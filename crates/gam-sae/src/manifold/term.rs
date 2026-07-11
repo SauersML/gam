@@ -227,12 +227,11 @@ pub(crate) const SAE_DECODER_REPULSION_COLLINEARITY_GATE: f64 = 0.5;
 /// mass, so the co-activation it would register and the anti-collapse repulsion /
 /// separation it would receive are negligible.
 ///
-/// For structurally sparse assignments (JumpReLU hard gate, ordered Beta--Bernoulli) the surviving
-/// active atoms sit far above this floor and the hard zeros are excluded anyway,
-/// so the co-active support is unchanged. It is load-bearing for SOFTMAX, whose
-/// normalization gives EVERY atom a tiny but strictly nonzero tail mass: a plain
-/// `a ≠ 0` test would mark all `K` atoms co-active on every row and collapse the
-/// scan to the dense `O(N·K²)` all-pairs cost (minutes at `K = 10⁴`). Matches the
+/// Only TopK is structurally sparse. ThresholdGate, ordered Beta--Bernoulli, and
+/// Softmax all have strictly positive finite-logit tails, so this floor defines
+/// their common numerical co-activity support. A plain `a ≠ 0` test would mark
+/// all `K` atoms co-active on every row and collapse the scan to the dense
+/// `O(N·K²)` all-pairs cost (minutes at `K = 10⁴`).
 /// This threshold is only an anti-collapse diagnostic/conditioning definition;
 /// it never truncates the reconstruction or its derivatives.
 pub(crate) const SAE_COACTIVE_RELATIVE_MASS_FLOOR: f64 = 1.0e-3;

@@ -100,7 +100,7 @@ def test_noncanonical_assignment_is_rejected() -> None:
     golden = _load(GOLDEN_FULL)
     assert golden["assignment"] == "topk"
     aliased = dict(golden)
-    aliased["assignment"] = "jumprelu"
+    aliased["assignment"] = "legacy_assignment"
     with pytest.raises(ValueError, match="recognized assignment"):
         ManifoldSAE.from_dict(aliased)
 

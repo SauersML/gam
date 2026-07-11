@@ -1600,7 +1600,7 @@ fn canonicalize_assignment_kind(kind: &str) -> Result<String, String> {
 // (`gam_sae::manifold::oos_logit_seed`, methods on `SaeManifoldTerm`) so the CLI
 // and Rust callers seed identically to python — issue #2236. The binding calls
 // `term.seed_oos_softmax_logits_from_projection_residuals(..)` /
-// `term.seed_oos_ordered_beta_logits_from_projected_decoder_lsq(..)` directly.
+// `term.seed_oos_ordered_beta_bernoulli_logits_from_projected_decoder_lsq(..)` directly.
 
 fn gumbel_temperature_schedule_from_pydict(
     schedule: Option<&Bound<'_, PyDict>>,

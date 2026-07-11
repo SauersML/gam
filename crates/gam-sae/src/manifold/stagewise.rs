@@ -891,7 +891,7 @@ fn isa_birth_seed_batch(
 ///
 /// Used both as the Phase-2 per-atom refit and as the chart-EXTENSION birth
 /// candidate (refit the last atom on its LOO residual so it can absorb the arc it
-/// left behind). Independent-gate modes (JumpReLU / ordered Beta--Bernoulli) refit exactly-additively;
+/// left behind). Independent-gate modes (ThresholdGate / ordered Beta--Bernoulli) refit exactly-additively;
 /// under Softmax the K=1 sub-gate is the constant `1`, so the sub-fit sees the
 /// full partial residual (classical additive backfitting) and the subsequent warm
 /// polish reconciles the re-normalized joint gate.
@@ -2616,7 +2616,7 @@ mod tests {
         let (atom0, cb0) = circle_atom("t0", &evaluator, &coords, 0, 1, p);
 
         // Helper: build a 1-atom ordered Beta--Bernoulli term from a per-row logit column.
-        let build_ordered_beta = |logit: &dyn Fn(usize) -> f64| -> SaeManifoldTerm {
+        let build_ordered_beta_bernoulli = |logit: &dyn Fn(usize) -> f64| -> SaeManifoldTerm {
             let mut logits = Array2::<f64>::zeros((n, 1));
             for row in 0..n {
                 logits[[row, 0]] = logit(row);
@@ -2633,7 +2633,7 @@ mod tests {
 
         // CONTESTED-vs-ANCHOR routing: existing atom ACTIVE on [0,h) (high logit),
         // INACTIVE on [h,n) (low logit) — so [h,n) are the uncontested anchor rows.
-        let contrast_term = build_ordered_beta(&|row| if row < h { 3.0 } else { -3.0 });
+        let contrast_term = build_ordered_beta_bernoulli(&|row| if row < h { 3.0 } else { -3.0 });
         let act = activity_of(&contrast_term);
         assert!(
             act[0] > act[n - 1] + 1e-6,
@@ -2655,7 +2655,7 @@ mod tests {
 
         // FALLBACK: uniform routing ⇒ no anchor contrast ⇒ dominant-energy column 0
         // (channel 0, the higher-variance planted factor).
-        let uniform_term = build_ordered_beta(&|_| 0.5);
+        let uniform_term = build_ordered_beta_bernoulli(&|_| 0.5);
         let decoder_u = top_factor_birth_decoder(&uniform_term, &model, residual.view())
             .unwrap()
             .decoder;
@@ -3444,7 +3444,7 @@ mod tests {
 
     /// THE PARITY LICENSE (batch-OMP orthogonality). Two DISJOINT planted circles:
     /// A on rows `[0,h)` in ambient plane (0,1), B on rows `[h,n)` in plane (2,3).
-    /// Under a ThresholdGate the born atom's gate is EXACTLY 0 off its support, so
+    /// Under a ThresholdGate the born atom's gate is numerically negligible off its support, so
     /// B's K=1 fit reads only rows `[h,n)`. The A-deflated residual R1 equals the
     /// original R0 on those rows (A gates off there), so B's fit against R0 (the
     /// batched pass) is IDENTICAL to its fit against R1 (the serial pass). Prove it

@@ -1833,7 +1833,7 @@ fn sae_logdet_theta_adjoint_from_probes_matches_ordered_beta_bernoulli() {
     rho.log_lambda_sparse = 0.5;
     let (_v, _l, cache) = term
         .penalized_laml_criterion_with_cache(target.view(), &rho, None, 200, 0.4, 1.0e-6, 1.0e-6)
-        .expect("converged ordered-Beta--Bernoulli cache");
+        .expect("converged ordered Beta--Bernoulli cache");
     assert_theta_adjoint_from_probes_matches_dense(&term, &rho, &cache);
 }
 
@@ -1848,7 +1848,7 @@ fn sae_logdet_theta_adjoint_from_probes_refuses_deflated_rows_2080() {
     rho.log_lambda_sparse = 0.5;
     let (_v, _l, cache) = term
         .penalized_laml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
-        .expect("converged learnable ordered-Beta--Bernoulli cache");
+        .expect("converged learnable ordered Beta--Bernoulli cache");
     assert!(
         cache.deflated_row_directions.iter().any(|d| !d.is_empty()),
         "fixture must genuinely deflate to exercise the hard-refuse (re-pick ρ if not)"

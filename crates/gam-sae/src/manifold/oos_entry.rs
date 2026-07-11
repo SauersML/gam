@@ -705,7 +705,7 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
             SaeOosAssignmentKind::OrderedBetaBernoulli { .. }
         )
     {
-        term.seed_oos_ordered_beta_logits_from_projected_decoder_lsq(target.view(), tau);
+        term.seed_oos_ordered_beta_bernoulli_logits_from_projected_decoder_lsq(target.view(), tau);
     }
 
     let loss = term.run_fixed_decoder_arrow_schur(

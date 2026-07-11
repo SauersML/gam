@@ -164,10 +164,10 @@ mod tests {
             manifolds.push(LatentManifold::Circle { period: 1.0 });
         }
 
-        // Independent hard-sigmoid (ThresholdGate) gates with saturating logits ⇒
+        // Independent smooth logistic ThresholdGate gates with saturating logits ⇒
         // every atom fires ~1 (σ((3−0)/0.7) ≈ 0.986) and each gate is a function of
         // its OWN logit alone — no cross-atom coupling. This deliberately avoids
-        // the ordered-Beta prior so the fixture isolates Tier-0 behavior instead
+        // the ordered Beta--Bernoulli prior so the fixture isolates Tier-0 behavior instead
         // of simultaneously testing index-dependent prior energy. The DC-zombie
         // property this test asserts is about Tier-0 vs the raw mean, NOT about
         // the assignment prior, so a uniform gate where "every

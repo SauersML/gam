@@ -2840,7 +2840,7 @@ impl SaeManifoldTerm {
                 canonicalize_softmax_logits(&mut self.assignment.logits);
             }
             AssignmentMode::OrderedBetaBernoulli { .. } => {
-                // σ(0/τ) = ½ — the Bernoulli posterior mean's neutral point.
+                // σ(0/τ) = ½ — the sigmoid gate's neutral point.
                 for row in 0..n {
                     self.assignment.logits[[row, atom]] = 0.0;
                 }
@@ -2849,7 +2849,7 @@ impl SaeManifoldTerm {
                 temperature,
                 threshold,
             } => {
-                // One temperature unit above the hard gate threshold:
+                // One temperature unit above the smooth gate center:
                 // just-active, inside the smooth transition band.
                 for row in 0..n {
                     self.assignment.logits[[row, atom]] = threshold + temperature;
@@ -3132,7 +3132,7 @@ impl SaeManifoldTerm {
             // Wachter null bar false-positives on HEALTHY correlated K≥2 fits — atoms
             // that legitimately share some output span but each carry real structure —
             // and reseeding them mid-fit regressed `manifold_beats_linear_joint_
-            // streaming_1026` and `planted_circle_multi_atom_jumprelu_clears_startup_
+            // streaming_1026` and `planted_circle_multi_atom_threshold_gate_clears_startup_
             // validation_1782`. Distinguishing "merged" from "merely correlated" needs
             // more than coherence (it depends on what the DATA needs), so the detector
             // is left as a callable diagnostic for the evidence-gated structure search
@@ -3729,7 +3729,7 @@ impl SaeManifoldTerm {
                 // presents is rank-deficient and its closed-form Laplace evidence is
                 // undefined — the SAME infeasible-ρ class as the non-PD Schur /
                 // per-row Hessian refusals (#1782). It arises for a legitimate seed
-                // state (a jumprelu / threshold gate that zeroes every row at an
+                // state (a threshold gate that numerically underflows on every row at an
                 // off-optimum seed ρ), NOT a coding defect, and fitting the resulting
                 // all-off (zero) dictionary just makes the outer optimizer grind on a
                 // gradient-free landscape. Surface a DISTINCT, classifiable refusal so
@@ -3877,7 +3877,7 @@ impl SaeManifoldTerm {
         let frames = (0..k)
             .map(|atom| crate::manifold::certificate::certificate_output_frame(self, atom))
             .collect::<Result<Vec<_>, String>>()?;
-        // OVERCOMPLETE GATE (ordered_beta_default_alpha false-positive root cause). A shared
+        // OVERCOMPLETE GATE (ordered_beta_bernoulli_default_alpha false-positive root cause). A shared
         // output subspace is evidence of a REDUNDANT atom only when the dictionary is
         // NOT overcomplete relative to the output space it actually occupies. Let
         // `R = dim(⋃_k col Q_k)` be the effective output rank — the dimension spanned
@@ -3885,7 +3885,7 @@ impl SaeManifoldTerm {
         // FORCES output-frame sharing: `K` curved atoms cannot each claim a private
         // output direction inside an `R < K`-dim space, so every co-firing pair MUST
         // overlap while encoding DISTINCT charts/phases — benign over-completeness, not
-        // duplication (measured on `ordered_beta_default_alpha`: 8 curved atoms in a ~6-dim
+        // duplication (measured on `ordered_beta_bernoulli_default_alpha`: 8 curved atoms in a ~6-dim
         // output, every frame-coherent pair reconstructs EV≈0.99 with contribution
         // cosine at the independence null; firing the reseed here burns the iteration
         // budget — guards-on 12-iter EV 0.697 vs guards-off 0.990). Restrict the whole
@@ -3936,7 +3936,7 @@ impl SaeManifoldTerm {
         // (n×p) are collinear over the rows — NOT merely when they share an output
         // subspace. Two curved atoms sharing a decoder frame at DIFFERENT charts
         // (phases) reconstruct DIFFERENT rows, so `Y_j ≠ Y_k`: benign, healthy,
-        // must not be reseeded (measured on `ordered_beta_default_alpha`: every frame-coherent
+        // must not be reseeded (measured on `ordered_beta_bernoulli_default_alpha`: every frame-coherent
         // pair reconstructs EV≈0.99 with contribution cosine ≤0.27, right at the
         // independence null, while the frame coherence reads ≈1). Confirm each
         // candidate on the Frobenius cosine of its contributions against a bar
@@ -4600,8 +4600,7 @@ impl SaeManifoldTerm {
             ));
         }
 
-        // When last_row_layout is set (compact active-set mode — JumpReLU
-        // gate or large-K ordered Beta--Bernoulli truncation), delta_ext_coord uses a
+        // When last_row_layout is set (compact hard-TopK support), delta_ext_coord uses a
         // variable-stride layout where row i occupies
         // [compact_offset_i .. compact_offset_i + q_active_i].
         // We expand each row back to full-q before applying.
@@ -5757,7 +5756,7 @@ impl SaeManifoldTerm {
             // decoder system at the engine's current ρ; the engine alone
             // moves ρ by minimising the penalised quasi-Laplace evidence
             // score (see `SaeManifoldTerm::penalized_laml_criterion`; #1421: NOT a
-            // true normalized-prior REML — the improper softmax/JumpReLU
+            // true normalized-prior REML — the improper softmax/ThresholdGate
             // assignment priors have no finite normalizer). The former in-loop
             // `update_ard_reml` rule (α = n / ‖t‖²) dropped the logdet /
             // effective-dof term and collapsed α on near-degenerate axes; it

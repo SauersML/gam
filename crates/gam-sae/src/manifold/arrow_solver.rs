@@ -198,7 +198,7 @@ impl<'a> DeflatedArrowSolver<'a> {
     /// diagonal contraction against it therefore spuriously includes
     /// `Σ_i vᵢ[s]²` at slot `s`, a ρ/θ-independent contribution that must be 0.
     /// This variant subtracts the per-row deflated outer-product diagonal
-    /// `Σ_i vᵢ[s]²` so the diagonal traces (ARD precision, ordered-Beta/softmax assignment
+    /// `Σ_i vᵢ[s]²` so the diagonal traces (ARD precision, ordered Beta--Bernoulli/softmax assignment
     /// log-strength) see only the kept subspace. The deflated subspace's β-Schur
     /// coupling is higher order and left to the per-block subtraction the
     /// off-diagonal (`solve`-based) traces apply directly.

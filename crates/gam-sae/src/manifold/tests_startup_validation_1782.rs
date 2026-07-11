@@ -1,4 +1,4 @@
-//! #1782 — `sae_manifold_fit` with `jumprelu`/`softmax` assignments and
+//! #1782 — `sae_manifold_fit` with `threshold_gate`/`softmax` assignments and
 //! `euclidean`/`linear` topologies failed at "no candidate seeds passed outer
 //! startup validation" on clean planted-circle data where `ordered_beta_bernoulli`+`circle`
 //! converges. Root causes: (1) the Euclidean/Linear PCA seed read the SAME
@@ -197,7 +197,7 @@ fn seed_passes_startup_validation(
 }
 
 /// The #1782 startup-validation matrix: on identical clean planted-circle data
-/// every assignment kind (ordered_beta_bernoulli, softmax, threshold_gate/jumprelu) and every
+/// every assignment kind (ordered_beta_bernoulli, softmax, threshold_gate) and every
 /// atom topology (circle, euclidean, linear) must PASS outer startup validation.
 /// Before the fix only circle/ordered_beta_bernoulli survived; the rest threw "no candidate
 /// seeds passed outer startup validation (SAE manifold)". Fast: one inner solve
@@ -266,7 +266,7 @@ fn run_full_fit(
         })
         .run(&mut objective, "SAE manifold")
         .unwrap_or_else(|e| {
-            // The two #1782 failure surfaces both land here: the jumprelu / euclidean
+            // The two #1782 failure surfaces both land here: the threshold-gate / euclidean
             // "no candidate seeds passed outer startup validation" abort, and the
             // softmax "BFGS aborted: globally infeasible neighbourhood at seed
             // (probe-refusal guard)" abort — both are the emptied / globally-refused
@@ -287,7 +287,7 @@ fn run_full_fit(
     ev
 }
 
-/// The assignment axis (the issue's headline: jumprelu/softmax) must not just
+/// The assignment axis (the issue's headline: threshold-gate/softmax) must not just
 /// pass validation but actually FIT: run the real outer `OuterProblem::run`
 /// ("SAE manifold") cascade — the exact FFI entry — on circle atoms for each
 /// assignment kind and require a finite reconstruction EV. Circle atoms are
@@ -364,8 +364,8 @@ fn cocollapse_startup_frontier_1026() {
     let ks = [4usize, 8];
     // Compare the assignment modes: ordered Beta--Bernoulli couples all rows through a cross-row
     // Woodbury evidence with NO matrix-free log-det route (so large-K refuses on
-    // the dense reduced Schur), whereas the hard-sigmoid gate (threshold_gate /
-    // "jumprelu") is per-row independent and streams. This measures which mode
+    // the dense reduced Schur), whereas the smooth logistic threshold gate is
+    // per-row independent and streams. This measures which mode
     // extends the startup frontier, decoupling the routing wall from seed
     // co-collapse.
     let modes: [(&str, fn() -> AssignmentMode); 3] = [
@@ -375,7 +375,7 @@ fn cocollapse_startup_frontier_1026() {
         ("thresh_gate", || AssignmentMode::threshold_gate(1.0, 0.5)),
         ("softmax    ", || AssignmentMode::softmax(1.0)),
     ];
-    let mut ordered_beta_frontier = 0usize;
+    let mut ordered_beta_bernoulli_frontier = 0usize;
     for (label, mk) in modes {
         let mut frontier = 0usize;
         for &k in &ks {
@@ -392,17 +392,17 @@ fn cocollapse_startup_frontier_1026() {
         }
         eprintln!("FRONTIER1026 {label}: largest passing K = {frontier}");
         if label.trim() == "ordered_beta_bernoulli" {
-            ordered_beta_frontier = frontier;
+            ordered_beta_bernoulli_frontier = frontier;
         }
     }
     assert!(
-        ordered_beta_frontier >= 4,
-        "startup validation must hold at least to K=4 (got frontier {ordered_beta_frontier})"
+        ordered_beta_bernoulli_frontier >= 4,
+        "startup validation must hold at least to K=4 (got frontier {ordered_beta_bernoulli_frontier})"
     );
 }
 
 /// WIN artifact (#1026 / #1610). A PRINCIPLED joint manifold SAE — curved 1-D
-/// circle fibers, hard-sigmoid gate (`threshold_gate`/"jumprelu", the per-row
+/// circle fibers, smooth logistic gate (`threshold_gate`, the per-row
 /// streaming assignment whose evidence log-det takes the matrix-free SLQ route)
 /// — fit end-to-end by the real outer penalized-LAML
 /// cascade must MATCH-OR-BEAT a traditional linear SAE (`fit_sparse_dictionary`,
@@ -426,7 +426,7 @@ fn manifold_beats_linear_joint_streaming_1026() {
             .expect("linear SAE baseline fits");
         let ev_linear = lin.explained_variance;
 
-        // Principled joint manifold SAE: curved circle fibers, hard-sigmoid gate,
+        // Principled joint manifold SAE: curved circle fibers, smooth logistic threshold gate,
         // solved directly by the coupled inner arrow-Schur joint Newton over the
         // (coords t, decoders β) block — the exact joint solve the outer penalized-LAML
         // cascade drives, run here at a fixed penalty seed so the comparison is a

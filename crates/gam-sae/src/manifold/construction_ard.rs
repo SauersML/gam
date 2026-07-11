@@ -47,15 +47,15 @@ impl SaeManifoldTerm {
     ///
     /// `cache.latent_block_inverse_diagonal()` returns the diagonal of the
     /// latent block `(H⁻¹)_tt` in the cache's compact per-row `delta_t`
-    /// layout (length `row_offsets[N]`); each per-row block is laid out as
-    /// `[logit scalars…, then per-active-atom coord axes…]`. This routine
+    /// layout (length `row_offsets[N]`). A compact hard-TopK row contains only
+    /// the selected atoms' coordinate axes; a dense row contains assignment
+    /// coordinates followed by all atom-coordinate axes. This routine
     /// sums those diagonal entries over the coord positions belonging to each
     /// `(atom k, axis j)` across all observation rows where atom `k` is active.
     ///
     /// `self.last_row_layout` must be the layout from the *same* assemble that
     /// produced `cache`:
-    /// - `Some(layout)`: compact active-set mode (JumpReLU / large-K
-    ///   softmax-ordered Beta--Bernoulli truncation). For row `i`, atom `k`'s position in the
+    /// - `Some(layout)`: compact exact hard-TopK support. For row `i`, atom `k`'s position in the
     ///   active list gives its compact coord-block start `coord_starts[i][pos]`;
     ///   inactive atoms contribute 0 (the prior dominates there anyway).
     /// - `None`: dense full-support layout, uniform row dim

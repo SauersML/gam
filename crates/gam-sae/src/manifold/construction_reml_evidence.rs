@@ -9,9 +9,9 @@ impl SaeManifoldTerm {
     /// Penalised quasi-Laplace evidence score for the SAE term at a FIXED ρ.
     ///
     /// #1421: this is NOT a true normalized-prior REML/evidence objective. The
-    /// assignment priors (softmax entropy, JumpReLU) have NO finite normalizer:
+    /// assignment priors (softmax entropy, ThresholdGate) have NO finite normalizer:
     /// for softmax the reference-logit chart sends `P(ℓ)→0` as a free logit →±∞
-    /// so `∫ e^{−λP} dℓ = ∞`, and JumpReLU's bounded penalty `0<P<λ` keeps
+    /// so `∫ e^{−λP} dℓ = ∞`, and ThresholdGate's bounded penalty `0<P<λ` keeps
     /// `e^{−λP}` bounded below over an unbounded domain, also divergent. There is
     /// therefore no ρ-independent assignment-prior normalizer that can be dropped
     /// as a constant. The smoothing-penalty `−½log|λS|_+` term IS a genuine
@@ -45,7 +45,7 @@ impl SaeManifoldTerm {
     /// constants that ARE dropped here (they shift `V` by a constant and do not
     /// affect the ρ-argmin) are the `2π` Laplace constant and the base
     /// `½ p·log|S|_+` penalty logdet. #1421: NO assignment-prior normalizer is
-    /// dropped, because none exists (softmax/JumpReLU priors are improper — see
+    /// dropped, because none exists (softmax/ThresholdGate priors are improper — see
     /// the doc on this function): the quasi-Laplace score simply omits a
     /// normalizer that is not a finite constant.
     ///
@@ -3430,7 +3430,7 @@ impl SaeManifoldTerm {
                 let inv_tau = 1.0 / temperature;
                 let activation = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
-                // #991 — this row's JumpReLU prior curvature in `htt` carries the
+                // #991 — this row's ThresholdGate prior curvature in `htt` carries the
                 // design weight `w_row`, so its θ-derivative carries the SAME
                 // `w_row` (value/logdet/adjoint stay on one weighted branch).
                 let w_row = self.row_loss_weights.as_deref().map_or(1.0, |w| w[row]);

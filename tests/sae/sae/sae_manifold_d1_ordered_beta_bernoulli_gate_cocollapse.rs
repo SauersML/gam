@@ -2,7 +2,7 @@
 //! converge at fixed rho and reconstruct an exactly representable curve.
 //!
 //! Ordered independent Beta--Bernoulli shrinkage belongs only to the empirical-Bayes assignment prior.
-//! The forward posterior-mean gate is sigmoid(logit / temperature), without a
+//! The forward reconstruction gate is sigmoid(logit / temperature), without a
 //! second multiplication by the ordered prior mean. Decoder magnitude stays in
 //! the physical coefficient block B, so this fixture directly catches either a
 //! reintroduced prior cap or a convergence path that returns a cold seed.
@@ -30,7 +30,7 @@ const D: usize = 1; // the #2228 configuration: intrinsic 1-D atom
 const MAX_DEGREE: usize = 2; // degree-2 patch {1, t, t²} — spans the planted curve
 const TAU: f64 = 0.5;
 // K=1 ⇒ the ordered prior mean is 0.5. It prices the empirical-Bayes assignment
-// prior, but must not multiply the forward posterior-mean gate a second time.
+// prior, but must not multiply the forward sigmoid gate a second time.
 const ALPHA: f64 = 1.0;
 const INNER_MAX_ITER: usize = 50;
 const LEARNING_RATE: f64 = 1.0;

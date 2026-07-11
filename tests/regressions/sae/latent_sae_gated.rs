@@ -53,7 +53,7 @@ fn latent_coord_assignment_decode_roundtrip_matches_dictionary_atom() {
 }
 
 #[test]
-fn sae_assignment_modes_softmax_ordered_beta_bernoulli_jumprelu_follow_documented_behavior() {
+fn sae_assignment_modes_follow_documented_behavior() {
     let coord_blocks = vec![
         array![[0.0], [0.0]],
         array![[0.0], [0.0]],
@@ -87,23 +87,32 @@ fn sae_assignment_modes_softmax_ordered_beta_bernoulli_jumprelu_follow_documente
         .try_assignments_row(0)
         .expect("ordered Beta--Bernoulli row should evaluate");
     assert!(
-        ordered_beta_bernoulli_row[0] > ordered_beta_bernoulli_row[1]
-            && ordered_beta_bernoulli_row[1] > ordered_beta_bernoulli_row[2],
-        "The ordered independent Beta--Bernoulli prior should favor earlier atoms when logits are tied."
+        ordered_beta_bernoulli_row
+            .iter()
+            .all(|value| (*value - 0.5).abs() < 1.0e-12),
+        "The ordered prior is scored once by the penalty and must not be multiplied into the posterior-mean reconstruction gate."
     );
 
-    let jump = SaeAssignment::from_blocks_with_mode(
+    let threshold_gate = SaeAssignment::from_blocks_with_mode(
         array![[0.2, 0.6, -2.0]],
         vec![array![[0.0]], array![[0.0]], array![[0.0]]],
         AssignmentMode::threshold_gate(0.5, 0.5),
     )
-    .expect("jumprelu assignment should build");
-    let jump_row = jump
+    .expect("threshold-gate assignment should build");
+    let threshold_gate_row = threshold_gate
         .try_assignments_row(0)
-        .expect("jumprelu row should evaluate");
+        .expect("threshold-gate row should evaluate");
+    let expected = [
+        1.0 / (1.0 + 0.6_f64.exp()),
+        1.0 / (1.0 + (-0.2_f64).exp()),
+        1.0 / (1.0 + 5.0_f64.exp()),
+    ];
     assert!(
-        jump_row[0] == 0.0 && jump_row[2] == 0.0 && jump_row[1] > 0.0,
-        "JumpReLU should return sparse assignments with only logits above threshold receiving non-zero activation."
+        threshold_gate_row
+            .iter()
+            .zip(expected)
+            .all(|(actual, expected)| (*actual - expected).abs() < 1.0e-12),
+        "ThresholdGate must return the exact smooth logistic gate on both sides of its center."
     );
 }
 

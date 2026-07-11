@@ -645,7 +645,7 @@ pub fn sae_decoder_lsq_init(
                 }
             }
         }
-        // #1777 canonical token for the hard-sigmoid gate.
+        // Canonical token for the smooth threshold-centered logistic gate.
         "threshold_gate" => {
             if !threshold_gate_threshold.is_finite() {
                 return Err(format!(
@@ -1059,7 +1059,7 @@ mod tests {
         // The seeded reconstruction must explain most of Z under the SAME forward
         // map the joint LSQ solved against: fitted[i,:] = Σ_k a_k · Phi_k[i,:] · B_k
         // where a_k is the ordered Beta--Bernoulli activation of the initial (all-zero) logits. For
-        // zero logits the posterior-mean Bernoulli gate is σ(0) = 0.5. Ordered
+        // zero logits the sigmoid gate is σ(0) = 0.5. Ordered
         // independent-Beta shrinkage is scored by the ordered prior, not multiplied
         // into the reconstruction a second time.
         // Reconstructing with the true per-atom weights (rather than an imagined

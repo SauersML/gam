@@ -13,8 +13,8 @@
 //!       only difference is the order of accumulation.
 //!
 //!   (b) **Per-token cost independent of `K` at fixed `k_active`.** Under the
-//!       JumpReLU structural gate, each token's Arrow-Schur row block is sized
-//!       by its *active* atom set (`|active| + Σ_{k∈active} d_k`), never by the
+//!       hard-TopK support gate, each token's Arrow-Schur row block is sized
+//!       by its selected atoms' coordinates (`Σ_{k∈support} d_k`), never by the
 //!       total atom count `K`. Doubling `K` while holding the per-token active
 //!       set fixed must leave every per-row block dimension unchanged, so the
 //!       assembly and per-row solve cost track `k_active`, not `K`. This is the
@@ -53,10 +53,9 @@ fn lcg_f64(state: &mut u64) -> f64 {
 /// Build a small Euclidean-patch SAE term with the requested gating mode.
 ///
 /// Euclidean atoms keep the per-row latent block flat (no tangent projection),
-/// so the streaming reduction and the JumpReLU active-set layout are exercised
-/// on the same code path the `K = 100K` fit uses. The gating logits are seeded
-/// so that, under JumpReLU with `threshold = 0`, exactly `n_active` atoms clear
-/// the gate per token regardless of `K`.
+/// so the streaming reduction and hard-TopK support layout are exercised on the
+/// same code path the `K = 100K` fit uses. The routing logits are seeded so that
+/// the same `n_active` atoms have the largest scores per token regardless of `K`.
 fn build_term(
     k_atoms: usize,
     basis_size: usize,
@@ -76,9 +75,9 @@ fn build_term(
         .wrapping_add(k_atoms as u64 * 97)
         .wrapping_add(n as u64 * 7);
 
-    // Gating logits: the first `n_active` atoms (modulo a per-row rotation) are
-    // driven positive, the rest negative, so a `threshold = 0` JumpReLU gate
-    // admits exactly `n_active` atoms per token independent of `K`.
+    // Routing logits: the first `n_active` atoms (modulo a per-row rotation)
+    // have the largest scores, so hard TopK selects exactly `n_active` atoms per
+    // token independent of `K`.
     let mut logits = Array2::<f64>::zeros((n, k_atoms));
     for row in 0..n {
         let base = row % k_atoms;
@@ -255,11 +254,11 @@ fn per_token_block_dim_is_independent_of_k_at_fixed_active() {
     let d = 2usize;
     let n = 64usize;
     let n_active = 3usize;
-    // JumpReLU with threshold 0: exactly `n_active` atoms clear the gate per
-    // token, so each token's compact row block is `n_active·(1 + d)` wide,
+    // Hard TopK selects exactly `n_active` atoms per token. Its compact row
+    // block contains coordinates only and is therefore `n_active·d` wide,
     // independent of K.
-    let mode = AssignmentMode::threshold_gate(1.0, 0.0);
-    let expected_block_dim = n_active * (1 + d);
+    let mode = AssignmentMode::top_k_support(n_active);
+    let expected_block_dim = n_active * d;
 
     let mut per_row_dims_at_k: Vec<Vec<usize>> = Vec::new();
     for k_atoms in [16usize, 32, 64] {

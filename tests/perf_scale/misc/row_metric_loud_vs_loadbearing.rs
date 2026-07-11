@@ -96,7 +96,7 @@ fn single_channel_atom(name: &str, channel: usize, amplitude: f64) -> SaeManifol
 }
 
 /// Build the planted two-atom fitted term. Both atoms are *active on every row*
-/// (high JumpReLU gate logits), so the Euclidean activation fit represents BOTH
+/// (high ThresholdGate logits), so the Euclidean activation fit represents BOTH
 /// — nothing is suppressed. The loud atom lives in channel 0 with large
 /// amplitude (high presence); the quiet atom in channel 1 with small amplitude
 /// (low presence).
@@ -107,7 +107,7 @@ fn planted_term() -> SaeManifoldTerm {
     // Two latent-coordinate blocks (one scalar coord per atom), at t = 0.
     let coord_blocks = vec![Array2::<f64>::zeros((N, 1)), Array2::<f64>::zeros((N, 1))];
 
-    // JumpReLU gate logits well above threshold for BOTH atoms on every row, so
+    // ThresholdGate logits well above threshold for BOTH atoms on every row, so
     // both gates are ~1 (σ((10−0)/0.1) ≈ 1). This is the "everything represented
     // survives" condition: the activation fit keeps both atoms maximally active.
     let mut logits = Array2::<f64>::zeros((N, 2));

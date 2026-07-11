@@ -125,12 +125,12 @@ def test_ordered_beta_bernoulli_assignments_decay_not_truncate_under_saturation(
     )
     A = np.asarray(fit.assignments)
     assert np.all(np.isfinite(A)), (
-        "ordered-Beta assignments under saturation contain non-finite entries"
+        "ordered Beta--Bernoulli assignments under saturation contain non-finite entries"
     )
     # Per-atom total mass: geometric decay, but no atom column is exactly
     # zero everywhere (that would be a hard truncation, not a soft prior).
     col_mass = A.sum(axis=0)
-    assert np.all(col_mass >= 0.0), "negative ordered-Beta assignment mass observed"
+    assert np.all(col_mass >= 0.0), "negative ordered Beta--Bernoulli assignment mass observed"
     assert np.all(np.isfinite(col_mass))
 
 

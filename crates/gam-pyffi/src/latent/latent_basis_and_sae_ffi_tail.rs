@@ -54,7 +54,7 @@ fn sae_manifold_fit_minimal<'py>(
     py: Python<'py>,
     z: PyReadonlyArray2<'py, f64>,
     atom_basis: Vec<String>,
-    atom_dim: Vec<usize>,
+    atom_dim: Option<Vec<usize>>,
     alpha: f64,
     tau: f64,
     learnable_alpha: bool,
@@ -178,6 +178,412 @@ fn sae_manifold_fit_minimal<'py>(
     // Post-search atom plans are emitted by the shared fit entry from the final
     // variable-K dictionary; the minimal binding never patches the payload.
     Ok(result_dict)
+}
+
+fn expand_public_fit_values<T: Clone>(
+    values: Vec<T>,
+    k_atoms: usize,
+    label: &str,
+) -> Result<Vec<T>, String> {
+    match values.len() {
+        1 => Ok(vec![values[0].clone(); k_atoms]),
+        len if len == k_atoms => Ok(values),
+        len => Err(format!(
+            "sae_manifold_fit: {label} must contain one shared value or K={k_atoms} values; got {len}"
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn public_fit_penalties(
+    isometry_weight: f64,
+    coord_sparsity: &str,
+    sparsity_weight: f64,
+    scad_mcp_gamma: Option<f64>,
+    decoder_feature_sparsity_groups: Option<Vec<Vec<usize>>>,
+    block_orthogonality_weight: f64,
+    nuclear_norm_weight: f64,
+    nuclear_norm_max_rank: Option<usize>,
+    decoder_incoherence_weight: f64,
+    k_atoms: usize,
+    d_max: usize,
+    p_out: usize,
+) -> Result<(Option<String>, Vec<String>), String> {
+    for (name, value) in [
+        ("isometry_weight", isometry_weight),
+        ("block_orthogonality_weight", block_orthogonality_weight),
+        ("nuclear_norm_weight", nuclear_norm_weight),
+        ("decoder_incoherence_weight", decoder_incoherence_weight),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!(
+                "sae_manifold_fit: {name} must be finite and non-negative; got {value}"
+            ));
+        }
+    }
+    let coord_sparsity = coord_sparsity.trim().to_ascii_lowercase();
+    if !matches!(coord_sparsity.as_str(), "l1" | "scad" | "mcp") {
+        return Err(format!(
+            "sae_manifold_fit: coord_sparsity must be 'l1', 'scad', or 'mcp'; got {coord_sparsity:?}"
+        ));
+    }
+    let gamma = scad_mcp_gamma.unwrap_or(if coord_sparsity == "scad" { 3.7 } else { 2.5 });
+    match coord_sparsity.as_str() {
+        "scad" if !gamma.is_finite() || gamma <= 2.0 => {
+            return Err(format!(
+                "sae_manifold_fit: scad_mcp_gamma must be finite and > 2 for SCAD; got {gamma}"
+            ));
+        }
+        "mcp" if !gamma.is_finite() || gamma <= 1.0 => {
+            return Err(format!(
+                "sae_manifold_fit: scad_mcp_gamma must be finite and > 1 for MCP; got {gamma}"
+            ));
+        }
+        _ => {}
+    }
+
+    let mut descriptors = Vec::new();
+    let mut names = Vec::new();
+    if matches!(coord_sparsity.as_str(), "scad" | "mcp") {
+        descriptors.push(serde_json::json!({
+            "kind": "scad_mcp",
+            "target": "t",
+            "variant": coord_sparsity,
+            "gamma": gamma,
+            "weight": sparsity_weight,
+        }));
+        names.push("ScadMcpPenalty".to_string());
+    }
+    if isometry_weight > 0.0 {
+        descriptors.push(serde_json::json!({
+            "kind": "isometry",
+            "target": "t",
+            "weight": isometry_weight,
+        }));
+        names.push("IsometryPenalty".to_string());
+    }
+    if block_orthogonality_weight > 0.0 {
+        if d_max < 2 {
+            return Err(format!(
+                "sae_manifold_fit: block_orthogonality_weight requires d_atom >= 2; got d_max={d_max}"
+            ));
+        }
+        let groups = (0..d_max).map(|axis| vec![axis]).collect::<Vec<_>>();
+        descriptors.push(serde_json::json!({
+            "kind": "block_orthogonality",
+            "target": "t",
+            "groups": groups,
+            "weight": block_orthogonality_weight,
+        }));
+        names.push("BlockOrthogonalityPenalty".to_string());
+    }
+    if let Some(groups) = decoder_feature_sparsity_groups {
+        let mut seen = vec![false; p_out];
+        if groups.is_empty() || groups.iter().any(Vec::is_empty) {
+            return Err(
+                "sae_manifold_fit: decoder_feature_sparsity_groups must contain non-empty groups"
+                    .to_string(),
+            );
+        }
+        for &feature in groups.iter().flatten() {
+            if feature >= p_out || seen[feature] {
+                return Err(format!(
+                    "sae_manifold_fit: decoder_feature_sparsity_groups must be a disjoint partition of 0..{p_out}"
+                ));
+            }
+            seen[feature] = true;
+        }
+        if seen.iter().any(|used| !used) {
+            return Err(format!(
+                "sae_manifold_fit: decoder_feature_sparsity_groups must cover every feature in 0..{p_out}"
+            ));
+        }
+        descriptors.push(serde_json::json!({
+            "kind": "mechanism_sparsity",
+            "target": "beta",
+            "feature_groups": groups,
+        }));
+        names.push("MechanismSparsityPenalty".to_string());
+    }
+    if nuclear_norm_weight > 0.0 {
+        let mut descriptor = serde_json::json!({
+            "kind": "nuclear_norm",
+            "target": "beta",
+            "weight": nuclear_norm_weight,
+        });
+        if let Some(max_rank) = nuclear_norm_max_rank {
+            descriptor["max_rank"] = serde_json::json!(max_rank);
+        }
+        descriptors.push(descriptor);
+        names.push("NuclearNormPenalty".to_string());
+    }
+    if decoder_incoherence_weight > 0.0 && k_atoms >= 2 {
+        descriptors.push(serde_json::json!({
+            "kind": "decoder_incoherence",
+            "target": "beta",
+            "block_sizes": vec![1_usize; k_atoms],
+            "p_out": p_out,
+            "weight": decoder_incoherence_weight,
+        }));
+        names.push("DecoderIncoherencePenalty".to_string());
+    }
+    let json = if descriptors.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&descriptors).map_err(|error| error.to_string())?)
+    };
+    Ok((json, names))
+}
+
+/// Public fitted-model front door. Python supplies only arrays and literal
+/// options; assignment/basis canonicalization, defaults, penalty descriptors,
+/// native fitting, and artifact construction all terminate in Rust.
+#[pyfunction(signature = (
+    z,
+    k_atoms,
+    atom_dim,
+    atom_topology=None,
+    atom_basis=None,
+    assignment_kind="softmax",
+    gumbel_schedule=None,
+    isometry_weight=1.0,
+    native_ard_enabled=true,
+    decoder_feature_sparsity_groups=None,
+    max_iter=50,
+    sparsity_strength=1.0,
+    coord_sparsity="scad",
+    scad_mcp_gamma=None,
+    smoothness=1.0,
+    alpha=None,
+    learnable_alpha=false,
+    learning_rate=None,
+    random_state=0,
+    block_orthogonality_weight=0.0,
+    nuclear_norm_weight=1.0,
+    nuclear_norm_max_rank=None,
+    decoder_incoherence_weight=1.0,
+    top_k=None,
+    initial_coords=None,
+    initial_logits=None,
+    tau=None,
+    threshold_gate_threshold=0.0,
+    fisher_factors=None,
+    fisher_mass_residual=None,
+    fisher_provenance=None,
+    row_loss_weights=None,
+    separation_barrier_strength_override=None,
+    ordered_beta_bernoulli_alpha_override=None,
+    promote_from_residual=true,
+    run_structure_search=true,
+    run_outer_rho_search=true,
+))]
+#[allow(clippy::too_many_arguments)]
+fn sae_manifold_fit_model<'py>(
+    py: Python<'py>,
+    z: PyReadonlyArray2<'py, f64>,
+    k_atoms: usize,
+    atom_dim: Vec<usize>,
+    atom_topology: Option<String>,
+    atom_basis: Option<Vec<String>>,
+    assignment_kind: &str,
+    gumbel_schedule: Option<&Bound<'py, PyDict>>,
+    isometry_weight: f64,
+    native_ard_enabled: bool,
+    decoder_feature_sparsity_groups: Option<Vec<Vec<usize>>>,
+    max_iter: usize,
+    sparsity_strength: f64,
+    coord_sparsity: &str,
+    scad_mcp_gamma: Option<f64>,
+    smoothness: f64,
+    alpha: Option<f64>,
+    learnable_alpha: bool,
+    learning_rate: Option<f64>,
+    random_state: u64,
+    block_orthogonality_weight: f64,
+    nuclear_norm_weight: f64,
+    nuclear_norm_max_rank: Option<usize>,
+    decoder_incoherence_weight: f64,
+    top_k: Option<usize>,
+    initial_coords: Option<PyReadonlyArray3<'py, f64>>,
+    initial_logits: Option<PyReadonlyArray2<'py, f64>>,
+    tau: Option<f64>,
+    threshold_gate_threshold: f64,
+    fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
+    fisher_mass_residual: Option<PyReadonlyArray1<'py, f64>>,
+    fisher_provenance: Option<String>,
+    row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
+    separation_barrier_strength_override: Option<f64>,
+    ordered_beta_bernoulli_alpha_override: Option<f64>,
+    promote_from_residual: bool,
+    run_structure_search: bool,
+    run_outer_rho_search: bool,
+) -> PyResult<Py<crate::ManifoldSaeCore>> {
+    if k_atoms == 0 {
+        return Err(py_value_error("sae_manifold_fit requires K >= 1".to_string()));
+    }
+    let z_view = z.as_array();
+    let (n_obs, p_out) = z_view.dim();
+    if n_obs < 2 || p_out == 0 {
+        return Err(py_value_error(format!(
+            "sae_manifold_fit requires a finite (N, p) matrix with N >= 2 and p >= 1; got ({n_obs}, {p_out})"
+        )));
+    }
+    if !z_view.iter().all(|value| value.is_finite()) {
+        return Err(py_value_error(
+            "sae_manifold_fit response contains non-finite values".to_string(),
+        ));
+    }
+    let atom_dim = expand_public_fit_values(atom_dim.unwrap_or_else(|| vec![2]), k_atoms, "d_atom")
+        .map_err(py_value_error)?;
+    if atom_dim.iter().any(|&dimension| dimension == 0) {
+        return Err(py_value_error(
+            "sae_manifold_fit requires every d_atom >= 1".to_string(),
+        ));
+    }
+    let has_declared_bases = atom_basis.is_some();
+    let basis_seed = match atom_basis {
+        Some(values) => expand_public_fit_values(values, k_atoms, "atom_basis")
+            .map_err(py_value_error)?,
+        None => vec![
+            gam::terms::sae::atom_schema::basis_kind_for_topology(
+                atom_topology.as_deref().unwrap_or("auto"),
+            );
+            k_atoms
+        ],
+    };
+    let atom_basis = basis_seed
+        .iter()
+        .map(|basis| gam::terms::sae::atom_schema::canonical_basis_kind(basis))
+        .collect::<Vec<_>>();
+    let declared_bases = has_declared_bases.then(|| basis_seed.clone());
+    if let (Some(topology), true) = (atom_topology.as_deref(), has_declared_bases) {
+        let resolved = gam::terms::sae::atom_schema::topology_for_bases(&atom_basis)
+            .ok_or_else(|| py_value_error("sae_manifold_fit requires at least one atom".to_string()))?;
+        let requested = gam::terms::sae::atom_schema::canonical_topology(topology);
+        if resolved != requested {
+            return Err(py_value_error(format!(
+                "sae_manifold_fit: atom_basis resolves to topology {resolved:?}, but atom_topology resolves to {requested:?}"
+            )));
+        }
+    }
+    let assignment = canonicalize_assignment_kind(assignment_kind).map_err(py_value_error)?;
+    let schedule = gumbel_temperature_schedule_from_pydict(gumbel_schedule)
+        .map_err(py_value_error)?;
+    let resolved_tau = tau.unwrap_or_else(|| schedule.as_ref().map_or(0.5, |state| state.tau_start));
+    let resolved_alpha = alpha.unwrap_or_else(|| {
+        if assignment == "ordered_beta_bernoulli"
+            && ordered_beta_bernoulli_alpha_override.is_none()
+            && !learnable_alpha
+        {
+            gam::terms::sae::assignment::default_ordered_beta_bernoulli_concentration_for_k_atoms(
+                k_atoms,
+            )
+        } else {
+            1.0
+        }
+    });
+    let resolved_learning_rate = learning_rate.unwrap_or(if assignment == "threshold_gate" {
+        0.05
+    } else {
+        1.0
+    });
+    let d_max = atom_dim.iter().copied().max().unwrap_or(1);
+    let (analytic_penalties, mut penalties) = public_fit_penalties(
+        isometry_weight,
+        coord_sparsity,
+        sparsity_strength,
+        scad_mcp_gamma,
+        decoder_feature_sparsity_groups,
+        block_orthogonality_weight,
+        nuclear_norm_weight,
+        nuclear_norm_max_rank,
+        decoder_incoherence_weight,
+        k_atoms,
+        d_max,
+        p_out,
+    )
+    .map_err(py_value_error)?;
+    if native_ard_enabled {
+        penalties.push("ARDPenalty".to_string());
+    }
+
+    let raw = sae_manifold_fit_minimal(
+        py,
+        z.clone(),
+        atom_basis.clone(),
+        atom_dim,
+        resolved_alpha,
+        resolved_tau,
+        learnable_alpha,
+        assignment.clone(),
+        sparsity_strength,
+        smoothness,
+        max_iter,
+        resolved_learning_rate,
+        1.0e-6,
+        1.0e-6,
+        gumbel_schedule,
+        analytic_penalties,
+        random_state,
+        top_k,
+        initial_logits,
+        initial_coords,
+        threshold_gate_threshold,
+        native_ard_enabled,
+        fisher_factors.clone(),
+        fisher_mass_residual,
+        fisher_provenance.clone(),
+        row_loss_weights,
+        separation_barrier_strength_override,
+        ordered_beta_bernoulli_alpha_override,
+        promote_from_residual,
+        run_structure_search,
+        run_outer_rho_search,
+        false,
+    )?;
+    let raw = crate::manifold::manifold_sae_coercion::py_any_to_json_value(
+        raw.bind(py).as_any(),
+    )?;
+    let fisher_nested = fisher_factors.map(|array| {
+        array
+            .as_array()
+            .outer_iter()
+            .map(|matrix| matrix.rows().into_iter().map(|row| row.to_vec()).collect())
+            .collect()
+    });
+    let topology_fallback = gam::terms::sae::atom_schema::topology_for_bases(&atom_basis)
+        .unwrap_or_else(|| "mixed".to_string());
+    let config = crate::manifold::manifold_sae_coercion::FitConfig {
+        topology_fallback,
+        assignment,
+        assignment_label: assignment_kind.to_string(),
+        penalties,
+        alpha: resolved_alpha,
+        learnable_alpha,
+        tau: resolved_tau,
+        sparsity_strength,
+        smoothness,
+        learning_rate: resolved_learning_rate,
+        max_iter: i64::try_from(max_iter)
+            .map_err(|_| py_value_error("max_iter exceeds i64".to_string()))?,
+        random_state: i64::try_from(random_state)
+            .map_err(|_| py_value_error("random_state exceeds i64".to_string()))?,
+        top_k: top_k
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| py_value_error("top_k exceeds i64".to_string()))?,
+        threshold_gate_threshold,
+        fisher_factors: fisher_nested,
+        fisher_provenance,
+        declared_bases,
+    };
+    let payload = crate::manifold::manifold_sae_coercion::build_manifold_sae_payload(
+        &raw,
+        crate::manifold::manifold_sae_coercion::column_mean(z_view),
+        &config,
+    )
+    .map_err(py_value_error)?;
+    Py::new(py, crate::ManifoldSaeCore::from_payload(payload)?)
 }
 
 /// Out-of-sample inference: same Newton driver as the fit path, with the

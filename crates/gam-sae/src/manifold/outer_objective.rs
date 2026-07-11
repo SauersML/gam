@@ -725,7 +725,7 @@ pub(crate) fn sae_outer_gradient_capability(plan: SaeStreamingPlan) -> Derivativ
 
 /// The assignment-strength coordinate handled by Hybrid-EFS's full analytic
 /// criterion gradient. Every assignment family with a structurally present
-/// sparse coordinate uses this lane, including learnable ordered-Beta
+/// sparse coordinate uses this lane, including learnable ordered Beta--Bernoulli
 /// concentration: its prior value, inner-mode response, and log-determinant
 /// derivative must be differentiated as one penalized-LAML scalar.
 pub(crate) fn assignment_strength_gradient_coordinate(rho: &SaeManifoldRho) -> Option<usize> {
@@ -2107,7 +2107,7 @@ impl SaeManifoldOuterObjective {
             || err.contains(
                 "undamped evidence factorization hit a non-PD per-row H_tt block before KKT",
             )
-            // #1782 — at a seed ρ, a K>1 jumprelu/softmax (or a rank-deficient
+            // #1782 — at a seed ρ, a K>1 threshold-gate/softmax (or a rank-deficient
             // euclidean/linear) fit's OFF-OPTIMUM inner state can leave the
             // reduced joint-Hessian Schur complement indefinite, so the undamped
             // Schur-complement Cholesky in `run_joint_fit_arrow_schur` /
@@ -2129,7 +2129,7 @@ impl SaeManifoldOuterObjective {
             // and is not silently masked as a recoverable probe.
             || (err.contains("Schur complement Cholesky failed")
                 && err.contains("not positive definite"))
-            // #2087 — at a seed ρ a K>1 jumprelu/threshold-gate assignment can gate an
+            // #2087 — at a seed ρ a K>1 threshold-gate assignment can give an
             // atom OFF at every row, so the sequential-deflation refit's gated design
             // `diag(a_·k)·Φ_k` is all-zero and the reduced joint problem is
             // rank-deficient with an undefined Laplace evidence — the SAME infeasible-ρ
@@ -2902,7 +2902,7 @@ impl SaeManifoldOuterObjective {
             Ok(evaluated) => evaluated,
             // #1782 — the EFS lane IS the SAE seed-startup-VALIDATION lane
             // (`run_fixed_point_outer_solver` → `eval_step(seed)` → `eval_efs` →
-            // `efs_step`). At a seed ρ a K>1 jumprelu/softmax (or rank-deficient
+            // `efs_step`). At a seed ρ a K>1 threshold-gate/softmax (or rank-deficient
             // euclidean/linear) fit's off-optimum inner state can leave the
             // reduced joint-Hessian Schur complement indefinite, so the undamped
             // Laplace factorization refuses ("Schur complement Cholesky failed:
@@ -2976,7 +2976,7 @@ impl SaeManifoldOuterObjective {
         // derivative of the same penalized-LAML scalar returned as `cost`.
         // This includes the explicit assignment-prior derivative, the inner-mode
         // response, and the log-determinant adjoint. In particular, learnable
-        // ordered-Beta concentration must not take a separate occupancy-only
+        // ordered Beta--Bernoulli concentration must not take a separate occupancy-only
         // marginal fixed point: that root omits criterion terms and therefore
         // does not share this objective's stationarity equation.
         if let Some(sparse_index) = rho.sparse_flat_index() {

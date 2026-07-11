@@ -2113,7 +2113,7 @@ mod tests {
         }
     }
 
-    /// The per-atom logistic gate (ordered Beta--Bernoulli/JumpReLU branch) is diagonal in the
+    /// The per-atom logistic gate (ordered Beta--Bernoulli/ThresholdGate branch) is diagonal in the
     /// logits and reproduces `σ' = σ(1−σ)·inv_tau`, `σ'' = σ(1−σ)(1−2σ)·inv_tau²`.
     #[test]
     fn per_atom_logistic_gate_matches_closed_form() {

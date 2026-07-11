@@ -69,7 +69,7 @@ impl AssignmentStrengthLayout {
 /// REML-selected continuous hyperparameters for SAE-manifold.
 #[derive(Debug, Clone)]
 pub struct SaeManifoldRho {
-    /// `log(lambda_sparse)` for softmax entropy or JumpReLU gated L1, or the
+    /// `log(lambda_sparse)` for softmax entropy or ThresholdGate gated L1, or the
     /// learnable `log(alpha)` offset for ordered Beta--Bernoulli assignment.
     pub log_lambda_sparse: f64,
     /// Typed assignment-strength layout. This is assignment-family state, not
@@ -306,7 +306,7 @@ impl SaeManifoldRho {
     /// stiffness `λ/φ_data` dimensionless — but that identity is derived from the
     /// Gaussian penalized-likelihood normal equations on a FIXED linear design.
     /// It is well-founded for the separable-gate modes (softmax entropy /
-    /// JumpReLU gated-L1), whose per-row gates are held at their seed weighting
+    /// ThresholdGate gated-L1), whose per-row gates are held at their seed weighting
     /// while the decoder/coordinates are refit, so `λ/φ` is exactly the effective
     /// stiffness.
     ///
@@ -360,7 +360,7 @@ impl SaeManifoldRho {
         // Hessian indefinite — a non-PD seed whose Laplace evidence log-det is
         // undefined. Because the SAE fit runs a single seed (`max_seeds = 1`),
         // the EFS startup validation then rejects it with "no candidate seeds
-        // passed outer startup validation" (the #1782 softmax / jumprelu failure),
+        // passed outer startup validation" (the #1782 softmax / threshold-gate failure),
         // exactly where ordered_beta_bernoulli — which is never dispersion-weakened — survives.
         //
         // Fix: for K > 1 keep the seed decoder-smoothness / ARD from being

@@ -427,7 +427,6 @@ mod tests {
             SaeFitAssignmentKind::from_tag("threshold_gate"),
             Ok(SaeFitAssignmentKind::ThresholdGate)
         );
-        assert!(SaeFitAssignmentKind::from_tag("jumprelu").is_err());
     }
 
     #[test]

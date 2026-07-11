@@ -125,7 +125,7 @@ pub(crate) fn sae_streaming_plan_from_budget(
         .saturating_mul(SAE_BYTES_PER_F64)
         .saturating_mul(SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER);
     // The matrix-free operator stores per-row Jacobians only over each row's
-    // ACTIVE atoms (sparse assignment: jumprelu / capped softmax) — an
+    // ACTIVE atoms (exact sparse assignment: TopK support) — an
     // `O(N · active · (1+d) · p)` footprint, NOT the dense `O(N · K · (1+d) · p)`
     // that the full `k_atoms · (1+d)` row block implies. Estimating the dense
     // block was the spurious ~7.9 GiB working set that refused a K=256 fit at

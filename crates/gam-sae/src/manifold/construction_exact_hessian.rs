@@ -708,7 +708,7 @@ impl SaeManifoldTerm {
         self.combine_assignment_strength_gradient(rho, logdet_trace, &gamma, &response, "dense")
     }
 
-    /// Exact non-ordered-Beta assignment-strength penalized-LAML gradient on the matrix-free
+    /// Exact non-ordered Beta--Bernoulli assignment-strength penalized-LAML gradient on the matrix-free
     /// evidence path. This is the one coordinate softmax entropy and gated L1
     /// cannot update through a Fellner-Schall equation:
     ///
@@ -848,7 +848,7 @@ impl SaeManifoldTerm {
                     self.row_loss_weights.as_deref(),
                 );
             // ordered Beta--Bernoulli concentration controls only the Beta--Bernoulli prior. The
-            // final posterior-mean gate is `sigmoid(logit/tau)`, so the data
+            // final reconstruction gate is `sigmoid(logit/tau)`, so the data
             // likelihood and its Gauss--Newton blocks have no direct alpha
             // derivative. Structurally fixed assignments have no sparse index
             // and skip this channel entirely.

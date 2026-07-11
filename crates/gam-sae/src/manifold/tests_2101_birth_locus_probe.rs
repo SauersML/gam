@@ -42,7 +42,7 @@ fn lcg_normal(s: &mut u64) -> f64 {
 }
 
 #[test]
-fn probe_2101_birth_locus_disjoint_6circle_ordered_beta() {
+fn probe_2101_birth_locus_disjoint_6circle_ordered_beta_bernoulli() {
     let n = 80usize;
     let p = 16usize;
     let ncirc = 6usize;
@@ -71,7 +71,7 @@ fn probe_2101_birth_locus_disjoint_6circle_ordered_beta() {
         }
     }
 
-    // K=1 ordered_beta seed: one circle atom on dims (0,1), coordinate ALIGNED to circle-0's
+    // K=1 ordered_beta_bernoulli seed: one circle atom on dims (0,1), coordinate ALIGNED to circle-0's
     // TRUE phase so the incumbent fully absorbs its own circle (else it under-fits
     // and the leftover blends into the birth — fit-robustness's decomposition
     // finding; the real pipeline pca-seeds this alignment).
@@ -206,14 +206,14 @@ fn probe_2101_birth_locus_disjoint_6circle_ordered_beta() {
             Some(&mut cb),
             None,
         )
-        .expect("stagewise disjoint-6-circle ordered_beta fit");
+        .expect("stagewise disjoint-6-circle ordered_beta_bernoulli fit");
         let k = res.term.k_atoms();
         let births = res.report.births_accepted;
         log.borrow_mut()
             .push(format!("FINAL: k={k} births={births}"));
         (k, births)
     };
-    eprintln!("\n==== #2101 BIRTH LOCUS TRAJECTORY (disjoint 6-circle ordered_beta) ====");
+    eprintln!("\n==== #2101 BIRTH LOCUS TRAJECTORY (disjoint 6-circle ordered_beta_bernoulli) ====");
     for line in log.borrow().iter() {
         eprintln!("{line}");
     }
@@ -247,7 +247,7 @@ fn probe_2101_birth_locus_disjoint_6circle_ordered_beta() {
 /// before/after. If cos/sin SURVIVE ⇒ the fit is fine and #2101 is purely the
 /// DC-SEED (seed cos/sin, my lane, SEPARATE from #5). If cos/sin COLLAPSE ⇒ the
 /// fit/criterion crushes circles (the ‖B‖→0 / harmonic-row reward — UNIFIED with
-/// fit-robustness's #5). Runs both ordered_beta and softmax gate modes.
+/// fit-robustness's #5). Runs both ordered_beta_bernoulli and softmax gate modes.
 ///
 /// The eprintln! trajectory is the diagnostic; the asserts are the guard. We do
 /// NOT assert survival (that is the open #2101 question) — only the invariants

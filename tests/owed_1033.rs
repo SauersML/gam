@@ -17,7 +17,7 @@
 //! `assemble_arrow_schur`, the inner Newton solve). For one ρ evaluation the
 //! n-sized work is, and each piece DEPENDS on ρ:
 //!
-//!   * per-row assignment gates `a_k = a_k(ρ.lambda_sparse)` (softmax / JumpReLU
+//!   * per-row assignment gates `a_k = a_k(ρ.lambda_sparse)` (softmax / ThresholdGate
 //!     / ordered independent Beta--Bernoulli temperatures), and hence the per-row active-set selection;
 //!   * per-row reconstruction `fitted = Σ_k a_k · B_k φ_k(t_k)`;
 //!   * per-row residuals and any whitening;

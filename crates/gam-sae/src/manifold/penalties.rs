@@ -135,7 +135,7 @@ impl SaeManifoldTerm {
         // are nonzero there, so iterating each row's active atoms and accumulating
         // their outer product yields the IDENTICAL matrix as the dense `k²·n`
         // triple loop — every skipped `(j,k,row)` term had a zero gate factor and
-        // contributed nothing. For the sparse ordered-Beta/Softmax routing this term exists
+        // contributed nothing. For the sparse ordered Beta--Bernoulli/Softmax routing this term exists
         // to regularize, the per-row active set is `≪ K`, so the cost collapses
         // from `O(K²·N)` (35e12 products at K=32768) to `O(N·active²)` with no
         // change to the result — the same coactive-pairs reduction proven exact
@@ -489,11 +489,10 @@ impl SaeManifoldTerm {
     /// (truncated numerator over `J∩K` but full-row denominators `Σ_all a_ik²`),
     /// which was NOT the full normalized coactivation NOR the truncated one — it
     /// systematically UNDER-weighted the barrier for dense-tail (softmax)
-    /// assignments (the full-row denominator inflates the divisor). For structurally
-    /// sparse assignments (JumpReLU hard gate / ordered-Beta MAP) every sub-floor entry is a
-    /// hard zero, so `J` is the full nonzero support, the truncated and full sums
-    /// coincide, and this is EXACTLY the full normalized coactivation to the last
-    /// bit (unchanged from before). Cost is `O(N·K)` to read the gates plus
+    /// assignments (the full-row denominator inflates the divisor). For hard
+    /// TopK assignments every inactive entry is exactly zero, so `J` is the full
+    /// nonzero support, the truncated and full sums coincide, and this is exactly
+    /// the full normalized coactivation. Cost is `O(N·K)` to read the gates plus
     /// `O(Σ_row active_row²)` over the per-row support.
     pub(crate) fn barrier_coactive_pairs(&self) -> Vec<(usize, usize, f64)> {
         self.barrier_coactive_support().0
@@ -507,9 +506,9 @@ impl SaeManifoldTerm {
     /// `per_atom_effective_sample_size` (`fisher_n = Σ w²`) uses, restricted to
     /// the same relative-mass active support as the numerator so numerator,
     /// denominator and softening `ε_C` are one measure
-    /// (for hard-gated routings — JumpReLU/ordered-Beta/TopK — the truncated and full sums
-    /// coincide exactly; for softmax the sub-floor tail is dropped from ALL of
-    /// them consistently). Returned together so the frozen gate can pin both at
+    /// (for hard TopK routing the truncated and full sums coincide exactly; for
+    /// every smooth gate family the sub-floor tail is dropped from all of them
+    /// consistently). Returned together so the frozen gate can pin both at
     /// the same chokepoint.
     pub(crate) fn barrier_coactive_support(&self) -> (Vec<(usize, usize, f64)>, Vec<f64>) {
         let k_atoms = self.k_atoms();
@@ -524,13 +523,11 @@ impl SaeManifoldTerm {
         // the score is a well-defined truncated cosine rather than a hybrid.
         //
         // "Co-firing" on a row means carrying NON-NEGLIGIBLE mass relative to that
-        // row's peak (`SAE_COACTIVE_RELATIVE_MASS_FLOOR`), not merely `a ≠ 0`. For
-        // structurally sparse modes (JumpReLU/ordered Beta--Bernoulli) the active atoms sit far above
-        // the floor and the hard zeros are excluded either way, so the support is
-        // the full nonzero support and the score is the exact full normalized
-        // coactivation. For SOFTMAX the sub-floor tail is dropped from BOTH sums,
-        // keeping the scan `O(N·active²)` and the score consistent with the compact
-        // row layout's cutoff.
+        // row's peak (`SAE_COACTIVE_RELATIVE_MASS_FLOOR`), not merely `a ≠ 0`.
+        // TopK's exact zeros make this its full nonzero support. ThresholdGate,
+        // ordered Beta--Bernoulli, and Softmax instead have smooth finite-logit
+        // tails, which are dropped from both sums so the scan stays
+        // `O(N·active²)` and the truncated cosine remains internally consistent.
         let mut energy = vec![0.0_f64; k_atoms];
         let mut num: std::collections::BTreeMap<(usize, usize), f64> =
             std::collections::BTreeMap::new();
@@ -1736,7 +1733,7 @@ impl SaeManifoldTerm {
                         // refused everything else upfront, so this branch
                         // is total and the K=1 vs K>=2 path is the same
                         // loop. Row-block coord penalties (ARD,
-                        // BlockOrthogonality, Sparsity/TopK/JumpReLU,
+                        // BlockOrthogonality, Sparsity/TopK/ThresholdGate,
                         // RowPrecisionPrior, ScadMcp, Isometry) target the
                         // "t" latent block (n_obs × d) and apply per atom
                         // — accumulate into the corresponding row offsets.

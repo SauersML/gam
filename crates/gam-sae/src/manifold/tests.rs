@@ -482,18 +482,18 @@ pub(crate) fn dictionary_incoherence_report_circle_kappa_matches_inverse_radius(
 /// audit's K==1 special-case bug.
 #[test]
 pub(crate) fn k1_gate_modes_do_not_pin_assignment_to_one() {
-    // ordered Beta--Bernoulli, K=1: the posterior-mean Bernoulli gate is σ(0/τ)=0.5. The ordered
+    // Ordered Beta--Bernoulli, K=1: the neutral sigmoid gate is σ(0/τ)=0.5. The ordered
     // prior is scored separately and never caps the final function.
-    let ordered_beta = SaeAssignment::from_blocks_with_mode(
+    let ordered_beta_bernoulli = SaeAssignment::from_blocks_with_mode(
         array![[0.0]],
         vec![array![[0.0]]],
         AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false),
     )
     .unwrap();
-    let ordered_beta_gate = ordered_beta.try_assignments_row(0).unwrap()[0];
-    assert_abs_diff_eq!(ordered_beta_gate, 0.5, epsilon = 1e-9);
+    let ordered_beta_bernoulli_gate = ordered_beta_bernoulli.try_assignments_row(0).unwrap()[0];
+    assert_abs_diff_eq!(ordered_beta_bernoulli_gate, 0.5, epsilon = 1e-9);
     assert!(
-        (ordered_beta_gate - 1.0).abs() > 1e-6,
+        (ordered_beta_bernoulli_gate - 1.0).abs() > 1e-6,
         "K=1 ordered Beta--Bernoulli must not pin the gate to 1.0"
     );
 
@@ -1423,7 +1423,7 @@ pub(crate) fn snapshot_restore_round_trips_mutated_state() {
 }
 
 #[test]
-pub(crate) fn ordered_beta_path_refreshes_periodic_basis_for_two_newton_iterations() {
+pub(crate) fn ordered_beta_bernoulli_path_refreshes_periodic_basis_for_two_newton_iterations() {
     let coords0 = array![[0.05], [0.20], [0.55], [0.80]];
     let (phi0, jet0) = periodic_basis(&coords0);
     let atom = SaeManifoldAtom::new_with_provided_function_gram(
@@ -2046,8 +2046,8 @@ pub(crate) fn collapse_rescue_projection_matches_train_and_oos_and_refuses_targe
 /// not leak into each other.
 #[test]
 pub(crate) fn per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha() {
-    let (mut term_a, _t_a, rho_a) = small_two_atom_ordered_beta_term();
-    let (mut term_b, _t_b, rho_b) = small_two_atom_ordered_beta_term();
+    let (mut term_a, _t_a, rho_a) = small_two_atom_ordered_beta_bernoulli_term();
+    let (mut term_b, _t_b, rho_b) = small_two_atom_ordered_beta_bernoulli_term();
 
     // Distinct per-fit configs, applied to each term independently.
     term_a.set_fit_config(SaeFitConfig {
@@ -2136,7 +2136,7 @@ pub(crate) fn per_fit_barrier_isolated_under_concurrent_fits() {
             .map(|&mu| {
                 scope.spawn(move || {
                     // Each thread owns its term (a distinct concurrent "fit").
-                    let (mut term, _t, _rho) = small_two_atom_ordered_beta_term();
+                    let (mut term, _t, _rho) = small_two_atom_ordered_beta_bernoulli_term();
                     term.set_fit_config(SaeFitConfig {
                         separation_barrier_strength_override: Some(mu),
                         ordered_beta_bernoulli_alpha_override: None,
@@ -2274,30 +2274,30 @@ pub(crate) fn sae_rho_seed_dispersion_scaling_shifts_every_scale_coupled_axis() 
     // fixed point; the sparse coordinate is a dimensionless log-α concentration
     // offset that was never a squared-output-unit penalty weight. So every ordered Beta--Bernoulli
     // coordinate stays at its absolute (already dimensionless) construction value.
-    for ordered_beta_mode in [
+    for ordered_beta_bernoulli_mode in [
         AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, true),
         AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false),
     ] {
-        let ordered_beta = rho
-            .seed_scaled_by_dispersion_for_assignment(dispersion, ordered_beta_mode)
+        let ordered_beta_bernoulli = rho
+            .seed_scaled_by_dispersion_for_assignment(dispersion, ordered_beta_bernoulli_mode)
             .unwrap();
         assert_abs_diff_eq!(
-            ordered_beta.log_lambda_sparse,
+            ordered_beta_bernoulli.log_lambda_sparse,
             rho.log_lambda_sparse,
             epsilon = 1.0e-14
         );
         assert_abs_diff_eq!(
-            ordered_beta.log_lambda_smooth[0],
+            ordered_beta_bernoulli.log_lambda_smooth[0],
             rho.log_lambda_smooth[0],
             epsilon = 1.0e-14
         );
         assert_abs_diff_eq!(
-            ordered_beta.log_ard[0][0],
+            ordered_beta_bernoulli.log_ard[0][0],
             rho.log_ard[0][0],
             epsilon = 1.0e-14
         );
         assert_abs_diff_eq!(
-            ordered_beta.log_ard[0][1],
+            ordered_beta_bernoulli.log_ard[0][1],
             rho.log_ard[0][1],
             epsilon = 1.0e-14
         );
@@ -2716,7 +2716,7 @@ pub(crate) fn streaming_exact_reml_matches_full_batch_reml_small_sae() {
 /// As [`small_two_atom_periodic_term`], but in ordered independent
 /// Beta--Bernoulli assignment mode. The full-batch and streaming paths must
 /// assemble the same shared-mass-dependent PSD curvature majorizer.
-pub(crate) fn small_two_atom_ordered_beta_term() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+pub(crate) fn small_two_atom_ordered_beta_bernoulli_term() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35]];
     let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45]];
     let (phi0, jet0) = periodic_basis(&coords0);
@@ -2774,7 +2774,7 @@ pub(crate) fn small_two_atom_ordered_beta_term() -> (SaeManifoldTerm, Array2<f64
 /// determinant for an ordered Beta--Bernoulli term at the same fitted state.
 #[test]
 pub(crate) fn streaming_exact_laml_matches_full_batch_ordered_beta_bernoulli() {
-    let (term0, target, rho) = small_two_atom_ordered_beta_term();
+    let (term0, target, rho) = small_two_atom_ordered_beta_bernoulli_term();
     let mut full = term0;
     let (_full_cost, _full_loss, cache) = full
         .penalized_laml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
@@ -5225,7 +5225,7 @@ fn hetero_compat_term(d0: usize, d1: usize) -> SaeManifoldTerm {
 /// #2098 (SPEC-8) / F6 — the heterogeneous-`d_atom` + row-block-penalty guard,
 /// after the F6 composition split. It must refuse a heterogeneous dictionary
 /// ONLY when a *non-composing*, fixed-`d` structural row-block penalty is present
-/// (block-orthogonality / TopK / JumpReLU / row-precision), and ADMIT the
+/// (block-orthogonality / TopK / ThresholdGate / row-precision), and ADMIT the
 /// dim-adaptive penalties that compose per atom (SCAD-MCP, sparsity, native ARD,
 /// isometry) — those are exactly what the flagship evidence-heterogeneous
 /// dictionary + gauge/ARD machinery need to run together.

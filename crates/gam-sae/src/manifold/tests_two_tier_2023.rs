@@ -6,8 +6,8 @@
 //! place merge bugs hide: atom order, logit column hstack, per-atom coords/ungated
 //! append, and rho (log_lambda_smooth / log_ard / global log_lambda_sparse) merge.
 //! Fitted-additivity `merged.fitted() == a.fitted() + b.fitted()` is exact only
-//! for independent-gate modes (JumpReLU/ordered Beta--Bernoulli) and is asserted in the two-tier
-//! integration test on a JumpReLU fixture (softmax re-normalizes over merged K).
+//! for independent-gate modes (ThresholdGate/ordered Beta--Bernoulli) and is asserted in the two-tier
+//! integration test on a ThresholdGate fixture (softmax re-normalizes over merged K).
 #[cfg(test)]
 mod tests {
     use crate::manifold::tests::small_two_atom_periodic_term;
@@ -90,9 +90,9 @@ mod tests {
     }
 
     #[test]
-    fn merge_tiers_is_exactly_additive_under_jumprelu_gates() {
+    fn merge_tiers_is_exactly_additive_under_threshold_gates() {
         // The load-bearing guarantee: for an INDEPENDENT-GATE mode (ThresholdGate,
-        // aka JumpReLU) each atom's gate is a function of its own logit alone, so
+        // ThresholdGate) each atom's gate is a function of its own logit alone, so
         // concatenating the two tiers' atoms makes the reconstruction exactly the
         // sum of the tiers' reconstructions — the mathematical premise the two-tier
         // fit-order's "curved tier explains the whitened residual" relies on. Under
@@ -100,7 +100,7 @@ mod tests {
         // is why the ORCHESTRATION restricts to independent-gate modes.
         let (mut a_term, _at, a_rho) = small_two_atom_periodic_term();
         let (mut b_term, _bt, b_rho) = small_two_atom_periodic_term();
-        // Convert the softmax fixture to an independent-gate (JumpReLU) mode on
+        // Convert the softmax fixture to an independent ThresholdGate mode on
         // BOTH tiers; the logits/coords/decoders are untouched, so the per-atom
         // gates are well-defined and identical to what the merged term will see.
         let gate = crate::assignment::AssignmentMode::threshold_gate(1.0, 0.0);
@@ -122,7 +122,7 @@ mod tests {
 
         let (merged, merged_rho) =
             crate::manifold::SaeManifoldTerm::merge_tiers(a_term, &a_rho, b_term, &b_rho)
-                .expect("merge two JumpReLU tiers");
+                .expect("merge two ThresholdGate tiers");
         let fm = merged
             .try_fitted_for_rho(&merged_rho)
             .expect("merged reconstruction");
@@ -135,7 +135,7 @@ mod tests {
         }
         assert!(
             max_abs < 1e-12,
-            "JumpReLU merge must be EXACTLY additive; max |merged - (a+b)| = {max_abs}"
+            "ThresholdGate merge must be EXACTLY additive; max |merged - (a+b)| = {max_abs}"
         );
         // Sanity: the tiers actually contribute (guards against a vacuous 0+0=0).
         let fa_norm: f64 = fa.iter().map(|x| x * x).sum::<f64>().sqrt();

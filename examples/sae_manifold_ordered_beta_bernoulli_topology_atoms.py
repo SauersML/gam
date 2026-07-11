@@ -87,7 +87,7 @@ def main() -> None:
     axes[0].set_xlabel("atom")
     axes[0].set_ylabel("observation")
     axes[1].imshow(fit.assignments[order], aspect="auto", vmin=0.0, vmax=1.0)
-    axes[1].set_title("ordered Beta assignments")
+    axes[1].set_title("ordered Beta--Bernoulli assignments")
     axes[1].set_xlabel("atom")
     axes[2].scatter(x[:, 0], x[:, 1], s=12, alpha=0.55, label="data")
     axes[2].scatter(fit.fitted[:, 0], fit.fitted[:, 1], s=8, alpha=0.55, label="fit")

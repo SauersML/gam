@@ -260,11 +260,11 @@ fn sae_ift_uses_exact_stationarity_jacobian_softmax_high_residual_1418() {
     assert_full_gradient_matches_fd("softmax_high_residual", &f);
 }
 
-/// #1418 (JumpReLU): isolates the residual-curvature channel of `ΔC` (no entropy
+/// #1418 (ThresholdGate): isolates the residual-curvature channel of `ΔC` (no entropy
 /// majorizer in gate modes), so this arm is a clean test that the dropped
 /// Gauss-Newton residual curvature `⟨r, ∂²f⟩` is restored in the implicit step.
 #[test]
-fn sae_ift_uses_exact_stationarity_jacobian_jumprelu_high_residual_1418() {
+fn sae_ift_uses_exact_stationarity_jacobian_threshold_gate_high_residual_1418() {
     let f = high_residual_curvature_fixture(AssignmentMode::threshold_gate(0.7, 0.0), -1.0);
-    assert_full_gradient_matches_fd("jumprelu_high_residual", &f);
+    assert_full_gradient_matches_fd("threshold_gate_high_residual", &f);
 }

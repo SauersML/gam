@@ -52,11 +52,11 @@ impl SaeManifoldTerm {
     /// Seed ordered Beta--Bernoulli assignment logits from a box-constrained least-squares decode of
     /// each held-out row.
     ///
-    /// For every row, coordinate descent recovers posterior-mean Bernoulli gates
+    /// For every row, coordinate descent recovers bounded reconstruction gates
     /// in `[0,1]`; the seeded logit is their temperature-scaled inverse sigmoid.
     /// Ordered shrinkage is applied by the ordered Beta--Bernoulli prior during fitting, not as a
     /// second cap in this reconstruction seed.
-    pub fn seed_oos_ordered_beta_logits_from_projected_decoder_lsq(
+    pub fn seed_oos_ordered_beta_bernoulli_logits_from_projected_decoder_lsq(
         &mut self,
         target: ArrayView2<'_, f64>,
         tau: f64,

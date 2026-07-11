@@ -376,7 +376,7 @@ impl SaeManifoldTerm {
     /// not in this merge — see below.
     ///
     /// Fitted-additivity `merged.fitted() == primary.fitted() + secondary.fitted()`
-    /// holds EXACTLY for independent-gate modes (JumpReLU / ordered Beta--Bernoulli, where each atom's
+    /// holds EXACTLY for independent-gate modes (ThresholdGate / ordered Beta--Bernoulli, where each atom's
     /// gate is computed independently); under Softmax the gate re-normalizes over
     /// the merged `K`, so the merge is a WARM START into the joint objective (the
     /// two-tier driver's final joint polish reconciles it).
@@ -2155,7 +2155,7 @@ impl SaeManifoldTerm {
                      has cross-row structure and cannot be expressed in the \
                      arrow-Schur row layout. Use only row-block-supported \
                      coord penalties (ARD, BlockOrthogonality, \
-                     Sparsity/TopK/JumpReLU, RowPrecisionPrior, \
+                     Sparsity/TopK/ThresholdGate, RowPrecisionPrior, \
                      ParametricRowPrecisionPrior, ScadMcp, Isometry) on the \
                      coord latent block, or move the penalty to a non-SAE \
                      term",
@@ -2166,7 +2166,7 @@ impl SaeManifoldTerm {
             // (per-atom-additive, dim-adaptive: ScadMcp / Sparsity / native ARD /
             // Isometry) dispatches cleanly on a mixed dictionary, so it never
             // forces a uniform `atom_dim`. Only the fixed-`d` structural
-            // penalties (BlockOrthogonality, TopK/JumpReLU, row-precision) do.
+            // penalties (BlockOrthogonality, TopK/ThresholdGate, row-precision) do.
             if !sae_row_block_penalty_composes_over_heterogeneous_coord_dims(penalty) {
                 non_composing_row_block = Some(penalty.name());
             }
@@ -2180,7 +2180,7 @@ impl SaeManifoldTerm {
                          atoms have heterogeneous coord latent dims (saw {first} \
                          and {mismatch}). This penalty carries a fixed per-axis \
                          structure bound to one shared `d` (BlockOrthogonality \
-                         reshapes to `(n_eff × d)` and groups axes; TopK/JumpReLU \
+                         reshapes to `(n_eff × d)` and groups axes; TopK/ThresholdGate \
                          hold per-axis thresholds; the row-precision priors hold a \
                          `(n_eff × d × d)` stack), so per-atom dispatch with mixed \
                          `d_k` would silently truncate or expand axes. Configure all \
@@ -2199,7 +2199,7 @@ impl SaeManifoldTerm {
     /// dictionary is compatible with the *dim-adaptive* row-block "t"-block
     /// penalties (native ARD / SCAD-MCP coord sparsity / sparsity / isometry) but
     /// incompatible with the *fixed-`d` structural* ones (block-orthogonality,
-    /// TopK/JumpReLU, row-precision priors).
+    /// TopK/ThresholdGate, row-precision priors).
     ///
     /// The dim-adaptive penalties are per-atom-additive and read each atom's own
     /// `d_k` (`ScadMcp`/`Sparsity` iterate the flat block element-wise; native
@@ -2264,7 +2264,7 @@ impl SaeManifoldTerm {
             "SAE-manifold fit refuses row-block analytic penalty {:?} on heterogeneous \
              atom coordinate dims (saw {first} and {mismatch}): this penalty carries a \
              fixed per-axis structure bound to one shared `d` (BlockOrthogonality reshapes \
-             to `(n_eff × d)` and groups axes; TopK/JumpReLU hold per-axis thresholds; the \
+             to `(n_eff × d)` and groups axes; TopK/ThresholdGate hold per-axis thresholds; the \
              row-precision priors hold a `(n_eff × d × d)` stack), so mixed per-atom \
              coordinate dims cannot be dispatched (they would silently truncate or pad axes). \
              Either configure a uniform atom_dim for all atoms, or drop this penalty. The \

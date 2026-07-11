@@ -169,7 +169,7 @@ fn lcg_normal(s: &mut u64) -> f64 {
     (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
 }
 
-/// A K-atom periodic term over `(n, p)` with a softmax assignment (non-ordered-Beta, so the
+/// A K-atom periodic term over `(n, p)` with a softmax assignment (non-ordered Beta--Bernoulli, so the
 /// streaming reduced-Schur log-det has a matrix-free route). Each atom carries the
 /// `TestPeriodicEvaluator` — REQUIRED by the streaming path, which re-evaluates
 /// Φ(t) per chunk via `materialize_chunk` — and a distinct nonzero decoder so the
@@ -319,13 +319,13 @@ fn wide_border_routes_to_streaming_without_fake_gradient_certificate() {
         .expect("matrix-free-admitted plan must not hard-error at the admission gate");
 }
 
-/// Hybrid-EFS must replace the former held-zero non-ordered-Beta assignment coordinate
+/// Hybrid-EFS must replace the former held-zero non-ordered Beta--Bernoulli assignment coordinate
 /// with the exact penalized-LAML derivative and expose that same root-equivalent update to
 /// the final fixed-point proof hook. This dense fixture exercises the exact dense
 /// sibling cheaply; the complete-gradient parity test below pins the matrix-free
 /// sibling to identical math.
 #[test]
-fn fixed_point_certificate_covers_non_ordered_beta_exact_gradient() {
+fn fixed_point_certificate_covers_non_ordered_beta_bernoulli_exact_gradient() {
     let make_objective = || {
         let (term, target, rho) = small_two_atom_periodic_term();
         let rho_flat = rho.to_flat();
@@ -338,7 +338,7 @@ fn fixed_point_certificate_covers_non_ordered_beta_exact_gradient() {
     let (mut iteration_objective, rho) = make_objective();
     let iteration = iteration_objective
         .eval_efs(&rho)
-        .expect("non-ordered-Beta EFS startup evaluation");
+        .expect("non-ordered Beta--Bernoulli EFS startup evaluation");
     let gradient = iteration
         .psi_gradient
         .as_ref()
@@ -371,12 +371,12 @@ fn fixed_point_certificate_covers_non_ordered_beta_exact_gradient() {
     }
 }
 
-/// Learnable ordered-Beta concentration uses the same complete criterion
+/// Learnable ordered Beta--Bernoulli concentration uses the same complete criterion
 /// derivative as every other assignment-strength coordinate. This guards
 /// against reintroducing the removed occupancy-only alpha fixed point, whose
 /// stationarity equation omitted the inner response and log-determinant terms.
 #[test]
-fn fixed_point_certificate_covers_ordered_beta_complete_gradient() {
+fn fixed_point_certificate_covers_ordered_beta_bernoulli_complete_gradient() {
     let make_objective = || {
         let (mut term, target, mut rho) = small_two_atom_periodic_term();
         term.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.8, 1.0, true);
@@ -391,7 +391,7 @@ fn fixed_point_certificate_covers_ordered_beta_complete_gradient() {
     let (mut iteration_objective, rho) = make_objective();
     let iteration = iteration_objective
         .eval_efs(&rho)
-        .expect("ordered-Beta EFS startup evaluation");
+        .expect("ordered Beta--Bernoulli EFS startup evaluation");
     let gradient = iteration
         .psi_gradient
         .as_ref()
@@ -407,19 +407,19 @@ fn fixed_point_certificate_covers_ordered_beta_complete_gradient() {
     let (mut proof_objective, proof_rho) = make_objective();
     let proof = proof_objective
         .eval_fixed_point_certificate(&proof_rho)
-        .expect("ordered-Beta fixed-point proof hook must evaluate");
+        .expect("ordered Beta--Bernoulli fixed-point proof hook must evaluate");
     match &proof.coordinates[0] {
         FixedPointCoordinateCertificate::Covered { update, scale } => {
             assert_abs_diff_eq!(*update, iteration.steps[0], epsilon = 1.0e-12);
             assert_eq!(*scale, 1.0);
         }
         FixedPointCoordinateCertificate::Uncovered { reason } => panic!(
-            "the complete ordered-Beta concentration derivative must certify this coordinate: {reason}"
+            "the complete ordered Beta--Bernoulli concentration derivative must certify this coordinate: {reason}"
         ),
     }
 }
 
-/// The non-ordered-Beta assignment-strength `0.5 tr(H^-1 dH/dlog_lambda_sparse)` channel
+/// The non-ordered Beta--Bernoulli assignment-strength `0.5 tr(H^-1 dH/dlog_lambda_sparse)` channel
 /// must be reconstructible from the same reduced-Schur inverse-probe bundle as
 /// the smoothness, ARD, and theta-adjoint channels. Full-basis probes with exact
 /// dense `S^-1` make the bundle identity exact, so this isolates the new matrix-

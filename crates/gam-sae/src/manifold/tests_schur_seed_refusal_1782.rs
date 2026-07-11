@@ -26,7 +26,7 @@ fn schur_non_pd_seed_refusal_message() -> String {
     )
 }
 
-/// #1782 regression — at a seed ρ, a K>1 `jumprelu`/`softmax` (or a
+/// #1782 regression — at a seed ρ, a K>1 `threshold_gate`/`softmax` (or a
 /// rank-deficient `euclidean`/`linear`) fit's OFF-OPTIMUM inner state can leave
 /// the reduced joint-Hessian Schur complement indefinite, so the undamped
 /// Laplace factorization refuses with an `ArrowSchurError::SchurFactorFailed`
@@ -85,7 +85,7 @@ pub(crate) fn non_pd_schur_seed_refusal_is_recoverable_1782() {
 /// #1782 — the fixed-point seed-startup VALIDATION lane (`eval_efs` → `efs_step`)
 /// is the lane SAE seeds are validated on (`fixed_point_available == true` →
 /// `Solver::Efs`; `run_fixed_point_outer_solver` rejects the seed when
-/// `eval_step` errors). Drive a K>1 `jumprelu` euclidean term through the full
+/// `eval_step` errors). Drive a K>1 `threshold_gate` euclidean term through the full
 /// outer cascade on planted-circle data and assert it does NOT die with the
 /// "no candidate seeds passed outer startup validation" abort — i.e. at least one
 /// seed passes startup validation and the fit runs to a result. Uses the same
@@ -93,7 +93,7 @@ pub(crate) fn non_pd_schur_seed_refusal_is_recoverable_1782() {
 /// infeasible-ρ seed refusal would empty the candidate set exactly as in the
 /// issue.
 #[test]
-pub(crate) fn planted_circle_multi_atom_jumprelu_clears_startup_validation_1782() {
+pub(crate) fn planted_circle_multi_atom_threshold_gate_clears_startup_validation_1782() {
     use gam_solve::rho_optimizer::OuterProblem;
     use gam_solve::seeding::SeedConfig;
 
@@ -102,7 +102,7 @@ pub(crate) fn planted_circle_multi_atom_jumprelu_clears_startup_validation_1782(
     let z = planted_circle_embedded(n, 6, 0.03);
     let p = z.ncols();
     // K>1 euclidean (constant+linear) atoms sharing one 1-D coordinate, with a
-    // jumprelu (threshold-gate) assignment — the non-ordered_beta assignment / non-circle
+    // ThresholdGate assignment — the non-ordered_beta_bernoulli assignment / non-circle
     // topology combination the issue reports as failing.
     let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| (row as f64 / n as f64) - 0.5);
     let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 1).unwrap());
@@ -164,10 +164,10 @@ pub(crate) fn planted_circle_multi_atom_jumprelu_clears_startup_validation_1782(
         let msg = err.to_string();
         assert!(
             !msg.contains("no candidate seeds passed outer startup validation"),
-            "#1782: K>1 jumprelu euclidean fit must not abort with an emptied seed cascade; got: {msg}"
+            "#1782: K>1 threshold-gate euclidean fit must not abort with an emptied seed cascade; got: {msg}"
         );
     }
     // The fit produced a result (converged or best-so-far); the startup
     // validation accepted the seed, which is the #1782 contract.
-    result.expect("#1782: multi-atom jumprelu fit must run to a result, not a seed-cascade abort");
+    result.expect("#1782: multi-atom threshold-gate fit must run to a result, not a seed-cascade abort");
 }

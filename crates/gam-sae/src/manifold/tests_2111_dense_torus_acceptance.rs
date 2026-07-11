@@ -7,7 +7,7 @@
 //! EVERY circle (density 6 — the degenerate regime where single-plane ring-ness
 //! fails and only 4th-order ISA separates the factors), distinct amplitudes
 //! `1.0 … 0.55`, independent angles, small isotropic noise. This is the
-//! `probe_2101_birth_locus_disjoint_6circle_ordered_beta` structure at a sample size
+//! `probe_2101_birth_locus_disjoint_6circle_ordered_beta_bernoulli` structure at a sample size
 //! (`n = 700`) clear of the dense-case small-sample floor (`n ≥ 300`; the
 //! gated-edge `ISA_SUBSAMPLE_FLOOR` resolution bound concerns `q → ½` gates,
 //! not this density-1 fixture).
@@ -160,7 +160,7 @@ fn seed_term(coords0: &Array2<f64>, p: usize) -> (SaeManifoldTerm, SaeManifoldRh
     // competition (probabilities sum to 1) and its entropy sparsity prior
     // maximally penalises exactly the dense co-activation the fixture requires,
     // so no born circle can clear the frozen-ρ evidence gate. This matches the
-    // `probe_2101_birth_locus_disjoint_6circle_ordered_beta` structure this test
+    // `probe_2101_birth_locus_disjoint_6circle_ordered_beta_bernoulli` structure this test
     // reproduces (see the module docstring) and every sibling circle-recovery
     // fixture (#2027/#2089/#2101), all of which seed `ordered_beta_bernoulli(0.7, 1.0, false)`.
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(

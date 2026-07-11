@@ -6,7 +6,7 @@
 //!   - dense `(q × beta_dim)` `H_tβ` cross-block where `q = K*(1 + d)`
 //!   - dense `q × q` per-row `H_tt^(i)` block
 //!   - dense `beta_dim × beta_dim` `sys.hbb` shared block (beta_dim = K*M*p)
-//!   - both Softmax and JumpReLU assignment variants
+//!   - both Softmax and ThresholdGate assignment variants
 //!   - Direct and InexactPCG solve modes
 //!
 //! Assertions are weak (finite, non-NaN) to survive future algorithmic
@@ -125,14 +125,14 @@ fn k8_softmax_assembly_is_finite() {
 }
 
 #[test]
-fn k8_jumprelu_assembly_is_finite() {
+fn k8_threshold_gate_assembly_is_finite() {
     let mut f = build_fixture(8, 4, 1, 500, 2, AssignmentMode::threshold_gate(1.0, 0.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
         .unwrap_or_else(|e| panic!("assemble_arrow_schur failed: {e}"));
-    assert_finite_vec(sys.gb.as_slice().unwrap(), "k8_jumprelu gb");
-    assert_finite_vec(sys.hbb.as_slice().unwrap(), "k8_jumprelu hbb");
+    assert_finite_vec(sys.gb.as_slice().unwrap(), "k8_threshold_gate gb");
+    assert_finite_vec(sys.hbb.as_slice().unwrap(), "k8_threshold_gate hbb");
 }
 
 #[test]
@@ -179,14 +179,14 @@ fn k16_softmax_assembly_is_finite() {
 }
 
 #[test]
-fn k16_jumprelu_assembly_is_finite() {
+fn k16_threshold_gate_assembly_is_finite() {
     let mut f = build_fixture(16, 4, 1, 500, 2, AssignmentMode::threshold_gate(1.0, 0.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
         .unwrap_or_else(|e| panic!("assemble_arrow_schur failed: {e}"));
-    assert_finite_vec(sys.gb.as_slice().unwrap(), "k16_jumprelu gb");
-    assert_finite_vec(sys.hbb.as_slice().unwrap(), "k16_jumprelu hbb");
+    assert_finite_vec(sys.gb.as_slice().unwrap(), "k16_threshold_gate gb");
+    assert_finite_vec(sys.hbb.as_slice().unwrap(), "k16_threshold_gate hbb");
 }
 
 #[test]
@@ -219,14 +219,14 @@ fn k32_softmax_assembly_is_finite() {
 }
 
 #[test]
-fn k32_jumprelu_assembly_is_finite() {
+fn k32_threshold_gate_assembly_is_finite() {
     let mut f = build_fixture(32, 8, 1, 500, 2, AssignmentMode::threshold_gate(1.0, 0.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
         .unwrap_or_else(|e| panic!("assemble_arrow_schur failed: {e}"));
-    assert_finite_vec(sys.gb.as_slice().unwrap(), "k32_jumprelu gb");
-    assert_finite_vec(sys.hbb.as_slice().unwrap(), "k32_jumprelu hbb");
+    assert_finite_vec(sys.gb.as_slice().unwrap(), "k32_threshold_gate gb");
+    assert_finite_vec(sys.hbb.as_slice().unwrap(), "k32_threshold_gate hbb");
 }
 
 #[test]
@@ -463,7 +463,7 @@ fn row_block_dim_matches_k_times_one_plus_d() {
 
 // ---------------------------------------------------------------------------
 // Gate-mode row block dimension probe (#1442): confirms q = K + K*d for the
-// gate-style assignment families (JumpReLU / ordered independent Beta--Bernoulli), which keep ALL K
+// smooth gate-style assignment families (ThresholdGate / ordered independent Beta--Bernoulli), which keep ALL K
 // assignment coordinates because there is no probability-simplex constraint and
 // hence no fixed reference logit. This is exactly one coordinate larger than the
 // Softmax convention q = (K-1) + K*d pinned by

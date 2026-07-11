@@ -209,7 +209,8 @@ pub(crate) const SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET: usize = 3;
 pub enum AssignmentMode {
     /// Row-wise simplex assignment with entropy sparsity.
     Softmax { temperature: f64, sparsity: f64 },
-    /// Deterministic concrete posterior means for a truncated ordered Beta--Bernoulli active set:
+    /// Deterministic sigmoid relaxation for an ordered independent
+    /// Beta--Bernoulli active set:
     /// `a_k = σ(logit_k/temperature)`. These are independent Bernoulli gates,
     /// not mixture/simplex responsibilities. The ordered geometric mean schedule
     /// `π_k = (α/(α+1))^{k+1}` is scored once by the ordered Beta--Bernoulli prior; it is not
@@ -282,7 +283,7 @@ impl AssignmentMode {
         }
     }
 
-    /// #1777 — construct the hard-sigmoid [`Self::ThresholdGate`].
+    /// Construct the smooth threshold-centered logistic [`Self::ThresholdGate`].
     #[must_use]
     pub fn threshold_gate(temperature: f64, threshold: f64) -> Self {
         Self::ThresholdGate {
@@ -1087,14 +1088,14 @@ pub fn default_ordered_beta_bernoulli_concentration_for_k_atoms(k_atoms: usize) 
     alpha.max(1.0)
 }
 
-/// Posterior-mean Bernoulli activations for the ordered Beta--Bernoulli assignment model.
+/// Sigmoid activations for the ordered Beta--Bernoulli assignment model.
 ///
 /// Ordered shrinkage belongs to the Beta--Bernoulli prior scored by
 /// [`OrderedBetaBernoulliPenalty`], not as a second multiplicative factor on the final
 /// reconstruction. Multiplying by the prior mean capped atom `k` at `mu_k < 1`
-/// even when its posterior inclusion probability was one, double-counted the
-/// prior, and made the fitted function depend on atom index. The concrete
-/// posterior mean is therefore simply `sigmoid(logit_k / temperature)`.
+/// even when its learned gate approached one, double-counted the prior and made
+/// the fitted function depend on atom index. The reconstruction gate is simply
+/// `sigmoid(logit_k / temperature)`.
 pub fn ordered_beta_bernoulli_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
@@ -1534,9 +1535,8 @@ pub(crate) fn assignment_prior_value_weighted(
             temperature,
             threshold,
         } => {
-            // Sparsity penalty uses the same threshold-centered surrogate and
-            // machine-precision support as its gradient/Hessian. Data-fit
-            // reconstruction remains hard-gated by `threshold_gate_row`.
+            // Sparsity penalty and reconstruction use the same smooth
+            // threshold-centered logistic gate as the gradient and Hessian.
             let sparsity_strength = rho.lambda_sparse();
             let k = assignment.k_atoms();
             let mut acc = 0.0;

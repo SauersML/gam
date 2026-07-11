@@ -54,7 +54,7 @@ fn fixture(mode: AssignmentMode, log_lambda_sparse: f64) -> Fixture {
         coords[1][[row, 0]] = (phase + 0.18).fract();
         let route = if row < n / 2 { 1.7 } else { -1.7 };
         logits[[row, 0]] = route;
-        // A genuine second active gate so the ordered independent Beta--Bernoulli / JumpReLU per-atom logits all
+        // A genuine second active gate so the ordered independent Beta--Bernoulli / ThresholdGate per-atom logits all
         // sit inside their optimization bands (softmax ignores the absolute
         // level, gate modes do not).
         logits[[row, 1]] = if row % 3 == 0 { 0.9 } else { 0.3 };
@@ -311,11 +311,11 @@ fn sae_outer_rho_gradient_certificate_consistent_under_rank_deficient_k2() {
 }
 
 #[test]
-fn sae_outer_rho_gradient_components_match_centered_fd_jumprelu() {
-    // JumpReLU with the threshold below the active logits so both gates sit in
+fn sae_outer_rho_gradient_components_match_centered_fd_threshold_gate() {
+    // ThresholdGate with the threshold below the active logits so both gates sit in
     // the optimization band and the sigmoid-sparsity third channel is live.
     let f = fixture(AssignmentMode::threshold_gate(0.7, 0.0), -1.5);
-    assert_full_gradient_matches_fd("jumprelu", &f);
+    assert_full_gradient_matches_fd("threshold_gate", &f);
 }
 
 #[test]

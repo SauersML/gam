@@ -395,7 +395,7 @@ impl SaeManifoldTerm {
                     // The support IS the layout: TopK gates are exactly {0, 1},
                     // so the compact row block is precisely the k support atoms —
                     // no cutoff heuristics, no near-threshold population, and the
-                    // per-token block is bounded at `k·(1+d)` BY CONSTRUCTION
+                    // per-token block is bounded at `k·d` BY CONSTRUCTION
                     // (the #2071 block-size contract holds with equality).
                     // Independent read-only per-row builds → order-preserving
                     // parallel collect is bit-identical to the serial push.
@@ -870,7 +870,7 @@ impl SaeManifoldTerm {
                             (q_active, jac_compact)
                         } else {
                             // Fresh per-row Jacobian, structurally identical to the
-                            // JumpReLU branch: every (q × p) element is unconditionally
+                            // ThresholdGate branch: every (q × p) element is unconditionally
                             // overwritten below (assignment-chart JVP rows + coordinate rows), so the
                             // `Array2::zeros` allocation needs no separate `fill(0.0)` and
                             // the populated buffer is returned by move without a clone.
@@ -1167,7 +1167,7 @@ impl SaeManifoldTerm {
                         // so no `q_i × β_dim` slab is ever materialized.
                         //
                         // Only the row's active atoms contribute `a_phi` support and data
-                        // curvature: in a compact layout (JumpReLU gate or large-K
+                        // curvature: in a compact layout (TopK support)
                         // top-`k_active` truncation) the inactive atoms carry zero (gated)
                         // or sub-cutoff assignment mass and are excluded — this is what
                         // keeps both the htbeta support and the `G` accumulation

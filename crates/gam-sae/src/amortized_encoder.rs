@@ -872,8 +872,9 @@ impl LearnedAmortizedEncoder {
         };
         let coord_abs_err_quantiles = quantiles_5(&mut abs_errs);
         // Support agreement is defined in assignment space. This is invariant
-        // to softmax logit shifts and automatically includes the hard threshold
-        // and ordered-ordered Beta--Bernoulli prior shrinkage already present in the fitted masses.
+        // to softmax logit shifts and automatically includes the smooth
+        // threshold-centered and ordered Beta--Bernoulli shrinkage already
+        // present in the fitted masses.
         let mut agree = 0usize;
         let total = n * k;
         for row in 0..n {

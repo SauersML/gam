@@ -310,7 +310,7 @@ impl SaeManifoldTerm {
     /// #736 guard) — keeping this single-source hand path guarded against the
     /// forgotten-channel bug class.
     ///
-    /// Softmax-only: the per-atom-logistic (ordered Beta--Bernoulli / JumpReLU) modes keep the jet
+    /// Softmax-only: the per-atom-logistic (ordered Beta--Bernoulli / ThresholdGate) modes keep the jet
     /// path (their hand gate prior diverged from the live ordered-geometric
     /// prior, so routing them through the jet is the value-preserving choice).
     fn fill_row_jets_hand_softmax(

@@ -380,14 +380,14 @@ pub(crate) fn ordered_beta_bernoulli_fixed_alpha_assignment_value_matches_logit_
 }
 
 #[test]
-pub(crate) fn jumprelu_assignment_value_matches_logit_gradient_fd() {
+pub(crate) fn threshold_gate_assignment_value_matches_logit_gradient_fd() {
     let n = 4usize;
     let k = 2usize;
     let temperature = 0.35_f64;
     let threshold = 0.1_f64;
     let logits =
         Array2::<f64>::from_shape_vec((n, k), vec![-13.0, -0.2, 0.0, 0.05, 0.15, 0.4, 0.9, 1.5])
-            .expect("valid JumpReLU logit grid");
+            .expect("valid ThresholdGate logit grid");
     let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
     let manifolds = vec![LatentManifold::Circle { period: 1.0 }; k];
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
@@ -396,10 +396,10 @@ pub(crate) fn jumprelu_assignment_value_matches_logit_gradient_fd() {
         manifolds,
         AssignmentMode::threshold_gate(temperature, threshold),
     )
-    .expect("valid JumpReLU assignment");
+    .expect("valid ThresholdGate assignment");
     let rho = SaeManifoldRho::new(0.7_f64.ln(), -6.0, vec![Array1::<f64>::zeros(1); k]);
     let (grad, _) =
-        assignment_prior_grad_hdiag(&assignment, &rho).expect("JumpReLU assignment gradient");
+        assignment_prior_grad_hdiag(&assignment, &rho).expect("ThresholdGate assignment gradient");
     let idx = 4usize;
     let step = 1.0e-6_f64;
     let mut plus = assignment.clone();
