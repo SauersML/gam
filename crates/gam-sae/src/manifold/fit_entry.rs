@@ -998,15 +998,12 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     // #977 / #1230 — recompute the joint-Hessian shape bands when structure
     // search changed the model OR a finalization fallback fired: the pre-search
     // bands are stale. Rebuild the JOINT inverse-Hessian bands from the FINAL
-    // term + ρ for EVERY atom (seed and born); on a non-PD post-search Hessian
-    // fall back to the per-atom Laplace completion below.
+    // term + ρ for EVERY atom (seed and born). Failure to reform the final
+    // joint covariance is an inference failure, not a reason to substitute a
+    // different per-atom covariance model.
     if structure_changed || finalization_invalidated_shape_uncertainty {
         let joint_registry = registry.clone();
-        // Snapshot the fitted term: the optional joint recompute mutates `term`
-        // while re-solving, so a recoverable refusal must not leave the actual
-        // fitted model perturbed. Restore it before degrading to per-atom bands.
-        let saved_term_for_shape_recompute = term.clone();
-        match term.recompute_joint_shape_uncertainty(
+        shape_uncertainty = term.recompute_joint_shape_uncertainty(
             z.view(),
             &rho,
             Some(&joint_registry),
@@ -1014,32 +1011,21 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
             learning_rate,
             ridge_ext_coord,
             ridge_beta,
-        ) {
-            Ok(joint) => {
-                shape_uncertainty = joint;
-                // The certificate dispersion was seeded from the (now stale)
-                // pre-search φ̂; refresh it to the joint recompute's final value.
-                term.set_certificate_dispersion(shape_uncertainty.dispersion)?;
-            }
-            Err(e) => {
-                term = saved_term_for_shape_recompute;
-                // The joint factor could not be reformed at the final state. Fall
-                // back to the per-atom Laplace completion: invalidate the stale
-                // joint bands so `complete_born_atom_shape_bands` refills each from
-                // its OWN penalized inner Hessian.
-                log::warn!(
-                    "[shape-uncertainty] joint band recompute after structure/finalization \
-                     change failed ({e}); falling back to per-atom Laplace bands"
-                );
-                shape_uncertainty.invalidate_bands_for_recompute();
-            }
-        }
+        )?;
+        // The certificate dispersion was seeded from the (now stale) φ̂;
+        // refresh it to the final joint recompute's value.
+        term.set_certificate_dispersion(shape_uncertainty.dispersion)?;
     }
-    // Backstop: fill any atom the joint factor left unidentified (all-NaN) — a
-    // structure-search-born atom the pre-search Schur never covered, or a
-    // degenerate joint block — from its own inner Hessian. A no-op after a
-    // successful joint recompute.
-    term.complete_born_atom_shape_bands(&mut shape_uncertainty)?;
+    if shape_uncertainty.atoms.len() != term.k_atoms()
+        || shape_uncertainty
+            .atoms
+            .iter()
+            .any(|atom| atom.band_sd.iter().any(|value| !value.is_finite()))
+    {
+        return Err(SaeFitError::Fit(
+            "final joint shape uncertainty is incomplete or non-finite".to_string(),
+        ));
+    }
 
     // Additive post-fit diagnostics (#980): the two-score per-atom lens and the
     // residual-gauge certificate. Per-atom ARD variances (∝ exp(−log_precision))

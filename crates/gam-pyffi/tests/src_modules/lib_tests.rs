@@ -150,7 +150,11 @@ fn manifold_sae_structured_metric_without_behavior_shard_is_loadable() {
     let error = manifold_sae_resident_fisher_metric(&payload)
         .err()
         .expect("behavioral provenance without retained factors must be rejected");
-    assert!(error.to_string().contains("requires retained fisher_factors"));
+    assert!(
+        error
+            .to_string()
+            .contains("requires retained fisher_factors")
+    );
 }
 
 #[test]

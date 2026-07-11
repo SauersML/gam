@@ -15,15 +15,15 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 use serde_json::Value;
 
-// The pure token-canonicalization schema (basis/topology aliases, assignment
-// tables, n_harmonics repair, chart periods) moved to the library
+// The strict token schema (basis/topology vocabulary, assignment tables,
+// harmonic validation, chart periods) lives in the library
 // (`gam_sae::atom_schema`) so the CLI, Rust users, and this binding share one
-// vocabulary — issue #2236. Re-exported here so every established
-// `manifold_sae_coercion::X` path keeps resolving.
-pub(crate) use gam::terms::sae::atom_schema::{
-    basis_kind_for_topology, basis_to_topology, canon_name, canonical_assignment_kind,
-    canonical_basis_kind, canonical_topology, coordinate_periods_for_basis, flat_block_assignment,
-    topologies_for_bases, topology_for_bases, validated_n_harmonics,
+// vocabulary.
+pub(crate) use gam::terms::sae::atom_schema::canonical_assignment_kind;
+use gam::terms::sae::atom_schema::{
+    basis_kind_for_topology, basis_to_topology, canonical_topology,
+    coordinate_periods_for_basis, flat_block_assignment, topologies_for_bases,
+    topology_for_bases, validated_n_harmonics,
 };
 
 /// Column mean `x.mean(axis=0)` -> `(P,)` — the training-mean centering vector
@@ -154,7 +154,7 @@ pub(crate) fn sae_flat_block_assignment(gating: &str) -> PyResult<String> {
 
 /// Restore the `linear_block` label a flat-block fit reports as the generic
 /// `linear`: for each atom the caller
-/// DECLARED as `linear_block`/`flat_block` AND that the fit left at topology
+/// DECLARED as `linear_block` AND that the fit left at topology
 /// `linear` (K unchanged), relabel its `basis_kinds` entry and topology to
 /// `linear_block`. `basis_specs` (the fitted kinds) is intentionally not patched;
 /// only the public `basis_kinds` / `atom_topologies` labels change. No-op
@@ -170,13 +170,13 @@ pub(crate) fn preserve_linear_block_labels(
     }
     let want: Vec<bool> = bases
         .iter()
-        .map(|b| matches!(canon_name(b).as_str(), "linear_block" | "flat_block"))
+        .map(|b| b == "linear_block")
         .collect();
     if !want.iter().any(|&w| w) {
         return;
     }
     for i in 0..atom_topologies.len() {
-        if want[i] && canon_name(&atom_topologies[i]) == "linear" {
+        if want[i] && atom_topologies[i] == "linear" {
             atom_topologies[i] = "linear_block".to_string();
             basis_kinds[i] = "linear_block".to_string();
         }
@@ -261,7 +261,6 @@ pub(crate) fn periodic_shape_band_reorder(
 /// [`build_manifold_sae_payload`] so the Rust-owned persisted schema is complete.
 /// `assignment` is already canonicalized by this module's shared parser.
 pub(crate) struct FitConfig {
-    pub(crate) topology_fallback: String,
     pub(crate) assignment: String,
     pub(crate) assignment_label: String,
     pub(crate) penalties: Vec<String>,
@@ -519,12 +518,12 @@ pub(crate) fn build_manifold_sae_payload(
     // `basis_specs` keeps the fitted kinds; public labels may be restored to
     // `linear_block` for a flat-block fit.
     let mut basis_kinds = kinds.clone();
-    let mut atom_topologies = topologies_for_bases(&kinds);
+    let mut atom_topologies = topologies_for_bases(&kinds)?;
     if let Some(bases) = cfg.declared_bases.as_deref() {
         preserve_linear_block_labels(&mut basis_kinds, &mut atom_topologies, bases);
     }
-    let atom_topology =
-        topology_for_bases(&basis_kinds).unwrap_or_else(|| cfg.topology_fallback.clone());
+    let atom_topology = topology_for_bases(&basis_kinds)?
+        .ok_or_else(|| "converged SAE payload contains no atoms".to_string())?;
     let metric_provenance = vstr(raw, "metric_provenance")?;
     let fisher_mass_residual = vopt(raw, "fisher_mass_residual").map(v_arr1).transpose()?;
     let selected_log_lambda_sparse = match vopt(raw, "log_lambda_sparse") {
@@ -625,13 +624,6 @@ mod manifold_sae_coercion_tests {
     use ndarray::array;
 
     #[test]
-    fn canon_name_lowercases_trims_and_dashes_to_underscore() {
-        assert_eq!(canon_name("  Periodic-Spline "), "periodic_spline");
-        assert_eq!(canon_name("EUCLIDEAN"), "euclidean");
-        assert_eq!(canon_name("linear-rank1"), "linear_rank1");
-    }
-
-    #[test]
     fn assignment_tokens_have_one_strict_parser() {
         for canonical in [
             "softmax",
@@ -653,24 +645,23 @@ mod manifold_sae_coercion_tests {
     }
 
     #[test]
-    fn topology_and_basis_aliases_share_one_directional_table() {
-        for (alias, canonical) in [
-            ("circle", "periodic"),
-            ("Periodic-Spline", "periodic"),
-            ("affine", "linear"),
-            ("flat-block", "linear_block"),
-            ("euclidean_quadratic_patch", "euclidean"),
-            ("hyperbolic", "poincare"),
-            ("mobius-band", "mobius"),
-            (" AUTO ", "auto"),
+    fn topology_and_basis_tokens_are_strict() {
+        assert_eq!(basis_kind_for_topology("circle"), Ok("periodic".to_string()));
+        assert_eq!(basis_kind_for_topology("auto"), Ok("auto".to_string()));
+        for removed in [
+            "Periodic-Spline",
+            "affine",
+            "flat-block",
+            "euclidean_quadratic_patch",
+            "hyperbolic",
+            "mobius-band",
+            " AUTO ",
+            "Weird-Kind",
         ] {
-            assert_eq!(canonical_basis_kind(alias), canonical, "alias {alias}");
-            assert_eq!(basis_kind_for_topology(alias), canonical, "alias {alias}");
+            assert!(basis_kind_for_topology(removed).is_err(), "removed {removed}");
+            assert!(gam::terms::sae::atom_schema::validate_seed_basis_kind(removed).is_err());
         }
-        assert_eq!(canonical_basis_kind(" Weird-Kind "), "weird_kind");
-        assert_eq!(basis_kind_for_topology(" Weird-Kind "), " Weird-Kind ");
-        assert_eq!(canonical_topology(" AUTO "), "auto");
-        assert_eq!(canonical_topology("mobius-band"), "mobius");
+        assert_eq!(canonical_topology("circle"), Ok("circle".to_string()));
     }
 
     #[test]
@@ -688,7 +679,7 @@ mod manifold_sae_coercion_tests {
             Ok(vec![None, Some(std::f64::consts::TAU)])
         );
         assert_eq!(
-            coordinate_periods_for_basis("mobius-band", 2),
+            coordinate_periods_for_basis("mobius", 2),
             Ok(vec![Some(2.0), None])
         );
         assert!(coordinate_periods_for_basis("mobius", 1).is_err());
@@ -707,54 +698,39 @@ mod manifold_sae_coercion_tests {
     }
 
     #[test]
-    fn basis_to_topology_matches_python_alias_map() {
-        // Every documented alias -> canonical topology, plus alias/casing forms.
+    fn basis_to_topology_maps_only_canonical_native_kinds() {
         for (basis, topo) in [
             ("periodic", "circle"),
-            ("periodic_spline", "circle"),
-            ("Circle", "circle"),
             ("sphere", "sphere"),
             ("torus", "torus"),
             ("linear", "linear"),
-            ("linear_rank1", "linear"),
-            ("affine", "linear"),
             ("linear_block", "linear_block"),
-            ("flat-block", "linear_block"),
             ("duchon", "euclidean"),
             ("euclidean", "euclidean"),
-            ("euclidean_patch", "euclidean"),
-            ("euclidean_quadratic_patch", "euclidean"),
             ("poincare", "poincare"),
-            ("hyperbolic", "poincare"),
-            ("poincare_patch", "poincare"),
             ("cylinder", "cylinder"),
-            ("mobius-band", "mobius"),
-            (" AUTO ", "auto"),
+            ("mobius", "mobius"),
+            ("finite_set", "finite_set"),
         ] {
-            assert_eq!(basis_to_topology(basis), topo, "basis {basis}");
+            assert_eq!(basis_to_topology(basis), Ok(topo.to_string()), "basis {basis}");
         }
-    }
-
-    #[test]
-    fn basis_to_topology_unknown_passes_through_original_string() {
-        // The round-trip label conversion returns the raw argument on a miss.
-        assert_eq!(basis_to_topology("Weird-Kind"), "Weird-Kind");
+        assert!(basis_to_topology("Weird-Kind").is_err());
     }
 
     #[test]
     fn topology_for_bases_common_vs_mixed() {
         assert_eq!(
-            topology_for_bases(&["periodic".into(), "circle".into()]),
-            Some("circle".to_string()),
+            topology_for_bases(&["periodic".into(), "periodic".into()]),
+            Ok(Some("circle".to_string())),
         );
         assert_eq!(
             topology_for_bases(&["periodic".into(), "euclidean".into()]),
-            Some("mixed".to_string()),
+            Ok(Some("mixed".to_string())),
         );
-        assert_eq!(topology_for_bases(&[]), None);
+        assert_eq!(topology_for_bases(&[]), Ok(None));
         assert_eq!(
             topologies_for_bases(&["duchon".into(), "linear".into()]),
-            vec!["euclidean".to_string(), "linear".to_string()],
+            Ok(vec!["euclidean".to_string(), "linear".to_string()]),
         );
     }
 

@@ -65,6 +65,9 @@ pub fn build_sae_minimal_seed(
     if !request.target.iter().all(|value| value.is_finite()) {
         return Err("sae_manifold_fit_minimal: target contains non-finite values".to_string());
     }
+    for basis in &request.atom_basis {
+        crate::atom_schema::validate_seed_basis_kind(basis)?;
+    }
 
     let auto_labels = if request.atom_basis.iter().any(|basis| basis == "auto") {
         Some(sae_output_energy_cluster_labels(request.target, k_atoms))

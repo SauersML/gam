@@ -1901,15 +1901,36 @@ fn sae_manifold_fit_inner<'py>(
     for atom_log_ard in &rho.log_ard {
         log_ard_py.append(atom_log_ard.clone().into_pyarray(py))?;
     }
+    // #2015/#2271 — Tier-0 input STANDARDIZATION divides every fit input
+    // column by its centered RMS `σ_c`, so the term's decoder (and every
+    // quantity the decoder feeds — its covariance, the closed-form shape
+    // bands) lives in that standardized frame, not the physical output
+    // units the persisted artifact promises (`decoder_coefficients` doc:
+    // "the atom's fitted radial scale... persisted predictions read this
+    // decoder directly"). This is the ONE crossing from the internal fit
+    // frame to the persisted/exposed frame (feeds both the live in-memory
+    // `ManifoldSAE` and its save/load payload, since they share the same
+    // struct), so lifting here — multiplying every per-channel quantity by
+    // `σ_c` — makes decoder_B, decoder_covariance, and the shape bands
+    // physical everywhere downstream, OOS included, with no separate
+    // `tier0_scale` persisted field required (unlike the additive `μ`,
+    // which is a whole-model constant applied once outside any atom).
+    let tier0_scale = term.tier0_scale().cloned();
     let atoms_py = PyList::empty(py);
     for atom_idx in 0..k_atoms {
         let atom = &term.atoms[atom_idx];
         let atom_dict = PyDict::new(py);
+        let mut decoder_physical = atom.full_width_decoder();
+        if let Some(sigma) = tier0_scale.as_ref() {
+            for mut row in decoder_physical.rows_mut() {
+                row *= sigma;
+            }
+        }
         atom_dict.set_item(
             // Expand the fit-internal rank-reduced frame before crossing the
             // Python boundary. All consumers receive the physical `M × p` decoder.
             "decoder_B",
-            atom.full_width_decoder().into_pyarray(py),
+            decoder_physical.into_pyarray(py),
         )?;
         atom_dict.set_item("basis_kind", atom_basis[atom_idx].clone())?;
         atom_dict.set_item("basis_centers", py.None())?;
@@ -1968,17 +1989,44 @@ fn sae_manifold_fit_inner<'py>(
                 // rank-reduced atom the assembled covariance is the reduced
                 // `(r·p)²`; lift it by the `(Q ⊗ I_p)` congruence to the exact
                 // `(M·p)²` posterior of `Q B̃`. Identity clone for un-reduced atoms.
-                let cov_full = atom
+                let mut cov_full = atom
                     .lift_reduced_decoder_covariance(cov, p_out)
                     .map_err(py_value_error)?;
+                // #2015/#2271 — same physical-frame lift as `decoder_B`. The flat
+                // layout is basis-major (`b*p_out + c`), so channel `c`'s
+                // congruence factor `σ_c` hits every entry whose row OR column
+                // index falls in channel `c`; `(D ⊗ I)ᵀ Cov (D ⊗ I)` with
+                // `D = diag(σ)` reduces to `Cov[i,j] *= σ_{i mod p} * σ_{j mod p}`.
+                if let Some(sigma) = tier0_scale.as_ref() {
+                    let m_p = cov_full.nrows();
+                    for i in 0..m_p {
+                        let si = sigma[i % p_out];
+                        for j in 0..m_p {
+                            cov_full[[i, j]] *= si * sigma[j % p_out];
+                        }
+                    }
+                }
                 atom_dict.set_item("decoder_covariance", cov_full.into_pyarray(py))?;
             }
             atom_dict.set_item(
                 "shape_band_coords",
                 unc.band_coords.clone().into_pyarray(py),
             )?;
-            atom_dict.set_item("shape_band_mean", unc.band_mean.clone().into_pyarray(py))?;
-            atom_dict.set_item("shape_band_sd", unc.band_sd.clone().into_pyarray(py))?;
+            let mut band_mean = unc.band_mean.clone();
+            let mut band_sd = unc.band_sd.clone();
+            if let Some(sigma) = tier0_scale.as_ref() {
+                // Ambient channel values (mean AND sd, both linear in the
+                // channel's physical scale — sd is not a variance) lift the
+                // same way as the decoder they are read off of.
+                for mut row in band_mean.rows_mut() {
+                    row *= sigma;
+                }
+                for mut row in band_sd.rows_mut() {
+                    row *= sigma;
+                }
+            }
+            atom_dict.set_item("shape_band_mean", band_mean.into_pyarray(py))?;
+            atom_dict.set_item("shape_band_sd", band_sd.into_pyarray(py))?;
         }
         atoms_py.append(atom_dict)?;
     }

@@ -4896,12 +4896,12 @@ pub fn run_structure_search_rounds(
                 // Refit the restructured candidate on the estimation rows only.
                 candidate_fit(cand_term, cand_rho, &estimation_rows)
             },
+            |state: &State, shard: &RowBlockShard| eval_log_lik(&state.0, shard),
             |state: &State, shard: &RowBlockShard| {
                 let (null_term, _null_rho) =
                     null_fit(state.0.clone(), state.1.clone(), &shard.rows)?;
                 eval_log_lik(&null_term, shard)
             },
-            |state: &State, shard: &RowBlockShard| eval_log_lik(&state.0, shard),
             // No-op fold: the candidate is the fixed predictable plug-in across
             // the held-out stream.
             |state: State, _: &RowBlockShard| Ok(state),

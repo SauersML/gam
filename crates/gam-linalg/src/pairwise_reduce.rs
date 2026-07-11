@@ -300,6 +300,114 @@ where
     pairwise_reduce_chunked(chunks, |a, b| a + b, 0.0)
 }
 
+/// Parallel, bit-reproducible pairwise map-reduce over the index range
+/// `0..n`.
+///
+/// Semantically identical — **bit-identical**, per the module determinism
+/// contract — to
+/// `pairwise_reduce(&(0..n).map(map).collect::<Vec<_>>(), combine, identity)`,
+/// but evaluated in parallel without materializing the mapped values. The
+/// recursion mirrors [`reduce_range`] exactly (same [`left_split`] tree, same
+/// base-block seeding from the first element), except that the two subtrees of
+/// every internal node are evaluated via `rayon::join`. Because the
+/// association order is fixed by the code structure — never by which thread
+/// ran what — the result is a pure function of `n` and the mapped values:
+/// independent of thread count, work stealing, and run-to-run scheduling.
+///
+/// This is the drop-in replacement for the nondeterministic
+/// `(0..n).into_par_iter().map(f).sum()` / `.reduce(..)` pattern, whose
+/// grouping depends on rayon's demand-driven splitting.
+pub fn par_pairwise_map_reduce<T, M, F>(n: usize, map: M, combine: F, identity: T) -> T
+where
+    T: Copy + Send,
+    M: Fn(usize) -> T + Sync,
+    F: Fn(T, T) -> T + Sync,
+{
+    par_reduce_index_range(0, n, &map, &combine, identity)
+}
+
+fn par_reduce_index_range<T, M, F>(lo: usize, hi: usize, map: &M, combine: &F, identity: T) -> T
+where
+    T: Copy + Send,
+    M: Fn(usize) -> T + Sync,
+    F: Fn(T, T) -> T + Sync,
+{
+    let len = hi - lo;
+    if len == 0 {
+        return identity;
+    }
+    if len <= BASE_CHUNK {
+        // Sequential base block, seeded from the first element — the same
+        // identity-free seeding as `reduce_range`.
+        let mut acc = map(lo);
+        for i in (lo + 1)..hi {
+            acc = combine(acc, map(i));
+        }
+        return acc;
+    }
+    let mid = lo + left_split(len);
+    let (left, right) = rayon::join(
+        || par_reduce_index_range(lo, mid, map, combine, identity),
+        || par_reduce_index_range(mid, hi, map, combine, identity),
+    );
+    combine(left, right)
+}
+
+/// Parallel, bit-reproducible pairwise sum of `f(0), f(1), …, f(n-1)`.
+///
+/// Bit-identical to `pairwise_sum(&(0..n).map(f).collect::<Vec<_>>())` and to
+/// itself across any thread count. See [`par_pairwise_map_reduce`].
+pub fn par_pairwise_sum<M>(n: usize, f: M) -> f64
+where
+    M: Fn(usize) -> f64 + Sync,
+{
+    par_pairwise_map_reduce(n, f, |a, b| a + b, 0.0)
+}
+
+/// Parallel, deterministic block fold for non-`Copy` accumulators (matrix /
+/// vector partials).
+///
+/// The index range `0..n` is split over the same length-only [`left_split`]
+/// tree as [`par_pairwise_map_reduce`]; each base block `lo..hi` (at most
+/// [`BASE_CHUNK`] indices) is folded sequentially by `base`, and internal
+/// nodes merge their two subtree partials with `combine`. The association
+/// order is a pure function of `n`, so the result never depends on thread
+/// count or scheduling. Returns `None` for `n == 0`.
+///
+/// This replaces the nondeterministic
+/// `into_par_iter().fold(zero_acc, ..).reduce(zero_acc, ..)` pattern for
+/// heavyweight accumulators, whose partial grouping depends on rayon's
+/// demand-driven splits.
+pub fn par_deterministic_block_fold<T, B, F>(n: usize, base: B, combine: F) -> Option<T>
+where
+    T: Send,
+    B: Fn(core::ops::Range<usize>) -> T + Sync,
+    F: Fn(T, T) -> T + Sync,
+{
+    if n == 0 {
+        return None;
+    }
+    Some(par_block_fold_range(0, n, &base, &combine))
+}
+
+fn par_block_fold_range<T, B, F>(lo: usize, hi: usize, base: &B, combine: &F) -> T
+where
+    T: Send,
+    B: Fn(core::ops::Range<usize>) -> T + Sync,
+    F: Fn(T, T) -> T + Sync,
+{
+    let len = hi - lo;
+    if len <= BASE_CHUNK {
+        return base(lo..hi);
+    }
+    let mid = lo + left_split(len);
+    let (left, right) = rayon::join(
+        || par_block_fold_range(lo, mid, base, combine),
+        || par_block_fold_range(mid, hi, base, combine),
+    );
+    combine(left, right)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,5 +537,88 @@ mod tests {
         let a = [1.0f64, 2.0, 3.0];
         let b = [4.0f64, 5.0];
         assert_eq!(pairwise_sum_chunked([a.as_ref(), b.as_ref()]), 15.0);
+    }
+
+    // ── parallel deterministic reductions ────────────────────────────────────
+
+    #[test]
+    fn par_pairwise_sum_bit_identical_to_sequential() {
+        for n in [0usize, 1, 5, BASE_CHUNK, BASE_CHUNK + 1, 3 * BASE_CHUNK + 17, 5000] {
+            let f = |i: usize| ((i as f64) * 0.7318 - 41.0).sin() * 1e6 / ((i + 1) as f64);
+            let xs: Vec<f64> = (0..n).map(f).collect();
+            let expected = pairwise_sum(&xs);
+            let got = par_pairwise_sum(n, f);
+            assert_eq!(got.to_bits(), expected.to_bits(), "n={n}");
+        }
+    }
+
+    #[test]
+    fn par_pairwise_sum_bit_stable_across_thread_counts() {
+        let n = 7 * BASE_CHUNK + 13;
+        let f = |i: usize| (1.0 / ((i + 1) as f64)).ln_1p() * if i % 3 == 0 { -1.0 } else { 1.0 };
+        let reference = par_pairwise_sum(n, f);
+        for threads in [1usize, 2, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool");
+            let got = pool.install(|| par_pairwise_sum(n, f));
+            assert_eq!(got.to_bits(), reference.to_bits(), "threads={threads}");
+        }
+    }
+
+    #[test]
+    fn par_pairwise_map_reduce_tuple_accumulators() {
+        let n = 4 * BASE_CHUNK + 3;
+        let map = |i: usize| {
+            let x = (i as f64).sqrt() * 0.911;
+            (x, x * x)
+        };
+        let seq: (f64, f64) = {
+            let xs: Vec<(f64, f64)> = (0..n).map(map).collect();
+            pairwise_reduce(&xs, |a, b| (a.0 + b.0, a.1 + b.1), (0.0, 0.0))
+        };
+        let par = par_pairwise_map_reduce(n, map, |a, b| (a.0 + b.0, a.1 + b.1), (0.0, 0.0));
+        assert_eq!(par.0.to_bits(), seq.0.to_bits());
+        assert_eq!(par.1.to_bits(), seq.1.to_bits());
+    }
+
+    #[test]
+    fn par_deterministic_block_fold_vec_accumulator_thread_invariant() {
+        let n = 6 * BASE_CHUNK + 41;
+        let dim = 7usize;
+        let run = || {
+            par_deterministic_block_fold(
+                n,
+                |range: core::ops::Range<usize>| {
+                    let mut acc = vec![0.0f64; dim];
+                    for i in range {
+                        for (d, slot) in acc.iter_mut().enumerate() {
+                            *slot += ((i * dim + d) as f64).cos() / ((i + 1) as f64);
+                        }
+                    }
+                    acc
+                },
+                |mut a: Vec<f64>, b: Vec<f64>| {
+                    for (x, y) in a.iter_mut().zip(&b) {
+                        *x += *y;
+                    }
+                    a
+                },
+            )
+            .expect("n > 0")
+        };
+        let reference = run();
+        for threads in [1usize, 2, 5] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool");
+            let got = pool.install(run);
+            for (g, r) in got.iter().zip(&reference) {
+                assert_eq!(g.to_bits(), r.to_bits(), "threads={threads}");
+            }
+        }
+        assert!(par_deterministic_block_fold(0, |_| vec![0.0f64; 1], |a, _b| a).is_none());
     }
 }

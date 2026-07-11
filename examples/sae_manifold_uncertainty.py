@@ -1,7 +1,7 @@
 """Read per-atom posterior shape uncertainty.
 
 Fresh manifold-SAE fits expose per-atom decoder covariance and a posterior
-shape band through ``shape_uncertainty``. This example prints the shape-band
+shape band directly on each native atom. This example prints the shape-band
 summary, then plots the fitted mean curve with a pointwise mean +/- one
 posterior standard deviation band.
 """
@@ -39,21 +39,25 @@ def main() -> None:
         random_state=0,
     )
 
-    atom = 0
-    band = fit.shape_uncertainty(atom=atom, n_sd=1.0)
-    covariance = fit.atoms[atom].decoder_covariance
+    atom = fit.atoms[0]
+    coords = np.asarray(atom.shape_band_coords)
+    mean = np.asarray(atom.shape_band_mean)
+    sd = np.asarray(atom.shape_band_sd)
+    lower = mean - sd
+    upper = mean + sd
+    covariance = atom.decoder_covariance
 
     print("Per-atom posterior shape uncertainty")
     print(f"r2={fit.reconstruction_r2:.3f}")
     print(f"decoder_covariance_shape={covariance.shape}")
-    print(f"shape band grid={band['coords'].shape} ambient={band['mean'].shape}")
-    print("ambient posterior sd mean:", np.round(band["sd"].mean(axis=0), 4))
+    print(f"shape band grid={coords.shape} ambient={mean.shape}")
+    print("ambient posterior sd mean:", np.round(sd.mean(axis=0), 4))
 
-    order = np.argsort(band["coords"][:, 0])
-    coord = band["coords"][order, 0]
-    mean = band["mean"][order]
-    lower = band["lower"][order]
-    upper = band["upper"][order]
+    order = np.argsort(coords[:, 0])
+    coord = coords[order, 0]
+    mean = mean[order]
+    lower = lower[order]
+    upper = upper[order]
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.4), constrained_layout=True)
     axes[0].scatter(x[:, 0], x[:, 1], s=14, alpha=0.4, label="data")

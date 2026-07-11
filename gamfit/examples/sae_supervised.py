@@ -236,7 +236,7 @@ def sae_supervised(
         Uniform example result with ``.sae``, ``.model``, ``.report()``, and
         ``.predict(X)``. Inspect ``fit.sae.assignments`` for the learned
         assignment matrix, ``fit.sae.atoms[i].decoder_covariance``, and
-        ``fit.sae.shape_uncertainty(atom=i)`` when present.
+        ``fit.sae.atoms[i].shape_band_mean`` / ``shape_band_sd`` when present.
 
     Raises
     ------

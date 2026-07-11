@@ -105,10 +105,9 @@ pub(crate) fn estimate_beta_phi_from_eta(
     const PHI_MAX: f64 = 1e6;
     const MU_EPS: f64 = 1e-9;
 
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    let (weighted_pearson, total_weight) = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
+    let (weighted_pearson, total_weight) = gam_linalg::pairwise_reduce::par_pairwise_map_reduce(
+        eta.len(),
+        |i| {
             let wi = priorweights[i].max(0.0);
             if wi == 0.0 {
                 return (0.0_f64, 0.0_f64);
@@ -120,11 +119,10 @@ pub(crate) fn estimate_beta_phi_from_eta(
             let var_unit = mui * (1.0 - mui);
             let resid = y[i] - mui;
             (wi * resid * resid / var_unit, wi)
-        })
-        .reduce(
-            || (0.0_f64, 0.0_f64),
-            |(p1, w1), (p2, w2)| (p1 + p2, w1 + w2),
-        );
+        },
+        |(p1, w1), (p2, w2)| (p1 + p2, w1 + w2),
+        (0.0_f64, 0.0_f64),
+    );
 
     if total_weight <= 0.0 || weighted_pearson <= 0.0 {
         return 1.0;
@@ -170,10 +168,9 @@ pub(crate) fn estimate_tweedie_phi_from_eta(
     const PHI_MAX: f64 = 1e12;
     const MU_EPS: f64 = 1e-300;
 
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    let (weighted_pearson, total_weight) = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
+    let (weighted_pearson, total_weight) = gam_linalg::pairwise_reduce::par_pairwise_map_reduce(
+        eta.len(),
+        |i| {
             let wi = priorweights[i].max(0.0);
             if wi == 0.0 {
                 return (0.0_f64, 0.0_f64);
@@ -184,11 +181,10 @@ pub(crate) fn estimate_tweedie_phi_from_eta(
             // out; the prior-weighted Pearson contribution is wᵢ·resid²/V(μᵢ).
             let var_unit = mui.powf(p).max(MU_EPS);
             (wi * resid * resid / var_unit, wi)
-        })
-        .reduce(
-            || (0.0_f64, 0.0_f64),
-            |(p1, w1), (p2, w2)| (p1 + p2, w1 + w2),
-        );
+        },
+        |(p1, w1), (p2, w2)| (p1 + p2, w1 + w2),
+        (0.0_f64, 0.0_f64),
+    );
 
     if total_weight <= 0.0 || !weighted_pearson.is_finite() || weighted_pearson <= 0.0 {
         return 1.0;
@@ -223,14 +219,13 @@ pub(crate) fn negbin_theta_score_and_info(
     priorweights: ArrayView1<'_, f64>,
     theta: f64,
 ) -> (f64, f64) {
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let psi_theta = digamma(theta);
     let trigamma_theta = trigamma(theta);
     let ln_theta = theta.ln();
     let inv_theta = 1.0 / theta;
-    let (score, info) = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
+    let (score, info) = gam_linalg::pairwise_reduce::par_pairwise_map_reduce(
+        eta.len(),
+        |i| {
             let wi = priorweights[i].max(0.0);
             if wi == 0.0 {
                 return (0.0_f64, 0.0_f64);

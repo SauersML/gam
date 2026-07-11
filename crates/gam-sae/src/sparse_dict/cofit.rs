@@ -46,9 +46,9 @@
 //!   not increase `J`. The previous chart set is always available as the
 //!   fallback, so the round is monotone by construction either way.
 //!
-//! Each committed round therefore has `J[r] ≤ J[r-1]` up to a tiny numerical
-//! slack; the loop runs a small fixed number of rounds or until the relative
-//! decrease of `J` stalls. The curved solver's internals are **untouched** — it
+//! Each committed round therefore has `J[r] ≤ J[r-1]` up to numerical
+//! tolerance; the loop runs until the relative decrease of `J` satisfies its
+//! convergence criterion. The curved solver's internals are **untouched** — it
 //! is called through its existing public surface with an adjusted target.
 
 use std::collections::HashSet;
@@ -64,8 +64,6 @@ use super::coordinate::explained_variance_from_reconstruction;
 /// Configuration for [`cofit_block_and_curved`].
 #[derive(Clone, Debug)]
 pub struct CofitConfig {
-    /// Maximum number of A/B alternation rounds after the one-shot round 0.
-    pub max_rounds: usize,
     /// Stop early once the relative decrease of the joint objective between two
     /// consecutive rounds falls below this (a stalled descent).
     pub rel_tol: f64,
@@ -85,7 +83,6 @@ pub struct CofitConfig {
 impl Default for CofitConfig {
     fn default() -> Self {
         Self {
-            max_rounds: 6,
             rel_tol: 1.0e-4,
             code_ridge: 1.0e-6,
             monotone_slack: 1.0e-6,
@@ -194,8 +191,8 @@ pub fn cofit_block_and_curved(
             codes.shape()
         ));
     }
-    if config.max_rounds == 0 {
-        return Err("cofit: max_rounds must be >= 1".to_string());
+    if !(config.rel_tol.is_finite() && config.rel_tol > 0.0) {
+        return Err("cofit: rel_tol must be finite and positive".to_string());
     }
     let g_total = decoder.nrows() / b;
 
@@ -233,7 +230,7 @@ pub fn cofit_block_and_curved(
     let mut n_charts = compose0.selected_chart_blocks.len() + compose0.selected_chart_pairs.len();
     let mut compose_result = compose0;
 
-    let mut rounds: Vec<CofitRound> = Vec::with_capacity(config.max_rounds + 1);
+    let mut rounds: Vec<CofitRound> = Vec::new();
     let mut objective = record_round(
         &mut rounds,
         0,
@@ -249,8 +246,9 @@ pub fn cofit_block_and_curved(
         },
     )?;
 
-    // ---- Rounds 1.. : alternate linear refit (A) then curved refit (B). ----
-    for round in 1..=config.max_rounds {
+    // ---- Rounds 1.. : alternate until the joint objective converges. ----
+    let mut round = 1usize;
+    loop {
         let prev_objective = objective;
 
         // (A) Linear tier refit against the chart-adjusted target `target − C`,
@@ -333,6 +331,7 @@ pub fn cofit_block_and_curved(
         if (prev_objective - objective) / denom < config.rel_tol {
             break;
         }
+        round += 1;
     }
 
     let linear_reconstruction =
@@ -758,7 +757,6 @@ mod cofit_tests {
         let (blocks, codes) = tied_routing(&x, &decoder, 2);
 
         let config = CofitConfig {
-            max_rounds: 5,
             code_ridge: 1.0e-6,
             chart: chart_cfg_small(),
             ..CofitConfig::default()
@@ -821,7 +819,6 @@ mod cofit_tests {
         let (blocks, codes) = tied_routing(&x, &decoder, 2);
 
         let config = CofitConfig {
-            max_rounds: 6,
             chart: chart_cfg_small(),
             ..CofitConfig::default()
         };
@@ -858,7 +855,6 @@ mod cofit_tests {
         let mut chart = chart_cfg_small();
         chart.max_blocks = 0;
         let config = CofitConfig {
-            max_rounds: 3,
             code_ridge: 1.0e-6,
             chart,
             ..CofitConfig::default()

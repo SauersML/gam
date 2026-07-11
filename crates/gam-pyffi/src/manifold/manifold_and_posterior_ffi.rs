@@ -6303,9 +6303,9 @@ impl ManifoldSaeCore {
             .decoder_blocks
             .iter()
             .try_fold(0_usize, |total, block| {
-                let block_size = block.iter().try_fold(0_usize, |rows, row| {
-                    rows.checked_add(row.len())
-                })?;
+                let block_size = block
+                    .iter()
+                    .try_fold(0_usize, |rows, row| rows.checked_add(row.len()))?;
                 total.checked_add(block_size)
             })
             .ok_or_else(|| {
@@ -6506,7 +6506,10 @@ impl ManifoldSaeCore {
             manifold_assignment_summary_from_array(assignments.view(), 1.0e-8)
                 .map_err(py_value_error)?;
         let common_dim = self.inner.atom_dims.first().copied().filter(|first| {
-            self.inner.atom_dims.iter().all(|dimension| dimension == first)
+            self.inner
+                .atom_dims
+                .iter()
+                .all(|dimension| dimension == first)
         });
 
         let active_dims = self
@@ -6520,9 +6523,11 @@ impl ManifoldSaeCore {
             atom_functionals.append(manifold_sae_report(py, &atom.functional_evidence)?)?;
         }
 
-        let selected_smooth = self.inner.selected_log_lambda_smooth.as_ref().map(|values| {
-            values.iter().map(|value| value.exp()).collect::<Vec<_>>()
-        });
+        let selected_smooth = self
+            .inner
+            .selected_log_lambda_smooth
+            .as_ref()
+            .map(|values| values.iter().map(|value| value.exp()).collect::<Vec<_>>());
         let out = PyDict::new(py);
         out.set_item(
             "bits_per_token",
@@ -6548,7 +6553,10 @@ impl ManifoldSaeCore {
         out.set_item("mean_assignment_mass", mean_assignment_mass)?;
         out.set_item("active_dims", active_dims)?;
         out.set_item("atom_functionals", atom_functionals)?;
-        out.set_item("diagnostics", json_value_to_py(py, self.inner.diagnostics.clone())?)?;
+        out.set_item(
+            "diagnostics",
+            json_value_to_py(py, self.inner.diagnostics.clone())?,
+        )?;
         out.set_item("cotrain", manifold_sae_report(py, &self.inner.cotrain)?)?;
         out.set_item("primitives", self.inner.primitive_names.clone())?;
         out.set_item("selected_smooth_lambdas", selected_smooth)?;
@@ -7065,14 +7073,14 @@ impl ManifoldSaeCore {
     /// Rust-owned model surface, not in a torch wrapper that would otherwise
     /// duplicate model math.
     #[getter]
-    fn selected_lambda_smooth<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> Option<Bound<'py, PyArray1<f64>>> {
-        self.inner.selected_log_lambda_smooth.as_ref().map(|values| {
-            let lambdas = values.iter().map(|value| value.exp()).collect::<Vec<_>>();
-            manifold_sae_vec1(py, &lambdas)
-        })
+    fn selected_lambda_smooth<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
+        self.inner
+            .selected_log_lambda_smooth
+            .as_ref()
+            .map(|values| {
+                let lambdas = values.iter().map(|value| value.exp()).collect::<Vec<_>>();
+                manifold_sae_vec1(py, &lambdas)
+            })
     }
     #[getter]
     fn selected_log_ard<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyList>>> {

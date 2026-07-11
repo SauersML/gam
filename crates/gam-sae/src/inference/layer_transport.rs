@@ -689,8 +689,8 @@ impl FittedTransport {
     /// span-exact certificate. On each knot span `h′` is a single polynomial of
     /// degree `d = `[`DomainBasis::derivative_poly_degree`]` (cubic spline ⇒
     /// quadratic). A degree-`d` polynomial is determined by `d + 1` samples, so
-    /// per span we sample `h′` at `d + 1` equally-spaced abscissae, reconstruct
-    /// the polynomial by finite differences, locate its interior critical
+    /// per span we evaluate `h′` at `d + 1` equally-spaced abscissae, reconstruct
+    /// the known-degree polynomial in the Lagrange basis, locate its interior critical
     /// points in closed form, and require `orientation·h′ > 0` at the span
     /// endpoints **and** every interior critical point. To stay sound even if a
     /// basis is not an exact polynomial of the assumed degree on a span (e.g. a
@@ -735,16 +735,17 @@ impl FittedTransport {
                 .collect();
             let values = self.oriented_derivative_at(&nodes, orientation)?;
 
-            // Polynomial in the local coordinate u = (t - nodes[0]) / step,
-            // reconstructed by Newton forward differences on the equally-spaced
-            // nodes. Coefficients in the monomial basis of u are recovered for
-            // the closed-form critical-point search.
+            // Polynomial in the local coordinate u = (t - nodes[0]) / step.
+            // Expand the exact Lagrange interpolant into monomial coefficients
+            // for the closed-form critical-point search. This is algebraic
+            // reconstruction of a known-degree spline piece, not a numerical
+            // derivative approximation.
             let step = if n_nodes > 1 {
                 nodes[1] - nodes[0]
             } else {
                 span
             };
-            let coeffs = monomial_from_equispaced(&values);
+            let coeffs = monomial_interpolant_at_integer_nodes(&values);
 
             // Sound guard: verify the reconstruction reproduces an independent
             // interior sample (deliberately off the reconstruction nodes — the
@@ -1169,54 +1170,34 @@ pub struct CompositionDefectReport {
     pub p_value: f64,
 }
 
-/// Recover the monomial coefficients (ascending: `c[0] + c[1]·u + …`) of the
-/// degree-`(values.len()−1)` polynomial that interpolates `values` at the
-/// integer abscissae `u = 0, 1, …, values.len()−1`. Used by the strict
-/// monotonicity certificate to reconstruct `h′` on a knot span from equally
-/// spaced samples. Exact for the polynomial pieces of a B-spline derivative.
-fn monomial_from_equispaced(values: &[f64]) -> Vec<f64> {
+/// Recover ascending monomial coefficients of the unique degree-`(n-1)`
+/// polynomial through `(i, values[i])`, `i = 0, …, n-1`, by expanding its
+/// Lagrange basis polynomials. The monotonicity certificate uses this exact
+/// algebraic reconstruction for each known-degree B-spline derivative piece.
+fn monomial_interpolant_at_integer_nodes(values: &[f64]) -> Vec<f64> {
     let n = values.len();
     if n == 0 {
         return Vec::new();
     }
-    // Newton forward differences Δ^k f[0] over the equally spaced nodes.
-    let mut diffs: Vec<f64> = values.to_vec();
-    let mut fwd = vec![0.0_f64; n];
-    fwd[0] = diffs[0];
-    for k in 1..n {
-        for i in 0..(n - k) {
-            diffs[i] = diffs[i + 1] - diffs[i];
-        }
-        fwd[k] = diffs[0];
-    }
-    // Newton form p(u) = Σ_k Δ^k f[0] · C(u, k), with the falling-factorial
-    // binomial C(u, k) = u(u−1)…(u−k+1)/k!. Accumulate into monomial coeffs.
     let mut coeffs = vec![0.0_f64; n];
-    // poly tracks the expanded C(u,k)·k!  = Π_{j<k}(u − j); divide by k! via the
-    // running factorial.
-    let mut poly = vec![0.0_f64; n];
-    poly[0] = 1.0;
-    let mut poly_len = 1usize;
-    let mut factorial = 1.0_f64;
-    for k in 0..n {
-        if k > 0 {
-            factorial *= k as f64;
-        }
-        let scale = fwd[k] / factorial;
-        for (i, &p) in poly.iter().take(poly_len).enumerate() {
-            coeffs[i] += scale * p;
-        }
-        // Multiply running product by (u − k): poly ← poly·(u − k).
-        if k + 1 < n {
-            let mut next = vec![0.0_f64; poly_len + 1];
-            for i in 0..poly_len {
-                next[i + 1] += poly[i]; // u · poly
-                next[i] -= (k as f64) * poly[i]; // −k · poly
+    for (i, &value) in values.iter().enumerate() {
+        let mut basis = vec![1.0_f64];
+        let mut denominator = 1.0_f64;
+        for j in 0..n {
+            if j == i {
+                continue;
             }
-            for i in 0..=poly_len {
-                poly[i] = next[i];
+            denominator *= i as f64 - j as f64;
+            let mut expanded = vec![0.0_f64; basis.len() + 1];
+            for (degree, &coefficient) in basis.iter().enumerate() {
+                expanded[degree] -= j as f64 * coefficient;
+                expanded[degree + 1] += coefficient;
             }
-            poly_len += 1;
+            basis = expanded;
+        }
+        let scale = value / denominator;
+        for (degree, coefficient) in basis.into_iter().enumerate() {
+            coeffs[degree] += scale * coefficient;
         }
     }
     coeffs
@@ -1964,7 +1945,7 @@ mod invert_tests {
         let values: Vec<f64> = (0..3)
             .map(|i| eval_monomial(&coeffs_true, i as f64))
             .collect();
-        let recon = monomial_from_equispaced(&values);
+        let recon = monomial_interpolant_at_integer_nodes(&values);
         for (a, b) in recon.iter().zip(coeffs_true.iter()) {
             assert!((a - b).abs() < 1e-12, "recon {a} vs {b}");
         }

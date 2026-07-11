@@ -386,27 +386,33 @@ fn sae_manifold_fit_model<'py>(
     }
     let has_declared_bases = atom_basis.is_some();
     let basis_seed = match atom_basis {
-        Some(values) => {
-            expand_public_fit_values(values, k_atoms, "atom_basis").map_err(py_value_error)?
-        }
-        None => vec![
-            gam::terms::sae::atom_schema::basis_kind_for_topology(
+        Some(values) => expand_public_fit_values(values, k_atoms, "atom_basis")
+            .map_err(py_value_error)?,
+        None => {
+            let basis = gam::terms::sae::atom_schema::basis_kind_for_topology(
                 atom_topology.as_deref().unwrap_or("auto"),
-            );
-            k_atoms
-        ],
+            )
+            .map_err(py_value_error)?;
+            vec![basis; k_atoms]
+        }
     };
+    for basis in &basis_seed {
+        gam::terms::sae::atom_schema::validate_seed_basis_kind(basis)
+            .map_err(py_value_error)?;
+    }
     let atom_basis = basis_seed
         .iter()
         .map(|basis| gam::terms::sae::atom_schema::canonical_basis_kind(basis))
         .collect::<Vec<_>>();
     let declared_bases = has_declared_bases.then(|| basis_seed.clone());
     if let (Some(topology), true) = (atom_topology.as_deref(), has_declared_bases) {
-        let resolved =
-            gam::terms::sae::atom_schema::topology_for_bases(&atom_basis).ok_or_else(|| {
+        let resolved = gam::terms::sae::atom_schema::topology_for_bases(&atom_basis)
+            .map_err(py_value_error)?
+            .ok_or_else(|| {
                 py_value_error("sae_manifold_fit requires at least one atom".to_string())
             })?;
-        let requested = gam::terms::sae::atom_schema::canonical_topology(topology);
+        let requested = gam::terms::sae::atom_schema::canonical_topology(topology)
+            .map_err(py_value_error)?;
         if resolved != requested {
             return Err(py_value_error(format!(
                 "sae_manifold_fit: atom_basis resolves to topology {resolved:?}, but atom_topology resolves to {requested:?}"
@@ -490,10 +496,7 @@ fn sae_manifold_fit_model<'py>(
             .map(|matrix| matrix.rows().into_iter().map(|row| row.to_vec()).collect())
             .collect()
     });
-    let topology_fallback = gam::terms::sae::atom_schema::topology_for_bases(&atom_basis)
-        .unwrap_or_else(|| "mixed".to_string());
     let config = crate::manifold::manifold_sae_coercion::FitConfig {
-        topology_fallback,
         assignment,
         assignment_label: assignment_kind.to_string(),
         penalties,

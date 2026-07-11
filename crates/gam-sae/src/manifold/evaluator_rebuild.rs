@@ -355,8 +355,9 @@ pub fn build_sae_basis_evaluators(
     Ok(out)
 }
 
-/// Canonical [`SaeAtomBasisKind`] for a Python-facing basis-kind spelling,
-/// resolved through the shared alias schema ([`crate::atom_schema`]).
+/// Native [`SaeAtomBasisKind`] for an exact canonical basis token. Public and
+/// Rust fit front doors validate seed tokens before calling this converter;
+/// `Precomputed` remains an internal representation for typed native artifacts.
 pub fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
     let canonical = crate::atom_schema::canonical_basis_kind(value);
     match canonical.as_str() {
@@ -364,11 +365,8 @@ pub fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
         "periodic" => SaeAtomBasisKind::Periodic,
         "sphere" => SaeAtomBasisKind::Sphere,
         "torus" => SaeAtomBasisKind::Torus,
-        // #1221 — the genuinely-linear (affine) atom: `γ(t) = b₀ + Σ t_a·b_a`,
-        // the degree-1 monomial patch. This is the honest "linear" baseline,
-        // distinct from `"euclidean"` / `"euclidean_patch"`, which is the degree-2
-        // QUADRATIC patch `{1, t, t²}`. `"euclidean_quadratic_patch"` is accepted
-        // as an explicit synonym so callers can name the quadratic patch honestly.
+        // The genuinely-linear atom is the degree-1 monomial patch, distinct
+        // from the degree-2 canonical `euclidean` patch.
         "linear" => SaeAtomBasisKind::Linear,
         // #BSF — `"linear_block"` is a BSF block expressed AS a manifold-SAE atom:
         // γ_g(t) = t·D_g with an orthonormal decoder frame D_g and block-level
@@ -376,18 +374,13 @@ pub fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
         // `Linear` degree-1 patch (the honest encoding of "BSF ⊂ ManifoldSAE" is a
         // frame + gating CONFIG on the linear atom, not a new basis type), so it
         // maps to `SaeAtomBasisKind::Linear` for construction/evidence; the
-        // `"linear_block"` label is preserved by the gamfit facade so an artifact
-        // fitted as linear_block round-trips as linear_block (not linear). A
-        // first-class `LinearBlock` enum variant was DEFERRED deliberately: it
-        // would force exhaustive-match edits across ~10 manifold/ files (a large,
-        // then-unverifiable, collision-prone change) for a type-level distinction
-        // the frame+gating config already carries. Do NOT "simplify" this alias
-        // away — it is load-bearing for the executable BSF-subset claim.
+        // exact `linear_block` public label is retained by the fit artifact.
         "linear_block" => SaeAtomBasisKind::Linear,
         "euclidean" => SaeAtomBasisKind::EuclideanPatch,
         "poincare" => SaeAtomBasisKind::Poincare,
         "cylinder" => SaeAtomBasisKind::Cylinder,
         "mobius" => SaeAtomBasisKind::Mobius,
+        "finite_set" => SaeAtomBasisKind::FiniteSet,
         other => SaeAtomBasisKind::Precomputed(other.to_string()),
     }
 }
@@ -404,14 +397,9 @@ pub fn sae_atom_basis_kind_name(kind: &SaeAtomBasisKind) -> String {
         SaeAtomBasisKind::Duchon => "duchon".to_string(),
         SaeAtomBasisKind::Sphere => "sphere".to_string(),
         SaeAtomBasisKind::Torus => "torus".to_string(),
-        // #1221 — the genuinely-linear atom round-trips under its own honest
-        // name. The degree-2 patch keeps its established `"euclidean_patch"` wire
-        // name (renaming it would break every consumer reading the serialized
-        // dictionary); honesty for it is carried by the distinct `"linear"`
-        // topology, the `"euclidean_quadratic_patch"` input synonym, and the
-        // documentation that `"euclidean"` is quadratic, not linear.
+        // The degree-1 and degree-2 patch families have distinct canonical names.
         SaeAtomBasisKind::Linear => "linear".to_string(),
-        SaeAtomBasisKind::EuclideanPatch => "euclidean_patch".to_string(),
+        SaeAtomBasisKind::EuclideanPatch => "euclidean".to_string(),
         SaeAtomBasisKind::Poincare => "poincare".to_string(),
         SaeAtomBasisKind::Cylinder => "cylinder".to_string(),
         SaeAtomBasisKind::Mobius => "mobius".to_string(),
