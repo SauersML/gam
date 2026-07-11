@@ -1187,49 +1187,6 @@ def fit(
         )
 
     headers, rows, table_kind = normalize_table(data)
-
-    # ── Vector-response (multinomial-logit) dispatch (#328). ──────────────
-    # The scalar `fit_table` payload pipeline is parameterised by a single
-    # `ResponseFamily × InverseLink` likelihood spec; multinomial-logit
-    # carries K-1 active linear predictors and a per-row dense Fisher block,
-    # which the scalar pipeline cannot represent. Routing here keeps the
-    # high-level Python API uniform — `gamfit.fit(data, formula,
-    # family='multinomial')` returns a `MultinomialModel` — while the
-    # underlying Rust entry is a dedicated formula→design→REML path that
-    # bypasses the workflow.rs `FitRequest::Standard` materialiser. The Rust
-    # `fit_penalized_multinomial_formula` driver runs the outer REML/LAML loop
-    # to select an independent smoothing parameter per (class, term); the
-    # `init_lambda` argument below is only the warm-start seed.
-    family_canonical = str(family).lower().replace("_", "-") if family is not None else "auto"
-    if family_canonical in {
-        "multinomial",
-        "multinomial-logit",
-        "categorical",
-        "categorical-logit",
-        "softmax",
-    }:
-        try:
-            model_bytes = bytes(
-                rust_module().fit_multinomial_formula_pyfunc(
-                    headers,
-                    rows,
-                    formula,
-                    1.0,   # init_lambda — warm-start seed; λ is REML-selected in Rust.
-                    50,    # max_iter
-                    1.0e-7,  # tol
-                )
-            )
-        except Exception as exc:
-            raise map_exception(exc) from exc
-        from ._model import MultinomialModel
-        return MultinomialModel(
-            _model_bytes=model_bytes,
-            _training_table_kind=table_kind,
-        )
-
-    fisher_w = None
-    if fisher_rao_w is not None:
-        fisher_w = _normalize_fisher_rao_w(fisher_rao_w, n_rows=len(rows), dim=1)
     rust_config = dict(config or {})
     for key in (
         "response_geometry",
@@ -1239,11 +1196,6 @@ def fit(
     ):
         rust_config.pop(key, None)
     _normalize_groups_config(rust_config)
-    # Persist the training-table container type into the model payload (the
-    # single serialized source of truth) so the predict-time output-container
-    # fallback for dict/list inputs survives save/load and dumps/loads. Without
-    # this, a reloaded model silently returns dict instead of the original
-    # container type for ambiguous prediction inputs (#394).
     rust_config["training_table_kind"] = table_kind
     resolved_precision_hyperpriors = _resolve_precision_hyperpriors(
         precision_hyperpriors, formula, headers, rows, rust_config.get("group_metadata")
@@ -1278,6 +1230,50 @@ def fit(
         smooths=smooths,
         config=rust_config or None,
     )
+
+    # ── Vector-response (multinomial-logit) dispatch (#328). ──────────────
+    # The scalar `fit_table` payload pipeline is parameterised by a single
+    # `ResponseFamily × InverseLink` likelihood spec; multinomial-logit
+    # carries K-1 active linear predictors and a per-row dense Fisher block,
+    # which the scalar pipeline cannot represent. Routing here keeps the
+    # high-level Python API uniform — `gamfit.fit(data, formula,
+    # family='multinomial')` returns a `MultinomialModel` — while the
+    # underlying Rust entry is a dedicated formula→design→REML path that
+    # bypasses the workflow.rs `FitRequest::Standard` materialiser. The Rust
+    # `fit_penalized_multinomial_formula` driver runs the outer REML/LAML loop
+    # to select an independent smoothing parameter per (class, term); the
+    # `init_lambda` argument below is only the warm-start seed.
+    family_canonical = str(family).lower().replace("_", "-") if family is not None else "auto"
+    if family_canonical in {
+        "multinomial",
+        "multinomial-logit",
+        "categorical",
+        "categorical-logit",
+        "softmax",
+    }:
+        try:
+            model_bytes = bytes(
+                rust_module().fit_multinomial_formula_pyfunc(
+                    headers,
+                    rows,
+                    formula,
+                    json.dumps(payload),
+                    1.0,   # init_lambda — warm-start seed; λ is REML-selected in Rust.
+                    50,    # max_iter
+                    1.0e-7,  # tol
+                )
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        from ._model import MultinomialModel
+        return MultinomialModel(
+            _model_bytes=model_bytes,
+            _training_table_kind=table_kind,
+        )
+
+    fisher_w = None
+    if fisher_rao_w is not None:
+        fisher_w = _normalize_fisher_rao_w(fisher_rao_w, n_rows=len(rows), dim=1)
     try:
         model_bytes = bytes(
             rust_module().fit_table(headers, rows, formula, json.dumps(payload), fisher_w)
@@ -1501,26 +1497,13 @@ def loads(model_bytes: bytes) -> Model:
     if multinomial_metadata is not None:
         from ._model import MultinomialModel  # local import avoids cycle
 
-        # The multinomial payload predates the `training_table_kind` sniff used
-        # by the scalar path; probe for it but tolerate the FFI rejecting the
-        # multinomial schema, in which case the container falls back to None.
-        try:
-            training_table_kind = rust_module().saved_model_payload_string(
-                model_bytes, "training_table_kind"
-            )
-        except Exception:
-            training_table_kind = None
         return MultinomialModel(
             _model_bytes=model_bytes,
-            _training_table_kind=training_table_kind,
+            _training_table_kind=str(multinomial_metadata["training_table_kind"]),
         )
     try:
         rust_module().load_model(model_bytes)
-        # Restore the training-table container type persisted in the payload so
-        # the reloaded model reproduces the original predict-time
-        # output-container fallback for dict/list inputs. `None` for older
-        # payloads written before #394, which degrade to the "dict" fallback.
-        training_table_kind = rust_module().saved_model_payload_string(
+        training_table_kind = rust_module().required_saved_model_payload_string(
             model_bytes, "training_table_kind"
         )
     except Exception as exc:
@@ -1573,7 +1556,7 @@ def _reconstruct_response_geometry(payload: Mapping[str, Any]) -> ResponseGeomet
         base_point=np.asarray(payload["base_point"], dtype=float),
         coordinates=str(payload["coordinates"]),
         reference=int(payload.get("reference", -1)),
-        training_table_kind=payload.get("training_table_kind"),
+        training_table_kind=str(payload["training_table_kind"]),
         shared_tangent_fit=shared_fit,
         curvature=payload.get("curvature"),
     )

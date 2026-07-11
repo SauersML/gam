@@ -1256,6 +1256,10 @@ class MultinomialModel:
         return "multinomial"
 
     @property
+    def training_table_kind(self) -> str:
+        return self._training_table_kind
+
+    @property
     def deviance(self) -> float:
         return float(self._metadata["deviance"])
 

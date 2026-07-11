@@ -1,6 +1,6 @@
 //! #5/(B) rank-charge criterion tests: the honest realised-rank BIC charge
 //! (i) ACCEPTS a real rank-2 circle, (ii) NEUTRALISES a vanishing decoder
-//! (co-collapse fix), (iii) is INERT when the flag is off.
+//! (co-collapse fix), and the canonical criterion is dense/streaming invariant.
 
 use crate::manifold::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
@@ -130,40 +130,7 @@ fn rank_charge_deff_accepts_circle_and_neutralises_vanishing() {
     term.atoms[0].decoder_coefficients.assign(&saved);
 }
 
-/// (iii) flag OFF ⇒ the criterion value is BYTE-IDENTICAL to the historical path.
-#[test]
-fn rank_charge_flag_off_is_inert() {
-    let (mut term, rho) = fitted_circle_term(80, 16);
-    let tgt = unit_target(&term);
-    // Explicitly disable the rank-charge switch to audit the historical ledger.
-    term.set_rank_charge_evidence(false);
-    let (v_off, _, _) = term
-        .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
-        .unwrap();
-    // Re-applying off is still identical.
-    term.set_rank_charge_evidence(false);
-    let (v_off2, _, _) = term
-        .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
-        .unwrap();
-    assert_eq!(
-        v_off, v_off2,
-        "rank_charge_evidence=false must be bit-identical to the historical criterion"
-    );
-    // flag ON changes the criterion (the rank charge replaces the coord-block).
-    term.set_rank_charge_evidence(true);
-    let (v_on, _, _) = term
-        .reml_criterion_with_cache(tgt.view(), &rho, None, 0, 1.0, 1e-6, 1e-6)
-        .unwrap();
-    eprintln!(
-        "[rank-charge] reml OFF={v_off:.4}  ON={v_on:.4}  (ON lowers the circle's complexity)"
-    );
-    assert!(
-        (v_on - v_off).abs() > 1e-6 && v_on.is_finite(),
-        "rank_charge_evidence=true must change the (finite) criterion; off={v_off:.4} on={v_on:.4}"
-    );
-}
-
-/// (iv) HEALTHY K=3 DECISION-LEVEL CONTROL (hand-built — the pipeline has no
+/// (iii) HEALTHY K=3 DECISION-LEVEL CONTROL (hand-built — the pipeline has no
 /// healthy multi-atom fit pre-recovery): three well-separated clean rank-2
 /// circles on disjoint output dims. The rank-charge value changes a lot BY
 /// DESIGN (over-charge removal), so inertness is checked at the DECISION level:

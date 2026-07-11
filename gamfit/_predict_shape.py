@@ -83,7 +83,7 @@ def shape_predict_response(
     headers: list[str],
     rows: list[list[str]],
     table_kind: str | None,
-    training_table_kind: str | None,
+    training_table_kind: str,
     interval: float | None,
     return_type: str | None,
     id_column: str | None,
@@ -245,7 +245,7 @@ def _shape_point_payload(
     id_column: str | None,
     row_ids: list[str] | None,
     table_kind: str | None,
-    training_table_kind: str | None,
+    training_table_kind: str,
     restore: Any,
 ) -> Any:
     """Shape any point payload: the 1-D ``point`` vector, or its table form.
@@ -277,7 +277,7 @@ def _restore_with_optional_id(
     row_ids: list[str] | None,
     return_type: str | None,
     table_kind: str | None,
-    training_table_kind: str | None,
+    training_table_kind: str,
     restore: Any,
 ) -> Any:
     """Tack on the id column (if any) and hand off to ``restore_output_table``."""

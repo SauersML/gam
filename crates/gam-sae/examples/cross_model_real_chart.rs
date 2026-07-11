@@ -510,7 +510,6 @@ fn envelope_report(
         total_centered_variance,
         term.n_obs(),
         dispersion,
-        term.rank_charge_evidence(),
     )?
     .ok_or_else(|| "hybrid envelope report had no eligible d=1 atom".to_string())
 }

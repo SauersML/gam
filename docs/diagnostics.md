@@ -173,7 +173,7 @@ model.is_survival               # bool
 model.is_marginal_slope         # bool
 model.is_transformation_normal  # bool
 model.response_name             # str | None (None for Surv(...) or non-simple lhs formulas)
-model.training_table_kind       # "pandas" | "polars" | "pyarrow" | "numpy" | "mapping" | "records" | "rows" | None
+model.training_table_kind       # "pandas" | "polars" | "pyarrow" | "numpy" | "mapping" | "records" | "rows" | "unknown"
 model.group_metadata            # dict | None, persisted per-group metadata
 model.deployment_extensions     # tuple of dicts, no-refit group extensions
 ```

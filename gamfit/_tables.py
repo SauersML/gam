@@ -382,7 +382,7 @@ def restore_output_table(
     *,
     requested: str | None,
     input_kind: str,
-    training_kind: str | None,
+    training_kind: str,
 ) -> Any:
     target = requested or preferred_output_kind(input_kind, training_kind)
     if target not in SUPPORTED_OUTPUT_KINDS:
@@ -416,7 +416,7 @@ def restore_output_table(
     raise ValueError(f"unsupported return_type '{target}'")
 
 
-def preferred_output_kind(input_kind: str, training_kind: str | None) -> str:
+def preferred_output_kind(input_kind: str, training_kind: str) -> str:
     if input_kind in {"pandas", "polars", "numpy", "pyarrow"}:
         return input_kind
     if training_kind in {"pandas", "polars", "numpy", "pyarrow"}:

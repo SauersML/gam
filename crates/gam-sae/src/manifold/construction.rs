@@ -3584,7 +3584,6 @@ impl SaeManifoldTerm {
             total_centered_variance,
             n,
             dispersion_r,
-            self.rank_charge_evidence(),
         )
     }
 

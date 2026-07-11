@@ -380,7 +380,7 @@ impl SaeManifoldTerm {
             None => 0.0,
         };
 
-        let v = if self.rank_charge_evidence {
+        let v = {
             // #5/(B): replace the COORDINATE-block ½log|H_tt| in the Laplace
             // complexity with the honest BIC ½·d_eff·log n on each atom's realised
             // decoder rank. The decoder-scale mispricing (`½log(a²‖B‖²)` scale,
@@ -394,18 +394,14 @@ impl SaeManifoldTerm {
             // hardcoded/self-relative floor). If it cannot be computed the vanishing-
             // atom detection silently degrades (R→0 keeps rank_eff≈rank), so surface
             // it loudly rather than hiding a re-admitted co-collapse.
-            let disp = match self.reconstruction_residual(target, rho).and_then(|resid| {
-                self.reconstruction_dispersion(&loss, &cache, rho, Some(resid.view()))
-            }) {
-                Ok(phi) => phi,
-                Err(e) => {
-                    log::warn!(
-                        "[#5 rank-charge] reconstruction_dispersion failed ({e}); noise floor \
-                         R→MIN_POSITIVE — vanishing-atom detection degraded this ρ-eval"
-                    );
-                    f64::MIN_POSITIVE
-                }
-            };
+            let residual = self.reconstruction_residual(target, rho)?;
+            let disp = self
+                .reconstruction_dispersion(&loss, &cache, rho, Some(residual.view()))
+                .map_err(|e| {
+                    format!(
+                        "SaeManifoldTerm::reml_criterion: rank-charge dispersion is required: {e}"
+                    )
+                })?;
             let d_eff = self.per_atom_realised_rank_dof(rho, disp)?;
             // Occupancy-aware effective sample size N_eff,k = Σ_i a_{ik}², the #2a
             // per-atom BIC log-scale (same quantity `per_atom_realised_rank_dof` uses
@@ -493,8 +489,6 @@ impl SaeManifoldTerm {
                 loss.total() + extra_penalty_energy + (0.5 * log_det - htt_half + rank_charge)
                     - occam
             }
-        } else {
-            loss.total() + extra_penalty_energy + 0.5 * log_det - occam
         };
         Ok((v, loss, cache))
     }
@@ -1896,18 +1890,14 @@ impl SaeManifoldTerm {
             &options,
             true,
         )?;
-        // #9: request the per-atom Grams + N_eff + log_det_tt in the SAME log-det
-        // pass ONLY when the rank charge is on (else zero overhead, historical path).
-        let mut rank_inputs = if self.rank_charge_evidence {
-            Some(StreamingRankInputs::default())
-        } else {
-            None
-        };
+        // #9: accumulate the per-atom Grams + N_eff + log_det_tt in the same
+        // log-det pass. These are required by the canonical rank-charge criterion.
+        let mut rank_inputs = StreamingRankInputs::default();
         let log_det = self.streaming_exact_arrow_log_det_with_lane(
             target,
             rho,
             registry,
-            rank_inputs.as_mut(),
+            Some(&mut rank_inputs),
             lane,
         )?;
         let occam = self.reml_occam_term(rho)?;
@@ -1920,25 +1910,27 @@ impl SaeManifoldTerm {
                 .map_err(|err| format!("SaeManifoldTerm::reml_criterion_streaming_exact: {err}"))?,
             None => 0.0,
         };
-        let v = if let Some(ri) = rank_inputs {
+        let v = {
+            let ri = rank_inputs;
             // #9/#5 streaming rank charge: replace the coordinate-block ½log|H_tt|
             // (= log_det_tt/2, exposed by the log-det pass) with Σ ½·d_eff·log n on
             // each atom's realised decoder rank, priced through the SAME
             // `rank_dof_from_grams` MP hard count as the dense path off the
             // chunk-accumulated Grams. The β/Schur block (the ‖B‖-independent part
             // of log_det) is untouched — bit-identical dense↔streaming by design.
-            let disp = match self.reconstruction_residual(target, rho).and_then(|resid| {
-                self.reconstruction_dispersion(&loss, &converged_cache, rho, Some(resid.view()))
-            }) {
-                Ok(phi) => phi,
-                Err(e) => {
-                    log::warn!(
-                        "[#9 rank-charge] reconstruction_dispersion failed ({e}); noise floor \
-                         R→MIN_POSITIVE — vanishing-atom detection degraded this ρ-eval"
-                    );
-                    f64::MIN_POSITIVE
-                }
-            };
+            let residual = self.reconstruction_residual(target, rho)?;
+            let disp = self
+                .reconstruction_dispersion(
+                    &loss,
+                    &converged_cache,
+                    rho,
+                    Some(residual.view()),
+                )
+                .map_err(|e| {
+                    format!(
+                        "SaeManifoldTerm::reml_criterion_streaming_exact: rank-charge dispersion is required: {e}"
+                    )
+                })?;
             let d_eff = self.rank_dof_from_grams(&ri.grams, &ri.n_eff, rho, disp)?;
             // #5 VETO (streaming): categorical Laplace-validity condition — a
             // rank_eff==0 (d_eff==0) atom reconstructs nothing, so its evidence is
@@ -1975,8 +1967,6 @@ impl SaeManifoldTerm {
                 loss.total() + extra_penalty_energy + (0.5 * log_det - htt_half + rank_charge)
                     - occam
             }
-        } else {
-            loss.total() + extra_penalty_energy + 0.5 * log_det - occam
         };
         Ok((v, loss, converged_cache))
     }

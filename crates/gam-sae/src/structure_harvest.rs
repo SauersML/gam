@@ -2706,11 +2706,7 @@ fn duplicate_atom(
     coords.push(term.assignment.coords[parent].clone());
     let assignment =
         crate::manifold::SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
-    let mut child = SaeManifoldTerm::new(atoms, assignment)?;
-    // Score the child on the parent's evidence-charge convention (see the note in
-    // `born_circle_atom`): `SaeManifoldTerm::new` resets `rank_charge_evidence`,
-    // and a birth/split gate must compare like-for-like Laplace complexity.
-    child.set_rank_charge_evidence(term.rank_charge_evidence());
+    let child = SaeManifoldTerm::new(atoms, assignment)?;
 
     let mut child_rho = rho.clone();
     if parent < child_rho.log_ard.len() {
@@ -4346,11 +4342,7 @@ fn born_atom(
     coords.push(born_coord_block);
     let assignment =
         crate::manifold::SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
-    let mut child = SaeManifoldTerm::new(atoms, assignment)?;
-    // Score the child on the parent's evidence-charge convention (see the note in
-    // `born_circle_atom`): `SaeManifoldTerm::new` resets `rank_charge_evidence`,
-    // and a birth gate must compare like-for-like Laplace complexity.
-    child.set_rank_charge_evidence(term.rank_charge_evidence());
+    let child = SaeManifoldTerm::new(atoms, assignment)?;
 
     let mut child_rho = rho.clone();
     // The born atom inherits the template atom's ARD block shape (disabled if
@@ -4487,16 +4479,7 @@ pub(crate) fn born_circle_atom(
     coords.push(born_coord_block);
     let assignment =
         crate::manifold::SaeAssignment::with_mode(logits, coords, term.assignment.mode)?;
-    let mut child = SaeManifoldTerm::new(atoms, assignment)?;
-    // Propagate the evidence-charge convention from the parent. `SaeManifoldTerm::
-    // new` resets `rank_charge_evidence` to its default (false); if the incumbent
-    // dictionary is scored on the occupancy-aware BIC rank charge, the born
-    // candidate MUST be scored the same way, or the birth gate compares two REML
-    // values on different Laplace-complexity scales (the raw per-row coordinate
-    // log-det ½log|H_tt| grows ≈ O(n) per atom with no occam offset, so a
-    // htt-charged candidate looks arbitrarily worse than a rank-charged incumbent
-    // and every good birth is rejected at large n).
-    child.set_rank_charge_evidence(term.rank_charge_evidence());
+    let child = SaeManifoldTerm::new(atoms, assignment)?;
 
     let mut child_rho = rho.clone();
     let inherited = child_rho

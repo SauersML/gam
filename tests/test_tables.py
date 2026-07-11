@@ -72,7 +72,7 @@ def test_restore_output_table_rejects_unknown_return_type() -> None:
             {"mean": [1.0], "linear_predictor": [0.0]},
             requested="arrowish",
             input_kind="mapping",
-            training_kind=None,
+            training_kind="unknown",
         )
 
 
@@ -87,7 +87,7 @@ def test_restore_output_table_dict_returns_prediction_result_with_field_access()
         },
         requested="dict",
         input_kind="mapping",
-        training_kind=None,
+        training_kind="unknown",
     )
 
     assert isinstance(restored, dict)
@@ -118,7 +118,7 @@ def test_restore_output_table_supports_pyarrow_output() -> None:
         {"mean": [1.0, 2.0], "linear_predictor": [0.0, 0.5]},
         requested="pyarrow",
         input_kind="mapping",
-        training_kind=None,
+        training_kind="unknown",
     )
 
     assert isinstance(restored, pyarrow.Table)

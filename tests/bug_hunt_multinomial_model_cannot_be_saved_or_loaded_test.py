@@ -52,6 +52,7 @@ def test_multinomial_model_save_load_round_trip():
 
     assert type(m2) is MultinomialModel
     assert m2.classes_ == m.classes_
+    assert m2.training_table_kind == "pandas"
 
     got = np.asarray(m2.predict(frame))
     assert got.shape == expected.shape
@@ -67,6 +68,7 @@ def test_multinomial_model_dumps_loads_round_trip():
 
     assert type(m2) is MultinomialModel
     assert m2.classes_ == m.classes_
+    assert m2.training_table_kind == "pandas"
     np.testing.assert_allclose(
         np.asarray(m2.predict(frame)),
         np.asarray(m.predict(frame)),
