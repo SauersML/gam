@@ -256,7 +256,8 @@ impl<S, const K: usize> FixedRuntimeJet<S, K> {
 impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for FixedRuntimeJet<S, K> {
     type Workspace = ();
 
-    fn constant(c: f64, dimension: usize, _workspace: &'arena Self::Workspace) -> Self {
+    fn constant(c: f64, dimension: usize, workspace: &'arena Self::Workspace) -> Self {
+        debug_assert_eq!(core::mem::size_of_val(workspace), 0);
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
         Self {
             inner: S::constant(c),
@@ -267,8 +268,9 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
         x: f64,
         axis: usize,
         dimension: usize,
-        _workspace: &'arena Self::Workspace,
+        workspace: &'arena Self::Workspace,
     ) -> Self {
+        debug_assert_eq!(core::mem::size_of_val(workspace), 0);
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
         Self {
             inner: S::variable(x, axis),
@@ -358,11 +360,7 @@ impl DynamicJetArena {
     /// Allocate and initialize a runtime-sized slice in the arena. Row programs
     /// use this for their primary-scalar arrays so those arrays share the same
     /// reusable workspace as derivative channels.
-    pub fn alloc_slice_fill_with<T>(
-        &self,
-        len: usize,
-        fill: impl FnMut(usize) -> T,
-    ) -> &mut [T] {
+    pub fn alloc_slice_fill_with<T>(&self, len: usize, fill: impl FnMut(usize) -> T) -> &mut [T] {
         self.bump.alloc_slice_fill_with(len, fill)
     }
 }
