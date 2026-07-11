@@ -116,23 +116,18 @@ where
         if mu.abs() >= rank_floor {
             return Ok(x);
         }
-        // #2253 — a NON-POSITIVE μ is NOT a fatal "not a stable minimum". The
-        // exact Hessian `A = B + ΔC` carries the residual curvature ΔC, which can
-        // tip a weakly-identified inner direction (decoder amplitude / scale /
-        // residual gauge, off the exactly-projected rotational gauge) marginally
-        // indefinite even AT the Gauss-Newton minimum — a genuine feature of a
-        // nonzero-residual fit, not a convergence failure. The evidence factor
-        // this outer gradient differentiates already handles that direction the
-        // principled way: `factor_spectral_deflated_evidence_row` deflates EVERY
-        // non-positive eigenvalue to unit stiffness `+1` (a ρ-independent
-        // contribution). So the IFT response along it is spurious `1/μ`
-        // amplification of a direction the evidence stiffened away — it MUST be
-        // deflated here too, or the outer gradient differentiates a fictitious
-        // criterion (the old `μ ≤ 0` refusal aborted the whole fit — the
-        // measured 2026-07-11 #2253 residual μ=-1.66e-3 on a K=1 circle). Route
-        // it into the same inverse-power deflation as a small-positive near-null
-        // direction. A hard error survives only for a non-finite / un-isolatable
-        // pencil below.
+        // Reaching here means `|μ| < rank_floor`: the solution is dominated by a
+        // genuinely SINGULAR (numerically curvature-free) pencil direction, whose
+        // `1/μ` amplification is an unidentifiable artifact, not a derivative. A
+        // resolved indefinite direction (`μ < 0`, `|μ| ≥ rank_floor`) was already
+        // returned above and is NOT deflated: the criterion value's `½log|B|`
+        // uses the majorized joint factor `B`, which is fully PD along it (the
+        // undamped inner solve SUCCEEDED, so `factor_spectral_deflated_evidence_
+        // row` — which only stiffens non-PD PER-ROW blocks — never fired), so the
+        // value genuinely depends on that direction and its `A⁻¹` IFT response is
+        // a real part of the θ-adjoint. Only the singular direction handled below
+        // is one the evidence factor would stiffen to unit curvature, so only its
+        // response is spurious and must be projected out.
         // Sharpen the offending direction by inverse power iteration on
         // the pencil (`v ← A⁻¹(B v)`, B-normalized); the corrupted `x` is
         // already dominated by it, so it is the natural seed. Convergence
