@@ -6323,10 +6323,28 @@ impl SaeManifoldTerm {
                 inner_incumbent_restored = true;
                 state_moved = true;
                 if self.frames_active() {
+                    // #2230 — the post-restore frame re-polar is the SAME
+                    // non-monotone block-coordinate hook the in-loop pair
+                    // guards against (it can RAISE the penalized objective by
+                    // trading reconstruction residual for decoder smoothness).
+                    // Running it unguarded here perturbed the very incumbent
+                    // just restored for being the best objective. Guard it
+                    // identically: keep the re-polar only when the banked
+                    // objective does not increase, else return the incumbent
+                    // bit-for-bit.
+                    let pre_refresh_state = self.snapshot_mutable_state();
                     self.refresh_active_frames_from_data(target)
                         .map_err(|err| {
                             format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
                         })?;
+                    let post_refresh_obj = self
+                        .penalized_objective_total(target, rho, analytic_penalties, 1.0)
+                        .unwrap_or(f64::INFINITY);
+                    if !(post_refresh_obj.is_finite()
+                        && post_refresh_obj <= best_reconstruction_obj + obj_scale)
+                    {
+                        self.restore_mutable_state(&pre_refresh_state)?;
+                    }
                 }
             }
         }
