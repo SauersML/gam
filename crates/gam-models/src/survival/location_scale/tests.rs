@@ -6485,20 +6485,22 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
         b3x: &[f64],
     ) -> S {
         let inv_sigma_entry = vars[7].neg().exp();
-        let u0 = vars[0].sub(&vars[4].mul(&inv_sigma_entry));
+        let q0 = vars[4].mul(&inv_sigma_entry).neg();
         let inv_sigma_exit = vars[6].neg().exp();
-        let u1 = vars[1].sub(&vars[3].mul(&inv_sigma_exit));
-        let g0 = vars[2].add(&inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5])));
-        let mut u0w = u0;
-        let mut u1w = u1;
+        let q1 = vars[3].mul(&inv_sigma_exit).neg();
+        let qdot0 = inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5]));
+        let mut q0w = q0;
+        let mut q1w = q1;
         let mut m1 = S::constant(1.0);
         for j in 0..pw {
             let bw = vars[9 + j];
-            u0w = u0w.add(&bw.mul(&u0.compose_unary([b0e[j], b1e[j], b2e[j], 0.0, 0.0])));
-            u1w = u1w.add(&bw.mul(&u1.compose_unary([b0x[j], b1x[j], b2x[j], b3x[j], 0.0])));
-            m1 = m1.add(&bw.mul(&u1.compose_unary([b1x[j], b2x[j], b3x[j], 0.0, 0.0])));
+            q0w = q0w.add(&bw.mul(&q0.compose_unary([b0e[j], b1e[j], b2e[j], 0.0, 0.0])));
+            q1w = q1w.add(&bw.mul(&q1.compose_unary([b0x[j], b1x[j], b2x[j], b3x[j], 0.0])));
+            m1 = m1.add(&bw.mul(&q1.compose_unary([b1x[j], b2x[j], b3x[j], 0.0, 0.0])));
         }
-        let g = m1.mul(&g0);
+        let u0w = vars[0].add(&q0w);
+        let u1w = vars[1].add(&q1w);
+        let g = vars[2].add(&m1.mul(&qdot0));
         let mut nll = u0w
             .compose_unary([
                 kernel.log_s0,
@@ -6576,15 +6578,11 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
             .build_dynamic_geometry(&states)
             .expect("dynamic geometry");
 
-        // Warp basis derivative stacks at the MODEL residual indices
-        // `value(u1) = h_exit + q_exit` and `value(u0) = h_entry + q_entry` — the
-        // exact points `sls_row_nll_wiggle` composes the stack onto (so the
-        // production §13 kernel and this independent tower agree). NOT the raw
-        // fixture `q0`: the oracle family transforms `eta_t`, so the fixture-seed
-        // index differs from the model's actual residual. Exit needs B,B',B'',B''';
-        // entry needs B,B',B''.
-        let u1_index = &dynamic.h_exit + &dynamic.q_exit;
-        let u0_index = &dynamic.h_entry + &dynamic.q_entry;
+        // Warp basis derivative stacks at the unwarped model indices q0. The
+        // criterion defines q=q0+βB(q0), then u=h+q; `dynamic.q_*` is already q
+        // and therefore cannot be the composition center without double-warping.
+        let u1_index = &dynamic.q_base_exit;
+        let u0_index = &dynamic.q_base_entry;
         let bx0 = survival_wiggle_basis_with_options(
             u1_index.view(),
             &knots,
