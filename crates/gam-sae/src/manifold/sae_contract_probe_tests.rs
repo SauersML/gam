@@ -611,8 +611,8 @@ fn sae_isometry_assembled_curvature_is_decoder_scale_invariant() {
 ///
 /// Co-scaling the physical target and decoder by `c` makes every data/smoothness
 /// energy and Hessian block scale by `c²`. The dimensionless isometry residual
-/// itself does not change, so its dimensional coefficient and the two numerical
-/// ridge curvatures must co-scale by `c²` as well. Under that complete physical
+/// and coordinate prior do not change, so their dimensional coefficients and
+/// the two numerical ridge curvatures must co-scale by `c²` as well. Under that complete physical
 /// co-scale, the normalized reconstruction `f/c` and normalized penalized
 /// criterion `V/c²` must agree with the unit-scale fit. This is the actual
 /// gauge-invariant fit property. Requiring each penalized optimum to have nearly
@@ -667,7 +667,7 @@ fn sae_isometry_joint_fit_is_physical_coscale_invariant_2099() {
         let mut isometry = IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(1)), 1);
         isometry.scalar_weight = scale_sq;
         registry.push(AnalyticPenaltyKind::Isometry(Arc::new(isometry)));
-        let mut rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![1.0_f64.ln()]]);
+        let mut rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![scale_sq.ln()]]);
 
         let loss = term
             .run_joint_fit_arrow_schur(
