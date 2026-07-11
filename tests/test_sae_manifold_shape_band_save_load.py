@@ -46,11 +46,24 @@ def test_shape_band_survives_save_load_to_tight_tolerance(tmp_path: Path):
     assert atom.decoder_covariance is not None, "fresh fit must expose decoder_covariance"
 
     before = fit.shape_uncertainty(0)
+    decoder_before = np.asarray(atom.decoder_coefficients, dtype=float).copy()
+    coords_before = np.asarray(atom.coords, dtype=float).copy()
+    rendered_before = np.asarray(fit.reconstruct_training(), dtype=float).copy()
+    topology_before = (fit.atom_topology, tuple(fit.atom_topologies))
 
     path = tmp_path / "sae_band.json"
     fit.save(path)
     restored = gamfit.ManifoldSAE.load(path)
     after = restored.shape_uncertainty(0)
+
+    np.testing.assert_array_equal(
+        np.asarray(restored.atoms[0].decoder_coefficients), decoder_before
+    )
+    np.testing.assert_array_equal(np.asarray(restored.atoms[0].coords), coords_before)
+    np.testing.assert_array_equal(
+        np.asarray(restored.reconstruct_training()), rendered_before
+    )
+    assert (restored.atom_topology, tuple(restored.atom_topologies)) == topology_before
 
     for key in ("coords", "mean", "sd", "lower", "upper"):
         np.testing.assert_allclose(
