@@ -6901,7 +6901,7 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
 
         // DIAGNOSTIC (#932): report max relative error per direction family to
         // localize the coeff-space FD vs analytic pullback convention gap.
-        let mut mk = |du: &[f64], dv: &[f64], label: &str| {
+        let mk = |du: &[f64], dv: &[f64], label: &str| {
             let d_dir_analytic = survival_ls_wiggle_directional_derivative_dense(
                 &family, &q0, &dynamic0, 0.0, &RowSet::All, du,
             )
