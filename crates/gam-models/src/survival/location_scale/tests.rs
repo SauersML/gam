@@ -6824,8 +6824,8 @@ fn survival_ls_wiggle_runtime_backend_runs_above_old_width_ceiling_932() {
 ///     the contracted `D_dir H = Σ_c ℓ_abc dir_c`,
 ///   * fourth order: [`survival_ls_wiggle_second_directional_derivative_dense`],
 ///     the contracted `D_u D_v H = Σ_cd ℓ_abcd u_c v_d`,
-/// — and pins each against an INDEPENDENT central-difference (5-point
-/// Richardson) witness built from OTHER production entry points, exactly as
+/// — and pins each against an INDEPENDENT Richardson-extrapolated 5-point
+/// central-difference witness built from OTHER production entry points, exactly as
 /// `flex_verify_932_tests` differences the hand path's own returned value:
 ///   * `D_dir H` is cross-checked against a Richardson derivative of the
 ///     production joint Hessian [`survival_ls_wiggle_joint_hessian_dense`]
@@ -6937,7 +6937,7 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
             )
             .expect("§13 dense wiggle directional")
         };
-        // 5-point Richardson first derivative of a matrix-valued map at s = 0:
+        // Fourth-order 5-point first derivative of a matrix-valued map at s = 0:
         // f'(0) ≈ (−f(2h) + 8 f(h) − 8 f(−h) + f(−2h)) / (12 h).
         let five_point = |fph: &Array2<f64>,
                           fp2h: &Array2<f64>,
@@ -6970,49 +6970,105 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
             )
             .expect("analytic second directional");
             let h3 = 1e-2;
-            let fd_third = five_point(
+            let coarse_third = five_point(
                 &hessian_at(h3, du),
                 &hessian_at(2.0 * h3, du),
                 &hessian_at(-h3, du),
                 &hessian_at(-2.0 * h3, du),
                 h3,
             );
+            let fine_h3 = 0.5 * h3;
+            let fine_third = five_point(
+                &hessian_at(fine_h3, du),
+                &hessian_at(2.0 * fine_h3, du),
+                &hessian_at(-fine_h3, du),
+                &hessian_at(-2.0 * fine_h3, du),
+                fine_h3,
+            );
+            // The 5-point stencil has leading error C h^4. Extrapolating the
+            // h and h/2 estimates cancels that term exactly, leaving O(h^6).
+            let coarse_extrap_third = (fine_third.mapv(|x| 16.0 * x) - &coarse_third) / 15.0;
+            let finer_h3 = 0.5 * fine_h3;
+            let finer_third = five_point(
+                &hessian_at(finer_h3, du),
+                &hessian_at(2.0 * finer_h3, du),
+                &hessian_at(-finer_h3, du),
+                &hessian_at(-2.0 * finer_h3, du),
+                finer_h3,
+            );
+            let fd_third = (finer_third.mapv(|x| 16.0 * x) - &fine_third) / 15.0;
             let mut third_max = 0.0_f64;
             let mut third_at = (0, 0);
+            let mut third_convergence = 0.0_f64;
             for ((a, b), &analytic) in d_dir_analytic.indexed_iter() {
                 let e = (analytic - fd_third[[a, b]]).abs() / (1.0 + analytic.abs());
                 if e > third_max {
                     third_max = e;
                     third_at = (a, b);
                 }
+                third_convergence = third_convergence.max(
+                    (fd_third[[a, b]] - coarse_extrap_third[[a, b]]).abs()
+                        / (1.0 + fd_third[[a, b]].abs()),
+                );
             }
             let h4 = 2e-2;
-            let fd_fourth = five_point(
+            let coarse_fourth = five_point(
                 &directional_at(h4, dv, du),
                 &directional_at(2.0 * h4, dv, du),
                 &directional_at(-h4, dv, du),
                 &directional_at(-2.0 * h4, dv, du),
                 h4,
             );
+            let fine_h4 = 0.5 * h4;
+            let fine_fourth = five_point(
+                &directional_at(fine_h4, dv, du),
+                &directional_at(2.0 * fine_h4, dv, du),
+                &directional_at(-fine_h4, dv, du),
+                &directional_at(-2.0 * fine_h4, dv, du),
+                fine_h4,
+            );
+            let coarse_extrap_fourth = (fine_fourth.mapv(|x| 16.0 * x) - &coarse_fourth) / 15.0;
+            let finer_h4 = 0.5 * fine_h4;
+            let finer_fourth = five_point(
+                &directional_at(finer_h4, dv, du),
+                &directional_at(2.0 * finer_h4, dv, du),
+                &directional_at(-finer_h4, dv, du),
+                &directional_at(-2.0 * finer_h4, dv, du),
+                finer_h4,
+            );
+            let fd_fourth = (finer_fourth.mapv(|x| 16.0 * x) - &fine_fourth) / 15.0;
             let mut fourth_max = 0.0_f64;
             let mut fourth_at = (0, 0);
+            let mut fourth_convergence = 0.0_f64;
             for ((a, b), &analytic) in d2_analytic.indexed_iter() {
                 let e = (analytic - fd_fourth[[a, b]]).abs() / (1.0 + analytic.abs());
                 if e > fourth_max {
                     fourth_max = e;
                     fourth_at = (a, b);
                 }
+                fourth_convergence = fourth_convergence.max(
+                    (fd_fourth[[a, b]] - coarse_extrap_fourth[[a, b]]).abs()
+                        / (1.0 + fd_fourth[[a, b]].abs()),
+                );
             }
             eprintln!(
                 "ZZ932 {distribution:?} {label}: third_max={third_max:.3e} at {third_at:?} \
-                 (analytic={:+.9e}, fd={:+.9e}), fourth_max={fourth_max:.3e} at {fourth_at:?} \
-                 (analytic={:+.9e}, fd={:+.9e})",
+                 (analytic={:+.9e}, fd={:+.9e}, convergence={third_convergence:.3e}), \
+                 fourth_max={fourth_max:.3e} at {fourth_at:?} \
+                 (analytic={:+.9e}, fd={:+.9e}, convergence={fourth_convergence:.3e})",
                 d_dir_analytic[third_at],
                 fd_third[third_at],
                 d2_analytic[fourth_at],
                 fd_fourth[fourth_at],
             );
-            (third_max, third_at, fourth_max, fourth_at)
+            (
+                third_max,
+                third_at,
+                third_convergence,
+                fourth_max,
+                fourth_at,
+                fourth_convergence,
+            )
         };
 
         let full_u: Vec<f64> = (0..ncoef)
@@ -7047,26 +7103,33 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
         let base_v = baseonly(&full_v);
         let cases = [
             ("FULL", mk(&full_u, &full_v, "FULL")),
-            (
-                "WIGGLE_ONLY",
-                mk(&wiggle_u, &wiggle_v, "WIGGLE_ONLY"),
-            ),
+            ("WIGGLE_ONLY", mk(&wiggle_u, &wiggle_v, "WIGGLE_ONLY")),
             ("BASE_ONLY", mk(&base_u, &base_v, "BASE_ONLY")),
         ];
         let mut failures = Vec::new();
-        for (label, (third_max, third_at, fourth_max, fourth_at)) in cases {
+        for (
+            label,
+            (third_max, third_at, third_convergence, fourth_max, fourth_at, fourth_convergence),
+        ) in cases
+        {
             // The header's contract: a dropped warp-coupling term shows O(1)
             // relative error, so these bounds gate correctness while leaving
-            // generous room for the five-point stencils' own truncation/
-            // cancellation noise (h=1e-2 / 2e-2).
+            // generous room for the extrapolated stencils' own truncation/
+            // cancellation noise (coarse h=1e-2 / 2e-2).
             if third_max >= 1.0e-5 {
+                failures.push(format!("{label} third={third_max:.3e} at {third_at:?}"));
+            }
+            if third_convergence >= 1.0e-5 {
                 failures.push(format!(
-                    "{label} third={third_max:.3e} at {third_at:?}"
+                    "{label} third Richardson convergence={third_convergence:.3e}"
                 ));
             }
             if fourth_max >= 1.0e-4 {
+                failures.push(format!("{label} fourth={fourth_max:.3e} at {fourth_at:?}"));
+            }
+            if fourth_convergence >= 1.0e-4 {
                 failures.push(format!(
-                    "{label} fourth={fourth_max:.3e} at {fourth_at:?}"
+                    "{label} fourth Richardson convergence={fourth_convergence:.3e}"
                 ));
             }
         }
@@ -7154,8 +7217,8 @@ fn survival_ls_wiggle_kernel_value_matches_direct_loglik_932() {
 
         // Wiggle jet kernel: single warp reconstructed from the UNWARPED base
         // predictors, βw live.
-        let kernel = SurvivalLsWiggleRowKernel::new(&family, &dynamic, 0.0)
-            .expect("wiggle row kernel");
+        let kernel =
+            SurvivalLsWiggleRowKernel::new(&family, &dynamic, 0.0).expect("wiggle row kernel");
 
         for row in 0..n {
             let arena = DynamicJetArena::new();
