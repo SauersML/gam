@@ -165,9 +165,11 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         .try_resume_from_checkpoint(n_params)
         .map(Array1::from)
         .unwrap_or(initial_flat);
+    objective.logdet_fd_probe_enabled = true;
     let audited = objective
         .eval(&banked)
         .expect("gradient eval at the audited rho");
+    objective.logdet_fd_probe_enabled = false;
     let grad = audited.gradient;
     assert!(
         objective.term.frames_active(),

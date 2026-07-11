@@ -649,6 +649,11 @@ pub struct SaeManifoldOuterObjective {
     /// early-return and every lane is byte-identical to the historical path.
     /// Installed by [`Self::with_crosscoder_blocks`].
     crosscoder_blocks: Option<CrosscoderBlockPricing>,
+    /// #2253: enable the expensive axis-aligned log-det finite-difference
+    /// diagnostic for one explicitly selected test evaluation. Disabled for
+    /// every ordinary lib test; absent from production builds.
+    #[cfg(test)]
+    pub(crate) logdet_fd_probe_enabled: bool,
 }
 
 /// #2230/#2087 exact basin-bundle memory admission.
@@ -770,6 +775,8 @@ impl SaeManifoldOuterObjective {
             checkpoint_fingerprint,
             checkpoint_path,
             crosscoder_blocks: None,
+            #[cfg(test)]
+            logdet_fd_probe_enabled: false,
         }
     }
 
@@ -3616,7 +3623,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // the desync is in `explicit`/`occam`; if not, the log-det channel is
         // the culprit. Also FD the total. Keyed by ρ.
         #[cfg(test)]
-        {
+        if self.logdet_fd_probe_enabled {
             let n_p = rho.len();
             let h = 1.0e-5_f64;
             let ld0 = crate::manifold::arrow_log_det_from_cache(&cache);
