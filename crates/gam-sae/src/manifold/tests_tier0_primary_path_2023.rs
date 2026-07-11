@@ -26,6 +26,32 @@ mod tests {
     use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
     use ndarray::{Array2, Axis};
 
+    /// Test-visible forwarding logger: the engine's diagnostic channels
+    /// (`log::debug!` bail naming in `terminal_exact_newton_polish`, the
+    /// `log::warn!` incumbent/warranty restores) are silently dropped by the
+    /// test harness unless a logger is installed — the exact trap that left
+    /// the tier-0 refusal unadjudicated across multiple probe runs. eprintln
+    /// is the test-side convention (`log::warn` is dropped in tests); this
+    /// forwards every record so a plain `--nocapture` run shows the engine's
+    /// own account of WHY it refused.
+    struct ForwardingTestLogger;
+    impl log::Log for ForwardingTestLogger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+        fn flush(&self) {}
+    }
+    static FORWARDING_TEST_LOGGER: ForwardingTestLogger = ForwardingTestLogger;
+    fn install_test_logger() {
+        // Ignore the error when another test already installed a logger.
+        if log::set_logger(&FORWARDING_TEST_LOGGER).is_ok() {
+            log::set_max_level(log::LevelFilter::Debug);
+        }
+    }
+
     /// `N_CIRCLE` evenly-spaced points on the unit circle, plus a per-dim constant
     /// `offset` (the global DC Tier-0 must carry) plus small deterministic iid
     /// observation noise.
@@ -169,6 +195,7 @@ mod tests {
     /// target's, i.e. the DC is present in `report.fitted`, carried by Tier-0).
     #[test]
     fn primary_entry_installs_tier0_mean_on_raw_target() {
+        install_test_logger();
         const OFFSET: f64 = 7.0;
         let target = circle_target(OFFSET);
         let target_col_mean = target.mean_axis(Axis(0)).unwrap();
@@ -224,6 +251,7 @@ mod tests {
     /// target, so a mean-zero target yields μ ≈ 0 (no double-subtraction hazard).
     #[test]
     fn primary_entry_tier0_is_a_noop_on_centered_target() {
+        install_test_logger();
         let target = circle_target(0.0); // the circle coords are already mean-zero
         let report = run_primary(target);
         let mu = report
