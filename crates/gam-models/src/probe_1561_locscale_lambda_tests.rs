@@ -68,7 +68,12 @@ fn pearson(a: &[f64], b: &[f64]) -> f64 {
 
 fn rmse(a: &[f64], b: &[f64]) -> f64 {
     let n = a.len() as f64;
-    (a.iter().zip(b).map(|(&x, &y)| (x - y) * (x - y)).sum::<f64>() / n).sqrt()
+    (a.iter()
+        .zip(b)
+        .map(|(&x, &y)| (x - y) * (x - y))
+        .sum::<f64>()
+        / n)
+        .sqrt()
 }
 
 fn fmt_vec(v: &[f64]) -> String {
