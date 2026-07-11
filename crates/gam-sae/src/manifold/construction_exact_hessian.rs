@@ -850,22 +850,11 @@ impl SaeManifoldTerm {
         // bit-for-bit (folding in any minibatch `penalty_scale` baked into it).
         let mut smooth_explicit = self.decoder_smoothness_value_per_atom(&lambda_smooth_vec);
         let smooth_explicit_sum: f64 = smooth_explicit.iter().sum();
-        // #2253: the criterion's smoothness penalty carries `renorm` (= the
-        // penalty_scale / normalization baked into `loss.smoothness`). The explicit
-        // term applies it just below; the θ-adjoint's IFT rhs
-        // `∂g_inner/∂log λ_k = λ_k S_k β̂_k` (`outer_rho_gradient_ift_rhs`)
-        // differentiates the SAME renormed penalty, so its response must be scaled
-        // by `smooth_renorm` too (applied in the adjoint loop below). Without it the
-        // adjoint is off by `1/renorm` and the outer gradient desyncs from
-        // `d(value)/dρ` — the K=1 circle non-stationary stall (measured adjoint
-        // −0.687 vs true −0.389 = renorm·(−0.687)).
-        let smooth_renorm = if smooth_explicit_sum.abs() > 0.0 {
-            loss.smoothness / smooth_explicit_sum
-        } else {
-            1.0
-        };
-        for v in smooth_explicit.iter_mut() {
-            *v *= smooth_renorm;
+        if smooth_explicit_sum.abs() > 0.0 {
+            let renorm = loss.smoothness / smooth_explicit_sum;
+            for v in smooth_explicit.iter_mut() {
+                *v *= renorm;
+            }
         }
         // #2080: the per-atom smoothness EDF `tr(H⁻¹ M_k)` off the shared
         // selected-inverse bundle when the surrogate lane supplied it; the dense
@@ -1025,21 +1014,7 @@ impl SaeManifoldTerm {
             for idx in 0..gamma.beta.len() {
                 dot += gamma.beta[idx] * solved.beta[idx];
             }
-            // #2253: for a smoothing coordinate the IFT rhs is the penalty
-            // gradient `λ_k S_k β̂_k`, which must carry the same `smooth_renorm`
-            // the criterion's penalty (and its explicit derivative) carries. Since
-            // `A⁻¹` is linear, scaling `−½·⟨Γ, A⁻¹ rhs⟩` by `smooth_renorm` is
-            // identical to scaling the rhs. Other coordinates (sparse/ard/block)
-            // are unaffected (`renorm == 1` for them).
-            let smooth_start = rho.smooth_flat_start();
-            let scale = if k_smooth > 0
-                && (smooth_start..smooth_start + k_smooth).contains(&coord)
-            {
-                smooth_renorm
-            } else {
-                1.0
-            };
-            third_order_correction[coord] = -0.5 * dot * scale;
+            third_order_correction[coord] = -0.5 * dot;
         }
 
         Ok(SaeOuterRhoGradientComponents {

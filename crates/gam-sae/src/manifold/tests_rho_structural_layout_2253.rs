@@ -108,15 +108,18 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let h = 1.0e-3_f64;
     let plus = &base + &(h * &direction);
     let minus = &base - &(h * &direction);
-    let cost_at = |rho: &Array1<f64>| {
-        let mut objective = planted_periodic_outer_objective_2253();
-        let cost = objective
-            .eval_cost(rho)
-            .expect("directional finite-difference value probe must converge");
-        (cost, objective.probe_telemetry())
-    };
-    let (plus_cost, plus_telemetry) = cost_at(&plus);
-    let (minus_cost, minus_telemetry) = cost_at(&minus);
+    // Probe both sides from the accepted base basin, exactly as the production
+    // line search does. A fresh cold objective at each side differentiates its
+    // seed-dependent basin-entry map rather than the branch whose analytic
+    // derivative `evaluation.gradient` describes.
+    let plus_cost = gradient_objective
+        .eval_cost(&plus)
+        .expect("+h directional value probe must converge");
+    let plus_telemetry = gradient_objective.probe_telemetry();
+    let minus_cost = gradient_objective
+        .eval_cost(&minus)
+        .expect("-h directional value probe must converge");
+    let minus_telemetry = gradient_objective.probe_telemetry();
     assert!(
         plus_cost.is_finite(),
         "+h must evaluate feasible REML evidence: \
@@ -147,7 +150,10 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     assert!(
         (analytic - finite_difference).abs() <= 5.0e-3 * scale,
         "K=1 Softmax active-coordinate derivative mismatch: analytic direction={analytic:.9e}, \
-         central FD={finite_difference:.9e}, error={:.3e}, scale={scale:.3e}",
-        (analytic - finite_difference).abs()
+         central FD={finite_difference:.9e}, error={:.3e}, scale={scale:.3e}, \
+         gradient={:?}, base_cost={base_cost:.17e}, plus_cost={plus_cost:.17e}, \
+         minus_cost={minus_cost:.17e}",
+        (analytic - finite_difference).abs(),
+        evaluation.gradient
     );
 }

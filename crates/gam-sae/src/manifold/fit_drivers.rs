@@ -260,7 +260,21 @@ impl SaeManifoldTerm {
                     current.latent_id() == expected.latent_id()
                         && current.as_flat() == expected.as_flat()
                 });
-        atoms_match && self.assignment.logits == snapshot.logits && coords_match
+        let row_layout_matches = match (&self.last_row_layout, &snapshot.last_row_layout) {
+            (Some(current), Some(expected)) => {
+                current.active_atoms == expected.active_atoms
+                    && current.logit_atoms == expected.logit_atoms
+                    && current.coord_starts == expected.coord_starts
+                    && current.coord_offsets_full == expected.coord_offsets_full
+                    && current.coord_dims == expected.coord_dims
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        atoms_match
+            && self.assignment.logits == snapshot.logits
+            && coords_match
+            && row_layout_matches
     }
 
     /// Restore the mutable state captured by [`Self::snapshot_mutable_state`].
@@ -5082,6 +5096,15 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<EvidenceJointFitOutcome, String> {
+        // Entry preparation is part of the evidence map too: rank reduction,
+        // frame activation, collapse guards, and cold-start placement all run
+        // before the Newton loop's explicit `state_moved` tracking begins. Keep
+        // an exact snapshot here so none of those model transitions can be
+        // mistaken for an idempotent re-entry. The snapshot is differential
+        // (large basis caches are deterministic and omitted), so this does not
+        // copy the dominant N x M storage.
+        let entry_state = self.snapshot_mutable_state();
+        let entry_temperature = self.assignment.mode.temperature();
         let outcome = self.run_joint_fit_arrow_schur_with_termination_policy(
             target,
             rho,
@@ -5099,12 +5122,15 @@ impl SaeManifoldTerm {
                     .to_string(),
             );
         }
+        let entry_state_recurred = self.matches_mutable_state(&entry_state)
+            && self.assignment.mode.temperature().to_bits() == entry_temperature.to_bits();
         Ok(EvidenceJointFitOutcome {
             loss: outcome.loss,
             fixed_point: matches!(
                 outcome.termination,
                 JointFitTermination::Frozen | JointFitTermination::NoStrictDecrease
-            ) && !outcome.state_moved,
+            ) && !outcome.state_moved
+                && entry_state_recurred,
         })
     }
 

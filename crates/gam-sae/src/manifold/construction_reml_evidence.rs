@@ -841,6 +841,59 @@ impl SaeManifoldTerm {
             // provably discarded is removed.
             let gradient_stationary =
                 grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance;
+            // #2253 — a coarse KKT-band hit is only an admission signal, not the
+            // differentiable root the IFT gradient assumes. A bounded evidence
+            // chunk reports `fixed_point` only when a whole re-entry accepted no
+            // strict Newton/proximal step and made no temperature/polish state
+            // transition. If the last chunk still moved, keep refining under the
+            // existing progress/refusal accounting even though the KKT residual is
+            // already below its ordinary-fit tolerance. No new tolerance or work
+            // budget is introduced: either the existing grant reaches the true
+            // no-descent recurrence, or the existing non-convergence refusal wins.
+            if gradient_stationary && !*evidence_fixed_point {
+                let refine_limit = Self::refine_iteration_limit(
+                    total_inner_iter,
+                    base_refine_iter,
+                    progress_refine_iter,
+                    previous_refine_grad_norm,
+                    grad_norm,
+                    saw_refine_progress,
+                );
+                let effective_refine_limit = refine_limit
+                    .checked_add(budget_escalation_extra)
+                    .ok_or_else(|| {
+                        "SaeManifoldTerm::reml_criterion: inner-refinement budget overflow"
+                            .to_string()
+                    })?;
+                if total_inner_iter >= effective_refine_limit {
+                    return Err(format!(
+                        "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
+                         KKT entered its admission band (raw ‖g‖={grad_norm:.6e}, quotient \
+                         ‖Π⊥gauge g‖={quotient_grad_norm:.6e}, tolerance {grad_tolerance:.6e}) \
+                         but an evidence-only re-entry still made a strict state/objective move \
+                         after {total_inner_iter} granted iterations. Refusing to differentiate \
+                         a non-idempotent inner map."
+                    ));
+                }
+                let remaining = effective_refine_limit - total_inner_iter;
+                let refine_iter = inner_max_iter.max(1).min(remaining);
+                saw_refine_progress |=
+                    Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
+                previous_refine_grad_norm = Some(grad_norm);
+                let refine = self.run_joint_fit_arrow_schur_for_evidence(
+                    target,
+                    rho_fixed,
+                    registry,
+                    refine_iter,
+                    learning_rate,
+                    ridge_ext_coord,
+                    ridge_beta,
+                )?;
+                *loss = refine.loss;
+                *evidence_fixed_point = refine.fixed_point;
+                total_inner_iter += refine_iter;
+                continue;
+            }
             if gradient_stationary {
                 // #1095/#2228 — decouple this ACCEPT from undamped-factor success,
                 // the same acceptance-local pattern as the stall path below. A
@@ -1163,7 +1216,10 @@ impl SaeManifoldTerm {
                 && relative_decrease < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
                 && captured_fraction < SAE_MANIFOLD_INNER_OBJECTIVE_STALL_FRACTION;
             previous_loss_total = new_loss_total;
-            if stalled && refine_rounds >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS {
+            if stalled
+                && refine_rounds >= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_MIN_ROUNDS
+                && *evidence_fixed_point
+            {
                 let mut stationary_sys = self
                     .assemble_arrow_schur(target, rho_fixed, registry)
                     .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
