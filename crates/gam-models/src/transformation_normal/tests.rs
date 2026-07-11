@@ -824,11 +824,17 @@ pub(crate) fn transformation_normal_full_outer_hessian_matches_resolved_objectiv
         compute_covariance: false,
         ..BlockwiseFitOptions::default()
     };
+    // Hold the optimized smoothing coordinate fixed while differentiating the
+    // resolved objective with respect to psi.  Rebuilding the family also
+    // rebuilds its data-scaled *initialization heuristic* for rho; following
+    // that moving seed would finite-difference a different composite path and
+    // can jump by O(1e4) under an O(1e-5) psi perturbation (#979 diagnostic).
+    let (_, _, _, base_spec) = toy_penalized_family_and_derivatives(&psi);
+    let rho = base_spec.initial_log_lambdas;
 
     let evaluate = |psi_value: &Array1<f64>, mode: gam_problem::EvalMode| {
         let (family, derivative_blocks, _state, spec) =
             toy_penalized_family_and_derivatives(psi_value);
-        let rho = spec.initial_log_lambdas.clone();
         evaluate_custom_family_joint_hyper(
             &family,
             std::slice::from_ref(&spec),
