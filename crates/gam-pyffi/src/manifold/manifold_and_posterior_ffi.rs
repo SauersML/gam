@@ -7061,8 +7061,6 @@ impl ManifoldSaeCore {
         t_to: PyReadonlyArray1<'py, f64>,
     ) -> PyResult<Py<PyDict>> {
         let inner = &self.inner;
-        let n_obs = inner.fitted.len();
-        let p_out = inner.fitted.first().map_or(0, Vec::len);
         let decoder_owned: Vec<Array2<f64>> = inner
             .decoder_blocks
             .iter()
@@ -7107,8 +7105,6 @@ impl ManifoldSaeCore {
             amplitude,
             t_from.as_array(),
             t_to.as_array(),
-            n_obs,
-            p_out,
             &inner.basis_kinds,
             &atom_dim,
             &decoder_views,
