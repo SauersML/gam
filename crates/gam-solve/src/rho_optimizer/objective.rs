@@ -180,6 +180,17 @@ pub trait OuterObjective {
     /// Restore to a clean baseline for the next multi-start candidate.
     fn reset(&mut self);
 
+    /// Transition an objective that actually used an approximate derivative
+    /// pilot to its exact full-data measure.
+    ///
+    /// The runner calls this once after the pilot solver returns a checkpoint.
+    /// `true` means the objective changed measure and must be optimized again
+    /// from that checkpoint before analytic certification. Exact objectives and
+    /// pilots that never installed a sample return `false`.
+    fn begin_exact_polish(&mut self) -> bool {
+        false
+    }
+
     /// Seed the inner-solver iterate before the first eval, e.g. when the
     /// outer-iterate cache restored a `(ρ, β)` pair from a prior run, or
     /// when the continuation walk forwards `OuterEval::inner_beta_hint`
@@ -694,6 +705,10 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
     fn reset(&mut self) {
         self.inner.reset();
     }
+
+    fn begin_exact_polish(&mut self) -> bool {
+        self.inner.begin_exact_polish()
+    }
 }
 
 /// Closure-based adapter for [`OuterObjective`].
@@ -726,6 +741,9 @@ pub struct ClosureObjective<
     pub(crate) fixed_point_certificate_fn: Option<
         Box<dyn FnMut(&mut S, &Array1<f64>) -> Result<FixedPointCertificateEval, EstimationError>>,
     >,
+    /// Optional single-shot transition from an approximate derivative pilot to
+    /// the exact objective measure.
+    pub(crate) exact_polish_fn: Option<Box<dyn FnMut(&mut S) -> bool>>,
     /// Optional seed-screening ranking proxy closure. When `None`,
     /// `eval_screening_proxy()` falls back to `eval_cost()` (the trait
     /// default), preserving legacy behavior for non-REML objectives.
@@ -834,6 +852,24 @@ where
             f(&mut self.state);
         }
     }
+
+    fn begin_exact_polish(&mut self) -> bool {
+        self.exact_polish_fn
+            .as_mut()
+            .is_some_and(|transition| transition(&mut self.state))
+    }
+}
+
+impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed>
+    ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed>
+{
+    pub fn with_exact_polish<Fpolish>(mut self, transition: Fpolish) -> Self
+    where
+        Fpolish: FnMut(&mut S) -> bool + 'static,
+    {
+        self.exact_polish_fn = Some(Box::new(transition));
+        self
+    }
 }
 
 impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp>
@@ -870,6 +906,7 @@ where
             reset_fn: self.reset_fn,
             efs_fn: self.efs_fn,
             fixed_point_certificate_fn: self.fixed_point_certificate_fn,
+            exact_polish_fn: self.exact_polish_fn,
             screening_proxy_fn: self.screening_proxy_fn,
             seed_fn: Some(seed_fn),
             continuation_prewarm: self.continuation_prewarm,
@@ -1196,6 +1233,10 @@ impl<'a> OuterObjective for CanonicalizedObjective<'a> {
 
     fn reset(&mut self) {
         self.inner.reset();
+    }
+
+    fn begin_exact_polish(&mut self) -> bool {
+        self.inner.begin_exact_polish()
     }
 
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {

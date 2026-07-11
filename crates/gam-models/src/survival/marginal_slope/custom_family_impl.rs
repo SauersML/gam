@@ -6,6 +6,15 @@
 use super::*;
 
 impl CustomFamily for SurvivalMarginalSlopeFamily {
+    fn outer_derivative_pilot_schedule(
+        &self,
+    ) -> Option<crate::custom_family::OuterDerivativePilotSchedule> {
+        Some(crate::custom_family::OuterDerivativePilotSchedule::new(
+            Arc::clone(&self.auto_subsample_phase_counter),
+            SURVIVAL_MGS_AUTO_SUBSAMPLE_PHASE1_BUDGET,
+        ))
+    }
+
     // Survival marginal-slope fits have a genuine under-identification regime
     // (near-collinear clustered-PC trends), so opt into the self-limiting
     // Jeffreys/Firth curvature. The trait default flipped to OFF in gam#1395

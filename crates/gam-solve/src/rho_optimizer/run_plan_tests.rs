@@ -1146,6 +1146,7 @@ fn closure_objective_delegates() {
         }),
         efs_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         fixed_point_certificate_fn: None,
+        exact_polish_fn: None,
         screening_proxy_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         continuation_prewarm: true,
@@ -1183,6 +1184,7 @@ fn closure_objective_seed_inner_state_delegates_when_hook_present() {
         reset_fn: None::<fn(&mut Vec<f64>)>,
         efs_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         fixed_point_certificate_fn: None,
+        exact_polish_fn: None,
         screening_proxy_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         continuation_prewarm: true,
@@ -1250,6 +1252,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
             })
         }),
         fixed_point_certificate_fn: None,
+        exact_polish_fn: None,
         screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         continuation_prewarm: true,
@@ -1328,6 +1331,7 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
             })
         }),
         fixed_point_certificate_fn: None,
+        exact_polish_fn: None,
         screening_proxy_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         continuation_prewarm: true,

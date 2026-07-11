@@ -27,6 +27,7 @@ use gam_problem::{
 };
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Family evaluation over all parameter blocks.
 #[derive(Clone, Debug)]
@@ -91,8 +92,67 @@ pub struct BatchedOuterGradientTerms {
 /// duplicate definition.
 pub use gam_problem::ExactNewtonOuterCurvature;
 
+/// Shared lifecycle for an unbiased sampled outer-derivative pilot.
+///
+/// Large marginal-slope objectives may use a deterministic
+/// Horvitz--Thompson row sample while the outer iterate is moving rapidly, but
+/// a fit may only be certified after optimizing the exact full-data measure.
+/// The family owns the evaluation counter; the generic outer runner owns the
+/// stage transition.  Keeping that transition explicit prevents a solver that
+/// converges before the nominal pilot budget from attempting to certify the
+/// sampled objective as though it were the exact REML/LAML criterion (#979).
+#[derive(Clone, Debug)]
+pub struct OuterDerivativePilotSchedule {
+    phase_counter: Arc<AtomicUsize>,
+    exact_phase_start: usize,
+}
+
+impl OuterDerivativePilotSchedule {
+    pub fn new(phase_counter: Arc<AtomicUsize>, exact_phase_start: usize) -> Self {
+        Self {
+            phase_counter,
+            exact_phase_start,
+        }
+    }
+
+    /// Enter the exact full-data phase iff at least one sampled derivative
+    /// evaluation actually ran and the family has not already transitioned.
+    ///
+    /// A compare/exchange loop makes the stage boundary single-shot even if a
+    /// future evaluator invokes the hook concurrently.  A zero counter is left
+    /// untouched: it means the problem was too small to install a sample (or a
+    /// caller supplied its own explicit measure), so no second optimization is
+    /// needed.
+    pub fn enter_exact_phase(&self) -> bool {
+        let mut observed = self.phase_counter.load(Ordering::SeqCst);
+        loop {
+            if observed == 0 || observed >= self.exact_phase_start {
+                return false;
+            }
+            match self.phase_counter.compare_exchange(
+                observed,
+                self.exact_phase_start,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(current) => observed = current,
+            }
+        }
+    }
+}
+
 /// User-defined family contract for multi-block generalized models.
 pub trait CustomFamily {
+    /// Optional sampled-derivative pilot owned by this family.
+    ///
+    /// Returning a schedule opts the family into the generic two-stage outer
+    /// solve: a cheap unbiased pilot followed unconditionally by an exact
+    /// full-data polish whenever the pilot actually installed a sample.
+    fn outer_derivative_pilot_schedule(&self) -> Option<OuterDerivativePilotSchedule> {
+        None
+    }
+
     /// Family-owned fingerprint for persistent coefficient warm-starts.
     ///
     /// The generic block specs contain design matrices, offsets, penalties,

@@ -9,6 +9,15 @@ use super::row_kernel::*;
 use super::*;
 
 impl CustomFamily for BernoulliMarginalSlopeFamily {
+    fn outer_derivative_pilot_schedule(
+        &self,
+    ) -> Option<crate::custom_family::OuterDerivativePilotSchedule> {
+        Some(crate::custom_family::OuterDerivativePilotSchedule::new(
+            Arc::clone(&self.auto_subsample_phase_counter),
+            BMS_AUTO_SUBSAMPLE_PHASE1_BUDGET,
+        ))
+    }
+
     // Bernoulli marginal-slope fits have a genuine separation regime
     // (near-perfectly-classified rows), so opt into the self-limiting
     // Jeffreys/Firth curvature that bounds the coefficient there. The trait

@@ -1077,6 +1077,18 @@ pub fn maybe_install_auto_outer_subsample(
     if options.outer_score_subsample.is_some() || !options.auto_outer_subsample {
         return None;
     }
+    // Establish that this problem will actually use a row sample before
+    // advancing the pilot counter.  The exact-polish lifecycle treats a zero
+    // counter as proof that no approximate derivative measure ran; counting a
+    // small-n no-op here would otherwise force a redundant second optimization.
+    let auto_options = AutoOuterSubsampleOptions {
+        min_n_for_auto,
+        min_k,
+        min_k_floor,
+        outer_work_per_k_unit: outer_work_per_k_unit.max(1),
+        ..AutoOuterSubsampleOptions::default()
+    };
+    let choice = auto_options.target_k_detailed(z.len())?;
     let phase_idx = {
         let mut guard = last_rho
             .lock()
@@ -1112,25 +1124,6 @@ pub fn maybe_install_auto_outer_subsample(
         }
         return None;
     }
-    // Honour the family's per-K-unit work cost. Constructing
-    // `AutoOuterSubsampleOptions::default()` here would silently reset
-    // `outer_work_per_k_unit` to 1, making the work-budget cap
-    // (`K_work = AUTO_OUTER_WORK_BUDGET / outer_work_per_k_unit`)
-    // never bind, and letting the noise-only rule pick K ≈ 0.10·n —
-    // which at large-scale n=195_780 is K≈19_578 instead of the survival
-    // family's intended K≈2_000. That ~9× inflation drove the
-    // documented 8h large-scale hang (exit 137 from resource exhaustion).
-    let auto_options = AutoOuterSubsampleOptions {
-        min_n_for_auto,
-        min_k,
-        min_k_floor,
-        outer_work_per_k_unit: outer_work_per_k_unit.max(1),
-        ..AutoOuterSubsampleOptions::default()
-    };
-    // Compute the K choice up-front so the log surfaces both the
-    // noise-only target and the work-cap target even when stratification
-    // ceil overshoots the picked K.
-    let choice = auto_options.target_k_detailed(z.len())?;
     let mask = auto_outer_score_subsample(z, stratum_secondary, &auto_options)?;
     let n_full = mask.n_full;
     let k = mask.len();
