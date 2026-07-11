@@ -22,8 +22,8 @@ use gam::terms::sae::manifold::SaeRowLayout;
 
 /// Build a layout over `k_atoms` atoms (each `coord_dim`-dimensional) where
 /// every one of `n` rows activates only `active_per_row` atoms. This mirrors the
-/// compact JumpReLU / IBP-MAP active-set layout that drives the assembly's
-/// per-worker scratch sizing.
+/// compact hard-TopK active-set layout that drives the assembly's per-worker
+/// scratch sizing.
 fn compact_layout(
     n: usize,
     k_atoms: usize,
@@ -31,10 +31,10 @@ fn compact_layout(
     active_per_row: usize,
 ) -> SaeRowLayout {
     let coord_dims = vec![coord_dim; k_atoms];
-    // Full-q offsets: atom k owns the [k] logit slot then `coord_dim` coord
-    // slots; layout out the full-q frame so offsets are realistic.
+    // Full-q offsets: hard TopK has no optimizable logit coordinates, so the
+    // frame consists only of the per-atom coordinate blocks.
     let mut coord_offsets_full = Vec::with_capacity(k_atoms);
-    let mut cursor = k_atoms; // logit block of width k_atoms precedes coords
+    let mut cursor = 0usize;
     for _ in 0..k_atoms {
         coord_offsets_full.push(cursor);
         cursor += coord_dim;
@@ -50,10 +50,9 @@ fn compact_layout(
         active.sort_unstable();
         active.dedup();
 
-        // Compact coord_starts, exactly as `from_active_atoms` computes them:
-        // the compact logit block of width `active.len()` precedes the coords.
+        // Compact coord_starts, exactly as `from_topk_gates` computes them.
         let mut starts = Vec::with_capacity(active.len());
-        let mut c = active.len();
+        let mut c = 0usize;
         for &k in &active {
             starts.push(c);
             c += coord_dims[k];
@@ -63,8 +62,7 @@ fn compact_layout(
     }
 
     SaeRowLayout {
-        active_atoms: active_atoms.clone(),
-        logit_atoms: active_atoms,
+        active_atoms,
         coord_starts,
         coord_offsets_full,
         coord_dims,
@@ -104,9 +102,8 @@ fn compact_scratch_scales_with_active_support_not_k_1410() {
 
     let layout = compact_layout(n, k_atoms, coord_dim, active_per_row);
 
-    // Full-q is the dense fallback dimension: one logit slot per atom plus all
-    // per-atom coord blocks. This is what the `None` (dense softmax) arm uses.
-    let full_q: usize = k_atoms + k_atoms * coord_dim;
+    // Full-q is the dense hard-TopK coordinate dimension.
+    let full_q: usize = k_atoms * coord_dim;
 
     let (decoded_rows, scratch_q) = scratch_dims(&layout);
 
@@ -122,9 +119,9 @@ fn compact_scratch_scales_with_active_support_not_k_1410() {
         "decoded scratch rows ({decoded_rows}) must be far below full K ({k_atoms})"
     );
 
-    // scratch_q is the compact per-row tangent dim: active.len() logit slots +
-    // sum of active coord dims = active_per_row * (1 + coord_dim).
-    let expected_scratch_q = active_per_row * (1 + coord_dim);
+    // scratch_q is the compact per-row tangent dimension: only the selected
+    // atoms' coordinate blocks.
+    let expected_scratch_q = active_per_row * coord_dim;
     assert_eq!(
         scratch_q, expected_scratch_q,
         "tangent scratch dim must equal the compact row dim ({expected_scratch_q}), \
@@ -162,7 +159,7 @@ fn compact_scratch_sized_by_worst_case_row_1410() {
     // active 9 atoms. The scratch must be sized for the 9-atom row.
     let coord_dims = vec![coord_dim; k_atoms];
     let mut coord_offsets_full = Vec::with_capacity(k_atoms);
-    let mut cursor = k_atoms;
+    let mut cursor = 0usize;
     for _ in 0..k_atoms {
         coord_offsets_full.push(cursor);
         cursor += coord_dim;
@@ -176,7 +173,7 @@ fn compact_scratch_sized_by_worst_case_row_1410() {
         active.sort_unstable();
         active.dedup();
         let mut starts = Vec::with_capacity(active.len());
-        let mut c = active.len();
+        let mut c = 0usize;
         for &k in &active {
             starts.push(c);
             c += coord_dims[k];
@@ -186,8 +183,7 @@ fn compact_scratch_sized_by_worst_case_row_1410() {
     }
 
     let layout = SaeRowLayout {
-        active_atoms: active_atoms.clone(),
-        logit_atoms: active_atoms,
+        active_atoms,
         coord_starts,
         coord_offsets_full,
         coord_dims,
@@ -200,10 +196,10 @@ fn compact_scratch_sized_by_worst_case_row_1410() {
         decoded_rows, 9,
         "decoded scratch must be sized for the densest row (9 active atoms)"
     );
-    // Its compact tangent dim is 9 logit slots + 9 coord blocks of width 2.
+    // Its compact tangent dimension is 9 coordinate blocks of width 2.
     assert_eq!(
         scratch_q,
-        9 * (1 + coord_dim),
+        9 * coord_dim,
         "tangent scratch must be sized for the densest row's compact block"
     );
 

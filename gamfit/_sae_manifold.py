@@ -316,8 +316,10 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         ``(G, p)`` when the Rust payload includes posterior shape uncertainty.
 
         Public methods are ``predict``/``reconstruct``,
-        ``reconstruct_training``, ``encode``, ``steer``, ``attach_fisher``, and
-        the strict v3 ``to_dict``/``save`` serialization surface.
+        ``reconstruct_training``, ``reconstruct_from_assignments``, ``encode``,
+        ``converged_latents``, ``frozen_dictionary``, ``summary``,
+        ``description_length``, ``steer``, ``attach_fisher``, and the strict v3
+        ``to_dict``/``to_json``/``save`` serialization surface.
     """
     if X is None:
         raise TypeError("sae_manifold_fit requires X input array")
@@ -500,7 +502,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     topology_supplied = atom_topology is not None
     # Magic default (#2238/#2239): when the caller names no topology, every
     # atom is seeded "auto" and the Rust fit entry races circle / torus /
-    # sphere / flat-2-D per atom by REML evidence over its seed cluster —
+    # sphere / flat-2-D per atom by the native penalized-LAML criterion over its
+    # seed cluster —
     # the historical pinned circle hard-capped intrinsically 2-D factors at
     # R² ≈ 0.5. An explicit atom_topology still pins exactly as before.
     atom_topology_str = str(atom_topology) if topology_supplied else "auto"

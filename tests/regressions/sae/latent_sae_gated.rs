@@ -53,7 +53,7 @@ fn latent_coord_assignment_decode_roundtrip_matches_dictionary_atom() {
 }
 
 #[test]
-fn sae_assignment_modes_softmax_ibp_jumprelu_follow_documented_behavior() {
+fn sae_assignment_modes_softmax_ordered_beta_bernoulli_jumprelu_follow_documented_behavior() {
     let coord_blocks = vec![
         array![[0.0], [0.0]],
         array![[0.0], [0.0]],
@@ -77,16 +77,19 @@ fn sae_assignment_modes_softmax_ibp_jumprelu_follow_documented_behavior() {
         );
     }
 
-    let ibp = SaeAssignment::from_blocks_with_mode(
+    let ordered_beta_bernoulli = SaeAssignment::from_blocks_with_mode(
         array![[0.0, 0.0, 0.0]],
         vec![array![[0.0]], array![[0.0]], array![[0.0]]],
         AssignmentMode::ordered_beta_bernoulli(1.0, 0.1, false),
     )
-    .expect("ibp assignment should build");
-    let ibp_row = ibp.try_assignments_row(0).expect("ibp row should evaluate");
+    .expect("ordered Beta--Bernoulli assignment should build");
+    let ordered_beta_bernoulli_row = ordered_beta_bernoulli
+        .try_assignments_row(0)
+        .expect("ordered Beta--Bernoulli row should evaluate");
     assert!(
-        ibp_row[0] > ibp_row[1] && ibp_row[1] > ibp_row[2],
-        "OrderedBetaBernoulli should reflect stick-breaking prior mass so earlier atoms are more likely than later atoms when logits are tied."
+        ordered_beta_bernoulli_row[0] > ordered_beta_bernoulli_row[1]
+            && ordered_beta_bernoulli_row[1] > ordered_beta_bernoulli_row[2],
+        "The ordered independent Beta--Bernoulli prior should favor earlier atoms when logits are tied."
     );
 
     let jump = SaeAssignment::from_blocks_with_mode(

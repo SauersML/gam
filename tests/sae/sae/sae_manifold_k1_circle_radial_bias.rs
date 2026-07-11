@@ -1,4 +1,4 @@
-//! #1023 task-2 radial-bias diagnostic: a K=1 IBP-MAP planted-circle fit through
+//! #1023 task-2 radial-bias diagnostic: a K=1 ordered independent Beta--Bernoulli planted-circle fit through
 //! the production outer engine, measuring the three discriminating numbers
 //! (mean gate ζ, fitted_radius/data_radius, and λ_smooth vs the empirical-Bayes
 //! optimum). The historical user-facing default `sae_manifold_fit(assignment="ordered_beta_bernoulli")`
@@ -70,7 +70,7 @@ fn planted_unit_circle(n: usize, p: usize, sigma: f64) -> Array2<f64> {
     z
 }
 
-/// Cold K=1 IBP-MAP term: PCA-free angle seed from the true ambient angle,
+/// Cold K=1 ordered independent Beta--Bernoulli term: PCA-free angle seed from the true ambient angle,
 /// closed-form LSQ decoder at the cold gate, exactly as the production path
 /// would after `term_from_padded_blocks` for one periodic atom.
 fn build_cold_k1_term(z: &Array2<f64>, seed_logit: f64) -> SaeManifoldTerm {
@@ -178,7 +178,7 @@ struct ArmMetrics {
     lambda_smooth: f64,
 }
 
-/// Fit a K=1 IBP planted unit circle from `seed_logit` and read the three
+/// Fit a K=1 ordered independent Beta--Bernoulli planted unit circle from `seed_logit` and read the three
 /// discriminating numbers: converged mean gate ζ (post-fit, not the seed),
 /// fitted/data radius ratio, and the landed λ_smooth.
 fn measure_arm(z: &Array2<f64>, p: usize, seed_logit: f64) -> ArmMetrics {
@@ -224,7 +224,7 @@ fn measure_arm(z: &Array2<f64>, p: usize, seed_logit: f64) -> ArmMetrics {
 /// run: the permanent contract is that the shipped `6*tau` seed converges with
 /// ζ≈1 and no radial shrinkage.
 #[test]
-fn sae_k1_ibp_circle_has_no_radial_shrinkage() {
+fn sae_k1_ordered_beta_bernoulli_circle_has_no_radial_shrinkage() {
     let n = 120usize;
     let p = 4usize;
     let sigma = 0.05_f64;
@@ -235,7 +235,7 @@ fn sae_k1_ibp_circle_has_no_radial_shrinkage() {
     let high = measure_arm(&z, p, production_fixed_seed_logit);
 
     println!(
-        "K=1 IBP circle (eb_optimal_lambda~{eb_optimal_lambda:.3e}):\n  \
+        "K=1 ordered independent Beta--Bernoulli circle (eb_optimal_lambda~{eb_optimal_lambda:.3e}):\n  \
          high-seed(logit 6*tau, gate0~1.0): mean_zeta={:.6} radius_ratio={:.6} lambda_smooth={:.4e}",
         high.mean_zeta, high.radius_ratio, high.lambda_smooth,
     );
@@ -246,12 +246,12 @@ fn sae_k1_ibp_circle_has_no_radial_shrinkage() {
     assert!(
         high.mean_zeta >= 0.99,
         "high-seed converged gate ζ={:.6} stuck below 0.99 — a second defect pulls the K=1 \
-         IBP gate off its optimum (π₀=1, no sparsity pressure should keep ζ<1); report it",
+         ordered independent Beta--Bernoulli gate off its optimum (π₀=1, no sparsity pressure should keep ζ<1); report it",
         high.mean_zeta,
     );
     assert!(
         high_bias <= 0.01,
-        "high-seed K=1 IBP circle radially biased by {:.2}% (radius_ratio={:.6}, ζ={:.6}); \
+        "high-seed K=1 ordered independent Beta--Bernoulli circle radially biased by {:.2}% (radius_ratio={:.6}, ζ={:.6}); \
          the fitted manifold must lie within 1% of the data radius",
         high_bias * 100.0,
         high.radius_ratio,

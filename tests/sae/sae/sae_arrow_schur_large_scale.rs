@@ -463,7 +463,7 @@ fn row_block_dim_matches_k_times_one_plus_d() {
 
 // ---------------------------------------------------------------------------
 // Gate-mode row block dimension probe (#1442): confirms q = K + K*d for the
-// gate-style assignment families (JumpReLU / IBP-MAP), which keep ALL K
+// gate-style assignment families (JumpReLU / ordered independent Beta--Bernoulli), which keep ALL K
 // assignment coordinates because there is no probability-simplex constraint and
 // hence no fixed reference logit. This is exactly one coordinate larger than the
 // Softmax convention q = (K-1) + K*d pinned by

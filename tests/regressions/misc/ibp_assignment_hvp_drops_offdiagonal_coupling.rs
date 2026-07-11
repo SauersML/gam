@@ -30,7 +30,7 @@
 //! Any consumer that treats `hvp` as a genuine Hessian-vector product — the
 //! inner Newton / preconditioner / curvature path of the SAE assignment
 //! optimization — gets curvature that ignores exactly the shared-feature
-//! coupling the finite-IBP prior exists to model.
+//! coupling the finite-ordered independent Beta--Bernoulli prior exists to model.
 //!
 //! The reference below is a central finite difference of `grad_target` (whose
 //! correctness is independently checkable against `value`): by definition
@@ -46,7 +46,7 @@ use gam::terms::analytic_penalties::{AnalyticPenalty, OrderedBetaBernoulliPenalt
 use ndarray::Array1;
 
 #[test]
-fn ibp_assignment_hvp_equals_true_hessian_vector_product() {
+fn ordered_beta_bernoulli_assignment_hvp_equals_true_hessian_vector_product() {
     let k_max = 3usize;
     // n_eff = 4 rows are implied by the 12-element target below (len / k_max).
 

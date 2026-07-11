@@ -1,10 +1,10 @@
 //! K-ladder recovery pin for the SAE manifold dictionary learner (#985 part 2).
 //!
 //! The K=2 fixture (`sae_manifold_joint_two_circle_recovery`) shows the cold
-//! IBP-MAP joint fit does not collapse for two planted circle atoms. This file
+//! ordered independent Beta--Bernoulli joint fit does not collapse for two planted circle atoms. This file
 //! climbs the K ladder: K=64 and K=1024 planted circle-atom dictionaries, with
 //! mutually-orthogonal-ish planted frames embedded in a larger ambient space p,
-//! driven through the SAME production engine (cold IBP-MAP residual-energy seed
+//! driven through the SAME production engine (cold ordered independent Beta--Bernoulli residual-energy seed
 //! logits, weighted-LSQ decoder init, generic outer cascade `OuterProblem::run`
 //! around `SaeManifoldOuterObjective`).
 //!
@@ -15,8 +15,8 @@
 //!
 //! Construction-path fidelity note: the gam crate cannot reach the pyffi-only
 //! seed helpers. As the K=2 fixture documents, we replicate the two seed stages
-//! that determine the routing collapse VERBATIM (residual-energy IBP logits at
-//! gain 4.0; weighted-LSQ decoder init at the IBP gate), and seed the latent
+//! that determine the routing collapse VERBATIM (residual-energy ordered independent Beta--Bernoulli logits at
+//! gain 4.0; weighted-LSQ decoder init at the ordered independent Beta--Bernoulli gate), and seed the latent
 //! coordinates from the planted angles (the production PCA / cluster coordinate
 //! seed is a separate stage; this is a routing/active-mass + span-recovery
 //! failure, not a coordinate-recovery one).
@@ -402,7 +402,7 @@ fn build_cold_term(truth: &Truth, z: ArrayView2<'_, f64>, p: usize) -> SaeManifo
             }
         }
     }
-    // Production cold IBP-MAP routing seed + weighted-LSQ decoder init.
+    // Production cold ordered independent Beta--Bernoulli routing seed + weighted-LSQ decoder init.
     let logits = residual_seed_logits(basis_values.view(), &basis_sizes, z, RESIDUAL_SEED_GAIN);
     let decoder = decoder_lsq_init(basis_values.view(), &basis_sizes, z, logits.view(), TAU);
 
@@ -663,7 +663,7 @@ fn run_rung(rung: &Rung) {
 
     // ---- VERBATIM diagnostic dump -----------------------------------------
     println!(
-        "=== SAE K-ladder recovery (IBP-MAP, production cold driver) K={k}, p={p}, N={} ===",
+        "=== SAE K-ladder recovery (ordered independent Beta--Bernoulli, production cold driver) K={k}, p={p}, N={} ===",
         truth.n
     );
     println!(

@@ -331,7 +331,7 @@ fn sae_manifold_description_length<'py>(
     l_param_bits: Option<f64>,
     active_threshold: f64,
 ) -> PyResult<PyObject> {
-    let coord_views = coords.iter().map(PyReadonlyArray2::as_array).collect::<Vec<_>>();
+    let coord_views = coords.iter().map(|block| block.as_array()).collect::<Vec<_>>();
     let dl = manifold_description_length_from_arrays(
         assignments.as_array(),
         &coord_views,

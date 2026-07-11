@@ -1,6 +1,6 @@
 //! Regression pin for the "K≥2 SAE joint fit collapses cold" failure
 //! (#853 class). Two planted circle atoms are recovered against the planted
-//! truth, driving the fit *exactly the way production does*: cold IBP-MAP
+//! truth, driving the fit *exactly the way production does*: cold ordered independent Beta--Bernoulli
 //! residual-energy seed logits, weighted-LSQ decoder init, and the generic
 //! outer cascade (`OuterProblem::run`) around `SaeManifoldOuterObjective` —
 //! the same engine `crates/gam-pyffi` `sae_manifold_fit_minimal` drives.
@@ -15,7 +15,7 @@
 //! `sae_residual_seed_logits`, `sae_decoder_lsq_init`,
 //! `sae_refine_routing_seed`). We replicate the two seed stages that
 //! determine the routing collapse VERBATIM from those bodies (residual-energy
-//! IBP logits at gain 4.0; weighted-LSQ decoder init at the IBP gate), and
+//! ordered independent Beta--Bernoulli logits at gain 4.0; weighted-LSQ decoder init at the ordered independent Beta--Bernoulli gate), and
 //! seed the latent coordinates from the planted angles (the production PCA /
 //! cluster coordinate seed is a separate stage; #853 is a routing/active-mass
 //! failure, not a coordinate-recovery one — mirroring the inline torus oracle
@@ -349,7 +349,7 @@ fn build_cold_term(truth: &Truth, z: ArrayView2<'_, f64>) -> SaeManifoldTerm {
             }
         }
     }
-    // Production cold IBP-MAP routing seed + weighted-LSQ decoder init.
+    // Production cold ordered independent Beta--Bernoulli routing seed + weighted-LSQ decoder init.
     let logits = residual_seed_logits(basis_values.view(), &basis_sizes, z, RESIDUAL_SEED_GAIN);
     let decoder = decoder_lsq_init(basis_values.view(), &basis_sizes, z, logits.view(), TAU);
 
@@ -590,7 +590,7 @@ fn sae_manifold_joint_two_circle_recovery_ordered_beta_bernoulli() {
     let r2 = 1.0 - ssr / sst.max(1.0e-12);
 
     // ---- VERBATIM diagnostic dump -----------------------------------------
-    println!("=== SAE two-circle recovery (IBP-MAP, production cold driver) ===");
+    println!("=== SAE two-circle recovery (ordered independent Beta--Bernoulli, production cold driver) ===");
     println!(
         "signal_scale={signal_scale:.6}  noise_sigma={:.6}",
         0.04 * signal_scale

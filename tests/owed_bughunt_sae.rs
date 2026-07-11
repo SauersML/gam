@@ -1,6 +1,6 @@
-//! Bug-hunt regression gate for the SAE / IBP / manifold subsystem.
+//! Bug-hunt regression gate for the SAE / ordered independent Beta--Bernoulli / manifold subsystem.
 //!
-//! Each test pins a correctness property found during the SAE/IBP/manifold
+//! Each test pins a correctness property found during the SAE/ordered independent Beta--Bernoulli/manifold
 //! adversarial math audit so a regression fails CI. Tests use only the public
 //! crate API.
 //!

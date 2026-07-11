@@ -1,14 +1,14 @@
 use super::*;
 use statrs::function::gamma::{digamma, ln_gamma};
 
-/// Ordered independent Beta--Bernoulli active-set prior over assignment logits.
+/// Ordered independent Beta--Bernoulli prior over relaxed assignment logits.
 ///
 /// Columns have independent `pi_k ~ Beta(a_k, 1)` rates whose means follow the
 /// ordered schedule
 ///
 /// `mu_k = (alpha / (alpha + 1))^(k + 1),  a_k = mu_k / (1 - mu_k)`.
 ///
-/// The forward assignment remains the deterministic posterior-mean relaxation
+/// The forward assignment is the deterministic relaxation
 /// `z_ik = sigmoid(ell_ik / tau)`.  The nuisance rate `pi_k` is integrated out
 /// exactly in the penalty.  With weighted active mass `M_k = sum_i w_i z_ik`
 /// and effective row count `N = sum_i w_i`, the per-column scalar is
@@ -18,7 +18,7 @@ use statrs::function::gamma::{digamma, ln_gamma};
 ///       -log Gamma(N - M_k + 1) + log Gamma(N + a_k + 1).
 /// ```
 ///
-/// Consequently the logit gradient, Hessian, alpha update, and evidence
+/// Consequently the logit gradient, Hessian, concentration update, and criterion
 /// channels below are all derivatives of this one integrated scalar.  Ordered
 /// shrinkage is scored here exactly once and is never multiplied into the
 /// reconstructed function as a second prior factor.

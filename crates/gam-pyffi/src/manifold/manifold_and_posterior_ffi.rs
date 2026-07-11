@@ -6551,7 +6551,7 @@ impl ManifoldSaeCore {
             .iter()
             .map(|block| manifold_sae_owned2(block))
             .collect::<PyResult<Vec<_>>>()?;
-        let coord_views = coords.iter().map(Array2::view).collect::<Vec<_>>();
+        let coord_views = coords.iter().map(|block| block.view()).collect::<Vec<_>>();
         let n_params = self
             .inner
             .decoder_blocks

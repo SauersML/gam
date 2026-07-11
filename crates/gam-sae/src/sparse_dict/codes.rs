@@ -31,11 +31,17 @@ pub fn solve_row_codes(
     s: usize,
     ridge: f32,
 ) -> SparseCode {
+    assert!(s > 0, "sparse-code support width must be positive");
     assert!(
         ridge.is_finite() && ridge >= 0.0,
         "active-set ridge must be finite and nonnegative, got {ridge}"
     );
-    let m = active.len();
+    assert_eq!(
+        row.len(),
+        decoder.ncols(),
+        "row width must equal decoder width"
+    );
+    let m = active.len().min(s);
     if m == 0 {
         // No live atom — emit zero code on atom 0 (padding contract).
         return SparseCode {
@@ -75,7 +81,7 @@ pub fn solve_row_codes(
 
     let mut indices = Vec::with_capacity(s);
     let mut codes = Vec::with_capacity(s);
-    for i in 0..m.min(s) {
+    for i in 0..m {
         indices.push(active[i].0);
         codes.push(solution[i] as f32);
     }

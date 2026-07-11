@@ -1,4 +1,4 @@
-"""Fit an IBP SAE manifold with Gumbel temperature annealing."""
+"""Fit an ordered independent Beta--Bernoulli SAE with temperature annealing."""
 
 from __future__ import annotations
 

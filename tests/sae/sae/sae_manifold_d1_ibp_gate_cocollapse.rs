@@ -1,7 +1,7 @@
-//! Regression pin for #2228 / #1095 / #2226: a K=1, d=1 IBP SAE must
+//! Regression pin for #2228 / #1095 / #2226: a K=1, d=1 ordered independent Beta--Bernoulli SAE must
 //! converge at fixed rho and reconstruct an exactly representable curve.
 //!
-//! Ordered IBP shrinkage belongs only to the empirical-Bayes assignment prior.
+//! Ordered ordered independent Beta--Bernoulli shrinkage belongs only to the empirical-Bayes assignment prior.
 //! The forward posterior-mean gate is sigmoid(logit / temperature), without a
 //! second multiplication by the ordered prior mean. Decoder magnitude stays in
 //! the physical coefficient block B, so this fixture directly catches either a
@@ -135,7 +135,7 @@ fn reconstruction_r2(fitted: &Array2<f64>, z: &Array2<f64>) -> f64 {
 }
 
 #[test]
-fn sae_manifold_d1_ibp_gate_cocollapse() {
+fn sae_manifold_d1_ordered_beta_bernoulli_gate_cocollapse() {
     let z = planted_curve();
     let term = build_cold_d1_term(&z);
     let init_rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(D); 1]);
@@ -156,16 +156,16 @@ fn sae_manifold_d1_ibp_gate_cocollapse() {
     let result = problem
         .run(
             &mut objective,
-            "SAE d=1 K=1 IBP-gate co-collapse (#2228/#1095)",
+            "SAE d=1 K=1 ordered independent Beta--Bernoulli-gate co-collapse (#2228/#1095)",
         )
         .expect(
             "outer cascade must complete on a K=1 d=1 atom whose degree-2 patch spans its \
              planted curve — a RemlConvergenceError (inner solve stalls at fixed ρ) reproduces \
-             the #2228 IBP-gate/decoder co-collapse",
+             the #2228 ordered independent Beta--Bernoulli-gate/decoder co-collapse",
         );
     objective
         .certify_outer_result(&result)
-        .expect("IBP co-collapse outer result must certify the installed state");
+        .expect("ordered independent Beta--Bernoulli co-collapse outer result must certify the installed state");
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
     let fitted_out = fitted.term.fitted();
     let r2 = reconstruction_r2(&fitted_out, &z);
@@ -179,7 +179,7 @@ fn sae_manifold_d1_ibp_gate_cocollapse() {
         .expect("certified result carries its analytic criterion certificate")
         .summary();
     println!(
-        "[#2228/#1095] d=1 K=1 IBP co-collapse: converged_via={converged_via} \
+        "[#2228/#1095] d=1 K=1 ordered independent Beta--Bernoulli co-collapse: converged_via={converged_via} \
          iterations={} final_grad_norm={:?} certificate={criterion_certificate} \
          final_value={:.6e} recon_R2={:.6}",
         result.iterations, result.final_grad_norm, result.final_value, r2

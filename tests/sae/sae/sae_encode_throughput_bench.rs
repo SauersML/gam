@@ -55,9 +55,9 @@ use std::time::Instant;
 const P: usize = 32;
 /// Circle basis size per atom: const + 1 harmonic (sin, cos).
 const M: usize = 3;
-/// IBP-MAP relaxation temperature (production `TAU`).
+/// ordered independent Beta--Bernoulli relaxation temperature (production `TAU`).
 const TAU: f64 = 0.5;
-/// IBP-MAP concentration (production `ALPHA`).
+/// ordered independent Beta--Bernoulli concentration (production `ALPHA`).
 const ALPHA: f64 = 1.0;
 /// Sparsity / smoothness hyperparameters held frozen during the encode.
 const SPARSITY: f64 = 1.0;
@@ -215,7 +215,7 @@ fn planted_batch(k_atoms: usize, frames: &[Array2<f64>]) -> Batch {
 /// The decoders are the PLANTED frames (frozen — never updated during the
 /// encode). Latent coordinates are seeded from the planted angles offset by a
 /// small constant so the encode's per-row Newton must actually move the
-/// coordinate (it is not handed the exact stationary point), and the IBP-MAP
+/// coordinate (it is not handed the exact stationary point), and the ordered independent Beta--Bernoulli
 /// routing logits are seeded from a per-row residual-energy heuristic so the
 /// active-set Newton starts from a realistic warm state rather than the truth.
 fn build_frozen_encode_term(batch: &Batch, frames: &[Array2<f64>]) -> SaeManifoldTerm {

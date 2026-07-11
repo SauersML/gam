@@ -135,7 +135,7 @@ def test_heterogeneous_mixed_topology_atoms_reconstruct():
     )
     assert np.all(np.isfinite(A)), "assignments contain non-finite entries"
     assert np.all(A >= -1e-9) and np.all(A <= 1.0 + 1e-9), (
-        "assignments must lie in [0, 1] for a softmax/IBP posterior; "
+        "assignments must lie in [0, 1] for bounded gates; "
         f"observed range [{A.min():.6g}, {A.max():.6g}]"
     )
 

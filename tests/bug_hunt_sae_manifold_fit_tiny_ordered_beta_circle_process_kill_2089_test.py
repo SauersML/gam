@@ -1,4 +1,4 @@
-"""Bug hunt / regression for issue #2089: a tiny ``sae_manifold_fit`` IBP
+"""Bug hunt / regression for issue #2089: a tiny ``sae_manifold_fit`` ordered independent Beta--Bernoulli
 circle fit TERMINATED THE HOST PYTHON PROCESS (exit 137 / SIGKILL) instead of
 returning a model or raising a Python exception.
 
@@ -55,7 +55,7 @@ _REPRO = textwrap.dedent(
 )
 
 
-def test_tiny_ibp_circle_fit_does_not_kill_the_process() -> None:
+def test_tiny_ordered_beta_circle_fit_does_not_kill_the_process() -> None:
     try:
         proc = subprocess.run(
             [sys.executable, "-c", _REPRO],
@@ -64,7 +64,7 @@ def test_tiny_ibp_circle_fit_does_not_kill_the_process() -> None:
             timeout=300,
         )
     except subprocess.TimeoutExpired:  # pragma: no cover - hang is also a failure
-        pytest.fail("sae_manifold_fit tiny IBP circle fit hung (>300s)")
+        pytest.fail("sae_manifold_fit tiny ordered independent Beta--Bernoulli circle fit hung (>300s)")
 
     assert proc.returncode >= 0, (
         "sae_manifold_fit terminated the host process with signal "

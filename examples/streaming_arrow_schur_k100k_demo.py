@@ -72,7 +72,8 @@ def main() -> None:
         K=N_ATOMS,
         atom_topology="euclidean",
         d_atom=D_ATOM,
-        assignment="jumprelu",
+        assignment="topk",
+        top_k=8,
         n_iter=MAX_ITER,
         random_state=0,
     )

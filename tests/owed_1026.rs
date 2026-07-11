@@ -46,7 +46,7 @@ const M: usize = 3; // periodic basis: [const, sin, cos]
 const P: usize = 3; // output channels
 
 /// Build a two-atom periodic SAE term over a fixed set of circle coordinates,
-/// with caller-supplied decoders. Latent dim 1, IBP-MAP routing (the production
+/// with caller-supplied decoders. Latent dim 1, ordered independent Beta--Bernoulli routing (the production
 /// real-data path in the #1026 thread).
 fn build_two_atom_term(dec0: Array2<f64>, dec1: Array2<f64>) -> SaeManifoldTerm {
     let coords0 = array![

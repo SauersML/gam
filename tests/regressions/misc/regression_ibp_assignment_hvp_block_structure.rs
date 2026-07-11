@@ -61,7 +61,7 @@ fn fd_hessian(
 }
 
 #[test]
-fn ibp_hvp_reproduces_full_hessian_and_is_block_diagonal() {
+fn ordered_beta_bernoulli_hvp_reproduces_full_hessian_and_is_block_diagonal() {
     let k_max = 3usize;
     let penalty = OrderedBetaBernoulliPenalty::new(k_max, 1.0, 1.0, false);
     let rho = Array1::<f64>::zeros(0);
@@ -149,7 +149,7 @@ fn ibp_hvp_reproduces_full_hessian_and_is_block_diagonal() {
 }
 
 #[test]
-fn ibp_hvp_collapses_to_diagonal_when_pi_is_clamped() {
+fn ordered_beta_bernoulli_hvp_collapses_to_diagonal_when_pi_is_clamped() {
     let k_max = 2usize;
     let penalty = OrderedBetaBernoulliPenalty::new(k_max, 1.0, 1.0, false);
     let rho = Array1::<f64>::zeros(0);

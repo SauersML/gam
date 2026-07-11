@@ -33,7 +33,7 @@
 //! not memorization.
 //!
 //! Everything runs through the SAME production engine the recovery pins use
-//! (`SaeManifoldOuterObjective` + `OuterProblem::run`, cold IBP-MAP
+//! (`SaeManifoldOuterObjective` + `OuterProblem::run`, cold ordered independent Beta--Bernoulli
 //! residual-energy seed logits at gain 4.0, weighted-LSQ decoder init at τ = 0.5).
 //! The only knob swept is K (and, for the contrast, the per-slot basis:
 //! curved circle vs euclidean degree-1 linear). The reconstruction metric is the
@@ -472,7 +472,7 @@ fn seed_slot_geometry(
 }
 
 /// Build the cold term for `slots` on a corpus row block, through the production
-/// cold IBP-MAP routing seed + weighted-LSQ decoder init.
+/// cold ordered independent Beta--Bernoulli routing seed + weighted-LSQ decoder init.
 fn build_cold_term(
     slots: &[Slot],
     corpus: &Corpus,
@@ -566,7 +566,7 @@ fn run_production_fit(
 /// Held-out reconstruction EV: re-seat the FITTED atoms (decoder coefficients
 /// frozen) onto the TEST-row latent coordinates and reconstruct, measuring EV on
 /// the test rows. The decoder is never re-fit on test rows — only the per-row
-/// assignment masses are seeded (the same cold residual-energy IBP routing the
+/// assignment masses are seeded (the same cold residual-energy ordered independent Beta--Bernoulli routing the
 /// production predict path uses), so this is a genuine generalization measurement
 /// of the trained DECODER.
 ///

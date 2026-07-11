@@ -379,17 +379,21 @@ def main() -> None:
         help="per-fit decoder-repulsion strength (default: evidence-derived)",
     )
     ap.add_argument(
-        "--ibp-alpha",
+        "--ordered-beta-alpha",
+        dest="ordered_beta_bernoulli_alpha",
         type=float,
         default=None,
-        help="per-fit IBP-MAP alpha (default: K-aware canonical value)",
+        help="per-fit ordered independent Beta--Bernoulli concentration",
     )
     args = ap.parse_args()
 
     if args.sep_mu is not None:
         print(f"[barrier] sep_mu={args.sep_mu}", flush=True)
     if args.ordered_beta_bernoulli_alpha is not None:
-        print(f"[ibp] alpha={args.ordered_beta_bernoulli_alpha}", flush=True)
+        print(
+            f"[ordered_beta_bernoulli] alpha={args.ordered_beta_bernoulli_alpha}",
+            flush=True,
+        )
 
     x = _load_activations(args)
     rng = np.random.default_rng(args.seed)

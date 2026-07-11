@@ -467,6 +467,41 @@ fn ordered_beta_bernoulli_assignment_learnable_alpha_hdiag_log_alpha_derivative_
 }
 
 #[test]
+fn ordered_beta_bernoulli_majorizer_log_alpha_derivative_matches_fd() {
+    let pen = OrderedBetaBernoulliPenalty::new(2, 2.0, 0.9, true);
+    let target = array![0.2_f64, -0.3, 0.7, -0.1, 0.4, 0.5];
+    let rho = array![0.15_f64];
+    let channels = pen.psd_majorizer_logit_third_channels(target.view(), rho.view());
+    let raw_derivative = pen.hessian_diag_log_alpha_derivative(target.view(), rho.view());
+    let mut analytic = Array1::<f64>::zeros(target.len());
+    for index in 0..target.len() {
+        if channels.diagonal_term[index] > 0.0 {
+            let column = index % pen.k_max;
+            analytic[index] = raw_derivative[index]
+                - channels.mass_hessian_log_alpha_derivative[column]
+                    * channels.z_jac[index]
+                    * channels.z_jac[index];
+        }
+    }
+
+    let step = 1.0e-6_f64;
+    let plus = pen.psd_majorizer_logit_third_channels(
+        target.view(),
+        array![rho[0] + step].view(),
+    );
+    let minus = pen.psd_majorizer_logit_third_channels(
+        target.view(),
+        array![rho[0] - step].view(),
+    );
+    for index in 0..target.len() {
+        let fd = (plus.diagonal_term[index].max(0.0)
+            - minus.diagonal_term[index].max(0.0))
+            / (2.0 * step);
+        assert_abs_diff_eq!(analytic[index], fd, epsilon = 2.0e-6);
+    }
+}
+
+#[test]
 fn ordered_beta_bernoulli_assignment_extreme_logits_remain_finite() {
     let pen = OrderedBetaBernoulliPenalty::new(3, 1.5, 1.0e-3, false);
     let t = array![

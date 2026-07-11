@@ -13,7 +13,7 @@ so ``ARDPenalty(...).value_grad(t)`` currently raises:
 The fix is to pass ``None`` (or a correctly sized vector) so the FFI's
 default-rho branch (``lib.rs:25440-25443``) fills zeros of the right length.
 
-These tests are RED until that fix lands. The IBP / BlockOrthogonality /
+These tests are RED until that fix lands. The ordered independent Beta--Bernoulli / BlockOrthogonality /
 MechanismSparsity descriptors happen to declare ``rho_count == 0`` for the
 non-learnable mode the wrapper sets, so they pass today; pinning the
 contract here guards against future descriptors that expose rho_count > 0.
@@ -99,13 +99,13 @@ def test_ard_value_grad_vector_target() -> None:
 
 
 # ---------------------------------------------------------------------------
-# IBP / BlockOrthogonality / MechanismSparsity — rho_count == 0 in non-
+# ordered independent Beta--Bernoulli / BlockOrthogonality / MechanismSparsity — rho_count == 0 in non-
 # learnable mode (which is what the wrapper sets). These should keep
 # working after the fix; they pin the contract so it doesn't regress.
 # ---------------------------------------------------------------------------
 
 
-def test_ibp_value_grad_numpy_runs() -> None:
+def test_ordered_beta_bernoulli_value_grad_numpy_runs() -> None:
     rng = np.random.default_rng(2)
     t = rng.standard_normal((8, 4))
     v, g = OrderedBetaBernoulliPenalty(alpha=1.0, tau=1.0).value_grad(t)

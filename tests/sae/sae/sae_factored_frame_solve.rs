@@ -154,7 +154,7 @@ fn planted_plane(truth: &SmallTruth, a: usize, p: usize) -> Array2<f64> {
 }
 
 // ---------------------------------------------------------------------------
-// Production cold seed (residual-energy IBP logits + weighted-LSQ decoder init),
+// Production cold seed (residual-energy ordered independent Beta--Bernoulli logits + weighted-LSQ decoder init),
 // ported VERBATIM from the battery fixtures.
 // ---------------------------------------------------------------------------
 

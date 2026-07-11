@@ -79,6 +79,23 @@ def test_deprecated_score_alias_is_rejected() -> None:
         ManifoldSAE.from_dict(aliased)
 
 
+def test_complete_native_criterion_is_required() -> None:
+    golden = _load(GOLDEN_FULL)
+    missing = dict(golden)
+    missing.pop("penalized_laml_criterion")
+    with pytest.raises(ValueError, match="missing field.*penalized_laml_criterion"):
+        ManifoldSAE.from_dict(missing)
+
+
+@pytest.mark.parametrize("obsolete", ["top_k_projection", "pre_topk"])
+def test_obsolete_projected_model_payloads_are_rejected(obsolete: str) -> None:
+    golden = _load(GOLDEN_FULL)
+    aliased = dict(golden)
+    aliased[obsolete] = {}
+    with pytest.raises(ValueError, match=rf"unknown field.*{obsolete}"):
+        ManifoldSAE.from_dict(aliased)
+
+
 def test_noncanonical_assignment_is_rejected() -> None:
     golden = _load(GOLDEN_FULL)
     assert golden["assignment"] == "topk"

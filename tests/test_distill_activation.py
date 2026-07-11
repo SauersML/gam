@@ -6,7 +6,7 @@ import pytest
 from gamfit.distill import _activation_from_logits
 
 
-def test_distilled_ibp_activation_is_the_posterior_mean_gate() -> None:
+def test_distilled_ordered_beta_bernoulli_activation_is_the_posterior_mean_gate() -> None:
     assignments = _activation_from_logits(
         np.zeros((1, 3)),
         assignment="ordered_beta_bernoulli",

@@ -1,7 +1,7 @@
 """Use decoder incoherence to separate co-active superposed manifold atoms.
 
 The data are the sum of two simultaneously active curved atoms in overlapping
-ambient channels. The script fits the same IBP SAE twice, once with the
+ambient channels. The script fits the same ordered Beta--Bernoulli SAE twice, once with the
 cross-atom decoder incoherence penalty disabled and once with it enabled, then
 reports the normalized decoder cross-Gram score.
 """

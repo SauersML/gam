@@ -27,9 +27,9 @@ fit = gamfit.sae_manifold_fit(
     assignment="softmax",           # production default
 )
 
-print(fit)              # ManifoldSAE(K=16, d_atom=1, atom_topology='circle', ...)
+print(fit)              # ManifoldSAE(K=16, n=..., p=..., topology='circle', ...)
 print(fit.summary())    # K, active dims, avg active atoms, reconstruction R², ...
-recon = fit.predict(Z)  # (N, p) reconstruction; == fit.fitted on training Z
+recon = fit.reconstruct_training()  # exact stored (N, p) training reconstruction
 ```
 
 `sae_manifold_fit` returns a [`ManifoldSAE`](#the-manifoldsae-result). Both
@@ -146,7 +146,7 @@ smoothing weights selected by the penalized-LAML objective. Each piece plays a d
   per-atom decoded points. Reported as `fit.reconstruction_r2`.
 
 - **Gate sparsity (`assignment=`, canonical).** The per-token, per-atom gate
-  is selected by the assignment prior. The three supported kinds are
+  is selected by the assignment prior. The four supported kinds are
   `"softmax"` (default), `"ordered_beta_bernoulli"`, `"threshold_gate"`, and
   `"topk"`.
   The ordered Beta--Bernoulli route uses relaxed indicators
@@ -261,20 +261,9 @@ sampling) to a per-channel ambient band:
 Var_c(t) = Σ_{b1,b2} Φ_k(t)[b1] Φ_k(t)[b2] · Cov(β_k)[(b1,c),(b2,c)]
 ```
 
-`fit.shape_uncertainty(k)` returns the mean curve and its `±sd` envelope for atom
-`k`, evaluated along the atom's own coordinates (so the band reports
-uncertainty exactly where the data lives):
-
-```python
-band = fit.shape_uncertainty(0, n_sd=1.96)   # pointwise 95% band
-band["coords"]   # (G, d_k)  the coordinates the band is evaluated at
-band["mean"]     # (G, p)    fitted ambient point m_k(t)
-band["sd"]       # (G, p)    posterior sd per channel
-band["lower"]    # (G, p)    mean - n_sd * sd
-band["upper"]    # (G, p)    mean + n_sd * sd
-```
-
-The raw covariance is also on each atom for custom grids:
+The fitted band is stored directly on each Rust-owned atom, evaluated along the
+atom's own coordinates (so it reports uncertainty exactly where the data
+lives):
 
 ```python
 atom = fit.atoms[0]
@@ -282,6 +271,8 @@ atom.decoder_covariance   # (M_k*p, M_k*p), row-major (basis, channel) flat layo
 atom.shape_band_coords    # (G, d_k)
 atom.shape_band_mean      # (G, p)
 atom.shape_band_sd        # (G, p)
+lower = atom.shape_band_mean - 1.96 * atom.shape_band_sd
+upper = atom.shape_band_mean + 1.96 * atom.shape_band_sd
 ```
 
 This is an epistemic posterior on the manifold, not the per-observation data
@@ -304,8 +295,8 @@ model, so the reported band still reflects the joint covariance of the returned
     artifact schema. They retain each atom's decoder coefficients, fitted
     per-token coordinates, resolved topology, shape-band grid/mean/sd, and a
     compact per-output-channel covariance factor. Loading reconstructs the
-    dense covariance surface used by `shape_uncertainty`, so the curve and its
-    uncertainty band can be rendered again without refitting. The on-disk
+    dense covariance and shape-band surfaces, so the curve and its uncertainty
+    band can be rendered again without refitting. The on-disk
     factor is `(p, M_k, M_k)`, not the unused dense `(M_k·p)^2` matrix.
 
 !!! note "Degenerate atoms and the huge-`p` fallback"
@@ -332,26 +323,26 @@ coords_k = fit.coords[0]                       # (N, d_k) per-token coordinate
 lo, hi   = coords_k.min(0), coords_k.max(0)    # full observed extent per axis
 p5, p95  = np.percentile(coords_k, [5, 95], 0) # robust central range
 
-band = fit.shape_uncertainty(0)
+atom = fit.atoms[0]
 # The band coordinates are an evenly-strided subset of the per-token
-# coordinates, so band["mean"] already traces the shape across exactly the
-# range the atom occupies. To inspect a sub-range, mask on band["coords"]:
-in_range = (band["coords"][:, 0] >= p5[0]) & (band["coords"][:, 0] <= p95[0])
-typical_curve = band["mean"][in_range]         # shape over the central 90% of use
-typical_sd    = band["sd"][in_range]
+# coordinates, so shape_band_mean traces the shape across the fitted range.
+in_range = ((atom.shape_band_coords[:, 0] >= p5[0]) &
+            (atom.shape_band_coords[:, 0] <= p95[0]))
+typical_curve = atom.shape_band_mean[in_range]  # central 90% of use
+typical_sd    = atom.shape_band_sd[in_range]
 ```
 
-For out-of-sample tokens, `fit.per_atom_latent_for(X)` returns the per-atom
-coordinates under the frozen decoder, so the same extent / percentile read
-applies to new data.
+For out-of-sample tokens, `fit.converged_latents(X)["coords"]` returns all
+per-atom coordinates from one frozen-decoder solve, so the same extent and
+percentile calculation applies to new data.
 
 ### Per-atom curvature report
 
 Fresh SAE fits also carry a first-class per-atom curvature report:
 
 ```python
-curv = fit.curvature()
-curv[0]["kappa_hat"]          # fitted empirical curvature estimate for atom 0
+curv = fit.curvature_report
+curv["atoms"][0]["kappa_hat"]  # fitted estimate, when present in the report
 ```
 
 `kappa_hat` is the empirical curvature bound used by the curved-dictionary
@@ -374,48 +365,49 @@ the full surface):
 | `fitted` / `assignments` | `(N, p)` training reconstruction / `(N, K)` gates |
 | `reconstruction_r2` / `penalized_loss_score` / `penalized_laml_criterion` / `dispersion` | fit quality / negative penalized loss / certified full penalized-LAML value (including Laplace and Occam terms) / noise scale |
 
-Methods: `predict` / `reconstruct(X)`, `encode(X)` (out-of-sample gates),
-`project(X, k)`, `per_atom_latent_for(X)` and `featurize(X)` (coordinates),
-`per_atom_active_set(X)`, `shape_uncertainty(k)`,
-`curvature()` / `atom_curvature(k)`, `summary()`,
-`get_decoder()` / `get_anchors()`, and `to_dict` / `from_dict` / `save` /
-`load`.
+Methods: `reconstruct_training()`, `predict(X)` / `reconstruct(X)`,
+`encode(X)`, `converged_latents(X)`, `reconstruct_from_assignments(codes)`,
+`frozen_dictionary()`, `summary()`, `description_length()`, `steer(...)`,
+`attach_fisher(...)` / `detach_fisher()`, and the strict `to_dict` /
+`from_dict` / `to_json` / `from_json` / `save` / `load` serialization surface.
 
-### Out-of-sample and encoder distillation
+### Out-of-sample inference
 
-`X=` is the data to reconstruct — it is **not** a warm start.
-To seed the joint solve from an amortized encoder's per-token prediction,
-pass `a_init` (assignment logits `(N, K)`) and/or `t_init` (coordinates
-`(K, N, D_max)`) and a small `n_iter` for a bounded refinement; read the
-converged supervision targets back with `fit.converged_latents(X)`.
+`X` is the data to reconstruct. The fitted object is immutable: held-out
+inference solves assignments and coordinates against the frozen decoder and
+the smoothing state selected by the fit. It does not accept an eager encoder,
+warm-start tensors, or a second training objective.
 
 The out-of-sample surface:
 
 ```python
-fit.predict(X)               # (N, p) reconstruction under the frozen decoder
-fit.reconstruct(X, t_init=None, a_init=None)   # same, with optional warm starts
-gates = fit.encode(X)        # (N, K) out-of-sample gates
-gates, stats = fit.encode(X, return_stats=True)
-coords = fit.featurize(X)    # [ (N, d_k) ] per-atom coords (alias of per_atom_latent_for)
-coords = fit.per_atom_latent_for(X)
-active = fit.per_atom_active_set(X, threshold=None)  # (N, K) bool active mask
-proj_k = fit.project(X, atom_k=0)        # (N, d_k) on-manifold coordinate block for the atom
-latents = fit.converged_latents(X)       # exact solver targets for distillation
-encoder = fit.distill_encoder(X)         # amortized torch encoder from exact solves
+reconstruction = fit.predict(X)       # (N, p), same operation as reconstruct(X)
+gates = fit.encode(X)                 # (N, K)
+latents = fit.converged_latents(X)    # one coherent solve
+latents["fitted"]                     # (N, p)
+latents["assignments"]                # (N, K), exactly the applied codes
+latents["logits"]                     # (N, K)
+latents["coords"]                     # [ (N, d_k) ]
 ```
 
-This enables the "encoder predicts → solver refines → distill the gap" loop:
-`distill_encoder` trains a post-hoc torch MLP from the exact out-of-sample
-latent solves so future inference is a single forward pass.
+Call `converged_latents` when several outputs are needed; separate
+`predict`/`encode` calls each perform their own frozen-decoder solve.
 
 ## Steering and causal intervention
 
-`fit.steer(atom_k, t_from, t_to)` builds a **causal intervention plan** that
+`fit.steer(atom_k, metric_row, amplitude, t_from, t_to)` builds a **causal
+intervention plan** that
 moves one atom's latent coordinate from `t_from` to `t_to` and reports the
 resulting ambient delta with output dosimetry:
 
 ```python
-plan = fit.steer(atom_k=3, t_from=0.1, t_to=0.4)
+plan = fit.steer(
+    atom_k=3,
+    metric_row=0,
+    amplitude=1.0,
+    t_from=np.array([0.1]),
+    t_to=np.array([0.4]),
+)
 plan["delta"]             # (p,) activation-space move a·(g_k(t_to) − g_k(t_from))
 plan["predicted_nats"]    # path-integrated output-Fisher KL dose (nats), or None
 plan["validity_radius"]   # latent step length the linearization is trusted to, or None
@@ -438,29 +430,24 @@ together*, *what geometry kind is each* — are adjudicated by an anytime-valid
 e-BH (Benjamini-Hochberg on e-values) certificate, so the false-discovery
 control holds under optional stopping:
 
-```python
-cert = fit.structure_certificate(alpha=0.05)   # confirmed/contested claims + e-values
-contested = fit.contested_claims(alpha=0.05)    # only the unconfirmed claims
-probes = fit.contested_probe_report(alpha=0.05) # what evidence would settle them
-```
+The immutable artifact exposes the native report as `fit.certificates` and the
+serialized structure certificate as `fit.structure_certificate_json`. These
+are the claims certified during fitting; reading the model does not rerun or
+retune the certification procedure.
 
 The same machinery is exposed at top level for working with raw claim ledgers:
 `gamfit.e_bh_dictionary_certificate(...)` and
 `gamfit.plan_probe_for_contested_claim(...)` (probe design for a contested
-claim). `contested_probe_report` pairs a contested claim with the probe that
-would most cheaply confirm or refute it — the design loop for active
-interpretability.
+claim).
 
 ## Trust, diagnostics, and curvature
 
 Per-atom trust scores fold tangent conditioning, activation frequency, and
 support into a single `[0, 1]` score:
 
-```python
-fit.atom_trust(0)            # scalar trust in [0, 1] for atom 0
-fit.atom_diagnostics(0)      # full per-atom diagnostic dict (tangent condition, ...)
-fit.shape_uncertainty(0, n_sd=1.96)  # {"coords","mean","sd","lower","upper"} shape band
-```
+The fitted diagnostics mapping is available as `fit.diagnostics`; per-atom
+shape uncertainty is available on `fit.atoms[k].shape_band_*`, and curvature
+is available in `fit.curvature_report` when the fit emitted it.
 
 The observed coordinate extent of an atom is read directly off
 `fit.coords[k]` (see [Typical coordinate range](#typical-coordinate-range)).

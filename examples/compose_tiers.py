@@ -255,15 +255,15 @@ def compose_tiers(
 
     def _stagewise_callback(event: dict[str, Any]) -> None:
         ev = event.get("ev")
-        reml = event.get("joint_penalized_laml_after")
+        criterion = event.get("joint_penalized_laml_after")
         ev_s = "nan" if ev is None else f"{float(ev):.6f}"
-        reml_s = "nan" if reml is None else f"{float(reml):.6g}"
+        criterion_s = "nan" if criterion is None else f"{float(criterion):.6g}"
         print(
             "[compose_tiers] stagewise "
             f"{event['event']} round={int(event['birth_round'])} "
             f"sweep={int(event['backfit_sweep'])} k={int(event['k'])} "
             f"candidate={event.get('candidate')} accepted={event.get('accepted')} "
-            f"ev={ev_s} reml={reml_s}",
+            f"ev={ev_s} penalized_laml={criterion_s}",
             flush=True,
         )
         _write_stagewise_checkpoint(event)

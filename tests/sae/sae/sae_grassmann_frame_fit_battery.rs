@@ -104,7 +104,7 @@ fn planted_z(truth: &SmallTruth, p: usize) -> Array2<f64> {
     z
 }
 
-/// Residual-energy IBP cold seed (the production `sae_residual_seed_logits`
+/// Residual-energy ordered independent Beta--Bernoulli cold seed (the production `sae_residual_seed_logits`
 /// path): logit ∝ −gain·(per-atom reconstruction residual − row mean)/row mean,
 /// so each row routes toward the atom that explains it best. Data-driven and
 /// soft (no hard ±gain saturation), which keeps the inner t-block PD-reachable.
@@ -175,7 +175,7 @@ fn residual_seed_logits(
     logits
 }
 
-/// Weighted-LSQ decoder seed at the IBP gate (the production
+/// Weighted-LSQ decoder seed at the ordered independent Beta--Bernoulli gate (the production
 /// `sae_decoder_lsq_init` path): per-atom decoder from a joint ridge LS of `z`
 /// on the gate-weighted bases.
 fn decoder_lsq_init(

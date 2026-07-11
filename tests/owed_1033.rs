@@ -18,7 +18,7 @@
 //! n-sized work is, and each piece DEPENDS on ρ:
 //!
 //!   * per-row assignment gates `a_k = a_k(ρ.lambda_sparse)` (softmax / JumpReLU
-//!     / IBP-MAP temperatures), and hence the per-row active-set selection;
+//!     / ordered independent Beta--Bernoulli temperatures), and hence the per-row active-set selection;
 //!   * per-row reconstruction `fitted = Σ_k a_k · B_k φ_k(t_k)`;
 //!   * per-row residuals and any whitening;
 //!   * per-row logit + coordinate Jacobian rows;

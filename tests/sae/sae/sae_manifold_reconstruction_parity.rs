@@ -4,7 +4,7 @@
 //! This is the discriminating measurement the #1026 roadmap calls for, run end
 //! to end through the SAME production engine the recovery pins use
 //! (`SaeManifoldOuterObjective` + the generic `OuterProblem::run` cascade, cold
-//! IBP-MAP residual-energy seed logits + weighted-LSQ decoder init at gain 4.0 /
+//! ordered independent Beta--Bernoulli residual-energy seed logits + weighted-LSQ decoder init at gain 4.0 /
 //! τ = 0.5). The DGP is the proven planted-circle dictionary from
 //! `sae_manifold_k_ladder_recovery` (K genuinely-curved circle features —
 //! integrated turning Θ = 2π each — embedded in mutually-orthogonal planted
@@ -378,7 +378,7 @@ struct Slot {
 }
 
 /// Build the cold term for an arbitrary slot list, through the production cold
-/// IBP-MAP routing seed + weighted-LSQ decoder init (identical to the recovery
+/// ordered independent Beta--Bernoulli routing seed + weighted-LSQ decoder init (identical to the recovery
 /// pins, generalized over heterogeneous atom bases).
 fn build_cold_term(
     truth: &Truth,

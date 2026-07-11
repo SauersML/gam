@@ -2,7 +2,7 @@
 
 The fixtures pin the JSON contract owned by Rust's ``ManifoldSaePayload``. The
 representative payload exercises every optional surface: mixed atom topologies,
-TopK routing, a JumpReLU threshold, output-Fisher steering state, the selected
+TopK routing, a smooth-gate threshold, output-Fisher steering state, the selected
 ``ρ*`` fields, and every diagnostic/certificate report block.
 
 The fitted model is the Rust-owned ``ManifoldSAE`` PyO3 class. Accordingly this
@@ -47,7 +47,7 @@ def _trust_atom(seed: float) -> dict[str, Any]:
 
 
 def build_payload() -> dict[str, Any]:
-    """Build a representative canonical v1 payload.
+    """Build a representative canonical v3 payload.
 
     Shapes: N=5 rows, p=4 channels, K=3 atoms.
       atom 0: periodic, M0=5 (H=2 -> 2H+1), d0=1  (carries coords_u_arc + band)
