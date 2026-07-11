@@ -1110,9 +1110,8 @@ mod parity_tests {
     fn transform_eta_nonfinite_image_is_a_typed_error() {
         let eta_lower = array![0.0_f64];
         let eta_upper = array![800.0_f64];
-        let exponential = |eta: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            Ok(eta.mapv(f64::exp))
-        };
+        let exponential =
+            |eta: &Array1<f64>| -> Result<Array1<f64>, EstimationError> { Ok(eta.mapv(f64::exp)) };
         let error = transform_eta_interval(
             &eta_lower,
             &eta_upper,

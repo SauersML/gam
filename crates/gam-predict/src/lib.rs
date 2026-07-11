@@ -286,40 +286,16 @@ fn selected_uncertainty_backend<'a>(
         }
         InferenceCovarianceMode::ConditionalPlusSmoothingPreferred => {
             if let Some(covariance) = fit.beta_covariance_corrected() {
-                if covariance.nrows() != expected_dim || covariance.ncols() != expected_dim {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "{label}: corrected covariance dimension mismatch: expected {}x{}, got {}x{}",
-                        expected_dim,
-                        expected_dim,
-                        covariance.nrows(),
-                        covariance.ncols()
-                    )));
-                }
-                // The smoothing-corrected covariance `H⁻¹ + J Var(ρ̂) Jᵀ` is only
-                // usable when it is finite. On a degenerate fit — e.g. an
-                // all-zero-count Poisson, whose flat likelihood leaves the outer
-                // REML problem near-singular — `Var(ρ̂)` blows up and the
-                // correction term carries non-finite entries, even though the
-                // conditional `H⁻¹` is well defined. A NaN/∞ covariance produces
-                // NaN standard errors that propagate through the interval path
-                // (the delta-method fallback in `transform_eta_interval` cannot
-                // rescue them because it multiplies the same blown-up SE), so a
-                // model the API reports as fitted yields non-finite interval
-                // bounds (#1515). Treat a non-finite correction exactly like a
-                // missing one — the `Preferred` mode already contracts to fall
-                // back to the conditional covariance when the correction is
-                // unavailable, and an unusable correction is that same case — so
-                // a fitted model always yields finite standard errors and bounds.
-                if covariance.iter().all(|v| v.is_finite()) {
-                    return Ok((
-                        PredictionCovarianceBackend::from_dense(covariance.view()),
-                        true,
-                    ));
-                }
-                log::warn!(
-                    "{label}: smoothing-corrected covariance has non-finite entries; \
-                     degrading to the conditional covariance (#1515)"
-                );
+                validate_dense_prediction_covariance(
+                    covariance.view(),
+                    expected_dim,
+                    "smoothing-corrected",
+                )
+                .map_err(EstimationError::InvalidInput)?;
+                return Ok((
+                    PredictionCovarianceBackend::from_dense(covariance.view()),
+                    true,
+                ));
             }
             selected_uncertainty_backend(
                 fit,
@@ -334,15 +310,12 @@ fn selected_uncertainty_backend<'a>(
                     "fit result does not contain smoothing-corrected covariance".to_string(),
                 )
             })?;
-            if covariance.nrows() != expected_dim || covariance.ncols() != expected_dim {
-                return Err(EstimationError::InvalidInput(format!(
-                    "{label}: corrected covariance dimension mismatch: expected {}x{}, got {}x{}",
-                    expected_dim,
-                    expected_dim,
-                    covariance.nrows(),
-                    covariance.ncols()
-                )));
-            }
+            validate_dense_prediction_covariance(
+                covariance.view(),
+                expected_dim,
+                "smoothing-corrected",
+            )
+            .map_err(EstimationError::InvalidInput)?;
             Ok((
                 PredictionCovarianceBackend::from_dense(covariance.view()),
                 true,
@@ -4096,6 +4069,54 @@ mod tests {
         assert!(
             err.contains("smoothing-corrected covariance"),
             "unexpected required-covariance error: {err}"
+        );
+    }
+
+    #[test]
+    fn smoothing_preferred_rejects_present_nonfinite_corrected_covariance() {
+        let predictor = GaussianLocationScalePredictor {
+            beta_mu: array![0.0],
+            beta_noise: array![0.0],
+            sigma_floor: gam_model_kernels::sigma_link::LOGB_SIGMA_FLOOR,
+            response_scale: 1.0,
+            covariance: Some(array![[1.0, 0.0], [0.0, 1.0]]),
+            link_wiggle: None,
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]),
+            offset: array![0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0]])),
+            offset_noise: None,
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        };
+        let options = PredictUncertaintyOptions {
+            covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+            includeobservation_interval: false,
+            apply_bias_correction: false,
+            edgeworth_one_sided: false,
+            boundary_correction: false,
+            ood_inflation: false,
+            multi_point_joint: false,
+            ..PredictUncertaintyOptions::default()
+        };
+        let fit = gaussian_location_scale_fit_with_covariance_and_corrected(
+            array![0.0],
+            array![0.0],
+            array![[1.0, 0.0], [0.0, 1.0]],
+            Some(array![[f64::NAN, 0.0], [0.0, 1.0]]),
+        );
+
+        let error = predictor
+            .predict_full_uncertainty(&input, &fit, &options)
+            .expect_err(
+                "a present corrupt correction must not be replaced by conditional covariance",
+            );
+        assert!(
+            error
+                .to_string()
+                .contains("smoothing-corrected covariance[0,0] is non-finite"),
+            "unexpected corrected-covariance error: {error}"
         );
     }
 
