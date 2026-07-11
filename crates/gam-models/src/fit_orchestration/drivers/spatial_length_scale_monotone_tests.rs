@@ -17,6 +17,7 @@
 mod spatial_length_scale_monotone_tests {
     use super::*;
     use gam_terms::basis::{MaternBasisSpec, MaternNu};
+    use gam_terms::smooth::auto_initial_length_scale_for_centers;
     use ndarray::{Array1, Array2, ArrayView2};
 
     /// Runs a Gaussian baseline fit and the spatial
@@ -95,6 +96,106 @@ mod spatial_length_scale_monotone_tests {
             }
             _ => panic!("expected Matérn term"),
         }
+    }
+
+    /// Return `(short_seed, long_endpoint, selected)` for the certified
+    /// pre-joint Matérn range comparison on a deterministic sinusoid. Keeping
+    /// this at the profiler boundary isolates the global basin decision from
+    /// the subsequent local joint optimizer.
+    fn profiled_matern_basin_for_frequency(frequency: f64) -> (f64, f64, f64) {
+        let n = 120usize;
+        let num_centers = 20usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let x = i as f64 / (n - 1) as f64;
+            data[[i, 0]] = x;
+            y[i] = (2.0 * std::f64::consts::PI * frequency * x).sin()
+                + 0.05 * (2.0 * std::f64::consts::PI * 37.0 * x).sin();
+        }
+        let short_seed =
+            auto_initial_length_scale_for_centers(data.view(), &[0], num_centers);
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "matern".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0],
+                    spec: MaternBasisSpec {
+                        periodic: None,
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers },
+                        length_scale: short_seed,
+                        nu: MaternNu::FiveHalves,
+                        include_intercept: false,
+                        double_penalty: true,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: None,
+                        nullspace_shrinkage_survived: None,
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+                joint_null_rotation: None,
+            }],
+        };
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let family = LikelihoodSpec::gaussian_identity();
+        let options = superseded_fit_options(&FitOptions::default());
+        let baseline = fit_term_collection_forspec(
+            data.view(),
+            y.view(),
+            weights.view(),
+            offset.view(),
+            &spec,
+            family.clone(),
+            &options,
+        )
+        .expect("short-range profile");
+        let resolved =
+            freeze_term_collection_from_design(&spec, &baseline.design).expect("freeze profile");
+        let spatial_terms = spatial_length_scale_term_indices(&resolved);
+        assert_eq!(spatial_terms, vec![0]);
+        let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+        let (psi_long, _) =
+            spatial_term_psi_bounds(data.view(), &resolved, 0, &kappa_options);
+        let long_endpoint = (-psi_long).exp();
+        let (selected_spec, _) = select_isotropic_matern_range_basin(
+            data.view(),
+            y.view(),
+            weights.view(),
+            offset.view(),
+            resolved,
+            baseline,
+            &family,
+            &options,
+            &kappa_options,
+            &spatial_terms,
+        )
+        .expect("certified endpoint profile comparison");
+        let selected = get_spatial_length_scale(&selected_spec, 0).expect("selected Matérn range");
+        (short_seed, long_endpoint, selected)
+    }
+
+    #[test]
+    fn smooth_nu_five_halves_selects_certified_long_range_basin() {
+        let (short, long, selected) = profiled_matern_basin_for_frequency(1.0);
+        assert!(long > short, "fixture must expose distinct range basins");
+        assert_eq!(
+            selected, long,
+            "smooth ν=5/2 signal should enter the certified long-range basin"
+        );
+    }
+
+    #[test]
+    fn sin8_nu_five_halves_retains_certified_short_range_basin() {
+        let (short, long, selected) = profiled_matern_basin_for_frequency(8.0);
+        assert!(long > short, "fixture must expose distinct range basins");
+        assert_eq!(
+            selected, short,
+            "sin8 ν=5/2 signal must retain the resolving short-range basin"
+        );
     }
 
     #[test]

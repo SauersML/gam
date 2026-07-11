@@ -5082,6 +5082,76 @@ fn composite_penalty_parallel_prefix_matches_serial_bit_exact() {
 /// The matrix-free reduced-Schur log-determinant `slq_reduced_schur_log_det`
 /// (Stochastic Lanczos Quadrature on the `schur_matvec` apply, NO dense `k×k`
 /// Schur formed) must agree with the exact dense evidence log|S| it replaces —
+/// #1017 CPU perf: `cholesky_lower` routes the wide reduced Schur (k ≥ 128)
+/// through faer's blocked LLT instead of the scalar triple loop. The blocked
+/// factor must reconstruct the SAME SPD matrix (`A = L Lᵀ`) as the scalar
+/// reference to a tight tolerance, be exactly lower-triangular (zero strictly
+/// above the diagonal), and yield the same log-determinant — otherwise the
+/// reduced solve and REML evidence that consume it would drift. Fixture width
+/// 200 clears the `FAER_CHOLESKY_MIN = 128` gate so this exercises the faer
+/// branch (the small direct-Schur tests below stay on the scalar path).
+#[test]
+fn cholesky_lower_faer_path_matches_scalar_reference_on_wide_schur() {
+    let k = 200usize;
+    // Well-conditioned SPD: MᵀM + k·I.
+    let mut m = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        for j in 0..k {
+            m[[i, j]] = 0.001 * (((i + 3) * (j + 1)) as f64).sin();
+        }
+    }
+    let mut a = m.t().dot(&m);
+    for i in 0..k {
+        a[[i, i]] += k as f64;
+    }
+    // Scalar reference (pre-#1017 body), independent of the routine under test.
+    let mut ref_l = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        for j in 0..=i {
+            let mut sum = a[[i, j]];
+            for kk in 0..j {
+                sum -= ref_l[[i, kk]] * ref_l[[j, kk]];
+            }
+            ref_l[[i, j]] = if i == j {
+                sum.sqrt()
+            } else {
+                sum / ref_l[[j, j]]
+            };
+        }
+    }
+    let l = cholesky_lower(&a).expect("wide SPD reduced Schur must factor");
+    let mut max_factor_diff = 0.0_f64;
+    for i in 0..k {
+        for j in 0..k {
+            if j > i {
+                assert_eq!(l[[i, j]], 0.0, "faer factor must be lower-triangular at ({i},{j})");
+            } else {
+                max_factor_diff = max_factor_diff.max((l[[i, j]] - ref_l[[i, j]]).abs());
+            }
+        }
+    }
+    // Reconstruction A ≈ L Lᵀ and log-det parity are the load-bearing invariants;
+    // the raw factor entries may differ by the blocked vs scalar rounding.
+    let recon = l.dot(&l.t());
+    let mut max_recon = 0.0_f64;
+    for i in 0..k {
+        for j in 0..k {
+            max_recon = max_recon.max((recon[[i, j]] - a[[i, j]]).abs());
+        }
+    }
+    assert!(
+        max_recon < 1e-8,
+        "faer Cholesky must reconstruct A to 1e-8 (max |LLᵀ-A| = {max_recon})"
+    );
+    let logdet_faer: f64 = (0..k).map(|i| 2.0 * l[[i, i]].ln()).sum();
+    let logdet_ref: f64 = (0..k).map(|i| 2.0 * ref_l[[i, i]].ln()).sum();
+    assert!(
+        (logdet_faer - logdet_ref).abs() < 1e-9,
+        "faer vs scalar log-det mismatch: {logdet_faer} vs {logdet_ref} \
+         (max factor entry diff {max_factor_diff})"
+    );
+}
+
 /// the route both dense evidence paths REFUSE above the in-core budget at the
 /// K=32k manifold border. Also asserts SLQ reproducibility and that the one-call
 /// `matrix_free_arrow_evidence_log_det` returns the exact `log_det_tt` (same
@@ -6474,16 +6544,46 @@ fn zz_measure_reduced_schur_cholesky() {
         for i in 0..k {
             spd[[i, i]] += k as f64;
         }
+        // Inline scalar baseline (the pre-#1017 `cholesky_lower` body) so the A/B
+        // is honest now that the production `cholesky_lower` itself routes k≥128
+        // through faer.
+        let naive = |a: &Array2<f64>| -> Array2<f64> {
+            let n = a.nrows();
+            let mut l = Array2::<f64>::zeros((n, n));
+            for i in 0..n {
+                for j in 0..=i {
+                    let mut sum = a[[i, j]];
+                    for kk in 0..j {
+                        sum -= l[[i, kk]] * l[[j, kk]];
+                    }
+                    if i == j {
+                        l[[i, j]] = sum.sqrt();
+                    } else {
+                        l[[i, j]] = sum / l[[j, j]];
+                    }
+                }
+            }
+            l
+        };
         // warm + time naive
         let mut checksum = 0.0_f64;
-        let _ = super::reduced_solve::cholesky_lower(&spd).unwrap();
+        let _ = naive(&spd);
         let reps = 3;
         let mut best_naive = f64::INFINITY;
         for _ in 0..reps {
             let t = Instant::now();
-            let l = super::reduced_solve::cholesky_lower(&spd).unwrap();
+            let l = naive(&spd);
             best_naive = best_naive.min(t.elapsed().as_secs_f64());
             checksum += l[[k - 1, 0]];
+        }
+        // Parity: production path (faer) vs the scalar reference must match.
+        let prod = super::reduced_solve::cholesky_lower(&spd).unwrap();
+        let ref_l = naive(&spd);
+        let mut max_abs = 0.0_f64;
+        for i in 0..k {
+            for j in 0..=i {
+                max_abs = max_abs.max((prod[[i, j]] - ref_l[[i, j]]).abs());
+            }
         }
         // faer LLT
         let view = gam_linalg::faer_ndarray::FaerArrayView::new(&spd);
@@ -6497,10 +6597,12 @@ fn zz_measure_reduced_schur_cholesky() {
             checksum += llt.L()[(k - 1, 0)];
         }
         eprintln!(
-            "zz_measure cholesky k={k}: naive={:.4}s faer={:.4}s speedup={:.1}x checksum={:.3}",
+            "zz_measure cholesky k={k}: naive={:.4}s faer={:.4}s speedup={:.1}x \
+             max_abs(prod-ref)={:.2e} checksum={:.3}",
             best_naive,
             best_faer,
             best_naive / best_faer,
+            max_abs,
             checksum
         );
     }

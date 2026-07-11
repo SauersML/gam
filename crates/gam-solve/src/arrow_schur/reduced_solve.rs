@@ -4997,6 +4997,36 @@ pub(crate) fn cholesky_lower(a: &Array2<f64>) -> Result<Array2<f64>, String> {
         return Ok(maybe_device);
     }
 
+    // CPU fast path (#1017): at the SAE border width the reduced Schur is a
+    // dense `k×k` (k≈2k–4k) whose scalar triple-loop factorization is O(k³/3)
+    // and neither blocked nor SIMD-vectorized — the dominant per-Newton-step
+    // cost on a CPU-only host. faer's blocked LLT computes the SAME `A = L Lᵀ`
+    // (to O(κ·ε), the slack the reduced solve/log-det already tolerate) an order
+    // of magnitude faster. Restrict it to `k ≥ FAER_CHOLESKY_MIN` so the many
+    // tiny per-row `d×d` blocks (d≤~8, factorization.rs) and the small dense
+    // test fixtures keep the exact scalar loop — bit-for-bit their historical
+    // factor — where faer's setup overhead would not pay off anyway. If faer
+    // declines (a non-PD blocked pivot) fall through to the scalar loop so the
+    // PD/non-PD verdict and its typed error stay exactly the historical ones
+    // (`factor_dense_reduced_schur`'s spectral-floor fallback keys only on Ok vs
+    // Err, so the boundary behavior is unchanged).
+    const FAER_CHOLESKY_MIN: usize = 128;
+    if n >= FAER_CHOLESKY_MIN {
+        let view = gam_linalg::faer_ndarray::FaerArrayView::new(a);
+        if let Ok(llt) =
+            gam_linalg::faer_ndarray::FaerLlt::new(view.as_ref(), faer::Side::Lower)
+        {
+            let l_faer = llt.L();
+            let mut l = Array2::<f64>::zeros((n, n));
+            for i in 0..n {
+                for j in 0..=i {
+                    l[[i, j]] = l_faer[(i, j)];
+                }
+            }
+            return Ok(l);
+        }
+    }
+
     let mut l = Array2::<f64>::zeros((n, n));
     for i in 0..n {
         for j in 0..=i {
