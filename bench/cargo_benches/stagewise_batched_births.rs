@@ -15,8 +15,8 @@ use gam::terms::sae::manifold::{
     BatchedStagewiseConfig, StagewiseConfig, fit_stagewise, fit_stagewise_batched,
 };
 use gam::terms::{
-    AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
+    sae::manifold::AssignmentMode, latent::LatentManifold, sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind,
+    sae::manifold::SaeBasisEvaluator, sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
 };
 use ndarray::{Array1, Array2};
 use std::sync::Arc;

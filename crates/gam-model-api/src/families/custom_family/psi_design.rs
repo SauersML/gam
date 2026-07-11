@@ -9,20 +9,17 @@ use gam_problem::{CustomFamilyError, DenseMatrixHyperOperator, EvalMode, HyperOp
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
-// The neutral ψ-derivative carriers, operator traits, and the joint-Hessian
-// source-preference / materialization-intent enums live in `gam-problem`; they
-// are re-exported here so every `custom_family::psi_design::*` path keeps
-// resolving without a duplicate definition. Only the trait that couples to the
-// `CustomFamily` evaluation carrier (`ExactNewtonJointHessianWorkspace`) stays
-// local below.
+// The neutral ψ-derivative carriers and operator traits live in
+// `gam-problem`. Only the trait that couples to the `CustomFamily` evaluation
+// carrier (`ExactNewtonJointHessianWorkspace`) stays local below.
 pub use gam_problem::{
     CustomFamilyBlockPsiDerivative, CustomFamilyPsiDerivativeOperator,
     JointHessianSourcePreference, MaterializablePsiDerivativeOperator, MaterializationIntent,
     SharedDerivativeBlocks,
 };
-pub use gam_problem::{
+use gam_problem::{
     ExactNewtonJointPsiSecondOrderContracted, ExactNewtonJointPsiSecondOrderTerms,
-    ExactNewtonJointPsiTerms,
+    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
 };
 
 pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
@@ -305,5 +302,3 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
             .collect()
     }
 }
-
-pub use gam_problem::ExactNewtonJointPsiWorkspace;

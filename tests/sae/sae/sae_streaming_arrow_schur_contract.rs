@@ -37,8 +37,8 @@ use gam::solver::arrow_schur::{
 };
 use gam::solver::gpu_kernels::arrow_schur::{ArrowSchurGpuFailure, solve_reduced_beta_pcg};
 use gam::terms::{
-    AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
-    SaeManifoldTerm,
+    sae::manifold::AssignmentMode, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldRho,
+    sae::manifold::SaeManifoldTerm,
 };
 
 /// Deterministic pseudo-random f64 ∈ (-1, 1) via LCG, matching the sibling

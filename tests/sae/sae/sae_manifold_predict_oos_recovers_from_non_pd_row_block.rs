@@ -26,8 +26,8 @@
 use ndarray::{Array1, Array2, Array3, array};
 
 use gam::terms::{
-    AssignmentMode, LatentManifold, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom,
-    SaeManifoldRho, SaeManifoldTerm,
+    sae::manifold::AssignmentMode, latent::LatentManifold, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeManifoldAtom,
+    sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
 };
 
 /// Build a tiny periodic-atom evaluator on a 3-row coordinate grid. The

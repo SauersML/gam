@@ -98,8 +98,8 @@ pub use gam_model_api::families::custom_family::{
 pub use gam_problem::{
     AdditiveBlockJacobian, BlockEffectiveJacobian, BlockGeometryDirectionalDerivative,
     BlockWorkingSet, CustomFamilyBlockPsiDerivative, CustomFamilyPsiDerivativeOperator,
-    ExactNewtonJointPsiTerms, ExactNewtonOuterObjective, FamilyLinearizationState,
-    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+    ExactNewtonOuterObjective, FamilyLinearizationState, ParameterBlockSpec, ParameterBlockState,
+    PenaltyMatrix,
 };
 
 // `whitened_spectrum` is a submodule hosted inside `joint_newton`; re-export it

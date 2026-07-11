@@ -26,8 +26,8 @@ use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 use gam::terms::latent::LatentManifold;
 use gam::terms::sae::identifiability::{GeneratorFamily, VerdictProvenance};
 use gam::terms::{
-    AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
-    SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
+    sae::manifold::AssignmentMode, sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeBasisEvaluator,
+    sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
 };
 use ndarray::{Array1, Array2, Array3, Array4, Array5, ArrayView2};
 use std::sync::Arc;

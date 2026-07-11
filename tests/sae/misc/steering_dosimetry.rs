@@ -42,7 +42,7 @@ use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::inference::steering::steer_delta;
 use gam::terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
 use gam::terms::{
-    PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldTerm,
+    sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldTerm,
 };
 
 const R: f64 = 1.3;
@@ -67,7 +67,7 @@ fn planted_circle(t0: f64) -> (SaeManifoldTerm, RowMetric) {
     let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m).expect("evaluator"));
     let coords = Array2::from_shape_vec((n, d), vec![t0]).expect("coords");
     let (phi, jet) = {
-        use gam::terms::SaeBasisEvaluator;
+        use gam::terms::sae::manifold::SaeBasisEvaluator;
         evaluator.evaluate(coords.view()).expect("evaluate")
     };
     assert_eq!(phi.dim(), (n, m));

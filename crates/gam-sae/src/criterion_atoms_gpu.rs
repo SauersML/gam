@@ -240,7 +240,6 @@ extern "C" __global__ void sae_residual_em_score_vjp_f64(
     }
 
     /// Launch the device-resident residual-EM forward kernel.
-    #[allow(clippy::too_many_arguments)]
     pub fn residual_em_score_device(
         ordinal: usize,
         dtype: ResidualEmCudaDType,
@@ -300,7 +299,6 @@ extern "C" __global__ void sae_residual_em_score_vjp_f64(
     }
 
     /// Launch the analytic device-resident residual-EM VJP kernel.
-    #[allow(clippy::too_many_arguments)]
     pub fn residual_em_score_vjp_device(
         ordinal: usize,
         dtype: ResidualEmCudaDType,
@@ -368,7 +366,6 @@ pub use device::{residual_em_score_device, residual_em_score_vjp_device};
 
 /// Non-Linux typed refusal for the Linux-only raw CUDA forward lane.
 #[cfg(not(target_os = "linux"))]
-#[allow(clippy::too_many_arguments)]
 pub fn residual_em_score_device(
     ordinal: usize,
     dtype: ResidualEmCudaDType,
@@ -391,7 +388,6 @@ pub fn residual_em_score_device(
 
 /// Non-Linux typed refusal for the Linux-only raw CUDA VJP lane.
 #[cfg(not(target_os = "linux"))]
-#[allow(clippy::too_many_arguments)]
 pub fn residual_em_score_vjp_device(
     ordinal: usize,
     dtype: ResidualEmCudaDType,

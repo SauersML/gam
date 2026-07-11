@@ -165,19 +165,85 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         .try_resume_from_checkpoint(n_params)
         .map(Array1::from)
         .unwrap_or(initial_flat);
-    let grad = objective
+    let audited = objective
         .eval(&banked)
-        .expect("gradient eval at the audited rho")
-        .gradient;
+        .expect("gradient eval at the audited rho");
+    let grad = audited.gradient;
+    assert!(
+        objective.term.frames_active(),
+        "the #2253 discriminator must exercise the profiled Grassmann-frame path"
+    );
+    let center_term = objective.term.clone();
+    let center_rho = objective.baseline_rho.from_flat(banked.view());
+    let mut center_atom_term = center_term.clone();
+    let center_atoms = center_atom_term
+        .criterion_as_atoms(
+            z.view(),
+            &center_rho,
+            objective.registry.as_ref(),
+            40,
+            0.05,
+            1.0e-6,
+            1.0e-6,
+        )
+        .expect("criterion atoms at the audited rho");
+    for atom in center_atoms.atoms() {
+        eprintln!(
+            "[zz2234] center atom {}: value={:+.6e} grad={:?}",
+            atom.label(),
+            atom.value(),
+            atom.grad(),
+        );
+    }
     let h = 1.0e-4;
     for j in 0..n_params {
         let mut plus = banked.clone();
         plus[j] += h;
         let mut minus = banked.clone();
         minus[j] -= h;
-        let c_plus = objective.eval(&plus).expect("eval at +h").cost;
-        let c_minus = objective.eval(&minus).expect("eval at -h").cost;
+        let plus_rho = objective.baseline_rho.from_flat(plus.view());
+        let minus_rho = objective.baseline_rho.from_flat(minus.view());
+        let mut plus_term = center_term.clone();
+        let mut minus_term = center_term.clone();
+        let plus_atoms = plus_term
+            .criterion_as_atoms(
+                z.view(),
+                &plus_rho,
+                objective.registry.as_ref(),
+                40,
+                0.05,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("criterion atoms at +h");
+        let minus_atoms = minus_term
+            .criterion_as_atoms(
+                z.view(),
+                &minus_rho,
+                objective.registry.as_ref(),
+                40,
+                0.05,
+                1.0e-6,
+                1.0e-6,
+            )
+            .expect("criterion atoms at -h");
+        let c_plus = plus_atoms.value();
+        let c_minus = minus_atoms.value();
         let fd = (c_plus - c_minus) / (2.0 * h);
+        for (plus_atom, minus_atom) in plus_atoms.atoms().iter().zip(minus_atoms.atoms()) {
+            let atom_fd = (plus_atom.value() - minus_atom.value()) / (2.0 * h);
+            eprintln!(
+                "[zz2234] coord {j} atom {}: analytic={:+.6e} central_fd={:+.6e}",
+                plus_atom.label(),
+                center_atoms
+                    .atoms()
+                    .iter()
+                    .find(|atom| atom.label() == plus_atom.label())
+                    .expect("matching center atom")
+                    .grad()[j],
+                atom_fd,
+            );
+        }
         let delta = (grad[j] - fd).abs();
         let tolerance = 5.0e-3 * (1.0 + grad[j].abs().max(fd.abs()));
         eprintln!(

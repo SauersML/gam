@@ -36,8 +36,8 @@ use gam::solver::arrow_schur::{
 };
 use gam::terms::latent::LatentManifold;
 use gam::terms::{
-    ArdSharing, AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
+    sae::manifold::ArdSharing, sae::manifold::AssignmentMode, sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind,
+    sae::manifold::SaeBasisEvaluator, sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
 };
 
 const M: usize = 3; // periodic basis: [const, sin, cos]

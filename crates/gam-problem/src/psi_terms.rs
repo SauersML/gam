@@ -3,8 +3,7 @@
 //! These ψ-hyperparameter term types and the [`ExactNewtonJointPsiWorkspace`]
 //! trait are neutral carriers in the criterion contract: they reference only
 //! [`HyperOperator`] / [`DriftDerivResult`] (defined in this crate) and ndarray
-//! arrays, so they live in `gam-problem` and are re-exported by the
-//! `custom_family` layer for backward compatibility.
+//! arrays, so `gam-problem` is their public namespace.
 
 use crate::{DriftDerivResult, HyperOperator};
 use ndarray::{Array1, Array2};

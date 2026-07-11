@@ -183,27 +183,6 @@ pub mod solver {
 pub mod terms {
     pub use gam_sae as sae;
     pub use gam_terms::*;
-    // #1521 carve compatibility: the SAE manifold public API used to live
-    // flatly under `gam::terms` before the manifold engine was split into the
-    // `gam-sae` crate. Roughly thirty integration tests (and downstream code)
-    // still import these types as `gam::terms::{SaeManifoldTerm, ...}`, so keep
-    // that path stable by re-exporting them from their new home. The types are
-    // all flattened onto `gam_sae::manifold` (which re-exports `assignment::*`,
-    // `basis::*`, `atom::*`, `loss::*`, `rho::*`, `term::*`). These explicit
-    // re-exports take priority over the `gam_terms::*` glob above, so there is
-    // no ambiguity with any same-named term-side item.
-    pub use gam_sae::manifold::{
-        ArdSharing, AssignmentMode, CurvatureWalkReport, EuclideanPatchEvaluator,
-        PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
-        SaeManifoldAtom, SaeManifoldLoss, SaeManifoldOuterObjective, SaeManifoldRho,
-        SaeManifoldTerm, SphereChartEvaluator, StagewiseEventKind, StagewiseProgress,
-        StagewiseProgressCallback, TorusHarmonicEvaluator,
-    };
-    // `LatentManifold` lives in `gam_terms::latent` and is not surfaced at the
-    // `gam_terms` root, so the `gam_terms::*` glob does not bring it to the flat
-    // `gam::terms::LatentManifold` path (only `gam::terms::latent::LatentManifold`).
-    // Several manifold tests/examples import the flat path; restore it.
-    pub use gam_terms::latent::LatentManifold;
 }
 /// Shared test-support helpers (FD harness, fixtures, reference-tool + CLI
 /// harnesses) carved into the `gam-test-support` crate under #1521 so the

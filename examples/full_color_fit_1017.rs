@@ -31,9 +31,9 @@ use gam::solver::arrow_schur::ArrowSolverMode;
 use gam::solver::rho_optimizer::OuterProblem;
 use gam::solver::seeding::SeedConfig;
 use gam::terms::{
-    AnalyticPenaltyRegistry, AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator,
-    SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldOuterObjective,
-    SaeManifoldRho, SaeManifoldTerm,
+    AnalyticPenaltyRegistry, sae::manifold::AssignmentMode, latent::LatentManifold, sae::manifold::PeriodicHarmonicEvaluator,
+    sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeBasisEvaluator, sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldOuterObjective,
+    sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
 };
 use gam_sae::manifold::StagewiseConfig;
 use ndarray::{Array1, Array2};

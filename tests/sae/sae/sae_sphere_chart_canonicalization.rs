@@ -30,8 +30,8 @@ use gam::terms::latent::LatentManifold;
 use gam::terms::sae::chart_canonicalization::sphere_chart_isometry_defect;
 use gam::terms::sae::identifiability::{GeneratorFamily, VerdictProvenance};
 use gam::terms::{
-    AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom,
-    SaeManifoldRho, SaeManifoldTerm,
+    sae::manifold::AssignmentMode, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeBasisEvaluator, sae::manifold::SaeManifoldAtom,
+    sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
 };
 use ndarray::{Array1, Array2, Array3};
 use std::sync::Arc;
@@ -55,7 +55,7 @@ fn sphere_basis_size(l_max: usize) -> usize {
 
 /// Real spherical-harmonic sphere-chart basis up to degree `L`, evaluated on
 /// `(lat, lon)` coordinates with its analytic first jet. This is the rich
-/// sibling of the production 7-column [`gam::terms::SphereChartEvaluator`] stub:
+/// sibling of the production 7-column [`gam::terms::sae::manifold::SphereChartEvaluator`] stub:
 /// `(L+1)²` real harmonics span enough of the boosted-image function space that
 /// the conformal-boost canonicalization is exactly image-frozen (the production
 /// stub is a jet-parity fixture and cannot absorb a warped image). The basis is

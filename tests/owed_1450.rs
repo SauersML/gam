@@ -65,8 +65,8 @@
 use ndarray::{Array1, Array2, Array3};
 
 use gam::terms::{
-    AssignmentMode, LatentManifold, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom,
-    SaeManifoldRho, SaeManifoldTerm,
+    sae::manifold::AssignmentMode, latent::LatentManifold, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeManifoldAtom,
+    sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
 };
 
 /// Build a softmax SAE term whose per-row softmax mass concentrates on a planted

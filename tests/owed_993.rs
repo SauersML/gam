@@ -35,7 +35,7 @@ use gam::terms::structure::anova_atom::{
     BindingNotion, FissionDecision, carve, carve_input_from_fitted_atom, fission_decision,
     fit_tensor_surface,
 };
-use gam::terms::{SaeBasisEvaluator, TorusHarmonicEvaluator};
+use gam::terms::{sae::manifold::SaeBasisEvaluator, sae::manifold::TorusHarmonicEvaluator};
 
 const N_HARMONICS: usize = 2;
 const N_SAMPLE: usize = 400;

@@ -28,8 +28,8 @@ use gam::solver::rho_optimizer::OuterProblem;
 use gam::terms::latent::LatentManifold;
 use gam::terms::sae::manifold::{GrassmannCrossMoment, GrassmannFrame};
 use gam::terms::{
-    AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
-    SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,
+    sae::manifold::AssignmentMode, sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment, sae::manifold::SaeAtomBasisKind, sae::manifold::SaeBasisEvaluator,
+    sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldOuterObjective, sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
 };
 use ndarray::{Array1, Array2, Array3, ArrayView2, ArrayView3};
 use std::sync::Arc;
