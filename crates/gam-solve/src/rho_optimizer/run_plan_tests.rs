@@ -60,6 +60,89 @@ fn certificate_attests_consistent_quadratic() {
     assert!(cert.stationarity.bound() > 0.0 && cert.stationarity.projected_norm().is_finite());
 }
 
+/// #979: a solver may finish before a family's nominal sampled-derivative
+/// budget. The sampled optimum is useful as a checkpoint, but the runner must
+/// then optimize the exact objective rather than merely re-evaluating and
+/// rejecting that checkpoint during certification.
+#[test]
+fn sampled_outer_pilot_is_followed_by_exact_polish_before_certification_979() {
+    #[derive(Default)]
+    struct PilotState {
+        exact: bool,
+        pilot_derivative_evals: usize,
+        exact_derivative_evals: usize,
+        transitions: usize,
+    }
+
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense)
+        .with_initial_rho(array![0.0])
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        });
+    let mut obj = problem
+        .build_objective(
+            PilotState::default(),
+            |state: &mut PilotState, rho: &Array1<f64>| {
+                let center = if state.exact { 1.0 } else { 2.0 };
+                let delta = rho[0] - center;
+                Ok(0.5 * delta * delta)
+            },
+            |state: &mut PilotState, rho: &Array1<f64>| {
+                if state.exact {
+                    state.exact_derivative_evals += 1;
+                } else {
+                    state.pilot_derivative_evals += 1;
+                }
+                let center = if state.exact { 1.0 } else { 2.0 };
+                let delta = rho[0] - center;
+                Ok(OuterEval {
+                    cost: 0.5 * delta * delta,
+                    gradient: array![delta],
+                    hessian: HessianValue::Dense(array![[1.0]]),
+                    inner_beta_hint: None,
+                })
+            },
+            None::<fn(&mut PilotState)>,
+            None::<
+                fn(
+                    &mut PilotState,
+                    &Array1<f64>,
+                ) -> Result<EfsEval, EstimationError>,
+            >,
+        )
+        .with_exact_polish(|state: &mut PilotState| {
+            if state.exact || state.pilot_derivative_evals == 0 {
+                return false;
+            }
+            state.exact = true;
+            state.transitions += 1;
+            true
+        });
+
+    let result = problem
+        .run(&mut obj, "sampled-pilot exact-polish regression #979")
+        .expect("the exact polish must converge and certify");
+    assert!(
+        (result.rho[0] - 1.0).abs() < 1.0e-7,
+        "returned sampled optimum instead of exact optimum: rho={:?}",
+        result.rho,
+    );
+    assert_eq!(obj.state.transitions, 1, "exact transition must be single-shot");
+    assert!(obj.state.pilot_derivative_evals > 0);
+    assert!(obj.state.exact_derivative_evals > 0);
+    assert!(
+        result
+            .criterion_certificate
+            .as_ref()
+            .is_some_and(OuterCriterionCertificate::certifies),
+        "exact-polished result must carry the mandatory certificate",
+    );
+}
+
 #[test]
 fn rho_uncertainty_diagnostic_does_not_change_outer_solution() {
     let center = array![0.25];

@@ -92,7 +92,7 @@ pub(crate) use gam_problem::*;
 // gam-models' own `gam_model_api`/`gam_problem` globs — they do not introduce an
 // E0659 ambiguity in the gam-models facade.
 pub use gam_model_api::families::custom_family::{
-    BlockwiseFitOptions, CustomFamily, FamilyEvaluation,
+    BlockwiseFitOptions, CustomFamily, FamilyEvaluation, OuterDerivativePilotSchedule,
     exact_newton_outer_geometry_supports_second_order_solver,
 };
 pub use gam_problem::{

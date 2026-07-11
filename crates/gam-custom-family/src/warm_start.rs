@@ -898,6 +898,7 @@ pub(crate) struct CustomOuterState {
     pub(crate) reset_warm_cache: Option<ConstrainedWarmStart>,
     pub(crate) last_error: Option<String>,
     pub(crate) initial_gradient_norm: Option<f64>,
+    pub(crate) outer_derivative_pilot: Option<OuterDerivativePilotSchedule>,
 }
 
 impl CustomOuterState {
@@ -907,7 +908,32 @@ impl CustomOuterState {
             reset_warm_cache: warm_start,
             last_error: None,
             initial_gradient_norm: None,
+            outer_derivative_pilot: None,
         }
+    }
+
+    pub(crate) fn with_outer_derivative_pilot(
+        mut self,
+        schedule: Option<OuterDerivativePilotSchedule>,
+    ) -> Self {
+        self.outer_derivative_pilot = schedule;
+        self
+    }
+
+    pub(crate) fn begin_exact_polish(&mut self) -> bool {
+        let transitioned = self
+            .outer_derivative_pilot
+            .as_ref()
+            .is_some_and(OuterDerivativePilotSchedule::enter_exact_phase);
+        if transitioned {
+            // The sampled pilot's final converged inner mode is the exact
+            // stage's warm baseline. `run_outer_uncertified` resets before its
+            // seed loop, so promote the live cache into the reset slot first.
+            self.reset_warm_cache = self.warm_cache.clone();
+            self.initial_gradient_norm = None;
+            self.last_error = None;
+        }
+        transitioned
     }
 
     pub(crate) fn reset(&mut self) {

@@ -983,6 +983,18 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
         self.eval(row, &vars)
     }
 
+    /// Per-row NLL VALUE (value channel of the single-source §13 warp row NLL).
+    /// The single warp the kernel reconstructs from the UNWARPED base predictors
+    /// must equal the family's DIRECT single-warp log-likelihood (which reads the
+    /// geometry's once-warped index); the `#932` value-vs-direct-loglik oracle
+    /// (`survival_ls_wiggle_kernel_value_matches_direct_loglik_932`) pins
+    /// `row_nll_value == -log_likelihood` at ≤1e-9, the decisive proof that the
+    /// double-warp is gone (a re-warp would make this differ by O(1)).
+    pub(crate) fn row_nll_value(&self, row: usize) -> Result<f64, String> {
+        let arena = DynamicJetArena::new();
+        Ok(self.row_order2(row, &arena)?.value())
+    }
+
     fn row_third_contracted<'arena>(
         &self,
         row: usize,

@@ -1928,6 +1928,34 @@ pub(crate) fn run_outer(
         return Ok(outer_result_to_native(result, &perm));
     }
     let mut result = run_outer_uncertified(obj, config, context)?;
+    if obj.begin_exact_polish() {
+        // A sampled outer-derivative pilot is an optimization stage, never a
+        // certifiable objective. Continue from its best checkpoint on the
+        // family's exact full-data measure before the mandatory analytic
+        // certificate. This transition is unconditional whenever the family
+        // reports that a sample actually ran, so convergence before a nominal
+        // phase budget cannot strand the optimizer on the stochastic surface
+        // (#979: matrix-free TR stopped after 6 evaluations while the family
+        // waited for a 12-evaluation counter).
+        let pilot_iterations = result.iterations;
+        let mut exact_config = config.clone();
+        exact_config.initial_rho = Some(result.rho.clone());
+        exact_config.heuristic_lambdas = None;
+        exact_config.seed_config.max_seeds = 1;
+        exact_config.seed_config.seed_budget = 1;
+        exact_config.screen_initial_rho = false;
+        exact_config.warm_start_cache_hit = true;
+        exact_config.operator_initial_trust_radius = result.operator_trust_radius;
+        exact_config.warm_start_outer_hessian = result.final_hessian.clone();
+        log::info!(
+            "[OUTER] {context}: sampled derivative pilot completed after {} iteration(s); \
+             continuing from its checkpoint on the exact full-data measure",
+            pilot_iterations,
+        );
+        let mut polished = run_outer_uncertified(obj, &exact_config, context)?;
+        polished.iterations = polished.iterations.saturating_add(pilot_iterations);
+        result = polished;
+    }
     // Mandatory analytic optimality certificate (#934): once at the selected
     // point, outside every hot loop, for every solver path and every iteration
     // budget. Missing or failed evidence is typed non-convergence; there is no

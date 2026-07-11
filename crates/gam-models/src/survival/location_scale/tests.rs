@@ -7054,6 +7054,112 @@ fn survival_ls_wiggle_third_and_fourth_directional_match_fd_932() {
     }
 }
 
+/// #932 link-wiggle DOUBLE-WARP guard (the decisive production oracle for the
+/// single-warp fix). The link warp is a SINGLE warp of the residual index:
+/// `build_dynamic_geometry` composes `q = q0 + Σ βw·B(q0)` ONCE and the family's
+/// direct log-likelihood (`log_likelihood_only`, replicated per-row below via the
+/// production `row_predictor_state` + `exact_row_kernel` at the once-warped
+/// `dynamic.q_exit`) is the correct single-warp objective. The single-source
+/// wiggle jet kernel reconstructs that SAME warp from the UNWARPED base
+/// predictors (`q_base_exit`/`q_base_entry`) with βw a live differentiable
+/// variable. So the kernel's row NLL VALUE must equal `-log_likelihood` per row.
+///
+/// This is the invariant a re-warp violates: the previous kernel read the
+/// already-warped primaries AND composed the warp a second time, so this oracle
+/// would have failed by O(1). It calls PRODUCTION on both sides (the wiggle
+/// kernel value vs the direct-objective log-likelihood) — not a replay — so it is
+/// the true cross-check that the double-warp is gone and the reconstructed warp
+/// matches the geometry's single warp exactly.
+#[test]
+fn survival_ls_wiggle_kernel_value_matches_direct_loglik_932() {
+    use super::row_kernel::{SurvivalExactRowKernel, SurvivalLsWiggleRowKernel};
+
+    // Reuse the directional oracle's regime: event rows, moderate-tail primaries
+    // clear of the monotonicity guard, cubic wiggle with nonzero amplitudes so
+    // the warp (and the h≠0 baseline that distinguishes residual-index warping
+    // from full-index warping) is genuinely exercised.
+    let primaries: Vec<[f64; SLS_ROW_K]> = vec![
+        [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
+        [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
+    ];
+    let event = [1.0, 0.0, 1.0, 0.0]; // mix event + censored so both loglik arms are pinned
+    let weight = [1.0, 0.8, 1.2, 1.1];
+    let n = primaries.len();
+
+    let q0_exit = Array1::from_shape_fn(n, |i| {
+        primaries[i][1] - primaries[i][3] * (-primaries[i][6]).exp()
+    });
+    let knots = array![-2.5, -2.5, -2.5, -2.5, 3.2, 3.2, 3.2, 3.2];
+    let degree = 3usize;
+    let xwiggle =
+        survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::value())
+            .expect("wiggle design B(q0_exit)");
+    let pw = xwiggle.ncols();
+    let betaw = Array1::from_shape_fn(pw, |b| 0.06 - 0.02 * b as f64);
+
+    for distribution in [
+        ResidualDistribution::Gaussian,
+        ResidualDistribution::Gumbel,
+        ResidualDistribution::Logistic,
+    ] {
+        let inverse_link = residual_distribution_inverse_link(distribution);
+        let mut family =
+            survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+        family.x_link_wiggle = Some(DesignMatrix::Dense(
+            gam_linalg::matrix::DenseDesignMatrix::from(xwiggle.clone()),
+        ));
+        family.wiggle_knots = Some(knots.clone());
+        family.wiggle_degree = Some(degree);
+
+        let mut states = survival_ls_joint_oracle_states(&primaries);
+        // Base blocks at the identity coefficient (β=1: the oracle-family eta
+        // vectors ARE the raw primary channels), mirroring the directional oracle.
+        states[0].beta = array![1.0];
+        states[1].beta = array![1.0];
+        states[2].beta = array![1.0];
+        states.push(ParameterBlockState {
+            beta: betaw.clone(),
+            eta: xwiggle.dot(&betaw),
+        });
+        let dynamic = family
+            .build_dynamic_geometry(&states)
+            .expect("dynamic geometry");
+
+        // Wiggle jet kernel: single warp reconstructed from the UNWARPED base
+        // predictors, βw live.
+        let kernel = SurvivalLsWiggleRowKernel::new(&family, &dynamic, 0.0)
+            .expect("wiggle row kernel");
+
+        for row in 0..n {
+            let kernel_nll = kernel.row_nll_value(row).expect("wiggle kernel value");
+            // Direct single-warp objective: exactly `log_likelihood_only`'s per-row
+            // body, reading the geometry's ONCE-warped index `dynamic.q_exit`.
+            let state = family.row_predictor_state(
+                dynamic.h_entry[row],
+                dynamic.h_exit[row],
+                dynamic.hdot_exit[row],
+                dynamic.q_entry[row],
+                dynamic.q_exit[row],
+                dynamic.qdot_exit[row],
+            );
+            let direct_ll = family
+                .exact_row_kernel(row, state)
+                .expect("exact row kernel")
+                .map_or(0.0, SurvivalExactRowKernel::log_likelihood);
+            // kernel value is the row NLL = -log_likelihood; equality proves the
+            // reconstructed single warp == the geometry's single warp.
+            assert!(
+                (kernel_nll + direct_ll).abs() <= 1e-9,
+                "{distribution:?} row {row}: wiggle kernel NLL {kernel_nll} != -direct log-lik {}; \
+                 a double-warp would make these differ by O(1)",
+                -direct_ll
+            );
+        }
+    }
+}
+
 /// #1569: the post-update monotone-cone feasibility check
 /// ([`validate_linear_constraints`]) must accept any β the DOWNSTREAM gates
 /// (`check_linear_feasibility` / `project_onto_linear_constraints`) already

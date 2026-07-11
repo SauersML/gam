@@ -1256,7 +1256,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     };
 
     let mut obj = problem.build_objective_with_screening_proxy(
-        CustomOuterState::new(persistent_warm_start.clone()),
+        CustomOuterState::new(persistent_warm_start.clone())
+            .with_outer_derivative_pilot(family.outer_derivative_pilot_schedule()),
         |outer: &mut CustomOuterState, rho: &Array1<f64>| {
             // Always use warm cache when available — the previous inner solution
             // gives a much better starting point. This was previously disabled for
@@ -1412,7 +1413,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     )
     .with_seed_inner_state(|outer: &mut CustomOuterState, beta: &Array1<f64>| {
         outer.seed_cached_beta(n_rho, specs, beta)
-    });
+    })
+    .with_exact_polish(CustomOuterState::begin_exact_polish);
 
     let outer_result = problem.run(&mut obj, "custom family");
 
