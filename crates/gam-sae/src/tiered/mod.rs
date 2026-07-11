@@ -52,7 +52,7 @@
 //! Term-level composition (concatenating a Tier-1 linear term with a Tier-2
 //! curved term into one solve) already lives in [`crate::manifold`]:
 //! `SaeManifoldTerm::merge_tiers` + `manifold::stagewise::terminal_joint_assembly`
-//! (exact additivity under independent JumpReLU/IBP gates). The Mode-A per-block
+//! (exact additivity under independent JumpReLU/ordered Beta--Bernoulli gates). The Mode-A per-block
 //! scale-out (one K=1 curved chart per orthonormal Tier-1 block) consumes the
 //! block frames on the block-sparse fit directly; see `sparse_dict::block`.
 

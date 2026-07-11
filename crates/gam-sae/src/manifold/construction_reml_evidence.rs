@@ -2254,27 +2254,6 @@ impl SaeManifoldTerm {
             // Cholesky-factoring the dense Schur. Peak memory is the per-row block
             // storage the inner PCG already holds, not the extra O(k²) dense S.
             //
-            // Valid for the NON-ordered Beta--Bernoulli (softmax / JumpReLU) evidence, whose exact
-            // log-det is `log_det_tt + log_det_schur` with NO cross-row Woodbury
-            // correction. The ordered Beta--Bernoulli cross-row term additionally needs
-            // `log det(I_R + D Uᵀ H₀'⁻¹ U)`, which has no matrix-free route yet, so
-            // it keeps refusing (loudly, pointing at the dense resident path).
-            if ordered_beta_bernoulli_assignment_third_channels_weighted(
-                &self.assignment,
-                rho,
-                false,
-                self.row_loss_weights.as_deref(),
-            )?
-            .is_some()
-            {
-                return Err(format!(
-                    "SaeManifoldTerm::streaming_exact_arrow_log_det: predicted dense reduced Schur \
-                     {} bytes exceeds budget {} bytes and the exact cross-row ordered Beta--Bernoulli Woodbury evidence \
-                     has no matrix-free log-det route yet; route ordered Beta--Bernoulli-active large-K fits through the \
-                     dense resident ArrowFactorCache::arrow_log_det",
-                    plan.estimated_dense_schur_bytes, plan.in_core_budget_bytes
-                ));
-            }
             let options = ArrowSolveOptions::direct()
                 .with_ill_conditioning_tolerated()
                 .with_schur_pd_floor(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
@@ -2673,8 +2652,6 @@ impl SaeManifoldTerm {
         // DEFLATED inverse; the full kept-subspace + β-Schur/rotation deflation
         // correction `tr(inv_vv·(D − DΦ[D]))` is subtracted per row afterwards
         // (`deflation_block_correction`), exactly as the data trace does. The
-        // cross-row off-diagonal pass below contracts only DISTINCT rows `i ≠ j`,
-        // off any single-row `vᵢ`'s support, so it needs no deflation correction.
         let inv_diag = solver
             .latent_inverse_diagonal()
             .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?;
@@ -2682,8 +2659,8 @@ impl SaeManifoldTerm {
         let total_t = cache.delta_t_len();
         // #932 FRONT C: row-local Takahashi selected inverse on the plain arrow
         // for the per-row deflation correction below (the diagonal trace already
-        // uses the cheap `latent_inverse_diagonal`); gauge / cross-row Woodbury
-        // fall back to the per-row full-system `solve` loop.
+        // uses the cheap `latent_inverse_diagonal`); gauge-deflated systems fall
+        // back to the per-row full-system `solve` loop.
         let fast_selected = solver.plain_selected_inverse_available();
         let selected_beta_inv = if fast_selected && cache.k > 0 {
             solver
@@ -2692,54 +2669,40 @@ impl SaeManifoldTerm {
         } else {
             Array2::<f64>::zeros((0, 0))
         };
-        // #1416 cross-row ordered Beta--Bernoulli source: the per-row block that the deflation
-        // factorizes is the NO-SELF base `H₀'` — the rank-one self curvature
-        // `d_k·J_ik²` is DOWNDATED from each logit diagonal and re-applied through
-        // the Woodbury carrier. The full-`H` diagonal contraction below still uses
-        // the full `hdiag` (which carries that self term), but the per-row
-        // DEFLATION correction must use `(∂H₀'/∂ρ)_tt`, i.e. `hdiag` MINUS the
-        // downdated self term — otherwise the Daleckii–Krein correction
-        // mis-attributes the (un-deflated) Woodbury self curvature's derivative to
-        // the deflated subspace. For non-ordered Beta--Bernoulli modes there is no Woodbury source and
-        // the self term is `0` (the deflated block IS the full block).
-        // #1416 (compact-layout completion): the ordered Beta--Bernoulli cross-row Woodbury source is
-        // installed for BOTH the dense and the compact (#1420 top-`k`) layouts (see
-        // `set_ordered_beta_bernoulli_cross_row_source`, which emits `(g_base + pos, atom, z'_ik)` for
-        // the active set under a compact layout), so the deflated base `H₀'` is the
-        // no-self block in BOTH layouts. The self-curvature downdate below must
-        // therefore run regardless of layout — gating it to the dense path (the
-        // pre-fix bug) left the compact deflation correction differentiating the
-        // un-downdated full block. For non-ordered Beta--Bernoulli modes `ordered_beta_bernoulli_assignment_third_channels`
-        // returns `None`, there is no Woodbury source, and `self_curv` is
-        // identically 0 (the deflated block IS the full block).
-        // RAW channels: the `w·s·c` diagonal split needs the un-clamped `w·s'`, so
-        // build raw and apply the gam#2144 majorization here.
-        let mut cross_channels = ordered_beta_bernoulli_assignment_third_channels_weighted(
+        let learnable_alpha = matches!(
+            self.assignment.mode,
+            AssignmentMode::OrderedBetaBernoulli {
+                learnable_alpha: true,
+                ..
+            }
+        );
+        let ordered_channels = ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
             &self.assignment,
             rho,
-            false,
             self.row_loss_weights.as_deref(),
         )?;
         // The integrated marginal's mass-Hessian coefficient is strictly
         // negative, so its cross-row rank-one block has the zero PSD Loewner
         // majorizer. Retain only the positive part of the row-local
         // concrete-Jacobian term, matching assembly exactly.
-        if let Some(ch) = cross_channels.as_mut() {
+        if let Some(ch) = ordered_channels.as_ref() {
             for row in 0..self.n_obs() {
                 for atom in 0..k_atoms {
                     let slot = row * k_atoms + atom;
-                    hdiag[slot] = super::construction_arrow_schur_assembly::ordered_beta_bernoulli_psd_majorized_hdiag(
-                        ch,
-                        row,
-                        k_atoms,
-                        atom,
-                        hdiag[slot],
-                    );
+                    hdiag[slot] = if learnable_alpha {
+                        super::construction_arrow_schur_assembly::ordered_beta_bernoulli_psd_majorized_log_alpha_hdiag(
+                            ch, row, k_atoms, atom, hdiag[slot],
+                        )
+                    } else {
+                        super::construction_arrow_schur_assembly::ordered_beta_bernoulli_psd_majorized_hdiag(
+                            ch, row, k_atoms, atom, hdiag[slot],
+                        )
+                    };
                 }
             }
         }
         let mut trace = 0.0_f64;
-        // Hoisted RHS scratch for the gauge/Woodbury per-row solve fallback:
+        // Hoisted RHS scratch for the gauge-deflated per-row solve fallback:
         // single-entry set/clear instead of a per-column total_t-sized zeroing.
         let mut rhs_t_scratch = Array1::<f64>::zeros(total_t);
         let rhs_beta_zero = Array1::<f64>::zeros(cache.k);
@@ -2862,11 +2825,10 @@ impl SaeManifoldTerm {
             return Ok(0.0);
         }
 
-        let mut ordered_beta_bernoulli_channels =
-            ordered_beta_bernoulli_assignment_third_channels_weighted(
+        let ordered_beta_bernoulli_channels =
+            ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
                 &self.assignment,
                 rho,
-                false,
                 row_weights,
             )?;
         let learnable_alpha = matches!(
@@ -2876,24 +2838,19 @@ impl SaeManifoldTerm {
                 ..
             }
         );
-        if let Some(channels) = ordered_beta_bernoulli_channels.as_mut() {
+        if let Some(channels) = ordered_beta_bernoulli_channels.as_ref() {
             for row in 0..self.n_obs() {
                 for atom in 0..k_atoms {
                     let index = row * k_atoms + atom;
-                    hdiag[index] =
+                    hdiag[index] = if learnable_alpha {
+                        super::construction_arrow_schur_assembly::ordered_beta_bernoulli_psd_majorized_log_alpha_hdiag(
+                            channels, row, k_atoms, atom, hdiag[index],
+                        )
+                    } else {
                         super::construction_arrow_schur_assembly::ordered_beta_bernoulli_psd_majorized_hdiag(
-                            channels,
-                            row,
-                            k_atoms,
-                            atom,
-                            hdiag[index],
-                        );
-                }
-            }
-            for atom in 0..k_atoms {
-                if channels.cross_row_d[atom] < 0.0 {
-                    channels.cross_row_d[atom] = 0.0;
-                    channels.cross_row_d_logalpha[atom] = 0.0;
+                            channels, row, k_atoms, atom, hdiag[index],
+                        )
+                    };
                 }
             }
         }
@@ -2947,29 +2904,15 @@ impl SaeManifoldTerm {
                 }
             } else {
                 let assignment_base = row * k_atoms;
-                let self_curvature = |atom: usize| -> f64 {
-                    let Some(channels) = ordered_beta_bernoulli_channels.as_ref() else {
-                        return 0.0;
-                    };
-                    let coefficient = if learnable_alpha {
-                        channels.cross_row_d_logalpha[atom]
-                    } else {
-                        channels.cross_row_d[atom]
-                    };
-                    let jacobian = channels.z_jac[assignment_base + atom];
-                    coefficient * jacobian * jacobian
-                };
                 match self.last_row_layout {
                     Some(ref layout) => {
                         for (slot, &atom) in layout.active_atoms[row].iter().enumerate() {
-                            derivative[[slot, slot]] =
-                                hdiag[assignment_base + atom] - self_curvature(atom);
+                            derivative[[slot, slot]] = hdiag[assignment_base + atom];
                         }
                     }
                     None => {
                         for atom in 0..assignment_dim.min(q) {
-                            derivative[[atom, atom]] =
-                                hdiag[assignment_base + atom] - self_curvature(atom);
+                            derivative[[atom, atom]] = hdiag[assignment_base + atom];
                         }
                     }
                 }
@@ -2999,8 +2942,8 @@ impl SaeManifoldTerm {
     }
 
     /// Matrix-free sibling of [`Self::assignment_log_strength_hessian_trace`]
-    /// for assignment families whose prior curvature is row-local (softmax,
-    /// threshold gate, and TopK).  Reconstructs each undeflated row's selected-
+    /// for assignment families whose majorized prior curvature is row-local.
+    /// Reconstructs each undeflated row's selected-
     /// inverse diagonal from the exact row-local inverse plus the shared
     /// `(z_j, S^-1 z_j)` reduced-Schur bundle:
     ///
@@ -3008,9 +2951,9 @@ impl SaeManifoldTerm {
     ///   (A_i^-1 H_tbeta z_j) * (A_i^-1 H_tbeta S^-1 z_j)`.
     ///
     /// This is the missing assignment-strength trace in the matrix-free analytic
-    /// rho-gradient cluster.  It deliberately refuses ordered Beta--Bernoulli cross-row curvature and
-    /// per-row spectral/gauge deflation: the border-only bundle represents the
-    /// plain row-block arrow inverse and cannot reconstruct either correction.
+    /// rho-gradient cluster. It deliberately refuses per-row spectral/gauge
+    /// deflation because the border-only bundle cannot reconstruct that
+    /// correction.
     pub(crate) fn assignment_log_strength_hessian_trace_from_probes(
         &self,
         rho: &SaeManifoldRho,
@@ -3018,17 +2961,6 @@ impl SaeManifoldTerm {
         probes: &[Array1<f64>],
         sinv_probes: &[Array1<f64>],
     ) -> Result<f64, String> {
-        if matches!(
-            self.assignment.mode,
-            AssignmentMode::OrderedBetaBernoulli { .. }
-        ) || cache.cross_row_woodbury.is_some()
-        {
-            return Err(
-                "assignment_log_strength_hessian_trace_from_probes: ordered Beta--Bernoulli cross-row curvature \
-                 is not represented by the border-only inverse-probe bundle"
-                    .to_string(),
-            );
-        }
         let m = probes.len();
         if m == 0 || sinv_probes.len() != m {
             return Err(format!(
@@ -3069,7 +3001,7 @@ impl SaeManifoldTerm {
             AssignmentMode::Softmax { .. } => return Ok(0.0),
             _ => None,
         };
-        let hdiag = if softmax.is_none() {
+        let mut hdiag = if softmax.is_none() {
             crate::assignment::assignment_prior_log_strength_hdiag_weighted(
                 &self.assignment,
                 rho,
@@ -3080,6 +3012,35 @@ impl SaeManifoldTerm {
         };
         if softmax.is_none() && hdiag.is_empty() {
             return Ok(0.0);
+        }
+        let ordered_channels =
+            ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
+                &self.assignment,
+                rho,
+                self.row_loss_weights.as_deref(),
+            )?;
+        let learnable_alpha = matches!(
+            self.assignment.mode,
+            AssignmentMode::OrderedBetaBernoulli {
+                learnable_alpha: true,
+                ..
+            }
+        );
+        if let Some(channels) = ordered_channels.as_ref() {
+            for row in 0..self.n_obs() {
+                for atom in 0..k_atoms {
+                    let index = row * k_atoms + atom;
+                    hdiag[index] = if learnable_alpha {
+                        super::construction_arrow_schur_assembly::ordered_beta_bernoulli_psd_majorized_log_alpha_hdiag(
+                            channels, row, k_atoms, atom, hdiag[index],
+                        )
+                    } else {
+                        super::construction_arrow_schur_assembly::ordered_beta_bernoulli_psd_majorized_hdiag(
+                            channels, row, k_atoms, atom, hdiag[index],
+                        )
+                    };
+                }
+            }
         }
         let assignment_dim = self.assignment.assignment_coord_dim();
         let row_loss_weights = self.row_loss_weights.as_deref();
@@ -3506,7 +3467,7 @@ impl SaeManifoldTerm {
         // has its assembled `htt` diagonal entry ZEROED (see
         // `assignment_prior_grad_hdiag`), so the θ-adjoint third derivative of that
         // zeroed entry must also be zero. Mirror the ordered Beta--Bernoulli channel zeroing in
-        // `ordered_beta_bernoulli_assignment_third_channels`. The ThresholdGate/ordered Beta--Bernoulli branches below are
+        // `ordered_beta_bernoulli_psd_majorizer_third_channels`. The ThresholdGate/ordered Beta--Bernoulli branches below are
         // both diagonal (`diag_atom == wrt_atom`), so masking on `wrt_atom` suffices.
         if self.assignment.logit_is_fixed(wrt_atom) {
             return 0.0;
@@ -3772,6 +3733,7 @@ impl SaeManifoldTerm {
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
         let mut jet_window_next = 0usize;
+        let mut ordered_beta_bernoulli_logit_sites: Vec<(usize, usize, usize, f64)> = Vec::new();
         for row in 0..n {
             let base = cache.row_offsets[row];
             if jet_window.is_empty() {
@@ -3930,9 +3892,9 @@ impl SaeManifoldTerm {
         // curvature plus the prior majorizers / `hessian_diag` diagonals the
         // Newton/Schur Cholesky factorizes — so each block's θ-derivative channel
         // is differentiated on the criterion's own branch (no value/gradient
-        // desync). The ordered Beta--Bernoulli-MAP assignment prior is the one block whose
-        // `hessian_diag` couples every row in a column through the plug-in
-        // empirical mass `M_k = Σ_i z_ik`; its logit derivative therefore has a
+        // desync). The integrated ordered Beta--Bernoulli prior is the one block
+        // whose row-local majorizer depends on the shared empirical mass
+        // `M_k = Σ_i z_ik`; its logit derivative therefore has a
         // row-local channel (handled inline via
         // `assignment_prior_hdiag_derivative_entry`) and a cross-row channel
         // (accumulated column-wise after the row loop, below).
@@ -3950,41 +3912,26 @@ impl SaeManifoldTerm {
         let second_jets = self.atom_second_jets()?;
         let border = self.border_channels_for_cache(cache)?;
         // #932 FRONT C: plain-arrow `(H⁻¹)_ββ = S⁻¹` formed once from the cached
-        // Schur factor; gauge / #1038 cross-row Woodbury fall back to the per-β
-        // `solve` loop where the row-local Takahashi blocks are not valid.
+        // Schur factor; gauge-deflated systems fall back to the per-β `solve`
+        // loop where the row-local Takahashi blocks are not valid.
         let fast_selected = joint_block && solver.plain_selected_inverse_available();
         let beta_inv = if joint_block {
             Self::selected_inverse_beta_block(solver, cache, fast_selected, "logdet_theta_adjoint")?
         } else {
             Array2::<f64>::zeros((cache.k, cache.k))
         };
-        // ordered Beta--Bernoulli `hessian_diag` logit third-derivative channels (#1006). The full
-        // ordered Beta--Bernoulli Hessian also has per-column cross-row rank-one terms
-        // `H_(i,k),(j,k) = d_k·J_ik·J_jk`; these ARE carried in `H` via the #1038
-        // Woodbury source (`OrderedBetaBernoulliCrossRowSource`, construction.rs:4710-4752), the
-        // ρ-trace differentiates them (#1416,
-        // `assignment_log_strength_hessian_trace`), AND this θ-adjoint now
-        // differentiates them exactly too: the empirical-`M_k` channel below
-        // contracts the shared-mass coupling of the DIAGONAL curvature, and the
-        // cross-row Woodbury pass (further below, using `cross_row_dd` and
-        // `logit_curvature`) contracts the `∂/∂ℓ_w (d_k·J_ik·J_jk)` rank-one
-        // derivative — so value, logdet, ρ-trace, and θ-adjoint all differentiate
-        // the one operator `H = H₀ + Σ_k d_k u_k u_kᵀ`.
-        // gam#2144/#1038: the assembly PSD-majorizes the ordered Beta--Bernoulli curvature
-        // UNCONDITIONALLY, so the θ-adjoint differentiates the MAJORIZED channels
-        // (clamped `cross_row_d`, gated `cross_row_dd`/`m_channel`/
-        // `local_logit_third`) — the exact derivative of the operator the evidence
-        // log-det factors, on every ordered Beta--Bernoulli path. Anything else desyncs the outer penalized-LAML
-        // gradient from the evidence (#2087).
+        // Exact derivatives of the ordered Beta--Bernoulli PSD majorizer. The
+        // negative-semidefinite mass rank-one block has zero majorizer; the
+        // retained row-local diagonal depends on `M_k`, so its derivative splits
+        // into a same-row term and a columnwise empirical-mass term below.
         // gam#2144: whitening of the row jets tracks `whitens_likelihood()` at ANY
         // rank (the assembly whitens `JᵀU UᵀJ` for full- and low-rank alike) and is
         // independent of the PSD majorization.
         let whiten_row_jets = self.whiten_logdet_row_jets();
         let ordered_beta_bernoulli_channels =
-            ordered_beta_bernoulli_assignment_third_channels_weighted(
+            ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
                 &self.assignment,
                 rho,
-                true,
                 self.row_loss_weights.as_deref(),
             )?;
         let k_atoms = self.k_atoms();
@@ -4015,18 +3962,15 @@ impl SaeManifoldTerm {
             }
             _ => None,
         };
-        // Per active logit site: row, atom, global t-index, raw selected-inverse
-        // diagonal. The raw diagonal drives the empirical-M contraction and the
-        // cross-row Woodbury self-subtraction. The cached unit-diagonal
-        // Daleckii-Krein weight lets the later empirical-M pass correct only the
-        // no-self row-base derivative, leaving the Woodbury self derivative raw.
+        // Per active logit site: row, atom, global t-index, selected-inverse
+        // diagonal, and the unit-diagonal Daleckii--Krein correction weight.
         #[derive(Clone, Copy)]
         struct OrderedBetaBernoulliLogitSite {
             row: usize,
             atom: usize,
             t_index: usize,
             raw_diag: f64,
-            no_self_diag_deflation_weight: f64,
+            diag_deflation_weight: f64,
         }
         let mut ordered_beta_bernoulli_logit_sites: Vec<OrderedBetaBernoulliLogitSite> = Vec::new();
 
@@ -4038,7 +3982,7 @@ impl SaeManifoldTerm {
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
         let mut jet_window_next = 0usize;
-        // Hoisted RHS scratch for the gauge/Woodbury per-row solve fallback.
+        // Hoisted RHS scratch for the gauge-deflated per-row solve fallback.
         let mut rhs_t_scratch = Array1::<f64>::zeros(total_t);
         let rhs_beta_zero = Array1::<f64>::zeros(cache.k);
         for row in 0..n {
@@ -4101,10 +4045,7 @@ impl SaeManifoldTerm {
             // criterion uses the deflation-map derivative `DΦ`. The kept-subspace Γ
             // subtracts `tr(inv_vv·(D − DΦ[D]))` over the t–t block via the same
             // Daleckii–Krein helper the ρ-traces use (the t–β / β–β blocks are not
-            // deflated). ordered Beta--Bernoulli cross-row Woodbury caches factor the no-self base, so
-            // the correction matrix below removes the local self derivative before
-            // applying `DΦ`; the full self/off-row rank-one derivative stays in the
-            // ordinary raw contractions.
+            // deflated).
             let defl_dirs = cache
                 .deflated_row_directions
                 .get(row)
@@ -4115,17 +4056,15 @@ impl SaeManifoldTerm {
                 .get(row)
                 .and_then(Option::as_ref);
 
-            // Record each active logit's column, global t-index, and raw
-            // selected-inverse diagonal for the ordered Beta--Bernoulli cross-row passes. Also cache
-            // the per-slot Daleckii-Krein weight for a unit diagonal derivative:
-            // the empirical-M `m_channel` later splits into a no-self row-base
-            // derivative plus a rank-one self derivative, and only the no-self
-            // piece belongs under the row deflation map.
+            // Record each active logit's column, global t-index, selected-inverse
+            // diagonal, and per-slot Daleckii--Krein weight for a unit diagonal
+            // derivative. The empirical-mass pass uses these to differentiate
+            // the same spectrally conditioned row-local majorizer.
             if ordered_beta_bernoulli_channels.is_some() {
                 for (pos, var) in jets.vars.iter().enumerate() {
                     if let SaeLocalRowVar::Logit { atom } = *var {
                         let raw_diag = inv_vv[[pos, pos]];
-                        let no_self_diag_deflation_weight = if defl_dirs.is_empty() {
+                        let diag_deflation_weight = if defl_dirs.is_empty() {
                             0.0
                         } else {
                             let mut unit_diag = Array2::<f64>::zeros((q, q));
@@ -4142,7 +4081,7 @@ impl SaeManifoldTerm {
                             atom,
                             t_index: base + pos,
                             raw_diag,
-                            no_self_diag_deflation_weight,
+                            diag_deflation_weight,
                         });
                     }
                 }
@@ -4245,46 +4184,7 @@ impl SaeManifoldTerm {
                                 _ => 0.0,
                             };
                         }
-                        let mut ordered_beta_bernoulli_self_derivative = 0.0_f64;
-                        // #2144: the row factor that spectral deflation conditions is
-                        // the ordered Beta--Bernoulli no-self base `H0'`, because
-                        // `solve_arrow_newton_step_with_options` downdates the
-                        // row-local `d_k J_ik^2` self curvature before factoring and
-                        // re-adds the full rank-one column through Woodbury. The trace
-                        // above still contracts the derivative of the full diagonal
-                        // against the full selected inverse; only the Daleckii-Krein
-                        // deflation-map correction must see the derivative of the
-                        // actually deflated row block. Therefore remove just the
-                        // direct-local derivative of the downdated ordered Beta--Bernoulli self term from
-                        // the matrix passed to `deflation_block_correction`. The
-                        // empirical-M and off-row Woodbury channels remain in their
-                        // existing passes.
-                        if let (
-                            Some(channels),
-                            SaeLocalRowVar::Logit { atom: diag_atom },
-                            SaeLocalRowVar::Logit { atom: wrt_atom },
-                        ) = (
-                            ordered_beta_bernoulli_channels.as_ref(),
-                            jets.vars[a],
-                            jets.vars[w],
-                        ) {
-                            if a == b && diag_atom == wrt_atom {
-                                let idx = row * k_atoms + diag_atom;
-                                ordered_beta_bernoulli_self_derivative = 2.0
-                                    * channels.cross_row_d[diag_atom]
-                                    * channels.z_jac[idx]
-                                    * channels.logit_curvature[idx];
-                            }
-                        }
-                        let deflated_base_dh = dh - ordered_beta_bernoulli_self_derivative;
-                        if !joint_block {
-                            // `htt_half` is formed from the factored ordered Beta--Bernoulli no-self
-                            // row base. Its raw contraction therefore excludes
-                            // the local diagonal piece reintroduced only by the
-                            // joint cross-row Woodbury carrier.
-                            dh = deflated_base_dh;
-                        }
-                        deflated_base_dh_mat[[a, b]] = deflated_base_dh;
+                        deflated_base_dh_mat[[a, b]] = dh;
                         gamma += inv_vv[[b, a]] * dh;
                     }
                 }
@@ -4349,152 +4249,21 @@ impl SaeManifoldTerm {
             }
         }
 
-        // ordered Beta--Bernoulli cross-row empirical-`M_k` channel of Γ (#1006). The assembled
-        // diagonal H_ik consumes `hessian_diag`, whose dependence on the column
-        // mass M_k = Σ_i z_ik couples every row in a column. Differentiating
-        // tr(H⁻¹ ∂H/∂ℓ_wk) on that shared branch:
-        //   Γ_wk += [ Σ_i (H⁻¹)_ik,ik · ∂_M H_ik ] · J_wk = C_k · J_wk,
-        // where ∂_M H_ik = `m_channel[i*K+k]` and J_wk = `z_jac[w*K+k]`. The
-        // row-local direct-`z` channel was already added inline above; this pass
-        // owns the empirical-mass branch. The no-self part of `m_channel` is a
-        // derivative of the deflated row base `H₀'`, so it receives the same
-        // Daleckii-Krein `DΦ` correction as the row-local channel; the rank-one
-        // self part stays raw and is paired with the off-row Woodbury derivative.
+        // Empirical-mass channel of the row-local ordered Beta--Bernoulli
+        // majorizer. Its diagonal depends on `M_k = Σ_i z_ik`, so a logit in
+        // row `w` differentiates every retained row-local diagonal in column
+        // `k`. The Daleckii--Krein weight applies to that same diagonal.
         if let Some(channels) = ordered_beta_bernoulli_channels.as_ref() {
-            let mut col_coeff = vec![0.0_f64; k_atoms];
+            let mut column_coefficient = vec![0.0_f64; k_atoms];
             for site in &ordered_beta_bernoulli_logit_sites {
-                let idx = site.row * k_atoms + site.atom;
-                let j = channels.z_jac[idx];
-                let self_mass = channels.cross_row_dd[site.atom] * j * j;
-                let no_self_mass = channels.m_channel[idx] - self_mass;
-                let raw_mass = if joint_block {
-                    channels.m_channel[idx]
-                } else {
-                    no_self_mass
-                };
-                col_coeff[site.atom] +=
-                    site.raw_diag * raw_mass - site.no_self_diag_deflation_weight * no_self_mass;
+                let index = site.row * k_atoms + site.atom;
+                column_coefficient[site.atom] +=
+                    (site.raw_diag - site.diag_deflation_weight) * channels.m_channel[index];
             }
             for site in &ordered_beta_bernoulli_logit_sites {
-                let idx = site.row * k_atoms + site.atom;
-                gamma_t[site.t_index] += col_coeff[site.atom] * channels.z_jac[idx];
-            }
-            if !joint_block {
-                return Ok(SaeArrowVector {
-                    t: gamma_t,
-                    beta: gamma_beta,
-                });
-            }
-
-            // #1416 / #1641: the EXACT cross-row Woodbury derivative of Γ. The
-            // assembled `H` carries the per-column rank-one block
-            // `W_k = d_k·u_k u_kᵀ` with `u_k` the J-weighted column indicator
-            // (`u_k[slot(i,k)] = J_ik`) and `d_k = w·s'_k` (`cross_row_d[k]`). Both
-            // `d_k` (through `M_k`) and the `u_k` entries (through `ℓ_ik`) depend on
-            // the logits, so
-            //   ∂W_k/∂ℓ_wk = dd_k·J_wk·u_k u_kᵀ
-            //               + d_k·c_wk·(e_w u_kᵀ + u_k e_wᵀ),
-            // where `dd_k = ∂d_k/∂M_k = w·s''_k` (`cross_row_dd[k]`),
-            // `c_wk = ∂J_wk/∂ℓ_wk` (`logit_curvature`), and `e_w` is the unit
-            // vector at row `w`'s logit-`k` slot.
-            //
-            // The θ-adjoint contracts the FULL trace `Γ_wk = tr(H⁻¹ ∂H/∂ℓ_wk)`
-            // (NOT the `½ tr` the ρ-trace uses — `fixed_state_logdet` differentiates
-            // the full `log|H|`, and the per-row blocks above contract `inv_vv·dh`
-            // with no ½). Critically, the `i=j` self curvature `w·s'_k·J_ik²` of the
-            // rank-one block lives on the assembled `htt` DIAGONAL `H_ik`, so its
-            // derivative is ALREADY differentiated by the row-local
-            // `local_logit_third` channel (direct-z, `i=w`) and the `m_channel`
-            // column pass (via `M_k`) above. This Woodbury pass must therefore add
-            // ONLY the off-diagonal `i≠j` remainder — otherwise the self term is
-            // double-counted (the #1641 defect: the pre-fix pass summed the full
-            // `u_k u_kᵀ` including `i=j`, AND carried the ρ-trace ½, AND dropped the
-            // factor 2 on the symmetric `e_w u_kᵀ + u_k e_wᵀ` term). Excluding `i=j`
-            // is also why this pass needs no deflation correction: it contracts only
-            // DISTINCT rows, off any single-row `vᵢ`'s support (matching the
-            // #1416 ρ-trace cross-row pass).
-            //
-            // Contracting `tr(H⁻¹ ∂W_k/∂ℓ_wk)` over `i≠j` only:
-            //   Γ_wk += dd_k·J_wk·( u_kᵀ H⁻¹ u_k − Σ_i P_ii·J_ik² )       (term A)
-            //         + 2·d_k·c_wk·( (H⁻¹ u_k)_{slot(w,k)} − P_ww·J_wk )  (term B),
-            // where `P_ii = (H⁻¹)_{slot(i,k),slot(i,k)}` is the selected-inverse
-            // diagonal recorded in `ordered_beta_bernoulli_logit_sites`. The subtracted self pieces are
-            // exactly the `i=j` terms the diagonal channels own. Both `u_kᵀ H⁻¹ u_k`
-            // and `(H⁻¹ u_k)` come from ONE solve per column, `x_k = H⁻¹ u_k` — so
-            // the adjoint differentiates the SAME `H = H₀ + Σ_k W_k` the
-            // value/logdet use, closing the one-operator contract on the rank-one
-            // block too.
-            //
-            // Group the column sites once (the layout is mode-agnostic: dense or
-            // compact, `ordered_beta_bernoulli_logit_sites` already carries each active logit's
-            // global t-index AND its selected-inverse diagonal `G_ii`), then per
-            // column build `u_k`, solve, and distribute the OFF-DIAGONAL remainder.
-            //
-            // #1416 FIX: the diagonal (`i = w`) parts of term A and term B are
-            // ALREADY supplied — `diag(term A) = dd_k·J_w·Σ_i G_ii·J_i²` by the
-            // `m_channel` column pass above (whose `m_channel = w·(s''·J² + s'·c)`
-            // carries the `s''·J²` self piece), and `diag(term B) = 2·d_k·c_w·G_ww·J_w`
-            // by the inline `local_logit_third` self channel (whose
-            // `s'·2J·∂_z J` piece is exactly that). So this pass must add ONLY the
-            // cross-row off-diagonal remainder; double-counting the diagonal here
-            // (the pre-fix `0.5·dd·J·uᵀGu + d·c·x_w` form, which is neither the
-            // full nor the off-diagonal value) desynced the θ-adjoint from the FD
-            // of `log|H|`. The exact `tr(H⁻¹ ∂W_k/∂ℓ_wk)` is
-            //   Γ_wk += dd_k·J_wk·(uᵀ G u − Σ_i G_ii·J_ik²)   (term A, off-diagonal)
-            //         + 2·d_k·c_wk·((G u)_w − G_ww·J_wk)        (term B, off-diagonal),
-            // with `uᵀGu = Σ_i J_ik·(Gu)_i`, `(Gu) = x_k = H⁻¹ u_k` from one solve,
-            // and `G_ii` the per-site selected-inverse diagonal.
-            let total_t = cache.delta_t_len();
-            // The Woodbury pass reconstructs the off-diagonal `(H⁻¹)_ij` from the
-            // deflated solve `x_k = H⁻¹ u_k` and subtracts the `i=j` self term; the
-            // self term must use the RAW deflated diagonal (matching `x_k`), NOT the
-            // Daleckii–Krein-corrected diagonal the `M_k` pass uses.
-            let mut col_sites: Vec<Vec<(usize, usize, f64)>> = vec![Vec::new(); k_atoms];
-            for site in &ordered_beta_bernoulli_logit_sites {
-                col_sites[site.atom].push((site.row, site.t_index, site.raw_diag));
-            }
-            // Hoisted RHS scratch: fill only this column's active slots, solve,
-            // then clear exactly those slots — no per-column total_t zeroing.
-            let mut rhs_t_scratch = Array1::<f64>::zeros(total_t);
-            let rhs_beta_zero = Array1::<f64>::zeros(cache.k);
-            for atom in 0..k_atoms {
-                let d_k = channels.cross_row_d[atom];
-                let dd_k = channels.cross_row_dd[atom];
-                if col_sites[atom].is_empty() || (d_k == 0.0 && dd_k == 0.0) {
-                    continue;
-                }
-                // u_k as a full t-RHS: J at each active logit-k slot.
-                for &(row, t_index, _g) in &col_sites[atom] {
-                    rhs_t_scratch[t_index] = channels.z_jac[row * k_atoms + atom];
-                }
-                let x_k = solver
-                    .solve(rhs_t_scratch.view(), rhs_beta_zero.view())
-                    .map_err(|err| {
-                        format!("logdet_theta_adjoint: ordered Beta--Bernoulli cross-row Woodbury solve: {err}")
-                    })?;
-                // Clear this column's active slots for the next atom's RHS.
-                for &(_row, t_index, _g) in &col_sites[atom] {
-                    rhs_t_scratch[t_index] = 0.0;
-                }
-                // (JᵀH⁻¹J)_k = u_kᵀ x_k, and the diagonal `Σ_i G_ii·J_ik²` that the
-                // `m_channel` pass already counted (subtract it from term A so this
-                // pass holds only the off-diagonal `i ≠ j` remainder).
-                let mut jt_hinv_j = 0.0_f64;
-                let mut diag_jt_g_j = 0.0_f64;
-                for &(row, t_index, g_ii) in &col_sites[atom] {
-                    let j = channels.z_jac[row * k_atoms + atom];
-                    jt_hinv_j += j * x_k.t[t_index];
-                    diag_jt_g_j += g_ii * j * j;
-                }
-                let off_diag_a = jt_hinv_j - diag_jt_g_j;
-                for &(row, t_index, g_ii) in &col_sites[atom] {
-                    let j_wk = channels.z_jac[row * k_atoms + atom];
-                    let c_wk = channels.logit_curvature[row * k_atoms + atom];
-                    // term A (off-diagonal) + term B (off-diagonal); the inline /
-                    // `m_channel` passes already added the diagonal parts.
-                    let off_diag_b = x_k.t[t_index] - g_ii * j_wk;
-                    gamma_t[t_index] += dd_k * j_wk * off_diag_a + 2.0 * d_k * c_wk * off_diag_b;
-                }
+                let index = site.row * k_atoms + site.atom;
+                gamma_t[site.t_index] +=
+                    column_coefficient[site.atom] * channels.z_jac[index];
             }
         }
 
@@ -4528,25 +4297,16 @@ impl SaeManifoldTerm {
     /// `P_l=Σ_j z_l[c_j] b_j`, `R_l=Σ_i (S⁻¹z_l)[c_i] b_i`, `Q_l=Σ_j z_l[c_j] bd_j`,
     /// `Rd_l=Σ_i (S⁻¹z_l)[c_i] bd_i` (`b`=`beta` jet, `bd`=`beta_deriv` jet).
     ///
-    /// # Scope: softmax / euclidean / non-cross-row (hard refuse otherwise)
+    /// # Scope
     ///
     /// The bundle spans ONLY the reduced-Schur border (`cache.k`), so the outer
-    /// products reconstruct exactly the NO-SELF base inverse `(H₀')⁻¹ = A_i⁻¹ +
-    /// G_i S⁻¹ G_iᵀ`. That equals the full `H⁻¹` only when the cache carries no
-    /// T-space rank-R correction; two regimes are therefore hard-refused (routed to
-    /// the dense channel, same discipline as invariant #2):
+    /// products reconstruct the row-block arrow inverse. One regime is
+    /// hard-refused and routed to the dense channel:
     ///
     /// * **Per-row deflation** (`deflated_row_directions`): the Daleckii–Krein
     ///   correction `−tr(inv_vv·(D − DΦ[D]))` needs the DEFLATED block the plain-S⁻¹
     ///   bundle does not carry.
-    /// * **ordered Beta--Bernoulli cross-row Woodbury** (`ordered_beta_bernoulli_channels` / `cache.cross_row_woodbury`):
-    ///   `W_k = d_k u_k u_kᵀ` lives in the T-block, layered onto `H₀'` as a rank-R
-    ///   correction (`full_inverse_apply`), NOT in the border the bundle spans —
-    ///   folding it matrix-free needs the bundle to additionally carry `H₀'⁻¹U`, a
-    ///   reduced-Schur/bundle design step tracked separately.
-    ///
-    /// On the accepted (softmax / euclidean / non-cross-row) regimes base = full
-    /// inverse, both refuse conditions are absent, and the from-probes and dense
+    /// On accepted regimes the from-probes and dense
     /// θ-adjoints agree exactly at full-basis probes — the FD gate's acceptance.
     pub(crate) fn logdet_theta_adjoint_from_probes(
         &self,
@@ -4607,32 +4367,12 @@ impl SaeManifoldTerm {
             }
         }
 
-        // Cross-row ordered Beta--Bernoulli Woodbury hard-refuse. The bundle spans only the reduced-Schur
-        // BORDER (the decoder-β channels, `cache.k`); the #1038 cross-row rank-one
-        // curvature `W_k = d_k u_k u_kᵀ` lives in the T-block, layered onto the NO-SELF
-        // base `H₀'` as a rank-R correction (`full_inverse_apply` / the
-        // `subtract_inverse_diagonal` step). The border-only outer products reconstruct
-        // exactly `A_i⁻¹ + G_i S⁻¹ G_iᵀ = (H₀')⁻¹` per row — NOT the Woodbury-corrected
-        // full inverse the dense adjoint contracts — so an ordered Beta--Bernoulli cross-row cache is routed
-        // to the dense channel (same hard-refuse discipline as deflation; folding this
-        // channel matrix-free needs the bundle to additionally carry `H₀'⁻¹U`, a
-        // reduced-Schur/bundle design step). The from-probes lane therefore owns the
-        // softmax / euclidean / non-cross-row regimes where base = full inverse.
         let ordered_beta_bernoulli_channels =
-            ordered_beta_bernoulli_assignment_third_channels_weighted(
+            ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
                 &self.assignment,
                 rho,
-                true,
                 self.row_loss_weights.as_deref(),
             )?;
-        if ordered_beta_bernoulli_channels.is_some() || cache.cross_row_woodbury.is_some() {
-            return Err(
-                "logdet_theta_adjoint_from_probes: cache carries an ordered Beta--Bernoulli cross-row Woodbury \
-                 (T-space rank-R) curvature the border-only probe bundle cannot reconstruct — \
-                 route this fit through the dense channel"
-                    .to_string(),
-            );
-        }
         let second_jets = self.atom_second_jets()?;
         let border = self.border_channels_for_cache(cache)?;
         let whiten_row_jets = self.whiten_logdet_row_jets();
@@ -4727,6 +4467,18 @@ impl SaeManifoldTerm {
                         inv_vv[[a, b]] += 0.5
                             * inv_m
                             * (w_probes[l][a] * s_probes[l][b] + s_probes[l][a] * w_probes[l][b]);
+                    }
+                }
+            }
+            if ordered_beta_bernoulli_channels.is_some() {
+                for (position, variable) in jets.vars.iter().enumerate() {
+                    if let SaeLocalRowVar::Logit { atom } = *variable {
+                        ordered_beta_bernoulli_logit_sites.push((
+                            row,
+                            atom,
+                            base + position,
+                            inv_vv[[position, position]],
+                        ));
                     }
                 }
             }

@@ -47,8 +47,6 @@ struct MarginalColumnDerivatives {
     score: f64,
     /// `d²L/dM²`.
     score_derivative: f64,
-    /// `d³L/dM³`.
-    score_second_derivative: f64,
 }
 
 impl OrderedBetaBernoulliPenalty {
@@ -194,7 +192,6 @@ impl OrderedBetaBernoulliPenalty {
                     a,
                     score: -digamma(active_arg) + digamma(inactive_arg),
                     score_derivative: -trigamma(active_arg) - trigamma(inactive_arg),
-                    score_second_derivative: -tetragamma(active_arg) + tetragamma(inactive_arg),
                 }
             })
             .collect();
@@ -227,13 +224,20 @@ impl OrderedBetaBernoulliPenalty {
         (d_score, d_score_derivative)
     }
 
-    /// Exact third-derivative channels of the integrated marginal Hessian.
+    /// Exact derivatives of the PSD Loewner majorizer used by the Laplace
+    /// curvature path.
+    ///
+    /// The integrated marginal has mass-Hessian coefficient
+    /// `s'=-ψ₁(M+a)-ψ₁(N-M+1)<0`, so its cross-row rank-one Hessian
+    /// block is negative semidefinite and contributes zero to the PSD
+    /// majorizer. The only retained curvature is the positive part of the
+    /// row-local term `s·d²z/dell²`. These channels differentiate that
+    /// declared majorizer exactly.
     #[must_use]
-    pub fn hessian_diag_logit_third_channels(
+    pub fn psd_majorizer_logit_third_channels(
         &self,
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
-        majorize: bool,
     ) -> OrderedBetaBernoulliHessianDiagThirdChannels {
         let alpha = self.resolved_alpha(rho);
         let a_col = self.column_beta_shapes(alpha);
@@ -246,7 +250,7 @@ impl OrderedBetaBernoulliPenalty {
         let mut z_jac = Array1::<f64>::zeros(target.len());
         let mut local_logit_third = Array1::<f64>::zeros(target.len());
         let mut m_channel = Array1::<f64>::zeros(target.len());
-        let mut logit_curvature = Array1::<f64>::zeros(target.len());
+        let mut diagonal_term = Array1::<f64>::zeros(target.len());
         for row in 0..n {
             let start = row * self.k_max;
             let w_i = self.row_weight(row);
@@ -259,54 +263,38 @@ impl OrderedBetaBernoulliPenalty {
                 let jac = zk * (1.0 - zk) * inv_tau;
                 let u = w_i * jac;
                 let curvature = zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2;
-                let dz_jac = (1.0 - 2.0 * zk) * inv_tau;
                 let dz_curvature = (1.0 - 6.0 * zk + 6.0 * zk * zk) * inv_tau2;
-                let rank_one_gate = if majorize {
-                    f64::from(column.score_derivative > 0.0)
-                } else {
-                    1.0
-                };
-                let diagonal_gate = if majorize {
-                    f64::from(column.score * curvature > 0.0)
-                } else {
-                    1.0
-                };
+                let raw_diagonal_term = self.weight * column.score * w_i * curvature;
+                let diagonal_gate = f64::from(raw_diagonal_term > 0.0);
 
                 z_jac[start + k] = u;
-                logit_curvature[start + k] = w_i * curvature;
-                local_logit_third[start + k] = self.weight
-                    * u
-                    * (rank_one_gate * 2.0 * column.score_derivative * u * dz_jac
-                        + diagonal_gate * column.score * dz_curvature);
+                diagonal_term[start + k] = raw_diagonal_term;
+                local_logit_third[start + k] =
+                    self.weight * diagonal_gate * column.score * u * dz_curvature;
                 m_channel[start + k] = self.weight
-                    * (rank_one_gate * column.score_second_derivative * u * u
-                        + diagonal_gate * column.score_derivative * w_i * curvature);
+                    * diagonal_gate
+                    * column.score_derivative
+                    * w_i
+                    * curvature;
             }
         }
 
-        let mut cross_row_d = Array1::<f64>::zeros(self.k_max);
-        let mut cross_row_dd = Array1::<f64>::zeros(self.k_max);
+        let mut mass_hessian_coefficient = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
             if self.column_is_fixed(k) {
                 continue;
             }
-            let column = columns[k];
-            if !majorize || column.score_derivative > 0.0 {
-                cross_row_d[k] = self.weight * column.score_derivative;
-                cross_row_dd[k] = self.weight * column.score_second_derivative;
-            }
+            mass_hessian_coefficient[k] = self.weight * columns[k].score_derivative;
         }
 
-        let mut cross_row_d_logalpha = Array1::<f64>::zeros(self.k_max);
+        let mut mass_hessian_log_alpha_derivative = Array1::<f64>::zeros(self.k_max);
         if self.learnable_alpha {
             let (_, d_score_derivative) = self.learnable_alpha_score_rho_derivs(target, rho);
             for k in 0..self.k_max {
                 if self.column_is_fixed(k) {
                     continue;
                 }
-                if !majorize || columns[k].score_derivative > 0.0 {
-                    cross_row_d_logalpha[k] = self.weight * d_score_derivative[k];
-                }
+                mass_hessian_log_alpha_derivative[k] = self.weight * d_score_derivative[k];
             }
         }
 
@@ -315,10 +303,9 @@ impl OrderedBetaBernoulliPenalty {
             z_jac,
             local_logit_third,
             m_channel,
-            cross_row_d,
-            cross_row_dd,
-            cross_row_d_logalpha,
-            logit_curvature,
+            mass_hessian_coefficient,
+            mass_hessian_log_alpha_derivative,
+            diagonal_term,
         }
     }
 
@@ -396,14 +383,16 @@ pub struct OrderedBetaBernoulliHessianDiagThirdChannels {
     pub local_logit_third: Array1<f64>,
     /// Active-mass derivative of each diagonal Hessian entry.
     pub m_channel: Array1<f64>,
-    /// Per-column coefficient of `u_k u_k^T` in the exact Hessian.
-    pub cross_row_d: Array1<f64>,
-    /// Active-mass derivative of `cross_row_d`.
-    pub cross_row_dd: Array1<f64>,
-    /// Log-concentration derivative of `cross_row_d`.
-    pub cross_row_d_logalpha: Array1<f64>,
-    /// `du_ik/dell_ik = w_i d²z_ik/dell_ik²`.
-    pub logit_curvature: Array1<f64>,
+    /// Raw per-column coefficient `weight·d²L/dM²` of the exact
+    /// mass-coupled rank-one Hessian. It is strictly negative and is retained
+    /// only to separate that term from a raw Hessian diagonal.
+    pub mass_hessian_coefficient: Array1<f64>,
+    /// Log-concentration derivative of [`Self::mass_hessian_coefficient`].
+    pub mass_hessian_log_alpha_derivative: Array1<f64>,
+    /// Raw row-local Hessian term
+    /// `weight·(dL/dM)·w_i·d²z_i/dell_i²`. Its positive part is the
+    /// ordered-prior PSD majorizer.
+    pub diagonal_term: Array1<f64>,
 }
 
 impl AnalyticPenalty for OrderedBetaBernoulliPenalty {

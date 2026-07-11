@@ -6,7 +6,7 @@
 //! place merge bugs hide: atom order, logit column hstack, per-atom coords/ungated
 //! append, and rho (log_lambda_smooth / log_ard / global log_lambda_sparse) merge.
 //! Fitted-additivity `merged.fitted() == a.fitted() + b.fitted()` is exact only
-//! for independent-gate modes (JumpReLU/IBP) and is asserted in the two-tier
+//! for independent-gate modes (JumpReLU/ordered Beta--Bernoulli) and is asserted in the two-tier
 //! integration test on a JumpReLU fixture (softmax re-normalizes over merged K).
 #[cfg(test)]
 mod tests {

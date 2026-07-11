@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 gamfit = pytest.importorskip("gamfit")
-import gamfit._sae_manifold as sae
+sae = pytest.importorskip("gamfit._sae_manifold")
 
 
 def _toy_matrix(n: int = 12, p: int = 4) -> np.ndarray:

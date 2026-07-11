@@ -21,9 +21,8 @@ class _AdmissionRust:
     """Fake of the Rust front door mirroring its lane rule: penalty-gated
     K > P demotes to sparse codes; a hard top-k support request at K > P is
     admitted to the curved framed/streaming lane. Also mirrors the thin
-    Rust-owned vocabulary/default helpers the facade consults on the way to
-    the admission (assignment canonicalization, topology→basis resolution,
-    the large-K top-k default) so the fake tracks the real FFI surface."""
+    Rust-owned vocabulary helpers the facade consults on the way to admission
+    so the fake tracks the real FFI surface."""
 
     def __init__(self) -> None:
         self.admission_calls: list[dict[str, Any]] = []
@@ -68,17 +67,6 @@ class _AdmissionRust:
 
     def sae_canonical_topology(self, name: str) -> str:
         return str(name)
-
-    def sae_default_top_k_for_large_dictionary(
-        self, n_obs: int, k_atoms: int
-    ) -> int | None:
-        # Mirror of assignment::default_top_k_for_large_dictionary: None when
-        # the dense softmax path is admitted (N/K >= K, or K <= 1), else
-        # clamp(ceil(N/K), 1, K-1).
-        if k_atoms <= 1 or n_obs >= k_atoms * k_atoms:
-            return None
-        cap = -(-int(n_obs) // int(k_atoms))
-        return max(1, min(cap, int(k_atoms) - 1))
 
     def sae_fit_admission(
         self,

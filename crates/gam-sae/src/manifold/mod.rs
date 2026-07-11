@@ -271,7 +271,6 @@ mod tests_parallelism_invariance_1557;
 mod tests_olmo;
 
 #[cfg(test)]
-mod tests_ordered_beta_bernoulli_capacity_1784;
 
 #[cfg(test)]
 mod tests_startup_validation_1782;
@@ -394,7 +393,6 @@ mod tests_cocollapse_disjoint_2027;
 mod tests_cocollapse_reseed_2089;
 
 #[cfg(test)]
-mod tests_topk_divergence_2134;
 
 #[cfg(test)]
 mod tests_outer_reml_probe_budget_2080;

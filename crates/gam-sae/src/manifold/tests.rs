@@ -1153,12 +1153,8 @@ pub(crate) fn periodic_ard_curvature_is_psd_in_assembled_htt() {
     }
 }
 
-/// #1117 follow-up (curved-atom sparse co-assignment): the compact active-set
-/// layout must apply the SAME per-row Riemannian geometry to the assembled
-/// Arrow-Schur blocks as the dense uniform-`q` layout. Before the fix the
-/// compact path skipped the tangent projection entirely (and `sparse_active_plan`
-/// refused to engage on any non-Euclidean ext-coord manifold), so a curved-atom
-/// SAE at large `K` paid the dense `K²` co-assignment Gram. The new code rebuilds
+/// The exact TopK compact layout must apply the same per-row Riemannian geometry
+/// as a full-support layout. The compact path rebuilds
 /// each compact row's product manifold + point in compact column order
 /// (`compact_row_ext_manifold_and_point`) and applies the identical
 /// `gt` gradient projection, `htt` Riemannian-Hessian correction, and `htbeta`
@@ -1166,7 +1162,7 @@ pub(crate) fn periodic_ard_curvature_is_psd_in_assembled_htt() {
 ///
 /// This pins the equivalence directly: with EVERY row's active set forced to the
 /// full atom set, the compact column order coincides with the dense full-`q`
-/// order (ordered Beta--Bernoulli-MAP has `assignment_coord_dim == k_atoms`), so the two assemblies
+/// order (`TopK { k: K }` has no gate coordinates), so the two assemblies
 /// must produce BIT-IDENTICAL `gt`, `htt`, and `htbeta` on a genuinely curved
 /// (Circle) two-atom term with non-trivial logits and coordinates (so the
 /// von-Mises gradient — hence the Riemannian Hessian correction — is nonzero).
@@ -1217,7 +1213,7 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
             LatentManifold::Circle { period: 1.0 },
             LatentManifold::Circle { period: 1.0 },
         ],
-        AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, true),
+        AssignmentMode::top_k_support(2),
     )
     .unwrap();
     let mut term = SaeManifoldTerm::new(vec![atom_a, atom_b], assignment).unwrap();
@@ -1227,8 +1223,11 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
         [-0.12, 0.08],
         [0.05, -0.20]
     ];
-    let alpha = 5.0_f64;
-    let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![alpha.ln()], array![alpha.ln()]]);
+    let rho = SaeManifoldRho::new(
+        0.0,
+        0.0,
+        vec![array![5.0_f64.ln()], array![5.0_f64.ln()]],
+    );
     let probe = SAE_DENSE_BETA_PENALTY_PROBE_MAX_DIM;
 
     // Dense layout: pin `Some(None)` so the override forces the dense path
@@ -1238,15 +1237,13 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
         .unwrap();
 
     // Compact layout with EVERY row's active set = both atoms (full support).
-    let coord_dims = vec![1usize, 1usize];
-    let coord_offsets = term.assignment.coord_offsets();
-    let full_active: Vec<Vec<usize>> = (0..n).map(|_| vec![0usize, 1usize]).collect();
-    let layout = SaeRowLayout::from_active_atoms_with_reference(
-        full_active,
-        coord_dims,
-        coord_offsets,
-        None,
-    );
+    let layout = SaeRowLayout::from_topk_gates(
+        &term.assignments_all_parallel(n).unwrap(),
+        2,
+        vec![1usize, 1usize],
+        term.assignment.coord_offsets(),
+    )
+    .unwrap();
     let compact = term
         .assemble_arrow_schur_inner(target.view(), &rho, None, 1.0, probe, Some(Some(layout)))
         .unwrap();
@@ -1290,20 +1287,11 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
     );
 }
 
-/// #1117 follow-up gate (a): the compact sparse co-assignment plan must ENGAGE
-/// on a curved (non-Euclidean) ext-coord manifold once the dense `K²` data Gram
-/// trips the in-core budget — exactly the manifold-SAE-on-OLMo regime (curved
-/// atoms + large `K`). Before the fix `sparse_active_plan` returned `None` for
-/// ANY curved atom regardless of `K`, forcing the dense `K²` coupling; the
-/// `is_euclidean()` guard is now removed and the budget is the sole gate.
-///
-/// We assert the engagement decision is identical for a curved (Circle) term and
-/// its Euclidean twin at the same `m_total`: (1) with a budget BELOW the dense
-/// Gram both engage the compact plan with the same `k_active_cap`; (2) with a
-/// huge budget both stay dense (`None`). The budget is pinned via
-/// `sparse_active_plan_for_budget` so no multi-GB Gram is allocated.
+/// Exact dense assignment admission is geometry-independent and refuses before
+/// allocation when the required row-curvature plus decoder-Gram storage exceeds
+/// the supplied budget. It never changes the model into a compact surrogate.
 #[test]
-pub(crate) fn sparse_plan_engages_on_curved_manifold_when_budget_tripped() {
+pub(crate) fn dense_assignment_budget_refuses_without_truncation() {
     // Build a `k`-atom ordered Beta--Bernoulli-MAP term with the given per-atom coordinate manifold.
     // Each atom carries the width-3 periodic basis, so `m_total = 3·k`.
     fn build_term(k: usize, curved: bool) -> SaeManifoldTerm {
@@ -1344,38 +1332,23 @@ pub(crate) fn sparse_plan_engages_on_curved_manifold_when_budget_tripped() {
     let curved = build_term(k, true);
     let euclidean = build_term(k, false);
 
-    // `m_total = 3·k`; dense Gram = (3k)² · 8 bytes. Pin a budget strictly below
-    // it so the plan must engage, and one far above it so it must not.
-    let m_total = 3 * k;
-    let dense_gram_bytes = m_total * m_total * std::mem::size_of::<f64>();
-    let small_budget = dense_gram_bytes / 2;
-    let huge_budget = dense_gram_bytes * 16;
-
-    let curved_engaged = curved.sparse_active_plan_for_budget(small_budget);
-    let euclid_engaged = euclidean.sparse_active_plan_for_budget(small_budget);
-    assert!(
-        curved_engaged.is_some(),
-        "curved-manifold term must engage the sparse plan once the dense K² Gram \
-         trips the budget (the #1117 follow-up lever) — got None"
-    );
+    let curved_required = curved.exact_dense_assignment_bytes();
+    let euclidean_required = euclidean.exact_dense_assignment_bytes();
     assert_eq!(
-        curved_engaged, euclid_engaged,
-        "the sparse-plan engagement decision (k_active_cap + cutoff) must no longer \
-         depend on whether the ext-coord manifold is curved: curved={curved_engaged:?} \
-         euclidean={euclid_engaged:?}"
+        curved_required, euclidean_required,
+        "exact dense memory accounting must not depend on coordinate geometry"
     );
-
-    // Above the dense-Gram footprint, both stay on the exact dense layout.
-    assert_eq!(
-        curved.sparse_active_plan_for_budget(huge_budget),
-        None,
-        "a curved term whose dense Gram fits the budget must keep the dense layout"
-    );
-    assert_eq!(
-        euclidean.sparse_active_plan_for_budget(huge_budget),
-        None,
-        "a Euclidean term whose dense Gram fits the budget must keep the dense layout"
-    );
+    let too_small = curved_required.saturating_sub(1);
+    let error = curved
+        .require_exact_dense_assignment_budget(too_small)
+        .expect_err("an undersized budget must refuse the exact dense model");
+    assert!(error.contains("never silently truncated"));
+    curved
+        .require_exact_dense_assignment_budget(curved_required)
+        .expect("the exact required-byte boundary is admitted");
+    euclidean
+        .require_exact_dense_assignment_budget(euclidean_required)
+        .expect("the exact required-byte boundary is admitted");
 }
 
 /// `snapshot_mutable_state` / `restore_mutable_state` (the in-place
@@ -3864,18 +3837,14 @@ pub(crate) fn matrix_free_plan_admits_when_in_core_budget_collapses_to_zero() {
     assert!(plan.admitted_or_error(n_obs, border_dim, k_atoms).is_ok());
 }
 
-/// Build a `K`-atom softmax SAE term whose per-row logits concentrate on a
-/// planted small support, for the #1450 end-to-end large-K compact-path test.
+/// Build a `K`-atom hard-TopK SAE term with a planted small support.
 ///
 /// Every atom is a 1-D `EuclideanPatch` with an `M=2` constant+linear basis and
 /// a distinct decoder direction, so the reconstruction is genuine and the
 /// per-row Arrow-Schur block has a real data-fit Gauss-Newton contribution.
-/// Row `i`'s logits put large mass on its planted active atoms and a uniform
-/// floor on every other atom, so the softmax assignment vector concentrates on
-/// the planted set (the true top-`k` support) while the dropped tail carries
-/// negligible `O(a)` mass — exactly the regime the compact softmax layout
-/// (#1408/#1409) is meant to optimize.
-fn planted_softmax_sae_term(
+/// Row `i`'s logits rank its planted atoms above every other atom, so the hard
+/// forward model and compact derivative system have exactly the same support.
+fn planted_topk_sae_term(
     n: usize,
     k_atoms: usize,
     planted: &[Vec<usize>],
@@ -3925,7 +3894,7 @@ fn planted_softmax_sae_term(
         logits,
         coord_blocks,
         manifolds,
-        AssignmentMode::softmax(1.0),
+        AssignmentMode::top_k_support(planted[0].len()),
     )
     .unwrap();
     let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
@@ -3933,16 +3902,14 @@ fn planted_softmax_sae_term(
     (term, target)
 }
 
-/// #1450 — end-to-end large-`K` compact-path contract for the softmax SAE
-/// encode: the assignment→support-proposal→assembly path must produce a per-row
+/// End-to-end large-`K` compact-path contract for the hard-TopK SAE: the
+/// assignment→support→assembly path must produce a per-row
 /// block whose dimension tracks the per-row active-atom count `k_active`, NOT
 /// the total `K`, and the assembled support must recover the planted top-`k`
-/// atoms. This drives the REAL paths #1408/#1409 fixed
-/// (`softmax_active_plan` → `from_dense_weights` → compact `assemble_arrow_schur`
-/// in fixed-decoder mode), not a hand-built `from_active_atoms` layout, and at a
-/// `K` (1000) large enough that a full-`K` per-row block would be ~1000× larger.
+/// atoms at a `K` large enough that a full-support row block would be orders of
+/// magnitude larger.
 #[test]
-pub(crate) fn large_k_softmax_compact_encode_is_o1_per_token_and_recovers_support() {
+pub(crate) fn large_k_topk_encode_is_support_bounded_and_exact() {
     let n = 8usize;
     let p = 4usize;
     let top_k = 3usize;
@@ -3954,17 +3921,14 @@ pub(crate) fn large_k_softmax_compact_encode_is_o1_per_token_and_recovers_suppor
     // support; the per-row compact dims must be IDENTICAL (n-free / independent
     // of K) and bounded by O(top_k).
     let assemble_dims = |k_atoms: usize| -> (Vec<usize>, Vec<Vec<usize>>) {
-        let (mut term, target) = planted_softmax_sae_term(n, k_atoms, &planted, p);
-        // Fold top_k into the OPTIMIZATION (the #1409 fix): softmax now engages
-        // the compact top-`k` row layout instead of a post-fit projection.
-        term.set_softmax_active_cap(Some(top_k));
+        let (mut term, target) = planted_topk_sae_term(n, k_atoms, &planted, p);
         // Fixed-decoder encode assembly (the #1407 path the encoder uses): only
         // the per-row htt/gt block is produced.
         term.fixed_decoder_assembly = true;
         let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k_atoms]);
         let sys = term
             .assemble_arrow_schur(target.view(), &rho, None)
-            .expect("compact softmax fixed-decoder assembly must succeed at large K");
+            .expect("exact TopK fixed-decoder assembly must succeed at large K");
         let dims: Vec<usize> = sys.rows.iter().map(|r| r.htt.nrows()).collect();
         // Each row's htt must be square and match gt.
         for r in &sys.rows {
@@ -3974,7 +3938,7 @@ pub(crate) fn large_k_softmax_compact_encode_is_o1_per_token_and_recovers_suppor
         let layout = term
             .last_row_layout
             .clone()
-            .expect("softmax at large K must engage the COMPACT active-set layout (#1408)");
+            .expect("TopK must install its exact compact support layout");
         let active: Vec<Vec<usize>> = layout.active_atoms.clone();
         (dims, active)
     };
@@ -3983,10 +3947,10 @@ pub(crate) fn large_k_softmax_compact_encode_is_o1_per_token_and_recovers_suppor
     let (dims_10k, active_10k) = assemble_dims(10_000);
 
     // (a) O(1)-per-token / n-free: per-row block dim is bounded by the active
-    // contract `top_k·(1 + d) = top_k·2` for d=1 coords, and is IDENTICAL across
+    // contract `top_k·d = top_k` for d=1 coords, and is IDENTICAL across
     // K=1000 and K=10000 (independent of total K). A full-K block would be
-    // `q = (K-1) + K·d`, i.e. ~3000 and ~30000 — orders of magnitude larger.
-    let bound = top_k * (1 + 1); // |active| + Σ d_k  (d_k = 1)
+    // `q = K·d`, i.e. 1000 and 10000 — orders of magnitude larger.
+    let bound = top_k; // no free gate coordinates; only Σ d_k
     for row in 0..n {
         assert!(
             dims_1k[row] <= bound,
@@ -4003,7 +3967,7 @@ pub(crate) fn large_k_softmax_compact_encode_is_o1_per_token_and_recovers_suppor
     // The full-K dense block would dwarf the compact one: assert the compact
     // total work is < 1/100 of the dense block even at the smaller K=1000.
     let compact_work: usize = dims_1k.iter().map(|&q| q * q).sum();
-    let dense_q = (1_000 - 1) + 1_000; // (K-1) free logits + K coord axes
+    let dense_q = 1_000; // K coordinate axes; TopK has no gate coordinates
     let dense_work = n * dense_q * dense_q;
     assert!(
         compact_work * 100 < dense_work,
@@ -4031,21 +3995,26 @@ pub(crate) fn large_k_softmax_compact_encode_is_o1_per_token_and_recovers_suppor
 pub(crate) fn sparse_active_layout_work_scales_with_active_atoms_not_total_k() {
     let n = 3;
     let k_atoms = 100_000;
-    let mut active_rows = Vec::with_capacity(n);
+    let mut gates = Vec::with_capacity(n);
     for row in 0..n {
-        active_rows.push(vec![row, 10_000 + row, 90_000 + row]);
+        let mut row_gates = Array1::<f64>::zeros(k_atoms);
+        for atom in [row, 10_000 + row, 90_000 + row] {
+            row_gates[atom] = 1.0;
+        }
+        gates.push(row_gates);
     }
     let coord_dims = vec![1usize; k_atoms];
-    let coord_offsets_full: Vec<usize> = (0..k_atoms).map(|k| k_atoms + k).collect();
-    let layout = SaeRowLayout::from_active_atoms_with_reference(
-        active_rows,
+    let coord_offsets_full: Vec<usize> = (0..k_atoms).collect();
+    let layout = SaeRowLayout::from_topk_gates(
+        &gates,
+        3,
         coord_dims,
         coord_offsets_full,
-        None,
-    );
+    )
+    .unwrap();
     for row in 0..n {
         assert_eq!(layout.active_atoms[row].len(), 3);
-        assert_eq!(layout.row_q_active(row), 6);
+        assert_eq!(layout.row_q_active(row), 3);
     }
     let compact_work: usize = (0..n)
         .map(|row| {
@@ -4053,10 +4022,10 @@ pub(crate) fn sparse_active_layout_work_scales_with_active_atoms_not_total_k() {
             q * q
         })
         .sum();
-    let dense_q = 2 * k_atoms;
+    let dense_q = k_atoms;
     let dense_work = n * dense_q * dense_q;
     assert!(compact_work < dense_work / 1_000_000_000);
-    assert_eq!(compact_work, n * 36);
+    assert_eq!(compact_work, n * 9);
 }
 
 /// Regression test for https://github.com/SauersML/gam/issues/163.
@@ -4787,123 +4756,86 @@ pub(crate) fn separation_barrier_deferred_curvature_matches_dense_hbb_1610() {
     }
 }
 
-/// `SaeRowLayout::from_dense_weights` must keep, per row, the
-/// top-`k_active_cap` atoms above the magnitude cutoff (always at least
-/// one), with compact coord starts that reproduce the `expand_row`
-/// round-trip back to full-q positions.
+/// `SaeRowLayout::from_topk_gates` records exactly the binary support and its
+/// compact coordinate starts reproduce the expansion into full coordinates.
 
 #[test]
-pub(crate) fn sae_row_layout_from_dense_weights_top_k_and_cutoff() {
-    // 3 atoms, coord dims [2, 1, 2] ⇒ full q = 3 + 5 = 8.
+pub(crate) fn sae_row_layout_from_topk_gates_is_exact() {
+    // 3 atoms, coord dims [2, 1, 2] ⇒ full q = 5 (TopK has no logit slots).
     let coord_dims = vec![2usize, 1, 2];
-    let coord_offsets_full = vec![3usize, 5, 6];
+    let coord_offsets_full = vec![0usize, 2, 3];
     let assignments = vec![
-        // Row 0: weights [0.7, 0.01, 0.29]; row peak 0.7, cutoff
-        // 0.05·0.7 = 0.035, cap 2 ⇒ {0, 2} (0.01 is below cutoff).
-        Array1::from_vec(vec![0.7, 0.01, 0.29]),
-        // Row 1 (#1414): uniformly small weights [0.001, 0.002, 0.0005].
-        // Row-relative cutoff 0.05·0.002 = 1e-4 keeps the two above it
-        // (atoms 1 and 0), NOT a single atom — a GLOBAL cutoff against
-        // row 0's peak (0.035) would have wrongly dropped this whole row to
-        // its single largest atom. Cap 2 ⇒ {0, 1}.
-        Array1::from_vec(vec![0.001, 0.002, 0.0005]),
+        Array1::from_vec(vec![1.0, 0.0, 1.0]),
+        Array1::from_vec(vec![1.0, 1.0, 0.0]),
     ];
-    let layout = SaeRowLayout::from_dense_weights(
+    let layout = SaeRowLayout::from_topk_gates(
         &assignments,
         2,
-        0.05,
         coord_dims,
         coord_offsets_full,
-        None,
-    );
+    )
+    .unwrap();
     assert_eq!(layout.active_atoms[0], vec![0, 2]);
     assert_eq!(layout.active_atoms[1], vec![0, 1]);
-    // Row 0 compact dim = |{0,2}| + d_0 + d_2 = 2 + 2 + 2 = 6.
-    assert_eq!(layout.row_q_active(0), 6);
-    // Row 1 compact dim = |{0,1}| + d_0 + d_1 = 2 + 2 + 1 = 5.
-    assert_eq!(layout.row_q_active(1), 5);
-    // expand_row round-trip for row 0: compact [logit0, logit2, t0_0,
-    // t0_1, t2_0, t2_1] → full-q with zeros for inactive atom 1.
-    let compact = vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0];
-    let mut full = vec![0.0_f64; 8];
+    assert_eq!(layout.row_q_active(0), 4);
+    assert_eq!(layout.row_q_active(1), 3);
+    // Row 0 compact [t0_0, t0_1, t2_0, t2_1] expands with atom 1 zero.
+    let compact = vec![1.0_f64, 2.0, 3.0, 4.0];
+    let mut full = vec![0.0_f64; 5];
     layout.expand_row(0, &compact, &mut full);
-    // logits: full[0] = atom0 logit, full[2] = atom2 logit, full[1] = 0.
     assert_eq!(full[0], 1.0);
-    assert_eq!(full[1], 0.0);
-    assert_eq!(full[2], 2.0);
-    // coords: atom0 at offset 3 (d=2), atom2 at offset 6 (d=2); atom1
-    // (offset 5, d=1) is inactive ⇒ zero.
+    assert_eq!(full[1], 2.0);
+    assert_eq!(full[2], 0.0);
     assert_eq!(full[3], 3.0);
     assert_eq!(full[4], 4.0);
-    assert_eq!(full[5], 0.0);
-    assert_eq!(full[6], 5.0);
-    assert_eq!(full[7], 6.0);
 }
 
-/// #1450: drive the REAL high-K support-proposal path (`from_dense_weights`,
-/// the routine #1411 fixed to use an O(K) partial-select instead of a full
-/// O(K log K) per-row sort) at production scale (K = 100_000) and assert the
-/// headline contract: per-token assembly work depends on `k_active`, NOT on
-/// total `K`. The existing `from_dense_weights` coverage
-/// (`sae_row_layout_from_dense_weights_top_k_and_cutoff`) runs only at K = 3,
-/// and `sparse_active_layout_work_scales_with_active_atoms_not_total_k` builds
-/// its layout from an already-known 3-atom active set via `from_active_atoms`,
-/// so neither exercises the actual proposal/selection at large K. This does:
-/// it constructs a dense K = 100_000 weight vector per row, runs the proposal,
-/// checks support recovery is exact, and pins the compact work to be
-/// independent of K (`q_active` set only by `cap` + active coord dims).
-// #1450 (salvaged from PR #1461 by HomunculusLabs): large-K (K=100000) end-to-end
-// `from_dense_weights` coverage — exact support recovery + K-independent compact work.
+/// Large-K hard-TopK layout: exact binary support recovery and coordinate work
+/// independent of total dictionary width.
 #[test]
-pub(crate) fn from_dense_weights_large_k_support_proposal_1450() {
+pub(crate) fn from_topk_gates_large_k_support_is_exact() {
     let (k_atoms, d, k_true, n) = (100_000_usize, 1, 4, 4);
     let planted: Vec<usize> = (0..k_true).map(|j| j * k_atoms / k_true).collect();
     let assignments: Vec<Array1<f64>> = (0..n)
         .map(|row| {
-            let mut a = vec![1e-9_f64; k_atoms];
-            for (i, &atom) in planted.iter().enumerate() {
-                a[atom] = 0.2 + 0.01 * (row + i) as f64;
+            let mut a = vec![0.0_f64; k_atoms];
+            for &atom in &planted {
+                a[atom] = 1.0;
             }
             Array1::from_vec(a)
         })
         .collect();
-    let coord_offsets: Vec<usize> = (0..k_atoms).map(|k| k_atoms + k).collect();
-    let layout = SaeRowLayout::from_dense_weights(
+    let coord_offsets: Vec<usize> = (0..k_atoms).collect();
+    let layout = SaeRowLayout::from_topk_gates(
         &assignments,
         k_true,
-        1e-3,
         vec![d; k_atoms],
         coord_offsets,
-        None,
-    );
+    )
+    .unwrap();
     for row in 0..n {
         assert_eq!(layout.active_atoms[row], planted, "row {row} wrong atoms");
-        assert_eq!(layout.row_q_active(row), k_true + k_true * d);
+        assert_eq!(layout.row_q_active(row), k_true * d);
     }
     let compact_work: usize = (0..n).map(|r| layout.row_q_active(r).pow(2)).sum();
-    assert!(compact_work < n * (k_atoms * (1 + d)).pow(2) / 1_000_000);
+    assert!(compact_work < n * (k_atoms * d).pow(2) / 1_000_000);
 }
 
 #[test]
-pub(crate) fn sae_row_layout_from_dense_weights_large_k_work_scales_with_active() {
+pub(crate) fn sae_row_layout_from_topk_gates_large_k_work_scales_with_support() {
     let n = 4usize;
     let k_atoms = 100_000usize;
     let cap = 8usize;
-    let relative_cutoff = 0.05_f64;
-    // Per row, plant `cap` large weights at known indices (descending so the
-    // row peak is unambiguous) on a background of tiny weights well below the
-    // row-relative cutoff. Support recovery must return exactly the planted set.
+    // Per row, plant exactly `cap` binary gates at known indices.
     let mut planted: Vec<Vec<usize>> = Vec::with_capacity(n);
     let mut assignments: Vec<Array1<f64>> = Vec::with_capacity(n);
     for row in 0..n {
-        let mut a = Array1::<f64>::from_elem(k_atoms, 1e-6);
+        let mut a = Array1::<f64>::zeros(k_atoms);
         let mut plant = Vec::with_capacity(cap);
         for j in 0..cap {
-            // Spread the planted atoms across the index range so a tail-only or
-            // prefix-only selector would miss some; magnitudes 1.0 down to
-            // ~0.3, all far above `relative_cutoff * peak = 0.05`.
+            // Spread the planted atoms across the index range.
             let idx = (row + j * (k_atoms / cap)) % k_atoms;
-            a[idx] = 1.0 - 0.1 * j as f64;
+            a[idx] = 1.0;
             plant.push(idx);
         }
         plant.sort_unstable();
@@ -4911,15 +4843,14 @@ pub(crate) fn sae_row_layout_from_dense_weights_large_k_work_scales_with_active(
         assignments.push(a);
     }
     let coord_dims = vec![1usize; k_atoms];
-    let coord_offsets_full: Vec<usize> = (0..k_atoms).map(|k| k_atoms + k).collect();
-    let layout = SaeRowLayout::from_dense_weights(
+    let coord_offsets_full: Vec<usize> = (0..k_atoms).collect();
+    let layout = SaeRowLayout::from_topk_gates(
         &assignments,
         cap,
-        relative_cutoff,
         coord_dims,
         coord_offsets_full,
-        None,
-    );
+    )
+    .unwrap();
     for row in 0..n {
         // Exact support recovery: the proposal must return exactly the planted
         // top-`cap` atoms (all background weights are below the cutoff).
@@ -4927,9 +4858,7 @@ pub(crate) fn sae_row_layout_from_dense_weights_large_k_work_scales_with_active(
             layout.active_atoms[row], planted[row],
             "row {row}: support recovery mismatch"
         );
-        // Compact dim is bounded by `cap` (+ one coord axis each), independent
-        // of K: q_active = cap + cap·1 = 2·cap.
-        assert_eq!(layout.row_q_active(row), 2 * cap, "row {row}: q_active");
+        assert_eq!(layout.row_q_active(row), cap, "row {row}: q_active");
     }
     let compact_work: usize = (0..n)
         .map(|row| {
@@ -4940,10 +4869,10 @@ pub(crate) fn sae_row_layout_from_dense_weights_large_k_work_scales_with_active(
     // The dense per-token cost would be `q² = (2K)²`; the compact contract is
     // `(2·cap)²` — independent of K. Pin the K-independent exact value AND that
     // it is astronomically below the dense full-K work.
-    assert_eq!(compact_work, n * (2 * cap) * (2 * cap));
-    let dense_q = 2 * k_atoms;
+    assert_eq!(compact_work, n * cap * cap);
+    let dense_q = k_atoms;
     let dense_work = n * dense_q * dense_q;
-    // The work ratio is EXACTLY `(2K)² / (2·cap)² = (K/cap)²` (the `n` token
+    // The work ratio is exactly `K² / cap² = (K/cap)²` (the `n` token
     // factor cancels), so for K = 100 000, cap = 8 the compact path is
     // `12500² = 156_250_000`× cheaper. Pin that exact astronomical factor — a
     // strictly stronger guard than the previous `< dense_work / 1e9`, whose

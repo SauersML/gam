@@ -9,7 +9,7 @@
 //!   ẑ_row,c(p) = Σ_k ζ_k(ℓ) · decoded_{k,c}(t_k),   decoded_{k,c}(t) = Σ_b Φ_b(t)·B_{b,c}
 //! ```
 //!
-//! — a **gate nonlinearity** `ζ(ℓ)` (softmax / IBP sigmoid) composed with a
+//! — a **gate nonlinearity** `ζ(ℓ)` (softmax / ordered Beta--Bernoulli sigmoid) composed with a
 //! **basis** `Φ(t)` composed with a **linear decoder** `B`, in the per-row
 //! primary coordinates `p = (gate logits ℓ, latent coordinates t)`. Today the
 //! arrow-Schur assembly (`SaeManifoldTerm::row_jets_for_logdet`) hand-packs the
@@ -2113,7 +2113,7 @@ mod tests {
         }
     }
 
-    /// The per-atom logistic gate (IBP/JumpReLU branch) is diagonal in the
+    /// The per-atom logistic gate (ordered Beta--Bernoulli/JumpReLU branch) is diagonal in the
     /// logits and reproduces `σ' = σ(1−σ)·inv_tau`, `σ'' = σ(1−σ)(1−2σ)·inv_tau²`.
     #[test]
     fn per_atom_logistic_gate_matches_closed_form() {

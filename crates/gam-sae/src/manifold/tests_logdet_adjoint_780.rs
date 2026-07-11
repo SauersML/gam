@@ -367,7 +367,7 @@ fn ordered_beta_bernoulli_sparse_rho_derivative_matrix_2156(
     let k_atoms = term.k_atoms();
     let mut hdiag = assignment_prior_log_strength_hdiag(&term.assignment, rho)
         .expect("ordered Beta--Bernoulli hdiag");
-    let mut channels = ordered_beta_bernoulli_assignment_third_channels(
+    let mut channels = ordered_beta_bernoulli_psd_majorizer_third_channels(
         &term.assignment,
         rho,
         false,
@@ -1426,7 +1426,7 @@ fn ordered_beta_bernoulli_1416_oracle_cache(
     rho: &SaeManifoldRho,
 ) -> ArrowFactorCache {
     let n = term.n_obs();
-    let channels = ordered_beta_bernoulli_assignment_third_channels(&term.assignment, rho, false)
+    let channels = ordered_beta_bernoulli_psd_majorizer_third_channels(&term.assignment, rho, false)
         .expect("channels")
         .expect("ordered Beta--Bernoulli mode must yield cross-row channels");
     // Full per-row ordered Beta--Bernoulli prior diagonal `(H_p)_ii = d·J_i² + s·c_i`, where the
@@ -1472,7 +1472,7 @@ fn ordered_beta_bernoulli_1416_oracle_cache_with_coord(
     rho: &SaeManifoldRho,
 ) -> ArrowFactorCache {
     let n = term.n_obs();
-    let channels = ordered_beta_bernoulli_assignment_third_channels(&term.assignment, rho, false)
+    let channels = ordered_beta_bernoulli_psd_majorizer_third_channels(&term.assignment, rho, false)
         .expect("channels")
         .expect("ordered Beta--Bernoulli mode must yield cross-row channels");
     let hdiag = assignment_prior_log_strength_hdiag(&term.assignment, rho).expect("hdiag");

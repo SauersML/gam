@@ -113,7 +113,7 @@ pub struct AmortizationErrorStats {
     pub coord_abs_err_quantiles: [f64; 5],
     /// Fraction of (row, atom) pairs whose assignment mass lies on the same side
     /// of the caller's activity floor. Assignment masses, unlike raw logits, are
-    /// softmax-shift invariant and include threshold-gate and IBP-prior effects.
+    /// softmax-shift invariant and include threshold-gate and ordered Beta--Bernoulli-prior effects.
     pub support_agreement: f64,
     /// Root-mean-square error of predicted amplitudes against exact amplitudes,
     /// pooled over every (row, atom).
@@ -873,7 +873,7 @@ impl LearnedAmortizedEncoder {
         let coord_abs_err_quantiles = quantiles_5(&mut abs_errs);
         // Support agreement is defined in assignment space. This is invariant
         // to softmax logit shifts and automatically includes the hard threshold
-        // and ordered-IBP prior shrinkage already present in the fitted masses.
+        // and ordered-ordered Beta--Bernoulli prior shrinkage already present in the fitted masses.
         let mut agree = 0usize;
         let total = n * k;
         for row in 0..n {

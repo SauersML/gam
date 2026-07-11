@@ -224,6 +224,88 @@ fn coordinate_variance_spectrum(coords: ndarray::ArrayView2<'_, f64>) -> Vec<f64
     spectrum
 }
 
+pub(crate) fn manifold_description_length_from_arrays(
+    assignments: ndarray::ArrayView2<'_, f64>,
+    coords: &[ndarray::ArrayView2<'_, f64>],
+    ev: f64,
+    n_params: i64,
+    l_param_bits: Option<f64>,
+    active_threshold: f64,
+) -> Result<gam::terms::sae::description_length::ManifoldFitDl, String> {
+    let (n_obs, k_atoms) = assignments.dim();
+    if coords.len() != k_atoms {
+        return Err(format!(
+            "manifold description length expected {k_atoms} coordinate blocks, got {}",
+            coords.len()
+        ));
+    }
+    if !active_threshold.is_finite() || active_threshold < 0.0 {
+        return Err(format!(
+            "manifold description length active_threshold must be finite and non-negative; got {active_threshold}"
+        ));
+    }
+
+    let mut coord_variances = Vec::<f64>::new();
+    let mut atom_coord_dims = Vec::<f64>::with_capacity(k_atoms);
+    for (atom, block) in coords.iter().enumerate() {
+        if block.nrows() != n_obs {
+            return Err(format!(
+                "manifold description length coords[{atom}] has {} rows, expected {n_obs}",
+                block.nrows()
+            ));
+        }
+        atom_coord_dims.push(block.ncols() as f64);
+        coord_variances.extend(coordinate_variance_spectrum(*block));
+    }
+
+    let total_var: f64 = coord_variances.iter().sum();
+    let delta2 = (1.0 - ev).max(1.0e-12) * total_var;
+    let mut codes = gam::terms::sae::atom_codes::SparseAtomCodes::empty(n_obs, k_atoms);
+    for row in 0..n_obs {
+        for atom in 0..k_atoms {
+            let gate = assignments[[row, atom]];
+            if gate.is_finite() && gate.abs() > active_threshold {
+                codes.row_mut(row).assign(atom, gate);
+            }
+        }
+    }
+    Ok(
+        gam::terms::sae::description_length::manifold_fit_description_length(
+            &codes,
+            &coord_variances,
+            delta2,
+            &atom_coord_dims,
+            ev,
+            n_params,
+            l_param_bits,
+        ),
+    )
+}
+
+pub(crate) fn manifold_description_length_to_pydict<'py>(
+    py: Python<'py>,
+    dl: &gam::terms::sae::description_length::ManifoldFitDl,
+) -> PyResult<PyObject> {
+    let out = PyDict::new(py);
+    out.set_item("bits_per_token", dl.bits_per_token)?;
+    out.set_item("total_bits", dl.total_bits)?;
+    out.set_item("code_bits", dl.code_bits)?;
+    out.set_item("selection_bits", dl.selection_bits)?;
+    out.set_item("dict_bits", dl.dict_bits)?;
+    out.set_item("code_bits_per_token", dl.code_bits_per_token)?;
+    out.set_item("selection_bits_per_token", dl.selection_bits_per_token)?;
+    out.set_item("dict_bits_per_token", dl.dict_bits_per_token)?;
+    out.set_item("coordinate_rate_bits", dl.coordinate_rate_bits)?;
+    out.set_item("l_param_bits", dl.l_param_bits)?;
+    out.set_item("ev", dl.ev)?;
+    out.set_item("n_tokens", dl.n_tokens)?;
+    out.set_item("k_active", dl.k_active)?;
+    out.set_item("coord_dim", dl.coord_dim)?;
+    out.set_item("g_dict", dl.g_dict)?;
+    out.set_item("n_params", dl.n_params)?;
+    Ok(out.into())
+}
+
 /// Fit-level bits/token description length of a manifold-SAE reconstruction.
 ///
 /// The headline currency the results.md postmortem argues for: the whole fit's
@@ -249,77 +331,17 @@ fn sae_manifold_description_length<'py>(
     l_param_bits: Option<f64>,
     active_threshold: f64,
 ) -> PyResult<PyObject> {
-    let assignments = assignments.as_array();
-    let (n_obs, k_atoms) = assignments.dim();
-    if coords.len() != k_atoms {
-        return Err(py_value_error(format!(
-            "sae_manifold_description_length: expected {k_atoms} coordinate blocks \
-             (one per atom), got {}",
-            coords.len()
-        )));
-    }
-    // Per-coordinate signal-variance spectrum + coded dim per atom, from the
-    // fitted chart coordinates.
-    let mut coord_variances: Vec<f64> = Vec::new();
-    let mut atom_coord_dims: Vec<f64> = Vec::with_capacity(k_atoms);
-    for (k, block) in coords.iter().enumerate() {
-        let c = block.as_array();
-        if c.nrows() != n_obs {
-            return Err(py_value_error(format!(
-                "sae_manifold_description_length: coords[{k}] has {} rows but assignments \
-                 have {n_obs}",
-                c.nrows()
-            )));
-        }
-        atom_coord_dims.push(c.ncols() as f64);
-        coord_variances.extend(coordinate_variance_spectrum(c));
-    }
-    // Achieved coordinate coding distortion: the fit's residual fraction of the
-    // total coordinate signal variance `(1 − ev)·Σ var`, matching the
-    // per-featurizer `Featurizer::residual`. `1 − ev` is floored away from zero so
-    // a saturated fit reports a large finite rate, not +∞.
-    let total_var: f64 = coord_variances.iter().sum();
-    let delta2 = (1.0 - ev).max(1.0e-12) * total_var;
-    // Empirical binary support matrix: an atom is coded for a token when its gate
-    // magnitude clears the numerical-dust floor. Reads the TRUE recorded support
-    // per token (sparse gate families stay sparse; a maximally-spread softmax row
-    // is priced at its true high support cost) instead of a rounded-mean count.
-    let mut codes = gam::terms::sae::atom_codes::SparseAtomCodes::empty(n_obs, k_atoms);
-    for n in 0..n_obs {
-        for k in 0..k_atoms {
-            let gate = assignments[[n, k]];
-            if gate.is_finite() && gate.abs() > active_threshold {
-                codes.row_mut(n).assign(k, gate);
-            }
-        }
-    }
-    let dl = gam::terms::sae::description_length::manifold_fit_description_length(
-        &codes,
-        &coord_variances,
-        delta2,
-        &atom_coord_dims,
+    let coord_views = coords.iter().map(PyReadonlyArray2::as_array).collect::<Vec<_>>();
+    let dl = manifold_description_length_from_arrays(
+        assignments.as_array(),
+        &coord_views,
         ev,
         n_params,
         l_param_bits,
-    );
-    let out = PyDict::new(py);
-    out.set_item("bits_per_token", dl.bits_per_token)?;
-    out.set_item("total_bits", dl.total_bits)?;
-    out.set_item("code_bits", dl.code_bits)?;
-    out.set_item("selection_bits", dl.selection_bits)?;
-    out.set_item("dict_bits", dl.dict_bits)?;
-    out.set_item("code_bits_per_token", dl.code_bits_per_token)?;
-    out.set_item("selection_bits_per_token", dl.selection_bits_per_token)?;
-    out.set_item("dict_bits_per_token", dl.dict_bits_per_token)?;
-    out.set_item("coordinate_rate_bits", dl.coordinate_rate_bits)?;
-    out.set_item("l_param_bits", dl.l_param_bits)?;
-    out.set_item("ev", dl.ev)?;
-    out.set_item("n_tokens", dl.n_tokens)?;
-    out.set_item("k_active", dl.k_active)?;
-    out.set_item("coord_dim", dl.coord_dim)?;
-    out.set_item("g_dict", dl.g_dict)?;
-    out.set_item("n_params", dl.n_params)?;
-    Ok(out.into())
+        active_threshold,
+    )
+    .map_err(py_value_error)?;
+    manifold_description_length_to_pydict(py, &dl)
 }
 
 /// Format a float the way Python's `f"{x:g}"` does (default precision 6), so the

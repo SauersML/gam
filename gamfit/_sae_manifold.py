@@ -140,11 +140,10 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         LINEAR verdicts (see :attr:`ManifoldSAE.hybrid_split`).
     assignment
         Assignment/gating family. ``"softmax"`` uses simplex-normalized additive
-        gates and is
-        the production default; at large ``K`` the fit derives a train-time
-        ``top_k`` cap from rows per atom when the caller leaves ``top_k`` unset.
-        ``"ordered_beta_bernoulli"`` uses independent posterior-mean Bernoulli
-        gates with an ordered integrated Beta prior. ``"threshold_gate"`` uses
+        gates and is the production default. Its exact full-support objective is
+        never truncated. ``"ordered_beta_bernoulli"`` uses independent relaxed
+        Bernoulli gates with an ordered, exactly integrated Beta prior.
+        ``"threshold_gate"`` uses
         a smooth threshold-centered logistic gate.
         ``"topk"`` is the hard per-row support gate (``AssignmentMode::TopK``):
         it requires an explicit ``top_k`` (the fixed active-set size), carries
@@ -256,14 +255,10 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         ``||B_j @ B_k.T||_F^2`` for stored ``(M_k, p_out)`` decoder blocks on
         co-firing atom pairs.
     top_k
-        Optional per-token active-set cap. ``None`` disables it;
-        integers in ``[1, K]`` cap the number of atoms a token may activate. This
-        is a TRAIN-TIME cap folded into the optimization (the engine builds the
-        compact active×active solve over the capped support), not a cosmetic
-        post-fit filter. The engine additionally applies an automatic
-        memory-budget cap: when the dense ``K`` working set would exceed the
-        host/device budget the compact active-set layout engages even without an
-        explicit ``top_k``. ``fitted`` is computed from the (capped) support.
+        Required fixed per-row support size for ``assignment="topk"``. It is
+        rejected for every smooth assignment family. The TopK reconstruction,
+        loss, derivatives, diagnostics, and OOS encoder all use this same exact
+        hard support; there is no post-fit projection.
     t_init, a_init
         Warm starts for amortized encoder distillation (#357). ``a_init`` has
         shape ``(N, K)`` and seeds assignment logits. ``t_init`` has shape
@@ -552,9 +547,9 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # R² ≥ 0.95 in 10 steps from a phase-shifted init). A small literal
     # `lr=0.05` starves the assignment posterior of gradient mass and lets
     # the ordered Beta--Bernoulli sigmoid drift into the saturated tail (the issue #165
-    # collapse: assignment mass ~1e-146). The ThresholdGate (#1777, formerly
-    # "jumprelu") keeps the historical smaller step because its hard-gate STE is
-    # more sensitive to overshooting the threshold. Callers can still override.
+    # collapse: assignment mass ~1e-146). The smooth threshold gate keeps the
+    # smaller step because its local slope is concentrated near the threshold.
+    # Callers can still override.
     if learning_rate is None:
         effective_lr = 0.05 if kind == "threshold_gate" else 1.0
     else:

@@ -23,16 +23,11 @@ use super::construction::{active_softmax_gershgorin_majorizer_entry, softmax_maj
 /// second-Jacobian diagonal `w·s·c` can have either sign. Under a low-rank
 /// whitening metric the data Gauss--Newton block need not dominate that
 /// negative curvature, so an undamped exact-Hessian log determinant need not
-/// exist. Clamp each piece to its positive part — exactly the MM/Loewner
-/// pattern ARD (`max(V'',0)`) and softmax (Gershgorin `D ⪰ H`) already use — so
-/// the assembled column block is `max(w·s',0)·J Jᵀ + diag(max(w·s·c,0)) ⪰ 0`.
-///
-/// The Woodbury source's `d_k` is clamped to the SAME `max(w·s',0)`, so the
-/// self-term downdate (`d_k·J²`) and the rank-one re-add differentiate one
-/// operator: `H₀'` keeps `max(w·s·c,0)` on its diagonal and the capacitance's
-/// `D = max(w·s',0) ⪰ 0` makes `C ⪰ I`. Majorizing a FIXED prior's curvature
-/// only conditions the Newton step / the Laplace normalizer — the gradient
-/// (which sets the stationary point) is untouched.
+/// exist. The rank-one block's zero matrix is already a PSD Loewner majorizer
+/// because `w·s' < 0`; the row-local term is majorized by its positive part.
+/// Thus the assembled block is simply `diag(max(w·s·c,0))`. The gradient
+/// remains the exact derivative of the integrated scalar; only the
+/// Newton/Laplace curvature uses this declared majorizer.
 pub(super) fn ordered_beta_bernoulli_psd_majorized_hdiag(
     channels: &OrderedBetaBernoulliHessianDiagThirdChannels,
     row: usize,
@@ -40,11 +35,49 @@ pub(super) fn ordered_beta_bernoulli_psd_majorized_hdiag(
     atom: usize,
     raw_hdiag: f64,
 ) -> f64 {
-    let j = channels.z_jac[row * k_atoms + atom];
-    let d = channels.cross_row_d[atom]; // w·s'_k, the rank-one self coefficient
-    let self_term = d * j * j; // w·s'·J², the cross-row rank-one self curvature
-    let diag_score_c = raw_hdiag - self_term; // w·s·c, the concrete-jacobian diagonal
-    d.max(0.0) * j * j + diag_score_c.max(0.0)
+    ordered_beta_bernoulli_psd_majorized_hdiag_derivative(
+        channels,
+        row,
+        k_atoms,
+        atom,
+        raw_hdiag,
+        channels.mass_hessian_coefficient[atom],
+    )
+}
+
+/// Log-concentration derivative of the same ordered Beta--Bernoulli PSD
+/// majorizer assembled by [`ordered_beta_bernoulli_psd_majorized_hdiag`].
+pub(super) fn ordered_beta_bernoulli_psd_majorized_log_alpha_hdiag(
+    channels: &OrderedBetaBernoulliHessianDiagThirdChannels,
+    row: usize,
+    k_atoms: usize,
+    atom: usize,
+    raw_log_alpha_hdiag: f64,
+) -> f64 {
+    ordered_beta_bernoulli_psd_majorized_hdiag_derivative(
+        channels,
+        row,
+        k_atoms,
+        atom,
+        raw_log_alpha_hdiag,
+        channels.mass_hessian_log_alpha_derivative[atom],
+    )
+}
+
+fn ordered_beta_bernoulli_psd_majorized_hdiag_derivative(
+    channels: &OrderedBetaBernoulliHessianDiagThirdChannels,
+    row: usize,
+    k_atoms: usize,
+    atom: usize,
+    raw_hdiag_derivative: f64,
+    mass_hessian_derivative: f64,
+) -> f64 {
+    let index = row * k_atoms + atom;
+    if channels.diagonal_term[index] <= 0.0 {
+        return 0.0;
+    }
+    let j = channels.z_jac[index];
+    raw_hdiag_derivative - mass_hessian_derivative * j * j
 }
 
 impl SaeManifoldTerm {
@@ -398,27 +431,8 @@ impl SaeManifoldTerm {
         // structure avoids an additional p² factor). TopK has an exact sparse
         // representation and never enters this check.
         if row_layout.is_none() {
-            let m_total: usize = self.atoms.iter().map(|atom| atom.basis_size()).sum();
-            let row_bytes = n
-                .saturating_mul(q)
-                .saturating_mul(q)
-                .saturating_mul(SAE_BYTES_PER_F64);
-            let gram_bytes = m_total
-                .saturating_mul(m_total)
-                .saturating_mul(SAE_BYTES_PER_F64);
-            let required_bytes = row_bytes.saturating_add(gram_bytes);
             let budget_bytes = sae_host_in_core_budget_bytes().0;
-            if required_bytes > budget_bytes {
-                return Err(format!(
-                    "exact {} assignment assembly requires at least {required_bytes} bytes for row curvature and decoder Gram, exceeding the in-core budget {budget_bytes} bytes at N={n}, K={k_atoms}. Use assignment='topk' with an explicit support size; smooth assignments are never silently truncated",
-                    match self.assignment.mode {
-                        AssignmentMode::Softmax { .. } => "softmax",
-                        AssignmentMode::OrderedBetaBernoulli { .. } => "ordered_beta_bernoulli",
-                        AssignmentMode::ThresholdGate { .. } => "threshold_gate",
-                        AssignmentMode::TopK { .. } => unreachable!(),
-                    }
-                ));
-            }
+            self.require_exact_dense_assignment_budget(budget_bytes)?;
         }
         // #974 likelihood-whitening seam. The single per-row decision: when the
         // installed `RowMetric` is a genuinely estimated noise model
@@ -569,10 +583,9 @@ impl SaeManifoldTerm {
         // the max(·,0) themselves from the raw `w·s'`/`w·s·c`, so this must be the
         // un-majorized channel set.
         let ordered_beta_bernoulli_majorizer =
-            ordered_beta_bernoulli_assignment_third_channels_weighted(
+            ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
                 &self.assignment,
                 rho,
-                false,
                 self.row_loss_weights.as_deref(),
             )?;
         // Data-fit Gauss-Newton β-Hessian is block-diagonal across the `p`

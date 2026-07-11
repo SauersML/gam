@@ -507,7 +507,7 @@ pub(crate) fn ordered_beta_bernoulli_assembly_emits_cross_row_woodbury_source_ma
     }
 
     // Distinct atom columns do NOT couple cross-row (independent
-    // stick-breaking masses): the off-diagonal in a DIFFERENT column is zero.
+    // ordered independent-Beta masses): the off-diagonal in a DIFFERENT column is zero.
     for i in 0..n {
         for j in 0..n {
             if i == j {
@@ -1540,17 +1540,11 @@ pub(crate) fn reference_function_gram_is_fixed_and_has_exact_trace_form() {
             column.dot(&gram.dot(&column))
         })
         .sum();
-    let matrix_form = decoder
-        .iter()
-        .enumerate()
-        .map(|(flat, &value)| {
-            let row = flat / p;
-            let output = flat % p;
-            value * gram.row(row).dot(&decoder.column(output))
-        })
-        .sum::<f64>();
+    let bt_s_b = decoder.t().dot(&gram).dot(&decoder);
+    let matrix_form = bt_s_b.diag().sum();
     assert_abs_diff_eq!(trace_form, matrix_form, epsilon = 1.0e-12);
 }
+
 pub(crate) fn gamma_fd_tiny_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let n = 10usize;
     let p = 3usize;

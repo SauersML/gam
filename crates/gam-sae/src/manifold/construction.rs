@@ -2799,6 +2799,49 @@ impl SaeManifoldTerm {
         Arc::from(ranges.into_boxed_slice())
     }
 
+    /// Irreducible resident bytes for exact full-support row curvature and the
+    /// decoder data Gram. This is a lower bound used for admission before either
+    /// allocation; saturating arithmetic turns dimension overflow into refusal.
+    pub(crate) fn exact_dense_assignment_bytes(&self) -> usize {
+        let n = self.n_obs();
+        let q = self.assignment.row_block_dim();
+        let m_total: usize = self.atoms.iter().map(|atom| atom.basis_size()).sum();
+        n.saturating_mul(q)
+            .saturating_mul(q)
+            .saturating_mul(SAE_BYTES_PER_F64)
+            .saturating_add(
+                m_total
+                    .saturating_mul(m_total)
+                    .saturating_mul(SAE_BYTES_PER_F64),
+            )
+    }
+
+    /// Enforce exact dense-assignment admission. Smooth assignment families are
+    /// never converted into an active-set surrogate to fit memory.
+    pub(crate) fn require_exact_dense_assignment_budget(
+        &self,
+        budget_bytes: usize,
+    ) -> Result<(), String> {
+        if matches!(self.assignment.mode, AssignmentMode::TopK { .. }) {
+            return Ok(());
+        }
+        let required_bytes = self.exact_dense_assignment_bytes();
+        if required_bytes <= budget_bytes {
+            return Ok(());
+        }
+        let family = match self.assignment.mode {
+            AssignmentMode::Softmax { .. } => "softmax",
+            AssignmentMode::OrderedBetaBernoulli { .. } => "ordered_beta_bernoulli",
+            AssignmentMode::ThresholdGate { .. } => "threshold_gate",
+            AssignmentMode::TopK { .. } => unreachable!(),
+        };
+        Err(format!(
+            "exact {family} assignment assembly requires at least {required_bytes} bytes for row curvature and decoder Gram, exceeding the in-core budget {budget_bytes} bytes at N={}, K={}. Use assignment='topk' with an explicit support size; smooth assignments are never silently truncated",
+            self.n_obs(),
+            self.k_atoms(),
+        ))
+    }
+
     pub fn flatten_beta(&self) -> Array1<f64> {
         let p = self.output_dim();
         let offsets = self.beta_offsets();

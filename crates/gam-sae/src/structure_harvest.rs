@@ -2271,7 +2271,7 @@ fn fold_atom_into(term: &mut SaeManifoldTerm, a: usize, b: usize) -> Result<(), 
     // Plain `max` UNDER-masses by up to `ln 2` on exactly the co-active rows that
     // triggered the fusion (where `la ≈ lb`): it gives the fused atom half the
     // combined mass, leaving the warm-start short and risking a FALSE rejection by
-    // the e-gate under a capped refit. For IBP/JumpReLU the per-atom gate is the
+    // the e-gate under a capped refit. For ordered Beta--Bernoulli/JumpReLU the per-atom gate is the
     // UN-normalized `σ(logit)`, so the union gate is `max(σ(la),σ(lb)) = σ(max(la,lb))`
     // → `max` is the correct combine there (a sum/logsumexp would over-gate).
     let softmax_routing = matches!(term.assignment.mode, AssignmentMode::Softmax { .. });
@@ -4444,7 +4444,7 @@ pub(crate) fn born_circle_atom(
             logits[[row, col]] = term.assignment.logits[[row, col]];
         }
         // #2101/#2109 PRESENCE-PROPORTIONAL gate seed. The flat weak BIRTH_SEED_LOGIT
-        // (−4) is fatal under IBP — the born circle starts nearly OFF (σ(−4)≈0.018) and
+        // (−4) is fatal under ordered Beta--Bernoulli — the born circle starts nearly OFF (σ(−4)≈0.018) and
         // the sub-fit collapses it (measured: ibp logit −4 collapses ‖B‖ 1.41→1e-4,
         // logit +3 survives). On a row where the born circle is PRESENT (`circle_gate`
         // finite: its 2-plane energy cleared the derived MP floor), route it at the
@@ -7909,7 +7909,7 @@ mod tests {
     /// the old `max` under-massed the fused atom (½ vs ⅔ on this 3-atom fixture
     /// where atoms 0,1 are co-active and atom 2 competes), leaving the warm-start
     /// short and risking a FALSE e-gate rejection of a good fusion under a capped
-    /// refit. (For IBP routing `max` stays correct — the gate is un-normalized.)
+    /// refit. (For ordered Beta--Bernoulli routing `max` stays correct — the gate is un-normalized.)
     #[test]
     fn fusion_preserves_combined_softmax_mass() {
         let (term, rho) = planted_term(&vec![vec![true, true, true]; 6]);

@@ -552,7 +552,7 @@ pub fn sae_refine_mobius_seed_coords_by_cluster(
 /// system in a degenerate fixed point on multi-atom configurations: the
 /// data-fit Jacobian, the assignment-weighted decoder gradient, and the
 /// sparsity-prior gradient cannot all be zero simultaneously, but the
-/// assignment prior (ordered Beta--Bernoulli-MAP stick-breaking or softmax entropy) is the only
+/// assignment prior (ordered independent Beta--Bernoulli or softmax entropy) is the only
 /// term with a non-zero gradient at iter 0. The optimizer then collapses the
 /// assignments to zero before any data signal has accumulated, even on
 /// trivially-separable signals such as the K=2 periodic torus reproducer in
@@ -1058,9 +1058,9 @@ mod tests {
 
         // The seeded reconstruction must explain most of Z under the SAME forward
         // map the joint LSQ solved against: fitted[i,:] = Σ_k a_k · Phi_k[i,:] · B_k
-        // where a_k is the ordered Beta--Bernoulli-MAP activation of the initial (all-zero) logits. For
+        // where a_k is the ordered Beta--Bernoulli activation of the initial (all-zero) logits. For
         // zero logits the posterior-mean Bernoulli gate is σ(0) = 0.5. Ordered
-        // stick-breaking shrinkage is scored by the ordered Beta--Bernoulli prior, not multiplied
+        // independent-Beta shrinkage is scored by the ordered prior, not multiplied
         // into the reconstruction a second time.
         // Reconstructing with the true per-atom weights (rather than an imagined
         // uniform gate) is what makes this a faithful check of the LSQ seed: the

@@ -1458,8 +1458,8 @@ pub(crate) fn fill_assignment_logit_jvp_rows(
             }
         }
         AssignmentMode::OrderedBetaBernoulli { temperature, .. } => {
-            // Posterior-mean Bernoulli gate `z_k = σ(l_k/τ)`; ordered
-            // stick-breaking shrinkage is scored once, in the ordered Beta--Bernoulli prior.
+            // Posterior-mean Bernoulli gate `z_k = σ(l_k/τ)`; independent-Beta
+            // shrinkage is scored once, in the ordered Beta--Bernoulli prior.
             let inv_tau = 1.0 / temperature;
             for logit_col in 0..assignments.len() {
                 if is_ungated(logit_col) {
@@ -1983,27 +1983,25 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
     Ok((grad, diag))
 }
 
-/// Build the exact ordered Beta--Bernoulli `hessian_diag` logit third-derivative channels (#1006)
-/// for the SAE log-det adjoint Γ, using the SAME penalty configuration —
+/// Build exact derivatives of the ordered Beta--Bernoulli PSD curvature
+/// majorizer for the SAE log-det adjoint Γ, using the same penalty configuration —
 /// `alpha`/`tau`/`learnable_alpha` and the `lambda_sparse` weight convention —
 /// that [`assignment_prior_grad_hdiag`] assembles into `htt`. Returns `None`
-/// for non-ordered Beta--Bernoulli assignment modes (no cross-row empirical-π coupling to correct).
-pub fn ordered_beta_bernoulli_assignment_third_channels(
+/// for other assignment modes.
+pub fn ordered_beta_bernoulli_psd_majorizer_third_channels(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
-    majorize: bool,
 ) -> Result<Option<OrderedBetaBernoulliHessianDiagThirdChannels>, String> {
-    ordered_beta_bernoulli_assignment_third_channels_weighted(assignment, rho, majorize, None)
+    ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(assignment, rho, None)
 }
 
-/// As [`ordered_beta_bernoulli_assignment_third_channels`], with the #991 design-honesty per-row
+/// As [`ordered_beta_bernoulli_psd_majorizer_third_channels`], with the #991 design-honesty per-row
 /// weights the assembled `htt` carried (the channels must differentiate the
-/// SAME weighted operator; `z_jac` then carries the weighted carrier `u = w·J`
-/// and `logit_curvature` its slot derivative `w·c`).
-pub(crate) fn ordered_beta_bernoulli_assignment_third_channels_weighted(
+/// same weighted operator; `z_jac` carries the weighted active-mass derivative
+/// `u = w·J`).
+pub(crate) fn ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
-    majorize: bool,
     row_weights: Option<&[f64]>,
 ) -> Result<Option<OrderedBetaBernoulliHessianDiagThirdChannels>, String> {
     let AssignmentMode::OrderedBetaBernoulli {
@@ -2022,8 +2020,7 @@ pub(crate) fn ordered_beta_bernoulli_assignment_third_channels_weighted(
     // arrays are not internally column-masked).
     let (penalty, rho_view) =
         ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
-    let mut channels =
-        penalty.hessian_diag_logit_third_channels(target.view(), rho_view.view(), majorize);
+    let mut channels = penalty.psd_majorizer_logit_third_channels(target.view(), rho_view.view());
     // #1026/#1033 — zero the log-det third-derivative channels of FIXED-logit
     // atoms (ungated, or all atoms under frozen routing) so the #1006 θ-adjoint
     // differentiates the SAME (fixed-logit-zeroed) `htt` that
@@ -2036,13 +2033,13 @@ pub(crate) fn ordered_beta_bernoulli_assignment_third_channels_weighted(
                 channels.z_jac[idx] = 0.0;
                 channels.local_logit_third[idx] = 0.0;
                 channels.m_channel[idx] = 0.0;
-                channels.logit_curvature[idx] = 0.0;
+                channels.diagonal_term[idx] = 0.0;
             }
         }
         for atom in 0..k {
             if assignment.logit_is_fixed(atom) {
-                channels.cross_row_d[atom] = 0.0;
-                channels.cross_row_dd[atom] = 0.0;
+                channels.mass_hessian_coefficient[atom] = 0.0;
+                channels.mass_hessian_log_alpha_derivative[atom] = 0.0;
             }
         }
     }

@@ -1905,7 +1905,7 @@ pub(crate) fn planted_low_rank_frame_recovered_by_polar() {
     }
 }
 
-/// Regression test for #1415: the JumpReLU third derivative consumed by the
+/// Regression test for #1415: the smooth-threshold third derivative consumed by the
 /// log-determinant θ-adjoint (`assignment_prior_hdiag_derivative_entry`) must be
 /// the EXACT derivative of the (separately certified) Hessian diagonal
 /// `P''(ℓ)=(λ/τ²)s(1−2a)`, namely `P'''(ℓ)=(λ/τ³)s(1−6a+6a²)`. The historical
@@ -1917,14 +1917,14 @@ pub(crate) fn planted_low_rank_frame_recovered_by_polar() {
 /// form). Also pins the exact threshold value `−λ/(8τ³)` and asserts the
 /// production entry is strictly negative there (the old formula returned 0).
 #[test]
-fn jumprelu_hdiag_third_derivative_matches_central_difference_1415() {
+fn smooth_threshold_hdiag_third_derivative_matches_central_difference_1415() {
     use ndarray::{Array1, Array2, Array3};
     let n = 6usize;
     let k = 2usize;
     let p = 3usize;
     let temperature = 0.35_f64;
     let threshold = 0.1_f64;
-    // Include the exact threshold (logit == θ ⇒ a = 1/2) plus in-band points.
+    // Include the exact threshold (logit == θ ⇒ a = 1/2) plus points on both sides.
     let logits = Array2::<f64>::from_shape_vec(
         (n, k),
         vec![
@@ -1971,9 +1971,6 @@ fn jumprelu_hdiag_third_derivative_matches_central_difference_1415() {
     for row in 0..n {
         for atom in 0..k {
             let logit = logits[[row, atom]];
-            if !crate::assignment::jumprelu_in_optimization_band(logit, threshold, temperature) {
-                continue;
-            }
             let entry = term.assignment_prior_hdiag_derivative_entry(
                 &rho,
                 row,

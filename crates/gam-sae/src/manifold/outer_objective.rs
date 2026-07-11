@@ -343,8 +343,11 @@ pub struct SaeIntoFittedResult {
     pub term: SaeManifoldTerm,
     pub rho: SaeManifoldRho,
     pub loss: SaeManifoldLoss,
-    /// Certified value of the full penalized-LAML criterion at the returned
-    /// stationary state. This is distinct from `loss.total()`.
+    /// Certified value of the full penalized-LAML criterion at the terminal
+    /// outer stationary state, before the optional image-frozen post-fit chart
+    /// canonicalization. This is distinct from `loss.total()`; consult
+    /// `charts_canonicalized` to know whether the returned term is a transported
+    /// chart representative of that certified state.
     pub penalized_laml_criterion: f64,
     /// True when post-fit chart canonicalization changed any atom's chart.
     pub charts_canonicalized: bool,
@@ -2491,11 +2494,12 @@ impl SaeManifoldOuterObjective {
     pub fn fit_at_fixed_rho(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<(), String> {
         self.fit_verdict = None;
         self.certified_penalized_laml_criterion = None;
+        let rho_state = self.baseline_rho.from_flat(rho_flat.clone());
         let (cost, _) = self.evaluate_with_refine_policy(rho_flat, true)?;
-        let cost = cost + self.block_jacobian(&self.baseline_rho.from_flat(rho_flat));
+        let cost = cost + self.block_jacobian(&rho_state);
         if !cost.is_finite() {
             return Err(
-                "SaeManifoldOuterObjective::fit_at_fixed_rho: penalized LAML evidence is infeasible at the requested rho"
+                "SaeManifoldOuterObjective::fit_at_fixed_rho: penalized-LAML criterion is infeasible at the requested rho"
                     .to_string(),
             );
         }
@@ -5381,6 +5385,7 @@ mod linear_parity_anchor_1026_tests {
                 .fit_at_fixed_rho(rho_flat.view())
                 .expect("fixed-rho fit converges");
             let fitted = outer.into_fitted().expect("fixed-rho fit was evaluated");
+            assert!(fitted.penalized_laml_criterion.is_finite());
             let recon = fitted.term.fitted();
             reconstruction_explained_variance(target.view(), recon.view()).expect("EV finite")
         };
@@ -5595,6 +5600,7 @@ mod linear_parity_anchor_1026_tests {
                 .fit_at_fixed_rho(rho_flat.view())
                 .expect("fixed-rho fit converges");
             let fitted = outer.into_fitted().expect("fixed-rho fit was evaluated");
+            assert!(fitted.penalized_laml_criterion.is_finite());
             let recon = fitted.term.fitted();
             reconstruction_explained_variance(target.view(), recon.view()).expect("EV finite")
         };

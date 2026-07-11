@@ -13,7 +13,7 @@
 /// solver scale. The floor is `√ε_machine`, the standard boundary below which
 /// a double-precision curvature ratio is not numerically identifiable; it is
 /// derived from the scalar type rather than tuned to a fixture. A direction
-/// below this floor (a saturated IBP gate logit has data
+/// below this floor (a saturated ordered Beta--Bernoulli gate logit has data
 /// curvature `∝ σ'(ℓ)² → 0`) is numerically curvature-free — the inner
 /// optimizer cannot resolve the iterate's position along it, so the IFT
 /// response `θ̂_ρ = −A⁻¹g_ρ` there is an unidentifiable `1/μ` amplification,
@@ -181,21 +181,18 @@ where
             // μ(x) collapsed onto μ_min — is ALREADY aligned with the offending
             // direction. Keep the best `v` and let the alignment/μ checks below
             // decide, instead of aborting the whole outer gradient.
-            let refined = match solve_b_preconditioned_gmres_with(
-                &bv,
-                |w| apply_a(w),
-                |w| precondition(w),
-            ) {
-                Ok(mut refined) => {
-                    normalize_b(&mut refined)?;
-                    refined
-                }
-                Err(_) => {
-                    // Refinement stalled — the current `v` is our best isolate.
-                    direction_converged = true;
-                    break;
-                }
-            };
+            let refined =
+                match solve_b_preconditioned_gmres_with(&bv, |w| apply_a(w), |w| precondition(w)) {
+                    Ok(mut refined) => {
+                        normalize_b(&mut refined)?;
+                        refined
+                    }
+                    Err(_) => {
+                        // Refinement stalled — the current `v` is our best isolate.
+                        direction_converged = true;
+                        break;
+                    }
+                };
             let b_refined = apply_b(&refined)?;
             let alignment = sae_inner(&v, &b_refined).abs();
             if !alignment.is_finite() {
@@ -711,7 +708,7 @@ impl SaeManifoldTerm {
         self.combine_assignment_strength_gradient(rho, logdet_trace, &gamma, &response, "dense")
     }
 
-    /// Exact non-IBP assignment-strength penalized-LAML gradient on the matrix-free
+    /// Exact non-ordered-Beta assignment-strength penalized-LAML gradient on the matrix-free
     /// evidence path. This is the one coordinate softmax entropy and gated L1
     /// cannot update through a Fellner-Schall equation:
     ///
@@ -850,7 +847,7 @@ impl SaeManifoldTerm {
                     rho,
                     self.row_loss_weights.as_deref(),
                 );
-            // IBP concentration controls only the Beta--Bernoulli prior. The
+            // ordered Beta--Bernoulli concentration controls only the Beta--Bernoulli prior. The
             // final posterior-mean gate is `sigmoid(logit/tau)`, so the data
             // likelihood and its Gauss--Newton blocks have no direct alpha
             // derivative. Structurally fixed assignments have no sparse index
@@ -980,11 +977,11 @@ impl SaeManifoldTerm {
         // selected inverse otherwise. The border-only bundle reconstructs the NO-SELF
         // base inverse `(H₀')⁻¹`, so `logdet_theta_adjoint_from_probes` HARD-REFUSES
         // (routes to dense) any cache carrying a T-space rank-R correction the border
-        // cannot span — per-row gauge/rotation deflation OR an IBP cross-row Woodbury —
+        // cannot span — per-row gauge/rotation deflation OR an ordered Beta--Bernoulli cross-row Woodbury —
         // and otherwise owns the softmax / euclidean / non-cross-row regimes exactly.
         // This completes the matrix-free selected-inverse cluster (smoothness EDF + ARD
-        // Hessian trace + θ-adjoint); the assignment/learnable-IBP log-strength traces
-        // (when that coordinate exists) plus the θ-adjoint's IBP-refused fits remain
+        // Hessian trace + θ-adjoint); the assignment/learnable-ordered Beta--Bernoulli log-strength traces
+        // (when that coordinate exists) plus the θ-adjoint's ordered Beta--Bernoulli-refused fits remain
         // solver-bound
         // — the last gaps before the routing flip (see the docstring).
         let mut gamma = match inverse_probe_bundle {

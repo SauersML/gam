@@ -1212,7 +1212,8 @@ pub fn fit_stagewise(
                 rho: &rho,
             },
         )?;
-        let (current_penalized_laml, _) = frozen_joint_penalized_laml(&mut term, target, &rho, registry, config)?;
+        let (current_penalized_laml, _) =
+            frozen_joint_penalized_laml(&mut term, target, &rho, registry, config)?;
         let cur_ev = ev_of(&term, target);
         emit_stagewise_progress(
             &mut progress,
@@ -1290,8 +1291,13 @@ pub fn fit_stagewise(
                     registry,
                     config,
                 )?;
-                let (penalized_laml, _) =
-                    frozen_joint_penalized_laml(&mut cand_term, target, &cand_rho, registry, config)?;
+                let (penalized_laml, _) = frozen_joint_penalized_laml(
+                    &mut cand_term,
+                    target,
+                    &cand_rho,
+                    registry,
+                    config,
+                )?;
                 let ev = ev_of(&cand_term, target);
                 Ok((cand_term, cand_rho, penalized_laml, ev))
             })
@@ -1389,8 +1395,13 @@ pub fn fit_stagewise(
                     config.ridge_ext_coord,
                     config.ridge_beta,
                 )?;
-                let (penalized_laml, _) =
-                    frozen_joint_penalized_laml(&mut cand_term, target, &cand_rho, registry, config)?;
+                let (penalized_laml, _) = frozen_joint_penalized_laml(
+                    &mut cand_term,
+                    target,
+                    &cand_rho,
+                    registry,
+                    config,
+                )?;
                 let ev = ev_of(&cand_term, target);
                 Ok((cand_term, cand_rho, penalized_laml, ev))
             })();
@@ -2142,7 +2153,8 @@ pub fn fit_stagewise_batched(
 
         // Current joint evidence + EV (the birth gate's reference), computed once
         // before the parallel race so the closures borrow `term` immutably.
-        let (current_penalized_laml, _) = frozen_joint_penalized_laml(&mut term, target, &rho, registry, base)?;
+        let (current_penalized_laml, _) =
+            frozen_joint_penalized_laml(&mut term, target, &rho, registry, base)?;
         let cur_ev = ev_of(&term, target);
 
         // ── PARALLEL racing: fit every candidate's K=1 sub-problem concurrently ──

@@ -194,8 +194,10 @@ pub struct SaeFitReport {
     pub rho: SaeManifoldRho,
     /// Penalized loss of the fitted model.
     pub loss: SaeManifoldLoss,
-    /// Certified full penalized-LAML criterion of the smooth fitted model,
-    /// including its Laplace and Occam terms. This is not `-loss.total()`.
+    /// Certified full penalized-LAML criterion at the terminal outer stationary
+    /// state, including its Laplace and Occam terms and preceding any optional
+    /// image-frozen post-fit chart canonicalization. This is not
+    /// `-loss.total()`.
     pub penalized_laml_criterion: f64,
     pub assignments: Array2<f64>,
     pub fitted: Array2<f64>,

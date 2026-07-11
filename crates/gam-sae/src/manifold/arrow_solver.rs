@@ -198,7 +198,7 @@ impl<'a> DeflatedArrowSolver<'a> {
     /// diagonal contraction against it therefore spuriously includes
     /// `Σ_i vᵢ[s]²` at slot `s`, a ρ/θ-independent contribution that must be 0.
     /// This variant subtracts the per-row deflated outer-product diagonal
-    /// `Σ_i vᵢ[s]²` so the diagonal traces (ARD precision, IBP/softmax assignment
+    /// `Σ_i vᵢ[s]²` so the diagonal traces (ARD precision, ordered-Beta/softmax assignment
     /// log-strength) see only the kept subspace. The deflated subspace's β-Schur
     /// coupling is higher order and left to the per-block subtraction the
     /// off-diagonal (`solve`-based) traces apply directly.
@@ -226,7 +226,7 @@ impl<'a> DeflatedArrowSolver<'a> {
     /// `solve`'s selected entries EXACTLY. It does so only on the plain bordered
     /// arrow: when a gauge Woodbury deflation is active (`woodbury_factor`) the
     /// `solve` output carries the rank-`R` gauge correction the row-local blocks
-    /// omit, and when a #1038 cross-row IBP Woodbury is present the cache's
+    /// omit, and when a #1038 cross-row ordered Beta--Bernoulli Woodbury is present the cache's
     /// per-row factors are the NO-SELF base `H₀'` (not the full operator). In
     /// either case callers MUST fall back to the per-row `solve` loop — the
     /// row-local blocks are NOT valid there.
@@ -565,7 +565,7 @@ pub(crate) fn apply_cached_arrow_hessian(
         }
     }
 
-    // #1038 IBP cross-row curvature: when the cache carries the exact rank-`R`
+    // #1038 ordered Beta--Bernoulli cross-row curvature: when the cache carries the exact rank-`R`
     // Woodbury, the operator it represents is `H_full = H₀' + U D Uᵀ` (the same
     // operator `full_inverse_apply` inverts and `arrow_log_det` reports). The
     // per-row factors reconstructed above are only the NO-SELF base `H₀'`, so the

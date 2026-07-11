@@ -135,7 +135,7 @@ impl SaeManifoldTerm {
         // are nonzero there, so iterating each row's active atoms and accumulating
         // their outer product yields the IDENTICAL matrix as the dense `k²·n`
         // triple loop — every skipped `(j,k,row)` term had a zero gate factor and
-        // contributed nothing. For the sparse IBP/Softmax routing this term exists
+        // contributed nothing. For the sparse ordered-Beta/Softmax routing this term exists
         // to regularize, the per-row active set is `≪ K`, so the cost collapses
         // from `O(K²·N)` (35e12 products at K=32768) to `O(N·active²)` with no
         // change to the result — the same coactive-pairs reduction proven exact
@@ -490,7 +490,7 @@ impl SaeManifoldTerm {
     /// which was NOT the full normalized coactivation NOR the truncated one — it
     /// systematically UNDER-weighted the barrier for dense-tail (softmax)
     /// assignments (the full-row denominator inflates the divisor). For structurally
-    /// sparse assignments (JumpReLU hard gate / IBP-MAP) every sub-floor entry is a
+    /// sparse assignments (JumpReLU hard gate / ordered-Beta MAP) every sub-floor entry is a
     /// hard zero, so `J` is the full nonzero support, the truncated and full sums
     /// coincide, and this is EXACTLY the full normalized coactivation to the last
     /// bit (unchanged from before). Cost is `O(N·K)` to read the gates plus
@@ -507,7 +507,7 @@ impl SaeManifoldTerm {
     /// `per_atom_effective_sample_size` (`fisher_n = Σ w²`) uses, restricted to
     /// the same relative-mass active support as the numerator so numerator,
     /// denominator and softening `ε_C` are one measure
-    /// (for hard-gated routings — JumpReLU/IBP/TopK — the truncated and full sums
+    /// (for hard-gated routings — JumpReLU/ordered-Beta/TopK — the truncated and full sums
     /// coincide exactly; for softmax the sub-floor tail is dropped from ALL of
     /// them consistently). Returned together so the frozen gate can pin both at
     /// the same chokepoint.
@@ -525,7 +525,7 @@ impl SaeManifoldTerm {
         //
         // "Co-firing" on a row means carrying NON-NEGLIGIBLE mass relative to that
         // row's peak (`SAE_COACTIVE_RELATIVE_MASS_FLOOR`), not merely `a ≠ 0`. For
-        // structurally sparse modes (JumpReLU/IBP) the active atoms sit far above
+        // structurally sparse modes (JumpReLU/ordered Beta--Bernoulli) the active atoms sit far above
         // the floor and the hard zeros are excluded either way, so the support is
         // the full nonzero support and the score is the exact full normalized
         // coactivation. For SOFTMAX the sub-floor tail is dropped from BOTH sums,

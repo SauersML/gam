@@ -1,17 +1,17 @@
-"""IBP-MAP stick-breaking prior saturation at high K / low alpha.
+"""Ordered independent-Beta prior saturation at high K / low alpha.
 
-The IBP prior weights atoms by ``pi_k = (alpha/(alpha+1))^(k+1)`` and applies
-it multiplicatively to the IBP-MAP assignments. The capacity test only
+The ordered prior uses mean schedule
+``pi_k = (alpha/(alpha+1))^(k+1)``. The capacity test only
 covers K in {1,2,4,8} at the default ``alpha=1.0`` (ratio ~0.5, gentle
 decay). It never probes the pathological regime: high K (10-15) with low
 alpha (0.1), where the ratio ~0.091 drives ``pi_k`` below ~7e-4 by k=3 and
-~4e-10 by k=10. The open question this guards: can REML capacity selection
+~4e-10 by k=10. The open question this guards: can penalized-LAML capacity selection
 still find the true K when the prior saturates and threatens to mask atoms
 that carry real signal?
 
 We reuse the ``_circle_data`` / evidence-extraction pattern from
 ``test_sae_manifold_capacity.py`` (multi-harmonic generalization for
-K_true=5) and assert REML evidence still resolves the true K rather than
+K_true=5) and assert the fitted criterion still resolves the true K rather than
 collapsing to K=1 under prior saturation.
 """
 from __future__ import annotations
@@ -64,22 +64,11 @@ def _multi_harmonic_data(
     return z
 
 
-def _evidence(fit) -> float:
-    """REML evidence (larger is better); same extraction order as
-    ``test_sae_manifold_capacity._evidence``."""
-    if hasattr(fit, "atoms") and fit.atoms:
-        atom = fit.atoms[0]
-        if hasattr(atom, "evidence"):
-            return float(atom.evidence)
-    for attr in ("reml_score", "evidence", "score"):
-        if hasattr(fit, attr):
-            value = getattr(fit, attr)
-            if isinstance(value, (int, float)):
-                return float(value)
-    raise AssertionError(
-        "SAE-manifold fit result exposes no REML evidence attribute "
-        "(checked atoms[0].evidence, reml_score, evidence, score)."
-    )
+def _criterion(fit) -> float:
+    """Certified penalized-LAML criterion (lower is better)."""
+    value = float(fit.penalized_laml_criterion)
+    assert np.isfinite(value)
+    return value
 
 
 def _select_k(z: np.ndarray, candidates: list[int], alpha: float) -> tuple[int, dict[int, float]]:
@@ -96,23 +85,23 @@ def _select_k(z: np.ndarray, candidates: list[int], alpha: float) -> tuple[int, 
             learning_rate=0.04,
             random_state=0,
         )
-        scores[k] = _evidence(fit)
-    best_k = max(scores, key=scores.get)
+        scores[k] = _criterion(fit)
+    best_k = min(scores, key=scores.get)
     return best_k, scores
 
 
-def test_reml_resolves_true_k_under_prior_saturation():
+def test_penalized_laml_resolves_true_k_under_prior_saturation():
     """K_true=5 multi-harmonic data, fit over candidates up to K=15 at the
-    saturating alpha=0.1. REML evidence must select K near 5, not collapse
-    to K=1 because the stick-breaking prior masks higher atoms."""
+    saturating alpha=0.1. Penalized LAML must select K near 5, not collapse
+    to K=1 because the ordered prior masks higher atoms."""
     z = _multi_harmonic_data(n=600, p=64, k_true=5, noise=0.04, seed=0)
     candidates = [1, 3, 5, 8, 15]
     best_k, scores = _select_k(z, candidates, alpha=0.1)
     assert 4 <= best_k <= 6, (
-        f"under prior saturation (alpha=0.1, K up to 15) REML failed to "
+        f"under prior saturation (alpha=0.1, K up to 15) penalized LAML failed to "
         f"resolve K_true=5; winner K={best_k}, scores="
         f"{ {k: round(v, 6) for k, v in scores.items()} }. A winner of K=1 "
-        f"would indicate the stick-breaking prior collapse is masking atoms "
+        f"would indicate the ordered prior collapse is masking atoms "
         f"that carry legitimate signal."
     )
 
@@ -136,23 +125,23 @@ def test_ibp_assignments_decay_not_truncate_under_saturation():
     )
     A = np.asarray(fit.assignments)
     assert np.all(np.isfinite(A)), (
-        "IBP-MAP assignments under saturation contain non-finite entries"
+        "ordered-Beta assignments under saturation contain non-finite entries"
     )
     # Per-atom total mass: geometric decay, but no atom column is exactly
     # zero everywhere (that would be a hard truncation, not a soft prior).
     col_mass = A.sum(axis=0)
-    assert np.all(col_mass >= 0.0), "negative IBP assignment mass observed"
+    assert np.all(col_mass >= 0.0), "negative ordered-Beta assignment mass observed"
     assert np.all(np.isfinite(col_mass))
 
 
 def test_reml_keeps_k1_winner_under_saturation():
     """Control: with K_true=1 data, fitting up to K=10 at alpha=0.1 must
-    still leave K=1 the REML winner. Saturation must not break the easy
+    still leave K=1 the penalized-LAML winner. Saturation must not break the easy
     case it makes 'easier' (the prior already favours small K)."""
     z = _circle_data(n=400, p=64, noise=0.04, seed=0)
     candidates = [1, 2, 5, 10]
     best_k, scores = _select_k(z, candidates, alpha=0.1)
     assert best_k == 1, (
-        f"with K_true=1 data and alpha=0.1, REML winner should be K=1; got "
+        f"with K_true=1 data and alpha=0.1, penalized-LAML winner should be K=1; got "
         f"K={best_k}, scores={ {k: round(v, 6) for k, v in scores.items()} }."
     )
