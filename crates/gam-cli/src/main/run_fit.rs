@@ -154,6 +154,7 @@ pub(crate) fn resolve_fit_invocation(
     }
 }
 
+#[cfg(test)]
 pub fn fit_config_from_fit_args(args: &FitArgs) -> Result<FitConfig, String> {
     resolve_fit_invocation(args).map(|resolved| resolved.fit_config)
 }

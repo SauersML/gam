@@ -40,6 +40,7 @@ pub(crate) fn family_arg_canonical_name(arg: FamilyArg) -> Option<&'static str> 
 /// `src/solver/estimate.rs`), which overrides the family-embedded link. Keeping
 /// the resolver link-state-free leaves a single, narrow family-routing contract
 /// shared verbatim with the workflow and PyFFI surfaces.
+#[cfg(test)]
 pub(crate) fn resolve_family(
     arg: FamilyArg,
     negative_binomial_theta: Option<f64>,
