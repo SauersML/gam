@@ -2993,7 +2993,7 @@ impl SaeManifoldOuterObjective {
         // marginal fixed point: that root omits criterion terms and therefore
         // does not share this objective's stationarity equation.
         if let Some(sparse_index) = rho.sparse_flat_index() {
-            debug_assert_eq!(
+            assert_eq!(
                 assignment_strength_gradient_coordinate(&rho),
                 Some(sparse_index)
             );

@@ -15,7 +15,6 @@ struct HardRankChargeAtomDifferential {
 impl SaeManifoldTerm {
     fn rank_charge_assignment_derivative(
         &self,
-        _row: usize,
         wrt_atom: usize,
         atom: usize,
         assignments: &[f64],
@@ -180,7 +179,6 @@ impl SaeManifoldTerm {
                         let mut derivative = 0.0_f64;
                         for atom in 0..self.k_atoms() {
                             let da = self.rank_charge_assignment_derivative(
-                                row,
                                 wrt_atom,
                                 atom,
                                 assignments
