@@ -895,9 +895,12 @@ pub struct SaeSteerRequest {
     pub coords: Vec<Array2<f64>>,
     /// The model's TRAINED per-row routing logits, `(n_obs, k_atoms)`.
     pub logits: Array2<f64>,
-    /// Assignment family (`TopK` is refused — steering a top-k fit needs its
-    /// saved support size, which this request does not carry).
+    /// Assignment family.
     pub assignment: SaeOosAssignmentKind,
+    /// Saved active-set support. Required for `TopK`; for capped softmax it
+    /// restores the fitted assignment contract rather than guessing from the
+    /// current logits.
+    pub top_k: Option<usize>,
     /// IBP-MAP concentration α (ignored outside `ibp_map`).
     pub alpha: f64,
     /// Softmax / gate temperature.
@@ -927,6 +930,7 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
         coords,
         logits,
         assignment,
+        top_k,
         alpha,
         tau,
         fisher_metric,
@@ -973,6 +977,13 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
             logits.dim()
         ));
     }
+    if let Some(support) = top_k {
+        if support == 0 || support > k_atoms {
+            return Err(format!(
+                "run_sae_manifold_steer: top_k must be in 1..={k_atoms}; got {support}"
+            ));
+        }
+    }
     let mode = match assignment {
         SaeOosAssignmentKind::Softmax => AssignmentMode::softmax(tau),
         SaeOosAssignmentKind::IbpMap { learnable_alpha } => {
@@ -987,13 +998,11 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
             AssignmentMode::threshold_gate(tau, threshold)
         }
         SaeOosAssignmentKind::TopK => {
-            // The steer request carries no support-size argument; the fixed
-            // support must come from the SAVED fit's metadata, not a guess.
-            return Err(
-                "run_sae_manifold_steer: TopK assignment is not routed through the steer entry — \
-                 steering a topk fit needs its saved support size"
-                    .to_string(),
-            );
+            let support = top_k.ok_or_else(|| {
+                "run_sae_manifold_steer: TopK assignment requires the saved top_k support size"
+                    .to_string()
+            })?;
+            AssignmentMode::top_k_support(support)
         }
     };
 
@@ -1026,6 +1035,7 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
     let assignment_state =
         SaeAssignment::from_blocks_with_mode_and_manifolds(logits, coord_blocks, manifolds, mode)?;
     let mut term = SaeManifoldTerm::new(atoms, assignment_state)?;
+    term.set_softmax_active_cap(top_k);
     if let Some(metric) = fisher_metric {
         term.set_row_metric(metric)?;
     }
@@ -1113,6 +1123,36 @@ mod tests {
             error.contains("trained log_ard must contain 1 atom blocks"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn typed_steer_entry_restores_saved_topk_support() {
+        let request = periodic_request();
+        let coords = request
+            .initial_coords
+            .expect("periodic fixture has coordinates")
+            .index_axis(ndarray::Axis(0), 0)
+            .to_owned();
+        let plan = run_sae_manifold_steer(SaeSteerRequest {
+            atoms: request.atoms,
+            coords: vec![coords],
+            logits: request
+                .initial_logits
+                .expect("periodic fixture has logits"),
+            assignment: SaeOosAssignmentKind::TopK,
+            top_k: Some(1),
+            alpha: 1.0,
+            tau: 0.5,
+            fisher_metric: None,
+            atom_k: 0,
+            metric_row: 0,
+            amplitude: 1.0,
+            t_from: vec![0.0],
+            t_to: vec![0.25],
+        })
+        .expect("saved TopK support must make the trained dictionary steerable");
+        assert_eq!(plan.delta.len(), 2);
+        assert!(plan.predicted_nats.is_none());
     }
 
     #[test]

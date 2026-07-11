@@ -1240,6 +1240,7 @@ struct SingleBlockExactJointDesignCache<'d> {
 }
 
 impl<'d> SingleBlockExactJointDesignCache<'d> {
+    #[cfg(test)]
     fn new(
         data: ArrayView2<'d, f64>,
         spec: TermCollectionSpec,
@@ -4306,14 +4307,6 @@ impl SingleSmoothTermRealization {
             .cloned()
             .collect()
     }
-}
-
-fn build_single_smooth_term_realization(
-    data: ArrayView2<'_, f64>,
-    termspec: &SmoothTermSpec,
-) -> Result<SingleSmoothTermRealization, BasisError> {
-    let policy = gam_runtime::resource::ResourcePolicy::default_library();
-    build_single_smooth_term_realization_with_policy(data, termspec, &policy)
 }
 
 fn build_single_smooth_term_realization_with_policy(

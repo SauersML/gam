@@ -6370,3 +6370,87 @@ pub(crate) fn covisibility_partition_recovers_groups_and_beats_scalar_jacobi() {
         scalar_diag.iterations
     );
 }
+
+/// zz_measure timing harness (#1017 CPU perf campaign): builds a realistic SAE
+/// shape (n rows, d frame depth, k border) with top-k-sparse cross blocks and
+/// times the serial `reduced_schur_and_log_det_tt` evidence loop and its
+/// sub-phases. Diagnostic only; `--ignored` so it never runs in CI.
+#[test]
+#[ignore]
+fn zz_measure_reduced_schur_log_det_phases() {
+    use std::time::Instant;
+    let n = 2000usize;
+    let d = 8usize;
+    let k = 2048usize;
+    let active = 64usize; // top-k active border columns per row
+    let mut sys = ArrowSchurSystem::new(n, d, k);
+    for (i, row) in sys.rows.iter_mut().enumerate() {
+        for r in 0..d {
+            for c in 0..d {
+                row.htt[[r, c]] = if r == c { 4.0 + (i % 3) as f64 } else { 0.1 };
+            }
+            row.gt[r] = 0.05 * ((i + r + 1) as f64).sin();
+            let base = (i * active) % (k - active);
+            for j in 0..active {
+                let c = base + j;
+                row.htbeta[[r, c]] = 0.01 * (((i + 1) * (c + 1)) as f64).cos();
+            }
+        }
+    }
+    for r in 0..k {
+        sys.gb[r] = 0.02 * ((r + 1) as f64).cos();
+        sys.hbb[[r, r]] = 6.0;
+    }
+    sys.refresh_row_hessian_fingerprint();
+
+    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    // warm
+    {
+        let mut streaming = StreamingArrowSchur::from_system(&sys, n);
+        let _ = streaming.reduced_schur_and_log_det_tt(0.0, 0.0, &options).unwrap();
+    }
+    let reps = 5;
+    let mut best = f64::INFINITY;
+    for _ in 0..reps {
+        let mut streaming = StreamingArrowSchur::from_system(&sys, n);
+        let t = Instant::now();
+        let (_ld, _schur) = streaming.reduced_schur_and_log_det_tt(0.0, 0.0, &options).unwrap();
+        best = best.min(t.elapsed().as_secs_f64());
+    }
+    eprintln!(
+        "zz_measure reduced_schur_and_log_det_tt n={n} d={d} k={k} active={active}: best={:.4}s",
+        best
+    );
+
+    // Phase breakdown on a fresh streaming system.
+    let mut streaming = StreamingArrowSchur::from_system(&sys, n);
+    streaming.reset_accumulator(0.0).unwrap();
+    let backend = CpuBatchedBlockSolver;
+    let mut t_build = 0.0;
+    let mut t_factor = 0.0;
+    let mut t_solve = 0.0;
+    let mut t_gemm = 0.0;
+    let reps2 = 3;
+    for _ in 0..reps2 {
+        for row_idx in 0..n {
+            let t = Instant::now();
+            let row = (streaming.row_builder)(row_idx).unwrap();
+            let di = row.htt.nrows();
+            let htbeta = streaming.row_htbeta(row_idx, &row, di);
+            t_build += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let factor = streaming.factor_row(&row, 0.0, di, row_idx).unwrap();
+            t_factor += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            let solved = backend.solve_block_matrix(factor.view(), htbeta.view());
+            t_solve += t.elapsed().as_secs_f64();
+            let t = Instant::now();
+            backend.block_gemm_subtract(&mut streaming.s_acc, &htbeta, &solved);
+            t_gemm += t.elapsed().as_secs_f64();
+        }
+    }
+    eprintln!(
+        "zz_measure phases (sum over {reps2} reps): build+htbeta={:.4}s factor={:.4}s solve={:.4}s gemm_subtract={:.4}s",
+        t_build, t_factor, t_solve, t_gemm
+    );
+}

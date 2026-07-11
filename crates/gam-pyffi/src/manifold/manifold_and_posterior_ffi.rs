@@ -7158,6 +7158,16 @@ impl ManifoldSaeCore {
             decoder_owned.iter().map(|a| a.view()).collect();
         let coord_views: Vec<ndarray::ArrayView2<'_, f64>> =
             coord_owned.iter().map(|a| a.view()).collect();
+        let top_k = inner
+            .top_k
+            .map(|support| {
+                usize::try_from(support).map_err(|_| {
+                    py_value_error(format!(
+                        "ManifoldSAE.steer: saved top_k must be non-negative; got {support}"
+                    ))
+                })
+            })
+            .transpose()?;
         let plan = steer_delta_with_metric_from_arrays(
             atom_k,
             metric_row,
@@ -7173,6 +7183,7 @@ impl ManifoldSaeCore {
             &coord_views,
             logits_owned.view(),
             inner.assignment.as_str(),
+            top_k,
             inner.tau,
             inner.alpha,
             inner.jumprelu_threshold,
