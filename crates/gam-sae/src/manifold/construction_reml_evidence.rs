@@ -253,10 +253,12 @@ impl SaeManifoldTerm {
                 ridge_beta,
             );
         }
-        // 1. Run the inner (t, β) Newton solve to convergence at FIXED ρ.
-        //    `run_joint_fit_arrow_schur` no longer touches ρ.
+        // 1. Run the inner (t, β) Newton solve to its numerical fixed point at
+        //    FIXED ρ. Evidence uses the idempotence polish rather than stopping
+        //    at the first coarse-KKT-band hit: the value and its implicit
+        //    derivative must describe the same differentiable root (#2253).
         let mut rho_fixed = rho.clone();
-        let mut loss = self.run_joint_fit_arrow_schur(
+        let mut loss = self.run_joint_fit_arrow_schur_for_evidence(
             target,
             &mut rho_fixed,
             registry,
@@ -673,7 +675,8 @@ impl SaeManifoldTerm {
         // Newton step in that case (the old `inner_max_iter.max(1)` floor moved
         // β off the seed), so we factor exactly once at the frozen iterate and
         // return that undamped cache without invoking the stationarity gate.
-        // The caller has already run `run_joint_fit_arrow_schur(..., 0, ...)`,
+        // The caller has already run
+        // `run_joint_fit_arrow_schur_for_evidence(..., 0, ...)`,
         // which under the `max_iter == 0` freeze (gam#577/#579, #850) runs ONLY
         // the β-neutral basis refresh and returns the loss without touching β —
         // it skips the rank-reduction, frame activation, re-seed guards, and the
@@ -1006,7 +1009,7 @@ impl SaeManifoldTerm {
                     saw_refine_progress |=
                         Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
                     previous_refine_grad_norm = Some(grad_norm);
-                    *loss = self.run_joint_fit_arrow_schur(
+                    *loss = self.run_joint_fit_arrow_schur_for_evidence(
                         target,
                         rho_fixed,
                         registry,
@@ -1104,7 +1107,7 @@ impl SaeManifoldTerm {
             saw_refine_progress |=
                 Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
             previous_refine_grad_norm = Some(grad_norm);
-            *loss = self.run_joint_fit_arrow_schur(
+            *loss = self.run_joint_fit_arrow_schur_for_evidence(
                 target,
                 rho_fixed,
                 registry,
@@ -1848,7 +1851,7 @@ impl SaeManifoldTerm {
         lane: Option<&mut SurrogateLaneState>,
     ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
         let mut rho_fixed = rho.clone();
-        let mut loss = self.run_joint_fit_arrow_schur(
+        let mut loss = self.run_joint_fit_arrow_schur_for_evidence(
             target,
             &mut rho_fixed,
             registry,

@@ -5024,6 +5024,59 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<SaeManifoldLoss, String> {
+        self.run_joint_fit_arrow_schur_with_kkt_policy(
+            target,
+            rho,
+            analytic_penalties,
+            max_iter,
+            step_size,
+            ridge_ext_coord,
+            ridge_beta,
+            true,
+        )
+    }
+
+    /// Evidence-gradient inner polish. The ordinary fit accepts the documented
+    /// coarse KKT band immediately; a Laplace value paired with an implicit
+    /// derivative cannot do that, because the resulting warm-start map is flat
+    /// inside the band while the analytic adjoint differentiates the exact root.
+    /// Keep the same KKT tolerance as an admission certificate, but bypass its
+    /// loop-top early exit and let the existing Armijo / directional-decrease /
+    /// objective-stall terminators drive the state to an idempotent numerical
+    /// fixed point before the undamped evidence cache is formed (#2253).
+    pub(crate) fn run_joint_fit_arrow_schur_for_evidence(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &mut SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        max_iter: usize,
+        step_size: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+    ) -> Result<SaeManifoldLoss, String> {
+        self.run_joint_fit_arrow_schur_with_kkt_policy(
+            target,
+            rho,
+            analytic_penalties,
+            max_iter,
+            step_size,
+            ridge_ext_coord,
+            ridge_beta,
+            false,
+        )
+    }
+
+    fn run_joint_fit_arrow_schur_with_kkt_policy(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &mut SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        max_iter: usize,
+        step_size: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+        allow_coarse_kkt_termination: bool,
+    ) -> Result<SaeManifoldLoss, String> {
         if !(step_size.is_finite() && step_size > 0.0) {
             return Err(format!(
                 "SaeManifoldTerm::run_joint_fit_arrow_schur: step_size must be finite and positive; got {step_size}"
@@ -5500,7 +5553,9 @@ impl SaeManifoldTerm {
             // quotient. A tiny quotient Newton step is a globalization diagnostic,
             // not a KKT certificate: on K=1 near-isotropic clouds it can be tiny
             // along the chart gauge while the outer residual remains large.
-            if grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance {
+            if allow_coarse_kkt_termination
+                && (grad_norm <= grad_tolerance || quotient_grad_norm <= grad_tolerance)
+            {
                 self.reclaim_arrow_assembly_workspace(&mut sys);
                 break;
             }
