@@ -77,9 +77,8 @@
 
 use ndarray::{Array1, ArrayView2};
 
-use crate::estimate::reml::continuation::{
-    ContinuationFailure, ContinuationState, continue_path_from, fit_with_continuation,
-};
+use crate::estimate::reml::continuation::{ContinuationState, eval_step};
+use crate::inner_status::InnerFailure;
 use crate::rho_optimizer::{OuterEvalOrder, OuterObjective};
 
 /// The endpoints of one coupled annealing leg, in path-parameter terms.
@@ -235,8 +234,6 @@ pub struct CoupledSchedules {
     pub rho_entry: Array1<f64>,
     /// ρ\* — the real-objective smoothing vector at `s = 0`.
     pub rho_target: Array1<f64>,
-    /// Legal upper bound on ρ (the spine clamps ρ₀ into this box).
-    pub rho_bounds_upper: Array1<f64>,
     /// Typed scalar entry/target state supplied by the objective itself.
     pub scalars: ContinuationScalarContract,
 }
@@ -509,11 +506,10 @@ pub(crate) enum ContinuationStep {
 /// accepted waypoint remains installed and no progress is fabricated.
 #[derive(Debug, Clone)]
 pub(crate) enum RefinementReason {
-    /// The ρ-anneal spine could not complete the descent to this waypoint's ρ
-    /// target from the current regime. The underlying `ContinuationFailure` is
-    /// kept for logging; the path's response is to retry from the last accepted
+    /// The exact coupled waypoint evaluation did not converge. The underlying
+    /// failure is kept for logging; the path retries from the last accepted
     /// state with a smaller attempted distance.
-    SpineStruggled(ContinuationFailure),
+    WaypointStruggled(InnerFailure),
     /// The active-mass floor was breached at this waypoint; a scaffold re-seed
     /// was recorded and the next attempted distance is refined.
     MassFloorBreached(MassFloorBreach),
@@ -602,12 +598,14 @@ impl ContinuationPath {
             bounds_upper.len(),
             "ContinuationPath::heavy_entry_for_rho: ρ target/bounds dim mismatch"
         );
-        // Passing `rho_target` as both entry and target lets the spine own the
-        // entire oversmoothing offset (it builds ρ₀ = ρ* + OVERSMOOTH_OFFSET_INIT
-        // internally and anneals down), while the path simply rides at `s` along
-        // ρ*. This keeps a single source of truth for the ρ anneal — the spine —
-        // and the path couples the τ / isometry legs against that shared walk.
-        let schedules = couple_schedules(rho_target.clone(), rho_target, bounds_upper, scalars);
+        // The legal upper box is the literal heavy-penalty endpoint. This uses
+        // objective-owned geometry rather than a private log-offset heuristic,
+        // and makes rho move under the same `s` as temperature and isometry.
+        let schedules = couple_schedules(
+            bounds_upper.clone(),
+            rho_target,
+            scalars,
+        );
         Self::enter(schedules)
     }
 
@@ -762,47 +760,54 @@ impl ContinuationPath {
             (self.s - self.s_step).max(0.0)
         };
 
-        // Install the objective-owned scalar state before the rho spine. This
+        // Install the objective-owned scalar state before evaluating rho. This
         // is the actual coupling seam: mutating private schedule copies would
         // leave the evaluated objective unchanged.
         let scalar_state = self.schedules.scalar_targets_at(s_next);
         obj.install_reactive_domain_scalar_state(&scalar_state)?;
         self.logit_tr = LogitTrustRegion::for_tau(scalar_state.assignment_temperature);
 
-        // The ρ leg rides the spine: anneal from the spine's own oversmoothed
-        // ρ₀ down to this waypoint's ρ target. At s = 1 the waypoint ρ target
-        // is ρ₀ itself, so the spine's oversmoothing stacks into the deepest
-        // contraction; at s = 0 it is ρ*.
-        let rho_target = self.schedules.rho_target_at(s_next);
-        // First leg (no converged waypoint yet): the full oversmoothed spine —
-        // the documented deepest-contraction entry. Every later waypoint is a
-        // WARM leg from the previous waypoint's converged state. The coupled
-        // path's waypoints ARE the anneal; re-running the whole ρ₀→target
-        // spine per waypoint multiplies the walk's cost by the spine budget
-        // (the K=2 existence fixture burned 7 CPU-hours exactly that way).
-        let spine = match self.warm.clone() {
-            Some(start) => {
-                // The coupled path is still a continuation pre-warm: its only
-                // payload is the converged inner coefficient state carried by
-                // `inner_beta_hint`.  Requesting an outer gradient here repeats
-                // the expensive REML/LAML derivative assembly at every waypoint
-                // even though no line search or stationarity test consumes it;
-                // the real outer optimizer asks for the gradient once after the
-                // path arrives.  `Value` preserves the same inner solve and warm
-                // beta propagation while removing that redundant derivative work.
-                continue_path_from(obj, start, &rho_target, OuterEvalOrder::Value)
-            }
-            None => fit_with_continuation(
-                obj,
-                &rho_target,
-                &self.schedules.rho_bounds_upper,
-                initial_beta,
-                OuterEvalOrder::Value,
+        // One path attempt is exactly one objective evaluation at the shared
+        // `(rho(s), scalar(s))` waypoint. There is no nested rho scheduler: its
+        // step floors, retry counts, and private clock would decouple rho from
+        // the scalar legs. The last accepted beta is the only warm payload.
+        let rho_waypoint = self.schedules.rho_target_at(s_next);
+        let (beta_seed, accepted_steps) = match self.warm.as_ref() {
+            Some(start) => (
+                start
+                    .last_eval
+                    .inner_beta_hint
+                    .clone()
+                    .unwrap_or_else(|| start.last_beta.clone()),
+                start.steps_accepted,
             ),
+            None => (initial_beta.clone(), 0),
         };
+        let evaluation = eval_step(
+            obj,
+            &rho_waypoint,
+            &beta_seed,
+            OuterEvalOrder::Value,
+        )
+        .and_then(|eval| {
+            if eval.cost.is_finite() {
+                Ok(eval)
+            } else {
+                Err(InnerFailure::LikelihoodFailure(format!(
+                    "reactive coupled waypoint at s={s_next:.17e} returned non-finite evidence {}",
+                    eval.cost
+                )))
+            }
+        });
 
-        Ok(match spine {
-            Ok(state) => {
+        Ok(match evaluation {
+            Ok(eval) => {
+                let state = ContinuationState {
+                    last_rho: rho_waypoint,
+                    last_eval: eval,
+                    last_beta: beta_seed,
+                    steps_accepted: accepted_steps + 1,
+                };
                 self.warm = Some(state.clone());
                 self.s = s_next;
                 // Successful progress permits a naturally larger next step,
@@ -844,7 +849,7 @@ impl ContinuationPath {
                 }
                 ContinuationStep::Refined {
                     s: self.s,
-                    reason: RefinementReason::SpineStruggled(failure),
+                    reason: RefinementReason::WaypointStruggled(failure),
                 }
             }
         })
@@ -854,21 +859,18 @@ impl ContinuationPath {
 /// Build a coupled path from the rho box and the typed scalar contract supplied
 /// by the objective.
 ///
-/// `rho_target` is ρ\* (the real objective); `rho_entry` is the oversmoothed
-/// entry ρ₀ (caller supplies, or the spine derives its own offset on top —
-/// passing `rho_target` here lets the spine own the entire oversmoothing and
-/// the path simply rides at `s` along ρ\*). `rho_bounds_upper` is the legal box.
+/// `rho_target` is ρ\* (the real objective); `rho_entry` is the objective's
+/// legal upper-box endpoint. Each is evaluated at the same `s` as the scalar
+/// contract.
 #[must_use]
 pub fn couple_schedules(
     rho_entry: Array1<f64>,
     rho_target: Array1<f64>,
-    rho_bounds_upper: Array1<f64>,
     scalars: ContinuationScalarContract,
 ) -> CoupledSchedules {
     CoupledSchedules {
         rho_entry,
         rho_target,
-        rho_bounds_upper,
         scalars,
     }
 }
@@ -910,7 +912,6 @@ mod tests {
         couple_schedules(
             Array1::from_vec(vec![5.0, 5.0]),
             Array1::from_vec(vec![0.0, 0.0]),
-            Array1::from_vec(vec![10.0, 10.0]),
             scalar_contract(),
         )
     }

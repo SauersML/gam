@@ -570,13 +570,24 @@ fn wide_p_outer_reml_terminates_within_probe_budget_2080() {
     eprintln!(
         "[#2080] wide-p outer fit: ev={ev:.4}, criterion_calls={}, \
          infeasible(non_pd_per_row={},cross_row={},schur={},inner_nc={}), \
-         infeasible_criterion_evals={}",
+         infeasible_criterion_evals={}, reactive_scalar_installs={}, \
+         reactive_target_restores={}",
         telemetry.criterion_calls,
         telemetry.infeasible_non_pd_per_row,
         telemetry.infeasible_cross_row,
         telemetry.infeasible_schur,
         telemetry.infeasible_inner_not_converged,
         telemetry.infeasible_criterion_evals,
+        telemetry.reactive_scalar_installs,
+        telemetry.reactive_target_restores,
+    );
+    assert!(
+        telemetry.reactive_scalar_installs > 0,
+        "the initially undefined wide-K=2 seed must traverse genuine objective-installed scalar waypoints"
+    );
+    assert!(
+        telemetry.reactive_target_restores > 0,
+        "the wide-K=2 continuation must restore the objective's literal scalar target before certification"
     );
     // Bounded criterion (eval / eval_cost / efs) budget — a PROBE COUNT, not a
     // wall-clock limit (SPEC bans time budgets). With `with_max_iter(4)` and a

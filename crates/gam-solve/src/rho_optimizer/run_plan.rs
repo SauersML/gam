@@ -710,10 +710,10 @@ pub(crate) fn run_outer_with_plan(
                             // next attempted distance is refined. Consume the
                             // reason for diagnostics, then continue.
                             match reason {
-                                RefinementReason::SpineStruggled(failure) => {
+                                RefinementReason::WaypointStruggled(failure) => {
                                     log::info!(
-                                        "[OUTER] {context}: continuation seed {seed_idx} spine \
-                                         struggled below s={s:.4} ({}); refining from regime {:?}",
+                                        "[OUTER] {context}: continuation seed {seed_idx} coupled \
+                                         waypoint struggled below s={s:.4} ({}); refining from regime {:?}",
                                         failure.message(),
                                         path.current_regime(),
                                     );

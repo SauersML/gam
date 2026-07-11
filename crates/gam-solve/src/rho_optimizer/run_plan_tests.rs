@@ -3456,10 +3456,7 @@ impl OuterObjective for ReactiveDomainObjective {
 
     fn reactive_domain_scalar_contract(
         &self,
-    ) -> Result<
-        Option<crate::continuation_path::ContinuationScalarContract>,
-        EstimationError,
-    > {
+    ) -> Result<Option<crate::continuation_path::ContinuationScalarContract>, EstimationError> {
         Ok(Some(Self::scalar_contract()))
     }
 
