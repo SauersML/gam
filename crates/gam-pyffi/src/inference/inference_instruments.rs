@@ -1164,6 +1164,39 @@ mod tests {
     }
 
     #[test]
+    fn ring_of_clusters_owns_discrete_cyclic_verdict_2262() {
+        let clusters = 7usize;
+        let per_cluster = 40usize;
+        let mut coords = Array2::<f64>::zeros((clusters * per_cluster, 2));
+        for cluster in 0..clusters {
+            let angle = std::f64::consts::TAU * cluster as f64 / clusters as f64;
+            let (sin_angle, cos_angle) = angle.sin_cos();
+            for sample in 0..per_cluster {
+                let phase = std::f64::consts::TAU * sample as f64 / per_cluster as f64;
+                let radial_noise = 0.04 * phase.cos();
+                let tangent_noise = 0.04 * phase.sin();
+                let radius = 2.0 + radial_noise;
+                let row = cluster * per_cluster + sample;
+                coords[[row, 0]] = 0.5 + radius * cos_angle - tangent_noise * sin_angle;
+                coords[[row, 1]] = -0.25 + radius * sin_angle + tangent_noise * cos_angle;
+            }
+        }
+        let verdict = run_atom_shape_race(coords.view(), 5, 2262, &[5, 7, 9]).unwrap();
+        assert_eq!(verdict.ring_clusters_k, 7);
+        assert!(
+            verdict.winner.starts_with("ring_clusters_k7"),
+            "winner={} names={:?} weights={:?} evidence={:?}",
+            verdict.winner,
+            verdict.candidate_names,
+            verdict.stacking_weights,
+            verdict.negative_log_evidence,
+        );
+        assert!(verdict.circle_wins);
+        assert!(verdict.circle_margin > 0.0);
+        assert_eq!(verdict.candidate_names.len(), 4);
+    }
+
+    #[test]
     fn debiased_functional_seam_returns_finite_estimate_and_se_on_a_fit() {
         // A genuine penalized least-squares fit (the same regime the engine's
         // own oracle test uses), driven through the #1055 pyffi seam helper
@@ -1496,7 +1529,7 @@ struct AtomShapeRaceVerdict {
     negative_log_evidence: Vec<f64>,
     mixture_k: usize,
     ring_clusters_k: usize,
-    circle_margin: f64,
+    circular_margin: f64,
     circle_wins: bool,
     is_cross_class: bool,
     headline: &'static str,
@@ -1574,13 +1607,17 @@ fn run_atom_shape_race(
         .map(|stacking| stacking.weights.to_vec())
         .unwrap_or_default();
     let winner = verdict.candidate_names[verdict.winner_index].clone();
-    let circle_margin = if stacking_weights.len() == candidate_count {
-        stacking_weights[0]
-            - stacking_weights
-                .iter()
-                .copied()
-                .skip(1)
-                .fold(f64::NEG_INFINITY, f64::max)
+    let circular_margin = if stacking_weights.len() == candidate_count {
+        let (mut circular_best, mut noncircular_best) =
+            (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for (name, &weight) in verdict.candidate_names.iter().zip(&stacking_weights) {
+            if name.starts_with("circle") || name.starts_with("ring_clusters") {
+                circular_best = circular_best.max(weight);
+            } else {
+                noncircular_best = noncircular_best.max(weight);
+            }
+        }
+        circular_best - noncircular_best
     } else {
         f64::NAN
     };
@@ -1592,7 +1629,7 @@ fn run_atom_shape_race(
         negative_log_evidence: verdict.negative_log_evidence,
         mixture_k,
         ring_clusters_k,
-        circle_margin,
+        circular_margin,
         is_cross_class: verdict.is_cross_class,
         headline: match verdict.headline {
             Headline::Stacking => "stacking",
@@ -1612,7 +1649,7 @@ fn atom_shape_verdict_dict<'py>(
     out.set_item("negative_log_evidence", &verdict.negative_log_evidence)?;
     out.set_item("mixture_k", verdict.mixture_k)?;
     out.set_item("ring_clusters_k", verdict.ring_clusters_k)?;
-    out.set_item("circle_margin", verdict.circle_margin)?;
+    out.set_item("circular_margin", verdict.circular_margin)?;
     out.set_item("circle_wins", verdict.circle_wins)?;
     out.set_item("is_cross_class", verdict.is_cross_class)?;
     out.set_item("headline", verdict.headline)?;
@@ -1625,8 +1662,8 @@ fn atom_shape_verdict_dict<'py>(
 /// predictive stacking — the EXACT `fit_mixture_rung` + `adjudicate_cross_class_
 /// race` machinery the in-tree gates and the production fit drive. Returns a dict
 /// with the winner name, per-candidate stacking weights, rank-aware evidences,
-/// the selected mixture order, and the circle's stacking margin over the best
-/// non-circle contender.
+/// the selected mixture orders, and the best circular candidate's stacking
+/// margin over the best non-circular contender.
 ///
 /// `coords` is the `(n, 2)` intrinsic-coordinate matrix (e.g. `fit.coords[0]`
 /// from `sae_manifold_fit`). `folds`/`seed` control the deterministic CV folding

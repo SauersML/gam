@@ -329,7 +329,7 @@ def run_battery(data: Path, out_path: Path, seed: int, n_iter: int) -> dict:
         results["adjudication"].append(entry)
         v = entry.get("shape_verdict", {})
         print(f"  adjudication {layer_name}: shape={v.get('winner', '?')} "
-              f"margin={v.get('circle_margin', float('nan'))}")
+              f"margin={v.get('circular_margin', float('nan'))}")
 
     # --- experiment 5: hillclimb over (tau, n_harmonics, intrinsic_rank) ----
     z = layers["L25_selfqualia"]

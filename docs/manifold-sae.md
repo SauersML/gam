@@ -470,17 +470,22 @@ fit payload / diagnostics mapping (for batch or offline analysis).
 
 `gamfit.adjudicate_atom_shape(coords, ...)` adjudicates the representational
 shape of a 2-D point set without forcing a topology: it races a smooth **S¹
-ring**, a **Euclidean Gaussian**, and the best **k-cluster Gaussian mixture**
-rung on held-out predictive density (deterministic cross-fitted stacking, the
-same `fit_mixture_rung` / `adjudicate_cross_class_race` machinery the
-production fit drives). The winner is whichever class predicts held-out points
-best. It is a top-level export, used throughout `tests/sae/`, and pairs
-naturally with `fit.coords[k]` from [`sae_manifold_fit`](#the-manifoldsae-result).
+ring**, a **Euclidean Gaussian**, the best free **k-cluster Gaussian mixture**,
+and a constrained **ring of clusters** whose component centers share one fitted
+circle. The last class is the generative model for discrete cyclic concepts:
+it explains clumpy density without throwing away cyclic order. All four race on
+held-out predictive density (deterministic cross-fitted stacking), while the
+two mixture rungs carry certified, rank-aware Laplace evidence. The winner is
+whichever class predicts held-out points best. It is a top-level export, used
+throughout `tests/sae/`, and pairs naturally with `fit.coords[k]` from
+[`sae_manifold_fit`](#the-manifoldsae-result).
 
 ```python
 import gamfit
 
-verdict = gamfit.adjudicate_atom_shape(coords, folds=5, seed=11)
+verdict = gamfit.adjudicate_atom_shape(
+    coords, folds=5, seed=11, mean_l0=dictionary_mean_l0
+)
 # coords: contiguous float64 (n, 2), n >= 4 (a few dozen points recommended);
 # k_ladder=[2, 3, ...] optionally overrides the mixture orders raced.
 ```
@@ -489,32 +494,34 @@ Returns a dict:
 
 | Key | Meaning |
 | --- | --- |
-| `winner` | `"circle"`, `"euclidean"`, or `"mixture_k{k}"` |
-| `circle_wins` | bool, the winner is the circle |
-| `circle_margin` | stacking-weight margin of circle over the best rival (`NaN` if weights are unavailable) |
+| `winner` | `"circle"`, `"euclidean"`, `"mixture_k{k}"`, or `"ring_clusters_k{k}"` |
+| `circle_wins` | bool, the winner is either circular density class |
+| `circle_margin` | best circular stacking weight minus the best non-circular weight (`NaN` if weights are unavailable) |
 | `mixture_k` | the mixture order selected inside the mixture rung |
+| `ring_clusters_k` | the order selected inside the constrained ring-of-clusters rung |
 | `candidate_names` / `stacking_weights` | per-candidate names and held-out stacking weights |
 | `negative_log_evidence` | per-candidate rank-aware negative log evidence |
 | `headline` | `"stacking"` or `"evidence"` — which criterion produced the verdict |
 | `is_cross_class` | bool, the race crossed shape classes |
 
-The mixture rung's EM can refuse to certify convergence (a `GamError`); callers
-adjudicating many groups should catch and skip, as
-`tests/sae/qwen_real_sae_pipeline.py` does.
+Either mixture EM can refuse to certify convergence (a `GamError`). That is a
+typed missing adjudication, not a negative topology verdict; record it as such
+and diagnose the failed candidate rather than converting it into a winner for
+another class.
 
 ### Usage caveats on real LLM activations
 
 These were measured on real residual-stream activations (Qwen3-8B and
 OLMo-2 weekday/month token sets, plus injected synthetic controls):
 
-1. **Clusters-on-a-circle read as `mixture`, not `circle`.** Discrete concept
-   tokens arranged on a ring (weekday/month circles) typically adjudicate as a
-   cluster mixture even when the ring is real and causally validated — the
-   mixture explains clustered mass better pointwise (measured margins of
-   `-0.36` to `-0.95` on confirmed circles). A `mixture_k` verdict on a
-   discrete concept must not be read as "no manifold": pair the adjudicator
-   with a centroid-ordering test (are the mixture's own centroids arranged on
-   a circle, against a permutation null?).
+1. **Discrete cyclic concepts have their own density class.** Older shape races
+   called confirmed weekday/month circles `mixture_k` because a uniform ring
+   could not explain their clustered angular mass. `ring_clusters_k{k}` now
+   fits the shared center/radius and component angles directly, with `2k+3`
+   parameters instead of the free 2-D mixture's `6k-1`. A remaining
+   `mixture_k` win therefore means the unconstrained centers predict held-out
+   points better; it is no longer silently standing in for an untested cyclic
+   arrangement.
 2. **Sparse non-negative codes carry a false-circle floor.** Structureless
    controls (per-dimension-shuffled activations, covariance-matched Gaussians)
    pushed through a sparse-SAE + per-group 2-D PCA pipeline still produce

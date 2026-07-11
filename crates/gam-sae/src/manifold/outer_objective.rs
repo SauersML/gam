@@ -3483,15 +3483,24 @@ fn reactive_smooth_curvature_scale(
     Ok((generalized_trace > 0.0).then_some(generalized_trace))
 }
 
-/// Exact observed Gauss--Newton scale of one latent coordinate at the diffuse
-/// scalar entry. Native ARD curvature has unit coefficient before multiplying
-/// by `alpha`, so this is the data-curvature-matching precision for that axis.
+/// Exact observed Gauss--Newton scale of one Euclidean latent coordinate at the
+/// diffuse scalar entry. Native Gaussian ARD curvature has unit coefficient
+/// before multiplying by `alpha`, so this is the data-curvature-matching
+/// precision for that axis.
+///
+/// A periodic axis deliberately returns `None`: its exact von-Mises Hessian is
+/// `alpha * cos(kappa * t)` and therefore changes sign around the chart. Raising
+/// `alpha` cannot convexify a full circle; it instead makes the half-chart around
+/// the antipode *more* indefinite and contracts a genuine loop toward the
+/// arbitrary phase origin. Periodic ARD consequently has no legal heavy-entry
+/// value above its literal target. Keeping that coordinate fixed is still a
+/// lockstep scalar path (its entry and target endpoints are identical).
 fn reactive_ard_curvature_scale(
     term: &SaeManifoldTerm,
     assignments: &Array2<f64>,
     atom_idx: usize,
     axis: usize,
-) -> Result<f64, String> {
+) -> Result<Option<f64>, String> {
     let atom = &term.atoms[atom_idx];
     let p = atom.decoder_coefficients.ncols();
     let m = atom.decoder_coefficients.nrows();
@@ -3501,6 +3510,10 @@ fn reactive_ard_curvature_scale(
             atom.basis_jacobian.dim(),
             atom.decoder_coefficients.dim()
         ));
+    }
+    let periods = term.assignment.coords[atom_idx].effective_axis_periods();
+    if periods.get(axis).copied().flatten().is_some() {
+        return Ok(None);
     }
     let whitens = term
         .row_metric
@@ -3537,7 +3550,7 @@ fn reactive_ard_curvature_scale(
         }
         maximum = maximum.max(curvature);
     }
-    Ok(maximum)
+    Ok(Some(maximum))
 }
 
 /// Objective-owned legal rho upper face for dense reactive SAE fits.
@@ -3546,9 +3559,11 @@ fn reactive_ard_curvature_scale(
 /// is outside the SAE objective's structural domain: it drives the dictionary
 /// below the exact signal-free null floor before continuation can start. This
 /// contract instead uses the objective's literal entry assignments and native
-/// penalty geometry. Decoder smoothness is bounded by `tr(P⁺G)`; each ARD axis
-/// is bounded by its observed latent Gauss--Newton curvature. Every bound is at
-/// least the literal target strength. No criterion probe or fitted-state trial
+/// penalty geometry. Decoder smoothness is bounded by `tr(P⁺G)`; Euclidean
+/// ARD is bounded by its observed latent Gauss--Newton curvature. Periodic ARD
+/// stays at its literal target because the von-Mises Hessian changes sign and
+/// therefore cannot define a convexifying heavy-entry direction. Every bound is
+/// at least the literal target strength. No criterion probe or fitted-state trial
 /// participates in constructing the box.
 fn reactive_rho_domain_upper(
     term: &SaeManifoldTerm,
@@ -3576,12 +3591,14 @@ fn reactive_rho_domain_upper(
             upper[index] = target_strength.max(scale).ln();
         }
         for axis in 0..rho.log_ard[atom_idx].len() {
-            let scale =
-                reactive_ard_curvature_scale(&entry_term, &assignments, atom_idx, axis)?;
-            largest_native_scale = largest_native_scale.max(scale);
-            let index = rho.ard_flat_index(atom_idx, axis);
-            let target_strength = SaeManifoldRho::stable_exp_strength(target[index]);
-            upper[index] = upper[index].max(target_strength.max(scale).ln());
+            if let Some(scale) =
+                reactive_ard_curvature_scale(&entry_term, &assignments, atom_idx, axis)?
+            {
+                largest_native_scale = largest_native_scale.max(scale);
+                let index = rho.ard_flat_index(atom_idx, axis);
+                let target_strength = SaeManifoldRho::stable_exp_strength(target[index]);
+                upper[index] = upper[index].max(target_strength.max(scale).ln());
+            }
         }
     }
 

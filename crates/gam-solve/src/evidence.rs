@@ -4641,6 +4641,66 @@ mod tests {
     use super::*;
     use crate::arrow_schur::ArrowFactorSlab;
 
+    fn discrete_ring_fixture(k: usize, side: usize) -> Array2<f64> {
+        let per_cluster = side * side;
+        let mut data = Array2::<f64>::zeros((k * per_cluster, 2));
+        for component in 0..k {
+            let angle = std::f64::consts::TAU * component as f64 / k as f64;
+            let center = [1.25 + 3.0 * angle.cos(), -0.75 + 3.0 * angle.sin()];
+            for local_row in 0..per_cluster {
+                let row = component * per_cluster + local_row;
+                let grid_x = local_row % side;
+                let grid_y = local_row / side;
+                let dx = (grid_x as f64 - (side as f64 - 1.0) / 2.0) / side as f64;
+                let dy = (grid_y as f64 - (side as f64 - 1.0) / 2.0) / side as f64;
+                data[[row, 0]] = center[0] + 0.08 * dx;
+                data[[row, 1]] = center[1] + 0.08 * dy;
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn ring_of_clusters_certifies_shared_circle_and_lower_dimension_2262() {
+        let data = discrete_ring_fixture(7, 6);
+        let config = GaussianMixtureConfig::default();
+        let constrained = fit_ring_gaussian_mixture(data.view(), 7, config)
+            .expect("constrained ring mixture must certify");
+        let unconstrained = fit_gaussian_mixture(data.view(), 7, config)
+            .expect("free mixture must certify");
+
+        assert_eq!(constrained.num_free_parameters(), 17);
+        assert_eq!(unconstrained.num_free_parameters(), 41);
+        assert!((constrained.center()[0] - 1.25).abs() < 0.02);
+        assert!((constrained.center()[1] + 0.75).abs() < 0.02);
+        assert!((constrained.radius() - 3.0).abs() < 0.02);
+        let certificate = constrained.certificate();
+        assert!(certificate.objective_residual <= certificate.objective_tolerance);
+        assert!(certificate.parameter_residual <= certificate.parameter_tolerance);
+
+        let constrained_evidence = constrained
+            .laplace_negative_log_evidence(data.view())
+            .expect("constrained evidence must be finite");
+        let free_evidence = unconstrained
+            .laplace_negative_log_evidence(data.view())
+            .expect("free-mixture evidence must be finite");
+        assert!(
+            constrained_evidence < free_evidence,
+            "the correctly constrained 17-parameter cyclic model must beat the 41-parameter free mixture on its own data: constrained={constrained_evidence}, free={free_evidence}"
+        );
+    }
+
+    #[test]
+    fn ring_of_clusters_rejects_unidentified_orders_2262() {
+        let data = discrete_ring_fixture(3, 4);
+        let error = fit_ring_gaussian_mixture(data.view(), 2, GaussianMixtureConfig::default())
+            .expect_err("two centers do not identify a circle");
+        assert!(
+            error.contains("at least three"),
+            "typed structural refusal must explain the unidentified circle: {error}"
+        );
+    }
+
     // Dense `H⁻¹` apply via explicit inverse (test-only reference solver).
     fn dense_inverse(h: &Array2<f64>) -> Array2<f64> {
         let p = h.nrows();
@@ -5523,6 +5583,51 @@ mod tests {
                 .laplace_negative_log_evidence(other_data.view())
                 .is_err()
         );
+    }
+
+    fn seven_clusters_on_a_circle_2262() -> Array2<f64> {
+        let clusters = 7usize;
+        let per_cluster = 32usize;
+        let mut data = Array2::<f64>::zeros((clusters * per_cluster, 2));
+        for cluster in 0..clusters {
+            let angle = std::f64::consts::TAU * cluster as f64 / clusters as f64;
+            let (sin_angle, cos_angle) = angle.sin_cos();
+            for sample in 0..per_cluster {
+                let phase = std::f64::consts::TAU * sample as f64 / per_cluster as f64;
+                let radial_noise = 0.035 * phase.cos();
+                let tangent_noise = 0.035 * phase.sin();
+                let radius = 2.0 + radial_noise;
+                let row = cluster * per_cluster + sample;
+                data[[row, 0]] = 0.4 + radius * cos_angle - tangent_noise * sin_angle;
+                data[[row, 1]] = -0.3 + radius * sin_angle + tangent_noise * cos_angle;
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn ring_of_clusters_fit_is_stationary_and_complexity_priced_2262() {
+        let data = seven_clusters_on_a_circle_2262();
+        let config = GaussianMixtureConfig::default();
+        let fit = fit_ring_gaussian_mixture(data.view(), 7, config).unwrap();
+        let certificate = fit.certificate();
+        assert!(certificate.objective_residual <= certificate.objective_tolerance);
+        assert!(certificate.parameter_residual <= certificate.parameter_tolerance);
+        assert_eq!(fit.num_free_parameters(), 17);
+        assert!((fit.center()[0] - 0.4).abs() < 0.05);
+        assert!((fit.center()[1] + 0.3).abs() < 0.05);
+        assert!((fit.radius() - 2.0).abs() < 0.05);
+        assert!(fit.variance().is_finite() && fit.variance() > 0.0);
+        assert!(fit
+            .per_point_log_density(data.view())
+            .unwrap()
+            .iter()
+            .all(|value| value.is_finite()));
+        assert!(fit.laplace_negative_log_evidence(data.view()).unwrap().is_finite());
+
+        let free = fit_gaussian_mixture(data.view(), 7, config).unwrap();
+        assert_eq!(free.num_free_parameters(), 41);
+        assert!(fit.num_free_parameters() < free.num_free_parameters());
     }
 
     #[test]

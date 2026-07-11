@@ -259,7 +259,7 @@ def main() -> int:
         )
         winner = v["winner"]
         best_k = v["mixture_k"]
-        margin = v["circle_margin"]
+        margin = v["circular_margin"]
         circle_wins = bool(v["circle_wins"])
         table = dict(zip(v["candidate_names"], v["stacking_weights"]))
         print("shape race via RUST FFI (gamfit.adjudicate_atom_shape), "
@@ -326,7 +326,7 @@ def main() -> int:
         "shape_winner": winner,
         "shape_table": table,
         "best_mixture_k": best_k,
-        "circle_margin": margin,
+        "circular_margin": margin,
         "circle_wins_shape_race": circle_wins,
         "kind_angular_concentration": kind_organized,
     }

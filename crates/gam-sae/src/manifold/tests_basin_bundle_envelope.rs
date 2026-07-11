@@ -197,6 +197,13 @@ fn reactive_rho_upper_face_comes_from_live_penalty_geometry() {
         seed[0].to_bits(),
         "fixed-alpha IBP has no live assignment-strength coordinate to anneal"
     );
+    for index in 3..upper.len() {
+        assert_eq!(
+            upper[index].to_bits(),
+            seed[index].to_bits(),
+            "periodic von-Mises ARD is sign-indefinite and must stay at its literal target"
+        );
+    }
     assert!(
         upper.iter().skip(1).all(|value| *value < 30.0),
         "live smoothing/ARD bounds must come from curvature geometry, not generic +30: {upper:?}"
