@@ -7607,12 +7607,22 @@ fn select_isotropic_matern_range_basin(
 
         let mut endpoint_spec = resolvedspec.clone();
         set_spatial_length_scale(&mut endpoint_spec, term_idx, long_length_scale)?;
-        let endpoint = fit_term_collection_forspec(
+        // Profile rho at the competing geometry by continuation from the
+        // already certified incumbent rho. This is still a full standard REML
+        // solve (including its ordinary seed certification), but it avoids
+        // throwing away the exact smoothing optimum immediately before a
+        // deliberately large geometry move. In particular, the long-range
+        // endpoint can make the three Matérn operator blocks nearly collinear;
+        // the incumbent lambdas provide the well-scaled starting chart needed
+        // for that profile to reach its KKT certificate rather than exhausting
+        // its startup plans a few ulps above stationarity.
+        let endpoint = fit_term_collection_forspecwith_heuristic_lambdas(
             data,
             y,
             weights,
             offset,
             &endpoint_spec,
+            best.fit.lambdas.as_slice(),
             family.clone(),
             options,
         )?;
