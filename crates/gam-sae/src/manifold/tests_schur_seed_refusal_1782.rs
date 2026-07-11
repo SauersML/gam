@@ -53,8 +53,8 @@ pub(crate) fn non_pd_schur_seed_refusal_is_recoverable_1782() {
         "fixture message must carry both non-PD Schur markers: {msg}"
     );
     // The load-bearing #1782 assertion: the non-PD Schur seed refusal is a
-    // recoverable infeasible-ρ probe (the outer lanes return +∞ / a finite
-    // collapse wall and steer back into the PD region), NOT a fatal error that
+    // recoverable infeasible-ρ probe (the outer lanes return the conventional
+    // `+inf` infeasible evaluation and steer back into the PD region), NOT a fatal error that
     // empties the seed cascade.
     assert!(
         SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(&msg),

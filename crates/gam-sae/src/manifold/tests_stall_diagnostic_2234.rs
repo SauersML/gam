@@ -261,19 +261,19 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
             eprintln!("[zz2234] PLAIN ENGINE DID NOT CERTIFY: {err}");
             let telemetry = objective.probe_telemetry();
             eprintln!("[zz2234] probe telemetry: {telemetry:?}");
-            // The 2026-07-10 wall pathology is the REGRESSION this gate pins:
-            // budget-marker refusals converted to 1e12 walls froze every fit
-            // (frozen isotropic checkpoint, ten-orders lane disagreement).
+            // The 2026-07-10 infeasibility pathology is the REGRESSION this gate
+            // pins: provisional budget-marker refusals froze every fit (frozen
+            // isotropic checkpoint, large lane disagreement).
             // Post-fix the optimizer descends genuinely; certification on this
             // deliberately tight fixture budget remains an honest optimizer
-            // limitation, not a wall. Assert the wall pathology stays dead.
+            // limitation, not an infeasible probe. Assert that pathology stays dead.
             assert_eq!(
-                telemetry.wall_cost_value_probes, 0,
-                "wall-cost probes returned — the #2234 wall pathology regressed"
+                telemetry.infeasible_criterion_evals, 0,
+                "infeasible probes returned — the #2234 pathology regressed"
             );
             assert!(
                 telemetry.criterion_calls > 10,
-                "the outer search froze after {} criterion calls — walls or an \
+                "the outer search froze after {} criterion calls — infeasibility or an \
                  equivalent freeze are back",
                 telemetry.criterion_calls
             );

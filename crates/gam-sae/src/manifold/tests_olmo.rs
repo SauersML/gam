@@ -168,8 +168,8 @@ pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
     );
 }
 
-/// #1189 — the outer loop must NOT pin at the `1e12` data-collapse sentinel on
-/// real OLMo-3-32B activations.
+/// #1189 — the curvature-arrival gate must not reject an attainable fit on real
+/// OLMo-3-32B activations.
 ///
 /// The production entry of record for a K >= 2 dictionary is the #1007
 /// certified curvature-homotopy walk from the base-topology anchor (whose
@@ -179,10 +179,9 @@ pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
 /// atoms is bounded by the cumulative low-rank (PCA) ceiling — well under any
 /// fixed absolute EV target. The pre-#1189 absolute floor rejected EVERY genuine
 /// anchor arrival, the fit fell through to the blind seed cascade, and the
-/// cascade collapsed into the degenerate basin (in-sample EV <=
-/// `SAE_FIT_DATA_COLLAPSE_EV_FLOOR`), so `add_fit_data_collapse_penalty` added
-/// `SAE_FIT_DATA_COLLAPSE_COST` on every outer trial and the whole REML loop
-/// pinned at `~1e12`.
+/// cascade collapsed into a degenerate basin (in-sample EV <=
+/// `SAE_FIT_DATA_COLLAPSE_EV_FLOOR`). Collapse is now a structural ledger
+/// verdict; this regression pins the data-derived arrival gate itself.
 ///
 /// The fix makes the arrival floor purely DATA-DERIVED: the achievable linear
 /// ceiling `anchor_ev` discounted by one atom's share (`anchor_ev * (K-1)/K`),
@@ -197,8 +196,7 @@ pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
 ///   * REAL regime (the bug): a fit AT the achievable PCA ceiling (≈ 0.4 on OLMo,
 ///     where the production hang's converged fit lands) is a perfect non-degenerate
 ///     fit; the data-derived floor must sit STRICTLY BELOW that ceiling at every K
-///     so the fit is accepted, not demoted to the cascade that pins the loop at the
-///     1e12 sentinel.
+///     so the fit is accepted, not demoted to a structurally collapsed cascade.
 ///   * SYNTHETIC regime: on planted harmonics the achievable ceiling is high
 ///     (≈ 0.95); the floor is a share of it, so a genuine curved recovery (EV ≈
 ///     0.94) clears it at every K — the same data-derived rule, no separate branch.
@@ -207,7 +205,7 @@ pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
 ///   * PATHOLOGICAL ceiling: the floor never drops below the data-collapse
 ///     threshold (a genuinely degenerate fit is always caught).
 #[test]
-pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
+pub(crate) fn olmo_real_arrival_floor_tracks_data_ceiling() {
     let path = olmo_fixture_path("olmo_mixedlayer_pca64_768.npy");
     let z = read_npy_f32_2d(&path);
     assert_eq!(z.dim(), (768, 64), "real OLMo fixture shape");
@@ -295,7 +293,7 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
     // ceiling — well UNDER the absolute 0.5 floor (≈ 0.4 on OLMo; the production
     // hang showed the converged fit lands here). A fit at that ceiling is a
     // PERFECT, non-degenerate fit, yet the pre-#1189 absolute floor rejected it and
-    // demoted to the collapsing cascade that pins the loop at the 1e12 sentinel.
+    // demoted to a structurally collapsed cascade.
     // The fix's relative floor must ACCEPT a fit at the achievable ceiling.
     let real_regime_ceiling = 0.40_f64; // representative OLMo K-atom PCA ceiling
     for k in [1usize, 2, 8] {
@@ -305,7 +303,7 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
             f < real_regime_ceiling,
             "[#1189] arrival floor {f:.5} (K={k}) is not strictly below the achievable real-data \
              ceiling {real_regime_ceiling}: a genuine fit AT the ceiling would be rejected and \
-             demoted to the collapsing cascade that pins the loop at the 1e12 sentinel."
+             demoted to a structurally collapsed cascade."
         );
     }
 
@@ -348,7 +346,7 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
     // curvature walk reaches a REAL curved branch whose whole-dictionary EV is
     // close to, but slightly below, the cumulative K-atom linear ceiling. Keying
     // the floor on the FULL ceiling would demote that genuine arrival to a branch
-    // bifurcation, and the seed cascade then co-collapses to the 1e12 sentinel.
+    // bifurcation, and the seed cascade then co-collapses.
     // The per-atom share forgives one atom's worth of the ceiling, so a curved K=3
     // arrival within 1/K of the ceiling CLEARS the floor.
     // Representative real-OLMo K=3 cumulative linear ceiling (production L44 run
@@ -393,8 +391,6 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
          (K=8 {f8:.4} >= ceiling {k3_linear_ceiling:.4})."
     );
 
-    // Guard the sentinel constant the fix exists to avoid pinning the loop at.
-    assert_eq!(SAE_FIT_DATA_COLLAPSE_COST, 1.0e12);
 }
 
 /// Resolve a committed OLMo `.npy` fixture by file name.
@@ -404,7 +400,7 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
 /// `MANIFEST_DIR/tests/data` join misses them. Some call sites historically
 /// open-coded a `../../tests/data` fallback and some forgot it (the latter then
 /// panicked with a bare ENOENT — `olmo_real_curvature_anchor_is_positive_definite`
-/// and `olmo_real_outer_fit_does_not_pin_at_collapse_sentinel`). Route every
+/// and `olmo_real_arrival_floor_tracks_data_ceiling`). Route every
 /// fixture lookup through this resolver so the two layouts are tried in ONE
 /// place: the per-crate path first (for a crate-local checkout), then the
 /// workspace-root path. A clear panic names both probed paths if neither exists.

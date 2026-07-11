@@ -335,7 +335,7 @@ struct CeilingRegionReport {
     fit_wall_seconds: f64,
     criterion_calls: usize,
     infeasible_total: usize,
-    wall_cost_value_probes: usize,
+    infeasible_criterion_evals: usize,
     certificate: Option<OuterCriterionCertificate>,
 }
 
@@ -407,7 +407,7 @@ fn fit_ceiling_region(
         fit_wall_seconds: fit_elapsed.as_secs_f64(),
         criterion_calls: telemetry.criterion_calls,
         infeasible_total: telemetry.infeasible_total(),
-        wall_cost_value_probes: telemetry.wall_cost_value_probes,
+        infeasible_criterion_evals: telemetry.infeasible_criterion_evals,
         certificate: result.criterion_certificate,
     })
 }
@@ -457,8 +457,8 @@ fn print_ceiling_report(report: &CeilingRegionReport) {
     println!("{label}_criterion_calls={}", report.criterion_calls);
     println!("{label}_infeasible_total={}", report.infeasible_total);
     println!(
-        "{label}_wall_cost_value_probes={}",
-        report.wall_cost_value_probes
+        "{label}_infeasible_criterion_evals={}",
+        report.infeasible_criterion_evals
     );
     print_gradient_certificate(label, report.certificate.as_ref());
     println!(

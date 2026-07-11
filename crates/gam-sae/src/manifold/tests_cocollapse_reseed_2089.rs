@@ -12,7 +12,7 @@
 //! White noise carries no low-rank circle structure, so at any non-trivial
 //! smoothing ρ the six decoders co-vanish together and the inner joint fit, after
 //! its bounded co-collapse reseed multi-start, refuses with the typed "dictionary
-//! did not escape total co-collapse" wall (rather than spiralling into a
+//! did not escape total co-collapse" error (rather than spiralling into a
 //! catastrophic / non-finite EV — see the numeric keep-best guard in
 //! `enforce_decoder_norm_guard`). The BUG: that refusal was classified
 //! NON-recoverable, so when the outer alpha="auto" ρ-search line-searches into a
@@ -21,9 +21,9 @@
 //! the non-PD Hessian probes, and the thrash that terminates the host process.
 //!
 //! The fix classifies the co-collapse refusal as a RECOVERABLE value-probe refusal
-//! (`is_recoverable_value_probe_refusal`), so every eval lane maps it to the finite
-//! collapse wall and the outer optimizer STEERS ρ back toward the feasible region
-//! (or ships best-so-far) instead of aborting.
+//! (`is_recoverable_value_probe_refusal`), so every eval lane returns an infeasible
+//! trial and the outer optimizer STEERS ρ back toward the feasible region instead
+//! of treating a made-up finite cost as evidence.
 //!
 //! This drives the inner joint fit on the EXACT repro geometry (120×32, K=6,
 //! circle, ibp_map) at a co-collapsing ρ, and asserts (a) it terminates with the
@@ -119,7 +119,7 @@ fn white_noise_circle_term(z: ArrayView2<'_, f64>, k: usize, harmonics: usize) -
 /// RECOVERABLE infeasible-ρ probe so the outer alpha="auto" search steers around it
 /// instead of aborting the whole fit. Pre-fix the co-collapse refusal was
 /// non-recoverable (the outer search aborted / thrashed the host to the exit-137
-/// SIGKILL); post-fix it is the finite collapse wall the search steers around.
+/// SIGKILL); post-fix it is an infeasible trial the search steers around.
 #[test]
 pub(crate) fn cocollapse_refusal_is_recoverable_infeasible_rho_2089() {
     // Mirror the issue's repro dimensions: X = rng.normal(size=(120, 32)), K = 6.
@@ -161,14 +161,14 @@ pub(crate) fn cocollapse_refusal_is_recoverable_infeasible_rho_2089() {
         Err(err) => {
             eprintln!("[#2089 repro] featureless K=6 circle co-collapse refusal: {err}");
             // The reseed path fired and refused with the typed total-co-collapse
-            // wall (not a panic, not a generic defect).
+            // error (not a panic, not a generic defect).
             assert!(
                 err.contains("did not escape total co-collapse"),
                 "#2089: expected the typed total-co-collapse refusal from the reseed path, \
                  got a different error: {err}"
             );
             // THE FIX: that refusal must be a RECOVERABLE infeasible-ρ probe so the
-            // outer alpha=\"auto\" optimizer reads it as the finite collapse wall and
+            // outer alpha=\"auto\" optimizer reads it as an infeasible trial and
             // steers ρ back toward the feasible region — NOT a fatal abort that (with
             // the pre-guard reseed thrash) SIGKILLs the host. Pre-fix this assertion
             // FAILS; post-fix it PASSES.

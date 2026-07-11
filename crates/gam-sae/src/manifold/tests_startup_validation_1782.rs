@@ -270,8 +270,8 @@ fn run_full_fit(
             // "no candidate seeds passed outer startup validation" abort, and the
             // softmax "BFGS aborted: globally infeasible neighbourhood at seed
             // (probe-refusal guard)" abort — both are the emptied / globally-refused
-            // seed cascade the fix removes by presenting a recoverable infeasible-ρ
-            // refusal as a finite collapse wall instead of `+∞`.
+            // seed cascade the fit must avoid by entering a basin with defined
+            // Laplace evidence; infeasible probes remain `+∞` and cannot certify.
             panic!("#1782 {label} fit must not abort at startup / in the outer solver, got: {e}")
         });
     objective
@@ -302,7 +302,7 @@ fn run_full_fit(
 /// neighbourhood to a FATAL seed rejection ("BFGS aborted: globally infeasible
 /// neighbourhood at seed (probe-refusal guard)"). `ibp_map`+`circle` lands in
 /// the PD region and never trips it — RED before the fix on `softmax`, GREEN
-/// after (the refusal now presents the finite collapse wall the EFS lane uses).
+/// after (the entry path now reaches a basin with defined Laplace evidence).
 #[test]
 fn assignment_kinds_fit_on_circle_1782() {
     let z = planted_circle_embedded(48, 6, 0.03);

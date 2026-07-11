@@ -570,13 +570,13 @@ fn wide_p_outer_reml_terminates_within_probe_budget_2080() {
     eprintln!(
         "[#2080] wide-p outer fit: ev={ev:.4}, criterion_calls={}, \
          infeasible(non_pd_per_row={},cross_row={},schur={},inner_nc={}), \
-         wall_cost_value_probes={}",
+         infeasible_criterion_evals={}",
         telemetry.criterion_calls,
         telemetry.infeasible_non_pd_per_row,
         telemetry.infeasible_cross_row,
         telemetry.infeasible_schur,
         telemetry.infeasible_inner_not_converged,
-        telemetry.wall_cost_value_probes,
+        telemetry.infeasible_criterion_evals,
     );
     // Bounded criterion (eval / eval_cost / efs) budget — a PROBE COUNT, not a
     // wall-clock limit (SPEC bans time budgets). With `with_max_iter(4)` and a
@@ -606,9 +606,9 @@ fn k1_generated_seed_circle_outer_reml_does_not_livelock_2153() {
     let (ev, telemetry) = run_k1_generated_seed_outer_fit(32, 24, 1);
     eprintln!(
         "[#2153] K=1 generated-seed outer fit: ev={ev:.4}, criterion_calls={}, \
-         wall_cost_value_probes={}, infeasible_total={}",
+         infeasible_criterion_evals={}, infeasible_total={}",
         telemetry.criterion_calls,
-        telemetry.wall_cost_value_probes,
+        telemetry.infeasible_criterion_evals,
         telemetry.infeasible_total(),
     );
     assert!(
@@ -640,7 +640,7 @@ fn ceiling_vs_pathology_outer_reml_instrument_2156() {
          predicted_decrease={:.6e}, actual_decrease={:.6e}, materialization_ratio={:.6e}, \
          outer_converged={}, outer_iterations={}, final_value={:.6e}, final_grad_norm={:.6e}, \
          rho_displacement={:.6e}, ev={:.4}, criterion_calls={}, \
-         wall_cost_value_probes={}, infeasible_total={}, outer_error={:?}, \
+         infeasible_criterion_evals={}, infeasible_total={}, outer_error={:?}, \
          predicted_not_materializing={}, step_collapsed={}, huge_final_gradient={}, \
          live_lock_present={}",
         report.initial_cost,
@@ -655,7 +655,7 @@ fn ceiling_vs_pathology_outer_reml_instrument_2156() {
         report.rho_displacement,
         report.ev,
         report.telemetry.criterion_calls,
-        report.telemetry.wall_cost_value_probes,
+        report.telemetry.infeasible_criterion_evals,
         report.telemetry.infeasible_total(),
         report.outer_error,
         report.predicted_decrease_not_materializing,

@@ -17,9 +17,9 @@ use std::sync::Arc;
 /// Deterministic K=1 periodic objective whose fitted dictionary carries real
 /// non-constant signal. The four-row, one-output warm-start contract toy used
 /// here previously is intentionally tiny and strongly regularized; its fitted
-/// output lands at the column mean and correctly triggers the absolute
-/// fit-data-collapse wall. That makes it invalid as a value-derivative witness:
-/// every nearby rho is supposed to return the same discrete wall.
+/// output lands at the column mean and correctly triggers the structural
+/// fit-data-collapse ledger. It is therefore a poor active-basin derivative
+/// witness; this fixture stays on a well-resolved noncollapsed branch.
 fn planted_periodic_outer_objective_2253() -> SaeManifoldOuterObjective {
     let target = planted_circle_embedded(32, 4, 0.02);
     let mut term =

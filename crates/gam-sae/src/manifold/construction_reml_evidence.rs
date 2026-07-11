@@ -730,8 +730,8 @@ impl SaeManifoldTerm {
         // the KKT gradient and the undamped step stay above their relative
         // tolerances (the near-singular Schur amplifies the step in the
         // weakly-identified decoder direction). The grad-OR-step gate then never
-        // fires and the solve is rejected as "did not converge" — the 1e12
-        // sentinel. A Newton/LM iterate whose objective has stopped decreasing
+        // fires and the solve is rejected as "did not converge". A Newton/LM
+        // iterate whose objective has stopped decreasing
         // to within `√εmach` of its scale IS the numerical inner optimum; ranking
         // the Laplace criterion there is correct. We accept that fixed point
         // instead of grinding the budget.
@@ -760,7 +760,7 @@ impl SaeManifoldTerm {
         // FINITE Laplace log-det, we stash that cache here; once the objective
         // stall persists for the full `STALL_MIN_ROUNDS` the floor itself is the
         // inner-convergence witness (#1051) and ranking this cache is correct —
-        // instead of refusing to the 1e12 infeasible sentinel at a fit that is
+        // instead of returning an infeasible refusal at a fit that is
         // de-facto converged (R²≈0.99).
         let mut stalled_finite_cache: Option<ArrowFactorCache> = None;
         loop {
@@ -1041,9 +1041,9 @@ impl SaeManifoldTerm {
             if total_inner_iter >= effective_refine_limit {
                 // #2234 stall synthesis — one PROGRESS-GATED budget escalation.
                 // Two prior designs collide here: the #2080 wide-p hang fix makes
-                // budget-limited solves refuse fast, and #2241 maps that refusal
-                // to the finite 1e12 wall — so at any ρ whose inner problem needs
-                // more than the budget, EVERY lane that lands here walls, the
+                // budget-limited solves refuse fast — so at any ρ whose inner
+                // problem needs more than the budget, EVERY lane that lands here
+                // returns infeasible evidence, the
                 // line search sees cliffs in all directions, and the outer fit
                 // freezes at a live gradient and refuses to mint (measured
                 // fleet-wide 2026-07-10: gam-sae 126 test failures, ten-orders
@@ -1286,8 +1286,7 @@ impl SaeManifoldTerm {
                 //     PD-floor conditioning of the rank-deficient directions is a
                 //     bias consistent across every ρ evaluation and so does not
                 //     move the outer optimum, whereas refusing hands the outer BFGS
-                //     a +∞ at a de-facto-converged point and drives the whole fit
-                //     to the 1e12 infeasible sentinel.
+                //     a +∞ at a de-facto-converged point and freezes the fit.
                 //   * The undamped factor FAILED at every stall round (a genuinely
                 //     broken / non-finite rank-deficient geometry, no finite
                 //     evidence to rank): surface the hard refusal — the same signal

@@ -83,7 +83,7 @@ pub(crate) const SAE_MANIFOLD_INNER_GRAD_REL_TOL: f64 = 1.0e-5;
 /// ill-conditioned penalised bilinear fit the KKT gradient and undamped step
 /// stay above tolerance while the objective stops moving; this `√εmach`-scale
 /// floor recognises that stalled iterate as the converged inner optimum instead
-/// of grinding the refine budget to the `1e12` infeasible sentinel.
+/// of grinding the refine budget to an infeasible refusal.
 pub(crate) const SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL: f64 = 1.0e-8;
 
 /// Fraction of the total since-entry objective reduction below which a refine
