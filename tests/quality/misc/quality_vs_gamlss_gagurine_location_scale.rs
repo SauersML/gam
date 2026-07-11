@@ -44,8 +44,7 @@
 //! gam side, pinned by reading the source (mirrors
 //! `quality_vs_gamlss_gaussian_location_scale.rs`):
 //!   * `fit_from_formula(..., FitConfig{ noise_formula: Some(...), .. })` routes
-//!     through `FitRequest::GaussianLocationScale`; this in-Rust path does NOT
-//!     rescale `y`, so reconstructed mu/sigma are already in raw GAG units.
+//!     through `FitRequest::GaussianLocationScale`.
 //!   * the response is standardized while fitting and returned coefficients are
 //!     mapped back to raw units, so prediction uses
 //!     `sigma = response_scale * LOGB_SIGMA_FLOOR + exp(eta_scale)`; the mean

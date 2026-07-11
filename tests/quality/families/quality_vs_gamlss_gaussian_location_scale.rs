@@ -24,9 +24,6 @@
 //! Notes on the gam side that this test pins down by reading the source:
 //!   * `fit_from_formula(..., FitConfig{ noise_formula: Some(...), .. })` routes
 //!     through `materialize_location_scale` -> `FitRequest::GaussianLocationScale`.
-//!     Unlike the CLI in `main.rs`, this in-Rust path does NOT rescale `y` by its
-//!     sample std, so the fitted coefficients and reconstructed mu / sigma are
-//!     already in raw response units.
 //!   * gam standardizes the response while fitting, then maps coefficients back
 //!     to raw units. Consequently the raw-unit noise link is
 //!     `sigma = response_scale * LOGB_SIGMA_FLOOR + exp(eta_scale)`; the
