@@ -2,8 +2,8 @@ use super::*;
 
 use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 use gam_math::jet_scalar::{
-    DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar, OneSeed, OneSeedBatch, OneSeedLane,
-    Order2, Order2Lane, RuntimeJetScalar, TwoSeed,
+    DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar, OneSeed,
+    OneSeedBatch, OneSeedLane, Order2, Order2Lane, RuntimeJetScalar, TwoSeed,
 };
 use wide::f64x4;
 
@@ -623,7 +623,7 @@ pub(crate) struct SlsWiggleRowBasis<'b> {
     pub(crate) b_u1: [&'b [f64]; 4],
 }
 
-pub(crate) fn sls_row_nll_wiggle<S: RuntimeJetScalar>(
+pub(crate) fn sls_row_nll_wiggle<'arena, S: RuntimeJetScalar<'arena>>(
     vars: &[S],
     kernel: &SurvivalExactRowKernel,
     pw: usize,
@@ -643,7 +643,7 @@ pub(crate) fn sls_row_nll_wiggle<S: RuntimeJetScalar>(
     let g0 = vars[2].add(&inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5])));
     let mut u0w = u0.clone();
     let mut u1w = u1.clone();
-    let mut m1 = S::constant(1.0, vars.len());
+    let mut m1 = vars[0].compose_unary([1.0, 0.0, 0.0, 0.0, 0.0]);
     for j in 0..pw {
         let bw = &vars[SLS_ROW_K + j];
         u0w = u0w.add(&bw.mul(&u0.compose_unary([b0e[j], b1e[j], b2e[j], b3e[j], 0.0])));
@@ -719,6 +719,20 @@ pub(crate) struct SurvivalLsWiggleRowKernel<'a> {
     b_u1_1: Array2<f64>,
     b_u1_2: Array2<f64>,
     b_u1_3: Array2<f64>,
+}
+
+struct SurvivalLsDynamicFold {
+    matrix: Array2<f64>,
+    arena: DynamicJetArena,
+}
+
+impl SurvivalLsDynamicFold {
+    fn new(n_coefficients: usize) -> Self {
+        Self {
+            matrix: Array2::zeros((n_coefficients, n_coefficients)),
+            arena: DynamicJetArena::new(),
+        }
+    }
 }
 
 impl<'a> SurvivalLsWiggleRowKernel<'a> {
@@ -846,26 +860,31 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
     }
 
     #[inline]
-    fn row_vars<S: RuntimeJetScalar>(
+    fn row_vars<'arena, S: RuntimeJetScalar<'arena>>(
         &self,
         row: usize,
-        seed: impl Fn(f64, usize, usize) -> S,
+        arena: &'arena S::Workspace,
+        seed: impl Fn(f64, usize, usize, &'arena S::Workspace) -> S,
     ) -> Vec<S> {
         let p = self.base.row_primary_values(row);
         let dimension = self.primary_dimension();
         (0..dimension)
             .map(|a| {
                 if a < SLS_ROW_K {
-                    seed(p[a], a, dimension)
+                    seed(p[a], a, dimension, arena)
                 } else {
-                    seed(self.betaw[a - SLS_ROW_K], a, dimension)
+                    seed(self.betaw[a - SLS_ROW_K], a, dimension, arena)
                 }
             })
             .collect()
     }
 
     #[inline]
-    fn eval<S: RuntimeJetScalar>(&self, row: usize, vars: &[S]) -> Result<S, String> {
+    fn eval<'arena, S: RuntimeJetScalar<'arena>>(
+        &self,
+        row: usize,
+        vars: &[S],
+    ) -> Result<S, String> {
         let kernel = self.base.row_nll_inputs(row)?.1;
         let r_u0_0 = self.b_u0_0.row(row).to_vec();
         let r_u0_1 = self.b_u0_1.row(row).to_vec();
@@ -954,29 +973,39 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
         }
     }
 
-    fn row_order2(&self, row: usize) -> Result<DynamicOrder2, String> {
-        let vars = self.row_vars(row, DynamicOrder2::variable);
+    fn row_order2<'arena>(
+        &self,
+        row: usize,
+        arena: &'arena DynamicJetArena,
+    ) -> Result<DynamicOrder2<'arena>, String> {
+        let vars = self.row_vars(row, arena, DynamicOrder2::variable);
         self.eval(row, &vars)
     }
 
-    fn row_third_contracted(&self, row: usize, dir: &[f64]) -> Result<DynamicOneSeed, String> {
+    fn row_third_contracted<'arena>(
+        &self,
+        row: usize,
+        dir: &[f64],
+        arena: &'arena DynamicJetArena,
+    ) -> Result<DynamicOneSeed<'arena>, String> {
         assert_eq!(dir.len(), self.primary_dimension());
-        let vars = self.row_vars(row, |x, a, dimension| {
-            DynamicOneSeed::seed_direction(x, a, dir[a], dimension)
+        let vars = self.row_vars(row, arena, |x, a, dimension, workspace| {
+            DynamicOneSeed::seed_direction(x, a, dir[a], dimension, workspace)
         });
         self.eval(row, &vars)
     }
 
-    fn row_fourth_contracted(
+    fn row_fourth_contracted<'arena>(
         &self,
         row: usize,
         dir_u: &[f64],
         dir_v: &[f64],
-    ) -> Result<DynamicTwoSeed, String> {
+        arena: &'arena DynamicJetArena,
+    ) -> Result<DynamicTwoSeed<'arena>, String> {
         assert_eq!(dir_u.len(), self.primary_dimension());
         assert_eq!(dir_v.len(), self.primary_dimension());
-        let vars = self.row_vars(row, |x, a, dimension| {
-            DynamicTwoSeed::seed(x, a, dir_u[a], dir_v[a], dimension)
+        let vars = self.row_vars(row, arena, |x, a, dimension, workspace| {
+            DynamicTwoSeed::seed(x, a, dir_u[a], dir_v[a], dimension, workspace)
         });
         self.eval(row, &vars)
     }
@@ -985,14 +1014,19 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
         let p = self.n_coefficients();
         rows.par_try_reduce_fold(
             self.n_rows(),
-            || Array2::<f64>::zeros((p, p)),
+            || SurvivalLsDynamicFold::new(p),
             |mut acc, row, weight| {
-                let out = self.row_order2(row)?;
-                self.add_pullback_hessian(row, out.h(), weight, &mut acc);
+                acc.arena.reset();
+                let out = self.row_order2(row, &acc.arena)?;
+                self.add_pullback_hessian(row, out.h(), weight, &mut acc.matrix);
                 Ok(acc)
             },
-            |a, b| Ok(a + b),
+            |mut a, b| {
+                a.matrix += &b.matrix;
+                Ok(a)
+            },
         )
+        .map(|fold| fold.matrix)
     }
 
     fn directional_derivative_dense(
@@ -1004,15 +1038,20 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
         let p = self.n_coefficients();
         rows.par_try_reduce_fold(
             self.n_rows(),
-            || Array2::<f64>::zeros((p, p)),
+            || SurvivalLsDynamicFold::new(p),
             |mut acc, row, weight| {
+                acc.arena.reset();
                 let direction = self.jacobian_action(row, d_beta);
-                let out = self.row_third_contracted(row, &direction)?;
-                self.add_pullback_hessian(row, out.contracted_third(), weight, &mut acc);
+                let out = self.row_third_contracted(row, &direction, &acc.arena)?;
+                self.add_pullback_hessian(row, out.contracted_third(), weight, &mut acc.matrix);
                 Ok(acc)
             },
-            |a, b| Ok(a + b),
+            |mut a, b| {
+                a.matrix += &b.matrix;
+                Ok(a)
+            },
         )
+        .map(|fold| fold.matrix)
     }
 
     fn second_directional_derivative_dense(
@@ -1026,16 +1065,22 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
         let p = self.n_coefficients();
         rows.par_try_reduce_fold(
             self.n_rows(),
-            || Array2::<f64>::zeros((p, p)),
+            || SurvivalLsDynamicFold::new(p),
             |mut acc, row, weight| {
+                acc.arena.reset();
                 let direction_u = self.jacobian_action(row, d_beta_u);
                 let direction_v = self.jacobian_action(row, d_beta_v);
-                let out = self.row_fourth_contracted(row, &direction_u, &direction_v)?;
-                self.add_pullback_hessian(row, out.contracted_fourth(), weight, &mut acc);
+                let out =
+                    self.row_fourth_contracted(row, &direction_u, &direction_v, &acc.arena)?;
+                self.add_pullback_hessian(row, out.contracted_fourth(), weight, &mut acc.matrix);
                 Ok(acc)
             },
-            |a, b| Ok(a + b),
+            |mut a, b| {
+                a.matrix += &b.matrix;
+                Ok(a)
+            },
         )
+        .map(|fold| fold.matrix)
     }
 }
 

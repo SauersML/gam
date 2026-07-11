@@ -204,12 +204,7 @@ pub trait RuntimeJetScalar<'arena>: Clone {
     /// A constant in a `dimension`-primary algebra.
     fn constant(c: f64, dimension: usize, workspace: &'arena Self::Workspace) -> Self;
     /// A seeded variable in a `dimension`-primary algebra.
-    fn variable(
-        x: f64,
-        axis: usize,
-        dimension: usize,
-        workspace: &'arena Self::Workspace,
-    ) -> Self;
+    fn variable(x: f64, axis: usize, dimension: usize, workspace: &'arena Self::Workspace) -> Self;
     /// Number of primary derivative axes carried by this scalar.
     fn dimension(&self) -> usize;
     /// Value channel.
@@ -258,9 +253,7 @@ impl<S, const K: usize> FixedRuntimeJet<S, K> {
     }
 }
 
-impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena>
-    for FixedRuntimeJet<S, K>
-{
+impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for FixedRuntimeJet<S, K> {
     type Workspace = ();
 
     fn constant(c: f64, dimension: usize, _workspace: &'arena Self::Workspace) -> Self {
@@ -389,8 +382,15 @@ impl DynamicOrder1<'_> {
 
     #[inline]
     fn assert_compatible(&self, o: &Self) {
-        assert_eq!(self.g.len(), o.g.len(), "dynamic first-order jet dimension mismatch");
-        assert!(std::ptr::eq(self.arena, o.arena), "dynamic jets belong to different arenas");
+        assert_eq!(
+            self.g.len(),
+            o.g.len(),
+            "dynamic first-order jet dimension mismatch"
+        );
+        assert!(
+            std::ptr::eq(self.arena, o.arena),
+            "dynamic jets belong to different arenas"
+        );
     }
 }
 
@@ -398,57 +398,95 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder1<'arena> {
     type Workspace = DynamicJetArena;
 
     fn constant(c: f64, dimension: usize, arena: &'arena DynamicJetArena) -> Self {
-        Self { arena, v: c, g: arena.zeros(dimension) }
+        Self {
+            arena,
+            v: c,
+            g: arena.zeros(dimension),
+        }
     }
 
-    fn variable(
-        x: f64,
-        axis: usize,
-        dimension: usize,
-        arena: &'arena DynamicJetArena,
-    ) -> Self {
-        assert!(axis < dimension, "dynamic first-order jet axis out of bounds");
+    fn variable(x: f64, axis: usize, dimension: usize, arena: &'arena DynamicJetArena) -> Self {
+        assert!(
+            axis < dimension,
+            "dynamic first-order jet axis out of bounds"
+        );
         let g = arena.zeros(dimension);
         g[axis] = 1.0;
         Self { arena, v: x, g }
     }
 
-    fn dimension(&self) -> usize { self.g.len() }
-    fn value(&self) -> f64 { self.v }
+    fn dimension(&self) -> usize {
+        self.g.len()
+    }
+    fn value(&self) -> f64 {
+        self.v
+    }
 
     fn add(&self, o: &Self) -> Self {
         self.assert_compatible(o);
         let g = self.arena.zeros(self.dimension());
-        for i in 0..g.len() { g[i] = self.g[i] + o.g[i]; }
-        Self { arena: self.arena, v: self.v + o.v, g }
+        for i in 0..g.len() {
+            g[i] = self.g[i] + o.g[i];
+        }
+        Self {
+            arena: self.arena,
+            v: self.v + o.v,
+            g,
+        }
     }
 
     fn sub(&self, o: &Self) -> Self {
         self.assert_compatible(o);
         let g = self.arena.zeros(self.dimension());
-        for i in 0..g.len() { g[i] = self.g[i] - o.g[i]; }
-        Self { arena: self.arena, v: self.v - o.v, g }
+        for i in 0..g.len() {
+            g[i] = self.g[i] - o.g[i];
+        }
+        Self {
+            arena: self.arena,
+            v: self.v - o.v,
+            g,
+        }
     }
 
     fn mul(&self, o: &Self) -> Self {
         self.assert_compatible(o);
         let g = self.arena.zeros(self.dimension());
-        for i in 0..g.len() { g[i] = self.v * o.g[i] + self.g[i] * o.v; }
-        Self { arena: self.arena, v: self.v * o.v, g }
+        for i in 0..g.len() {
+            g[i] = self.v * o.g[i] + self.g[i] * o.v;
+        }
+        Self {
+            arena: self.arena,
+            v: self.v * o.v,
+            g,
+        }
     }
 
-    fn neg(&self) -> Self { self.scale(-1.0) }
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
 
     fn scale(&self, s: f64) -> Self {
         let g = self.arena.zeros(self.dimension());
-        for i in 0..g.len() { g[i] = self.g[i] * s; }
-        Self { arena: self.arena, v: self.v * s, g }
+        for i in 0..g.len() {
+            g[i] = self.g[i] * s;
+        }
+        Self {
+            arena: self.arena,
+            v: self.v * s,
+            g,
+        }
     }
 
     fn compose_unary(&self, d: [f64; 5]) -> Self {
         let g = self.arena.zeros(self.dimension());
-        for i in 0..g.len() { g[i] = d[1] * self.g[i]; }
-        Self { arena: self.arena, v: d[0], g }
+        for i in 0..g.len() {
+            g[i] = d[1] * self.g[i];
+        }
+        Self {
+            arena: self.arena,
+            v: d[0],
+            g,
+        }
     }
 }
 
@@ -519,12 +557,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         }
     }
 
-    fn variable(
-        x: f64,
-        axis: usize,
-        dimension: usize,
-        arena: &'arena DynamicJetArena,
-    ) -> Self {
+    fn variable(x: f64, axis: usize, dimension: usize, arena: &'arena DynamicJetArena) -> Self {
         assert!(
             axis < dimension,
             "dynamic second-order jet axis out of bounds"
@@ -693,12 +726,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOneSeed<'arena> {
         }
     }
 
-    fn variable(
-        x: f64,
-        axis: usize,
-        dimension: usize,
-        arena: &'arena DynamicJetArena,
-    ) -> Self {
+    fn variable(x: f64, axis: usize, dimension: usize, arena: &'arena DynamicJetArena) -> Self {
         Self {
             base: DynamicOrder2::variable(x, axis, dimension, arena),
             eps: DynamicOrder2::constant(0.0, dimension, arena),
@@ -807,12 +835,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicTwoSeed<'arena> {
         }
     }
 
-    fn variable(
-        x: f64,
-        axis: usize,
-        dimension: usize,
-        arena: &'arena DynamicJetArena,
-    ) -> Self {
+    fn variable(x: f64, axis: usize, dimension: usize, arena: &'arena DynamicJetArena) -> Self {
         Self {
             base: DynamicOrder2::variable(x, axis, dimension, arena),
             eps: DynamicOrder2::constant(0.0, dimension, arena),

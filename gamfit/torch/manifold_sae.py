@@ -552,11 +552,12 @@ def _residual_em_input_shape(
             f"residual-EM tensors must share one dtype, got {x.dtype} and "
             f"{per_atom_recon.dtype}"
         )
-    if x.is_cuda and x.dtype not in (torch.float32, torch.float64):
-        raise TypeError(
-            "residual-EM CUDA scoring supports exactly torch.float32 and "
-            f"torch.float64, got {x.dtype}"
-        )
+    if x.device.type == "cuda":
+        # Validate through the exact dtype-to-kernel map used by the raw FFI
+        # call. Unsupported CUDA tensors must fail here; they never enter the
+        # CPU NumPy oracle path and never rely on a later branch condition for
+        # refusal.
+        _residual_em_cuda_dtype_name(x.dtype)
     return n, atoms, dim
 
 
@@ -633,7 +634,7 @@ class _ResidualEmScoreFn(torch.autograd.Function):
         nonneg: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         n, f, d = _residual_em_input_shape(x, per_atom_recon)
-        if x.is_cuda:
+        if x.device.type == "cuda":
             ordinal_value = x.device.index
             if ordinal_value is None:
                 raise ValueError(

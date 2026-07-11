@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
+import textwrap
 
 import pytest
 import torch
@@ -128,21 +130,37 @@ def test_residual_em_cuda_refuses_unsupported_or_mismatched_metadata() -> None:
         )
 
 
+def _ffi_if_body_source(function: object, ffi_name: str) -> str:
+    """Return the unique conditional body that owns a named CUDA FFI call."""
+    source = textwrap.dedent(inspect.getsource(function))
+    tree = ast.parse(source)
+    matches: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        body = ast.Module(body=node.body, type_ignores=[])
+        rendered = ast.unparse(body)
+        if ffi_name in rendered:
+            matches.append(rendered)
+    assert len(matches) == 1, (
+        f"expected one conditional branch owning {ffi_name}, found {len(matches)}"
+    )
+    return matches[0]
+
+
 def test_residual_em_cuda_branch_contains_no_host_tensor_conversion() -> None:
-    forward = inspect.getsource(_ResidualEmScoreFn.forward)
-    forward_cuda = forward.split("if x.is_cuda:", maxsplit=1)[1].split(
-        "code_np", maxsplit=1
-    )[0]
+    forward_cuda = _ffi_if_body_source(
+        _ResidualEmScoreFn.forward, "sae_residual_em_score_cuda"
+    )
     assert "sae_residual_em_score_cuda" in forward_cuda
     assert "_validate_residual_em_cuda_buffer" in forward_cuda
     assert "to_numpy_f64" not in forward_cuda
     assert ".cpu(" not in forward_cuda
     assert ".numpy(" not in forward_cuda
 
-    backward = inspect.getsource(_ResidualEmScoreFn.backward)
-    backward_cuda = backward.split("if ctx.cuda_lane:", maxsplit=1)[1].split(
-        "grad_recon_np", maxsplit=1
-    )[0]
+    backward_cuda = _ffi_if_body_source(
+        _ResidualEmScoreFn.backward, "sae_residual_em_score_vjp_cuda"
+    )
     assert "sae_residual_em_score_vjp_cuda" in backward_cuda
     assert "_validate_residual_em_cuda_buffer" in backward_cuda
     assert "to_numpy_f64" not in backward_cuda
