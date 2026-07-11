@@ -496,7 +496,7 @@ Returns a dict:
 | --- | --- |
 | `winner` | `"circle"`, `"euclidean"`, `"mixture_k{k}"`, or `"ring_clusters_k{k}"` |
 | `circle_wins` | bool, the winner is either circular density class |
-| `circle_margin` | best circular stacking weight minus the best non-circular weight (`NaN` if weights are unavailable) |
+| `circular_margin` | best circular stacking weight minus the best non-circular weight (`NaN` if weights are unavailable) |
 | `mixture_k` | the mixture order selected inside the mixture rung |
 | `ring_clusters_k` | the order selected inside the constrained ring-of-clusters rung |
 | `candidate_names` / `stacking_weights` | per-candidate names and held-out stacking weights |

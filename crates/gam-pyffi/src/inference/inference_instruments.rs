@@ -1192,7 +1192,7 @@ mod tests {
             verdict.negative_log_evidence,
         );
         assert!(verdict.circle_wins);
-        assert!(verdict.circle_margin > 0.0);
+        assert!(verdict.circular_margin > 0.0);
         assert_eq!(verdict.candidate_names.len(), 4);
     }
 
@@ -1382,9 +1382,9 @@ mod tests {
 // intrinsic 2-D coordinates (the SAME Rust evidence code the in-tree
 // `quality_llm_weekday_circle` gate drives), exposed so the real-activation
 // driver computes the verdict with ONE evidence implementation, not a Python
-// re-implementation. Races a smooth S¹ ring against a Euclidean Gaussian and the
-// best k-cluster mixture rung; the held-out predictive-stacking headline picks
-// the winner.
+// re-implementation. Races a smooth S¹ ring, a Euclidean Gaussian, a free
+// k-cluster mixture, and a circle-constrained ring of clusters; the held-out
+// predictive-stacking headline picks the winner.
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Held-out log-density of the smooth-circle (ring) candidate on 2-D coords:
@@ -1657,13 +1657,13 @@ fn atom_shape_verdict_dict<'py>(
 }
 
 /// Adjudicate the representational SHAPE of a recovered atom's intrinsic 2-D
-/// coordinates (issue #977 / #907): race a smooth S¹ ring against a Euclidean
-/// Gaussian and the best k-cluster mixture rung, headlined by held-out
-/// predictive stacking — the EXACT `fit_mixture_rung` + `adjudicate_cross_class_
-/// race` machinery the in-tree gates and the production fit drive. Returns a dict
-/// with the winner name, per-candidate stacking weights, rank-aware evidences,
-/// the selected mixture orders, and the best circular candidate's stacking
-/// margin over the best non-circular contender.
+/// coordinates (issue #977 / #907 / #2262): race a smooth S¹ ring against a
+/// Euclidean Gaussian, the best free k-cluster mixture, and a constrained
+/// ring-of-clusters mixture whose centers share one fitted circle. The headline
+/// is held-out predictive stacking through the exact production race machinery.
+/// Returns the winner, per-candidate weights/evidences, both selected mixture
+/// orders, and the best circular candidate's margin over the best non-circular
+/// contender.
 ///
 /// `coords` is the `(n, 2)` intrinsic-coordinate matrix (e.g. `fit.coords[0]`
 /// from `sae_manifold_fit`). `folds`/`seed` control the deterministic CV folding
