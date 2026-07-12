@@ -1559,7 +1559,7 @@ mod observed_single_source_oracle_tests {
         use super::*;
         use gam_math::jet_scalar::JetScalar;
         use gam_math::jet_tower::{
-            RowNllProgramGeneric, generic_fourth_contracted, generic_third_contracted,
+            RowProgram, program_fourth_contracted, program_third_contracted,
         };
 
         /// The gaulss row NLL `ℓ = a·ln σ + ½·a·(y−η_μ)²/σ²` in the PRODUCTION
@@ -1572,7 +1572,7 @@ mod observed_single_source_oracle_tests {
             a: f64,
         }
 
-        impl RowNllProgramGeneric<2> for GaulssJetRow {
+        impl RowProgram<2> for GaulssJetRow {
             fn n_rows(&self) -> usize {
                 1
             }
@@ -1582,7 +1582,7 @@ mod observed_single_source_oracle_tests {
                 }
                 Ok([self.eta_mu, self.eta_ls])
             }
-            fn row_nll_generic<S: JetScalar<2>>(
+            fn eval<S: JetScalar<2>>(
                 &self,
                 row: usize,
                 p: &[S; 2],
@@ -1632,7 +1632,7 @@ mod observed_single_source_oracle_tests {
                     eta_ls,
                     a,
                 };
-                let jt = generic_third_contracted(&prog, 0, &[xi_mu, xi_ls]).expect("jet third");
+                let jt = program_third_contracted(&prog, 0, &[xi_mu, xi_ls]).expect("jet third");
                 close(w_u[0], jt[0][0], &format!("dH_μμ μ={mu} η={eta_ls}"));
                 close(c_u[0], jt[0][1], &format!("dH_μls μ={mu} η={eta_ls}"));
                 close(c_u[0], jt[1][0], &format!("dH_lsμ μ={mu} η={eta_ls}"));
@@ -1671,7 +1671,7 @@ mod observed_single_source_oracle_tests {
                     a,
                 };
                 let jt =
-                    generic_fourth_contracted(&prog, 0, &[xi_mu_u, xi_ls_u], &[xi_mu_v, xi_ls_v])
+                    program_fourth_contracted(&prog, 0, &[xi_mu_u, xi_ls_u], &[xi_mu_v, xi_ls_v])
                         .expect("jet fourth");
                 close(w_uv[0], jt[0][0], &format!("d²H_μμ μ={mu} η={eta_ls}"));
                 close(c_uv[0], jt[0][1], &format!("d²H_μls μ={mu} η={eta_ls}"));

@@ -2119,8 +2119,8 @@ mod tests {
         use super::*;
         use gam_math::jet_scalar::JetScalar;
         use gam_math::jet_tower::{
-            RowNllProgramGeneric, generic_fourth_contracted, generic_row_kernel,
-            generic_third_contracted,
+            RowProgram, program_fourth_contracted, program_row_kernel,
+            program_third_contracted,
         };
         use std::sync::Arc;
 
@@ -2133,7 +2133,7 @@ mod tests {
             w: f64,
         }
 
-        impl<const M: usize> RowNllProgramGeneric<M> for MultinomialJetRow<M> {
+        impl<const M: usize> RowProgram<M> for MultinomialJetRow<M> {
             fn n_rows(&self) -> usize {
                 1
             }
@@ -2145,7 +2145,7 @@ mod tests {
                 }
                 Ok(self.eta)
             }
-            fn row_nll_generic<S: JetScalar<M>>(
+            fn eval<S: JetScalar<M>>(
                 &self,
                 row: usize,
                 p: &[S; M],
@@ -2283,7 +2283,7 @@ mod tests {
                 let prog = MultinomialJetRow { eta, obs, w };
 
                 // ── Jet ORACLE vs LIVE production (≤1e-9) ──────────────────────
-                let (jet_v, jet_g, jet_h) = generic_row_kernel(&prog, 0).expect("jet row kernel");
+                let (jet_v, jet_g, jet_h) = program_row_kernel(&prog, 0).expect("jet row kernel");
 
                 // Value + gradient from the live log-lik assembler (NLL = −log_lik,
                 // ∇NLL = −∇log_lik).
@@ -2320,9 +2320,9 @@ mod tests {
                 // Third + fourth directional Fisher jets from the live closed forms.
                 let dir: [f64; M] = std::array::from_fn(|_| rng.uniform(-1.5, 1.5));
                 let u: [f64; M] = std::array::from_fn(|_| rng.uniform(-1.5, 1.5));
-                let jet_third = generic_third_contracted(&prog, 0, &dir).expect("jet third");
+                let jet_third = program_third_contracted(&prog, 0, &dir).expect("jet third");
                 let prod_t3 = prod_third(&family, &eta, &dir);
-                let jet_fourth = generic_fourth_contracted(&prog, 0, &u, &dir).expect("jet fourth");
+                let jet_fourth = program_fourth_contracted(&prog, 0, &u, &dir).expect("jet fourth");
                 let prod_t4 = prod_fourth(&family, &eta, &u, &dir);
                 for a in 0..M {
                     for b in 0..M {
