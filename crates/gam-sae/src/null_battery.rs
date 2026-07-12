@@ -605,14 +605,106 @@ pub fn matched_spectrum_gaussian_null(
     Ok(out)
 }
 
+struct StablePopulationMoments {
+    origin: Array1<f64>,
+    mean_offset: Array1<f64>,
+    covariance: Array2<f64>,
+}
+
+/// Translation-stable multivariate Welford moments.  Coordinates are first
+/// expressed relative to an observed row, preventing a large chart origin from
+/// erasing the small residuals whose covariance is the object being matched.
+fn stable_population_moments(data: ArrayView2<'_, f64>) -> Result<StablePopulationMoments, String> {
+    validate_matrix(data, "stable-moment input")?;
+    let n = data.nrows();
+    let p = data.ncols();
+    let origin = data.row(0).to_owned();
+    let mut mean_offset = Array1::<f64>::zeros(p);
+    let mut second_moment = Array2::<f64>::zeros((p, p));
+    let mut relative = vec![0.0_f64; p];
+    let mut delta = vec![0.0_f64; p];
+    let mut residual = vec![0.0_f64; p];
+    for row in 0..n {
+        let count = (row + 1) as f64;
+        for axis in 0..p {
+            relative[axis] = data[[row, axis]] - origin[axis];
+            delta[axis] = relative[axis] - mean_offset[axis];
+            mean_offset[axis] += delta[axis] / count;
+            residual[axis] = relative[axis] - mean_offset[axis];
+        }
+        for left in 0..p {
+            for right in 0..=left {
+                // The two products are equal in exact arithmetic. Averaging
+                // them preserves symmetry under independently rounded mean
+                // updates without privileging a coordinate ordering.
+                second_moment[[left, right]] +=
+                    0.5 * (delta[left] * residual[right] + delta[right] * residual[left]);
+            }
+        }
+    }
+    let inverse_count = 1.0 / n as f64;
+    let mut covariance = Array2::<f64>::zeros((p, p));
+    for left in 0..p {
+        for right in 0..=left {
+            let value = second_moment[[left, right]] * inverse_count;
+            covariance[[left, right]] = value;
+            covariance[[right, left]] = value;
+        }
+    }
+    if mean_offset
+        .iter()
+        .chain(covariance.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err("stable mean/covariance accumulation overflowed".to_string());
+    }
+    Ok(StablePopulationMoments {
+        origin,
+        mean_offset,
+        covariance,
+    })
+}
+
+/// Certify that a symmetric covariance eigenspectrum is positive semidefinite
+/// up to the backward error of its eigendecomposition. A negative eigenvalue
+/// no larger than `64 * p * eps * trace` in magnitude is numerical zero; a
+/// value beyond that scale-relative envelope is a material indefiniteness and
+/// must not be silently projected into a different covariance.
+fn certified_covariance_spectrum(
+    eigenvalues: ArrayView1<'_, f64>,
+    covariance_trace: f64,
+) -> Result<Vec<f64>, String> {
+    if !covariance_trace.is_finite() || covariance_trace < 0.0 {
+        return Err(format!(
+            "covariance trace must be finite and non-negative; got {covariance_trace}"
+        ));
+    }
+    let tolerance = 64.0 * eigenvalues.len() as f64 * f64::EPSILON * covariance_trace;
+    let mut certified = Vec::with_capacity(eigenvalues.len());
+    for (axis, &eigenvalue) in eigenvalues.iter().enumerate() {
+        if !eigenvalue.is_finite() {
+            return Err(format!(
+                "covariance eigenvalue {axis} is non-finite: {eigenvalue}"
+            ));
+        }
+        if eigenvalue < -tolerance {
+            return Err(format!(
+                "covariance is materially indefinite: eigenvalue {axis}={eigenvalue:.6e} is below the numerical PSD tolerance -{tolerance:.6e}"
+            ));
+        }
+        certified.push(if eigenvalue < 0.0 { 0.0 } else { eigenvalue });
+    }
+    Ok(certified)
+}
+
 /// Gaussian null matched to the observed mean and full covariance.
 ///
 /// The covariance square root is formed from the symmetric eigendecomposition,
 /// not by adding a ridge: zero empirical eigenvalues stay exactly zero, so a
 /// rank-deficient coordinate cloud produces a rank-deficient matched null
-/// rather than a different full-rank distribution. Tiny negative eigenvalues
-/// produced solely by floating-point eigensolver roundoff are projected to the
-/// positive-semidefinite cone at zero.
+/// rather than a different full-rank distribution. A scale-relative backward-
+/// error certificate distinguishes numerical negative zero from a materially
+/// indefinite spectrum before any projection is allowed.
 pub fn covariance_matched_gaussian_null(
     data: ArrayView2<'_, f64>,
     seed: u64,
@@ -623,40 +715,31 @@ pub fn covariance_matched_gaussian_null(
     validate_matrix(data, "covariance-matched Gaussian input")?;
     let n = data.nrows();
     let p = data.ncols();
-    let mean = column_mean(data);
-    let mut covariance = Array2::<f64>::zeros((p, p));
-    for row in data.rows() {
-        for a in 0..p {
-            let da = row[a] - mean[a];
-            for b in 0..=a {
-                covariance[[a, b]] += da * (row[b] - mean[b]);
-            }
-        }
-    }
-    for a in 0..p {
-        for b in 0..=a {
-            let value = covariance[[a, b]] / n as f64;
-            covariance[[a, b]] = value;
-            covariance[[b, a]] = value;
-        }
-    }
-    let (eigenvalues, eigenvectors) = covariance.eigh(Side::Lower).map_err(|error| {
+    let moments = stable_population_moments(data)?;
+    let covariance_trace = moments.covariance.diag().sum();
+    let (eigenvalues, eigenvectors) = moments.covariance.eigh(Side::Lower).map_err(|error| {
         format!("covariance-matched Gaussian eigendecomposition failed: {error}")
     })?;
+    let eigenvalues = certified_covariance_spectrum(eigenvalues.view(), covariance_trace)?;
 
     let mut rng = StdRng::seed_from_u64(seed);
     let mut out = Array2::<f64>::zeros((n, p));
     let mut scaled_normal = vec![0.0_f64; p];
     for row in 0..n {
         for axis in 0..p {
-            scaled_normal[axis] = eigenvalues[axis].max(0.0).sqrt() * standard_normal(&mut rng);
+            scaled_normal[axis] = eigenvalues[axis].sqrt() * standard_normal(&mut rng);
         }
         for col in 0..p {
-            let mut draw = mean[col];
+            let mut relative_draw = moments.mean_offset[col];
             for axis in 0..p {
-                draw += eigenvectors[[col, axis]] * scaled_normal[axis];
+                relative_draw += eigenvectors[[col, axis]] * scaled_normal[axis];
             }
-            out[[row, col]] = draw;
+            out[[row, col]] = moments.origin[col] + relative_draw;
+            if !out[[row, col]].is_finite() {
+                return Err(format!(
+                    "covariance-matched Gaussian draw overflowed at row {row}, column {col}"
+                ));
+            }
         }
     }
     Ok(out)
@@ -1954,6 +2037,110 @@ mod tests {
                     realized[[a, b]],
                 );
             }
+        }
+    }
+
+    #[test]
+    fn covariance_matched_moments_obey_translation_rotation_and_scale_laws() {
+        let rows = 4_096usize;
+        let mut base = Array2::<f64>::zeros((rows, 3));
+        for row in 0..rows {
+            let phase = std::f64::consts::TAU * row as f64 / rows as f64;
+            base[[row, 0]] = 2.0 * phase.cos() + 0.2 * (3.0 * phase).sin();
+            base[[row, 1]] = 0.7 * phase.sin() + 0.4 * base[[row, 0]];
+            base[[row, 2]] = 0.3 * (2.0 * phase).cos() - 0.2 * base[[row, 1]];
+        }
+        let reference = stable_population_moments(base.view()).unwrap();
+
+        let translation = [1.0e12, -2.0e12, 0.5e12];
+        let mut translated = base.clone();
+        for mut row in translated.rows_mut() {
+            for axis in 0..3 {
+                row[axis] += translation[axis];
+            }
+        }
+        let shifted = stable_population_moments(translated.view()).unwrap();
+        for axis in 0..3 {
+            let reference_mean = reference.origin[axis] + reference.mean_offset[axis];
+            let shifted_mean = shifted.origin[axis] + shifted.mean_offset[axis];
+            assert!(
+                (shifted_mean - translation[axis] - reference_mean).abs() < 3.0e-4,
+                "translation destabilized mean axis {axis}: reference={reference_mean}, shifted={shifted_mean}"
+            );
+        }
+        for left in 0..3 {
+            for right in 0..3 {
+                assert!(
+                    (shifted.covariance[[left, right]] - reference.covariance[[left, right]]).abs()
+                        < 3.0e-4,
+                    "translation changed covariance ({left},{right})"
+                );
+            }
+        }
+
+        let scale = 1.0e-7_f64;
+        let scaled = base.mapv(|value| scale * value);
+        let scaled_moments = stable_population_moments(scaled.view()).unwrap();
+        let covariance_scale = reference
+            .covariance
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        for left in 0..3 {
+            for right in 0..3 {
+                let expected = scale * scale * reference.covariance[[left, right]];
+                let error = (scaled_moments.covariance[[left, right]] - expected).abs();
+                assert!(error < 2.0e-13 * scale * scale * covariance_scale);
+            }
+        }
+
+        let angle = 0.713_f64;
+        let (sin_angle, cos_angle) = angle.sin_cos();
+        let rotation = ndarray::array![
+            [cos_angle, -sin_angle, 0.0],
+            [sin_angle, cos_angle, 0.0],
+            [0.0, 0.0, 1.0]
+        ];
+        let rotated = base.dot(&rotation.t());
+        let rotated_moments = stable_population_moments(rotated.view()).unwrap();
+        let expected_rotated = rotation.dot(&reference.covariance).dot(&rotation.t());
+        for left in 0..3 {
+            for right in 0..3 {
+                assert!(
+                    (rotated_moments.covariance[[left, right]] - expected_rotated[[left, right]])
+                        .abs()
+                        < 2.0e-12,
+                    "orthogonal covariance law failed at ({left},{right})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn covariance_psd_certificate_rejects_material_negative_spectrum() {
+        let trace = 3.0_f64;
+        let dimension = 3usize;
+        let tolerance = 64.0 * dimension as f64 * f64::EPSILON * trace;
+        let roundoff = ndarray::array![-0.5 * tolerance, 1.0, 2.0];
+        let certified = certified_covariance_spectrum(roundoff.view(), trace).unwrap();
+        assert_eq!(certified[0], 0.0);
+        assert_eq!(certified[1..], [1.0, 2.0]);
+
+        let indefinite = ndarray::array![-2.0 * tolerance, 1.0, 2.0];
+        let error = certified_covariance_spectrum(indefinite.view(), trace)
+            .expect_err("material indefiniteness must not be silently projected");
+        assert!(error.contains("materially indefinite"), "{error}");
+
+        let scale_squared = 1.0e-18_f64;
+        let scaled = roundoff.mapv(|value| scale_squared * value);
+        let scaled_certified =
+            certified_covariance_spectrum(scaled.view(), scale_squared * trace).unwrap();
+        for axis in 0..dimension {
+            assert_eq!(
+                scaled_certified[axis],
+                scale_squared * certified[axis],
+                "PSD certificate must commute with covariance scaling"
+            );
         }
     }
 
