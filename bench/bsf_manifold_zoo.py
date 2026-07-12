@@ -64,96 +64,14 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
 from bench._synth_sae_metrics import _hungarian_max_numpy
+from bench.manifold_zoo_geometry import CURVED_CYCLE, ZOO, validate_analytic_sample
 from gamfit._description_length import FittedFeaturizer, description_length
 
-# --------------------------------------------------------------------------- #
-# The manifold zoo (their Appendix table, verbatim parametrizations)          #
-# --------------------------------------------------------------------------- #
-
-
-@dataclass(frozen=True)
-class ZooType:
-    name: str
-    intrinsic_dim: int
-    span_dim: int
-    sampler: Callable[[np.random.Generator, int], tuple[np.ndarray, np.ndarray]]
-    """(rng, n) -> (points (n, span_dim), intrinsic coords (n, intrinsic_dim))."""
-
-
-def _segment(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
-    t = rng.uniform(-1.0, 1.0, size=n)
-    return t[:, None], t[:, None]
-
-
-def _circle(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
-    th = rng.uniform(0.0, 2.0 * np.pi, size=n)
-    return np.column_stack([np.cos(th), np.sin(th)]), th[:, None]
-
-
-def _disk(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
-    th = rng.uniform(0.0, 2.0 * np.pi, size=n)
-    r = np.sqrt(rng.uniform(0.0, 1.0, size=n))
-    return np.column_stack([r * np.cos(th), r * np.sin(th)]), np.column_stack([r, th])
-
-
-def _sphere(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
-    th = rng.uniform(0.0, 2.0 * np.pi, size=n)
-    phi = np.arccos(rng.uniform(-1.0, 1.0, size=n))  # uniform on the sphere
-    pts = np.column_stack(
-        [np.sin(phi) * np.cos(th), np.sin(phi) * np.sin(th), np.cos(phi)]
-    )
-    return pts, np.column_stack([phi, th])
-
-
-def _torus(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
-    big_r, small_r = 1.0, 0.4
-    th = rng.uniform(0.0, 2.0 * np.pi, size=n)
-    phi = rng.uniform(0.0, 2.0 * np.pi, size=n)
-    ring = big_r + small_r * np.cos(phi)
-    pts = np.column_stack([ring * np.cos(th), ring * np.sin(th), small_r * np.sin(phi)])
-    return pts, np.column_stack([th, phi])
-
-
-def _mobius(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
-    phi = rng.uniform(0.0, 2.0 * np.pi, size=n)
-    t = rng.uniform(-0.5, 0.5, size=n)
-    a = 1.0 + t * np.cos(phi / 2.0)
-    pts = np.column_stack([a * np.cos(phi), a * np.sin(phi), t * np.sin(phi / 2.0)])
-    return pts, np.column_stack([phi, t])
-
-
-def _swiss(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
-    th = rng.uniform(1.5 * np.pi, 4.5 * np.pi, size=n)
-    h = rng.uniform(-1.0, 1.0, size=n)
-    pts = np.column_stack([th * np.cos(th), h, th * np.sin(th)])
-    return pts, np.column_stack([th, h])
-
-
-def _helix(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
-    th = rng.uniform(0.0, 4.0 * np.pi, size=n)
-    pts = np.column_stack([np.cos(th), np.sin(th), 0.25 * th])
-    return pts, th[:, None]
-
-
-ZOO: dict[str, ZooType] = {
-    z.name: z
-    for z in (
-        ZooType("segment", 1, 1, _segment),
-        ZooType("circle", 1, 2, _circle),
-        ZooType("disk", 2, 2, _disk),
-        ZooType("sphere", 2, 3, _sphere),
-        ZooType("torus", 2, 3, _torus),
-        ZooType("mobius", 2, 3, _mobius),
-        ZooType("swiss", 2, 3, _swiss),
-        ZooType("helix", 1, 3, _helix),
-    )
-}
-CURVED_CYCLE = ["circle", "disk", "sphere", "torus", "mobius", "swiss", "helix"]
 _CALIBRATION_N = 50_000  # their per-instance center+RMS calibration sample size
 
 
@@ -164,11 +82,14 @@ class FactorInstance:
     mu: np.ndarray  # (span_dim,) calibration mean
     sigma: float  # calibration RMS norm
 
-    def draw(self, rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
-        """(contribution in R^d (n, d), intrinsic coords (n, intrinsic_dim))."""
+    def draw(
+        self, rng: np.random.Generator, n: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return ambient contribution, intrinsic parameters, and native points."""
         raw, theta = ZOO[self.kind].sampler(rng, n)
+        validate_analytic_sample(self.kind, raw, theta)
         local = (raw - self.mu[None, :]) / self.sigma
-        return local @ self.frame, theta
+        return local @ self.frame, theta, local
 
 
 class ZooData:
@@ -237,7 +158,8 @@ class ZooData:
                 )
         for kind in kinds:
             zoo = ZOO[kind]
-            raw, _ = zoo.sampler(rng, _CALIBRATION_N)
+            raw, calibration_parameters = zoo.sampler(rng, _CALIBRATION_N)
+            validate_analytic_sample(kind, raw, calibration_parameters)
             mu = raw.mean(axis=0)
             centered = raw - mu[None, :]
             sigma = float(np.sqrt(np.mean(np.sum(centered * centered, axis=1))))
@@ -273,8 +195,8 @@ class ZooData:
 
         Returns ``(x (n, d), active (n, M) bool, contribs)`` where ``contribs``
         (kept only for eval splits -- it is the ground truth being recovered)
-        is a per-factor list of ``{"rows": idx, "m": contribution, "theta": t}``
-        restricted to the rows where that factor is active.
+        is a per-factor list of ambient contribution, intrinsic parameters, and
+        exact native-span coordinates, restricted to active rows.
         """
         rng = np.random.default_rng(seed)
         x = np.zeros((n, self.d_ambient))
@@ -302,10 +224,16 @@ class ZooData:
             idx = np.flatnonzero(active[:, i])
             if idx.size == 0:
                 if contribs is not None:
-                    contribs.append({"rows": idx, "m": np.zeros((0, self.d_ambient)),
-                                     "theta": np.zeros((0, 1))})
+                    contribs.append(
+                        {
+                            "rows": idx,
+                            "m": np.zeros((0, self.d_ambient)),
+                            "theta": np.zeros((0, ZOO[factor.kind].intrinsic_dim)),
+                            "local": np.zeros((0, ZOO[factor.kind].span_dim)),
+                        }
+                    )
                 continue
-            m_i, theta = factor.draw(rng, idx.size)
+            m_i, theta, local = factor.draw(rng, idx.size)
             if self.dgp == "llm":
                 # Mean-one lognormal amplitude per firing, scaled by the
                 # feature's power-law importance; the ground-truth
@@ -315,9 +243,12 @@ class ZooData:
                     size=idx.size,
                 )
                 m_i = amps[:, None] * m_i
+                local = amps[:, None] * local
             x[idx] += m_i
             if contribs is not None:
-                contribs.append({"rows": idx, "m": m_i, "theta": theta})
+                contribs.append(
+                    {"rows": idx, "m": m_i, "theta": theta, "local": local}
+                )
         if self.dgp == "llm" and self.noise > 0.0:
             # Dense unstructured residual — deliberately NOT part of any
             # factor's ground truth; it is the unexplained-variance floor.
@@ -668,6 +599,8 @@ def dump_clouds(
     max_factors: int = 8,
     max_points: int = 1500,
 ) -> None:
+    if data.dgp != "toy":
+        raise ValueError("native analytic cloud dumps require the nuisance-free toy DGP")
     # Deterministic by factor index so every featurizer dumps the SAME factors
     # and the gallery columns are directly comparable.
     candidates = list(recovery["per_factor"])
@@ -687,7 +620,8 @@ def dump_clouds(
         take = np.arange(rows.size)
         if rows.size > max_points:
             take = np.random.default_rng(0).choice(rows.size, size=max_points, replace=False)
-        m_true = contribs[i]["m"][take]
+        factor = data.factors[i]
+        true_local = contribs[i]["local"][take]
         if isinstance(p["matched_atom"], list):
             _, m_hat_all = _greedy_flat_match(
                 fitted, rows, contribs[i]["m"], ZOO[p["kind"]].span_dim
@@ -695,12 +629,16 @@ def dump_clouds(
             m_hat = m_hat_all[take]
         else:
             m_hat = fitted.atom_contribution(int(p["matched_atom"]))[rows][take]
-        # Project both into the TRUE factor's principal frame (their rendering).
-        center = m_true.mean(axis=0, keepdims=True)
-        _u, _s, vt = np.linalg.svd(m_true - center, full_matrices=False)
-        frame = vt[:3]
-        payload[f"true_{i}"] = ((m_true - center) @ frame.T).astype(np.float32)
-        payload[f"rec_{i}"] = ((m_hat - center) @ frame.T).astype(np.float32)
+        # frame.T exactly inverts the random isometry. Undoing the deterministic
+        # center/RMS calibration then restores the sampler's original native
+        # analytic coordinates. No displayed-point PCA, SVD, UMAP, or learned
+        # projection is involved.
+        recovered_local = m_hat @ factor.frame.T
+        true_native = true_local * factor.sigma + factor.mu[None, :]
+        recovered_native = recovered_local * factor.sigma + factor.mu[None, :]
+        validate_analytic_sample(p["kind"], true_native, contribs[i]["theta"][take])
+        payload[f"true_{i}"] = true_native.astype(np.float32)
+        payload[f"rec_{i}"] = recovered_native.astype(np.float32)
         payload[f"theta_{i}"] = contribs[i]["theta"][take].astype(np.float32)
         if fitted.atom_intrinsic_coords is not None and not isinstance(p["matched_atom"], list):
             coords = fitted.atom_intrinsic_coords(int(p["matched_atom"]))
@@ -716,7 +654,8 @@ def dump_clouds(
     payload["meta_json"] = np.frombuffer(
         json.dumps(
             {
-                "schema": "joint-manifold-sae-clouds-v1",
+                "schema": "joint-manifold-sae-analytic-clouds-v2",
+                "coordinate_space": "native-analytic",
                 "featurizer": fitted.name,
                 "joint_fit": fitted.name == "ours_rust",
                 "fit_config": (fitted.extras or {}).get("fit_config"),

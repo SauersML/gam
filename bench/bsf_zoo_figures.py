@@ -244,11 +244,15 @@ def _atlas_cloud_records(
     records: dict[str, dict[str, Any]] = {}
     with np.load(path) as store:
         meta = _cloud_meta(store)
-        if meta.get("schema") != "joint-manifold-sae-clouds-v1":
-            raise ValueError("cloud file does not use the joint-fit schema")
+        if meta.get("schema") != "joint-manifold-sae-analytic-clouds-v2":
+            raise ValueError("cloud file does not use the native analytic joint-fit schema")
+        if meta.get("coordinate_space") != "native-analytic":
+            raise ValueError("cloud file does not contain native analytic coordinates")
         if meta.get("featurizer") != "ours_rust" or meta.get("joint_fit") is not True:
             raise ValueError("cloud file is not a joint Rust Manifold SAE fit")
         data_config = meta.get("data_config") or {}
+        if data_config.get("dgp") != "toy":
+            raise ValueError("atlas ground truth must use the nuisance-free analytic toy DGP")
         if data_config.get("kinds") != ATLAS_KINDS:
             raise ValueError(
                 "joint fit must contain the eight analytic zoo factors in atlas order"
