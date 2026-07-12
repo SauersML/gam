@@ -6376,6 +6376,149 @@ mod tests {
         );
     }
 
+    /// DIAGNOSTIC (temporary #2240): fit the PCA-folded Duchon sheet and the
+    /// intrinsic-unfolded Duchon sheet directly and print their in-sample REML
+    /// scores, to see why the intrinsic challenger loses the race.
+    #[test]
+    fn diag_swiss_roll_duchon_reml_scores() {
+        use ndarray::Array1;
+        let (n_t, n_h) = (45usize, 10usize);
+        let n = n_t * n_h;
+        let mut target = Array2::<f64>::zeros((n, 3));
+        for ti in 0..n_t {
+            let t = 1.2 * std::f64::consts::PI
+                + (3.2 - 1.2) * std::f64::consts::PI * ti as f64 / (n_t - 1) as f64;
+            for hi in 0..n_h {
+                let h = 10.0 * hi as f64 / (n_h - 1) as f64;
+                let row = ti * n_h + hi;
+                target[[row, 0]] = t * t.cos();
+                target[[row, 1]] = h;
+                target[[row, 2]] = t * t.sin();
+            }
+        }
+        let rows: Vec<usize> = (0..n).collect();
+        let weights = Array1::<f64>::ones(n);
+
+        // PCA standardized 2-PC chart, exactly as discover_primary_atom_topologies.
+        let mut mean = vec![0.0_f64; 3];
+        for &row in &rows {
+            for col in 0..3 {
+                mean[col] += target[[row, col]];
+            }
+        }
+        for v in &mut mean {
+            *v /= rows.len() as f64;
+        }
+        let mut local = Array2::<f64>::zeros((rows.len(), 3));
+        for (o, &r) in rows.iter().enumerate() {
+            for col in 0..3 {
+                local[[o, col]] = target[[r, col]] - mean[col];
+            }
+        }
+        let (_u, _s, vt) = local.svd(false, true).unwrap();
+        let vt = vt.unwrap();
+        let n_pcs = vt.nrows().min(4);
+        let mut proj = Array2::<f64>::zeros((n, n_pcs));
+        for row in 0..n {
+            for pc in 0..n_pcs {
+                let mut acc = 0.0;
+                for col in 0..3 {
+                    acc += (target[[row, col]] - mean[col]) * vt[[pc, col]];
+                }
+                proj[[row, pc]] = acc;
+            }
+        }
+        let sd = |pc: usize| -> f64 {
+            let mut acc = 0.0;
+            for &r in &rows {
+                acc += proj[[r, pc]] * proj[[r, pc]];
+            }
+            (acc / rows.len() as f64).sqrt().max(1e-12)
+        };
+        let (sd0, sd1) = (sd(0), sd(1));
+        let mut pca_coords = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            pca_coords[[row, 0]] = proj[[row, 0]] / sd0;
+            pca_coords[[row, 1]] = proj[[row, 1]] / sd1;
+        }
+        let budget = duchon_sheet_race_center_budget(rows.len());
+        let pca_centers = duchon_sheet_centers(&pca_coords, &rows, budget).unwrap();
+        let pca_duchon = TopologyCandidateSpec {
+            kind: AutoTopologyKind::DuchonSheet,
+            basis_kind: SaeAtomBasisKind::Duchon,
+            manifold: LatentManifold::Euclidean,
+            latent_dim: 2,
+            evaluator: Arc::new(
+                DuchonCoordinateEvaluator::new(pca_centers, DUCHON_SHEET_M).unwrap(),
+            ),
+            coords: pca_coords.clone(),
+        };
+        let pca_flat = TopologyCandidateSpec {
+            kind: AutoTopologyKind::Euclidean,
+            basis_kind: SaeAtomBasisKind::EuclideanPatch,
+            manifold: LatentManifold::Euclidean,
+            latent_dim: 2,
+            evaluator: Arc::new(EuclideanPatchEvaluator::new(2, 2).unwrap()),
+            coords: pca_coords.clone(),
+        };
+        let pca_duchon_reml = fit_topology_candidate(&pca_duchon, target.view(), weights.view())
+            .unwrap()
+            .raw_reml;
+        let pca_flat_reml = fit_topology_candidate(&pca_flat, target.view(), weights.view())
+            .unwrap()
+            .raw_reml;
+
+        // Intrinsic challenger specs on the geodesic-unfolded chart.
+        let (int_specs, int_chart) =
+            build_intrinsic_primary_specs(target.view(), &rows, 2).unwrap().unwrap();
+        let mut int_lines = String::new();
+        for spec in &int_specs {
+            let reml = fit_topology_candidate(spec, target.view(), weights.view())
+                .unwrap()
+                .raw_reml;
+            int_lines.push_str(&format!(" [{:?} reml={reml}]", spec.basis_kind));
+        }
+        // In-sample reconstruction R² of each chart (proof of fit quality).
+        let recon_r2 = |spec: &TopologyCandidateSpec| -> f64 {
+            let fit = fit_topology_candidate(spec, target.view(), weights.view())
+                .unwrap()
+                .fit_handle;
+            let recon = fit.phi.dot(&fit.decoder);
+            let (mut sr, mut st) = (0.0_f64, 0.0_f64);
+            for row in 0..n {
+                for col in 0..3 {
+                    let r = target[[row, col]] - recon[[row, col]];
+                    sr += r * r;
+                    let c = target[[row, col]] - mean[col];
+                    st += c * c;
+                }
+            }
+            1.0 - sr / st
+        };
+        let int_duchon = int_specs
+            .iter()
+            .find(|s| s.basis_kind == SaeAtomBasisKind::Duchon)
+            .unwrap();
+        let int_chart_span = {
+            let mut lo = [f64::INFINITY; 2];
+            let mut hi = [f64::NEG_INFINITY; 2];
+            for row in 0..n {
+                for c in 0..2 {
+                    lo[c] = lo[c].min(int_chart[[row, c]]);
+                    hi[c] = hi[c].max(int_chart[[row, c]]);
+                }
+            }
+            [hi[0] - lo[0], hi[1] - lo[1]]
+        };
+        panic!(
+            "DIAG2: pca_duchon_reml={pca_duchon_reml} pca_flat_reml={pca_flat_reml} int={int_lines} \
+             pca_duchon_insample_r2={} int_duchon_insample_r2={} int_chart_span={:?}",
+            recon_r2(&pca_duchon),
+            recon_r2(int_duchon),
+            int_chart_span
+        );
+    }
+
     /// #2243 — a circle winner's harmonic RESOLUTION is grown by evidence, not
     /// pinned to the historical fixed budget (2 harmonics at the default
     /// `d_atom = 2`). The planted 1-D factor carries energy at the fundamental
