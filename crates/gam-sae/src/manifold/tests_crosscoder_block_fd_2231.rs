@@ -213,7 +213,7 @@ fn rho_flat_round_trip_carries_block_coordinates() {
     assert_eq!(flat[plain_len], 0.7);
     assert_eq!(flat[plain_len + 1], -0.4);
 
-    let recovered = block.from_flat(flat.view());
+    let recovered = block.from_flat(flat.view()).unwrap();
     assert_eq!(recovered.log_lambda_block, vec![0.7, -0.4]);
     assert_eq!(recovered.log_lambda_sparse, -0.3);
     assert_eq!(recovered.log_lambda_smooth, vec![0.5, 0.5]);
@@ -226,7 +226,7 @@ fn rho_flat_round_trip_carries_block_coordinates() {
     // 1 sparse + 2 smooth + 1 shared axis + 1 block.
     assert_eq!(sflat.len(), 1 + 2 + 1 + 1);
     assert_eq!(sflat[sflat.len() - 1], 1.1);
-    let srecovered = shared.from_flat(sflat.view());
+    let srecovered = shared.from_flat(sflat.view()).unwrap();
     assert_eq!(srecovered.log_lambda_block, vec![1.1]);
 }
 
@@ -238,6 +238,6 @@ fn empty_block_flat_is_plain_sae_layout() {
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![arr1(&[0.0_f64])]);
     let flat: Array1<f64> = rho.to_flat();
     assert_eq!(flat.len(), 1 + 1 + 1);
-    let back = rho.from_flat(flat.view());
+    let back = rho.from_flat(flat.view()).unwrap();
     assert!(back.log_lambda_block.is_empty());
 }

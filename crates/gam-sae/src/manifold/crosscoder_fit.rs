@@ -1000,7 +1000,7 @@ pub fn run_sae_crosscoder_fit(
     let faer_sequential_whole_fit = gam_linalg::faer_ndarray::FaerSequentialScope::enter();
 
     let objective = if request.run_outer_rho_search {
-        let search_initial = match objective.try_resume_from_checkpoint(n_params) {
+        let search_initial = match objective.try_resume_from_checkpoint(n_params)? {
             Some(banked) => ndarray::Array1::from(banked),
             None => initial_flat,
         };

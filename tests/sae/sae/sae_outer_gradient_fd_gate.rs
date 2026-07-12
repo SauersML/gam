@@ -164,8 +164,8 @@ fn centered_fd(
     let mut minus = template.to_flat();
     plus[coord] += h;
     minus[coord] -= h;
-    let rho_plus = template.from_flat(plus.view());
-    let rho_minus = template.from_flat(minus.view());
+    let rho_plus = template.from_flat(plus.view()).unwrap();
+    let rho_minus = template.from_flat(minus.view()).unwrap();
     let (_, vp, _, _) = evaluate(start, target, &rho_plus, inner_max_iter);
     let (_, vm, _, _) = evaluate(start, target, &rho_minus, inner_max_iter);
     (vp - vm) / (2.0 * h)
@@ -349,8 +349,8 @@ fn frozen_explicit_fd(
     let mut minus = template.to_flat();
     plus[coord] += h;
     minus[coord] -= h;
-    let rho_plus = template.from_flat(plus.view());
-    let rho_minus = template.from_flat(minus.view());
+    let rho_plus = template.from_flat(plus.view()).unwrap();
+    let rho_minus = template.from_flat(minus.view()).unwrap();
     let lp = term
         .loss(target.view(), &rho_plus)
         .expect("frozen-θ loss +h")
@@ -492,7 +492,7 @@ fn zz_2087_third_order_envelope_discriminator_softmax() {
     let h_small = 2.0e-4;
     let mut plus = f.rho.to_flat();
     plus[coord] += h_small;
-    let rho_plus = f.rho.from_flat(plus.view());
+    let rho_plus = f.rho.from_flat(plus.view()).unwrap();
     let frozen_plus = converged
         .loss(f.target.view(), &rho_plus)
         .expect("frozen-θ loss at rho+h")
@@ -516,8 +516,8 @@ fn zz_2087_third_order_envelope_discriminator_softmax() {
         let mut m_ = f.rho.to_flat();
         p[coord] += h;
         m_[coord] -= h;
-        let rho_p = f.rho.from_flat(p.view());
-        let rho_m = f.rho.from_flat(m_.view());
+        let rho_p = f.rho.from_flat(p.view()).unwrap();
+        let rho_m = f.rho.from_flat(m_.view()).unwrap();
         let (_, vp, _, _) = evaluate(&converged, &f.target, &rho_p, 64);
         let (_, vm, _, _) = evaluate(&converged, &f.target, &rho_m, 64);
         let fd = (vp - vm) / (2.0 * h);

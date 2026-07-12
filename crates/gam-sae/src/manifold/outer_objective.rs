@@ -1128,23 +1128,37 @@ impl SaeManifoldOuterObjective {
     /// into the term (and the baseline term, so a multi-start `reset` re-opens
     /// from the banked state rather than the cold seed), seeds the termination
     /// ledger counters, and returns the banked outer ρ to open the search at.
-    /// Any incompatibility or install failure is logged and the fit proceeds
-    /// cold — a checkpoint can improve a fit, never break one.
-    pub fn try_resume_from_checkpoint(&mut self, expected_rho_len: usize) -> Option<Vec<f64>> {
+    /// Structural incompatibility or mutable-state install failure is logged and
+    /// the fit proceeds cold. A shape-compatible checkpoint whose rho violates
+    /// the objective's mathematical domain is different: it is a typed refusal,
+    /// because silently replacing that optimization state would conceal corrupt
+    /// outer coordinates.
+    pub fn try_resume_from_checkpoint(
+        &mut self,
+        expected_rho_len: usize,
+    ) -> Result<Option<Vec<f64>>, String> {
         self.fit_verdict = None;
         if !self.checkpoint_path.exists() {
-            return None;
+            return Ok(None);
         }
         let ckpt = match super::checkpoint::SaeFitCheckpoint::load(&self.checkpoint_path) {
             Ok(c) => c,
             Err(e) => {
                 log::warn!("SAE fit checkpoint resume: {e}; fitting cold");
-                return None;
+                return Ok(None);
             }
         };
         if let Err(e) = ckpt.verify_compatible(&self.checkpoint_fingerprint, expected_rho_len) {
             log::warn!("SAE fit checkpoint resume: {e}; fitting cold");
-            return None;
+            return Ok(None);
+        }
+        if let Err(e) = self
+            .baseline_rho
+            .from_flat(ArrayView1::from(ckpt.rho_flat.as_slice()))
+        {
+            return Err(format!(
+                "SAE fit checkpoint resume refused invalid rho payload: {e}"
+            ));
         }
         let install_result = ckpt.install_into(&mut self.term);
         if install_result.is_ok()
@@ -1154,7 +1168,7 @@ impl SaeManifoldOuterObjective {
         }
         if let Err(e) = install_result {
             log::warn!("SAE fit checkpoint resume: {e}; fitting cold");
-            return None;
+            return Ok(None);
         }
         self.termination.seed_from_checkpoint(
             ckpt.ledger.evals,
@@ -1168,7 +1182,7 @@ impl SaeManifoldOuterObjective {
             ckpt.ledger.evals,
             ckpt.ledger.best_cost,
         );
-        Some(ckpt.rho_flat)
+        Ok(Some(ckpt.rho_flat))
     }
 
     /// Remove the banked checkpoint after a CONVERGED fit is minted: its
@@ -2187,7 +2201,7 @@ impl SaeManifoldOuterObjective {
         // certificate is single-use evidence for the exact state/rho pair that
         // produced it, never a sticky success flag.
         self.fit_verdict = None;
-        let rho = self.baseline_rho.from_flat(rho_flat);
+        let rho = self.baseline_rho.from_flat(rho_flat)?;
         // #2231 Inc-B — materialize the block-relevance target scaling for THIS ρ
         // before any inner solve reads `self.target`. Every value/refine/member/
         // discovery lane funnels through this one drive, so a single idempotent
@@ -2305,7 +2319,7 @@ impl SaeManifoldOuterObjective {
     pub fn fit_at_fixed_rho(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<(), String> {
         self.fit_verdict = None;
         self.terminal_penalized_quasi_laplace_criterion = None;
-        let rho_state = self.baseline_rho.from_flat(rho_flat.clone());
+        let rho_state = self.baseline_rho.from_flat(rho_flat.clone())?;
         let (criterion, _) = self.evaluate_with_refine_policy(rho_flat, true)?;
         let jacobian = self.block_jacobian(&rho_state);
         let cost = criterion + jacobian;
@@ -2480,7 +2494,7 @@ impl SaeManifoldOuterObjective {
 
         // (5) Admit the discovery basin and read the envelope. `same_basin_at_rho`
         // needs the centered target variance normalizer; compute it once.
-        let rho_state = self.baseline_rho.from_flat(rho_flat);
+        let rho_state = self.baseline_rho.from_flat(rho_flat)?;
         let ss_tot =
             super::fit_drivers::TargetCenteredColStats::compute(self.target.view()).ss_tot();
         let len_before = bundle.len();
@@ -2657,7 +2671,7 @@ impl SaeManifoldOuterObjective {
         // #2230/#2087 — the EFS lane commits a new accepted basin below; the
         // saved envelope basins are keyed to the pre-step accepted basin.
         self.basin_bundle.clear();
-        let rho = self.baseline_rho.from_flat(rho_flat);
+        let rho = self.baseline_rho.from_flat(rho_flat)?;
         let n_params = rho.to_flat().len();
         // #2231 Inc-B — scale the block columns for this ρ before the EFS inner
         // solve reads `self.target` (idempotent; no-op for a plain SAE).
@@ -3565,7 +3579,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
             Ok((cost, _beta)) => {
                 // #2231 Inc-B — price the block-relevance Jacobian into the SAME
                 // cost that flows to `termination.record` (0 for a plain SAE).
-                let cost = cost + self.block_jacobian(&self.baseline_rho.from_flat(rho.view()));
+                let rho_state = self
+                    .baseline_rho
+                    .from_flat(rho.view())
+                    .map_err(EstimationError::InvalidInput)?;
+                let cost = cost + self.block_jacobian(&rho_state);
                 if !cost.is_finite() {
                     return Ok(f64::INFINITY);
                 }
@@ -3590,7 +3608,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
         self.check_cancelled()?;
         self.probe_telemetry.criterion_calls += 1;
-        let rho_state = self.baseline_rho.from_flat(rho.view());
+        let rho_state = self
+            .baseline_rho
+            .from_flat(rho.view())
+            .map_err(EstimationError::InvalidInput)?;
         // #2231 Inc-B — scale the block columns for this ρ before either the
         // streaming value path or the dense `penalized_quasi_laplace_criterion_with_cache` below
         // reads `self.target` (idempotent; no-op for a plain SAE).
@@ -3919,7 +3940,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // #2231 Inc-B — price the block Jacobian into the line-search
                 // probe cost (0 for a plain SAE) so the value the outer search
                 // ranks matches the gradient/EFS lanes.
-                let cost = cost + self.block_jacobian(&self.baseline_rho.from_flat(rho.view()));
+                let rho_state = self
+                    .baseline_rho
+                    .from_flat(rho.view())
+                    .map_err(EstimationError::InvalidInput)?;
+                let cost = cost + self.block_jacobian(&rho_state);
                 if !cost.is_finite() {
                     return Ok(OuterEval::infeasible(rho.len()));
                 }
@@ -3951,7 +3976,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // `efs_step` already populated the block-tail Fellner–Schall step
         // `Δlog λ_ℓ = ln(n·p_ℓ/R̃_ℓ)`, so the EFS descent moves the block λ toward
         // the same root the gradient lane vanishes at.
-        eval.cost += self.block_jacobian(&self.baseline_rho.from_flat(rho.view()));
+        let rho_state = self
+            .baseline_rho
+            .from_flat(rho.view())
+            .map_err(EstimationError::InvalidInput)?;
+        eval.cost += self.block_jacobian(&rho_state);
         if self.termination.record(eval.cost) {
             self.bank_checkpoint(rho);
         }
@@ -3966,7 +3995,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
         let (evaluation, coordinates) = self
             .efs_step_with_certificate(rho.view())
             .map_err(EstimationError::RemlOptimizationFailed)?;
-        let cost = evaluation.cost + self.block_jacobian(&self.baseline_rho.from_flat(rho.view()));
+        let rho_state = self
+            .baseline_rho
+            .from_flat(rho.view())
+            .map_err(EstimationError::InvalidInput)?;
+        let cost = evaluation.cost + self.block_jacobian(&rho_state);
         Ok(FixedPointCertificateEval { cost, coordinates })
     }
 
@@ -4026,8 +4059,12 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 
     fn outer_domain_upper_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
+        self.baseline_rho
+            .validate_ard_log_strength_domain()
+            .map_err(EstimationError::InvalidInput)?;
+        let ard_upper = self.baseline_rho.ard_flat_domain_upper_bound();
         let Some(contract) = self.reactive_domain_scalar_contract()? else {
-            return Ok(None);
+            return Ok(ard_upper);
         };
         // The reactive entry replaces the invalid common cold dictionary with a
         // deterministic disjoint-chart placement. Derive the legal rho face
@@ -4049,13 +4086,25 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     "reactive rho domain could not construct its separated entry geometry: {error}"
                 ))
             })?;
-        reactive_rho_domain_upper(
+        let mut reactive_upper = reactive_rho_domain_upper(
             &entry_term,
             &self.baseline_rho,
             contract.entry().assignment_temperature,
         )
-        .map(Some)
-        .map_err(EstimationError::RemlOptimizationFailed)
+        .map_err(EstimationError::RemlOptimizationFailed)?;
+        if let Some(ard_upper) = ard_upper {
+            for index in 0..reactive_upper.len() {
+                reactive_upper[index] = reactive_upper[index].min(ard_upper[index]);
+            }
+        }
+        Ok(Some(reactive_upper))
+    }
+
+    fn outer_domain_lower_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
+        self.baseline_rho
+            .validate_ard_log_strength_domain()
+            .map_err(EstimationError::InvalidInput)?;
+        Ok(self.baseline_rho.ard_flat_domain_lower_bound())
     }
 
     /// Dense K≥2 joint fits may have undefined quasi-Laplace score at the literal
@@ -4188,7 +4237,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 state.assignment_temperature,
             )
             .map_err(EstimationError::RemlOptimizationFailed)?;
-            let entry_rho = self.baseline_rho.from_flat(entry_rho_flat.view());
+            let entry_rho = self
+                .baseline_rho
+                .from_flat(entry_rho_flat.view())
+                .map_err(EstimationError::InvalidInput)?;
             self.term
                 .refit_reactive_entry_decoders_at_smooth_face(
                     self.target.view(),
@@ -4259,7 +4311,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
                         .to_string(),
                 )
             })?;
-        let rho_state = self.baseline_rho.from_flat(rho.view());
+        let rho_state = self
+            .baseline_rho
+            .from_flat(rho.view())
+            .map_err(EstimationError::InvalidInput)?;
         let target_contract = self.reactive_domain_scalar_contract()?.ok_or_else(|| {
             EstimationError::RemlOptimizationFailed(
                 "active reactive waypoint lost its scalar contract before commit".to_string(),

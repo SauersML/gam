@@ -180,7 +180,7 @@ fn rho_flat_coordinate_space_is_n_invariant_1033() {
         flat.len()
     );
     // Round-trip is the exact inverse and stays k-dim.
-    let back = rho.from_flat(flat.view());
+    let back = rho.from_flat(flat.view()).unwrap();
     assert_eq!(back.to_flat().len(), RHO_FLAT_LEN);
     assert!(
         flat.iter().all(|v| v.is_finite()),

@@ -603,7 +603,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         // the banked incumbent as the warm start and open the ρ search at the
         // banked coordinate. The resumed run must still CONVERGE on its own —
         // a checkpoint never mints a fit, it only saves the work.
-        let search_init_rho = match objective.try_resume_from_checkpoint(n_params) {
+        let search_init_rho = match objective.try_resume_from_checkpoint(n_params)? {
             Some(banked) => ndarray::Array1::from(banked),
             None => init_rho_flat.clone(),
         };
@@ -748,7 +748,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
             // Resume only the checkpoint for this exact structured phase. Earlier
             // phases have already been deterministically rebuilt on this run;
             // their distinct files cannot leak a differently-whitened state here.
-            let search_init_rho = match objective.try_resume_from_checkpoint(warm_flat.len()) {
+            let search_init_rho = match objective.try_resume_from_checkpoint(warm_flat.len())? {
                 Some(banked) => ndarray::Array1::from(banked),
                 None => warm_flat,
             };

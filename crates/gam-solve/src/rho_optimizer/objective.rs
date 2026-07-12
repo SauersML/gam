@@ -235,6 +235,16 @@ pub trait OuterObjective {
         Ok(None)
     }
 
+    /// Optional objective-owned hard lower domain for the outer coordinates.
+    ///
+    /// This is intersected with the caller's configured box at the same single
+    /// runner seam as [`Self::outer_domain_upper_bound`], before any seed,
+    /// continuation waypoint, solver evaluation, or stationarity certificate can
+    /// observe an out-of-domain coordinate.
+    fn outer_domain_lower_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
+        Ok(None)
+    }
+
     /// Optional opt-in to the device-resident outer REML BFGS-over-ρ driver
     /// (`crate::gpu::reml_outer::run_reml_outer_on_device`). Returns
     /// `Some(adm)` when the objective is a REML evaluator whose

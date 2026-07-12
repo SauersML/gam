@@ -49,7 +49,7 @@ fn fixed_assignment_strength_is_absent_from_flat_rho_layout_2253() {
     // the stored (inner-state) sparse value without emitting it into the outer
     // vector.
     let moved = array![0.7, -0.5];
-    let restored = softmax.from_flat(moved.view());
+    let restored = softmax.from_flat(moved.view()).unwrap();
     assert_eq!(restored.to_flat(), moved);
     assert_abs_diff_eq!(restored.log_lambda_sparse, -1.7, epsilon = 0.0);
 
@@ -107,7 +107,10 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     );
     assert_eq!(evaluation.gradient.len(), 2);
 
-    let rho_state = gradient_objective.baseline_rho.from_flat(base.view());
+    let rho_state = gradient_objective
+        .baseline_rho
+        .from_flat(base.view())
+        .unwrap();
     let mut audit_term = gradient_objective.term.clone();
     let mut atomized_audit_term = audit_term.clone();
     let (audit_value, audit_loss, audit_cache) = audit_term
@@ -210,7 +213,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let frozen_ridge_beta = gradient_objective.ridge_beta;
     let criterion_parts_at = |rho_flat: &Array1<f64>, inner_max_iter: usize| {
         let mut term = frozen_anchor_term.clone();
-        let rho = frozen_baseline_rho.from_flat(rho_flat.view());
+        let rho = frozen_baseline_rho.from_flat(rho_flat.view()).unwrap();
         let (criterion, loss, cache) = term
             .penalized_quasi_laplace_criterion_with_cache(
                 frozen_target.view(),
@@ -562,7 +565,7 @@ fn frozen_state_per_coordinate_channel_fd_audit_2253() {
     objective
         .eval(&base)
         .expect("base gradient lane must converge");
-    let rho_state = objective.baseline_rho.from_flat(base.view());
+    let rho_state = objective.baseline_rho.from_flat(base.view()).unwrap();
     let mut audit_term = objective.term.clone();
     let (_frozen_value, audit_loss, audit_cache) = audit_term
         .penalized_quasi_laplace_criterion_with_cache(
@@ -591,7 +594,7 @@ fn frozen_state_per_coordinate_channel_fd_audit_2253() {
     let anchor_term = objective.term.clone();
     let frozen_cost_at = |rho_flat: &Array1<f64>| -> f64 {
         let mut term = anchor_term.clone();
-        let rho = objective.baseline_rho.from_flat(rho_flat.view());
+        let rho = objective.baseline_rho.from_flat(rho_flat.view()).unwrap();
         term.penalized_quasi_laplace_criterion_with_cache(
             objective.target.view(),
             &rho,

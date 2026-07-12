@@ -205,8 +205,8 @@ fn centered_fd(
     let mut minus = template.to_flat();
     plus[coord] += h;
     minus[coord] -= h;
-    let rho_plus = template.from_flat(plus.view());
-    let rho_minus = template.from_flat(minus.view());
+    let rho_plus = template.from_flat(plus.view()).unwrap();
+    let rho_minus = template.from_flat(minus.view()).unwrap();
     let (_, vp, _, _) = evaluate(start, target, &rho_plus, inner_max_iter);
     let (_, vm, _, _) = evaluate(start, target, &rho_minus, inner_max_iter);
     (vp - vm) / (2.0 * h)

@@ -1000,7 +1000,7 @@ fn ranking_and_gradient_lanes_match_bare_reml() {
     let bare_value = {
         let mut probe = warmstart_test_objective_with_evaluator();
         let target = probe.target.clone();
-        let rho_state = probe.baseline_rho.from_flat(rho_flat.view());
+        let rho_state = probe.baseline_rho.from_flat(rho_flat.view()).unwrap();
         // Warm-start identically to the value lane.
         probe
             .term
@@ -1039,7 +1039,7 @@ fn ranking_and_gradient_lanes_match_bare_reml() {
     let bare_grad = {
         let mut probe = warmstart_test_objective_with_evaluator();
         let target = probe.target.clone();
-        let rho_state = probe.baseline_rho.from_flat(rho_flat.view());
+        let rho_state = probe.baseline_rho.from_flat(rho_flat.view()).unwrap();
         // Warm-start identically to the gradient lane.
         probe
             .term

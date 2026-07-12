@@ -43,7 +43,7 @@ pub(crate) fn sae_manifold_lambda_smooth_is_per_atom_and_roundtrips_1556() {
     }
 
     // Round-trip: from_flat reconstructs every per-atom smoothness entry exactly.
-    let restored = rho.from_flat(flat.view());
+    let restored = rho.from_flat(flat.view()).unwrap();
     assert_eq!(restored.log_lambda_smooth.len(), k);
     for atom in 0..k {
         assert_abs_diff_eq!(

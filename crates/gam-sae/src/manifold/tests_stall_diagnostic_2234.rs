@@ -365,6 +365,7 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
     // internally inconsistent. Finite differences remain confined to this test.
     let banked = objective
         .try_resume_from_checkpoint(n_params)
+        .expect("checkpoint rho must satisfy the objective domain")
         .map(Array1::from)
         .unwrap_or(initial_flat);
     // Align the mutable objective term with the banked rho. The actual audit
@@ -380,7 +381,7 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         "the #2253 discriminator must exercise the profiled Grassmann-frame path"
     );
     let center_term = objective.term.clone();
-    let center_rho = objective.baseline_rho.from_flat(banked.view());
+    let center_rho = objective.baseline_rho.from_flat(banked.view()).unwrap();
     let h = 1.0e-4;
     let mut failures = Vec::new();
     for inner_max_iter in [40usize, 200usize] {
@@ -449,8 +450,8 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
             plus[j] += h;
             let mut minus = banked.clone();
             minus[j] -= h;
-            let plus_rho = objective.baseline_rho.from_flat(plus.view());
-            let minus_rho = objective.baseline_rho.from_flat(minus.view());
+            let plus_rho = objective.baseline_rho.from_flat(plus.view()).unwrap();
+            let minus_rho = objective.baseline_rho.from_flat(minus.view()).unwrap();
             let plus = logdet_audit_point(
                 center.term.clone(),
                 z.view(),

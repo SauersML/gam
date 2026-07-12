@@ -613,7 +613,7 @@ fn shared_ard_collapses_outer_param_count_at_large_k() {
     let mut moved = flat.clone();
     moved[4] = 1.5; // axis-0 shared log-precision
     moved[5] = -2.5; // axis-1 shared log-precision
-    let rebuilt = shared.from_flat(moved.view());
+    let rebuilt = shared.from_flat(moved.view()).unwrap();
     assert_eq!(rebuilt.ard_sharing, ArdSharing::Shared);
     // Every atom that owns axis 0 sees 1.5; every atom owning axis 1 sees -2.5;
     // the 1-axis atom keeps its single axis.
