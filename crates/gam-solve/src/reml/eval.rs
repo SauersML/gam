@@ -204,6 +204,7 @@ pub(crate) fn sigma_cubature_dispatch(
                      falling through to CPU Rayon oracle"
                 );
             }
+            #[cfg(target_os = "linux")]
             Err(crate::gpu_kernels::sigma_cubature::SigmaCubatureGpuError::Geometry(error)) => {
                 return Err(error);
             }

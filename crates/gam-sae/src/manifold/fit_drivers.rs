@@ -4280,7 +4280,25 @@ impl SaeManifoldTerm {
             self.structural_cocollapse_reseeds
         );
         let pc_pair_offset = self.structural_cocollapse_reseeds.saturating_sub(1);
-        self.reseed_atoms_onto_distinct_residual_pcs(&to_reseed, target, rho, pc_pair_offset)?;
+        // #2132 — CURVED reborn atoms take DISJOINT chunks of the uncovered
+        // residual by SEQUENTIAL deflation (peel between atoms): a co-collapsed
+        // dictionary leaves one low-rank structure, so a simultaneous seed re-reads
+        // it for every atom and they re-collide. FLAT atoms keep the simultaneous
+        // PC-offset / data-row seed — their euclidean score-projection charts no
+        // manifold and needs no residual deflation to stay disjoint.
+        let (curved, flat): (Vec<usize>, Vec<usize>) =
+            to_reseed.iter().copied().partition(|&atom| {
+                !matches!(
+                    self.atoms[atom].basis_kind,
+                    SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Linear
+                )
+            });
+        if !curved.is_empty() {
+            self.reseed_curved_atoms_sequential_deflation(&curved, target, rho)?;
+        }
+        if !flat.is_empty() {
+            self.reseed_atoms_onto_distinct_residual_pcs(&flat, target, rho, pc_pair_offset)?;
+        }
         for &atom in &to_reseed {
             self.reseed_collapsed_atom_logits(atom);
         }

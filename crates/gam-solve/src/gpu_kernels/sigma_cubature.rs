@@ -12,6 +12,9 @@ use gam_gpu::gpu_error::GpuError;
 
 #[derive(Debug)]
 pub enum SigmaCubatureGpuError {
+    /// Only the Linux/CUDA dispatch path can surface a geometry error; the
+    /// non-Linux stub declines before any geometry is evaluated.
+    #[cfg(target_os = "linux")]
     Geometry(gam_problem::EstimationError),
     Runtime(GpuError),
 }
@@ -19,6 +22,7 @@ pub enum SigmaCubatureGpuError {
 impl std::fmt::Display for SigmaCubatureGpuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(target_os = "linux")]
             Self::Geometry(error) => write!(f, "{error}"),
             Self::Runtime(error) => write!(f, "{error}"),
         }

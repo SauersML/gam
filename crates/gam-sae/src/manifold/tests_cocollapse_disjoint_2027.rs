@@ -483,3 +483,136 @@ pub(crate) fn overcomplete_distinct_phases_stay_silent_2132() {
         "benign overcomplete pigeonhole sharing (distinct phases) must NOT be flagged"
     );
 }
+
+/// Two circles of UNEQUAL amplitude on disjoint output-channel parities: circle A
+/// (unit amplitude) on the even channels {0, 2}, circle B (`amp_b < 1`) on the odd
+/// channels {1, 3}, driven by incommensurate phases so the circles are not row-
+/// aligned. A DOMINATES, so a co-collapse reseed that seeds both atoms from the
+/// same residual reads circle A for BOTH (re-collision); only a sequential-
+/// deflation reseed — peel A onto atom 0, then seed atom 1 from the remainder —
+/// separates them onto the two disjoint circles.
+fn two_amplitude_circle_target(n: usize, amp_b: f64) -> Array2<f64> {
+    let p = 4usize;
+    let mut z = Array2::<f64>::zeros((n, p));
+    for row in 0..n {
+        let ta = std::f64::consts::TAU * (row as f64) / (n as f64);
+        let tb = std::f64::consts::TAU * (2.0 * row as f64 + 0.37) / (n as f64);
+        z[[row, 0]] = ta.cos();
+        z[[row, 2]] = ta.sin();
+        z[[row, 1]] = amp_b * tb.cos();
+        z[[row, 3]] = amp_b * tb.sin();
+    }
+    z
+}
+
+/// Build a fresh K=2 periodic term (production PCA seed, decoders cold at zero)
+/// from an arbitrary target — the general form of [`two_circle_k2_term`].
+fn k2_periodic_term_from_target(target: &Array2<f64>, m: usize) -> SaeManifoldTerm {
+    let n = target.nrows();
+    let p = target.ncols();
+    let d = 1usize;
+    let k = 2usize;
+    let basis_kinds = vec![SaeAtomBasisKind::Periodic; k];
+    let dims = vec![d; k];
+    let seed = sae_pca_seed_initial_coords(target.view(), &basis_kinds, &dims).unwrap();
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m).unwrap());
+
+    let mut basis_values = Array3::<f64>::zeros((k, n, m));
+    let mut basis_jacobian = Array4::<f64>::zeros((k, n, m, d));
+    let decoder = Array3::<f64>::zeros((k, m, p));
+    let mut penalties = Array3::<f64>::zeros((k, m, m));
+    let mut coords_vec: Vec<Array2<f64>> = Vec::new();
+    for atom in 0..k {
+        let coords = seed.slice(s![atom, .., 0..d]).to_owned();
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        basis_values.slice_mut(s![atom, .., ..]).assign(&phi);
+        basis_jacobian.slice_mut(s![atom, .., .., ..]).assign(&jet);
+        penalties
+            .slice_mut(s![atom, .., ..])
+            .assign(&Array2::<f64>::eye(m));
+        coords_vec.push(coords);
+    }
+    let logits = Array2::<f64>::zeros((n, k));
+    let mut evaluators: Vec<Option<Arc<dyn SaeBasisSecondJet>>> = Vec::new();
+    for _ in 0..k {
+        evaluators.push(Some(evaluator.clone()));
+    }
+    term_from_padded_blocks_with_mode(
+        n,
+        p,
+        &basis_kinds,
+        basis_values.view(),
+        basis_jacobian.view(),
+        &vec![m; k],
+        &dims,
+        decoder.view(),
+        penalties.view(),
+        logits.view(),
+        &coords_vec,
+        AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false),
+        &evaluators,
+    )
+    .unwrap()
+}
+
+/// #2132 births — the SEQUENTIAL-DEFLATION birth reseed must separate co-collapsed
+/// CURVED atoms onto DISJOINT structure. With cold decoders the reconstruction
+/// residual is the full two-circle target; reseeding both atoms must peel the
+/// dominant circle A onto atom 0 and land atom 1 on circle B (what atom 0 left
+/// behind), so their provisional decoders concentrate on OPPOSITE output-channel
+/// parities. A simultaneous seed reads circle A for both atoms (both even-dominant
+/// = re-collision), which this opposite-parity assertion rejects.
+#[test]
+pub(crate) fn birth_reseed_sequential_deflation_separates_curved_atoms_2132() {
+    let n = 96usize;
+    let m = 5usize;
+    let target = two_amplitude_circle_target(n, 0.4);
+    let p = target.ncols();
+    let mut term = k2_periodic_term_from_target(&target, m);
+    let rho = SaeManifoldRho::new(
+        0.0,
+        -6.0,
+        vec![Array1::<f64>::zeros(1), Array1::<f64>::zeros(1)],
+    );
+    // Cold decoders ⇒ reconstruction residual == target (both circles uncovered),
+    // so both atoms carry distinct signal and the sequence reseeds both.
+    let reseeded = term
+        .reseed_curved_atoms_sequential_deflation(&[0, 1], target.view(), &rho)
+        .unwrap();
+    assert_eq!(
+        reseeded,
+        vec![0, 1],
+        "both curved atoms sit above the residual noise floor, so both reseed"
+    );
+
+    // Per-atom provisional-decoder energy split across even vs odd output channels:
+    // circle A lives on the even channels, circle B on the odd.
+    let mut even_frac = [0.0_f64; 2];
+    for (atom_idx, atom) in term.atoms.iter().enumerate() {
+        let b = &atom.decoder_coefficients; // (m × p)
+        let (mut e_even, mut e_odd) = (0.0_f64, 0.0_f64);
+        for col in 0..b.nrows() {
+            for out in 0..p {
+                let v = b[[col, out]] * b[[col, out]];
+                if out % 2 == 0 {
+                    e_even += v;
+                } else {
+                    e_odd += v;
+                }
+            }
+        }
+        even_frac[atom_idx] = e_even / (e_even + e_odd).max(1.0e-300);
+    }
+    eprintln!("[#2132 birth reseed] per-atom even-energy fraction = {even_frac:?}");
+    let (lo, hi) = if even_frac[0] <= even_frac[1] {
+        (even_frac[0], even_frac[1])
+    } else {
+        (even_frac[1], even_frac[0])
+    };
+    assert!(
+        lo < 0.5 && hi > 0.5,
+        "sequential-deflation birth reseed did NOT separate the two curved atoms onto \
+         disjoint structure: even-energy fractions {even_frac:?} both on one side of 0.5 \
+         (a simultaneous seed re-reads the dominant circle for both atoms = re-collision)"
+    );
+}

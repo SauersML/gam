@@ -32,6 +32,7 @@ impl PirlsLoopLikelihoodScale {
         }
     }
 
+    #[cfg(any(target_os = "linux", test))]
     fn kernel_argument(
         self,
         family: crate::gpu_kernels::pirls_row::PirlsRowFamily,
