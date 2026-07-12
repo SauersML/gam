@@ -1774,20 +1774,6 @@ pub fn cell_moving_boundary_flux_tower_theta_integrand<const K1: usize, const K:
 /// construction. The linear Jacobian wiring (coefficients ↔ primaries) is
 /// NOT part of this trait — it is family data, not calculus, and stays on
 /// the `RowKernel` implementor.
-pub trait RowNllProgram<const K: usize>: Send + Sync {
-    /// Number of observations the program covers.
-    fn n_rows(&self) -> usize;
-
-    /// Current primary-scalar values for `row` (where to seed the tower).
-    fn primaries(&self, row: usize) -> Result<[f64; K], String>;
-
-    /// The row NLL evaluated on tower scalars. `p[a]` arrives pre-seeded as
-    /// variable `a` at the current primary value; implementations combine
-    /// them with `Tower4` arithmetic and per-row data (response, censoring
-    /// indicators, offsets) entering as constants.
-    fn row_nll(&self, row: usize, p: &[Tower4<K>; K]) -> Result<Tower4<K>, String>;
-}
-
 // ── The canonical single-source seam (#932 consolidation) ────────────
 //
 // `RowProgram<K>` is the ONE row-program interface #932 converges every family
