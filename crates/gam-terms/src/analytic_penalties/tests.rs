@@ -783,6 +783,31 @@ fn parametric_row_precision_domains_distinguish_log_strengths_from_raw_coordinat
 }
 
 #[test]
+fn sparsity_learnable_smoothing_has_one_structural_coordinate() {
+    assert!(
+        SparsityPenalty::hoyer(PenaltyTier::Psi)
+            .with_learnable_smoothing()
+            .is_err(),
+        "Hoyer has no smoothing scale and must not acquire a dead rho axis"
+    );
+
+    let penalty = SparsityPenalty::smoothed_l1(PenaltyTier::Psi, 1.0e-3)
+        .unwrap()
+        .with_learnable_smoothing()
+        .unwrap();
+    assert_eq!(penalty.rho_count(), 2);
+    let domains = penalty.rho_coordinate_domains().unwrap();
+    assert_eq!(domains.len(), 2);
+    assert_eq!(domains[1], (LOG_STRENGTH_MIN, LOG_STRENGTH_MAX));
+    penalty
+        .validate_rho(array![0.0, LOG_STRENGTH_MAX].view())
+        .expect("closed smoothing face is valid");
+    assert!(penalty
+        .validate_rho(array![0.0, LOG_STRENGTH_MAX + 1.0e-6].view())
+        .is_err());
+}
+
+#[test]
 fn ard_grad_target_matches_lambda_t() {
     let d = 2;
     let t = array![0.5_f64, 1.0, 2.0, -1.0];

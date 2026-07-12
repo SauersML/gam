@@ -1356,13 +1356,13 @@ fn neumaier_add(sum: &mut f64, correction: &mut f64, term: f64) -> Result<(), St
     if !next.is_finite() {
         return Err("compensated column-mean accumulation overflowed".to_string());
     }
-    if sum.abs() >= term.abs() {
+    if (*sum).abs() >= term.abs() {
         *correction += (*sum - next) + term;
     } else {
         *correction += (term - next) + *sum;
     }
     *sum = next;
-    if !correction.is_finite() {
+    if !(*correction).is_finite() {
         return Err("compensated column-mean correction overflowed".to_string());
     }
     Ok(())
@@ -1387,12 +1387,12 @@ fn stable_column_location(data: ArrayView2<'_, f64>) -> Result<StableColumnLocat
         let mut sum = 0.0_f64;
         let mut correction = 0.0_f64;
         if relative_chart_is_representable {
-            for &value in data.column(axis) {
+            for &value in data.column(axis).iter() {
                 neumaier_add(&mut sum, &mut correction, (value - origin) / count)?;
             }
             mean[axis] = origin + (sum + correction);
         } else {
-            for &value in data.column(axis) {
+            for &value in data.column(axis).iter() {
                 neumaier_add(&mut sum, &mut correction, value / count)?;
             }
             mean[axis] = sum + correction;
@@ -1484,7 +1484,11 @@ fn certified_covariance_spectrum(
 /// rank-deficient coordinate cloud produces a rank-deficient matched null
 /// rather than a different full-rank distribution. A scale-relative backward-
 /// error certificate distinguishes numerical negative zero from a materially
-/// indefinite spectrum before any projection is allowed.
+/// indefinite spectrum before any projection is allowed. The eigensystem is
+/// evaluated after dividing by the largest covariance entry, so a finite
+/// covariance remains admissible even when its trace or leading eigenvalue is
+/// larger than `f64::MAX`; the square-root scale is restored only after the
+/// decomposition.
 pub fn covariance_matched_gaussian_null(
     data: ArrayView2<'_, f64>,
     seed: u64,
@@ -1495,29 +1499,37 @@ pub fn covariance_matched_gaussian_null(
     validate_matrix(data, "covariance-matched Gaussian input")?;
     let n = data.nrows();
     let p = data.ncols();
-    let moments = stable_population_moments(data)?;
-    let covariance_trace = moments.covariance.diag().sum();
-    let (eigenvalues, eigenvectors) = moments.covariance.eigh(Side::Lower).map_err(|error| {
+    let StablePopulationMoments {
+        location,
+        covariance: mut normalized_covariance,
+    } = stable_population_moments(data)?;
+    let covariance_scale = normalized_covariance
+        .iter()
+        .fold(0.0_f64, |scale, &value| scale.max(value.abs()));
+    if covariance_scale > 0.0 {
+        normalized_covariance.mapv_inplace(|value| value / covariance_scale);
+    }
+    let normalized_trace = normalized_covariance.diag().sum();
+    let (eigenvalues, eigenvectors) = normalized_covariance.eigh(Side::Lower).map_err(|error| {
         format!("covariance-matched Gaussian eigendecomposition failed: {error}")
     })?;
-    let eigenvalues = certified_covariance_spectrum(eigenvalues.view(), covariance_trace)?;
+    let eigenvalues = certified_covariance_spectrum(eigenvalues.view(), normalized_trace)?;
+    let covariance_root_scale = covariance_scale.sqrt();
 
     let mut rng = StdRng::seed_from_u64(seed);
     let mut out = Array2::<f64>::zeros((n, p));
     let mut scaled_normal = vec![0.0_f64; p];
     for row in 0..n {
         for axis in 0..p {
-            scaled_normal[axis] = eigenvalues[axis].sqrt() * standard_normal(&mut rng);
+            scaled_normal[axis] =
+                eigenvalues[axis].sqrt() * covariance_root_scale * standard_normal(&mut rng);
         }
         for col in 0..p {
             let mut centered_draw = 0.0_f64;
             for axis in 0..p {
                 centered_draw += eigenvectors[[col, axis]] * scaled_normal[axis];
             }
-            out[[row, col]] = moments
-                .location
-                .compose_centered(centered_draw, col)
-                .map_err(|error| {
+            out[[row, col]] = location.compose_centered(centered_draw, col).map_err(|error| {
                     format!(
                         "covariance-matched Gaussian draw failed at row {row}, column {col}: {error}"
                     )
@@ -2959,6 +2971,25 @@ mod tests {
         let moments = stable_population_moments(covariance_input.view()).unwrap();
         assert!(moments.covariance[[0, 0]].is_finite());
         assert!(moments.covariance[[0, 0]] > 0.0);
+
+        let huge_scale = 1.1e154_f64;
+        let trace_overflow = ndarray::array![
+            [huge_scale, huge_scale],
+            [huge_scale, -huge_scale],
+            [-huge_scale, huge_scale],
+            [-huge_scale, -huge_scale],
+        ];
+        let huge_moments = stable_population_moments(trace_overflow.view()).unwrap();
+        assert!(
+            huge_moments
+                .covariance
+                .diag()
+                .iter()
+                .all(|value| value.is_finite())
+        );
+        assert!(huge_moments.covariance.diag().sum().is_infinite());
+        let huge_draw = covariance_matched_gaussian_null(trace_overflow.view(), 979).unwrap();
+        assert!(huge_draw.iter().all(|value| value.is_finite()));
 
         let finite_limit = 1.7e308_f64;
         let antipodal =

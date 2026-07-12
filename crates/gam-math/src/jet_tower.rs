@@ -4679,29 +4679,6 @@ mod tests {
 }
 
 #[inline]
-fn erfcx_nonnegative(x: f64) -> f64 {
-    if !x.is_finite() {
-        return if x.is_sign_positive() {
-            0.0
-        } else {
-            f64::INFINITY
-        };
-    }
-    if x <= 0.0 {
-        return 1.0;
-    }
-    if x < 26.0 {
-        ((x * x).min(700.0)).exp() * statrs::function::erf::erfc(x)
-    } else {
-        let inv = 1.0 / x;
-        let inv2 = inv * inv;
-        let poly = 1.0 - 0.5 * inv2 + 0.75 * inv2 * inv2 - 1.875 * inv2 * inv2 * inv2
-            + 6.5625 * inv2 * inv2 * inv2 * inv2;
-        inv * poly / std::f64::consts::PI.sqrt()
-    }
-}
-
-#[inline]
 fn log1mexp_positive(a: f64) -> f64 {
     assert!(a >= 0.0, "log1mexp_positive requires a >= 0: a={a}");
     if a > core::f64::consts::LN_2 {
@@ -4726,7 +4703,7 @@ fn signed_probit_logcdf_and_mills_ratio(x: f64) -> (f64, f64) {
     }
     if x < 0.0 {
         let u = -x / std::f64::consts::SQRT_2;
-        let ex = erfcx_nonnegative(u).max(1e-300);
+        let ex = crate::probability::erfcx_nonnegative(u).max(1e-300);
         let log_cdf = -u * u + (0.5 * ex).ln();
         let lambda = (2.0 / std::f64::consts::PI).sqrt() / ex;
         (log_cdf, lambda)

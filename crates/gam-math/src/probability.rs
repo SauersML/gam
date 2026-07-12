@@ -59,7 +59,7 @@ pub fn erfcx_nonnegative(x: f64) -> f64 {
         return 1.0;
     }
     if x < 26.0 {
-        ((x * x).min(700.0)).exp() * erfc(x)
+        (x * x).exp() * erfc(x)
     } else {
         let inv = 1.0 / x;
         let inv2 = inv * inv;

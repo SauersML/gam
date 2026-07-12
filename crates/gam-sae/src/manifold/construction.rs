@@ -1497,7 +1497,7 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         dispersion_r: f64,
     ) -> Result<Vec<f64>, String> {
-        rho.validate_log_strength_domain()?;
+        self.assignment.validate_rho_domain(rho)?;
         let lam = rho.lambda_smooth_vec();
         // Fixed noise floor R = residual variance (dispersion). Guard finite/positive.
         let r_floor = if dispersion_r.is_finite() && dispersion_r > 0.0 {
@@ -4494,7 +4494,7 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         penalty_scale: f64,
     ) -> Result<SaeManifoldLoss, String> {
-        rho.validate_log_strength_domain()?;
+        self.assignment.validate_rho_domain(rho)?;
         if !(penalty_scale.is_finite() && penalty_scale > 0.0) {
             return Err(format!(
                 "SaeManifoldTerm::loss_scaled: penalty_scale must be finite and positive; got {penalty_scale}"
@@ -5091,7 +5091,7 @@ impl SaeManifoldTerm {
     }
 
     pub(crate) fn ard_value(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
-        rho.validate_log_strength_domain()?;
+        self.assignment.validate_rho_domain(rho)?;
         if rho.log_ard.len() != self.k_atoms() {
             return Err(format!(
                 "ARD rho has {} atoms but term has {}",

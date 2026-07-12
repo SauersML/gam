@@ -2338,6 +2338,47 @@ mod support_measure_tests {
 }
 
 #[cfg(test)]
+mod ordered_alpha_domain_tests {
+    use super::*;
+    use gam_terms::analytic_penalties::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN};
+
+    fn ordered_assignment(alpha: f64) -> SaeAssignment {
+        SaeAssignment::from_blocks_with_mode(
+            Array2::<f64>::zeros((3, 2)),
+            vec![Array2::<f64>::zeros((3, 1)); 2],
+            AssignmentMode::ordered_beta_bernoulli(0.8, alpha, true),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn learnable_ordered_alpha_tightens_sparse_rho_face_without_saturation() {
+        let alpha = 1.7_f64;
+        let assignment = ordered_assignment(alpha);
+        let (lower, upper) = assignment
+            .learnable_alpha_rho_domain()
+            .unwrap()
+            .expect("learnable ordered alpha owns the sparse rho coordinate");
+        assert!(upper < LOG_STRENGTH_MAX);
+
+        let legal = SaeManifoldRho::new(upper, 0.0, vec![Array1::zeros(1); 2])
+            .for_assignment(assignment.mode);
+        assignment
+            .validate_rho_domain(&legal)
+            .expect("closed effective-alpha upper face is legal");
+        let invalid = SaeManifoldRho::new(upper + 1.0e-6, 0.0, vec![Array1::zeros(1); 2])
+            .for_assignment(assignment.mode);
+        assert!(assignment.validate_rho_domain(&invalid).is_err());
+
+        assert_eq!(
+            lower,
+            LOG_STRENGTH_MIN - alpha.ln(),
+            "lower face must be shifted by the base concentration too"
+        );
+    }
+}
+
+#[cfg(test)]
 mod fill_into_buffer_1557_tests {
     //! #1557 — the fill-into-caller-buffer variant
     //! [`SaeAssignment::try_assignments_row_into`] must produce

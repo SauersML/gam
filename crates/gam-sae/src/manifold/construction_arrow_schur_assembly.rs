@@ -181,7 +181,7 @@ impl SaeManifoldTerm {
         dense_beta_penalty_probe_max_dim: usize,
         forced_layout: ForcedRowLayout,
     ) -> Result<ArrowSchurSystem, String> {
-        rho.validate_log_strength_domain()?;
+        self.assignment.validate_rho_domain(rho)?;
         if !(penalty_scale.is_finite() && penalty_scale > 0.0) {
             return Err(format!(
                 "SaeManifoldTerm::assemble_arrow_schur_scaled: penalty_scale must be finite and positive; got {penalty_scale}"

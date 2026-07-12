@@ -16,7 +16,7 @@ fn entropy_log_plus_one(p: f64) -> f64 {
 /// Sparsifier kernel.
 ///
 /// * `SmoothedL1 { eps }` — `Σ_i sqrt(x_i² + ε²)`. The smoothing scale `ε`
-///   may be REML-selected (`eps_rho_index = Some(_)`), in which case the
+///   may be REML-selected, in which case the
 ///   shrink rate `ε → 0` is governed by the marginal likelihood (Occam keeps
 ///   `ε` large when the data don't demand sharpness).
 /// * `Hoyer` — `(√n · ‖x‖_1 − ‖x‖_2) / (√n − 1)`. Scale-invariant; encourages
@@ -49,12 +49,10 @@ pub struct SparsityPenalty {
     pub kind: SparsityKind,
     pub weight: f64,
     pub weight_schedule: Option<ScalarWeightSchedule>,
-    /// Index of `log strength` inside this penalty's local ρ view.
-    pub strength_rho_index: usize,
-    /// If `Some`, the index of `log ε` (or `log δ`) inside this penalty's
-    /// local ρ view. If `None`, `ε` / `δ` is held fixed at the value baked
-    /// into [`SparsityKind`].
-    pub eps_rho_index: Option<usize>,
+    /// Whether local rho coordinate 1 learns `log ε` (or `log δ`). Coordinate
+    /// 0 is always the log-strength. Keeping this as a boolean makes invalid
+    /// local index layouts unrepresentable.
+    learnable_smoothing: bool,
 }
 
 /// Entropy sparsity over row-wise softmax assignment logits.
@@ -623,8 +621,7 @@ impl SparsityPenalty {
             kind: SparsityKind::SmoothedL1 { eps },
             weight: 1.0,
             weight_schedule: None,
-            strength_rho_index: 0,
-            eps_rho_index: None,
+            learnable_smoothing: false,
         })
     }
 
@@ -642,8 +639,7 @@ impl SparsityPenalty {
             kind: SparsityKind::Log { delta },
             weight: 1.0,
             weight_schedule: None,
-            strength_rho_index: 0,
-            eps_rho_index: None,
+            learnable_smoothing: false,
         })
     }
 
@@ -656,30 +652,41 @@ impl SparsityPenalty {
             kind: SparsityKind::Hoyer,
             weight: 1.0,
             weight_schedule: None,
-            strength_rho_index: 0,
-            eps_rho_index: None,
+            learnable_smoothing: false,
         }
     }
 
     impl_with_weight_schedule!(weight);
 
+    #[must_use = "invalid learnable-smoothing requests must be handled"]
+    pub fn with_learnable_smoothing(mut self) -> Result<Self, String> {
+        if matches!(self.kind, SparsityKind::Hoyer) {
+            return Err("Hoyer sparsity has no smoothing coordinate to learn".to_string());
+        }
+        // Coordinate 0 is the strength and coordinate 1 is the optional
+        // smoothing log-scale. Do not accept an arbitrary index: rho_count is
+        // exactly two in this state, so any other index is structurally
+        // impossible and would defer a builder error into evaluator indexing.
+        self.learnable_smoothing = true;
+        Ok(self)
+    }
+
     #[must_use]
-    pub fn with_eps_reml(mut self, eps_rho_index: usize) -> Self {
-        self.eps_rho_index = Some(eps_rho_index);
-        self
+    pub fn learns_smoothing(&self) -> bool {
+        self.learnable_smoothing
     }
 
     /// Resolve `(strength, eps_or_delta)` from the current ρ view.
     fn resolved(&self, rho: ArrayView1<'_, f64>) -> (f64, f64) {
-        let strength = validated_learnable_weight(self.weight, rho[self.strength_rho_index]);
-        let smoothing = match (self.eps_rho_index, self.kind) {
+        let strength = validated_learnable_weight(self.weight, rho[0]);
+        let smoothing = match (self.learnable_smoothing, self.kind) {
             // The owning seam validates this log-smoothing coordinate before
             // exact exponentiation, so it stays positive without a saturated
             // tail or value/derivative mismatch.
-            (Some(idx), _) => validated_exp_log_strength(rho[idx]),
-            (None, SparsityKind::SmoothedL1 { eps }) => eps,
-            (None, SparsityKind::Log { delta }) => delta,
-            (None, SparsityKind::Hoyer) => 0.0,
+            (true, _) => validated_exp_log_strength(rho[1]),
+            (false, SparsityKind::SmoothedL1 { eps }) => eps,
+            (false, SparsityKind::Log { delta }) => delta,
+            (false, SparsityKind::Hoyer) => 0.0,
         };
         (strength, smoothing)
     }
@@ -698,16 +705,16 @@ impl AnalyticPenalty for SparsityPenalty {
                 self.rho_count()
             ));
         }
-        resolve_learnable_weight(self.weight, rho[self.strength_rho_index])?;
-        if let Some(index) = self.eps_rho_index {
-            checked_exp_log_strength(rho[index])?;
+        resolve_learnable_weight(self.weight, rho[0])?;
+        if self.learnable_smoothing {
+            checked_exp_log_strength(rho[1])?;
         }
         Ok(())
     }
 
     fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
         let mut domains = vec![(LOG_STRENGTH_MIN, LOG_STRENGTH_MAX); self.rho_count()];
-        domains[self.strength_rho_index] = learnable_weight_coordinate_domain(self.weight)?
+        domains[0] = learnable_weight_coordinate_domain(self.weight)?
             .ok_or_else(|| "sparsity has zero base weight".to_string())?;
         Ok(domains)
     }
@@ -959,8 +966,8 @@ impl AnalyticPenalty for SparsityPenalty {
         let n_rho = self.rho_count();
         let mut out = Array1::<f64>::zeros(n_rho);
         let p_val = self.value(target, rho);
-        out[self.strength_rho_index] = p_val;
-        if let Some(eps_idx) = self.eps_rho_index {
+        out[0] = p_val;
+        if self.learnable_smoothing {
             let (lam, smooth) = self.resolved(rho);
             let mut dp_deps = 0.0;
             match self.kind {
@@ -981,13 +988,13 @@ impl AnalyticPenalty for SparsityPenalty {
                 SparsityKind::Hoyer => {}
             }
             // Chain through ρ_eps = log(ε)  ⇒  ∂ε/∂ρ_eps = ε.
-            out[eps_idx] = smooth * dp_deps;
+            out[1] = smooth * dp_deps;
         }
         out
     }
 
     fn rho_count(&self) -> usize {
-        1 + if self.eps_rho_index.is_some() { 1 } else { 0 }
+        1 + usize::from(self.learnable_smoothing)
     }
 
     fn name(&self) -> &str {

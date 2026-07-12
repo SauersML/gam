@@ -953,8 +953,9 @@ pub fn run_sae_crosscoder_fit(
         .initial_rho
         .for_assignment(request.base_term.assignment.mode);
     request
-        .initial_rho
-        .validate_log_strength_domain()
+        .base_term
+        .assignment
+        .validate_rho_domain(&request.initial_rho)
         .map_err(SaeFitError::Fit)?;
     let initial_flat = request.initial_rho.to_flat();
     let n_params = initial_flat.len();

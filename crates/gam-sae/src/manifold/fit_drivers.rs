@@ -692,7 +692,7 @@ impl SaeManifoldTerm {
     ) -> Result<(), String> {
         use crate::chart_canonicalization::{CHART_RECOMPOSITION_REL_TOL, CanonicalChartTopology};
 
-        rho.validate_log_strength_domain()?;
+        self.assignment.validate_rho_domain(rho)?;
 
         // #F3 — capture the PRE-canonicalization coordinate spread per atom/axis.
         // The ARD precisions are stamped AFTER the reparameterization below (see the
@@ -4271,7 +4271,7 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
     ) -> Result<(), String> {
-        rho.validate_log_strength_domain()?;
+        self.assignment.validate_rho_domain(rho)?;
         let n = self.n_obs();
         let p = self.output_dim();
         let k = self.k_atoms();
@@ -5018,7 +5018,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
     ) -> Result<SaeManifoldLoss, String> {
         *rho = rho.clone().for_assignment(self.assignment.mode);
-        rho.validate_log_strength_domain()?;
+        self.assignment.validate_rho_domain(rho)?;
         if !(step_size.is_finite() && step_size > 0.0) {
             return Err(format!(
                 "SaeManifoldTerm::run_fixed_decoder_arrow_schur: step_size must be finite and positive; got {step_size}"
@@ -5407,7 +5407,7 @@ impl SaeManifoldTerm {
         allow_heuristic_termination: bool,
     ) -> Result<JointFitOutcome, String> {
         *rho = rho.clone().for_assignment(self.assignment.mode);
-        rho.validate_log_strength_domain()?;
+        self.assignment.validate_rho_domain(rho)?;
         if !(step_size.is_finite() && step_size > 0.0) {
             return Err(format!(
                 "SaeManifoldTerm::run_joint_fit_arrow_schur: step_size must be finite and positive; got {step_size}"

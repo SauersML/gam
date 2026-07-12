@@ -1008,14 +1008,7 @@ pub(crate) fn hash_analytic_penalty_kind(
             hash_sparsity_kind(hasher, p.kind);
             hasher.write_f64(p.weight);
             hash_weight_schedule_option(hasher, &p.weight_schedule);
-            hasher.write_usize(p.strength_rho_index);
-            match p.eps_rho_index {
-                Some(idx) => {
-                    hasher.write_bool(true);
-                    hasher.write_usize(idx);
-                }
-                None => hasher.write_bool(false),
-            }
+            hasher.write_bool(p.learns_smoothing());
         }
         AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => {
             hasher.write_str("softmax-assignment-sparsity");

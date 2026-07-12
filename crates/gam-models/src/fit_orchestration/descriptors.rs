@@ -682,7 +682,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                             "{context}.eps_weight='auto' is not meaningful for Hoyer sparsity"
                         ));
                     }
-                    "auto" => penalty.with_eps_reml(1),
+                    "auto" => penalty.with_learnable_smoothing()?,
                     other => {
                         return Err(format!(
                             "{context}.eps_weight must be 'auto' or 'fixed'; got {other:?}"

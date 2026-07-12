@@ -315,7 +315,7 @@ impl SaeManifoldTerm {
         residual: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
     ) -> Result<f64, String> {
-        rho.validate_log_strength_domain()?;
+        self.assignment.validate_rho_domain(rho)?;
         let n = self.n_obs();
         let p = self.output_dim();
         if residual.dim() != (n, p) {
@@ -700,7 +700,7 @@ impl SaeManifoldTerm {
         &self,
         rho: &SaeManifoldRho,
     ) -> Result<Vec<Array1<f64>>, String> {
-        rho.validate_log_strength_domain()?;
+        self.assignment.validate_rho_domain(rho)?;
         if rho.log_ard.len() != self.k_atoms() {
             return Err(format!(
                 "ARD rho has {} atoms but term has {}",
@@ -766,7 +766,7 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
-        rho.validate_log_strength_domain()
+        self.assignment.validate_rho_domain(rho)
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         // RAW selected-inverse diagonal: the per-axis diagonal contraction uses
         // the DEFLATED inverse; the full kept-subspace + rotation deflation
@@ -914,7 +914,7 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
-        rho.validate_log_strength_domain()
+        self.assignment.validate_rho_domain(rho)
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let row_weights = self.row_loss_weights.as_deref();
         let coord_offsets = self.assignment.coord_offsets();
@@ -1053,7 +1053,7 @@ impl SaeManifoldTerm {
         probes: &[Array1<f64>],
         sinv_probes: &[Array1<f64>],
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
-        rho.validate_log_strength_domain()
+        self.assignment.validate_rho_domain(rho)
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let m = probes.len();
         if m == 0 || sinv_probes.len() != m {
