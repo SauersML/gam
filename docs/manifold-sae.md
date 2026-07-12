@@ -470,9 +470,13 @@ and a constrained **ring of clusters** whose component centers share one fitted
 circle. The last class is the generative model for discrete cyclic concepts:
 it explains clumpy density without throwing away cyclic order. All four race on
 held-out predictive density (deterministic cross-fitted stacking), while the
-two mixture rungs carry certified, rank-aware Laplace evidence. The winner is
-whichever class predicts held-out points best. It is a top-level export, used
-throughout `tests/sae/`, and pairs naturally with `fit.coords[k]` from
+two mixture rungs carry certified, rank-aware Laplace evidence. `winner` names
+the best individual density. The circular topology verdict instead aggregates
+the stacking mass of the smooth-circle and ring-of-clusters densities before
+comparing it with the aggregate non-circular mass; this is invariant to an
+otherwise arbitrary split between two predictors of the same circular class.
+It is a top-level export, used throughout `tests/sae/`, and pairs naturally with
+`fit.coords[k]` from
 [`sae_manifold_fit`](#the-manifoldsae-result).
 
 ```python
@@ -490,8 +494,9 @@ Returns a dict:
 | Key | Meaning |
 | --- | --- |
 | `winner` | `"circle"`, `"euclidean"`, `"mixture_k{k}"`, or `"ring_clusters_k{k}"` |
-| `circle_wins` | bool, the winner is either circular density class |
-| `circular_margin` | best circular stacking weight minus the best non-circular weight (`NaN` if weights are unavailable) |
+| `circle_wins` | bool, total circular stacking mass exceeds total non-circular mass |
+| `circular_stacking_weight` / `noncircular_stacking_weight` | stacking mass aggregated within the two topology classes |
+| `circular_margin` | total circular mass minus total non-circular mass |
 | `mixture_k` | the mixture order selected inside the mixture rung |
 | `ring_clusters_k` | the order selected inside the constrained ring-of-clusters rung |
 | `candidate_names` / `stacking_weights` | per-candidate names and held-out stacking weights |
@@ -501,6 +506,7 @@ Returns a dict:
 | `matched_controls` | full verdicts after shuffling these supplied coordinates and replacing them by a covariance-matched Gaussian |
 | `control_false_circle_floor` | circular-win fraction across those two adjudicator-input controls |
 | `dictionary_mean_l0` | the dictionary sparsity supplied alongside the rate |
+| `detection_floor` | Marchenko–Pastur reconstruction-energy edge when `n_eff`, `ambient_p`, and `dispersion_r` are supplied together; otherwise `None` |
 
 Either mixture EM can refuse to certify convergence (a `GamError`). That is a
 typed missing adjudication, not a negative topology verdict; record it as such
