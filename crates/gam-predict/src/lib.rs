@@ -683,7 +683,7 @@ fn require_posterior_mean_backend<'a>(
             Err(reason) => rejected.push(reason),
         }
     }
-    if let Some(backend) = conditional_prediction_backend(fit, expected_dim, label) {
+    if let Some(backend) = conditional_prediction_backend(fit, expected_dim, label)? {
         return Ok(backend);
     }
     // The posterior mean E[g⁻¹(η)] is the estimand of this pass; without a
