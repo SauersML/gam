@@ -620,20 +620,25 @@ fn sls_row_vgh_compiled(
     primary: &[f64; SLS_ROW_K],
     kernel: &SurvivalExactRowKernel,
 ) -> (f64, [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K]) {
-    let entry_vars: [Order2<3>; 3] =
-        std::array::from_fn(|axis| Order2::variable(primary[SLS_U0_AXES[axis]], axis));
-    let exit_vars: [Order2<3>; 3] =
-        std::array::from_fn(|axis| Order2::variable(primary[SLS_U1_AXES[axis]], axis));
-    let rate_vars: [Order2<5>; 5] =
-        std::array::from_fn(|axis| Order2::variable(primary[SLS_G_AXES[axis]], axis));
-    let u0 = sls_index(&entry_vars[0], &entry_vars[1], &entry_vars[2]);
-    let u1 = sls_index(&exit_vars[0], &exit_vars[1], &exit_vars[2]);
+    // Literal local seeds are load-bearing codegen. `array::from_fn` leaves the
+    // five `Order2<5>` identities materialized as a 1,240-byte array in LLVM
+    // IR; naming the live seeds individually removes that aggregate and cuts
+    // the native stack frame by one third while retaining the same axis maps.
+    let entry_h = Order2::variable(primary[SLS_U0_AXES[0]], 0);
+    let entry_t = Order2::variable(primary[SLS_U0_AXES[1]], 1);
+    let entry_ls = Order2::variable(primary[SLS_U0_AXES[2]], 2);
+    let exit_h = Order2::variable(primary[SLS_U1_AXES[0]], 0);
+    let exit_t = Order2::variable(primary[SLS_U1_AXES[1]], 1);
+    let exit_ls = Order2::variable(primary[SLS_U1_AXES[2]], 2);
+    let rate_h = Order2::variable(primary[SLS_G_AXES[0]], 0);
+    let rate_t = Order2::variable(primary[SLS_G_AXES[1]], 1);
+    let rate_td = Order2::variable(primary[SLS_G_AXES[2]], 2);
+    let rate_ls = Order2::variable(primary[SLS_G_AXES[3]], 3);
+    let rate_lsd = Order2::variable(primary[SLS_G_AXES[4]], 4);
+    let u0 = sls_index(&entry_h, &entry_t, &entry_ls);
+    let u1 = sls_index(&exit_h, &exit_t, &exit_ls);
     let g = sls_event_rate(
-        &rate_vars[0],
-        &rate_vars[1],
-        &rate_vars[2],
-        &rate_vars[3],
-        &rate_vars[4],
+        &rate_h, &rate_t, &rate_td, &rate_ls, &rate_lsd,
     );
     let plan = sls_outer_plan(kernel);
     let truncate = |stack: [f64; 5]| [stack[0], stack[1], stack[2]];
