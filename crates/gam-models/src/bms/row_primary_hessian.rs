@@ -183,12 +183,7 @@ mod empirical_cubic_moment_tests {
             }
             for (v, right) in coeffs.iter().enumerate() {
                 let dense = (0..4)
-                    .map(|i| {
-                        left[i]
-                            * (0..4)
-                                .map(|j| dense_second[i][j] * right[j])
-                                .sum::<f64>()
-                    })
+                    .map(|i| left[i] * (0..4).map(|j| dense_second[i][j] * right[j]).sum::<f64>())
                     .sum();
                 close(
                     dot4(left, &compiled.action(right)),
@@ -2857,6 +2852,19 @@ impl BernoulliMarginalSlopeFamily {
         for partition_cell in &cells {
             let lo = partition_cell.cell.left;
             let hi = partition_cell.cell.right;
+            let node_begin = node_cursor;
+            if node_begin < empirical_grid.nodes.len() && empirical_grid.nodes[node_begin] < lo {
+                return Err(format!(
+                    "empirical flex moment compiler found grid node {} below the next cell's left edge {lo}",
+                    empirical_grid.nodes[node_begin]
+                ));
+            }
+            let node_end =
+                node_begin + empirical_grid.nodes[node_begin..].partition_point(|&node| node < hi);
+            node_cursor = node_end;
+            if node_begin == node_end {
+                continue;
+            }
             // `obs` and the basis `coeff4` tuples are span-fixed within the cell;
             // evaluate them ONCE at an interior probe point (the same helper the
             // StandardNormal branch uses). `η` itself still varies with the node
@@ -2864,11 +2872,9 @@ impl BernoulliMarginalSlopeFamily {
             let z_probe = exact::interval_probe_point(lo, hi)?;
             let obs = self.observed_denested_cell_partials_at_z(z_probe, a, b, beta_h, beta_w)?;
 
-            coeff_u.iter_mut().for_each(|c| *c = [0.0; 4]);
-            if need_hessian {
-                coeff_au.iter_mut().for_each(|c| *c = [0.0; 4]);
-                coeff_bu.iter_mut().for_each(|c| *c = [0.0; 4]);
-            }
+            // Every live source channel is overwritten below: logslope at
+            // index 1 and every coefficient in each configured deviation
+            // range. Avoid dense zeroing of the whole primary tape per cell.
             coeff_u[1] = obs.dc_db;
             if need_hessian {
                 coeff_au[1] = obs.dc_dab;
@@ -2886,6 +2892,7 @@ impl BernoulliMarginalSlopeFamily {
                             scale,
                         );
                         if need_hessian {
+                            coeff_au[idx] = [0.0; 4];
                             coeff_bu[idx] = scale_coeff4(
                                 exact::score_basis_cell_coefficients(basis_span, 1.0),
                                 scale,
@@ -2950,19 +2957,6 @@ impl BernoulliMarginalSlopeFamily {
                 }
             }
 
-            let node_begin = node_cursor;
-            if node_begin < empirical_grid.nodes.len() && empirical_grid.nodes[node_begin] < lo {
-                return Err(format!(
-                    "empirical flex moment compiler found grid node {} below the next cell's left edge {lo}",
-                    empirical_grid.nodes[node_begin]
-                ));
-            }
-            let node_end =
-                node_begin + empirical_grid.nodes[node_begin..].partition_point(|&node| node < hi);
-            node_cursor = node_end;
-            if node_begin == node_end {
-                continue;
-            }
             let mut moments = EmpiricalCubicMomentJet2::default();
             for node_idx in node_begin..node_end {
                 let node = empirical_grid.nodes[node_idx];

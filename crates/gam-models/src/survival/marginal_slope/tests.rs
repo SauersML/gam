@@ -8963,3 +8963,130 @@ fn survival_jeffreys_contracted_trace_hessian_matches_fd_of_trace() {
         );
     }
 }
+
+/// gam#979 isolation gate: does `SurvivalMarginalSlopeRowKernel`'s
+/// static-sparsity `SparseTower4<RIGID_LINEAR_MASK>` build the SAME full
+/// `t4` (all 256 entries, not just the 3 `fourth_contracted(u,v)` direction
+/// pairs `rigid_row_kernel_agrees_with_jet_tower_program_all_channels`
+/// checks) as the dense `Tower4<4>` oracle, on the EXACT fixture/row the
+/// contracted-trace-Hessian FD gate above exercises?
+///
+/// My `contracted_trace_hessian` hook is the FIRST production consumer to
+/// read `t4[a][b][c][d]` directly for every `(a,b)` pair (a genuine
+/// non-rank-1 bilinear contraction against a full 4×4 weight matrix,
+/// `Σ_ab w_row[a,b]·t4[a][b][c][d]`) rather than through a single
+/// `fourth_contracted(u, v)` rank-1 direction pair — every prior consumer
+/// only ever exercised the latter. This test empirically checks whether that
+/// previously-untested full-tensor read path agrees with the dense oracle,
+/// independent of whether the contracted-trace-Hessian FD gate above passes
+/// or fails.
+#[test]
+fn survival_sparse_tower4_full_t4_matches_dense_oracle_979() {
+    use super::row_kernel::{RIGID_LINEAR_MASK, SparseTower4, rigid_row_inputs, rigid_row_kernel_primaries, rigid_row_nll};
+    use gam_math::jet_tower::evaluate_program;
+
+    let n = 120usize;
+    let z: Vec<f64> = (0..n).map(|r| ((r as f64) * 0.29).sin() * 0.9).collect();
+    let weights: Vec<f64> = (0..n).map(|r| 0.6 + 0.4 * ((r % 5) as f64) / 5.0).collect();
+    let event: Vec<f64> = (0..n).map(|r| ((r % 3 == 0) as u8) as f64).collect();
+
+    let p_m = 2usize;
+    let p_g = 2usize;
+    let marginal_design = Array2::from_shape_fn((n, p_m), |(r, j)| {
+        0.2 + 0.05 * (r as f64).cos() + 0.11 * (j as f64) - 0.013 * (r as f64) / (n as f64)
+    });
+    let logslope_design = Array2::from_shape_fn((n, p_g), |(r, j)| {
+        0.1 + 0.07 * (r as f64).sin() - 0.09 * (j as f64) + 0.004 * (r as f64) / (n as f64)
+    });
+
+    let mut family = oracle_rigid_family(n, &z, &weights, &event, None);
+    family.marginal_design = DesignMatrix::from(marginal_design.clone());
+    family.logslope_design = DesignMatrix::from(logslope_design.clone());
+
+    let beta_time = array![0.6];
+    let beta_marginal = array![0.18, -0.12];
+    let beta_logslope = array![-0.2, 0.13];
+    let marginal_eta = marginal_design.dot(&beta_marginal);
+    let logslope_eta = logslope_design.dot(&beta_logslope);
+    let block_states = vec![
+        ParameterBlockState {
+            beta: beta_time.clone(),
+            eta: Array1::zeros(n),
+        },
+        ParameterBlockState {
+            beta: beta_marginal.clone(),
+            eta: marginal_eta.clone(),
+        },
+        ParameterBlockState {
+            beta: beta_logslope.clone(),
+            eta: logslope_eta.clone(),
+        },
+    ];
+    let probit_scale = family.probit_frailty_scale();
+
+    let mut primaries = Vec::with_capacity(n);
+    for row in 0..n {
+        let q0 = family.design_entry.dot_row(row, &beta_time)
+            + family.offset_entry[row]
+            + marginal_eta[row];
+        let q1 = family.design_exit.dot_row(row, &beta_time)
+            + family.offset_exit[row]
+            + marginal_eta[row];
+        let qd1 = family.design_derivative_exit.dot_row(row, &beta_time)
+            + family.derivative_offset_exit[row];
+        let g = logslope_eta[row];
+        primaries.push([q0, q1, qd1, g]);
+    }
+    let program = SurvivalMarginalSlopeRigidNllProgram {
+        primaries,
+        z: z.clone(),
+        w: weights.clone(),
+        d: event.clone(),
+        probit_scale,
+    };
+
+    let mut max_abs_gap = 0.0_f64;
+    let mut max_rel_gap = 0.0_f64;
+    for row in 0..n {
+        let dense = evaluate_program(&program, row).expect("dense tower4 oracle");
+
+        let p = rigid_row_kernel_primaries(&family, &block_states, row).expect("primaries");
+        let inputs = rigid_row_inputs(
+            &family,
+            &block_states,
+            row,
+            "sparse-vs-dense t4 isolation test",
+        )
+        .expect("rigid row inputs");
+        let vars: [SparseTower4<RIGID_LINEAR_MASK>; 4] =
+            std::array::from_fn(|a| SparseTower4::variable(p[a], a));
+        let sparse = rigid_row_nll(&vars, &inputs).expect("sparse tower4");
+
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        let dv = dense.t4[a][b][c][d];
+                        let sv = sparse.t4[a][b][c][d];
+                        let abs_gap = (dv - sv).abs();
+                        let rel_gap = abs_gap / dv.abs().max(1.0);
+                        if abs_gap > max_abs_gap {
+                            max_abs_gap = abs_gap;
+                        }
+                        if rel_gap > max_rel_gap {
+                            max_rel_gap = rel_gap;
+                        }
+                        assert!(
+                            rel_gap < 1e-9,
+                            "row {row} t4[{a}][{b}][{c}][{d}]: sparse={sv:.12e} dense={dv:.12e} \
+                             abs_gap={abs_gap:e} rel_gap={rel_gap:e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "[979 isolation] full t4 max_abs_gap={max_abs_gap:e} max_rel_gap={max_rel_gap:e} over {n} rows"
+    );
+}

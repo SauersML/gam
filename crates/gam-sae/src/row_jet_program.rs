@@ -820,8 +820,7 @@ impl<S: SaeSoftmaxRowProgramSource> SoftmaxMoment<'_, S> {
         self.inv_tau
             * self.inv_tau
             * self.source.gate_value(atom_j)
-            * (diagonal
-                - self.source.gate_value(atom_l) * (component_j + component_l - 2.0 * mean))
+            * (diagonal - self.source.gate_value(atom_l) * (component_j + component_l - 2.0 * mean))
     }
 
     #[inline]
@@ -884,10 +883,7 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
             mean[c] += z * component[c];
         }
     }
-    let moment = SoftmaxMoment {
-        source,
-        inv_tau,
-    };
+    let moment = SoftmaxMoment { source, inv_tau };
 
     // Logit gradient and Hessian are centered softmax moments.  This is the
     // asymptotic win: O(L²P) for L free logits, versus O(L²KP) in the hand

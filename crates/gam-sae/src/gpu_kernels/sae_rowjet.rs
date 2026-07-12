@@ -21,35 +21,38 @@
 //! not be described or wired as the complete production row jet until those
 //! inputs and channels are present.
 //!
-//! On the CPU the covered subspace is the dense softmax gate Hessian: `K×K` per output column,
-//! built from `K` exp-jets sharing one reciprocal jet — irreducibly `O(K³)` per
-//! row even after the #932 denominator-sharing / column-hoisting wins. On an
-//! A100 the per-row work is embarrassingly parallel across `n` rows and the
-//! `exp` is hardware, so the dense Hessian that bottlenecks the CPU is a
-//! non-issue. Measured (aga13 A100, full f64, no fast-math): **26× (K=16) to 76×
-//! (K=8)** kernel-only over the 1-thread CPU path, **device == CPU to 1e-15**.
+//! The CPU reference now runs the structure-compiled centered-moment schedule:
+//! each logit-Hessian output is O(1), so the covered subspace is O(K²P), the
+//! size of the returned tensor, rather than the old dense-jet O(K³P) work. The
+//! device kernel still evaluates the generic seeded-jet recurrence and is an
+//! independent mathematical oracle; its historical A100 timings predate this CPU
+//! cutover and therefore are not a current device-vs-host performance claim.
 //!
 //! # Single source, exactly
 //!
-//! The device kernel is a byte-faithful port of the [`Order2<K>`] =
+//! The device kernel is a byte-faithful port of the `Order2<K>` =
 //! [`Tower2<K>`] scalar arithmetic in [`gam_math::jet_tower`]: `add` /
 //! `scale` / truncated-Leibniz `mul`, and order-2 Faà di Bruno `compose_unary`
 //! for `exp` and `recip` (the `1/u` stack `[1/u, −1/u², 2/u³]`). It runs
-//! [`SaeReconstructionRowProgram::all_gates`]' algebra (shared softmax
+//! the generic row program's gate algebra (shared softmax
 //! denominator, single reciprocal, max-subtracted exponents) and the
 //! `ẑ_c = Σ_k ζ_k·decoded_{k,c}` assembly in the **same summation order** as the
-//! CPU, so the channels agree to round-off. There is no bespoke gate chain rule:
-//! the same jet program emits every derivative.
+//! CPU expression, so the channels agree to round-off. The CPU side derives the
+//! same channels through the centralized structure-compiled softmax-moment
+//! primitive, providing an independent oracle rather than duplicating this
+//! recurrence.
 //!
 //! # CPU fallback
 //!
 //! [`sae_row_jets`] is the general entry point. When a CUDA device is admitted it
 //! runs the kernel; otherwise (no Linux / no runtime / probe failure / too few
 //! rows to amortise the launch) it falls back to the CPU
-//! [`SaeReconstructionRowProgram::reconstruction_all_columns_packed`] — the SAME
-//! unified jet — so the result is identical and the path is never GPU-only.
+//! [`execute_softmax_row_program`] — the same unified semantic row program with a
+//! sparse execution schedule — so the path is never GPU-only.
 
-use crate::row_jet_program::SaeReconstructionRowProgram;
+use crate::row_jet_program::{
+    SaeRowPrimary, SaeSoftmaxRowProgramSource, execute_softmax_row_program,
+};
 use gam_solve::gpu_kernels::sae_resident::{DeviceResidentArrowShape, DeviceResidentArrowSlabs};
 
 /// One row's order-≤2 reconstruction jet channels, flattened row-major:
@@ -200,13 +203,12 @@ pub fn softmax_kernel_source(k: usize, p: usize) -> String {
 
 /// Minimum row count below which the device launch is not worth its fixed cost
 /// (probe + H2D + D2H). Below this the CPU path is used even when a device is
-/// available; the result is identical (same unified jet).
+/// available; the result is mathematically identical to round-off.
 pub const DEVICE_ROW_THRESHOLD: usize = 4_096;
 
-/// CPU reference: build every row's `first`/`second` channels from the SAME
-/// unified jet the production assembly uses
-/// ([`SaeReconstructionRowProgram::reconstruction_all_columns_packed`]). This is
-/// the fallback path AND the exactness oracle the device kernel is pinned to.
+/// CPU reference: build every row's `first`/`second` channels from the same
+/// structure-compiled semantic row program as production. This is the fallback
+/// path and the independent exactness oracle the device recurrence is pinned to.
 #[must_use]
 pub fn sae_row_jets_cpu_softmax(
     rows: &[SaeSoftmaxRowInputs],
@@ -218,14 +220,21 @@ pub fn sae_row_jets_cpu_softmax(
     let mut first = vec![0.0_f64; n * k * p];
     let mut second = vec![0.0_f64; n * k * k * p];
     for (row, inp) in rows.iter().enumerate() {
-        let prog = softmax_program(inp, k, p, inv_tau);
-        fill_row_channels(
-            &prog,
+        let source = GateOnlySoftmaxRowProgram {
+            input: inp,
+            gate_value: softmax_values(&inp.logits, inv_tau),
             k,
             p,
-            &mut first[row * k * p..(row + 1) * k * p],
-            &mut second[row * k * k * p..(row + 1) * k * k * p],
-        );
+        };
+        let channels = execute_softmax_row_program(&source, inv_tau, 1.0);
+        for a in 0..k {
+            for c in 0..p {
+                first[(row * k + a) * p + c] = channels.first[a][c];
+                for b in 0..k {
+                    second[((row * k + a) * k + b) * p + c] = channels.second[a][b][c];
+                }
+            }
+        }
     }
     SaeRowJetChannels {
         n_rows: n,
@@ -236,47 +245,72 @@ pub fn sae_row_jets_cpu_softmax(
     }
 }
 
-/// Assemble a one-row [`SaeReconstructionRowProgram`] for the softmax bottleneck
-/// shape: `K` gate-logit primaries, decoded values fed as constant per-atom
-/// "single-basis" decoders so `decoded_{k,c}` is reproduced exactly. The latent
-/// coordinate primaries are not seeded here (the K³ softmax Hessian is the gate
-/// logits). The complete CPU program also seeds coordinates; the current device
-/// input/kernel does not.
-fn softmax_program(
-    inp: &SaeSoftmaxRowInputs,
+/// Gate-only adapter for the same structure-compiled row program used by the
+/// complete CPU log-det path.  Decoded values are component constants and every
+/// primary is a logit; coordinate and beta methods are therefore unreachable by
+/// the schedule and return the corresponding empty/zero channel.
+struct GateOnlySoftmaxRowProgram<'a> {
+    input: &'a SaeSoftmaxRowInputs,
+    gate_value: Vec<f64>,
     k: usize,
     p: usize,
-    inv_tau: f64,
-) -> SaeReconstructionRowProgram {
-    use crate::row_jet_program::{AtomRowBasisJet, RowGate};
-    // Each atom carries a single basis function with value 1 and decoder row =
-    // the decoded values, so `decoded_{k,c} = 1 * decoded[k*p+c]`. The basis has
-    // zero jacobian/second (constant in this chart), matching the device kernel
-    // where `decoded` enters as a constant jet.
-    let atoms: Vec<AtomRowBasisJet> = (0..k)
-        .map(|atom| AtomRowBasisJet {
-            phi: vec![1.0],
-            d_phi: vec![vec![]],
-            d2_phi: vec![vec![]],
-            decoder: vec![(0..p).map(|c| inp.decoded[atom * p + c]).collect()],
-            latent_dim: 0,
-        })
-        .collect();
-    // softmax gate value ζ_k (only needed for the value channel, which the
-    // logdet consumer does not read here; supply the true softmax for parity).
-    let gate_value = softmax_values(&inp.logits, inv_tau);
-    SaeReconstructionRowProgram {
-        atoms,
-        gate_value,
-        logits: inp.logits.clone(),
-        gate_shift: vec![0.0; k],
-        gate: RowGate::Softmax { inv_tau },
-        logit_slot: (0..k).map(Some).collect(),
-        coord_slot: vec![vec![]; k],
-        // Softmax bottleneck: no ungated / frozen-routing atoms (both reject
-        // softmax), so every gate follows the free-logit softmax law.
-        fixed_gate_value: Vec::new(),
-        n_primaries: k,
+}
+
+impl SaeSoftmaxRowProgramSource for GateOnlySoftmaxRowProgram<'_> {
+    fn n_atoms(&self) -> usize {
+        self.k
+    }
+
+    fn out_dim(&self) -> usize {
+        self.p
+    }
+
+    fn n_primaries(&self) -> usize {
+        self.k
+    }
+
+    fn primary(&self, slot: usize) -> SaeRowPrimary {
+        SaeRowPrimary::Logit { atom: slot }
+    }
+
+    fn gate_value(&self, atom: usize) -> f64 {
+        self.gate_value[atom]
+    }
+
+    fn atom_is_active(&self, _atom: usize) -> bool {
+        true
+    }
+
+    fn fill_decoded(&self, atom: usize, out: &mut [f64]) {
+        out.copy_from_slice(&self.input.decoded[atom * self.p..(atom + 1) * self.p]);
+    }
+
+    fn fill_decoded_first(&self, _atom: usize, _axis: usize, out: &mut [f64]) {
+        out.fill(0.0);
+    }
+
+    fn fill_decoded_second(&self, _atom: usize, _axis_a: usize, _axis_b: usize, out: &mut [f64]) {
+        out.fill(0.0);
+    }
+
+    fn n_beta_borders(&self) -> usize {
+        0
+    }
+
+    fn beta_border_atom(&self, _border: usize) -> usize {
+        0
+    }
+
+    fn beta_border_basis_value(&self, _border: usize) -> f64 {
+        0.0
+    }
+
+    fn beta_border_basis_first(&self, _border: usize, _axis: usize) -> f64 {
+        0.0
+    }
+
+    fn beta_border_output(&self, _border: usize) -> &[f64] {
+        &[]
     }
 }
 
@@ -290,53 +324,11 @@ fn softmax_values(logits: &[f64], inv_tau: f64) -> Vec<f64> {
     exps.iter().map(|e| e / denom).collect()
 }
 
-/// Dispatch the per-row `first`/`second` fill across the supported tower arities,
-/// reusing the production `reconstruction_all_columns_packed::<K>()` so the
-/// fallback is bit-identical to the live assembly.
-fn fill_row_channels(
-    prog: &SaeReconstructionRowProgram,
-    k: usize,
-    p: usize,
-    first: &mut [f64],
-    second: &mut [f64],
-) {
-    macro_rules! dispatch {
-        ($($kk:literal),* $(,)?) => {
-            match k {
-                $(
-                    $kk => {
-                        let cols = prog.reconstruction_all_columns_packed::<$kk>();
-                        for (c, tower) in cols.iter().enumerate() {
-                            let g = tower.g();
-                            let h = tower.h();
-                            for a in 0..$kk {
-                                first[a * p + c] = g[a];
-                                for b in 0..$kk {
-                                    second[(a * $kk + b) * p + c] = h[a][b];
-                                }
-                            }
-                        }
-                    }
-                )*
-                // SAFETY: `k` is the SAE atom count, which the device row-jet
-                // path only accepts in `1..=16` (the dispatch arms above cover
-                // exactly that range, matching the host `Order2<K>` monomorphic
-                // instantiations). The caller gates the GPU fast path on this
-                // bound, so this arm is unreachable for any constructed model; a
-                // panic here means an upstream contract was violated and must
-                // fail loudly rather than silently produce a wrong Hessian.
-                _ => panic!("SAE device row-jet supports K in 1..=16, got {k}"),
-            }
-        };
-    }
-    dispatch!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
-}
-
 /// General entry point: compute every softmax row's order-≤2 reconstruction jet
 /// channels, on the GPU when a CUDA device is admitted and the batch is large
-/// enough to amortise the launch, else on the CPU. Both paths run the SAME
-/// unified [`Order2<K>`] jet, so the result is identical (proven ≤1e-9; measured
-/// 1e-15 on the A100).
+/// enough to amortise the launch, else on the CPU. Both paths evaluate the same
+/// softmax-expectation derivatives via independent compiled-moment (CPU) and
+/// seeded-jet (device) schedules, with parity enforced to ≤1e-9.
 #[must_use]
 pub fn sae_row_jets_softmax(
     rows: &[SaeSoftmaxRowInputs],
@@ -366,7 +358,7 @@ pub fn sae_row_jets_softmax(
 pub enum SaeRowJetPath {
     /// The NVRTC `sae_rowjet_softmax` kernel compiled and ran on the device.
     Device,
-    /// The host `Order2<K>` jet ran (no Linux / no CUDA runtime / below the
+    /// The host structure-compiled row program ran (no Linux / no CUDA runtime / below the
     /// `DEVICE_ROW_THRESHOLD` launch break-even).
     Cpu,
 }
@@ -389,9 +381,9 @@ pub enum SaeRowJetPath {
 ///   [`sae_row_jets_softmax`]'s behaviour while still reporting which path ran.
 /// * [`GpuPolicy::Off`] — always the CPU; returns `Ok((_, Cpu))`.
 ///
-/// Both paths run the SAME unified [`Order2<K>`] jet, so when the device runs
-/// its channels match the CPU oracle to round-off (proven ≤1e-9; the parity
-/// tests assert it on this box's real V100).
+/// Both paths evaluate the same derivatives, so when the device runs its seeded
+/// jet channels match the compiled CPU oracle to round-off; parity tests enforce
+/// ≤1e-9.
 ///
 /// # Errors
 /// Returns [`GpuError`] when [`GpuPolicy::Required`] is set but the device path

@@ -1364,6 +1364,290 @@ fn latent_kernel_sum_log_jet(
     Ok(out)
 }
 
+/// A one-pass analytic lift of a latent kernel sum into an order-specific jet.
+///
+/// `suffixes` describes the nilpotent parts carried by the requested scalar:
+/// `[]` for the ordinary order-two base, `[u]` for the `OneSeed` epsilon part,
+/// and `[u]`, `[v]`, `[u,v]` for the three non-base `TwoSeed` parts.  For each
+/// part we differentiate the SAME kernel-term program in the order
+/// `[primary_a, primary_b, suffix...]`.  That ordering is deliberately the
+/// pre-cutover `MultiDirJet` ordering, so every requested raw derivative is
+/// assembled by the same recurrence and signed-log reduction as its oracle.
+/// The expensive quadrature bundle is then evaluated ONCE at the maximum `k`
+/// required by the complete output instead of once per Hessian cell.
+fn latent_kernel_sum_order2_parts<const K: usize>(
+    quadctx: &QuadratureContext,
+    base_terms: &[LatentKernelPrimaryTerm],
+    state: LatentKernelPrimaryState,
+    primary_directions: &[LatentKernelPrimaryDirection; K],
+    suffixes: &[&[LatentKernelPrimaryDirection]],
+    context: &str,
+) -> Result<(f64, Vec<Order2<K>>), LatentSurvivalError> {
+    let order2_width = 1 + K + K * (K + 1) / 2;
+    let mut term_lists = Vec::<Vec<LatentKernelPrimaryTerm>>::with_capacity(
+        suffixes.len() * order2_width,
+    );
+
+    for suffix in suffixes {
+        let mut append = |axes: &[LatentKernelPrimaryDirection]| {
+            let mut terms = base_terms.to_vec();
+            for direction in axes.iter().chain(suffix.iter()) {
+                terms = latent_kernel_differentiate_terms(&terms, *direction);
+            }
+            term_lists.push(terms);
+        };
+        append(&[]);
+        for a in 0..K {
+            append(&[primary_directions[a]]);
+        }
+        for a in 0..K {
+            for b in a..K {
+                append(&[primary_directions[a], primary_directions[b]]);
+            }
+        }
+    }
+
+    let max_k = term_lists
+        .iter()
+        .flat_map(|terms| terms.iter().map(|term| term.k))
+        .max()
+        .unwrap_or(0);
+    let bundle =
+        log_kernel_bundle(quadctx, state.q.exp(), state.mu, state.sigma, max_k).map_err(|e| {
+            LatentSurvivalError::NumericalFailure {
+                reason: format!("{context} kernel evaluation failed: {e}"),
+            }
+        })?;
+
+    let evaluate_terms =
+        |terms: &[LatentKernelPrimaryTerm]| -> Result<(f64, f64), LatentSurvivalError> {
+            let mut log_mags = Vec::with_capacity(terms.len());
+            let mut signs = Vec::with_capacity(terms.len());
+            for term in terms {
+                if term.coeff == 0.0 {
+                    continue;
+                }
+                if term.qdot_power > 0 && !(state.qdot.is_finite() && state.qdot > 0.0) {
+                    return Err(LatentSurvivalError::NumericalFailure {
+                        reason: format!(
+                            "{context} requires positive finite qdot for exact-event directional terms, got {}",
+                            state.qdot
+                        ),
+                    });
+                }
+                let log_qdot = if term.qdot_power > 0 {
+                    state.qdot.ln()
+                } else {
+                    0.0
+                };
+                log_mags.push(
+                    term.coeff.abs().ln()
+                        + term.q_exp as f64 * state.q
+                        + term.tau_exp as f64 * state.log_sigma_factor
+                        + term.qdot_power as f64 * log_qdot
+                        + bundle.get(term.k),
+                );
+                signs.push(term.coeff.signum());
+            }
+            if log_mags.is_empty() {
+                return Ok((f64::NEG_INFINITY, 0.0));
+            }
+            Ok(signed_log_sum_exp(&log_mags, &signs))
+        };
+
+    let (base_log_sum, base_sign) = evaluate_terms(&term_lists[0])?;
+    if !(base_log_sum.is_finite() && base_sign > 0.0) {
+        return Err(LatentSurvivalError::NumericalFailure {
+            reason: format!("{context} produced a non-positive signed kernel sum"),
+        });
+    }
+    let normalized = |terms: &[LatentKernelPrimaryTerm]| -> Result<f64, LatentSurvivalError> {
+        let (log_abs, sign) = evaluate_terms(terms)?;
+        Ok(if !log_abs.is_finite() || sign == 0.0 {
+            0.0
+        } else {
+            sign * (log_abs - base_log_sum).exp()
+        })
+    };
+
+    let mut parts = Vec::with_capacity(suffixes.len());
+    let mut cursor = 0usize;
+    for part in 0..suffixes.len() {
+        let value = if part == 0 {
+            // The base is the kernel divided by itself.  Keep this literal 1.0,
+            // matching the old `MultiDirJet::constant(..., 1.0)` construction.
+            1.0
+        } else {
+            normalized(&term_lists[cursor])?
+        };
+        cursor += 1;
+        let mut tower = gam_math::jet_tower::Tower2::<K>::constant(value);
+        for a in 0..K {
+            tower.g[a] = normalized(&term_lists[cursor])?;
+            cursor += 1;
+        }
+        for a in 0..K {
+            for b in a..K {
+                let derivative = normalized(&term_lists[cursor])?;
+                cursor += 1;
+                tower.h[a][b] = derivative;
+                tower.h[b][a] = derivative;
+            }
+        }
+        parts.push(Order2(tower));
+    }
+    debug_assert_eq!(cursor, term_lists.len());
+    Ok((base_log_sum, parts))
+}
+
+#[inline]
+fn latent_kernel_direction_linear_combination<const K: usize>(
+    primary_directions: &[LatentKernelPrimaryDirection; K],
+    coefficients: &[f64; K],
+) -> LatentKernelPrimaryDirection {
+    let mut out = LatentKernelPrimaryDirection {
+        dq: 0.0,
+        dqd: 0.0,
+        dmu: 0.0,
+        dtau: 0.0,
+    };
+    for a in 0..K {
+        out.dq += coefficients[a] * primary_directions[a].dq;
+        out.dqd += coefficients[a] * primary_directions[a].dqd;
+        out.dmu += coefficients[a] * primary_directions[a].dmu;
+        out.dtau += coefficients[a] * primary_directions[a].dtau;
+    }
+    out
+}
+
+/// Backend seam for the single latent-survival row expression.  Only the
+/// analytic multivariate kernel primitive differs by requested channel; all
+/// numerator/denominator/event algebra below is instantiated unchanged.
+trait LatentPrimaryJetBackend<const K: usize> {
+    type Jet: JetScalar<K>;
+
+    fn kernel_sum_log(
+        &self,
+        quadctx: &QuadratureContext,
+        base_terms: &[LatentKernelPrimaryTerm],
+        state: LatentKernelPrimaryState,
+        primary_directions: &[LatentKernelPrimaryDirection; K],
+        context: &str,
+    ) -> Result<Self::Jet, LatentSurvivalError>;
+}
+
+#[derive(Clone, Copy)]
+struct LatentOrder2Backend;
+
+impl<const K: usize> LatentPrimaryJetBackend<K> for LatentOrder2Backend {
+    type Jet = Order2<K>;
+
+    fn kernel_sum_log(
+        &self,
+        quadctx: &QuadratureContext,
+        base_terms: &[LatentKernelPrimaryTerm],
+        state: LatentKernelPrimaryState,
+        primary_directions: &[LatentKernelPrimaryDirection; K],
+        context: &str,
+    ) -> Result<Self::Jet, LatentSurvivalError> {
+        let suffixes: [&[LatentKernelPrimaryDirection]; 1] = [&[]];
+        let (base_log_sum, mut parts) = latent_kernel_sum_order2_parts(
+            quadctx,
+            base_terms,
+            state,
+            primary_directions,
+            &suffixes,
+            context,
+        )?;
+        let mut out = parts.remove(0).compose_unary(latent_unary_derivatives_log(1.0));
+        out.0.v += base_log_sum;
+        Ok(out)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LatentOneSeedBackend<const K: usize> {
+    direction: [f64; K],
+}
+
+impl<const K: usize> LatentPrimaryJetBackend<K> for LatentOneSeedBackend<K> {
+    type Jet = OneSeed<K>;
+
+    fn kernel_sum_log(
+        &self,
+        quadctx: &QuadratureContext,
+        base_terms: &[LatentKernelPrimaryTerm],
+        state: LatentKernelPrimaryState,
+        primary_directions: &[LatentKernelPrimaryDirection; K],
+        context: &str,
+    ) -> Result<Self::Jet, LatentSurvivalError> {
+        let seed = latent_kernel_direction_linear_combination(primary_directions, &self.direction);
+        let seed_suffix = [seed];
+        let suffixes: [&[LatentKernelPrimaryDirection]; 2] = [&[], &seed_suffix];
+        let (base_log_sum, parts) = latent_kernel_sum_order2_parts(
+            quadctx,
+            base_terms,
+            state,
+            primary_directions,
+            &suffixes,
+            context,
+        )?;
+        let mut out = OneSeed {
+            base: parts[0],
+            eps: parts[1],
+        }
+        .compose_unary(latent_unary_derivatives_log(1.0));
+        out.base.0.v += base_log_sum;
+        Ok(out)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LatentTwoSeedBackend<const K: usize> {
+    direction_u: [f64; K],
+    direction_v: [f64; K],
+}
+
+impl<const K: usize> LatentPrimaryJetBackend<K> for LatentTwoSeedBackend<K> {
+    type Jet = TwoSeed<K>;
+
+    fn kernel_sum_log(
+        &self,
+        quadctx: &QuadratureContext,
+        base_terms: &[LatentKernelPrimaryTerm],
+        state: LatentKernelPrimaryState,
+        primary_directions: &[LatentKernelPrimaryDirection; K],
+        context: &str,
+    ) -> Result<Self::Jet, LatentSurvivalError> {
+        let seed_u =
+            latent_kernel_direction_linear_combination(primary_directions, &self.direction_u);
+        let seed_v =
+            latent_kernel_direction_linear_combination(primary_directions, &self.direction_v);
+        let suffix_u = [seed_u];
+        let suffix_v = [seed_v];
+        let suffix_uv = [seed_u, seed_v];
+        let suffixes: [&[LatentKernelPrimaryDirection]; 4] =
+            [&[], &suffix_u, &suffix_v, &suffix_uv];
+        let (base_log_sum, parts) = latent_kernel_sum_order2_parts(
+            quadctx,
+            base_terms,
+            state,
+            primary_directions,
+            &suffixes,
+            context,
+        )?;
+        let mut out = TwoSeed {
+            base: parts[0],
+            eps: parts[1],
+            del: parts[2],
+            eps_del: parts[3],
+        }
+        .compose_unary(latent_unary_derivatives_log(1.0));
+        out.base.0.v += base_log_sum;
+        Ok(out)
+    }
+}
+
 fn latent_survival_basis_direction(primary_idx: usize) -> LatentSurvivalPrimaryDirection {
     match primary_idx {
         LATENT_SURVIVAL_PRIMARY_Q_ENTRY => LatentSurvivalPrimaryDirection {
@@ -1483,7 +1767,8 @@ fn latent_survival_map_right_direction(
     }
 }
 
-fn latent_survival_row_primary_log_jet(
+#[cfg(test)]
+fn latent_survival_row_primary_log_jet_multidir_reference(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
     q_entry: f64,
@@ -1588,7 +1873,8 @@ fn latent_survival_row_primary_log_jet(
                 "latent survival numerator",
             )?
         }
-        LatentSurvivalEventType::IntervalCensored => latent_survival_interval_numerator_log_jet(
+        LatentSurvivalEventType::IntervalCensored =>
+            latent_survival_interval_numerator_log_jet_multidir_reference(
             quadctx,
             row,
             q_exit,
@@ -1640,7 +1926,8 @@ fn latent_survival_row_primary_log_jet(
 /// follows by the Faà-di-Bruno composition already implemented in
 /// `MultiDirJet::compose_unary`, so the derivative reductions are consistent
 /// with the exact-event/right-censored branches by construction.
-fn latent_survival_interval_numerator_log_jet(
+#[cfg(test)]
+fn latent_survival_interval_numerator_log_jet_multidir_reference(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
     q_exit: f64,
@@ -1727,7 +2014,403 @@ fn latent_survival_interval_numerator_log_jet(
     Ok(linear_numerator.compose_unary(latent_unary_derivatives_log(base)))
 }
 
+/// The single latent-survival row program, instantiated at an order-two,
+/// one-seed, or two-seed backend.  Event dispatch and the interval
+/// log-difference are intentionally expressed once here; a backend changes only
+/// the derivative layout used to lift each analytic kernel-sum primitive.
+fn latent_survival_row_primary_jet<const K: usize, B: LatentPrimaryJetBackend<K>>(
+    backend: &B,
+    quadctx: &QuadratureContext,
+    row: &LatentSurvivalRow,
+    q_entry: f64,
+    q_exit: f64,
+    qdot_exit: f64,
+    q_right: f64,
+    mu: f64,
+    sigma: f64,
+    log_sigma_factor: f64,
+) -> Result<B::Jet, String> {
+    let entry_state = LatentKernelPrimaryState {
+        q: q_entry,
+        qdot: 1.0,
+        mu,
+        sigma,
+        log_sigma_factor,
+    };
+    let entry_directions: [LatentKernelPrimaryDirection; K] = std::array::from_fn(|a| {
+        latent_survival_map_entry_direction(latent_survival_basis_direction(a))
+    });
+    let denominator = backend
+        .kernel_sum_log(
+            quadctx,
+            &[LatentKernelPrimaryTerm {
+                coeff: 1.0,
+                q_exp: 0,
+                qdot_power: 0,
+                tau_exp: 0,
+                k: 0,
+            }],
+            entry_state,
+            &entry_directions,
+            "latent survival denominator",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let numerator = match row.event_type {
+        LatentSurvivalEventType::RightCensored | LatentSurvivalEventType::ExactEvent => {
+            let exit_state = LatentKernelPrimaryState {
+                q: q_exit,
+                qdot: qdot_exit,
+                mu,
+                sigma,
+                log_sigma_factor,
+            };
+            let exit_directions: [LatentKernelPrimaryDirection; K] =
+                std::array::from_fn(|a| {
+                    latent_survival_map_exit_direction(
+                        latent_survival_basis_direction(a),
+                        row.event_type,
+                    )
+                });
+            match row.event_type {
+                LatentSurvivalEventType::RightCensored => backend
+                    .kernel_sum_log(
+                        quadctx,
+                        &[LatentKernelPrimaryTerm {
+                            coeff: 1.0,
+                            q_exp: 0,
+                            qdot_power: 0,
+                            tau_exp: 0,
+                            k: 0,
+                        }],
+                        exit_state,
+                        &exit_directions,
+                        "latent survival numerator",
+                    )
+                    .map_err(|error| error.to_string())?,
+                LatentSurvivalEventType::ExactEvent => {
+                    // A zero unloaded-hazard term is retained in the stack
+                    // array but disappears in the signed-log evaluator and all
+                    // derivative recurrences.  This avoids a per-row Vec while
+                    // preserving the exact loaded-only branch.
+                    let numerator_terms = [
+                        LatentKernelPrimaryTerm {
+                            coeff: row.hazard_unloaded,
+                            q_exp: 0,
+                            qdot_power: 0,
+                            tau_exp: 0,
+                            k: 0,
+                        },
+                        LatentKernelPrimaryTerm {
+                            coeff: 1.0,
+                            q_exp: 1,
+                            qdot_power: 1,
+                            tau_exp: 0,
+                            k: 1,
+                        },
+                    ];
+                    backend
+                        .kernel_sum_log(
+                            quadctx,
+                            &numerator_terms,
+                            exit_state,
+                            &exit_directions,
+                            "latent survival numerator",
+                        )
+                        .map_err(|error| error.to_string())?
+                }
+                LatentSurvivalEventType::IntervalCensored => unreachable!(
+                    "interval rows are routed to the dedicated two-boundary branch"
+                ),
+            }
+        }
+        LatentSurvivalEventType::IntervalCensored => latent_survival_interval_numerator_jet(
+            backend,
+            quadctx,
+            row,
+            q_exit,
+            q_right,
+            mu,
+            sigma,
+            log_sigma_factor,
+        )?,
+    };
+
+    let unloaded_offset = match row.event_type {
+        LatentSurvivalEventType::IntervalCensored => row.mass_unloaded_entry,
+        _ => -row.mass_unloaded_exit + row.mass_unloaded_entry,
+    };
+    Ok(numerator
+        .sub(&denominator)
+        .add(&B::Jet::constant(unloaded_offset)))
+}
+
+fn latent_survival_interval_numerator_jet<
+    const K: usize,
+    B: LatentPrimaryJetBackend<K>,
+>(
+    backend: &B,
+    quadctx: &QuadratureContext,
+    row: &LatentSurvivalRow,
+    q_exit: f64,
+    q_right: f64,
+    mu: f64,
+    sigma: f64,
+    log_sigma_factor: f64,
+) -> Result<B::Jet, String> {
+    let single_k0 = [LatentKernelPrimaryTerm {
+        coeff: 1.0,
+        q_exp: 0,
+        qdot_power: 0,
+        tau_exp: 0,
+        k: 0,
+    }];
+    let left_state = LatentKernelPrimaryState {
+        q: q_exit,
+        qdot: 1.0,
+        mu,
+        sigma,
+        log_sigma_factor,
+    };
+    let right_state = LatentKernelPrimaryState {
+        q: q_right,
+        qdot: 1.0,
+        mu,
+        sigma,
+        log_sigma_factor,
+    };
+    let left_directions: [LatentKernelPrimaryDirection; K] = std::array::from_fn(|a| {
+        latent_survival_map_left_direction(latent_survival_basis_direction(a))
+    });
+    let right_directions: [LatentKernelPrimaryDirection; K] = std::array::from_fn(|a| {
+        latent_survival_map_right_direction(latent_survival_basis_direction(a))
+    });
+    let log_left = backend
+        .kernel_sum_log(
+            quadctx,
+            &single_k0,
+            left_state,
+            &left_directions,
+            "latent survival interval left boundary",
+        )
+        .map_err(|error| error.to_string())?;
+    let log_right = backend
+        .kernel_sum_log(
+            quadctx,
+            &single_k0,
+            right_state,
+            &right_directions,
+            "latent survival interval right boundary",
+        )
+        .map_err(|error| error.to_string())?;
+
+    let linear_left = log_left.exp().scale((-row.mass_unloaded_left).exp());
+    let linear_right = log_right.exp().scale((-row.mass_unloaded_right).exp());
+    let linear_numerator = linear_left.sub(&linear_right);
+    let base = linear_numerator.value();
+    if !(base.is_finite() && base > 0.0) {
+        return Err(LatentSurvivalError::NumericalFailure {
+            reason: format!(
+                "latent survival interval numerator must be a positive survival-mass difference, \
+                 got c_L*K0(M_L) - c_R*K0(M_R) = {base}; require M_L < M_R (i.e. L < R)"
+            ),
+        }
+        .into());
+    }
+    Ok(linear_numerator.compose_unary(latent_unary_derivatives_log(base)))
+}
+
 fn latent_survival_row_primary_gradient_hessian(
+    quadctx: &QuadratureContext,
+    row: &LatentSurvivalRow,
+    q_entry: f64,
+    q_exit: f64,
+    qdot_exit: f64,
+    q_right: f64,
+    mu: f64,
+    sigma: f64,
+    include_log_sigma: bool,
+) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+    let log_sigma_factor = if sigma > 0.0 { sigma.ln() } else { 0.0 };
+    let mut gradient = Array1::<f64>::zeros(LATENT_SURVIVAL_PRIMARY_DIM);
+    let mut neg_hessian =
+        Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
+    if include_log_sigma {
+        let out = latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_DIM, _>(
+            &LatentOrder2Backend,
+            quadctx,
+            row,
+            q_entry,
+            q_exit,
+            qdot_exit,
+            q_right,
+            mu,
+            sigma,
+            log_sigma_factor,
+        )?;
+        gradient.as_slice_mut().expect("gradient is contiguous").copy_from_slice(&out.g());
+        let hessian = out.h();
+        for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+            for b in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+                neg_hessian[[a, b]] = -hessian[a][b];
+            }
+        }
+        Ok((out.value(), gradient, neg_hessian))
+    } else {
+        let out = latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_LOG_SIGMA, _>(
+            &LatentOrder2Backend,
+            quadctx,
+            row,
+            q_entry,
+            q_exit,
+            qdot_exit,
+            q_right,
+            mu,
+            sigma,
+            log_sigma_factor,
+        )?;
+        for a in 0..LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
+            gradient[a] = out.g()[a];
+            for b in 0..LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
+                neg_hessian[[a, b]] = -out.h()[a][b];
+            }
+        }
+        Ok((out.value(), gradient, neg_hessian))
+    }
+}
+
+fn latent_survival_row_primary_third_contracted(
+    quadctx: &QuadratureContext,
+    row: &LatentSurvivalRow,
+    q_entry: f64,
+    q_exit: f64,
+    qdot_exit: f64,
+    q_right: f64,
+    mu: f64,
+    sigma: f64,
+    direction: &Array1<f64>,
+    include_log_sigma: bool,
+) -> Result<Array2<f64>, String> {
+    let log_sigma_factor = if sigma > 0.0 { sigma.ln() } else { 0.0 };
+    let mut result =
+        Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
+    if include_log_sigma {
+        let backend = LatentOneSeedBackend {
+            direction: std::array::from_fn(|a| direction[a]),
+        };
+        let out = latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_DIM, _>(
+            &backend,
+            quadctx,
+            row,
+            q_entry,
+            q_exit,
+            qdot_exit,
+            q_right,
+            mu,
+            sigma,
+            log_sigma_factor,
+        )?;
+        let third = out.contracted_third();
+        for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+            for b in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+                result[[a, b]] = -third[a][b];
+            }
+        }
+    } else {
+        let backend = LatentOneSeedBackend {
+            direction: std::array::from_fn(|a| direction[a]),
+        };
+        let out = latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_LOG_SIGMA, _>(
+            &backend,
+            quadctx,
+            row,
+            q_entry,
+            q_exit,
+            qdot_exit,
+            q_right,
+            mu,
+            sigma,
+            log_sigma_factor,
+        )?;
+        let third = out.contracted_third();
+        for a in 0..LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
+            for b in 0..LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
+                result[[a, b]] = -third[a][b];
+            }
+        }
+    }
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn latent_survival_row_primary_fourth_contracted(
+    quadctx: &QuadratureContext,
+    row: &LatentSurvivalRow,
+    q_entry: f64,
+    q_exit: f64,
+    qdot_exit: f64,
+    q_right: f64,
+    mu: f64,
+    sigma: f64,
+    direction_u: &Array1<f64>,
+    direction_v: &Array1<f64>,
+    include_log_sigma: bool,
+) -> Result<Array2<f64>, String> {
+    let log_sigma_factor = if sigma > 0.0 { sigma.ln() } else { 0.0 };
+    let mut result =
+        Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
+    if include_log_sigma {
+        let backend = LatentTwoSeedBackend {
+            direction_u: std::array::from_fn(|a| direction_u[a]),
+            direction_v: std::array::from_fn(|a| direction_v[a]),
+        };
+        let out = latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_DIM, _>(
+            &backend,
+            quadctx,
+            row,
+            q_entry,
+            q_exit,
+            qdot_exit,
+            q_right,
+            mu,
+            sigma,
+            log_sigma_factor,
+        )?;
+        let fourth = out.contracted_fourth();
+        for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+            for b in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+                result[[a, b]] = -fourth[a][b];
+            }
+        }
+    } else {
+        let backend = LatentTwoSeedBackend {
+            direction_u: std::array::from_fn(|a| direction_u[a]),
+            direction_v: std::array::from_fn(|a| direction_v[a]),
+        };
+        let out = latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_LOG_SIGMA, _>(
+            &backend,
+            quadctx,
+            row,
+            q_entry,
+            q_exit,
+            qdot_exit,
+            q_right,
+            mu,
+            sigma,
+            log_sigma_factor,
+        )?;
+        let fourth = out.contracted_fourth();
+        for a in 0..LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
+            for b in 0..LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
+                result[[a, b]] = -fourth[a][b];
+            }
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+fn latent_survival_row_primary_gradient_hessian_multidir_reference(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
     q_entry: f64,
@@ -1747,7 +2430,7 @@ fn latent_survival_row_primary_gradient_hessian(
     } else {
         LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
     };
-    let log_lik = latent_survival_row_primary_log_jet(
+    let log_lik = latent_survival_row_primary_log_jet_multidir_reference(
         quadctx,
         row,
         q_entry,
@@ -1762,7 +2445,7 @@ fn latent_survival_row_primary_gradient_hessian(
     .coeff(0);
     for a in 0..active_primary {
         let dir_a = latent_survival_basis_direction(a);
-        gradient[a] = latent_survival_row_primary_log_jet(
+        gradient[a] = latent_survival_row_primary_log_jet_multidir_reference(
             quadctx,
             row,
             q_entry,
@@ -1776,7 +2459,7 @@ fn latent_survival_row_primary_gradient_hessian(
         )?
         .coeff(1);
         for b in a..active_primary {
-            let coeff = latent_survival_row_primary_log_jet(
+            let coeff = latent_survival_row_primary_log_jet_multidir_reference(
                 quadctx,
                 row,
                 q_entry,
@@ -1796,7 +2479,8 @@ fn latent_survival_row_primary_gradient_hessian(
     Ok((log_lik, gradient, neg_hessian))
 }
 
-fn latent_survival_row_primary_third_contracted(
+#[cfg(test)]
+fn latent_survival_row_primary_third_contracted_multidir_reference(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
     q_entry: f64,
@@ -1826,7 +2510,7 @@ fn latent_survival_row_primary_third_contracted(
     for a in 0..active_primary {
         let dir_a = latent_survival_basis_direction(a);
         for b in a..active_primary {
-            let coeff = latent_survival_row_primary_log_jet(
+            let coeff = latent_survival_row_primary_log_jet_multidir_reference(
                 quadctx,
                 row,
                 q_entry,
@@ -1846,7 +2530,8 @@ fn latent_survival_row_primary_third_contracted(
     Ok(out)
 }
 
-fn latent_survival_row_primary_fourth_contracted(
+#[cfg(test)]
+fn latent_survival_row_primary_fourth_contracted_multidir_reference(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
     q_entry: f64,
@@ -1885,7 +2570,7 @@ fn latent_survival_row_primary_fourth_contracted(
     for a in 0..active_primary {
         let dir_a = latent_survival_basis_direction(a);
         for b in a..active_primary {
-            let coeff = latent_survival_row_primary_log_jet(
+            let coeff = latent_survival_row_primary_log_jet_multidir_reference(
                 quadctx,
                 row,
                 q_entry,

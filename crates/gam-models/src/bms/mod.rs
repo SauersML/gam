@@ -294,7 +294,7 @@ impl EmpiricalZGrid {
     /// the whole grid. Prefer this over building the struct literally; every
     /// code path that goes through `new` satisfies the same contract that
     /// `validate_empirical_z_grid` checks on read.
-    pub fn new(nodes: Vec<f64>, weights: Vec<f64>, context: &str) -> Result<Self, String> {
+    pub fn new(mut nodes: Vec<f64>, mut weights: Vec<f64>, context: &str) -> Result<Self, String> {
         if nodes.len() != weights.len() {
             return Err(format!(
                 "{context} empirical latent measure node/weight length mismatch: nodes={}, weights={}",
@@ -302,9 +302,7 @@ impl EmpiricalZGrid {
                 weights.len()
             ));
         }
-        let mut pairs: Vec<(f64, f64)> = nodes.into_iter().zip(weights).collect();
-        pairs.sort_by(|left, right| left.0.total_cmp(&right.0));
-        let (nodes, weights): (Vec<f64>, Vec<f64>) = pairs.into_iter().unzip();
+        sort_empirical_node_weight_pairs(&mut nodes, &mut weights);
         validate_empirical_z_grid(&nodes, &weights, context)?;
         Ok(Self { nodes, weights })
     }
@@ -462,6 +460,41 @@ impl LatentMeasureKind {
                 )?)))
             }
         }
+    }
+}
+
+/// Allocation-free heapsort of parallel empirical node/weight storage.
+/// `EmpiricalZGrid::new` owns both vectors, so moving pairs in place avoids the
+/// third temporary allocation that a `Vec<(node, weight)>` canonicalization
+/// would add to the per-row local-mixture path.
+fn sort_empirical_node_weight_pairs(nodes: &mut [f64], weights: &mut [f64]) {
+    debug_assert_eq!(nodes.len(), weights.len());
+    fn sift_down(nodes: &mut [f64], weights: &mut [f64], mut root: usize, end: usize) {
+        loop {
+            let mut child = 2 * root + 1;
+            if child >= end {
+                return;
+            }
+            if child + 1 < end && nodes[child].total_cmp(&nodes[child + 1]).is_lt() {
+                child += 1;
+            }
+            if !nodes[root].total_cmp(&nodes[child]).is_lt() {
+                return;
+            }
+            nodes.swap(root, child);
+            weights.swap(root, child);
+            root = child;
+        }
+    }
+
+    let len = nodes.len();
+    for root in (0..len / 2).rev() {
+        sift_down(nodes, weights, root, len);
+    }
+    for end in (1..len).rev() {
+        nodes.swap(0, end);
+        weights.swap(0, end);
+        sift_down(nodes, weights, 0, end);
     }
 }
 
@@ -2130,12 +2163,8 @@ mod tests {
 
     #[test]
     fn empirical_grid_validation_rejects_noncanonical_node_order() {
-        let err = validate_empirical_z_grid(
-            &[0.0, -1.0],
-            &[0.5, 0.5],
-            "sorted-grid invariant",
-        )
-        .expect_err("persisted grids must already be canonical");
+        let err = validate_empirical_z_grid(&[0.0, -1.0], &[0.5, 0.5], "sorted-grid invariant")
+            .expect_err("persisted grids must already be canonical");
         assert!(err.contains("nodes must be sorted ascending"), "{err}");
     }
 }
@@ -2181,8 +2210,8 @@ pub(crate) use family::{
     build_link_deviation_block_from_knots_design_seed_and_weights,
     build_score_warp_deviation_block_from_seed,
 };
-pub(crate) use gradient_paths::standardize_latent_z_with_policy;
 pub(crate) use gradient_paths::signed_probit_neglog_unary_stack;
+pub(crate) use gradient_paths::standardize_latent_z_with_policy;
 pub(crate) use gradient_paths::{
     empirical_intercept_from_marginal, signed_probit_neglog_derivatives_up_to_fourth,
     unary_derivatives_log, unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi,

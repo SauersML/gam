@@ -3677,6 +3677,32 @@ mod patterned_order2_perf_tests {
             }
         }
 
+        // Exact event/censor endpoints are semantically active branches, not
+        // merely convenient benchmark inputs: the inactive derivative stack
+        // may be non-finite, so a fused schedule must never manufacture
+        // `0 * Inf`. Pin both endpoints to the generic program separately.
+        for d in [0.0, 1.0] {
+            let mut endpoint_kernel = kernel;
+            endpoint_kernel.d = d;
+            let endpoint_want = dense(&p, &endpoint_kernel);
+            let endpoint_got = hand_fused(&p, &endpoint_kernel);
+            close(endpoint_got.0, endpoint_want.0, "fused-hand endpoint value");
+            for i in 0..SLS_ROW_K {
+                close(
+                    endpoint_got.1[i],
+                    endpoint_want.1[i],
+                    &format!("fused-hand endpoint gradient d={d} [{i}]"),
+                );
+                for j in 0..SLS_ROW_K {
+                    close(
+                        endpoint_got.2[i][j],
+                        endpoint_want.2[i][j],
+                        &format!("fused-hand endpoint Hessian d={d} [{i},{j}]"),
+                    );
+                }
+            }
+        }
+
         let iterations = 2_000_000usize;
         let mut best_dense = f64::INFINITY;
         let mut best_patterned = f64::INFINITY;

@@ -119,6 +119,11 @@ fn ln_stack(x: f64) -> [f64; 5] {
 /// this interface and re-instantiated at [`Jet2`] / [`Jet3`] / [`Jet4`] for the
 /// value/grad/Hessian, contracted-third, and contracted-fourth channels.
 trait FlexJet: Sized + Clone {
+    /// Highest derivative order represented by this nilpotent algebra.
+    /// A value-zero perturbation raised to `ORDER + 1` is identically zero, so
+    /// generic Taylor-polynomial builders must stop at this exact order.
+    const ORDER: usize;
+
     fn value(&self) -> f64;
     fn add(&self, o: &Self) -> Self;
     fn sub(&self, o: &Self) -> Self;
@@ -323,6 +328,8 @@ impl Jet2 {
 }
 
 impl FlexJet for Jet2 {
+    const ORDER: usize = 2;
+
     #[inline]
     fn value(&self) -> f64 {
         self.v
@@ -447,6 +454,8 @@ impl Jet1 {
 }
 
 impl FlexJet for Jet1 {
+    const ORDER: usize = 1;
+
     #[inline]
     fn value(&self) -> f64 {
         self.v
@@ -519,6 +528,8 @@ impl Jet3 {
 }
 
 impl FlexJet for Jet3 {
+    const ORDER: usize = 3;
+
     #[inline]
     fn value(&self) -> f64 {
         self.base.v
@@ -585,6 +596,8 @@ impl Jet4 {
 }
 
 impl FlexJet for Jet4 {
+    const ORDER: usize = 4;
+
     #[inline]
     fn value(&self) -> f64 {
         self.base.v
@@ -1129,9 +1142,10 @@ impl MomentTerm for Jet1 {
 /// jets) and dotting against the NUMERIC moments gives the interior
 /// `Σ_m S_m·M_{n+m}^{numeric}` — exact to every order because the `e^{−Δq}`
 /// expansion already contains the `(∂q)²` cross-term and higher. The truncation
-/// `e^{−Δq} ≈ Σ_{k≤4} (−Δq)^k/k!` is exact for the Jet≤4 nilpotency (`Δq` has
-/// value 0, so `(−Δq)^5` only feeds 5th-and-higher derivatives the order-≤4 jets
-/// discard). The boundary is the Leibniz flux `+ f(z_R)·z_R' − f(z_L)·z_L'`,
+/// `e^{−Δq} ≈ Σ_{k≤J::ORDER} (−Δq)^k/k!` is exact in each instantiated
+/// nilpotent algebra (`Δq` has value 0, so the next power only feeds derivative
+/// orders that `J` does not represent). The boundary is the Leibniz flux
+/// `+ f(z_R)·z_R' − f(z_L)·z_L'`,
 /// integrand VALUE at the moving endpoint times the edge θ-velocity jet (exact to
 /// all orders via the edge-jet algebra).
 fn base_moment_jets<J: FlexJet>(
@@ -1142,6 +1156,19 @@ fn base_moment_jets<J: FlexJet>(
     right_finite: bool,
     numeric_moments: &[f64],
 ) -> [J; 5] {
+    assert!(
+        (1..=4).contains(&J::ORDER),
+        "base_moment_jets supports exact derivative orders 1 through 4"
+    );
+    let required_moments = 5 + 6 * J::ORDER;
+    assert!(
+        numeric_moments.len() >= required_moments,
+        "order-{} base-moment jet requires numeric M_0..M_{}, got only {} moments",
+        J::ORDER,
+        required_moments - 1,
+        numeric_moments.len()
+    );
+
     // η₀ = value-only coefficient jets; jet-polynomial convolution helper.
     let c0_const: [J; 4] = std::array::from_fn(|k| const_jet_like(&c[k], c[k].value()));
     let conv = |lhs: &[J], rhs: &[J]| -> Vec<J> {
@@ -1163,10 +1190,13 @@ fn base_moment_jets<J: FlexJet>(
         .zip(eta0_sq.iter())
         .map(|(a, b)| a.sub(b).scale(-0.5))
         .collect();
-    // S(z) = e^{−Δq} = Σ_{k=0}^{4} (−Δq)^k / k!  (jet-coefficient polynomial),
-    // splitting e^{−q(θ)} = e^{−q0}·e^{−Δq}, Δq = q(θ)−q0. Truncating at k=p=4
-    // is EXACT for the order-≤4 jets: value(−Δq)=0 ⇒ −Δq ∈ m (nilpotent) ⇒
-    // (−Δq)^{p+1} = 0.
+    // S(z) = e^{−Δq} = Σ_{k=0}^{J::ORDER} (−Δq)^k / k!
+    // (jet-coefficient polynomial),
+    // splitting e^{−q(θ)} = e^{−q0}·e^{−Δq}, Δq = q(θ)−q0. Truncating at
+    // p=J::ORDER is EXACT: value(−Δq)=0 ⇒ −Δq ∈ m (nilpotent) ⇒
+    // (−Δq)^{p+1} = 0. Using the instantiated order is not an approximation:
+    // evaluating the order-four polynomial in Jet1/2/3 previously spent most
+    // of its time constructing channels that are identically zero.
     //
     // MOMENT-DEGREE BUDGET. η is cubic ⇒ deg_z(Δq) ≤ 6, so deg_z(S) ≤ 6p, and
     // the interior dot `Σ_m S_m·M_{n+m}` below reaches `M_{n+6p}`. An order-`p`
@@ -1176,7 +1206,7 @@ fn base_moment_jets<J: FlexJet>(
     let mut s_poly: Vec<J> = vec![const_jet_like(&c[0], 1.0)];
     let mut power: Vec<J> = s_poly.clone();
     let factorials = [1.0_f64, 1.0, 2.0, 6.0, 24.0];
-    for fact in factorials.iter().skip(1) {
+    for fact in factorials.iter().take(J::ORDER + 1).skip(1) {
         power = conv(&power, &neg_dq);
         for (m, coeff) in power.iter().enumerate() {
             let term = coeff.scale(1.0 / fact);
@@ -1204,7 +1234,7 @@ fn base_moment_jets<J: FlexJet>(
     std::array::from_fn(|n| {
         let mut acc = const_jet_like(&c[0], 0.0);
         for (m, s_m) in s_poly.iter().enumerate() {
-            let m_npm = numeric_moments.get(n + m).copied().unwrap_or(0.0);
+            let m_npm = numeric_moments[n + m];
             if m_npm != 0.0 {
                 acc = acc.add(&s_m.scale(m_npm));
             }
@@ -1223,9 +1253,11 @@ fn base_moment_jets<J: FlexJet>(
 /// 0, derivative channels = the §D moving-boundary flux to all orders). With
 /// `δ = z_E − z_E0` (jet, value 0) and `g(z) = zⁿ e^{−q}`,
 /// `∫_{z_E0}^{z_E} g dz = g·δ + ½ g_z δ² + ⅙ g_zz δ³ + (1/24) g_zzz δ⁴` (Taylor
-/// in δ; δ⁵ vanishes for the order-≤4 jets). `g`, `g_z`, … are evaluated at the
-/// FIXED edge `z_E0` but with the θ-dependent coefficient jets `c`, so the sliver
-/// carries the full coefficient × edge cross-motion. `q = ½(z² + η²)`,
+/// in δ; the instantiated [`FlexJet::ORDER`] selects the exact prefix because
+/// the next δ power vanishes in that nilpotent quotient). `g`, `g_z`, … are
+/// evaluated at the FIXED edge `z_E0` but with the θ-dependent coefficient jets
+/// `c`, so the sliver carries the full coefficient × edge cross-motion.
+/// `q = ½(z² + η²)`,
 /// `q_z = z + η η_z`, `η_z = c1 + 2c2 z + 3c3 z²`; the `g`-stack follows from
 /// `g_z = (n/z − q_z) g` by the product/chain rule.
 ///
@@ -1248,7 +1280,8 @@ fn edge_sliver_jet<J: FlexJet>(n: usize, c: &[J; 4], z_e: &J, finite: bool) -> O
     }
     let z0 = z_e.value();
     let zc = const_jet_like(z_e, z0); // fixed edge, value-only
-    // η, η_z, η_zz, η_zzz at the fixed edge as jets (in c).
+    // η at the fixed edge as a jet in c. Higher z-derivatives are constructed
+    // lazily below only when the instantiated nilpotent order can consume them.
     let eta = c[3]
         .mul(&zc)
         .add(&c[2])
@@ -1256,17 +1289,6 @@ fn edge_sliver_jet<J: FlexJet>(n: usize, c: &[J; 4], z_e: &J, finite: bool) -> O
         .add(&c[1])
         .mul(&zc)
         .add(&c[0]);
-    let eta_z = c[2]
-        .scale(2.0)
-        .add(&c[3].scale(3.0).mul(&zc))
-        .mul(&zc)
-        .add(&c[1]); // c1 + 2c2 z + 3c3 z²
-    let eta_zz = c[2].scale(2.0).add(&c[3].scale(6.0).mul(&zc)); // 2c2 + 6c3 z
-    let eta_zzz = c[3].scale(6.0); // 6c3
-    // q_z = z + η η_z ; q_zz = 1 + η_z² + η η_zz ; q_zzz = 3 η_z η_zz + η η_zzz
-    let q_z = zc.add(&eta.mul(&eta_z));
-    let q_zz = add_const(&eta_z.mul(&eta_z).add(&eta.mul(&eta_zz)), 1.0);
-    let q_zzz = eta_z.scale(3.0).mul(&eta_zz).add(&eta.mul(&eta_zzz));
     // g = zⁿ e^{−q}.
     let z_pow = {
         let mut zk = const_jet_like(z_e, 1.0);
@@ -1278,6 +1300,19 @@ fn edge_sliver_jet<J: FlexJet>(n: usize, c: &[J; 4], z_e: &J, finite: bool) -> O
     let q = zc.mul(&zc).add(&eta.mul(&eta)).scale(0.5);
     let w = exp_jet(&q.scale(-1.0));
     let g = z_pow.mul(&w);
+    let delta = tangent_jet(z_e);
+    let mut sliver = g.mul(&delta);
+    if J::ORDER == 1 {
+        return Some(sliver);
+    }
+
+    // η_z and q_z are needed starting at the δ² term.
+    let eta_z = c[2]
+        .scale(2.0)
+        .add(&c[3].scale(3.0).mul(&zc))
+        .mul(&zc)
+        .add(&c[1]); // c1 + 2c2 z + 3c3 z²
+    let q_z = zc.add(&eta.mul(&eta_z));
     // n/z^k constants (z held at the fixed edge); 0 when n=0 or z0=0.
     let nz = |power: i32| -> J {
         if n == 0 || z0 == 0.0 {
@@ -1286,27 +1321,42 @@ fn edge_sliver_jet<J: FlexJet>(n: usize, c: &[J; 4], z_e: &J, finite: bool) -> O
             const_jet_like(z_e, n as f64 / z0.powi(power))
         }
     };
-    // g_z/g = a1 = n/z − q_z ; a1' = −n/z² − q_zz ; a1'' = 2n/z³ − q_zzz.
+    // g_z/g = a1 = n/z − q_z.
     let a1 = nz(1).sub(&q_z);
-    let a1p = nz(2).scale(-1.0).sub(&q_zz);
-    let a1pp = nz(3).scale(2.0).sub(&q_zzz);
     let g_z = a1.mul(&g);
-    // g_zz/g = b2 = a1' + a1² ; g_zzz/g = b2' + a1 b2, b2' = a1'' + 2 a1 a1'.
+    let d2 = delta.mul(&delta);
+    sliver = sliver.add(&g_z.mul(&d2).scale(0.5));
+    if J::ORDER == 2 {
+        return Some(sliver);
+    }
+
+    // η_zz, q_zz and a1' first contribute through the δ³ term.
+    let eta_zz = c[2].scale(2.0).add(&c[3].scale(6.0).mul(&zc)); // 2c2 + 6c3 z
+    let q_zz = add_const(&eta_z.mul(&eta_z).add(&eta.mul(&eta_zz)), 1.0);
+    let a1p = nz(2).scale(-1.0).sub(&q_zz);
+    // g_zz/g = b2 = a1' + a1².
     let b2 = a1p.add(&a1.mul(&a1));
     let g_zz = b2.mul(&g);
+    let d3 = d2.mul(&delta);
+    sliver = sliver.add(&g_zz.mul(&d3).scale(1.0 / 6.0));
+    if J::ORDER == 3 {
+        return Some(sliver);
+    }
+
+    // The fourth-order quotient is the only one that can observe g_zzz·δ⁴.
+    assert_eq!(
+        J::ORDER,
+        4,
+        "edge sliver supports derivative orders 1 through 4"
+    );
+    let eta_zzz = c[3].scale(6.0); // 6c3
+    let q_zzz = eta_z.scale(3.0).mul(&eta_zz).add(&eta.mul(&eta_zzz));
+    let a1pp = nz(3).scale(2.0).sub(&q_zzz);
+    // g_zzz/g = b2' + a1 b2, b2' = a1'' + 2 a1 a1'.
     let b2p = a1pp.add(&a1.mul(&a1p).scale(2.0));
     let g_zzz = b2p.add(&a1.mul(&b2)).mul(&g);
-    // δ-power jets (δ value 0).
-    let delta = tangent_jet(z_e);
-    let d2 = delta.mul(&delta);
-    let d3 = d2.mul(&delta);
     let d4 = d3.mul(&delta);
-    Some(
-        g.mul(&delta)
-            .add(&g_z.mul(&d2).scale(0.5))
-            .add(&g_zz.mul(&d3).scale(1.0 / 6.0))
-            .add(&g_zzz.mul(&d4).scale(1.0 / 24.0)),
-    )
+    Some(sliver.add(&g_zzz.mul(&d4).scale(1.0 / 24.0)))
 }
 
 /// #932 item-2 STEP 3c: the GENERIC-order timepoint `(eta, chi, d)` builder over
@@ -2966,7 +3016,7 @@ mod moment_engine_tests {
     /// `M_0..M_4` (interior `Σ_m S_m M_{n+m}` + moving-edge sliver flux) against a
     /// central finite difference of `evaluate_cell_moments` on a smooth one-
     /// parameter cell family `c_k(θ)=c_k0+θ·dc_k`, `z_{L,R}(θ)=z0+θ·v`. The
-    /// gradient channel of the `Jet2` (seeded with `dc`/`v` in primary slot 0) is
+    /// gradient channel of the order-exact `Jet1` (seeded with `dc`/`v` in primary slot 0) is
     /// the analytic `dM_n/dθ`; the value channel is the numeric `M_n`.
     #[test]
     fn base_moment_jets_first_derivative_matches_fd_932() {
@@ -3002,7 +3052,7 @@ mod moment_engine_tests {
         let seeded = |x: f64, vel: f64| {
             let mut g = vec![0.0; p];
             g[0] = vel;
-            Jet2::from_parts(x, &g, &[])
+            Jet1 { v: x, g }
         };
         let c_jets = [
             seeded(c0[0], dc[0]),
@@ -3060,13 +3110,11 @@ mod moment_engine_tests {
             c2: c0[2] + theta * dc[2],
             c3: c0[3] + theta * dc[3],
         };
-        // The `e^{−Δq}` interior closure expands `S(z)=Σ_{k≤4}(−Δq)^k/k!`; for the
-        // SECOND θ-derivative the `(−Δq)²` term (degree-12 in z, since η is cubic so
-        // `−Δq=½(η²−η₀²)` is degree-6) reaches `M_{n+12}` (up to `M_16` for `n≤4`). A
-        // `max_degree` of 12 silently `unwrap_or(0.0)`s those high-degree moments,
-        // truncating the analytic second derivative (~1.5% on `M_1`). Production
-        // builds the cached moments to order 27 (`build_cached_partition`); match it
-        // so the moment dot is complete to every order the Jet2 Hessian reads.
+        // The order-two `e^{−Δq}` interior closure retains
+        // `S(z)=Σ_{k≤2}(−Δq)^k/k!`. Its `(−Δq)²` term is degree 12 in z (η is
+        // cubic, hence Δq degree 6) and reaches `M_{n+12}`, up to `M_16` for
+        // n≤4. Production builds cached moments beyond that; match the complete
+        // budget so every Jet2 Hessian channel is exact.
         let max_degree = 27usize;
         let moments_at = |theta: f64| -> Vec<f64> {
             evaluate_cell_moments(cell_at(theta), max_degree)
@@ -3558,7 +3606,11 @@ mod moment_engine_tests {
             c2: 0.15,
             c3: 0.05,
         };
-        let numeric = evaluate_cell_moments(cell, 9)
+        // Jet2 carries an exact order-two moment polynomial, whose cubic η
+        // requires M_0..M_16 even though this witness only reads the lifted
+        // intercept gradient. Supplying the complete algebra avoids silently
+        // constructing a truncated Hessian behind that gradient check.
+        let numeric = evaluate_cell_moments(cell, 16)
             .expect("numeric moments")
             .moments
             .into_vec();

@@ -6,6 +6,90 @@
 
 use super::tests::gamma_fd_tiny_fixture;
 use super::*;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
+// Thread-scoped allocation ledger for the full-output schedule benchmark.  The
+// allocator delegates every operation unchanged to `System`; counters are active
+// only on the single libtest thread inside an explicitly measured region.
+struct SaeRowJetCountingAllocator;
+
+thread_local! {
+    static TRACK_ROW_JET_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+    static ROW_JET_ALLOCATION_CALLS: Cell<u64> = const { Cell::new(0) };
+    static ROW_JET_ALLOCATED_BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+fn note_row_jet_allocation(size: usize) {
+    if !TRACK_ROW_JET_ALLOCATIONS
+        .try_with(Cell::get)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    ROW_JET_ALLOCATION_CALLS
+        .try_with(|counter| counter.set(counter.get() + 1))
+        .unwrap_or(());
+    ROW_JET_ALLOCATED_BYTES
+        .try_with(|counter| counter.set(counter.get() + size as u64))
+        .unwrap_or(());
+}
+
+// SAFETY: every operation is delegated to `System` with its pointer/layout
+// contract unchanged.  The const-initialized thread-local counters allocate
+// nothing and cannot alter allocation ownership.
+unsafe impl GlobalAlloc for SaeRowJetCountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `layout` is valid by this method's `GlobalAlloc` contract.
+        let pointer = unsafe { System.alloc(layout) };
+        if !pointer.is_null() {
+            note_row_jet_allocation(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `layout` is valid by this method's `GlobalAlloc` contract.
+        let pointer = unsafe { System.alloc_zeroed(layout) };
+        if !pointer.is_null() {
+            note_row_jet_allocation(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        // SAFETY: the caller supplies the matching live `System` allocation.
+        unsafe { System.dealloc(pointer, layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: the caller supplies a live allocation and `new_size` is
+        // forwarded unchanged, as required by `GlobalAlloc`.
+        let new_pointer = unsafe { System.realloc(pointer, layout, new_size) };
+        if !new_pointer.is_null() {
+            note_row_jet_allocation(new_size);
+        }
+        new_pointer
+    }
+}
+
+#[global_allocator]
+static SAE_ROW_JET_GLOBAL_ALLOCATOR: SaeRowJetCountingAllocator = SaeRowJetCountingAllocator;
+
+fn begin_row_jet_allocation_measurement() {
+    TRACK_ROW_JET_ALLOCATIONS.with(|tracking| tracking.set(false));
+    ROW_JET_ALLOCATION_CALLS.with(|counter| counter.set(0));
+    ROW_JET_ALLOCATED_BYTES.with(|counter| counter.set(0));
+    TRACK_ROW_JET_ALLOCATIONS.with(|tracking| tracking.set(true));
+}
+
+fn end_row_jet_allocation_measurement() -> (u64, u64) {
+    TRACK_ROW_JET_ALLOCATIONS.with(|tracking| tracking.set(false));
+    (
+        ROW_JET_ALLOCATION_CALLS.with(Cell::get),
+        ROW_JET_ALLOCATED_BYTES.with(Cell::get),
+    )
+}
 
 /// #932 follow-up (the issue-comment cache-seam ask): the SAE row
 /// jet-program oracle driven directly from a CONVERGED production
@@ -439,6 +523,36 @@ pub(crate) fn softmax_compiled_schedule_beats_hand_full_channels_932() {
             "K={k_atoms} compiled vs hand full-channel max abs {max_abs:e}, scale {scale:e}"
         );
 
+        begin_row_jet_allocation_measurement();
+        let allocation_probe_compiled = term
+            .row_jets_for_logdet(
+                0,
+                vars.clone(),
+                assignments.view(),
+                &second_jets,
+                &border,
+            )
+            .unwrap();
+        let (compiled_allocations, compiled_bytes) = end_row_jet_allocation_measurement();
+        begin_row_jet_allocation_measurement();
+        let allocation_probe_hand = term.row_jets_for_logdet_hand_reference(
+            0,
+            vars.clone(),
+            assignments.view(),
+            &second_jets,
+            &border,
+        );
+        let (hand_allocations, hand_bytes) = end_row_jet_allocation_measurement();
+        assert!(
+            (checksum(&allocation_probe_compiled) + checksum(&allocation_probe_hand)).is_finite(),
+            "allocation probes must materialize finite full channels"
+        );
+        assert!(
+            compiled_allocations <= hand_allocations && compiled_bytes <= hand_bytes,
+            "K={k_atoms} compiled allocations {compiled_allocations}/{compiled_bytes}B must not \
+             exceed hand {hand_allocations}/{hand_bytes}B"
+        );
+
         #[cfg(debug_assertions)]
         let (repetitions, trials) = (1usize, 1usize);
         #[cfg(not(debug_assertions))]
@@ -505,7 +619,9 @@ pub(crate) fn softmax_compiled_schedule_beats_hand_full_channels_932() {
         let hand_ns = best_hand.as_nanos() as f64 / repetitions as f64;
         eprintln!(
             "[SAE-SOFTMAX-932] K={k_atoms} P={p} hand={hand_ns:.1} ns/row \
-             compiled={compiled_ns:.1} ns/row ratio={:.4}x max_abs={max_abs:.3e}",
+             compiled={compiled_ns:.1} ns/row ratio={:.4}x max_abs={max_abs:.3e} \
+             allocs hand={hand_allocations}/{hand_bytes}B \
+             compiled={compiled_allocations}/{compiled_bytes}B",
             compiled_ns / hand_ns
         );
         #[cfg(not(debug_assertions))]
