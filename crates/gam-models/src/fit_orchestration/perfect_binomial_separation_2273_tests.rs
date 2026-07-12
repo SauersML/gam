@@ -138,3 +138,29 @@ fn exact_separation_smooth_n_sweep_mints_2273() {
 fn exact_separation_explicit_firth_mints_2273() {
     assert_exact_separation_mints(40, "y ~ x", true);
 }
+
+/// The coefficient-runaway / Fisher-weight-collapse separation pathology is
+/// NOT logit-specific — it afflicts every binomial inverse link. Before the
+/// link-general rescue, the reactive Firth retry in `fit_from_formula` was
+/// gated on `is_binomial_logit`, so a NON-logit binomial fit
+/// (`link(type=probit)`, `link(type=cloglog)`) on exactly-separated data
+/// produced a retryable `RemlDidNotConverge`/PrefitSeparation error that the
+/// link gate then refused to act on — a hard failure with no model, off the
+/// default link, despite the README promising Firth handles binomial
+/// separation.
+///
+/// The headline case is probit at n=6: measured to halt on a flat-valley
+/// outer stall (|g|≈1.9e2 ≫ bound=1.0) and mint only under Firth, with the
+/// automatic retry never engaging pre-fix. After gating the rescue on
+/// `LikelihoodSpec::supports_firth()` (Binomial + Fisher-weight-jet link),
+/// every one of these mints through the same no-explicit-`--firth`
+/// automatic-retry path the default-link sweeps use. This test goes red if
+/// the rescue is ever narrowed back to the logit special case.
+#[test]
+fn exact_separation_nonlogit_links_rescued_by_firth_2273() {
+    for link in ["probit", "cloglog"] {
+        for &n in &[6usize, 10, 40, 100] {
+            assert_exact_separation_mints(n, &format!("y ~ x + link(type={link})"), false);
+        }
+    }
+}
