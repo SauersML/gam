@@ -1127,6 +1127,179 @@ fn data_driven_higher_latent_dim_helps_out_of_sample() {
     );
 }
 
+/// Held-out variance explained by the best rank-`r` AFFINE (mean + top-`r`
+/// principal directions) reconstruction fit on `z_tr` and scored on `z_te`. This
+/// is the closed-form linear/PCA baseline #2261 compares the curved arm against:
+/// the optimal rank-`r` linear autoencoder, computed by one eigendecomposition of
+/// the training covariance (no iteration). The EV denominator is the raw
+/// out-of-sample sum of squares, matching `oos_train_curved`'s `ev_oos` exactly so
+/// the two numbers are directly comparable.
+fn oos_linear_affine_rank_ev(z_tr: &Array2<f64>, z_te: &Array2<f64>, r: usize) -> f64 {
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let p = z_tr.ncols();
+    let n_tr = z_tr.nrows();
+    let mut mean = ndarray::Array1::<f64>::zeros(p);
+    for row in 0..n_tr {
+        for c in 0..p {
+            mean[c] += z_tr[[row, c]];
+        }
+    }
+    mean.mapv_inplace(|v| v / n_tr as f64);
+    let mut centered_tr = z_tr.clone();
+    for row in 0..n_tr {
+        for c in 0..p {
+            centered_tr[[row, c]] -= mean[c];
+        }
+    }
+    // Top-`r` right singular directions of the centered training data = top-`r`
+    // eigenvectors of the p×p training covariance ZᵀZ.
+    let cov = fast_ata(&centered_tr);
+    // `eigh` returns eigenvalues ascending; magnitudes are unused, only the
+    // ordering (top-`r` = trailing `r` columns).
+    let (_evals, evecs) = cov.eigh(faer::Side::Lower).unwrap();
+    let r = r.min(p);
+    // Project the held-out rows (mean-removed) onto the top-`r` eigenvectors and
+    // add the mean back: `recon = mean + (z_te - mean) V Vᵀ`.
+    let mut v = Array2::<f64>::zeros((p, r));
+    for j in 0..r {
+        let col = p - 1 - j;
+        for i in 0..p {
+            v[[i, j]] = evecs[[i, col]];
+        }
+    }
+    let n_te = z_te.nrows();
+    let mut err = 0.0_f64;
+    let mut tot = 0.0_f64;
+    for row in 0..n_te {
+        // coords = (z_te_row - mean) · V  (length r)
+        let mut coords = ndarray::Array1::<f64>::zeros(r);
+        for j in 0..r {
+            let mut acc = 0.0_f64;
+            for c in 0..p {
+                acc += (z_te[[row, c]] - mean[c]) * v[[c, j]];
+            }
+            coords[j] = acc;
+        }
+        for c in 0..p {
+            let mut recon = mean[c];
+            for j in 0..r {
+                recon += coords[j] * v[[c, j]];
+            }
+            let d = z_te[[row, c]] - recon;
+            err += d * d;
+            tot += z_te[[row, c]] * z_te[[row, c]];
+        }
+    }
+    1.0 - err / tot
+}
+
+/// A planted-curvature fixture: a genuinely 1-D closed curve embedded in R^6 by
+/// three Fourier harmonics, `x(θ) = [cosθ, sinθ, 0.7cos2θ, 0.7sin2θ, 0.5cos3θ,
+/// 0.5sin3θ]` plus small deterministic noise. Intrinsic dimension is ONE (a
+/// circle), but the curve LINEARLY spans all six ambient dimensions, so no
+/// low-rank linear/PCA code can capture it while a single curved circle atom can.
+/// Train and test use DISJOINT deterministic θ grids so the EV is honestly
+/// held-out. Bit-reproducible (no RNG): the "noise" is a fixed LCG per element.
+fn planted_curve_oos_split() -> (Array2<f64>, Array2<f64>) {
+    const P: usize = 6;
+    let amp = [1.0, 1.0, 0.7, 0.7, 0.5, 0.5];
+    let embed = |theta: f64| -> [f64; P] {
+        [
+            amp[0] * theta.cos(),
+            amp[1] * theta.sin(),
+            amp[2] * (2.0 * theta).cos(),
+            amp[3] * (2.0 * theta).sin(),
+            amp[4] * (3.0 * theta).cos(),
+            amp[5] * (3.0 * theta).sin(),
+        ]
+    };
+    let two_pi = std::f64::consts::TAU;
+    let build = |n: usize, phase: f64, seed0: u64| -> Array2<f64> {
+        let mut z = Array2::<f64>::zeros((n, P));
+        let mut state = seed0;
+        for row in 0..n {
+            let theta = two_pi * ((row as f64 + phase) / n as f64);
+            let x = embed(theta);
+            for c in 0..P {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let unit = ((state >> 11) as f64) * f64::from_bits(0x3CA0000000000000);
+                z[[row, c]] = x[c] + 0.02 * (2.0 * unit - 1.0);
+            }
+        }
+        z
+    };
+    // Disjoint grids: train on the integer grid, test on the half-shifted grid.
+    (build(300, 0.0, 0x9E3779B97F4A7C15), build(200, 0.5, 0xD1B54A32D192ED03))
+}
+
+/// #2261 — from a PCA/linear WARM START the curved arm reaches AND beats the
+/// closed-form linear baseline on genuinely curved data, at a MODEST fit budget.
+///
+/// #2261 measured the (since-removed) gradient torch lane undertraining against a
+/// closed-form SVD top-K baseline at default step budgets — the curved arm spent
+/// thousands of steps merely recovering what the linear baseline gets for free.
+/// The production Rust path does not have that gap because it does not COLD-start:
+/// `sae_pca_seed_initial_coords` reads the circle coordinate straight off the PCA
+/// projection (`atan2(PC2, PC1)`) and `sae_decoder_lsq_init` fits the decoder in
+/// closed form — i.e. the "warm-start curved atoms from the linear/PCA solution"
+/// this issue proposes is already the default seed, not an opt-in.
+///
+/// This pins the objective consequence on a planted 1-D curve that linearly spans
+/// R^6 (`planted_curve_oos_split`):
+///
+///  (A) START AT LINEAR PARITY — the PURE PCA seed (zero refit iterations) already
+///      explains the held-out data at least as well as the optimal rank-2 affine
+///      (PCA) code. There is no regime where the curved arm sits below the linear
+///      baseline waiting to be trained up: the warm start begins at/above it.
+///
+///  (B) CURVATURE THEN BEATS LINEAR — after a handful of production encode↔refit
+///      steps the curved arm's held-out EV clears the linear rank-2 baseline by a
+///      wide margin (the curve's 2nd/3rd harmonics are invisible to any rank-2
+///      linear code but reconstructed exactly by one circle atom).
+///
+/// Match-or-beat on an objective (held-out reconstruction), never closeness to a
+/// reference output; the linear baseline is the thing to beat, computed in closed
+/// form on the same split.
+#[test]
+fn curved_warm_start_matches_or_beats_linear_baseline_out_of_sample_2261() {
+    let (tr, te) = planted_curve_oos_split();
+    // Optimal rank-2 affine (PCA) OOS EV: the 2-plane the circle's dominant
+    // harmonic occupies is exactly what the periodic seed reads via atan2, so
+    // rank-2 is the matched, GENEROUS linear baseline for a single circle atom.
+    let linear_oos = oos_linear_affine_rank_ev(&tr, &te, 2);
+    // (A) Pure PCA seed (0 refit iters), d=1 circle, 3 harmonics.
+    let (_seed_in, seed_oos) = oos_train_curved(&tr, &te, 1, 3, 0, false, 0);
+    // (B) After a modest production encode↔refit budget.
+    let (_fit_in, fit_oos) = oos_train_curved(&tr, &te, 1, 3, 5, false, 0);
+    eprintln!(
+        "[#2261] planted curve OOS EV: linear rank-2={linear_oos:.4}  \
+         curved seed(0 iters)={seed_oos:.4}  curved fit(5 iters)={fit_oos:.4}"
+    );
+    // (A) The warm start begins at least at linear parity — no undertraining gap.
+    assert!(
+        seed_oos >= linear_oos - 1.0e-3,
+        "PCA-warm-started curved seed must start AT OR ABOVE the linear rank-2 \
+         baseline (that is what warm-starting from the PCA/linear solution buys); \
+         seed_oos={seed_oos:.4} linear_oos={linear_oos:.4}"
+    );
+    // (B) Curvature then beats the linear baseline by a clear margin.
+    assert!(
+        fit_oos > linear_oos + 0.05,
+        "curved arm must BEAT the closed-form linear rank-2 baseline out-of-sample \
+         on genuinely curved data (its higher harmonics are invisible to any linear \
+         code); fit_oos={fit_oos:.4} linear_oos={linear_oos:.4}"
+    );
+    // Sanity: the fixture is genuinely curved — a rank-2 linear code cannot
+    // explain it, else the comparison would be vacuous.
+    assert!(
+        linear_oos < 0.85,
+        "planted curve must be genuinely nonlinear (rank-2 linear OOS EV must be \
+         well below 1); linear_oos={linear_oos:.4}"
+    );
+}
+
 /// Certified-encode soundness near a SELF-CROSSING manifold. The figure-eight atom
 /// `m(t) = (cos 2πt, sin 4πt)` self-crosses at the origin (t=0.25 and t=0.75 →
 /// (0,0)), so a target near the crossing has two competing reconstruction minima.
