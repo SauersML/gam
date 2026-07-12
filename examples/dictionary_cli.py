@@ -90,23 +90,32 @@ def steer_atom(
     t_from: Any,
     t_to: Any,
     *,
+    target_nats: float,
+    patched_forward_kl: Any,
     metric_row: int = 0,
-    amplitude: float = 1.0,
+    tol_rel: float = 1.0e-2,
+    max_probes: int = 12,
+    readout_tol_rel: float = 1.0e-1,
 ) -> dict[str, Any]:
-    """Predicted output effect of moving atom ``atom_k`` from ``t_from`` to ``t_to``.
+    """Apply a measured target-KL chart move on one atom.
 
-    Thin pass-through to ``ManifoldSAE.steer`` (the SAC_PLAN W8 dose machinery): the
-    fitted chart carries an output-Fisher metric and path-integrates it to report
-    ``predicted_nats`` — how far the model's output distribution moves — *before*
-    the edit. The dose-calibration experiment validated this predictor (slope
-    ≈ 0.85, unbiased median ratio ≈ 1.1); see REPORT.md control row.
+    ``patched_forward_kl(amplitude)`` must apply that amplitude to the real model
+    and return ``KL(p_base || p_patched)``. The Rust solver brackets the requested
+    dose, returns the exact activation delta atomically, and raises if the target
+    is unreachable or the probe budget cannot certify it.
     """
-    plan = fit.steer(
-        int(atom_k),
-        int(metric_row),
-        float(amplitude),
-        np.atleast_1d(np.asarray(t_from, dtype=float)),
-        np.atleast_1d(np.asarray(t_to, dtype=float)),
+    plan = fit.steer_to_target(
+        {
+            "atom_k": int(atom_k),
+            "metric_row": int(metric_row),
+            "target_nats": float(target_nats),
+            "t_from": np.atleast_1d(np.asarray(t_from, dtype=float)),
+            "t_to": np.atleast_1d(np.asarray(t_to, dtype=float)),
+            "tol_rel": float(tol_rel),
+            "max_iter": int(max_probes),
+            "readout_tol_rel": float(readout_tol_rel),
+        },
+        patched_forward_kl,
     )
     return dict(plan)
 

@@ -400,33 +400,39 @@ Call `converged_latents` when several outputs are needed; separate
 
 ## Steering and causal intervention
 
-`fit.steer(atom_k, metric_row, amplitude, t_from, t_to)` builds a **causal
-intervention plan** that
-moves one atom's latent coordinate from `t_from` to `t_to` and reports the
-resulting ambient delta with output dosimetry:
+`fit.steer_to_target(request, patched_forward_kl)` builds a **causal intervention
+plan** at a requested measured KL dose. The callback applies a proposed amplitude
+to the real downstream model and returns `KL(p_base || p_patched)`:
 
 ```python
-plan = fit.steer(
-    atom_k=3,
-    metric_row=0,
-    amplitude=1.0,
-    t_from=np.array([0.1]),
-    t_to=np.array([0.4]),
+plan = fit.steer_to_target(
+    {
+        "atom_k": 3,
+        "metric_row": 0,
+        "target_nats": 0.05,
+        "t_from": np.array([0.1]),
+        "t_to": np.array([0.4]),
+        "tol_rel": 0.01,
+        "max_iter": 12,
+        "readout_tol_rel": 0.1,
+    },
+    patched_forward_kl,
 )
-plan["delta"]             # (p,) activation-space move a·(g_k(t_to) − g_k(t_from))
-plan["predicted_nats"]    # path-integrated output-Fisher KL dose (nats), or None
-plan["validity_radius"]   # latent step length the linearization is trusted to, or None
+plan["delta"]             # exact (p,) activation-space move to apply
+plan["measured_nats"]     # patched-forward KL at the solved amplitude
+plan["validation"]        # "patched_forward"
+plan["readout_kl_radius"] # contiguous calibrated amplitude radius, or None
+plan["validity_radius"]   # chart-linearization radius, or None
 plan["off_manifold_norm"] # component of the move off the atom's local tangents (≈0 on-manifold)
 plan["metric_provenance"] # "OutputFisher" if a Fisher metric was installed, else "Euclidean"
 ```
 
 It answers "if I push token feature *k* along its manifold from here to there,
-what happens downstream, and how far can I trust that?" — the move stays on the
-atom's fitted shape, and `predicted_nats` quantifies the intervention strength
-in output-distribution terms. The KL dose and validity radius require an
-output-Fisher metric (`fisher_factors=` supplied to `sae_manifold_fit`);
-without it the geometry (`delta`, `off_manifold_norm`) is still returned but
-the dose degrades to `None`, not zero.
+what happens downstream, and how far can I trust that?" The move stays on the
+atom's fitted shape, while the patched forward—not a universal raw amplitude—
+certifies intervention strength. Target-dose solving requires an output-Fisher
+metric (`fisher_factors=` supplied to `sae_manifold_fit`) and fails explicitly
+when the target cannot be reached or certified within the probe budget.
 
 ## Certified structure (anytime-valid)
 
