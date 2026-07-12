@@ -651,6 +651,7 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         dispersion: f64,
     ) -> Result<(Array2<f64>, f64), String> {
+        rho.validate_log_strength_domain()?;
         let n = self.n_obs();
         let p = self.output_dim();
         if target.dim() != (n, p) {

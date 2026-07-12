@@ -456,13 +456,7 @@ impl ClaimNullCalibration {
 pub fn primary_null_pvalue(report: &NullBatteryReport) -> f64 {
     let mut selected = Vec::new();
     for summary in &report.summaries {
-        if matches!(
-            summary.kind,
-            NullKind::PhaseRandomized
-                | NullKind::MatchedSpectrumGaussian
-                | NullKind::CovarianceExactHadamard
-                | NullKind::ArchitectureMatchedRandomWeight
-        ) {
+        if is_primary_structure_destroying_null(summary.kind) {
             selected.push(summary.p_value);
         }
     }
@@ -475,13 +469,7 @@ pub fn primary_null_pvalue(report: &NullBatteryReport) -> f64 {
 pub fn primary_null_z(report: &NullBatteryReport) -> f64 {
     let mut selected = Vec::new();
     for summary in &report.summaries {
-        if matches!(
-            summary.kind,
-            NullKind::PhaseRandomized
-                | NullKind::MatchedSpectrumGaussian
-                | NullKind::CovarianceExactHadamard
-                | NullKind::ArchitectureMatchedRandomWeight
-        ) {
+        if is_primary_structure_destroying_null(summary.kind) {
             selected.push(summary.z);
         }
     }
@@ -489,6 +477,22 @@ pub fn primary_null_z(report: &NullBatteryReport) -> f64 {
         selected.extend(report.summaries.iter().map(|summary| summary.z));
     }
     selected.into_iter().fold(f64::INFINITY, f64::min)
+}
+
+/// Controls that destroy the claimed cross-row/cross-coordinate structure
+/// while retaining a matched nuisance property. A claim must clear every
+/// available member, hence the conservative maximum p-value / minimum z-score.
+/// Token shuffles and rotations are deliberately excluded: they preserve an
+/// unordered point cloud or a basis-invariant topology, respectively.
+const fn is_primary_structure_destroying_null(kind: NullKind) -> bool {
+    matches!(
+        kind,
+        NullKind::PhaseRandomized
+            | NullKind::PerDimensionShuffle
+            | NullKind::MatchedSpectrumGaussian
+            | NullKind::CovarianceExactHadamard
+            | NullKind::ArchitectureMatchedRandomWeight
+    )
 }
 
 /// Run an arbitrary scalar audit on the observed matrix and each requested null.
@@ -2541,6 +2545,27 @@ fn normalize(v: &mut Array1<f64>) {
 mod tests {
     use super::*;
 
+    fn summary_with_primary_metrics(kind: NullKind, p_value: f64, z: f64) -> NullSummary {
+        NullSummary {
+            kind,
+            tail: Tail::Larger,
+            observed: 1.0,
+            n: 1,
+            mean: 0.0,
+            sd: 1.0,
+            min: 0.0,
+            q25: 0.0,
+            median: 0.0,
+            q75: 0.0,
+            max: 0.0,
+            z,
+            p_value,
+            monte_carlo_standard_error: 0.0,
+            extreme_draws: 0,
+            samples: vec![0.0],
+        }
+    }
+
     fn assert_population_moments_close(
         expected: ArrayView2<'_, f64>,
         actual: ArrayView2<'_, f64>,
@@ -2599,6 +2624,23 @@ mod tests {
             spectrum.mp_detection_edge(),
             floor
         );
+    }
+
+    #[test]
+    fn primary_claim_calibration_requires_the_per_dimension_shuffle() {
+        let report = NullBatteryReport {
+            observed: 1.0,
+            summaries: vec![
+                summary_with_primary_metrics(NullKind::PhaseRandomized, 0.01, 4.0),
+                summary_with_primary_metrics(NullKind::PerDimensionShuffle, 0.40, 0.25),
+                // These preserve the relevant unordered/basis-invariant shape
+                // and therefore must not determine the primary claim metric.
+                summary_with_primary_metrics(NullKind::TokenShuffle, 0.90, -3.0),
+                summary_with_primary_metrics(NullKind::RandomRotation, 0.80, -2.0),
+            ],
+        };
+        assert_eq!(primary_null_pvalue(&report), 0.40);
+        assert_eq!(primary_null_z(&report), 0.25);
     }
 
     #[test]

@@ -60,7 +60,7 @@ class CentroidCircularOrderingTest(unittest.TestCase):
         self.assertEqual(out["params"]["control_seed"], 0xCE17_202)
         self.assertEqual(
             out["params"]["null_model"],
-            "per_dimension_permutation_full_pipeline",
+            "per_dimension_permutation_refit_seeded_lloyd",
         )
 
     def test_shuffled_ring_fails(self) -> None:
@@ -76,8 +76,8 @@ class CentroidCircularOrderingTest(unittest.TestCase):
     def test_masked_ring_after_pca_fails(self) -> None:
         # ring in dims (0, 1) + a linear factor in dim 2 at 2x the ring
         # radius: top-2 PCA keeps the linear factor and one ring axis, so
-        # the ring is lost before the test ever sees it (measured detection
-        # limit of the census pipeline; adjudicator degrades to mixture too)
+        # the ring is lost before the test ever sees it (a top-variance
+        # projection failure mode; the adjudicator degrades to mixture too)
         rng = np.random.default_rng(2)
         ring = _clusters_on_ring(seed=2)
         n = ring.shape[0]
@@ -113,7 +113,9 @@ class CentroidCircularOrderingTest(unittest.TestCase):
         angles = 2.0 * np.pi * np.arange(7) / 7.0
         centers = np.column_stack((np.cos(angles), np.sin(angles)))
         reference_cv, reference_gap = _CO.ring_stats(centers)
-        scaled_cv, scaled_gap = _CO.ring_stats(4.0e307 * centers)
+        # Directly subtracting two antipodal x coordinates now overflows, but
+        # the geometry itself is representable in a bounded affine chart.
+        scaled_cv, scaled_gap = _CO.ring_stats(1.7e308 * centers)
         self.assertTrue(np.isfinite(scaled_cv))
         self.assertTrue(np.isfinite(scaled_gap))
         self.assertAlmostEqual(scaled_cv, reference_cv, places=14)

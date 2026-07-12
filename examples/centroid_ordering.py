@@ -24,10 +24,10 @@ their radius):
      centroid radii about the centroid mean (low CV = centroids sit on a
      circle), plus angular coverage (max angular gap between sorted
      centroid angles; a big gap = an arc or a clump, not a ring).
-  3. Full-pipeline conditional-randomization null: independently permute each
-     coordinate column, preserving both empirical marginals exactly while
-     destroying their pairing, then rerun the same seeded Lloyd fit on every
-     draw. The plus-one p-value is
+  3. Full diagnostic-pipeline conditional-randomization null: independently
+     permute each supplied coordinate column, preserving both empirical
+     marginals exactly while destroying their pairing, then rerun the same
+     seeded Lloyd fit on every draw. The plus-one p-value is
      P(permuted fitted-centroid CV <= observed CV). Randomizing already-fitted
      centroids is invalid because k-means quantization itself is part of the
      statistic.
@@ -85,18 +85,30 @@ def _seed(value: int) -> int:
     return result
 
 
-def _center_points(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Center through a relative chart so a large origin does not erase spread."""
-    anchor = points[0].copy()
-    relative = points - anchor
-    if not np.isfinite(relative).all():
-        raise ValueError("point coordinate range overflowed while centering")
-    mean_offset = relative.mean(axis=0)
-    centered = relative - mean_offset
-    location = anchor + mean_offset
-    if not np.isfinite(centered).all() or not np.isfinite(location).all():
-        raise ValueError("centered point coordinates are non-finite")
-    return centered, location
+def _scaled_centered_chart(
+    points: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Return an overflow-free affine chart and its reconstruction scales.
+
+    Dividing by the largest absolute coordinate *before* centering keeps every
+    finite input in ``[-1, 1]``.  This handles antipodal values near ``f64``'s
+    limit, whose direct subtraction overflows, while retaining the ulp-scale
+    differences of a small cloud translated to a large representable origin.
+    """
+    magnitude = float(np.max(np.abs(points)))
+    if not np.isfinite(magnitude):
+        raise ValueError("point coordinate magnitude is non-finite")
+    if magnitude == 0.0:
+        scaled = np.zeros_like(points)
+        return scaled, scaled.copy(), 0.0, 0.0
+    scaled = points / magnitude
+    center = scaled.mean(axis=0)
+    centered = scaled - center
+    spread = float(np.max(np.abs(centered)))
+    if not np.isfinite(scaled).all() or not np.isfinite(centered).all():
+        raise ValueError("scaled point chart is non-finite")
+    working = centered / spread if spread > 0.0 else centered.copy()
+    return scaled, working, magnitude, spread
 
 
 def kmeans_centroids(coords: np.ndarray, k: int, seed: int = 0,
@@ -108,15 +120,11 @@ def kmeans_centroids(coords: np.ndarray, k: int, seed: int = 0,
     seed = _seed(seed)
     if k > X.shape[0]:
         raise ValueError(f"k={k} exceeds the {X.shape[0]} coordinate rows")
-    centered, location = _center_points(X)
-    coordinate_scale = float(np.max(np.abs(centered)))
-    if coordinate_scale == 0.0:
+    scaled, working, coordinate_scale, spread = _scaled_centered_chart(X)
+    if spread == 0.0:
         if k == 1:
-            return location.reshape(1, 2)
+            return (scaled.mean(axis=0) * coordinate_scale).reshape(1, 2)
         raise ValueError(f"k={k} exceeds the number of distinct coordinate rows")
-    working = centered / coordinate_scale
-    if not np.isfinite(working).all():
-        raise ValueError("k-means coordinate normalization overflowed")
 
     rng = np.random.default_rng(seed)
     # Seed one row, then take the farthest row from the selected set. This is
@@ -164,7 +172,14 @@ def kmeans_centroids(coords: np.ndarray, k: int, seed: int = 0,
         if not np.isfinite(next_centers).all():
             raise ValueError("k-means centroid update produced non-finite coordinates")
         if previous_labels is not None and np.array_equal(labels, previous_labels):
-            result = next_centers * coordinate_scale + location
+            # Recompute in the bounded absolute chart. This is algebraically
+            # identical to undoing the centered working chart, but it avoids an
+            # original-scale offset addition and guarantees each centroid is a
+            # convex mean of its own finite input rows.
+            scaled_result = np.vstack(
+                [scaled[labels == cluster].mean(axis=0) for cluster in range(k)]
+            )
+            result = scaled_result * coordinate_scale
             if not np.isfinite(result).all():
                 raise ValueError("k-means centroid reconstruction overflowed")
             return result
@@ -181,14 +196,12 @@ def ring_stats(centers: np.ndarray) -> tuple[float, float]:
     angular gap between sorted centroid angles (360 = degenerate).
     """
     c = _finite_points(centers, "centers", 3)
-    c, _ = _center_points(c)
-    # Radius CV and angles are exactly scale-invariant. Normalize before either
-    # calculation so finite centroids whose raw squares overflow (for example,
-    # coordinates around 1e307) retain their representable geometry.
-    coordinate_scale = float(np.max(np.abs(c)))
-    if not np.isfinite(coordinate_scale) or coordinate_scale <= 0.0:
+    _, normalized, _, spread = _scaled_centered_chart(c)
+    # Radius CV and angles are invariant to translation and common positive
+    # scale. The shared chart scales before centering, so even a finite
+    # antipodal pair whose raw difference exceeds f64 retains its geometry.
+    if spread <= 0.0:
         raise ValueError("centroid ring is unidentified at zero radius")
-    normalized = c / coordinate_scale
     r = np.hypot(normalized[:, 0], normalized[:, 1])
     mean_radius = float(r.mean())
     if not np.isfinite(mean_radius) or mean_radius <= 0.0:
@@ -298,7 +311,7 @@ def centroid_circular_ordering(coords: np.ndarray, k: int, *, seed: int = 0,
         "params": {
             "control_seed": control_seed,
             "kmeans_seed": seed,
-            "null_model": "per_dimension_permutation_full_pipeline",
+            "null_model": "per_dimension_permutation_refit_seeded_lloyd",
             "n_null": n_null,
             "p_thresh": p_thresh,
             "gap_thresh_deg": gap_thresh_deg,

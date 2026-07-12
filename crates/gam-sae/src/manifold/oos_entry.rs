@@ -1133,7 +1133,7 @@ pub fn run_sae_manifold_certify_external(
         base_term.set_row_metric(metric)?;
     }
 
-    let initial_rho = build_rho(regularization, &latent_dims)?;
+    let initial_rho = build_rho(regularization, &latent_dims, mode)?;
 
     run_sae_manifold_certify(SaeCertifyRequest {
         base_term,

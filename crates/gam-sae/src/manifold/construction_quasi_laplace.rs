@@ -114,6 +114,7 @@ impl SaeManifoldTerm {
         refine_progress_extension: bool,
         lane: Option<&mut SurrogateLaneState>,
     ) -> Result<(f64, SaeManifoldLoss), String> {
+        rho.validate_log_strength_domain()?;
         // #976 evidence-ledger scope: one criterion evaluation = one per-atom
         // reseed budget. The joint-fit driver no longer clears the ledger on
         // evidence re-entries (each refine round used to get a fresh budget and
@@ -202,6 +203,7 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
         refine_progress_extension: bool,
     ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
+        rho.validate_log_strength_domain()?;
         // #976 evidence-ledger scope (see `penalized_quasi_laplace_criterion_with_refine_policy_
         // and_lane`): direct cache-lane callers also get a fresh per-evaluation
         // reseed budget here; the double clear when routed through the value
@@ -2277,6 +2279,7 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
         lane: Option<&mut SurrogateLaneState>,
     ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
+        rho.validate_log_strength_domain()?;
         let mut rho_fixed = rho.clone();
         let initial_fit = self.run_joint_fit_arrow_schur_for_quasi_laplace(
             target,
@@ -2836,6 +2839,7 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
     ) -> Result<f64, String> {
+        rho.validate_log_strength_domain()?;
         let k_atoms = self.k_atoms();
         // #1038 softmax: `H` carries the DENSE entropy block, and since the
         // entropy curvature scales linearly with `λ_sparse = exp(ρ)`,
@@ -3056,6 +3060,7 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
     ) -> Result<f64, String> {
+        rho.validate_log_strength_domain()?;
         let k_atoms = self.k_atoms();
         let assignment_dim = self.assignment.assignment_coord_dim();
         let row_weights = self.row_loss_weights.as_deref();
@@ -3209,6 +3214,7 @@ impl SaeManifoldTerm {
         probes: &[Array1<f64>],
         sinv_probes: &[Array1<f64>],
     ) -> Result<f64, String> {
+        rho.validate_log_strength_domain()?;
         let m = probes.len();
         if m == 0 || sinv_probes.len() != m {
             return Err(format!(
@@ -4912,6 +4918,7 @@ impl SaeManifoldTerm {
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
     ) -> Result<SaeOuterRhoGradientComponents, String> {
+        rho.validate_log_strength_domain()?;
         let solver = self.outer_gradient_arrow_solver(cache, &rho.lambda_smooth_vec())?;
         self.analytic_outer_rho_gradient_components(target, rho, loss, cache, &solver)
             .map_err(|e| e.to_string())

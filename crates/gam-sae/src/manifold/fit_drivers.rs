@@ -4271,6 +4271,7 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
     ) -> Result<(), String> {
+        rho.validate_log_strength_domain()?;
         let n = self.n_obs();
         let p = self.output_dim();
         let k = self.k_atoms();
@@ -5016,6 +5017,8 @@ impl SaeManifoldTerm {
         step_size: f64,
         ridge_ext_coord: f64,
     ) -> Result<SaeManifoldLoss, String> {
+        *rho = rho.clone().for_assignment(self.assignment.mode);
+        rho.validate_log_strength_domain()?;
         if !(step_size.is_finite() && step_size > 0.0) {
             return Err(format!(
                 "SaeManifoldTerm::run_fixed_decoder_arrow_schur: step_size must be finite and positive; got {step_size}"
@@ -5403,6 +5406,8 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
         allow_heuristic_termination: bool,
     ) -> Result<JointFitOutcome, String> {
+        *rho = rho.clone().for_assignment(self.assignment.mode);
+        rho.validate_log_strength_domain()?;
         if !(step_size.is_finite() && step_size > 0.0) {
             return Err(format!(
                 "SaeManifoldTerm::run_joint_fit_arrow_schur: step_size must be finite and positive; got {step_size}"

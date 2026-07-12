@@ -3541,6 +3541,10 @@ impl OuterObjective for ReactiveDomainObjective {
         Ok(Some(array![2.5]))
     }
 
+    fn outer_domain_lower_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
+        Ok(Some(array![-2.5]))
+    }
+
     fn reactive_domain_scalar_contract(
         &self,
     ) -> Result<Option<crate::continuation_path::ContinuationScalarContract>, EstimationError> {
@@ -3635,6 +3639,63 @@ fn reactive_domain_arrival_accepts_exact_finite_literal_seed() {
     assert!(
         reactive_arrival_postcondition(&state, &seed).is_ok(),
         "an exact finite literal-seed state must authorize arrival"
+    );
+}
+
+#[test]
+fn active_outer_domain_refuses_singleton_search_interval() {
+    let mut config = OuterConfig::default();
+    config.bounds = Some((array![-1_000.0], array![1_000.0]));
+    let error = install_objective_domain(
+        &mut config,
+        1,
+        Some(array![700.0]),
+        Some(array![700.0]),
+    )
+    .expect_err("an active optimizer coordinate needs a nonzero-width interval");
+    let message = error.to_string();
+    assert!(
+        message.contains("no finite searchable interval")
+            && message.contains("fixed-rho")
+            && message.contains("lower < upper"),
+        "unexpected singleton-domain refusal: {message}"
+    );
+}
+
+#[test]
+fn custom_box_and_seed_are_intersected_with_both_objective_faces() {
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_bounds(array![-1_000.0], array![1_000.0])
+        .with_initial_rho(array![-900.0])
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        })
+        .with_max_iter(1);
+    let mut objective =
+        ReactiveDomainObjective::new(0.125, ReactiveDomainMode::FiniteAtColdSeed);
+    drop(problem.run(
+        &mut objective,
+        "two-sided objective-domain intersection",
+    ));
+    assert!(!objective.rho_value_evals.is_empty());
+    assert!(
+        objective
+            .rho_value_evals
+            .iter()
+            .all(|&rho| (-2.5..=2.5).contains(&rho)),
+        "configured box or seed leaked past objective domain: {:?}",
+        objective.rho_value_evals
+    );
+    assert!(
+        objective
+            .rho_value_evals
+            .iter()
+            .any(|rho| rho.to_bits() == (-2.5_f64).to_bits()),
+        "the out-of-domain initial seed must project onto the exact lower face"
     );
 }
 

@@ -2549,7 +2549,7 @@ pub(crate) fn outer_bounds_template(config: &OuterConfig, n: usize) -> (Array1<f
 /// box. The resulting box is stored back on `config`, making it the one source
 /// consumed by seed projection, continuation entry, every solver, and terminal
 /// projected-stationarity certification.
-fn install_objective_domain(
+pub(crate) fn install_objective_domain(
     config: &mut OuterConfig,
     n_params: usize,
     objective_lower: Option<Array1<f64>>,
@@ -2600,7 +2600,7 @@ fn install_objective_domain(
         }
         if !(lower[index].is_finite() && upper[index].is_finite() && lower[index] < upper[index]) {
             return Err(EstimationError::InvalidInput(format!(
-                "outer objective-domain intersection is empty or non-finite at coordinate {index}: lower={}, upper={}",
+                "outer objective-domain intersection has no finite searchable interval at coordinate {index}: lower={}, upper={}; a closed scalar endpoint may be valid for fixed-rho evaluation, but an active optimizer coordinate requires lower < upper",
                 lower[index], upper[index]
             )));
         }

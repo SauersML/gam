@@ -2582,14 +2582,14 @@ fn circular_gaussian_bessel_terms(
 // asks whether the data is better explained as the disjoint sum of those
 // structures than by any single pure rung.
 //
-// Each component is fit on its responsibility group as its own parametric
-// generative density and scored by BIC/2, the same invariant criterion used by
-// every other parametric shape candidate. The union's score is the sum of its
-// component scores. Its complexity price is therefore the total
-// `½ Σ_c P_c log(n_c)` over responsibility groups.
-// A union is therefore strictly more expensive than either pure component, so
-// it can only win when the structured split buys enough likelihood to pay for
-// its extra parameters — the negative-control discipline of #907.
+// The hard responsibility groups only determine which rows fit each component.
+// The resulting candidate is one normalized, unlabeled soft-mixture density
+// `p(y) = Σ_c π_c p_c(y)`, with `π_c = n_c / n`. It is scored on every
+// training row by that same mixture density used for held-out evaluation. Its
+// BIC/2 complexity price is `½(Σ_c P_c + m - 1) log(n)`: component
+// parameters plus the `m - 1` free mixing weights, all on the common sample
+// scale. This makes the union directly comparable to the other normalized
+// parametric candidates in the topology race.
 
 /// The fixed ladder of structured-union composites. Deterministic and closed:
 /// open-ended structure search stays owned by #976's move set; these three are
@@ -2612,10 +2612,11 @@ pub const UNION_STRUCTURE_LADDER: &[UnionStructure] = &[
 ];
 
 /// The per-component generative structure a union pins each responsibility group
-/// to. `Line` and `PointCluster` share the full-covariance Gaussian density
-/// (a line is an anisotropic Gaussian — the covariance, not a different
-/// parameterization, is what distinguishes them); `Circle` is the proper
-/// Cartesian density of a uniform latent circle convolved with isotropic
+/// to. `Line` is a full-covariance Gaussian, while `PointCluster` is the nested
+/// isotropic Gaussian with `d + 1` parameters. The covariance constraint makes
+/// line+cluster a genuine structured alternative to a generic two-component
+/// full-covariance mixture instead of a duplicate candidate. `Circle` is the
+/// proper Cartesian density of a uniform latent circle convolved with isotropic
 /// Gaussian noise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnionComponentKind {
@@ -2655,27 +2656,31 @@ impl UnionStructure {
     }
 }
 
-/// One fitted component of a union: its pinned structure, the rows it owns
-/// (after the hard responsibility split), its free-parameter count, and its
-/// BIC-form negative-log-evidence on the common scale.
+/// One fitted component of a union: its pinned structure, the rows used to fit
+/// it after the hard responsibility split, its free-parameter count, and its
+/// normalized soft-mixture weight. A component has no standalone BIC inside a
+/// union: the likelihood is the indivisible `log Σ_c π_c p_c(y)` scored on
+/// every row.
 #[derive(Debug, Clone)]
 pub struct UnionComponentFit {
     pub kind: UnionComponentKind,
     pub row_count: usize,
     pub num_parameters: usize,
-    pub bic: f64,
+    pub mixing_weight: f64,
 }
 
 /// A fitted structured-union candidate: the composite kind, the per-component
-/// fits, the summed BIC-form negative-log-evidence, and the total
-/// free-parameter count across components (the complexity price).
+/// fits, its normalized soft-mixture training likelihood, the corresponding
+/// BIC-form negative-log-evidence, and the complete free-parameter count.
 #[derive(Debug, Clone)]
 pub struct UnionStructureFit {
     pub structure: UnionStructure,
     pub components: Vec<UnionComponentFit>,
-    /// Summed component BIC/2 (lower wins).
+    /// `Σ_i log(Σ_c π_c p_c(y_i))` over all training rows.
+    pub log_likelihood: f64,
+    /// `-log_likelihood + ½ total_parameters log(n)` (lower wins).
     pub bic: f64,
-    /// `Σ_c P_c` — total free-parameter count across components.
+    /// `Σ_c P_c + (m - 1)`, including the free mixing weights.
     pub total_parameters: usize,
 }
 

@@ -940,17 +940,6 @@ pub fn run_sae_crosscoder_fit(
             block_dims.len()
         )));
     }
-    if !request
-        .initial_rho
-        .log_lambda_block
-        .iter()
-        .all(|value| value.is_finite())
-    {
-        return Err(SaeFitError::Fit(
-            "run_sae_crosscoder_fit: initial block log lambdas must be finite".to_string(),
-        ));
-    }
-
     // Wide stacked layers: default every rank-shrinkable atom onto its profiled
     // Grassmann frame BEFORE border admission — the factored border Σ M_k·r_k is
     // p̃-independent, while the full-B border (Σ M_k·p̃)² workspace is quadratic
@@ -963,6 +952,10 @@ pub fn run_sae_crosscoder_fit(
     request.initial_rho = request
         .initial_rho
         .for_assignment(request.base_term.assignment.mode);
+    request
+        .initial_rho
+        .validate_log_strength_domain()
+        .map_err(SaeFitError::Fit)?;
     let initial_flat = request.initial_rho.to_flat();
     let n_params = initial_flat.len();
     let cancel = request

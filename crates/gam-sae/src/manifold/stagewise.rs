@@ -355,6 +355,7 @@ pub fn frozen_joint_penalized_quasi_laplace(
     registry: Option<&AnalyticPenaltyRegistry>,
     config: &StagewiseConfig,
 ) -> Result<(f64, SaeManifoldLoss), String> {
+    rho.validate_log_strength_domain()?;
     term.penalized_quasi_laplace_criterion(
         target,
         rho,
@@ -525,7 +526,9 @@ fn fit_single_atom_response_in_place(
                 .cloned()
                 .unwrap_or_else(|| Array1::zeros(0)),
         ],
-    );
+    )
+    .for_assignment(sub_term.assignment.mode);
+    sub_rho.validate_log_strength_domain()?;
     sub_term.run_joint_fit_arrow_schur(
         response,
         &mut sub_rho,
@@ -903,6 +906,7 @@ fn refit_single_atom_in_place(
     registry: Option<&AnalyticPenaltyRegistry>,
     config: &StagewiseConfig,
 ) -> Result<(), String> {
+    rho.validate_log_strength_domain()?;
     let n = term.n_obs();
     let p = term.output_dim();
     let k = term.k_atoms();
@@ -955,6 +959,7 @@ fn backfit_sweep(
     registry: Option<&AnalyticPenaltyRegistry>,
     config: &StagewiseConfig,
 ) -> Result<(), String> {
+    rho.validate_log_strength_domain()?;
     term.set_guards_enabled(false);
     // Routing step: re-solve gates + coordinates jointly at frozen decoders. A
     // failed assemble is a no-op (the state stays at the last good iterate); the
@@ -1008,6 +1013,8 @@ pub fn fit_stagewise(
     // to completion. `None` ⇒ the historical, uninterruptible path, bit-for-bit.
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<StagewiseResult, String> {
+    rho = rho.for_assignment(seed.assignment.mode);
+    rho.validate_log_strength_domain()?;
     let n = target.nrows();
     if seed.k_atoms() != 1 {
         return Err(format!(
@@ -2078,6 +2085,8 @@ pub fn fit_stagewise_batched(
     sample_weights: Option<&[f64]>,
     config: &BatchedStagewiseConfig,
 ) -> Result<BatchedStagewiseResult, String> {
+    rho = rho.for_assignment(seed.assignment.mode);
+    rho.validate_log_strength_domain()?;
     let n = target.nrows();
     if seed.k_atoms() != 1 {
         return Err(format!(
@@ -2331,8 +2340,11 @@ pub fn terminal_joint_assembly(
     registry: Option<&AnalyticPenaltyRegistry>,
     config: &StagewiseConfig,
 ) -> Result<(SaeManifoldTerm, SaeManifoldRho, f64, SaeManifoldLoss), String> {
+    primary_rho.validate_log_strength_domain()?;
+    secondary_rho.validate_log_strength_domain()?;
     let (mut merged, merged_rho) =
         SaeManifoldTerm::merge_tiers(primary, primary_rho, secondary, secondary_rho)?;
+    merged_rho.validate_log_strength_domain()?;
     // Disarm the reseed guards ONLY for the frozen (evaluate-don't-optimize) pass,
     // then RE-ARM before returning: guards-off is the K=1 / backfitting rationale,
     // but the composed artifact must ship with the collapse-guard stack armed so

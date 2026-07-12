@@ -1547,6 +1547,7 @@ impl SaeManifoldOuterObjective {
         rho: &SaeManifoldRho,
     ) -> Result<bool, String> {
         self.fit_verdict = None;
+        rho.validate_log_strength_domain()?;
         let rho = rho.clone();
         self.current_rho = rho.clone();
         // #2080 (a) — the homotopy walk mutates the accepted basin through its
@@ -3453,6 +3454,7 @@ fn reactive_rho_domain_upper(
     rho: &SaeManifoldRho,
     entry_temperature: f64,
 ) -> Result<Array1<f64>, String> {
+    rho.validate_log_strength_domain()?;
     let mut entry_term = term.clone();
     entry_term
         .assignment

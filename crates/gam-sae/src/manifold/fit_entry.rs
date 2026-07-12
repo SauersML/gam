@@ -563,6 +563,9 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     // The seed ρ vector the outer engine optimizes; its length is the objective's
     // declared `n_params`.
     let init_rho = init_rho.for_assignment(base_term.assignment.mode);
+    init_rho
+        .validate_log_strength_domain()
+        .map_err(SaeFitError::Fit)?;
     let init_rho_flat = init_rho.to_flat();
     let n_params = init_rho_flat.len();
 
@@ -1074,6 +1077,8 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     // Additive post-fit diagnostics (#980): the two-score per-atom lens and the
     // residual-gauge certificate. Per-atom ARD variances (∝ exp(−log_precision))
     // are threaded in when native ARD was enabled, else `None` per atom.
+    rho.validate_log_strength_domain()
+        .map_err(SaeFitError::Fit)?;
     let ard_variances: Vec<Option<Array1<f64>>> = rho
         .log_ard
         .iter()
@@ -1249,6 +1254,8 @@ pub fn run_sae_manifold_certify(request: SaeCertifyRequest) -> Result<SaeFitRepo
     // family; this changes no numeric value, so `rho` is otherwise installed
     // verbatim from the caller.
     let mut rho = initial_rho.for_assignment(term.assignment.mode);
+    rho.validate_log_strength_domain()
+        .map_err(SaeFitError::Fit)?;
 
     // No outer search / inner solve ran, so there is no just-converged joint
     // Hessian factor to read off an outer objective (contrast
@@ -1408,6 +1415,8 @@ pub fn run_sae_manifold_certify(request: SaeCertifyRequest) -> Result<SaeFitRepo
         }
     }
 
+    rho.validate_log_strength_domain()
+        .map_err(SaeFitError::Fit)?;
     let ard_variances: Vec<Option<Array1<f64>>> = rho
         .log_ard
         .iter()
