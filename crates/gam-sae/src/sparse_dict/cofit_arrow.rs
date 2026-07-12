@@ -164,40 +164,11 @@ pub fn cofit_linear_via_arrow(
         }
     }
 
-    // One linear (degree-1 monomial) atom per block. Basis Φ = [1, t₁,…,t_b]
-    // (M = b+1), jet = ∂Φ/∂t (row 0 the intercept → 0; the identity block for the
-    // linear columns), decoder = [0; block's b decoder rows] (intercept seeded 0,
-    // the target is the de-meaned Tier-1 residual). Roughness gram is 0 — a linear
-    // atom is flat.
+    // One linear (degree-1 monomial) atom per block — a flat atom is the degree-1
+    // special case of the curved atom the composed lane also builds.
     let mut atoms: Vec<SaeManifoldAtom> = Vec::with_capacity(g);
     for gi in 0..g {
-        let t = &coord_blocks[gi];
-        let mut phi = Array2::<f64>::zeros((n, b + 1));
-        let mut jet = Array3::<f64>::zeros((n, b + 1, b));
-        for i in 0..n {
-            phi[[i, 0]] = 1.0;
-            for r in 0..b {
-                phi[[i, r + 1]] = t[[i, r]];
-                jet[[i, r + 1, r]] = 1.0;
-            }
-        }
-        let mut atom_decoder = Array2::<f64>::zeros((b + 1, p));
-        for r in 0..b {
-            for c in 0..p {
-                atom_decoder[[r + 1, c]] = decoder[[gi * b + r, c]] as f64;
-            }
-        }
-        let gram = Array2::<f64>::zeros((b + 1, b + 1));
-        let atom = SaeManifoldAtom::new_with_provided_function_gram(
-            format!("t1_block_{gi}"),
-            SaeAtomBasisKind::Linear,
-            b,
-            phi,
-            jet,
-            atom_decoder,
-            gram,
-        )?;
-        atoms.push(atom);
+        atoms.push(build_linear_atom(gi, &coord_blocks[gi], decoder, b, p)?);
     }
 
     // Frozen routing: dense logits large on fired atoms, small elsewhere; the
@@ -644,5 +615,161 @@ mod tests {
             tol
         );
         assert_eq!(arrow.reconstructed.dim(), (n, p));
+    }
+
+    /// Orthonormal-per-block decoder with a planted overlap, mirroring the fixture
+    /// [`super::super::cofit`] is tested on: 3 blocks of size b=2 in P=5, block 1
+    /// overlapping block 0 on e1 (so the tied projection double-counts e1), block 2
+    /// the plane holding a planted circle.
+    fn planted_decoder() -> Array2<f32> {
+        let s = 1.0f32 / 2.0f32.sqrt();
+        Array2::from_shape_vec(
+            (6, 5),
+            vec![
+                1.0, 0.0, 0.0, 0.0, 0.0, // e0
+                0.0, 1.0, 0.0, 0.0, 0.0, // e1
+                0.0, s, s, 0.0, 0.0, // (e1+e2)/√2
+                0.0, s, -s, 0.0, 0.0, // (e1−e2)/√2
+                0.0, 0.0, 0.0, 1.0, 0.0, // e3
+                0.0, 0.0, 0.0, 0.0, 1.0, // e4
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Planted linear part in span{e0,e1,e2} plus a unit circle in the {e3,e4}
+    /// plane, tiny noise — the trap fixture (a genuine curved chart in block 2).
+    fn planted_data(n: usize) -> Array2<f32> {
+        let mut x = Array2::<f32>::zeros((n, 5));
+        for i in 0..n {
+            let a = ((i * 7 + 1) % 17) as f32 / 17.0 - 0.5;
+            let bb = ((i * 13 + 5) % 19) as f32 / 19.0 - 0.5;
+            let cc = ((i * 5 + 3) % 23) as f32 / 23.0 - 0.5;
+            let t = 2.0 * std::f64::consts::PI * (i as f64) / (n as f64);
+            let noise = 0.002 * (((i * 3) % 11) as f32 / 11.0 - 0.5);
+            x[[i, 0]] = a;
+            x[[i, 1]] = bb;
+            x[[i, 2]] = cc;
+            x[[i, 3]] = t.cos() as f32 + noise;
+            x[[i, 4]] = t.sin() as f32 - noise;
+        }
+        x
+    }
+
+    /// Tied per-block routing (every row fires all three blocks; γ = 1): exactly
+    /// what a converged block-sparse fit stores.
+    fn tied_routing(
+        x: &Array2<f32>,
+        decoder: &Array2<f32>,
+        b: usize,
+    ) -> (Array2<u32>, Array3<f32>) {
+        let n = x.nrows();
+        let g = decoder.nrows() / b;
+        let mut blocks = Array2::<u32>::zeros((n, g));
+        let mut codes = Array3::<f32>::zeros((n, g, b));
+        for i in 0..n {
+            for gg in 0..g {
+                blocks[[i, gg]] = gg as u32;
+                for r in 0..b {
+                    let atom = decoder.row(gg * b + r);
+                    let mut dot = 0.0f32;
+                    for c in 0..decoder.ncols() {
+                        dot += x[[i, c]] * atom[c];
+                    }
+                    codes[[i, gg, r]] = dot;
+                }
+            }
+        }
+        (blocks, codes)
+    }
+
+    fn parity_chart_cfg() -> BlockChartComposeConfig {
+        BlockChartComposeConfig {
+            block_size: 2,
+            block_topk: 3,
+            min_firings: 8,
+            crossfit_folds: 4,
+            pair_screen: false,
+            ..BlockChartComposeConfig::default()
+        }
+    }
+
+    /// #2023 Increment 5 (the composed cutover): the unified arrow-Schur joint solve
+    /// over a MIXED linear + curved atom set must MATCH-OR-BEAT the hand-rolled A/B
+    /// coordinate-descent co-fit ([`super::super::cofit_block_and_curved`]) in
+    /// explained variance on the same planted routing, and it must actually fold in
+    /// a curved atom (the discovered circle in block 2). This is the parity evidence
+    /// that licenses deleting the alternation and repointing `fit_tiered`.
+    #[test]
+    fn composed_arrow_matches_or_beats_block_cofit_2023() {
+        use crate::sparse_dict::{CofitConfig, cofit_block_and_curved};
+
+        let n = 240usize;
+        let b = 2usize;
+        let decoder = planted_decoder();
+        let x = planted_data(n);
+        let (blocks, codes) = tied_routing(&x, &decoder, b);
+
+        // Reference: the hand-rolled A/B co-fit (the deletion target).
+        let cofit_cfg = CofitConfig {
+            code_ridge: 1.0e-6,
+            chart: parity_chart_cfg(),
+            ..CofitConfig::default()
+        };
+        let cofit = cofit_block_and_curved(
+            x.view(),
+            decoder.view(),
+            blocks.view(),
+            codes.view(),
+            1.0,
+            &cofit_cfg,
+        )
+        .expect("block A/B co-fit runs");
+
+        // Candidate: the unified arrow-Schur composed joint solve.
+        let arrow_cfg = ArrowCofitConfig {
+            max_iter: 256,
+            chart: parity_chart_cfg(),
+            ..ArrowCofitConfig::default()
+        };
+        let arrow = cofit_composed_via_arrow(
+            x.view(),
+            decoder.view(),
+            blocks.view(),
+            codes.view(),
+            1.0,
+            &arrow_cfg,
+        )
+        .expect("composed arrow-Schur co-fit runs end to end");
+
+        eprintln!(
+            "[#2023 5] cofit_ev={:.6} arrow_ev={:.6} n_curved={} certified={} charge={:.4}",
+            cofit.explained_variance,
+            arrow.explained_variance,
+            arrow.n_curved_atoms,
+            arrow.certified,
+            arrow.curved_charge
+        );
+
+        assert!(
+            arrow.explained_variance.is_finite(),
+            "composed arrow EV must be finite, got {}",
+            arrow.explained_variance
+        );
+        assert!(
+            arrow.n_curved_atoms >= 1,
+            "the composed fold must promote at least one curved atom (the circle in \
+             block 2); got {}",
+            arrow.n_curved_atoms
+        );
+        let tol = 1.0e-2 * (1.0 + cofit.explained_variance.abs());
+        assert!(
+            arrow.explained_variance >= cofit.explained_variance - tol,
+            "#2023 5: composed arrow EV {} must match-or-beat block A/B co-fit EV {} (tol {})",
+            arrow.explained_variance,
+            cofit.explained_variance,
+            tol
+        );
+        assert_eq!(arrow.reconstructed.dim(), (n, 5));
     }
 }

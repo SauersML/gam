@@ -43,6 +43,9 @@ use ndarray::Array2;
 use std::process::ExitCode;
 use std::time::Instant;
 
+mod common;
+use common::splitmix64;
+
 struct Args {
     rows: usize,
     p: usize,
@@ -152,14 +155,6 @@ fn planted_activations(rows: usize, p: usize) -> Array2<f64> {
         // Deterministic small wobble.
         v + 0.01 * (((i * 31 + c * 17) as f64) * 0.013).cos()
     })
-}
-
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
 }
 
 fn run() -> Result<(), String> {

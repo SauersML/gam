@@ -1,5 +1,5 @@
 use gam_sae::front_door::admit_sae_fit;
-use gam_sae::sparse_dict::{BlockSparseConfig, BlockSparseStreamState};
+use gam_sae::sparse_dict::{BlockSparseConfig, BlockSparseStreamState, coordinate_partition_frames};
 use memmap2::Mmap;
 use ndarray::Array2;
 use serde_json::json;
@@ -7,6 +7,9 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+mod common;
+use common::splitmix64;
 
 #[derive(Clone, Debug)]
 struct Args {
@@ -130,7 +133,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rss_after_peel = read_rss();
 
     let decoder_start = Instant::now();
-    let decoder = coordinate_block_decoder(args.atoms, p, args.block_size);
+    // Same signed-coordinate splitmix64 construction the library seeds its block
+    // dictionary with; `atoms` is validated divisible by `block_size` above, so
+    // `atoms / block_size` blocks of `block_size` axes is exactly `atoms` rows.
+    let decoder = coordinate_partition_frames(args.atoms / args.block_size, args.block_size, p);
     let decoder_seconds = decoder_start.elapsed().as_secs_f64();
     let rss_after_decoder = read_rss();
 
@@ -750,33 +756,6 @@ fn normalize(v: &mut [f64]) {
     }
 }
 
-fn coordinate_block_decoder(atoms: usize, p: usize, b: usize) -> Array2<f32> {
-    let mut decoder = Array2::<f32>::zeros((atoms, p));
-    let blocks = atoms / b;
-    let mut state = 0xd1b5_4a32_d192_ed03u64;
-    for block in 0..blocks {
-        let mut used = Vec::with_capacity(b);
-        for r in 0..b {
-            state = splitmix64(state ^ block as u64 ^ ((r as u64) << 32));
-            let mut coord = (state as usize) % p;
-            while used.contains(&coord) {
-                coord = (coord + 1) % p;
-            }
-            used.push(coord);
-            let sign = if (state >> 63) == 0 { 1.0 } else { -1.0 };
-            decoder[[block * b + r, coord]] = sign;
-        }
-    }
-    decoder
-}
-
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
-}
 
 fn read_rss() -> Rss {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();

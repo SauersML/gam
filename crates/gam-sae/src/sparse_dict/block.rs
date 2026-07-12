@@ -1522,7 +1522,11 @@ pub enum BlockSeedPolicy {
 /// `b` axes within a block are distinct coordinates, hence already orthonormal) with
 /// no dependence on `x` — the `O(K·b)` large-`K` seed that sidesteps the serial
 /// farthest-point corpus pass. Requires `b ≤ P` (distinct coordinates per block).
-pub(super) fn coordinate_partition_frames(n_blocks: usize, b: usize, p: usize) -> Array2<f32> {
+///
+/// Public because the large-`K` scaling examples (`scale_k`, `tiered_*`) seed their
+/// synthetic block dictionaries with exactly this construction; they call this instead
+/// of carrying a hand-copied duplicate of the splitmix64 signed-coordinate stream.
+pub fn coordinate_partition_frames(n_blocks: usize, b: usize, p: usize) -> Array2<f32> {
     let mut decoder = Array2::<f32>::zeros((n_blocks * b, p));
     let mut state = 0xd1b5_4a32_d192_ed03u64;
     for block in 0..n_blocks {
