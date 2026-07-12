@@ -12,8 +12,8 @@ use super::*;
 
 use crate::fnv1a::Fnv1a;
 use gam_math::jet_scalar::{
-    DynamicJetArena, DynamicOneSeed, DynamicOneSeedBatch, DynamicOneSeedBatchWorkspace,
-    DynamicTwoSeed, RuntimeJetScalar, filtered_implicit_solve_runtime_scalar,
+    DynamicJetArena, DynamicOneSeedBatch, DynamicOneSeedBatchWorkspace, DynamicTwoSeed,
+    RuntimeJetScalar, filtered_implicit_solve_runtime_scalar,
 };
 
 thread_local! {
@@ -1413,7 +1413,7 @@ impl BernoulliMarginalSlopeFamily {
                     axis,
                     r,
                     &workspace,
-                    |lane| f64::from(lane == axis),
+                    |lane| if lane == axis { 1.0 } else { 0.0 },
                 )
             });
             let jet = plan.evaluate(vars, 3, &workspace)?;
