@@ -3937,38 +3937,33 @@ pub fn discover_primary_atom_topologies(
                 )
             })?;
             // Intrinsic-metric CHALLENGER (#2240/#2280): re-race the fold-sensitive
-            // d=2 candidates on the geodesic embedding of the birth image, which
-            // unrolls a swiss-roll-class fold the PCA chart creases. It enters under
-            // the SAME REML evidence and wins only by a strictly lower TK cost; a
-            // win also swaps in its unfolded chart for the Duchon-center growth.
-            // Fail-safe: any embedding/race failure leaves the PCA winner untouched.
-            //
-            // GATED to a FLAT PCA verdict (EuclideanPatch/Duchon): the challenger
-            // only ever offers the raw-coordinate flat + thin-plate charts, and a
-            // thin-plate sheet is flexible enough to out-fit a SPECIALIZED curved
-            // chart (sphere/torus/circle) on evidence even when that curved chart is
-            // the true topology (the #2238/#2239 contract). A genuinely curved factor
-            // gets a curved PCA winner; only a SHEET verdict (flat/Duchon — the
-            // least-bad chart for a folded plane) can be a fold worth unrolling. So
-            // the challenger runs iff PCA already said "sheet", never overriding a
-            // discovered sphere/torus/circle.
-            let pca_is_sheet = matches!(
-                pca_winner.as_ref().map(|(fit, _)| &fit.basis_kind),
-                Some(SaeAtomBasisKind::EuclideanPatch) | Some(SaeAtomBasisKind::Duchon)
-            );
-            let intrinsic_challenger = if pca_is_sheet {
-                match build_intrinsic_primary_specs(target, &rows, max_dims[atom_idx]) {
-                    Ok(Some((int_specs, int_chart))) => {
-                        match race_spec_set(int_specs, target, weights.view()) {
-                            Ok(Some((int_fit, int_score))) => Some((int_fit, int_score, int_chart)),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
+            // d=2 candidates on the cluster-local geodesic embedding. It enters the
+            // SAME REML evidence race as every PCA-chart candidate; evidence, not a
+            // post-hoc PCA winner-class gate, decides whether unfolding is useful.
+            // An embedding or evidence failure is a failed discovery operation and
+            // is returned to the caller instead of silently substituting the PCA
+            // result.
+            let intrinsic_challenger =
+                match build_intrinsic_primary_specs(target, &rows, max_dims[atom_idx]).map_err(
+                    |error| {
+                        format!(
+                            "discover_primary_atom_topologies: intrinsic chart failed for auto atom {atom_idx}: {error}"
+                        )
+                    },
+                )? {
+                    Some((int_specs, int_chart)) => race_spec_set(
+                        int_specs,
+                        target,
+                        weights.view(),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "discover_primary_atom_topologies: intrinsic evidence race failed for auto atom {atom_idx}: {error}"
+                        )
+                    })?
+                    .map(|(int_fit, int_score)| (int_fit, int_score, int_chart)),
+                    None => None,
+                };
             // When the intrinsic seed wins, its unfolded chart both drives the
             // Duchon-center growth (`sheet_coords`) AND must be installed as the
             // atom's final seed coordinates (`winning_intrinsic_chart`) so the
@@ -4101,7 +4096,8 @@ fn build_intrinsic_primary_specs(
         return Ok(None);
     }
     let n_obs = target.nrows();
-    let embed = crate::manifold::intrinsic_geodesic_embedding(target, 2)?;
+    let local_target = target.select(Axis(0), rows);
+    let embed = crate::manifold::intrinsic_geodesic_embedding(local_target.view(), 2)?;
     if embed.ncols() < 2 {
         return Ok(None);
     }
@@ -4113,15 +4109,15 @@ fn build_intrinsic_primary_specs(
     let mut coords = Array2::<f64>::zeros((n_obs, 2));
     for col in 0..2 {
         let mut acc = 0.0_f64;
-        for &row in rows {
-            acc += embed[[row, col]] * embed[[row, col]];
+        for local_row in 0..rows.len() {
+            acc += embed[[local_row, col]] * embed[[local_row, col]];
         }
         let sd = (acc * inv_count).sqrt();
         if !(sd > 1e-12) || !sd.is_finite() {
             return Ok(None);
         }
-        for row in 0..n_obs {
-            coords[[row, col]] = embed[[row, col]] / sd;
+        for (local_row, &global_row) in rows.iter().enumerate() {
+            coords[[global_row, col]] = embed[[local_row, col]] / sd;
         }
     }
     let mut specs: Vec<TopologyCandidateSpec> = Vec::with_capacity(2);
@@ -6152,6 +6148,57 @@ mod tests {
     use gam_terms::latent::LatentManifold;
     use ndarray::Array2;
     use std::sync::Arc;
+
+    #[test]
+    fn intrinsic_primary_chart_is_cluster_local_2240() {
+        let local_rows = 20usize;
+        let other_rows = 20usize;
+        let mut first = Array2::<f64>::zeros((local_rows + other_rows, 3));
+        let mut second = Array2::<f64>::zeros((local_rows + other_rows, 3));
+        for row in 0..local_rows {
+            let x = (row % 5) as f64;
+            let y = (row / 5) as f64;
+            let z = 0.15 * x * y;
+            for target in [&mut first, &mut second] {
+                target[[row, 0]] = x;
+                target[[row, 1]] = y;
+                target[[row, 2]] = z;
+            }
+        }
+        for offset in 0..other_rows {
+            let row = local_rows + offset;
+            let x = (offset % 5) as f64;
+            let y = (offset / 5) as f64;
+            first[[row, 0]] = 10.0 + x;
+            first[[row, 1]] = y;
+            second[[row, 0]] = 1.0e6 + 1.0e4 * x;
+            second[[row, 1]] = -1.0e6 + 1.0e4 * y;
+            second[[row, 2]] = 2.0e6;
+        }
+        let rows = (0..local_rows).collect::<Vec<_>>();
+        let (_, first_chart) = build_intrinsic_primary_specs(first.view(), &rows, 2)
+            .expect("first local embedding")
+            .expect("realizable first local chart");
+        let (_, second_chart) = build_intrinsic_primary_specs(second.view(), &rows, 2)
+            .expect("second local embedding")
+            .expect("realizable second local chart");
+
+        for row in 0..local_rows {
+            for col in 0..2 {
+                assert_eq!(
+                    first_chart[[row, col]].to_bits(),
+                    second_chart[[row, col]].to_bits(),
+                    "another atom's observations must not alter cluster-local geodesics"
+                );
+            }
+        }
+        for row in local_rows..(local_rows + other_rows) {
+            assert_eq!(first_chart[[row, 0]], 0.0);
+            assert_eq!(first_chart[[row, 1]], 0.0);
+            assert_eq!(second_chart[[row, 0]], 0.0);
+            assert_eq!(second_chart[[row, 1]], 0.0);
+        }
+    }
 
     /// A parent nominated more than once (by different partners at different
     /// significances) must collapse to EXACTLY ONE entry — the most-suspect
