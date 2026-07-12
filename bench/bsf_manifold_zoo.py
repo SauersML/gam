@@ -10,9 +10,10 @@ rolls, helices) embedded in ``R^d`` through random orthonormal maps, summed
 contribution R^2 of 0.93-0.97 against an oracle ceiling of 0.99, while the flat
 TopK SAE shatters to ~0.53 (their Fig. "leaderboard").
 
-This bench reproduces that data-generating process EXACTLY (their Appendix
-"Toy model of Manifold Superposition", including the per-instance center+RMS
-normalization and the clean, noise-free mixtures) and scores:
+This bench uses exact analytic defining equations for all eight native objects,
+including a full-height 2-D Swiss-roll sheet, then applies the paper's
+per-instance center/RMS normalization and clean additive-superposition protocol.
+It scores:
 
 * ``ours_rust``  -- ``gamfit.sae_manifold_fit`` (the production Rust REML path)
   at its DEFAULTS. Atoms are genuinely curved charts, so a circle costs ONE
@@ -46,7 +47,7 @@ Results append as JSONL (a crash loses nothing); ``--dump-clouds`` writes an
 NPZ with per-factor true/recovered contribution clouds + intrinsic-coordinate
 hue for the figure gallery (``bench/bsf_zoo_figures.py``).
 
-Paper-matched invocation (their toy: M=128, d=128, L0=4, N=3e5):
+Large joint invocation (M=128, d=128, L0=4, N=3e5):
 
     python3 -m bench.bsf_manifold_zoo --factors 128 --ambient 128 --l0 4 \
         --n-train 300000 --n-test 100000 --featurizers ours_rust,flat,oracle
