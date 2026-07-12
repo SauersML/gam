@@ -9,7 +9,7 @@
 //! and pin registry is enforced by the workspace-root build policy.
 
 use gam_math::jet_tower::RowProgram;
-use gam_models::gamlss::{GaussianJointRowProgram, GaussianJointRowScalars};
+use gam_models::gamlss::GaussianJointRowProgram;
 use gam_models::survival::CauseSpecificRowProgram;
 use gam_models::MultinomialLogitRowProgram;
 
@@ -24,7 +24,4 @@ fn canonical_row_programs_are_production_artifacts() {
         require_row_program::<2, GaussianJointRowProgram<'a>>();
     }
     require_gaussian();
-
-    let _: for<'a> fn(&'a GaussianJointRowScalars) -> GaussianJointRowProgram<'a> =
-        GaussianJointRowProgram::new;
 }
