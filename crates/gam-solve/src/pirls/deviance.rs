@@ -67,6 +67,56 @@ fn cloglog_binomial_geometry(y: f64, eta: f64) -> (f64, f64, f64) {
     (log_mu, -t, negative_score)
 }
 
+#[inline]
+fn loglog_binomial_geometry(y: f64, eta: f64) -> (f64, f64, f64) {
+    let r = (-eta).exp();
+    if !r.is_finite() {
+        return (
+            f64::NEG_INFINITY,
+            -0.0,
+            if y == 0.0 { -0.0 } else { f64::NEG_INFINITY },
+        );
+    }
+    let log_mu = -r;
+    let log_one_minus_mu = gam_math::probability::log1mexp_positive(r);
+    let survival_score = if r == 0.0 {
+        1.0
+    } else if r > 709.0 {
+        0.0
+    } else {
+        r / r.exp_m1()
+    };
+    (log_mu, log_one_minus_mu, (1.0 - y) * survival_score - y * r)
+}
+
+#[inline]
+fn cauchit_binomial_geometry(y: f64, eta: f64) -> (f64, f64, f64) {
+    let (mu, one_minus_mu) = if eta > 0.0 {
+        let tail = (1.0 / eta).atan() / std::f64::consts::PI;
+        (1.0 - tail, tail)
+    } else if eta < 0.0 {
+        let head = (-1.0 / eta).atan() / std::f64::consts::PI;
+        (head, 1.0 - head)
+    } else {
+        (0.5, 0.5)
+    };
+    let log_mu = mu.ln();
+    let log_one_minus_mu = one_minus_mu.ln();
+    let absolute_eta = eta.abs();
+    let log_dmu = if absolute_eta <= f64::MAX.sqrt() {
+        -std::f64::consts::PI.ln() - eta.mul_add(eta, 1.0).ln()
+    } else {
+        -std::f64::consts::PI.ln() - 2.0 * absolute_eta.ln() - (1.0 / absolute_eta).powi(2).ln_1p()
+    };
+    let residual = mu - y;
+    let negative_score = if residual == 0.0 {
+        0.0
+    } else {
+        residual.signum() * (log_dmu + residual.abs().ln() - log_mu - log_one_minus_mu).exp()
+    };
+    (log_mu, log_one_minus_mu, negative_score)
+}
+
 /// One observation's exact deviance surface in linear-predictor coordinates.
 ///
 /// `half_deviance` is `D_i / 2`; `eta_score` is its derivative with respect to
@@ -786,6 +836,12 @@ pub(crate) fn deviance_eta_row_with_log_measure_scale(
                 InverseLink::Standard(StandardLink::CLogLog) => {
                     Some(cloglog_binomial_geometry(y, eta))
                 }
+                InverseLink::Standard(StandardLink::LogLog) => {
+                    Some(loglog_binomial_geometry(y, eta))
+                }
+                InverseLink::Standard(StandardLink::Cauchit) => {
+                    Some(cauchit_binomial_geometry(y, eta))
+                }
                 _ => None,
             };
             let jet = if is_logit || standard_geometry.is_some() {
@@ -927,7 +983,7 @@ pub(crate) fn deviance_eta_row_with_log_measure_scale(
             if !(a.is_finite() && a >= 0.0 && b.is_finite() && b >= 0.0) {
                 return Err(deviance_row_error(row, "beta shape", eta, a.max(b)));
             }
-            let saturated = beta_loglikelihood_full_unit(y, y, *phi);
+            let saturated = beta_saturated_loglikelihood_unit(y, *phi)?;
             let log_normalizer = if a < f64::MIN_POSITIVE {
                 // Γ(a) = Γ(1+a)/a, and b rounds exactly to phi once the
                 // logit-tail shape is subnormal. Thus
@@ -1492,7 +1548,7 @@ fn omitted_log_likelihood_row(
             )
         }
         ResponseFamily::Beta { phi } => {
-            let saturated = beta_loglikelihood_full_unit(y, y, *phi);
+            let saturated = beta_saturated_loglikelihood_unit(y, *phi)?;
             if !saturated.is_finite() {
                 return Err(deviance_row_error(
                     row,
@@ -1669,18 +1725,42 @@ pub(crate) fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
 }
 
 #[inline]
-pub(crate) fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
-    if !valid_beta_phi(phi) || !valid_beta_response(yi) {
-        return f64::NAN;
+fn beta_saturated_loglikelihood_unit(y: f64, phi: f64) -> Result<f64, EstimationError> {
+    if !valid_beta_phi(phi) || !valid_beta_response(y) {
+        crate::bail_invalid_estim!(
+            "Beta saturated likelihood requires y in (0,1) and positive finite precision; got y={y}, phi={phi}"
+        );
     }
-    if !(mui.is_finite() && mui > 0.0 && mui < 1.0) {
-        return f64::NAN;
-    }
-    let a = mui * phi;
-    let b = (1.0 - mui) * phi;
-    beta_log_normalizer(a, b, phi) + phi * xlogy(mui, yi) + phi * xlogy(1.0 - mui, 1.0 - yi)
-        - yi.ln()
-        - (1.0 - yi).ln()
+    let log_phi = phi.ln();
+    let log_y = y.ln();
+    let log_one_minus_y = (-y).ln_1p();
+    let log_a = log_phi + log_y;
+    let log_b = log_phi + log_one_minus_y;
+    let a = log_a.exp();
+    let b = log_b.exp();
+    let log_normalizer = match (a == 0.0, b == 0.0) {
+        (true, true) => log_a + log_b - log_phi,
+        (true, false) => log_a,
+        (false, true) => log_b,
+        (false, false) => beta_log_normalizer(a, b, phi),
+    };
+    let scaled_log = |log_coefficient: f64, logarithm: f64| {
+        if logarithm == 0.0 {
+            0.0
+        } else {
+            logarithm.signum() * (log_coefficient + logarithm.abs().ln()).exp()
+        }
+    };
+    stable_finite_signed_sum(
+        &[
+            log_normalizer,
+            scaled_log(log_a, log_y),
+            scaled_log(log_b, log_one_minus_y),
+            -log_y,
+            -log_one_minus_y,
+        ],
+        "Beta saturated log-likelihood",
+    )
 }
 
 /// `ln(2π)` — the per-observation Gaussian / saddlepoint normalizer constant.
@@ -2068,9 +2148,7 @@ fn tweedie_exact_series_loglik_from_eta(
         let value = stable_finite_signed_sum(&components, "exact Tweedie series term")?;
         let absolute_sum: f64 = components.iter().map(|component| component.abs()).sum();
         let input_roundoff_bound = 16.0 * f64::EPSILON * absolute_sum;
-        if !absolute_sum.is_finite()
-            || input_roundoff_bound > 1.0e-10 * value.abs().max(1.0)
-        {
+        if !absolute_sum.is_finite() || input_roundoff_bound > 1.0e-10 * value.abs().max(1.0) {
             return Err(deviance_row_error(
                 row,
                 "exact Tweedie series-term cancellation certificate",
@@ -2285,7 +2363,7 @@ pub fn tweedie_exact_loglik_total_from_eta(
                 return Err(deviance_row_error(
                     row,
                     "exact Tweedie prior weight",
-                    f64::NAN,
+                    eta[row],
                     weight,
                 ));
             }
@@ -2296,7 +2374,7 @@ pub fn tweedie_exact_loglik_total_from_eta(
                 return Err(deviance_row_error(
                     row,
                     "exact Tweedie response",
-                    f64::NAN,
+                    eta[row],
                     y[row],
                 ));
             }

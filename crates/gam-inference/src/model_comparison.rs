@@ -99,18 +99,18 @@ pub struct ModelComparison {
 /// Exact Wood–Pya–Säfken corrected effective degrees of freedom.
 ///
 /// `edf_conditional = tr(F)` with `F = H⁻¹X'WX` (the engine's `edf_total`).
-/// The correction term is `tr(X'WX · Σ_ρ)` where `Σ_ρ` is the H⁻¹-scale
-/// smoothing-parameter uncertainty covariance. The engine stores the genuine
+/// The correction term is `tr(X'WX · C) / s`, where `C` is the retained
+/// coefficient-covariance correction and `s` is the coefficient-covariance
+/// ownership scale (`V_beta = s H⁻¹`). The engine stores the genuine
 /// symmetric-PSD weighted Gram `X'WX = H − S(λ)` directly on the fit
 /// ([`UnifiedFitResult::weighted_gram`], issue #1027) — pairing it with
-/// `Σ_ρ = smoothing_correction / φ` makes the correction the nonnegative
-/// `tr(A½ B A½)` it is defined to be, instead of the indefinite `H·F`
+/// `C` makes the correction the nonnegative `tr(A½ B A½)` it is defined to
+/// be, instead of the indefinite `H·F`
 /// reconstruction (where the stored `H` need not satisfy `H·F = X'WX`) that
 /// drove the corrected EDF below the conditional EDF.
 ///
-/// Returns `edf_conditional` unchanged when any exact input is absent —
-/// the conditional value is the honest fallback, never an approximation of
-/// the correction.
+/// Missing artifacts or method provenance produce `corrected=None` with a
+/// typed reason; malformed present inputs are errors.
 pub fn corrected_edf(
     edf_conditional: f64,
     weighted_gram: Option<ArrayView2<'_, f64>>,
@@ -173,10 +173,8 @@ pub fn corrected_edf(
     })
 }
 
-/// `tr(X'WX · Σ_ρ)` with `Σ_ρ = smoothing_correction / φ` and `X'WX` the
-/// stored PSD weighted Gram. Returns `0.0` when any input is missing,
-/// non-square, dimension-mismatched, or non-finite. Nonnegative by
-/// construction (both factors are symmetric PSD).
+/// `tr(X'WX · C) / s` with `X'WX` and `C` PSD and `s` the explicit
+/// coefficient-covariance scale.
 fn wps_correction_term(
     xwx: ArrayView2<'_, f64>,
     corr: ArrayView2<'_, f64>,
@@ -377,8 +375,8 @@ pub struct ComparisonReport {
     /// `AIC_corrected(a) − AIC_corrected(b)`; negative favours `a`.
     pub delta_aic_corrected: Option<f64>,
     /// `false` when the two fits have a different number of observations and the
-    /// paired predictive difference could not be formed; `delta_elpd` is then
-    /// `NaN` and only the AIC gap is meaningful.
+    /// paired predictive difference could not be formed; paired metrics are
+    /// then `None`.
     pub rows_aligned: bool,
 }
 
@@ -469,11 +467,10 @@ pub fn compare(
 /// Assemble the comparison payload for a fitted GLM/GAM from the fit result plus
 /// optional ALO diagnostics.
 ///
-/// The corrected-AIC channel is always populated (it needs only fit-retained
-/// fields). The ALO elpd channel is populated when `alo` is supplied and the
-/// fit carries an engine-level family: the leave-one-out linear predictors are
-/// the ALO `eta_tilde`, mapped through the family inverse link to means and
-/// scored by the per-row family log-likelihood kernel.
+/// Corrected AIC is populated only with retained, method-certified correction
+/// provenance. The ALO elpd channel is populated when `alo` is supplied and the
+/// fit carries an engine-level family; both predictors are scored directly in
+/// eta coordinates.
 ///
 /// `eta_hat` is the *fitted* linear predictor (including offset) and `y` the
 /// response, both length `n`.
@@ -689,19 +686,24 @@ mod tests {
         // X'WX = I, φ = 2 → correction is tr(X'WX·corr)/φ = tr(corr)/φ.
         let xwx = Array2::<f64>::eye(3);
         let corr = array![[2.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 6.0]];
-        let edf = corrected_edf(3.0, Some(xwx.view()), Some(corr.view()), 2.0);
+        let edf = corrected_edf(3.0, Some(xwx.view()), Some(corr.view()), Some(2.0), 1, true)
+            .expect("corrected EDF");
         // tr(corr)/φ = (2+4+6)/2 = 6, so corrected = 3 + 6 = 9, ρ-df = 6.
-        assert!((edf.corrected - 9.0).abs() < 1e-12);
-        assert!((edf.rho_uncertainty_df() - 6.0).abs() < 1e-12);
+        assert_eq!(edf.corrected, Some(9.0));
+        assert_eq!(edf.rho_uncertainty_df(), Some(6.0));
         assert!((edf.conditional - 3.0).abs() < 1e-12);
     }
 
     #[test]
-    fn corrected_edf_falls_back_to_conditional_without_inputs() {
-        let edf = corrected_edf(5.5, None, None, 1.0);
+    fn corrected_edf_reports_unavailable_without_inputs() {
+        let edf = corrected_edf(5.5, None, None, Some(1.0), 1, true).expect("availability result");
         assert_eq!(edf.conditional, 5.5);
-        assert_eq!(edf.corrected, 5.5);
-        assert_eq!(edf.rho_uncertainty_df(), 0.0);
+        assert_eq!(edf.corrected, None);
+        assert_eq!(edf.rho_uncertainty_df(), None);
+        assert_eq!(
+            edf.unavailable_reason,
+            Some(CorrectedEdfUnavailable::MissingWeightedGram)
+        );
     }
 
     #[test]
@@ -779,10 +781,11 @@ mod tests {
             log_lik: 0.0,
             edf: CorrectedEdf {
                 conditional: 0.0,
-                corrected: 0.0,
+                corrected: Some(0.0),
+                unavailable_reason: None,
             },
             aic_conditional: aic,
-            aic_corrected: aic,
+            aic_corrected: Some(aic),
             loo: Some(AloElpd {
                 elpd: pw.iter().sum(),
                 se: Some(0.0),
@@ -793,12 +796,12 @@ mod tests {
         };
         let a = mk(array![-1.0, -1.0, -1.0, -1.0], 10.0);
         let b = mk(array![-2.0, -2.0, -2.0, -2.0], 14.0);
-        let rep = compare(&a, &b);
+        let rep = compare(&a, &b).expect("comparison");
         assert!(rep.rows_aligned);
         // a − b: elpd diff = (-4) - (-8) = +4 favours a; aic diff = 10 - 14 = -4 favours a.
-        assert!((rep.delta_elpd - 4.0).abs() < 1e-12);
-        assert!((rep.delta_aic_corrected + 4.0).abs() < 1e-12);
-        assert!(rep.delta_elpd_se.abs() < 1e-12);
+        assert_eq!(rep.delta_elpd, Some(4.0));
+        assert_eq!(rep.delta_aic_corrected, Some(-4.0));
+        assert_eq!(rep.delta_elpd_se, Some(0.0));
     }
 
     #[test]
@@ -817,10 +820,11 @@ mod tests {
             log_lik: 0.0,
             edf: CorrectedEdf {
                 conditional: 0.0,
-                corrected: 0.0,
+                corrected: Some(0.0),
+                unavailable_reason: None,
             },
             aic_conditional: 0.0,
-            aic_corrected: 0.0,
+            aic_corrected: Some(0.0),
             loo: Some(AloElpd {
                 elpd: pw.iter().sum(),
                 se: Some(0.0),
@@ -832,11 +836,11 @@ mod tests {
         // Paired differences (0, 2): s² = 2, SE(Σ diff) = √(2·2) = 2.
         let a = mk(array![0.0, 2.0]);
         let b = mk(array![0.0, 0.0]);
-        let rep = compare(&a, &b);
+        let rep = compare(&a, &b).expect("comparison");
         assert!(rep.rows_aligned);
         assert!(
-            (rep.delta_elpd_se - 2.0).abs() < 1e-12,
-            "se = {}",
+            rep.delta_elpd_se == Some(2.0),
+            "se = {:?}",
             rep.delta_elpd_se
         );
     }
@@ -847,10 +851,11 @@ mod tests {
             log_lik: 0.0,
             edf: CorrectedEdf {
                 conditional: 0.0,
-                corrected: 0.0,
+                corrected: Some(0.0),
+                unavailable_reason: None,
             },
             aic_conditional: 0.0,
-            aic_corrected: 5.0,
+            aic_corrected: Some(5.0),
             loo: Some(AloElpd {
                 elpd: pw.iter().sum(),
                 se: Some(0.0),
@@ -861,10 +866,10 @@ mod tests {
         };
         let a = mk(array![-1.0, -1.0, -1.0]);
         let b = mk(array![-1.0, -1.0]);
-        let rep = compare(&a, &b);
+        let rep = compare(&a, &b).expect("comparison");
         assert!(!rep.rows_aligned);
-        assert!(rep.delta_elpd.is_nan());
+        assert_eq!(rep.delta_elpd, None);
         // AIC gap still reported.
-        assert!((rep.delta_aic_corrected - 0.0).abs() < 1e-12);
+        assert_eq!(rep.delta_aic_corrected, Some(0.0));
     }
 }

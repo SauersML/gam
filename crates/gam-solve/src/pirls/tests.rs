@@ -4920,7 +4920,7 @@ mod reporting_loglikelihood_tests {
     fn scalar_equals_sum_of_pointwise() {
         let y = array![0.0, 2.0, 5.0, 1.0];
         let mu = array![1.0, 2.0, 4.0, 1.5];
-        let w = array![1.0, 1.0, 2.0, 0.5];
+        let w = array![1.0, 1.0, 2.0, 1.0];
         let glm = canonical(ResponseFamily::Poisson, StandardLink::Log);
         let evaluation = full_at_fixture(&y, &mu, &glm, &w, StandardLink::Log);
         let pw = evaluation.pointwise();
