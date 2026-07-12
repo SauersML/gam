@@ -3717,11 +3717,8 @@ impl BernoulliMarginalSlopeFamily {
             let row_ctx = Self::row_ctx(cache, row);
             let [t3_q, t3_g] =
                 if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
-                    let point = self.primary_point_from_block_states(
-                        row,
-                        block_states,
-                        &cache.primary,
-                    )?;
+                    let point =
+                        self.primary_point_from_block_states(row, block_states, &cache.primary)?;
                     let (q, b, beta_h_owned, beta_w_owned) =
                         self.primary_point_components(&point, &cache.primary);
                     self.empirical_flex_row_third_contracted_many(
@@ -3787,38 +3784,61 @@ impl BernoulliMarginalSlopeFamily {
             let mut e_g = Array1::<f64>::zeros(r);
             e_g[cache.primary.logslope] = 1.0;
             let row_ctx = Self::row_ctx(cache, row);
-            let t4_qq = self.row_primary_fourth_contracted_ordered(
-                row,
-                block_states,
-                cache,
-                row_ctx,
-                &e_q,
-                &e_q,
-            )?;
-            let t4_gg = self.row_primary_fourth_contracted_ordered(
-                row,
-                block_states,
-                cache,
-                row_ctx,
-                &e_g,
-                &e_g,
-            )?;
-            let t4_qg_ordered = self.row_primary_fourth_contracted_ordered(
-                row,
-                block_states,
-                cache,
-                row_ctx,
-                &e_q,
-                &e_g,
-            )?;
-            let t4_qg_swapped = self.row_primary_fourth_contracted_ordered(
-                row,
-                block_states,
-                cache,
-                row_ctx,
-                &e_g,
-                &e_q,
-            )?;
+            let [t4_qq, t4_gg, t4_qg_ordered, t4_qg_swapped] =
+                if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
+                    let point =
+                        self.primary_point_from_block_states(row, block_states, &cache.primary)?;
+                    let (q, b, beta_h_owned, beta_w_owned) =
+                        self.primary_point_components(&point, &cache.primary);
+                    self.empirical_flex_row_fourth_contracted_many_ordered(
+                        row,
+                        &cache.primary,
+                        q,
+                        b,
+                        beta_h_owned.as_ref(),
+                        beta_w_owned.as_ref(),
+                        row_ctx,
+                        &[(&e_q, &e_q), (&e_g, &e_g), (&e_q, &e_g), (&e_g, &e_q)],
+                        &grid,
+                    )?
+                    .try_into()
+                    .expect("four empirical BMS axis pairs produce four contractions")
+                } else {
+                    [
+                        self.row_primary_fourth_contracted_ordered(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &e_q,
+                            &e_q,
+                        )?,
+                        self.row_primary_fourth_contracted_ordered(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &e_g,
+                            &e_g,
+                        )?,
+                        self.row_primary_fourth_contracted_ordered(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &e_q,
+                            &e_g,
+                        )?,
+                        self.row_primary_fourth_contracted_ordered(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &e_g,
+                            &e_q,
+                        )?,
+                    ]
+                };
             let mut t4_qg = t4_qg_ordered;
             t4_qg.zip_mut_with(&t4_qg_swapped, |a, &b| *a = 0.5 * (*a + b));
             Ok(FlexAxisFourthRowTensors {
@@ -3866,13 +3886,7 @@ impl BernoulliMarginalSlopeFamily {
                 return Ok(out);
             }
         }
-        self.row_primary_third_contracted_with_moments(
-            row,
-            block_states,
-            cache,
-            row_ctx,
-            dir,
-        )
+        self.row_primary_third_contracted_with_moments(row, block_states, cache, row_ctx, dir)
     }
 
     pub(super) fn row_primary_third_contracted_with_moments(
@@ -7004,6 +7018,105 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
         Ok(out)
+    }
+
+    /// Evaluate several symmetric fourth contractions for one row. Empirical
+    /// FLEX evaluates both ordered orientations in one two-seed batch per
+    /// bounded chunk, preserving the established arithmetic symmetrization
+    /// while sharing the row-plan base across pairs.
+    pub(super) fn row_primary_fourth_contracted_many(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
+    ) -> Result<Vec<Array2<f64>>, String> {
+        const PAIRS_PER_EMPIRICAL_BATCH: usize = 4;
+
+        if direction_pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let flex_active = self.effective_flex_active(block_states)?;
+        let expected = if flex_active { cache.primary.total } else { 2 };
+        if let Some((lane, (direction_u, direction_v))) =
+            direction_pairs
+                .iter()
+                .enumerate()
+                .find(|(_, (direction_u, direction_v))| {
+                    direction_u.len() != expected || direction_v.len() != expected
+                })
+        {
+            return Err(format!(
+                "bernoulli fourth contracted row {row} pair {lane}: direction lengths ({},{}) != {expected}",
+                direction_u.len(),
+                direction_v.len()
+            ));
+        }
+        let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? else {
+            return direction_pairs
+                .iter()
+                .map(|(direction_u, direction_v)| {
+                    self.row_primary_fourth_contracted(
+                        row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        direction_u,
+                        direction_v,
+                    )
+                })
+                .collect();
+        };
+        if !flex_active {
+            return direction_pairs
+                .iter()
+                .map(|(direction_u, direction_v)| {
+                    self.row_primary_fourth_contracted(
+                        row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        direction_u,
+                        direction_v,
+                    )
+                })
+                .collect();
+        }
+
+        let primary = &cache.primary;
+        let point = self.primary_point_from_block_states(row, block_states, primary)?;
+        let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
+        let mut contractions = Vec::with_capacity(direction_pairs.len());
+        for pair_chunk in direction_pairs.chunks(PAIRS_PER_EMPIRICAL_BATCH) {
+            let mut ordered_pairs = Vec::with_capacity(2 * pair_chunk.len());
+            for &(direction_u, direction_v) in pair_chunk {
+                ordered_pairs.push((direction_u, direction_v));
+                ordered_pairs.push((direction_v, direction_u));
+            }
+            let ordered = self.empirical_flex_row_fourth_contracted_many_ordered(
+                row,
+                primary,
+                q,
+                b,
+                beta_h_owned.as_ref(),
+                beta_w_owned.as_ref(),
+                row_ctx,
+                &ordered_pairs,
+                &grid,
+            )?;
+            let mut orientations = ordered.into_iter();
+            while let Some(mut ordered) = orientations.next() {
+                let swapped = orientations
+                    .next()
+                    .expect("each empirical BMS pair has two ordered orientations");
+                ordered.zip_mut_with(&swapped, |ordered, &swapped| {
+                    *ordered = 0.5 * (*ordered + swapped);
+                });
+                contractions.push(ordered);
+            }
+        }
+        Ok(contractions)
     }
 
     pub(super) fn row_primary_fourth_contracted(

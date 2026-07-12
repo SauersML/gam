@@ -12,8 +12,8 @@ use super::*;
 
 use crate::fnv1a::Fnv1a;
 use gam_math::jet_scalar::{
-    DynamicJetArena, DynamicJetBatchWorkspace, DynamicOneSeedBatch, DynamicTwoSeed,
-    FixedRuntimeJet, OneSeed, RuntimeJetScalar, TwoSeed, filtered_implicit_solve_runtime_scalar,
+    DynamicJetBatchWorkspace, DynamicOneSeedBatch, DynamicTwoSeedBatch, FixedRuntimeJet, OneSeed,
+    RuntimeJetScalar, TwoSeed, filtered_implicit_solve_runtime_scalar,
 };
 
 thread_local! {
@@ -22,10 +22,10 @@ thread_local! {
     /// allocator for the runtime-sized jet tape.
     static EMPIRICAL_BMS_THIRD_WORKSPACE: std::cell::RefCell<DynamicJetBatchWorkspace> =
         std::cell::RefCell::new(DynamicJetBatchWorkspace::new(1));
-    /// Per-worker empirical FLEX fourth-order workspace for the general-width
-    /// two-seed path.
-    static EMPIRICAL_BMS_FOURTH_WORKSPACE: std::cell::RefCell<DynamicJetArena> =
-        std::cell::RefCell::new(DynamicJetArena::new());
+    /// Per-worker empirical FLEX fourth-order pair workspace. A caller may
+    /// evaluate several `(u,v)` contractions in one row-plan traversal.
+    static EMPIRICAL_BMS_FOURTH_WORKSPACE: std::cell::RefCell<DynamicJetBatchWorkspace> =
+        std::cell::RefCell::new(DynamicJetBatchWorkspace::new(1));
 }
 
 #[derive(Clone)]
@@ -1536,6 +1536,81 @@ impl BernoulliMarginalSlopeFamily {
         if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
             return Err("non-finite empirical flexible row context in fourth contraction".into());
         }
+        if matches!(r, 4 | 8 | 12 | 18) {
+            let plan = self.empirical_bms_row_jet_plan(
+                row,
+                primary,
+                q,
+                b,
+                beta_h,
+                beta_w,
+                row_ctx.intercept,
+                grid,
+            )?;
+            let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
+            return match r {
+                4 => Self::empirical_fixed_fourth_contracted::<4>(&plan, &point, dir_u, dir_v),
+                8 => Self::empirical_fixed_fourth_contracted::<8>(&plan, &point, dir_u, dir_v),
+                12 => Self::empirical_fixed_fourth_contracted::<12>(&plan, &point, dir_u, dir_v),
+                18 => Self::empirical_fixed_fourth_contracted::<18>(&plan, &point, dir_u, dir_v),
+                _ => unreachable!("fixed empirical BMS width was matched above"),
+            };
+        }
+        let pairs = [(dir_u, dir_v)];
+        let mut contracted = self.empirical_flex_row_fourth_contracted_many_ordered(
+            row, primary, q, b, beta_h, beta_w, row_ctx, &pairs, grid,
+        )?;
+        Ok(contracted
+            .pop()
+            .expect("one empirical BMS direction pair produces one contraction"))
+    }
+
+    /// Evaluate an ordered batch of fourth contractions in one canonical
+    /// row-plan traversal. The shared order-two base is computed once; each
+    /// lane carries only its `(epsilon, delta, epsilon-delta)` coefficients.
+    pub(super) fn empirical_flex_row_fourth_contracted_many_ordered(
+        &self,
+        row: usize,
+        primary: &PrimarySlices,
+        q: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
+        grid: &EmpiricalZGrid,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        let r = primary.total;
+        if direction_pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some((lane, (direction_u, direction_v))) =
+            direction_pairs
+                .iter()
+                .enumerate()
+                .find(|(_, (direction_u, direction_v))| {
+                    direction_u.len() != r || direction_v.len() != r
+                })
+        {
+            return Err(format!(
+                "bernoulli empirical flex fourth contraction pair {lane} lengths ({},{}) != primary dimension {r}",
+                direction_u.len(),
+                direction_v.len()
+            ));
+        }
+        let is_zero = |direction: &Array1<f64>| direction.iter().all(|value| *value == 0.0);
+        if direction_pairs
+            .iter()
+            .all(|(direction_u, direction_v)| is_zero(direction_u) || is_zero(direction_v))
+        {
+            return Ok(direction_pairs
+                .iter()
+                .map(|_| Array2::<f64>::zeros((r, r)))
+                .collect());
+        }
+        if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
+            return Err("non-finite empirical flexible row context in fourth contraction".into());
+        }
         let plan = self.empirical_bms_row_jet_plan(
             row,
             primary,
@@ -1547,26 +1622,33 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        match r {
-            4 => return Self::empirical_fixed_fourth_contracted::<4>(&plan, &point, dir_u, dir_v),
-            8 => return Self::empirical_fixed_fourth_contracted::<8>(&plan, &point, dir_u, dir_v),
-            12 => {
-                return Self::empirical_fixed_fourth_contracted::<12>(&plan, &point, dir_u, dir_v);
-            }
-            18 => {
-                return Self::empirical_fixed_fourth_contracted::<18>(&plan, &point, dir_u, dir_v);
-            }
-            _ => {}
-        }
-        EMPIRICAL_BMS_FOURTH_WORKSPACE.with(|arena| {
-            let mut arena = arena.borrow_mut();
-            arena.reset();
-            let vars = arena.alloc_slice_fill_with(r, |axis| {
-                DynamicTwoSeed::seed(point[axis], axis, dir_u[axis], dir_v[axis], r, &arena)
+        EMPIRICAL_BMS_FOURTH_WORKSPACE.with(|workspace| {
+            let mut workspace = workspace.borrow_mut();
+            workspace.reset(direction_pairs.len());
+            let vars = workspace.alloc_slice_fill_with(r, |axis| {
+                DynamicTwoSeedBatch::seed_direction_pairs(
+                    point[axis],
+                    axis,
+                    r,
+                    &workspace,
+                    |lane| (direction_pairs[lane].0[axis], direction_pairs[lane].1[axis]),
+                )
             });
-            let jet = plan.evaluate(vars, 4, &arena)?;
-            Array2::from_shape_vec((r, r), jet.contracted_fourth().to_vec())
-                .map_err(|error| format!("empirical BMS fourth-contraction shape: {error}"))
+            let jet = plan.evaluate(vars, 4, &workspace)?;
+            direction_pairs
+                .iter()
+                .enumerate()
+                .map(|(lane, (direction_u, direction_v))| {
+                    if is_zero(direction_u) || is_zero(direction_v) {
+                        Ok(Array2::<f64>::zeros((r, r)))
+                    } else {
+                        Array2::from_shape_vec((r, r), jet.contracted_fourth(lane).to_vec())
+                            .map_err(|error| {
+                                format!("empirical BMS fourth-contraction shape: {error}")
+                            })
+                    }
+                })
+                .collect()
         })
     }
 
@@ -4239,6 +4321,7 @@ mod empirical_flex_jet_oracle_tests {
     //! flip and asserts the witness rejects it.
 
     use super::*;
+    use gam_math::jet_scalar::{DynamicJetArena, DynamicOneSeed, DynamicTwoSeed};
 
     /// Test handle bundling a family with one active deviation block and the
     /// primary layout / fixed coefficients the kernel reads.

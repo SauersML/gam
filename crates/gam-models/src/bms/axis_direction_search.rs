@@ -3636,15 +3636,18 @@ impl BernoulliMarginalSlopeFamily {
                     })
                     .collect::<Result<Vec<_>, String>>()?;
                 let row_ctx = Self::row_ctx(cache, row);
-                for (idx, (u_idx, v_idx)) in pair_indices.iter().copied().enumerate() {
-                    let mut fourth = self.row_primary_fourth_contracted(
-                        row,
-                        block_states,
-                        cache,
-                        row_ctx,
-                        &row_dirs[u_idx],
-                        &row_dirs[v_idx],
-                    )?;
+                let row_pairs = pair_indices
+                    .iter()
+                    .map(|&(u_idx, v_idx)| (&row_dirs[u_idx], &row_dirs[v_idx]))
+                    .collect::<Vec<_>>();
+                let fourths = self.row_primary_fourth_contracted_many(
+                    row,
+                    block_states,
+                    cache,
+                    row_ctx,
+                    &row_pairs,
+                )?;
+                for (idx, mut fourth) in fourths.into_iter().enumerate() {
                     if w != 1.0 {
                         fourth.mapv_inplace(|value| value * w);
                     }
@@ -3670,15 +3673,18 @@ impl BernoulliMarginalSlopeFamily {
                             })
                             .collect::<Result<Vec<_>, String>>()?;
                         let row_ctx = Self::row_ctx(cache, row);
-                        for (idx, (u_idx, v_idx)) in pair_indices.iter().copied().enumerate() {
-                            let mut fourth = self.row_primary_fourth_contracted(
-                                row,
-                                block_states,
-                                cache,
-                                row_ctx,
-                                &row_dirs[u_idx],
-                                &row_dirs[v_idx],
-                            )?;
+                        let row_pairs = pair_indices
+                            .iter()
+                            .map(|&(u_idx, v_idx)| (&row_dirs[u_idx], &row_dirs[v_idx]))
+                            .collect::<Vec<_>>();
+                        let fourths = self.row_primary_fourth_contracted_many(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &row_pairs,
+                        )?;
+                        for (idx, mut fourth) in fourths.into_iter().enumerate() {
                             if w != 1.0 {
                                 fourth.mapv_inplace(|value| value * w);
                             }
