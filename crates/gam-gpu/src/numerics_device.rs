@@ -33,65 +33,62 @@ pub const PROBIT_NUMERICS_CU: &str = r#"
 
 #define INV_SQRT_2PI 0.3989422804014327
 #define SQRT_2       1.4142135623730951
+#define LN_2         0.6931471805599453
 
 extern "C" __device__ __forceinline__ double erfcx_nonnegative(double x) {
-    if (!isfinite(x)) {
-        return (x > 0.0) ? 0.0 : (1.0 / 0.0);
-    }
-    if (x <= 0.0) return 1.0;
+    if (isnan(x) || x < 0.0) return nan("");
+    if (isinf(x)) return 0.0;
     if (x < 26.0) {
-        double xx = x * x;
-        if (xx > 700.0) xx = 700.0;
-        return exp(xx) * erfc(x);
+        return exp(x * x) * erfc(x);
     }
-    // 4-term asymptotic expansion of erfcx for large x.
+    // Six-correction asymptotic expansion of erfcx for large x. At x=26,
+    // the first omitted term is below 2e-17 relative to the leading term.
     double inv  = 1.0 / x;
     double inv2 = inv * inv;
     double poly = 1.0
-                - 0.5      * inv2
-                + 0.75     * inv2 * inv2
-                - 1.875    * inv2 * inv2 * inv2
-                + 6.5625   * inv2 * inv2 * inv2 * inv2;
+                + inv2 * (-0.5
+                + inv2 * (0.75
+                + inv2 * (-1.875
+                + inv2 * (6.5625
+                + inv2 * (-29.53125
+                + inv2 * 162.421875)))));
     const double inv_sqrt_pi = 0.5641895835477563; // 1/√π
     return inv * poly * inv_sqrt_pi;
 }
 
 extern "C" __device__ __forceinline__ double log_ndtr(double x) {
-    if (x ==  (1.0 / 0.0)) return 0.0;
-    if (x == -(1.0 / 0.0)) return -(1.0 / 0.0);
     if (isnan(x)) return x;
+    if (isinf(x)) return (x > 0.0) ? 0.0 : x;
     if (x < 0.0) {
         double u   = -x / SQRT_2;
         double ex  = erfcx_nonnegative(u);
-        if (ex < 1e-300) ex = 1e-300;
-        return -u * u + log(0.5 * ex);
+        return -u * u + log(ex) - LN_2;
     } else {
-        double c = 0.5 * erfc(-x / SQRT_2);
-        if (c < 1e-300) c = 1e-300;
-        if (c > 1.0)    c = 1.0;
-        return log(c);
+        double upper_tail = 0.5 * erfc(x / SQRT_2);
+        return log1p(-upper_tail);
     }
 }
 
 // Returns (log Φ(x), φ(x)/Φ(x)).
 extern "C" __device__ __forceinline__ void
 log_ndtr_and_mills(double x, double *log_cdf, double *lambda) {
-    if (x ==  (1.0 / 0.0)) { *log_cdf = 0.0;            *lambda = 0.0;            return; }
-    if (x == -(1.0 / 0.0)) { *log_cdf = -(1.0 / 0.0);   *lambda = (1.0 / 0.0);    return; }
     if (isnan(x))          { *log_cdf = x;              *lambda = x;              return; }
+    if (isinf(x)) {
+        if (x > 0.0) { *log_cdf = 0.0; *lambda = 0.0; }
+        else         { *log_cdf = x;   *lambda = -x;  }
+        return;
+    }
     if (x < 0.0) {
         double u   = -x / SQRT_2;
         double ex  = erfcx_nonnegative(u);
-        if (ex < 1e-300) ex = 1e-300;
-        *log_cdf = -u * u + log(0.5 * ex);
+        *log_cdf = -u * u + log(ex) - LN_2;
         const double sqrt_2_over_pi = 0.7978845608028654; // √(2/π)
         *lambda  = sqrt_2_over_pi / ex;
     } else {
-        double cdf = 0.5 * erfc(-x / SQRT_2);
-        if (cdf < 1e-300) cdf = 1e-300;
-        if (cdf > 1.0)    cdf = 1.0;
+        double upper_tail = 0.5 * erfc(x / SQRT_2);
+        double cdf = 1.0 - upper_tail;
         double pdf = INV_SQRT_2PI * exp(-0.5 * x * x);
-        *log_cdf = log(cdf);
+        *log_cdf = log1p(-upper_tail);
         *lambda  = pdf / cdf;
     }
 }

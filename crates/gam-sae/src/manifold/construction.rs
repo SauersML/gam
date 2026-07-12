@@ -87,7 +87,7 @@ pub(crate) const RANK_VANISHED_REL: f64 = 1.0e-9;
 /// alive, in which case #2258 charges the minimum non-degenerate rank one.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct ReconstructionRankClassification {
-    pub mp_detection_rank: usize,
+    pub mp_reconstruction_rank: usize,
     pub production_chargeable_rank: usize,
     pub top_signal: f64,
 }
@@ -133,23 +133,23 @@ pub(super) fn classify_reconstruction_rank(
     edge: f64,
     r_floor: f64,
 ) -> ReconstructionRankClassification {
-    let mut mp_detection_rank = 0usize;
+    let mut mp_reconstruction_rank = 0usize;
     let mut top_signal = 0.0_f64;
     for &signal in mu {
         if signal > edge {
-            mp_detection_rank += 1;
+            mp_reconstruction_rank += 1;
         }
         top_signal = top_signal.max(signal);
     }
-    let production_chargeable_rank = if mp_detection_rank > 0 {
-        mp_detection_rank
+    let production_chargeable_rank = if mp_reconstruction_rank > 0 {
+        mp_reconstruction_rank
     } else if top_signal > RANK_VANISHED_REL * r_floor {
         1
     } else {
         0
     };
     ReconstructionRankClassification {
-        mp_detection_rank,
+        mp_reconstruction_rank,
         production_chargeable_rank,
         top_signal,
     }
@@ -324,7 +324,7 @@ pub(crate) fn realised_rank_charge_dof(
         Ok((_, sv, _)) => sv,
         Err(e) => return Err(format!("realised_rank_charge_dof: recon svd: {e}")),
     };
-    let edge = crate::null_battery::mp_detection_floor(n_eff, p_out, r_floor)
+    let edge = crate::null_battery::mp_reconstruction_rank_edge(n_eff, p_out, r_floor)
         .map_err(|error| format!("realised_rank_charge_dof: {error}"))?;
     let mu = sv
         .iter()
@@ -352,7 +352,7 @@ pub(crate) fn realised_rank_charge_dof(
     //     featureless-residual birth must now pay ½·basis_edf·ln n it cannot
     //     earn), and the fit minted for the user carries its honest weak
     //     evidence instead of no model at all.
-    if rank.mp_detection_rank == 0 && rank.production_chargeable_rank == 1 {
+    if rank.mp_reconstruction_rank == 0 && rank.production_chargeable_rank == 1 {
         log::debug!(
             "realised_rank_charge_dof: below-detection-edge atom promoted to rank 1 — \
              top sv²/n_eff={:.6e} vs MP edge={edge:.6e} \

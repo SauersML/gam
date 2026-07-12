@@ -108,33 +108,34 @@ pub fn empirical_p_value(
     })
 }
 
-/// Marchenko–Pastur rank-detection threshold (#2262): the per-observation
+/// Marchenko–Pastur reconstruction-rank edge (#2262): the per-observation
 /// reconstruction energy `R·(1+√(p/n_eff))²` that the production rank charge
-/// uses to call a decoder direction MP-detected at `(n_eff, p, R)`. This is the
+/// uses to count a decoder direction in the hard reconstruction rank at
+/// `(n_eff, p, R)`. This is the
 /// identical closed-form noise edge the production rank charge thresholds on
 /// ([`crate::manifold::construction::realised_rank_charge_dof`], and its
 /// audit twin
-/// [`crate::manifold::wbic_audit::ReconSpectrum::mp_detection_edge`]) —
+/// [`crate::manifold::wbic_audit::ReconSpectrum::mp_reconstruction_rank_edge`]) —
 /// surfaced standalone so a caller can report the rank-charge diagnostic
 /// alongside a shape verdict without needing a fitted decoder Gram. It is not
 /// an information-theoretic detection limit and the predictive 2-D shape race
-/// does not threshold on it: a direction below this edge is MP-undetected by
-/// the production rank classifier, but that fact neither negates nor overrides
+/// does not threshold on it: a direction below this edge is omitted from the
+/// hard reconstruction-rank count, but that fact neither negates nor overrides
 /// a shape verdict.
-pub fn mp_detection_floor(n_eff: f64, p: f64, r_floor: f64) -> Result<f64, String> {
+pub fn mp_reconstruction_rank_edge(n_eff: f64, p: f64, r_floor: f64) -> Result<f64, String> {
     if !n_eff.is_finite() || n_eff <= 0.0 {
         return Err(format!(
-            "mp_detection_floor: n_eff must be finite and positive; got {n_eff}"
+            "mp_reconstruction_rank_edge: n_eff must be finite and positive; got {n_eff}"
         ));
     }
     if !p.is_finite() || p < 0.0 {
         return Err(format!(
-            "mp_detection_floor: p must be finite and non-negative; got {p}"
+            "mp_reconstruction_rank_edge: p must be finite and non-negative; got {p}"
         ));
     }
     if !r_floor.is_finite() || r_floor < 0.0 {
         return Err(format!(
-            "mp_detection_floor: r_floor must be finite and non-negative; got {r_floor}"
+            "mp_reconstruction_rank_edge: r_floor must be finite and non-negative; got {r_floor}"
         ));
     }
     // Zero residual dispersion has an exactly zero edge. Handle it before the
@@ -163,13 +164,13 @@ pub fn mp_detection_floor(n_eff: f64, p: f64, r_floor: f64) -> Result<f64, Strin
     let log_edge = r_floor.ln() + 2.0 * log_multiplier;
     if !log_edge.is_finite() || log_edge > f64::MAX.ln() {
         return Err(format!(
-            "mp_detection_floor: edge is not representable for n_eff={n_eff}, p={p}, r_floor={r_floor}"
+            "mp_reconstruction_rank_edge: edge is not representable for n_eff={n_eff}, p={p}, r_floor={r_floor}"
         ));
     }
     let recovered_edge = log_edge.exp();
     if !recovered_edge.is_finite() || recovered_edge == 0.0 {
         return Err(format!(
-            "mp_detection_floor: edge is not representable for n_eff={n_eff}, p={p}, r_floor={r_floor}"
+            "mp_reconstruction_rank_edge: edge is not representable for n_eff={n_eff}, p={p}, r_floor={r_floor}"
         ));
     }
     Ok(recovered_edge)
@@ -1353,7 +1354,15 @@ impl StableColumnLocation {
                 "centered draw is non-finite on column {axis}: {centered}"
             ));
         }
-        let value = self.mean[axis] + centered;
+        let composition_scale = self.offset_scale[axis].max(centered.abs());
+        let value = if composition_scale == 0.0 {
+            self.origin[axis]
+        } else {
+            let normalized_total = self.normalized_offset[axis]
+                * (self.offset_scale[axis] / composition_scale)
+                + centered / composition_scale;
+            normalized_total.mul_add(composition_scale, self.origin[axis])
+        };
         if !value.is_finite() {
             return Err(format!(
                 "absolute value is not representable on column {axis}"
@@ -2714,39 +2723,34 @@ pub fn summarize_null_distribution(
     let mut sorted = samples.clone();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let n = samples.len();
-    // Compute descriptive moments in a bounded chart. Directly summing ten
-    // perfectly valid values near 1e308 overflows even when their mean and
-    // variance are representable; raw squared deviations fail much earlier.
-    let scale = samples.iter().map(|value| value.abs()).fold(0.0, f64::max);
-    let (mean, sd, z) = if scale > 0.0 {
-        let scaled_mean = samples.iter().map(|value| value / scale).sum::<f64>() / n as f64;
-        let scaled_var = if n > 1 {
-            samples
-                .iter()
-                .map(|value| {
-                    let difference = value / scale - scaled_mean;
-                    difference * difference
-                })
-                .sum::<f64>()
-                / (n - 1) as f64
-        } else {
-            0.0
-        };
-        let scaled_sd = scaled_var.sqrt();
-        let mean = scaled_mean * scale;
-        let sd = scaled_sd * scale;
-        let z = if scaled_sd > 0.0 {
-            (observed / scale - scaled_mean) / scaled_sd
-        } else {
-            0.0
-        };
-        if !(mean.is_finite() && sd.is_finite() && z.is_finite()) {
-            return Err("null summary moments are not representable in float64".to_string());
-        }
-        (mean, sd, z)
+    let sample_matrix = ArrayView2::from_shape((n, 1), samples.as_slice()).map_err(|error| {
+        format!("could not construct null-summary sample view: {error}")
+    })?;
+    let location = stable_column_location(sample_matrix)?;
+    let mean = location.absolute_mean()?[0];
+    let mut residual_squares = ScaledSumSquares::default();
+    for &sample in &samples {
+        residual_squares.add(location.centered_value(sample, 0)?)?;
+    }
+    let sd = if n > 1 {
+        residual_squares.rms(n - 1)?
     } else {
-        (0.0, 0.0, 0.0)
+        0.0
     };
+    let observed_residual = location.centered_value(observed, 0)?;
+    let z = if sd > 0.0 {
+        observed_residual / sd
+    } else if observed_residual == 0.0 {
+        0.0
+    } else {
+        return Err(
+            "null z-score is undefined because a constant null differs from the observation"
+                .to_string(),
+        );
+    };
+    if !(mean.is_finite() && sd.is_finite() && z.is_finite()) {
+        return Err("null summary moments are not representable in float64".to_string());
+    }
     Ok(NullSummary {
         kind,
         tail,

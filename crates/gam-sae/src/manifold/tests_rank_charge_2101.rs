@@ -683,9 +683,9 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
     let base_spectrum = spectrum(&base_decoder);
     let d0 = d_eff(&base_decoder);
     assert!(
-        base_spectrum.mp_detection_rank() >= 1 && d0 > 0.0,
+        base_spectrum.mp_reconstruction_rank() >= 1 && d0 > 0.0,
         "resolved circle must begin above the MP edge; rank={}, d_eff={d0}",
-        base_spectrum.mp_detection_rank(),
+        base_spectrum.mp_reconstruction_rank(),
     );
 
     // First certify the continuous part of the scaling law. The edge and EDF are
@@ -695,8 +695,8 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
         let scaled = base_decoder.mapv(|v| c * v);
         let scaled_spectrum = spectrum(&scaled);
         assert_eq!(
-            scaled_spectrum.mp_detection_edge(),
-            base_spectrum.mp_detection_edge(),
+            scaled_spectrum.mp_reconstruction_rank_edge(),
+            base_spectrum.mp_reconstruction_rank_edge(),
             "fixed dispersion and aspect ratio imply a fixed MP edge"
         );
         assert_eq!(
@@ -711,7 +711,9 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
             .enumerate()
         {
             let expected = c * c * mu_0;
-            let tolerance = 512.0 * f64::EPSILON * expected.max(base_spectrum.mp_detection_edge());
+            let tolerance = 512.0
+                * f64::EPSILON
+                * expected.max(base_spectrum.mp_reconstruction_rank_edge());
             assert!(
                 (mu_c - expected).abs() <= tolerance,
                 "decoder scaling law failed on mode {axis}: \
@@ -722,7 +724,7 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
         let old_proxy_shift = 0.5 * (nc.ln() - n0.ln());
         eprintln!(
             "[#2099 scale law] c={c:>4}: hard rank={} | old ½log‖B‖² shift={old_proxy_shift:+.4}",
-            scaled_spectrum.mp_detection_rank(),
+            scaled_spectrum.mp_reconstruction_rank(),
         );
         assert!(
             old_proxy_shift.abs() > 0.1,
@@ -742,7 +744,7 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
         .iter()
         .copied()
         .filter(|&mu| mu > 0.0)
-        .map(|mu| (base_spectrum.mp_detection_edge() / mu).sqrt())
+        .map(|mu| (base_spectrum.mp_reconstruction_rank_edge() / mu).sqrt())
         .collect();
     hard_transitions.sort_by(f64::total_cmp);
     assert!(
@@ -796,7 +798,7 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
         let hard_rank = base_spectrum
             .reconstruction_energies()
             .iter()
-            .filter(|&&mu| c2 * mu > base_spectrum.mp_detection_edge())
+            .filter(|&&mu| c2 * mu > base_spectrum.mp_reconstruction_rank_edge())
             .count();
         let expected_rank = if hard_rank > 0 {
             hard_rank

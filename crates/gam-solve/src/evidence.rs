@@ -1033,7 +1033,9 @@ impl GaussianMixtureFit {
 /// log-normalizing constant `−½(d log 2π + log|Σ|)`.
 #[derive(Debug, Clone)]
 struct GaussianComponentEval {
-    mean: Array1<f64>,
+    residual_origin: Array1<f64>,
+    residual_scale: Array1<f64>,
+    residual_normalized_offset: Array1<f64>,
     precision: Array2<f64>,
     log_norm: f64,
     d: usize,
@@ -1042,6 +1044,9 @@ struct GaussianComponentEval {
 impl GaussianComponentEval {
     fn factor(mean: ArrayView1<'_, f64>, cov: &Array2<f64>) -> Result<Self, String> {
         let d = mean.len();
+        if mean.iter().any(|value| !value.is_finite()) {
+            return Err("mixture component mean must be finite".to_string());
+        }
         if cov.nrows() != d || cov.ncols() != d {
             return Err(format!(
                 "mixture component covariance must be {d}x{d}, got {}x{}",
@@ -1061,7 +1066,13 @@ impl GaussianComponentEval {
                 ));
             }
             log_det += ev.ln();
-            inv_evals[idx] = 1.0 / ev;
+            let inverse = ev.recip();
+            if !inverse.is_finite() {
+                return Err(format!(
+                    "mixture component precision is not representable: eigenvalue {idx} is {ev:.3e}"
+                ));
+            }
+            inv_evals[idx] = inverse;
         }
         // Σ⁻¹ = V diag(1/λ) Vᵀ.
         let mut precision = Array2::<f64>::zeros((d, d));
@@ -1075,21 +1086,23 @@ impl GaussianComponentEval {
             }
         }
         let log_norm = -0.5 * (d as f64 * (2.0 * std::f64::consts::PI).ln() + log_det);
+        if precision.iter().any(|value| !value.is_finite()) || !log_norm.is_finite() {
+            return Err("mixture component factorization produced non-finite precision or log normalizer".to_string());
+        }
         Ok(Self {
-            mean: mean.to_owned(),
+            residual_origin: mean.to_owned(),
+            residual_scale: Array1::zeros(d),
+            residual_normalized_offset: Array1::zeros(d),
             precision,
             log_norm,
             d,
         })
     }
 
-    fn isotropic(mean: Array1<f64>, variance: f64) -> Result<Self, String> {
-        let d = mean.len();
+    fn isotropic(charts: &[StableScalarMeanChart], variance: f64) -> Result<Self, String> {
+        let d = charts.len();
         if d == 0 {
             return Err("isotropic Gaussian density requires positive dimension".to_string());
-        }
-        if mean.iter().any(|value| !value.is_finite()) {
-            return Err("isotropic Gaussian mean must be finite".to_string());
         }
         if !(variance.is_finite() && variance > 0.0) {
             return Err(format!(
@@ -1111,7 +1124,11 @@ impl GaussianComponentEval {
             return Err("isotropic Gaussian log normalizer is non-finite".to_string());
         }
         Ok(Self {
-            mean,
+            residual_origin: Array1::from_iter(charts.iter().map(|chart| chart.origin)),
+            residual_scale: Array1::from_iter(charts.iter().map(|chart| chart.scale)),
+            residual_normalized_offset: Array1::from_iter(
+                charts.iter().map(|chart| chart.normalized_offset),
+            ),
             precision,
             log_norm,
             d,
@@ -1120,22 +1137,35 @@ impl GaussianComponentEval {
 
     #[inline]
     fn log_density(&self, y: ArrayView1<'_, f64>) -> f64 {
-        let pv = self.precision_times_residual(y);
+        let residual = self.residual(y);
+        let pv = self.precision_times_residual(&residual);
         let mut quad = 0.0_f64;
         for c in 0..self.d {
-            quad += (y[c] - self.mean[c]) * pv[c];
+            quad += residual[c] * pv[c];
         }
         self.log_norm - 0.5 * quad
     }
 
+    #[inline]
+    fn residual(&self, y: ArrayView1<'_, f64>) -> Vec<f64> {
+        let mut residual = vec![0.0_f64; self.d];
+        for axis in 0..self.d {
+            residual[axis] = (-self.residual_normalized_offset[axis]).mul_add(
+                self.residual_scale[axis],
+                y[axis] - self.residual_origin[axis],
+            );
+        }
+        residual
+    }
+
     /// `Σ⁻¹ (y − μ)`.
     #[inline]
-    fn precision_times_residual(&self, y: ArrayView1<'_, f64>) -> Vec<f64> {
+    fn precision_times_residual(&self, residual: &[f64]) -> Vec<f64> {
         let mut out = vec![0.0_f64; self.d];
         for a in 0..self.d {
             let mut acc = 0.0_f64;
             for b in 0..self.d {
-                acc += self.precision[[a, b]] * (y[b] - self.mean[b]);
+                acc += self.precision[[a, b]] * residual[b];
             }
             out[a] = acc;
         }
@@ -2750,11 +2780,20 @@ pub fn union_responsibility_split(
             &fit.covariances[j],
         )?);
     }
-    let log_w: Vec<f64> = fit
+    let log_w = fit
         .weights
         .iter()
-        .map(|w| w.max(f64::MIN_POSITIVE).ln())
-        .collect();
+        .enumerate()
+        .map(|(component, &weight)| {
+            if weight.is_finite() && weight > 0.0 {
+                Ok(weight.ln())
+            } else {
+                Err(format!(
+                    "union split received invalid fitted weight {weight} for component {component}"
+                ))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     for i in 0..n {
         let row = data.row(i);
         let mut best_j = 0usize;
@@ -2765,6 +2804,11 @@ pub fn union_responsibility_split(
                 best_lt = lt;
                 best_j = j;
             }
+        }
+        if !best_lt.is_finite() {
+            return Err(format!(
+                "union split produced no finite component score at row {i}"
+            ));
         }
         groups[best_j].push(i);
     }
@@ -3145,9 +3189,72 @@ fn fit_union_component_density(
     })
 }
 
-/// Maximum-likelihood isotropic Gaussian fit. Coordinates are centered at each
-/// column's finite range midpoint before reduction, avoiding avoidable overflow
-/// and loss of translation precision at large common offsets.
+#[derive(Debug, Clone, Copy)]
+struct StableScalarMeanChart {
+    origin: f64,
+    scale: f64,
+    normalized_offset: f64,
+}
+
+impl StableScalarMeanChart {
+    #[inline]
+    fn centered(self, value: f64) -> Result<f64, String> {
+        let relative = value - self.origin;
+        let centered = (-self.normalized_offset).mul_add(self.scale, relative);
+        if centered.is_finite() {
+            Ok(centered)
+        } else {
+            Err("union isotropic point residual is not representable".to_string())
+        }
+    }
+}
+
+/// Range-safe and translation-accurate scalar mean chart. The normalized mean
+/// offset is retained separately from the rounded absolute mean so residuals
+/// use `(x-origin)-offset` rather than losing a fractional offset at a large
+/// common translation. FMA also lets a subnormal offset affect the correctly
+/// rounded absolute mean without first rounding that offset to zero.
+fn stable_scalar_mean_chart(values: ArrayView1<'_, f64>) -> Result<StableScalarMeanChart, String> {
+    if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+        return Err("stable scalar mean requires finite nonempty values".to_string());
+    }
+    let anchor = values[0];
+    let anchor_chart_is_representable = values
+        .iter()
+        .all(|&value| (value - anchor).is_finite());
+    let origin = if anchor_chart_is_representable {
+        anchor
+    } else {
+        0.0
+    };
+    let scale = values
+        .iter()
+        .map(|&value| (value - origin).abs())
+        .fold(0.0_f64, f64::max);
+    if scale == 0.0 {
+        return Ok(StableScalarMeanChart {
+            origin,
+            scale: 0.0,
+            normalized_offset: 0.0,
+        });
+    }
+    let normalized = values
+        .iter()
+        .map(|&value| (value - origin) / scale)
+        .collect::<Vec<_>>();
+    let normalized_offset = pairwise_sum(&normalized) / values.len() as f64;
+    let mean = normalized_offset.mul_add(scale, origin);
+    if !(normalized_offset.is_finite() && mean.is_finite()) {
+        return Err("union isotropic point mean is not representable".to_string());
+    }
+    Ok(StableScalarMeanChart {
+        origin,
+        scale,
+        normalized_offset,
+    })
+}
+
+/// Maximum-likelihood isotropic Gaussian fit in stable per-column mean charts.
 fn fit_isotropic_gaussian_component(
     group: ArrayView2<'_, f64>,
     covariance_floor: f64,
@@ -3163,8 +3270,6 @@ fn fit_isotropic_gaussian_component(
         ));
     }
 
-    let mut minima = Array1::from_elem(d, f64::INFINITY);
-    let mut maxima = Array1::from_elem(d, f64::NEG_INFINITY);
     for row in group.rows() {
         for axis in 0..d {
             let value = row[axis];
@@ -3173,29 +3278,13 @@ fn fit_isotropic_gaussian_component(
                     "union isotropic point data contains non-finite coordinate {value}"
                 ));
             }
-            minima[axis] = minima[axis].min(value);
-            maxima[axis] = maxima[axis].max(value);
         }
     }
 
-    let mut origin = Array1::<f64>::zeros(d);
-    let mut mean_offset = Array1::<f64>::zeros(d);
-    let mut mean = Array1::<f64>::zeros(d);
+    let mut charts = Vec::with_capacity(d);
     for axis in 0..d {
-        origin[axis] = 0.5 * minima[axis] + 0.5 * maxima[axis];
-        let contributions = group
-            .column(axis)
-            .iter()
-            .map(|&value| (value - origin[axis]) / n as f64)
-            .collect::<Vec<_>>();
-        mean_offset[axis] = pairwise_sum(&contributions);
-        mean[axis] = origin[axis] + mean_offset[axis];
-        if !mean[axis].is_finite() {
-            return Err("union isotropic point mean is non-finite".to_string());
-        }
-        // Residuals and the eventual evaluator must refer to the same rounded,
-        // representable mean parameter.
-        mean_offset[axis] = mean[axis] - origin[axis];
+        let chart = stable_scalar_mean_chart(group.column(axis))?;
+        charts.push(chart);
     }
 
     let scalar_count = n
@@ -3205,10 +3294,7 @@ fn fit_isotropic_gaussian_component(
     let mut residual_scale = 0.0_f64;
     for row in group.rows() {
         for axis in 0..d {
-            let residual = (row[axis] - origin[axis]) - mean_offset[axis];
-            if !residual.is_finite() {
-                return Err("union isotropic point residual is non-finite".to_string());
-            }
+            let residual = charts[axis].centered(row[axis])?;
             residual_scale = residual_scale.max(residual.abs());
             residuals.push(residual);
         }
@@ -3227,7 +3313,7 @@ fn fit_isotropic_gaussian_component(
         }
         unconstrained.max(covariance_floor)
     };
-    GaussianComponentEval::isotropic(mean, variance)
+    GaussianComponentEval::isotropic(&charts, variance)
 }
 
 fn score_union_components(

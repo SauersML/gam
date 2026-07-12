@@ -94,8 +94,6 @@ use gam_solve::mixture_link::{
 
 use gam_solve::pirls::LinearInequalityConstraints;
 
-use crate::probability::erfcx_nonnegative;
-
 use crate::probability::{normal_cdf, normal_pdf};
 
 use crate::fit_orchestration::drivers::{

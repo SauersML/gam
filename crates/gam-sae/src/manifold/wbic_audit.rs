@@ -151,7 +151,7 @@ impl ReconSpectrum {
     }
 
     /// Validated Marchenko–Pastur detection edge.
-    pub fn mp_detection_edge(&self) -> f64 {
+    pub fn mp_reconstruction_rank_edge(&self) -> f64 {
         self.edge
     }
 
@@ -178,8 +178,8 @@ impl ReconSpectrum {
     /// This is a diagnostic detection rank, not the production chargeable rank:
     /// an alive decoder can have detection rank zero and still be charged rank
     /// one by [`Self::production_chargeable_rank`].
-    pub fn mp_detection_rank(&self) -> usize {
-        self.rank_classification().mp_detection_rank
+    pub fn mp_reconstruction_rank(&self) -> usize {
+        self.rank_classification().mp_reconstruction_rank
     }
 
     /// #2258 production CHARGEABLE rank — the hard MP detection count,
@@ -225,8 +225,8 @@ impl ReconSpectrum {
     /// `n_eff`). This satisfies inert-row invariance — appending rows on which the
     /// atom's gate is OFF adds 0 to `Σa²` and so must not change the charge — which
     /// `log n` violates. Floored at `N_eff=1` to keep the log non-negative.
-    pub fn mp_detection_charge(&self) -> f64 {
-        0.5 * self.mp_detection_rank() as f64 * self.basis_edf * self.n_eff.max(1.0).ln()
+    pub fn mp_reconstruction_rank_charge(&self) -> f64 {
+        0.5 * self.mp_reconstruction_rank() as f64 * self.basis_edf * self.n_eff.max(1.0).ln()
     }
 
     /// Actual production Laplace–BIC charge
@@ -321,7 +321,7 @@ pub fn recon_spectrum(
         Ok((_, sv, _)) => sv,
         Err(e) => return Err(format!("recon_spectrum: recon svd: {e}")),
     };
-    let edge = crate::null_battery::mp_detection_floor(n_eff, p_out, r_floor)
+    let edge = crate::null_battery::mp_reconstruction_rank_edge(n_eff, p_out, r_floor)
         .map_err(|error| format!("recon_spectrum: {error}"))?;
     let mu = sv
         .iter()
@@ -365,7 +365,7 @@ pub struct AuditRow {
     /// Rows the atom was fit on.
     pub n: usize,
     /// Integer count of directions above the MP detection edge.
-    pub mp_detection_rank: usize,
+    pub mp_reconstruction_rank: usize,
     /// Integer rank the production criterion actually charges, including #2258
     /// alive-below-edge promotion.
     pub production_chargeable_rank: usize,
@@ -375,7 +375,7 @@ pub struct AuditRow {
     pub basis_edf: f64,
     /// Theoretical hard-MP detection charge
     /// `½·rank_mp·basis_edf·log N_eff`.
-    pub mp_detection_charge: f64,
+    pub mp_reconstruction_rank_charge: f64,
     /// Actual production rank / BIC charge
     /// `½·rank_chargeable·basis_edf·log N_eff`.
     pub production_charge: f64,
@@ -392,7 +392,7 @@ pub struct AuditRow {
 impl AuditRow {
     /// Price a named atom from its reconstruction spectrum.
     pub fn from_spectrum(name: impl Into<String>, spec: &ReconSpectrum, n: usize) -> Self {
-        let mp_detection_charge = spec.mp_detection_charge();
+        let mp_reconstruction_rank_charge = spec.mp_reconstruction_rank_charge();
         let production_charge = spec.production_charge();
         let wbic_charge = spec.wbic_charge();
         let production_minus_wbic = production_charge - wbic_charge;
@@ -404,11 +404,11 @@ impl AuditRow {
         Self {
             name: name.into(),
             n,
-            mp_detection_rank: spec.mp_detection_rank(),
+            mp_reconstruction_rank: spec.mp_reconstruction_rank(),
             production_chargeable_rank: spec.production_chargeable_rank(),
             rank_soft: spec.rank_soft(),
             basis_edf: spec.basis_edf(),
-            mp_detection_charge,
+            mp_reconstruction_rank_charge,
             production_charge,
             wbic_charge,
             production_minus_wbic,
@@ -432,11 +432,11 @@ pub fn render_audit_table(rows: &[AuditRow]) -> String {
             "{:<23} {:>3} {:>6} {:>6} {:>7.3} {:>8.3} {:>7.3} {:>7.3} {:>7.3} {:>10.3} {:>7.3}\n",
             r.name,
             r.n,
-            r.mp_detection_rank,
+            r.mp_reconstruction_rank,
             r.production_chargeable_rank,
             r.rank_soft,
             r.basis_edf,
-            r.mp_detection_charge,
+            r.mp_reconstruction_rank_charge,
             r.production_charge,
             r.wbic_charge,
             r.production_minus_wbic,
@@ -699,11 +699,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(spec.mp_detection_rank(), 0);
+        assert_eq!(spec.mp_reconstruction_rank(), 0);
         assert_eq!(spec.production_chargeable_rank(), 1);
         assert_eq!(d_prod, spec.basis_edf());
         assert_eq!(spec.production_charge(), 0.5 * d_prod * n_eff.ln());
-        assert_eq!(spec.mp_detection_charge(), 0.0);
+        assert_eq!(spec.mp_reconstruction_rank_charge(), 0.0);
     }
 
     /// A zero MP edge does not make a zero-energy direction count as one. At the
@@ -715,9 +715,9 @@ mod tests {
         let gram = Array2::<f64>::eye(2);
         let zero = Array2::<f64>::zeros((2, 2));
         let zero_spec = recon_spectrum(&gram, &zero, 2.0, 2.0, 0.0, 0.0, None).unwrap();
-        assert_eq!(zero_spec.mp_detection_edge(), 0.0);
+        assert_eq!(zero_spec.mp_reconstruction_rank_edge(), 0.0);
         assert_eq!(zero_spec.rank_soft(), 0.0);
-        assert_eq!(zero_spec.mp_detection_rank(), 0);
+        assert_eq!(zero_spec.mp_reconstruction_rank(), 0);
         assert_eq!(zero_spec.production_chargeable_rank(), 0);
         assert_eq!(zero_spec.wbic_charge(), 0.0);
 
@@ -725,9 +725,9 @@ mod tests {
         one_direction[[0, 0]] = 1.0;
         let positive_spec =
             recon_spectrum(&gram, &one_direction, 2.0, 2.0, 0.0, 0.0, None).unwrap();
-        assert_eq!(positive_spec.mp_detection_edge(), 0.0);
+        assert_eq!(positive_spec.mp_reconstruction_rank_edge(), 0.0);
         assert_eq!(positive_spec.rank_soft(), 1.0);
-        assert_eq!(positive_spec.mp_detection_rank(), 1);
+        assert_eq!(positive_spec.mp_reconstruction_rank(), 1);
         assert_eq!(positive_spec.production_chargeable_rank(), 1);
     }
 
@@ -761,7 +761,7 @@ mod tests {
         let energy = spec.reconstruction_energies()[0];
         assert!(energy.is_finite());
         assert!((energy / 1.0e200 - 1.0).abs() < 1.0e-12);
-        assert_eq!(spec.mp_detection_rank(), 1);
+        assert_eq!(spec.mp_reconstruction_rank(), 1);
         assert_eq!(spec.production_chargeable_rank(), 1);
 
         let d_prod = super::super::construction::realised_rank_charge_dof(
@@ -851,7 +851,7 @@ mod tests {
         assert_eq!(
             recon_spectrum(&gram, &decoder, 0.0, 3.0, 1.0, 0.0, None)
                 .unwrap()
-                .mp_detection_edge(),
+                .mp_reconstruction_rank_edge(),
             0.0
         );
     }
@@ -1130,30 +1130,30 @@ mod tests {
         // (c) the weak near-edge circle is not MP-detected but is production-
         // chargeable. The two ranks must remain separately visible.
         assert!(
-            near.mp_detection_rank == 0
+            near.mp_reconstruction_rank == 0
                 && near.production_chargeable_rank == 1
                 && near.rank_soft > 0.0
-                && near.mp_detection_charge == 0.0
+                && near.mp_reconstruction_rank_charge == 0.0
                 && near.production_charge > 0.0,
             "weak near-edge circle must distinguish MP non-detection from production \
              chargeability: mp={} prod={} soft={:.3}",
-            near.mp_detection_rank,
+            near.mp_reconstruction_rank,
             near.production_chargeable_rank,
             near.rank_soft
         );
         // (d) A fitted noise decoder is alive even when MP-undetected; an exactly
         // vanished decoder, and only that fixture, stays production rank zero.
         assert!(
-            blend.mp_detection_rank == 0
+            blend.mp_reconstruction_rank == 0
                 && blend.production_chargeable_rank == 1
                 && blend.rank_soft < 0.3,
             "noise fit must distinguish MP rank from production rank: \
              mp={} prod={} soft={:.3}",
-            blend.mp_detection_rank,
+            blend.mp_reconstruction_rank,
             blend.production_chargeable_rank,
             blend.rank_soft
         );
-        assert_eq!(vanished.mp_detection_rank, 0);
+        assert_eq!(vanished.mp_reconstruction_rank, 0);
         assert_eq!(vanished.production_chargeable_rank, 0);
         assert_eq!(vanished.production_charge, 0.0);
         assert_eq!(vanished.wbic_charge, 0.0);
@@ -1259,7 +1259,7 @@ mod tests {
             basis_edf: 3.0,
             n_eff: 50.0,
         };
-        assert_eq!(spec.mp_detection_rank(), 1);
+        assert_eq!(spec.mp_reconstruction_rank(), 1);
         assert_eq!(spec.production_chargeable_rank(), 1);
         let d_eff = spec.production_chargeable_rank() as f64 * spec.basis_edf(); // 3.0
         let expected = 0.5 * d_eff * (50.0_f64).ln();
@@ -1332,10 +1332,11 @@ mod tests {
         }
         let disk = spectrum_from_fit(data.view(), &w, &phi, 0.12 * 0.12, 0.0, None).unwrap();
         assert!(
-            disk.mp_detection_rank() > 0 && disk.rank_soft() < disk.mp_detection_rank() as f64,
+            disk.mp_reconstruction_rank() > 0
+                && disk.rank_soft() < disk.mp_reconstruction_rank() as f64,
             "disk fixture must have above-edge directions the tempered count discounts: \
              hard={} soft={:.3}",
-            disk.mp_detection_rank(),
+            disk.mp_reconstruction_rank(),
             disk.rank_soft()
         );
         assert!(

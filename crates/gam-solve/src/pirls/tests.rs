@@ -9,7 +9,6 @@ pub(crate) use super::*;
 
 #[cfg(test)]
 mod tests {
-    use super::log_link_working_state::{ETA_CLAMP, MIN_MU};
     use super::loop_driver::default_beta_guess_external;
     use super::reweight::madsen_lm_accept_factor;
     use super::{
@@ -21,9 +20,9 @@ mod tests {
         observed_weight_dispatch, observed_weight_noncanonical, select_active_set_release,
         should_log_pirls_decision_summary, should_use_sparse_native_pirls,
         solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
-        tweedie_log_weight_mu_power, update_glmvectors, variance_jet_for_weight_family,
-        write_gamma_log_working_state, write_negative_binomial_log_working_state,
-        write_poisson_log_working_state, write_tweedie_log_working_state,
+        update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state,
+        write_negative_binomial_log_working_state, write_poisson_log_working_state,
+        write_tweedie_log_working_state,
     };
     use crate::active_set;
     use crate::estimate::EstimationError;
@@ -34,7 +33,7 @@ mod tests {
     use gam_math::probability::standard_normal_quantile;
     use gam_problem::{
         Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkComponent, LinkFunction,
-        LogSmoothingParamsView, MIN_WEIGHT, MixtureLinkSpec, ResponseFamily, StandardLink,
+        LogSmoothingParamsView, MixtureLinkSpec, ResponseFamily, StandardLink,
     };
 
     // Full-operator Firth/Jeffreys diagnostics reference (#1575): bit-identical to
@@ -352,326 +351,383 @@ mod tests {
         assert!(madsen_lm_accept_factor(0.99) >= 1.0 / 3.0 - 1e-15);
     }
 
-    /// Outputs of a single log-link working-state write: `mu`, `weights`, `z`,
-    /// and the four derivative buffers. Used by the parity test to compare the
-    /// unified engine against the independent pre-unification reference math.
-    pub(crate) struct LogLinkWorkingOutputs {
-        pub(crate) mu: Array1<f64>,
-        pub(crate) weights: Array1<f64>,
-        pub(crate) z: Array1<f64>,
-        pub(crate) c: Array1<f64>,
-        pub(crate) d: Array1<f64>,
-        pub(crate) dmu_deta: Array1<f64>,
-        pub(crate) d2mu_deta2: Array1<f64>,
-        pub(crate) d3mu_deta3: Array1<f64>,
-    }
-
-    impl LogLinkWorkingOutputs {
-        pub(crate) fn zeros(n: usize) -> Self {
-            Self {
-                mu: Array1::zeros(n),
-                weights: Array1::zeros(n),
-                z: Array1::zeros(n),
-                c: Array1::zeros(n),
-                d: Array1::zeros(n),
-                dmu_deta: Array1::zeros(n),
-                d2mu_deta2: Array1::zeros(n),
-                d3mu_deta3: Array1::zeros(n),
-            }
+    #[test]
+    fn log_link_edges_are_exact_and_tiny_weights_are_not_floored() {
+        let eta = array![-700.0, 0.0, 700.0, -2.0];
+        let y = array![1.0, 1.0, 1.0, 0.0];
+        let prior = array![1.0, 1e-300, 1.0, 0.0];
+        let n = eta.len();
+        let mut mu = Array1::zeros(n);
+        let mut weights = Array1::zeros(n);
+        let mut z = Array1::zeros(n);
+        let mut c = Array1::zeros(n);
+        let mut d = Array1::zeros(n);
+        let mut d1 = Array1::zeros(n);
+        let mut d2 = Array1::zeros(n);
+        let mut d3 = Array1::zeros(n);
+        write_poisson_log_working_state(
+            y.view(),
+            &eta,
+            prior.view(),
+            &mut mu,
+            &mut weights,
+            &mut z,
+            Some(WorkingDerivativeBuffersMut {
+                c: &mut c,
+                d: &mut d,
+                dmu_deta: &mut d1,
+                d2mu_deta2: &mut d2,
+                d3mu_deta3: &mut d3,
+            }),
+        )
+        .expect("closed log-link domain must be represented exactly");
+        for i in 0..n {
+            assert_eq!(mu[i].to_bits(), eta[i].exp().to_bits());
+            assert_eq!(d1[i].to_bits(), mu[i].to_bits());
+            assert_eq!(d2[i].to_bits(), mu[i].to_bits());
+            assert_eq!(d3[i].to_bits(), mu[i].to_bits());
+            assert!(z[i].is_finite());
         }
-
-        pub(crate) fn assert_matches(&self, other: &Self, family: &str) {
-            for (name, lhs, rhs) in [
-                ("mu", &self.mu, &other.mu),
-                ("weights", &self.weights, &other.weights),
-                ("z", &self.z, &other.z),
-                ("c", &self.c, &other.c),
-                ("d", &self.d, &other.d),
-                ("dmu_deta", &self.dmu_deta, &other.dmu_deta),
-                ("d2mu_deta2", &self.d2mu_deta2, &other.d2mu_deta2),
-                ("d3mu_deta3", &self.d3mu_deta3, &other.d3mu_deta3),
-            ] {
-                for (i, (a, b)) in lhs.iter().zip(rhs.iter()).enumerate() {
-                    assert_eq!(
-                        a.to_bits(),
-                        b.to_bits(),
-                        "{family}: buffer `{name}` row {i} diverged from the \
-                         pre-unification reference: engine={a:?} reference={b:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Representative `(eta, y, prior_weight)` rows exercising the shared engine
-    /// edge cases: ordinary rows, the `eta` clamp (`|eta| > 700`), the
-    /// `MIN_WEIGHT` floor (tiny prior weight), and a zero-prior dropped row.
-    pub(crate) fn log_link_parity_rows() -> (Array1<f64>, Array1<f64>, Array1<f64>) {
-        let eta = array![-2.3, 0.0, 1.7, 4.2, -800.0, 900.0, -3.0, 0.5];
-        let y = array![0.0, 1.0, 3.0, 12.0, 0.0, 25.0, 2.0, 1.0];
-        // Row 6 carries a tiny prior weight to trip the MIN_WEIGHT floor; row 7
-        // carries zero prior weight to exercise the dropped-row branch.
-        let prior = array![1.0, 1.0, 2.0, 0.5, 1.0, 1.0, 1e-13, 0.0];
-        (eta, y, prior)
-    }
-
-    /// Pre-unification Poisson reference: `V(mu) = mu`, canonical-link curvature.
-    pub(crate) fn reference_poisson(
-        eta: &Array1<f64>,
-        y: &Array1<f64>,
-        prior: &Array1<f64>,
-    ) -> LogLinkWorkingOutputs {
-        let mut out = LogLinkWorkingOutputs::zeros(eta.len());
-        for i in 0..eta.len() {
-            let eta_raw = eta[i];
-            let eta_i = eta_raw.clamp(-ETA_CLAMP, ETA_CLAMP);
-            let mu_i = eta_i.exp().max(MIN_MU);
-            out.mu[i] = mu_i;
-            let raw_weight = prior[i].max(0.0) * mu_i;
-            let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
-            out.weights[i] = if raw_weight > 0.0 {
-                raw_weight.max(MIN_WEIGHT)
-            } else {
-                0.0
-            };
-            out.z[i] = eta_i + (y[i] - mu_i) / mu_i;
-            out.dmu_deta[i] = mu_i;
-            out.d2mu_deta2[i] = mu_i;
-            out.d3mu_deta3[i] = mu_i;
-            if !(floor_active || eta_raw != eta_i) {
-                out.c[i] = raw_weight;
-                out.d[i] = raw_weight;
-            }
-        }
-        out
-    }
-
-    /// Pre-unification Gamma reference: weight `prior * shape`, unfloored, no
-    /// curvature, `mu`-jet never zeroed on clamp.
-    pub(crate) fn reference_gamma(
-        eta: &Array1<f64>,
-        y: &Array1<f64>,
-        prior: &Array1<f64>,
-        shape: f64,
-    ) -> LogLinkWorkingOutputs {
-        let mut out = LogLinkWorkingOutputs::zeros(eta.len());
-        for i in 0..eta.len() {
-            let eta_i = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP);
-            let mu_i = eta_i.exp().max(MIN_MU);
-            out.mu[i] = mu_i;
-            out.weights[i] = prior[i].max(0.0) * shape;
-            out.z[i] = eta_i + (y[i] - mu_i) / mu_i;
-            out.dmu_deta[i] = mu_i;
-            out.d2mu_deta2[i] = mu_i;
-            out.d3mu_deta3[i] = mu_i;
-        }
-        out
-    }
-
-    /// Pre-unification Tweedie reference: weight `prior * mu^(2-p) / phi`, the
-    /// `mu`-jet zeroed on clamp, curvature `(2-p) * w`, `(2-p)^2 * w`.
-    pub(crate) fn reference_tweedie(
-        eta: &Array1<f64>,
-        y: &Array1<f64>,
-        prior: &Array1<f64>,
-        p: f64,
-        phi: f64,
-    ) -> LogLinkWorkingOutputs {
-        let exponent = 2.0 - p;
-        let mut out = LogLinkWorkingOutputs::zeros(eta.len());
-        for i in 0..eta.len() {
-            let eta_raw = eta[i];
-            let eta_i = eta_raw.clamp(-ETA_CLAMP, ETA_CLAMP);
-            let clamp_active = eta_raw != eta_i;
-            let mu_i = eta_i.exp().max(MIN_MU);
-            out.mu[i] = mu_i;
-            let raw_weight = prior[i].max(0.0) * tweedie_log_weight_mu_power(mu_i, p) / phi;
-            let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
-            out.weights[i] = if raw_weight > 0.0 {
-                raw_weight.max(MIN_WEIGHT)
-            } else {
-                0.0
-            };
-            out.z[i] = eta_i + (y[i] - mu_i) / mu_i;
-            if !clamp_active {
-                out.dmu_deta[i] = mu_i;
-                out.d2mu_deta2[i] = mu_i;
-                out.d3mu_deta3[i] = mu_i;
-            }
-            if !(floor_active || clamp_active) {
-                out.c[i] = exponent * raw_weight;
-                out.d[i] = exponent * exponent * raw_weight;
-            }
-        }
-        out
-    }
-
-    /// Pre-unification negative-binomial reference: numerically-stable Fisher
-    /// weight `mu * theta / (theta + mu)`, curvature from the NB variance jet.
-    pub(crate) fn reference_negbin(
-        eta: &Array1<f64>,
-        y: &Array1<f64>,
-        prior: &Array1<f64>,
-        theta: f64,
-    ) -> LogLinkWorkingOutputs {
-        let mut out = LogLinkWorkingOutputs::zeros(eta.len());
-        for i in 0..eta.len() {
-            let eta_raw = eta[i];
-            let eta_i = eta_raw.clamp(-ETA_CLAMP, ETA_CLAMP);
-            let mu_i = eta_i.exp().max(MIN_MU);
-            let denom = theta + mu_i;
-            let negbin_weight = if theta > mu_i {
-                mu_i / (1.0 + mu_i / theta)
-            } else {
-                theta / (1.0 + theta / mu_i)
-            };
-            let raw_weight = prior[i].max(0.0) * negbin_weight;
-            let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
-            out.mu[i] = mu_i;
-            out.weights[i] = if raw_weight > 0.0 {
-                raw_weight.max(MIN_WEIGHT)
-            } else {
-                0.0
-            };
-            out.z[i] = eta_i + (y[i] - mu_i) / mu_i;
-            out.dmu_deta[i] = mu_i;
-            out.d2mu_deta2[i] = mu_i;
-            out.d3mu_deta3[i] = mu_i;
-            if !(floor_active || eta_raw != eta_i) {
-                out.c[i] = raw_weight * theta / denom;
-                out.d[i] = raw_weight * theta * (theta - mu_i) / (denom * denom);
-            }
-        }
-        out
-    }
-
-    /// Run a unified log-link writer through both its derivative and
-    /// no-derivative branches and collect the buffers.
-    pub(crate) fn run_unified<F>(
-        n: usize,
-        write: F,
-    ) -> (LogLinkWorkingOutputs, LogLinkWorkingOutputs)
-    where
-        F: Fn(
-            &mut Array1<f64>,
-            &mut Array1<f64>,
-            &mut Array1<f64>,
-            Option<WorkingDerivativeBuffersMut<'_>>,
-        ),
-    {
-        let mut with = LogLinkWorkingOutputs::zeros(n);
-        {
-            let mut c = Array1::zeros(n);
-            let mut d = Array1::zeros(n);
-            let mut dmu = Array1::zeros(n);
-            let mut d2 = Array1::zeros(n);
-            let mut d3 = Array1::zeros(n);
-            write(
-                &mut with.mu,
-                &mut with.weights,
-                &mut with.z,
-                Some(WorkingDerivativeBuffersMut {
-                    c: &mut c,
-                    d: &mut d,
-                    dmu_deta: &mut dmu,
-                    d2mu_deta2: &mut d2,
-                    d3mu_deta3: &mut d3,
-                }),
-            );
-            with.c = c;
-            with.d = d;
-            with.dmu_deta = dmu;
-            with.d2mu_deta2 = d2;
-            with.d3mu_deta3 = d3;
-        }
-        let mut without = LogLinkWorkingOutputs::zeros(n);
-        write(&mut without.mu, &mut without.weights, &mut without.z, None);
-        (with, without)
+        assert_eq!(weights[1].to_bits(), 1e-300_f64.to_bits());
+        assert_eq!(c[1].to_bits(), weights[1].to_bits());
+        assert_eq!(d[1].to_bits(), weights[1].to_bits());
+        assert_eq!(weights[3], 0.0);
+        assert_eq!(z[3].to_bits(), eta[3].to_bits());
     }
 
     #[test]
-    pub(crate) fn log_link_working_state_engine_matches_per_family_reference() {
-        // The unified `write_log_link_working_state` engine must reproduce the
-        // exact pre-unification per-family row math bit-for-bit: `mu`, `weights`,
-        // working response `z`, and the curvature buffers `c`/`d`, across every
-        // edge case (eta clamp, MIN_WEIGHT floor, zero-prior dropped row). The
-        // no-derivative branch must additionally agree with the derivative
-        // branch on `mu`/`weights`/`z`. Bounds are exact (bitwise), never
-        // weakened — any divergence is a real regression in a central solver
-        // path shared by Poisson, Gamma, Tweedie, and negative binomial.
-        let (eta, y, prior) = log_link_parity_rows();
+    fn every_log_link_family_uses_the_same_exact_row_and_derivative_surface() {
+        let eta = array![-2.0, 0.0, 2.0];
+        let y = array![1.0, 2.0, 4.0];
+        let prior = array![0.5, 1e-300, 0.0];
         let n = eta.len();
 
-        // Poisson.
-        let reference = reference_poisson(&eta, &y, &prior);
-        let (with, without) = run_unified(n, |mu, w, z, derivs| {
-            write_poisson_log_working_state(y.view(), &eta, prior.view(), mu, w, z, derivs);
-        });
-        with.assert_matches(&reference, "Poisson (derivatives)");
-        assert_eq!(with.mu.to_vec(), without.mu.to_vec(), "Poisson mu branch");
-        assert_eq!(
-            with.weights.to_vec(),
-            without.weights.to_vec(),
-            "Poisson weights branch"
-        );
-        assert_eq!(with.z.to_vec(), without.z.to_vec(), "Poisson z branch");
+        let check = |family: &str,
+                     with_mu: &Array1<f64>,
+                     with_w: &Array1<f64>,
+                     with_z: &Array1<f64>,
+                     without_mu: &Array1<f64>,
+                     without_w: &Array1<f64>,
+                     without_z: &Array1<f64>| {
+            assert_eq!(with_mu, without_mu, "{family} mu seam");
+            assert_eq!(with_w, without_w, "{family} weight seam");
+            assert_eq!(with_z, without_z, "{family} working-response seam");
+        };
 
-        // Gamma (fixed shape).
-        let shape = 2.5;
-        let reference = reference_gamma(&eta, &y, &prior, shape);
-        let (with, without) = run_unified(n, |mu, w, z, derivs| {
-            write_gamma_log_working_state(y.view(), &eta, prior.view(), shape, mu, w, z, derivs);
-        });
-        with.assert_matches(&reference, "Gamma (derivatives)");
-        assert_eq!(with.mu.to_vec(), without.mu.to_vec(), "Gamma mu branch");
-        assert_eq!(
-            with.weights.to_vec(),
-            without.weights.to_vec(),
-            "Gamma weights branch"
-        );
-        assert_eq!(with.z.to_vec(), without.z.to_vec(), "Gamma z branch");
+        // Gamma: W = prior * shape and both eta derivatives vanish.
+        {
+            let shape = 2.5;
+            let mut mu = Array1::zeros(n);
+            let mut w = Array1::zeros(n);
+            let mut z = Array1::zeros(n);
+            let mut c = Array1::zeros(n);
+            let mut d = Array1::zeros(n);
+            let mut d1 = Array1::zeros(n);
+            let mut d2 = Array1::zeros(n);
+            let mut d3 = Array1::zeros(n);
+            write_gamma_log_working_state(
+                y.view(),
+                &eta,
+                prior.view(),
+                shape,
+                &mut mu,
+                &mut w,
+                &mut z,
+                Some(WorkingDerivativeBuffersMut {
+                    c: &mut c,
+                    d: &mut d,
+                    dmu_deta: &mut d1,
+                    d2mu_deta2: &mut d2,
+                    d3mu_deta3: &mut d3,
+                }),
+            )
+            .unwrap();
+            let mut mu_plain = Array1::zeros(n);
+            let mut w_plain = Array1::zeros(n);
+            let mut z_plain = Array1::zeros(n);
+            write_gamma_log_working_state(
+                y.view(),
+                &eta,
+                prior.view(),
+                shape,
+                &mut mu_plain,
+                &mut w_plain,
+                &mut z_plain,
+                None,
+            )
+            .unwrap();
+            check("Gamma", &mu, &w, &z, &mu_plain, &w_plain, &z_plain);
+            for i in 0..n {
+                assert_eq!(w[i].to_bits(), (prior[i] * shape).to_bits());
+                assert_eq!(c[i], 0.0);
+                assert_eq!(d[i], 0.0);
+                assert_eq!(d1[i].to_bits(), mu[i].to_bits());
+            }
+        }
 
-        // Tweedie.
-        let p = 1.5;
-        let phi = 0.7;
-        let reference = reference_tweedie(&eta, &y, &prior, p, phi);
-        let (with, without) = run_unified(n, |mu, w, z, derivs| {
-            write_tweedie_log_working_state(y.view(), &eta, prior.view(), p, phi, mu, w, z, derivs)
-                .expect("valid Tweedie parameters");
-        });
-        with.assert_matches(&reference, "Tweedie (derivatives)");
-        assert_eq!(with.mu.to_vec(), without.mu.to_vec(), "Tweedie mu branch");
-        assert_eq!(
-            with.weights.to_vec(),
-            without.weights.to_vec(),
-            "Tweedie weights branch"
-        );
-        assert_eq!(with.z.to_vec(), without.z.to_vec(), "Tweedie z branch");
+        // Tweedie: W = prior * mu^(2-p)/phi and c,d are exact derivatives.
+        {
+            let (p, phi) = (1.5, 2.0);
+            let mut mu = Array1::zeros(n);
+            let mut w = Array1::zeros(n);
+            let mut z = Array1::zeros(n);
+            let mut c = Array1::zeros(n);
+            let mut d = Array1::zeros(n);
+            let mut d1 = Array1::zeros(n);
+            let mut d2 = Array1::zeros(n);
+            let mut d3 = Array1::zeros(n);
+            write_tweedie_log_working_state(
+                y.view(),
+                &eta,
+                prior.view(),
+                p,
+                phi,
+                &mut mu,
+                &mut w,
+                &mut z,
+                Some(WorkingDerivativeBuffersMut {
+                    c: &mut c,
+                    d: &mut d,
+                    dmu_deta: &mut d1,
+                    d2mu_deta2: &mut d2,
+                    d3mu_deta3: &mut d3,
+                }),
+            )
+            .unwrap();
+            let mut mu_plain = Array1::zeros(n);
+            let mut w_plain = Array1::zeros(n);
+            let mut z_plain = Array1::zeros(n);
+            write_tweedie_log_working_state(
+                y.view(),
+                &eta,
+                prior.view(),
+                p,
+                phi,
+                &mut mu_plain,
+                &mut w_plain,
+                &mut z_plain,
+                None,
+            )
+            .unwrap();
+            check("Tweedie", &mu, &w, &z, &mu_plain, &w_plain, &z_plain);
+            for i in 0..n {
+                assert_eq!(c[i].to_bits(), (0.5 * w[i]).to_bits());
+                assert_eq!(d[i].to_bits(), (0.25 * w[i]).to_bits());
+            }
+        }
 
-        // Negative binomial (fixed theta).
-        let theta = 3.0;
-        let reference = reference_negbin(&eta, &y, &prior, theta);
-        let (with, without) = run_unified(n, |mu, w, z, derivs| {
+        // NB2: express curvature through r = theta/(theta+mu), never a squared
+        // overflowing denominator.
+        {
+            let theta = 3.0;
+            let mut mu = Array1::zeros(n);
+            let mut w = Array1::zeros(n);
+            let mut z = Array1::zeros(n);
+            let mut c = Array1::zeros(n);
+            let mut d = Array1::zeros(n);
+            let mut d1 = Array1::zeros(n);
+            let mut d2 = Array1::zeros(n);
+            let mut d3 = Array1::zeros(n);
             write_negative_binomial_log_working_state(
                 y.view(),
                 &eta,
                 prior.view(),
                 theta,
-                mu,
-                w,
-                z,
-                derivs,
+                &mut mu,
+                &mut w,
+                &mut z,
+                Some(WorkingDerivativeBuffersMut {
+                    c: &mut c,
+                    d: &mut d,
+                    dmu_deta: &mut d1,
+                    d2mu_deta2: &mut d2,
+                    d3mu_deta3: &mut d3,
+                }),
             )
-            .expect("valid negative-binomial theta");
-        });
-        with.assert_matches(&reference, "NegBin (derivatives)");
-        assert_eq!(with.mu.to_vec(), without.mu.to_vec(), "NegBin mu branch");
-        assert_eq!(
-            with.weights.to_vec(),
-            without.weights.to_vec(),
-            "NegBin weights branch"
-        );
-        assert_eq!(with.z.to_vec(), without.z.to_vec(), "NegBin z branch");
+            .unwrap();
+            let mut mu_plain = Array1::zeros(n);
+            let mut w_plain = Array1::zeros(n);
+            let mut z_plain = Array1::zeros(n);
+            write_negative_binomial_log_working_state(
+                y.view(),
+                &eta,
+                prior.view(),
+                theta,
+                &mut mu_plain,
+                &mut w_plain,
+                &mut z_plain,
+                None,
+            )
+            .unwrap();
+            check("NB2", &mu, &w, &z, &mu_plain, &w_plain, &z_plain);
+            for i in 0..n {
+                let r = theta / (theta + mu[i]);
+                assert_relative_eq!(c[i], w[i] * r, max_relative = 1e-15);
+                assert_relative_eq!(d[i], w[i] * r * (2.0 * r - 1.0), max_relative = 1e-15);
+            }
+        }
+    }
+
+    #[test]
+    fn every_log_link_rule_refuses_unrepresentable_row_products_atomically() {
+        fn sentinels() -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+            (
+                Array1::from_elem(1, 11.0),
+                Array1::from_elem(1, 13.0),
+                Array1::from_elem(1, 17.0),
+            )
+        }
+        fn assert_atomic(mu: &Array1<f64>, w: &Array1<f64>, z: &Array1<f64>) {
+            assert_eq!(mu[0], 11.0);
+            assert_eq!(w[0], 13.0);
+            assert_eq!(z[0], 17.0);
+        }
+        let eta = array![700.0];
+        let y = array![1.0];
+
+        let (mut mu, mut w, mut z) = sentinels();
+        let err = write_poisson_log_working_state(
+            y.view(),
+            &eta,
+            array![1e10].view(),
+            &mut mu,
+            &mut w,
+            &mut z,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EstimationError::PirlsRowGeometryUnrepresentable { row: 0, .. }
+        ));
+        assert_atomic(&mu, &w, &z);
+
+        let (mut mu, mut w, mut z) = sentinels();
+        write_gamma_log_working_state(
+            y.view(),
+            &array![0.0],
+            array![2.0].view(),
+            1e308,
+            &mut mu,
+            &mut w,
+            &mut z,
+            None,
+        )
+        .unwrap_err();
+        assert_atomic(&mu, &w, &z);
+
+        let (mut mu, mut w, mut z) = sentinels();
+        write_tweedie_log_working_state(
+            y.view(),
+            &array![-700.0],
+            array![1.0].view(),
+            1.000_001,
+            1e308,
+            &mut mu,
+            &mut w,
+            &mut z,
+            None,
+        )
+        .unwrap_err();
+        assert_atomic(&mu, &w, &z);
+
+        let (mut mu, mut w, mut z) = sentinels();
+        write_negative_binomial_log_working_state(
+            y.view(),
+            &eta,
+            array![1e308].view(),
+            3.0,
+            &mut mu,
+            &mut w,
+            &mut z,
+            None,
+        )
+        .unwrap_err();
+        assert_atomic(&mu, &w, &z);
+    }
+
+    #[test]
+    fn log_link_refusal_is_atomic_and_reports_the_smallest_bad_row() {
+        let eta = array![0.0, 701.0, -701.0];
+        let y = array![1.0, 1.0, 1.0];
+        let prior = Array1::ones(3);
+        let mut mu = Array1::from_elem(3, 17.0);
+        let mut weights = Array1::from_elem(3, 19.0);
+        let mut z = Array1::from_elem(3, 23.0);
+        let err = write_poisson_log_working_state(
+            y.view(),
+            &eta,
+            prior.view(),
+            &mut mu,
+            &mut weights,
+            &mut z,
+            None,
+        )
+        .expect_err("out-of-domain eta must be refused");
+        assert!(matches!(
+            err,
+            EstimationError::InverseLinkDomainViolation { eta: 701.0, .. }
+        ));
+        assert_eq!(mu, Array1::from_elem(3, 17.0));
+        assert_eq!(weights, Array1::from_elem(3, 19.0));
+        assert_eq!(z, Array1::from_elem(3, 23.0));
+    }
+
+    #[test]
+    fn canonical_logit_tail_geometry_remains_exact_at_rounded_mean_endpoints() {
+        let eta = array![-700.0, -40.0, 40.0, 700.0];
+        let y = array![1.0, 1.0, 0.0, 0.0];
+        let prior = Array1::ones(4);
+        let mut mu = Array1::zeros(4);
+        let mut weights = Array1::zeros(4);
+        let mut z = Array1::zeros(4);
+        update_glmvectors(
+            y.view(),
+            &eta,
+            &InverseLink::Standard(StandardLink::Logit),
+            prior.view(),
+            &mut mu,
+            &mut weights,
+            &mut z,
+            None,
+        )
+        .expect("represented canonical-logit tails must not be projected");
+        assert_eq!(mu[2], 1.0);
+        assert_eq!(mu[3], 1.0);
+        for i in 0..4 {
+            let jet = crate::mixture_link::logit_inverse_link_jet5(eta[i]);
+            assert_eq!(weights[i].to_bits(), jet.d1.to_bits());
+            assert!(weights[i] > 0.0 && z[i].is_finite());
+        }
+    }
+
+    #[test]
+    fn canonical_logit_weight_derivative_matches_finite_difference_at_tail() {
+        let eta0 = 40.0;
+        let h = 1e-4;
+        let eval_weight = |eta_value: f64| {
+            let eta = array![eta_value];
+            let y = array![0.0];
+            let prior = array![1.0];
+            let mut mu = Array1::zeros(1);
+            let mut weight = Array1::zeros(1);
+            let mut z = Array1::zeros(1);
+            update_glmvectors(
+                y.view(),
+                &eta,
+                &InverseLink::Standard(StandardLink::Logit),
+                prior.view(),
+                &mut mu,
+                &mut weight,
+                &mut z,
+                None,
+            )
+            .unwrap();
+            weight[0]
+        };
+        let fd = (eval_weight(eta0 + h) - eval_weight(eta0 - h)) / (2.0 * h);
+        let analytic = crate::mixture_link::logit_inverse_link_jet5(eta0).d2;
+        assert_relative_eq!(fd, analytic, max_relative = 2e-8, epsilon = 1e-30);
     }
 
     #[test]
@@ -1535,13 +1591,13 @@ mod tests {
             let jet = crate::quadrature::integrated_inverse_link_jet(
                 &ctx,
                 LinkFunction::Logit,
-                fit.final_eta[i].clamp(-ETA_CLAMP, ETA_CLAMP),
+                fit.final_eta[i],
                 covariate_se[i],
             )
             .expect("logit integrated inverse-link jet should evaluate");
             let expected = bernoulli_geometry_from_jet(
+                i,
                 fit.final_eta[i],
-                fit.final_eta[i].clamp(-ETA_CLAMP, ETA_CLAMP),
                 y[i],
                 w[i],
                 MixtureInverseLinkJet {
@@ -1550,7 +1606,8 @@ mod tests {
                     d2: jet.d2,
                     d3: jet.d3,
                 },
-            );
+            )
+            .expect("integrated Bernoulli row geometry must be representable");
             assert_relative_eq!(
                 fit.solve_dmu_deta[i],
                 jet.d1,
@@ -1893,11 +1950,10 @@ mod tests {
         // legitimately goes non-positive on individual rows when a large
         // residual flips the sign of the residual-dependent correction `B`
         // (the link is non-canonical, so B ≠ 0). The observed-curvature array
-        // build must NOT hard-bail on such a finite-but-indefinite row: the
-        // inner Newton system floors it via `solver_hessian_weights_into` and
-        // the outer REML derivative path floors it via
-        // `outer_hessian_curvature_arrays`, both keeping the Hessian SPD. Before
-        // the fix the build aborted with "observed Hessian curvature is not
+        // build must NOT hard-bail on such a finite-but-indefinite row: signed
+        // row curvature is assembled exactly and any required PD stabilization
+        // is an explicit ridge on the assembled matrix. Before the fix the build
+        // aborted with "observed Hessian curvature is not
         // positive finite at row N", which propagated up as
         // "no candidate seeds passed outer startup validation
         // (mixture/SAS flexible link)" and made the whole joint solve fail.
@@ -1928,14 +1984,14 @@ mod tests {
         let y = array![1.0, 0.0, 0.0, 1.0, 1.0, 0.0];
         let w = Array1::<f64>::ones(eta.len());
 
-        // Fisher weights at these η (positive, used as the SPD floor reference).
+        // Exact Fisher weights at these represented eta values.
         let mut fisher = Array1::<f64>::zeros(eta.len());
         for i in 0..eta.len() {
             let jet = crate::mixture_link::inverse_link_jet_for_inverse_link(&link, eta[i])
                 .expect("mixture jet");
             let mu = jet.mu;
-            let v = (mu * (1.0 - mu)).max(1e-12);
-            fisher[i] = (jet.d1 * jet.d1 / v).max(1e-12);
+            let v = mu * (1.0 - mu);
+            fisher[i] = jet.d1 * jet.d1 / v;
         }
 
         // Post-fix contract: the build SUCCEEDS (no bail) and returns finite
@@ -2147,7 +2203,8 @@ mod tests {
             .gamma_shape()
             .expect("gamma fit should expose fitted shape");
         let profiled_shape =
-            super::estimate_gamma_shape_from_eta(y.view(), &result.final_eta.to_owned(), w.view());
+            super::estimate_gamma_shape_from_eta(y.view(), &result.final_eta.to_owned(), w.view())
+                .expect("converged Gamma shape must be representable");
 
         assert!(fitted_shape > 1.0, "shape should not stay fixed at one");
         assert_relative_eq!(

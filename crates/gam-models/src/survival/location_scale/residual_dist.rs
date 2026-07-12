@@ -1,4 +1,5 @@
 use super::*;
+use gam_math::probability::normal_logcdf_derivatives;
 
 // Layer 2 defense (canonical implementation lives beside the σ-link in
 // `gam_model_kernels::sigma_link` so the fit engine and the prediction
@@ -21,30 +22,49 @@ pub(crate) fn probit_survival_value(eta: f64) -> f64 {
 
 #[inline]
 pub(crate) fn probit_log_survival_and_ratio_derivatives(eta: f64) -> (f64, f64, f64, f64, f64) {
-    if eta.is_nan() {
-        return (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+    // log S(eta) = log Phi(-eta). If d_k is the kth derivative of log Phi at
+    // -eta, the hazard ratio and its first three eta derivatives are
+    // d_1, -d_2, d_3, -d_4. The shared stack owns all tail cancellation and
+    // representability policy, including the exact infinite limits.
+    let d = normal_logcdf_derivatives(-eta);
+    (d[0], d[1], -d[2], d[3], -d[4])
+}
+
+#[cfg(test)]
+mod probit_tail_tests {
+    use super::probit_log_survival_and_ratio_derivatives;
+
+    #[test]
+    fn probit_survival_derivatives_have_exact_infinite_limits() {
+        assert_eq!(
+            probit_log_survival_and_ratio_derivatives(f64::NEG_INFINITY),
+            (0.0, 0.0, -0.0, 0.0, -0.0)
+        );
+        assert_eq!(
+            probit_log_survival_and_ratio_derivatives(f64::INFINITY),
+            (f64::NEG_INFINITY, f64::INFINITY, 1.0, 0.0, -0.0)
+        );
+        assert!(
+            probit_log_survival_and_ratio_derivatives(f64::NAN)
+                .into_iter()
+                .all(f64::is_nan)
+        );
     }
-    if eta == f64::NEG_INFINITY {
-        return (0.0, 0.0, 0.0, 0.0, 0.0);
+
+    #[test]
+    fn probit_survival_derivatives_preserve_both_extreme_tails() {
+        let (_, ratio, dr, ddr, dddr) = probit_log_survival_and_ratio_derivatives(1.0e100);
+        assert_eq!(ratio, 1.0e100);
+        assert_eq!(dr, 1.0);
+        assert!(ddr > 0.0 && ddr.is_finite());
+        assert_eq!(dddr, -0.0);
+
+        let (_, ratio, dr, ddr, dddr) = probit_log_survival_and_ratio_derivatives(-38.6);
+        assert_eq!(ratio, 0.0);
+        assert!(dr > 0.0 && dr.is_subnormal());
+        assert!(ddr > 0.0 && ddr.is_subnormal());
+        assert!(dddr > 0.0 && dddr.is_subnormal());
     }
-    let x = eta / std::f64::consts::SQRT_2;
-    let (log_survival, ratio) = if eta >= 0.0 {
-        // erfcx(x) = exp(x²)·erfc(x); compute once and reuse for both
-        // log-survival and the hazard ratio.
-        let erfcx_val = erfcx_nonnegative(x);
-        let log_surv = -0.5 * eta * eta + (0.5 * erfcx_val).ln();
-        let r = std::f64::consts::FRAC_2_SQRT_PI / (std::f64::consts::SQRT_2 * erfcx_val);
-        (log_surv, r)
-    } else {
-        let survival = probit_survival_value(eta);
-        (survival.ln(), normal_pdf(eta) / survival)
-    };
-    let dr = ratio * (ratio - eta);
-    let ddr = 2.0 * ratio.powi(3) - 3.0 * eta * ratio.powi(2) + (eta * eta - 1.0) * ratio;
-    let dddr = 6.0 * ratio.powi(4) - 12.0 * eta * ratio.powi(3)
-        + (7.0 * eta * eta - 4.0) * ratio.powi(2)
-        + (-eta * eta * eta + 3.0 * eta) * ratio;
-    (log_survival, ratio, dr, ddr, dddr)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

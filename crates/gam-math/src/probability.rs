@@ -1,5 +1,8 @@
 use statrs::function::{beta::inv_beta_reg, erf::erfc};
 
+const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
+const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
+
 /// Quantile (inverse CDF) of a Beta distribution with shape parameters `a > 0`
 /// and `b > 0` at probability `p`: the value `x in [0, 1]` with
 /// `I_x(a, b) = p`, where `I` is the regularized incomplete beta.
@@ -71,7 +74,7 @@ pub fn erfcx_nonnegative(x: f64) -> f64 {
                             + inv2
                                 * (-1.875
                                     + inv2 * (6.5625 + inv2 * (-29.53125 + inv2 * 162.421875)))));
-        inv * poly / std::f64::consts::PI.sqrt()
+        inv * poly * INV_SQRT_PI
     }
 }
 
@@ -245,7 +248,7 @@ pub fn signed_probit_logcdf_and_mills_ratio(x: f64) -> (f64, f64) {
         let (u, scaled_tail) = negative_normal_tail_components(x);
         (
             negative_normal_logcdf_from_scaled_tail(u, scaled_tail),
-            (2.0 / std::f64::consts::PI).sqrt() / scaled_tail,
+            SQRT_2_OVER_PI / scaled_tail,
         )
     } else {
         let upper_tail = 0.5 * erfc(x / std::f64::consts::SQRT_2);

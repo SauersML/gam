@@ -1792,7 +1792,7 @@ where
 
             let final_eta = pirls_res.final_eta.to_owned();
             let (theta_score, theta_info) =
-                pirls::negbin_theta_score_and_info(y_o.view(), &final_eta, w_o.view(), theta);
+                pirls::negbin_theta_score_and_info(y_o.view(), &final_eta, w_o.view(), theta)?;
             let theta_residual = negbin_theta_stationarity_residual(theta, theta_score, theta_info);
             // This residual is a Newton displacement in the outer log-theta
             // coordinate, so it shares the outer REML tolerance. The beta
@@ -1885,7 +1885,7 @@ where
             // theta at the current converged eta, then re-optimize rho with theta
             // fixed. No secant/grid extrapolation and no unreported answer cap.
             let theta_next =
-                pirls::estimate_negbin_theta_from_eta(y_o.view(), &final_eta, w_o.view());
+                pirls::estimate_negbin_theta_from_eta(y_o.view(), &final_eta, w_o.view())?;
             log::info!(
                 "[OUTER] negative-binomial joint round {} not yet certified: \
                  rho residual {:.3e}/{:.3e}, theta residual {:.3e}/{:.3e}; \
