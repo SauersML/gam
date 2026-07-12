@@ -1200,6 +1200,28 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             }
             let pcg_rel_tol = joint_pcg_eisenstat_walker_forcing(prev_kkt_norm, current_kkt_norm);
 
+            {
+                let grad_phi_inf = head_jeffreys_term
+                    .as_ref()
+                    .map(|(g, _)| g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max))
+                    .unwrap_or(0.0);
+                let beta_inf_probe = states
+                    .iter()
+                    .flat_map(|s| s.beta.iter())
+                    .map(|v| v.abs())
+                    .fold(0.0_f64, f64::max);
+                log::info!(
+                    "[979-PROBE] cyc={:>3} firth_armed={} skippable={} |gradPhi|inf={:.3e} kkt={:.3e} |beta|inf={:.3e} endgame={}",
+                    cycle,
+                    head_jeffreys_term.is_some(),
+                    jeffreys_skippable_this_cycle,
+                    grad_phi_inf,
+                    current_kkt_norm,
+                    beta_inf_probe,
+                    jeffreys_completion_endgame,
+                );
+            }
+
             let solve_joint_constraints_dense = joint_constraints.is_some()
                 || !matrix_free_joint_requested
                 || joint_hessian_is_dense;
