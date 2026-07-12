@@ -829,6 +829,479 @@ fn sae_manifold_predict_oos<'py>(
     sae_oos_report_to_pydict(py, report)
 }
 
+/// FFI surface for the #2266 evaluation-only certification entry (#2263 item
+/// 4): certify an externally-trained (torch-lane) SAE-manifold state — no
+/// closed-form solve, no coordinate/decoder optimization — and return the SAME
+/// certificate/diagnostics payload dict a native fit returns (certificates,
+/// trust/fit diagnostics, coordinate fidelity, the anytime-valid structure
+/// certificate). The binding rebuilds the frozen dictionary from the caller's
+/// own trained decoder/coords/logits using the identical per-atom marshalling
+/// contract as [`sae_manifold_predict_oos`] / `sae_steer_delta` (basis kind +
+/// latent_dim + decoder block + Duchon centers/harmonics), installs it
+/// verbatim, and calls
+/// [`gam::terms::sae::manifold::run_sae_manifold_certify_external`].
+///
+/// `initial_coords`/`initial_logits` are REQUIRED here (unlike the fit path's
+/// optional warm start): they ARE the trained state being certified, not a
+/// seed for further optimization. `log_lambda_sparse`/`log_lambda_smooth`/
+/// `log_ard` are the trained terminal regularization state the certificate is
+/// evaluated under — the same "must supply the regularization that produced
+/// the decoder" contract `sae_manifold_predict_oos` already carries.
+/// `outer_termination.verdict` on the returned payload reports `External`
+/// (see the library entry's doc) rather than a native stationarity
+/// certificate, and `penalized_quasi_laplace_criterion` is the penalized
+/// objective evaluated AT the supplied state, not a certified minimum.
+#[pyfunction(signature = (
+    z,
+    atom_basis,
+    atom_dim,
+    decoder_blocks,
+    duchon_centers,
+    n_harmonics_list,
+    basis_size_list,
+    initial_coords,
+    initial_logits,
+    alpha,
+    tau,
+    assignment_kind,
+    log_lambda_sparse,
+    log_lambda_smooth,
+    log_ard,
+    learnable_alpha = false,
+    top_k = None,
+    threshold_gate_threshold = 0.0,
+    max_iter = 50,
+    learning_rate = 0.04,
+    ridge_ext_coord = 1.0e-6,
+    ridge_beta = 1.0e-6,
+    isometry_pin_active = false,
+    run_structure_search = true,
+    analytic_penalties = None,
+    fisher_factors = None,
+    fisher_mass_residual = None,
+    fisher_provenance = None,
+))]
+fn sae_manifold_certify_external<'py>(
+    py: Python<'py>,
+    z: PyReadonlyArray2<'py, f64>,
+    atom_basis: Vec<String>,
+    atom_dim: Vec<usize>,
+    decoder_blocks: Vec<PyReadonlyArray2<'py, f64>>,
+    duchon_centers: Vec<Option<PyReadonlyArray2<'py, f64>>>,
+    n_harmonics_list: Vec<Option<usize>>,
+    basis_size_list: Vec<usize>,
+    initial_coords: PyReadonlyArray3<'py, f64>,
+    initial_logits: PyReadonlyArray2<'py, f64>,
+    alpha: f64,
+    tau: f64,
+    assignment_kind: String,
+    log_lambda_sparse: f64,
+    log_lambda_smooth: Vec<f64>,
+    log_ard: Vec<Vec<f64>>,
+    learnable_alpha: bool,
+    top_k: Option<usize>,
+    threshold_gate_threshold: f64,
+    max_iter: usize,
+    learning_rate: f64,
+    ridge_ext_coord: f64,
+    ridge_beta: f64,
+    isometry_pin_active: bool,
+    run_structure_search: bool,
+    analytic_penalties: Option<String>,
+    fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
+    fisher_mass_residual: Option<PyReadonlyArray1<'py, f64>>,
+    fisher_provenance: Option<String>,
+) -> PyResult<Py<PyDict>> {
+    let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
+    let z_view = z.as_array();
+    let (n_obs, p_out) = z_view.dim();
+    let k_atoms = atom_basis.len();
+    if atom_dim.len() != k_atoms
+        || decoder_blocks.len() != k_atoms
+        || duchon_centers.len() != k_atoms
+        || n_harmonics_list.len() != k_atoms
+        || basis_size_list.len() != k_atoms
+    {
+        return Err(py_value_error(format!(
+            "sae_manifold_certify_external: per-atom metadata lengths must equal K={k_atoms}"
+        )));
+    }
+
+    let assignment = match assignment_kind.as_str() {
+        "softmax" => gam::terms::sae::manifold::SaeOosAssignmentKind::Softmax,
+        "ordered_beta_bernoulli" => {
+            gam::terms::sae::manifold::SaeOosAssignmentKind::OrderedBetaBernoulli { learnable_alpha }
+        }
+        "threshold_gate" => gam::terms::sae::manifold::SaeOosAssignmentKind::ThresholdGate {
+            threshold: threshold_gate_threshold,
+        },
+        "topk" => gam::terms::sae::manifold::SaeOosAssignmentKind::TopK,
+        _ => {
+            return Err(py_value_error(format!(
+                "sae_manifold_certify_external: unsupported assignment kind {assignment_kind:?}"
+            )));
+        }
+    };
+
+    let atom_centers: Vec<Option<Array2<f64>>> = duchon_centers
+        .iter()
+        .map(|o| o.as_ref().map(|a| a.as_array().to_owned()))
+        .collect();
+    let atoms: Vec<gam::terms::sae::manifold::SaeOosAtomSpec> = (0..k_atoms)
+        .map(|atom_index| gam::terms::sae::manifold::SaeOosAtomSpec {
+            basis_kind: sae_atom_basis_kind_from_str(&atom_basis[atom_index]),
+            latent_dim: atom_dim[atom_index],
+            decoder: decoder_blocks[atom_index].as_array().to_owned(),
+            centers: atom_centers[atom_index].clone(),
+            n_harmonics: n_harmonics_list[atom_index],
+            basis_size: basis_size_list[atom_index],
+        })
+        .collect();
+
+    let coords_view = initial_coords.as_array();
+    if coords_view.shape()[0] != k_atoms {
+        return Err(py_value_error(format!(
+            "sae_manifold_certify_external: initial_coords must carry K={k_atoms} atom blocks; got {}",
+            coords_view.shape()[0]
+        )));
+    }
+    let coords: Vec<Array2<f64>> = (0..k_atoms)
+        .map(|atom_index| {
+            coords_view
+                .index_axis(Axis(0), atom_index)
+                .to_owned()
+        })
+        .collect();
+
+    let regularization = gam::terms::sae::manifold::SaeOosRegularization {
+        log_lambda_sparse,
+        log_lambda_smooth,
+        log_ard,
+    };
+
+    let fisher_mass_residual_owned = fisher_mass_residual
+        .as_ref()
+        .map(|values| values.as_array().to_owned());
+    let fisher_metric = match fisher_factors {
+        Some(factors) => {
+            let request = SaeFisherRowMetricRequest::from_tag(
+                factors.as_array(),
+                n_obs,
+                p_out,
+                fisher_provenance.as_deref(),
+                fisher_mass_residual_owned.as_ref().map(|values| values.view()),
+            )
+            .map_err(py_value_error)?;
+            Some(build_sae_fisher_row_metric(request).map_err(py_value_error)?)
+        }
+        None => None,
+    };
+    let metric_provenance: &'static str = match &fisher_metric {
+        Some(metric) => gam::terms::sae::manifold::metric_provenance_label(metric.provenance()),
+        None => "Euclidean",
+    };
+
+    let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
+        Some(s) => Some(serde_json::from_str(&s).map_err(serde_json_error_to_pyerr)?),
+        None => None,
+    };
+    let max_atom_dim = atom_dim
+        .iter()
+        .copied()
+        .max()
+        .ok_or_else(|| py_value_error("sae_manifold_certify_external: atom_dim is empty".to_string()))?;
+    let total_basis: usize = basis_size_list.iter().copied().sum();
+    let mut latent_blocks = serde_json::Map::new();
+    latent_blocks.insert(
+        "t".into(),
+        serde_json::json!({"name": "t", "n": n_obs, "d": max_atom_dim}),
+    );
+    latent_blocks.insert(
+        "beta".into(),
+        serde_json::json!({"name": "beta", "n": p_out, "d": total_basis}),
+    );
+    let latent_payload = serde_json::Value::Object(latent_blocks);
+    let registry = build_analytic_penalty_registry_from_json(
+        Some(&latent_payload),
+        analytic_penalties.as_ref(),
+    )
+    .map_err(py_value_error)?;
+
+    let request = gam::terms::sae::manifold::SaeCertifyExternalRequest {
+        target: z_view.to_owned(),
+        atoms,
+        coords,
+        logits: initial_logits.as_array().to_owned(),
+        assignment,
+        top_k,
+        alpha,
+        tau,
+        regularization,
+        fisher_metric,
+        registry,
+        max_iter,
+        learning_rate,
+        ridge_ext_coord,
+        ridge_beta,
+        isometry_pin_active,
+        metric_provenance,
+        run_structure_search,
+    };
+
+    let report = gam::terms::sae::manifold::run_sae_manifold_certify_external(request)
+        .map_err(|err| sae_fit_error_to_pyerr(py, err))?;
+
+    // #2266/#2263 — the reported dict shape below is a deliberate duplicate of
+    // `sae_manifold_fit_inner`'s postlude (same `SaeFitReport` fields, same
+    // helper functions), NOT a shared extraction: `run_sae_manifold_certify`'s
+    // own doc comment (fit_entry.rs) records that its postlude was duplicated
+    // from `run_sae_manifold_fit_on_target` rather than factored out, because
+    // the source function is under concurrent edit elsewhere in this
+    // workspace and an extraction risked colliding with that churn. The same
+    // reasoning applies here on the pyffi side; keep this block in sync with
+    // `sae_manifold_fit_inner`'s tail if that payload shape changes.
+    let seed_refine_random_state = 0u64;
+    let fisher_mass_residual = fisher_mass_residual_owned.as_ref().map(|values| values.view());
+    let gam::terms::sae::manifold::SaeFitReport {
+        term,
+        rho,
+        loss,
+        penalized_quasi_laplace_criterion,
+        assignments,
+        fitted,
+        active_mask,
+        reconstruction_r2,
+        outer_termination,
+        shape_uncertainty,
+        metric_provenance,
+        structured_residual_diagnostics,
+        trust_diagnostics,
+        fit_diagnostics,
+        amortized_encoder_consistency,
+        certificate_ledger,
+        structure_search_json,
+        structure_certificate_json,
+        reported_log_alpha,
+    } = report;
+
+    let k_atoms = term.k_atoms();
+    let atom_basis: Vec<String> = term
+        .atoms
+        .iter()
+        .map(|atom| sae_atom_basis_kind_name(&atom.basis_kind))
+        .collect();
+    let atom_dim: Vec<usize> = term.atoms.iter().map(|atom| atom.latent_dim).collect();
+    let log_ard_py = PyList::empty(py);
+    for atom_log_ard in &rho.log_ard {
+        log_ard_py.append(atom_log_ard.clone().into_pyarray(py))?;
+    }
+    let tier0_scale = term.tier0_scale().cloned();
+    let atoms_py = PyList::empty(py);
+    for atom_idx in 0..k_atoms {
+        let atom = &term.atoms[atom_idx];
+        let atom_dict = PyDict::new(py);
+        let mut decoder_physical = atom.full_width_decoder();
+        if let Some(sigma) = tier0_scale.as_ref() {
+            for mut row in decoder_physical.rows_mut() {
+                row *= sigma;
+            }
+        }
+        atom_dict.set_item("decoder_B", decoder_physical.into_pyarray(py))?;
+        atom_dict.set_item("basis_kind", atom_basis[atom_idx].clone())?;
+        atom_dict.set_item("basis_centers", py.None())?;
+        atom_dict.set_item(
+            "on_atom_coords_t",
+            term.assignment.coords[atom_idx]
+                .as_matrix()
+                .into_pyarray(py),
+        )?;
+        match fit_diagnostics
+            .coordinate_fidelity
+            .get(atom_idx)
+            .and_then(|entry| entry.as_ref())
+            .and_then(|fid| fid.coords_u_arc.as_ref())
+        {
+            Some(u_arc) => {
+                atom_dict.set_item("on_atom_coords_u_arc", u_arc.clone().into_pyarray(py))?
+            }
+            None => atom_dict.set_item("on_atom_coords_u_arc", py.None())?,
+        }
+        atom_dict.set_item(
+            "assignments_z",
+            assignments.column(atom_idx).to_owned().into_pyarray(py),
+        )?;
+        atom_dict.set_item("active_dim", atom_dim[atom_idx])?;
+        if let Some(unc) = shape_uncertainty.atoms.get(atom_idx) {
+            if let Some(cov) = &unc.decoder_covariance {
+                let mut cov_full = atom
+                    .lift_reduced_decoder_covariance(cov, p_out)
+                    .map_err(py_value_error)?;
+                if let Some(sigma) = tier0_scale.as_ref() {
+                    let m_p = cov_full.nrows();
+                    for i in 0..m_p {
+                        let si = sigma[i % p_out];
+                        for j in 0..m_p {
+                            cov_full[[i, j]] *= si * sigma[j % p_out];
+                        }
+                    }
+                }
+                atom_dict.set_item("decoder_covariance", cov_full.into_pyarray(py))?;
+            }
+            match (&unc.band_coords, &unc.band_mean, &unc.band_sd) {
+                (Some(coords), Some(mean), Some(sd)) => {
+                    atom_dict.set_item("shape_band_coords", coords.clone().into_pyarray(py))?;
+                    let mut band_mean = mean.clone();
+                    let mut band_sd = sd.clone();
+                    if let Some(sigma) = tier0_scale.as_ref() {
+                        for mut row in band_mean.rows_mut() {
+                            row *= sigma;
+                        }
+                        for mut row in band_sd.rows_mut() {
+                            row *= sigma;
+                        }
+                    }
+                    atom_dict.set_item("shape_band_mean", band_mean.into_pyarray(py))?;
+                    atom_dict.set_item("shape_band_sd", band_sd.into_pyarray(py))?;
+                }
+                (None, None, None) => {}
+                _ => {
+                    return Err(py_value_error(format!(
+                        "atom {atom_idx} has a partial shape-uncertainty band"
+                    )));
+                }
+            }
+        }
+        atoms_py.append(atom_dict)?;
+    }
+
+    let out = PyDict::new(py);
+    out.set_item("atoms", atoms_py)?;
+    out.set_item("assignments_z", assignments.into_pyarray(py))?;
+    out.set_item("logits", term.assignment.logits.clone().into_pyarray(py))?;
+    out.set_item("atom_active_mask", active_mask)?;
+    out.set_item("fitted", fitted.into_pyarray(py))?;
+    out.set_item("reconstruction_r2", reconstruction_r2)?;
+    match term.tier0_mean() {
+        Some(mean) => out.set_item("tier0_mean", mean.clone().into_pyarray(py))?,
+        None => out.set_item("tier0_mean", py.None())?,
+    }
+    match term.tier0_scale() {
+        Some(scale) => out.set_item("tier0_scale", scale.clone().into_pyarray(py))?,
+        None => out.set_item("tier0_scale", py.None())?,
+    }
+    {
+        let termination = PyDict::new(py);
+        termination.set_item("verdict", outer_termination.verdict.as_str())?;
+        termination.set_item("evals", outer_termination.evals)?;
+        termination.set_item(
+            "evals_since_improvement",
+            outer_termination.evals_since_improvement,
+        )?;
+        termination.set_item("wall_seconds", outer_termination.wall.as_secs_f64())?;
+        out.set_item("termination", termination)?;
+    }
+    sae_set_penalized_loss_items(&out, &loss, "penalized_loss_score")?;
+    out.set_item(
+        "penalized_quasi_laplace_criterion",
+        penalized_quasi_laplace_criterion,
+    )?;
+    out.set_item("log_alpha", reported_log_alpha)?;
+    out.set_item("log_lambda_smooth", rho.log_lambda_smooth.clone())?;
+    out.set_item("log_lambda_sparse", rho.log_lambda_sparse)?;
+    out.set_item("log_ard", log_ard_py)?;
+    out.set_item("assignment_prior", assignment_kind)?;
+    out.set_item(
+        "solver_plan",
+        sae_streaming_plan_to_pydict(py, term.streaming_plan())?,
+    )?;
+    out.set_item(
+        "diagnostics",
+        sae_trust_diagnostics_dict(py, &trust_diagnostics)?,
+    )?;
+    out.set_item("dispersion", shape_uncertainty.dispersion)?;
+    out.set_item("metric_provenance", metric_provenance)?;
+    out.set_item(
+        "structured_residual_diagnostics",
+        structured_residual_pass_diagnostics_dict(py, &structured_residual_diagnostics)?,
+    )?;
+    if let Some(mr) = fisher_mass_residual {
+        out.set_item("fisher_mass_residual", mr.to_owned().into_pyarray(py))?;
+    }
+    out.set_item(
+        "atom_two_lens",
+        sae_atom_two_lens_dict(py, &fit_diagnostics.atom_two_lens)?,
+    )?;
+    out.set_item(
+        "residual_gauge",
+        sae_residual_gauge_dict(py, &fit_diagnostics.residual_gauge)?,
+    )?;
+    if let Some(report) = term.hybrid_split_report() {
+        out.set_item("hybrid_split", sae_hybrid_split_dict(py, report)?)?;
+    }
+    let cotrain = PyDict::new(py);
+    cotrain.set_item(
+        "recon_consistency",
+        amortized_encoder_consistency.recon_consistency,
+    )?;
+    cotrain.set_item(
+        "unconverged_fraction",
+        amortized_encoder_consistency.unconverged_fraction,
+    )?;
+    cotrain.set_item("n_unconverged", amortized_encoder_consistency.n_unconverged)?;
+    cotrain.set_item("n_encodes", amortized_encoder_consistency.n_encodes)?;
+    out.set_item("cotrain", cotrain)?;
+    if let Some(report) = &fit_diagnostics.incoherence_report {
+        out.set_item("curvature_report", sae_curvature_report_dict(py, report)?)?;
+        out.set_item(
+            "incoherence_report",
+            sae_incoherence_report_dict(py, report)?,
+        )?;
+    }
+    out.set_item(
+        "atom_inference",
+        sae_atom_inference_list(py, &fit_diagnostics.atom_inference)?,
+    )?;
+    out.set_item(
+        "coordinate_fidelity",
+        sae_coordinate_fidelity_dict(py, &fit_diagnostics.coordinate_fidelity)?,
+    )?;
+    out.set_item(
+        "topology_persistence",
+        topology_persistence_ffi::sae_topology_persistence_dict(
+            py,
+            &fit_diagnostics.topology_persistence,
+        )?,
+    )?;
+    out.set_item(
+        "certificates",
+        certificate_ledger_dict(py, &certificate_ledger)?,
+    )?;
+    let fitted_atom_plans = sae_fitted_atom_plans(&term, &atom_centers, seed_refine_random_state)
+        .map_err(py_value_error)?;
+    let atom_plans_py = PyList::empty(py);
+    for plan in fitted_atom_plans {
+        let entry = PyDict::new(py);
+        entry.set_item("kind", sae_atom_basis_kind_name(&plan.kind))?;
+        entry.set_item("latent_dim", plan.latent_dim)?;
+        entry.set_item("n_harmonics", plan.n_harmonics)?;
+        entry.set_item("basis_size", plan.basis_size)?;
+        match plan.duchon_centers {
+            Some(centers) => entry.set_item("duchon_centers", centers.into_pyarray(py))?,
+            None => entry.set_item("duchon_centers", py.None())?,
+        }
+        atom_plans_py.append(entry)?;
+    }
+    out.set_item("atom_plans", atom_plans_py)?;
+
+    out.set_item("chosen_k", k_atoms)?;
+    out.set_item("oos_projection_top1", top_k == Some(1))?;
+    if let Some(json) = structure_search_json {
+        out.set_item("structure_search", json)?;
+    }
+    out.set_item("structure_certificate", structure_certificate_json)?;
+    Ok(out.unbind())
+}
+
 /// Compute a steering plan with output dosimetry for a fitted SAE-manifold atom
 /// ([`gam::inference::steering::steer_delta`]).
 ///

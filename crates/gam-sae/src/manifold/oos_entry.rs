@@ -941,6 +941,217 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
     steer_delta(&term, metric, atom_k, metric_row, amplitude, &t_from, &t_to)
 }
 
+/// Fully owned, Python-free request to certify an externally-trained
+/// (torch-lane) SAE-manifold state (#2266 / #2263 item 4). Rebuilds the SAME
+/// frozen dictionary [`run_sae_manifold_oos`] / [`run_sae_manifold_steer`]
+/// rebuild from [`SaeOosAtomSpec`] + trained coordinates/logits — no
+/// coordinate or decoder solve; the caller's own (e.g. torch) training loop
+/// already produced them — installs it VERBATIM as
+/// [`SaeCertifyRequest::base_term`], and delegates to
+/// [`run_sae_manifold_certify`] for the shared post-fit diagnostics /
+/// anytime-valid structure certificate pipeline. This is the entry a torch-lane
+/// fit uses to obtain the same certificates a native closed-form fit gets,
+/// without pretending a stationarity certificate exists for state this entry
+/// never optimized.
+pub struct SaeCertifyExternalRequest {
+    /// The training target the externally-trained decoder was fit against.
+    pub target: Array2<f64>,
+    /// Persisted trained atoms (decoder + basis schema), identical to the OOS
+    /// dictionary definition.
+    pub atoms: Vec<SaeOosAtomSpec>,
+    /// The model's TRAINED per-row on-manifold coordinates, one `(n_obs,
+    /// latent_dim)` block per atom.
+    pub coords: Vec<Array2<f64>>,
+    /// The model's TRAINED per-row routing logits, `(n_obs, k_atoms)`.
+    pub logits: Array2<f64>,
+    /// Assignment family.
+    pub assignment: SaeOosAssignmentKind,
+    /// Saved active-set support; required for `TopK`.
+    pub top_k: Option<usize>,
+    /// Ordered Beta-Bernoulli concentration α (ignored outside that assignment).
+    pub alpha: f64,
+    /// Softmax / gate temperature.
+    pub tau: f64,
+    /// The trained terminal regularization state (same contract as
+    /// [`run_sae_manifold_oos`]: the certificate must be built at the
+    /// regularization that produced the decoder, not a default).
+    pub regularization: SaeOosRegularization,
+    /// The per-row output-Fisher metric to certify dosimetry through, or
+    /// `None` for the geometry-only Euclidean metric.
+    pub fisher_metric: Option<gam_problem::RowMetric>,
+    /// Pre-built analytic-penalty registry (built by the caller above
+    /// `gam-sae`, identical contract to [`SaeCertifyRequest::registry`]).
+    pub registry: AnalyticPenaltyRegistry,
+    pub max_iter: usize,
+    pub learning_rate: f64,
+    pub ridge_ext_coord: f64,
+    pub ridge_beta: f64,
+    pub isometry_pin_active: bool,
+    pub metric_provenance: &'static str,
+    /// #977/#997 evidence-guarded structure search around the installed
+    /// state (same default-true contract as [`SaeCertifyRequest`]).
+    pub run_structure_search: bool,
+}
+
+/// Certify an externally-trained (torch-lane) SAE-manifold fit with no
+/// closed-form solve. Shares its validation and term-rebuild with
+/// [`run_sae_manifold_oos`] / [`run_sae_manifold_steer`] (same
+/// [`SaeOosAtomSpec`] contract) so a torch-lane caller's decoder/coords/logits
+/// rebuild into the identical dictionary a native fit or OOS encode would, then
+/// hands the rebuilt term to [`run_sae_manifold_certify`] verbatim.
+pub fn run_sae_manifold_certify_external(
+    request: SaeCertifyExternalRequest,
+) -> Result<SaeFitReport, SaeFitError> {
+    let SaeCertifyExternalRequest {
+        target,
+        atoms: atom_specs,
+        coords,
+        logits,
+        assignment,
+        top_k,
+        alpha,
+        tau,
+        regularization,
+        fisher_metric,
+        registry,
+        max_iter,
+        learning_rate,
+        ridge_ext_coord,
+        ridge_beta,
+        isometry_pin_active,
+        metric_provenance,
+        run_structure_search,
+    } = request;
+    let k_atoms = atom_specs.len();
+    if k_atoms == 0 {
+        return Err(
+            "run_sae_manifold_certify_external: at least one atom is required"
+                .to_string()
+                .into(),
+        );
+    }
+    if coords.len() != k_atoms {
+        return Err(format!(
+            "run_sae_manifold_certify_external: coords must have K={k_atoms} per-atom blocks; got {}",
+            coords.len()
+        )
+        .into());
+    }
+    let (n_obs, p_out) = target.dim();
+    if n_obs == 0 || p_out == 0 {
+        return Err(format!(
+            "run_sae_manifold_certify_external: n_obs and p_out must be positive; got ({n_obs}, {p_out})"
+        )
+        .into());
+    }
+    if logits.dim() != (n_obs, k_atoms) || !logits.iter().all(|value| value.is_finite()) {
+        return Err(format!(
+            "run_sae_manifold_certify_external: logits must be a finite ({n_obs}, {k_atoms}) matrix; got {:?}",
+            logits.dim()
+        )
+        .into());
+    }
+    if let Some(support) = top_k {
+        if support == 0 || support > k_atoms {
+            return Err(format!(
+                "run_sae_manifold_certify_external: top_k must be in 1..={k_atoms}; got {support}"
+            )
+            .into());
+        }
+    }
+    match (assignment, top_k) {
+        (SaeOosAssignmentKind::TopK, None) => {
+            return Err(
+                "run_sae_manifold_certify_external: TopK assignment requires the saved top_k support size"
+                    .to_string()
+                    .into(),
+            );
+        }
+        (SaeOosAssignmentKind::TopK, Some(_)) | (_, None) => {}
+        (_, Some(support)) => {
+            return Err(format!(
+                "run_sae_manifold_certify_external: top_k={support} is valid only for TopK assignment"
+            )
+            .into());
+        }
+    }
+    finite_positive("alpha", alpha)?;
+    finite_positive("tau", tau)?;
+    let mode = match assignment {
+        SaeOosAssignmentKind::Softmax => AssignmentMode::softmax(tau),
+        SaeOosAssignmentKind::OrderedBetaBernoulli { learnable_alpha } => {
+            AssignmentMode::ordered_beta_bernoulli(tau, alpha, learnable_alpha)
+        }
+        SaeOosAssignmentKind::ThresholdGate { threshold } => {
+            if !threshold.is_finite() {
+                return Err(format!(
+                    "run_sae_manifold_certify_external: threshold-gate threshold must be finite; got {threshold}"
+                )
+                .into());
+            }
+            AssignmentMode::threshold_gate(tau, threshold)
+        }
+        SaeOosAssignmentKind::TopK => {
+            let support = top_k.ok_or_else(|| {
+                "run_sae_manifold_certify_external: TopK assignment requires the saved top_k support size"
+                    .to_string()
+            })?;
+            AssignmentMode::top_k_support(support)
+        }
+    };
+
+    let latent_dims: Vec<usize> = atom_specs.iter().map(|spec| spec.latent_dim).collect();
+    let mut coord_blocks = Vec::with_capacity(k_atoms);
+    let mut atoms = Vec::with_capacity(k_atoms);
+    for (atom_index, spec) in atom_specs.iter().enumerate() {
+        let block = &coords[atom_index];
+        if block.dim() != (n_obs, spec.latent_dim) {
+            return Err(format!(
+                "run_sae_manifold_certify_external: coords[{atom_index}] must be (N, d)=({n_obs}, {}); got {:?}",
+                spec.latent_dim,
+                block.dim()
+            )
+            .into());
+        }
+        if !block.iter().all(|value| value.is_finite()) {
+            return Err(format!(
+                "run_sae_manifold_certify_external: coords[{atom_index}] contains non-finite values"
+            )
+            .into());
+        }
+        atoms.push(build_oos_atom(atom_index, spec, block.view(), p_out)?);
+        coord_blocks.push(block.clone());
+    }
+    let manifolds = atom_specs
+        .iter()
+        .map(|spec| spec.basis_kind.latent_manifold(spec.latent_dim))
+        .collect();
+    let assignment_state =
+        SaeAssignment::from_blocks_with_mode_and_manifolds(logits, coord_blocks, manifolds, mode)?;
+    let mut base_term = SaeManifoldTerm::new(atoms, assignment_state)?;
+    if let Some(metric) = fisher_metric {
+        base_term.set_row_metric(metric)?;
+    }
+
+    let initial_rho = build_rho(regularization, &latent_dims)?;
+
+    run_sae_manifold_certify(SaeCertifyRequest {
+        base_term,
+        target,
+        registry,
+        initial_rho,
+        max_iter,
+        learning_rate,
+        ridge_ext_coord,
+        ridge_beta,
+        alpha,
+        isometry_pin_active,
+        metric_provenance,
+        run_structure_search,
+        cancel: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

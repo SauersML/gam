@@ -3327,6 +3327,108 @@ pub(crate) fn q_chain_derivs_scalar(eta_t: f64, eta_ls: f64) -> (f64, f64, f64, 
 }
 
 #[cfg(test)]
+mod patterned_order2_perf_tests {
+    use super::*;
+    use gam_math::jet_scalar::Order2;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn fixture() -> ([f64; SLS_ROW_K], SurvivalExactRowKernel) {
+        (
+            [0.4, -0.7, 0.2, 0.8, -0.35, 0.11, -0.25, 0.31, -0.17],
+            SurvivalExactRowKernel {
+                w: 1.3,
+                d: 1.0,
+                log_s0: -0.8,
+                r0: 0.7,
+                dr0: -0.3,
+                ddr0: 0.12,
+                dddr0: -0.05,
+                log_s1: -1.1,
+                r1: 0.9,
+                dr1: -0.4,
+                ddr1: 0.18,
+                dddr1: -0.08,
+                logphi1: -1.4,
+                dlogphi1: -0.6,
+                d2logphi1: -1.0,
+                d3logphi1: 0.0,
+                d4logphi1: 0.0,
+                log_g: -0.2,
+                d_log_g: 1.4,
+                d2_log_g: -1.96,
+                d3_log_g: 5.488,
+                d4_log_g: -23.0496,
+            },
+        )
+    }
+
+    fn dense(
+        p: &[f64; SLS_ROW_K],
+        kernel: &SurvivalExactRowKernel,
+    ) -> (f64, [f64; 9], [[f64; 9]; 9]) {
+        let vars: [Order2<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|axis| Order2::variable(p[axis], axis));
+        let out = sls_row_nll(&vars, kernel).expect("dense row NLL");
+        (out.value(), out.g(), out.h())
+    }
+
+    fn patterned(
+        p: &[f64; SLS_ROW_K],
+        kernel: &SurvivalExactRowKernel,
+    ) -> (f64, [f64; 9], [[f64; 9]; 9]) {
+        let vars: [SlsOrder2; SLS_ROW_K] =
+            std::array::from_fn(|axis| SlsOrder2::variable(p[axis], axis));
+        let out = sls_row_nll(&vars, kernel).expect("patterned row NLL");
+        (out.value(), out.g(), out.h())
+    }
+
+    #[test]
+    fn measure_sls_patterned_vs_dense_932() {
+        let (p, kernel) = fixture();
+        let want = dense(&p, &kernel);
+        let got = patterned(&p, &kernel);
+        let close = |a: f64, b: f64, label: &str| {
+            let tolerance = 1e-12 * a.abs().max(b.abs()).max(1.0);
+            assert!(
+                (a - b).abs() <= tolerance,
+                "{label}: {a:+.16e} vs {b:+.16e}"
+            );
+        };
+        close(got.0, want.0, "value");
+        for i in 0..SLS_ROW_K {
+            close(got.1[i], want.1[i], &format!("gradient[{i}]"));
+            for j in 0..SLS_ROW_K {
+                close(got.2[i][j], want.2[i][j], &format!("Hessian[{i},{j}]"));
+            }
+        }
+
+        let iterations = 2_000_000usize;
+        let mut best_dense = f64::INFINITY;
+        let mut best_patterned = f64::INFINITY;
+        for _ in 0..5 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(dense(black_box(&p), black_box(&kernel)));
+            }
+            best_dense = best_dense.min(started.elapsed().as_secs_f64());
+
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(patterned(black_box(&p), black_box(&kernel)));
+            }
+            best_patterned = best_patterned.min(started.elapsed().as_secs_f64());
+        }
+        let dense_ns = best_dense * 1e9 / iterations as f64;
+        let patterned_ns = best_patterned * 1e9 / iterations as f64;
+        eprintln!(
+            "SLS-PATTERNED-932 dense={dense_ns:.2} ns/row patterned={patterned_ns:.2} ns/row ratio={:.3}",
+            patterned_ns / dense_ns,
+        );
+    }
+}
+
+#[cfg(test)]
 mod simd_batch_bit_identity_tests {
     use super::*;
 

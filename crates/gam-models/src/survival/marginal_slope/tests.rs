@@ -8840,3 +8840,126 @@ fn rigid_survival_all_axes_build_once_equals_per_axis_sweep_979() {
         }
     }
 }
+
+/// gam#979 Jeffreys wide-p contracted-trace-Hessian FD verification (survival
+/// twin of the BMS gate `bernoulli_jeffreys_contracted_trace_hessian_matches_fd_of_trace`).
+///
+/// Builds the same kind of non-trivial rigid fixture as the build-once gate
+/// above (`oracle_rigid_family` + 2-column marginal/logslope designs, so the
+/// hook's `time` block genuinely shares 3 different design rows with the
+/// `q0/q1/qd1` primaries and `marginal_design` genuinely couples `q0` and
+/// `q1`), picks a fixed deterministic symmetric 5×5 trace weight `W`, and
+/// checks `family.joint_jeffreys_information_contracted_trace_hessian_with_specs`
+/// against central second differences of `tr(W · H(β))` (using the existing
+/// `exact_newton_joint_hessian` to get `H` at perturbed β) over several
+/// directions spanning all three blocks.
+#[test]
+fn survival_jeffreys_contracted_trace_hessian_matches_fd_of_trace() {
+    let n = 120usize;
+    let z: Vec<f64> = (0..n).map(|r| ((r as f64) * 0.29).sin() * 0.9).collect();
+    let weights: Vec<f64> = (0..n).map(|r| 0.6 + 0.4 * ((r % 5) as f64) / 5.0).collect();
+    let event: Vec<f64> = (0..n).map(|r| ((r % 3 == 0) as u8) as f64).collect();
+
+    let p_m = 2usize;
+    let p_g = 2usize;
+    let marginal_design = Array2::from_shape_fn((n, p_m), |(r, j)| {
+        0.2 + 0.05 * (r as f64).cos() + 0.11 * (j as f64) - 0.013 * (r as f64) / (n as f64)
+    });
+    let logslope_design = Array2::from_shape_fn((n, p_g), |(r, j)| {
+        0.1 + 0.07 * (r as f64).sin() - 0.09 * (j as f64) + 0.004 * (r as f64) / (n as f64)
+    });
+
+    let mut family = oracle_rigid_family(n, &z, &weights, &event, None);
+    family.marginal_design = DesignMatrix::from(marginal_design.clone());
+    family.logslope_design = DesignMatrix::from(logslope_design.clone());
+
+    let total = 1 + p_m + p_g;
+    let specs = vec![
+        dummy_blockspec(1),
+        dummy_blockspec(p_m),
+        dummy_blockspec(p_g),
+    ];
+
+    // beta_flat = [time(1), marginal(2), logslope(2)].
+    let states_at = |beta_flat: &Array1<f64>| -> Vec<ParameterBlockState> {
+        let beta_time = beta_flat.slice(ndarray::s![0..1]).to_owned();
+        let beta_marginal = beta_flat.slice(ndarray::s![1..1 + p_m]).to_owned();
+        let beta_logslope = beta_flat.slice(ndarray::s![1 + p_m..total]).to_owned();
+        let marginal_eta = marginal_design.dot(&beta_marginal);
+        let logslope_eta = logslope_design.dot(&beta_logslope);
+        vec![
+            ParameterBlockState {
+                beta: beta_time,
+                // Unused by the closed-form likelihood (recomputed from
+                // beta_time directly via the 3 time designs); zeros satisfy
+                // the CustomFamily interface shape contract only.
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: beta_marginal,
+                eta: marginal_eta,
+            },
+            ParameterBlockState {
+                beta: beta_logslope,
+                eta: logslope_eta,
+            },
+        ]
+    };
+
+    let beta0 = array![0.6, 0.18, -0.12, -0.2, 0.13];
+
+    // Fixed asymmetric-then-symmetrized 5x5 trace weight `W` (deterministic
+    // pseudo-noise pattern, no RNG dependency).
+    let mut w_raw = Array2::<f64>::zeros((total, total));
+    for i in 0..total {
+        for j in 0..total {
+            w_raw[[i, j]] = ((i * 7 + j * 11 + 2) % 13) as f64 * 0.1 - 0.6;
+        }
+    }
+    let w_raw_t = w_raw.t().to_owned();
+    let w = (&w_raw + &w_raw_t).mapv(|v| v * 0.5);
+
+    let states0 = states_at(&beta0);
+    let analytic = family
+        .joint_jeffreys_information_contracted_trace_hessian_with_specs(&states0, &specs, &w)
+        .expect("contracted trace hessian call")
+        .expect("rigid path must supply the contracted completion");
+    assert_eq!(analytic.dim(), (total, total));
+
+    let trace_of_hessian_at = |beta_flat: &Array1<f64>| -> f64 {
+        let states = states_at(beta_flat);
+        let h = family
+            .exact_newton_joint_hessian(&states)
+            .expect("exact_newton_joint_hessian")
+            .expect("exact_newton_joint_hessian some");
+        // tr(W H) = Σ_ij W_ij H_ij for symmetric W, H (H_ji = H_ij).
+        (&w * &h).sum()
+    };
+
+    let directions = [
+        array![1.0, 0.0, 0.0, 0.0, 0.0],
+        array![0.0, 1.0, 0.0, 0.0, 0.0],
+        array![0.0, 0.0, 1.0, 0.0, 0.0],
+        array![0.0, 0.0, 0.0, 1.0, 0.0],
+        array![0.0, 0.0, 0.0, 0.0, 1.0],
+        array![0.5, -0.4, 0.3, 0.6, -0.2],
+        array![-0.3, 0.5, -0.6, 0.2, 0.4],
+    ];
+    let eps = 1e-3;
+    for (idx, dir) in directions.iter().enumerate() {
+        let step: Array1<f64> = dir.mapv(|v| v * eps);
+        let beta_plus: Array1<f64> = &beta0 + &step;
+        let beta_minus: Array1<f64> = &beta0 - &step;
+        let plus = trace_of_hessian_at(&beta_plus);
+        let minus = trace_of_hessian_at(&beta_minus);
+        let center = trace_of_hessian_at(&beta0);
+        let fd_second = (plus - 2.0 * center + minus) / (eps * eps);
+        let analytic_quad = dir.dot(&analytic.dot(dir));
+        let rel = (fd_second - analytic_quad).abs() / fd_second.abs().max(1.0);
+        assert!(
+            rel < 1e-5,
+            "direction {idx}: survival contracted trace-Hessian FD mismatch: \
+             analytic={analytic_quad:.10e} fd={fd_second:.10e} rel={rel:.3e}"
+        );
+    }
+}

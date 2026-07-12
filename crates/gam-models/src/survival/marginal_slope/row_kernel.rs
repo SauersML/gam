@@ -1553,4 +1553,156 @@ impl SurvivalMarginalSlopeRowKernel {
             })
             .collect()
     }
+
+    /// gam#979 Jeffreys wide-p contracted-trace-Hessian for the rigid survival
+    /// marginal-slope kernel: `∇²_β tr(W · H(β))` for a caller-supplied
+    /// full-joint trace weight `W`. Binary twin of BMS's
+    /// `rigid_row_contracted_trace_hessian_coefficients` +
+    /// `joint_jeffreys_information_contracted_trace_hessian_with_specs`,
+    /// generalized from BMS's 2 block-orthogonal primaries to survival's 4
+    /// primaries `(q0, q1, qd1, g)`. Unlike BMS, the primaries are NOT
+    /// block-diagonal in coefficient space: `q0, q1, qd1` all read the SAME
+    /// `time` coefficient block (through three different design matrices),
+    /// and `q0, q1` are additionally coupled through `marginal_design`. So the
+    /// trace-weight projection cannot use BMS's simple per-block scalar
+    /// extraction; it goes through each primary's actual design-row
+    /// components (`primary_trace_weight`).
+    ///
+    /// Per row: project `W` into the row's 4×4 primary space via
+    /// `w_row[a][b] = jᵃᵀ·W·jᵇ` (`primary_trace_weight`), then contract the
+    /// row's fourth-order primary tensor `t4` against it —
+    /// `coeff[c][d] = Σ_{a,b} w_row[a][b]·t4[a][b][c][d]` — and pull the
+    /// resulting 4×4 back into coefficient space with the kernel's own
+    /// `add_pullback_hessian`, in the SAME deterministic `ARROW_ROW_CHUNK`
+    /// chunked-fold order the batched all-axes overrides above use.
+    pub(crate) fn contracted_trace_hessian(
+        &self,
+        weight: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let p = self.n_coefficients();
+        if weight.dim() != (p, p) {
+            return Err(format!(
+                "SurvivalMarginalSlopeRowKernel::contracted_trace_hessian: weight shape {:?} != ({p}, {p})",
+                weight.dim()
+            ));
+        }
+        let towers = self.build_row_towers()?;
+        self.chunked_pullback_reduce(p, |row, acc| -> Result<(), String> {
+            let w_row = self.primary_trace_weight(row, weight)?;
+            let t4 = &towers[row].t4;
+            let mut coeff = [[0.0_f64; 4]; 4];
+            for c in 0..4 {
+                for d in 0..4 {
+                    let mut s = 0.0;
+                    for a in 0..4 {
+                        for b in 0..4 {
+                            s += w_row[a][b] * t4[a][b][c][d];
+                        }
+                    }
+                    coeff[c][d] = s;
+                }
+            }
+            self.add_pullback_hessian(row, &coeff, acc);
+            Ok(())
+        })
+    }
+
+    /// Project the caller's full-joint trace weight `W` into row `row`'s 4×4
+    /// primary space: `w_row[a][b] = jᵃᵀ·W·jᵇ`, where `jᵃ` is primary `a`'s
+    /// row Jacobian written as its design-row COMPONENTS (each component a
+    /// `(design row, coefficient range)` pair) rather than a materialized
+    /// dense length-`p` vector — `q0 = (entry design, time) + (marginal
+    /// design, marginal)`, `q1 = (exit design, time) + (marginal design,
+    /// marginal)`, `qd1 = (derivative-exit design, time)`, `g = (logslope
+    /// design, logslope)`. Summing `component(a)·W[range,range]·component(b)`
+    /// over every pair of components is exactly `jᵃᵀ·W·jᵇ` since `W`
+    /// restricted to any range pair not covered by a component is multiplied
+    /// by an implicit zero there. Cost is `O(Σ p_block²)` per row (the same
+    /// complexity class as BMS's per-row trace contraction), not
+    /// `O(p_total²)`, since only the 3 real blocks (`time, marginal,
+    /// logslope`) — never the optional flex/influence ones, which this hook
+    /// only runs when inactive — are read.
+    fn primary_trace_weight(
+        &self,
+        row: usize,
+        weight: &Array2<f64>,
+    ) -> Result<[[f64; 4]; 4], String> {
+        let xt_e = self
+            .family
+            .design_entry
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("primary_trace_weight: design_entry row chunk failed: {e}"))?;
+        let xt_x = self
+            .family
+            .design_exit
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("primary_trace_weight: design_exit row chunk failed: {e}"))?;
+        let xt_d = self
+            .family
+            .design_derivative_exit
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| {
+                format!("primary_trace_weight: design_derivative_exit row chunk failed: {e}")
+            })?;
+        let xm = self
+            .family
+            .marginal_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("primary_trace_weight: marginal_design row chunk failed: {e}"))?;
+        let xg = self
+            .family
+            .logslope_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("primary_trace_weight: logslope_design row chunk failed: {e}"))?;
+
+        struct Component<'a> {
+            vec: ArrayView1<'a, f64>,
+            range: std::ops::Range<usize>,
+        }
+        let components: [Vec<Component<'_>>; 4] = [
+            vec![
+                Component {
+                    vec: xt_e.row(0),
+                    range: self.slices.time.clone(),
+                },
+                Component {
+                    vec: xm.row(0),
+                    range: self.slices.marginal.clone(),
+                },
+            ],
+            vec![
+                Component {
+                    vec: xt_x.row(0),
+                    range: self.slices.time.clone(),
+                },
+                Component {
+                    vec: xm.row(0),
+                    range: self.slices.marginal.clone(),
+                },
+            ],
+            vec![Component {
+                vec: xt_d.row(0),
+                range: self.slices.time.clone(),
+            }],
+            vec![Component {
+                vec: xg.row(0),
+                range: self.slices.logslope.clone(),
+            }],
+        ];
+
+        let mut w_row = [[0.0_f64; 4]; 4];
+        for a in 0..4 {
+            for b in 0..4 {
+                let mut acc = 0.0;
+                for ca in &components[a] {
+                    for cb in &components[b] {
+                        let wblk = weight.slice(s![ca.range.clone(), cb.range.clone()]);
+                        acc += ca.vec.dot(&wblk.dot(&cb.vec));
+                    }
+                }
+                w_row[a][b] = acc;
+            }
+        }
+        Ok(w_row)
+    }
 }

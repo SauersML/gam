@@ -568,6 +568,51 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         Ok(Some(axes))
     }
 
+    /// gam#979 wide-p Jeffreys completion: `∇²_β tr(W · H(β))` for a
+    /// caller-supplied full-joint trace weight `W`, in ONE `O(n · p_block²)`
+    /// pass instead of the `p(p+1)/2` pairwise `H''[e_a, e_b]` fallback.
+    /// Survival twin of BMS's
+    /// `joint_jeffreys_information_contracted_trace_hessian_with_specs`.
+    /// Survival declares Jeffreys information == observed Hessian (the trait
+    /// default `joint_jeffreys_information_matches_observed_hessian` stays
+    /// `true` here), so this contracts the OBSERVED joint Newton Hessian.
+    /// Only the rigid (non-per-z, non-flex, non-timewiggle) path has the
+    /// closed-form fourth-order primary tensor this needs
+    /// (`SurvivalMarginalSlopeRowKernel::contracted_trace_hessian`); every
+    /// other configuration falls back to `Ok(None)` (the generic pairwise
+    /// `H''` completion), matching the same gate order used by
+    /// `exact_newton_joint_hessian_directional_derivative` above.
+    fn joint_jeffreys_information_contracted_trace_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        weight: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if !self.outer_default_trustworthy_for_joint_hessian(specs)
+            && !self.joint_hessian_is_structurally_coupled(block_states)?
+        {
+            return Ok(None);
+        }
+        if self.per_z_logslope_active()
+            || self.effective_flex_active(block_states)?
+            || self.flex_timewiggle_active()
+        {
+            return Ok(None);
+        }
+        let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
+        kern.contracted_trace_hessian(weight).map(Some)
+    }
+
+    /// See [`Self::joint_jeffreys_information_contracted_trace_hessian_with_specs`]:
+    /// available whenever the rigid (non-per-z, non-flex, non-timewiggle)
+    /// path is taken; every other configuration returns `Ok(None)` from that
+    /// method and callers fall back correctly (no pairwise fallback for
+    /// those configurations, matching the documented cost tradeoff in
+    /// `gam-custom-family/src/jeffreys.rs`).
+    fn joint_jeffreys_information_contracted_trace_hessian_available(&self) -> bool {
+        true
+    }
+
     fn exact_newton_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
