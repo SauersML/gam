@@ -1518,6 +1518,50 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
+    // ── Jeffreys wide-p contracted-trace-Hessian row kernel ──────────────
+    //
+    // Binary twin of
+    // `binomial_location_scale::expected_joint_contracted_trace_hessian_from_designs`
+    // (gam#979): computes one row's contribution to `∇²_β tr(W · H(β))` for a
+    // caller-supplied full-joint trace weight `W`, where `H` is the OBSERVED
+    // joint Newton Hessian (BMS's Jeffreys information is declared identical
+    // to the observed Hessian via
+    // `joint_jeffreys_information_matches_observed_hessian` staying `true`).
+    //
+    // `H` is block-structured over the two rigid primaries
+    // `(marginal, logslope)`; for row `i` it equals
+    // `X_pᵀ h_i[p][q] X_q` summed over the primary block pair `(p, q)`, so
+    // `tr(W H) = Σ_i (trace_qq[i]·h_i[q][q] + trace_qg[i]·h_i[q][g] +
+    // trace_gg[i]·h_i[g][g])` where `trace_pq[i] = x_p[i]ᵀ W_pq x_q[i]`
+    // (the reference's `trace_tt`/`trace_tl`/`trace_ll`, renamed to this
+    // family's `(marginal=q, logslope=g)` primaries). Differentiating this
+    // linear functional of the row's local Hessian twice through
+    // `η_q[i] = x_q[i]·β_q`, `η_g[i] = x_g[i]·β_g` requires exactly the
+    // row's uncontracted FOURTH-order primary tensor (one order higher than
+    // the reference's third-order expected-information coefficients, because
+    // BMS's `H` is the observed Hessian — second order in the log-likelihood
+    // — rather than an expected/Fisher information already one order lower).
+    // `contract_fourth_full` at each of the three unit (marginal, logslope)
+    // direction pairs gives that second directional derivative of the row's
+    // full local Hessian in one call; combining with the trace scalars
+    // mirrors the reference's `coeff_tt[i] = trace_tt·tt_tt + trace_tl·tt_tl +
+    // trace_ll·tt_ll` pattern exactly, substituted for this family's own
+    // closed-form tensor.
+    pub(super) fn rigid_row_contracted_trace_hessian_coefficients(
+        fourth: &[[[[f64; 2]; 2]; 2]; 2],
+        trace_qq: f64,
+        trace_qg: f64,
+        trace_gg: f64,
+    ) -> (f64, f64, f64) {
+        let m_qq = contract_fourth_full(fourth, 1.0, 0.0, 1.0, 0.0);
+        let m_qg = contract_fourth_full(fourth, 1.0, 0.0, 0.0, 1.0);
+        let m_gg = contract_fourth_full(fourth, 0.0, 1.0, 0.0, 1.0);
+        let coeff_qq = trace_qq * m_qq[0][0] + trace_qg * m_qg[0][0] + trace_gg * m_gg[0][0];
+        let coeff_qg = trace_qq * m_qq[0][1] + trace_qg * m_qg[0][1] + trace_gg * m_gg[0][1];
+        let coeff_gg = trace_qq * m_qq[1][1] + trace_qg * m_qg[1][1] + trace_gg * m_gg[1][1];
+        (coeff_qq, coeff_qg, coeff_gg)
+    }
+
     /// Outer-aware variant of `log_likelihood_only`. When
     /// `options.outer_score_subsample` is `None` this iterates over all rows
     /// and returns a value identical (bit-for-bit) to the legacy full-data

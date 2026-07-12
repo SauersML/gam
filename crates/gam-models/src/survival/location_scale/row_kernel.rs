@@ -2,8 +2,8 @@ use super::*;
 
 use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 use gam_math::jet_scalar::{
-    DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar, OneSeed,
-    OneSeedBatch, OneSeedLane, Order2, Order2Lane, RuntimeJetScalar, TwoSeed,
+    DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, HessianPattern, JetScalar,
+    OneSeed, OneSeedBatch, OneSeedLane, Order2Lane, PatternedOrder2, RuntimeJetScalar, TwoSeed,
 };
 use wide::f64x4;
 
@@ -312,6 +312,50 @@ pub(crate) fn split_survival_psi_design(
 /// the index-space derivative tensors are diagonal in `i`.
 pub(crate) const SLS_ROW_K: usize = 9;
 
+/// The exact structural Hessian support of [`sls_row_nll`]. The likelihood is a
+/// sum of three univariate outer functions of:
+///
+/// - `u0`, depending on primaries `{0,4,7}`;
+/// - `u1`, depending on `{1,3,6}`;
+/// - `g`, depending on `{2,3,5,6,8}`.
+///
+/// Their symmetric pair union contains 24 channels. This pattern is an
+/// execution schedule for the same generic row expression, not a derivative
+/// formula.
+#[derive(Clone, Copy, Debug)]
+struct SlsHessianPattern;
+
+impl HessianPattern<SLS_ROW_K, 24> for SlsHessianPattern {
+    const PAIRS: [(usize, usize); 24] = [
+        (0, 0),
+        (0, 4),
+        (0, 7),
+        (1, 1),
+        (1, 3),
+        (1, 6),
+        (2, 2),
+        (2, 3),
+        (2, 5),
+        (2, 6),
+        (2, 8),
+        (3, 3),
+        (3, 5),
+        (3, 6),
+        (3, 8),
+        (4, 4),
+        (4, 7),
+        (5, 5),
+        (5, 6),
+        (5, 8),
+        (6, 6),
+        (6, 8),
+        (7, 7),
+        (8, 8),
+    ];
+}
+
+type SlsOrder2 = PatternedOrder2<SlsHessianPattern, SLS_ROW_K, 24>;
+
 /// `RowKernel<9>` adapter for the survival location-scale joint likelihood
 /// (non-wiggle path). Holds the per-β quantities already computed by
 /// [`SurvivalLocationScaleFamily::collect_joint_quantities_rescaled`] and
@@ -467,11 +511,10 @@ impl SurvivalLsRowKernel<'_> {
 /// * `S = TwoSeed<9>` → the contracted fourth `Σ_{cd} ℓ_{abcd} u_c v_d`
 ///   (2.8 KiB/row, the `RowKernel::row_fourth_contracted` path).
 ///
-/// (The packed `Order2<9>` value/grad/Hessian scalar — 728 B — is the base each
-/// of `OneSeed`/`TwoSeed` is built on, and is itself the oracle the live
-/// hand-assembled joint Hessian / block gradient are pinned against; a future
-/// joint-Hessian cutover would instantiate it here once a sparsity-aware packed
-/// jet closes the measured 3.8–5.3× gap against the bespoke sparse assembler.)
+/// The value/gradient/Hessian consumer instantiates this expression at
+/// [`SlsOrder2`], whose compile-time 24-pair Hessian pattern is the exact union
+/// induced by `(u0,u1,g)`. It omits the 57 impossible entries of a dense 9×9
+/// Hessian while preserving the same mathematical source.
 ///
 /// The nine primary channels are `(h_entry, h_exit, hdot_exit, eta_t_exit,
 /// eta_t_entry, eta_t_deriv, eta_ls_exit, eta_ls_entry, eta_ls_deriv)` — see
@@ -1416,36 +1459,26 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         row: usize,
     ) -> Result<(f64, [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K]), String> {
         // #932: value, gradient and Hessian derive from the SAME single-sourced
-        // row NLL (`sls_row_nll`) instantiated at the packed `Order2<9>` scalar —
-        // the exact order-≤2 truncation of the Leibniz / Faà di Bruno rules (728
-        // B/row). There is no longer a hand-assembled coefficient-space chain rule
+        // row NLL (`sls_row_nll`) instantiated at `SlsOrder2`, the exact
+        // order-≤2 Leibniz / Faà di Bruno algebra over the 24 structurally live
+        // upper-triangle Hessian pairs. There is no hand-assembled row chain rule
         // here: the `(v, g, H)` channels are the order-≤2 part of the very
         // expression whose order-3/4 directional contractions `row_third_contracted`
         // / `row_fourth_contracted` already evaluate, so all four channels share one
         // mathematical definition (the #736/#932 single-source contract). Identity
-        // seeding (`Order2::variable`) makes the ε/δ-free tower carry ∂/∂p_a and
+        // identity seeding makes the ε/δ-free tower carry ∂/∂p_a and
         // ∂²/∂p_a∂p_b directly. Bit-identical to `row_nll_tower(row)?` value/grad/
         // Hessian by the `survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels`
         // oracle (≤ 1e-9).
         //
-        // MEASURED PERF EXCEPTION (#932 speed audit, measured CPU): this dense
-        // `Order2<9>` v/g/H definition is ORACLE-PINNED (it is the single source
-        // the analytic joint-Hessian and block-gradient oracles compare the live
-        // hand assemblers against) but is NOT the production joint-Hessian path.
-        // The production non-wiggle joint Hessian ships the sparse
-        // `assemble_joint_hessian_from_quantities` because this dense jet is
-        // ~3.8–5.3× SLOWER (standalone ns/row + `--emit asm` op counts): a dense
-        // order-2 tower over 9 channels cannot recover the
-        // 3-functionally-independent-index × ≤5-touched-channel sparsity the
-        // bespoke chain rule hard-codes — inherent, not a tuning gap. DO NOT route
-        // the production joint Hessian through this dense `Order2<9>` row kernel
-        // without FIRST replacing it with a sparsity-aware packed jet; doing so
-        // as-is is a 3.8–5.3× regression. The hand path stays faithful to THIS
-        // single source via the analytic oracles named in
-        // `assemble_joint_hessian_from_quantities`'s doc.
+        // The former dense `Order2<9>` instantiation was measured 3.8–5.3× slower
+        // than the sparse hand assembler. `SlsOrder2` is the sparsity-aware
+        // replacement: it evaluates only the exact 24-pair support and expands
+        // structural zeros at the RowKernel boundary. Production cutover remains
+        // gated on a direct release benchmark against
+        // `assemble_joint_hessian_from_quantities`.
         let (p, kernel) = self.row_nll_inputs(row)?;
-        let vars: [Order2<SLS_ROW_K>; SLS_ROW_K] =
-            std::array::from_fn(|a| Order2::variable(p[a], a));
+        let vars: [SlsOrder2; SLS_ROW_K] = std::array::from_fn(|a| SlsOrder2::variable(p[a], a));
         let out = sls_row_nll(&vars, &kernel)?;
         Ok((out.value(), out.g(), out.h()))
     }

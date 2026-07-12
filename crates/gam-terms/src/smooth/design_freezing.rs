@@ -133,9 +133,19 @@ fn freeze_smooth_basis_from_metadata(
                 Some(z) => SpatialIdentifiability::FrozenTransform {
                     transform: z.clone(),
                 },
+                // `None` here does NOT mean "no orthogonality was requested":
+                // the term-collection builder defers ThinPlate/Duchon's
+                // `OrthogonalToParametric` centering to the global
+                // parametric-orthogonality step in `term_design.rs` (see
+                // `smooth_requires_parametric_orthogonality`), so the basis
+                // build always reports `identifiability_transform: None` for
+                // that policy even though centering is still required on
+                // every rebuild. Collapsing it to `None` here silently
+                // disabled that rebuild-time centering (gh#2274).
                 None => match &s.identifiability {
-                    SpatialIdentifiability::FrozenTransform { .. } => s.identifiability.clone(),
-                    _ => SpatialIdentifiability::None,
+                    SpatialIdentifiability::FrozenTransform { .. }
+                    | SpatialIdentifiability::OrthogonalToParametric => s.identifiability.clone(),
+                    SpatialIdentifiability::None => SpatialIdentifiability::None,
                 },
             };
             s.radial_reparam = radial_reparam.clone();
@@ -143,7 +153,11 @@ fn freeze_smooth_basis_from_metadata(
             *input_scales = meta_scales.clone();
         }
         (
-            SmoothBasisSpec::ThinPlate { feature_cols, .. },
+            SmoothBasisSpec::ThinPlate {
+                feature_cols,
+                spec: s_orig,
+                ..
+            },
             BasisMetadata::Duchon {
                 centers,
                 length_scale,
@@ -161,11 +175,24 @@ fn freeze_smooth_basis_from_metadata(
             // request to a pure Duchon spline because k < polynomial-nullspace
             // size at this dimension. Bake the resolved Duchon parameters into
             // the spec so predict-time goes through the same Duchon code path.
+            //
+            // `identifiability_transform: None` does NOT mean "no
+            // orthogonality was requested" — the term-collection builder
+            // defers `OrthogonalToParametric` centering to the global
+            // parametric-orthogonality step (`term_design.rs`), so preserve
+            // the original ThinPlate spec's policy instead of downgrading to
+            // `None` (gh#2274).
             let identifiability = match identifiability_transform {
                 Some(z) => SpatialIdentifiability::FrozenTransform {
                     transform: z.clone(),
                 },
-                None => SpatialIdentifiability::None,
+                None => match &s_orig.identifiability {
+                    SpatialIdentifiability::FrozenTransform { .. }
+                    | SpatialIdentifiability::OrthogonalToParametric => {
+                        s_orig.identifiability.clone()
+                    }
+                    SpatialIdentifiability::None => SpatialIdentifiability::None,
+                },
             };
             *basis = SmoothBasisSpec::Duchon {
                 feature_cols: feature_cols.clone(),

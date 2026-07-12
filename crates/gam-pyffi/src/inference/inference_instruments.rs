@@ -1200,6 +1200,83 @@ mod tests {
         assert_eq!(verdict.candidate_names.len(), 4);
     }
 
+    /// #2262 structureless-null control: on pure isotropic Gaussian noise (no
+    /// ring, no cluster structure whatsoever) both matched controls must still
+    /// run cleanly end to end and produce a well-formed
+    /// `control_false_circle_floor` in `{0.0, 0.5, 1.0}` — the exact quantity
+    /// the issue's false-circle-floor claim is built from. This exercises the
+    /// SAME `matched_control_verdicts` path `adjudicate_atom_shape` calls, just
+    /// without the Python boundary.
+    #[test]
+    fn matched_controls_report_a_well_formed_false_circle_floor_on_pure_noise_2262() {
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        use rand_distr::{Distribution, Normal};
+
+        let n = 300usize;
+        let mut rng = StdRng::seed_from_u64(2262);
+        let normal = Normal::new(0.0, 1.0).unwrap();
+        let mut coords = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            coords[[row, 0]] = normal.sample(&mut rng);
+            coords[[row, 1]] = normal.sample(&mut rng);
+        }
+
+        let ladder = [5usize, 7, 9];
+        let (shuffle_verdict, gaussian_verdict, false_circle_floor) = matched_control_verdicts(
+            coords.view(),
+            5,
+            2262,
+            &ladder,
+            Some(80.0), // plausible healthy-dictionary mean L0
+        )
+        .expect("matched controls must run cleanly on pure noise, not error out");
+
+        assert!(
+            (0.0..=1.0).contains(&false_circle_floor),
+            "false-circle floor must be a rate in [0, 1]: {false_circle_floor}"
+        );
+        assert!(
+            (false_circle_floor - 0.0).abs() < 1e-12
+                || (false_circle_floor - 0.5).abs() < 1e-12
+                || (false_circle_floor - 1.0).abs() < 1e-12,
+            "false-circle floor must be exactly {{0, 1/2, 1}} for a two-control average: got {false_circle_floor}"
+        );
+        assert_eq!(
+            false_circle_floor,
+            (usize::from(shuffle_verdict.circle_wins) + usize::from(gaussian_verdict.circle_wins))
+                as f64
+                / 2.0,
+            "reported floor must equal the mean of the two controls' own circle_wins flags"
+        );
+
+        // mean_l0 is mandatory: omitting it must be a clean error, not a panic
+        // or a silent floor.
+        let err = matched_control_verdicts(coords.view(), 5, 2262, &ladder, None)
+            .expect_err("mean_l0 must be required for matched controls");
+        assert!(err.contains("mean_l0"), "error should name mean_l0: {err}");
+    }
+
+    /// #2262 detection-reach statement: `detection_floor` surfaced by
+    /// `adjudicate_atom_shape` must be exactly the same closed-form MP edge
+    /// `mp_detection_floor` (and the production reconstruction-Gram pricing)
+    /// compute — no independent reimplementation to drift out of sync.
+    #[test]
+    fn detection_floor_matches_closed_form_mp_edge_2262() {
+        use gam::terms::sae::null_battery::mp_detection_floor;
+
+        let n_eff = 84.0;
+        let ambient_p = 64.0;
+        let dispersion_r = 1.005;
+        let expected = dispersion_r * (1.0 + (ambient_p / n_eff).sqrt()).powi(2);
+        let floor =
+            mp_detection_floor(n_eff, ambient_p, dispersion_r).expect("valid inputs must succeed");
+        assert!(
+            (floor - expected).abs() < 1e-12,
+            "floor={floor} expected={expected}"
+        );
+    }
+
     #[test]
     fn debiased_functional_seam_returns_finite_estimate_and_se_on_a_fit() {
         // A genuine penalized least-squares fit (the same regime the engine's
@@ -1641,6 +1718,39 @@ fn run_atom_shape_race(
     })
 }
 
+/// Run the two matched structureless controls (#2262) for one shape
+/// adjudication and return `(shuffle_verdict, gaussian_verdict,
+/// false_circle_floor)`. Pulled out of the pyfunction body so it is directly
+/// unit-testable on pure-noise fixtures without a Python interpreter.
+fn matched_control_verdicts(
+    coords_view: ArrayView2<'_, f64>,
+    folds: usize,
+    seed: u64,
+    ladder: &[usize],
+    mean_l0: Option<f64>,
+) -> Result<(AtomShapeRaceVerdict, AtomShapeRaceVerdict, f64), String> {
+    let mean_l0 = mean_l0.ok_or_else(|| {
+        "adjudicate_atom_shape: mean_l0 is required when matched_controls=True; a shape-verdict rate without dictionary sparsity is uninterpretable"
+            .to_string()
+    })?;
+    if !mean_l0.is_finite() || mean_l0 < 0.0 {
+        return Err(format!(
+            "adjudicate_atom_shape: mean_l0 must be finite and non-negative; got {mean_l0}"
+        ));
+    }
+    use gam::terms::sae::null_battery::{
+        covariance_matched_gaussian_null, per_dimension_shuffle_null,
+    };
+    let shuffled = per_dimension_shuffle_null(coords_view, seed ^ 0xD1AE_510F)?;
+    let gaussian = covariance_matched_gaussian_null(coords_view, seed ^ 0xC0A4_71A1)?;
+    let shuffle_verdict = run_atom_shape_race(shuffled.view(), folds, seed, ladder)?;
+    let gaussian_verdict = run_atom_shape_race(gaussian.view(), folds, seed, ladder)?;
+    let false_circle_floor = (usize::from(shuffle_verdict.circle_wins)
+        + usize::from(gaussian_verdict.circle_wins)) as f64
+        / 2.0;
+    Ok((shuffle_verdict, gaussian_verdict, false_circle_floor))
+}
+
 fn atom_shape_verdict_dict<'py>(
     py: Python<'py>,
     verdict: &AtomShapeRaceVerdict,
@@ -1708,8 +1818,24 @@ pub(crate) fn shape_matched_control<'py>(
 /// earlier SAE/grouping/PCA stages, generate each control at the pipeline entry
 /// with [`shape_matched_control`] and rerun every stage. Non-dictionary callers
 /// can explicitly disable `matched_controls` and receive no control-rate claim.
+///
+/// #2262 detection-reach statement: when `n_eff`, `ambient_p`, and
+/// `dispersion_r` are all supplied (the atom's occupancy-weighted effective
+/// sample size, the pre-projection ambient dictionary width, and the residual
+/// dispersion `R`), the returned dict also carries `detection_floor` — the
+/// Marchenko–Pastur noise edge `R·(1+√(ambient_p/n_eff))²` below which no
+/// reconstruction direction at this sample size and ambient dimension can be
+/// distinguished from noise (the identical closed-form edge the production
+/// rank charge thresholds on; see
+/// [`gam::terms::sae::null_battery::mp_detection_floor`]). A masked ring whose
+/// true signal energy sits below this floor is architecturally undetectable
+/// by the race regardless of the verdict returned, so this is a statement
+/// about detection reach, not a substitute for the verdict. Omitting any of
+/// the three inputs leaves `detection_floor` as `None`.
 #[pyfunction]
-#[pyo3(signature = (coords, folds = 5, seed = 11, k_ladder = None, mean_l0 = None, matched_controls = true))]
+#[pyo3(
+    signature = (coords, folds = 5, seed = 11, k_ladder = None, mean_l0 = None, matched_controls = true, n_eff = None, ambient_p = None, dispersion_r = None)
+)]
 pub(crate) fn adjudicate_atom_shape<'py>(
     py: Python<'py>,
     coords: numpy::PyReadonlyArray2<'py, f64>,
@@ -1718,6 +1844,9 @@ pub(crate) fn adjudicate_atom_shape<'py>(
     k_ladder: Option<Vec<usize>>,
     mean_l0: Option<f64>,
     matched_controls: bool,
+    n_eff: Option<f64>,
+    ambient_p: Option<f64>,
+    dispersion_r: Option<f64>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let coords_view = coords.as_array();
     let ladder = k_ladder.unwrap_or_else(|| gam::solver::MIXTURE_K_LADDER.to_vec());
@@ -1726,29 +1855,19 @@ pub(crate) fn adjudicate_atom_shape<'py>(
     let out = atom_shape_verdict_dict(py, &observed)?;
     out.set_item("dictionary_mean_l0", mean_l0)?;
 
+    let detection_floor = match (n_eff, ambient_p, dispersion_r) {
+        (Some(n_eff), Some(ambient_p), Some(dispersion_r)) => Some(
+            gam::terms::sae::null_battery::mp_detection_floor(n_eff, ambient_p, dispersion_r)
+                .map_err(py_value_error)?,
+        ),
+        _ => None,
+    };
+    out.set_item("detection_floor", detection_floor)?;
+
     if matched_controls {
-        let mean_l0 = mean_l0.ok_or_else(|| {
-            py_value_error(
-                "adjudicate_atom_shape: mean_l0 is required when matched_controls=True; a shape-verdict rate without dictionary sparsity is uninterpretable"
-                    .to_string(),
-            )
-        })?;
-        if !mean_l0.is_finite() || mean_l0 < 0.0 {
-            return Err(py_value_error(format!(
-                "adjudicate_atom_shape: mean_l0 must be finite and non-negative; got {mean_l0}"
-            )));
-        }
-        use gam::terms::sae::null_battery::{
-            covariance_matched_gaussian_null, per_dimension_shuffle_null,
-        };
-        let shuffled =
-            per_dimension_shuffle_null(coords_view, seed ^ 0xD1AE_510F).map_err(py_value_error)?;
-        let gaussian = covariance_matched_gaussian_null(coords_view, seed ^ 0xC0A4_71A1)
-            .map_err(py_value_error)?;
-        let shuffle_verdict =
-            run_atom_shape_race(shuffled.view(), folds, seed, &ladder).map_err(py_value_error)?;
-        let gaussian_verdict =
-            run_atom_shape_race(gaussian.view(), folds, seed, &ladder).map_err(py_value_error)?;
+        let (shuffle_verdict, gaussian_verdict, false_circle_floor) =
+            matched_control_verdicts(coords_view, folds, seed, &ladder, mean_l0)
+                .map_err(py_value_error)?;
         let controls = PyDict::new(py);
         controls.set_item(
             "per_dimension_shuffle",
@@ -1758,9 +1877,6 @@ pub(crate) fn adjudicate_atom_shape<'py>(
             "covariance_matched_gaussian",
             atom_shape_verdict_dict(py, &gaussian_verdict)?,
         )?;
-        let false_circle_floor = (usize::from(shuffle_verdict.circle_wins)
-            + usize::from(gaussian_verdict.circle_wins)) as f64
-            / 2.0;
         out.set_item("matched_controls", controls)?;
         out.set_item("control_false_circle_floor", false_circle_floor)?;
     } else {

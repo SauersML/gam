@@ -1091,6 +1091,192 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         .map(Some)
     }
 
+    /// gam#979 wide-p Jeffreys completion: `∇²_β tr(W · H(β))` for a
+    /// caller-supplied full-joint trace weight `W`, in ONE `O(n · p_block²)`
+    /// pass instead of the `p(p+1)/2` pairwise `H''[e_a, e_b]` fallback.
+    ///
+    /// Binary twin of
+    /// `binomial_location_scale::expected_joint_contracted_trace_hessian_from_designs`.
+    /// BMS declares Jeffreys information == observed Hessian
+    /// (`joint_jeffreys_information_matches_observed_hessian` stays `true`),
+    /// so this contracts the OBSERVED joint Newton Hessian rather than a
+    /// separate expected-information object. Only the rigid two-primary
+    /// `(marginal, logslope)` path has the closed-form fourth-order tensor
+    /// this needs (`rigid_row_fourth_full` / `fourth_full_cache`); the flex
+    /// score-warp/link-deviation extension widens the primary space beyond
+    /// what that tensor covers, so flex-active fits fall back to `None` (the
+    /// generic pairwise `H''` completion).
+    fn joint_jeffreys_information_contracted_trace_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        weight: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if !self.outer_default_trustworthy_for_joint_hessian(specs)
+            && !self.joint_hessian_is_structurally_coupled(block_states)?
+        {
+            return Ok(None);
+        }
+        if self.effective_flex_active(block_states)? {
+            return Ok(None);
+        }
+        let slices = block_slices(self);
+        let pt = slices.marginal.len();
+        let pg = slices.logslope.len();
+        let total = slices.total;
+        if weight.dim() != (total, total) {
+            return Err(format!(
+                "BMS joint_jeffreys_information_contracted_trace_hessian_with_specs: weight shape {:?} != ({total}, {total})",
+                weight.dim()
+            ));
+        }
+        let n = self.y.len();
+        if n == 0 {
+            return Ok(Some(Array2::zeros((total, total))));
+        }
+
+        let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
+        let fourth = kern.fourth_full_cache();
+        if fourth.len() != n {
+            return Err(format!(
+                "BMS joint_jeffreys_information_contracted_trace_hessian_with_specs: fourth-tensor cache length {} != n {n}",
+                fourth.len()
+            ));
+        }
+
+        const ROWS_PER_CHUNK: usize = 4096;
+        let n_chunks = n.div_ceil(ROWS_PER_CHUNK);
+        let accumulated = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            n_chunks,
+            |chunk_range: std::ops::Range<usize>| -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), String> {
+                let mut h_qq = Array2::<f64>::zeros((pt, pt));
+                let mut h_qg = Array2::<f64>::zeros((pt, pg));
+                let mut h_gg = Array2::<f64>::zeros((pg, pg));
+                for chunk_idx in chunk_range {
+                    let start = chunk_idx * ROWS_PER_CHUNK;
+                    let end = (start + ROWS_PER_CHUNK).min(n);
+                    let rows = start..end;
+
+                    let x_m_owned;
+                    let x_m_view = match self.marginal_design.as_dense_ref() {
+                        Some(dense) => dense.slice(s![rows.clone(), ..]),
+                        None => {
+                            x_m_owned = self.marginal_design.try_row_chunk(rows.clone()).map_err(
+                                |e| format!("BMS jeffreys contracted-trace: marginal row chunk failed: {e}"),
+                            )?;
+                            x_m_owned.view()
+                        }
+                    };
+                    let x_g_owned;
+                    let x_g_view = match self.logslope_design.as_dense_ref() {
+                        Some(dense) => dense.slice(s![rows.clone(), ..]),
+                        None => {
+                            x_g_owned = self.logslope_design.try_row_chunk(rows.clone()).map_err(
+                                |e| format!("BMS jeffreys contracted-trace: logslope row chunk failed: {e}"),
+                            )?;
+                            x_g_owned.view()
+                        }
+                    };
+
+                    for (local, row) in rows.clone().enumerate() {
+                        let x_m_row = x_m_view.row(local);
+                        let x_g_row = x_g_view.row(local);
+                        // trace_pq[row] = x_p[row]^T W_pq x_q[row], the row's
+                        // contribution to tr(W H) per output block pair;
+                        // mirrors the reference's trace_tt/trace_tl/trace_ll.
+                        let mut trace_qq = 0.0;
+                        for a in 0..pt {
+                            let xa = x_m_row[a];
+                            if xa == 0.0 {
+                                continue;
+                            }
+                            for b in 0..pt {
+                                trace_qq += xa * weight[[a, b]] * x_m_row[b];
+                            }
+                        }
+                        let mut trace_qg = 0.0;
+                        for a in 0..pt {
+                            let xa = x_m_row[a];
+                            if xa == 0.0 {
+                                continue;
+                            }
+                            for b in 0..pg {
+                                trace_qg += xa * (weight[[a, pt + b]] + weight[[pt + b, a]]) * x_g_row[b];
+                            }
+                        }
+                        let mut trace_gg = 0.0;
+                        for a in 0..pg {
+                            let xa = x_g_row[a];
+                            if xa == 0.0 {
+                                continue;
+                            }
+                            for b in 0..pg {
+                                trace_gg += xa * weight[[pt + a, pt + b]] * x_g_row[b];
+                            }
+                        }
+
+                        let (coeff_qq, coeff_qg, coeff_gg) =
+                            crate::bms::cell_moment_assembly::BernoulliMarginalSlopeFamily::rigid_row_contracted_trace_hessian_coefficients(
+                                &fourth[row],
+                                trace_qq,
+                                trace_qg,
+                                trace_gg,
+                            );
+
+                        for a in 0..pt {
+                            let xa = x_m_row[a];
+                            if xa == 0.0 {
+                                continue;
+                            }
+                            for b in 0..pt {
+                                h_qq[[a, b]] += coeff_qq * xa * x_m_row[b];
+                            }
+                            for b in 0..pg {
+                                h_qg[[a, b]] += coeff_qg * xa * x_g_row[b];
+                            }
+                        }
+                        for a in 0..pg {
+                            let xa = x_g_row[a];
+                            if xa == 0.0 {
+                                continue;
+                            }
+                            for b in 0..pg {
+                                h_gg[[a, b]] += coeff_gg * xa * x_g_row[b];
+                            }
+                        }
+                    }
+                }
+                Ok((h_qq, h_qg, h_gg))
+            },
+            |(mut acc_qq, mut acc_qg, mut acc_gg), (chunk_qq, chunk_qg, chunk_gg)| -> Result<_, String> {
+                acc_qq += &chunk_qq;
+                acc_qg += &chunk_qg;
+                acc_gg += &chunk_gg;
+                Ok((acc_qq, acc_qg, acc_gg))
+            },
+        )?;
+        let (h_qq, h_qg, h_gg) = accumulated.unwrap_or_else(|| {
+            (
+                Array2::zeros((pt, pt)),
+                Array2::zeros((pt, pg)),
+                Array2::zeros((pg, pg)),
+            )
+        });
+        let mut out = Array2::<f64>::zeros((total, total));
+        out.slice_mut(s![0..pt, 0..pt]).assign(&h_qq);
+        out.slice_mut(s![0..pt, pt..total]).assign(&h_qg);
+        out.slice_mut(s![pt..total, 0..pt]).assign(&h_qg.t());
+        out.slice_mut(s![pt..total, pt..total]).assign(&h_gg);
+        Ok(Some(out))
+    }
+
+    /// See [`Self::joint_jeffreys_information_contracted_trace_hessian_with_specs`]:
+    /// available whenever the rigid (non-flex) path is taken; the flex path
+    /// returns `Ok(None)` from that method and callers fall back correctly.
+    fn joint_jeffreys_information_contracted_trace_hessian_available(&self) -> bool {
+        true
+    }
+
     fn exact_newton_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],

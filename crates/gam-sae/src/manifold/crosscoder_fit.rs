@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicBool;
 use gam_solve::rho_optimizer::{OuterProblem, OuterResult};
 use gam_solve::seeding::SeedConfig;
 use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
-use ndarray::{Array2, s};
+use ndarray::{Array1, Array2, s};
 use serde::Serialize;
 
 use super::*;
@@ -47,13 +47,24 @@ pub fn pair_crosscoder_targets(
 /// Fully typed request for the crosscoder schedule over the unified engine.
 ///
 /// `base_term` must be seeded at the augmented width
-/// `anchor.ncols() + sum(block.target.ncols())`.  The target matrices are kept
-/// unscaled here; [`SaeManifoldOuterObjective::with_crosscoder_blocks`] owns the
-/// idempotent `sqrt(lambda_l)` materialization at every rho evaluation.
+/// `anchor.ncols() + sum(block.target.ncols())`.  The target matrices passed in
+/// (`anchor`, `blocks`) are kept unscaled/raw here; [`SaeManifoldOuterObjective::with_crosscoder_blocks`]
+/// owns the idempotent `sqrt(lambda_l)` materialization at every rho evaluation
+/// ON TOP of the per-column equilibration `column_scale` applies BEFORE the fit
+/// (#2015; see [`equilibrate_crosscoder_columns`]) — the two scalings compose
+/// (`internal_target = [Z | Y] / column_scale`, then blocks are further
+/// multiplied by `√λ_ℓ` in place), and the fitted term's `tier0_scale`
+/// (installed by [`run_sae_crosscoder_fit`]) undoes `column_scale` on every
+/// exposed reconstruction/decoder.
 pub struct SaeCrosscoderFitRequest {
     pub anchor_label: String,
     pub anchor: Array2<f64>,
     pub blocks: Vec<NamedCrosscoderTarget>,
+    /// Per-column equilibration scale (length `p_x + Σ p_ℓ`), computed by
+    /// [`equilibrate_crosscoder_columns`] over the SAME raw stacked
+    /// `[anchor | blocks...]` target `base_term`'s seed was built against, so
+    /// the seed and the objective's internal target agree on units.
+    pub column_scale: Array1<f64>,
     pub base_term: SaeManifoldTerm,
     pub registry: AnalyticPenaltyRegistry,
     pub initial_rho: SaeManifoldRho,
@@ -63,6 +74,69 @@ pub struct SaeCrosscoderFitRequest {
     pub ridge_beta: f64,
     pub run_outer_rho_search: bool,
     pub cancel: Option<Arc<AtomicBool>>,
+}
+
+/// Column-equilibrate an augmented crosscoder target in place (#2015): scale
+/// every column to unit root-mean-square, and return the per-column scale.
+///
+/// # Why
+///
+/// The joint arrow-Schur Newton solve's contraction rate is set by the output
+/// Hessian's conditioning. With no column equilibration, a real activation +
+/// behavior augmentation measured column-norm spreads of ~1.3e4 (leading
+/// activation PCA channels vs. the small end of the `√λ_y`-scaled behavior
+/// tangent columns), joint Hessian condition number ≈ 1e8 — the diagnosed root
+/// cause of the "~1e3 inner iterations then honest KKT refusal" wall on real
+/// Qwen data (gam#2015). Scaling each column to unit RMS (`D = diag(‖col‖)`,
+/// fit against `Z̃D⁻¹`) makes every output channel contribute at unit curvature
+/// to the shared latent coordinate, so the globalized Newton solve takes full
+/// steps instead of crawling.
+///
+/// # Why this does not fight the `λ_ℓ` block-weighting machinery
+///
+/// This runs on the RAW stacked target BEFORE any `√λ_ℓ` block scaling is
+/// materialized (`with_crosscoder_blocks` captures its `pristine_blocks` from
+/// the target AFTER this call, so the pristine baseline already carries
+/// `column_scale` and every subsequent `√λ_ℓ` rewrite layers on top of it,
+/// never replacing it). `λ_ℓ` is a single scalar per block — it does not
+/// vary the RELATIVE scale of that block's own columns — so equilibrating
+/// columns first and letting REML select `λ_ℓ` second leaves the model
+/// `λ_ℓ = φ_x/φ_ℓ` identification untouched; only the inner solve's
+/// conditioning changes.
+///
+/// A column whose RMS is at or below `√ε` of the largest column's RMS is
+/// numerically empty (an all-(near)zero output channel); scaling it would
+/// amplify representation noise, so it keeps unit scale (a scalar-type-derived
+/// floor, not a tuning knob) — mirrors the single-block Tier-0 standardization
+/// gate ([`SaeManifoldTerm::set_tier0_scale`]).
+pub fn equilibrate_crosscoder_columns(target: &mut Array2<f64>) -> Array1<f64> {
+    let (n_rows, p) = target.dim();
+    let mut scale = Array1::<f64>::zeros(p);
+    if n_rows == 0 {
+        scale.fill(1.0);
+        return scale;
+    }
+    let n = n_rows as f64;
+    for (col_idx, col) in target.columns().into_iter().enumerate() {
+        scale[col_idx] = (col.iter().map(|v| v * v).sum::<f64>() / n).sqrt();
+    }
+    let scale_max = scale.iter().cloned().fold(0.0_f64, f64::max);
+    if scale_max.is_finite() && scale_max > 0.0 {
+        let floor = scale_max * f64::EPSILON.sqrt();
+        for s in scale.iter_mut() {
+            if !(*s > floor) {
+                *s = 1.0;
+            }
+        }
+        for mut row in target.rows_mut() {
+            row /= &scale;
+        }
+    } else {
+        // Every column is exactly zero: nothing to equilibrate; unit scale is
+        // the honest no-op (dividing by it changes nothing).
+        scale.fill(1.0);
+    }
+    scale
 }
 
 /// Single source of truth for the automatic circle-crosscoder fit controls used
@@ -491,8 +565,13 @@ pub fn run_auto_sae_crosscoder_fit(
     request: SaeCrosscoderAutoFitRequest,
 ) -> Result<SaeCrosscoderFitReport, SaeFitError> {
     request.config.validate()?;
-    let (stacked, _, _) =
+    let (mut stacked, _, _) =
         stack_crosscoder_targets(&request.anchor_label, &request.anchor, &request.blocks)?;
+    // #2015 — equilibrate BEFORE seeding so the seed's decoder/coordinates are
+    // fit in the SAME conditioning frame `run_sae_crosscoder_fit` builds its
+    // objective in (it re-derives the identical `column_scale` from the same
+    // raw `anchor`/`blocks`, so the two stacked targets are byte-identical).
+    let column_scale = equilibrate_crosscoder_columns(&mut stacked);
     let assignment = SaeFitAssignmentKind::Softmax;
     let minimal = build_sae_minimal_seed(SaeMinimalSeedRequest {
         target: stacked.view(),
@@ -559,6 +638,7 @@ pub fn run_auto_sae_crosscoder_fit(
         anchor_label: request.anchor_label,
         anchor: request.anchor,
         blocks: request.blocks,
+        column_scale,
         base_term: seed.base_term,
         registry,
         initial_rho: seed.initial_rho,
@@ -821,7 +901,7 @@ fn certify_crosscoder_outer(
 pub fn run_sae_crosscoder_fit(
     mut request: SaeCrosscoderFitRequest,
 ) -> Result<SaeCrosscoderFitReport, SaeFitError> {
-    let (stacked, block_dims, labels) =
+    let (mut stacked, block_dims, labels) =
         stack_crosscoder_targets(&request.anchor_label, &request.anchor, &request.blocks)?;
     let p_x = request.anchor.ncols();
     if request.base_term.output_dim() != stacked.ncols() {
@@ -830,6 +910,23 @@ pub fn run_sae_crosscoder_fit(
             request.base_term.output_dim(),
             stacked.ncols()
         )));
+    }
+    if request.column_scale.len() != stacked.ncols() {
+        return Err(SaeFitError::Fit(format!(
+            "run_sae_crosscoder_fit: column_scale length {} != augmented target width {}",
+            request.column_scale.len(),
+            stacked.ncols()
+        )));
+    }
+    // #2015 — apply the SAME column equilibration the seed was built against
+    // (`run_auto_sae_crosscoder_fit` derives `column_scale` from this identical
+    // raw `[anchor | blocks...]` stack, so this reproduces it bit-for-bit) to
+    // the objective's own internal target, BEFORE `with_crosscoder_blocks`
+    // captures its `pristine_blocks` baseline below — so every subsequent
+    // `√λ_ℓ` block rewrite composes on top of the equilibrated columns rather
+    // than replacing them.
+    for mut row in stacked.rows_mut() {
+        row /= &request.column_scale;
     }
     if request.initial_rho.log_lambda_block.is_empty() {
         request.initial_rho.log_lambda_block = vec![0.0; block_dims.len()];
@@ -926,14 +1023,31 @@ pub fn run_sae_crosscoder_fit(
     let termination = fitted_result.termination;
     let layout = CrosscoderLayout::new(p_x, block_dims, labels, rho.log_lambda_block.clone())?;
     term.set_crosscoder_layout(layout.clone())?;
+    // #2015 — install the column-equilibration scale as the term's Tier-0
+    // scale so every reconstruction exit point (`try_fitted` and friends,
+    // which already add the Tier-0 scale/mean back in
+    // `add_tier0_mean_inplace`) returns honest per-column units automatically;
+    // `layer_decoder` reads it directly to un-scale exposed decoders below.
+    term.set_tier0_scale(request.column_scale.clone())
+        .map_err(SaeFitError::Fit)?;
 
     let scaled_fitted = term.try_fitted()?;
     let mut layers = Vec::with_capacity(1 + request.blocks.len());
     let anchor_fitted = scaled_fitted.slice(s![.., 0..p_x]).to_owned();
+    // #2015 — the internal decoder decodes the EQUILIBRATED anchor columns
+    // (Z/column_scale); multiply each column back by its own column_scale to
+    // expose the honest raw-Z decoder (mirrors `layer_decoder`'s un-scaling
+    // for the non-anchor blocks).
     let anchor_decoders = term
         .atoms
         .iter()
-        .map(|atom| atom.full_width_decoder().slice(s![.., 0..p_x]).to_owned())
+        .map(|atom| {
+            let mut decoder = atom.full_width_decoder().slice(s![.., 0..p_x]).to_owned();
+            for (col, &column_scale) in request.column_scale.iter().take(p_x).enumerate() {
+                decoder.column_mut(col).mapv_inplace(|v| v * column_scale);
+            }
+            decoder
+        })
         .collect();
     layers.push(CrosscoderLayerFit {
         label: request.anchor_label,

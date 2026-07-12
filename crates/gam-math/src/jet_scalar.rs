@@ -1037,6 +1037,165 @@ pub fn filtered_implicit_solve_scalar<const K: usize, S: JetScalar<K>>(
     a
 }
 
+// ── PatternedOrder2<P, K, H>: compile-time sparse Hessian ───────────────
+
+/// Compile-time upper-triangle Hessian pattern for [`PatternedOrder2`].
+///
+/// `PAIRS` contains exactly the `(row, column)` channels a row program can
+/// produce, with `row <= column`.  Pointwise Taylor algebra never couples one
+/// Hessian pair through another: output `H[i,j]` depends only on the two input
+/// `H[i,j]` channels and their `g[i]`/`g[j]` channels.  It is therefore exact to
+/// omit structurally impossible pairs rather than multiplying their zeros.
+pub trait HessianPattern<const K: usize, const H: usize> {
+    const PAIRS: [(usize, usize); H];
+}
+
+/// Exact order-two jet with a dense gradient and a compile-time patterned
+/// upper-triangle Hessian.
+///
+/// This carries `1 + K + H` scalars instead of `1 + K + K²`.  Its arithmetic is
+/// the same Leibniz/Faà-di-Bruno algebra as [`Order2`], evaluated only for the
+/// Hessian pairs declared by `P`.  A family row NLL remains written once over
+/// [`JetScalar`]; the pattern is an execution schedule, not a second derivative
+/// formula.
+#[derive(Debug)]
+pub struct PatternedOrder2<P, const K: usize, const H: usize> {
+    v: f64,
+    g: [f64; K],
+    h: [f64; H],
+    pattern: std::marker::PhantomData<fn() -> P>,
+}
+
+impl<P, const K: usize, const H: usize> Copy for PatternedOrder2<P, K, H> {}
+
+impl<P, const K: usize, const H: usize> Clone for PatternedOrder2<P, K, H> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P, const K: usize, const H: usize> PatternedOrder2<P, K, H>
+where
+    P: HessianPattern<K, H>,
+{
+    #[inline]
+    #[must_use]
+    pub fn g(&self) -> [f64; K] {
+        self.g
+    }
+
+    /// Expand the patterned upper triangle into the dense symmetric shape
+    /// required by the existing `RowKernel` interface. Missing pairs are exact
+    /// structural zeros.
+    #[inline]
+    #[must_use]
+    pub fn h(&self) -> [[f64; K]; K] {
+        let mut dense = [[0.0; K]; K];
+        for (slot, &(i, j)) in P::PAIRS.iter().enumerate() {
+            dense[i][j] = self.h[slot];
+            dense[j][i] = self.h[slot];
+        }
+        dense
+    }
+}
+
+impl<P, const K: usize, const H: usize> JetScalar<K> for PatternedOrder2<P, K, H>
+where
+    P: HessianPattern<K, H>,
+{
+    #[inline]
+    fn constant(c: f64) -> Self {
+        Self {
+            v: c,
+            g: [0.0; K],
+            h: [0.0; H],
+            pattern: std::marker::PhantomData,
+        }
+    }
+
+    #[inline]
+    fn variable(x: f64, axis: usize) -> Self {
+        let mut out = Self::constant(x);
+        if axis < K {
+            out.g[axis] = 1.0;
+        }
+        out
+    }
+
+    #[inline]
+    fn value(&self) -> f64 {
+        self.v
+    }
+
+    #[inline]
+    fn add(&self, other: &Self) -> Self {
+        let mut out = Self::constant(self.v + other.v);
+        for i in 0..K {
+            out.g[i] = self.g[i] + other.g[i];
+        }
+        for slot in 0..H {
+            out.h[slot] = self.h[slot] + other.h[slot];
+        }
+        out
+    }
+
+    #[inline]
+    fn sub(&self, other: &Self) -> Self {
+        let mut out = Self::constant(self.v - other.v);
+        for i in 0..K {
+            out.g[i] = self.g[i] - other.g[i];
+        }
+        for slot in 0..H {
+            out.h[slot] = self.h[slot] - other.h[slot];
+        }
+        out
+    }
+
+    #[inline]
+    fn mul(&self, other: &Self) -> Self {
+        let mut out = Self::constant(self.v * other.v);
+        for i in 0..K {
+            out.g[i] = self.v * other.g[i] + self.g[i] * other.v;
+        }
+        for (slot, &(i, j)) in P::PAIRS.iter().enumerate() {
+            out.h[slot] = self.v * other.h[slot]
+                + self.g[i] * other.g[j]
+                + self.g[j] * other.g[i]
+                + self.h[slot] * other.v;
+        }
+        out
+    }
+
+    #[inline]
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
+
+    #[inline]
+    fn scale(&self, scale: f64) -> Self {
+        let mut out = Self::constant(self.v * scale);
+        for i in 0..K {
+            out.g[i] = self.g[i] * scale;
+        }
+        for slot in 0..H {
+            out.h[slot] = self.h[slot] * scale;
+        }
+        out
+    }
+
+    #[inline]
+    fn compose_unary(&self, derivatives: [f64; 5]) -> Self {
+        let mut out = Self::constant(derivatives[0]);
+        for i in 0..K {
+            out.g[i] = derivatives[1] * self.g[i];
+        }
+        for (slot, &(i, j)) in P::PAIRS.iter().enumerate() {
+            out.h[slot] = derivatives[2] * self.g[i] * self.g[j] + derivatives[1] * self.h[slot];
+        }
+        out
+    }
+}
+
 // ── Order2<K>: value / gradient / Hessian (doc §A.1) ────────────────────
 
 /// Truncated SECOND-order scalar: value `v`, gradient `g_a`, Hessian `H_{ab}`.
@@ -2490,6 +2649,35 @@ mod tests {
             close(s.0.g[a], t.g[a], &format!("grad[{a}]"));
             for b in 0..2 {
                 close(s.h()[a][b], t.h[a][b], &format!("hess[{a}][{b}]"));
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct FullTwoPattern;
+
+    impl HessianPattern<2, 3> for FullTwoPattern {
+        const PAIRS: [(usize, usize); 3] = [(0, 0), (0, 1), (1, 1)];
+    }
+
+    /// Patterned order-two arithmetic is channel-identical to dense `Order2`
+    /// when the pattern covers the expression's complete Hessian support.
+    #[test]
+    fn patterned_order2_matches_dense_order2() {
+        type Sparse = PatternedOrder2<FullTwoPattern, 2, 3>;
+        let dense_vars: [Order2<2>; 2] = std::array::from_fn(|a| Order2::variable(SEED[a], a));
+        let sparse_vars: [Sparse; 2] = std::array::from_fn(|a| Sparse::variable(SEED[a], a));
+        let dense = row_expr(&dense_vars);
+        let sparse = row_expr(&sparse_vars);
+        close(sparse.value(), dense.value(), "patterned value");
+        for i in 0..2 {
+            close(sparse.g()[i], dense.g()[i], &format!("patterned grad[{i}]"));
+            for j in 0..2 {
+                close(
+                    sparse.h()[i][j],
+                    dense.h()[i][j],
+                    &format!("patterned hess[{i}][{j}]"),
+                );
             }
         }
     }

@@ -534,12 +534,18 @@ impl SaeManifoldTerm {
 
     /// The HONEST-units per-layer decoder `B_k^(ℓ)` of atom `k`, output block `ℓ`:
     /// the decoder columns of block `ℓ` divided by `√λ_ℓ` (un-doing the target
-    /// scaling that `stack_augmented_target` applied). Requires an installed
+    /// scaling that `stack_augmented_target` applied), and — when a Tier-0
+    /// column-equilibration scale is installed (#2015; see
+    /// [`Self::set_tier0_scale`] and `crosscoder_fit::equilibrate_crosscoder_columns`)
+    /// — un-doing that per-column scale too, so the returned decoder is honest in
+    /// the CALLER's raw target units regardless of the internal conditioning
+    /// frame the inner solve actually ran on. Requires an installed
     /// [`CrosscoderLayout`] (via a multi-block fit or [`Self::set_crosscoder_layout`]).
     ///
     /// This is the first-class form of the by-hand slice+unscale
-    /// (`decoder_coefficients[:, off_ℓ..off_ℓ+p_ℓ] / √λ_ℓ`): identical values, but
-    /// the offsets and `√λ_ℓ` are owned by the layout so no caller recomputes them.
+    /// (`decoder_coefficients[:, off_ℓ..off_ℓ+p_ℓ] / √λ_ℓ`, times the column's
+    /// tier0 scale): identical values, but the offsets, `√λ_ℓ`, and tier0 scale
+    /// are owned here so no caller recomputes them.
     pub fn layer_decoder(&self, k: usize, l: usize) -> Result<Array2<f64>, String> {
         let layout = self.crosscoder_layout.as_ref().ok_or_else(|| {
             "SaeManifoldTerm::layer_decoder: no crosscoder layout installed (run \
@@ -562,8 +568,16 @@ impl SaeManifoldTerm {
         // Materialize the full-width decoder before crossing the layer boundary;
         // the fit may use a reduced Grassmann coordinate internally.
         let physical = self.atoms[k].full_width_decoder();
-        let scaled = physical.slice(s![.., layout.block_range(l)]);
-        Ok(scaled.mapv(|value| inv * value))
+        let range = layout.block_range(l);
+        let scaled = physical.slice(s![.., range.clone()]);
+        let mut out = scaled.mapv(|value| inv * value);
+        if let Some(tier0_scale) = self.tier0_scale() {
+            for (local_col, global_col) in range.enumerate() {
+                let column_scale = tier0_scale[global_col];
+                out.column_mut(local_col).mapv_inplace(|v| v * column_scale);
+            }
+        }
+        Ok(out)
     }
 
     /// Snapshot the ENTIRE mutable fit state a λ line-search trial perturbs, so a
