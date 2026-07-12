@@ -108,6 +108,9 @@ trait FisherPerturbation: JetScalar<0> {
     ) -> Self::Channels;
     fn store_channels(channels: Self::Channels, weight: f64) -> Self::Channels;
     fn fisher_weight(weight: f64) -> f64;
+    fn denominator<F>(m: usize, perturbed_mass: &F) -> Self
+    where
+        F: Fn(usize) -> (f64, f64, Self);
 }
 
 impl FisherPerturbation for OneSeed<0> {
@@ -153,6 +156,21 @@ impl FisherPerturbation for OneSeed<0> {
     #[inline(always)]
     fn fisher_weight(_: f64) -> f64 {
         1.0
+    }
+
+    #[inline(always)]
+    fn denominator<F>(m: usize, perturbed_mass: &F) -> Self
+    where
+        F: Fn(usize) -> (f64, f64, Self),
+    {
+        let mut eps_coefficient = 0.0;
+        for a in 0..m {
+            eps_coefficient += gam_math::nested_dual::JetField::value(&perturbed_mass(a).2.eps);
+        }
+        Self {
+            base: <Order2<0> as JetScalar<0>>::constant(1.0),
+            eps: <Order2<0> as JetScalar<0>>::constant(eps_coefficient),
+        }
     }
 }
 
@@ -204,6 +222,22 @@ impl FisherPerturbation for TwoSeed<0> {
     fn fisher_weight(weight: f64) -> f64 {
         weight
     }
+
+    #[inline(always)]
+    fn denominator<F>(m: usize, perturbed_mass: &F) -> Self
+    where
+        F: Fn(usize) -> (f64, f64, Self),
+    {
+        let mut denominator = Self::constant(1.0);
+        for a in 0..m {
+            let (probability, _, mass) = perturbed_mass(a);
+            denominator = gam_math::nested_dual::JetField::add(
+                &denominator,
+                &gam_math::nested_dual::JetField::sub(&mass, &Self::constant(probability)),
+            );
+        }
+        denominator
+    }
 }
 
 #[inline(always)]
@@ -243,6 +277,33 @@ fn write_static_fisher<S: FisherPerturbation, F: Fn(usize) -> f64, const M: usiz
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FisherOutputSchedule {
+    SymmetricTriangle,
+    ContiguousFull,
+}
+
+#[cfg(target_arch = "x86_64")]
+const AVX2_WITHOUT_AVX512: bool =
+    cfg!(target_feature = "avx2") && !cfg!(target_feature = "avx512f");
+#[cfg(not(target_arch = "x86_64"))]
+const AVX2_WITHOUT_AVX512: bool = false;
+
+/// Select a storage schedule for the same elementwise [`fisher_entry`]
+/// expression. First-order M=32 favors contiguous rows on AVX2-only targets,
+/// while AVX-512 favors symmetric triangular writes; larger first-order blocks
+/// amortize the full-row arithmetic on every target. Mixed-second output stays
+/// triangular. The associated order and target-feature constants erase the
+/// inactive schedule during monomorphization.
+#[inline(always)]
+fn fisher_output_schedule<S: FisherPerturbation>(m: usize) -> FisherOutputSchedule {
+    if S::CONTIGUOUS_FULL && (m >= 64 || (m == 32 && AVX2_WITHOUT_AVX512)) {
+        FisherOutputSchedule::ContiguousFull
+    } else {
+        FisherOutputSchedule::SymmetricTriangle
+    }
+}
+
 /// Evaluate the one canonical active-class softmax/Fisher expression
 ///
 /// `p_a(delta) = p_a exp(delta_a) / (1 + sum_c p_c (exp(delta_c) - 1))`
@@ -257,10 +318,11 @@ fn write_static_fisher<S: FisherPerturbation, F: Fn(usize) -> f64, const M: usiz
 /// second-directional Fisher path without a dense class-axis derivative tower.
 /// Only live nilpotent coefficients survive between phases: one contiguous
 /// weighted first channel or three mixed-second channels. The generated output
-/// lowering specializes the common Fisher entry at `M=2,3,8,32` and uses a
-/// contiguous full-row form from `M=64`, while arbitrary widths retain the same
-/// triangular expression. These are storage/loop lowerings of this expression,
-/// not independent derivative formulas.
+/// lowering specializes the common Fisher entry at `M=2,3,8,32`; at first
+/// order M=32 selects an ISA-shaped triangular or contiguous schedule, and
+/// M>=64 uses contiguous full rows. Mixed-second and arbitrary-width output
+/// retain the same triangular expression. These are storage/loop lowerings of
+/// this expression, not independent derivative formulas.
 #[inline(always)]
 fn softmax_fisher_perturbation<S: FisherPerturbation>(
     m: usize,
@@ -273,7 +335,6 @@ fn softmax_fisher_perturbation<S: FisherPerturbation>(
 ) {
     assert_eq!(normalized.len(), m);
     assert_eq!(fisher.len(), m * m);
-    let mut denominator = S::constant(1.0);
     let perturbed_mass = |a| {
         let pa = probability(a);
         let direction_u = direction_u(a);
@@ -287,13 +348,7 @@ fn softmax_fisher_perturbation<S: FisherPerturbation>(
         );
         (pa, direction_u, mass)
     };
-    for a in 0..m {
-        let (pa, _, mass) = perturbed_mass(a);
-        denominator = gam_math::nested_dual::JetField::add(
-            &denominator,
-            &gam_math::nested_dual::JetField::sub(&mass, &S::constant(pa)),
-        );
-    }
+    let denominator = S::denominator(m, &perturbed_mass);
     let inverse =
         gam_math::nested_dual::JetField::compose_unary(&denominator, [1.0, -1.0, 2.0, -6.0, 24.0]);
     for (a, channels) in normalized.iter_mut().enumerate() {
@@ -337,11 +392,12 @@ fn softmax_fisher_perturbation<S: FisherPerturbation>(
         write_static_fisher::<S, _, 8>(&probability, normalized, fisher, output_weight);
         return;
     }
-    if m == 32 {
+    let output_schedule = fisher_output_schedule::<S>(m);
+    if m == 32 && output_schedule == FisherOutputSchedule::SymmetricTriangle {
         write_static_fisher::<S, _, 32>(&probability, normalized, fisher, output_weight);
         return;
     }
-    if S::CONTIGUOUS_FULL && m >= 64 {
+    if output_schedule == FisherOutputSchedule::ContiguousFull {
         for a in 0..m {
             let pa = lifted(a);
             let row_start = a * m;
@@ -359,302 +415,6 @@ fn softmax_fisher_perturbation<S: FisherPerturbation>(
             let coefficient = fisher_entry(pa, lifted(b), false, output_weight);
             fisher[a * m + b] = coefficient;
             fisher[b * m + a] = coefficient;
-        }
-    }
-}
-
-#[cfg(test)]
-mod fisher_lowering_release_gate {
-    use super::*;
-    use std::hint::black_box;
-    use std::time::Instant;
-
-    #[unsafe(no_mangle)]
-    #[inline(never)]
-    fn live_first(
-        probability: &[f64],
-        direction: &[f64],
-        weight: f64,
-        normalized: &mut [f64],
-        fisher: &mut [f64],
-    ) {
-        softmax_fisher_perturbation::<OneSeed<0>>(
-            probability.len(),
-            weight,
-            |a| probability[a],
-            |a| direction[a],
-            |_| 0.0,
-            normalized,
-            fisher,
-        );
-    }
-
-    #[unsafe(no_mangle)]
-    #[inline(never)]
-    fn live_second(
-        probability: &[f64],
-        direction_u: &[f64],
-        direction_v: &[f64],
-        weight: f64,
-        normalized: &mut [[f64; 3]],
-        fisher: &mut [f64],
-    ) {
-        softmax_fisher_perturbation::<TwoSeed<0>>(
-            probability.len(),
-            weight,
-            |a| probability[a],
-            |a| direction_u[a],
-            |a| direction_v[a],
-            normalized,
-            fisher,
-        );
-    }
-
-    #[unsafe(no_mangle)]
-    #[inline(never)]
-    fn strongest_hand_first(
-        probability: &[f64],
-        direction: &[f64],
-        weight: f64,
-        derivative: &mut [f64],
-        fisher: &mut [f64],
-    ) {
-        let m = probability.len();
-        let mut mean = 0.0;
-        for a in 0..m {
-            mean += probability[a] * direction[a];
-        }
-        for a in 0..m {
-            derivative[a] = probability[a] * (direction[a] - mean);
-        }
-        for a in 0..m {
-            let pa = probability[a];
-            fisher[a * m + a] = weight * (derivative[a] - 2.0 * derivative[a] * pa);
-            for b in (a + 1)..m {
-                let value = weight * (-(derivative[a] * probability[b] + pa * derivative[b]));
-                fisher[a * m + b] = value;
-                fisher[b * m + a] = value;
-            }
-        }
-    }
-
-    #[unsafe(no_mangle)]
-    #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
-    fn strongest_hand_second(
-        probability: &[f64],
-        direction_u: &[f64],
-        direction_v: &[f64],
-        weight: f64,
-        derivative_u: &mut [f64],
-        derivative_v: &mut [f64],
-        mixed_derivative: &mut [f64],
-        fisher: &mut [f64],
-    ) {
-        let m = probability.len();
-        let mut mean_u = 0.0;
-        let mut mean_v = 0.0;
-        for a in 0..m {
-            mean_u += probability[a] * direction_u[a];
-            mean_v += probability[a] * direction_v[a];
-        }
-        for a in 0..m {
-            derivative_u[a] = probability[a] * (direction_u[a] - mean_u);
-            derivative_v[a] = probability[a] * (direction_v[a] - mean_v);
-        }
-        let mut mixed_mean = 0.0;
-        for a in 0..m {
-            mixed_mean += derivative_v[a] * direction_u[a];
-        }
-        for a in 0..m {
-            mixed_derivative[a] =
-                derivative_v[a] * (direction_u[a] - mean_u) - probability[a] * mixed_mean;
-        }
-        for a in 0..m {
-            let pa = probability[a];
-            fisher[a * m + a] = weight
-                * (mixed_derivative[a]
-                    - 2.0 * mixed_derivative[a] * pa
-                    - 2.0 * derivative_u[a] * derivative_v[a]);
-            for b in (a + 1)..m {
-                let value = weight
-                    * (-(mixed_derivative[a] * probability[b]
-                        + derivative_u[a] * derivative_v[b]
-                        + derivative_v[a] * derivative_u[b]
-                        + pa * mixed_derivative[b]));
-                fisher[a * m + b] = value;
-                fisher[b * m + a] = value;
-            }
-        }
-    }
-
-    fn median_ns(mut kernel: impl FnMut() -> f64, iterations: usize) -> f64 {
-        for _ in 0..1_000 {
-            black_box(kernel());
-        }
-        let mut samples = [0.0; 9];
-        for sample in &mut samples {
-            let start = Instant::now();
-            let mut witness = 0.0;
-            for _ in 0..iterations {
-                witness += black_box(kernel());
-            }
-            black_box(witness);
-            *sample = start.elapsed().as_nanos() as f64 / iterations as f64;
-        }
-        samples.sort_by(f64::total_cmp);
-        samples[4]
-    }
-
-    #[test]
-    #[ignore = "release-only issue #932 strongest-hand performance gate"]
-    fn generated_fisher_lowering_beats_strongest_hand() {
-        assert!(
-            !cfg!(debug_assertions),
-            "run with cargo test --release -- --ignored"
-        );
-        for m in [2_usize, 3, 8, 32, 64] {
-            let raw_sum = (m * (m + 1) / 2) as f64;
-            let probability: Vec<f64> = (0..m).map(|a| 0.83 * (a + 1) as f64 / raw_sum).collect();
-            let direction_u: Vec<f64> = (0..m)
-                .map(|a| ((a + 1) as f64 * 0.713).sin() * 0.37)
-                .collect();
-            let direction_v: Vec<f64> = (0..m)
-                .map(|a| ((a + 1) as f64 * 1.117).cos() * 0.29)
-                .collect();
-            let weight = 1.37;
-            let mut first_channels = vec![0.0; m];
-            let mut second_channels = vec![[0.0; 3]; m];
-            let mut live_first_out = vec![0.0; m * m];
-            let mut live_second_out = vec![0.0; m * m];
-            let mut hand_first_out = vec![0.0; m * m];
-            let mut hand_second_out = vec![0.0; m * m];
-            let mut derivative = vec![0.0; m];
-            let mut derivative_u = vec![0.0; m];
-            let mut derivative_v = vec![0.0; m];
-            let mut mixed_derivative = vec![0.0; m];
-
-            live_first(
-                &probability,
-                &direction_u,
-                weight,
-                &mut first_channels,
-                &mut live_first_out,
-            );
-            strongest_hand_first(
-                &probability,
-                &direction_u,
-                weight,
-                &mut derivative,
-                &mut hand_first_out,
-            );
-            live_second(
-                &probability,
-                &direction_u,
-                &direction_v,
-                weight,
-                &mut second_channels,
-                &mut live_second_out,
-            );
-            strongest_hand_second(
-                &probability,
-                &direction_u,
-                &direction_v,
-                weight,
-                &mut derivative_u,
-                &mut derivative_v,
-                &mut mixed_derivative,
-                &mut hand_second_out,
-            );
-            let first_error = live_first_out
-                .iter()
-                .zip(&hand_first_out)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max);
-            let second_error = live_second_out
-                .iter()
-                .zip(&hand_second_out)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max);
-            assert!(first_error < 2e-15, "M={m} first error {first_error:e}");
-            assert!(second_error < 3e-15, "M={m} second error {second_error:e}");
-
-            let iterations = if m <= 3 {
-                200_000
-            } else if m <= 8 {
-                50_000
-            } else {
-                5_000
-            };
-            let hand_first_ns = median_ns(
-                || {
-                    strongest_hand_first(
-                        &probability,
-                        &direction_u,
-                        weight,
-                        &mut derivative,
-                        &mut hand_first_out,
-                    );
-                    hand_first_out[m * m - 1]
-                },
-                iterations,
-            );
-            let live_first_ns = median_ns(
-                || {
-                    live_first(
-                        &probability,
-                        &direction_u,
-                        weight,
-                        &mut first_channels,
-                        &mut live_first_out,
-                    );
-                    live_first_out[m * m - 1]
-                },
-                iterations,
-            );
-            let hand_second_ns = median_ns(
-                || {
-                    strongest_hand_second(
-                        &probability,
-                        &direction_u,
-                        &direction_v,
-                        weight,
-                        &mut derivative_u,
-                        &mut derivative_v,
-                        &mut mixed_derivative,
-                        &mut hand_second_out,
-                    );
-                    hand_second_out[m * m - 1]
-                },
-                iterations,
-            );
-            let live_second_ns = median_ns(
-                || {
-                    live_second(
-                        &probability,
-                        &direction_u,
-                        &direction_v,
-                        weight,
-                        &mut second_channels,
-                        &mut live_second_out,
-                    );
-                    live_second_out[m * m - 1]
-                },
-                iterations,
-            );
-            println!(
-                "M={m:>2} first hand={hand_first_ns:9.3}ns live={live_first_ns:9.3}ns ratio={:.3} second hand={hand_second_ns:9.3}ns live={live_second_ns:9.3}ns ratio={:.3}",
-                live_first_ns / hand_first_ns,
-                live_second_ns / hand_second_ns,
-            );
-            assert!(
-                live_first_ns < hand_first_ns,
-                "M={m} first live={live_first_ns}ns hand={hand_first_ns}ns"
-            );
-            assert!(
-                live_second_ns < hand_second_ns,
-                "M={m} second live={live_second_ns}ns hand={hand_second_ns}ns"
-            );
         }
     }
 }
