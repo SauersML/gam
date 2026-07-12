@@ -315,3 +315,134 @@ def test_tree_reducer_combiner_default_is_sum() -> None:
     partials = {0: np.array([1.0, 2.0]), 1: np.array([3.0, 4.0]), 2: np.array([5.0, 6.0])}
     got = TreeReducer([0, 1, 2]).reduce(partials)
     np.testing.assert_array_equal(got, np.array([9.0, 12.0]))
+
+
+@pytest.mark.parametrize("bad_rank", [True, 1.0, 1.5, "1"])
+def test_tree_reducer_rejects_lossy_rank_coercions(bad_rank: object) -> None:
+    with pytest.raises(TypeError, match="rank ids must be integers"):
+        TreeReducer([0, bad_rank])  # type: ignore[list-item]
+
+    reducer = TreeReducer([0, 1])
+    with pytest.raises(TypeError, match="rank ids must be integers"):
+        reducer.reduce({bad_rank: np.array([1.0]), 1: np.array([2.0])})  # type: ignore[dict-item]
+
+
+def test_tree_reducer_accepts_numpy_integral_rank_ids() -> None:
+    reducer = TreeReducer([np.int64(0), np.int32(1)])
+    got = reducer.reduce(
+        {np.int16(0): np.array([1.0]), np.int64(1): np.array([2.0])}
+    )
+    np.testing.assert_array_equal(got, np.array([3.0]))
+
+
+def test_tree_reducer_checkpoint_is_little_endian_and_nan_payload_exact() -> None:
+    bits = np.array(
+        [0x7FF8000000000042, 0x8000000000000000, 0x7FF0000000000000],
+        dtype=np.uint64,
+    )
+    little = bits.view(np.float64)
+    big = little.astype(np.dtype(">f8"))
+
+    little_session = TreeReducer([0]).start_session({0: little}, job_id="bits")
+    big_session = TreeReducer([0]).start_session({0: big}, job_id="bits")
+    assert little_session.input_fingerprint == big_session.input_fingerprint
+
+    result = little_session.reduce()
+    checkpoint = little_session.checkpoint()
+    assert checkpoint["entries"][0]["dtype"] == "<f8"
+    assert result.view(np.uint64).tolist() == bits.tolist()
+
+    resumed = TreeReducer([0]).start_session({0: little}, job_id="bits")
+    resumed.restore(json.loads(json.dumps(checkpoint)))
+    assert resumed.reduce().view(np.uint64).tolist() == bits.tolist()
+
+    different_payload = bits.copy()
+    different_payload[0] = np.uint64(0x7FF8000000000043)
+    different = TreeReducer([0]).start_session(
+        {0: different_payload.view(np.float64)}, job_id="bits"
+    )
+    assert different.input_fingerprint != little_session.input_fingerprint
+
+
+def test_tree_reducer_isolates_mutating_and_aliased_combiner_outputs() -> None:
+    retained_arguments: list[np.ndarray] = []
+
+    def destructive_add(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+        left += right
+        retained_arguments.append(left)
+        return left
+
+    reducer = TreeReducer(
+        [0, 1, 2], combine=destructive_add, combine_id="destructive-add.v1"
+    )
+    partials = {
+        0: np.array([1.0]),
+        1: np.array([2.0]),
+        2: np.array([3.0]),
+    }
+    session = reducer.start_session(partials, job_id="owned-cache")
+    np.testing.assert_array_equal(session.reduce(), np.array([6.0]))
+
+    # User code retained the exact arrays it mutated and returned. Those must
+    # be working copies, never arrays owned by the session cache.
+    for retained in retained_arguments:
+        retained.fill(999.0)
+    np.testing.assert_array_equal(session.reduce(), np.array([6.0]))
+
+    resumed = reducer.start_session(partials, job_id="owned-cache")
+    resumed.restore(json.loads(json.dumps(session.checkpoint())))
+    np.testing.assert_array_equal(resumed.reduce(), np.array([6.0]))
+
+
+def test_tree_reducer_restore_rejects_semantically_forged_internal_cache() -> None:
+    reducer = TreeReducer([0, 1])
+    partials = {0: np.array([1.0]), 1: np.array([2.0])}
+    source = reducer.start_session(partials, job_id="semantic-validation")
+    source.reduce()
+
+    # Produce a self-consistent SHA-256 checkpoint around an incorrect root.
+    # The checksum alone cannot establish that a subtree is the result of the
+    # declared combiner.
+    source._cache[source.tree.signature()] = np.array([1234.0])
+    forged = source.checkpoint()
+
+    target = reducer.start_session(partials, job_id="semantic-validation")
+    np.testing.assert_array_equal(target.reduce(), np.array([3.0]))
+    before = target.checkpoint()
+    with pytest.raises(ValueError, match="does not match deterministic reduction"):
+        target.restore(forged)
+    # Restore is transactional: a failed attempt cannot poison existing state.
+    assert target.checkpoint() == before
+    np.testing.assert_array_equal(target.reduce(), np.array([3.0]))
+
+
+def test_tree_reducer_restore_enforces_strict_json_checkpoint_shape() -> None:
+    reducer = TreeReducer([0])
+    partials = {0: np.array([1.0])}
+    source = reducer.start_session(partials, job_id="strict-json")
+    source.reduce()
+    checkpoint = source.checkpoint()
+
+    extra_top_level = dict(checkpoint)
+    extra_top_level["ignored"] = True
+    with pytest.raises(ValueError, match="keys mismatch"):
+        reducer.start_session(partials, job_id="strict-json").restore(extra_top_level)
+
+    malformed_entry = json.loads(json.dumps(checkpoint))
+    malformed_entry["entries"][0]["shape"] = [True]
+    with pytest.raises(ValueError, match="shape must be a list of integers"):
+        reducer.start_session(partials, job_id="strict-json").restore(malformed_entry)
+
+    wrong_dtype = json.loads(json.dumps(checkpoint))
+    wrong_dtype["entries"][0]["dtype"] = ">f8"
+    with pytest.raises(ValueError, match="dtype must be '<f8'"):
+        reducer.start_session(partials, job_id="strict-json").restore(wrong_dtype)
+
+    payload = json.dumps(checkpoint)
+    duplicate_key_payload = payload.replace(
+        '"schema":', '"schema": "duplicate", "schema":', 1
+    )
+    with pytest.raises(ValueError, match="malformed reduction checkpoint JSON"):
+        reducer.start_session(partials, job_id="strict-json").restore_json(
+            duplicate_key_payload
+        )
