@@ -229,9 +229,9 @@ pub fn sae_row_jets_cpu_softmax(
         let channels = execute_softmax_row_program(&source, inv_tau, 1.0);
         for a in 0..k {
             for c in 0..p {
-                first[(row * k + a) * p + c] = channels.first[a][c];
+                first[(row * k + a) * p + c] = channels.first(a)[c];
                 for b in 0..k {
-                    second[((row * k + a) * k + b) * p + c] = channels.second[a][b][c];
+                    second[((row * k + a) * k + b) * p + c] = channels.second(a, b)[c];
                 }
             }
         }

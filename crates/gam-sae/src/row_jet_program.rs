@@ -899,13 +899,6 @@ impl SaeScheduledRowJets {
         &mut self.data[start..start + self.p]
     }
 
-    pub(crate) fn first_rows(&self) -> impl Iterator<Item = &[f64]> {
-        self.data[..self.second_offset()].chunks_exact(self.p)
-    }
-
-    pub(crate) fn all_values_mut(&mut self) -> &mut [f64] {
-        &mut self.data
-    }
 }
 
 /// The derivative algebra of `Y = Σ_k z_k D_k`, where `z = softmax(r ℓ)`.
@@ -973,21 +966,25 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
     let n_beta = source.n_beta_borders();
     let mut out = SaeScheduledRowJets::zeros(q, p, n_beta);
 
-    // Compile the row's variable layout once.  Dense softmax uses the reduced
-    // K-1 logit chart; compact active-set rows may contain coordinates only.
-    let mut logits = Vec::with_capacity(q.min(k));
-    let mut coords = Vec::with_capacity(q);
-    for slot in 0..q {
-        match source.primary(slot) {
-            SaeRowPrimary::Logit { atom } => logits.push((slot, atom)),
-            SaeRowPrimary::Coord { atom, axis } => coords.push((slot, atom, axis)),
-        }
-    }
-
     // Component values and their softmax expectation.  Inactive components are
-    // the exact zero function but their probability still normalizes active gates.
-    let mut decoded = vec![0.0_f64; k * p];
-    let mut mean = vec![0.0_f64; p];
+    // the exact zero function but their probability still normalizes active
+    // gates. All non-output workspace lives in ONE allocation: K centered
+    // components, their P-wide expectation, and one reusable P-wide derivative
+    // buffer. The variable layout is read directly from the borrowed source;
+    // materializing separate logit/coordinate vectors would add two allocations
+    // per row without reducing the schedule's asymptotic work.
+    let decoded_len = k
+        .checked_mul(p)
+        .expect("SAE row-program decoded workspace length overflow");
+    let tail_len = p
+        .checked_mul(2)
+        .expect("SAE row-program scratch workspace length overflow");
+    let work_len = decoded_len
+        .checked_add(tail_len)
+        .expect("SAE row-program total workspace length overflow");
+    let mut work = vec![0.0_f64; work_len];
+    let (decoded, tail) = work.split_at_mut(decoded_len);
+    let (mean, scratch) = tail.split_at_mut(p);
     for atom in 0..k {
         if !source.atom_is_active(atom) {
             continue;
@@ -1013,13 +1010,19 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
     // Logit gradient and Hessian are centered softmax moments.  This is the
     // asymptotic win: O(L²P) for L free logits, versus O(L²KP) in the hand
     // `d2z[j][l][k] · decoded[k]` contraction and still more in a dense jet.
-    for &(slot_j, atom_j) in &logits {
+    for slot_j in 0..q {
+        let SaeRowPrimary::Logit { atom: atom_j } = source.primary(slot_j) else {
+            continue;
+        };
         let centered_j = &decoded[atom_j * p..(atom_j + 1) * p];
         let first_coefficient = sqrt_row_w * moment.expectation_first_coefficient(atom_j);
         for (target, &value) in out.first_mut(slot_j).iter_mut().zip(centered_j) {
             *target = first_coefficient * value;
         }
-        for &(slot_l, atom_l) in &logits {
+        for slot_l in 0..q {
+            let SaeRowPrimary::Logit { atom: atom_l } = source.primary(slot_l) else {
+                continue;
+            };
             let centered_l = &decoded[atom_l * p..(atom_l + 1) * p];
             let (j_coefficient, l_coefficient) =
                 moment.expectation_second_coefficients(atom_j, atom_l);
@@ -1033,30 +1036,35 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
 
     // Each coordinate belongs to exactly one component.  Its first jet is
     // scaled by z_k; differentiating that gate supplies every logit×coord block.
-    let mut scratch = vec![0.0_f64; p];
-    for &(coord_slot, atom, axis) in &coords {
+    for coord_slot in 0..q {
+        let SaeRowPrimary::Coord { atom, axis } = source.primary(coord_slot) else {
+            continue;
+        };
         if !source.atom_is_active(atom) {
             continue;
         }
-        source.fill_decoded_first(atom, axis, &mut scratch);
+        source.fill_decoded_first(atom, axis, scratch);
         let z = source.gate_value(atom);
         let coordinate_coefficient = z * sqrt_row_w;
-        for (target, &value) in out.first_mut(coord_slot).iter_mut().zip(&scratch) {
+        for (target, &value) in out.first_mut(coord_slot).iter_mut().zip(&*scratch) {
             *target = coordinate_coefficient * value;
         }
-        for &(logit_slot, logit_atom) in &logits {
+        for logit_slot in 0..q {
+            let SaeRowPrimary::Logit { atom: logit_atom } = source.primary(logit_slot) else {
+                continue;
+            };
             let coefficient = moment.gate_first(atom, logit_atom) * sqrt_row_w;
             for (target, &value) in out
                 .second_mut(logit_slot, coord_slot)
                 .iter_mut()
-                .zip(&scratch)
+                .zip(&*scratch)
             {
                 *target = coefficient * value;
             }
             for (target, &value) in out
                 .second_mut(coord_slot, logit_slot)
                 .iter_mut()
-                .zip(&scratch)
+                .zip(&*scratch)
             {
                 *target = coefficient * value;
             }
@@ -1065,17 +1073,31 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
 
     // Coordinate×coordinate curvature is block diagonal by atom.  The basis
     // source supplies the local quadratic jet, so no cross-atom zeros are built.
-    for &(slot_a, atom_a, axis_a) in &coords {
+    for slot_a in 0..q {
+        let SaeRowPrimary::Coord {
+            atom: atom_a,
+            axis: axis_a,
+        } = source.primary(slot_a)
+        else {
+            continue;
+        };
         if !source.atom_is_active(atom_a) {
             continue;
         }
-        for &(slot_b, atom_b, axis_b) in &coords {
+        for slot_b in 0..q {
+            let SaeRowPrimary::Coord {
+                atom: atom_b,
+                axis: axis_b,
+            } = source.primary(slot_b)
+            else {
+                continue;
+            };
             if atom_a != atom_b {
                 continue;
             }
-            source.fill_decoded_second(atom_a, axis_a, axis_b, &mut scratch);
+            source.fill_decoded_second(atom_a, axis_a, axis_b, scratch);
             let coefficient = source.gate_value(atom_a) * sqrt_row_w;
-            for (target, &value) in out.second_mut(slot_a, slot_b).iter_mut().zip(&scratch) {
+            for (target, &value) in out.second_mut(slot_a, slot_b).iter_mut().zip(&*scratch) {
                 *target = coefficient * value;
             }
         }
@@ -1096,7 +1118,10 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
         for (target, &value) in out.beta_mut(border).iter_mut().zip(output) {
             *target = base * value;
         }
-        for &(slot, logit_atom) in &logits {
+        for slot in 0..q {
+            let SaeRowPrimary::Logit { atom: logit_atom } = source.primary(slot) else {
+                continue;
+            };
             let scalar = moment.gate_first(atom, logit_atom) * phi * sqrt_row_w;
             for (target, &value) in out.beta_deriv_mut(slot, border).iter_mut().zip(output) {
                 *target = scalar * value;
@@ -1109,7 +1134,14 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
                 *target = scalar * value;
             }
         }
-        for &(slot, coord_atom, axis) in &coords {
+        for slot in 0..q {
+            let SaeRowPrimary::Coord {
+                atom: coord_atom,
+                axis,
+            } = source.primary(slot)
+            else {
+                continue;
+            };
             if coord_atom != atom {
                 continue;
             }
@@ -2225,11 +2257,11 @@ mod tests {
             let mut scale = 1.0_f64;
             for (column, tower) in generic.iter().enumerate() {
                 for a in 0..K {
-                    max_abs = max_abs.max((compiled.first[a][column] - tower.g()[a]).abs());
+                    max_abs = max_abs.max((compiled.first(a)[column] - tower.g()[a]).abs());
                     scale = scale.max(tower.g()[a].abs());
                     for b in 0..K {
-                        max_abs =
-                            max_abs.max((compiled.second[a][b][column] - tower.h()[a][b]).abs());
+                        max_abs = max_abs
+                            .max((compiled.second(a, b)[column] - tower.h()[a][b]).abs());
                         scale = scale.max(tower.h()[a][b].abs());
                     }
                 }
