@@ -32,16 +32,45 @@ pub enum GamlssError {
     /// optimization (invalid probabilities, non-finite log-likelihood,
     /// invalid λ, divergence).
     NumericalFailure { reason: String },
+    /// A finite predictor/input produced a row likelihood or fitting-geometry
+    /// quantity that cannot be represented by `f64`.  This is deliberately a
+    /// typed refusal: changing the predictor, response, or curvature with a
+    /// clamp/floor would fit a different objective.
+    RowGeometryUnrepresentable {
+        row: usize,
+        quantity: &'static str,
+        eta: f64,
+        value: f64,
+    },
 }
 
-impl_reason_error_boilerplate! {
-    GamlssError {
-        DimensionMismatch,
-        InvalidInput,
-        NonFinite,
-        UnsupportedConfiguration,
-        ConstraintViolation,
-        NumericalFailure,
+impl std::fmt::Display for GamlssError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DimensionMismatch { reason }
+            | Self::InvalidInput { reason }
+            | Self::NonFinite { reason }
+            | Self::UnsupportedConfiguration { reason }
+            | Self::ConstraintViolation { reason }
+            | Self::NumericalFailure { reason } => f.write_str(reason),
+            Self::RowGeometryUnrepresentable {
+                row,
+                quantity,
+                eta,
+                value,
+            } => write!(
+                f,
+                "GAMLSS row geometry is not representable at row {row}: {quantity} evaluated from eta={eta:?} produced {value:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GamlssError {}
+
+impl From<GamlssError> for String {
+    fn from(err: GamlssError) -> String {
+        err.to_string()
     }
 }
 
@@ -52,22 +81,6 @@ impl From<crate::block_layout::block_count::BlockCountMismatch> for GamlssError 
         }
     }
 }
-
-/// Numerical floor on μ ∈ (0, 1) used only for downstream `1/μ` and
-/// `1/(1-μ)` divisions and for `μ.ln()` / `(1-μ).ln()` in the generic
-/// composed-link binomial log-likelihood (where the logit-stable
-/// `log_expit` form is unavailable because `q` is the composed link
-/// argument, not the raw logit η). Pure numerical safety, NOT a model
-/// assumption — when the optimizer pushes μ to the floor it indicates a
-/// separated/saturated fit which is detected and surfaced upstream
-/// (`detect_logit_instability`, `Unstable` PIRLS status). For
-/// composed-link μ, derivatives `dμ/dq` etc. are NOT zeroed when the
-/// floor is hit; they carry the legitimate gradient signal of the
-/// outer link and zeroing them would create a phantom flat region that
-/// the optimizer would converge to as a stationary point.
-pub(crate) const MIN_PROB: f64 = 1e-10;
-
-pub(crate) const MIN_DERIV: f64 = 1e-8;
 
 /// Lower clamp on POSITIVE working weights `w_i = (dμ/dη)² / V(μ_i)`
 /// to keep `Xᵀ W X` numerically representable. Strictly numerical:
@@ -86,25 +99,6 @@ pub(crate) const MIN_DERIV: f64 = 1e-8;
 /// [`gam_problem::MIN_WEIGHT`] so every floored family shares one definition
 /// rather than re-declaring it per module.
 use gam_problem::MIN_WEIGHT;
-
-/// Hard symmetric clamp on η used by the Poisson / Gaussian / Gamma working-
-/// model log-likelihood loops to keep `exp(η)` and `log(σ)` finite under the
-/// IRLS step. Hoisted out of each loop so all three families share the same
-/// numerical regime.
-pub(crate) const ETA_HARD_CLAMP: f64 = 30.0;
-
-/// Saturated `exp(η)` used by every log-link mean reconstruction in this
-/// module: clamp η into `[−ETA_HARD_CLAMP, ETA_HARD_CLAMP]` so `exp` stays
-/// finite, then floor at `MIN_WEIGHT` so downstream divisions never see
-/// exact zero. Centralising the formula here means a tolerance change
-/// propagates to all three families (Poisson / Gaussian / Gamma) without
-/// risk of one path drifting.
-#[inline]
-pub(crate) fn saturated_exp_eta(eta: f64) -> f64 {
-    eta.clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP)
-        .exp()
-        .max(MIN_WEIGHT)
-}
 
 /// Floor applied to a fitted smoothing parameter λ before `ln(λ)` is taken to
 /// seed an outer-loop `initial_log_lambdas` warm start. A pilot fit can return

@@ -91,10 +91,10 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
     // assembly is byte-identical to the per-block-only path.
     let joint_bundle = options.joint_penalties.as_deref();
     let joint_log_lambdas: Vec<f64> = joint_bundle
-        .map(|b| b.log_lambdas.clone())
+        .map(|b| b.log_lambdas().to_vec())
         .unwrap_or_default();
     let joint_penalty_matrices: Vec<Array2<f64>> = joint_bundle
-        .map(|b| b.specs.iter().map(|s| s.matrix.clone()).collect())
+        .map(|b| b.specs().iter().map(|s| s.matrix.clone()).collect())
         .unwrap_or_default();
     for matrix in &joint_penalty_matrices {
         let root = penalty_matrix_root(matrix)?;

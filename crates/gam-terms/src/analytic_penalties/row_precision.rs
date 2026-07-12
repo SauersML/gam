@@ -1028,7 +1028,8 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
             ));
         }
         for k in 0..self.log_alpha.len() {
-            checked_exp_log_strength(self.active_log_alpha(k, rho))?;
+            checked_exp_log_strength(self.active_log_alpha(k, rho))
+                .map_err(|error| error.to_string())?;
             if !self.active_raw_beta(k, rho).is_finite() {
                 return Err(format!(
                     "parametric row-precision raw-beta coordinate {k} is non-finite"

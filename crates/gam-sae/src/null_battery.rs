@@ -1000,10 +1000,101 @@ fn fwht_rows_in_place(workspace: &mut [f64], rows: usize, cols: usize) -> Result
     Ok(())
 }
 
+/// Unit vector orthogonal to the all-ones direction. Its Householder
+/// reflection `Q = I - 2vv'` fixes the empirical mean, is dense for every
+/// `n >= 3`, and costs one projection plus one rank-one update instead of an
+/// `n x n` matrix. A seeded row permutation randomizes which observation is
+/// the distinguished final coordinate.
+fn dense_fixed_mean_householder_vector(n: usize) -> Result<Vec<f64>, String> {
+    if n < 3 {
+        return Err(format!(
+            "covariance-exact geometry destruction requires at least three rows; with n={n}, every mean-fixing orthogonal map is only a row permutation"
+        ));
+    }
+    let n_float = n as f64;
+    let small = (n_float * (n_float - 1.0)).sqrt().recip();
+    let large = -((n - 1) as f64) * small;
+    if !(small.is_finite() && small > 0.0 && large.is_finite()) {
+        return Err("could not construct the dense fixed-mean Householder vector".to_string());
+    }
+    let mut vector = Vec::new();
+    vector.try_reserve_exact(n).map_err(|error| {
+        format!(
+            "could not allocate dense fixed-mean Householder vector ({n} float64 scalars): {error}"
+        )
+    })?;
+    vector.resize(n, small);
+    vector[n - 1] = large;
+    Ok(vector)
+}
+
+fn is_walsh_character(signs: &[f64]) -> bool {
+    if signs.len() < 2 || !signs.len().is_power_of_two() || signs[0] != 1.0 {
+        return false;
+    }
+    for index in 0..signs.len() {
+        let mut expected = 1.0;
+        let mut remaining = index;
+        let mut bit = 0usize;
+        while remaining != 0 {
+            if remaining & 1 == 1 {
+                expected *= signs[1usize << bit];
+            }
+            remaining >>= 1;
+            bit += 1;
+        }
+        if signs[index] != expected {
+            return false;
+        }
+    }
+    true
+}
+
+fn fill_hadamard_signs(
+    signs: &mut [f64],
+    seed: u64,
+    block: HadamardBlock,
+) -> Result<(), String> {
+    if signs.len() != block.rows || !block.rows.is_power_of_two() {
+        return Err("Hadamard sign workspace does not match its block".to_string());
+    }
+    let block_ordinal = u64::try_from(block.ordinal).map_err(|_| {
+        format!(
+            "covariance-exact Hadamard block ordinal {} exceeds the seed domain",
+            block.ordinal
+        )
+    })?;
+    let mut sign_rng = StdRng::seed_from_u64(mix_seed(
+        seed ^ HADAMARD_SIGN_SEED_DOMAIN,
+        block_ordinal,
+        block.rows as u64,
+    ));
+    signs[0] = 1.0;
+    for sign in &mut signs[1..] {
+        *sign = if sign_rng.random_range(0..2) == 0 {
+            -1.0
+        } else {
+            1.0
+        };
+    }
+    // H diag(d) H / B is a signed row permutation exactly when `d` is a
+    // Walsh character. Exclude that finite bad set for every block where a
+    // genuinely mixing fixed-mean Hadamard map exists. Flipping one entry of a
+    // character cannot produce another character for B >= 4 (distinct
+    // characters differ on B/2 entries).
+    if block.rows >= 4 && is_walsh_character(signs) {
+        signs[1] = -signs[1];
+    }
+    Ok(())
+}
+
 fn transform_covariance_exact_hadamard_tile<T: NativeControlScalar>(
     data: &ArrayView2<'_, T>,
     permutation: &[usize],
     origin: &[f64],
+    column_scale: &[f64],
+    householder_projection: &[f64],
+    householder_vector: &[f64],
     seed: u64,
     tile: HadamardTile,
     workspace: &mut [f64],
@@ -1029,6 +1120,9 @@ fn transform_covariance_exact_hadamard_tile<T: NativeControlScalar>(
         || tile.cols == 0
         || column_end > p
         || origin.len() != p
+        || column_scale.len() != p
+        || householder_projection.len() != p
+        || householder_vector.len() != permutation.len()
     {
         return Err(format!(
             "covariance-exact Hadamard block {} has an invalid internal plan",
@@ -1052,7 +1146,8 @@ fn transform_covariance_exact_hadamard_tile<T: NativeControlScalar>(
     let inverse_rows = 1.0 / block.rows as f64;
 
     for local_row in 0..block.rows {
-        let source_row = permutation[block.start + local_row];
+        let permuted_row = block.start + local_row;
+        let source_row = permutation[permuted_row];
         if source_row >= data.nrows() {
             return Err(format!(
                 "covariance-exact Hadamard permutation row {source_row} is out of bounds"
@@ -1064,7 +1159,16 @@ fn transform_covariance_exact_hadamard_tile<T: NativeControlScalar>(
             // absolute origin from erasing small covariance-bearing residuals
             // while Q·1 = 1 restores the same origin exactly.
             let relative = data[[source_row, col]].widen() - origin[col];
-            let scaled = relative * inverse_rows;
+            let normalized_relative = if column_scale[col] > 0.0 {
+                relative / column_scale[col]
+            } else {
+                0.0
+            };
+            let mixed_relative = (-2.0 * householder_vector[permuted_row]).mul_add(
+                householder_projection[col],
+                normalized_relative,
+            );
+            let scaled = mixed_relative * inverse_rows;
             if !scaled.is_finite() {
                 return Err(format!(
                     "{} covariance-exact Hadamard residual overflowed at input row {source_row}, column {col}",
@@ -1076,25 +1180,7 @@ fn transform_covariance_exact_hadamard_tile<T: NativeControlScalar>(
     }
 
     fwht_rows_in_place(workspace, block.rows, tile.cols)?;
-    let block_ordinal = u64::try_from(block.ordinal).map_err(|_| {
-        format!(
-            "covariance-exact Hadamard block ordinal {} exceeds the seed domain",
-            block.ordinal
-        )
-    })?;
-    let mut sign_rng = StdRng::seed_from_u64(mix_seed(
-        seed ^ HADAMARD_SIGN_SEED_DOMAIN,
-        block_ordinal,
-        block.rows as u64,
-    ));
-    signs[0] = 1.0;
-    for sign in &mut signs[1..] {
-        *sign = if sign_rng.random_range(0..2) == 0 {
-            -1.0
-        } else {
-            1.0
-        };
-    }
+    fill_hadamard_signs(signs, seed, block)?;
     for local_row in 0..block.rows {
         let sign = signs[local_row];
         for local_col in 0..tile.cols {
@@ -1144,6 +1230,67 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
     permutation.extend(0..n);
     let mut permutation_rng = StdRng::seed_from_u64(seed ^ HADAMARD_PERMUTATION_SEED_DOMAIN);
     permutation.shuffle(&mut permutation_rng);
+
+    let householder_vector = dense_fixed_mean_householder_vector(n)?;
+    let mut column_scale = Vec::<f64>::new();
+    column_scale.try_reserve_exact(p).map_err(|error| {
+        format!(
+            "could not allocate covariance-exact Hadamard column scales ({p} float64 scalars): {error}"
+        )
+    })?;
+    column_scale.resize(p, 0.0);
+    for &source_row in &permutation {
+        for col in 0..p {
+            let relative = data[[source_row, col]].widen() - origin[col];
+            if !relative.is_finite() {
+                return Err(format!(
+                    "{} covariance-exact Hadamard residual range is not representable at input row {source_row}, column {col}",
+                    T::TYPE_NAME
+                ));
+            }
+            column_scale[col] = column_scale[col].max(relative.abs());
+        }
+    }
+    let mut householder_projection = Vec::<f64>::new();
+    householder_projection
+        .try_reserve_exact(p)
+        .map_err(|error| {
+            format!(
+                "could not allocate covariance-exact Hadamard Householder projection ({p} float64 scalars): {error}"
+            )
+        })?;
+    householder_projection.resize(p, 0.0);
+    let mut projection_correction = Vec::<f64>::new();
+    projection_correction
+        .try_reserve_exact(p)
+        .map_err(|error| {
+            format!(
+                "could not allocate covariance-exact Hadamard projection correction ({p} float64 scalars): {error}"
+            )
+        })?;
+    projection_correction.resize(p, 0.0);
+    for (permuted_row, &source_row) in permutation.iter().enumerate() {
+        for col in 0..p {
+            let normalized_relative = if column_scale[col] > 0.0 {
+                (data[[source_row, col]].widen() - origin[col]) / column_scale[col]
+            } else {
+                0.0
+            };
+            neumaier_add(
+                &mut householder_projection[col],
+                &mut projection_correction[col],
+                householder_vector[permuted_row] * normalized_relative,
+            )?;
+        }
+    }
+    for col in 0..p {
+        householder_projection[col] += projection_correction[col];
+        if !householder_projection[col].is_finite() {
+            return Err(format!(
+                "covariance-exact Hadamard Householder projection is non-finite on column {col}"
+            ));
+        }
+    }
 
     let mut out = fallible_native_output::<T>(n, p, "covariance-exact Hadamard")?;
     let total_workspace_scalars = workspace_scalars
@@ -1208,6 +1355,9 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
                     &data,
                     &permutation,
                     &origin,
+                    &column_scale,
+                    &householder_projection,
+                    &householder_vector,
                     seed,
                     *tile,
                     &mut workspace[..block_scalars],
@@ -1242,7 +1392,8 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
                 let output_row = tile.block.start + local_row;
                 for local_col in 0..tile.cols {
                     let col = tile.first_col + local_col;
-                    let value = origin[col] + workspace[local_row * tile.cols + local_col];
+                    let value = workspace[local_row * tile.cols + local_col]
+                        .mul_add(column_scale[col], origin[col]);
                     out[[output_row, col]] = T::narrow(value).ok_or_else(|| {
                         format!(
                             "{} covariance-exact Hadamard output overflowed at row {output_row}, column {col}",
@@ -1258,17 +1409,22 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
 
 /// Seeded structureless control preserving empirical mean and full covariance.
 ///
-/// Rows are globally permuted, partitioned greedily into power-of-two blocks no
-/// larger than [`COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS`], and transformed by
-/// `Q = H D H / B` in each block. `H` is the unnormalised Sylvester Hadamard
-/// matrix and the first Rademacher sign in `D` is fixed to +1. Therefore
-/// `Q'Q = I` and `Q·1 = 1`: mean and centered cross-product are invariant in
-/// exact arithmetic, while rowwise radii and nonlinear manifold geometry are
-/// mixed. Row-block/column-band tiles run independently with sequential
-/// butterfly arithmetic. Peak transform storage is at most
+/// Rows are globally permuted and first reflected by the dense mean-fixing
+/// Householder map `Q0 = I - 2vv'`, where `v'1 = 0`. They are then partitioned
+/// greedily into power-of-two blocks no larger than
+/// [`COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS`] and transformed by
+/// `Qb = H D H / B` in each block. `H` is the unnormalised Sylvester Hadamard
+/// matrix and the first Rademacher sign in `D` is fixed to +1; Walsh-character
+/// sign patterns that would reduce `Qb` to a row permutation are excluded for
+/// `B >= 4`. Thus the composite `Qb Q0` is genuinely mixing even for binary
+/// tail blocks, while `Q'Q = I` and `Q·1 = 1` preserve the mean and centered
+/// cross-product in exact arithmetic. With fewer than three rows no
+/// non-permutation mean-fixing orthogonal map exists, so the control refuses.
+/// Row-block/column-band tiles run independently with sequential butterfly
+/// arithmetic. Peak transform storage is at most
 /// `min(8, Rayon threads) × B × p` float64 scalars and never exceeds the
-/// 128-MiB active-workspace budget; column banding makes each tile at most
-/// 32 MiB.
+/// 128-MiB active-workspace budget, plus `O(n + p)` for the Householder vector
+/// and its column projections; column banding makes each tile at most 32 MiB.
 pub fn covariance_exact_hadamard_null(
     data: ArrayView2<'_, f64>,
     seed: u64,

@@ -75,7 +75,7 @@ pub enum JointPenaltyError {
         col: usize,
         value: f64,
     },
-    NonFiniteInitialLogLambda {
+    InitialLogStrengthOutOfDomain {
         value: f64,
     },
     NotSymmetric {
@@ -110,8 +110,8 @@ impl std::fmt::Display for JointPenaltyError {
                 f,
                 "joint penalty matrix has non-finite entry at ({row},{col}): {value}"
             ),
-            Self::NonFiniteInitialLogLambda { value } => {
-                write!(f, "joint penalty initial_log_lambda is non-finite: {value}")
+            Self::InitialLogStrengthOutOfDomain { value } => {
+                write!(f, "joint penalty initial_log_lambda is outside the exact strength domain: {value}")
             }
             Self::NotSymmetric {
                 row,
@@ -201,8 +201,8 @@ impl JointPenaltySpec {
         if nrows != ncols {
             return Err(JointPenaltyError::NotSquare { nrows, ncols });
         }
-        if !self.initial_log_lambda.is_finite() {
-            return Err(JointPenaltyError::NonFiniteInitialLogLambda {
+        if crate::validate_log_strength(self.initial_log_lambda).is_err() {
+            return Err(JointPenaltyError::InitialLogStrengthOutOfDomain {
                 value: self.initial_log_lambda,
             });
         }
@@ -281,8 +281,9 @@ impl JointPenaltySpec {
 /// contributions to the joint-Newton primitives.
 #[derive(Clone, Debug)]
 pub struct JointPenaltyBundle {
-    pub specs: std::sync::Arc<Vec<JointPenaltySpec>>,
-    pub log_lambdas: Vec<f64>,
+    specs: std::sync::Arc<Vec<JointPenaltySpec>>,
+    log_lambdas: Vec<f64>,
+    lambdas: Vec<f64>,
 }
 
 impl JointPenaltyBundle {
@@ -300,7 +301,8 @@ impl JointPenaltyBundle {
                 log_lambdas.len(),
             ));
         }
-        for (i, spec) in specs.iter().enumerate() {
+        let mut lambdas = Vec::with_capacity(log_lambdas.len());
+        for (i, (spec, &log_lambda)) in specs.iter().zip(log_lambdas.iter()).enumerate() {
             if spec.dim() != total_compiled {
                 return Err(format!(
                     "joint penalty {i}: dim {} != total_compiled {}",
@@ -308,8 +310,17 @@ impl JointPenaltyBundle {
                     total_compiled,
                 ));
             }
+            spec.validate()
+                .map_err(|error| format!("joint penalty {i}: {error}"))?;
+            lambdas.push(crate::checked_exp_log_strength(log_lambda).map_err(|error| {
+                format!("joint penalty {i} current log-precision: {error}")
+            })?);
         }
-        Ok(Self { specs, log_lambdas })
+        Ok(Self {
+            specs,
+            log_lambdas,
+            lambdas,
+        })
     }
 
     #[inline]
@@ -322,12 +333,26 @@ impl JointPenaltyBundle {
         self.specs.is_empty()
     }
 
+    #[inline]
+    pub fn specs(&self) -> &[JointPenaltySpec] {
+        self.specs.as_slice()
+    }
+
+    #[inline]
+    pub fn log_lambdas(&self) -> &[f64] {
+        self.log_lambdas.as_slice()
+    }
+
+    #[inline]
+    pub fn lambdas(&self) -> &[f64] {
+        self.lambdas.as_slice()
+    }
+
     /// Total joint-penalty contribution to the objective:
     ///   `½ Σ_j exp(ρ_j) · βᵀ S_j β`.
     pub fn quadratic(&self, beta: ArrayView1<'_, f64>) -> f64 {
         let mut total = 0.0;
-        for (spec, &log_lambda) in self.specs.iter().zip(self.log_lambdas.iter()) {
-            let lam = log_lambda.exp();
+        for (spec, &lam) in self.specs.iter().zip(self.lambdas.iter()) {
             total += 0.5 * lam * spec.quadratic_form(beta);
         }
         total
@@ -336,8 +361,7 @@ impl JointPenaltyBundle {
     /// Accumulate `Σ_j exp(ρ_j) · S_j · v` into `out` (additive).
     pub fn add_apply_into(&self, vector: ArrayView1<'_, f64>, out: &mut ndarray::Array1<f64>) {
         assert_eq!(out.len(), vector.len());
-        for (spec, &log_lambda) in self.specs.iter().zip(self.log_lambdas.iter()) {
-            let lam = log_lambda.exp();
+        for (spec, &lam) in self.specs.iter().zip(self.lambdas.iter()) {
             let sv = spec.matrix.dot(&vector);
             out.scaled_add(lam, &sv);
         }
@@ -345,8 +369,7 @@ impl JointPenaltyBundle {
 
     /// Accumulate `Σ_j exp(ρ_j) · diag(S_j)` into `diag` (additive).
     pub fn add_diag(&self, diag: &mut ndarray::Array1<f64>) {
-        for (spec, &log_lambda) in self.specs.iter().zip(self.log_lambdas.iter()) {
-            let lam = log_lambda.exp();
+        for (spec, &lam) in self.specs.iter().zip(self.lambdas.iter()) {
             for (i, value) in spec.matrix.diag().iter().enumerate() {
                 diag[i] += lam * *value;
             }
@@ -356,8 +379,7 @@ impl JointPenaltyBundle {
     /// Accumulate `Σ_j exp(ρ_j) · S_j` into the full `matrix` (additive).
     pub fn add_to_matrix(&self, matrix: &mut Array2<f64>) {
         assert_eq!(matrix.nrows(), matrix.ncols());
-        for (spec, &log_lambda) in self.specs.iter().zip(self.log_lambdas.iter()) {
-            let lam = log_lambda.exp();
+        for (spec, &lam) in self.specs.iter().zip(self.lambdas.iter()) {
             matrix.scaled_add(lam, &spec.matrix);
         }
     }
@@ -366,8 +388,7 @@ impl JointPenaltyBundle {
     ///   `∂/∂ρ_j [½ exp(ρ_j) βᵀ S_j β] = exp(ρ_j) · ½ βᵀ S_j β`.
     pub fn rho_objective_gradient(&self, beta: ArrayView1<'_, f64>, out: &mut [f64]) {
         assert_eq!(out.len(), self.specs.len());
-        for (i, (spec, &log_lambda)) in self.specs.iter().zip(self.log_lambdas.iter()).enumerate() {
-            let lam = log_lambda.exp();
+        for (i, (spec, &lam)) in self.specs.iter().zip(self.lambdas.iter()).enumerate() {
             out[i] = 0.5 * lam * spec.quadratic_form(beta);
         }
     }
@@ -504,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_non_finite_initial_log_lambda() {
+    fn validate_rejects_initial_log_strength_outside_exact_domain() {
         let spec = JointPenaltySpec {
             label: None,
             matrix: Array2::zeros((2, 2)),
@@ -513,8 +534,46 @@ mod tests {
         };
         assert!(matches!(
             spec.validate(),
-            Err(JointPenaltyError::NonFiniteInitialLogLambda { .. })
+            Err(JointPenaltyError::InitialLogStrengthOutOfDomain { .. })
         ));
+
+        let mut finite_but_too_large = cross_block_spec();
+        finite_but_too_large.initial_log_lambda = crate::LOG_STRENGTH_MAX + 1.0;
+        assert!(matches!(
+            finite_but_too_large.validate(),
+            Err(JointPenaltyError::InitialLogStrengthOutOfDomain { .. })
+        ));
+    }
+
+    #[test]
+    fn bundle_construction_is_atomic_at_exact_log_strength_faces() {
+        let specs = std::sync::Arc::new(vec![cross_block_spec(), cross_block_spec()]);
+        let bundle = JointPenaltyBundle::new(
+            specs.clone(),
+            vec![crate::LOG_STRENGTH_MIN, crate::LOG_STRENGTH_MAX],
+            4,
+        )
+        .expect("closed endpoints");
+        for ((&actual, &log_strength), expected) in bundle
+            .lambdas()
+            .iter()
+            .zip(bundle.log_lambdas())
+            .zip([
+                crate::LOG_STRENGTH_MIN.exp(),
+                crate::LOG_STRENGTH_MAX.exp(),
+            ])
+        {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+            assert_eq!(actual.to_bits(), log_strength.exp().to_bits());
+        }
+
+        let error = JointPenaltyBundle::new(
+            specs,
+            vec![0.0, crate::LOG_STRENGTH_MAX + 1.0],
+            4,
+        )
+        .expect_err("one invalid coordinate refuses the whole bundle");
+        assert!(error.contains("joint penalty 1 current log-precision"));
     }
 
     /// 2-block toy with one full-width SPD joint penalty:

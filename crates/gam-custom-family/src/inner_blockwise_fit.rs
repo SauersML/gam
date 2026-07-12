@@ -220,7 +220,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
     let ridge = effective_solverridge(options.ridge_floor);
     let joint_bundle: Option<&gam_problem::JointPenaltyBundle> = options.joint_penalties.as_deref();
     if let Some(bundle) = joint_bundle {
-        for (i, spec) in bundle.specs.iter().enumerate() {
+        for (i, spec) in bundle.specs().iter().enumerate() {
             if spec.dim() != total_joint_p {
                 return Err(format!(
                     "joint penalty {i}: dim {} != total compiled p {}",
@@ -229,13 +229,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 ));
             }
         }
-        if bundle.specs.len() != bundle.log_lambdas.len() {
-            return Err(format!(
-                "joint penalty bundle: {} specs vs {} log_lambdas",
-                bundle.specs.len(),
-                bundle.log_lambdas.len(),
-            ));
-        }
+        debug_assert_eq!(bundle.specs().len(), bundle.log_lambdas().len());
     }
     let mut cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; specs.len()];
     if let Some(seed) = warm_start

@@ -1,8 +1,7 @@
 use super::*;
 
 pub(crate) const MIN_CONDITIONAL_PRECISION: f64 = 1.0e-12;
-pub const LOG_STRENGTH_MIN: f64 = -700.0;
-pub const LOG_STRENGTH_MAX: f64 = 700.0;
+pub use gam_problem::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN, checked_exp_log_strength};
 
 // ---------------------------------------------------------------------------
 // Common trait
@@ -90,25 +89,10 @@ pub fn resolve_learnable_weight(base_weight: f64, rho: f64) -> Result<f64, Strin
     } else {
         log_base + rho
     };
-    Ok(checked_exp_log_strength(log_strength)?.copysign(base_weight))
+    Ok(checked_exp_log_strength(log_strength)
+        .map_err(|error| error.to_string())?
+        .copysign(base_weight))
 }
-
-/// Exponentiate a log-strength exactly on the closed supported domain.
-///
-/// Out-of-domain or non-finite inputs are errors. In particular, this function
-/// never clamps, floors, or otherwise creates a constant tail whose derivative
-/// would disagree with the analytic value/gradient/Hessian contract.
-pub fn checked_exp_log_strength(log_strength: f64) -> Result<f64, String> {
-    if log_strength.is_finite() && (LOG_STRENGTH_MIN..=LOG_STRENGTH_MAX).contains(&log_strength) {
-        Ok(log_strength.exp())
-    } else {
-        Err(format!(
-            "effective log strength must be finite and in [{LOG_STRENGTH_MIN}, \
-             {LOG_STRENGTH_MAX}]; got {log_strength}"
-        ))
-    }
-}
-
 pub fn learnable_weight_coordinate_domain(base_weight: f64) -> Result<Option<(f64, f64)>, String> {
     if base_weight == 0.0 {
         return Ok(None);

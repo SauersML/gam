@@ -275,11 +275,10 @@ impl StabilizationLedger {
     }
 }
 /// Generate a `#[repr(transparent)]` `Array1<f64>` newtype with the
-/// `new`/`Deref`/`DerefMut`/`AsRef`/`From` boilerplate every wrapper in this
-/// module needs. Keeping the three semantic types behind one macro both
-/// removes ~100 lines of duplication and guarantees they cannot drift apart.
+/// `new`/`Deref`/`DerefMut`/`AsRef`/`From` boilerplate used by unconstrained
+/// numeric vectors in this module.
 macro_rules! array1_f64_newtype {
-    ($name:ident $(, $extra:ident)*) => {
+    ($name:ident) => {
         #[repr(transparent)]
         #[derive(Clone, Debug, PartialEq)]
         pub struct $name(pub Array1<f64>);
@@ -321,20 +320,11 @@ macro_rules! array1_f64_newtype {
             #[inline]
             fn from(values: $name) -> Self { values.0 }
         }
-
-        $( array1_f64_newtype!(@extra $name $extra); )*
-    };
-    (@extra $name:ident exp) => {
-        impl $name {
-            #[inline]
-            pub fn exp(&self) -> Array1<f64> { self.0.mapv(f64::exp) }
-        }
     };
 }
 
 array1_f64_newtype!(Coefficients);
 array1_f64_newtype!(LinearPredictor);
-array1_f64_newtype!(LogSmoothingParams, exp);
 
 /// Index into `TermCollectionSpec::smooth_terms` (and the parallel
 /// `TermCollectionDesign::smooth.terms` slice produced from it).
@@ -509,14 +499,26 @@ impl std::fmt::Display for RowIdx {
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
-pub struct LogSmoothingParamsView<'a>(pub ArrayView1<'a, f64>);
+pub struct LogSmoothingParamsView<'a>(ArrayView1<'a, f64>);
 
 impl<'a> LogSmoothingParamsView<'a> {
-    pub fn new(values: ArrayView1<'a, f64>) -> Self {
-        Self(values)
+    /// Borrow a smoothing vector only after every coordinate satisfies the
+    /// exact shared logarithmic-strength contract.
+    pub fn new(
+        values: ArrayView1<'a, f64>,
+    ) -> Result<Self, crate::IndexedLogStrengthDomainError> {
+        for (coordinate, &value) in values.iter().enumerate() {
+            crate::validate_log_strength(value).map_err(|_| {
+                crate::IndexedLogStrengthDomainError { coordinate, value }
+            })?;
+        }
+        Ok(Self(values))
     }
 
-    pub fn exp(&self) -> Array1<f64> {
+    /// Exact physical strengths for this already-validated vector.
+    pub fn exact_exp(&self) -> Array1<f64> {
+        // `new` established the private invariant; the borrow prevents the
+        // source array from being mutated for this view's lifetime.
         self.0.mapv(f64::exp)
     }
 }
@@ -572,11 +574,17 @@ mod newtype_tests {
     }
 
     #[test]
-    fn log_smoothing_params_exp_matches_elementwise() {
-        let arr = array![0.0_f64, 1.0, -1.0];
-        let rho = LogSmoothingParams::new(arr.clone());
-        let expected = arr.mapv(f64::exp);
-        assert_eq!(rho.exp(), expected);
+    fn log_smoothing_params_view_is_validated_and_exponentiates_exactly() {
+        let arr = array![crate::LOG_STRENGTH_MIN, 0.0, crate::LOG_STRENGTH_MAX];
+        let rho = LogSmoothingParamsView::new(arr.view()).expect("closed domain");
+        for (actual, expected) in rho.exact_exp().iter().zip(arr.iter()) {
+            assert_eq!(actual.to_bits(), expected.exp().to_bits());
+        }
+
+        let invalid = array![0.0, crate::LOG_STRENGTH_MAX + 1.0];
+        let error = LogSmoothingParamsView::new(invalid.view()).unwrap_err();
+        assert_eq!(error.coordinate, 1);
+        assert_eq!(error.value, crate::LOG_STRENGTH_MAX + 1.0);
     }
 
     #[test]

@@ -709,7 +709,7 @@ impl AnalyticPenalty for SparsityPenalty {
         }
         resolve_learnable_weight(self.weight, rho[0])?;
         if self.learnable_smoothing {
-            checked_exp_log_strength(rho[1])?;
+            checked_exp_log_strength(rho[1]).map_err(|error| error.to_string())?;
         }
         Ok(())
     }
