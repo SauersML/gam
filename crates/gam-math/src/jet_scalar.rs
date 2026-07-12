@@ -1028,6 +1028,31 @@ pub fn filtered_implicit_solve_scalar<const K: usize, S: JetScalar<K>>(
 
 // ── PatternedOrder2<P, K, H>: compile-time sparse Hessian ───────────────
 
+/// Runtime-dimension form of [`filtered_implicit_solve_scalar`].
+///
+/// The state is lifted directly in the caller's [`RuntimeJetScalar`] algebra,
+/// so one row expression can serve a runtime-sized value/gradient/Hessian
+/// evaluation (`DynamicOrder2`), a Hessian-contracted third derivative
+/// (`DynamicOneSeed`), and a Hessian-contracted fourth derivative
+/// (`DynamicTwoSeed`). `iters` is the algebra's nilpotency order: two, three,
+/// and four respectively. No implicit axis is appended to the derivative
+/// storage.
+pub fn filtered_implicit_solve_runtime_scalar<'arena, S: RuntimeJetScalar<'arena>>(
+    a0: f64,
+    inv_fa: f64,
+    iters: usize,
+    dimension: usize,
+    workspace: &'arena S::Workspace,
+    f: impl Fn(&S) -> S,
+) -> S {
+    let mut a = S::constant(a0, dimension, workspace);
+    for _ in 0..iters {
+        let residual = f(&a);
+        a = a.sub(&residual.scale(inv_fa));
+    }
+    a
+}
+
 /// Compile-time upper-triangle Hessian pattern for [`PatternedOrder2`].
 ///
 /// `PAIRS` contains exactly the `(row, column)` channels a row program can
