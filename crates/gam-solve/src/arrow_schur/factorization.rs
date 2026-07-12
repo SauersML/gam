@@ -1157,7 +1157,13 @@ pub(crate) fn analytic_penalty_row_hessian_fingerprint(
             hasher.write_bool(p.learnable_weight);
             if p.learnable_weight {
                 hasher.write_usize(p.rho_index);
-                hasher.write_f64(p.weight * rho_local[p.rho_index].exp());
+                hasher.write_f64(
+                    gam_terms::analytic_penalties::resolve_learnable_weight(
+                        p.weight,
+                        rho_local[p.rho_index],
+                    )
+                    .expect("registry rho was validated before row-Hessian fingerprinting"),
+                );
             }
             for &value in p.lambda_per_row.iter() {
                 hasher.write_f64(value);
@@ -1181,7 +1187,12 @@ pub(crate) fn analytic_penalty_row_hessian_fingerprint(
                 let active_log_alpha = p.log_alpha[k] + rho_local[k];
                 hasher.write_f64(p.log_alpha[k]);
                 hasher.write_f64(active_log_alpha);
-                hasher.write_f64(active_log_alpha.exp());
+                hasher.write_f64(
+                    gam_terms::analytic_penalties::checked_exp_log_strength(active_log_alpha)
+                        .expect(
+                            "registry rho was validated before parametric row-Hessian fingerprinting",
+                        ),
+                );
             }
             let raw_beta_offset = p.log_alpha.len();
             for k in 0..p.raw_beta.len() {
@@ -1200,7 +1211,15 @@ pub(crate) fn analytic_penalty_row_hessian_fingerprint(
             }
             if p.learnable_weight {
                 hasher.write_usize(weight_offset);
-                hasher.write_f64(p.weight * rho_local[weight_offset].exp());
+                hasher.write_f64(
+                    gam_terms::analytic_penalties::resolve_learnable_weight(
+                        p.weight,
+                        rho_local[weight_offset],
+                    )
+                    .expect(
+                        "registry rho was validated before parametric row-Hessian fingerprinting",
+                    ),
+                );
             }
         }
         _ => {

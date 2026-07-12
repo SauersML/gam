@@ -840,12 +840,11 @@ impl ParametricRowPrecisionPriorPenalty {
                     "ParametricRowPrecisionPriorPenalty::new log_alpha[{k}] must be finite"
                 ));
             }
-            let alpha_k = log_alpha_k.exp();
-            if !(alpha_k.is_finite() && alpha_k > 0.0) {
-                return Err(format!(
-                    "ParametricRowPrecisionPriorPenalty::new exp(log_alpha[{k}]) must be finite and > 0"
-                ));
-            }
+            checked_exp_log_strength(log_alpha_k).map_err(|error| {
+                format!(
+                    "ParametricRowPrecisionPriorPenalty::new invalid log_alpha[{k}]: {error}"
+                )
+            })?;
             let raw_beta_k = raw_beta[k];
             if !raw_beta_k.is_finite() {
                 return Err(format!(
@@ -1052,7 +1051,10 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
     }
 
     fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
-        let mut domains = vec![(f64::MIN, f64::MAX); self.rho_count()];
+        // raw_beta and mu are ordinary additive real coordinates. They must be
+        // finite when evaluated, but they are not log-strengths and therefore
+        // have no artificial ±700 optimization face.
+        let mut domains = vec![(f64::NEG_INFINITY, f64::INFINITY); self.rho_count()];
         for (k, &base_log_alpha) in self.log_alpha.iter().enumerate() {
             domains[self.log_alpha_offset() + k] = (
                 LOG_STRENGTH_MIN - base_log_alpha,

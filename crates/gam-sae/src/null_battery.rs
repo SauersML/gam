@@ -1300,65 +1300,118 @@ pub fn matched_spectrum_gaussian_null(
     let mut out = Array2::<f64>::zeros(pc_scores.raw_dim());
     for row in 0..out.nrows() {
         for pc in 0..out.ncols() {
-            let relative_draw = location.mean_offset[pc] + sd[pc] * standard_normal(&mut rng);
-            out[[row, pc]] = location.origin[pc] + relative_draw;
-            if !out[[row, pc]].is_finite() {
-                return Err(format!(
-                    "matched-spectrum Gaussian draw overflowed at row {row}, column {pc}"
-                ));
-            }
+            let centered_draw = sd[pc] * standard_normal(&mut rng);
+            out[[row, pc]] = location
+                .compose_centered(centered_draw, pc)
+                .map_err(|error| {
+                    format!(
+                        "matched-spectrum Gaussian draw failed at row {row}, column {pc}: {error}"
+                    )
+                })?;
         }
     }
     Ok(out)
 }
 
 struct StableColumnLocation {
-    origin: Array1<f64>,
-    mean_offset: Array1<f64>,
+    mean: Array1<f64>,
 }
 
 impl StableColumnLocation {
     fn absolute_mean(&self) -> Result<Array1<f64>, String> {
-        let mean = &self.origin + &self.mean_offset;
-        if mean.iter().any(|value| !value.is_finite()) {
+        if self.mean.iter().any(|value| !value.is_finite()) {
             return Err("column mean overflowed in absolute coordinates".to_string());
         }
-        Ok(mean)
+        Ok(self.mean.clone())
+    }
+
+    fn centered_value(&self, value: f64, axis: usize) -> Result<f64, String> {
+        let centered = value - self.mean[axis];
+        if !centered.is_finite() {
+            return Err(format!(
+                "centered value is not representable on column {axis}"
+            ));
+        }
+        Ok(centered)
+    }
+
+    fn compose_centered(&self, centered: f64, axis: usize) -> Result<f64, String> {
+        if !centered.is_finite() {
+            return Err(format!(
+                "centered draw is non-finite on column {axis}: {centered}"
+            ));
+        }
+        let value = self.mean[axis] + centered;
+        if !value.is_finite() {
+            return Err(format!(
+                "absolute value is not representable on column {axis}"
+            ));
+        }
+        Ok(value)
     }
 }
 
-/// Shared translation-stable column location. Means are accumulated in the
-/// residual chart `x - first_row`, then retained as `(origin, mean_offset)` so
-/// downstream centering never needs to subtract two large absolute means.
+fn neumaier_add(sum: &mut f64, correction: &mut f64, term: f64) -> Result<(), String> {
+    let next = *sum + term;
+    if !next.is_finite() {
+        return Err("compensated column-mean accumulation overflowed".to_string());
+    }
+    if sum.abs() >= term.abs() {
+        *correction += (*sum - next) + term;
+    } else {
+        *correction += (term - next) + *sum;
+    }
+    *sum = next;
+    if !correction.is_finite() {
+        return Err("compensated column-mean correction overflowed".to_string());
+    }
+    Ok(())
+}
+
+/// Shared range-safe column location. When subtraction from the first row is
+/// representable, a compensated residual-chart average preserves small
+/// variations around a large translation. Otherwise a compensated convex
+/// average of `x / n` handles antipodal finite values without ever forming
+/// their unrepresentable difference. Downstream centering fails only when the
+/// physical-coordinate residual itself is not representable.
 fn stable_column_location(data: ArrayView2<'_, f64>) -> Result<StableColumnLocation, String> {
     validate_matrix(data, "stable-column-location input")?;
-    let origin = data.row(0).to_owned();
-    let mut mean_offset = Array1::<f64>::zeros(data.ncols());
-    for row in 0..data.nrows() {
-        let count = (row + 1) as f64;
-        for axis in 0..data.ncols() {
-            let relative = data[[row, axis]] - origin[axis];
-            mean_offset[axis] += (relative - mean_offset[axis]) / count;
+    let count = data.nrows() as f64;
+    let mut mean = Array1::<f64>::zeros(data.ncols());
+    for axis in 0..data.ncols() {
+        let origin = data[[0, axis]];
+        let relative_chart_is_representable = data
+            .column(axis)
+            .iter()
+            .all(|&value| (value - origin).is_finite());
+        let mut sum = 0.0_f64;
+        let mut correction = 0.0_f64;
+        if relative_chart_is_representable {
+            for &value in data.column(axis) {
+                neumaier_add(&mut sum, &mut correction, (value - origin) / count)?;
+            }
+            mean[axis] = origin + (sum + correction);
+        } else {
+            for &value in data.column(axis) {
+                neumaier_add(&mut sum, &mut correction, value / count)?;
+            }
+            mean[axis] = sum + correction;
         }
     }
-    if mean_offset.iter().any(|value| !value.is_finite()) {
+    if mean.iter().any(|value| !value.is_finite()) {
         return Err("stable column-mean accumulation overflowed".to_string());
     }
-    Ok(StableColumnLocation {
-        origin,
-        mean_offset,
-    })
+    Ok(StableColumnLocation { mean })
 }
 
 struct StablePopulationMoments {
-    origin: Array1<f64>,
-    mean_offset: Array1<f64>,
+    location: StableColumnLocation,
     covariance: Array2<f64>,
 }
 
-/// Translation-stable two-pass population moments. Coordinates are first
-/// expressed relative to an observed row, preventing a large chart origin from
-/// erasing the small residuals whose covariance is the object being matched.
+/// Range- and translation-stable two-pass population moments. Coordinates are
+/// centered through the range-safe location above, preventing both antipodal-
+/// range overflow and a large location from erasing the residual covariance.
 fn stable_population_moments(data: ArrayView2<'_, f64>) -> Result<StablePopulationMoments, String> {
     let location = stable_column_location(data)?;
     let n = data.nrows();
@@ -1367,13 +1420,11 @@ fn stable_population_moments(data: ArrayView2<'_, f64>) -> Result<StablePopulati
     let mut covariance = Array2::<f64>::zeros((p, p));
     for row in 0..n {
         for left in 0..p {
-            let left_residual = ((data[[row, left]] - location.origin[left])
-                - location.mean_offset[left])
-                * inverse_sqrt_count;
+            let left_residual =
+                location.centered_value(data[[row, left]], left)? * inverse_sqrt_count;
             for right in 0..=left {
-                let right_residual = ((data[[row, right]] - location.origin[right])
-                    - location.mean_offset[right])
-                    * inverse_sqrt_count;
+                let right_residual =
+                    location.centered_value(data[[row, right]], right)? * inverse_sqrt_count;
                 covariance[[left, right]] += left_residual * right_residual;
             }
         }
@@ -1389,8 +1440,7 @@ fn stable_population_moments(data: ArrayView2<'_, f64>) -> Result<StablePopulati
         return Err("stable mean/covariance accumulation overflowed".to_string());
     }
     Ok(StablePopulationMoments {
-        origin: location.origin,
-        mean_offset: location.mean_offset,
+        location,
         covariance,
     })
 }
@@ -1460,16 +1510,18 @@ pub fn covariance_matched_gaussian_null(
             scaled_normal[axis] = eigenvalues[axis].sqrt() * standard_normal(&mut rng);
         }
         for col in 0..p {
-            let mut relative_draw = moments.mean_offset[col];
+            let mut centered_draw = 0.0_f64;
             for axis in 0..p {
-                relative_draw += eigenvectors[[col, axis]] * scaled_normal[axis];
+                centered_draw += eigenvectors[[col, axis]] * scaled_normal[axis];
             }
-            out[[row, col]] = moments.origin[col] + relative_draw;
-            if !out[[row, col]].is_finite() {
-                return Err(format!(
-                    "covariance-matched Gaussian draw overflowed at row {row}, column {col}"
-                ));
-            }
+            out[[row, col]] = moments
+                .location
+                .compose_centered(centered_draw, col)
+                .map_err(|error| {
+                    format!(
+                        "covariance-matched Gaussian draw failed at row {row}, column {col}: {error}"
+                    )
+                })?;
         }
     }
     Ok(out)
@@ -1501,19 +1553,17 @@ pub fn architecture_matched_random_weight_null(
     for i in 0..n {
         let src = rng.random_range(0..random_weight.nrows());
         for j in 0..p {
-            let centered = (random_weight[[src, j]] - random_weight_location.origin[j])
-                - random_weight_location.mean_offset[j];
+            let centered = random_weight_location.centered_value(random_weight[[src, j]], j)?;
             let scaled = if rw_sd[j] > 0.0 {
                 (centered / rw_sd[j]) * obs_sd[j]
             } else {
                 0.0
             };
-            out[[i, j]] = observed_location.origin[j] + (observed_location.mean_offset[j] + scaled);
-            if !out[[i, j]].is_finite() {
-                return Err(format!(
-                    "architecture-matched draw overflowed at row {i}, column {j}"
-                ));
-            }
+            out[[i, j]] = observed_location
+                .compose_centered(scaled, j)
+                .map_err(|error| {
+                    format!("architecture-matched draw failed at row {i}, column {j}: {error}")
+                })?;
         }
     }
     Ok(out)
@@ -1537,7 +1587,7 @@ pub fn empirical_residual_bootstrap(
     for i in 0..n {
         let src = rng.random_range(0..n);
         for j in 0..p {
-            out[[i, j]] = (residuals[[src, j]] - location.origin[j]) - location.mean_offset[j];
+            out[[i, j]] = location.centered_value(residuals[[src, j]], j)?;
         }
     }
     Ok(out)
@@ -2507,14 +2557,14 @@ fn stable_column_sd(
     data: ArrayView2<'_, f64>,
     location: &StableColumnLocation,
 ) -> Result<Array1<f64>, String> {
-    if location.origin.len() != data.ncols() || location.mean_offset.len() != data.ncols() {
+    if location.mean.len() != data.ncols() {
         return Err("column-scale location dimension mismatch".to_string());
     }
     let mut scales = Array1::<f64>::zeros(data.ncols());
     let mut scaled_sums = Array1::<f64>::ones(data.ncols());
     for row in data.rows() {
         for j in 0..data.ncols() {
-            let d = (row[j] - location.origin[j]) - location.mean_offset[j];
+            let d = location.centered_value(row[j], j)?;
             let magnitude = d.abs();
             if magnitude == 0.0 {
                 continue;
@@ -2544,9 +2594,11 @@ fn stable_column_sd(
 fn centered_column(col: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
     let matrix = col.insert_axis(Axis(1));
     let location = stable_column_location(matrix.view())?;
-    Ok(matrix
+    matrix
         .column(0)
-        .mapv(|value| (value - location.origin[0]) - location.mean_offset[0]))
+        .iter()
+        .map(|&value| location.centered_value(value, 0))
+        .collect::<Result<Array1<_>, _>>()
 }
 
 fn centered_matrix(data: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
@@ -2554,7 +2606,7 @@ fn centered_matrix(data: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
     let mut out = Array2::<f64>::zeros(data.raw_dim());
     for row in 0..data.nrows() {
         for col in 0..data.ncols() {
-            out[[row, col]] = (data[[row, col]] - location.origin[col]) - location.mean_offset[col];
+            out[[row, col]] = location.centered_value(data[[row, col]], col)?;
         }
     }
     Ok(out)
@@ -2628,8 +2680,8 @@ mod tests {
     ) {
         let expected = stable_population_moments(expected).unwrap();
         let actual = stable_population_moments(actual).unwrap();
-        let expected_mean = &expected.origin + &expected.mean_offset;
-        let actual_mean = &actual.origin + &actual.mean_offset;
+        let expected_mean = expected.location.absolute_mean().unwrap();
+        let actual_mean = actual.location.absolute_mean().unwrap();
         for axis in 0..expected_mean.len() {
             let scale = expected_mean[axis].abs().max(1.0);
             assert!(
@@ -2888,13 +2940,13 @@ mod tests {
         ];
         let observed_location = stable_column_location(observed.view()).unwrap();
         let observed_sd = stable_column_sd(observed.view(), &observed_location).unwrap();
-        assert!(observed_sd.iter().all(|value| value.is_finite() && *value > 0.0));
-        let matched = architecture_matched_random_weight_null(
-            observed.view(),
-            donor.view(),
-            2262,
-        )
-        .unwrap();
+        assert!(
+            observed_sd
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+        );
+        let matched =
+            architecture_matched_random_weight_null(observed.view(), donor.view(), 2262).unwrap();
         assert!(matched.iter().all(|value| value.is_finite()));
 
         let covariance_scale = 1.0e154_f64;
@@ -2907,6 +2959,24 @@ mod tests {
         let moments = stable_population_moments(covariance_input.view()).unwrap();
         assert!(moments.covariance[[0, 0]].is_finite());
         assert!(moments.covariance[[0, 0]] > 0.0);
+
+        let finite_limit = 1.7e308_f64;
+        let antipodal =
+            ndarray::array![[finite_limit, -finite_limit], [-finite_limit, finite_limit],];
+        let antipodal_location = stable_column_location(antipodal.view()).unwrap();
+        let antipodal_mean = antipodal_location.absolute_mean().unwrap();
+        assert!(antipodal_mean.iter().all(|value| value.is_finite()));
+        assert!(antipodal_mean.iter().all(|value| value.abs() <= 1.0e292));
+        for row in antipodal.rows() {
+            for axis in 0..antipodal.ncols() {
+                assert!(
+                    antipodal_location
+                        .centered_value(row[axis], axis)
+                        .unwrap()
+                        .is_finite()
+                );
+            }
+        }
     }
 
     #[test]
@@ -2961,20 +3031,8 @@ mod tests {
             .expect("covariance-matched Gaussian null");
         assert_eq!(draw, repeated, "seeded Gaussian null must be reproducible");
 
-        let empirical_covariance = |data: ArrayView2<'_, f64>| {
-            let location = stable_column_location(data).unwrap();
-            let mut covariance = Array2::<f64>::zeros((data.ncols(), data.ncols()));
-            for row in data.rows() {
-                for a in 0..data.ncols() {
-                    for b in 0..data.ncols() {
-                        let da = (row[a] - location.origin[a]) - location.mean_offset[a];
-                        let db = (row[b] - location.origin[b]) - location.mean_offset[b];
-                        covariance[[a, b]] += da * db;
-                    }
-                }
-            }
-            covariance / data.nrows() as f64
-        };
+        let empirical_covariance =
+            |data: ArrayView2<'_, f64>| stable_population_moments(data).unwrap().covariance;
         let target = empirical_covariance(observed.view());
         let realized = empirical_covariance(draw.view());
         for a in 0..observed.ncols() {
@@ -3216,8 +3274,8 @@ mod tests {
             .rows()
             .into_iter()
             .map(|row| {
-                let x = (row[0] - location.origin[0]) - location.mean_offset[0];
-                let y = (row[1] - location.origin[1]) - location.mean_offset[1];
+                let x = location.centered_value(row[0], 0).unwrap();
+                let y = location.centered_value(row[1], 1).unwrap();
                 x.hypot(y)
             })
             .collect::<Vec<_>>();
@@ -3255,12 +3313,14 @@ mod tests {
             }
         }
         let shifted = stable_population_moments(translated.view()).unwrap();
+        let reference_mean = reference.location.absolute_mean().unwrap();
+        let shifted_mean = shifted.location.absolute_mean().unwrap();
         for axis in 0..3 {
-            let reference_mean = reference.origin[axis] + reference.mean_offset[axis];
-            let shifted_mean = shifted.origin[axis] + shifted.mean_offset[axis];
             assert!(
-                (shifted_mean - translation[axis] - reference_mean).abs() < 3.0e-4,
-                "translation destabilized mean axis {axis}: reference={reference_mean}, shifted={shifted_mean}"
+                (shifted_mean[axis] - translation[axis] - reference_mean[axis]).abs() < 3.0e-4,
+                "translation destabilized mean axis {axis}: reference={} shifted={}",
+                reference_mean[axis],
+                shifted_mean[axis]
             );
         }
         for left in 0..3 {

@@ -81,7 +81,8 @@ fn gam_sas_link_transform_matches_scipy_sinh_arcsinh_cdf() {
     let mut gam_d3 = Vec::with_capacity(n);
     for i in 0..n {
         let InverseLinkJet { mu, d1, d2, d3 } =
-            sas_inverse_link_jet(eta_col[i], eps_col[i], logd_col[i]);
+            sas_inverse_link_jet(eta_col[i], eps_col[i], logd_col[i])
+                .expect("finite SAS eta");
         gam_mu.push(mu);
         gam_d1.push(d1);
         gam_d2.push(d2);

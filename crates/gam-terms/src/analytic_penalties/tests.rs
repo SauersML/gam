@@ -692,6 +692,97 @@ fn learnable_weight_effective_log_domain_is_exact_and_unsaturated() {
 }
 
 #[test]
+fn registry_propagates_effective_strength_domain_and_freeze_refuses_invalid_rho() {
+    let alpha = 1.7_f64;
+    let penalty = OrderedBetaBernoulliPenalty::new(3, alpha, 0.8, true);
+    let kind = AnalyticPenaltyKind::OrderedBetaBernoulli(Arc::new(penalty));
+    let mut registry = AnalyticPenaltyRegistry::new();
+    registry.push(kind.clone());
+
+    let (expected_lower, expected_upper) = learnable_weight_coordinate_domain(alpha)
+        .unwrap()
+        .expect("positive alpha has a coordinate domain");
+    let (lower, upper) = registry.rho_domain_bounds().unwrap();
+    assert_eq!(lower.as_slice(), Some(&[expected_lower][..]));
+    assert_eq!(upper.as_slice(), Some(&[expected_upper][..]));
+    registry
+        .validate_rho(array![expected_upper].view())
+        .expect("closed upper face is legal");
+    assert!(registry
+        .validate_rho(array![expected_upper + 1.0e-6].view())
+        .is_err());
+
+    let target = Array1::<f64>::zeros(3);
+    assert!(FrozenAnalyticPenaltyOp::new(
+        kind,
+        target,
+        array![expected_upper + 1.0e-6],
+    )
+    .is_err());
+}
+
+#[test]
+fn parametric_row_precision_domains_distinguish_log_strengths_from_raw_coordinates() {
+    let target = PsiSlice::full(4, Some(2));
+    let penalty = ParametricRowPrecisionPriorPenalty::new(
+        target.clone(),
+        array![[0.0_f64], [1.0]],
+        array![0.0_f64, 2.0_f64.ln()],
+        array![0.0_f64, -0.5],
+        array![[0.0_f64], [0.5]],
+        1.7,
+        2,
+        true,
+    )
+    .unwrap();
+
+    let domains = penalty.rho_coordinate_domains().unwrap();
+    assert_eq!(domains.len(), 7);
+    assert_eq!(domains[0], (LOG_STRENGTH_MIN, LOG_STRENGTH_MAX));
+    assert_eq!(
+        domains[1],
+        (
+            LOG_STRENGTH_MIN - 2.0_f64.ln(),
+            LOG_STRENGTH_MAX - 2.0_f64.ln(),
+        )
+    );
+    for &(lower, upper) in &domains[2..6] {
+        assert_eq!(lower, f64::NEG_INFINITY);
+        assert_eq!(upper, f64::INFINITY);
+    }
+    assert_eq!(
+        domains[6],
+        learnable_weight_coordinate_domain(1.7)
+            .unwrap()
+            .expect("positive weight has a coordinate domain")
+    );
+
+    // Raw beta and mu are finite additive coordinates, not log-strengths:
+    // values beyond ±700 remain valid while a log-alpha beyond its effective
+    // face is refused.
+    let mut rho = Array1::<f64>::zeros(7);
+    rho[2] = 701.0;
+    rho[4] = -701.0;
+    penalty
+        .validate_rho(rho.view())
+        .expect("finite raw-beta and mu coordinates are unbounded");
+    rho[0] = LOG_STRENGTH_MAX + 1.0e-6;
+    assert!(penalty.validate_rho(rho.view()).is_err());
+
+    assert!(ParametricRowPrecisionPriorPenalty::new(
+        target,
+        array![[0.0_f64], [1.0]],
+        array![LOG_STRENGTH_MAX + 1.0, 0.0],
+        array![0.0_f64, -0.5],
+        array![[0.0_f64], [0.5]],
+        1.7,
+        2,
+        true,
+    )
+    .is_err());
+}
+
+#[test]
 fn ard_grad_target_matches_lambda_t() {
     let d = 2;
     let t = array![0.5_f64, 1.0, 2.0, -1.0];

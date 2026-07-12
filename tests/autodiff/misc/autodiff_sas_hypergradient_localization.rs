@@ -308,7 +308,8 @@ fn sas_epsilon_eta_derivative_partials_match_three_autodiff_engines() {
     ];
 
     for (eta, epsilon, log_delta) in cases {
-        let out = sas_inverse_link_jetwith_param_partials(eta, epsilon, log_delta);
+        let out = sas_inverse_link_jetwith_param_partials(eta, epsilon, log_delta)
+            .expect("finite SAS eta");
 
         let (_, d1_nd) = first_derivative(|eps| sas_eta_d1_numdual(eta, eps, log_delta), epsilon);
         let (_, d2_nd) = first_derivative(|eps| sas_eta_d2_numdual(eta, eps, log_delta), epsilon);
@@ -360,11 +361,14 @@ fn sas_epsilon_partialfd_at_problem_point() {
     let eta = -1.2;
     let epsilon = -0.4;
     let log_delta = -0.3;
-    let out = sas_inverse_link_jetwith_param_partials(eta, epsilon, log_delta);
+    let out = sas_inverse_link_jetwith_param_partials(eta, epsilon, log_delta)
+        .expect("finite SAS eta");
     let h = 1e-6;
 
-    let ep_p = gam::mixture_link::sas_inverse_link_jet(eta, epsilon + h, log_delta);
-    let ep_m = gam::mixture_link::sas_inverse_link_jet(eta, epsilon - h, log_delta);
+    let ep_p = gam::mixture_link::sas_inverse_link_jet(eta, epsilon + h, log_delta)
+        .expect("finite SAS eta");
+    let ep_m = gam::mixture_link::sas_inverse_link_jet(eta, epsilon - h, log_delta)
+        .expect("finite SAS eta");
     let fd_ep = (
         (ep_p.mu - ep_m.mu) / (2.0 * h),
         (ep_p.d1 - ep_m.d1) / (2.0 * h),

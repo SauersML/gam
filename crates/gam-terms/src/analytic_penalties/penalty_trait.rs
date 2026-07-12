@@ -52,23 +52,15 @@ impl PsiSlice {
     }
 }
 
-/// Resolve a learnable penalty strength `base_weight · exp(rho)` without ever
-/// overflowing to `inf` or (for a nonzero base weight) underflowing to exact
-/// `0.0`.
+/// Resolve the exact learnable strength `base_weight · exp(rho)` in log space.
 ///
-/// For finite `rho ≳ 709` the naive `base_weight * rho.exp()` overflows to
-/// `inf`; the resulting `inf` then poisons the solve via `inf · 0.0 = NaN` or
-/// `inf / inf = NaN` in the value/grad/Hessian. Conversely for `rho ≲ -745`
-/// `rho.exp()` underflows to `0.0`, silently disabling a penalty whose base
-/// weight is strictly positive and reintroducing `0/0` in ratios that divide by
-/// the strength.
-///
-/// The fix is to evaluate the product in log-space and clamp the *log-strength*
-/// into the finite-normal band before exponentiating, so the returned strength
-/// is always finite (and strictly positive whenever `base_weight ≠ 0`). The
-/// clamp band is symmetric in log-strength about zero, matched to the largest /
-/// smallest positive normal `f64`, leaving a safety margin so subsequent
-/// multiplications by `O(1)` factors stay finite.
+/// The effective log-strength `ln|base_weight| + rho` must lie in the closed
+/// [`LOG_STRENGTH_MIN`, `LOG_STRENGTH_MAX`] domain. Values outside that domain
+/// are rejected instead of saturated: a plateau would make the evaluated
+/// value constant while analytic `rho` derivatives remain nonzero. Computing
+/// the product as `sign(base_weight) · exp(ln|base_weight| + rho)` also avoids
+/// an overflowing intermediate `exp(rho)` when a very small base permits a
+/// large legal coordinate.
 pub fn resolve_learnable_weight(base_weight: f64, rho: f64) -> Result<f64, String> {
     if base_weight == 0.0 {
         return if rho.is_finite() {
@@ -84,21 +76,34 @@ pub fn resolve_learnable_weight(base_weight: f64, rho: f64) -> Result<f64, Strin
             "learnable weight requires finite base and coordinate; got base_weight={base_weight}, rho={rho}"
         ));
     }
-    let log_strength = base_weight.abs().ln() + rho;
+    let log_base = base_weight.abs().ln();
+    let (lower, upper) = (
+        LOG_STRENGTH_MIN - log_base,
+        LOG_STRENGTH_MAX - log_base,
+    );
+    if !(lower..=upper).contains(&rho) {
+        return Err(format!(
+            "learnable coordinate must be in [{lower}, {upper}] so its effective log strength is in [{LOG_STRENGTH_MIN}, {LOG_STRENGTH_MAX}]; got {rho}"
+        ));
+    }
+    // Map the two emitted faces back to their mathematical effective values
+    // exactly. This is not saturation: values beyond either face were refused
+    // above. It only removes one subtraction/addition roundoff at a legal face.
+    let log_strength = if rho == lower {
+        LOG_STRENGTH_MIN
+    } else if rho == upper {
+        LOG_STRENGTH_MAX
+    } else {
+        log_base + rho
+    };
     Ok(checked_exp_log_strength(log_strength)?.copysign(base_weight))
 }
 
-/// Exponentiate a learnable log-precision `exp(log_alpha)` with the exponent
-/// clamped into the finite-normal band, returning a finite, strictly-positive
-/// precision.
+/// Exponentiate a log-strength exactly on the closed supported domain.
 ///
-/// A raw `log_alpha.exp()` overflows to `inf` for `log_alpha ≳ 709` (an `inf`
-/// precision then poisons the ARD value/grad/Hessian via `inf · 0.0 = NaN`) and
-/// underflows to exact `0.0` for `log_alpha ≲ -745` (a zero precision drops a
-/// prior the term still expects to be positive). Clamping the exponent and
-/// flooring at the smallest positive normal keeps the precision a finite,
-/// strictly-positive `f64` while still spanning arbitrarily small / large
-/// values within range (#742, Issue 4).
+/// Out-of-domain or non-finite inputs are errors. In particular, this function
+/// never clamps, floors, or otherwise creates a constant tail whose derivative
+/// would disagree with the analytic value/gradient/Hessian contract.
 pub fn checked_exp_log_strength(log_strength: f64) -> Result<f64, String> {
     if log_strength.is_finite()
         && (LOG_STRENGTH_MIN..=LOG_STRENGTH_MAX).contains(&log_strength)
@@ -260,7 +265,10 @@ pub trait AnalyticPenalty: Send + Sync {
     }
 
     /// Per-local-coordinate legal intervals. The generic optimizer intersects
-    /// these with its configured box before evaluating a penalty.
+    /// these with its configured box before evaluating a penalty. Ordinary
+    /// non-log coordinates may return infinite endpoints to denote an
+    /// unbounded face; evaluation still requires every supplied coordinate to
+    /// be finite.
     fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
         Ok(vec![
             (LOG_STRENGTH_MIN, LOG_STRENGTH_MAX);

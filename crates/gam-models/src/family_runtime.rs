@@ -363,6 +363,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 let state = self.require_sas_state()?;
                 Ok(posterior_mv_from_prob_kernel(quadctx, eta, se_eta, |x| {
                     gam_solve::mixture_link::sas_inverse_link_jet(x, state.epsilon, state.log_delta)
+                        .expect("normal quadrature nodes must be finite")
                         .mu
                 }))
             }

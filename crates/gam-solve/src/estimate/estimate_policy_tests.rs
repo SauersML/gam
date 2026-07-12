@@ -996,7 +996,11 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
     let eta_true = x.dot(&true_beta);
     let eps_true = 0.25;
     let ld_true = -0.20;
-    let p = eta_true.mapv(|e| sas_inverse_link_jet(e, eps_true, ld_true).mu);
+    let p = eta_true.mapv(|e| {
+        sas_inverse_link_jet(e, eps_true, ld_true)
+            .expect("finite SAS eta")
+            .mu
+    });
     let mut rng = StdRng::seed_from_u64(seed);
     let y = p.mapv(|pi| if rng.random::<f64>() < pi { 1.0 } else { 0.0 });
 
@@ -1084,7 +1088,8 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
                 eta[i],
                 sas_state.epsilon,
                 sas_state.log_delta,
-            );
+            )
+            .expect("finite SAS eta");
             let mu = jets.jet.mu;
             let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
             let d1 = jets.jet.d1;
@@ -1108,7 +1113,8 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
                     eta[i],
                     sas_state.epsilon,
                     sas_state.log_delta,
-                );
+                )
+                .expect("finite SAS eta");
                 let mu = jets.jet.mu;
                 let d1 = jets.jet.d1;
                 let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
@@ -1140,7 +1146,8 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
                 eta[i].clamp(-30.0, 30.0),
                 sas_state.epsilon,
                 sas_state.log_delta,
-            );
+            )
+            .expect("finite SAS eta");
             let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
             let d2 = jets.jet.d2;
@@ -1245,7 +1252,11 @@ fn sas_true_score_beta_jacobian_matchesfd_at_seed19() {
     let eta_true = x.dot(&true_beta);
     let eps_true = 0.25;
     let ld_true = -0.20;
-    let p = eta_true.mapv(|e| sas_inverse_link_jet(e, eps_true, ld_true).mu);
+    let p = eta_true.mapv(|e| {
+        sas_inverse_link_jet(e, eps_true, ld_true)
+            .expect("finite SAS eta")
+            .mu
+    });
     let mut rng = StdRng::seed_from_u64(seed);
     let y = p.mapv(|pi| if rng.random::<f64>() < pi { 1.0 } else { 0.0 });
 
@@ -1342,7 +1353,8 @@ fn sas_true_score_beta_jacobian_matchesfd_at_seed19() {
                 eta[i].clamp(-30.0, 30.0),
                 sas_state.epsilon,
                 sas_state.log_delta,
-            );
+            )
+            .expect("finite SAS eta");
             let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
             let aux = link_binomial_aux(y[i], w[i].max(0.0), mu);
@@ -1365,7 +1377,8 @@ fn sas_true_score_beta_jacobian_matchesfd_at_seed19() {
             eta0[i].clamp(-30.0, 30.0),
             sas_state.epsilon,
             sas_state.log_delta,
-        );
+        )
+        .expect("finite SAS eta");
         let mu = jets.jet.mu;
         let d1 = jets.jet.d1;
         let d2 = jets.jet.d2;
@@ -1415,7 +1428,11 @@ fn sas_pirlshessian_matches_true_score_jacobian_at_seed19() {
     let eta_true = x.dot(&true_beta);
     let eps_true = 0.25;
     let ld_true = -0.20;
-    let p = eta_true.mapv(|e| sas_inverse_link_jet(e, eps_true, ld_true).mu);
+    let p = eta_true.mapv(|e| {
+        sas_inverse_link_jet(e, eps_true, ld_true)
+            .expect("finite SAS eta")
+            .mu
+    });
     let mut rng = StdRng::seed_from_u64(seed);
     let y = p.mapv(|pi| if rng.random::<f64>() < pi { 1.0 } else { 0.0 });
 
@@ -1511,7 +1528,8 @@ fn sas_pirlshessian_matches_true_score_jacobian_at_seed19() {
             eta0[i].clamp(-30.0, 30.0),
             sas_state.epsilon,
             sas_state.log_delta,
-        );
+        )
+        .expect("finite SAS eta");
         let mu = jets.jet.mu;
         let d1 = jets.jet.d1;
         let d2 = jets.jet.d2;
@@ -1545,12 +1563,14 @@ fn link_binomial_aux_stay_finite_for_saturated_sas_probabilities() {
         (
             0.0,
             sas_inverse_link_jetwith_param_partials(-30.0, 0.0, 12.0)
+                .expect("finite SAS eta")
                 .jet
                 .mu,
         ),
         (
             1.0,
             sas_inverse_link_jetwith_param_partials(30.0, 0.0, 12.0)
+                .expect("finite SAS eta")
                 .jet
                 .mu,
         ),

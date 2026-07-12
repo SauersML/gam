@@ -292,7 +292,11 @@ impl AnalyticPenaltyRegistry {
                 ));
             }
             for (local, &(lo, hi)) in domains.iter().enumerate() {
-                if !(lo.is_finite() && hi.is_finite() && lo < hi) {
+                // Infinite faces deliberately represent ordinary unbounded
+                // real coordinates (for example parametric raw-beta and mu).
+                // The optimizer intersects these with its finite configured
+                // box; `validate_rho` separately refuses non-finite values.
+                if lo.is_nan() || hi.is_nan() || lo >= hi {
                     return Err(format!(
                         "analytic penalty `{}` has invalid rho domain[{local}] [{lo}, {hi}]",
                         penalty.name()

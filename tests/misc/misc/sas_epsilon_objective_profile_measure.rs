@@ -127,7 +127,11 @@ fn sas_epsilon_objective_profile_measure() {
     let eps_true: f64 = 0.38;
     let log_delta_true: f64 = -0.30;
     let eta = x.dot(&beta_true);
-    let p_true = eta.mapv(|e| sas_inverse_link_jet(e, eps_true, log_delta_true).mu);
+    let p_true = eta.mapv(|e| {
+        sas_inverse_link_jet(e, eps_true, log_delta_true)
+            .expect("finite SAS eta")
+            .mu
+    });
 
     let mut rng = StdRng::seed_from_u64(9001);
     let y = p_true.mapv(|p| if rng.random::<f64>() < p { 1.0 } else { 0.0 });

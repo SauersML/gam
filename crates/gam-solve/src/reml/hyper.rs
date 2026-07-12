@@ -2876,7 +2876,7 @@ impl<'a> RemlState<'a> {
                     eta_i,
                     sas_state.epsilon,
                     sas_state.log_delta,
-                )
+                )?
             };
             let mu = jets.jet.mu;
             let d1 = jets.jet.d1;

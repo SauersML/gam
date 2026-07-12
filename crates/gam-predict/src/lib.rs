@@ -2756,8 +2756,11 @@ where
                                 .to_string(),
                         )
                     })?;
-                    let jets =
-                        sas_inverse_link_jetwith_param_partials(eta[i], sas.epsilon, sas.log_delta);
+                    let jets = sas_inverse_link_jetwith_param_partials(
+                        eta[i],
+                        sas.epsilon,
+                        sas.log_delta,
+                    )?;
                     let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
                     meanvar += quadratic_form(cov_theta, &g)?;
                 }

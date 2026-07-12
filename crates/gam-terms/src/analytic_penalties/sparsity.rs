@@ -673,11 +673,9 @@ impl SparsityPenalty {
     fn resolved(&self, rho: ArrayView1<'_, f64>) -> (f64, f64) {
         let strength = validated_learnable_weight(self.weight, rho[self.strength_rho_index]);
         let smoothing = match (self.eps_rho_index, self.kind) {
-            // A learnable smoothing `exp(rho)` underflows to exact `0.0` for
-            // `rho ≲ -745`, which reintroduces a non-differentiable kink and a
-            // `0/0` at `x = 0` in `sqrt(x² + ε²)` / the Log sparsifier. Floor it
-            // at the smallest positive normal so the smoothing stays strictly
-            // positive while still shrinking arbitrarily close to zero.
+            // The owning seam validates this log-smoothing coordinate before
+            // exact exponentiation, so it stays positive without a saturated
+            // tail or value/derivative mismatch.
             (Some(idx), _) => validated_exp_log_strength(rho[idx]),
             (None, SparsityKind::SmoothedL1 { eps }) => eps,
             (None, SparsityKind::Log { delta }) => delta,
@@ -1208,9 +1206,8 @@ impl SmoothThresholdPenalty {
     impl_with_weight_schedule!(weight);
 
     fn threshold(&self, axis: usize, rho: ArrayView1<'_, f64>) -> f64 {
-        // A learnable threshold `θ·exp(rho)` overflows to `inf` for large `rho`;
-        // the downstream gate `σ((l−θ)/τ)` then evaluates `inf·gate = NaN`. Clamp
-        // the log-magnitude so the threshold stays a finite normal.
+        // Resolve the exact multiplicative threshold after the owning seam has
+        // validated its effective log-strength domain.
         validated_learnable_weight(self.thresholds[axis], rho[axis])
     }
 

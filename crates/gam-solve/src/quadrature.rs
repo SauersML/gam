@@ -2922,7 +2922,8 @@ pub fn integrated_logit_inverse_link_jet_pirls(
 
 #[inline]
 fn sas_point_jet(x: f64, epsilon: f64, log_delta: f64) -> (f64, f64, f64, f64) {
-    let jet = sas_inverse_link_jet(x, epsilon, log_delta);
+    let jet = sas_inverse_link_jet(x, epsilon, log_delta)
+        .expect("normal quadrature nodes must be finite");
     (jet.mu, jet.d1, jet.d2, jet.d3)
 }
 

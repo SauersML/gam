@@ -2099,11 +2099,9 @@ impl SaeManifoldTerm {
         let beta_off = self.beta_offsets()[atom_idx];
         let beta_block = m * p;
         let jet = &atom.basis_jacobian;
-        // Resolve the learnable isometry strength `scalar_weight · exp(rho)` in
-        // log-space with a clamped exponent: the naive `scalar_weight *
-        // rho.exp()` overflows to `inf` for `rho ≳ 709`, and the downstream
-        // `inf · jacobian` / `inf · 0.0` then injects NaN into the GN curvature
-        // block and β-penalty, poisoning the joint solve (#742, Issue 4).
+        // Resolve the exact learnable isometry strength after the registry seam
+        // has validated its effective log-strength domain. There is no
+        // saturated tail, so value and analytic rho derivatives stay aligned.
         //
         // #795 scale-invariant curvature: the value / gradient paths penalize
         // the SCALE-INVARIANT residual `R_n = g_n/gbar − g^ref_n` (normalized by
@@ -2369,11 +2367,9 @@ impl SaeManifoldTerm {
             };
             weighted_jacobian_rows.push(wj);
         }
-        // Resolve the learnable isometry strength `scalar_weight · exp(rho)` in
-        // log-space with a clamped exponent: the naive `scalar_weight *
-        // rho.exp()` overflows to `inf` for `rho ≳ 709`, and the downstream
-        // `inf · jacobian` / `inf · 0.0` then injects NaN into the GN curvature
-        // block and β-penalty, poisoning the joint solve (#742, Issue 4).
+        // Resolve the exact learnable isometry strength after the registry seam
+        // has validated its effective log-strength domain. There is no
+        // saturated tail, so value and analytic rho derivatives stay aligned.
         //
         // #795 scale-invariant curvature (decoder β block): the `gb` gradient
         // accumulated above routes through the gbar-normalized
