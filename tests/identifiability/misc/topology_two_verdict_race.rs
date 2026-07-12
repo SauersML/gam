@@ -37,8 +37,8 @@
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
 use gam::solver::topology_selector::{
     AutoTopologyKind, CrossClassCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
-    MIXTURE_K_LADDER, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_cross_class_race,
-    fit_mixture_rung, mixture_density_provider,
+    MIXTURE_K_LADDER, PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED,
+    adjudicate_cross_class_race, fit_mixture_rung, mixture_density_provider,
 };
 use ndarray::{Array2, ArrayView2};
 
@@ -216,13 +216,13 @@ fn run_race(data: &Array2<f64>) -> Verdict {
 
     let candidates = vec![
         CrossClassCandidate {
-            kind: AutoTopologyKind::Circle,
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
             negative_log_evidence: ring_negative_log_evidence(data.view()),
             certification: EvidenceCertification::Exact,
             density_provider: ring_density_provider(data.view()),
         },
         CrossClassCandidate {
-            kind: AutoTopologyKind::Mixture { k: mixture_k },
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Mixture { k: mixture_k }),
             negative_log_evidence: mix_winner.negative_log_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: mixture_density_provider(data.view(), mixture_k, cfg),

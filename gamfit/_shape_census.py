@@ -94,6 +94,10 @@ def run_shape_controlled_census(
         input_dtype = np.dtype(declared_dtype) if declared_dtype is not None else None
     except TypeError:
         input_dtype = None
+    if input_dtype is not None and input_dtype.kind == "c":
+        raise TypeError(
+            f"data must be real-valued; complex dtype {input_dtype} is not supported"
+        )
     if input_dtype is not None and input_dtype.kind == "f" and input_dtype.itemsize == 4:
         source_dtype = np.dtype(np.float32)
         control_function = shape_matched_control_f32

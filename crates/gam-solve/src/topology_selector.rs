@@ -37,13 +37,12 @@
 
 use crate::evidence::{
     GaussianMixtureConfig, StackingConfig, StackingWeights, TopologyScoreScale,
-    UNION_STRUCTURE_LADDER, UnionStructure, UnionStructureFit, fit_gaussian_mixture,
-    fit_union_ladder, fit_union_structure, solve_stacking_weights, union_per_point_log_density,
+    UnionStructure, UnionStructureFit, fit_gaussian_mixture, fit_union_ladder,
+    fit_union_structure, solve_stacking_weights, union_per_point_log_density,
 };
 use crate::priority_selection::{PriorityCandidate, rank_priority_candidates};
 use crate::row_sampling_measure::CoresetCertificate;
 use ndarray::{Array2, ArrayView2};
-use serde_json::Value as JsonValue;
 use statrs::distribution::{ChiSquared, ContinuousCDF};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -102,19 +101,12 @@ pub enum AutoTopologyKind {
     Mixture {
         k: usize,
     },
-    /// The free-mixture model-selection procedure rather than one fixed order.
-    /// Each outer training fold chooses its own `k` by rank-aware evidence, so
-    /// the resulting predictive column is honest for the whole class.
-    MixtureClass,
     /// `k` tight Gaussian clusters whose centers share one fitted circle
     /// (#2262). This is the density class for discrete cyclic concepts: it
     /// preserves clustered mass while pricing the common circular geometry.
     RingOfClusters {
         k: usize,
     },
-    /// The ring-of-clusters model-selection procedure with order selected
-    /// independently inside each outer training fold.
-    RingOfClustersClass,
     /// Structured-union composite (#907): a small FIXED set of component
     /// structures joined by a hard responsibility split (e.g. circle+circle,
     /// circle+cluster, line+cluster). Like the mixture rung it is a discrete,
@@ -142,9 +134,7 @@ impl AutoTopologyKind {
             AutoTopologyKind::DuchonSheet => "duchon_sheet",
             AutoTopologyKind::ConstantCurvature => "constant_curvature",
             AutoTopologyKind::Mixture { .. } => "mixture",
-            AutoTopologyKind::MixtureClass => "mixture",
             AutoTopologyKind::RingOfClusters { .. } => "ring_clusters",
-            AutoTopologyKind::RingOfClustersClass => "ring_clusters",
             AutoTopologyKind::Union { structure } => structure.as_str(),
         }
     }
@@ -162,17 +152,11 @@ impl AutoTopologyKind {
     /// `true` iff this candidate is the discrete-mixture model class (as
     /// opposed to a smooth manifold / Euclidean latent topology).
     pub const fn is_discrete_mixture(self) -> bool {
-        matches!(
-            self,
-            AutoTopologyKind::Mixture { .. } | AutoTopologyKind::MixtureClass
-        )
+        matches!(self, AutoTopologyKind::Mixture { .. })
     }
 
     pub const fn is_ring_of_clusters(self) -> bool {
-        matches!(
-            self,
-            AutoTopologyKind::RingOfClusters { .. } | AutoTopologyKind::RingOfClustersClass
-        )
+        matches!(self, AutoTopologyKind::RingOfClusters { .. })
     }
 
     /// `true` iff this candidate is the structured-union composite class (#907).
@@ -189,40 +173,48 @@ impl AutoTopologyKind {
     }
 
     pub fn parse(value: &str) -> Result<Self, String> {
-        let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
-        if let Some(structure) = parse_union_name(&normalized) {
-            return Ok(AutoTopologyKind::Union { structure });
-        }
-        if let Some(rest) = normalized.strip_prefix("ring_clusters") {
-            if rest.is_empty() {
-                return Ok(AutoTopologyKind::RingOfClustersClass);
-            }
-            let Some(rest) = rest.strip_prefix("_k") else {
+        let canonical = value.trim().to_ascii_lowercase();
+        if let Some(rest) = canonical.strip_prefix("ring_clusters_k") {
+            if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(format!(
                     "ring-of-clusters candidate must use ring_clusters_k{{n}}; got {value:?}"
                 ));
-            };
+            }
             let k: usize = rest
                 .parse()
-                .map_err(|_| format!("ring-of-clusters order must be an integer; got {value:?}"))?;
+                .map_err(|_| format!("ring-of-clusters order is out of range; got {value:?}"))?;
             if k < 3 {
                 return Err("ring-of-clusters order k must be >= 3".to_string());
             }
             return Ok(AutoTopologyKind::RingOfClusters { k });
         }
-        if let Some(rest) = normalized.strip_prefix("mixture") {
-            // Accept "mixture", "mixture_k7", "mixture7", "mixture_7".
-            let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
-            if digits.is_empty() {
-                return Ok(AutoTopologyKind::MixtureClass);
+        if canonical.starts_with("ring_clusters") {
+            return Err(format!(
+                "ring-of-clusters candidate must use ring_clusters_k{{n}}; got {value:?}"
+            ));
+        }
+        if let Some(rest) = canonical.strip_prefix("mixture_k") {
+            if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!(
+                    "mixture candidate must use mixture_k{{n}}; got {value:?}"
+                ));
             }
-            let k: usize = digits
+            let k: usize = rest
                 .parse()
-                .map_err(|_| format!("mixture order must be a positive integer; got {value:?}"))?;
+                .map_err(|_| format!("mixture order is out of range; got {value:?}"))?;
             if k == 0 {
                 return Err("mixture order k must be >= 1".to_string());
             }
             return Ok(AutoTopologyKind::Mixture { k });
+        }
+        if canonical.starts_with("mixture") {
+            return Err(format!(
+                "mixture candidate must use mixture_k{{n}}; got {value:?}"
+            ));
+        }
+        let normalized = canonical.replace('-', "_");
+        if let Some(structure) = parse_union_name(&normalized) {
+            return Ok(AutoTopologyKind::Union { structure });
         }
         match normalized.as_str() {
             "euclidean" | "flat" | "euclidean_patch" | "euclideanpatch" => {
@@ -232,6 +224,7 @@ impl AutoTopologyKind {
             "sphere" | "s2" => Ok(AutoTopologyKind::Sphere),
             "torus" => Ok(AutoTopologyKind::Torus),
             "cylinder" => Ok(AutoTopologyKind::Cylinder),
+            "mobius" => Ok(AutoTopologyKind::Mobius),
             "duchon" | "duchon_sheet" | "duchonsheet" | "thin_plate" | "thinplate" => {
                 Ok(AutoTopologyKind::DuchonSheet)
             }
@@ -239,7 +232,7 @@ impl AutoTopologyKind {
                 Ok(AutoTopologyKind::ConstantCurvature)
             }
             other => Err(format!(
-                "topology candidate must be euclidean, circle, sphere, torus, cylinder, duchon_sheet, constant_curvature, mixture[_k{{n}}], ring_clusters[_k{{n}}], or a union (union_circle+circle, union_circle+cluster, union_line+cluster); got {other:?}"
+                "topology candidate must be euclidean, circle, sphere, torus, cylinder, mobius, duchon_sheet, constant_curvature, mixture_k{{n}}, ring_clusters_k{{n}}, or a union (union_circle+circle, union_circle+cluster, union_line+cluster); got {other:?}"
             )),
         }
     }
@@ -321,32 +314,68 @@ impl AutoTopologyKind {
         out
     }
 
-    /// The full discrete-mixture rung: one candidate per `k` in
-    /// [`MIXTURE_K_LADDER`].
-    pub fn mixture_ladder() -> Vec<Self> {
-        MIXTURE_K_LADDER
-            .iter()
-            .map(|&k| AutoTopologyKind::Mixture { k })
-            .collect()
+}
+
+/// A predictive column in a cross-class race.
+///
+/// Fixed topology fits and adaptive model-selection procedures are different
+/// statistical objects. In particular, an adaptive class chooses its order
+/// independently inside every outer training fold; it must never alias a fixed
+/// topology name or take the evidence-only same-class shortcut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PredictiveCandidateKind {
+    Fixed(AutoTopologyKind),
+    MixtureClass,
+    RingOfClustersClass,
+}
+
+impl PredictiveCandidateKind {
+    /// Injective, stable identity for predictive columns and reports.
+    pub fn display_name(self) -> String {
+        match self {
+            PredictiveCandidateKind::Fixed(kind) => kind.display_name(),
+            PredictiveCandidateKind::MixtureClass => "mixture_class".to_string(),
+            PredictiveCandidateKind::RingOfClustersClass => {
+                "ring_clusters_class".to_string()
+            }
+        }
     }
 
-    pub fn ring_of_clusters_ladder() -> Vec<Self> {
-        MIXTURE_K_LADDER
-            .iter()
-            .copied()
-            .filter(|&k| k >= 3)
-            .map(|k| AutoTopologyKind::RingOfClusters { k })
-            .collect()
+    /// Coarse density family used only where a report explicitly asks for a
+    /// family label rather than a predictive-column identity.
+    pub const fn family_tag(self) -> &'static str {
+        match self {
+            PredictiveCandidateKind::Fixed(kind) => kind.as_str(),
+            PredictiveCandidateKind::MixtureClass => "mixture",
+            PredictiveCandidateKind::RingOfClustersClass => "ring_clusters",
+        }
     }
 
-    /// The full structured-union rung: one candidate per composite in
-    /// [`UNION_STRUCTURE_LADDER`] (#907). Fixed and closed — no open-ended
-    /// structure search (that stays owned by #976's move set).
-    pub fn union_ladder() -> Vec<Self> {
-        UNION_STRUCTURE_LADDER
-            .iter()
-            .map(|&structure| AutoTopologyKind::Union { structure })
-            .collect()
+    pub const fn is_discrete_class(self) -> bool {
+        match self {
+            PredictiveCandidateKind::Fixed(kind) => kind.is_discrete_class(),
+            PredictiveCandidateKind::MixtureClass
+            | PredictiveCandidateKind::RingOfClustersClass => true,
+        }
+    }
+
+    /// Adaptive classes require honest outer-fold refitting even when every
+    /// entry in the race is a discrete class.
+    pub const fn requires_predictive_stacking(self) -> bool {
+        matches!(
+            self,
+            PredictiveCandidateKind::MixtureClass
+                | PredictiveCandidateKind::RingOfClustersClass
+        )
+    }
+
+    pub const fn is_circular(self) -> bool {
+        matches!(
+            self,
+            PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle)
+                | PredictiveCandidateKind::Fixed(AutoTopologyKind::RingOfClusters { .. })
+                | PredictiveCandidateKind::RingOfClustersClass
+        )
     }
 }
 
@@ -384,7 +413,6 @@ pub fn parse_union_name(normalized: &str) -> Option<UnionStructure> {
 pub struct TopologyAutoSelector {
     pub candidates: Vec<AutoTopologyKind>,
     pub score_scale: TopologyScoreScale,
-    pub latent: Option<String>,
 }
 
 impl TopologyAutoSelector {
@@ -392,75 +420,7 @@ impl TopologyAutoSelector {
         Self {
             candidates: candidates.unwrap_or_else(AutoTopologyKind::all),
             score_scale: TopologyScoreScale::PerEffectiveDim,
-            latent: None,
         }
-    }
-
-    pub fn from_json(value: &JsonValue) -> Result<Self, String> {
-        let obj = value
-            .as_object()
-            .ok_or_else(|| "topology_auto_selector must be an object".to_string())?;
-        let candidates = match obj.get("candidates").filter(|value| !value.is_null()) {
-            None => AutoTopologyKind::all(),
-            Some(raw) => {
-                let items = raw.as_array().ok_or_else(|| {
-                    "topology_auto_selector.candidates must be a list".to_string()
-                })?;
-                if items.is_empty() {
-                    return Err(
-                        "topology_auto_selector.candidates must have at least one entry"
-                            .to_string(),
-                    );
-                }
-                let mut out = Vec::with_capacity(items.len());
-                for (idx, item) in items.iter().enumerate() {
-                    let name = item.as_str().ok_or_else(|| {
-                        format!("topology_auto_selector.candidates[{idx}] must be a string")
-                    })?;
-                    let kind = AutoTopologyKind::parse(name)?;
-                    if out.contains(&kind) {
-                        return Err(format!(
-                            "topology_auto_selector duplicate candidate {:?}",
-                            kind.as_str()
-                        ));
-                    }
-                    out.push(kind);
-                }
-                out
-            }
-        };
-        let score_scale = match obj
-            .get("score_scale")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("per_effective_dim")
-            .trim()
-            .to_ascii_lowercase()
-            .replace('-', "_")
-            .as_str()
-        {
-            "per_observation" => TopologyScoreScale::PerObservation,
-            "per_effective_dim" => TopologyScoreScale::PerEffectiveDim,
-            other => {
-                return Err(format!(
-                    "topology_auto_selector.score_scale must be per_effective_dim or per_observation; got {other:?}"
-                ));
-            }
-        };
-        let latent = obj
-            .get("latent")
-            .filter(|value| !value.is_null())
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(str::to_string)
-                    .ok_or_else(|| "topology_auto_selector.latent must be a string".to_string())
-            })
-            .transpose()?;
-        Ok(Self {
-            candidates,
-            score_scale,
-            latent,
-        })
     }
 }
 
@@ -1982,11 +1942,9 @@ pub fn build_cv_log_density_table(
     Ok(table)
 }
 
-/// Adjudicated outcome of a cross-class race. When the race mixes a smooth
-/// manifold candidate with the discrete-mixture rung, `headline` is the stacking
-/// verdict (held-out predictive log-density), and the rank-aware Laplace
-/// evidence is retained per-candidate as corroboration. Same-class races report
-/// `Headline::Evidence` (winner-take-all on rank-aware evidence).
+/// Adjudicated outcome of a predictive race. A mixed smooth/discrete race and
+/// any race containing an adaptive class use honest held-out stacking; only a
+/// race of fixed candidates from one side of that boundary uses evidence alone.
 #[derive(Debug, Clone)]
 pub struct CrossClassRaceVerdict {
     /// Candidate display names, column-aligned with the stacking table / weights.
@@ -1996,10 +1954,11 @@ pub struct CrossClassRaceVerdict {
     /// Rank-aware Laplace negative-log-evidence per candidate (corroboration;
     /// lower is better).
     pub negative_log_evidence: Vec<f64>,
-    /// Stacking weights over the candidates (present iff `is_cross_class`).
+    /// Stacking weights over the candidates (present iff `headline` is
+    /// [`Headline::Stacking`]).
     pub stacking: Option<StackingWeights>,
-    /// Index of the headline winner. For cross-class races this is the max
-    /// stacking-weight candidate; for same-class it is the min-evidence one.
+    /// Index of the headline winner. For stacking races this is the max-weight
+    /// candidate; for evidence races it is the min-evidence one.
     pub winner_index: usize,
     /// Which statistic drove the headline.
     pub headline: Headline,
@@ -2016,7 +1975,8 @@ pub struct CrossClassRaceVerdict {
 pub enum Headline {
     /// Rank-aware Laplace evidence (same-class race, winner-take-all).
     Evidence,
-    /// Held-out predictive log-density / stacking weights (cross-class race).
+    /// Held-out predictive log-density / stacking weights (cross-class or
+    /// adaptive-class race).
     Stacking,
 }
 
@@ -2099,7 +2059,7 @@ impl EvidenceCertification {
 /// that evidence was certified (for the margin contract), and a selection-time
 /// held-out-density provider that refits per CV fold.
 pub struct CrossClassCandidate<'a> {
-    pub kind: AutoTopologyKind,
+    pub kind: PredictiveCandidateKind,
     pub negative_log_evidence: f64,
     /// Certification of `negative_log_evidence`. Defaults conceptually to
     /// [`EvidenceCertification::Exact`]; construct with [`Self::exact`] for the
@@ -2112,7 +2072,7 @@ impl<'a> CrossClassCandidate<'a> {
     /// Construct a candidate whose evidence is an exact point value (the
     /// classic full-corpus dense-logdet path — no margin floor).
     pub fn exact(
-        kind: AutoTopologyKind,
+        kind: PredictiveCandidateKind,
         negative_log_evidence: f64,
         density_provider: HeldOutDensityProvider<'a>,
     ) -> Self {
@@ -2143,19 +2103,18 @@ pub struct InsufficientRaceMargin {
     pub required_margin: f64,
 }
 
-/// Adjudicate a race that may mix smooth-manifold and discrete candidates
-/// (the discrete-mixture rung and/or a structured union, #907). Cross-class
-/// mixing is auto-detected from the candidate kinds (a race is cross-class iff
-/// it contains BOTH at least one smooth/Euclidean candidate AND at least one
-/// discrete candidate — [`AutoTopologyKind::Mixture`] or
-/// [`AutoTopologyKind::Union`]). When cross-class,
-/// the headline switches to stacking over a selection-time CV held-out
-/// log-density table; otherwise the headline is the rank-aware evidence winner.
+/// Adjudicate a race that may mix smooth-manifold and discrete candidates.
+/// Cross-class mixing is auto-detected (at least one fixed smooth candidate and
+/// at least one discrete candidate). Such races use stacking over a
+/// selection-time CV held-out log-density table. An adaptive model-selection
+/// class also forces stacking even in a discrete-only race, because its order
+/// must be selected independently within every outer training fold. Evidence
+/// alone adjudicates only same-class races made entirely of fixed candidates.
 /// `seed` is mixed into the deterministic CV fold assignment (#1386): the same
 /// seed reproduces the identical held-out folding, different seeds give
 /// different — but still deterministic — foldings. It only affects the
-/// cross-class (stacking) path; same-class races are winner-take-all on evidence
-/// and ignore it. Pass [`STACKING_CV_SEED`] for the default folding.
+/// stacking path; fixed same-class races are winner-take-all on evidence and
+/// ignore it. Pass [`STACKING_CV_SEED`] for the default folding.
 pub fn adjudicate_cross_class_race(
     n: usize,
     candidates: Vec<CrossClassCandidate<'_>>,
@@ -2177,8 +2136,12 @@ pub fn adjudicate_cross_class_race(
     let has_discrete = candidates.iter().any(|c| c.kind.is_discrete_class());
     let has_smooth = candidates.iter().any(|c| !c.kind.is_discrete_class());
     let is_cross_class = has_discrete && has_smooth;
+    let has_adaptive_class = candidates
+        .iter()
+        .any(|candidate| candidate.kind.requires_predictive_stacking());
+    let use_stacking = is_cross_class || has_adaptive_class;
 
-    if !is_cross_class {
+    if !use_stacking {
         // Same-class: winner-take-all on rank-aware evidence (lower wins).
         let certifications: Vec<EvidenceCertification> =
             candidates.iter().map(|c| c.certification).collect();
@@ -2247,13 +2210,13 @@ pub fn adjudicate_cross_class_race(
     }
     Ok(CrossClassRaceVerdict {
         candidate_names: names,
-        is_cross_class: true,
+        is_cross_class,
         negative_log_evidence: evidence,
         stacking: Some(stacking),
         winner_index,
         headline: Headline::Stacking,
-        // Cross-class headlines adjudicate by held-out predictive stacking on
-        // the full corpus, not by the approximate-evidence scalar, so the
+        // Stacking headlines adjudicate by held-out predictive density on the
+        // full corpus, not by the approximate-evidence scalar, so the
         // enclosure/coreset margin contract does not gate the verdict here.
         insufficient_margin: None,
     })
@@ -2688,13 +2651,13 @@ mod tests {
         // enclosure with gap 1.0. Lead of 0.5 < gap ⇒ provisional.
         let near = vec![
             CrossClassCandidate {
-                kind: AutoTopologyKind::Circle,
+                kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
                 negative_log_evidence: 100.0,
                 certification: EvidenceCertification::Enclosure { gap: 1.0 },
                 density_provider: trivial_provider(),
             },
             CrossClassCandidate {
-                kind: AutoTopologyKind::Euclidean,
+                kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
                 negative_log_evidence: 100.5,
                 certification: EvidenceCertification::Enclosure { gap: 1.0 },
                 density_provider: trivial_provider(),
@@ -2721,13 +2684,13 @@ mod tests {
         // A lead that clears the gap transfers the verdict cleanly.
         let far = vec![
             CrossClassCandidate {
-                kind: AutoTopologyKind::Circle,
+                kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
                 negative_log_evidence: 100.0,
                 certification: EvidenceCertification::Enclosure { gap: 1.0 },
                 density_provider: trivial_provider(),
             },
             CrossClassCandidate {
-                kind: AutoTopologyKind::Euclidean,
+                kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
                 negative_log_evidence: 105.0,
                 certification: EvidenceCertification::Enclosure { gap: 1.0 },
                 density_provider: trivial_provider(),
@@ -2758,13 +2721,13 @@ mod tests {
         let lead = 0.5 * required;
         let candidates = vec![
             CrossClassCandidate {
-                kind: AutoTopologyKind::Circle,
+                kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
                 negative_log_evidence: 10.0,
                 certification: EvidenceCertification::Coreset { certificate: cert },
                 density_provider: trivial_provider(),
             },
             CrossClassCandidate {
-                kind: AutoTopologyKind::Euclidean,
+                kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
                 negative_log_evidence: 10.0 + lead,
                 certification: EvidenceCertification::Coreset { certificate: cert },
                 density_provider: trivial_provider(),

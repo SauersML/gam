@@ -45,9 +45,9 @@ Example::
 
 The activation file must contain one finite, two-dimensional NumPy array.
 Controls are generated and consumed one at a time so the runner never retains
-both corpus-sized controls simultaneously.  The native control generator
-requires contiguous ``float64`` input; conversion may therefore materialize
-one copy when the source file uses another dtype or layout.
+both corpus-sized controls simultaneously. Native contiguous ``float32`` and
+``float64`` inputs retain their dtype without a source copy; other dtypes or
+layouts are normalized once before the three isolated callback runs.
 
 Measured caveats from the Qwen3-8B/OLMo-2 censuses still apply:
 

@@ -48,8 +48,8 @@ use gam::inference::smooth_test::SmoothTestScale;
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
 use gam::solver::topology_selector::{
     AutoTopologyKind, CrossClassCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
-    MIXTURE_K_LADDER, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_cross_class_race,
-    fit_mixture_rung, mixture_density_provider,
+    MIXTURE_K_LADDER, PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED,
+    adjudicate_cross_class_race, fit_mixture_rung, mixture_density_provider,
 };
 use gam::terms::structure::anova_atom::{BindingNotion, CarveInput, carve, fit_tensor_surface};
 use ndarray::{Array1, Array2, ArrayView2};
@@ -203,13 +203,13 @@ fn race_shape(data: &Array2<f64>) -> ShapeVerdict {
 
     let candidates = vec![
         CrossClassCandidate {
-            kind: AutoTopologyKind::Circle,
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
             negative_log_evidence: ring_negative_log_evidence(data.view()),
             certification: EvidenceCertification::Exact,
             density_provider: ring_density_provider(data.view()),
         },
         CrossClassCandidate {
-            kind: AutoTopologyKind::Mixture { k: mixture_k },
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Mixture { k: mixture_k }),
             negative_log_evidence: rung.winner().negative_log_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: mixture_density_provider(data.view(), mixture_k, cfg),

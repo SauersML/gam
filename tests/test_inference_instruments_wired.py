@@ -91,6 +91,10 @@ def test_shape_controlled_census_rejects_ambiguous_seeds_and_bad_data() -> None:
         gamfit.run_shape_controlled_census(
             np.array([[1.0, np.nan], [2.0, 3.0]]), pipeline
         )
+    with pytest.raises(TypeError, match="complex dtype"):
+        gamfit.run_shape_controlled_census(
+            np.ones((4, 2), dtype=np.complex64) * (1.0 + 2.0j), pipeline
+        )
 
 
 def test_float32_shape_controls_preserve_dtype_seed_marginals_and_covariance(

@@ -70,8 +70,8 @@
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig, fit_gaussian_mixture};
 use gam::solver::topology_selector::{
     AutoTopologyKind, CrossClassCandidate, EvidenceCertification, HeldOutDensityProvider,
-    MIXTURE_K_LADDER, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_cross_class_race,
-    fit_mixture_rung, mixture_density_provider,
+    MIXTURE_K_LADDER, PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED,
+    adjudicate_cross_class_race, fit_mixture_rung, mixture_density_provider,
 };
 use gam::test_support::reference::{Column, run_python};
 use ndarray::{Array2, ArrayView2};
@@ -393,7 +393,7 @@ fn build_cross_class_candidates<'a>(
     // Smooth circle candidate.
     let circle_evidence = circle_nle(data).expect("circle evidence");
     candidates.push(CrossClassCandidate {
-        kind: AutoTopologyKind::Circle,
+        kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
         negative_log_evidence: circle_evidence,
         certification: EvidenceCertification::Exact,
         density_provider: circle_density_provider(data),
@@ -405,7 +405,7 @@ fn build_cross_class_candidates<'a>(
         }
         let nle = mixture_nle_for_k(data, k, cfg).expect("mixture evidence");
         candidates.push(CrossClassCandidate {
-            kind: AutoTopologyKind::Mixture { k },
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Mixture { k }),
             negative_log_evidence: nle,
             certification: EvidenceCertification::Exact,
             density_provider: mixture_density_provider(data, k, cfg),

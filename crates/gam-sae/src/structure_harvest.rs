@@ -3433,7 +3433,6 @@ fn race_spec_set(
         // marginal-likelihood ranking the Bayesian evidence is designed to support,
         // so the genuinely-best-fitting topology wins.
         score_scale: TopologyScoreScale::PerObservation,
-        latent: None,
     };
     // Index the realized specs by kind so the fit closure can find the right
     // evaluator/coords for the kind the selector hands it.

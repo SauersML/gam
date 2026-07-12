@@ -24,8 +24,8 @@
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig, UnionStructure};
 use gam::solver::topology_selector::{
     AutoTopologyKind, CrossClassCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
-    STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_cross_class_race, fit_union_candidate,
-    fit_union_rung, union_density_provider,
+    PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_cross_class_race,
+    fit_union_candidate, fit_union_rung, union_density_provider,
 };
 use ndarray::{Array2, ArrayView2};
 
@@ -263,21 +263,21 @@ fn run_race(data: &Array2<f64>) -> RaceOutcome {
 
     let candidates = vec![
         CrossClassCandidate {
-            kind: AutoTopologyKind::Circle,
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
             negative_log_evidence: ring_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: ring_density_provider(data.view()),
         },
         CrossClassCandidate {
-            kind: AutoTopologyKind::Torus,
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Torus),
             negative_log_evidence: torus_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: torus_density_provider(data.view()),
         },
         CrossClassCandidate {
-            kind: AutoTopologyKind::Union {
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Union {
                 structure: union_structure,
-            },
+            }),
             negative_log_evidence: union_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: union_density_provider(data.view(), union_structure, cfg),

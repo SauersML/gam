@@ -34,7 +34,7 @@
 use gam::solver::evidence::StackingConfig;
 use gam::solver::topology_selector::{
     AutoTopologyKind, CrossClassCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
-    STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_cross_class_race,
+    PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_cross_class_race,
 };
 use ndarray::{Array2, ArrayView2};
 
@@ -288,13 +288,13 @@ fn run_bottom_rung(data: &Array2<f64>) -> LadderOutcome {
     // --- Same-class headline: Euclidean(Gaussian) vs Circle, winner-take-all.
     let candidates = vec![
         CrossClassCandidate {
-            kind: AutoTopologyKind::Euclidean,
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
             negative_log_evidence: gaussian_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: gaussian2d_density_provider(data.view()),
         },
         CrossClassCandidate {
-            kind: AutoTopologyKind::Circle,
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
             negative_log_evidence: ring_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: ring_density_provider(data.view()),
@@ -331,19 +331,19 @@ fn run_bottom_rung(data: &Array2<f64>) -> LadderOutcome {
     );
     let stack_candidates = vec![
         CrossClassCandidate {
-            kind: AutoTopologyKind::Euclidean,
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
             negative_log_evidence: gaussian_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: gaussian2d_density_provider(data.view()),
         },
         CrossClassCandidate {
-            kind: AutoTopologyKind::Circle,
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
             negative_log_evidence: ring_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: ring_density_provider(data.view()),
         },
         CrossClassCandidate {
-            kind: AutoTopologyKind::Mixture { k: 1 },
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Mixture { k: 1 }),
             negative_log_evidence: gaussian_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: mixture_provider,

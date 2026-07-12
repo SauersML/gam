@@ -14,8 +14,8 @@
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
 use gam::solver::topology_selector::{
     AutoTopologyKind, CrossClassCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
-    MIXTURE_K_LADDER, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_cross_class_race,
-    fit_mixture_rung,
+    MIXTURE_K_LADDER, PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED,
+    adjudicate_cross_class_race, fit_mixture_rung,
 };
 use ndarray::{Array2, ArrayView2};
 
@@ -180,13 +180,13 @@ fn run_race(data: &Array2<f64>) -> RaceOutcome {
 
     let candidates = vec![
         CrossClassCandidate {
-            kind: AutoTopologyKind::Circle,
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
             negative_log_evidence: circle_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: circle_provider,
         },
         CrossClassCandidate {
-            kind: AutoTopologyKind::Mixture { k: mixture_k },
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Mixture { k: mixture_k }),
             negative_log_evidence: mixture_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: mixture_provider,
@@ -358,13 +358,13 @@ fn same_class_race_keeps_evidence_headline() {
     let provider_b = ring_density_provider(data.view());
     let candidates = vec![
         CrossClassCandidate {
-            kind: AutoTopologyKind::Circle,
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
             negative_log_evidence: 100.0,
             certification: EvidenceCertification::Exact,
             density_provider: provider_a,
         },
         CrossClassCandidate {
-            kind: AutoTopologyKind::Euclidean,
+            kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
             negative_log_evidence: 250.0,
             certification: EvidenceCertification::Exact,
             density_provider: provider_b,
