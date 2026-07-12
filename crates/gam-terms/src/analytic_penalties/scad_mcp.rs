@@ -419,6 +419,7 @@ impl AnalyticPenalty for ScadMcpPenalty {
     }
 
     impl_learnable_weight_rho_count!();
+    impl_learnable_weight_domain!(weight);
 
     fn name(&self) -> &str {
         "scad_mcp"

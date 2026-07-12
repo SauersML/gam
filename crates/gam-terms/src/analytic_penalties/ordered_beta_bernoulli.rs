@@ -408,6 +408,28 @@ impl AnalyticPenalty for OrderedBetaBernoulliPenalty {
         PenaltyTier::Psi
     }
 
+    fn validate_rho(&self, rho: ArrayView1<'_, f64>) -> Result<(), String> {
+        if rho.len() != self.rho_count() {
+            return Err(format!(
+                "ordered Beta--Bernoulli rho length {} != declared {}",
+                rho.len(),
+                self.rho_count()
+            ));
+        }
+        if self.learnable_alpha {
+            resolve_learnable_weight(self.alpha, rho[0])?;
+        }
+        Ok(())
+    }
+
+    fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
+        if !self.learnable_alpha {
+            return Ok(Vec::new());
+        }
+        Ok(vec![learnable_weight_coordinate_domain(self.alpha)?
+            .ok_or_else(|| "ordered Beta--Bernoulli alpha must be positive".to_string())?])
+    }
+
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
         let alpha = self.resolved_alpha(rho);
         let a_col = self.column_beta_shapes(alpha);

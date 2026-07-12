@@ -116,6 +116,26 @@ impl AnalyticPenalty for ARDPenalty {
         PenaltyTier::Psi
     }
 
+    fn validate_rho(&self, rho: ArrayView1<'_, f64>) -> Result<(), String> {
+        if rho.len() != self.rho_count() {
+            return Err(format!(
+                "ARD rho length {} != latent dimension {}",
+                rho.len(),
+                self.rho_count()
+            ));
+        }
+        for axis in 0..self.latent_dim {
+            resolve_learnable_weight(self.weight, rho[self.rho_indices[axis]])?;
+        }
+        Ok(())
+    }
+
+    fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
+        let domain = learnable_weight_coordinate_domain(self.weight)?
+            .ok_or_else(|| "ARD base weight must be positive".to_string())?;
+        Ok(vec![domain; self.rho_count()])
+    }
+
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
         let d = self.latent_dim;
         let n_obs = target.len() / d;

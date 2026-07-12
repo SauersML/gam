@@ -1022,6 +1022,52 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
         PenaltyTier::Psi
     }
 
+    fn validate_rho(&self, rho: ArrayView1<'_, f64>) -> Result<(), String> {
+        if rho.len() != self.rho_count() {
+            return Err(format!(
+                "parametric row-precision rho length {} != declared {}",
+                rho.len(),
+                self.rho_count()
+            ));
+        }
+        for k in 0..self.log_alpha.len() {
+            checked_exp_log_strength(self.active_log_alpha(k, rho))?;
+            if !self.active_raw_beta(k, rho).is_finite() {
+                return Err(format!(
+                    "parametric row-precision raw-beta coordinate {k} is non-finite"
+                ));
+            }
+            for axis in 0..self.aux.ncols() {
+                if !self.active_mu(k, axis, rho).is_finite() {
+                    return Err(format!(
+                        "parametric row-precision mean coordinate ({k}, {axis}) is non-finite"
+                    ));
+                }
+            }
+        }
+        if self.learnable_weight {
+            resolve_learnable_weight(self.weight, rho[self.weight_offset()])?;
+        }
+        Ok(())
+    }
+
+    fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
+        let mut domains = vec![(f64::MIN, f64::MAX); self.rho_count()];
+        for (k, &base_log_alpha) in self.log_alpha.iter().enumerate() {
+            domains[self.log_alpha_offset() + k] = (
+                LOG_STRENGTH_MIN - base_log_alpha,
+                LOG_STRENGTH_MAX - base_log_alpha,
+            );
+        }
+        if self.learnable_weight {
+            domains[self.weight_offset()] = learnable_weight_coordinate_domain(self.weight)?
+                .ok_or_else(|| {
+                    "parametric row-precision cannot learn a zero base weight".to_string()
+                })?;
+        }
+        Ok(domains)
+    }
+
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
         let Some(t) = self.target_matrix(target) else {
             return 0.0;

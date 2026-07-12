@@ -13,6 +13,14 @@ use std::ops::Neg;
 use std::sync::OnceLock;
 
 const SAS_U_CLAMP: f64 = 50.0;
+/// Inclusive eta domain for the solver's standard log inverse-link derivative
+/// seams. Within this conservative IEEE-754-safe interval, `exp(eta)` is finite,
+/// positive, and normal, so the value and every analytic derivative are exactly
+/// the same operation. Solver callers must reject steps outside this domain;
+/// silently projecting eta would define a different, nonsmooth link.
+pub const LOG_LINK_SOLVER_ETA_MIN: f64 = -700.0;
+/// Inclusive upper endpoint of the standard log-link solver domain.
+pub const LOG_LINK_SOLVER_ETA_MAX: f64 = 700.0;
 /// Bound B used by the bounded sinh-arcsinh log-delta parameterisation:
 /// `delta = exp(B * tanh(raw_log_delta / B))`. Exposed for the outer-strategy
 /// edge-barrier helpers in `solver/estimate.rs` that previously had to
@@ -37,6 +45,19 @@ fn latent_cloglog_point_jet(
         d2: jet.d2,
         d3: jet.d3,
     })
+}
+
+#[inline]
+fn log_link_solver_exp(eta: f64) -> Result<f64, EstimationError> {
+    if !(LOG_LINK_SOLVER_ETA_MIN..=LOG_LINK_SOLVER_ETA_MAX).contains(&eta) {
+        return Err(EstimationError::InverseLinkDomainViolation {
+            link: "standard log inverse link",
+            eta,
+            lower: LOG_LINK_SOLVER_ETA_MIN,
+            upper: LOG_LINK_SOLVER_ETA_MAX,
+        });
+    }
+    Ok(eta.exp())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -967,18 +988,14 @@ impl InverseLinkKernel for LinkFunction {
                 d3: 0.0,
             }),
             LinkFunction::Log => {
-                // SOLVER-INTERNAL inverse-link jet: `η.clamp(−700, 700).exp()`.
-                // The clamp is an intentional conditioning hack so the IRLS/REML
-                // normal equations stay well posed when η wanders into the tails
-                // during a trust-region step — it is NOT the public response
-                // transform. Public response-scale outputs (predictions, FFI
-                // `apply_inverse_link_array`, posterior bands) must use the EXACT
-                // `exp(η)` in `families::inverse_link::apply_inverse_link_vec`,
-                // which is finite wherever representable. Do not reroute a public
-                // output through this clamped jet (issue #963). Keep the clamp:
-                // solver consumers (e.g. `reml/runtime.rs` trust-region `excess`)
-                // pass raw η and rely on it to keep μ finite.
-                let e = eta.clamp(-700.0, 700.0).exp();
+                // A projected value with unprojected exp derivatives is not a jet:
+                // outside the projection interval the value is constant but the
+                // old implementation returned a nonzero derivative. Evaluate the
+                // exact exponential on the declared solver domain and refuse every
+                // other eta through the typed error channel. Public response-scale
+                // transforms remain unrestricted and use their separate exact-exp
+                // path below (issue #963).
+                let e = log_link_solver_exp(eta)?;
                 Ok(InverseLinkJet {
                     mu: e,
                     d1: e,
@@ -1128,11 +1145,9 @@ fn link_function_mu_d1(link: LinkFunction, eta: f64) -> Result<(f64, f64), Estim
     match link {
         LinkFunction::Identity => Ok((eta, 1.0)),
         LinkFunction::Log => {
-            // SOLVER-INTERNAL clamped `(μ, dμ/dη)`; see the matching note on the
-            // full `LinkFunction::Log` jet above. Public response transforms use
-            // exact `exp(η)` via `families::inverse_link::apply_inverse_link_vec`
-            // (issue #963).
-            let e = eta.clamp(-700.0, 700.0).exp();
+            // Keep the fast seam mathematically identical to the full jet: exact
+            // exp and exact exp derivative on the same declared solver domain.
+            let e = log_link_solver_exp(eta)?;
             Ok((e, e))
         }
         LinkFunction::Logit => Ok(component_inverse_link_mu_d1(LinkComponent::Logit, eta)),
@@ -1318,7 +1333,7 @@ fn inverse_link_pdf_derivative_for_inverse_link(
 ) -> Result<f64, EstimationError> {
     match link {
         InverseLink::Standard(StandardLink::Identity) => Ok(0.0),
-        InverseLink::Standard(StandardLink::Log) => Ok(eta.clamp(-700.0, 700.0).exp()),
+        InverseLink::Standard(StandardLink::Log) => log_link_solver_exp(eta),
         InverseLink::Standard(StandardLink::Probit) => Ok(order.probit(eta)),
         InverseLink::Standard(StandardLink::Logit) => {
             Ok(order.component(LinkComponent::Logit, eta))
@@ -1422,12 +1437,13 @@ pub fn inverse_link_jet_for_family(
     spec.link.jet(eta)
 }
 
-/// Exact-public log inverse-link jet: `mu = d1 = d2 = d3 = exp(η)` with NO
-/// `η`-clamp. Sibling of the solver-internal `LinkFunction::Log` jet (which
-/// clamps `η` to `[−700, 700]` as an IRLS/REML conditioning hack); see issue
+/// Exact-public log inverse-link jet: `mu = d1 = d2 = d3 = exp(η)` with no
+/// solver-domain restriction. The solver-internal sibling evaluates the same
+/// exact expression only on [`LOG_LINK_SOLVER_ETA_MIN`] through
+/// [`LOG_LINK_SOLVER_ETA_MAX`] and returns a typed refusal outside it; see issue
 /// #963. Every derivative of `exp` is `exp`, so all four jet slots carry the
-/// same exact value — finite wherever representable, `0.0` on underflow,
-/// `+∞` on overflow.
+/// same value — finite wherever representable, `0.0` on underflow, and `+∞` on
+/// overflow.
 #[inline]
 fn log_inverse_link_jet_exact(eta: f64) -> InverseLinkJet {
     let e = eta.exp();
@@ -1442,15 +1458,14 @@ fn log_inverse_link_jet_exact(eta: f64) -> InverseLinkJet {
 /// EXACT public inverse-link jet for response-scale prediction outputs.
 ///
 /// Identical to [`inverse_link_jet_for_family`] for every link EXCEPT the
-/// standard `Log` link, where it returns the exact `exp(η)` jet instead of the
-/// solver's `η.clamp(−700, 700).exp()` conditioning transform. On finite `η`
-/// the two diverge (η = 705: exact `exp(705)` ≈ 1.5e306 vs clamped
-/// `exp(700)` ≈ 1.0e304; η = −720: exact ≈ 2e−313 vs clamped ≈ 9.9e−305), so
-/// public predictions (`FamilyStrategy::inverse_link_jet`/`inverse_link_array`,
-/// the predict response + delta-method SE path) route here. The solver/REML/
-/// PIRLS engines keep the clamped jet (issue #963). For `|η| ≤ 700` this is
-/// byte-identical to the clamped jet (the clamp is inert there), so no
-/// in-range prediction changes.
+/// standard `Log` link, where it accepts every IEEE input while the shared
+/// solver derivative seam accepts only its declared domain. For example,
+/// `eta = 705` remains a valid public prediction (`exp(705) ≈ 1.5e306`) but is
+/// a typed solver-domain refusal. Public predictions
+/// (`FamilyStrategy::inverse_link_jet`/`inverse_link_array`, the predict mean +
+/// delta-method SE path) therefore route here. Within the inclusive solver
+/// domain the two paths are byte-identical because both evaluate bare
+/// `exp(eta)` (issue #963).
 pub fn inverse_link_jet_for_family_public(
     spec: &LikelihoodSpec,
     eta: f64,
@@ -2274,6 +2289,128 @@ pub fn sas_inverse_link_jetwith_param_partials(
 mod tests {
     use super::*;
     use gam_problem::{InverseLink, LikelihoodSpec, LinkComponent, MixtureLinkSpec, SasLinkState};
+
+    fn assert_log_link_domain_error(error: EstimationError, eta: f64) {
+        match error {
+            EstimationError::InverseLinkDomainViolation {
+                link,
+                eta: rejected,
+                lower,
+                upper,
+            } => {
+                assert_eq!(link, "standard log inverse link");
+                if eta.is_nan() {
+                    assert!(rejected.is_nan());
+                } else {
+                    assert_eq!(rejected, eta);
+                }
+                assert_eq!(lower, LOG_LINK_SOLVER_ETA_MIN);
+                assert_eq!(upper, LOG_LINK_SOLVER_ETA_MAX);
+            }
+            other => panic!("expected typed log-link domain refusal, got {other}"),
+        }
+    }
+
+    #[test]
+    fn log_link_solver_boundaries_are_inclusive_exact_exp_jets() {
+        let link = InverseLink::Standard(StandardLink::Log);
+        let spec = LikelihoodSpec::poisson_log();
+        for eta in [LOG_LINK_SOLVER_ETA_MIN, LOG_LINK_SOLVER_ETA_MAX] {
+            let expected = eta.exp();
+            assert!(expected.is_finite() && expected > 0.0);
+
+            let jet = inverse_link_jet_for_inverse_link(&link, eta).expect("boundary jet");
+            assert_eq!(jet.mu, expected);
+            assert_eq!(jet.d1, expected);
+            assert_eq!(jet.d2, expected);
+            assert_eq!(jet.d3, expected);
+
+            assert_eq!(
+                inverse_link_mu_d1_for_inverse_link(&link, eta).expect("boundary mu/d1"),
+                (expected, expected)
+            );
+            assert_eq!(
+                inverse_link_pdfthird_derivative_for_inverse_link(&link, eta)
+                    .expect("boundary fourth derivative"),
+                expected
+            );
+            assert_eq!(
+                inverse_link_pdffourth_derivative_for_inverse_link(&link, eta)
+                    .expect("boundary fifth derivative"),
+                expected
+            );
+            assert_eq!(
+                inverse_link_jet_for_family(&spec, eta).expect("boundary family jet"),
+                jet
+            );
+        }
+    }
+
+    #[test]
+    fn log_link_solver_seams_refuse_every_eta_outside_the_declared_domain() {
+        let link = InverseLink::Standard(StandardLink::Log);
+        let spec = LikelihoodSpec::poisson_log();
+        let just_below = f64::from_bits(LOG_LINK_SOLVER_ETA_MIN.to_bits() + 1);
+        let just_above = f64::from_bits(LOG_LINK_SOLVER_ETA_MAX.to_bits() + 1);
+
+        for eta in [
+            just_below,
+            just_above,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NAN,
+        ] {
+            assert_log_link_domain_error(
+                inverse_link_jet_for_inverse_link(&link, eta).expect_err("full jet must refuse"),
+                eta,
+            );
+            assert_log_link_domain_error(
+                inverse_link_mu_d1_for_inverse_link(&link, eta)
+                    .expect_err("mu/d1 seam must refuse"),
+                eta,
+            );
+            assert_log_link_domain_error(
+                inverse_link_pdfthird_derivative_for_inverse_link(&link, eta)
+                    .expect_err("fourth derivative seam must refuse"),
+                eta,
+            );
+            assert_log_link_domain_error(
+                inverse_link_pdffourth_derivative_for_inverse_link(&link, eta)
+                    .expect_err("fifth derivative seam must refuse"),
+                eta,
+            );
+            assert_log_link_domain_error(
+                inverse_link_jet_for_family(&spec, eta)
+                    .expect_err("family jet seam must refuse"),
+                eta,
+            );
+        }
+    }
+
+    #[test]
+    fn log_link_solver_value_gradient_is_consistent_near_both_domain_edges() {
+        let link = InverseLink::Standard(StandardLink::Log);
+        let h = 1.0e-5;
+        for eta in [LOG_LINK_SOLVER_ETA_MIN + 1.0, 0.0, LOG_LINK_SOLVER_ETA_MAX - 1.0] {
+            let jet = inverse_link_jet_for_inverse_link(&link, eta).expect("interior jet");
+            let eta_plus = eta + h;
+            let eta_minus = eta - h;
+            let mu_plus = inverse_link_jet_for_inverse_link(&link, eta_plus)
+                .expect("plus jet")
+                .mu;
+            let mu_minus = inverse_link_jet_for_inverse_link(&link, eta_minus)
+                .expect("minus jet")
+                .mu;
+            let finite_difference = (mu_plus - mu_minus) / (eta_plus - eta_minus);
+            let relative_error = ((finite_difference - jet.d1) / jet.d1).abs();
+            assert!(
+                relative_error < 5.0e-10,
+                "log-link value/gradient mismatch at eta={eta}: analytic={}, finite_difference={}, relative_error={relative_error}",
+                jet.d1,
+                finite_difference
+            );
+        }
+    }
 
     #[test]
     fn softmax_jacobian_matchesfd() {

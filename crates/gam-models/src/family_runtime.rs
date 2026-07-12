@@ -235,11 +235,11 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
 
     fn inverse_link_jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
         // Public response-scale surface: use the EXACT inverse-link jet so the
-        // log link reports `exp(η)` (finite wherever representable) rather than
-        // the solver's `η.clamp(−700, 700).exp()` conditioning value. This funnel
-        // feeds `inverse_link`/`inverse_link_array` and the predict mean +
-        // delta-method SE path; the solver/REML/PIRLS engines keep the clamped
-        // jet. For `|η| ≤ 700` the two are byte-identical (issue #963).
+        // log link reports `exp(eta)` wherever IEEE-754 can represent it. The
+        // shared solver derivative seam instead refuses eta outside its declared
+        // inclusive [-700, 700] domain; PIRLS working-state conditioning remains
+        // a separate concern. Within the solver domain both paths are the same
+        // exact exponential (issue #963).
         inverse_link_jet_for_family_public(&self.spec, eta)
     }
 
@@ -473,18 +473,16 @@ mod log_link_public_jet_tests {
     use ndarray::Array1;
 
     /// The PUBLIC predict surface for a log-link family (Poisson/Gamma/Tweedie/
-    /// NB) must report the EXACT `exp(η)`, never the solver's
-    /// `η.clamp(−700, 700).exp()` conditioning value (issue #963). This drives
-    /// the exact funnel the predict path uses — `FamilyStrategy::inverse_link`
-    /// / `inverse_link_array` / `inverse_link_jet` (the predict mean +
-    /// delta-method SE source) — and pins the finite boundary η where the exact
-    /// and clamped transforms diverge.
+    /// NB) accepts representable eta beyond the solver derivative domain. This
+    /// drives the exact funnel the predict path uses —
+    /// `FamilyStrategy::inverse_link` / `inverse_link_array` /
+    /// `inverse_link_jet` — and pins a finite eta the solver correctly refuses.
     #[test]
     fn public_predict_log_inverse_link_is_exact_exp_at_boundary() {
         let strategy = strategy_for_spec(&LikelihoodSpec::poisson_log());
 
-        // η = 705: exact exp(705) ≈ 1.505e306 is finite; the solver clamp would
-        // return exp(700) ≈ 1.014e304, wrong by exp(5) ≈ 148.
+        // eta = 705 is outside the solver derivative domain but exact exp(705)
+        // is representable and therefore valid on this public surface.
         let exact = 705.0_f64.exp();
         assert!(exact.is_finite(), "exp(705) must be representable in f64");
         let jet = strategy.inverse_link_jet(705.0).expect("jet");
@@ -493,10 +491,10 @@ mod log_link_public_jet_tests {
         assert_eq!(jet.d1, exact, "predict dmu/deta must be exact exp(705)");
         assert_eq!(jet.d2, exact);
         assert_eq!(jet.d3, exact);
-        let clamped = 700.0_f64.exp();
+        let historical_projection = 700.0_f64.exp();
         assert!(
-            jet.mu > clamped * 100.0,
-            "exact exp(705) must exceed the clamped exp(700) by ~exp(5)"
+            jet.mu > historical_projection * 100.0,
+            "exact exp(705) must not regress to the historical exp(700) projection"
         );
 
         // Array entry point used by `predict_plugin_response`/`response`.
@@ -505,15 +503,14 @@ mod log_link_public_jet_tests {
             .expect("array");
         assert_eq!(arr[0], exact, "inverse_link_array must be exact exp(705)");
 
-        // η = −720: exact underflows toward 0 (≈2.03e−313); the clamp would pin
-        // it at exp(−700) ≈ 9.86e−305 (~4.85e8× too large).
+        // eta = -720 is likewise valid on the public response transform.
         let exact_neg = (-720.0_f64).exp();
         let jet = strategy.inverse_link_jet(-720.0).expect("jet");
         assert_eq!(jet.mu, exact_neg, "predict mean must be exact exp(-720)");
-        let clamped_neg = (-700.0_f64).exp();
+        let historical_projection_neg = (-700.0_f64).exp();
         assert!(
-            jet.mu < clamped_neg,
-            "exact exp(-720) must be strictly below the clamped exp(-700)"
+            jet.mu < historical_projection_neg,
+            "exact exp(-720) must not regress to the historical exp(-700) projection"
         );
 
         // True IEEE limits honored exactly on the public surface.
@@ -523,30 +520,29 @@ mod log_link_public_jet_tests {
         assert_eq!(under.mu, 0.0, "exp(-746) -> 0.0");
     }
 
-    /// No regression: for in-range η (|η| ≤ 700 — where the solver clamp is
-    /// inert) the public predict jet is BYTE-IDENTICAL to the pre-fix clamped
-    /// jet across mu and all derivatives. Only the out-of-range tails change.
+    /// On the inclusive solver domain, the public and solver jets are
+    /// byte-identical exact exponentials across the value and all derivatives.
     #[test]
-    fn public_predict_log_jet_byte_identical_to_clamped_in_range() {
+    fn public_predict_log_jet_is_byte_identical_on_solver_domain() {
         let spec = LikelihoodSpec::poisson_log();
         let strategy = strategy_for_spec(&spec);
         for &eta in &[
             -700.0, -300.0, -12.5, -1.0, -0.25, 0.0, 0.25, 1.0, 12.5, 300.0, 700.0,
         ] {
             let public_jet = strategy.inverse_link_jet(eta).expect("public jet");
-            let clamped_jet = inverse_link_jet_for_family(&spec, eta).expect("clamped jet");
+            let solver_jet = inverse_link_jet_for_family(&spec, eta).expect("solver jet");
             assert_eq!(
                 public_jet.mu.to_bits(),
-                clamped_jet.mu.to_bits(),
+                solver_jet.mu.to_bits(),
                 "mu must be byte-identical in range at eta={eta}"
             );
             assert_eq!(
                 public_jet.d1.to_bits(),
-                clamped_jet.d1.to_bits(),
+                solver_jet.d1.to_bits(),
                 "d1 must be byte-identical in range at eta={eta}"
             );
-            assert_eq!(public_jet.d2.to_bits(), clamped_jet.d2.to_bits());
-            assert_eq!(public_jet.d3.to_bits(), clamped_jet.d3.to_bits());
+            assert_eq!(public_jet.d2.to_bits(), solver_jet.d2.to_bits());
+            assert_eq!(public_jet.d3.to_bits(), solver_jet.d3.to_bits());
         }
     }
 }

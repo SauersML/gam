@@ -1,12 +1,11 @@
 use super::*;
+pub(crate) use gam_terms::analytic_penalties::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN};
 
 /// Closed numerical domain of every active flat log-strength coordinate.
 ///
 /// These are real parameter-domain endpoints, not saturation points: callers
 /// reject values outside the interval instead of clipping them onto a constant
 /// objective plateau.
-pub(crate) const LOG_STRENGTH_MIN: f64 = -700.0;
-pub(crate) const LOG_STRENGTH_MAX: f64 = 700.0;
 
 /// #1026 — how the per-atom ARD precisions are exposed to the OUTER PENALIZED QUASI-LAPLACE
 /// optimizer.

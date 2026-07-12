@@ -84,19 +84,13 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
                 // correct IEEE semantics — finite wherever `exp(η)` is representable,
                 // `0.0` on underflow (η ≲ −745.1), `+∞` on overflow (η ≳ 709.8).
                 //
-                // Deliberately NO `η.clamp(−700, 700)` here. That clamp lives only
-                // in the SOLVER's inverse-link jet (`LinkFunction::Log` in
-                // `solver/mixture_link.rs`) and PIRLS working-state engine
-                // (`solver/pirls/log_link_working_state.rs::ETA_CLAMP`), where it is
-                // an intentional conditioning hack that keeps the IRLS normal
-                // equations well posed. On FINITE η the two disagree: e.g. at
-                // η = 705 the exact value is exp(705) ≈ 1.5e306 (finite and correct)
-                // while the clamped solver value is exp(700) ≈ 1.0e304 (off by
-                // exp(5) ≈ 148×); at η = −720 the exact value underflows toward 0
-                // (≈ 2e−313) while the clamp pins it at exp(−700) ≈ 9.9e−305. Public
-                // response-scale outputs (FFI `apply_inverse_link_array`, posterior
-                // bands) must report the exact value, so they route here, never
-                // through the solver's clamped jet.
+                // This public transform deliberately has no solver-domain
+                // restriction. The shared solver derivative seam evaluates the
+                // same exact exponential only for eta in [-700, 700] and returns
+                // a typed refusal outside it; the PIRLS working-state engine has
+                // its own separate conditioning policy. Thus eta=705 remains a
+                // valid public response value even though it is not a valid input
+                // to the solver jet (issue #963).
                 out.push(e.exp());
             }
         }
@@ -132,7 +126,7 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
 /// [`apply_inverse_link_vec`] exactly for the `Standard` links *except* for the
 /// `Log` link: the public response transform reports the EXACT `exp(η)` (see the
 /// `LinkFunction::Log` branch above and issue #963), whereas the solver jet
-/// applies the conditioning clamp `η.clamp(−700, 700)`. To preserve that public
+/// refuses eta outside its declared domain. To preserve the unrestricted public
 /// contract this routes `Standard(Log)` (and `Standard(Identity)`) through the
 /// string path, and only the genuinely parameterized / non-log links through the
 /// solver evaluator.
@@ -143,10 +137,9 @@ pub fn apply_inverse_link_spec_vec(
     use gam_problem::{InverseLink, StandardLink};
 
     // Standard links have a documented EXACT public response transform (notably
-    // the unclamped `exp(η)` for Log) that diverges from the solver's clamped
-    // jet on finite boundary η. Keep them on the string path so the public
-    // contract pinned by `public_log_inverse_link_is_exact_exp_not_solver_clamp`
-    // is preserved regardless of which entry point is used.
+    // unrestricted `exp(eta)` for Log) that accepts inputs outside the solver
+    // derivative domain. Keep them on the string path so the public contract is
+    // preserved regardless of which entry point is used.
     if let InverseLink::Standard(std_link) = link {
         let tag = match std_link {
             StandardLink::Identity => "identity",
@@ -179,46 +172,42 @@ mod tests {
     };
     use gam_solve::mixture_link::inverse_link_mu_d1_for_inverse_link;
 
-    /// The public log inverse link is the EXACT `exp(η)`, never the solver's
-    /// `η.clamp(−700, 700).exp()` conditioning transform. This pins the contract
-    /// at the finite boundary η values where the two implementations diverge, so
-    /// a future refactor cannot silently reroute a public response-scale output
-    /// through the clamped solver jet (issue #963).
+    /// The public log inverse link is exact `exp(eta)` on the unrestricted IEEE
+    /// surface, including finite inputs outside the shared solver jet's declared
+    /// domain (issue #963).
     #[test]
-    fn public_log_inverse_link_is_exact_exp_not_solver_clamp() {
-        // η = 705: exact exp(705) is finite (≈1.5e306); the solver clamp would
-        // return exp(700) (≈1.0e304), wrong by a factor of exp(5) ≈ 148.
+    fn public_log_inverse_link_is_exact_exp_outside_solver_domain() {
+        // eta = 705 is outside the solver derivative domain, but its exponential
+        // is finite and valid as a public response transform.
         let out = apply_inverse_link_vec(&[705.0], "log").expect("log inverse link");
         assert_eq!(out.len(), 1);
         let exact = 705.0_f64.exp();
         assert!(exact.is_finite(), "exp(705) must be representable in f64");
         assert_eq!(
             out[0], exact,
-            "public log inverse link must be exact exp(705), not the solver clamp"
+            "public log inverse link must be exact exp(705)"
         );
-        let clamped = 700.0_f64.exp();
+        let historical_projection = 700.0_f64.exp();
         assert!(
-            out[0] > clamped * 100.0,
-            "exact exp(705) must exceed the clamped exp(700) by ~exp(5); got {} vs {}",
+            out[0] > historical_projection * 100.0,
+            "exact exp(705) must not regress to the historical exp(700) projection; got {} vs {}",
             out[0],
-            clamped
+            historical_projection
         );
 
-        // η = −720: exact exp(−720) underflows toward 0 (≈2e−313, subnormal);
-        // the solver clamp would pin it at exp(−700) ≈ 9.9e−305, ~4.85e8× too
-        // large. Either way the exact value is strictly below the clamped one.
+        // eta = -720 is also valid on the public response transform.
         let out = apply_inverse_link_vec(&[-720.0], "log").expect("log inverse link");
         let exact = (-720.0_f64).exp();
         assert_eq!(
             out[0], exact,
-            "public log inverse link must be exact exp(-720), not the solver clamp"
+            "public log inverse link must be exact exp(-720)"
         );
-        let clamped = (-700.0_f64).exp();
+        let historical_projection = (-700.0_f64).exp();
         assert!(
-            out[0] < clamped,
-            "exact exp(-720) must be strictly below the clamped exp(-700); got {} vs {}",
+            out[0] < historical_projection,
+            "exact exp(-720) must not regress to the historical exp(-700) projection; got {} vs {}",
             out[0],
-            clamped
+            historical_projection
         );
 
         // True IEEE overflow/underflow limits are honored exactly.
@@ -346,7 +335,7 @@ mod tests {
     /// The spec path agrees with the string path for the `Standard` links —
     /// including the EXACT-`exp` Log contract (#963): `Standard(Log)` is routed
     /// back through the string path, so the boundary η = 705 still yields the
-    /// unclamped exp(705), not the solver clamp.
+    /// unrestricted exp(705), even though 705 is outside the solver domain.
     #[test]
     fn spec_path_matches_string_path_for_standard_links_incl_exact_log() {
         let eta = [-1.5_f64, 0.0, 0.8];
@@ -369,7 +358,7 @@ mod tests {
         assert_eq!(
             out[0],
             705.0_f64.exp(),
-            "Standard(Log) spec path must report exact exp(705), not the solver clamp"
+            "Standard(Log) spec path must report exact exp(705)"
         );
     }
 

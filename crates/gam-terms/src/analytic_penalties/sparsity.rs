@@ -404,6 +404,21 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         PenaltyTier::Psi
     }
 
+    fn validate_rho(&self, rho: ArrayView1<'_, f64>) -> Result<(), String> {
+        if rho.len() != 1 {
+            return Err(format!(
+                "softmax assignment sparsity rho length {} != 1",
+                rho.len()
+            ));
+        }
+        resolve_learnable_weight(self.weight, rho[0]).map(|_| ())
+    }
+
+    fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
+        Ok(vec![learnable_weight_coordinate_domain(self.weight)?
+            .ok_or_else(|| "softmax assignment sparsity has zero base weight".to_string())?])
+    }
+
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
         let lambda = validated_learnable_weight(self.weight, rho[0]);
         let n = target.len() / self.k_atoms;
@@ -663,7 +678,7 @@ impl SparsityPenalty {
             // `0/0` at `x = 0` in `sqrt(x² + ε²)` / the Log sparsifier. Floor it
             // at the smallest positive normal so the smoothing stays strictly
             // positive while still shrinking arbitrarily close to zero.
-            (Some(idx), _) => rho[idx].exp().max(f64::MIN_POSITIVE),
+            (Some(idx), _) => validated_exp_log_strength(rho[idx]),
             (None, SparsityKind::SmoothedL1 { eps }) => eps,
             (None, SparsityKind::Log { delta }) => delta,
             (None, SparsityKind::Hoyer) => 0.0,
@@ -675,6 +690,28 @@ impl SparsityPenalty {
 impl AnalyticPenalty for SparsityPenalty {
     fn tier(&self) -> PenaltyTier {
         self.target_tier
+    }
+
+    fn validate_rho(&self, rho: ArrayView1<'_, f64>) -> Result<(), String> {
+        if rho.len() != self.rho_count() {
+            return Err(format!(
+                "sparsity rho length {} != declared {}",
+                rho.len(),
+                self.rho_count()
+            ));
+        }
+        resolve_learnable_weight(self.weight, rho[self.strength_rho_index])?;
+        if let Some(index) = self.eps_rho_index {
+            checked_exp_log_strength(rho[index])?;
+        }
+        Ok(())
+    }
+
+    fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
+        let mut domains = vec![(LOG_STRENGTH_MIN, LOG_STRENGTH_MAX); self.rho_count()];
+        domains[self.strength_rho_index] = learnable_weight_coordinate_domain(self.weight)?
+            .ok_or_else(|| "sparsity has zero base weight".to_string())?;
+        Ok(domains)
     }
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
@@ -1234,6 +1271,31 @@ pub fn smooth_threshold_gate_value_grad(z: f64, tau: f64, smoothing_eps: f64) ->
 impl AnalyticPenalty for SmoothThresholdPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
+    }
+
+    fn validate_rho(&self, rho: ArrayView1<'_, f64>) -> Result<(), String> {
+        if rho.len() != self.latent_dim {
+            return Err(format!(
+                "smooth-threshold rho length {} != latent dimension {}",
+                rho.len(),
+                self.latent_dim
+            ));
+        }
+        for axis in 0..self.latent_dim {
+            resolve_learnable_weight(self.thresholds[axis], rho[axis])?;
+        }
+        Ok(())
+    }
+
+    fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
+        self.thresholds
+            .iter()
+            .map(|&threshold| {
+                learnable_weight_coordinate_domain(threshold)?.ok_or_else(|| {
+                    "smooth-threshold cannot learn a zero threshold multiplicatively".to_string()
+                })
+            })
+            .collect()
     }
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {

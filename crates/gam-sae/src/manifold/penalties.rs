@@ -2121,7 +2121,8 @@ impl SaeManifoldTerm {
         // is unavailable/degenerate we skip the block rather than write a
         // mis-scaled one.
         let mu_raw =
-            resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
+            resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index])
+                .expect("analytic-penalty rho must be validated before SAE assembly");
         let Some(gbar) = corrected.metric_normalizer(d) else {
             return;
         };
@@ -2382,7 +2383,8 @@ impl SaeManifoldTerm {
         // preserving (positive scalar on a PSD Gram block); skip on a degenerate
         // normalizer rather than write a mis-scaled block.
         let mu_raw =
-            resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
+            resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index])
+                .expect("analytic-penalty rho must be validated before SAE assembly");
         let Some(gbar) = corrected.metric_normalizer(d) else {
             return;
         };

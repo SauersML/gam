@@ -440,13 +440,11 @@ mod tests {
         assert!(err.contains("zero draws"));
     }
 
-    /// The posterior response-scale band path is a PUBLIC consumer of the log
-    /// inverse link and must report the EXACT `exp(η)`, never the solver's
-    /// `η.clamp(−700, 700).exp()` conditioning transform (issue #963). Pin the
-    /// finite boundary η = 705 where the exact value (≈1.5e306) and the clamped
-    /// value (exp(700) ≈ 1.0e304) diverge by ~exp(5) ≈ 148.
+    /// The posterior response-scale band path is a public consumer of the log
+    /// inverse link and accepts representable eta beyond the shared solver
+    /// derivative domain (issue #963).
     #[test]
-    fn response_bands_use_exact_log_inverse_link_not_solver_clamp() {
+    fn response_bands_use_exact_log_inverse_link_outside_solver_domain() {
         // Single degenerate draw at η = 705 so every response-scale summary
         // (point estimate + both band edges) collapses to exp(705) exactly.
         let eta = Array2::from_shape_vec((1, 1), vec![705.0]).expect("shape");
@@ -455,7 +453,7 @@ mod tests {
 
         let exact = 705.0_f64.exp();
         assert!(exact.is_finite(), "exp(705) must be representable in f64");
-        let clamped = 700.0_f64.exp();
+        let historical_projection = 700.0_f64.exp();
         for (label, v) in [
             ("mean", mean[0]),
             ("mean_lower", mean_lower[0]),
@@ -463,11 +461,11 @@ mod tests {
         ] {
             assert_eq!(
                 v, exact,
-                "{label} must be exact exp(705), not the solver-clamped exp(700)"
+                "{label} must be exact exp(705)"
             );
             assert!(
-                v > clamped * 100.0,
-                "{label} must exceed the clamped exp(700) by ~exp(5); got {v} vs {clamped}"
+                v > historical_projection * 100.0,
+                "{label} must not regress to the historical exp(700) projection; got {v} vs {historical_projection}"
             );
         }
     }

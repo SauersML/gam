@@ -395,6 +395,7 @@ impl AssignmentMode {
                 over
             } else if learnable_alpha {
                 resolve_learnable_weight(alpha, rho.log_lambda_sparse)
+                    .expect("ordered Beta--Bernoulli rho must be validated before resolution")
             } else {
                 alpha
             }),
@@ -792,6 +793,37 @@ impl SaeAssignment {
         }
     }
 
+    pub(crate) fn validate_rho_domain(&self, rho: &SaeManifoldRho) -> Result<(), String> {
+        rho.validate_log_strength_domain()?;
+        if let AssignmentMode::OrderedBetaBernoulli {
+            alpha,
+            learnable_alpha: true,
+            ..
+        } = self.mode
+            && self.ordered_beta_bernoulli_alpha_override.is_none()
+        {
+            resolve_learnable_weight(alpha, rho.log_lambda_sparse).map_err(|error| {
+                format!("ordered Beta--Bernoulli learnable concentration: {error}")
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn learnable_alpha_rho_domain(&self) -> Result<Option<(f64, f64)>, String> {
+        let AssignmentMode::OrderedBetaBernoulli {
+            alpha,
+            learnable_alpha: true,
+            ..
+        } = self.mode
+        else {
+            return Ok(None);
+        };
+        if self.ordered_beta_bernoulli_alpha_override.is_some() {
+            return Ok(None);
+        }
+        gam_terms::analytic_penalties::learnable_weight_coordinate_domain(alpha)
+    }
+
     /// #1777 — install (or clear, with `None`) the PER-FIT ordered Beta--Bernoulli-α override on this
     /// assignment. Source of truth used by [`Self::resolved_ordered_beta_bernoulli_alpha`]; the FFI
     /// reaches it through the term's `set_fit_config`.
@@ -909,7 +941,8 @@ impl SaeAssignment {
         else {
             return false;
         };
-        let resolved_alpha = resolve_learnable_weight(alpha, rho.log_lambda_sparse);
+        let resolved_alpha = resolve_learnable_weight(alpha, rho.log_lambda_sparse)
+            .expect("ordered Beta--Bernoulli rho must be validated before persistence");
         self.mode = AssignmentMode::OrderedBetaBernoulli {
             temperature,
             alpha: resolved_alpha,
@@ -1447,7 +1480,7 @@ pub(crate) fn ordered_beta_bernoulli_exact_hessian_minus_majorizer_hvp_weighted(
     row_weights: Option<&[f64]>,
     direction: ArrayView1<'_, f64>,
 ) -> Result<Array1<f64>, String> {
-    rho.validate_log_strength_domain()?;
+    assignment.validate_rho_domain(rho)?;
     let AssignmentMode::OrderedBetaBernoulli {
         temperature, alpha, ..
     } = assignment.mode
@@ -1562,7 +1595,7 @@ pub(crate) fn assignment_prior_value_weighted(
     rho: &SaeManifoldRho,
     row_weights: Option<&[f64]>,
 ) -> Result<f64, String> {
-    rho.validate_log_strength_domain()?;
+    assignment.validate_rho_domain(rho)?;
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)?;
     }
@@ -1640,7 +1673,7 @@ pub(crate) fn assignment_prior_log_strength_derivative_weighted(
     rho: &SaeManifoldRho,
     row_weights: Option<&[f64]>,
 ) -> Result<f64, String> {
-    rho.validate_log_strength_domain()?;
+    assignment.validate_rho_domain(rho)?;
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)?;
     }
@@ -1692,7 +1725,7 @@ pub(crate) fn assignment_prior_log_strength_hdiag_weighted(
     rho: &SaeManifoldRho,
     row_weights: Option<&[f64]>,
 ) -> Result<Array1<f64>, String> {
-    rho.validate_log_strength_domain()?;
+    assignment.validate_rho_domain(rho)?;
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)?;
     }
@@ -1808,7 +1841,7 @@ pub(crate) fn assignment_prior_log_strength_target_mixed_weighted(
     rho: &SaeManifoldRho,
     row_weights: Option<&[f64]>,
 ) -> Result<Array1<f64>, String> {
-    rho.validate_log_strength_domain()?;
+    assignment.validate_rho_domain(rho)?;
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)?;
     }
@@ -1867,7 +1900,7 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
     rho: &SaeManifoldRho,
     row_weights: Option<&[f64]>,
 ) -> Result<(Array1<f64>, Array1<f64>), String> {
-    rho.validate_log_strength_domain()?;
+    assignment.validate_rho_domain(rho)?;
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)?;
     }
@@ -1993,7 +2026,7 @@ pub(crate) fn ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
     rho: &SaeManifoldRho,
     row_weights: Option<&[f64]>,
 ) -> Result<Option<OrderedBetaBernoulliHessianDiagThirdChannels>, String> {
-    rho.validate_log_strength_domain()?;
+    assignment.validate_rho_domain(rho)?;
     let AssignmentMode::OrderedBetaBernoulli {
         temperature, alpha, ..
     } = assignment.mode

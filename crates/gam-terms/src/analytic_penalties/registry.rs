@@ -62,6 +62,18 @@ macro_rules! define_analytic_penalty_kind {
                 }
             }
 
+            pub fn validate_rho(&self, rho: ArrayView1<'_, f64>) -> Result<(), String> {
+                match self {
+                    $(AnalyticPenaltyKind::$variant(p) => <$ty as AnalyticPenalty>::validate_rho(p, rho),)*
+                }
+            }
+
+            pub fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
+                match self {
+                    $(AnalyticPenaltyKind::$variant(p) => <$ty as AnalyticPenalty>::rho_coordinate_domains(p),)*
+                }
+            }
+
             pub fn kind_tag(&self) -> &'static str {
                 match self {
                     $(AnalyticPenaltyKind::$variant(_) => <$ty as PenaltyManifest>::KIND_TAG,)*
@@ -250,6 +262,49 @@ impl AnalyticPenaltyRegistry {
         }
         out
     }
+
+    pub fn validate_rho(&self, rho: ArrayView1<'_, f64>) -> Result<(), String> {
+        if rho.len() != self.total_rho_count() {
+            return Err(format!(
+                "analytic-penalty rho length {} != registry dimension {}",
+                rho.len(),
+                self.total_rho_count()
+            ));
+        }
+        for (penalty, (slice, _, _)) in self.penalties.iter().zip(self.rho_layout()) {
+            penalty.validate_rho(rho.slice(s![slice]))?;
+        }
+        Ok(())
+    }
+
+    pub fn rho_domain_bounds(&self) -> Result<(Array1<f64>, Array1<f64>), String> {
+        let mut lower = Array1::<f64>::zeros(self.total_rho_count());
+        let mut upper = Array1::<f64>::zeros(self.total_rho_count());
+        let mut offset = 0usize;
+        for penalty in &self.penalties {
+            let domains = penalty.rho_coordinate_domains()?;
+            if domains.len() != penalty.rho_count() {
+                return Err(format!(
+                    "analytic penalty `{}` returned {} rho domains for {} coordinates",
+                    penalty.name(),
+                    domains.len(),
+                    penalty.rho_count()
+                ));
+            }
+            for (local, &(lo, hi)) in domains.iter().enumerate() {
+                if !(lo.is_finite() && hi.is_finite() && lo < hi) {
+                    return Err(format!(
+                        "analytic penalty `{}` has invalid rho domain[{local}] [{lo}, {hi}]",
+                        penalty.name()
+                    ));
+                }
+                lower[offset + local] = lo;
+                upper[offset + local] = hi;
+            }
+            offset += domains.len();
+        }
+        Ok((lower, upper))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,13 +341,18 @@ const ORTHOGONALITY_LOGDET_SLQ_PROBES: usize = 16;
 const ORTHOGONALITY_LOGDET_LANCZOS_STEPS: usize = 32;
 
 impl FrozenAnalyticPenaltyOp {
-    #[must_use]
-    pub fn new(penalty: AnalyticPenaltyKind, target: Array1<f64>, rho: Array1<f64>) -> Self {
-        Self {
+    #[must_use = "invalid analytic-penalty rho must be handled"]
+    pub fn new(
+        penalty: AnalyticPenaltyKind,
+        target: Array1<f64>,
+        rho: Array1<f64>,
+    ) -> Result<Self, String> {
+        penalty.validate_rho(rho.view())?;
+        Ok(Self {
             penalty,
             target,
             rho,
-        }
+        })
     }
 
     /// Underlying penalty (read-only). Useful for the outer driver that needs
@@ -830,8 +890,16 @@ const fn splitmix64(state: &mut u64) -> u64 {
 impl AnalyticPenaltyKind {
     /// Freeze this kind at `(target, rho)` and return an `Arc<dyn PenaltyOp>`
     /// ready to slot into `BlockwisePenalty::with_op` or `PenaltyForm::Operator`.
-    #[must_use]
-    pub fn freeze(&self, target: Array1<f64>, rho: Array1<f64>) -> Arc<dyn PenaltyOp> {
-        Arc::new(FrozenAnalyticPenaltyOp::new(self.clone(), target, rho))
+    #[must_use = "invalid analytic-penalty rho must be handled"]
+    pub fn freeze(
+        &self,
+        target: Array1<f64>,
+        rho: Array1<f64>,
+    ) -> Result<Arc<dyn PenaltyOp>, String> {
+        Ok(Arc::new(FrozenAnalyticPenaltyOp::new(
+            self.clone(),
+            target,
+            rho,
+        )?))
     }
 }

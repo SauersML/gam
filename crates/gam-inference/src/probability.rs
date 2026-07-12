@@ -818,9 +818,9 @@ fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
 
 /// Inverse-link transform per likelihood specification (response scale).
 ///
-/// Uses the EXACT public inverse-link jet, so the log link reports `exp(η)`
-/// (finite wherever representable) rather than the solver's clamped value
-/// (issue #963).
+/// Uses the exact public inverse-link jet, so the log link reports `exp(eta)`
+/// wherever IEEE-754 can represent it, including inputs outside the shared
+/// solver derivative domain (issue #963).
 #[inline]
 pub fn try_inverse_link_array(
     likelihood: &LikelihoodSpec,

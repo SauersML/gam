@@ -2702,15 +2702,7 @@ fn matched_control_verdicts(
     ladder: &[usize],
     mean_l0: Option<f64>,
 ) -> Result<(AtomShapeRaceVerdict, AtomShapeRaceVerdict, f64), String> {
-    let mean_l0 = mean_l0.ok_or_else(|| {
-        "adjudicate_atom_shape: mean_l0 is required when matched_controls=True; a shape-verdict rate without dictionary sparsity is uninterpretable"
-            .to_string()
-    })?;
-    if !mean_l0.is_finite() || mean_l0 < 0.0 {
-        return Err(format!(
-            "adjudicate_atom_shape: mean_l0 must be finite and non-negative; got {mean_l0}"
-        ));
-    }
+    validate_control_mean_l0(mean_l0)?;
     use gam::terms::sae::null_battery::{
         covariance_matched_gaussian_null, per_dimension_shuffle_null,
     };
@@ -2726,6 +2718,19 @@ fn matched_control_verdicts(
         gaussian_verdict,
         control_circular_win_fraction,
     ))
+}
+
+fn validate_control_mean_l0(mean_l0: Option<f64>) -> Result<f64, String> {
+    let mean_l0 = mean_l0.ok_or_else(|| {
+        "adjudicate_atom_shape: mean_l0 is required when matched_controls=True; a shape-verdict rate without dictionary sparsity is uninterpretable"
+            .to_string()
+    })?;
+    if !mean_l0.is_finite() || mean_l0 < 0.0 {
+        return Err(format!(
+            "adjudicate_atom_shape: mean_l0 must be finite and non-negative; got {mean_l0}"
+        ));
+    }
+    Ok(mean_l0)
 }
 
 fn shape_detection_floor(
@@ -2917,6 +2922,14 @@ pub(crate) fn adjudicate_atom_shape<'py>(
     dispersion_r: Option<f64>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let coords_view = coords.as_array();
+    // Reject malformed optional contracts before any reporting fit or CV race.
+    // These diagnostics cannot alter the model fit, so spending a full race
+    // before discovering a missing field is both slow and misleading.
+    if matched_controls || mean_l0.is_some() {
+        validate_control_mean_l0(mean_l0).map_err(py_value_error)?;
+    }
+    let detection_floor =
+        shape_detection_floor(n_eff, ambient_p, dispersion_r).map_err(py_value_error)?;
     let ladder = k_ladder.unwrap_or_else(|| {
         gam::solver::MIXTURE_K_LADDER
             .iter()
@@ -2929,8 +2942,6 @@ pub(crate) fn adjudicate_atom_shape<'py>(
     let out = atom_shape_verdict_dict(py, &observed)?;
     out.set_item("dictionary_mean_l0", mean_l0)?;
 
-    let detection_floor =
-        shape_detection_floor(n_eff, ambient_p, dispersion_r).map_err(py_value_error)?;
     out.set_item("detection_floor", detection_floor)?;
 
     if matched_controls {

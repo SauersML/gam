@@ -355,6 +355,11 @@ where
         match err {
             EstimationError::LinearSystemSolveFailed(_)
             | EstimationError::HessianNotPositiveDefinite { .. } => true,
+            // The shared log-link jet is an exact function on a declared eta
+            // domain. A trial step outside that domain is infeasible, so LM must
+            // reject and damp the step rather than either projecting the link or
+            // terminating the entire fit.
+            EstimationError::InverseLinkDomainViolation { .. } => true,
             EstimationError::InvalidInput(message) => {
                 let message = message.to_ascii_lowercase();
                 message.contains("nan")

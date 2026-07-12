@@ -592,6 +592,9 @@ pub(crate) fn estimation_error_to_pyerr(err: EstimationError) -> PyErr {
         }
         EstimationError::ModelIsIllConditioned { .. } => IllConditionedError::new_err(message),
         EstimationError::InvalidInput(_) => InvalidInputError::new_err(message),
+        EstimationError::InverseLinkDomainViolation { .. } => {
+            InvalidInputError::new_err(message)
+        }
         EstimationError::MonotoneRoot(_) => MonotoneRootError::new_err(message),
         EstimationError::CalibratorTrainingFailed(_) => CalibratorError::new_err(message),
         EstimationError::InvalidSpecification(_) => InvalidSpecificationError::new_err(message),

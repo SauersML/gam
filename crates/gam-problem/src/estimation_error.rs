@@ -511,6 +511,17 @@ pub enum EstimationError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    #[error(
+        "Inverse-link domain violation for {link}: eta={eta:?} is outside the supported \
+         interval [{lower}, {upper}]"
+    )]
+    InverseLinkDomainViolation {
+        link: &'static str,
+        eta: f64,
+        lower: f64,
+        upper: f64,
+    },
+
     #[error("monotone root solve: {0}")]
     MonotoneRoot(#[from] MonotoneRootError),
 

@@ -918,7 +918,7 @@ impl SaeManifoldOuterObjective {
     /// (plain SAE byte-identity). Called at the ρ-materialization point of every
     /// `&mut self` eval lane so no inner solve ever reads a stale-scaled target.
     fn apply_block_scaling(&mut self, rho: &SaeManifoldRho) -> Result<(), String> {
-        rho.validate_log_strength_domain()?;
+        self.term.assignment.validate_rho_domain(rho)?;
         // Disjoint field borrows: the pricing state and the target are rewritten
         // together, so destructure `self` rather than route through a `self`
         // method that would alias both.
@@ -1547,7 +1547,7 @@ impl SaeManifoldOuterObjective {
         rho: &SaeManifoldRho,
     ) -> Result<bool, String> {
         self.fit_verdict = None;
-        rho.validate_log_strength_domain()?;
+        self.term.assignment.validate_rho_domain(rho)?;
         let rho = rho.clone();
         self.current_rho = rho.clone();
         // #2080 (a) — the homotopy walk mutates the accepted basin through its
@@ -3454,7 +3454,7 @@ fn reactive_rho_domain_upper(
     rho: &SaeManifoldRho,
     entry_temperature: f64,
 ) -> Result<Array1<f64>, String> {
-    rho.validate_log_strength_domain()?;
+    term.assignment.validate_rho_domain(rho)?;
     let mut entry_term = term.clone();
     entry_term
         .assignment
@@ -4076,10 +4076,21 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 
     fn outer_domain_upper_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
-        self.baseline_rho
-            .validate_log_strength_domain()
+        self.baseline_term
+            .assignment
+            .validate_rho_domain(&self.baseline_rho)
             .map_err(EstimationError::InvalidInput)?;
-        let log_strength_upper = self.baseline_rho.flat_domain_upper_bound();
+        let mut log_strength_upper = self.baseline_rho.flat_domain_upper_bound();
+        if let Some((_, alpha_upper)) = self
+            .baseline_term
+            .assignment
+            .learnable_alpha_rho_domain()
+            .map_err(EstimationError::InvalidInput)?
+            && let (Some(bounds), Some(index)) =
+                (log_strength_upper.as_mut(), self.baseline_rho.sparse_flat_index())
+        {
+            bounds[index] = bounds[index].min(alpha_upper);
+        }
         let Some(contract) = self.reactive_domain_scalar_contract()? else {
             return Ok(log_strength_upper);
         };
@@ -4118,10 +4129,22 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 
     fn outer_domain_lower_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
-        self.baseline_rho
-            .validate_log_strength_domain()
+        self.baseline_term
+            .assignment
+            .validate_rho_domain(&self.baseline_rho)
             .map_err(EstimationError::InvalidInput)?;
-        Ok(self.baseline_rho.flat_domain_lower_bound())
+        let mut lower = self.baseline_rho.flat_domain_lower_bound();
+        if let Some((alpha_lower, _)) = self
+            .baseline_term
+            .assignment
+            .learnable_alpha_rho_domain()
+            .map_err(EstimationError::InvalidInput)?
+            && let (Some(bounds), Some(index)) =
+                (lower.as_mut(), self.baseline_rho.sparse_flat_index())
+        {
+            bounds[index] = bounds[index].max(alpha_lower);
+        }
+        Ok(lower)
     }
 
     /// Dense K≥2 joint fits may have undefined quasi-Laplace score at the literal
