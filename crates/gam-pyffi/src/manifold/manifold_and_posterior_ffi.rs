@@ -6859,6 +6859,140 @@ impl ManifoldSaeCore {
         steer_plan_to_pydict(py, plan)
     }
 
+    /// Target-dose steering (gh#2263): solve for the amplitude that lands a
+    /// requested output-KL dose `target_nats` on atom `atom_k`'s chord, instead
+    /// of asking the caller for a meaningless raw amplitude. Returns the
+    /// closed-form seed `a0 = sqrt(2 q*/(dgᵀ M dg))` plus, when a `probe`
+    /// (a Python callable `a → measured KL in nats`, a patched forward) is
+    /// supplied, the closed-loop-corrected amplitude, the measured KL, and the
+    /// dual radii (`chart_radius` as shipped + `readout_kl_radius`). Reuses the
+    /// SAME frozen-dictionary rebuild as `steer`.
+    #[pyo3(signature = (
+        atom_k,
+        metric_row,
+        target_nats,
+        t_from,
+        t_to,
+        tol_rel = 1e-2,
+        max_iter = 12,
+        readout_tol_rel = 1e-1,
+        probe = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn steer_to_target<'py>(
+        &self,
+        py: Python<'py>,
+        atom_k: usize,
+        metric_row: usize,
+        target_nats: f64,
+        t_from: PyReadonlyArray1<'py, f64>,
+        t_to: PyReadonlyArray1<'py, f64>,
+        tol_rel: f64,
+        max_iter: usize,
+        readout_tol_rel: f64,
+        probe: Option<PyObject>,
+    ) -> PyResult<Py<PyDict>> {
+        let inner = &self.inner;
+        // Same frozen-dictionary marshalling as `steer` (kept inline so the two
+        // steering entries rebuild from identical handle state).
+        let decoder_owned: Vec<Array2<f64>> = inner
+            .decoder_blocks
+            .iter()
+            .map(|b| manifold_sae_owned2(b))
+            .collect::<PyResult<_>>()?;
+        let coord_owned: Vec<Array2<f64>> = inner
+            .coords
+            .iter()
+            .map(|c| manifold_sae_owned2(c))
+            .collect::<PyResult<_>>()?;
+        let duchon_owned: Vec<Option<Array2<f64>>> = inner
+            .duchon_centers
+            .iter()
+            .map(|c| c.as_ref().map(|m| manifold_sae_owned2(m)).transpose())
+            .collect::<PyResult<_>>()?;
+        let logits_owned = manifold_sae_owned2(&inner.low_level_logits)?;
+        let atom_dim: Vec<usize> = inner.atom_dims.iter().map(|&d| d.max(0) as usize).collect();
+        let basis_sizes: Vec<usize> = inner
+            .basis_sizes
+            .iter()
+            .map(|&s| s.max(0) as usize)
+            .collect();
+        let n_harm: Vec<Option<usize>> = inner
+            .basis_kinds
+            .iter()
+            .zip(&inner.n_harmonics)
+            .map(|(kind, &h)| {
+                if kind == "periodic" || kind == "torus" {
+                    Some(h.max(0) as usize)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
+            decoder_owned.iter().map(|a| a.view()).collect();
+        let coord_views: Vec<ndarray::ArrayView2<'_, f64>> =
+            coord_owned.iter().map(|a| a.view()).collect();
+        let top_k = inner
+            .top_k
+            .map(|support| {
+                usize::try_from(support).map_err(|_| {
+                    py_value_error(format!(
+                        "ManifoldSAE.steer_to_target: saved top_k must be non-negative; got {support}"
+                    ))
+                })
+            })
+            .transpose()?;
+
+        let config = gam::inference::steering::TargetDoseConfig {
+            tol_rel,
+            max_iter,
+            readout_tol_rel,
+        };
+        // Wrap the optional Python patched-forward into a Rust FnMut(a) -> KL.
+        let mut probe_boxed: Option<Box<dyn FnMut(f64) -> Result<f64, String>>> =
+            probe.map(|obj| {
+                let boxed: Box<dyn FnMut(f64) -> Result<f64, String>> =
+                    Box::new(move |a: f64| -> Result<f64, String> {
+                        Python::with_gil(|py| {
+                            let res = obj
+                                .call1(py, (a,))
+                                .map_err(|e| format!("steer_to_target probe raised: {e}"))?;
+                            res.extract::<f64>(py).map_err(|e| {
+                                format!("steer_to_target probe must return a float: {e}")
+                            })
+                        })
+                    });
+                boxed
+            });
+        let probe_ref = probe_boxed.as_deref_mut();
+
+        let plan = steer_to_target_from_arrays(
+            atom_k,
+            metric_row,
+            target_nats,
+            config,
+            t_from.as_array(),
+            t_to.as_array(),
+            &inner.basis_kinds,
+            &atom_dim,
+            &decoder_views,
+            &duchon_owned,
+            &n_harm,
+            &basis_sizes,
+            &coord_views,
+            logits_owned.view(),
+            inner.assignment.as_str(),
+            top_k,
+            inner.tau,
+            inner.alpha,
+            inner.threshold_gate_threshold,
+            self.fisher_metric.clone(),
+            probe_ref,
+        )?;
+        target_dose_plan_to_pydict(py, plan)
+    }
+
     /// Held-out dense reconstruction `(N, p)` of `x_new` — the Rust-owned
     /// counterpart of `ManifoldSAE.reconstruct` for out-of-sample rows. Runs the
     /// frozen-decoder OOS Newton solve through the SAME typed gam-sae entry the

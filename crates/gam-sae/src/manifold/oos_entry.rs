@@ -795,81 +795,79 @@ pub struct SaeSteerRequest {
     pub t_to: Vec<f64>,
 }
 
-/// Build the frozen trained dictionary into an [`SaeManifoldTerm`] pinned at its
-/// TRAINED coordinates / logits and measure the steering plan for atom `atom_k`.
-/// Mirrors the term rebuild of [`run_sae_manifold_oos`] (sharing
-/// [`build_oos_atom`]) with no coordinate solve.
-pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, String> {
-    let SaeSteerRequest {
-        atoms: atom_specs,
-        coords,
-        logits,
-        assignment,
-        top_k,
-        alpha,
-        tau,
-        fisher_metric,
-        atom_k,
-        metric_row,
-        amplitude,
-        t_from,
-        t_to,
-    } = request;
+/// Rebuild the frozen trained dictionary into an [`SaeManifoldTerm`] pinned at its
+/// TRAINED coordinates / logits (no coordinate solve), with the installed
+/// output-Fisher metric when supplied. Shared by the amplitude steer
+/// ([`run_sae_manifold_steer`]) and the target-dose steer
+/// ([`run_sae_manifold_steer_to_target`]) so both rebuild the trained dictionary
+/// bit-for-bit through one path. `caller` names the caller in error messages.
+#[allow(clippy::too_many_arguments)]
+fn build_steer_term(
+    caller: &str,
+    atom_specs: Vec<SaeOosAtomSpec>,
+    coords: Vec<Array2<f64>>,
+    logits: Array2<f64>,
+    assignment: SaeOosAssignmentKind,
+    top_k: Option<usize>,
+    alpha: f64,
+    tau: f64,
+    fisher_metric: Option<gam_problem::RowMetric>,
+    atom_k: usize,
+    metric_row: usize,
+) -> Result<SaeManifoldTerm, String> {
     let k_atoms = atom_specs.len();
     if k_atoms == 0 {
-        return Err("run_sae_manifold_steer: at least one atom is required".to_string());
+        return Err(format!("{caller}: at least one atom is required"));
     }
     if coords.len() != k_atoms {
         return Err(format!(
-            "run_sae_manifold_steer: coords must have K={k_atoms} per-atom blocks; got {}",
+            "{caller}: coords must have K={k_atoms} per-atom blocks; got {}",
             coords.len()
         ));
     }
     if atom_k >= k_atoms {
         return Err(format!(
-            "run_sae_manifold_steer: atom_k={atom_k} out of range for K={k_atoms} atoms"
+            "{caller}: atom_k={atom_k} out of range for K={k_atoms} atoms"
         ));
     }
     if metric_row >= logits.nrows() {
         return Err(format!(
-            "run_sae_manifold_steer: metric_row={metric_row} out of range for {} fitted rows",
+            "{caller}: metric_row={metric_row} out of range for {} fitted rows",
             logits.nrows()
         ));
     }
-    finite_positive("amplitude", amplitude)?;
     finite_positive("alpha", alpha)?;
     finite_positive("tau", tau)?;
     let n_obs = logits.nrows();
     let p_out = atom_specs[0].decoder.ncols();
     if n_obs == 0 || p_out == 0 {
         return Err(format!(
-            "run_sae_manifold_steer: n_obs and p_out must be positive; got ({n_obs}, {p_out})"
+            "{caller}: n_obs and p_out must be positive; got ({n_obs}, {p_out})"
         ));
     }
     if logits.dim() != (n_obs, k_atoms) || !logits.iter().all(|value| value.is_finite()) {
         return Err(format!(
-            "run_sae_manifold_steer: logits must be a finite ({n_obs}, {k_atoms}) matrix; got {:?}",
+            "{caller}: logits must be a finite ({n_obs}, {k_atoms}) matrix; got {:?}",
             logits.dim()
         ));
     }
     if let Some(support) = top_k {
         if support == 0 || support > k_atoms {
             return Err(format!(
-                "run_sae_manifold_steer: top_k must be in 1..={k_atoms}; got {support}"
+                "{caller}: top_k must be in 1..={k_atoms}; got {support}"
             ));
         }
     }
     match (assignment, top_k) {
         (SaeOosAssignmentKind::TopK, None) => {
-            return Err(
-                "run_sae_manifold_steer: TopK assignment requires the saved top_k support size"
-                    .to_string(),
-            );
+            return Err(format!(
+                "{caller}: TopK assignment requires the saved top_k support size"
+            ));
         }
         (SaeOosAssignmentKind::TopK, Some(_)) | (_, None) => {}
         (_, Some(support)) => {
             return Err(format!(
-                "run_sae_manifold_steer: top_k={support} is valid only for TopK assignment"
+                "{caller}: top_k={support} is valid only for TopK assignment"
             ));
         }
     }
@@ -881,15 +879,14 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
         SaeOosAssignmentKind::ThresholdGate { threshold } => {
             if !threshold.is_finite() {
                 return Err(format!(
-                    "run_sae_manifold_steer: threshold-gate threshold must be finite; got {threshold}"
+                    "{caller}: threshold-gate threshold must be finite; got {threshold}"
                 ));
             }
             AssignmentMode::threshold_gate(tau, threshold)
         }
         SaeOosAssignmentKind::TopK => {
             let support = top_k.ok_or_else(|| {
-                "run_sae_manifold_steer: TopK assignment requires the saved top_k support size"
-                    .to_string()
+                format!("{caller}: TopK assignment requires the saved top_k support size")
             })?;
             AssignmentMode::top_k_support(support)
         }
@@ -904,14 +901,14 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
         let block = &coords[atom_index];
         if block.dim() != (n_obs, spec.latent_dim) {
             return Err(format!(
-                "run_sae_manifold_steer: coords[{atom_index}] must be (N, d)=({n_obs}, {}); got {:?}",
+                "{caller}: coords[{atom_index}] must be (N, d)=({n_obs}, {}); got {:?}",
                 spec.latent_dim,
                 block.dim()
             ));
         }
         if !block.iter().all(|value| value.is_finite()) {
             return Err(format!(
-                "run_sae_manifold_steer: coords[{atom_index}] contains non-finite values"
+                "{caller}: coords[{atom_index}] contains non-finite values"
             ));
         }
         atoms.push(build_oos_atom(atom_index, spec, block.view(), p_out)?);
@@ -927,12 +924,134 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
     if let Some(metric) = fisher_metric {
         term.set_row_metric(metric)?;
     }
+    Ok(term)
+}
 
+/// Build the frozen trained dictionary and measure the steering plan for atom
+/// `atom_k` at a fixed `amplitude`. Mirrors the term rebuild of
+/// [`run_sae_manifold_oos`] (sharing [`build_oos_atom`]) with no coordinate solve.
+pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, String> {
+    let SaeSteerRequest {
+        atoms,
+        coords,
+        logits,
+        assignment,
+        top_k,
+        alpha,
+        tau,
+        fisher_metric,
+        atom_k,
+        metric_row,
+        amplitude,
+        t_from,
+        t_to,
+    } = request;
+    finite_positive("amplitude", amplitude)?;
+    let term = build_steer_term(
+        "run_sae_manifold_steer",
+        atoms,
+        coords,
+        logits,
+        assignment,
+        top_k,
+        alpha,
+        tau,
+        fisher_metric,
+        atom_k,
+        metric_row,
+    )?;
     // The metric the dose is measured through: the installed per-row metric, or a
     // bit-identical Euclidean metric (geometry-only; dose degrades to None).
-    let euclidean = gam_problem::RowMetric::euclidean(n_obs, p_out)?;
+    let euclidean = gam_problem::RowMetric::euclidean(term.n_obs(), term.output_dim())?;
     let metric = term.row_metric().unwrap_or(&euclidean);
     steer_delta(&term, metric, atom_k, metric_row, amplitude, &t_from, &t_to)
+}
+
+/// Fully owned request to solve for the amplitude realizing a TARGET output-KL
+/// dose (in nats) on atom `atom_k`'s chord (gh#2263 target-dose surface). Same
+/// frozen-dictionary rebuild as [`SaeSteerRequest`], with `amplitude` replaced by
+/// the requested `target_nats` and the closed-loop `config`.
+pub struct SaeSteerToTargetRequest {
+    /// Persisted trained atoms (decoder + basis schema).
+    pub atoms: Vec<SaeOosAtomSpec>,
+    /// TRAINED per-row on-manifold coordinates, one `(n_obs, latent_dim)` block per atom.
+    pub coords: Vec<Array2<f64>>,
+    /// TRAINED per-row routing logits, `(n_obs, k_atoms)`.
+    pub logits: Array2<f64>,
+    /// Assignment family.
+    pub assignment: SaeOosAssignmentKind,
+    /// Saved active-set support (required for `TopK`).
+    pub top_k: Option<usize>,
+    /// Ordered Beta--Bernoulli concentration α.
+    pub alpha: f64,
+    /// Softmax / gate temperature.
+    pub tau: f64,
+    /// The per-row output-Fisher metric the dose is measured through, or `None`.
+    pub fisher_metric: Option<gam_problem::RowMetric>,
+    /// The atom whose coordinate is being steered.
+    pub atom_k: usize,
+    /// Exact fitted row whose output-Fisher block prices the applied move.
+    pub metric_row: usize,
+    /// Source on-manifold coordinate.
+    pub t_from: Vec<f64>,
+    /// Target on-manifold coordinate (fixes the chord DIRECTION; the amplitude is solved).
+    pub t_to: Vec<f64>,
+    /// Requested output-KL dose in nats.
+    pub target_nats: f64,
+    /// Closed-loop correction tuning.
+    pub config: TargetDoseConfig,
+}
+
+/// Solve for the amplitude that realizes `target_nats` on atom `atom_k`'s chord.
+/// The optional `probe` (a patched-forward KL callback, `a → KL`) drives the
+/// closed-loop secant correction and the readout-KL radius; with `probe = None`
+/// the returned [`TargetDosePlan`] is the unvalidated closed-form seed.
+pub fn run_sae_manifold_steer_to_target(
+    request: SaeSteerToTargetRequest,
+    probe: Option<&mut PatchedForwardKl<'_>>,
+) -> Result<TargetDosePlan, String> {
+    let SaeSteerToTargetRequest {
+        atoms,
+        coords,
+        logits,
+        assignment,
+        top_k,
+        alpha,
+        tau,
+        fisher_metric,
+        atom_k,
+        metric_row,
+        t_from,
+        t_to,
+        target_nats,
+        config,
+    } = request;
+    let term = build_steer_term(
+        "run_sae_manifold_steer_to_target",
+        atoms,
+        coords,
+        logits,
+        assignment,
+        top_k,
+        alpha,
+        tau,
+        fisher_metric,
+        atom_k,
+        metric_row,
+    )?;
+    let euclidean = gam_problem::RowMetric::euclidean(term.n_obs(), term.output_dim())?;
+    let metric = term.row_metric().unwrap_or(&euclidean);
+    steer_to_target_nats(
+        &term,
+        metric,
+        atom_k,
+        metric_row,
+        &t_from,
+        &t_to,
+        target_nats,
+        config,
+        probe,
+    )
 }
 
 /// Fully owned, Python-free request to certify an externally-trained

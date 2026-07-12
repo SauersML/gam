@@ -1508,6 +1508,120 @@ fn steer_delta_with_metric_from_arrays(
     gam::terms::sae::manifold::run_sae_manifold_steer(request).map_err(py_value_error)
 }
 
+/// Rebuild the trained term from arrays and solve for the amplitude realizing a
+/// TARGET output-KL dose (gh#2263). Mirrors [`steer_delta_with_metric_from_arrays`]
+/// but drives the target-dose entry; the optional `probe` (a patched-forward KL
+/// callback) drives the closed-loop correction and the readout-KL radius.
+#[allow(clippy::too_many_arguments)]
+fn steer_to_target_from_arrays(
+    atom_k: usize,
+    metric_row: usize,
+    target_nats: f64,
+    config: gam::inference::steering::TargetDoseConfig,
+    t_from: ndarray::ArrayView1<'_, f64>,
+    t_to: ndarray::ArrayView1<'_, f64>,
+    atom_basis: &[String],
+    atom_dim: &[usize],
+    decoder_blocks: &[ndarray::ArrayView2<'_, f64>],
+    duchon_centers: &[Option<Array2<f64>>],
+    n_harmonics_list: &[Option<usize>],
+    basis_size_list: &[usize],
+    coords: &[ndarray::ArrayView2<'_, f64>],
+    logits: ndarray::ArrayView2<'_, f64>,
+    assignment_kind: &str,
+    top_k: Option<usize>,
+    tau: f64,
+    alpha: f64,
+    threshold_gate_threshold: f64,
+    fisher_metric: Option<gam::inference::row_metric::RowMetric>,
+    probe: Option<&mut gam::inference::steering::PatchedForwardKl<'_>>,
+) -> PyResult<gam::inference::steering::TargetDosePlan> {
+    let assignment_kind = canonicalize_assignment_kind(assignment_kind).map_err(py_value_error)?;
+    let k_atoms = atom_basis.len();
+    if atom_dim.len() != k_atoms
+        || decoder_blocks.len() != k_atoms
+        || duchon_centers.len() != k_atoms
+        || n_harmonics_list.len() != k_atoms
+        || basis_size_list.len() != k_atoms
+        || coords.len() != k_atoms
+    {
+        return Err(py_value_error(format!(
+            "sae_steer_to_target: per-atom metadata lengths must equal K={k_atoms}"
+        )));
+    }
+    let assignment = match assignment_kind.as_str() {
+        "softmax" => gam::terms::sae::manifold::SaeOosAssignmentKind::Softmax,
+        "ordered_beta_bernoulli" => {
+            gam::terms::sae::manifold::SaeOosAssignmentKind::OrderedBetaBernoulli {
+                learnable_alpha: false,
+            }
+        }
+        "threshold_gate" => gam::terms::sae::manifold::SaeOosAssignmentKind::ThresholdGate {
+            threshold: threshold_gate_threshold,
+        },
+        "topk" => gam::terms::sae::manifold::SaeOosAssignmentKind::TopK,
+        _ => {
+            return Err(py_value_error(format!(
+                "sae_steer_to_target: assignment_kind must be one of 'softmax', \
+                 'ordered_beta_bernoulli', 'threshold_gate', or 'topk'; got {assignment_kind}"
+            )));
+        }
+    };
+    let atoms: Vec<gam::terms::sae::manifold::SaeOosAtomSpec> = (0..k_atoms)
+        .map(|atom_index| gam::terms::sae::manifold::SaeOosAtomSpec {
+            basis_kind: sae_atom_basis_kind_from_str(&atom_basis[atom_index]),
+            latent_dim: atom_dim[atom_index],
+            decoder: decoder_blocks[atom_index].to_owned(),
+            centers: duchon_centers[atom_index].clone(),
+            n_harmonics: n_harmonics_list[atom_index],
+            basis_size: basis_size_list[atom_index],
+        })
+        .collect();
+    let coord_blocks: Vec<Array2<f64>> = coords.iter().map(|block| block.to_owned()).collect();
+
+    let request = gam::terms::sae::manifold::SaeSteerToTargetRequest {
+        atoms,
+        coords: coord_blocks,
+        logits: logits.to_owned(),
+        assignment,
+        top_k,
+        alpha,
+        tau,
+        fisher_metric,
+        atom_k,
+        metric_row,
+        t_from: t_from.to_vec(),
+        t_to: t_to.to_vec(),
+        target_nats,
+        config,
+    };
+    gam::terms::sae::manifold::run_sae_manifold_steer_to_target(request, probe)
+        .map_err(py_value_error)
+}
+
+/// Render a [`gam::inference::steering::TargetDosePlan`] as a Python dict.
+fn target_dose_plan_to_pydict(
+    py: Python<'_>,
+    plan: gam::inference::steering::TargetDosePlan,
+) -> PyResult<Py<PyDict>> {
+    let provenance_str = gam::terms::sae::manifold::metric_provenance_label(plan.metric_provenance);
+    let out = PyDict::new(py);
+    out.set_item("atom", plan.atom)?;
+    out.set_item("atom_name", plan.atom_name)?;
+    out.set_item("target_nats", plan.target_nats)?;
+    out.set_item("seed_amplitude", plan.seed_amplitude)?;
+    out.set_item("amplitude", plan.amplitude)?;
+    out.set_item("predicted_nats", plan.predicted_nats)?;
+    out.set_item("predicted_nats_kind", plan.predicted_nats_kind.as_str())?;
+    out.set_item("measured_nats", plan.measured_nats)?;
+    out.set_item("iterations", plan.iterations)?;
+    out.set_item("converged", plan.converged)?;
+    out.set_item("chart_radius", plan.chart_radius)?;
+    out.set_item("readout_kl_radius", plan.readout_kl_radius)?;
+    out.set_item("metric_provenance", provenance_str)?;
+    Ok(out.unbind())
+}
+
 /// Render a [`gam::inference::steering::SteerPlan`] as the Python dict both steer
 /// callers return (the `sae_steer_delta` pyfunction and `ManifoldSaeCore::steer`).
 fn steer_plan_to_pydict(

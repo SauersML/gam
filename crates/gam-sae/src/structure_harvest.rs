@@ -3417,7 +3417,21 @@ fn race_birth_topology(
     // REML evidence and wins only when it scores strictly better; on a non-fold it
     // ties the linear seed and the default (template) is kept. Fail-safe: any
     // embedding/race failure leaves the template winner untouched.
-    let intrinsic_winner = race_intrinsic_coords(target, weights, d_k).unwrap_or(None);
+    //
+    // GATED to a FLAT template verdict (EuclideanPatch): a genuinely curved born
+    // atom (circle/torus/sphere/cylinder) already wins its specialized chart on the
+    // template coords, and re-racing on the geodesic embedding must not let a
+    // flexible flat/patch fit override that true topology. Only a flat verdict — the
+    // least-bad chart for a folded plane — can be a fold worth unrolling.
+    let template_is_sheet = matches!(
+        template_winner.as_ref().map(|(fit, _)| &fit.basis_kind),
+        Some(SaeAtomBasisKind::EuclideanPatch)
+    );
+    let intrinsic_winner = if template_is_sheet {
+        race_intrinsic_coords(target, weights, d_k).unwrap_or(None)
+    } else {
+        None
+    };
     // Lower TK/REML cost wins (issue #396 sign convention); the template keeps
     // ties, so PCA stays default and intrinsic only supplants it by evidence.
     let winner = match (template_winner, intrinsic_winner) {
@@ -3928,7 +3942,21 @@ pub fn discover_primary_atom_topologies(
             // the SAME REML evidence and wins only by a strictly lower TK cost; a
             // win also swaps in its unfolded chart for the Duchon-center growth.
             // Fail-safe: any embedding/race failure leaves the PCA winner untouched.
-            let intrinsic_challenger =
+            //
+            // GATED to a FLAT PCA verdict (EuclideanPatch/Duchon): the challenger
+            // only ever offers the raw-coordinate flat + thin-plate charts, and a
+            // thin-plate sheet is flexible enough to out-fit a SPECIALIZED curved
+            // chart (sphere/torus/circle) on evidence even when that curved chart is
+            // the true topology (the #2238/#2239 contract). A genuinely curved factor
+            // gets a curved PCA winner; only a SHEET verdict (flat/Duchon — the
+            // least-bad chart for a folded plane) can be a fold worth unrolling. So
+            // the challenger runs iff PCA already said "sheet", never overriding a
+            // discovered sphere/torus/circle.
+            let pca_is_sheet = matches!(
+                pca_winner.as_ref().map(|(fit, _)| &fit.basis_kind),
+                Some(SaeAtomBasisKind::EuclideanPatch) | Some(SaeAtomBasisKind::Duchon)
+            );
+            let intrinsic_challenger = if pca_is_sheet {
                 match build_intrinsic_primary_specs(target, &rows, max_dims[atom_idx]) {
                     Ok(Some((int_specs, int_chart))) => {
                         match race_spec_set(int_specs, target, weights.view()) {
@@ -3937,7 +3965,10 @@ pub fn discover_primary_atom_topologies(
                         }
                     }
                     _ => None,
-                };
+                }
+            } else {
+                None
+            };
             // When the intrinsic seed wins, its unfolded chart both drives the
             // Duchon-center growth (`sheet_coords`) AND must be installed as the
             // atom's final seed coordinates (`winning_intrinsic_chart`) so the

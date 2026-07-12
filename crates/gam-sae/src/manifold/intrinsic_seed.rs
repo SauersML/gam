@@ -39,7 +39,7 @@
 //! self-adjoint solver. Same input ⇒ bit-identical coordinates run-to-run.
 
 use super::SaeAtomBasisKind;
-use gam_linalg::faer_ndarray::strict_symmetric_eigh;
+use gam_linalg::faer_ndarray::FaerEigh;
 use ndarray::{Array2, Array3, ArrayView2};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -384,8 +384,21 @@ pub fn intrinsic_geodesic_embedding(
             b_mat[[a, b]] = -0.5 * (d2[[a, b]] - row_mean[a] - row_mean[b] + grand);
         }
     }
+    // `B` is symmetric in exact arithmetic, but `B_ab` and `B_ba` are accumulated
+    // through independent float operations, leaving a ~1e-14 asymmetry that grows
+    // with the data scale. Average each off-diagonal pair so the matrix is
+    // BIT-symmetric before the self-adjoint eigensolve; the solver reads only the
+    // lower triangle, so this also fixes which triangle it trusts.
+    for a in 0..l {
+        for b in (a + 1)..l {
+            let avg = 0.5 * (b_mat[[a, b]] + b_mat[[b, a]]);
+            b_mat[[a, b]] = avg;
+            b_mat[[b, a]] = avg;
+        }
+    }
 
-    let (evals, evecs) = strict_symmetric_eigh(&b_mat, Side::Lower)
+    let (evals, evecs) = b_mat
+        .eigh(Side::Lower)
         .map_err(|err| format!("intrinsic_seed: MDS eigensolve failed: {err:?}"))?;
     // Select the top d POSITIVE eigenvalues (descending). faer returns ascending;
     // sort an index list by descending eigenvalue with an index tie-break.
@@ -551,25 +564,32 @@ mod tests {
     /// configuration must reproduce that configuration up to a rigid motion. We
     /// check the recovered pairwise distances match the originals (rigid-motion
     /// invariant), which is the defining property of a correct MDS.
+    ///
+    /// The configuration is small enough (`n = 6 ≤ k + 1`) that the deterministic
+    /// kNN graph is COMPLETE — every pair is a direct edge, so the graph geodesic
+    /// equals the exact Euclidean distance and MDS recovers the plane to rounding.
+    /// (A sparse grid graph would inject the Isomap "staircase" over-estimate of
+    /// diagonal distances, which is a property of the discrete graph metric, not
+    /// an MDS error — so this test isolates the MDS/extension math.)
     #[test]
     fn mds_recovers_known_configuration_up_to_rigid_motion() {
-        // A deterministic non-degenerate 2-D point set embedded in 3-D ambient
-        // (third coord constant), n large enough that every point is a landmark
-        // is NOT required — the geodesic on a dense grid equals the Euclidean
-        // metric here since the set is convex and well-sampled.
-        let n = 25usize;
+        // Six deterministic 2-D points (a 2×3 lattice) embedded in 3-D ambient
+        // with a constant third coordinate. n = 6 and k = max(2d+1, ⌈log2 n⌉) = 5
+        // ⇒ each node links the other five ⇒ complete graph ⇒ exact Euclidean
+        // geodesics.
+        let n = 6usize;
         let mut z = Array2::<f64>::zeros((n, 3));
-        for i in 0..5 {
-            for j in 0..5 {
-                let r = i * 5 + j;
+        for i in 0..2 {
+            for j in 0..3 {
+                let r = i * 3 + j;
                 z[[r, 0]] = i as f64;
                 z[[r, 1]] = j as f64;
                 z[[r, 2]] = 0.5; // constant ambient offset
             }
         }
         let embed = intrinsic_geodesic_embedding(z.view(), 2).unwrap();
-        // Compare a sample of pairwise embedded distances to ambient distances.
-        // On this convex grid the geodesic ≈ Euclidean, so MDS recovers the plane.
+        // Every embedded pairwise distance must match the ambient Euclidean
+        // distance (rigid-motion invariant) to rounding.
         let mut max_rel = 0.0_f64;
         for a in 0..n {
             for b in (a + 1)..n {
@@ -586,9 +606,9 @@ mod tests {
             }
         }
         assert!(
-            max_rel < 0.05,
-            "MDS must reproduce the planar configuration's pairwise distances \
-             (max relative error {max_rel:.4})"
+            max_rel < 1e-6,
+            "MDS on a complete-graph (exact-Euclidean) configuration must reproduce \
+             its pairwise distances to rounding (max relative error {max_rel:.3e})"
         );
     }
 
