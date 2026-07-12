@@ -92,18 +92,44 @@ pub(crate) fn realised_rank_charge_dof(
         Err(e) => return Err(format!("realised_rank_charge_dof: recon svd: {e}")),
     };
     let edge = r_floor * (1.0 + (p_out / n_eff).sqrt()).powi(2);
-    let rank_eff = sv.iter().filter(|&&s| (s * s) / n_eff > edge).count() as f64;
-    if rank_eff == 0.0 {
-        // A zero effective rank triggers the categorical Laplace-validity veto
-        // upstream (criterion → +∞), so when it fires the NUMBERS must be on
-        // the record: an inflated noise floor R (e.g. an edf≈n dispersion at a
-        // small fixture) silently vetoes real atoms.
+    let mut rank_eff = sv.iter().filter(|&&s| (s * s) / n_eff > edge).count() as f64;
+    // DETECTION vs DEGENERACY (#2258 real-activation class). rank_eff == 0
+    // conflated two regimes with opposite correct handling:
+    //   · VANISHED decoder (a²‖B‖² → 0): the β-mode is degenerate, the
+    //     β-Schur log-det → −∞ is the Laplace approximation BREAKING DOWN,
+    //     and the RLCT argument above makes the categorical +∞ veto the only
+    //     valid pricing. This is the regime the veto was built for (births on
+    //     featureless residuals).
+    //   · BELOW the MP DETECTION EDGE but numerically alive: in a p ≈ n_eff
+    //     regime the edge is ≈ 4R (measured on real GPT-2 activations:
+    //     R=1.005, n_eff=84, p=64 ⇒ edge=3.53 vs top signal 0.32–0.84), so a
+    //     genuine fitted decoder simply isn't separable from noise AT THIS
+    //     SAMPLE SIZE. The Laplace value is perfectly valid there; vetoing
+    //     turned every weak-signal PRIMARY fit into a hard refusal — the
+    //     mechanism behind the 0/39 real-activation grid. Price such an atom
+    //     at the MINIMUM non-degenerate rank (1): an alive decoder occupies
+    //     at least a ray, the charge is strictly HIGHER than the rank-0 zero
+    //     charge (so the birth-gate null-license stays closed — a
+    //     featureless-residual birth must now pay ½·basis_edf·ln n it cannot
+    //     earn), and the fit minted for the user carries its honest weak
+    //     evidence instead of no model at all.
+    let top_signal = {
         let top_sv = sv.iter().cloned().fold(0.0_f64, f64::max);
+        top_sv * top_sv / n_eff
+    };
+    const VANISHED_REL: f64 = 1.0e-9;
+    if rank_eff == 0.0 && top_signal > VANISHED_REL * r_floor {
         log::debug!(
-            "realised_rank_charge_dof: rank_eff=0 — top sv²/n_eff={:.6e} vs MP edge={:.6e} \
-             (R={r_floor:.6e}, n_eff={n_eff:.3e}, p_out={p_out})",
-            top_sv * top_sv / n_eff,
-            edge,
+            "realised_rank_charge_dof: below-detection-edge atom promoted to rank 1 — \
+             top sv²/n_eff={top_signal:.6e} vs MP edge={edge:.6e} \
+             (R={r_floor:.6e}, n_eff={n_eff:.3e}, p_out={p_out})"
+        );
+        rank_eff = 1.0;
+    } else if rank_eff == 0.0 {
+        log::debug!(
+            "realised_rank_charge_dof: VANISHED decoder (categorical veto upstream) — \
+             top sv²/n_eff={top_signal:.6e} ≤ {VANISHED_REL:.0e}·R (R={r_floor:.6e}, \
+             n_eff={n_eff:.3e}, p_out={p_out})"
         );
     }
     // basis_edf = tr(gram·(gram+λS)⁻¹).
