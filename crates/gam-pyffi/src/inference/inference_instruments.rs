@@ -43,8 +43,6 @@ use gam::inference::structure_evidence::{
     split_likelihood_log_e_value,
 };
 use gam::solver::CircularGaussianFit2d;
-#[cfg(test)]
-use gam_math::special::bessel_i0_log_minus_abs_and_ratio;
 
 use crate::py_value_error;
 
@@ -1259,7 +1257,7 @@ mod tests {
             let dy = coords[[row, 1]] - center[1];
             let observed_radius = dx.hypot(dy);
             let kappa = radius * observed_radius / noise_variance;
-            let (_, bessel_ratio) = bessel_i0_log_minus_abs_and_ratio(kappa);
+            let (_, bessel_ratio) = gam_math::special::bessel_i0_log_minus_abs_and_ratio(kappa);
             let center_multiplier =
                 (1.0 - radius * bessel_ratio / observed_radius) / noise_variance;
             center_score[0] += center_multiplier * dx;
