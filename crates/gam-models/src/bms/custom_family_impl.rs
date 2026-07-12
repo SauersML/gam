@@ -2222,14 +2222,17 @@ impl BernoulliMarginalSlopeFamily {
         let beta_h = beta_h_owned.as_ref();
         let beta_w = beta_w_owned.as_ref();
         if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
-            return row_dirs
-                .iter()
-                .map(|dir| {
-                    self.empirical_flex_row_third_contracted(
-                        row, primary, q, b, beta_h, beta_w, row_ctx, dir, &grid,
-                    )
-                })
-                .collect();
+            return self.empirical_flex_row_third_contracted_many(
+                row,
+                primary,
+                q,
+                b,
+                beta_h,
+                beta_w,
+                row_ctx,
+                row_dirs,
+                &grid,
+            );
         }
 
         let a = row_ctx.intercept;

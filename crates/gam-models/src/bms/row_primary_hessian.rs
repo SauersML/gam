@@ -3715,20 +3715,46 @@ impl BernoulliMarginalSlopeFamily {
             let mut e_g = Array1::<f64>::zeros(r);
             e_g[cache.primary.logslope] = 1.0;
             let row_ctx = Self::row_ctx(cache, row);
-            let t3_q = self.row_primary_third_contracted_with_moments(
-                row,
-                block_states,
-                cache,
-                row_ctx,
-                &e_q,
-            )?;
-            let t3_g = self.row_primary_third_contracted_with_moments(
-                row,
-                block_states,
-                cache,
-                row_ctx,
-                &e_g,
-            )?;
+            let [t3_q, t3_g] =
+                if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
+                    let point = self.primary_point_from_block_states(
+                        row,
+                        block_states,
+                        &cache.primary,
+                    )?;
+                    let (q, b, beta_h_owned, beta_w_owned) =
+                        self.primary_point_components(&point, &cache.primary);
+                    self.empirical_flex_row_third_contracted_many(
+                        row,
+                        &cache.primary,
+                        q,
+                        b,
+                        beta_h_owned.as_ref(),
+                        beta_w_owned.as_ref(),
+                        row_ctx,
+                        &[e_q, e_g],
+                        &grid,
+                    )?
+                    .try_into()
+                    .expect("two empirical BMS axis directions produce two contractions")
+                } else {
+                    [
+                        self.row_primary_third_contracted_with_moments(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &e_q,
+                        )?,
+                        self.row_primary_third_contracted_with_moments(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &e_g,
+                        )?,
+                    ]
+                };
             Ok(FlexAxisThirdRowTensors {
                 third: [t3_q, t3_g],
             })
@@ -4625,16 +4651,9 @@ impl BernoulliMarginalSlopeFamily {
         let beta_h = beta_h_owned.as_ref();
         let beta_w = beta_w_owned.as_ref();
         if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
-            let mut grad = Array1::<f64>::zeros(r);
-            for dir_idx in 0..r {
-                let mut basis = Array1::<f64>::zeros(r);
-                basis[dir_idx] = 1.0;
-                let third = self.empirical_flex_row_third_contracted(
-                    row, primary, q, b, beta_h, beta_w, row_ctx, &basis, &grid,
-                )?;
-                grad[dir_idx] = Self::row_primary_trace_contract(&third, gram);
-            }
-            return Ok(grad);
+            return self.empirical_flex_row_third_trace_gradient(
+                row, primary, q, b, beta_h, beta_w, row_ctx, gram, &grid,
+            );
         }
 
         use super::exact_kernel as exact;
