@@ -1940,6 +1940,7 @@ mod tests {
     use super::test_support::{dispersion_gamma_nll_order2, dispersion_nb_nll_order2};
     use super::*;
     use crate::gamlss::test_support::dispersion_tweedie_nll_generic;
+    use gam_math::nested_dual::JetField;
 
     /// Order-≤1 `ln Γ` compose: only the value (`d[0] = lnΓ`) and first-derivative
     /// (`d[1] = ψ`) stack slots are consumed by an [`Order1`] jet, so we evaluate

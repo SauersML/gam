@@ -3785,6 +3785,7 @@ pub(crate) fn q_chain_derivs_scalar(eta_t: f64, eta_ls: f64) -> (f64, f64, f64, 
 mod patterned_order2_perf_tests {
     use super::*;
     use gam_math::jet_scalar::Order2;
+    use gam_math::nested_dual::JetField;
     use std::hint::black_box;
 
     /// The exact structural Hessian support of [`sls_row_nll`]. The likelihood is a

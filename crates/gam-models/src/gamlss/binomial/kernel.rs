@@ -863,6 +863,7 @@ mod packed_scalar_oracle_tests {
     use super::*;
     use crate::gamlss::test_support::binomial_location_scale_nll_tower;
     use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
+    use gam_math::nested_dual::JetField;
     use gam_problem::{InverseLink, StandardLink};
 
     fn rel_close(a: f64, b: f64, label: &str) {
