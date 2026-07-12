@@ -1676,7 +1676,7 @@ fn latent_kernel_sum_order2_parts<const K: usize>(
     primary_directions: &[LatentKernelPrimaryDirection; K],
     suffixes: &[&[LatentKernelPrimaryDirection]],
     context: &str,
-) -> Result<(f64, [Order2<K>; 4]), LatentSurvivalError> {
+) -> Result<[Order2<K>; 4], LatentSurvivalError> {
     assert!(
         !suffixes.is_empty() && suffixes.len() <= 4,
         "latent kernel lift supports one to four order-two parts"
@@ -1805,7 +1805,101 @@ fn latent_kernel_sum_order2_parts<const K: usize>(
         }
         parts[part] = Order2(tower);
     }
-    Ok((base_log_sum, parts))
+    Ok(latent_kernel_normalized_log_parts(
+        base_log_sum,
+        parts,
+        suffixes.len(),
+    ))
+}
+
+/// Convert normalized kernel-sum moments into derivatives of the log sum.
+///
+/// `normalized_parts` is the single analytic recurrence's compact moment
+/// layout: the base carries `(1, S_a/S, S_ab/S)`, the one-seed parts carry
+/// `(S_u/S, S_au/S, S_abu/S)`, and the two-seed cross part carries
+/// `(S_uv/S, S_auv/S, S_abuv/S)`. For each requested output channel we expose
+/// those moments as a four-slot derivative table `(a,b,u,v)` and let the shared
+/// compensated Faà-di-Bruno reducer perform `log` composition. This avoids the
+/// severe tail cancellation caused by composing projected `Order2` products in
+/// stages, while retaining one recurrence, one moment layout, and one general
+/// composition rule for Order2, OneSeed, and TwoSeed.
+fn latent_kernel_normalized_log_parts<const K: usize>(
+    base_log_sum: f64,
+    normalized_parts: [Order2<K>; 4],
+    part_count: usize,
+) -> [Order2<K>; 4] {
+    assert!(matches!(part_count, 1 | 2 | 4));
+    let log_stack = latent_unary_derivatives_log(1.0);
+    let log_derivative = |moments: &[f64; 16], positions: &[usize]| {
+        gam_math::jet_algebra::faa_di_bruno_compensated(positions, &log_stack, |block| {
+            let mask = block
+                .iter()
+                .fold(0usize, |mask, &slot| mask | (1usize << slot));
+            moments[mask]
+        })
+    };
+    let moments_for = |a: usize, b: usize| {
+        let base = &normalized_parts[0].0;
+        let u = &normalized_parts[1].0;
+        let v = &normalized_parts[2].0;
+        let uv = &normalized_parts[3].0;
+        [
+            1.0,
+            base.g[a],
+            base.g[b],
+            base.h[a][b],
+            u.v,
+            u.g[a],
+            u.g[b],
+            u.h[a][b],
+            v.v,
+            v.g[a],
+            v.g[b],
+            v.h[a][b],
+            uv.v,
+            uv.g[a],
+            uv.g[b],
+            uv.h[a][b],
+        ]
+    };
+
+    let mut out = [Order2::<K>::constant(0.0); 4];
+    out[0].0.v = base_log_sum;
+    if part_count >= 2 {
+        out[1].0.v = normalized_parts[1].0.v;
+    }
+    if part_count == 4 {
+        out[2].0.v = normalized_parts[2].0.v;
+        let moments = moments_for(0, 0);
+        out[3].0.v = log_derivative(&moments, &[2, 3]);
+    }
+
+    for a in 0..K {
+        let moments = moments_for(a, a);
+        out[0].0.g[a] = moments[1];
+        if part_count >= 2 {
+            out[1].0.g[a] = log_derivative(&moments, &[0, 2]);
+        }
+        if part_count == 4 {
+            out[2].0.g[a] = log_derivative(&moments, &[0, 3]);
+            out[3].0.g[a] = log_derivative(&moments, &[0, 2, 3]);
+        }
+        for b in a..K {
+            let moments = moments_for(a, b);
+            out[0].0.h[a][b] = log_derivative(&moments, &[0, 1]);
+            if part_count >= 2 {
+                out[1].0.h[a][b] = log_derivative(&moments, &[0, 1, 2]);
+            }
+            if part_count == 4 {
+                out[2].0.h[a][b] = log_derivative(&moments, &[0, 1, 3]);
+                out[3].0.h[a][b] = log_derivative(&moments, &[0, 1, 2, 3]);
+            }
+            for part in 0..part_count {
+                out[part].0.h[b][a] = out[part].0.h[a][b];
+            }
+        }
+    }
+    out
 }
 
 #[inline]
@@ -1859,7 +1953,7 @@ impl<const K: usize> LatentPrimaryJetBackend<K> for LatentOrder2Backend {
         context: &str,
     ) -> Result<Self::Jet, LatentSurvivalError> {
         let suffixes: [&[LatentKernelPrimaryDirection]; 1] = [&[]];
-        let (base_log_sum, parts) = latent_kernel_sum_order2_parts(
+        let parts = latent_kernel_sum_order2_parts(
             quadctx,
             base_terms,
             state,
@@ -1867,9 +1961,7 @@ impl<const K: usize> LatentPrimaryJetBackend<K> for LatentOrder2Backend {
             &suffixes,
             context,
         )?;
-        let mut out = parts[0].compose_unary(latent_unary_derivatives_log(1.0));
-        out.0.v += base_log_sum;
-        Ok(out)
+        Ok(parts[0])
     }
 }
 
@@ -1892,7 +1984,7 @@ impl<const K: usize> LatentPrimaryJetBackend<K> for LatentOneSeedBackend<K> {
         let seed = latent_kernel_direction_linear_combination(primary_directions, &self.direction);
         let seed_suffix = [seed];
         let suffixes: [&[LatentKernelPrimaryDirection]; 2] = [&[], &seed_suffix];
-        let (base_log_sum, parts) = latent_kernel_sum_order2_parts(
+        let parts = latent_kernel_sum_order2_parts(
             quadctx,
             base_terms,
             state,
@@ -1900,13 +1992,10 @@ impl<const K: usize> LatentPrimaryJetBackend<K> for LatentOneSeedBackend<K> {
             &suffixes,
             context,
         )?;
-        let mut out = OneSeed {
+        Ok(OneSeed {
             base: parts[0],
             eps: parts[1],
-        }
-        .compose_unary(latent_unary_derivatives_log(1.0));
-        out.base.0.v += base_log_sum;
-        Ok(out)
+        })
     }
 }
 
@@ -1936,7 +2025,7 @@ impl<const K: usize> LatentPrimaryJetBackend<K> for LatentTwoSeedBackend<K> {
         let suffix_uv = [seed_u, seed_v];
         let suffixes: [&[LatentKernelPrimaryDirection]; 4] =
             [&[], &suffix_u, &suffix_v, &suffix_uv];
-        let (base_log_sum, parts) = latent_kernel_sum_order2_parts(
+        let parts = latent_kernel_sum_order2_parts(
             quadctx,
             base_terms,
             state,
@@ -1944,15 +2033,12 @@ impl<const K: usize> LatentPrimaryJetBackend<K> for LatentTwoSeedBackend<K> {
             &suffixes,
             context,
         )?;
-        let mut out = TwoSeed {
+        Ok(TwoSeed {
             base: parts[0],
             eps: parts[1],
             del: parts[2],
             eps_del: parts[3],
-        }
-        .compose_unary(latent_unary_derivatives_log(1.0));
-        out.base.0.v += base_log_sum;
-        Ok(out)
+        })
     }
 }
 

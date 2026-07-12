@@ -230,6 +230,105 @@ where
     total
 }
 
+#[derive(Clone, Copy)]
+struct CompensatedValue {
+    hi: f64,
+    lo: f64,
+}
+
+impl CompensatedValue {
+    #[inline]
+    fn from_f64(value: f64) -> Self {
+        Self { hi: value, lo: 0.0 }
+    }
+
+    #[inline]
+    fn renormalize(hi: f64, lo: f64) -> Self {
+        let sum = hi + lo;
+        Self {
+            hi: sum,
+            lo: lo - (sum - hi),
+        }
+    }
+
+    #[inline]
+    fn add(self, other: Self) -> Self {
+        let sum = self.hi + other.hi;
+        let virtual_other = sum - self.hi;
+        let error = (self.hi - (sum - virtual_other)) + (other.hi - virtual_other);
+        Self::renormalize(sum, error + self.lo + other.lo)
+    }
+
+    #[inline]
+    fn mul_f64(self, factor: f64) -> Self {
+        let product = self.hi * factor;
+        let error = self.hi.mul_add(factor, -product) + self.lo * factor;
+        Self::renormalize(product, error)
+    }
+
+    #[inline]
+    fn value(self) -> f64 {
+        self.hi + self.lo
+    }
+}
+
+/// Compensated multivariate Faà di Bruno reduction for cancellation-prone
+/// derivative channels.
+///
+/// This walks the same cached set partitions as [`faa_di_bruno`], but carries
+/// every partition product and the final partition sum as a two-component
+/// expansion. It is intended for small, finite derivative stacks whose true
+/// result is much smaller than the individual partition terms (for example a
+/// fourth derivative of `log` in a distribution tail). The combinatorics stay
+/// single-sourced here; callers provide only their layout-specific derivative
+/// lookup.
+#[inline]
+pub fn faa_di_bruno_compensated<F>(
+    positions: &[usize],
+    derivs: &[f64],
+    mut inner: F,
+) -> f64
+where
+    F: FnMut(&[usize]) -> f64,
+{
+    let m = positions.len();
+    if m == 0 {
+        return derivs[0];
+    }
+    assert!(
+        m <= MAX_SLOTS,
+        "too many differentiation slots for compensated partition enumeration"
+    );
+
+    let full = 1usize << m;
+    let mut labelled = SlotBuf::new();
+    let mut block_values = [0.0f64; 1 << MAX_SLOTS];
+    for (submask, slot) in block_values.iter_mut().enumerate().take(full).skip(1) {
+        labelled.len = 0;
+        let mut bits = submask;
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            labelled.push(positions[bit]);
+            bits &= bits - 1;
+        }
+        *slot = inner(labelled.as_slice());
+    }
+
+    let mut total = CompensatedValue::from_f64(0.0);
+    for part in partition_table(m) {
+        let order = part.n_blocks as usize;
+        if order >= derivs.len() {
+            continue;
+        }
+        let mut product = CompensatedValue::from_f64(derivs[order]);
+        for &block_mask in &part.blocks[..order] {
+            product = product.mul_f64(block_values[block_mask as usize]);
+        }
+        total = total.add(product);
+    }
+    total.value()
+}
+
 /// Layout hook for jets that share the Faà di Bruno unary-composition kernel.
 ///
 /// `DERIVS` is the length of the unary derivative stack: `5` for fourth-order
