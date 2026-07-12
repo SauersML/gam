@@ -4728,14 +4728,18 @@ fn enforce_production_derivative_specializations(root: &Path) {
         let production_path = root.join(specialization.production_path);
         match fs::read_to_string(&production_path) {
             Ok(source) => {
-                let production_end = source.find("#[cfg(test)]").unwrap_or(source.len());
+                let test_mask = compute_test_mask(&source, Path::new(specialization.production_path));
                 for anchor in specialization.production_anchors {
                     match source.find(anchor) {
-                        Some(offset) if offset < production_end => {}
-                        Some(_) => violations.push(format!(
-                            "{} production anchor is gated by cfg(test): {}",
-                            specialization.family, anchor
-                        )),
+                        Some(offset) => {
+                            let line = source[..offset].bytes().filter(|byte| *byte == b'\n').count();
+                            if test_mask.get(line).copied().unwrap_or(false) {
+                                violations.push(format!(
+                                    "{} production anchor is gated by cfg(test): {}",
+                                    specialization.family, anchor
+                                ));
+                            }
+                        }
                         None => violations.push(format!(
                             "{} production anchor is missing: {}",
                             specialization.family, anchor
@@ -4773,8 +4777,11 @@ fn enforce_production_derivative_specializations(root: &Path) {
         if rel.extension().and_then(OsStr::to_str) != Some("rs") {
             return;
         }
-        let production = content.split("#[cfg(test)]").next().unwrap_or(content);
-        for (line_index, line) in production.lines().enumerate() {
+        let test_mask = compute_test_mask(content, rel);
+        for (line_index, line) in content.lines().enumerate() {
+            if test_mask.get(line_index).copied().unwrap_or(false) {
+                continue;
+            }
             let trimmed = line.trim();
             let row_kernel_impl = (trimmed.starts_with("impl ") || trimmed.starts_with("impl<"))
                 && trimmed.contains("RowKernel<")
