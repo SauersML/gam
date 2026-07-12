@@ -6877,97 +6877,61 @@ pub fn parse_f64_2d_npy_header(
     bytes: &[u8],
     path: &PathBuf,
 ) -> Result<(usize, usize, usize), BasisError> {
-    if bytes.len() < 10 || &bytes[0..6] != b"\x93NUMPY" {
-        crate::bail_invalid_basis!("lazy Pca scores '{}' is not a .npy file", path.display());
-    }
-    let major = bytes[6];
-    let header_len = match major {
-        1 => u16::from_le_bytes([bytes[8], bytes[9]]) as usize,
-        2 | 3 => {
-            if bytes.len() < 12 {
-                crate::bail_invalid_basis!(
-                    "lazy Pca scores '{}' has a truncated .npy header",
-                    path.display()
-                );
-            }
-            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize
-        }
-        other => {
-            crate::bail_invalid_basis!(
-                "lazy Pca scores '{}' uses unsupported .npy version {}",
-                path.display(),
-                other
-            );
-        }
-    };
-    let header_start = if major == 1 { 10 } else { 12 };
-    let data_offset = header_start + header_len;
-    if bytes.len() < data_offset {
-        crate::bail_invalid_basis!(
-            "lazy Pca scores '{}' has a truncated .npy header",
-            path.display()
-        );
-    }
-    let header = std::str::from_utf8(&bytes[header_start..data_offset]).map_err(|err| {
+    let mut reader = std::io::Cursor::new(bytes);
+    let header = npyz::NpyHeader::from_reader(&mut reader).map_err(|err| {
         BasisError::InvalidInput(format!(
-            "lazy Pca scores '{}' has a non-UTF8 .npy header: {err}",
+            "lazy Pca scores '{}' has an invalid .npy header: {err}",
             path.display()
         ))
     })?;
-    if !(header.contains("'descr': '<f8'")
-        || header.contains("\"descr\": \"<f8\"")
-        || header.contains("'descr': '|f8'")
-        || header.contains("\"descr\": \"|f8\""))
-    {
+    let is_little_endian_f64 = matches!(
+        header.dtype(),
+        npyz::DType::Plain(ref dtype)
+            if dtype.type_char() == npyz::TypeChar::Float
+                && dtype.size_field() == 8
+                && dtype.endianness() == npyz::Endianness::Little
+    );
+    if !is_little_endian_f64 {
         crate::bail_invalid_basis!(
-            "lazy Pca scores '{}' must be float64 little-endian .npy",
-            path.display()
+            "lazy Pca scores '{}' must be scalar little-endian float64 .npy, got {}",
+            path.display(),
+            header.dtype().descr()
         );
     }
-    if header.contains("True") {
+    if header.order() != npyz::Order::C {
         crate::bail_invalid_basis!(
             "lazy Pca scores '{}' must be C-contiguous, not Fortran-ordered",
             path.display()
         );
     }
-    let shape_pos = header.find("shape").ok_or_else(|| {
-        BasisError::InvalidInput(format!(
-            "lazy Pca scores '{}' .npy header is missing shape",
-            path.display()
-        ))
-    })?;
-    let open = header[shape_pos..].find('(').ok_or_else(|| {
-        BasisError::InvalidInput(format!(
-            "lazy Pca scores '{}' .npy header has malformed shape",
-            path.display()
-        ))
-    })? + shape_pos;
-    let close = header[open..].find(')').ok_or_else(|| {
-        BasisError::InvalidInput(format!(
-            "lazy Pca scores '{}' .npy header has malformed shape",
-            path.display()
-        ))
-    })? + open;
-    let dims = header[open + 1..close]
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(|part| part.parse::<usize>())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| {
-            BasisError::InvalidInput(format!(
-                "lazy Pca scores '{}' .npy shape is not integral: {err}",
-                path.display()
-            ))
-        })?;
-    if dims.len() != 2 {
+    if header.shape().len() != 2 {
         crate::bail_invalid_basis!(
             "lazy Pca scores '{}' must have shape (N, K), got {:?}",
             path.display(),
-            dims
+            header.shape()
         );
     }
-    Ok((data_offset, dims[0], dims[1]))
+    let nrows = usize::try_from(header.shape()[0]).map_err(|_| {
+        BasisError::InvalidInput(format!(
+            "lazy Pca scores '{}' row count {} exceeds this platform's address space",
+            path.display(),
+            header.shape()[0]
+        ))
+    })?;
+    let ncols = usize::try_from(header.shape()[1]).map_err(|_| {
+        BasisError::InvalidInput(format!(
+            "lazy Pca scores '{}' column count {} exceeds this platform's address space",
+            path.display(),
+            header.shape()[1]
+        ))
+    })?;
+    let data_offset = usize::try_from(reader.position()).map_err(|_| {
+        BasisError::InvalidInput(format!(
+            "lazy Pca scores '{}' header offset exceeds this platform's address space",
+            path.display()
+        ))
+    })?;
+    Ok((data_offset, nrows, ncols))
 }
 
 pub fn pca_center_mean(x: ArrayView2<'_, f64>) -> Result<Array1<f64>, BasisError> {
@@ -7170,7 +7134,7 @@ pub fn build_pca_smooth_basis(
 
 #[cfg(test)]
 mod pca_function_mass_tests {
-    use super::{PenaltySource, build_pca_smooth_basis};
+    use super::{PenaltySource, build_pca_smooth_basis, parse_f64_2d_npy_header};
     use ndarray::{Array1, Array2, array};
     use std::io::Write;
     use std::path::PathBuf;
@@ -7215,6 +7179,43 @@ mod pca_function_mass_tests {
                 .expect("write .npy score");
         }
         path
+    }
+
+    fn npy_v1_bytes(mut header: String) -> Vec<u8> {
+        while (10 + header.len() + 1) % 16 != 0 {
+            header.push(' ');
+        }
+        header.push('\n');
+        let header_len = u16::try_from(header.len()).expect("test header fits v1");
+        let mut bytes = b"\x93NUMPY".to_vec();
+        bytes.extend_from_slice(&[1, 0]);
+        bytes.extend_from_slice(&header_len.to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn npy_header_parser_uses_exact_ast_fields_2293() {
+        let path = PathBuf::from("scores.npy");
+        let bytes = npy_v1_bytes(
+            "{'shape':(3, 2), 'note':'True', 'descr':'<f8', 'fortran_order':False,}"
+                .to_string(),
+        );
+        let (offset, rows, cols) =
+            parse_f64_2d_npy_header(&bytes, &path).expect("valid reordered header");
+        assert_eq!((rows, cols), (3, 2));
+        assert_eq!(offset, bytes.len());
+
+        for header in [
+            "{'descr':'<f8','fortran_order':True,'shape':(3,2),}",
+            "{'descr':'>f8','fortran_order':False,'shape':(3,2),}",
+            "{'descr':'<f8','shape':(3,2),}",
+            "{'descr':'<f8','fortran_order':'False','shape':(3,2),}",
+            "{'descr':'<f8','fortran_order':False,'shape':(6,),}",
+        ] {
+            let invalid = npy_v1_bytes(header.to_string());
+            assert!(parse_f64_2d_npy_header(&invalid, &path).is_err(), "{header}");
+        }
     }
 
     #[test]
