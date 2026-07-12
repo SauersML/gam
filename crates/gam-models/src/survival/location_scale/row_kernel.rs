@@ -3,8 +3,9 @@ use super::*;
 use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar,
-    MappedOrder2Accumulator, OneSeedBatch, OneSeedLane, Order2, Order2Lane, RuntimeJetScalar,
+    MappedOrder2Accumulator, OneSeedBatch, OneSeedLane, Order2Lane, RuntimeJetScalar,
 };
+use gam_row_macros::row_atom;
 use wide::f64x4;
 
 #[derive(Clone, Copy, Debug)]
@@ -571,25 +572,22 @@ fn sls_outer_plan(kernel: &SurvivalExactRowKernel) -> SlsOuterPlan {
     }
 }
 
-#[inline(always)]
-fn sls_index<const K: usize, S: JetScalar<K>>(h: &S, eta_t: &S, eta_ls: &S) -> S {
-    h.sub(&eta_t.mul(&eta_ls.neg().exp()))
+row_atom! {
+    fn sls_index => sls_index_order2(h, eta_t, eta_ls) {
+        h - eta_t * exp(-eta_ls)
+    }
 }
 
-#[inline(always)]
-fn sls_event_rate<const K: usize, S: JetScalar<K>>(
-    hdot: &S,
-    eta_t: &S,
-    eta_t_deriv: &S,
-    eta_ls: &S,
-    eta_ls_deriv: &S,
-) -> S {
-    hdot.add(
-        &eta_ls
-            .neg()
-            .exp()
-            .mul(&eta_t.mul(eta_ls_deriv).sub(eta_t_deriv)),
-    )
+row_atom! {
+    fn sls_event_rate => sls_event_rate_order2(
+        hdot,
+        eta_t,
+        eta_t_deriv,
+        eta_ls,
+        eta_ls_deriv
+    ) {
+        hdot + exp(-eta_ls) * (eta_t * eta_ls_deriv - eta_t_deriv)
+    }
 }
 
 #[inline(always)]
@@ -620,25 +618,25 @@ fn sls_row_vgh_compiled(
     primary: &[f64; SLS_ROW_K],
     kernel: &SurvivalExactRowKernel,
 ) -> (f64, [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K]) {
-    // Literal local seeds are load-bearing codegen. `array::from_fn` leaves the
-    // five `Order2<5>` identities materialized as a 1,240-byte array in LLVM
-    // IR; naming the live seeds individually removes that aggregate and cuts
-    // the native stack frame by one third while retaining the same axis maps.
-    let entry_h = Order2::variable(primary[SLS_U0_AXES[0]], 0);
-    let entry_t = Order2::variable(primary[SLS_U0_AXES[1]], 1);
-    let entry_ls = Order2::variable(primary[SLS_U0_AXES[2]], 2);
-    let exit_h = Order2::variable(primary[SLS_U1_AXES[0]], 0);
-    let exit_t = Order2::variable(primary[SLS_U1_AXES[1]], 1);
-    let exit_ls = Order2::variable(primary[SLS_U1_AXES[2]], 2);
-    let rate_h = Order2::variable(primary[SLS_G_AXES[0]], 0);
-    let rate_t = Order2::variable(primary[SLS_G_AXES[1]], 1);
-    let rate_td = Order2::variable(primary[SLS_G_AXES[2]], 2);
-    let rate_ls = Order2::variable(primary[SLS_G_AXES[3]], 3);
-    let rate_lsd = Order2::variable(primary[SLS_G_AXES[4]], 4);
-    let u0 = sls_index(&entry_h, &entry_t, &entry_ls);
-    let u1 = sls_index(&exit_h, &exit_t, &exit_ls);
-    let g = sls_event_rate(
-        &rate_h, &rate_t, &rate_td, &rate_ls, &rate_lsd,
+    // These static atoms are symbolically differentiated and CSE'd at build
+    // time from the exact same `row_atom!` expressions used by the generic
+    // high-order jets. Only final live channels exist at runtime.
+    let u0 = sls_index_order2(
+        primary[SLS_U0_AXES[0]],
+        primary[SLS_U0_AXES[1]],
+        primary[SLS_U0_AXES[2]],
+    );
+    let u1 = sls_index_order2(
+        primary[SLS_U1_AXES[0]],
+        primary[SLS_U1_AXES[1]],
+        primary[SLS_U1_AXES[2]],
+    );
+    let g = sls_event_rate_order2(
+        primary[SLS_G_AXES[0]],
+        primary[SLS_G_AXES[1]],
+        primary[SLS_G_AXES[2]],
+        primary[SLS_G_AXES[3]],
+        primary[SLS_G_AXES[4]],
     );
     let plan = sls_outer_plan(kernel);
     let truncate = |stack: [f64; 5]| [stack[0], stack[1], stack[2]];

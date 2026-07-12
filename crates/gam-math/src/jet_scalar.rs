@@ -1374,6 +1374,96 @@ pub struct MappedOrder2Accumulator<const K: usize> {
     hessian: [[f64; K]; K],
 }
 
+/// Compile-time-symbolic value/gradient/Hessian of one local row atom.
+///
+/// The Hessian stores only its upper triangle, in row-major triangular order.
+/// Instances are emitted by `gam-row-macros`; unlike a runtime forward jet,
+/// they contain only final live channels and therefore introduce no seeded
+/// identity arrays, dependency masks, or zero arithmetic.
+#[derive(Clone, Copy, Debug)]
+pub struct StaticOrder2Atom<const N: usize, const H: usize> {
+    value: f64,
+    gradient: [f64; N],
+    hessian: [f64; H],
+}
+
+impl<const N: usize, const H: usize> StaticOrder2Atom<N, H> {
+    /// Construct a generated atom. `H` must equal `N(N+1)/2`.
+    #[inline(always)]
+    #[must_use]
+    pub fn new(value: f64, gradient: [f64; N], hessian: [f64; H]) -> Self {
+        assert!(H == N * (N + 1) / 2, "invalid packed order-two shape");
+        Self {
+            value,
+            gradient,
+            hessian,
+        }
+    }
+
+    /// Scalar value of the generated atom.
+    #[inline(always)]
+    #[must_use]
+    pub fn value(&self) -> f64 {
+        self.value
+    }
+
+    /// Generated local gradient.
+    #[inline(always)]
+    #[must_use]
+    pub fn gradient(&self) -> [f64; N] {
+        self.gradient
+    }
+
+    /// Generated local Hessian entry. The matrix is symmetric.
+    #[inline(always)]
+    #[must_use]
+    pub fn hessian_at(&self, row: usize, column: usize) -> f64 {
+        assert!(row < N && column < N, "static atom Hessian axis out of range");
+        let (row, column) = if row <= column {
+            (row, column)
+        } else {
+            (column, row)
+        };
+        let index = row * (2 * N - row + 1) / 2 + column - row;
+        self.hessian[index]
+    }
+}
+
+/// Order-two channel reader accepted by [`MappedOrder2Accumulator`].
+///
+/// Both ordinary forward jets and build-time-symbolic atoms implement this
+/// interface. The accumulator owns the only global scatter/chain rule.
+pub trait Order2AtomChannels<const N: usize> {
+    /// Local gradient entry.
+    fn gradient_at(&self, axis: usize) -> f64;
+    /// Local Hessian entry.
+    fn hessian_at(&self, row: usize, column: usize) -> f64;
+}
+
+impl<const N: usize> Order2AtomChannels<N> for Order2<N> {
+    #[inline(always)]
+    fn gradient_at(&self, axis: usize) -> f64 {
+        self.0.g[axis]
+    }
+
+    #[inline(always)]
+    fn hessian_at(&self, row: usize, column: usize) -> f64 {
+        self.0.h[row][column]
+    }
+}
+
+impl<const N: usize, const H: usize> Order2AtomChannels<N> for StaticOrder2Atom<N, H> {
+    #[inline(always)]
+    fn gradient_at(&self, axis: usize) -> f64 {
+        self.gradient[axis]
+    }
+
+    #[inline(always)]
+    fn hessian_at(&self, row: usize, column: usize) -> f64 {
+        StaticOrder2Atom::hessian_at(self, row, column)
+    }
+}
+
 impl<const K: usize> MappedOrder2Accumulator<K> {
     /// Empty additive accumulator.
     #[inline(always)]
@@ -1393,9 +1483,9 @@ impl<const K: usize> MappedOrder2Accumulator<K> {
     /// pullback whose identified cross terms need multiplicity that this simple
     /// scatter deliberately does not represent.
     #[inline(always)]
-    pub fn add_composed<const N: usize>(
+    pub fn add_composed<const N: usize, A: Order2AtomChannels<N>>(
         &mut self,
-        atom: &Order2<N>,
+        atom: &A,
         axes: [usize; N],
         derivatives: [f64; 3],
     ) {
@@ -1413,11 +1503,13 @@ impl<const K: usize> MappedOrder2Accumulator<K> {
         self.value += derivatives[0];
         for local_i in 0..N {
             let global_i = axes[local_i];
-            self.gradient[global_i] += derivatives[1] * atom.0.g[local_i];
+            self.gradient[global_i] += derivatives[1] * atom.gradient_at(local_i);
             for local_j in local_i..N {
                 let global_j = axes[local_j];
-                let mut channel = derivatives[1] * atom.0.h[local_i][local_j];
-                channel += derivatives[2] * atom.0.g[local_i] * atom.0.g[local_j];
+                let mut channel = derivatives[1] * atom.hessian_at(local_i, local_j);
+                channel += derivatives[2]
+                    * atom.gradient_at(local_i)
+                    * atom.gradient_at(local_j);
                 self.hessian[global_i][global_j] += channel;
                 if global_i != global_j {
                     self.hessian[global_j][global_i] += channel;

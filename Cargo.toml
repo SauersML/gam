@@ -47,6 +47,7 @@ members = [
     "crates/gam-model-kernels",
     "crates/gam-custom-family",
     "crates/gam-models",
+    "crates/gam-row-macros",
     "crates/gam-inference",
     "crates/gam-report",
     "crates/gam-config",

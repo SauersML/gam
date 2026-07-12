@@ -1,0 +1,19 @@
+[package]
+name = "gam-row-macros"
+version = "0.3.149"
+edition = "2024"
+rust-version = "1.93"
+description = "Build-time symbolic lowering for gam row-program atoms"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/SauersML/gam"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
+syn = { version = "2.0.117", features = ["full"] }
+
+[lints.rust]
+warnings = "deny"
