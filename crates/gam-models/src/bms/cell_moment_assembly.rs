@@ -47,8 +47,8 @@ pub(super) struct EmpiricalBmsRowJetPlan {
     mu_stack: [f64; 5],
     calibration: Vec<EmpiricalBmsCalibrationNodeJetPlan>,
     observed: EmpiricalBmsIndexJetPlan,
-    observed_sign: f64,
-    observed_neglog_stack: [f64; 5],
+    pub(super) observed_sign: f64,
+    pub(super) observed_neglog_stack: [f64; 5],
 }
 
 pub(super) struct EmpiricalBmsRowJetOutput<S> {

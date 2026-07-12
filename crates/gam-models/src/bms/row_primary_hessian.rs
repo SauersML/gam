@@ -3012,11 +3012,12 @@ impl BernoulliMarginalSlopeFamily {
 
         let r = primary.total;
         scratch.reset(need_hessian);
-        if let Some(empirical_grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
+        let empirical_grid = self.latent_measure.empirical_grid_for_training_row(row)?;
+        let empirical_plan = if let Some(grid) = empirical_grid.as_deref() {
             if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
                 return Err("non-finite empirical flexible row context in VGH evaluation".into());
             }
-            let plan = self.empirical_bms_row_jet_plan(
+            Some(self.empirical_bms_row_jet_plan(
                 row,
                 primary,
                 q,
@@ -3024,39 +3025,11 @@ impl BernoulliMarginalSlopeFamily {
                 beta_h,
                 beta_w,
                 row_ctx.intercept,
-                &empirical_grid,
-            )?;
-            let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-            if need_hessian {
-                let (value, gradient, hessian, intercept_gradient) =
-                    self.empirical_bms_row_order2(&plan, &point)?;
-                scratch.grad.assign(&gradient);
-                scratch.hess.assign(&hessian);
-                self.cache_row_intercept_predictor(
-                    row,
-                    plan.intercept_root,
-                    q,
-                    b,
-                    beta_h,
-                    beta_w,
-                    &intercept_gradient,
-                );
-                return Ok(value);
-            }
-            let (value, gradient, intercept_gradient) =
-                self.empirical_bms_row_order1(&plan, &point)?;
-            scratch.grad.assign(&gradient);
-            self.cache_row_intercept_predictor(
-                row,
-                plan.intercept_root,
-                q,
-                b,
-                beta_h,
-                beta_w,
-                &intercept_gradient,
-            );
-            return Ok(value);
-        }
+                grid,
+            )?)
+        } else {
+            None
+        };
         // Reusable per-row coefficient buffers live on the scratch. Resize once
         // if the scratch was constructed for a different primary dimension; the
         // common case is `len == r` so this is a no-op.
@@ -3072,7 +3045,9 @@ impl BernoulliMarginalSlopeFamily {
                 scratch.active_cell_primaries.reserve(r);
             }
         }
-        let a = row_ctx.intercept;
+        let a = empirical_plan
+            .as_ref()
+            .map_or(row_ctx.intercept, |plan| plan.intercept_root);
         let f_a = row_ctx.m_a;
         let y_i = self.y[row];
         let w_i = self.weights[row];
@@ -3101,7 +3076,31 @@ impl BernoulliMarginalSlopeFamily {
         let zero_family: &[[f64; 4]] = scratch.zero_family.as_slice();
         let mut f_aa = 0.0f64;
 
-        {
+        if let Some(grid) = empirical_grid.as_deref() {
+            // Order-two lowering of the canonical empirical row plan. The
+            // sorted grid is compiled into per-cell cubic moments, preserving
+            // O(G + cells·k²) work instead of evaluating a dense runtime jet
+            // once per node. The family authors only the explicit calibration
+            // channels here; the shared implicit pullback below owns the IFT
+            // and observed-NLL chain rules.
+            f_aa = self.flex_grid_calibration_derivs_compiled_jet2(
+                grid,
+                primary,
+                a,
+                b,
+                beta_h,
+                beta_w,
+                need_hessian,
+                coeff_u.as_mut_slice(),
+                coeff_au.as_mut_slice(),
+                coeff_bu.as_mut_slice(),
+                active_cell_primaries,
+                g_u_fixed.as_mut_slice(),
+                f_u,
+                f_au,
+                f_uv,
+            )?;
+        } else {
             // Reuse cached row moments whenever they cover the requested
             // derivative order. Degree-9 moments are exact for gradient-only
             // calls too, and avoiding a second degree-3 cell sweep preserves
@@ -3324,26 +3323,6 @@ impl BernoulliMarginalSlopeFamily {
             f_uv[[0, 0]] = -marginal.mu2;
         }
 
-        let a_u = &mut scratch.a_u;
-        for u in 0..r {
-            a_u[u] = -f_u[u] * inv_ma;
-        }
-        self.cache_row_intercept_predictor(row, a, q, b, beta_h, beta_w, a_u);
-        let a_uv = &mut scratch.a_uv;
-        if need_hessian {
-            for u in 0..r {
-                for v in u..r {
-                    let val = -(f_uv[[u, v]]
-                        + f_au[u] * a_u[v]
-                        + f_au[v] * a_u[u]
-                        + f_aa * a_u[u] * a_u[v])
-                        * inv_ma;
-                    a_uv[[u, v]] = val;
-                    a_uv[[v, u]] = val;
-                }
-            }
-        }
-
         let z_obs = self.z[row];
         let u_obs = a + b * z_obs;
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
@@ -3418,6 +3397,96 @@ impl BernoulliMarginalSlopeFamily {
             zero_family,
             zero_family,
         );
+
+        if let Some(plan) = empirical_plan.as_ref() {
+            let explicit_dimension = r + 1;
+            let mut constraint_gradient = vec![0.0; explicit_dimension];
+            let mut constraint_hessian = vec![0.0; explicit_dimension * explicit_dimension];
+            constraint_gradient[0] = f_a;
+            for u in 0..r {
+                constraint_gradient[u + 1] = f_u[u];
+            }
+            if need_hessian {
+                constraint_hessian[0] = f_aa;
+                for u in 0..r {
+                    let axis = u + 1;
+                    constraint_hessian[axis] = f_au[u];
+                    constraint_hessian[axis * explicit_dimension] = f_au[u];
+                    for v in 0..r {
+                        constraint_hessian
+                            [axis * explicit_dimension + (v + 1)] = f_uv[[u, v]];
+                    }
+                }
+            }
+            let constraint = gam_math::jet_scalar::RuntimeOrder2Channels::new(
+                0.0,
+                constraint_gradient,
+                constraint_hessian,
+            )?;
+
+            // Explicit observed index eta(a, theta) lowered from the same local
+            // cubic spans as `EmpiricalBmsRowJetPlan::index_jet`. Axis zero is
+            // the uneliminated intercept; theta axes are shifted by one.
+            let mut eta_gradient = vec![0.0; explicit_dimension];
+            let mut eta_hessian = vec![0.0; explicit_dimension * explicit_dimension];
+            eta_gradient[0] = chi_obs;
+            for u in 0..r {
+                eta_gradient[u + 1] = eval_coeff4_at(&g_jet.first[u], z_obs);
+            }
+            if need_hessian {
+                eta_hessian[0] = eta_aa_obs;
+                for u in 0..r {
+                    let axis = u + 1;
+                    let eta_au = eval_coeff4_at(&g_jet.a_first[u], z_obs);
+                    eta_hessian[axis] = eta_au;
+                    eta_hessian[axis * explicit_dimension] = eta_au;
+                    for v in u..r {
+                        let other = v + 1;
+                        let eta_uv = eval_coeff4_at(
+                            &g_jet.pair_from_b_family(
+                                g_jet.b_first,
+                                u,
+                                v,
+                                COEFF_SUPPORT_BHW,
+                            ),
+                            z_obs,
+                        );
+                        eta_hessian[axis * explicit_dimension + other] = eta_uv;
+                        eta_hessian[other * explicit_dimension + axis] = eta_uv;
+                    }
+                }
+            }
+            let sign = plan.observed_sign;
+            let mut signed = gam_math::jet_scalar::RuntimeOrder2Channels::new(
+                sign * eta_val,
+                eta_gradient.into_iter().map(|value| sign * value).collect(),
+                eta_hessian.into_iter().map(|value| sign * value).collect(),
+            )?;
+            signed = signed.compose_unary(plan.observed_neglog_stack);
+            let pulled =
+                gam_math::jet_scalar::implicit_pullback_order2(&constraint, &signed, 0)?;
+            for u in 0..r {
+                scratch.grad[u] = pulled.output.gradient[u];
+            }
+            if need_hessian {
+                for u in 0..r {
+                    for v in 0..r {
+                        scratch.hess[[u, v]] = pulled.output.hessian[u * r + v];
+                    }
+                }
+            }
+            let intercept_gradient = Array1::from_vec(pulled.state_gradient);
+            self.cache_row_intercept_predictor(
+                row,
+                a,
+                q,
+                b,
+                beta_h,
+                beta_w,
+                &intercept_gradient,
+            );
+            return Ok(pulled.output.value);
+        }
 
         // `scratch.reset(need_hessian)` at the top of this function zeroed both
         // `rho` and `tau` unconditionally, so no manual fill is needed here.
