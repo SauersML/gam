@@ -86,6 +86,7 @@ pub use evidence::{
     union_per_point_log_density, union_responsibility_split,
 };
 pub use topology_selector::{
+    AdaptiveRungError, AdaptiveRungFailureStage, AdaptiveRungKind, AdaptiveRungOrderFailure,
     AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider, MIXTURE_K_LADDER,
     MixtureRungFit, MixtureRungResult, PredictiveCandidateKind, PredictiveRaceCandidate,
     PredictiveRaceVerdict, RingOfClustersRungFit, RingOfClustersRungResult, STACKING_CV_FOLDS,
@@ -95,8 +96,8 @@ pub use topology_selector::{
     TopologyCandidateSelectionResult, TopologyRaceParallelCandidate, TopologySelectionScoreKind,
     TopologySelectionScoreScale, UnionRungFit, UnionRungResult, adjudicate_predictive_race,
     build_cv_log_density_table, deterministic_cv_folds, deterministic_cv_folds_seeded,
-    fit_mixture_rung, fit_ring_of_clusters_rung, fit_union_candidate, fit_union_rung,
-    mixture_density_provider, parse_union_name, ring_of_clusters_density_provider,
+    fit_free_cluster_rung, fit_mixture_rung, fit_ring_of_clusters_rung, fit_union_candidate,
+    fit_union_rung, mixture_density_provider, parse_union_name, ring_of_clusters_density_provider,
     run_topology_race_parallel, select_topology_candidate_lifecycle, select_topology_with_fit,
     select_topology_with_fit_parallel, tk_normalized_score, union_density_provider,
 };

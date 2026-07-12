@@ -140,10 +140,13 @@ class CentroidCircularOrderingTest(unittest.TestCase):
         def certify_refit(draw: np.ndarray, k: int, seed: int) -> np.ndarray:
             self.assertEqual(k, 3)
             self.assertEqual(seed, 17)
-            for column in range(coords.shape[1]):
-                np.testing.assert_array_equal(
-                    np.sort(draw[:, column]), np.sort(coords[:, column])
-                )
+            if not fitted_inputs:
+                np.testing.assert_array_equal(draw, coords)
+            else:
+                for column in range(coords.shape[1]):
+                    np.testing.assert_array_equal(
+                        np.sort(draw[:, column]), np.sort(coords[:, column])
+                    )
             fitted_inputs.append(draw.copy())
             return np.array([[1.0, 0.0], [-0.5, 0.75], [-0.5, -0.75]])
 
@@ -155,13 +158,17 @@ class CentroidCircularOrderingTest(unittest.TestCase):
             mock.patch.object(
                 _CO,
                 "ring_stats",
-                side_effect=[(0.10, 120.0), (0.20, 120.0), (0.40, 120.0)],
+                side_effect=[
+                    (0.20, 120.0),
+                    (0.10, 120.0),
+                    (0.20, 120.0),
+                    (0.40, 120.0),
+                ],
             ),
         ):
             p_value = _CO.ring_mc_pvalue(
                 coords,
                 3,
-                0.20,
                 n_null=3,
                 control_seed=23,
                 kmeans_seed=17,
@@ -169,10 +176,11 @@ class CentroidCircularOrderingTest(unittest.TestCase):
 
         make_rng.assert_called_once_with(23)
         self.assertEqual(shuffle.calls, 6)
-        self.assertEqual(len(fitted_inputs), 3)
-        np.testing.assert_array_equal(fitted_inputs[0][:, 0], coords[np.roll(base_order, 1), 0])
+        self.assertEqual(len(fitted_inputs), 4)
+        np.testing.assert_array_equal(fitted_inputs[0], coords)
+        np.testing.assert_array_equal(fitted_inputs[1][:, 0], coords[np.roll(base_order, 1), 0])
         np.testing.assert_array_equal(
-            fitted_inputs[0][:, 1], coords[np.roll(base_order[::-1], 2), 1]
+            fitted_inputs[1][:, 1], coords[np.roll(base_order[::-1], 2), 1]
         )
         np.testing.assert_array_equal(coords, pristine)
         self.assertEqual(p_value, 0.75, "ties and the plus-one correction must count")

@@ -1165,6 +1165,24 @@ mod tests {
     }
 
     #[test]
+    fn atom_shape_race_rejects_invalid_folds_before_any_reporting_fit() {
+        // Coincident coordinates would fail the reporting gauge if fitting
+        // began. The fold-contract error must win, proving validation happens
+        // before any full-data or control fit is launched.
+        let coords = Array2::<f64>::zeros((4, 2));
+        for folds in [0usize, 1, 5] {
+            let error = run_atom_shape_race(coords.view(), folds, 11, &[3])
+                .expect_err("shape CV requires 2 <= folds <= n");
+            assert_eq!(
+                error,
+                format!(
+                    "adjudicate_atom_shape: require 2 <= folds <= n; got folds={folds}, n=4"
+                )
+            );
+        }
+    }
+
+    #[test]
     fn ring_of_clusters_owns_discrete_cyclic_verdict_2262() {
         let clusters = 7usize;
         let per_cluster = 40usize;
@@ -2324,15 +2342,9 @@ fn free_mixture_rung_predictive_density(
     ladder: &[usize],
     config: gam::solver::evidence::GaussianMixtureConfig,
 ) -> Result<(usize, Vec<f64>), String> {
-    let rung = gam::solver::fit_mixture_rung(train, ladder, config)?;
-    // Refinement may probe k=1 while bracketing k=2. Euclidean already owns
-    // that identical one-component Gaussian, so the free-cluster class starts
-    // at k=2 in every outer training fold just as it does on the full data.
-    let fit = rung
-        .fits
-        .iter()
-        .find(|fit| fit.k >= 2)
-        .ok_or_else(|| "fold-local mixture selection produced no order k >= 2".to_string())?;
+    let rung = gam::solver::fit_free_cluster_rung(train, ladder, config)
+        .map_err(|error| error.to_string())?;
+    let fit = rung.winner();
     Ok((fit.k, fit.fit.per_point_log_density(eval)?.to_vec()))
 }
 
@@ -2342,7 +2354,8 @@ fn ring_cluster_rung_predictive_density(
     ladder: &[usize],
     config: gam::solver::evidence::GaussianMixtureConfig,
 ) -> Result<(usize, Vec<f64>), String> {
-    let rung = gam::solver::fit_ring_of_clusters_rung(train, ladder, config)?;
+    let rung = gam::solver::fit_ring_of_clusters_rung(train, ladder, config)
+        .map_err(|error| error.to_string())?;
     let fit = rung.winner();
     Ok((fit.k, fit.fit.per_point_log_density(eval)?.to_vec()))
 }
@@ -2426,7 +2439,7 @@ fn run_atom_shape_race(
     use gam::solver::topology_selector::EvidenceCertification;
     use gam::solver::{
         AutoTopologyKind, Headline, PredictiveCandidateKind, PredictiveRaceCandidate,
-        adjudicate_predictive_race, fit_mixture_rung, fit_ring_of_clusters_rung,
+        adjudicate_predictive_race, fit_free_cluster_rung, fit_ring_of_clusters_rung,
     };
 
     if coords.ncols() != 2 {
@@ -2435,8 +2448,14 @@ fn run_atom_shape_race(
             coords.dim()
         ));
     }
-    if coords.nrows() < 4 {
+    let n = coords.nrows();
+    if n < 4 {
         return Err("adjudicate_atom_shape: need at least 4 rows to adjudicate".to_string());
+    }
+    if folds < 2 || folds > n {
+        return Err(format!(
+            "adjudicate_atom_shape: require 2 <= folds <= n; got folds={folds}, n={n}"
+        ));
     }
     if !coords.iter().all(|value| value.is_finite()) {
         return Err("adjudicate_atom_shape: coords must be finite".to_string());
@@ -2446,7 +2465,6 @@ fn run_atom_shape_race(
     // chart and derives its gauge from that fold's training rows alone.
     let reporting_coords = canonical_shape_coordinates(coords)?;
     let raw_coords = coords.to_owned();
-    let n = raw_coords.nrows();
     let config = GaussianMixtureConfig::default();
     // `Euclidean` already is the one-component full Gaussian. Letting the
     // mixture rung choose k=1 inserts the identical predictive density twice,
@@ -2475,20 +2493,16 @@ fn run_atom_shape_race(
             "adjudicate_atom_shape: k_ladder must contain a ring-cluster order k >= 3".to_string(),
         );
     }
-    let mixture = fit_mixture_rung(reporting_coords.view(), &mixture_ladder, config)?;
-    // Local order refinement deliberately probes immediate neighbours and may
-    // therefore fit k=1 while bracketing a k=2 coarse rung.  That fit is useful
-    // to the in-class search but is ineligible for this race: Euclidean already
-    // represents the one-component full Gaussian. Select the best ranked
-    // eligible fit after refinement instead of accidentally reintroducing the
-    // duplicate column we removed from the input ladder.
-    let mixture_winner =
-        mixture.fits.iter().find(|fit| fit.k >= 2).ok_or_else(|| {
-            "shape mixture refinement produced no eligible order k >= 2".to_string()
-        })?;
+    let mixture = fit_free_cluster_rung(reporting_coords.view(), &mixture_ladder, config)
+        .map_err(|error| error.to_string())?;
+    let mixture_winner = mixture.winner();
     let mixture_reporting_k = mixture_winner.k;
-    let ring_clusters =
-        fit_ring_of_clusters_rung(reporting_coords.view(), &ring_cluster_ladder, config)?;
+    let ring_clusters = fit_ring_of_clusters_rung(
+        reporting_coords.view(),
+        &ring_cluster_ladder,
+        config,
+    )
+    .map_err(|error| error.to_string())?;
     let ring_clusters_reporting_k = ring_clusters.winner().k;
     let mixture_fold_orders = std::rc::Rc::new(std::cell::RefCell::new(Vec::with_capacity(folds)));
     let ring_cluster_fold_orders =
@@ -2770,13 +2784,16 @@ pub(crate) fn shape_matched_control_f32<'py>(
 ///
 /// `coords` is the `(n, 2)` intrinsic-coordinate matrix (e.g. `fit.coords[0]`
 /// from `sae_manifold_fit`). `folds`/`seed` control the deterministic CV folding
-/// of the held-out density table. By default, the identical race also runs on
-/// an independent per-dimension shuffle and a covariance-matched Gaussian of
-/// these supplied coordinates; `mean_l0` is then required and is emitted beside
-/// this adjudicator-input false-circle floor. To audit artifacts introduced by
-/// earlier SAE/grouping/PCA stages, generate each control at the pipeline entry
-/// with [`shape_matched_control`] and rerun every stage. Non-dictionary callers
-/// can explicitly disable `matched_controls` and receive no control-rate claim.
+/// of the held-out density table and must satisfy `2 <= folds <= n`. Thus the
+/// default `folds = 5` requires `n >= 5`; with an explicit smaller fold count,
+/// the shape models themselves require `n >= 4`. By default, the identical race
+/// also runs on an independent per-dimension shuffle and a covariance-matched
+/// Gaussian of these supplied coordinates; `mean_l0` is then required and is
+/// emitted beside this adjudicator-input false-circle floor. To audit artifacts
+/// introduced by earlier SAE/grouping/PCA stages, generate each control at the
+/// pipeline entry with [`shape_matched_control`] and rerun every stage.
+/// Non-dictionary callers can explicitly disable `matched_controls` and receive
+/// no control-rate claim.
 ///
 /// #2262 rank-detection diagnostic: when `n_eff`, `ambient_p`, and
 /// `dispersion_r` are all supplied (the atom's occupancy-weighted effective

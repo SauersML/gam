@@ -1337,9 +1337,10 @@ mod tests {
     /// branch and the large-argument scaled-polynomial branch — including
     /// `η ≫ 709`, where the naive `bessel_i0(η).ln()` / `bessel_i1/bessel_i0`
     /// overflow to `+inf` and divide to `NaN` (the #1113 iter-0 ρ-gradient poison).
-    /// The returned `ratio` is the analytic derivative the periodic ARD
-    /// normalizer's ρ-gradient consumes, so a central-difference of the returned
-    /// `log_i0` must reproduce it.
+    /// The returned ratio is the ordinary first derivative of `log I0`, so a
+    /// central difference must reproduce it. Periodic ARD uses the separate
+    /// centered, log-scale derivative because `η·(ratio−1)` is numerically
+    /// singular after this ordinary ratio rounds to one.
     #[test]
     fn bessel_log_i0_and_ratio_is_overflow_free_and_derivative_consistent() {
         // η spanning both branches and well past the e^η overflow threshold.

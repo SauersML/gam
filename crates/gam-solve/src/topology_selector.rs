@@ -1387,14 +1387,142 @@ impl MixtureRungResult {
     }
 }
 
+/// Which adaptive discrete class produced a rung error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdaptiveRungKind {
+    GaussianMixture,
+    RingOfClusters,
+}
+
+impl AdaptiveRungKind {
+    const fn display_name(self) -> &'static str {
+        match self {
+            Self::GaussianMixture => "Gaussian-mixture",
+            Self::RingOfClusters => "ring-of-clusters",
+        }
+    }
+}
+
+/// Stage at which one eligible adaptive-rung order failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdaptiveRungFailureStage {
+    Fit,
+    Evidence,
+}
+
+/// Failure of one specific, eligible order in an adaptive rung.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdaptiveRungOrderFailure {
+    pub k: usize,
+    pub stage: AdaptiveRungFailureStage,
+    pub message: String,
+}
+
+/// A fail-closed adaptive-rung refusal.
+///
+/// Order selection is only meaningful when all evidence values being compared
+/// came from certified fits. A failed order is therefore surfaced, even if a
+/// different order fitted successfully; choosing among the survivors would
+/// silently change the estimand. Likewise, hitting the local-refinement budget
+/// is an explicit refusal rather than an unbracketed best-so-far result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdaptiveRungError {
+    InvalidInput {
+        kind: AdaptiveRungKind,
+        message: String,
+    },
+    OrderFailures {
+        kind: AdaptiveRungKind,
+        failures: Vec<AdaptiveRungOrderFailure>,
+    },
+    RefinementBudgetExhausted {
+        kind: AdaptiveRungKind,
+        best_k: usize,
+        completed_probes: usize,
+    },
+}
+
+impl std::fmt::Display for AdaptiveRungError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInput { kind, message } => {
+                write!(formatter, "invalid {} rung: {message}", kind.display_name())
+            }
+            Self::OrderFailures { kind, failures } => {
+                write!(
+                    formatter,
+                    "{} rung refused because {} eligible order(s) failed",
+                    kind.display_name(),
+                    failures.len()
+                )?;
+                for failure in failures {
+                    write!(
+                        formatter,
+                        "; k={} {:?}: {}",
+                        failure.k, failure.stage, failure.message
+                    )?;
+                }
+                Ok(())
+            }
+            Self::RefinementBudgetExhausted {
+                kind,
+                best_k,
+                completed_probes,
+            } => write!(
+                formatter,
+                "{} rung exhausted its {completed_probes}-probe refinement budget before bracketing k={best_k}",
+                kind.display_name()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AdaptiveRungError {}
+
+fn eligible_adaptive_orders(
+    kind: AdaptiveRungKind,
+    ladder: &[usize],
+    minimum_order: usize,
+    n: usize,
+) -> Result<Vec<usize>, AdaptiveRungError> {
+    if ladder.is_empty() {
+        return Err(AdaptiveRungError::InvalidInput {
+            kind,
+            message: "order ladder must not be empty".to_string(),
+        });
+    }
+    if let Some(&k) = ladder.iter().find(|&&k| k < minimum_order) {
+        return Err(AdaptiveRungError::InvalidInput {
+            kind,
+            message: format!(
+                "order k={k} is outside this class, whose minimum order is k={minimum_order}"
+            ),
+        });
+    }
+    let orders = ladder
+        .iter()
+        .copied()
+        .filter(|&k| k <= n)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if orders.is_empty() {
+        return Err(AdaptiveRungError::InvalidInput {
+            kind,
+            message: format!(
+                "no requested order is eligible for n={n}; need {minimum_order} <= k <= n"
+            ),
+        });
+    }
+    Ok(orders)
+}
+
 /// Hard cap on the number of EXTRA orders the local refinement around the
 /// coarse-ladder winner may probe. Refinement walks one neighbour at a time
 /// and stops as soon as the running winner is bracketed (both immediate
-/// neighbours fitted and worse), so this cap only binds on a pathological
-/// BIC profile that keeps improving monotonically past the ladder — a
-/// regime the BIC parameter price rules out for any real cluster
-/// structure. It exists so the sweep stays a bounded pure function of the
-/// data, never a runaway loop.
+/// neighbours fitted and worse). If the cap binds, the rung returns
+/// [`AdaptiveRungError::RefinementBudgetExhausted`]; it never treats an
+/// unbracketed best-so-far order as a certified winner.
 pub const MIXTURE_REFINEMENT_MAX_PROBES: usize = 16;
 
 /// Fit the discrete-mixture rung over a fixed `k`-ladder, then **refine
@@ -1415,21 +1543,42 @@ pub fn fit_mixture_rung(
     data: ArrayView2<'_, f64>,
     ladder: &[usize],
     config: GaussianMixtureConfig,
-) -> Result<MixtureRungResult, String> {
+) -> Result<MixtureRungResult, AdaptiveRungError> {
+    fit_mixture_rung_with_minimum_order(data, ladder, 1, config)
+}
+
+/// Fit the free-cluster adaptive class. Unlike the general Gaussian-mixture
+/// rung, this class owns only orders `k >= 2`: the one-component full Gaussian
+/// is the Euclidean candidate. The minimum is enforced inside refinement, so a
+/// coarse `k = 2` winner can never be bracketed by an ineligible `k = 1` fit.
+pub fn fit_free_cluster_rung(
+    data: ArrayView2<'_, f64>,
+    ladder: &[usize],
+    config: GaussianMixtureConfig,
+) -> Result<MixtureRungResult, AdaptiveRungError> {
+    fit_mixture_rung_with_minimum_order(data, ladder, 2, config)
+}
+
+fn fit_mixture_rung_with_minimum_order(
+    data: ArrayView2<'_, f64>,
+    ladder: &[usize],
+    minimum_order: usize,
+    config: GaussianMixtureConfig,
+) -> Result<MixtureRungResult, AdaptiveRungError> {
+    let kind = AdaptiveRungKind::GaussianMixture;
     let n = data.nrows();
+    let coarse_orders = eligible_adaptive_orders(kind, ladder, minimum_order, n)?;
     let mut fits: Vec<MixtureRungFit> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
     // Every order ever attempted (fitted OR failed): refinement must not
     // re-propose a failed order forever.
     let mut attempted: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
 
     let try_order = |k: usize,
                      fits: &mut Vec<MixtureRungFit>,
-                     errors: &mut Vec<String>,
-                     attempted: &mut std::collections::BTreeSet<usize>| {
-        if k == 0 || k > n || !attempted.insert(k) {
-            return;
-        }
+                     attempted: &mut std::collections::BTreeSet<usize>|
+     -> Option<AdaptiveRungOrderFailure> {
+        debug_assert!(k >= minimum_order && k <= n && !attempted.contains(&k));
+        attempted.insert(k);
         match fit_gaussian_mixture(data, k, config) {
             Ok(fit) => {
                 let num_parameters = fit.num_free_parameters();
@@ -1441,50 +1590,70 @@ pub fn fit_mixture_rung(
                         num_parameters,
                         bic,
                     });
+                    None
                 } else {
-                    errors.push(format!("mixture k={k} BIC is not finite"));
+                    Some(AdaptiveRungOrderFailure {
+                        k,
+                        stage: AdaptiveRungFailureStage::Evidence,
+                        message: "BIC is not finite".to_string(),
+                    })
                 }
             }
-            Err(e) => errors.push(format!("mixture k={k} fit: {e}")),
+            Err(error) => Some(AdaptiveRungOrderFailure {
+                k,
+                stage: AdaptiveRungFailureStage::Fit,
+                message: error.to_string(),
+            }),
         }
     };
 
-    for &k in ladder {
-        try_order(k, &mut fits, &mut errors, &mut attempted);
+    let mut failures = Vec::new();
+    for k in coarse_orders {
+        if let Some(failure) = try_order(k, &mut fits, &mut attempted) {
+            failures.push(failure);
+        }
     }
-    if fits.is_empty() {
-        return Err(format!(
-            "mixture rung produced no fittable orders{}",
-            if errors.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", errors.join("; "))
-            }
-        ));
+    if !failures.is_empty() {
+        return Err(AdaptiveRungError::OrderFailures { kind, failures });
     }
 
     // Local refinement: bracket the running winner. The running winner uses
     // the same rule as the final ranking (lower BIC, ties to the smaller k), so
     // refinement and ranking can never disagree about who the winner is.
     let mut probes = 0usize;
-    while probes < MIXTURE_REFINEMENT_MAX_PROBES {
-        let best_k = fits
+    loop {
+        let Some(best_k) = fits
             .iter()
             .min_by(|a, b| {
-                a.bic
-                    .partial_cmp(&b.bic)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.k.cmp(&b.k))
+                a.bic.total_cmp(&b.bic).then(a.k.cmp(&b.k))
             })
             .map(|f| f.k)
-            .unwrap_or(1);
-        let next = [best_k.saturating_sub(1), best_k + 1]
+        else {
+            return Err(AdaptiveRungError::InvalidInput {
+                kind,
+                message: "no eligible order produced a fit".to_string(),
+            });
+        };
+        let next = [best_k.checked_sub(1), best_k.checked_add(1)]
             .into_iter()
-            .find(|&k| k >= 1 && k <= n && !attempted.contains(&k));
+            .flatten()
+            .find(|&k| k >= minimum_order && k <= n && !attempted.contains(&k));
         let Some(k) = next else {
             break; // bracketed: both neighbours attempted (or out of range).
         };
-        try_order(k, &mut fits, &mut errors, &mut attempted);
+        if probes == MIXTURE_REFINEMENT_MAX_PROBES {
+            return Err(AdaptiveRungError::RefinementBudgetExhausted {
+                kind,
+                best_k,
+                completed_probes: probes,
+            });
+        }
+        if let Some(failure) = try_order(k, &mut fits, &mut attempted) {
+            return Err(AdaptiveRungError::OrderFailures {
+                kind,
+                failures: vec![failure],
+            });
+        }
         probes += 1;
     }
     // In-class winner-take-all on the BIC scale (lower wins).
@@ -1530,24 +1699,24 @@ impl RingOfClustersRungResult {
 
 /// Fit and locally refine the constrained ring-of-clusters order ladder.
 /// Orders below three are structurally incapable of identifying a circle and
-/// are excluded. Ranking uses the same BIC-form criterion as the free
-/// Gaussian-mixture rung and the smooth parametric shape candidates.
+/// are rejected as outside the class. Ranking uses the same BIC-form criterion
+/// as the free Gaussian-mixture rung and the smooth parametric shape candidates.
 pub fn fit_ring_of_clusters_rung(
     data: ArrayView2<'_, f64>,
     ladder: &[usize],
     config: GaussianMixtureConfig,
-) -> Result<RingOfClustersRungResult, String> {
+) -> Result<RingOfClustersRungResult, AdaptiveRungError> {
+    let kind = AdaptiveRungKind::RingOfClusters;
     let n = data.nrows();
+    let coarse_orders = eligible_adaptive_orders(kind, ladder, 3, n)?;
     let mut fits = Vec::<RingOfClustersRungFit>::new();
-    let mut errors = Vec::<String>::new();
     let mut attempted = std::collections::BTreeSet::<usize>::new();
     let try_order = |k: usize,
                      fits: &mut Vec<RingOfClustersRungFit>,
-                     errors: &mut Vec<String>,
-                     attempted: &mut std::collections::BTreeSet<usize>| {
-        if k < 3 || k > n || !attempted.insert(k) {
-            return;
-        }
+                     attempted: &mut std::collections::BTreeSet<usize>|
+     -> Option<AdaptiveRungOrderFailure> {
+        debug_assert!(k >= 3 && k <= n && !attempted.contains(&k));
+        attempted.insert(k);
         match crate::evidence::fit_ring_gaussian_mixture(data, k, config) {
             Ok(fit) => {
                 let bic = fit.bic();
@@ -1558,45 +1727,65 @@ pub fn fit_ring_of_clusters_rung(
                         bic,
                         fit,
                     });
+                    None
                 } else {
-                    errors.push(format!("ring-of-clusters k={k} BIC is not finite"));
+                    Some(AdaptiveRungOrderFailure {
+                        k,
+                        stage: AdaptiveRungFailureStage::Evidence,
+                        message: "BIC is not finite".to_string(),
+                    })
                 }
             }
-            Err(error) => errors.push(format!("ring-of-clusters k={k} fit: {error}")),
+            Err(message) => Some(AdaptiveRungOrderFailure {
+                k,
+                stage: AdaptiveRungFailureStage::Fit,
+                message,
+            }),
         }
     };
-    for &k in ladder {
-        try_order(k, &mut fits, &mut errors, &mut attempted);
+    let mut failures = Vec::new();
+    for k in coarse_orders {
+        if let Some(failure) = try_order(k, &mut fits, &mut attempted) {
+            failures.push(failure);
+        }
     }
-    if fits.is_empty() {
-        return Err(format!(
-            "ring-of-clusters rung produced no fittable orders{}",
-            if errors.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", errors.join("; "))
-            }
-        ));
+    if !failures.is_empty() {
+        return Err(AdaptiveRungError::OrderFailures { kind, failures });
     }
     let mut probes = 0usize;
-    while probes < MIXTURE_REFINEMENT_MAX_PROBES {
-        let best_k = fits
+    loop {
+        let Some(best_k) = fits
             .iter()
             .min_by(|left, right| {
-                left.bic
-                    .partial_cmp(&right.bic)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(left.k.cmp(&right.k))
+                left.bic.total_cmp(&right.bic).then(left.k.cmp(&right.k))
             })
             .map(|fit| fit.k)
-            .unwrap_or(3);
-        let next = [best_k.saturating_sub(1), best_k + 1]
+        else {
+            return Err(AdaptiveRungError::InvalidInput {
+                kind,
+                message: "no eligible order produced a fit".to_string(),
+            });
+        };
+        let next = [best_k.checked_sub(1), best_k.checked_add(1)]
             .into_iter()
+            .flatten()
             .find(|&k| k >= 3 && k <= n && !attempted.contains(&k));
         let Some(k) = next else {
             break;
         };
-        try_order(k, &mut fits, &mut errors, &mut attempted);
+        if probes == MIXTURE_REFINEMENT_MAX_PROBES {
+            return Err(AdaptiveRungError::RefinementBudgetExhausted {
+                kind,
+                best_k,
+                completed_probes: probes,
+            });
+        }
+        if let Some(failure) = try_order(k, &mut fits, &mut attempted) {
+            return Err(AdaptiveRungError::OrderFailures {
+                kind,
+                failures: vec![failure],
+            });
+        }
         probes += 1;
     }
     let ranked = rank_priority_candidates(
@@ -2076,6 +2265,22 @@ pub fn adjudicate_predictive_race(
     if candidates.is_empty() {
         return Err("predictive race requires at least one candidate".to_string());
     }
+    for (index, candidate) in candidates.iter().enumerate() {
+        if !candidate.negative_log_evidence.is_finite() {
+            return Err(format!(
+                "predictive race candidate {index} ({}) has non-finite negative-log-evidence {:?}",
+                candidate.kind.display_name(),
+                candidate.negative_log_evidence
+            ));
+        }
+        let required_margin = candidate.certification.required_margin();
+        if !required_margin.is_finite() || required_margin < 0.0 {
+            return Err(format!(
+                "predictive race candidate {index} ({}) has invalid certification margin {required_margin:?}; margins must be finite and nonnegative",
+                candidate.kind.display_name()
+            ));
+        }
+    }
     for index in 0..candidates.len() {
         if let Some(first_index) = candidates[..index]
             .iter()
@@ -2107,14 +2312,15 @@ pub fn adjudicate_predictive_race(
         // Same-class: winner-take-all on rank-aware evidence (lower wins).
         let certifications: Vec<EvidenceCertification> =
             candidates.iter().map(|c| c.certification).collect();
-        let mut winner_index = 0usize;
-        let mut best = f64::INFINITY;
-        for (idx, &nle) in evidence.iter().enumerate() {
-            if nle.is_finite() && nle < best {
-                best = nle;
-                winner_index = idx;
-            }
-        }
+        // Every value was validated above, so this reduction cannot silently
+        // retain index zero merely because no comparable value existed.
+        let winner_index = evidence
+            .iter()
+            .enumerate()
+            .min_by(|left, right| left.1.total_cmp(right.1))
+            .map(|(index, _)| index)
+            .ok_or_else(|| "predictive race has no evidence values".to_string())?;
+        let best = evidence[winner_index];
         // Decision-margin contract (#1011 enclosure / #1012 coreset, one seam):
         // the winner's lead over the closest contender must clear the larger of
         // the two candidates' required margins (an exact candidate floors at 0,
@@ -2125,7 +2331,7 @@ pub fn adjudicate_predictive_race(
         // bounds cannot distinguish.
         let mut insufficient_margin: Option<InsufficientRaceMargin> = None;
         for (idx, &nle) in evidence.iter().enumerate() {
-            if idx == winner_index || !nle.is_finite() {
+            if idx == winner_index {
                 continue;
             }
             let lead = nle - best;
@@ -2677,6 +2883,79 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_rungs_reject_out_of_class_orders_before_fitting() {
+        let data = Array2::<f64>::zeros((4, 2));
+        let free_error = fit_free_cluster_rung(
+            data.view(),
+            &[1, 2],
+            GaussianMixtureConfig::default(),
+        )
+        .expect_err("the free-cluster class must own k >= 2 inside the rung");
+        assert!(matches!(
+            &free_error,
+            AdaptiveRungError::InvalidInput {
+                kind: AdaptiveRungKind::GaussianMixture,
+                ..
+            }
+        ));
+        assert!(free_error.to_string().contains("minimum order is k=2"));
+
+        let ring_error = fit_ring_of_clusters_rung(
+            data.view(),
+            &[2, 3],
+            GaussianMixtureConfig::default(),
+        )
+        .expect_err("the ring-cluster class must own k >= 3 inside the rung");
+        assert!(matches!(
+            &ring_error,
+            AdaptiveRungError::InvalidInput {
+                kind: AdaptiveRungKind::RingOfClusters,
+                ..
+            }
+        ));
+        assert!(ring_error.to_string().contains("minimum order is k=3"));
+    }
+
+    #[test]
+    fn adaptive_rungs_expose_every_eligible_coarse_fit_failure() {
+        let data = Array2::<f64>::zeros((4, 2));
+        let invalid_config = GaussianMixtureConfig {
+            max_iter: 0,
+            ..GaussianMixtureConfig::default()
+        };
+        let mixture_error = fit_mixture_rung(data.view(), &[1, 2], invalid_config)
+            .expect_err("one surviving order must not hide another order's failed fit");
+        match mixture_error {
+            AdaptiveRungError::OrderFailures { kind, failures } => {
+                assert_eq!(kind, AdaptiveRungKind::GaussianMixture);
+                assert_eq!(
+                    failures.iter().map(|failure| failure.k).collect::<Vec<_>>(),
+                    vec![1, 2]
+                );
+                assert!(
+                    failures
+                        .iter()
+                        .all(|failure| failure.stage == AdaptiveRungFailureStage::Fit)
+                );
+            }
+            other => panic!("expected typed per-order failures, got {other:?}"),
+        }
+
+        let ring_error = fit_ring_of_clusters_rung(data.view(), &[3, 4], invalid_config)
+            .expect_err("ring orders must also fail closed");
+        match ring_error {
+            AdaptiveRungError::OrderFailures { kind, failures } => {
+                assert_eq!(kind, AdaptiveRungKind::RingOfClusters);
+                assert_eq!(
+                    failures.iter().map(|failure| failure.k).collect::<Vec<_>>(),
+                    vec![3, 4]
+                );
+            }
+            other => panic!("expected typed per-order failures, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn held_out_mixture_candidates_never_change_their_declared_order() {
         let data = Array2::<f64>::zeros((4, 2));
         let mixture = mixture_density_provider(data.view(), 3, GaussianMixtureConfig::default());
@@ -2871,6 +3150,66 @@ mod tests {
         )
         .expect_err("duplicate predictive columns make stacking non-identifiable");
         assert!(error.contains("duplicate candidate \"circle\""), "{error}");
+    }
+
+    #[test]
+    fn predictive_race_rejects_nonfinite_evidence_before_adjudication() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let candidates = vec![
+                PredictiveRaceCandidate {
+                    kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
+                    negative_log_evidence: 1.0,
+                    certification: EvidenceCertification::Exact,
+                    density_provider: trivial_provider(),
+                },
+                PredictiveRaceCandidate {
+                    kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
+                    negative_log_evidence: invalid,
+                    certification: EvidenceCertification::Exact,
+                    density_provider: trivial_provider(),
+                },
+            ];
+            let error = adjudicate_predictive_race(
+                8,
+                candidates,
+                4,
+                STACKING_CV_SEED,
+                StackingConfig::default(),
+            )
+            .expect_err("a non-finite candidate must not be skipped in favor of index zero");
+            assert!(error.contains("candidate 1"), "{error}");
+            assert!(error.contains("non-finite negative-log-evidence"), "{error}");
+        }
+    }
+
+    #[test]
+    fn predictive_race_rejects_invalid_certification_margins() {
+        for invalid in [f64::NAN, f64::INFINITY, -1.0] {
+            let candidates = vec![
+                PredictiveRaceCandidate {
+                    kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
+                    negative_log_evidence: 1.0,
+                    certification: EvidenceCertification::Enclosure { gap: invalid },
+                    density_provider: trivial_provider(),
+                },
+                PredictiveRaceCandidate {
+                    kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
+                    negative_log_evidence: 2.0,
+                    certification: EvidenceCertification::Exact,
+                    density_provider: trivial_provider(),
+                },
+            ];
+            let error = adjudicate_predictive_race(
+                8,
+                candidates,
+                4,
+                STACKING_CV_SEED,
+                StackingConfig::default(),
+            )
+            .expect_err("invalid uncertainty cannot define a race margin");
+            assert!(error.contains("candidate 0"), "{error}");
+            assert!(error.contains("finite and nonnegative"), "{error}");
+        }
     }
 
     /// #1386: the `seed` mixed into the cross-class CV folding is functional, not

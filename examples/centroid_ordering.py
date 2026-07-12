@@ -192,29 +192,10 @@ def ring_stats(centers: np.ndarray) -> tuple[float, float]:
     return cv, float(np.degrees(gaps.max()))
 
 
-def ring_mc_pvalue(coords: np.ndarray, k: int, observed_cv: float,
-                   n_null: int = 2000, control_seed: int = 0,
-                   kmeans_seed: int = 0) -> float:
-    """Conditional-randomization P(null fitted-centroid CV <= observed).
-
-    Every draw independently permutes each coordinate column, preserving both
-    empirical marginals exactly while removing cross-coordinate pairing. The
-    same seeded Lloyd map used for the observation is refitted on every draw.
-    This calibrates the complete statistic: fitted centroids are dependent
-    estimators and must not themselves be treated as iid null observations.
-    Ties count in the lower tail and the plus-one correction is applied once.
-    """
-    points = _finite_points(coords, "coords", 3)
-    k = _positive_integer(k, "k")
-    if k < 3:
-        raise ValueError(f"need k >= 3 centroids to test a ring; got k={k}")
-    if k > points.shape[0]:
-        raise ValueError(f"k={k} exceeds the {points.shape[0]} coordinate rows")
-    if not np.isfinite(observed_cv) or observed_cv < 0.0:
-        raise ValueError(f"observed_cv must be finite and non-negative; got {observed_cv}")
-    n_null = _positive_integer(n_null, "n_null")
-    control_seed = _seed(control_seed)
-    kmeans_seed = _seed(kmeans_seed)
+def _ring_mc_pvalue_from_observed(points: np.ndarray, k: int, observed_cv: float,
+                                  n_null: int, control_seed: int,
+                                  kmeans_seed: int) -> float:
+    """Run the conditional-randomization tail after a coupled observed fit."""
     rng = np.random.default_rng(control_seed)
     base_order = np.arange(points.shape[0])
     row_order = base_order.copy()
@@ -232,6 +213,35 @@ def ring_mc_pvalue(coords: np.ndarray, k: int, observed_cv: float,
         if cv <= observed_cv:
             hits += 1
     return (hits + 1) / (n_null + 1)
+
+
+def ring_mc_pvalue(coords: np.ndarray, k: int, n_null: int = 2000,
+                   control_seed: int = 0, kmeans_seed: int = 0) -> float:
+    """Conditional-randomization P(null fitted-centroid CV <= observed).
+
+    Every draw independently permutes each coordinate column, preserving both
+    empirical marginals exactly while removing cross-coordinate pairing. The
+    observed statistic and every null statistic are fit here with the same
+    seeded Lloyd map. Coupling them in one operation prevents a p-value for one
+    coordinate cloud or seed from being attached to another. Fitted centroids
+    are dependent estimators and must not themselves be treated as iid null
+    observations. Ties count in the lower tail and the plus-one correction is
+    applied once.
+    """
+    points = _finite_points(coords, "coords", 3)
+    k = _positive_integer(k, "k")
+    if k < 3:
+        raise ValueError(f"need k >= 3 centroids to test a ring; got k={k}")
+    if k > points.shape[0]:
+        raise ValueError(f"k={k} exceeds the {points.shape[0]} coordinate rows")
+    n_null = _positive_integer(n_null, "n_null")
+    control_seed = _seed(control_seed)
+    kmeans_seed = _seed(kmeans_seed)
+    observed_centers = kmeans_centroids(points, k, seed=kmeans_seed)
+    observed_cv, _ = ring_stats(observed_centers)
+    return _ring_mc_pvalue_from_observed(
+        points, k, observed_cv, n_null, control_seed, kmeans_seed
+    )
 
 
 def centroid_circular_ordering(coords: np.ndarray, k: int, *, seed: int = 0,
@@ -263,13 +273,13 @@ def centroid_circular_ordering(coords: np.ndarray, k: int, *, seed: int = 0,
     centers = kmeans_centroids(coords, k, seed=seed)
     cv, gap = ring_stats(centers)
     control_seed = seed ^ _CONDITIONAL_RANDOMIZATION_SEED_DOMAIN
-    p = ring_mc_pvalue(
+    p = _ring_mc_pvalue_from_observed(
         coords,
         k,
         cv,
-        n_null=n_null,
-        control_seed=control_seed,
-        kmeans_seed=seed,
+        n_null,
+        control_seed,
+        seed,
     )
     return {
         "k": int(k),
