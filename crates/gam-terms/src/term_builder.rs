@@ -1764,11 +1764,7 @@ pub fn build_smooth_basis(
         for r in 0..n_rows {
             let key: Vec<u64> = views
                 .iter()
-                .map(|v| {
-                    let x = v[r];
-                    let norm = if x == 0.0 { 0.0 } else { x };
-                    norm.to_bits()
-                })
+                .map(|v| gam_data::canonical_level_bits(v[r]))
                 .collect();
             distinct_points.insert(key);
             if distinct_points.len() > 1 {
@@ -3842,8 +3838,7 @@ pub fn unique_count_column(col: ArrayView1<'_, f64>) -> usize {
     use std::collections::HashSet;
     let mut set = HashSet::<u64>::with_capacity(col.len());
     for &v in col {
-        let norm = if v == 0.0 { 0.0 } else { v };
-        set.insert(norm.to_bits());
+        set.insert(gam_data::canonical_level_bits(v));
     }
     set.len().max(1)
 }
@@ -3924,12 +3919,10 @@ fn min_per_group_unique_count(
     use std::collections::{HashMap, HashSet};
     let mut per_group: HashMap<u64, HashSet<u64>> = HashMap::new();
     for (xi, gi) in feature_col.iter().zip(group_col.iter()) {
-        let xnorm = if *xi == 0.0 { 0.0 } else { *xi };
-        let gnorm = if *gi == 0.0 { 0.0 } else { *gi };
         per_group
-            .entry(gnorm.to_bits())
+            .entry(gam_data::canonical_level_bits(*gi))
             .or_default()
-            .insert(xnorm.to_bits());
+            .insert(gam_data::canonical_level_bits(*xi));
     }
     per_group
         .values()
@@ -4832,6 +4825,37 @@ mod tests {
     use gam_data::{DataSchema, SchemaColumn};
     use ndarray::{Array1, Array2};
     use std::collections::BTreeMap;
+
+    /// #2293 regression: distinct-value counting for factor levels must route
+    /// through `gam_data::canonical_level_bits`, so `+0.0` / `-0.0` collapse to
+    /// one level and every NaN payload collapses to one level. The previous
+    /// ad-hoc `if x == 0.0 { 0.0 } else { x }.to_bits()` idiom collapsed signed
+    /// zero but left distinct NaN bit patterns as separate levels, over-counting
+    /// the cardinality that caps a factor/cr marginal's basis.
+    #[test]
+    fn unique_count_column_uses_canonical_level_bits() {
+        // +0.0 and -0.0 are one level; two NaN payloads are one level.
+        let signed_zero = Array1::from(vec![0.0, -0.0, 0.0]);
+        assert_eq!(
+            unique_count_column(signed_zero.view()),
+            1,
+            "+0.0 and -0.0 must collapse to a single level"
+        );
+
+        let nan_a = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan_b = f64::from_bits(0xfff8_0000_0000_dead);
+        assert!(nan_a.is_nan() && nan_b.is_nan() && nan_a.to_bits() != nan_b.to_bits());
+        let nans = Array1::from(vec![nan_a, nan_b]);
+        assert_eq!(
+            unique_count_column(nans.view()),
+            1,
+            "distinct NaN payloads must collapse to a single level"
+        );
+
+        // Ordinary finite values stay distinct.
+        let finite = Array1::from(vec![1.0, 2.0, 2.0, 3.0]);
+        assert_eq!(unique_count_column(finite.view()), 3);
+    }
 
     /// #1867 regression: on sparse 1-D data the generic conditioning cap in
     /// [`default_num_centers`] (`n / COND_N_DIVISOR`) starves a radial
