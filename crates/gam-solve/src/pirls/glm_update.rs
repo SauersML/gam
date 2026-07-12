@@ -475,7 +475,7 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
         }
         ResponseFamily::Tweedie { p } => {
             let p = *p;
-            let phi = fixed_glm_dispersion(likelihood);
+            let phi = fixed_glm_dispersion(likelihood)?;
             if !is_valid_tweedie_power(p) {
                 crate::bail_invalid_estim!(
                     "Tweedie variance power must be finite and strictly between 1 and 2; got {p}",

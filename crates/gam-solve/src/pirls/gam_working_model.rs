@@ -757,7 +757,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         self.update_with_curvature(beta, HessianCurvatureKind::Fisher)
     }
 
-    fn penalized_deviance_scale(&self) -> f64 {
+    fn penalized_deviance_scale(&self) -> Result<f64, EstimationError> {
         // Matches the constant dispersion factor `write_*_working_state` bakes
         // into `self.lastweights` (Gamma `·shape`, Tweedie/fixed-φ Gaussian
         // `/φ`), reading the SAME `self.likelihood` the weights are built from,

@@ -1530,25 +1530,27 @@ pub(crate) fn resolve_effective_rho_prior(configured: &RhoPrior) -> std::borrow:
 pub(crate) fn reml_fixed_glm_dispersion(
     likelihood: &GlmLikelihoodSpec,
 ) -> Result<f64, EstimationError> {
-    let phi = match &likelihood.spec.response {
+    use gam_problem::ResolvedLikelihoodScale as Scale;
+    let resolved = likelihood
+        .resolved_scale()
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+    let phi = match resolved {
         // These likelihoods carry their complete scale in the family geometry:
         // NB through theta, Beta through its precision-dependent likelihood and
         // Hessian. Treating Beta precision as EDM dispersion double-scales EFS.
-        ResponseFamily::Binomial
-        | ResponseFamily::Poisson
-        | ResponseFamily::NegativeBinomial { .. }
-        | ResponseFamily::Beta { .. } => 1.0,
-        ResponseFamily::Gamma | ResponseFamily::Tweedie { .. } | ResponseFamily::Gaussian => {
-            likelihood.fixed_phi().ok_or_else(|| {
-                EstimationError::InvalidInput(format!(
-                    "{} REML fixed-dispersion path requires an explicit dispersion",
-                    likelihood.spec.response.name()
-                ))
-            })?
-        }
-        ResponseFamily::RoystonParmar => {
+        Scale::Unit | Scale::NegativeBinomial { .. } | Scale::BetaPrecision { .. } => 1.0,
+        Scale::FixedGaussian { phi } | Scale::Tweedie { phi, .. } => phi.value(),
+        Scale::Gamma { .. } => resolved
+            .gamma_phi()
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,
+        Scale::ProfiledGaussian => {
             return Err(EstimationError::InvalidInput(
-                "Royston-Parmar is not a GLM fixed-dispersion family".to_string(),
+                "profiled Gaussian has no fixed REML dispersion".to_string(),
+            ));
+        }
+        Scale::NoScalarScale => {
+            return Err(EstimationError::InvalidInput(
+                "family has no scalar GLM dispersion".to_string(),
             ));
         }
     };

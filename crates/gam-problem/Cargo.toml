@@ -21,5 +21,8 @@ rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 
+[dev-dependencies]
+serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
+
 [lints.rust]
 warnings = "deny"

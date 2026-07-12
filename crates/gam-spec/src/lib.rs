@@ -2100,6 +2100,30 @@ impl ResolvedLikelihoodScale {
         }
     }
 
+    pub fn gamma_phi(self) -> Result<f64, InvalidLikelihoodScale> {
+        match self {
+            Self::Gamma {
+                scale: ResolvedGammaScale::Dispersion(phi),
+                ..
+            } => Ok(phi.value()),
+            Self::Gamma {
+                scale: ResolvedGammaScale::Shape(shape),
+                ..
+            } => {
+                let phi = 1.0 / shape.value();
+                if phi.is_finite() && phi > 0.0 {
+                    Ok(phi)
+                } else {
+                    Err(InvalidLikelihoodScale::new(format!(
+                        "Gamma dispersion 1 / shape is not representable for shape={:?}: {phi:?}",
+                        shape.value()
+                    )))
+                }
+            }
+            other => Err(other.wrong_family("a Gamma dispersion")),
+        }
+    }
+
     pub fn tweedie_log_phi(self) -> Result<f64, InvalidLikelihoodScale> {
         match self {
             Self::Tweedie { phi, .. } => Ok(phi.log_value()),
@@ -2359,6 +2383,11 @@ impl GlmLikelihoodSpec {
     }
 
     #[inline]
+    pub fn resolved_gamma_phi(&self) -> Result<f64, InvalidLikelihoodScale> {
+        self.resolved_scale()?.gamma_phi()
+    }
+
+    #[inline]
     pub fn resolved_tweedie_phi(&self) -> Result<f64, InvalidLikelihoodScale> {
         self.resolved_scale()?.tweedie_phi()
     }
@@ -2371,6 +2400,16 @@ impl GlmLikelihoodSpec {
     #[inline]
     pub fn resolved_negbin_theta(&self) -> Result<f64, InvalidLikelihoodScale> {
         self.resolved_scale()?.negative_binomial_theta()
+    }
+
+    #[inline]
+    pub fn resolved_beta_precision(&self) -> Result<f64, InvalidLikelihoodScale> {
+        self.resolved_scale()?.beta_precision()
+    }
+
+    #[inline]
+    pub fn resolved_beta_log_precision(&self) -> Result<f64, InvalidLikelihoodScale> {
+        self.resolved_scale()?.beta_log_precision()
     }
 
     #[inline]

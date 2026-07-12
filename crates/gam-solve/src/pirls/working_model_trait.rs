@@ -47,8 +47,8 @@ pub trait WorkingModel {
     /// built from. `1.0` for families whose weight carries no such factor (the
     /// solver objective is already self-consistent there). See
     /// `curvature::penalized_objective_deviance_scale` and issue #2128.
-    fn penalized_deviance_scale(&self) -> f64 {
-        1.0
+    fn penalized_deviance_scale(&self) -> Result<f64, EstimationError> {
+        Ok(1.0)
     }
 }
 
@@ -324,6 +324,9 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 Ok(())
             }
             (ResponseFamily::Gaussian, _, _) => {
+                let resolved_scale = self
+                    .resolved_scale()
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
                 update_glmvectors(
                     y,
                     eta,
@@ -343,15 +346,16 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 // calculations expect. `ProfiledGaussian` returns `None` here,
                 // preserving the historical "weights == prior" behaviour for
                 // the default profiled case.
-                if let Some(phi) = self.scale.fixed_phi() {
-                    if !(phi.is_finite() && phi > 0.0) {
-                        crate::bail_invalid_estim!(
-                            "Gaussian fixed dispersion phi must be finite and positive (got {})",
-                            phi
-                        );
-                    }
+                if let gam_problem::ResolvedLikelihoodScale::FixedGaussian { phi } = resolved_scale
+                {
+                    let phi = phi.value();
                     if phi != 1.0 {
                         let inv_phi = 1.0 / phi;
+                        if !(inv_phi.is_finite() && inv_phi > 0.0) {
+                            crate::bail_invalid_estim!(
+                                "Gaussian reciprocal dispersion is not representable for phi={phi}: {inv_phi:?}"
+                            );
+                        }
                         weights.mapv_inplace(|w| w * inv_phi);
                     }
                 }
@@ -367,7 +371,8 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                     eta,
                     priorweights,
                     p,
-                    fixed_glm_dispersion(self),
+                    self.resolved_tweedie_phi()
+                        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,
                     mu,
                     weights,
                     z,
@@ -375,8 +380,10 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (ResponseFamily::NegativeBinomial { theta, .. }, _, _) => {
-                let theta = *theta;
+            (ResponseFamily::NegativeBinomial { .. }, _, _) => {
+                let theta = self
+                    .resolved_negbin_theta()
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
                 write_negative_binomial_log_working_state(
                     y,
                     eta,
@@ -389,8 +396,10 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (ResponseFamily::Beta { phi }, _, _) => {
-                let phi = *phi;
+            (ResponseFamily::Beta { .. }, _, _) => {
+                let phi = self
+                    .resolved_beta_precision()
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
                 write_beta_logit_working_state(
                     y,
                     eta,
@@ -403,16 +412,21 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (ResponseFamily::Gamma, _, _) => write_gamma_log_working_state(
-                y,
-                eta,
-                priorweights,
-                self.gamma_shape().unwrap_or(1.0),
-                mu,
-                weights,
-                z,
-                derivatives,
-            ),
+            (ResponseFamily::Gamma, _, _) => {
+                let shape = self
+                    .resolved_gamma_shape()
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+                write_gamma_log_working_state(
+                    y,
+                    eta,
+                    priorweights,
+                    shape,
+                    mu,
+                    weights,
+                    z,
+                    derivatives,
+                )
+            }
             (ResponseFamily::RoystonParmar, _, _) => Err(EstimationError::InvalidInput(
                 "RoystonParmar is survival-specific and not a GLM IRLS family".to_string(),
             )),

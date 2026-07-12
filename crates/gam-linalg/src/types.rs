@@ -45,31 +45,9 @@ impl RidgePolicy {
         Self::SolverOnly
     }
 
-    /// Stabilization is selected independently of smoothing parameters in all
-    /// supported modes. There is no public state that can contradict this.
     #[inline]
-    pub const fn is_rho_independent(self) -> bool {
-        true
-    }
-
-    #[inline]
-    pub const fn includes_objective(self) -> bool {
+    pub const fn accounts_for_objective(self) -> bool {
         !matches!(self, Self::SolverOnly)
-    }
-
-    #[inline]
-    pub const fn includes_quadratic_penalty(self) -> bool {
-        self.includes_objective()
-    }
-
-    #[inline]
-    pub const fn includes_penalty_logdet(self) -> bool {
-        self.includes_objective()
-    }
-
-    #[inline]
-    pub const fn includes_laplace_hessian(self) -> bool {
-        self.includes_objective()
     }
 
     #[inline]
@@ -96,10 +74,7 @@ mod ridge_policy_tests {
     #[test]
     fn exact_policy_is_homogeneous_and_full() {
         let policy = RidgePolicy::exact_full_objective();
-        assert!(policy.is_rho_independent());
-        assert!(policy.includes_quadratic_penalty());
-        assert!(policy.includes_penalty_logdet());
-        assert!(policy.includes_laplace_hessian());
+        assert!(policy.accounts_for_objective());
         assert_eq!(policy.determinant_mode(), Some(RidgeDeterminantMode::Full));
         assert!(!policy.is_approximation());
     }
@@ -107,7 +82,7 @@ mod ridge_policy_tests {
     #[test]
     fn positive_part_policy_is_explicitly_approximate() {
         let policy = RidgePolicy::positive_part_approximate_objective();
-        assert!(policy.includes_objective());
+        assert!(policy.accounts_for_objective());
         assert_eq!(
             policy.determinant_mode(),
             Some(RidgeDeterminantMode::PositivePartApproximation)
@@ -118,10 +93,7 @@ mod ridge_policy_tests {
     #[test]
     fn solver_only_policy_cannot_enter_objective_accounting() {
         let policy = RidgePolicy::solver_only();
-        assert!(!policy.includes_objective());
-        assert!(!policy.includes_quadratic_penalty());
-        assert!(!policy.includes_penalty_logdet());
-        assert!(!policy.includes_laplace_hessian());
+        assert!(!policy.accounts_for_objective());
         assert_eq!(policy.determinant_mode(), None);
     }
 }

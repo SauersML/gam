@@ -13,27 +13,92 @@ pub enum RidgeMatrixForm {
     ScaledIdentity,
 }
 
-/// Concrete ridge metadata stamped into a fitted PIRLS result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidStabilization {
+    reason: String,
+}
+
+impl InvalidStabilization {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for InvalidStabilization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid stabilization metadata: {}", self.reason)
+    }
+}
+
+impl std::error::Error for InvalidStabilization {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct RidgePassportWire {
+    delta: f64,
+    matrix_form: RidgeMatrixForm,
+    policy: RidgePolicy,
+}
+
+/// Validated ridge metadata stamped into a fitted PIRLS result.
+///
+/// Construction and deserialization both reject non-finite or negative
+/// magnitudes; fields are private so invalid state cannot be assembled with a
+/// literal.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RidgePassportWire", into = "RidgePassportWire")]
 pub struct RidgePassport {
-    /// Stabilization magnitude for matrix form `delta * I`.
-    pub delta: f64,
-    pub matrix_form: RidgeMatrixForm,
-    pub policy: RidgePolicy,
+    delta: f64,
+    matrix_form: RidgeMatrixForm,
+    policy: RidgePolicy,
 }
 
 impl RidgePassport {
-    pub const fn scaled_identity(delta: f64, policy: RidgePolicy) -> Self {
+    pub fn scaled_identity(delta: f64, policy: RidgePolicy) -> Result<Self, InvalidStabilization> {
+        if !(delta.is_finite() && delta >= 0.0) {
+            return Err(InvalidStabilization::new(format!(
+                "ridge delta must be finite and non-negative, got {delta:?}"
+            )));
+        }
+        Ok(Self {
+            delta: if delta == 0.0 { 0.0 } else { delta },
+            matrix_form: RidgeMatrixForm::ScaledIdentity,
+            policy,
+        })
+    }
+
+    /// Exact zero-ridge passport; this fixed sentinel has no unchecked input.
+    pub const fn zero(policy: RidgePolicy) -> Self {
         Self {
-            delta,
+            delta: 0.0,
             matrix_form: RidgeMatrixForm::ScaledIdentity,
             policy,
         }
     }
 
     #[inline]
+    pub const fn delta(self) -> f64 {
+        self.delta
+    }
+
+    #[inline]
+    pub const fn matrix_form(self) -> RidgeMatrixForm {
+        self.matrix_form
+    }
+
+    #[inline]
+    pub const fn policy(self) -> RidgePolicy {
+        self.policy
+    }
+
+    #[inline]
     pub const fn penalty_logdet_ridge(self) -> f64 {
-        if self.policy.include_penalty_logdet {
+        if self.policy.accounts_for_objective() {
             self.delta
         } else {
             0.0
@@ -41,11 +106,31 @@ impl RidgePassport {
     }
 
     #[inline]
-    pub const fn laplacehessianridge(self) -> f64 {
-        if self.policy.include_laplacehessian {
+    pub const fn laplace_hessian_ridge(self) -> f64 {
+        if self.policy.accounts_for_objective() {
             self.delta
         } else {
             0.0
+        }
+    }
+}
+
+impl TryFrom<RidgePassportWire> for RidgePassport {
+    type Error = InvalidStabilization;
+
+    fn try_from(wire: RidgePassportWire) -> Result<Self, Self::Error> {
+        let mut passport = Self::scaled_identity(wire.delta, wire.policy)?;
+        passport.matrix_form = wire.matrix_form;
+        Ok(passport)
+    }
+}
+
+impl From<RidgePassport> for RidgePassportWire {
+    fn from(passport: RidgePassport) -> Self {
+        Self {
+            delta: passport.delta,
+            matrix_form: passport.matrix_form,
+            policy: passport.policy,
         }
     }
 }
@@ -83,10 +168,75 @@ impl RidgePassport {
 /// stabilization rules to drive δ from spectral evidence rather than a
 /// condition-number heuristic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "InertiaWire", into = "InertiaWire")]
 pub struct Inertia {
-    pub positive: usize,
-    pub zero: usize,
-    pub negative: usize,
+    positive: usize,
+    zero: usize,
+    negative: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct InertiaWire {
+    positive: usize,
+    zero: usize,
+    negative: usize,
+}
+
+impl Inertia {
+    pub fn new(
+        positive: usize,
+        zero: usize,
+        negative: usize,
+    ) -> Result<Self, InvalidStabilization> {
+        let total = positive
+            .checked_add(zero)
+            .and_then(|value| value.checked_add(negative))
+            .ok_or_else(|| InvalidStabilization::new("inertia count sum overflows usize"))?;
+        if total == 0 {
+            return Err(InvalidStabilization::new(
+                "inertia must describe a non-empty matrix",
+            ));
+        }
+        Ok(Self {
+            positive,
+            zero,
+            negative,
+        })
+    }
+
+    pub const fn positive(self) -> usize {
+        self.positive
+    }
+
+    pub const fn zero(self) -> usize {
+        self.zero
+    }
+
+    pub const fn negative(self) -> usize {
+        self.negative
+    }
+
+    pub fn total(self) -> usize {
+        self.positive + self.zero + self.negative
+    }
+}
+
+impl TryFrom<InertiaWire> for Inertia {
+    type Error = InvalidStabilization;
+
+    fn try_from(wire: InertiaWire) -> Result<Self, Self::Error> {
+        Self::new(wire.positive, wire.zero, wire.negative)
+    }
+}
+
+impl From<Inertia> for InertiaWire {
+    fn from(inertia: Inertia) -> Self {
+        Self {
+            positive: inertia.positive,
+            zero: inertia.zero,
+            negative: inertia.negative,
+        }
+    }
 }
 
 /// Why a stabilization δ was chosen at this site.
@@ -113,11 +263,9 @@ pub enum StabilizationKind {
     SolverDampingOnly,
     /// Added strictly so a linear solve succeeds. The objective/Hessian the
     /// caller sees is unchanged; the perturbation is a property of the
-    /// solver, not the model. `backward_error_bound` is the max change to
-    /// the solution norm imputable to the perturbation, when known.
-    NumericalPerturbation {
-        backward_error_bound: Option<f64>,
-    },
+    /// solver, not the model. Its optional backward-error bound lives on the
+    /// enclosing ledger.
+    NumericalPerturbation,
     /// An explicit part of a downstream approximation, not of the fitted
     /// model. Unlike `NumericalPerturbation`, consumers must not report the
     /// result as if the unperturbed estimand had been evaluated.
@@ -127,20 +275,28 @@ pub enum StabilizationKind {
     ExplicitPrior,
 }
 
-/// Canonical record of a single stabilization δ applied at a single site.
-///
-/// Construct via the helper constructors (`solver_damping`,
-/// `numerical_perturbation`, `explicit_prior`) so the `included_in_*`
-/// invariants are guaranteed to match `kind`. Direct field construction is
-/// public for serialization round-trips only.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct StabilizationLedgerWire {
+    kind: StabilizationKind,
+    delta: f64,
+    matrix_form: RidgeMatrixForm,
+    chosen_by: StabilizationRule,
+    backward_error_bound: Option<f64>,
+    inertia_before: Option<Inertia>,
+    inertia_after: Option<Inertia>,
+}
+
+/// Canonical validated record of one stabilization applied at one site.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "StabilizationLedgerWire", into = "StabilizationLedgerWire")]
 pub struct StabilizationLedger {
-    pub kind: StabilizationKind,
-    pub delta: f64,
-    pub matrix_form: RidgeMatrixForm,
-    pub chosen_by: StabilizationRule,
-    pub inertia_before: Option<Inertia>,
-    pub inertia_after: Option<Inertia>,
+    kind: StabilizationKind,
+    delta: f64,
+    matrix_form: RidgeMatrixForm,
+    chosen_by: StabilizationRule,
+    backward_error_bound: Option<f64>,
+    inertia_before: Option<Inertia>,
+    inertia_after: Option<Inertia>,
 }
 
 impl StabilizationLedger {
@@ -151,6 +307,7 @@ impl StabilizationLedger {
             delta: 0.0,
             matrix_form: RidgeMatrixForm::ScaledIdentity,
             chosen_by: StabilizationRule::FixedConstant,
+            backward_error_bound: None,
             inertia_before: None,
             inertia_after: None,
         }
@@ -159,62 +316,53 @@ impl StabilizationLedger {
     /// LM/TR damping. δ is invisible to the objective, gradient, and any
     /// saved artifact. Asserting this invariant at every read site is the
     /// whole reason the ledger exists.
-    pub const fn solver_damping(delta: f64, chosen_by: StabilizationRule) -> Self {
-        Self {
-            kind: StabilizationKind::SolverDampingOnly,
-            delta,
-            matrix_form: RidgeMatrixForm::ScaledIdentity,
-            chosen_by,
-            inertia_before: None,
-            inertia_after: None,
-        }
+    pub fn solver_damping(
+        delta: f64,
+        chosen_by: StabilizationRule,
+    ) -> Result<Self, InvalidStabilization> {
+        Self::try_new(StabilizationKind::SolverDampingOnly, delta, chosen_by, None)
     }
 
     /// Solver-only perturbation that leaves the objective unchanged. The
     /// caller may attach a backward-error bound when one is available
     /// (e.g. from iterative refinement / Wilkinson-style analysis).
-    pub const fn numerical_perturbation(
+    pub fn numerical_perturbation(
         delta: f64,
         chosen_by: StabilizationRule,
         backward_error_bound: Option<f64>,
-    ) -> Self {
-        Self {
-            kind: StabilizationKind::NumericalPerturbation {
-                backward_error_bound,
-            },
+    ) -> Result<Self, InvalidStabilization> {
+        Self::try_new(
+            StabilizationKind::NumericalPerturbation,
             delta,
-            matrix_form: RidgeMatrixForm::ScaledIdentity,
             chosen_by,
-            inertia_before: None,
-            inertia_after: None,
-        }
+            backward_error_bound,
+        )
     }
 
     /// Ridge declared as part of a downstream approximation (for example the
     /// regularized rho covariance used to place sigma points).
-    pub const fn approximation_only(delta: f64, chosen_by: StabilizationRule) -> Self {
-        Self {
-            kind: StabilizationKind::ApproximationOnly,
-            delta,
-            matrix_form: RidgeMatrixForm::ScaledIdentity,
-            chosen_by,
-            inertia_before: None,
-            inertia_after: None,
-        }
+    pub fn approximation_only(
+        delta: f64,
+        chosen_by: StabilizationRule,
+    ) -> Result<Self, InvalidStabilization> {
+        Self::try_new(StabilizationKind::ApproximationOnly, delta, chosen_by, None)
     }
 
     /// Model-level explicit prior. δ enters every accounting pass: the
     /// quadratic penalty, the Laplace Hessian, the penalty log-determinant,
     /// and serialization.
-    pub const fn explicit_prior(delta: f64, matrix_form: RidgeMatrixForm) -> Self {
-        Self {
-            kind: StabilizationKind::ExplicitPrior,
+    pub fn explicit_prior(
+        delta: f64,
+        matrix_form: RidgeMatrixForm,
+    ) -> Result<Self, InvalidStabilization> {
+        let mut ledger = Self::try_new(
+            StabilizationKind::ExplicitPrior,
             delta,
-            matrix_form,
-            chosen_by: StabilizationRule::UserSpecified,
-            inertia_before: None,
-            inertia_after: None,
-        }
+            StabilizationRule::UserSpecified,
+            None,
+        )?;
+        ledger.matrix_form = matrix_form;
+        Ok(ledger)
     }
 
     /// Bridge from the existing `RidgePassport` so PIRLS-side code (which
@@ -229,24 +377,130 @@ impl StabilizationLedger {
     /// explicit prior. Heterogeneous flag combinations cannot be produced
     /// by the public `RidgePolicy` API and have no inhabitants downstream.
     pub const fn from_passport(passport: RidgePassport) -> Self {
-        let any_included = passport.policy.include_quadratic_penalty
-            || passport.policy.include_laplacehessian
-            || passport.policy.include_penalty_logdet;
-        let kind = if any_included {
+        let kind = if passport.policy.accounts_for_objective() {
             StabilizationKind::ExplicitPrior
         } else {
-            StabilizationKind::NumericalPerturbation {
-                backward_error_bound: None,
-            }
+            StabilizationKind::NumericalPerturbation
         };
         Self {
             kind,
             delta: passport.delta,
             matrix_form: passport.matrix_form,
             chosen_by: StabilizationRule::FixedConstant,
+            backward_error_bound: None,
             inertia_before: None,
             inertia_after: None,
         }
+    }
+
+    fn try_new(
+        kind: StabilizationKind,
+        delta: f64,
+        chosen_by: StabilizationRule,
+        backward_error_bound: Option<f64>,
+    ) -> Result<Self, InvalidStabilization> {
+        if matches!(kind, StabilizationKind::None) {
+            return Err(InvalidStabilization::new(
+                "None stabilization must be constructed with StabilizationLedger::none",
+            ));
+        }
+        if !(delta.is_finite() && delta >= 0.0) {
+            return Err(InvalidStabilization::new(format!(
+                "stabilization delta must be finite and non-negative, got {delta:?}"
+            )));
+        }
+        Self::validate_rule(chosen_by)?;
+        if let Some(bound) = backward_error_bound
+            && !(bound.is_finite() && bound >= 0.0)
+        {
+            return Err(InvalidStabilization::new(format!(
+                "backward-error bound must be finite and non-negative, got {bound:?}"
+            )));
+        }
+        if !matches!(kind, StabilizationKind::NumericalPerturbation)
+            && backward_error_bound.is_some()
+        {
+            return Err(InvalidStabilization::new(
+                "only a numerical perturbation may carry a backward-error bound",
+            ));
+        }
+        Ok(Self {
+            kind,
+            delta: if delta == 0.0 { 0.0 } else { delta },
+            matrix_form: RidgeMatrixForm::ScaledIdentity,
+            chosen_by,
+            backward_error_bound,
+            inertia_before: None,
+            inertia_after: None,
+        })
+    }
+
+    fn validate_rule(rule: StabilizationRule) -> Result<(), InvalidStabilization> {
+        match rule {
+            StabilizationRule::InertiaTarget { spd_floor }
+                if !(spd_floor.is_finite() && spd_floor > 0.0) =>
+            {
+                Err(InvalidStabilization::new(format!(
+                    "inertia-target SPD floor must be finite and strictly positive, got {spd_floor:?}"
+                )))
+            }
+            StabilizationRule::BackoffEscalation { attempts } if attempts == 0 => Err(
+                InvalidStabilization::new("backoff escalation must record at least one attempt"),
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn with_inertia(
+        mut self,
+        before: Option<Inertia>,
+        after: Option<Inertia>,
+    ) -> Result<Self, InvalidStabilization> {
+        if before.is_some() != after.is_some() {
+            return Err(InvalidStabilization::new(
+                "inertia diagnostics must record both the pre- and post-stabilization matrix",
+            ));
+        }
+        if let (Some(before), Some(after)) = (before, after)
+            && before.total() != after.total()
+        {
+            return Err(InvalidStabilization::new(format!(
+                "inertia dimensions disagree: before={}, after={}",
+                before.total(),
+                after.total()
+            )));
+        }
+        self.inertia_before = before;
+        self.inertia_after = after;
+        Ok(self)
+    }
+
+    pub const fn kind(self) -> StabilizationKind {
+        self.kind
+    }
+
+    pub const fn delta(self) -> f64 {
+        self.delta
+    }
+
+    pub const fn matrix_form(self) -> RidgeMatrixForm {
+        self.matrix_form
+    }
+
+    pub const fn chosen_by(self) -> StabilizationRule {
+        self.chosen_by
+    }
+
+    pub const fn backward_error_bound(self) -> Option<f64> {
+        self.backward_error_bound
+    }
+
+    pub const fn inertia_before(self) -> Option<Inertia> {
+        self.inertia_before
+    }
+
+    pub const fn inertia_after(self) -> Option<Inertia> {
+        self.inertia_after
     }
 
     /// δ value to fold into the quadratic penalty term, or 0.0 if this
@@ -258,7 +512,7 @@ impl StabilizationLedger {
             StabilizationKind::ExplicitPrior => self.delta,
             StabilizationKind::None
             | StabilizationKind::SolverDampingOnly
-            | StabilizationKind::NumericalPerturbation { .. }
+            | StabilizationKind::NumericalPerturbation
             | StabilizationKind::ApproximationOnly => 0.0,
         }
     }
@@ -272,7 +526,7 @@ impl StabilizationLedger {
             StabilizationKind::ExplicitPrior => self.delta,
             StabilizationKind::None
             | StabilizationKind::SolverDampingOnly
-            | StabilizationKind::NumericalPerturbation { .. }
+            | StabilizationKind::NumericalPerturbation
             | StabilizationKind::ApproximationOnly => 0.0,
         }
     }
@@ -286,8 +540,57 @@ impl StabilizationLedger {
             StabilizationKind::ExplicitPrior => self.delta,
             StabilizationKind::None
             | StabilizationKind::SolverDampingOnly
-            | StabilizationKind::NumericalPerturbation { .. }
+            | StabilizationKind::NumericalPerturbation
             | StabilizationKind::ApproximationOnly => 0.0,
+        }
+    }
+}
+
+impl TryFrom<StabilizationLedgerWire> for StabilizationLedger {
+    type Error = InvalidStabilization;
+
+    fn try_from(wire: StabilizationLedgerWire) -> Result<Self, Self::Error> {
+        if matches!(wire.kind, StabilizationKind::None) {
+            if wire.delta != 0.0
+                || wire.chosen_by != StabilizationRule::FixedConstant
+                || wire.backward_error_bound.is_some()
+                || wire.inertia_before.is_some()
+                || wire.inertia_after.is_some()
+            {
+                return Err(InvalidStabilization::new(
+                    "None stabilization must have zero delta and no diagnostic payload",
+                ));
+            }
+            return Ok(Self::none());
+        }
+        let mut ledger = Self::try_new(
+            wire.kind,
+            wire.delta,
+            wire.chosen_by,
+            wire.backward_error_bound,
+        )?;
+        if matches!(wire.kind, StabilizationKind::ExplicitPrior)
+            && wire.chosen_by != StabilizationRule::UserSpecified
+        {
+            return Err(InvalidStabilization::new(
+                "an explicit prior must be recorded as user specified",
+            ));
+        }
+        ledger.matrix_form = wire.matrix_form;
+        ledger.with_inertia(wire.inertia_before, wire.inertia_after)
+    }
+}
+
+impl From<StabilizationLedger> for StabilizationLedgerWire {
+    fn from(ledger: StabilizationLedger) -> Self {
+        Self {
+            kind: ledger.kind,
+            delta: ledger.delta,
+            matrix_form: ledger.matrix_form,
+            chosen_by: ledger.chosen_by,
+            backward_error_bound: ledger.backward_error_bound,
+            inertia_before: ledger.inertia_before,
+            inertia_after: ledger.inertia_after,
         }
     }
 }
@@ -619,15 +922,18 @@ mod newtype_tests {
 #[cfg(test)]
 mod ridge_policy_tests {
     use super::{
-        RidgePassport, RidgePolicy, StabilizationKind, StabilizationLedger, StabilizationRule,
+        Inertia, RidgeMatrixForm, RidgePassport, RidgePolicy, StabilizationKind,
+        StabilizationLedger, StabilizationRule,
     };
+    use serde_json::json;
 
     #[test]
     fn solver_only_ridge_policy_stays_off_objective_accounting() {
-        let passport = RidgePassport::scaled_identity(1.0e-4, RidgePolicy::solver_only());
+        let passport = RidgePassport::scaled_identity(1.0e-4, RidgePolicy::solver_only())
+            .expect("finite non-negative ridge");
 
         assert!(
-            !passport.policy.include_quadratic_penalty,
+            !passport.policy().accounts_for_objective(),
             "solver-only ridge must not add a quadratic prior"
         );
         assert_eq!(
@@ -636,21 +942,17 @@ mod ridge_policy_tests {
             "solver-only ridge must not shift the penalty logdet"
         );
         assert_eq!(
-            passport.laplacehessianridge(),
+            passport.laplace_hessian_ridge(),
             0.0,
             "solver-only ridge must not shift the Laplace Hessian"
         );
 
         let ledger = StabilizationLedger::from_passport(passport);
         assert!(
-            matches!(
-                ledger.kind,
-                StabilizationKind::NumericalPerturbation {
-                    backward_error_bound: None
-                }
-            ),
+            matches!(ledger.kind(), StabilizationKind::NumericalPerturbation),
             "solver-only ridge is a numerical perturbation, not an explicit prior"
         );
+        assert_eq!(ledger.backward_error_bound(), None);
         assert_eq!(
             ledger.quadratic_delta(),
             0.0,
@@ -671,11 +973,135 @@ mod ridge_policy_tests {
     #[test]
     fn approximation_ridge_is_passported_without_becoming_a_model_prior() {
         let ledger =
-            StabilizationLedger::approximation_only(1.0e-8, StabilizationRule::FixedConstant);
-        assert!(matches!(ledger.kind, StabilizationKind::ApproximationOnly));
-        assert_eq!(ledger.delta, 1.0e-8);
+            StabilizationLedger::approximation_only(1.0e-8, StabilizationRule::FixedConstant)
+                .expect("valid approximation ridge");
+        assert!(matches!(
+            ledger.kind(),
+            StabilizationKind::ApproximationOnly
+        ));
+        assert_eq!(ledger.delta(), 1.0e-8);
         assert_eq!(ledger.quadratic_delta(), 0.0);
         assert_eq!(ledger.laplace_hessian_delta(), 0.0);
         assert_eq!(ledger.penalty_logdet_delta(), 0.0);
+    }
+
+    #[test]
+    fn stabilization_magnitudes_reject_negative_and_non_finite_values() {
+        for invalid in [-1.0, f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
+            assert!(RidgePassport::scaled_identity(invalid, RidgePolicy::solver_only()).is_err());
+            assert!(
+                StabilizationLedger::solver_damping(invalid, StabilizationRule::FixedConstant)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn serde_cannot_bypass_passport_validation() {
+        let negative = json!({
+            "delta": -1.0,
+            "matrix_form": "ScaledIdentity",
+            "policy": "SolverOnly"
+        });
+        assert!(serde_json::from_value::<RidgePassport>(negative).is_err());
+
+        let passport = RidgePassport::scaled_identity(
+            2.5e-7,
+            RidgePolicy::positive_part_approximate_objective(),
+        )
+        .expect("valid ridge");
+        let roundtrip: RidgePassport =
+            serde_json::from_value(serde_json::to_value(passport).expect("serialize passport"))
+                .expect("deserialize validated passport");
+        assert_eq!(roundtrip, passport);
+    }
+
+    #[test]
+    fn serde_cannot_bypass_ledger_semantics() {
+        let invalid_none = json!({
+            "kind": "None",
+            "delta": 1.0,
+            "matrix_form": "ScaledIdentity",
+            "chosen_by": "FixedConstant",
+            "backward_error_bound": null,
+            "inertia_before": null,
+            "inertia_after": null
+        });
+        assert!(serde_json::from_value::<StabilizationLedger>(invalid_none).is_err());
+
+        let invalid_prior_rule = json!({
+            "kind": "ExplicitPrior",
+            "delta": 1.0,
+            "matrix_form": "ScaledIdentity",
+            "chosen_by": "Heuristic",
+            "backward_error_bound": null,
+            "inertia_before": null,
+            "inertia_after": null
+        });
+        assert!(serde_json::from_value::<StabilizationLedger>(invalid_prior_rule).is_err());
+
+        let bound_on_wrong_kind = json!({
+            "kind": "ApproximationOnly",
+            "delta": 1.0,
+            "matrix_form": "ScaledIdentity",
+            "chosen_by": "FixedConstant",
+            "backward_error_bound": 1.0e-10,
+            "inertia_before": null,
+            "inertia_after": null
+        });
+        assert!(serde_json::from_value::<StabilizationLedger>(bound_on_wrong_kind).is_err());
+    }
+
+    #[test]
+    fn rule_and_inertia_metadata_are_validated() {
+        assert!(
+            StabilizationLedger::solver_damping(
+                1.0,
+                StabilizationRule::InertiaTarget { spd_floor: 0.0 }
+            )
+            .is_err()
+        );
+        assert!(
+            StabilizationLedger::solver_damping(
+                1.0,
+                StabilizationRule::BackoffEscalation { attempts: 0 }
+            )
+            .is_err()
+        );
+        assert!(Inertia::new(0, 0, 0).is_err());
+        assert!(Inertia::new(usize::MAX, 1, 0).is_err());
+
+        let before = Inertia::new(2, 1, 0).expect("valid inertia");
+        let wrong_dimension = Inertia::new(3, 1, 0).expect("valid inertia");
+        let ledger = StabilizationLedger::numerical_perturbation(
+            1.0e-8,
+            StabilizationRule::BackoffEscalation { attempts: 2 },
+            Some(1.0e-12),
+        )
+        .expect("valid perturbation");
+        assert!(ledger.with_inertia(Some(before), None).is_err());
+        assert!(
+            ledger
+                .with_inertia(Some(before), Some(wrong_dimension))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn objective_accounting_is_structural() {
+        let explicit = StabilizationLedger::explicit_prior(0.25, RidgeMatrixForm::ScaledIdentity)
+            .expect("valid explicit prior");
+        assert_eq!(explicit.quadratic_delta(), 0.25);
+        assert_eq!(explicit.laplace_hessian_delta(), 0.25);
+        assert_eq!(explicit.penalty_logdet_delta(), 0.25);
+
+        for policy in [
+            RidgePolicy::exact_full_objective(),
+            RidgePolicy::positive_part_approximate_objective(),
+        ] {
+            let passport = RidgePassport::scaled_identity(0.25, policy).expect("valid ridge");
+            assert_eq!(passport.penalty_logdet_ridge(), 0.25);
+            assert_eq!(passport.laplace_hessian_ridge(), 0.25);
+        }
     }
 }

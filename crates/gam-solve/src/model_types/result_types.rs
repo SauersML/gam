@@ -17,7 +17,7 @@ pub fn dispersion_from_likelihood(
     likelihood: &GlmLikelihoodSpec,
     standard_deviation: f64,
 ) -> Result<Dispersion, EstimationError> {
-    use LikelihoodScaleMetadata as Scale;
+    use gam_problem::ResolvedLikelihoodScale as Scale;
 
     let invalid = |reason: String| {
         EstimationError::InvalidInput(format!(
@@ -26,13 +26,18 @@ pub fn dispersion_from_likelihood(
         ))
     };
     let known = |phi| Dispersion::known(phi).map_err(|err| invalid(err.to_string()));
-    let estimated = |phi| Dispersion::estimated(phi).map_err(|err| invalid(err.to_string()));
+    let estimated_dispersion = |phi| {
+        Dispersion::estimated(phi).map_err(|err| invalid(err.to_string()))
+    };
     let reciprocal = |value, is_estimated| {
         Dispersion::from_reciprocal(value, is_estimated).map_err(|err| invalid(err.to_string()))
     };
+    let resolved = likelihood
+        .resolved_scale()
+        .map_err(|error| invalid(error.to_string()))?;
 
-    match (&likelihood.spec.response, likelihood.scale) {
-        (ResponseFamily::Gaussian, Scale::ProfiledGaussian) => {
+    match resolved {
+        Scale::ProfiledGaussian => {
             if !(standard_deviation.is_finite() && standard_deviation >= 0.0) {
                 return Err(invalid(format!(
                     "profiled Gaussian standard deviation must be finite and non-negative, got {standard_deviation}"
@@ -44,95 +49,49 @@ pub fn dispersion_from_likelihood(
                     "squared profiled Gaussian standard deviation is not representable: {standard_deviation}^2"
                 )));
             }
-            estimated(phi)
+            estimated_dispersion(phi)
         }
-        (ResponseFamily::Gaussian, Scale::FixedDispersion { phi }) => known(phi),
-        (ResponseFamily::Gaussian, scale) => Err(invalid(format!(
-            "Gaussian requires ProfiledGaussian or FixedDispersion metadata, got {scale:?}"
-        ))),
-
-        (ResponseFamily::Gamma, Scale::FixedGammaShape { shape }) => reciprocal(shape, false),
-        (ResponseFamily::Gamma, Scale::EstimatedGammaShape { shape }) => reciprocal(shape, true),
-        (ResponseFamily::Gamma, Scale::FixedDispersion { phi }) => known(phi),
-        (ResponseFamily::Gamma, scale) => Err(invalid(format!(
-            "Gamma requires a resolved shape or fixed dispersion, got {scale:?}"
-        ))),
-
-        (ResponseFamily::Tweedie { .. }, Scale::EstimatedTweediePhi { phi }) => estimated(phi),
-        (ResponseFamily::Tweedie { .. }, Scale::FixedDispersion { phi }) => known(phi),
-        (ResponseFamily::Tweedie { .. }, scale) => Err(invalid(format!(
-            "Tweedie requires resolved EstimatedTweediePhi or FixedDispersion metadata, got {scale:?}"
-        ))),
-
-        (ResponseFamily::Beta { phi }, Scale::EstimatedBetaPhi { phi: metadata_phi }) => {
-            if phi.to_bits() != metadata_phi.to_bits() {
-                return Err(invalid(format!(
-                    "Beta family precision ({phi}) and scale metadata precision ({metadata_phi}) disagree"
-                )));
+        Scale::FixedGaussian { phi } => known(phi.value()),
+        Scale::Unit | Scale::NegativeBinomial { .. } => Ok(Dispersion::UNIT),
+        Scale::Gamma {
+            scale: gam_problem::ResolvedGammaScale::Shape(shape),
+            estimated: is_estimated,
+        } => reciprocal(shape.value(), is_estimated),
+        Scale::Gamma {
+            scale: gam_problem::ResolvedGammaScale::Dispersion(phi),
+            estimated,
+        } => {
+            if estimated {
+                estimated_dispersion(phi.value())
+            } else {
+                known(phi.value())
             }
-            if !(*phi > 0.0 && phi.is_finite()) {
-                return Err(invalid(format!(
-                    "Beta precision must be finite and strictly positive, got {phi}"
-                )));
+        }
+        Scale::Tweedie { phi, estimated } => {
+            if estimated {
+                estimated_dispersion(phi.value())
+            } else {
+                known(phi.value())
             }
-            let beta_dispersion = if *phi >= 1.0 {
-                let inv_precision = 1.0 / *phi;
+        }
+        Scale::BetaPrecision {
+            precision,
+            estimated: is_estimated,
+        } => {
+            let precision = precision.value();
+            let beta_dispersion = if precision >= 1.0 {
+                let inv_precision = 1.0 / precision;
                 inv_precision / (1.0 + inv_precision)
             } else {
-                1.0 / (1.0 + *phi)
+                1.0 / (1.0 + precision)
             };
-            estimated(beta_dispersion)
-        }
-        (ResponseFamily::Beta { .. }, scale) => Err(invalid(format!(
-            "Beta requires resolved precision metadata, got {scale:?}"
-        ))),
-
-        (
-            ResponseFamily::NegativeBinomial {
-                theta,
-                theta_fixed: false,
-            },
-            Scale::EstimatedNegBinTheta {
-                theta: metadata_theta,
-            },
-        )
-        | (
-            ResponseFamily::NegativeBinomial {
-                theta,
-                theta_fixed: true,
-            },
-            Scale::FixedNegBinTheta {
-                theta: metadata_theta,
-            },
-        ) => {
-            if !(theta.is_finite() && *theta > 0.0) {
-                return Err(invalid(format!(
-                    "negative-binomial theta must be finite and positive, got {theta}"
-                )));
+            if is_estimated {
+                estimated_dispersion(beta_dispersion)
+            } else {
+                known(beta_dispersion)
             }
-            if theta.to_bits() != metadata_theta.to_bits() {
-                return Err(invalid(format!(
-                    "negative-binomial family theta ({theta}) and scale metadata theta ({metadata_theta}) disagree"
-                )));
-            }
-            // NB2 has no scalar response dispersion: theta is part of
-            // V(mu)=mu+mu^2/theta and the Fisher working weight already carries
-            // it. Its exponential-family scale is exactly one.
-            Ok(Dispersion::UNIT)
         }
-        (ResponseFamily::NegativeBinomial { .. }, scale) => Err(invalid(format!(
-            "negative-binomial theta ownership is unresolved or inconsistent: {scale:?}"
-        ))),
-
-        (ResponseFamily::Binomial | ResponseFamily::Poisson, Scale::FixedDispersion { phi })
-            if phi.to_bits() == 1.0_f64.to_bits() =>
-        {
-            Ok(Dispersion::UNIT)
-        }
-        (ResponseFamily::Binomial | ResponseFamily::Poisson, scale) => Err(invalid(format!(
-            "fixed-scale count/Bernoulli families require exact unit dispersion metadata, got {scale:?}"
-        ))),
-        (ResponseFamily::RoystonParmar, _) => Err(invalid(
+        Scale::NoScalarScale => Err(invalid(
             "Royston-Parmar has no GLM scalar response dispersion".to_string(),
         )),
     }
@@ -1870,6 +1829,14 @@ impl UnifiedFitResult {
             );
         }
         validate_likelihood_scale_estimation(likelihood_scale)?;
+        if let Some(spec) = likelihood_family.as_ref() {
+            GlmLikelihoodSpec {
+                spec: spec.clone(),
+                scale: likelihood_scale,
+            }
+            .resolved_scale()
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+        }
         ensure_finite_scalar_estimation("fit_result.log_likelihood", log_likelihood)?;
         ensure_finite_scalar_estimation("fit_result.deviance", deviance)?;
         ensure_finite_scalar_estimation("fit_result.reml_score", reml_score)?;

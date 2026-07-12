@@ -662,7 +662,7 @@ where
         // Tweedie/fixed-φ Gaussian 1/φ, else 1). Read AFTER the iter-start
         // `update_with_curvature` above so the once-per-solve Gamma-shape lock is
         // in place; it is constant for the rest of this inner solve.
-        let penalized_dev_scale = model.penalized_deviance_scale();
+        let penalized_dev_scale = model.penalized_deviance_scale()?;
         let current_penalized = penalizedobjective(&state, penalized_dev_scale);
         if current_penalized.is_finite() && current_penalized < min_penalized_deviance {
             min_penalized_deviance = current_penalized;
@@ -2070,7 +2070,7 @@ where
                                 // across this inner solve); read locally since
                                 // this polish branch sits outside the iter-start
                                 // binding's scope.
-                                let polish_dev_scale = model.penalized_deviance_scale();
+                                let polish_dev_scale = model.penalized_deviance_scale()?;
                                 let obj_before = penalizedobjective(&state, polish_dev_scale);
                                 let obj_after =
                                     penalizedobjective(&polished_state, polish_dev_scale);

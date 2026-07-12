@@ -3393,7 +3393,7 @@ impl<'a> RemlState<'a> {
         // links and other GLM families that support the observed Hessian
         // surface (Probit, CLogLog, SAS, BetaLogistic, Mixture, GammaLog).
         let likelihood = &pirls_result.likelihood;
-        let weight_family = pirls::weight_family_for_glm_likelihood(likelihood);
+        let weight_family = pirls::weight_family_for_glm_likelihood(likelihood)?;
         let phi = reml_fixed_glm_dispersion(likelihood)?;
         let dmu_deta = &pirls_result.solve_dmu_deta;
         let d2mu_deta2 = &pirls_result.solve_d2mu_deta2;

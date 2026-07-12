@@ -159,8 +159,28 @@ pub fn exact_hessian_surface_arrays(
 }
 
 #[inline]
-pub(crate) fn fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
-    likelihood.fixed_phi().unwrap_or(1.0)
+pub(crate) fn fixed_glm_dispersion(
+    likelihood: &GlmLikelihoodSpec,
+) -> Result<f64, EstimationError> {
+    use gam_problem::ResolvedLikelihoodScale as Scale;
+
+    let scale = likelihood
+        .resolved_scale()
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+    match scale {
+        // The profiled Gaussian working geometry is intentionally scale-free.
+        Scale::ProfiledGaussian | Scale::Unit | Scale::NegativeBinomial { .. } => Ok(1.0),
+        Scale::FixedGaussian { phi } | Scale::Tweedie { phi, .. } => Ok(phi.value()),
+        Scale::Gamma { .. } => scale
+            .gamma_phi()
+            .map_err(|error| EstimationError::InvalidInput(error.to_string())),
+        // Beta precision is already inside its variance/Fisher geometry; it is
+        // not an exponential-dispersion phi multiplier.
+        Scale::BetaPrecision { .. } => Ok(1.0),
+        Scale::NoScalarScale => Err(EstimationError::InvalidInput(
+            "family has no fixed GLM dispersion".to_string(),
+        )),
+    }
 }
 
 /// The constant dispersion factor `k` the inner IRLS working weight carries but
@@ -190,43 +210,68 @@ pub(crate) fn fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
 ///    Gaussian): the working weight carries no constant dispersion factor absent
 ///    from D, so `k = 1` and the objective is already self-consistent.
 #[inline]
-pub(crate) fn penalized_objective_deviance_scale(likelihood: &GlmLikelihoodSpec) -> f64 {
+pub(crate) fn penalized_objective_deviance_scale(
+    likelihood: &GlmLikelihoodSpec,
+) -> Result<f64, EstimationError> {
+    let resolved = likelihood
+        .resolved_scale()
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     let k = match likelihood.spec.response {
-        ResponseFamily::Gamma => likelihood.gamma_shape().unwrap_or(1.0),
+        ResponseFamily::Gamma => resolved
+            .gamma_shape()
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,
         ResponseFamily::Tweedie { .. } => {
-            let phi = fixed_glm_dispersion(likelihood);
-            if phi.is_finite() && phi > 0.0 {
-                1.0 / phi
-            } else {
-                1.0
-            }
+            let phi = resolved
+                .tweedie_phi()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+            1.0 / phi
         }
-        ResponseFamily::Gaussian => match likelihood.fixed_phi() {
-            Some(phi) if phi.is_finite() && phi > 0.0 && phi != 1.0 => 1.0 / phi,
-            _ => 1.0,
+        ResponseFamily::Gaussian => match resolved {
+            gam_problem::ResolvedLikelihoodScale::ProfiledGaussian => 1.0,
+            gam_problem::ResolvedLikelihoodScale::FixedGaussian { phi } => 1.0 / phi.value(),
+            _ => {
+                return Err(EstimationError::InvalidInput(
+                    "resolved Gaussian scale has the wrong family variant".to_string(),
+                ));
+            }
         },
         _ => 1.0,
     };
-    // The scale multiplies an objective value used only for gain-ratio /
-    // stall-detection ratios; a non-finite or non-positive k would corrupt the
-    // accept test, so fall back to the neutral 1.0 (identical to pre-#2126
-    // behaviour when the shape happened to be 1).
-    if k.is_finite() && k > 0.0 { k } else { 1.0 }
+    if k.is_finite() && k > 0.0 {
+        Ok(k)
+    } else {
+        Err(EstimationError::InvalidInput(format!(
+            "penalized objective deviance scale is not representable: {k:?}"
+        )))
+    }
 }
 
 #[inline]
-pub fn weight_family_for_glm_likelihood(likelihood: &GlmLikelihoodSpec) -> WeightFamily {
+pub fn weight_family_for_glm_likelihood(
+    likelihood: &GlmLikelihoodSpec,
+) -> Result<WeightFamily, EstimationError> {
+    let resolved = likelihood
+        .resolved_scale()
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     match &likelihood.spec.response {
-        ResponseFamily::Gaussian => WeightFamily::Gaussian,
-        ResponseFamily::Poisson => WeightFamily::Poisson,
-        ResponseFamily::Tweedie { p } => WeightFamily::Tweedie { p: *p },
-        ResponseFamily::NegativeBinomial { theta, .. } => {
-            WeightFamily::NegativeBinomial { theta: *theta }
-        }
-        ResponseFamily::Beta { phi } => WeightFamily::Beta { phi: *phi },
-        ResponseFamily::Gamma => WeightFamily::Gamma,
-        ResponseFamily::Binomial => WeightFamily::Binomial,
-        ResponseFamily::RoystonParmar => WeightFamily::Gaussian,
+        ResponseFamily::Gaussian => Ok(WeightFamily::Gaussian),
+        ResponseFamily::Poisson => Ok(WeightFamily::Poisson),
+        ResponseFamily::Tweedie { p } => Ok(WeightFamily::Tweedie { p: *p }),
+        ResponseFamily::NegativeBinomial { .. } => Ok(WeightFamily::NegativeBinomial {
+            theta: resolved
+                .negative_binomial_theta()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,
+        }),
+        ResponseFamily::Beta { .. } => Ok(WeightFamily::Beta {
+            phi: resolved
+                .beta_precision()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,
+        }),
+        ResponseFamily::Gamma => Ok(WeightFamily::Gamma),
+        ResponseFamily::Binomial => Ok(WeightFamily::Binomial),
+        ResponseFamily::RoystonParmar => Err(EstimationError::InvalidInput(
+            "Royston-Parmar is not a GLM weight family".to_string(),
+        )),
     }
 }
 
@@ -317,9 +362,9 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
         *hessian_d = Array1::<f64>::zeros(n);
     }
 
-    let weight_family = weight_family_for_glm_likelihood(likelihood);
+    let weight_family = weight_family_for_glm_likelihood(likelihood)?;
     let weight_link = weight_link_for_inverse_link(inverse_link);
-    let phi = fixed_glm_dispersion(likelihood);
+    let phi = fixed_glm_dispersion(likelihood)?;
 
     // Compute into an indexed certificate buffer before touching caller-owned
     // arrays.  Parallel evaluation stays O(n), while the ordered scan below

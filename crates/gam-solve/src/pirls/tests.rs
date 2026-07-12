@@ -4898,7 +4898,7 @@ mod reporting_loglikelihood_tests {
             } else {
                 (y.clone(), mu.clone())
             };
-            let link = match glm.spec.response {
+            let link = match &glm.spec.response {
                 ResponseFamily::Gaussian => StandardLink::Identity,
                 ResponseFamily::Binomial => StandardLink::Logit,
                 _ => StandardLink::Log,
@@ -4938,8 +4938,8 @@ mod reporting_loglikelihood_tests {
 #[cfg(test)]
 mod tweedie_exact_series_tests {
     use super::super::{
-        tweedie_exact_loglik, tweedie_exact_loglik_total, tweedie_saddlepoint_loglik,
-        tweedie_series_loglik,
+        tweedie_exact_loglik, tweedie_exact_loglik_total,
+        tweedie_saddlepoint_loglik_approximation, tweedie_series_loglik,
     };
     use ndarray::Array1;
     use rand::RngExt;
@@ -5046,7 +5046,7 @@ mod tweedie_exact_series_tests {
         let (mu, phi, p) = (1.0e8_f64, 0.5_f64, 1.5_f64);
         let y = mu;
         let exact = tweedie_exact_loglik(y, mu, 1.0, p, phi);
-        let saddle = tweedie_saddlepoint_loglik(y, mu, 1.0, p, phi);
+        let saddle = tweedie_saddlepoint_loglik_approximation(y, mu, 1.0, p, phi);
         assert!(
             (exact - saddle).abs() < 1e-12,
             "above the index threshold the exact path must equal the saddlepoint: \
@@ -5056,7 +5056,7 @@ mod tweedie_exact_series_tests {
         // saddlepoint to O(1/index) — a seamless (small-gap) crossover, no jump.
         let (mu2, phi2) = (5.0e3_f64, 1.0_f64); // index ≈ 283, below threshold
         let series = tweedie_series_loglik(mu2, mu2, 1.0, p, phi2);
-        let saddle2 = tweedie_saddlepoint_loglik(mu2, mu2, 1.0, p, phi2);
+        let saddle2 = tweedie_saddlepoint_loglik_approximation(mu2, mu2, 1.0, p, phi2);
         assert!(
             (series - saddle2).abs() < 1e-2,
             "series and saddlepoint must agree closely near the crossover: {series} vs {saddle2}"
@@ -5167,7 +5167,9 @@ mod tweedie_exact_series_tests {
         let saddle_obj = |p: f64| {
             let phi = pearson_phi(&y, &mu, p);
             (0..n)
-                .map(|i| tweedie_saddlepoint_loglik(y[i], mu[i], w[i], p, phi))
+                .map(|i| {
+                    tweedie_saddlepoint_loglik_approximation(y[i], mu[i], w[i], p, phi)
+                })
                 .sum::<f64>()
         };
 

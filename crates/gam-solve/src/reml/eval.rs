@@ -283,9 +283,21 @@ pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
         });
     }
 
-    // Gamma dispersion shape: used by the Gamma-Log row kernel. All other
-    // families ignore this parameter; pass 1.0 as the safe default.
-    let gamma_shape = likelihood_spec.gamma_shape().unwrap_or(1.0);
+    // Gamma dispersion shape is required only by the Gamma row kernel. The
+    // current GPU ABI carries a scalar slot for every family, so non-Gamma
+    // admissions use its documented inert value after their own scale contract
+    // has been validated; Gamma can no longer silently inherit that value.
+    let gamma_shape = match likelihood_spec.spec.response {
+        ResponseFamily::Gamma => likelihood_spec
+            .resolved_gamma_shape()
+            .map_err(|error| gam_gpu::gpu_err!("sigma Gamma scale: {error}"))?,
+        _ => {
+            likelihood_spec
+                .resolved_scale()
+                .map_err(|error| gam_gpu::gpu_err!("sigma likelihood scale: {error}"))?;
+            1.0
+        }
+    };
 
     try_gpu_sigma_stream_pool_eval(
         x_dense.view(),

@@ -1833,7 +1833,7 @@ fn full_log_likelihood_row(
     if weight == 0.0 {
         return Ok(0.0);
     }
-    if matches!(likelihood.spec.response, ResponseFamily::Poisson) {
+    if matches!(&likelihood.spec.response, ResponseFamily::Poisson) {
         let saturated = poisson_saturated_log_likelihood(y);
         let weighted_saturated = if saturated == 0.0 {
             0.0
@@ -1926,7 +1926,7 @@ pub fn evaluate_full_log_likelihood_from_eta(
         );
     }
     let log_measure_scale = eta_log_measure_scale(likelihood)?;
-    if matches!(likelihood.spec.response, ResponseFamily::Gaussian) {
+    if matches!(&likelihood.spec.response, ResponseFamily::Gaussian) {
         likelihood.resolved_gaussian_log_phi().map_err(|error| {
             EstimationError::InvalidInput(format!(
                 "fully-normalized Gaussian likelihood requires an explicit positive dispersion: {error}"
@@ -1975,7 +1975,13 @@ pub fn evaluate_full_log_likelihood_from_eta(
 /// kernel's `−w·d/φ` term exactly; this only restores the `−½ln(2πφᵢ y^p)`
 /// prefactor. Homogeneous so `elpd(c·y) − elpd(y) = −n ln c` still holds.
 #[inline]
-pub(crate) fn tweedie_saddlepoint_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
+pub(crate) fn tweedie_saddlepoint_loglik_approximation(
+    yi: f64,
+    mui: f64,
+    w: f64,
+    p: f64,
+    phi: f64,
+) -> f64 {
     if w <= 0.0 {
         // Zero prior weight excludes the observation (the y>0 prefactor's
         // −ln wᵢ would otherwise diverge).
@@ -1987,29 +1993,15 @@ pub(crate) fn tweedie_saddlepoint_loglik(yi: f64, mui: f64, w: f64, p: f64, phi:
         exponent
     } else {
         // φᵢ = φ/w  ⇒  −½ ln(2π (φ/w) y^p).
-        exponent - 0.5 * (LN_2PI + phi.ln() - w.max(f64::MIN_POSITIVE).ln() + p * yi.ln())
+        exponent - 0.5 * (LN_2PI + phi.ln() - w.ln() + p * yi.ln())
     }
 }
-
-/// Dominant-series-index above which the exact compound-Poisson–gamma series is
-/// abandoned for the saddlepoint approximation. The number of series terms
-/// carrying non-negligible mass grows like `√(index)`, while the saddlepoint's
-/// relative error decays like `O(1/index)` (it is the many-jumps CLT limit of the
-/// same density), so beyond this many jumps the series is expensive *and* the
-/// saddlepoint is already exact to far below the resolution of a variance-power
-/// profile. At an index of `10⁴` the series sums `~√(74·index) ≈ 860` terms and
-/// the saddlepoint density is accurate to `~10⁻⁴` — the two agree, so the switch
-/// is seamless. Gating on the *index* (which accounts for the observation `y`,
-/// not just the mean-driven rate λ) also bounds the work for a large-`y`/small-`μ`
-/// outlier whose dominant term sits far above λ.
-const TWEEDIE_SERIES_MAX_INDEX: f64 = 1.0e4;
 
 /// Analytic estimate of the index `k` of the dominant term in the
 /// compound-Poisson–gamma series at one observation — the maximizer of the log
 /// summand `g(k)`, obtained by solving `g'(k)=0` with the leading `ψ(x)≈ln x`
 /// approximation. Reduces to the Poisson rate `λ` when `y=μ` and grows with `y`.
-/// Used both to start the series climb near the peak (so the climb is short at
-/// any magnitude) and to decide the saddlepoint fallback.
+/// Used to start the exact series climb near the peak.
 #[inline]
 fn tweedie_series_peak_index(yi: f64, mui: f64, phi_i: f64, p: f64) -> f64 {
     let two_minus_p = 2.0 - p;
@@ -2029,7 +2021,7 @@ fn tweedie_series_peak_index(yi: f64, mui: f64, phi_i: f64, p: f64) -> f64 {
 /// observation, evaluated by the Jørgensen / Dunn–Smyth infinite-series
 /// representation of the exponential-dispersion normalizer.
 ///
-/// Unlike [`tweedie_saddlepoint_loglik`] — which is asymptotically exact only in
+/// Unlike [`tweedie_saddlepoint_loglik_approximation`] — which is asymptotically exact only in
 /// the many-jumps (large-λ) limit and biases the maximum-likelihood variance
 /// power **low** at small/moderate λ (#2105) — this is the exact normalized
 /// density. It is what a profile likelihood of `p` must optimize (mgcv's
@@ -2127,25 +2119,11 @@ pub(crate) fn tweedie_series_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64)
     f_peak + acc.ln()
 }
 
-/// Exact Tweedie log-density with an automatic saddlepoint fallback in the
-/// large-λ regime (see [`TWEEDIE_SERIES_MAX_LAMBDA`]). Prefer this over
-/// [`tweedie_saddlepoint_loglik`] wherever the *accuracy* of the density in `p`
-/// matters — above all the variance-power profile — and over
-/// [`tweedie_series_loglik`] when the sample can contain arbitrarily large means
-/// (the fallback bounds the per-observation term count).
+/// Exact Tweedie log-density. This never switches to a saddlepoint: callers
+/// selecting an exact likelihood always receive the compound-Poisson–gamma
+/// series named by the API.
 #[inline]
 pub(crate) fn tweedie_exact_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
-    if w <= 0.0 {
-        return 0.0;
-    }
-    let phi_i = phi / w;
-    let peak_index = tweedie_series_peak_index(yi, mui, phi_i, p);
-    // Non-finite dominant index (degenerate μ / φ) or the many-jumps CLT regime:
-    // defer to the saddlepoint, which is well-defined and, at a large index,
-    // exact. The index (not just λ) accounts for a large-y outlier.
-    if !peak_index.is_finite() || peak_index > TWEEDIE_SERIES_MAX_INDEX {
-        return tweedie_saddlepoint_loglik(yi, mui, w, p, phi);
-    }
     tweedie_series_loglik(yi, mui, w, p, phi)
 }
 
