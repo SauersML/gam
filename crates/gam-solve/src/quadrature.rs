@@ -1296,7 +1296,10 @@ fn log_normal_cdf_stable(x: f64) -> f64 {
         let u = -x / SQRT_2;
         -u * u + (0.5 * erfcx_nonnegative(u)).ln()
     } else {
-        gam_math::probability::normal_cdf(x).max(1e-300).ln()
+        // Phi(-8) is about 6e-16, so this branch is strictly positive by
+        // construction. A 1e-300 floor can never activate here and would only
+        // obscure the exact domain argument.
+        gam_math::probability::normal_cdf(x).ln()
     }
 }
 

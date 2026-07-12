@@ -141,7 +141,9 @@ impl NestedPrefixPenalty {
         self.prefix_sizes
             .iter()
             .enumerate()
-            .map(|(k, _)| validated_learnable_weight(self.shell_weights[k], rho[self.rho_indices[k]]))
+            .map(|(k, _)| {
+                validated_learnable_weight(self.shell_weights[k], rho[self.rho_indices[k]])
+            })
             .collect()
     }
 
@@ -181,10 +183,7 @@ impl AnalyticPenalty for NestedPrefixPenalty {
             ));
         }
         for shell in 0..self.prefix_sizes.len() {
-            resolve_learnable_weight(
-                self.shell_weights[shell],
-                rho[self.rho_indices[shell]],
-            )?;
+            resolve_learnable_weight(self.shell_weights[shell], rho[self.rho_indices[shell]])?;
         }
         Ok(())
     }

@@ -522,6 +522,17 @@ pub enum EstimationError {
         upper: f64,
     },
 
+    #[error(
+        "PIRLS row geometry is not representable at row {row}: {quantity} evaluated from \
+         eta={eta:?} produced {value:?}"
+    )]
+    PirlsRowGeometryUnrepresentable {
+        row: usize,
+        quantity: &'static str,
+        eta: f64,
+        value: f64,
+    },
+
     #[error("monotone root solve: {0}")]
     MonotoneRoot(#[from] MonotoneRootError),
 

@@ -3,7 +3,6 @@
 //! tweedie response validators and the special-function helpers they need.
 
 use super::*;
-use gam_problem::MIN_WEIGHT;
 
 #[inline]
 pub(crate) fn standard_inverse_link_jet(
@@ -15,99 +14,192 @@ pub(crate) fn standard_inverse_link_jet(
 
 #[inline]
 pub(crate) fn bernoulli_logit_geometry_from_jet(
-    eta_raw: f64,
-    eta_used: f64,
+    row: usize,
+    eta: f64,
     y: f64,
     priorweight: f64,
     jet: crate::mixture_link::LogitJet5,
-    zero_on_nonsmooth: bool,
-) -> WorkingBernoulliGeometry {
+) -> Result<WorkingBernoulliGeometry, EstimationError> {
+    if !(priorweight.is_finite() && priorweight >= 0.0) {
+        return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+            row,
+            quantity: "prior weight",
+            eta,
+            value: priorweight,
+        });
+    }
+    if !(jet.mu.is_finite()
+        && jet.mu > 0.0
+        && jet.mu < 1.0
+        && jet.d1.is_finite()
+        && jet.d1 > 0.0
+        && jet.d2.is_finite()
+        && jet.d3.is_finite())
+    {
+        return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+            row,
+            quantity: "canonical-logit inverse-link jet",
+            eta,
+            value: jet.mu,
+        });
+    }
     let fisher = jet.d1;
-    let nonsmooth = eta_raw != eta_used || !fisher.is_finite() || fisher < 0.0;
-    let (c, d) = if nonsmooth && zero_on_nonsmooth {
-        (0.0, 0.0)
+    let (weight, z, c, d) = if priorweight == 0.0 {
+        (0.0, eta, 0.0, 0.0)
     } else {
-        (priorweight * jet.d2, priorweight * jet.d3)
+        let weight = priorweight * fisher;
+        let z = bernoulli_exact_working_response(row, eta, y, jet.mu, jet.d1)?;
+        let c = priorweight * jet.d2;
+        let d = priorweight * jet.d3;
+        for (quantity, value) in [
+            ("canonical-logit Fisher weight", weight),
+            ("canonical-logit dW/deta", c),
+            ("canonical-logit d2W/deta2", d),
+        ] {
+            if !value.is_finite() || (quantity.ends_with("weight") && value <= 0.0) {
+                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row,
+                    quantity,
+                    eta,
+                    value,
+                });
+            }
+        }
+        (weight, z, c, d)
     };
-    WorkingBernoulliGeometry {
+    Ok(WorkingBernoulliGeometry {
         mu: jet.mu,
-        weight: priorweight * fisher,
-        z: bernoulli_exact_working_response(eta_used, y, jet.mu, jet.d1),
+        weight,
+        z,
         c,
         d,
+    })
+}
+
+#[inline]
+fn unrepresentable_bernoulli(
+    row: usize,
+    quantity: &'static str,
+    eta: f64,
+    value: f64,
+) -> EstimationError {
+    EstimationError::PirlsRowGeometryUnrepresentable {
+        row,
+        quantity,
+        eta,
+        value,
     }
 }
 
 /// Compute working IRLS geometry for a single Bernoulli observation.
 ///
-/// This helper returns the exact statistical working state. It does not floor
-/// the Fisher mass or the working response for solver conditioning; doing so
-/// would change the model rather than just the Newton system.
-///
-/// The weight returned is the **Fisher** (expected information) weight
-/// W_F = h'(η)² / V(μ). The c and d fields are likewise the Fisher
-/// derivatives c_F = dW_F/dη and d_F = d²W_F/dη².
-///
-/// NOTE: For non-canonical links (probit, cloglog, SAS, mixture), the
-/// observed weight differs:
-///   W_obs = W_F − (y−μ) · B,  B = (h''V − h'²V') / V²
-/// The observed c/d include residual-dependent corrections. PIRLS keeps
-/// these Fisher carriers for the score-side RHS `X'W(z-eta) - S beta`,
-/// while the Newton/Laplace Hessian side may switch to the observed,
-/// clamped curvature surface. The accepted Hessian-side c/d arrays are
-/// stored separately in `PirlsResult::solve_c_array` / `solve_d_array`
-/// and consumed directly by the REML/LAML exact-derivative code.
+/// The returned quantities are exact values of one smooth inverse-link
+/// surface.  If the response variance, score carrier, or Fisher-weight jet is
+/// not representable, the row is refused instead of being replaced with zero
+/// curvature or a projected working response.
 #[inline]
 pub(crate) fn bernoulli_geometry_from_jet(
-    eta_raw: f64,
-    eta_used: f64,
+    row: usize,
+    eta: f64,
     y: f64,
     priorweight: f64,
     jet: MixtureInverseLinkJet,
-) -> WorkingBernoulliGeometry {
+) -> Result<WorkingBernoulliGeometry, EstimationError> {
+    if !(priorweight.is_finite() && priorweight >= 0.0) {
+        return Err(unrepresentable_bernoulli(
+            row,
+            "prior weight",
+            eta,
+            priorweight,
+        ));
+    }
+    if !(jet.mu.is_finite()
+        && jet.mu > 0.0
+        && jet.mu < 1.0
+        && jet.d1.is_finite()
+        && jet.d1 > 0.0
+        && jet.d2.is_finite()
+        && jet.d3.is_finite())
+    {
+        return Err(unrepresentable_bernoulli(
+            row,
+            "inverse-link jet",
+            eta,
+            jet.mu,
+        ));
+    }
     let mu = jet.mu;
     let v = mu * (1.0 - mu);
+    if !(v.is_finite() && v > 0.0) {
+        return Err(unrepresentable_bernoulli(
+            row,
+            "Bernoulli variance",
+            eta,
+            v,
+        ));
+    }
+    if priorweight == 0.0 {
+        return Ok(WorkingBernoulliGeometry {
+            mu,
+            weight: 0.0,
+            z: eta,
+            c: 0.0,
+            d: 0.0,
+        });
+    }
     let n0 = jet.d1 * jet.d1;
-    let fisher = if v.is_finite() && v > 0.0 {
-        n0 / v
-    } else {
-        0.0
-    };
-    let nonsmooth =
-        eta_raw != eta_used || !v.is_finite() || v <= 0.0 || !fisher.is_finite() || fisher < 0.0;
-    let (c, d) = if nonsmooth {
-        (0.0, 0.0)
-    } else {
-        let v1 = jet.d1 * (1.0 - 2.0 * mu);
-        let v2 = jet.d2 * (1.0 - 2.0 * mu) - 2.0 * jet.d1 * jet.d1;
-        let n1 = 2.0 * jet.d1 * jet.d2;
-        let n2 = 2.0 * (jet.d2 * jet.d2 + jet.d1 * jet.d3);
-        let numer1 = n1 * v - n0 * v1;
-        let c = priorweight * numer1 / (v * v);
-        let d = priorweight * ((n2 * v - n0 * v2) / (v * v) - 2.0 * numer1 * v1 / (v * v * v));
-        (c, d)
-    };
-    WorkingBernoulliGeometry {
+    let fisher = n0 / v;
+    let weight = priorweight * fisher;
+    if !(fisher.is_finite() && fisher > 0.0 && weight.is_finite() && weight > 0.0) {
+        return Err(unrepresentable_bernoulli(
+            row,
+            "Bernoulli Fisher weight",
+            eta,
+            weight,
+        ));
+    }
+    let v1 = jet.d1 * (1.0 - 2.0 * mu);
+    let v2 = jet.d2 * (1.0 - 2.0 * mu) - 2.0 * jet.d1 * jet.d1;
+    let n1 = 2.0 * jet.d1 * jet.d2;
+    let n2 = 2.0 * (jet.d2 * jet.d2 + jet.d1 * jet.d3);
+    let numer1 = n1 * v - n0 * v1;
+    let c = priorweight * numer1 / (v * v);
+    let d = priorweight
+        * ((n2 * v - n0 * v2) / (v * v) - 2.0 * numer1 * v1 / (v * v * v));
+    if !c.is_finite() {
+        return Err(unrepresentable_bernoulli(row, "dW/deta", eta, c));
+    }
+    if !d.is_finite() {
+        return Err(unrepresentable_bernoulli(row, "d2W/deta2", eta, d));
+    }
+    Ok(WorkingBernoulliGeometry {
         mu,
-        weight: priorweight * fisher,
-        z: bernoulli_exact_working_response(eta_used, y, mu, jet.d1),
+        weight,
+        z: bernoulli_exact_working_response(row, eta, y, mu, jet.d1)?,
         c,
         d,
-    }
+    })
 }
 
 #[inline]
-pub(crate) fn bernoulli_exact_working_response(eta: f64, y: f64, mu: f64, dmu_deta: f64) -> f64 {
-    // Preserve the exact IRLS score carrier W(z-eta) = y-mu whenever the link
-    // jet is finite. Numerical conditioning belongs in the linear solve, not in
-    // the Bernoulli likelihood geometry.
-    if dmu_deta.is_finite() && dmu_deta > 0.0 {
-        let delta = (y - mu) / dmu_deta;
-        if delta.is_finite() {
-            return eta + delta;
-        }
+pub(crate) fn bernoulli_exact_working_response(
+    row: usize,
+    eta: f64,
+    y: f64,
+    mu: f64,
+    dmu_deta: f64,
+) -> Result<f64, EstimationError> {
+    let z = eta + (y - mu) / dmu_deta;
+    if z.is_finite() {
+        Ok(z)
+    } else {
+        Err(unrepresentable_bernoulli(
+            row,
+            "Bernoulli working response",
+            eta,
+            z,
+        ))
     }
-    eta
 }
 
 #[inline]
@@ -145,7 +237,8 @@ pub(crate) fn write_poisson_log_working_state(
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
-) {
+) -> Result<(), EstimationError> {
+    validate_count_responses(&y, &priorweights, "Poisson")?;
     log_link_working_state::write_log_link_working_state(
         &log_link_working_state::LogLinkRule {
             weight: log_link_working_state::WorkingWeight::PoissonIdentity,
@@ -153,8 +246,6 @@ pub(crate) fn write_poisson_log_working_state(
                 c_ratio: 1.0,
                 d_ratio: 1.0,
             },
-            floor_weight: true,
-            zero_mu_jet_on_clamp: false,
         },
         y,
         eta,
@@ -163,7 +254,7 @@ pub(crate) fn write_poisson_log_working_state(
         weights,
         z,
         derivatives,
-    );
+    )
 }
 
 /// Working state for Gamma(shape = k) with a log link.
@@ -181,7 +272,10 @@ pub(crate) fn write_gamma_log_working_state(
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
-) {
+) -> Result<(), EstimationError> {
+    if !(shape.is_finite() && shape > 0.0) {
+        crate::bail_invalid_estim!("Gamma shape must be finite and > 0; got {shape}");
+    }
     log_link_working_state::write_log_link_working_state(
         &log_link_working_state::LogLinkRule {
             weight: log_link_working_state::WorkingWeight::Constant { factor: shape },
@@ -189,8 +283,6 @@ pub(crate) fn write_gamma_log_working_state(
                 c_ratio: 0.0,
                 d_ratio: 0.0,
             },
-            floor_weight: false,
-            zero_mu_jet_on_clamp: false,
         },
         y,
         eta,
@@ -199,17 +291,14 @@ pub(crate) fn write_gamma_log_working_state(
         weights,
         z,
         derivatives,
-    );
+    )
 }
 
 pub const BETA_MU_EPS: f64 = 1.0e-12;
 
 #[inline]
 pub(crate) fn tweedie_log_weight_mu_power(mu: f64, p: f64) -> f64 {
-    // Match the 1e-300 MIN_DEVIANCE floor used by the REML deviance path:
-    // smaller positive mu values are below a non-degenerate f64 likelihood
-    // contribution, but flooring here keeps mu^(2-p) away from underflow.
-    mu.max(1.0e-300).powf(2.0 - p)
+    mu.powf(2.0 - p)
 }
 
 #[inline]
@@ -367,9 +456,8 @@ pub(crate) fn beta_logit_working_curvature_eta_derivatives(
 /// Working state for Tweedie with a log link.
 ///
 /// With `mu = exp(eta)`, `V(mu) = phi * mu^p`, and `g'(mu) = 1 / mu`, the Fisher
-/// working weight is `mu^(2-p) / phi`, scaled by prior weight. The `mu`-jet must
-/// be zeroed when `eta` is clamped because the fractional power makes the local
-/// jet unreliable there. Parameter ranges and responses are validated up front.
+/// working weight is `mu^(2-p) / phi`, scaled by prior weight. Parameter ranges,
+/// responses, and every represented row quantity are validated up front.
 #[inline]
 pub(crate) fn write_tweedie_log_working_state(
     y: ArrayView1<f64>,
@@ -403,8 +491,6 @@ pub(crate) fn write_tweedie_log_working_state(
                 c_ratio: exponent,
                 d_ratio: exponent * exponent,
             },
-            floor_weight: true,
-            zero_mu_jet_on_clamp: true,
         },
         y,
         eta,
@@ -413,8 +499,7 @@ pub(crate) fn write_tweedie_log_working_state(
         weights,
         z,
         derivatives,
-    );
-    Ok(())
+    )
 }
 
 /// Working state for NB(mu, theta) with a log link and fixed theta.
@@ -445,8 +530,6 @@ pub(crate) fn write_negative_binomial_log_working_state(
         &log_link_working_state::LogLinkRule {
             weight: log_link_working_state::WorkingWeight::NegativeBinomial { theta },
             curvature: log_link_working_state::WorkingCurvature::NegativeBinomial { theta },
-            floor_weight: true,
-            zero_mu_jet_on_clamp: false,
         },
         y,
         eta,
@@ -455,8 +538,7 @@ pub(crate) fn write_negative_binomial_log_working_state(
         weights,
         z,
         derivatives,
-    );
-    Ok(())
+    )
 }
 
 /// Working state for Beta(mu * phi, (1 - mu) * phi) with a logit link.

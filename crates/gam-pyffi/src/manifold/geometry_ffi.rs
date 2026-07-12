@@ -2943,6 +2943,7 @@ impl ParametricAuxConditionalPriorPenalty {
         .map_err(py_value_error)?;
         let flat: Array1<f64> = view.iter().copied().collect();
         let rho = Array1::<f64>::zeros(0);
+        penalty.validate_rho(rho.view()).map_err(py_value_error)?;
         let value = penalty.value(flat.view(), rho.view());
         let grad_flat = penalty.grad_target(flat.view(), rho.view());
         let grad = grad_flat
@@ -3321,6 +3322,7 @@ impl IvaeRidgeMeanGauge {
         .map_err(py_value_error)?;
         let flat: Array1<f64> = view.iter().copied().collect();
         let rho = Array1::<f64>::zeros(0);
+        penalty.validate_rho(rho.view()).map_err(py_value_error)?;
         let value = penalty.value(flat.view(), rho.view());
         let grad_flat = penalty.grad_target(flat.view(), rho.view());
         let grad = grad_flat
@@ -3523,6 +3525,7 @@ impl MechanismSparsityPenalty {
         .map_err(py_value_error)?;
         let flat: Array1<f64> = view.iter().copied().collect();
         let rho = Array1::<f64>::zeros(0);
+        penalty.validate_rho(rho.view()).map_err(py_value_error)?;
         let value = penalty.value(flat.view(), rho.view());
         let grad_flat = penalty.grad_target(flat.view(), rho.view());
         let grad = grad_flat
@@ -4224,6 +4227,7 @@ impl AuxConditionalPriorPenalty {
                 .map_err(py_value_error)?;
         let flat: Array1<f64> = view.iter().copied().collect();
         let rho = Array1::<f64>::zeros(0);
+        penalty.validate_rho(rho.view()).map_err(py_value_error)?;
         let value = penalty.value(flat.view(), rho.view());
         let grad_flat = penalty.grad_target(flat.view(), rho.view());
         let grad = grad_flat

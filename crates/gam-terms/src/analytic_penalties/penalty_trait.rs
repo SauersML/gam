@@ -63,13 +63,10 @@ impl PsiSlice {
 /// large legal coordinate.
 pub fn resolve_learnable_weight(base_weight: f64, rho: f64) -> Result<f64, String> {
     if base_weight == 0.0 {
-        return if rho.is_finite() {
-            Ok(0.0)
-        } else {
-            Err(format!(
-                "learnable log-weight coordinate must be finite; got {rho}"
-            ))
-        };
+        return Err(
+            "a multiplicatively learnable weight requires a nonzero base; zero would make its rho coordinate structurally dead"
+                .to_string(),
+        );
     }
     if !(base_weight.is_finite() && rho.is_finite()) {
         return Err(format!(
@@ -77,10 +74,7 @@ pub fn resolve_learnable_weight(base_weight: f64, rho: f64) -> Result<f64, Strin
         ));
     }
     let log_base = base_weight.abs().ln();
-    let (lower, upper) = (
-        LOG_STRENGTH_MIN - log_base,
-        LOG_STRENGTH_MAX - log_base,
-    );
+    let (lower, upper) = (LOG_STRENGTH_MIN - log_base, LOG_STRENGTH_MAX - log_base);
     if !(lower..=upper).contains(&rho) {
         return Err(format!(
             "learnable coordinate must be in [{lower}, {upper}] so its effective log strength is in [{LOG_STRENGTH_MIN}, {LOG_STRENGTH_MAX}]; got {rho}"
@@ -105,9 +99,7 @@ pub fn resolve_learnable_weight(base_weight: f64, rho: f64) -> Result<f64, Strin
 /// never clamps, floors, or otherwise creates a constant tail whose derivative
 /// would disagree with the analytic value/gradient/Hessian contract.
 pub fn checked_exp_log_strength(log_strength: f64) -> Result<f64, String> {
-    if log_strength.is_finite()
-        && (LOG_STRENGTH_MIN..=LOG_STRENGTH_MAX).contains(&log_strength)
-    {
+    if log_strength.is_finite() && (LOG_STRENGTH_MIN..=LOG_STRENGTH_MAX).contains(&log_strength) {
         Ok(log_strength.exp())
     } else {
         Err(format!(
@@ -258,7 +250,10 @@ pub trait AnalyticPenalty: Send + Sync {
         }
         for (axis, &value) in rho.iter().enumerate() {
             checked_exp_log_strength(value).map_err(|error| {
-                format!("analytic penalty `{}` rho axis {axis}: {error}", self.name())
+                format!(
+                    "analytic penalty `{}` rho axis {axis}: {error}",
+                    self.name()
+                )
             })?;
         }
         Ok(())
@@ -270,10 +265,7 @@ pub trait AnalyticPenalty: Send + Sync {
     /// unbounded face; evaluation still requires every supplied coordinate to
     /// be finite.
     fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
-        Ok(vec![
-            (LOG_STRENGTH_MIN, LOG_STRENGTH_MAX);
-            self.rho_count()
-        ])
+        Ok(vec![(LOG_STRENGTH_MIN, LOG_STRENGTH_MAX); self.rho_count()])
     }
 
     /// Scalar penalty contribution `P(target; ρ)`. The strength factor

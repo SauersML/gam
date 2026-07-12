@@ -878,7 +878,8 @@ impl SaeManifoldTerm {
         solver: &DeflatedArrowSolver<'_>,
         inverse_probe_bundle: Option<(&[Array1<f64>], &[Array1<f64>])>,
     ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
-        self.assignment.validate_rho_domain(rho)
+        self.assignment
+            .validate_rho_domain(rho)
             .map_err(OuterGradientError::internal)?;
         let n_params = rho.to_flat().len();
         let mut explicit = Array1::<f64>::zeros(n_params);

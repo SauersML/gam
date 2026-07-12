@@ -1114,8 +1114,10 @@ impl AnalyticPenalty for IsometryPenalty {
     }
 
     fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
-        Ok(vec![learnable_weight_coordinate_domain(self.scalar_weight)?
-            .ok_or_else(|| "isometry scalar weight must be positive".to_string())?])
+        Ok(vec![
+            learnable_weight_coordinate_domain(self.scalar_weight)?
+                .ok_or_else(|| "isometry scalar weight must be positive".to_string())?,
+        ])
     }
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {

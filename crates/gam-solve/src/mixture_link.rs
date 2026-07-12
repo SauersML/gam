@@ -126,7 +126,11 @@ pub struct LogitJet5 {
 
 #[inline]
 fn canonicalzero(v: f64) -> f64 {
-    if v.abs() < f64::MIN_POSITIVE { 0.0 } else { v }
+    // Normalize the two IEEE zero encodings for deterministic jets without
+    // changing their mathematical support. A nonzero subnormal is still a
+    // representable derivative and must survive: replacing it by zero creates
+    // an artificial constant tail and a kink at MIN_POSITIVE.
+    if v == 0.0 { 0.0 } else { v }
 }
 
 #[inline]
@@ -2509,6 +2513,51 @@ mod tests {
                 finite_difference
             );
         }
+    }
+
+    #[test]
+    fn subnormal_inverse_link_derivatives_are_preserved_not_plateaued() {
+        let left_eta = -743.0_f64;
+        let left_scale = left_eta.exp();
+        assert!(left_scale > 0.0 && left_scale < f64::MIN_POSITIVE);
+        let left = logit_inverse_link_jet5(left_eta);
+        for (order, derivative) in [left.d1, left.d2, left.d3, left.d4, left.d5]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                derivative > 0.0 && derivative < f64::MIN_POSITIVE,
+                "left-tail logit derivative order {} lost its represented subnormal: {derivative}",
+                order + 1
+            );
+        }
+
+        let right_eta = 743.0_f64;
+        let right_scale = (-right_eta).exp();
+        assert!(right_scale > 0.0 && right_scale < f64::MIN_POSITIVE);
+        let right = logit_inverse_link_jet5(right_eta);
+        for (order, derivative, sign) in [
+            (1, right.d1, 1.0),
+            (2, right.d2, -1.0),
+            (3, right.d3, 1.0),
+            (4, right.d4, -1.0),
+            (5, right.d5, 1.0),
+        ] {
+            assert_eq!(derivative.signum(), sign, "wrong order-{order} tail sign");
+            assert!(
+                derivative.abs() > 0.0 && derivative.abs() < f64::MIN_POSITIVE,
+                "right-tail logit derivative order {order} lost its represented subnormal: {derivative}"
+            );
+        }
+
+        let royston_eta = 735.0_f64.ln();
+        let royston = royston_parmar_inverse_link_jet(royston_eta)
+            .expect("finite Royston-Parmar subnormal-tail eta");
+        assert!(
+            royston.d1 < 0.0 && royston.d1.abs() < f64::MIN_POSITIVE,
+            "Royston-Parmar exact tail derivative must retain its subnormal: {}",
+            royston.d1
+        );
     }
 
     #[test]

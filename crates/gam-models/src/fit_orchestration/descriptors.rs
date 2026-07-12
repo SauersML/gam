@@ -21,13 +21,12 @@ use gam_problem::schedule::{GumbelTemperatureSchedule, ScheduleKind};
 use gam_terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
     BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind, HarmonicRoughnessPenalty,
-    IsometryPenalty, IvaeRidgeMeanGauge, SmoothThresholdPenalty,
-    MechanismSparsityPenalty, NestedPrefixPenalty, NuclearNormPenalty,
-    OrderedBetaBernoulliPenalty, OrthogonalityPenalty,
+    IsometryPenalty, IvaeRidgeMeanGauge, MechanismSparsityPenalty, NestedPrefixPenalty,
+    NuclearNormPenalty, OrderedBetaBernoulliPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule, ShapeMonotonicityPenalty,
-    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
-    TotalVariationPenalty,
+    SmoothThresholdPenalty, SoftmaxAssignmentSparsityPenalty, SparsityPenalty,
+    TopKActivationPenalty, TotalVariationPenalty,
 };
 
 /// A latent block a penalty descriptor can target, identified either by name or

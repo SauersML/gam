@@ -413,8 +413,10 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     }
 
     fn rho_coordinate_domains(&self) -> Result<Vec<(f64, f64)>, String> {
-        Ok(vec![learnable_weight_coordinate_domain(self.weight)?
-            .ok_or_else(|| "softmax assignment sparsity has zero base weight".to_string())?])
+        Ok(vec![
+            learnable_weight_coordinate_domain(self.weight)?
+                .ok_or_else(|| "softmax assignment sparsity has zero base weight".to_string())?,
+        ])
     }
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {

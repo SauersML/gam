@@ -426,8 +426,10 @@ impl AnalyticPenalty for OrderedBetaBernoulliPenalty {
         if !self.learnable_alpha {
             return Ok(Vec::new());
         }
-        Ok(vec![learnable_weight_coordinate_domain(self.alpha)?
-            .ok_or_else(|| "ordered Beta--Bernoulli alpha must be positive".to_string())?])
+        Ok(vec![
+            learnable_weight_coordinate_domain(self.alpha)?
+                .ok_or_else(|| "ordered Beta--Bernoulli alpha must be positive".to_string())?,
+        ])
     }
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {

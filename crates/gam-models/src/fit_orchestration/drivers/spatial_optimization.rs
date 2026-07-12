@@ -1028,49 +1028,48 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
         let mut ssecond_components = vec![None; log_kappa_dim];
         ssecond_components[i] = Some(s2_components);
         let mut penaltysecond_partner_indices: Option<Vec<usize>> = None;
-        let penaltysecond_component_provider = if let (Some(provider), Some(gid)) =
-            (aniso_cross_penalty_provider, aniso_group_id)
-        {
-            let group_indices = group_indices_map.get(&gid).cloned().unwrap_or_default();
-            let axis_in_group =
-                group_indices
-                    .iter()
-                    .position(|&idx| idx == i)
-                    .ok_or_else(|| {
-                        EstimationError::InvalidInput(format!(
-                            "missing spatial hyper axis {} in anisotropy group {}",
-                            i, gid
-                        ))
-                    })?;
-            penaltysecond_partner_indices = Some(
-                group_indices
-                    .iter()
-                    .copied()
-                    .filter(|&idx| idx != i)
-                    .collect(),
-            );
-            let penalty_indices_inner = penalty_indices.clone();
-            let global_range_inner = global_range.clone();
-            let total_p_inner = total_p;
-            let group_indices_inner = group_indices;
-            Some(std::sync::Arc::new(
-                move |j: usize| -> Result<
-                    Option<Vec<gam_solve::estimate::reml::PenaltyDerivativeComponent>>,
-                    EstimationError,
-                > {
-                    let Some(other_axis_in_group) =
-                        group_indices_inner.iter().position(|&idx| idx == j)
-                    else {
-                        return Ok(None);
-                    };
-                    if other_axis_in_group == axis_in_group {
-                        return Ok(None);
-                    }
-                    let cross_pens = provider(other_axis_in_group)?;
-                    if cross_pens.is_empty() {
-                        return Ok(None);
-                    }
-                    Ok(Some(
+        let penaltysecond_component_provider =
+            if let (Some(provider), Some(gid)) = (aniso_cross_penalty_provider, aniso_group_id) {
+                let group_indices = group_indices_map.get(&gid).cloned().unwrap_or_default();
+                let axis_in_group =
+                    group_indices
+                        .iter()
+                        .position(|&idx| idx == i)
+                        .ok_or_else(|| {
+                            EstimationError::InvalidInput(format!(
+                                "missing spatial hyper axis {} in anisotropy group {}",
+                                i, gid
+                            ))
+                        })?;
+                penaltysecond_partner_indices = Some(
+                    group_indices
+                        .iter()
+                        .copied()
+                        .filter(|&idx| idx != i)
+                        .collect(),
+                );
+                let penalty_indices_inner = penalty_indices.clone();
+                let global_range_inner = global_range.clone();
+                let total_p_inner = total_p;
+                let group_indices_inner = group_indices;
+                Some(std::sync::Arc::new(
+                    move |j: usize| -> Result<
+                        Option<Vec<gam_solve::estimate::reml::PenaltyDerivativeComponent>>,
+                        EstimationError,
+                    > {
+                        let Some(other_axis_in_group) =
+                            group_indices_inner.iter().position(|&idx| idx == j)
+                        else {
+                            return Ok(None);
+                        };
+                        if other_axis_in_group == axis_in_group {
+                            return Ok(None);
+                        }
+                        let cross_pens = provider(other_axis_in_group)?;
+                        if cross_pens.is_empty() {
+                            return Ok(None);
+                        }
+                        Ok(Some(
                         penalty_indices_inner
                             .iter()
                             .copied()
@@ -1089,21 +1088,21 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
                             })
                             .collect(),
                     ))
-                },
-            )
-                as std::sync::Arc<
-                    dyn Fn(
-                            usize,
-                        ) -> Result<
-                            Option<Vec<gam_solve::estimate::reml::PenaltyDerivativeComponent>>,
-                            EstimationError,
-                        > + Send
-                        + Sync
-                        + 'static,
-                >)
-        } else {
-            None
-        };
+                    },
+                )
+                    as std::sync::Arc<
+                        dyn Fn(
+                                usize,
+                            ) -> Result<
+                                Option<Vec<gam_solve::estimate::reml::PenaltyDerivativeComponent>>,
+                                EstimationError,
+                            > + Send
+                            + Sync
+                            + 'static,
+                    >)
+            } else {
+                None
+            };
         // First derivative: use implicit operator when available to avoid
         // storing dense (n x p) matrices for all D axes simultaneously.
         let x_first_hyper = if let Some(ref op) = implicit_operator {
@@ -6148,18 +6147,14 @@ mod exact_joint_seed_config_tests {
 
     #[test]
     fn exact_joint_marginal_slope_profiles_get_deeper_startup_validation() {
-        let bms = exact_joint_seed_config(
-            gam_problem::SeedRiskProfile::GeneralizedLinear,
-            2,
-            false,
-        );
+        let bms =
+            exact_joint_seed_config(gam_problem::SeedRiskProfile::GeneralizedLinear, 2, false);
         assert_eq!(bms.max_seeds, 1);
         assert_eq!(bms.seed_budget, 1);
         assert_eq!(bms.screen_max_inner_iterations, 8);
         assert_eq!(bms.num_auxiliary_trailing, 2);
 
-        let survival =
-            exact_joint_seed_config(gam_problem::SeedRiskProfile::Survival, 3, false);
+        let survival = exact_joint_seed_config(gam_problem::SeedRiskProfile::Survival, 3, false);
         assert_eq!(survival.max_seeds, 8);
         assert_eq!(survival.seed_budget, 4);
         assert_eq!(survival.screen_max_inner_iterations, 8);
@@ -6346,8 +6341,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_bfgs_step_cap(bfgs_step_cap)
         .with_bfgs_step_cap_psi(bfgs_step_cap_psi)
         .with_seed_config({
-            let mut sc =
-                exact_joint_seed_config(risk_profile, auxiliary_dim, initial_seed_only);
+            let mut sc = exact_joint_seed_config(risk_profile, auxiliary_dim, initial_seed_only);
             if has_constant_curvature {
                 // Let the seed grid reach the widened over-smoothing ceiling so a
                 // smooth whose true REML optimum genuinely lives at large λ can be
@@ -7183,7 +7177,8 @@ fn try_exact_joint_latent_coord_optimization(
             if lower[start + local] >= upper[start + local] {
                 return Err(EstimationError::InvalidInput(format!(
                     "analytic-penalty rho domain has no searchable interval at coordinate {local}: lower={}, upper={}",
-                    lower[start + local], upper[start + local]
+                    lower[start + local],
+                    upper[start + local]
                 )));
             }
         }
@@ -7620,14 +7615,12 @@ fn select_isotropic_matern_range_basin(
         else {
             continue;
         };
-        let num_centers =
-            gam_terms::basis::center_strategy_num_centers(&matern.center_strategy).ok_or_else(
-                || {
-                    EstimationError::InvalidInput(format!(
-                        "resolved isotropic Matérn term {term_idx} has no finite center count"
-                    ))
-                },
-            )?;
+        let num_centers = gam_terms::basis::center_strategy_num_centers(&matern.center_strategy)
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(format!(
+                    "resolved isotropic Matérn term {term_idx} has no finite center count"
+                ))
+            })?;
         let companion_length_scale = matern_low_rank_center_resolution_length_scale(
             data,
             feature_cols,

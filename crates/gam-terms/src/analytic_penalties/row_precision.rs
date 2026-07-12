@@ -841,9 +841,7 @@ impl ParametricRowPrecisionPriorPenalty {
                 ));
             }
             checked_exp_log_strength(log_alpha_k).map_err(|error| {
-                format!(
-                    "ParametricRowPrecisionPriorPenalty::new invalid log_alpha[{k}]: {error}"
-                )
+                format!("ParametricRowPrecisionPriorPenalty::new invalid log_alpha[{k}]: {error}")
             })?;
             let raw_beta_k = raw_beta[k];
             if !raw_beta_k.is_finite() {

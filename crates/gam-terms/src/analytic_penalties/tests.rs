@@ -665,14 +665,17 @@ fn ordered_beta_bernoulli_row_weighted_channels_are_one_operator_991() {
 
 #[test]
 fn learnable_weight_effective_log_domain_is_exact_and_unsaturated() {
+    assert!(
+        resolve_learnable_weight(0.0, 0.0).is_err(),
+        "a zero base would make a multiplicative rho coordinate dead"
+    );
     let base = 1.7_f64;
     let (lower, upper) = learnable_weight_coordinate_domain(base)
         .unwrap()
         .expect("positive base has a coordinate domain");
-    for (coordinate, expected_log_strength) in [
-        (lower, LOG_STRENGTH_MIN),
-        (upper, LOG_STRENGTH_MAX),
-    ] {
+    for (coordinate, expected_log_strength) in
+        [(lower, LOG_STRENGTH_MIN), (upper, LOG_STRENGTH_MAX)]
+    {
         let resolved = resolve_learnable_weight(base, coordinate).unwrap();
         assert!((resolved.ln() - expected_log_strength).abs() < 1.0e-12);
     }
@@ -686,9 +689,7 @@ fn learnable_weight_effective_log_domain_is_exact_and_unsaturated() {
     penalty
         .validate_rho(array![upper].view())
         .expect("exact effective-strength endpoint is valid");
-    assert!(penalty
-        .validate_rho(array![upper + 1.0e-6].view())
-        .is_err());
+    assert!(penalty.validate_rho(array![upper + 1.0e-6].view()).is_err());
 }
 
 #[test]
@@ -708,17 +709,14 @@ fn registry_propagates_effective_strength_domain_and_freeze_refuses_invalid_rho(
     registry
         .validate_rho(array![expected_upper].view())
         .expect("closed upper face is legal");
-    assert!(registry
-        .validate_rho(array![expected_upper + 1.0e-6].view())
-        .is_err());
+    assert!(
+        registry
+            .validate_rho(array![expected_upper + 1.0e-6].view())
+            .is_err()
+    );
 
     let target = Array1::<f64>::zeros(3);
-    assert!(FrozenAnalyticPenaltyOp::new(
-        kind,
-        target,
-        array![expected_upper + 1.0e-6],
-    )
-    .is_err());
+    assert!(FrozenAnalyticPenaltyOp::new(kind, target, array![expected_upper + 1.0e-6],).is_err());
 }
 
 #[test]
@@ -756,6 +754,15 @@ fn parametric_row_precision_domains_distinguish_log_strengths_from_raw_coordinat
             .unwrap()
             .expect("positive weight has a coordinate domain")
     );
+    let mut registry = AnalyticPenaltyRegistry::new();
+    registry.push(AnalyticPenaltyKind::ParametricRowPrecisionPrior(Arc::new(
+        penalty.clone(),
+    )));
+    let (registry_lower, registry_upper) = registry.rho_domain_bounds().unwrap();
+    for index in 2..6 {
+        assert_eq!(registry_lower[index], f64::NEG_INFINITY);
+        assert_eq!(registry_upper[index], f64::INFINITY);
+    }
 
     // Raw beta and mu are finite additive coordinates, not log-strengths:
     // values beyond ±700 remain valid while a log-alpha beyond its effective
@@ -766,20 +773,25 @@ fn parametric_row_precision_domains_distinguish_log_strengths_from_raw_coordinat
     penalty
         .validate_rho(rho.view())
         .expect("finite raw-beta and mu coordinates are unbounded");
+    registry
+        .validate_rho(rho.view())
+        .expect("registry preserves ordinary unbounded raw coordinates");
     rho[0] = LOG_STRENGTH_MAX + 1.0e-6;
     assert!(penalty.validate_rho(rho.view()).is_err());
 
-    assert!(ParametricRowPrecisionPriorPenalty::new(
-        target,
-        array![[0.0_f64], [1.0]],
-        array![LOG_STRENGTH_MAX + 1.0, 0.0],
-        array![0.0_f64, -0.5],
-        array![[0.0_f64], [0.5]],
-        1.7,
-        2,
-        true,
-    )
-    .is_err());
+    assert!(
+        ParametricRowPrecisionPriorPenalty::new(
+            target,
+            array![[0.0_f64], [1.0]],
+            array![LOG_STRENGTH_MAX + 1.0, 0.0],
+            array![0.0_f64, -0.5],
+            array![[0.0_f64], [0.5]],
+            1.7,
+            2,
+            true,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -802,9 +814,11 @@ fn sparsity_learnable_smoothing_has_one_structural_coordinate() {
     penalty
         .validate_rho(array![0.0, LOG_STRENGTH_MAX].view())
         .expect("closed smoothing face is valid");
-    assert!(penalty
-        .validate_rho(array![0.0, LOG_STRENGTH_MAX + 1.0e-6].view())
-        .is_err());
+    assert!(
+        penalty
+            .validate_rho(array![0.0, LOG_STRENGTH_MAX + 1.0e-6].view())
+            .is_err()
+    );
 }
 
 #[test]

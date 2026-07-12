@@ -1529,11 +1529,14 @@ pub fn covariance_matched_gaussian_null(
             for axis in 0..p {
                 centered_draw += eigenvectors[[col, axis]] * scaled_normal[axis];
             }
-            out[[row, col]] = location.compose_centered(centered_draw, col).map_err(|error| {
+            let draw = location
+                .compose_centered(centered_draw, col)
+                .map_err(|error| {
                     format!(
                         "covariance-matched Gaussian draw failed at row {row}, column {col}: {error}"
                     )
                 })?;
+            out[[row, col]] = draw;
         }
     }
     Ok(out)

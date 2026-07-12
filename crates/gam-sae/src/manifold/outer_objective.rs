@@ -4086,8 +4086,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
             .assignment
             .learnable_alpha_rho_domain()
             .map_err(EstimationError::InvalidInput)?
-            && let (Some(bounds), Some(index)) =
-                (log_strength_upper.as_mut(), self.baseline_rho.sparse_flat_index())
+            && let (Some(bounds), Some(index)) = (
+                log_strength_upper.as_mut(),
+                self.baseline_rho.sparse_flat_index(),
+            )
         {
             bounds[index] = bounds[index].min(alpha_upper);
         }

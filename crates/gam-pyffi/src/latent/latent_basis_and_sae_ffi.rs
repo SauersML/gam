@@ -2002,10 +2002,7 @@ fn sae_manifold_fit_inner<'py>(
             }
             match (&unc.band_coords, &unc.band_mean, &unc.band_sd) {
                 (Some(coords), Some(mean), Some(sd)) => {
-                    atom_dict.set_item(
-                        "shape_band_coords",
-                        coords.clone().into_pyarray(py),
-                    )?;
+                    atom_dict.set_item("shape_band_coords", coords.clone().into_pyarray(py))?;
                     let mut band_mean = mean.clone();
                     let mut band_sd = sd.clone();
                     if let Some(sigma) = tier0_scale.as_ref() {
