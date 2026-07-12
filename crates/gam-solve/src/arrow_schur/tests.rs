@@ -6163,9 +6163,19 @@ fn factor_dense_reduced_schur_reconstructs_original_illconditioned_matrix_2015()
     for i in 0..n {
         schur[[i, i]] = diag_scale[i];
     }
+    // Coupling `c · min(diag_i, diag_j)`: each off-diagonal entry is bounded by
+    // `c` times the SMALLER of its row's/column's own diagonal, so for ANY row
+    // the sum of its (n-1) off-diagonal magnitudes is at most
+    // `c · (n-1) · diag_i` (since `min(diag_i, diag_j) ≤ diag_i`) — strictly
+    // less than `diag_i` for `c · (n-1) < 1` (here `c=1e-3`, `n-1=5`). This
+    // guarantees strict diagonal dominance, hence genuine positive-definiteness,
+    // for EVERY row regardless of how extreme the diagonal spread is — unlike a
+    // `sqrt(diag_i·diag_j)`-scaled coupling, which can violate dominance at the
+    // smallest-diagonal row.
+    let coupling_fraction = 1.0e-3_f64;
     for i in 0..n {
         for j in (i + 1)..n {
-            let coupling = 0.01 * (diag_scale[i] * diag_scale[j]).sqrt();
+            let coupling = coupling_fraction * diag_scale[i].min(diag_scale[j]);
             schur[[i, j]] = coupling;
             schur[[j, i]] = coupling;
         }

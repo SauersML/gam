@@ -692,6 +692,13 @@ fn jacobi_diagonal_scale(schur: &Array2<f64>) -> Array1<f64> {
 /// trust-region fallback) needs no change: they already operate on whatever
 /// `(factor, floored_schur)` this function hands back, in the SAME original
 /// units as always.
+///
+/// GPU cross-reference: the device/GPU dense-reference path
+/// (`gam_solve::gpu_kernels::arrow_schur::solve_arrow_newton_step_dense_reference`)
+/// factors the full joint `(t, β)` system independently of this function and
+/// does NOT yet get this equilibration. Both paths are exact; the GPU path is
+/// simply not yet as well-conditioned on an ill-scaled system. Porting the
+/// same technique there is a deliberate follow-up, not part of this change.
 pub(crate) fn factor_dense_reduced_schur(
     schur: &Array2<f64>,
     schur_pd_floor: Option<f64>,
