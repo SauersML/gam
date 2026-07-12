@@ -7087,6 +7087,18 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let point = self.primary_point_from_block_states(row, block_states, primary)?;
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
+        let plan = self.empirical_bms_row_jet_plan(
+            row,
+            primary,
+            q,
+            b,
+            beta_h_owned.as_ref(),
+            beta_w_owned.as_ref(),
+            row_ctx.intercept,
+            &grid,
+        )?;
+        let primary_point =
+            Self::intercept_primary_point(q, b, beta_h_owned.as_ref(), beta_w_owned.as_ref());
         let mut contractions = Vec::with_capacity(direction_pairs.len());
         for pair_chunk in direction_pairs.chunks(PAIRS_PER_EMPIRICAL_BATCH) {
             let mut ordered_pairs = Vec::with_capacity(2 * pair_chunk.len());
@@ -7094,16 +7106,11 @@ impl BernoulliMarginalSlopeFamily {
                 ordered_pairs.push((direction_u, direction_v));
                 ordered_pairs.push((direction_v, direction_u));
             }
-            let ordered = self.empirical_flex_row_fourth_contracted_many_ordered(
-                row,
-                primary,
-                q,
-                b,
-                beta_h_owned.as_ref(),
-                beta_w_owned.as_ref(),
-                row_ctx,
+            let ordered = Self::empirical_bms_fourth_batch_from_plan(
+                &plan,
+                &primary_point,
                 &ordered_pairs,
-                &grid,
+                primary.total,
             )?;
             let mut orientations = ordered.into_iter();
             while let Some(mut ordered) = orientations.next() {

@@ -1622,6 +1622,20 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
+        Self::empirical_bms_fourth_batch_from_plan(&plan, &point, direction_pairs, r)
+    }
+
+    /// Execute one already-frozen row plan at a batch of ordered two-seed
+    /// lanes. The outer many-pair consumer reuses the same plan across bounded
+    /// arena chunks, so chunking caps memory without repeating grid/basis
+    /// preprocessing.
+    pub(super) fn empirical_bms_fourth_batch_from_plan(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+        direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
+        r: usize,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        let is_zero = |direction: &Array1<f64>| direction.iter().all(|value| *value == 0.0);
         EMPIRICAL_BMS_FOURTH_WORKSPACE.with(|workspace| {
             let mut workspace = workspace.borrow_mut();
             workspace.reset(direction_pairs.len());
