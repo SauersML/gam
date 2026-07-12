@@ -5535,7 +5535,7 @@ impl DesignMatrix {
                 let col_ptr = symbolic.col_ptr();
                 let row_idx = symbolic.row_idx();
                 for idx in col_ptr[col]..col_ptr[col + 1] {
-                    output[row_idx[idx]] = values[idx];
+                    output[row_idx[idx]] += values[idx];
                 }
             }
         }
@@ -5617,7 +5617,7 @@ impl DesignMatrix {
                     let end = col_ptr[j + 1];
                     let mut out_col = out.column_mut(k);
                     for idx in start..end {
-                        out_col[row_idx[idx]] = values[idx];
+                        out_col[row_idx[idx]] += values[idx];
                     }
                 }
                 out
@@ -6285,6 +6285,40 @@ mod tests {
         let y_dense = dense.dot(&v);
         for i in 0..y_sparse.len() {
             assert!((y_sparse[i] - y_dense[i]).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn sparse_column_extractors_accumulate_duplicate_entries() {
+        // Same non-canonical CSC as the to_dense fixture: column 0 carries two
+        // entries at row 1 (2.0 + 3.5 = 5.5); column 1 a single -1.0 at row 0.
+        // column_into and extract_columns must accumulate duplicates exactly
+        // like to_dense/apply, not last-write-wins.
+        let symbolic = SymbolicSparseColMat::new_unsorted_checked(
+            3,
+            2,
+            vec![0_usize, 2, 3],
+            None,
+            vec![1_usize, 1, 0],
+        );
+        let sparse = SparseColMat::new(symbolic, vec![2.0_f64, 3.5, -1.0]);
+        let design = DesignMatrix::from(sparse);
+        let dense = design.to_dense();
+
+        let mut col0 = Array1::<f64>::zeros(3);
+        design.column_into(0, col0.view_mut());
+        assert!((col0[1] - 5.5).abs() < 1e-12);
+        for i in 0..3 {
+            assert!((col0[i] - dense[[i, 0]]).abs() < 1e-12);
+        }
+
+        let block = design.extract_columns(&[0, 1]);
+        assert!((block[[1, 0]] - 5.5).abs() < 1e-12);
+        assert!((block[[0, 1]] + 1.0).abs() < 1e-12);
+        for i in 0..3 {
+            for (k, &j) in [0usize, 1].iter().enumerate() {
+                assert!((block[[i, k]] - dense[[i, j]]).abs() < 1e-12);
+            }
         }
     }
 

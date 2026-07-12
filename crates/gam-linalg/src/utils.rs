@@ -798,17 +798,20 @@ pub fn boundary_hit_indices(
     (at_lower, at_upper)
 }
 
-/// SPD-only spectrum condition number: λ_max / λ_min on the principal
-/// (positive-eigenvalue) spectrum.
+/// SPD-only spectrum condition number: the exact ratio λ_max / λ_min on the
+/// principal (positive-eigenvalue) spectrum, with **no** hidden floor — a
+/// near-singular λ_min yields a correspondingly large (or infinite) ratio,
+/// which is precisely the ill-conditioning signal callers depend on.
 ///
 /// **Invariant:** caller must have already established the matrix is
 /// positive definite. For indefinite matrices λ_min may be negative or
-/// zero and the ratio max/min becomes meaningless (it can be negative or
-/// infinite even when the matrix is well-scaled). When the spectrum sign is
-/// unknown, inspect inertia directly via [`symmetric_extremes`].
+/// zero and the ratio becomes meaningless (it can be negative or infinite
+/// even when the matrix is well-scaled). When the spectrum sign is unknown,
+/// inspect inertia directly via [`symmetric_extremes`]; callers that want a
+/// clamped condition number must floor λ_min themselves.
 pub fn symmetric_spectrum_condition_number(matrix: &Array2<f64>) -> f64 {
     symmetric_extremes(matrix)
-        .map(|(min, max)| max / min.max(1e-12))
+        .map(|(min, max)| max / min)
         .unwrap_or(f64::NAN)
 }
 
@@ -1892,5 +1895,23 @@ mod pure_fn_tests {
     #[test]
     fn predict_gam_mismatch_some_when_rows_differ() {
         assert!(predict_gam_dimension_mismatch_message(10, 3, 3, 9).is_some());
+    }
+}
+
+#[cfg(test)]
+mod condition_number_tests {
+    use super::symmetric_spectrum_condition_number;
+    use ndarray::Array2;
+
+    #[test]
+    fn condition_number_is_the_unfloored_lambda_ratio() {
+        // Diagonal SPD matrix with lambda_min = 1e-14, lambda_max = 4.0. The
+        // exact ratio is 4e14; a hidden 1e-12 floor on lambda_min would cap it
+        // near 4e12 and hide the ill-conditioning. Assert the honest ratio.
+        let mut m = Array2::<f64>::zeros((2, 2));
+        m[[0, 0]] = 1.0e-14;
+        m[[1, 1]] = 4.0;
+        let cond = symmetric_spectrum_condition_number(&m);
+        assert!(cond > 1.0e14, "expected unfloored ratio ~4e14, got {cond:e}");
     }
 }
