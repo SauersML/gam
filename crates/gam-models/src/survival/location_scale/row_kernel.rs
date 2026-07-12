@@ -4,7 +4,7 @@ use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar,
     MappedOrder2Accumulator, OneSeed, OneSeedBatch, OneSeedLane, Order2, Order2Lane,
-    RuntimeJetScalar, TwoSeed,
+    RuntimeJetScalar,
 };
 use wide::f64x4;
 
@@ -1504,6 +1504,33 @@ fn batched_axis_thirds(
     out
 }
 
+/// #932: the canonical single-source seam. The row NLL is written ONCE as
+/// [`sls_row_nll`]; this exposes it through [`gam_math::jet_tower::RowProgram`]
+/// so the `RowKernel` contraction channels derive mechanically from `eval` (via
+/// the `program_*` helpers) rather than re-seeding the packed jet per method.
+/// Non-positive-weight rows carry no exact kernel and evaluate to a structural
+/// zero — the `None` arm the hand contraction methods short-circuited on.
+impl gam_math::jet_tower::RowProgram<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
+    fn n_rows(&self) -> usize {
+        self.family.n
+    }
+
+    fn primaries(&self, row: usize) -> Result<[f64; SLS_ROW_K], String> {
+        Ok(self.row_primary_values(row))
+    }
+
+    fn eval<S: JetScalar<SLS_ROW_K>>(
+        &self,
+        row: usize,
+        p: &[S; SLS_ROW_K],
+    ) -> Result<S, String> {
+        match self.row_nll_inputs_opt(row)? {
+            Some((_, kernel)) => sls_row_nll(p, &kernel),
+            None => Ok(S::constant(0.0)),
+        }
+    }
+}
+
 impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
     fn n_rows(&self) -> usize {
         self.family.n
@@ -1675,19 +1702,13 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         row: usize,
         dir: &[f64; SLS_ROW_K],
     ) -> Result<[[f64; SLS_ROW_K]; SLS_ROW_K], String> {
-        // Packed one-seed directional scalar (1.46 KiB/row): the ε-Hessian
-        // channel is exactly `Σ_c ℓ_{abc} dir_c` without materialising the dense
-        // `t3`. Bit-identical to `row_nll_tower(row)?.third_contracted(dir)` by
-        // the `survival_ls_packed_scalar_*` oracle.
-        //
-        // `None` is reserved for non-positive observation weight, whose
-        // likelihood and every derivative are structurally zero.
-        let Some((p, kernel)) = self.row_nll_inputs_opt(row)? else {
-            return Ok([[0.0; SLS_ROW_K]; SLS_ROW_K]);
-        };
-        let vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] =
-            std::array::from_fn(|a| OneSeed::seed_direction(p[a], a, dir[a]));
-        Ok(sls_row_nll(&vars, &kernel)?.contracted_third())
+        // #932: derived mechanically from the single-source `RowProgram::eval`
+        // (one-seed scalar → ε-Hessian channel `Σ_c ℓ_{abc} dir_c`, no dense
+        // `t3`). Byte-identical to the previous hand-seeded `sls_row_nll` at
+        // `OneSeed<9>` — same `row_primary_values` + `row_nll_inputs_opt` kernel,
+        // same `None`→zero structural-zero arm (eval returns `constant(0.0)`) —
+        // pinned by the `survival_ls_packed_scalar_*` oracles.
+        gam_math::jet_tower::program_third_contracted(self, row, dir)
     }
 
     fn row_fourth_contracted(
@@ -1696,18 +1717,11 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         dir_u: &[f64; SLS_ROW_K],
         dir_v: &[f64; SLS_ROW_K],
     ) -> Result<[[f64; SLS_ROW_K]; SLS_ROW_K], String> {
-        // Packed two-seed scalar (2.8 KiB/row): the εδ-Hessian channel is exactly
-        // `Σ_{cd} ℓ_{abcd} u_c v_d` without materialising the dense `t4`.
-        // Bit-identical to `row_nll_tower(row)?.fourth_contracted(u, v)`.
-        //
-        // Non-positive-weight rows have the same structural zero contribution
-        // as in `row_third_contracted`.
-        let Some((p, kernel)) = self.row_nll_inputs_opt(row)? else {
-            return Ok([[0.0; SLS_ROW_K]; SLS_ROW_K]);
-        };
-        let vars: [TwoSeed<SLS_ROW_K>; SLS_ROW_K] =
-            std::array::from_fn(|a| TwoSeed::seed(p[a], a, dir_u[a], dir_v[a]));
-        Ok(sls_row_nll(&vars, &kernel)?.contracted_fourth())
+        // #932: derived mechanically from the single-source `RowProgram::eval`
+        // (two-seed scalar → εδ-Hessian channel `Σ_{cd} ℓ_{abcd} u_c v_d`, no
+        // dense `t4`). Byte-identical to the previous hand-seeded `sls_row_nll`
+        // at `TwoSeed<9>`, same `None`→zero structural-zero arm.
+        gam_math::jet_tower::program_fourth_contracted(self, row, dir_u, dir_v)
     }
 
     /// Batched all-axes first directional derivative with the per-row NLL
