@@ -457,7 +457,7 @@ pub fn render_audit_table(rows: &[AuditRow]) -> String {
 /// that validates the closed form against a genuine tempered-posterior
 /// expectation.
 #[cfg(test)]
-mod learning_coeff_helpers {
+mod learning_coeff_helper_tests {
     use super::*;
 
     pub(super) fn direction_learning_coefficient(mu: f64, edge: f64, n_eff: f64) -> f64 {
@@ -586,7 +586,7 @@ pub fn spectrum_from_fit(
 
 #[cfg(test)]
 mod tests {
-    use super::learning_coeff_helpers::{
+    use super::learning_coeff_helper_tests::{
         direction_learning_coefficient, sampled_direction_learning_coefficient,
     };
     use super::*;
