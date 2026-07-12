@@ -313,57 +313,6 @@ pub(crate) fn split_survival_psi_design(
 /// the index-space derivative tensors are diagonal in `i`.
 pub(crate) const SLS_ROW_K: usize = 9;
 
-/// The exact structural Hessian support of [`sls_row_nll`]. The likelihood is a
-/// sum of three univariate outer functions of:
-///
-/// - `u0`, depending on primaries `{0,4,7}`;
-/// - `u1`, depending on `{1,3,6}`;
-/// - `g`, depending on `{2,3,5,6,8}`.
-///
-/// Their symmetric pair union contains 24 channels. This pattern is an
-/// execution schedule for the same generic row expression, not a derivative
-/// formula.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug)]
-struct SlsHessianPattern;
-
-#[cfg(test)]
-const SLS_HESSIAN_PAIRS: [(usize, usize); 24] = [
-    (0, 0),
-    (0, 4),
-    (0, 7),
-    (1, 1),
-    (1, 3),
-    (1, 6),
-    (2, 2),
-    (2, 3),
-    (2, 5),
-    (2, 6),
-    (2, 8),
-    (3, 3),
-    (3, 5),
-    (3, 6),
-    (3, 8),
-    (4, 4),
-    (4, 7),
-    (5, 5),
-    (5, 6),
-    (5, 8),
-    (6, 6),
-    (6, 8),
-    (7, 7),
-    (8, 8),
-];
-
-#[cfg(test)]
-impl gam_math::jet_scalar::HessianPattern<SLS_ROW_K, 24> for SlsHessianPattern {
-    const PAIRS: [(usize, usize); 24] = SLS_HESSIAN_PAIRS;
-    const PAIR_BITS: [[u128; SLS_ROW_K]; SLS_ROW_K] =
-        gam_math::jet_scalar::hessian_pair_bits(Self::PAIRS);
-}
-
-#[cfg(test)]
-type SlsOrder2 = gam_math::jet_scalar::PatternedOrder2<SlsHessianPattern, SLS_ROW_K, 24>;
 
 /// `RowKernel<9>` adapter for the survival location-scale joint likelihood
 /// (non-wiggle path). Holds the per-β quantities already computed by
@@ -3428,6 +3377,54 @@ mod patterned_order2_perf_tests {
     use super::*;
     use gam_math::jet_scalar::Order2;
     use std::hint::black_box;
+
+    /// The exact structural Hessian support of [`sls_row_nll`]. The likelihood is a
+    /// sum of three univariate outer functions of:
+    ///
+    /// - `u0`, depending on primaries `{0,4,7}`;
+    /// - `u1`, depending on `{1,3,6}`;
+    /// - `g`, depending on `{2,3,5,6,8}`.
+    ///
+    /// Their symmetric pair union contains 24 channels. This pattern is an
+    /// execution schedule for the same generic row expression, not a derivative
+    /// formula.
+    #[derive(Clone, Copy, Debug)]
+    struct SlsHessianPattern;
+
+    const SLS_HESSIAN_PAIRS: [(usize, usize); 24] = [
+        (0, 0),
+        (0, 4),
+        (0, 7),
+        (1, 1),
+        (1, 3),
+        (1, 6),
+        (2, 2),
+        (2, 3),
+        (2, 5),
+        (2, 6),
+        (2, 8),
+        (3, 3),
+        (3, 5),
+        (3, 6),
+        (3, 8),
+        (4, 4),
+        (4, 7),
+        (5, 5),
+        (5, 6),
+        (5, 8),
+        (6, 6),
+        (6, 8),
+        (7, 7),
+        (8, 8),
+    ];
+
+    impl gam_math::jet_scalar::HessianPattern<SLS_ROW_K, 24> for SlsHessianPattern {
+        const PAIRS: [(usize, usize); 24] = SLS_HESSIAN_PAIRS;
+        const PAIR_BITS: [[u128; SLS_ROW_K]; SLS_ROW_K] =
+            gam_math::jet_scalar::hessian_pair_bits(Self::PAIRS);
+    }
+
+    type SlsOrder2 = gam_math::jet_scalar::PatternedOrder2<SlsHessianPattern, SLS_ROW_K, 24>;
     use std::time::Instant;
 
     fn fixture() -> ([f64; SLS_ROW_K], SurvivalExactRowKernel) {

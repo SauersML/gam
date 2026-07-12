@@ -1398,8 +1398,8 @@ impl<const K: usize> MappedOrder2Accumulator<K> {
         axes: [usize; N],
         derivatives: [f64; 3],
     ) {
-        debug_assert!(axes.iter().all(|&axis| axis < K));
-        debug_assert!(
+        assert!(axes.iter().all(|&axis| axis < K));
+        assert!(
             axes.iter()
                 .enumerate()
                 .all(|(i, axis)| !axes[..i].contains(axis)),
