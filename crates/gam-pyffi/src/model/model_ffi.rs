@@ -5980,7 +5980,14 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     // forward converges identically to the unconstrained forward (no
     // constraint is binding), so the closed-form Gaussian REML backward
     // applied to the unconstrained problem produces the correct VJP.
-    let init_lambda = log_lambda_at_optimum.map(|rho| rho.exp());
+    let init_lambda = log_lambda_at_optimum
+        .map(gam::checked_exp_log_strength)
+        .transpose()
+        .map_err(|error| {
+            py_value_error(format!(
+                "gaussian_reml_fit_with_constraints_backward: {error}"
+            ))
+        })?;
 
     // The constrained forward returns the smoothing parameter as `lambda`
     // and `log_lambda`. Upstream `grad_lambda` and `grad_log_lambda` both

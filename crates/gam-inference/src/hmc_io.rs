@@ -7334,7 +7334,13 @@ impl JointBetaRhoPosterior {
         let z = params.slice(ndarray::s![..n_beta]);
         let rho = params.slice(ndarray::s![n_beta..n_beta + n_rho]);
         let link_params = params.slice(ndarray::s![n_beta + n_rho..]);
-        let lambdas: Array1<f64> = rho.mapv(f64::exp);
+        let lambdas = match gam_problem::checked_exp_log_strengths(rho.iter().copied()) {
+            Ok(values) => Array1::from_vec(values),
+            Err(_) => {
+                out_grad.fill(0.0);
+                return f64::NEG_INFINITY;
+            }
+        };
 
         let inverse_link = match self.inverse_link_with_params(link_params) {
             Ok(link) => link,
@@ -7516,7 +7522,7 @@ impl JointBetaRhoPosterior {
             }
             RhoPrior::GammaPrecision { shape, rate } => {
                 for k in 0..n_rho {
-                    let lambda = rho[k].exp();
+                    let lambda = lambdas[k];
                     // Density over sampled rho includes the e^rho Jacobian (Gamma is on lambda = e^rho).
                     rho_prior += *shape * rho[k] - *rate * lambda;
                     grad_rho[k] += *shape - *rate * lambda;
@@ -7550,7 +7556,7 @@ impl JointBetaRhoPosterior {
                             grad_rho[k] -= inv_var * d;
                         }
                         RhoPrior::GammaPrecision { shape, rate } => {
-                            let lambda = rho[k].exp();
+                            let lambda = lambdas[k];
                             // Density over sampled rho includes the e^rho Jacobian (Gamma is on lambda = e^rho).
                             rho_prior += *shape * rho[k] - *rate * lambda;
                             grad_rho[k] += *shape - *rate * lambda;

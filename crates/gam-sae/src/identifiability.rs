@@ -3339,7 +3339,8 @@ fn atom_smooth_significance(fit: &AtomInnerFit) -> Option<AtomSmoothSignificance
     let log_e = gam_terms::inference::structure_evidence::split_likelihood_log_e_value(
         log_lik_alt,
         log_lik_null_sup,
-    );
+    )
+    .ok()?;
     if !log_e.is_finite() {
         return None;
     }
@@ -3399,7 +3400,7 @@ pub fn dictionary_report(
 ) -> Result<DictionaryReport, String> {
     Ok(DictionaryReport {
         gauge: residual_gauge(model)?,
-        structure: ledger.certify(alpha),
+        structure: ledger.certify(alpha).map_err(|error| error.to_string())?,
         transport_ladders: Vec::new(),
         atom_inference: atom_inference_reports(model),
     })

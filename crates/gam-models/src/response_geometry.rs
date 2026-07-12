@@ -433,6 +433,7 @@ struct Evaluation {
     coefficients: Array2<f64>,
     profiled_deviance: f64,
     penalty_traces: Array1<f64>,
+    lambdas: Array1<f64>,
 }
 
 #[derive(Debug)]
@@ -533,7 +534,7 @@ pub fn fit_shared_tangent_reml(
     let mut lambdas = Array1::<f64>::zeros(prepared.output_penalty_slots);
     let mut edf_by_penalty = Array1::<f64>::zeros(prepared.output_penalty_slots);
     for (active_index, penalty) in prepared.penalties.iter().enumerate() {
-        lambdas[penalty.output_slot] = rho[active_index].exp();
+        lambdas[penalty.output_slot] = evaluation.lambdas[active_index];
         let upper = (penalty.rank * prepared.n_outputs) as f64;
         let raw = upper - evaluation.penalty_traces[active_index];
         edf_by_penalty[penalty.output_slot] =
@@ -718,9 +719,8 @@ impl PreparedSharedTangent {
                 self.penalties.len()
             )));
         }
-        if rho.iter().any(|value| !value.is_finite()) {
-            return Err(invalid("log-lambdas must be finite"));
-        }
+        gam_problem::validate_log_strengths(rho.iter().copied())
+            .map_err(|error| invalid(format!("shared-tangent rho: {error}")))?;
         match &self.statistics {
             SufficientStatistics::Isotropic { gram, cross } => {
                 self.evaluate_isotropic(rho, gram, cross)
@@ -808,6 +808,7 @@ impl PreparedSharedTangent {
             coefficients,
             profiled_deviance,
             penalty_traces,
+            lambdas,
         })
     }
 
@@ -902,6 +903,7 @@ impl PreparedSharedTangent {
             coefficients,
             profiled_deviance,
             penalty_traces,
+            lambdas,
         })
     }
 
@@ -967,16 +969,12 @@ impl PreparedSharedTangent {
         rho: &Array1<f64>,
     ) -> Result<(Array2<f64>, Array1<f64>), EstimationError> {
         let mut combined = Array2::<f64>::zeros((self.n_coefficients, self.n_coefficients));
-        let mut lambdas = Array1::<f64>::zeros(rho.len());
+        let lambdas = Array1::from_vec(
+            gam_problem::checked_exp_log_strengths(rho.iter().copied())
+                .map_err(|error| invalid(format!("shared-tangent rho: {error}")))?,
+        );
         for (index, penalty) in self.penalties.iter().enumerate() {
-            let lambda = rho[index].exp();
-            if !lambda.is_finite() || lambda <= 0.0 {
-                return Err(invalid(format!(
-                    "log-lambda {} exponentiated to invalid value {lambda}",
-                    rho[index]
-                )));
-            }
-            lambdas[index] = lambda;
+            let lambda = lambdas[index];
             for local_row in 0..penalty.local.nrows() {
                 for local_col in 0..penalty.local.ncols() {
                     combined[[

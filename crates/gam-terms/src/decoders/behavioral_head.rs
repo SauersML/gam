@@ -638,7 +638,8 @@ pub fn head_feature_significance(
             format!("head_feature_significance: invalid calibrated axis p-value: {err}")
         })?);
     }
-    let fdr_rejected = e_benjamini_hochberg(&log_e_values, alpha);
+    let fdr_rejected = e_benjamini_hochberg(&log_e_values, alpha)
+        .map_err(|error| format!("head_feature_significance: {error}"))?;
     Ok(HeadFeatureSignificance {
         statistic,
         p_value,

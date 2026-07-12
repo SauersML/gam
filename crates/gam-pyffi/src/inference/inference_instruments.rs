@@ -148,8 +148,9 @@ impl PyAtomBirthGate {
 pub(crate) fn split_likelihood_log_e(
     log_lik_alternative_on_eval: f64,
     log_lik_null_sup_on_eval: f64,
-) -> f64 {
+) -> PyResult<f64> {
     split_likelihood_log_e_value(log_lik_alternative_on_eval, log_lik_null_sup_on_eval)
+        .map_err(|error| py_value_error(error.to_string()))
 }
 
 /// e-BH dictionary certificate (Wang–Ramdas, issue #984): FDR control over the
@@ -158,8 +159,11 @@ pub(crate) fn split_likelihood_log_e(
 /// sharing every token violate PRDS). Returns the sorted indices of the
 /// CONFIRMED claims with FDR ≤ `alpha`.
 #[pyfunction]
-pub(crate) fn e_bh_dictionary_certificate(log_e_values: Vec<f64>, alpha: f64) -> Vec<usize> {
-    e_benjamini_hochberg(&log_e_values, alpha)
+pub(crate) fn e_bh_dictionary_certificate(
+    log_e_values: Vec<f64>,
+    alpha: f64,
+) -> PyResult<Vec<usize>> {
+    e_benjamini_hochberg(&log_e_values, alpha).map_err(|error| py_value_error(error.to_string()))
 }
 
 /// Calibrate a p-value into a (conservative, valid) log e-value via the
@@ -210,8 +214,10 @@ pub(crate) fn sae_structure_certificate_report(
     let entries = &cert.entries;
     let m = entries.len();
     let log_e: Vec<f64> = entries.iter().map(|entry| entry.log_e).collect();
-    let confirmed_idx: std::collections::HashSet<usize> =
-        e_benjamini_hochberg(&log_e, level).into_iter().collect();
+    let confirmed_idx: std::collections::HashSet<usize> = e_benjamini_hochberg(&log_e, level)
+        .map_err(|error| py_value_error(error.to_string()))?
+        .into_iter()
+        .collect();
     // rank_of[i] = 1-based rank of claim i in descending log_e order (stable on
     // ties, so equal log_e keep ascending index order — matching the facade's
     // `sorted(..., reverse=True)`).
@@ -1138,8 +1144,8 @@ mod tests {
     #[test]
     fn split_lr_log_e_is_the_likelihood_difference() {
         // log E = ℓ_alt − sup ℓ_null; a calibrated null (alt = null sup) is 0.
-        assert!((split_likelihood_log_e(-10.0, -10.0)).abs() < 1e-15);
-        assert!((split_likelihood_log_e(-8.0, -10.0) - 2.0).abs() < 1e-15);
+        assert!((split_likelihood_log_e(-10.0, -10.0).unwrap()).abs() < 1e-15);
+        assert!((split_likelihood_log_e(-8.0, -10.0).unwrap() - 2.0).abs() < 1e-15);
     }
 
     #[test]
@@ -1147,7 +1153,7 @@ mod tests {
         // One overwhelming claim (log e huge) clears the e-BH threshold; a
         // cluster of near-1 e-values (log e ≈ 0) does not.
         let logs = vec![20.0_f64.ln() * 5.0, 0.01, -0.2, 0.0];
-        let confirmed = e_bh_dictionary_certificate(logs, 0.05);
+        let confirmed = e_bh_dictionary_certificate(logs, 0.05).unwrap();
         assert_eq!(confirmed, vec![0]);
     }
 

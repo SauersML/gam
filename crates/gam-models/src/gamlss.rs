@@ -39,7 +39,7 @@ use crate::custom_family::{
     CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
     CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyPsiSecondDesignAction,
     CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
-    ExactNewtonJointPsiDirectCache, FamilyChannelHessian, FamilyEvaluation, ParameterBlockSpec,
+    ExactNewtonJointPsiDirectCache, FamilyEvaluation, ParameterBlockSpec,
     ParameterBlockState, PenaltyMatrix, PsiDesignMap, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
     resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
@@ -169,7 +169,7 @@ use weighted_design_products::{
 };
 
 mod row_linalg;
-use row_linalg::{psd_clamp_2x2, scale_matrix_rows};
+use row_linalg::scale_matrix_rows;
 
 mod joint_packing;
 use joint_packing::{

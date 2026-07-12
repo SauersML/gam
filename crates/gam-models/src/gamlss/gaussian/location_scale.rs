@@ -1016,144 +1016,6 @@ impl GaussianLocationScaleFamily {
     }
 }
 
-/// Per-subject 2×2 channel Hessian `W_i` for Gaussian location-scale.
-///
-/// The row negative log-likelihood (with per-row weight `w_i`, response `y_i`,
-/// mean predictor `μ_i`, log-scale predictor `s_i = log σ_i`) is
-///
-/// ```text
-/// ρ_i(μ, s) = w_i [s + 0.5·(y_i − μ)²·exp(−2s)]
-/// ```
-///
-/// The 2×2 Hessian in `(μ, s)` coordinates:
-///
-/// ```text
-/// W_i[0,0] = w_i · exp(−2 s_i)                        ∂²ρ/∂μ²
-/// W_i[1,1] = w_i · 2·(y_i − μ_i)²·exp(−2 s_i)        ∂²ρ/∂s²
-/// W_i[0,1] = W_i[1,0] = w_i · 2·(y_i − μ_i)·exp(−2 s_i)  ∂²ρ/∂μ∂s
-/// ```
-///
-/// The off-diagonal cross-channel term `∂²ρ/∂μ∂s` is nonzero whenever the
-/// residual `(y_i − μ_i) ≠ 0`, i.e. away from the fitted mean.
-pub struct GaussianLocationScaleChannelHessian {
-    /// Row-major `(n × 2 × 2)` PSD-clamped per-subject Hessian.
-    pub(crate) h: ndarray::Array3<f64>,
-}
-
-impl GaussianLocationScaleChannelHessian {
-    /// Construct the raw (un-PSD-clamped) per-subject observed Hessian.
-    ///
-    /// For Gaussian location-scale the 2×2 observed Hessian
-    /// `[[w·e^{-2s}, 2·w·r·e^{-2s}], [2·w·r·e^{-2s}, 2·w·r²·e^{-2s}]]`
-    /// has determinant `-2·w²·r²·e^{-4s}` which is non-positive whenever
-    /// the residual `r = y − μ ≠ 0`. Tests that finite-difference the row
-    /// NLL must compare against this raw observed Hessian — PSD clamping
-    /// alters the eigenvalues and the FD-versus-closed-form match fails.
-    ///
-    /// Production code that needs a PSD matrix (e.g. the canonicalize gate)
-    /// must call [`Self::from_pilot`] which PSD-clamps via 2×2
-    /// eigendecomposition.
-    pub fn from_pilot_observed_unclamped(
-        y: &ndarray::Array1<f64>,
-        w: &ndarray::Array1<f64>,
-        eta_mu: &ndarray::Array1<f64>,
-        eta_log_sigma: &ndarray::Array1<f64>,
-    ) -> Result<Self, String> {
-        let n = y.len();
-        if w.len() != n || eta_mu.len() != n || eta_log_sigma.len() != n {
-            return Err(format!(
-                "GaussianLocationScaleChannelHessian::from_pilot_observed_unclamped: \
-                 length mismatch y={n} w={} eta_mu={} eta_log_sigma={}",
-                w.len(),
-                eta_mu.len(),
-                eta_log_sigma.len(),
-            ));
-        }
-        let mut h = ndarray::Array3::<f64>::zeros((n, 2, 2));
-        for i in 0..n {
-            let wi = w[i];
-            let mu_i = eta_mu[i];
-            let s_i = eta_log_sigma[i];
-            let inv_sigma2 = (-2.0 * s_i).exp();
-            let resid = y[i] - mu_i;
-            h[[i, 0, 0]] = wi * inv_sigma2;
-            h[[i, 1, 1]] = wi * 2.0 * resid * resid * inv_sigma2;
-            h[[i, 0, 1]] = wi * 2.0 * resid * inv_sigma2;
-            h[[i, 1, 0]] = h[[i, 0, 1]];
-        }
-        Ok(Self { h })
-    }
-
-    /// Construct from pilot predictors (μ and log σ at current β) and data,
-    /// with PSD eigenvalue clamping applied per subject.
-    ///
-    /// `y` is the response, `w` the per-row sample weights, `eta_mu` and
-    /// `eta_log_sigma` the current linear predictors. Negative eigenvalues
-    /// are projected to zero (PSD clamp) before storage so the resulting
-    /// matrix is a valid metric for the W-Gram identifiability compile.
-    pub fn from_pilot(
-        y: &ndarray::Array1<f64>,
-        w: &ndarray::Array1<f64>,
-        eta_mu: &ndarray::Array1<f64>,
-        eta_log_sigma: &ndarray::Array1<f64>,
-    ) -> Result<Self, String> {
-        let n = y.len();
-        if w.len() != n || eta_mu.len() != n || eta_log_sigma.len() != n {
-            return Err(format!(
-                "GaussianLocationScaleChannelHessian::from_pilot: \
-                 length mismatch y={n} w={} eta_mu={} eta_log_sigma={}",
-                w.len(),
-                eta_mu.len(),
-                eta_log_sigma.len(),
-            ));
-        }
-        let mut h = ndarray::Array3::<f64>::zeros((n, 2, 2));
-        for i in 0..n {
-            let wi = w[i];
-            let mu_i = eta_mu[i];
-            let s_i = eta_log_sigma[i];
-            let inv_sigma2 = (-2.0 * s_i).exp(); // exp(-2s) = 1/sigma^2
-            let resid = y[i] - mu_i;
-            // Hessian of w_i * ρ_i
-            let h00 = wi * inv_sigma2;
-            let h11 = wi * 2.0 * resid * resid * inv_sigma2;
-            let h01 = wi * 2.0 * resid * inv_sigma2;
-            // PSD clamp via eigendecomposition of 2×2 matrix.
-            // psd_clamp_2x2 returns (λ1, λ2, u1[0], u1[1], u2[0], u2[1])
-            // where u1 and u2 are unit eigenvectors for λ1 and λ2.
-            // Reconstruction: H_psd = λ1·u1·u1ᵀ + λ2·u2·u2ᵀ
-            let (e0, e1, u1_0, u1_1, u2_0, u2_1) = psd_clamp_2x2(h00, h01, h11);
-            h[[i, 0, 0]] = e0 * u1_0 * u1_0 + e1 * u2_0 * u2_0;
-            h[[i, 0, 1]] = e0 * u1_0 * u1_1 + e1 * u2_0 * u2_1;
-            h[[i, 1, 0]] = h[[i, 0, 1]];
-            h[[i, 1, 1]] = e0 * u1_1 * u1_1 + e1 * u2_1 * u2_1;
-        }
-        Ok(Self { h })
-    }
-}
-
-impl FamilyChannelHessian for GaussianLocationScaleChannelHessian {
-    fn n_outputs(&self) -> usize {
-        2
-    }
-
-    fn n_subjects(&self) -> usize {
-        self.h.shape()[0]
-    }
-
-    fn fill_subject(&self, i: usize, out: &mut [f64]) {
-        assert_eq!(out.len(), 4);
-        out[0] = self.h[[i, 0, 0]];
-        out[1] = self.h[[i, 0, 1]];
-        out[2] = self.h[[i, 1, 0]];
-        out[3] = self.h[[i, 1, 1]];
-    }
-
-    fn evaluate_full(&self) -> ndarray::Array3<f64> {
-        self.h.clone()
-    }
-}
-
 impl CustomFamily for GaussianLocationScaleFamily {
     /// The Gaussian location-scale joint curvature is the OBSERVED joint
     /// Hessian (Wood–Pya–Säfken 2016 LAML object; #1561): (μ,μ) weight `w = a/σ²`,
@@ -1256,104 +1118,41 @@ impl CustomFamily for GaussianLocationScaleFamily {
         // so these Diagonal weights are only used for the inner IRLS iteration
         // (where Fisher scoring is fine). See response.md Section 3.
         //
-        let mut zmu = Array1::<f64>::zeros(n);
-        let mut wmu = Array1::<f64>::zeros(n);
-        let mut z_ls = Array1::<f64>::zeros(n);
-        let mut w_ls = Array1::<f64>::zeros(n);
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
-        let mut ll = 0.0;
-
-        const CHUNK: usize = 1024;
-        if let (
-            Some(y_s),
-            Some(w_s),
-            Some(mu_s),
-            Some(ls_s),
-            Some(zmu_s),
-            Some(wmu_s),
-            Some(zls_s),
-            Some(wls_s),
-        ) = (
-            self.y.as_slice_memory_order(),
-            self.weights.as_slice_memory_order(),
-            etamu.as_slice_memory_order(),
-            eta_log_sigma.as_slice_memory_order(),
-            zmu.as_slice_memory_order_mut(),
-            wmu.as_slice_memory_order_mut(),
-            z_ls.as_slice_memory_order_mut(),
-            w_ls.as_slice_memory_order_mut(),
-        ) {
-            // Per-row Gaussian LS kernel writes 4 working arrays directly into
-            // the output slices; ll partials are collected in chunk-index
-            // order (deterministic) and reduced with a length-only-dependent
-            // pairwise sum. Independent across rows.
-            let ll_partials: Vec<f64> = zmu_s
-                .par_chunks_mut(CHUNK)
-                .zip(wmu_s.par_chunks_mut(CHUNK))
-                .zip(zls_s.par_chunks_mut(CHUNK))
-                .zip(wls_s.par_chunks_mut(CHUNK))
-                .enumerate()
-                .map(|(chunk_idx, (((zmu_c, wmu_c), zls_c), wls_c))| {
-                    let start = chunk_idx * CHUNK;
-                    let mut local_ll = 0.0;
-                    for local in 0..zmu_c.len() {
-                        let i = start + local;
-                        let row =
-                            gaussian_diagonal_row_kernel(y_s[i], mu_s[i], ls_s[i], w_s[i], ln2pi);
-                        zmu_c[local] = mu_s[i] + row.location_working_shift;
-                        wmu_c[local] = row.location_working_weight;
-                        zls_c[local] = row.log_sigma_working_response;
-                        wls_c[local] = row.log_sigma_working_weight;
-                        local_ll += row.log_likelihood;
-                    }
-                    local_ll
-                })
-                .collect();
-            ll += gam_linalg::pairwise_reduce::pairwise_sum(&ll_partials);
-        } else {
-            // Fallback path: inputs are not contiguous. Outputs (just-allocated
-            // Array1::zeros) always are. Reborrow input views into the closure.
-            let y_view = self.y.view();
-            let w_view = self.weights.view();
-            let mu_view = etamu.view();
-            let ls_view = eta_log_sigma.view();
-            let zmu_s = zmu
-                .as_slice_memory_order_mut()
-                .expect("zeros is contiguous");
-            let wmu_s = wmu
-                .as_slice_memory_order_mut()
-                .expect("zeros is contiguous");
-            let zls_s = z_ls
-                .as_slice_memory_order_mut()
-                .expect("zeros is contiguous");
-            let wls_s = w_ls
-                .as_slice_memory_order_mut()
-                .expect("zeros is contiguous");
-            let ll_partials: Vec<f64> = zmu_s
-                .par_chunks_mut(CHUNK)
-                .zip(wmu_s.par_chunks_mut(CHUNK))
-                .zip(zls_s.par_chunks_mut(CHUNK))
-                .zip(wls_s.par_chunks_mut(CHUNK))
-                .enumerate()
-                .map(|(chunk_idx, (((zmu_c, wmu_c), zls_c), wls_c))| {
-                    let start = chunk_idx * CHUNK;
-                    let mut local_ll = 0.0;
-                    for local in 0..zmu_c.len() {
-                        let i = start + local;
-                        let row = gaussian_diagonal_row_kernel(
-                            y_view[i], mu_view[i], ls_view[i], w_view[i], ln2pi,
-                        );
-                        zmu_c[local] = mu_view[i] + row.location_working_shift;
-                        wmu_c[local] = row.location_working_weight;
-                        zls_c[local] = row.log_sigma_working_response;
-                        wls_c[local] = row.log_sigma_working_weight;
-                        local_ll += row.log_likelihood;
-                    }
-                    local_ll
-                })
-                .collect();
-            ll += gam_linalg::pairwise_reduce::pairwise_sum(&ll_partials);
+        let certified: Vec<Result<GaussianDiagonalRowKernel, String>> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                gaussian_diagonal_row_kernel(
+                    i,
+                    self.y[i],
+                    etamu[i],
+                    eta_log_sigma[i],
+                    self.weights[i],
+                    ln2pi,
+                )
+            })
+            .collect();
+        let mut rows = Vec::with_capacity(n);
+        for row in certified {
+            rows.push(row?);
         }
+        let mut ll = 0.0;
+        for (i, row) in rows.iter().enumerate() {
+            ll += row.log_likelihood;
+            if !ll.is_finite() {
+                return Err(GamlssError::RowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "Gaussian cumulative log likelihood",
+                    eta: eta_log_sigma[i],
+                    value: ll,
+                }
+                .into());
+            }
+        }
+        let zmu = self.y.clone();
+        let wmu = Array1::from_iter(rows.iter().map(|row| row.location_working_weight));
+        let z_ls = Array1::from_iter(rows.iter().map(|row| row.log_sigma_working_response));
+        let w_ls = Array1::from_iter(rows.iter().map(|row| row.log_sigma_working_weight));
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,
@@ -1375,38 +1174,27 @@ impl CustomFamily for GaussianLocationScaleFamily {
             }
             .into());
         }
-        // logb noise link: σ(η_ls) = LOGB_SIGMA_FLOOR + exp(η_ls). σ ≥ b > 0
-        // bounds the loglik below (−Σlog σ ≥ −n log b) and bounds 1/σ² by 1/b²,
-        // so the previous `inv_s2.min(1e24)` cap is structurally unnecessary.
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
         let mut ll = 0.0;
-        if let (Some(y_s), Some(w_s), Some(mu_s), Some(ls_s)) = (
-            self.y.as_slice_memory_order(),
-            self.weights.as_slice_memory_order(),
-            etamu.as_slice_memory_order(),
-            eta_log_sigma.as_slice_memory_order(),
-        ) {
-            ll += gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
-                let wi = w_s[i];
-                if wi == 0.0 {
-                    return 0.0;
+        for i in 0..n {
+            ll += gaussian_diagonal_row_kernel(
+                i,
+                self.y[i],
+                etamu[i],
+                eta_log_sigma[i],
+                self.weights[i],
+                ln2pi,
+            )?
+            .log_likelihood;
+            if !ll.is_finite() {
+                return Err(GamlssError::RowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "Gaussian cumulative log likelihood",
+                    eta: eta_log_sigma[i],
+                    value: ll,
                 }
-                let sigma_i = logb_sigma_from_eta_scalar(ls_s[i]);
-                let inv_s2 = (sigma_i * sigma_i).recip();
-                let r = y_s[i] - mu_s[i];
-                wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
-            });
-        } else {
-            ll += gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
-                let wi = self.weights[i];
-                if wi == 0.0 {
-                    return 0.0;
-                }
-                let sigma_i = logb_sigma_from_eta_scalar(eta_log_sigma[i]);
-                let inv_s2 = (sigma_i * sigma_i).recip();
-                let r = self.y[i] - etamu[i];
-                wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
-            });
+                .into());
+            }
         }
         Ok(ll)
     }
@@ -1440,18 +1228,34 @@ impl CustomFamily for GaussianLocationScaleFamily {
             .into());
         }
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
-        let ll: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(subsample.rows.len(), |k| {
-            let row = &subsample.rows[k];
-            let i = row.index;
-            let wi = self.weights[i];
-            if wi == 0.0 {
-                return 0.0;
+        let mut ll = 0.0;
+        for sampled in &subsample.rows {
+            let i = sampled.index;
+            let row_ll = gaussian_diagonal_row_kernel(
+                i,
+                self.y[i],
+                etamu[i],
+                eta_log_sigma[i],
+                self.weights[i],
+                ln2pi,
+            )?
+            .log_likelihood;
+            let contribution = scaled_signed_product3(sampled.weight, row_ll, 1.0);
+            ll += contribution;
+            if !contribution.is_finite() || !ll.is_finite() {
+                return Err(GamlssError::RowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "Gaussian subsampled log likelihood",
+                    eta: eta_log_sigma[i],
+                    value: if contribution.is_finite() {
+                        ll
+                    } else {
+                        contribution
+                    },
+                }
+                .into());
             }
-            let sigma_i = logb_sigma_from_eta_scalar(eta_log_sigma[i]);
-            let inv_s2 = (sigma_i * sigma_i).recip();
-            let r = self.y[i] - etamu[i];
-            row.weight * wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
-        });
+        }
         Ok(ll)
     }
 
@@ -1552,18 +1356,10 @@ impl CustomFamily for GaussianLocationScaleFamily {
             Self::BLOCK_LOG_SIGMA => {
                 // Gaussian log-sigma block:
                 //
-                // The PIRLS information weight is
-                //
-                //   w_ls = max(2 * weight * clamp(g, -1, 1)^2, MIN_WEIGHT),
-                //   g    = sigma'(eta_ls) / sigma(eta_ls),
-                // with the semantic rule that zero observation weights stay zero.
-                //
-                // Along a direction d eta_ls,
-                //
-                //   dw_ls is the directional derivative of that piecewise
-                //   definition. On the active clamp branch or active MIN_WEIGHT
-                //   floor branch, the returned derivative is zero to match the
-                //   selected local piece of the evaluated weight.
+                // The exact PIRLS Fisher weight is
+                // `w_ls = 2 * weight * g^2`, `g = sigma'(eta_ls)/sigma(eta_ls)`.
+                // It is never projected row-by-row; matrix-level stabilization
+                // owns conditioning after the exact derivative is assembled.
                 //
                 // This is the exact directional derivative needed by the REML
                 // trace term
@@ -1573,11 +1369,13 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 //
                 // for diagonal working-set blocks.
                 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-                let dw_vec: Vec<f64> = (0..n)
+                let dw_vec: Vec<Result<f64, String>> = (0..n)
                     .into_par_iter()
                     .map(|i| {
                         let d1 = crate::sigma_link::logb_sigma_jet1_scalar(eta_ls[i]).d1;
                         gaussian_log_sigma_irlsinfo_directional_derivative(
+                            i,
+                            eta_ls[i],
                             self.weights[i],
                             sigma[i],
                             d1,
@@ -1586,7 +1384,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
                     })
                     .collect();
                 for (i, v) in dw_vec.into_iter().enumerate() {
-                    dw[i] = v;
+                    dw[i] = v?;
                 }
                 Ok(Some(dw))
             }

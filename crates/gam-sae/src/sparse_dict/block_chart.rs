@@ -342,7 +342,8 @@ pub fn compose_block_coordinate_charts(
     let mut family_log_e: Vec<f64> = Vec::with_capacity(singles.len() + pairs.len());
     family_log_e.extend(singles.iter().map(|c| c.evidence.log_e));
     family_log_e.extend(pairs.iter().map(|c| c.evidence.log_e));
-    let fdr = super::split_lr_fdr::family_fdr_certificate(family_log_e, CHART_FDR_ALPHA);
+    let fdr = super::split_lr_fdr::family_fdr_certificate(family_log_e, CHART_FDR_ALPHA)
+        .map_err(|error| format!("block chart e-BH certificate: {error}"))?;
     for &idx in &fdr.rejected {
         if idx < singles.len() {
             singles[idx].evidence.fdr_selected = true;

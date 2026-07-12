@@ -2186,78 +2186,67 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
             .into());
         }
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
-        // Per-row kernel emits 6 working values into pre-allocated outputs;
-        // ll is reduced via Rayon's sum. Independent across rows. Note
-        // wmu == ww (both equal location_working_weight) and the mean+wiggle
-        // working responses share row.location_working_shift, applied to
-        // eta_mu[i] and etaw[i] respectively. The previous `q = eta_mu + etaw`
-        // intermediate is inlined to avoid an extra n-vector allocation.
-        let mut zmu = Array1::<f64>::zeros(n);
-        let mut wmu = Array1::<f64>::zeros(n);
-        let mut zls = Array1::<f64>::zeros(n);
-        let mut wls = Array1::<f64>::zeros(n);
-        let mut zw = Array1::<f64>::zeros(n);
-        let mut ww = Array1::<f64>::zeros(n);
-        const CHUNK: usize = 1024;
-        let zmu_s = zmu
-            .as_slice_memory_order_mut()
-            .expect("zeros is contiguous");
-        let wmu_s = wmu
-            .as_slice_memory_order_mut()
-            .expect("zeros is contiguous");
-        let zls_s = zls
-            .as_slice_memory_order_mut()
-            .expect("zeros is contiguous");
-        let wls_s = wls
-            .as_slice_memory_order_mut()
-            .expect("zeros is contiguous");
-        let zw_s = zw.as_slice_memory_order_mut().expect("zeros is contiguous");
-        let ww_s = ww.as_slice_memory_order_mut().expect("zeros is contiguous");
-        let y_view = self.y.view();
-        let w_view = self.weights.view();
-        let eta_mu_view = eta_mu.view();
-        let eta_ls_view = eta_ls.view();
-        let etaw_view = etaw.view();
-        // Per-chunk log-likelihood partials are collected in chunk-index order
-        // (map→collect over an indexed parallel iterator is deterministic),
-        // then reduced with a length-only-dependent pairwise sum.
-        let ll_partials: Vec<f64> = zmu_s
-            .par_chunks_mut(CHUNK)
-            .zip(wmu_s.par_chunks_mut(CHUNK))
-            .zip(zls_s.par_chunks_mut(CHUNK))
-            .zip(wls_s.par_chunks_mut(CHUNK))
-            .zip(zw_s.par_chunks_mut(CHUNK))
-            .zip(ww_s.par_chunks_mut(CHUNK))
-            .enumerate()
-            .map(
-                |(chunk_idx, (((((zmu_c, wmu_c), zls_c), wls_c), zw_c), ww_c))| {
-                    let start = chunk_idx * CHUNK;
-                    let mut local_ll = 0.0;
-                    for local in 0..zmu_c.len() {
-                        let i = start + local;
-                        let q_i = eta_mu_view[i] + etaw_view[i];
-                        let row = gaussian_diagonal_row_kernel(
-                            y_view[i],
-                            q_i,
-                            eta_ls_view[i],
-                            w_view[i],
-                            ln2pi,
-                        );
-                        let w_i = row.location_working_weight;
-                        let shift = row.location_working_shift;
-                        zmu_c[local] = eta_mu_view[i] + shift;
-                        wmu_c[local] = w_i;
-                        zw_c[local] = etaw_view[i] + shift;
-                        ww_c[local] = w_i;
-                        zls_c[local] = row.log_sigma_working_response;
-                        wls_c[local] = row.log_sigma_working_weight;
-                        local_ll += row.log_likelihood;
+        let certified: Vec<Result<(GaussianDiagonalRowKernel, f64, f64), String>> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let q = eta_mu[i] + etaw[i];
+                if !q.is_finite() {
+                    return Err(GamlssError::RowGeometryUnrepresentable {
+                        row: i,
+                        quantity: "Gaussian mean-plus-wiggle predictor",
+                        eta: eta_mu[i],
+                        value: q,
                     }
-                    local_ll
-                },
-            )
+                    .into());
+                }
+                let z_mu = self.y[i] - etaw[i];
+                let z_wiggle = self.y[i] - eta_mu[i];
+                if !z_mu.is_finite() || !z_wiggle.is_finite() {
+                    return Err(GamlssError::RowGeometryUnrepresentable {
+                        row: i,
+                        quantity: "Gaussian wiggle working response",
+                        eta: q,
+                        value: if z_mu.is_finite() { z_wiggle } else { z_mu },
+                    }
+                    .into());
+                }
+                Ok((
+                    gaussian_diagonal_row_kernel(
+                        i,
+                        self.y[i],
+                        q,
+                        eta_ls[i],
+                        self.weights[i],
+                        ln2pi,
+                    )?,
+                    z_mu,
+                    z_wiggle,
+                ))
+            })
             .collect();
-        let ll: f64 = gam_linalg::pairwise_reduce::pairwise_sum(&ll_partials);
+        let mut rows = Vec::with_capacity(n);
+        for row in certified {
+            rows.push(row?);
+        }
+        let mut ll = 0.0;
+        for (i, row) in rows.iter().enumerate() {
+            ll += row.0.log_likelihood;
+            if !ll.is_finite() {
+                return Err(GamlssError::RowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "Gaussian wiggle cumulative log likelihood",
+                    eta: eta_ls[i],
+                    value: ll,
+                }
+                .into());
+            }
+        }
+        let zmu = Array1::from_iter(rows.iter().map(|row| row.1));
+        let zw = Array1::from_iter(rows.iter().map(|row| row.2));
+        let wmu = Array1::from_iter(rows.iter().map(|row| row.0.location_working_weight));
+        let ww = wmu.clone();
+        let zls = Array1::from_iter(rows.iter().map(|row| row.0.log_sigma_working_response));
+        let wls = Array1::from_iter(rows.iter().map(|row| row.0.log_sigma_working_weight));
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,
@@ -2288,14 +2277,28 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
             }
             .into());
         }
-        let q = eta_mu + etaw;
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
         let mut ll = 0.0;
         for i in 0..self.y.len() {
-            let sigma_i = logb_sigma_from_eta_scalar(eta_ls[i]);
-            let inv_s2 = (sigma_i * sigma_i).recip();
-            let r = self.y[i] - q[i];
-            ll += self.weights[i] * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()));
+            let q = eta_mu[i] + etaw[i];
+            ll += gaussian_diagonal_row_kernel(
+                i,
+                self.y[i],
+                q,
+                eta_ls[i],
+                self.weights[i],
+                ln2pi,
+            )?
+            .log_likelihood;
+            if !ll.is_finite() {
+                return Err(GamlssError::RowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "Gaussian wiggle cumulative log likelihood",
+                    eta: eta_ls[i],
+                    value: ll,
+                }
+                .into());
+            }
         }
         Ok(ll)
     }
@@ -2334,18 +2337,32 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
             .into());
         }
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
-        let ll: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(subsample.rows.len(), |k| {
-            let row = &subsample.rows[k];
-            let i = row.index;
-            let wi = self.weights[i];
-            if wi == 0.0 {
-                return 0.0;
+        let mut ll = 0.0;
+        for (k, sampled) in subsample.rows.iter().enumerate() {
+            let i = sampled.index;
+            let q = eta_mu[i] + etaw[i];
+            let row_ll = gaussian_diagonal_row_kernel(
+                i,
+                self.y[i],
+                q,
+                eta_ls[i],
+                self.weights[i],
+                ln2pi,
+            )?
+            .log_likelihood;
+            let contribution = scaled_signed_product3(sampled.weight, row_ll, 1.0);
+            ll += contribution;
+            if !contribution.is_finite() || !ll.is_finite() {
+                return Err(GamlssError::RowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "Gaussian wiggle subsampled log likelihood",
+                    eta: eta_ls[i],
+                    value: if contribution.is_finite() { ll } else { contribution },
+                }
+                .into());
             }
-            let sigma_i = logb_sigma_from_eta_scalar(eta_ls[i]);
-            let inv_s2 = (sigma_i * sigma_i).recip();
-            let r = self.y[i] - eta_mu[i] - etaw[i];
-            row.weight * wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
-        });
+            let _ = k;
+        }
         Ok(ll)
     }
 

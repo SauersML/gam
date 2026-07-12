@@ -112,7 +112,9 @@ mod linux_impl {
     use gam_linalg::matrix::DesignMatrix;
     use gam_linalg::matrix::SymmetricMatrix;
     use gam_problem::LinearInequalityConstraints;
-    use gam_problem::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor};
+    use gam_problem::{
+        Coefficients, EstimationError, GlmLikelihoodSpec, InverseLink, LinearPredictor,
+    };
     use gam_terms::construction::ReparamResult;
 
     /// All inputs needed for the GPU PIRLS loop end-to-end. Built by the
@@ -234,7 +236,7 @@ mod linux_impl {
     /// and the full CPU-oracle surface was assembled.
     pub fn try_gpu_pirls_loop_dispatch(
         input: GpuPirlsDispatchInput<'_>,
-    ) -> Option<Result<(PirlsResult, WorkingModelPirlsResult), String>> {
+    ) -> Option<Result<(PirlsResult, WorkingModelPirlsResult), EstimationError>> {
         // Honor the documented GPU policy: never route to the GPU loop when
         // the caller has explicitly selected CPU execution.
         if !cuda_selected() {
@@ -273,7 +275,7 @@ mod linux_impl {
         curvature: CurvatureMode,
         n: usize,
         p: usize,
-    ) -> Result<(PirlsResult, WorkingModelPirlsResult), String> {
+    ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
         assert_eq!(admission.n, n);
         assert_eq!(admission.p, p);
         // --- Device upload + workspace allocation -----------------------
@@ -283,15 +285,19 @@ mod linux_impl {
             input.y,
             input.priorweights,
             input.offset,
-        )?;
+        )
+        .map_err(EstimationError::InvalidInput)?;
         // Upload Qs for this ρ/σ point. Identity when no reparameterization.
-        let mut ws = pirls_gpu::allocate_sigma_pirls_workspace(&shared)?;
+        let mut ws = pirls_gpu::allocate_sigma_pirls_workspace(&shared)
+            .map_err(EstimationError::InvalidInput)?;
         if let Some(qs) = input.qs {
-            pirls_gpu::upload_qs_pirls(&mut ws, qs)?;
+            pirls_gpu::upload_qs_pirls(&mut ws, qs).map_err(EstimationError::InvalidInput)?;
         } else {
-            pirls_gpu::upload_qs_identity_pirls(&mut ws)?;
+            pirls_gpu::upload_qs_identity_pirls(&mut ws)
+                .map_err(EstimationError::InvalidInput)?;
         }
-        let mut loop_ws = pirls_gpu::allocate_pirls_loop_workspace(&shared, &ws)?;
+        let mut loop_ws = pirls_gpu::allocate_pirls_loop_workspace(&shared, &ws)
+            .map_err(EstimationError::InvalidInput)?;
 
         let lm_ridge = input.initial_lm_lambda.unwrap_or(1e-6);
         // Forward the active Gamma shape so the GammaLog kernel uses the
@@ -342,7 +348,11 @@ mod linux_impl {
             input.max_iterations,
             input.convergence_tolerance,
             Some(&extra),
-        )?;
+        )
+        .map_err(|error| match error {
+            cuda::PirlsGpuLoopError::Geometry(error) => error,
+            cuda::PirlsGpuLoopError::Runtime(message) => EstimationError::InvalidInput(message),
+        })?;
 
         // --- Assemble PirlsResult + WorkingModelPirlsResult ------------
         let cuda::PirlsLoopOutcome {
@@ -378,24 +388,7 @@ mod linux_impl {
             final_lm_lambda,
             min_deviance,
             max_abs_eta,
-            per_row_status_or,
         } = outcome;
-        // per_row_status_or already drives `status` (Unstable when forbidden
-        // bits are set) via build_loop_outcome. Enforce the invariant here so
-        // a future regression that breaks the loop's classification is caught
-        // at the dispatch boundary rather than silently passing a corrupt
-        // iterate to the outer REML loop.
-        {
-            const FORBIDDEN_ROW: u32 = crate::gpu_kernels::pirls_row::status_flags::INVALID_RESPONSE
-                | crate::gpu_kernels::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
-            if (per_row_status_or & FORBIDDEN_ROW) != 0 && !matches!(status, PirlsStatus::Unstable)
-            {
-                return Err(format!(
-                    "GPU PIRLS: per_row_status_or={per_row_status_or:#010x} has forbidden row \
-                     status bits but outcome status is {status:?} — expected Unstable"
-                ));
-            }
-        }
 
         // `logdet` corresponds to log|H_penalized| at the converged β; it is
         // not on the CPU oracle's `PirlsResult` surface (REML recomputes it
@@ -403,9 +396,9 @@ mod linux_impl {
         // catches a non-PD final factorisation before downstream code
         // touches the Hessian.
         if !logdet.is_finite() {
-            return Err(format!(
+            return Err(EstimationError::InvalidInput(format!(
                 "GPU PIRLS loop returned non-finite log|H| = {logdet}"
-            ));
+            )));
         }
         // `converged` already feeds `status` (Converged / Unstable /
         // MaxIterationsReached); make the relationship explicit so a future

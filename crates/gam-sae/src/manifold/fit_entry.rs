@@ -1152,7 +1152,9 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
 
     // Anytime-valid structure certificate (#1058 / #984): the e-BH certificate
     // over the ledger's per-claim e-processes at the search FDR level α = 0.05.
-    let structure_certificate = structure_ledger.certify(0.05);
+    let structure_certificate = structure_ledger
+        .certify(0.05)
+        .map_err(|error| error.to_string())?;
     let structure_certificate_json =
         serde_json::to_string(&structure_certificate).map_err(|e| e.to_string())?;
 
@@ -1491,7 +1493,9 @@ pub fn run_sae_manifold_certify(request: SaeCertifyRequest) -> Result<SaeFitRepo
     // Anytime-valid structure certificate (#1058 / #984), exactly as the fit
     // entry produces it — empty ledger certifies trivially when the search did
     // not run.
-    let structure_certificate = structure_ledger.certify(0.05);
+    let structure_certificate = structure_ledger
+        .certify(0.05)
+        .map_err(|error| error.to_string())?;
     let structure_certificate_json =
         serde_json::to_string(&structure_certificate).map_err(|e| e.to_string())?;
 

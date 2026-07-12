@@ -302,7 +302,9 @@ pub fn wbic_lambda_dynamics(input: &WbicDynamicsInput<'_>) -> Result<WbicDynamic
         }
 
         // Per-atom e-BH over the steps: a confirmed POSITIVE jump is a birth.
-        let cert = birth_evidence.certify(input.birth_alpha);
+        let cert = birth_evidence
+            .certify(input.birth_alpha)
+            .map_err(|error| error.to_string())?;
         for (jump, entry) in jumps.iter_mut().zip(cert.entries.iter()) {
             jump.born = entry.confirmed && jump.delta_lambda > 0.0;
         }
@@ -328,7 +330,8 @@ pub fn wbic_lambda_dynamics(input: &WbicDynamicsInput<'_>) -> Result<WbicDynamic
         .collect::<Result<Vec<_>, _>>()?;
     // e-BH natively accepts −∞ as exact zero e-value, so a never-born atom is
     // represented exactly rather than by an arbitrary finite sentinel.
-    let cross_atom_born = e_benjamini_hochberg(&peak_log_e, input.birth_alpha);
+    let cross_atom_born =
+        e_benjamini_hochberg(&peak_log_e, input.birth_alpha).map_err(|error| error.to_string())?;
 
     Ok(WbicDynamicsReport {
         atoms,
@@ -724,6 +727,7 @@ mod tests {
         let total_log_e = |a: &AtomLambdaTrajectory| -> f64 {
             a.birth_evidence
                 .certify(0.05)
+                .unwrap()
                 .entries
                 .iter()
                 .map(|e| e.log_e)

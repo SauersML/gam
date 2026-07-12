@@ -622,7 +622,7 @@ mod tests {
         assert!(!out.state.contains(&"fake"));
 
         // Ledger: birth claim certified, fusion claim contested with evidence.
-        let cert = ledger.certify(0.05);
+        let cert = ledger.certify(0.05).unwrap();
         let confirmed: Vec<_> = cert.confirmed().map(|e| e.kind.clone()).collect();
         assert!(confirmed.contains(&ClaimKind::AtomExists { atom: 100 }));
         assert!(

@@ -192,9 +192,8 @@ pub mod status_codes {
     pub const FISHER_WEIGHT: u32 = 6;
     pub const OBSERVED_WEIGHT: u32 = 7;
     pub const GRADIENT: u32 = 8;
-    pub const WORKING_RESPONSE: u32 = 9;
-    pub const DEVIANCE: u32 = 10;
-    pub const FINAL_OUTPUT: u32 = 11;
+    pub const DEVIANCE: u32 = 9;
+    pub const FINAL_OUTPUT: u32 = 10;
 
     pub const fn quantity(code: u32) -> &'static str {
         match code {
@@ -206,7 +205,6 @@ pub mod status_codes {
             FISHER_WEIGHT => "Fisher weight",
             OBSERVED_WEIGHT => "observed Hessian weight",
             GRADIENT => "eta gradient",
-            WORKING_RESPONSE => "working response",
             DEVIANCE => "deviance contribution",
             FINAL_OUTPUT => "final row output",
             _ => "unknown GPU PIRLS refusal",
@@ -391,6 +389,73 @@ fn certify_output(row: usize, eta: f64, output: RowOutput) -> Result<RowOutput, 
     Ok(output)
 }
 
+/// Evaluate `a*b/c` while avoiding a false overflow/underflow caused solely by
+/// operation order.  At least one of the product-first or quotient-first forms
+/// is normally representable whenever the final positive f64 is; all three are
+/// tried in a fixed order so CPU/device refusal and rounding stay deterministic.
+#[inline]
+fn positive_mul_div(a: f64, b: f64, c: f64) -> f64 {
+    let product = a * b;
+    if product.is_finite() && product > 0.0 {
+        let value = product / c;
+        if value.is_finite() && value > 0.0 {
+            return value;
+        }
+    }
+    let quotient_a = a / c;
+    if quotient_a.is_finite() && quotient_a > 0.0 {
+        let value = quotient_a * b;
+        if value.is_finite() && value > 0.0 {
+            return value;
+        }
+    }
+    let quotient_b = b / c;
+    if quotient_b.is_finite() && quotient_b > 0.0 {
+        let value = quotient_b * a;
+        if value.is_finite() && value > 0.0 {
+            return value;
+        }
+    }
+    product / c
+}
+
+/// `u - log1p(u)` without cancellation around zero.
+#[inline]
+fn gamma_unit_deviance_near_one(u: f64) -> f64 {
+    if u.abs() > 0.125 {
+        return u - u.ln_1p();
+    }
+    let mut power = u * u;
+    let mut sum = 0.5 * power;
+    for degree in 3..=14 {
+        power *= u;
+        let term = power / f64::from(degree);
+        if degree % 2 == 0 {
+            sum += term;
+        } else {
+            sum -= term;
+        }
+    }
+    sum
+}
+
+/// `(1+u)log1p(u)-u` without cancellation around zero.
+#[inline]
+fn poisson_unit_deviance_near_one(u: f64) -> f64 {
+    if u.abs() > 0.125 {
+        return (1.0 + u) * u.ln_1p() - u;
+    }
+    let mut power = u * u;
+    let mut sum = 0.5 * power;
+    for degree in 3..=14 {
+        power *= u;
+        let coefficient =
+            if degree % 2 == 0 { 1.0 } else { -1.0 } / (f64::from(degree) * f64::from(degree - 1));
+        sum += coefficient * power;
+    }
+    sum
+}
+
 #[inline]
 fn row_gaussian_identity(
     row: usize,
@@ -442,7 +507,7 @@ fn row_poisson_log(
             input.eta,
             RowOutput {
                 mu,
-            status: status_codes::OK,
+                status: status_codes::OK,
                 ..RowOutput::default()
             },
         );
@@ -451,18 +516,19 @@ fn row_poisson_log(
     if !(w_fisher.is_finite() && w_fisher > 0.0) {
         return Err(row_error(row, "Poisson Fisher weight", input.eta, w_fisher));
     }
-    let ratio_resid = input.y / mu - 1.0;
-    let z = input.eta + ratio_resid;
-    if !z.is_finite() {
-        return Err(row_error(row, "Poisson working response", input.eta, z));
-    }
-    let grad_eta = w_prior * (input.y - mu);
-    let dev_term = if input.y > 0.0 {
-        input.y * (input.y.ln() - input.eta) - (input.y - mu)
+    let weighted_y = w_prior * input.y;
+    let grad_eta = weighted_y - w_fisher;
+    let dev_base = if input.y == 0.0 {
+        w_fisher
     } else {
-        mu
+        let u = (input.y - mu) / mu;
+        if u.abs() <= 0.125 {
+            w_fisher * poisson_unit_deviance_near_one(u)
+        } else {
+            weighted_y * (input.y.ln() - input.eta) - weighted_y + w_fisher
+        }
     };
-    let dev = 2.0 * w_prior * dev_term;
+    let dev = 2.0 * dev_base;
     let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
     certify_output(
         row,
@@ -500,7 +566,7 @@ fn row_gamma_log(
             input.eta,
             RowOutput {
                 mu,
-            status: status_codes::OK,
+                status: status_codes::OK,
                 ..RowOutput::default()
             },
         );
@@ -509,11 +575,18 @@ fn row_gamma_log(
     if !(w_fisher.is_finite() && w_fisher > 0.0) {
         return Err(row_error(row, "Gamma Fisher weight", input.eta, w_fisher));
     }
-    let ratio = input.y / mu;
-    let ratio_resid = ratio - 1.0;
+    let weighted_ratio = positive_mul_div(w_fisher, input.y, mu);
+    if !(weighted_ratio.is_finite() && weighted_ratio > 0.0) {
+        return Err(row_error(
+            row,
+            "Gamma weighted mean ratio",
+            input.eta,
+            weighted_ratio,
+        ));
+    }
     let w_hessian = match mode {
         CurvatureMode::Fisher => w_fisher,
-        CurvatureMode::Observed => w_fisher * ratio,
+        CurvatureMode::Observed => weighted_ratio,
     };
     if !w_hessian.is_finite() {
         return Err(row_error(
@@ -523,12 +596,14 @@ fn row_gamma_log(
             w_hessian,
         ));
     }
-    let z = input.eta + ratio_resid;
-    if !z.is_finite() {
-        return Err(row_error(row, "Gamma working response", input.eta, z));
-    }
-    let grad_eta = w_fisher * ratio_resid;
-    let dev = 2.0 * w_prior * shape * (ratio_resid - (input.y.ln() - input.eta));
+    let grad_eta = weighted_ratio - w_fisher;
+    let u = (input.y - mu) / mu;
+    let dev_base = if u.abs() <= 0.125 {
+        w_fisher * gamma_unit_deviance_near_one(u)
+    } else {
+        weighted_ratio - w_fisher * (1.0 + input.y.ln() - input.eta)
+    };
+    let dev = 2.0 * dev_base;
     certify_output(
         row,
         input.eta,
@@ -591,7 +666,7 @@ fn row_bernoulli_logit(
             input.eta,
             RowOutput {
                 mu,
-            status: status_codes::OK,
+                status: status_codes::OK,
                 ..RowOutput::default()
             },
         );
@@ -601,15 +676,6 @@ fn row_bernoulli_logit(
         return Err(row_error(row, "logit Fisher weight", input.eta, w_fisher));
     }
     let grad_eta = w_prior * residual;
-    let z = input.eta + residual / dmu_deta;
-    if !z.is_finite() {
-        return Err(row_error(
-            row,
-            "canonical-logit working response",
-            input.eta,
-            z,
-        ));
-    }
     let dev = bernoulli_logit_deviance(input.y, input.eta, w_prior);
     let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
     certify_output(
@@ -696,7 +762,7 @@ fn row_bernoulli_noncanonical(
             input.eta,
             RowOutput {
                 mu,
-            status: status_codes::OK,
+                status: status_codes::OK,
                 ..RowOutput::default()
             },
         );
@@ -731,10 +797,6 @@ fn row_bernoulli_noncanonical(
             input.eta,
             w_hessian,
         ));
-    }
-    let z = input.eta + resid / d1;
-    if !z.is_finite() {
-        return Err(row_error(row, "Bernoulli working response", input.eta, z));
     }
     let dev = bernoulli_deviance(input.y, mu, w_prior);
     certify_output(
@@ -1251,10 +1313,7 @@ pub struct AlphaLadderDevBuffers {
 #[cfg(target_os = "linux")]
 impl AlphaLadderDevBuffers {
     /// Allocate the ladder device buffers on `stream`.
-    pub fn allocate(
-        stream: &Arc<cudarc::driver::CudaStream>,
-        n: usize,
-    ) -> Result<Self, GpuError> {
+    pub fn allocate(stream: &Arc<cudarc::driver::CudaStream>, n: usize) -> Result<Self, GpuError> {
         let status_len = ALPHA_LADDER_LEN.checked_mul(n).ok_or_else(|| {
             gam_gpu::gpu_err!("pirls_row ladder status length overflows: {ALPHA_LADDER_LEN} * {n}")
         })?;
@@ -1588,9 +1647,8 @@ static constexpr unsigned int PIRLS_INVERSE_LINK = 5u;
 static constexpr unsigned int PIRLS_FISHER_WEIGHT = 6u;
 static constexpr unsigned int PIRLS_OBSERVED_WEIGHT = 7u;
 static constexpr unsigned int PIRLS_GRADIENT = 8u;
-static constexpr unsigned int PIRLS_WORKING_RESPONSE = 9u;
-static constexpr unsigned int PIRLS_DEVIANCE = 10u;
-static constexpr unsigned int PIRLS_FINAL_OUTPUT = 11u;
+static constexpr unsigned int PIRLS_DEVIANCE = 9u;
+static constexpr unsigned int PIRLS_FINAL_OUTPUT = 10u;
 
 __device__ __forceinline__ void pirls_refuse(unsigned int* status, unsigned int code) {
     if (*status == PIRLS_OK) *status = code;
@@ -1628,13 +1686,56 @@ __device__ __forceinline__ double std_norm_pdf(double x) {
     return 0.3989422804014327 * exp(-0.5 * x * x);
 }
 
+__device__ __forceinline__ double positive_mul_div(double a, double b, double c) {
+    double product = a * b;
+    if (isfinite(product) && product > 0.0) {
+        double value = product / c;
+        if (isfinite(value) && value > 0.0) return value;
+    }
+    double quotient_a = a / c;
+    if (isfinite(quotient_a) && quotient_a > 0.0) {
+        double value = quotient_a * b;
+        if (isfinite(value) && value > 0.0) return value;
+    }
+    double quotient_b = b / c;
+    if (isfinite(quotient_b) && quotient_b > 0.0) {
+        double value = quotient_b * a;
+        if (isfinite(value) && value > 0.0) return value;
+    }
+    return product / c;
+}
+
+__device__ __forceinline__ double gamma_unit_deviance_near_one(double u) {
+    if (fabs(u) > 0.125) return u - log1p(u);
+    double power = u * u;
+    double sum = 0.5 * power;
+    for (int degree = 3; degree <= 14; ++degree) {
+        power *= u;
+        double term = power / (double)degree;
+        sum += (degree & 1) ? -term : term;
+    }
+    return sum;
+}
+
+__device__ __forceinline__ double poisson_unit_deviance_near_one(double u) {
+    if (fabs(u) > 0.125) return (1.0 + u) * log1p(u) - u;
+    double power = u * u;
+    double sum = 0.5 * power;
+    for (int degree = 3; degree <= 14; ++degree) {
+        power *= u;
+        double coefficient = ((degree & 1) ? -1.0 : 1.0)
+            / ((double)degree * (double)(degree - 1));
+        sum += coefficient * power;
+    }
+    return sum;
+}
+
 __device__ __forceinline__ bool pirls_outputs_finite(
     double mu, double grad_eta, double w_fisher, double w_hessian,
-    double w_solver, double z, double dev
+    double w_solver, double dev
 ) {
     return isfinite(mu) && isfinite(grad_eta) && isfinite(w_fisher)
-        && isfinite(w_hessian) && isfinite(w_solver) && isfinite(z)
-        && isfinite(dev);
+        && isfinite(w_hessian) && isfinite(w_solver) && isfinite(dev);
 }
 "#,
         log_eta_min = crate::mixture_link::LOG_LINK_SOLVER_ETA_MIN,
@@ -1731,7 +1832,7 @@ fn gaussian_identity_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
         r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
-    double w_hessian = 0.0, w_solver = 0.0, z = 0.0, dev = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, dev = 0.0;
     if (!isfinite(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
     if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
         pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
@@ -1742,17 +1843,14 @@ fn gaussian_identity_body(curvature: CurvatureMode) -> String {
         w_fisher = wp;
         w_hessian = wp;
         w_solver = w_hessian;
-        if (wp == 0.0) {{
-            z = eta_i;
-        }} else {{
+        if (wp > 0.0) {{
             double resid = y_i - mu;
             grad_eta = wp * resid;
-            z = y_i;
             dev = wp * resid * resid;
         }}
     }}
     if (status == PIRLS_OK && !pirls_outputs_finite(
-            mu, grad_eta, w_fisher, w_hessian, w_solver, z, dev))
+            mu, grad_eta, w_fisher, w_hessian, w_solver, dev))
         pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
@@ -1763,7 +1861,7 @@ fn poisson_log_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
         r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
-    double w_hessian = 0.0, w_solver = 0.0, z = 0.0, dev = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, dev = 0.0;
     if (!pirls_log_eta_valid(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
     if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
         pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
@@ -1773,9 +1871,6 @@ fn poisson_log_body(curvature: CurvatureMode) -> String {
         mu = exp(eta_i);
         if (!(isfinite(mu) && mu > 0.0)) pirls_refuse(&status, PIRLS_INVERSE_LINK);
     }}
-    if (status == PIRLS_OK && wp == 0.0) {{
-        z = eta_i;
-    }}
     if (status == PIRLS_OK && wp > 0.0) {{
         w_fisher = wp * mu;
         if (!(isfinite(w_fisher) && w_fisher > 0.0))
@@ -1783,20 +1878,24 @@ fn poisson_log_body(curvature: CurvatureMode) -> String {
         if (status == PIRLS_OK) {{
             w_hessian = w_fisher;
             w_solver = w_hessian;
-            grad_eta = wp * (y_i - mu);
+            double weighted_y = wp * y_i;
+            grad_eta = weighted_y - w_fisher;
             if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
-            double ratio_resid = y_i / mu - 1.0;
-            z = eta_i + ratio_resid;
-            if (!isfinite(z)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
-            double dev_term = y_i > 0.0
-                ? y_i * (log(y_i) - eta_i) - (y_i - mu)
-                : mu;
-            dev = 2.0 * wp * dev_term;
+            double dev_base;
+            if (y_i == 0.0) {{
+                dev_base = w_fisher;
+            }} else {{
+                double u = (y_i - mu) / mu;
+                dev_base = fabs(u) <= 0.125
+                    ? w_fisher * poisson_unit_deviance_near_one(u)
+                    : weighted_y * (log(y_i) - eta_i) - weighted_y + w_fisher;
+            }}
+            dev = 2.0 * dev_base;
             if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
         }}
     }}
     if (status == PIRLS_OK && !pirls_outputs_finite(
-            mu, grad_eta, w_fisher, w_hessian, w_solver, z, dev))
+            mu, grad_eta, w_fisher, w_hessian, w_solver, dev))
         pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
@@ -1809,7 +1908,7 @@ fn gamma_log_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
         r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
-    double w_hessian = 0.0, w_solver = 0.0, z = 0.0, dev = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, dev = 0.0;
     if (!pirls_log_eta_valid(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
     if (status == PIRLS_OK && !(isfinite(shape) && shape > 0.0))
         pirls_refuse(&status, PIRLS_GAMMA_SHAPE);
@@ -1821,31 +1920,31 @@ fn gamma_log_body(curvature: CurvatureMode) -> String {
         mu = exp(eta_i);
         if (!(isfinite(mu) && mu > 0.0)) pirls_refuse(&status, PIRLS_INVERSE_LINK);
     }}
-    if (status == PIRLS_OK && wp == 0.0) {{
-        z = eta_i;
-    }}
     if (status == PIRLS_OK && wp > 0.0) {{
         w_fisher = wp * shape;
         if (!(isfinite(w_fisher) && w_fisher > 0.0))
             pirls_refuse(&status, PIRLS_FISHER_WEIGHT);
-        double ratio = y_i / mu;
+        double weighted_ratio = positive_mul_div(w_fisher, y_i, mu);
+        if (!(isfinite(weighted_ratio) && weighted_ratio > 0.0))
+            pirls_refuse(&status, PIRLS_GRADIENT);
 #ifdef PIRLS_CURVATURE_OBSERVED
-        w_hessian = w_fisher * ratio;
+        w_hessian = weighted_ratio;
 #else
         w_hessian = w_fisher;
 #endif
         if (!isfinite(w_hessian)) pirls_refuse(&status, PIRLS_OBSERVED_WEIGHT);
         w_solver = w_hessian;
-        double ratio_resid = ratio - 1.0;
-        grad_eta = w_fisher * ratio_resid;
+        grad_eta = weighted_ratio - w_fisher;
         if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
-        z = eta_i + ratio_resid;
-        if (!isfinite(z)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
-        dev = 2.0 * wp * shape * (ratio_resid - (log(y_i) - eta_i));
+        double u = (y_i - mu) / mu;
+        double dev_base = fabs(u) <= 0.125
+            ? w_fisher * gamma_unit_deviance_near_one(u)
+            : weighted_ratio - w_fisher * (1.0 + log(y_i) - eta_i);
+        dev = 2.0 * dev_base;
         if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
     }}
     if (status == PIRLS_OK && !pirls_outputs_finite(
-            mu, grad_eta, w_fisher, w_hessian, w_solver, z, dev))
+            mu, grad_eta, w_fisher, w_hessian, w_solver, dev))
         pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
@@ -1856,7 +1955,7 @@ fn bernoulli_logit_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
         r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
-    double w_hessian = 0.0, w_solver = 0.0, z = 0.0, dev = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, dev = 0.0;
     if (!isfinite(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
     if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
         pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
@@ -1871,9 +1970,6 @@ fn bernoulli_logit_body(curvature: CurvatureMode) -> String {
         if (!(isfinite(mu) && mu >= 0.0 && mu <= 1.0
                 && isfinite(dmu_deta) && dmu_deta > 0.0))
             pirls_refuse(&status, PIRLS_INVERSE_LINK);
-    }}
-    if (status == PIRLS_OK && wp == 0.0) {{
-        z = eta_i;
     }}
     if (status == PIRLS_OK && wp > 0.0) {{
         double residual;
@@ -1890,13 +1986,11 @@ fn bernoulli_logit_body(curvature: CurvatureMode) -> String {
         w_solver = w_hessian;
         grad_eta = wp * residual;
         if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
-        z = eta_i + residual / dmu_deta;
-        if (!isfinite(z)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
         dev = logit_deviance(y_i, eta_i, wp);
         if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
     }}
     if (status == PIRLS_OK && !pirls_outputs_finite(
-            mu, grad_eta, w_fisher, w_hessian, w_solver, z, dev))
+            mu, grad_eta, w_fisher, w_hessian, w_solver, dev))
         pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
@@ -1907,7 +2001,7 @@ fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
         r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
-    double w_hessian = 0.0, w_solver = 0.0, z = 0.0, dev = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, dev = 0.0;
     if (!isfinite(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
     if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
         pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
@@ -1924,9 +2018,6 @@ fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
                 && isfinite(dmu_deta) && dmu_deta > 0.0
                 && isfinite(d2mu_deta2) && isfinite(d3mu_deta3)))
             pirls_refuse(&status, PIRLS_INVERSE_LINK);
-    }}
-    if (status == PIRLS_OK && wp == 0.0) {{
-        z = eta_i;
     }}
     if (status == PIRLS_OK && wp > 0.0) {{
         v = mu * (1.0 - mu);
@@ -1947,13 +2038,11 @@ fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
         w_solver = w_hessian;
         grad_eta = wp * resid * dmu_deta / v;
         if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
-        z = eta_i + resid / dmu_deta;
-        if (!isfinite(z)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
         dev = bernoulli_deviance(y_i, mu, wp);
         if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
     }}
     if (status == PIRLS_OK && !pirls_outputs_finite(
-            mu, grad_eta, w_fisher, w_hessian, w_solver, z, dev))
+            mu, grad_eta, w_fisher, w_hessian, w_solver, dev))
         pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
@@ -1964,7 +2053,7 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
         r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
-    double w_hessian = 0.0, w_solver = 0.0, z = 0.0, dev = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, dev = 0.0;
     if (!isfinite(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
     if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
         pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
@@ -1984,9 +2073,6 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
                 && isfinite(d2mu_deta2) && isfinite(d3mu_deta3)))
             pirls_refuse(&status, PIRLS_INVERSE_LINK);
     }}
-    if (status == PIRLS_OK && wp == 0.0) {{
-        z = eta_i;
-    }}
     if (status == PIRLS_OK && wp > 0.0) {{
         v = mu * (1.0 - mu);
         double fisher_per_prior = dmu_deta * dmu_deta / v;
@@ -2006,13 +2092,11 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
         w_solver = w_hessian;
         grad_eta = wp * resid * dmu_deta / v;
         if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
-        z = eta_i + resid / dmu_deta;
-        if (!isfinite(z)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
         dev = bernoulli_deviance(y_i, mu, wp);
         if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
     }}
     if (status == PIRLS_OK && !pirls_outputs_finite(
-            mu, grad_eta, w_fisher, w_hessian, w_solver, z, dev))
+            mu, grad_eta, w_fisher, w_hessian, w_solver, dev))
         pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )

@@ -103,8 +103,8 @@ pub use joint_penalty::{JointPenaltyBundle, JointPenaltyError, JointPenaltySpec}
 pub use linear_constraints::LinearInequalityConstraints;
 pub use log_strength::{
     IndexedLogStrengthDomainError, LOG_STRENGTH_MAX, LOG_STRENGTH_MIN, LogStrengthDomainError,
-    checked_exp_log_strength, checked_exp_log_strengths, validate_log_strength,
-    validate_log_strengths,
+    PhysicalStrengthDomainError, checked_exp_log_strength, checked_exp_log_strengths,
+    checked_log_strength, validate_log_strength, validate_log_strengths,
 };
 pub use monotone_root_error::MonotoneRootError;
 pub use penalty_coordinate::PenaltyCoordinate;

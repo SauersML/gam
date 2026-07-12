@@ -34,6 +34,23 @@ impl std::fmt::Display for LogStrengthDomainError {
 
 impl std::error::Error for LogStrengthDomainError {}
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhysicalStrengthDomainError {
+    pub value: f64,
+}
+
+impl std::fmt::Display for PhysicalStrengthDomainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "physical strength must be positive and finite with its logarithm in [{LOG_STRENGTH_MIN}, {LOG_STRENGTH_MAX}]; got {}",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for PhysicalStrengthDomainError {}
+
 /// Coordinate-aware failure returned when validating a vector of logarithmic
 /// strengths.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -114,6 +131,18 @@ pub fn checked_exp_log_strength(log_strength: f64) -> Result<f64, LogStrengthDom
     Ok(log_strength.exp())
 }
 
+/// Recover a canonical logarithmic coordinate without flooring or ceilinging
+/// a physical strength.
+pub fn checked_log_strength(strength: f64) -> Result<f64, PhysicalStrengthDomainError> {
+    if !(strength.is_finite() && strength > 0.0) {
+        return Err(PhysicalStrengthDomainError { value: strength });
+    }
+    let log_strength = strength.ln();
+    validate_log_strength(log_strength)
+        .map_err(|_| PhysicalStrengthDomainError { value: strength })?;
+    Ok(log_strength)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +178,15 @@ mod tests {
         let error = checked_exp_log_strengths(values).unwrap_err();
         assert_eq!(error.coordinate, 1);
         assert_eq!(error.value, LOG_STRENGTH_MAX + 1.0);
+    }
+
+    #[test]
+    fn physical_strength_conversion_refuses_floor_and_ceiling_cases() {
+        for value in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            assert!(checked_log_strength(value).is_err());
+        }
+        for endpoint in [LOG_STRENGTH_MIN, LOG_STRENGTH_MAX] {
+            assert!(checked_log_strength(endpoint.exp()).is_ok());
+        }
     }
 }

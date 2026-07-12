@@ -44,7 +44,6 @@ where
 /// flooring at the smallest positive normal `f64` keeps `ln` finite for an
 /// exactly-zero (fully-relaxed) penalty without perturbing any λ above the
 /// denormal range.
-const LOG_LAMBDA_UNDERFLOW_FLOOR: f64 = 1e-300;
 
 /// Inner-PIRLS controls shared by the survival-transformation baseline and
 /// smoothing-coordinate eval closures. The baseline geometry is mildly
@@ -1413,15 +1412,27 @@ fn optimize_survival_transformation_smoothing(
     if num_smoothing == 0 {
         return Ok(None);
     }
+    if num_smoothing > penalty_blocks.len() {
+        return Err(format!(
+            "survival transformation smoothing count {num_smoothing} exceeds penalty count {}",
+            penalty_blocks.len()
+        ));
+    }
     // Full λ vector (smoothing blocks + fixed ridge), used to rebuild each
     // candidate model. The ridge entries (indices >= num_smoothing) are frozen.
     let seed_lambdas: Vec<f64> = penalty_blocks.iter().map(|b| b.lambda).collect();
-    let seed_rho = Array1::from_iter(
+    let seed_log_lambdas =
         seed_lambdas
             .iter()
-            .take(num_smoothing)
-            .map(|&l| l.max(1e-12).ln()),
-    );
+            .copied()
+            .enumerate()
+            .map(|(coordinate, value)| {
+                gam_problem::checked_log_strength(value).map_err(|error| {
+                    format!("survival transformation seed lambda {coordinate}: {error}")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    let seed_rho = Array1::from_vec(seed_log_lambdas[..num_smoothing].to_vec());
 
     // Memoize the most recent (ρ, cost, gradient) triple. The outer BFGS bridge
     // queries this objective through TWO separate closures — a value-only probe
@@ -1446,6 +1457,8 @@ fn optimize_survival_transformation_smoothing(
         (f64, Array1<f64>),
         gam_solve::estimate::EstimationError,
     > {
+        let physical_smoothing =
+            gam_problem::checked_exp_log_strengths(rho_smooth.iter().copied())?;
         if let Some((cached_rho, cached_cost, cached_grad)) = eval_cache.borrow().as_ref()
             && cached_rho == rho_smooth
         {
@@ -1454,7 +1467,7 @@ fn optimize_survival_transformation_smoothing(
         let mut candidate = model.clone();
         let mut lambdas = seed_lambdas.clone();
         for k in 0..num_smoothing {
-            lambdas[k] = rho_smooth[k].exp();
+            lambdas[k] = physical_smoothing[k];
         }
         candidate
             .set_penalty_lambdas(&lambdas)
@@ -1500,7 +1513,20 @@ fn optimize_survival_transformation_smoothing(
         // block order, as the unified survival LAML evaluator requires. The
         // candidate's λ are exactly `lambdas` (smoothing entries from the
         // proposal, ridge entries frozen), so build ρ from that vector directly.
-        let full_rho = Array1::from_iter(lambdas.iter().filter(|&&l| l > 0.0).map(|&l| l.ln()));
+        let full_rho = Array1::from_vec(
+            lambdas
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(coordinate, value)| {
+                    gam_problem::checked_log_strength(value).map_err(|error| {
+                        gam_solve::estimate::EstimationError::InvalidInput(format!(
+                            "survival smoothing candidate lambda {coordinate}: {error}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
         let (cost, grad_full) = candidate
             .unified_lamlobjective_and_rhogradient(&beta, &state, &full_rho)
             .map_err(|error| {
@@ -1602,17 +1628,11 @@ fn optimize_survival_transformation_smoothing(
             selected_rho.to_vec(),
         ));
     }
+    let selected_lambdas = gam_problem::checked_exp_log_strengths(selected_rho.iter().copied())
+        .map_err(|error| format!("survival transformation selected rho: {error}"))?;
     let mut lambdas = seed_lambdas;
-    for k in 0..num_smoothing {
-        let lam = selected_rho[k].exp();
-        if !(lam.is_finite() && lam > 0.0) {
-            return Err(format!(
-                "survival transformation smoothing selector produced invalid lambda[{k}]={lam} \
-                 from selected-rho checkpoint={:?}",
-                selected_rho.to_vec(),
-            ));
-        }
-        lambdas[k] = lam;
+    for (slot, lambda) in lambdas.iter_mut().zip(selected_lambdas) {
+        *slot = lambda;
     }
     Ok(Some(lambdas))
 }
@@ -1624,7 +1644,18 @@ fn survival_unified_fit_result(
     state: &gam_solve::pirls::WorkingState,
     penalty_blocks: &[PenaltyBlock],
 ) -> Result<UnifiedFitResult, String> {
-    let log_lambdas = lambdas.mapv(|v| v.max(LOG_LAMBDA_UNDERFLOW_FLOOR).ln());
+    let log_lambdas = Array1::from_vec(
+        lambdas
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(coordinate, value)| {
+                gam_problem::checked_log_strength(value).map_err(|error| {
+                    format!("survival fit lambda coordinate {coordinate}: {error}")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     require_certified_survival_pirls(
         summary,
         "survival transformation fit assembly",
@@ -1857,7 +1888,10 @@ fn fit_cause_specific_survival_transformation_custom(
                 )),
             );
             nullspace_dims.push(block.nullspace_dim);
-            initial_log_lambdas[penalty_idx] = block.lambda.max(LOG_LAMBDA_UNDERFLOW_FLOOR).ln();
+            initial_log_lambdas[penalty_idx] = gam_problem::checked_log_strength(block.lambda)
+                .map_err(|error| {
+                    format!("cause-specific survival penalty {penalty_idx} strength: {error}")
+                })?;
         }
         let beta_start = beta0_flat.slice(s![cause * p..(cause + 1) * p]).to_owned();
         // Cause-specific blocks share the same time-basis design `x_exit`
@@ -2089,10 +2123,15 @@ fn hash_workflow_design_matrix(
 
 fn survival_transformation_log_lambdas(
     penalty_blocks: &[crate::survival::PenaltyBlock],
-) -> Vec<f64> {
+) -> Result<Vec<f64>, String> {
     penalty_blocks
         .iter()
-        .map(|block| block.lambda.max(LOG_LAMBDA_UNDERFLOW_FLOOR).ln())
+        .enumerate()
+        .map(|(coordinate, block)| {
+            gam_problem::checked_log_strength(block.lambda).map_err(|error| {
+                format!("survival transformation penalty {coordinate}: {error}")
+            })
+        })
         .collect()
 }
 
@@ -2627,7 +2666,7 @@ pub(crate) fn fit_survival_transformation_model(
         initial_lm_lambda: None,
         arrow_schur: None,
     };
-    let rho_for_cache = survival_transformation_log_lambdas(&penalty_blocks);
+    let rho_for_cache = survival_transformation_log_lambdas(&penalty_blocks)?;
     let expected_beta_len = beta0.len();
     let persistent_warm_start_key = persistent_survival_transformation_key(
         &spec,

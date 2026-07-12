@@ -108,13 +108,16 @@ pub struct FdrCertificate {
 /// The caller is responsible for having computed EVERY screened candidate's
 /// `log_e` (via [`crossfit_ui_log_evalue`] / [`shell_vs_ring_log_evalue`]) and
 /// passing them ALL — the screening feeds this family, it must not gate it.
-pub fn family_fdr_certificate(log_e: Vec<f64>, alpha: f64) -> FdrCertificate {
-    let rejected = e_benjamini_hochberg(&log_e, alpha);
-    FdrCertificate {
+pub fn family_fdr_certificate(
+    log_e: Vec<f64>,
+    alpha: f64,
+) -> Result<FdrCertificate, gam_terms::inference::structure_evidence::EBhError> {
+    let rejected = e_benjamini_hochberg(&log_e, alpha)?;
+    Ok(FdrCertificate {
         alpha,
         log_e,
         rejected,
-    }
+    })
 }
 
 /// Cross-fit universal-inference split-LR log-e-value from fitter closures.
@@ -586,7 +589,7 @@ mod tests {
                     shell_vs_ring_log_evalue(&coords, 2, 1.0e-6).unwrap()
                 })
                 .collect();
-            let cert = family_fdr_certificate(log_e, alpha);
+            let cert = family_fdr_certificate(log_e, alpha).unwrap();
             if !cert.rejected.is_empty() {
                 false_discovery_sims += 1;
             }
@@ -616,7 +619,7 @@ mod tests {
                 let line = draw_line(&mut rng, 240, 3, 2.0, 0.3);
                 log_e.push(shell_vs_ring_log_evalue(&line, 2, 1.0e-6).unwrap());
             }
-            let cert = family_fdr_certificate(log_e, alpha);
+            let cert = family_fdr_certificate(log_e, alpha).unwrap();
             if cert.rejected.contains(&0) {
                 discovered += 1;
             }
@@ -639,7 +642,7 @@ mod tests {
             log_e.is_infinite() && log_e < 0.0,
             "q<2 must give -inf log_e"
         );
-        let cert = family_fdr_certificate(vec![log_e], 0.1);
+        let cert = family_fdr_certificate(vec![log_e], 0.1).unwrap();
         assert!(cert.rejected.is_empty());
     }
 }

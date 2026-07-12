@@ -587,25 +587,23 @@ pub(crate) fn gaussian_jointrow_scalars(
     let mut kappa = Array1::<f64>::uninit(nobs);
     let mut kappa_prime = Array1::<f64>::uninit(nobs);
     let mut kappa_dprime = Array1::<f64>::uninit(nobs);
-    for i in 0..nobs {
-        let jet = crate::sigma_link::logb_sigma_jet1_scalar(eta_ls[i]);
-        let s = jet.sigma;
-        // κ = exp(η)/(b + exp(η)). Use the direct exp(η)/σ form
-        // when finite — it preserves the precision of exp(η) at very negative
-        // η (where 1 − b/σ catastrophically cancels because b/σ → 1). The
-        // η → +∞ branch returns 1 cleanly without hitting ∞/∞ NaN.
-        let ki = logb_dlog_sigma_deta(s, jet.d1);
-        let kp = ki * (1.0 - ki);
-        let kdp = kp * (1.0 - 2.0 * ki);
-        let wi = weights[i] / (s * s);
-        let ri = y[i] - etamu[i];
+    let ln2pi = (2.0 * std::f64::consts::PI).ln();
+    // Compute into an indexed temporary first. Parallel collection preserves
+    // row order; scanning the results afterward reports the smallest failing
+    // row deterministically and publishes no partially initialized scalar set.
+    let certified: Vec<Result<GaussianDiagonalRowKernel, String>> = (0..nobs)
+        .into_par_iter()
+        .map(|i| gaussian_diagonal_row_kernel(i, y[i], etamu[i], eta_ls[i], weights[i], ln2pi))
+        .collect();
+    for (i, row) in certified.into_iter().enumerate() {
+        let row = row?;
         obs_weight[i].write(weights[i]);
-        w[i].write(wi);
-        m[i].write(ri * wi);
-        n[i].write(ri * ri * wi);
-        kappa[i].write(ki);
-        kappa_prime[i].write(kp);
-        kappa_dprime[i].write(kdp);
+        w[i].write(row.joint_w);
+        m[i].write(row.joint_m);
+        n[i].write(row.joint_n);
+        kappa[i].write(row.kappa);
+        kappa_prime[i].write(row.kappa_prime);
+        kappa_dprime[i].write(row.kappa_dprime);
     }
     // SAFETY: every `MaybeUninit` slot in each of these arrays was written
     // exactly once in the `for i in 0..nobs` loop above; no slot is read,
@@ -1395,7 +1393,9 @@ mod observed_single_source_oracle_tests {
     /// no curvature coefficients involved).
     fn row_nll(y: f64, mu: f64, eta_ls: f64, a: f64) -> f64 {
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
-        -gaussian_diagonal_row_kernel(y, mu, eta_ls, a, ln2pi).log_likelihood
+        -gaussian_diagonal_row_kernel(0, y, mu, eta_ls, a, ln2pi)
+            .expect("representable Gaussian oracle row")
+            .log_likelihood
     }
 
     /// Observed 2×2 Hessian of the row NLL in `(μ, η_ls)` by central FD.
