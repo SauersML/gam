@@ -2052,7 +2052,7 @@ impl<'a> RemlState<'a> {
                 &inner_solution,
                 rho.as_slice().unwrap(),
                 gradient.as_slice().unwrap(),
-            );
+            )?;
             let psi_gradient = if hybrid.psi_indices.is_empty() {
                 None
             } else {
@@ -2078,7 +2078,7 @@ impl<'a> RemlState<'a> {
                 &inner_solution,
                 rho.as_slice().unwrap(),
                 gradient.as_slice().unwrap(),
-            );
+            )?;
             gam_problem::EfsEval {
                 cost: cost_result.cost,
                 steps,

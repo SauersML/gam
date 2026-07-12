@@ -61,6 +61,11 @@ pub fn reml_laml_evaluate(
     mode: EvalMode,
     prior_cost_gradient: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
 ) -> Result<RemlLamlResult, String> {
+    // Validate the complete raw entry vector before tangent recursion or any
+    // objective work. This makes every downstream exponential dominated by a
+    // deterministic, smallest-coordinate refusal rather than optimizer bounds.
+    let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())
+        .map_err(|error| format!("REML/LAML rho: {error}"))?;
     // Constraint-tangent-space dispatch. When the inner converged at a
     // constrained-stationary point with a non-empty active inequality set,
     // the principled LAML outer objective lives on `null(A_act)`. Build a
@@ -92,7 +97,6 @@ pub fn reml_laml_evaluate(
         .into());
     }
     let k = rho.len();
-    let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
     let curvature_lambdas: Vec<f64> = lambdas
         .iter()
         .copied()

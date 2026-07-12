@@ -17,11 +17,6 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut2, s};
 use super::GamlssError;
 use super::exact_design_row_chunks;
 
-pub(super) fn signedwith_floor(v: f64, floor: f64) -> f64 {
-    let a = v.abs().max(floor);
-    if v >= 0.0 { a } else { -a }
-}
-
 pub(super) fn xt_diag_x_dense(
     design: &Array2<f64>,
     diag: &Array1<f64>,

@@ -764,43 +764,128 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             .into());
         }
 
-        let mut ll = 0.0;
-        let mut z_eta = Array1::<f64>::zeros(n);
-        let mut w_eta = Array1::<f64>::zeros(n);
-        let mut z_wiggle = Array1::<f64>::zeros(n);
-        let mut w_wiggle = Array1::<f64>::zeros(n);
+        // Certify the entire batch before constructing any working array.  The
+        // q-space NLL derivative stack is the single source of truth for both
+        // the objective and the working geometry; probability/variance and
+        // derivative floors would define a different loss in the tails.
+        let mut rows = Vec::with_capacity(n);
         for i in 0..n {
             let q = eta[i] + etaw[i];
-            let (mu_q, d1_q) = inverse_link_mu_d1_for_inverse_link(&self.link_kind, q)
-                .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
+            if !eta[i].is_finite() || !etaw[i].is_finite() || !q.is_finite() {
+                return Err(GamlssError::RowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "binomial mean-wiggle predictor q",
+                    eta: eta[i],
+                    value: q,
+                }
+                .into());
+            }
             let yi = self.y[i];
             let wi = self.weights[i];
-            ll += binomial_location_scale_log_likelihood(yi, wi, q, &self.link_kind, mu_q)?;
-
-            let mu = mu_q.clamp(1e-12, 1.0 - 1e-12);
-            let var = (mu * (1.0 - mu)).max(MIN_PROB);
-            let dmu_deta = d1_q * dq_dq0[i];
-            let dmu_dw = d1_q;
-            if wi == 0.0 || !var.is_finite() {
-                z_eta[i] = eta[i];
-                z_wiggle[i] = etaw[i];
+            if !yi.is_finite() || !(0.0..=1.0).contains(&yi) {
+                return Err(GamlssError::InvalidInput {
+                    reason: format!(
+                        "BinomialMeanWiggleFamily requires y in [0, 1]; found y[{i}]={yi}"
+                    ),
+                }
+                .into());
+            }
+            if !wi.is_finite() || wi < 0.0 {
+                return Err(GamlssError::InvalidInput {
+                    reason: format!(
+                        "BinomialMeanWiggleFamily requires finite non-negative weights; found weight[{i}]={wi}"
+                    ),
+                }
+                .into());
+            }
+            let slope = dq_dq0[i];
+            if !slope.is_finite() {
+                return Err(GamlssError::RowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "binomial mean-wiggle warp slope",
+                    eta: eta[i],
+                    value: slope,
+                }
+                .into());
+            }
+            if wi == 0.0 {
+                rows.push((0.0, eta[i], 0.0, etaw[i], 0.0));
                 continue;
             }
-
-            if dmu_deta.is_finite() {
-                w_eta[i] = floor_positiveweight(wi * (dmu_deta * dmu_deta / var), MIN_WEIGHT);
-                z_eta[i] = eta[i] + (yi - mu) / signedwith_floor(dmu_deta, MIN_DERIV);
-            } else {
-                z_eta[i] = eta[i];
+            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
+                .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
+            let row_ll = binomial_location_scale_log_likelihood(
+                yi,
+                wi,
+                q,
+                &self.link_kind,
+                jet.mu,
+            )?;
+            let (m1, m2, _) = binomial_neglog_q_derivatives_dispatch(
+                yi,
+                wi,
+                q,
+                jet.mu,
+                jet.d1,
+                jet.d2,
+                jet.d3,
+                &self.link_kind,
+            );
+            if !row_ll.is_finite() || !m1.is_finite() || !m2.is_finite() || m2 <= 0.0 {
+                return Err(GamlssError::RowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "binomial mean-wiggle q curvature",
+                    eta: q,
+                    value: m2,
+                }
+                .into());
             }
-
-            if dmu_dw.is_finite() {
-                w_wiggle[i] = floor_positiveweight(wi * (dmu_dw * dmu_dw / var), MIN_WEIGHT);
-                z_wiggle[i] = etaw[i] + (yi - mu) / signedwith_floor(dmu_dw, MIN_DERIV);
+            let (z_eta_i, w_eta_i) = if slope == 0.0 {
+                (eta[i], 0.0)
             } else {
-                z_wiggle[i] = etaw[i];
+                let weight = m2 * slope * slope;
+                let response = eta[i] - m1 * slope / weight;
+                if !weight.is_finite() || weight <= 0.0 || !response.is_finite() {
+                    return Err(GamlssError::RowGeometryUnrepresentable {
+                        row: i,
+                        quantity: "binomial mean-wiggle eta working geometry",
+                        eta: eta[i],
+                        value: response,
+                    }
+                    .into());
+                }
+                (response, weight)
+            };
+            let z_wiggle_i = etaw[i] - m1 / m2;
+            if !z_wiggle_i.is_finite() {
+                return Err(GamlssError::RowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "binomial mean-wiggle wiggle working response",
+                    eta: etaw[i],
+                    value: z_wiggle_i,
+                }
+                .into());
+            }
+            rows.push((row_ll, z_eta_i, w_eta_i, z_wiggle_i, m2));
+        }
+
+        let mut ll = 0.0;
+        for (i, row) in rows.iter().enumerate() {
+            ll += row.0;
+            if !ll.is_finite() {
+                return Err(GamlssError::RowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "binomial mean-wiggle cumulative log likelihood",
+                    eta: eta[i],
+                    value: ll,
+                }
+                .into());
             }
         }
+        let z_eta = Array1::from_iter(rows.iter().map(|row| row.1));
+        let w_eta = Array1::from_iter(rows.iter().map(|row| row.2));
+        let z_wiggle = Array1::from_iter(rows.iter().map(|row| row.3));
+        let w_wiggle = Array1::from_iter(rows.iter().map(|row| row.4));
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,

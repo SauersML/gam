@@ -1,5 +1,5 @@
 use super::*;
-pub(crate) use gam_terms::analytic_penalties::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN};
+pub(crate) use gam_problem::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN};
 
 /// Closed numerical domain of every active flat log-strength coordinate.
 ///

@@ -170,6 +170,143 @@ pub(super) struct DispersionRowKernel {
     pub(super) disp_response: f64,
 }
 
+#[inline]
+fn dispersion_geometry_error(
+    row: usize,
+    quantity: &'static str,
+    eta: f64,
+    value: f64,
+) -> String {
+    GamlssError::RowGeometryUnrepresentable {
+        row,
+        quantity,
+        eta,
+        value,
+    }
+    .into()
+}
+
+/// Certify the exact open parameter domain used by the row towers.  The domain
+/// is defined by representability of the linked distribution parameters, not
+/// by an arbitrary predictor box.
+fn validate_dispersion_row_geometry_inputs(
+    kind: DispersionFamilyKind,
+    row: usize,
+    yi: f64,
+    eta_mu: f64,
+    eta_d: f64,
+    prior_weight: f64,
+) -> Result<(), String> {
+    if !eta_mu.is_finite() || !eta_d.is_finite() {
+        return Err(GamlssError::NonFinite {
+            reason: format!(
+                "{} requires finite predictors at row {row}; eta_mu={eta_mu}, eta_d={eta_d}",
+                kind.family_tag()
+            ),
+        }
+        .into());
+    }
+    if !prior_weight.is_finite() || prior_weight < 0.0 {
+        return Err(GamlssError::InvalidInput {
+            reason: format!(
+                "{} requires finite non-negative prior weights; weight[{row}]={prior_weight}",
+                kind.family_tag()
+            ),
+        }
+        .into());
+    }
+    if prior_weight == 0.0 {
+        return Ok(());
+    }
+    let (support_ok, support) = match kind {
+        DispersionFamilyKind::NegativeBinomial => (
+            yi.is_finite() && yi >= 0.0 && yi.fract() == 0.0,
+            "a finite non-negative integer",
+        ),
+        DispersionFamilyKind::Gamma => (yi.is_finite() && yi > 0.0, "finite and > 0"),
+        DispersionFamilyKind::Beta => (
+            yi.is_finite() && yi > 0.0 && yi < 1.0,
+            "finite and strictly inside (0, 1)",
+        ),
+        DispersionFamilyKind::Tweedie { p } => (
+            yi.is_finite() && yi >= 0.0 && p.is_finite() && p > 1.0 && p < 2.0,
+            "finite and >= 0 with power strictly inside (1, 2)",
+        ),
+    };
+    if !support_ok {
+        return Err(GamlssError::InvalidInput {
+            reason: format!(
+                "{} response outside support at row {row}: y={yi} (requires {support})",
+                kind.family_tag()
+            ),
+        }
+        .into());
+    }
+
+    let require_positive = |quantity, eta, value: f64| {
+        if value.is_finite() && value > 0.0 {
+            Ok(())
+        } else {
+            Err(dispersion_geometry_error(row, quantity, eta, value))
+        }
+    };
+    match kind {
+        DispersionFamilyKind::NegativeBinomial => {
+            let mu = eta_mu.exp();
+            let theta = eta_d.exp();
+            require_positive("negative-binomial mean exp(eta_mu)", eta_mu, mu)?;
+            require_positive("negative-binomial precision exp(eta_d)", eta_d, theta)
+        }
+        DispersionFamilyKind::Gamma => {
+            require_positive("Gamma mean exp(eta_mu)", eta_mu, eta_mu.exp())?;
+            require_positive("Gamma precision exp(eta_d)", eta_d, eta_d.exp())
+        }
+        DispersionFamilyKind::Beta => {
+            let mu = gam_linalg::utils::stable_logistic(eta_mu);
+            if !mu.is_finite() || mu <= 0.0 || mu >= 1.0 {
+                return Err(dispersion_geometry_error(
+                    row,
+                    "Beta mean logistic(eta_mu) in the open unit interval",
+                    eta_mu,
+                    mu,
+                ));
+            }
+            let phi = eta_d.exp();
+            require_positive("Beta precision exp(eta_d)", eta_d, phi)?;
+            require_positive("Beta first shape mu*phi", eta_mu, mu * phi)?;
+            require_positive("Beta second shape (1-mu)*phi", eta_mu, (1.0 - mu) * phi)
+        }
+        DispersionFamilyKind::Tweedie { .. } => {
+            require_positive("Tweedie mean exp(eta_mu)", eta_mu, eta_mu.exp())?;
+            require_positive("Tweedie dispersion exp(-eta_d)", eta_d, (-eta_d).exp())
+        }
+    }
+}
+
+fn validate_dispersion_row_kernel_output(
+    row: usize,
+    eta_mu: f64,
+    eta_d: f64,
+    prior_weight: f64,
+    output: &DispersionRowKernel,
+) -> Result<(), String> {
+    if prior_weight == 0.0 {
+        return Ok(());
+    }
+    for (quantity, eta, value, strictly_positive) in [
+        ("dispersion-family row log likelihood", eta_mu, output.loglik, false),
+        ("dispersion-family mean working weight", eta_mu, output.mean_weight, true),
+        ("dispersion-family mean working response", eta_mu, output.mean_response, false),
+        ("dispersion-family precision working weight", eta_d, output.disp_weight, true),
+        ("dispersion-family precision working response", eta_d, output.disp_response, false),
+    ] {
+        if !value.is_finite() || (strictly_positive && value <= 0.0) {
+            return Err(dispersion_geometry_error(row, quantity, eta, value));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod test_support {
     use super::*;
@@ -493,12 +630,62 @@ pub(crate) fn dispersion_tweedie_disp_order2(
 /// `-dispersion_nb_disp_order2(..).value()`.
 #[inline]
 fn dispersion_nb_neg_loglik(yi: f64, mu: f64, theta: f64, wi: f64) -> f64 {
-    let tpm = theta + mu;
-    let s = ln_gamma(theta + yi) - ln_gamma(theta) - ln_gamma(yi + 1.0) + theta * theta.ln()
-        - theta * tpm.ln()
-        + mu.ln() * yi
-        - tpm.ln() * yi;
+    let log_theta_share = log_positive_share(theta, mu);
+    let log_mu_share = log_positive_share(mu, theta);
+    let s = ln_gamma(theta + yi) - ln_gamma(theta) - ln_gamma(yi + 1.0)
+        + theta * log_theta_share
+        + yi * log_mu_share;
     -(s * -wi)
+}
+
+/// `log(numerator / (numerator + other))` without forming the potentially
+/// overflowing sum or subtracting nearly equal logarithms.
+#[inline]
+fn log_positive_share(numerator: f64, other: f64) -> f64 {
+    if numerator >= other {
+        -(other / numerator).ln_1p()
+    } else {
+        let ratio = numerator / other;
+        ratio.ln() - ratio.ln_1p()
+    }
+}
+
+#[inline]
+fn positive_share(numerator: f64, other: f64) -> f64 {
+    if numerator >= other {
+        1.0 / (1.0 + other / numerator)
+    } else {
+        let ratio = numerator / other;
+        ratio / (1.0 + ratio)
+    }
+}
+
+/// Jensen NB precision Fisher information already transformed to log-precision
+/// coordinates, `theta^2 I_theta`.  For large theta, expand
+/// `trigamma(x)-1/x` after the transformation so the representable O(1)
+/// result is never obtained by subtracting underflowed O(theta^-2) terms.
+#[inline]
+fn nb_log_precision_fisher_jensen(mu: f64, theta: f64) -> f64 {
+    let r = positive_share(theta, mu);
+    if theta <= 32.0 {
+        let total = theta + mu;
+        let remainder_theta = gam_math::jet_tower::trigamma(theta) - theta.recip();
+        let remainder_total = gam_math::jet_tower::trigamma(total) - total.recip();
+        return theta * theta * (remainder_theta - remainder_total);
+    }
+    let one_minus_r = 1.0 - r;
+    let one_minus_r2 = one_minus_r * (1.0 + r);
+    let r2 = r * r;
+    let one_minus_r3 = one_minus_r * (1.0 + r + r2);
+    let r4 = r2 * r2;
+    let one_minus_r5 = one_minus_r * (1.0 + r + r2 + r2 * r + r4);
+    let r6 = r4 * r2;
+    let one_minus_r7 = one_minus_r * (1.0 + r + r2 + r2 * r + r4 + r4 * r + r6);
+    let inv = theta.recip();
+    let inv2 = inv * inv;
+    0.5 * one_minus_r2 + (inv / 6.0) * one_minus_r3
+        - (inv * inv2 / 30.0) * one_minus_r5
+        + (inv * inv2 * inv2 / 42.0) * one_minus_r7
 }
 
 /// Gamma row NLL value, plain `f64`, bit-identical to
@@ -616,15 +803,29 @@ pub(crate) fn dispersion_eta_nll_order2(
         DispersionFamilyKind::NegativeBinomial => {
             let mu = eta_mu.exp();
             let theta = eta_d.exp();
-            let tpm = theta.add(&mu);
             let theta_plus_y = theta.add(&O2::constant(yi));
+            let log_total = if em >= ed {
+                eta_mu.add(
+                    &eta_d
+                        .sub(&eta_mu)
+                        .exp()
+                        .add(&O2::constant(1.0))
+                        .ln(),
+                )
+            } else {
+                eta_d.add(
+                    &eta_mu
+                        .sub(&eta_d)
+                        .exp()
+                        .add(&O2::constant(1.0))
+                        .ln(),
+                )
+            };
             let loglik = order2_ln_gamma(&theta_plus_y)
                 .sub(&order2_ln_gamma(&theta))
                 .sub(&O2::constant(ln_gamma(yi + 1.0)))
-                .add(&theta.mul(&theta.ln()))
-                .sub(&theta.mul(&tpm.ln()))
-                .add(&mu.ln().scale(yi))
-                .sub(&tpm.ln().scale(yi));
+                .add(&theta.mul(&eta_d.sub(&log_total)))
+                .add(&eta_mu.sub(&log_total).scale(yi));
             loglik.scale(-wi)
         }
         DispersionFamilyKind::Gamma => {
@@ -751,14 +952,8 @@ pub(super) fn dispersion_row_kernel(
             let tower = dispersion_nb_disp_order1(yi, mu, theta, wi);
             let s_theta = -tower.g()[0] / wi;
             let loglik = -tower.value();
-            let info_mu = (theta / (mu * tpm)).max(DISPERSION_MIN_CURVATURE);
-            let score_mu = theta * (yi - mu) / (mu * tpm);
-            let (mean_weight, mean_response) = clamped_working_pair(
-                mean_slope,
-                em,
-                wi * mu * mu * info_mu,
-                score_mu / (mu * info_mu),
-            );
+            let mean_weight = wi * mu * theta / tpm;
+            let mean_response = em + (yi - mu) / mu;
             // Dispersion (log-θ) IRLS curvature: use the EXPECTED (Fisher)
             // information in θ, not the per-row OBSERVED Hessian channel
             // (`_info_theta_observed`). The NB2 log-likelihood is strongly
@@ -798,13 +993,8 @@ pub(super) fn dispersion_row_kernel(
             let trigamma_theta = gam_math::jet_tower::trigamma(theta);
             let trigamma_tpm = gam_math::jet_tower::trigamma(tpm);
             let info_theta_fisher = trigamma_theta - trigamma_tpm - 1.0 / theta + 1.0 / tpm;
-            let info_pos = info_theta_fisher.max(DISPERSION_MIN_CURVATURE);
-            let (disp_weight, disp_response) = clamped_working_pair(
-                disp_slope,
-                ed,
-                wi * theta * theta * info_pos,
-                s_theta / (theta * info_pos),
-            );
+            let disp_weight = wi * theta * theta * info_theta_fisher;
+            let disp_response = ed + s_theta / (theta * info_theta_fisher);
             DispersionRowKernel {
                 loglik,
                 mean_weight,
@@ -816,25 +1006,13 @@ pub(super) fn dispersion_row_kernel(
         DispersionFamilyKind::Gamma => {
             let mu = em.exp();
             let nu = ed.exp(); // precision = shape ν
-            let y_pos = yi.max(1e-300);
-            let tower = dispersion_gamma_disp_order2(yi, y_pos, mu, nu, wi);
+            let tower = dispersion_gamma_disp_order2(yi, yi, mu, nu, wi);
             let (s_nu, info_nu_raw) = tower_score_info(&tower, 0, wi);
             let loglik = -tower.value();
-            let info_mu = (nu / (mu * mu)).max(DISPERSION_MIN_CURVATURE);
-            let score_mu = nu * (yi - mu) / (mu * mu);
-            let (mean_weight, mean_response) = clamped_working_pair(
-                mean_slope,
-                em,
-                wi * mu * mu * info_mu,
-                score_mu / (mu * info_mu),
-            );
-            let info_nu = info_nu_raw.max(DISPERSION_MIN_CURVATURE);
-            let (disp_weight, disp_response) = clamped_working_pair(
-                disp_slope,
-                ed,
-                wi * nu * nu * info_nu,
-                s_nu / (nu * info_nu),
-            );
+            let mean_weight = wi * nu;
+            let mean_response = em + (yi - mu) / mu;
+            let disp_weight = wi * nu * nu * info_nu_raw;
+            let disp_response = ed + s_nu / (nu * info_nu_raw);
             DispersionRowKernel {
                 loglik,
                 mean_weight,
@@ -845,27 +1023,26 @@ pub(super) fn dispersion_row_kernel(
         }
         DispersionFamilyKind::Beta => {
             // logit mean link.
-            let mu = 1.0 / (1.0 + (-em).exp());
+            let logit = gam_solve::mixture_link::logit_inverse_link_jet5(em);
+            let mu = logit.mu;
             let phi = ed.exp(); // precision
-            let q = mu * (1.0 - mu); // dμ/dη, strictly positive for |em| ≤ clamp
+            let q = logit.d1;
             let tower = dispersion_beta_nll_order2(yi, mu, phi, wi);
-            let (score_mu, info_mu_raw) = tower_score_info(&tower, 0, wi);
-            let (s_phi, info_phi_raw) = tower_score_info(&tower, 1, wi);
+            let (score_mu, _) = tower_score_info(&tower, 0, wi);
+            let (s_phi, _) = tower_score_info(&tower, 1, wi);
             let loglik = -tower.value();
-            let info_mu = info_mu_raw.max(DISPERSION_MIN_CURVATURE);
-            let (mean_weight, mean_response) = clamped_working_pair(
-                mean_slope,
-                em,
-                wi * q * q * info_mu,
-                score_mu / (q * info_mu),
-            );
-            let info_phi = info_phi_raw.max(DISPERSION_MIN_CURVATURE);
-            let (disp_weight, disp_response) = clamped_working_pair(
-                disp_slope,
-                ed,
-                wi * phi * phi * info_phi,
-                s_phi / (phi * info_phi),
-            );
+            let a = mu * phi;
+            let b = (1.0 - mu) * phi;
+            let tri_a = gam_math::jet_tower::trigamma(a);
+            let tri_b = gam_math::jet_tower::trigamma(b);
+            let tri_phi = gam_math::jet_tower::trigamma(phi);
+            let info_mu = phi * phi * (tri_a + tri_b);
+            let one_minus_mu = 1.0 - mu;
+            let info_phi = mu * mu * tri_a + one_minus_mu * one_minus_mu * tri_b - tri_phi;
+            let mean_weight = wi * q * q * info_mu;
+            let mean_response = em + score_mu / (q * info_mu);
+            let disp_weight = wi * phi * phi * info_phi;
+            let disp_response = ed + s_phi / (phi * info_phi);
             DispersionRowKernel {
                 loglik,
                 mean_weight,
@@ -884,12 +1061,8 @@ pub(super) fn dispersion_row_kernel(
             // Fisher-orthogonal to the dispersion block in this
             // parameterization), so they stay hand-written exactly as the
             // NB/Gamma mean arms do.
-            let (mean_weight, mean_response) = clamped_working_pair(
-                mean_slope,
-                em,
-                wi * mu.powf(two_minus_p) / phi,
-                (yi - mu) / mu,
-            );
+            let mean_weight = wi * mu.powf(two_minus_p) / phi;
+            let mean_response = em + (yi - mu) / mu;
             // Dispersion channel: the η_d-space score and OBSERVED information
             // come straight off the single-expression tower seeded on `η_d`
             // (#932), so the saddlepoint/point-mass branch split, the
@@ -904,11 +1077,9 @@ pub(super) fn dispersion_row_kernel(
             // same helper the NB/Gamma/Beta arms use (returns `(0, 0)` when the
             // prior weight is zero, so the row stays excluded below).
             let (s_eta, info_eta_raw) = tower_score_info(&tower, 0, wi);
-            let curvature_eta = info_eta_raw.max(DISPERSION_MIN_CURVATURE);
-            // The working response divides by this per-row curvature so the
-            // prior weight cancels.
-            let (disp_weight, disp_response) =
-                clamped_working_pair(disp_slope, ed, wi * curvature_eta, s_eta / curvature_eta);
+            let curvature_eta = if yi > 0.0 { 0.5 } else { info_eta_raw };
+            let disp_weight = wi * curvature_eta;
+            let disp_response = ed + s_eta / curvature_eta;
             DispersionRowKernel {
                 loglik,
                 mean_weight,
@@ -955,11 +1126,16 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
                 self.weights.len()
             ));
         }
-        let mut mean_weights = Array1::<f64>::zeros(n);
-        let mut mean_response = Array1::<f64>::zeros(n);
-        let mut disp_weights = Array1::<f64>::zeros(n);
-        let mut disp_response = Array1::<f64>::zeros(n);
-
+        for i in 0..n {
+            validate_dispersion_row_geometry_inputs(
+                self.kind,
+                i,
+                self.y[i],
+                eta_mu[i],
+                eta_d[i],
+                self.weights[i],
+            )?;
+        }
         // `dispersion_row_kernel` is a pure, row-independent map — each row reads
         // only `y[i]`/`eta_mu[i]`/`eta_d[i]`/`weights[i]` and writes nothing
         // shared — and it is transcendental-heavy (per-row digamma/trigamma
@@ -1005,13 +1181,28 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
         // diverges at this (β_μ, β_d) — silently dropping such rows would
         // evaluate a different dataset's objective.
         let mut log_likelihood = 0.0;
-        for (i, row) in kernels.into_iter().enumerate() {
+        for (i, row) in kernels.iter().enumerate() {
+            validate_dispersion_row_kernel_output(
+                i,
+                eta_mu[i],
+                eta_d[i],
+                self.weights[i],
+                row,
+            )?;
             log_likelihood += row.loglik;
-            mean_weights[i] = row.mean_weight.max(0.0);
-            mean_response[i] = row.mean_response;
-            disp_weights[i] = row.disp_weight.max(0.0);
-            disp_response[i] = row.disp_response;
+            if !log_likelihood.is_finite() {
+                return Err(dispersion_geometry_error(
+                    i,
+                    "dispersion-family cumulative log likelihood",
+                    eta_mu[i],
+                    log_likelihood,
+                ));
+            }
         }
+        let mean_weights = Array1::from_iter(kernels.iter().map(|row| row.mean_weight));
+        let mean_response = Array1::from_iter(kernels.iter().map(|row| row.mean_response));
+        let disp_weights = Array1::from_iter(kernels.iter().map(|row| row.disp_weight));
+        let disp_response = Array1::from_iter(kernels.iter().map(|row| row.disp_response));
         Ok(FamilyEvaluation {
             log_likelihood,
             blockworking_sets: vec![
@@ -1026,6 +1217,28 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
         let eta_mu = &block_states[Self::BLOCK_MEAN].eta;
         let eta_d = &block_states[Self::BLOCK_DISP].eta;
         let n = self.y.len();
+        if eta_mu.len() != n || eta_d.len() != n || self.weights.len() != n {
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "{} log-likelihood row-count mismatch: y={n}, eta_mu={}, eta_d={}, weights={}",
+                    self.kind.family_tag(),
+                    eta_mu.len(),
+                    eta_d.len(),
+                    self.weights.len()
+                ),
+            }
+            .into());
+        }
+        for i in 0..n {
+            validate_dispersion_row_geometry_inputs(
+                self.kind,
+                i,
+                self.y[i],
+                eta_mu[i],
+                eta_d[i],
+                self.weights[i],
+            )?;
+        }
         // #1591 prune: the objective needs only the row log-likelihood, so each
         // row evaluates the value channel alone (`to_bits`-identical to
         // `dispersion_row_kernel(..).loglik`), skipping every gradient/Hessian
@@ -1065,8 +1278,24 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
         // Honest sum — see `evaluate`: non-finite row terms signal genuine
         // divergence and must reach the caller, not be silently dropped.
         let mut ll = 0.0;
-        for loglik in per_row {
+        for (i, loglik) in per_row.into_iter().enumerate() {
+            if !loglik.is_finite() {
+                return Err(dispersion_geometry_error(
+                    i,
+                    "dispersion-family row log likelihood",
+                    eta_mu[i],
+                    loglik,
+                ));
+            }
             ll += loglik;
+            if !ll.is_finite() {
+                return Err(dispersion_geometry_error(
+                    i,
+                    "dispersion-family cumulative log likelihood",
+                    eta_mu[i],
+                    ll,
+                ));
+            }
         }
         Ok(ll)
     }
@@ -1129,6 +1358,16 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
                 self.weights.len()
             ));
         }
+        for i in 0..n {
+            validate_dispersion_row_geometry_inputs(
+                self.kind,
+                i,
+                self.y[i],
+                eta_mu[i],
+                eta_d[i],
+                self.weights[i],
+            )?;
+        }
 
         // Per-row observed `(∂²/∂η_μ², ∂²/∂η_μ∂η_d, ∂²/∂η_d²)` weights — one
         // full `Order2<2>` η-space tower per row. Row-independent, so fan it
@@ -1162,6 +1401,17 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
                     })
                     .collect()
             };
+        for (i, &(h_mm, h_md, h_dd)) in observed.iter().enumerate() {
+            for (quantity, eta, value) in [
+                ("dispersion-family observed mean curvature", eta_mu[i], h_mm),
+                ("dispersion-family observed cross curvature", eta_mu[i], h_md),
+                ("dispersion-family observed precision curvature", eta_d[i], h_dd),
+            ] {
+                if !value.is_finite() {
+                    return Err(dispersion_geometry_error(i, quantity, eta, value));
+                }
+            }
+        }
         let mean_weights = Array1::from_shape_fn(n, |i| observed[i].0);
         let cross_weights = Array1::from_shape_fn(n, |i| observed[i].1);
         let disp_weights = Array1::from_shape_fn(n, |i| observed[i].2);
@@ -1339,7 +1589,7 @@ pub(crate) fn dispersion_location_scale_warm_start(
 fn dispersion_moment_log_precision_seed(kind: DispersionFamilyKind, yi: f64, eta_mu: f64) -> f64 {
     const LOG_PRECISION_FLOOR: f64 = -10.0;
     const LOG_PRECISION_CEILING: f64 = 10.0;
-    let em = eta_mu.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
+    let em = eta_mu;
     let raw = match kind {
         DispersionFamilyKind::Beta => {
             // Beta's mean and precision scores are not Fisher-orthogonal in

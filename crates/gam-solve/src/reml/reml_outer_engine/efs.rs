@@ -72,7 +72,11 @@ pub(crate) const EFS_MAX_STEP: f64 = 5.0;
 ///
 /// Steps are clamped to `[-EFS_MAX_STEP, EFS_MAX_STEP]` so a single
 /// iteration cannot move λ by more than `exp(EFS_MAX_STEP)`.
-pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64], gradient: &[f64]) -> Vec<f64> {
+pub fn compute_efs_update(
+    solution: &InnerSolution<'_>,
+    rho: &[f64],
+    gradient: &[f64],
+) -> Result<Vec<f64>, String> {
     let k = rho.len();
     let ext_dim = solution.ext_coords.len();
     let total = k + ext_dim;
@@ -85,13 +89,14 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64], gradient: &
     let mut steps = vec![0.0; total];
 
     let (profiled_scale, dp_cgrad) = efs_profiling(solution);
-    let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+    let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())
+        .map_err(|error| format!("EFS rho: {error}"))?;
     let penalty_quad_atom = crate::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
         &lambdas,
         &solution.penalty_coords,
         &solution.beta,
     )
-    .expect("EFS penalty-quadratic atom must match InnerSolution penalty layout");
+    .map_err(|error| format!("EFS penalty-quadratic layout: {error}"))?;
 
     // Universal-form EFS: `Δρ_i = log(1 − 2·g_full[i]/q_eff_i)`. This is
     // identical to the canonical `log((d−t)/q_eff)` when no out-of-band
@@ -128,7 +133,7 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64], gradient: &
         }
     }
 
-    steps
+    Ok(steps)
 }
 
 /// Regularization threshold for pseudoinverse of the trace Gram matrix.
@@ -237,7 +242,7 @@ pub fn compute_hybrid_efs_update(
     solution: &InnerSolution<'_>,
     rho: &[f64],
     gradient: &[f64],
-) -> HybridEfsResult {
+) -> Result<HybridEfsResult, String> {
     let k = rho.len();
     let hop = &*solution.hessian_op;
     let ext_dim = solution.ext_coords.len();
@@ -259,13 +264,14 @@ pub fn compute_hybrid_efs_update(
     // candidates in parallel once the block is large enough, then keep the
     // actual update write-back serial so fallback/backtracking decisions still
     // see a deterministic step vector.
-    let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+    let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())
+        .map_err(|error| format!("hybrid EFS rho: {error}"))?;
     let penalty_quad_atom = crate::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
         &lambdas,
         &solution.penalty_coords,
         &solution.beta,
     )
-    .expect("hybrid EFS penalty-quadratic atom must match InnerSolution penalty layout");
+    .map_err(|error| format!("hybrid EFS penalty-quadratic layout: {error}"))?;
     let rho_candidates: Vec<(usize, Option<f64>)> =
         if k >= HYBRID_EFS_SCALAR_PAR_THRESHOLD && rayon::current_thread_index().is_none() {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -404,11 +410,11 @@ pub fn compute_hybrid_efs_update(
                 let raw_step = -PSI_INITIAL_ALPHA * psi_gradient[0] / gram;
                 steps[global_idx] = raw_step.clamp(-EFS_MAX_STEP, EFS_MAX_STEP);
             }
-            return HybridEfsResult {
+            return Ok(HybridEfsResult {
                 steps,
                 psi_indices: psi_global_indices,
                 psi_gradient,
-            };
+            });
         }
 
         let total_p = hop.dim();
@@ -620,11 +626,11 @@ pub fn compute_hybrid_efs_update(
         }
     }
 
-    HybridEfsResult {
+    Ok(HybridEfsResult {
         steps,
         psi_indices: psi_global_indices,
         psi_gradient,
-    }
+    })
 }
 
 /// Compute G⁺ v where G⁺ is the pseudoinverse of symmetric matrix G.

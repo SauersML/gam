@@ -507,11 +507,7 @@ impl<'a> LogSmoothingParamsView<'a> {
     pub fn new(
         values: ArrayView1<'a, f64>,
     ) -> Result<Self, crate::IndexedLogStrengthDomainError> {
-        for (coordinate, &value) in values.iter().enumerate() {
-            crate::validate_log_strength(value).map_err(|_| {
-                crate::IndexedLogStrengthDomainError { coordinate, value }
-            })?;
-        }
+        crate::validate_log_strengths(values.iter().copied())?;
         Ok(Self(values))
     }
 

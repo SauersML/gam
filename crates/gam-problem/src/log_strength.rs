@@ -79,6 +79,32 @@ pub fn validate_log_strength(log_strength: f64) -> Result<(), LogStrengthDomainE
     }
 }
 
+/// Validate a complete vector, reporting the deterministic smallest invalid
+/// coordinate before any caller-visible computation begins.
+pub fn validate_log_strengths(
+    values: impl IntoIterator<Item = f64>,
+) -> Result<(), IndexedLogStrengthDomainError> {
+    for (coordinate, value) in values.into_iter().enumerate() {
+        validate_log_strength(value)
+            .map_err(|_| IndexedLogStrengthDomainError { coordinate, value })?;
+    }
+    Ok(())
+}
+
+/// Convert a complete vector atomically on the exact supported domain.
+pub fn checked_exp_log_strengths(
+    values: impl IntoIterator<Item = f64>,
+) -> Result<Vec<f64>, IndexedLogStrengthDomainError> {
+    let mut strengths = Vec::new();
+    for (coordinate, value) in values.into_iter().enumerate() {
+        strengths.push(
+            checked_exp_log_strength(value)
+                .map_err(|_| IndexedLogStrengthDomainError { coordinate, value })?,
+        );
+    }
+    Ok(strengths)
+}
+
 /// Exponentiate a logarithmic strength on the exact closed solver domain.
 ///
 /// No input is clamped and no output is floored or capped.  Thus the returned
@@ -119,5 +145,13 @@ mod tests {
                 value.to_bits()
             );
         }
+    }
+
+    #[test]
+    fn vector_validation_reports_the_smallest_bad_coordinate_atomically() {
+        let values = [0.0, LOG_STRENGTH_MAX + 1.0, f64::NAN];
+        let error = checked_exp_log_strengths(values).unwrap_err();
+        assert_eq!(error.coordinate, 1);
+        assert_eq!(error.value, LOG_STRENGTH_MAX + 1.0);
     }
 }

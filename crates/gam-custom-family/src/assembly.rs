@@ -617,7 +617,7 @@ pub(crate) fn unified_joint_efs_eval(
     if has_psi {
         let inner_hessian_scale =
             hessian_factorization_geometric_scale(inner_solution.hessian_op.as_ref());
-        let hybrid = compute_hybrid_efs_update(&inner_solution, rho_slice, gradient_slice);
+        let hybrid = compute_hybrid_efs_update(&inner_solution, rho_slice, gradient_slice)?;
         Ok(gam_problem::EfsEval {
             cost: result.cost,
             steps: hybrid.steps,
@@ -641,7 +641,7 @@ pub(crate) fn unified_joint_efs_eval(
             hessian_factorization_geometric_scale(inner_solution.hessian_op.as_ref());
         Ok(gam_problem::EfsEval {
             cost: result.cost,
-            steps: compute_efs_update(&inner_solution, rho_slice, gradient_slice),
+            steps: compute_efs_update(&inner_solution, rho_slice, gradient_slice)?,
             beta: Some(inner_solution.beta.clone()),
             psi_gradient: None,
             psi_indices: None,
@@ -2402,30 +2402,28 @@ pub(crate) fn normalize_outer_eval_error_detail(error: &str) -> &str {
 /// zero (the ψ coordinate does not move any realized penalty).
 pub(crate) fn assemble_block_local_s_psi(
     deriv: &CustomFamilyBlockPsiDerivative,
-    per_block_rho: &Array1<f64>,
+    per_block_lambdas: &Array1<f64>,
     p_block: usize,
-) -> Result<Array2<f64>, String> {
-    let lambdas = exact_lambdas_from_log_strengths(
-        per_block_rho,
-        "block-local psi penalty log strength",
-    )?;
+) -> Array2<f64> {
     if let Some(ref components) = deriv.s_psi_penalty_components {
         let mut s = Array2::<f64>::zeros((p_block, p_block));
         for (penalty_idx, s_part) in components {
-            s_part.add_scaled_to(lambdas[*penalty_idx], &mut s);
+            s_part.add_scaled_to(per_block_lambdas[*penalty_idx], &mut s);
         }
-        return Ok(s);
+        return s;
     }
     if let Some(ref components) = deriv.s_psi_components {
         let mut s = Array2::<f64>::zeros((p_block, p_block));
         for (penalty_idx, s_part) in components {
-            s.scaled_add(lambdas[*penalty_idx], s_part);
+            s.scaled_add(per_block_lambdas[*penalty_idx], s_part);
         }
-        Ok(s)
+        s
     } else if let Some(penalty_idx) = deriv.penalty_index {
-        Ok(deriv.s_psi.mapv(|v| lambdas[penalty_idx] * v))
+        deriv
+            .s_psi
+            .mapv(|v| per_block_lambdas[penalty_idx] * v)
     } else {
-        Ok(Array2::<f64>::zeros((p_block, p_block)))
+        Array2::<f64>::zeros((p_block, p_block))
     }
 }
 
@@ -2438,42 +2436,38 @@ pub(crate) fn assemble_block_local_s_psi(
 pub(crate) fn assemble_block_local_s_psi_psi(
     deriv_i: &CustomFamilyBlockPsiDerivative,
     local_j: usize,
-    per_block_rho: &Array1<f64>,
+    per_block_lambdas: &Array1<f64>,
     p_block: usize,
-) -> Result<Array2<f64>, String> {
-    let lambdas = exact_lambdas_from_log_strengths(
-        per_block_rho,
-        "block-local psi-psi penalty log strength",
-    )?;
+) -> Array2<f64> {
     if let Some(ref parts) = deriv_i.s_psi_psi_penalty_components {
         let mut s = Array2::<f64>::zeros((p_block, p_block));
         if let Some(pair_parts) = parts.get(local_j) {
             for (penalty_idx, s_part) in pair_parts {
-                s_part.add_scaled_to(lambdas[*penalty_idx], &mut s);
+                s_part.add_scaled_to(per_block_lambdas[*penalty_idx], &mut s);
             }
         }
-        return Ok(s);
+        return s;
     }
     if let Some(ref parts) = deriv_i.s_psi_psi_components {
         let mut s = Array2::<f64>::zeros((p_block, p_block));
         if let Some(pair_parts) = parts.get(local_j) {
             for (penalty_idx, s_part) in pair_parts {
-                s.scaled_add(lambdas[*penalty_idx], s_part);
+                s.scaled_add(per_block_lambdas[*penalty_idx], s_part);
             }
         }
-        Ok(s)
+        s
     } else if let Some(ref parts) = deriv_i.s_psi_psi {
         if let Some(s_part) = parts.get(local_j) {
             if let Some(penalty_index) = deriv_i.penalty_index {
-                Ok(s_part.mapv(|v| lambdas[penalty_index] * v))
+                s_part.mapv(|v| per_block_lambdas[penalty_index] * v)
             } else {
-                Ok(Array2::<f64>::zeros((p_block, p_block)))
+                Array2::<f64>::zeros((p_block, p_block))
             }
         } else {
-            Ok(Array2::<f64>::zeros((p_block, p_block)))
+            Array2::<f64>::zeros((p_block, p_block))
         }
     } else {
-        Ok(Array2::<f64>::zeros((p_block, p_block)))
+        Array2::<f64>::zeros((p_block, p_block))
     }
 }
 

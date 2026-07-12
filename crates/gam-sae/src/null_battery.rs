@@ -1042,11 +1042,7 @@ fn dense_fixed_mean_householder_vector(n: usize) -> Result<Vec<f64>, String> {
         let negative = -((positive_count as f64) / (negative_count as f64 * n as f64)).sqrt();
         (positive_count, negative_count, positive, negative)
     };
-    if !(positive.is_finite()
-        && positive > 0.0
-        && negative.is_finite()
-        && negative < 0.0)
-    {
+    if !(positive.is_finite() && positive > 0.0 && negative.is_finite() && negative < 0.0) {
         return Err("could not construct the dense fixed-mean Householder vector".to_string());
     }
     let mut vector = Vec::new();
@@ -3854,6 +3850,13 @@ mod tests {
             !preserves_every_column_multiset,
             "the three-row covariance-exact control reduced to a row permutation"
         );
+
+        // The first-row chart would form 1.5e308 - (-4e307) and fail even
+        // though centering at the stable mean leaves every residual and this
+        // orthogonal transform representable.
+        let antipodal_range = ndarray::array![[1.5e308], [-4.0e307], [-4.0e307]];
+        let antipodal_mixed = covariance_exact_hadamard_null(antipodal_range.view(), 2262).unwrap();
+        assert!(antipodal_mixed.iter().all(|value| value.is_finite()));
 
         let impossible = ndarray::array![[0.0], [1.0]];
         let error = covariance_exact_hadamard_null(impossible.view(), 1).unwrap_err();

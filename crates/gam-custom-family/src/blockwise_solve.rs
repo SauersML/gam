@@ -14,15 +14,24 @@ pub(crate) fn exact_lambdas_from_log_strengths(
     log_strengths: &Array1<f64>,
     label: &str,
 ) -> Result<Array1<f64>, CustomFamilyError> {
-    let mut lambdas = Vec::with_capacity(log_strengths.len());
-    for (coordinate, &value) in log_strengths.iter().enumerate() {
-        lambdas.push(gam_problem::checked_exp_log_strength(value).map_err(|error| {
-            CustomFamilyError::ConstraintViolation {
-                reason: format!("{label} coordinate {coordinate}: {error}"),
-            }
-        })?);
-    }
-    Ok(Array1::from_vec(lambdas))
+    gam_problem::checked_exp_log_strengths(log_strengths.iter().copied())
+        .map(Array1::from_vec)
+        .map_err(|error| CustomFamilyError::ConstraintViolation {
+            reason: format!("{label}: {error}"),
+        })
+}
+
+pub(crate) fn exact_lambdas_by_block(
+    block_log_strengths: &[Array1<f64>],
+    label: &str,
+) -> Result<Vec<Array1<f64>>, CustomFamilyError> {
+    block_log_strengths
+        .iter()
+        .enumerate()
+        .map(|(block, values)| {
+            exact_lambdas_from_log_strengths(values, &format!("{label} block {block}"))
+        })
+        .collect()
 }
 
 pub(crate) fn aggregate_labeled_hessian(
@@ -309,13 +318,11 @@ pub(crate) fn split_log_lambdas(
     // Certify the complete vector before producing any partial block output.
     // Every downstream physical conversion is therefore dominated by the
     // shared exact-domain contract even when it operates block-by-block.
-    for (coordinate, &value) in flat.iter().enumerate() {
-        gam_problem::validate_log_strength(value).map_err(|error| {
-            CustomFamilyError::ConstraintViolation {
-                reason: format!("log-smoothing vector coordinate {coordinate}: {error}"),
-            }
-        })?;
-    }
+    gam_problem::validate_log_strengths(flat.iter().copied()).map_err(|error| {
+        CustomFamilyError::ConstraintViolation {
+            reason: format!("log-smoothing vector: {error}"),
+        }
+    })?;
     let mut out = Vec::with_capacity(penalty_counts.len());
     let mut at = 0usize;
     for &k in penalty_counts {

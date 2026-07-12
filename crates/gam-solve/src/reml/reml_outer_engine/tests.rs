@@ -3300,7 +3300,7 @@ pub(crate) fn efs_step_is_zero_at_scalar_optimum() {
     // universal form `Δρ = log(1 − 2·g_full/q_eff)` collapses to
     // `log(1) = 0`.
     let gradient_at_optimum = [0.0_f64];
-    let steps = compute_efs_update(&solution, &rho, &gradient_at_optimum);
+    let steps = compute_efs_update(&solution, &rho, &gradient_at_optimum).expect("valid EFS rho");
     assert_eq!(steps.len(), 1);
     assert!(
         steps[0].abs() < 1e-12,
@@ -3312,7 +3312,7 @@ pub(crate) fn efs_step_is_zero_at_scalar_optimum() {
     // multiplicative target `1 − 2·0.1/0.75 = 0.733` ⇒ Δρ = log(0.733).
     let q_eff = lambda * beta_hat * beta_hat; // 0.75
     let g_off = 0.1_f64;
-    let steps_off = compute_efs_update(&solution, &rho, &[g_off]);
+    let steps_off = compute_efs_update(&solution, &rho, &[g_off]).expect("valid EFS rho");
     let expected = (1.0_f64 - 2.0 * g_off / q_eff).ln();
     assert!(
         (steps_off[0] - expected).abs() < 1e-12,

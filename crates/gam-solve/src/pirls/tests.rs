@@ -675,7 +675,7 @@ mod tests {
 
     #[test]
     fn fixed_rho_uses_the_shared_closed_log_strength_domain_without_projection() {
-        use gam_terms::analytic_penalties::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN};
+        use gam_problem::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN};
 
         let rho = array![LOG_STRENGTH_MIN, 0.0, LOG_STRENGTH_MAX];
         let lambda = exact_lambdas_from_rho(

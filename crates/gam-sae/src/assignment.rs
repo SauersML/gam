@@ -2340,7 +2340,7 @@ mod support_measure_tests {
 #[cfg(test)]
 mod ordered_alpha_domain_tests {
     use super::*;
-    use gam_terms::analytic_penalties::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN};
+    use gam_problem::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN};
 
     fn ordered_assignment(alpha: f64) -> SaeAssignment {
         SaeAssignment::from_blocks_with_mode(

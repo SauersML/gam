@@ -227,9 +227,9 @@ pub(crate) fn validate_lambda_pair_consistency(
         .into());
     }
     for (idx, (&log_lambda, &lambda)) in log_lambdas.iter().zip(lambdas.iter()).enumerate() {
-        let expected = log_lambda.exp();
-        let tolerance = 1e-10 * expected.abs().max(1.0);
-        if (lambda - expected).abs() > tolerance {
+        let expected = gam_problem::checked_exp_log_strength(log_lambda)
+            .map_err(|error| format!("{label} log coordinate {idx}: {error}"))?;
+        if lambda.to_bits() != expected.to_bits() {
             return Err(format!(
                 "{label}[{idx}] inconsistent with exp(log_lambda): got {lambda}, expected {expected}",
             ));
