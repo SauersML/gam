@@ -3,8 +3,7 @@ use super::*;
 use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar,
-    MappedOrder2Accumulator, OneSeed, OneSeedBatch, OneSeedLane, Order2, Order2Lane,
-    RuntimeJetScalar,
+    MappedOrder2Accumulator, OneSeedBatch, OneSeedLane, Order2, Order2Lane, RuntimeJetScalar,
 };
 use wide::f64x4;
 
@@ -3918,6 +3917,7 @@ mod patterned_order2_perf_tests {
 #[cfg(test)]
 mod simd_batch_bit_identity_tests {
     use super::*;
+    use gam_math::jet_scalar::OneSeed;
 
     #[test]
     fn missing_fitted_state_is_a_typed_geometry_error() {
