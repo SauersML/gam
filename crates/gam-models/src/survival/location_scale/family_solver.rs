@@ -446,6 +446,7 @@ impl SurvivalLocationScaleFamily {
     /// Θ(n · Σ p_b²) instead of Θ(n · (Σ p_b)²) — for large scale
     /// (n ≈ 3·10⁵, Σ p_b ≈ 200) this avoids ~12·10⁹ scalar multiplies and
     /// the corresponding p² dense allocation per evaluate.
+    #[cfg(test)]
     pub(crate) fn assemble_block_diagonal_hessians_from_quantities(
         &self,
         q: &SurvivalJointQuantities,
@@ -683,6 +684,7 @@ impl SurvivalLocationScaleFamily {
     /// gradient is likewise pinned by
     /// `survival_ls_block_gradient_matches_single_sourced_tower_932`. A future
     /// cutover requires a sparsity-aware packed jet that closes the measured gap.
+    #[cfg(test)]
     pub(crate) fn assemble_joint_hessian_from_quantities(
         &self,
         q: &SurvivalJointQuantities,
@@ -701,6 +703,7 @@ impl SurvivalLocationScaleFamily {
     /// (WS4a-survival-LS): every survival-LS assembly site is of the form
     /// `Σ_i x_i y_iᵀ · w_i` (row-additive), so per-row mask multiplication
     /// is unbiased for `Σ_i w_i · x_i y_iᵀ` under HT weighting.
+    #[cfg(test)]
     pub(crate) fn assemble_joint_hessian_from_quantities_masked(
         &self,
         q: &SurvivalJointQuantities,
