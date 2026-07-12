@@ -13,7 +13,7 @@ use super::*;
 use crate::fnv1a::Fnv1a;
 use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOneSeedBatch, DynamicOneSeedBatchWorkspace, DynamicTwoSeed,
-    RuntimeJetScalar, filtered_implicit_solve_runtime_scalar,
+    FixedRuntimeJet, OneSeed, RuntimeJetScalar, TwoSeed, filtered_implicit_solve_runtime_scalar,
 };
 
 thread_local! {
@@ -1263,6 +1263,61 @@ impl BernoulliMarginalSlopeFamily {
         )))
     }
 
+    #[inline]
+    fn empirical_fixed_third_contracted<const K: usize>(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+        direction: &[f64],
+    ) -> Result<Array2<f64>, String> {
+        debug_assert_eq!(point.len(), K);
+        debug_assert_eq!(direction.len(), K);
+        let vars: [FixedRuntimeJet<OneSeed<K>, K>; K] = std::array::from_fn(|axis| {
+            FixedRuntimeJet::from_inner(OneSeed::seed_direction(point[axis], axis, direction[axis]))
+        });
+        let contracted = plan
+            .evaluate(&vars, 3, &())?
+            .into_inner()
+            .contracted_third();
+        let mut out = Array2::<f64>::zeros((K, K));
+        for a in 0..K {
+            for b in 0..K {
+                out[[a, b]] = contracted[a][b];
+            }
+        }
+        Ok(out)
+    }
+
+    #[inline]
+    fn empirical_fixed_fourth_contracted<const K: usize>(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+        direction_u: &[f64],
+        direction_v: &[f64],
+    ) -> Result<Array2<f64>, String> {
+        debug_assert_eq!(point.len(), K);
+        debug_assert_eq!(direction_u.len(), K);
+        debug_assert_eq!(direction_v.len(), K);
+        let vars: [FixedRuntimeJet<TwoSeed<K>, K>; K] = std::array::from_fn(|axis| {
+            FixedRuntimeJet::from_inner(TwoSeed::seed(
+                point[axis],
+                axis,
+                direction_u[axis],
+                direction_v[axis],
+            ))
+        });
+        let contracted = plan
+            .evaluate(&vars, 4, &())?
+            .into_inner()
+            .contracted_fourth();
+        let mut out = Array2::<f64>::zeros((K, K));
+        for a in 0..K {
+            for b in 0..K {
+                out[[a, b]] = contracted[a][b];
+            }
+        }
+        Ok(out)
+    }
+
     pub(super) fn empirical_flex_row_third_contracted(
         &self,
         row: usize,
@@ -1275,6 +1330,39 @@ impl BernoulliMarginalSlopeFamily {
         dir: &Array1<f64>,
         grid: &EmpiricalZGrid,
     ) -> Result<Array2<f64>, String> {
+        let r = primary.total;
+        if dir.len() != r {
+            return Err(format!(
+                "bernoulli empirical flex third contraction direction length {} != primary dimension {r}",
+                dir.len()
+            ));
+        }
+        if dir.iter().all(|value| *value == 0.0) {
+            return Ok(Array2::<f64>::zeros((r, r)));
+        }
+        if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
+            return Err("non-finite empirical flexible row context in third contraction".into());
+        }
+        if matches!(r, 4 | 8 | 12 | 18) {
+            let plan = self.empirical_bms_row_jet_plan(
+                row,
+                primary,
+                q,
+                b,
+                beta_h,
+                beta_w,
+                row_ctx.intercept,
+                grid,
+            )?;
+            let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
+            return match r {
+                4 => Self::empirical_fixed_third_contracted::<4>(&plan, &point, dir),
+                8 => Self::empirical_fixed_third_contracted::<8>(&plan, &point, dir),
+                12 => Self::empirical_fixed_third_contracted::<12>(&plan, &point, dir),
+                18 => Self::empirical_fixed_third_contracted::<18>(&plan, &point, dir),
+                _ => unreachable!("fixed empirical BMS width was matched above"),
+            };
+        }
         let mut contracted = self.empirical_flex_row_third_contracted_many(
             row,
             primary,
@@ -1347,20 +1435,15 @@ impl BernoulliMarginalSlopeFamily {
             let mut workspace = workspace.borrow_mut();
             workspace.reset(row_dirs.len());
             let vars = workspace.alloc_slice_fill_with(r, |axis| {
-                DynamicOneSeedBatch::seed_directions(
-                    point[axis],
-                    axis,
-                    r,
-                    &workspace,
-                    |lane| row_dirs[lane][axis],
-                )
+                DynamicOneSeedBatch::seed_directions(point[axis], axis, r, &workspace, |lane| {
+                    row_dirs[lane][axis]
+                })
             });
             let jet = plan.evaluate(vars, 3, &workspace)?;
             (0..row_dirs.len())
                 .map(|lane| {
-                    Array2::from_shape_vec((r, r), jet.contracted_third(lane).to_vec()).map_err(
-                        |error| format!("empirical BMS third-contraction shape: {error}"),
-                    )
+                    Array2::from_shape_vec((r, r), jet.contracted_third(lane).to_vec())
+                        .map_err(|error| format!("empirical BMS third-contraction shape: {error}"))
                 })
                 .collect()
         })
@@ -1408,13 +1491,9 @@ impl BernoulliMarginalSlopeFamily {
             let mut workspace = workspace.borrow_mut();
             workspace.reset(r);
             let vars = workspace.alloc_slice_fill_with(r, |axis| {
-                DynamicOneSeedBatch::seed_directions(
-                    point[axis],
-                    axis,
-                    r,
-                    &workspace,
-                    |lane| if lane == axis { 1.0 } else { 0.0 },
-                )
+                DynamicOneSeedBatch::seed_directions(point[axis], axis, r, &workspace, |lane| {
+                    if lane == axis { 1.0 } else { 0.0 }
+                })
             });
             let jet = plan.evaluate(vars, 3, &workspace)?;
             let mut gradient = Array1::<f64>::zeros(r);
@@ -1468,6 +1547,17 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
+        match r {
+            4 => return Self::empirical_fixed_fourth_contracted::<4>(&plan, &point, dir_u, dir_v),
+            8 => return Self::empirical_fixed_fourth_contracted::<8>(&plan, &point, dir_u, dir_v),
+            12 => {
+                return Self::empirical_fixed_fourth_contracted::<12>(&plan, &point, dir_u, dir_v);
+            }
+            18 => {
+                return Self::empirical_fixed_fourth_contracted::<18>(&plan, &point, dir_u, dir_v);
+            }
+            _ => {}
+        }
         EMPIRICAL_BMS_FOURTH_WORKSPACE.with(|arena| {
             let mut arena = arena.borrow_mut();
             arena.reset();
