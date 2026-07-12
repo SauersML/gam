@@ -1811,15 +1811,6 @@ pub fn derived_row_kernel<const K: usize, P: RowNllProgram<K> + ?Sized>(
     Ok((t.v, t.g, t.h))
 }
 
-/// Mechanically derived `row_third_contracted` channel.
-pub fn derived_third_contracted<const K: usize, P: RowNllProgram<K> + ?Sized>(
-    prog: &P,
-    row: usize,
-    dir: &[f64; K],
-) -> Result<[[f64; K]; K], String> {
-    Ok(evaluate_program(prog, row)?.third_contracted(dir))
-}
-
 // ── The canonical single-source seam (#932 consolidation) ────────────
 //
 // `RowProgram<K>` is the ONE row-program interface #932 converges every family
