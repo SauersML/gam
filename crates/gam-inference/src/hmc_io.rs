@@ -1382,89 +1382,6 @@ fn joint_family_logp_and_grad(
     exact_glm_logp_and_grad_for_likelihood_into(&resolved, data, eta, &mut residual)
 }
 
-/// Logistic regression log-likelihood and gradient.
-///
-/// log p(y|η) = y·η − log(1 + exp(η)), gradient = X'(w ⊙ (y − μ))
-fn logit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
-    let mut residual = Array1::<f64>::zeros(data.n_samples);
-    logit_logp_and_grad_into(data, eta, &mut residual)
-}
-
-fn logit_logp_and_grad_into(
-    data: &SharedData,
-    eta: &Array1<f64>,
-    residual: &mut Array1<f64>,
-) -> (f64, Array1<f64>) {
-    use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
-    let n = data.n_samples;
-    assert_eq!(residual.len(), n);
-    // Per-row independent: write residual entry into a pre-allocated buffer and
-    // reduce the ll contribution in parallel — avoids materialising a
-    // Vec<(f64, f64)> and the serial scatter that follows.
-    let ll_parts: Vec<f64> = residual
-        .as_slice_mut()
-        .unwrap()
-        .par_iter_mut()
-        .enumerate()
-        .map(|(i, slot)| {
-            let eta_i = eta[i];
-            let y_i = data.y[i];
-            let w_i = data.weights[i];
-            let mu = gam_linalg::utils::stable_logistic(eta_i);
-            *slot = w_i * (y_i - mu);
-            w_i * (y_i * eta_i - gam_linalg::utils::stable_softplus(eta_i))
-        })
-        .collect();
-    let ll: f64 = gam_linalg::pairwise_reduce::pairwise_sum(&ll_parts);
-
-    let grad_ll = fast_atv(data.x.as_ref(), &*residual);
-    (ll, grad_ll)
-}
-
-/// Probit regression log-likelihood and gradient.
-///
-/// log p(y|η) = Σ [y·log Φ(η) + (1-y)·log(1-Φ(η))],
-/// gradient_i = w_i · [y_i · φ(η_i)/Φ(η_i) − (1-y_i) · φ(η_i)/(1−Φ(η_i))]
-///
-/// Uses erfc-based log Φ for numerical stability.
-fn probit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
-    let mut residual = Array1::<f64>::zeros(data.n_samples);
-    probit_logp_and_grad_into(data, eta, &mut residual)
-}
-
-fn probit_logp_and_grad_into(
-    data: &SharedData,
-    eta: &Array1<f64>,
-    residual: &mut Array1<f64>,
-) -> (f64, Array1<f64>) {
-    use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
-    let n = data.n_samples;
-    assert_eq!(residual.len(), n);
-    let ll_parts: Vec<f64> = residual
-        .as_slice_mut()
-        .unwrap()
-        .par_iter_mut()
-        .enumerate()
-        .map(|(i, slot)| {
-            let eta_i = eta[i];
-            let y_i = data.y[i];
-            let w_i = data.weights[i];
-            let log_phi_pos = log_ndtr(eta_i);
-            let log_phi_neg = log_ndtr(-eta_i);
-            let log_phi_val = standard_normal_log_pdf(eta_i);
-            let ratio_pos = (log_phi_val - log_phi_pos).exp();
-            let ratio_neg = (log_phi_val - log_phi_neg).exp();
-            let grad_i = y_i * ratio_pos - (1.0 - y_i) * ratio_neg;
-            *slot = w_i * grad_i;
-            w_i * (y_i * log_phi_pos + (1.0 - y_i) * log_phi_neg)
-        })
-        .collect();
-    let ll: f64 = gam_linalg::pairwise_reduce::pairwise_sum(&ll_parts);
-
-    let grad_ll = fast_atv(data.x.as_ref(), &*residual);
-    (ll, grad_ll)
-}
-
 /// Complementary log-log regression log-likelihood and gradient.
 ///
 /// CLogLog link: μ = 1 − exp(−exp(η))
@@ -1765,7 +1682,8 @@ mod tests {
         FamilyNutsInputs, GlmFlatInputs, JointBetaRhoInputs, JointBetaRhoPosterior,
         LinkWiggleFamilyParams, LinkWigglePosterior, LinkWiggleSplineArtifacts, NutsConfig,
         NutsFamily, NutsPosterior, NutsResult, SharedData, cloglog_bernoulli_logp_and_residual,
-        firth_jeffreys_logp_and_grad, joint_family_logp_and_grad,
+        exact_glm_logp_and_grad_into, firth_jeffreys_logp_and_grad,
+        joint_family_logp_and_grad,
         laplace_directional_cubic_diagnostic, laplace_skewness_threshold,
         laplace_trustworthiness_from_skewness, run_joint_beta_rho_sampling,
         run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family,
@@ -1773,8 +1691,8 @@ mod tests {
     use gam_linalg::matrix::DesignMatrix;
     use gam_models::survival::{PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec};
     use gam_problem::types::{
-        InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization,
-        ResponseFamily, RhoPrior, StandardLink,
+        GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec,
+        LogLikelihoodNormalization, ResponseFamily, RhoPrior, StandardLink,
     };
     use gam_solve::estimate::{
         BlockRole, FitGeometry, FitInference, FittedBlock, FittedLinkState, UnifiedFitResult,
@@ -1833,6 +1751,51 @@ mod tests {
             let logp = self.compute_joint_logp_and_grad_into(params, &mut grad);
             (logp, grad)
         }
+    }
+
+    fn nuts_test_likelihood(family: NutsFamily, parameter: f64) -> GlmLikelihoodSpec {
+        let mut spec = family.likelihood_spec();
+        let scale = match family {
+            NutsFamily::Gaussian => LikelihoodScaleMetadata::ProfiledGaussian,
+            NutsFamily::GammaLog => LikelihoodScaleMetadata::EstimatedGammaShape {
+                shape: parameter,
+            },
+            NutsFamily::TweedieLog => {
+                spec.response = ResponseFamily::Tweedie { p: parameter };
+                LikelihoodScaleMetadata::EstimatedTweediePhi { phi: 1.0 }
+            }
+            NutsFamily::NegativeBinomialLog => {
+                spec.response = ResponseFamily::NegativeBinomial {
+                    theta: parameter,
+                    theta_fixed: false,
+                };
+                LikelihoodScaleMetadata::EstimatedNegBinTheta { theta: parameter }
+            }
+            NutsFamily::BinomialLogit
+            | NutsFamily::BinomialProbit
+            | NutsFamily::BinomialCLogLog
+            | NutsFamily::PoissonLog => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+        };
+        GlmLikelihoodSpec { spec, scale }
+    }
+
+    fn exact_eta_geometry(
+        likelihood: &GlmLikelihoodSpec,
+        y: &Array1<f64>,
+        weights: &Array1<f64>,
+        eta: &Array1<f64>,
+    ) -> Result<(f64, Array1<f64>), String> {
+        let mut score = Array1::zeros(eta.len());
+        let value = gam_solve::pirls::eta_log_likelihood_value_and_score_into(
+            y.view(),
+            eta,
+            likelihood,
+            &likelihood.spec.link,
+            weights.view(),
+            &mut score,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok((value, score))
     }
 
     fn hmc_test_fit(
@@ -1930,8 +1893,7 @@ mod tests {
             penalty.view(),
             fit.beta.view(),
             explicit.view(),
-            NutsFamily::Gaussian,
-            1.0,
+            nuts_test_likelihood(NutsFamily::Gaussian, 1.0),
             gam_solve::estimate::Dispersion::UNIT,
             false,
         )
@@ -2042,8 +2004,18 @@ mod tests {
     #[test]
     fn cloglog_log_mu_uses_complementary_loglog_inverse_link() {
         let eta = -1.0_f64;
-        let (ll_y1, residual_y1) =
-            cloglog_bernoulli_logp_and_residual(eta, 1.0).expect("valid eta");
+        let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::CLogLog),
+        ));
+        let (ll_y1, score) = exact_eta_geometry(
+            &likelihood,
+            &array![1.0],
+            &array![1.0],
+            &array![eta],
+        )
+        .expect("valid eta");
+        let residual_y1 = score[0];
         let expected = (1.0 - (-eta.exp()).exp()).ln();
         let wrong_log_one_minus_exp_eta = (1.0 - eta.exp()).ln();
 
@@ -2051,8 +2023,20 @@ mod tests {
         assert!((ll_y1 - wrong_log_one_minus_exp_eta).abs() > 0.5);
 
         let eps = 1e-6;
-        let (lp, _) = cloglog_bernoulli_logp_and_residual(eta + eps, 1.0).expect("valid eta");
-        let (lm, _) = cloglog_bernoulli_logp_and_residual(eta - eps, 1.0).expect("valid eta");
+        let (lp, _) = exact_eta_geometry(
+            &likelihood,
+            &array![1.0],
+            &array![1.0],
+            &array![eta + eps],
+        )
+        .expect("valid eta");
+        let (lm, _) = exact_eta_geometry(
+            &likelihood,
+            &array![1.0],
+            &array![1.0],
+            &array![eta - eps],
+        )
+        .expect("valid eta");
         let fd = (lp - lm) / (2.0 * eps);
         assert!(
             (residual_y1 - fd).abs() < 1e-9,
@@ -2072,13 +2056,14 @@ mod tests {
             weights: Arc::new(array![1.0]),
             mode: Arc::new(array![0.0]),
             offset: None,
-            gamma_shape: 1.0,
-            inv_dispersion: 1.0,
+            likelihood: nuts_test_likelihood(NutsFamily::PoissonLog, 1.0),
             n_samples: 1,
             dim: 1,
         };
         let eta = array![-701.0];
-        let (ll, grad) = super::poisson_log_logp_and_grad(&data, &eta);
+        let mut eta_score = Array1::zeros(1);
+        let (ll, grad) = exact_glm_logp_and_grad_into(&data, &eta, &mut eta_score)
+            .expect("representable Poisson tail");
         assert!(
             ll.is_finite() && ll.abs() < 1e-300,
             "Poisson y=0, eta=-701 must keep its ~0 log-density, got {ll}"
@@ -2087,8 +2072,18 @@ mod tests {
 
         // Deep cloglog left tail: exp(η) underflows below η ≈ −745, but the
         // exact limits are log μ → η and d(log μ)/dη → 1.
-        let (ll_tail, res_tail) =
-            cloglog_bernoulli_logp_and_residual(-750.0, 1.0).expect("finite eta is valid");
+        let cloglog = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::CLogLog),
+        ));
+        let (ll_tail, score_tail) = exact_eta_geometry(
+            &cloglog,
+            &array![1.0],
+            &array![1.0],
+            &array![-750.0],
+        )
+        .expect("finite eta is valid");
+        let res_tail = score_tail[0];
         assert!(
             (ll_tail - (-750.0)).abs() < 1e-9,
             "cloglog log-density must approach eta in the deep left tail, got {ll_tail}"
@@ -2101,9 +2096,11 @@ mod tests {
             y: Arc::new(array![3.0]),
             ..data
         };
-        let (ll_of, grad_of) = super::poisson_log_logp_and_grad(&data_pos, &array![710.0]);
-        assert_eq!(ll_of, f64::NEG_INFINITY);
-        assert_eq!(grad_of[0], 0.0);
+        let mut overflow_score = Array1::zeros(1);
+        assert!(
+            exact_glm_logp_and_grad_into(&data_pos, &array![710.0], &mut overflow_score).is_err(),
+            "unrepresentable Poisson tail must fail atomically"
+        );
     }
 
     /// #2245 finding 16: saved-model sampling must reconstruct the fitted
@@ -2123,14 +2120,16 @@ mod tests {
             weights: Arc::new(array![100.0, 1.0]),
             mode: Arc::new(array![0.0]),
             offset: None,
-            gamma_shape: 1.0,
-            inv_dispersion: 1.0,
+            likelihood: nuts_test_likelihood(NutsFamily::BinomialLogit, 1.0),
             n_samples: 2,
             dim: 1,
         };
         // At the weighted MLE η* = log 100 the score is (numerically) zero.
         let eta_star = 100.0_f64.ln();
-        let (_, grad_star) = super::logit_logp_and_grad(&data, &array![eta_star, eta_star]);
+        let mut score_star = Array1::zeros(2);
+        let (_, grad_star) =
+            exact_glm_logp_and_grad_into(&data, &array![eta_star, eta_star], &mut score_star)
+                .expect("weighted logit geometry");
         assert!(
             grad_star[0].abs() < 1e-9,
             "weighted Bernoulli score must vanish at log 100, got {}",
@@ -2138,7 +2137,10 @@ mod tests {
         );
         // At the *unweighted* mode η = 0 the weighted score is 100 − 101·0.5 =
         // 49.5 ≫ 0: the unit-weight reconstruction targets the wrong posterior.
-        let (_, grad_zero) = super::logit_logp_and_grad(&data, &array![0.0, 0.0]);
+        let mut score_zero = Array1::zeros(2);
+        let (_, grad_zero) =
+            exact_glm_logp_and_grad_into(&data, &array![0.0, 0.0], &mut score_zero)
+                .expect("weighted logit geometry");
         assert!(
             (grad_zero[0] - 49.5).abs() < 1e-9,
             "unit-weight point must carry a large positive weighted score, got {}",
@@ -2259,8 +2261,7 @@ mod tests {
             penalty.view(),
             mode.view(),
             hessian.view(),
-            NutsFamily::BinomialLogit,
-            1.0,
+            nuts_test_likelihood(NutsFamily::BinomialLogit, 1.0),
             gam_solve::estimate::Dispersion::UNIT,
             true,
         )
@@ -2309,22 +2310,21 @@ mod tests {
             weights: Arc::new(weights.clone()),
             mode: Arc::new(Array1::zeros(1)),
             offset: None,
-            gamma_shape: shape,
-            inv_dispersion: 1.0,
+            likelihood: nuts_test_likelihood(NutsFamily::GammaLog, shape),
             n_samples: x.nrows(),
             dim: x.ncols(),
         };
 
-        let (ll, grad) = super::gamma_log_logp_and_grad(&data, &eta);
+        let mut eta_score = Array1::zeros(eta.len());
+        let (ll, grad) = exact_glm_logp_and_grad_into(&data, &eta, &mut eta_score)
+            .expect("Gamma geometry");
 
         let mut expected_ll = 0.0;
         let mut expected_score = 0.0;
         for i in 0..eta.len() {
             let mu = eta[i].exp();
-            expected_ll += weights[i]
-                * (shape * shape.ln() - statrs::function::gamma::ln_gamma(shape) - shape * eta[i]
-                    + (shape - 1.0) * y[i].ln()
-                    - shape * y[i] / mu);
+            let ratio = y[i] / mu;
+            expected_ll -= weights[i] * shape * (ratio - 1.0 - ratio.ln());
             expected_score += weights[i] * shape * (y[i] / mu - 1.0);
         }
 
@@ -2392,8 +2392,7 @@ mod tests {
             s.view(),
             mode.view(),
             hessian.view(),
-            NutsFamily::GammaLog,
-            shape,
+            nuts_test_likelihood(NutsFamily::GammaLog, shape),
             gam_solve::estimate::Dispersion::estimated(1.0 / shape).unwrap(),
             false,
         )
@@ -2459,8 +2458,7 @@ mod tests {
             s.view(),
             mode.view(),
             hessian.view(),
-            NutsFamily::GammaLog,
-            shape,
+            nuts_test_likelihood(NutsFamily::GammaLog, shape),
             gam_solve::estimate::Dispersion::estimated(1.0 / shape).unwrap(),
             false,
         )
@@ -2501,8 +2499,7 @@ mod tests {
             weights: Arc::new(weights.clone()),
             mode: Arc::new(Array1::zeros(x.ncols())),
             offset: None,
-            gamma_shape: 1.0,
-            inv_dispersion: 1.0,
+            likelihood: nuts_test_likelihood(NutsFamily::BinomialLogit, 1.0),
             n_samples: x.nrows(),
             dim: x.ncols(),
         };
@@ -2588,7 +2585,7 @@ mod tests {
                 penalty_matrix: penalty.view(),
                 mode: mode.view(),
                 hessian: non_spd_hessian.view(),
-                gamma_shape: None,
+                likelihood_scale: LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
                 dispersion: gam_solve::model_types::Dispersion::UNIT,
                 firth_bias_reduction: false,
                 offset: None,
@@ -2630,7 +2627,7 @@ mod tests {
                 penalty_matrix: penalty.view(),
                 mode: mode.view(),
                 hessian: non_spdhessian.view(),
-                gamma_shape: None,
+                likelihood_scale: LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
                 dispersion: gam_solve::estimate::Dispersion::UNIT,
                 firth_bias_reduction: false,
                 offset: None,
@@ -2670,7 +2667,7 @@ mod tests {
                 penalty_matrix: penalty.view(),
                 mode: mode.view(),
                 hessian: non_spdhessian.view(),
-                gamma_shape: None,
+                likelihood_scale: LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
                 dispersion: gam_solve::estimate::Dispersion::UNIT,
                 firth_bias_reduction: false,
                 offset: None,
@@ -2715,7 +2712,7 @@ mod tests {
                 penalty_matrix: penalty.view(),
                 mode: mode.view(),
                 hessian: hessian.view(),
-                gamma_shape: None,
+                likelihood_scale: LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
                 dispersion: gam_solve::estimate::Dispersion::UNIT,
                 firth_bias_reduction: true,
                 offset: None,
@@ -2757,8 +2754,7 @@ mod tests {
             penalty.view(),
             mode.view(),
             hessian.view(),
-            NutsFamily::Gaussian,
-            1.0,
+            nuts_test_likelihood(NutsFamily::Gaussian, 1.0),
             gam_solve::estimate::Dispersion::UNIT,
             false,
             None,
@@ -2803,8 +2799,7 @@ mod tests {
                 penalty.view(),
                 mode.view(),
                 hessian.view(),
-                NutsFamily::Gaussian,
-                1.0,
+                nuts_test_likelihood(NutsFamily::Gaussian, 1.0),
                 gam_solve::estimate::Dispersion::UNIT,
                 false,
                 None,
@@ -2936,8 +2931,7 @@ mod tests {
             penalty.view(),
             mode.view(),
             hessian.view(),
-            NutsFamily::Gaussian,
-            1.0,
+            nuts_test_likelihood(NutsFamily::Gaussian, 1.0),
             gam_solve::estimate::Dispersion::UNIT,
             false,
             None,
@@ -2963,8 +2957,7 @@ mod tests {
             penalty.view(),
             mode.view(),
             hessian.view(),
-            NutsFamily::Gaussian,
-            1.0,
+            nuts_test_likelihood(NutsFamily::Gaussian, 1.0),
             gam_solve::estimate::Dispersion::UNIT,
             false,
             None,
@@ -2999,11 +2992,13 @@ mod tests {
             x: x.view(),
             y: y.view(),
             weights: w.view(),
-            likelihood: LikelihoodSpec {
-                response: ResponseFamily::Poisson,
-                link: InverseLink::Standard(StandardLink::Log),
+            likelihood: GlmLikelihoodSpec {
+                spec: LikelihoodSpec {
+                    response: ResponseFamily::Poisson,
+                    link: InverseLink::Standard(StandardLink::Log),
+                },
+                scale: LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
             },
-            gamma_shape: None,
             dispersion: gam_solve::model_types::Dispersion::UNIT,
             offset: None,
             mode: mode.view(),
@@ -3052,11 +3047,10 @@ mod tests {
                 CanonicalPenalty::from_dense_root(penalty_2, 2),
             ],
             rho_mode.view(),
-            LikelihoodSpec {
+            GlmLikelihoodSpec::canonical(LikelihoodSpec {
                 response: ResponseFamily::Gaussian,
                 link: InverseLink::Standard(StandardLink::Identity),
-            },
-            None,
+            }),
             gam_solve::model_types::Dispersion::UNIT,
             None,
             RhoPrior::Flat,
@@ -3099,11 +3093,10 @@ mod tests {
             hessian.view(),
             vec![penalty.clone()],
             array![0.0].view(),
-            LikelihoodSpec {
+            GlmLikelihoodSpec::canonical(LikelihoodSpec {
                 response: ResponseFamily::Gaussian,
                 link: InverseLink::Standard(StandardLink::Identity),
-            },
-            None,
+            }),
             gam_solve::model_types::Dispersion::UNIT,
             None,
             prior.clone(),
@@ -3118,11 +3111,10 @@ mod tests {
             hessian.view(),
             vec![penalty],
             array![2.5].view(),
-            LikelihoodSpec {
+            GlmLikelihoodSpec::canonical(LikelihoodSpec {
                 response: ResponseFamily::Gaussian,
                 link: InverseLink::Standard(StandardLink::Identity),
-            },
-            None,
+            }),
             gam_solve::model_types::Dispersion::UNIT,
             None,
             prior,
@@ -3166,11 +3158,10 @@ mod tests {
             hessian.view(),
             Vec::new(),
             Array1::<f64>::zeros(0).view(),
-            LikelihoodSpec {
+            GlmLikelihoodSpec::canonical(LikelihoodSpec {
                 response: ResponseFamily::Gaussian,
                 link: InverseLink::Standard(StandardLink::Identity),
-            },
-            None,
+            }),
             gam_solve::model_types::Dispersion::estimated(4.0).unwrap(),
             Some(offset.view()),
             RhoPrior::Flat,
@@ -3205,8 +3196,7 @@ mod tests {
             weights: Arc::new(weights),
             mode: Arc::new(Array1::zeros(1)),
             offset: None,
-            gamma_shape: 1.0,
-            inv_dispersion: 1.0,
+            likelihood: nuts_test_likelihood(NutsFamily::BinomialLogit, 1.0),
             n_samples: 2,
             dim: 1,
         };
@@ -3316,11 +3306,10 @@ mod tests {
             hessian.view(),
             vec![cp1, cp2],
             rho.view(),
-            LikelihoodSpec {
+            GlmLikelihoodSpec::canonical(LikelihoodSpec {
                 response: ResponseFamily::Gaussian,
                 link: InverseLink::Standard(StandardLink::Identity),
-            },
-            None,
+            }),
             gam_solve::model_types::Dispersion::UNIT,
             None,
             RhoPrior::Flat,
@@ -3369,18 +3358,21 @@ mod tests {
     /// explicit error. No family is silently remapped to a different one.
     #[test]
     fn joint_hmc_family_gating_never_remaps() {
-        let data = SharedData {
+        let eta = array![0.1, -0.1];
+        let data_for = |spec: &LikelihoodSpec| SharedData {
             x: Arc::new(array![[1.0], [1.0]]),
-            y: Arc::new(array![1.0, 0.0]),
+            y: Arc::new(match &spec.response {
+                ResponseFamily::Binomial => array![1.0, 0.0],
+                ResponseFamily::Gamma | ResponseFamily::Beta { .. } => array![1.0, 0.5],
+                _ => array![1.0, 0.0],
+            }),
             weights: Arc::new(array![1.0, 1.0]),
             mode: Arc::new(Array1::zeros(1)),
             offset: None,
-            gamma_shape: 1.0,
-            inv_dispersion: 1.0,
+            likelihood: GlmLikelihoodSpec::canonical(spec.clone()),
             n_samples: 2,
             dim: 1,
         };
-        let eta = array![0.1, -0.1];
 
         // These families must succeed with their own inverse link.
         let accepted = [
@@ -3410,6 +3402,7 @@ mod tests {
             },
         ];
         for spec in &accepted {
+            let data = data_for(spec);
             let result = joint_family_logp_and_grad(spec, &data, &eta);
             assert!(
                 result.is_ok(),
@@ -3444,6 +3437,7 @@ mod tests {
             },
         ];
         for spec in &adaptive {
+            let data = data_for(spec);
             let result = joint_family_logp_and_grad(spec, &data, &eta);
             assert!(
                 result.is_ok(),
@@ -3453,14 +3447,12 @@ mod tests {
         }
 
         // RoystonParmar must be explicitly rejected (not silently remapped).
-        let rp_result = joint_family_logp_and_grad(
-            &LikelihoodSpec {
+        let rp = LikelihoodSpec {
                 response: ResponseFamily::RoystonParmar,
                 link: InverseLink::Standard(StandardLink::Logit),
-            },
-            &data,
-            &eta,
-        );
+            };
+        let rp_data = data_for(&rp);
+        let rp_result = joint_family_logp_and_grad(&rp, &rp_data, &eta);
         assert!(
             rp_result.is_err(),
             "RoystonParmar should be rejected, not silently accepted"

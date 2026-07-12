@@ -6168,17 +6168,11 @@ fn certify_bounded_edf_interval(
             "{label} has invalid EDF interval/value: value={value}, interval=[{lower}, {upper}]"
         );
     }
-    let scale = 1.0_f64
-        .max(value.abs())
-        .max(lower.abs())
-        .max(upper.abs());
+    let scale = 1.0_f64.max(value.abs()).max(lower.abs()).max(upper.abs());
     // A dense trace has p^2 rounded products/additions. This is a backward-
     // error allowance for that declared operation count, not a statistical
     // projection: values materially outside the mathematical interval fail.
-    let allowed = 256.0
-        * f64::EPSILON
-        * (dimension.max(1) as f64).powi(2)
-        * scale;
+    let allowed = 256.0 * f64::EPSILON * (dimension.max(1) as f64).powi(2) * scale;
     if value < lower {
         if lower - value <= allowed {
             return Ok(lower);
