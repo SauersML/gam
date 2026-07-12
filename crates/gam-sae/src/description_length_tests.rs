@@ -1023,7 +1023,7 @@ fn birth_prescreen_selects_same_winner_as_unscreened_eq4_race() {
     let argmax = |v: &[f64]| -> usize {
         v.iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .max_by(|&(_, a), &(_, b)| a.total_cmp(b))
             .map(|(i, _)| i)
             .expect("non-empty race")
     };
