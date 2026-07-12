@@ -157,7 +157,10 @@ fn softmax_fisher_perturbation<S: FisherPerturbation>(
     let mut denominator = one;
     for a in 0..m {
         let pa = probability(a);
-        let delta = S::seed(direction_u(a), direction_v(a));
+        let delta = S::seed(FisherDirection {
+            u: direction_u(a),
+            v: direction_v(a),
+        });
         let exp_delta = delta.compose_unary([1.0; 5]);
         denominator = denominator.add(&exp_delta.sub(&one).scale(pa));
         normalized[a] = exp_delta.scale(pa);
