@@ -6941,7 +6941,7 @@ impl ManifoldSaeCore {
             probe.map(|obj| {
                 let boxed: Box<dyn FnMut(f64) -> Result<f64, String>> =
                     Box::new(move |a: f64| -> Result<f64, String> {
-                        Python::with_gil(|py| {
+                        Python::attach(|py| {
                             let res = obj
                                 .call1(py, (a,))
                                 .map_err(|e| format!("steer_to_target probe raised: {e}"))?;
