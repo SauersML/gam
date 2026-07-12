@@ -6789,7 +6789,7 @@ fn survival_ls_block_diagonal_wiggle_block_matches_single_source_932() {
 
         // Nonzero, monotone-feasible (nonnegative) wiggle coefficients so the
         // warp coupling term the bespoke assembler dropped is actually live.
-        let betaw = Array1::from_shape_fn(pw, |b| 0.2 + 0.05 * b as f64);
+        let betaw = Array1::from_shape_fn(pw, |b| 0.02 + 0.005 * b as f64);
         let mut states = survival_ls_joint_oracle_states(&primaries);
         states.push(ParameterBlockState {
             eta: xwiggle.dot(&betaw),
