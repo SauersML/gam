@@ -3869,36 +3869,6 @@ pub fn discover_primary_atom_topologies(
         .collect()
 }
 
-/// Evidence-driven harmonic resolution for a periodic (circle) primary atom
-/// (#2243). The historical seed budget (`2·d_atom + 1` harmonics, i.e. 2
-/// harmonics at the default `d_atom = 2`) under-resolves genuinely 1-D factors
-/// with real high-frequency content, capping reconstruction below the fidelity
-/// the data supports even once the topology is right. This selects the harmonic
-/// count by the SAME proper closed-form REML marginal likelihood the topology
-/// race scores with (`fit_topology_candidate` → `raw_reml`, already complexity-
-/// priced through `log|H| − log|λS|₊` + profiled dispersion, so lower is better):
-/// it takes the GLOBAL evidence minimum over the candidate resolutions rather
-/// than stopping at the first non-improving rung, because the angular spectrum
-/// can have gaps (a fundamental plus a higher harmonic with nothing between), so
-/// the evidence is not guaranteed unimodal in resolution.
-///
-/// Two hard, data-derived bounds keep the search finite and free of any tuned
-/// resolution constant:
-///
-/// * the identifiability limit `2H + 1 < n_cluster` — the weighted REML cannot
-///   be identified with more basis columns than the cluster has observations;
-/// * a spectral bandwidth — the largest harmonic whose weighted periodogram
-///   energy exceeds a machine-precision fraction (`1e-12`) of the peak
-///   single-harmonic energy. Harmonics above the bandwidth carry no
-///   reconstructible signal, only basis columns the complexity term would
-///   charge for, so they can never be the evidence optimum. The `1e-12` is a
-///   numerical-zero guard (a harmonic that small is indistinguishable from
-///   absent), NOT a smoothing/energy threshold.
-///
-/// The REML argmin then chooses the complexity-optimal resolution within the
-/// band. `n_cluster` too small for even a single harmonic, or a target with no
-/// angular energy, returns an error (the caller surfaces it as a discovery
-/// failure rather than silently pinning a resolution).
 /// Duchon nullspace order `m` for the raced 2-D thin-plate sheet (#2240) —
 /// DERIVED (identity with the seed builder): mirrors the FFI seed path's
 /// `sae_duchon_atom_m(dim) = dim/2 + 2`, i.e. `m = 3` (degree-2 polynomial
@@ -4027,6 +3997,65 @@ fn select_duchon_sheet_resolution(
     Ok(best_c)
 }
 
+/// Measured spectral noise floor for evidence-driven resolution selection
+/// (#2243). A resolution knob is a BANDWIDTH question, not a smoothing one:
+/// include every harmonic carrying real, above-noise energy and let the fit's
+/// own REML-selected λ shrink the unsupported ones — over-provisioning is
+/// harmless (an empty harmonic's roughness penalty drives its coefficient to
+/// zero), while under-provisioning structurally caps reconstruction. The floor
+/// is measured from the periodogram itself, with no tuned smoothing constant:
+///
+/// * a numerical-zero guard `peak · 1e-12` — a harmonic that small is
+///   indistinguishable from roundoff, never real signal. It dominates on clean
+///   (near-noiseless) data, where the median energy collapses to ~0;
+/// * a noise-level guard `median · log2(K)` — under band-limited signal the
+///   per-harmonic energies are dominated by the noise floor, whose robust
+///   center is the median (real harmonics are sparse outliers that do not move
+///   it). `log2(K) = ln K / ln 2` is the expected value of the maximum of `K`
+///   exponential-tailed noise energies in units of the median, i.e. the
+///   Bonferroni expected-one-false-alarm bound over the `K` tested harmonics —
+///   a harmonic above it is a genuine spectral outlier, not the largest of `K`
+///   noise draws. It grows only logarithmically in the band size, so it stays
+///   sensitive to real structure on large clusters. It dominates under real
+///   noise.
+///
+/// This replaces the earlier REML-argmin-over-resolutions ladder, which
+/// UNDER-resolved exactly-fittable clean data (the #2243 disease it was meant
+/// to cure): the closed-form REML dispersion reward is floored at
+/// `MIN_DEVIANCE`, so an exact fit's evidence gain is capped while its
+/// complexity term `½d·(log|H| − log|λS|₊)` diverges as the REML λ→0 (needed to
+/// admit a high harmonic against its `∝ h⁴` roughness penalty); at modest
+/// cluster sizes the complexity term wins and the argmin stops below the real
+/// bandwidth. Bandwidth selection prices resolution on the spectrum, where it
+/// belongs, and leaves smoothing to the fit's own REML λ.
+fn spectral_noise_floor(energies: &[f64], peak_energy: f64) -> f64 {
+    let numerical = peak_energy * 1e-12;
+    let k = energies.len();
+    if k == 0 {
+        return numerical;
+    }
+    let mut sorted: Vec<f64> = energies.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if k % 2 == 1 {
+        sorted[k / 2]
+    } else {
+        0.5 * (sorted[k / 2 - 1] + sorted[k / 2])
+    };
+    let bonferroni = (k as f64).max(2.0).log2();
+    numerical.max(median * bonferroni)
+}
+
+/// Evidence-driven harmonic resolution for a periodic (circle) primary atom
+/// (#2243). The historical seed budget (`2·d_atom + 1` harmonics, i.e. 2
+/// harmonics at the default `d_atom = 2`) under-resolves genuinely 1-D factors
+/// with real high-frequency content, capping reconstruction below the fidelity
+/// the data supports even once the topology is right. The resolution is the
+/// weighted angular periodogram's BANDWIDTH — the highest harmonic whose energy
+/// clears the measured [`spectral_noise_floor`] — bounded by the
+/// identifiability limit `2H + 1 < n_cluster` (the weighted fit cannot be
+/// identified with more basis columns than the cluster has observations). A
+/// target with no angular energy returns an error (the caller surfaces it as a
+/// discovery failure rather than silently pinning a resolution).
 fn select_periodic_resolution(
     circle_coords: ArrayView2<'_, f64>,
     target: ArrayView2<'_, f64>,
@@ -4036,11 +4065,10 @@ fn select_periodic_resolution(
     let n_obs = target.nrows();
     let p_out = target.ncols();
     // 2H + 1 basis columns must stay strictly below the cluster sample count for
-    // the weighted REML to be identifiable.
+    // the weighted fit to be identifiable.
     let ident_ceiling = (n_cluster.saturating_sub(2) / 2).max(1);
     // Weighted angular periodogram energy per harmonic, over the cluster rows the
-    // weights select. Harmonics beyond the highest with non-numerical-zero energy
-    // are pruned from the (potentially expensive) REML ladder below.
+    // weights select.
     let mut peak_energy = 0.0_f64;
     let mut energies = Vec::with_capacity(ident_ceiling);
     for h in 1..=ident_ceiling {
@@ -4066,48 +4094,13 @@ fn select_periodic_resolution(
             "select_periodic_resolution: the circle winner carries no angular energy".to_string(),
         );
     }
-    let energy_floor = peak_energy * 1e-12;
+    let floor = spectral_noise_floor(&energies, peak_energy);
     let bandwidth = energies
         .iter()
-        .rposition(|&energy| energy > energy_floor)
+        .rposition(|&energy| energy > floor)
         .map(|idx| idx + 1)
         .unwrap_or(1);
-    let ceiling = bandwidth.min(ident_ceiling).max(1);
-    let mut best_h = 0usize;
-    let mut best_score = f64::INFINITY;
-    for h in 1..=ceiling {
-        let evaluator = match PeriodicHarmonicEvaluator::new(h) {
-            Ok(evaluator) => evaluator,
-            Err(_) => continue,
-        };
-        let spec = TopologyCandidateSpec {
-            kind: AutoTopologyKind::Circle,
-            basis_kind: SaeAtomBasisKind::Periodic,
-            manifold: LatentManifold::Circle { period: 1.0 },
-            latent_dim: 1,
-            evaluator: Arc::new(evaluator),
-            coords: circle_coords.to_owned(),
-        };
-        // `raw_reml` is the proper REML evidence (lower is better); with a common
-        // `n_obs` and no null-space term it is monotone in the per-observation
-        // `tk_normalized_score` the topology race ranks on, so comparing it
-        // directly selects the same resolution the race machinery would.
-        let score = match fit_topology_candidate(&spec, target, weights) {
-            Ok(evidence) => evidence.raw_reml,
-            Err(_) => continue,
-        };
-        if score.is_finite() && score < best_score {
-            best_score = score;
-            best_h = h;
-        }
-    }
-    if best_h == 0 {
-        return Err(
-            "select_periodic_resolution: no fittable harmonic resolution for the circle winner"
-                .to_string(),
-        );
-    }
-    Ok(best_h)
+    Ok(bandwidth.min(ident_ceiling).max(1))
 }
 
 /// Evidence-driven per-axis harmonic order for a torus primary winner (#2243 —
@@ -4115,31 +4108,18 @@ fn select_periodic_resolution(
 /// The historical fixed order (`SAE_DEFAULT_TORUS_HARMONICS = 3`) under-resolves
 /// a genuinely toroidal factor whose angular content on either circle factor
 /// runs above third order, capping reconstruction below the fidelity the data
-/// supports even once the topology is right. This selects the per-axis order by
-/// the SAME proper closed-form REML marginal likelihood the topology race scores
-/// with (`fit_topology_candidate` → `raw_reml`, complexity-priced through
-/// `log|H| − log|λS|₊` + profiled dispersion, so lower is better), taking the
-/// GLOBAL evidence minimum over the candidate orders (the angular spectrum can
-/// have gaps, so the evidence is not guaranteed unimodal in resolution).
-///
-/// Two hard, data-derived bounds keep the search finite and free of any tuned
-/// resolution constant:
-///
-/// * the identifiability limit `(2H + 1)^2 < n_cluster` — the tensor-product
-///   torus design has `(2H+1)^d` columns (`d = 2`), and the weighted REML cannot
-///   be identified with more basis columns than the cluster has observations —
-///   intersected with the seed builder's dense guard `(2H+1)^2 ≤ 4·SAE_MAX_PERIODIC_HARMONICS`,
-///   so the selected order always builds;
-/// * a spectral bandwidth — the largest PER-AXIS order carrying non-numerical-
-///   zero energy at any joint harmonic `(h₀, h₁)` in the weighted 2-D angular
-///   periodogram. Orders above it add only basis columns the complexity term
-///   would charge for, so they can never be the evidence optimum. The `1e-12` is
-///   a numerical-zero guard (indistinguishable from absent), NOT a smoothing
-///   threshold.
-///
-/// `n_cluster` too small for even a single per-axis harmonic, or a target with
-/// no angular energy, returns an error (the caller surfaces it as a discovery
-/// failure rather than silently pinning a resolution).
+/// supports even once the topology is right. The per-axis order is the joint
+/// angular periodogram's BANDWIDTH — the largest per-axis order of any joint
+/// harmonic `(h₀, h₁)` whose energy clears the measured [`spectral_noise_floor`]
+/// — bounded by the identifiability limit `(2H + 1)^2 < n_cluster` (the
+/// tensor-product design has `(2H+1)^2` columns, and the weighted fit cannot be
+/// identified with more columns than the cluster has observations) intersected
+/// with the seed builder's dense guard `(2H+1)^2 ≤ 4·SAE_MAX_PERIODIC_HARMONICS`,
+/// so the selected order always builds. Same spectral criterion as the circle
+/// (see [`select_periodic_resolution`]): over-provisioning is smoothed away by
+/// the fit's own REML λ. A target with no angular energy returns an error (the
+/// caller surfaces it as a discovery failure rather than silently pinning a
+/// resolution).
 fn select_torus_resolution(
     torus_coords: ArrayView2<'_, f64>,
     target: ArrayView2<'_, f64>,
@@ -4196,50 +4176,21 @@ fn select_torus_resolution(
             "select_torus_resolution: the torus winner carries no angular energy".to_string(),
         );
     }
-    let energy_floor = peak_energy * 1e-12;
+    // Per-axis resolution = the joint periodogram's bandwidth (the largest
+    // per-axis order of any cell clearing the measured noise floor), bounded by
+    // the identifiability/dense ceiling. Same spectral-bandwidth criterion as
+    // the circle (see [`spectral_noise_floor`] and [`select_periodic_resolution`]):
+    // over-provisioning is smoothed away by the fit's own REML λ, so this prices
+    // resolution on the spectrum rather than under-resolving via a REML argmin.
+    let cell_energies: Vec<f64> = cells.iter().map(|(_, energy)| *energy).collect();
+    let floor = spectral_noise_floor(&cell_energies, peak_energy);
     let bandwidth = cells
         .iter()
-        .filter(|(_, energy)| *energy > energy_floor)
+        .filter(|(_, energy)| *energy > floor)
         .map(|(order, _)| *order)
         .max()
         .unwrap_or(1);
-    let ceiling = bandwidth.min(hard_ceiling).max(1);
-    let mut best_h = 0usize;
-    let mut best_score = f64::INFINITY;
-    for h in 1..=ceiling {
-        let evaluator = match TorusHarmonicEvaluator::new(2, h) {
-            Ok(evaluator) => evaluator,
-            Err(_) => continue,
-        };
-        let spec = TopologyCandidateSpec {
-            kind: AutoTopologyKind::Torus,
-            basis_kind: SaeAtomBasisKind::Torus,
-            manifold: LatentManifold::Product(vec![
-                LatentManifold::Circle { period: 1.0 },
-                LatentManifold::Circle { period: 1.0 },
-            ]),
-            latent_dim: 2,
-            evaluator: Arc::new(evaluator),
-            coords: torus_coords.to_owned(),
-        };
-        // `raw_reml` is the proper REML evidence (lower is better) on a common
-        // `n_obs`, so comparing it directly selects the same order the race
-        // machinery would (see `select_periodic_resolution`).
-        let score = match fit_topology_candidate(&spec, target, weights) {
-            Ok(evidence) => evidence.raw_reml,
-            Err(_) => continue,
-        };
-        if score.is_finite() && score < best_score {
-            best_score = score;
-            best_h = h;
-        }
-    }
-    if best_h == 0 {
-        return Err(
-            "select_torus_resolution: no fittable harmonic order for the torus winner".to_string(),
-        );
-    }
-    Ok(best_h)
+    Ok(bandwidth.min(hard_ceiling).max(1))
 }
 
 /// Resolve every `"auto"` entry of a primary seed dictionary to the concrete
