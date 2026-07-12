@@ -3668,8 +3668,9 @@ impl SaeManifoldTerm {
     /// The floor is MEASURED, not tuned. The residual output-Gram
     /// (`residualᵀ·residual`, `p×p`) eigenvalues are the per-direction residual
     /// energies; the leading direction carries signal iff it clears
-    /// [`leading_direction_above_noise_floor`] — `median · log2(#dirs)`, the same
-    /// robust-median Bonferroni floor the #2243 spectral bandwidth uses.
+    /// [`leading_direction_above_noise_floor`] — `lower-quartile · log2(#dirs)`, a
+    /// robust-quantile Bonferroni floor whose noise estimate survives signal
+    /// spanning up to ~3/4 of the (few) output directions.
     pub(crate) fn residual_has_uncovered_signal(
         &self,
         target: ArrayView2<'_, f64>,
@@ -8139,12 +8140,21 @@ fn leading_direction_above_noise_floor(energies: &[f64]) -> bool {
         return false;
     }
     let m = sorted.len();
-    let median = if m % 2 == 1 {
-        sorted[m / 2]
-    } else {
-        0.5 * (sorted[m / 2 - 1] + sorted[m / 2])
-    };
-    let floor = (peak * 1e-12).max(median * (m as f64).max(2.0).log2());
+    // Robust noise-scale estimate for the Bonferroni floor. The MEDIAN reads the
+    // noise level only while FEWER than half the directions carry signal (its 50%
+    // breakdown point); a co-collapsed dictionary leaves a residual whose real
+    // structure can span up to HALF the — often very few — output directions. Two
+    // unequal circles uncovered in p=4 channels give a residual Gram spectrum
+    // ≈[7.7, 7.7, 48, 48]: the median (27.8) is pulled onto circle A's own energy
+    // and `median·log2(4)=55.7` swallows the peak (48), so the gate reads genuine
+    // two-circle signal as pure noise and NOTHING reseeds (#2132). Estimate the
+    // noise subspace from the LOWER QUARTILE instead: it tolerates signal in up to
+    // ~3/4 of the directions, yet — unlike the raw minimum — stays robust to a lone
+    // spuriously-small (rank-deficient) eigenvalue. Under pure noise the quartile
+    // still tracks the flat bulk, so the `·log2(#dirs)` Bonferroni multiple keeps a
+    // spike-free spectrum below the floor exactly as before.
+    let noise_scale = sorted[(((m - 1) as f64) * 0.25).round() as usize];
+    let floor = (peak * 1e-12).max(noise_scale * (m as f64).max(2.0).log2());
     peak > floor
 }
 
@@ -8235,18 +8245,35 @@ mod projection_policy_tests {
     #[test]
     fn leading_direction_above_noise_floor_separates_signal_from_noise_2132() {
         // Pure noise: comparable per-direction energies, no spike ⇒ the leading
-        // direction does NOT clear the median·log2 floor.
+        // direction does NOT clear the lower-quartile·log2 floor.
         let noise: Vec<f64> = (0..20).map(|i| 1.0 + 0.15 * ((i % 5) as f64 - 2.0)).collect();
         assert!(
             !leading_direction_above_noise_floor(&noise),
             "a flat (pure-noise) residual spectrum must read as NO uncovered signal"
         );
-        // One dominant uncovered direction rises far above the noise median ⇒ signal.
+        // One dominant uncovered direction rises far above the noise quantile ⇒ signal.
         let mut signal = noise.clone();
         signal[7] = 100.0;
         assert!(
             leading_direction_above_noise_floor(&signal),
             "a residual spectrum with a dominant direction must read as uncovered signal"
+        );
+        // #2132 root-cause pin — signal spanning HALF the (few) directions must NOT
+        // be swallowed. Two unequal circles uncovered in p=4 output channels give a
+        // residual Gram spectrum ≈[7.7, 7.7, 48, 48]; a median noise estimate (27.8)
+        // is pulled onto circle A's own energy and `median·log2(4)=55.7` buries the
+        // peak (48), so a median floor reads real two-circle signal as pure noise
+        // and reseeds NOTHING. The lower-quartile floor must read it as signal.
+        assert!(
+            leading_direction_above_noise_floor(&[7.68, 7.68, 48.0, 48.0]),
+            "two circles filling all p=4 directions must read as uncovered signal, not noise"
+        );
+        // And the peeled remainder (circle A subtracted) — circle B alone, a rank-2
+        // structure in p=4 with two near-zero directions — must still read as signal
+        // so the sequential-deflation reseed lands the second atom.
+        assert!(
+            leading_direction_above_noise_floor(&[1.0e-9, 1.0e-9, 7.68, 7.68]),
+            "the weaker uncovered circle must still clear the floor after the dominant peel"
         );
         // Degenerate inputs carry no signal to reseed onto.
         assert!(!leading_direction_above_noise_floor(&[]));
