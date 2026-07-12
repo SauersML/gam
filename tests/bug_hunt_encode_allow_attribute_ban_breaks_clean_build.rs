@@ -107,7 +107,10 @@ fn strip_line_comment(line: &str) -> &str {
 /// attribute opener, with at least one lint token before the closing `)`.
 /// Mirrors `build.rs::scan_for_banned_allow`.
 fn line_has_silencer(code: &str) -> bool {
-    if !code.contains("#[") {
+    // Both attribute forms must be tested: `#[` is not a substring of the
+    // inner form `#![` (bytes `#`, `!`, `[`), so a lone `#[` check misses
+    // crate-/module-level `#![allow(...)]` / `#![expect(...)]` silencers.
+    if !code.contains("#[") && !code.contains("#![") {
         return false;
     }
     for silencer in ["allow(", "expect("] {

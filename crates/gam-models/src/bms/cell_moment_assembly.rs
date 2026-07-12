@@ -15,6 +15,7 @@ use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOneSeed, DynamicTwoSeed, RuntimeJetScalar,
     filtered_implicit_solve_runtime_scalar,
 };
+use gam_math::nested_dual::JetField;
 
 #[derive(Clone)]
 pub(super) struct EmpiricalBmsIndexJetPlan {
@@ -2057,6 +2058,41 @@ impl BernoulliMarginalSlopeFamily {
         shared_is_sigma_aux_index(self.gaussian_frailty_sd, derivative_blocks, psi_index)
     }
 
+    fn sigma_scale_derivatives(
+        &self,
+    ) -> Result<crate::survival::lognormal_kernel::ProbitFrailtyScaleJet, String> {
+        let sigma = self.gaussian_frailty_sd.ok_or_else(|| {
+            "bernoulli marginal-slope log-sigma auxiliary requested without GaussianShift sigma"
+                .to_string()
+        })?;
+        Ok(crate::survival::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(
+            sigma.ln(),
+        ))
+    }
+
+    /// Evaluate the canonical rigid standard-normal row program with the slope
+    /// already lifted through a jet-valued frailty scale. `probit_scale = 1`
+    /// prevents a second scale application inside the single row expression.
+    fn row_neglog_canonical_scale_jet<S: gam_math::jet_scalar::JetScalar<2>>(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        primaries: &[S; 2],
+        scale: &S,
+    ) -> Result<S, String> {
+        let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+        let observed_primaries = [primaries[0], primaries[1].mul(scale)];
+        rigid_standard_normal_row_nll_generic(
+            &observed_primaries,
+            marginal,
+            self.z[row],
+            self.y[row],
+            self.weights[row],
+            1.0,
+        )
+    }
+
+    #[cfg(test)]
     pub(super) fn sigma_scale_jet(
         &self,
         n_dirs: usize,
@@ -2072,6 +2108,7 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn row_neglog_directional_with_scale_jet(
         &self,
         row: usize,

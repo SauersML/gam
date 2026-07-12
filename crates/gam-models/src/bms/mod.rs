@@ -13,13 +13,18 @@ use crate::fit_orchestration::drivers::{
     spatial_length_scale_term_indices,
 };
 use crate::marginal_slope_shared::{
-    CoeffSupport, DirectionalScaleJets, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
-    add_optional_matrix, add_optional_vector, add_two_surface_psi_outer,
+    CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, add_optional_matrix,
+    add_optional_vector, add_two_surface_psi_outer,
     build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
-    directional_obj_grad_hess, eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
+    eval_coeff4_at, first_parameter_directional_order2_terms, first_parameter_order2_terms,
+    is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
     outer_weighted_rows, parameter_block_specs_match_rows, probit_frailty_scale,
-    probit_frailty_scale_multi_dir_jet, psi_derivative_location, scale_coeff4,
+    psi_derivative_location, scale_coeff4, second_parameter_order2_terms,
+};
+#[cfg(test)]
+use crate::marginal_slope_shared::{
+    DirectionalScaleJets, directional_obj_grad_hess, probit_frailty_scale_multi_dir_jet,
 };
 use crate::model_types::UnifiedFitResult;
 use crate::outer_subsample::WeightedOuterRow;
@@ -36,6 +41,7 @@ use crate::spatial_psi_bridge::build_block_spatial_psi_derivatives;
 use crate::survival::lognormal_kernel::FrailtySpec;
 use crate::wiggle::initializewiggle_knots_from_seed;
 use gam_linalg::matrix::{DesignMatrix, SymmetricMatrix};
+#[cfg(test)]
 use gam_math::jet_partitions::MultiDirJet;
 use gam_problem::{
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,

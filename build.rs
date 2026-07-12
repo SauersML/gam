@@ -2455,7 +2455,9 @@ fn scan_for_dead_cfg_gates(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf
         }
         for (idx, line) in content.lines().enumerate() {
             let stripped = strip_strings_and_comments(line);
-            if !stripped.contains("#[") {
+            // Both `#[cfg(any())]` and the crate-/module-level `#![cfg(any())]`
+            // inner form are dead-by-construction gates; match either.
+            if !line_has_attr_marker(&stripped) {
                 continue;
             }
             if line_has_empty_cfg_gate(&stripped) {
@@ -2498,7 +2500,7 @@ fn scan_for_feature_cfg_gates(
             let stripped = stripped_lines.get(idx).map(String::as_str).unwrap_or(line);
             // Must be an attribute line (`#[...]` or `#![...]`) and
             // contain a `cfg(`/`cfg_attr(` invocation.
-            if !(stripped.contains("#[") || stripped.contains("#![")) {
+            if !line_has_attr_marker(stripped) {
                 continue;
             }
             if !(stripped.contains("cfg(") || stripped.contains("cfg_attr(")) {
@@ -2833,6 +2835,19 @@ fn is_exempt_test_submodule_name(name: &str) -> bool {
         || name == "test_support"
         || name.starts_with("tests_")
         || name.ends_with("_tests")
+}
+
+/// True when `s` carries an attribute marker in either the outer (`#[...]`)
+/// or inner (`#![...]`) form. Both must be tested explicitly: the substring
+/// `#[` does NOT occur inside `#![` (the bytes are `#`, `!`, `[` — the `#`
+/// is followed by `!`, not `[`), so a lone `contains("#[")` silently misses
+/// every crate-/module-level inner attribute. Every scanner that early-outs
+/// on "is this even an attribute line?" MUST funnel through this helper so
+/// the inner-attribute blind spot cannot be reintroduced one scanner at a
+/// time. Operate on a string/comment-stripped line so attribute syntax
+/// quoted inside `"..."` or `//` text does not register.
+fn line_has_attr_marker(s: &str) -> bool {
+    s.contains("#[") || s.contains("#![")
 }
 
 /// True when `stripped` contains `cfg(any(...))` or `cfg(all(...))` with
@@ -3730,10 +3745,11 @@ fn scan_for_banned_allow(
         for (idx, line) in content.lines().enumerate() {
             let code = stripped_lines.get(idx).map(String::as_str).unwrap_or(line);
             // Only match when the silencer is part of an attribute on this
-            // line: preceded somewhere by `#[` or `#![`. (The inner-attribute
-            // form `#![` already contains `#[` as a substring, so a single
-            // check covers both.)
-            if !code.contains("#[") {
+            // line: preceded somewhere by `#[` or `#![`. Both forms must be
+            // tested — `#[` is NOT a substring of `#![` (bytes `#`, `!`, `[`),
+            // so a lone `#[` check silently misses crate-/module-level
+            // `#![allow(...)]` / `#![expect(...)]` inner attributes.
+            if !line_has_attr_marker(code) {
                 continue;
             }
             for silencer in SILENCERS {

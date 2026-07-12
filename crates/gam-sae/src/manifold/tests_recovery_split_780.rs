@@ -1,7 +1,6 @@
 // Split from tests.rs under the #780 oversized-file gate: recovery-suite +
 // registry/assignment tests from line ~6560 onward. Same module scope via
 // `use super::tests::*` so shared fixtures keep working.
-#![allow(unused_imports)]
 use super::tests::*;
 use super::*;
 use approx::assert_abs_diff_eq;
