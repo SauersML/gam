@@ -31,7 +31,8 @@ Caveat carried over from the census: sparse non-negative codes pushed
 through per-group 2-D PCA produce ring-like centroid arrangements on
 STRUCTURELESS controls at a double-digit rate per run. A positive here is
 "consistent with a ring", not proof — always run the byte-identical
-pipeline on matched shuffled/Gaussian controls before interpreting rates.
+pipeline on the full-pipeline per-dimension-shuffle and covariance-exact
+Hadamard controls before interpreting rates.
 
 Pure NumPy; analysis-side code in the examples/ (non-production) sense of
 SPEC.md. Import it next to this file the same way

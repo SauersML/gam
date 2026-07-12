@@ -25,6 +25,7 @@ pub const COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS: usize = 1_024;
 
 const HADAMARD_PERMUTATION_SEED_DOMAIN: u64 = 0x4841_4441_5045_524D;
 const HADAMARD_SIGN_SEED_DOMAIN: u64 = 0x4841_4441_5349_474E;
+const PER_DIMENSION_SHUFFLE_SEED_DOMAIN: u64 = 0x5045_5244_494D_5348;
 
 /// Direction of the claim statistic under the null.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -593,16 +594,7 @@ pub fn per_dimension_shuffle_null(
     seed: u64,
 ) -> Result<Array2<f64>, String> {
     validate_matrix(data, "per-dimension-shuffle input")?;
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut out = Array2::<f64>::zeros(data.raw_dim());
-    for col in 0..data.ncols() {
-        let mut order: Vec<usize> = (0..data.nrows()).collect();
-        order.shuffle(&mut rng);
-        for (dst, &src) in order.iter().enumerate() {
-            out[[dst, col]] = data[[src, col]];
-        }
-    }
-    Ok(out)
+    per_dimension_shuffle_null_impl(data, seed)
 }
 
 /// Float32-preserving form of [`per_dimension_shuffle_null`].
@@ -614,26 +606,17 @@ pub fn per_dimension_shuffle_null_f32(
     seed: u64,
 ) -> Result<Array2<f32>, String> {
     validate_matrix_f32(data, "float32 per-dimension-shuffle input")?;
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut out = Array2::<f32>::zeros(data.raw_dim());
-    for col in 0..data.ncols() {
-        let mut order: Vec<usize> = (0..data.nrows()).collect();
-        order.shuffle(&mut rng);
-        for (dst, &src) in order.iter().enumerate() {
-            out[[dst, col]] = data[[src, col]];
-        }
-    }
-    Ok(out)
+    per_dimension_shuffle_null_impl(data, seed)
 }
 
-trait HadamardScalar: Copy + Default {
+trait NativeControlScalar: Copy + Default + Send + Sync {
     const TYPE_NAME: &'static str;
 
     fn widen(self) -> f64;
     fn narrow(value: f64) -> Option<Self>;
 }
 
-impl HadamardScalar for f64 {
+impl NativeControlScalar for f64 {
     const TYPE_NAME: &'static str = "float64";
 
     fn widen(self) -> f64 {
@@ -645,7 +628,7 @@ impl HadamardScalar for f64 {
     }
 }
 
-impl HadamardScalar for f32 {
+impl NativeControlScalar for f32 {
     const TYPE_NAME: &'static str = "float32";
 
     fn widen(self) -> f64 {
@@ -656,6 +639,67 @@ impl HadamardScalar for f32 {
         let narrowed = value as f32;
         (value.is_finite() && narrowed.is_finite()).then_some(narrowed)
     }
+}
+
+fn fallible_native_output<T: NativeControlScalar>(
+    n: usize,
+    p: usize,
+    control_name: &str,
+) -> Result<Array2<T>, String> {
+    let output_scalars = n.checked_mul(p).ok_or_else(|| {
+        format!(
+            "{} {control_name} output shape overflowed: {n} rows × {p} columns",
+            T::TYPE_NAME
+        )
+    })?;
+    let mut output_storage = Vec::<T>::new();
+    output_storage
+        .try_reserve_exact(output_scalars)
+        .map_err(|error| {
+            format!(
+                "could not allocate {} {control_name} output ({n} × {p} native scalars): {error}",
+                T::TYPE_NAME
+            )
+        })?;
+    output_storage.resize(output_scalars, T::default());
+    Array2::<T>::from_shape_vec((n, p), output_storage).map_err(|error| {
+        format!(
+            "could not construct {} {control_name} output with shape {n} × {p}: {error}",
+            T::TYPE_NAME
+        )
+    })
+}
+
+fn per_dimension_shuffle_null_impl<T: NativeControlScalar>(
+    data: ArrayView2<'_, T>,
+    seed: u64,
+) -> Result<Array2<T>, String> {
+    let n = data.nrows();
+    let p = data.ncols();
+    let mut out = fallible_native_output::<T>(n, p, "per-dimension-shuffle")?;
+    out.axis_iter_mut(Axis(1))
+        .into_par_iter()
+        .enumerate()
+        .try_for_each(|(col, mut output_column)| -> Result<(), String> {
+            let mut order = Vec::<usize>::new();
+            order.try_reserve_exact(n).map_err(|error| {
+                format!(
+                    "could not allocate per-dimension-shuffle row order for column {col} ({n} indices): {error}"
+                )
+            })?;
+            order.extend(0..n);
+            let mut rng = StdRng::seed_from_u64(mix_seed(
+                seed,
+                PER_DIMENSION_SHUFFLE_SEED_DOMAIN,
+                col as u64,
+            ));
+            order.shuffle(&mut rng);
+            for (destination, &source) in order.iter().enumerate() {
+                output_column[destination] = data[[source, col]];
+            }
+            Ok(())
+        })?;
+    Ok(out)
 }
 
 fn largest_power_of_two_at_most(value: usize) -> Result<usize, String> {
@@ -703,6 +747,9 @@ fn fwht_rows_in_place(
                 "Hadamard stage shape overflowed: {slab_rows} rows × {cols} columns"
             )
         })?;
+        let half_scalars = half.checked_mul(cols).ok_or_else(|| {
+            format!("Hadamard half-stage shape overflowed: {half} rows × {cols} columns")
+        })?;
         if workspace.len() % slab_scalars != 0 {
             return Err(format!(
                 "Hadamard stage slab of {slab_scalars} scalars does not divide workspace length {}",
@@ -712,7 +759,7 @@ fn fwht_rows_in_place(
         workspace
             .par_chunks_mut(slab_scalars)
             .for_each(|slab| {
-                let (upper, lower) = slab.split_at_mut(half * cols);
+                let (upper, lower) = slab.split_at_mut(half_scalars);
                 for paired_row in 0..half {
                     let row_offset = paired_row * cols;
                     for col in 0..cols {
@@ -729,7 +776,7 @@ fn fwht_rows_in_place(
     Ok(())
 }
 
-fn covariance_exact_hadamard_null_impl<T: HadamardScalar>(
+fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
     data: ArrayView2<'_, T>,
     seed: u64,
 ) -> Result<Array2<T>, String> {
@@ -751,37 +798,32 @@ fn covariance_exact_hadamard_null_impl<T: HadamardScalar>(
     })?;
     workspace.resize(workspace_scalars, 0.0);
 
-    let origin = (0..p)
-        .map(|col| data[[0, col]].widen())
-        .collect::<Vec<_>>();
-    let mut permutation = (0..n).collect::<Vec<_>>();
+    let mut origin = Vec::<f64>::new();
+    origin.try_reserve_exact(p).map_err(|error| {
+        format!(
+            "could not allocate covariance-exact Hadamard origin ({p} float64 scalars): {error}"
+        )
+    })?;
+    origin.extend((0..p).map(|col| data[[0, col]].widen()));
+    let mut permutation = Vec::<usize>::new();
+    permutation.try_reserve_exact(n).map_err(|error| {
+        format!(
+            "could not allocate covariance-exact Hadamard row permutation ({n} indices): {error}"
+        )
+    })?;
+    permutation.extend(0..n);
     let mut permutation_rng =
         StdRng::seed_from_u64(seed ^ HADAMARD_PERMUTATION_SEED_DOMAIN);
     permutation.shuffle(&mut permutation_rng);
 
-    let mut signs = vec![1.0_f64; workspace_rows];
-    let output_scalars = n.checked_mul(p).ok_or_else(|| {
+    let mut signs = Vec::<f64>::new();
+    signs.try_reserve_exact(workspace_rows).map_err(|error| {
         format!(
-            "{} covariance-exact Hadamard output shape overflowed: {n} rows × {p} columns",
-            T::TYPE_NAME
+            "could not allocate covariance-exact Hadamard signs ({workspace_rows} float64 scalars): {error}"
         )
     })?;
-    let mut output_storage = Vec::<T>::new();
-    output_storage
-        .try_reserve_exact(output_scalars)
-        .map_err(|error| {
-            format!(
-                "could not allocate {} covariance-exact Hadamard output ({n} × {p} native scalars): {error}",
-                T::TYPE_NAME
-            )
-        })?;
-    output_storage.resize(output_scalars, T::default());
-    let mut out = Array2::<T>::from_shape_vec((n, p), output_storage).map_err(|error| {
-        format!(
-            "could not construct {} covariance-exact Hadamard output with shape {n} × {p}: {error}",
-            T::TYPE_NAME
-        )
-    })?;
+    signs.resize(workspace_rows, 1.0);
+    let mut out = fallible_native_output::<T>(n, p, "covariance-exact Hadamard")?;
     let mut block_start = 0usize;
     let mut block_ordinal = 0usize;
     while block_start < n {
@@ -2167,6 +2209,43 @@ fn normalize(v: &mut Array1<f64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_population_moments_close(
+        expected: ArrayView2<'_, f64>,
+        actual: ArrayView2<'_, f64>,
+        mean_relative_tolerance: f64,
+        covariance_relative_tolerance: f64,
+    ) {
+        let expected = stable_population_moments(expected).unwrap();
+        let actual = stable_population_moments(actual).unwrap();
+        let expected_mean = &expected.origin + &expected.mean_offset;
+        let actual_mean = &actual.origin + &actual.mean_offset;
+        for axis in 0..expected_mean.len() {
+            let scale = expected_mean[axis].abs().max(1.0);
+            assert!(
+                (actual_mean[axis] - expected_mean[axis]).abs()
+                    <= mean_relative_tolerance * scale,
+                "mean {axis} mismatch: expected={} actual={} scale={scale}",
+                expected_mean[axis],
+                actual_mean[axis]
+            );
+        }
+        for left in 0..expected.covariance.nrows() {
+            for right in 0..expected.covariance.ncols() {
+                let scale = (expected.covariance[[left, left]].sqrt()
+                    * expected.covariance[[right, right]].sqrt())
+                .max(1.0);
+                assert!(
+                    (actual.covariance[[left, right]] - expected.covariance[[left, right]])
+                        .abs()
+                        <= covariance_relative_tolerance * scale,
+                    "covariance ({left},{right}) mismatch: expected={} actual={} scale={scale}",
+                    expected.covariance[[left, right]],
+                    actual.covariance[[left, right]]
+                );
+            }
+        }
+    }
 
     #[test]
     fn mp_detection_floor_matches_recon_spectrum_edge() {

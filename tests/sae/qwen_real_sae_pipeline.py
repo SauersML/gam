@@ -624,11 +624,11 @@ def main() -> int:
     runs = {
         "observed": controlled.observed,
         "per_dimension_shuffle": controlled.per_dimension_shuffle,
-        "covariance_matched_gaussian": controlled.covariance_matched_gaussian,
+        "covariance_exact_hadamard": controlled.covariance_exact_hadamard,
     }
     control_runs = [
         controlled.per_dimension_shuffle,
-        controlled.covariance_matched_gaussian,
+        controlled.covariance_exact_hadamard,
     ]
     control_wins = sum(run["n_circular_wins"] for run in control_runs)
     control_adjudicated = sum(run["n_adjudicated"] for run in control_runs)
@@ -642,7 +642,7 @@ def main() -> int:
         "seed_provenance": {
             "pipeline_seed": controlled.pipeline_seed,
             "per_dimension_shuffle_seed": controlled.per_dimension_shuffle_seed,
-            "covariance_matched_gaussian_seed": controlled.covariance_matched_gaussian_seed,
+            "covariance_exact_hadamard_seed": controlled.covariance_exact_hadamard_seed,
         },
         "wall_seconds": time.time() - t0,
         "config": vars(args),

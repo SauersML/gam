@@ -2652,7 +2652,7 @@ fn matched_control_verdicts(
         ));
     }
     use gam::terms::sae::null_battery::{
-        covariance_exact_hadamard_null, per_dimension_shuffle_null,
+        covariance_matched_gaussian_null, per_dimension_shuffle_null,
     };
     let shuffled = per_dimension_shuffle_null(coords_view, seed ^ 0xD1AE_510F)?;
     let gaussian = covariance_matched_gaussian_null(coords_view, seed ^ 0xC0A4_71A1)?;
@@ -2737,7 +2737,7 @@ pub(crate) fn shape_matched_control<'py>(
     seed: u64,
 ) -> PyResult<Bound<'py, numpy::PyArray2<f64>>> {
     use gam::terms::sae::null_battery::{
-        covariance_matched_gaussian_null, per_dimension_shuffle_null,
+        covariance_exact_hadamard_null, per_dimension_shuffle_null,
     };
     use numpy::IntoPyArray;
 

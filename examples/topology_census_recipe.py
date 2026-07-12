@@ -3,10 +3,11 @@
 
 The runner delegates to ``gamfit.run_shape_controlled_census``, which calls one
 user-supplied census function three times: once on the observed activation
-matrix, once on a per-dimension shuffle, and once on a covariance-matched
-Gaussian. The callable and its seed are identical across all three runs. Only
-the input matrix changes, so SAE training, co-activation grouping, projection,
-and shape adjudication all remain inside the controlled path.
+matrix, once on a per-dimension shuffle, and once on a covariance-exact
+randomized Hadamard control. The callable and its seed are identical across all
+three runs. Only the input matrix changes, so SAE training, co-activation
+grouping, projection, and shape adjudication all remain inside the controlled
+path.
 
 The pipeline callable is supplied as ``MODULE:CALLABLE`` and must have this
 contract::
@@ -142,9 +143,9 @@ def _validated_control_report(controlled_census: object) -> dict[str, object]:
             controlled_census.per_dimension_shuffle,
             "per_dimension_shuffle",
         ),
-        "covariance_matched_gaussian": _validate_pipeline_summary(
-            controlled_census.covariance_matched_gaussian,
-            "covariance_matched_gaussian",
+        "covariance_exact_hadamard": _validate_pipeline_summary(
+            controlled_census.covariance_exact_hadamard,
+            "covariance_exact_hadamard",
         ),
     }
     control_adjudications = sum(int(run["n_adjudicated"]) for run in controls.values())
@@ -160,7 +161,7 @@ def _validated_control_report(controlled_census: object) -> dict[str, object]:
         ),
         "pipeline_seed": controlled_census.pipeline_seed,
         "per_dimension_shuffle_seed": controlled_census.per_dimension_shuffle_seed,
-        "covariance_matched_gaussian_seed": controlled_census.covariance_matched_gaussian_seed,
+        "covariance_exact_hadamard_seed": controlled_census.covariance_exact_hadamard_seed,
     }
 
 

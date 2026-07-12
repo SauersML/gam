@@ -63,19 +63,19 @@ def test_shape_controlled_census_replays_the_exact_full_pipeline() -> None:
         "per_dimension_shuffle",
         seed=result.per_dimension_shuffle_seed,
     )
-    expected_gaussian = gamfit.shape_matched_control(
+    expected_hadamard = gamfit.shape_matched_control(
         pristine,
-        "covariance_matched_gaussian",
-        seed=result.covariance_matched_gaussian_seed,
+        "covariance_exact_hadamard",
+        seed=result.covariance_exact_hadamard_seed,
     )
     np.testing.assert_array_equal(calls[1][0], expected_shuffle)
-    np.testing.assert_array_equal(calls[2][0], expected_gaussian)
+    np.testing.assert_array_equal(calls[2][0], expected_hadamard)
     assert result.observed["checksum"] == pytest.approx(float(pristine.sum()))
     assert result.per_dimension_shuffle["checksum"] == pytest.approx(
         float(expected_shuffle.sum())
     )
-    assert result.covariance_matched_gaussian["checksum"] == pytest.approx(
-        float(expected_gaussian.sum())
+    assert result.covariance_exact_hadamard["checksum"] == pytest.approx(
+        float(expected_hadamard.sum())
     )
 
 
@@ -150,24 +150,72 @@ def test_float32_shape_controls_preserve_dtype_seed_marginals_and_covariance(
     for col in range(activations.shape[1]):
         np.testing.assert_array_equal(np.sort(shuffle[:, col]), np.sort(activations[:, col]))
 
-    gaussian = gamfit.shape_matched_control_f32(
+    hadamard = gamfit.shape_matched_control_f32(
         activations,
-        "covariance_matched_gaussian",
-        seed=result.covariance_matched_gaussian_seed,
+        "covariance_exact_hadamard",
+        seed=result.covariance_exact_hadamard_seed,
     )
-    repeated_gaussian = gamfit.shape_matched_control_f32(
+    repeated_hadamard = gamfit.shape_matched_control_f32(
         activations,
-        "covariance_matched_gaussian",
-        seed=result.covariance_matched_gaussian_seed,
+        "covariance_exact_hadamard",
+        seed=result.covariance_exact_hadamard_seed,
     )
-    assert gaussian.dtype == np.float32
-    np.testing.assert_array_equal(gaussian, repeated_gaussian)
-    np.testing.assert_array_equal(calls[2][0], gaussian)
+    assert hadamard.dtype == np.float32
+    np.testing.assert_array_equal(hadamard, repeated_hadamard)
+    np.testing.assert_array_equal(calls[2][0], hadamard)
+    np.testing.assert_allclose(
+        hadamard.astype(np.float64).mean(axis=0),
+        activations.astype(np.float64).mean(axis=0),
+        rtol=2.0e-6,
+        atol=2.0e-3,
+    )
     target_covariance = np.cov(activations.astype(np.float64), rowvar=False, bias=True)
-    realized_covariance = np.cov(gaussian.astype(np.float64), rowvar=False, bias=True)
+    realized_covariance = np.cov(hadamard.astype(np.float64), rowvar=False, bias=True)
     scales = np.sqrt(np.diag(target_covariance))
-    tolerance = 0.04 * np.outer(scales, scales)
-    np.testing.assert_array_less(np.abs(realized_covariance - target_covariance), tolerance)
+    tolerance = 5.0e-3 * np.maximum(np.outer(scales, scales), 1.0e-8)
+    np.testing.assert_array_less(
+        np.abs(realized_covariance - target_covariance), tolerance
+    )
+
+
+def test_native_contiguous_source_is_shared_but_callbacks_are_private(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gamfit._shape_census as shape_census
+
+    original = np.arange(96, dtype=np.float32).reshape(32, 3)
+    native_sources: list[np.ndarray] = []
+    callback_matrices: list[np.ndarray] = []
+
+    def recording_control(
+        source: np.ndarray, kind: str, *, seed: int
+    ) -> np.ndarray:
+        del kind, seed
+        native_sources.append(source)
+        assert source.flags.c_contiguous
+        assert not source.flags.writeable
+        return source.copy(order="C")
+
+    monkeypatch.setattr(shape_census, "shape_matched_control_f32", recording_control)
+
+    def pipeline(matrix: np.ndarray, seed: int) -> int:
+        assert seed == 11
+        assert matrix.flags.c_contiguous
+        assert matrix.flags.writeable
+        assert not np.shares_memory(matrix, original)
+        callback_matrices.append(matrix)
+        return matrix.shape[0]
+
+    gamfit.run_shape_controlled_census(original, pipeline)
+    assert original.flags.writeable
+    assert len(native_sources) == 2
+    assert all(np.shares_memory(source, original) for source in native_sources)
+    assert len(callback_matrices) == 3
+    assert all(
+        not np.shares_memory(left, right)
+        for index, left in enumerate(callback_matrices)
+        for right in callback_matrices[index + 1 :]
+    )
 
 
 def test_shape_controlled_census_converts_non_native_dtype_once_to_float64(

@@ -14,7 +14,7 @@ from ._rust import shape_matched_control, shape_matched_control_f32
 _ResultT = TypeVar("_ResultT")
 _U64_MAX = (1 << 64) - 1
 _SHUFFLE_SEED_DOMAIN = 0xD1AE_510F
-_GAUSSIAN_SEED_DOMAIN = 0xC0A4_71A1
+_HADAMARD_SEED_DOMAIN = 0x4841_DA4D
 _ControlMatrix = NDArray[np.float32] | NDArray[np.float64]
 
 
@@ -30,10 +30,10 @@ class ShapeControlledCensus(Generic[_ResultT]):
 
     observed: _ResultT
     per_dimension_shuffle: _ResultT
-    covariance_matched_gaussian: _ResultT
+    covariance_exact_hadamard: _ResultT
     pipeline_seed: int
     per_dimension_shuffle_seed: int
-    covariance_matched_gaussian_seed: int
+    covariance_exact_hadamard_seed: int
 
 
 def _u64(value: int, name: str) -> int:
@@ -56,20 +56,24 @@ def run_shape_controlled_census(
     ``pipeline`` must be a deterministic callable of ``(matrix, seed)`` that
     fresh-fits the complete analysis under audit: SAE/dictionary training,
     co-activation grouping, intrinsic projection or subspace search, and shape
-    adjudication. The callback receives a private writable matrix copy and the
-    identical ``pipeline_seed`` on all three calls. The immutable source matrix
-    is never exposed, so callback mutation cannot contaminate a later control.
+    adjudication. The callback receives a private writable matrix and the
+    identical ``pipeline_seed`` on all three calls. The read-only internal
+    source is never exposed, so callback mutation cannot contaminate a later
+    control. Callers must not mutate the original input concurrently while this
+    function is running.
 
     Native float32 and float64 inputs preserve their dtype in all three
-    callbacks. Float32 controls accumulate only their `O(p²)` moments and
-    eigendecomposition in float64; no `n × p` float64 matrix is created. Every
-    other input dtype is converted once to a native contiguous float64 source.
+    callbacks. An already C-contiguous native input is retained as a read-only
+    view without a corpus-sized source copy. Other layouts and dtypes are
+    normalized exactly once. The covariance-exact transform uses one bounded
+    ``B × p`` float64 workspace with ``B <= 1024``; it never forms a ``p × p``
+    covariance or a corpus-sized float64 copy of float32 input.
 
     The controls are generated at pipeline entry, not from a fitted 2-D chart:
-    a per-dimension permutation preserves every marginal, while a Gaussian draw
-    preserves the full empirical mean/covariance. Distinct deterministic seed
-    domains match ``adjudicate_atom_shape``'s built-in coordinate-level controls.
-    Only one control matrix is resident at a time unless the callback retains it.
+    a per-dimension permutation preserves every marginal, while a mean-fixing
+    orthogonal randomized Hadamard transform preserves the full empirical mean
+    and covariance in exact arithmetic. Only one control matrix is resident at
+    a time unless the callback retains it.
     """
 
     if not callable(pipeline):
@@ -87,7 +91,11 @@ def run_shape_controlled_census(
     else:
         source_dtype = np.dtype(np.float64)
         control_function = shape_matched_control
-    source = np.array(data, dtype=source_dtype, order="C", copy=True)
+    # np.asarray reuses an already native C-contiguous array and performs the
+    # only normalization allocation otherwise. A view lets us enforce an
+    # internal read-only contract without changing the caller's writeable flag.
+    normalized = np.asarray(data, dtype=source_dtype, order="C")
+    source = normalized.view()
     if source.ndim != 2 or source.shape[0] == 0 or source.shape[1] == 0:
         raise ValueError(
             f"data must be a nonempty two-dimensional matrix; got shape {source.shape}"
@@ -97,7 +105,7 @@ def run_shape_controlled_census(
     source.setflags(write=False)
 
     shuffle_seed = control_seed ^ _SHUFFLE_SEED_DOMAIN
-    gaussian_seed = control_seed ^ _GAUSSIAN_SEED_DOMAIN
+    hadamard_seed = control_seed ^ _HADAMARD_SEED_DOMAIN
     observed = pipeline(source.copy(order="C"), pipeline_seed)
 
     shuffled = control_function(
@@ -106,35 +114,51 @@ def run_shape_controlled_census(
         seed=shuffle_seed,
     )
     shuffled_array = np.asarray(shuffled)
-    if shuffled_array.dtype != source_dtype or shuffled_array.shape != source.shape:
+    if (
+        shuffled_array.dtype != source_dtype
+        or shuffled_array.shape != source.shape
+        or not shuffled_array.flags.c_contiguous
+        or not shuffled_array.flags.writeable
+        or np.shares_memory(shuffled_array, source)
+    ):
         raise RuntimeError(
-            "native per-dimension shuffle returned the wrong dtype or shape: "
-            f"{shuffled_array.dtype} {shuffled_array.shape}"
+            "native per-dimension shuffle violated its private writable C-array "
+            f"contract: dtype={shuffled_array.dtype}, shape={shuffled_array.shape}, "
+            f"C={shuffled_array.flags.c_contiguous}, "
+            f"writeable={shuffled_array.flags.writeable}"
         )
     shuffled_result = pipeline(shuffled_array, pipeline_seed)
     del shuffled
     del shuffled_array
 
-    gaussian = control_function(
+    hadamard = control_function(
         source,
-        "covariance_matched_gaussian",
-        seed=gaussian_seed,
+        "covariance_exact_hadamard",
+        seed=hadamard_seed,
     )
-    gaussian_array = np.asarray(gaussian)
-    if gaussian_array.dtype != source_dtype or gaussian_array.shape != source.shape:
+    hadamard_array = np.asarray(hadamard)
+    if (
+        hadamard_array.dtype != source_dtype
+        or hadamard_array.shape != source.shape
+        or not hadamard_array.flags.c_contiguous
+        or not hadamard_array.flags.writeable
+        or np.shares_memory(hadamard_array, source)
+    ):
         raise RuntimeError(
-            "native covariance-matched Gaussian returned the wrong dtype or shape: "
-            f"{gaussian_array.dtype} {gaussian_array.shape}"
+            "native covariance-exact Hadamard control violated its private "
+            f"writable C-array contract: dtype={hadamard_array.dtype}, "
+            f"shape={hadamard_array.shape}, C={hadamard_array.flags.c_contiguous}, "
+            f"writeable={hadamard_array.flags.writeable}"
         )
-    gaussian_result = pipeline(gaussian_array, pipeline_seed)
-    del gaussian
-    del gaussian_array
+    hadamard_result = pipeline(hadamard_array, pipeline_seed)
+    del hadamard
+    del hadamard_array
 
     return ShapeControlledCensus(
         observed=observed,
         per_dimension_shuffle=shuffled_result,
-        covariance_matched_gaussian=gaussian_result,
+        covariance_exact_hadamard=hadamard_result,
         pipeline_seed=pipeline_seed,
         per_dimension_shuffle_seed=shuffle_seed,
-        covariance_matched_gaussian_seed=gaussian_seed,
+        covariance_exact_hadamard_seed=hadamard_seed,
     )

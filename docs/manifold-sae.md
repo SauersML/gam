@@ -585,12 +585,17 @@ controlled = gamfit.run_shape_controlled_census(
 )
 print(controlled.observed)
 print(controlled.per_dimension_shuffle)
-print(controlled.covariance_matched_gaussian)
+print(controlled.covariance_exact_hadamard)
 ```
 
-Float32 activation corpora stay float32 through the control generator; stable
-means/covariances and the covariance eigendecomposition are accumulated in
-float64 without materializing an `n × p` float64 copy. Float64 inputs remain
+The full-pipeline covariance control globally permutes rows, then applies
+seeded blockwise orthogonal Walsh-Hadamard mixing. Every block transform `Q`
+satisfies `QᵀQ = I` and `Q1 = 1`, so the complete control preserves the
+empirical mean and centered cross-product exactly in real arithmetic while
+destroying rowwise radii and nonlinear manifold geometry. Its work is
+`O(np log B)` with `B ≤ 1024`, and peak transform storage is one `B × p`
+float64 workspace rather than a corpus-sized covariance matrix or factor.
+Float32 activation corpora produce float32 controls; float64 inputs remain
 float64. The callback contract requires a fresh deterministic fit and receives
 the same `pipeline_seed` for all three runs.
 
