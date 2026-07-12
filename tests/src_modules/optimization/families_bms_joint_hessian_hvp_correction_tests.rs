@@ -2316,7 +2316,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
 }
 
 /// The single-expression Taylor-jet tower (#932) of the rigid standard-normal
-/// Bernoulli marginal-slope row NLL, written ONCE over `Tower4<2>` primaries
+/// Bernoulli marginal-slope row NLL, written ONCE over generic jet primaries
 /// `(η_m, g)`:
 ///
 /// ```text
@@ -2331,7 +2331,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
 ///
 /// It reuses the family's hand-certified `[f64; 5]` special-function stacks
 /// (`unary_derivatives_sqrt` / `unary_derivatives_neglog_phi` and the
-/// link-map's q-derivatives) through `Tower4::compose_unary`, so no probit
+/// link-map's q-derivatives) through `JetScalar::compose_unary`, so no probit
 /// primitive is re-derived here: the tower mechanizes only the
 /// Leibniz / Faà di Bruno composition that the production
 /// `rigid_standard_normal_*` tower path mechanizes — the chain-rule
@@ -2342,7 +2342,7 @@ struct BernoulliRigidNllProgram {
     block_states: Vec<ParameterBlockState>,
 }
 
-impl gam_math::jet_tower::RowNllProgram<2> for BernoulliRigidNllProgram {
+impl gam_math::jet_tower::RowProgram<2> for BernoulliRigidNllProgram {
     fn n_rows(&self) -> usize {
         self.family.y.len()
     }
@@ -2351,18 +2351,18 @@ impl gam_math::jet_tower::RowNllProgram<2> for BernoulliRigidNllProgram {
         Ok([self.block_states[0].eta[row], self.block_states[1].eta[row]])
     }
 
-    fn row_nll(
+    fn eval<S: gam_math::jet_scalar::JetScalar<2>>(
         &self,
         row: usize,
-        p: &[gam_math::jet_tower::Tower4<2>; 2],
-    ) -> Result<gam_math::jet_tower::Tower4<2>, String> {
+        p: &[S; 2],
+    ) -> Result<S, String> {
         let y = self.family.y[row];
         let w = self.family.weights[row];
         let z = self.family.z[row];
         let s = 2.0 * y - 1.0;
         let s_f = self.family.probit_frailty_scale();
 
-        let marginal = self.family.marginal_link_map(p[0].v)?;
+        let marginal = self.family.marginal_link_map(p[0].value())?;
         let q = p[0].compose_unary([
             marginal.q,
             marginal.q1,
@@ -2370,12 +2370,14 @@ impl gam_math::jet_tower::RowNllProgram<2> for BernoulliRigidNllProgram {
             marginal.q3,
             marginal.q4,
         ]);
-        let observed_g = p[1] * s_f;
-        let one_plus_b2 = observed_g * observed_g + 1.0;
-        let c = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.v));
-        let eta = q * c + observed_g * z;
-        let m = eta * s;
-        Ok(m.compose_unary(unary_derivatives_neglog_phi(m.v, w)))
+        let observed_g = p[1].scale(s_f);
+        let one_plus_b2 = observed_g
+            .mul(&observed_g)
+            .add(&S::constant(1.0));
+        let c = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.value()));
+        let eta = q.mul(&c).add(&observed_g.scale(z));
+        let m = eta.scale(s);
+        Ok(m.compose_unary(unary_derivatives_neglog_phi(m.value(), w)))
     }
 }
 
@@ -2384,7 +2386,7 @@ impl gam_math::jet_tower::RowNllProgram<2> for BernoulliRigidNllProgram {
 ///
 /// Audits every channel the hand-written kernel emits — value / gradient /
 /// Hessian / `row_third_contracted(dir)` / `row_fourth_contracted(u, v)` —
-/// against the single-expression `RowNllProgram<2>`-derived tower truth,
+/// against the single-expression `RowProgram<2>`-derived tower truth,
 /// over per-row-varying `(η_m, g)` fixtures (mixed labels, non-unit weights,
 /// with and without Gaussian frailty so the probit scale ≠ 1) and several
 /// direction vectors. Together with the survival marginal-slope oracle this
@@ -2392,7 +2394,7 @@ impl gam_math::jet_tower::RowNllProgram<2> for BernoulliRigidNllProgram {
 /// is CI-verified channel-by-channel against the one-expression truth.
 #[test]
 fn bernoulli_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
-    use gam_math::jet_tower::{KernelChannels, evaluate_program, verify_kernel_channels};
+    use gam_math::jet_tower::{KernelChannels, program_full_tower, verify_kernel_channels};
     use crate::row_kernel::RowKernel;
 
     let n = 6usize;
@@ -2426,7 +2428,7 @@ fn bernoulli_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
         };
 
         for row in 0..n {
-            let tower = evaluate_program(&program, row).expect("tower evaluation");
+            let tower = program_full_tower(&program, row).expect("tower evaluation");
 
             let (value, gradient, hessian) =
                 RowKernel::row_kernel(&kernel, row).expect("hand kernel value/grad/hess");
