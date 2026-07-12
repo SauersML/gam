@@ -583,12 +583,36 @@ fn sls_row_vgh_compiled(
     let plan = sls_outer_plan(kernel);
     let truncate = |stack: [f64; 5]| [stack[0], stack[1], stack[2]];
     let mut output = MappedOrder2Accumulator::zero();
-    output.add_composed(&u0, SLS_U0_AXES, truncate(plan.u0));
+    output.add_composed(
+        &u0,
+        SLS_U0_AXES,
+        truncate(plan.u0),
+        false,
+        [false; 3],
+        [false; 6],
+    );
     if let Some(stack) = plan.u1 {
-        output.add_composed(&u1, SLS_U1_AXES, truncate(stack));
+        output.add_composed(
+            &u1,
+            SLS_U1_AXES,
+            truncate(stack),
+            true,
+            [false; 3],
+            [false; 6],
+        );
     }
     if let Some(stack) = plan.g {
-        output.add_composed(&g, SLS_G_AXES, truncate(stack));
+        output.add_composed(
+            &g,
+            SLS_G_AXES,
+            truncate(stack),
+            true,
+            [false, true, false, true, false],
+            [
+                false, false, false, false, false, true, false, true, false, false, false, false,
+                true, false, false,
+            ],
+        );
     }
     output.into_channels()
 }

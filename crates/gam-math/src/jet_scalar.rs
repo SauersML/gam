@@ -1381,18 +1381,26 @@ pub struct MappedOrder2Accumulator<const K: usize> {
 /// they contain only final live channels and therefore introduce no seeded
 /// identity arrays, dependency masks, or zero arithmetic.
 #[derive(Clone, Copy, Debug)]
-pub struct StaticOrder2Atom<const N: usize, const H: usize> {
+pub struct StaticOrder2Atom<
+    const N: usize,
+    const H: usize,
+    const GRADIENT_BITS: u128,
+    const HESSIAN_BITS: u128,
+> {
     value: f64,
     gradient: [f64; N],
     hessian: [f64; H],
 }
 
-impl<const N: usize, const H: usize> StaticOrder2Atom<N, H> {
+impl<const N: usize, const H: usize, const G: u128, const Q: u128>
+    StaticOrder2Atom<N, H, G, Q>
+{
     /// Construct a generated atom. `H` must equal `N(N+1)/2`.
     #[inline(always)]
     #[must_use]
     pub fn new(value: f64, gradient: [f64; N], hessian: [f64; H]) -> Self {
         assert!(H == N * (N + 1) / 2, "invalid packed order-two shape");
+        assert!(N <= 128 && H <= 128, "static atom sparsity mask overflow");
         Self {
             value,
             gradient,
@@ -1434,6 +1442,10 @@ impl<const N: usize, const H: usize> StaticOrder2Atom<N, H> {
 /// Both ordinary forward jets and build-time-symbolic atoms implement this
 /// interface. The accumulator owns the only global scatter/chain rule.
 pub trait Order2AtomChannels<const N: usize> {
+    /// Structurally live local gradient channels.
+    const GRADIENT_BITS: u128;
+    /// Structurally live packed upper-Hessian channels.
+    const HESSIAN_BITS: u128;
     /// Local gradient entry.
     fn gradient_at(&self, axis: usize) -> f64;
     /// Local Hessian entry.
@@ -1441,6 +1453,9 @@ pub trait Order2AtomChannels<const N: usize> {
 }
 
 impl<const N: usize> Order2AtomChannels<N> for Order2<N> {
+    const GRADIENT_BITS: u128 = low_mask(N);
+    const HESSIAN_BITS: u128 = low_mask(N * (N + 1) / 2);
+
     #[inline(always)]
     fn gradient_at(&self, axis: usize) -> f64 {
         self.0.g[axis]
@@ -1452,7 +1467,12 @@ impl<const N: usize> Order2AtomChannels<N> for Order2<N> {
     }
 }
 
-impl<const N: usize, const H: usize> Order2AtomChannels<N> for StaticOrder2Atom<N, H> {
+impl<const N: usize, const H: usize, const G: u128, const Q: u128> Order2AtomChannels<N>
+    for StaticOrder2Atom<N, H, G, Q>
+{
+    const GRADIENT_BITS: u128 = G;
+    const HESSIAN_BITS: u128 = Q;
+
     #[inline(always)]
     fn gradient_at(&self, axis: usize) -> f64 {
         self.gradient[axis]
@@ -1461,6 +1481,14 @@ impl<const N: usize, const H: usize> Order2AtomChannels<N> for StaticOrder2Atom<
     #[inline(always)]
     fn hessian_at(&self, row: usize, column: usize) -> f64 {
         StaticOrder2Atom::hessian_at(self, row, column)
+    }
+}
+
+const fn low_mask(channels: usize) -> u128 {
+    if channels >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << channels) - 1
     }
 }
 
@@ -1476,19 +1504,24 @@ impl<const K: usize> MappedOrder2Accumulator<K> {
         }
     }
 
-    /// Add `f(atom)` using the exact order-two Faà di Bruno rule.
+    /// Scatter `f(atom)` using the exact order-two Faà di Bruno rule.
     ///
     /// `axes[i]` maps local derivative axis `i` to its global primary axis. The
     /// map must be injective. Repeated axes describe a non-injective linear
     /// pullback whose identified cross terms need multiplicity that this simple
     /// scatter deliberately does not represent.
     #[inline(always)]
-    pub fn add_composed<const N: usize, A: Order2AtomChannels<N>>(
+    pub fn add_composed<const N: usize, const H: usize, A: Order2AtomChannels<N>>(
         &mut self,
         atom: &A,
         axes: [usize; N],
         derivatives: [f64; 3],
+        value_add: bool,
+        gradient_add: [bool; N],
+        hessian_add: [bool; H],
     ) {
+        assert!(H == N * (N + 1) / 2, "invalid mapped Hessian write shape");
+        assert!(N <= 128 && H <= 128, "mapped atom sparsity mask overflow");
         assert!(
             axes.iter().all(|&axis| axis < K),
             "mapped atom axis must be within the global primary dimension"
@@ -1500,20 +1533,57 @@ impl<const K: usize> MappedOrder2Accumulator<K> {
             "mapped atom axes must be injective"
         );
 
-        self.value += derivatives[0];
+        if value_add {
+            self.value += derivatives[0];
+        } else {
+            self.value = derivatives[0];
+        }
+        let mut packed = 0;
         for local_i in 0..N {
             let global_i = axes[local_i];
-            self.gradient[global_i] += derivatives[1] * atom.gradient_at(local_i);
+            if A::GRADIENT_BITS & (1u128 << local_i) != 0 {
+                let channel = derivatives[1] * atom.gradient_at(local_i);
+                if gradient_add[local_i] {
+                    self.gradient[global_i] += channel;
+                } else {
+                    self.gradient[global_i] = channel;
+                }
+            }
             for local_j in local_i..N {
                 let global_j = axes[local_j];
-                let mut channel = derivatives[1] * atom.hessian_at(local_i, local_j);
-                channel += derivatives[2]
-                    * atom.gradient_at(local_i)
-                    * atom.gradient_at(local_j);
-                self.hessian[global_i][global_j] += channel;
-                if global_i != global_j {
-                    self.hessian[global_j][global_i] += channel;
+                let inner_live = A::HESSIAN_BITS & (1u128 << packed) != 0;
+                let outer_live = A::GRADIENT_BITS & (1u128 << local_i) != 0
+                    && A::GRADIENT_BITS & (1u128 << local_j) != 0;
+                let channel = if inner_live {
+                    let inner = derivatives[1] * atom.hessian_at(local_i, local_j);
+                    if outer_live {
+                        inner
+                            + derivatives[2]
+                                * atom.gradient_at(local_i)
+                                * atom.gradient_at(local_j)
+                    } else {
+                        inner
+                    }
+                } else if outer_live {
+                    derivatives[2]
+                        * atom.gradient_at(local_i)
+                        * atom.gradient_at(local_j)
+                } else {
+                    packed += 1;
+                    continue;
+                };
+                if hessian_add[packed] {
+                    self.hessian[global_i][global_j] += channel;
+                    if global_i != global_j {
+                        self.hessian[global_j][global_i] += channel;
+                    }
+                } else {
+                    self.hessian[global_i][global_j] = channel;
+                    if global_i != global_j {
+                        self.hessian[global_j][global_i] = channel;
+                    }
                 }
+                packed += 1;
             }
         }
     }
@@ -3039,8 +3109,22 @@ mod tests {
         let q0 = local_q0.value();
         let q1_exp = local_q1.value().exp();
         let mut lowered = MappedOrder2Accumulator::<K>::zero();
-        lowered.add_composed(&local_q0, [3, 1], [q0.ln(), q0.recip(), -1.0 / (q0 * q0)]);
-        lowered.add_composed(&local_q1, [1, 2], [q1_exp, q1_exp, q1_exp]);
+        lowered.add_composed(
+            &local_q0,
+            [3, 1],
+            [q0.ln(), q0.recip(), -1.0 / (q0 * q0)],
+            false,
+            [false, false],
+            [false, false, false],
+        );
+        lowered.add_composed(
+            &local_q1,
+            [1, 2],
+            [q1_exp, q1_exp, q1_exp],
+            true,
+            [true, false],
+            [true, false, false],
+        );
         let (value, gradient, hessian) = lowered.into_channels();
 
         close(value, dense.value(), "mapped value");
@@ -3062,7 +3146,14 @@ mod tests {
         let vars: [Order2<2>; 2] = std::array::from_fn(|axis| Order2::variable(0.2, axis));
         let atom = vars[0].add(&vars[1]);
         let mut lowered = MappedOrder2Accumulator::<2>::zero();
-        lowered.add_composed(&atom, [1, 1], [0.4, 1.0, 0.0]);
+        lowered.add_composed(
+            &atom,
+            [1, 1],
+            [0.4, 1.0, 0.0],
+            false,
+            [false, false],
+            [false, false, false],
+        );
     }
 
     #[test]
@@ -3070,7 +3161,14 @@ mod tests {
     fn mapped_order2_accumulator_rejects_out_of_range_axes() {
         let atom = Order2::<1>::variable(0.2, 0);
         let mut lowered = MappedOrder2Accumulator::<2>::zero();
-        lowered.add_composed(&atom, [2], [0.2, 1.0, 0.0]);
+        lowered.add_composed(
+            &atom,
+            [2],
+            [0.2, 1.0, 0.0],
+            false,
+            [false],
+            [false],
+        );
     }
 
     #[test]

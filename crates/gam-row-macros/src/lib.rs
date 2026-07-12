@@ -680,12 +680,31 @@ fn expand(input: RowAtomInput) -> Result<TokenStream2> {
             .iter()
             .map(|&id| node_reference(id, &graph, &primaries, &constants));
         let packed = dimension * (dimension + 1) / 2;
+        let gradient_bits = gradient
+            .iter()
+            .enumerate()
+            .fold(0u128, |bits, (axis, &id)| {
+                bits | (u128::from(!graph.is_zero(id)) << axis)
+            });
+        let hessian_bits = packed_hessian
+            .iter()
+            .enumerate()
+            .fold(0u128, |bits, (slot, &id)| {
+                bits | (u128::from(!graph.is_zero(id)) << slot)
+            });
+        let gradient_bits = Literal::u128_unsuffixed(gradient_bits);
+        let hessian_bits = Literal::u128_unsuffixed(hessian_bits);
         output.push(quote! {
             #[inline(always)]
             #visibility fn #order2_name(
                 #(#primaries: f64,)*
                 #(#constants: f64),*
-            ) -> ::gam_math::jet_scalar::StaticOrder2Atom<#dimension, #packed> {
+            ) -> ::gam_math::jet_scalar::StaticOrder2Atom<
+                #dimension,
+                #packed,
+                #gradient_bits,
+                #hessian_bits,
+            > {
                 #(#definitions)*
                 ::gam_math::jet_scalar::StaticOrder2Atom::new(
                     #value_ref,
