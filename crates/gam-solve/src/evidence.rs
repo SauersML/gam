@@ -5400,8 +5400,7 @@ mod tests {
         // tolerance.
         let objective_scale = 1.0;
         let recorded_step = -1.4e-13;
-        let uncertainty =
-            gaussian_mixture_monotonicity_uncertainty(objective_scale, 0.0, 0.0);
+        let uncertainty = gaussian_mixture_monotonicity_uncertainty(objective_scale, 0.0, 0.0);
         let certificate = GaussianMixtureCertificate {
             mean_log_likelihood: -objective_scale,
             mean_log_likelihood_gain: recorded_step,
@@ -5454,9 +5453,7 @@ mod tests {
             (f64::EPSILON.sqrt() * objective_scale).max(recorded_reduction_bound),
             "reported uncertainty must come from the composite-map and reduction bounds"
         );
-        assert!(
-            certificate.mean_log_likelihood_gain >= -certificate.monotonicity_uncertainty
-        );
+        assert!(certificate.mean_log_likelihood_gain >= -certificate.monotonicity_uncertainty);
         assert!(certificate.objective_residual <= certificate.objective_tolerance);
         assert!(certificate.parameter_residual <= certificate.parameter_tolerance);
     }
@@ -5631,12 +5628,17 @@ mod tests {
         assert!((fit.center()[1] + 0.3).abs() < 0.05);
         assert!((fit.radius() - 2.0).abs() < 0.05);
         assert!(fit.variance().is_finite() && fit.variance() > 0.0);
-        assert!(fit
-            .per_point_log_density(data.view())
-            .unwrap()
-            .iter()
-            .all(|value| value.is_finite()));
-        assert!(fit.laplace_negative_log_evidence(data.view()).unwrap().is_finite());
+        assert!(
+            fit.per_point_log_density(data.view())
+                .unwrap()
+                .iter()
+                .all(|value| value.is_finite())
+        );
+        assert!(
+            fit.laplace_negative_log_evidence(data.view())
+                .unwrap()
+                .is_finite()
+        );
 
         let free = fit_gaussian_mixture(data.view(), 7, config).unwrap();
         assert_eq!(free.num_free_parameters(), 41);

@@ -15,11 +15,11 @@
 //! build returns an error and the caller cold-starts, so a misfired transfer
 //! can never fail a fit.
 
-use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 use crate::warm_start_artifact::{
     FitArtifact, FitDescriptor, RHO_SATURATION, TermIdentityKey, TransferProvenance,
 };
 use faer::Side;
+use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
 use ndarray::{Array1, Array2};
 
 /// Magnitude past which a *projected* reduced-coordinate β is treated as a

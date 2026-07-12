@@ -30,9 +30,9 @@
 //! [`joint_jeffreys_term`] (self-limiting, returns the exact zero contribution on
 //! a well-conditioned fit) is the only "apply where needed" mechanism.
 
+use faer::Side;
 use gam_linalg::faer_ndarray::FaerEigh;
 use gam_linalg::lanczos::{SymmetricLanczosOptions, symmetric_lanczos_eigenpairs};
-use faer::Side;
 use ndarray::{Array1, Array2, ArrayView2};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -541,7 +541,8 @@ pub(crate) fn conditioning_gate_weight_hess(lambda_min: f64, lambda_max: f64) ->
         let ln10 = std::f64::consts::LN_10;
         let r_min = 1.0 / (lambda_min * ln10);
         let r_max = -1.0 / (lambda_max * ln10);
-        let g_mm = d2w_rel_dr2 * r_min * r_min + dw_rel_dr * (-1.0 / (lambda_min * lambda_min * ln10));
+        let g_mm =
+            d2w_rel_dr2 * r_min * r_min + dw_rel_dr * (-1.0 / (lambda_min * lambda_min * ln10));
         let g_mm_max = d2w_rel_dr2 * r_min * r_max; // ∂²r/∂λ_min∂λ_max = 0
         let g_max_max =
             d2w_rel_dr2 * r_max * r_max + dw_rel_dr * (1.0 / (lambda_max * lambda_max * ln10));
@@ -1610,11 +1611,7 @@ pub fn joint_jeffreys_phi_explicit_param_second_derivative(
 ) -> Result<f64, String> {
     use faer::Side;
     let p = h_joint.nrows();
-    for (name, mat) in [
-        ("pert_i", pert_i),
-        ("pert_j", pert_j),
-        ("pert_ij", pert_ij),
-    ] {
+    for (name, mat) in [("pert_i", pert_i), ("pert_j", pert_j), ("pert_ij", pert_ij)] {
         if mat.nrows() != p || mat.ncols() != p {
             return Err(format!(
                 "joint_jeffreys_phi_explicit_param_second_derivative: {name} shape {}x{} != {p}x{p}",
@@ -1642,7 +1639,9 @@ pub fn joint_jeffreys_phi_explicit_param_second_derivative(
         }
     }
     let (evals, evecs) = h_id_sym.eigh(Side::Lower).map_err(|e| {
-        format!("joint_jeffreys_phi_explicit_param_second_derivative: eigendecomposition failed: {e}")
+        format!(
+            "joint_jeffreys_phi_explicit_param_second_derivative: eigendecomposition failed: {e}"
+        )
     })?;
     let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
     let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -1743,10 +1742,7 @@ pub fn joint_jeffreys_phi_explicit_param_second_derivative(
             .iter()
             .map(|&lam| jeffreys_antiderivative(lam, floor))
             .sum::<f64>();
-    Ok(gate_weight * u_ij
-        + gate_dot_i * u_j
-        + gate_dot_j * u_i
-        + gate_hess_ij * phi_ungated)
+    Ok(gate_weight * u_ij + gate_dot_i * u_j + gate_dot_j * u_i + gate_hess_ij * phi_ungated)
 }
 
 /// β-FIXED PREPARED BASE for the joint-Jeffreys curvature perturbation derivative.

@@ -9,8 +9,8 @@
 //! unconditionally (the workspace ban-scanner forbids feature gating); a `pub`
 //! debug helper the production path never calls is inert by construction.
 
-use super::*;
 use super::joint_hyper::ExternalJointHyperEvaluator;
+use super::*;
 
 impl<'a> ExternalJointHyperEvaluator<'a> {
     /// DEBUG ONLY: run PIRLS at `theta` (cost-only path) and return the dense

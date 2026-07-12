@@ -612,9 +612,7 @@ impl DeviceResidentArrowWorkspace {
                                     self.context_id(),
                                 );
                                 gam_gpu::profile::telemetry_record_factorization();
-                                gam_gpu::profile::telemetry_record_h2d(
-                                    self.frame_upload_bytes(),
-                                );
+                                gam_gpu::profile::telemetry_record_h2d(self.frame_upload_bytes());
                                 resident_frame = Some((ridge_t, ridge_beta, frame));
                             }
                             Err(err) => frame_build_error = Some(map_gpu_error(err)),
@@ -696,17 +694,16 @@ impl DeviceResidentArrowWorkspace {
 
             // Predicted reduction from the bare quadratic model on the residual
             // system, identical formula to the production trust-region ratio.
-            let predicted_reduction =
-                crate::arrow_schur::arrow_bare_quadratic_model_reduction(
-                    &residual,
-                    solution.delta_t.view(),
-                    solution.delta_beta.view(),
-                    ridge_t,
-                    ridge_beta,
-                )
-                .map_err(|err| DeviceResidentArrowError::Solve {
-                    reason: format!("SAE resident inner loop predicted-reduction failed: {err}"),
-                })?;
+            let predicted_reduction = crate::arrow_schur::arrow_bare_quadratic_model_reduction(
+                &residual,
+                solution.delta_t.view(),
+                solution.delta_beta.view(),
+                ridge_t,
+                ridge_beta,
+            )
+            .map_err(|err| DeviceResidentArrowError::Solve {
+                reason: format!("SAE resident inner loop predicted-reduction failed: {err}"),
+            })?;
 
             // Trial iterate.
             let mut trial_t = t.clone();
@@ -962,9 +959,7 @@ impl DeviceResidentArrowWorkspace {
                                     self.context_id(),
                                 );
                                 gam_gpu::profile::telemetry_record_factorization();
-                                gam_gpu::profile::telemetry_record_h2d(
-                                    self.frame_upload_bytes(),
-                                );
+                                gam_gpu::profile::telemetry_record_h2d(self.frame_upload_bytes());
                                 shared.frame = Some((ridge_t, ridge_beta, frame));
                             }
                             Err(err) => frame_build_error = Some(map_gpu_error(err)),
@@ -1024,17 +1019,16 @@ impl DeviceResidentArrowWorkspace {
                 Err(other) => return Err(other),
             };
 
-            let predicted_reduction =
-                crate::arrow_schur::arrow_bare_quadratic_model_reduction(
-                    &residual,
-                    solution.delta_t.view(),
-                    solution.delta_beta.view(),
-                    ridge_t,
-                    ridge_beta,
-                )
-                .map_err(|err| DeviceResidentArrowError::Solve {
-                    reason: format!("SAE outer-sequence predicted-reduction failed: {err}"),
-                })?;
+            let predicted_reduction = crate::arrow_schur::arrow_bare_quadratic_model_reduction(
+                &residual,
+                solution.delta_t.view(),
+                solution.delta_beta.view(),
+                ridge_t,
+                ridge_beta,
+            )
+            .map_err(|err| DeviceResidentArrowError::Solve {
+                reason: format!("SAE outer-sequence predicted-reduction failed: {err}"),
+            })?;
 
             let mut trial_t = t.clone();
             let mut trial_beta = beta.clone();
@@ -2450,125 +2444,127 @@ mod tests {
             match crate::gpu_kernels::arrow_schur::ResidentArrowFrameHandle::new(&base, 0.0, 0.0) {
                 Err(err) => panic!("resident frame must build on CUDA host: {err:?}"),
                 Ok(frame) => {
-            let frame_build_ms = t_build.elapsed().as_secs_f64() * 1e3;
+                    let frame_build_ms = t_build.elapsed().as_secs_f64() * 1e3;
 
-            // Warm-up: one solve on each path before timing so the residency
-            // ratio reflects steady-state per-iterate cost, not the one-time
-            // NVRTC/cuSOLVER handle init, module JIT, or first-touch device
-            // allocation (those are paid once per process, not per inner
-            // iteration). The production inner loop pays them once and then runs
-            // MANY solves, which is exactly the regime this assertion guards.
-            frame
-                .solve_gradient(&gradients[0].0, &gradients[0].1)
-                .expect("resident warm-up solve");
-            {
-                let mut sys = ws.to_arrow_system();
-                for (i, row) in sys.rows.iter_mut().enumerate() {
-                    for r in 0..d {
-                        row.gt[r] = gradients[0].0[i * d + r];
-                    }
-                }
-                for (j, gb) in sys.gb.iter_mut().enumerate() {
-                    *gb = gradients[0].1[j];
-                }
-                sys.refresh_row_hessian_fingerprint();
-                crate::gpu_kernels::arrow_schur::solve_arrow_newton_step(&sys, 0.0, 0.0)
-                    .expect("reupload warm-up solve");
-            }
-
-            // RESIDENT: reuse the (already-built, already-warmed) frame for N
-            // gradient-only solves. Times ONLY the per-iterate gradient solves —
-            // upload `O(n·d + k)` gradient, run the cheap residual path, read
-            // back `δ`. No POTRF, no `D`/`B` re-upload.
-            let t_res = Instant::now();
-            let mut resident_steps = Vec::with_capacity(N_SOLVES);
-            for (g_t, g_beta) in &gradients {
-                resident_steps.push(
+                    // Warm-up: one solve on each path before timing so the residency
+                    // ratio reflects steady-state per-iterate cost, not the one-time
+                    // NVRTC/cuSOLVER handle init, module JIT, or first-touch device
+                    // allocation (those are paid once per process, not per inner
+                    // iteration). The production inner loop pays them once and then runs
+                    // MANY solves, which is exactly the regime this assertion guards.
                     frame
-                        .solve_gradient(g_t, g_beta)
-                        .expect("resident solve_gradient"),
-                );
-            }
-            let resident_ms = t_res.elapsed().as_secs_f64() * 1e3;
-
-            // REUPLOAD: N full solves, each re-uploading D/B/g and re-factoring.
-            let t_reup = Instant::now();
-            let mut reupload_steps = Vec::with_capacity(N_SOLVES);
-            for (g_t, g_beta) in &gradients {
-                let mut sys = ws.to_arrow_system();
-                for (i, row) in sys.rows.iter_mut().enumerate() {
-                    for r in 0..d {
-                        row.gt[r] = g_t[i * d + r];
+                        .solve_gradient(&gradients[0].0, &gradients[0].1)
+                        .expect("resident warm-up solve");
+                    {
+                        let mut sys = ws.to_arrow_system();
+                        for (i, row) in sys.rows.iter_mut().enumerate() {
+                            for r in 0..d {
+                                row.gt[r] = gradients[0].0[i * d + r];
+                            }
+                        }
+                        for (j, gb) in sys.gb.iter_mut().enumerate() {
+                            *gb = gradients[0].1[j];
+                        }
+                        sys.refresh_row_hessian_fingerprint();
+                        crate::gpu_kernels::arrow_schur::solve_arrow_newton_step(&sys, 0.0, 0.0)
+                            .expect("reupload warm-up solve");
                     }
-                }
-                for (j, gb) in sys.gb.iter_mut().enumerate() {
-                    *gb = g_beta[j];
-                }
-                sys.refresh_row_hessian_fingerprint();
-                reupload_steps.push(
-                    crate::gpu_kernels::arrow_schur::solve_arrow_newton_step(&sys, 0.0, 0.0)
-                        .expect("reupload solve_arrow_newton_step"),
-                );
-            }
-            let reupload_ms = t_reup.elapsed().as_secs_f64() * 1e3;
 
-            // Parity: resident and reupload steps must be bit-identical (same
-            // factor kernels; residency only skips re-deriving g-independent work).
-            let mut max_rel = 0.0_f64;
-            for (rs, us) in resident_steps.iter().zip(reupload_steps.iter()) {
-                let scale = us
-                    .delta_t
-                    .iter()
-                    .chain(us.delta_beta.iter())
-                    .fold(1.0_f64, |m, &v| m.max(v.abs()));
-                for (a, b) in rs.delta_t.iter().zip(us.delta_t.iter()) {
-                    max_rel = max_rel.max((a - b).abs() / scale);
-                }
-                for (a, b) in rs.delta_beta.iter().zip(us.delta_beta.iter()) {
-                    max_rel = max_rel.max((a - b).abs() / scale);
-                }
-            }
+                    // RESIDENT: reuse the (already-built, already-warmed) frame for N
+                    // gradient-only solves. Times ONLY the per-iterate gradient solves —
+                    // upload `O(n·d + k)` gradient, run the cheap residual path, read
+                    // back `δ`. No POTRF, no `D`/`B` re-upload.
+                    let t_res = Instant::now();
+                    let mut resident_steps = Vec::with_capacity(N_SOLVES);
+                    for (g_t, g_beta) in &gradients {
+                        resident_steps.push(
+                            frame
+                                .solve_gradient(g_t, g_beta)
+                                .expect("resident solve_gradient"),
+                        );
+                    }
+                    let resident_ms = t_res.elapsed().as_secs_f64() * 1e3;
 
-            let resident_per_solve = resident_ms / N_SOLVES as f64;
-            let reupload_per_solve = reupload_ms / N_SOLVES as f64;
-            let residency_speedup = reupload_ms / resident_ms.max(1e-9);
-            println!(
-                "[#1017 per-solve {label}] N={N_SOLVES} frame_build={frame_build_ms:.2}ms \
+                    // REUPLOAD: N full solves, each re-uploading D/B/g and re-factoring.
+                    let t_reup = Instant::now();
+                    let mut reupload_steps = Vec::with_capacity(N_SOLVES);
+                    for (g_t, g_beta) in &gradients {
+                        let mut sys = ws.to_arrow_system();
+                        for (i, row) in sys.rows.iter_mut().enumerate() {
+                            for r in 0..d {
+                                row.gt[r] = g_t[i * d + r];
+                            }
+                        }
+                        for (j, gb) in sys.gb.iter_mut().enumerate() {
+                            *gb = g_beta[j];
+                        }
+                        sys.refresh_row_hessian_fingerprint();
+                        reupload_steps.push(
+                            crate::gpu_kernels::arrow_schur::solve_arrow_newton_step(
+                                &sys, 0.0, 0.0,
+                            )
+                            .expect("reupload solve_arrow_newton_step"),
+                        );
+                    }
+                    let reupload_ms = t_reup.elapsed().as_secs_f64() * 1e3;
+
+                    // Parity: resident and reupload steps must be bit-identical (same
+                    // factor kernels; residency only skips re-deriving g-independent work).
+                    let mut max_rel = 0.0_f64;
+                    for (rs, us) in resident_steps.iter().zip(reupload_steps.iter()) {
+                        let scale = us
+                            .delta_t
+                            .iter()
+                            .chain(us.delta_beta.iter())
+                            .fold(1.0_f64, |m, &v| m.max(v.abs()));
+                        for (a, b) in rs.delta_t.iter().zip(us.delta_t.iter()) {
+                            max_rel = max_rel.max((a - b).abs() / scale);
+                        }
+                        for (a, b) in rs.delta_beta.iter().zip(us.delta_beta.iter()) {
+                            max_rel = max_rel.max((a - b).abs() / scale);
+                        }
+                    }
+
+                    let resident_per_solve = resident_ms / N_SOLVES as f64;
+                    let reupload_per_solve = reupload_ms / N_SOLVES as f64;
+                    let residency_speedup = reupload_ms / resident_ms.max(1e-9);
+                    println!(
+                        "[#1017 per-solve {label}] N={N_SOLVES} frame_build={frame_build_ms:.2}ms \
                  resident={resident_ms:.2}ms ({resident_per_solve:.3}ms/solve, \
                  grad-upload + warm factors) reupload={reupload_ms:.2}ms \
                  ({reupload_per_solve:.3}ms/solve, N factors + N D/B uploads) \
                  residency_speedup={residency_speedup:.2}x parity_rel={max_rel:e}"
-            );
-            assert!(
-                max_rel < 1e-9,
-                "{label}: resident per-solve steps must match reupload (rel {max_rel:e})"
-            );
+                    );
+                    assert!(
+                        max_rel < 1e-9,
+                        "{label}: resident per-solve steps must match reupload (rel {max_rel:e})"
+                    );
 
-            // #1017 deliverable 2: the residency amortization must actually fire
-            // on hardware — reusing the resident factors across iterations has to
-            // be STRICTLY cheaper per solve than re-uploading D/B/g and
-            // re-factoring every iterate. This is the core perf claim, asserted
-            // (not merely printed) so a regression that silently re-uploads, or a
-            // dispatch change that drops the resident path, fails the gate on the
-            // A100 instead of slipping through as a slower-but-green run.
-            //
-            // The `color_arm` shape (n=180, p=5120) is the decisive case: the
-            // per-solve reupload pays a 5120-wide border Schur factor + the
-            // `O(n·d·p)` cross-block upload every iterate, while the resident path
-            // pays only the `O(n·d + p)` gradient transfer and two border TRSMs.
-            // We require a clear >1.5x margin there. The `qwen_non_gating` shape
-            // (p=2048) has a smaller border so its margin is thinner; we still
-            // require a genuine speedup (>1x) but do not over-tighten it.
-            let min_speedup = if label == "color_arm" { 1.5 } else { 1.0 };
-            assert!(
-                residency_speedup > min_speedup,
-                "{label}: across-iteration residency must beat per-solve re-upload \
+                    // #1017 deliverable 2: the residency amortization must actually fire
+                    // on hardware — reusing the resident factors across iterations has to
+                    // be STRICTLY cheaper per solve than re-uploading D/B/g and
+                    // re-factoring every iterate. This is the core perf claim, asserted
+                    // (not merely printed) so a regression that silently re-uploads, or a
+                    // dispatch change that drops the resident path, fails the gate on the
+                    // A100 instead of slipping through as a slower-but-green run.
+                    //
+                    // The `color_arm` shape (n=180, p=5120) is the decisive case: the
+                    // per-solve reupload pays a 5120-wide border Schur factor + the
+                    // `O(n·d·p)` cross-block upload every iterate, while the resident path
+                    // pays only the `O(n·d + p)` gradient transfer and two border TRSMs.
+                    // We require a clear >1.5x margin there. The `qwen_non_gating` shape
+                    // (p=2048) has a smaller border so its margin is thinner; we still
+                    // require a genuine speedup (>1x) but do not over-tighten it.
+                    let min_speedup = if label == "color_arm" { 1.5 } else { 1.0 };
+                    assert!(
+                        residency_speedup > min_speedup,
+                        "{label}: across-iteration residency must beat per-solve re-upload \
                  (residency_speedup={residency_speedup:.3}x, required >{min_speedup}x; \
                  resident {resident_per_solve:.3}ms/solve vs reupload \
                  {reupload_per_solve:.3}ms/solve over N={N_SOLVES} solves) — the resident \
                  frame either silently re-uploaded D/B or the dispatch dropped the \
                  amortized factor path"
-            );
+                    );
                 }
             }
         }

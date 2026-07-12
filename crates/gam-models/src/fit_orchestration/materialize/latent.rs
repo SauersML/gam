@@ -702,12 +702,6 @@ pub(super) fn prepare_standard_latent_coord(
         config.latents.as_ref(),
         config.analytic_penalties.as_ref(),
     )?;
-    if config.topology_auto_selector.is_some() && specs.is_empty() {
-        return Err(
-            "TopologyAutoSelector requires a Smooth with latent coords; pass latents={...}"
-                .to_string(),
-        );
-    }
     if specs.is_empty() {
         return Ok(None);
     }
@@ -718,15 +712,6 @@ pub(super) fn prepare_standard_latent_coord(
         );
     }
     let spec = specs.into_iter().next().unwrap();
-    if let Some(selector) = config.topology_auto_selector.as_ref()
-        && let Some(requested) = selector.latent.as_ref()
-        && requested != &spec.target
-    {
-        return Err(format!(
-            "TopologyAutoSelector requested latent {requested:?}, but the formula path materialized latent {:?}",
-            spec.target
-        ));
-    }
     if spec.n != data.values.nrows() || spec.n != y.len() {
         return Err(format!(
             "latent '{}' row count {} does not match data rows {}",

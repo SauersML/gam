@@ -940,9 +940,7 @@ where
     }
 }
 
-impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed>
-    ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed>
-{
+impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> {
     pub fn with_exact_polish<Fpolish>(mut self, transition: Fpolish) -> Self
     where
         Fpolish: FnMut(&mut S) -> bool + 'static,

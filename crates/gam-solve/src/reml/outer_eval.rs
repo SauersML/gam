@@ -21,21 +21,21 @@
 pub(crate) use super::*;
 
 pub(crate) use super::sparse_penalty_block_count_from_canonical;
-pub(crate) use gam_terms::construction::{
-    create_balanced_penalty_root_from_canonical, precompute_reparam_invariant_from_canonical,
-};
-pub(crate) use gam_linalg::utils::{boundary_hit_indices, symmetric_spectrum_condition_number};
-pub(crate) use crate::pirls::PirlsWorkspace;
 use crate::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 pub(crate) use crate::persistent_warm_start::{
     PersistentWarmStartRecord, load_record, store_record,
 };
+pub(crate) use crate::pirls::PirlsWorkspace;
+pub(crate) use gam_linalg::utils::{boundary_hit_indices, symmetric_spectrum_condition_number};
 pub(crate) use gam_problem::{
     GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior,
     SasLinkState, StandardLink,
 };
 pub(crate) use gam_problem::{HessianValue, OuterEval};
 pub(crate) use gam_runtime::warm_start::Fingerprinter;
+pub(crate) use gam_terms::construction::{
+    create_balanced_penalty_root_from_canonical, precompute_reparam_invariant_from_canonical,
+};
 // #1521 trait-inversion: the `BlockExcessTarget` evaluator trait (implemented by
 // `Gam784BlockTarget`, consumed by the up-tier #784 sampler) lives in the neutral
 // `gam_problem` contract so gam-solve has no back-edge into the gam-inference SCC.

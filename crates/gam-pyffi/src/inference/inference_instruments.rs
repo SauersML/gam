@@ -1485,10 +1485,10 @@ mod tests {
     #[test]
     fn circular_verdict_aggregates_within_class_stacking_mass() {
         let kinds = [
-            gam::solver::AutoTopologyKind::Circle,
-            gam::solver::AutoTopologyKind::Euclidean,
-            gam::solver::AutoTopologyKind::MixtureClass,
-            gam::solver::AutoTopologyKind::RingOfClustersClass,
+            gam::solver::PredictiveCandidateKind::Fixed(gam::solver::AutoTopologyKind::Circle),
+            gam::solver::PredictiveCandidateKind::Fixed(gam::solver::AutoTopologyKind::Euclidean),
+            gam::solver::PredictiveCandidateKind::MixtureClass,
+            gam::solver::PredictiveCandidateKind::RingOfClustersClass,
         ];
         // No individual circular candidate beats Euclidean (0.30 < 0.40), but
         // the circular topology class owns 0.60 total mass. A max-vs-max rule
@@ -1560,8 +1560,7 @@ mod tests {
         let perturbed_slot = eval_rows - 1;
         perturbed_free_coords[[train_rows + perturbed_slot, 0]] = 1.0e12;
         perturbed_free_coords[[train_rows + perturbed_slot, 1]] = -1.0e12;
-        let perturbed_free_trace =
-            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let perturbed_free_trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let perturbed_actual = free_mixture_rung_provider_2d(
             perturbed_free_coords,
             ladder,
@@ -1631,8 +1630,7 @@ mod tests {
         let perturbed_ring_slot = eval_rows - 1;
         perturbed_ring_coords[[clusters * per_cluster + perturbed_ring_slot, 0]] = -1.0e12;
         perturbed_ring_coords[[clusters * per_cluster + perturbed_ring_slot, 1]] = 1.0e12;
-        let perturbed_ring_trace =
-            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let perturbed_ring_trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let perturbed_ring_actual = ring_cluster_rung_provider_2d(
             perturbed_ring_coords,
             ring_ladder,
@@ -2349,7 +2347,7 @@ struct AtomShapeRaceVerdict {
 }
 
 fn circular_stacking_summary(
-    candidate_kinds: &[gam::solver::AutoTopologyKind],
+    candidate_kinds: &[gam::solver::PredictiveCandidateKind],
     stacking_weights: &[f64],
 ) -> Result<(f64, f64, f64, bool), String> {
     if candidate_kinds.len() != stacking_weights.len() || candidate_kinds.is_empty() {
@@ -2368,12 +2366,7 @@ fn circular_stacking_summary(
                 kind.display_name()
             ));
         }
-        if matches!(
-            kind,
-            gam::solver::AutoTopologyKind::Circle
-                | gam::solver::AutoTopologyKind::RingOfClusters { .. }
-                | gam::solver::AutoTopologyKind::RingOfClustersClass
-        ) {
+        if kind.is_circular() {
             circular_weight += weight;
         } else {
             noncircular_weight += weight;
@@ -2431,8 +2424,7 @@ fn fit_shape_coordinate_gauge(
                     "{context} training coordinate range overflowed on axis {axis}"
                 ));
             }
-            mean_offset[axis] =
-                previous_weight * mean_offset[axis] + new_weight * relative;
+            mean_offset[axis] = previous_weight * mean_offset[axis] + new_weight * relative;
         }
     }
 
@@ -2451,8 +2443,8 @@ fn fit_shape_coordinate_gauge(
                 continue;
             }
             if norm_scale < magnitude {
-                scaled_sum_squares = 1.0
-                    + scaled_sum_squares * (norm_scale / magnitude) * (norm_scale / magnitude);
+                scaled_sum_squares =
+                    1.0 + scaled_sum_squares * (norm_scale / magnitude) * (norm_scale / magnitude);
                 norm_scale = magnitude;
             } else {
                 scaled_sum_squares += (magnitude / norm_scale) * (magnitude / norm_scale);
@@ -2485,8 +2477,7 @@ fn apply_shape_coordinate_gauge(
     let mut canonical = Array2::<f64>::zeros(coords.raw_dim());
     for row in 0..coords.nrows() {
         for axis in 0..2 {
-            let value = ((coords[[row, axis]] - gauge.anchor[axis])
-                - gauge.mean_offset[axis])
+            let value = ((coords[[row, axis]] - gauge.anchor[axis]) - gauge.mean_offset[axis])
                 / gauge.scale;
             if !value.is_finite() {
                 return Err(format!(
@@ -2659,8 +2650,8 @@ fn run_atom_shape_race(
     use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
     use gam::solver::topology_selector::EvidenceCertification;
     use gam::solver::{
-        AutoTopologyKind, CrossClassCandidate, Headline, adjudicate_cross_class_race,
-        fit_mixture_rung, fit_ring_of_clusters_rung,
+        AutoTopologyKind, CrossClassCandidate, Headline, PredictiveCandidateKind,
+        adjudicate_cross_class_race, fit_mixture_rung, fit_ring_of_clusters_rung,
     };
 
     if coords.ncols() != 2 {
@@ -2728,10 +2719,10 @@ fn run_atom_shape_race(
     let ring_cluster_fold_orders =
         std::rc::Rc::new(std::cell::RefCell::new(Vec::with_capacity(folds)));
     let candidate_kinds = [
-        AutoTopologyKind::Circle,
-        AutoTopologyKind::Euclidean,
-        AutoTopologyKind::MixtureClass,
-        AutoTopologyKind::RingOfClustersClass,
+        PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
+        PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
+        PredictiveCandidateKind::MixtureClass,
+        PredictiveCandidateKind::RingOfClustersClass,
     ];
     let candidates = vec![
         CrossClassCandidate {
@@ -2782,10 +2773,12 @@ fn run_atom_shape_race(
         .ok_or_else(|| {
             "shape race mixed model classes but returned no stacking result".to_string()
         })?;
-    let winner_class = verdict.candidate_names[verdict.winner_index].clone();
+    let winner_class = candidate_kinds[verdict.winner_index]
+        .family_tag()
+        .to_string();
     let reporting_winner = match candidate_kinds[verdict.winner_index] {
-        AutoTopologyKind::MixtureClass => format!("mixture_k{mixture_reporting_k}"),
-        AutoTopologyKind::RingOfClustersClass => {
+        PredictiveCandidateKind::MixtureClass => format!("mixture_k{mixture_reporting_k}"),
+        PredictiveCandidateKind::RingOfClustersClass => {
             format!("ring_clusters_k{ring_clusters_reporting_k}")
         }
         kind => kind.display_name(),

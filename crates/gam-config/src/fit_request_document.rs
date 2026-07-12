@@ -160,8 +160,6 @@ pub struct FitRequestConfigDocument {
     pub time_num_internal_knots: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_smooth_lambda: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub topology_auto_selector: Option<JsonValue>,
     /// Container type of the caller's training table (`"pandas"`, `"polars"`,
     /// `"pyarrow"`, `"numpy"`, ...), passed through opaquely into the saved
     /// model payload for the predict-time output-container fallback (#394).
@@ -372,6 +370,22 @@ mod tests {
             FitRequestDocument::from_json(wrong_version)
                 .unwrap_err()
                 .contains("unsupported fit request schema_version")
+        );
+    }
+
+    #[test]
+    fn parser_rejects_removed_topology_selector_descriptor() {
+        let legacy = r#"{
+            "schema": "gam.fit-request",
+            "schema_version": 1,
+            "formula": "y ~ x",
+            "config": {"topology_auto_selector": {"candidates": ["circle"]}}
+        }"#;
+        let error = FitRequestDocument::from_json(legacy)
+            .expect_err("removed no-op selector field must not be silently ignored");
+        assert!(
+            error.contains("unknown field `topology_auto_selector`"),
+            "{error}"
         );
     }
 }

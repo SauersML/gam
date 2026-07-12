@@ -233,8 +233,8 @@ mod linux_impl {
         convergence_tol: f64,
         max_iter: usize,
     ) -> Result<Option<Vec<SigmaPointResult>>, GpuError> {
-        use crate::gpu_kernels::sigma_cubature::pool_size;
         use crate::gpu::pirls_gpu;
+        use crate::gpu_kernels::sigma_cubature::pool_size;
 
         let m = per_sigma.len();
         let p = x_original.ncols();

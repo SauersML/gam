@@ -1175,8 +1175,8 @@ pub fn launch_row_reweight_on_stream(
             )
         })?;
     const THREADS_PER_BLOCK: u32 = 256;
-    let n_u32 =
-        u32::try_from(n).map_err(|_| gam_gpu::gpu_err!("n={n} exceeds u32 for row reweight grid sizing"))?;
+    let n_u32 = u32::try_from(n)
+        .map_err(|_| gam_gpu::gpu_err!("n={n} exceeds u32 for row reweight grid sizing"))?;
     let grid_x = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
     let n_i32 = i32::try_from(n)
         .map_err(|_| gam_gpu::gpu_err!("n={n} exceeds i32 for row reweight kernel argument"))?;
@@ -1310,8 +1310,8 @@ pub fn launch_solve_row_on_stream(
         .load_function(kernel_name)
         .gpu_ctx_with(|err| format!("solve-row load_function({kernel_name}): {err}"))?;
     const THREADS_PER_BLOCK: u32 = 256;
-    let n_u32 =
-        u32::try_from(n).map_err(|_| gam_gpu::gpu_err!("n={n} exceeds u32 for solve-row grid sizing"))?;
+    let n_u32 = u32::try_from(n)
+        .map_err(|_| gam_gpu::gpu_err!("n={n} exceeds u32 for solve-row grid sizing"))?;
     let grid_x = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
     let n_i32 = i32::try_from(n)
         .map_err(|_| gam_gpu::gpu_err!("n={n} exceeds i32 for solve-row kernel argument"))?;
@@ -1378,8 +1378,8 @@ pub fn launch_alpha_ladder_on_stream(
         .load_function(kernel_name)
         .gpu_ctx_with(|err| format!("alpha-ladder load_function({kernel_name}): {err}"))?;
     const THREADS_PER_BLOCK: u32 = 256;
-    let n_u32 =
-        u32::try_from(n).map_err(|_| gam_gpu::gpu_err!("n={n} exceeds u32 for alpha-ladder grid sizing"))?;
+    let n_u32 = u32::try_from(n)
+        .map_err(|_| gam_gpu::gpu_err!("n={n} exceeds u32 for alpha-ladder grid sizing"))?;
     let row_blocks = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
     let n_i32 = i32::try_from(n)
         .map_err(|_| gam_gpu::gpu_err!("n={n} exceeds i32 for alpha-ladder kernel argument"))?;

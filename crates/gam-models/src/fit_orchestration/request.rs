@@ -637,10 +637,6 @@ pub struct FitConfig {
     /// validated against the declared latent-coordinate blocks before a
     /// standard latent fit starts.
     pub analytic_penalties: Option<JsonValue>,
-    /// Formula-path latent topology selector descriptor. The selector itself
-    /// fits candidates through the ordinary workflow; this slot lets callers
-    /// request and validate that path from the same config registry.
-    pub topology_auto_selector: Option<gam_solve::topology_selector::TopologyAutoSelector>,
     /// `gamfit.fit(..., smooths={...})` Python kwarg routed through the FFI
     /// bridge. JSON object keyed by formula symbol (single column name or
     /// comma-joined tuple) → smooth descriptor (`{"kind": "duchon",
@@ -719,7 +715,6 @@ impl Default for FitConfig {
             penalty_block_gamma_priors: Vec::new(),
             latents: None,
             analytic_penalties: None,
-            topology_auto_selector: None,
             smooth_overrides: None,
             persist_warm_start_disk: true,
             spatial_center_counts: None,

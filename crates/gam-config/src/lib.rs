@@ -159,11 +159,6 @@ pub fn resolve_fit_request_config(
         .as_ref()
         .map(|descriptors| descriptors.to_json_value())
         .transpose()?;
-    fit_config.topology_auto_selector = json_config
-        .topology_auto_selector
-        .as_ref()
-        .map(gam_solve::topology_selector::TopologyAutoSelector::from_json)
-        .transpose()?;
     fit_config.family = json_config.family;
     fit_config.negative_binomial_theta = json_config.negative_binomial_theta;
     fit_config.expectile_tau = json_config.expectile_tau;

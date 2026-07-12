@@ -4,7 +4,7 @@ Two public selectors are exposed:
 
 * :func:`select_topology` builds candidate formulas around an
   ``s(..., type=AUTO)`` smooth and ranks fitted models by evidence-like scores.
-* :class:`TopologyAutoSelector` is a descriptor-style helper for selecting the
+* :class:`TopologyAutoSelector` is a multi-fit orchestrator for selecting the
   topology of one :class:`gamfit.LatentCoord` block while preserving the rest
   of the caller's fit configuration.
 """
@@ -1071,20 +1071,6 @@ class TopologyAutoSelector:
         """Select which latent block name this selector should rank."""
         self.latent = str(latent)
         return self
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        """Serialize selector configuration for composition-engine hosts."""
-        payload: dict[str, Any] = {"score_scale": self.score_scale}
-        if self.candidates is not None:
-            payload["candidates"] = [
-                _candidate_from_item(item, 1, idx)[0]
-                for idx, item in enumerate(self.candidates)
-            ]
-        if self.latent is not None:
-            payload["latent"] = self.latent
-        return payload
-
-    _to_rust_payload = to_rust_descriptor
 
     def fit(
         self,

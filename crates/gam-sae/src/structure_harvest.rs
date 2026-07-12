@@ -90,8 +90,8 @@ use crate::description_length::{BirthMdlPrescreen, predicted_birth_dl_bits};
 use crate::frames::GrassmannFrame;
 use crate::manifold::{
     AssignmentMode, AtlasSeamKind, GraphStructureSelection, LearnedGraphAtom, OccupancyLaw,
-    SAE_MAX_PERIODIC_HARMONICS, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
-    SaeManifoldTerm, SaeReferenceRoughness, SphereChartTransition, UnitSpeedChartTransition,
+    SAE_MAX_PERIODIC_HARMONICS, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
+    SaeReferenceRoughness, SphereChartTransition, UnitSpeedChartTransition,
     amplitude_concentration_certificate, classify_occupancy_interval,
 };
 use crate::migration_ledger::SaeMigrationLedger;
@@ -4180,8 +4180,7 @@ fn select_torus_resolution(
                         continue;
                     }
                     let angle = std::f64::consts::TAU
-                        * (h0 as f64 * torus_coords[[row, 0]]
-                            + h1 as f64 * torus_coords[[row, 1]]);
+                        * (h0 as f64 * torus_coords[[row, 0]] + h1 as f64 * torus_coords[[row, 1]]);
                     re += w * target[[row, col]] * angle.cos();
                     im += w * target[[row, col]] * angle.sin();
                 }

@@ -24,11 +24,11 @@
 //! predictive log-density table by cross-validation folds within the race and
 //! feed it to [`crate::evidence::solve_stacking_weights`]. This module
 //! does exactly that when a race mixes model classes (smooth manifold vs the
-//! discrete-mixture rung): the HEADLINE ranking statistic switches to held-out
-//! predictive log-density / stacking weights, with the rank-aware Laplace
-//! evidence retained as corroboration. Same-class races keep today's
-//! winner-take-all evidence behavior. The class mix is auto-detected from the
-//! candidate kinds — there is no flag.
+//! discrete-mixture rung), or contains an adaptive order-selection class: the
+//! HEADLINE ranking statistic switches to held-out predictive log-density /
+//! stacking weights, with rank-aware Laplace evidence retained as
+//! corroboration. Same-class races of fixed candidates keep winner-take-all
+//! evidence behavior. The requirement is inferred from typed candidate kinds.
 //!
 //! What is still future work: persisting a mixture predictor for OOS prediction
 //! on new rows. The selection-time stacking table is computed from fits that
@@ -36,9 +36,9 @@
 //! prediction path. That OOS-retention package is out of scope here.
 
 use crate::evidence::{
-    GaussianMixtureConfig, StackingConfig, StackingWeights, TopologyScoreScale,
-    UnionStructure, UnionStructureFit, fit_gaussian_mixture, fit_union_ladder,
-    fit_union_structure, solve_stacking_weights, union_per_point_log_density,
+    GaussianMixtureConfig, StackingConfig, StackingWeights, TopologyScoreScale, UnionStructure,
+    UnionStructureFit, fit_gaussian_mixture, fit_union_ladder, fit_union_structure,
+    solve_stacking_weights, union_per_point_log_density,
 };
 use crate::priority_selection::{PriorityCandidate, rank_priority_candidates};
 use crate::row_sampling_measure::CoresetCertificate;
@@ -313,7 +313,6 @@ impl AutoTopologyKind {
         }
         out
     }
-
 }
 
 /// A predictive column in a cross-class race.
@@ -335,9 +334,7 @@ impl PredictiveCandidateKind {
         match self {
             PredictiveCandidateKind::Fixed(kind) => kind.display_name(),
             PredictiveCandidateKind::MixtureClass => "mixture_class".to_string(),
-            PredictiveCandidateKind::RingOfClustersClass => {
-                "ring_clusters_class".to_string()
-            }
+            PredictiveCandidateKind::RingOfClustersClass => "ring_clusters_class".to_string(),
         }
     }
 
@@ -364,8 +361,7 @@ impl PredictiveCandidateKind {
     pub const fn requires_predictive_stacking(self) -> bool {
         matches!(
             self,
-            PredictiveCandidateKind::MixtureClass
-                | PredictiveCandidateKind::RingOfClustersClass
+            PredictiveCandidateKind::MixtureClass | PredictiveCandidateKind::RingOfClustersClass
         )
     }
 
@@ -2579,6 +2575,57 @@ mod tests {
     }
 
     #[test]
+    fn fixed_topology_parser_requires_canonical_ordered_density_names() {
+        assert_eq!(
+            AutoTopologyKind::parse("mixture_k7"),
+            Ok(AutoTopologyKind::Mixture { k: 7 })
+        );
+        assert_eq!(
+            AutoTopologyKind::parse("ring_clusters_k5"),
+            Ok(AutoTopologyKind::RingOfClusters { k: 5 })
+        );
+        assert_eq!(
+            AutoTopologyKind::parse("mobius"),
+            Ok(AutoTopologyKind::Mobius)
+        );
+
+        for malformed in [
+            "mixture",
+            "mixture7",
+            "mixture_7",
+            "mixture-k7",
+            "mixture_k",
+            "mixture_k7junk",
+            "ring_clusters",
+            "ring_clusters7",
+            "ring_clusters-k7",
+            "ring_clusters_k",
+            "ring_clusters_k7junk",
+        ] {
+            assert!(
+                AutoTopologyKind::parse(malformed).is_err(),
+                "{malformed:?} must not alias a fixed candidate or adaptive class"
+            );
+        }
+    }
+
+    #[test]
+    fn predictive_candidate_names_distinguish_fixed_fits_from_adaptive_classes() {
+        assert_eq!(
+            PredictiveCandidateKind::Fixed(AutoTopologyKind::Mixture { k: 7 }).display_name(),
+            "mixture_k7"
+        );
+        assert_eq!(
+            PredictiveCandidateKind::MixtureClass.display_name(),
+            "mixture_class"
+        );
+        assert_eq!(
+            PredictiveCandidateKind::RingOfClustersClass.display_name(),
+            "ring_clusters_class"
+        );
+    }
+
+    #[test]
     fn topology_race_parallel_matches_sequential_synthetic_candidates() {
         let candidates = vec![
             SyntheticRaceCandidate { seed: 11, len: 64 },
@@ -2745,6 +2792,43 @@ mod tests {
             .insufficient_margin
             .expect("lead inside the coreset transfer margin must be flagged");
         assert!((escalation.required_margin - required).abs() < 1e-9);
+    }
+
+    #[test]
+    fn adaptive_discrete_class_race_uses_honest_predictive_stacking() {
+        let candidates = vec![
+            CrossClassCandidate {
+                kind: PredictiveCandidateKind::MixtureClass,
+                // Deliberately make evidence prefer the other class: the test
+                // must fail if this adaptive race takes the evidence shortcut.
+                negative_log_evidence: 100.0,
+                certification: EvidenceCertification::Exact,
+                density_provider: Box::new(|_, eval| Ok(vec![0.0; eval.len()])),
+            },
+            CrossClassCandidate {
+                kind: PredictiveCandidateKind::RingOfClustersClass,
+                negative_log_evidence: 0.0,
+                certification: EvidenceCertification::Exact,
+                density_provider: Box::new(|_, eval| Ok(vec![-20.0; eval.len()])),
+            },
+        ];
+        let verdict = adjudicate_cross_class_race(
+            10,
+            candidates,
+            5,
+            STACKING_CV_SEED,
+            StackingConfig::default(),
+        )
+        .expect("adaptive discrete-class race");
+
+        assert!(!verdict.is_cross_class);
+        assert_eq!(verdict.headline, Headline::Stacking);
+        assert!(verdict.stacking.is_some());
+        assert_eq!(verdict.winner_index, 0);
+        assert_eq!(
+            verdict.candidate_names,
+            ["mixture_class", "ring_clusters_class"]
+        );
     }
 
     /// #1386: the `seed` mixed into the cross-class CV folding is functional, not

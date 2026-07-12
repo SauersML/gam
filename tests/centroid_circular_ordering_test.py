@@ -86,6 +86,24 @@ class CentroidCircularOrderingTest(unittest.TestCase):
             _CO.centroid_circular_ordering(coords, 2)
         with self.assertRaises(ValueError):
             _CO.centroid_circular_ordering(coords[:, :1], 5)
+        with self.assertRaises(ValueError):
+            _CO.centroid_circular_ordering(np.full((8, 2), np.nan), 3)
+        with self.assertRaises(ValueError):
+            _CO.centroid_circular_ordering(coords, 7, n_null=0)
+        with self.assertRaises(ValueError):
+            _CO.kmeans_centroids(np.zeros((8, 2)), 2)
+
+    def test_single_cluster_is_the_mean_not_the_seed_row(self) -> None:
+        coords = np.array([[0.0, 0.0], [2.0, 4.0], [7.0, -1.0]])
+        centers = _CO.kmeans_centroids(coords, 1, seed=17)
+        np.testing.assert_allclose(centers[0], coords.mean(axis=0), atol=1.0e-15)
+
+    def test_rank_deficient_gaussian_null_needs_no_ridge(self) -> None:
+        centers = np.column_stack((np.arange(7, dtype=np.float64), np.zeros(7)))
+        observed_cv, _ = _CO.ring_stats(centers)
+        p_value = _CO.ring_mc_pvalue(centers, observed_cv, n_null=64, seed=3)
+        self.assertGreater(p_value, 0.0)
+        self.assertLessEqual(p_value, 1.0)
 
 
 if __name__ == "__main__":

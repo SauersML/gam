@@ -1831,9 +1831,8 @@ pub(crate) fn run_outer_with_plan(
                                     // score of 2.7e3, certificate refused at
                                     // its raw 4.4e-2 bound and the fit died
                                     // with RemlConvergenceError).
-                                    result.operator_stop_reason = Some(
-                                        OperatorTrustRegionStopReason::CostStallFlatValley,
-                                    );
+                                    result.operator_stop_reason =
+                                        Some(OperatorTrustRegionStopReason::CostStallFlatValley);
                                     Ok(result)
                                 }
                                 None => Err(EstimationError::RemlOptimizationFailed(format!(
