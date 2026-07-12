@@ -3,17 +3,51 @@
 //! `\eta`.
 
 use super::*;
-use gam_problem::MIN_WEIGHT;
+
+#[derive(Clone, Copy)]
+struct CertifiedBernoulliRow {
+    geometry: WorkingBernoulliGeometry,
+    jet: MixtureInverseLinkJet,
+}
 
 #[inline]
-fn stable_logit_mu(eta: f64) -> f64 {
-    if eta >= 0.0 {
-        let z = (-eta).exp();
-        1.0 / (1.0 + z)
+fn certify_bernoulli_row(
+    inverse_link: &InverseLink,
+    row: usize,
+    eta: f64,
+    y: f64,
+    prior_weight: f64,
+) -> Result<CertifiedBernoulliRow, EstimationError> {
+    if matches!(inverse_link, InverseLink::Standard(StandardLink::Logit)) {
+        let jet5 = logit_inverse_link_jet5(eta);
+        let geometry = bernoulli_logit_geometry_from_jet(row, eta, y, prior_weight, jet5)?;
+        Ok(CertifiedBernoulliRow {
+            geometry,
+            jet: MixtureInverseLinkJet {
+                mu: jet5.mu,
+                d1: jet5.d1,
+                d2: jet5.d2,
+                d3: jet5.d3,
+            },
+        })
     } else {
-        let z = eta.exp();
-        z / (1.0 + z)
+        let jet = standard_inverse_link_jet(inverse_link, eta)?;
+        let geometry = bernoulli_geometry_from_jet(row, eta, y, prior_weight, jet)?;
+        Ok(CertifiedBernoulliRow { geometry, jet })
     }
+}
+
+fn certify_bernoulli_rows(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    inverse_link: &InverseLink,
+    priorweights: ArrayView1<f64>,
+) -> Result<Vec<CertifiedBernoulliRow>, EstimationError> {
+    let rows: Vec<Result<CertifiedBernoulliRow, EstimationError>> = (0..eta.len())
+        .into_par_iter()
+        .map(|i| certify_bernoulli_row(inverse_link, i, eta[i], y[i], priorweights[i]))
+        .collect();
+    rows.into_iter().collect()
 }
 
 pub fn update_glmvectors(
@@ -27,80 +61,6 @@ pub fn update_glmvectors(
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) -> Result<(), EstimationError> {
     let link = inverse_link.link_function();
-
-    // Fast vectorized path for pure logit (most common binomial link).
-    // Avoids per-element function dispatch; structured for SIMD auto-vectorization.
-    if matches!(link, LinkFunction::Logit)
-        && inverse_link.mixture_state().is_none()
-        && inverse_link.sas_state().is_none()
-    {
-        if let Some(mut derivs) = derivatives {
-            let WorkingSlices {
-                mu: mu_s,
-                weights: weights_s,
-                z: z_s,
-            } = working_slices(mu, weights, z);
-            let WorkingDerivSlices {
-                c: c_s,
-                d: d_s,
-                dmu: dmu_s,
-                d2: d2_s,
-                d3: d3_s,
-            } = working_deriv_slices(&mut derivs);
-            mu_s.par_iter_mut()
-                .zip(weights_s.par_iter_mut())
-                .zip(z_s.par_iter_mut())
-                .zip(c_s.par_iter_mut())
-                .zip(d_s.par_iter_mut())
-                .zip(dmu_s.par_iter_mut())
-                .zip(d2_s.par_iter_mut())
-                .zip(d3_s.par_iter_mut())
-                .enumerate()
-                .for_each(
-                    |(i, (((((((mu_o, w_o), z_o), c_o), d_o), dmu_o), d2_o), d3_o))| {
-                        let eta_raw = eta[i];
-                        let eta_c = eta_raw.clamp(-ETA_CLAMP, ETA_CLAMP);
-                        let jet = logit_inverse_link_jet5(eta_c);
-                        let geom = bernoulli_logit_geometry_from_jet(
-                            eta_raw,
-                            eta_c,
-                            y[i],
-                            priorweights[i],
-                            jet,
-                            true,
-                        );
-                        *mu_o = geom.mu;
-                        *w_o = geom.weight;
-                        *z_o = geom.z;
-                        *c_o = geom.c;
-                        *d_o = geom.d;
-                        *dmu_o = jet.d1;
-                        *d2_o = jet.d2;
-                        *d3_o = jet.d3;
-                    },
-                );
-        } else {
-            let WorkingSlices {
-                mu: mu_s,
-                weights: weights_s,
-                z: z_s,
-            } = working_slices(mu, weights, z);
-            mu_s.par_iter_mut()
-                .zip(weights_s.par_iter_mut())
-                .zip(z_s.par_iter_mut())
-                .enumerate()
-                .for_each(|(i, ((mu_o, w_o), z_o))| {
-                    let eta_c = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP);
-                    let mu = stable_logit_mu(eta_c);
-                    let fisher = mu * (1.0 - mu);
-                    *mu_o = mu;
-                    *w_o = priorweights[i] * fisher;
-                    *z_o = bernoulli_exact_working_response(eta_c, y[i], mu, fisher);
-                });
-        }
-        return Ok(());
-    }
-
     match link {
         LinkFunction::Logit
         | LinkFunction::Probit
@@ -109,10 +69,7 @@ pub fn update_glmvectors(
         | LinkFunction::Cauchit
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => {
-            // On logit geometry, freeze higher η-derivatives in nonsmooth
-            // regions so PIRLS and outer derivative code differentiate the
-            // same piecewise-smooth surface.
-            let zero_on_nonsmooth = matches!(link, LinkFunction::Logit);
+            let certified = certify_bernoulli_rows(y, eta, inverse_link, priorweights)?;
             if let Some(mut derivs) = derivatives {
                 let WorkingSlices {
                     mu: mu_s,
@@ -134,53 +91,19 @@ pub fn update_glmvectors(
                     .zip(dmu_s.par_iter_mut())
                     .zip(d2_s.par_iter_mut())
                     .zip(d3_s.par_iter_mut())
-                    .enumerate()
-                    .try_for_each(
-                        |(
-                            i,
-                            (((((((mu_o, w_o), z_o), c_o), d_o), dmu_o), d2_o), d3_o),
-                        )|
-                         -> Result<(), EstimationError> {
-                            let eta_used = eta_for_observed_hessian_jet(inverse_link, eta[i]);
-                            if matches!(link, LinkFunction::Logit) {
-                                let jet = logit_inverse_link_jet5(eta_used);
-                                let geom = bernoulli_logit_geometry_from_jet(
-                                    eta[i],
-                                    eta_used,
-                                    y[i],
-                                    priorweights[i],
-                                    jet,
-                                    zero_on_nonsmooth,
-                                );
-                                *mu_o = geom.mu;
-                                *w_o = geom.weight;
-                                *z_o = geom.z;
-                                *c_o = geom.c;
-                                *d_o = geom.d;
-                                *dmu_o = jet.d1;
-                                *d2_o = jet.d2;
-                                *d3_o = jet.d3;
-                            } else {
-                                let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                                let geom = bernoulli_geometry_from_jet(
-                                    eta[i],
-                                    eta_used,
-                                    y[i],
-                                    priorweights[i],
-                                    jet,
-                                );
-                                *mu_o = geom.mu;
-                                *w_o = geom.weight;
-                                *z_o = geom.z;
-                                *c_o = geom.c;
-                                *d_o = geom.d;
-                                *dmu_o = jet.d1;
-                                *d2_o = jet.d2;
-                                *d3_o = jet.d3;
-                            }
-                            Ok(())
+                    .zip(certified.par_iter())
+                    .for_each(
+                        |((((((((mu_o, w_o), z_o), c_o), d_o), dmu_o), d2_o), d3_o), row)| {
+                            *mu_o = row.geometry.mu;
+                            *w_o = row.geometry.weight;
+                            *z_o = row.geometry.z;
+                            *c_o = row.geometry.c;
+                            *d_o = row.geometry.d;
+                            *dmu_o = row.jet.d1;
+                            *d2_o = row.jet.d2;
+                            *d3_o = row.jet.d3;
                         },
-                    )?;
+                    );
             } else {
                 let WorkingSlices {
                     mu: mu_s,
@@ -190,37 +113,12 @@ pub fn update_glmvectors(
                 mu_s.par_iter_mut()
                     .zip(weights_s.par_iter_mut())
                     .zip(z_s.par_iter_mut())
-                    .enumerate()
-                    .try_for_each(|(i, ((mu_o, w_o), z_o))| -> Result<(), EstimationError> {
-                        let eta_used = eta_for_observed_hessian_jet(inverse_link, eta[i]);
-                        if matches!(link, LinkFunction::Logit) {
-                            let jet = logit_inverse_link_jet5(eta_used);
-                            let geom = bernoulli_logit_geometry_from_jet(
-                                eta[i],
-                                eta_used,
-                                y[i],
-                                priorweights[i],
-                                jet,
-                                zero_on_nonsmooth,
-                            );
-                            *mu_o = geom.mu;
-                            *w_o = geom.weight;
-                            *z_o = geom.z;
-                        } else {
-                            let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                            let geom = bernoulli_geometry_from_jet(
-                                eta[i],
-                                eta_used,
-                                y[i],
-                                priorweights[i],
-                                jet,
-                            );
-                            *mu_o = geom.mu;
-                            *w_o = geom.weight;
-                            *z_o = geom.z;
-                        }
-                        Ok(())
-                    })?;
+                    .zip(certified.par_iter())
+                    .for_each(|(((mu_o, w_o), z_o), row)| {
+                        *mu_o = row.geometry.mu;
+                        *w_o = row.geometry.weight;
+                        *z_o = row.geometry.z;
+                    });
             }
             Ok(())
         }
@@ -229,8 +127,7 @@ pub fn update_glmvectors(
             Ok(())
         }
         LinkFunction::Log => {
-            write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives);
-            Ok(())
+            write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives)
         }
     }
 }
@@ -377,6 +274,41 @@ pub fn update_glmvectors_integrated_for_link(
             inverse_link
         );
     }
+    let certified: Vec<Result<CertifiedBernoulliRow, EstimationError>> = (0..eta.len())
+        .into_par_iter()
+        .map(|i| {
+            let jet = if let InverseLink::LatentCLogLog(state) = inverse_link {
+                crate::quadrature::latent_cloglog_inverse_link_jet(
+                    quadctx,
+                    eta[i],
+                    se[i].hypot(state.latent_sd),
+                )?
+            } else if matches!(inverse_link, InverseLink::Standard(StandardLink::Logit)) {
+                crate::quadrature::integrated_logit_inverse_link_jet_pirls(
+                    quadctx, eta[i], se[i],
+                )?
+            } else {
+                crate::quadrature::integrated_inverse_link_jetwith_state(
+                    quadctx,
+                    link,
+                    eta[i],
+                    se[i],
+                    inverse_link.mixture_state(),
+                    inverse_link.sas_state(),
+                )?
+            };
+            let jet = MixtureInverseLinkJet {
+                mu: jet.mean,
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
+            };
+            let geometry =
+                bernoulli_geometry_from_jet(i, eta[i], y[i], priorweights[i], jet)?;
+            Ok(CertifiedBernoulliRow { geometry, jet })
+        })
+        .collect();
+    let certified: Vec<CertifiedBernoulliRow> = certified.into_iter().collect::<Result<_, _>>()?;
     if let Some(mut derivs) = derivatives {
         let WorkingSlices {
             mu: mu_s,
@@ -398,55 +330,19 @@ pub fn update_glmvectors_integrated_for_link(
             .zip(dmu_s.par_iter_mut())
             .zip(d2_s.par_iter_mut())
             .zip(d3_s.par_iter_mut())
-            .enumerate()
-            .try_for_each(
-                |(i, (((((((mu_o, w_o), z_o), c_o), d_o), dmu_o), d2_o), d3_o))|
-                 -> Result<(), EstimationError> {
-                    let jet = if let InverseLink::LatentCLogLog(state) = inverse_link {
-                        crate::quadrature::latent_cloglog_inverse_link_jet(
-                            quadctx,
-                            eta[i],
-                            se[i].hypot(state.latent_sd),
-                        )?
-                    } else if matches!(inverse_link, InverseLink::Standard(StandardLink::Logit)) {
-                        crate::quadrature::integrated_logit_inverse_link_jet_pirls(
-                            quadctx, eta[i], se[i],
-                        )?
-                    } else {
-                        crate::quadrature::integrated_inverse_link_jetwith_state(
-                            quadctx,
-                            link,
-                            eta[i],
-                            se[i],
-                            inverse_link.mixture_state(),
-                            inverse_link.sas_state(),
-                        )?
-                    };
-                    let local_jet = MixtureInverseLinkJet {
-                        mu: jet.mean,
-                        d1: jet.d1,
-                        d2: jet.d2,
-                        d3: jet.d3,
-                    };
-                    let e = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP);
-                    let geom = bernoulli_geometry_from_jet(
-                        eta[i],
-                        e,
-                        y[i],
-                        priorweights[i],
-                        local_jet,
-                    );
-                    *mu_o = geom.mu;
-                    *w_o = geom.weight;
-                    *z_o = geom.z;
-                    *c_o = geom.c;
-                    *d_o = geom.d;
-                    *dmu_o = local_jet.d1;
-                    *d2_o = local_jet.d2;
-                    *d3_o = local_jet.d3;
-                    Ok(())
+            .zip(certified.par_iter())
+            .for_each(
+                |((((((((mu_o, w_o), z_o), c_o), d_o), dmu_o), d2_o), d3_o), row)| {
+                    *mu_o = row.geometry.mu;
+                    *w_o = row.geometry.weight;
+                    *z_o = row.geometry.z;
+                    *c_o = row.geometry.c;
+                    *d_o = row.geometry.d;
+                    *dmu_o = row.jet.d1;
+                    *d2_o = row.jet.d2;
+                    *d3_o = row.jet.d3;
                 },
-            )?;
+            );
     } else {
         let WorkingSlices {
             mu: mu_s,
@@ -456,41 +352,12 @@ pub fn update_glmvectors_integrated_for_link(
         mu_s.par_iter_mut()
             .zip(weights_s.par_iter_mut())
             .zip(z_s.par_iter_mut())
-            .enumerate()
-            .try_for_each(|(i, ((mu_o, w_o), z_o))| -> Result<(), EstimationError> {
-                let jet = if let InverseLink::LatentCLogLog(state) = inverse_link {
-                    crate::quadrature::latent_cloglog_inverse_link_jet(
-                        quadctx,
-                        eta[i],
-                        se[i].hypot(state.latent_sd),
-                    )?
-                } else if matches!(inverse_link, InverseLink::Standard(StandardLink::Logit)) {
-                    crate::quadrature::integrated_logit_inverse_link_jet_pirls(
-                        quadctx, eta[i], se[i],
-                    )?
-                } else {
-                    crate::quadrature::integrated_inverse_link_jetwith_state(
-                        quadctx,
-                        link,
-                        eta[i],
-                        se[i],
-                        inverse_link.mixture_state(),
-                        inverse_link.sas_state(),
-                    )?
-                };
-                let local_jet = MixtureInverseLinkJet {
-                    mu: jet.mean,
-                    d1: jet.d1,
-                    d2: jet.d2,
-                    d3: jet.d3,
-                };
-                let e = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP);
-                let geom = bernoulli_geometry_from_jet(eta[i], e, y[i], priorweights[i], local_jet);
-                *mu_o = geom.mu;
-                *w_o = geom.weight;
-                *z_o = geom.z;
-                Ok(())
-            })?;
+            .zip(certified.par_iter())
+            .for_each(|(((mu_o, w_o), z_o), row)| {
+                *mu_o = row.geometry.mu;
+                *w_o = row.geometry.weight;
+                *z_o = row.geometry.z;
+            });
     }
     Ok(())
 }
@@ -552,22 +419,19 @@ pub fn update_glmvectors_integrated_by_family(
     )
 }
 
-/// Compute first/second eta derivatives of the PIRLS working curvature W(eta),
-/// consistent with the clamped working-geometry rules used by
-/// `update_glmvectors`.
+/// Compute first/second eta derivatives of the exact PIRLS working curvature
+/// `W(eta)` on the same represented inverse-link surface as `update_glmvectors`.
 ///
 /// Math note:
-/// - In the smooth interior (no clamps/floors active), `c[i]` and `d[i]` are
-///   classical derivatives of the diagonal PIRLS curvature W_i(eta):
+/// - `c[i]` and `d[i]` are classical derivatives of the diagonal PIRLS
+///   curvature W_i(eta):
 ///     c_i = dW_i/dη_i,  d_i = d²W_i/dη_i².
 /// - For canonical GLM families, these are the per-observation carriers of
 ///   higher likelihood derivatives (`-ℓ'''(η_i)` and `-ℓ''''(η_i)`) expressed
 ///   through the working-curvature map W(η).
 /// - They are load-bearing in exact outer derivatives:
 ///   `c` enters dH/dρ (outer gradient), and `d` enters d²H/dρ² (outer Hessian).
-/// - When hard clamps activate, the update map is piecewise and no longer C².
-///   Setting c_i=d_i=0 is a practical subgradient-like choice to avoid unstable
-///   explosive derivatives at the kink.
+/// Any row for which the exact carriers are not representable is refused.
 pub(crate) fn computeworkingweight_derivatives_from_eta(
     likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
@@ -601,10 +465,7 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
                         c_ratio: 1.0,
                         d_ratio: 1.0,
                     },
-                    floor_weight: true,
-                    zero_mu_jet_on_clamp: false,
                 },
-                inverse_link,
                 eta,
                 priorweights,
                 WorkingDerivativeBuffersMut {
@@ -639,10 +500,7 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
                         c_ratio: exponent,
                         d_ratio: exponent * exponent,
                     },
-                    floor_weight: true,
-                    zero_mu_jet_on_clamp: true,
                 },
-                inverse_link,
                 eta,
                 priorweights,
                 WorkingDerivativeBuffersMut {
@@ -666,10 +524,7 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
                 &log_link_working_state::LogLinkRule {
                     weight: log_link_working_state::WorkingWeight::NegativeBinomial { theta },
                     curvature: log_link_working_state::WorkingCurvature::NegativeBinomial { theta },
-                    floor_weight: true,
-                    zero_mu_jet_on_clamp: false,
                 },
-                inverse_link,
                 eta,
                 priorweights,
                 WorkingDerivativeBuffersMut {
@@ -747,10 +602,7 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
                         c_ratio: 0.0,
                         d_ratio: 0.0,
                     },
-                    floor_weight: false,
-                    zero_mu_jet_on_clamp: false,
                 },
-                inverse_link,
                 eta,
                 priorweights,
                 WorkingDerivativeBuffersMut {

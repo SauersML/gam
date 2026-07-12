@@ -433,9 +433,23 @@ pub(crate) fn mobius_double_cover_coords_from_projection(
         ));
     }
     let gamma = 0.5 * chosen.1.atan2(chosen.0);
+    let pi = std::f64::consts::PI;
+    let two_pi = std::f64::consts::TAU;
+    // Continuous fundamental-domain coordinate `s in [0, 1)`. The deck twin
+    // `(s + 1, -w)` is glued only at the seam `s -> 1`, so WITHIN one domain
+    // the signed width must not change sign. The half-angle that unwinds the
+    // band must therefore be built from this continuous `s` (`half = pi * s`),
+    // NOT from the raw `atan2` angle: `atan2`'s branch cut lands in the middle
+    // of the domain (at `s = 1/2`), and a half-angle taken from it flips sign
+    // there, corrupting the recovered width to (s, -w) — a different physical
+    // point on the band — across half the loop.
+    let mut fundamental_s = Array1::<f64>::zeros(n);
     let mut signed_width = Array1::<f64>::zeros(n);
     for row in 0..n {
-        let half_angle = 0.5 * orientation * angle[row] + gamma;
+        let raw = orientation * angle[row] / two_pi;
+        let s = raw - raw.floor();
+        fundamental_s[row] = s;
+        let half_angle = pi * s + gamma;
         signed_width[row] = radial[row] * half_angle.cos() + transverse[row] * half_angle.sin();
     }
     let width_sd = (cluster_rows
@@ -452,8 +466,7 @@ pub(crate) fn mobius_double_cover_coords_from_projection(
 
     let mut coords = Array2::<f64>::zeros((n, 2));
     for row in 0..n {
-        let phase = orientation * angle[row] / std::f64::consts::TAU;
-        coords[[row, 0]] = phase - phase.floor();
+        coords[[row, 0]] = fundamental_s[row];
         coords[[row, 1]] = (signed_width[row] / (2.0 * width_sd)).clamp(-1.0, 1.0);
     }
     Ok(coords)

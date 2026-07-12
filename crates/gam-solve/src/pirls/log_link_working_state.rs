@@ -12,7 +12,10 @@
 use super::{WorkingDerivativeBuffersMut, working_deriv_slices, working_slices};
 use crate::estimate::EstimationError;
 use ndarray::{Array1, ArrayView1};
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+    IntoParallelRefMutIterator, ParallelIterator,
+};
 
 /// Family-specific Fisher working weight, before multiplication by the row's
 /// prior weight.
@@ -47,6 +50,12 @@ struct ExactLogLinkRow {
     weight: f64,
     c: f64,
     d: f64,
+}
+
+#[derive(Clone, Copy)]
+struct ExactLogLinkWorkingRow {
+    geometry: ExactLogLinkRow,
+    z: f64,
 }
 
 #[inline]
@@ -173,6 +182,41 @@ fn exact_working_response(
     }
 }
 
+fn certify_working_rows(
+    rule: &LogLinkRule,
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<f64>,
+) -> Result<Vec<ExactLogLinkWorkingRow>, EstimationError> {
+    let rows: Vec<Result<ExactLogLinkWorkingRow, EstimationError>> = (0..eta.len())
+        .into_par_iter()
+        .map(|i| {
+            let geometry = exact_log_link_row(rule, i, eta[i], priorweights[i])?;
+            let z = if geometry.weight == 0.0 {
+                eta[i]
+            } else {
+                exact_working_response(i, eta[i], y[i], geometry.mu)?
+            };
+            Ok(ExactLogLinkWorkingRow { geometry, z })
+        })
+        .collect();
+    // Scan in row order so multiple bad rows always report the smallest index.
+    // Output buffers remain untouched unless the entire batch is certified.
+    rows.into_iter().collect()
+}
+
+fn certify_curvature_rows(
+    rule: &LogLinkRule,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<f64>,
+) -> Result<Vec<ExactLogLinkRow>, EstimationError> {
+    let rows: Vec<Result<ExactLogLinkRow, EstimationError>> = (0..eta.len())
+        .into_par_iter()
+        .map(|i| exact_log_link_row(rule, i, eta[i], priorweights[i]))
+        .collect();
+    rows.into_iter().collect()
+}
+
 /// Write exact log-link `mu`, Fisher weights, working responses, and optional
 /// derivative carriers for every row.
 pub(super) fn write_log_link_working_state(
@@ -185,6 +229,7 @@ pub(super) fn write_log_link_working_state(
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) -> Result<(), EstimationError> {
+    let rows = certify_working_rows(rule, y, eta, priorweights)?;
     if let Some(mut derivs) = derivatives {
         let slices = working_slices(mu, weights, z);
         let deriv_slices = working_deriv_slices(&mut derivs);
@@ -198,26 +243,20 @@ pub(super) fn write_log_link_working_state(
             .zip(deriv_slices.d3.par_iter_mut())
             .zip(deriv_slices.c.par_iter_mut())
             .zip(deriv_slices.d.par_iter_mut())
-            .enumerate()
-            .try_for_each(
-                |(i, (((((((mu_o, w_o), z_o), dmu_o), d2_o), d3_o), c_o), d_o))| {
-                    let row = exact_log_link_row(rule, i, eta[i], priorweights[i])?;
-                    let z_i = if row.weight == 0.0 {
-                        eta[i]
-                    } else {
-                        exact_working_response(i, eta[i], y[i], row.mu)?
-                    };
-                    *mu_o = row.mu;
-                    *w_o = row.weight;
-                    *z_o = z_i;
-                    *dmu_o = row.mu;
-                    *d2_o = row.mu;
-                    *d3_o = row.mu;
-                    *c_o = row.c;
-                    *d_o = row.d;
-                    Ok(())
+            .zip(rows.par_iter())
+            .for_each(
+                |((((((((mu_o, w_o), z_o), dmu_o), d2_o), d3_o), c_o), d_o), row)| {
+                    *mu_o = row.geometry.mu;
+                    *w_o = row.geometry.weight;
+                    *z_o = row.z;
+                    *dmu_o = row.geometry.mu;
+                    *d2_o = row.geometry.mu;
+                    *d3_o = row.geometry.mu;
+                    *c_o = row.geometry.c;
+                    *d_o = row.geometry.d;
                 },
-            )
+            );
+        Ok(())
     } else {
         let slices = working_slices(mu, weights, z);
         slices
@@ -225,19 +264,13 @@ pub(super) fn write_log_link_working_state(
             .par_iter_mut()
             .zip(slices.weights.par_iter_mut())
             .zip(slices.z.par_iter_mut())
-            .enumerate()
-            .try_for_each(|(i, ((mu_o, w_o), z_o))| {
-                let row = exact_log_link_row(rule, i, eta[i], priorweights[i])?;
-                let z_i = if row.weight == 0.0 {
-                    eta[i]
-                } else {
-                    exact_working_response(i, eta[i], y[i], row.mu)?
-                };
-                *mu_o = row.mu;
-                *w_o = row.weight;
-                *z_o = z_i;
-                Ok(())
-            })
+            .zip(rows.par_iter())
+            .for_each(|(((mu_o, w_o), z_o), row)| {
+                *mu_o = row.geometry.mu;
+                *w_o = row.geometry.weight;
+                *z_o = row.z;
+            });
+        Ok(())
     }
 }
 
@@ -249,6 +282,7 @@ pub(super) fn write_log_link_eta_curvature(
     priorweights: ArrayView1<f64>,
     mut buffers: WorkingDerivativeBuffersMut<'_>,
 ) -> Result<(), EstimationError> {
+    let rows = certify_curvature_rows(rule, eta, priorweights)?;
     let slices = working_deriv_slices(&mut buffers);
     slices
         .c
@@ -257,14 +291,13 @@ pub(super) fn write_log_link_eta_curvature(
         .zip(slices.dmu.par_iter_mut())
         .zip(slices.d2.par_iter_mut())
         .zip(slices.d3.par_iter_mut())
-        .enumerate()
-        .try_for_each(|(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| {
-            let row = exact_log_link_row(rule, i, eta[i], priorweights[i])?;
+        .zip(rows.par_iter())
+        .for_each(|(((((c_o, d_o), dmu_o), d2_o), d3_o), row)| {
             *c_o = row.c;
             *d_o = row.d;
             *dmu_o = row.mu;
             *d2_o = row.mu;
             *d3_o = row.mu;
-            Ok(())
-        })
+        });
+    Ok(())
 }

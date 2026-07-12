@@ -28,9 +28,17 @@ pub(crate) fn bernoulli_logit_geometry_from_jet(
             value: priorweight,
         });
     }
+    if !eta.is_finite() {
+        return Err(EstimationError::InverseLinkDomainViolation {
+            link: "standard logit inverse link",
+            eta,
+            lower: -f64::MAX,
+            upper: f64::MAX,
+        });
+    }
     if !(jet.mu.is_finite()
-        && jet.mu > 0.0
-        && jet.mu < 1.0
+        && jet.mu >= 0.0
+        && jet.mu <= 1.0
         && jet.d1.is_finite()
         && jet.d1 > 0.0
         && jet.d2.is_finite()
@@ -48,7 +56,7 @@ pub(crate) fn bernoulli_logit_geometry_from_jet(
         (0.0, eta, 0.0, 0.0)
     } else {
         let weight = priorweight * fisher;
-        let z = bernoulli_exact_working_response(row, eta, y, jet.mu, jet.d1)?;
+        let z = canonical_logit_working_response(row, eta, y, jet.d1)?;
         let c = priorweight * jet.d2;
         let d = priorweight * jet.d3;
         for (quantity, value) in [
@@ -74,6 +82,50 @@ pub(crate) fn bernoulli_logit_geometry_from_jet(
         c,
         d,
     })
+}
+
+/// Canonical-logit working response evaluated from a stable tail complement.
+/// `mu` may round to exactly zero or one while `exp(-|eta|)` and the score
+/// remain representable; reconstructing `y-mu` from that complement keeps the
+/// exact canonical score surface alive through the declared solver tail.
+#[inline]
+fn canonical_logit_working_response(
+    row: usize,
+    eta: f64,
+    y: f64,
+    dmu_deta: f64,
+) -> Result<f64, EstimationError> {
+    if !(y.is_finite() && (0.0..=1.0).contains(&y)) {
+        return Err(unrepresentable_bernoulli(
+            row,
+            "binomial response",
+            eta,
+            y,
+        ));
+    }
+    let tail = (-eta.abs()).exp();
+    let residual = if eta >= 0.0 {
+        let one_minus_mu = tail / (1.0 + tail);
+        if y == 1.0 {
+            one_minus_mu
+        } else {
+            (y - 1.0) + one_minus_mu
+        }
+    } else {
+        let mu = tail / (1.0 + tail);
+        y - mu
+    };
+    let z = eta + residual / dmu_deta;
+    if z.is_finite() {
+        Ok(z)
+    } else {
+        Err(unrepresentable_bernoulli(
+            row,
+            "canonical-logit working response",
+            eta,
+            z,
+        ))
+    }
 }
 
 #[inline]
@@ -432,14 +484,13 @@ pub(crate) fn polygamma3(mut x: f64) -> f64 {
 pub(crate) fn beta_logit_working_curvature_eta_derivatives(
     prior_weight: f64,
     phi: f64,
-    mu: f64,
     q: f64,
+    q_prime: f64,
+    q_double_prime: f64,
     a: f64,
     b: f64,
     trigamma_sum: f64,
 ) -> (f64, f64) {
-    let q_prime = q * (1.0 - 2.0 * mu);
-    let q_double_prime = q * (1.0 - 2.0 * mu) * (1.0 - 2.0 * mu) - 2.0 * q * q;
     let psi2_diff = polygamma2(a) - polygamma2(b);
     let psi3_sum = polygamma3(a) + polygamma3(b);
     let phi_sq = phi * phi;
@@ -451,6 +502,149 @@ pub(crate) fn beta_logit_working_curvature_eta_derivatives(
             + 4.0 * q * q_prime * phi * q * psi2_diff
             + q_sq * (phi * q_prime * psi2_diff + phi_sq * q_sq * psi3_sum));
     (c, d)
+}
+
+#[derive(Clone, Copy)]
+struct ExactBetaLogitRow {
+    mu: f64,
+    weight: f64,
+    z: f64,
+    c: f64,
+    d: f64,
+    dmu: f64,
+    d2mu: f64,
+    d3mu: f64,
+}
+
+#[inline]
+fn exact_beta_logit_row(
+    row: usize,
+    eta: f64,
+    y: Option<f64>,
+    prior_weight: f64,
+    phi: f64,
+) -> Result<ExactBetaLogitRow, EstimationError> {
+    if !(prior_weight.is_finite() && prior_weight >= 0.0) {
+        return Err(unrepresentable_bernoulli(
+            row,
+            "prior weight",
+            eta,
+            prior_weight,
+        ));
+    }
+    if !eta.is_finite() {
+        return Err(EstimationError::InverseLinkDomainViolation {
+            link: "standard logit inverse link",
+            eta,
+            lower: -f64::MAX,
+            upper: f64::MAX,
+        });
+    }
+    let jet = logit_inverse_link_jet5(eta);
+    if !(jet.mu.is_finite()
+        && jet.mu > 0.0
+        && jet.mu < 1.0
+        && jet.d1.is_finite()
+        && jet.d1 > 0.0
+        && jet.d2.is_finite()
+        && jet.d3.is_finite())
+    {
+        return Err(unrepresentable_bernoulli(
+            row,
+            "beta-logit inverse-link jet",
+            eta,
+            jet.mu,
+        ));
+    }
+    if prior_weight == 0.0 {
+        return Ok(ExactBetaLogitRow {
+            mu: jet.mu,
+            weight: 0.0,
+            z: eta,
+            c: 0.0,
+            d: 0.0,
+            dmu: jet.d1,
+            d2mu: jet.d2,
+            d3mu: jet.d3,
+        });
+    }
+
+    let mu = jet.mu;
+    let q = jet.d1;
+    let a = mu * phi;
+    let b = (1.0 - mu) * phi;
+    if !(a.is_finite() && a > 0.0) {
+        return Err(unrepresentable_bernoulli(row, "beta shape a", eta, a));
+    }
+    if !(b.is_finite() && b > 0.0) {
+        return Err(unrepresentable_bernoulli(row, "beta shape b", eta, b));
+    }
+    let trigamma_sum = trigamma(a) + trigamma(b);
+    let info_mu = phi * phi * trigamma_sum;
+    if !(info_mu.is_finite() && info_mu > 0.0) {
+        return Err(unrepresentable_bernoulli(
+            row,
+            "beta mean information",
+            eta,
+            info_mu,
+        ));
+    }
+    let weight = prior_weight * q * q * info_mu;
+    if !(weight.is_finite() && weight > 0.0) {
+        return Err(unrepresentable_bernoulli(
+            row,
+            "beta Fisher weight",
+            eta,
+            weight,
+        ));
+    }
+    let z = if let Some(y) = y {
+        let score_mu = phi * (digamma(b) - digamma(a) + y.ln() - (1.0 - y).ln());
+        let score_eta_denominator = q * info_mu;
+        let z = eta + score_mu / score_eta_denominator;
+        if !z.is_finite() {
+            return Err(unrepresentable_bernoulli(
+                row,
+                "beta working response",
+                eta,
+                z,
+            ));
+        }
+        z
+    } else {
+        eta
+    };
+    let (c, d) = beta_logit_working_curvature_eta_derivatives(
+        prior_weight,
+        phi,
+        q,
+        jet.d2,
+        jet.d3,
+        a,
+        b,
+        trigamma_sum,
+    );
+    if !c.is_finite() {
+        return Err(unrepresentable_bernoulli(row, "beta dW/deta", eta, c));
+    }
+    if !d.is_finite() {
+        return Err(unrepresentable_bernoulli(
+            row,
+            "beta d2W/deta2",
+            eta,
+            d,
+        ));
+    }
+    Ok(ExactBetaLogitRow {
+        mu,
+        weight,
+        z,
+        c,
+        d,
+        dmu: jet.d1,
+        d2mu: jet.d2,
+        d3mu: jet.d3,
+    })
 }
 
 /// Working state for Tweedie with a log link.
@@ -557,6 +751,11 @@ pub(crate) fn write_beta_logit_working_state(
         crate::bail_invalid_estim!("beta-regression phi must be finite and > 0; got {phi}");
     }
     validate_beta_responses(&y, &priorweights)?;
+    let certified: Vec<Result<ExactBetaLogitRow, EstimationError>> = (0..eta.len())
+        .into_par_iter()
+        .map(|i| exact_beta_logit_row(i, eta[i], Some(y[i]), priorweights[i], phi))
+        .collect();
+    let certified: Vec<ExactBetaLogitRow> = certified.into_iter().collect::<Result<_, _>>()?;
     if let Some(mut derivs) = derivatives {
         let WorkingSlices {
             mu: mu_s,
@@ -578,49 +777,17 @@ pub(crate) fn write_beta_logit_working_state(
             .zip(d3_s.par_iter_mut())
             .zip(c_s.par_iter_mut())
             .zip(d_s.par_iter_mut())
-            .enumerate()
+            .zip(certified.par_iter())
             .for_each(
-                |(i, (((((((mu_o, w_o), z_o), dmu_o), d2_o), d3_o), c_o), d_o))| {
-                    let eta_raw = eta[i];
-                    let eta_i = eta_raw.clamp(-ETA_CLAMP, ETA_CLAMP);
-                    let jet = logit_inverse_link_jet5(eta_i);
-                    let mu_i = safe_beta_mu(jet.mu);
-                    let q = (mu_i * (1.0 - mu_i)).max(BETA_MU_EPS);
-                    let yi = y[i];
-                    let a = (mu_i * phi).max(BETA_MU_EPS);
-                    let b = ((1.0 - mu_i) * phi).max(BETA_MU_EPS);
-                    let score_mu = phi * (digamma(b) - digamma(a) + yi.ln() - (1.0 - yi).ln());
-                    let trigamma_sum = trigamma(a) + trigamma(b);
-                    let info_mu = phi * phi * trigamma_sum;
-                    let prior_weight = priorweights[i].max(0.0);
-                    let raw_weight = prior_weight * q * q * info_mu;
-                    let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
-                    *mu_o = mu_i;
-                    *w_o = if raw_weight > 0.0 {
-                        raw_weight.max(MIN_WEIGHT)
-                    } else {
-                        0.0
-                    };
-                    *z_o = eta_i + score_mu / (q * info_mu).max(MIN_WEIGHT);
-                    *dmu_o = q;
-                    *d2_o = q * (1.0 - 2.0 * mu_i);
-                    *d3_o = q * (1.0 - 6.0 * q);
-                    if floor_active || eta_raw != eta_i {
-                        *c_o = 0.0;
-                        *d_o = 0.0;
-                    } else {
-                        let (c_i, d_i) = beta_logit_working_curvature_eta_derivatives(
-                            prior_weight,
-                            phi,
-                            mu_i,
-                            q,
-                            a,
-                            b,
-                            trigamma_sum,
-                        );
-                        *c_o = c_i;
-                        *d_o = d_i;
-                    }
+                |((((((((mu_o, w_o), z_o), dmu_o), d2_o), d3_o), c_o), d_o), state)| {
+                    *mu_o = state.mu;
+                    *w_o = state.weight;
+                    *z_o = state.z;
+                    *dmu_o = state.dmu;
+                    *d2_o = state.d2mu;
+                    *d3_o = state.d3mu;
+                    *c_o = state.c;
+                    *d_o = state.d;
                 },
             );
     } else {
@@ -632,25 +799,11 @@ pub(crate) fn write_beta_logit_working_state(
         mu_s.par_iter_mut()
             .zip(weights_s.par_iter_mut())
             .zip(z_s.par_iter_mut())
-            .enumerate()
-            .for_each(|(i, ((mu_o, w_o), z_o))| {
-                let eta_i = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP);
-                let jet = logit_inverse_link_jet5(eta_i);
-                let mu_i = safe_beta_mu(jet.mu);
-                let q = (mu_i * (1.0 - mu_i)).max(BETA_MU_EPS);
-                let yi = y[i];
-                let a = (mu_i * phi).max(BETA_MU_EPS);
-                let b = ((1.0 - mu_i) * phi).max(BETA_MU_EPS);
-                let score_mu = phi * (digamma(b) - digamma(a) + yi.ln() - (1.0 - yi).ln());
-                let info_mu = phi * phi * (trigamma(a) + trigamma(b));
-                let raw_weight = priorweights[i].max(0.0) * q * q * info_mu;
-                *mu_o = mu_i;
-                *w_o = if raw_weight > 0.0 {
-                    raw_weight.max(MIN_WEIGHT)
-                } else {
-                    0.0
-                };
-                *z_o = eta_i + score_mu / (q * info_mu).max(MIN_WEIGHT);
+            .zip(certified.par_iter())
+            .for_each(|(((mu_o, w_o), z_o), state)| {
+                *mu_o = state.mu;
+                *w_o = state.weight;
+                *z_o = state.z;
             });
     }
     Ok(())
