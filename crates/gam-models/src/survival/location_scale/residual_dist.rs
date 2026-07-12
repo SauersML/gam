@@ -1,5 +1,5 @@
 use super::*;
-use gam_math::probability::{normal_cdf, normal_logcdf_derivatives};
+use gam_math::probability::{normal_cdf, normal_logcdf_derivatives, normal_pdf};
 
 // Layer 2 defense (canonical implementation lives beside the σ-link in
 // `gam_model_kernels::sigma_link` so the fit engine and the prediction
