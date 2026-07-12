@@ -15,7 +15,7 @@ pub(crate) fn build_model_summary(
     family: LikelihoodSpec,
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
-) -> ModelSummary {
+) -> Result<ModelSummary, String> {
     const CONTINUOUS_ORDER_EPS: f64 = 1e-12;
     let se = fit
         .beta_standard_errors_corrected()
@@ -40,92 +40,35 @@ pub(crate) fn build_model_summary(
     };
     let whitening_gram_full: Option<&Array2<f64>> = fit.weighted_gram().or(design_gram.as_ref());
     let scale_is_estimated = matches!(
-        family.response,
-        ResponseFamily::Gaussian | ResponseFamily::Gamma
+        fit.likelihood_scale,
+        LikelihoodScaleMetadata::ProfiledGaussian
+            | LikelihoodScaleMetadata::EstimatedGammaShape { .. }
     );
-    let residual_df = (y.len() as f64 - fit.edf_total().unwrap_or(fit.beta.len() as f64)).max(1.0);
+    let residual_df = fit.edf_total().and_then(|edf| {
+        let value = y.len() as f64 - edf;
+        (edf.is_finite() && value.is_finite() && value > 0.0).then_some(value)
+    });
     let two_sided_parametric_p = |z: f64| -> Option<f64> {
         if !z.is_finite() {
             return None;
         }
         if scale_is_estimated {
-            let dist = StudentsT::new(0.0, 1.0, residual_df).ok()?;
+            let dist = StudentsT::new(0.0, 1.0, residual_df?).ok()?;
             Some((2.0 * (1.0 - dist.cdf(z.abs()))).clamp(0.0, 1.0))
         } else {
             Some((2.0 * (1.0 - normal_cdf(z.abs()))).clamp(0.0, 1.0))
         }
     };
 
-    let nullmu = match family.response {
-        ResponseFamily::Gaussian => {
-            let wsum = weights.iter().copied().sum::<f64>().max(1e-12);
-            let ybar = y
-                .iter()
-                .zip(weights.iter())
-                .map(|(&yy, &ww)| yy * ww)
-                .sum::<f64>()
-                / wsum;
-            Array1::from_elem(y.len(), ybar)
-        }
-        ResponseFamily::Binomial => {
-            let wsum = weights.iter().copied().sum::<f64>().max(1e-12);
-            let p = y
-                .iter()
-                .zip(weights.iter())
-                .map(|(&yy, &ww)| yy * ww)
-                .sum::<f64>()
-                / wsum;
-            Array1::from_elem(y.len(), p)
-        }
-        ResponseFamily::RoystonParmar => Array1::from_elem(y.len(), 0.0),
-        ResponseFamily::Poisson
-        | ResponseFamily::Tweedie { .. }
-        | ResponseFamily::NegativeBinomial { .. }
-        | ResponseFamily::Beta { .. }
-        | ResponseFamily::Gamma => {
-            let wsum = weights.iter().copied().sum::<f64>().max(1e-12);
-            let mean = y
-                .iter()
-                .zip(weights.iter())
-                .map(|(&yy, &ww)| yy * ww)
-                .sum::<f64>()
-                / wsum;
-            let baseline = match family.response {
-                ResponseFamily::Poisson => mean.max(0.0),
-                ResponseFamily::Beta { .. } => {
-                    mean.clamp(gam::pirls::BETA_MU_EPS, 1.0 - gam::pirls::BETA_MU_EPS)
-                }
-                _ => mean.max(1e-12),
-            };
-            Array1::from_elem(y.len(), baseline)
-        }
+    let null_likelihood = gam::types::GlmLikelihoodSpec {
+        spec: family.clone(),
+        scale: fit.likelihood_scale,
     };
-    let null_dev = {
-        let null_likelihood = if family.is_royston_parmar() {
-            gam::types::GlmLikelihoodSpec::canonical(gam::types::LikelihoodSpec::new(
-                gam::types::ResponseFamily::Gaussian,
-                gam::types::InverseLink::Standard(gam::types::StandardLink::Identity),
-            ))
-        } else {
-            // Use the fit's *estimated* scale metadata, not the family default.
-            // For Gamma the unit deviance is multiplied by the estimated shape
-            // (calculate_deviance, deviance.rs), and `fit.deviance` already
-            // carries that estimated shape (PIRLS bakes it in via
-            // `with_gamma_shape`). `canonical(family)` would reset the shape to
-            // the default 1.0, so the null deviance would be scaled differently
-            // from the full deviance and the ratio `1 − D_full/D_null` would be
-            // contaminated by the shape factor. Threading the fitted scale here
-            // keeps both deviances on the same scale so it cancels exactly (the
-            // same applies to any other scale-carrying family, e.g. Beta φ).
-            gam::types::GlmLikelihoodSpec {
-                spec: family.clone(),
-                scale: fit.likelihood_scale,
-            }
-        };
-        gam::pirls::calculate_deviance(y, &nullmu, &null_likelihood, weights)
-    };
+    let null_dev = gam::pirls::calculate_null_deviance(y, &null_likelihood, weights)
+        .map_err(|error| format!("null-model deviance evaluation failed: {error}"))?;
     let deviance_explained = if null_dev.is_finite() && null_dev > 0.0 {
-        Some((1.0 - fit.deviance / null_dev).clamp(-9.0, 1.0))
+        let value = 1.0 - fit.deviance / null_dev;
+        value.is_finite().then_some(value)
     } else {
         None
     };
@@ -367,13 +310,13 @@ pub(crate) fn build_model_summary(
         });
     }
 
-    ModelSummary {
+    Ok(ModelSummary {
         family: family.pretty_name().to_string(),
         deviance_explained,
         reml_score: Some(fit.reml_score),
         parametric_terms,
         smooth_terms,
-    }
+    })
 }
 
 pub(crate) fn covariance_from_model(

@@ -3728,7 +3728,7 @@ fn cauchit_natural_jet(eta: f64) -> BernoulliNaturalJet {
         let inv = eta.recip();
         inv * inv / (1.0 + inv * inv)
     };
-    let d3_over_d1 = (6.0 * (eta * ratio) - 2.0) * inv_one_plus_sq;
+    let d3_over_d1 = inv_one_plus_sq * (6.0 * (eta * ratio) - 2.0 * inv_one_plus_sq);
     let d1_over_mu = (log_d1 - mu.ln()).exp();
     let d1_over_q = (log_d1 - one_minus_mu.ln()).exp();
     let left_d2_ratio = d2_over_d1 * d1_over_mu;
@@ -6211,60 +6211,20 @@ fn exact_bounded_edf(
     Ok((edf_by_block, penalty_block_trace, edf_total))
 }
 
-/// Symmetric posterior-precision inverse for the bounded-coefficient path.
-///
-/// The penalised Hessian at a strict posterior maximum is SPD, so its inverse
-/// is the posterior covariance. We eigendecompose the symmetric precision and
-/// invert the positive-eigenvalue subspace, projecting out the (rare)
-/// structural null directions a penalised model leaves flat rather than
-/// δ-ridging them — the same honest pseudo-inverse contract the strict
-/// pseudo-Laplace covariance uses (gam#748). A genuinely indefinite precision
-/// (a negative eigenvalue beyond rounding) means the reported mode is not a
-/// posterior maximum and is surfaced as a fit-quality error rather than
-/// masked.
-fn symmetric_positive_definite_inverse_or_pseudo(
+/// Certified, unperturbed posterior-precision inverse for a bounded fit.
+/// A reported covariance exists only at a strict posterior maximum, hence the
+/// precision must be SPD. Singular and indefinite modes are refused; projecting
+/// them into a pseudo-covariance would silently report zero uncertainty in an
+/// unidentified direction.
+fn certified_bounded_posterior_covariance(
     precision: &Array2<f64>,
+    label: &'static str,
 ) -> Result<Array2<f64>, EstimationError> {
-    use gam_linalg::faer_ndarray::FaerEigh;
-    let p = precision.nrows();
-    if precision.ncols() != p {
-        crate::bail_invalid_estim!(
-            "posterior precision inverse requires a square matrix, got {}x{}",
-            precision.nrows(),
-            precision.ncols()
-        );
-    }
-    if p == 0 {
-        return Ok(Array2::<f64>::zeros((0, 0)));
-    }
-    let symmetric = (precision + &precision.t().to_owned()) * 0.5;
-    let (evals, evecs) = symmetric.eigh(faer::Side::Lower).map_err(|e| {
+    gam_linalg::utils::certified_spd_inverse(precision, label).map_err(|error| {
         EstimationError::InvalidInput(format!(
-            "posterior precision eigendecomposition failed: {e}"
+            "bounded posterior covariance requires an exact SPD precision: {error}"
         ))
-    })?;
-    let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-    let tol =
-        (10.0 * f64::EPSILON * (p as f64) * (p as f64) * max_abs_eval).max(100.0 * f64::EPSILON);
-    if let Some(&min_eval) = evals
-        .iter()
-        .filter(|&&ev| ev < -tol)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-    {
-        crate::bail_invalid_estim!(
-            "bounded posterior precision is non-PD at the converged optimum (min eigenvalue \
-             {min_eval:.6e} < -tol={tol:.6e}); the reported mode is not a strict posterior \
-             maximum, so a covariance would be meaningless"
-        );
-    }
-    // Σ = U diag(1/λ_+) Uᵀ over the positive-eigenvalue subspace.
-    let mut scaled = evecs.clone();
-    for (j, &ev) in evals.iter().enumerate() {
-        let inv = if ev > tol { 1.0 / ev } else { 0.0 };
-        scaled.column_mut(j).mapv_inplace(|v| v * inv);
-    }
-    let cov = scaled.dot(&evecs.t());
-    Ok((&cov + &cov.t().to_owned()) * 0.5)
+    })
 }
 
 fn transform_bounded_latent_precision_to_user_internal(
@@ -6514,13 +6474,13 @@ fn fit_bounded_term_collection_with_design(
     // carries no smoothing parameters — the no-rho fit path — leaving a bounded
     // fit with a populated precision but no user-scale covariance, the gam#854
     // symptom). The latent precision is SPD at a strict posterior maximum; on a
-    // marginally-indefinite boundary Hessian we invert the positive-eigenvalue
-    // subspace (the structural null space of a penalised model is a flat
-    // posterior direction, not something to ridge away), matching the
-    // strict-pseudo-Laplace covariance contract (gam#748).
+    // singular or indefinite boundary Hessian no finite posterior covariance
+    // exists, so inference is refused rather than projected onto a
+    // pseudo-covariance.
     let beta_covariance_unscaled = if options.compute_inference {
-        Some(symmetric_positive_definite_inverse_or_pseudo(
+        Some(certified_bounded_posterior_covariance(
             &penalized_hessian,
+            "bounded user-scale posterior precision",
         )?)
     } else {
         None
@@ -6531,8 +6491,9 @@ fn fit_bounded_term_collection_with_design(
     // user-scale one. Invert the same latent precision that produced the
     // reported user precision so the two are an exact transform pair.
     let latent_cov = if options.compute_inference {
-        Some(symmetric_positive_definite_inverse_or_pseudo(
+        Some(certified_bounded_posterior_covariance(
             &latent_precision,
+            "bounded latent posterior precision",
         )?)
     } else {
         None
@@ -7808,6 +7769,35 @@ mod glm_eta_observation_fd_tests {
     }
 
     #[test]
+    fn binomial_natural_coordinate_towers_match_finite_differences() {
+        for (label, family, eta) in [
+            ("logit", LikelihoodSpec::binomial_logit(), 0.7),
+            ("probit", LikelihoodSpec::binomial_probit(), -1.1),
+            ("cloglog", LikelihoodSpec::binomial_cloglog(), 0.4),
+            (
+                "loglog",
+                LikelihoodSpec::try_new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(StandardLink::LogLog),
+                )
+                .unwrap(),
+                -0.35,
+            ),
+            (
+                "cauchit",
+                LikelihoodSpec::try_new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(StandardLink::Cauchit),
+                )
+                .unwrap(),
+                1.25,
+            ),
+        ] {
+            check_fd(label, &family, 0.37, eta);
+        }
+    }
+
+    #[test]
     fn logit_observation_geometry_carries_the_prior_weight_everywhere() {
         let eta = 1.75;
         let y = 0.3;
@@ -7894,5 +7884,31 @@ mod glm_eta_observation_fd_tests {
         )
         .expect_err("mathematically sub-f64 Fisher information must be refused");
         assert!(err.to_string().contains("Fisher weight"), "{err}");
+    }
+
+    #[test]
+    fn bounded_covariance_requires_a_certified_strict_spd_precision() {
+        let covariance = certified_bounded_posterior_covariance(
+            &array![[4.0, 1.0], [1.0, 3.0]],
+            "bounded covariance regression",
+        )
+        .expect("strict SPD precision");
+        assert!((covariance[[0, 0]] - 3.0 / 11.0).abs() < 1e-14);
+        assert!((covariance[[0, 1]] + 1.0 / 11.0).abs() < 1e-14);
+        assert!((covariance[[1, 1]] - 4.0 / 11.0).abs() < 1e-14);
+
+        for invalid in [
+            array![[1.0, 1.0], [1.0, 1.0]],
+            array![[1.0, 2.0], [2.0, 1.0]],
+        ] {
+            assert!(
+                certified_bounded_posterior_covariance(
+                    &invalid,
+                    "invalid bounded covariance regression"
+                )
+                .is_err(),
+                "singular/indefinite precision must not become a pseudo-covariance"
+            );
+        }
     }
 }

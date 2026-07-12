@@ -1095,7 +1095,7 @@ pub(crate) fn deviance_eta_rows_with_log_measure_scale(
     rows.into_iter().collect()
 }
 
-pub(crate) fn calculate_deviance_from_eta(
+pub fn calculate_deviance_from_eta(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     likelihood: &GlmLikelihoodSpec,
@@ -1111,6 +1111,314 @@ pub(crate) fn calculate_deviance_from_eta(
     } else {
         crate::bail_invalid_estim!("deviance reduction exceeded f64 range")
     }
+}
+
+/// A signed-log weighted average that never forms `weight * value` in the
+/// original scale. Zero-weight rows are dormant: their values are not passed to
+/// `transform`. Reducing numerator and denominator in log space preserves
+/// positive subnormal weights even when their ratio to the largest weight would
+/// underflow before a compensating response magnitude is applied.
+fn null_weighted_average(
+    y: ArrayView1<f64>,
+    priorweights: ArrayView1<f64>,
+    quantity: &'static str,
+    transform: impl Fn(usize, f64) -> Result<f64, EstimationError>,
+) -> Result<f64, EstimationError> {
+    if y.len() != priorweights.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "{quantity}: response/weight length mismatch: {} versus {}",
+            y.len(),
+            priorweights.len()
+        )));
+    }
+    let mut max_weight = 0.0_f64;
+    for (row, &weight) in priorweights.iter().enumerate() {
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(EstimationError::InvalidInput(format!(
+                "{quantity}: weight at row {row} must be finite and non-negative; got {weight}"
+            )));
+        }
+        max_weight = max_weight.max(weight);
+    }
+    if max_weight == 0.0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "{quantity}: at least one observation weight must be positive"
+        )));
+    }
+
+    let mut numerator_logs = Vec::with_capacity(y.len());
+    let mut numerator_signs = Vec::with_capacity(y.len());
+    let mut denominator_logs = Vec::with_capacity(y.len());
+    let mut denominator_signs = Vec::with_capacity(y.len());
+    for row in 0..y.len() {
+        if priorweights[row] == 0.0 {
+            numerator_logs.push(f64::NEG_INFINITY);
+            numerator_signs.push(0.0);
+            denominator_logs.push(f64::NEG_INFINITY);
+            denominator_signs.push(0.0);
+            continue;
+        }
+        let value = transform(row, y[row])?;
+        if !value.is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "{quantity}: transformed response at row {row} is not finite: {value}"
+            )));
+        }
+        denominator_logs.push(priorweights[row].ln());
+        denominator_signs.push(1.0);
+        if value == 0.0 {
+            numerator_logs.push(f64::NEG_INFINITY);
+            numerator_signs.push(0.0);
+        } else {
+            numerator_logs.push(priorweights[row].ln() + value.abs().ln());
+            numerator_signs.push(value.signum());
+        }
+    }
+    let (denominator_log, denominator_sign) =
+        gam_math::probability::signed_log_sum_exp(&denominator_logs, &denominator_signs);
+    if denominator_sign != 1.0 || !denominator_log.is_finite() {
+        return Err(EstimationError::InvalidInput(format!(
+            "{quantity}: positive weight sum is not representable in log space: sign={denominator_sign}, log_magnitude={denominator_log}"
+        )));
+    }
+    let (numerator_log, numerator_sign) =
+        gam_math::probability::signed_log_sum_exp(&numerator_logs, &numerator_signs);
+    if numerator_sign == 0.0 && numerator_log == f64::NEG_INFINITY {
+        return Ok(0.0);
+    }
+    if !numerator_log.is_finite() || numerator_sign.abs() != 1.0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "{quantity}: signed weighted numerator is indeterminate: sign={numerator_sign}, log_magnitude={numerator_log}"
+        )));
+    }
+    let average_log = numerator_log - denominator_log;
+    let average = numerator_sign * average_log.exp();
+    if !average.is_finite() || average == 0.0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "{quantity}: weighted average is outside the finite nonzero f64 range: sign={numerator_sign}, log_magnitude={average_log}"
+        )));
+    }
+    Ok(average)
+}
+
+fn beta_null_score(eta: f64, phi: f64, weighted_logit_response: f64) -> f64 {
+    let (mu, one_minus_mu) = logit_probability_pair(eta);
+    let tail = (-eta.abs()).exp();
+    let dmu = tail / ((1.0 + tail) * (1.0 + tail));
+    let a = mu * phi;
+    let b = one_minus_mu * phi;
+    let c = phi * dmu;
+    beta_scaled_digamma(c, a, one_minus_mu)
+        - beta_scaled_digamma(c, b, mu)
+        - c * weighted_logit_response
+}
+
+/// Solve the fixed-precision Beta intercept score in its unbounded logit
+/// coordinate. The raw-mean shortcut is not the Beta MLE: the exact root obeys
+/// `psi(phi*mu) - psi(phi*(1-mu)) = E_w[logit(y)]`.
+fn beta_null_eta(
+    y: ArrayView1<f64>,
+    priorweights: ArrayView1<f64>,
+    phi: f64,
+) -> Result<f64, EstimationError> {
+    if !(phi.is_finite() && phi > 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Beta null model requires finite positive precision; got {phi}"
+        )));
+    }
+    let target = null_weighted_average(
+        y,
+        priorweights,
+        "Beta null-model logit response",
+        |row, response| {
+            if !(response.is_finite() && response > 0.0 && response < 1.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Beta null model requires responses strictly inside (0,1); row {row} has {response}"
+                )));
+            }
+            Ok(response.ln() - (-response).ln_1p())
+        },
+    )?;
+
+    let mut lower = -1.0_f64;
+    let mut upper = 1.0_f64;
+    let mut lower_score = beta_null_score(lower, phi, target);
+    let mut upper_score = beta_null_score(upper, phi, target);
+    while lower_score > 0.0 && lower > -1024.0 {
+        lower *= 2.0;
+        lower_score = beta_null_score(lower, phi, target);
+    }
+    while upper_score < 0.0 && upper < 1024.0 {
+        upper *= 2.0;
+        upper_score = beta_null_score(upper, phi, target);
+    }
+    if lower_score.is_nan()
+        || upper_score.is_nan()
+        || lower_score > 0.0
+        || upper_score < 0.0
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "Beta null score could not be bracketed: lower=({lower},{lower_score}), upper=({upper},{upper_score}), target={target}"
+        )));
+    }
+    if lower_score == 0.0 {
+        return Ok(lower);
+    }
+    if upper_score == 0.0 {
+        return Ok(upper);
+    }
+
+    for _ in 0..256 {
+        let midpoint = lower + 0.5 * (upper - lower);
+        if midpoint == lower || midpoint == upper {
+            return Ok(if lower_score.abs() <= upper_score.abs() {
+                lower
+            } else {
+                upper
+            });
+        }
+        let score = beta_null_score(midpoint, phi, target);
+        if score.is_nan() {
+            return Err(EstimationError::InvalidInput(format!(
+                "Beta null score is NaN at eta={midpoint}, precision={phi}, target={target}"
+            )));
+        }
+        if score == 0.0 {
+            return Ok(midpoint);
+        }
+        if score < 0.0 {
+            lower = midpoint;
+            lower_score = score;
+        } else {
+            upper = midpoint;
+            upper_score = score;
+        }
+    }
+    Err(EstimationError::InvalidInput(format!(
+        "Beta null score did not reach an adjacent-float bracket: lower=({lower},{lower_score}), upper=({upper},{upper_score})"
+    )))
+}
+
+/// Exact intercept-only deviance for reporting and deviance-explained metrics.
+///
+/// The deviance is a function of the fitted mean, not of the chosen monotone
+/// link, so the oracle evaluates the null mean in a numerically convenient
+/// canonical coordinate (identity, log, or logit). Every family except fixed-
+/// precision Beta has the weighted response mean as its intercept-only MLE;
+/// Beta uses the exact digamma score root above. Boundary Poisson/Tweedie/NB and
+/// Binomial samples have a genuine zero null deviance and are returned without
+/// fabricating a tiny interior mean.
+pub fn calculate_null_deviance(
+    y: ArrayView1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    priorweights: ArrayView1<f64>,
+) -> Result<f64, EstimationError> {
+    let response = &likelihood.spec.response;
+    let response_mean = |domain: &'static str,
+                         valid: fn(f64) -> bool|
+     -> Result<f64, EstimationError> {
+        null_weighted_average(y, priorweights, domain, |row, value| {
+            if !valid(value) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "{domain}: invalid response at row {row}: {value}"
+                )));
+            }
+            Ok(value)
+        })
+    };
+
+    let (eta_value, inverse_link, null_likelihood) = match response {
+        ResponseFamily::Gaussian => {
+            let mean = response_mean("Gaussian null model", f64::is_finite)?;
+            (
+                mean,
+                InverseLink::Standard(StandardLink::Identity),
+                likelihood.clone(),
+            )
+        }
+        ResponseFamily::RoystonParmar => {
+            let mean = response_mean("Royston-Parmar null model", f64::is_finite)?;
+            let inverse_link = InverseLink::Standard(StandardLink::Identity);
+            (
+                mean,
+                inverse_link.clone(),
+                GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                    ResponseFamily::Gaussian,
+                    inverse_link,
+                )),
+            )
+        }
+        ResponseFamily::Binomial => {
+            let mean = response_mean("Binomial null model", |value| {
+                value.is_finite() && (0.0..=1.0).contains(&value)
+            })?;
+            if mean == 0.0 || mean == 1.0 {
+                return Ok(0.0);
+            }
+            let inverse_link = InverseLink::Standard(StandardLink::Logit);
+            (
+                mean.ln() - (-mean).ln_1p(),
+                inverse_link.clone(),
+                GlmLikelihoodSpec {
+                    spec: LikelihoodSpec::new(response.clone(), inverse_link),
+                    scale: likelihood.scale,
+                },
+            )
+        }
+        ResponseFamily::Beta { phi } => {
+            let eta = beta_null_eta(y, priorweights, *phi)?;
+            let inverse_link = InverseLink::Standard(StandardLink::Logit);
+            (
+                eta,
+                inverse_link.clone(),
+                GlmLikelihoodSpec {
+                    spec: LikelihoodSpec::new(response.clone(), inverse_link),
+                    scale: likelihood.scale,
+                },
+            )
+        }
+        ResponseFamily::Poisson
+        | ResponseFamily::NegativeBinomial { .. }
+        | ResponseFamily::Tweedie { .. } => {
+            let mean = response_mean("non-negative count null model", |value| {
+                value.is_finite() && value >= 0.0
+            })?;
+            if mean == 0.0 {
+                return Ok(0.0);
+            }
+            let inverse_link = InverseLink::Standard(StandardLink::Log);
+            (
+                mean.ln(),
+                inverse_link.clone(),
+                GlmLikelihoodSpec {
+                    spec: LikelihoodSpec::new(response.clone(), inverse_link),
+                    scale: likelihood.scale,
+                },
+            )
+        }
+        ResponseFamily::Gamma => {
+            let mean = response_mean("Gamma null model", |value| {
+                value.is_finite() && value > 0.0
+            })?;
+            let inverse_link = InverseLink::Standard(StandardLink::Log);
+            (
+                mean.ln(),
+                inverse_link.clone(),
+                GlmLikelihoodSpec {
+                    spec: LikelihoodSpec::new(response.clone(), inverse_link),
+                    scale: likelihood.scale,
+                },
+            )
+        }
+    };
+    let eta = Array1::from_elem(y.len(), eta_value);
+    calculate_deviance_from_eta(
+        y,
+        &eta,
+        &null_likelihood,
+        &inverse_link,
+        priorweights,
+    )
 }
 
 fn eta_log_likelihood_geometry_omitting_constants(
