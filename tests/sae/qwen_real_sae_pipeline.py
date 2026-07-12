@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import sys
 import time
@@ -178,50 +179,162 @@ def _kmeans(X: np.ndarray, k: int, seed: int, log, iters: int = 50):
 # Stage 1b: per-group 2-D coordinates + gam adjudication.
 # ---------------------------------------------------------------------------
 
-def group_coords_2d(codes: np.ndarray, members: np.ndarray, W_dec: np.ndarray,
-                    max_rows: int, seed: int):
-    """Project the group's per-token contribution to 2-D intrinsic coords.
-
-    The group's reconstruction in ACTIVATION space is `codes[:, members] @
-    W_dec[members]`. We adjudicate the geometry there rather than on the raw
-    ReLU codes: a circular feature in activation space is split by ReLU into
-    cos+/cos-/sin+/sin- half-features, so the raw code submatrix folds the ring
-    into a non-negative quadrant. Reconstructing in activation space un-folds
-    that split, recovering the genuine manifold the adjudicator should judge.
-    Restrict to tokens where the group is meaningfully active, then PCA to 2-D.
-    Returns [m, 2] or None if too few active rows / degenerate.
-    """
-    sub = codes[:, members]                       # [N, |group|]
-    active_rows = np.where((sub > 0).sum(axis=1) >= max(2, members.size // 4))[0]
+def _active_group_codes(codes, members, max_rows, seed):
+    sub = codes[:, members]
+    active_rows = np.flatnonzero((sub > 0).sum(axis=1) >= max(2, members.size // 4))
     if active_rows.size < 16:
         return None
-    rng = np.random.default_rng(seed)
     if active_rows.size > max_rows:
+        rng = np.random.default_rng(seed)
         active_rows = np.sort(rng.choice(active_rows, size=max_rows, replace=False))
-    # Group contribution in activation space, then PCA to 2-D.
-    M = sub[active_rows] @ W_dec[members]         # [m, d_in]
-    M = M - M.mean(axis=0, keepdims=True)
-    # PCA to 2-D via SVD.
+    return np.asarray(sub[active_rows], dtype=np.float64)
+
+
+def _circle_projection_score(coords):
+    """Fast label-free circle score used only on discovery rows."""
+    x = np.asarray(coords, dtype=np.float64)
+    design = np.column_stack((2.0 * x[:, 0], 2.0 * x[:, 1], np.ones(x.shape[0])))
+    target = np.square(x).sum(axis=1)
     try:
-        U, S, _ = np.linalg.svd(M, full_matrices=False)
+        parameters, _, rank, _ = np.linalg.lstsq(design, target, rcond=None)
     except np.linalg.LinAlgError:
         return None
-    if S.size < 2 or S[1] < 1e-9:
+    if rank < 3 or not np.isfinite(parameters).all():
         return None
-    coords = U[:, :2] * S[:2]
-    if not np.all(np.isfinite(coords)) or coords.std() < 1e-9:
+    center = parameters[:2]
+    relative = x - center
+    radii = np.linalg.norm(relative, axis=1)
+    mean_radius = float(radii.mean())
+    if not math.isfinite(mean_radius) or mean_radius <= np.finfo(np.float64).tiny:
         return None
-    return np.ascontiguousarray(coords.astype(np.float64))
+    radial_cv = float(radii.std() / mean_radius)
+    unit = (relative[:, 0] + 1j * relative[:, 1]) / np.maximum(
+        radii, np.finfo(np.float64).tiny
+    )
+    # Harmonics 1 and 2 reject one/two-ended line clouds but leave every
+    # regularly spaced cyclic concept with at least three states unpenalized.
+    angular_defect = float(max(abs(unit.mean()), abs(np.square(unit).mean())))
+    score = radial_cv + angular_defect
+    if not math.isfinite(score):
+        return None
+    return score, radial_cv, angular_defect, center.tolist()
 
 
-def adjudicate_groups(gamfit, codes, groups, W_dec, max_rows, seed, log=print):
+def group_coords_2d(
+    discovery_codes,
+    evaluation_codes,
+    members,
+    decoder,
+    max_rows,
+    max_search_pcs,
+    seed,
+):
+    """Select a variance-normalized PC pair on independent discovery rows.
+
+    The decoder contribution factors as ``C @ D`` with group width ``g``.
+    A thin QR of ``D.T`` reduces PCA from the ambient activation width to at
+    most ``g`` dimensions, then every PC pair among the retained rank is scored
+    in O(n g²). Pair selection sees discovery rows only. The returned chart is
+    the selected projection of disjoint evaluation rows, scaled by discovery
+    variances, so a low-variance ring hidden behind a dominant linear factor is
+    reachable without leaking shape-evaluation rows into subspace selection.
+    """
+    discovery = _active_group_codes(discovery_codes, members, max_rows, seed)
+    evaluation = _active_group_codes(
+        evaluation_codes,
+        members,
+        max_rows,
+        seed ^ 0x5EED_EA11,
+    )
+    if discovery is None or evaluation is None:
+        return None
+    decoder_block = np.asarray(decoder[members], dtype=np.float64)
+    discovery_mean = discovery.mean(axis=0, keepdims=True)
+    centered_discovery = discovery - discovery_mean
+    centered_evaluation = evaluation - discovery_mean
+    try:
+        _, decoder_r = np.linalg.qr(decoder_block.T, mode="reduced")
+        reduced_discovery = centered_discovery @ decoder_r.T
+        reduced_evaluation = centered_evaluation @ decoder_r.T
+        left, singular_values, right_t = np.linalg.svd(
+            reduced_discovery,
+            full_matrices=False,
+        )
+    except np.linalg.LinAlgError:
+        return None
+    if singular_values.size < 2 or singular_values[0] <= 0.0:
+        return None
+    rank_tolerance = (
+        max(reduced_discovery.shape)
+        * np.finfo(singular_values.dtype).eps
+        * singular_values[0]
+    )
+    numerical_rank = int(np.count_nonzero(singular_values > rank_tolerance))
+    retained = min(numerical_rank, max_search_pcs)
+    if retained < 2:
+        return None
+    discovery_scores = left[:, :retained] * singular_values[:retained]
+    evaluation_scores = reduced_evaluation @ right_t[:retained].T
+    scales = np.sqrt(np.mean(np.square(discovery_scores), axis=0))
+    if not np.isfinite(scales).all() or np.any(scales <= 0.0):
+        return None
+
+    best = None
+    for first in range(retained - 1):
+        for second in range(first + 1, retained):
+            pair = discovery_scores[:, [first, second]] / scales[[first, second]]
+            scored = _circle_projection_score(pair)
+            if scored is None:
+                continue
+            candidate = (scored[0], first, second, scored)
+            if best is None or candidate[:3] < best[:3]:
+                best = candidate
+    if best is None:
+        return None
+    _, first, second, score_parts = best
+    coords = evaluation_scores[:, [first, second]] / scales[[first, second]]
+    if not np.isfinite(coords).all():
+        return None
+    metadata = {
+        "selected_pc_axes": [first, second],
+        "searched_pcs": retained,
+        "discovery_circle_score": score_parts[0],
+        "discovery_radial_cv": score_parts[1],
+        "discovery_angular_defect": score_parts[2],
+        "discovery_circle_center": score_parts[3],
+        "n_discovery_rows": int(discovery.shape[0]),
+        "n_evaluation_rows": int(evaluation.shape[0]),
+    }
+    return np.ascontiguousarray(coords, dtype=np.float64), metadata
+
+
+def adjudicate_groups(
+    gamfit,
+    discovery_codes,
+    evaluation_codes,
+    groups,
+    decoder,
+    max_rows,
+    max_search_pcs,
+    seed,
+    log=print,
+):
     verdicts = []
-    mean_l0 = float(np.count_nonzero(codes, axis=1).mean())
+    mean_l0 = float(np.count_nonzero(evaluation_codes, axis=1).mean())
     for gi, members in enumerate(groups):
-        coords = group_coords_2d(codes, members, W_dec, max_rows, seed + gi)
-        if coords is None:
-            log(f"  group {gi:3d} ({members.size} feats): too few active rows, skipped")
+        projected = group_coords_2d(
+            discovery_codes,
+            evaluation_codes,
+            members,
+            decoder,
+            max_rows,
+            max_search_pcs,
+            seed + gi,
+        )
+        if projected is None:
+            log(f"  group {gi:3d} ({members.size} feats): no certifiable 2-D chart, skipped")
             continue
+        coords, subspace = projected
         try:
             v = gamfit.adjudicate_atom_shape(
                 coords,
@@ -257,11 +370,12 @@ def adjudicate_groups(gamfit, codes, groups, W_dec, max_rows, seed, log=print):
             "headline": v["headline"],
             "stacking_weights": dict(zip(v["candidate_names"], v["stacking_weights"])),
             "dictionary_mean_l0": float(v["dictionary_mean_l0"]),
+            "subspace_selection": subspace,
         }
         verdicts.append(rec)
         log(f"  group {gi:3d} ({members.size:3d} feats, {coords.shape[0]:4d} rows): "
             f"{v['winner_class']:16s} margin={v['circular_margin']:+.4f} "
-            f"reporting={v['reporting_winner']}")
+            f"reporting={v['reporting_winner']} pcs={subspace['selected_pc_axes']}")
     return verdicts
 
 
@@ -338,10 +452,12 @@ def run_complete_census_pipeline(
     decoder = model.W_dec.detach().cpu().numpy()
     verdicts = adjudicate_groups(
         gamfit,
+        discovery_codes,
         evaluation_codes,
         groups,
         decoder,
         args.max_group_rows,
+        args.subspace_search_pcs,
         pipeline_seed,
         log,
     )
@@ -419,6 +535,12 @@ def main() -> int:
     ap.add_argument("--n-groups", type=int, default=64)
     ap.add_argument("--min-group", type=int, default=4)
     ap.add_argument("--max-group-rows", type=int, default=2000)
+    ap.add_argument(
+        "--subspace-search-pcs",
+        type=int,
+        default=12,
+        help="maximum decoder-contribution PCs searched for a discovery-only circular pair",
+    )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--control-seed", type=int, default=17)
     ap.add_argument("--device", type=str, default="cuda")
@@ -431,6 +553,12 @@ def main() -> int:
         return 0
     if not args.act_dir:
         print("ERROR: --act-dir required (or --print-run-spec).", file=sys.stderr)
+        return 2
+    if args.subspace_search_pcs < 2 or args.max_group_rows < 16:
+        print(
+            "ERROR: --subspace-search-pcs must be >= 2 and --max-group-rows must be >= 16.",
+            file=sys.stderr,
+        )
         return 2
 
     t0 = time.time()

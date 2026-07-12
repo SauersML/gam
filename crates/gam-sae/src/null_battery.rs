@@ -752,8 +752,7 @@ fn stable_population_moments_f32(
     let mut covariance = Array2::<f64>::zeros((p, p));
     for row in 0..n {
         for left in 0..p {
-            let left_residual =
-                (f64::from(data[[row, left]]) - origin[left]) - mean_offset[left];
+            let left_residual = (f64::from(data[[row, left]]) - origin[left]) - mean_offset[left];
             for right in 0..=left {
                 let right_residual =
                     (f64::from(data[[row, right]]) - origin[right]) - mean_offset[right];
@@ -2278,7 +2277,10 @@ mod tests {
         }
         let draw = covariance_matched_gaussian_null_f32(observed.view(), 2262).unwrap();
         let repeated = covariance_matched_gaussian_null_f32(observed.view(), 2262).unwrap();
-        assert_eq!(draw, repeated, "float32 Gaussian control must be reproducible");
+        assert_eq!(
+            draw, repeated,
+            "float32 Gaussian control must be reproducible"
+        );
 
         let target = stable_population_moments_f32(observed.view()).unwrap();
         let realized = stable_population_moments_f32(draw.view()).unwrap();

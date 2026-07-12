@@ -170,29 +170,29 @@ def test_float32_shape_controls_preserve_dtype_seed_marginals_and_covariance(
     np.testing.assert_array_less(np.abs(realized_covariance - target_covariance), tolerance)
 
 
-def test_shape_controlled_census_converts_non_native_dtype_once_to_float64(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import gamfit._shape_census as shape_census
-
+def test_shape_controlled_census_converts_non_native_dtype_once_to_float64() -> None:
     source = np.arange(96, dtype=np.int16).reshape(32, 3)
-    real_array = shape_census.np.array
-    conversions: list[np.dtype] = []
 
-    def tracked_array(data, *args, **kwargs):
-        dtype = np.dtype(kwargs["dtype"])
-        conversions.append(dtype)
-        return real_array(data, *args, **kwargs)
+    class CountingArrayLike:
+        dtype = source.dtype
 
-    monkeypatch.setattr(shape_census.np, "array", tracked_array)
+        def __init__(self) -> None:
+            self.conversions = 0
+
+        def __array__(self, dtype=None, copy=None):
+            self.conversions += 1
+            assert np.dtype(dtype) == np.dtype(np.float64)
+            return source.astype(dtype, copy=True)
+
+    counted_source = CountingArrayLike()
     seen_dtypes: list[np.dtype] = []
 
     def pipeline(matrix: np.ndarray, seed: int) -> int:
         seen_dtypes.append(matrix.dtype)
         return seed
 
-    gamfit.run_shape_controlled_census(source, pipeline)
-    assert conversions == [np.dtype(np.float64)]
+    gamfit.run_shape_controlled_census(counted_source, pipeline)
+    assert counted_source.conversions == 1
     assert seen_dtypes == [np.dtype(np.float64)] * 3
 
 
