@@ -1150,11 +1150,11 @@ fn rigid_row_kernel_propagates_nan_signed_margin_errors() {
 }
 
 /// The single-expression Taylor-jet tower (#932) of the rigid K=1
-/// survival marginal-slope row NLL, written ONCE over `Tower4<4>`
+/// survival marginal-slope row NLL, written ONCE over generic jet
 /// primaries `(q0, q1, qd1, g)`. It reuses the family's OWN hand-certified
 /// `[f64; 5]` special-function derivative stacks (`unary_derivatives_sqrt`
 /// / `_neglog_phi` / `_log_normal_pdf` / `_log`) through
-/// `Tower4::compose_unary`, so no probit/log primitive is re-derived here:
+/// `JetScalar::compose_unary`, so no probit/log primitive is re-derived here:
 /// the tower mechanizes only the Leibniz / Faà di Bruno composition that
 /// `row_primary_closed_form` previously coded by hand (where #736's
 /// cross-block sign flip lived). The value channel of the returned tower
@@ -1168,7 +1168,7 @@ struct SurvivalMarginalSlopeRigidNllProgram {
     probit_scale: f64,
 }
 
-impl gam_math::jet_tower::RowNllProgram<4> for SurvivalMarginalSlopeRigidNllProgram {
+impl gam_math::jet_tower::RowProgram<4> for SurvivalMarginalSlopeRigidNllProgram {
     fn n_rows(&self) -> usize {
         self.primaries.len()
     }
@@ -1180,12 +1180,11 @@ impl gam_math::jet_tower::RowNllProgram<4> for SurvivalMarginalSlopeRigidNllProg
             .ok_or_else(|| format!("rigid nll program: row {row} out of range"))
     }
 
-    fn row_nll(
+    fn eval<S: gam_math::jet_scalar::JetScalar<4>>(
         &self,
         row: usize,
-        p: &[gam_math::jet_tower::Tower4<4>; 4],
-    ) -> Result<gam_math::jet_tower::Tower4<4>, String> {
-        use gam_math::jet_tower::Tower4;
+        p: &[S; 4],
+    ) -> Result<S, String> {
         let z = *self
             .z
             .get(row)
@@ -1200,38 +1199,43 @@ impl gam_math::jet_tower::RowNllProgram<4> for SurvivalMarginalSlopeRigidNllProg
 
         // c(g) = sqrt(1 + (s_f g)^2)  — K=1 covariance_ones = 1, exactly the
         // shared MultiDirJet `one_plus_b2 -> sqrt` composition.
-        let observed_g = g * s_f;
-        let one_plus_b2 = observed_g * observed_g + 1.0;
-        let c = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.v));
+        let observed_g = g.scale(s_f);
+        let one_plus_b2 = observed_g
+            .mul(&observed_g)
+            .add(&S::constant(1.0));
+        let c = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.value()));
 
-        let eta0 = q0 * c + observed_g * z;
-        let eta1 = q1 * c + observed_g * z;
-        let ad1 = qd1 * c;
+        let eta0 = q0.mul(&c).add(&observed_g.scale(z));
+        let eta1 = q1.mul(&c).add(&observed_g.scale(z));
+        let ad1 = qd1.mul(&c);
 
         // Entry survival: +w logΦ(-η0) = -1 * (-w logΦ(-η0)).
-        let neg_eta0 = -eta0;
+        let neg_eta0 = eta0.neg();
         let entry = neg_eta0
-            .compose_unary(unary_derivatives_neglog_phi(neg_eta0.v, w))
+            .compose_unary(unary_derivatives_neglog_phi(neg_eta0.value(), w))
             .scale(-1.0);
         // Exit survival: (1-d) * (-w logΦ(-η1)) carried with weight w(1-d).
-        let neg_eta1 = -eta1;
-        let exit = neg_eta1.compose_unary(unary_derivatives_neglog_phi(neg_eta1.v, w * (1.0 - d)));
+        let neg_eta1 = eta1.neg();
+        let exit = neg_eta1.compose_unary(unary_derivatives_neglog_phi(
+            neg_eta1.value(),
+            w * (1.0 - d),
+        ));
         // Event density: -w d logφ(η1).
         let event_density = if d > 0.0 {
-            eta1.compose_unary(unary_derivatives_log_normal_pdf(eta1.v))
+            eta1.compose_unary(unary_derivatives_log_normal_pdf(eta1.value()))
                 .scale(-w * d)
         } else {
-            Tower4::<4>::zero()
+            S::constant(0.0)
         };
         // Time derivative: -w d log(ad1).
         let time_deriv = if d > 0.0 {
-            ad1.compose_unary(unary_derivatives_log(ad1.v))
+            ad1.compose_unary(unary_derivatives_log(ad1.value()))
                 .scale(-w * d)
         } else {
-            Tower4::<4>::zero()
+            S::constant(0.0)
         };
 
-        Ok(exit + entry + event_density + time_deriv)
+        Ok(exit.add(&entry).add(&event_density).add(&time_deriv))
     }
 }
 
@@ -1291,7 +1295,7 @@ fn oracle_rigid_family(
 /// Audits every channel the production `SurvivalMarginalSlopeRowKernel`
 /// emits — value / gradient / Hessian / `row_third_contracted(dir)` /
 /// `row_fourth_contracted(u, v)` — against the single-expression
-/// `RowNllProgram<4>`-derived tower truth, over several fixture rows
+/// `RowProgram<4>`-derived tower truth, over several fixture rows
 /// (mixed event/censored, with and without Gaussian frailty so the probit
 /// scale ≠ 1) and several random direction vectors. The cross blocks that
 /// #736's sign flip corrupted are contracted explicitly. Agreement here is
@@ -1300,7 +1304,7 @@ fn oracle_rigid_family(
 #[test]
 fn rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
     use crate::row_kernel::RowKernel;
-    use gam_math::jet_tower::{KernelChannels, evaluate_program, verify_kernel_channels};
+    use gam_math::jet_tower::{KernelChannels, program_full_tower, verify_kernel_channels};
 
     let n = 7;
     let z = [0.4, -1.1, 0.0, 0.7, -0.3, 1.6, -1.4];
@@ -1366,7 +1370,7 @@ fn rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
         };
 
         for row in 0..n {
-            let tower = evaluate_program(&program, row).expect("tower evaluation");
+            let tower = program_full_tower(&program, row).expect("tower evaluation");
 
             let (value, gradient, hessian) =
                 RowKernel::row_kernel(&kernel, row).expect("production kernel value/grad/hess");
@@ -1605,7 +1609,7 @@ fn exact_flex_row_value_matches_rigid_with_zero_score_and_link_coefficients() {
 /// proving resolving power (the #736 genus the shared-input parity cannot catch).
 #[test]
 fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip() {
-    use gam_math::jet_tower::{derived_fourth_contracted, derived_third_contracted};
+    use gam_math::jet_tower::{program_fourth_contracted, program_third_contracted};
 
     let score_runtime = test_deviation_runtime();
     let link_runtime = test_deviation_runtime();
@@ -1740,7 +1744,7 @@ fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip()
             let flex_full = family
                 .row_flex_primary_third_contracted_exact(0, &block_states, &embed(d4))
                 .expect("flex third contracted at zero deviation");
-            let rigid = derived_third_contracted(&program, 0, d4).expect("rigid third");
+            let rigid = program_third_contracted(&program, 0, d4).expect("rigid third");
             let scale = rigid
                 .iter()
                 .flatten()
@@ -1766,7 +1770,7 @@ fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip()
             let flex_full = family
                 .row_flex_primary_third_contracted_exact(0, &block_states, &embed(d4))
                 .expect("flex third contracted (tripwire)");
-            let rigid = derived_third_contracted(&program, 0, d4).expect("rigid third (tripwire)");
+            let rigid = program_third_contracted(&program, 0, d4).expect("rigid third (tripwire)");
             // (q0, g) cross block — the marginal↔logslope coupling.
             let want = rigid[0][3];
             let scale = want.abs().max(1.0);
@@ -1787,7 +1791,7 @@ fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip()
             let flex_full = family
                 .row_flex_primary_fourth_contracted_exact(0, &block_states, &embed(du), &embed(dv))
                 .expect("flex fourth contracted at zero deviation");
-            let rigid = derived_fourth_contracted(&program, 0, du, dv).expect("rigid fourth");
+            let rigid = program_fourth_contracted(&program, 0, du, dv).expect("rigid fourth");
             let scale = rigid
                 .iter()
                 .flatten()
@@ -8537,7 +8541,7 @@ fn block_hessian_dense_operator_parity_all_five_blocks() {
 
 #[test]
 fn zz_diag_failure1_flex_vs_rigid_vs_fdhess() {
-    use gam_math::jet_tower::derived_third_contracted;
+    use gam_math::jet_tower::program_third_contracted;
     // FAILURE 1 fixture row.
     let event = 1.0_f64;
     let weight = 0.75_f64;
@@ -8663,7 +8667,7 @@ fn zz_diag_failure1_flex_vs_rigid_vs_fdhess() {
         d: vec![event],
         probit_scale: family.probit_frailty_scale(),
     };
-    let rigid = derived_third_contracted(&program, 0, &dir4).unwrap();
+    let rigid = program_third_contracted(&program, 0, &dir4).unwrap();
 
     const THIRD_CONTRACTED_TOL: f64 = 1e-5;
     for (u, &bu) in bidx.iter().enumerate() {
@@ -9193,7 +9197,7 @@ fn survival_jeffreys_contracted_trace_hook_beats_pairwise_979() {
 fn survival_sparse_tower4_full_t4_matches_dense_oracle_979() {
     use super::row_kernel::{RIGID_LINEAR_MASK, SparseTower4, rigid_row_inputs, rigid_row_kernel_primaries, rigid_row_nll};
     use gam_math::jet_scalar::JetScalar;
-    use gam_math::jet_tower::evaluate_program;
+    use gam_math::jet_tower::program_full_tower;
 
     let n = 120usize;
     let z: Vec<f64> = (0..n).map(|r| ((r as f64) * 0.29).sin() * 0.9).collect();
@@ -9258,7 +9262,7 @@ fn survival_sparse_tower4_full_t4_matches_dense_oracle_979() {
     let mut max_abs_gap = 0.0_f64;
     let mut max_rel_gap = 0.0_f64;
     for row in 0..n {
-        let dense = evaluate_program(&program, row).expect("dense tower4 oracle");
+        let dense = program_full_tower(&program, row).expect("dense tower4 oracle");
 
         let p = rigid_row_kernel_primaries(&family, &block_states, row).expect("primaries");
         let inputs = rigid_row_inputs(

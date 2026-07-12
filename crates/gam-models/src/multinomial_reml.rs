@@ -81,17 +81,28 @@ use std::sync::{Arc, Mutex};
 /// `TwoSeed<0>` selects the mixed second directional derivative. There are no
 /// primary axes because this program differentiates only along supplied
 /// coefficient-space directions.
+/// The pair of coefficient-space directions a Fisher perturbation is seeded
+/// along. First-directional seeds consume only `u`; the mixed second-directional
+/// seed consumes both. Bundling the pair keeps a single `seed` signature across
+/// both perturbation orders without forcing either impl to carry an unused
+/// positional argument.
+#[derive(Clone, Copy)]
+struct FisherDirection {
+    u: f64,
+    v: f64,
+}
+
 trait FisherPerturbation: JetScalar<0> {
-    fn seed(direction_u: f64, direction_v: f64) -> Self;
+    fn seed(direction: FisherDirection) -> Self;
     fn coefficient(&self) -> f64;
 }
 
 impl FisherPerturbation for OneSeed<0> {
     #[inline(always)]
-    fn seed(direction_u: f64, _direction_v: f64) -> Self {
+    fn seed(direction: FisherDirection) -> Self {
         Self {
             base: <Order2<0> as JetScalar<0>>::constant(0.0),
-            eps: <Order2<0> as JetScalar<0>>::constant(direction_u),
+            eps: <Order2<0> as JetScalar<0>>::constant(direction.u),
         }
     }
 
@@ -103,11 +114,11 @@ impl FisherPerturbation for OneSeed<0> {
 
 impl FisherPerturbation for TwoSeed<0> {
     #[inline(always)]
-    fn seed(direction_u: f64, direction_v: f64) -> Self {
+    fn seed(direction: FisherDirection) -> Self {
         Self {
             base: <Order2<0> as JetScalar<0>>::constant(0.0),
-            eps: <Order2<0> as JetScalar<0>>::constant(direction_u),
-            del: <Order2<0> as JetScalar<0>>::constant(direction_v),
+            eps: <Order2<0> as JetScalar<0>>::constant(direction.u),
+            del: <Order2<0> as JetScalar<0>>::constant(direction.v),
             eps_del: <Order2<0> as JetScalar<0>>::constant(0.0),
         }
     }
@@ -140,8 +151,8 @@ fn softmax_fisher_perturbation<S: FisherPerturbation>(
     normalized: &mut [S],
     fisher: &mut [f64],
 ) {
-    debug_assert_eq!(normalized.len(), m);
-    debug_assert_eq!(fisher.len(), m * m);
+    assert_eq!(normalized.len(), m);
+    assert_eq!(fisher.len(), m * m);
     let one = S::constant(1.0);
     let mut denominator = one;
     for a in 0..m {
