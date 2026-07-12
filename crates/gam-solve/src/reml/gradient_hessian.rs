@@ -6735,6 +6735,10 @@ impl<'a> RemlState<'a> {
                 );
             }
             pirls_config.link_kind = self.runtime_inverse_link();
+            let resolved_likelihood_scale = pirls_config
+                .likelihood
+                .resolved_scale()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
             // Negative-Binomial λ-search θ freeze (#1082). With θ estimated,
             // the inner solver re-derives θ from each outer iterate's warm-start
             // η, so the NB working response / deviance / penalty-logdet — and
@@ -6748,16 +6752,29 @@ impl<'a> RemlState<'a> {
             // `refine_dispersion_at_converged_eta = true` accept-fit in
             // `optimizer.rs`), exactly as the dispersion-at-converged-η contract
             // requires. No effect on non-NB or user-fixed-θ specs.
-            if pirls_config.likelihood.negbin_theta_is_estimated() {
+            if matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
+                    estimated: true,
+                    ..
+                }
+            ) {
                 let frozen_bits = self.frozen_negbin_theta.load(Ordering::Relaxed);
                 if frozen_bits != 0 {
                     let frozen_theta = f64::from_bits(frozen_bits);
-                    if frozen_theta.is_finite() && frozen_theta > 0.0 {
-                        pirls_config.likelihood = pirls_config
-                            .likelihood
-                            .clone()
-                            .with_negbin_theta_frozen_for_search(frozen_theta);
+                    if !(frozen_theta.is_finite() && frozen_theta > 0.0) {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "frozen negative-binomial theta is invalid: {frozen_theta:?}"
+                        )));
                     }
+                    pirls_config.likelihood = pirls_config
+                        .likelihood
+                        .clone()
+                        .with_negbin_theta_frozen_for_search(frozen_theta);
+                    pirls_config
+                        .likelihood
+                        .resolved_scale()
+                        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
                 }
             }
             // Tweedie λ-search φ freeze (#1477). The same drift mechanism as the
@@ -6771,16 +6788,29 @@ impl<'a> RemlState<'a> {
             // `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ; φ is still refreshed
             // at the single final reported fit. No effect on non-Tweedie or
             // user-fixed-φ specs.
-            if pirls_config.likelihood.tweedie_phi_is_estimated() {
+            if matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Tweedie {
+                    estimated: true,
+                    ..
+                }
+            ) {
                 let frozen_bits = self.frozen_tweedie_phi.load(Ordering::Relaxed);
                 if frozen_bits != 0 {
                     let frozen_phi = f64::from_bits(frozen_bits);
-                    if frozen_phi.is_finite() && frozen_phi > 0.0 {
-                        pirls_config.likelihood = pirls_config
-                            .likelihood
-                            .clone()
-                            .with_tweedie_phi_frozen_for_search(frozen_phi);
+                    if !(frozen_phi.is_finite() && frozen_phi > 0.0) {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "frozen Tweedie dispersion is invalid: {frozen_phi:?}"
+                        )));
                     }
+                    pirls_config.likelihood = pirls_config
+                        .likelihood
+                        .clone()
+                        .with_tweedie_phi_frozen_for_search(frozen_phi);
+                    pirls_config
+                        .likelihood
+                        .resolved_scale()
+                        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
                 }
             }
             // Gamma λ-search shape freeze (#1074). Same drift mechanism as the NB
@@ -6799,16 +6829,29 @@ impl<'a> RemlState<'a> {
             // converged solve's MLE `k` so `F(ρ) = REML(ρ, k_frozen)` is
             // stationary in ρ; `k` is still refreshed at the single final
             // reported fit. No effect on non-Gamma or user-fixed-shape specs.
-            if pirls_config.likelihood.scale.gamma_shape_is_estimated() {
+            if matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Gamma {
+                    estimated: true,
+                    ..
+                }
+            ) {
                 let frozen_bits = self.frozen_gamma_shape.load(Ordering::Relaxed);
                 if frozen_bits != 0 {
                     let frozen_shape = f64::from_bits(frozen_bits);
-                    if frozen_shape.is_finite() && frozen_shape > 0.0 {
-                        pirls_config.likelihood = pirls_config
-                            .likelihood
-                            .clone()
-                            .with_gamma_shape_frozen_for_search(frozen_shape);
+                    if !(frozen_shape.is_finite() && frozen_shape > 0.0) {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "frozen Gamma shape is invalid: {frozen_shape:?}"
+                        )));
                     }
+                    pirls_config.likelihood = pirls_config
+                        .likelihood
+                        .clone()
+                        .with_gamma_shape_frozen_for_search(frozen_shape);
+                    pirls_config
+                        .likelihood
+                        .resolved_scale()
+                        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
                 }
             }
             // Levenberg-Marquardt damping warm-start. Read the cached
@@ -7309,52 +7352,95 @@ impl<'a> RemlState<'a> {
     ) -> Result<Arc<PirlsResult>, EstimationError> {
         let mut pirls_config = self.config.as_pirls_config();
         pirls_config.link_kind = self.runtime_inverse_link();
+        let resolved_likelihood_scale = pirls_config
+            .likelihood
+            .resolved_scale()
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
         // Pin the same λ-search-frozen NB θ the outer loop converged under
         // (#1082), so the rho-uncertainty sigma-point criterion is evaluated on
         // the identical stationary surface F(ρ) = REML(ρ, θ_frozen) rather than
         // re-estimating θ at each off-trajectory σ-point.
-        if pirls_config.likelihood.negbin_theta_is_estimated() {
+        if matches!(
+            resolved_likelihood_scale,
+            gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
+                estimated: true,
+                ..
+            }
+        ) {
             let frozen_bits = self.frozen_negbin_theta.load(Ordering::Relaxed);
             if frozen_bits != 0 {
                 let frozen_theta = f64::from_bits(frozen_bits);
-                if frozen_theta.is_finite() && frozen_theta > 0.0 {
-                    pirls_config.likelihood = pirls_config
-                        .likelihood
-                        .clone()
-                        .with_negbin_theta_frozen_for_search(frozen_theta);
+                if !(frozen_theta.is_finite() && frozen_theta > 0.0) {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "frozen negative-binomial theta is invalid: {frozen_theta:?}"
+                    )));
                 }
+                pirls_config.likelihood = pirls_config
+                    .likelihood
+                    .clone()
+                    .with_negbin_theta_frozen_for_search(frozen_theta);
+                pirls_config
+                    .likelihood
+                    .resolved_scale()
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
             }
         }
         // Pin the same λ-search-frozen Tweedie φ the outer loop converged under
         // (#1477), so the rho-uncertainty sigma-point criterion is evaluated on
         // the identical stationary surface F(ρ) = REML(ρ, φ_frozen) rather than
         // re-estimating φ at each off-trajectory σ-point.
-        if pirls_config.likelihood.tweedie_phi_is_estimated() {
+        if matches!(
+            resolved_likelihood_scale,
+            gam_problem::ResolvedLikelihoodScale::Tweedie {
+                estimated: true,
+                ..
+            }
+        ) {
             let frozen_bits = self.frozen_tweedie_phi.load(Ordering::Relaxed);
             if frozen_bits != 0 {
                 let frozen_phi = f64::from_bits(frozen_bits);
-                if frozen_phi.is_finite() && frozen_phi > 0.0 {
-                    pirls_config.likelihood = pirls_config
-                        .likelihood
-                        .clone()
-                        .with_tweedie_phi_frozen_for_search(frozen_phi);
+                if !(frozen_phi.is_finite() && frozen_phi > 0.0) {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "frozen Tweedie dispersion is invalid: {frozen_phi:?}"
+                    )));
                 }
+                pirls_config.likelihood = pirls_config
+                    .likelihood
+                    .clone()
+                    .with_tweedie_phi_frozen_for_search(frozen_phi);
+                pirls_config
+                    .likelihood
+                    .resolved_scale()
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
             }
         }
         // Pin the same λ-search-frozen Gamma shape the outer loop converged under
         // (#1074), so the rho-uncertainty sigma-point criterion is evaluated on
         // the identical stationary surface F(ρ) = REML(ρ, k_frozen) rather than
         // re-estimating `k` at each off-trajectory σ-point.
-        if pirls_config.likelihood.scale.gamma_shape_is_estimated() {
+        if matches!(
+            resolved_likelihood_scale,
+            gam_problem::ResolvedLikelihoodScale::Gamma {
+                estimated: true,
+                ..
+            }
+        ) {
             let frozen_bits = self.frozen_gamma_shape.load(Ordering::Relaxed);
             if frozen_bits != 0 {
                 let frozen_shape = f64::from_bits(frozen_bits);
-                if frozen_shape.is_finite() && frozen_shape > 0.0 {
-                    pirls_config.likelihood = pirls_config
-                        .likelihood
-                        .clone()
-                        .with_gamma_shape_frozen_for_search(frozen_shape);
+                if !(frozen_shape.is_finite() && frozen_shape > 0.0) {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "frozen Gamma shape is invalid: {frozen_shape:?}"
+                    )));
                 }
+                pirls_config.likelihood = pirls_config
+                    .likelihood
+                    .clone()
+                    .with_gamma_shape_frozen_for_search(frozen_shape);
+                pirls_config
+                    .likelihood
+                    .resolved_scale()
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
             }
         }
 

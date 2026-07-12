@@ -554,10 +554,11 @@ fn resolve_hmc_likelihood(
         // The standard-deviation argument is consulted only by the profiled
         // Gaussian branch handled above. Every resolved non-profiled family
         // derives its response dispersion entirely from typed metadata.
-        let expected = gam_solve::estimate::dispersion_from_likelihood(&likelihood, None)
-            .map_err(|error| HmcError::InvalidConfig {
+        let expected = gam_solve::estimate::dispersion_from_likelihood(&likelihood, None).map_err(
+            |error| HmcError::InvalidConfig {
                 reason: format!("HMC likelihood scale metadata is inconsistent: {error}"),
-            })?;
+            },
+        )?;
         if expected.phi().to_bits() != phi.to_bits()
             || expected.is_estimated() != dispersion.is_estimated()
         {

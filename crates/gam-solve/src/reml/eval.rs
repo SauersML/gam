@@ -59,6 +59,7 @@ pub enum SmoothingCorrectionOutcome {
     Cubature {
         correction: Array2<f64>,
         rho_covariance: Option<Array2<f64>>,
+        rho_hessian_stabilization: gam_problem::StabilizationLedger,
         rank: usize,
         n_points: usize,
         near_boundary: bool,
@@ -71,6 +72,7 @@ pub enum SmoothingCorrectionOutcome {
         rho_covariance: Option<Array2<f64>>,
         reason: &'static str,
         severity: SmoothingCorrectionFallbackSeverity,
+        method: Option<SmoothingCorrectionMethod>,
     },
     /// Exact first-order geometry was unavailable. The typed reason is
     /// preserved instead of presenting a missing matrix as a routine skip.
@@ -81,16 +83,29 @@ pub enum SmoothingCorrectionOutcome {
 }
 
 impl SmoothingCorrectionOutcome {
-    /// Extract the additive correction matrix, if any.
-    ///
-    /// Returns `None` only when the first-order path itself produced
-    /// nothing (e.g. `n_rho == 0` where no separate correction is
-    /// meaningful, or when no base covariance was supplied to upgrade).
-    pub fn into_correction(self) -> Option<Array2<f64>> {
+    /// Consume the outcome without discarding how a retained matrix was made.
+    pub fn into_correction_with_method(
+        self,
+    ) -> (Option<Array2<f64>>, Option<SmoothingCorrectionMethod>) {
         match self {
-            SmoothingCorrectionOutcome::Cubature { correction, .. } => Some(correction),
-            SmoothingCorrectionOutcome::FirstOrder { correction, .. } => correction,
-            SmoothingCorrectionOutcome::Unavailable { .. } => None,
+            SmoothingCorrectionOutcome::Cubature {
+                correction,
+                rank,
+                n_points,
+                rho_hessian_stabilization,
+                ..
+            } => (
+                Some(correction),
+                Some(SmoothingCorrectionMethod::SigmaPointCubature {
+                    rank,
+                    n_points,
+                    rho_hessian_stabilization,
+                }),
+            ),
+            SmoothingCorrectionOutcome::FirstOrder {
+                correction, method, ..
+            } => (correction, method),
+            SmoothingCorrectionOutcome::Unavailable { .. } => (None, None),
         }
     }
 
@@ -689,6 +704,12 @@ impl<'a> RemlState<'a> {
             super::compute_smoothing_correction(self, final_rho, final_lambdas, final_fit);
         let first_order_correction = first_order.correction.clone();
         let first_order_rho_covariance = first_order.rho_covariance.clone();
+        let first_order_method = first_order.correction.as_ref().map(|_| {
+            SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
+                active_rank: first_order.active_rank.unwrap_or(0),
+                rho_dimension: final_rho.len(),
+            }
+        });
         if let SmoothingCorrectionStatus::Unavailable(reason) = first_order.status.clone() {
             return self.finalize_smoothing_outcome(SmoothingCorrectionOutcome::Unavailable {
                 reason,
@@ -701,6 +722,7 @@ impl<'a> RemlState<'a> {
                 rho_covariance: first_order_rho_covariance.clone(),
                 reason,
                 severity: Routine,
+                method: first_order_method,
             }
         };
         let first_order_numerical = |correction: Option<Array2<f64>>, reason: &'static str| {
@@ -709,6 +731,7 @@ impl<'a> RemlState<'a> {
                 rho_covariance: first_order_rho_covariance.clone(),
                 reason,
                 severity: NumericalFailure,
+                method: first_order_method,
             }
         };
         let n_rho = final_rho.len();
@@ -1029,6 +1052,7 @@ impl<'a> RemlState<'a> {
         self.finalize_smoothing_outcome(SmoothingCorrectionOutcome::Cubature {
             correction: corr,
             rho_covariance: Some(hessian_rho_inv),
+            rho_hessian_stabilization: cubature_ridge,
             rank,
             n_points: sigma_points.len(),
             near_boundary,
@@ -2257,6 +2281,12 @@ mod smoothing_correction_outcome_tests {
             rho_covariance: None,
             reason,
             severity,
+            method: with_matrix.then_some(
+                SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
+                    active_rank: 1,
+                    rho_dimension: 1,
+                },
+            ),
         }
     }
 
@@ -2265,6 +2295,11 @@ mod smoothing_correction_outcome_tests {
         let outcome = SmoothingCorrectionOutcome::Cubature {
             correction: array![[2.0, 0.0], [0.0, 2.0]],
             rho_covariance: None,
+            rho_hessian_stabilization: gam_problem::StabilizationLedger::approximation_only(
+                1.0e-8,
+                gam_problem::StabilizationRule::FixedConstant,
+            )
+            .expect("valid test cubature ridge"),
             rank: 2,
             n_points: 4,
             near_boundary: true,
@@ -2272,9 +2307,12 @@ mod smoothing_correction_outcome_tests {
             max_rho_var: 0.7,
         };
         assert_eq!(outcome.branch_label(), "cubature");
-        let mat = outcome
-            .into_correction()
-            .expect("cubature always has a matrix");
+        let (mat, method) = outcome.into_correction_with_method();
+        let mat = mat.expect("cubature always has a matrix");
+        assert!(matches!(
+            method,
+            Some(SmoothingCorrectionMethod::SigmaPointCubature { .. })
+        ));
         assert_eq!(mat.dim(), (2, 2));
         assert_eq!(mat[[0, 0]], 2.0);
     }
@@ -2287,7 +2325,7 @@ mod smoothing_correction_outcome_tests {
             true,
         );
         assert_eq!(outcome.branch_label(), "first-order (routine)");
-        assert!(outcome.into_correction().is_some());
+        assert!(outcome.into_correction_with_method().0.is_some());
     }
 
     #[test]
@@ -2298,7 +2336,7 @@ mod smoothing_correction_outcome_tests {
             true,
         );
         assert_eq!(outcome.branch_label(), "first-order (numerical failure)");
-        assert!(outcome.into_correction().is_some());
+        assert!(outcome.into_correction_with_method().0.is_some());
     }
 
     #[test]
@@ -2308,7 +2346,7 @@ mod smoothing_correction_outcome_tests {
             SmoothingCorrectionFallbackSeverity::Routine,
             false,
         );
-        assert!(outcome.into_correction().is_none());
+        assert!(outcome.into_correction_with_method().0.is_none());
     }
 
     #[test]
@@ -2474,7 +2512,8 @@ mod smoothing_correction_outcome_tests {
             let after = SMOOTHING_CORRECTION_CUBATURE_COUNT.load(Ordering::SeqCst);
 
             let correction = outcome
-                .into_correction()
+                .into_correction_with_method()
+                .0
                 .expect("cubature/first-order outcome carries a correction matrix");
             (correction, after.saturating_sub(before))
         };

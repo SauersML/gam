@@ -784,6 +784,10 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         self.workspace.eta_buf.assign(&self.offset);
         self.workspace.eta_buf += &matvec_tmp;
         self.workspace.matvec_buf = matvec_tmp;
+        let resolved_likelihood_scale = self
+            .likelihood
+            .resolved_scale()
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
 
         // Estimate the Gamma dispersion shape once from the warm-start η and
         // freeze it for the remainder of this inner solve. Holding the shape
@@ -791,7 +795,14 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // stationary target and the LM gain ratio stays consistent across trial
         // and accepted iterates. The shape refreshes across outer iterations
         // because a fresh model is built per inner solve. See issue #511.
-        if self.likelihood.scale.gamma_shape_is_estimated() && !self.gamma_shape_locked {
+        if matches!(
+            resolved_likelihood_scale,
+            gam_problem::ResolvedLikelihoodScale::Gamma {
+                estimated: true,
+                ..
+            }
+        ) && !self.gamma_shape_locked
+        {
             let shape =
                 estimate_gamma_shape_from_eta(self.y, &self.workspace.eta_buf, self.priorweights)?;
             self.likelihood = self.likelihood.clone().with_gamma_shape(shape);
@@ -805,7 +816,14 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // shape lock above), and it refreshes across outer iterations as a fresh
         // working model is built per inner solve. With φ pinned at the seed of 1
         // the mean smooth was over-penalized / under-fit on precise data.
-        if self.likelihood.scale.beta_phi_is_estimated() && !self.beta_phi_locked {
+        if matches!(
+            resolved_likelihood_scale,
+            gam_problem::ResolvedLikelihoodScale::BetaPrecision {
+                estimated: true,
+                ..
+            }
+        ) && !self.beta_phi_locked
+        {
             let phi =
                 estimate_beta_phi_from_eta(self.y, &self.workspace.eta_buf, self.priorweights)?;
             self.likelihood = self.likelihood.clone().with_beta_phi(phi);
@@ -819,7 +837,14 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // the penalized argmin β̂ — a stationary LM target (mirroring the Gamma
         // shape and Beta φ locks above), and it refreshes across outer iterations
         // as a fresh working model is built per inner solve.
-        if self.likelihood.scale.tweedie_phi_is_estimated() && !self.tweedie_phi_locked {
+        if matches!(
+            resolved_likelihood_scale,
+            gam_problem::ResolvedLikelihoodScale::Tweedie {
+                estimated: true,
+                ..
+            }
+        ) && !self.tweedie_phi_locked
+        {
             if let ResponseFamily::Tweedie { p } = self.likelihood.spec.response {
                 let phi = estimate_tweedie_phi_from_eta(
                     self.y,
@@ -840,7 +865,14 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // φ lock above); it refreshes across outer iterations as a fresh working
         // model is built per inner solve. With `theta` frozen at the seed every
         // coefficient/η SE ignored the data's overdispersion.
-        if self.likelihood.scale.negbin_theta_is_estimated() && !self.negbin_theta_locked {
+        if matches!(
+            resolved_likelihood_scale,
+            gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
+                estimated: true,
+                ..
+            }
+        ) && !self.negbin_theta_locked
+        {
             let theta =
                 estimate_negbin_theta_from_eta(self.y, &self.workspace.eta_buf, self.priorweights)?;
             self.likelihood = self.likelihood.clone().with_negbin_theta(theta);

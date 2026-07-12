@@ -78,11 +78,8 @@ fn resolved_fit_dispersion(
     let family = fit.likelihood_family.as_ref().ok_or_else(|| {
         format!("{context}: fit has no engine-level family and no scalar dispersion")
     })?;
-    let likelihood = gam_problem::GlmLikelihoodSpec::try_new(
-        family.clone(),
-        fit.likelihood_scale,
-    )
-    .map_err(|err| format!("{context}: invalid fitted likelihood scale: {err}"))?;
+    let likelihood = gam_problem::GlmLikelihoodSpec::try_new(family.clone(), fit.likelihood_scale)
+        .map_err(|err| format!("{context}: invalid fitted likelihood scale: {err}"))?;
     let profiled_standard_deviation = matches!(
         likelihood
             .resolved_scale()

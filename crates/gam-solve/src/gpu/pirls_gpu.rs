@@ -41,9 +41,9 @@ impl PirlsLoopLikelihoodScale {
             (PirlsRowFamily::GammaLog, PirlsLoopLikelihoodScaleKind::GammaShape(shape)) => {
                 Ok(shape)
             }
-            (PirlsRowFamily::GammaLog, PirlsLoopLikelihoodScaleKind::NonGamma) => Err(
-                "GPU Gamma row kernel requires an explicit resolved Gamma shape".to_string(),
-            ),
+            (PirlsRowFamily::GammaLog, PirlsLoopLikelihoodScaleKind::NonGamma) => {
+                Err("GPU Gamma row kernel requires an explicit resolved Gamma shape".to_string())
+            }
             (_, PirlsLoopLikelihoodScaleKind::NonGamma) => Ok(f64::NAN),
             (_, PirlsLoopLikelihoodScaleKind::GammaShape(shape)) => Err(format!(
                 "GPU non-Gamma row kernel {family:?} received Gamma shape {shape:?}"
@@ -3867,6 +3867,37 @@ pub fn cholesky_solve_only_gpu(
 
 pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
     gam_gpu::solver::cholesky_lower_gpu(hessian)
+}
+
+#[cfg(test)]
+mod pirls_loop_likelihood_scale_tests {
+    use super::PirlsLoopLikelihoodScale;
+    use crate::gpu_kernels::pirls_row::PirlsRowFamily;
+
+    #[test]
+    fn gpu_row_scale_discriminant_rejects_family_mismatch() {
+        assert!(
+            PirlsLoopLikelihoodScale::non_gamma()
+                .kernel_argument(PirlsRowFamily::GammaLog)
+                .is_err()
+        );
+        let gamma = PirlsLoopLikelihoodScale::gamma_shape(2.0).expect("positive Gamma shape");
+        assert!(gamma.kernel_argument(PirlsRowFamily::PoissonLog).is_err());
+        assert_eq!(
+            gamma
+                .kernel_argument(PirlsRowFamily::GammaLog)
+                .expect("matching Gamma contract"),
+            2.0
+        );
+    }
+
+    #[test]
+    fn non_gamma_kernel_scalar_is_poisoned_not_unit_scaled() {
+        let abi_value = PirlsLoopLikelihoodScale::non_gamma()
+            .kernel_argument(PirlsRowFamily::PoissonLog)
+            .expect("matching non-Gamma contract");
+        assert!(abi_value.is_nan());
+    }
 }
 
 /// Stage 3.2 V100 parity: the device-input PIRLS step must produce

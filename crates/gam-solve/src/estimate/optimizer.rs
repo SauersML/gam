@@ -1870,6 +1870,7 @@ where
     let mut penalty_block_trace = vec![0.0; k];
     let mut edf_total = 0.0;
     let mut smoothing_correction = None;
+    let mut smoothing_correction_method = None;
     let mut rho_covariance = None;
     let mut penalized_hessian = Array2::<f64>::zeros((0, 0));
     let mut beta_covariance = None;
@@ -2405,7 +2406,8 @@ where
                 }
                 outcome => {
                     rho_covariance = outcome.rho_covariance().cloned();
-                    smoothing_correction = outcome.into_correction();
+                    (smoothing_correction, smoothing_correction_method) =
+                        outcome.into_correction_with_method();
                 }
             }
         }
@@ -2609,6 +2611,7 @@ where
         penalty_block_trace,
         edf_total,
         smoothing_correction,
+        smoothing_correction_method,
         penalized_hessian: penalized_hessian.into(),
         working_weights: pirls_res.solveweights.to_owned(),
         working_response: pirls_res.solveworking_response.to_owned(),

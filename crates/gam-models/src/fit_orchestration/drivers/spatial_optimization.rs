@@ -8692,7 +8692,7 @@ pub fn smooth_term_lr_inference_forspec(
                         eta[i],
                         family_disp,
                     )
-                        .and_then(|jets| jets.kappas().ok())
+                    .and_then(|jets| jets.kappas().ok())
                 })
                 .collect();
             if let (Some(kappas), Some(dist)) = (kappas, chi2.as_ref()) {
@@ -8914,6 +8914,37 @@ fn wood_reference_df(influence: Option<&Array2<f64>>, coeff_range: &Range<usize>
     let tr = (0..block.nrows()).map(|i| block[[i, i]]).sum::<f64>();
     let tr2 = block.dot(&block).diag().sum();
     (tr.is_finite() && tr2.is_finite() && tr > 0.0).then(|| (2.0 * tr - tr2).max(tr).max(1e-12))
+}
+
+#[cfg(test)]
+mod likelihood_scale_wps_tests {
+    use super::wps_block_uncertainty_df;
+    use ndarray::array;
+
+    #[test]
+    fn wps_trace_uses_coefficient_covariance_scale() {
+        let xwx = array![[1.0, 0.0], [0.0, 1.0]];
+        let correction = array![[1.0, 0.0], [0.0, 1.0]];
+        let extra_df = wps_block_uncertainty_df(Some(&xwx), Some(&correction), &(0..2), 4.0)
+            .expect("valid WPS geometry")
+            .expect("correction artifacts are present");
+        assert_eq!(extra_df, 0.5);
+    }
+
+    #[test]
+    fn wps_absence_is_distinct_from_invalid_geometry() {
+        let xwx = array![[1.0]];
+        assert_eq!(
+            wps_block_uncertainty_df(Some(&xwx), None, &(0..1), 1.0)
+                .expect("missing optional artifact is not malformed geometry"),
+            None
+        );
+
+        let negative_correction = array![[-1.0]];
+        let error = wps_block_uncertainty_df(Some(&xwx), Some(&negative_correction), &(0..1), 1.0)
+            .expect_err("negative corrected EDF must not be silently zeroed");
+        assert!(error.to_string().contains("must be non-negative"));
+    }
 }
 
 #[cfg(test)]
