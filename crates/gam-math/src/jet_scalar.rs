@@ -1389,8 +1389,9 @@ impl<const K: usize> MappedOrder2Accumulator<K> {
     /// Add `f(atom)` using the exact order-two Faà di Bruno rule.
     ///
     /// `axes[i]` maps local derivative axis `i` to its global primary axis. The
-    /// map must be injective; repeated axes would describe a nonlinear pullback
-    /// and require additional map-curvature terms rather than a scatter.
+    /// map must be injective. Repeated axes describe a non-injective linear
+    /// pullback whose identified cross terms need multiplicity that this simple
+    /// scatter deliberately does not represent.
     #[inline(always)]
     pub fn add_composed<const N: usize>(
         &mut self,
@@ -1398,7 +1399,10 @@ impl<const K: usize> MappedOrder2Accumulator<K> {
         axes: [usize; N],
         derivatives: [f64; 3],
     ) {
-        assert!(axes.iter().all(|&axis| axis < K));
+        assert!(
+            axes.iter().all(|&axis| axis < K),
+            "mapped atom axis must be within the global primary dimension"
+        );
         assert!(
             axes.iter()
                 .enumerate()

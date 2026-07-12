@@ -312,7 +312,9 @@ pub(crate) fn split_survival_psi_design(
 /// equivalence test). Indices `i ∈ {u0,u1,g}` are functionally independent so
 /// the index-space derivative tensors are diagonal in `i`.
 pub(crate) const SLS_ROW_K: usize = 9;
-
+const SLS_U0_AXES: [usize; 3] = [0, 4, 7];
+const SLS_U1_AXES: [usize; 3] = [1, 3, 6];
+const SLS_G_AXES: [usize; 5] = [2, 3, 5, 6, 8];
 
 /// `RowKernel<9>` adapter for the survival location-scale joint likelihood
 /// (non-wiggle path). Holds the per-β quantities already computed by
@@ -620,11 +622,11 @@ fn sls_row_vgh_compiled(
     kernel: &SurvivalExactRowKernel,
 ) -> (f64, [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K]) {
     let entry_vars: [Order2<3>; 3] =
-        std::array::from_fn(|axis| Order2::variable(primary[[0, 4, 7][axis]], axis));
+        std::array::from_fn(|axis| Order2::variable(primary[SLS_U0_AXES[axis]], axis));
     let exit_vars: [Order2<3>; 3] =
-        std::array::from_fn(|axis| Order2::variable(primary[[1, 3, 6][axis]], axis));
+        std::array::from_fn(|axis| Order2::variable(primary[SLS_U1_AXES[axis]], axis));
     let rate_vars: [Order2<5>; 5] =
-        std::array::from_fn(|axis| Order2::variable(primary[[2, 3, 5, 6, 8][axis]], axis));
+        std::array::from_fn(|axis| Order2::variable(primary[SLS_G_AXES[axis]], axis));
     let u0 = sls_index(&entry_vars[0], &entry_vars[1], &entry_vars[2]);
     let u1 = sls_index(&exit_vars[0], &exit_vars[1], &exit_vars[2]);
     let g = sls_event_rate(
@@ -637,12 +639,12 @@ fn sls_row_vgh_compiled(
     let plan = sls_outer_plan(kernel);
     let truncate = |stack: [f64; 5]| [stack[0], stack[1], stack[2]];
     let mut output = MappedOrder2Accumulator::zero();
-    output.add_composed(&u0, [0, 4, 7], truncate(plan.u0));
+    output.add_composed(&u0, SLS_U0_AXES, truncate(plan.u0));
     if let Some(stack) = plan.u1 {
-        output.add_composed(&u1, [1, 3, 6], truncate(stack));
+        output.add_composed(&u1, SLS_U1_AXES, truncate(stack));
     }
     if let Some(stack) = plan.g {
-        output.add_composed(&g, [2, 3, 5, 6, 8], truncate(stack));
+        output.add_composed(&g, SLS_G_AXES, truncate(stack));
     }
     output.into_channels()
 }
