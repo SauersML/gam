@@ -2009,11 +2009,13 @@ impl SaeManifoldTerm {
                 // registry-independent), so start from a zero factored block in
                 // that case instead of unwrapping.
                 let mut hbb_c = match analytic_penalties {
-                    Some(registry) => self.build_factored_beta_penalty_curvature(
-                        registry,
-                        penalty_scale,
-                        &frame_projection,
-                    )?,
+                    Some(registry) => self
+                        .build_factored_beta_penalty_curvature(
+                            registry,
+                            penalty_scale,
+                            &frame_projection,
+                        )
+                        .map_err(|error| error.to_string())?,
                     None => Array2::<f64>::zeros((
                         frame_projection.border_dim(),
                         frame_projection.border_dim(),
