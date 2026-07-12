@@ -1907,7 +1907,7 @@ pub enum LikelihoodScaleMetadata {
     /// The engine does not expose fixed-scale semantics for this family.
     /// Family has no scalar GLM scale by model definition (currently only
     /// Royston-Parmar). This is not a missing-value fallback.
-    NoScalarScale,
+    Unspecified,
 }
 
 impl LikelihoodScaleMetadata {
@@ -2364,7 +2364,7 @@ impl GlmLikelihoodSpec {
             )),
 
             (ResponseFamily::RoystonParmar, Metadata::Unspecified) => {
-                Ok(Resolved::NoScalarScale)
+                Ok(Resolved::Unspecified)
             }
             (ResponseFamily::RoystonParmar, _) => {
                 Err(mismatch("Unspecified metadata (no scalar GLM scale)"))
@@ -2506,7 +2506,7 @@ impl GlmLikelihoodSpec {
             // weight (issue #802) — multiplying again would double-count it.
             // The same holds verbatim for a user-fixed `theta` (issue #983).
             | ResolvedLikelihoodScale::NegativeBinomial { .. } => Ok(1.0),
-            ResolvedLikelihoodScale::NoScalarScale => Err(InvalidLikelihoodScale::new(
+            ResolvedLikelihoodScale::Unspecified => Err(InvalidLikelihoodScale::new(
                 "family has no scalar coefficient-covariance scale".to_string(),
             )),
         }
