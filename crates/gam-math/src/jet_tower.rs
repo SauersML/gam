@@ -1921,7 +1921,6 @@ pub fn program_full_tower<const K: usize, P: RowProgram<K> + ?Sized>(
     prog.eval(row, &vars)
 }
 
-
 // ── The oracle ───────────────────────────────────────────────────────
 
 /// One row's worth of hand-written kernel outputs, as claimed by a
@@ -2033,7 +2032,6 @@ pub fn verify_kernel_channels<const K: usize>(
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
