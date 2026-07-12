@@ -399,7 +399,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let weighted_event_mass: f64 = event_target
         .iter()
         .zip(weights.iter())
-        .filter(|(&code, _)| code > 0)
+        .filter(|&(&code, _)| code > 0)
         .map(|(_, &weight)| weight)
         .sum();
     if !(weighted_event_mass > 0.0) {

@@ -157,7 +157,7 @@ pub(crate) fn materialize_survival<'a>(
     let weighted_event_mass: f64 = event_codes
         .iter()
         .zip(weights.iter())
-        .filter(|(&code, _)| code > 0)
+        .filter(|&(&code, _)| code > 0)
         .map(|(_, &weight)| weight)
         .sum();
     if !(weighted_event_mass > 0.0) {
