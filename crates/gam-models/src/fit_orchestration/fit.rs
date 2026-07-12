@@ -482,7 +482,7 @@ pub(crate) fn fit_standard_model(
         request.estimate_tweedie_p = false;
     }
 
-    // #1762: near-perfect linear separation drives the binomial-logit REML/ARC
+    // #1762: near-perfect linear separation drives the binomial REML/ARC
     // outer optimizer into a FLAT-VALLEY STALL. As the fit approaches
     // separation the coefficients want to run to infinity, the PIRLS working
     // weights w = μ̂(1−μ̂) collapse to ~0 over the saturated majority of rows,
@@ -493,22 +493,36 @@ pub(crate) fn fit_standard_model(
     // PirlsDidNotConverge error). Firth's Jeffreys-prior penalty is the textbook
     // remedy: it bounds the coefficients and keeps the working weights from
     // collapsing, so the inner solve is well conditioned at every λ and the
-    // outer optimizer certifies quickly. Retry ONCE with Firth when a plain
-    // binomial-logit fit fails with typed separation/non-convergence evidence,
-    // and adopt it only if the retry itself carries both inner and outer
-    // convergence certificates. If the retry fails, return the ORIGINAL base
-    // error unchanged; a failed rescue can never replace its evidence or mint
-    // the abandoned base iterate. Structural errors are not Firth-retryable.
-    let is_binomial_logit = matches!(request.family.response, ResponseFamily::Binomial)
-        && matches!(
-            request.family.link,
-            InverseLink::Standard(StandardLink::Logit)
-        );
+    // outer optimizer certifies quickly.
+    //
+    // #2273: this pathology is NOT logit-specific. The coefficient runaway and
+    // Fisher-weight collapse under separation happen on EVERY binomial link
+    // (probit's Φ, cloglog, loglog, cauchit, and the stateful SAS/Beta-Logistic/
+    // Mixture links) — measured directly on the issue's n=6 exact-separation
+    // fixture, where the probit fit halts on a flat-valley stall (|g|≈1.9e2 ≫
+    // bound) and mints only under Firth. Firth's Jeffreys prior is a link-general
+    // remedy: it is defined for any binomial inverse link that exposes a
+    // Fisher-weight jet (exactly `LikelihoodSpec::supports_firth`, the same gate
+    // `--firth` validates against), so the reactive rescue must be armed for the
+    // whole Firth-capable binomial family, not just the logit special case — else
+    // the README's "Firth / Jeffreys bias reduction handles separation in
+    // binomial fits" promise silently fails to hold off the default link.
+    //
+    // Retry ONCE with Firth when a plain (non-Firth) Firth-capable binomial fit
+    // fails with typed separation/non-convergence evidence, and adopt it only if
+    // the retry itself carries both inner and outer convergence certificates. If
+    // the retry fails, return the ORIGINAL base error unchanged; a failed rescue
+    // can never replace its evidence or mint the abandoned base iterate.
+    // Structural errors are not Firth-retryable, and links without a Fisher-weight
+    // jet fall straight through to the original error (arming Firth on them would
+    // itself be rejected, then reduced back to the original error by
+    // `certified_retry_or_original`).
+    let is_firth_capable_binomial = request.family.supports_firth();
     let base = fit_standard_base(&request, &request.family, &request.options);
     let fitted = match base {
         Ok(fitted) => fitted,
         Err(original_error)
-            if is_binomial_logit
+            if is_firth_capable_binomial
                 && !request.options.firth_bias_reduction
                 && firth_can_rescue(&original_error) =>
         {
@@ -520,18 +534,20 @@ pub(crate) fn fit_standard_model(
             match certified_retry_or_original(original_error, firth) {
                 Ok(firth_fitted) => {
                     log::info!(
-                        "[#1762] binomial-logit base fit failed with retryable \
-                         separation/non-convergence evidence ({original_report}); Firth \
+                        "[#1762/#2273] Firth-capable binomial base fit ({}) failed with \
+                         retryable separation/non-convergence evidence ({original_report}); Firth \
                          bias-reduction retry certified — adopting it (Firth edf {:.2}).",
+                        request.family.pretty_name(),
                         firth_fitted.fit.edf_total().unwrap_or(f64::NAN),
                     );
                     firth_fitted
                 }
                 Err(original_error) => {
                     log::warn!(
-                        "[#1762] binomial-logit base fit failed ({original_report}); Firth retry \
-                         also failed to certify ({}) — returning the original typed base \
-                         evidence, not either abandoned iterate.",
+                        "[#1762/#2273] Firth-capable binomial base fit ({}) failed \
+                         ({original_report}); Firth retry also failed to certify ({}) — returning \
+                         the original typed base evidence, not either abandoned iterate.",
+                        request.family.pretty_name(),
                         firth_failure.unwrap_or_else(|| "unknown retry failure".to_string()),
                     );
                     return Err(original_error.to_string());
