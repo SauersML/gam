@@ -65,8 +65,6 @@ use edf::{
     calculate_edfwithworkspace_from_factor, calculate_edfwithworkspace_with_penalty,
 };
 
-use log_link_working_state::ETA_CLAMP;
-
 pub(crate) use penalty::PirlsPenalty;
 use penalty::{
     KroneckerQsTransform, WorkingCoordinateDesign, WorkingReparamTransform, attach_penalty_shift,

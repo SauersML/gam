@@ -33,8 +33,10 @@ their radius):
      statistic.
 
 Caveat carried over from the census: sparse non-negative codes pushed
-through per-group 2-D PCA produce ring-like centroid arrangements on
-STRUCTURELESS controls at a double-digit rate per run. A positive here is
+through per-group 2-D PCA can produce ring-like centroid arrangements on
+STRUCTURELESS controls. Across a sufficiently large prespecified census their
+circular-win rate can be double-digit; the two controls from any one run are
+descriptive outcomes, not an FPR estimate. A positive here is
 "consistent with a ring", not proof — always run the byte-identical
 pipeline on the full-pipeline per-dimension-shuffle and covariance-exact
 Hadamard controls before interpreting rates.

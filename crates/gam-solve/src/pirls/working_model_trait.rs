@@ -356,8 +356,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 Ok(())
             }
             (ResponseFamily::Poisson, _, _) => {
-                write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives);
-                Ok(())
+                write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives)
             }
             (ResponseFamily::Tweedie { p }, _, _) => {
                 let p = *p;
@@ -412,8 +411,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                     weights,
                     z,
                     derivatives,
-                );
-                Ok(())
+                )
             }
             (ResponseFamily::RoystonParmar, _, _) => Err(EstimationError::InvalidInput(
                 "RoystonParmar is survival-specific and not a GLM IRLS family".to_string(),

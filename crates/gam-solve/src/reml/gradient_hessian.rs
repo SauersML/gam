@@ -3270,14 +3270,12 @@ impl<'a> RemlState<'a> {
         pirls_result: &PirlsResult,
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
         let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
-        Ok(crate::pirls::outer_hessian_curvature_arrays(
+        crate::pirls::exact_hessian_surface_arrays(
             pirls_result.final_weights_signed(),
-            pirls_result.solve_weights_psd(),
             &c_array,
             &d_array,
             &pirls_result.final_eta.to_owned(),
-            &self.config.link_kind,
-        ))
+        )
     }
 
     /// Returns the (c, d, e) per-row mode-curvature carriers required for
@@ -3319,11 +3317,6 @@ impl<'a> RemlState<'a> {
 
         let inverse_link = self.runtime_inverse_link();
 
-        // Use the same saturation contract as PIRLS observed-Hessian
-        // assembly.  If PIRLS evaluated W_obs at a clamped eta, the
-        // derivative wrt the unclamped eta is zero; higher curvature carriers
-        // must be zero on that branch as well.
-
         // Canonical-Logit fast path: W = h'(η), so ∂³W/∂η³ = h''''(η)
         // taken from the dedicated 5-jet (no variance-jet machinery).
         // Mixture links advertise `link_function() == Logit` but are
@@ -3343,14 +3336,17 @@ impl<'a> RemlState<'a> {
             let weights = &self.weights;
             let e_s = e_array.as_slice_mut().expect("e_array must be contiguous");
             e_s.par_iter_mut().enumerate().for_each(|(i, e_o)| {
-                let eta_raw = final_eta[i];
-                if pirls::eta_clamp_active(&inverse_link, eta_raw) {
-                    *e_o = 0.0;
-                } else {
-                    let jet = crate::mixture_link::logit_inverse_link_jet5(eta_raw);
-                    *e_o = weights[i].max(0.0) * jet.d4;
-                }
+                let jet = crate::mixture_link::logit_inverse_link_jet5(final_eta[i]);
+                *e_o = weights[i] * jet.d4;
             });
+            if let Some((i, &value)) = e_array.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "observed Hessian d3W/deta3",
+                    eta: final_eta[i],
+                    value,
+                });
+            }
             return Ok((c_array, d_array, e_array));
         }
 
@@ -3395,10 +3391,6 @@ impl<'a> RemlState<'a> {
             .enumerate()
             .try_for_each(|(i, e_o)| -> Result<(), EstimationError> {
                 let eta_raw = final_eta[i];
-                if pirls::eta_clamp_active(inverse_link_ref, eta_raw) {
-                    *e_o = 0.0;
-                    return Ok(());
-                }
                 let h1 = dmu_deta[i];
                 let h2 = d2mu_deta2[i];
                 let h3 = d3mu_deta3[i];
@@ -3416,20 +3408,37 @@ impl<'a> RemlState<'a> {
                     || !h4.is_finite()
                     || !h5.is_finite()
                 {
-                    *e_o = 0.0;
-                    return Ok(());
+                    return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                        row: i,
+                        quantity: "observed Hessian inverse-link five-jet",
+                        eta: eta_raw,
+                        value: h5,
+                    });
                 }
                 let mu_i = mu[i];
                 let vj = pirls::variance_jet_for_weight_family(weight_family, mu_i);
                 if !(vj.v.is_finite() && vj.v > 0.0) {
-                    *e_o = 0.0;
-                    return Ok(());
+                    return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                        row: i,
+                        quantity: "observed Hessian variance",
+                        eta: eta_raw,
+                        value: vj.v,
+                    });
                 }
-                let pw = weights[i].max(0.0);
+                let pw = weights[i];
                 let y_i = y_view[i];
                 let e_i = pirls::e_obs_from_jets(y_i, mu_i, h1, h2, h3, h4, h5, vj, phi, pw);
-                *e_o = if e_i.is_finite() { e_i } else { 0.0 };
-                Ok(())
+                if e_i.is_finite() {
+                    *e_o = e_i;
+                    Ok(())
+                } else {
+                    Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                        row: i,
+                        quantity: "observed Hessian d3W/deta3",
+                        eta: eta_raw,
+                        value: e_i,
+                    })
+                }
             })?;
 
         Ok((c_array, d_array, e_array))
@@ -3458,15 +3467,17 @@ impl<'a> RemlState<'a> {
         let weights = &self.weights;
         let f_s = f_array.as_slice_mut().expect("f_array must be contiguous");
         f_s.par_iter_mut().enumerate().for_each(|(i, f_o)| {
-            let eta_raw = final_eta[i];
-            let eta_used = eta_raw.clamp(-ETA_OVERFLOW_CLAMP, ETA_OVERFLOW_CLAMP);
-            if eta_raw != eta_used {
-                *f_o = 0.0;
-            } else {
-                let jet = crate::mixture_link::logit_inverse_link_jet5(eta_used);
-                *f_o = weights[i].max(0.0) * jet.d5;
-            }
+            let jet = crate::mixture_link::logit_inverse_link_jet5(final_eta[i]);
+            *f_o = weights[i] * jet.d5;
         });
+        if let Some((i, &value)) = f_array.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+            return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                row: i,
+                quantity: "observed Hessian d4W/deta4",
+                eta: final_eta[i],
+                value,
+            });
+        }
         Ok((c_array, d_array, e_array, f_array))
     }
 

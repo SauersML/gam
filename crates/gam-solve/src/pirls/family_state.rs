@@ -505,19 +505,19 @@ pub(crate) fn beta_logit_working_curvature_eta_derivatives(
 }
 
 #[derive(Clone, Copy)]
-struct ExactBetaLogitRow {
-    mu: f64,
-    weight: f64,
-    z: f64,
-    c: f64,
-    d: f64,
-    dmu: f64,
-    d2mu: f64,
-    d3mu: f64,
+pub(crate) struct ExactBetaLogitRow {
+    pub(crate) mu: f64,
+    pub(crate) weight: f64,
+    pub(crate) z: f64,
+    pub(crate) c: f64,
+    pub(crate) d: f64,
+    pub(crate) dmu: f64,
+    pub(crate) d2mu: f64,
+    pub(crate) d3mu: f64,
 }
 
 #[inline]
-fn exact_beta_logit_row(
+pub(crate) fn exact_beta_logit_row(
     row: usize,
     eta: f64,
     y: Option<f64>,

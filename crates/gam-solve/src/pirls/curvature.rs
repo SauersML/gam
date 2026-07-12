@@ -13,10 +13,6 @@ pub struct VarianceJet {
 }
 
 impl VarianceJet {
-    /// Lower floor on μ before evaluating power-law variance functions, so that
-    /// `μ^(p−k)` derivatives stay finite as μ → 0 instead of producing inf/NaN.
-    const VARIANCE_MU_FLOOR: f64 = 1e-10;
-
     /// Bernoulli / binomial variance V(μ) = μ(1−μ).
     #[inline]
     pub fn bernoulli(mu: f64) -> Self {
@@ -56,7 +52,6 @@ impl VarianceJet {
     /// Tweedie variance V(μ) = μ^p.
     #[inline]
     pub fn tweedie(mu: f64, p: f64) -> Self {
-        let mu = mu.max(Self::VARIANCE_MU_FLOOR);
         Self {
             v: mu.powf(p),
             v1: p * mu.powf(p - 1.0),
@@ -69,7 +64,6 @@ impl VarianceJet {
     /// Negative-binomial variance V(μ) = μ + μ² / theta.
     #[inline]
     pub fn negative_binomial(mu: f64, theta: f64) -> Self {
-        let mu = mu.max(Self::VARIANCE_MU_FLOOR);
         let inv_theta = if valid_negbin_theta(theta) {
             1.0 / theta
         } else {
@@ -109,7 +103,7 @@ impl VarianceJet {
     /// Beta-regression variance V(μ) = μ(1−μ)/(1+φ).
     #[inline]
     pub fn beta(mu: f64, phi: f64) -> Self {
-        let scale = 1.0 / (1.0 + phi.max(1e-12));
+        let scale = 1.0 / (1.0 + phi);
         let base = Self::bernoulli(mu);
         Self {
             v: base.v * scale,
@@ -121,71 +115,47 @@ impl VarianceJet {
     }
 }
 
-pub(crate) const OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC: f64 = 1e-6;
-
-pub(crate) const OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR: f64 = 1e-12;
-
-/// Returns the per-row floor `max(fisher · 1e-6, 1e-12)` used by PIRLS to
-/// stabilize the observed-information Hessian H = X' W X + S. Saturated
-/// rows where W_obs ≤ floor were silently raised to `floor` when PIRLS
-/// built the inner Hessian; outer REML/LAML derivatives must use the
-/// **same** floored W to keep `H` and `dH/dψ` on one surface.
-///
-/// This is the single source of truth for the floor formula. Both the
-/// inner solver (`solver_hessian_weights_into`) and the outer derivative
-/// path (`outer_hessian_curvature_arrays`) route through this helper so
-/// the inner-stabilized H and the outer dH/dψ cannot drift apart.
-#[inline]
-pub fn solver_hessian_weight_floor(fisher_weight: f64) -> f64 {
-    (fisher_weight.max(0.0) * OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC)
-        .max(OBSERVED_HESSIAN_WEIGHT_ABS_FLOOR)
-}
-
-/// Build the (W, c, d) triple that matches PIRLS's stabilized H = X' W X + S.
-///
-/// PIRLS internally uses `W[i] = max(W_obs[i], floor(W_F[i]))` to keep H PD,
-/// but `pirls_result.finalweights` stores the **unfloored** observed weights.
-/// Reusing those directly in `∂H/∂ψ = X_τ' W X + … + X' diag(c · X_τ β̂) X`
-/// produces an operator that disagrees with `H` at every saturated row — a
-/// 5%-Frobenius bias that `tr(G_ε(H) · op)` amplifies by O(1/σ_min(H)),
-/// driving the analytic gradient off by orders of magnitude.
-///
-/// This helper returns the floored W, plus c and d masked to zero wherever
-/// the floor is active (so `∂W/∂η` is zero on the constant-floor branch).
-pub fn outer_hessian_curvature_arrays(
+/// Certify and return the exact statistical `(W, dW/deta, d2W/deta2)` surface.
+/// Positive-definiteness stabilization belongs to the assembled matrix/ridge
+/// layer; changing individual row weights would change the likelihood Hessian.
+pub fn exact_hessian_surface_arrays(
     hessian_weights: gam_linalg::matrix::SignedWeightsView<'_>,
-    fisher_weights: gam_linalg::matrix::PsdWeightsView<'_>,
     c_array: &Array1<f64>,
     d_array: &Array1<f64>,
     eta: &Array1<f64>,
-    inverse_link: &InverseLink,
-) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
     let hessian_view = hessian_weights.view();
-    let fisher_view = fisher_weights.view();
     let n = hessian_view.len();
-    let mut w_out = Array1::<f64>::zeros(n);
-    let mut c_out = Array1::<f64>::zeros(n);
-    let mut d_out = Array1::<f64>::zeros(n);
+    if c_array.len() != n || d_array.len() != n || eta.len() != n {
+        crate::bail_invalid_estim!(
+            "exact Hessian surface length mismatch: W={}, c={}, d={}, eta={}",
+            n,
+            c_array.len(),
+            d_array.len(),
+            eta.len()
+        );
+    }
     for i in 0..n {
-        let floor = solver_hessian_weight_floor(fisher_view[i]);
-        let w = hessian_view[i];
-        let clamp_active = eta_clamp_active(inverse_link, eta[i]);
-        let w_below_floor = !(w.is_finite() && w > floor);
-        if w_below_floor {
-            w_out[i] = floor;
-            c_out[i] = 0.0;
-            d_out[i] = 0.0;
-        } else if clamp_active {
-            w_out[i] = w;
-            c_out[i] = 0.0;
-            d_out[i] = 0.0;
-        } else {
-            w_out[i] = w;
-            c_out[i] = c_array[i];
-            d_out[i] = d_array[i];
+        for (quantity, value) in [
+            ("observed Hessian weight", hessian_view[i]),
+            ("observed Hessian dW/deta", c_array[i]),
+            ("observed Hessian d2W/deta2", d_array[i]),
+        ] {
+            if !value.is_finite() {
+                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row: i,
+                    quantity,
+                    eta: eta[i],
+                    value,
+                });
+            }
         }
     }
-    (w_out, c_out, d_out)
+    Ok((
+        hessian_view.to_owned(),
+        c_array.to_owned(),
+        d_array.to_owned(),
+    ))
 }
 
 #[inline]
@@ -304,63 +274,6 @@ pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
     )
 }
 
-#[inline]
-pub(crate) fn eta_for_observed_hessian_jet(inverse_link: &InverseLink, eta: f64) -> f64 {
-    match inverse_link {
-        // Why: canonical links keep V(mu) representable across the full f64 eta range; only guard against inf.
-        InverseLink::Standard(StandardLink::Logit | StandardLink::Log) => {
-            eta.clamp(-ETA_CLAMP, ETA_CLAMP)
-        }
-        InverseLink::Standard(StandardLink::Identity) => eta,
-        // Why: probit mu=Phi(eta) saturates to 1.0 in f64 by |eta|~8.3; +/-6 keeps V=mu(1-mu) ~ 1e-9 representable.
-        InverseLink::Standard(StandardLink::Probit) => eta.clamp(-6.0, 6.0),
-        // Why: cloglog has mu~exp(eta) for eta<<0 (underflows below ~-23) and 1-mu~exp(-exp(eta)) collapses by eta=3.
-        InverseLink::Standard(StandardLink::CLogLog) | InverseLink::LatentCLogLog(_) => {
-            eta.clamp(-23.0, 3.0)
-        }
-        InverseLink::Standard(StandardLink::LogLog) => eta.clamp(-3.0, 23.0),
-        InverseLink::Standard(StandardLink::Cauchit) => eta.clamp(-1.0e6, 1.0e6),
-        // Why: SAS / beta-logistic / mixture compose logistic-like sigmoids that saturate by |eta|~20 (logistic(20)~1-2e-9).
-        InverseLink::Sas(_) | InverseLink::BetaLogistic(_) | InverseLink::Mixture(_) => {
-            eta.clamp(-20.0, 20.0)
-        }
-    }
-}
-
-/// Returns true at rows where PIRLS clamped η (so the observed-info weights
-/// were computed at the clamped value, making `∂W/∂η` zero w.r.t. the
-/// **unclamped** η).  Outer REML/LAML derivative formulas must mask `c_obs`
-/// and `d_obs` to zero on these rows or the analytic ∂H/∂ψ disagrees with
-/// the H whose log-det we differentiate.
-#[inline]
-pub fn eta_clamp_active(inverse_link: &InverseLink, eta: f64) -> bool {
-    let clamped = eta_for_observed_hessian_jet(inverse_link, eta);
-    clamped != eta
-}
-
-/// Build solver-conditioned weights from the exact hessian weights.
-///
-/// The returned array applies a solver-only floor per observation so the
-/// Newton linear system X'W X + S stays numerically usable. This floor is
-/// purely a linear-algebra concern: the exact statistical weights stored in
-/// `lasthessian_weights` / `finalweights` are not affected.
-pub(crate) fn solver_hessian_weights_into(
-    hessian_weights: &Array1<f64>,
-    fisher_weights: &Array1<f64>,
-    out: &mut Array1<f64>,
-) {
-    if out.len() != hessian_weights.len() {
-        *out = Array1::<f64>::zeros(hessian_weights.len());
-    }
-    ndarray::Zip::from(out)
-        .and(hessian_weights)
-        .and(fisher_weights)
-        .par_for_each(|o, &w, &fw| {
-            let floor = solver_hessian_weight_floor(fw);
-            *o = if w.is_finite() && w > floor { w } else { floor };
-        });
-}
-
 /// Compute vectorised observed-information curvature arrays (w_obs, c_obs, d_obs)
 /// for the Hessian surface at the mode.
 ///
@@ -371,7 +284,7 @@ pub(crate) fn solver_hessian_weights_into(
 /// and other flexible links.
 ///
 /// The output arrays are:
-/// - `hessian_weights`: W_obs per observation (exact; solver floor applied separately).
+/// - `hessian_weights`: W_obs per observation (exact; matrix ridge applied separately).
 /// - `hessian_c`: c_obs = dW_obs/deta per observation (for outer gradient C[v]).
 /// - `hessian_d`: d_obs = d^2W_obs/deta^2 per observation (for outer Hessian Q[v_k,v_l]).
 ///
@@ -408,33 +321,28 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
     let weight_link = weight_link_for_inverse_link(inverse_link);
     let phi = fixed_glm_dispersion(likelihood);
 
-    // Parallel per-row weight assembly. At large scale (n = 320k) this loop
-    // dominates non-canonical paths because each row independently evaluates
-    // inverse-link jets and residual-dependent observed curvature. Write
-    // directly into reusable output slices rather than collecting row tuples,
-    // which removes an O(n) temporary allocation on every PIRLS update.
-    hessian_weights
-        .as_slice_mut()
-        .expect("hessian weights must be contiguous")
-        .par_iter_mut()
-        .zip(
-            hessian_c
-                .as_slice_mut()
-                .expect("hessian c must be contiguous")
-                .par_iter_mut(),
-        )
-        .zip(
-            hessian_d
-                .as_slice_mut()
-                .expect("hessian d must be contiguous")
-                .par_iter_mut(),
-        )
-        .enumerate()
-        .try_for_each(|(i, ((w_out, c_out), d_out))| -> Result<(), EstimationError> {
-            let eta_used = eta_for_observed_hessian_jet(inverse_link, eta[i]);
-            // Why: closed-form observed_weight_noncanonical requires (mu, d1..d3, h4) at one consistent eta;
-            // mixing PIRLS-state jets at unclamped eta with h4 at eta_used produced 0/0 in phi_v* divisions,
-            // surfacing as: "observed Hessian curvature is not positive finite at row N: observed=NaN, fisher=0".
+    // Compute into an indexed certificate buffer before touching caller-owned
+    // arrays.  Parallel evaluation stays O(n), while the ordered scan below
+    // deterministically reports the smallest bad row and guarantees atomic
+    // output on error.
+    let certified: Vec<Result<(f64, f64, f64), EstimationError>> = (0..n)
+        .into_par_iter()
+        .map(|i| -> Result<(f64, f64, f64), EstimationError> {
+            let eta_used = eta[i];
+            if !(priorweights[i].is_finite() && priorweights[i] >= 0.0) {
+                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "prior weight",
+                    eta: eta_used,
+                    value: priorweights[i],
+                });
+            }
+            if priorweights[i] == 0.0 {
+                return Ok((0.0, 0.0, 0.0));
+            }
+            // Every jet and every variance carrier is evaluated at this exact
+            // eta.  A non-representable tail is refused below rather than
+            // projected onto a different Hessian surface.
             let jet =
                 crate::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta_used)?;
             let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
@@ -447,46 +355,59 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
                 y[i],
                 jet.mu,
                 phi,
-                priorweights[i].max(0.0),
+                priorweights[i],
                 jet,
                 h4,
             );
-            let fisher_weight = fisher_weights[i].max(0.0);
             // A *finite* but non-positive observed weight is NOT a failure: the
             // observed information `W_obs = W_Fisher - (y-μ)·B` legitimately goes
             // indefinite on individual rows for a non-canonical link (probit,
             // cloglog, SAS, and — critically for #1598 — a blended/mixture link)
-            // whenever a large residual flips the sign of the residual-dependent
-            // correction. The inner Newton system never uses this raw value: it
-            // is clamped to the SPD floor `max(W_Fisher·1e-6, 1e-12)` by
-            // `solver_hessian_weights_into`, and the outer REML/LAML derivative
-            // path applies the *same* floor through `outer_hessian_curvature_arrays`
-            // (which also zeroes c/d on the floored row). Both consumers are
-            // designed precisely to absorb an indefinite W_obs, so hard-bailing
-            // here defeats that stabilization and aborts an otherwise well-posed
-            // solve — the mixture/SAS joint link fit on data its own pure
-            // components fit trivially (clean logit under blended(logit, probit)).
-            //
-            // We therefore reject ONLY a genuinely non-finite (NaN/Inf) weight,
-            // which signals a broken jet rather than benign indefiniteness, and
-            // pass finite values (including non-positive ones) straight through to
-            // the flooring consumers. Likewise `c_obs`/`d_obs` only need to be
-            // finite; they are zeroed automatically on any floored row downstream.
+            // whenever a residual flips the correction's sign.  Signed row
+            // weights are assembled exactly; the matrix-level ridge handles a
+            // non-PD aggregate without modifying these statistical carriers.
             if !w_obs.is_finite() {
-                crate::bail_invalid_estim!(
-                    "observed Hessian curvature is not finite at row {i}: observed={w_obs}, fisher={fisher_weight}"
-                );
+                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "observed Hessian weight",
+                    eta: eta_used,
+                    value: w_obs,
+                });
             }
-            if !c_obs.is_finite() || !d_obs.is_finite() {
-                crate::bail_invalid_estim!(
-                    "observed Hessian curvature derivatives are non-finite at row {i}: c={c_obs}, d={d_obs}"
-                );
+            if !c_obs.is_finite() {
+                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "observed Hessian dW/deta",
+                    eta: eta_used,
+                    value: c_obs,
+                });
             }
-            *w_out = w_obs;
-            *c_out = c_obs;
-            *d_out = d_obs;
-            Ok(())
+            if !d_obs.is_finite() {
+                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "observed Hessian d2W/deta2",
+                    eta: eta_used,
+                    value: d_obs,
+                });
+            }
+            Ok((w_obs, c_obs, d_obs))
         })
+        .collect();
+    let certified: Vec<(f64, f64, f64)> = certified.into_iter().collect::<Result<_, _>>()?;
+    for (i, &(w, c, d)) in certified.iter().enumerate() {
+        hessian_weights[i] = w;
+        hessian_c[i] = c;
+        hessian_d[i] = d;
+    }
+    // The caller supplies Fisher weights for the observed-vs-Fisher contract;
+    // certify that this parallel surface has the same row cardinality.
+    if fisher_weights.len() != n {
+        crate::bail_invalid_estim!(
+            "observed Hessian Fisher-weight length mismatch: expected {n}, got {}",
+            fisher_weights.len()
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn compute_observed_hessian_curvature_arrays(

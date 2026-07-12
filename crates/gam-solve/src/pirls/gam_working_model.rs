@@ -1037,18 +1037,16 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let hessian_curvature = self.update_hessian_curvature_arrays(requested_curvature)?;
         self.lasthessian_curvature = hessian_curvature;
 
-        // Build solver-side weights in the reusable n-buffer: apply a
-        // per-observation SPD floor so the Newton linear system is
-        // well-conditioned, without contaminating the model weights stored in
-        // `lasthessian_weights`.
+        // Assemble the exact signed statistical Hessian.  Positive-definiteness
+        // stabilization is applied only after X'WX + S has been assembled,
+        // through the explicit matrix ridge below; changing individual row
+        // weights would define a different likelihood surface.
         if self.workspace.matvec_buf.len() != n {
             self.workspace.matvec_buf = Array1::zeros(n);
         }
-        solver_hessian_weights_into(
-            &self.lasthessian_weights,
-            &self.lastweights,
-            &mut self.workspace.matvec_buf,
-        );
+        self.workspace
+            .matvec_buf
+            .assign(&self.lasthessian_weights);
         let solver_weights = std::mem::take(&mut self.workspace.matvec_buf);
 
         let (penalized_hessian, sparsehessian, ridge_used) = if matches!(

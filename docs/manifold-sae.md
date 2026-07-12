@@ -539,12 +539,12 @@ OLMo-2 weekday/month token sets, plus injected synthetic controls):
    `mixture_k` win therefore means the unconstrained centers predict held-out
    points better; it is no longer silently standing in for an untested cyclic
    arrangement.
-2. **Sparse non-negative codes carry a false-circle floor.** Structureless
-   controls (per-dimension-shuffled activations, covariance-matched Gaussians)
-   pushed through a sparse-SAE + per-group 2-D PCA pipeline still produce
-   adjudicator circle wins in double-digit percentages of groups. Never
-   interpret raw circle-win rates without running the byte-identical pipeline
-   on matched structureless controls.
+2. **Sparse non-negative codes can produce circular control verdicts.**
+   Structureless controls (per-dimension-shuffled activations,
+   covariance-matched Gaussians) pushed through a sparse-SAE + per-group 2-D
+   PCA pipeline still produce adjudicator circle wins in double-digit
+   percentages of groups. Never interpret raw circle-win rates without running
+   the byte-identical pipeline on matched structureless controls.
 3. **A fixed top-2 PCA masks low-relative-variance rings.** A genuine ring
    sharing its group with a linear factor at ~1× its radius is already lost
    after a top-2 variance projection, and at 2× the adjudicator prefers a
@@ -567,8 +567,11 @@ rules keep the verdict rates meaningful:
   the code sparsity it was measured at. Report mean L0 next to any rate.
 - **Run matched structureless controls.** Push a per-dimension-shuffled copy
   and a covariance-exact randomized-Hadamard copy of the same matrix through the
-  byte-identical pipeline, and report verdict rates against that per-run
-  false-circle floor (measured floors reached double digits), never raw.
+  byte-identical pipeline, and report the observed and control verdict rates
+  side by side. Across a sufficiently large prespecified census, control win
+  rates reached double digits in the measured examples. For one run, however,
+  the two control outcomes and their descriptive fraction are not an estimated
+  false-positive rate or a calibrated floor.
 
 The controls embedded in `adjudicate_atom_shape` begin at its 2-D coordinate
 input, so their two verdicts diagnose the adjudicator itself; their descriptive

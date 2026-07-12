@@ -45,13 +45,6 @@ pub(crate) const HGB_SENS_FLOOR: f64 = 1e-6;
 
 pub(crate) const IFT_QUALITY_HISTORY_CAP: usize = 5;
 
-/// Clamp bound on a linear predictor `eta` so `exp(eta)` cannot overflow f64
-/// (`exp` overflows near `709`). Mirrors the canonical PIRLS `ETA_CLAMP`; kept
-/// as a local const because that one is private to the `pirls` module. Used to
-/// detect out-of-range η rows when materializing the logit fifth-derivative
-/// channel (an out-of-range row contributes zero rather than a garbage jet).
-pub(crate) const ETA_OVERFLOW_CLAMP: f64 = 700.0;
-
 /// Rolling-quality bands and step-cap adjustment factors for the IFT step-cap
 /// controller (`record_ift_prediction_quality`). `quality` is the relative
 /// prediction residual averaged over the last [`IFT_QUALITY_HISTORY_CAP`]

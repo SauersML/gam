@@ -462,6 +462,12 @@ pub fn primary_null_metrics(report: &NullBatteryReport) -> Result<(f64, f64), St
         .summaries
         .iter()
         .any(|summary| is_primary_structure_destroying_null(summary.kind));
+    if !has_primary {
+        return Err(
+            "primary null calibration requires at least one structure-destroying control"
+                .to_string(),
+        );
+    }
     let mut p_value = 0.0_f64;
     let mut z = f64::INFINITY;
     for summary in &report.summaries {
@@ -479,7 +485,7 @@ pub fn primary_null_metrics(report: &NullBatteryReport) -> Result<(f64, f64), St
                 summary.z
             ));
         }
-        if !has_primary || is_primary_structure_destroying_null(summary.kind) {
+        if is_primary_structure_destroying_null(summary.kind) {
             p_value = p_value.max(summary.p_value);
             z = z.min(summary.z);
         }
@@ -1354,7 +1360,7 @@ impl StableColumnLocation {
 fn neumaier_add(sum: &mut f64, correction: &mut f64, term: f64) -> Result<(), String> {
     let next = *sum + term;
     if !next.is_finite() {
-        return Err("compensated column-mean accumulation overflowed".to_string());
+        return Err("compensated accumulation overflowed".to_string());
     }
     if (*sum).abs() >= term.abs() {
         *correction += (*sum - next) + term;
@@ -1363,7 +1369,7 @@ fn neumaier_add(sum: &mut f64, correction: &mut f64, term: f64) -> Result<(), St
     }
     *sum = next;
     if !(*correction).is_finite() {
-        return Err("compensated column-mean correction overflowed".to_string());
+        return Err("compensated accumulation correction overflowed".to_string());
     }
     Ok(())
 }
@@ -1387,15 +1393,41 @@ fn stable_column_location(data: ArrayView2<'_, f64>) -> Result<StableColumnLocat
         let mut sum = 0.0_f64;
         let mut correction = 0.0_f64;
         if relative_chart_is_representable {
-            for &value in data.column(axis).iter() {
-                neumaier_add(&mut sum, &mut correction, (value - origin) / count)?;
+            let residual_scale = data
+                .column(axis)
+                .iter()
+                .map(|&value| (value - origin).abs())
+                .fold(0.0_f64, f64::max);
+            if residual_scale == 0.0 {
+                mean[axis] = origin;
+                continue;
             }
-            mean[axis] = origin + (sum + correction);
+            for &value in data.column(axis).iter() {
+                neumaier_add(
+                    &mut sum,
+                    &mut correction,
+                    (value - origin) / residual_scale,
+                )?;
+            }
+            let normalized_offset = (sum + correction) / count;
+            // Fusing the scale restoration with the translated origin avoids
+            // double-rounding a subnormal offset before it can change the
+            // correctly rounded absolute mean.
+            mean[axis] = normalized_offset.mul_add(residual_scale, origin);
         } else {
-            for &value in data.column(axis).iter() {
-                neumaier_add(&mut sum, &mut correction, value / count)?;
+            let absolute_scale = data
+                .column(axis)
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0_f64, f64::max);
+            if absolute_scale == 0.0 {
+                mean[axis] = 0.0;
+                continue;
             }
-            mean[axis] = sum + correction;
+            for &value in data.column(axis).iter() {
+                neumaier_add(&mut sum, &mut correction, value / absolute_scale)?;
+            }
+            mean[axis] = ((sum + correction) / count) * absolute_scale;
         }
     }
     if mean.iter().any(|value| !value.is_finite()) {
@@ -1418,20 +1450,26 @@ fn stable_population_moments(data: ArrayView2<'_, f64>) -> Result<StablePopulati
     let p = data.ncols();
     let inverse_sqrt_count = 1.0 / (n as f64).sqrt();
     let mut covariance = Array2::<f64>::zeros((p, p));
+    let mut covariance_correction = Array2::<f64>::zeros((p, p));
+    let mut scaled_residuals = vec![0.0_f64; p];
     for row in 0..n {
+        for axis in 0..p {
+            scaled_residuals[axis] =
+                location.centered_value(data[[row, axis]], axis)? * inverse_sqrt_count;
+        }
         for left in 0..p {
-            let left_residual =
-                location.centered_value(data[[row, left]], left)? * inverse_sqrt_count;
             for right in 0..=left {
-                let right_residual =
-                    location.centered_value(data[[row, right]], right)? * inverse_sqrt_count;
-                covariance[[left, right]] += left_residual * right_residual;
+                neumaier_add(
+                    &mut covariance[[left, right]],
+                    &mut covariance_correction[[left, right]],
+                    scaled_residuals[left] * scaled_residuals[right],
+                )?;
             }
         }
     }
     for left in 0..p {
         for right in 0..=left {
-            let value = covariance[[left, right]];
+            let value = covariance[[left, right]] + covariance_correction[[left, right]];
             covariance[[left, right]] = value;
             covariance[[right, left]] = value;
         }
@@ -1564,6 +1602,14 @@ pub fn architecture_matched_random_weight_null(
     let obs_sd = stable_column_sd(observed, &observed_location)?;
     let random_weight_location = stable_column_location(random_weight)?;
     let rw_sd = stable_column_sd(random_weight, &random_weight_location)?;
+    for axis in 0..p {
+        if rw_sd[axis] == 0.0 && obs_sd[axis] > 0.0 {
+            return Err(format!(
+                "architecture-matched donor column {axis} has zero scale but observed scale is {}",
+                obs_sd[axis]
+            ));
+        }
+    }
     let mut out = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         let src = rng.random_range(0..random_weight.nrows());
@@ -1572,6 +1618,8 @@ pub fn architecture_matched_random_weight_null(
             let scaled = if rw_sd[j] > 0.0 {
                 (centered / rw_sd[j]) * obs_sd[j]
             } else {
+                // Both target and donor are structurally constant on this
+                // axis, as certified above.
                 0.0
             };
             out[[i, j]] = observed_location
@@ -2575,30 +2623,15 @@ fn stable_column_sd(
     if location.mean.len() != data.ncols() {
         return Err("column-scale location dimension mismatch".to_string());
     }
-    let mut scales = Array1::<f64>::zeros(data.ncols());
-    let mut scaled_sums = Array1::<f64>::ones(data.ncols());
+    let mut accumulators = vec![ScaledSumSquares::default(); data.ncols()];
     for row in data.rows() {
         for j in 0..data.ncols() {
-            let d = location.centered_value(row[j], j)?;
-            let magnitude = d.abs();
-            if magnitude == 0.0 {
-                continue;
-            }
-            if scales[j] < magnitude {
-                let ratio = scales[j] / magnitude;
-                scaled_sums[j] = 1.0 + scaled_sums[j] * ratio * ratio;
-                scales[j] = magnitude;
-            } else {
-                let ratio = magnitude / scales[j];
-                scaled_sums[j] += ratio * ratio;
-            }
+            accumulators[j].add(location.centered_value(row[j], j)?)?;
         }
     }
     let mut sd = Array1::<f64>::zeros(data.ncols());
     for axis in 0..data.ncols() {
-        if scales[axis] > 0.0 {
-            sd[axis] = scales[axis] * (scaled_sums[axis] / data.nrows() as f64).sqrt();
-        }
+        sd[axis] = accumulators[axis].rms(data.nrows())?;
     }
     if sd.iter().any(|value| !value.is_finite()) {
         return Err("stable column-scale accumulation overflowed".to_string());
@@ -2606,30 +2639,102 @@ fn stable_column_sd(
     Ok(sd)
 }
 
-fn centered_column(col: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
-    let matrix = col.insert_axis(Axis(1));
-    let location = stable_column_location(matrix.view())?;
-    matrix
-        .column(0)
-        .iter()
-        .map(|&value| location.centered_value(value, 0))
-        .collect::<Result<Array1<_>, _>>()
+/// LAPACK-LASSQ-style sum of squares represented as
+/// `scale^2 * scaled_sum`. No raw square is formed before division by the
+/// current scale.
+#[derive(Clone, Copy, Debug, Default)]
+struct ScaledSumSquares {
+    scale: f64,
+    scaled_sum: f64,
 }
 
-fn centered_matrix(data: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+impl ScaledSumSquares {
+    fn add(&mut self, value: f64) -> Result<(), String> {
+        if !value.is_finite() {
+            return Err(format!(
+                "scaled sum-of-squares received non-finite value {value}"
+            ));
+        }
+        let magnitude = value.abs();
+        if magnitude == 0.0 {
+            return Ok(());
+        }
+        if self.scale < magnitude {
+            let ratio = self.scale / magnitude;
+            self.scaled_sum = 1.0 + self.scaled_sum * ratio * ratio;
+            self.scale = magnitude;
+        } else {
+            let ratio = magnitude / self.scale;
+            self.scaled_sum += ratio * ratio;
+        }
+        if self.scaled_sum.is_finite() {
+            Ok(())
+        } else {
+            Err("scaled sum-of-squares accumulation overflowed".to_string())
+        }
+    }
+
+    fn norm(self) -> Result<f64, String> {
+        if self.scale == 0.0 {
+            return Ok(0.0);
+        }
+        let norm = self.scale * self.scaled_sum.sqrt();
+        if norm.is_finite() {
+            Ok(norm)
+        } else {
+            Err("Euclidean norm is not representable in float64".to_string())
+        }
+    }
+
+    fn rms(self, count: usize) -> Result<f64, String> {
+        if count == 0 {
+            return Err("root-mean-square requires at least one value".to_string());
+        }
+        if self.scale == 0.0 {
+            return Ok(0.0);
+        }
+        let rms = self.scale * (self.scaled_sum / count as f64).sqrt();
+        if rms.is_finite() {
+            Ok(rms)
+        } else {
+            Err("root-mean-square is not representable in float64".to_string())
+        }
+    }
+}
+
+/// Center every column and divide the entire residual matrix by its largest
+/// absolute entry. Scale-invariant diagnostics can then form products and
+/// Gram matrices without ever squaring a physical-coordinate magnitude.
+fn centered_unit_chart(data: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
     let location = stable_column_location(data)?;
-    let mut out = Array2::<f64>::zeros(data.raw_dim());
+    let mut scale = 0.0_f64;
     for row in 0..data.nrows() {
         for col in 0..data.ncols() {
-            out[[row, col]] = location.centered_value(data[[row, col]], col)?;
+            scale = scale.max(location.centered_value(data[[row, col]], col)?.abs());
+        }
+    }
+    let mut out = Array2::<f64>::zeros(data.raw_dim());
+    if scale == 0.0 {
+        return Ok(out);
+    }
+    for row in 0..data.nrows() {
+        for col in 0..data.ncols() {
+            out[[row, col]] = location.centered_value(data[[row, col]], col)? / scale;
         }
     }
     Ok(out)
 }
 
-fn matrix_rms(data: ArrayView2<'_, f64>) -> f64 {
-    let ss = data.iter().map(|v| v * v).sum::<f64>();
-    (ss / (data.nrows() * data.ncols()) as f64).sqrt()
+fn matrix_rms(data: ArrayView2<'_, f64>) -> Result<f64, String> {
+    let count = data
+        .nrows()
+        .checked_mul(data.ncols())
+        .ok_or_else(|| "matrix RMS element count overflowed usize".to_string())?;
+    let mut accumulator = ScaledSumSquares::default();
+    for &value in data {
+        accumulator.add(value)?;
+    }
+    accumulator.rms(count)
 }
 
 fn dominant_eigenvector(matrix: ArrayView2<'_, f64>, seed: u64) -> Result<Array1<f64>, String> {
