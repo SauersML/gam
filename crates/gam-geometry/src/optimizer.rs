@@ -774,7 +774,8 @@ mod tests {
             1
         }
 
-        fn tangent_basis(&self, _point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
+        fn tangent_basis(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
+            assert_eq!(point.len(), 1, "IndefiniteLine points are one-dimensional");
             Ok(Array2::eye(1))
         }
 
@@ -796,21 +797,39 @@ mod tests {
 
         fn parallel_transport(
             &self,
-            _point_along: ArrayView2<'_, f64>,
+            point_along: ArrayView2<'_, f64>,
             vec: ArrayView1<'_, f64>,
         ) -> GeometryResult<Array1<f64>> {
+            assert_eq!(
+                point_along.ncols(),
+                1,
+                "IndefiniteLine transport paths are one-dimensional"
+            );
+            assert_eq!(vec.len(), 1, "IndefiniteLine tangents are one-dimensional");
             Ok(vec.to_owned())
         }
 
-        fn metric_tensor(&self, _point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
+        fn metric_tensor(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
+            assert_eq!(point.len(), 1, "IndefiniteLine points are one-dimensional");
             Ok(ndarray::array![[-1.0]])
         }
 
         fn sectional_curvature(
             &self,
-            _point: ArrayView1<'_, f64>,
-            _tangent_pair: (ArrayView1<'_, f64>, ArrayView1<'_, f64>),
+            point: ArrayView1<'_, f64>,
+            tangent_pair: (ArrayView1<'_, f64>, ArrayView1<'_, f64>),
         ) -> GeometryResult<f64> {
+            assert_eq!(point.len(), 1, "IndefiniteLine points are one-dimensional");
+            assert_eq!(
+                tangent_pair.0.len(),
+                1,
+                "IndefiniteLine tangents are one-dimensional"
+            );
+            assert_eq!(
+                tangent_pair.1.len(),
+                1,
+                "IndefiniteLine tangents are one-dimensional"
+            );
             Ok(0.0)
         }
     }
@@ -1061,8 +1080,9 @@ mod tests {
         impl RiemannianObjective for NanGradient {
             fn value_gradient(
                 &mut self,
-                _point: ArrayView1<'_, f64>,
+                point: ArrayView1<'_, f64>,
             ) -> GeometryResult<(f64, Array1<f64>)> {
+                assert_eq!(point.len(), 1, "NanGradient is one-dimensional");
                 Ok((0.0, Array1::from_vec(vec![f64::NAN])))
             }
         }
