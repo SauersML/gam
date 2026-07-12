@@ -170,12 +170,12 @@ def fit_gam_flat(x_tr, x_te, mean_tr, *, K, top_k, max_epochs, seed, collect=Non
     return held_out_ev(x_te, recon, mean_tr), fit.explained_variance
 
 
-def fit_curved_topk(x_tr, x_te, mean_tr, *, K, top_k, d_atom, topology, seed):
+def fit_curved_topk(x_tr, x_te, mean_tr, *, K, top_k, d_atom, topology, max_epochs, seed):
     import gamfit
 
     model = gamfit.sae_manifold_fit(
         x_tr, K=K, d_atom=d_atom, atom_topology=topology,
-        assignment="topk", top_k=top_k, random_state=seed)
+        assignment="topk", top_k=top_k, n_iter=max_epochs, random_state=seed)
     recon = np.asarray(model.reconstruct(x_te), dtype=np.float32)
     return held_out_ev(x_te, recon, mean_tr)
 
@@ -348,7 +348,7 @@ def main() -> int:
     elif args.arm == "curved_topk":
         ev = fit_curved_topk(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
                              d_atom=args.d_atom, topology=args.atom_topology,
-                             seed=args.seed)
+                             max_epochs=args.max_epochs, seed=args.seed)
     elif args.arm == "hybrid_rust":
         ev, ev_flat = fit_hybrid_rust(x_tr, x_te, mean_tr, K=args.K, top_k=args.top_k,
                                       curved_K=args.curved_atoms, curved_k=args.curved_k,
