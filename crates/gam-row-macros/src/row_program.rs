@@ -241,7 +241,7 @@ fn path_ident(path: &ExprPath) -> Result<&Ident> {
 }
 
 fn numeric_literal(literal: &ExprLit) -> bool {
-    matches!(literal.lit, Lit::Float(_) | Lit::Int(_))
+    matches!(&literal.lit, Lit::Float(_) | Lit::Int(_))
 }
 
 fn validate_scalar(expression: &Expr, constants: &HashSet<String>) -> Result<()> {
