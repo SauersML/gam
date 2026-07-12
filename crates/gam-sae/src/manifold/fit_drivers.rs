@@ -4124,6 +4124,14 @@ impl SaeManifoldTerm {
             floor_by_atom[atom] = bar;
             coherence_by_atom[atom] = coherence;
         }
+        // #2132 — reseed only onto UNCOVERED structure. The residual is what the
+        // whole dictionary leaves unexplained; if it is at the measured noise floor
+        // the collapsed atoms are genuinely REDUNDANT and reseeding would just
+        // re-plant a duplicate onto noise (the reseed-duplication spiral). In that
+        // case demote them (terminal) instead — killing the duplicate before it is
+        // re-created rather than detecting it after (where duplication is
+        // indistinguishable from benign tiling). Measured once per guard call.
+        let residual_uncovered = self.residual_has_uncovered_signal(target, rho)?;
         let mut to_reseed = Vec::new();
         for atom in 0..k {
             if !selected[atom] {
@@ -4134,7 +4142,8 @@ impl SaeManifoldTerm {
                 .iter()
                 .filter(|event| event.atom == atom && event.action == CollapseAction::Reseeded)
                 .count();
-            if reseeds_used < SAE_ATOM_COLLAPSE_RESEED_BUDGET
+            if residual_uncovered
+                && reseeds_used < SAE_ATOM_COLLAPSE_RESEED_BUDGET
                 && self.structural_cocollapse_reseeds < SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET
             {
                 to_reseed.push(atom);
@@ -7991,6 +8000,38 @@ impl SaeManifoldTerm {
 /// rather than evidence of a redundant atom. `p` is the output dimension (every frame
 /// is `p × r_k`); an SVD failure degrades to `p` (the maximal meaningful rank) so a
 /// numerical hiccup never spuriously DISABLES the guard.
+/// #2132 — does the LEADING residual direction carry signal above the measured
+/// noise floor? `energies` are the residual output-Gram eigenvalues (per-direction
+/// residual energies, unordered). The robust noise level is their MEDIAN (real
+/// uncovered directions are sparse spikes that do not move it); the leading
+/// direction carries signal when its energy exceeds `median · log2(#dirs)` — the
+/// Bonferroni expected-one-false-alarm bound over the `#dirs` directions (the
+/// energy of the largest of `#dirs` noise directions in units of the median grows
+/// only logarithmically), guarded below by a numerical-zero fraction of the peak.
+/// This is the same measured-floor shape as the #2243 spectral bandwidth. The test
+/// errs toward RESEED (a false "signal present" only wastes a budget-bounded
+/// reseed; a false "noise" would wrongly demote a real atom), so the log2 factor is
+/// deliberately conservative rather than an MP-exact edge.
+fn leading_direction_above_noise_floor(energies: &[f64]) -> bool {
+    if energies.is_empty() {
+        return false;
+    }
+    let mut sorted: Vec<f64> = energies.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let peak = *sorted.last().unwrap();
+    if !(peak > 0.0) {
+        return false;
+    }
+    let m = sorted.len();
+    let median = if m % 2 == 1 {
+        sorted[m / 2]
+    } else {
+        0.5 * (sorted[m / 2 - 1] + sorted[m / 2])
+    };
+    let floor = (peak * 1e-12).max(median * (m as f64).max(2.0).log2());
+    peak > floor
+}
+
 fn union_output_frame_rank(frames: &[Array2<f64>], p: usize) -> usize {
     let total_cols: usize = frames.iter().map(|q| q.ncols()).sum();
     if p == 0 || total_cols == 0 {
@@ -8068,5 +8109,31 @@ mod projection_policy_tests {
         term.seed_coords_by_decoder_projection(Array2::<f64>::zeros((1, 2)).view())
             .expect("compact multivariate chart is skipped, not an error");
         assert_eq!(term.assignment.coords[0].as_matrix(), before);
+    }
+
+    /// #2132 — the measured-noise-floor "uncovered signal" test that gates a
+    /// co-collapse reseed against re-planting a duplicate onto noise: a flat
+    /// (pure-noise) residual spectrum reads as NO uncovered signal (demote the
+    /// redundant atom), while a spectrum with a dominant direction reads as signal
+    /// (reseed onto it is legitimate).
+    #[test]
+    fn leading_direction_above_noise_floor_separates_signal_from_noise_2132() {
+        // Pure noise: comparable per-direction energies, no spike ⇒ the leading
+        // direction does NOT clear the median·log2 floor.
+        let noise: Vec<f64> = (0..20).map(|i| 1.0 + 0.15 * ((i % 5) as f64 - 2.0)).collect();
+        assert!(
+            !leading_direction_above_noise_floor(&noise),
+            "a flat (pure-noise) residual spectrum must read as NO uncovered signal"
+        );
+        // One dominant uncovered direction rises far above the noise median ⇒ signal.
+        let mut signal = noise.clone();
+        signal[7] = 100.0;
+        assert!(
+            leading_direction_above_noise_floor(&signal),
+            "a residual spectrum with a dominant direction must read as uncovered signal"
+        );
+        // Degenerate inputs carry no signal to reseed onto.
+        assert!(!leading_direction_above_noise_floor(&[]));
+        assert!(!leading_direction_above_noise_floor(&[0.0, 0.0, 0.0]));
     }
 }
