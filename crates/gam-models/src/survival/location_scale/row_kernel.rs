@@ -1804,7 +1804,7 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
             return None;
         };
         Some((|| {
-            let n = self.n_rows();
+            let n = gam_math::jet_tower::RowProgram::n_rows(self);
             // Two per-row builds shared by EVERY axis, so the special-function and
             // design-materialization cost is paid once instead of `p` times:
             //   * `inputs[row]`  — the special-function-heavy NLL derivative stack

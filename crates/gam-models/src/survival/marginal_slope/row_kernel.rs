@@ -1413,7 +1413,7 @@ impl SurvivalMarginalSlopeRowKernel {
     /// build-once batched override contracts against it without changing any
     /// downstream arithmetic.
     fn build_row_towers(&self) -> Result<Vec<SparseTower4<RIGID_LINEAR_MASK>>, String> {
-        let n = <Self as RowKernel<4>>::n_rows(self);
+        let n = gam_math::jet_tower::RowProgram::n_rows(self);
         (0..n)
             .into_par_iter()
             .map(|row| {
@@ -1444,7 +1444,7 @@ impl SurvivalMarginalSlopeRowKernel {
     /// `t3` channel). The cached `t3` is bit-for-bit what the dense tower would
     /// produce.
     fn build_row_third_towers(&self) -> Result<Vec<SparseTower3<RIGID_LINEAR_MASK>>, String> {
-        let n = <Self as RowKernel<4>>::n_rows(self);
+        let n = gam_math::jet_tower::RowProgram::n_rows(self);
         (0..n)
             .into_par_iter()
             .map(|row| {
@@ -1471,7 +1471,7 @@ impl SurvivalMarginalSlopeRowKernel {
     where
         F: Fn(usize, &mut Array2<f64>) -> Result<(), String> + Sync,
     {
-        let n = <Self as RowKernel<4>>::n_rows(self);
+        let n = gam_math::jet_tower::RowProgram::n_rows(self);
         let chunk = crate::outer_subsample::ARROW_ROW_CHUNK;
         let n_chunks = crate::outer_subsample::arrow_row_chunk_count(n);
         let chunk_accumulators: Vec<Result<Array2<f64>, String>> = (0..n_chunks)
