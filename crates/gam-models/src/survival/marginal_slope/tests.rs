@@ -8945,6 +8945,47 @@ fn survival_jeffreys_contracted_trace_hessian_matches_fd_of_trace() {
         array![0.5, -0.4, 0.3, 0.6, -0.2],
         array![-0.3, 0.5, -0.6, 0.2, 0.4],
     ];
+
+    // ── Truncation-free analytic cross-check: the AUTHORITATIVE assembly gate ──
+    // The finite-difference loop further below is discretization-limited (see
+    // its comment): `tr(W·H)` is already second-order in β, so its second
+    // difference probes the FOURTH derivative and the Richardson residual floors
+    // at `O(h⁴·f⁽⁸⁾)`, which the neglog-Φ Mills-ratio tails push to ~3e-4
+    // relative on the high-magnitude time direction — a pure truncation artifact
+    // that no achievable `h` removes. So the FD can only catch an O(1) formula
+    // blunder; it cannot pin the assembly.
+    //
+    // This block pins the hook's FULL assembly (`primary_trace_weight`
+    // W-projection + full-`t4` contraction + `add_pullback_hessian`) to machine
+    // precision with NO finite-difference truncation, using the identity
+    //     uᵀ · (∇²_β tr(W·H)) · u  ==  tr(W · ∂²H/∂β_u²).
+    // The right-hand side is built by
+    // `exact_newton_joint_hessiansecond_directional_derivative` — the rank-1
+    // `fourth_contracted` second-directional path that the outer-REML Jeffreys
+    // drift already relies on. It shares neither `primary_trace_weight` nor the
+    // direct full-`t4` read with the hook: it assembles the whole `∂²H` matrix
+    // first and contracts `W` in COEFFICIENT space, whereas the hook projects
+    // `W` into PRIMARY space per row before contracting `t4`. Their agreement
+    // therefore validates that the primary-space trace projection and the
+    // Jacobian pullback commute with the coefficient-space trace. Both sides are
+    // exact (no `h`), so the tolerance is tight (1e-9), and this — not the FD —
+    // is what guarantees the #979 completion is correct.
+    for (idx, dir) in directions.iter().enumerate() {
+        let huu = family
+            .exact_newton_joint_hessiansecond_directional_derivative(&states0, dir, dir)
+            .expect("second directional derivative call")
+            .expect("rigid path must supply the second directional derivative");
+        let trace_w_huu = (&w * &huu).sum();
+        let analytic_quad = dir.dot(&analytic.dot(dir));
+        let rel = (trace_w_huu - analytic_quad).abs() / trace_w_huu.abs().max(1.0);
+        assert!(
+            rel < 1e-9,
+            "direction {idx}: contracted trace-Hessian assembly vs independent \
+             tr(W·∂²H/∂β_u²) mismatch: analytic={analytic_quad:.12e} \
+             independent={trace_w_huu:.12e} rel={rel:.3e}"
+        );
+    }
+
     // `tr(W·H(β))` is a second derivative of the row NLL, so its central
     // second difference probes the FOURTH β-derivative and carries an
     // `(h²/12)·(sixth-derivative-of-NLL)` truncation term. For the probit /
