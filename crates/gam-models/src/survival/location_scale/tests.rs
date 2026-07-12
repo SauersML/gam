@@ -6300,8 +6300,8 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
 
             // Link-wiggle warp: amplitudes are primaries 9..9+PW; each basis is
             // composed onto the BASE index jet (so it carries the η-dependence).
-            let q0v = JetScalar::value(&q0);
-            let q1v = JetScalar::value(&q1);
+            let q0v = gam_math::nested_dual::JetField::value(&q0);
+            let q1v = gam_math::nested_dual::JetField::value(&q1);
             let mut q0w = q0;
             let mut q1w = q1;
             let mut m1 = S::constant(1.0);
@@ -6320,7 +6320,7 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
             let mut nll = u0w
                 .compose_unary(survival_ls_log_survival_stack(
                     &self.link,
-                    JetScalar::value(&u0w),
+                    gam_math::nested_dual::JetField::value(&u0w),
                 )?)
                 .scale(self.w);
             let censored_weight = self.w * (1.0 - self.d);
@@ -6328,7 +6328,7 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
                 nll = nll.add(
                     &u1w.compose_unary(survival_ls_log_survival_stack(
                         &self.link,
-                        JetScalar::value(&u1w),
+                        gam_math::nested_dual::JetField::value(&u1w),
                     )?)
                     .scale(-censored_weight),
                 );
@@ -6339,13 +6339,13 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
                     .add(
                         &u1w.compose_unary(survival_ls_log_pdf_stack(
                             &self.link,
-                            JetScalar::value(&u1w),
+                            gam_math::nested_dual::JetField::value(&u1w),
                             0.0,
                         )?)
                         .scale(-event_weight),
                     )
                     .add(
-                        &g.compose_unary(survival_ls_positive_log_stack(JetScalar::value(&g)))
+                        &g.compose_unary(survival_ls_positive_log_stack(gam_math::nested_dual::JetField::value(&g)))
                             .scale(-event_weight),
                     );
             }

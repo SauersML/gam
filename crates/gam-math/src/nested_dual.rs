@@ -307,33 +307,10 @@ mod nested_dual_tower4_oracle_tests {
     use super::*;
     use crate::jet_tower::Tower4;
 
-    // Bridge the engine tower into `JetField` so the SAME `program` runs on both
-    // `Tower4<2>` and `Dual2<Dual2<f64>>`. `scale`/`neg` are composed from the
-    // tower's `mul`/`sub` primitives (it exposes no direct scale/neg).
-    impl<const K: usize> JetField for Tower4<K> {
-        fn value(&self) -> f64 {
-            self.v
-        }
-        fn add(&self, o: &Self) -> Self {
-            Tower4::add(self, o)
-        }
-        fn sub(&self, o: &Self) -> Self {
-            Tower4::sub(self, o)
-        }
-        fn mul(&self, o: &Self) -> Self {
-            Tower4::mul(self, o)
-        }
-        fn neg(&self) -> Self {
-            Tower4::constant(0.0).sub(self)
-        }
-        fn scale(&self, s: f64) -> Self {
-            Tower4::mul(self, &Tower4::constant(s))
-        }
-        fn compose_unary(&self, d: [f64; 5]) -> Self {
-            Tower4::compose_unary(self, d)
-        }
-    }
-
+    // `Tower4` is a production `JetField` (its `JetScalar` impl in `jet_scalar.rs`
+    // now rides the shared base), so the SAME `program` runs on both `Tower4<2>`
+    // and `Dual2<Dual2<f64>>` with no test-only bridge. The oracle path adds only
+    // the `Copy` constructor through `JetFieldConst`.
     impl<const K: usize> JetFieldConst for Tower4<K> {
         fn from_f64(x: f64) -> Self {
             Tower4::constant(x)

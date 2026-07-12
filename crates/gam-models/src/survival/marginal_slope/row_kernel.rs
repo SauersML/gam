@@ -100,6 +100,9 @@ impl<const LIN: u32> JetScalar<4> for SparseOrder2<LIN> {
             hess: [[0.0; 4]; 4],
         }
     }
+}
+
+impl<const LIN: u32> gam_math::nested_dual::JetField for SparseOrder2<LIN> {
     fn value(&self) -> f64 {
         self.v
     }
@@ -294,6 +297,9 @@ impl<const LIN: u32> JetScalar<4> for SparseTower3<LIN> {
         out.g[axis] = 1.0;
         out
     }
+}
+
+impl<const LIN: u32> gam_math::nested_dual::JetField for SparseTower3<LIN> {
     fn value(&self) -> f64 {
         self.v
     }
@@ -519,6 +525,9 @@ impl<const LIN: u32> JetScalar<4> for SparseTower4<LIN> {
         out.g[axis] = 1.0;
         out
     }
+}
+
+impl<const LIN: u32> gam_math::nested_dual::JetField for SparseTower4<LIN> {
     fn value(&self) -> f64 {
         self.v
     }

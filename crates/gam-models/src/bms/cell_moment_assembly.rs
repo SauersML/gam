@@ -11,6 +11,130 @@ use super::row_kernel::*;
 use super::*;
 
 use crate::fnv1a::Fnv1a;
+use gam_math::jet_scalar::{
+    DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, RuntimeJetScalar,
+    filtered_implicit_solve_runtime_scalar,
+};
+
+#[derive(Clone)]
+pub(super) struct EmpiricalBmsIndexJetPlan {
+    z: f64,
+    score_values: Vec<f64>,
+    link_stacks: Vec<[f64; 5]>,
+}
+
+#[derive(Clone)]
+struct EmpiricalBmsCalibrationNodeJetPlan {
+    index: EmpiricalBmsIndexJetPlan,
+    weight: f64,
+    cdf_stack: [f64; 5],
+}
+
+/// Canonical empirical-latent Bernoulli row plan shared by rigid and FLEX.
+///
+/// Rigid is the `h = w = None`, `dimension = 2` specialization. FLEX appends
+/// the score-warp and link-deviation primaries. The plan freezes only scalar
+/// base-point data: the certified intercept root, its scalar calibration
+/// Jacobian, the left-biased local spline spans, and primitive derivative
+/// stacks. Every derivative channel is produced by [`Self::evaluate`] from one
+/// [`RuntimeJetScalar`] expression.
+#[derive(Clone)]
+pub(super) struct EmpiricalBmsRowJetPlan {
+    primary: PrimarySlices,
+    intercept_root: f64,
+    inv_f_a: f64,
+    scale: f64,
+    mu_stack: [f64; 5],
+    calibration: Vec<EmpiricalBmsCalibrationNodeJetPlan>,
+    observed: EmpiricalBmsIndexJetPlan,
+    observed_sign: f64,
+    observed_neglog_stack: [f64; 5],
+}
+
+pub(super) struct EmpiricalBmsRowJetOutput<S> {
+    pub(super) nll: S,
+    pub(super) intercept: S,
+}
+
+impl EmpiricalBmsRowJetPlan {
+    #[inline]
+    fn index_jet<'arena, S: RuntimeJetScalar<'arena>>(
+        &self,
+        a: &S,
+        vars: &[S],
+        index: &EmpiricalBmsIndexJetPlan,
+        workspace: &'arena S::Workspace,
+    ) -> S {
+        let dimension = self.primary.total;
+        let b = &vars[self.primary.logslope];
+        let u = a.add(&b.scale(index.z));
+        let mut inside = u.clone();
+
+        if let Some(range) = self.primary.h.as_ref() {
+            let mut score = S::constant(0.0, dimension, workspace);
+            for (local, idx) in range.clone().enumerate() {
+                score = score.add(&vars[idx].scale(index.score_values[local]));
+            }
+            inside = inside.add(&b.mul(&score));
+        }
+
+        if let Some(range) = self.primary.w.as_ref() {
+            let mut warp = S::constant(0.0, dimension, workspace);
+            for (local, idx) in range.clone().enumerate() {
+                let basis = u.compose_unary(index.link_stacks[local]);
+                warp = warp.add(&vars[idx].mul(&basis));
+            }
+            inside = inside.add(&warp);
+        }
+        inside.scale(self.scale)
+    }
+
+    /// Evaluate the single empirical-row expression in any runtime-sized jet
+    /// algebra. `lift_iters` is two for order-2, three for one-seed, and four
+    /// for two-seed/full-order evaluation.
+    pub(super) fn evaluate<'arena, S: RuntimeJetScalar<'arena>>(
+        &self,
+        vars: &[S],
+        lift_iters: usize,
+        workspace: &'arena S::Workspace,
+    ) -> Result<EmpiricalBmsRowJetOutput<S>, String> {
+        let dimension = self.primary.total;
+        if vars.len() != dimension {
+            return Err(format!(
+                "empirical BMS row plan received {} primaries, expected {dimension}",
+                vars.len()
+            ));
+        }
+        if vars.iter().any(|var| var.dimension() != dimension) {
+            return Err("empirical BMS row plan received a mismatched jet dimension".to_string());
+        }
+
+        let neg_mu = vars[self.primary.q]
+            .compose_unary(self.mu_stack)
+            .neg();
+        let constraint = |a: &S| -> S {
+            let mut residual = neg_mu.clone();
+            for node in &self.calibration {
+                let eta = self.index_jet(a, vars, &node.index, workspace);
+                residual = residual.add(&eta.compose_unary(node.cdf_stack).scale(node.weight));
+            }
+            residual
+        };
+        let intercept = filtered_implicit_solve_runtime_scalar(
+            self.intercept_root,
+            self.inv_f_a,
+            lift_iters,
+            dimension,
+            workspace,
+            constraint,
+        );
+        let signed = self
+            .index_jet(&intercept, vars, &self.observed, workspace)
+            .scale(self.observed_sign);
+        let nll = signed.compose_unary(self.observed_neglog_stack);
+        Ok(EmpiricalBmsRowJetOutput { nll, intercept })
+    }
+}
 
 /// Bounded same-β reuse store for the BMS per-row cell-moment exact-cache.
 ///
@@ -349,7 +473,7 @@ impl BernoulliMarginalSlopeFamily {
             2,
         )?;
         Ok((
-            gam_math::jet_scalar::JetScalar::value(&jet),
+            gam_math::nested_dual::JetField::value(&jet),
             jet.g(),
             jet.h(),
         ))
@@ -524,7 +648,7 @@ impl BernoulliMarginalSlopeFamily {
         let eta = a_jet.add(&g_jet.scale(s * z));
         let sign = 2.0 * self.y[row] - 1.0;
         let signed = eta.scale(sign);
-        let m_signed = gam_math::jet_scalar::JetScalar::value(&signed);
+        let m_signed = gam_math::nested_dual::JetField::value(&signed);
         if !(m_signed.is_finite() || m_signed == f64::INFINITY) {
             return Err(format!(
                 "empirical rigid jet: non-finite signed margin {m_signed} at row {row}"
@@ -537,6 +661,248 @@ impl BernoulliMarginalSlopeFamily {
             ));
         }
         Ok(signed.compose_unary(stack))
+    }
+
+    fn empirical_bms_index_jet_plan(
+        &self,
+        primary: &PrimarySlices,
+        intercept: f64,
+        slope: f64,
+        z: f64,
+    ) -> Result<EmpiricalBmsIndexJetPlan, String> {
+        let score_values = if let Some(range) = primary.h.as_ref() {
+            let runtime = self.score_warp.as_ref().ok_or_else(|| {
+                "empirical BMS score-warp primary range without runtime".to_string()
+            })?;
+            let mut values = vec![0.0; range.len()];
+            Self::for_each_deviation_basis_cubic_at(
+                runtime,
+                range,
+                z,
+                "empirical BMS score-warp plan",
+                |local, _, cubic| {
+                    values[local] = cubic.evaluate(z);
+                    Ok(())
+                },
+            )?;
+            values
+        } else {
+            Vec::new()
+        };
+
+        let link_stacks = if let Some(range) = primary.w.as_ref() {
+            let runtime = self.link_dev.as_ref().ok_or_else(|| {
+                "empirical BMS link-deviation primary range without runtime".to_string()
+            })?;
+            let u = intercept + slope * z;
+            let mut stacks = vec![[0.0; 5]; range.len()];
+            Self::for_each_deviation_basis_cubic_at(
+                runtime,
+                range,
+                u,
+                "empirical BMS link-deviation plan",
+                |local, _, cubic| {
+                    stacks[local] = [
+                        cubic.evaluate(u),
+                        cubic.first_derivative(u),
+                        cubic.second_derivative(u),
+                        6.0 * cubic.c3,
+                        0.0,
+                    ];
+                    Ok(())
+                },
+            )?;
+            stacks
+        } else {
+            Vec::new()
+        };
+        Ok(EmpiricalBmsIndexJetPlan {
+            z,
+            score_values,
+            link_stacks,
+        })
+    }
+
+    /// Compile the scalar base-point data for the canonical empirical-latent
+    /// row expression. `intercept_seed` is in the raw FLEX coordinate, where
+    /// the observed probit index is `scale * (a + b*z + deviations)`. Rigid
+    /// callers convert their historical scaled intercept by dividing by
+    /// `scale`, making rigid exactly the zero-deviation specialization.
+    pub(super) fn empirical_bms_row_jet_plan(
+        &self,
+        row: usize,
+        primary: &PrimarySlices,
+        q: f64,
+        slope: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        intercept_seed: f64,
+        grid: &EmpiricalZGrid,
+    ) -> Result<EmpiricalBmsRowJetPlan, String> {
+        if primary.total < 2 || primary.q >= primary.total || primary.logslope >= primary.total {
+            return Err("empirical BMS row plan has an invalid primary layout".to_string());
+        }
+        match (primary.h.as_ref(), beta_h) {
+            (Some(range), Some(beta)) if range.len() == beta.len() => {}
+            (None, None) => {}
+            (Some(range), Some(beta)) => {
+                return Err(format!(
+                    "empirical BMS score coefficients {} != primary range {}",
+                    beta.len(),
+                    range.len()
+                ));
+            }
+            _ => {
+                return Err("empirical BMS score primary/beta presence mismatch".to_string());
+            }
+        }
+        match (primary.w.as_ref(), beta_w) {
+            (Some(range), Some(beta)) if range.len() == beta.len() => {}
+            (None, None) => {}
+            (Some(range), Some(beta)) => {
+                return Err(format!(
+                    "empirical BMS link coefficients {} != primary range {}",
+                    beta.len(),
+                    range.len()
+                ));
+            }
+            _ => {
+                return Err("empirical BMS link primary/beta presence mismatch".to_string());
+            }
+        }
+        if !intercept_seed.is_finite() {
+            return Err(format!(
+                "empirical BMS row plan has non-finite intercept seed at row {row}"
+            ));
+        }
+
+        // The derivative lift requires a genuine scalar root. Refine in the
+        // model's scalar calibration kernel, then freeze the primal Jacobian;
+        // derivative channels below come only from the canonical jet expression.
+        let mut intercept_root = intercept_seed;
+        let scalar_tol = 1e-12 * (1.0 + intercept_root.abs());
+        for _ in 0..4 {
+            let (residual, f_a, _) = self.evaluate_empirical_grid_calibration_newton(
+                intercept_root,
+                q,
+                slope,
+                beta_h,
+                beta_w,
+                grid,
+            )?;
+            intercept_root -= residual / f_a;
+            if residual.abs() <= scalar_tol {
+                break;
+            }
+        }
+        let (root_residual, f_a, _) = self.evaluate_empirical_grid_calibration_newton(
+            intercept_root,
+            q,
+            slope,
+            beta_h,
+            beta_w,
+            grid,
+        )?;
+        let root_tol = 1e-9 * (1.0 + intercept_root.abs());
+        if root_residual.abs() > root_tol {
+            return Err(format!(
+                "empirical BMS intercept is not a calibration root at row {row}: \
+                 residual={root_residual:.3e} > {root_tol:.3e}"
+            ));
+        }
+        if !(f_a.is_finite() && f_a > 0.0) {
+            return Err(format!(
+                "empirical BMS calibration has invalid F_a={f_a} at row {row}"
+            ));
+        }
+
+        let marginal = self.marginal_link_map(q)?;
+        let mut calibration = Vec::with_capacity(grid.nodes.len());
+        for (node, weight) in grid.pairs() {
+            let index = self.empirical_bms_index_jet_plan(
+                primary,
+                intercept_root,
+                slope,
+                node,
+            )?;
+            let obs = self.observed_denested_cell_partials_at_z(
+                node,
+                intercept_root,
+                slope,
+                beta_h,
+                beta_w,
+            )?;
+            let eta = eval_coeff4_at(&obs.coeff, node);
+            calibration.push(EmpiricalBmsCalibrationNodeJetPlan {
+                index,
+                weight,
+                cdf_stack: unary_derivatives_normal_cdf(eta),
+            });
+        }
+
+        let observed = self.empirical_bms_index_jet_plan(
+            primary,
+            intercept_root,
+            slope,
+            self.z[row],
+        )?;
+        let obs = self.observed_denested_cell_partials_at_z(
+            self.z[row],
+            intercept_root,
+            slope,
+            beta_h,
+            beta_w,
+        )?;
+        let observed_sign = 2.0 * self.y[row] - 1.0;
+        let signed = observed_sign * eval_coeff4_at(&obs.coeff, self.z[row]);
+        let observed_neglog_stack =
+            unary_derivatives_neglog_phi(signed, self.weights[row]);
+        if !observed_neglog_stack[0].is_finite() {
+            return Err(format!(
+                "empirical BMS row plan has non-finite log Phi at row {row}"
+            ));
+        }
+        Ok(EmpiricalBmsRowJetPlan {
+            primary: primary.clone(),
+            intercept_root,
+            inv_f_a: 1.0 / f_a,
+            scale: self.probit_frailty_scale(),
+            mu_stack: [
+                marginal.mu,
+                marginal.mu1,
+                marginal.mu2,
+                marginal.mu3,
+                marginal.mu4,
+            ],
+            calibration,
+            observed,
+            observed_sign,
+            observed_neglog_stack,
+        })
+    }
+
+    pub(super) fn empirical_bms_row_order2(
+        &self,
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+    ) -> Result<(f64, Array1<f64>, Array2<f64>, Array1<f64>), String> {
+        let dimension = plan.primary.total;
+        if point.len() != dimension {
+            return Err(format!(
+                "empirical BMS order-2 point length {} != {dimension}",
+                point.len()
+            ));
+        }
+        let arena = DynamicJetArena::new();
+        let vars = arena.alloc_slice_fill_with(dimension, |axis| {
+            DynamicOrder2::variable(point[axis], axis, dimension, &arena)
+        });
+        let out = plan.evaluate(vars, 2, &arena)?;
+        let gradient = Array1::from_vec(out.nll.g().to_vec());
+        let hessian = Array2::from_shape_vec((dimension, dimension), out.nll.h().to_vec())
+            .map_err(|error| format!("empirical BMS Hessian shape: {error}"))?;
+        let intercept_gradient = Array1::from_vec(out.intercept.g().to_vec());
+        Ok((out.nll.v, gradient, hessian, intercept_gradient))
     }
 
     pub(super) fn primary_component_jet(

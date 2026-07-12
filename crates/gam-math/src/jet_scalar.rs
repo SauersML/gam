@@ -43,7 +43,7 @@
 //!
 //! As in [`crate::jet_tower`], humans own primitive stability and the algebra
 //! owns combinatorics: tail-critical special functions enter ONLY as
-//! hand-certified `[f64; 5]` derivative stacks through [`JetScalar::compose_unary`]
+//! hand-certified `[f64; 5]` derivative stacks through [`crate::nested_dual::JetField::compose_unary`]
 //! (each scalar consumes the leading entries its order needs), never by
 //! differentiating an unstable primal.
 //!
@@ -917,7 +917,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicTwoSeed<'arena> {
 // the primaries (mirroring how they read as `Tower4` expressions). These
 // delegate channel-for-channel to the inner `Tower2` arithmetic (which has
 // `Add`/`Mul`; `Sub`/`Neg` are expressed as `+ (-1)·rhs` exactly as the
-// `JetScalar::sub` / `JetScalar::neg` impls do), so an `Order2` expression is
+// `crate::nested_dual::JetField::sub` / `crate::nested_dual::JetField::neg` impls do), so an `Order2` expression is
 // bit-identical to the same `Tower4` expression's order-≤2 channels.
 
 impl<const K: usize> std::ops::Add for Order2<K> {
@@ -1324,6 +1324,9 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
     fn variable(x: f64, axis: usize) -> Self {
         Order2(crate::jet_tower::Tower2::variable(x, axis))
     }
+}
+
+impl<const K: usize> crate::nested_dual::JetField for Order2<K> {
     fn value(&self) -> f64 {
         self.0.v
     }
@@ -2110,6 +2113,9 @@ impl<const K: usize> JetScalar<K> for Order1<K> {
         g[axis] = 1.0;
         Order1 { v: x, g }
     }
+}
+
+impl<const K: usize> crate::nested_dual::JetField for Order1<K> {
     fn value(&self) -> f64 {
         self.v
     }
@@ -2221,6 +2227,9 @@ impl<const K: usize> JetScalar<K> for OneSeed<K> {
             eps: Order2::constant(0.0),
         }
     }
+}
+
+impl<const K: usize> crate::nested_dual::JetField for OneSeed<K> {
     fn value(&self) -> f64 {
         self.base.value()
     }
@@ -2556,6 +2565,9 @@ impl<const K: usize> JetScalar<K> for TwoSeed<K> {
             eps_del: Order2::constant(0.0),
         }
     }
+}
+
+impl<const K: usize> crate::nested_dual::JetField for TwoSeed<K> {
     fn value(&self) -> f64 {
         self.base.value()
     }
@@ -2918,6 +2930,9 @@ impl<const K: usize> JetScalar<K> for crate::jet_tower::Tower3<K> {
     fn variable(x: f64, axis: usize) -> Self {
         crate::jet_tower::Tower3::variable(x, axis)
     }
+}
+
+impl<const K: usize> crate::nested_dual::JetField for crate::jet_tower::Tower3<K> {
     fn value(&self) -> f64 {
         self.v
     }
@@ -2962,6 +2977,9 @@ impl<const K: usize> JetScalar<K> for crate::jet_tower::Tower4<K> {
     fn variable(x: f64, axis: usize) -> Self {
         crate::jet_tower::Tower4::variable(x, axis)
     }
+}
+
+impl<const K: usize> crate::nested_dual::JetField for crate::jet_tower::Tower4<K> {
     fn value(&self) -> f64 {
         self.v
     }
@@ -3281,7 +3299,7 @@ mod tests {
                 let base = rand_unit(state);
                 let mut s = Order2::<K>::variable(base, 0);
                 for a in 1..K {
-                    s = JetScalar::mul(&s, &Order2::<K>::variable(rand_unit(state), a));
+                    s = crate::nested_dual::JetField::mul(&s, &Order2::<K>::variable(rand_unit(state), a));
                 }
                 let with = s.compose_unary_with(stack);
                 let explicit = s.compose_unary(stack(s.value()));
@@ -3549,16 +3567,16 @@ mod batch_tests {
             <Self as JetScalar<K>>::constant(c)
         }
         fn add(&self, o: &Self) -> Self {
-            JetScalar::add(self, o)
+            crate::nested_dual::JetField::add(self, o)
         }
         fn sub(&self, o: &Self) -> Self {
-            JetScalar::sub(self, o)
+            crate::nested_dual::JetField::sub(self, o)
         }
         fn mul(&self, o: &Self) -> Self {
-            JetScalar::mul(self, o)
+            crate::nested_dual::JetField::mul(self, o)
         }
         fn scale(&self, s: f64) -> Self {
-            JetScalar::scale(self, s)
+            crate::nested_dual::JetField::scale(self, s)
         }
         fn exp(&self) -> Self {
             JetScalar::exp(self)
@@ -3718,16 +3736,16 @@ mod batch_tests {
             <Self as JetScalar<K>>::constant(c)
         }
         fn add(&self, o: &Self) -> Self {
-            JetScalar::add(self, o)
+            crate::nested_dual::JetField::add(self, o)
         }
         fn sub(&self, o: &Self) -> Self {
-            JetScalar::sub(self, o)
+            crate::nested_dual::JetField::sub(self, o)
         }
         fn mul(&self, o: &Self) -> Self {
-            JetScalar::mul(self, o)
+            crate::nested_dual::JetField::mul(self, o)
         }
         fn scale(&self, s: f64) -> Self {
-            JetScalar::scale(self, s)
+            crate::nested_dual::JetField::scale(self, s)
         }
         fn exp(&self) -> Self {
             JetScalar::exp(self)
@@ -3772,16 +3790,16 @@ mod batch_tests {
             <Self as JetScalar<K>>::constant(c)
         }
         fn add(&self, o: &Self) -> Self {
-            JetScalar::add(self, o)
+            crate::nested_dual::JetField::add(self, o)
         }
         fn sub(&self, o: &Self) -> Self {
-            JetScalar::sub(self, o)
+            crate::nested_dual::JetField::sub(self, o)
         }
         fn mul(&self, o: &Self) -> Self {
-            JetScalar::mul(self, o)
+            crate::nested_dual::JetField::mul(self, o)
         }
         fn scale(&self, s: f64) -> Self {
-            JetScalar::scale(self, s)
+            crate::nested_dual::JetField::scale(self, s)
         }
         fn exp(&self) -> Self {
             JetScalar::exp(self)
@@ -4024,10 +4042,10 @@ mod unit_tests {
     fn order2_add_sub_roundtrip() {
         let p = Order2::<2>::variable(3.0, 0);
         let q = Order2::<2>::variable(2.0, 1);
-        let pq = JetScalar::add(&p, &q);
+        let pq = crate::nested_dual::JetField::add(&p, &q);
         // value = 3 + 2 = 5
         assert_eq!(pq.value(), 5.0, "add value");
-        let back = JetScalar::sub(&pq, &q);
+        let back = crate::nested_dual::JetField::sub(&pq, &q);
         // (p + q) - q gradient should equal p's gradient exactly
         for a in 0..2 {
             assert_eq!(back.g()[a], p.g()[a], "grad[{a}] roundtrip");
@@ -4042,7 +4060,7 @@ mod unit_tests {
         let qv = -2.0_f64;
         let p = Order2::<2>::variable(pv, 0);
         let q = Order2::<2>::variable(qv, 1);
-        let pq = JetScalar::mul(&p, &q);
+        let pq = crate::nested_dual::JetField::mul(&p, &q);
         assert_eq!(pq.value(), pv * qv, "value = p·q");
         assert_eq!(pq.g()[0], qv, "∂(p·q)/∂p = q");
         assert_eq!(pq.g()[1], pv, "∂(p·q)/∂q = p");
@@ -4057,7 +4075,7 @@ mod unit_tests {
     fn order2_scale_multiplies_all_channels() {
         let p = Order2::<2>::variable(4.0, 0);
         let s = 2.5_f64;
-        let ps = JetScalar::scale(&p, s);
+        let ps = crate::nested_dual::JetField::scale(&p, s);
         assert_eq!(ps.value(), 4.0 * s);
         assert_eq!(ps.g()[0], 1.0 * s);
         assert_eq!(ps.g()[1], 0.0);
@@ -4128,7 +4146,7 @@ mod unit_tests {
         let qv = -2.0_f64;
         let p = Order1::<2>::variable(pv, 0);
         let q = Order1::<2>::variable(qv, 1);
-        let pq = JetScalar::mul(&p, &q);
+        let pq = crate::nested_dual::JetField::mul(&p, &q);
         assert_eq!(pq.value(), pv * qv);
         assert_eq!(pq.g()[0], qv, "∂(p·q)/∂p = q");
         assert_eq!(pq.g()[1], pv, "∂(p·q)/∂q = p");
@@ -4154,11 +4172,11 @@ mod unit_tests {
         // evaluate (p * q + p).exp() at (p0, q0)
         let p1 = Order1::<2>::variable(p0, 0);
         let q1 = Order1::<2>::variable(q0, 1);
-        let expr1 = JetScalar::exp(&JetScalar::add(&JetScalar::mul(&p1, &q1), &p1));
+        let expr1 = JetScalar::exp(&crate::nested_dual::JetField::add(&crate::nested_dual::JetField::mul(&p1, &q1), &p1));
 
         let p2 = Order2::<2>::variable(p0, 0);
         let q2 = Order2::<2>::variable(q0, 1);
-        let expr2 = JetScalar::exp(&JetScalar::add(&JetScalar::mul(&p2, &q2), &p2));
+        let expr2 = JetScalar::exp(&crate::nested_dual::JetField::add(&crate::nested_dual::JetField::mul(&p2, &q2), &p2));
 
         assert!(
             (expr1.value() - expr2.value()).abs() < 1e-14,
@@ -4182,7 +4200,7 @@ mod unit_tests {
         let theta = Order2::<1>::variable(theta0, 0);
         // a0 = theta0, F_a = 1, inv_fa = 1; 2 iters suffice for Order2.
         let a = filtered_implicit_solve_scalar::<1, Order2<1>>(theta0, 1.0, 2, |a_jet| {
-            JetScalar::sub(a_jet, &theta)
+            crate::nested_dual::JetField::sub(a_jet, &theta)
         });
         assert!((a.value() - theta0).abs() < 1e-14, "value = theta0");
         // da/dtheta = 1 (identity)
@@ -4201,8 +4219,8 @@ mod unit_tests {
         let theta = Order2::<1>::variable(theta0, 0);
         // F(a,theta) = a*a - theta
         let a = filtered_implicit_solve_scalar::<1, Order2<1>>(a0, inv_fa, 2, |a_jet| {
-            let aa = JetScalar::mul(a_jet, a_jet);
-            JetScalar::sub(&aa, &theta)
+            let aa = crate::nested_dual::JetField::mul(a_jet, a_jet);
+            crate::nested_dual::JetField::sub(&aa, &theta)
         });
         let tol = 1e-12;
         assert!((a.value() - a0).abs() < tol, "value = sqrt(theta0)");

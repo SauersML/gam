@@ -108,7 +108,7 @@ impl FisherPerturbation for OneSeed<0> {
 
     #[inline(always)]
     fn coefficient(&self) -> f64 {
-        JetScalar::value(&self.eps)
+        gam_math::nested_dual::JetField::value(&self.eps)
     }
 }
 
@@ -125,7 +125,7 @@ impl FisherPerturbation for TwoSeed<0> {
 
     #[inline(always)]
     fn coefficient(&self) -> f64 {
-        JetScalar::value(&self.eps_del)
+        gam_math::nested_dual::JetField::value(&self.eps_del)
     }
 }
 
