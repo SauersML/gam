@@ -1267,7 +1267,7 @@ impl BernoulliMarginalSlopeFamily {
     fn empirical_fixed_third_contracted<const K: usize>(
         plan: &EmpiricalBmsRowJetPlan,
         point: &[f64],
-        direction: &[f64],
+        direction: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
         debug_assert_eq!(point.len(), K);
         debug_assert_eq!(direction.len(), K);
@@ -1291,8 +1291,8 @@ impl BernoulliMarginalSlopeFamily {
     fn empirical_fixed_fourth_contracted<const K: usize>(
         plan: &EmpiricalBmsRowJetPlan,
         point: &[f64],
-        direction_u: &[f64],
-        direction_v: &[f64],
+        direction_u: &Array1<f64>,
+        direction_v: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
         debug_assert_eq!(point.len(), K);
         debug_assert_eq!(direction_u.len(), K);
