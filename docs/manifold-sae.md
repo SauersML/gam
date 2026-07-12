@@ -564,7 +564,7 @@ rules keep the verdict rates meaningful:
   dense-dictionary groups) — so a raw verdict rate is uninterpretable without
   the code sparsity it was measured at. Report mean L0 next to any rate.
 - **Run matched structureless controls.** Push a per-dimension-shuffled copy
-  and a covariance-matched Gaussian copy of the same matrix through the
+  and a covariance-exact randomized-Hadamard copy of the same matrix through the
   byte-identical pipeline, and report verdict rates against that per-run
   false-circle floor (measured floors reached double digits), never raw.
 
@@ -597,8 +597,9 @@ seeded blockwise orthogonal Walsh-Hadamard mixing. Every block transform `Q`
 satisfies `QᵀQ = I` and `Q1 = 1`, so the complete control preserves the
 empirical mean and centered cross-product exactly in real arithmetic while
 destroying rowwise radii and nonlinear manifold geometry. Its work is
-`O(np log B)` with `B ≤ 1024`, and peak transform storage is one `B × p`
-float64 workspace rather than a corpus-sized covariance matrix or factor.
+`O(np log B)` with `B ≤ 1024`, and peak transform storage is at most
+`min(8, ceil(n / B), worker_threads) × B × p` float64 scalars rather than a
+corpus-sized covariance matrix or factor.
 Float32 activation corpora produce float32 controls; float64 inputs remain
 float64. The callback contract requires a fresh deterministic fit and receives
 the same `pipeline_seed` for all three runs.

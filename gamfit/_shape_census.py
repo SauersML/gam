@@ -74,9 +74,10 @@ def run_shape_controlled_census(
     Native float32 and float64 inputs preserve their dtype in all three
     callbacks. An already C-contiguous native input is retained as a read-only
     view without a corpus-sized source copy. Other layouts and dtypes are
-    normalized exactly once. The covariance-exact transform uses one bounded
-    ``B × p`` float64 workspace with ``B <= 1024``; it never forms a ``p × p``
-    covariance or a corpus-sized float64 copy of float32 input.
+    normalized exactly once. The covariance-exact transform uses at most
+    ``min(8, ceil(n / B), worker_threads)`` bounded ``B × p`` float64
+    workspaces with ``B <= 1024``; it never forms a ``p × p`` covariance or a
+    corpus-sized float64 copy of float32 input.
 
     The controls are generated at pipeline entry, not from a fitted 2-D chart:
     a per-dimension permutation preserves every marginal, while a mean-fixing

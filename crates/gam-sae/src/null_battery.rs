@@ -22,9 +22,10 @@ pub const COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS: usize = 1_024;
 
 /// Hard cap on concurrently transformed covariance-exact Hadamard blocks.
 ///
-/// Actual concurrency is the minimum of this cap, the number of blocks, and
-/// the active Rayon pool's thread count. Thus transform memory is bounded by
-/// `8 * 1024 * p * sizeof(f64)` independently of the corpus row count.
+/// Actual concurrency is the minimum of this cap, `ceil(n / 1024)`, and the
+/// active Rayon pool's thread count. Thus transform memory is bounded by
+/// `8 * 1024 * p * sizeof(f64)` independently of the corpus row count; binary
+/// tail blocks share those same task workspaces in later waves.
 pub const COVARIANCE_EXACT_HADAMARD_MAX_PARALLEL_WORKSPACES: usize = 8;
 
 const HADAMARD_PERMUTATION_SEED_DOMAIN: u64 = 0x4841_4441_5045_524D;
@@ -771,11 +772,19 @@ fn covariance_exact_hadamard_blocks(nrows: usize) -> Result<Vec<HadamardBlock>, 
     Ok(blocks)
 }
 
-fn covariance_exact_hadamard_parallel_tasks(blocks: usize) -> Result<usize, String> {
-    if blocks == 0 {
-        return Err("covariance-exact Hadamard parallel plan requires blocks".to_string());
+fn covariance_exact_hadamard_parallel_tasks(nrows: usize) -> Result<usize, String> {
+    if nrows == 0 {
+        return Err("covariance-exact Hadamard parallel plan requires rows".to_string());
     }
-    Ok(blocks
+    let tail_group = if nrows % COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS == 0 {
+        0
+    } else {
+        1
+    };
+    let row_groups = (nrows / COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS)
+        .checked_add(tail_group)
+        .ok_or_else(|| "covariance-exact Hadamard row-group count overflowed".to_string())?;
+    Ok(row_groups
         .min(COVARIANCE_EXACT_HADAMARD_MAX_PARALLEL_WORKSPACES)
         .min(rayon::current_num_threads().max(1)))
 }
@@ -942,7 +951,7 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
         return Err("covariance-exact Hadamard input must be nonempty".to_string());
     }
     let blocks = covariance_exact_hadamard_blocks(n)?;
-    let parallel_tasks = covariance_exact_hadamard_parallel_tasks(blocks.len())?;
+    let parallel_tasks = covariance_exact_hadamard_parallel_tasks(n)?;
     let workspace_rows = covariance_exact_hadamard_workspace_rows(n)?;
     let workspace_scalars = workspace_rows.checked_mul(p).ok_or_else(|| {
         format!(
@@ -1084,7 +1093,7 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
 /// exact arithmetic, while rowwise radii and nonlinear manifold geometry are
 /// mixed. Blocks run independently with sequential butterfly arithmetic. Peak
 /// transform storage is at most
-/// `min(8, block_count, Rayon threads) × B × p` float64 scalars.
+/// `min(8, ceil(n / B), Rayon threads) × B × p` float64 scalars.
 pub fn covariance_exact_hadamard_null(
     data: ArrayView2<'_, f64>,
     seed: u64,
@@ -2759,17 +2768,17 @@ mod tests {
             .num_threads(1)
             .build()
             .unwrap()
-            .install(|| covariance_exact_hadamard_parallel_tasks(blocks.len()).unwrap());
+            .install(|| covariance_exact_hadamard_parallel_tasks(rows).unwrap());
         let four_tasks = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .build()
             .unwrap()
-            .install(|| covariance_exact_hadamard_parallel_tasks(blocks.len()).unwrap());
+            .install(|| covariance_exact_hadamard_parallel_tasks(rows).unwrap());
         let sixteen_thread_tasks = rayon::ThreadPoolBuilder::new()
             .num_threads(16)
             .build()
             .unwrap()
-            .install(|| covariance_exact_hadamard_parallel_tasks(blocks.len()).unwrap());
+            .install(|| covariance_exact_hadamard_parallel_tasks(rows).unwrap());
         assert_eq!(one_task, 1);
         assert_eq!(four_tasks, 4);
         assert_eq!(
@@ -2787,6 +2796,23 @@ mod tests {
                 * columns
         );
         assert!(bounded_scalars < rows * columns);
+
+        let binary_tail_rows = COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS + 476;
+        assert!(
+            covariance_exact_hadamard_blocks(binary_tail_rows)
+                .unwrap()
+                .len()
+                > 2
+        );
+        let binary_tail_tasks = rayon::ThreadPoolBuilder::new()
+            .num_threads(16)
+            .build()
+            .unwrap()
+            .install(|| covariance_exact_hadamard_parallel_tasks(binary_tail_rows).unwrap());
+        assert_eq!(
+            binary_tail_tasks, 2,
+            "binary tail blocks must reuse ceil(n / B) bounded workspaces"
+        );
     }
 
     #[test]

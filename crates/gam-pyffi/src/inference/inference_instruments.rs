@@ -2940,8 +2940,9 @@ pub(crate) fn shape_matched_control<'py>(
 /// Float32-preserving structureless control for full-pipeline censuses.
 ///
 /// Unlike [`shape_matched_control`], this entry point never widens the full
-/// `n × p` input or output matrix. The covariance-exact branch transforms one
-/// power-of-two row block at a time in a bounded `B × p` float64 workspace,
+/// `n × p` input or output matrix. The covariance-exact branch transforms
+/// independent power-of-two row blocks in at most
+/// `min(8, ceil(n / B), worker_threads)` bounded `B × p` float64 workspaces,
 /// with `B <= 1024`; it never forms a `p × p` covariance or eigendecomposition.
 #[pyfunction]
 #[pyo3(signature = (data, kind, seed = 11))]
