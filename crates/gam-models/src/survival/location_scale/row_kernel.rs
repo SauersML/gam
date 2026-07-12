@@ -1556,8 +1556,10 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         // runtime dependency mask, or dense 9×9 intermediate exists. The
         // `survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels`
         // oracle pins this compiled schedule to the full Tower4 source.
-        let (p, kernel) = self.row_nll_inputs(row)?;
-        Ok(sls_row_vgh_compiled(&p, &kernel))
+        match self.row_nll_inputs_opt(row)? {
+            Some((p, kernel)) => Ok(sls_row_vgh_compiled(&p, &kernel)),
+            None => Ok((0.0, [0.0; SLS_ROW_K], [[0.0; SLS_ROW_K]; SLS_ROW_K])),
+        }
     }
 
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; SLS_ROW_K] {
@@ -1851,6 +1853,62 @@ fn require_fitted_block_geometry(
     Ok(())
 }
 
+/// The three coefficient-space views lowered from the same packed survival-LS
+/// row-Hessian coefficients. `DenseFull` is the coupled exact-Newton matrix,
+/// `BlockDiagonal` is the per-block inner-Newton working set, and
+/// `DiagonalOnly` is the trust metric. No target re-evaluates row calculus.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SlsCoefficientHessianTarget {
+    DenseFull,
+    BlockDiagonal,
+    DiagonalOnly,
+}
+
+pub(crate) enum SlsCoefficientHessian {
+    DenseFull(Array2<f64>),
+    BlockDiagonal(Vec<Array2<f64>>),
+    DiagonalOnly(Array1<f64>),
+}
+
+#[derive(Clone, Debug)]
+struct SlsHessianPairGroup {
+    left_channel: usize,
+    right_channel: usize,
+    left_design: usize,
+    right_design: usize,
+    pairs: Vec<(usize, usize)>,
+}
+
+/// The only structurally live upper-triangle pairs of the canonical
+/// nine-primary survival-LS row program. The ordering is block-major:
+/// TT, TQ, TL, QQ, QL, LL. Symmetry supplies the omitted lower triangle.
+const SLS_HESSIAN_PAIRS: [(usize, usize); 24] = [
+    (0, 0),
+    (1, 1),
+    (2, 2),
+    (0, 4),
+    (1, 3),
+    (2, 3),
+    (2, 5),
+    (0, 7),
+    (1, 6),
+    (2, 6),
+    (2, 8),
+    (3, 3),
+    (3, 5),
+    (4, 4),
+    (5, 5),
+    (3, 6),
+    (3, 8),
+    (4, 7),
+    (5, 6),
+    (5, 8),
+    (6, 6),
+    (6, 8),
+    (7, 7),
+    (8, 8),
+];
+
 impl SurvivalLocationScaleFamily {
     pub(crate) const BLOCK_TIME: usize = 0;
     pub(crate) const BLOCK_THRESHOLD: usize = 1;
@@ -1890,6 +1948,255 @@ impl SurvivalLocationScaleFamily {
             dynamic,
             deriv_log_scale,
             offsets: self.joint_block_offsets(),
+        }
+    }
+
+    /// Lower the canonical non-wiggle [`RowProgram`] Hessian into coefficient
+    /// space through one packed 24-pair plan.
+    ///
+    /// Channels which resolve to the same physical design share a group before
+    /// any cross product is run: entry falls back to exit, while absent
+    /// derivative designs remove their pairs. Thus the 24 structural pairs
+    /// become 12 cross products for invariant threshold/scale designs, 18 when
+    /// one block is fully time-varying, and 24 when both are. Per-row coefficients
+    /// live in one slot-major `groups × n` buffer. An HT mask, when present, is
+    /// multiplied into each final grouped row coefficient exactly once.
+    pub(crate) fn survival_ls_coefficient_hessian(
+        &self,
+        dynamic: &SurvivalDynamicGeometry,
+        deriv_log_scale: f64,
+        row_mask: Option<&Array1<f64>>,
+        target: SlsCoefficientHessianTarget,
+    ) -> Result<SlsCoefficientHessian, String> {
+        if self.x_link_wiggle.is_some() {
+            return Err(SurvivalLocationScaleError::InternalInvariant {
+                reason: "the packed 24-pair survival-LS plan requires fixed non-wiggle geometry"
+                    .to_string(),
+            }
+            .into());
+        }
+        if let Some(mask) = row_mask
+            && mask.len() != self.n
+        {
+            return Err(SurvivalLocationScaleError::DimensionMismatch {
+                reason: format!(
+                    "survival-LS coefficient Hessian mask length {} != row count {}",
+                    mask.len(),
+                    self.n
+                ),
+            }
+            .into());
+        }
+
+        let threshold_exit = self.x_threshold.to_dense_cow();
+        let threshold_entry = self
+            .x_threshold_entry
+            .as_ref()
+            .map(DesignMatrix::to_dense_cow);
+        let threshold_deriv = self
+            .x_threshold_deriv
+            .as_ref()
+            .map(DesignMatrix::to_dense_cow);
+        let log_sigma_exit = self.x_log_sigma.to_dense_cow();
+        let log_sigma_entry = self
+            .x_log_sigma_entry
+            .as_ref()
+            .map(DesignMatrix::to_dense_cow);
+        let log_sigma_deriv = self
+            .x_log_sigma_deriv
+            .as_ref()
+            .map(DesignMatrix::to_dense_cow);
+
+        let designs: [Option<&Array2<f64>>; SLS_ROW_K] = [
+            Some(&dynamic.time_jac_entry),
+            Some(&dynamic.time_jac_exit),
+            Some(&dynamic.time_jac_deriv),
+            Some(threshold_exit.as_ref()),
+            Some(
+                threshold_entry
+                    .as_deref()
+                    .unwrap_or(threshold_exit.as_ref()),
+            ),
+            threshold_deriv.as_deref(),
+            Some(log_sigma_exit.as_ref()),
+            Some(
+                log_sigma_entry
+                    .as_deref()
+                    .unwrap_or(log_sigma_exit.as_ref()),
+            ),
+            log_sigma_deriv.as_deref(),
+        ];
+
+        // Stable design identities. A fallback channel deliberately receives
+        // its exit channel's identity, which is what merges pair coefficients
+        // before the single X'WX call. Optional derivative channels have no
+        // identity and their structural pairs disappear.
+        let design_ids: [Option<usize>; SLS_ROW_K] = [
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(if threshold_entry.is_some() { 4 } else { 3 }),
+            threshold_deriv.as_ref().map(|_| 5),
+            Some(6),
+            Some(if log_sigma_entry.is_some() { 7 } else { 6 }),
+            log_sigma_deriv.as_ref().map(|_| 8),
+        ];
+
+        let mut groups: Vec<SlsHessianPairGroup> = Vec::with_capacity(SLS_HESSIAN_PAIRS.len());
+        for (left_channel, right_channel) in SLS_HESSIAN_PAIRS {
+            let (Some(left_design), Some(right_design)) =
+                (design_ids[left_channel], design_ids[right_channel])
+            else {
+                continue;
+            };
+            if let Some(group) = groups.iter_mut().find(|group| {
+                group.left_design == left_design && group.right_design == right_design
+            }) {
+                group.pairs.push((left_channel, right_channel));
+            } else {
+                groups.push(SlsHessianPairGroup {
+                    left_channel,
+                    right_channel,
+                    left_design,
+                    right_design,
+                    pairs: vec![(left_channel, right_channel)],
+                });
+            }
+        }
+
+        let kernel = self.survival_ls_row_kernel_rescaled(dynamic, deriv_log_scale);
+        let mut slots = Array2::<f64>::zeros((groups.len(), self.n));
+        slots
+            .axis_iter_mut(Axis(1))
+            .into_par_iter()
+            .enumerate()
+            .try_for_each(|(row, mut row_slots)| -> Result<(), String> {
+                let (_, _, h) = crate::row_kernel::RowKernel::row_kernel(&kernel, row)?;
+                for (slot, group) in groups.iter().enumerate() {
+                    let coefficient = group
+                        .pairs
+                        .iter()
+                        .fold(0.0, |sum, &(a, b)| sum + h[a][b]);
+                    row_slots[slot] = match row_mask {
+                        Some(mask) => coefficient * mask[row],
+                        None => coefficient,
+                    };
+                }
+                Ok(())
+            })?;
+
+        let offsets = self.joint_block_offsets();
+        let p_total = *offsets
+            .last()
+            .ok_or_else(|| "missing survival-LS joint block offsets".to_string())?;
+        if offsets.len() != 4 {
+            return Err(SurvivalLocationScaleError::InternalInvariant {
+                reason: format!(
+                    "packed survival-LS plan expected three coefficient blocks, got {}",
+                    offsets.len().saturating_sub(1)
+                ),
+            }
+            .into());
+        }
+
+        if target == SlsCoefficientHessianTarget::DiagonalOnly {
+            let mut diagonal = Array1::<f64>::zeros(p_total);
+            for (slot, group) in groups.iter().enumerate() {
+                let left_block = group.left_channel / 3;
+                let right_block = group.right_channel / 3;
+                if left_block != right_block {
+                    continue;
+                }
+                let left = designs[group.left_channel]
+                    .expect("active survival-LS pair has a left design");
+                let right = designs[group.right_channel]
+                    .expect("active survival-LS pair has a right design");
+                let weights = sanitize_survival_weight_vector(&slots.row(slot).to_owned());
+                let multiplicity = if group.left_channel == group.right_channel {
+                    1.0
+                } else {
+                    2.0
+                };
+                let offset = offsets[left_block];
+                for row in 0..self.n {
+                    let weight = multiplicity * weights[row];
+                    if weight == 0.0 {
+                        continue;
+                    }
+                    for coefficient in 0..left.ncols() {
+                        diagonal[offset + coefficient] +=
+                            weight * left[[row, coefficient]] * right[[row, coefficient]];
+                    }
+                }
+            }
+            return Ok(SlsCoefficientHessian::DiagonalOnly(diagonal));
+        }
+
+        let selected = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| {
+                target == SlsCoefficientHessianTarget::DenseFull
+                    || group.left_channel / 3 == group.right_channel / 3
+            })
+            .collect::<Vec<_>>();
+        let products = selected
+            .into_par_iter()
+            .map(|(slot, group)| {
+                let left = designs[group.left_channel]
+                    .expect("active survival-LS pair has a left design");
+                let right = designs[group.right_channel]
+                    .expect("active survival-LS pair has a right design");
+                let weights = slots.row(slot).to_owned();
+                weighted_crossprod_dense_with_parallelism(left, &weights, right, faer::Par::Seq)
+                    .map(|product| (group, product))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        match target {
+            SlsCoefficientHessianTarget::DenseFull => {
+                let mut dense = Array2::<f64>::zeros((p_total, p_total));
+                for (group, product) in products {
+                    let left_block = group.left_channel / 3;
+                    let right_block = group.right_channel / 3;
+                    let (left_start, left_end) = (offsets[left_block], offsets[left_block + 1]);
+                    let (right_start, right_end) =
+                        (offsets[right_block], offsets[right_block + 1]);
+                    dense
+                        .slice_mut(s![left_start..left_end, right_start..right_end])
+                        .scaled_add(1.0, &product);
+                    if left_block != right_block {
+                        dense
+                            .slice_mut(s![right_start..right_end, left_start..left_end])
+                            .scaled_add(1.0, &product.t());
+                    } else if group.left_channel != group.right_channel {
+                        dense
+                            .slice_mut(s![left_start..left_end, right_start..right_end])
+                            .scaled_add(1.0, &product.t());
+                    }
+                }
+                Ok(SlsCoefficientHessian::DenseFull(dense))
+            }
+            SlsCoefficientHessianTarget::BlockDiagonal => {
+                let mut blocks = (0..3)
+                    .map(|block| {
+                        Array2::<f64>::zeros((
+                            offsets[block + 1] - offsets[block],
+                            offsets[block + 1] - offsets[block],
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                for (group, product) in products {
+                    let block = group.left_channel / 3;
+                    blocks[block].scaled_add(1.0, &product);
+                    if group.left_channel != group.right_channel {
+                        blocks[block].scaled_add(1.0, &product.t());
+                    }
+                }
+                Ok(SlsCoefficientHessian::BlockDiagonal(blocks))
+            }
+            SlsCoefficientHessianTarget::DiagonalOnly => unreachable!(),
         }
     }
 
