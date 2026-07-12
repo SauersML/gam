@@ -869,7 +869,7 @@ pub(crate) fn rigid_row_inputs(
 /// * `S = TwoSeed<4>` → contracted fourth `Σ_{cd} ℓ_{abcd} u_c v_d`
 ///   (`row_fourth_contracted`),
 /// * `S = Tower4<4>`  → the full dense `(v,g,H,t3,t4)` oracle / #979 all-axes
-///   build-once path ([`rigid_row_kernel_nll_tower`]).
+///   build-once truth (via [`gam_math::jet_tower::program_full_tower`]).
 ///
 /// The four primaries are `(q0, q1, qd1, g)`. From them
 ///   `c(g) = √(1 + (s·g)²·covariance_ones)`,
@@ -967,54 +967,12 @@ pub(crate) fn rigid_row_nll<S: JetScalar<4>>(
     Ok(exit.add(&entry).add(&event_density).add(&time_deriv))
 }
 
-/// Thin `Tower4<4>` wrapper over the single-source [`rigid_row_nll`]: evaluates
-/// the SAME expression at the all-channels dense scalar to obtain the full
-/// `(v, g, H, t3, t4)` in one pass. Used by the `RowNllProgram<4>` impl (the
-/// contraction.rs helpers) and the #979 all-axes build-once path
-/// ([`SurvivalMarginalSlopeRowKernel::build_row_towers`]), which genuinely
-/// reuses a row's `t3`/`t4` across every coefficient axis.
-pub(crate) fn rigid_row_kernel_nll_tower(
-    family: &SurvivalMarginalSlopeFamily,
-    block_states: &[ParameterBlockState],
-    row: usize,
-    p: &[gam_math::jet_tower::Tower4<4>; 4],
-    context: &str,
-) -> Result<gam_math::jet_tower::Tower4<4>, String> {
-    let inputs = rigid_row_inputs(family, block_states, row, context)?;
-    rigid_row_nll(p, &inputs)
-}
-
-impl gam_math::jet_tower::RowNllProgram<4> for SurvivalMarginalSlopeRowKernel {
-    fn n_rows(&self) -> usize {
-        self.family.n
-    }
-
-    fn primaries(&self, row: usize) -> Result<[f64; 4], String> {
-        rigid_row_kernel_primaries(&self.family, &self.block_states, row)
-    }
-
-    fn row_nll(
-        &self,
-        row: usize,
-        p: &[gam_math::jet_tower::Tower4<4>; 4],
-    ) -> Result<gam_math::jet_tower::Tower4<4>, String> {
-        rigid_row_kernel_nll_tower(
-            &self.family,
-            &self.block_states,
-            row,
-            p,
-            "survival marginal-slope rigid row tower",
-        )
-    }
-}
-
 /// #932: the canonical single-source seam. The row NLL is written ONCE as
 /// [`rigid_row_nll`]; this exposes it through [`gam_math::jet_tower::RowProgram`]
 /// so the `RowKernel` derivative channels below derive mechanically from `eval`
-/// (via the `program_*` helpers) rather than re-seeding the jet per method. The
-/// `Tower4`-specialised [`gam_math::jet_tower::RowNllProgram`] impl above is the
-/// same expression at `S = Tower4` and is retained until its contraction.rs /
-/// all-axes consumers move onto `program_full_tower` (#932 capstone).
+/// via the `program_*` helpers. Instantiating this same method at `S = Tower4`
+/// through [`gam_math::jet_tower::program_full_tower`] supplies the dense oracle;
+/// there is no second tower-only program surface.
 impl gam_math::jet_tower::RowProgram<4> for SurvivalMarginalSlopeRowKernel {
     fn n_rows(&self) -> usize {
         self.family.n
@@ -1319,12 +1277,11 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     /// the rigid survival marginal-slope kernel (gam#979).
     ///
     /// The generic per-axis fall-back (`row_kernel_directional_derivative_all_axes`)
-    /// asks for `Hdot[e_a]` `p` separate times, and EACH per-axis sweep rebuilds
-    /// the per-row fourth-order `Tower4<4>` for every row inside
-    /// `row_third_contracted` (`evaluate_program` → full t3/t4 build) — `n·p`
-    /// tower evaluations per all-axes call. For survival the tower is the
-    /// expensive object (closed-form probit/log-pdf composition over four
-    /// primaries), so this is the #979 inner-Newton Jeffreys/Firth hot path.
+    /// asks for `Hdot[e_a]` `p` separate times, and EACH per-axis sweep evaluates
+    /// the per-row one-seed program scalar inside `row_third_contracted` — `n·p`
+    /// program evaluations per all-axes call. For survival the expression is
+    /// expensive (closed-form probit/log-pdf composition over four primaries),
+    /// so this is the #979 inner-Newton Jeffreys/Firth hot path.
     ///
     /// This override builds each row's `t3` tensor ONCE (the swept axis enters
     /// only through the cheap primary projection `dir_a = Jᵢ·e_a` and the linear
@@ -1333,7 +1290,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     /// `Tower4::third_contracted`, and `add_pullback_hessian` in the EXACT SAME
     /// `ARROW_ROW_CHUNK`-chunked reduction order as the generic per-axis path
     /// (`par_try_reduce_fold(RowSet::All)`): the cached `t3[row]` is bit-for-bit
-    /// the tensor a fresh `evaluate_program(row)` would produce (a deterministic
+    /// the tensor a fresh `program_full_tower(row)` would produce (a deterministic
     /// pure function of the row), and every float op downstream is identical, so
     /// axis `a` matches `row_kernel_directional_derivative(self, All, e_a)`
     /// bit-for-bit. Only the redundant `(p−1)·n` tower rebuilds are removed.
@@ -1363,8 +1320,8 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     /// Jeffreys `H_Φ` drift analogue of the first-order override above.
     ///
     /// With `d_beta_u` fixed and the second direction sweeping every canonical
-    /// axis, the generic per-axis path runs `p` full-data sweeps each rebuilding
-    /// the per-row `Tower4<4>` (`row_fourth_contracted` → `evaluate_program`).
+    /// axis, the generic per-axis path runs `p` full-data sweeps each evaluating
+    /// the per-row two-seed program scalar through `row_fourth_contracted`.
     /// This override builds each row's `t4` tensor and the fixed-direction
     /// projection `dir_u = Jᵢ·u` ONCE, then closes every axis with the cheap
     /// linear `t4.fourth_contracted(dir_u, dir_a)` and the kernel's own
@@ -1443,14 +1400,14 @@ impl SurvivalMarginalSlopeRowKernel {
     ///
     /// Evaluates the SAME single-source [`rigid_row_nll`] (including its
     /// monotonicity guard) at the static-sparsity [`SparseTower4<RIGID_LINEAR_MASK>`]
-    /// scalar instead of the dense `Tower4<4>` `evaluate_program` build: the
+    /// scalar instead of the dense `Tower4<4>` `program_full_tower` build: the
     /// affine rigid primaries `q0,q1,qd1` make the multi-linear-leg derivative
     /// blocks structurally zero on every `mul`/`compose` intermediate, so the
     /// `t4` Leibniz/Faà-di-Bruno reads that touch them are elided (measured 2.89×
     /// fewer FP ops on the `t4` build; standalone oracle scratchpad/sparse_t4_probe.rs,
     /// 5000/5000 rows `to_bits`-identical to the engine `Tower4<4>` on every
     /// channel). The cached `t4` (and the `fourth_contracted` accumulation order)
-    /// is therefore bit-for-bit what `evaluate_program(row)` would produce, so the
+    /// is therefore bit-for-bit what `program_full_tower(row)` would produce, so the
     /// build-once batched override contracts against it without changing any
     /// downstream arithmetic.
     fn build_row_towers(&self) -> Result<Vec<SparseTower4<RIGID_LINEAR_MASK>>, String> {
@@ -1476,7 +1433,7 @@ impl SurvivalMarginalSlopeRowKernel {
     /// all-axes path (#1591). Evaluates the SAME single-source [`rigid_row_nll`]
     /// (including its monotonicity guard) at the static-sparsity
     /// [`SparseTower3<RIGID_LINEAR_MASK>`] scalar instead of the dense `Tower4<4>`
-    /// `evaluate_program` builds: the consumer reads only `third_contracted` (a
+    /// `program_full_tower` build: the consumer reads only `third_contracted` (a
     /// `t3` contraction), so the discarded `K⁴ = 256`-entry fourth tensor is never
     /// computed, AND the affine rigid primaries make the multi-linear-leg `t3`
     /// reads structurally zero, eliding them too (measured 1.81× fewer FP ops on
