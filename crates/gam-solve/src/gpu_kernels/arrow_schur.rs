@@ -5360,6 +5360,34 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 k: host.k,
             })
         }
+
+        /// Overwrite the resident per-row `ainv` for a fixed `ridge_t` (the single
+        /// evidence ridge), WITHOUT running the PCG — so an evidence matvec closure
+        /// primes the factors once and every apply reuses them. Mirrors the
+        /// ridge-dependent refresh in [`SaeResidentFrame::resolve`]. A genuinely
+        /// non-PD row surfaces `RidgeBumpRequired`/`SchurFactorFailed` (the caller
+        /// then declines to the CPU matvec, which handles the escalation).
+        pub(super) fn prime_ainv(
+            &self,
+            sys: &ArrowSchurSystem,
+            ridge_t: f64,
+        ) -> Result<(), ArrowSchurGpuFailure> {
+            if sys.k != self.k || sys.rows.len() != self.n_rows {
+                return Err(ArrowSchurGpuFailure::Unavailable);
+            }
+            let ainv =
+                super::compute_ainv_host(sys, &self.q_of, self.max_q, self.n_rows, ridge_t)?;
+            let mut buffers = self
+                .buffers
+                .lock()
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            if ainv.len() != buffers.ainv.len() {
+                return Err(ArrowSchurGpuFailure::Unavailable);
+            }
+            self.stream
+                .memcpy_htod(&ainv, &mut buffers.ainv)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)
+        }
     }
 
     impl super::SaeResidentFrame for ResidentSaeFrameHandle {
