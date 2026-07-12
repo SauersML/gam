@@ -1864,6 +1864,10 @@ fn sae_manifold_fit_inner<'py>(
     // wants exactly `k` atoms and none of these re-searches — see the example.
     run_structure_search: bool,
     structured_residual_passes: Option<usize>,
+    // Ordered independent Beta–Bernoulli concentration override (#2267). `None`
+    // selects the canonical evidence-derived default; a value pins the per-fit
+    // concentration for the `ordered_beta_bernoulli` assignment.
+    ordered_beta_bernoulli_alpha_override: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(serde_json_error_to_pyerr)?),
@@ -1941,7 +1945,7 @@ fn sae_manifold_fit_inner<'py>(
         data_row_reseed: false,
         fit_config: gam::terms::sae::manifold::SaeFitConfig {
             separation_barrier_strength_override,
-            ordered_beta_bernoulli_alpha_override: None,
+            ordered_beta_bernoulli_alpha_override,
         },
         temperature_schedule,
         fisher_metric,
