@@ -386,12 +386,23 @@ fn freeze_smooth_basis_from_metadata(
                 Some(z) => SpatialIdentifiability::FrozenTransform {
                     transform: z.clone(),
                 },
+                // `None` here does NOT mean "no orthogonality was requested":
+                // the term-collection builder defers Duchon's
+                // `OrthogonalToParametric` centering to the global
+                // parametric-orthogonality step in `term_design.rs` (see
+                // `smooth_requires_parametric_orthogonality`), so the basis
+                // build always reports `identifiability_transform: None` for
+                // that policy even though centering is still required on
+                // every rebuild. Collapsing it to `None` here silently
+                // disabled that rebuild-time centering, so a later rebuild
+                // from the frozen spec (predict, or a κ-trial re-realization
+                // such as the ψ-Gram tensor fast path) produced a wider,
+                // uncentered design than the fit-time one, desyncing it from
+                // the fit-time Gauge (gh#2274).
                 None => match &s.identifiability {
-                    // If the spec already carries a frozen transform but the
-                    // metadata lost it (e.g. raw rebuild stripped it), keep
-                    // the existing frozen transform rather than downgrading.
-                    SpatialIdentifiability::FrozenTransform { .. } => s.identifiability.clone(),
-                    _ => SpatialIdentifiability::None,
+                    SpatialIdentifiability::FrozenTransform { .. }
+                    | SpatialIdentifiability::OrthogonalToParametric => s.identifiability.clone(),
+                    SpatialIdentifiability::None => SpatialIdentifiability::None,
                 },
             };
             s.aniso_log_scales = meta_aniso.clone();
