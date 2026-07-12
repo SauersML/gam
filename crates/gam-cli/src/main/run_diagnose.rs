@@ -260,7 +260,8 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             eta_hat.view(),
             weights.view(),
             Some(&alo),
-        );
+        )
+        .map_err(|err| format!("cannot resolve model-comparison dispersion: {err}"))?;
         let mut summary = Table::new();
         summary
             .load_preset(UTF8_FULL)

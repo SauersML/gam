@@ -731,7 +731,7 @@ impl<'a> RemlState<'a> {
             DispersionHandling::ProfiledGaussian
         } else {
             DispersionHandling::Fixed {
-                phi: reml_fixed_glm_dispersion(&pirls_result.likelihood),
+                phi: reml_fixed_glm_dispersion(&pirls_result.likelihood)?,
                 include_logdet_h: true,
                 include_logdet_s: true,
             }
@@ -837,7 +837,7 @@ impl<'a> RemlState<'a> {
         } else if pirls_result.derivatives_unsupported {
             (
                 DispersionHandling::Fixed {
-                    phi: reml_fixed_glm_dispersion(&pirls_result.likelihood),
+                    phi: reml_fixed_glm_dispersion(&pirls_result.likelihood)?,
                     include_logdet_h: true,
                     include_logdet_s: true,
                 },
@@ -847,7 +847,7 @@ impl<'a> RemlState<'a> {
             let (hessian_weights, c_array, d_array) = self.hessian_surface_arrays(pirls_result)?;
             (
                 DispersionHandling::Fixed {
-                    phi: reml_fixed_glm_dispersion(&pirls_result.likelihood),
+                    phi: reml_fixed_glm_dispersion(&pirls_result.likelihood)?,
                     include_logdet_h: true,
                     include_logdet_s: true,
                 },

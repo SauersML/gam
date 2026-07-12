@@ -53,6 +53,39 @@ use gam_terms::smooth::build_term_collection_design;
 use gam_terms::smooth::{LinearCoefficientGeometry, weighted_blockwise_penalty_sum};
 use gam_terms::term_builder::resolve_role_col;
 
+fn sampling_sqrt_covariance_scale(
+    fit: &gam_solve::estimate::UnifiedFitResult,
+    context: &str,
+) -> Result<f64, String> {
+    let scale = fit
+        .coefficient_covariance_scale()
+        .map_err(|err| format!("{context}: cannot resolve coefficient-covariance scale: {err}"))?;
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(format!(
+            "{context}: posterior sampling requires a finite strictly-positive coefficient-covariance scale, got {scale}"
+        ));
+    }
+    Ok(scale.sqrt())
+}
+
+fn resolved_fit_dispersion(
+    fit: &gam_solve::estimate::UnifiedFitResult,
+    context: &str,
+) -> Result<gam_problem::Dispersion, String> {
+    if let Some(dispersion) = fit.dispersion() {
+        return Ok(dispersion);
+    }
+    let family = fit.likelihood_family.as_ref().ok_or_else(|| {
+        format!("{context}: fit has no engine-level family and no scalar dispersion")
+    })?;
+    let likelihood = gam_problem::GlmLikelihoodSpec {
+        spec: family.clone(),
+        scale: fit.likelihood_scale,
+    };
+    gam_solve::estimate::dispersion_from_likelihood(&likelihood, fit.standard_deviation)
+        .map_err(|err| format!("{context}: cannot resolve fitted dispersion: {err}"))
+}
+
 /// Entry, exit, and derivative designs are live both in the caller's final
 /// assembly and in the current WorkingModelSurvival owner.
 const SURVIVAL_DESIGN_LIVE_COPIES: usize = 2 * 3;
@@ -421,7 +454,7 @@ pub fn laplace_gaussian_fallback(
     // `√φ` behaviour exactly; it only changes (fixes) Beta. This keeps the
     // draw spread identical to the reported `summary().std_error`, like the
     // sibling bounded-coefficient path (gam#1514).
-    let sqrt_cov_scale = fit.coefficient_covariance_scale().max(0.0).sqrt();
+    let sqrt_cov_scale = sampling_sqrt_covariance_scale(&fit, rationale)?;
     if h.nrows() != p || h.ncols() != p {
         return Err(format!(
             "{rationale}: penalised Hessian is {}x{}, expected {}x{}",
@@ -701,7 +734,7 @@ fn sample_standard(
             // Forward the saved training dispersion so NUTS whitening uses the
             // posterior scale selected at fit time; fixed-scale families remain
             // a no-op.
-            dispersion: fit.dispersion().unwrap_or_default(),
+            dispersion: resolved_fit_dispersion(&fit, "standard saved-model NUTS")?,
             // The fit's optimized target: dropping the Jeffreys term Φ(β)
             // from a Firth fit samples a different posterior (#2245
             // finding 16). Persisted on the fit artifacts at fit time.
@@ -751,7 +784,8 @@ fn sample_standard_bounded(
     // Gaussian, `1` for fixed-scale Binomial). Re-applying `√cov_scale` here
     // keeps the draw spread identical to the reported `summary().std_error`
     // (gam#1514); the truncated-constraint path does the analogous √φ lift.
-    let sqrt_cov_scale = fit.coefficient_covariance_scale().max(0.0).sqrt();
+    let sqrt_cov_scale =
+        sampling_sqrt_covariance_scale(&fit, "standard bounded-coefficient posterior")?;
     let n_total = cfg.n_samples.saturating_mul(cfg.n_chains);
     let samples = gam_models::fit_orchestration::drivers::sample_bounded_latent_posterior_internal(
         &mode,
@@ -821,7 +855,8 @@ fn sample_standard_truncated(
     // every constrained interval by √φ.
     let penalized_hessian =
         explicit_fit_hessian_for_whitening(&fit, p, "saved standard constrained model")?;
-    let sqrt_cov_scale = fit.coefficient_covariance_scale().max(0.0).sqrt();
+    let sqrt_cov_scale =
+        sampling_sqrt_covariance_scale(&fit, "standard constrained-coefficient posterior")?;
 
     // Recover the UNCONSTRAINED Gaussian center of the local quadratic (#2245
     // finding 20). A Gaussian truncated to the polytope stays centred at its
@@ -1061,18 +1096,22 @@ fn sample_standard_link_wiggle(
         (ResponseFamily::Poisson, _) => LinkWiggleFamilyParams::PoissonLog,
         (ResponseFamily::Tweedie { p }, _) => LinkWiggleFamilyParams::TweedieLog {
             power: *p,
-            phi: fit.likelihood_scale.fixed_phi().unwrap_or(1.0),
+            phi: fit.likelihood_scale.fixed_phi().ok_or_else(|| {
+                "link-wiggle Tweedie sampling requires resolved dispersion metadata".to_string()
+            })?,
         },
-        (ResponseFamily::NegativeBinomial { theta, .. }, _) => {
+        (ResponseFamily::NegativeBinomial { .. }, _) => {
             LinkWiggleFamilyParams::NegativeBinomialLog {
-                theta: fit.likelihood_scale.negbin_theta().unwrap_or(*theta),
+                theta: fit.likelihood_scale.negbin_theta().ok_or_else(|| {
+                    "link-wiggle negative-binomial sampling requires resolved theta metadata"
+                        .to_string()
+                })?,
             }
         }
         (ResponseFamily::Gamma, _) => LinkWiggleFamilyParams::GammaLog {
-            shape: fit
-                .likelihood_scale
-                .gamma_shape()
-                .unwrap_or(fit.standard_deviation),
+            shape: fit.likelihood_scale.gamma_shape().ok_or_else(|| {
+                "link-wiggle Gamma sampling requires resolved shape metadata".to_string()
+            })?,
         },
         _ => {
             return Err(format!(

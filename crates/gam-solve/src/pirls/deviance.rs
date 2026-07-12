@@ -554,7 +554,18 @@ fn deviance_eta_row_with_log_measure_scale(
             if !y.is_finite() {
                 return Err(deviance_row_error(row, "Gaussian response", eta, y));
             }
-            let phi = likelihood.fixed_phi().unwrap_or(1.0);
+            let phi = if matches!(
+                &likelihood.scale,
+                gam_problem::LikelihoodScaleMetadata::ProfiledGaussian
+            ) {
+                // Reported profiled-Gaussian deviance is intentionally the raw
+                // RSS measure; profiling happens in the outer objective.
+                1.0
+            } else {
+                likelihood.fixed_phi().ok_or_else(|| {
+                    deviance_row_error(row, "Gaussian dispersion metadata", eta, f64::NAN)
+                })?
+            };
             if !(phi.is_finite() && phi > 0.0) {
                 return Err(deviance_row_error(row, "Gaussian dispersion", eta, phi));
             }
@@ -992,7 +1003,11 @@ pub(crate) fn calculate_loglikelihood_omitting_constants_from_eta(
 ) -> Result<f64, EstimationError> {
     let log_measure_scale = match &likelihood.spec.response {
         ResponseFamily::Gamma => {
-            let shape = likelihood.gamma_shape().unwrap_or(1.0);
+            let shape = likelihood.gamma_shape().ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "Gamma eta log-likelihood requires explicit shape metadata".to_string(),
+                )
+            })?;
             if !(shape.is_finite() && shape > 0.0) {
                 crate::bail_invalid_estim!("Gamma shape must be finite and positive; got {shape}");
             }

@@ -1527,30 +1527,38 @@ pub(crate) fn resolve_effective_rho_prior(configured: &RhoPrior) -> std::borrow:
 }
 
 #[inline]
-pub(crate) fn reml_fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
-    let spec = reml_spec(likelihood);
-    match (&spec.response, &spec.link) {
-        // Beta carries phi inside the response variant under the LikelihoodSpec form.
-        (ResponseFamily::Beta { phi }, _) => *phi,
-        // REML uses unit scale for NB; overdispersion is encoded by theta in the
-        // response variant. IRLS consumes theta through the variance chain, not
-        // as a separate phi.
-        (ResponseFamily::NegativeBinomial { .. }, _) => 1.0,
-        // Tweedie's variance power lives on the response variant; the scale phi
-        // comes from the dispersion slot.
-        (ResponseFamily::Tweedie { .. }, _) => likelihood.fixed_phi().unwrap_or(1.0),
-        // All other (response, link) combinations share the dispersion-slot phi
-        // (defaulting to 1.0 when absent).
-        (
-            ResponseFamily::Gaussian
-            | ResponseFamily::Binomial
-            | ResponseFamily::Poisson
-            | ResponseFamily::Gamma,
-            _,
-        ) => likelihood.fixed_phi().unwrap_or(1.0),
-        // RoystonParmar is survival-specific and not produced by
-        // `reml_spec` from any `LikelihoodSpec` GLM family combination.
-        (ResponseFamily::RoystonParmar, _) => likelihood.fixed_phi().unwrap_or(1.0),
+pub(crate) fn reml_fixed_glm_dispersion(
+    likelihood: &GlmLikelihoodSpec,
+) -> Result<f64, EstimationError> {
+    let phi = match &likelihood.spec.response {
+        // These likelihoods carry their complete scale in the family geometry:
+        // NB through theta, Beta through its precision-dependent likelihood and
+        // Hessian. Treating Beta precision as EDM dispersion double-scales EFS.
+        ResponseFamily::Binomial
+        | ResponseFamily::Poisson
+        | ResponseFamily::NegativeBinomial { .. }
+        | ResponseFamily::Beta { .. } => 1.0,
+        ResponseFamily::Gamma | ResponseFamily::Tweedie { .. } | ResponseFamily::Gaussian => {
+            likelihood.fixed_phi().ok_or_else(|| {
+                EstimationError::InvalidInput(format!(
+                    "{} REML fixed-dispersion path requires an explicit dispersion",
+                    likelihood.spec.response.name()
+                ))
+            })?
+        }
+        ResponseFamily::RoystonParmar => {
+            return Err(EstimationError::InvalidInput(
+                "Royston-Parmar is not a GLM fixed-dispersion family".to_string(),
+            ));
+        }
+    };
+    if phi.is_finite() && phi > 0.0 {
+        Ok(phi)
+    } else {
+        Err(EstimationError::InvalidInput(format!(
+            "{} REML dispersion must be finite and positive; got {phi}",
+            likelihood.spec.response.name()
+        )))
     }
 }
 

@@ -1302,6 +1302,27 @@ mod tests {
     }
 
     #[test]
+    fn strict_sparse_spd_preserves_sub_threshold_stored_entries() {
+        let tiny = 5.0e-13;
+        let matrix = array![[1.0, tiny], [tiny, 1.0]];
+        let sparse = dense_to_sparse_symmetric_upper(&matrix, 0.0).unwrap();
+        let factor = factorize_sparse_spd_strict(&sparse).unwrap();
+        let solution = solve_sparse_spd(&factor, &array![0.0, 1.0]).unwrap();
+        assert!(solution[0] < 0.0, "tiny coupling must not be dropped");
+        approx_eq(solution[0], -tiny / (1.0 - tiny * tiny), 1.0e-27);
+    }
+
+    #[test]
+    fn strict_sparse_spd_rejects_full_or_lower_triangle_storage() {
+        let matrix = array![[2.0, 0.5], [0.5, 3.0]];
+        let full = dense_to_sparse(&matrix, 0.0).unwrap();
+        let error = factorize_sparse_spd_strict(&full)
+            .err()
+            .expect("full symmetric storage must be rejected");
+        assert!(error.to_string().contains("upper-triangle storage"));
+    }
+
+    #[test]
     fn solve_sparse_spd_3x3_round_trip() {
         let a: Array2<f64> = array![[9.0, 3.0, 1.0], [3.0, 8.0, 2.0], [1.0, 2.0, 7.0]];
         let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();

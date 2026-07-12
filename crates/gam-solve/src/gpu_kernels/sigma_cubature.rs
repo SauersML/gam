@@ -440,3 +440,31 @@ mod linux_impl {
         Ok(Some(outcomes))
     }
 }
+
+#[cfg(test)]
+mod covariance_contract_tests {
+    use super::certified_sigma_point_covariance;
+    use gam_linalg::utils::CertifiedSymmetricSolveError;
+    use ndarray::array;
+
+    #[test]
+    fn cpu_and_gpu_sigma_postprocessing_share_one_unperturbed_inverse_contract() {
+        let hessian = array![[4.0, 1.0], [1.0, 3.0]];
+        let covariance = certified_sigma_point_covariance(&hessian, "shared sigma contract")
+            .expect("strict SPD inverse");
+        let identity = hessian.dot(&covariance);
+        assert!((identity[[0, 0]] - 1.0).abs() <= 4.0 * f64::EPSILON);
+        assert!((identity[[1, 1]] - 1.0).abs() <= 4.0 * f64::EPSILON);
+        assert!(identity[[0, 1]].abs() <= 4.0 * f64::EPSILON);
+        assert!(identity[[1, 0]].abs() <= 4.0 * f64::EPSILON);
+    }
+
+    #[test]
+    fn shared_sigma_contract_rejects_an_invertible_indefinite_hessian() {
+        let hessian = array![[1.0, 2.0], [2.0, 1.0]];
+        assert!(matches!(
+            certified_sigma_point_covariance(&hessian, "shared sigma contract"),
+            Err(CertifiedSymmetricSolveError::NotPositiveDefinite { .. })
+        ));
+    }
+}

@@ -3272,8 +3272,11 @@ fn reactive_smooth_curvature_scale(
             atom.smooth_penalty.dim()
         ));
     }
-    let (rank, penalty_pinv) = gam_linalg::utils::block_penalty_rank_and_pinv(&atom.smooth_penalty)
-        .map_err(|error| format!("reactive rho domain penalty spectrum failed: {error}"))?;
+    let penalty_geometry =
+        gam_linalg::utils::rank_certified_psd_pseudoinverse(&atom.smooth_penalty, 1.0e-10)
+            .map_err(|error| format!("reactive rho domain penalty spectrum failed: {error}"))?;
+    let rank = penalty_geometry.rank();
+    let penalty_pinv = penalty_geometry.into_pseudoinverse();
     if rank == 0 {
         return Ok(None);
     }
@@ -3308,12 +3311,13 @@ fn reactive_smooth_curvature_scale(
     }
 
     // Form the PSD square root of P⁺ on exactly the retained penalty range.
-    // `block_penalty_rank_and_pinv` owns the rank tolerance; retaining the
-    // largest `rank` eigenpairs here reuses that decision without reviving tiny
-    // numerical eigenvalues in the null space.
-    let (pinv_eigenvalues, pinv_eigenvectors) = penalty_pinv
-        .eigh(Side::Lower)
-        .map_err(|error| format!("reactive rho domain P⁺ spectrum failed: {error}"))?;
+    // The declared penalty pseudoinverse cutoff owns the rank decision;
+    // retaining the largest `rank` eigenpairs here reuses that decision without
+    // reviving tiny numerical eigenvalues in the null space. This second EVD is
+    // strict too: no jitter may change the retained range.
+    let (pinv_eigenvalues, pinv_eigenvectors) =
+        gam_linalg::faer_ndarray::strict_symmetric_eigh(&penalty_pinv, Side::Lower)
+            .map_err(|error| format!("reactive rho domain P⁺ spectrum failed: {error}"))?;
     if !pinv_eigenvalues.iter().all(|value| value.is_finite()) {
         return Err(format!(
             "reactive rho domain: atom {atom_idx} P⁺ spectrum is non-finite"

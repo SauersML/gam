@@ -7478,7 +7478,9 @@ fn extend_model_with_random_effect_level(
             // dispersion for Gamma/Tweedie/NB. Omitting `φ̂` made the prior
             // (and any deployment interval built from it) wrong by `1/φ̂` and,
             // for an estimated scale, not response-scale equivariant. See #674.
-            let phi = fit.dispersion_phi();
+            let phi = fit
+                .dispersion_phi()
+                .map_err(|err| format!("cannot resolve unseen-level prior dispersion: {err}"))?;
             if !(phi.is_finite() && phi > 0.0) {
                 return Err(format!(
                     "extend_with_group term '{term_name}' has a non-finite or non-positive \
@@ -8938,7 +8940,8 @@ fn generative_replicates_encoded_impl(
         fit.likelihood_scale,
         fit.standard_deviation,
         &family,
-    );
+    )
+    .map_err(|err| format!("generative_replicates: unresolved fitted scale: {err}"))?;
     // Build the generative specification (mean + noise model).
     let spec =
         generativespec_from_predict(prediction, family, gaussian_scale, Some(&prior_weights))

@@ -5605,9 +5605,10 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
     let mut ranks = Vec::with_capacity(f_blocks);
     let mut pinvs = Vec::with_capacity(f_blocks);
     for penalty in &penalties {
-        let (rank, pinv) = gam_linalg::utils::block_penalty_rank_and_pinv(penalty)?;
-        ranks.push(rank);
-        pinvs.push(pinv);
+        let geometry =
+            gam_linalg::utils::rank_certified_psd_pseudoinverse(penalty, 1.0e-10)?;
+        ranks.push(geometry.rank());
+        pinvs.push(geometry.into_pseudoinverse());
     }
 
     let lambdas = Array1::from_iter(rhos.iter().map(|rho| rho.exp()));

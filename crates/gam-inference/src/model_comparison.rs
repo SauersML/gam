@@ -28,7 +28,7 @@
 
 use crate::alo::AloDiagnostics;
 use gam_problem::types::{GlmLikelihoodSpec, LikelihoodSpec};
-use gam_solve::estimate::UnifiedFitResult;
+use gam_solve::estimate::{EstimationError, UnifiedFitResult};
 use gam_solve::psis::pareto_smooth_weights;
 use ndarray::{Array1, ArrayView1, ArrayView2};
 
@@ -301,8 +301,8 @@ pub fn model_comparison_from_unified(
     eta_hat: ArrayView1<'_, f64>,
     prior_weights: ArrayView1<'_, f64>,
     alo: Option<&AloDiagnostics>,
-) -> ModelComparison {
-    let phi = fit.dispersion_phi();
+) -> Result<ModelComparison, EstimationError> {
+    let phi = fit.dispersion_phi()?;
     let edf_conditional = fit.edf_total().unwrap_or(f64::NAN);
     let edf = corrected_edf(
         edf_conditional,
@@ -354,13 +354,13 @@ pub fn model_comparison_from_unified(
         )
     });
 
-    ModelComparison {
+    Ok(ModelComparison {
         log_lik,
         edf,
         aic_conditional,
         aic_corrected,
         loo,
-    }
+    })
 }
 
 /// ALO elpd for an engine-level family: map the fitted and ALO leave-one-out

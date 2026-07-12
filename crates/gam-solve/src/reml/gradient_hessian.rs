@@ -2617,7 +2617,7 @@ impl<'a> RemlState<'a> {
         // EDM dispersion here.
         let phi = match reml_spec(&self.config.likelihood).response {
             ResponseFamily::Gaussian | ResponseFamily::Beta { .. } => 1.0,
-            _ => reml_fixed_glm_dispersion(&self.config.likelihood),
+            _ => reml_fixed_glm_dispersion(&self.config.likelihood)?,
         };
         if !(phi.is_finite() && phi > 0.0) {
             return Err(EstimationError::InvalidInput(format!(
@@ -3394,7 +3394,7 @@ impl<'a> RemlState<'a> {
         // surface (Probit, CLogLog, SAS, BetaLogistic, Mixture, GammaLog).
         let likelihood = &pirls_result.likelihood;
         let weight_family = pirls::weight_family_for_glm_likelihood(likelihood);
-        let phi = reml_fixed_glm_dispersion(likelihood);
+        let phi = reml_fixed_glm_dispersion(likelihood)?;
         let dmu_deta = &pirls_result.solve_dmu_deta;
         let d2mu_deta2 = &pirls_result.solve_d2mu_deta2;
         let d3mu_deta3 = &pirls_result.solve_d3mu_deta3;
@@ -8182,14 +8182,13 @@ mod firth_hessian_direction_reuse_tests {
         }
         let h_solver = h.clone();
         let h_inv_solve = move |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            Ok(gam_linalg::utils::certified_spd_factorize(
-                &h_solver,
-                "Firth test Hessian",
+            Ok(
+                gam_linalg::utils::certified_spd_factorize(&h_solver, "Firth test Hessian")
+                    .expect("well-conditioned SPD factor")
+                    .solve(rhs)
+                    .expect("certified SPD solve")
+                    .into_solution(),
             )
-            .expect("well-conditioned SPD factor")
-            .solve(rhs)
-            .expect("certified SPD solve")
-            .into_solution())
         };
 
         let hess = RemlState::tk_hessian_rho_canonical_logit(
@@ -8292,14 +8291,13 @@ mod firth_hessian_direction_reuse_tests {
         }
         let h_solver = h.clone();
         let h_inv_solve = move |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            Ok(gam_linalg::utils::certified_spd_factorize(
-                &h_solver,
-                "Firth k4 test Hessian",
+            Ok(
+                gam_linalg::utils::certified_spd_factorize(&h_solver, "Firth k4 test Hessian")
+                    .expect("well-conditioned SPD factor")
+                    .solve(rhs)
+                    .expect("certified SPD solve")
+                    .into_solution(),
             )
-            .expect("well-conditioned SPD factor")
-            .solve(rhs)
-            .expect("certified SPD solve")
-            .into_solution())
         };
         RemlState::tk_hessian_rho_canonical_logit(
             x,

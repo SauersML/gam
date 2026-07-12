@@ -16,8 +16,8 @@ use ndarray::{Array1, Array2};
 /// [`LikelihoodScaleMetadata`] (`scale`); the value embedded in the response
 /// spec (`likelihood.response`) is only the construction-time *seed* (e.g.
 /// `theta = 1.0`, `phi = 1.0`), left un-updated after the fit refreshes the
-/// estimate. Generation must therefore read the *fitted* dispersion off `scale`,
-/// falling back to the seed only for fit-free construction. Reading the seed was
+/// estimate. Generation must therefore read the *fitted* dispersion off `scale`.
+/// Reading the seed was
 /// the shared root cause of a whole family of bugs — Gamma #678, Beta #769/#770,
 /// Tweedie #771, and the NB sibling #1124 (`Var = mu + mu^2` instead of
 /// `mu + mu^2/theta_hat`).
@@ -32,33 +32,101 @@ use ndarray::{Array1, Array2};
 /// threads a full `exp(eta_d(x))` vector via
 /// [`NoiseModel::from_likelihood_with_per_row_dispersion`] instead.)
 ///
-/// `standard_deviation` is the fit's residual scale, used as the Gamma-shape and
-/// Gaussian-`sigma` fallback. Returns `None` only for families that carry no
-/// dispersion at all in the fallback arm (never, in practice, for the families
-/// above).
+/// `standard_deviation` is used only by a profiled Gaussian. Families without a
+/// scalar noise parameter return `Ok(None)`; unresolved or inconsistent scale
+/// metadata is an error.
 pub fn family_noise_parameter(
     scale: LikelihoodScaleMetadata,
     standard_deviation: f64,
     likelihood: &LikelihoodSpec,
-) -> Option<f64> {
-    match likelihood.response {
+) -> Result<Option<f64>, EstimationError> {
+    let invalid = |reason: String| {
+        EstimationError::InvalidInput(format!(
+            "{} generative scale is unresolved: {reason}",
+            likelihood.pretty_name()
+        ))
+    };
+    let positive = |name: &str, value: f64| {
+        if value.is_finite() && value > 0.0 {
+            Ok(Some(value))
+        } else {
+            Err(invalid(format!(
+                "{name} must be finite and strictly positive, got {value}"
+            )))
+        }
+    };
+    match (&likelihood.response, scale) {
+        (ResponseFamily::Gaussian, LikelihoodScaleMetadata::ProfiledGaussian) => {
+            if standard_deviation.is_finite() && standard_deviation >= 0.0 {
+                Ok(Some(if standard_deviation == 0.0 {
+                    0.0
+                } else {
+                    standard_deviation
+                }))
+            } else {
+                Err(invalid(format!(
+                    "profiled Gaussian sigma must be finite and non-negative, got {standard_deviation}"
+                )))
+            }
+        }
+        (ResponseFamily::Gaussian, LikelihoodScaleMetadata::FixedDispersion { phi }) => {
+            positive("fixed Gaussian dispersion", phi).map(|_| Some(phi.sqrt()))
+        }
         // Tweedie: `gaussian_scale` carries the *dispersion* phi; the variance
         // power `p` is read straight off the family spec by `from_likelihood`.
         // phi is estimated jointly with the mean (#771), so consult the fit's
         // scale metadata; unit dispersion is the fit-free fallback.
-        ResponseFamily::Tweedie { .. } => scale.fixed_phi().or(Some(1.0)),
+        (
+            ResponseFamily::Tweedie { .. },
+            LikelihoodScaleMetadata::EstimatedTweediePhi { phi }
+            | LikelihoodScaleMetadata::FixedDispersion { phi },
+        ) => positive("Tweedie dispersion phi", phi),
         // NB overdispersion theta is estimated jointly with the mean and stored
         // as `EstimatedNegBinTheta`; the spec theta is only the seed (#1124).
-        ResponseFamily::NegativeBinomial { theta, .. } => scale.negbin_theta().or(Some(theta)),
+        (
+            ResponseFamily::NegativeBinomial {
+                theta: _,
+                theta_fixed: false,
+            },
+            LikelihoodScaleMetadata::EstimatedNegBinTheta {
+                theta: metadata_theta,
+            },
+        )
+        | (
+            ResponseFamily::NegativeBinomial {
+                theta: _,
+                theta_fixed: true,
+            },
+            LikelihoodScaleMetadata::FixedNegBinTheta {
+                theta: metadata_theta,
+            },
+        ) => {
+            positive("negative-binomial theta", metadata_theta)
+        }
         // Beta precision phi is estimated jointly with the mean (#567/#770); the
         // spec phi is only the seed.
-        ResponseFamily::Beta { phi } => scale.fixed_phi().or(Some(phi)),
+        (
+            ResponseFamily::Beta { .. },
+            LikelihoodScaleMetadata::EstimatedBetaPhi { phi: metadata_phi },
+        ) => positive("Beta precision phi", metadata_phi),
         // Gamma shape k is estimated jointly with the mean (#678); fall back to
         // the residual scale only when the fit recorded no shape.
-        ResponseFamily::Gamma => scale.gamma_shape().or(Some(standard_deviation)),
+        (ResponseFamily::Gamma, LikelihoodScaleMetadata::FixedGammaShape { shape })
+        | (ResponseFamily::Gamma, LikelihoodScaleMetadata::EstimatedGammaShape { shape }) => {
+            positive("Gamma shape", shape)
+        }
         // Gaussian / Poisson / Binomial: the residual scale is the generative
         // sigma (Poisson/Binomial ignore it downstream).
-        _ => Some(standard_deviation),
+        (
+            ResponseFamily::Binomial | ResponseFamily::Poisson,
+            LikelihoodScaleMetadata::FixedDispersion { phi },
+        ) if phi.to_bits() == 1.0_f64.to_bits() => Ok(None),
+        (ResponseFamily::RoystonParmar, _) => Err(invalid(
+            "Royston-Parmar has no generic scalar generative noise parameter".to_string(),
+        )),
+        (_, metadata) => Err(invalid(format!(
+            "family and likelihood-scale metadata are inconsistent: {metadata:?}"
+        ))),
     }
 }
 
@@ -265,7 +333,7 @@ impl NoiseModel {
                     phi: Array1::from_elem(nobs, phi),
                 })
             }
-            ResponseFamily::NegativeBinomial { theta, .. } => {
+            ResponseFamily::NegativeBinomial { .. } => {
                 // The NB overdispersion θ is estimated jointly with the mean and
                 // the authoritative post-fit value is handed in as
                 // `gaussian_scale` (from `likelihood_scale.negbin_theta()`);
@@ -273,17 +341,16 @@ impl NoiseModel {
                 // Reading the seed was the NB sibling of the Beta #770 bug:
                 // generate drew Var = μ + μ² (θ = 1) regardless of the fitted
                 // overdispersion (#1124). Mirror the Beta arm below.
-                let theta = gaussian_scale.unwrap_or(*theta);
-                if !(theta.is_finite() && theta > 0.0) {
-                    crate::bail_invalid_estim!(
-                        "negative-binomial theta must be finite and > 0; got {theta}"
-                    );
-                }
+                let theta = Self::require_positive_noise_parameter(
+                    likelihood,
+                    "negative-binomial theta",
+                    gaussian_scale,
+                )?;
                 Ok(NoiseModel::NegativeBinomial {
                     theta: Array1::from_elem(nobs, theta),
                 })
             }
-            ResponseFamily::Beta { phi } => {
+            ResponseFamily::Beta { .. } => {
                 // The Beta precision φ is estimated jointly with the mean
                 // (issue #567), so the authoritative value after fitting is the
                 // dispersion handed in as `gaussian_scale` — exactly as Gamma's
@@ -297,12 +364,11 @@ impl NoiseModel {
                 // with φ = 1.0 regardless of the data — nearly uniform on (0,1),
                 // ~20× too much variance — even though the fit estimated φ and
                 // the caller forwarded it here.
-                let phi = gaussian_scale.unwrap_or(*phi);
-                if !(phi.is_finite() && phi > 0.0) {
-                    crate::bail_invalid_estim!(
-                        "beta-regression phi must be finite and > 0; got {phi}"
-                    );
-                }
+                let phi = Self::require_positive_noise_parameter(
+                    likelihood,
+                    "beta-regression phi",
+                    gaussian_scale,
+                )?;
                 Ok(NoiseModel::Beta {
                     phi: Array1::from_elem(nobs, phi),
                 })
@@ -336,6 +402,14 @@ impl NoiseModel {
         likelihood: &LikelihoodSpec,
         dispersion: Array1<f64>,
     ) -> Result<NoiseModel, EstimationError> {
+        for (index, &value) in dispersion.iter().enumerate() {
+            if !(value.is_finite() && value > 0.0) {
+                crate::bail_invalid_estim!(
+                    "{} per-row generative dispersion at index {index} must be finite and strictly positive, got {value}",
+                    likelihood.pretty_name()
+                );
+            }
+        }
         match &likelihood.response {
             ResponseFamily::Tweedie { p } => {
                 let p = *p;
@@ -432,7 +506,12 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
             }
             let mut y = spec.mean.clone();
             for i in 0..y.len() {
-                let sd = sigma[i].max(0.0);
+                let sd = sigma[i];
+                if !(sd.is_finite() && sd >= 0.0) {
+                    crate::bail_invalid_estim!(
+                        "Gaussian sigma at row {i} must be finite and non-negative, got {sd}"
+                    );
+                }
                 if sd == 0.0 {
                     continue;
                 }
@@ -446,7 +525,15 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
         NoiseModel::Poisson => {
             let mut y = Array1::<f64>::zeros(spec.mean.len());
             for i in 0..y.len() {
-                let lam = spec.mean[i].max(1e-12);
+                let lam = spec.mean[i];
+                if lam < 0.0 {
+                    crate::bail_invalid_estim!(
+                        "Poisson mean at row {i} must be non-negative, got {lam}"
+                    );
+                }
+                if lam == 0.0 {
+                    continue;
+                }
                 let dist = rand_distr::Poisson::new(lam).map_err(|e| {
                     EstimationError::InvalidInput(format!("invalid Poisson rate {lam}: {e}"))
                 })?;
@@ -471,7 +558,21 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
             if (*p - 1.0).abs() <= 1.0e-12 {
                 for i in 0..y.len() {
                     let phi_i = phi[i];
-                    let lam = (spec.mean[i] / phi_i).max(1e-12);
+                    let mu = spec.mean[i];
+                    if mu < 0.0 {
+                        crate::bail_invalid_estim!(
+                            "Tweedie-Poisson mean at row {i} must be non-negative, got {mu}"
+                        );
+                    }
+                    if mu == 0.0 {
+                        continue;
+                    }
+                    let lam = mu / phi_i;
+                    if !(lam.is_finite() && lam > 0.0) {
+                        crate::bail_invalid_estim!(
+                            "Tweedie-Poisson rate at row {i} is not representable: {mu}/{phi_i}"
+                        );
+                    }
                     let dist = rand_distr::Poisson::new(lam).map_err(|e| {
                         EstimationError::InvalidInput(format!(
                             "invalid Tweedie-Poisson rate {lam}: {e}"
@@ -484,9 +585,27 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
             if (*p - 2.0).abs() <= 1.0e-12 {
                 for i in 0..y.len() {
                     let phi_i = phi[i];
-                    let shape = (1.0 / phi_i).max(1e-12);
-                    let mu = spec.mean[i].max(1e-12);
-                    let scale = (mu * phi_i).max(1e-12);
+                    let mu = spec.mean[i];
+                    if mu < 0.0 {
+                        crate::bail_invalid_estim!(
+                            "Tweedie-Gamma mean at row {i} must be non-negative, got {mu}"
+                        );
+                    }
+                    if mu == 0.0 {
+                        continue;
+                    }
+                    let shape = 1.0 / phi_i;
+                    let scale = mu * phi_i;
+                    if !(shape.is_finite() && shape > 0.0) {
+                        crate::bail_invalid_estim!(
+                            "Tweedie-Gamma reciprocal dispersion at row {i} is not representable: 1/{phi_i}"
+                        );
+                    }
+                    if !(scale.is_finite() && scale > 0.0) {
+                        crate::bail_invalid_estim!(
+                            "Tweedie-Gamma scale at row {i} is not representable: {mu}*{phi_i}"
+                        );
+                    }
                     let dist = rand_distr::Gamma::new(shape, scale).map_err(|e| {
                         EstimationError::InvalidInput(format!(
                             "invalid Tweedie-Gamma params shape={shape} scale={scale}: {e}"
@@ -499,9 +618,30 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
             let alpha = (2.0 - *p) / (*p - 1.0);
             for i in 0..y.len() {
                 let phi_i = phi[i];
-                let mu = spec.mean[i].max(1e-12);
-                let lambda = (mu.powf(2.0 - *p) / (phi_i * (2.0 - *p))).max(1e-12);
-                let scale = (phi_i * (*p - 1.0) * mu.powf(*p - 1.0)).max(1e-12);
+                let mu = spec.mean[i];
+                if mu < 0.0 {
+                    crate::bail_invalid_estim!(
+                        "Tweedie mean at row {i} must be non-negative, got {mu}"
+                    );
+                }
+                if mu == 0.0 {
+                    continue;
+                }
+                let log_lambda =
+                    (2.0 - *p) * mu.ln() - phi_i.ln() - (2.0 - *p).ln();
+                let log_scale = phi_i.ln() + (*p - 1.0).ln() + (*p - 1.0) * mu.ln();
+                let lambda = log_lambda.exp();
+                let scale = log_scale.exp();
+                if !(lambda.is_finite() && lambda > 0.0) {
+                    crate::bail_invalid_estim!(
+                        "Tweedie compound-Poisson rate at row {i} is not representable (log rate {log_lambda})"
+                    );
+                }
+                if !(scale.is_finite() && scale > 0.0) {
+                    crate::bail_invalid_estim!(
+                        "Tweedie jump scale at row {i} is not representable (log scale {log_scale})"
+                    );
+                }
                 let count_dist = rand_distr::Poisson::new(lambda).map_err(|e| {
                     EstimationError::InvalidInput(format!(
                         "invalid Tweedie compound-Poisson rate {lambda}: {e}"
@@ -532,14 +672,35 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
                         "invalid negative-binomial theta at row {i}: {theta_i}"
                     );
                 }
-                let mu = spec.mean[i].max(1e-12);
-                let scale = (mu / theta_i).max(1e-12);
+                let mu = spec.mean[i];
+                if mu < 0.0 {
+                    crate::bail_invalid_estim!(
+                        "negative-binomial mean at row {i} must be non-negative, got {mu}"
+                    );
+                }
+                if mu == 0.0 {
+                    continue;
+                }
+                let scale = mu / theta_i;
+                if !(scale.is_finite() && scale > 0.0) {
+                    crate::bail_invalid_estim!(
+                        "negative-binomial Gamma-mixture scale at row {i} is not representable: {mu}/{theta_i}"
+                    );
+                }
                 let gamma = rand_distr::Gamma::new(theta_i, scale).map_err(|e| {
                     EstimationError::InvalidInput(format!(
                         "invalid NegativeBinomial gamma mixture params theta={theta_i} scale={scale}: {e}"
                     ))
                 })?;
-                let lambda = rand_distr::Distribution::sample(&gamma, rng).max(1e-12);
+                let lambda = rand_distr::Distribution::sample(&gamma, rng);
+                if lambda == 0.0 {
+                    continue;
+                }
+                if !lambda.is_finite() {
+                    crate::bail_invalid_estim!(
+                        "negative-binomial latent Poisson rate at row {i} is non-finite"
+                    );
+                }
                 let poisson = rand_distr::Poisson::new(lambda).map_err(|e| {
                     EstimationError::InvalidInput(format!(
                         "invalid NegativeBinomial Poisson rate {lambda}: {e}"
@@ -557,9 +718,19 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
                 if !(phi_i.is_finite() && phi_i > 0.0) {
                     crate::bail_invalid_estim!("invalid beta-regression phi at row {i}: {phi_i}");
                 }
-                let mu = spec.mean[i].clamp(1e-12, 1.0 - 1e-12);
-                let alpha = (mu * phi_i).max(1e-12);
-                let beta = ((1.0 - mu) * phi_i).max(1e-12);
+                let mu = spec.mean[i];
+                if !(mu > 0.0 && mu < 1.0) {
+                    crate::bail_invalid_estim!(
+                        "Beta mean at row {i} must lie strictly in (0, 1), got {mu}"
+                    );
+                }
+                let alpha = mu * phi_i;
+                let beta = (1.0 - mu) * phi_i;
+                if !(alpha.is_finite() && alpha > 0.0 && beta.is_finite() && beta > 0.0) {
+                    crate::bail_invalid_estim!(
+                        "Beta shape parameters at row {i} are not representable: alpha={alpha}, beta={beta}"
+                    );
+                }
                 let dist = rand_distr::Beta::new(alpha, beta).map_err(|e| {
                     EstimationError::InvalidInput(format!(
                         "invalid Beta params alpha={alpha} beta={beta}: {e}"
@@ -577,8 +748,18 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
                 if !shape_i.is_finite() || shape_i <= 0.0 {
                     crate::bail_invalid_estim!("invalid Gamma shape at row {i}: {shape_i}");
                 }
-                let mu = spec.mean[i].max(1e-12);
-                let scale = (mu / shape_i).max(1e-12);
+                let mu = spec.mean[i];
+                if !(mu > 0.0) {
+                    crate::bail_invalid_estim!(
+                        "Gamma mean at row {i} must be strictly positive, got {mu}"
+                    );
+                }
+                let scale = mu / shape_i;
+                if !(scale.is_finite() && scale > 0.0) {
+                    crate::bail_invalid_estim!(
+                        "Gamma scale at row {i} is not representable: {mu}/{shape_i}"
+                    );
+                }
                 let dist = rand_distr::Gamma::new(shape_i, scale).map_err(|e| {
                     EstimationError::InvalidInput(format!(
                         "invalid Gamma params shape={shape_i} scale={scale}: {e}"
@@ -747,7 +928,7 @@ mod tests {
                 0.0,
                 &nb,
             ),
-            Some(2.97),
+            Ok(Some(2.97)),
             "NB picker must read theta_hat (#1124), not the seed theta=1"
         );
 
@@ -760,7 +941,7 @@ mod tests {
                 0.0,
                 &tw,
             ),
-            Some(7.25),
+            Ok(Some(7.25)),
             "Tweedie picker must read phi_hat (#771), not the variance power p"
         );
 
@@ -772,7 +953,7 @@ mod tests {
                 0.0,
                 &beta,
             ),
-            Some(12.0),
+            Ok(Some(12.0)),
             "Beta picker must read phi_hat (#770), not the seed phi=1"
         );
 
@@ -784,40 +965,27 @@ mod tests {
                 0.123,
                 &gamma,
             ),
-            Some(4.5),
+            Ok(Some(4.5)),
             "Gamma picker must read shape_hat (#678), not the residual-scale fallback"
         );
     }
 
-    /// With no fitted dispersion recorded (fit-free construction), the picker
-    /// falls back to the seed on the spec / the residual scale. It must never
-    /// return `None` for a dispersion family, or generation would have nothing
-    /// to draw with.
+    /// Construction seeds are not fitted dispersion. Missing/inconsistent
+    /// metadata must fail rather than silently changing the generated law.
     #[test]
-    fn family_noise_parameter_falls_back_to_seed_when_unfitted() {
-        // `ProfiledGaussian` carries no fixed_phi / negbin_theta / gamma_shape,
-        // so every accessor returns `None` and the picker must use the fallback.
+    fn family_noise_parameter_rejects_unresolved_fit_metadata() {
         let none = LikelihoodScaleMetadata::ProfiledGaussian;
-        assert_eq!(
-            family_noise_parameter(none, 0.0, &LikelihoodSpec::negative_binomial_log(3.5)),
-            Some(3.5),
-            "NB picker must fall back to the spec seed theta"
+        assert!(
+            family_noise_parameter(none, 0.0, &LikelihoodSpec::negative_binomial_log(3.5))
+                .is_err()
         );
-        assert_eq!(
-            family_noise_parameter(none, 0.0, &LikelihoodSpec::beta_logit(8.0)),
-            Some(8.0),
-            "Beta picker must fall back to the spec seed phi"
+        assert!(
+            family_noise_parameter(none, 0.0, &LikelihoodSpec::beta_logit(8.0)).is_err()
         );
-        assert_eq!(
-            family_noise_parameter(none, 0.0, &LikelihoodSpec::tweedie_log(1.5)),
-            Some(1.0),
-            "Tweedie picker must fall back to unit dispersion"
+        assert!(
+            family_noise_parameter(none, 0.0, &LikelihoodSpec::tweedie_log(1.5)).is_err()
         );
-        assert_eq!(
-            family_noise_parameter(none, 2.0, &LikelihoodSpec::gamma_log()),
-            Some(2.0),
-            "Gamma picker must fall back to the residual scale"
-        );
+        assert!(family_noise_parameter(none, 2.0, &LikelihoodSpec::gamma_log()).is_err());
     }
 
     /// End-to-end through the exact composition `gam generate` and
@@ -830,7 +998,7 @@ mod tests {
         let nobs = 6usize;
         let seed_spec = LikelihoodSpec::negative_binomial_log(1.0);
         let scale = LikelihoodScaleMetadata::EstimatedNegBinTheta { theta: 2.751 };
-        let picked = family_noise_parameter(scale, 0.0, &seed_spec);
+        let picked = family_noise_parameter(scale, 0.0, &seed_spec).unwrap();
         let noise =
             NoiseModel::from_likelihood(&seed_spec, nobs, picked).expect("NB noise model builds");
         let NoiseModel::NegativeBinomial { theta } = noise else {

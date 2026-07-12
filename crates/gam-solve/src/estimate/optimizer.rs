@@ -2063,12 +2063,7 @@ where
                     .map_err(|_| EstimationError::ModelIsIllConditioned {
                         condition_number: f64::INFINITY,
                     })?;
-            certify_factorized_inference_solve(
-                h,
-                &rhs,
-                &sol,
-                "penalty-block EDF trace",
-            )?;
+            certify_factorized_inference_solve(h, &rhs, &sol, "penalty-block EDF trace")?;
             // Frobenius inner product: only the block rows of rhs are nonzero.
             let mut frob = 0.0f64;
             for col in 0..rank {
@@ -2145,12 +2140,13 @@ where
                 // Sharing one certified SPD inverse makes the block traces and
                 // influence matrix read the identical `H⁻¹`. Failure is not a
                 // request to silently change rank or add a diagonal perturbation.
-                let h_inv = posterior_covariance_inverse(&h_orig, "edf reconciliation")
-                    .map_err(|error| {
+                let h_inv = posterior_covariance_inverse(&h_orig, "edf reconciliation").map_err(
+                    |error| {
                         EstimationError::RemlOptimizationFailed(format!(
                             "EDF reconciliation requires an exact SPD Hessian inverse: {error}"
                         ))
-                    })?;
+                    },
+                )?;
                 {
                     let qs = &pirls_res.reparam_result.qs;
                     let p_t = qs.ncols();
@@ -2240,12 +2236,7 @@ where
                 "exact bias-correction solve failed: {reason}"
             ))
         })?;
-        certify_factorized_inference_vector_solve(
-            h,
-            &s_beta_t,
-            &b_t,
-            "bias correction",
-        )?;
+        certify_factorized_inference_vector_solve(h, &s_beta_t, &b_t, "bias correction")?;
         let qs = &pirls_res.reparam_result.qs;
         let b_orig = qs.dot(&b_t);
         if b_orig.iter().any(|value| !value.is_finite()) {
@@ -2398,10 +2389,9 @@ where
         // the factorised-Hessian path in PredictionCovarianceBackend::Factorized.
 
         // Attempt the full inverse when the bundle fits the policy budget.
-        let beta_covariance_unscaled: Option<Array2<f64>> = if dense_covariance_reservation
-            .is_some()
-        {
-            Some(
+        let beta_covariance_unscaled: Option<Array2<f64>> =
+            if dense_covariance_reservation.is_some() {
+                Some(
                 posterior_covariance_inverse(&penalized_hessian, "posterior covariance").map_err(
                     |error| {
                         EstimationError::RemlOptimizationFailed(format!(
@@ -2410,9 +2400,9 @@ where
                     },
                 )?,
             )
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         if let Some(ref h_inv) = beta_covariance_unscaled {
             // Full inverse available: wrap as phi-scaled covariance, compute
@@ -2885,7 +2875,7 @@ where
     // both holds explicitly before handing the assembled result back.
     drop(dense_covariance_reservation);
     drop(factorized_inference_reservation);
-    Ok(conditioning.backtransform_external_result(result))
+    conditioning.backtransform_external_result(result)
 }
 
 #[cfg(test)]

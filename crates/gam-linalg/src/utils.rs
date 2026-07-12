@@ -1,7 +1,7 @@
 use crate::LinalgError;
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholeskyFactor, FaerLinalgError, array2_to_matmut,
-    factorize_symmetricwith_fallback,
+    factorize_symmetricwith_fallback, strict_symmetric_eigh,
 };
 use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::matrix::symmetrize_in_place;
@@ -1433,98 +1433,113 @@ pub fn gaussian_weighted_ridge_batch(
     Ok((coefficients, fitted))
 }
 
-/// Rank and Moore–Penrose pseudoinverse of a symmetric PSD penalty matrix via
-/// its eigendecomposition, keeping eigenpairs whose eigenvalue exceeds a
-/// relative tolerance. Returns `(rank, pinv)`.
-pub fn block_penalty_rank_and_pinv(
+/// Rank-truncated pseudoinverse of an exact finite symmetric PSD matrix.
+#[derive(Debug)]
+pub struct RankCertifiedPsdPseudoinverse {
+    rank: usize,
+    relative_cutoff: f64,
+    absolute_cutoff: f64,
+    max_eigenvalue: f64,
+    pseudoinverse: Array2<f64>,
+}
+
+impl RankCertifiedPsdPseudoinverse {
+    #[inline]
+    pub const fn rank(&self) -> usize {
+        self.rank
+    }
+
+    #[inline]
+    pub const fn relative_cutoff(&self) -> f64 {
+        self.relative_cutoff
+    }
+
+    #[inline]
+    pub const fn absolute_cutoff(&self) -> f64 {
+        self.absolute_cutoff
+    }
+
+    #[inline]
+    pub const fn max_eigenvalue(&self) -> f64 {
+        self.max_eigenvalue
+    }
+
+    #[inline]
+    pub fn pseudoinverse(&self) -> &Array2<f64> {
+        &self.pseudoinverse
+    }
+
+    #[inline]
+    pub fn into_pseudoinverse(self) -> Array2<f64> {
+        self.pseudoinverse
+    }
+
+    #[inline]
+    pub fn into_rank_and_pseudoinverse(self) -> (usize, Array2<f64>) {
+        (self.rank, self.pseudoinverse)
+    }
+}
+
+/// Compute a declared rank-truncated PSD pseudoinverse from one strict,
+/// unjittered eigendecomposition of the supplied matrix.
+///
+/// Eigenvalues `lambda > relative_cutoff * lambda_max` define the certified
+/// range. Values at or below that explicit cutoff define the discarded null
+/// space. A negative eigenvalue is admitted only within the dimension-scaled
+/// eigensolver roundoff bound; material indefiniteness is an error. No absolute
+/// floor, repaired eigendecomposition, or fallback rank is hidden here.
+pub fn rank_certified_psd_pseudoinverse(
     penalty: &Array2<f64>,
-) -> Result<(usize, Array2<f64>), LinalgError> {
-    let (eigs, vecs) =
-        penalty
-            .to_owned()
-            .eigh(Side::Lower)
-            .map_err(|_| LinalgError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            })?;
-    let max_abs = eigs.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
-    let tol = (1.0e-10 * max_abs).max(1.0e-14);
+    relative_cutoff: f64,
+) -> Result<RankCertifiedPsdPseudoinverse, LinalgError> {
+    if !relative_cutoff.is_finite() || !(0.0..1.0).contains(&relative_cutoff) {
+        return Err(LinalgError::InvalidInput(format!(
+            "PSD pseudoinverse relative cutoff must be finite in [0, 1), got {relative_cutoff:?}"
+        )));
+    }
+    let (eigs, vecs) = strict_symmetric_eigh(penalty, Side::Lower)
+        .map_err(|error| LinalgError::InvalidInput(error.to_string()))?;
+    let max_abs = eigs
+        .iter()
+        .fold(0.0_f64, |maximum, &value| maximum.max(value.abs()));
+    let max_eigenvalue = eigs
+        .iter()
+        .fold(0.0_f64, |maximum, &value| maximum.max(value));
+    let psd_roundoff = 128.0 * penalty.nrows() as f64 * f64::EPSILON * max_abs;
+    if let Some((index, &value)) = eigs
+        .iter()
+        .enumerate()
+        .find(|(_, value)| **value < -psd_roundoff)
+    {
+        return Err(LinalgError::InvalidInput(format!(
+            "PSD pseudoinverse input is indefinite at eigenvalue {index}: {value:.3e} < -{psd_roundoff:.3e}"
+        )));
+    }
+    let absolute_cutoff = relative_cutoff * max_eigenvalue;
     let mut rank = 0_usize;
     let mut scaled = Array2::<f64>::zeros(vecs.dim());
     for col in 0..eigs.len() {
-        if eigs[col] > tol {
+        if eigs[col] > absolute_cutoff {
             rank += 1;
             for row in 0..vecs.nrows() {
                 scaled[[row, col]] = vecs[[row, col]] / eigs[col];
             }
         }
     }
-    Ok((rank, scaled.dot(&vecs.t())))
-}
-
-/// Invert a symmetric positive-definite matrix, escalating a relative diagonal
-/// ridge until the Cholesky factorization succeeds (robust SPD inverse).
-pub fn invert_spd_with_ridge(
-    matrix: &Array2<f64>,
-    ridge_rel: f64,
-) -> Result<Array2<f64>, LinalgError> {
-    let n = matrix.nrows();
-    let eye = Array2::<f64>::eye(n);
-    let scale = (0..n).map(|i| matrix[[i, i]].abs()).fold(1.0_f64, f64::max);
-    let ridges = [0.0, ridge_rel, 1.0e-10, 1.0e-8, 1.0e-6, 1.0e-4];
-    for rel in ridges {
-        let mut candidate = matrix.clone();
-        if rel > 0.0 {
-            for i in 0..n {
-                candidate[[i, i]] += rel * scale;
-            }
-        }
-        if let Ok(chol) = candidate.cholesky(Side::Lower) {
-            return Ok(chol.solve_mat(&eye));
-        }
+    let mut pseudoinverse = scaled.dot(&vecs.t());
+    symmetrize_in_place(&mut pseudoinverse);
+    if pseudoinverse.iter().any(|value| !value.is_finite()) {
+        return Err(LinalgError::InvalidInput(
+            "PSD pseudoinverse is not representable at the declared rank cutoff".to_string(),
+        ));
     }
-    Err(LinalgError::ModelIsIllConditioned {
-        condition_number: f64::INFINITY,
+    Ok(RankCertifiedPsdPseudoinverse {
+        rank,
+        relative_cutoff,
+        absolute_cutoff,
+        max_eigenvalue,
+        pseudoinverse,
     })
-}
-
-/// Solve a symmetric (possibly indefinite/ill-conditioned) linear system via
-/// eigendecomposition with a spectral floor: eigenvalues below the floor are
-/// clamped (preserving sign) before inversion, stabilizing the solve.
-pub fn solve_symmetric_vector_with_floor(
-    matrix: &Array2<f64>,
-    rhs: &Array1<f64>,
-    ridge_rel: f64,
-) -> Result<Array1<f64>, LinalgError> {
-    let n = matrix.nrows();
-    let mut sym = matrix.clone();
-    symmetrize_in_place(&mut sym);
-    let (eigs, vecs) = sym
-        .eigh(Side::Lower)
-        .map_err(|_| LinalgError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        })?;
-    let max_eig = eigs.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
-    let floor = (ridge_rel * max_eig.max(1.0)).max(1.0e-12);
-    let projected = vecs.t().dot(rhs);
-    let mut scaled = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let denom = if eigs[i].abs() >= floor {
-            eigs[i]
-        } else if eigs[i].is_sign_negative() {
-            -floor
-        } else {
-            floor
-        };
-        scaled[i] = projected[i] / denom;
-    }
-    let out = vecs.dot(&scaled);
-    if out.iter().all(|value| value.is_finite()) {
-        Ok(out)
-    } else {
-        Err(LinalgError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        })
-    }
 }
 
 /// Solve a symmetric dense block system `H x = rhs` (single right-hand side)
@@ -1544,7 +1559,7 @@ pub fn solve_dense_block_system(
 mod certified_inverse_tests {
     use super::{
         CertifiedSymmetricSolveError, certified_spd_factorize, certified_spd_inverse,
-        certified_symmetric_solve,
+        certified_symmetric_solve, rank_certified_psd_pseudoinverse,
     };
     use ndarray::array;
 
@@ -1623,6 +1638,25 @@ mod certified_inverse_tests {
         let solved = certified_symmetric_solve(&matrix, &rhs, "indefinite equation").unwrap();
         assert_eq!(solved.solution(), &array![3.0, 2.0]);
         assert_eq!(solved.certificate().residual_max_abs, 0.0);
+    }
+
+    #[test]
+    fn psd_pseudoinverse_reports_the_declared_scale_invariant_rank_cutoff() {
+        let matrix = array![[1.0e-200, 0.0], [0.0, 1.0e-212]];
+        let geometry = rank_certified_psd_pseudoinverse(&matrix, 1.0e-10).unwrap();
+        assert_eq!(geometry.rank(), 1);
+        assert_eq!(geometry.relative_cutoff(), 1.0e-10);
+        assert_eq!(geometry.absolute_cutoff(), 1.0e-210);
+        assert_eq!(geometry.max_eigenvalue(), 1.0e-200);
+        assert!(geometry.pseudoinverse()[[0, 0]].is_finite());
+        assert_eq!(geometry.pseudoinverse()[[1, 1]], 0.0);
+    }
+
+    #[test]
+    fn psd_pseudoinverse_rejects_material_indefiniteness_instead_of_repairing_it() {
+        let matrix = array![[1.0, 0.0], [0.0, -1.0e-4]];
+        let error = rank_certified_psd_pseudoinverse(&matrix, 1.0e-10).unwrap_err();
+        assert!(error.to_string().contains("indefinite"));
     }
 }
 

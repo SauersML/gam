@@ -302,7 +302,8 @@ pub(crate) fn run_generate_unified(
                         fit_saved.likelihood_scale,
                         fit_saved.standard_deviation,
                         &family,
-                    ),
+                    )
+                    .map_err(|err| format!("failed to resolve generative dispersion: {err}"))?,
                     // This scalar-dispersion fallback arm handles non-Gaussian
                     // families (Gamma/NB/Beta/Tweedie), whose observation draw
                     // does not take analytic prior weights; the Gaussian
@@ -351,7 +352,8 @@ pub(crate) fn run_generate_unified(
                 fit_saved.likelihood_scale,
                 fit_saved.standard_deviation,
                 &family,
-            ),
+            )
+            .map_err(|err| format!("failed to resolve generative dispersion: {err}"))?,
             // Prior-weight scaling for the weighted-Gaussian replicate draw is
             // resolved in the FFI `Model.sample_replicates` path (#2025); this
             // CLI generate arm preserves its existing scalar-sigma behavior.

@@ -1363,10 +1363,11 @@ pub(crate) fn weighted_ridge_sandwich_cov(
             meat_scaled[[i, j]] *= s;
         }
     }
-    let (_rank, m_pinv) =
-        gam_linalg::utils::block_penalty_rank_and_pinv(&m_scaled).map_err(|e| {
+    let m_pinv = gam_linalg::utils::rank_certified_psd_pseudoinverse(&m_scaled, 1.0e-10)
+        .map_err(|e| {
             format!("conditional latent calibration sandwich pseudo-inverse failed: {e}")
-        })?;
+        })?
+        .into_pseudoinverse();
     let mut cov = m_pinv.dot(&meat_scaled).dot(&m_pinv);
     // Undo the symmetric scaling: cov_raw = D⁻¹ cov_scaled D⁻¹.
     for i in 0..p {
@@ -1446,8 +1447,10 @@ pub(crate) fn robust_conditional_score_pvalue(
     if !s.iter().all(|v| v.is_finite()) || !omega.iter().all(|v| v.is_finite()) {
         return Ok(None);
     }
-    let (rank, omega_pinv) = gam_linalg::utils::block_penalty_rank_and_pinv(&omega)
+    let omega_geometry = gam_linalg::utils::rank_certified_psd_pseudoinverse(&omega, 1.0e-10)
         .map_err(|e| format!("conditional score test pseudo-inverse failed: {e}"))?;
+    let rank = omega_geometry.rank();
+    let omega_pinv = omega_geometry.into_pseudoinverse();
     if rank == 0 {
         return Ok(None);
     }

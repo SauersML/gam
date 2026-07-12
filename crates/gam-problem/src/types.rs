@@ -622,7 +622,9 @@ mod newtype_tests {
 
 #[cfg(test)]
 mod ridge_policy_tests {
-    use super::{RidgePassport, RidgePolicy, StabilizationKind, StabilizationLedger};
+    use super::{
+        RidgePassport, RidgePolicy, StabilizationKind, StabilizationLedger, StabilizationRule,
+    };
 
     #[test]
     fn solver_only_ridge_policy_stays_off_objective_accounting() {
@@ -668,5 +670,16 @@ mod ridge_policy_tests {
             0.0,
             "solver-only ridge must not contribute to determinant accounting"
         );
+    }
+
+    #[test]
+    fn approximation_ridge_is_passported_without_becoming_a_model_prior() {
+        let ledger =
+            StabilizationLedger::approximation_only(1.0e-8, StabilizationRule::FixedConstant);
+        assert!(matches!(ledger.kind, StabilizationKind::ApproximationOnly));
+        assert_eq!(ledger.delta, 1.0e-8);
+        assert_eq!(ledger.quadratic_delta(), 0.0);
+        assert_eq!(ledger.laplace_hessian_delta(), 0.0);
+        assert_eq!(ledger.penalty_logdet_delta(), 0.0);
     }
 }
