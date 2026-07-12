@@ -55,6 +55,8 @@
 
 use std::time::Instant;
 
+use ndarray::ArrayView1;
+
 use crate::encode::{AtlasConfig, AtomEncodeAtlas, KANTOROVICH_THRESHOLD, euclidean_patch_degree};
 use crate::manifold::SaeManifoldAtom;
 use gam_gpu::policy::{EncodeDecisionBlocked, EncodeDeploymentDecision};
@@ -789,37 +791,35 @@ fn nearest_charts_topk(
     amplitude: f64,
     scratch: &mut Scratch,
 ) -> Vec<usize> {
-    if dev.charts.is_empty() || dev.topk == 0 {
-        return Vec::new();
-    }
-    let p = dev.p;
-    let mut scored: Vec<(usize, f64)> = Vec::new();
-    let mut recon = vec![0.0_f64; p];
-    for (idx, chart) in dev.charts.iter().enumerate() {
-        if chart.certified_radius <= 0.0 {
-            continue;
-        }
-        eval_basis(
-            dev,
-            &chart.center,
-            &mut scratch.phi,
-            &mut scratch.jet,
-            &mut scratch.hess,
-        );
-        recon_amp1(dev, &scratch.phi, &mut recon);
-        let mut dist = 0.0;
-        for c in 0..p {
-            let diff = amplitude * recon[c] - x[c];
-            dist += diff * diff;
-        }
-        scored.push((idx, dist));
-    }
-    scored.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
-    scored.into_iter().take(dev.topk).map(|(i, _)| i).collect()
+    // The amplitude-gating + `(distance, index)` tie-break comparator is shared
+    // with the CPU atlas encode via `crate::encode::select_nearest_charts_topk`,
+    // so the two paths cannot drift. This host path re-evaluates the basis at each
+    // chart center (`eval_basis` + `recon_amp1`) exactly as the CUDA kernel does,
+    // keeping the emulator its bit-parity oracle; only the comparator is shared.
+    crate::encode::select_nearest_charts_topk(
+        dev.charts.len(),
+        ArrayView1::from(x),
+        amplitude,
+        dev.topk,
+        |idx, out| {
+            let chart = &dev.charts[idx];
+            if chart.certified_radius <= 0.0 {
+                return false;
+            }
+            eval_basis(
+                dev,
+                &chart.center,
+                &mut scratch.phi,
+                &mut scratch.jet,
+                &mut scratch.hess,
+            );
+            recon_amp1(dev, &scratch.phi, out);
+            true
+        },
+    )
+    .into_iter()
+    .map(|(i, _)| i)
+    .collect()
 }
 
 /// The full exact per-row certified encode for one `EuclideanPatch` atom — the

@@ -70,10 +70,103 @@ use crate::vector_response::{
     MultinomialLogitLikelihood, VectorLikelihood, validate_multinomial_simplex,
 };
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
+use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
 use gam_problem::HyperOperator;
 use gam_solve::pirls::dense_block_xtwx;
 use ndarray::{Array1, Array2, Array3, ArrayView2};
 use std::sync::{Arc, Mutex};
+
+/// Nilpotent coefficient selected from the canonical multinomial perturbation
+/// program below. `OneSeed<0>` selects the first directional derivative;
+/// `TwoSeed<0>` selects the mixed second directional derivative. There are no
+/// primary axes because this program differentiates only along supplied
+/// coefficient-space directions.
+trait FisherPerturbation: JetScalar<0> {
+    fn seed(direction_u: f64, direction_v: f64) -> Self;
+    fn coefficient(&self) -> f64;
+}
+
+impl FisherPerturbation for OneSeed<0> {
+    #[inline(always)]
+    fn seed(direction_u: f64, _direction_v: f64) -> Self {
+        Self {
+            base: <Order2<0> as JetScalar<0>>::constant(0.0),
+            eps: <Order2<0> as JetScalar<0>>::constant(direction_u),
+        }
+    }
+
+    #[inline(always)]
+    fn coefficient(&self) -> f64 {
+        JetScalar::value(&self.eps)
+    }
+}
+
+impl FisherPerturbation for TwoSeed<0> {
+    #[inline(always)]
+    fn seed(direction_u: f64, direction_v: f64) -> Self {
+        Self {
+            base: <Order2<0> as JetScalar<0>>::constant(0.0),
+            eps: <Order2<0> as JetScalar<0>>::constant(direction_u),
+            del: <Order2<0> as JetScalar<0>>::constant(direction_v),
+            eps_del: <Order2<0> as JetScalar<0>>::constant(0.0),
+        }
+    }
+
+    #[inline(always)]
+    fn coefficient(&self) -> f64 {
+        JetScalar::value(&self.eps_del)
+    }
+}
+
+/// Evaluate the one canonical active-class softmax/Fisher expression
+///
+/// `p_a(delta) = p_a exp(delta_a) / (1 + sum_c p_c (exp(delta_c) - 1))`
+///
+/// and `F_ab(delta) = weight * (indicator(a=b) p_a(delta) -
+/// p_a(delta) p_b(delta))`, then select the requested nilpotent coefficient.
+/// The implicit reference class is exactly the constant mass in the leading
+/// `1`; at the base point the denominator is bit-exactly one. The exponential
+/// and reciprocal derivative stacks are supplied at their fixed base points
+/// zero and one, so this performs no transcendental calls. Instantiating the
+/// same expression at `OneSeed<0>` or `TwoSeed<0>` yields every live first- and
+/// second-directional Fisher path without a dense class-axis derivative tower.
+#[inline(always)]
+fn softmax_fisher_perturbation<S: FisherPerturbation>(
+    m: usize,
+    weight: f64,
+    probability: impl Fn(usize) -> f64,
+    direction_u: impl Fn(usize) -> f64,
+    direction_v: impl Fn(usize) -> f64,
+    normalized: &mut [S],
+    fisher: &mut [f64],
+) {
+    debug_assert_eq!(normalized.len(), m);
+    debug_assert_eq!(fisher.len(), m * m);
+    let one = S::constant(1.0);
+    let mut denominator = one;
+    for a in 0..m {
+        let pa = probability(a);
+        let delta = S::seed(direction_u(a), direction_v(a));
+        let exp_delta = delta.compose_unary([1.0; 5]);
+        denominator = denominator.add(&exp_delta.sub(&one).scale(pa));
+        normalized[a] = exp_delta.scale(pa);
+    }
+    let inverse = denominator.compose_unary([1.0, -1.0, 2.0, -6.0, 24.0]);
+    for probability in normalized.iter_mut() {
+        *probability = probability.mul(&inverse);
+    }
+    for a in 0..m {
+        let pa = normalized[a];
+        let diagonal = pa.sub(&pa.mul(&pa)).scale(weight);
+        fisher[a * m + a] = diagonal.coefficient();
+        for b in (a + 1)..m {
+            let off_diagonal = pa.mul(&normalized[b]).neg().scale(weight);
+            let coefficient = off_diagonal.coefficient();
+            fisher[a * m + b] = coefficient;
+            fisher[b * m + a] = coefficient;
+        }
+    }
+}
 
 /// The reference-symmetric class-space metric `M = I_m − J_m/K` (`m = K−1`
 /// active classes, `J` = all-ones), the closed-form CLR whitening factor of

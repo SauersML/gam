@@ -3925,40 +3925,85 @@ pub(crate) fn center_amortized_jacobian(
     Some((a1, recon))
 }
 
+/// The shared chart-routing comparator: the SINGLE amplitude-gating + tie-break
+/// decision every chart-routing top-k selection funnels through, so the CPU
+/// atlas encode ([`nearest_chart`], [`nearest_charts_topk`]) and the GPU-host
+/// resident encode
+/// ([`crate::gpu_kernels::sae_encode_resident::nearest_charts_topk`]) can never
+/// drift apart.
+///
+/// For each of `n_charts` charts (in index order), `recon_into(idx, out)` writes
+/// the chart's amplitude-1 center reconstruction `m₁(t_idx)` into `out` and
+/// returns whether the chart is certifiable (`certified_radius > 0`); a `false`
+/// return skips it. The score is the TRUE encode objective at the row's
+/// amplitude `z`, `‖x − z·m₁(t_c)‖²` — NOT the amplitude-1 `‖x − m₁(t_c)‖²`,
+/// because the reconstruction actually compared against `x` is `z·m₁(t_c)` and
+/// routing on amplitude-1 centers picks the wrong chart whenever `z ≠ 1` (a small
+/// `z` makes a large-norm center reconstruct near a small `x`). The `k` charts of
+/// smallest score are returned as `(index, distance)` sorted by `(distance,
+/// index)` — a strict, deterministic first-wins tie rule.
+///
+/// The recon SOURCE is deliberately left to the caller: the CPU path copies the
+/// distilled `recon_center` (precomputed once at build), while the GPU-host path
+/// re-evaluates the basis at the chart center (mirroring exactly what the CUDA
+/// kernel does, so the emulator stays its bit-parity oracle). Only the comparator
+/// is shared.
+pub(crate) fn select_nearest_charts_topk(
+    n_charts: usize,
+    x: ArrayView1<'_, f64>,
+    amplitude: f64,
+    k: usize,
+    mut recon_into: impl FnMut(usize, &mut [f64]) -> bool,
+) -> Vec<(usize, f64)> {
+    if n_charts == 0 || k == 0 {
+        return Vec::new();
+    }
+    let mut recon = vec![0.0_f64; x.len()];
+    let mut scored: Vec<(usize, f64)> = Vec::new();
+    for idx in 0..n_charts {
+        if !recon_into(idx, &mut recon) {
+            continue;
+        }
+        // Amplitude-scaled center distance, accumulated in place.
+        let mut dist = 0.0;
+        for (r, xv) in recon.iter().zip(x.iter()) {
+            let diff = amplitude * r - xv;
+            dist += diff * diff;
+        }
+        scored.push((idx, dist));
+    }
+    // Sort by distance, then chart index for a deterministic, first-wins order.
+    scored.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    scored.truncate(k);
+    scored
+}
+
 /// Route a target row to the nearest chart of an atom by reconstruction
 /// distance: the chart whose center reconstruction `m(t_c)` is closest to `x`.
 /// Returns the chart index and the distance, or `None` when the atom has no
-/// charts.
+/// charts. Equivalent to `select_nearest_charts_topk(.., 1).first()`, routed
+/// through the shared comparator.
 pub(crate) fn nearest_chart(
     atom_atlas: &AtomEncodeAtlas,
     x: ArrayView1<'_, f64>,
     amplitude: f64,
 ) -> Option<(usize, f64)> {
-    if atom_atlas.charts.is_empty() {
-        return None;
-    }
-    let mut best: Option<(usize, f64)> = None;
-    for (idx, chart) in atom_atlas.charts.iter().enumerate() {
+    select_nearest_charts_topk(atom_atlas.charts.len(), x, amplitude, 1, |idx, out| {
+        let chart = &atom_atlas.charts[idx];
         if chart.certified_radius <= 0.0 {
-            continue;
+            return false;
         }
-        // F1: score the TRUE encode objective `‖x − z·m(t_c)‖²` at the row's
-        // amplitude `z`, NOT the amplitude-1 `‖x − m(t_c)‖²`. The distilled
-        // `chart.recon_center` is the amplitude-1 reconstruction `m₁(t_c)`; the
-        // reconstruction actually compared against `x` is `z·m₁(t_c)`. Routing on
-        // the amplitude-1 centers picks the wrong chart whenever `z ≠ 1` (e.g. a
-        // small `z` makes a large-norm center reconstruct near a small `x`).
-        // Distance accumulated in place, no temporary array.
-        let mut dist = 0.0;
-        for (r, xv) in chart.recon_center.iter().zip(x.iter()) {
-            let diff = amplitude * r - xv;
-            dist += diff * diff;
+        for (o, r) in out.iter_mut().zip(chart.recon_center.iter()) {
+            *o = *r;
         }
-        if best.map(|(_, b)| dist < b).unwrap_or(true) {
-            best = Some((idx, dist));
-        }
-    }
-    best
+        true
+    })
+    .into_iter()
+    .next()
 }
 
 /// The `k` charts whose CENTER reconstruction `m(t_c)` is nearest to `x` in
@@ -3974,36 +4019,25 @@ pub(crate) fn nearest_charts_topk(
     amplitude: f64,
     k: usize,
 ) -> Vec<usize> {
-    if atom_atlas.charts.is_empty() || k == 0 {
-        return Vec::new();
-    }
-    let mut scored: Vec<(usize, f64)> = Vec::new();
-    for (idx, chart) in atom_atlas.charts.iter().enumerate() {
+    // `m₁(t_c) = BᵀΦ(t_c)` is an OFFLINE per-chart constant already distilled into
+    // `chart.recon_center` at build time (bit-for-bit the same φ·decoder
+    // accumulation this used to recompute). Reuse it instead of re-evaluating the
+    // basis at a fixed center for every row — that re-eval was the encode's
+    // dominant per-row cost. The amplitude-gating + tie-break comparator lives in
+    // `select_nearest_charts_topk` (shared with the GPU-host path).
+    select_nearest_charts_topk(atom_atlas.charts.len(), x, amplitude, k, |idx, out| {
+        let chart = &atom_atlas.charts[idx];
         if chart.certified_radius <= 0.0 {
-            continue;
+            return false;
         }
-        // `m₁(t_c) = BᵀΦ(t_c)` is an OFFLINE per-chart constant already distilled
-        // into `chart.recon_center` at build time (bit-for-bit the same φ·decoder
-        // accumulation this used to recompute). Reuse it instead of re-evaluating
-        // the basis at a fixed center for every row — that re-eval was the encode's
-        // dominant per-row cost (charts × rows basis evals, each allocating the φ/jet
-        // arrays). F1: score the amplitude-scaled `‖x − z·m₁(t_c)‖²` (the true
-        // objective), not the amplitude-1 `‖m₁(t_c) − x‖²`. Computed in place.
-        let mut dist = 0.0;
-        for (r, xv) in chart.recon_center.iter().zip(x.iter()) {
-            let diff = amplitude * r - xv;
-            dist += diff * diff;
+        for (o, r) in out.iter_mut().zip(chart.recon_center.iter()) {
+            *o = *r;
         }
-        scored.push((idx, dist));
-    }
-    // Sort by distance, then chart index for a deterministic, first-wins order
-    // consistent with `nearest_chart`'s strict-`<` tie rule.
-    scored.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
-    scored.into_iter().take(k).map(|(idx, _)| idx).collect()
+        true
+    })
+    .into_iter()
+    .map(|(idx, _)| idx)
+    .collect()
 }
 
 /// Reconstruction error `‖x − z·m(t)‖` of an encoded coordinate `t` — the
