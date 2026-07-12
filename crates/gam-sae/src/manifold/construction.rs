@@ -71,6 +71,130 @@ pub struct StreamingRankInputs {
 /// never desync.
 pub(crate) const RANK_VANISHED_REL: f64 = 1.0e-9;
 
+/// Validate the shared reconstruction-rank problem before either the production
+/// value path or the WBIC audit touches a factorization. Keeping this contract
+/// in one place prevents the two mathematically identical paths from drifting,
+/// and turns ndarray dimension mismatches into ordinary errors instead of dot-
+/// product panics.
+pub(super) fn validate_rank_charge_problem(
+    gram: &Array2<f64>,
+    decoder: &Array2<f64>,
+    n_eff: f64,
+    p_out: f64,
+    r_floor: f64,
+    lam_smooth: f64,
+    smooth_penalty: Option<&Array2<f64>>,
+) -> Result<(), String> {
+    let m = gram.nrows();
+    if gram.ncols() != m {
+        return Err(format!(
+            "rank-charge Gram must be square; got {:?}",
+            gram.dim()
+        ));
+    }
+    if decoder.nrows() != m {
+        return Err(format!(
+            "rank-charge decoder must have {m} rows; got {:?}",
+            decoder.dim()
+        ));
+    }
+    if !p_out.is_finite() || p_out < 0.0 || p_out != decoder.ncols() as f64 {
+        return Err(format!(
+            "rank-charge p_out must equal the decoder width {}; got {p_out}",
+            decoder.ncols()
+        ));
+    }
+    if !n_eff.is_finite() || n_eff < 0.0 {
+        return Err(format!(
+            "rank-charge n_eff must be finite and non-negative; got {n_eff}"
+        ));
+    }
+    if !r_floor.is_finite() || r_floor < 0.0 {
+        return Err(format!(
+            "rank-charge dispersion must be finite and non-negative; got {r_floor}"
+        ));
+    }
+    if !lam_smooth.is_finite() || lam_smooth < 0.0 {
+        return Err(format!(
+            "rank-charge smoothing weight must be finite and non-negative; got {lam_smooth}"
+        ));
+    }
+    if gram.iter().any(|value| !value.is_finite()) {
+        return Err("rank-charge Gram must be finite".to_string());
+    }
+    if decoder.iter().any(|value| !value.is_finite()) {
+        return Err("rank-charge decoder must be finite".to_string());
+    }
+
+    let gram_scale = gram.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
+    let gram_symmetry_tolerance =
+        64.0 * m as f64 * f64::EPSILON * gram_scale.max(f64::MIN_POSITIVE);
+    for row in 0..m {
+        for col in 0..row {
+            if (gram[[row, col]] - gram[[col, row]]).abs() > gram_symmetry_tolerance {
+                return Err(format!(
+                    "rank-charge Gram is materially asymmetric at ({row}, {col})"
+                ));
+            }
+        }
+    }
+
+    if let Some(penalty) = smooth_penalty {
+        if penalty.dim() != (m, m) {
+            return Err(format!(
+                "rank-charge smooth penalty shape {:?} does not match Gram shape ({m}, {m})",
+                penalty.dim()
+            ));
+        }
+        if penalty.iter().any(|value| !value.is_finite()) {
+            return Err("rank-charge smooth penalty must be finite".to_string());
+        }
+        let penalty_scale = penalty
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        let penalty_symmetry_tolerance =
+            64.0 * m as f64 * f64::EPSILON * penalty_scale.max(f64::MIN_POSITIVE);
+        for row in 0..m {
+            for col in 0..row {
+                if (penalty[[row, col]] - penalty[[col, row]]).abs() > penalty_symmetry_tolerance {
+                    return Err(format!(
+                        "rank-charge smooth penalty is materially asymmetric at ({row}, {col})"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Certify the eigenspectrum of a matrix promised to be a Gram matrix. Tiny
+/// negative eigenvalues inside the symmetric eigensolver's backward-error
+/// envelope are numerical zero; a material negative direction is invalid data,
+/// not a direction the rank charge may silently discard.
+pub(super) fn certified_gram_spectrum(
+    eigenvalues: ArrayView1<'_, f64>,
+) -> Result<Vec<f64>, String> {
+    if eigenvalues.iter().any(|value| !value.is_finite()) {
+        return Err("rank-charge Gram eigenspectrum is non-finite".to_string());
+    }
+    let scale = eigenvalues
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max);
+    let tolerance = 64.0 * eigenvalues.len() as f64 * f64::EPSILON * scale.max(f64::MIN_POSITIVE);
+    let mut certified = Vec::with_capacity(eigenvalues.len());
+    for (axis, &eigenvalue) in eigenvalues.iter().enumerate() {
+        if eigenvalue < -tolerance {
+            return Err(format!(
+                "rank-charge Gram is materially indefinite: eigenvalue {axis}={eigenvalue:.6e} is below -{tolerance:.6e}"
+            ));
+        }
+        certified.push(eigenvalue.max(0.0));
+    }
+    Ok(certified)
+}
+
 pub(crate) fn realised_rank_charge_dof(
     gram: &Array2<f64>,
     decoder: &Array2<f64>,
@@ -81,7 +205,16 @@ pub(crate) fn realised_rank_charge_dof(
     smooth_penalty: Option<&Array2<f64>>,
 ) -> Result<f64, String> {
     let m = gram.nrows();
-    if m == 0 || !(n_eff > 0.0) {
+    validate_rank_charge_problem(
+        gram,
+        decoder,
+        n_eff,
+        p_out,
+        r_floor,
+        lam_smooth,
+        smooth_penalty,
+    )?;
+    if m == 0 || n_eff == 0.0 {
         return Ok(0.0);
     }
     // rank_eff: MP hard count on the reconstruction Gram. U orthogonal ⇒ svd of
@@ -89,10 +222,11 @@ pub(crate) fn realised_rank_charge_dof(
     let (evals, u) = gram
         .eigh(super::Side::Lower)
         .map_err(|e| format!("realised_rank_charge_dof: eigh(G): {e}"))?;
+    let evals = certified_gram_spectrum(evals.view())?;
     let mut scaled = u.t().dot(decoder);
     let cols = scaled.ncols();
     for i in 0..m {
-        let s = evals[i].max(0.0).sqrt();
+        let s = evals[i].sqrt();
         for j in 0..cols {
             scaled[[i, j]] *= s;
         }
@@ -101,7 +235,8 @@ pub(crate) fn realised_rank_charge_dof(
         Ok((_, sv, _)) => sv,
         Err(e) => return Err(format!("realised_rank_charge_dof: recon svd: {e}")),
     };
-    let edge = r_floor * (1.0 + (p_out / n_eff).sqrt()).powi(2);
+    let edge = crate::null_battery::mp_detection_floor(n_eff, p_out, r_floor)
+        .map_err(|error| format!("realised_rank_charge_dof: {error}"))?;
     let mut rank_eff = sv.iter().filter(|&&s| (s * s) / n_eff > edge).count() as f64;
     // DETECTION vs DEGENERACY (#2258 real-activation class). rank_eff == 0
     // conflated two regimes with opposite correct handling:
@@ -144,12 +279,6 @@ pub(crate) fn realised_rank_charge_dof(
     // basis_edf = tr(gram·(gram+λS)⁻¹).
     let mut mmat = gram.clone();
     if let Some(pen) = smooth_penalty {
-        if pen.dim() != (m, m) {
-            return Err(format!(
-                "realised_rank_charge_dof: smooth penalty shape {:?} does not match Gram shape ({m}, {m})",
-                pen.dim()
-            ));
-        }
         for i in 0..m {
             for j in 0..m {
                 mmat[[i, j]] += lam_smooth * pen[[i, j]];

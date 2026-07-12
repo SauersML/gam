@@ -221,21 +221,31 @@ pub fn recon_spectrum(
     smooth_penalty: Option<&Array2<f64>>,
 ) -> Result<ReconSpectrum, String> {
     let m = gram.nrows();
-    if m == 0 || !(n_eff > 0.0) {
+    super::construction::validate_rank_charge_problem(
+        gram,
+        decoder,
+        n_eff,
+        p_out,
+        r_floor,
+        lam_smooth,
+        smooth_penalty,
+    )?;
+    if m == 0 || n_eff == 0.0 {
         return Ok(ReconSpectrum {
             mu: Vec::new(),
             edge: 0.0,
             basis_edf: 0.0,
-            n_eff: n_eff.max(0.0),
+            n_eff,
         });
     }
     let (evals, u) = gram
         .eigh(Side::Lower)
         .map_err(|e| format!("recon_spectrum: eigh(G): {e}"))?;
+    let evals = super::construction::certified_gram_spectrum(evals.view())?;
     let mut scaled = u.t().dot(decoder);
     let cols = scaled.ncols();
     for i in 0..m {
-        let s = evals[i].max(0.0).sqrt();
+        let s = evals[i].sqrt();
         for j in 0..cols {
             scaled[[i, j]] *= s;
         }
@@ -244,17 +254,12 @@ pub fn recon_spectrum(
         Ok((_, sv, _)) => sv,
         Err(e) => return Err(format!("recon_spectrum: recon svd: {e}")),
     };
-    let edge = r_floor * (1.0 + (p_out / n_eff).sqrt()).powi(2);
+    let edge = crate::null_battery::mp_detection_floor(n_eff, p_out, r_floor)
+        .map_err(|error| format!("recon_spectrum: {error}"))?;
     let mu: Vec<f64> = sv.iter().map(|&s| (s * s) / n_eff).collect();
     // basis_edf = tr(G(G+λS)⁻¹), the same ridge trace the production core computes.
     let mut mmat = gram.clone();
     if let Some(pen) = smooth_penalty {
-        if pen.dim() != (m, m) {
-            return Err(format!(
-                "recon_spectrum: smooth penalty shape {:?} does not match Gram shape ({m}, {m})",
-                pen.dim()
-            ));
-        }
         for i in 0..m {
             for j in 0..m {
                 mmat[[i, j]] += lam_smooth * pen[[i, j]];
@@ -565,6 +570,62 @@ mod tests {
         assert!(
             (d_prod - d_audit).abs() < 1e-8,
             "audit hard d_eff must match production: prod={d_prod} audit={d_audit}"
+        );
+    }
+
+    #[test]
+    fn rank_charge_value_and_audit_share_strict_numeric_contract() {
+        let gram = Array2::<f64>::eye(2);
+        let decoder = Array2::<f64>::zeros((2, 3));
+        let production = |gram: &Array2<f64>,
+                          decoder: &Array2<f64>,
+                          n_eff: f64,
+                          p_out: f64,
+                          r_floor: f64,
+                          lam_smooth: f64,
+                          penalty: Option<&Array2<f64>>| {
+            super::super::construction::realised_rank_charge_dof(
+                gram, decoder, n_eff, p_out, r_floor, lam_smooth, penalty,
+            )
+        };
+
+        for (n_eff, p_out, r_floor, lam_smooth) in [
+            (f64::NAN, 3.0, 1.0, 0.0),
+            (-1.0, 3.0, 1.0, 0.0),
+            (10.0, f64::INFINITY, 1.0, 0.0),
+            (10.0, 3.0, -1.0, 0.0),
+            (10.0, 3.0, 1.0, f64::NAN),
+        ] {
+            assert!(production(&gram, &decoder, n_eff, p_out, r_floor, lam_smooth, None).is_err());
+            assert!(
+                recon_spectrum(&gram, &decoder, n_eff, p_out, r_floor, lam_smooth, None).is_err()
+            );
+        }
+
+        let wrong_width = Array2::<f64>::zeros((2, 2));
+        assert!(production(&gram, &wrong_width, 10.0, 3.0, 1.0, 0.0, None).is_err());
+        assert!(recon_spectrum(&gram, &wrong_width, 10.0, 3.0, 1.0, 0.0, None).is_err());
+
+        // A smoothing penalty can make G+lambda*S positive definite, so a
+        // materially negative Gram direction used to survive Cholesky after
+        // being silently clipped out of the reconstruction rank. Both paths
+        // must reject the invalid Gram before smoothing changes it.
+        let indefinite = Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, -0.25]).unwrap();
+        let penalty = Array2::<f64>::eye(2);
+        assert!(production(&indefinite, &decoder, 10.0, 3.0, 1.0, 1.0, Some(&penalty)).is_err());
+        assert!(
+            recon_spectrum(&indefinite, &decoder, 10.0, 3.0, 1.0, 1.0, Some(&penalty)).is_err()
+        );
+
+        assert_eq!(
+            production(&gram, &decoder, 0.0, 3.0, 1.0, 0.0, None).unwrap(),
+            0.0
+        );
+        assert_eq!(
+            recon_spectrum(&gram, &decoder, 0.0, 3.0, 1.0, 0.0, None)
+                .unwrap()
+                .edge,
+            0.0
         );
     }
 
