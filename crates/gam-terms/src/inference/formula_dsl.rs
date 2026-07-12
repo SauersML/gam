@@ -590,16 +590,28 @@ fn wr_cross(left: Vec<WrAtomList>, right: Vec<WrAtomList>) -> Vec<WrAtomList> {
 }
 
 fn wr_nest(left: Vec<WrAtomList>, right: Vec<WrAtomList>) -> Vec<WrAtomList> {
-    // a/b = a + a:b
-    let mut out = Vec::with_capacity(left.len() + left.len() * right.len());
+    // Wilkinson-Rogers nesting `A/B`: keep every term of `A`, then nest `B`
+    // within the *whole* left-hand group by crossing each right term with the
+    // product of ALL variables appearing anywhere on the left (not with each
+    // left term separately). This makes chained nesting hierarchical —
+    // `a/b/c` = {a, a:b, a:b:c}, never a spurious `a:c` — and matches R/mgcv
+    // `terms()` exactly, including `a*b/c` = {a, b, a:b, a:b:c} and
+    // `(a+b)/c` = {a, b, a:b:c}. See `parse_formula_chained_wr_nesting_is_hierarchical`.
+    let mut left_atoms: WrAtomList = left.iter().flatten().cloned().collect();
+    left_atoms.sort();
+    left_atoms.dedup();
+
+    let mut out = Vec::with_capacity(left.len() + right.len());
     out.extend(left.iter().cloned());
-    for l in &left {
-        for r in &right {
-            let mut merged: WrAtomList = l.iter().cloned().chain(r.iter().cloned()).collect();
-            merged.sort();
-            merged.dedup();
-            out.push(merged);
-        }
+    for r in &right {
+        let mut merged: WrAtomList = left_atoms
+            .iter()
+            .cloned()
+            .chain(r.iter().cloned())
+            .collect();
+        merged.sort();
+        merged.dedup();
+        out.push(merged);
     }
     out
 }
@@ -1005,6 +1017,65 @@ mod tests {
         assert_eq!(
             names,
             vec!["Linear(x)".to_string(), "Interaction(x:z)".to_string()]
+        );
+    }
+
+    /// Collect the WR term labels of a parsed formula in `:`-joined form,
+    /// matching R/mgcv `attr(terms(...), "term.labels")` so nesting/crossing
+    /// expansions can be pinned against ground truth.
+    #[cfg(test)]
+    fn wr_term_labels(formula: &str) -> Vec<String> {
+        let parsed = parse_formula(formula).unwrap_or_else(|e| panic!("parse {formula}: {e}"));
+        parsed
+            .terms
+            .iter()
+            .map(|t| match t {
+                ParsedTerm::Linear { name, .. } => name.clone(),
+                ParsedTerm::Interaction { vars, .. } => vars.join(":"),
+                other => format!("Other({other:?})"),
+            })
+            .collect()
+    }
+
+    /// Regression for #2290: chained Wilkinson-Rogers nesting `a/b/c` must be
+    /// hierarchical — the deepest interaction crosses `c` with the FULL `a:b`,
+    /// giving `{a, a:b, a:b:c}` with NO spurious `a:c`. Before the fix,
+    /// `Rule::product`'s left-associative fold distributed `c` over every
+    /// accumulated left term (`{a, a:b}`), minting `a:c`. Each expansion is
+    /// pinned against R/mgcv `terms()` ground truth.
+    #[test]
+    fn parse_formula_chained_wr_nesting_is_hierarchical() {
+        // R: terms(y ~ a/b/c) -> a  a:b  a:b:c
+        assert_eq!(
+            wr_term_labels("y ~ a/b/c"),
+            vec!["a".to_string(), "a:b".to_string(), "a:b:c".to_string()],
+            "a/b/c must nest hierarchically with no spurious a:c"
+        );
+        // R: terms(y ~ a*b/c) -> a  b  a:b  a:b:c
+        assert_eq!(
+            wr_term_labels("y ~ a*b/c"),
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "a:b".to_string(),
+                "a:b:c".to_string()
+            ],
+            "a*b/c nests c within the whole a*b group"
+        );
+        // R: terms(y ~ x/z) -> x  x:z  (single-level nesting unchanged)
+        assert_eq!(
+            wr_term_labels("y ~ x/z"),
+            vec!["x".to_string(), "x:z".to_string()],
+        );
+        // R: terms(y ~ a/b/c/d) -> a  a:b  a:b:c  a:b:c:d
+        assert_eq!(
+            wr_term_labels("y ~ a/b/c/d"),
+            vec![
+                "a".to_string(),
+                "a:b".to_string(),
+                "a:b:c".to_string(),
+                "a:b:c:d".to_string()
+            ],
         );
     }
 
