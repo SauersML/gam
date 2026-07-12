@@ -6383,13 +6383,19 @@ mod tests {
 
         // Reconstruction: the selected resolution recovers the whole signal while
         // the historical 2-harmonic default cannot touch the 4f half of the energy.
+        // `h` is a harmonic ORDER (what `select_periodic_resolution` returns); the
+        // periodic basis for order `h` is the `2h + 1` columns `{1, cos, sin, …,
+        // cos hθ, sin hθ}`, and `PeriodicHarmonicEvaluator::new` takes that (odd)
+        // width, not the order.
         let circle_r2 = |h: usize| -> f64 {
             let spec = TopologyCandidateSpec {
                 kind: AutoTopologyKind::Circle,
                 basis_kind: SaeAtomBasisKind::Periodic,
                 manifold: LatentManifold::Circle { period: 1.0 },
                 latent_dim: 1,
-                evaluator: Arc::new(PeriodicHarmonicEvaluator::new(h).expect("periodic evaluator")),
+                evaluator: Arc::new(
+                    PeriodicHarmonicEvaluator::new(2 * h + 1).expect("periodic evaluator"),
+                ),
                 coords: coords.clone(),
             };
             let fit = fit_topology_candidate(&spec, target.view(), weights.view())
