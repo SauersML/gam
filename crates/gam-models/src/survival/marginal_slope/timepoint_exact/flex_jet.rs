@@ -80,7 +80,8 @@
 //! ────────────────────────────────────────────────────────────────────────────
 
 use super::*;
-use crate::bms::signed_probit_neglog_derivatives_up_to_fourth;
+use crate::bms::{signed_probit_neglog_derivatives_up_to_fourth, signed_probit_neglog_unary_stack};
+#[cfg(test)]
 use crate::inference::probability::signed_probit_logcdf_and_mills_ratio;
 use crate::survival::marginal_slope::gpu;
 
@@ -94,9 +95,18 @@ use crate::survival::marginal_slope::gpu;
 /// (`flex_sensitivity.rs`, `gpu::cpu_oracle_*`).
 #[inline]
 fn surv_stack(eta: f64) -> Result<[f64; 5], String> {
-    let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(-eta);
-    let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(-eta, 1.0)?;
-    Ok([logcdf, k1, -k2, k3, -k4])
+    let signed_margin = -eta;
+    if signed_margin != f64::INFINITY && !signed_margin.is_finite() {
+        return Err(format!(
+            "non-finite signed margin in exact probit derivative helper: {signed_margin}"
+        ));
+    }
+    // `weight = -1` makes the fused BMS primitive return the derivative stack
+    // of `logΦ(m)` from ONE Mills-ratio evaluation. Compose with `m = -η` by
+    // flipping odd derivative orders. This replaces the old two-call sequence
+    // (one `logcdf`, then another `logcdf` discarded by the derivative helper).
+    let m_stack = signed_probit_neglog_unary_stack(signed_margin, -1.0);
+    Ok([m_stack[0], -m_stack[1], m_stack[2], -m_stack[3], m_stack[4]])
 }
 
 /// The `[f64; 5]` Faà di Bruno stack of `ln(x)`.
@@ -170,16 +180,10 @@ fn flex_row_nll<J: FlexJet>(
 // straight into the two `(g, h)` output buffers the caller returns. It reads the
 // ndarray input views in place, fuses all seven terms into one gradient pass and
 // one upper-triangular Hessian pass, and materializes neither copied input
-// tensors nor dense unit-primary tensors for `q1`/`qd1`. It remains
-// `f64::to_bits`-identical to the generic `Jet2` path channel-for-channel (gate
-// [`fused_jet2_row_nll_is_bit_identical_to_generic`], ≥2000 random inputs/​p).
-//
-// Bit-identity holds because every fused expression is the textual image of the
-// generic op composition: `compose_unary` then `scale` then `add`/`sub`, with the
-// `±` accumulation associated exactly as the generic chained `add`/`sub` does
-// (per element, left to right). IEEE `+`/`*` commutativity (`a+b≡b+a`, `a*b≡b*a`,
-// bit-exact) covers the only reordered pairs (the `g_i·g_j + g_j·g_i` cross term
-// and the trailing `·s` of each term).
+// tensors nor dense unit-primary tensors for `q1`/`qd1`. The independent generic
+// `Jet2` oracle pins every channel to `1e-12`; the compiled schedule groups each
+// source's first/second chain coefficient once, so its final rounding can differ
+// from the generic term-by-term accumulation by a few ulps.
 struct FusedSrc<'a> {
     v: f64,
     g: ndarray::ArrayView1<'a, f64>,
@@ -192,7 +196,8 @@ struct FusedOut {
 }
 
 /// Fused value/grad/Hessian of the flex row NLL (sans the additive `w·d·ln2π`
-/// constant, added by the caller). Bit-identical to `flex_row_nll::<Jet2>`.
+/// constant, added by the caller). Algebraically identical to
+/// `flex_row_nll::<Jet2>` and oracle-pinned to `1e-12`.
 #[inline]
 fn fused_row_nll_jet2(
     eta0: &FusedSrc,
@@ -215,12 +220,19 @@ fn fused_row_nll_jet2(
     let chi_stack = ln_stack(chi1.v);
     let d_stack = ln_stack(d1.v);
     let qd_stack = ln_stack(qd1);
+    let eta0_first = surv0[1] * wi;
+    let eta0_second = surv0[2] * wi;
+    let eta1_first = surv1[1] * exit_scale + (eta1.v + eta1.v) * eta_square_scale;
+    let eta1_second = surv1[2] * exit_scale + 2.0 * eta_square_scale;
+    let chi_first = -chi_stack[1] * wd;
+    let chi_second = -chi_stack[2] * wd;
+    let d_first = d_stack[1] * wd;
+    let d_second = d_stack[2] * wd;
     let mut out = FusedOut {
         v: surv0[0] * wi,
         g: vec![0.0; p],
         h: vec![0.0; p * p],
     };
-    // Keep the exact generic-expression association order for bit identity.
     out.v += surv1[0] * exit_scale;
     out.v += (eta1.v * eta1.v) * eta_square_scale;
     out.v += (q1 * q1) * eta_square_scale;
@@ -229,14 +241,13 @@ fn fused_row_nll_jet2(
     out.v += -qd_stack[0] * wd;
 
     for i in 0..p {
-        let mut value = (surv0[1] * eta0.g[i]) * wi;
-        value += (surv1[1] * eta1.g[i]) * exit_scale;
-        value += (eta1.v * eta1.g[i] + eta1.g[i] * eta1.v) * eta_square_scale;
+        let mut value = eta0_first * eta0.g[i];
+        value += eta1_first * eta1.g[i];
         if i == q1_axis {
             value += (q1 + q1) * eta_square_scale;
         }
-        value += -((chi_stack[1] * chi1.g[i]) * wd);
-        value += (d_stack[1] * d1.g[i]) * wd;
+        value += chi_first * chi1.g[i];
+        value += d_first * d1.g[i];
         if i == qd1_axis {
             value += -(qd_stack[1] * wd);
         }
@@ -245,18 +256,13 @@ fn fused_row_nll_jet2(
 
     for i in 0..p {
         for j in i..p {
-            let mut value = (surv0[2] * eta0.g[i] * eta0.g[j] + surv0[1] * eta0.h[[i, j]]) * wi;
-            value += (surv1[2] * eta1.g[i] * eta1.g[j] + surv1[1] * eta1.h[[i, j]]) * exit_scale;
-            value += (eta1.v * eta1.h[[i, j]]
-                + eta1.g[i] * eta1.g[j]
-                + eta1.g[j] * eta1.g[i]
-                + eta1.h[[i, j]] * eta1.v)
-                * eta_square_scale;
+            let mut value = eta0_second * eta0.g[i] * eta0.g[j] + eta0_first * eta0.h[[i, j]];
+            value += eta1_second * eta1.g[i] * eta1.g[j] + eta1_first * eta1.h[[i, j]];
             if i == q1_axis && j == q1_axis {
                 value += 2.0 * eta_square_scale;
             }
-            value += -(chi_stack[2] * chi1.g[i] * chi1.g[j] + chi_stack[1] * chi1.h[[i, j]]) * wd;
-            value += (d_stack[2] * d1.g[i] * d1.g[j] + d_stack[1] * d1.h[[i, j]]) * wd;
+            value += chi_second * chi1.g[i] * chi1.g[j] + chi_first * chi1.h[[i, j]];
+            value += d_second * d1.g[i] * d1.g[j] + d_first * d1.h[[i, j]];
             if i == qd1_axis && j == qd1_axis {
                 value += -(qd_stack[2] * wd);
             }
@@ -767,8 +773,8 @@ impl SurvivalMarginalSlopeFamily {
             let grad = Array1::from(out.g);
             return Ok((value, grad, Array2::zeros((p, p))));
         }
-        // Fused two-allocation Jet2 evaluation: bit-identical to
-        // `flex_row_nll::<Jet2>` (gate `fused_jet2_row_nll_is_bit_identical_to_generic`)
+        // Fused two-allocation Jet2 evaluation: oracle-equivalent to
+        // `flex_row_nll::<Jet2>` (gate `fused_jet2_row_nll_matches_generic`)
         // but without intermediate `Vec` allocations, copied input tensors, or
         // dense q₁/qd₁ unit-primary tensors. It reads the four timepoint ndarray
         // views directly and writes only the returned gradient/Hessian buffers.
@@ -4834,8 +4840,8 @@ mod moment_engine_tests {
 
 #[cfg(test)]
 mod fused_jet2_oracle_tests {
-    //! Gate: the fused single-allocation Jet2 row-NLL evaluator
-    //! ([`fused_row_nll_jet2`]) is `f64::to_bits`-identical to the generic
+    //! Gate: the fused two-output-allocation Jet2 row-NLL evaluator
+    //! ([`fused_row_nll_jet2`]) agrees to `1e-12` with the generic
     //! single-source [`flex_row_nll`] instantiated at [`Jet2`] — value, gradient,
     //! and Hessian, channel-for-channel — over ≥2000 random inputs at several
     //! primary counts `p`. This pins the production fast path used by
@@ -4867,7 +4873,7 @@ mod fused_jet2_oracle_tests {
     }
 
     #[test]
-    fn fused_jet2_row_nll_is_bit_identical_to_generic() {
+    fn fused_jet2_row_nll_matches_generic() {
         for &p in &[3usize, 6, 9, 12, 20] {
             let mut st = 0x5DEE_CE66_D9C7_F123u64 ^ (p as u64).wrapping_mul(0x9E3779B97F4A7C15);
             for _ in 0..2200 {
@@ -4933,20 +4939,19 @@ mod fused_jet2_oracle_tests {
                     p,
                 );
 
-                assert_eq!(g_out.v.to_bits(), f_out.v.to_bits(), "value p={p}");
-                for i in 0..p {
-                    assert_eq!(
-                        g_out.g[i].to_bits(),
-                        f_out.g[i].to_bits(),
-                        "grad[{i}] p={p}"
+                let close = |left: f64, right: f64, channel: &str| {
+                    let tolerance = 1e-12 * left.abs().max(right.abs()).max(1.0);
+                    assert!(
+                        (left - right).abs() <= tolerance,
+                        "{channel} p={p}: generic={left:+.16e} fused={right:+.16e}"
                     );
+                };
+                close(g_out.v, f_out.v, "value");
+                for i in 0..p {
+                    close(g_out.g[i], f_out.g[i], &format!("grad[{i}]"));
                 }
                 for k in 0..p * p {
-                    assert_eq!(
-                        g_out.h[k].to_bits(),
-                        f_out.h[k].to_bits(),
-                        "hess[{k}] p={p}"
-                    );
+                    close(g_out.h[k], f_out.h[k], &format!("hess[{k}]"));
                 }
             }
         }
