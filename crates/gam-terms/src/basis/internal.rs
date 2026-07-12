@@ -210,7 +210,7 @@ pub(super) fn generate_full_knot_vector_quantile(
             if x <= minval || x >= maxval {
                 continue;
             }
-            if last.map(|prev| (x - prev).abs() <= tol).unwrap_or(false) {
+            if last == Some(x) {
                 continue;
             }
             support.push(x);
@@ -237,7 +237,7 @@ pub(super) fn generate_full_knot_vector_quantile(
                 support[lo] * (1.0 - frac) + support[hi] * frac
             };
             let q = q.clamp(minval, maxval);
-            if q <= prev_q + tol || q >= maxval - tol {
+            if q <= prev_q || q >= maxval {
                 crate::bail_invalid_basis!(
                     "quantile knot placement produced a non-interior knot at index {}: {:.6e}",
                     j - 1,
