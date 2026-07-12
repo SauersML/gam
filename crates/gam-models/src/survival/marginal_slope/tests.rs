@@ -8,7 +8,6 @@ use crate::survival::marginal_slope::flex_oracle_structs_tests::{
 };
 use approx::assert_relative_eq;
 use faer::sparse::{SparseColMat, Triplet};
-use gam_math::jet_scalar::JetScalar;
 use gam_linalg::matrix::{DenseDesignMatrix, SymmetricMatrix};
 use ndarray::array;
 
