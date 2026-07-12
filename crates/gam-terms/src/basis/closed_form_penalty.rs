@@ -924,9 +924,15 @@ pub(crate) fn hybrid_self_pair_radial_derivative_with_kappa_derivs_odd_d(
 
     // In odd dimension, every half-integer Matérn Taylor block and every
     // contributing Riesz block carries the same κ power after partial
-    // fraction assembly:
-    //   f^(2q)(0; κ) = C · κ^{d + 2q - 2(m+s)}.
-    let exponent = d as f64 + 2.0 * q as f64 - 2.0 * (m + s) as f64;
+    // fraction assembly. The Matérn/polyharmonic Green's function of order
+    // `n = 2(m+s)` in dimension `d` scales as `g(r; κ) = κ^{d-2n} G(κr)` for a
+    // dimensionless profile `G` (convergent case `2n > d`), so its `2q`-th
+    // radial derivative at the collision `R = 0` picks up `2q` extra powers of
+    // κ from the chain rule:
+    //   f^(2q)(0; κ) = C · κ^{d - 2n + 2q} = C · κ^{d + 2q - 4(m+s)}.
+    // (The prior `d + 2q - 2(m+s)` used a single `m+s` instead of the full
+    // order `n = 2(m+s)`, mismatching the even-d path and the Fourier scaling.)
+    let exponent = d as f64 + 2.0 * q as f64 - 4.0 * (m + s) as f64;
     let f_kappa = exponent * f / kappa;
     let f_kappa2 = exponent * (exponent - 1.0) * f / (kappa * kappa);
     Some((f, f_kappa, f_kappa2))
@@ -2748,6 +2754,49 @@ mod tests {
                     residual.abs() <= 1e-10 * k_next.abs(),
                     "nu={nu} x={x} residual={residual} k_next={k_next}"
                 );
+            }
+        }
+    }
+
+    /// Regression for #2291: the odd-d hybrid self-pair κ-derivative must match
+    /// a central finite difference of the (correct) value `f(R=0; κ)`. Because
+    /// the collision value is an exact power law `f = C·κ^{d+2q-4(m+s)}`, the
+    /// analytic `f_κ = exponent·f/κ` and `f_κκ = exponent(exponent-1)·f/κ²` are
+    /// exact and the central FD of `f` (whose VALUE path is correct) is the
+    /// honest oracle. The prior exponent `d+2q-2(m+s)` used a single `m+s`
+    /// instead of the full Matérn order `n=2(m+s)`, so `f_κ`/`f_κκ` were wrong
+    /// by a fixed multiplicative factor while `f` stayed right — invisible to any
+    /// value-only check, but the FD below fails hard on it.
+    #[test]
+    pub(crate) fn hybrid_self_pair_odd_d_kappa_derivative_matches_value_finite_difference() {
+        use super::hybrid_self_pair_radial_derivative_with_kappa_derivs_odd_d as odd_d;
+        // (d, m, s, q): d=3,m=s=1 admits only q=0 (the lead's spec); d=3,m=s=2
+        // (Matérn order n=8) admits q=0,1,2 so the FD also exercises the higher
+        // radial-derivative blocks. All odd-d convergent Duchon/Matérn cases.
+        let cases = [(3usize, 1usize, 1usize, 0usize)]
+            .into_iter()
+            .chain([(3, 2, 2, 0), (3, 2, 2, 1), (3, 2, 2, 2)]);
+        for (d, m, s, q) in cases {
+            for kappa in [0.7_f64, 1.9] {
+                let (f, f_kappa, f_kappa2) =
+                    odd_d(q, m, s, d, kappa).expect("valid odd-d hybrid self-pair block");
+                assert!(f.is_finite() && f != 0.0, "f must be finite nonzero");
+                // Central finite differences of the value w.r.t. κ.
+                let h = 1e-4 * kappa;
+                let f_plus = odd_d(q, m, s, d, kappa + h).expect("f(κ+h)").0;
+                let f_minus = odd_d(q, m, s, d, kappa - h).expect("f(κ-h)").0;
+                let fd1 = (f_plus - f_minus) / (2.0 * h);
+                let fd2 = (f_plus - 2.0 * f + f_minus) / (h * h);
+                // O(h²) central-difference accuracy on a smooth power law; the
+                // wrong exponent is off by an integer factor (e.g. −f/κ vs
+                // −5f/κ for m=s=1,q=0), so any sane tolerance separates them.
+                assert_relative_close(f_kappa, fd1, 1e-6);
+                assert_relative_close(f_kappa2, fd2, 1e-4);
+                // Guard the exponent itself against a compensating value error:
+                // exponent = d + 2q − 4(m+s) reconstructed from f_κ·κ/f.
+                let recovered_exponent = f_kappa * kappa / f;
+                let expected_exponent = d as f64 + 2.0 * q as f64 - 4.0 * (m + s) as f64;
+                assert_relative_close(recovered_exponent, expected_exponent, 1e-9);
             }
         }
     }
