@@ -466,7 +466,7 @@ impl LatentManifold {
             Self::Euclidean | Self::Circle { .. } => v.to_owned(),
             Self::Sphere { dim } => {
                 assert_eq!(t.len(), *dim);
-                let tv = dot_views(t, v);
+                let tv = t.dot(&v);
                 let mut out = v.to_owned();
                 for a in 0..*dim {
                     out[a] -= tv * t[a];
@@ -642,7 +642,7 @@ impl LatentManifold {
         assert_eq!(t.len(), xi.len());
         assert_eq!(eh.nrows(), t.len());
         assert_eq!(eh.ncols(), t.len());
-        let eh_xi = matvec(eh, xi);
+        let eh_xi = eh.dot(&xi);
         self.euclidean_hessian_action_to_riemannian(t, eg, xi, eh_xi.view())
     }
 
@@ -663,8 +663,8 @@ impl LatentManifold {
                 assert_eq!(t.len(), *dim);
                 let grad_r = self.project_to_tangent(t, eg);
                 let mut ambient = self.project_to_tangent(t, eh_xi);
-                let eg_normal = dot_views(eg, t);
-                let normal_curve = dot_views(grad_r.view(), xi);
+                let eg_normal = eg.dot(&t);
+                let normal_curve = grad_r.dot(&xi);
                 for a in 0..*dim {
                     ambient[a] -= eg_normal * xi[a];
                     ambient[a] -= normal_curve * t[a];
@@ -1370,28 +1370,6 @@ fn normalize_or_axis(v: ArrayView1<'_, f64>, dim: usize) -> Array1<f64> {
         }
         out
     }
-}
-
-fn dot_views(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
-    assert_eq!(a.len(), b.len());
-    let mut acc = 0.0_f64;
-    for i in 0..a.len() {
-        acc += a[i] * b[i];
-    }
-    acc
-}
-
-fn matvec(a: ArrayView2<'_, f64>, x: ArrayView1<'_, f64>) -> Array1<f64> {
-    assert_eq!(a.ncols(), x.len());
-    let mut out = Array1::<f64>::zeros(a.nrows());
-    for i in 0..a.nrows() {
-        let mut acc = 0.0_f64;
-        for j in 0..a.ncols() {
-            acc += a[[i, j]] * x[j];
-        }
-        out[i] = acc;
-    }
-    out
 }
 
 #[inline]

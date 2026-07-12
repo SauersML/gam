@@ -14,7 +14,6 @@
 //! rows against the CPU row program.
 
 /// Flattened row-major value, gradient, and Hessian channels for `K = 4`.
-#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SurvivalRowVghChannels {
     pub(crate) value: Vec<f64>,
@@ -23,7 +22,6 @@ pub(crate) struct SurvivalRowVghChannels {
 }
 
 /// Scalar-independent inputs for one rigid survival row.
-#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone)]
 pub(crate) struct SurvivalRowInputs {
     pub(crate) primaries: [f64; 4],
@@ -56,6 +54,21 @@ pub(crate) fn survival_rigid_row_vgh(
     );
     device::survival_rigid_row_vgh_device(rows, probit_scale)
         .map_err(|error| format!("survival VGH device execution failed: {error}"))
+}
+
+/// Non-Linux hosts have no CUDA path; admission always refuses them, so this
+/// stub keeps the call site platform-neutral and fails loud if ever reached.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub(crate) fn survival_rigid_row_vgh(
+    rows: &[SurvivalRowInputs],
+    probit_scale: f64,
+) -> Result<SurvivalRowVghChannels, String> {
+    Err(format!(
+        "survival VGH device execution is Linux-only: refused batch of {} rows \
+         (probit_scale={probit_scale})",
+        rows.len(),
+    ))
 }
 
 /// Order-2 CUDA lowering for the four rigid survival primaries.
