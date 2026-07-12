@@ -58,6 +58,23 @@ LABELS = {
     "oracle": "Oracle (true subspaces)",
 }
 KIND_ORDER = ["segment", "circle", "disk", "sphere", "torus", "mobius", "swiss", "helix"]
+ATLAS_KINDS = ["circle", "helix", "sphere", "torus", "mobius", "swiss"]
+ATLAS_LABELS = {
+    "circle": ("Circle", "closed · 1D"),
+    "helix": ("Helix", "open · 1D"),
+    "sphere": ("Sphere", "closed · 2D"),
+    "torus": ("Torus", "product · 2D"),
+    "mobius": ("Möbius", "non-orientable · 2D"),
+    "swiss": ("Swiss roll", "open · 2D"),
+}
+ATLAS_CAMERA = {
+    "circle": (28, -58),
+    "helix": (22, -52),
+    "sphere": (22, -42),
+    "torus": (30, -52),
+    "mobius": (28, -62),
+    "swiss": (24, -60),
+}
 
 
 def _style(ax: plt.Axes) -> None:
@@ -148,7 +165,7 @@ def _cloud_meta(npz: np.lib.npyio.NpzFile) -> dict[str, Any]:
     return json.loads(bytes(npz["meta_json"]).decode())
 
 
-def fig_gallery(clouds_dir: Path, out: Path, *, max_factors: int = 6) -> None:
+def fig_gallery(clouds_dir: Path, out: Path, *, max_factors: int = 8) -> None:
     files = sorted(clouds_dir.glob("clouds_*.npz"))
     if not files:
         return
@@ -168,18 +185,17 @@ def fig_gallery(clouds_dir: Path, out: Path, *, max_factors: int = 6) -> None:
         i = meta["factor"]
         theta = np.asarray(ref[f"theta_{i}"])
         hue = theta[:, 0]
-        cyclic = meta["kind"] in ("circle", "sphere", "torus", "mobius", "helix")
+        cyclic = meta["kind"] in ("circle", "torus", "mobius")
         cmap = plt.get_cmap("twilight" if cyclic else "viridis")
         panels = [("true", ref[f"true_{i}"])]
         for name in col_order:
             store = stores[name]
             key = f"rec_{i}"
             panels.append((name, store[key] if key in store else None))
-        # One shared cube per row, sized by the TRUE cloud, so a recovered
-        # cloud's near-zero residual directions cannot be autoscaled into
-        # fake-looking noise.
-        true_cloud = panels[0][1]
-        lim = float(np.max(np.abs(true_cloud))) * 1.08 + 1e-9
+        # One shared cube per row sized by the union. This keeps every column on
+        # the same honest scale without silently clipping a bad reconstruction.
+        finite_clouds = [cloud for _, cloud in panels if cloud is not None]
+        lim = max(float(np.max(np.abs(cloud))) for cloud in finite_clouds) * 1.08 + 1e-9
         for c, (name, cloud) in enumerate(panels):
             ax = fig.add_subplot(n_rows, n_cols, r * n_cols + c + 1, projection="3d")
             ax.set_facecolor(SURFACE)
@@ -199,7 +215,7 @@ def fig_gallery(clouds_dir: Path, out: Path, *, max_factors: int = 6) -> None:
                 title = {"true": "ground truth"}.get(name, LABELS.get(name, name))
                 ax.set_title(title, fontsize=9.5, color=INK, pad=2)
             if c == 0:
-                ax.text2D(-0.12, 0.5, f"{meta['kind']}\nR²={meta['r2']:.2f}",
+                ax.text2D(-0.12, 0.5, meta["kind"],
                           transform=ax.transAxes, ha="right", va="center",
                           fontsize=8.5, color=INK_2)
     fig.suptitle("Recovered concept manifolds — hue is the TRUE intrinsic coordinate",
@@ -207,6 +223,162 @@ def fig_gallery(clouds_dir: Path, out: Path, *, max_factors: int = 6) -> None:
     fig.subplots_adjust(left=0.08, right=0.99, top=0.93, bottom=0.01,
                         hspace=0.02, wspace=0.02)
     fig.savefig(out, facecolor=SURFACE, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _atlas_cloud_records(clouds_dir: Path) -> dict[str, dict[str, Any]]:
+    """Load exactly one newest-code ours_rust cloud record per atlas kind."""
+    records: dict[str, dict[str, Any]] = {}
+    for path in sorted(clouds_dir.rglob("clouds_ours_rust*.npz")):
+        with np.load(path) as store:
+            meta = _cloud_meta(store)
+            if meta.get("featurizer") != "ours_rust":
+                continue
+            for factor in meta["factors"]:
+                kind = str(factor["kind"])
+                if kind not in ATLAS_KINDS:
+                    continue
+                if kind in records:
+                    raise ValueError(
+                        f"multiple ours_rust cloud records for {kind}: "
+                        f"{records[kind]['path']} and {path}"
+                    )
+                index = int(factor["factor"])
+                records[kind] = {
+                    "path": path,
+                    "true": np.asarray(store[f"true_{index}"], dtype=float),
+                    "recovered": np.asarray(store[f"rec_{index}"], dtype=float),
+                    "theta": np.asarray(store[f"theta_{index}"], dtype=float),
+                    "r2": float(factor["r2"]),
+                }
+    missing = [kind for kind in ATLAS_KINDS if kind not in records]
+    if missing:
+        raise ValueError(f"atlas is missing ours_rust clouds for: {', '.join(missing)}")
+    return records
+
+
+def _pad_cloud(cloud: np.ndarray) -> np.ndarray:
+    if cloud.ndim != 2 or cloud.shape[1] == 0 or cloud.shape[1] > 3:
+        raise ValueError(f"atlas cloud must have one to three columns; got {cloud.shape}")
+    if cloud.shape[1] == 3:
+        return cloud
+    return np.pad(cloud, ((0, 0), (0, 3 - cloud.shape[1])))
+
+
+def _atlas_hue(kind: str, theta: np.ndarray) -> tuple[np.ndarray, str]:
+    values = np.asarray(theta[:, 0], dtype=float)
+    if kind in ("circle", "torus", "mobius"):
+        return np.mod(values, 2.0 * np.pi) / (2.0 * np.pi), "twilight"
+    lo, hi = float(values.min()), float(values.max())
+    scale = hi - lo
+    return (values - lo) / (scale if scale > 0.0 else 1.0), "viridis"
+
+
+def _atlas_scatter(
+    ax: Any,
+    cloud: np.ndarray,
+    hue: np.ndarray,
+    cmap: str,
+    center: np.ndarray,
+    radius: float,
+    camera: tuple[float, float],
+) -> None:
+    ax.scatter(
+        cloud[:, 0], cloud[:, 1], cloud[:, 2], c=hue, cmap=cmap,
+        vmin=0.0, vmax=1.0, s=3.2, alpha=0.80, linewidths=0,
+        rasterized=True,
+    )
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
+    ax.set_box_aspect((1.0, 1.0, 1.0))
+    ax.set_proj_type("ortho")
+    ax.view_init(elev=camera[0], azim=camera[1])
+    ax.set_axis_off()
+
+
+def fig_all_zoos_atlas(
+    clouds_dir: Path,
+    smooth_zoo: Path,
+    out: Path,
+    *,
+    source_sha: str,
+) -> None:
+    """One fitted atlas: planted manifolds, Manifold SAE, and GAM smooth zoo."""
+    if not source_sha:
+        raise ValueError("source_sha is required for a provenance-bearing atlas")
+    records = _atlas_cloud_records(clouds_dir)
+    smooth = plt.imread(smooth_zoo)
+
+    fig = plt.figure(figsize=(16.8, 9.3), dpi=210, facecolor=SURFACE)
+    grid = fig.add_gridspec(
+        3, 6, height_ratios=(1.0, 1.0, 0.92), hspace=0.01, wspace=0.015,
+        left=0.055, right=0.995, top=0.875, bottom=0.055,
+    )
+    for column, kind in enumerate(ATLAS_KINDS):
+        record = records[kind]
+        true = _pad_cloud(record["true"])
+        recovered = _pad_cloud(record["recovered"])
+        union = np.vstack((true, recovered))
+        lower = union.min(axis=0)
+        upper = union.max(axis=0)
+        center = 0.5 * (lower + upper)
+        radius = 0.54 * float(np.max(upper - lower)) + 1.0e-9
+        hue, cmap = _atlas_hue(kind, record["theta"])
+
+        planted_ax = fig.add_subplot(grid[0, column], projection="3d")
+        recovered_ax = fig.add_subplot(grid[1, column], projection="3d")
+        for ax, cloud in ((planted_ax, true), (recovered_ax, recovered)):
+            ax.set_facecolor(SURFACE)
+            _atlas_scatter(
+                ax, cloud, hue[: len(cloud)], cmap, center, radius,
+                ATLAS_CAMERA[kind],
+            )
+        title, subtitle = ATLAS_LABELS[kind]
+        planted_ax.set_title(
+            f"{title}\n{subtitle}", fontsize=11.2, color=INK, pad=0,
+            fontweight="semibold", linespacing=1.35,
+        )
+        recovered_ax.text2D(
+            0.07, 0.07, f"held-out R²  {record['r2']:.3f}",
+            transform=recovered_ax.transAxes, ha="left", va="bottom",
+            fontsize=8.3, color=INK,
+            bbox={"boxstyle": "round,pad=0.32", "facecolor": "white",
+                  "edgecolor": GRID, "linewidth": 0.6, "alpha": 0.92},
+        )
+
+    fig.text(
+        0.017, 0.705, "PLANTED", rotation=90, ha="center", va="center",
+        fontsize=8.5, color=INK_MUTED, fontweight="bold",
+    )
+    fig.text(
+        0.017, 0.435, "MANIFOLD SAE", rotation=90, ha="center", va="center",
+        fontsize=8.5, color=SERIES["ours_rust"], fontweight="bold",
+    )
+
+    smooth_ax = fig.add_subplot(grid[2, :])
+    smooth_ax.imshow(smooth)
+    smooth_ax.set_axis_off()
+    smooth_ax.set_title(
+        "GAM SMOOTH ZOO  ·  four fitted geometries on the same observations",
+        fontsize=9.5, color=INK_2, loc="left", pad=3, fontweight="semibold",
+    )
+
+    fig.text(
+        0.055, 0.962, "THE GEOMETRY ZOO", ha="left", va="top",
+        fontsize=23, color=INK, fontweight="bold",
+    )
+    fig.text(
+        0.055, 0.921,
+        "What was planted, what the Rust Manifold SAE recovered, and how GAM smooths see one surface",
+        ha="left", va="top", fontsize=11.2, color=INK_2,
+    )
+    fig.text(
+        0.995, 0.018,
+        f"gam {source_sha[:12]}  ·  held-out clouds  ·  color = planted intrinsic coordinate",
+        ha="right", va="bottom", fontsize=7.5, color=INK_MUTED,
+    )
+    fig.savefig(out, facecolor=SURFACE, bbox_inches="tight", pad_inches=0.12)
     plt.close(fig)
 
 
@@ -330,6 +502,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results", required=True)
     parser.add_argument("--clouds-dir", default=None)
+    parser.add_argument("--smooth-zoo", default=None)
+    parser.add_argument("--source-sha", default=None)
     parser.add_argument("--out-dir", default="figures/bsf_zoo")
     args = parser.parse_args()
     out_dir = Path(args.out_dir)
@@ -343,6 +517,13 @@ def main() -> int:
     fig_pareto(results, out_dir / "pareto.png")
     if args.clouds_dir:
         fig_gallery(Path(args.clouds_dir), out_dir / "gallery.png")
+    if args.smooth_zoo:
+        if args.clouds_dir is None or args.source_sha is None:
+            raise SystemExit("--smooth-zoo requires --clouds-dir and --source-sha")
+        fig_all_zoos_atlas(
+            Path(args.clouds_dir), Path(args.smooth_zoo),
+            out_dir / "all_zoos_atlas.png", source_sha=args.source_sha,
+        )
     print(f"figures -> {out_dir}")
     return 0
 

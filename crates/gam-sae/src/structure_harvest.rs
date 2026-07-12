@@ -750,16 +750,37 @@ pub fn harvest_move_proposals(
                 let r = model.factor_rank();
                 // #2233 closed-form MDL birth pre-screen. Every quantity below is
                 // read from the structured residual-factor fit already computed —
-                // no candidate refit runs here. Shared per-round crossover inputs:
-                //  * ŝ = participation ratio of the factor-energy spectrum,
-                //  * (d, m) = the curved topology matched to ŝ (basis surcharge),
+                // no candidate refit runs here. Per-proposal crossover inputs:
+                //  * ŝ_j = LOCAL ambient span (participation ratio of the residual's
+                //    factor-coordinate energies on candidate j's OWN active rows),
+                //  * (d_j, m_j) = the curved topology matched to ŝ_j,
                 //  * G = current dictionary size, L0 = mean active atoms/token,
                 //  * N = tokens, P = channels.
                 let energies: Vec<f64> = (0..r)
                     .map(|j| factor.column(j).iter().map(|v| v * v).sum::<f64>())
                     .collect();
-                let span = participation_ratio(&energies);
-                let (intrinsic_dim, basis_size) = curved_topology_for_span(span);
+                let norms: Vec<f64> = energies.iter().map(|&e| e.sqrt()).collect();
+                // Per-row projection onto each UNIT factor direction, computed once
+                // (`unit_proj[[i, l]] = r_i · u_l`, `u_l = col_l/‖col_l‖`). A proposal's
+                // ambient span is then read LOCALLY from these coordinates on its own
+                // active rows — never one global participation ratio of the whole
+                // residual spectrum, which conflates every co-mined factor and biases
+                // admit/defer inconsistently (up when the spectrum is rich, down when
+                // it is peaked).
+                let mut unit_proj = Array2::<f64>::zeros((n, r));
+                for row in 0..n {
+                    let res_row = residuals.row(row);
+                    for l in 0..r {
+                        if norms[l] > 0.0 {
+                            let col = factor.column(l);
+                            let mut proj = 0.0_f64;
+                            for out in 0..p {
+                                proj += res_row[out] * col[out];
+                            }
+                            unit_proj[[row, l]] = proj / norms[l];
+                        }
+                    }
+                }
                 let g_dict = term.k_atoms();
                 let l0 = mean_active_atoms(assignments.view());
                 let n_tokens = n as f64;
@@ -768,7 +789,6 @@ pub fn harvest_move_proposals(
                 // DEFERRED (not proposed this round — a soft defer, never a kill).
                 let mut scored: Vec<(usize, f64)> = Vec::with_capacity(r);
                 for j in 0..r {
-                    let col = factor.column(j);
                     let energy = energies[j];
                     if !(energy > 0.0) {
                         // A zero-energy direction carries no residual structure to
@@ -776,7 +796,8 @@ pub fn harvest_move_proposals(
                         births_deferred += 1;
                         continue;
                     }
-                    let norm = energy.sqrt();
+                    let col = factor.column(j);
+                    let norm = norms[j];
                     // Per-direction idiosyncratic-noise floor δ_j = u_jᵀ D u_j (the
                     // residual diagonal projected onto the unit birth direction) —
                     // derived from the fitted noise model, not a hand-set floor.
@@ -785,21 +806,28 @@ pub fn harvest_move_proposals(
                         let u = col[out] / norm;
                         noise_floor += u * u * diagonal[out];
                     }
-                    // ρ̂_j: fraction of tokens whose residual projects onto the unit
-                    // direction above that direction's noise floor.
+                    // ρ̂_j (fraction of tokens above the noise floor on u_j) AND the
+                    // local factor-coordinate energies on j's active rows, in ONE pass.
                     let mut active = 0usize;
+                    let mut local_energy = vec![0.0_f64; r];
                     for row in 0..n {
-                        let res_row = residuals.row(row);
-                        let mut proj = 0.0_f64;
-                        for out in 0..p {
-                            proj += res_row[out] * col[out];
-                        }
-                        proj /= norm;
-                        if proj * proj > noise_floor {
+                        let proj_j = unit_proj[[row, j]];
+                        if proj_j * proj_j > noise_floor {
                             active += 1;
+                            for l in 0..r {
+                                let v = unit_proj[[row, l]];
+                                local_energy[l] += v * v;
+                            }
                         }
                     }
                     let rho = active as f64 / n_tokens;
+                    // ŝ_j: the LOCAL ambient span — participation ratio of the residual's
+                    // factor-coordinate energies where THIS candidate fires (a circle
+                    // living in a 2-plane ⇒ ≈2; an isolated direction ⇒ ≈1, priced as
+                    // linear). (d_j, m_j) follow from ŝ_j, so the dictionary/support
+                    // terms are matched to the atom this candidate would actually race.
+                    let span = participation_ratio(&local_energy);
+                    let (intrinsic_dim, basis_size) = curved_topology_for_span(span);
                     let predicted = predicted_birth_dl_bits(&BirthMdlPrescreen {
                         rho,
                         span,

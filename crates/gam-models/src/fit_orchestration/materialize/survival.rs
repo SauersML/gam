@@ -189,6 +189,34 @@ pub(crate) fn materialize_survival<'a>(
         }
         .into());
     }
+    // Per-cause identifiability for competing risks (#2276 hardening). The total
+    // weighted-event-mass gate above guarantees SOME cause has positive mass, but
+    // a cause-specific hazard block for cause `c` is unidentifiable when `c` has
+    // zero positive-weight events — the total gate passes while a modeled cause
+    // has none. `cause_count_from_event_codes` already rejects non-contiguous
+    // codes (a code-ABSENT cause), so every cause in `1..=cause_count` is
+    // code-present here; this checks that each also carries positive WEIGHTED
+    // event mass (kernels drop `weight <= 0` rows, so a code-present but
+    // all-zero-weighted cause has an empty effective cause-`c` score and its
+    // hazard is unidentified exactly like the total zero-event case).
+    if cause_count > 1 {
+        for cause in 1..=cause_count {
+            let cause_code = cause as u8;
+            let cause_mass: f64 = event_codes
+                .iter()
+                .zip(weights.iter())
+                .filter(|&(&code, _)| code == cause_code)
+                .map(|(_, &weight)| weight)
+                .sum();
+            if !(cause_mass > 0.0) {
+                return Err(WorkflowError::InvalidConfig {
+                    reason: format!(
+                        "cause-specific competing risks: cause {cause} of {cause_count} has no target event with positive weight, so its cause-specific hazard block is unidentifiable; every code-{cause} row is absent or zero-weighted"
+                    ),
+                });
+            }
+        }
+    }
     if parsed.linkwiggle.is_some()
         && !matches!(
             survival_mode,
