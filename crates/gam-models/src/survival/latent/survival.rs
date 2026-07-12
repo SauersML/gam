@@ -6903,7 +6903,7 @@ mod tests {
     #[test]
     fn latent_survival_one_pass_exact_tails_match_multidir_all_channels_932() {
         let quadctx = QuadratureContext::new();
-        let regimes = [
+        let regimes: [(&str, f64, f64, f64, f64, f64, f64); 3] = [
             (
                 "tiny-mass-left",
                 -14.0_f64,
