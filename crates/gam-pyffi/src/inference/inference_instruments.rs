@@ -2788,11 +2788,22 @@ pub(crate) fn shape_matched_control_f32<'py>(
 /// Euclidean Gaussian, the best free k-cluster mixture, and a constrained
 /// ring-of-clusters mixture whose centers share one fitted circle. The headline
 /// is held-out predictive stacking through the exact production race machinery.
-/// Returns the winner, per-candidate weights/evidences, both selected mixture
-/// orders, and the total circular stacking mass minus the total non-circular
-/// stacking mass. Aggregating within topology class makes `circle_wins`
-/// invariant to splitting predictive mass between the smooth-circle and
-/// ring-of-clusters candidates; `winner` remains the best individual candidate.
+/// `winner_class` is the fixed class whose outer-fold predictive column receives
+/// the largest stacking weight (`circle`, `euclidean`, `mixture`, or
+/// `ring_clusters`). `reporting_winner` attaches the all-data reporting order to
+/// a mixture-class winner (for example `ring_clusters_k7`); that reporting fit
+/// is never used to score an outer evaluation fold.
+///
+/// Every outer training fold selects its own free-mixture and ring-cluster order
+/// using only that fold's training rows before scoring its evaluation rows.
+/// `mixture_fold_selected_k` / `ring_clusters_fold_selected_k` expose those
+/// leakage-free choices in fold order, and the corresponding `*_fold_k_histogram`
+/// mappings summarize them. `mixture_reporting_k` and
+/// `ring_clusters_reporting_k` are separate all-data fits for interpretation and
+/// final deployment. The result also returns per-class stacking weights and
+/// full-data evidences. Aggregating the smooth-circle and ring-cluster weights
+/// makes `circle_wins` invariant to an arbitrary split of predictive mass inside
+/// the circular class; `circular_margin` is circular minus non-circular mass.
 ///
 /// `coords` is the `(n, 2)` intrinsic-coordinate matrix (e.g. `fit.coords[0]`
 /// from `sae_manifold_fit`). `folds`/`seed` control the deterministic CV folding

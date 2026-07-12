@@ -11,7 +11,20 @@ use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
+use rayon::prelude::*;
 use std::f64::consts::PI;
+
+/// Maximum row count of one covariance-exact Hadamard block.
+///
+/// The full-pipeline control allocates exactly one float64 transform workspace
+/// with at most `COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS * p` scalars. Keeping
+/// this bound independent of the corpus row count makes the control viable for
+/// activation matrices with hundreds of thousands of rows and thousands of
+/// columns.
+pub const COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS: usize = 1_024;
+
+const HADAMARD_PERMUTATION_SEED_DOMAIN: u64 = 0x4841_4441_5045_524D;
+const HADAMARD_SIGN_SEED_DOMAIN: u64 = 0x4841_4441_5349_474E;
 
 /// Direction of the claim statistic under the null.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,10 +151,10 @@ pub enum NullKind {
     /// and variance in every supplied PC column, preserving the eigenspectrum
     /// while destroying cyclic/non-Gaussian structure.
     MatchedSpectrumGaussian,
-    /// Draw a multivariate Gaussian with the observed mean and full covariance.
-    /// Unlike `MatchedSpectrumGaussian`, this is expressed in the supplied
-    /// coordinates and preserves their cross-covariance as well as their scales.
-    CovarianceMatchedGaussian,
+    /// Apply a seeded, mean-fixing orthogonal Hadamard transform to globally
+    /// permuted rows. This preserves the empirical mean and full covariance
+    /// while destroying rowwise nonlinear geometry in bounded memory.
+    CovarianceExactHadamard,
     /// Use separately supplied random-weight activations from the same
     /// architecture, moment-matched to the observed matrix shape.
     ArchitectureMatchedRandomWeight,
@@ -155,7 +168,7 @@ impl NullKind {
             Self::TokenShuffle => "token_shuffle",
             Self::PerDimensionShuffle => "per_dimension_shuffle",
             Self::MatchedSpectrumGaussian => "matched_spectrum_gaussian",
-            Self::CovarianceMatchedGaussian => "covariance_matched_gaussian",
+            Self::CovarianceExactHadamard => "covariance_exact_hadamard",
             Self::ArchitectureMatchedRandomWeight => "architecture_matched_random_weight",
         }
     }
@@ -181,7 +194,7 @@ impl NullBatteryConfig {
                 NullKind::TokenShuffle,
                 NullKind::PerDimensionShuffle,
                 NullKind::MatchedSpectrumGaussian,
-                NullKind::CovarianceMatchedGaussian,
+                NullKind::CovarianceExactHadamard,
                 NullKind::ArchitectureMatchedRandomWeight,
             ],
             tail: Tail::Larger,
@@ -403,7 +416,7 @@ pub fn primary_null_pvalue(report: &NullBatteryReport) -> f64 {
             summary.kind,
             NullKind::PhaseRandomized
                 | NullKind::MatchedSpectrumGaussian
-                | NullKind::CovarianceMatchedGaussian
+                | NullKind::CovarianceExactHadamard
                 | NullKind::ArchitectureMatchedRandomWeight
         ) {
             selected.push(summary.p_value);
@@ -422,7 +435,7 @@ pub fn primary_null_z(report: &NullBatteryReport) -> f64 {
             summary.kind,
             NullKind::PhaseRandomized
                 | NullKind::MatchedSpectrumGaussian
-                | NullKind::CovarianceMatchedGaussian
+                | NullKind::CovarianceExactHadamard
                 | NullKind::ArchitectureMatchedRandomWeight
         ) {
             selected.push(summary.z);
@@ -469,8 +482,8 @@ where
                 NullKind::MatchedSpectrumGaussian => {
                     matched_spectrum_gaussian_null(data, rep_seed)?
                 }
-                NullKind::CovarianceMatchedGaussian => {
-                    covariance_matched_gaussian_null(data, rep_seed)?
+                NullKind::CovarianceExactHadamard => {
+                    covariance_exact_hadamard_null(data, rep_seed)?
                 }
                 NullKind::ArchitectureMatchedRandomWeight => {
                     let Some(rw) = random_weight else {
@@ -1809,7 +1822,7 @@ fn kind_seed(kind: NullKind) -> u64 {
         NullKind::TokenShuffle => 0x70CE_514F,
         NullKind::PerDimensionShuffle => 0xD1AE_510F,
         NullKind::MatchedSpectrumGaussian => 0x5EEC_7A11,
-        NullKind::CovarianceMatchedGaussian => 0xC0A4_71A1,
+        NullKind::CovarianceExactHadamard => 0x4841_DA4D,
         NullKind::ArchitectureMatchedRandomWeight => 0xA2C4_177E,
     }
 }
