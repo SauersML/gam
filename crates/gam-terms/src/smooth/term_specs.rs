@@ -7537,10 +7537,21 @@ pub fn build_by_smooth_local(
             let inner_meta = inner.metadata.clone();
             let n_penalties = inner.penalties.len();
             let n_blocks = n_penalties.saturating_mul(n_levels);
-            let mut penalties = Vec::<Array2<f64>>::with_capacity(n_blocks);
-            let mut penaltyinfo = Vec::<PenaltyInfo>::with_capacity(n_blocks);
-            let mut nullspaces = Vec::<usize>::with_capacity(n_blocks);
-            for (pen_pos, s_inner) in inner.penalties.iter().enumerate() {
+            let active_inner_info = inner
+                .penaltyinfo
+                .iter()
+                .filter(|info| info.active)
+                .collect::<Vec<_>>();
+            if active_inner_info.len() != n_penalties {
+                crate::bail_invalid_basis!(
+                    "by-factor smooth term '{}' has {} active penalty metadata records for {} matrices",
+                    term.name,
+                    active_inner_info.len(),
+                    n_penalties
+                );
+            }
+            let mut candidates = Vec::<PenaltyCandidate>::with_capacity(n_blocks);
+            for (s_inner, base_info) in inner.penalties.iter().zip(active_inner_info.into_iter()) {
                 for lvl in 0..n_levels {
                     let off = lvl * p;
                     let mut s_big = Array2::<f64>::zeros((q, q));
@@ -7548,22 +7559,32 @@ pub fn build_by_smooth_local(
                         .slice_mut(s![off..off + p, off..off + p])
                         .assign(s_inner);
                     let (s_big, scale) = normalize_penalty_in_constrained_space(&s_big);
-                    let mut info = inner.penaltyinfo[pen_pos].clone();
-                    // Distinct original_index per (penalty, level) so each λ is a
-                    // separate identifiable coordinate downstream.
-                    info.original_index = pen_pos * n_levels + lvl;
-                    info.normalization_scale *= scale;
-                    // Each block now spans exactly ONE level → per-level nullity,
-                    // not the tiled (× n_levels) hint of the shared construction.
-                    info.kronecker_factors = None;
-                    penalties.push(s_big);
-                    penaltyinfo.push(info);
-                    nullspaces.push(inner.nullspaces[pen_pos]);
+                    candidates.push(PenaltyCandidate {
+                        matrix: s_big,
+                        nullspace_dim_hint: q.saturating_sub(base_info.effective_rank),
+                        source: base_info.source.clone(),
+                        normalization_scale: base_info.normalization_scale * scale,
+                        kronecker_factors: None,
+                        op: None,
+                    });
                 }
             }
 
-            let null_eigenvectors = vec![None; penalties.len()];
-            let ops = vec![None; penalties.len()];
+            // Re-analyze the completed q×q blocks in their actual coefficient
+            // space. Copying the p×p marginal nullity understated every block's
+            // null space by `(n_levels-1)·p`, while leaving its null basis and
+            // joint-null rotation absent. The canonical filter authors matrix,
+            // rank, nullity, null basis, and metadata together.
+            let (penalties, nullspaces, penaltyinfo, null_eigenvectors, ops) =
+                crate::basis::filter_active_penalty_candidates_with_ops(candidates)?;
+            let joint_null_rotation = crate::basis::compute_joint_null_rotation(&penalties)?;
+            let mut inherited_dropped = inner
+                .penaltyinfo
+                .iter()
+                .filter(|info| !info.active)
+                .cloned()
+                .collect::<Vec<_>>();
+            inherited_dropped.extend(inner.pre_dropped_penaltyinfo);
 
             Ok(LocalSmoothTermBuild {
                 dim: q,
@@ -7572,9 +7593,9 @@ pub fn build_by_smooth_local(
                 ops,
                 nullspaces,
                 null_eigenvectors,
-                joint_null_rotation: None,
+                joint_null_rotation,
                 penaltyinfo,
-                pre_dropped_penaltyinfo: inner.pre_dropped_penaltyinfo,
+                pre_dropped_penaltyinfo: inherited_dropped,
                 metadata: BasisMetadata::BySmooth {
                     inner: Box::new(inner_meta),
                     by_col: *feature_col,
