@@ -39,7 +39,9 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2};
 
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
-use gam::inference::steering::steer_delta;
+use gam::inference::steering::{
+    steer_delta, steer_to_target_nats, PatchedForwardKl, TargetDoseConfig,
+};
 use gam::terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
 use gam::terms::{
     sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment,
@@ -431,5 +433,174 @@ fn predicted_nats_survive_tier0_frame_rescale_2249() {
         (vr - delta).abs() < 1e-9,
         "tiny step must be fully within validity radius under Tier-0 rescaling: \
          vr={vr:.5e}, move={delta:.5e}"
+    );
+}
+
+/// gh#2263 target-dose API — the closed-form seed `a0 = sqrt(2 q*/(dgᵀ M dg))`
+/// hits the requested dose EXACTLY on the planted quadratic readout, with no
+/// model in the loop (`probe = None`). The planted circle metric is `F = I₂` at
+/// `rank = p`, so `predicted_nats(a) = ½‖a·dg‖²` is exactly quadratic in `a`;
+/// the seed identity `½ a0² dgᵀM dg = q*` therefore holds to machine precision at
+/// every dose (and a-fortiori at infinitesimal dose). This is the pure math +
+/// plumbing surface; the closed form is reported UNVALIDATED (`converged=false`)
+/// because without a patched forward it prices the second-order dose, not KL.
+#[test]
+fn target_dose_closed_form_seed_hits_dose_exactly() {
+    let t0 = 0.0;
+    let (term, metric) = planted_circle(t0);
+    let delta = 0.02_f64;
+
+    // Unit-amplitude dose sets the scale; ask for a fraction of it.
+    let unit = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("unit");
+    let unit_nats = unit.predicted_nats.expect("unit dose");
+    let target = 0.37 * unit_nats;
+
+    let plan = steer_to_target_nats(
+        &term,
+        &metric,
+        0,
+        0,
+        &[t0],
+        &[t0 + delta],
+        target,
+        TargetDoseConfig::default(),
+        None,
+    )
+    .expect("target-dose plan");
+
+    // Closed-form identity: ½ a0² dgᵀM dg == q* exactly.
+    assert!(
+        (plan.predicted_nats - target).abs() / target < 1e-12,
+        "closed-form seed dose {} must equal target {target} (rel={:.3e})",
+        plan.predicted_nats,
+        (plan.predicted_nats - target).abs() / target
+    );
+    assert!(
+        (plan.amplitude - plan.seed_amplitude).abs() < 1e-15,
+        "with no probe the amplitude is the closed-form seed"
+    );
+    // Independently: applying `steer_delta` at the seed amplitude reproduces q*.
+    let applied =
+        steer_delta(&term, &metric, 0, 0, plan.amplitude, &[t0], &[t0 + delta]).expect("applied");
+    let applied_nats = applied.predicted_nats.expect("applied dose");
+    assert!(
+        (applied_nats - target).abs() / target < 1e-12,
+        "re-applying the seed amplitude must land the dose: {applied_nats} vs {target}"
+    );
+    // Unvalidated closed form: no probe ⇒ not converged, no measurement, no
+    // readout-KL radius; the chart radius is still reported.
+    assert!(!plan.converged, "closed form is unvalidated without a probe");
+    assert!(plan.measured_nats.is_none());
+    assert_eq!(plan.iterations, 0);
+    assert!(plan.readout_kl_radius.is_none());
+    assert!(plan.chart_radius.is_some(), "chart radius must be reported");
+}
+
+/// gh#2263 target-dose API — with an EXACT-quadratic patched forward the seed is
+/// already right, so the closed-loop correction confirms it in a single probe and
+/// stamps the readout-KL radius (the quadratic matches the measured KL there).
+#[test]
+fn target_dose_exact_probe_converges_in_one_step() {
+    let t0 = 0.0;
+    let (term, metric) = planted_circle(t0);
+    let delta = 0.02_f64;
+    let unit = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("unit");
+    let unit_nats = unit.predicted_nats.expect("unit dose");
+    let target = 0.5 * unit_nats;
+
+    // Exact-quadratic probe: measured KL == the endpoint Fisher quadratic (the
+    // planted readout IS a quadratic, so the second-order dose is the true KL).
+    let mut probe = |a: f64| -> Result<f64, String> {
+        let p = steer_delta(&term, &metric, 0, 0, a, &[t0], &[t0 + delta])?;
+        Ok(p.predicted_nats.expect("dose"))
+    };
+    let plan = steer_to_target_nats(
+        &term,
+        &metric,
+        0,
+        0,
+        &[t0],
+        &[t0 + delta],
+        target,
+        TargetDoseConfig::default(),
+        Some(&mut probe as &mut PatchedForwardKl),
+    )
+    .expect("target-dose plan");
+
+    assert!(plan.converged, "exact-quadratic probe must converge");
+    assert_eq!(plan.iterations, 1, "the seed already hits the target exactly");
+    let measured = plan.measured_nats.expect("measured");
+    assert!(
+        (measured - target).abs() / target < 1e-9,
+        "measured KL {measured} must equal target {target}"
+    );
+    // The probe matched the quadratic at the seed ⇒ that amplitude is inside the
+    // readout-KL radius.
+    let rr = plan.readout_kl_radius.expect("readout radius established");
+    assert!(
+        (rr - plan.seed_amplitude).abs() < 1e-9,
+        "readout radius {rr} must be the (in-tolerance) seed amplitude {}",
+        plan.seed_amplitude
+    );
+}
+
+/// gh#2263 target-dose API — with a SATURATING patched forward (true KL bounded
+/// while the quadratic grows) the closed-form seed under-delivers KL, and the
+/// secant loop corrects UPWARD onto the measured curve. The seed sits past the
+/// readout-KL radius (measured departs from the quadratic there), so the radius is
+/// reported as unestablished — exactly the diagnostic #2249 asks for.
+#[test]
+fn target_dose_saturating_probe_secant_corrects_upward() {
+    let t0 = 0.0;
+    let (term, metric) = planted_circle(t0);
+    let delta = 0.05_f64;
+    let unit = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("unit");
+    let unit_nats = unit.predicted_nats.expect("unit dose");
+    let target = 0.5_f64; // nats, below the saturation ceiling K = 1.0
+
+    // Saturating monotone KL: measured = K·(1 − exp(−quad/K)), ≈ quad for small
+    // quad, bounded by K. quad(a) = a²·unit_nats.
+    let k_sat = 1.0_f64;
+    let mut probe = |a: f64| -> Result<f64, String> {
+        let quad = a * a * unit_nats;
+        Ok(k_sat * (1.0 - (-quad / k_sat).exp()))
+    };
+    let plan = steer_to_target_nats(
+        &term,
+        &metric,
+        0,
+        0,
+        &[t0],
+        &[t0 + delta],
+        target,
+        TargetDoseConfig::default(),
+        Some(&mut probe as &mut PatchedForwardKl),
+    )
+    .expect("target-dose plan");
+
+    assert!(
+        plan.converged,
+        "secant must reach the (sub-ceiling) target on a saturating curve"
+    );
+    let measured = plan.measured_nats.expect("measured");
+    assert!(
+        (measured - target).abs() / target <= TargetDoseConfig::default().tol_rel,
+        "corrected measured KL {measured} must reach target {target}"
+    );
+    // Saturation ⇒ the quadratic over-predicts, so the true amplitude exceeds the
+    // closed-form seed (had to push harder to realize the same measured KL).
+    assert!(
+        plan.amplitude > plan.seed_amplitude,
+        "saturating readout needs MORE amplitude than the quadratic seed: {} vs {}",
+        plan.amplitude,
+        plan.seed_amplitude
+    );
+    assert!(plan.iterations >= 2, "correction must take at least one secant step");
+    // The seed dose (quad = target = 0.5) already departs from the saturating
+    // measured (0.5 vs 0.39, 22% > 10% readout tol), so no probed amplitude was in
+    // readout tolerance ⇒ the readout-KL radius is honestly unestablished here.
+    assert!(
+        plan.readout_kl_radius.is_none(),
+        "seed is past the readout-KL radius; radius must be reported unestablished"
     );
 }

@@ -578,6 +578,232 @@ pub fn predicted_response(
     Ok(project_onto_tangent_span(&tangents, delta))
 }
 
+/// A patched-forward KL probe the target-dose loop plugs into: given an applied
+/// amplitude `a`, return the measured `KL(p_base ‖ p_patched)` in nats for the
+/// chord `a·(g(t_to) − g(t_from))`. The GPU re-measurement supplies a real
+/// model-in-the-loop forward here; the closed-form seed needs none.
+pub type PatchedForwardKl<'a> = dyn FnMut(f64) -> Result<f64, String> + 'a;
+
+/// Tuning for the closed-loop correction in [`steer_to_target_nats`].
+#[derive(Clone, Copy, Debug)]
+pub struct TargetDoseConfig {
+    /// Relative tolerance on measured KL vs the target that stops the loop.
+    pub tol_rel: f64,
+    /// Hard cap on secant iterations (each is one patched-forward probe).
+    pub max_iter: usize,
+    /// A probed amplitude counts as inside the readout-KL radius while its
+    /// measured KL matches the local quadratic within this relative tolerance.
+    pub readout_tol_rel: f64,
+}
+
+impl Default for TargetDoseConfig {
+    fn default() -> Self {
+        Self {
+            tol_rel: 1.0e-2,
+            max_iter: 12,
+            readout_tol_rel: 1.0e-1,
+        }
+    }
+}
+
+/// The amplitude that realizes a target output-KL dose on one atom's chord, plus
+/// the explicit dual-radius contract (gh#2249/#2263).
+#[derive(Clone, Debug)]
+pub struct TargetDosePlan {
+    /// Which atom was steered (index into [`SaeManifoldTerm::atoms`]).
+    pub atom: usize,
+    /// The atom's name.
+    pub atom_name: String,
+    /// The requested dose in nats of KL.
+    pub target_nats: f64,
+    /// Closed-form first-order amplitude `a0 = sqrt(2 q* / (dgᵀ M dg))`, exact in
+    /// the quadratic/in-radius regime.
+    pub seed_amplitude: f64,
+    /// Final amplitude: `seed_amplitude` when no probe was supplied, else the
+    /// closed-loop-corrected amplitude.
+    pub amplitude: f64,
+    /// Quadratic dose `½ a² dgᵀ M dg` at [`Self::amplitude`] (equals
+    /// [`Self::target_nats`] at the seed by construction).
+    pub predicted_nats: f64,
+    /// Full-mass / unaudited / low-rank-lower-bound status of the quadratic dose.
+    pub predicted_nats_kind: FisherDoseKind,
+    /// Probe-measured patched-forward KL at [`Self::amplitude`], when a callback
+    /// was supplied; `None` for the pure closed-form seed.
+    pub measured_nats: Option<f64>,
+    /// Number of patched-forward probes consumed (0 without a callback).
+    pub iterations: usize,
+    /// Whether the measured KL reached the target within `tol_rel`. Always
+    /// `false` without a callback: the closed form is *unvalidated* by
+    /// construction — it prices the second-order dose, not the true KL.
+    pub converged: bool,
+    /// **CHART radius** (as shipped by [`SteerPlan::validity_radius`]): the latent
+    /// step at which the decoder chord leaves its tangent linearization under the
+    /// fixed base-row metric. Amplitude-invariant. `None` under a no-behavior
+    /// metric. This certifies chart linearization ONLY — not that the quadratic
+    /// dose tracks the true output KL (that is the readout radius below).
+    pub chart_radius: Option<f64>,
+    /// **READOUT-KL radius**: the largest probed amplitude whose measured KL still
+    /// matched the local quadratic within `readout_tol_rel` — beyond it the true
+    /// softmax KL saturates and the quadratic ceases to be calibrated. `None` when
+    /// no callback was supplied (it cannot be established without the model) or
+    /// when even the smallest probed amplitude was already out of tolerance.
+    pub readout_kl_radius: Option<f64>,
+    /// Provenance of the metric the dose is read through.
+    pub metric_provenance: MetricProvenance,
+}
+
+/// Solve for the amplitude that lands a target output-KL dose `target_nats` (in
+/// nats) on atom `atom_k`'s chord from `t_from` to `t_to` (gh#2263 target-dose
+/// surface — `amplitude = 1` has no universal meaning, the dose does).
+///
+/// The closed form `a0 = sqrt(2 q* / (dgᵀ M dg))` (`dg` the unit-amplitude chord,
+/// `M` the row output-Fisher) is exact in the quadratic/in-radius regime — and is
+/// correctly scaled only because the chord and the metric now share the raw
+/// activation frame (gh#2249, `ace3b9af3`; a Tier-0 σ-mis-scale on `dg` would
+/// have poisoned `a0`). Past the readout-KL radius the true KL saturates, so an
+/// optional `probe` (a patched forward) drives a secant correction onto the
+/// measured curve and opportunistically records the readout-KL radius. With
+/// `probe = None` the result is the unvalidated closed-form seed: pure math and
+/// plumbing, no model in the loop.
+#[allow(clippy::too_many_arguments)]
+pub fn steer_to_target_nats(
+    model: &SaeManifoldTerm,
+    metric: &RowMetric,
+    atom_k: usize,
+    metric_row: usize,
+    t_from: &[f64],
+    t_to: &[f64],
+    target_nats: f64,
+    config: TargetDoseConfig,
+    probe: Option<&mut PatchedForwardKl<'_>>,
+) -> Result<TargetDosePlan, String> {
+    if !(target_nats.is_finite() && target_nats > 0.0) {
+        return Err(format!(
+            "steer_to_target_nats: target_nats must be finite and positive, got {target_nats}"
+        ));
+    }
+    if !(config.tol_rel > 0.0) || config.max_iter == 0 || !(config.readout_tol_rel > 0.0) {
+        return Err(format!(
+            "steer_to_target_nats: config must have tol_rel>0, max_iter>0, readout_tol_rel>0; \
+             got {config:?}"
+        ));
+    }
+    // Unit-amplitude reference: predicted_nats(a) = a²·unit_nats, and the chart
+    // radius / provenance / dose kind are all amplitude-invariant.
+    let unit = steer_delta(model, metric, atom_k, metric_row, 1.0, t_from, t_to)?;
+    let unit_nats = unit.predicted_nats.ok_or_else(|| {
+        format!(
+            "steer_to_target_nats: atom {atom_k} has no behavioral (nats) metric \
+             (provenance {:?}); a target-nats dose is undefined",
+            unit.metric_provenance
+        )
+    })?;
+    if !(unit_nats > 0.0) {
+        return Err(format!(
+            "steer_to_target_nats: unit-amplitude dose is {unit_nats} (the chord carries no \
+             Fisher mass in metric row {metric_row}); cannot solve for a target amplitude"
+        ));
+    }
+    // Closed-form first-order seed: a0²·unit_nats = q*.
+    let seed_amplitude = (target_nats / unit_nats).sqrt();
+    let quad = |a: f64| a * a * unit_nats;
+
+    let mut plan = TargetDosePlan {
+        atom: atom_k,
+        atom_name: unit.atom_name.clone(),
+        target_nats,
+        seed_amplitude,
+        amplitude: seed_amplitude,
+        predicted_nats: quad(seed_amplitude),
+        predicted_nats_kind: unit.predicted_nats_kind,
+        measured_nats: None,
+        iterations: 0,
+        converged: false,
+        chart_radius: unit.validity_radius,
+        readout_kl_radius: None,
+        metric_provenance: unit.metric_provenance,
+    };
+
+    let probe = match probe {
+        Some(probe) => probe,
+        // No model in the loop: return the unvalidated closed-form seed.
+        None => return Ok(plan),
+    };
+
+    // Closed-loop secant correction on f(a) = KL(a) − q*, seeded by the closed
+    // form and a quadratic-informed second point. KL(a) is monotone increasing in
+    // a over the in-regime, so this converges in ~1 step in-radius and only does
+    // real work where saturation bends the curve. A probed amplitude whose
+    // measured KL still matches the local quadratic marks the readout-KL radius.
+    let measure = |probe: &mut PatchedForwardKl<'_>, a: f64| -> Result<f64, String> {
+        let kl = probe(a)?;
+        if !(kl.is_finite() && kl >= 0.0) {
+            return Err(format!(
+                "steer_to_target_nats: probe returned a non-finite/negative KL {kl} at amplitude {a}"
+            ));
+        }
+        Ok(kl)
+    };
+
+    let mut a_prev = seed_amplitude;
+    let mut kl_prev = measure(probe, a_prev)?;
+    plan.iterations += 1;
+    plan.amplitude = a_prev;
+    plan.measured_nats = Some(kl_prev);
+    plan.predicted_nats = quad(a_prev);
+    {
+        let q = quad(a_prev);
+        if q > 0.0 && (kl_prev - q).abs() / q <= config.readout_tol_rel {
+            plan.readout_kl_radius = Some(plan.readout_kl_radius.map_or(a_prev, |r| r.max(a_prev)));
+        }
+    }
+    if (kl_prev - target_nats).abs() / target_nats <= config.tol_rel {
+        plan.converged = true;
+        return Ok(plan);
+    }
+    // Quadratic-informed second point: if KL ≈ c·a², a·sqrt(q*/kl) lands near q*.
+    let mut a_curr = (a_prev * (target_nats / kl_prev.max(f64::MIN_POSITIVE)).sqrt())
+        .max(f64::MIN_POSITIVE);
+    while plan.iterations < config.max_iter {
+        let kl_curr = measure(probe, a_curr)?;
+        plan.iterations += 1;
+        plan.amplitude = a_curr;
+        plan.measured_nats = Some(kl_curr);
+        plan.predicted_nats = quad(a_curr);
+        {
+            let q = quad(a_curr);
+            if q > 0.0 && (kl_curr - q).abs() / q <= config.readout_tol_rel {
+                plan.readout_kl_radius =
+                    Some(plan.readout_kl_radius.map_or(a_curr, |r| r.max(a_curr)));
+            }
+        }
+        if (kl_curr - target_nats).abs() / target_nats <= config.tol_rel {
+            plan.converged = true;
+            break;
+        }
+        // Secant update on f(a) = KL(a) − q*, with a quadratic-rescale fallback
+        // whenever the secant denominator degenerates or leaves the positive axis.
+        let f_prev = kl_prev - target_nats;
+        let f_curr = kl_curr - target_nats;
+        let denom = f_curr - f_prev;
+        let rescale = a_curr * (target_nats / kl_curr.max(f64::MIN_POSITIVE)).sqrt();
+        let a_next = if denom.abs() > 0.0 {
+            let step = a_curr - f_curr * (a_curr - a_prev) / denom;
+            if step.is_finite() && step > 0.0 {
+                step
+            } else {
+                rescale
+            }
+        } else {
+            rescale
+        };
+        a_prev = a_curr;
+        kl_prev = kl_curr;
+        a_curr = a_next.max(f64::MIN_POSITIVE);
+    }
+    Ok(plan)
+}
+
 /// Does this provenance carry behavioral (output-Fisher) information? Euclidean
 /// is the isotropic activation-only path and carries none; the factored
 /// provenances do. (Mirrors `atom_lens::metric_carries_behavior`.)

@@ -14,7 +14,9 @@ use gam_terms::basis::{DuchonNullspaceOrder, duchon_sae_atom_penalty, monomial_e
 use ndarray::{Array1, Array2, Array3, ArrayView2, s};
 
 use crate::hybrid_split::AtomLinearImage;
-use crate::inference::steering::{SteerPlan, steer_delta};
+use crate::inference::steering::{
+    steer_delta, steer_to_target_nats, PatchedForwardKl, SteerPlan, TargetDoseConfig, TargetDosePlan,
+};
 
 use super::{
     AssignmentMode, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
