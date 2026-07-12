@@ -12,17 +12,17 @@ mod tests {
     use super::loop_driver::{default_beta_guess_external, exact_lambdas_from_rho};
     use super::reweight::madsen_lm_accept_factor;
     use super::{
-        LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath,
-        PirlsProblem, PirlsWorkspace, WeightFamily, WeightLink, WorkingDerivativeBuffersMut,
-        bernoulli_geometry_from_jet, calculate_deviance, calculate_loglikelihood,
-        calculate_loglikelihood_omitting_constants, compute_constraint_kkt_diagnostics,
-        compute_observed_hessian_curvature_arrays, fit_model_for_fixed_rho,
-        observed_weight_dispatch, observed_weight_noncanonical, select_active_set_release,
-        should_log_pirls_decision_summary, should_use_sparse_native_pirls,
-        solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
-        update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state,
-        write_negative_binomial_log_working_state, write_poisson_log_working_state,
-        write_tweedie_log_working_state,
+        DENSE_OUTER_MAX_P, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
+        PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily,
+        WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance,
+        calculate_loglikelihood, calculate_loglikelihood_omitting_constants,
+        compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays,
+        fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical,
+        select_active_set_release, should_log_pirls_decision_summary,
+        should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
+        solve_newton_directionwith_lower_bounds, update_glmvectors, variance_jet_for_weight_family,
+        write_gamma_log_working_state, write_negative_binomial_log_working_state,
+        write_poisson_log_working_state, write_tweedie_log_working_state,
     };
     use crate::active_set;
     use crate::estimate::EstimationError;
@@ -86,6 +86,33 @@ mod tests {
             streamed[[0, 0]] < 0.0,
             "negative row weights must not be clipped through a sqrt(max(0,w)) Gram path"
         );
+    }
+
+    #[test]
+    fn sparse_spgemm_xtwx_preserves_signed_observed_weights() {
+        let p = DENSE_OUTER_MAX_P + 1;
+        let triplets = vec![
+            Triplet::new(0, 0, 1.0),
+            Triplet::new(0, 1, 2.0),
+            Triplet::new(1, 0, 3.0),
+            Triplet::new(1, 1, -1.0),
+        ];
+        let x = SparseColMat::try_new_from_triplets(2, p, &triplets).unwrap();
+        let mut cache = SparseXtWxCache::new(&x).unwrap();
+        cache.compute_numeric(&x, &array![2.0, -1.5]).unwrap();
+
+        let value = |row: usize, col: usize| {
+            let range = cache.xtwx_symbolic.col_range(col);
+            range
+                .clone()
+                .find_map(|index| {
+                    (cache.xtwx_symbolic.row_idx()[index] == row).then_some(cache.xtwxvalues[index])
+                })
+                .expect("requested entry must be in X^T X symbolic pattern")
+        };
+        assert_relative_eq!(value(0, 0), -11.5, epsilon = 1e-12);
+        assert_relative_eq!(value(0, 1), 8.5, epsilon = 1e-12);
+        assert_relative_eq!(value(1, 1), 6.5, epsilon = 1e-12);
     }
 
     #[test]

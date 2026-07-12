@@ -340,14 +340,14 @@ fn normal_logcdf_derivatives_left_tail(x: f64) -> [f64; 5] {
     for n in (1..=32).rev() {
         let denominator = t + q.value;
         let inv_denominator = denominator.recip();
-        let value = f64::from(n) * inv_denominator;
+        let value = f64::from(n) / denominator;
         let denominator_first = 1.0 + q.first;
         let a = denominator_first * inv_denominator;
         let b = q.second * inv_denominator;
         let c = q.third * inv_denominator;
         q = MillsCorrectionDerivatives {
             value,
-            first: -value * a,
+            first: -value * denominator_first / denominator,
             second: value * (2.0 * a * a - b),
             third: value * (-6.0 * a * a * a + 6.0 * a * b - c),
         };

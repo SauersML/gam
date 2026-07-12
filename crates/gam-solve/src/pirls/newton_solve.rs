@@ -48,24 +48,12 @@ pub(crate) struct DenseOuterState {
 }
 
 /// State for the sparse-SpGEMM backend (faer numeric matmul scratch and the
-/// pre-scaled (√W)·X factors that feed it).
-///
-/// `sqrt_weights` caches `√wᵢ` for each finite nonnegative PIRLS working
-/// weight row of X. Without it, the right-factor loop would recompute the same
-/// sqrt once per nonzero of X (each row weight gets read by every column that
-/// has a nonzero in that row), so for an n=400 K · avg-nnz-per-row=10 design
-/// that's 4 M sqrts per PIRLS iteration. Precomputing once collapses that to n
-/// sqrts and the inner loop becomes a pure multiply.
-///
-/// This is deliberately separate from REML/Firth's fixed
-/// `observation_weight_sqrt` handling in `solver/reml/firth.rs`: this cache
-/// materializes the current working-weight Gram factors, while Firth stores
-/// case-weight roots so reduced designs can later be mapped back with
-/// reciprocal roots.
+/// row-scaled `X^T W` left factor and unscaled `X` right factor that feed it).
+/// This asymmetric factorization preserves signed observed-information weights
+/// exactly and is cheaper than forming two square-root-scaled factors.
 pub(crate) struct SparseSpGemmState {
     pub(crate) wxvalues: Vec<f64>,
     pub(crate) wx_tvalues: Vec<f64>,
-    pub(crate) sqrt_weights: Vec<f64>,
     pub(crate) info: SparseMatMulInfo,
     pub(crate) scratch: MemBuffer,
     pub(crate) par: Par,
@@ -117,7 +105,6 @@ impl SparseXtWxCache {
             XtWxBackend::Sparse(SparseSpGemmState {
                 wxvalues: vec![0.0; x.val().len()],
                 wx_tvalues: vec![0.0; x_t_csc.val().len()],
-                sqrt_weights: vec![0.0; x.nrows()],
                 info,
                 scratch,
                 par,
@@ -283,8 +270,7 @@ impl DenseOuterState {
 }
 
 impl SparseSpGemmState {
-    /// Compute XᵀWX into the symbolic-pattern array `xtwxvalues` via faer's
-    /// sparse-sparse matmul: XᵀWX = (√W·X)ᵀ · (√W·X).
+    /// Compute XᵀWX via faer's sparse-sparse matmul as `(XᵀW) · X`.
     pub(crate) fn compute(
         &mut self,
         x: &SparseColMat<usize, f64>,
@@ -296,37 +282,20 @@ impl SparseSpGemmState {
     ) {
         let n = x_t.ncols();
         assert_eq!(weights.len(), n);
-        assert_eq!(self.sqrt_weights.len(), n);
-
-        assert!(
-            weights.iter().all(|&w| w.is_finite() && w >= 0.0),
-            "SparseSpGemmState::compute requires finite nonnegative PIRLS weights"
-        );
-        // Cache √w once per row so the inner loops can multiply
-        // without repeated sqrt calls. Single owning slice avoids ndarray
-        // bounds checks in the hot loops below.
-        let sqrt_w = self.sqrt_weights.as_mut_slice();
-        for (dst, &w) in sqrt_w.iter_mut().zip(weights.iter()) {
-            *dst = w.sqrt();
-        }
-        let sqrt_w: &[f64] = sqrt_w;
+        assert!(weights.iter().all(|w| w.is_finite()));
 
         let x_ref = x.as_ref();
-        // Right factor: √W · X, stored in X's CSC sparsity pattern.
+        // Right factor: X, copied into the reusable numeric buffer.
         for col in 0..p {
-            let rows = x_ref.row_idx_of_col_raw(col);
             let xvals = x_ref.val_of_col(col);
             let range = x_ref.col_range(col);
             let dst = &mut self.wxvalues[range];
-            for ((d, &s), row) in dst.iter_mut().zip(xvals.iter()).zip(rows.iter()) {
-                *d = s * sqrt_w[row.unbound()];
-            }
+            dst.copy_from_slice(xvals);
         }
-        // Left factor: (√W · X)ᵀ in X^T's CSC sparsity pattern. X^T's columns
-        // correspond to rows of X, so each column scales by √w_row — read
-        // straight from the cached slice with no per-column sqrt.
+        // Left factor: X^T W. X^T's columns correspond to rows of X, so each
+        // column scales once by the exact (possibly signed) row weight.
         for col in 0..n {
-            let w = sqrt_w[col];
+            let w = weights[col];
             let xvals = x_t.val_of_col(col);
             let range = x_t.col_range(col);
             let dst = &mut self.wx_tvalues[range];
@@ -378,11 +347,7 @@ pub(crate) fn accumulate_outer_upper(
         .expect("dense XᵀWX accumulator is row-major and contiguous");
 
     for i in rows {
-        // Sparse PIRLS precompute deliberately clips to Fisher-style
-        // nonnegative weights before the row outer product. The shared REML
-        // dense helper preserves signed observed-Hessian weights exactly, so
-        // routing this sparse path through it would change curvature semantics.
-        let w_i = weights[i].max(0.0);
+        let w_i = weights[i];
         if w_i == 0.0 {
             continue;
         }

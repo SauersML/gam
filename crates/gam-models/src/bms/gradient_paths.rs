@@ -611,7 +611,12 @@ pub(crate) fn signed_probit_neglog_derivatives_up_to_fourth_numeric(
         return (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
     }
     let d = normal_logcdf_derivatives(signed_margin);
-    (-weight * d[1], -weight * d[2], -weight * d[3], -weight * d[4])
+    (
+        -weight * d[1],
+        -weight * d[2],
+        -weight * d[3],
+        -weight * d[4],
+    )
 }
 
 /// Exact probit derivative helper used by analytic jet code paths.
@@ -2113,7 +2118,10 @@ mod jet_tower_oracle_tests {
     #[test]
     fn signed_probit_stack_preserves_extreme_tail_derivatives_and_weight_sign() {
         let positive = signed_probit_neglog_unary_stack(f64::NEG_INFINITY, 2.0);
-        assert_eq!(positive, [f64::INFINITY, f64::NEG_INFINITY, 2.0, -0.0, -0.0]);
+        assert_eq!(
+            positive,
+            [f64::INFINITY, f64::NEG_INFINITY, 2.0, -0.0, -0.0]
+        );
         let negative = signed_probit_neglog_unary_stack(f64::NEG_INFINITY, -2.0);
         assert_eq!(negative, [f64::NEG_INFINITY, f64::INFINITY, -2.0, 0.0, 0.0]);
 

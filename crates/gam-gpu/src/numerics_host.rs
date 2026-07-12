@@ -81,9 +81,7 @@ pub fn erfcx_nonnegative(x: f64) -> f64 {
                 + inv2
                     * (0.75
                         + inv2
-                            * (-1.875
-                                + inv2
-                                    * (6.5625 + inv2 * (-29.53125 + inv2 * 162.421875)))));
+                            * (-1.875 + inv2 * (6.5625 + inv2 * (-29.53125 + inv2 * 162.421875)))));
     inv * poly * INV_SQRT_PI
 }
 
@@ -158,7 +156,11 @@ pub fn log_ndtr_mills_curvature(x: f64) -> (f64, f64, f64) {
         return (log_cdf, lambda, x);
     }
     if x.is_infinite() {
-        return (log_cdf, lambda, if x.is_sign_positive() { 0.0 } else { 1.0 });
+        return (
+            log_cdf,
+            lambda,
+            if x.is_sign_positive() { 0.0 } else { 1.0 },
+        );
     }
     let curvature = if x <= -4.0 {
         let t = -x;
@@ -328,12 +330,7 @@ mod probit_parity_tests {
                 "device source lost shared tail contract `{required}`"
             );
         }
-        for forbidden in [
-            "1e-300",
-            "if (xx > 700.0)",
-            "if (cdf > 1.0)",
-            "1.0 / 0.0",
-        ] {
+        for forbidden in ["1e-300", "if (xx > 700.0)", "if (cdf > 1.0)", "1.0 / 0.0"] {
             assert!(
                 !PROBIT_NUMERICS_CU.contains(forbidden),
                 "device source reintroduced numerical projection `{forbidden}`"
@@ -341,8 +338,8 @@ mod probit_parity_tests {
         }
     }
 
-    /// `log_ndtr` boundary + bulk identity `log Φ(x) = log(½·erfc(-x/√2))` to
-    /// ≤ 2 ULP for `|x| ≤ 3`, and `Φ(x)+Φ(-x)=1` to ≤ 4e-16.
+    /// `log_ndtr` boundary + stable bulk Gaussian identity to ≤ 2 ULP for
+    /// `|x| ≤ 3`, and `Φ(x)+Φ(-x)=1` to ≤ 4e-16.
     #[test]
     fn log_ndtr_matches_log_cdf_and_reflects() {
         assert_eq!(log_ndtr(0.0), libm::log(0.5));
@@ -354,8 +351,12 @@ mod probit_parity_tests {
         let mut worst_bulk = 0.0_f64;
         for i in -30..=30 {
             let x = i as f64 * 0.1;
-            let cdf = 0.5 * erfc(-x / SQRT_2);
-            worst_bulk = worst_bulk.max(ulp(log_ndtr(x), libm::log(cdf)));
+            let expected = if x < 0.0 {
+                libm::log(0.5 * erfc(-x / SQRT_2))
+            } else {
+                libm::log1p(-0.5 * erfc(x / SQRT_2))
+            };
+            worst_bulk = worst_bulk.max(ulp(log_ndtr(x), expected));
         }
         assert!(
             worst_bulk <= 2.0,
@@ -423,9 +424,11 @@ mod probit_parity_tests {
             log_ndtr_mills_curvature(f64::NEG_INFINITY),
             (f64::NEG_INFINITY, f64::INFINITY, 1.0)
         );
-        assert!(log_ndtr_mills_curvature(f64::NAN)
-            .into_iter()
-            .all(f64::is_nan));
+        assert!(
+            log_ndtr_mills_curvature(f64::NAN)
+                .into_iter()
+                .all(f64::is_nan)
+        );
 
         let h = 1.0e-5;
         for x in [-8.0_f64, -4.0, -2.0, 0.0, 3.0] {

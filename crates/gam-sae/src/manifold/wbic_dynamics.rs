@@ -141,25 +141,37 @@ impl AtomLambdaTrajectory {
     /// survives the `1/S` dilution and still clears e-BH; a never-born atom sums
     /// to 0 (`log −∞`) and cannot be selected. Computed by log-sum-exp for
     /// overflow safety.
-    pub fn peak_birth_log_e(&self) -> f64 {
+    pub fn peak_birth_log_e(&self) -> Result<f64, String> {
         let n_steps = self.jumps.len();
         if n_steps == 0 {
-            return f64::NEG_INFINITY;
+            return Ok(f64::NEG_INFINITY);
         }
-        let positive: Vec<f64> = self
-            .jumps
-            .iter()
-            .filter(|j| j.delta_lambda > 0.0)
-            .map(|j| j.log_e)
-            .collect();
+        let mut positive = Vec::new();
+        for jump in self.jumps.iter().filter(|jump| jump.delta_lambda > 0.0) {
+            if jump.log_e.is_nan() || jump.log_e == f64::INFINITY {
+                return Err(format!(
+                    "atom {} has invalid positive-jump log-e value {} at step {}→{}",
+                    self.atom_name, jump.log_e, jump.from_ckpt, jump.to_ckpt
+                ));
+            }
+            positive.push(jump.log_e);
+        }
         let max = positive.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        if !max.is_finite() {
+        if max == f64::NEG_INFINITY {
             // No positive jump ⇒ the mixture is exactly 0 ⇒ log −∞.
-            return f64::NEG_INFINITY;
+            return Ok(f64::NEG_INFINITY);
         }
         // log( (1/S)·Σ_{Δλ>0} exp(log_e) ) = logsumexp − ln S, overflow-safe.
         let sumexp: f64 = positive.iter().map(|&l| (l - max).exp()).sum();
-        max + sumexp.ln() - (n_steps as f64).ln()
+        let peak = max + sumexp.ln() - (n_steps as f64).ln();
+        if peak.is_finite() {
+            Ok(peak)
+        } else {
+            Err(format!(
+                "atom {} peak birth log-e mixture is non-finite: {peak}",
+                self.atom_name
+            ))
+        }
     }
 }
 
@@ -314,18 +326,11 @@ pub fn wbic_lambda_dynamics(input: &WbicDynamicsInput<'_>) -> Result<WbicDynamic
     // be selected.
     let peak_log_e: Vec<f64> = atoms
         .iter()
-        .map(|a| {
-            let p = a.peak_birth_log_e();
-            if p.is_finite() { p } else { f64::NEG_INFINITY }
-        })
-        .collect();
-    // e-BH expects finite inputs; map a never-born −∞ to a large negative so its
-    // e-value is ~0 (never confirmed) without polluting the ordering.
-    let finite_log_e: Vec<f64> = peak_log_e
-        .iter()
-        .map(|&v| if v.is_finite() { v } else { -1.0e300 })
-        .collect();
-    let cross_atom_born = e_benjamini_hochberg(&finite_log_e, input.birth_alpha);
+        .map(AtomLambdaTrajectory::peak_birth_log_e)
+        .collect::<Result<Vec<_>, _>>()?;
+    // e-BH natively accepts −∞ as exact zero e-value, so a never-born atom is
+    // represented exactly rather than by an arbitrary finite sentinel.
+    let cross_atom_born = e_benjamini_hochberg(&peak_log_e, input.birth_alpha);
 
     Ok(WbicDynamicsReport {
         atoms,
@@ -454,11 +459,18 @@ fn best_effort_transport(
 /// validly into the atom's birth e-process.
 fn no_jump_log_e_value(z: f64) -> Result<f64, String> {
     if !z.is_finite() {
-        return Ok(0.0);
+        return Err(format!(
+            "no-jump evidence requires a finite studentized jump; got {z}"
+        ));
     }
     let normal =
         Normal::new(0.0, 1.0).map_err(|e| format!("standard normal construction failed: {e}"))?;
-    let p: f64 = (2.0 * (1.0 - normal.cdf(z.abs()))).clamp(f64::MIN_POSITIVE, 1.0);
+    let p: f64 = 2.0 * normal.sf(z.abs());
+    if !(p.is_finite() && p > 0.0 && p <= 1.0) {
+        return Err(format!(
+            "two-sided normal tail is not representable for studentized jump {z}: p={p}"
+        ));
+    }
     log_e_from_p_calibrator(p)
 }
 

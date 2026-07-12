@@ -68,6 +68,14 @@ pub(crate) fn link_binomial_aux(
     wi: f64,
     mu: f64,
 ) -> Result<LinkBinomialAux, EstimationError> {
+    if !(wi.is_finite() && wi >= 0.0) {
+        return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+            row,
+            quantity: "prior weight",
+            eta,
+            value: wi,
+        });
+    }
     if !(mu.is_finite() && mu > 0.0 && mu < 1.0) {
         return Err(EstimationError::PirlsRowGeometryUnrepresentable {
             row,
@@ -2871,7 +2879,7 @@ impl<'a> RemlState<'a> {
             let mu = jets.jet.mu;
             let d1 = jets.jet.d1;
             let yi = self.y[i];
-            let wi = self.weights[i].max(0.0);
+            let wi = self.weights[i];
             let aux = link_binomial_aux(i, eta_i, yi, wi, mu)?;
 
             for j in 0..aux_dim {
@@ -3047,7 +3055,7 @@ impl<'a> RemlState<'a> {
             let mu = jet.mu;
             let d1 = jet.d1;
             let yi = self.y[i];
-            let wi = self.weights[i].max(0.0);
+            let wi = self.weights[i];
             let aux = link_binomial_aux(i, eta_i, yi, wi, mu)?;
 
             for j in 0..aux_dim {

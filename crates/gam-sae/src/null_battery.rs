@@ -193,8 +193,9 @@ pub enum NullKind {
     /// as an unordered circle or ring of clusters.
     PerDimensionShuffle,
     /// Draw independent Gaussian principal-component scores with the same mean
-    /// and variance in every supplied PC column, preserving the eigenspectrum
-    /// while destroying cyclic/non-Gaussian structure.
+    /// and variance parameters in every supplied PC column. The finite random
+    /// draw fluctuates around, rather than exactly preserving, that target
+    /// eigenspectrum while destroying cyclic/non-Gaussian structure.
     MatchedSpectrumGaussian,
     /// Apply a seeded, mean-fixing orthogonal Hadamard transform to globally
     /// permuted rows. This preserves the empirical mean and full covariance
@@ -1294,8 +1295,9 @@ pub fn covariance_exact_hadamard_null_f32(
 /// component coordinates.
 ///
 /// Each output PC column is an independent normal draw with the observed
-/// column's mean and sample standard deviation. Consequently the per-PC
-/// eigenspectrum is preserved while cyclic ordering, higher moments, and
+/// column's mean and population standard deviation. Consequently the generated
+/// population matches the per-PC variance targets while a finite draw has the
+/// corresponding Monte Carlo fluctuation; cyclic ordering, higher moments, and
 /// cross-row manifold structure are destroyed. The explicit PC-coordinate
 /// contract avoids a hidden eigen-decomposition or a Python-side reimplementation.
 pub fn matched_spectrum_gaussian_null(
@@ -1392,9 +1394,9 @@ fn neumaier_add(sum: &mut f64, correction: &mut f64, term: f64) -> Result<(), St
 /// Shared range-safe column location. When subtraction from the first row is
 /// representable, a compensated residual-chart average preserves small
 /// variations around a large translation. Otherwise a compensated convex
-/// average of `x / n` handles antipodal finite values without ever forming
-/// their unrepresentable difference. Downstream centering fails only when the
-/// physical-coordinate residual itself is not representable.
+/// average in a max-absolute unit chart handles antipodal finite values without
+/// ever forming their unrepresentable difference. Downstream centering fails
+/// only when the physical-coordinate residual itself is not representable.
 fn stable_column_location(data: ArrayView2<'_, f64>) -> Result<StableColumnLocation, String> {
     validate_matrix(data, "stable-column-location input")?;
     let count = data.nrows() as f64;
@@ -1477,8 +1479,8 @@ fn stable_population_moments(data: ArrayView2<'_, f64>) -> Result<StablePopulati
     let mut residual_scales = vec![0.0_f64; p];
     for row in 0..n {
         for axis in 0..p {
-            residual_scales[axis] = residual_scales[axis]
-                .max(location.centered_value(data[[row, axis]], axis)?.abs());
+            residual_scales[axis] =
+                residual_scales[axis].max(location.centered_value(data[[row, axis]], axis)?.abs());
         }
     }
     let mut covariance = Array2::<f64>::zeros((p, p));
@@ -1622,7 +1624,9 @@ pub fn covariance_matched_gaussian_null(
     Ok(out)
 }
 
-/// Resample real random-weight activations and match observed column moments.
+/// Resample real random-weight activations after mapping donor columns to the
+/// observed mean/scale parameters. Finite resampling still has ordinary Monte
+/// Carlo fluctuation around those targets.
 pub fn architecture_matched_random_weight_null(
     observed: ArrayView2<'_, f64>,
     random_weight: ArrayView2<'_, f64>,
@@ -2984,12 +2988,7 @@ fn balanced_nonnegative_product(
     }
 }
 
-fn balanced_finite_product(
-    first: f64,
-    second: f64,
-    third: f64,
-    name: &str,
-) -> Result<f64, String> {
+fn balanced_finite_product(first: f64, second: f64, third: f64, name: &str) -> Result<f64, String> {
     let factors = [first, second, third];
     if factors.iter().any(|value| !value.is_finite()) {
         return Err(format!("{name} factors must be finite; got {factors:?}"));
@@ -3464,6 +3463,22 @@ mod tests {
         let error =
             architecture_matched_random_weight_null(observed.view(), donor.view(), 9).unwrap_err();
         assert!(error.contains("zero scale"), "{error}");
+    }
+
+    #[test]
+    fn balanced_product_refuses_silent_positive_amplitude_underflow() {
+        let subnormal = f64::from_bits(1);
+        let error =
+            balanced_nonnegative_product(subnormal, 0.5, 0.5, "test amplitude").unwrap_err();
+        assert!(error.contains("underflows"), "{error}");
+        assert_eq!(
+            balanced_nonnegative_product(0.0, f64::MAX, f64::MAX, "zero amplitude").unwrap(),
+            0.0
+        );
+        assert_eq!(
+            balanced_nonnegative_product(1.0e-300, 1.0e300, 2.0, "balanced amplitude").unwrap(),
+            2.0
+        );
     }
 
     #[test]

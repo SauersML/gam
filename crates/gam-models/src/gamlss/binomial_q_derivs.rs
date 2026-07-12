@@ -684,8 +684,7 @@ mod tests {
 
     #[test]
     fn probit_closed_form_keeps_deep_tail_curvature_and_subnormal_channels() {
-        let (m1, m2, m3) =
-            binomial_neglog_q_derivatives_probit_closed_form(0.0, 1.0, 1.0e100);
+        let (m1, m2, m3) = binomial_neglog_q_derivatives_probit_closed_form(0.0, 1.0, 1.0e100);
         assert_eq!(m1, 1.0e100);
         assert_eq!(m2, 1.0);
         assert!(m3 > 0.0 && m3.is_finite());
@@ -694,8 +693,7 @@ mod tests {
             0.0
         );
 
-        let (m1, m2, m3) =
-            binomial_neglog_q_derivatives_probit_closed_form(1.0, 1.0, 38.6);
+        let (m1, m2, m3) = binomial_neglog_q_derivatives_probit_closed_form(1.0, 1.0, 38.6);
         assert_eq!(m1, 0.0);
         assert!(m2 > 0.0 && m2.is_subnormal());
         assert!(m3 < 0.0 && m3.is_subnormal());

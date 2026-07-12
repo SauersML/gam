@@ -105,11 +105,9 @@ impl<'a> RemlState<'a> {
     /// Undo the fixed observation-weight row scale used by Firth reduced
     /// designs.
     ///
-    /// Keep this distinct from PIRLS's sparse-SpGEMM `sqrt_weights` cache in
-    /// `solver/pirls.rs`: PIRLS materializes roots of the current working
-    /// weights for a Gram factorization, while this uses stored fixed
-    /// case-weight roots and their reciprocals to map reduced design
-    /// derivatives back to raw design space.
+    /// These stored fixed case-weight roots and reciprocals map reduced design
+    /// derivatives back to raw design space. PIRLS's moving sparse Gram uses
+    /// the signed asymmetric factorization `(X^T W) X` and has no root cache.
     #[inline]
     pub(crate) fn scale_rows_by_inverse_observation_weight_sqrt(
         out: &mut Array2<f64>,

@@ -1413,8 +1413,8 @@ impl HyperOperator for SparseDirectionalHyperOperator {
 }
 
 /// Matrix-free GLM cubic-correction drift `C[v] = −Xᵀ diag(c ⊙ X v) X`
-/// (rows masked to the active Hessian-curvature surface, sign folded into
-/// the stored diagonal).
+/// on the exact represented Hessian-curvature surface (sign folded into the
+/// stored diagonal).
 ///
 /// # Why this must stay an operator (#901 layer 2)
 ///
