@@ -322,7 +322,7 @@ fn validate_cause_specific_block(
 }
 
 row_atom! {
-    fn cause_specific_row [order2, third, fourth](
+    fn cause_specific_row [generic, order2, third, fourth](
         eta_exit,
         eta_entry,
         derivative;
@@ -343,6 +343,73 @@ struct CauseSpecificAtomInput {
     weight: f64,
     entry_active: f64,
     event: f64,
+}
+
+/// Production [`gam_math::jet_tower::RowProgram`] for one cause-specific
+/// Royston-Parmar row.
+///
+/// The generic evaluator and the live specialized order-2/third/fourth
+/// lowerings are all emitted from [`cause_specific_row`]. Predictor values are
+/// ordered as exit index, entry index, and positive spline derivative; entry
+/// and event activity remain row constants.
+pub struct CauseSpecificRowProgram {
+    primary: [f64; 3],
+    weight: f64,
+    entry_active: f64,
+    event: f64,
+}
+
+impl CauseSpecificRowProgram {
+    /// Construct one canonical predictor-space row program.
+    pub fn new(
+        primary: [f64; 3],
+        weight: f64,
+        entry_active: bool,
+        event: bool,
+    ) -> Self {
+        Self {
+            primary,
+            weight,
+            entry_active: f64::from(entry_active),
+            event: f64::from(event),
+        }
+    }
+
+    fn require_row(row: usize) -> Result<(), String> {
+        if row != 0 {
+            return Err(format!(
+                "CauseSpecificRowProgram holds exactly one row; got row {row}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl gam_math::jet_tower::RowProgram<3> for CauseSpecificRowProgram {
+    fn n_rows(&self) -> usize {
+        1
+    }
+
+    fn primaries(&self, row: usize) -> Result<[f64; 3], String> {
+        Self::require_row(row)?;
+        Ok(self.primary)
+    }
+
+    fn eval<S: gam_math::jet_scalar::JetScalar<3>>(
+        &self,
+        row: usize,
+        p: &[S; 3],
+    ) -> Result<S, String> {
+        Self::require_row(row)?;
+        Ok(cause_specific_row(
+            &p[0],
+            &p[1],
+            &p[2],
+            self.weight,
+            self.entry_active,
+            self.event,
+        ))
+    }
 }
 
 /// Validate one live row and canonicalise inactive entry/event primaries to
@@ -3235,55 +3302,13 @@ mod tests {
     /// `cause_specific_hessian_second_directional_derivative`) and pins each
     /// channel against the universal gam-math jet at ≤1e-9, plus an independent
     /// central-difference witness of the live third/fourth against the live lower
-    /// order. Production now derives every channel from its generated row
-    /// expression; this independently restated test program is only an oracle.
+    /// order. The generic production program and every specialized channel are
+    /// emitted from the same row declaration.
     mod jet_cause_specific_production_parity {
         use super::*;
-        use gam_math::jet_scalar::JetScalar;
         use gam_math::jet_tower::{
-            RowProgram, program_fourth_contracted, program_row_kernel, program_third_contracted,
+            program_fourth_contracted, program_row_kernel, program_third_contracted,
         };
-
-        /// The cause-specific row NLL written ONCE through the jet scalar:
-        /// `ℓ = w·[e^{η1} − 1{entry}·e^{η0} − δ·(η1 + ln s)]`, additively separable
-        /// over the three predictors (primary 0 = exit index `η1`, primary 1 =
-        /// entry index `η0`, primary 2 = spline derivative `s > 0`). The entry gate
-        /// `1{entry}` and event gate `δ` enter as per-row constants.
-        struct CauseSpecificJetRow {
-            has_entry: bool,
-            event: bool,
-            w: f64,
-            base: [f64; 3],
-        }
-
-        impl RowProgram<3> for CauseSpecificJetRow {
-            fn n_rows(&self) -> usize {
-                1
-            }
-            fn primaries(&self, row: usize) -> Result<[f64; 3], String> {
-                if row != 0 {
-                    return Err(format!(
-                        "CauseSpecificJetRow holds exactly one row; got row {row}"
-                    ));
-                }
-                Ok(self.base)
-            }
-            fn eval<S: JetScalar<3>>(&self, row: usize, p: &[S; 3]) -> Result<S, String> {
-                if row != 0 {
-                    return Err(format!(
-                        "CauseSpecificJetRow holds exactly one row; got row {row}"
-                    ));
-                }
-                let mut ell = p[0].exp();
-                if self.has_entry {
-                    ell = ell.sub(&p[1].exp());
-                }
-                if self.event {
-                    ell = ell.sub(&p[0].add(&p[2].ln()));
-                }
-                Ok(ell.scale(self.w))
-            }
-        }
 
         /// A single-row cause-specific block with the design collapsed to the 3×3
         /// identity (`x_exit = e0`, `x_entry = e1`, `x_derivative = e2`, zero
@@ -3326,12 +3351,12 @@ mod tests {
             let v_beta = array![-0.2_f64, 0.8_f64, -0.4_f64];
             let w = 1.4_f64;
             let block = identity_block(w, has_entry, event);
-            let prog = CauseSpecificJetRow {
+            let prog = crate::survival::CauseSpecificRowProgram::new(
+                [beta[0], beta[1], beta[2]],
+                w,
                 has_entry,
                 event,
-                w,
-                base: [beta[0], beta[1], beta[2]],
-            };
+            );
             let label = format!("entry={has_entry} event={event}");
 
             // ── Value / gradient / Hessian: LIVE evaluate vs jet ──────────────
