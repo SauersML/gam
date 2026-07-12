@@ -261,28 +261,28 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
             for out_col in 0..p {
                 let tower = prog.reconstruction_column::<K>(out_col);
                 let g_floor = (0..K)
-                    .map(|a| jets.first[a][out_col].abs())
+                    .map(|a| jets.first(a)[out_col].abs())
                     .fold(1e-12_f64, f64::max);
                 let h_floor = (0..K)
                     .flat_map(|a| (0..K).map(move |b| (a, b)))
-                    .map(|(a, b)| jets.second[a][b][out_col].abs())
+                    .map(|(a, b)| jets.second(a, b)[out_col].abs())
                     .fold(1e-12_f64, f64::max);
                 for a in 0..K {
                     let want = sqrt_row_w * tower.g[a];
                     assert!(
-                        (jets.first[a][out_col] - want).abs() <= 1e-9 * g_floor,
+                        (jets.first(a)[out_col] - want).abs() <= 1e-9 * g_floor,
                         "weighted={weighted} row {row} col {out_col} first[{a}]: \
                              production {} vs tower {}",
-                        jets.first[a][out_col],
+                        jets.first(a)[out_col],
                         want
                     );
                     for b in 0..K {
                         let want2 = sqrt_row_w * tower.h[a][b];
                         assert!(
-                            (jets.second[a][b][out_col] - want2).abs() <= 1e-9 * h_floor,
+                            (jets.second(a, b)[out_col] - want2).abs() <= 1e-9 * h_floor,
                             "weighted={weighted} row {row} col {out_col} \
                                  second[{a}][{b}]: production {} vs tower {}",
-                            jets.second[a][b][out_col],
+                            jets.second(a, b)[out_col],
                             want2
                         );
                     }
@@ -312,12 +312,12 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                     let want_v = sqrt_row_w * s.v * out_c;
                     let v_floor = want_v.abs().max(1e-12);
                     assert!(
-                        (jets.beta[beta_pos][out_col] - want_v).abs() <= 1e-9 * v_floor,
+                        (jets.beta(beta_pos)[out_col] - want_v).abs() <= 1e-9 * v_floor,
                         "weighted={weighted} row {row} col {out_col} \
                          beta[{beta_pos}] (atom {} basis {}): production {} vs tower {}",
                         channel.atom,
                         channel.basis_col,
-                        jets.beta[beta_pos][out_col],
+                        jets.beta(beta_pos)[out_col],
                         want_v
                     );
                     for a in 0..K {
@@ -328,19 +328,19 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                         // produces (the hand path fills both identically); both
                         // must equal the tower's first-derivative channel × out_c.
                         assert!(
-                            (jets.beta_deriv[a][beta_pos][out_col] - want_d).abs()
+                            (jets.beta_deriv(a, beta_pos)[out_col] - want_d).abs()
                                 <= 1e-9 * d_floor,
                             "weighted={weighted} row {row} col {out_col} \
                              beta_deriv[{a}][{beta_pos}]: production {} vs tower {}",
-                            jets.beta_deriv[a][beta_pos][out_col],
+                            jets.beta_deriv(a, beta_pos)[out_col],
                             want_d
                         );
                         assert!(
-                            (jets.beta_l_deriv[a][beta_pos][out_col] - want_d).abs()
+                            (jets.beta_l_deriv(a, beta_pos)[out_col] - want_d).abs()
                                 <= 1e-9 * d_floor,
                             "weighted={weighted} row {row} col {out_col} \
                              beta_l_deriv[{a}][{beta_pos}]: production {} vs tower {}",
-                            jets.beta_l_deriv[a][beta_pos][out_col],
+                            jets.beta_l_deriv(a, beta_pos)[out_col],
                             want_d
                         );
                     }

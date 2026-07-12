@@ -597,8 +597,8 @@ fn softmax_logit_dual_channel_report_2156(
 
     for a in 0..jets.vars.len() {
         for b in 0..jets.vars.len() {
-            let entry = sae_dot(&jets.second[a][local_w], &jets.first[b])
-                + sae_dot(&jets.first[a], &jets.second[b][local_w]);
+            let entry = sae_dot(jets.second(a, local_w), jets.first(b))
+                + sae_dot(jets.first(a), jets.second(b, local_w));
             tt_data[[base + a, base + b]] = entry;
         }
     }
@@ -617,8 +617,8 @@ fn softmax_logit_dual_channel_report_2156(
 
     for a in 0..jets.vars.len() {
         for (beta_pos, channel) in border.iter().enumerate() {
-            let entry = sae_dot(&jets.second[a][local_w], &jets.beta[beta_pos])
-                + sae_dot(&jets.first[a], &jets.beta_deriv[local_w][beta_pos]);
+            let entry = sae_dot(jets.second(a, local_w), jets.beta(beta_pos))
+                + sae_dot(jets.first(a), jets.beta_deriv(local_w, beta_pos));
             let t_idx = base + a;
             let b_idx = total_t + channel.index;
             t_beta[[t_idx, b_idx]] = entry;
@@ -627,8 +627,8 @@ fn softmax_logit_dual_channel_report_2156(
     }
     for (beta_i, channel_i) in border.iter().enumerate() {
         for (beta_j, channel_j) in border.iter().enumerate() {
-            let entry = sae_dot(&jets.beta_deriv[local_w][beta_i], &jets.beta[beta_j])
-                + sae_dot(&jets.beta[beta_i], &jets.beta_deriv[local_w][beta_j]);
+            let entry = sae_dot(jets.beta_deriv(local_w, beta_i), jets.beta(beta_j))
+                + sae_dot(jets.beta(beta_i), jets.beta_deriv(local_w, beta_j));
             beta_beta[[total_t + channel_i.index, total_t + channel_j.index]] = entry;
         }
     }
@@ -1237,8 +1237,8 @@ pub(crate) fn sae_logdet_theta_adjoint_logit0_dense_trace_localization_2156() {
     };
     for a in 0..jets.vars.len() {
         for b in 0..jets.vars.len() {
-            let mut entry = sae_dot(&jets.second[a][local_w], &jets.first[b])
-                + sae_dot(&jets.first[a], &jets.second[b][local_w]);
+            let mut entry = sae_dot(jets.second(a, local_w), jets.first(b))
+                + sae_dot(jets.first(a), jets.second(b, local_w));
             if let (
                 SaeLocalRowVar::Logit { atom: atom_a },
                 SaeLocalRowVar::Logit { atom: atom_b },
@@ -1255,8 +1255,8 @@ pub(crate) fn sae_logdet_theta_adjoint_logit0_dense_trace_localization_2156() {
     }
     for a in 0..jets.vars.len() {
         for (beta_pos, channel) in border.iter().enumerate() {
-            let entry = sae_dot(&jets.second[a][local_w], &jets.beta[beta_pos])
-                + sae_dot(&jets.first[a], &jets.beta_deriv[local_w][beta_pos]);
+            let entry = sae_dot(jets.second(a, local_w), jets.beta(beta_pos))
+                + sae_dot(jets.first(a), jets.beta_deriv(local_w, beta_pos));
             let global_a = base + a;
             let global_beta = total_t + channel.index;
             dh[[global_a, global_beta]] = entry;
@@ -1265,8 +1265,8 @@ pub(crate) fn sae_logdet_theta_adjoint_logit0_dense_trace_localization_2156() {
     }
     for (beta_i, channel_i) in border.iter().enumerate() {
         for (beta_j, channel_j) in border.iter().enumerate() {
-            let entry = sae_dot(&jets.beta_deriv[local_w][beta_i], &jets.beta[beta_j])
-                + sae_dot(&jets.beta[beta_i], &jets.beta_deriv[local_w][beta_j]);
+            let entry = sae_dot(jets.beta_deriv(local_w, beta_i), jets.beta(beta_j))
+                + sae_dot(jets.beta(beta_i), jets.beta_deriv(local_w, beta_j));
             dh[[total_t + channel_i.index, total_t + channel_j.index]] = entry;
         }
     }

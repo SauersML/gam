@@ -30,6 +30,10 @@ fn block_log_lambda_gradient_matches_central_difference() {
     let block_rss = [30.0_f64, 12.0, 7.5];
     let dims = [5usize, 3, 2];
     let log_lambda = [0.2_f64, -0.5, 0.9];
+    // Nonzero envelope-priced penalty energy `P` (#2228): held constant w.r.t.
+    // `log λ_ℓ`, so the analytic gradient (which prices `P` into `pooled'`) must
+    // still equal the central difference of the value that prices the SAME `P`.
+    let penalty_energy = 15.0_f64;
 
     let analytic = profiled_penalized_quasi_laplace_block_log_lambda_gradient(
         n_obs,
@@ -38,6 +42,7 @@ fn block_log_lambda_gradient_matches_central_difference() {
         &block_rss,
         &dims,
         &log_lambda,
+        penalty_energy,
     );
     assert_eq!(analytic.len(), block_rss.len());
 
@@ -47,10 +52,23 @@ fn block_log_lambda_gradient_matches_central_difference() {
         let mut minus = log_lambda;
         plus[l] += h;
         minus[l] -= h;
-        let c_plus =
-            profiled_penalized_quasi_laplace_criterion(n_obs, p_x, rss_x, &block_rss, &dims, &plus);
+        let c_plus = profiled_penalized_quasi_laplace_criterion(
+            n_obs,
+            p_x,
+            rss_x,
+            &block_rss,
+            &dims,
+            &plus,
+            penalty_energy,
+        );
         let c_minus = profiled_penalized_quasi_laplace_criterion(
-            n_obs, p_x, rss_x, &block_rss, &dims, &minus,
+            n_obs,
+            p_x,
+            rss_x,
+            &block_rss,
+            &dims,
+            &minus,
+            penalty_energy,
         );
         let fd = (c_plus - c_minus) / (2.0 * h);
         let tol = 1e-5 * (1.0 + analytic[l].abs());
@@ -76,11 +94,13 @@ fn gradient_and_efs_step_vanish_at_variance_ratio_fixed_point() {
     let rss_x = 24.0_f64;
     let block_rss = [50.0_f64, 9.0];
     let dims = [4usize, 3];
+    let penalty_energy = 10.0_f64;
 
-    // Each block seeded at its variance-ratio root; because the pooled residual
-    // couples the coordinates, the per-coordinate gradient only vanishes when ALL
-    // blocks sit at their root together (which they do here).
-    let var_x = rss_x / p_x as f64;
+    // Each block seeded at its penalty-priced variance-ratio root
+    // `λ_ℓ* = ((R_x+P)/p_x)/(R_ℓ/d_ℓ)`; because the pooled residual couples the
+    // coordinates, the per-coordinate gradient only vanishes when ALL blocks sit
+    // at their root together (which they do here).
+    let var_x = (rss_x + penalty_energy) / p_x as f64;
     let log_lambda: Vec<f64> = block_rss
         .iter()
         .zip(dims.iter())
@@ -94,6 +114,7 @@ fn gradient_and_efs_step_vanish_at_variance_ratio_fixed_point() {
         &block_rss,
         &dims,
         &log_lambda,
+        penalty_energy,
     );
     for (l, g) in grad.iter().enumerate() {
         assert!(
@@ -108,6 +129,7 @@ fn gradient_and_efs_step_vanish_at_variance_ratio_fixed_point() {
         &block_rss,
         &dims,
         &log_lambda,
+        penalty_energy,
     );
     for (l, s) in steps.iter().enumerate() {
         assert!(
@@ -128,6 +150,7 @@ fn one_efs_step_reaches_the_variance_ratio_root() {
     let block_rss = [8.0_f64, 40.0];
     let dims = [3usize, 5];
     let log_lambda = [1.3_f64, -2.1]; // far from the root
+    let penalty_energy = 22.0_f64;
 
     let steps = profiled_penalized_quasi_laplace_block_efs_log_lambda_steps(
         p_x,
@@ -135,8 +158,9 @@ fn one_efs_step_reaches_the_variance_ratio_root() {
         &block_rss,
         &dims,
         &log_lambda,
+        penalty_energy,
     );
-    let var_x = rss_x / p_x as f64;
+    let var_x = (rss_x + penalty_energy) / p_x as f64;
     for l in 0..block_rss.len() {
         let root = (var_x / (block_rss[l] / dims[l] as f64)).ln();
         assert!(
@@ -157,6 +181,7 @@ fn unidentifiable_block_is_held() {
     let block_rss = [0.0_f64, 6.0]; // block 0 perfectly reconstructed
     let dims = [2usize, 3];
     let log_lambda = [0.0_f64, 0.0];
+    let penalty_energy = 5.0_f64;
 
     let steps = profiled_penalized_quasi_laplace_block_efs_log_lambda_steps(
         p_x,
@@ -164,6 +189,7 @@ fn unidentifiable_block_is_held() {
         &block_rss,
         &dims,
         &log_lambda,
+        penalty_energy,
     );
     assert_eq!(steps[0], 0.0, "unidentifiable block must be held");
     assert!(steps[1] != 0.0, "identifiable block must still move");

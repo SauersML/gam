@@ -309,8 +309,7 @@ impl SaeManifoldTerm {
         program: &crate::row_jet_program::SaeReconstructionRowProgram,
         arena: &gam_math::jet_scalar::DynamicJetArena,
         sqrt_row_w: f64,
-        first: &mut [Vec<f64>],
-        second: &mut [Vec<Vec<f64>>],
+        channels: &mut crate::row_jet_program::SaeScheduledRowJets,
     ) {
         // Build every output column at once with the per-atom gate / basis jets
         // hoisted out of the column loop (#932 perf): the softmax gate jet and
@@ -323,9 +322,9 @@ impl SaeManifoldTerm {
             let g = tower.g();
             let h = tower.h();
             for a in 0..q {
-                first[a][out_col] = sqrt_row_w * g[a];
+                channels.first_mut(a)[out_col] = sqrt_row_w * g[a];
                 for b in 0..q {
-                    second[a][b][out_col] = sqrt_row_w * h[a * q + b];
+                    channels.second_mut(a, b)[out_col] = sqrt_row_w * h[a * q + b];
                 }
             }
         }
@@ -336,9 +335,7 @@ impl SaeManifoldTerm {
         arena: &gam_math::jet_scalar::DynamicJetArena,
         sqrt_row_w: f64,
         border: &[SaeBorderChannel],
-        beta: &mut [Vec<f64>],
-        beta_deriv: &mut [Vec<Vec<f64>>],
-        beta_l_deriv: &mut [Vec<Vec<f64>>],
+        channels: &mut crate::row_jet_program::SaeScheduledRowJets,
     ) {
         let p = program.out_dim();
         // s = ζ_k(ℓ)·Φ_b(t_k) over the local (logit/coord) primaries, built from
@@ -363,13 +360,13 @@ impl SaeManifoldTerm {
             let s_g = s.g();
             for out_col in 0..p {
                 let out_c = channel.output[out_col];
-                beta[beta_pos][out_col] = sqrt_row_w * s_v * out_c;
+                channels.beta_mut(beta_pos)[out_col] = sqrt_row_w * s_v * out_c;
                 for a in 0..q {
                     // Reconstruction is linear in β, so beta_deriv and
                     // beta_l_deriv are the identical mixed ∂²ẑ_c/∂β∂p_a channel.
                     let mixed = sqrt_row_w * s_g[a] * out_c;
-                    beta_deriv[a][beta_pos][out_col] = mixed;
-                    beta_l_deriv[a][beta_pos][out_col] = mixed;
+                    channels.beta_deriv_mut(a, beta_pos)[out_col] = mixed;
+                    channels.beta_l_deriv_mut(a, beta_pos)[out_col] = mixed;
                 }
             }
         }
@@ -379,6 +376,15 @@ impl SaeManifoldTerm {
 #[cfg(test)]
 mod tests_softmax_hand_reference {
     use super::*;
+
+    pub(crate) struct LegacySaeRowJets {
+        pub(crate) vars: Vec<SaeLocalRowVar>,
+        pub(crate) first: Vec<Vec<f64>>,
+        pub(crate) second: Vec<Vec<Vec<f64>>>,
+        pub(crate) beta: Vec<Vec<f64>>,
+        pub(crate) beta_deriv: Vec<Vec<Vec<f64>>>,
+        pub(crate) beta_l_deriv: Vec<Vec<Vec<f64>>>,
+    }
 
     impl SaeManifoldTerm {
         /// `∂²g_k/∂t_{ik,axis_a}∂t_{ik,axis_b}` for one row/atom: the decoded second
@@ -670,7 +676,7 @@ mod tests_softmax_hand_reference {
             assignments: ArrayView1<'_, f64>,
             second_jets: &[Array4<f64>],
             border: &[SaeBorderChannel],
-        ) -> SaeRowJets {
+        ) -> LegacySaeRowJets {
             let p = self.output_dim();
             let q = vars.len();
             let sqrt_row_w = self
@@ -699,7 +705,7 @@ mod tests_softmax_hand_reference {
                 &mut beta_deriv,
                 &mut beta_l_deriv,
             );
-            SaeRowJets {
+            LegacySaeRowJets {
                 vars,
                 first,
                 second,
@@ -726,7 +732,7 @@ impl SaeManifoldTerm {
             .row_loss_weights
             .as_deref()
             .map_or(1.0, |w| w[row].sqrt());
-        let (first, second, beta, beta_deriv, beta_l_deriv) = match self.assignment.mode {
+        let channels = match self.assignment.mode {
             AssignmentMode::Softmax { temperature, .. } => {
                 // Structure-compiled unified row program: the borrowed adapter
                 // reads the same live tensors as the former hand kernel, while
@@ -746,13 +752,7 @@ impl SaeManifoldTerm {
                 let scheduled = crate::row_jet_program::execute_softmax_row_program(
                     &source, inv_tau, sqrt_row_w,
                 );
-                (
-                    scheduled.first,
-                    scheduled.second,
-                    scheduled.beta,
-                    scheduled.beta_deriv,
-                    scheduled.beta_l_deriv,
-                )
+                scheduled
             }
             AssignmentMode::OrderedBetaBernoulli { .. }
             | AssignmentMode::ThresholdGate { .. }
@@ -770,11 +770,11 @@ impl SaeManifoldTerm {
                     assignments,
                     second_jets,
                 )?;
-                let mut first = vec![vec![0.0_f64; p]; q];
-                let mut second = vec![vec![vec![0.0_f64; p]; q]; q];
-                let mut beta = vec![vec![0.0_f64; p]; border.len()];
-                let mut beta_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
-                let mut beta_l_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
+                let mut channels = crate::row_jet_program::SaeScheduledRowJets::zeros(
+                    q,
+                    p,
+                    border.len(),
+                );
                 SAE_ROW_JET_ARENA.with(|cell| {
                     let mut arena = cell.borrow_mut();
                     arena.reset();
@@ -782,31 +782,21 @@ impl SaeManifoldTerm {
                         &program,
                         &arena,
                         sqrt_row_w,
-                        &mut first,
-                        &mut second,
+                        &mut channels,
                     );
                     Self::fill_beta_border_channels_from_program_dynamic(
                         &program,
                         &arena,
                         sqrt_row_w,
                         border,
-                        &mut beta,
-                        &mut beta_deriv,
-                        &mut beta_l_deriv,
+                        &mut channels,
                     );
                 });
-                (first, second, beta, beta_deriv, beta_l_deriv)
+                channels
             }
         };
 
-        Ok(SaeRowJets {
-            vars,
-            first,
-            second,
-            beta,
-            beta_deriv,
-            beta_l_deriv,
-        })
+        Ok(SaeRowJets { vars, channels })
     }
 }
 

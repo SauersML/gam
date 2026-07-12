@@ -723,10 +723,10 @@ impl SaeManifoldTerm {
             rhs_beta.fill(0.0);
             let base = cache.row_offsets[row];
             for local in 0..jets.vars.len() {
-                rhs_t[base + local] = sae_dot(&jets.first[local], &error_metric);
+                rhs_t[base + local] = sae_dot(jets.first(local), &error_metric);
             }
             for (beta_pos, channel) in border.iter().enumerate() {
-                rhs_beta[channel.index] += sae_dot(&jets.beta[beta_pos], &error_metric);
+                rhs_beta[channel.index] += sae_dot(jets.beta(beta_pos), &error_metric);
             }
             let rhs = SaeArrowVector {
                 t: rhs_t.clone(),

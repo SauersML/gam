@@ -279,6 +279,23 @@ impl SaeManifoldTerm {
             let base_unscaled: Vec<f64> = (0..blocks.len())
                 .map(|i| base_scaled[i] / cur_log_lambda[i].exp())
                 .collect();
+            // Envelope-priced penalty energy `P` of the CURRENT-λ refit (#2228):
+            // twice the non-data-fit penalized-objective energy the inner engine
+            // drove to (`P = 2·(penalized_objective_total − data_fit)` — decoder
+            // smoothness + ARD + assignment prior + any analytic-registry energy).
+            // Since `2e178664f` the inner engine returns the PENALIZED-objective
+            // fixed point, so its residuals carry the penalty trade-off; pricing
+            // `P` into the pooled dispersion is what restores the envelope theorem
+            // (the profiled criterion's total λ-derivative equals its partial), so
+            // the closed-form `λ*` is exact again. Held FIXED across a sweep's λ
+            // moves (it is a fitted-state quantity, not an explicit λ function).
+            let base_pen = 2.0
+                * (self.penalized_objective_total(
+                    base_aug.view(),
+                    rho,
+                    analytic_penalties,
+                    1.0,
+                )? - base_loss.data_fit);
             let baseline_crit = profiled_penalized_quasi_laplace_criterion(
                 n_obs,
                 px,
@@ -286,6 +303,7 @@ impl SaeManifoldTerm {
                 &base_unscaled,
                 &dims,
                 &cur_log_lambda,
+                base_pen,
             );
             // The improved current-λ fit to fall back to if no λ step is accepted.
             let baseline_state = self.fit_state_snapshot();
@@ -303,7 +321,12 @@ impl SaeManifoldTerm {
                     continue;
                 }
                 let r_ell = base_unscaled[idx];
-                let var_x = base_rx / px as f64;
+                // `(R_x + P)/p_x` — the penalty-priced anchor variance. The
+                // coupled multiblock fixed point `λ_ℓ·R_ℓ = d_ℓ·pooled'/p̃`
+                // collapses to `λ_ℓ* = ((R_x+P)/p_x)/(R_ℓ/d_ℓ)`, so `P` enters
+                // the closed form only through this numerator (see
+                // `profiled_penalized_quasi_laplace_block_efs_log_lambda_steps`).
+                let var_x = (base_rx + base_pen) / px as f64;
                 if !(r_ell > 0.0) || !(var_x > 0.0) {
                     // No block residual variance ⇒ λ_ℓ unidentifiable; hold it.
                     identifiable[idx] = false;
@@ -341,6 +364,7 @@ impl SaeManifoldTerm {
                         &base_unscaled,
                         &dims,
                         &log_lambda_star,
+                        base_pen,
                     )
             } else {
                 0.0
@@ -433,6 +457,18 @@ impl SaeManifoldTerm {
                     let trb_unscaled: Vec<f64> = (0..blocks.len())
                         .map(|i| trb_scaled[i] / trial_ll[i].exp())
                         .collect();
+                    // The trial's OWN realized penalty energy `P` at its λ-trial
+                    // fitted state (same `2·(penalized_objective_total − data_fit)`
+                    // as the baseline), so the Armijo comparison `trial_crit` vs
+                    // `baseline_crit` prices each side's penalty consistently under
+                    // the envelope-corrected criterion.
+                    let trial_pen = 2.0
+                        * (self.penalized_objective_total(
+                            aug.view(),
+                            rho,
+                            analytic_penalties,
+                            1.0,
+                        )? - trial_loss.data_fit);
                     let trial_crit = profiled_penalized_quasi_laplace_criterion(
                         n_obs,
                         px,
@@ -440,6 +476,7 @@ impl SaeManifoldTerm {
                         &trb_unscaled,
                         &dims,
                         &trial_ll,
+                        trial_pen,
                     );
                     Ok(Some((trial_crit, (trial_ll, trial_loss))))
                 },

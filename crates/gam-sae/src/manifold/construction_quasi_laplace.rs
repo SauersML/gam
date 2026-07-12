@@ -3990,11 +3990,11 @@ impl SaeManifoldTerm {
                 })?;
                 Self::whiten_logdet_metric_vec(metric, row, p, &mut v)?;
             }
-            for (var_idx, first) in jets.first.iter().enumerate() {
-                t[base + var_idx] = -0.5 * sae_dot(first, &v);
+            for var_idx in 0..jets.vars.len() {
+                t[base + var_idx] = -0.5 * sae_dot(jets.first(var_idx), &v);
             }
             for (channel_pos, channel) in border.iter().enumerate() {
-                beta[channel.index] += -0.5 * sae_dot(&jets.beta[channel_pos], &v);
+                beta[channel.index] += -0.5 * sae_dot(jets.beta(channel_pos), &v);
             }
         }
         Ok(SaeArrowVector { t, beta })
@@ -4040,27 +4040,45 @@ impl SaeManifoldTerm {
             .as_ref()
             .ok_or_else(|| "logdet_theta_adjoint: whitening metric absent".to_string())?;
         let p = self.output_dim();
-        for first in jets.first.iter_mut() {
-            Self::whiten_logdet_metric_vec(metric, row, p, first)?;
+        if jets.channels.p() != p {
+            return Err(format!(
+                "logdet_theta_adjoint: packed row jet width {} != output dim {p}",
+                jets.channels.p()
+            ));
         }
-        for second_row in jets.second.iter_mut() {
-            for second in second_row.iter_mut() {
-                Self::whiten_logdet_metric_vec(metric, row, p, second)?;
+        let rank = metric.metric_rank();
+        let q = jets.channels.q();
+        let n_beta = jets.channels.n_beta();
+        let mut whitened = crate::row_jet_program::SaeScheduledRowJets::zeros(q, rank, n_beta);
+        let apply = |input: &[f64], output: &mut [f64]| {
+            for rank_col in 0..rank {
+                let mut acc = 0.0_f64;
+                for out_col in 0..p {
+                    acc += metric.factor_entry(row, out_col, rank_col) * input[out_col];
+                }
+                output[rank_col] = acc;
+            }
+        };
+        for a in 0..q {
+            apply(jets.first(a), whitened.first_mut(a));
+            for b in 0..q {
+                apply(jets.second(a, b), whitened.second_mut(a, b));
+            }
+            for beta_pos in 0..n_beta {
+                apply(
+                    jets.beta_deriv(a, beta_pos),
+                    whitened.beta_deriv_mut(a, beta_pos),
+                );
+                apply(
+                    jets.beta_l_deriv(a, beta_pos),
+                    whitened.beta_l_deriv_mut(a, beta_pos),
+                );
             }
         }
-        for beta in jets.beta.iter_mut() {
-            Self::whiten_logdet_metric_vec(metric, row, p, beta)?;
+        for beta_pos in 0..n_beta {
+            apply(jets.beta(beta_pos), whitened.beta_mut(beta_pos));
         }
-        for beta_deriv_row in jets.beta_deriv.iter_mut() {
-            for beta_deriv in beta_deriv_row.iter_mut() {
-                Self::whiten_logdet_metric_vec(metric, row, p, beta_deriv)?;
-            }
-        }
-        for beta_l_deriv_row in jets.beta_l_deriv.iter_mut() {
-            for beta_l_deriv in beta_l_deriv_row.iter_mut() {
-                Self::whiten_logdet_metric_vec(metric, row, p, beta_l_deriv)?;
-            }
-        }
+        jets.channels = whitened;
         Ok(())
     }
 
@@ -4359,14 +4377,14 @@ impl SaeManifoldTerm {
                                 SaeLocalRowVar::Coord { atom: atom_a, .. },
                                 SaeLocalRowVar::Coord { atom: atom_b, .. },
                             ) => {
-                                let h_ab = sae_dot(&jets.first[a], &jets.first[b]);
+                                let h_ab = sae_dot(jets.first(a), jets.first(b));
                                 h_ab * Self::softmax_data_weight_product_logit_factor(
                                     a_soft, atom_a, atom_b, atom_w, inv_tau,
                                 )
                             }
                             _ => {
-                                sae_dot(&jets.second[a][w], &jets.first[b])
-                                    + sae_dot(&jets.first[a], &jets.second[b][w])
+                                sae_dot(jets.second(a, w), jets.first(b))
+                                    + sae_dot(jets.first(a), jets.second(b, w))
                             }
                         };
                         // `∂D/∂z_w` is diagonal, so it contributes only when the two
@@ -4421,15 +4439,15 @@ impl SaeManifoldTerm {
                 }
                 for a in 0..q {
                     for (beta_pos, channel) in border.iter().enumerate() {
-                        let dh = sae_dot(&jets.second[a][w], &jets.beta[beta_pos])
-                            + sae_dot(&jets.first[a], &jets.beta_deriv[w][beta_pos]);
+                        let dh = sae_dot(jets.second(a, w), jets.beta(beta_pos))
+                            + sae_dot(jets.first(a), jets.beta_deriv(w, beta_pos));
                         gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
                     }
                 }
                 for (beta_i, channel_i) in border.iter().enumerate() {
                     for (beta_j, channel_j) in border.iter().enumerate() {
-                        let dh = sae_dot(&jets.beta_deriv[w][beta_i], &jets.beta[beta_j])
-                            + sae_dot(&jets.beta[beta_i], &jets.beta_deriv[w][beta_j]);
+                        let dh = sae_dot(jets.beta_deriv(w, beta_i), jets.beta(beta_j))
+                            + sae_dot(jets.beta(beta_i), jets.beta_deriv(w, beta_j));
                         gamma += beta_inv[[channel_i.index, channel_j.index]] * dh;
                     }
                 }
@@ -4441,8 +4459,8 @@ impl SaeManifoldTerm {
                 let mut dh_mat = Array2::<f64>::zeros((q, q));
                 for a in 0..q {
                     for b in 0..q {
-                        let dh = sae_dot(&jets.beta_l_deriv[a][w_beta_pos], &jets.first[b])
-                            + sae_dot(&jets.first[a], &jets.beta_l_deriv[b][w_beta_pos]);
+                        let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.first(b))
+                            + sae_dot(jets.first(a), jets.beta_l_deriv(b, w_beta_pos));
                         dh_mat[[a, b]] = dh;
                         gamma += inv_vv[[b, a]] * dh;
                     }
@@ -4457,7 +4475,10 @@ impl SaeManifoldTerm {
                 }
                 for a in 0..q {
                     for (beta_pos, channel) in border.iter().enumerate() {
-                        let dh = sae_dot(&jets.beta_l_deriv[a][w_beta_pos], &jets.beta[beta_pos]);
+                        let dh = sae_dot(
+                            jets.beta_l_deriv(a, w_beta_pos),
+                            jets.beta(beta_pos),
+                        );
                         gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
                     }
                 }
@@ -4710,7 +4731,11 @@ impl SaeManifoldTerm {
 
             // Precompute the β–β fold carriers P_l, R_l (w-independent) per probe.
             let bjet_len = if k_border > 0 {
-                jets.beta.first().map_or(0, Vec::len)
+                if jets.channels.n_beta() == 0 {
+                    0
+                } else {
+                    jets.channels.p()
+                }
             } else {
                 0
             };
@@ -4723,7 +4748,7 @@ impl SaeManifoldTerm {
                     for (beta_pos, channel) in border.iter().enumerate() {
                         let zc = probes[l][channel.index];
                         let sc = sinv_probes[l][channel.index];
-                        let bj = &jets.beta[beta_pos];
+                        let bj = jets.beta(beta_pos);
                         for c in 0..bjet_len {
                             p_l[c] += zc * bj[c];
                             r_l[c] += sc * bj[c];
@@ -4768,14 +4793,14 @@ impl SaeManifoldTerm {
                                 SaeLocalRowVar::Coord { atom: atom_a, .. },
                                 SaeLocalRowVar::Coord { atom: atom_b, .. },
                             ) => {
-                                let h_ab = sae_dot(&jets.first[a], &jets.first[b]);
+                                let h_ab = sae_dot(jets.first(a), jets.first(b));
                                 h_ab * Self::softmax_data_weight_product_logit_factor(
                                     a_soft, atom_a, atom_b, atom_w, inv_tau,
                                 )
                             }
                             _ => {
-                                sae_dot(&jets.second[a][w], &jets.first[b])
-                                    + sae_dot(&jets.first[a], &jets.second[b][w])
+                                sae_dot(jets.second(a, w), jets.first(b))
+                                    + sae_dot(jets.first(a), jets.second(b, w))
                             }
                         };
                         if let (
@@ -4813,8 +4838,8 @@ impl SaeManifoldTerm {
                 // t–β block: reuse the dense contraction with the reconstructed inv_vβ.
                 for a in 0..q {
                     for (beta_pos, channel) in border.iter().enumerate() {
-                        let dh = sae_dot(&jets.second[a][w], &jets.beta[beta_pos])
-                            + sae_dot(&jets.first[a], &jets.beta_deriv[w][beta_pos]);
+                        let dh = sae_dot(jets.second(a, w), jets.beta(beta_pos))
+                            + sae_dot(jets.first(a), jets.beta_deriv(w, beta_pos));
                         gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
                     }
                 }
@@ -4826,7 +4851,7 @@ impl SaeManifoldTerm {
                         for (beta_pos, channel) in border.iter().enumerate() {
                             let zc = probes[l][channel.index];
                             let sc = sinv_probes[l][channel.index];
-                            let bd = &jets.beta_deriv[w][beta_pos];
+                            let bd = jets.beta_deriv(w, beta_pos);
                             for c in 0..bjet_len {
                                 q_l[c] += zc * bd[c];
                                 rd_l[c] += sc * bd[c];
@@ -4842,14 +4867,17 @@ impl SaeManifoldTerm {
                 let mut gamma = 0.0_f64;
                 for a in 0..q {
                     for b in 0..q {
-                        let dh = sae_dot(&jets.beta_l_deriv[a][w_beta_pos], &jets.first[b])
-                            + sae_dot(&jets.first[a], &jets.beta_l_deriv[b][w_beta_pos]);
+                        let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.first(b))
+                            + sae_dot(jets.first(a), jets.beta_l_deriv(b, w_beta_pos));
                         gamma += inv_vv[[b, a]] * dh;
                     }
                 }
                 for a in 0..q {
                     for (beta_pos, channel) in border.iter().enumerate() {
-                        let dh = sae_dot(&jets.beta_l_deriv[a][w_beta_pos], &jets.beta[beta_pos]);
+                        let dh = sae_dot(
+                            jets.beta_l_deriv(a, w_beta_pos),
+                            jets.beta(beta_pos),
+                        );
                         gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
                     }
                 }

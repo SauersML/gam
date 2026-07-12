@@ -450,7 +450,7 @@ impl SaeManifoldTerm {
             for a in 0..q {
                 let mut acc = 0.0_f64;
                 for b in 0..q {
-                    let r_ab = sae_dot(&error_metric, &jets.second[a][b]);
+                    let r_ab = sae_dot(&error_metric, jets.second(a, b));
                     acc += r_ab * v_t[b];
                 }
                 out.t[base + a] += acc;
@@ -459,7 +459,7 @@ impl SaeManifoldTerm {
             //      `jets.beta_deriv[a][β]` = ∂(∂f/∂β_β)/∂θ_a (the mixed second jet).
             for a in 0..q {
                 for (beta_pos, channel) in border.iter().enumerate() {
-                    let r_ab = sae_dot(&error_metric, &jets.beta_deriv[a][beta_pos]);
+                    let r_ab = sae_dot(&error_metric, jets.beta_deriv(a, beta_pos));
                     // t row picks up β leg of v; β row picks up t leg of v.
                     out.t[base + a] += r_ab * v.beta[channel.index];
                     out.beta[channel.index] += r_ab * v_t[a];

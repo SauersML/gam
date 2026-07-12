@@ -7362,8 +7362,17 @@ mod tests {
                     samples,
                 );
             let pair_count = dimension * (dimension + 1) / 2;
+            let order2_width = 1 + dimension + pair_count;
             let vgh_reference_bundle_allocs = 2 * (1 + dimension + pair_count);
             let contracted_reference_bundle_allocs = 2 * pair_count;
+            eprintln!(
+                "LATENT-ONE-PASS-OPS-932 K={dimension} signed-term-reductions/state VGH {}->{order2_width} T3 {}->{} T4 {}->{}",
+                1 + 2 * dimension + 4 * pair_count,
+                8 * pair_count,
+                2 * order2_width,
+                16 * pair_count,
+                4 * order2_width,
+            );
             eprintln!(
                 "LATENT-ONE-PASS-932 K={dimension} VGH prechange={vgh_reference_us:.3}us one-pass={vgh_one_pass_us:.3}us ratio={vgh_ratio:.4} speedup={:.2}x bundle-Vec-allocs={vgh_reference_bundle_allocs}->2; T3 prechange={third_reference_us:.3}us one-pass={third_one_pass_us:.3}us ratio={third_ratio:.4} speedup={:.2}x bundle-Vec-allocs={contracted_reference_bundle_allocs}->2; T4 prechange={fourth_reference_us:.3}us one-pass={fourth_one_pass_us:.3}us ratio={fourth_ratio:.4} speedup={:.2}x bundle-Vec-allocs={contracted_reference_bundle_allocs}->2; FULL-3PASS prechange={full_reference_us:.3}us one-pass={full_one_pass_us:.3}us ratio={full_ratio:.4} speedup={:.2}x bundle-Vec-allocs={}->6; FULL-COMBINED prechange={combined_reference_us:.3}us one-pass={combined_one_pass_us:.3}us ratio={combined_ratio:.4} speedup={:.2}x bundle-Vec-allocs={}->2; derivative-plan-heap-allocs=0 three-pass-output-ndarray-allocs=4->4 combined-output-ndarray-allocs=5->0",
                 1.0 / vgh_ratio,
