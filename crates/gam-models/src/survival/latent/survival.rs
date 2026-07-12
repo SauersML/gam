@@ -6199,6 +6199,43 @@ mod tests {
             max_relative_array2(&dh, &fd_dh) < 2e-4,
             "latent binary workspace dH mismatch: dh={dh:?}, fd={fd_dh:?}"
         );
+
+        let direction_v = array![-0.15, 0.25, 0.08, -0.12];
+        let d2h = family
+            .exact_newton_joint_hessiansecond_directional_derivative(
+                &states,
+                &direction,
+                &direction_v,
+            )
+            .expect("latent binary d2H")
+            .expect("latent binary should expose d2H");
+        let d2_step = 4e-4;
+        let dh_plus = family
+            .exact_newton_joint_hessian_directional_derivative(
+                &latent_binary_states_from_joint_beta(
+                    &family,
+                    &(array![0.15, 0.25, 0.1, -0.15] + d2_step * &direction_v),
+                ),
+                &direction,
+            )
+            .expect("latent binary dH plus")
+            .expect("latent binary should expose dH plus");
+        let dh_minus = family
+            .exact_newton_joint_hessian_directional_derivative(
+                &latent_binary_states_from_joint_beta(
+                    &family,
+                    &(array![0.15, 0.25, 0.1, -0.15] - d2_step * &direction_v),
+                ),
+                &direction,
+            )
+            .expect("latent binary dH minus")
+            .expect("latent binary should expose dH minus");
+        let fd_d2h = (dh_plus - dh_minus) / (2.0 * d2_step);
+        let d2h_rel = frobenius_relative_array2(&d2h, &fd_d2h);
+        assert!(
+            d2h_rel < 2e-2,
+            "latent binary combined TwoSeed d2H mismatch: rel={d2h_rel}, analytic={d2h:?}, fd={fd_d2h:?}"
+        );
     }
 
     #[test]
@@ -6736,8 +6773,22 @@ mod tests {
         mu: f64,
         sigma: f64,
     ) -> LatentFullPrimaryChannels {
-        let direction_u = array![0.17, -0.11, 0.09, 0.13, -0.07, 0.05];
-        let direction_v = array![-0.08, 0.14, -0.06, 0.04, 0.12, -0.09];
+        let direction_u = array![
+            0.17,
+            -0.11,
+            0.09,
+            0.13,
+            -0.07,
+            if include_log_sigma { 0.05 } else { 0.0 }
+        ];
+        let direction_v = array![
+            -0.08,
+            0.14,
+            -0.06,
+            0.04,
+            0.12,
+            if include_log_sigma { -0.09 } else { 0.0 }
+        ];
         if use_multidir_reference {
             let (value, gradient, hessian) =
                 latent_survival_row_primary_gradient_hessian_multidir_reference(
@@ -6963,6 +7014,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn latent_survival_derivative_support_stays_inline_932() {
+        let base_terms = [
+            LatentKernelPrimaryTerm {
+                coeff: 0.08,
+                q_exp: 0,
+                qdot_power: 0,
+                tau_exp: 0,
+                k: 0,
+            },
+            LatentKernelPrimaryTerm {
+                coeff: 1.0,
+                q_exp: 1,
+                qdot_power: 1,
+                tau_exp: 0,
+                k: 1,
+            },
+        ];
+        let primary: [LatentKernelPrimaryDirection; LATENT_SURVIVAL_PRIMARY_DIM] =
+            std::array::from_fn(|a| {
+                latent_survival_map_exit_direction(
+                    latent_survival_basis_direction(a),
+                    LatentSurvivalEventType::ExactEvent,
+                )
+            });
+        let u_coeff = [0.17, -0.11, 0.09, 0.13, -0.07, 0.05];
+        let v_coeff = [-0.08, 0.14, -0.06, 0.04, 0.12, -0.09];
+        let u = latent_kernel_direction_linear_combination(&primary, &u_coeff);
+        let v = latent_kernel_direction_linear_combination(&primary, &v_coeff);
+        let suffix_u = [u];
+        let suffix_v = [v];
+        let suffix_uv = [u, v];
+        let suffixes: [&[LatentKernelPrimaryDirection]; 4] =
+            [&[], &suffix_u, &suffix_v, &suffix_uv];
+        let mut maximum_support = 0usize;
+        for suffix in suffixes {
+            for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+                for b in a..LATENT_SURVIVAL_PRIMARY_DIM {
+                    let terms = latent_kernel_term_sequence_inline(
+                        &base_terms,
+                        &[primary[a], primary[b]],
+                        suffix,
+                    );
+                    assert!(!terms.spilled(), "derivative term support spilled to heap");
+                    maximum_support = maximum_support.max(terms.len());
+                }
+            }
+        }
+        eprintln!(
+            "LATENT-ONE-PASS-932 derivative-support max_terms={maximum_support} inline_capacity={LATENT_TERM_INLINE_CAPACITY} heap_allocations=0"
+        );
+        assert!(maximum_support <= LATENT_TERM_INLINE_CAPACITY);
+    }
+
     fn best_elapsed_seconds(mut run: impl FnMut(), iterations: usize, samples: usize) -> f64 {
         let mut best = f64::INFINITY;
         for _ in 0..samples {
@@ -7008,12 +7113,26 @@ mod tests {
         let q_right = 0.5;
         let mu = -0.15;
         let sigma = 0.3_f64.exp();
-        let direction_u = array![0.17, -0.11, 0.09, 0.13, -0.07, 0.05];
-        let direction_v = array![-0.08, 0.14, -0.06, 0.04, 0.12, -0.09];
         let iterations = if cfg!(debug_assertions) { 1 } else { 5 };
         let samples = if cfg!(debug_assertions) { 1 } else { 3 };
 
         for include_log_sigma in [false, true] {
+            let direction_u = array![
+                0.17,
+                -0.11,
+                0.09,
+                0.13,
+                -0.07,
+                if include_log_sigma { 0.05 } else { 0.0 }
+            ];
+            let direction_v = array![
+                -0.08,
+                0.14,
+                -0.06,
+                0.04,
+                0.12,
+                if include_log_sigma { -0.09 } else { 0.0 }
+            ];
             let dimension = if include_log_sigma { 6 } else { 5 };
             let (vgh_reference_us, vgh_one_pass_us, vgh_ratio) = measured_channel_ratio(
                 || {
@@ -7149,22 +7268,118 @@ mod tests {
                 iterations,
                 samples,
             );
+            let (combined_reference_us, combined_one_pass_us, combined_ratio) =
+                measured_channel_ratio(
+                    || {
+                        std::hint::black_box(
+                            latent_survival_row_primary_gradient_hessian_multidir_reference(
+                                &quadctx,
+                                &row,
+                                q_entry,
+                                q_exit,
+                                qdot_exit,
+                                q_right,
+                                mu,
+                                sigma,
+                                include_log_sigma,
+                            )
+                            .expect("prechange combined VGH"),
+                        );
+                        for direction in [&direction_u, &direction_v] {
+                            std::hint::black_box(
+                                latent_survival_row_primary_third_contracted_multidir_reference(
+                                    &quadctx,
+                                    &row,
+                                    q_entry,
+                                    q_exit,
+                                    qdot_exit,
+                                    q_right,
+                                    mu,
+                                    sigma,
+                                    direction,
+                                    include_log_sigma,
+                                )
+                                .expect("prechange combined third"),
+                            );
+                        }
+                        std::hint::black_box(
+                            latent_survival_row_primary_fourth_contracted_multidir_reference(
+                                &quadctx,
+                                &row,
+                                q_entry,
+                                q_exit,
+                                qdot_exit,
+                                q_right,
+                                mu,
+                                sigma,
+                                &direction_u,
+                                &direction_v,
+                                include_log_sigma,
+                            )
+                            .expect("prechange combined fourth"),
+                        );
+                    },
+                    || {
+                        if include_log_sigma {
+                            let backend = LatentTwoSeedBackend {
+                                direction_u: std::array::from_fn(|a| direction_u[a]),
+                                direction_v: std::array::from_fn(|a| direction_v[a]),
+                            };
+                            std::hint::black_box(
+                                latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_DIM, _>(
+                                    &backend,
+                                    &quadctx,
+                                    &row,
+                                    q_entry,
+                                    q_exit,
+                                    qdot_exit,
+                                    q_right,
+                                    mu,
+                                    sigma,
+                                    sigma.ln(),
+                                )
+                                .expect("combined K6 TwoSeed"),
+                            );
+                        } else {
+                            std::hint::black_box(
+                                latent_survival_row_primary_two_seed_fixed_sigma(
+                                    &quadctx,
+                                    &row,
+                                    q_entry,
+                                    q_exit,
+                                    qdot_exit,
+                                    q_right,
+                                    mu,
+                                    sigma,
+                                    &direction_u,
+                                    &direction_v,
+                                )
+                                .expect("combined K5 TwoSeed"),
+                            );
+                        }
+                    },
+                    iterations,
+                    samples,
+                );
             let pair_count = dimension * (dimension + 1) / 2;
             let vgh_reference_bundle_allocs = 2 * (1 + dimension + pair_count);
             let contracted_reference_bundle_allocs = 2 * pair_count;
             eprintln!(
-                "LATENT-ONE-PASS-932 K={dimension} VGH prechange={vgh_reference_us:.3}us one-pass={vgh_one_pass_us:.3}us ratio={vgh_ratio:.4} speedup={:.2}x bundle-Vec-allocs={vgh_reference_bundle_allocs}->2; T3 prechange={third_reference_us:.3}us one-pass={third_one_pass_us:.3}us ratio={third_ratio:.4} speedup={:.2}x bundle-Vec-allocs={contracted_reference_bundle_allocs}->2; T4 prechange={fourth_reference_us:.3}us one-pass={fourth_one_pass_us:.3}us ratio={fourth_ratio:.4} speedup={:.2}x bundle-Vec-allocs={contracted_reference_bundle_allocs}->2; FULL prechange={full_reference_us:.3}us one-pass={full_one_pass_us:.3}us ratio={full_ratio:.4} speedup={:.2}x bundle-Vec-allocs={}->6; derivative-plan-heap-allocs=0 output-ndarray-allocs=4->4",
+                "LATENT-ONE-PASS-932 K={dimension} VGH prechange={vgh_reference_us:.3}us one-pass={vgh_one_pass_us:.3}us ratio={vgh_ratio:.4} speedup={:.2}x bundle-Vec-allocs={vgh_reference_bundle_allocs}->2; T3 prechange={third_reference_us:.3}us one-pass={third_one_pass_us:.3}us ratio={third_ratio:.4} speedup={:.2}x bundle-Vec-allocs={contracted_reference_bundle_allocs}->2; T4 prechange={fourth_reference_us:.3}us one-pass={fourth_one_pass_us:.3}us ratio={fourth_ratio:.4} speedup={:.2}x bundle-Vec-allocs={contracted_reference_bundle_allocs}->2; FULL-3PASS prechange={full_reference_us:.3}us one-pass={full_one_pass_us:.3}us ratio={full_ratio:.4} speedup={:.2}x bundle-Vec-allocs={}->6; FULL-COMBINED prechange={combined_reference_us:.3}us one-pass={combined_one_pass_us:.3}us ratio={combined_ratio:.4} speedup={:.2}x bundle-Vec-allocs={}->2; derivative-plan-heap-allocs=0 three-pass-output-ndarray-allocs=4->4 combined-output-ndarray-allocs=5->0",
                 1.0 / vgh_ratio,
                 1.0 / third_ratio,
                 1.0 / fourth_ratio,
                 1.0 / full_ratio,
                 vgh_reference_bundle_allocs + 2 * contracted_reference_bundle_allocs,
+                1.0 / combined_ratio,
+                vgh_reference_bundle_allocs + 3 * contracted_reference_bundle_allocs,
             );
             for (channel, ratio) in [
                 ("VGH", vgh_ratio),
                 ("T3", third_ratio),
                 ("T4", fourth_ratio),
-                ("full", full_ratio),
+                ("full-3pass", full_ratio),
+                ("full-combined", combined_ratio),
             ] {
                 assert!(
                     ratio < 1.0,

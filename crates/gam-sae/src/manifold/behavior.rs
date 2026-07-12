@@ -1059,10 +1059,10 @@ pub fn stack_augmented_target(
 
 /// The multi-block profiled penalized quasi-Laplace criterion (the quantity minimised over the
 /// block weights), evaluated at a fitted state's UNSCALED residual sums of
-/// squares. Up to `log λ`-independent constants it is
+/// squares and its penalty energy. Up to `log λ`-independent constants it is
 ///
 /// ```text
-///   C = (n·p̃/2)·log((R_x + Σ_ℓ λ_ℓ·R_ℓ)/(n·p̃)) − Σ_ℓ (n·p_ℓ/2)·log λ_ℓ ,
+///   C = (n·p̃/2)·log((R_x + Σ_ℓ λ_ℓ·R_ℓ + P)/(n·p̃)) − Σ_ℓ (n·p_ℓ/2)·log λ_ℓ ,
 /// ```
 ///
 /// (`p̃ = p_x + Σ p_ℓ`, `n = n_obs`), the profiled Gaussian negative-log-marginal
@@ -1075,6 +1075,29 @@ pub fn stack_augmented_target(
 /// backtracking) is monotone and cannot diverge; its stationary point is the
 /// same per-block variance ratio the closed form targets.
 ///
+/// # The penalty term `P` and the envelope theorem (#2228)
+///
+/// `penalty_energy = P` is TWICE the non-data-fit penalized-objective energy the
+/// inner engine drives to at the fitted state, i.e. `P = 2·(penalized_objective_total
+/// − data_fit)` (decoder smoothness + ARD + assignment prior + any analytic
+/// registry / repulsion / barrier energy, each entering `½·φ⁻¹` of the Gaussian
+/// exponent under the mgcv scaled-prior convention). The FACTOR OF TWO is not
+/// cosmetic: the inner solve makes `∂(½·pooled_raw + ½·P)/∂θ̂ = 0` at the fitted
+/// `θ̂ = (decoder, coords, logits)`, so `pooled' = pooled_raw + P` obeys
+/// `∂pooled'/∂θ̂ = 2·∂(inner objective)/∂θ̂ = 0`. That is exactly the condition for
+/// the envelope theorem to cancel the fitted-state response of the profiled
+/// criterion, so `dC/d log λ_ℓ` equals its EXPLICIT partial and the closed-form
+/// variance-ratio `λ*` is again the exact per-block minimiser at held residuals.
+///
+/// This term was UNNECESSARY (P ≡ 0 was exact) only while the inner engine
+/// returned the near-LS data-fit residuals. It became load-bearing at
+/// `2e178664f` ("invert the inner engine — block sweeps first"), which made
+/// `run_joint_fit_arrow_schur` converge to the PENALIZED-objective fixed point:
+/// the returned residuals then carry the penalty trade-off, the RSS-only pooled
+/// broke the envelope, and the two-block λ-sweep stalled (the closed-form `λ*`
+/// proposed moves the truncated-refit criterion refused). Pricing `P` inside the
+/// pooled dispersion restores value/`λ*` coherence against that engine.
+///
 /// Returns `+∞` for a non-positive pooled residual (an invalid state a caller's
 /// line search should reject).
 pub fn profiled_penalized_quasi_laplace_criterion(
@@ -1084,6 +1107,7 @@ pub fn profiled_penalized_quasi_laplace_criterion(
     block_rss_unscaled: &[f64],
     block_dims: &[usize],
     block_log_lambda: &[f64],
+    penalty_energy: f64,
 ) -> f64 {
     let n = n_obs as f64;
     let mut p_tilde = p_x as f64;
@@ -1098,6 +1122,9 @@ pub fn profiled_penalized_quasi_laplace_criterion(
         p_tilde += dim as f64;
         jac += (dim as f64) * log_lambda;
     }
+    // Price the fitted-state penalty energy into the pooled dispersion (envelope
+    // term — held fixed w.r.t. `log λ_ℓ`, see the item comment above).
+    pooled += penalty_energy;
     if !(pooled > 0.0) {
         return f64::INFINITY;
     }
@@ -1111,21 +1138,23 @@ pub fn profiled_penalized_quasi_laplace_criterion(
 /// only the EXPLICIT `λ_ℓ`-dependence of the profiled criterion survives:
 ///
 /// ```text
-///   ∂C/∂(log λ_ℓ) = (n·p̃/2) · λ_ℓ·R_ℓ / (R_x + Σ_m λ_m·R_m)  −  n·p_ℓ/2 ,
+///   ∂C/∂(log λ_ℓ) = (n·p̃/2) · λ_ℓ·R_ℓ / (R_x + Σ_m λ_m·R_m + P)  −  n·p_ℓ/2 ,
 /// ```
 ///
 /// (`p̃ = p_x + Σ p_ℓ`), the exact derivative of the profiled Gaussian
-/// negative-log-marginal (`d pooled/d log λ_ℓ = λ_ℓ R_ℓ`) plus the `√λ_ℓ`
-/// target-scaling Jacobian (`d(−½ n Σ p_m log λ_m)/d log λ_ℓ = −½ n p_ℓ`). This is
+/// negative-log-marginal (`d pooled/d log λ_ℓ = λ_ℓ R_ℓ`; the envelope-priced
+/// penalty `P` is held fixed, see [`profiled_penalized_quasi_laplace_criterion`])
+/// plus the `√λ_ℓ` target-scaling Jacobian
+/// (`d(−½ n Σ p_m log λ_m)/d log λ_ℓ = −½ n p_ℓ`). This is
 /// the desync-safe (#2087) partner of the value in [`profiled_penalized_quasi_laplace_criterion`] —
 /// they are a consistent `(value, gradient)` pair, FD-verified in
 /// `tests_crosscoder_block_fd_2231.rs`.
 ///
 /// The per-coordinate stationary point `λ_ℓ·R_ℓ = (p_ℓ/p̃)·pooled` is met exactly
-/// by the joint variance-ratio fixed point `λ_ℓ = (R_x/p_x)/(R_ℓ/p_ℓ)` (substitute
-/// and use `pooled = R_x·p̃/p_x` there), so the analytic gradient and the
-/// closed-form EFS step ([`profiled_penalized_quasi_laplace_block_efs_log_lambda_steps`]) agree at the
-/// optimum — the coherence the planted two-layer test pins.
+/// by the joint variance-ratio fixed point `λ_ℓ = ((R_x+P)/p_x)/(R_ℓ/p_ℓ)`
+/// (substitute and use `pooled = (R_x+P)·p̃/p_x` there), so the analytic gradient
+/// and the closed-form EFS step ([`profiled_penalized_quasi_laplace_block_efs_log_lambda_steps`])
+/// agree at the optimum — the coherence the planted two-layer test pins.
 ///
 /// Returns all-zero for a non-positive pooled residual (the criterion is then
 /// `+∞`; a caller's line search rejects the value and must not consume a NaN
@@ -1137,6 +1166,7 @@ pub fn profiled_penalized_quasi_laplace_block_log_lambda_gradient(
     block_rss_unscaled: &[f64],
     block_dims: &[usize],
     block_log_lambda: &[f64],
+    penalty_energy: f64,
 ) -> Vec<f64> {
     let n = n_obs as f64;
     let mut p_tilde = p_x as f64;
@@ -1149,6 +1179,7 @@ pub fn profiled_penalized_quasi_laplace_block_log_lambda_gradient(
         pooled += log_lambda.exp() * rss;
         p_tilde += dim as f64;
     }
+    pooled += penalty_energy;
     if !(pooled > 0.0) {
         return vec![0.0; block_rss_unscaled.len()];
     }
@@ -1173,14 +1204,24 @@ pub fn profiled_penalized_quasi_laplace_block_log_lambda_gradient(
 /// residual variance (`R_ℓ ≤ 0`, or a non-positive anchor variance) is
 /// unidentifiable and HELD (step 0), matching the M1 driver's `identifiable`
 /// gate.
+///
+/// `penalty_energy = P` (the envelope-priced fitted-state penalty; see
+/// [`profiled_penalized_quasi_laplace_criterion`]) enters ONLY through the
+/// anchor-variance numerator `R_x → R_x + P`: solving the coupled multiblock
+/// fixed point `λ_ℓ·R_ℓ = d_ℓ·pooled'/p̃` (with `pooled' = R_x + Σ λ_m R_m + P`)
+/// simultaneously over all ℓ collapses — via `Σ_ℓ λ_ℓ R_ℓ = (Σ d_ℓ)·pooled'/p̃`
+/// and `p̃ − Σ d_ℓ = p_x` — to `pooled' = p̃·(R_x+P)/p_x`, hence the per-block
+/// closed form `λ_ℓ* = ((R_x+P)/p_x)/(R_ℓ/d_ℓ)`. `P = 0` recovers the historical
+/// pure variance ratio exactly.
 pub fn profiled_penalized_quasi_laplace_block_efs_log_lambda_steps(
     p_x: usize,
     rss_x: f64,
     block_rss_unscaled: &[f64],
     block_dims: &[usize],
     block_log_lambda: &[f64],
+    penalty_energy: f64,
 ) -> Vec<f64> {
-    let var_x = rss_x / p_x as f64;
+    let var_x = (rss_x + penalty_energy) / p_x as f64;
     block_rss_unscaled
         .iter()
         .zip(block_dims.iter())

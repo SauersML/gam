@@ -620,11 +620,59 @@ pub(crate) struct SaeBorderChannel {
 #[derive(Debug, Clone)]
 pub(crate) struct SaeRowJets {
     pub(crate) vars: Vec<SaeLocalRowVar>,
-    pub(crate) first: Vec<Vec<f64>>,
-    pub(crate) second: Vec<Vec<Vec<f64>>>,
-    pub(crate) beta: Vec<Vec<f64>>,
-    pub(crate) beta_deriv: Vec<Vec<Vec<f64>>>,
-    pub(crate) beta_l_deriv: Vec<Vec<Vec<f64>>>,
+    pub(crate) channels: crate::row_jet_program::SaeScheduledRowJets,
+}
+
+impl SaeRowJets {
+    #[inline]
+    pub(crate) fn first(&self, primary: usize) -> &[f64] {
+        self.channels.first(primary)
+    }
+
+    #[inline]
+    pub(crate) fn first_mut(&mut self, primary: usize) -> &mut [f64] {
+        self.channels.first_mut(primary)
+    }
+
+    #[inline]
+    pub(crate) fn second(&self, a: usize, b: usize) -> &[f64] {
+        self.channels.second(a, b)
+    }
+
+    #[inline]
+    pub(crate) fn second_mut(&mut self, a: usize, b: usize) -> &mut [f64] {
+        self.channels.second_mut(a, b)
+    }
+
+    #[inline]
+    pub(crate) fn beta(&self, border: usize) -> &[f64] {
+        self.channels.beta(border)
+    }
+
+    #[inline]
+    pub(crate) fn beta_mut(&mut self, border: usize) -> &mut [f64] {
+        self.channels.beta_mut(border)
+    }
+
+    #[inline]
+    pub(crate) fn beta_deriv(&self, primary: usize, border: usize) -> &[f64] {
+        self.channels.beta_deriv(primary, border)
+    }
+
+    #[inline]
+    pub(crate) fn beta_deriv_mut(&mut self, primary: usize, border: usize) -> &mut [f64] {
+        self.channels.beta_deriv_mut(primary, border)
+    }
+
+    #[inline]
+    pub(crate) fn beta_l_deriv(&self, primary: usize, border: usize) -> &[f64] {
+        self.channels.beta_l_deriv(primary, border)
+    }
+
+    #[inline]
+    pub(crate) fn beta_l_deriv_mut(&mut self, primary: usize, border: usize) -> &mut [f64] {
+        self.channels.beta_l_deriv_mut(primary, border)
+    }
 }
 
 pub(crate) fn sae_dot(a: &[f64], b: &[f64]) -> f64 {

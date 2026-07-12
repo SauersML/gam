@@ -768,14 +768,144 @@ pub(crate) trait SaeSoftmaxRowProgramSource {
     fn beta_border_output(&self, border: usize) -> &[f64];
 }
 
-/// Complete order-≤2 channels emitted by [`execute_softmax_row_program`].
-/// The layout matches the log-det consumer without an intermediate dense jet.
+/// Complete order-≤2 channels emitted by [`execute_softmax_row_program`], in
+/// one packed allocation. Logical shapes are `first[q,p]`, `second[q,q,p]`,
+/// `beta[n_beta,p]`, and two mixed arrays `[q,n_beta,p]`.
+#[derive(Debug, Clone)]
 pub(crate) struct SaeScheduledRowJets {
-    pub first: Vec<Vec<f64>>,
-    pub second: Vec<Vec<Vec<f64>>>,
-    pub beta: Vec<Vec<f64>>,
-    pub beta_deriv: Vec<Vec<Vec<f64>>>,
-    pub beta_l_deriv: Vec<Vec<Vec<f64>>>,
+    data: Vec<f64>,
+    q: usize,
+    p: usize,
+    n_beta: usize,
+}
+
+impl SaeScheduledRowJets {
+    pub(crate) fn zeros(q: usize, p: usize, n_beta: usize) -> Self {
+        let first = q.checked_mul(p);
+        let second = q.checked_mul(q).and_then(|value| value.checked_mul(p));
+        let beta = n_beta.checked_mul(p);
+        let mixed = q
+            .checked_mul(n_beta)
+            .and_then(|value| value.checked_mul(p));
+        // SAFETY: a dimension product that cannot fit `usize` cannot describe a
+        // realizable allocation; fail before a wrapped length aliases channels.
+        let total = first
+            .and_then(|value| second.and_then(|next| value.checked_add(next)))
+            .and_then(|value| beta.and_then(|next| value.checked_add(next)))
+            .and_then(|value| {
+                mixed.and_then(|next| next.checked_mul(2).and_then(|twice| value.checked_add(twice)))
+            })
+            .expect("SAE row-jet packed channel length overflow");
+        Self {
+            data: vec![0.0; total],
+            q,
+            p,
+            n_beta,
+        }
+    }
+
+    #[inline]
+    fn second_offset(&self) -> usize {
+        self.q * self.p
+    }
+
+    #[inline]
+    fn beta_offset(&self) -> usize {
+        self.second_offset() + self.q * self.q * self.p
+    }
+
+    #[inline]
+    fn beta_deriv_offset(&self) -> usize {
+        self.beta_offset() + self.n_beta * self.p
+    }
+
+    #[inline]
+    fn beta_l_deriv_offset(&self) -> usize {
+        self.beta_deriv_offset() + self.q * self.n_beta * self.p
+    }
+
+    #[inline]
+    pub(crate) fn q(&self) -> usize {
+        self.q
+    }
+
+    #[inline]
+    pub(crate) fn p(&self) -> usize {
+        self.p
+    }
+
+    #[inline]
+    pub(crate) fn n_beta(&self) -> usize {
+        self.n_beta
+    }
+
+    #[inline]
+    pub(crate) fn first(&self, primary: usize) -> &[f64] {
+        let start = primary * self.p;
+        &self.data[start..start + self.p]
+    }
+
+    #[inline]
+    pub(crate) fn first_mut(&mut self, primary: usize) -> &mut [f64] {
+        let start = primary * self.p;
+        &mut self.data[start..start + self.p]
+    }
+
+    #[inline]
+    pub(crate) fn second(&self, a: usize, b: usize) -> &[f64] {
+        let start = self.second_offset() + (a * self.q + b) * self.p;
+        &self.data[start..start + self.p]
+    }
+
+    #[inline]
+    pub(crate) fn second_mut(&mut self, a: usize, b: usize) -> &mut [f64] {
+        let start = self.second_offset() + (a * self.q + b) * self.p;
+        &mut self.data[start..start + self.p]
+    }
+
+    #[inline]
+    pub(crate) fn beta(&self, border: usize) -> &[f64] {
+        let start = self.beta_offset() + border * self.p;
+        &self.data[start..start + self.p]
+    }
+
+    #[inline]
+    pub(crate) fn beta_mut(&mut self, border: usize) -> &mut [f64] {
+        let start = self.beta_offset() + border * self.p;
+        &mut self.data[start..start + self.p]
+    }
+
+    #[inline]
+    pub(crate) fn beta_deriv(&self, primary: usize, border: usize) -> &[f64] {
+        let start = self.beta_deriv_offset() + (primary * self.n_beta + border) * self.p;
+        &self.data[start..start + self.p]
+    }
+
+    #[inline]
+    pub(crate) fn beta_deriv_mut(&mut self, primary: usize, border: usize) -> &mut [f64] {
+        let start = self.beta_deriv_offset() + (primary * self.n_beta + border) * self.p;
+        &mut self.data[start..start + self.p]
+    }
+
+    #[inline]
+    pub(crate) fn beta_l_deriv(&self, primary: usize, border: usize) -> &[f64] {
+        let start = self.beta_l_deriv_offset() + (primary * self.n_beta + border) * self.p;
+        &self.data[start..start + self.p]
+    }
+
+    #[inline]
+    pub(crate) fn beta_l_deriv_mut(&mut self, primary: usize, border: usize) -> &mut [f64] {
+        let start = self.beta_l_deriv_offset() + (primary * self.n_beta + border) * self.p;
+        &mut self.data[start..start + self.p]
+    }
+
+    pub(crate) fn first_rows(&self) -> impl Iterator<Item = &[f64]> {
+        self.data[..self.second_offset()].chunks_exact(self.p)
+    }
+
+    pub(crate) fn all_values_mut(&mut self) -> &mut [f64] {
+        &mut self.data
+    }
 }
 
 /// The derivative algebra of `Y = Σ_k z_k D_k`, where `z = softmax(r ℓ)`.
@@ -815,9 +945,12 @@ impl<S: SaeSoftmaxRowProgramSource> SoftmaxMoment<'_, S> {
     #[inline]
     fn gate_first(&self, gated_atom: usize, logit_atom: usize) -> f64 {
         let diagonal = if gated_atom == logit_atom { 1.0 } else { 0.0 };
-        self.inv_tau
-            * self.source.gate_value(gated_atom)
+        // Preserve the historical/tower rounding order `z * (...) * r`; this
+        // channel is later multiplied by tiny beta-border outputs, where one
+        // earlier rounding can dominate a relative-only oracle.
+        self.source.gate_value(gated_atom)
             * (diagonal - self.source.gate_value(logit_atom))
+            * self.inv_tau
     }
 }
 
@@ -838,13 +971,7 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
     let p = source.out_dim();
     let q = source.n_primaries();
     let n_beta = source.n_beta_borders();
-    let mut out = SaeScheduledRowJets {
-        first: vec![vec![0.0; p]; q],
-        second: vec![vec![vec![0.0; p]; q]; q],
-        beta: vec![vec![0.0; p]; n_beta],
-        beta_deriv: vec![vec![vec![0.0; p]; n_beta]; q],
-        beta_l_deriv: vec![vec![vec![0.0; p]; n_beta]; q],
-    };
+    let mut out = SaeScheduledRowJets::zeros(q, p, n_beta);
 
     // Compile the row's variable layout once.  Dense softmax uses the reduced
     // K-1 logit chart; compact active-set rows may contain coordinates only.
@@ -889,8 +1016,8 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
     for &(slot_j, atom_j) in &logits {
         let centered_j = &decoded[atom_j * p..(atom_j + 1) * p];
         let first_coefficient = sqrt_row_w * moment.expectation_first_coefficient(atom_j);
-        for c in 0..p {
-            out.first[slot_j][c] = first_coefficient * centered_j[c];
+        for (target, &value) in out.first_mut(slot_j).iter_mut().zip(centered_j) {
+            *target = first_coefficient * value;
         }
         for &(slot_l, atom_l) in &logits {
             let centered_l = &decoded[atom_l * p..(atom_l + 1) * p];
@@ -898,9 +1025,8 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
                 moment.expectation_second_coefficients(atom_j, atom_l);
             let j_coefficient = sqrt_row_w * j_coefficient;
             let l_coefficient = sqrt_row_w * l_coefficient;
-            for c in 0..p {
-                out.second[slot_j][slot_l][c] =
-                    j_coefficient * centered_j[c] + l_coefficient * centered_l[c];
+            for (c, target) in out.second_mut(slot_j, slot_l).iter_mut().enumerate() {
+                *target = j_coefficient * centered_j[c] + l_coefficient * centered_l[c];
             }
         }
     }
@@ -914,15 +1040,25 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
         }
         source.fill_decoded_first(atom, axis, &mut scratch);
         let z = source.gate_value(atom);
-        for c in 0..p {
-            out.first[coord_slot][c] = sqrt_row_w * z * scratch[c];
+        let coordinate_coefficient = z * sqrt_row_w;
+        for (target, &value) in out.first_mut(coord_slot).iter_mut().zip(&scratch) {
+            *target = coordinate_coefficient * value;
         }
         for &(logit_slot, logit_atom) in &logits {
-            let coefficient = sqrt_row_w * moment.gate_first(atom, logit_atom);
-            for c in 0..p {
-                let mixed = coefficient * scratch[c];
-                out.second[logit_slot][coord_slot][c] = mixed;
-                out.second[coord_slot][logit_slot][c] = mixed;
+            let coefficient = moment.gate_first(atom, logit_atom) * sqrt_row_w;
+            for (target, &value) in out
+                .second_mut(logit_slot, coord_slot)
+                .iter_mut()
+                .zip(&scratch)
+            {
+                *target = coefficient * value;
+            }
+            for (target, &value) in out
+                .second_mut(coord_slot, logit_slot)
+                .iter_mut()
+                .zip(&scratch)
+            {
+                *target = coefficient * value;
             }
         }
     }
@@ -938,9 +1074,9 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
                 continue;
             }
             source.fill_decoded_second(atom_a, axis_a, axis_b, &mut scratch);
-            let coefficient = sqrt_row_w * source.gate_value(atom_a);
-            for c in 0..p {
-                out.second[slot_a][slot_b][c] = coefficient * scratch[c];
+            let coefficient = source.gate_value(atom_a) * sqrt_row_w;
+            for (target, &value) in out.second_mut(slot_a, slot_b).iter_mut().zip(&scratch) {
+                *target = coefficient * value;
             }
         }
     }
@@ -956,28 +1092,39 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
         }
         let phi = source.beta_border_basis_value(border);
         let output = source.beta_border_output(border);
-        let base = sqrt_row_w * source.gate_value(atom) * phi;
-        for c in 0..p {
-            out.beta[border][c] = base * output[c];
+        let base = source.gate_value(atom) * phi * sqrt_row_w;
+        for (target, &value) in out.beta_mut(border).iter_mut().zip(output) {
+            *target = base * value;
         }
         for &(slot, logit_atom) in &logits {
-            let scalar = sqrt_row_w * moment.gate_first(atom, logit_atom) * phi;
-            for c in 0..p {
-                let mixed = scalar * output[c];
-                out.beta_deriv[slot][border][c] = mixed;
-                out.beta_l_deriv[slot][border][c] = mixed;
+            let scalar = moment.gate_first(atom, logit_atom) * phi * sqrt_row_w;
+            for (target, &value) in out.beta_deriv_mut(slot, border).iter_mut().zip(output) {
+                *target = scalar * value;
+            }
+            for (target, &value) in out
+                .beta_l_deriv_mut(slot, border)
+                .iter_mut()
+                .zip(output)
+            {
+                *target = scalar * value;
             }
         }
         for &(slot, coord_atom, axis) in &coords {
             if coord_atom != atom {
                 continue;
             }
-            let scalar =
-                sqrt_row_w * source.gate_value(atom) * source.beta_border_basis_first(border, axis);
-            for c in 0..p {
-                let mixed = scalar * output[c];
-                out.beta_deriv[slot][border][c] = mixed;
-                out.beta_l_deriv[slot][border][c] = mixed;
+            let scalar = source.gate_value(atom)
+                * source.beta_border_basis_first(border, axis)
+                * sqrt_row_w;
+            for (target, &value) in out.beta_deriv_mut(slot, border).iter_mut().zip(output) {
+                *target = scalar * value;
+            }
+            for (target, &value) in out
+                .beta_l_deriv_mut(slot, border)
+                .iter_mut()
+                .zip(output)
+            {
+                *target = scalar * value;
             }
         }
     }
@@ -2100,6 +2247,169 @@ mod tests {
         let mut imbalanced = softmax_fixture_k(4, 1, 4, 7, 4.0);
         imbalanced.logits = vec![35.0, 2.0, -18.0, -40.0];
         check::<8>(imbalanced, 4.0);
+    }
+
+    /// Conditioning-aware beta-border derivative oracle.  The compiled gate
+    /// channel is checked against both double-double softmax arithmetic and an
+    /// independent five-point derivative of `z_k(ℓ) Phi` evaluated entirely in
+    /// double-double precision.  The sweep spans balanced and saturated tails and
+    /// twelve orders of border scale, so a tiny derivative is judged against the
+    /// operation's conditioning rather than an impossible relative-only floor.
+    #[test]
+    fn softmax_beta_border_gate_derivative_matches_quad_and_fd_across_tails_932() {
+        use qd::Quad;
+
+        fn q(value: f64) -> Quad {
+            Quad::from_f64(value)
+        }
+
+        fn q_to_f64(value: Quad) -> f64 {
+            value.0 + value.1
+        }
+
+        fn quad_border_value(
+            logits: &[f64],
+            inv_tau: f64,
+            gated_atom: usize,
+            logit_atom: usize,
+            displacement: f64,
+            phi: f64,
+        ) -> Quad {
+            let shifted_max = logits
+                .iter()
+                .enumerate()
+                .map(|(atom, &value)| {
+                    (value + if atom == logit_atom { displacement } else { 0.0 }) * inv_tau
+                })
+                .fold(f64::NEG_INFINITY, f64::max);
+            let exps: Vec<Quad> = logits
+                .iter()
+                .enumerate()
+                .map(|(atom, &value)| {
+                    let displaced =
+                        value + if atom == logit_atom { displacement } else { 0.0 };
+                    (q(displaced) * q(inv_tau) - q(shifted_max)).exp()
+                })
+                .collect();
+            let denominator = exps.iter().copied().fold(Quad::ZERO, |sum, value| sum + value);
+            exps[gated_atom] / denominator * q(phi)
+        }
+
+        let cases = [
+            vec![0.4, -0.7, 0.1, -0.2],
+            vec![35.0, 2.0, -18.0, -40.0],
+            vec![-35.0, -2.0, 18.0, 40.0],
+            vec![8.0, 8.0 - 1.0e-10, -8.0, -24.0],
+        ];
+        let mut comparisons = 0usize;
+        let mut max_conditioned_error = 0.0_f64;
+        let mut max_fd_conditioned_error = 0.0_f64;
+        for logits in cases {
+            for inv_tau in [0.25_f64, 1.3, 4.0] {
+                let mut program = softmax_fixture_k(4, 1, 2, 1, inv_tau);
+                program.logits.clone_from(&logits);
+                let shift = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max) * inv_tau;
+                let exps: Vec<f64> = logits
+                    .iter()
+                    .map(|&value| (value * inv_tau - shift).exp())
+                    .collect();
+                let denominator: f64 = exps.iter().sum();
+                program.gate_value = exps.iter().map(|&value| value / denominator).collect();
+                let moment = SoftmaxMoment {
+                    source: &program,
+                    inv_tau,
+                };
+                for gated_atom in 0..4 {
+                    for logit_atom in 0..4 {
+                        for phi in [1.0e-12_f64, 1.0, 1.0e12] {
+                            let got = moment.gate_first(gated_atom, logit_atom) * phi;
+                            let z_k = quad_border_value(
+                                &logits,
+                                inv_tau,
+                                gated_atom,
+                                logit_atom,
+                                0.0,
+                                1.0,
+                            );
+                            let z_j = quad_border_value(
+                                &logits,
+                                inv_tau,
+                                logit_atom,
+                                logit_atom,
+                                0.0,
+                                1.0,
+                            );
+                            let diagonal: f64 =
+                                if gated_atom == logit_atom { 1.0 } else { 0.0 };
+                            let exact = z_k * (q(diagonal) - z_j) * q(inv_tau) * q(phi);
+                            let exact_f64 = q_to_f64(exact);
+                            let condition = q_to_f64(
+                                z_k * (q(diagonal.abs()) + z_j) * q(inv_tau.abs()) * q(phi.abs()),
+                            )
+                            .abs();
+                            let error = (got - exact_f64).abs();
+                            let allowance = 64.0 * f64::EPSILON * condition + 1.0e-300;
+                            max_conditioned_error = max_conditioned_error.max(error / allowance);
+                            assert!(
+                                error <= allowance,
+                                "gate derivative tail/scale error {error:e} > {allowance:e}; \
+                                 gated={gated_atom} logit={logit_atom} r={inv_tau} phi={phi:e}"
+                            );
+
+                            let h = 1.0e-4_f64;
+                            let fm2 = quad_border_value(
+                                &logits,
+                                inv_tau,
+                                gated_atom,
+                                logit_atom,
+                                -2.0 * h,
+                                phi,
+                            );
+                            let fm1 = quad_border_value(
+                                &logits,
+                                inv_tau,
+                                gated_atom,
+                                logit_atom,
+                                -h,
+                                phi,
+                            );
+                            let fp1 = quad_border_value(
+                                &logits,
+                                inv_tau,
+                                gated_atom,
+                                logit_atom,
+                                h,
+                                phi,
+                            );
+                            let fp2 = quad_border_value(
+                                &logits,
+                                inv_tau,
+                                gated_atom,
+                                logit_atom,
+                                2.0 * h,
+                                phi,
+                            );
+                            let fd = (fm2 - q(8.0) * fm1 + q(8.0) * fp1 - fp2) / q(12.0 * h);
+                            let fd_error = (q_to_f64(fd) - exact_f64).abs();
+                            let fd_allowance = 2.0e-12 * condition + 1.0e-300;
+                            max_fd_conditioned_error =
+                                max_fd_conditioned_error.max(fd_error / fd_allowance);
+                            assert!(
+                                fd_error <= fd_allowance,
+                                "quad five-point derivative error {fd_error:e} > {fd_allowance:e}"
+                            );
+                            comparisons += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[SAE-SOFTMAX-ACCURACY-932] comparisons={comparisons} \
+             max_f64_condition_fraction={max_conditioned_error:.3e} \
+             max_quad_fd_condition_fraction={max_fd_conditioned_error:.3e}"
+        );
+        assert_eq!(comparisons, 576);
     }
 
     /// The runtime production backend must remain exact beyond the former
