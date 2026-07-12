@@ -3681,7 +3681,7 @@ impl BernoulliMarginalSlopeFamily {
     /// `rigid_third_full`).
     ///
     /// Each row's tensors are produced by the *slow* third-order cell-walk
-    /// worker (`row_primary_third_contracted_recompute_with_moments`) evaluated
+    /// worker (`row_primary_third_contracted_with_moments`) evaluated
     /// at the two primary-axis basis vectors `e_q`, `e_g` — so the cached
     /// values are the very contractions the per-axis path used to recompute,
     /// just computed once and reused.
@@ -3715,14 +3715,14 @@ impl BernoulliMarginalSlopeFamily {
             let mut e_g = Array1::<f64>::zeros(r);
             e_g[cache.primary.logslope] = 1.0;
             let row_ctx = Self::row_ctx(cache, row);
-            let t3_q = self.row_primary_third_contracted_recompute_with_moments(
+            let t3_q = self.row_primary_third_contracted_with_moments(
                 row,
                 block_states,
                 cache,
                 row_ctx,
                 &e_q,
             )?;
-            let t3_g = self.row_primary_third_contracted_recompute_with_moments(
+            let t3_g = self.row_primary_third_contracted_with_moments(
                 row,
                 block_states,
                 cache,
@@ -3761,7 +3761,7 @@ impl BernoulliMarginalSlopeFamily {
             let mut e_g = Array1::<f64>::zeros(r);
             e_g[cache.primary.logslope] = 1.0;
             let row_ctx = Self::row_ctx(cache, row);
-            let t4_qq = self.row_primary_fourth_contracted_recompute_ordered(
+            let t4_qq = self.row_primary_fourth_contracted_ordered(
                 row,
                 block_states,
                 cache,
@@ -3769,7 +3769,7 @@ impl BernoulliMarginalSlopeFamily {
                 &e_q,
                 &e_q,
             )?;
-            let t4_gg = self.row_primary_fourth_contracted_recompute_ordered(
+            let t4_gg = self.row_primary_fourth_contracted_ordered(
                 row,
                 block_states,
                 cache,
@@ -3777,7 +3777,7 @@ impl BernoulliMarginalSlopeFamily {
                 &e_g,
                 &e_g,
             )?;
-            let t4_qg_ordered = self.row_primary_fourth_contracted_recompute_ordered(
+            let t4_qg_ordered = self.row_primary_fourth_contracted_ordered(
                 row,
                 block_states,
                 cache,
@@ -3785,7 +3785,7 @@ impl BernoulliMarginalSlopeFamily {
                 &e_q,
                 &e_g,
             )?;
-            let t4_qg_swapped = self.row_primary_fourth_contracted_recompute_ordered(
+            let t4_qg_swapped = self.row_primary_fourth_contracted_ordered(
                 row,
                 block_states,
                 cache,
@@ -3814,7 +3814,7 @@ impl BernoulliMarginalSlopeFamily {
     /// already parallelize the outer row reductions with Rayon (`row_iter` /
     /// chunk `into_par_iter()` folds), which avoids nested Rayon overhead for
     /// the small per-row matrices assembled here.
-    pub(super) fn row_primary_third_contracted_recompute(
+    pub(super) fn row_primary_third_contracted(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -3840,7 +3840,7 @@ impl BernoulliMarginalSlopeFamily {
                 return Ok(out);
             }
         }
-        self.row_primary_third_contracted_recompute_with_moments(
+        self.row_primary_third_contracted_with_moments(
             row,
             block_states,
             cache,
@@ -3849,7 +3849,7 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
-    pub(super) fn row_primary_third_contracted_recompute_with_moments(
+    pub(super) fn row_primary_third_contracted_with_moments(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -3893,7 +3893,7 @@ impl BernoulliMarginalSlopeFamily {
         let beta_h = beta_h_owned.as_ref();
         let beta_w = beta_w_owned.as_ref();
         if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
-            return self.empirical_flex_row_third_contracted_recompute(
+            return self.empirical_flex_row_third_contracted(
                 row, primary, q, b, beta_h, beta_w, row_ctx, dir, &grid,
             );
         }
@@ -4629,7 +4629,7 @@ impl BernoulliMarginalSlopeFamily {
             for dir_idx in 0..r {
                 let mut basis = Array1::<f64>::zeros(r);
                 basis[dir_idx] = 1.0;
-                let third = self.empirical_flex_row_third_contracted_recompute(
+                let third = self.empirical_flex_row_third_contracted(
                     row, primary, q, b, beta_h, beta_w, row_ctx, &basis, &grid,
                 )?;
                 grad[dir_idx] = Self::row_primary_trace_contract(&third, gram);
@@ -5677,7 +5677,7 @@ impl BernoulliMarginalSlopeFamily {
         if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
             let mut traces = vec![0.0; row_dirs.len()];
             for (dir_idx, dir) in row_dirs.iter().enumerate() {
-                let third = self.empirical_flex_row_third_contracted_recompute(
+                let third = self.empirical_flex_row_third_contracted(
                     row, primary, q, b, beta_h, beta_w, row_ctx, dir, &grid,
                 )?;
                 traces[dir_idx] = Self::row_primary_trace_contract(&third, gram);
@@ -5972,7 +5972,7 @@ impl BernoulliMarginalSlopeFamily {
     ///   out[k,l] = sum_{m,n} f_{klmn} dir_u[m] dir_v[n]
     /// Rigid path uses the closed-form kernel. The flexible de-nested
     /// transport path contracts the cell-moment kernel analytically.
-    pub(super) fn row_primary_fourth_contracted_recompute_ordered(
+    pub(super) fn row_primary_fourth_contracted_ordered(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -6029,7 +6029,7 @@ impl BernoulliMarginalSlopeFamily {
         let beta_h = beta_h_owned.as_ref();
         let beta_w = beta_w_owned.as_ref();
         if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
-            return self.empirical_flex_row_fourth_contracted_recompute(
+            return self.empirical_flex_row_fourth_contracted(
                 row, primary, q, b, beta_h, beta_w, row_ctx, dir_u, dir_v, &grid,
             );
         }
@@ -6987,7 +6987,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(out)
     }
 
-    pub(super) fn row_primary_fourth_contracted_recompute(
+    pub(super) fn row_primary_fourth_contracted(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -7030,7 +7030,7 @@ impl BernoulliMarginalSlopeFamily {
                 return Ok(out);
             }
         }
-        let ordered = self.row_primary_fourth_contracted_recompute_ordered(
+        let ordered = self.row_primary_fourth_contracted_ordered(
             row,
             block_states,
             cache,
@@ -7042,7 +7042,7 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(ordered);
         }
 
-        let swapped = self.row_primary_fourth_contracted_recompute_ordered(
+        let swapped = self.row_primary_fourth_contracted_ordered(
             row,
             block_states,
             cache,

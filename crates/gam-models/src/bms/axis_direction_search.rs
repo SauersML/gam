@@ -1323,7 +1323,7 @@ impl BernoulliMarginalSlopeFamily {
                         let mut dir = Array1::<f64>::zeros(primary.total);
                         dir[dir_idx] = psi_local.dot(&block_states[axis.block_idx].beta);
                         let mut f_pipi = f_pipi_base.clone();
-                        let mut third = self.row_primary_third_contracted_recompute(
+                        let mut third = self.row_primary_third_contracted(
                             row,
                             block_states,
                             cache,
@@ -1569,21 +1569,21 @@ impl BernoulliMarginalSlopeFamily {
                                     row_ctx,
                                     cache,
                                 )?;
-                            let mut third_i = self.row_primary_third_contracted_recompute(
+                            let mut third_i = self.row_primary_third_contracted(
                                 row,
                                 block_states,
                                 cache,
                                 row_ctx,
                                 &dir_i,
                             )?;
-                            let mut third_j = self.row_primary_third_contracted_recompute(
+                            let mut third_j = self.row_primary_third_contracted(
                                 row,
                                 block_states,
                                 cache,
                                 row_ctx,
                                 &dir_j,
                             )?;
-                            let mut fourth = self.row_primary_fourth_contracted_recompute(
+                            let mut fourth = self.row_primary_fourth_contracted(
                                 row,
                                 block_states,
                                 cache,
@@ -1710,7 +1710,7 @@ impl BernoulliMarginalSlopeFamily {
                             acc.2.add_pullback(self, row, slices, primary, &fourth);
 
                             // --- third_ij tensor pullback ---
-                            let mut third_ij = self.row_primary_third_contracted_recompute(
+                            let mut third_ij = self.row_primary_third_contracted(
                                 row,
                                 block_states,
                                 cache,
@@ -1949,7 +1949,7 @@ impl BernoulliMarginalSlopeFamily {
                             dir_alpha.scaled_add(alpha_psi[j], d);
                         }
                     }
-                    let third_alpha = self.row_primary_third_contracted_recompute(
+                    let third_alpha = self.row_primary_third_contracted(
                         row,
                         block_states,
                         cache,
@@ -1962,7 +1962,7 @@ impl BernoulliMarginalSlopeFamily {
                         let idx_i = if block_i == 0 { 0 } else { 1 };
                         let dir_i = &dir[i];
                         // third_i = third(dir_i); reused below.
-                        let third_i = self.row_primary_third_contracted_recompute(
+                        let third_i = self.row_primary_third_contracted(
                             row,
                             block_states,
                             cache,
@@ -1971,7 +1971,7 @@ impl BernoulliMarginalSlopeFamily {
                         )?;
                         // fourth(dir_i, dir(α)) — bilinear, one cached-tensor
                         // contraction per (output row i, data row).
-                        let mut fourth = self.row_primary_fourth_contracted_recompute(
+                        let mut fourth = self.row_primary_fourth_contracted(
                             row,
                             block_states,
                             cache,
@@ -2146,7 +2146,7 @@ impl BernoulliMarginalSlopeFamily {
                         block_acc.add_pullback(self, row, slices, primary, &fourth);
                         // third_ij(α) tensor pullback
                         if have_ij {
-                            let mut third_ij = self.row_primary_third_contracted_recompute(
+                            let mut third_ij = self.row_primary_third_contracted(
                                 row,
                                 block_states,
                                 cache,
@@ -2288,14 +2288,14 @@ impl BernoulliMarginalSlopeFamily {
                         primary,
                     )?;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let mut third_beta = self.row_primary_third_contracted_recompute(
+                    let mut third_beta = self.row_primary_third_contracted(
                         row,
                         block_states,
                         cache,
                         row_ctx,
                         &row_dir,
                     )?;
-                    let mut fourth = self.row_primary_fourth_contracted_recompute(
+                    let mut fourth = self.row_primary_fourth_contracted(
                         row,
                         block_states,
                         cache,
@@ -2319,7 +2319,7 @@ impl BernoulliMarginalSlopeFamily {
                         &right_primary,
                     );
                     acc.add_pullback(self, row, slices, primary, &fourth);
-                    let mut third_action = self.row_primary_third_contracted_recompute(
+                    let mut third_action = self.row_primary_third_contracted(
                         row,
                         block_states,
                         cache,
@@ -2429,14 +2429,14 @@ impl BernoulliMarginalSlopeFamily {
                         primary,
                     )?;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let mut third_beta = self.row_primary_third_contracted_recompute(
+                    let mut third_beta = self.row_primary_third_contracted(
                         row,
                         block_states,
                         cache,
                         row_ctx,
                         &row_dir,
                     )?;
-                    let mut fourth = self.row_primary_fourth_contracted_recompute(
+                    let mut fourth = self.row_primary_fourth_contracted(
                         row,
                         block_states,
                         cache,
@@ -2460,7 +2460,7 @@ impl BernoulliMarginalSlopeFamily {
                         &right_primary,
                     );
                     acc.add_pullback(self, row, slices, primary, &fourth);
-                    let mut third_action = self.row_primary_third_contracted_recompute(
+                    let mut third_action = self.row_primary_third_contracted(
                         row,
                         block_states,
                         cache,
@@ -2563,7 +2563,7 @@ impl BernoulliMarginalSlopeFamily {
                     let row_dir =
                         self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let mut third = self.row_primary_third_contracted_recompute(
+                    let mut third = self.row_primary_third_contracted(
                         row,
                         block_states,
                         cache,
@@ -2652,7 +2652,7 @@ impl BernoulliMarginalSlopeFamily {
                     let row_dir =
                         self.row_primary_direction_from_flat(row, slices, primary, d_beta_flat)?;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let mut third = self.row_primary_third_contracted_recompute(
+                    let mut third = self.row_primary_third_contracted(
                         row,
                         block_states,
                         cache,
@@ -3325,7 +3325,7 @@ impl BernoulliMarginalSlopeFamily {
                     let row_v =
                         self.row_primary_direction_from_flat(row, slices, primary, d_beta_v_flat)?;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let mut fourth = self.row_primary_fourth_contracted_recompute(
+                    let mut fourth = self.row_primary_fourth_contracted(
                         row,
                         block_states,
                         cache,
@@ -3438,7 +3438,7 @@ impl BernoulliMarginalSlopeFamily {
                     let row_v =
                         self.row_primary_direction_from_flat(row, slices, primary, d_beta_v_flat)?;
                     let row_ctx = Self::row_ctx(cache, row);
-                    let mut fourth = self.row_primary_fourth_contracted_recompute(
+                    let mut fourth = self.row_primary_fourth_contracted(
                         row,
                         block_states,
                         cache,
@@ -3637,7 +3637,7 @@ impl BernoulliMarginalSlopeFamily {
                     .collect::<Result<Vec<_>, String>>()?;
                 let row_ctx = Self::row_ctx(cache, row);
                 for (idx, (u_idx, v_idx)) in pair_indices.iter().copied().enumerate() {
-                    let mut fourth = self.row_primary_fourth_contracted_recompute(
+                    let mut fourth = self.row_primary_fourth_contracted(
                         row,
                         block_states,
                         cache,
@@ -3671,7 +3671,7 @@ impl BernoulliMarginalSlopeFamily {
                             .collect::<Result<Vec<_>, String>>()?;
                         let row_ctx = Self::row_ctx(cache, row);
                         for (idx, (u_idx, v_idx)) in pair_indices.iter().copied().enumerate() {
-                            let mut fourth = self.row_primary_fourth_contracted_recompute(
+                            let mut fourth = self.row_primary_fourth_contracted(
                                 row,
                                 block_states,
                                 cache,

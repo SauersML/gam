@@ -1252,7 +1252,7 @@ impl BernoulliMarginalSlopeFamily {
         )))
     }
 
-    pub(super) fn empirical_flex_row_third_contracted_recompute(
+    pub(super) fn empirical_flex_row_third_contracted(
         &self,
         row: usize,
         primary: &PrimarySlices,
@@ -1297,7 +1297,7 @@ impl BernoulliMarginalSlopeFamily {
             .map_err(|error| format!("empirical BMS third-contraction shape: {error}"))
     }
 
-    pub(super) fn empirical_flex_row_fourth_contracted_recompute(
+    pub(super) fn empirical_flex_row_fourth_contracted(
         &self,
         row: usize,
         primary: &PrimarySlices,
@@ -1539,7 +1539,7 @@ impl BernoulliMarginalSlopeFamily {
 
     /// Look up the per-row rigid uncontracted third-derivative tensor from
     /// the cache, populating it lazily on first access via one parallel
-    /// row pass. Used by `row_primary_third_contracted_recompute` so the
+    /// row pass. Used by `row_primary_third_contracted` so the
     /// build-psi-hyper-coords sweep over 32 ψ-axes pays the heavy empirical
     /// jet at most once per row.
     ///
@@ -1732,8 +1732,8 @@ impl BernoulliMarginalSlopeFamily {
     /// Prewarm the degree-`required_degree` full-row cell-moment bundle once,
     /// from serial setup code, before a FLEX outer-derivative row par-fold.
     ///
-    /// The FLEX third/fourth row recompute kernels
-    /// (`row_primary_{third,fourth}_contracted_recompute*`) read the per-cell
+    /// The FLEX third/fourth row contraction kernels
+    /// (`row_primary_{third,fourth}_contracted*`) read the per-cell
     /// moments through `row_cell_moments_for_third_degree15`, which only
     /// consults an *already-built* bundle. Without a serial prewarm, the first
     /// row to need degree-15 moments finds no bundle and falls back to
@@ -3992,7 +3992,7 @@ mod empirical_flex_jet_oracle_tests {
     //! over the latent grid (`empirical_flex_calibration_jets`), the score-warp
     //! cubic basis enters multiplicatively on the slope through `b·Σβ_h·b_h(z)`,
     //! and the link-deviation cubic enters as `Σβ_w·b_w(u)` composed at the
-    //! observed index `u`. `row_{third,fourth}_contracted_recompute` then read
+    //! observed index `u`. `row_{third,fourth}_contracted` then read
     //! contracted directional derivatives off that jet. NONE of that higher-dim
     //! `(q, b, β_h, β_w)` tower was guarded by an independent oracle — only the
     //! rigid (no-deviation) empirical and standard-normal paths were.
@@ -4009,7 +4009,7 @@ mod empirical_flex_jet_oracle_tests {
     //!
     //! then central-differences `ℓ(q, b, β_h, β_w)` to first/second/third/fourth
     //! order and compares against the production jet's `coeff` channels and the
-    //! contracted-recompute tensors. A companion test plants a cross-block sign
+    //! contracted tensors. A companion test plants a cross-block sign
     //! flip and asserts the witness rejects it.
 
     use super::*;
@@ -4696,7 +4696,7 @@ mod empirical_flex_jet_oracle_tests {
         }
 
         // Third derivatives: a spanning set of distinct-axis triples + a
-        // diagonal, matching the contracted-recompute the kernel exposes.
+        // diagonal, matching the contracted tensors the kernel exposes.
         let triples: [[usize; 3]; 4] =
             [[q, b, dev0], [b, b, dev0], [q, dev0, dev0], [b, dev0, dev0]];
         for tri in &triples {
@@ -4782,8 +4782,8 @@ mod empirical_flex_jet_oracle_tests {
     }
 
     #[test]
-    fn empirical_flex_contracted_recompute_matches_witness_and_catches_sign_flip() {
-        // Exercise the row_{third,fourth}_contracted_recompute entry points
+    fn empirical_flex_contractions_match_witness_and_catch_sign_flip() {
+        // Exercise the row_{third,fourth}_contracted entry points
         // (the production-facing API) and confirm the independent witness both
         // matches them and would reject a planted cross-block sign flip.
         let fx = make_fixture(false); // link-dev
@@ -4821,7 +4821,7 @@ mod empirical_flex_jet_oracle_tests {
         let dir_b = BernoulliMarginalSlopeFamily::unit_primary_direction(r, b);
         let third = fx
             .family
-            .empirical_flex_row_third_contracted_recompute(
+            .empirical_flex_row_third_contracted(
                 0,
                 &fx.primary,
                 q0,
@@ -4832,7 +4832,7 @@ mod empirical_flex_jet_oracle_tests {
                 &dir_b,
                 &fx.grid,
             )
-            .expect("third contracted recompute");
+            .expect("third contracted evaluation");
         // Exact independent tower over (q, b, dev0); read the contracted
         // entries straight off its symmetric tensors — no FD truncation.
         let tower = flex_tower_witness(&fx, &p0);
@@ -4848,7 +4848,7 @@ mod empirical_flex_jet_oracle_tests {
         );
 
         // A planted sign flip of that cross block must leave the witness band:
-        // proves the contracted-recompute path has resolving power against the
+        // proves the contracted path has resolving power against the
         // #736 cross-block genus.
         let flipped = -third[[q, dev0]];
         if wit_qd_b.abs() > 1e-6 {
@@ -4862,7 +4862,7 @@ mod empirical_flex_jet_oracle_tests {
         let dir_dev0 = BernoulliMarginalSlopeFamily::unit_primary_direction(r, dev0);
         let fourth = fx
             .family
-            .empirical_flex_row_fourth_contracted_recompute(
+            .empirical_flex_row_fourth_contracted(
                 0,
                 &fx.primary,
                 q0,
@@ -4874,7 +4874,7 @@ mod empirical_flex_jet_oracle_tests {
                 &dir_dev0,
                 &fx.grid,
             )
-            .expect("fourth contracted recompute");
+            .expect("fourth contracted evaluation");
         // fourth_contracted[q,b] = ∂⁴ℓ[q, b, b, dev0] = t4[q,b,b,dev0].
         let wit_qb_b_d = tower_channel(&fx, &tower, &[q, b, b, dev0]);
         assert!(
@@ -5753,7 +5753,7 @@ mod empirical_flex_jet_oracle_tests {
                 let (new_third_ns, new_third) = timed_matrix(5, || {
                     fixture
                         .family
-                        .empirical_flex_row_third_contracted_recompute(
+                        .empirical_flex_row_third_contracted(
                             0,
                             &fixture.primary,
                             q,
@@ -5782,7 +5782,7 @@ mod empirical_flex_jet_oracle_tests {
                 let (new_fourth_ns, new_fourth) = timed_matrix(5, || {
                     fixture
                         .family
-                        .empirical_flex_row_fourth_contracted_recompute(
+                        .empirical_flex_row_fourth_contracted(
                             0,
                             &fixture.primary,
                             q,

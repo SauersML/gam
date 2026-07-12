@@ -2160,7 +2160,7 @@ impl BernoulliMarginalSlopeFamily {
             ));
         }
         if row_dirs.len() == 1 {
-            return Ok(vec![self.row_primary_third_contracted_recompute(
+            return Ok(vec![self.row_primary_third_contracted(
                 row,
                 block_states,
                 cache,
@@ -2225,7 +2225,7 @@ impl BernoulliMarginalSlopeFamily {
             return row_dirs
                 .iter()
                 .map(|dir| {
-                    self.empirical_flex_row_third_contracted_recompute(
+                    self.empirical_flex_row_third_contracted(
                         row, primary, q, b, beta_h, beta_w, row_ctx, dir, &grid,
                     )
                 })
