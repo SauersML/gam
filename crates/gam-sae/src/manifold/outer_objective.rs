@@ -2291,6 +2291,17 @@ impl SaeManifoldOuterObjective {
         let cost = if penalized_quasi_laplace_cost.is_finite() {
             penalized_quasi_laplace_cost
         } else {
+            // The criterion function returned Ok with a NON-FINITE value —
+            // this is the assembled-value class (a non-finite Laplace
+            // normalizer / rank charge / dispersion term at the converged
+            // cache), distinct from the typed-refusal class the mapping
+            // sites name. A silent ∞ here made every downstream
+            // 'infeasible at the requested rho' failure untraceable.
+            log::debug!(
+                "SAE criterion assembled a NON-FINITE value {penalized_quasi_laplace_cost:.6e} \
+                 (loss total {:.6e}) at the converged inner state — mapping to +inf",
+                loss.total()
+            );
             self.probe_telemetry.infeasible_criterion_evals += 1;
             f64::INFINITY
         };
