@@ -80,7 +80,9 @@
 //! ────────────────────────────────────────────────────────────────────────────
 
 use super::*;
-use crate::bms::{signed_probit_neglog_derivatives_up_to_fourth, signed_probit_neglog_unary_stack};
+#[cfg(test)]
+use crate::bms::signed_probit_neglog_derivatives_up_to_fourth;
+use crate::bms::signed_probit_neglog_unary_stack;
 #[cfg(test)]
 use crate::inference::probability::signed_probit_logcdf_and_mills_ratio;
 use crate::survival::marginal_slope::gpu;

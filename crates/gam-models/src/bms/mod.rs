@@ -2139,6 +2139,7 @@ pub(crate) use family::{
     build_score_warp_deviation_block_from_seed,
 };
 pub(crate) use gradient_paths::standardize_latent_z_with_policy;
+pub(crate) use gradient_paths::signed_probit_neglog_unary_stack;
 pub(crate) use gradient_paths::{
     empirical_intercept_from_marginal, signed_probit_neglog_derivatives_up_to_fourth,
     unary_derivatives_log, unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi,
