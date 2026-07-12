@@ -1965,9 +1965,9 @@ mod tests_multidir_row {
             q_entry,
             q_exit,
             qdot_exit,
-            q_right,
             mu,
             sigma,
+            ..
         } = point;
         let log_sigma_factor = point.log_sigma_factor();
         let entry_state = LatentKernelPrimaryState {
@@ -6904,7 +6904,15 @@ mod tests {
     fn latent_survival_one_pass_exact_tails_match_multidir_all_channels_932() {
         let quadctx = QuadratureContext::new();
         let regimes = [
-            ("tiny-mass-left", -14.0, -10.0, 0.31, 0.0, -5.0, 0.08),
+            (
+                "tiny-mass-left",
+                -14.0_f64,
+                -10.0_f64,
+                0.31,
+                0.0,
+                -5.0,
+                0.08,
+            ),
             ("large-mass-right", 2.0, 6.0, 1.7, 0.0, 3.5, 0.45),
             ("wide-frailty", -3.0, 1.5, 0.62, 0.0, -1.8, 4.0),
         ];
