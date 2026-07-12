@@ -3405,6 +3405,45 @@ fn race_birth_topology(
     weights: ArrayView1<'_, f64>,
     d_k: usize,
 ) -> Result<Option<TopologyRaceFit>, String> {
+    // The PCA/template-coordinate race is the cheaper DEFAULT: the born atom
+    // inherits the template atom's coordinate block, and the topology candidates
+    // are adjudicated on those linear-seed coordinates.
+    let template_winner = race_template_coords(coords, target, weights, d_k)?;
+    // Intrinsic-metric CHALLENGER (#2240/#2280): on a FOLDED residual (a swiss
+    // roll, a creased sheet) the template coordinates are self-overlapping in the
+    // ambient metric, so every topology candidate fits a crumpled image. Re-race
+    // the SAME candidate set on the geodesic (Isomap) embedding of the birth
+    // image, which unrolls the fold. The challenger enters under the IDENTICAL
+    // REML evidence and wins only when it scores strictly better; on a non-fold it
+    // ties the linear seed and the default (template) is kept. Fail-safe: any
+    // embedding/race failure leaves the template winner untouched.
+    let intrinsic_winner = race_intrinsic_coords(target, weights, d_k).unwrap_or(None);
+    // Lower TK/REML cost wins (issue #396 sign convention); the template keeps
+    // ties, so PCA stays default and intrinsic only supplants it by evidence.
+    let winner = match (template_winner, intrinsic_winner) {
+        (Some((t_fit, t_score)), Some((i_fit, i_score))) => {
+            if i_score < t_score {
+                Some(i_fit)
+            } else {
+                Some(t_fit)
+            }
+        }
+        (Some((t_fit, _)), None) => Some(t_fit),
+        (None, Some((i_fit, _))) => Some(i_fit),
+        (None, None) => None,
+    };
+    Ok(winner)
+}
+
+/// The PCA/template-coordinate topology race: the historical born-atom path,
+/// returning the winning fit AND its TK-normalized evidence so the intrinsic
+/// challenger in [`race_birth_topology`] can be compared on the same scale.
+fn race_template_coords(
+    coords: ArrayView2<'_, f64>,
+    target: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    d_k: usize,
+) -> Result<Option<(TopologyRaceFit, f64)>, String> {
     let base_specs = topology_candidates_for_dim(coords, d_k)?;
     if base_specs.is_empty() {
         return Ok(None);
@@ -3433,13 +3472,58 @@ fn race_birth_topology(
     race_spec_set(base_specs, target, weights)
 }
 
+/// The intrinsic-metric challenger race: embed the birth image `target`
+/// (`n × p`) into `d_k` dimensions by classical Landmark-Isomap (geodesic MDS),
+/// min-max normalize each geodesic axis to the flat `[-0.5, 0.5]` convention the
+/// template coordinates use (so the Euclidean-patch design is scale-commensurable
+/// with the template race), and race the SAME topology candidate set on those
+/// unfolded coordinates. Returns the winning fit and its TK evidence, or `None`
+/// when the embedding is degenerate or no candidate is realizable.
+fn race_intrinsic_coords(
+    target: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    d_k: usize,
+) -> Result<Option<(TopologyRaceFit, f64)>, String> {
+    if d_k == 0 || target.nrows() < 3 {
+        return Ok(None);
+    }
+    let embed = crate::manifold::intrinsic_geodesic_embedding(target, d_k)?;
+    let n = embed.nrows();
+    let d = embed.ncols();
+    if n == 0 || d == 0 {
+        return Ok(None);
+    }
+    // Per-axis min-max to [-0.5, 0.5]; a collapsed axis (zero span) means the
+    // geodesic embedding found no intrinsic spread there — the challenger is not
+    // realizable, so bail and keep the template winner.
+    let mut coords = Array2::<f64>::zeros((n, d));
+    for col in 0..d {
+        let (lo, hi) = (0..n).fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), r| {
+            let v = embed[[r, col]];
+            (lo.min(v), hi.max(v))
+        });
+        let span = hi - lo;
+        if !(span > 0.0) || !span.is_finite() {
+            return Ok(None);
+        }
+        for r in 0..n {
+            coords[[r, col]] = (embed[[r, col]] - lo) / span - 0.5;
+        }
+    }
+    let specs = topology_candidates_for_dim(coords.view(), d_k)?;
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    race_spec_set(specs, target, weights)
+}
+
 /// Race one realized candidate spec set against the birth target and return the
 /// evidence-winning fit. Shared by the base and the F1 radial-promoted races.
 fn race_spec_set(
     specs: Vec<TopologyCandidateSpec>,
     target: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
-) -> Result<Option<TopologyRaceFit>, String> {
+) -> Result<Option<(TopologyRaceFit, f64)>, String> {
     if specs.is_empty() {
         return Ok(None);
     }
@@ -3503,7 +3587,7 @@ fn race_spec_set(
     let winner = ranked
         .winner()
         .ok_or_else(|| "race_birth_topology: empty ranking".to_string())?;
-    Ok(Some(winner.fit_handle.clone()))
+    Ok(Some((winner.fit_handle.clone(), winner.tk_score)))
 }
 
 /// A primary-atom topology choice discovered by the fit-entry evidence race
@@ -3820,16 +3904,50 @@ pub fn discover_primary_atom_topologies(
             for &row in &rows {
                 weights[row] = 1.0;
             }
-            let fit = race_spec_set(specs, target, weights.view()).map_err(|error| {
+            // PCA/linear race is the cheaper DEFAULT.
+            let pca_winner = race_spec_set(specs, target, weights.view()).map_err(|error| {
                 format!(
                     "discover_primary_atom_topologies: evidence race failed for auto atom {atom_idx}: {error}"
                 )
             })?;
-            let fit = fit.ok_or_else(|| {
-                format!(
-                    "discover_primary_atom_topologies: evidence race returned no winner for auto atom {atom_idx}"
-                )
-            })?;
+            // Intrinsic-metric CHALLENGER (#2240/#2280): re-race the fold-sensitive
+            // d=2 candidates on the geodesic embedding of the birth image, which
+            // unrolls a swiss-roll-class fold the PCA chart creases. It enters under
+            // the SAME REML evidence and wins only by a strictly lower TK cost; a
+            // win also swaps in its unfolded chart for the Duchon-center growth.
+            // Fail-safe: any embedding/race failure leaves the PCA winner untouched.
+            let intrinsic_challenger =
+                match build_intrinsic_primary_specs(target, &rows, max_dims[atom_idx]) {
+                    Ok(Some((int_specs, int_chart))) => {
+                        match race_spec_set(int_specs, target, weights.view()) {
+                            Ok(Some((int_fit, int_score))) => Some((int_fit, int_score, int_chart)),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+            let fit = match (pca_winner, intrinsic_challenger) {
+                (Some((p_fit, p_score)), Some((i_fit, i_score, i_chart))) => {
+                    if i_score < p_score {
+                        // The unfolded sheet won: its chart drives the winner's
+                        // Duchon-center resolution growth below.
+                        sheet_coords = Some(i_chart);
+                        i_fit
+                    } else {
+                        p_fit
+                    }
+                }
+                (Some((p_fit, _)), None) => p_fit,
+                (None, Some((i_fit, _, i_chart))) => {
+                    sheet_coords = Some(i_chart);
+                    i_fit
+                }
+                (None, None) => {
+                    return Err(format!(
+                        "discover_primary_atom_topologies: evidence race returned no winner for auto atom {atom_idx}"
+                    ));
+                }
+            };
             // #2243 — for a circle winner, GROW the harmonic resolution by the
             // same REML evidence: the topology race ran the circle at a fixed low
             // budget only to discriminate topology, but a genuinely 1-D factor's
@@ -3895,6 +4013,82 @@ pub fn discover_primary_atom_topologies(
             })
         })
         .collect()
+}
+
+/// Intrinsic-metric CHALLENGER spec set for the primary discovery race
+/// (#2240/#2280). On a FOLDED residual factor (a swiss roll, a creased sheet) the
+/// PCA 2-PC chart the primary race builds is self-overlapping, so even the
+/// flexible Duchon sheet fits a crumpled image. This embeds the birth image
+/// `target` by its geodesic (Isomap) metric — which unrolls the fold — standardizes
+/// each intrinsic axis to unit in-cluster SD (so the Euclidean-patch / Duchon
+/// design is scale-commensurable with the PCA flat candidate), and offers the two
+/// FOLD-SENSITIVE `d = 2` candidates (a flat patch and a thin-plate sheet) on those
+/// unfolded coordinates. The caller races this set against the PCA set under the
+/// SAME REML evidence and keeps the PCA winner on ties, so the intrinsic seed
+/// supplants the linear one only when its unfolding earns strictly higher evidence.
+///
+/// Returns `(specs, chart)` where `chart` is the standardized intrinsic 2-D chart
+/// the winning sheet's resolution growth reads. `None` when the atom is `d < 2`
+/// (folds are a sheet story; `d = 1` line/circle is served by the PCA race), the
+/// cluster is too small for a geodesic graph, or the embedding is degenerate.
+fn build_intrinsic_primary_specs(
+    target: ArrayView2<'_, f64>,
+    rows: &[usize],
+    max_dim: usize,
+) -> Result<Option<(Vec<TopologyCandidateSpec>, Array2<f64>)>, String> {
+    if max_dim < 2 || rows.len() < 3 {
+        return Ok(None);
+    }
+    let n_obs = target.nrows();
+    let embed = crate::manifold::intrinsic_geodesic_embedding(target, 2)?;
+    if embed.ncols() < 2 {
+        return Ok(None);
+    }
+    // Standardize each intrinsic axis to unit in-cluster SD (the PCA flat patch's
+    // O(1)-coordinate convention). A collapsed axis (no intrinsic spread) means the
+    // geodesic embedding found no second dimension — the challenger is not
+    // realizable, so bail and keep the PCA winner.
+    let inv_count = 1.0 / rows.len().max(1) as f64;
+    let mut coords = Array2::<f64>::zeros((n_obs, 2));
+    for col in 0..2 {
+        let mut acc = 0.0_f64;
+        for &row in rows {
+            acc += embed[[row, col]] * embed[[row, col]];
+        }
+        let sd = (acc * inv_count).sqrt();
+        if !(sd > 1e-12) || !sd.is_finite() {
+            return Ok(None);
+        }
+        for row in 0..n_obs {
+            coords[[row, col]] = embed[[row, col]] / sd;
+        }
+    }
+    let mut specs: Vec<TopologyCandidateSpec> = Vec::with_capacity(2);
+    let flat = EuclideanPatchEvaluator::new(2, 2)
+        .map_err(|error| format!("intrinsic primary flat evaluator failed: {error}"))?;
+    specs.push(TopologyCandidateSpec {
+        kind: AutoTopologyKind::Euclidean,
+        basis_kind: SaeAtomBasisKind::EuclideanPatch,
+        manifold: LatentManifold::Euclidean,
+        latent_dim: 2,
+        evaluator: Arc::new(flat),
+        coords: coords.clone(),
+    });
+    if let Some(centers) =
+        duchon_sheet_centers(&coords, rows, duchon_sheet_race_center_budget(rows.len()))
+    {
+        let sheet = DuchonCoordinateEvaluator::new(centers, DUCHON_SHEET_M)
+            .map_err(|error| format!("intrinsic primary duchon evaluator failed: {error}"))?;
+        specs.push(TopologyCandidateSpec {
+            kind: AutoTopologyKind::DuchonSheet,
+            basis_kind: SaeAtomBasisKind::Duchon,
+            manifold: LatentManifold::Euclidean,
+            latent_dim: 2,
+            evaluator: Arc::new(sheet),
+            coords: coords.clone(),
+        });
+    }
+    Ok(Some((specs, coords)))
 }
 
 /// Duchon nullspace order `m` for the raced 2-D thin-plate sheet (#2240) —

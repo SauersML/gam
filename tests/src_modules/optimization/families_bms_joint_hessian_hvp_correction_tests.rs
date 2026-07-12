@@ -1668,13 +1668,13 @@ fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
         penalties_dense.push(block_penalties);
         penalty_cursor += count;
     }
-    if opts.ridge_policy.include_quadratic_penalty || opts.ridge_policy.include_penalty_logdet {
+    if opts.ridge_policy.accounts_for_objective() {
         for diag in 0..total {
             h[[diag, diag]] += ridge;
         }
     }
 
-    let penalty_logdet_ridge = if opts.ridge_policy.include_penalty_logdet {
+    let penalty_logdet_ridge = if opts.ridge_policy.accounts_for_objective() {
         ridge
     } else {
         0.0
