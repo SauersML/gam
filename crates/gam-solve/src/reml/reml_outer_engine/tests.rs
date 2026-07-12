@@ -3322,6 +3322,44 @@ pub(crate) fn efs_step_is_zero_at_scalar_optimum() {
     );
 }
 
+/// The pure-EFS stepper (`compute_efs_update`) and the hybrid stepper
+/// (`compute_hybrid_efs_update`) must produce BIT-FOR-BIT identical ρ/τ steps
+/// whenever there are no ψ (design-moving) coordinates — both now route the
+/// penalty-like block through the single shared `efs_penalty_like_steps`
+/// helper, so the two can never silently diverge again. This pins that
+/// unification: re-inlining either loop with a subtly different `q_eff` or a
+/// non-deterministic write-back would break the exact-bits assertion.
+#[test]
+pub(crate) fn efs_update_and_hybrid_agree_bit_for_bit_without_psi() {
+    // Two-ρ Gaussian solution, no ext coords (no ψ): the hybrid path's ψ block
+    // is empty, so its output is exactly the penalty-like block.
+    let rho = [0.3_f64, -0.7_f64];
+    let solution = build_gaussian_test_solution(&rho);
+    assert!(
+        solution.ext_coords.is_empty(),
+        "fixture must have no ext coords so hybrid == pure EFS"
+    );
+
+    // An off-optimum gradient so the steps are non-trivial and the comparison
+    // exercises the actual `log(1 − 2g/q_eff)` arithmetic, not just `log 1 = 0`.
+    for gradient in [[0.11_f64, -0.04_f64], [0.0, 0.0], [-0.25, 0.18]] {
+        let pure = compute_efs_update(&solution, &rho, &gradient).expect("pure EFS");
+        let hybrid = compute_hybrid_efs_update(&solution, &rho, &gradient).expect("hybrid EFS");
+        assert_eq!(pure.len(), hybrid.steps.len());
+        assert!(
+            hybrid.psi_indices.is_empty() && hybrid.psi_gradient.is_empty(),
+            "no ψ coords ⇒ empty ψ metadata"
+        );
+        for (i, (&p, &h)) in pure.iter().zip(hybrid.steps.iter()).enumerate() {
+            assert_eq!(
+                p.to_bits(),
+                h.to_bits(),
+                "coord {i}: pure EFS step {p} != hybrid step {h} (gradient {gradient:?})"
+            );
+        }
+    }
+}
+
 /// `efs_log_step_from_grad` recovers the canonical
 /// `log((d − t)/q_eff)` Wood–Fasiolo step when the gradient is the
 /// pure REML/LAML stationarity gradient `g_base = (q_eff + t − d)/2`,

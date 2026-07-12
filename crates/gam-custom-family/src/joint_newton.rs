@@ -1372,19 +1372,32 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
             ) {
                 Ok(pld) => pld.value(),
                 Err(eigh_err_msg) => {
-                    // `from_components` only fails when the single internal
-                    // eigendecomposition fails, which for PSD penalties is
-                    // purely numerical. Fall back to Cholesky on the ridged
-                    // matrix (which should be SPD). The Cholesky logdet
-                    // includes null-space contributions (~m₀ × ln(ridge)),
-                    // a smooth bias that does not corrupt the REML gradient.
+                    // `from_components` only fails when its single internal
+                    // eigendecomposition fails, which for a PSD penalty is purely
+                    // numerical. Route the fallback through the SAME canonical
+                    // strict pseudo-logdet the joint-Hessian path uses
+                    // (`strict_exact_pseudo_logdet`): the exact positive-eigenspace
+                    // sum `Σ_{σ>tol} log σ` with NO δ-ridge escalation, on the same
+                    // `positive_eigenvalue_threshold` the analytic REML gradient's
+                    // trace kernel uses. A ridge-escalated Cholesky logdet would
+                    // instead carry a ρ-dependent, discontinuous `δ(ρ)` the
+                    // derivatives ignore — the "approximate determinant + exact
+                    // traces = a Hessian for a different objective" trap (gam#748).
+                    // A genuinely un-decomposable penalty now surfaces as a hard
+                    // error instead of a masked, biased number.
                     let mut s_for_logdet = s_lambda.clone();
                     if ridge > 0.0 {
                         for i in 0..p {
                             s_for_logdet[[i, i]] += ridge;
                         }
                     }
-                    penalty_logdet_cholesky_fallback(&s_for_logdet, ridge, b, p, &eigh_err_msg)?
+                    strict_exact_pseudo_logdet(&s_for_logdet, p).map_err(|strict_err| {
+                        format!(
+                            "penalty logdet: canonical PenaltyPseudologdet eigendecomposition \
+                             failed for block {b} ({eigh_err_msg}); strict pseudo-logdet fallback \
+                             (no δ-ridge masking, gam#748) also failed: {strict_err}"
+                        )
+                    })?
                 }
             }
         } else {

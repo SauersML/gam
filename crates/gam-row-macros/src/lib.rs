@@ -8,7 +8,7 @@
 //! forward jets must preserve for IEEE-754 semantics.
 
 use proc_macro::TokenStream;
-use proc_macro2::{Ident, Literal, TokenStream as TokenStream2};
+use proc_macro2::{Ident, Literal, Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use std::collections::{HashMap, HashSet};
 use syn::parse::{Parse, ParseStream};
@@ -562,44 +562,45 @@ fn node_definition(
     graph: &Graph,
     primaries: &[Ident],
     constants: &[Ident],
-) -> TokenStream2 {
+) -> Result<TokenStream2> {
     let reference = |child| node_reference(child, graph, primaries, constants);
     match graph.nodes[id] {
         Node::Add(left, right) => {
             let (left, right) = (reference(left), reference(right));
-            quote!(#left + #right)
+            Ok(quote!(#left + #right))
         }
         Node::Sub(left, right) => {
             let (left, right) = (reference(left), reference(right));
-            quote!(#left - #right)
+            Ok(quote!(#left - #right))
         }
         Node::Mul(left, right) => {
             let (left, right) = (reference(left), reference(right));
-            quote!(#left * #right)
+            Ok(quote!(#left * #right))
         }
         Node::Div(left, right) => {
             let (left, right) = (reference(left), reference(right));
-            quote!(#left / #right)
+            Ok(quote!(#left / #right))
         }
         Node::Neg(value) => {
             let value = reference(value);
-            quote!(-#value)
+            Ok(quote!(-#value))
         }
         Node::Exp(value) => {
             let value = reference(value);
-            quote!(#value.exp())
+            Ok(quote!(#value.exp()))
         }
         Node::Ln(value) => {
             let value = reference(value);
-            quote!(#value.ln())
+            Ok(quote!(#value.ln()))
         }
         Node::Sqrt(value) => {
             let value = reference(value);
-            quote!(#value.sqrt())
+            Ok(quote!(#value.sqrt()))
         }
-        Node::Constant(_) | Node::Variable(_) | Node::Parameter(_) => {
-            unreachable!("leaf has no definition")
-        }
+        Node::Constant(_) | Node::Variable(_) | Node::Parameter(_) => Err(syn::Error::new(
+            Span::call_site(),
+            "row_atom internal schedule error: a leaf node has no temporary definition",
+        )),
     }
 }
 
@@ -608,7 +609,7 @@ fn schedule_definitions(
     graph: &Graph,
     primaries: &[Ident],
     constants: &[Ident],
-) -> Vec<TokenStream2> {
+) -> Result<Vec<TokenStream2>> {
     let mut seen = HashSet::new();
     let mut order = Vec::new();
     for root in roots {
@@ -616,10 +617,10 @@ fn schedule_definitions(
     }
     order
         .into_iter()
-        .map(|id| {
+        .map(|id| -> Result<TokenStream2> {
             let temporary = format_ident!("__row_atom_{id}");
-            let expression = node_definition(id, graph, primaries, constants);
-            quote!(let #temporary: f64 = #expression;)
+            let expression = node_definition(id, graph, primaries, constants)?;
+            Ok(quote!(let #temporary: f64 = #expression;))
         })
         .collect()
 }
@@ -674,7 +675,7 @@ fn expand(input: RowAtomInput) -> Result<TokenStream2> {
             &graph,
             &primaries,
             &constants,
-        );
+        )?;
         let value_ref = node_reference(value, &graph, &primaries, &constants);
         let gradient_refs = gradient
             .iter()
@@ -744,7 +745,7 @@ fn expand(input: RowAtomInput) -> Result<TokenStream2> {
                 });
             }
         }
-        let definitions = schedule_definitions(roots, &graph, &primaries, &constants);
+        let definitions = schedule_definitions(roots, &graph, &primaries, &constants)?;
         output.push(quote! {
             #[inline(always)]
             #visibility fn #third_name(
@@ -797,7 +798,7 @@ fn expand(input: RowAtomInput) -> Result<TokenStream2> {
                 });
             }
         }
-        let definitions = schedule_definitions(roots, &graph, &primaries, &constants);
+        let definitions = schedule_definitions(roots, &graph, &primaries, &constants)?;
         output.push(quote! {
             #[inline(always)]
             #visibility fn #fourth_name(

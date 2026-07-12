@@ -491,15 +491,15 @@ impl SurvivalLocationScaleFamily {
                 log_scale,
             )));
         }
-        match self.survival_ls_coefficient_hessian(
-            &dynamic,
-            log_scale,
-            None,
-            SlsCoefficientHessianTarget::DenseFull,
-        )? {
-            SlsCoefficientHessian::DenseFull(dense) => Ok(Some((dense, log_scale))),
-            _ => unreachable!("dense-full rescaled SLS target returned another shape"),
-        }
+        let dense = self
+            .survival_ls_coefficient_hessian(
+                &dynamic,
+                log_scale,
+                None,
+                SlsCoefficientHessianTarget::DenseFull,
+            )?
+            .into_dense_full()?;
+        Ok(Some((dense, log_scale)))
     }
 
     pub(crate) fn exact_newton_joint_hessian_directional_derivative_rescaled(
@@ -1142,9 +1142,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // canonical runtime-sized row program, then slices the same dense result.
         let dynamic = self.build_dynamic_geometry(block_states)?;
         let block_hessians = if self.x_link_wiggle.is_some() {
-            let dense = super::row_kernel::survival_ls_wiggle_joint_hessian_dense(
-                self, &dynamic, 0.0,
-            )?;
+            let dense =
+                super::row_kernel::survival_ls_wiggle_joint_hessian_dense(self, &dynamic, 0.0)?;
             let offsets = self.joint_block_offsets();
             offsets
                 .windows(2)
@@ -1155,15 +1154,13 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 })
                 .collect()
         } else {
-            match self.survival_ls_coefficient_hessian(
+            self.survival_ls_coefficient_hessian(
                 &dynamic,
                 0.0,
                 None,
                 SlsCoefficientHessianTarget::BlockDiagonal,
-            )? {
-                SlsCoefficientHessian::BlockDiagonal(blocks) => blocks,
-                _ => unreachable!("block-diagonal SLS target returned another shape"),
-            }
+            )?
+            .into_block_diagonal()?
         };
         if block_hessians.len() != block_gradients.len() {
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
@@ -1332,15 +1329,15 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 super::row_kernel::survival_ls_wiggle_joint_hessian_dense(self, &dynamic, 0.0)?,
             ));
         }
-        match self.survival_ls_coefficient_hessian(
-            &dynamic,
-            0.0,
-            None,
-            SlsCoefficientHessianTarget::DenseFull,
-        )? {
-            SlsCoefficientHessian::DenseFull(dense) => Ok(Some(dense)),
-            _ => unreachable!("dense-full SLS target returned another shape"),
-        }
+        let dense = self
+            .survival_ls_coefficient_hessian(
+                &dynamic,
+                0.0,
+                None,
+                SlsCoefficientHessianTarget::DenseFull,
+            )?
+            .into_dense_full()?;
+        Ok(Some(dense))
     }
 
     fn exact_newton_joint_gradient_evaluation(
@@ -1690,21 +1687,17 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let log_scale = self.hessian_deriv_log_rescale(block_states);
         let dynamic = self.build_dynamic_geometry(block_states)?;
         let h_diagonal = if self.x_link_wiggle.is_some() {
-            super::row_kernel::survival_ls_wiggle_joint_hessian_dense(
-                self, &dynamic, log_scale,
-            )?
-            .diag()
-            .to_owned()
+            super::row_kernel::survival_ls_wiggle_joint_hessian_dense(self, &dynamic, log_scale)?
+                .diag()
+                .to_owned()
         } else {
-            match self.survival_ls_coefficient_hessian(
+            self.survival_ls_coefficient_hessian(
                 &dynamic,
                 log_scale,
                 None,
                 SlsCoefficientHessianTarget::DiagonalOnly,
-            )? {
-                SlsCoefficientHessian::DiagonalOnly(diagonal) => diagonal,
-                _ => unreachable!("diagonal-only SLS target returned another shape"),
-            }
+            )?
+            .into_diagonal_only()?
         };
         if h_diagonal.len() != p_total {
             return Ok(None);

@@ -4,6 +4,105 @@ use super::*;
 /// overshooting). Each iteration changes `λ` by at most `exp(EFS_MAX_STEP)`.
 pub(crate) const EFS_MAX_STEP: f64 = 5.0;
 
+/// Fill the penalty-like (ρ and extended-τ) entries of the EFS step vector with
+/// the universal-form multiplicative update `Δ = log(1 − 2·g_full/q_eff)`.
+///
+/// This is the single source of the penalty-like EFS arithmetic shared by
+/// [`compute_efs_update`] and [`compute_hybrid_efs_update`]; both produce
+/// byte-identical ρ/τ steps because they route through here. ψ (design-moving)
+/// ext coordinates are left at `0.0` — the caller that needs them
+/// ([`compute_hybrid_efs_update`]) overwrites those with the preconditioned
+/// gradient step. `q_eff` for ρ carries the gamma-precision-rate prior
+/// adjustment; τ uses the bare penalty-quadratic scale.
+///
+/// The per-coordinate arithmetic reads only that coordinate's own gradient
+/// entry, penalty root, and λ, so it fans across rayon once the block is large
+/// enough (from a non-rayon caller); the write-back is deterministic, so the
+/// result is independent of the fan-out decision.
+fn efs_penalty_like_steps(
+    solution: &InnerSolution<'_>,
+    rho: &[f64],
+    gradient: &[f64],
+) -> Result<Vec<f64>, String> {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let k = rho.len();
+    let ext_dim = solution.ext_coords.len();
+    let total = k + ext_dim;
+    assert_eq!(
+        gradient.len(),
+        total,
+        "efs_penalty_like_steps: gradient length {} != n_rho({k}) + n_ext({ext_dim})",
+        gradient.len(),
+    );
+    let mut steps = vec![0.0; total];
+
+    let (profiled_scale, dp_cgrad) = efs_profiling(solution);
+    let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())
+        .map_err(|error| format!("EFS rho: {error}"))?;
+    let penalty_quad_atom = crate::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
+        &lambdas,
+        &solution.penalty_coords,
+        &solution.beta,
+    )
+    .map_err(|error| format!("EFS penalty-quadratic layout: {error}"))?;
+
+    // ── ρ coordinates: universal-form EFS with the gamma-precision-rate q_eff.
+    let rho_step = |idx: usize| -> (usize, Option<f64>) {
+        let lambda = lambdas[idx];
+        let a_i = penalty_quad_atom.rho_frozen_d1(idx);
+        let q_eff = efs_q_eff_with_gamma_rate(
+            efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale),
+            lambda,
+            &solution.rho_prior,
+            idx,
+        );
+        (idx, efs_log_step_from_grad(q_eff, gradient[idx]))
+    };
+    let rho_candidates: Vec<(usize, Option<f64>)> =
+        if k >= HYBRID_EFS_SCALAR_PAR_THRESHOLD && rayon::current_thread_index().is_none() {
+            (0..k).into_par_iter().map(rho_step).collect()
+        } else {
+            (0..k).map(rho_step).collect()
+        };
+    for (idx, candidate) in rho_candidates {
+        if let Some(step) = candidate {
+            steps[idx] = step;
+        }
+    }
+
+    // ── Extended penalty-like (τ) coordinates: same Wood–Fasiolo update, bare
+    // q_eff. ψ (design-moving) ext coords are skipped (left at 0.0): EFS has no
+    // convergence guarantee there.
+    let tau_local: Vec<usize> = solution
+        .ext_coords
+        .iter()
+        .enumerate()
+        .filter_map(|(ext_idx, coord)| coord.is_penalty_like.then_some(ext_idx))
+        .collect();
+    let tau_step = |ext_idx: usize| -> (usize, Option<f64>) {
+        let coord = &solution.ext_coords[ext_idx];
+        let g_idx = k + ext_idx;
+        let q_eff = efs_q_eff(coord.a, &solution.dispersion, dp_cgrad, profiled_scale);
+        (g_idx, efs_log_step_from_grad(q_eff, gradient[g_idx]))
+    };
+    let tau_candidates: Vec<(usize, Option<f64>)> = if tau_local.len()
+        >= HYBRID_EFS_SCALAR_PAR_THRESHOLD
+        && rayon::current_thread_index().is_none()
+    {
+        tau_local.into_par_iter().map(tau_step).collect()
+    } else {
+        tau_local.into_iter().map(tau_step).collect()
+    };
+    for (g_idx, candidate) in tau_candidates {
+        if let Some(step) = candidate {
+            steps[g_idx] = step;
+        }
+    }
+
+    Ok(steps)
+}
+
 /// Extended Fellner–Schall update for ρ and penalty-like (τ) hyperparameters.
 ///
 /// Universal-form multiplicative log-λ update driven by the *full* outer
@@ -77,63 +176,14 @@ pub fn compute_efs_update(
     rho: &[f64],
     gradient: &[f64],
 ) -> Result<Vec<f64>, String> {
-    let k = rho.len();
-    let ext_dim = solution.ext_coords.len();
-    let total = k + ext_dim;
-    assert_eq!(
-        gradient.len(),
-        total,
-        "compute_efs_update: gradient length {} != n_rho({k}) + n_ext({ext_dim})",
-        gradient.len(),
-    );
-    let mut steps = vec![0.0; total];
-
-    let (profiled_scale, dp_cgrad) = efs_profiling(solution);
-    let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())
-        .map_err(|error| format!("EFS rho: {error}"))?;
-    let penalty_quad_atom = crate::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
-        &lambdas,
-        &solution.penalty_coords,
-        &solution.beta,
-    )
-    .map_err(|error| format!("EFS penalty-quadratic layout: {error}"))?;
-
-    // Universal-form EFS: `Δρ_i = log(1 − 2·g_full[i]/q_eff_i)`. This is
-    // identical to the canonical `log((d−t)/q_eff)` when no out-of-band
-    // cost terms exist (TK, prior, Firth, barrier, SAS ridge), and shifts
-    // the multiplicative target by exactly the residual gradient when
-    // they do. We get the augmented stationarity for free, in exchange
-    // for one `EvalMode::ValueAndGradient` evaluation per outer
-    // iteration.
-    for idx in 0..k {
-        let lambda = lambdas[idx];
-        let a_i = penalty_quad_atom.rho_frozen_d1(idx);
-        let q_eff = efs_q_eff_with_gamma_rate(
-            efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale),
-            lambda,
-            &solution.rho_prior,
-            idx,
-        );
-        if let Some(step) = efs_log_step_from_grad(q_eff, gradient[idx]) {
-            steps[idx] = step;
-        }
-    }
-
-    // ψ coords (`!is_penalty_like`) are skipped: EFS has no convergence
-    // guarantee there. The hybrid update supplies a preconditioned
-    // gradient step for them.
-    for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
-        if !coord.is_penalty_like {
-            continue;
-        }
-        let g_idx = k + ext_idx;
-        let q_eff = efs_q_eff(coord.a, &solution.dispersion, dp_cgrad, profiled_scale);
-        if let Some(step) = efs_log_step_from_grad(q_eff, gradient[g_idx]) {
-            steps[g_idx] = step;
-        }
-    }
-
-    Ok(steps)
+    // Pure penalty-like (ρ + τ) EFS: the universal-form multiplicative update
+    // `Δ = log(1 − 2·g_full/q_eff)`, identical to the canonical `log((d−t)/q_eff)`
+    // when no out-of-band cost terms exist (TK, prior, Firth, barrier, SAS
+    // ridge) and shifted by exactly the residual gradient when they do. Any ψ
+    // (design-moving) ext coords are left at 0.0; only [`compute_hybrid_efs_update`]
+    // fills those. This is the same helper the hybrid path uses for its ρ/τ
+    // block, so the two steppers agree bit-for-bit off the ψ coordinates.
+    efs_penalty_like_steps(solution, rho, gradient)
 }
 
 /// Regularization threshold for pseudoinverse of the trace Gram matrix.
@@ -247,9 +297,6 @@ pub fn compute_hybrid_efs_update(
     let hop = &*solution.hessian_op;
     let ext_dim = solution.ext_coords.len();
     let total = k + ext_dim;
-    let mut steps = vec![0.0; total];
-
-    let (profiled_scale, dp_cgrad) = efs_profiling(solution);
     assert_eq!(
         gradient.len(),
         total,
@@ -257,111 +304,25 @@ pub fn compute_hybrid_efs_update(
         gradient.len(),
     );
 
-    // ── ρ coordinates: universal-form EFS (see compute_efs_update) ──
+    // ── ρ + extended-τ penalty-like coordinates ──
     //
-    // The per-coordinate candidate construction is independent: each candidate
-    // reads only the converged β̂, the coordinate root, ρᵢ, and gᵢ.  Build
-    // candidates in parallel once the block is large enough, then keep the
-    // actual update write-back serial so fallback/backtracking decisions still
-    // see a deterministic step vector.
-    let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())
-        .map_err(|error| format!("hybrid EFS rho: {error}"))?;
-    let penalty_quad_atom = crate::estimate::reml::atoms::PenaltyQuadAtom::from_penalty_coords(
-        &lambdas,
-        &solution.penalty_coords,
-        &solution.beta,
-    )
-    .map_err(|error| format!("hybrid EFS penalty-quadratic layout: {error}"))?;
-    let rho_candidates: Vec<(usize, Option<f64>)> =
-        if k >= HYBRID_EFS_SCALAR_PAR_THRESHOLD && rayon::current_thread_index().is_none() {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            (0..k)
-                .into_par_iter()
-                .map(|idx| {
-                    let lambda = lambdas[idx];
-                    let a_i = penalty_quad_atom.rho_frozen_d1(idx);
-                    let q_eff = efs_q_eff_with_gamma_rate(
-                        efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale),
-                        lambda,
-                        &solution.rho_prior,
-                        idx,
-                    );
-                    (idx, efs_log_step_from_grad(q_eff, gradient[idx]))
-                })
-                .collect()
-        } else {
-            (0..k)
-                .map(|idx| {
-                    let lambda = lambdas[idx];
-                    let a_i = penalty_quad_atom.rho_frozen_d1(idx);
-                    let q_eff = efs_q_eff_with_gamma_rate(
-                        efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale),
-                        lambda,
-                        &solution.rho_prior,
-                        idx,
-                    );
-                    (idx, efs_log_step_from_grad(q_eff, gradient[idx]))
-                })
-                .collect()
-        };
-    for (idx, candidate) in rho_candidates {
-        if let Some(step) = candidate {
-            steps[idx] = step;
-        }
-    }
+    // Route the whole penalty-like block through the shared
+    // `efs_penalty_like_steps` helper (the same one `compute_efs_update` uses),
+    // so the hybrid path's ρ/τ steps are bit-for-bit identical to the pure-EFS
+    // path. ψ (design-moving) ext coords come back as 0.0 and are overwritten
+    // with the preconditioned gradient step below.
+    let mut steps = efs_penalty_like_steps(solution, rho, gradient)?;
 
-    // ── Extended penalty-like (τ) coordinates: universal-form EFS ──
-    // ── ψ (design-moving) coordinates: collect for preconditioned gradient ──
-    //
-    // τ coords go through the same Wood–Fasiolo update as ρ. ψ coords are
-    // collected and processed jointly via the ψ-ψ trace Gram matrix below.
+    // Classify ψ (design-moving) ext coordinates for the joint preconditioned
+    // gradient step. τ (penalty-like) coords are already filled above; here we
+    // only collect the ψ indices, preserving their order for the returned
+    // metadata.
     let mut psi_local_indices: Vec<usize> = Vec::new(); // index within ext_coords
     let mut psi_global_indices: Vec<usize> = Vec::new(); // index in full θ vector
-    let mut tau_local_indices: Vec<usize> = Vec::new(); // penalty-like ext coords
-
-    // Classify ext coordinates serially.  This preserves ψ ordering for the
-    // returned metadata and keeps the penalty-like-vs-design-moving decision
-    // out of the parallel update fill.
     for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
-        let g_idx = k + ext_idx;
-        if coord.is_penalty_like {
-            tau_local_indices.push(ext_idx);
-        } else {
-            // ψ coordinate: collect for joint preconditioned gradient.
+        if !coord.is_penalty_like {
             psi_local_indices.push(ext_idx);
-            psi_global_indices.push(g_idx);
-        }
-    }
-
-    let tau_candidates: Vec<(usize, Option<f64>)> = if tau_local_indices.len()
-        >= HYBRID_EFS_SCALAR_PAR_THRESHOLD
-        && rayon::current_thread_index().is_none()
-    {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        tau_local_indices
-            .to_vec()
-            .into_par_iter()
-            .map(|ext_idx| {
-                let coord = &solution.ext_coords[ext_idx];
-                let g_idx = k + ext_idx;
-                let q_eff = efs_q_eff(coord.a, &solution.dispersion, dp_cgrad, profiled_scale);
-                (g_idx, efs_log_step_from_grad(q_eff, gradient[g_idx]))
-            })
-            .collect()
-    } else {
-        tau_local_indices
-            .iter()
-            .map(|&ext_idx| {
-                let coord = &solution.ext_coords[ext_idx];
-                let g_idx = k + ext_idx;
-                let q_eff = efs_q_eff(coord.a, &solution.dispersion, dp_cgrad, profiled_scale);
-                (g_idx, efs_log_step_from_grad(q_eff, gradient[g_idx]))
-            })
-            .collect()
-    };
-    for (g_idx, candidate) in tau_candidates {
-        if let Some(step) = candidate {
-            steps[g_idx] = step;
+            psi_global_indices.push(k + ext_idx);
         }
     }
 

@@ -636,7 +636,6 @@ fn add_composed_hessian_pairs<const N: usize, const H: usize, A: Order2AtomChann
             let row = axes[local_row];
             let column = axes[local_column];
             let slot = SLS_HESSIAN_PAIR_SLOTS[row][column];
-            debug_assert!(slot < SLS_HESSIAN_PAIRS.len());
             let inner_live = A::HESSIAN_BITS & (1u128 << packed) != 0;
             let outer_live = A::GRADIENT_BITS & (1u128 << local_row) != 0
                 && A::GRADIENT_BITS & (1u128 << local_column) != 0;
@@ -1936,6 +1935,59 @@ pub(crate) enum SlsCoefficientHessian {
     DiagonalOnly(Array1<f64>),
 }
 
+impl SlsCoefficientHessian {
+    /// Consume the coupled dense-full Newton matrix. The lowering is
+    /// single-sourced from `survival_ls_coefficient_hessian`: the returned
+    /// variant always matches the `SlsCoefficientHessianTarget` that was
+    /// requested. A mismatch is therefore a solver-internal invariant break,
+    /// surfaced as a real error rather than a panic.
+    pub(crate) fn into_dense_full(self) -> Result<Array2<f64>, String> {
+        match self {
+            SlsCoefficientHessian::DenseFull(dense) => Ok(dense),
+            other => Err(SlsCoefficientHessian::variant_mismatch("DenseFull", &other)),
+        }
+    }
+
+    /// Consume the per-block inner-Newton working set. See `into_dense_full`
+    /// for the single-source invariant that makes a mismatch an internal error.
+    pub(crate) fn into_block_diagonal(self) -> Result<Vec<Array2<f64>>, String> {
+        match self {
+            SlsCoefficientHessian::BlockDiagonal(blocks) => Ok(blocks),
+            other => Err(SlsCoefficientHessian::variant_mismatch(
+                "BlockDiagonal",
+                &other,
+            )),
+        }
+    }
+
+    /// Consume the trust-metric diagonal. See `into_dense_full` for the
+    /// single-source invariant that makes a mismatch an internal error.
+    pub(crate) fn into_diagonal_only(self) -> Result<Array1<f64>, String> {
+        match self {
+            SlsCoefficientHessian::DiagonalOnly(diagonal) => Ok(diagonal),
+            other => Err(SlsCoefficientHessian::variant_mismatch(
+                "DiagonalOnly",
+                &other,
+            )),
+        }
+    }
+
+    fn variant_mismatch(expected: &str, got: &SlsCoefficientHessian) -> String {
+        let got_name = match got {
+            SlsCoefficientHessian::DenseFull(_) => "DenseFull",
+            SlsCoefficientHessian::BlockDiagonal(_) => "BlockDiagonal",
+            SlsCoefficientHessian::DiagonalOnly(_) => "DiagonalOnly",
+        };
+        SurvivalLocationScaleError::InternalInvariant {
+            reason: format!(
+                "survival-LS coefficient Hessian: requested {expected} view but lowered \
+                 {got_name}; packed 24-pair plan target and returned shape are single-sourced"
+            ),
+        }
+        .into()
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SlsHessianPairGroup {
     left_channel: usize,
@@ -2285,7 +2337,13 @@ impl SurvivalLocationScaleFamily {
                 }
                 Ok(SlsCoefficientHessian::BlockDiagonal(blocks))
             }
-            SlsCoefficientHessianTarget::DiagonalOnly => unreachable!(),
+            SlsCoefficientHessianTarget::DiagonalOnly => {
+                Err(SurvivalLocationScaleError::InternalInvariant {
+                    reason: "diagonal-only survival-LS lowering escaped its dedicated branch"
+                        .to_string(),
+                }
+                .into())
+            }
         }
     }
 

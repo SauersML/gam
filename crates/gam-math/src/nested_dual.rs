@@ -26,11 +26,18 @@
 /// the [`crate::jet_tower::Tower4`] / [`crate::jet_scalar::JetScalar`] Faà di
 /// Bruno convention exactly, so a program written against `JetField` evaluates
 /// identically on the engine tower and on a nested dual.
-pub trait JetField: Copy {
-    /// A constant field element with value `x` and every derivative channel zero.
-    fn from_f64(x: f64) -> Self;
+///
+/// This is the SHARED scalar-field algebra base of the #932 tower: the
+/// const-`K` packed [`crate::jet_scalar::JetScalar`] and the runtime-`p`
+/// Vec-backed flex jets (`survival::marginal_slope::timepoint_exact::FlexJet`)
+/// both EXTEND it, so the field ops and the single Faà di Bruno composition are
+/// declared exactly ONCE here. It is deliberately NOT `Copy` (the Vec-backed
+/// flex jets are `Clone`, not `Copy`) and carries no constructor (a Vec-backed
+/// constant needs a primary count) — the `Copy`, `from_f64`-carrying nested-dual
+/// oracle path adds those through [`JetFieldConst`].
+pub trait JetField {
     /// The real value channel (recurses through any nesting to the `f64` leaf).
-    fn value_f64(&self) -> f64;
+    fn value(&self) -> f64;
     fn add(&self, o: &Self) -> Self;
     fn sub(&self, o: &Self) -> Self;
     fn mul(&self, o: &Self) -> Self;
@@ -39,18 +46,24 @@ pub trait JetField: Copy {
     fn scale(&self, s: f64) -> Self;
     /// Faà di Bruno composition `f ∘ self` given the OUTER real function's
     /// derivative stack `d = [f(u), f′(u), f″(u), f‴(u), f⁗(u)]` evaluated at
-    /// `u = self.value_f64()` — the identical `[f64; 5]` stack shape
+    /// `u = self.value()` — the identical `[f64; 5]` stack shape
     /// [`crate::jet_tower::Tower4::compose_unary`] consumes.
     fn compose_unary(&self, d: [f64; 5]) -> Self;
 }
 
+/// A [`JetField`] that is `Copy` and can be built from a real constant with
+/// every derivative channel zero. The nested-dual oracle (`Dual2` over a `Copy`
+/// leaf) needs a dimensionless constructor; the runtime-`p` Vec-backed flex jets
+/// deliberately do NOT satisfy this (their constant needs a primary count), so
+/// it lives on this subtrait rather than the shared algebra base.
+pub trait JetFieldConst: JetField + Copy {
+    /// A constant field element with value `x` and every derivative channel zero.
+    fn from_f64(x: f64) -> Self;
+}
+
 impl JetField for f64 {
     #[inline]
-    fn from_f64(x: f64) -> Self {
-        x
-    }
-    #[inline]
-    fn value_f64(&self) -> f64 {
+    fn value(&self) -> f64 {
         *self
     }
     #[inline]
@@ -80,6 +93,13 @@ impl JetField for f64 {
     }
 }
 
+impl JetFieldConst for f64 {
+    #[inline]
+    fn from_f64(x: f64) -> Self {
+        x
+    }
+}
+
 /// A single-direction second-order jet over the field `S`: value `v`, first
 /// derivative `g`, second derivative `h`, all with respect to ONE seeded
 /// direction. Nest it (`Dual2<Dual2<f64>>`) for a second, independent direction.
@@ -93,7 +113,7 @@ pub struct Dual2<S: JetField> {
     pub h: S,
 }
 
-impl<S: JetField> Dual2<S> {
+impl<S: JetFieldConst> Dual2<S> {
     /// A constant (value `v`, zero derivatives) — carries no dependence on this
     /// dual's direction (but `v` may still depend on an inner nested direction).
     #[inline]
@@ -119,12 +139,8 @@ impl<S: JetField> Dual2<S> {
 
 impl<S: JetField> JetField for Dual2<S> {
     #[inline]
-    fn from_f64(x: f64) -> Self {
-        Self::constant(S::from_f64(x))
-    }
-    #[inline]
-    fn value_f64(&self) -> f64 {
-        self.v.value_f64()
+    fn value(&self) -> f64 {
+        self.v.value()
     }
     #[inline]
     fn add(&self, o: &Self) -> Self {
@@ -188,6 +204,13 @@ impl<S: JetField> JetField for Dual2<S> {
             g: f1.mul(&self.g),
             h: f1.mul(&self.h).add(&f2.mul(&self.g).mul(&self.g)),
         }
+    }
+}
+
+impl<S: JetFieldConst> JetFieldConst for Dual2<S> {
+    #[inline]
+    fn from_f64(x: f64) -> Self {
+        Self::constant(S::from_f64(x))
     }
 }
 
@@ -288,10 +311,7 @@ mod nested_dual_tower4_oracle_tests {
     // `Tower4<2>` and `Dual2<Dual2<f64>>`. `scale`/`neg` are composed from the
     // tower's `mul`/`sub` primitives (it exposes no direct scale/neg).
     impl<const K: usize> JetField for Tower4<K> {
-        fn from_f64(x: f64) -> Self {
-            Tower4::constant(x)
-        }
-        fn value_f64(&self) -> f64 {
+        fn value(&self) -> f64 {
             self.v
         }
         fn add(&self, o: &Self) -> Self {
@@ -314,6 +334,12 @@ mod nested_dual_tower4_oracle_tests {
         }
     }
 
+    impl<const K: usize> JetFieldConst for Tower4<K> {
+        fn from_f64(x: f64) -> Self {
+            Tower4::constant(x)
+        }
+    }
+
     /// exp stack `[e,e,e,e,e]` at `u`.
     fn exp_stack(u: f64) -> [f64; 5] {
         let e = u.exp();
@@ -332,17 +358,17 @@ mod nested_dual_tower4_oracle_tests {
     ///   f(p0, p1) = exp(p0·p1 + 0.3·p0)
     ///             + ln(1 + p0² + 0.5·p1² + 0.2·p0·p1)
     ///             − 0.7·(p0 − p1)²
-    fn program<J: JetField>(p0: &J, p1: &J) -> J {
+    fn program<J: JetFieldConst>(p0: &J, p1: &J) -> J {
         let one = J::from_f64(1.0);
         // exp(p0·p1 + 0.3·p0)
         let arg_e = p0.mul(p1).add(&p0.scale(0.3));
-        let term_exp = arg_e.compose_unary(exp_stack(arg_e.value_f64()));
+        let term_exp = arg_e.compose_unary(exp_stack(arg_e.value()));
         // ln(1 + p0² + 0.5·p1² + 0.2·p0·p1)
         let arg_l = one
             .add(&p0.mul(p0))
             .add(&p1.mul(p1).scale(0.5))
             .add(&p0.mul(p1).scale(0.2));
-        let term_ln = arg_l.compose_unary(ln_stack(arg_l.value_f64()));
+        let term_ln = arg_l.compose_unary(ln_stack(arg_l.value()));
         // −0.7·(p0 − p1)²
         let diff = p0.sub(p1);
         let term_quad = diff.mul(&diff).scale(-0.7);

@@ -25,10 +25,19 @@
 //! the joint solver's `EvidenceJointFitOutcome.fixed_point`: the arrow-routed fit
 //! is `certified` iff the evidence policy certified an idempotent fixed point.
 
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use ndarray::{Array1, Array2, Array3, ArrayView2, ArrayView3};
 
+use gam_terms::latent::LatentManifold;
+
 use crate::assignment::{AssignmentMode, SaeAssignment};
+use crate::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
 use crate::manifold::{SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm};
+use super::block_chart::{
+    BlockChartComposeConfig, BlockChartComposeResult, compose_block_coordinate_charts,
+};
 use super::coordinate::explained_variance_from_reconstruction;
 
 /// Result of the arrow-Schur-routed co-fit linear tier (Stage 1).
@@ -43,13 +52,23 @@ pub struct ArrowCofitReport {
     /// fixed point (`EvidenceJointFitOutcome.fixed_point`); `false` is the typed
     /// open certificate at `K ≫ rank`.
     pub certified: bool,
+    /// Number of curved (periodic) atoms folded into the joint solve — the count
+    /// of blocks whose BIC-gated chart discovery ([`compose_block_coordinate_charts`])
+    /// promoted them from a flat linear atom to a curved chart. `0` for the
+    /// linear-only path ([`cofit_linear_via_arrow`]). This is the curved-birth
+    /// count the migration ledger banks.
+    pub n_curved_atoms: usize,
+    /// Total BIC complexity charge (`Σ ½·d_eff·ln n_eff`, nats) of the curved
+    /// charts folded in — the description-length currency the ledger records as
+    /// `dl_bits`. `0.0` for the linear-only path.
+    pub curved_charge: f64,
 }
 
 /// Tuning for the arrow-routed linear fit. `max_iter` must be generous enough for
 /// the evidence policy to settle: `run_joint_fit_arrow_schur_for_quasi_laplace`
 /// rejects a heuristic termination, so a too-small budget errors rather than
 /// returning an open certificate.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ArrowCofitConfig {
     pub log_lambda_sparse: f64,
     pub log_lambda_smooth: f64,
@@ -57,6 +76,16 @@ pub struct ArrowCofitConfig {
     pub step_size: f64,
     pub ridge_ext_coord: f64,
     pub ridge_beta: f64,
+    /// Number of periodic-harmonic basis columns `M = 2·h + 1` for a folded
+    /// curved atom (must be odd, `>= 3`). `3` is one harmonic — an exact circle,
+    /// the ring the chart-discovery lane certifies. Used only by
+    /// [`cofit_composed_via_arrow`].
+    pub curved_num_basis: usize,
+    /// Chart-discovery configuration passed to [`compose_block_coordinate_charts`]
+    /// to decide WHICH blocks fold in as curved atoms. Its `block_size` /
+    /// `block_topk` / `gamma` are overwritten from the passed routing so the tiers
+    /// always agree on geometry. Used only by [`cofit_composed_via_arrow`].
+    pub chart: BlockChartComposeConfig,
 }
 
 impl Default for ArrowCofitConfig {
@@ -68,6 +97,8 @@ impl Default for ArrowCofitConfig {
             step_size: 1.0,
             ridge_ext_coord: 1.0e-6,
             ridge_beta: 1.0e-6,
+            curved_num_basis: 3,
+            chart: BlockChartComposeConfig::default(),
         }
     }
 }
@@ -215,7 +246,329 @@ pub fn cofit_linear_via_arrow(
         reconstructed,
         explained_variance,
         certified: outcome.fixed_point,
+        n_curved_atoms: 0,
+        curved_charge: 0.0,
     })
+}
+
+/// Build one linear (degree-1 monomial) atom for block `gi`: basis `Φ = [1, t₁,…,t_b]`
+/// (`M = b+1`), jet `∂Φ/∂t` (row 0 the intercept → 0; the identity block for the
+/// linear columns), decoder = `[0; block's b decoder rows]`, roughness Gram `0`
+/// (a linear atom is flat). Shared by the linear-only and composed paths.
+fn build_linear_atom(
+    gi: usize,
+    coord_block: &Array2<f64>,
+    decoder: ArrayView2<'_, f32>,
+    b: usize,
+    p: usize,
+) -> Result<SaeManifoldAtom, String> {
+    let n = coord_block.nrows();
+    let mut phi = Array2::<f64>::zeros((n, b + 1));
+    let mut jet = Array3::<f64>::zeros((n, b + 1, b));
+    for i in 0..n {
+        phi[[i, 0]] = 1.0;
+        for r in 0..b {
+            phi[[i, r + 1]] = coord_block[[i, r]];
+            jet[[i, r + 1, r]] = 1.0;
+        }
+    }
+    let mut atom_decoder = Array2::<f64>::zeros((b + 1, p));
+    for r in 0..b {
+        for c in 0..p {
+            atom_decoder[[r + 1, c]] = decoder[[gi * b + r, c]] as f64;
+        }
+    }
+    let gram = Array2::<f64>::zeros((b + 1, b + 1));
+    SaeManifoldAtom::new_with_provided_function_gram(
+        format!("t1_block_{gi}"),
+        SaeAtomBasisKind::Linear,
+        b,
+        phi,
+        jet,
+        atom_decoder,
+        gram,
+    )
+}
+
+/// Build one curved (periodic-harmonic) atom for block `gi` over a per-row angle
+/// coordinate `sᵢ = θᵢ / 2π ∈ [0,1)`, `θᵢ = atan2(t₂, t₁)` of the block's first two
+/// latent coords. The fundamental sin/cos decoder rows are seeded from the block's
+/// two decoder directions scaled by the mean firing radius `r̄` so the seed already
+/// traces the block's circle (`Φ·β ≈ r̄(cos θ · d₀ + sin θ · d₁)`); the joint solve
+/// refines `β` and the angle. Returns the atom and its `N×1` angle coordinate block.
+fn build_curved_atom(
+    gi: usize,
+    coord_block: &Array2<f64>,
+    decoder: ArrayView2<'_, f32>,
+    b: usize,
+    p: usize,
+    evaluator: &Arc<PeriodicHarmonicEvaluator>,
+    m: usize,
+) -> Result<(SaeManifoldAtom, Array2<f64>), String> {
+    let n = coord_block.nrows();
+    let inv_two_pi = 1.0 / (2.0 * std::f64::consts::PI);
+    let mut angle = Array2::<f64>::zeros((n, 1));
+    let mut radius_sum = 0.0;
+    let mut radius_n = 0.0;
+    for i in 0..n {
+        let t0 = coord_block[[i, 0]];
+        let t1 = coord_block[[i, 1]];
+        if t0 != 0.0 || t1 != 0.0 {
+            let theta = t1.atan2(t0);
+            // Wrap θ/2π into [0,1); atan2 ∈ (-π,π] ⇒ raw ∈ (-0.5,0.5].
+            let mut s = theta * inv_two_pi;
+            if s < 0.0 {
+                s += 1.0;
+            }
+            angle[[i, 0]] = s;
+            radius_sum += (t0 * t0 + t1 * t1).sqrt();
+            radius_n += 1.0;
+        }
+    }
+    let r_bar = if radius_n > 0.0 {
+        radius_sum / radius_n
+    } else {
+        1.0
+    };
+
+    let (phi, jet) = evaluator.evaluate(angle.view())?;
+    // Seed the fundamental harmonic decoder from the block's two directions so the
+    // atom starts on the block's circle. Column layout (PeriodicHarmonicEvaluator):
+    // 0 = constant, 1 = sin(2π·t), 2 = cos(2π·t), … .
+    let mut atom_decoder = Array2::<f64>::zeros((m, p));
+    if m >= 3 {
+        for c in 0..p {
+            atom_decoder[[2, c]] = r_bar * decoder[[gi * b, c]] as f64;
+            atom_decoder[[1, c]] = r_bar * decoder[[gi * b + 1, c]] as f64;
+        }
+    }
+    let gram = Array2::<f64>::eye(m);
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
+        format!("circle_block_{gi}"),
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        atom_decoder,
+        gram,
+    )?
+    .with_basis_second_jet(evaluator.clone());
+    Ok((atom, angle))
+}
+
+/// Fold BOTH the flat linear tier AND the BIC-discovered curved tier into ONE
+/// unified arrow-Schur joint solve (#2023 Increment 5, the composed cutover).
+///
+/// This is the composed analogue of [`cofit_linear_via_arrow`] and the match-or-beat
+/// replacement for the hand-rolled A/B coordinate descent of
+/// [`super::cofit_block_and_curved`]: instead of alternating a linear-code refit with
+/// a guarded curved-chart commit, it builds a mixed atom set — a flat linear atom for
+/// every block the chart-discovery lane leaves flat, a curved periodic atom for every
+/// block it promotes to a ring — and descends the SINGLE joint objective the unified
+/// engine minimises. A linear atom is the degree-1 special case of the curved atom
+/// (#2232), so the two tiers live in one assembly and one solve; the residual-
+/// orthogonality trap the alternation closed is closed here by construction, because
+/// the joint solve never freezes one tier against the other's stale residual.
+///
+/// **Chart discovery, not chart fitting.** [`compose_block_coordinate_charts`] is
+/// called ONCE — only to decide WHICH blocks are curved (its BIC-gated
+/// `selected_chart_blocks` / `selected_chart_pairs`) and to price them
+/// (`curved_charge`). The actual reconstruction is the arrow-Schur joint fit over the
+/// mixed atoms, warm-started from the routing, NOT the compose lane's own radial
+/// charts. Blocks with `b < 2` cannot carry an angle and stay linear.
+///
+/// **Stage 1 scope (dense).** DENSE assignment, moderate `K`, same as
+/// [`cofit_linear_via_arrow`]: the massive-`K` support-sparse engine seam is Stage 2
+/// (specced to the engine lane on #2023). This module only CALLS `SaeManifoldTerm`.
+pub fn cofit_composed_via_arrow(
+    target: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    blocks: ArrayView2<'_, u32>,
+    codes: ArrayView3<'_, f32>,
+    gamma: f32,
+    config: &ArrowCofitConfig,
+) -> Result<ArrowCofitReport, String> {
+    let (n, k_active) = blocks.dim();
+    let b = codes.shape()[2];
+    if b == 0 {
+        return Err("cofit_composed_via_arrow: block_size (codes.shape[2]) must be >= 1".to_string());
+    }
+    if decoder.nrows() == 0 || decoder.nrows() % b != 0 {
+        return Err(format!(
+            "cofit_composed_via_arrow: decoder rows {} must be a positive multiple of block_size {b}",
+            decoder.nrows()
+        ));
+    }
+    let g = decoder.nrows() / b;
+    let p = decoder.ncols();
+    if target.nrows() != n || target.ncols() != p {
+        return Err(format!(
+            "cofit_composed_via_arrow: target {:?} incompatible with N={n}, P={p}",
+            target.dim()
+        ));
+    }
+    if codes.shape()[0] != n || codes.shape()[1] != k_active {
+        return Err(format!(
+            "cofit_composed_via_arrow: codes shape {:?} incompatible with blocks {:?}",
+            codes.shape(),
+            blocks.dim()
+        ));
+    }
+    let m = config.curved_num_basis;
+    if m < 3 || m % 2 == 0 {
+        return Err(format!(
+            "cofit_composed_via_arrow: curved_num_basis must be odd and >= 3, got {m}"
+        ));
+    }
+
+    // --- Chart discovery: which blocks fold in as curved atoms, and their charge. ---
+    let mut chart_cfg = config.chart.clone();
+    chart_cfg.block_size = b;
+    chart_cfg.block_topk = k_active;
+    chart_cfg.gamma = gamma;
+    chart_cfg.residual_target = true;
+    let discovery = compose_block_coordinate_charts(target, decoder, blocks, codes, &chart_cfg)?;
+    let curved_blocks = accepted_curved_blocks(&discovery, g, b);
+    let curved_charge = accepted_curved_charge(&discovery);
+
+    // --- Per-block latent coordinates T_g (N×b): the block's γ-scaled signed codes
+    //     on the rows it fired, 0 elsewhere. Shared by both atom kinds. ---
+    let mut coord_blocks: Vec<Array2<f64>> = (0..g).map(|_| Array2::<f64>::zeros((n, b))).collect();
+    for i in 0..n {
+        for j in 0..k_active {
+            let atom = blocks[[i, j]] as usize;
+            if atom >= g {
+                return Err(format!(
+                    "cofit_composed_via_arrow: routed block {atom} out of range (G={g})"
+                ));
+            }
+            for r in 0..b {
+                coord_blocks[atom][[i, r]] = (gamma * codes[[i, j, r]]) as f64;
+            }
+        }
+    }
+
+    // --- Build the mixed atom set: curved for discovered ring blocks, linear else. ---
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m)?);
+    let mut atoms: Vec<SaeManifoldAtom> = Vec::with_capacity(g);
+    let mut assignment_coords: Vec<Array2<f64>> = Vec::with_capacity(g);
+    let mut manifolds: Vec<LatentManifold> = Vec::with_capacity(g);
+    let mut n_curved_atoms = 0usize;
+    for gi in 0..g {
+        if curved_blocks.contains(&gi) {
+            let (atom, angle) =
+                build_curved_atom(gi, &coord_blocks[gi], decoder, b, p, &evaluator, m)?;
+            atoms.push(atom);
+            assignment_coords.push(angle);
+            manifolds.push(LatentManifold::Circle { period: 1.0 });
+            n_curved_atoms += 1;
+        } else {
+            let atom = build_linear_atom(gi, &coord_blocks[gi], decoder, b, p)?;
+            atoms.push(atom);
+            assignment_coords.push(coord_blocks[gi].clone());
+            manifolds.push(LatentManifold::Euclidean);
+        }
+    }
+
+    // --- Frozen routing: dense logits large on fired atoms, small elsewhere. ---
+    const ON: f64 = 1.0;
+    const OFF: f64 = -1.0e3;
+    let mut logits = Array2::<f64>::from_elem((n, g), OFF);
+    for i in 0..n {
+        for j in 0..k_active {
+            logits[[i, blocks[[i, j]] as usize]] = ON;
+        }
+    }
+    let k_support = k_active.min(g).max(1);
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        assignment_coords,
+        manifolds,
+        AssignmentMode::top_k_support(k_support),
+    )?;
+
+    let mut term = SaeManifoldTerm::new(atoms, assignment)?;
+    term.set_guards_enabled(false);
+    // Per-atom ARD log-precision vectors sized to each atom's latent dim (b for a
+    // linear atom, 1 for a curved atom).
+    let log_ard: Vec<Array1<f64>> = (0..g)
+        .map(|gi| {
+            if curved_blocks.contains(&gi) {
+                Array1::<f64>::zeros(1)
+            } else {
+                Array1::<f64>::zeros(b)
+            }
+        })
+        .collect();
+    let mut rho = SaeManifoldRho::new(config.log_lambda_sparse, config.log_lambda_smooth, log_ard);
+
+    let target_f64 = target.mapv(|v| v as f64);
+    let outcome = term.run_joint_fit_arrow_schur_for_quasi_laplace(
+        target_f64.view(),
+        &mut rho,
+        None,
+        config.max_iter,
+        config.step_size,
+        config.ridge_ext_coord,
+        config.ridge_beta,
+    )?;
+
+    let recon_f64 = term.try_fitted_for_rho(&rho)?;
+    let reconstructed = recon_f64.mapv(|v| v as f32);
+    let explained_variance =
+        explained_variance_from_reconstruction(target, reconstructed.view())?;
+
+    Ok(ArrowCofitReport {
+        reconstructed,
+        explained_variance,
+        certified: outcome.fixed_point,
+        n_curved_atoms,
+        curved_charge,
+    })
+}
+
+/// The BIC-selected chart-owned block set (single blocks + both members of each
+/// selected pair), restricted to blocks that can carry an angle (`b >= 2`).
+fn accepted_curved_blocks(
+    result: &BlockChartComposeResult,
+    g: usize,
+    b: usize,
+) -> HashSet<usize> {
+    let mut s = HashSet::new();
+    if b < 2 {
+        return s;
+    }
+    for &gi in &result.selected_chart_blocks {
+        if gi < g {
+            s.insert(gi);
+        }
+    }
+    for &(g0, g1) in &result.selected_chart_pairs {
+        if g0 < g {
+            s.insert(g0);
+        }
+        if g1 < g {
+            s.insert(g1);
+        }
+    }
+    s
+}
+
+/// Total BIC complexity charge (nats) of the selected charts — the ledger's
+/// description-length currency for the curved births.
+fn accepted_curved_charge(result: &BlockChartComposeResult) -> f64 {
+    let mut charge = 0.0;
+    for rec in &result.block_records {
+        if rec.evidence.selected_by_bic {
+            charge += rec.evidence.charge;
+        }
+    }
+    for rec in &result.pair_records {
+        if rec.evidence.selected_by_bic {
+            charge += rec.evidence.charge;
+        }
+    }
+    charge
 }
 
 #[cfg(test)]
