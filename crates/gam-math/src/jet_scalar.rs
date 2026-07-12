@@ -2829,6 +2829,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mapped_order2_accumulator_matches_dense_overlapping_atoms() {
+        const K: usize = 4;
+        let p = [0.2_f64, 0.7, -0.4, 0.3];
+        let dense_vars: [Order2<K>; K] =
+            std::array::from_fn(|axis| Order2::variable(p[axis], axis));
+        let dense_q0 = dense_vars[3]
+            .mul(&dense_vars[1])
+            .add(&dense_vars[3].exp());
+        let dense_q1 = dense_vars[1].mul(&dense_vars[2]).sub(&dense_vars[2]);
+        let dense = dense_q0.ln().add(&dense_q1.exp());
+
+        let local_q0_vars: [Order2<2>; 2] =
+            std::array::from_fn(|axis| Order2::variable(p[[3, 1][axis]], axis));
+        let local_q0 = local_q0_vars[0]
+            .mul(&local_q0_vars[1])
+            .add(&local_q0_vars[0].exp());
+        let local_q1_vars: [Order2<2>; 2] =
+            std::array::from_fn(|axis| Order2::variable(p[[1, 2][axis]], axis));
+        let local_q1 = local_q1_vars[0]
+            .mul(&local_q1_vars[1])
+            .sub(&local_q1_vars[1]);
+
+        let q0 = local_q0.value();
+        let q1_exp = local_q1.value().exp();
+        let mut lowered = MappedOrder2Accumulator::<K>::zero();
+        lowered.add_composed(&local_q0, [3, 1], [q0.ln(), q0.recip(), -1.0 / (q0 * q0)]);
+        lowered.add_composed(&local_q1, [1, 2], [q1_exp, q1_exp, q1_exp]);
+        let (value, gradient, hessian) = lowered.into_channels();
+
+        close(value, dense.value(), "mapped value");
+        for i in 0..K {
+            close(gradient[i], dense.g()[i], &format!("mapped gradient[{i}]"));
+            for j in 0..K {
+                close(
+                    hessian[i][j],
+                    dense.h()[i][j],
+                    &format!("mapped Hessian[{i},{j}]"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "mapped atom axes must be injective")]
+    fn mapped_order2_accumulator_rejects_duplicate_axes() {
+        let vars: [Order2<2>; 2] = std::array::from_fn(|axis| Order2::variable(0.2, axis));
+        let atom = vars[0].add(&vars[1]);
+        let mut lowered = MappedOrder2Accumulator::<2>::zero();
+        lowered.add_composed(&atom, [1, 1], [0.4, 1.0, 0.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "mapped atom axis must be within")]
+    fn mapped_order2_accumulator_rejects_out_of_range_axes() {
+        let atom = Order2::<1>::variable(0.2, 0);
+        let mut lowered = MappedOrder2Accumulator::<2>::zero();
+        lowered.add_composed(&atom, [2], [0.2, 1.0, 0.0]);
+    }
+
     #[derive(Clone, Copy, Debug)]
     struct FullTwoPattern;
 
