@@ -565,13 +565,18 @@ pub fn run_auto_sae_crosscoder_fit(
     request: SaeCrosscoderAutoFitRequest,
 ) -> Result<SaeCrosscoderFitReport, SaeFitError> {
     request.config.validate()?;
-    let (mut stacked, _, _) =
+    let (stacked, _, _) =
         stack_crosscoder_targets(&request.anchor_label, &request.anchor, &request.blocks)?;
-    // #2015 — equilibrate BEFORE seeding so the seed's decoder/coordinates are
-    // fit in the SAME conditioning frame `run_sae_crosscoder_fit` builds its
-    // objective in (it re-derives the identical `column_scale` from the same
-    // raw `anchor`/`blocks`, so the two stacked targets are byte-identical).
-    let column_scale = equilibrate_crosscoder_columns(&mut stacked);
+    // #2015 — unit-RMS data equilibration was tried here and REVERTED: for a
+    // homoscedastic reconstruction objective, dividing columns by their RMS is
+    // not a reparametrization — it changes the estimand (noise-dominated
+    // columns are amplified to unit RMS and the fit spends capacity explaining
+    // them). Measured on MSI 13021686: the real-Qwen tiny-crawl gate refused
+    // at the co-collapse floor (EV 0.4566 vs null 0.4583) and planted
+    // transport recovery collapsed (phase R² 0.139, smooth R² 0.837). The
+    // conditioning fix for the κ~1e8 within-block spread must live in the
+    // inner solver's linear algebra (preconditioning), not in the data frame.
+    let column_scale = Array1::<f64>::ones(stacked.ncols());
     let assignment = SaeFitAssignmentKind::Softmax;
     let minimal = build_sae_minimal_seed(SaeMinimalSeedRequest {
         target: stacked.view(),
@@ -918,13 +923,10 @@ pub fn run_sae_crosscoder_fit(
             stacked.ncols()
         )));
     }
-    // #2015 — apply the SAME column equilibration the seed was built against
-    // (`run_auto_sae_crosscoder_fit` derives `column_scale` from this identical
-    // raw `[anchor | blocks...]` stack, so this reproduces it bit-for-bit) to
-    // the objective's own internal target, BEFORE `with_crosscoder_blocks`
-    // captures its `pristine_blocks` baseline below — so every subsequent
-    // `√λ_ℓ` block rewrite composes on top of the equilibrated columns rather
-    // than replacing them.
+    // #2015 — `column_scale` is unit under the reverted data-equilibration
+    // design (see `run_auto_sae_crosscoder_fit`); the division is kept so a
+    // future solver-level preconditioning design can reuse the plumbing, and
+    // is an exact no-op today.
     for mut row in stacked.rows_mut() {
         row /= &request.column_scale;
     }
