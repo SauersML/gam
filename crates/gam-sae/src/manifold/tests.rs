@@ -1284,6 +1284,95 @@ pub(crate) fn compact_layout_riemannian_geometry_matches_dense_on_full_support()
     );
 }
 
+/// #2295 — a compact mixed-dimensional row must preserve every ambient axis.
+/// `LatentManifold::Euclidean` is `R^d` at the coordinate-block boundary but a
+/// scalar factor inside `Product`; storing one `Euclidean` child for this plane
+/// used to make the product one axis too short and panic in every projection,
+/// retraction, and Riemannian-Hessian operation after the preceding Circle.
+#[test]
+pub(crate) fn compact_mixed_dimensional_manifold_expands_euclidean_axes_2295() {
+    let circle_coords = array![[0.12_f64], [0.63]];
+    let (circle_phi, circle_jet) = periodic_basis(&circle_coords);
+    let circle_atom = SaeManifoldAtom::new_with_provided_function_gram(
+        "circle",
+        SaeAtomBasisKind::Periodic,
+        1,
+        circle_phi,
+        circle_jet,
+        Array2::<f64>::zeros((3, 2)),
+        Array2::<f64>::eye(3),
+    )
+    .unwrap()
+    .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+
+    let plane_coords = array![[0.2_f64, -0.4], [0.7, 0.1]];
+    let plane_evaluator = Arc::new(EuclideanPatchEvaluator::new(2, 1).unwrap());
+    let (plane_phi, plane_jet) = plane_evaluator.evaluate(plane_coords.view()).unwrap();
+    let plane_atom = SaeManifoldAtom::new_with_provided_function_gram(
+        "plane",
+        SaeAtomBasisKind::EuclideanPatch,
+        2,
+        plane_phi,
+        plane_jet,
+        Array2::<f64>::zeros((3, 2)),
+        Array2::<f64>::eye(3),
+    )
+    .unwrap()
+    .with_basis_evaluator(plane_evaluator);
+
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((2, 2)),
+        vec![circle_coords, plane_coords],
+        vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Euclidean,
+        ],
+        AssignmentMode::top_k_support(2),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(vec![circle_atom, plane_atom], assignment).unwrap();
+    let assignments = vec![array![1.0_f64, 1.0], array![1.0, 1.0]];
+    let layout = SaeRowLayout::from_topk_gates(
+        &assignments,
+        2,
+        vec![1, 2],
+        term.assignment.coord_offsets(),
+    )
+    .unwrap();
+
+    let (manifold, point) = term.compact_row_ext_manifold_and_point(0, &layout);
+    assert_eq!(point.len(), 3);
+    assert_eq!(manifold.ambient_dim(point.len()), point.len());
+
+    let gradient = array![0.3_f64, -0.2, 0.5];
+    let velocity = array![0.04_f64, -0.03, 0.02];
+    let euclidean_hessian = array![[2.0_f64, 0.1, 0.0], [0.1, 1.5, -0.2], [0.0, -0.2, 1.0]];
+    assert_eq!(manifold.project_point(point.view()).len(), 3);
+    assert_eq!(
+        manifold
+            .project_gradient_to_tangent(point.view(), gradient.view())
+            .len(),
+        3
+    );
+    assert_eq!(
+        manifold
+            .project_vector_to_gradient_tangent(
+                point.view(),
+                gradient.view(),
+                velocity.view(),
+            )
+            .len(),
+        3
+    );
+    assert_eq!(manifold.retract(point.view(), velocity.view()).len(), 3);
+    assert_eq!(
+        manifold
+            .riemannian_hessian_matrix(point.view(), gradient.view(), euclidean_hessian.view())
+            .dim(),
+        (3, 3)
+    );
+}
+
 /// Exact dense assignment admission is geometry-independent and refuses before
 /// allocation when the required row-curvature plus decoder-Gram storage exceeds
 /// the supplied budget. It never changes the model into a compact surrogate.

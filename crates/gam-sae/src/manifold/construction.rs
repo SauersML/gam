@@ -5287,6 +5287,32 @@ impl SaeManifoldTerm {
         out
     }
 
+    /// Append one coordinate block in the scalar-factor representation required
+    /// by [`LatentManifold::Product`]. A top-level `Euclidean` means `R^d`, but
+    /// the same variant inside a product means one scalar axis, so an `R^d`
+    /// coordinate must be expanded to `d` Euclidean children. Constrained
+    /// manifolds already encode their ambient width and remain one child.
+    fn append_coordinate_manifold_parts(
+        parts: &mut Vec<LatentManifold>,
+        manifold: &LatentManifold,
+        latent_dim: usize,
+    ) -> bool {
+        assert_eq!(
+            manifold.ambient_dim(latent_dim),
+            latent_dim,
+            "coordinate manifold ambient width must equal its latent dimension"
+        );
+        if manifold.is_euclidean() {
+            for _ in 0..latent_dim {
+                parts.push(LatentManifold::Euclidean);
+            }
+            false
+        } else {
+            parts.push(manifold.clone());
+            true
+        }
+    }
+
     pub(crate) fn ext_coord_manifold(&self) -> LatentManifold {
         let mut parts = Vec::with_capacity(self.assignment.row_block_dim());
         for _ in 0..self.assignment.assignment_coord_dim() {
@@ -5294,14 +5320,11 @@ impl SaeManifoldTerm {
         }
         let mut any_constrained = false;
         for coord in &self.assignment.coords {
-            if coord.manifold().is_euclidean() {
-                for _ in 0..coord.latent_dim() {
-                    parts.push(LatentManifold::Euclidean);
-                }
-            } else {
-                any_constrained = true;
-                parts.push(coord.manifold().clone());
-            }
+            any_constrained |= Self::append_coordinate_manifold_parts(
+                &mut parts,
+                coord.manifold(),
+                coord.latent_dim(),
+            );
         }
         if any_constrained {
             LatentManifold::Product(parts)
@@ -5333,7 +5356,7 @@ impl SaeManifoldTerm {
     ) -> (LatentManifold, Array1<f64>) {
         let active = &layout.active_atoms[row];
         let q_active = layout.row_q_active(row);
-        let mut parts: Vec<LatentManifold> = Vec::with_capacity(active.len());
+        let mut parts: Vec<LatentManifold> = Vec::with_capacity(q_active);
         let mut point = Array1::<f64>::zeros(q_active);
         // Coordinate blocks: each active atom's coordinate manifold + point, at
         // the compact coord start the layout assigned it.
@@ -5342,11 +5365,7 @@ impl SaeManifoldTerm {
             let d = coord.latent_dim();
             let coord_start = layout.coord_starts[row][j];
             let manifold_k = coord.manifold();
-            // A `d`-dim coordinate whose manifold is a product (e.g. a torus =
-            // Circle×Circle) already carries its `d` parts; a scalar manifold is
-            // one part. Either way the manifold's ambient width must equal `d`,
-            // matching the `d` compact columns at `coord_start`.
-            parts.push(manifold_k.clone());
+            Self::append_coordinate_manifold_parts(&mut parts, manifold_k, d);
             let coord_point = coord.row(row);
             for axis in 0..d {
                 point[coord_start + axis] = coord_point[axis];
