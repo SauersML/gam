@@ -5369,6 +5369,177 @@ mod linear_parity_anchor_1026_tests {
         SaeManifoldTerm::new(vec![atom], assignment).unwrap()
     }
 
+    /// #2228/#2266 — in the small-ρ dense regime the SAE outer objective must
+    /// DECLARE an analytic (dense) Hessian so the planner's guardless
+    /// `(Analytic gradient, Analytic Hessian) => Solver::Arc` arm fires — ARC
+    /// crosses the non-stationary saddle band by cubic regularization, where the
+    /// first-order Hybrid-EFS/BFGS lane (the historical `DeclaredHessianForm::
+    /// Unavailable` route) plateaus. This pins the full routing contract that
+    /// unblocks the E1 mint: the capability declares `Dense`, `plan` selects ARC
+    /// with `HessianSource::Analytic`, and — the paired half the analytic-route
+    /// contract in `build_bridge_hessian_for_source` requires — the
+    /// `ValueGradientHessian` eval materializes a symmetric dense outer Hessian,
+    /// while the `ValueAndGradient` order stays `Unavailable` (no wasted curvature
+    /// on line-search cost/gradient probes). The dense Hessian is verified to be
+    /// exactly the canonical `fd_outer_hessian_from_gradient` functional (the ONE
+    /// stepper the outer certificate's decrement rescue also consumes — no
+    /// parallel FD path), and is eigen-decomposed to confirm it is a usable
+    /// symmetric curvature the saddle certificate can read.
+    ///
+    /// (Full ARC step ACCEPTANCE across the 4.8×-over band additionally needs the
+    /// value↔gradient desync closure (#2228/#2266, a separate lane); the routing,
+    /// dense-Hessian assembly, and ARC selection pinned here are independently
+    /// correct and independently testable.)
+    #[test]
+    fn small_dense_sae_declares_dense_hessian_and_routes_arc_2266() {
+        use faer::Side;
+        use gam_linalg::faer_ndarray::strict_symmetric_eigh;
+        use gam_solve::rho_optimizer::{HessianSource, Solver, plan};
+
+        // A well-posed rank-2 linear SAE (K=1, d=1 ungated background tier) — the
+        // #1026 fixture, whose inner solve converges cleanly, standing in for the
+        // small-ρ dense E1 regime (K=1, low ρ-dimension, dense direct-logdet).
+        let n = 40usize;
+        let p = 6usize;
+        let zf: Vec<f64> = (0..n)
+            .map(|i| ((i as f64 + 1.0) * 0.23).sin() + 0.3 * ((i * 3) as f64).cos())
+            .collect();
+        let c0 = Array1::from_shape_fn(p, |c| 1.0 + 0.5 * (c as f64) - 0.2 * ((c % 3) as f64));
+        let c1 = Array1::from_shape_fn(p, |c| (((c * 2 + 1) % 5) as f64 - 2.0) * 0.7);
+        let target = Array2::from_shape_fn((n, p), |(i, c)| c0[c] + zf[i] * c1[c]);
+        let coords = Array2::from_shape_fn((n, 1), |(i, _)| zf[i]);
+        let logits =
+            Array2::from_shape_fn((n, 1), |(i, _)| -3.0 + 6.0 * (i as f64) / (n as f64 - 1.0));
+
+        let build_obj = || {
+            let term = single_linear_atom_term(coords.clone(), logits.clone(), p, true);
+            let init_rho = SaeManifoldRho::new(
+                (1.0e-4_f64).ln(),
+                (1.0e-2_f64).ln(),
+                vec![Array1::<f64>::zeros(1)],
+            );
+            SaeManifoldOuterObjective::new(term, target.clone(), None, init_rho, 60, 0.5, 1e-4, 1e-4)
+        };
+
+        let mut obj = build_obj();
+        let rho_flat = obj.baseline_rho.to_flat();
+        assert!(
+            rho_flat.len() <= SMALL_ANALYTIC_HESSIAN_MAX_PARAMS,
+            "fixture ρ-dimension {} must sit inside the small dense regime bound {}",
+            rho_flat.len(),
+            SMALL_ANALYTIC_HESSIAN_MAX_PARAMS
+        );
+
+        // (1) Capability declares an analytic dense Hessian, and the pure planner
+        //     therefore selects ARC with the analytic Hessian source — the whole
+        //     point: no first-order plateau at the saddle.
+        let cap = obj.capability();
+        assert_eq!(
+            cap.gradient,
+            Derivative::Analytic,
+            "the dense-admitted SAE outer gradient must be analytic"
+        );
+        assert_eq!(
+            cap.hessian,
+            DeclaredHessianForm::Dense,
+            "the small-ρ dense regime must DECLARE an analytic dense outer Hessian \
+             (was Unavailable, forcing the first-order saddle plateau)"
+        );
+        let outer_plan = plan(&cap);
+        assert_eq!(
+            outer_plan.solver,
+            Solver::Arc,
+            "declaring a dense analytic Hessian must route the planner to ARC, \
+             not the first-order EFS/BFGS lane; got {outer_plan}"
+        );
+        assert_eq!(
+            outer_plan.hessian_source,
+            HessianSource::Analytic,
+            "ARC on the SAE dense regime consumes the analytic Hessian source"
+        );
+
+        // (2) The `ValueAndGradient` order (line-search cost/gradient probes) does
+        //     NOT pay for a Hessian; only `ValueGradientHessian` does. This is the
+        //     order-gating the ARC bridge relies on.
+        let vg = obj
+            .eval_with_order(&rho_flat, OuterEvalOrder::ValueAndGradient)
+            .expect("value+gradient eval at the seed");
+        assert!(
+            matches!(vg.hessian, HessianValue::Unavailable),
+            "the value+gradient order must not materialize a Hessian"
+        );
+
+        // (3) The `ValueGradientHessian` order materializes a Dense symmetric outer
+        //     Hessian — the paired half of the analytic-route contract. Computed on
+        //     a FRESH objective so its warm-start history matches the direct
+        //     canonical-FD reference in (4) exactly.
+        let mut obj_h = build_obj();
+        let vgh = obj_h
+            .eval_with_order(&rho_flat, OuterEvalOrder::ValueGradientHessian)
+            .expect("value+gradient+Hessian eval at the seed");
+        assert!(
+            vgh.cost.is_finite(),
+            "the dense-regime Hessian eval must be feasible at the seed"
+        );
+        let HessianValue::Dense(h) = vgh.hessian else {
+            panic!(
+                "the small-ρ dense regime must return HessianValue::Dense on the \
+                 ValueGradientHessian order; got {:?}",
+                vgh.hessian
+            );
+        };
+        let d = rho_flat.len();
+        assert_eq!(h.dim(), (d, d), "the outer Hessian must be ρ-dimension square");
+        for i in 0..d {
+            for j in 0..d {
+                assert!(h[[i, j]].is_finite(), "outer Hessian entry ({i},{j}) is non-finite");
+                assert!(
+                    (h[[i, j]] - h[[j, i]]).abs() <= 1e-9 * (1.0 + h[[i, j]].abs()),
+                    "outer Hessian must be symmetric: H[{i},{j}]={} vs H[{j},{i}]={}",
+                    h[[i, j]],
+                    h[[j, i]]
+                );
+            }
+        }
+
+        // (4) The eval-site Hessian IS the canonical FD-of-analytic-gradient
+        //     functional (the same stepper the outer certificate decrement rescue
+        //     consumes), computed on a freshly-built identical objective. This pins
+        //     the unification: no bespoke parallel FD path.
+        let mut obj_ref = build_obj();
+        let h_ref = fd_outer_hessian_from_gradient(&mut obj_ref, &rho_flat)
+            .expect("canonical FD outer Hessian at the seed");
+        for i in 0..d {
+            for j in 0..d {
+                assert!(
+                    (h[[i, j]] - h_ref[[i, j]]).abs() <= 1e-9 * (1.0 + h_ref[[i, j]].abs()),
+                    "the dense eval Hessian must equal the canonical \
+                     fd_outer_hessian_from_gradient functional at ({i},{j}): \
+                     {} vs {}",
+                    h[[i, j]],
+                    h_ref[[i, j]]
+                );
+            }
+        }
+
+        // (5) The dense Hessian is a usable symmetric curvature the saddle
+        //     certificate reads: its self-adjoint eigendecomposition succeeds with
+        //     finite eigenvalues. ARC follows any negative-curvature eigenvector off
+        //     a saddle by construction; the inertia is reported for the record.
+        let (evals, _evecs) =
+            strict_symmetric_eigh(&h, Side::Lower).expect("dense outer Hessian eigendecomposition");
+        assert!(
+            evals.iter().all(|v| v.is_finite()),
+            "outer Hessian eigenvalues must be finite: {evals:?}"
+        );
+        let n_neg = evals.iter().filter(|v| **v < 0.0).count();
+        let n_pos = evals.iter().filter(|v| **v > 0.0).count();
+        println!(
+            "[#2266] small-ρ dense SAE outer Hessian eigenvalues={evals:?} \
+             (negative={n_neg}, positive={n_pos}); ARC selected, saddle-capable route active"
+        );
+    }
+
     /// #1026 END-TO-END: a fitted LINEAR SAE whose single linear atom is the
     /// UNGATED background tier (gate ≡ 1) reaches the rank-2 PCA reconstruction
     /// ceiling, with the inner Newton converging cleanly on the ridge-inert
