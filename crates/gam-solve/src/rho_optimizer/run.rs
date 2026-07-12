@@ -1946,7 +1946,18 @@ pub enum OperatorTrustRegionStopReason {
 /// evaluation failure, length mismatch, or non-finite entry — the caller then
 /// simply has no curvature evidence, exactly as before. The mixed-partial
 /// asymmetry (truncation + residual inner noise) is symmetrized away.
-fn fd_outer_hessian_from_gradient(
+///
+/// This is the ONE canonical FD-of-analytic-gradient stepper. Besides the
+/// certificate decrement rescue above, the small-ρ dense outer-Hessian route
+/// (#2228/#2266: `gam-sae`'s `SaeManifoldOuterObjective::eval_with_order`
+/// materializes a `HessianValue::Dense` so the planner selects ARC instead of
+/// first-order BFGS/EFS across the saddle band) calls it through this same
+/// entry, so the in-loop Hessian, the seed Hessian, and the final-point
+/// certificate Hessian are byte-identical functionals — no parallel stepper.
+/// The probe evals request `ValueAndGradient` only, so a caller whose
+/// `ValueGradientHessian` order routes here never recurses into a nested
+/// Hessian build.
+pub fn fd_outer_hessian_from_gradient(
     obj: &mut dyn OuterObjective,
     rho: &Array1<f64>,
 ) -> Option<Array2<f64>> {

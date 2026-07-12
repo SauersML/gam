@@ -71,5 +71,10 @@ pub use run::OuterResult;
 // that thread the termination verdict into their own payloads (gam-sae's
 // SaeOuterTermination) can name the variants.
 pub use run::OuterConvergedVia;
+// Re-export the canonical FD-of-analytic-gradient outer-Hessian stepper at
+// `pub` so the gam-sae SAE objective materializes its small-ρ dense outer
+// Hessian (#2228/#2266 ARC route) through the SAME functional the outer
+// certificate's decrement rescue uses — one stepper, no parallel FD path.
+pub use run::fd_outer_hessian_from_gradient;
 pub(crate) use run_plan::*;
 pub(crate) use seed_screening::*;
