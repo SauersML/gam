@@ -172,7 +172,23 @@ pub fn atom_behavior_isometry(
 
     // Split the fitted augmented decoder [B_k | √λ_y C_k] into the activation
     // decoder B_k and the nats-unit behavior decoder C_k (the √λ_y un-done).
-    let (b_k, c_k) = block.split_decoder(atom.decoder_coefficients.view())?;
+    // Tier-0 column standardization/equilibration (#2015) is a fit-internal
+    // frame: undo it first so b_k/c_k are in raw activation / nats units,
+    // matching the raw-frame quantities the isometry ratio is quoted against.
+    let mut augmented = atom.decoder_coefficients.to_owned();
+    if let Some(scale) = term.tier0_scale() {
+        if scale.len() != augmented.ncols() {
+            return Err(format!(
+                "atom_behavior_isometry: tier0 scale length {} != decoder width {}",
+                scale.len(),
+                augmented.ncols()
+            ));
+        }
+        for (col, &s) in scale.iter().enumerate() {
+            augmented.column_mut(col).mapv_inplace(|v| v * s);
+        }
+    }
+    let (b_k, c_k) = block.split_decoder(augmented.view())?;
     let coords = term.assignment.coords[atom_idx].as_matrix().to_owned();
     if coords.ncols() != 1 {
         return Ok(None);

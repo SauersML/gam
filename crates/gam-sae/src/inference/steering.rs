@@ -441,8 +441,9 @@ pub fn steer_delta(
     }
 
     // --- the on-manifold activation-space delta -----------------------------
-    let g_from = decode_at(atom, t_from)?;
-    let g_to = decode_at(atom, t_to)?;
+    let tier0_scale = model.tier0_scale();
+    let g_from = decode_at(atom, t_from, tier0_scale)?;
+    let g_to = decode_at(atom, t_to, tier0_scale)?;
     let mut delta = Array1::<f64>::zeros(p);
     for i in 0..p {
         delta[i] = amplitude * (g_to[i] - g_from[i]);
@@ -484,7 +485,7 @@ pub fn steer_delta(
             t_mid[a] = t_mid[a].rem_euclid(period);
         }
     }
-    let tangents = decode_tangents_at(atom, &t_mid)?;
+    let tangents = decode_tangents_at(atom, &t_mid, tier0_scale)?;
     let off_manifold_norm = off_manifold_residual_norm(&tangents, delta.view());
 
     // --- dosimetry: exact applied-delta Fisher endpoint KL ------------------
@@ -493,6 +494,7 @@ pub fn steer_delta(
     } else {
         let ctx = SteerContext {
             atom,
+            scale: tier0_scale,
             metric,
             row: metric_row,
             p,
@@ -572,7 +574,7 @@ pub fn predicted_response(
             atom.name
         )
     })?;
-    let tangents = decode_tangents_at(atom, t_at)?;
+    let tangents = decode_tangents_at(atom, t_at, model.tier0_scale())?;
     Ok(project_onto_tangent_span(&tangents, delta))
 }
 
@@ -590,17 +592,47 @@ fn metric_carries_behavior(p: MetricProvenance) -> bool {
 
 /// Evaluate the decoder output `g_k(t) = Φ_k(t) B_k ∈ ℝ^p` at an arbitrary
 /// latent coordinate `t` (length `d`) via the atom's installed evaluator.
-fn decode_at(atom: &SaeManifoldAtom, t: &[f64]) -> Result<Array1<f64>, String> {
+///
+/// `scale` is the owning term's Tier-0 column scale (`term.tier0_scale()`):
+/// under standardization/equilibration the fitted decoder lives in the
+/// internal per-column frame `B_int[:,c] = B_raw[:,c]/σ_c`, while the row
+/// metric `M = UUᵀ` is always built from raw activation-space probes. Every
+/// steering quantity that meets the metric (chords, tangents, doses) must
+/// therefore be mapped back to raw units, `g_raw[c] = σ_c·g_int[c]` (gh#2249
+/// calibration confound; the Tier-0 MEAN cancels in every consumer here
+/// because only chords/tangents are used, never absolute decodes).
+fn decode_at(
+    atom: &SaeManifoldAtom,
+    t: &[f64],
+    scale: Option<&Array1<f64>>,
+) -> Result<Array1<f64>, String> {
     let d = t.len();
     let coords = Array2::from_shape_vec((1, d), t.to_vec())
         .map_err(|e| format!("steer_delta::decode_at: coord shape: {e}"))?;
-    Ok(atom.decode_at_coords(coords.view())?.row(0).to_owned())
+    let mut out = atom.decode_at_coords(coords.view())?.row(0).to_owned();
+    if let Some(scale) = scale {
+        if scale.len() != out.len() {
+            return Err(format!(
+                "steer_delta::decode_at: tier0 scale length {} != output_dim {}",
+                scale.len(),
+                out.len()
+            ));
+        }
+        for (v, &s) in out.iter_mut().zip(scale.iter()) {
+            *v *= s;
+        }
+    }
+    Ok(out)
 }
 
 /// Evaluate the decoder tangents `∂g_k/∂t_a = Φ_k'(t) B_k ∈ ℝ^p`, one per latent
 /// axis `a ∈ 0..d`, at an arbitrary latent coordinate `t`. Returned as a
 /// `(p × d)` matrix whose column `a` is the tangent along axis `a`.
-fn decode_tangents_at(atom: &SaeManifoldAtom, t: &[f64]) -> Result<Array2<f64>, String> {
+fn decode_tangents_at(
+    atom: &SaeManifoldAtom,
+    t: &[f64],
+    scale: Option<&Array1<f64>>,
+) -> Result<Array2<f64>, String> {
     let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
         "steer_delta::decode_tangents_at: atom has no installed basis evaluator".to_string()
     })?;
@@ -633,6 +665,17 @@ fn decode_tangents_at(atom: &SaeManifoldAtom, t: &[f64]) -> Result<Array2<f64>, 
             for out_col in 0..p {
                 tang[[out_col, axis]] += dphi * decoder[[basis_col, out_col]];
             }
+        }
+    }
+    if let Some(scale) = scale {
+        if scale.len() != p {
+            return Err(format!(
+                "steer_delta::decode_tangents_at: tier0 scale length {} != output_dim {p}",
+                scale.len()
+            ));
+        }
+        for (out_col, &s) in scale.iter().enumerate() {
+            tang.row_mut(out_col).mapv_inplace(|v| v * s);
         }
     }
     Ok(tang)
@@ -742,6 +785,10 @@ fn solve_spd_small(gram: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
 /// its helpers take a single context rather than a long argument list.
 struct SteerContext<'a> {
     atom: &'a SaeManifoldAtom,
+    /// Tier-0 column scale of the owning term, when standardization /
+    /// equilibration is installed: decodes must be un-scaled back to raw
+    /// activation units before they meet the (always raw-frame) row metric.
+    scale: Option<&'a Array1<f64>>,
     metric: &'a RowMetric,
     /// The row whose per-row metric the dose is measured through.
     row: usize,
@@ -787,7 +834,7 @@ fn validity_radius(ctx: &SteerContext<'_>, t_from: &[f64]) -> Result<f64, String
     let amp = ctx.amplitude;
 
     // Initial-tangent linear output move per unit τ: v0 = (∂g/∂t|_{t_from}) Δt.
-    let tang0 = decode_tangents_at(ctx.atom, t_from)?;
+    let tang0 = decode_tangents_at(ctx.atom, t_from, ctx.scale)?;
     let mut v0 = Array1::<f64>::zeros(p);
     for i in 0..p {
         let mut acc = 0.0_f64;
@@ -803,12 +850,12 @@ fn validity_radius(ctx: &SteerContext<'_>, t_from: &[f64]) -> Result<f64, String
         return Ok(full_len);
     }
 
-    let g_from = decode_at(ctx.atom, t_from)?;
+    let g_from = decode_at(ctx.atom, t_from, ctx.scale)?;
     let steps = STEER_VALIDITY_STEPS;
     for s in 0..steps {
         let tau = (s as f64 + 1.0) / steps as f64;
         let t_mid = path_coordinate(t_from, dt, ctx.periods, tau);
-        let g_tau = decode_at(ctx.atom, &t_mid)?;
+        let g_tau = decode_at(ctx.atom, &t_mid, ctx.scale)?;
         let mut chord = Array1::<f64>::zeros(p);
         for i in 0..p {
             chord[i] = amp * (g_tau[i] - g_from[i]);
@@ -965,7 +1012,7 @@ pub fn collateral_curve(
         let mut frames = Vec::with_capacity(n);
         for row in 0..n {
             let t: Vec<f64> = coords.row(row).to_vec();
-            frames.push(decode_tangents_at(&model.atoms[atom_idx], &t)?);
+            frames.push(decode_tangents_at(&model.atoms[atom_idx], &t, model.tier0_scale())?);
         }
         Ok(frames)
     };
