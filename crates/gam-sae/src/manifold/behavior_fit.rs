@@ -389,28 +389,17 @@ impl SaeManifoldTerm {
             // true`. Only a realizable descent the search actually captured (in
             // either direction) keeps the sweep moving.
 
-            // Armijo backtracking on the profiled criterion: take the largest
-            // fraction `s` of the closed-form log-λ step whose refit strictly beats
-            // the refit-at-current-λ baseline. Each trial refits from the SAME
+            // One signed-step trial of the closed-form direction `d = λ* − λ_cur`.
+            // `s` is a SIGNED scale: `s > 0` steps toward λ*, `s < 0` steps away
+            // from it (the reverse half-axis). Each trial refits from the SAME
             // `base` snapshot with the SAME inner budget as the baseline, so the
             // comparison isolates the λ move; the criterion penalises λ→0, so a step
             // that would abandon a block is rejected — the fix that makes the
-            // otherwise non-contractive (fit, λ-update) alternation monotone.
-            // Backtracking line search on the closed-form λ step, migrated onto
-            // the shared `opt` primitive. `trial(s)` evaluates the step
-            // of scale `s` (always well defined here, so never `Ok(None)`) and
-            // threads the trial iterate `(trial_ll, trial_loss)` through the
-            // payload; `accept` inlines the exact Armijo sufficient-decrease test
-            // (`trial_crit < baseline_crit − armijo_eps`), bit-for-bit identical to
-            // the pre-migration loop (initial step 1.0, ×0.5 contraction,
-            // `MAX_BACKTRACK` trials).
-            let accepted_step = backtracking_line_search::<(Vec<f64>, SaeManifoldLoss), String>(
-                BacktrackConfig {
-                    initial_step: 1.0,
-                    contraction: 0.5,
-                    max_steps: MAX_BACKTRACK,
-                },
-                |s| {
+            // otherwise non-contractive (fit, λ-update) alternation monotone. The
+            // trial threads `(trial_ll, trial_loss)` through the payload.
+            let accepted_step = {
+            let mut trial =
+                |s: f64| -> Result<Option<(f64, (Vec<f64>, SaeManifoldLoss))>, String> {
                     let mut trial_ll = cur_log_lambda.clone();
                     for idx in 0..blocks.len() {
                         if identifiable[idx] {
@@ -427,16 +416,17 @@ impl SaeManifoldTerm {
                     // equivariant (`min_β ‖√λ·y − Φβ‖² + βᵀSβ` maps to
                     // `λ(‖y − Φb‖² + bᵀSb)` under `β = √λ·b`), so the incumbent fit at
                     // `λ_cur` maps to the EXACT incumbent at `λ_trial` by scaling each
-                    // behavior block's decoder columns by `√(λ_trial/λ_cur)`. Without
-                    // this rescale every trial starts with a spurious scaled-residual
-                    // `(√λ_t − √λ_c)²·‖Ŷ‖²` that the TRUNCATED inner solve must burn
-                    // its iteration budget removing — which biases the Armijo
-                    // comparison against exactly the large closed-form λ jumps the
-                    // fixed point needs from a distant start (the from-0.0
-                    // 20-sweep-exhaustion failure of `reml_selects_lambda_y…`). The
-                    // rescaled state is the same fit in the new parameterization, so
-                    // this changes no fixed point — it only stops the line search from
-                    // paying an artificial re-fitting tax proportional to the step.
+                    // behavior block's decoder columns by `√(λ_trial/λ_cur)` (valid
+                    // for a step of EITHER sign). Without this rescale every trial
+                    // starts with a spurious scaled-residual `(√λ_t − √λ_c)²·‖Ŷ‖²`
+                    // that the TRUNCATED inner solve must burn its iteration budget
+                    // removing — which biases the comparison against exactly the
+                    // large closed-form λ jumps the fixed point needs from a distant
+                    // start (the from-0.0 20-sweep-exhaustion failure of
+                    // `reml_selects_lambda_y…`). The rescaled state is the same fit in
+                    // the new parameterization, so this changes no fixed point — it
+                    // only stops the search from paying an artificial re-fitting tax
+                    // proportional to the step.
                     for idx in 0..blocks.len() {
                         let scale = (0.5 * (trial_ll[idx] - cur_log_lambda[idx])).exp();
                         if scale != 1.0 {
@@ -465,9 +455,11 @@ impl SaeManifoldTerm {
                         .collect();
                     // The trial's OWN realized penalty energy `P` at its λ-trial
                     // fitted state (same `2·(penalized_objective_total − data_fit)`
-                    // as the baseline), so the Armijo comparison `trial_crit` vs
-                    // `baseline_crit` prices each side's penalty consistently under
-                    // the envelope-corrected criterion.
+                    // as the baseline). This is NOT an envelope correction (the
+                    // envelope is broken; see the note above) — it simply makes both
+                    // sides of the comparison price their fitted-state penalty the
+                    // same way, so `trial_crit` and `baseline_crit` are the SAME
+                    // profiled criterion read at two λ's.
                     let trial_pen = 2.0
                         * (self.penalized_objective_total(
                             aug.view(),
@@ -485,37 +477,65 @@ impl SaeManifoldTerm {
                         trial_pen,
                     );
                     Ok(Some((trial_crit, (trial_ll, trial_loss))))
+                };
+
+            // Backtrack along `+d` toward λ* (initial step 1.0, ×0.5 contraction);
+            // if no forward fraction descends the refit criterion, backtrack along
+            // `−d` away from λ* (initial step −1.0, contraction preserves the sign).
+            // The same trial closure serves both directions — `s` carries the sign.
+            // `accept` is the exact sufficient-decrease test
+            // `trial_crit < baseline_crit − armijo_eps`, direction-agnostic.
+            let forward = backtracking_line_search::<(Vec<f64>, SaeManifoldLoss), String>(
+                BacktrackConfig {
+                    initial_step: 1.0,
+                    contraction: 0.5,
+                    max_steps: MAX_BACKTRACK,
                 },
+                &mut trial,
                 |_s, trial_crit| trial_crit < baseline_crit - armijo_eps,
             )?;
+            if forward.is_some() {
+                forward
+            } else {
+                backtracking_line_search::<(Vec<f64>, SaeManifoldLoss), String>(
+                    BacktrackConfig {
+                        initial_step: -1.0,
+                        contraction: 0.5,
+                        max_steps: MAX_BACKTRACK,
+                    },
+                    &mut trial,
+                    |_s, trial_crit| trial_crit < baseline_crit - armijo_eps,
+                )?
+            }
+            };
 
             if let Some(step) = accepted_step {
                 let (trial_ll, trial_loss) = step.payload;
                 cur_log_lambda = trial_ll;
                 loss = trial_loss;
             } else {
-                // No fraction of the closed-form λ step beats the current-λ
-                // baseline: moving λ cannot lower the criterion from here. Reinstate
-                // the improved current-λ fit (`baseline_state`, no worse than the
-                // sweep-entry state) at the unchanged weights and stop.
+                // Neither `+d` nor `−d` lowers the EXACT refit criterion below
+                // `baseline_crit − armijo_eps`: λ_cur is a local minimiser of the
+                // criterion the trials evaluate, along the closed-form axis, to the
+                // search resolution — a GENUINE criterion fixed point. Reinstate the
+                // improved current-λ fit (`baseline_state`, no worse than the
+                // sweep-entry state) at the unchanged weights and report converged.
                 //
-                // F4 — honest flag. This branch is reached ONLY after BOTH
-                // convergence gates above FAILED: the closed-form λ* still wants
-                // a > tol move AND its held-residual predicted decrease exceeds
-                // the Armijo resolution — a realizable improvement existed on
-                // paper. A step that then fails the line search is a genuine
-                // STALL (the truncated inner solve cannot resolve the
-                // coordinated improvement the move needs), not tolerance-
-                // convergence. Leaving `converged = false` keeps the flag honest in
-                // BOTH directions — `true` only when λ actually settled (or every
-                // block became inert), `false` for a stall or a `max_sweeps`
-                // exhaustion.
+                // This is the #2015 fix: the old code reached here only via the
+                // forward search and declared a STALL (`converged = false`),
+                // presuming the closed-form `+d` was a true descent direction the
+                // truncated solve just could not realize. With the envelope broken
+                // (see the note above) `+d` is NOT the refit criterion's descent
+                // direction, so a forward-only failure was misread as a stall for a
+                // λ that had actually settled. Testing BOTH directions on the exact
+                // criterion turns "no move helps" into an honest convergence verdict
+                // (and still catches a real reverse-descent, taking that step above).
                 for idx in 0..blocks.len() {
                     blocks[idx] = blocks[idx].with_log_lambda(cur_log_lambda[idx])?;
                 }
                 self.fit_state_restore(&baseline_state)?;
                 loss = base_loss;
-                converged = false;
+                converged = true;
                 for idx in 0..blocks.len() {
                     trajectories[idx].push(cur_log_lambda[idx]);
                 }

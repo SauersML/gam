@@ -16,12 +16,16 @@ use std::f64::consts::PI;
 
 /// Maximum row count of one covariance-exact Hadamard block.
 ///
-/// The full-pipeline control allocates exactly one float64 transform workspace
-/// with at most `COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS * p` scalars. Keeping
-/// this bound independent of the corpus row count makes the control viable for
-/// activation matrices with hundreds of thousands of rows and thousands of
-/// columns.
+/// Each active block owns one float64 transform workspace with at most
+/// `COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS * p` scalars.
 pub const COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS: usize = 1_024;
+
+/// Hard cap on concurrently transformed covariance-exact Hadamard blocks.
+///
+/// Actual concurrency is the minimum of this cap, the number of blocks, and
+/// the active Rayon pool's thread count. Thus transform memory is bounded by
+/// `8 * 1024 * p * sizeof(f64)` independently of the corpus row count.
+pub const COVARIANCE_EXACT_HADAMARD_MAX_PARALLEL_WORKSPACES: usize = 8;
 
 const HADAMARD_PERMUTATION_SEED_DOMAIN: u64 = 0x4841_4441_5045_524D;
 const HADAMARD_SIGN_SEED_DOMAIN: u64 = 0x4841_4441_5349_474E;
@@ -729,15 +733,62 @@ fn largest_power_of_two_at_most(value: usize) -> Result<usize, String> {
     Ok(1usize << (usize::BITS - value.leading_zeros() - 1))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HadamardBlock {
+    start: usize,
+    rows: usize,
+    ordinal: usize,
+}
+
+fn covariance_exact_hadamard_blocks(nrows: usize) -> Result<Vec<HadamardBlock>, String> {
+    if nrows == 0 {
+        return Err("covariance-exact Hadamard block plan requires rows".to_string());
+    }
+    let capacity = (nrows / COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS)
+        .checked_add(usize::BITS as usize)
+        .ok_or_else(|| "covariance-exact Hadamard block-plan capacity overflowed".to_string())?;
+    let mut blocks = Vec::<HadamardBlock>::new();
+    blocks.try_reserve_exact(capacity).map_err(|error| {
+        format!(
+            "could not allocate covariance-exact Hadamard block plan ({capacity} descriptors): {error}"
+        )
+    })?;
+    let mut start = 0usize;
+    while start < nrows {
+        let rows = largest_power_of_two_at_most(
+            (nrows - start).min(COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS),
+        )?;
+        let ordinal = blocks.len();
+        blocks.push(HadamardBlock {
+            start,
+            rows,
+            ordinal,
+        });
+        start = start.checked_add(rows).ok_or_else(|| {
+            "covariance-exact Hadamard block-plan row offset overflowed".to_string()
+        })?;
+    }
+    Ok(blocks)
+}
+
+fn covariance_exact_hadamard_parallel_tasks(blocks: usize) -> Result<usize, String> {
+    if blocks == 0 {
+        return Err("covariance-exact Hadamard parallel plan requires blocks".to_string());
+    }
+    Ok(blocks
+        .min(COVARIANCE_EXACT_HADAMARD_MAX_PARALLEL_WORKSPACES)
+        .min(rayon::current_num_threads().max(1)))
+}
+
 fn covariance_exact_hadamard_workspace_rows(nrows: usize) -> Result<usize, String> {
     largest_power_of_two_at_most(nrows.min(COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS))
 }
 
 /// In-place, unnormalised Sylvester fast Walsh-Hadamard transform over rows.
 ///
-/// A stage owns disjoint row-pair slabs. Rayon may schedule those slabs in any
-/// order, but every scalar follows the same fixed butterfly sequence, making
-/// the result bit-identical across thread counts and schedules.
+/// The transform is deliberately sequential inside a block. Independent blocks
+/// are the parallel unit, avoiding a Rayon barrier at every butterfly stage
+/// while every scalar retains one fixed operation sequence.
 fn fwht_rows_in_place(workspace: &mut [f64], rows: usize, cols: usize) -> Result<(), String> {
     if !rows.is_power_of_two() || cols == 0 {
         return Err(format!(
@@ -770,38 +821,115 @@ fn fwht_rows_in_place(workspace: &mut [f64], rows: usize, cols: usize) -> Result
                 workspace.len()
             ));
         }
-        let slab_count = workspace.len() / slab_scalars;
-        let parallelize_row_pairs = slab_count < rayon::current_num_threads();
-        workspace.par_chunks_mut(slab_scalars).for_each(|slab| {
+        for slab in workspace.chunks_exact_mut(slab_scalars) {
             let (upper, lower) = slab.split_at_mut(half_scalars);
-            if parallelize_row_pairs {
-                upper
-                    .par_chunks_mut(cols)
-                    .zip(lower.par_chunks_mut(cols))
-                    .for_each(|(upper_row, lower_row)| {
-                        for col in 0..cols {
-                            let left = upper_row[col];
-                            let right = lower_row[col];
-                            upper_row[col] = left + right;
-                            lower_row[col] = left - right;
-                        }
-                    });
-            } else {
-                for paired_row in 0..half {
-                    let row_offset = paired_row * cols;
-                    for col in 0..cols {
-                        let index = row_offset + col;
-                        let left = upper[index];
-                        let right = lower[index];
-                        upper[index] = left + right;
-                        lower[index] = left - right;
-                    }
+            for paired_row in 0..half {
+                let row_offset = paired_row * cols;
+                for col in 0..cols {
+                    let index = row_offset + col;
+                    let left = upper[index];
+                    let right = lower[index];
+                    upper[index] = left + right;
+                    lower[index] = left - right;
                 }
             }
-        });
+        }
         half = slab_rows;
     }
     Ok(())
+}
+
+fn transform_covariance_exact_hadamard_block<T: NativeControlScalar>(
+    data: &ArrayView2<'_, T>,
+    permutation: &[usize],
+    origin: &[f64],
+    seed: u64,
+    block: HadamardBlock,
+    workspace: &mut [f64],
+    signs: &mut [f64],
+) -> Result<(), String> {
+    let p = data.ncols();
+    let block_end = block.start.checked_add(block.rows).ok_or_else(|| {
+        format!(
+            "covariance-exact Hadamard block {} row range overflowed",
+            block.ordinal
+        )
+    })?;
+    if !block.rows.is_power_of_two()
+        || block.rows > COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS
+        || block_end > permutation.len()
+        || origin.len() != p
+    {
+        return Err(format!(
+            "covariance-exact Hadamard block {} has an invalid internal plan",
+            block.ordinal
+        ));
+    }
+    let block_scalars = block.rows.checked_mul(p).ok_or_else(|| {
+        format!(
+            "{} covariance-exact Hadamard block shape overflowed: {} rows × {p} columns",
+            T::TYPE_NAME,
+            block.rows
+        )
+    })?;
+    if workspace.len() != block_scalars || signs.len() != block.rows {
+        return Err(format!(
+            "covariance-exact Hadamard block {} received invalid workspace lengths",
+            block.ordinal
+        ));
+    }
+    let inverse_rows = 1.0 / block.rows as f64;
+
+    for local_row in 0..block.rows {
+        let source_row = permutation[block.start + local_row];
+        if source_row >= data.nrows() {
+            return Err(format!(
+                "covariance-exact Hadamard permutation row {source_row} is out of bounds"
+            ));
+        }
+        for col in 0..p {
+            // Transform in the first-row residual chart. This prevents a large
+            // absolute origin from erasing small covariance-bearing residuals
+            // while Q·1 = 1 restores the same origin exactly.
+            let relative = data[[source_row, col]].widen() - origin[col];
+            let scaled = relative * inverse_rows;
+            if !scaled.is_finite() {
+                return Err(format!(
+                    "{} covariance-exact Hadamard residual overflowed at input row {source_row}, column {col}",
+                    T::TYPE_NAME
+                ));
+            }
+            workspace[local_row * p + col] = scaled;
+        }
+    }
+
+    fwht_rows_in_place(workspace, block.rows, p)?;
+    let block_ordinal = u64::try_from(block.ordinal).map_err(|_| {
+        format!(
+            "covariance-exact Hadamard block ordinal {} exceeds the seed domain",
+            block.ordinal
+        )
+    })?;
+    let mut sign_rng = StdRng::seed_from_u64(mix_seed(
+        seed ^ HADAMARD_SIGN_SEED_DOMAIN,
+        block_ordinal,
+        block.rows as u64,
+    ));
+    signs[0] = 1.0;
+    for sign in &mut signs[1..] {
+        *sign = if sign_rng.random_range(0..2) == 0 {
+            -1.0
+        } else {
+            1.0
+        };
+    }
+    for local_row in 0..block.rows {
+        let sign = signs[local_row];
+        for col in 0..p {
+            workspace[local_row * p + col] *= sign;
+        }
+    }
+    fwht_rows_in_place(workspace, block.rows, p)
 }
 
 fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
@@ -810,6 +938,11 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
 ) -> Result<Array2<T>, String> {
     let n = data.nrows();
     let p = data.ncols();
+    if n == 0 || p == 0 {
+        return Err("covariance-exact Hadamard input must be nonempty".to_string());
+    }
+    let blocks = covariance_exact_hadamard_blocks(n)?;
+    let parallel_tasks = covariance_exact_hadamard_parallel_tasks(blocks.len())?;
     let workspace_rows = covariance_exact_hadamard_workspace_rows(n)?;
     let workspace_scalars = workspace_rows.checked_mul(p).ok_or_else(|| {
         format!(
@@ -817,14 +950,6 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
             T::TYPE_NAME
         )
     })?;
-    let mut workspace = Vec::<f64>::new();
-    workspace.try_reserve_exact(workspace_scalars).map_err(|error| {
-        format!(
-            "could not allocate {} covariance-exact Hadamard workspace ({workspace_rows} × {p} float64 scalars): {error}",
-            T::TYPE_NAME
-        )
-    })?;
-    workspace.resize(workspace_scalars, 0.0);
 
     let mut origin = Vec::<f64>::new();
     origin.try_reserve_exact(p).map_err(|error| {
@@ -843,83 +968,108 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
     let mut permutation_rng = StdRng::seed_from_u64(seed ^ HADAMARD_PERMUTATION_SEED_DOMAIN);
     permutation.shuffle(&mut permutation_rng);
 
-    let mut signs = Vec::<f64>::new();
-    signs.try_reserve_exact(workspace_rows).map_err(|error| {
-        format!(
-            "could not allocate covariance-exact Hadamard signs ({workspace_rows} float64 scalars): {error}"
-        )
-    })?;
-    signs.resize(workspace_rows, 1.0);
     let mut out = fallible_native_output::<T>(n, p, "covariance-exact Hadamard")?;
-    let mut block_start = 0usize;
-    let mut block_ordinal = 0usize;
-    while block_start < n {
-        let block_rows = largest_power_of_two_at_most(
-            (n - block_start).min(COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS),
-        )?;
-        let block_scalars = block_rows.checked_mul(p).ok_or_else(|| {
+    let total_workspace_scalars = workspace_scalars
+        .checked_mul(parallel_tasks)
+        .ok_or_else(|| {
             format!(
-                "{} covariance-exact Hadamard block shape overflowed: {block_rows} rows × {p} columns",
+                "{} covariance-exact Hadamard parallel workspace size overflowed: {parallel_tasks} × {workspace_rows} × {p}",
                 T::TYPE_NAME
             )
         })?;
-        let block_workspace = &mut workspace[..block_scalars];
-        let inverse_rows = 1.0 / block_rows as f64;
+    let mut workspaces = Vec::<f64>::new();
+    workspaces
+        .try_reserve_exact(total_workspace_scalars)
+        .map_err(|error| {
+            format!(
+                "could not allocate {} covariance-exact Hadamard parallel workspaces ({parallel_tasks} × {workspace_rows} × {p} float64 scalars): {error}",
+                T::TYPE_NAME
+            )
+        })?;
+    workspaces.resize(total_workspace_scalars, 0.0);
 
-        for local_row in 0..block_rows {
-            let source_row = permutation[block_start + local_row];
-            for col in 0..p {
-                // Transform in the first-row residual chart. This prevents a
-                // large absolute origin from erasing small covariance-bearing
-                // residuals while Q·1 = 1 restores the same origin exactly.
-                let relative = data[[source_row, col]].widen() - origin[col];
-                let scaled = relative * inverse_rows;
-                if !scaled.is_finite() {
-                    return Err(format!(
-                        "{} covariance-exact Hadamard residual overflowed at input row {source_row}, column {col}",
-                        T::TYPE_NAME
-                    ));
-                }
-                block_workspace[local_row * p + col] = scaled;
-            }
-        }
+    let total_signs = workspace_rows
+        .checked_mul(parallel_tasks)
+        .ok_or_else(|| {
+            format!(
+                "covariance-exact Hadamard parallel sign workspace size overflowed: {parallel_tasks} × {workspace_rows}"
+            )
+        })?;
+    let mut signs = Vec::<f64>::new();
+    signs.try_reserve_exact(total_signs).map_err(|error| {
+        format!(
+            "could not allocate covariance-exact Hadamard parallel signs ({parallel_tasks} × {workspace_rows} float64 scalars): {error}"
+        )
+    })?;
+    signs.resize(total_signs, 1.0);
 
-        fwht_rows_in_place(block_workspace, block_rows, p)?;
-        let mut sign_rng = StdRng::seed_from_u64(mix_seed(
-            seed ^ HADAMARD_SIGN_SEED_DOMAIN,
-            block_ordinal as u64,
-            block_rows as u64,
-        ));
-        signs[0] = 1.0;
-        for sign in &mut signs[1..block_rows] {
-            *sign = if sign_rng.random_range(0..2) == 0 {
-                -1.0
-            } else {
-                1.0
-            };
-        }
-        for local_row in 0..block_rows {
-            let sign = signs[local_row];
-            for col in 0..p {
-                block_workspace[local_row * p + col] *= sign;
-            }
-        }
-        fwht_rows_in_place(block_workspace, block_rows, p)?;
-
-        for local_row in 0..block_rows {
-            let output_row = block_start + local_row;
-            for col in 0..p {
-                let value = origin[col] + block_workspace[local_row * p + col];
-                out[[output_row, col]] = T::narrow(value).ok_or_else(|| {
+    for wave_start in (0..blocks.len()).step_by(parallel_tasks) {
+        let wave_end = wave_start
+            .checked_add(parallel_tasks)
+            .ok_or_else(|| "covariance-exact Hadamard parallel wave range overflowed".to_string())?
+            .min(blocks.len());
+        let wave = &blocks[wave_start..wave_end];
+        // All three iterators are indexed, so workspace slot i always belongs
+        // to wave block i regardless of Rayon scheduling. Collecting indexed
+        // results also makes a simultaneous error report deterministic.
+        let results = wave
+            .par_iter()
+            .zip(workspaces.par_chunks_mut(workspace_scalars))
+            .zip(signs.par_chunks_mut(workspace_rows))
+            .map(|((block, workspace), block_signs)| {
+                let block_scalars = block.rows.checked_mul(p).ok_or_else(|| {
                     format!(
-                        "{} covariance-exact Hadamard output overflowed at row {output_row}, column {col}",
-                        T::TYPE_NAME
+                        "{} covariance-exact Hadamard block shape overflowed: {} rows × {p} columns",
+                        T::TYPE_NAME,
+                        block.rows
                     )
                 })?;
+                transform_covariance_exact_hadamard_block(
+                    &data,
+                    &permutation,
+                    &origin,
+                    seed,
+                    *block,
+                    &mut workspace[..block_scalars],
+                    &mut block_signs[..block.rows],
+                )
+            })
+            .collect::<Vec<_>>();
+        for result in results {
+            result?;
+        }
+
+        // Narrowing is one linear output pass after the expensive transforms.
+        // Keeping it ordered avoids extra native block buffers and preserves the
+        // exact output layout while the two O(log B) FWHTs run block-parallel.
+        for (slot, block) in wave.iter().enumerate() {
+            let workspace_start = slot.checked_mul(workspace_scalars).ok_or_else(|| {
+                "covariance-exact Hadamard workspace slot offset overflowed".to_string()
+            })?;
+            let block_scalars = block.rows.checked_mul(p).ok_or_else(|| {
+                format!(
+                    "{} covariance-exact Hadamard block shape overflowed: {} rows × {p} columns",
+                    T::TYPE_NAME,
+                    block.rows
+                )
+            })?;
+            let workspace_end = workspace_start.checked_add(block_scalars).ok_or_else(|| {
+                "covariance-exact Hadamard workspace block range overflowed".to_string()
+            })?;
+            let workspace = &workspaces[workspace_start..workspace_end];
+            for local_row in 0..block.rows {
+                let output_row = block.start + local_row;
+                for col in 0..p {
+                    let value = origin[col] + workspace[local_row * p + col];
+                    out[[output_row, col]] = T::narrow(value).ok_or_else(|| {
+                        format!(
+                            "{} covariance-exact Hadamard output overflowed at row {output_row}, column {col}",
+                            T::TYPE_NAME
+                        )
+                    })?;
+                }
             }
         }
-        block_start += block_rows;
-        block_ordinal += 1;
     }
     Ok(out)
 }
@@ -932,7 +1082,9 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
 /// matrix and the first Rademacher sign in `D` is fixed to +1. Therefore
 /// `Q'Q = I` and `Q·1 = 1`: mean and centered cross-product are invariant in
 /// exact arithmetic, while rowwise radii and nonlinear manifold geometry are
-/// mixed. Peak transform storage is one bounded `B × p` float64 workspace.
+/// mixed. Blocks run independently with sequential butterfly arithmetic. Peak
+/// transform storage is at most
+/// `min(8, block_count, Rayon threads) × B × p` float64 scalars.
 pub fn covariance_exact_hadamard_null(
     data: ArrayView2<'_, f64>,
     seed: u64,
@@ -943,9 +1095,10 @@ pub fn covariance_exact_hadamard_null(
 
 /// Float32-output form of [`covariance_exact_hadamard_null`].
 ///
-/// The bounded transform workspace uses float64 arithmetic, but no corpus-sized
-/// float64 matrix is ever allocated; input scalars are widened block by block
-/// and output scalars are narrowed directly into the `n × p` float32 result.
+/// The bounded per-task transform workspaces use float64 arithmetic, but no
+/// corpus-sized float64 matrix is ever allocated; input scalars are widened
+/// block by block and output scalars are narrowed directly into the `n × p`
+/// float32 result.
 pub fn covariance_exact_hadamard_null_f32(
     data: ArrayView2<'_, f32>,
     seed: u64,
@@ -2586,17 +2739,54 @@ mod tests {
             covariance_exact_hadamard_workspace_rows(rows).unwrap(),
             COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS
         );
-        let mut remaining = rows;
-        let mut blocks = Vec::new();
-        while remaining > 0 {
-            let block = largest_power_of_two_at_most(
-                remaining.min(COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS),
-            )
-            .unwrap();
-            blocks.push(block);
-            remaining -= block;
-        }
+        let blocks = covariance_exact_hadamard_blocks(rows)
+            .unwrap()
+            .iter()
+            .map(|block| block.rows)
+            .collect::<Vec<_>>();
         assert_eq!(blocks, vec![1_024, 1_024, 2, 1]);
+    }
+
+    #[test]
+    fn covariance_exact_hadamard_parallel_workspace_count_is_bounded() {
+        let rows = 32 * COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS + 3;
+        let blocks = covariance_exact_hadamard_blocks(rows).unwrap();
+        assert_eq!(blocks.len(), 34);
+        assert_eq!(blocks[32].rows, 2);
+        assert_eq!(blocks[33].rows, 1);
+
+        let one_task = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| covariance_exact_hadamard_parallel_tasks(blocks.len()).unwrap());
+        let four_tasks = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| covariance_exact_hadamard_parallel_tasks(blocks.len()).unwrap());
+        let sixteen_thread_tasks = rayon::ThreadPoolBuilder::new()
+            .num_threads(16)
+            .build()
+            .unwrap()
+            .install(|| covariance_exact_hadamard_parallel_tasks(blocks.len()).unwrap());
+        assert_eq!(one_task, 1);
+        assert_eq!(four_tasks, 4);
+        assert_eq!(
+            sixteen_thread_tasks,
+            COVARIANCE_EXACT_HADAMARD_MAX_PARALLEL_WORKSPACES
+        );
+
+        let columns = 7_000usize;
+        let per_workspace = COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS * columns;
+        let bounded_scalars = sixteen_thread_tasks * per_workspace;
+        assert_eq!(
+            bounded_scalars,
+            COVARIANCE_EXACT_HADAMARD_MAX_PARALLEL_WORKSPACES
+                * COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS
+                * columns
+        );
+        assert!(bounded_scalars < rows * columns);
     }
 
     #[test]
