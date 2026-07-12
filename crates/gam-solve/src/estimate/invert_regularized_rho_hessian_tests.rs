@@ -1,4 +1,4 @@
-use super::smoothing_correction::{EigenClassification, invert_regularized_rho_hessian};
+use super::smoothing_correction::{EigenClassification, invert_identified_rho_hessian};
 use ndarray::Array2;
 
 /// Build a real symmetric n×n matrix with a specified eigenvalue spectrum
@@ -61,7 +61,7 @@ fn build_with_spectrum(eigenvalues: &[f64]) -> (Array2<f64>, Array2<f64>) {
 #[test]
 fn spd_case_returns_full_rank_inverse_no_repair() {
     let (a, _q) = build_with_spectrum(&[10.0, 5.0, 2.0, 1.0]);
-    let inv = invert_regularized_rho_hessian(&a).expect("invert");
+    let inv = invert_identified_rho_hessian(&a).expect("invert");
     assert_eq!(inv.active_rank, 4);
     assert_eq!(inv.dropped_negative, 0);
     assert_eq!(inv.dropped_small_positive, 0);
@@ -85,7 +85,7 @@ fn spd_case_returns_full_rank_inverse_no_repair() {
 fn z2_saddle_case_drops_negative_eigenpair() {
     let evals = [10.0, 5.0, 2.0, -0.066];
     let (a, q) = build_with_spectrum(&evals);
-    let inv = invert_regularized_rho_hessian(&a).expect("invert");
+    let inv = invert_identified_rho_hessian(&a).expect("invert");
     assert_eq!(inv.active_rank, 3);
     assert_eq!(inv.dropped_negative, 1);
     assert_eq!(inv.dropped_small_positive, 0);
@@ -128,7 +128,7 @@ fn flat_direction_dropped() {
     // count as "near-zero direction dropped" for this test's purposes.
     let evals = [10.0, 5.0, 2.0, -1e-13];
     let (a, q) = build_with_spectrum(&evals);
-    let inv = invert_regularized_rho_hessian(&a).expect("invert");
+    let inv = invert_identified_rho_hessian(&a).expect("invert");
     assert_eq!(inv.active_rank, 3, "expected three identified directions");
     let dropped = inv.dropped_small_positive + inv.dropped_numerical_zero + inv.dropped_negative;
     assert_eq!(dropped, 1, "expected exactly one direction dropped");
@@ -147,7 +147,7 @@ fn flat_direction_dropped() {
 fn mixed_negative_and_flat_yields_active_rank_two() {
     let evals = [10.0, 5.0, -0.066, 1e-13];
     let (a, _q) = build_with_spectrum(&evals);
-    let inv = invert_regularized_rho_hessian(&a).expect("invert");
+    let inv = invert_identified_rho_hessian(&a).expect("invert");
     assert_eq!(inv.active_rank, 2);
     assert_eq!(inv.dropped_negative, 1);
     assert_eq!(
@@ -162,7 +162,7 @@ fn mixed_negative_and_flat_yields_active_rank_two() {
 fn all_bad_spectrum_yields_zero_active_rank() {
     let evals = [-0.1, -0.05, -1.0, -0.5];
     let (a, _q) = build_with_spectrum(&evals);
-    let inv = invert_regularized_rho_hessian(&a).expect("invert");
+    let inv = invert_identified_rho_hessian(&a).expect("invert");
     assert_eq!(inv.active_rank, 0);
     assert_eq!(inv.dropped_negative, 4);
     assert!(inv.repaired_hessian);
@@ -182,7 +182,7 @@ fn all_bad_spectrum_yields_zero_active_rank() {
 fn non_finite_input_returns_none() {
     let mut a = Array2::<f64>::eye(4);
     a[[1, 1]] = f64::NAN;
-    let result = invert_regularized_rho_hessian(&a);
+    let result = invert_identified_rho_hessian(&a);
     assert!(
         result.is_none(),
         "expected None for NaN-bearing input matrix"
@@ -190,7 +190,7 @@ fn non_finite_input_returns_none() {
 
     let mut a = Array2::<f64>::eye(4);
     a[[2, 2]] = f64::INFINITY;
-    let result = invert_regularized_rho_hessian(&a);
+    let result = invert_identified_rho_hessian(&a);
     assert!(
         result.is_none(),
         "expected None for Inf-bearing input matrix"
@@ -204,7 +204,7 @@ fn non_finite_input_returns_none() {
 #[test]
 fn slow_path_populates_eigenvalues_and_eigenvectors() {
     let (a, _q) = build_with_spectrum(&[10.0, 5.0, 2.0, -0.066]);
-    let inv = invert_regularized_rho_hessian(&a).expect("invert");
+    let inv = invert_identified_rho_hessian(&a).expect("invert");
     assert!(inv.repaired_hessian);
     assert_eq!(inv.eigenvalues.len(), 4);
     assert_eq!(inv.eigenvectors.shape(), &[4, 4]);
@@ -223,7 +223,7 @@ fn slow_path_populates_eigenvalues_and_eigenvectors() {
 #[test]
 fn fast_path_leaves_eigendecomp_fields_empty() {
     let (a, _q) = build_with_spectrum(&[10.0, 5.0, 2.0, 1.0]);
-    let inv = invert_regularized_rho_hessian(&a).expect("invert");
+    let inv = invert_identified_rho_hessian(&a).expect("invert");
     assert!(!inv.repaired_hessian);
     assert!(inv.eigenvalues.is_empty());
     assert!(inv.eigenvectors.is_empty());

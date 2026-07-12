@@ -5224,12 +5224,10 @@ pub(crate) fn pseudo_laplace_exact_newton_rejects_indefinite_hessian() {
 #[test]
 pub(crate) fn auto_determinant_mode_is_exact_full_logdet_policy() {
     let h = array![[6.0, 0.8, 0.1], [0.8, 4.5, 0.4], [0.1, 0.4, 3.2]];
-    let exact =
-        stable_logdet_with_ridge_policy(&h, 1e-8, RidgePolicy::exact_full_objective())
-            .expect("exact logdet");
-    let auto =
-        stable_logdet_with_ridge_policy(&h, 1e-8, RidgePolicy::exact_full_objective())
-            .expect("auto logdet");
+    let exact = stable_logdet_with_ridge_policy(&h, 1e-8, RidgePolicy::exact_full_objective())
+        .expect("exact logdet");
+    let auto = stable_logdet_with_ridge_policy(&h, 1e-8, RidgePolicy::exact_full_objective())
+        .expect("auto logdet");
     assert!((auto - exact).abs() < 1e-12, "auto={auto}, exact={exact}");
 }
 
@@ -5247,13 +5245,12 @@ pub(crate) fn indefinite_hessian_uses_smooth_regularized_logdet() {
     // `DenseSpectralOperator` gradient computes — eliminating the
     // cost/gradient mismatch that broke BFGS line search.
     let h = array![[-1.0, 0.0], [0.0, 2.0]];
-    let logdet =
-        stable_logdet_with_ridge_policy(
-            &h,
-            1e-12,
-            RidgePolicy::positive_part_approximate_objective(),
-        )
-            .expect("smooth-regularized logdet must be finite for indefinite H");
+    let logdet = stable_logdet_with_ridge_policy(
+        &h,
+        1e-12,
+        RidgePolicy::positive_part_approximate_objective(),
+    )
+    .expect("smooth-regularized logdet must be finite for indefinite H");
     assert!(
         logdet.is_finite(),
         "smooth-regularized logdet should be finite, got {logdet}"

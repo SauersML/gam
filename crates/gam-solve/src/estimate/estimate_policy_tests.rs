@@ -1229,7 +1229,8 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
     // genuine guard: ~1e4× the observed residual yet ~370× tighter than the
     // original miss, and robust to cross-platform PIRLS-convergence jitter.
     assert_eq!(
-        pirls_result.ridge_passport.delta(), 0.0,
+        pirls_result.ridge_passport.delta(),
+        0.0,
         "well-conditioned n=20 SAS fit must take no stabilization ridge; \
          a nonzero ridge would mean the IFT Jacobian and the FD re-solve no \
          longer linearize the same system (gam#855)"

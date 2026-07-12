@@ -537,6 +537,15 @@ pub enum EstimationError {
     },
 
     #[error(
+        "Exact Tweedie series work limit at row {row}: at least {required_terms_lower_bound:?} terms are required, budget is {budget}"
+    )]
+    ExactTweedieSeriesWorkLimit {
+        row: usize,
+        required_terms_lower_bound: f64,
+        budget: usize,
+    },
+
+    #[error(
         "Log-strength domain violation at coordinate {coordinate}: value={value:?} is outside \
          the supported interval [{lower}, {upper}]"
     )]

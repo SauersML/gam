@@ -92,7 +92,7 @@ impl RemlConfig {
 /// record is emitted at this site because the perturbation never escapes the
 /// local `V_rho` inverse (it touches no saved coefficient, objective, or
 /// user-visible summary).
-const LAML_RIDGE: f64 = 1e-8;
+const RHO_IDENTIFIABILITY_ABS_FLOOR: f64 = 1e-8;
 /// Minimum penalized-deviance floor, expressed as a fraction of the
 /// problem's own deviance scale (the weighted null deviance `D₀`, see
 /// [`smooth_floor_dp`]). The floor exists only to keep the profiled
@@ -304,7 +304,7 @@ pub(crate) enum EigenClassification {
 /// itself fails (non-finite eigenvalues or eigenvectors). An all-bad spectrum
 /// (active_rank == 0) still returns `Some`; the caller is responsible for
 /// deciding whether to use a zero-rank covariance.
-pub(crate) fn invert_regularized_rho_hessian(
+pub(crate) fn invert_identified_rho_hessian(
     hessian_rho: &Array2<f64>,
 ) -> Option<InvertedRhoHessian> {
     let n = hessian_rho.nrows();
@@ -345,7 +345,7 @@ pub(crate) fn invert_regularized_rho_hessian(
         .max(1.0);
     let min_eigenvalue = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
     let neg_tol = 64.0 * f64::EPSILON * (n.max(1) as f64) * spectral_scale;
-    let tau = (spectral_scale * 1e-10).max(LAML_RIDGE);
+    let tau = (spectral_scale * 1e-10).max(RHO_IDENTIFIABILITY_ABS_FLOOR);
 
     let mut inverse = Array2::<f64>::zeros((n, n));
     let mut classifications = Vec::with_capacity(n);
@@ -816,11 +816,10 @@ pub(crate) fn compute_smoothing_correction(
     // Symmetrize the Hessian
     gam_linalg::matrix::symmetrize_in_place(&mut hessian_rho);
 
-    // Step 3: Invert Hessian to get V_rho.
-    // Add a small ridge before factorization to regularize weakly identified ρ directions.
-    add_relative_diag_ridge(&mut hessian_rho, LAML_RIDGE, LAML_RIDGE);
-
-    let inverted = match invert_regularized_rho_hessian(&hessian_rho) {
+    // Step 3: invert the exact, unperturbed Hessian on its explicitly
+    // identified spectral subspace. A diagonal ridge would change V_rho and
+    // therefore the covariance estimand while being invisible in the result.
+    let inverted = match invert_identified_rho_hessian(&hessian_rho) {
         Some(inv) => inv,
         None => {
             log::warn!(

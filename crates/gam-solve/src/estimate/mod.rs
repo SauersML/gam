@@ -30,9 +30,7 @@ use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, stat
 pub use crate::model_types::{CoefficientPriorMean, Dispersion, EstimationError, PenaltySpec};
 use crate::pirls::{self, PirlsResult};
 use gam_linalg::matrix::{DesignMatrix, LinearOperator};
-use gam_linalg::utils::{
-    KahanSum, add_relative_diag_ridge, certified_spd_inverse, row_mismatch_message,
-};
+use gam_linalg::utils::{KahanSum, certified_spd_inverse, row_mismatch_message};
 use gam_problem::{
     Coefficients, GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodScaleMetadata,
     LikelihoodSpec, LinkFunction, LogLikelihoodNormalization, LogSmoothingParamsView,

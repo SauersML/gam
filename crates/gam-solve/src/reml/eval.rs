@@ -836,9 +836,7 @@ impl<'a> RemlState<'a> {
         ) {
             Ok(inverse) => inverse.into_inverse(),
             Err(error) => {
-                log::warn!(
-                    "sigma cubature refused explicitly ridged rho Hessian: {error}"
-                );
+                log::warn!("sigma cubature refused explicitly ridged rho Hessian: {error}");
                 return self.finalize_smoothing_outcome(first_order_numerical(
                     first_order_correction,
                     "explicitly ridged rho Hessian failed exact SPD inversion",

@@ -1999,27 +1999,6 @@ pub(crate) fn tweedie_saddlepoint_loglik_approximation(
     }
 }
 
-/// Analytic estimate of the index `k` of the dominant term in the
-/// compound-Poisson–gamma series at one observation — the maximizer of the log
-/// summand `g(k)`, obtained by solving `g'(k)=0` with the leading `ψ(x)≈ln x`
-/// approximation. Reduces to the Poisson rate `λ` when `y=μ` and grows with `y`.
-/// Used to start the exact series climb near the peak.
-#[inline]
-#[cfg(test)]
-fn tweedie_series_peak_index(yi: f64, mui: f64, phi_i: f64, p: f64) -> f64 {
-    let two_minus_p = 2.0 - p;
-    let p_minus_one = p - 1.0;
-    let lambda = mui.powf(two_minus_p) / (phi_i * two_minus_p);
-    if yi <= 0.0 {
-        return lambda;
-    }
-    let alpha = two_minus_p / p_minus_one;
-    let gamma_scale = phi_i * p_minus_one * mui.powf(p_minus_one);
-    // k* ≈ exp{ [ln λ + α·ln(y/γ) − α·ln α] / (1+α) }.
-    let ln_k = (lambda.ln() + alpha * (yi / gamma_scale).ln() - alpha * alpha.ln()) / (1.0 + alpha);
-    ln_k.exp().max(1.0)
-}
-
 /// Exact compound-Poisson–gamma density in log-mean coordinates. A finite work
 /// certificate is part of the contract: an observation whose dominant series
 /// index cannot be enumerated exactly in f64, or whose roundoff-negligible tail
@@ -2064,11 +2043,8 @@ fn tweedie_exact_series_loglik_from_eta(
     }
     let log_peak_index =
         (log_lambda + alpha * (log_y - log_gamma_scale) - alpha * alpha.ln()) / (1.0 + alpha);
-    // Above 2^52, `k + 1` is not a distinct f64 and an exact integer-index
-    // series cannot be traversed in this representation.
-    const MAX_EXACT_INDEX: f64 = 4_503_599_627_370_496.0;
     let peak_index = log_peak_index.exp().max(1.0);
-    if !peak_index.is_finite() || peak_index >= MAX_EXACT_INDEX {
+    if !peak_index.is_finite() {
         return Err(deviance_row_error(
             row,
             "exact Tweedie dominant series index",
@@ -2076,16 +2052,28 @@ fn tweedie_exact_series_loglik_from_eta(
             peak_index,
         ));
     }
+    const MAX_EXACT_TERMS: usize = 100_000;
+    let work_limit = |required_terms_lower_bound: f64| {
+        EstimationError::ExactTweedieSeriesWorkLimit {
+            row,
+            required_terms_lower_bound,
+            budget: MAX_EXACT_TERMS,
+        }
+    };
+    let rounded_peak = peak_index.round().max(1.0);
+    // The lower tail is finite and must be summed all the way to k=1. Thus the
+    // rounded peak alone is a rigorous lower bound on required work.
+    if rounded_peak > MAX_EXACT_TERMS as f64 {
+        return Err(work_limit(rounded_peak));
+    }
     let log_term = |k: f64| {
         -lambda + k * log_lambda - ln_gamma(k + 1.0) + (k * alpha - 1.0) * log_y
             - y_over_scale
             - k * alpha * log_gamma_scale
             - ln_gamma(k * alpha)
     };
-    const LOG_SUM_CUTOFF: f64 = 37.4;
-    const MAX_EXACT_TERMS: usize = 10_000_000;
     let mut terms = 1_usize;
-    let mut k_peak = peak_index.round().max(1.0);
+    let mut k_peak = rounded_peak;
     let mut f_peak = log_term(k_peak);
     if !f_peak.is_finite() {
         return Err(deviance_row_error(
@@ -2105,12 +2093,7 @@ fn tweedie_exact_series_loglik_from_eta(
             break;
         }
         if terms > MAX_EXACT_TERMS {
-            return Err(deviance_row_error(
-                row,
-                "exact Tweedie series work certificate",
-                eta,
-                terms as f64,
-            ));
+            return Err(work_limit(terms as f64));
         }
     }
     while k_peak > 1.0 {
@@ -2123,19 +2106,50 @@ fn tweedie_exact_series_loglik_from_eta(
             break;
         }
         if terms > MAX_EXACT_TERMS {
-            return Err(deviance_row_error(
-                row,
-                "exact Tweedie series work certificate",
-                eta,
-                terms as f64,
-            ));
+            return Err(work_limit(terms as f64));
         }
     }
+    let compensated_add = |sum: &mut f64, compensation: &mut f64, term: f64| {
+        let next = *sum + term;
+        *compensation += if sum.abs() >= term.abs() {
+            (*sum - next) + term
+        } else {
+            (term - next) + *sum
+        };
+        *sum = next;
+    };
     let mut accumulator = 1.0_f64;
+    let mut compensation = 0.0_f64;
+
+    // The lower tail has finitely many terms. Sum every one through k=1; no
+    // heuristic truncation is needed or permitted.
+    let mut k = k_peak - 1.0;
+    while k >= 1.0 {
+        let difference = log_term(k) - f_peak;
+        if difference.is_nan() || difference == f64::INFINITY {
+            return Err(deviance_row_error(
+                row,
+                "exact Tweedie lower series term",
+                eta,
+                difference,
+            ));
+        }
+        compensated_add(&mut accumulator, &mut compensation, difference.exp());
+        k -= 1.0;
+        terms += 1;
+        if terms > MAX_EXACT_TERMS {
+            return Err(work_limit(terms as f64));
+        }
+    }
+
+    // Above the mode, strict log-concavity makes adjacent term ratios decrease.
+    // After adding t_k, all omitted mass is bounded by
+    // t_{k+1}/(1-r_{k+1}). Stop only when adding that rigorous bound cannot
+    // change the compensated f64 accumulator.
     let mut k = k_peak + 1.0;
     loop {
         let difference = log_term(k) - f_peak;
-        if difference < -LOG_SUM_CUTOFF {
+        if difference == f64::NEG_INFINITY {
             break;
         }
         if !difference.is_finite() {
@@ -2146,45 +2160,36 @@ fn tweedie_exact_series_loglik_from_eta(
                 difference,
             ));
         }
-        accumulator += difference.exp();
-        k += 1.0;
+        compensated_add(&mut accumulator, &mut compensation, difference.exp());
         terms += 1;
         if terms > MAX_EXACT_TERMS {
-            return Err(deviance_row_error(
-                row,
-                "exact Tweedie series work certificate",
-                eta,
-                terms as f64,
-            ));
+            return Err(work_limit(terms as f64));
         }
-    }
-    let mut k = k_peak - 1.0;
-    while k >= 1.0 {
-        let difference = log_term(k) - f_peak;
-        if difference < -LOG_SUM_CUTOFF {
+
+        let next_difference = log_term(k + 1.0) - f_peak;
+        if next_difference == f64::NEG_INFINITY {
             break;
         }
-        if !difference.is_finite() {
+        if !next_difference.is_finite() {
             return Err(deviance_row_error(
                 row,
-                "exact Tweedie lower series term",
+                "exact Tweedie upper-tail certificate",
                 eta,
-                difference,
+                next_difference,
             ));
         }
-        accumulator += difference.exp();
-        k -= 1.0;
-        terms += 1;
-        if terms > MAX_EXACT_TERMS {
-            return Err(deviance_row_error(
-                row,
-                "exact Tweedie series work certificate",
-                eta,
-                terms as f64,
-            ));
+        let log_ratio = next_difference - difference;
+        if log_ratio < 0.0 {
+            let ratio = log_ratio.exp();
+            let remaining_bound = next_difference.exp() / (1.0 - ratio);
+            let represented_sum = accumulator + compensation;
+            if represented_sum + remaining_bound == represented_sum {
+                break;
+            }
         }
+        k += 1.0;
     }
-    let value = f_peak + accumulator.ln();
+    let value = f_peak + (accumulator + compensation).ln();
     if value.is_finite() {
         Ok(value)
     } else {
@@ -2216,88 +2221,15 @@ fn tweedie_exact_series_loglik_from_eta(
 /// f(y>0) = Σ_{k≥1} Pois(k; λ) · Gamma(y; kα, γ),  α = (2−p)/(p−1),
 ///                                                 γ = φᵢ (p−1) μ^{p−1}.
 /// ```
-/// The infinite sum is evaluated by log-sum-exp around its dominant term. The
-/// summand is log-concave in `k`, so a climb from `k ≈ λ` finds the global max
-/// and the tails are accumulated outward until they fall `LOG_SUM_CUTOFF` below
-/// the peak.
+/// Test adapter for the production eta-space exact-series oracle.
 #[inline]
 #[cfg(test)]
 pub(crate) fn tweedie_series_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
-    if w <= 0.0 {
-        // Zero prior weight excludes the observation (matches the saddlepoint).
+    if w == 0.0 {
         return 0.0;
     }
-    let phi_i = phi / w;
-    let two_minus_p = 2.0 - p;
-    let p_minus_one = p - 1.0;
-    // λ = μ^{2−p} / (φᵢ (2−p)) — the compound-Poisson jump rate.
-    let lambda = mui.powf(two_minus_p) / (phi_i * two_minus_p);
-    if yi <= 0.0 {
-        // Exact point mass at zero: P(Y = 0) = exp(−λ).
-        return -lambda;
-    }
-    let alpha = two_minus_p / p_minus_one; // gamma shape per jump
-    let gamma_scale = phi_i * p_minus_one * mui.powf(p_minus_one);
-    let ln_lambda = lambda.ln();
-    let ln_y = yi.ln();
-    let ln_gamma_scale = gamma_scale.ln();
-    let y_over_scale = yi / gamma_scale;
-    // log of the k-th mixture term: Poisson(k; λ) pmf + Gamma(y; kα, γ) pdf.
-    let log_term = |k: f64| -> f64 {
-        -lambda + k * ln_lambda - ln_gamma(k + 1.0) + (k * alpha - 1.0) * ln_y
-            - y_over_scale
-            - k * alpha * ln_gamma_scale
-            - ln_gamma(k * alpha)
-    };
-    // Climb to the dominant term. Start at the analytic peak-index estimate
-    // (which reduces to λ when y ≈ μ and tracks large y), so the climb only
-    // refines by a few steps at any magnitude; the log-concave summand is
-    // unimodal so the climb reaches the global maximum.
-    let mut k_peak = tweedie_series_peak_index(yi, mui, phi_i, p)
-        .round()
-        .max(1.0);
-    let mut f_peak = log_term(k_peak);
-    loop {
-        let f_up = log_term(k_peak + 1.0);
-        if f_up > f_peak {
-            k_peak += 1.0;
-            f_peak = f_up;
-        } else {
-            break;
-        }
-    }
-    while k_peak > 1.0 {
-        let f_down = log_term(k_peak - 1.0);
-        if f_down > f_peak {
-            k_peak -= 1.0;
-            f_peak = f_down;
-        } else {
-            break;
-        }
-    }
-    // Accumulate exp(term − peak) outward until the tails are negligible.
-    // e^{−LOG_SUM_CUTOFF} ≈ 6·10⁻¹⁷ is below f64 round-off relative to the peak.
-    const LOG_SUM_CUTOFF: f64 = 37.4;
-    let mut acc = 1.0_f64; // the peak term itself (exp(0))
-    let mut k = k_peak + 1.0;
-    loop {
-        let d = log_term(k) - f_peak;
-        if d < -LOG_SUM_CUTOFF {
-            break;
-        }
-        acc += d.exp();
-        k += 1.0;
-    }
-    let mut k = k_peak - 1.0;
-    while k >= 1.0 {
-        let d = log_term(k) - f_peak;
-        if d < -LOG_SUM_CUTOFF {
-            break;
-        }
-        acc += d.exp();
-        k -= 1.0;
-    }
-    f_peak + acc.ln()
+    tweedie_exact_series_loglik_from_eta(0, yi, mui.ln(), w, p, phi.ln())
+        .expect("exact Tweedie test fixture")
 }
 
 /// Exact Tweedie log-density. This never switches to a saddlepoint: callers

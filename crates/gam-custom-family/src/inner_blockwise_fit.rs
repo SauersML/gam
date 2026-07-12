@@ -6806,10 +6806,18 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
             }
         } else {
             let solver = gam_linalg::utils::StableSolver::new("joint polish");
-            match solver.solvevectorwithridge_retries(&h_dense, &rhs, JOINT_TRACE_STABILITY_RIDGE) {
-                Some(d) => d,
-                None => break,
+            let factor = match solver.factorize(&h_dense) {
+                Ok(factor) => factor,
+                Err(_) => break,
+            };
+            let mut direction = rhs.clone();
+            let mut direction_matrix =
+                gam_linalg::faer_ndarray::array1_to_col_matmut(&mut direction);
+            factor.solve_in_place(direction_matrix.as_mut());
+            if !direction.iter().all(|value| value.is_finite()) {
+                break;
             }
+            direction
         };
         if !delta.iter().all(|v| v.is_finite()) {
             break;
