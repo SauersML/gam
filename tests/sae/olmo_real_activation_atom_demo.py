@@ -194,8 +194,9 @@ def main() -> int:
         seed=args.seed + 11,
         mean_l0=mean_l0,
     )
-    winner = v["winner"]
-    best_k = v["mixture_k"]
+    winner_class = v["winner_class"]
+    reporting_winner = v["reporting_winner"]
+    mixture_reporting_k = v["mixture_reporting_k"]
     margin = v["circular_margin"]
     circle_wins = bool(v["circle_wins"])
     table = dict(zip(v["candidate_names"], v["stacking_weights"]))
@@ -205,7 +206,10 @@ def main() -> int:
     )
     for name, val in sorted(table.items(), key=lambda kv: -kv[1]):
         print(f"    {name:18s} weight={val:.4f}")
-    print(f"  VERDICT: {winner}  (circular stacking margin = {margin:+.4f})")
+    print(
+        f"  VERDICT: class={winner_class} reporting={reporting_winner} "
+        f"(circular stacking margin = {margin:+.4f})"
+    )
 
     # --- #975 attribute carve: does an attribute bind the coordinate? --------
     # Color the recovered atlas by the prompt `kind` and report whether the
@@ -251,9 +255,10 @@ def main() -> int:
         "layer": args.layer,
         "reconstruction_r2": r2,
         "atom_topology": str(topology),
-        "shape_winner": winner,
+        "shape_winner_class": winner_class,
+        "shape_reporting_winner": reporting_winner,
         "shape_table": table,
-        "best_mixture_k": best_k,
+        "mixture_reporting_k": mixture_reporting_k,
         "circular_margin": margin,
         "circle_wins_shape_race": circle_wins,
         "kind_angular_concentration": kind_organized,
@@ -272,10 +277,11 @@ def main() -> int:
         return 6
 
     if circle_wins:
-        print("\n*** REAL-ACTIVATION WIN: the recovered atom is an evidence-adjudicated S^1 "
+        print("\n*** REAL-ACTIVATION WIN: the recovered atom is a predictively adjudicated S^1 "
               "circle BEATING the cluster null on real OLMo activations. ***")
     else:
-        print(f"\n*** REAL-ACTIVATION FINDING: the recovered atom adjudicates as '{winner}', "
+        print(f"\n*** REAL-ACTIVATION FINDING: the recovered atom adjudicates as "
+              f"class='{winner_class}' reporting='{reporting_winner}', "
               "not a smooth circle — the structure ladder reports the honest verdict "
               "(the wager loses measurably on this layer/concept, which is itself the result). ***")
     return 0
