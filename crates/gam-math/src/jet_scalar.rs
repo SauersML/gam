@@ -1434,6 +1434,98 @@ impl<const K: usize> MappedOrder2Accumulator<K> {
     }
 }
 
+/// One inner scalar in a runtime-width additive order-two composition.
+///
+/// Implementors expose only the inner gradient and Hessian. The corresponding
+/// outer function's first and second derivatives live beside the source in the
+/// caller's term type, so several terms that share an inner scalar may be fused
+/// before entering [`DynamicOrder2Accumulator`].
+pub trait DynamicOrder2Term {
+    /// Outer first derivative `f'(q)` for this already-fused source.
+    fn outer_first(&self) -> f64;
+
+    /// Outer second derivative `f''(q)` for this already-fused source.
+    fn outer_second(&self) -> f64;
+
+    /// Inner first derivative `q_i`.
+    fn inner_gradient(&self, axis: usize) -> f64;
+
+    /// Inner second derivative `q_ij`.
+    fn inner_hessian(&self, row: usize, column: usize) -> f64;
+}
+
+/// Allocation-minimal runtime-width lowering of an additive order-two program.
+///
+/// This is the dynamic-width sibling of [`MappedOrder2Accumulator`]. A caller
+/// first reduces its mathematical row program to a scalar value plus `N`
+/// independent composed sources. This accumulator then performs the universal
+/// chain rule
+///
+/// ```text
+/// g_i  = sum_t (f_t' q_t,i)
+/// H_ij = sum_t (f_t'' q_t,i q_t,j + f_t' q_t,ij)
+/// ```
+///
+/// in one gradient pass and one upper-triangular Hessian pass. It owns exactly
+/// the two buffers that become the returned gradient and Hessian; no per-term
+/// derivative buffer or jet temporary is allocated. `N` is const-generic so a
+/// small fixed source set is visible to LLVM and can be unrolled.
+#[derive(Debug)]
+pub struct DynamicOrder2Accumulator {
+    value: f64,
+    gradient: Vec<f64>,
+    hessian: Vec<f64>,
+}
+
+impl DynamicOrder2Accumulator {
+    /// Lower a fused additive source set at runtime primary width `dimension`.
+    #[inline(always)]
+    #[must_use]
+    pub fn from_composed_sum<T: DynamicOrder2Term, const N: usize>(
+        dimension: usize,
+        value: f64,
+        terms: &[T; N],
+    ) -> Self {
+        let mut gradient = vec![0.0; dimension];
+        let mut hessian = vec![0.0; dimension * dimension];
+
+        for axis in 0..dimension {
+            let mut channel = 0.0;
+            for term in terms {
+                channel += term.outer_first() * term.inner_gradient(axis);
+            }
+            gradient[axis] = channel;
+        }
+
+        for row in 0..dimension {
+            for column in row..dimension {
+                let mut channel = 0.0;
+                for term in terms {
+                    let row_gradient = term.inner_gradient(row);
+                    let column_gradient = term.inner_gradient(column);
+                    channel += term.outer_second() * row_gradient * column_gradient
+                        + term.outer_first() * term.inner_hessian(row, column);
+                }
+                hessian[row * dimension + column] = channel;
+                hessian[column * dimension + row] = channel;
+            }
+        }
+
+        Self {
+            value,
+            gradient,
+            hessian,
+        }
+    }
+
+    /// Finish the lowering as `(value, gradient, row-major symmetric Hessian)`.
+    #[inline(always)]
+    #[must_use]
+    pub fn into_channels(self) -> (f64, Vec<f64>, Vec<f64>) {
+        (self.value, self.gradient, self.hessian)
+    }
+}
+
 // ── Lane-batched Order-2 scalar: 4 rows per pass in SIMD lanes (perf) ────
 //
 // The hot per-row jet kernels evaluate ONE row's `(v, g, H)` tower at a time in
@@ -2887,6 +2979,93 @@ mod tests {
         let atom = Order2::<1>::variable(0.2, 0);
         let mut lowered = MappedOrder2Accumulator::<2>::zero();
         lowered.add_composed(&atom, [2], [0.2, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn dynamic_order2_accumulator_matches_dense_composed_sum() {
+        const K: usize = 4;
+
+        struct Term {
+            first: f64,
+            second: f64,
+            gradient: [f64; K],
+            hessian: [[f64; K]; K],
+        }
+
+        impl DynamicOrder2Term for Term {
+            fn outer_first(&self) -> f64 {
+                self.first
+            }
+
+            fn outer_second(&self) -> f64 {
+                self.second
+            }
+
+            fn inner_gradient(&self, axis: usize) -> f64 {
+                self.gradient[axis]
+            }
+
+            fn inner_hessian(&self, row: usize, column: usize) -> f64 {
+                self.hessian[row][column]
+            }
+        }
+
+        let p = [0.7, -0.3, 0.2, 0.8];
+        let vars: [Order2<K>; K] = std::array::from_fn(|axis| Order2::variable(p[axis], axis));
+        let first_atom = vars[0]
+            .mul(&vars[1])
+            .add(&vars[2].exp())
+            .add(&Order2::constant(1.5));
+        let second_atom = vars[1].mul(&vars[3]).sub(&vars[0]);
+        let first_value = first_atom.value();
+        let second_exp = second_atom.value().exp();
+        let first_stack = [
+            first_value.ln(),
+            first_value.recip(),
+            -1.0 / (first_value * first_value),
+            0.0,
+            0.0,
+        ];
+        let second_stack = [second_exp, second_exp, second_exp, second_exp, second_exp];
+        let dense = first_atom
+            .compose_unary(first_stack)
+            .add(&second_atom.compose_unary(second_stack));
+        let terms = [
+            Term {
+                first: first_stack[1],
+                second: first_stack[2],
+                gradient: first_atom.g(),
+                hessian: first_atom.h(),
+            },
+            Term {
+                first: second_stack[1],
+                second: second_stack[2],
+                gradient: second_atom.g(),
+                hessian: second_atom.h(),
+            },
+        ];
+        let (value, gradient, hessian) = DynamicOrder2Accumulator::from_composed_sum(
+            K,
+            first_stack[0] + second_stack[0],
+            &terms,
+        )
+        .into_channels();
+
+        close(value, dense.value(), "dynamic value");
+        for row in 0..K {
+            close(
+                gradient[row],
+                dense.g()[row],
+                &format!("dynamic gradient[{row}]"),
+            );
+            for column in 0..K {
+                close(
+                    hessian[row * K + column],
+                    dense.h()[row][column],
+                    &format!("dynamic Hessian[{row},{column}]"),
+                );
+            }
+        }
     }
 
     #[derive(Clone, Copy, Debug)]

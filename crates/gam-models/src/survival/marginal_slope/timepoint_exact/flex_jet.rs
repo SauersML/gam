@@ -82,6 +82,7 @@
 use super::*;
 use crate::bms::signed_probit_neglog_unary_stack;
 use crate::survival::marginal_slope::gpu;
+use gam_math::jet_scalar::{DynamicOrder2Accumulator, DynamicOrder2Term};
 
 /// The `[f64; 5]` Faà di Bruno stack of `g(η) = logΦ(−η)` at `η`.
 ///
@@ -136,6 +137,206 @@ trait FlexJet: Sized + Clone {
     #[inline]
     fn ln(&self) -> Self {
         self.compose_unary(ln_stack(self.value()))
+    }
+}
+
+const FLEX_OUTER_SOURCE_COUNT: usize = 6;
+const FLEX_OUTER_TERM_COUNT: usize = 7;
+
+/// The six independent inner scalars used by the seven-term flex row NLL.
+/// `eta1` appears twice (survival and Gaussian-density terms), and the order-two
+/// compiler fuses those two outer stacks before touching its derivative views.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum FlexOuterSource {
+    Eta0 = 0,
+    Eta1 = 1,
+    Q1 = 2,
+    Chi1 = 3,
+    D1 = 4,
+    Qd1 = 5,
+}
+
+impl FlexOuterSource {
+    #[inline(always)]
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FlexOuterTransform {
+    Compose([f64; 5]),
+    Square,
+}
+
+#[derive(Clone, Copy)]
+enum FlexOuterCombine {
+    Add,
+    Subtract,
+}
+
+/// One term of the flex row NLL. This term list is the sole mathematical
+/// definition consumed by both the generic high-order jets and the compiled
+/// allocation-minimal order-two lowering.
+#[derive(Clone, Copy)]
+struct FlexOuterTerm {
+    source: FlexOuterSource,
+    transform: FlexOuterTransform,
+    scale: f64,
+    combine: FlexOuterCombine,
+}
+
+impl FlexOuterTerm {
+    #[inline(always)]
+    fn evaluate<J: FlexJet>(&self, sources: &FlexJetSources<'_, J>) -> J {
+        let source = sources.get(self.source);
+        let transformed = match self.transform {
+            FlexOuterTransform::Compose(stack) => source.compose_unary(stack),
+            FlexOuterTransform::Square => source.mul(source),
+        };
+        transformed.scale(self.scale)
+    }
+
+    #[inline(always)]
+    fn order2_channels(&self, source_value: f64) -> [f64; 3] {
+        let mut channels = match self.transform {
+            FlexOuterTransform::Compose(stack) => [stack[0], stack[1], stack[2]],
+            FlexOuterTransform::Square => [
+                source_value * source_value,
+                source_value + source_value,
+                2.0,
+            ],
+        };
+        for channel in &mut channels {
+            *channel *= self.scale;
+        }
+        channels
+    }
+}
+
+struct FlexJetSources<'a, J> {
+    eta0: &'a J,
+    eta1: &'a J,
+    q1: &'a J,
+    chi1: &'a J,
+    d1: &'a J,
+    qd1: &'a J,
+}
+
+impl<'a, J> FlexJetSources<'a, J> {
+    #[inline(always)]
+    fn get(&self, source: FlexOuterSource) -> &'a J {
+        match source {
+            FlexOuterSource::Eta0 => self.eta0,
+            FlexOuterSource::Eta1 => self.eta1,
+            FlexOuterSource::Q1 => self.q1,
+            FlexOuterSource::Chi1 => self.chi1,
+            FlexOuterSource::D1 => self.d1,
+            FlexOuterSource::Qd1 => self.qd1,
+        }
+    }
+}
+
+/// The single flex row-NLL source, excluding the additive `w·d·ln2π`
+/// constant. The ordered seven-term plan preserves the generic evaluator's
+/// historical arithmetic while exposing the same source/transform metadata to
+/// the order-two compiler.
+struct FlexOuterPlan {
+    terms: [FlexOuterTerm; FLEX_OUTER_TERM_COUNT],
+}
+
+impl FlexOuterPlan {
+    #[inline(always)]
+    fn new(
+        chi1: f64,
+        d1: f64,
+        qd1: f64,
+        surv0: [f64; 5],
+        surv1: [f64; 5],
+        wi: f64,
+        di: f64,
+    ) -> Self {
+        let wd = wi * di;
+        Self {
+            terms: [
+                FlexOuterTerm {
+                    source: FlexOuterSource::Eta0,
+                    transform: FlexOuterTransform::Compose(surv0),
+                    scale: wi,
+                    combine: FlexOuterCombine::Add,
+                },
+                FlexOuterTerm {
+                    source: FlexOuterSource::Eta1,
+                    transform: FlexOuterTransform::Compose(surv1),
+                    scale: -wi * (1.0 - di),
+                    combine: FlexOuterCombine::Add,
+                },
+                FlexOuterTerm {
+                    source: FlexOuterSource::Eta1,
+                    transform: FlexOuterTransform::Square,
+                    scale: 0.5 * wd,
+                    combine: FlexOuterCombine::Add,
+                },
+                FlexOuterTerm {
+                    source: FlexOuterSource::Q1,
+                    transform: FlexOuterTransform::Square,
+                    scale: 0.5 * wd,
+                    combine: FlexOuterCombine::Add,
+                },
+                FlexOuterTerm {
+                    source: FlexOuterSource::Chi1,
+                    transform: FlexOuterTransform::Compose(ln_stack(chi1)),
+                    scale: wd,
+                    combine: FlexOuterCombine::Subtract,
+                },
+                FlexOuterTerm {
+                    source: FlexOuterSource::D1,
+                    transform: FlexOuterTransform::Compose(ln_stack(d1)),
+                    scale: wd,
+                    combine: FlexOuterCombine::Add,
+                },
+                FlexOuterTerm {
+                    source: FlexOuterSource::Qd1,
+                    transform: FlexOuterTransform::Compose(ln_stack(qd1)),
+                    scale: wd,
+                    combine: FlexOuterCombine::Subtract,
+                },
+            ],
+        }
+    }
+
+    #[inline(always)]
+    fn evaluate<J: FlexJet>(&self, sources: &FlexJetSources<'_, J>) -> J {
+        let mut output = self.terms[0].evaluate(sources);
+        for term in &self.terms[1..] {
+            let contribution = term.evaluate(sources);
+            output = match term.combine {
+                FlexOuterCombine::Add => output.add(&contribution),
+                FlexOuterCombine::Subtract => output.sub(&contribution),
+            };
+        }
+        output
+    }
+
+    /// Compile the ordered term list to one value plus one `(f', f'')` pair per
+    /// independent source. Terms sharing a source are fused before the
+    /// runtime-width gradient/Hessian sweep.
+    #[inline(always)]
+    fn compile_order2(&self, source_values: [f64; FLEX_OUTER_SOURCE_COUNT]) -> FlexOrder2Plan {
+        let mut value = 0.0;
+        let mut derivatives = [[0.0; 2]; FLEX_OUTER_SOURCE_COUNT];
+        for term in &self.terms {
+            let channels = term.order2_channels(source_values[term.source.index()]);
+            let sign = match term.combine {
+                FlexOuterCombine::Add => 1.0,
+                FlexOuterCombine::Subtract => -1.0,
+            };
+            value += sign * channels[0];
+            derivatives[term.source.index()][0] += sign * channels[1];
+            derivatives[term.source.index()][1] += sign * channels[2];
+        }
+        FlexOrder2Plan { value, derivatives }
     }
 }
 
