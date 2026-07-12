@@ -211,6 +211,7 @@ pub trait RuntimeJetScalar<'arena>: Clone {
 /// row program can be instantiated at a fixed tower and at a dynamic packed
 /// scalar; production code unwraps the inner fixed tower after evaluation.
 #[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
 pub struct FixedRuntimeJet<S, const K: usize> {
     inner: S,
 }
@@ -218,12 +219,14 @@ pub struct FixedRuntimeJet<S, const K: usize> {
 impl<S, const K: usize> FixedRuntimeJet<S, K> {
     /// Wrap a fixed-dimension scalar so a runtime-dimension row expression can
     /// evaluate it without authoring a second const-generic body.
+    #[inline(always)]
     #[must_use]
     pub fn from_inner(inner: S) -> Self {
         Self { inner }
     }
 
     /// Recover the wrapped const-generic scalar.
+    #[inline(always)]
     #[must_use]
     pub fn into_inner(self) -> S {
         self.inner
@@ -233,6 +236,7 @@ impl<S, const K: usize> FixedRuntimeJet<S, K> {
 impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for FixedRuntimeJet<S, K> {
     type Workspace = ();
 
+    #[inline(always)]
     fn constant(c: f64, dimension: usize, &(): &'arena Self::Workspace) -> Self {
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
         Self {
@@ -240,6 +244,7 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
         }
     }
 
+    #[inline(always)]
     fn variable(x: f64, axis: usize, dimension: usize, &(): &'arena Self::Workspace) -> Self {
         assert_eq!(dimension, K, "fixed jet dimension mismatch");
         Self {
@@ -247,44 +252,52 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
         }
     }
 
+    #[inline(always)]
     fn dimension(&self) -> usize {
         K
     }
 
+    #[inline(always)]
     fn value(&self) -> f64 {
         self.inner.value()
     }
 
+    #[inline(always)]
     fn add(&self, o: &Self) -> Self {
         Self {
             inner: self.inner.add(&o.inner),
         }
     }
 
+    #[inline(always)]
     fn sub(&self, o: &Self) -> Self {
         Self {
             inner: self.inner.sub(&o.inner),
         }
     }
 
+    #[inline(always)]
     fn mul(&self, o: &Self) -> Self {
         Self {
             inner: self.inner.mul(&o.inner),
         }
     }
 
+    #[inline(always)]
     fn neg(&self) -> Self {
         Self {
             inner: self.inner.neg(),
         }
     }
 
+    #[inline(always)]
     fn scale(&self, s: f64) -> Self {
         Self {
             inner: self.inner.scale(s),
         }
     }
 
+    #[inline(always)]
     fn compose_unary(&self, d: [f64; 5]) -> Self {
         Self {
             inner: self.inner.compose_unary(d),
