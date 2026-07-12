@@ -1311,15 +1311,25 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
                     );
                 }
                 CostStallVerdict::Converged => {
+                    // Report the band that ACTUALLY certified: absolute
+                    // tolerance, score-relative flat-valley bound, or the
+                    // #2241 probe-noise floor — printing only the raw
+                    // tolerance made a flat-band acceptance read as an
+                    // arithmetic impossibility in the log.
+                    let flat_band = flat_valley_converged_grad_bound(guard.best_value);
+                    let noise_band = guard.probe_noise_grad_bound().unwrap_or(f64::NAN);
                     log::info!(
                         "[OUTER] cost-stall convergence: REML objective improved < {:.3e} \
                          (relative) over {} consecutive accepted outer steps AND the projected \
-                         gradient cleared the outer tolerance (|g|={:.3e} <= {:.3e}); accepting \
+                         gradient cleared a stationarity band (|g|={:.3e}; absolute tol {:.3e}, \
+                         score-relative flat band {:.3e}, probe-noise band {:.3e}); accepting \
                          best-so-far as a stationary optimum (value={:.6e}).",
                         guard.rel_tol,
                         guard.window,
                         guard.best_grad_norm,
                         guard.grad_threshold,
+                        flat_band,
+                        noise_band,
                         guard.best_value,
                     );
                     return Err(ObjectiveEvalError::Fatal {

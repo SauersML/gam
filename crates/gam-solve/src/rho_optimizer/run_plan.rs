@@ -1814,11 +1814,26 @@ pub(crate) fn run_outer_with_plan(
                                     // certificate honors the same flat band the
                                     // guard certified in the loop.
                                     result.flat_noise_grad_bound = exit.noise_grad_bound;
-                                    if !exit.converged {
-                                        result.operator_stop_reason = Some(
-                                            OperatorTrustRegionStopReason::CostStallFlatValley,
-                                        );
-                                    }
+                                    // Preserve HOW BFGS stopped even when the
+                                    // guard already certified the stalled score
+                                    // surface (mirrors the ARC branch above).
+                                    // The mandatory final analytic certificate
+                                    // uses this provenance to apply the same
+                                    // score-relative flat-valley band as the
+                                    // guard; gating the marker on
+                                    // `!exit.converged` made the final pass
+                                    // silently revert to the much tighter raw
+                                    // solver bound and reject the identical
+                                    // point the guard certified (#1689 in ARC;
+                                    // reproduced live on the BFGS route by the
+                                    // GPT-2 E1 structured pass: guard accepted
+                                    // |g|=4.97e-1 under the flat band on a
+                                    // score of 2.7e3, certificate refused at
+                                    // its raw 4.4e-2 bound and the fit died
+                                    // with RemlConvergenceError).
+                                    result.operator_stop_reason = Some(
+                                        OperatorTrustRegionStopReason::CostStallFlatValley,
+                                    );
                                     Ok(result)
                                 }
                                 None => Err(EstimationError::RemlOptimizationFailed(format!(
