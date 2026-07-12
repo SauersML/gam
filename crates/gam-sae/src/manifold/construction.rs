@@ -5080,6 +5080,7 @@ impl SaeManifoldTerm {
     }
 
     pub(crate) fn ard_value(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
+        rho.validate_ard_log_strength_domain()?;
         if rho.log_ard.len() != self.k_atoms() {
             return Err(format!(
                 "ARD rho has {} atoms but term has {}",
@@ -5110,11 +5111,7 @@ impl SaeManifoldTerm {
             // wrapped (Circle) axes and the Gaussian on Euclidean axes.
             let periods = coord.effective_axis_periods();
             for axis in 0..d {
-                let log_alpha = SaeManifoldRho::clamped_log_strength(rho.log_ard[atom_idx][axis]);
-                // Clamp the log-precision before exponentiating: a raw
-                // `exp(log_ard)` overflows to `inf` for `log_ard ≳ 709`, and the
-                // `inf` precision then poisons the ARD energy / curvature with
-                // `inf · 0.0 = NaN` (#742, Issue 4).
+                let log_alpha = rho.log_ard[atom_idx][axis];
                 let alpha = log_alpha.exp();
                 let period = periods[axis];
                 let mut energy = 0.0;

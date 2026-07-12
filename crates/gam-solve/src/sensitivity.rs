@@ -397,8 +397,8 @@ pub struct CaseDeletionInfluence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_linalg::faer_ndarray::FaerCholesky;
     use faer::Side;
+    use gam_linalg::faer_ndarray::FaerCholesky;
     use ndarray::array;
 
     /// Textbook 3×3 lower-Cholesky, written out so the LowerTriangular

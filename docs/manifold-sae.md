@@ -494,7 +494,9 @@ import gamfit
 verdict = gamfit.adjudicate_atom_shape(
     coords, folds=5, seed=11, mean_l0=dictionary_mean_l0
 )
-# coords: contiguous float64 (n, 2), n >= 4 (a few dozen points recommended);
+# coords: contiguous float64 (n, 2). Default folds=5 requires n >= 5;
+# explicit folds must satisfy 2 <= folds <= n and leave >= 3 training rows
+# in every outer fold (a few dozen points are recommended).
 # k_ladder=[2, 3, ...] optionally overrides the mixture orders raced.
 ```
 

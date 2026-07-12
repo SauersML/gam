@@ -1491,28 +1491,24 @@ fn eligible_adaptive_orders(
             message: "order ladder must not be empty".to_string(),
         });
     }
-    if let Some(&k) = ladder.iter().find(|&&k| k < minimum_order) {
-        return Err(AdaptiveRungError::InvalidInput {
-            kind,
-            message: format!(
-                "order k={k} is outside this class, whose minimum order is k={minimum_order}"
-            ),
-        });
-    }
-    let orders = ladder
-        .iter()
-        .copied()
-        .filter(|&k| k <= n)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if orders.is_empty() {
-        return Err(AdaptiveRungError::InvalidInput {
-            kind,
-            message: format!(
-                "no requested order is eligible for n={n}; need {minimum_order} <= k <= n"
-            ),
-        });
+    let mut seen = std::collections::BTreeSet::new();
+    let mut orders = Vec::with_capacity(ladder.len());
+    for &k in ladder {
+        if k < minimum_order || k > n {
+            return Err(AdaptiveRungError::InvalidInput {
+                kind,
+                message: format!(
+                    "requested order k={k} is outside this class on n={n} rows; require {minimum_order} <= k <= n"
+                ),
+            });
+        }
+        if !seen.insert(k) {
+            return Err(AdaptiveRungError::InvalidInput {
+                kind,
+                message: format!("order ladder contains duplicate k={k}"),
+            });
+        }
+        orders.push(k);
     }
     Ok(orders)
 }
@@ -1624,9 +1620,7 @@ fn fit_mixture_rung_with_minimum_order(
     loop {
         let Some(best_k) = fits
             .iter()
-            .min_by(|a, b| {
-                a.bic.total_cmp(&b.bic).then(a.k.cmp(&b.k))
-            })
+            .min_by(|a, b| a.bic.total_cmp(&b.bic).then(a.k.cmp(&b.k)))
             .map(|f| f.k)
         else {
             return Err(AdaptiveRungError::InvalidInput {
@@ -1756,9 +1750,7 @@ pub fn fit_ring_of_clusters_rung(
     loop {
         let Some(best_k) = fits
             .iter()
-            .min_by(|left, right| {
-                left.bic.total_cmp(&right.bic).then(left.k.cmp(&right.k))
-            })
+            .min_by(|left, right| left.bic.total_cmp(&right.bic).then(left.k.cmp(&right.k)))
             .map(|fit| fit.k)
         else {
             return Err(AdaptiveRungError::InvalidInput {
@@ -2885,12 +2877,9 @@ mod tests {
     #[test]
     fn adaptive_rungs_reject_out_of_class_orders_before_fitting() {
         let data = Array2::<f64>::zeros((4, 2));
-        let free_error = fit_free_cluster_rung(
-            data.view(),
-            &[1, 2],
-            GaussianMixtureConfig::default(),
-        )
-        .expect_err("the free-cluster class must own k >= 2 inside the rung");
+        let free_error =
+            fit_free_cluster_rung(data.view(), &[1, 2], GaussianMixtureConfig::default())
+                .expect_err("the free-cluster class must own k >= 2 inside the rung");
         assert!(matches!(
             &free_error,
             AdaptiveRungError::InvalidInput {
@@ -2898,14 +2887,11 @@ mod tests {
                 ..
             }
         ));
-        assert!(free_error.to_string().contains("minimum order is k=2"));
+        assert!(free_error.to_string().contains("require 2 <= k <= n"));
 
-        let ring_error = fit_ring_of_clusters_rung(
-            data.view(),
-            &[2, 3],
-            GaussianMixtureConfig::default(),
-        )
-        .expect_err("the ring-cluster class must own k >= 3 inside the rung");
+        let ring_error =
+            fit_ring_of_clusters_rung(data.view(), &[2, 3], GaussianMixtureConfig::default())
+                .expect_err("the ring-cluster class must own k >= 3 inside the rung");
         assert!(matches!(
             &ring_error,
             AdaptiveRungError::InvalidInput {
@@ -2913,7 +2899,15 @@ mod tests {
                 ..
             }
         ));
-        assert!(ring_error.to_string().contains("minimum order is k=3"));
+        assert!(ring_error.to_string().contains("require 3 <= k <= n"));
+
+        let oversized = fit_mixture_rung(data.view(), &[5], GaussianMixtureConfig::default())
+            .expect_err("orders above n must not disappear from the requested estimand");
+        assert!(oversized.to_string().contains("require 1 <= k <= n"));
+
+        let duplicate = fit_mixture_rung(data.view(), &[1, 1], GaussianMixtureConfig::default())
+            .expect_err("duplicate orders must not be silently deduplicated");
+        assert!(duplicate.to_string().contains("duplicate k=1"));
     }
 
     #[test]
@@ -3178,7 +3172,10 @@ mod tests {
             )
             .expect_err("a non-finite candidate must not be skipped in favor of index zero");
             assert!(error.contains("candidate 1"), "{error}");
-            assert!(error.contains("non-finite negative-log-evidence"), "{error}");
+            assert!(
+                error.contains("non-finite negative-log-evidence"),
+                "{error}"
+            );
         }
     }
 

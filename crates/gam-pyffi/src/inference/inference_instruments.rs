@@ -1175,10 +1175,22 @@ mod tests {
                 .expect_err("shape CV requires 2 <= folds <= n");
             assert_eq!(
                 error,
-                format!(
-                    "adjudicate_atom_shape: require 2 <= folds <= n; got folds={folds}, n=4"
-                )
+                format!("adjudicate_atom_shape: require 2 <= folds <= n; got folds={folds}, n=4")
             );
+        }
+
+        let error = run_atom_shape_race(coords.view(), 2, 11, &[3])
+            .expect_err("every ring-cluster training fold needs at least three rows");
+        assert!(error.contains("minimum of 2 with n=4, folds=2"), "{error}");
+
+        for (ladder, expected) in [
+            (vec![0], "require 1 <= k <= n"),
+            (vec![5], "require 1 <= k <= n"),
+            (vec![2, 2], "duplicate k=2"),
+        ] {
+            let error = run_atom_shape_race(coords.view(), 4, 11, &ladder)
+                .expect_err("invalid order ladders must fail before fitting");
+            assert!(error.contains(expected), "{error}");
         }
     }
 
@@ -2457,8 +2469,31 @@ fn run_atom_shape_race(
             "adjudicate_atom_shape: require 2 <= folds <= n; got folds={folds}, n={n}"
         ));
     }
+    let largest_evaluation_fold = n / folds + usize::from(n % folds != 0);
+    let minimum_training_rows = n - largest_evaluation_fold;
+    if minimum_training_rows < 3 {
+        return Err(format!(
+            "adjudicate_atom_shape: every outer training fold must contain at least 3 rows for the ring-cluster class; got a minimum of {minimum_training_rows} with n={n}, folds={folds}"
+        ));
+    }
     if !coords.iter().all(|value| value.is_finite()) {
         return Err("adjudicate_atom_shape: coords must be finite".to_string());
+    }
+    if k_ladder.is_empty() {
+        return Err("adjudicate_atom_shape: k_ladder must not be empty".to_string());
+    }
+    let mut seen_orders = std::collections::BTreeSet::new();
+    for &k in k_ladder {
+        if k == 0 || k > n {
+            return Err(format!(
+                "adjudicate_atom_shape: requested order k={k} is invalid for n={n}; require 1 <= k <= n"
+            ));
+        }
+        if !seen_orders.insert(k) {
+            return Err(format!(
+                "adjudicate_atom_shape: k_ladder contains duplicate k={k}"
+            ));
+        }
     }
     // Full-data coordinates are canonicalized only for reporting fits and
     // corroborating BIC/2 scores. Every outer-CV provider below receives the raw
@@ -2471,35 +2506,56 @@ fn run_atom_shape_race(
     // so the stacking optimum is non-identifiable and the reported weights
     // depend on candidate ordering. The free *cluster* contender begins at two
     // components; the circular cluster model begins at three.
-    let mixture_ladder = k_ladder
+    let mixture_reporting_ladder = k_ladder
         .iter()
         .copied()
         .filter(|&k| k >= 2)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
         .collect::<Vec<_>>();
-    if mixture_ladder.is_empty() {
+    if mixture_reporting_ladder.is_empty() {
         return Err(
             "adjudicate_atom_shape: k_ladder must contain a free-mixture order k >= 2".to_string(),
         );
     }
-    let ring_cluster_ladder = mixture_ladder
+    let ring_cluster_reporting_ladder = mixture_reporting_ladder
         .iter()
         .copied()
         .filter(|&k| k >= 3)
         .collect::<Vec<_>>();
-    if ring_cluster_ladder.is_empty() {
+    if ring_cluster_reporting_ladder.is_empty() {
         return Err(
             "adjudicate_atom_shape: k_ladder must contain a ring-cluster order k >= 3".to_string(),
         );
     }
-    let mixture = fit_free_cluster_rung(reporting_coords.view(), &mixture_ladder, config)
+    // Every outer fold races the same, explicitly feasible order sets. Orders
+    // that require more rows than the smallest training fold remain eligible
+    // for the all-data reporting fit but cannot define a common CV class.
+    let mixture_fold_ladder = mixture_reporting_ladder
+        .iter()
+        .copied()
+        .filter(|&k| k <= minimum_training_rows)
+        .collect::<Vec<_>>();
+    if mixture_fold_ladder.is_empty() {
+        return Err(format!(
+            "adjudicate_atom_shape: k_ladder has no free-mixture order feasible in every outer training fold (minimum training rows {minimum_training_rows})"
+        ));
+    }
+    let ring_cluster_fold_ladder = ring_cluster_reporting_ladder
+        .iter()
+        .copied()
+        .filter(|&k| k <= minimum_training_rows)
+        .collect::<Vec<_>>();
+    if ring_cluster_fold_ladder.is_empty() {
+        return Err(format!(
+            "adjudicate_atom_shape: k_ladder has no ring-cluster order feasible in every outer training fold (minimum training rows {minimum_training_rows})"
+        ));
+    }
+    let mixture = fit_free_cluster_rung(reporting_coords.view(), &mixture_reporting_ladder, config)
         .map_err(|error| error.to_string())?;
     let mixture_winner = mixture.winner();
     let mixture_reporting_k = mixture_winner.k;
     let ring_clusters = fit_ring_of_clusters_rung(
         reporting_coords.view(),
-        &ring_cluster_ladder,
+        &ring_cluster_reporting_ladder,
         config,
     )
     .map_err(|error| error.to_string())?;
@@ -2536,7 +2592,7 @@ fn run_atom_shape_race(
             // rows cannot leak into either preprocessing or model selection.
             density_provider: free_mixture_rung_provider_2d(
                 raw_coords.clone(),
-                mixture_ladder.clone(),
+                mixture_fold_ladder,
                 config,
                 std::rc::Rc::clone(&mixture_fold_orders),
             ),
@@ -2547,7 +2603,7 @@ fn run_atom_shape_race(
             certification: EvidenceCertification::Exact,
             density_provider: ring_cluster_rung_provider_2d(
                 raw_coords,
-                ring_cluster_ladder.clone(),
+                ring_cluster_fold_ladder,
                 config,
                 std::rc::Rc::clone(&ring_cluster_fold_orders),
             ),
@@ -2786,14 +2842,16 @@ pub(crate) fn shape_matched_control_f32<'py>(
 /// from `sae_manifold_fit`). `folds`/`seed` control the deterministic CV folding
 /// of the held-out density table and must satisfy `2 <= folds <= n`. Thus the
 /// default `folds = 5` requires `n >= 5`; with an explicit smaller fold count,
-/// the shape models themselves require `n >= 4`. By default, the identical race
-/// also runs on an independent per-dimension shuffle and a covariance-matched
-/// Gaussian of these supplied coordinates; `mean_l0` is then required and is
-/// emitted beside this adjudicator-input false-circle floor. To audit artifacts
-/// introduced by earlier SAE/grouping/PCA stages, generate each control at the
-/// pipeline entry with [`shape_matched_control`] and rerun every stage.
-/// Non-dictionary callers can explicitly disable `matched_controls` and receive
-/// no control-rate claim.
+/// the shape models require `n >= 4` and at least three rows in every outer
+/// training fold. An explicit `k_ladder` must contain unique orders in `1..=n`;
+/// the default ladder is truncated to that feasible range before the race. By
+/// default, the identical race also runs on an independent per-dimension
+/// shuffle and a covariance-matched Gaussian of these supplied coordinates;
+/// `mean_l0` is then required and is emitted beside this adjudicator-input
+/// false-circle floor. To audit artifacts introduced by earlier
+/// SAE/grouping/PCA stages, generate each control at the pipeline entry with
+/// [`shape_matched_control`] and rerun every stage. Non-dictionary callers can
+/// explicitly disable `matched_controls` and receive no control-rate claim.
 ///
 /// #2262 rank-detection diagnostic: when `n_eff`, `ambient_p`, and
 /// `dispersion_r` are all supplied (the atom's occupancy-weighted effective
@@ -2823,7 +2881,13 @@ pub(crate) fn adjudicate_atom_shape<'py>(
     dispersion_r: Option<f64>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let coords_view = coords.as_array();
-    let ladder = k_ladder.unwrap_or_else(|| gam::solver::MIXTURE_K_LADDER.to_vec());
+    let ladder = k_ladder.unwrap_or_else(|| {
+        gam::solver::MIXTURE_K_LADDER
+            .iter()
+            .copied()
+            .filter(|&k| k <= coords_view.nrows())
+            .collect()
+    });
     let observed =
         run_atom_shape_race(coords_view, folds, seed, &ladder).map_err(py_value_error)?;
     let out = atom_shape_verdict_dict(py, &observed)?;

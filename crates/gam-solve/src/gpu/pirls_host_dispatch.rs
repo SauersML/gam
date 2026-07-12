@@ -16,9 +16,7 @@
 //! `crate::gpu::pirls_dispatch_wire`; this file only owns the
 //! host-side admission logic and struct assembly.
 
-use gam_terms::construction::ReparamResult;
 use crate::estimate::EstimationError;
-use gam_linalg::matrix::DesignMatrix;
 #[cfg(target_os = "linux")]
 use crate::pirls::FIXED_STABILIZATION_RIDGE;
 #[cfg(target_os = "linux")]
@@ -27,7 +25,9 @@ use crate::pirls::{
     GaussianFixedCache, LinearInequalityConstraints, PirlsConfig, PirlsCoordinateFrame,
     PirlsPenalty, PirlsResult, WorkingModelPirlsResult,
 };
+use gam_linalg::matrix::DesignMatrix;
 use gam_problem::LinkFunction;
+use gam_terms::construction::ReparamResult;
 use ndarray::{Array1, Array2, ArrayView1};
 use std::sync::Arc;
 
@@ -96,9 +96,7 @@ where
         && penalty_coefficient_lower_bounds.is_none()
         && penalty_linear_constraints_original.is_none()
     {
-        use crate::gpu::pirls_dispatch_wire::{
-            GpuGaussianPlsInput, try_gpu_gaussian_pls_dispatch,
-        };
+        use crate::gpu::pirls_dispatch_wire::{GpuGaussianPlsInput, try_gpu_gaussian_pls_dispatch};
         if let Some(cache) = gaussian_fixed_cache {
             if let PirlsPenalty::Dense {
                 s_transformed,

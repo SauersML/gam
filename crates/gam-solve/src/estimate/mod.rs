@@ -26,27 +26,27 @@ use crate::estimate::reml::{DirectionalHyperParam, RemlState};
 use std::fmt;
 
 // Crate-level imports
-use gam_terms::construction::{CanonicalPenalty, ReparamInvariant};
-use gam_linalg::utils::{
-    KahanSum, add_relative_diag_ridge, matrix_inversewith_regularization, row_mismatch_message,
-};
-use gam_linalg::matrix::{DesignMatrix, LinearOperator};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 pub use crate::model_types::{CoefficientPriorMean, Dispersion, EstimationError, PenaltySpec};
 use crate::pirls::{self, PirlsResult};
-use gam_terms::smooth::BlockwisePenalty;
+use gam_linalg::matrix::{DesignMatrix, LinearOperator};
+use gam_linalg::utils::{
+    KahanSum, add_relative_diag_ridge, matrix_inversewith_regularization, row_mismatch_message,
+};
 use gam_problem::{
     Coefficients, GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodScaleMetadata,
     LikelihoodSpec, LinkFunction, LogLikelihoodNormalization, LogSmoothingParamsView,
     ResponseFamily, RidgePassport, StandardLink,
 };
 use gam_problem::{MixtureLinkSpec, SasLinkSpec};
+use gam_terms::construction::{CanonicalPenalty, ReparamInvariant};
+use gam_terms::smooth::BlockwisePenalty;
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 // faer: high-performance dense solvers
-use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, fast_ab, fast_atb};
 use faer::{MatRef, Side};
+use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, fast_ab, fast_atb};
 use rayon::prelude::*;
 
 // Note: deflateweights_by_se was removed. We now use integrated (GHQ)
@@ -79,7 +79,6 @@ pub use crate::model_types::{
     saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
     validate_dense_hessian_export, validate_explicit_dense_hessian_for_whitening,
 };
-pub use gam_problem::{ensure_finite_scalar, validate_all_finite};
 pub use evaluation::{
     evaluate_external_ift_residual_at_perturbed_rho, evaluate_externalcost_andridge,
     evaluate_externalgradient,
@@ -89,12 +88,11 @@ pub(crate) use external_options::{
     effective_sas_link_for_family, resolved_external_config, validate_penalty_spec_shape,
 };
 pub use fit::{fit_gam, fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas};
+pub use gam_problem::{ensure_finite_scalar, validate_all_finite};
 pub use joint_hyper::ExternalJointHyperEvaluator;
 pub(crate) use optimizer::optimize_external_designwith_heuristic_lambdas_andwarm_start;
 pub use optimizer::{optimize_external_design, optimize_external_designwith_heuristic_lambdas};
-pub use outer_eval_capture::{
-    OuterEvalRecord, enable_outer_eval_capture, take_outer_eval_capture,
-};
+pub use outer_eval_capture::{OuterEvalRecord, enable_outer_eval_capture, take_outer_eval_capture};
 pub(crate) use penalty::{
     ParametricColumnConditioning, faer_frob_inner, kahan_sum, map_hessian_to_original_basis,
 };
@@ -102,8 +100,7 @@ pub(crate) use prefit::validate_penalty_specs;
 pub(crate) use smoothing_correction::{
     AUTO_CUBATURE_BOUNDARY_MARGIN, AUTO_CUBATURE_MAX_BETA_DIM, AUTO_CUBATURE_MAX_EIGENVECTORS,
     AUTO_CUBATURE_MAX_RHO_DIM, AUTO_CUBATURE_TARGET_VAR_FRAC, RHO_SOFT_PRIOR_SHARPNESS,
-    RHO_SOFT_PRIOR_WEIGHT, RemlConfig, compute_smoothing_correction,
-    smooth_floor_dp,
+    RHO_SOFT_PRIOR_WEIGHT, RemlConfig, compute_smoothing_correction, smooth_floor_dp,
 };
 // #1521 carve: the spatial-optimization driver reads the unified rho bound as
 // `gam_solve::estimate::RHO_BOUND`.

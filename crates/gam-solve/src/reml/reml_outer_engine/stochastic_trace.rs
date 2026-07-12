@@ -419,7 +419,11 @@ impl StochasticTraceEstimator {
 
     /// Estimate a single trace `tr(H⁻¹ A)` using the same batched Hutchinson
     /// core as the multi-coordinate path.
-    pub fn estimate_single_trace(&self, hop: &dyn HessianFactorization, matrix: &Array2<f64>) -> f64 {
+    pub fn estimate_single_trace(
+        &self,
+        hop: &dyn HessianFactorization,
+        matrix: &Array2<f64>,
+    ) -> f64 {
         let matrices = [matrix];
         self.estimate_hinv_traces(hop, StochasticTraceTargets::Dense(&matrices))[0]
     }

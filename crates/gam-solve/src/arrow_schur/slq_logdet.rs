@@ -50,7 +50,7 @@
 //! be reproducible.
 
 use super::*;
-use gam_linalg::lanczos::{symmetric_lanczos_eigenpairs, SymmetricLanczosOptions};
+use gam_linalg::lanczos::{SymmetricLanczosOptions, symmetric_lanczos_eigenpairs};
 use gam_linalg::utils::splitmix64;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -353,7 +353,9 @@ mod tests {
         // exercises the matvec closure path without any matrix assembly.
         let dim = 100usize;
         let mut state = 123u64;
-        let diag: Vec<f64> = (0..dim).map(|_| next_uniform(&mut state, 0.5, 4.0)).collect();
+        let diag: Vec<f64> = (0..dim)
+            .map(|_| next_uniform(&mut state, 0.5, 4.0))
+            .collect();
         let exact: f64 = diag.iter().map(|d| d.ln()).sum();
 
         let diag_clone = diag.clone();

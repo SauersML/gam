@@ -1123,10 +1123,7 @@ pub(crate) fn certificate_hessian_is_psd(hessian: &Array2<f64>) -> Option<bool> 
 /// malformed, an entry is non-finite, the shifted factor is not PD, or the
 /// resulting quadratic form is negative (impossible for a PD factor, guarded
 /// against roundoff).
-pub(crate) fn newton_predicted_decrease(
-    hessian: &Array2<f64>,
-    grad: &Array1<f64>,
-) -> Option<f64> {
+pub(crate) fn newton_predicted_decrease(hessian: &Array2<f64>, grad: &Array1<f64>) -> Option<f64> {
     let n = hessian.nrows();
     if n == 0 || hessian.ncols() != n || grad.len() != n {
         return None;
@@ -1500,7 +1497,8 @@ pub(crate) fn certify_outer_optimality(
     // stationarity certificate below, and the vector feeds the curvature-scaled
     // flat-valley Newton decrement (#2253/#2249/#2015) once the analytic Hessian
     // is in hand.
-    let projected_gradient = project_gradient_vector(&result.rho, &evaluation.gradient, Some(&bounds));
+    let projected_gradient =
+        project_gradient_vector(&result.rho, &evaluation.gradient, Some(&bounds));
     let projected_grad_norm = projected_gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
     let solver_bound = outer_gradient_tolerance(config).threshold(evaluation.cost, grad_norm);
     let mut stationarity_bound = if matches!(
@@ -1553,8 +1551,8 @@ pub(crate) fn certify_outer_optimality(
     const OUTER_WALL_SENTINEL_FLOOR: f64 = 1.0e10;
     let solver_is_wall =
         !solver_final_value.is_finite() || solver_final_value.abs() >= OUTER_WALL_SENTINEL_FLOOR;
-    let analytic_is_real = result.final_value.is_finite()
-        && result.final_value.abs() < OUTER_WALL_SENTINEL_FLOOR;
+    let analytic_is_real =
+        result.final_value.is_finite() && result.final_value.abs() < OUTER_WALL_SENTINEL_FLOOR;
     let transient_wall = solver_is_wall && analytic_is_real;
     if !transient_wall
         && (!solver_final_value.is_finite()
@@ -1679,8 +1677,7 @@ pub(crate) fn certify_outer_optimality(
         None
     };
     if let Some(hessian) = analytic_hessian.as_ref().or(fd_hessian.as_ref())
-        && let Some(predicted_decrease) =
-            newton_predicted_decrease(hessian, &projected_gradient)
+        && let Some(predicted_decrease) = newton_predicted_decrease(hessian, &projected_gradient)
         && predicted_decrease.is_finite()
         && predicted_decrease > 0.0
     {
@@ -2059,42 +2056,42 @@ pub(crate) fn run_outer(
     // only fires when the solver CLAIMED convergence (a budget-exhausted
     // result is not a desync — its refusal is genuine).
     let claimed_converged = result.converged;
-    result.criterion_certificate =
-        match certify_outer_optimality(obj, config, context, &mut result) {
-            Ok(certificate) => Some(certificate),
-            Err(refusal) if claimed_converged => {
-                let prior_iterations = result.iterations;
-                log::info!(
-                    "[OUTER] {context}: solver convergence claim failed analytic \
+    result.criterion_certificate = match certify_outer_optimality(obj, config, context, &mut result)
+    {
+        Ok(certificate) => Some(certificate),
+        Err(refusal) if claimed_converged => {
+            let prior_iterations = result.iterations;
+            log::info!(
+                "[OUTER] {context}: solver convergence claim failed analytic \
                      certification after {prior_iterations} iteration(s); re-running once \
                      seeded at the refused checkpoint so the in-loop tolerance anchors to \
                      the terminal cost scale (#2273 stale-tolerance desync)"
-                );
-                let mut retry_cfg = config.clone();
-                retry_cfg.initial_rho = Some(result.rho.clone());
-                retry_cfg.heuristic_lambdas = None;
-                retry_cfg.seed_config.max_seeds = 1;
-                retry_cfg.seed_config.seed_budget = 1;
-                retry_cfg.screen_initial_rho = false;
-                retry_cfg.warm_start_cache_hit = true;
-                retry_cfg.operator_initial_trust_radius = result.operator_trust_radius;
-                retry_cfg.warm_start_outer_hessian = result.final_hessian.clone();
-                obj.reset();
-                match run_outer_uncertified(obj, &retry_cfg, context) {
-                    Ok(mut retried) => {
-                        retried.iterations = retried.iterations.saturating_add(prior_iterations);
-                        result = retried;
-                        Some(certify_outer_optimality(obj, config, context, &mut result)?)
-                    }
-                    // The retry could not even run (e.g. the checkpoint is a
-                    // hard refusal wall for the objective): surface the
-                    // ORIGINAL certification refusal, which carries the
-                    // checkpoint evidence.
-                    Err(_) => return Err(refusal),
+            );
+            let mut retry_cfg = config.clone();
+            retry_cfg.initial_rho = Some(result.rho.clone());
+            retry_cfg.heuristic_lambdas = None;
+            retry_cfg.seed_config.max_seeds = 1;
+            retry_cfg.seed_config.seed_budget = 1;
+            retry_cfg.screen_initial_rho = false;
+            retry_cfg.warm_start_cache_hit = true;
+            retry_cfg.operator_initial_trust_radius = result.operator_trust_radius;
+            retry_cfg.warm_start_outer_hessian = result.final_hessian.clone();
+            obj.reset();
+            match run_outer_uncertified(obj, &retry_cfg, context) {
+                Ok(mut retried) => {
+                    retried.iterations = retried.iterations.saturating_add(prior_iterations);
+                    result = retried;
+                    Some(certify_outer_optimality(obj, config, context, &mut result)?)
                 }
+                // The retry could not even run (e.g. the checkpoint is a
+                // hard refusal wall for the objective): surface the
+                // ORIGINAL certification refusal, which carries the
+                // checkpoint evidence.
+                Err(_) => return Err(refusal),
             }
-            Err(refusal) => return Err(refusal),
-        };
+        }
+        Err(refusal) => return Err(refusal),
+    };
     result.rho_uncertainty_diagnostic = Some(compute_rho_uncertainty_diagnostic(
         obj,
         config,
@@ -2571,10 +2568,7 @@ fn install_objective_upper_domain(
             )));
         }
         upper[index] = upper[index].min(domain);
-        if !(lower[index].is_finite()
-            && upper[index].is_finite()
-            && lower[index] < upper[index])
-        {
+        if !(lower[index].is_finite() && upper[index].is_finite() && lower[index] < upper[index]) {
             return Err(EstimationError::InvalidInput(format!(
                 "outer objective-domain intersection is empty or non-finite at coordinate {index}: lower={}, upper={}",
                 lower[index], upper[index]

@@ -302,6 +302,7 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         residual: Option<ArrayView2<'_, f64>>,
     ) -> Result<f64, String> {
+        rho.validate_ard_log_strength_domain()?;
         let n = self.n_obs();
         let p = self.output_dim();
         // Design-honesty weights are normalized to mean one, so they redistribute

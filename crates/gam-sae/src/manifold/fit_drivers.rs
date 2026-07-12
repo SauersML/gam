@@ -692,6 +692,8 @@ impl SaeManifoldTerm {
     ) -> Result<(), String> {
         use crate::chart_canonicalization::{CHART_RECOMPOSITION_REL_TOL, CanonicalChartTopology};
 
+        rho.validate_ard_log_strength_domain()?;
+
         // #F3 — capture the PRE-canonicalization coordinate spread per atom/axis.
         // The ARD precisions are stamped AFTER the reparameterization below (see the
         // end of this fn), MOMENT-MATCHED into the canonical chart: a coordinate

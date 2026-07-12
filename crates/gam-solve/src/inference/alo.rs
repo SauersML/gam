@@ -8,9 +8,9 @@ use faer::{Accum, Par};
 use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky};
 use gam_linalg::matrix::{PsdWeightsView, SignedWeightsView};
 use gam_linalg::utils::StableSolver;
-use opt::{BacktrackConfig, backtracking_line_search};
 use gam_problem::LinkFunction;
 use ndarray::{Array1, Array2, ArrayView1, ShapeBuilder, s};
+use opt::{BacktrackConfig, backtracking_line_search};
 use std::convert::Infallible;
 use std::fmt;
 
@@ -2209,8 +2209,7 @@ mod tests {
 
         // ...and match the closed-form W_S reference for every row.
         for obs in 0..n {
-            let expected =
-                (phi * x[[obs, 0]] * x[[obs, 0]] / (h * h) * sum_ws_x2).sqrt();
+            let expected = (phi * x[[obs, 0]] * x[[obs, 0]] / (h * h) * sum_ws_x2).sqrt();
             assert!(
                 (diag.se_sandwich[obs] - expected).abs() <= 1e-10 * expected.max(1.0),
                 "row {obs}: se_sandwich={} expected={expected}",

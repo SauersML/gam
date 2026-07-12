@@ -3812,6 +3812,7 @@ impl SaeManifoldTerm {
         j: usize,
         cache: &ArrowFactorCache,
     ) -> Result<SaeArrowVector, String> {
+        rho.validate_ard_log_strength_domain()?;
         let n_params = rho.to_flat().len();
         if j >= n_params {
             return Err(format!(
@@ -4133,6 +4134,7 @@ impl SaeManifoldTerm {
         solver: &DeflatedArrowSolver<'_>,
         joint_block: bool,
     ) -> Result<SaeArrowVector, String> {
+        rho.validate_ard_log_strength_domain()?;
         // Γ_a = tr(H⁻¹ ∂H/∂θ_a) over the inner variables θ (#1006). `H` here is
         // the SAME object the criterion factor builds — Gauss-Newton data
         // curvature plus the prior majorizers / `hessian_diag` diagonals the
@@ -4559,6 +4561,7 @@ impl SaeManifoldTerm {
         probes: &[Array1<f64>],
         sinv_probes: &[Array1<f64>],
     ) -> Result<SaeArrowVector, String> {
+        rho.validate_ard_log_strength_domain()?;
         if cache.arrow_log_det().is_none() {
             return Err(
                 "logdet_theta_adjoint_from_probes: cache lacks an authoritative joint-Hessian \

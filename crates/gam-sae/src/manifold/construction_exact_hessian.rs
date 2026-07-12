@@ -324,6 +324,7 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         v: &SaeArrowVector,
     ) -> Result<SaeArrowVector, String> {
+        rho.validate_ard_log_strength_domain()?;
         let p = self.output_dim();
         let n = self.n_obs();
         let k_atoms = self.k_atoms();
@@ -876,6 +877,8 @@ impl SaeManifoldTerm {
         solver: &DeflatedArrowSolver<'_>,
         inverse_probe_bundle: Option<(&[Array1<f64>], &[Array1<f64>])>,
     ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
+        rho.validate_ard_log_strength_domain()
+            .map_err(OuterGradientError::internal)?;
         let n_params = rho.to_flat().len();
         let mut explicit = Array1::<f64>::zeros(n_params);
         let mut logdet_trace = Array1::<f64>::zeros(n_params);

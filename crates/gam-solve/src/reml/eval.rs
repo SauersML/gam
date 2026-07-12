@@ -215,10 +215,10 @@ pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
     state: &RemlState<'_>,
     sigma_points: &[Array1<f64>],
 ) -> Result<Option<Vec<SigmaPointResult>>, gam_gpu::GpuError> {
-    use gam_terms::construction::{EngineDims, stable_reparameterization_engine_canonical};
-    use gam_gpu::device_runtime::GpuRuntime;
-    use crate::gpu_kernels::sigma_cubature::try_gpu_sigma_stream_pool_eval;
     use crate::gpu::pirls_dispatch_wire::admission_for;
+    use crate::gpu_kernels::sigma_cubature::try_gpu_sigma_stream_pool_eval;
+    use gam_gpu::device_runtime::GpuRuntime;
+    use gam_terms::construction::{EngineDims, stable_reparameterization_engine_canonical};
 
     if sigma_points.is_empty() {
         return Ok(Some(Vec::new()));
@@ -620,7 +620,9 @@ impl<'a> RemlState<'a> {
                 Some(escalator.escalate_rho_posterior(
                     final_rho,
                     &outer_hessian,
-                    &mut |rho| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()),
+                    &mut |rho| {
+                        self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok())
+                    },
                     &mut |rho| {
                         self.without_persistent_warm_start_store(|| {
                             // NUTS leapfrog gradients need the criterion value and
@@ -810,8 +812,8 @@ impl<'a> RemlState<'a> {
             ));
         }
 
-        use gam_linalg::faer_ndarray::FaerEigh;
         use faer::Side;
+        use gam_linalg::faer_ndarray::FaerEigh;
         let (evals, evecs) = match hessian_rho_inv.eigh(Side::Lower) {
             Ok(x) => x,
             Err(_) => {

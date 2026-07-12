@@ -1,5 +1,13 @@
 use super::*;
 
+/// Closed numerical domain of every learnable ARD log precision.
+///
+/// These are real parameter-domain endpoints, not saturation points: callers
+/// reject values outside the interval instead of clipping them onto a constant
+/// objective plateau.
+pub(crate) const ARD_LOG_STRENGTH_MIN: f64 = -700.0;
+pub(crate) const ARD_LOG_STRENGTH_MAX: f64 = 700.0;
+
 /// #1026 — how the per-atom ARD precisions are exposed to the OUTER PENALIZED QUASI-LAPLACE
 /// optimizer.
 ///
@@ -468,9 +476,57 @@ impl SaeManifoldRho {
     /// smoothing-Occam normalizer `½·d·log λ`) must read THIS, not the raw
     /// coordinate, so value and log conventions describe the same λ_eff.
     pub(crate) fn clamped_log_strength(log_strength: f64) -> f64 {
-        const MAX_LOG_STRENGTH: f64 = 700.0;
-        const MIN_LOG_STRENGTH: f64 = -700.0;
-        log_strength.clamp(MIN_LOG_STRENGTH, MAX_LOG_STRENGTH)
+        log_strength.clamp(ARD_LOG_STRENGTH_MIN, ARD_LOG_STRENGTH_MAX)
+    }
+
+    /// Validate the full per-atom ARD table against the supported closed domain.
+    /// Every fallible value, inner-solve, trace, and IFT entry calls this before
+    /// consuming an ARD strength, so ARD never acquires clipped plateau semantics.
+    pub(crate) fn validate_ard_log_strength_domain(&self) -> Result<(), String> {
+        for (atom, block) in self.log_ard.iter().enumerate() {
+            for (axis, &value) in block.iter().enumerate() {
+                if !value.is_finite()
+                    || !(ARD_LOG_STRENGTH_MIN..=ARD_LOG_STRENGTH_MAX).contains(&value)
+                {
+                    return Err(format!(
+                        "ARD log precision at atom {atom}, axis {axis} must be finite and in \
+                         [{ARD_LOG_STRENGTH_MIN}, {ARD_LOG_STRENGTH_MAX}]; got {value}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Objective-domain lower face in flat-rho layout. Non-ARD coordinates use
+    /// the widest finite endpoint, so intersecting this face with the configured
+    /// search box changes only ARD coordinates.
+    pub(crate) fn ard_flat_domain_lower_bound(&self) -> Option<Array1<f64>> {
+        if self.log_ard.iter().all(Array1::is_empty) {
+            return None;
+        }
+        let mut lower = Array1::from_elem(self.to_flat().len(), f64::MIN);
+        for atom in 0..self.log_ard.len() {
+            for axis in 0..self.log_ard[atom].len() {
+                lower[self.ard_flat_index(atom, axis)] = ARD_LOG_STRENGTH_MIN;
+            }
+        }
+        Some(lower)
+    }
+
+    /// Objective-domain upper face in flat-rho layout; see
+    /// [`Self::ard_flat_domain_lower_bound`].
+    pub(crate) fn ard_flat_domain_upper_bound(&self) -> Option<Array1<f64>> {
+        if self.log_ard.iter().all(Array1::is_empty) {
+            return None;
+        }
+        let mut upper = Array1::from_elem(self.to_flat().len(), f64::MAX);
+        for atom in 0..self.log_ard.len() {
+            for axis in 0..self.log_ard[atom].len() {
+                upper[self.ard_flat_index(atom, axis)] = ARD_LOG_STRENGTH_MAX;
+            }
+        }
+        Some(upper)
     }
 
     /// Flatten ρ into the contiguous outer-coordinate vector the generic
@@ -576,20 +632,21 @@ impl SaeManifoldRho {
     /// per-atom smoothness coordinates (#1556) and the few shared per-axis ARD
     /// values are BROADCAST back to every atom that owns that axis, rebuilding the
     /// full per-atom table the inner solve consumes.
-    pub fn from_flat(&self, flat: ArrayView1<'_, f64>) -> SaeManifoldRho {
+    pub fn from_flat(&self, flat: ArrayView1<'_, f64>) -> Result<SaeManifoldRho, String> {
         let smooth_start = self.smooth_flat_start();
-        match self.ard_sharing {
+        let rebuilt = match self.ard_sharing {
             ArdSharing::PerAtom => {
                 let k = self.log_lambda_smooth.len();
                 let ard_len: usize = self.log_ard.iter().map(|a| a.len()).sum();
                 let block_len = self.log_lambda_block.len();
-                assert_eq!(
-                    flat.len(),
-                    smooth_start + k + ard_len + block_len,
-                    "SaeManifoldRho::from_flat: flat length {} != sparse_dim + K + Σ d_k + (L-1) = {}",
-                    flat.len(),
-                    smooth_start + k + ard_len + block_len
-                );
+                let expected = smooth_start + k + ard_len + block_len;
+                if flat.len() != expected {
+                    return Err(format!(
+                        "SaeManifoldRho::from_flat: flat length {} != sparse_dim + K + \
+                         Σ d_k + (L-1) = {expected}",
+                        flat.len()
+                    ));
+                }
                 let log_lambda_smooth: Vec<f64> =
                     (0..k).map(|atom| flat[smooth_start + atom]).collect();
                 let mut log_ard = Vec::with_capacity(self.log_ard.len());
@@ -620,13 +677,14 @@ impl SaeManifoldRho {
                 let k = self.log_lambda_smooth.len();
                 let max_d = self.max_ard_axes();
                 let block_len = self.log_lambda_block.len();
-                assert_eq!(
-                    flat.len(),
-                    smooth_start + k + max_d + block_len,
-                    "SaeManifoldRho::from_flat: shared-ARD flat length {} != sparse_dim + K + max_d + (L-1) = {}",
-                    flat.len(),
-                    smooth_start + k + max_d + block_len
-                );
+                let expected = smooth_start + k + max_d + block_len;
+                if flat.len() != expected {
+                    return Err(format!(
+                        "SaeManifoldRho::from_flat: shared-ARD flat length {} != sparse_dim + K + \
+                         max_d + (L-1) = {expected}",
+                        flat.len()
+                    ));
+                }
                 let log_lambda_smooth: Vec<f64> =
                     (0..k).map(|atom| flat[smooth_start + atom]).collect();
                 // Broadcast the shared per-axis strengths into each atom's block,
@@ -657,6 +715,8 @@ impl SaeManifoldRho {
                     log_lambda_block,
                 }
             }
-        }
+        };
+        rebuilt.validate_ard_log_strength_domain()?;
+        Ok(rebuilt)
     }
 }

@@ -4,8 +4,8 @@
 //! penalties with the sparse-exact REML path. Generic sparse factorization and
 //! solve routines stay in `linalg::sparse_exact`.
 
-use gam_terms::construction::CanonicalPenalty;
 use crate::estimate::EstimationError;
+use gam_terms::construction::CanonicalPenalty;
 
 /// Return the count of block-separable canonical penalties eligible for the
 /// sparse-exact REML path. `None` means at least two penalties overlap in

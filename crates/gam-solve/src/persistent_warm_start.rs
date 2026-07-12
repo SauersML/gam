@@ -447,11 +447,10 @@ mod warm_start_artifact_tests {
         let family = format!("test-loso-{}", unix_secs_now());
         // Full-data fit on 1000 rows.
         let mut full = sample_artifact(&family, "x", vec![1.7]);
-        full.descriptor.row_population =
-            Some(crate::warm_start_artifact::RowPopulationTag {
-                n_rows: 1000,
-                label: Some("full".to_string()),
-            });
+        full.descriptor.row_population = Some(crate::warm_start_artifact::RowPopulationTag {
+            n_rows: 1000,
+            label: Some("full".to_string()),
+        });
         full.global.n_rows = 1000;
         let full_key = full.descriptor.descriptor_key().to_hex();
 

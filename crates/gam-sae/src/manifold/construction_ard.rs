@@ -315,6 +315,7 @@ impl SaeManifoldTerm {
         residual: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
     ) -> Result<f64, String> {
+        rho.validate_ard_log_strength_domain()?;
         let n = self.n_obs();
         let p = self.output_dim();
         if residual.dim() != (n, p) {
@@ -699,6 +700,7 @@ impl SaeManifoldTerm {
         &self,
         rho: &SaeManifoldRho,
     ) -> Result<Vec<Array1<f64>>, String> {
+        rho.validate_ard_log_strength_domain()?;
         if rho.log_ard.len() != self.k_atoms() {
             return Err(format!(
                 "ARD rho has {} atoms but term has {}",
@@ -730,8 +732,7 @@ impl SaeManifoldTerm {
             }
             let periods = coord.effective_axis_periods();
             for axis in 0..d {
-                let raw_log_alpha = rho.log_ard[atom_idx][axis];
-                let log_alpha = SaeManifoldRho::clamped_log_strength(raw_log_alpha);
+                let log_alpha = rho.log_ard[atom_idx][axis];
                 let alpha = log_alpha.exp();
                 let period = periods[axis];
                 let mut energy_deriv = 0.0_f64;
@@ -753,14 +754,7 @@ impl SaeManifoldTerm {
                         n_eff * bessel_i0_centered_terms_from_log_abs(log_eta).2
                     }
                 };
-                atom_out[axis] = if log_alpha == raw_log_alpha {
-                    energy_deriv + normalizer_deriv
-                } else {
-                    // `ard_value` is constant outside the finite-strength band
-                    // because both its energy and normalizer use the same
-                    // clamped log precision.
-                    0.0
-                };
+                atom_out[axis] = energy_deriv + normalizer_deriv;
             }
             out.push(atom_out);
         }
@@ -773,6 +767,8 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
+        rho.validate_ard_log_strength_domain()
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         // RAW selected-inverse diagonal: the per-axis diagonal contraction uses
         // the DEFLATED inverse; the full kept-subspace + rotation deflation
         // correction `tr(inv_vv·(D − DΦ[D]))` is subtracted per (row, axis)
@@ -919,6 +915,8 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
+        rho.validate_ard_log_strength_domain()
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let row_weights = self.row_loss_weights.as_deref();
         let coord_offsets = self.assignment.coord_offsets();
         let periods: Vec<Vec<Option<f64>>> = self
@@ -1056,6 +1054,8 @@ impl SaeManifoldTerm {
         probes: &[Array1<f64>],
         sinv_probes: &[Array1<f64>],
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
+        rho.validate_ard_log_strength_domain()
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let m = probes.len();
         if m == 0 || sinv_probes.len() != m {
             return Err(ArrowSchurError::SchurFactorFailed {
