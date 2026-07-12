@@ -8998,6 +8998,7 @@ fn survival_jeffreys_contracted_trace_hessian_matches_fd_of_trace() {
 #[test]
 fn survival_sparse_tower4_full_t4_matches_dense_oracle_979() {
     use super::row_kernel::{RIGID_LINEAR_MASK, SparseTower4, rigid_row_inputs, rigid_row_kernel_primaries, rigid_row_nll};
+    use gam_math::jet_scalar::JetScalar;
     use gam_math::jet_tower::evaluate_program;
 
     let n = 120usize;
