@@ -822,7 +822,7 @@ fn expand(input: RowAtomInput) -> Result<TokenStream2> {
 
 /// Define one row atom and emit exactly its requested build-time lowerings.
 ///
-/// ```ignore
+/// ```text
 /// row_atom! {
 ///     pub(crate) fn row [generic, order2, third, fourth](
 ///         eta, deriv;
