@@ -893,9 +893,9 @@ row_program! {
         let eta1 = add(mul(q1, correction), observed_gz);
         let adjusted_derivative = mul(qd1, correction);
 
-        let neg_eta0 = scale(eta0, -1.0);
+        let neg_eta0 = neg(eta0);
         let entry = scale(compose(neglog_phi, neg_eta0, wi), -1.0);
-        let neg_eta1 = scale(eta1, -1.0);
+        let neg_eta1 = neg(eta1);
         let exit = compose(neglog_phi, neg_eta1, wi * (1.0 - di));
 
         let mut event_density = zero();
