@@ -3505,6 +3505,13 @@ mod patterned_order2_perf_tests {
         (out.value(), out.g(), out.h())
     }
 
+    fn compiled(
+        p: &[f64; SLS_ROW_K],
+        kernel: &SurvivalExactRowKernel,
+    ) -> (f64, [f64; 9], [[f64; 9]; 9]) {
+        sls_row_vgh_compiled(p, kernel)
+    }
+
     /// Direct sparse chain-rule schedule used only as the performance baseline.
     /// This deliberately duplicates the calculus in test code so the generic
     /// backend is compared with the strongest plausible hand implementation.
@@ -3723,6 +3730,7 @@ mod patterned_order2_perf_tests {
         let want = dense(&p, &kernel);
         let got = patterned(&p, &kernel);
         let literal_seed_result = patterned_literal_seeds(&p, &kernel);
+        let compiled_result = compiled(&p, &kernel);
         let hand_result = hand(&p, &kernel);
         let hand_fused_result = hand_fused(&p, &kernel);
         let close = |a: f64, b: f64, label: &str| {
@@ -3734,6 +3742,7 @@ mod patterned_order2_perf_tests {
         };
         close(got.0, want.0, "value");
         close(literal_seed_result.0, want.0, "literal-seed value");
+        close(compiled_result.0, want.0, "compiled value");
         close(hand_result.0, want.0, "hand value");
         close(hand_fused_result.0, want.0, "fused-hand value");
         for i in 0..SLS_ROW_K {
@@ -3742,6 +3751,11 @@ mod patterned_order2_perf_tests {
                 literal_seed_result.1[i],
                 want.1[i],
                 &format!("literal-seed gradient[{i}]"),
+            );
+            close(
+                compiled_result.1[i],
+                want.1[i],
+                &format!("compiled gradient[{i}]"),
             );
             close(hand_result.1[i], want.1[i], &format!("hand gradient[{i}]"));
             close(
@@ -3755,6 +3769,11 @@ mod patterned_order2_perf_tests {
                     literal_seed_result.2[i][j],
                     want.2[i][j],
                     &format!("literal-seed Hessian[{i},{j}]"),
+                );
+                close(
+                    compiled_result.2[i][j],
+                    want.2[i][j],
+                    &format!("compiled Hessian[{i},{j}]"),
                 );
                 close(
                     hand_result.2[i][j],
@@ -3790,18 +3809,34 @@ mod patterned_order2_perf_tests {
             }
             let endpoint_want = dense(&p, &endpoint_kernel);
             let endpoint_got = hand_fused(&p, &endpoint_kernel);
+            let endpoint_compiled = compiled(&p, &endpoint_kernel);
             close(endpoint_got.0, endpoint_want.0, "fused-hand endpoint value");
+            close(
+                endpoint_compiled.0,
+                endpoint_want.0,
+                "compiled endpoint value",
+            );
             for i in 0..SLS_ROW_K {
                 close(
                     endpoint_got.1[i],
                     endpoint_want.1[i],
                     &format!("fused-hand endpoint gradient d={d} [{i}]"),
                 );
+                close(
+                    endpoint_compiled.1[i],
+                    endpoint_want.1[i],
+                    &format!("compiled endpoint gradient d={d} [{i}]"),
+                );
                 for j in 0..SLS_ROW_K {
                     close(
                         endpoint_got.2[i][j],
                         endpoint_want.2[i][j],
                         &format!("fused-hand endpoint Hessian d={d} [{i},{j}]"),
+                    );
+                    close(
+                        endpoint_compiled.2[i][j],
+                        endpoint_want.2[i][j],
+                        &format!("compiled endpoint Hessian d={d} [{i},{j}]"),
                     );
                 }
             }
@@ -3811,6 +3846,7 @@ mod patterned_order2_perf_tests {
         let mut best_dense = f64::INFINITY;
         let mut best_patterned = f64::INFINITY;
         let mut best_literal_seeds = f64::INFINITY;
+        let mut best_compiled = f64::INFINITY;
         let mut best_hand = f64::INFINITY;
         let mut best_hand_fused = f64::INFINITY;
         for _ in 0..5 {
@@ -3843,17 +3879,25 @@ mod patterned_order2_perf_tests {
                 black_box(patterned_literal_seeds(black_box(&p), black_box(&kernel)));
             }
             best_literal_seeds = best_literal_seeds.min(started.elapsed().as_secs_f64());
+
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(compiled(black_box(&p), black_box(&kernel)));
+            }
+            best_compiled = best_compiled.min(started.elapsed().as_secs_f64());
         }
         let dense_ns = best_dense * 1e9 / iterations as f64;
         let patterned_ns = best_patterned * 1e9 / iterations as f64;
         let literal_seeds_ns = best_literal_seeds * 1e9 / iterations as f64;
+        let compiled_ns = best_compiled * 1e9 / iterations as f64;
         let hand_ns = best_hand * 1e9 / iterations as f64;
         let hand_fused_ns = best_hand_fused * 1e9 / iterations as f64;
         eprintln!(
-            "SLS-PATTERNED-932 hand={hand_ns:.2} ns/row fused-hand={hand_fused_ns:.2} ns/row dense={dense_ns:.2} ns/row patterned={patterned_ns:.2} ns/row literal-seeds={literal_seeds_ns:.2} ns/row patterned/fused-hand={:.3} literal-seeds/fused-hand={:.3} patterned/dense={:.3}",
+            "SLS-PATTERNED-932 hand={hand_ns:.2} ns/row fused-hand={hand_fused_ns:.2} ns/row dense={dense_ns:.2} ns/row patterned={patterned_ns:.2} ns/row literal-seeds={literal_seeds_ns:.2} ns/row compiled={compiled_ns:.2} ns/row compiled/fused-hand={:.3} patterned/fused-hand={:.3} literal-seeds/fused-hand={:.3} compiled/dense={:.3}",
+            compiled_ns / hand_fused_ns,
             patterned_ns / hand_fused_ns,
             literal_seeds_ns / hand_fused_ns,
-            patterned_ns / dense_ns,
+            compiled_ns / dense_ns,
         );
     }
 }
