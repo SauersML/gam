@@ -8732,8 +8732,8 @@ pub(crate) fn binomial_location_scale_wiggle_hessian_row_pieces_match_jet_tower_
 // cause: the NB dispersion (log-θ) block assembled its IRLS curvature from the
 // per-row OBSERVED Hessian channel `−∂²ℓ/∂θ²`, which carries the row-specific
 // `ψ′(θ+y)` term and goes NEGATIVE for every row whose count sits below its
-// current fitted precision. Flooring each negative row at
-// `DISPERSION_MIN_CURVATURE≈0` then divides the exact score by ~0 in the
+// current fitted precision. Replacing each negative row by an arbitrary
+// epsilon then divides the exact score by ~0 in the
 // working response, producing O(1e10) IRLS targets that explode the dispersion
 // step and stall the inner block-cyclic solve, whose non-convergence is then
 // escalated to a hard error. The fix switches the dispersion curvature to the
@@ -8746,8 +8746,8 @@ pub(crate) fn binomial_location_scale_wiggle_hessian_row_pieces_match_jet_tower_
 // heteroscedastic iterate whose fitted precision sits ABOVE the data's true
 // overdispersion (the regime the inner solve traverses), the NB dispersion
 // working set must stay well-conditioned. With the pre-fix OBSERVED curvature
-// the per-row information is negative for these rows, gets floored to
-// `DISPERSION_MIN_CURVATURE`, and the working response `disp_response` blows up
+// the per-row information is negative for these rows, gets epsilon-clamped,
+// and the working response `disp_response` blows up
 // to O(1e9)+ (the exact score divided by ~0). With the EXPECTED (Fisher)
 // curvature the response stays O(1) and the per-row IRLS weight reflects
 // genuine positive curvature. This asserts the bounded, well-conditioned

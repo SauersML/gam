@@ -447,10 +447,11 @@ pub fn gaussian_reml_point_eval_at_rho(
     weights: Option<ArrayView1<'_, f64>>,
     rho: f64,
 ) -> Result<GaussianRemlPointEval, EstimationError> {
+    let lambda = gam_problem::checked_exp_log_strength(rho)
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     let y2 = y.insert_axis(Axis(1));
     let prepared = prepare_gaussian_reml(x, y2.view(), penalty, nullspace_dim, weights, None)?;
     let eval = prepared.evaluate(rho);
-    let lambda = rho.exp();
     let coefficients = prepared.coefficients(lambda).column(0).to_owned();
     let sigma2 = prepared.sigma2(lambda)[0];
     Ok(GaussianRemlPointEval {
@@ -685,7 +686,8 @@ pub fn gaussian_reml_multi_closed_form_with_cache_no_alloc(
         d,
         rho,
     );
-    let lambda = rho.exp();
+    let lambda = gam_problem::checked_exp_log_strength(rho)
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     fill_coefficients_no_alloc(eigen_cache, workspace, lambda, coefficients.view_mut());
     fill_fitted_no_alloc(x, coefficients.view(), fitted.view_mut());
     fill_sigma2_no_alloc(
@@ -800,7 +802,8 @@ fn block_orthogonal_eval(
     penalty: &Array2<f64>,
     rho: f64,
 ) -> Result<BlockOrthogonalEval, EstimationError> {
-    let lambda = rho.exp();
+    let lambda = gam_problem::checked_exp_log_strength(rho)
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     validate_initial_lambda(lambda)?;
     let scaled_penalty = penalty * lambda;
     let hessian = canonicalize_penalty((gram + &scaled_penalty).view());
@@ -3162,7 +3165,9 @@ pub fn gaussian_reml_cyclic_multi_lambda_rho(
             let mut a = xtwx.clone();
             for (j, s_j) in s_full.iter().enumerate() {
                 if j != kk {
-                    a.scaled_add(rho[j].exp(), s_j);
+                    let lambda = gam_problem::checked_exp_log_strength(rho[j])
+                        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+                    a.scaled_add(lambda, s_j);
                 }
             }
             // Diagonalise the (S_k, A_k) pencil; a non-PD metric (singular

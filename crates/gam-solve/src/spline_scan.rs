@@ -619,7 +619,7 @@ pub struct SplineScanFit {
     /// Posterior variance of `f` at each knot (scaled by `sigma2`).
     pub var: Vec<f64>,
     /// Selected (or supplied) log smoothing parameter `log λ`.
-    pub log_lambda: f64,
+    log_lambda: f64,
     /// Profiled (or supplied) observation variance σ².
     pub sigma2: f64,
     /// Concentrated diffuse restricted log-likelihood at the optimum, up to a
@@ -720,7 +720,9 @@ fn concentrated_criterion_jet(
     log_lambda: f64,
     order: usize,
 ) -> Result<(f64, f64, f64), String> {
-    let pass = run_filter(nodes, (-log_lambda).exp(), order)?;
+    let q = gam_problem::checked_exp_log_strength(-log_lambda)
+        .map_err(|error| format!("spline scan inverse log strength: {error}"))?;
+    let pass = run_filter(nodes, q, order)?;
     // Profiled σ̂² over the proper innovations plus within-tie residuals;
     // the restricted degrees of freedom subtract the diffuse dimension `order`.
     let dof = (n_obs - order) as f64;
@@ -978,7 +980,8 @@ pub fn fit_spline_scan_at(
         ));
     }
     let (nodes, ssr_within, n_obs) = pool_nodes(x, y, w, order)?;
-    let q = (-log_lambda).exp();
+    let q = gam_problem::checked_exp_log_strength(-log_lambda)
+        .map_err(|error| format!("spline scan inverse log strength: {error}"))?;
     let pass = run_filter(&nodes, q, order)?;
     let n = nodes.len();
     let dof = (n_obs - order) as f64;
@@ -1279,10 +1282,9 @@ impl SplineScanFit {
                 return Err(format!("spline scan state: non-finite entry at {i}"));
             }
         }
-        if !(state.log_lambda.is_finite()
-            && state.restricted_loglik.is_finite()
-            && state.sigma2.is_finite()
-            && state.sigma2 > 0.0)
+        gam_problem::validate_log_strength(state.log_lambda)
+            .map_err(|error| format!("spline scan state: {error}"))?;
+        if !(state.restricted_loglik.is_finite() && state.sigma2.is_finite() && state.sigma2 > 0.0)
         {
             return Err(format!(
                 "spline scan state: invalid scalars (log_lambda={}, sigma2={}, restricted_loglik={})",
@@ -1358,7 +1360,8 @@ impl SplineScanFit {
             smoothed_state,
             smoothed_cov,
             rts_gain,
-            q: (-state.log_lambda).exp(),
+            q: gam_problem::checked_exp_log_strength(-state.log_lambda)
+                .map_err(|error| format!("spline scan inverse log strength: {error}"))?,
             node_weight: state.node_weight.clone(),
         })
     }
@@ -1508,7 +1511,12 @@ impl SplineScanFit {
 
     /// Selected smoothing parameter `λ = e^{log λ}` (#1046).
     pub fn lambda(&self) -> f64 {
-        self.log_lambda.exp()
+        gam_problem::checked_exp_log_strength(self.log_lambda)
+            .expect("SplineScanFit construction validates its private log strength")
+    }
+
+    pub fn log_lambda(&self) -> f64 {
+        self.log_lambda
     }
 
     /// Raw observation count `n` used to profile σ² (#1046).

@@ -401,7 +401,7 @@ mod test_support {
             .sub(&a.ln_gamma())
             .sub(&b.ln_gamma())
             .add(&a.sub(&S::constant(1.0)).scale(yc.ln()))
-            .add(&b.sub(&S::constant(1.0)).scale((1.0 - yc).ln()));
+            .add(&b.sub(&S::constant(1.0)).scale((-yc).ln_1p()));
         loglik.scale(-wi)
     }
 
@@ -483,7 +483,7 @@ pub(crate) fn dispersion_beta_nll_order2(
         .sub(&order2_ln_gamma(&a))
         .sub(&order2_ln_gamma(&b))
         .add(&a.sub(&O2::constant(1.0)).scale(yc.ln()))
-        .add(&b.sub(&O2::constant(1.0)).scale((1.0 - yc).ln()));
+        .add(&b.sub(&O2::constant(1.0)).scale((-yc).ln_1p()));
     loglik.scale(-wi)
 }
 
@@ -646,8 +646,8 @@ pub(crate) fn dispersion_tweedie_disp_order2(
 // On a per-row loglik that is the dominant transcendental saving.
 // ============================================================================
 
-/// NB2 row NLL value, plain `f64`, bit-identical to
-/// `-dispersion_nb_disp_order2(..).value()`.
+/// NB2 row log-likelihood, evaluated through stable log shares so `mu+theta`
+/// is never formed and may mathematically exceed `f64::MAX`.
 #[inline]
 fn dispersion_nb_loglik(yi: f64, mu: f64, theta: f64, wi: f64) -> f64 {
     let log_theta_share = log_positive_share(theta, mu);
@@ -727,9 +727,8 @@ fn dispersion_beta_neg_loglik(yi: f64, mu: f64, phi: f64, wi: f64) -> f64 {
     let yc = yi;
     let a = mu * phi;
     let b = one_minus_mu * phi;
-    let s = ln_gamma(phi) - ln_gamma(a) - ln_gamma(b)
-        + (a - 1.0) * yc.ln()
-        + (b - 1.0) * (1.0 - yc).ln();
+    let s =
+        ln_gamma(phi) - ln_gamma(a) - ln_gamma(b) + (a - 1.0) * yc.ln() + (b - 1.0) * (-yc).ln_1p();
     -(s * -wi)
 }
 
@@ -858,7 +857,7 @@ pub(crate) fn dispersion_eta_nll_order2(
                 .sub(&order2_ln_gamma(&a))
                 .sub(&order2_ln_gamma(&b))
                 .add(&a.sub(&O2::constant(1.0)).scale(yc.ln()))
-                .add(&b.sub(&O2::constant(1.0)).scale((1.0 - yc).ln()));
+                .add(&b.sub(&O2::constant(1.0)).scale((-yc).ln_1p()));
             loglik.scale(-wi)
         }
         DispersionFamilyKind::Tweedie { p } => {
@@ -965,8 +964,8 @@ pub(super) fn dispersion_row_kernel(
             // its current fitted precision (overestimated size / underestimated
             // overdispersion). Far from the optimum a majority of rows can be
             // negative, so the assembled block curvature `Xᵀdiag(w)X` loses
-            // positive-definiteness; flooring each negative row at
-            // `DISPERSION_MIN_CURVATURE` (≈0) then divides the exact score by
+            // positive-definiteness; replacing each negative row by an
+            // arbitrary epsilon then divides the exact score by
             // ~0 in the working response, producing O(1e12) IRLS targets that
             // make the dispersion block step explode and the inner block-cyclic
             // solve stall (never reaching KKT within the cycle budget — the
@@ -986,8 +985,7 @@ pub(super) fn dispersion_row_kernel(
             // carries the EXACT score `s_theta` (= ∂ℓ/∂θ from the tower), so the
             // penalized stationary point (score = 0) is byte-unchanged — this is
             // Fisher scoring, which only re-conditions the inner solve and never
-            // shifts the optimum (cf. the `DISPERSION_MIN_CURVATURE` contract
-            // note above). The observed channel `_info_theta_observed` is no
+            // shifts the optimum. The observed channel `_info_theta_observed` is no
             // longer consumed for the weight.
             // #1591-follow-up: scalar `trigamma` (== `trigamma_derivative_stack
             // (·)[0]` bit-for-bit) evaluates ONLY ψ′; the old `[0]`-index form

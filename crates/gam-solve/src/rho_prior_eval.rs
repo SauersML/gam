@@ -177,7 +177,9 @@ pub(crate) fn scalar_terms(
                     "{context} Gamma precision prior requires shape > 0 and rate >= 0"
                 )));
             }
-            let lambda = r.exp();
+            let lambda = gam_problem::checked_exp_log_strength(r).map_err(|error| {
+                RhoPriorError::constraint_violation(format!("{context}: {error}"))
+            })?;
             // Deterministic REML/LAML uses the MAP-in-lambda convention; rho samplers add the Jacobian.
             Ok((
                 *rate * lambda - (*shape - 1.0) * r,

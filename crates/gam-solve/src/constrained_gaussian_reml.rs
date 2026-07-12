@@ -211,7 +211,8 @@ pub fn constrained_gaussian_reml_forward(
     let mut visited_faces: Vec<Vec<u64>> = Vec::new();
 
     loop {
-        let lambda = rho.exp();
+        let lambda = gam_problem::checked_exp_log_strength(rho)
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
         let hessian = &gram + &(penalty.clone() * lambda);
         let (qp_beta, qp_active) = solve_quadratic_with_linear_constraints(
             &hessian,
@@ -430,12 +431,8 @@ impl AffineFaceProfile {
     }
 
     fn evaluate(&self, rho: f64) -> Result<AffineFaceEvaluation, EstimationError> {
-        let lambda = rho.exp();
-        if !lambda.is_finite() || lambda <= 0.0 {
-            crate::bail_invalid_estim!(
-                "constrained Gaussian REML produced a non-positive smoothing parameter"
-            );
-        }
+        let lambda = gam_problem::checked_exp_log_strength(rho)
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
         let tangent_dim = self.face.z.ncols();
         let (gamma, inverse, logdet_h) = if tangent_dim == 0 {
             (Array2::zeros((0, 1)), Array2::zeros((0, 0)), 0.0)

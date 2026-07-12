@@ -50,9 +50,8 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
     ) -> Result<SparseRemlDecision, EstimationError> {
-        let lambdas = Array1::from_vec(gam_problem::checked_exp_log_strengths(
-            rho.iter().copied(),
-        )?);
+        let lambdas =
+            Array1::from_vec(gam_problem::checked_exp_log_strengths(rho.iter().copied())?);
         let p = self.p;
         let has_dense_constraints =
             self.linear_constraints.is_some() || self.coefficient_lower_bounds.is_some();
@@ -131,25 +130,28 @@ impl<'a> RemlState<'a> {
             }
         }
         let mut workspace = PirlsWorkspace::new(self.y.len(), self.p, 0, 0);
-        Ok(match workspace.sparse_penalized_system_stats(x_sparse, &s_lambda) {
-            Ok(stats)
-                if stats.density_upper < Self::SPARSE_HESSIAN_MAX_DENSITY && block_count > 0 =>
-            {
-                SparseRemlDecision {
-                    geometry: RemlGeometry::SparseExactSpd,
-                    reason: "sparse_exact_spd",
-                    p,
-                    nnz_x,
-                    nnz_h_upper_est: Some(stats.nnz_h_upper),
-                    density_h_upper_est: Some(stats.density_upper),
+        Ok(
+            match workspace.sparse_penalized_system_stats(x_sparse, &s_lambda) {
+                Ok(stats)
+                    if stats.density_upper < Self::SPARSE_HESSIAN_MAX_DENSITY
+                        && block_count > 0 =>
+                {
+                    SparseRemlDecision {
+                        geometry: RemlGeometry::SparseExactSpd,
+                        reason: "sparse_exact_spd",
+                        p,
+                        nnz_x,
+                        nnz_h_upper_est: Some(stats.nnz_h_upper),
+                        density_h_upper_est: Some(stats.density_upper),
+                    }
                 }
-            }
-            Ok(stats) => dense_backend(
-                "penalized_hessian_too_dense",
-                Some(stats.nnz_h_upper),
-                Some(stats.density_upper),
-            ),
-            Err(_) => dense_backend("sparse_stats_failed", None, None),
-        })
+                Ok(stats) => dense_backend(
+                    "penalized_hessian_too_dense",
+                    Some(stats.nnz_h_upper),
+                    Some(stats.density_upper),
+                ),
+                Err(_) => dense_backend("sparse_stats_failed", None, None),
+            },
+        )
     }
 }

@@ -4418,9 +4418,9 @@ impl DirectionalHyperParam {
                     rho.len()
                 );
             }
-            component
-                .matrix
-                .scaled_add_to(&mut out, rho[component.penalty_index].exp())?;
+            let lambda = gam_problem::checked_exp_log_strength(rho[component.penalty_index])
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+            component.matrix.scaled_add_to(&mut out, lambda)?;
         }
         Ok(out)
     }

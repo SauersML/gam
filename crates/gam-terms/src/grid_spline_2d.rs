@@ -770,12 +770,9 @@ impl GridSpline2dDesign {
     }
 
     fn solve_at(&self, log_lambda: f64) -> Result<Solved, String> {
-        if !log_lambda.is_finite() {
-            return Err(format!(
-                "grid spline 2d: non-finite log lambda {log_lambda}"
-            ));
-        }
-        let mut a = self.dense_system(log_lambda.exp());
+        let lambda = gam_problem::checked_exp_log_strength(log_lambda)
+            .map_err(|error| format!("grid spline 2d: {error}"))?;
+        let mut a = self.dense_system(lambda);
         let logdet = cholesky_logdet(&mut a, self.p)?;
         let n_dims = self.rhs.len();
         let mut coeffs = Vec::with_capacity(n_dims);

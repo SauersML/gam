@@ -313,6 +313,15 @@ pub struct BlockSparseConvergence {
     /// certificate always records zero.
     pub polar_failures: usize,
     pub tolerance: f64,
+    /// Whether the frame-projector fixed point CERTIFIED to `tolerance` (no
+    /// accepted births, no polar failures, residuals within tolerance on the
+    /// replayed full alternation). `false` marks a **best-effort** fit returned
+    /// at `K ≫ intrinsic-rank` where ~`K − rank` blocks are structurally spurious
+    /// and the frame residual legitimately cannot close (#2275) — the residual
+    /// fields above then quantify exactly how open the certificate is. The
+    /// certified Err-contract entry point (`fit_block_sparse_dictionary*`) never
+    /// returns a `certified: false` fit; only the `*_best_effort_*` entry does.
+    pub certified: bool,
 }
 
 impl BlockSparseConvergence {
@@ -330,6 +339,7 @@ impl BlockSparseConvergence {
             accepted_births: 0,
             polar_failures: 0,
             tolerance: 1e-6,
+            certified: true,
         }
     }
 }

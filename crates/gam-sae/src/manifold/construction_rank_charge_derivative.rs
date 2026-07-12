@@ -86,7 +86,7 @@ impl SaeManifoldTerm {
                 Some(&atom.smooth_penalty),
             )?;
             // #2258 — the CHARGEABLE rank, not the raw hard MP count: the
-            // value path promotes a below-detection-edge-but-alive atom to
+            // value path promotes a below-reconstruction-rank-edge-but-alive atom to
             // rank 1, and the derivative must take the SAME branch (the
             // promoted rank is locally constant, so the differential's form
             // is unchanged). Only a genuinely VANISHED decoder — the

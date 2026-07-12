@@ -48,9 +48,9 @@
 use std::sync::OnceLock;
 
 use gam_gpu::gpu_error::GpuError;
-use gam_problem::EstimationError;
 #[cfg(target_os = "linux")]
 use gam_gpu::gpu_error::GpuResultExt;
+use gam_problem::EstimationError;
 
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
@@ -369,17 +369,21 @@ fn row_gaussian_identity(
         (w * resid, input.y, w * resid * resid)
     };
     let w_hessian = select_w_hessian(mode, w, 0.0);
-    certify_output(row, input.eta, RowOutput {
-        mu,
-        grad_eta,
-        w_fisher: w,
-        w_hessian,
-        w_solver: w_hessian,
-        z_fisher: z,
-        z_hessian: z,
-        deviance: dev,
-        status: status_codes::OK,
-    })
+    certify_output(
+        row,
+        input.eta,
+        RowOutput {
+            mu,
+            grad_eta,
+            w_fisher: w,
+            w_hessian,
+            w_solver: w_hessian,
+            z_fisher: z,
+            z_hessian: z,
+            deviance: dev,
+            status: status_codes::OK,
+        },
+    )
 }
 
 #[inline]
@@ -394,13 +398,17 @@ fn row_poisson_log(
         return Err(row_error(row, "Poisson response", input.eta, input.y));
     }
     if w_prior == 0.0 {
-        return certify_output(row, input.eta, RowOutput {
-            mu,
-            z_fisher: input.eta,
-            z_hessian: input.eta,
-            status: status_codes::OK,
-            ..RowOutput::default()
-        });
+        return certify_output(
+            row,
+            input.eta,
+            RowOutput {
+                mu,
+                z_fisher: input.eta,
+                z_hessian: input.eta,
+                status: status_codes::OK,
+                ..RowOutput::default()
+            },
+        );
     }
     let w_fisher = w_prior * mu;
     if !(w_fisher.is_finite() && w_fisher > 0.0) {
@@ -416,17 +424,21 @@ fn row_poisson_log(
     };
     let dev = 2.0 * w_prior * dev_term;
     let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
-    certify_output(row, input.eta, RowOutput {
-        mu,
-        grad_eta,
-        w_fisher,
-        w_hessian,
-        w_solver: w_hessian,
-        z_fisher: z,
-        z_hessian: z,
-        deviance: dev,
-        status: status_codes::OK,
-    })
+    certify_output(
+        row,
+        input.eta,
+        RowOutput {
+            mu,
+            grad_eta,
+            w_fisher,
+            w_hessian,
+            w_solver: w_hessian,
+            z_fisher: z,
+            z_hessian: z,
+            deviance: dev,
+            status: status_codes::OK,
+        },
+    )
 }
 
 #[inline]
@@ -445,13 +457,17 @@ fn row_gamma_log(
         return Err(row_error(row, "Gamma response", input.eta, input.y));
     }
     if w_prior == 0.0 {
-        return certify_output(row, input.eta, RowOutput {
-            mu,
-            z_fisher: input.eta,
-            z_hessian: input.eta,
-            status: status_codes::OK,
-            ..RowOutput::default()
-        });
+        return certify_output(
+            row,
+            input.eta,
+            RowOutput {
+                mu,
+                z_fisher: input.eta,
+                z_hessian: input.eta,
+                status: status_codes::OK,
+                ..RowOutput::default()
+            },
+        );
     }
     let w_fisher = w_prior * shape;
     if !(w_fisher.is_finite() && w_fisher > 0.0) {
@@ -474,17 +490,21 @@ fn row_gamma_log(
     let z = input.eta + ratio_resid;
     let grad_eta = w_fisher * ratio_resid;
     let dev = 2.0 * w_prior * shape * (ratio_resid - (input.y.ln() - input.eta));
-    certify_output(row, input.eta, RowOutput {
-        mu,
-        grad_eta,
-        w_fisher,
-        w_hessian,
-        w_solver: w_hessian,
-        z_fisher: z,
-        z_hessian: z,
-        deviance: dev,
-        status: status_codes::OK,
-    })
+    certify_output(
+        row,
+        input.eta,
+        RowOutput {
+            mu,
+            grad_eta,
+            w_fisher,
+            w_hessian,
+            w_solver: w_hessian,
+            z_fisher: z,
+            z_hessian: z,
+            deviance: dev,
+            status: status_codes::OK,
+        },
+    )
 }
 
 #[inline]
@@ -529,13 +549,17 @@ fn row_bernoulli_logit(
         ));
     }
     if w_prior == 0.0 {
-        return certify_output(row, input.eta, RowOutput {
-            mu,
-            z_fisher: input.eta,
-            z_hessian: input.eta,
-            status: status_codes::OK,
-            ..RowOutput::default()
-        });
+        return certify_output(
+            row,
+            input.eta,
+            RowOutput {
+                mu,
+                z_fisher: input.eta,
+                z_hessian: input.eta,
+                status: status_codes::OK,
+                ..RowOutput::default()
+            },
+        );
     }
     let w_fisher = w_prior * dmu_deta;
     if !(w_fisher.is_finite() && w_fisher > 0.0) {
@@ -545,17 +569,21 @@ fn row_bernoulli_logit(
     let z = input.eta + residual / dmu_deta;
     let dev = bernoulli_logit_deviance(input.y, input.eta, w_prior);
     let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
-    certify_output(row, input.eta, RowOutput {
-        mu,
-        grad_eta,
-        w_fisher,
-        w_hessian,
-        w_solver: w_hessian,
-        z_fisher: z,
-        z_hessian: z,
-        deviance: dev,
-        status: status_codes::OK,
-    })
+    certify_output(
+        row,
+        input.eta,
+        RowOutput {
+            mu,
+            grad_eta,
+            w_fisher,
+            w_hessian,
+            w_solver: w_hessian,
+            z_fisher: z,
+            z_hessian: z,
+            deviance: dev,
+            status: status_codes::OK,
+        },
+    )
 }
 
 #[inline]
@@ -622,13 +650,17 @@ fn row_bernoulli_noncanonical(
         return Err(row_error(row, "inverse-link jet", input.eta, mu));
     }
     if w_prior == 0.0 {
-        return certify_output(row, input.eta, RowOutput {
-            mu,
-            z_fisher: input.eta,
-            z_hessian: input.eta,
-            status: status_codes::OK,
-            ..RowOutput::default()
-        });
+        return certify_output(
+            row,
+            input.eta,
+            RowOutput {
+                mu,
+                z_fisher: input.eta,
+                z_hessian: input.eta,
+                status: status_codes::OK,
+                ..RowOutput::default()
+            },
+        );
     }
     let v = mu * (1.0 - mu);
     let fisher_per_prior = d1 * d1 / v;
@@ -640,7 +672,12 @@ fn row_bernoulli_noncanonical(
         && w_fisher.is_finite()
         && w_fisher > 0.0)
     {
-        return Err(row_error(row, "Bernoulli Fisher weight", input.eta, w_fisher));
+        return Err(row_error(
+            row,
+            "Bernoulli Fisher weight",
+            input.eta,
+            w_fisher,
+        ));
     }
     let resid = input.y - mu;
     let grad_eta = w_prior * resid * d1 / v;
@@ -658,17 +695,21 @@ fn row_bernoulli_noncanonical(
     }
     let z = input.eta + resid / d1;
     let dev = bernoulli_deviance(input.y, mu, w_prior);
-    certify_output(row, input.eta, RowOutput {
-        mu,
-        grad_eta,
-        w_fisher,
-        w_hessian,
-        w_solver: w_hessian,
-        z_fisher: z,
-        z_hessian: z,
-        deviance: dev,
-        status: status_codes::OK,
-    })
+    certify_output(
+        row,
+        input.eta,
+        RowOutput {
+            mu,
+            grad_eta,
+            w_fisher,
+            w_hessian,
+            w_solver: w_hessian,
+            z_fisher: z,
+            z_hessian: z,
+            deviance: dev,
+            status: status_codes::OK,
+        },
+    )
 }
 
 #[inline]
@@ -685,18 +726,12 @@ fn softplus(x: f64) -> f64 {
 fn bernoulli_logit_deviance(y: f64, eta: f64, w: f64) -> f64 {
     let log_mu = -softplus(-eta);
     let log_one_minus_mu = -softplus(eta);
-    2.0 * w
-        * (xlogy(y, y) + xlogy(1.0 - y, 1.0 - y)
-            - y * log_mu
-            - (1.0 - y) * log_one_minus_mu)
+    2.0 * w * (xlogy(y, y) + xlogy(1.0 - y, 1.0 - y) - y * log_mu - (1.0 - y) * log_one_minus_mu)
 }
 
 #[inline]
 fn bernoulli_deviance(y: f64, mu: f64, w: f64) -> f64 {
-    2.0 * w
-        * (xlogy(y, y) + xlogy(1.0 - y, 1.0 - y)
-            - y * mu.ln()
-            - (1.0 - y) * (-mu).ln_1p())
+    2.0 * w * (xlogy(y, y) + xlogy(1.0 - y, 1.0 - y) - y * mu.ln() - (1.0 - y) * (-mu).ln_1p())
 }
 
 /// Stable Φ(x) using the complementary error function with the same identity
@@ -970,7 +1005,7 @@ pub struct JitFamilySpec {
     pub spec_id: u64,
     /// CUDA body source. Must read from `eta_c`, `y_i`, `wp`, set
     /// `flags`, and assign to `mu`, `grad_eta`, `w_fisher`, `w_hessian`,
-    /// `w_solver`, `z_f`, `z_h`, `dev`. See [`COMMON_DEVICE_PROLOG`] for
+    /// `w_solver`, `z_f`, `z_h`, `dev`. See [`common_device_prolog`] for
     /// the available helpers.
     pub body: String,
 }
@@ -1042,24 +1077,25 @@ extern "C" __global__ void {kernel_name}(
 ) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    unsigned int flags = 0u;
+    unsigned int status = PIRLS_OK;
     double eta_i = eta[i];
     double y_i = y[i];
-    double wp = prior_w[i] > 0.0 ? prior_w[i] : 0.0;
-    if (prior_w[i] <= 0.0) flags |= 0x10u;
+    double wp = prior_w[i];
 {body}
-    mu_out[i] = mu;
-    grad_eta_out[i] = grad_eta;
-    w_fisher_out[i] = w_fisher;
-    w_hessian_out[i] = w_hessian;
-    w_solver_out[i] = w_solver;
-    z_fisher_out[i] = z_f;
-    z_hessian_out[i] = z_h;
-    deviance_out[i] = dev;
-    status_out[i] = flags;
+    if (status == PIRLS_OK) {{
+        mu_out[i] = mu;
+        grad_eta_out[i] = grad_eta;
+        w_fisher_out[i] = w_fisher;
+        w_hessian_out[i] = w_hessian;
+        w_solver_out[i] = w_solver;
+        z_fisher_out[i] = z_f;
+        z_hessian_out[i] = z_h;
+        deviance_out[i] = dev;
+    }}
+    status_out[i] = status;
 }}
 "#,
-            prolog = COMMON_DEVICE_PROLOG,
+            prolog = common_device_prolog(),
         )
     }
 }
@@ -1170,28 +1206,38 @@ pub const ALPHA_LADDER: [f64; ALPHA_LADDER_LEN] =
 /// **candidate-objective mode**: for each of the [`ALPHA_LADDER_LEN`] step
 /// sizes α_k the kernel evaluates `η_trial_i = η_i + α_k · xδ_i`, computes
 /// the per-row deviance, and atomically accumulates the sum into
-/// `objective_dev[k]`. Status flags are OR-accumulated into `status_dev[k]`.
+/// `objective_dev[k]`. Each row writes its refusal code to
+/// `status_dev[k * n + i]`, preserving deterministic row identity.
 /// After a single `memcpy_dtoh` the host picks the first α that achieves
 /// deviance descent — no per-α kernel launch, no full row-output write.
 #[cfg(target_os = "linux")]
 pub struct AlphaLadderDevBuffers {
     /// Device: summed deviance for each alpha step, length [`ALPHA_LADDER_LEN`].
     pub objective_dev: cudarc::driver::CudaSlice<f64>,
-    /// Device: OR-reduced status flags for each alpha step, length [`ALPHA_LADDER_LEN`].
+    /// Device: row refusal codes in alpha-major order, length
+    /// `ALPHA_LADDER_LEN * n`.
     pub status_dev: cudarc::driver::CudaSlice<u32>,
+    pub n: usize,
 }
 
 #[cfg(target_os = "linux")]
 impl AlphaLadderDevBuffers {
     /// Allocate the ladder device buffers on `stream`.
-    pub fn allocate(stream: &Arc<cudarc::driver::CudaStream>) -> Result<Self, GpuError> {
+    pub fn allocate(
+        stream: &Arc<cudarc::driver::CudaStream>,
+        n: usize,
+    ) -> Result<Self, GpuError> {
+        let status_len = ALPHA_LADDER_LEN.checked_mul(n).ok_or_else(|| {
+            gam_gpu::gpu_err!("pirls_row ladder status length overflows: {ALPHA_LADDER_LEN} * {n}")
+        })?;
         Ok(Self {
             objective_dev: stream
                 .alloc_zeros::<f64>(ALPHA_LADDER_LEN)
                 .gpu_ctx_with(|err| format!("pirls_row ladder alloc objective: {err}"))?,
             status_dev: stream
-                .alloc_zeros::<u32>(ALPHA_LADDER_LEN)
+                .alloc_zeros::<u32>(status_len)
                 .gpu_ctx_with(|err| format!("pirls_row ladder alloc status: {err}"))?,
+            n,
         })
     }
 
@@ -1420,7 +1466,7 @@ pub fn launch_solve_row_on_stream(
 /// Evaluates `η_trial_i = η_i + α_k · xδ_i` for all `i ∈ [0,n)` and all
 /// `k ∈ [0, ALPHA_LADDER_LEN)` simultaneously.  Each thread atomically
 /// accumulates the per-row deviance into `out.objective_dev[k]` and
-/// OR-accumulates status flags into `out.status_dev[k]`.
+/// writes each refusal code to `out.status_dev[k * n + i]`.
 ///
 /// The grid is `(row_blocks × ALPHA_LADDER_LEN)`: block index `bx / n_blocks`
 /// selects the alpha slot, `bx % n_blocks` selects the row tile.
@@ -1443,6 +1489,9 @@ pub fn launch_alpha_ladder_on_stream(
     out: &mut AlphaLadderDevBuffers,
 ) -> Result<(), GpuError> {
     use cudarc::driver::{LaunchConfig, PushKernelArg};
+    if out.n != n {
+        gam_gpu::gpu_bail!("alpha-ladder buffers shape {} mismatches n={n}", out.n);
+    }
     let module = backend.module_for_ladder(family, curvature)?;
     let kernel_name = family.ladder_kernel_name();
     let func = module
@@ -1478,7 +1527,8 @@ pub fn launch_alpha_ladder_on_stream(
     // For GammaLog `double shape` is inserted after `prior_w`.
     // Grid is (row_blocks × ALPHA_LADDER_LEN); each thread reads alphas[] via
     // blockIdx.y, rows via blockIdx.x * blockDim.x + threadIdx.x (guarded by n).
-    // Atomic double-precision add to objective_out[blockIdx.y], OR to status_out[blockIdx.y].
+    // Atomic double-precision add to objective_out[blockIdx.y]; each thread
+    // owns status_out[blockIdx.y * n + i].
     unsafe { builder.launch(cfg) }
         .map(|_event_pair| ())
         .gpu_ctx_with(|err| format!("alpha-ladder launch({kernel_name}): {err}"))
@@ -1488,39 +1538,64 @@ pub fn launch_alpha_ladder_on_stream(
 // CUDA sources (one per family / curvature pair)
 // ────────────────────────────────────────────────────────────────────────
 
-/// Common device-side helpers shared across every family kernel.
+/// Common device-side helpers shared across every family kernel.  The log-link
+/// interval is injected from the same Rust constants used by the CPU oracle,
+/// so the generated CUDA source cannot drift to a second domain policy.
 #[cfg(target_os = "linux")]
-const COMMON_DEVICE_PROLOG: &str = r#"
+fn common_device_prolog() -> String {
+    format!(
+        r#"
 extern "C" {
     double exp(double);
     double log(double);
     double log1p(double);
-    double tanh(double);
-    double sqrt(double);
+    double expm1(double);
     double fabs(double);
     double erfc(double);
 }
 
-__device__ __forceinline__ double clamp_eta(double eta, unsigned int* flags) {
-    const double E = 700.0;
-    if (eta > E) { *flags |= 0x1u; return E; }
-    if (eta < -E) { *flags |= 0x1u; return -E; }
-    return eta;
+static constexpr double PIRLS_LOG_ETA_MIN = {log_eta_min:?};
+static constexpr double PIRLS_LOG_ETA_MAX = {log_eta_max:?};
+
+static constexpr unsigned int PIRLS_OK = 0u;
+static constexpr unsigned int PIRLS_ETA_DOMAIN = 1u;
+static constexpr unsigned int PIRLS_PRIOR_WEIGHT = 2u;
+static constexpr unsigned int PIRLS_RESPONSE = 3u;
+static constexpr unsigned int PIRLS_GAMMA_SHAPE = 4u;
+static constexpr unsigned int PIRLS_INVERSE_LINK = 5u;
+static constexpr unsigned int PIRLS_FISHER_WEIGHT = 6u;
+static constexpr unsigned int PIRLS_OBSERVED_WEIGHT = 7u;
+static constexpr unsigned int PIRLS_GRADIENT = 8u;
+static constexpr unsigned int PIRLS_WORKING_RESPONSE = 9u;
+static constexpr unsigned int PIRLS_DEVIANCE = 10u;
+static constexpr unsigned int PIRLS_FINAL_OUTPUT = 11u;
+
+__device__ __forceinline__ void pirls_refuse(unsigned int* status, unsigned int code) {
+    if (*status == PIRLS_OK) *status = code;
+}
+
+__device__ __forceinline__ bool pirls_log_eta_valid(double eta) {
+    return eta >= PIRLS_LOG_ETA_MIN && eta <= PIRLS_LOG_ETA_MAX;
+}
+
+__device__ __forceinline__ double xlogy(double x, double y) {
+    return x == 0.0 ? 0.0 : x * log(y);
+}
+
+__device__ __forceinline__ double softplus(double x) {
+    return (x > 0.0 ? x : 0.0) + log1p(exp(-fabs(x)));
 }
 
 __device__ __forceinline__ double bernoulli_deviance(double y, double mu, double w) {
-    if (w == 0.0) return 0.0;
-    double t1 = (y > 0.0) ? y * log(y / mu) : 0.0;
-    double t2 = (y < 1.0) ? (1.0 - y) * log((1.0 - y) / (1.0 - mu)) : 0.0;
-    return 2.0 * w * (t1 + t2);
+    return 2.0 * w * (xlogy(y, y) + xlogy(1.0 - y, 1.0 - y)
+        - y * log(mu) - (1.0 - y) * log1p(-mu));
 }
 
-__device__ __forceinline__ double bernoulli_z(double eta, double y, double mu, double dmu_deta) {
-    if (dmu_deta > 0.0 && isfinite(dmu_deta)) {
-        double delta = (y - mu) / dmu_deta;
-        if (isfinite(delta)) return eta + delta;
-    }
-    return eta;
+__device__ __forceinline__ double logit_deviance(double y, double eta, double w) {
+    double log_mu = -softplus(-eta);
+    double log_one_minus_mu = -softplus(eta);
+    return 2.0 * w * (xlogy(y, y) + xlogy(1.0 - y, 1.0 - y)
+        - y * log_mu - (1.0 - y) * log_one_minus_mu);
 }
 
 __device__ __forceinline__ double std_norm_cdf(double x) {
@@ -1530,7 +1605,20 @@ __device__ __forceinline__ double std_norm_cdf(double x) {
 __device__ __forceinline__ double std_norm_pdf(double x) {
     return 0.3989422804014327 * exp(-0.5 * x * x);
 }
-"#;
+
+__device__ __forceinline__ bool pirls_outputs_finite(
+    double mu, double grad_eta, double w_fisher, double w_hessian,
+    double w_solver, double z_f, double z_h, double dev
+) {
+    return isfinite(mu) && isfinite(grad_eta) && isfinite(w_fisher)
+        && isfinite(w_hessian) && isfinite(w_solver) && isfinite(z_f)
+        && isfinite(z_h) && isfinite(dev);
+}
+"#,
+        log_eta_min = crate::mixture_link::LOG_LINK_SOLVER_ETA_MIN,
+        log_eta_max = crate::mixture_link::LOG_LINK_SOLVER_ETA_MAX,
+    )
+}
 
 /// Build the per-family CUDA source. Each source defines exactly one entry
 /// kernel (`family.kernel_name()`) reading the input arrays and writing the
@@ -1587,24 +1675,25 @@ extern "C" __global__ void {kernel_name}(
 ) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    unsigned int flags = 0u;
+    unsigned int status = PIRLS_OK;
     double eta_i = eta[i];
     double y_i = y[i];
-    double wp = prior_w[i] > 0.0 ? prior_w[i] : 0.0;
-    if (prior_w[i] <= 0.0) flags |= 0x10u;
+    double wp = prior_w[i];
 {body}
-    mu_out[i] = mu;
-    grad_eta_out[i] = grad_eta;
-    w_fisher_out[i] = w_fisher;
-    w_hessian_out[i] = w_hessian;
-    w_solver_out[i] = w_solver;
-    z_fisher_out[i] = z_f;
-    z_hessian_out[i] = z_h;
-    deviance_out[i] = dev;
-    status_out[i] = flags;
+    if (status == PIRLS_OK) {{
+        mu_out[i] = mu;
+        grad_eta_out[i] = grad_eta;
+        w_fisher_out[i] = w_fisher;
+        w_hessian_out[i] = w_hessian;
+        w_solver_out[i] = w_solver;
+        z_fisher_out[i] = z_f;
+        z_hessian_out[i] = z_h;
+        deviance_out[i] = dev;
+    }}
+    status_out[i] = status;
 }}
 "#,
-        prolog = COMMON_DEVICE_PROLOG,
+        prolog = common_device_prolog(),
     )
 }
 
@@ -1625,15 +1714,32 @@ fn curvature_tag(curvature: CurvatureMode) -> &'static str {
 fn gaussian_identity_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
-        r#"{tag}    double mu = eta_i;
-    double resid = y_i - mu;
-    double grad_eta = wp * resid;
-    double w_fisher = wp;
-    double w_hessian = wp;
-    double w_solver = (wp > 0.0) ? fmax(wp, 1e-12) : 0.0;
-    double z_f = y_i;
-    double z_h = y_i;
-    double dev = wp * resid * resid;
+        r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, z_f = 0.0, z_h = 0.0, dev = 0.0;
+    if (!isfinite(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
+    if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
+        pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
+    if (status == PIRLS_OK && wp > 0.0 && !isfinite(y_i))
+        pirls_refuse(&status, PIRLS_RESPONSE);
+    if (status == PIRLS_OK) {{
+        mu = eta_i;
+        w_fisher = wp;
+        w_hessian = wp;
+        w_solver = w_hessian;
+        if (wp == 0.0) {{
+            z_f = eta_i;
+            z_h = eta_i;
+        }} else {{
+            double resid = y_i - mu;
+            grad_eta = wp * resid;
+            z_f = y_i;
+            z_h = y_i;
+            dev = wp * resid * resid;
+        }}
+    }}
+    if (status == PIRLS_OK && !pirls_outputs_finite(
+            mu, grad_eta, w_fisher, w_hessian, w_solver, z_f, z_h, dev))
+        pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
 }
@@ -1642,21 +1748,44 @@ fn gaussian_identity_body(curvature: CurvatureMode) -> String {
 fn poisson_log_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
-        r#"{tag}    double eta_c = clamp_eta(eta_i, &flags);
-    double mu_raw = exp(eta_c);
-    if (mu_raw < 1e-10) flags |= 0x2u;
-    double mu = (mu_raw > 1e-10) ? mu_raw : 1e-10;
-    double raw_w = wp * mu;
-    double w_fisher = (raw_w > 0.0) ? fmax(raw_w, 1e-12) : 0.0;
-    double resid = y_i - mu;
-    double grad_eta = wp * resid;
-    double w_hessian = w_fisher;
-    double w_solver = w_fisher;
-    double z_f = eta_c + resid / mu;
-    double z_h = z_f;
-    double dev_term = (y_i > 0.0) ? (y_i * log(y_i / mu) - resid) : (-resid);
-    double dev = 2.0 * wp * dev_term;
-    if (!(isfinite(y_i) && y_i >= 0.0)) flags |= 0x8u;
+        r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, z_f = 0.0, z_h = 0.0, dev = 0.0;
+    if (!pirls_log_eta_valid(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
+    if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
+        pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
+    if (status == PIRLS_OK && wp > 0.0 && !(isfinite(y_i) && y_i >= 0.0))
+        pirls_refuse(&status, PIRLS_RESPONSE);
+    if (status == PIRLS_OK) {{
+        mu = exp(eta_i);
+        if (!(isfinite(mu) && mu > 0.0)) pirls_refuse(&status, PIRLS_INVERSE_LINK);
+    }}
+    if (status == PIRLS_OK && wp == 0.0) {{
+        z_f = eta_i;
+        z_h = eta_i;
+    }}
+    if (status == PIRLS_OK && wp > 0.0) {{
+        w_fisher = wp * mu;
+        if (!(isfinite(w_fisher) && w_fisher > 0.0))
+            pirls_refuse(&status, PIRLS_FISHER_WEIGHT);
+        if (status == PIRLS_OK) {{
+            w_hessian = w_fisher;
+            w_solver = w_hessian;
+            grad_eta = wp * (y_i - mu);
+            if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
+            double ratio_resid = y_i / mu - 1.0;
+            z_f = eta_i + ratio_resid;
+            z_h = z_f;
+            if (!isfinite(z_f)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
+            double dev_term = y_i > 0.0
+                ? y_i * (log(y_i) - eta_i) - (y_i - mu)
+                : mu;
+            dev = 2.0 * wp * dev_term;
+            if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
+        }}
+    }}
+    if (status == PIRLS_OK && !pirls_outputs_finite(
+            mu, grad_eta, w_fisher, w_hessian, w_solver, z_f, z_h, dev))
+        pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
 }
@@ -1667,29 +1796,47 @@ fn gamma_log_body(curvature: CurvatureMode) -> String {
     // directly. No local shadowing needed.
     let tag = curvature_tag(curvature);
     format!(
-        r#"{tag}    double eta_c = clamp_eta(eta_i, &flags);
-    double mu_raw = exp(eta_c);
-    if (mu_raw < 1e-10) flags |= 0x2u;
-    double mu = (mu_raw > 1e-10) ? mu_raw : 1e-10;
-    double w_fisher = wp * shape;
+        r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, z_f = 0.0, z_h = 0.0, dev = 0.0;
+    if (!pirls_log_eta_valid(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
+    if (status == PIRLS_OK && !(isfinite(shape) && shape > 0.0))
+        pirls_refuse(&status, PIRLS_GAMMA_SHAPE);
+    if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
+        pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
+    if (status == PIRLS_OK && wp > 0.0 && !(isfinite(y_i) && y_i > 0.0))
+        pirls_refuse(&status, PIRLS_RESPONSE);
+    if (status == PIRLS_OK) {{
+        mu = exp(eta_i);
+        if (!(isfinite(mu) && mu > 0.0)) pirls_refuse(&status, PIRLS_INVERSE_LINK);
+    }}
+    if (status == PIRLS_OK && wp == 0.0) {{
+        z_f = eta_i;
+        z_h = eta_i;
+    }}
+    if (status == PIRLS_OK && wp > 0.0) {{
+        w_fisher = wp * shape;
+        if (!(isfinite(w_fisher) && w_fisher > 0.0))
+            pirls_refuse(&status, PIRLS_FISHER_WEIGHT);
+        double ratio = y_i / mu;
 #ifdef PIRLS_CURVATURE_OBSERVED
-    // Stage 5: observed information for Gamma-log.
-    //   w_obs = w_F + w_F · (y/μ − 1) = w_F · y/μ.
-    double w_hessian = (w_fisher > 0.0 && mu > 0.0 && isfinite(y_i))
-        ? w_fisher * (y_i / mu)
-        : w_fisher;
+        w_hessian = w_fisher * ratio;
 #else
-    double w_hessian = w_fisher;
+        w_hessian = w_fisher;
 #endif
-    double w_solver = (w_hessian > 0.0) ? fmax(w_hessian, 1e-12) : 0.0;
-    double resid = y_i - mu;
-    double grad_eta = wp * resid / mu;
-    double z_f = eta_c + resid / mu;
-    double z_h = z_f;
-    double dev = (y_i > 0.0)
-        ? (2.0 * wp * (-log(y_i / mu) + resid / mu))
-        : (1.0 / 0.0);
-    if (!(isfinite(y_i) && y_i > 0.0)) flags |= 0x8u;
+        if (!isfinite(w_hessian)) pirls_refuse(&status, PIRLS_OBSERVED_WEIGHT);
+        w_solver = w_hessian;
+        double ratio_resid = ratio - 1.0;
+        grad_eta = w_fisher * ratio_resid;
+        if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
+        z_f = eta_i + ratio_resid;
+        z_h = z_f;
+        if (!isfinite(z_f)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
+        dev = 2.0 * wp * shape * (ratio_resid - (log(y_i) - eta_i));
+        if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
+    }}
+    if (status == PIRLS_OK && !pirls_outputs_finite(
+            mu, grad_eta, w_fisher, w_hessian, w_solver, z_f, z_h, dev))
+        pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
 }
@@ -1698,21 +1845,51 @@ fn gamma_log_body(curvature: CurvatureMode) -> String {
 fn bernoulli_logit_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
-        r#"{tag}    double eta_c = clamp_eta(eta_i, &flags);
-    double half = 0.5 * eta_c;
-    double mu_raw = 0.5 * (1.0 + tanh(half));
-    if (mu_raw < 1e-12 || mu_raw > 1.0 - 1e-12) flags |= 0x2u;
-    double mu = fmin(fmax(mu_raw, 1e-12), 1.0 - 1e-12);
-    double dmu_deta = mu * (1.0 - mu);
-    double w_fisher = wp * dmu_deta;
-    double w_hessian = w_fisher;
-    double w_solver = (w_fisher > 0.0) ? fmax(w_fisher, 1e-12) : 0.0;
-    double resid = y_i - mu;
-    double grad_eta = wp * resid;
-    double dev = bernoulli_deviance(y_i, mu, wp);
-    double z_f = bernoulli_z(eta_c, y_i, mu, dmu_deta);
-    double z_h = z_f;
-    if (!(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0)) flags |= 0x8u;
+        r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, z_f = 0.0, z_h = 0.0, dev = 0.0;
+    if (!isfinite(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
+    if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
+        pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
+    if (status == PIRLS_OK && wp > 0.0
+            && !(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0))
+        pirls_refuse(&status, PIRLS_RESPONSE);
+    double tail = exp(-fabs(eta_i));
+    double denom = 1.0 + tail;
+    double dmu_deta = tail / (denom * denom);
+    if (status == PIRLS_OK) {{
+        mu = eta_i >= 0.0 ? 1.0 / denom : tail / denom;
+        if (!(isfinite(mu) && mu >= 0.0 && mu <= 1.0
+                && isfinite(dmu_deta) && dmu_deta > 0.0))
+            pirls_refuse(&status, PIRLS_INVERSE_LINK);
+    }}
+    if (status == PIRLS_OK && wp == 0.0) {{
+        z_f = eta_i;
+        z_h = eta_i;
+    }}
+    if (status == PIRLS_OK && wp > 0.0) {{
+        double residual;
+        if (eta_i >= 0.0) {{
+            double one_minus_mu = tail / denom;
+            residual = y_i == 1.0 ? one_minus_mu : (y_i - 1.0) + one_minus_mu;
+        }} else {{
+            residual = y_i - mu;
+        }}
+        w_fisher = wp * dmu_deta;
+        if (!(isfinite(w_fisher) && w_fisher > 0.0))
+            pirls_refuse(&status, PIRLS_FISHER_WEIGHT);
+        w_hessian = w_fisher;
+        w_solver = w_hessian;
+        grad_eta = wp * residual;
+        if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
+        z_f = eta_i + residual / dmu_deta;
+        z_h = z_f;
+        if (!isfinite(z_f)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
+        dev = logit_deviance(y_i, eta_i, wp);
+        if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
+    }}
+    if (status == PIRLS_OK && !pirls_outputs_finite(
+            mu, grad_eta, w_fisher, w_hessian, w_solver, z_f, z_h, dev))
+        pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
 }
@@ -1721,35 +1898,57 @@ fn bernoulli_logit_body(curvature: CurvatureMode) -> String {
 fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
-        r#"{tag}    double eta_c = clamp_eta(eta_i, &flags);
-    double mu_raw = std_norm_cdf(eta_c);
-    if (mu_raw < 1e-12 || mu_raw > 1.0 - 1e-12) flags |= 0x2u;
-    double mu = fmin(fmax(mu_raw, 1e-12), 1.0 - 1e-12);
-    double dmu_deta = std_norm_pdf(eta_c);
-    double v = mu * (1.0 - mu);
-    double fpp = (v > 0.0) ? dmu_deta * dmu_deta / v : 0.0;
-    double w_fisher = wp * fpp;
-#ifdef PIRLS_CURVATURE_OBSERVED
-    // Stage 5: observed information for Bernoulli probit.
-    //   w_obs = w_F + w_p · (y − μ) · [h'/V − h²·V'/V²].
-    // h(η)=φ(η), h'(η)=−η·φ(η); V'=1−2μ.
-    double w_hessian = w_fisher;
-    if (v > 0.0 && wp > 0.0) {{
-        double h_prime = -eta_c * dmu_deta;
-        double v_prime = 1.0 - 2.0 * mu;
-        double bracket = h_prime / v - (dmu_deta * dmu_deta) * v_prime / (v * v);
-        w_hessian = w_fisher + wp * (y_i - mu) * bracket;
+        r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, z_f = 0.0, z_h = 0.0, dev = 0.0;
+    if (!isfinite(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
+    if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
+        pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
+    if (status == PIRLS_OK && wp > 0.0
+            && !(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0))
+        pirls_refuse(&status, PIRLS_RESPONSE);
+    double dmu_deta = 0.0, d2mu_deta2 = 0.0, d3mu_deta3 = 0.0, v = 0.0;
+    if (status == PIRLS_OK) {{
+        mu = std_norm_cdf(eta_i);
+        dmu_deta = std_norm_pdf(eta_i);
+        d2mu_deta2 = -eta_i * dmu_deta;
+        d3mu_deta3 = (eta_i * eta_i - 1.0) * dmu_deta;
+        if (!(isfinite(mu) && mu > 0.0 && mu < 1.0
+                && isfinite(dmu_deta) && dmu_deta > 0.0
+                && isfinite(d2mu_deta2) && isfinite(d3mu_deta3)))
+            pirls_refuse(&status, PIRLS_INVERSE_LINK);
     }}
+    if (status == PIRLS_OK && wp == 0.0) {{
+        z_f = eta_i;
+        z_h = eta_i;
+    }}
+    if (status == PIRLS_OK && wp > 0.0) {{
+        v = mu * (1.0 - mu);
+        double fisher_per_prior = dmu_deta * dmu_deta / v;
+        w_fisher = wp * fisher_per_prior;
+        if (!(isfinite(v) && v > 0.0 && isfinite(fisher_per_prior)
+                && fisher_per_prior > 0.0 && isfinite(w_fisher) && w_fisher > 0.0))
+            pirls_refuse(&status, PIRLS_FISHER_WEIGHT);
+        double resid = y_i - mu;
+#ifdef PIRLS_CURVATURE_OBSERVED
+        double bracket = d2mu_deta2 / v
+            - (dmu_deta * dmu_deta) * (1.0 - 2.0 * mu) / (v * v);
+        w_hessian = w_fisher - wp * resid * bracket;
 #else
-    double w_hessian = w_fisher;
+        w_hessian = w_fisher;
 #endif
-    double w_solver = (w_hessian > 0.0) ? fmax(w_hessian, 1e-12) : 0.0;
-    double resid = y_i - mu;
-    double grad_eta = (v > 0.0) ? wp * resid * dmu_deta / v : 0.0;
-    double dev = bernoulli_deviance(y_i, mu, wp);
-    double z_f = bernoulli_z(eta_c, y_i, mu, dmu_deta);
-    double z_h = z_f;
-    if (!(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0)) flags |= 0x8u;
+        if (!isfinite(w_hessian)) pirls_refuse(&status, PIRLS_OBSERVED_WEIGHT);
+        w_solver = w_hessian;
+        grad_eta = wp * resid * dmu_deta / v;
+        if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
+        z_f = eta_i + resid / dmu_deta;
+        z_h = z_f;
+        if (!isfinite(z_f)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
+        dev = bernoulli_deviance(y_i, mu, wp);
+        if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
+    }}
+    if (status == PIRLS_OK && !pirls_outputs_finite(
+            mu, grad_eta, w_fisher, w_hessian, w_solver, z_f, z_h, dev))
+        pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
 }
@@ -1758,38 +1957,59 @@ fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
 fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
-        r#"{tag}    double eta_c = clamp_eta(eta_i, &flags);
-    double inner = exp(eta_c);
-    // μ = 1 − exp(−exp(η)); use -expm1(-inner) to avoid catastrophic
-    // cancellation in the deep negative tail (η ≲ -36).
-    double mu_raw = -expm1(-inner);
-    if (mu_raw < 1e-12 || mu_raw > 1.0 - 1e-12) flags |= 0x2u;
-    double mu = fmin(fmax(mu_raw, 1e-12), 1.0 - 1e-12);
-    double dmu_deta = inner * (1.0 - mu_raw);
-    double v = mu * (1.0 - mu);
-    double fpp = (v > 0.0) ? dmu_deta * dmu_deta / v : 0.0;
-    double w_fisher = wp * fpp;
-#ifdef PIRLS_CURVATURE_OBSERVED
-    // Stage 5: observed information for Bernoulli cloglog.
-    //   w_obs = w_F + w_p · (y − μ) · [h'/V − h²·V'/V²].
-    // h'(η) = h(η) · (1 − inner); V'=1−2μ.
-    double w_hessian = w_fisher;
-    if (v > 0.0 && wp > 0.0) {{
-        double h_prime = dmu_deta * (1.0 - inner);
-        double v_prime = 1.0 - 2.0 * mu;
-        double bracket = h_prime / v - (dmu_deta * dmu_deta) * v_prime / (v * v);
-        w_hessian = w_fisher + wp * (y_i - mu) * bracket;
+        r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, z_f = 0.0, z_h = 0.0, dev = 0.0;
+    if (!isfinite(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
+    if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
+        pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
+    if (status == PIRLS_OK && wp > 0.0
+            && !(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0))
+        pirls_refuse(&status, PIRLS_RESPONSE);
+    double inner = 0.0, dmu_deta = 0.0, d2mu_deta2 = 0.0, d3mu_deta3 = 0.0, v = 0.0;
+    if (status == PIRLS_OK) {{
+        inner = exp(eta_i);
+        double complement = exp(-inner);
+        mu = -expm1(-inner);
+        dmu_deta = inner * complement;
+        d2mu_deta2 = dmu_deta * (1.0 - inner);
+        d3mu_deta3 = dmu_deta * (1.0 - 3.0 * inner + inner * inner);
+        if (!(isfinite(mu) && mu > 0.0 && mu < 1.0
+                && isfinite(dmu_deta) && dmu_deta > 0.0
+                && isfinite(d2mu_deta2) && isfinite(d3mu_deta3)))
+            pirls_refuse(&status, PIRLS_INVERSE_LINK);
     }}
+    if (status == PIRLS_OK && wp == 0.0) {{
+        z_f = eta_i;
+        z_h = eta_i;
+    }}
+    if (status == PIRLS_OK && wp > 0.0) {{
+        v = mu * (1.0 - mu);
+        double fisher_per_prior = dmu_deta * dmu_deta / v;
+        w_fisher = wp * fisher_per_prior;
+        if (!(isfinite(v) && v > 0.0 && isfinite(fisher_per_prior)
+                && fisher_per_prior > 0.0 && isfinite(w_fisher) && w_fisher > 0.0))
+            pirls_refuse(&status, PIRLS_FISHER_WEIGHT);
+        double resid = y_i - mu;
+#ifdef PIRLS_CURVATURE_OBSERVED
+        double bracket = d2mu_deta2 / v
+            - (dmu_deta * dmu_deta) * (1.0 - 2.0 * mu) / (v * v);
+        w_hessian = w_fisher - wp * resid * bracket;
 #else
-    double w_hessian = w_fisher;
+        w_hessian = w_fisher;
 #endif
-    double w_solver = (w_hessian > 0.0) ? fmax(w_hessian, 1e-12) : 0.0;
-    double resid = y_i - mu;
-    double grad_eta = (v > 0.0) ? wp * resid * dmu_deta / v : 0.0;
-    double dev = bernoulli_deviance(y_i, mu, wp);
-    double z_f = bernoulli_z(eta_c, y_i, mu, dmu_deta);
-    double z_h = z_f;
-    if (!(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0)) flags |= 0x8u;
+        if (!isfinite(w_hessian)) pirls_refuse(&status, PIRLS_OBSERVED_WEIGHT);
+        w_solver = w_hessian;
+        grad_eta = wp * resid * dmu_deta / v;
+        if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
+        z_f = eta_i + resid / dmu_deta;
+        z_h = z_f;
+        if (!isfinite(z_f)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
+        dev = bernoulli_deviance(y_i, mu, wp);
+        if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
+    }}
+    if (status == PIRLS_OK && !pirls_outputs_finite(
+            mu, grad_eta, w_fisher, w_hessian, w_solver, z_f, z_h, dev))
+        pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
 }
@@ -1845,19 +2065,20 @@ extern "C" __global__ void {kernel_name}(
 ) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    unsigned int flags = 0u;
+    unsigned int status = PIRLS_OK;
     double eta_i = eta[i];
     double y_i = y[i];
-    double wp = prior_w[i] > 0.0 ? prior_w[i] : 0.0;
-    if (prior_w[i] <= 0.0) flags |= 0x10u;
+    double wp = prior_w[i];
 {body}
-    grad_eta_out[i] = grad_eta;
-    w_solver_out[i] = w_solver;
-    deviance_out[i] = dev;
-    status_out[i] = flags;
+    if (status == PIRLS_OK) {{
+        grad_eta_out[i] = grad_eta;
+        w_solver_out[i] = w_solver;
+        deviance_out[i] = dev;
+    }}
+    status_out[i] = status;
 }}
 "#,
-        prolog = COMMON_DEVICE_PROLOG,
+        prolog = common_device_prolog(),
     )
 }
 
@@ -1931,18 +2152,17 @@ extern "C" __global__ void {kernel_name}(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int k = (int)blockIdx.y;
     if (i >= n) return;
-    unsigned int flags = 0u;
+    unsigned int status = PIRLS_OK;
     double alpha = PIRLS_ALPHAS[k];
     double eta_i = eta[i] + alpha * xd[i];
     double y_i = y[i];
-    double wp = prior_w[i] > 0.0 ? prior_w[i] : 0.0;
-    if (prior_w[i] <= 0.0) flags |= 0x10u;
+    double wp = prior_w[i];
 {body}
-    atomicAdd(&objective_out[k], dev);
-    atomicOr(&status_out[k], flags);
+    if (status == PIRLS_OK) atomicAdd(&objective_out[k], dev);
+    status_out[k * n + i] = status;
 }}
 "#,
-        prolog = COMMON_DEVICE_PROLOG,
+        prolog = common_device_prolog(),
         alphas = ALPHA_LADDER_CUDA_ARRAY,
     )
 }

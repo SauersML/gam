@@ -704,7 +704,7 @@ fn run_canonical_standard_fit(
                 scan.knots.len(),
                 scan.edf(),
                 scan.sigma2,
-                scan.log_lambda,
+                scan.log_lambda(),
                 scan.restricted_loglik,
             );
             if let Some(out) = args.out.as_ref() {

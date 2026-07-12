@@ -799,17 +799,8 @@ impl CascadeRemlProfile<'_> {
     }
 
     fn evaluate(&self, log_lambda: f64) -> Result<CascadeScoreEvaluation, String> {
-        if !log_lambda.is_finite() {
-            return Err(format!(
-                "residual cascade: non-finite log lambda {log_lambda}"
-            ));
-        }
-        let lambda = log_lambda.exp();
-        if !(lambda.is_finite() && lambda > 0.0) {
-            return Err(format!(
-                "residual cascade: log lambda {log_lambda} is outside the finite exponential range"
-            ));
-        }
+        let lambda = gam_problem::checked_exp_log_strength(log_lambda)
+            .map_err(|error| format!("residual cascade: {error}"))?;
 
         let core = self.core;
         let (coeff, _, _) = core.solve_coeff(lambda, &core.rhs, None)?;
@@ -2137,8 +2128,10 @@ impl ResidualCascadeDesign {
     /// so the conditioning oracle can reconstruct that block-arrow preconditioner
     /// from the public dense system and certify it is uniformly conditioned in
     /// depth. See [`COARSE_DOMINANCE`].
-    pub fn coarse_space_cols(&self, log_lambda: f64) -> usize {
-        self.core.coarse_space_cols(log_lambda.exp())
+    pub fn coarse_space_cols(&self, log_lambda: f64) -> Result<usize, String> {
+        let lambda = gam_problem::checked_exp_log_strength(log_lambda)
+            .map_err(|error| format!("residual cascade: {error}"))?;
+        Ok(self.core.coarse_space_cols(lambda))
     }
 
     /// Total coefficient count (`dim + 1` polynomial + all centers).
@@ -2212,13 +2205,17 @@ impl ResidualCascadeDesign {
     /// Exact dense log-determinant of `X'WX + λD` (errors past the sizing
     /// cap) — exposed for the in-test SLQ-vs-exact oracle.
     pub fn logdet_exact(&self, log_lambda: f64) -> Result<f64, String> {
-        self.core.logdet_dense(log_lambda.exp())
+        let lambda = gam_problem::checked_exp_log_strength(log_lambda)
+            .map_err(|error| format!("residual cascade: {error}"))?;
+        self.core.logdet_dense(lambda)
     }
 
     /// SLQ log-determinant estimate on the fixed deterministic probes —
     /// exposed for the in-test SLQ-vs-exact oracle.
     pub fn logdet_slq(&self, log_lambda: f64) -> Result<f64, String> {
-        self.core.logdet_slq(log_lambda.exp())
+        let lambda = gam_problem::checked_exp_log_strength(log_lambda)
+            .map_err(|error| format!("residual cascade: {error}"))?;
+        self.core.logdet_slq(lambda)
     }
 
     /// Profiled-σ² REML criterion at `log λ` (differences across λ are exact
@@ -2244,13 +2241,9 @@ impl ResidualCascadeDesign {
         warm: Option<&[f64]>,
         profile_normalized_logdet: Option<f64>,
     ) -> Result<ResidualCascadeFit, String> {
-        if !log_lambda.is_finite() {
-            return Err(format!(
-                "residual cascade: non-finite log lambda {log_lambda}"
-            ));
-        }
         let core = &self.core;
-        let lambda = log_lambda.exp();
+        let lambda = gam_problem::checked_exp_log_strength(log_lambda)
+            .map_err(|error| format!("residual cascade: {error}"))?;
         let (coeff, rel_res, iters) = core.solve_coeff(lambda, &core.rhs, warm)?;
         let rss_pen = core.rss_pen(&coeff);
         let dof = (core.y.len() - core.nullity()) as f64;
@@ -2390,7 +2383,9 @@ impl ResidualCascadeDesign {
         }
         let g2: f64 = g.iter().map(|v| v * v).sum();
         let d_next = level_weight(next_l, core.sobolev_s, core.dim);
-        let gain_bound = g2 / (fit.log_lambda.exp() * d_next);
+        let lambda = gam_problem::checked_exp_log_strength(fit.log_lambda)
+            .map_err(|error| format!("residual cascade refinement: {error}"))?;
+        let gain_bound = g2 / (lambda * d_next);
         if next_l >= MAX_LEVELS {
             Ok(NextLevelAssessment::CapacityExceeded {
                 obstruction: RefinementObstruction::LevelCapacity {
@@ -2461,7 +2456,8 @@ impl ResidualCascadeFit {
             mean += v * self.coeff[c];
             dense_row[c] += v;
         }
-        let lambda = self.log_lambda.exp();
+        let lambda = gam_problem::checked_exp_log_strength(self.log_lambda)
+            .map_err(|error| format!("residual cascade fit: {error}"))?;
         let zsol = if let Some(l) = &self.predict_chol {
             chol_solve(l, core.m, &dense_row)
         } else {
@@ -2480,7 +2476,8 @@ impl ResidualCascadeFit {
     /// solve per sample (warm-started at the mode).
     pub fn sample_coefficients(&self, n_samples: usize) -> Result<Vec<Vec<f64>>, String> {
         let core = &self.core;
-        let lambda = self.log_lambda.exp();
+        let lambda = gam_problem::checked_exp_log_strength(self.log_lambda)
+            .map_err(|error| format!("residual cascade fit: {error}"))?;
         let sigma = self.sigma2.sqrt();
         let sqrt_lambda = lambda.sqrt();
         let n = core.y.len();
@@ -2529,7 +2526,8 @@ impl ResidualCascadeFit {
     /// replays the posterior mean+variance bit-for-bit.
     pub fn to_state(&self) -> Result<ResidualCascadeState, String> {
         let core = &self.core;
-        let lambda = self.log_lambda.exp();
+        let lambda = gam_problem::checked_exp_log_strength(self.log_lambda)
+            .map_err(|error| format!("residual cascade fit: {error}"))?;
         let predict_chol = if let Some(l) = &self.predict_chol {
             l.clone()
         } else if let Some(l) = &core.predict_chol {
@@ -2723,8 +2721,9 @@ impl ResidualCascadeFit {
                 ));
             }
         }
-        if !(state.log_lambda.is_finite()
-            && state.sigma2.is_finite()
+        gam_problem::validate_log_strength(state.log_lambda)
+            .map_err(|error| format!("residual cascade state: {error}"))?;
+        if !(state.sigma2.is_finite()
             && state.sigma2 > 0.0
             && state.restricted_loglik.is_finite()
             && state.rss_pen.is_finite())

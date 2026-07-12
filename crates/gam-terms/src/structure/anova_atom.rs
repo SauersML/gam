@@ -972,7 +972,8 @@ pub fn fit_pair_surface(
                     coeff_covariance,
                     residual_cross_cov,
                     unit_covariance,
-                    lambda: fit.log_lambda.exp(),
+                    lambda: gam_problem::checked_exp_log_strength(fit.log_lambda)
+                        .map_err(|error| format!("ANOVA pair-surface log strength: {error}"))?,
                     edf: post.edf,
                     residual_df: post.residual_df,
                 },
