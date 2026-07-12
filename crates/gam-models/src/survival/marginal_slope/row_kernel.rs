@@ -1023,9 +1023,6 @@ impl gam_math::jet_tower::RowProgram<4> for SurvivalMarginalSlopeRowKernel {
 }
 
 impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
-    fn n_rows(&self) -> usize {
-        self.family.n
-    }
     fn n_coefficients(&self) -> usize {
         self.slices.total
     }
@@ -1077,9 +1074,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
 
         #[cfg(target_os = "linux")]
         {
-            use crate::gpu_kernels::survival_rowjet::{
-                SurvivalRowInputs, survival_rigid_row_vgh,
-            };
+            use crate::gpu_kernels::survival_rowjet::{SurvivalRowInputs, survival_rigid_row_vgh};
             let probit_scale = self.family.probit_frailty_scale();
             let qd1_lower = self.family.time_derivative_lower_bound();
             // Gather per-row inputs in parallel (the pure-f64 score summary + primary
@@ -1278,28 +1273,6 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
                 .squared_axpy_row_into(row, h[3][3], &mut gd)
                 .expect("logslope squared_axpy dim mismatch");
         }
-    }
-
-    fn row_third_contracted(&self, row: usize, dir: &[f64; 4]) -> Result<[[f64; 4]; 4], String> {
-        // #932: derived mechanically from the single-source `RowProgram::eval`
-        // (one-seed scalar → ε-Hessian channel `Σ_c ℓ_{abc} dir_c`, no dense
-        // `t3`). Byte-identical to the previous hand-seeded `rigid_row_nll` at
-        // `OneSeed<4>` — same `primaries` + `rigid_row_inputs` + `rigid_row_nll`
-        // — pinned by `rigid_row_kernel_agrees_with_jet_tower_program_all_channels`.
-        gam_math::jet_tower::program_third_contracted(self, row, dir)
-    }
-
-    fn row_fourth_contracted(
-        &self,
-        row: usize,
-        dir_u: &[f64; 4],
-        dir_v: &[f64; 4],
-    ) -> Result<[[f64; 4]; 4], String> {
-        // #932: derived mechanically from the single-source `RowProgram::eval`
-        // (two-seed scalar → εδ-Hessian channel `Σ_{cd} ℓ_{abcd} u_c v_d`, no
-        // dense `t4`). Byte-identical to the previous hand-seeded `rigid_row_nll`
-        // at `TwoSeed<4>`.
-        gam_math::jet_tower::program_fourth_contracted(self, row, dir_u, dir_v)
     }
 
     /// Batched all-axes FIRST directional derivative of the joint Hessian for

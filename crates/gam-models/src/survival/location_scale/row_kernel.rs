@@ -1601,10 +1601,6 @@ impl gam_math::jet_tower::RowProgram<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
 }
 
 impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
-    fn n_rows(&self) -> usize {
-        self.family.n
-    }
-
     fn n_coefficients(&self) -> usize {
         *self.offsets.last().expect("offsets has block bounds")
     }
@@ -1766,33 +1762,6 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                 }
             }
         }
-    }
-
-    fn row_third_contracted(
-        &self,
-        row: usize,
-        dir: &[f64; SLS_ROW_K],
-    ) -> Result<[[f64; SLS_ROW_K]; SLS_ROW_K], String> {
-        // #932: derived mechanically from the single-source `RowProgram::eval`
-        // (one-seed scalar → ε-Hessian channel `Σ_c ℓ_{abc} dir_c`, no dense
-        // `t3`). Byte-identical to the previous hand-seeded `sls_row_nll` at
-        // `OneSeed<9>` — same `row_primary_values` + `row_nll_inputs_opt` kernel,
-        // same `None`→zero structural-zero arm (eval returns `constant(0.0)`) —
-        // pinned by the `survival_ls_packed_scalar_*` oracles.
-        gam_math::jet_tower::program_third_contracted(self, row, dir)
-    }
-
-    fn row_fourth_contracted(
-        &self,
-        row: usize,
-        dir_u: &[f64; SLS_ROW_K],
-        dir_v: &[f64; SLS_ROW_K],
-    ) -> Result<[[f64; SLS_ROW_K]; SLS_ROW_K], String> {
-        // #932: derived mechanically from the single-source `RowProgram::eval`
-        // (two-seed scalar → εδ-Hessian channel `Σ_{cd} ℓ_{abcd} u_c v_d`, no
-        // dense `t4`). Byte-identical to the previous hand-seeded `sls_row_nll`
-        // at `TwoSeed<9>`, same `None`→zero structural-zero arm.
-        gam_math::jet_tower::program_fourth_contracted(self, row, dir_u, dir_v)
     }
 
     /// Batched all-axes first directional derivative with the per-row NLL

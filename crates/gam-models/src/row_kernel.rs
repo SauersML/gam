@@ -199,18 +199,16 @@ where
 
 /// A row-decomposable likelihood kernel with K primary scalars per row.
 ///
-/// Implementors provide only:
-///   1. The analytic kernel (NLL + gradient + Hessian in K-dim primary space)
-///   2. The linear Jacobian wiring (coefficients ↔ primary scalars)
-///   3. Assembly helpers (quadratic pullback, diagonal accumulation)
-///   4. Higher-order contracted kernels for REML outer derivatives
+/// Every kernel MUST implement [`gam_math::jet_tower::RowProgram`], which is
+/// the one semantic row NLL. Value/gradient/Hessian and the contracted third /
+/// fourth channels default to mechanical evaluations of that program. A family
+/// may override a channel only with a structure-compiled performance schedule
+/// pinned against the inherited program; it can no longer implement a kernel
+/// without supplying the common source.
 ///
 /// All coefficient-space assembly (gradient, matvec, diagonal, dense Hessian,
 /// directional derivatives) is derived generically.
-pub trait RowKernel<const K: usize>: Send + Sync {
-    /// Number of observations.
-    fn n_rows(&self) -> usize;
-
+pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send + Sync {
     /// Total number of coefficients (flat β dimension).
     fn n_coefficients(&self) -> usize;
 
@@ -218,7 +216,9 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     ///
     /// Returns `(nll_i, ∇_i[K], H_i[K×K])` — the negative log-likelihood,
     /// gradient, and Hessian in primary space for observation `row`.
-    fn row_kernel(&self, row: usize) -> Result<(f64, [f64; K], [[f64; K]; K]), String>;
+    fn row_kernel(&self, row: usize) -> Result<(f64, [f64; K], [[f64; K]; K]), String> {
+        gam_math::jet_tower::program_row_kernel(self, row)
+    }
 
     /// Forward Jacobian action: Jᵢ · d_beta → K-dim primary direction.
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; K];
@@ -248,7 +248,9 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     /// Returns the K×K matrix of third derivatives contracted with one
     /// primary-space direction. Used for first directional derivatives of
     /// the Hessian (REML outer gradient).
-    fn row_third_contracted(&self, row: usize, dir: &[f64; K]) -> Result<[[f64; K]; K], String>;
+    fn row_third_contracted(&self, row: usize, dir: &[f64; K]) -> Result<[[f64; K]; K], String> {
+        gam_math::jet_tower::program_third_contracted(self, row, dir)
+    }
 
     /// Fourth-order contracted derivative: `∂⁴ℓ_i / (∂p_a ∂p_b ∂[dir_u] ∂[dir_v])`.
     ///
@@ -260,7 +262,9 @@ pub trait RowKernel<const K: usize>: Send + Sync {
         row: usize,
         dir_u: &[f64; K],
         dir_v: &[f64; K],
-    ) -> Result<[[f64; K]; K], String>;
+    ) -> Result<[[f64; K]; K], String> {
+        gam_math::jet_tower::program_fourth_contracted(self, row, dir_u, dir_v)
+    }
 
     /// Optional warm-up hook: triggers any per-row caches the kernel keeps for
     /// `row_third_contracted` / `row_fourth_contracted`. Called by
@@ -2131,6 +2135,7 @@ mod gram_inner_contraction_tests {
     use crate::custom_family::{
         JointHessianSource, exact_newton_joint_hessian_source_from_workspace,
     };
+    use gam_math::nested_dual::JetField;
     use gam_problem::ProjectedFactorCache;
     use ndarray::Array2;
 
@@ -2167,10 +2172,10 @@ mod gram_inner_contraction_tests {
     }
 
     /// Synthetic K=4 row kernel: dense `(n × p)` design `X` per primary scalar
-    /// (so each row's Jacobian is a sparse-style stack of K row vectors), with
-    /// arbitrary K×K third / fourth contracted derivatives that depend on row
-    /// and direction. Used only to exercise `trace_projected_factor_with_jf`
-    /// against an independent reference contraction loop.
+    /// (so each row's Jacobian is a sparse-style stack of K row vectors) and one
+    /// quartic [`gam_math::jet_tower::RowProgram`] supplying every calculus
+    /// channel. Used only to exercise `trace_projected_factor_with_jf` against
+    /// an independent reference contraction loop.
     struct SyntheticKernel {
         n: usize,
         p: usize,
@@ -2200,24 +2205,64 @@ mod gram_inner_contraction_tests {
         }
     }
 
-    impl RowKernel<4> for SyntheticKernel {
+    impl gam_math::jet_tower::RowProgram<4> for SyntheticKernel {
         fn n_rows(&self) -> usize {
             self.n
         }
-        fn n_coefficients(&self) -> usize {
-            self.p
-        }
-        fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
+
+        fn primaries(&self, row: usize) -> Result<[f64; 4], String> {
             if row >= self.n {
                 return Err(format!("synthetic row {row} outside n={}", self.n));
             }
-            let mut grad = [0.0_f64; 4];
-            let mut hess = [[0.0_f64; 4]; 4];
-            for k in 0..4 {
-                grad[k] = self.designs[k].row(row).sum();
-                hess[k][k] = 1.0 + (row as f64 + k as f64).abs() * 1.0e-6;
+            let width = self.p.max(1) as f64;
+            Ok(std::array::from_fn(|axis| {
+                self.designs[axis].row(row).sum() / width
+            }))
+        }
+
+        fn eval<S: gam_math::jet_scalar::JetScalar<4>>(
+            &self,
+            row: usize,
+            p: &[S; 4],
+        ) -> Result<S, String> {
+            if row >= self.n {
+                return Err(format!("synthetic row {row} outside n={}", self.n));
             }
-            Ok((0.5 * grad.iter().map(|v| v * v).sum::<f64>(), grad, hess))
+            // A genuine quartic scalar program gives the workspace tests
+            // nonzero, mutually consistent V/G/H/t3/t4 channels. The old test
+            // fixture authored unrelated arbitrary tensors and therefore could
+            // not satisfy the RowProgram-enforced production contract.
+            let row_scale = 1.0 + row as f64 * 1.0e-3;
+            let mut out = S::constant(0.0);
+            for axis in 0..4 {
+                let x = p[axis];
+                let x2 = x.mul(&x);
+                let x3 = x2.mul(&x);
+                let x4 = x2.mul(&x2);
+                out = out
+                    .add(&x2.scale(0.5 * row_scale * (axis + 1) as f64))
+                    .add(&x3.scale((0.07 + 0.01 * axis as f64) / 6.0))
+                    .add(&x4.scale((0.03 + 0.005 * axis as f64) / 24.0));
+            }
+            for left in 0..4 {
+                for right in (left + 1)..4 {
+                    let left2 = p[left].mul(&p[left]);
+                    let right2 = p[right].mul(&p[right]);
+                    let cubic = left2.mul(&p[right]);
+                    let quartic = left2.mul(&right2);
+                    let pair_scale = 1.0 + (left + right) as f64 * 0.1;
+                    out = out
+                        .add(&cubic.scale(0.015 * pair_scale))
+                        .add(&quartic.scale(0.004 * pair_scale));
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    impl RowKernel<4> for SyntheticKernel {
+        fn n_coefficients(&self) -> usize {
+            self.p
         }
         fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 4] {
             let mut out = [0.0_f64; 4];
@@ -2267,46 +2312,6 @@ mod gram_inner_contraction_tests {
                 }
                 diag[j] += acc;
             }
-        }
-        fn row_third_contracted(
-            &self,
-            row: usize,
-            dir: &[f64; 4],
-        ) -> Result<[[f64; 4]; 4], String> {
-            // Arbitrary symmetric K×K matrix that depends on row and dir.
-            let mut t = [[0.0_f64; 4]; 4];
-            let row_f = (row as f64) * 0.013;
-            for a in 0..4 {
-                for b in a..4 {
-                    let v = (row_f + a as f64 * 0.7 + b as f64 * 1.3).sin()
-                        + dir[a] * 0.25
-                        + dir[b] * 0.5
-                        + dir[(a + b) % 4] * 0.125;
-                    t[a][b] = v;
-                    t[b][a] = v;
-                }
-            }
-            Ok(t)
-        }
-        fn row_fourth_contracted(
-            &self,
-            row: usize,
-            dir_u: &[f64; 4],
-            dir_v: &[f64; 4],
-        ) -> Result<[[f64; 4]; 4], String> {
-            let mut t = [[0.0_f64; 4]; 4];
-            let row_f = (row as f64) * 0.011 + 0.31;
-            for a in 0..4 {
-                for b in a..4 {
-                    let v = (row_f + a as f64 * 0.9 + b as f64 * 1.7).cos()
-                        + dir_u[a] * 0.13
-                        + dir_v[b] * 0.27
-                        + dir_u[(a + b) % 4] * dir_v[(a + 1) % 4] * 0.05;
-                    t[a][b] = v;
-                    t[b][a] = v;
-                }
-            }
-            Ok(t)
         }
     }
 
@@ -2519,19 +2524,31 @@ mod gram_inner_contraction_tests {
         }
     }
 
-    // Forward every `RowKernel` method to the inner synthetic kernel. No method
-    // touches the build counter — only construction does — so the counter
-    // measures kernel REBUILDS, exactly the quantity #979 collapsed from `p` to
-    // 1.
-    impl RowKernel<4> for BuildCountingKernel {
+    // Forward the one RowProgram and all coefficient-space wiring to the inner
+    // synthetic kernel. No method touches the build counter — only construction
+    // does — so the counter measures kernel REBUILDS, exactly the quantity #979
+    // collapsed from `p` to 1.
+    impl gam_math::jet_tower::RowProgram<4> for BuildCountingKernel {
         fn n_rows(&self) -> usize {
-            self.inner.n_rows()
+            self.inner.n
         }
+
+        fn primaries(&self, row: usize) -> Result<[f64; 4], String> {
+            gam_math::jet_tower::RowProgram::primaries(&self.inner, row)
+        }
+
+        fn eval<S: gam_math::jet_scalar::JetScalar<4>>(
+            &self,
+            row: usize,
+            p: &[S; 4],
+        ) -> Result<S, String> {
+            gam_math::jet_tower::RowProgram::eval(&self.inner, row, p)
+        }
+    }
+
+    impl RowKernel<4> for BuildCountingKernel {
         fn n_coefficients(&self) -> usize {
             self.inner.n_coefficients()
-        }
-        fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
-            self.inner.row_kernel(row)
         }
         fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 4] {
             self.inner.jacobian_action(row, d_beta)
@@ -2544,21 +2561,6 @@ mod gram_inner_contraction_tests {
         }
         fn add_diagonal_quadratic(&self, row: usize, h: &[[f64; 4]; 4], diag: &mut [f64]) {
             self.inner.add_diagonal_quadratic(row, h, diag)
-        }
-        fn row_third_contracted(
-            &self,
-            row: usize,
-            dir: &[f64; 4],
-        ) -> Result<[[f64; 4]; 4], String> {
-            self.inner.row_third_contracted(row, dir)
-        }
-        fn row_fourth_contracted(
-            &self,
-            row: usize,
-            dir_u: &[f64; 4],
-            dir_v: &[f64; 4],
-        ) -> Result<[[f64; 4]; 4], String> {
-            self.inner.row_fourth_contracted(row, dir_u, dir_v)
         }
     }
 

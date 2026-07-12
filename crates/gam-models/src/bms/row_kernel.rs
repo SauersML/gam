@@ -327,15 +327,8 @@ impl gam_math::jet_tower::RowProgram<2> for BernoulliRigidRowKernel {
 }
 
 impl RowKernel<2> for BernoulliRigidRowKernel {
-    fn n_rows(&self) -> usize {
-        self.family.y.len()
-    }
     fn n_coefficients(&self) -> usize {
         self.slices.total
-    }
-
-    fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
-        gam_math::jet_tower::program_row_kernel(self, row)
     }
 
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 2] {
