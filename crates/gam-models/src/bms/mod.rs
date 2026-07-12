@@ -1142,7 +1142,7 @@ impl LatentZConditionalCalibration {
     /// `solved_fit.beta_covariance()` lives in). With `score_β,i = ∂ℓ_i/∂β`,
     /// `s_i = ∂²ℓ_i/∂β∂ζ_i = J_iᵀ·(∂²ℓ_i/∂η_i∂ζ_i)` is the mixed `(β, ζ)`
     /// second derivative of the warped row kernel contracted through the slope
-    /// design Jacobian `J_i` — exactly the #932 RowNllProgram/Tower4 z-jet
+    /// design Jacobian `J_i` — exactly the #932 `RowProgram` z-jet
     /// channel (`z` is already a row-program input; one extra mixed `(β, z)` jet
     /// channel reads off `∂²ℓ/∂β∂z`). It must be evaluated at the converged `β̂`
     /// in the SAME reduced frame as `vb`.
