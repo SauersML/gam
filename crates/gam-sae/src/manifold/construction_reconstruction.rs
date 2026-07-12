@@ -307,7 +307,30 @@ impl SaeManifoldTerm {
         // Design-honesty weights are normalized to mean one, so they redistribute
         // residual mass without changing the scalar observation count.
         let n_scalar = (n * p) as f64;
-        let rss = 2.0 * loss.data_fit;
+        // FRAME CONSISTENCY (#2228/#2258 tier-0 root cause): under an active
+        // WHITENING row metric the likelihood's `loss.data_fit` is the
+        // WHITENED residual energy — ≈ n·p BY CONSTRUCTION (whitening
+        // normalizes residuals to unit scale) — so a φ̂ built from it prices
+        // the noise floor at ~n·p/resid_dof ≈ 2 REGARDLESS of the actual fit
+        // quality. Every consumer of this dispersion lives in the RAW output
+        // frame: the rank-charge MP edge compares against the unwhitened
+        // reconstruction Gram (measured veto: R=2.16 vs top signal 1.01 on a
+        // fitted EV=0.998 circle → rank_eff=0 → categorical +∞ → 'infeasible
+        // at the requested rho' for every structured pass), and the shape
+        // bands are φ-scaled output-frame covariances. Price φ from the RAW
+        // residual whenever the caller supplied it and the metric whitens.
+        let metric_whitens = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|metric| metric.whitens_likelihood());
+        let rss = if metric_whitens && residual.is_some() {
+            residual
+                .as_ref()
+                .map(|res| res.iter().map(|value| value * value).sum::<f64>())
+                .unwrap_or(2.0 * loss.data_fit)
+        } else {
+            2.0 * loss.data_fit
+        };
         let smooth_edf: f64 = self
             .decoder_smoothness_effective_dof_per_atom(cache, &rho.lambda_smooth_vec())
             .map_err(|e| format!("reconstruction_dispersion: smooth edf: {e}"))?
