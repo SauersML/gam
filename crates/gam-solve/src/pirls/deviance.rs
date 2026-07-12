@@ -53,16 +53,11 @@ fn log_standard_normal_cdf_and_score(x: f64) -> (f64, f64) {
                 * (-1.0
                     + inv2
                         * (3.0
-                            + inv2
-                                * (-15.0
-                                    + inv2 * (105.0 + inv2 * (-945.0 + inv2 * 10_395.0)))));
+                            + inv2 * (-15.0 + inv2 * (105.0 + inv2 * (-945.0 + inv2 * 10_395.0)))));
         let log_cdf = -0.5 * t2 - t.ln() - HALF_LOG_2PI + tail_series.ln();
-        let inverse_mills = t
-            + inv
-                * (1.0
-                    + inv2
-                        * (-2.0
-                            + inv2 * (10.0 + inv2 * (-74.0 + inv2 * (706.0 - 8_162.0 * inv2)))));
+        let inverse_mills = t + inv
+            * (1.0
+                + inv2 * (-2.0 + inv2 * (10.0 + inv2 * (-74.0 + inv2 * (706.0 - 8_162.0 * inv2)))));
         (log_cdf, inverse_mills)
     } else {
         let erfc = statrs::function::erf::erfc(-x * std::f64::consts::FRAC_1_SQRT_2);
@@ -77,8 +72,7 @@ fn log_standard_normal_cdf_and_score(x: f64) -> (f64, f64) {
 #[inline]
 fn probit_binomial_geometry(y: f64, eta: f64) -> (f64, f64, f64) {
     let (log_mu, dlog_mu) = log_standard_normal_cdf_and_score(eta);
-    let (log_one_minus_mu, dlog_survival_at_neg_eta) =
-        log_standard_normal_cdf_and_score(-eta);
+    let (log_one_minus_mu, dlog_survival_at_neg_eta) = log_standard_normal_cdf_and_score(-eta);
     let negative_score = if y == 1.0 {
         -dlog_mu
     } else if y == 0.0 {
@@ -986,9 +980,7 @@ pub(crate) fn deviance_eta_row_with_log_measure_scale(
             } else {
                 beta_log_normalizer(a, b, *phi)
             };
-            let fitted = log_normalizer
-                + *phi * xlogy(mu, y)
-                + *phi * xlogy(one_minus_mu, 1.0 - y)
+            let fitted = log_normalizer + *phi * xlogy(mu, y) + *phi * xlogy(one_minus_mu, 1.0 - y)
                 - y.ln()
                 - (1.0 - y).ln();
             let half_unit = saturated - fitted;
@@ -1252,11 +1244,7 @@ fn beta_null_eta(
         upper *= 2.0;
         upper_score = beta_null_score(upper, phi, target);
     }
-    if lower_score.is_nan()
-        || upper_score.is_nan()
-        || lower_score > 0.0
-        || upper_score < 0.0
-    {
+    if lower_score.is_nan() || upper_score.is_nan() || lower_score > 0.0 || upper_score < 0.0 {
         return Err(EstimationError::InvalidInput(format!(
             "Beta null score could not be bracketed: lower=({lower},{lower_score}), upper=({upper},{upper_score}), target={target}"
         )));
@@ -1314,18 +1302,23 @@ pub fn calculate_null_deviance(
     priorweights: ArrayView1<f64>,
 ) -> Result<f64, EstimationError> {
     let response = &likelihood.spec.response;
-    let response_mean = |domain: &'static str,
-                         valid: fn(f64) -> bool|
-     -> Result<f64, EstimationError> {
-        null_weighted_average(y, priorweights, domain, |row, value| {
-            if !valid(value) {
-                return Err(EstimationError::InvalidInput(format!(
-                    "{domain}: invalid response at row {row}: {value}"
-                )));
-            }
-            Ok(value)
-        })
-    };
+    if !matches!(response, ResponseFamily::RoystonParmar) {
+        // The null deviance is scale-free for several families, but accepting
+        // contradictory family/metadata state here would let reporting bless a
+        // fit that covariance and sampling correctly reject.
+        crate::estimate::dispersion_from_likelihood(likelihood, 0.0)?;
+    }
+    let response_mean =
+        |domain: &'static str, valid: fn(f64) -> bool| -> Result<f64, EstimationError> {
+            null_weighted_average(y, priorweights, domain, |row, value| {
+                if !valid(value) {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "{domain}: invalid response at row {row}: {value}"
+                    )));
+                }
+                Ok(value)
+            })
+        };
 
     let (eta_value, inverse_link, null_likelihood) = match response {
         ResponseFamily::Gaussian => {
@@ -1397,9 +1390,7 @@ pub fn calculate_null_deviance(
             )
         }
         ResponseFamily::Gamma => {
-            let mean = response_mean("Gamma null model", |value| {
-                value.is_finite() && value > 0.0
-            })?;
+            let mean = response_mean("Gamma null model", |value| value.is_finite() && value > 0.0)?;
             let inverse_link = InverseLink::Standard(StandardLink::Log);
             (
                 mean.ln(),
@@ -1412,13 +1403,7 @@ pub fn calculate_null_deviance(
         }
     };
     let eta = Array1::from_elem(y.len(), eta_value);
-    calculate_deviance_from_eta(
-        y,
-        &eta,
-        &null_likelihood,
-        &inverse_link,
-        priorweights,
-    )
+    calculate_deviance_from_eta(y, &eta, &null_likelihood, &inverse_link, priorweights)
 }
 
 fn eta_log_likelihood_geometry_omitting_constants(
@@ -1626,14 +1611,8 @@ pub(crate) fn calculate_loglikelihood_omitting_constants_from_eta(
     inverse_link: &InverseLink,
     priorweights: ArrayView1<f64>,
 ) -> Result<f64, EstimationError> {
-    eta_log_likelihood_geometry_omitting_constants(
-        y,
-        eta,
-        likelihood,
-        inverse_link,
-        priorweights,
-    )
-    .map(|(value, _)| value)
+    eta_log_likelihood_geometry_omitting_constants(y, eta, likelihood, inverse_link, priorweights)
+        .map(|(value, _)| value)
 }
 
 #[inline]
@@ -1725,129 +1704,6 @@ pub(crate) fn beta_unit_deviance(yi: f64, mui: f64, phi: f64) -> f64 {
         return f64::NAN;
     }
     beta_loglikelihood_full_unit(yi, yi, phi) - beta_loglikelihood_full_unit(yi, mui, phi)
-}
-
-#[inline]
-pub fn calculate_deviance(
-    y: ArrayView1<f64>,
-    mu: &Array1<f64>,
-    likelihood: &GlmLikelihoodSpec,
-    priorweights: ArrayView1<f64>,
-) -> f64 {
-    match &likelihood.spec.response {
-        ResponseFamily::Binomial => {
-            let total_residual: f64 = RowSet::All.par_reduce_fold(
-                y.len(),
-                || 0.0_f64,
-                |acc, i, _row_weight| {
-                    let yi = y[i];
-                    let mui_c = mu[i];
-                    let wi = priorweights[i];
-                    let term1 = if yi > EPS {
-                        yi * (yi.ln() - mui_c.ln())
-                    } else {
-                        0.0
-                    };
-                    let term2 = if yi < 1.0 - EPS {
-                        (1.0 - yi) * ((1.0 - yi).ln() - (1.0 - mui_c).ln())
-                    } else {
-                        0.0
-                    };
-                    acc + wi * (term1 + term2)
-                },
-                |a, b| a + b,
-            );
-            2.0 * total_residual
-        }
-        ResponseFamily::Gaussian => {
-            // Scaled Gaussian deviance is sum(prior_i * (y_i - mu_i)^2 / phi).
-            // The default `ProfiledGaussian` metadata reports no fixed phi and
-            // we keep the historical unscaled form (phi == 1) so that profiled
-            // sigma fits remain unchanged. When the caller fixes phi explicitly
-            // we divide by it so the deviance lines up with the IRLS working
-            // weights (`prior_i / phi`) and with the canonical exponential-
-            // family scaled deviance used elsewhere.
-            let phi = likelihood.scale.fixed_phi().unwrap_or(1.0);
-            if !(phi.is_finite() && phi > 0.0) {
-                return f64::NAN;
-            }
-            let raw: f64 = ndarray::Zip::from(y)
-                .and(mu)
-                .and(priorweights)
-                .map_collect(|&yi, &mui, &wi| wi * (yi - mui) * (yi - mui))
-                .sum();
-            raw / phi
-        }
-        ResponseFamily::Poisson => {
-            let total: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
-                let yi = y[i];
-                let mui_c = mu[i];
-                priorweights[i] * poisson_unit_deviance(yi, mui_c)
-            });
-            2.0 * total
-        }
-        ResponseFamily::Tweedie { p } => {
-            let p = *p;
-            // Report the *unscaled* Tweedie deviance D = 2·Σ wᵢ·d(yᵢ, μᵢ),
-            // matching every other family here (Poisson/Binomial/NB/Beta and
-            // Gamma post-#2126 all accumulate the bare `priorweights·unit_deviance`
-            // with φ ≡ 1) and matching R/mgcv/statsmodels' reported deviance.
-            // Dividing the unit deviance by the fitted dispersion φ̂ would report
-            // the *scaled* deviance D/φ̂ instead — the #2126 defect. The
-            // dispersion is reported separately; the deviance itself must stay
-            // scale-free so `deviance_explained = 1 − D_resid/D_null` is a pure
-            // ratio of like-scaled deviances.
-            let phi = fixed_glm_dispersion(likelihood);
-            if !is_valid_tweedie_power(p) || !(phi.is_finite() && phi > 0.0) {
-                return f64::NAN;
-            }
-            if validate_tweedie_responses(&y, &priorweights).is_err() {
-                return f64::NAN;
-            }
-            let total: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
-                let yi = y[i];
-                let mui_c = mu[i];
-                priorweights[i] * tweedie_unit_deviance(yi, mui_c, p)
-            });
-            2.0 * total
-        }
-        ResponseFamily::NegativeBinomial { theta, .. } => {
-            let theta = *theta;
-            let total: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
-                let yi = y[i];
-                let mui_c = mu[i];
-                priorweights[i] * negative_binomial_unit_deviance(yi, mui_c, theta)
-            });
-            2.0 * total
-        }
-        ResponseFamily::Beta { phi } => {
-            let phi = *phi;
-            if !valid_beta_phi(phi) {
-                return f64::NAN;
-            }
-            let total: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
-                priorweights[i] * beta_unit_deviance(y[i], mu[i], phi)
-            });
-            2.0 * total
-        }
-        ResponseFamily::Gamma => {
-            // Report the *unscaled* Gamma deviance D = 2·Σ wᵢ·d(yᵢ, μᵢ), matching
-            // every other family here (Poisson/Binomial/NB/Beta all accumulate the
-            // bare `priorweights·unit_deviance` with φ ≡ 1) and matching R/mgcv/
-            // statsmodels' `summary.deviance`. Multiplying the unit deviance by the
-            // fitted shape (≈ 1/φ̂) would report the *scaled* deviance D/φ̂ instead
-            // — the #2126 defect. The dispersion is reported separately; the
-            // deviance itself must stay scale-free so `deviance_explained =
-            // 1 − D_resid/D_null` is a pure ratio of like-scaled deviances.
-            let total: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
-                let yi_c = y[i].max(EPS);
-                let mui_c = mu[i];
-                priorweights[i] * gamma_unit_deviance(yi_c, mui_c)
-            });
-            2.0 * total
-        }
-        ResponseFamily::RoystonParmar => f64::NAN,
-    }
 }
 
 #[inline]

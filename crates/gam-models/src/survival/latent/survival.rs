@@ -130,10 +130,7 @@ struct ValidatedLikelihoodWeights<'a> {
 }
 
 impl<'a> ValidatedLikelihoodWeights<'a> {
-    fn new(
-        values: &'a Array1<f64>,
-        context: &str,
-    ) -> Result<Self, LatentSurvivalError> {
+    fn new(values: &'a Array1<f64>, context: &str) -> Result<Self, LatentSurvivalError> {
         if let Some((row, &weight)) = values
             .iter()
             .enumerate()
@@ -223,10 +220,7 @@ fn require_finite_likelihood_scalar(value: f64, quantity: &str) -> Result<f64, S
     }
 }
 
-fn require_finite_likelihood_vector(
-    values: &Array1<f64>,
-    quantity: &str,
-) -> Result<(), String> {
+fn require_finite_likelihood_vector(values: &Array1<f64>, quantity: &str) -> Result<(), String> {
     if let Some((index, &value)) = values
         .iter()
         .enumerate()
@@ -239,13 +233,8 @@ fn require_finite_likelihood_vector(
     Ok(())
 }
 
-fn require_finite_likelihood_matrix(
-    values: &Array2<f64>,
-    quantity: &str,
-) -> Result<(), String> {
-    if let Some(((row, col), &value)) = values
-        .indexed_iter()
-        .find(|(_, value)| !value.is_finite())
+fn require_finite_likelihood_matrix(values: &Array2<f64>, quantity: &str) -> Result<(), String> {
+    if let Some(((row, col), &value)) = values.indexed_iter().find(|(_, value)| !value.is_finite())
     {
         return Err(format!(
             "latent likelihood accumulated {quantity}[{row},{col}] is not representable: {value:?}"
@@ -3645,12 +3634,8 @@ impl LatentSurvivalFamily {
                 &primary_gradient,
                 wi,
             )?;
-            let weighted_primary_hessian = checked_weighted_row_matrix(
-                wi,
-                &primary_hessian,
-                row_idx,
-                "primary Hessian",
-            )?;
+            let weighted_primary_hessian =
+                checked_weighted_row_matrix(wi, &primary_hessian, row_idx, "primary Hessian")?;
             self.add_pullback_primary_block_diagonals(
                 row_idx,
                 &weighted_primary_hessian,
@@ -3727,12 +3712,8 @@ impl LatentSurvivalFamily {
                     &primary_gradient,
                     wi,
                 )?;
-                let weighted_primary_hessian = checked_weighted_row_matrix(
-                    wi,
-                    &primary_hessian,
-                    row_idx,
-                    "primary Hessian",
-                )?;
+                let weighted_primary_hessian =
+                    checked_weighted_row_matrix(wi, &primary_hessian, row_idx, "primary Hessian")?;
                 self.add_pullback_primary_hessian(
                     &mut acc.hessian,
                     row_idx,
@@ -4227,19 +4208,76 @@ struct BinaryFromLogSurvival {
     ///     neg_Hess(log_lik) = grad_scale * neg_hessian + outer_scale * score²
     /// so by the chain rule this MUST equal `grad_scale` (= ℓ'). Keeping
     /// the two fields separate is purely for readability at call sites;
-    /// the `assert!` in [`binary_log_survival_scales`] enforces the
+    /// the `assert!` in [`binary_from_log_survival`] enforces the
     /// equality.
     neg_hess_scale: f64,
     /// -ℓ''(s). For event=1 this is +S/(1-S)²; for event=0 it is 0.
     outer_scale: f64,
-    /// ℓ''(s) — derivative of `grad_scale` w.r.t. s.
-    grad_scale_prime: f64,
-    /// ℓ'''(s) — second derivative of `grad_scale` w.r.t. s.
-    grad_scale_second: f64,
-    /// -ℓ'''(s) — derivative of `outer_scale` w.r.t. s.
-    outer_scale_prime: f64,
-    /// -ℓ''''(s) — second derivative of `outer_scale` w.r.t. s.
-    outer_scale_second: f64,
+}
+
+/// Exact binary log likelihood from a row log-survival `s`.
+///
+/// This value-only path deliberately does not evaluate derivatives: near
+/// `s = 0`, `log(1-exp(s))` can remain finite after one or more derivatives
+/// cease to be representable. A likelihood-only caller must not fail because
+/// of an output it did not request.
+fn binary_log_likelihood_from_log_survival(
+    log_survival: f64,
+    event: u8,
+) -> Result<f64, LatentSurvivalError> {
+    match event {
+        0 => {
+            if !log_survival.is_finite() || log_survival > 0.0 {
+                return Err(LatentSurvivalError::NumericalFailure {
+                    reason: format!(
+                        "latent-binary requires finite log survival <= 0 for a censored row, got {log_survival:?}"
+                    ),
+                });
+            }
+            Ok(log_survival)
+        }
+        1 => {
+            if !log_survival.is_finite() || log_survival >= 0.0 {
+                return Err(LatentSurvivalError::NumericalFailure {
+                    reason: format!(
+                        "latent-binary requires finite log survival < 0 for an observed event, got {log_survival:?}"
+                    ),
+                });
+            }
+            let event_prob = -log_survival.exp_m1();
+            if !(event_prob.is_finite() && event_prob > 0.0) {
+                return Err(LatentSurvivalError::NumericalFailure {
+                    reason: format!(
+                        "latent-binary event probability is not representable from log survival {log_survival:?}"
+                    ),
+                });
+            }
+            Ok(event_prob.ln())
+        }
+        _ => Err(LatentSurvivalError::InvalidDataset {
+            reason: format!("latent-binary requires event targets in {{0,1}}, got {event}"),
+        }),
+    }
+}
+
+/// Value and first log-survival derivative for the binary row transform.
+fn binary_from_log_survival_through_first(
+    log_survival: f64,
+    event: u8,
+) -> Result<(f64, f64), LatentSurvivalError> {
+    let log_lik = binary_log_likelihood_from_log_survival(log_survival, event)?;
+    if event == 0 {
+        return Ok((log_lik, 1.0));
+    }
+    let odds = (log_survival - log_lik).exp();
+    if !odds.is_finite() {
+        return Err(LatentSurvivalError::NumericalFailure {
+            reason: format!(
+                "latent-binary log-survival derivative order 1 is not representable at {log_survival:?}: {odds:?}"
+            ),
+        });
+    }
+    Ok((log_lik, -odds))
 }
 
 /// Analytic source of truth for derivatives of
@@ -4247,35 +4285,18 @@ struct BinaryFromLogSurvival {
 /// coordinate `s < 0`.
 ///
 /// `P = -expm1(s)` avoids cancellation when survival is near one. Writing the
-/// derivative algebra in terms of the odds `r = exp(s) / P` avoids the `P^2`,
-/// `P^3`, and `P^4` intermediates that previously underflowed before a finite
-/// ratio could be formed. Any genuinely unrepresentable derivative is rejected.
-fn binary_log_survival_scales(
-    log_survival: f64,
-) -> Result<(f64, f64, f64, f64, f64), LatentSurvivalError> {
-    if !log_survival.is_finite() || log_survival >= 0.0 {
-        return Err(LatentSurvivalError::NumericalFailure {
-            reason: format!(
-                "latent-binary requires finite log survival < 0 for an observed event, got {log_survival:?}"
-            ),
-        });
-    }
-    let event_prob = -log_survival.exp_m1();
-    if !(event_prob.is_finite() && event_prob > 0.0) {
-        return Err(LatentSurvivalError::NumericalFailure {
-            reason: format!(
-                "latent-binary event probability is not representable from log survival {log_survival:?}"
-            ),
-        });
-    }
-    let log_lik = event_prob.ln();
-    let odds = (log_survival - log_lik).exp();
+/// derivative algebra in terms of the odds `r = exp(s) / P` avoids the `P²`
+/// intermediate that previously underflowed before a finite ratio could be
+/// formed. This base routine computes only through order two; third/fourth
+/// derivatives are validated lazily by the directional-Hessian paths that
+/// consume them, so an unrepresentable unused fourth derivative cannot reject
+/// an otherwise representable likelihood, gradient, and Hessian.
+fn binary_log_survival_scales(log_survival: f64) -> Result<(f64, f64, f64), LatentSurvivalError> {
+    let (log_lik, ell_prime) = binary_from_log_survival_through_first(log_survival, 1)?;
+    let odds = -ell_prime;
     let one_plus_odds = 1.0 + odds;
-    let ell_prime = -odds;
     let ell_pp = -odds * one_plus_odds;
-    let ell_ppp = ell_pp * (1.0 + 2.0 * odds);
-    let ell_pppp = ell_pp * (1.0 + 6.0 * odds + 6.0 * odds * odds);
-    let scales = [log_lik, ell_prime, ell_pp, ell_ppp, ell_pppp];
+    let scales = [log_lik, ell_prime, ell_pp];
     if let Some((order, value)) = scales
         .iter()
         .enumerate()
@@ -4287,7 +4308,7 @@ fn binary_log_survival_scales(
             ),
         });
     }
-    Ok((log_lik, ell_prime, ell_pp, ell_ppp, ell_pppp))
+    Ok((log_lik, ell_prime, ell_pp))
 }
 
 fn binary_from_log_survival(
@@ -4297,14 +4318,10 @@ fn binary_from_log_survival(
     if event == 0 {
         // ℓ(s) = s ⇒ ℓ' = 1, ℓ'' = ℓ''' = ℓ'''' = 0.
         return Ok(BinaryFromLogSurvival {
-            log_lik: log_survival,
+            log_lik: binary_log_likelihood_from_log_survival(log_survival, event)?,
             grad_scale: 1.0,
             neg_hess_scale: 1.0,
             outer_scale: 0.0,
-            grad_scale_prime: 0.0,
-            grad_scale_second: 0.0,
-            outer_scale_prime: 0.0,
-            outer_scale_second: 0.0,
         });
     }
     if event != 1 {
@@ -4312,15 +4329,10 @@ fn binary_from_log_survival(
             reason: format!("latent-binary requires event targets in {{0,1}}, got {event}"),
         });
     }
-    let (log_lik, ell_prime, ell_pp, ell_ppp, ell_pppp) =
-        binary_log_survival_scales(log_survival)?;
+    let (log_lik, ell_prime, ell_pp) = binary_log_survival_scales(log_survival)?;
     let grad_scale = ell_prime;
     let neg_hess_scale = ell_prime; // coefficient on (-d²s/dβ²); equals ℓ'.
     let outer_scale = -ell_pp;
-    let grad_scale_prime = ell_pp;
-    let grad_scale_second = ell_ppp;
-    let outer_scale_prime = -ell_ppp;
-    let outer_scale_second = -ell_pppp;
     // The Newton accumulator at the call sites computes
     //     neg_Hess(log_lik) = neg_hess_scale * (-d²s/dβ²) + outer_scale * (ds/dβ)²
     // For this identity to hold by the chain rule, the coefficient on the
@@ -4338,11 +4350,55 @@ fn binary_from_log_survival(
         grad_scale,
         neg_hess_scale,
         outer_scale,
-        grad_scale_prime,
-        grad_scale_second,
-        outer_scale_prime,
-        outer_scale_second,
     })
+}
+
+/// Binary log-survival chain rule through third order. The extra scalar is
+/// `d outer_scale / ds = -ℓ'''(s)`. The derivative of `grad_scale` is already
+/// available exactly as `-base.outer_scale = ℓ''(s)`.
+fn binary_from_log_survival_through_third(
+    log_survival: f64,
+    event: u8,
+) -> Result<(BinaryFromLogSurvival, f64), LatentSurvivalError> {
+    let base = binary_from_log_survival(log_survival, event)?;
+    if event == 0 {
+        return Ok((base, 0.0));
+    }
+    let odds = -base.grad_scale;
+    let ell_pp = -base.outer_scale;
+    let ell_ppp = ell_pp * (1.0 + 2.0 * odds);
+    if !ell_ppp.is_finite() {
+        return Err(LatentSurvivalError::NumericalFailure {
+            reason: format!(
+                "latent-binary log-survival derivative order 3 is not representable at {log_survival:?}: {ell_ppp:?}"
+            ),
+        });
+    }
+    Ok((base, -ell_ppp))
+}
+
+/// Binary log-survival chain rule through fourth order. Returns
+/// `(base, -ℓ''', -ℓ'''')`, the first and second derivatives of
+/// `base.outer_scale` with respect to log survival.
+fn binary_from_log_survival_through_fourth(
+    log_survival: f64,
+    event: u8,
+) -> Result<(BinaryFromLogSurvival, f64, f64), LatentSurvivalError> {
+    let (base, outer_scale_prime) = binary_from_log_survival_through_third(log_survival, event)?;
+    if event == 0 {
+        return Ok((base, 0.0, 0.0));
+    }
+    let odds = -base.grad_scale;
+    let ell_pp = -base.outer_scale;
+    let ell_pppp = ell_pp * (1.0 + 6.0 * odds + 6.0 * odds * odds);
+    if !ell_pppp.is_finite() {
+        return Err(LatentSurvivalError::NumericalFailure {
+            reason: format!(
+                "latent-binary log-survival derivative order 4 is not representable at {log_survival:?}: {ell_pppp:?}"
+            ),
+        });
+    }
+    Ok((base, outer_scale_prime, -ell_pppp))
 }
 
 impl LatentBinaryFamily {
@@ -4667,18 +4723,21 @@ impl LatentBinaryFamily {
                     false,
                 )
                 .map_err(|reason| LatentSurvivalError::NumericalFailure { reason })?;
-            let binary = binary_from_log_survival(row_log_survival, self.event_target[row_idx])?;
+            let (_, grad_scale) = binary_from_log_survival_through_first(
+                row_log_survival,
+                self.event_target[row_idx],
+            )?;
             // ∂NLL/∂o_ch = −w · grad_scale · ∂(log S)/∂q_ch.
             entry[row_idx] = -checked_weighted_row_value(
                 wi,
-                binary.grad_scale * survival_gradient[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
+                grad_scale * survival_gradient[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
                 row_idx,
                 "binary entry-offset score",
             )
             .map_err(|reason| LatentSurvivalError::NumericalFailure { reason })?;
             exit[row_idx] = -checked_weighted_row_value(
                 wi,
-                binary.grad_scale * survival_gradient[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
+                grad_scale * survival_gradient[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
                 row_idx,
                 "binary exit-offset score",
             )
@@ -4735,8 +4794,10 @@ impl LatentBinaryFamily {
                 },
                 &direction,
             )?;
-            let binary =
-                binary_from_log_survival(row_jet.base.value(), self.event_target[row_idx])?;
+            let (binary, outer_scale_prime) = binary_from_log_survival_through_third(
+                row_jet.base.value(),
+                self.event_target[row_idx],
+            )?;
             let base_gradient = row_jet.base.g();
             let base_hessian = row_jet.base.h();
             let contracted_third = row_jet.contracted_third();
@@ -4774,15 +4835,13 @@ impl LatentBinaryFamily {
             let g_u = -survival_hessian.dot(&direction);
             let t_u = survival_gradient.dot(&direction);
             let mut primary = binary.grad_scale * third;
-            primary.scaled_add(binary.grad_scale_prime * t_u, &survival_hessian);
+            primary.scaled_add(-binary.outer_scale * t_u, &survival_hessian);
             for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
                 for b in 0..LATENT_SURVIVAL_PRIMARY_DIM {
-                    primary[[a, b]] += binary.outer_scale_prime
-                        * t_u
-                        * survival_gradient[a]
-                        * survival_gradient[b]
-                        + binary.outer_scale
-                            * (g_u[a] * survival_gradient[b] + survival_gradient[a] * g_u[b]);
+                    primary[[a, b]] +=
+                        outer_scale_prime * t_u * survival_gradient[a] * survival_gradient[b]
+                            + binary.outer_scale
+                                * (g_u[a] * survival_gradient[b] + survival_gradient[a] * g_u[b]);
                 }
             }
             let weighted_primary =
@@ -4839,8 +4898,11 @@ impl LatentBinaryFamily {
                 &direction_u,
                 &direction_v,
             )?;
-            let binary =
-                binary_from_log_survival(row_jet.base.value(), self.event_target[row_idx])?;
+            let (binary, outer_scale_prime, outer_scale_second) =
+                binary_from_log_survival_through_fourth(
+                    row_jet.base.value(),
+                    self.event_target[row_idx],
+                )?;
             let base_gradient = row_jet.base.g();
             let base_hessian = row_jet.base.h();
             let contracted_third_u = row_jet.eps.h();
@@ -4879,12 +4941,14 @@ impl LatentBinaryFamily {
             let t_u = survival_gradient.dot(&direction_u);
             let t_v = survival_gradient.dot(&direction_v);
             let l_uv = -direction_u.dot(&survival_hessian.dot(&direction_v));
-            let c_u = binary.grad_scale_prime * t_u;
-            let c_v = binary.grad_scale_prime * t_v;
-            let c_uv = binary.grad_scale_second * t_u * t_v + binary.grad_scale_prime * l_uv;
-            let o_u = binary.outer_scale_prime * t_u;
-            let o_v = binary.outer_scale_prime * t_v;
-            let o_uv = binary.outer_scale_second * t_u * t_v + binary.outer_scale_prime * l_uv;
+            let grad_scale_prime = -binary.outer_scale;
+            let grad_scale_second = -outer_scale_prime;
+            let c_u = grad_scale_prime * t_u;
+            let c_v = grad_scale_prime * t_v;
+            let c_uv = grad_scale_second * t_u * t_v + grad_scale_prime * l_uv;
+            let o_u = outer_scale_prime * t_u;
+            let o_v = outer_scale_prime * t_v;
+            let o_uv = outer_scale_second * t_u * t_v + outer_scale_prime * l_uv;
             let mut primary = binary.grad_scale * fourth;
             primary.scaled_add(c_u, &third_v);
             primary.scaled_add(c_v, &third_u);
@@ -5541,12 +5605,8 @@ impl CustomFamily for LatentBinaryFamily {
                 latent_survival_time_jet(&self.quadctx, &row, 0.0, mu[i], self.latent_sd)?;
             let t_entry = self.x_time_entry.row(i);
             let t_exit = self.x_time_exit.row(i);
-            let time_gradient_scale = checked_weighted_row_value(
-                wi,
-                binary.grad_scale,
-                i,
-                "binary time gradient scale",
-            )?;
+            let time_gradient_scale =
+                checked_weighted_row_value(wi, binary.grad_scale, i, "binary time gradient scale")?;
             for j in 0..p_time {
                 grad_time[j] += time_gradient_scale
                     * (time_jet.grad_entry * t_entry[j] + time_jet.grad_exit * t_exit[j]);
@@ -5557,22 +5617,14 @@ impl CustomFamily for LatentBinaryFamily {
                 i,
                 "binary entry Hessian scale",
             )?;
-            dense_outer_accumulate(
-                &mut hess_time,
-                entry_hessian_scale,
-                t_entry,
-            );
+            dense_outer_accumulate(&mut hess_time, entry_hessian_scale, t_entry);
             let exit_hessian_scale = checked_weighted_row_value(
                 wi,
                 binary.neg_hess_scale * time_jet.neg_hess_exit,
                 i,
                 "binary exit Hessian scale",
             )?;
-            dense_outer_accumulate(
-                &mut hess_time,
-                exit_hessian_scale,
-                t_exit,
-            );
+            dense_outer_accumulate(&mut hess_time, exit_hessian_scale, t_exit);
             if binary.outer_scale != 0.0 {
                 let entry_outer_scale = checked_weighted_row_value(
                     wi,
@@ -5580,22 +5632,14 @@ impl CustomFamily for LatentBinaryFamily {
                     i,
                     "binary entry outer Hessian scale",
                 )?;
-                dense_outer_accumulate(
-                    &mut hess_time,
-                    entry_outer_scale,
-                    t_entry,
-                );
+                dense_outer_accumulate(&mut hess_time, entry_outer_scale, t_entry);
                 let exit_outer_scale = checked_weighted_row_value(
                     wi,
                     binary.outer_scale * time_jet.grad_exit * time_jet.grad_exit,
                     i,
                     "binary exit outer Hessian scale",
                 )?;
-                dense_outer_accumulate(
-                    &mut hess_time,
-                    exit_outer_scale,
-                    t_exit,
-                );
+                dense_outer_accumulate(&mut hess_time, exit_outer_scale, t_exit);
                 let cross_outer_scale = checked_weighted_row_value(
                     wi,
                     binary.outer_scale * time_jet.grad_entry * time_jet.grad_exit,
@@ -5645,10 +5689,13 @@ impl CustomFamily for LatentBinaryFamily {
             let survival_jet =
                 LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], self.latent_sd)
                     .map_err(|e| format!("LatentBinaryFamily row {i}: {e}"))?;
-            let binary = binary_from_log_survival(survival_jet.log_lik, self.event_target[i])?;
+            let binary_log_lik = binary_log_likelihood_from_log_survival(
+                survival_jet.log_lik,
+                self.event_target[i],
+            )?;
             ll.add(checked_weighted_row_value(
                 wi,
-                binary.log_lik,
+                binary_log_lik,
                 i,
                 "binary log likelihood",
             )?);
@@ -6069,6 +6116,270 @@ mod tests {
         ]
     }
 
+    fn assert_scalar_is_scaled(got: f64, unweighted: f64, scale: f64, quantity: &str) {
+        let expected = unweighted * scale;
+        let tolerance = 128.0 * f64::EPSILON * expected.abs().max(f64::MIN_POSITIVE);
+        assert!(
+            (got - expected).abs() <= tolerance,
+            "{quantity} did not scale with its positive row weight: got={got:?}, expected={expected:?}, unweighted={unweighted:?}, scale={scale:?}, tolerance={tolerance:?}"
+        );
+    }
+
+    fn assert_vector_is_scaled(
+        got: &Array1<f64>,
+        unweighted: &Array1<f64>,
+        scale: f64,
+        quantity: &str,
+    ) {
+        assert_eq!(got.len(), unweighted.len());
+        for (index, (&actual, &base)) in got.iter().zip(unweighted.iter()).enumerate() {
+            assert_scalar_is_scaled(actual, base, scale, &format!("{quantity}[{index}]"));
+        }
+    }
+
+    fn assert_matrix_is_scaled(
+        got: &Array2<f64>,
+        unweighted: &Array2<f64>,
+        scale: f64,
+        quantity: &str,
+    ) {
+        assert_eq!(got.dim(), unweighted.dim());
+        for ((row, col), &actual) in got.indexed_iter() {
+            assert_scalar_is_scaled(
+                actual,
+                unweighted[[row, col]],
+                scale,
+                &format!("{quantity}[{row},{col}]"),
+            );
+        }
+    }
+
+    #[test]
+    fn binary_log_survival_math_is_cancellation_free_and_derivative_order_aware() {
+        let near_one_survival = -1.0e-16;
+        let expected = (-near_one_survival.exp_m1()).ln();
+        let got = binary_log_likelihood_from_log_survival(near_one_survival, 1)
+            .expect("near-boundary binary event likelihood");
+        assert_eq!(got.to_bits(), expected.to_bits());
+
+        // At s=-1e-100 the value, score, Hessian, and third derivative are
+        // representable, while the fourth derivative is mathematically beyond
+        // f64 range. Value/order-2 callers must succeed; only the order-4 path
+        // is allowed to refuse the unrepresentable result.
+        let extreme = -1.0e-100;
+        assert!(
+            binary_log_likelihood_from_log_survival(extreme, 1)
+                .expect("value remains representable")
+                .is_finite()
+        );
+        let (_, first) = binary_from_log_survival_through_first(extreme, 1)
+            .expect("first derivative remains representable");
+        assert!(first.is_finite());
+        let second =
+            binary_from_log_survival(extreme, 1).expect("second derivative remains representable");
+        assert!(second.outer_scale.is_finite());
+        let (_, third) = binary_from_log_survival_through_third(extreme, 1)
+            .expect("third derivative remains representable");
+        assert!(third.is_finite());
+        let fourth = binary_from_log_survival_through_fourth(extreme, 1)
+            .expect_err("unrepresentable fourth derivative must be explicit");
+        assert!(
+            fourth.to_string().contains("derivative order 4"),
+            "unexpected fourth-derivative error: {fourth}"
+        );
+    }
+
+    #[test]
+    fn latent_likelihood_preserves_every_positive_weight_and_scales_all_derivatives() {
+        // This power-of-two scale is far below the deleted 1e-12 omission
+        // threshold. Multiplication by it changes only the exponent, making
+        // value/gradient/Hessian scaling a sharp regression oracle rather than
+        // a loose floating-point approximation.
+        let tiny_normal = 2.0_f64.powi(-48);
+
+        let mut survival_unit = learnable_sigma_test_family();
+        survival_unit.weights = array![1.0, 0.0];
+        let survival_states = latent_survival_states_from_joint_beta(
+            &survival_unit,
+            &learnable_sigma_test_joint_beta(),
+        );
+        let (survival_ll, survival_gradient, survival_hessian) = survival_unit
+            .evaluate_exact_newton_joint_dense(&survival_states)
+            .expect("unit-weight latent-survival evaluation");
+        let mut survival_tiny = survival_unit.clone();
+        survival_tiny.weights[0] = tiny_normal;
+        let (tiny_survival_ll, tiny_survival_gradient, tiny_survival_hessian) = survival_tiny
+            .evaluate_exact_newton_joint_dense(&survival_states)
+            .expect("tiny-positive latent-survival evaluation");
+        assert_scalar_is_scaled(
+            tiny_survival_ll,
+            survival_ll,
+            tiny_normal,
+            "survival log likelihood",
+        );
+        assert_vector_is_scaled(
+            &tiny_survival_gradient,
+            &survival_gradient,
+            tiny_normal,
+            "survival gradient",
+        );
+        assert_matrix_is_scaled(
+            &tiny_survival_hessian,
+            &survival_hessian,
+            tiny_normal,
+            "survival Hessian",
+        );
+
+        let mut binary_unit = fixed_sigma_binary_test_family();
+        binary_unit.weights = array![1.0, 0.0];
+        let binary_beta = array![0.15, 0.25, 0.1, -0.15];
+        let binary_states = latent_binary_states_from_joint_beta(&binary_unit, &binary_beta);
+        let (binary_ll, binary_gradient, binary_hessian) = binary_unit
+            .evaluate_exact_newton_joint_dense(&binary_states)
+            .expect("unit-weight latent-binary evaluation");
+        let mut binary_tiny = binary_unit.clone();
+        binary_tiny.weights[0] = tiny_normal;
+        let (tiny_binary_ll, tiny_binary_gradient, tiny_binary_hessian) = binary_tiny
+            .evaluate_exact_newton_joint_dense(&binary_states)
+            .expect("tiny-positive latent-binary evaluation");
+        assert_scalar_is_scaled(
+            tiny_binary_ll,
+            binary_ll,
+            tiny_normal,
+            "binary log likelihood",
+        );
+        assert_vector_is_scaled(
+            &tiny_binary_gradient,
+            &binary_gradient,
+            tiny_normal,
+            "binary gradient",
+        );
+        assert_matrix_is_scaled(
+            &tiny_binary_hessian,
+            &binary_hessian,
+            tiny_normal,
+            "binary Hessian",
+        );
+
+        // A largest-subnormal sample weight remains a real likelihood row.
+        // Its single-row log-likelihood product is representable and must not
+        // collapse to the all-zero dormant-row result.
+        let largest_subnormal = f64::from_bits((1_u64 << 52) - 1);
+        survival_tiny.weights[0] = largest_subnormal;
+        let subnormal_survival_ll = survival_tiny
+            .log_likelihood_only(&survival_states)
+            .expect("subnormal latent-survival likelihood");
+        assert_ne!(subnormal_survival_ll, 0.0);
+        assert_scalar_is_scaled(
+            subnormal_survival_ll,
+            survival_ll,
+            largest_subnormal,
+            "subnormal survival log likelihood",
+        );
+        binary_tiny.weights[0] = largest_subnormal;
+        let subnormal_binary_ll = binary_tiny
+            .log_likelihood_only(&binary_states)
+            .expect("subnormal latent-binary likelihood");
+        assert_ne!(subnormal_binary_ll, 0.0);
+        assert_scalar_is_scaled(
+            subnormal_binary_ll,
+            binary_ll,
+            largest_subnormal,
+            "subnormal binary log likelihood",
+        );
+
+        // Even the smallest positive subnormal survives when the mathematical
+        // product is representable. If it is not representable, the checked
+        // scaling primitive refuses it explicitly instead of converting the
+        // row into a semantic zero.
+        let smallest_subnormal = f64::from_bits(1);
+        assert_eq!(
+            checked_weighted_row_value(smallest_subnormal, 1.0, 0, "test")
+                .expect("representable smallest-subnormal product")
+                .to_bits(),
+            smallest_subnormal.to_bits()
+        );
+        let underflow = checked_weighted_row_value(smallest_subnormal, 0.25, 0, "test")
+            .expect_err("non-zero underflow must be explicit");
+        assert!(
+            underflow.contains("underflowed"),
+            "unexpected error: {underflow}"
+        );
+    }
+
+    #[test]
+    fn zero_weight_likelihood_rows_are_dormant_before_response_and_predictor_access() {
+        let mut survival = learnable_sigma_test_family();
+        survival.weights = array![1.0, 0.0];
+        let beta = learnable_sigma_test_joint_beta();
+        let states = latent_survival_states_from_joint_beta(&survival, &beta);
+        let expected = survival
+            .evaluate_exact_newton_joint_dense(&states)
+            .expect("clean zero-weight survival reference");
+
+        survival.event_target[1] = 17;
+        survival.unloaded_mass_entry[1] = f64::NAN;
+        survival.unloaded_mass_exit[1] = f64::NEG_INFINITY;
+        survival.unloaded_mass_right[1] = -1.0;
+        survival.unloaded_hazard_exit[1] = f64::NAN;
+        survival.time_offset_right[1] = f64::NAN;
+        survival.x_time_right.row_mut(1).fill(f64::NAN);
+        let mut dormant_states = states.clone();
+        let n = survival.event_target.len();
+        dormant_states[LatentSurvivalFamily::BLOCK_TIME].eta[1] = f64::NAN;
+        dormant_states[LatentSurvivalFamily::BLOCK_TIME].eta[n + 1] = f64::INFINITY;
+        dormant_states[LatentSurvivalFamily::BLOCK_TIME].eta[2 * n + 1] = f64::NEG_INFINITY;
+        dormant_states[LatentSurvivalFamily::BLOCK_MEAN].eta[1] = f64::NAN;
+        let got = survival
+            .evaluate_exact_newton_joint_dense(&dormant_states)
+            .expect("zero-weight survival row must not inspect dormant response/predictors");
+        assert_eq!(got, expected);
+
+        let mut binary = fixed_sigma_binary_test_family();
+        binary.weights = array![1.0, 0.0];
+        let binary_beta = array![0.15, 0.25, 0.1, -0.15];
+        let binary_states = latent_binary_states_from_joint_beta(&binary, &binary_beta);
+        let expected = binary
+            .evaluate_exact_newton_joint_dense(&binary_states)
+            .expect("clean zero-weight binary reference");
+        binary.event_target[1] = 17;
+        binary.unloaded_mass_entry[1] = f64::NAN;
+        binary.unloaded_mass_exit[1] = f64::NEG_INFINITY;
+        let mut dormant_binary_states = binary_states.clone();
+        let n = binary.event_target.len();
+        dormant_binary_states[LatentBinaryFamily::BLOCK_TIME].eta[1] = f64::NAN;
+        dormant_binary_states[LatentBinaryFamily::BLOCK_TIME].eta[n + 1] = f64::INFINITY;
+        dormant_binary_states[LatentBinaryFamily::BLOCK_MEAN].eta[1] = f64::NAN;
+        let got = binary
+            .evaluate_exact_newton_joint_dense(&dormant_binary_states)
+            .expect("zero-weight binary row must not inspect dormant response/predictors");
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn invalid_likelihood_weight_preflight_is_atomic_and_precedes_row_evaluation() {
+        let mut family = fixed_sigma_binary_test_family();
+        let beta = array![0.15, 0.25, 0.1, -0.15];
+        let mut states = latent_binary_states_from_joint_beta(&family, &beta);
+        // If row evaluation ran first, this active row would fail on its NaN
+        // predictor before the invalid second weight was discovered.
+        states[LatentBinaryFamily::BLOCK_MEAN].eta[0] = f64::NAN;
+        for invalid in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            family.weights = array![1.0, invalid];
+            let error = family
+                .evaluate_exact_newton_joint_dense(&states)
+                .expect_err("invalid likelihood weight must refuse the whole call");
+            assert!(
+                error.contains("latent-binary row 2 has invalid likelihood weight"),
+                "weight preflight did not win atomically for {invalid:?}: {error}"
+            );
+            assert!(
+                !error.contains("predictor"),
+                "row evaluation ran before weight preflight for {invalid:?}: {error}"
+            );
+        }
+    }
+
     // --- shared latent-interval validation engine: parity / contract tests ---
 
     use crate::survival::location_scale::{TimeBlockInput, TimeBlockMonotonicity};
@@ -6305,6 +6616,46 @@ mod tests {
                 .to_string()
                 .starts_with("latent-survival time block column mismatch"),
             "unexpected survival time-block message: {surv_time_err}"
+        );
+    }
+
+    #[test]
+    fn latent_interval_validation_treats_exact_zero_rows_as_response_dormant() {
+        let n = 2;
+        let data = Array2::<f64>::zeros((n, 1));
+
+        let mut survival = valid_survival_spec(n, 1);
+        survival.weights[0] = 0.0;
+        survival.age_entry[0] = f64::NAN;
+        survival.age_exit[0] = f64::NEG_INFINITY;
+        survival.event_target[0] = 19;
+        survival.unloaded_mass_entry[0] = f64::NAN;
+        survival.unloaded_mass_exit[0] = -1.0;
+        survival.unloaded_hazard_exit[0] = f64::INFINITY;
+        validate_latent_survival_inputs(data.view(), &survival, &loaded_frailty())
+            .expect("zero-weight survival response row must be dormant");
+
+        let mut binary = valid_binary_spec(n, 1);
+        binary.weights[0] = 0.0;
+        binary.age_entry[0] = f64::NAN;
+        binary.age_exit[0] = f64::NEG_INFINITY;
+        binary.event_target[0] = 19;
+        binary.unloaded_mass_entry[0] = f64::NAN;
+        binary.unloaded_mass_exit[0] = -1.0;
+        validate_latent_binary_inputs(data.view(), &binary, &loaded_frailty())
+            .expect("zero-weight binary response row must be dormant");
+
+        // The weight scan is whole-vector and precedes response geometry. A
+        // later invalid weight therefore wins deterministically over the bad
+        // active response in row 1.
+        survival.weights = array![1.0, f64::NAN];
+        let error = validate_latent_survival_inputs(data.view(), &survival, &loaded_frailty())
+            .expect_err("non-finite weight must atomically refuse validation");
+        assert!(
+            error
+                .to_string()
+                .contains("latent-survival row 2 has invalid weight"),
+            "unexpected atomic preflight error: {error}"
         );
     }
 

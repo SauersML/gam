@@ -739,7 +739,7 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                     family.clone(),
                     y.view(),
                     reportweights.view(),
-                );
+                )?;
                 for st in &summary.smooth_terms {
                     if let Some(ord) = st.continuous_order.as_ref() {
                         let status = match ord.status {

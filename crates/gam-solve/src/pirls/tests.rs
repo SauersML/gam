@@ -12,20 +12,20 @@ mod tests {
     use super::loop_driver::{default_beta_guess_external, exact_lambdas_from_rho};
     use super::reweight::madsen_lm_accept_factor;
     use super::{
-        DENSE_OUTER_MAX_P, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
+        DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily,
         WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet,
         calculate_deviance_from_eta, calculate_loglikelihood,
-        calculate_loglikelihood_omitting_constants_from_eta, compute_constraint_kkt_diagnostics,
-        DevianceEtaRow, compute_observed_hessian_curvature_arrays,
+        calculate_loglikelihood_omitting_constants_from_eta, calculate_null_deviance,
+        compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays,
         deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale,
-        fit_model_for_fixed_rho,
-        observed_weight_dispatch, observed_weight_noncanonical, select_active_set_release,
-        should_log_pirls_decision_summary, should_use_sparse_native_pirls,
-        solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
-        stable_finite_signed_sum, update_glmvectors, variance_jet_for_weight_family,
-        write_gamma_log_working_state, write_negative_binomial_log_working_state,
-        write_poisson_log_working_state, write_tweedie_log_working_state,
+        fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical,
+        select_active_set_release, should_log_pirls_decision_summary,
+        should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
+        solve_newton_directionwith_lower_bounds, stable_finite_signed_sum, update_glmvectors,
+        variance_jet_for_weight_family, write_gamma_log_working_state,
+        write_negative_binomial_log_working_state, write_poisson_log_working_state,
+        write_tweedie_log_working_state,
     };
     use crate::active_set;
     use crate::estimate::EstimationError;
@@ -1836,6 +1836,58 @@ mod tests {
     }
 
     #[test]
+    fn null_deviance_preserves_boundaries_dormancy_and_beta_mle_geometry() {
+        let poisson = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            InverseLink::Standard(StandardLink::Log),
+        ));
+        let zeros = array![0.0, 0.0, f64::NAN];
+        let dormant = array![1.0, 2.0, 0.0];
+        assert_eq!(
+            calculate_null_deviance(zeros.view(), &poisson, dormant.view()).unwrap(),
+            0.0,
+            "an all-zero positive-weight Poisson sample has a genuine boundary null deviance"
+        );
+        let negative = array![1.0, -1.0, 0.0];
+        assert!(calculate_null_deviance(zeros.view(), &poisson, negative.view()).is_err());
+
+        let phi = 7.0;
+        let beta = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::new(
+                ResponseFamily::Beta { phi },
+                InverseLink::Standard(StandardLink::Logit),
+            ),
+            scale: gam_problem::LikelihoodScaleMetadata::EstimatedBetaPhi { phi },
+        };
+        let y = array![0.01, 0.2, 0.85];
+        let w = array![1.0, 3.0, 0.5];
+        let exact_null = calculate_null_deviance(y.view(), &beta, w.view()).unwrap();
+        let arithmetic_mean = y
+            .iter()
+            .zip(w.iter())
+            .map(|(&response, &weight)| response * weight)
+            .sum::<f64>()
+            / w.sum();
+        let arithmetic_eta = array![
+            arithmetic_mean.ln() - (-arithmetic_mean).ln_1p(),
+            arithmetic_mean.ln() - (-arithmetic_mean).ln_1p(),
+            arithmetic_mean.ln() - (-arithmetic_mean).ln_1p(),
+        ];
+        let arithmetic_deviance = calculate_deviance_from_eta(
+            y.view(),
+            &arithmetic_eta,
+            &beta,
+            &InverseLink::Standard(StandardLink::Logit),
+            w.view(),
+        )
+        .unwrap();
+        assert!(
+            exact_null < arithmetic_deviance,
+            "the fixed-precision Beta intercept MLE is not generally the weighted arithmetic mean"
+        );
+    }
+
+    #[test]
     fn deviance_eta_row_value_and_score_are_one_surface_for_every_glm_family() {
         let cases = [
             (ResponseFamily::Gaussian, StandardLink::Identity, -0.4, 0.7),
@@ -2080,14 +2132,8 @@ mod tests {
 
         let eta = mu.mapv(f64::ln);
         let inverse_link = InverseLink::Standard(StandardLink::Log);
-        let dev = calculate_deviance_from_eta(
-            y.view(),
-            &eta,
-            &likelihood,
-            &inverse_link,
-            w.view(),
-        )
-        .expect("Gamma eta deviance must be representable");
+        let dev = calculate_deviance_from_eta(y.view(), &eta, &likelihood, &inverse_link, w.view())
+            .expect("Gamma eta deviance must be representable");
 
         let sum_unit: f64 = w
             .iter()
@@ -2141,14 +2187,8 @@ mod tests {
 
         let eta = mu.mapv(f64::ln);
         let inverse_link = InverseLink::Standard(StandardLink::Log);
-        let dev = calculate_deviance_from_eta(
-            y.view(),
-            &eta,
-            &likelihood,
-            &inverse_link,
-            w.view(),
-        )
-        .expect("Tweedie eta deviance must be representable");
+        let dev = calculate_deviance_from_eta(y.view(), &eta, &likelihood, &inverse_link, w.view())
+            .expect("Tweedie eta deviance must be representable");
 
         // Unscaled reference: 2·Σ wᵢ·d(yᵢ, μᵢ) with the Tweedie unit deviance
         // `d = y^{2-p}/((1-p)(2-p)) - y·μ^{1-p}/(1-p) + μ^{2-p}/(2-p)`.

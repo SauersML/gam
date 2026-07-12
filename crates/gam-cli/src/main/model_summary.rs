@@ -492,7 +492,8 @@ mod per_term_edf_tests {
             LikelihoodSpec::gaussian_identity(),
             y.view(),
             weights.view(),
-        );
+        )
+        .expect("model summary must resolve its exact null likelihood");
 
         let edf_total = std_fit
             .fit

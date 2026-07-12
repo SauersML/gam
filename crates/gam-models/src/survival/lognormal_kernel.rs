@@ -673,10 +673,7 @@ impl LogKernelSumJet {
         let mut log_bundles: Vec<(f64, LogLognormalKernelBundle)> = Vec::with_capacity(2);
         let mut overall_mode = IntegratedExpectationMode::ExactClosedForm;
         for term in terms {
-            if !log_bundles
-                .iter()
-                .any(|(m, _)| *m == term.m)
-            {
+            if !log_bundles.iter().any(|(m, _)| *m == term.m) {
                 let b = log_kernel_bundle(quadctx, term.m, mu, sigma, max_k_needed)?;
                 overall_mode = worst_mode(overall_mode, b.mode);
                 log_bundles.push((term.m, b));
@@ -684,11 +681,7 @@ impl LogKernelSumJet {
         }
 
         let get_lb = |m: f64| -> &LogLognormalKernelBundle {
-            &log_bundles
-                .iter()
-                .find(|(bm, _)| *bm == m)
-                .unwrap()
-                .1
+            &log_bundles.iter().find(|(bm, _)| *bm == m).unwrap().1
         };
 
         // Per-term: log magnitude, sign, and ratio jet.
@@ -1163,12 +1156,11 @@ impl LatentSurvivalRowJet {
         sigma: f64,
         row: &LatentSurvivalRow,
     ) -> Result<Self, EstimationError> {
-        let unloaded_offset =
-            if row.mass_unloaded_exit != 0.0 || row.mass_unloaded_entry != 0.0 {
-                -row.mass_unloaded_exit + row.mass_unloaded_entry
-            } else {
-                0.0
-            };
+        let unloaded_offset = if row.mass_unloaded_exit != 0.0 || row.mass_unloaded_entry != 0.0 {
+            -row.mass_unloaded_exit + row.mass_unloaded_entry
+        } else {
+            0.0
+        };
         let num = exact_event_kernel_jet(quadctx, row, mu, sigma)?;
 
         if row.mass_entry > 0.0 {

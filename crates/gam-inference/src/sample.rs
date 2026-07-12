@@ -730,7 +730,7 @@ fn sample_standard(
             penalty_matrix: penalty.view(),
             mode: fit.beta.view(),
             hessian: explicit_fit_hessian_for_whitening(&fit, p, "saved standard model")?.view(),
-            gamma_shape: fit.likelihood_scale.gamma_shape(),
+            likelihood_scale: fit.likelihood_scale,
             // Forward the saved training dispersion so NUTS whitening uses the
             // posterior scale selected at fit time; fixed-scale families remain
             // a no-op.

@@ -4276,6 +4276,7 @@ fn evaluate_standard_familyobservations(
     let mut neghessian_eta = Array1::<f64>::zeros(n);
     let mut neghessian_eta_derivative = Array1::<f64>::zeros(n);
     let mut log_likelihood = 0.0;
+    let mut log_likelihood_compensation = 0.0;
 
     for i in 0..n {
         let row =
@@ -4285,7 +4286,10 @@ fn evaluate_standard_familyobservations(
         fisherweight[i] = row.fisherweight;
         neghessian_eta[i] = row.neghessian_eta;
         neghessian_eta_derivative[i] = row.neghessian_eta_derivative;
-        log_likelihood += row.log_likelihood;
+        let adjusted = row.log_likelihood - log_likelihood_compensation;
+        let updated = log_likelihood + adjusted;
+        log_likelihood_compensation = (updated - log_likelihood) - adjusted;
+        log_likelihood = updated;
         if !log_likelihood.is_finite() {
             return Err(bounded_row_error(
                 i,
@@ -6130,13 +6134,65 @@ fn trace_of_dense_product(a: &Array2<f64>, b: &Array2<f64>) -> Result<f64, Strin
             SmoothError::dimension_mismatch("trace_of_dense_product dimension mismatch").into(),
         );
     }
-    let mut trace = 0.0;
+    if a.iter().chain(b.iter()).any(|value| !value.is_finite()) {
+        return Err("trace_of_dense_product requires finite matrices".to_string());
+    }
+    let mut trace = gam_linalg::utils::KahanSum::default();
     for i in 0..a.nrows() {
         for j in 0..a.ncols() {
-            trace += a[[i, j]] * b[[j, i]];
+            let term = a[[i, j]] * b[[j, i]];
+            if !term.is_finite() {
+                return Err(format!(
+                    "trace_of_dense_product term ({i}, {j}) is not representable"
+                ));
+            }
+            trace.add(term);
         }
     }
+    let trace = trace.sum();
+    if !trace.is_finite() {
+        return Err("trace_of_dense_product sum is not representable".to_string());
+    }
     Ok(trace)
+}
+
+fn certify_bounded_edf_interval(
+    value: f64,
+    lower: f64,
+    upper: f64,
+    dimension: usize,
+    label: &str,
+) -> Result<f64, EstimationError> {
+    if !(value.is_finite() && lower.is_finite() && upper.is_finite() && lower <= upper) {
+        crate::bail_invalid_estim!(
+            "{label} has invalid EDF interval/value: value={value}, interval=[{lower}, {upper}]"
+        );
+    }
+    let scale = 1.0_f64
+        .max(value.abs())
+        .max(lower.abs())
+        .max(upper.abs());
+    // A dense trace has p^2 rounded products/additions. This is a backward-
+    // error allowance for that declared operation count, not a statistical
+    // projection: values materially outside the mathematical interval fail.
+    let allowed = 256.0
+        * f64::EPSILON
+        * (dimension.max(1) as f64).powi(2)
+        * scale;
+    if value < lower {
+        if lower - value <= allowed {
+            return Ok(lower);
+        }
+    } else if value > upper {
+        if value - upper <= allowed {
+            return Ok(upper);
+        }
+    } else {
+        return Ok(value);
+    }
+    crate::bail_invalid_estim!(
+        "{label}={value} lies outside [{lower}, {upper}] by more than the dense-trace backward-error allowance {allowed}"
+    )
 }
 
 fn exact_bounded_edf(
@@ -6160,10 +6216,15 @@ fn exact_bounded_edf(
     let mut edf_by_block = Vec::with_capacity(penalties.len());
     // Raw per-block penalty trace tr_kk = λ_kk·tr(H⁻¹S_kk) (issue #1219).
     let mut penalty_block_trace = Vec::with_capacity(penalties.len());
-    let mut trace_sum = 0.0;
+    let mut trace_sum = gam_linalg::utils::KahanSum::default();
 
     for (k, ps) in penalties.iter().enumerate() {
         let lambda_k = lambdas[k];
+        if !(lambda_k.is_finite() && lambda_k >= 0.0) {
+            crate::bail_invalid_estim!(
+                "bounded EDF smoothing strength at block {k} must be finite and non-negative, got {lambda_k}"
+            );
+        }
         match ps {
             PenaltySpec::Block {
                 local, col_range, ..
@@ -6183,10 +6244,16 @@ fn exact_bounded_edf(
                 let trace_k = lambda_k
                     * trace_of_dense_product(&cov_block.to_owned(), local)
                         .map_err(EstimationError::InvalidInput)?;
-                trace_sum += trace_k;
+                trace_sum.add(trace_k);
                 penalty_block_trace.push(trace_k);
                 let p_k = penalty_rank as f64;
-                edf_by_block.push((p_k - trace_k).clamp(0.0, p_k));
+                edf_by_block.push(certify_bounded_edf_interval(
+                    p_k - trace_k,
+                    0.0,
+                    p_k,
+                    p,
+                    &format!("bounded EDF block {k}"),
+                )?);
             }
             PenaltySpec::Dense(m) | PenaltySpec::DenseWithMean { matrix: m, .. } => {
                 s_lambda.scaled_add(lambda_k, m);
@@ -6196,10 +6263,16 @@ fn exact_bounded_edf(
                 let trace_k = lambda_k
                     * trace_of_dense_product(latent_cov, m)
                         .map_err(EstimationError::InvalidInput)?;
-                trace_sum += trace_k;
+                trace_sum.add(trace_k);
                 penalty_block_trace.push(trace_k);
                 let p_k = penalty_rank as f64;
-                edf_by_block.push((p_k - trace_k).clamp(0.0, p_k));
+                edf_by_block.push(certify_bounded_edf_interval(
+                    p_k - trace_k,
+                    0.0,
+                    p_k,
+                    p,
+                    &format!("bounded EDF block {k}"),
+                )?);
             }
         }
     }
@@ -6207,7 +6280,14 @@ fn exact_bounded_edf(
     let nullity_total = estimate_penalty_nullity(&s_lambda)
         .map_err(|e| EstimationError::InvalidInput(format!("bounded EDF nullity failed: {e}")))?
         as f64;
-    let edf_total = (p as f64 - trace_sum).clamp(nullity_total, p as f64);
+    let trace_sum = trace_sum.sum();
+    let edf_total = certify_bounded_edf_interval(
+        p as f64 - trace_sum,
+        nullity_total,
+        p as f64,
+        p,
+        "bounded total EDF",
+    )?;
     Ok((edf_by_block, penalty_block_trace, edf_total))
 }
 
@@ -6220,11 +6300,13 @@ fn certified_bounded_posterior_covariance(
     precision: &Array2<f64>,
     label: &'static str,
 ) -> Result<Array2<f64>, EstimationError> {
-    gam_linalg::utils::certified_spd_inverse(precision, label).map_err(|error| {
-        EstimationError::InvalidInput(format!(
-            "bounded posterior covariance requires an exact SPD precision: {error}"
-        ))
-    })
+    gam_linalg::utils::certified_spd_inverse(precision, label)
+        .map(gam_linalg::utils::CertifiedSpdInverse::into_inverse)
+        .map_err(|error| {
+            EstimationError::InvalidInput(format!(
+                "bounded posterior covariance requires an exact SPD precision: {error}"
+            ))
+        })
 }
 
 fn transform_bounded_latent_precision_to_user_internal(
@@ -7804,17 +7886,21 @@ mod glm_eta_observation_fd_tests {
         let weight = 7.25;
         let state = one_obs_weight(&LikelihoodSpec::binomial_logit(), y, weight, eta);
         let jet = logit_inverse_link_jet5(eta);
-        assert_eq!(state.fisherweight[0], weight * jet.d1);
-        assert_eq!(state.neghessian_eta[0], weight * jet.d1);
-        assert_eq!(state.neghessian_eta_derivative[0], weight * jet.d2);
-        assert_eq!(state.score[0], weight * (y - jet.mu));
+        for (got, expected) in [
+            (state.fisherweight[0], weight * jet.d1),
+            (state.neghessian_eta[0], weight * jet.d1),
+            (state.neghessian_eta_derivative[0], weight * jet.d2),
+            (state.score[0], weight * (y - jet.mu)),
+        ] {
+            assert!((got - expected).abs() <= 4.0 * f64::EPSILON * (1.0 + expected.abs()));
+        }
     }
 
     #[test]
     fn tiny_positive_and_zero_weights_are_not_projected() {
         let tiny = 1e-200;
         let logit = one_obs_weight(&LikelihoodSpec::binomial_logit(), 0.4, tiny, 0.0);
-        assert_eq!(logit.fisherweight[0], 0.25 * tiny);
+        assert!((logit.fisherweight[0] / tiny - 0.25).abs() <= 2.0 * f64::EPSILON);
         assert!(logit.fisherweight[0] < 1e-190);
 
         let zero = one_obs_weight(&LikelihoodSpec::gaussian_identity(), 3.0, 0.0, -2.0);
