@@ -2372,6 +2372,101 @@ impl SurvivalMarginalSlopeFamily {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// #932 nested-dual ORACLE instantiation of the single-source flex geometry.
+//
+// `gam_math::nested_dual::Dual22 = Dual2<Dual2<f64>>` carries a truncation-FREE
+// forward-over-forward derivative in TWO independent scalar directions `(s, t)`,
+// each to 2nd order (2 + 2 = 4th-order bidirectional). Instantiating the SAME
+// `flex_timepoint_inputs_generic` geometry over it — with every primary seeded
+// as `base_i + s·d1_i + t·d2_i` — makes the `∂²_s ∂²_t` channel (`channels()[8]`)
+// equal to the full arbitrary-weight bidirectional contraction
+//   Σ_abcd ℓ_abcd · d1_a d1_b d2_c d2_d
+// via a DIFFERENT composition ordering than the production p-primary `Jet4`.
+// This is the truncation-free replacement for the flex jet4 bidirectional's
+// scalar-FD sanity gate (the last FD-limited seam in the #932 tower). It is an
+// ORACLE only — never used on the production sweep — so it lives beside, not
+// inside, the p-primary jet types.
+use gam_math::nested_dual::{Dual22, JetField};
+
+impl FlexJet for Dual22 {
+    // The 2+2 nesting auto-zeros `s³`/`t³`, so the highest represented order in
+    // EITHER direction is 2 — but the mixed tower reaches `∂²_s ∂²_t` (order 4).
+    // `base_moment_jets`' `e^{−Δq}` truncation stops at `(−Δq)^{ORDER}`; ORDER=4
+    // makes it exact for every channel this dual represents.
+    const ORDER: usize = 4;
+    #[inline]
+    fn value(&self) -> f64 {
+        JetField::value_f64(self)
+    }
+    #[inline]
+    fn add(&self, o: &Self) -> Self {
+        JetField::add(self, o)
+    }
+    #[inline]
+    fn sub(&self, o: &Self) -> Self {
+        JetField::sub(self, o)
+    }
+    #[inline]
+    fn mul(&self, o: &Self) -> Self {
+        JetField::mul(self, o)
+    }
+    #[inline]
+    fn scale(&self, s: f64) -> Self {
+        JetField::scale(self, s)
+    }
+    #[inline]
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        JetField::compose_unary(self, d)
+    }
+}
+
+impl MomentTerm for Dual22 {
+    fn moment_term(&self, m: &Self) -> Self {
+        // The layout-independent Leibniz-weighted moving-boundary residual term
+        // (same math as the `Jet2` impl, re-expressed in the two-direction
+        // `(s, t)` channel layout). `self` = c_k (coefficient jet, value
+        // stripped), `m` = M_k (moment jet). For a target channel of order
+        // `α = (a in s, b in t)`, sum over every split that puts `(j, l)` of the
+        // derivatives on `c` (the rest on `M`), excluding the pure-`M` split
+        // `(0, 0)` (c's value is carried by the scalar seed, not here). Each
+        // split's weight is `|β| / |α| = (j + l) / (a + b)`, times the
+        // multinomial multiplicity `C(a, j)·C(b, l)` for choosing which
+        // same-direction derivatives land on `c`.
+        let c = self.channels();
+        let mm = m.channels();
+        // `(s-order, t-order) → channels() index`, keyed to `Dual22::channels`:
+        //   [v.v, g.v, v.g, h.v, g.g, v.h, h.g, g.h, h.h]
+        //  = [(0,0),(1,0),(0,1),(2,0),(1,1),(0,2),(2,1),(1,2),(2,2)].
+        const IDX: [[usize; 3]; 3] = [[0, 2, 5], [1, 4, 7], [3, 6, 8]];
+        // Binomial C(n, k) for n, k ∈ {0, 1, 2}.
+        const BINOM: [[f64; 3]; 3] =
+            [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 2.0, 1.0]];
+        let mut out = [0.0f64; 9];
+        for a in 0..=2usize {
+            for b in 0..=2usize {
+                let total = a + b;
+                if total == 0 {
+                    continue; // value channel: stripped.
+                }
+                let mut acc = 0.0;
+                for j in 0..=a {
+                    for l in 0..=b {
+                        if j + l == 0 {
+                            continue; // pure-M split dropped.
+                        }
+                        let w = BINOM[a][j] * BINOM[b][l] * ((j + l) as f64)
+                            / (total as f64);
+                        acc += w * c[IDX[j][l]] * mm[IDX[a - j][b - l]];
+                    }
+                }
+                out[IDX[a][b]] = acc;
+            }
+        }
+        Dual22::from_channels(out)
+    }
+}
+
 #[cfg(test)]
 mod moment_engine_tests {
     use super::*;
