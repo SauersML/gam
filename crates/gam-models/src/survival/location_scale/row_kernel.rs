@@ -4,6 +4,7 @@ use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, HessianPattern, JetScalar,
     OneSeed, OneSeedBatch, OneSeedLane, Order2Lane, PatternedOrder2, RuntimeJetScalar, TwoSeed,
+    hessian_pair_bits,
 };
 use wide::f64x4;
 
@@ -354,6 +355,7 @@ const SLS_HESSIAN_PAIRS: [(usize, usize); 24] = [
 
 impl HessianPattern<SLS_ROW_K, 24> for SlsHessianPattern {
     const PAIRS: [(usize, usize); 24] = SLS_HESSIAN_PAIRS;
+    const PAIR_BITS: [[u128; SLS_ROW_K]; SLS_ROW_K] = hessian_pair_bits(Self::PAIRS);
 }
 
 type SlsOrder2 = PatternedOrder2<SlsHessianPattern, SLS_ROW_K, 24>;

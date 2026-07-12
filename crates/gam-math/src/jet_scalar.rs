@@ -1268,8 +1268,8 @@ where
             gradient_mask &= gradient_mask - 1;
             out.g[i] = derivatives[1] * self.g[i];
         }
-        out.hessian_mask = self.hessian_mask
-            | Self::pair_mask_between(self.gradient_mask, self.gradient_mask);
+        out.hessian_mask =
+            self.hessian_mask | Self::pair_mask_between(self.gradient_mask, self.gradient_mask);
         let mut hessian_mask = out.hessian_mask;
         while hessian_mask != 0 {
             let slot = hessian_mask.trailing_zeros() as usize;
@@ -2743,6 +2743,7 @@ mod tests {
 
     impl HessianPattern<2, 3> for FullTwoPattern {
         const PAIRS: [(usize, usize); 3] = [(0, 0), (0, 1), (1, 1)];
+        const PAIR_BITS: [[u128; 2]; 2] = hessian_pair_bits(Self::PAIRS);
     }
 
     /// Patterned order-two arithmetic is channel-identical to dense `Order2`
