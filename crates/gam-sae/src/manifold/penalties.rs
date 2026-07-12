@@ -1868,12 +1868,16 @@ impl SaeManifoldTerm {
     ) -> Result<AnalyticPenaltyKind, ArrowSchurError> {
         // Isometry requires per-step cache refresh from the atom's second jet
         // before value / grad_target / hvp are live. The registry-held
-        // IsometryPenalty was constructed with p_out equal to the latent dim
-        // from the JSON latent spec; clone it and correct p_out to the atom's
-        // true decoder output dimension before refreshing caches.
+        // IsometryPenalty was constructed from the registry-wide latent spec;
+        // clone it and retarget both its local coordinate slice and p_out to
+        // this atom before refreshing caches. In a heterogeneous SAE the
+        // registry target uses d_max, while each cache has shape (N, p*d_atom).
+        // Leaving d_max on the clone makes `value` reshape a d=1 atom as d=2
+        // and then ask `pullback_metric` for p*2 Jacobian columns.
         let atom = &self.atoms[atom_idx];
         let p = atom.decoder_coefficients.ncols();
         let mut corrected: IsometryPenalty = (**iso).clone();
+        corrected.target = PsiSlice::full(coord.len(), Some(atom.latent_dim));
         corrected.p_out = p;
         // Single-source-of-truth gauge metric: the isometry pullback weight is
         // taken from the SAME RowMetric the reconstruction likelihood whitens

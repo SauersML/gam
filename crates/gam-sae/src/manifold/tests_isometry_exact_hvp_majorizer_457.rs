@@ -492,3 +492,94 @@ pub(crate) fn refresh_isometry_caches_pairs_each_penalty_to_its_own_atom() {
         "the two penalties must not collapse onto the same atom"
     );
 }
+
+/// A heterogeneous SAE owns one registry-level isometry penalty whose target
+/// is sized at `d_max`, but evaluates that penalty against every atom's own
+/// compact coordinate block. The corrected per-atom clone must therefore
+/// carry the atom-local `(N * d_atom, d_atom)` target before its Jacobian cache
+/// is refreshed. Otherwise the d=1 atom below installs `(N, p)` and `value`
+/// reads the stale d=2 target, requesting `(N, 2p)` and panicking.
+#[test]
+pub(crate) fn corrected_isometry_penalty_retargets_mixed_dimension_atoms() {
+    let p_out = 4usize;
+    let coords_d1 = array![[0.05], [0.20], [0.55], [0.80]];
+    let coords_d2 = array![[-0.61, 0.23], [-0.18, -1.07], [0.42, 0.81], [0.73, -0.39]];
+
+    let (atom_d1, _, _) = build_isometry_atom_for_evaluator(
+        Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap()),
+        SaeAtomBasisKind::Periodic,
+        &coords_d1,
+        p_out,
+        0.53,
+    );
+    let (atom_d2, _, _) = build_isometry_atom_for_evaluator(
+        Arc::new(SphereChartEvaluator),
+        SaeAtomBasisKind::Sphere,
+        &coords_d2,
+        p_out,
+        1.37,
+    );
+
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((coords_d1.nrows(), 2)),
+        vec![coords_d1, coords_d2],
+        vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Product(vec![
+                LatentManifold::Interval { lo: -1.0, hi: 1.0 },
+                LatentManifold::Circle {
+                    period: std::f64::consts::TAU,
+                },
+            ]),
+        ],
+        AssignmentMode::ordered_beta_bernoulli(0.7, 1.0, true),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(vec![atom_d1, atom_d2], assignment).unwrap();
+
+    // This mirrors production: one default-on registry penalty is sized from
+    // the heterogeneous latent spec's maximum dimension and shared by both
+    // atoms. Per-atom correction must keep it live, not disable it.
+    let mut registry = AnalyticPenaltyRegistry::new();
+    registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
+        IsometryPenalty::new_euclidean(PsiSlice::full(term.n_obs() * 2, Some(2)), p_out),
+    )));
+    let registry_iso = match &registry.penalties[0] {
+        AnalyticPenaltyKind::Isometry(penalty) => penalty,
+        _ => panic!("expected isometry penalty"),
+    };
+    let rho = array![0.0_f64];
+
+    for (atom_idx, expected_dim) in [(0usize, 1usize), (1usize, 2usize)] {
+        let coord = &term.assignment.coords[atom_idx];
+        let corrected = term
+            .corrected_isometry_penalty(registry_iso, atom_idx, coord)
+            .unwrap();
+        let corrected_iso = match &corrected {
+            AnalyticPenaltyKind::Isometry(penalty) => penalty,
+            _ => panic!("expected corrected isometry penalty"),
+        };
+        assert_eq!(corrected_iso.target.latent_dim, Some(expected_dim));
+        assert_eq!(corrected_iso.target.len(), term.n_obs() * expected_dim);
+        assert_eq!(
+            corrected_iso
+                .jacobian_cache()
+                .expect("corrected penalty must have a live Jacobian cache")
+                .ncols(),
+            p_out * expected_dim
+        );
+        let value = corrected.value(coord.as_flat().view(), rho.view());
+        assert!(
+            value.is_finite() && value > 0.0,
+            "atom {atom_idx} must retain live, nonzero default isometry; got {value}"
+        );
+    }
+
+    let total = term
+        .isometry_penalty_value_total(&registry)
+        .expect("mixed-dimension default isometry must evaluate without a shape panic");
+    assert!(
+        total.is_finite() && total > 0.0,
+        "mixed-dimension isometry total must remain live; got {total}"
+    );
+}
