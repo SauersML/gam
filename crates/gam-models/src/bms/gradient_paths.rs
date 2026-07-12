@@ -2652,6 +2652,75 @@ mod jet_tower_oracle_tests {
         }
     }
 
+    #[test]
+    fn measure_rigid_vgh_jet_vs_hand_932() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let eta = [0.3_f64, -0.7, 0.05, 0.9, -1.2, 2.1, -2.4];
+        let g = [0.2_f64, -0.5, 0.35, -0.15, 0.6, 0.45, -0.55];
+        let z = [0.4_f64, -1.1, 0.0, 0.7, -0.3, 1.6, -1.4];
+        let y = [1.0_f64, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+        let w = [1.0_f64, 0.8, 1.3, 0.9, 1.1, 0.7, 1.4];
+        let maps: Vec<BernoulliMarginalLinkMap> = eta
+            .iter()
+            .map(|&value| {
+                bernoulli_marginal_link_map(
+                    &InverseLink::Standard(gam_problem::StandardLink::Probit),
+                    value,
+                )
+                .expect("link map")
+            })
+            .collect();
+        let reps = 500_000usize;
+        let mut best_hand = f64::INFINITY;
+        let mut best_jet = f64::INFINITY;
+        for _ in 0..5 {
+            let start = Instant::now();
+            let mut sum = 0.0;
+            for _ in 0..reps {
+                for row in 0..eta.len() {
+                    let (value, gradient, hessian) =
+                        hand_rigid_vgh(maps[row], g[row], z[row], y[row], w[row], 1.0);
+                    sum += value
+                        + gradient[0]
+                        + gradient[1]
+                        + hessian[0][0]
+                        + hessian[0][1]
+                        + hessian[1][1];
+                }
+            }
+            black_box(sum);
+            best_hand = best_hand.min(start.elapsed().as_secs_f64());
+
+            let start = Instant::now();
+            let mut sum = 0.0;
+            for _ in 0..reps {
+                for row in 0..eta.len() {
+                    let (value, gradient, hessian) = rigid_standard_normal_row_kernel(
+                        maps[row], g[row], z[row], y[row], w[row], 1.0,
+                    )
+                    .expect("jet kernel");
+                    sum += value
+                        + gradient[0]
+                        + gradient[1]
+                        + hessian[0][0]
+                        + hessian[0][1]
+                        + hessian[1][1];
+                }
+            }
+            black_box(sum);
+            best_jet = best_jet.min(start.elapsed().as_secs_f64());
+        }
+        let rows = (reps * eta.len()) as f64;
+        let hand_ns = best_hand * 1.0e9 / rows;
+        let jet_ns = best_jet * 1.0e9 / rows;
+        eprintln!(
+            "RIGID-VGH-932 hand={hand_ns:.2} ns/row jet={jet_ns:.2} ns/row ratio={:.3}",
+            jet_ns / hand_ns
+        );
+    }
+
     // NOTE: the hand-vs-jet timing microbench (`bench_rigid_vgh_jet_vs_hand`)
     // was removed — `#[ignore]`d timing benches are banned by `build.rs`, and
     // the kernel's *correctness* against the hand chain is already pinned by the

@@ -2760,6 +2760,46 @@ mod tests {
             }
         }
     }
+
+    /// The runtime backend is only competitive with fixed packed jets if a
+    /// worker pays for its arena chunks once, not once per row. Exercise the
+    /// same reset/evaluate lifecycle used by the survival-LS and SAE callers and
+    /// pin the allocator-facing invariant directly: a second equal-width row
+    /// must not grow the arena.
+    #[test]
+    fn dynamic_jet_arena_reuses_warm_row_storage_932() {
+        fn evaluate(arena: &DynamicJetArena) -> (f64, f64, f64) {
+            const K: usize = 12;
+            let variables = arena.alloc_slice_fill_with(K, |axis| {
+                DynamicOrder2::variable(0.05 * (axis + 1) as f64, axis, K, arena)
+            });
+            let mut output = DynamicOrder2::constant(0.25, K, arena);
+            for axis in 0..K {
+                let nonlinear = variables[axis]
+                    .scale(0.7 + 0.01 * axis as f64)
+                    .exp()
+                    .mul(&variables[(axis + 1) % K].add(&variables[axis]));
+                output = output.add(&nonlinear);
+            }
+            (output.value(), output.g()[3], output.h_at(3, 7))
+        }
+
+        let mut arena = DynamicJetArena::with_capacity(256 * 1024);
+        let first = evaluate(&arena);
+        let warm_bytes = arena.allocated_bytes();
+        assert!(warm_bytes > 0);
+        arena.reset();
+        let second = evaluate(&arena);
+        let reused_bytes = arena.allocated_bytes();
+
+        assert_eq!(second.0.to_bits(), first.0.to_bits());
+        assert_eq!(second.1.to_bits(), first.1.to_bits());
+        assert_eq!(second.2.to_bits(), first.2.to_bits());
+        assert_eq!(
+            reused_bytes, warm_bytes,
+            "equal-width warm rows must reuse arena chunks"
+        );
+    }
 }
 
 #[cfg(test)]
