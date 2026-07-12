@@ -261,6 +261,7 @@ pub fn estimate_on_rows_with_nulls(
         kinds: vec![
             crate::null_battery::NullKind::PhaseRandomized,
             crate::null_battery::NullKind::RandomRotation,
+            crate::null_battery::NullKind::PerDimensionShuffle,
             crate::null_battery::NullKind::ArchitectureMatchedRandomWeight,
         ],
         tail: crate::null_battery::Tail::Larger,
@@ -285,8 +286,9 @@ pub fn estimate_on_rows_with_nulls(
         nulls,
         spike_in_roc,
     )?;
-    report.null_calibration =
-        Some(crate::null_battery::ClaimNullCalibration::from_calibrated_roc(calibrated));
+    report.null_calibration = Some(
+        crate::null_battery::ClaimNullCalibration::from_calibrated_roc(calibrated)?,
+    );
     Ok(report)
 }
 

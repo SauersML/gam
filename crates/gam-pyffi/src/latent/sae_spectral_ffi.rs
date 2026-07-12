@@ -1277,7 +1277,9 @@ fn standing_sparse_null_calibration(
         nulls,
         roc,
     )?;
-    Ok(Some(nb::ClaimNullCalibration::from_calibrated_roc(report)))
+    Ok(Some(nb::ClaimNullCalibration::from_calibrated_roc(
+        report,
+    )?))
 }
 
 /// Typed knob bundle for `audit_sae`, decoded from the single Python-side

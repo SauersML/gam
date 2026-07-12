@@ -639,12 +639,7 @@ impl OuterProblem {
         let objective_lower = obj.outer_domain_lower_bound()?;
         let objective_upper = obj.outer_domain_upper_bound()?;
         if objective_lower.is_some() || objective_upper.is_some() {
-            install_objective_domain(
-                &mut config,
-                self.n_params,
-                objective_lower,
-                objective_upper,
-            )?;
+            install_objective_domain(&mut config, self.n_params, objective_lower, objective_upper)?;
         }
         let Some(session) = config.cache_session.clone() else {
             return run_outer(obj, &config, context);

@@ -91,21 +91,20 @@ mod log_strength_domain_tests {
 
     #[test]
     fn structurally_absent_sparse_placeholder_is_ignored_and_never_scaled() {
-        let rho = SaeManifoldRho::new(
-            f64::INFINITY,
-            0.0,
-            vec![Array1::<f64>::zeros(0)],
-        )
-        .for_assignment(AssignmentMode::softmax(1.0));
+        let rho = SaeManifoldRho::new(17.0, 0.0, vec![Array1::<f64>::zeros(0)])
+            .for_assignment(AssignmentMode::softmax(1.0));
         assert_eq!(rho.sparse_flat_index(), None);
-        rho.validate_log_strength_domain()
+        let mut irrelevant_placeholder = rho.clone();
+        irrelevant_placeholder.log_lambda_sparse = f64::INFINITY;
+        irrelevant_placeholder
+            .validate_log_strength_domain()
             .expect("a non-coordinate placeholder is outside the objective domain");
         assert_eq!(rho.to_flat(), array![0.0]);
 
         let scaled = rho
             .seed_scaled_by_dispersion_for_assignment(1.0e300, AssignmentMode::softmax(1.0))
             .expect("dispersion scaling must not touch an absent sparse coordinate");
-        assert_eq!(scaled.log_lambda_sparse, f64::INFINITY);
+        assert_eq!(scaled.log_lambda_sparse, 17.0);
         assert_eq!(scaled.to_flat().len(), 1);
         scaled
             .validate_log_strength_domain()
@@ -531,10 +530,7 @@ impl SaeManifoldRho {
     /// (#1556).
     #[must_use]
     pub fn lambda_smooth_vec(&self) -> Vec<f64> {
-        self.log_lambda_smooth
-            .iter()
-            .map(|&v| v.exp())
-            .collect()
+        self.log_lambda_smooth.iter().map(|&v| v.exp()).collect()
     }
 
     /// Validate every log-strength represented in the flat outer layout against

@@ -5325,7 +5325,7 @@ fn ard_atom_and_coord(
 /// `eta·(I1/I0-1)` becomes zero after the ratio rounds to one. Pin both the
 /// value and its log-precision derivative in that regime.
 #[test]
-pub(crate) fn periodic_ard_centered_bessel_value_gradient_survive_huge_precision() {
+pub(crate) fn periodic_ard_centered_bessel_value_gradient_survive_domain_edge() {
     let n = 3usize;
     let coords = Array2::<f64>::zeros((n, 1));
     let manifold = LatentManifold::Circle { period: 1.0 };
@@ -5338,7 +5338,7 @@ pub(crate) fn periodic_ard_centered_bessel_value_gradient_survive_huge_precision
     )
     .unwrap();
     let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
-    let log_alpha = 690.0_f64;
+    let log_alpha = LOG_STRENGTH_MAX - 1.0e-3;
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![log_alpha]]);
 
     let value = term.ard_value(&rho).unwrap();

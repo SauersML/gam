@@ -2,11 +2,11 @@
 //!
 //! A *union* candidate is a small FIXED composite of named component structures
 //! ({circle+circle, circle+point-cluster, line+cluster}) joined by a hard
-//! row-responsibility split. Each component is REML/Laplace-fit on its group and
-//! the per-component rank-aware evidences are SUMMED, priced by the TOTAL
-//! free-parameter count across components — so a union is strictly more expensive
-//! than either pure rung and can only win when the structured split buys enough
-//! likelihood to pay for its extra parameters.
+//! row-responsibility split. Each component is fit on its group, then the union
+//! is scored as one normalized soft-mixture density on every row. BIC prices all
+//! component parameters plus the free mixing weight on the common sample scale,
+//! so a union can only win when the structured split buys enough likelihood to
+//! pay for its extra parameters.
 //!
 //! These planted tests sample from GROUND-TRUTH generators at fixed integer seeds
 //! (no clock randomness) and assert the cross-class adjudicator recovers the
@@ -21,7 +21,9 @@
 //! The assertions are against the PLANTED TRUTH (which generator produced the
 //! data), never against a reference tool's output.
 
-use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig, UnionStructure};
+use gam::solver::evidence::{
+    GaussianMixtureConfig, StackingConfig, UnionStructure, union_per_point_log_density,
+};
 use gam::solver::topology_selector::{
     AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider,
     PredictiveCandidateKind, PredictiveRaceCandidate, STACKING_CV_FOLDS, STACKING_CV_SEED,
@@ -477,8 +479,8 @@ fn single_circle_negative_control_does_not_prefer_any_union() {
 
 #[test]
 fn fit_union_candidate_prices_by_total_parameter_count() {
-    // The union evidence is the SUM of component rank-aware evidences and the
-    // complexity price is the TOTAL free-parameter count across components.
+    // The union likelihood is one normalized soft mixture on all rows, and the
+    // complexity price includes both components plus the free mixing weight.
     let data = sample_two_circles(7);
     let cfg = GaussianMixtureConfig::default();
     let fit = fit_union_candidate(data.view(), UnionStructure::CircleCircle, cfg)
@@ -488,31 +490,45 @@ fn fit_union_candidate_prices_by_total_parameter_count() {
         UnionStructure::CircleCircle,
         "structure must round-trip"
     );
-    // Two circle components, 4 parameters each → 8 total.
+    // Two circle components, 4 parameters each, plus one free mixing weight.
     assert_eq!(
-        fit.total_parameters, 8,
-        "circle+circle total parameter count must be the sum across components (4 + 4)"
+        fit.total_parameters, 9,
+        "circle+circle total parameter count must be 4 + 4 + one free mixing weight"
     );
     assert_eq!(
         fit.total_parameters, fit.fit.total_parameters,
         "rung total_parameters must mirror the inner UnionStructureFit"
     );
-    // Summed evidence equals the sum of the per-component negative-log-evidences.
-    let summed: f64 = fit.fit.components.iter().map(|c| c.bic).sum();
+    let per_point = union_per_point_log_density(
+        data.view(),
+        data.view(),
+        UnionStructure::CircleCircle,
+        cfg,
+    )
+    .expect("the fitted union must score its training rows");
+    let log_likelihood: f64 = per_point.iter().sum();
     assert!(
-        (fit.bic - summed).abs() <= 1e-9 * (1.0 + summed.abs()),
-        "union negative-log-evidence must be the SUM of component evidences \
-         (got {:.6}, sum {:.6})",
-        fit.bic,
-        summed,
+        (fit.fit.log_likelihood - log_likelihood).abs()
+            <= 1e-9 * (1.0 + log_likelihood.abs()),
+        "training and predictive paths must use the same normalized mixture likelihood"
     );
+    let expected_bic =
+        -log_likelihood + 0.5 * fit.total_parameters as f64 * (data.nrows() as f64).ln();
     assert!(
-        fit.bic.is_finite(),
-        "summed rank-aware Laplace evidence must be finite"
+        (fit.bic - expected_bic).abs() <= 1e-9 * (1.0 + expected_bic.abs()),
+        "union BIC must price the shared training likelihood on the common n-row scale"
     );
     let total_component_params: usize = fit.fit.components.iter().map(|c| c.num_parameters).sum();
     assert_eq!(
-        fit.total_parameters, total_component_params,
-        "total_parameters must equal the sum of per-component parameter counts"
+        fit.total_parameters,
+        total_component_params + fit.fit.components.len() - 1,
+        "total_parameters must include m - 1 free mixing weights"
     );
+    let total_weight: f64 = fit
+        .fit
+        .components
+        .iter()
+        .map(|component| component.mixing_weight)
+        .sum();
+    assert!((total_weight - 1.0).abs() <= 8.0 * f64::EPSILON);
 }

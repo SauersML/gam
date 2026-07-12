@@ -1083,6 +1083,42 @@ impl GaussianComponentEval {
         })
     }
 
+    fn isotropic(mean: Array1<f64>, variance: f64) -> Result<Self, String> {
+        let d = mean.len();
+        if d == 0 {
+            return Err("isotropic Gaussian density requires positive dimension".to_string());
+        }
+        if mean.iter().any(|value| !value.is_finite()) {
+            return Err("isotropic Gaussian mean must be finite".to_string());
+        }
+        if !(variance.is_finite() && variance > 0.0) {
+            return Err(format!(
+                "isotropic Gaussian variance must be finite and positive, got {variance}"
+            ));
+        }
+        let inverse_variance = variance.recip();
+        if !inverse_variance.is_finite() {
+            return Err(format!(
+                "isotropic Gaussian precision is non-finite for variance {variance}"
+            ));
+        }
+        let mut precision = Array2::<f64>::zeros((d, d));
+        for axis in 0..d {
+            precision[[axis, axis]] = inverse_variance;
+        }
+        let log_norm =
+            -0.5 * d as f64 * ((2.0 * std::f64::consts::PI).ln() + variance.ln());
+        if !log_norm.is_finite() {
+            return Err("isotropic Gaussian log normalizer is non-finite".to_string());
+        }
+        Ok(Self {
+            mean,
+            precision,
+            log_norm,
+            d,
+        })
+    }
+
     #[inline]
     fn log_density(&self, y: ArrayView1<'_, f64>) -> f64 {
         let pv = self.precision_times_residual(y);
@@ -2736,10 +2772,10 @@ pub fn union_responsibility_split(
     Ok(groups)
 }
 
-/// Fit one structured-union candidate: hard-split the rows into one group per
-/// component, fit each component's pinned density, and sum BIC/2. The
-/// complexity price is the total
-/// free-parameter count across components.
+/// Fit one structured-union candidate. The hard split identifies component
+/// training groups; heterogeneous component roles are assigned by evaluating
+/// every unique role permutation. Each assignment is then scored as one
+/// normalized soft mixture on every training row.
 ///
 /// Returns an error if any component group is too small to identify its
 /// structure (so an over-priced or non-identifiable composite simply does not
@@ -2749,43 +2785,24 @@ pub fn fit_union_structure(
     structure: UnionStructure,
     config: GaussianMixtureConfig,
 ) -> Result<UnionStructureFit, String> {
-    let comps = structure.components();
-    let m = comps.len();
-    let groups = union_responsibility_split(data, m, config)?;
-    let mut fits = Vec::with_capacity(m);
-    let mut total_nle = 0.0_f64;
-    let mut total_parameters = 0usize;
-    for (kind, rows) in comps.iter().zip(groups.iter()) {
-        let group = gather_union_rows(data, rows);
-        let (nle, p) = fit_union_component(group.view(), *kind, config)?;
-        if !nle.is_finite() {
-            return Err(format!(
-                "union {} component {:?} produced non-finite BIC",
-                structure.as_str(),
-                kind
-            ));
-        }
-        total_nle += nle;
-        total_parameters += p;
-        fits.push(UnionComponentFit {
-            kind: *kind,
-            row_count: rows.len(),
-            num_parameters: p,
-            bic: nle,
-        });
-    }
+    let fitted = fit_union_density(data, structure, config)?;
     Ok(UnionStructureFit {
         structure,
-        components: fits,
-        bic: total_nle,
-        total_parameters,
+        components: fitted
+            .components
+            .iter()
+            .map(UnionComponentDensity::summary)
+            .collect(),
+        log_likelihood: fitted.log_likelihood,
+        bic: fitted.bic,
+        total_parameters: fitted.total_parameters,
     })
 }
 
-/// Fit the whole fixed union ladder and rank in-class by summed BIC (lower
-/// wins). Composites that fail to fit (e.g. a group too
-/// small to identify a circle) are skipped. Returns the fitted ladder sorted
-/// best-first.
+/// Fit the whole fixed union ladder and rank in-class by normalized soft-mixture
+/// BIC (lower wins). The declared ladder is one selection family: if any
+/// eligible structure fails, the whole comparison fails with every per-structure
+/// error rather than silently selecting from an easier survivor set.
 pub fn fit_union_ladder(
     data: ArrayView2<'_, f64>,
     config: GaussianMixtureConfig,
@@ -2798,15 +2815,14 @@ pub fn fit_union_ladder(
             Err(e) => errors.push(format!("{}: {e}", structure.as_str())),
         }
     }
-    if fits.is_empty() {
+    if !errors.is_empty() {
         return Err(format!(
-            "union ladder produced no fittable composites{}",
-            if errors.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", errors.join("; "))
-            }
+            "union ladder comparison failed; every declared structure must fit ({})",
+            errors.join("; ")
         ));
+    }
+    if fits.is_empty() {
+        return Err("union ladder is empty".to_string());
     }
     let ranked = rank_priority_candidates(
         fits.into_iter()
@@ -2835,37 +2851,6 @@ fn gather_union_rows(data: ArrayView2<'_, f64>, idx: &[usize]) -> Array2<f64> {
     out
 }
 
-/// Fit a single union component density on its responsibility group and return
-/// `(bic, free_parameter_count)`. `Line` and
-/// `PointCluster` use the full-covariance Gaussian density (a single mixture
-/// component); `Circle` uses [`CircularGaussianFit2d`].
-fn fit_union_component(
-    group: ArrayView2<'_, f64>,
-    kind: UnionComponentKind,
-    config: GaussianMixtureConfig,
-) -> Result<(f64, usize), String> {
-    match kind {
-        UnionComponentKind::Line | UnionComponentKind::PointCluster => {
-            // A single full-covariance Gaussian is the k=1 mixture, so reuse
-            // its exact BIC calculation.
-            if group.nrows() < group.ncols() + 1 {
-                return Err(format!(
-                    "union gaussian component needs >= {} rows, got {}",
-                    group.ncols() + 1,
-                    group.nrows()
-                ));
-            }
-            let fit = fit_gaussian_mixture(group, 1, config).map_err(|error| error.to_string())?;
-            Ok((fit.bic(), fit.num_free_parameters()))
-        }
-        UnionComponentKind::Circle => {
-            let rows = union_circle_rows(group)?;
-            let (_, bic) = CircularGaussianFit2d::fit_with_bic(group, &rows)?;
-            Ok((bic, CircularGaussianFit2d::NUM_FREE_PARAMETERS))
-        }
-    }
-}
-
 /// Apply the structured-union admission policy to one circle group and return
 /// its complete deterministic row set.
 /// The `n > P` rule belongs to this composite ladder; it is not an intrinsic
@@ -2881,79 +2866,406 @@ fn union_circle_rows(group: ArrayView2<'_, f64>) -> Result<Vec<usize>, String> {
     Ok((0..group.nrows()).collect())
 }
 
-/// A fitted union component as a *predictive density* (not just an evidence
-/// scalar): either a full-covariance Gaussian (`Line`/`PointCluster`) or a
-/// Gaussian-blurred latent circle. Carries the mixing weight
-/// `π_c = row_count_c / n_train` so a union can be evaluated as the soft mixture
-/// `Σ_c π_c p_c(y)` at held-out rows for cross-class stacking.
+/// The shared fitted-density representation used by both in-sample BIC and
+/// held-out predictive scoring. `Line` and `PointCluster` deliberately share
+/// the Gaussian evaluator after fitting, but differ in covariance constraints
+/// and parameter count.
 #[derive(Debug, Clone)]
-enum UnionComponentDensity {
-    Gaussian {
-        log_weight: f64,
-        eval: GaussianComponentEval,
-    },
-    Circle {
-        log_weight: f64,
-        fit: CircularGaussianFit2d,
-    },
+enum UnionDensityModel {
+    Gaussian(GaussianComponentEval),
+    Circle(CircularGaussianFit2d),
+}
+
+#[derive(Debug, Clone)]
+struct UnionComponentDensity {
+    kind: UnionComponentKind,
+    row_count: usize,
+    num_parameters: usize,
+    mixing_weight: f64,
+    log_weight: f64,
+    model: UnionDensityModel,
 }
 
 impl UnionComponentDensity {
+    fn summary(&self) -> UnionComponentFit {
+        UnionComponentFit {
+            kind: self.kind,
+            row_count: self.row_count,
+            num_parameters: self.num_parameters,
+            mixing_weight: self.mixing_weight,
+        }
+    }
+
+    fn dimension(&self) -> usize {
+        match &self.model {
+            UnionDensityModel::Gaussian(eval) => eval.d,
+            UnionDensityModel::Circle(_) => 2,
+        }
+    }
+
     /// `log π_c + log p_c(y)` for one eval row.
     fn weighted_log_density(&self, y: ArrayView1<'_, f64>) -> f64 {
-        match self {
-            UnionComponentDensity::Gaussian { log_weight, eval } => {
-                log_weight + eval.log_density(y)
-            }
-            UnionComponentDensity::Circle { log_weight, fit } => {
-                log_weight + fit.log_density(y[0], y[1])
-            }
-        }
+        let component_log_density = match &self.model {
+            UnionDensityModel::Gaussian(eval) => eval.log_density(y),
+            UnionDensityModel::Circle(fit) => fit.log_density(y[0], y[1]),
+        };
+        self.log_weight + component_log_density
     }
 }
 
-/// Fit each union component's *density* on the training rows (hard
-/// responsibility split) so the composite can be evaluated as the soft mixture
-/// `Σ_c π_c p_c(y)` at new rows. Mixing weights are the training row shares.
-fn fit_union_component_densities(
+#[derive(Debug, Clone)]
+struct FittedUnionDensity {
+    components: Vec<UnionComponentDensity>,
+    log_likelihood: f64,
+    bic: f64,
+    total_parameters: usize,
+}
+
+fn fit_union_density(
     train: ArrayView2<'_, f64>,
     structure: UnionStructure,
     config: GaussianMixtureConfig,
-) -> Result<Vec<UnionComponentDensity>, String> {
-    let comps = structure.components();
-    let m = comps.len();
-    let groups = union_responsibility_split(train, m, config)?;
-    let n_train = train.nrows().max(1) as f64;
-    let mut out = Vec::with_capacity(m);
-    for (kind, rows) in comps.iter().zip(groups.iter()) {
+) -> Result<FittedUnionDensity, String> {
+    let groups = union_responsibility_split(train, structure.num_components(), config)?;
+    fit_union_density_from_groups(train, structure, &groups, config)
+}
+
+/// Fit and score a union for an already-established hard partition. This seam
+/// makes role assignment explicitly independent of the arbitrary component
+/// labels emitted by the responsibility split.
+fn fit_union_density_from_groups(
+    train: ArrayView2<'_, f64>,
+    structure: UnionStructure,
+    groups: &[Vec<usize>],
+    config: GaussianMixtureConfig,
+) -> Result<FittedUnionDensity, String> {
+    validate_union_partition(train.nrows(), structure.num_components(), groups)?;
+    let assignments = unique_union_role_assignments(structure.components());
+    let mut best: Option<FittedUnionDensity> = None;
+    let mut errors = Vec::new();
+
+    for roles in assignments {
+        let candidate = (|| {
+            let mut components = Vec::with_capacity(groups.len());
+            let n_train = train.nrows() as f64;
+            for (&kind, rows) in roles.iter().zip(groups) {
+                let group = gather_union_rows(train, rows);
+                let mixing_weight = rows.len() as f64 / n_train;
+                components.push(fit_union_component_density(
+                    group.view(),
+                    kind,
+                    mixing_weight,
+                    config,
+                )?);
+            }
+
+            let component_parameters = components.iter().try_fold(0usize, |sum, component| {
+                sum.checked_add(component.num_parameters)
+                    .ok_or_else(|| "union component parameter count overflowed usize".to_string())
+            })?;
+            let mixing_parameters = components.len() - 1;
+            let total_parameters = component_parameters
+                .checked_add(mixing_parameters)
+                .ok_or_else(|| "union total parameter count overflowed usize".to_string())?;
+            let per_point = score_union_components(&components, train)?;
+            let log_likelihood = pairwise_sum(
+                per_point
+                    .as_slice()
+                    .expect("owned union score vector must be contiguous"),
+            );
+            if !log_likelihood.is_finite() {
+                return Err("union training log likelihood is non-finite".to_string());
+            }
+            let bic = -log_likelihood
+                + 0.5 * total_parameters as f64 * (train.nrows() as f64).ln();
+            if !bic.is_finite() {
+                return Err("union normalized soft-mixture BIC is non-finite".to_string());
+            }
+            Ok(FittedUnionDensity {
+                components,
+                log_likelihood,
+                bic,
+                total_parameters,
+            })
+        })();
+
+        match candidate {
+            Ok(candidate) => {
+                let replace = match &best {
+                    Some(current) => candidate.bic.total_cmp(&current.bic).is_lt(),
+                    None => true,
+                };
+                // Unique assignments are generated in canonical order. Keeping
+                // the earlier assignment on an exact score tie is deterministic.
+                if replace {
+                    best = Some(candidate);
+                }
+            }
+            Err(error) => errors.push(format!("{roles:?}: {error}")),
+        }
+    }
+
+    best.ok_or_else(|| {
+        format!(
+            "union {} has no finite role assignment ({})",
+            structure.as_str(),
+            errors.join("; ")
+        )
+    })
+}
+
+fn validate_union_partition(
+    n_rows: usize,
+    expected_groups: usize,
+    groups: &[Vec<usize>],
+) -> Result<(), String> {
+    if n_rows == 0 {
+        return Err("union fitting requires at least one training row".to_string());
+    }
+    if groups.len() != expected_groups {
+        return Err(format!(
+            "union partition has {} groups, expected {expected_groups}",
+            groups.len()
+        ));
+    }
+    let mut seen = vec![false; n_rows];
+    for (group_index, rows) in groups.iter().enumerate() {
         if rows.is_empty() {
+            return Err(format!("union partition group {group_index} is empty"));
+        }
+        for &row in rows {
+            if row >= n_rows {
+                return Err(format!(
+                    "union partition group {group_index} contains out-of-range row {row} for {n_rows} rows"
+                ));
+            }
+            if std::mem::replace(&mut seen[row], true) {
+                return Err(format!("union partition contains duplicate row {row}"));
+            }
+        }
+    }
+    if let Some(missing) = seen.iter().position(|included| !included) {
+        return Err(format!("union partition omits row {missing}"));
+    }
+    Ok(())
+}
+
+fn unique_union_role_assignments(roles: &[UnionComponentKind]) -> Vec<Vec<UnionComponentKind>> {
+    fn visit(
+        roles: &[UnionComponentKind],
+        used: &mut [bool],
+        assignment: &mut Vec<UnionComponentKind>,
+        out: &mut Vec<Vec<UnionComponentKind>>,
+    ) {
+        if assignment.len() == roles.len() {
+            out.push(assignment.clone());
+            return;
+        }
+        let mut used_at_depth = Vec::new();
+        for (index, &role) in roles.iter().enumerate() {
+            if used[index] || used_at_depth.contains(&role) {
+                continue;
+            }
+            used_at_depth.push(role);
+            used[index] = true;
+            assignment.push(role);
+            visit(roles, used, assignment, out);
+            assignment.pop();
+            used[index] = false;
+        }
+    }
+
+    let mut out = Vec::new();
+    visit(
+        roles,
+        &mut vec![false; roles.len()],
+        &mut Vec::with_capacity(roles.len()),
+        &mut out,
+    );
+    out
+}
+
+fn fit_union_component_density(
+    group: ArrayView2<'_, f64>,
+    kind: UnionComponentKind,
+    mixing_weight: f64,
+    config: GaussianMixtureConfig,
+) -> Result<UnionComponentDensity, String> {
+    if !(mixing_weight.is_finite() && mixing_weight > 0.0 && mixing_weight <= 1.0) {
+        return Err(format!(
+            "union component mixing weight must be finite and in (0, 1], got {mixing_weight}"
+        ));
+    }
+    let row_count = group.nrows();
+    let (model, num_parameters) = match kind {
+        UnionComponentKind::Line => {
+            if group.nrows() < group.ncols() + 1 {
+                return Err(format!(
+                    "union line component needs >= {} rows, got {}",
+                    group.ncols() + 1,
+                    group.nrows()
+                ));
+            }
+            let fit = fit_gaussian_mixture(group, 1, config).map_err(|error| error.to_string())?;
+            let num_parameters = fit.num_free_parameters();
+            let eval = GaussianComponentEval::factor(fit.means.row(0), &fit.covariances[0])?;
+            (UnionDensityModel::Gaussian(eval), num_parameters)
+        }
+        UnionComponentKind::PointCluster => {
+            if group.nrows() < group.ncols() + 1 {
+                return Err(format!(
+                    "union isotropic point component needs >= {} rows, got {}",
+                    group.ncols() + 1,
+                    group.nrows()
+                ));
+            }
+            let eval = fit_isotropic_gaussian_component(group, config.covariance_floor)?;
+            (
+                UnionDensityModel::Gaussian(eval),
+                group
+                    .ncols()
+                    .checked_add(1)
+                    .ok_or_else(|| "union point parameter count overflowed usize".to_string())?,
+            )
+        }
+        UnionComponentKind::Circle => {
+            let rows = union_circle_rows(group)?;
+            let fit = CircularGaussianFit2d::fit(group, &rows)?;
+            (
+                UnionDensityModel::Circle(fit),
+                CircularGaussianFit2d::NUM_FREE_PARAMETERS,
+            )
+        }
+    };
+    Ok(UnionComponentDensity {
+        kind,
+        row_count,
+        num_parameters,
+        mixing_weight,
+        log_weight: mixing_weight.ln(),
+        model,
+    })
+}
+
+/// Maximum-likelihood isotropic Gaussian fit. Coordinates are centered at each
+/// column's finite range midpoint before reduction, avoiding avoidable overflow
+/// and loss of translation precision at large common offsets.
+fn fit_isotropic_gaussian_component(
+    group: ArrayView2<'_, f64>,
+    covariance_floor: f64,
+) -> Result<GaussianComponentEval, String> {
+    let n = group.nrows();
+    let d = group.ncols();
+    if n == 0 || d == 0 {
+        return Err("union isotropic point component requires a non-empty matrix".to_string());
+    }
+    if !(covariance_floor.is_finite() && covariance_floor > 0.0) {
+        return Err(format!(
+            "union isotropic covariance floor must be finite and positive, got {covariance_floor}"
+        ));
+    }
+
+    let mut minima = Array1::from_elem(d, f64::INFINITY);
+    let mut maxima = Array1::from_elem(d, f64::NEG_INFINITY);
+    for row in group.rows() {
+        for axis in 0..d {
+            let value = row[axis];
+            if !value.is_finite() {
+                return Err(format!(
+                    "union isotropic point data contains non-finite coordinate {value}"
+                ));
+            }
+            minima[axis] = minima[axis].min(value);
+            maxima[axis] = maxima[axis].max(value);
+        }
+    }
+
+    let mut origin = Array1::<f64>::zeros(d);
+    let mut mean_offset = Array1::<f64>::zeros(d);
+    let mut mean = Array1::<f64>::zeros(d);
+    for axis in 0..d {
+        origin[axis] = 0.5 * minima[axis] + 0.5 * maxima[axis];
+        let contributions = group
+            .column(axis)
+            .iter()
+            .map(|&value| (value - origin[axis]) / n as f64)
+            .collect::<Vec<_>>();
+        mean_offset[axis] = pairwise_sum(&contributions);
+        mean[axis] = origin[axis] + mean_offset[axis];
+        if !mean[axis].is_finite() {
+            return Err("union isotropic point mean is non-finite".to_string());
+        }
+    }
+
+    let scalar_count = n
+        .checked_mul(d)
+        .ok_or_else(|| "union isotropic residual count overflowed usize".to_string())?;
+    let mut residuals = Vec::with_capacity(scalar_count);
+    let mut residual_scale = 0.0_f64;
+    for row in group.rows() {
+        for axis in 0..d {
+            let residual = (row[axis] - origin[axis]) - mean_offset[axis];
+            if !residual.is_finite() {
+                return Err("union isotropic point residual is non-finite".to_string());
+            }
+            residual_scale = residual_scale.max(residual.abs());
+            residuals.push(residual);
+        }
+    }
+    let variance = if residual_scale == 0.0 {
+        covariance_floor
+    } else {
+        let normalized_squares = residuals
+            .iter()
+            .map(|residual| (residual / residual_scale).powi(2))
+            .collect::<Vec<_>>();
+        let normalized_mean_square = pairwise_sum(&normalized_squares) / scalar_count as f64;
+        let rms = residual_scale * normalized_mean_square.sqrt();
+        let unconstrained = rms * rms;
+        if !unconstrained.is_finite() {
+            return Err("union isotropic point variance is non-finite".to_string());
+        }
+        unconstrained.max(covariance_floor)
+    };
+    GaussianComponentEval::isotropic(mean, variance)
+}
+
+fn score_union_components(
+    components: &[UnionComponentDensity],
+    eval: ArrayView2<'_, f64>,
+) -> Result<Array1<f64>, String> {
+    if components.is_empty() {
+        return Err("union density requires at least one component".to_string());
+    }
+    for component in components {
+        if component.dimension() != eval.ncols() {
             return Err(format!(
-                "union {} held-out density: empty component group",
-                structure.as_str()
+                "union component {:?} has dimension {}, eval has {} columns",
+                component.kind,
+                component.dimension(),
+                eval.ncols()
             ));
         }
-        let log_weight = (rows.len() as f64 / n_train).max(f64::MIN_POSITIVE).ln();
-        let group = gather_union_rows(train, rows);
-        match kind {
-            UnionComponentKind::Line | UnionComponentKind::PointCluster => {
-                if group.nrows() < group.ncols() + 1 {
-                    return Err(format!(
-                        "union gaussian component density needs >= {} rows, got {}",
-                        group.ncols() + 1,
-                        group.nrows()
-                    ));
-                }
-                let fit = fit_gaussian_mixture(group.view(), 1, config)
-                    .map_err(|error| error.to_string())?;
-                let eval = GaussianComponentEval::factor(fit.means.row(0), &fit.covariances[0])?;
-                out.push(UnionComponentDensity::Gaussian { log_weight, eval });
-            }
-            UnionComponentKind::Circle => {
-                let rows = union_circle_rows(group.view())?;
-                let fit = CircularGaussianFit2d::fit(group.view(), &rows)?;
-                out.push(UnionComponentDensity::Circle { log_weight, fit });
+    }
+    let mut out = Array1::<f64>::zeros(eval.nrows());
+    let mut terms = vec![f64::NEG_INFINITY; components.len()];
+    for i in 0..eval.nrows() {
+        let row = eval.row(i);
+        let mut max_term = f64::NEG_INFINITY;
+        for (component_index, component) in components.iter().enumerate() {
+            let term = component.weighted_log_density(row);
+            terms[component_index] = term;
+            if term > max_term {
+                max_term = term;
             }
         }
+        let value = log_sum_exp(&terms, max_term);
+        if !value.is_finite() {
+            return Err(format!(
+                "union density produced non-finite log density at eval row {i}"
+            ));
+        }
+        out[i] = value;
     }
     Ok(out)
 }
@@ -2975,22 +3287,8 @@ pub fn union_per_point_log_density(
             eval.ncols()
         ));
     }
-    let densities = fit_union_component_densities(train, structure, config)?;
-    let mut out = Array1::<f64>::zeros(eval.nrows());
-    let mut terms = vec![f64::NEG_INFINITY; densities.len()];
-    for i in 0..eval.nrows() {
-        let row = eval.row(i);
-        let mut max_term = f64::NEG_INFINITY;
-        for (c, dens) in densities.iter().enumerate() {
-            let lt = dens.weighted_log_density(row);
-            terms[c] = lt;
-            if lt > max_term {
-                max_term = lt;
-            }
-        }
-        out[i] = log_sum_exp(&terms, max_term);
-    }
-    Ok(out)
+    let fitted = fit_union_density(train, structure, config)?;
+    score_union_components(&fitted.components, eval)
 }
 
 /// One fitted model in a REML/LAML evidence comparison.
@@ -5564,31 +5862,23 @@ mod tests {
     fn union_circles_use_the_shared_normalized_cartesian_density() {
         let data = two_noisy_circles_for_union();
         let config = GaussianMixtureConfig::default();
-        let groups = union_responsibility_split(data.view(), 2, config).unwrap();
-        assert_eq!(groups.len(), 2);
-
-        let mut direct_component_bics = Vec::with_capacity(groups.len());
-        for rows in &groups {
-            assert!(rows.len() > CircularGaussianFit2d::NUM_FREE_PARAMETERS);
-            let group = gather_union_rows(data.view(), rows);
-            let group_rows = (0..group.nrows()).collect::<Vec<_>>();
-            let (_, bic) = CircularGaussianFit2d::fit_with_bic(group.view(), &group_rows).unwrap();
-            direct_component_bics.push(bic);
-        }
-        let direct_bic = pairwise_sum(&direct_component_bics);
+        let density_fit =
+            fit_union_density(data.view(), UnionStructure::CircleCircle, config).unwrap();
         let union = fit_union_structure(data.view(), UnionStructure::CircleCircle, config).unwrap();
         assert_eq!(
             union.total_parameters,
-            2 * CircularGaussianFit2d::NUM_FREE_PARAMETERS
+            2 * CircularGaussianFit2d::NUM_FREE_PARAMETERS + 1
         );
-        assert!((union.bic - direct_bic).abs() < 1.0e-12);
+        let component_weight_sum: f64 = union
+            .components
+            .iter()
+            .map(|component| component.mixing_weight)
+            .sum();
+        assert!((component_weight_sum - 1.0).abs() <= 8.0 * f64::EPSILON);
 
-        let densities =
-            fit_union_component_densities(data.view(), UnionStructure::CircleCircle, config)
-                .unwrap();
-        let mut fitted_centers = Array2::<f64>::zeros((densities.len(), 2));
-        for (index, density) in densities.iter().enumerate() {
-            let UnionComponentDensity::Circle { fit, .. } = density else {
+        let mut fitted_centers = Array2::<f64>::zeros((density_fit.components.len(), 2));
+        for (index, component) in density_fit.components.iter().enumerate() {
+            let UnionDensityModel::Circle(fit) = &component.model else {
                 panic!("circle+circle union produced a non-circle density");
             };
             let center = fit.center();
@@ -5602,6 +5892,26 @@ mod tests {
             assert!((at_center - expected).abs() < 1.0e-12 * (1.0 + expected.abs()));
         }
 
+        let training_log_density = union_per_point_log_density(
+            data.view(),
+            data.view(),
+            UnionStructure::CircleCircle,
+            config,
+        )
+        .unwrap();
+        let direct_log_likelihood = pairwise_sum(
+            training_log_density
+                .as_slice()
+                .expect("owned score vector is contiguous"),
+        );
+        assert!(
+            (union.log_likelihood - direct_log_likelihood).abs()
+                <= 1.0e-12 * (1.0 + direct_log_likelihood.abs())
+        );
+        let expected_bic = -direct_log_likelihood
+            + 0.5 * union.total_parameters as f64 * (data.nrows() as f64).ln();
+        assert!((union.bic - expected_bic).abs() <= 1.0e-12 * (1.0 + expected_bic.abs()));
+
         let held_out = union_per_point_log_density(
             data.view(),
             fitted_centers.view(),
@@ -5610,6 +5920,142 @@ mod tests {
         )
         .unwrap();
         assert!(held_out.iter().all(|value| value.is_finite()));
+    }
+
+    fn circle_and_point_union_data() -> (Array2<f64>, Vec<Vec<usize>>) {
+        let circle_rows = 32usize;
+        let point_rows = 12usize;
+        let mut data = Array2::<f64>::zeros((circle_rows + point_rows, 2));
+        for row in 0..circle_rows {
+            let angle = std::f64::consts::TAU * row as f64 / circle_rows as f64;
+            let radius = 1.0 + 0.025 * (3.0 * angle).cos();
+            data[[row, 0]] = -4.0 + radius * angle.cos();
+            data[[row, 1]] = 0.2 + radius * angle.sin();
+        }
+        for offset in 0..point_rows {
+            let phase = offset as f64;
+            let row = circle_rows + offset;
+            data[[row, 0]] = 4.0 + 0.055 * (1.7 * phase).cos() + 0.018 * (0.4 * phase).sin();
+            data[[row, 1]] = -0.3 + 0.052 * (1.3 * phase).sin() - 0.015 * (0.9 * phase).cos();
+        }
+        (
+            data,
+            vec![
+                (0..circle_rows).collect(),
+                (circle_rows..circle_rows + point_rows).collect(),
+            ],
+        )
+    }
+
+    #[test]
+    fn heterogeneous_union_role_assignment_is_group_label_invariant() {
+        let (data, groups) = circle_and_point_union_data();
+        let config = GaussianMixtureConfig::default();
+        let forward = fit_union_density_from_groups(
+            data.view(),
+            UnionStructure::CirclePointCluster,
+            &groups,
+            config,
+        )
+        .unwrap();
+        let reversed_groups = vec![groups[1].clone(), groups[0].clone()];
+        let reversed = fit_union_density_from_groups(
+            data.view(),
+            UnionStructure::CirclePointCluster,
+            &reversed_groups,
+            config,
+        )
+        .unwrap();
+
+        assert_eq!(forward.components[0].kind, UnionComponentKind::Circle);
+        assert_eq!(
+            forward.components[1].kind,
+            UnionComponentKind::PointCluster
+        );
+        assert_eq!(
+            reversed.components[0].kind,
+            UnionComponentKind::PointCluster
+        );
+        assert_eq!(reversed.components[1].kind, UnionComponentKind::Circle);
+        assert_eq!(forward.total_parameters, 4 + 3 + 1);
+        assert_eq!(reversed.total_parameters, forward.total_parameters);
+        assert!(
+            (forward.log_likelihood - reversed.log_likelihood).abs()
+                <= 1.0e-12 * (1.0 + forward.log_likelihood.abs())
+        );
+        assert!((forward.bic - reversed.bic).abs() <= 1.0e-12 * (1.0 + forward.bic.abs()));
+    }
+
+    #[test]
+    fn point_cluster_is_isotropic_and_line_remains_full_covariance() {
+        let (mut data, mut groups) = circle_and_point_union_data();
+        // Replace the first group by a narrow, genuinely anisotropic line so
+        // the line role is identifiable without changing the point group.
+        for row in 0..groups[0].len() {
+            let coordinate = (row as f64 - 15.5) / 4.0;
+            data[[row, 0]] = -4.0 + coordinate;
+            data[[row, 1]] = 0.2 + 0.018 * coordinate + 0.006 * (1.9 * row as f64).sin();
+        }
+        let fit = fit_union_density_from_groups(
+            data.view(),
+            UnionStructure::LineCluster,
+            &groups,
+            GaussianMixtureConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(fit.components[0].kind, UnionComponentKind::Line);
+        assert_eq!(fit.components[0].num_parameters, 5);
+        assert_eq!(fit.components[1].kind, UnionComponentKind::PointCluster);
+        assert_eq!(fit.components[1].num_parameters, 3);
+        assert_eq!(fit.total_parameters, 5 + 3 + 1);
+
+        let UnionDensityModel::Gaussian(point) = &fit.components[1].model else {
+            panic!("point cluster did not produce a Gaussian density");
+        };
+        assert_eq!(point.precision[[0, 1]], 0.0);
+        assert_eq!(point.precision[[1, 0]], 0.0);
+        assert_eq!(point.precision[[0, 0]], point.precision[[1, 1]]);
+        let total_weight: f64 = fit
+            .components
+            .iter()
+            .map(|component| component.mixing_weight)
+            .sum();
+        assert!((total_weight - 1.0).abs() <= 8.0 * f64::EPSILON);
+
+        // Reversing group labels must reverse the selected roles, not the
+        // fitted unlabeled mixture density or its common-scale score.
+        groups.reverse();
+        let reversed = fit_union_density_from_groups(
+            data.view(),
+            UnionStructure::LineCluster,
+            &groups,
+            GaussianMixtureConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(reversed.components[0].kind, UnionComponentKind::PointCluster);
+        assert_eq!(reversed.components[1].kind, UnionComponentKind::Line);
+        assert!((fit.bic - reversed.bic).abs() <= 1.0e-12 * (1.0 + fit.bic.abs()));
+    }
+
+    #[test]
+    fn union_ladder_fails_closed_when_one_declared_structure_fails() {
+        let mut data = Array2::<f64>::zeros((8, 2));
+        for row in 0..5 {
+            let angle = std::f64::consts::TAU * row as f64 / 5.0;
+            data[[row, 0]] = -5.0 + angle.cos();
+            data[[row, 1]] = angle.sin();
+        }
+        data[[5, 0]] = 5.00;
+        data[[5, 1]] = 0.00;
+        data[[6, 0]] = 5.08;
+        data[[6, 1]] = 0.02;
+        data[[7, 0]] = 4.97;
+        data[[7, 1]] = 0.07;
+
+        let error = fit_union_ladder(data.view(), GaussianMixtureConfig::default()).unwrap_err();
+        assert!(error.contains("every declared structure must fit"));
+        assert!(error.contains(UnionStructure::CircleCircle.as_str()));
+        assert!(error.contains("needs at least 5 rows"));
     }
 
     #[test]

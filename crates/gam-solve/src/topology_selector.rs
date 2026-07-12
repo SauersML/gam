@@ -1804,20 +1804,20 @@ pub fn fit_ring_of_clusters_rung(
 // ===========================================================================
 
 /// One fitted entry of the structured-union rung: the composite structure, its
-/// summed component BIC/2, and the total free-parameter count across components.
-/// Lower is better.
+/// normalized soft-mixture BIC/2, and the complete free-parameter count. Lower
+/// is better.
 #[derive(Debug, Clone)]
 pub struct UnionRungFit {
     pub structure: UnionStructure,
     pub fit: UnionStructureFit,
-    /// `Σ_c P_c` — total free-parameter count across all components.
+    /// `Σ_c P_c + (m - 1)`, including free mixing weights.
     pub total_parameters: usize,
-    /// Summed component BIC/2.
+    /// BIC/2 of `Σ_c π_c p_c(y)` scored on all training rows.
     pub bic: f64,
 }
 
 /// Result of fitting the whole fixed union ladder: every fitted composite plus
-/// the index of the in-class winner (lowest summed BIC).
+/// the index of the in-class winner (lowest normalized soft-mixture BIC).
 #[derive(Debug, Clone)]
 pub struct UnionRungResult {
     pub fits: Vec<UnionRungFit>,
@@ -1832,18 +1832,21 @@ impl UnionRungResult {
 
 /// Fit the structured-union rung over the FIXED ladder
 /// [`crate::evidence::UNION_STRUCTURE_LADDER`] and rank in-class by
-/// summed BIC. Each composite is hard-split into one
+/// normalized soft-mixture BIC. Each composite is hard-split into one
 /// responsibility group per component (reusing the mixture rung's deterministic
-/// seeding + EM), and each component is fit on its group. Composites whose groups are too small to
-/// identify their structure are skipped (they never enter the race rather than
-/// scoring spuriously well). Deterministic: the split and the component fits are
+/// seeding + EM), and each component is fit on its group. Every fitted density
+/// is then scored on all rows as `Σ_c π_c p_c(y)`. Heterogeneous roles are
+/// assigned by finite minimum over all unique group-role permutations. The
+/// declared ladder fails closed if any structure cannot be identified, avoiding
+/// survivor-selection bias. Deterministic: all splits, assignments, and fits are
 /// pure functions of the data.
 pub fn fit_union_rung(
     data: ArrayView2<'_, f64>,
     config: GaussianMixtureConfig,
 ) -> Result<UnionRungResult, String> {
-    // `fit_union_ladder` already fits the fixed ladder and ranks best-first by
-    // summed BIC (cheaper composite wins ties). Re-wrap each
+    // `fit_union_ladder` already fits the complete fixed ladder and ranks
+    // best-first by normalized soft-mixture BIC (cheaper composite wins ties).
+    // Re-wrap each
     // fit with its complexity price for the rung view.
     let ladder = fit_union_ladder(data, config)?;
     let fits: Vec<UnionRungFit> = ladder

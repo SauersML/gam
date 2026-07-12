@@ -744,8 +744,7 @@ impl SaeManifoldTerm {
                 let normalizer_deriv = match period {
                     None => -0.5 * n_eff,
                     Some(p) => {
-                        let log_eta =
-                            log_alpha + 2.0 * (p.ln() - std::f64::consts::TAU.ln());
+                        let log_eta = log_alpha + 2.0 * (p.ln() - std::f64::consts::TAU.ln());
                         // d/d(log α) of `n[-η + log I0(η)]` is
                         // `n·η·(I1/I0−1)`. The centered primitive evaluates the
                         // complete product, so its `−½` large-η limit survives

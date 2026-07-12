@@ -436,10 +436,9 @@ pub struct ClaimNullCalibration {
 }
 
 impl ClaimNullCalibration {
-    pub fn from_calibrated_roc(report: CalibratedRocClaimReport) -> Self {
-        let null_pvalue = primary_null_pvalue(&report.nulls);
-        let null_z = primary_null_z(&report.nulls);
-        Self {
+    pub fn from_calibrated_roc(report: CalibratedRocClaimReport) -> Result<Self, String> {
+        let (null_pvalue, null_z) = primary_null_metrics(&report.nulls)?;
+        Ok(Self {
             claim: report.claim,
             observed_statistic: report.nulls.observed,
             null_pvalue,
@@ -449,34 +448,43 @@ impl ClaimNullCalibration {
             spikein_power: report.claimed_snr_power,
             null_distribution: report.nulls.summaries,
             spike_in_roc: report.spike_in_roc,
-        }
+        })
     }
 }
 
-pub fn primary_null_pvalue(report: &NullBatteryReport) -> f64 {
-    let mut selected = Vec::new();
+/// Conservative headline across every available structure-destroying control.
+/// Returns `(maximum p-value, minimum z-score)` in one allocation-free pass.
+pub fn primary_null_metrics(report: &NullBatteryReport) -> Result<(f64, f64), String> {
+    if report.summaries.is_empty() {
+        return Err("primary null calibration requires at least one null summary".to_string());
+    }
+    let has_primary = report
+        .summaries
+        .iter()
+        .any(|summary| is_primary_structure_destroying_null(summary.kind));
+    let mut p_value = 0.0_f64;
+    let mut z = f64::INFINITY;
     for summary in &report.summaries {
-        if is_primary_structure_destroying_null(summary.kind) {
-            selected.push(summary.p_value);
+        if !(summary.p_value.is_finite() && (0.0..=1.0).contains(&summary.p_value)) {
+            return Err(format!(
+                "primary null calibration received invalid {} p-value {}",
+                summary.kind.as_str(),
+                summary.p_value
+            ));
+        }
+        if !summary.z.is_finite() {
+            return Err(format!(
+                "primary null calibration received non-finite {} z-score {}",
+                summary.kind.as_str(),
+                summary.z
+            ));
+        }
+        if !has_primary || is_primary_structure_destroying_null(summary.kind) {
+            p_value = p_value.max(summary.p_value);
+            z = z.min(summary.z);
         }
     }
-    if selected.is_empty() {
-        selected.extend(report.summaries.iter().map(|summary| summary.p_value));
-    }
-    selected.into_iter().fold(0.0_f64, f64::max)
-}
-
-pub fn primary_null_z(report: &NullBatteryReport) -> f64 {
-    let mut selected = Vec::new();
-    for summary in &report.summaries {
-        if is_primary_structure_destroying_null(summary.kind) {
-            selected.push(summary.z);
-        }
-    }
-    if selected.is_empty() {
-        selected.extend(report.summaries.iter().map(|summary| summary.z));
-    }
-    selected.into_iter().fold(f64::INFINITY, f64::min)
+    Ok((p_value, z))
 }
 
 /// Controls that destroy the claimed cross-row/cross-coordinate structure
@@ -513,6 +521,17 @@ where
     validate_matrix(data, "observed")?;
     if config.replicates == 0 {
         return Err("null battery requires at least one replicate".to_string());
+    }
+    if config.kinds.is_empty() {
+        return Err("null battery requires at least one null kind".to_string());
+    }
+    for index in 0..config.kinds.len() {
+        if config.kinds[..index].contains(&config.kinds[index]) {
+            return Err(format!(
+                "null battery contains duplicate {} control",
+                config.kinds[index].as_str()
+            ));
+        }
     }
     let observed = audit(data)?;
     require_finite(observed, "observed statistic")?;
@@ -2386,24 +2405,38 @@ pub fn summarize_null_distribution(
     let mut sorted = samples.clone();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let n = samples.len();
-    let mean = samples.iter().sum::<f64>() / n as f64;
-    let var = if n > 1 {
-        samples
-            .iter()
-            .map(|x| {
-                let d = *x - mean;
-                d * d
-            })
-            .sum::<f64>()
-            / (n - 1) as f64
+    // Compute descriptive moments in a bounded chart. Directly summing ten
+    // perfectly valid values near 1e308 overflows even when their mean and
+    // variance are representable; raw squared deviations fail much earlier.
+    let scale = samples.iter().map(|value| value.abs()).fold(0.0, f64::max);
+    let (mean, sd, z) = if scale > 0.0 {
+        let scaled_mean = samples.iter().map(|value| value / scale).sum::<f64>() / n as f64;
+        let scaled_var = if n > 1 {
+            samples
+                .iter()
+                .map(|value| {
+                    let difference = value / scale - scaled_mean;
+                    difference * difference
+                })
+                .sum::<f64>()
+                / (n - 1) as f64
+        } else {
+            0.0
+        };
+        let scaled_sd = scaled_var.sqrt();
+        let mean = scaled_mean * scale;
+        let sd = scaled_sd * scale;
+        let z = if scaled_sd > 0.0 {
+            (observed / scale - scaled_mean) / scaled_sd
+        } else {
+            0.0
+        };
+        if !(mean.is_finite() && sd.is_finite() && z.is_finite()) {
+            return Err("null summary moments are not representable in float64".to_string());
+        }
+        (mean, sd, z)
     } else {
-        0.0
-    };
-    let sd = var.sqrt();
-    let z = if sd > 0.0 {
-        (observed - mean) / sd
-    } else {
-        0.0
+        (0.0, 0.0, 0.0)
     };
     Ok(NullSummary {
         kind,
@@ -2639,8 +2672,28 @@ mod tests {
                 summary_with_primary_metrics(NullKind::RandomRotation, 0.80, -2.0),
             ],
         };
-        assert_eq!(primary_null_pvalue(&report), 0.40);
-        assert_eq!(primary_null_z(&report), 0.25);
+        assert_eq!(primary_null_metrics(&report).unwrap(), (0.40, 0.25));
+
+        let empty = NullBatteryReport {
+            observed: 1.0,
+            summaries: Vec::new(),
+        };
+        assert!(primary_null_metrics(&empty).is_err());
+    }
+
+    #[test]
+    fn null_summary_moments_do_not_overflow_on_large_finite_location() {
+        let samples = vec![1.0e307, 1.0e307 + 2.0e292, 1.0e307 - 2.0e292];
+        let summary = summarize_null_distribution(
+            NullKind::PerDimensionShuffle,
+            1.0e307,
+            samples,
+            Tail::Larger,
+        )
+        .unwrap();
+        assert!(summary.mean.is_finite());
+        assert!(summary.sd.is_finite());
+        assert!(summary.z.is_finite());
     }
 
     #[test]

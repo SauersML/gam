@@ -526,12 +526,8 @@ fn build_rho(
         }
         ard.push(Array1::from(values.clone()));
     }
-    let rho = SaeManifoldRho::with_per_atom_smooth(
-        log_lambda_sparse,
-        log_lambda_smooth,
-        ard,
-    )
-    .for_assignment(assignment_mode);
+    let rho = SaeManifoldRho::with_per_atom_smooth(log_lambda_sparse, log_lambda_smooth, ard)
+        .for_assignment(assignment_mode);
     rho.validate_log_strength_domain()
         .map_err(|error| format!("run_sae_manifold_oos: {error}"))?;
     Ok(rho)

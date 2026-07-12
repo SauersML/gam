@@ -1414,6 +1414,24 @@ mod tests {
     }
 
     #[test]
+    fn shape_coordinate_gauge_handles_antipodal_finite_range() {
+        let magnitude = 1.7e308_f64;
+        let coords = ndarray::array![
+            [magnitude, 0.0],
+            [-magnitude, 0.0],
+            [0.0, magnitude],
+            [0.0, -magnitude],
+        ];
+        let gauge = fit_shape_coordinate_gauge(coords.view(), "extreme shape").unwrap();
+        let canonical = apply_shape_coordinate_gauge(coords.view(), gauge, "extreme shape")
+            .unwrap();
+        assert!(canonical.iter().all(|value| value.is_finite()));
+        assert!(gauge.log_scale.is_finite());
+        assert_eq!(canonical[[0, 0]], -canonical[[1, 0]]);
+        assert_eq!(canonical[[2, 1]], -canonical[[3, 1]]);
+    }
+
+    #[test]
     fn euclidean_gaussian_is_similarity_equivariant_with_a_normalized_density() {
         let n = 180usize;
         let mut coords = Array2::<f64>::zeros((n, 2));
@@ -2194,16 +2212,21 @@ fn circular_stacking_summary(
 
 #[derive(Clone, Copy)]
 struct ShapeCoordinateGauge {
-    anchor: [f64; 2],
-    mean_offset: [f64; 2],
-    scale: f64,
+    coordinate_scale: f64,
+    mean_scaled: [f64; 2],
+    rms_scaled: f64,
+    log_scale: f64,
 }
 
 /// Fit the translation and uniform-scale gauge from training rows only.
 ///
-/// The mean is accumulated as a sequence of convex combinations, so neither
-/// `n * mean` nor a large absolute chart origin can overflow. The RMS uses the
-/// LAPACK `lassq` scaling recurrence rather than summing raw squares.
+/// Coordinates are first divided by their largest absolute training value.
+/// Thus every subsequent subtraction lies in a bounded chart even for finite
+/// antipodal values whose raw difference exceeds float64. The mean is a
+/// sequence of convex combinations and the RMS uses the LAPACK `lassq`
+/// recurrence rather than summing raw squares. The physical scale is retained
+/// in log space, so its Jacobian remains representable even if the product of
+/// the two chart scales would overflow or underflow.
 fn fit_shape_coordinate_gauge(
     training: ArrayView2<'_, f64>,
     context: &str,
@@ -2216,20 +2239,23 @@ fn fit_shape_coordinate_gauge(
             "{context} training coordinates must be a nonempty finite (n, 2) matrix"
         ));
     }
-    let anchor = [training[[0, 0]], training[[0, 1]]];
-    let mut mean_offset = [0.0_f64; 2];
+    let coordinate_scale = training
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max);
+    if !(coordinate_scale.is_finite() && coordinate_scale > 0.0) {
+        return Err(format!(
+            "{context} training coordinates have zero or non-finite scale"
+        ));
+    }
+    let mut mean_scaled = [0.0_f64; 2];
     for row in 0..training.nrows() {
         let count = (row + 1) as f64;
         let previous_weight = (count - 1.0) / count;
         let new_weight = 1.0 / count;
         for axis in 0..2 {
-            let relative = training[[row, axis]] - anchor[axis];
-            if !relative.is_finite() {
-                return Err(format!(
-                    "{context} training coordinate range overflowed on axis {axis}"
-                ));
-            }
-            mean_offset[axis] = previous_weight * mean_offset[axis] + new_weight * relative;
+            let scaled = training[[row, axis]] / coordinate_scale;
+            mean_scaled[axis] = previous_weight * mean_scaled[axis] + new_weight * scaled;
         }
     }
 
@@ -2237,7 +2263,7 @@ fn fit_shape_coordinate_gauge(
     let mut scaled_sum_squares = 1.0_f64;
     for row in training.rows() {
         for axis in 0..2 {
-            let centered = (row[axis] - anchor[axis]) - mean_offset[axis];
+            let centered = row[axis] / coordinate_scale - mean_scaled[axis];
             if !centered.is_finite() {
                 return Err(format!(
                     "{context} centered training coordinate overflowed on axis {axis}"
@@ -2256,16 +2282,18 @@ fn fit_shape_coordinate_gauge(
             }
         }
     }
-    let scale = norm_scale * (scaled_sum_squares / training.nrows() as f64).sqrt();
-    if !(scale.is_finite() && scale > 0.0) {
+    let rms_scaled = norm_scale * (scaled_sum_squares / training.nrows() as f64).sqrt();
+    let log_scale = coordinate_scale.ln() + rms_scaled.ln();
+    if !(rms_scaled.is_finite() && rms_scaled > 0.0 && log_scale.is_finite()) {
         return Err(format!(
             "{context} training coordinates have zero or non-finite centered scale"
         ));
     }
     Ok(ShapeCoordinateGauge {
-        anchor,
-        mean_offset,
-        scale,
+        coordinate_scale,
+        mean_scaled,
+        rms_scaled,
+        log_scale,
     })
 }
 
@@ -2282,8 +2310,9 @@ fn apply_shape_coordinate_gauge(
     let mut canonical = Array2::<f64>::zeros(coords.raw_dim());
     for row in 0..coords.nrows() {
         for axis in 0..2 {
-            let value = ((coords[[row, axis]] - gauge.anchor[axis]) - gauge.mean_offset[axis])
-                / gauge.scale;
+            let value = (coords[[row, axis]] / gauge.coordinate_scale
+                - gauge.mean_scaled[axis])
+                / gauge.rms_scaled;
             if !value.is_finite() {
                 return Err(format!(
                     "{context} canonical coordinate overflowed at row {row}, axis {axis}"
@@ -2333,7 +2362,7 @@ fn canonical_shape_fold(
     let training = gather_shape_rows(coords, train, &format!("{context} training fold"))?;
     let evaluation = gather_shape_rows(coords, eval, &format!("{context} evaluation fold"))?;
     let gauge = fit_shape_coordinate_gauge(training.view(), context)?;
-    let log_volume_scale = 2.0 * gauge.scale.ln();
+    let log_volume_scale = 2.0 * gauge.log_scale;
     if !log_volume_scale.is_finite() {
         return Err(format!("{context} coordinate Jacobian is non-finite"));
     }

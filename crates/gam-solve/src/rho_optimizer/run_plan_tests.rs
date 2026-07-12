@@ -3646,13 +3646,8 @@ fn reactive_domain_arrival_accepts_exact_finite_literal_seed() {
 fn active_outer_domain_refuses_singleton_search_interval() {
     let mut config = OuterConfig::default();
     config.bounds = Some((array![-1_000.0], array![1_000.0]));
-    let error = install_objective_domain(
-        &mut config,
-        1,
-        Some(array![700.0]),
-        Some(array![700.0]),
-    )
-    .expect_err("an active optimizer coordinate needs a nonzero-width interval");
+    let error = install_objective_domain(&mut config, 1, Some(array![700.0]), Some(array![700.0]))
+        .expect_err("an active optimizer coordinate needs a nonzero-width interval");
     let message = error.to_string();
     assert!(
         message.contains("no finite searchable interval")
@@ -3675,12 +3670,8 @@ fn custom_box_and_seed_are_intersected_with_both_objective_faces() {
             ..Default::default()
         })
         .with_max_iter(1);
-    let mut objective =
-        ReactiveDomainObjective::new(0.125, ReactiveDomainMode::FiniteAtColdSeed);
-    drop(problem.run(
-        &mut objective,
-        "two-sided objective-domain intersection",
-    ));
+    let mut objective = ReactiveDomainObjective::new(0.125, ReactiveDomainMode::FiniteAtColdSeed);
+    drop(problem.run(&mut objective, "two-sided objective-domain intersection"));
     assert!(!objective.rho_value_evals.is_empty());
     assert!(
         objective
