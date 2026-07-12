@@ -1947,18 +1947,21 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        let q = self.collect_joint_quantities(block_states)?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
         if self.x_link_wiggle.is_some() {
-            // #932: link-wiggle joint Hessian via the single-source §13 warp
-            // kernel; non-wiggle rows keep the bespoke path below.
-            let dynamic = self.build_dynamic_geometry(block_states)?;
             return Ok(Some(
                 super::row_kernel::survival_ls_wiggle_joint_hessian_dense(self, &dynamic, 0.0)?,
             ));
         }
-        // #932 measured perf exception: sparse hand assembler, pinned to the
-        // single-source jet by the analytic oracles (see the method doc).
-        self.assemble_joint_hessian_from_quantities(&q, block_states)
+        match self.survival_ls_coefficient_hessian(
+            &dynamic,
+            0.0,
+            None,
+            SlsCoefficientHessianTarget::DenseFull,
+        )? {
+            SlsCoefficientHessian::DenseFull(dense) => Ok(Some(dense)),
+            _ => unreachable!("dense-full SLS target returned another shape"),
+        }
     }
 
     fn exact_newton_joint_gradient_evaluation(
