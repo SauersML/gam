@@ -1766,14 +1766,6 @@ pub fn cell_moving_boundary_flux_tower_theta_integrand<const K1: usize, const K:
 
 // ── The program seam ─────────────────────────────────────────────────
 
-/// A family's row negative log-likelihood written ONCE over tower scalars.
-///
-/// This is the single source of truth #932 asks for: the value channel of
-/// the returned tower must BE the production row NLL (same branches, same
-/// guards, same numerics), and every derivative channel is then exact by
-/// construction. The linear Jacobian wiring (coefficients ↔ primaries) is
-/// NOT part of this trait — it is family data, not calculus, and stays on
-/// the `RowKernel` implementor.
 // ── The canonical single-source seam (#932 consolidation) ────────────
 //
 // `RowProgram<K>` is the ONE row-program interface #932 converges every family
