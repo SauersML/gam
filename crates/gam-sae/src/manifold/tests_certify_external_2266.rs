@@ -14,13 +14,14 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::inference::steering::steer_delta;
     use crate::manifold::{
-        SaeCertifyRequest, SaeFitAssignmentKind, SaeFitConfig, SaeFitSeedReport, SaeFitSeedRequest,
-        SaeMinimalSeedReport, SaeMinimalSeedRequest, SaeOuterVerdict, build_sae_fit_seed,
-        build_sae_minimal_seed, run_sae_manifold_certify,
+        SaeCertifyRequest, SaeFisherRowMetricRequest, SaeFitAssignmentKind, SaeFitConfig,
+        SaeFitSeedReport, SaeFitSeedRequest, SaeMinimalSeedReport, SaeMinimalSeedRequest,
+        SaeOuterVerdict, build_sae_fit_seed, build_sae_minimal_seed, run_sae_manifold_certify,
     };
     use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
-    use ndarray::Array2;
+    use ndarray::{Array2, Array3};
 
     const N_CIRCLE: usize = 64;
     const NOISE_SIGMA: f64 = 0.05;
@@ -88,6 +89,23 @@ mod tests {
             refine_routing,
         } = minimal;
 
+        // #2266 dosimetry check: a torch-lane trainer's fit is normally paired
+        // with an output-Fisher harvest shard (the SAME per-row metric a
+        // native fit installs). Install one here so this test can assert the
+        // certify entry's term is fully steer_delta-capable afterward — a
+        // rank-1 factor is enough to make the metric carry "behavior"
+        // (`MetricProvenance::OutputFisher`), which is the ONLY thing
+        // `validity_radius`/`predicted_nats` gate on (see
+        // `steering::metric_carries_behavior`); no closed-form-only state is
+        // required beyond the fitted term + this metric.
+        let p_out = target.ncols();
+        let fisher_u3 = Array3::<f64>::from_shape_fn((N_CIRCLE, p_out, 1), |(_, i, _)| {
+            if i == 0 { 1.0 } else { 0.0 }
+        });
+        let fisher_metric_request =
+            SaeFisherRowMetricRequest::from_tag(fisher_u3.view(), N_CIRCLE, p_out, None, None)
+                .expect("rank-1 output-Fisher metric request");
+
         let registry = AnalyticPenaltyRegistry::new();
         let seed = build_sae_fit_seed(SaeFitSeedRequest {
             target: target.view(),
@@ -119,7 +137,7 @@ mod tests {
             data_row_reseed: false,
             fit_config: SaeFitConfig::default(),
             temperature_schedule: None,
-            fisher_metric: None,
+            fisher_metric: Some(fisher_metric_request),
             row_loss_weights: None,
             registry: &registry,
         })
@@ -196,6 +214,38 @@ mod tests {
         assert!(
             report.penalized_quasi_laplace_criterion.is_finite(),
             "the penalized objective evaluated at the installed state must be finite"
+        );
+
+        // #2266 — validity_radius (and predicted_nats) is NOT a report field:
+        // it is a per-steer-call quantity `steer_delta` computes from the
+        // TERM + a behavioral RowMetric, exactly the same for a
+        // certify-external term as for a natively-fitted one. Prove the
+        // certified term is fully steer_delta-capable: the installed
+        // output-Fisher metric must have survived the certify entry's
+        // postlude untouched (no metric replacement anywhere in
+        // `run_sae_manifold_certify`'s certificate/diagnostics rebuild), and a
+        // small on-manifold move must report a finite, positive
+        // validity_radius exactly as it would off a native fit.
+        let metric = report
+            .term
+            .row_metric()
+            .expect("the installed output-Fisher metric must survive the certify entry verbatim");
+        let plan = steer_delta(&report.term, metric, 0, 0, 0.1, &[0.0], &[0.05])
+            .expect("steer_delta must run on a certify-external term paired with a behavioral metric");
+        assert!(
+            plan.validity_radius.is_some(),
+            "validity_radius must be Some for a certify-external term + behavioral metric — \
+             #2266's dosimetry contract needs the term + metric steer_delta reads, not a native \
+             closed-form solve"
+        );
+        let radius = plan.validity_radius.expect("checked above");
+        assert!(
+            radius.is_finite() && radius > 0.0,
+            "validity_radius must be a finite positive latent step length; got {radius}"
+        );
+        assert!(
+            plan.predicted_nats.is_some(),
+            "predicted_nats must likewise be available under a behavioral metric"
         );
     }
 }
