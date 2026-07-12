@@ -3,7 +3,6 @@
 pub mod calibration;
 pub mod cli_harness;
 pub mod fd_checker;
-pub mod marginal_slope_sigma_sweep;
 pub mod reference;
 
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
