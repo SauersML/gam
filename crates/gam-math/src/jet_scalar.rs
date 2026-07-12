@@ -1048,6 +1048,24 @@ pub fn filtered_implicit_solve_scalar<const K: usize, S: JetScalar<K>>(
 /// omit structurally impossible pairs rather than multiplying their zeros.
 pub trait HessianPattern<const K: usize, const H: usize> {
     const PAIRS: [(usize, usize); H];
+    const PAIR_BITS: [[u128; K]; K];
+}
+
+/// Build the symmetric axis-pair → patterned-slot lookup used by dependency
+/// propagation in [`PatternedOrder2`].
+pub const fn hessian_pair_bits<const K: usize, const H: usize>(
+    pairs: [(usize, usize); H],
+) -> [[u128; K]; K] {
+    let mut table = [[0u128; K]; K];
+    let mut slot = 0;
+    while slot < H {
+        let (i, j) = pairs[slot];
+        let bit = 1u128 << slot;
+        table[i][j] = bit;
+        table[j][i] = bit;
+        slot += 1;
+    }
+    table
 }
 
 /// Exact order-two jet with a dense gradient and a compile-time patterned
@@ -1063,6 +1081,8 @@ pub struct PatternedOrder2<P, const K: usize, const H: usize> {
     v: f64,
     g: [f64; K],
     h: [f64; H],
+    gradient_mask: u128,
+    hessian_mask: u128,
     pattern: std::marker::PhantomData<fn() -> P>,
 }
 
@@ -1097,6 +1117,23 @@ where
         }
         dense
     }
+
+    #[inline]
+    fn pair_mask_between(left: u128, right: u128) -> u128 {
+        let mut result = 0u128;
+        let mut left_axes = left;
+        while left_axes != 0 {
+            let i = left_axes.trailing_zeros() as usize;
+            left_axes &= left_axes - 1;
+            let mut right_axes = right;
+            while right_axes != 0 {
+                let j = right_axes.trailing_zeros() as usize;
+                right_axes &= right_axes - 1;
+                result |= P::PAIR_BITS[i][j];
+            }
+        }
+        result
+    }
 }
 
 impl<P, const K: usize, const H: usize> JetScalar<K> for PatternedOrder2<P, K, H>
@@ -1109,6 +1146,8 @@ where
             v: c,
             g: [0.0; K],
             h: [0.0; H],
+            gradient_mask: 0,
+            hessian_mask: 0,
             pattern: std::marker::PhantomData,
         }
     }
@@ -1118,6 +1157,7 @@ where
         let mut out = Self::constant(x);
         if axis < K {
             out.g[axis] = 1.0;
+            out.gradient_mask = 1u128 << axis;
         }
         out
     }
@@ -1130,10 +1170,18 @@ where
     #[inline]
     fn add(&self, other: &Self) -> Self {
         let mut out = Self::constant(self.v + other.v);
-        for i in 0..K {
+        out.gradient_mask = self.gradient_mask | other.gradient_mask;
+        let mut gradient_mask = out.gradient_mask;
+        while gradient_mask != 0 {
+            let i = gradient_mask.trailing_zeros() as usize;
+            gradient_mask &= gradient_mask - 1;
             out.g[i] = self.g[i] + other.g[i];
         }
-        for slot in 0..H {
+        out.hessian_mask = self.hessian_mask | other.hessian_mask;
+        let mut hessian_mask = out.hessian_mask;
+        while hessian_mask != 0 {
+            let slot = hessian_mask.trailing_zeros() as usize;
+            hessian_mask &= hessian_mask - 1;
             out.h[slot] = self.h[slot] + other.h[slot];
         }
         out
@@ -1142,10 +1190,18 @@ where
     #[inline]
     fn sub(&self, other: &Self) -> Self {
         let mut out = Self::constant(self.v - other.v);
-        for i in 0..K {
+        out.gradient_mask = self.gradient_mask | other.gradient_mask;
+        let mut gradient_mask = out.gradient_mask;
+        while gradient_mask != 0 {
+            let i = gradient_mask.trailing_zeros() as usize;
+            gradient_mask &= gradient_mask - 1;
             out.g[i] = self.g[i] - other.g[i];
         }
-        for slot in 0..H {
+        out.hessian_mask = self.hessian_mask | other.hessian_mask;
+        let mut hessian_mask = out.hessian_mask;
+        while hessian_mask != 0 {
+            let slot = hessian_mask.trailing_zeros() as usize;
+            hessian_mask &= hessian_mask - 1;
             out.h[slot] = self.h[slot] - other.h[slot];
         }
         out
@@ -1154,10 +1210,21 @@ where
     #[inline]
     fn mul(&self, other: &Self) -> Self {
         let mut out = Self::constant(self.v * other.v);
-        for i in 0..K {
+        out.gradient_mask = self.gradient_mask | other.gradient_mask;
+        let mut gradient_mask = out.gradient_mask;
+        while gradient_mask != 0 {
+            let i = gradient_mask.trailing_zeros() as usize;
+            gradient_mask &= gradient_mask - 1;
             out.g[i] = self.v * other.g[i] + self.g[i] * other.v;
         }
-        for (slot, &(i, j)) in P::PAIRS.iter().enumerate() {
+        out.hessian_mask = self.hessian_mask
+            | other.hessian_mask
+            | Self::pair_mask_between(self.gradient_mask, other.gradient_mask);
+        let mut hessian_mask = out.hessian_mask;
+        while hessian_mask != 0 {
+            let slot = hessian_mask.trailing_zeros() as usize;
+            hessian_mask &= hessian_mask - 1;
+            let (i, j) = P::PAIRS[slot];
             out.h[slot] = self.v * other.h[slot]
                 + self.g[i] * other.g[j]
                 + self.g[j] * other.g[i]
@@ -1174,10 +1241,18 @@ where
     #[inline]
     fn scale(&self, scale: f64) -> Self {
         let mut out = Self::constant(self.v * scale);
-        for i in 0..K {
+        out.gradient_mask = self.gradient_mask;
+        let mut gradient_mask = out.gradient_mask;
+        while gradient_mask != 0 {
+            let i = gradient_mask.trailing_zeros() as usize;
+            gradient_mask &= gradient_mask - 1;
             out.g[i] = self.g[i] * scale;
         }
-        for slot in 0..H {
+        out.hessian_mask = self.hessian_mask;
+        let mut hessian_mask = out.hessian_mask;
+        while hessian_mask != 0 {
+            let slot = hessian_mask.trailing_zeros() as usize;
+            hessian_mask &= hessian_mask - 1;
             out.h[slot] = self.h[slot] * scale;
         }
         out
@@ -1186,10 +1261,20 @@ where
     #[inline]
     fn compose_unary(&self, derivatives: [f64; 5]) -> Self {
         let mut out = Self::constant(derivatives[0]);
-        for i in 0..K {
+        out.gradient_mask = self.gradient_mask;
+        let mut gradient_mask = out.gradient_mask;
+        while gradient_mask != 0 {
+            let i = gradient_mask.trailing_zeros() as usize;
+            gradient_mask &= gradient_mask - 1;
             out.g[i] = derivatives[1] * self.g[i];
         }
-        for (slot, &(i, j)) in P::PAIRS.iter().enumerate() {
+        out.hessian_mask = self.hessian_mask
+            | Self::pair_mask_between(self.gradient_mask, self.gradient_mask);
+        let mut hessian_mask = out.hessian_mask;
+        while hessian_mask != 0 {
+            let slot = hessian_mask.trailing_zeros() as usize;
+            hessian_mask &= hessian_mask - 1;
+            let (i, j) = P::PAIRS[slot];
             out.h[slot] = derivatives[2] * self.g[i] * self.g[j] + derivatives[1] * self.h[slot];
         }
         out
