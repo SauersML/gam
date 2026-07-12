@@ -9047,14 +9047,14 @@ fn survival_jeffreys_contracted_trace_hessian_matches_fd_of_trace() {
 /// endgame cycle. The hook produces the identical completion in ONE `O(n·p²)`
 /// family pass, cheap enough to run every cycle.
 ///
-/// Marked `#[ignore]`: it is a wall-clock benchmark (unsuitable for shared-node
-/// CI timing) that also builds all `p(p+1)/2` pairwise passes, so it is slow by
-/// construction. Run on demand with `--ignored --nocapture`. When run it ALSO
-/// pins the hook to the independent pairwise path over the FULL `p×p` matrix
-/// (truncation-free, via `uᵀ∇²tr(W·H)v = tr(W·∂²H/∂β_u∂β_v)`), a strictly
-/// larger correctness surface than the 7-direction gate above.
+/// Wall-clock benchmark plus full-matrix pinning gate. It builds all
+/// `p(p+1)/2` pairwise passes, so it is slow by construction, and its timing
+/// assertion keeps a 20× margin under a theoretical ~p(p+1)/2 ≈ 861× ratio so
+/// shared-node scheduling noise cannot flip it. It ALSO pins the hook to the
+/// independent pairwise path over the FULL `p×p` matrix (truncation-free, via
+/// `uᵀ∇²tr(W·H)v = tr(W·∂²H/∂β_u∂β_v)`), a strictly larger correctness
+/// surface than the 7-direction gate above.
 #[test]
-#[ignore = "wall-clock perf benchmark (#979); run with --ignored --nocapture"]
 fn survival_jeffreys_contracted_trace_hook_beats_pairwise_979() {
     let n = 6000usize;
     let z: Vec<f64> = (0..n).map(|r| ((r as f64) * 0.29).sin() * 0.9).collect();

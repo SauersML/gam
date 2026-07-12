@@ -1,4 +1,5 @@
 use super::*;
+use ndarray::s;
 
 // ---------------------------------------------------------------------------
 // Operator-form wrapper for the REML/PIRLS canonical pipeline
@@ -271,8 +272,16 @@ impl AnalyticPenaltyRegistry {
                 self.total_rho_count()
             ));
         }
-        for (penalty, (slice, _, _)) in self.penalties.iter().zip(self.rho_layout()) {
-            penalty.validate_rho(rho.slice(s![slice]))?;
+        // Hot evaluation seam: walk the concatenated vector directly rather
+        // than allocating the diagnostic `rho_layout()` Vec on every value /
+        // gradient / Hessian call.
+        let mut offset = 0usize;
+        for penalty in &self.penalties {
+            let end = offset + penalty.rho_count();
+            penalty
+                .validate_rho(rho.slice(s![offset..end]))
+                .map_err(|error| format!("analytic penalty `{}`: {error}", penalty.name()))?;
+            offset = end;
         }
         Ok(())
     }
