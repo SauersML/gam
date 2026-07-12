@@ -73,6 +73,39 @@ pub fn empirical_p_value(
     })
 }
 
+/// Marchenko–Pastur detection-reach statement (#2262): the minimum
+/// per-observation signal energy `R·(1+√(p/n_eff))²` a reconstruction
+/// direction must clear to be distinguishable from noise at this
+/// `(n_eff, p, R)`. This is the identical closed-form noise edge the
+/// production rank charge already thresholds on
+/// ([`crate::manifold::construction::realised_rank_charge_dof`], and its
+/// audit twin [`crate::manifold::wbic_audit::ReconSpectrum::edge`]) —
+/// surfaced standalone so a shape-adjudication caller can report "this is
+/// the smallest signal this sample size and ambient dimension could ever
+/// certify" alongside a verdict, without needing a fitted decoder Gram to
+/// call the production path. A masked ring living below this floor (e.g.
+/// its per-observation signal-to-noise ratio does not clear `edge`) is
+/// architecturally undetectable by the MP-thresholded race, independent of
+/// whatever the adjudicator's verdict says.
+pub fn mp_detection_floor(n_eff: f64, p: f64, r_floor: f64) -> Result<f64, String> {
+    if !(n_eff > 0.0) {
+        return Err(format!(
+            "mp_detection_floor: n_eff must be positive; got {n_eff}"
+        ));
+    }
+    if !p.is_finite() || p < 0.0 {
+        return Err(format!(
+            "mp_detection_floor: p must be finite and non-negative; got {p}"
+        ));
+    }
+    if !r_floor.is_finite() || r_floor < 0.0 {
+        return Err(format!(
+            "mp_detection_floor: r_floor must be finite and non-negative; got {r_floor}"
+        ));
+    }
+    Ok(r_floor * (1.0 + (p / n_eff).sqrt()).powi(2))
+}
+
 /// One member of the standing null battery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NullKind {
@@ -1686,6 +1719,56 @@ fn normalize(v: &mut Array1<f64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mp_detection_floor_matches_recon_spectrum_edge() {
+        use ndarray::array;
+
+        let gram = array![[3.0, 0.5], [0.5, 2.0]];
+        let decoder = array![[1.0, 0.0, 0.5], [0.0, 1.0, -0.5]];
+        let n_eff = 40.0;
+        let p_out = 3.0;
+        let r_floor = 1.25;
+
+        let spectrum =
+            crate::manifold::recon_spectrum(&gram, &decoder, n_eff, p_out, r_floor, 0.0, None)
+                .expect("recon_spectrum should succeed on a well-posed Gram");
+        let floor = mp_detection_floor(n_eff, p_out, r_floor)
+            .expect("mp_detection_floor should succeed on valid inputs");
+
+        assert!(
+            (spectrum.edge - floor).abs() < 1.0e-12,
+            "standalone detection floor must match the production MP edge byte-for-byte: \
+             spectrum.edge={} floor={}",
+            spectrum.edge,
+            floor
+        );
+    }
+
+    #[test]
+    fn mp_detection_floor_grows_with_ambient_dimension_and_dispersion() {
+        let base = mp_detection_floor(50.0, 10.0, 1.0).unwrap();
+        let wider = mp_detection_floor(50.0, 200.0, 1.0).unwrap();
+        let noisier = mp_detection_floor(50.0, 10.0, 4.0).unwrap();
+        assert!(
+            wider > base,
+            "a larger ambient dimension should raise the detection floor: base={base} wider={wider}"
+        );
+        assert!(
+            noisier > base,
+            "higher dispersion should raise the detection floor: base={base} noisier={noisier}"
+        );
+    }
+
+    #[test]
+    fn mp_detection_floor_rejects_invalid_inputs() {
+        assert!(mp_detection_floor(0.0, 10.0, 1.0).is_err());
+        assert!(mp_detection_floor(-1.0, 10.0, 1.0).is_err());
+        assert!(mp_detection_floor(50.0, -1.0, 1.0).is_err());
+        assert!(mp_detection_floor(50.0, 10.0, -1.0).is_err());
+        assert!(mp_detection_floor(50.0, f64::NAN, 1.0).is_err());
+        assert!(mp_detection_floor(50.0, 10.0, f64::INFINITY).is_err());
+    }
 
     #[test]
     fn structured_signal_beats_required_nulls_but_noise_does_not() {
