@@ -89,6 +89,7 @@ from ._rust import (  # native topology-census instruments
     adjudicate_atom_shape,
     shape_matched_control,
 )
+from ._shape_census import ShapeControlledCensus, run_shape_controlled_census
 from ._compare import compare_models
 from ._linear_dictionary import LinearDictionaryFit, linear_dictionary_fit
 from ._sparse_dictionary import (

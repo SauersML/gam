@@ -1,19 +1,23 @@
-"""Centroid circular-ordering test: are a mixture's clusters arranged on a ring?
+"""Centroid circular-ordering diagnostic: are candidate centers ordered on a ring?
 
-Second-tier companion to ``gamfit.adjudicate_atom_shape``. The shape race
-reads discrete concept clusters ARRANGED ON a circle (weekday/month token
-sets are the measured case) as ``mixture_k``, because a Gaussian mixture
-explains clumpy mass better pointwise than a uniform ring — even when the
-ring is real and causally validated. This module asks the follow-up
-question the race cannot: *are the mixture's own centroids arranged on a
-circle, against a matched Gaussian null?*
+Companion to ``gamfit.adjudicate_atom_shape``. The production race now owns
+discrete cyclic structure through ``ring_clusters_k{k}``, and its
+``circle_wins`` flag compares the combined stacking mass of the smooth-circle
+and ring-of-clusters candidates against the combined non-circular mass. This
+module is an independent ordering diagnostic: it can corroborate the selected
+ring-cluster order, or test whether the centroids of a winning free
+``mixture_k{k}`` nevertheless exhibit circular order against a matched
+Gaussian null.
 
 Procedure (validated in the two-tier census of real Qwen3-8B SAE features;
-the same construction rescued known calendar circles the race mislabeled and
-correctly failed rings masked past ~1x their radius):
+the same construction historically exposed calendar circles before the
+ring-of-clusters density landed, and correctly failed rings masked past ~1x
+their radius):
 
   1. Seeded k-means on the 2-D coordinates, with k = the adjudicator's
-     ``mixture_k`` (k >= 3 required for a meaningful ring test).
+     ``ring_clusters_k`` when diagnosing its circular candidate, or
+     ``mixture_k`` when diagnosing the free-mixture candidate (k >= 3 is
+     required for a meaningful ring test).
   2. Ring statistic on the centroids: coefficient of variation (CV) of
      centroid radii about the centroid mean (low CV = centroids sit on a
      circle), plus angular coverage (max angular gap between sorted
@@ -101,10 +105,12 @@ def centroid_circular_ordering(coords: np.ndarray, k: int, *, seed: int = 0,
                                gap_thresh_deg: float = 150.0) -> dict:
     """Full second-tier test on a ``(n, 2)`` coordinate cloud.
 
-    ``k`` should be the adjudicator's chosen ``mixture_k`` (>= 3). Returns a
-    dict with ``radius_cv``, ``max_gap_deg``, ``mc_p``, the centers, and the
-    combined verdict ``ordered_on_circle`` (p below threshold AND angular
-    coverage without a large gap).
+    ``k`` should be the order of the candidate being diagnosed:
+    ``ring_clusters_k`` for the constrained circular candidate or
+    ``mixture_k`` for the free-mixture candidate. Returns a dict with
+    ``radius_cv``, ``max_gap_deg``, ``mc_p``, the centers, and the combined
+    verdict ``ordered_on_circle`` (p below threshold AND angular coverage
+    without a large gap).
     """
     coords = np.asarray(coords, dtype=np.float64)
     if coords.ndim != 2 or coords.shape[1] != 2:

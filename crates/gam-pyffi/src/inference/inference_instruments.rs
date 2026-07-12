@@ -1470,6 +1470,87 @@ mod tests {
         assert!(circle_wins);
     }
 
+    #[test]
+    fn discrete_rung_orders_are_selected_inside_each_outer_training_fold() {
+        use gam::solver::evidence::GaussianMixtureConfig;
+
+        let train_rows = 90usize;
+        let eval_rows = 18usize;
+        let mut free_coords = Array2::<f64>::zeros((train_rows + eval_rows, 2));
+        for row in 0..train_rows {
+            let cluster = row % 2;
+            let phase = std::f64::consts::TAU * (row / 2) as f64 / (train_rows / 2) as f64;
+            free_coords[[row, 0]] = if cluster == 0 { -2.0 } else { 2.0 } + 0.12 * phase.cos();
+            free_coords[[row, 1]] = 0.08 * phase.sin();
+        }
+        // These outer-held-out rows form a remote third cluster. If they leak
+        // into order selection or parameter fitting, the returned density
+        // cannot equal the independently fitted training-only prediction.
+        for slot in 0..eval_rows {
+            let row = train_rows + slot;
+            let phase = std::f64::consts::TAU * slot as f64 / eval_rows as f64;
+            free_coords[[row, 0]] = 40.0 + 0.2 * phase.cos();
+            free_coords[[row, 1]] = -30.0 + 0.2 * phase.sin();
+        }
+        let train = (0..train_rows).collect::<Vec<_>>();
+        let eval = (train_rows..train_rows + eval_rows).collect::<Vec<_>>();
+        let train_coords = gather_shape_rows(free_coords.view(), &train, "test train").unwrap();
+        let eval_coords = gather_shape_rows(free_coords.view(), &eval, "test eval").unwrap();
+        let config = GaussianMixtureConfig::default();
+        let ladder = vec![2usize, 3];
+        let (train_selected_k, expected) = free_mixture_rung_predictive_density(
+            train_coords.view(),
+            eval_coords.view(),
+            &ladder,
+            config,
+        )
+        .unwrap();
+        let actual = free_mixture_rung_provider_2d(free_coords, ladder, config)(&train, &eval)
+            .expect("outer provider must fit and select only on training rows");
+        assert!(train_selected_k >= 2);
+        assert_eq!(actual, expected);
+
+        let clusters = 3usize;
+        let per_cluster = 30usize;
+        let mut ring_coords = Array2::<f64>::zeros((clusters * per_cluster + eval_rows, 2));
+        for cluster in 0..clusters {
+            let angle = std::f64::consts::TAU * cluster as f64 / clusters as f64;
+            for sample in 0..per_cluster {
+                let phase = std::f64::consts::TAU * sample as f64 / per_cluster as f64;
+                let row = cluster * per_cluster + sample;
+                ring_coords[[row, 0]] =
+                    (2.0 + 0.08 * phase.cos()) * angle.cos() - 0.05 * phase.sin() * angle.sin();
+                ring_coords[[row, 1]] =
+                    (2.0 + 0.08 * phase.cos()) * angle.sin() + 0.05 * phase.sin() * angle.cos();
+            }
+        }
+        for slot in 0..eval_rows {
+            let row = clusters * per_cluster + slot;
+            ring_coords[[row, 0]] = 25.0 + slot as f64;
+            ring_coords[[row, 1]] = -20.0;
+        }
+        let ring_train = (0..clusters * per_cluster).collect::<Vec<_>>();
+        let ring_eval =
+            (clusters * per_cluster..clusters * per_cluster + eval_rows).collect::<Vec<_>>();
+        let ring_train_coords =
+            gather_shape_rows(ring_coords.view(), &ring_train, "ring test train").unwrap();
+        let ring_eval_coords =
+            gather_shape_rows(ring_coords.view(), &ring_eval, "ring test eval").unwrap();
+        let ring_ladder = vec![3usize, 4];
+        let (ring_selected_k, ring_expected) = ring_cluster_rung_predictive_density(
+            ring_train_coords.view(),
+            ring_eval_coords.view(),
+            &ring_ladder,
+            config,
+        )
+        .unwrap();
+        let ring_actual =
+            ring_cluster_rung_provider_2d(ring_coords, ring_ladder, config)(&ring_train, &ring_eval)
+                .expect("ring provider must fit and select only on training rows");
+        assert!(ring_selected_k >= 3);
+        assert_eq!(ring_actual, ring_expected);
+    }
+
     /// #2262 structureless-null control: on pure isotropic Gaussian noise (no
     /// ring, no cluster structure whatsoever) both matched controls must still
     /// run cleanly end to end and produce a well-formed
@@ -1543,9 +1624,9 @@ mod tests {
     fn detection_floor_matches_closed_form_mp_edge_2262() {
         use gam::terms::sae::null_battery::mp_detection_floor;
 
-        let n_eff = 84.0;
-        let ambient_p = 64.0;
-        let dispersion_r = 1.005;
+        let n_eff = 84.0_f64;
+        let ambient_p = 64.0_f64;
+        let dispersion_r = 1.005_f64;
         let expected = dispersion_r * (1.0 + (ambient_p / n_eff).sqrt()).powi(2);
         let floor =
             mp_detection_floor(n_eff, ambient_p, dispersion_r).expect("valid inputs must succeed");
@@ -2245,6 +2326,99 @@ fn canonical_shape_coordinates(coords: ArrayView2<'_, f64>) -> Result<Array2<f64
     Ok(centered)
 }
 
+fn gather_shape_rows(
+    coords: ArrayView2<'_, f64>,
+    rows: &[usize],
+    context: &str,
+) -> Result<Array2<f64>, String> {
+    if rows.iter().any(|&row| row >= coords.nrows()) {
+        return Err(format!(
+            "{context} contains an out-of-bounds row for {} coordinates",
+            coords.nrows()
+        ));
+    }
+    let mut gathered = Array2::<f64>::zeros((rows.len(), coords.ncols()));
+    for (target, &source) in rows.iter().enumerate() {
+        gathered.row_mut(target).assign(&coords.row(source));
+    }
+    Ok(gathered)
+}
+
+/// Select the free-cluster order using only an outer fold's training rows, then
+/// score that fold's untouched evaluation rows. The full-data order remains a
+/// useful final-fit/evidence summary, but it must never choose the model used to
+/// construct an outer-held-out predictive density.
+fn free_mixture_rung_predictive_density(
+    train: ArrayView2<'_, f64>,
+    eval: ArrayView2<'_, f64>,
+    ladder: &[usize],
+    config: gam::solver::evidence::GaussianMixtureConfig,
+) -> Result<(usize, Vec<f64>), String> {
+    let rung = gam::solver::fit_mixture_rung(train, ladder, config)?;
+    // Refinement may probe k=1 while bracketing k=2. Euclidean already owns
+    // that identical one-component Gaussian, so the free-cluster class starts
+    // at k=2 in every outer training fold just as it does on the full data.
+    let fit = rung
+        .fits
+        .iter()
+        .find(|fit| fit.k >= 2)
+        .ok_or_else(|| "fold-local mixture selection produced no order k >= 2".to_string())?;
+    Ok((
+        fit.k,
+        fit.fit.per_point_log_density(eval)?.to_vec(),
+    ))
+}
+
+fn ring_cluster_rung_predictive_density(
+    train: ArrayView2<'_, f64>,
+    eval: ArrayView2<'_, f64>,
+    ladder: &[usize],
+    config: gam::solver::evidence::GaussianMixtureConfig,
+) -> Result<(usize, Vec<f64>), String> {
+    let rung = gam::solver::fit_ring_of_clusters_rung(train, ladder, config)?;
+    let fit = rung.winner();
+    Ok((
+        fit.k,
+        fit.fit.per_point_log_density(eval)?.to_vec(),
+    ))
+}
+
+fn free_mixture_rung_provider_2d(
+    coords: Array2<f64>,
+    ladder: Vec<usize>,
+    config: gam::solver::evidence::GaussianMixtureConfig,
+) -> gam::solver::HeldOutDensityProvider<'static> {
+    Box::new(move |train: &[usize], eval: &[usize]| {
+        let train_coords = gather_shape_rows(coords.view(), train, "mixture training fold")?;
+        let eval_coords = gather_shape_rows(coords.view(), eval, "mixture evaluation fold")?;
+        free_mixture_rung_predictive_density(
+            train_coords.view(),
+            eval_coords.view(),
+            &ladder,
+            config,
+        )
+        .map(|(_, density)| density)
+    })
+}
+
+fn ring_cluster_rung_provider_2d(
+    coords: Array2<f64>,
+    ladder: Vec<usize>,
+    config: gam::solver::evidence::GaussianMixtureConfig,
+) -> gam::solver::HeldOutDensityProvider<'static> {
+    Box::new(move |train: &[usize], eval: &[usize]| {
+        let train_coords = gather_shape_rows(coords.view(), train, "ring-cluster training fold")?;
+        let eval_coords = gather_shape_rows(coords.view(), eval, "ring-cluster evaluation fold")?;
+        ring_cluster_rung_predictive_density(
+            train_coords.view(),
+            eval_coords.view(),
+            &ladder,
+            config,
+        )
+        .map(|(_, density)| density)
+    })
+}
+
 fn run_atom_shape_race(
     coords: ArrayView2<'_, f64>,
     folds: usize,
@@ -2255,8 +2429,7 @@ fn run_atom_shape_race(
     use gam::solver::topology_selector::EvidenceCertification;
     use gam::solver::{
         AutoTopologyKind, CrossClassCandidate, Headline, adjudicate_cross_class_race,
-        fit_mixture_rung, fit_ring_of_clusters_rung, mixture_density_provider,
-        ring_of_clusters_density_provider,
+        fit_mixture_rung, fit_ring_of_clusters_rung,
     };
 
     if coords.ncols() != 2 {
@@ -2332,15 +2505,22 @@ fn run_atom_shape_race(
             kind: AutoTopologyKind::Mixture { k: mixture_k },
             negative_log_evidence: mixture_winner.negative_log_evidence,
             certification: EvidenceCertification::Exact,
-            density_provider: mixture_density_provider(owned.view(), mixture_k, config),
+            // The displayed/reported k is the full-data final fit. Its outer-CV
+            // predictive column independently selects k on each training fold,
+            // so held-out rows cannot leak into model-order selection.
+            density_provider: free_mixture_rung_provider_2d(
+                owned.clone(),
+                mixture_ladder.clone(),
+                config,
+            ),
         },
         CrossClassCandidate {
             kind: AutoTopologyKind::RingOfClusters { k: ring_clusters_k },
             negative_log_evidence: ring_clusters.winner().negative_log_evidence,
             certification: EvidenceCertification::Exact,
-            density_provider: ring_of_clusters_density_provider(
-                owned.view(),
-                ring_clusters_k,
+            density_provider: ring_cluster_rung_provider_2d(
+                owned.clone(),
+                ring_cluster_ladder.clone(),
                 config,
             ),
         },

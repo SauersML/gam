@@ -25,6 +25,72 @@ gamfit = pytest.importorskip("gamfit")
 pytest.importorskip("gamfit._rust")
 
 
+def test_shape_controlled_census_replays_the_exact_full_pipeline() -> None:
+    rows = np.arange(64, dtype=np.float64)
+    activations = np.column_stack(
+        [
+            1.0e6 + rows,
+            -2.0e6 + np.sin(rows),
+            (rows % 7.0) - 3.0,
+            np.cos(0.25 * rows),
+        ]
+    )
+    pristine = activations.copy()
+    calls: list[tuple[np.ndarray, int]] = []
+
+    def pipeline(matrix: np.ndarray, seed: int) -> dict[str, float | int]:
+        snapshot = matrix.copy()
+        calls.append((snapshot, seed))
+        # A real training pipeline is allowed to mutate its working matrix. The
+        # runner must isolate that mutation from both later controls.
+        matrix.fill(np.nan)
+        return {"seed": seed, "checksum": float(snapshot.sum())}
+
+    result = gamfit.run_shape_controlled_census(
+        activations,
+        pipeline,
+        control_seed=2262,
+        pipeline_seed=17,
+    )
+    assert isinstance(result, gamfit.ShapeControlledCensus)
+    assert len(calls) == 3
+    assert [seed for _, seed in calls] == [17, 17, 17]
+    np.testing.assert_array_equal(calls[0][0], pristine)
+    np.testing.assert_array_equal(activations, pristine)
+
+    expected_shuffle = gamfit.shape_matched_control(
+        pristine,
+        "per_dimension_shuffle",
+        seed=result.per_dimension_shuffle_seed,
+    )
+    expected_gaussian = gamfit.shape_matched_control(
+        pristine,
+        "covariance_matched_gaussian",
+        seed=result.covariance_matched_gaussian_seed,
+    )
+    np.testing.assert_array_equal(calls[1][0], expected_shuffle)
+    np.testing.assert_array_equal(calls[2][0], expected_gaussian)
+    assert result.observed["checksum"] == pytest.approx(float(pristine.sum()))
+    assert result.per_dimension_shuffle["checksum"] == pytest.approx(
+        float(expected_shuffle.sum())
+    )
+    assert result.covariance_matched_gaussian["checksum"] == pytest.approx(
+        float(expected_gaussian.sum())
+    )
+
+
+def test_shape_controlled_census_rejects_ambiguous_seeds_and_bad_data() -> None:
+    pipeline = lambda matrix, seed: (matrix.shape, seed)
+    with pytest.raises(TypeError, match="control_seed"):
+        gamfit.run_shape_controlled_census(np.ones((4, 2)), pipeline, control_seed=True)
+    with pytest.raises(ValueError, match="pipeline_seed"):
+        gamfit.run_shape_controlled_census(np.ones((4, 2)), pipeline, pipeline_seed=-1)
+    with pytest.raises(ValueError, match="finite"):
+        gamfit.run_shape_controlled_census(
+            np.array([[1.0, np.nan], [2.0, 3.0]]), pipeline
+        )
+
+
 def test_layer_transport_fit_reaches_python():
     rng = np.random.default_rng(0)
     t = np.sort(rng.uniform(0.0, 2.0 * math.pi, size=200))

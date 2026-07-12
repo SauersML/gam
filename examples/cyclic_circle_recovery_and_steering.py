@@ -14,9 +14,11 @@ permutation null, steering-validated):
      label-aware chart is rebuilt for every shuffled labeling, so chart
      construction cannot inflate the statistic); (b) the
      ``gamfit.adjudicate_atom_shape`` race on the 2-D coords, paired with the
-     centroid circular-ordering second tier (``centroid_ordering.py`` next to
-     this file) — discrete clusters ON a ring adjudicate as ``mixture_k``, and
-     the centroid test is what rescues the real circle from that verdict.
+     centroid circular-ordering diagnostic (``centroid_ordering.py`` next to
+     this file). The race owns discrete cyclic structure through its
+     ``ring_clusters_k`` candidate, and ``circle_wins`` compares total circular
+     stacking mass (smooth circle plus ring clusters) with total non-circular
+     mass. The centroid test independently checks angular ordering.
   3. STEER: fit a circle atom on final-position activations of calendar
      continuation prompts (gamfit torch lane), then patch the chord of the
      fitted decoder curve into the residual stream and measure next-token
@@ -409,13 +411,27 @@ def run_concept(model, tok, gamfit_mod, concept: str, words, rec_templates,
         verdict.pop("negative_log_evidence", None)
     except Exception as exc:  # noqa: BLE001
         verdict = {"error": f"{type(exc).__name__}: {exc}"}
-    # Discrete clusters ON a ring typically adjudicate as mixture_k — run the
-    # centroid second tier at the race's own k (fall back to the period).
-    k2 = int(verdict.get("mixture_k", period)) if "error" not in verdict else period
+    # Diagnose the class that owns the verdict. A circular class win uses the
+    # constrained ring candidate's order; otherwise the free mixture's order
+    # checks whether a nominally non-circular cluster winner is nevertheless
+    # angularly ordered. The known concept period is only used when the shape
+    # race itself failed and therefore returned no fitted orders.
+    if "error" in verdict:
+        tier2_candidate = "known_period_after_adjudication_error"
+        k2 = period
+    elif bool(verdict["circle_wins"]):
+        tier2_candidate = "ring_clusters"
+        k2 = int(verdict["ring_clusters_k"])
+    else:
+        tier2_candidate = "free_mixture"
+        k2 = int(verdict["mixture_k"])
     tier2 = centroid_circular_ordering(coords2, max(k2, 3), seed=seed,
                                        n_null=n_perm)
     tier2.pop("centers", None)
-    log(f"  adjudicator: {verdict.get('winner', verdict)}; centroid tier-2: "
+    tier2["candidate_class"] = tier2_candidate
+    log(f"  adjudicator: {verdict.get('winner', verdict)}; "
+        f"circular_class_wins={verdict.get('circle_wins')}; "
+        f"centroid diagnostic ({tier2_candidate}, k={k2}): "
         f"ordered_on_circle={tier2['ordered_on_circle']} "
         f"(radius_cv={tier2['radius_cv']:.3f}, mc_p={tier2['mc_p']:.4f})")
 
