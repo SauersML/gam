@@ -806,6 +806,229 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOneSeed<'arena> {
     }
 }
 
+/// Reusable arena plus lane count for [`DynamicOneSeedBatch`].
+///
+/// A caller resets this once per row/chunk and evaluates every requested
+/// third-derivative contraction in one row-program pass. The bump retains its
+/// largest chunk, so warmed rows do not return to the global allocator.
+#[derive(Debug)]
+pub struct DynamicOneSeedBatchWorkspace {
+    arena: DynamicJetArena,
+    lanes: usize,
+}
+
+impl DynamicOneSeedBatchWorkspace {
+    /// Create a reusable workspace for `lanes` simultaneous directions.
+    #[must_use]
+    pub fn new(lanes: usize) -> Self {
+        Self {
+            arena: DynamicJetArena::new(),
+            lanes,
+        }
+    }
+
+    /// Reclaim all jet storage and select the next evaluation's lane count.
+    pub fn reset(&mut self, lanes: usize) {
+        self.arena.reset();
+        self.lanes = lanes;
+    }
+
+    /// Bytes retained by the bump allocator after the largest evaluation.
+    #[must_use]
+    pub fn allocated_bytes(&self) -> usize {
+        self.arena.allocated_bytes()
+    }
+
+    /// Allocate a primary array in the same arena as every scalar channel.
+    #[inline(always)]
+    pub fn alloc_slice_fill_with<T>(
+        &self,
+        len: usize,
+        fill: impl FnMut(usize) -> T,
+    ) -> &mut [T] {
+        self.arena.alloc_slice_fill_with(len, fill)
+    }
+}
+
+/// Runtime-sized batch of one-seed contractions sharing one order-two base.
+///
+/// Lane `l` is algebraically identical to a standalone [`DynamicOneSeed`]
+/// seeded by direction `u_l`, but the value/gradient/Hessian base is evaluated
+/// once rather than once per direction. The output lane's epsilon Hessian is
+/// `sum_c d³f/(dx_a dx_b dx_c) u_l[c]`.
+#[derive(Clone, Copy, Debug)]
+pub struct DynamicOneSeedBatch<'arena> {
+    /// Shared value/gradient/Hessian channels.
+    pub base: DynamicOrder2<'arena>,
+    /// One nilpotent epsilon coefficient per contraction direction.
+    eps: &'arena [DynamicOrder2<'arena>],
+}
+
+impl<'arena> DynamicOneSeedBatch<'arena> {
+    /// Seed one primary across every direction lane.
+    #[inline(always)]
+    #[must_use]
+    pub fn seed_directions(
+        x: f64,
+        axis: usize,
+        dimension: usize,
+        workspace: &'arena DynamicOneSeedBatchWorkspace,
+        mut direction_at: impl FnMut(usize) -> f64,
+    ) -> Self {
+        let eps = workspace.arena.alloc_slice_fill_with(workspace.lanes, |lane| {
+            DynamicOrder2::constant(direction_at(lane), dimension, &workspace.arena)
+        });
+        Self {
+            base: DynamicOrder2::variable(x, axis, dimension, &workspace.arena),
+            eps,
+        }
+    }
+
+    /// Number of simultaneous contraction directions.
+    #[inline(always)]
+    #[must_use]
+    pub fn lanes(&self) -> usize {
+        self.eps.len()
+    }
+
+    /// Row-major contracted-third matrix for one direction lane.
+    #[inline(always)]
+    #[must_use]
+    pub fn contracted_third(&self, lane: usize) -> &[f64] {
+        self.eps[lane].h()
+    }
+
+    #[inline(always)]
+    fn assert_compatible(&self, other: &Self) {
+        self.base.assert_compatible(&other.base);
+        assert_eq!(
+            self.eps.len(),
+            other.eps.len(),
+            "dynamic one-seed batch lane mismatch"
+        );
+    }
+}
+
+impl<'arena> RuntimeJetScalar<'arena> for DynamicOneSeedBatch<'arena> {
+    type Workspace = DynamicOneSeedBatchWorkspace;
+
+    #[inline(always)]
+    fn constant(
+        c: f64,
+        dimension: usize,
+        workspace: &'arena DynamicOneSeedBatchWorkspace,
+    ) -> Self {
+        let eps = workspace.arena.alloc_slice_fill_with(workspace.lanes, |_| {
+            DynamicOrder2::constant(0.0, dimension, &workspace.arena)
+        });
+        Self {
+            base: DynamicOrder2::constant(c, dimension, &workspace.arena),
+            eps,
+        }
+    }
+
+    #[inline(always)]
+    fn variable(
+        x: f64,
+        axis: usize,
+        dimension: usize,
+        workspace: &'arena DynamicOneSeedBatchWorkspace,
+    ) -> Self {
+        let eps = workspace.arena.alloc_slice_fill_with(workspace.lanes, |_| {
+            DynamicOrder2::constant(0.0, dimension, &workspace.arena)
+        });
+        Self {
+            base: DynamicOrder2::variable(x, axis, dimension, &workspace.arena),
+            eps,
+        }
+    }
+
+    #[inline(always)]
+    fn dimension(&self) -> usize {
+        self.base.dimension()
+    }
+
+    #[inline(always)]
+    fn value(&self) -> f64 {
+        self.base.value()
+    }
+
+    #[inline(always)]
+    fn add(&self, other: &Self) -> Self {
+        self.assert_compatible(other);
+        let eps = self
+            .base
+            .arena
+            .alloc_slice_fill_with(self.eps.len(), |lane| self.eps[lane].add(&other.eps[lane]));
+        Self {
+            base: self.base.add(&other.base),
+            eps,
+        }
+    }
+
+    #[inline(always)]
+    fn sub(&self, other: &Self) -> Self {
+        self.assert_compatible(other);
+        let eps = self
+            .base
+            .arena
+            .alloc_slice_fill_with(self.eps.len(), |lane| self.eps[lane].sub(&other.eps[lane]));
+        Self {
+            base: self.base.sub(&other.base),
+            eps,
+        }
+    }
+
+    #[inline(always)]
+    fn mul(&self, other: &Self) -> Self {
+        self.assert_compatible(other);
+        let eps = self.base.arena.alloc_slice_fill_with(self.eps.len(), |lane| {
+            self.base
+                .mul(&other.eps[lane])
+                .add(&self.eps[lane].mul(&other.base))
+        });
+        Self {
+            base: self.base.mul(&other.base),
+            eps,
+        }
+    }
+
+    #[inline(always)]
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
+
+    #[inline(always)]
+    fn scale(&self, scale: f64) -> Self {
+        let eps = self
+            .base
+            .arena
+            .alloc_slice_fill_with(self.eps.len(), |lane| self.eps[lane].scale(scale));
+        Self {
+            base: self.base.scale(scale),
+            eps,
+        }
+    }
+
+    #[inline(always)]
+    fn compose_unary(&self, derivatives: [f64; 5]) -> Self {
+        let fprime = self.base.compose_unary([
+            derivatives[1],
+            derivatives[2],
+            derivatives[3],
+            derivatives[4],
+            derivatives[4],
+        ]);
+        let eps = self.base.arena.alloc_slice_fill_with(self.eps.len(), |lane| {
+            fprime.mul(&self.eps[lane])
+        });
+        Self {
+            base: self.base.compose_unary(derivatives),
+            eps,
+        }
+    }
+}
+
 /// Runtime-sized two-seed scalar for a Hessian-contracted fourth derivative.
 #[derive(Clone, Copy, Debug)]
 pub struct DynamicTwoSeed<'arena> {
