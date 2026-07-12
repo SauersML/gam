@@ -331,9 +331,33 @@ fn first_wall_hit(u: f64, w: f64, g: f64, t_max: f64) -> Option<f64> {
             // Moving outward → reflect immediately.
             return Some(0.0);
         }
-        // Moving inward (or tangent): the next downward crossing is ~a full
-        // period away, well beyond t_max ≤ π/2, so there is no hit to register.
-        return None;
+        if g >= 0.0 {
+            // Feasible-center geometry: from the wall with inward (or
+            // tangent) velocity, the next downward crossing sits at
+            // ψ + acos(−g/r) ≥ ψ + π/2 > t_max, so there is no hit to
+            // register within the arc.
+            return None;
+        }
+        // INFEASIBLE center (g < 0): the harmonic pull points THROUGH this
+        // wall, so an inward launch curves back and exits the polytope
+        // within the arc whenever the launch speed is small (downward
+        // crossing at ψ + acos(−g/r) with acos(·) < π/2). Taking the
+        // feasible-center shortcut here let the trajectory pass straight
+        // through the wall — the measured infeasible draw (β = −0.518 for
+        // the β ≥ 0, center −1 half-normal fixture, whose start sits
+        // exactly on its active wall). Compute the exact downward crossing
+        // HERE rather than falling through: the interior path's sub-eps
+        // wrap-correction assumes c0 > eps and would misread a genuine
+        // near-tangent exit (t ≈ 0⁺) as a wrap artefact. A sub-eps root is
+        // returned as an immediate bounce; the bounce cap backstops the
+        // degenerate tangent case at a feasible on-wall position.
+        let r = (u * u + w * w).sqrt();
+        if r <= AMPLITUDE_FLOOR {
+            return None;
+        }
+        let q = (-g / r).clamp(-1.0, 1.0);
+        let t = (w.atan2(u) + q.acos()).rem_euclid(2.0 * std::f64::consts::PI);
+        return if t <= t_max { Some(t) } else { None };
     }
 
     let r = (u * u + w * w).sqrt();
