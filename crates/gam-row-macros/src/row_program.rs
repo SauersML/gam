@@ -525,6 +525,88 @@ fn witness_dependencies(statements: &[Statement], witnesses: &[Ident]) -> HashSe
     }
 }
 
+fn collect_scalar_expression_dependencies(expression: &Expr, dependencies: &mut HashSet<String>) {
+    match expression {
+        Expr::Path(path) => {
+            if let Some(ident) = path.path.get_ident() {
+                dependencies.insert(ident.to_string());
+            }
+        }
+        Expr::Paren(ExprParen { expr, .. }) | Expr::Group(ExprGroup { expr, .. }) => {
+            collect_scalar_expression_dependencies(expr, dependencies);
+        }
+        Expr::Unary(ExprUnary { expr, .. }) => {
+            collect_scalar_expression_dependencies(expr, dependencies);
+        }
+        Expr::Binary(ExprBinary { left, right, .. }) => {
+            collect_scalar_expression_dependencies(left, dependencies);
+            collect_scalar_expression_dependencies(right, dependencies);
+        }
+        Expr::Lit(_) => {}
+        _ => unreachable!("validated row_program scalar grammar"),
+    }
+}
+
+fn collect_program_scalar_dependencies(
+    expression: &ProgramExpr,
+    dependencies: &mut HashSet<String>,
+) {
+    match expression {
+        ProgramExpr::Path(_) | ProgramExpr::Zero => {}
+        ProgramExpr::Neg(value) => collect_program_scalar_dependencies(value, dependencies),
+        ProgramExpr::Scale(value, scalar) | ProgramExpr::AddConstant(value, scalar) => {
+            collect_program_scalar_dependencies(value, dependencies);
+            collect_scalar_expression_dependencies(scalar, dependencies);
+        }
+        ProgramExpr::Add(left, right) | ProgramExpr::Mul(left, right) => {
+            collect_program_scalar_dependencies(left, dependencies);
+            collect_program_scalar_dependencies(right, dependencies);
+        }
+        ProgramExpr::Compose {
+            arguments,
+            value: _,
+            ..
+        } => {
+            for argument in arguments {
+                collect_scalar_expression_dependencies(argument, dependencies);
+            }
+        }
+    }
+}
+
+fn witness_scalar_dependencies(
+    statements: &[Statement],
+    jet_dependencies: &HashSet<String>,
+) -> HashSet<String> {
+    let mut dependencies = HashSet::new();
+    for statement in statements {
+        match statement {
+            Statement::Local { name, value, .. }
+                if jet_dependencies.contains(&name.to_string()) =>
+            {
+                collect_program_scalar_dependencies(value, &mut dependencies);
+            }
+            Statement::If {
+                condition,
+                assignments,
+            } => {
+                let mut condition_is_needed = false;
+                for (target, value) in assignments {
+                    if jet_dependencies.contains(&target.to_string()) {
+                        collect_program_scalar_dependencies(value, &mut dependencies);
+                        condition_is_needed = true;
+                    }
+                }
+                if condition_is_needed {
+                    collect_scalar_expression_dependencies(condition, &mut dependencies);
+                }
+            }
+            Statement::Local { .. } => {}
+        }
+    }
+    dependencies
+}
+
 fn scalar_cuda(expression: &Expr, constants: &HashSet<String>) -> Result<String> {
     match expression {
         Expr::Path(path) => {
@@ -1264,6 +1346,8 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
     let witness_values = witnesses.iter().map(|witness| quote!(#witness.value()));
     let witness_count = witnesses.len();
     let scalar_witness_dependencies = witness_dependencies(&statements, &witnesses);
+    let scalar_witness_scalar_dependencies =
+        witness_scalar_dependencies(&statements, &scalar_witness_dependencies);
     let scalar_witness_statements = statements.iter().filter_map(|statement| match statement {
         Statement::Local {
             name,
@@ -1297,12 +1381,18 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
     let scalar_witness_function = if witnesses.is_empty() {
         quote!()
     } else {
+        let scalar_witness_primaries = primaries
+            .iter()
+            .filter(|primary| scalar_witness_dependencies.contains(&primary.to_string()));
+        let scalar_witness_constants = constants
+            .iter()
+            .filter(|constant| scalar_witness_scalar_dependencies.contains(&constant.to_string()));
         let scalar_witness_values = witnesses.iter();
         quote! {
             #[inline(always)]
             #visibility fn #scalar_witness_name(
-                #(#primaries: f64,)*
-                #(#constants: f64),*
+                #(#scalar_witness_primaries: f64,)*
+                #(#scalar_witness_constants: f64),*
             ) -> [f64; #witness_count] {
                 #(#scalar_witness_statements)*
                 [#(#scalar_witness_values),*]
@@ -1522,5 +1612,6 @@ mod tests {
         assert!(witness.contains("adjusted"));
         assert!(!witness.contains("log_stack"));
         assert!(!witness.contains("discarded"));
+        assert!(!witness.contains("event : f64"));
     }
 }
