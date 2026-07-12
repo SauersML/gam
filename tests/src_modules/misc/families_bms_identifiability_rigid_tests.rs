@@ -7090,7 +7090,7 @@ fn empirical_rigid_higher_order_match_finite_differences() {
 /// (`empirical_rigid_grad_hess_match_finite_differences`,
 /// `empirical_rigid_higher_order_match_finite_differences`). This test adds the
 /// #932 universal-oracle form the issue asks for: it writes the empirical row
-/// NLL ONCE over `Tower4<2>` and asserts the hand kernel's value / gradient /
+/// NLL ONCE over the generic row-program scalar and asserts the hand kernel's value / gradient /
 /// Hessian / `row_third_contracted` / `row_fourth_contracted` channels equal the
 /// single-expression tower truth EXACTLY (no FD truncation tolerance). The
 /// intercept jet `a(m, g)` is obtained by JET-NEWTON on the implicit
@@ -7121,7 +7121,7 @@ struct EmpiricalRigidNllProgram {
     grid_w: Vec<f64>,
 }
 
-impl gam_math::jet_tower::RowNllProgram<2> for EmpiricalRigidNllProgram {
+impl gam_math::jet_tower::RowProgram<2> for EmpiricalRigidNllProgram {
     fn n_rows(&self) -> usize {
         self.a_root.len()
     }
@@ -7131,26 +7131,21 @@ impl gam_math::jet_tower::RowNllProgram<2> for EmpiricalRigidNllProgram {
         Ok([self.marginal[row].q, self.slope[row]])
     }
 
-    fn row_nll(
+    fn eval<S: gam_math::jet_scalar::JetScalar<2>>(
         &self,
         row: usize,
-        p: &[gam_math::jet_tower::Tower4<2>; 2],
-    ) -> Result<gam_math::jet_tower::Tower4<2>, String> {
-        use gam_math::jet_tower::Tower4;
+        p: &[S; 2],
+    ) -> Result<S, String> {
         // p[0] is the seeded m-jet, p[1] the seeded g-jet. The marginal link
         // value μ(m) and its m-derivatives enter as a constant-in-g jet seeded
         // from the link map (μ depends only on m = primary 0).
         let g = p[1];
         let lm = self.marginal[row];
-        let mut mu = Tower4::<2>::constant(lm.mu);
-        mu.g[0] = lm.mu1;
-        mu.h[0][0] = lm.mu2;
-        mu.t3[0][0][0] = lm.mu3;
-        mu.t4[0][0][0][0] = lm.mu4;
+        let mu = p[0].compose_unary([lm.mu, lm.mu1, lm.mu2, lm.mu3, lm.mu4]);
 
         let s = self.s;
         // observed_slope = s·g, a jet in g.
-        let observed_slope = g * s;
+        let observed_slope = g.scale(s);
 
         // Jet-Newton for the intercept jet a(m, g) solving the implicit
         // calibration G(a, m, g) = Σ_k w_k·Φ(a + s·g·x_k) − μ(m) = 0.
@@ -7158,36 +7153,36 @@ impl gam_math::jet_tower::RowNllProgram<2> for EmpiricalRigidNllProgram {
         // every derivative order quadratically, so a fixed handful of steps
         // pins all of a_{(i,j)} for i+j ≤ 4 to full precision. This is the
         // fully-independent derivation: no a_m/a_mm/… formula is written.
-        let mut a = Tower4::<2>::constant(self.a_root[row]);
+        let mut a = S::constant(self.a_root[row]);
         for _ in 0..8 {
             // G(a) and G_a(a) accumulated in one grid pass over the jet algebra.
-            let mut gsum = Tower4::<2>::zero() - mu; // − μ(m)
-            let mut ga = Tower4::<2>::zero();
+            let mut gsum = S::constant(0.0).sub(&mu); // − μ(m)
+            let mut ga = S::constant(0.0);
             for (&node, &weight) in self.nodes.iter().zip(self.grid_w.iter()) {
                 // η_k = a + (s·g)·x_k, a jet in (m via a, g).
-                let eta_k = a + observed_slope * node;
-                let cdf = eta_k.compose_unary(unary_derivatives_normal_cdf(eta_k.v));
-                let pdf = eta_k.compose_unary(unary_derivatives_normal_pdf(eta_k.v));
-                gsum = gsum + cdf * weight;
-                ga = ga + pdf * weight;
+                let eta_k = a.add(&observed_slope.scale(node));
+                let cdf = eta_k.compose_unary(unary_derivatives_normal_cdf(eta_k.value()));
+                let pdf = eta_k.compose_unary(unary_derivatives_normal_pdf(eta_k.value()));
+                gsum = gsum.add(&cdf.scale(weight));
+                ga = ga.add(&pdf.scale(weight));
             }
             // Newton update a ← a − G / G_a in the jet ring.
-            a = a - gsum / ga;
+            a = a.sub(&gsum.mul(&ga.recip()));
         }
 
         // Observed index η = a + (s·g)·z; z is this row's data constant.
         let z = self.z[row];
-        let eta = a + observed_slope * z;
-        let signed = eta * self.sign[row];
+        let eta = a.add(&observed_slope.scale(z));
+        let signed = eta.scale(self.sign[row]);
         // ONE transcendental: the shared signed-probit NLL stack, the same
         // single scalar source of truth the hand kernel consumes.
-        if !(signed.v.is_finite() || signed.v == f64::INFINITY) {
+        if !(signed.value().is_finite() || signed.value() == f64::INFINITY) {
             return Err(format!(
                 "empirical rigid nll program: non-finite signed margin {} at row {row}",
-                signed.v
+                signed.value()
             ));
         }
-        let stack = signed_probit_neglog_unary_stack(signed.v, self.w[row]);
+        let stack = signed_probit_neglog_unary_stack(signed.value(), self.w[row]);
         if !stack[0].is_finite() {
             return Err(format!(
                 "empirical rigid nll program: non-finite log Φ at row {row}"
@@ -7199,7 +7194,7 @@ impl gam_math::jet_tower::RowNllProgram<2> for EmpiricalRigidNllProgram {
 
 #[test]
 fn empirical_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
-    use gam_math::jet_tower::{KernelChannels, evaluate_program, verify_kernel_channels};
+    use gam_math::jet_tower::{KernelChannels, program_full_tower, verify_kernel_channels};
 
     let (family, grid, marginal_etas, slopes) = empirical_rigid_fd_fixture();
     let s = family.probit_frailty_scale();
@@ -7285,7 +7280,7 @@ fn empirical_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
             fourth,
         };
 
-        let tower = evaluate_program(&program, row).unwrap_or_else(|e| panic!("{} failed: {:?}", "program tower", e));
+        let tower = program_full_tower(&program, row).unwrap_or_else(|e| panic!("{} failed: {:?}", "program tower", e));
         verify_kernel_channels(&tower, &claims, 1e-7).unwrap_or_else(|e| {
             panic!("empirical rigid jet-tower oracle mismatch at row {row}: {e}")
         });
