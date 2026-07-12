@@ -869,6 +869,49 @@ impl BernoulliMarginalSlopeFamily {
         })
     }
 
+    /// Rigid empirical-latent specialization of the canonical BMS row plan.
+    /// The historical rigid scalar root is stored in the scaled probit-index
+    /// coordinate; dividing by `scale` maps it into the raw intercept coordinate
+    /// used by the shared FLEX expression.
+    pub(super) fn empirical_rigid_bms_row_jet_plan(
+        &self,
+        row: usize,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+        grid: &EmpiricalZGrid,
+    ) -> Result<EmpiricalBmsRowJetPlan, String> {
+        let scale = self.probit_frailty_scale();
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err(format!(
+                "empirical rigid BMS row plan has invalid scale {scale}"
+            ));
+        }
+        let scaled_intercept = self.empirical_rigid_intercept_for_row(
+            row,
+            marginal,
+            slope,
+            &grid.nodes,
+            &grid.weights,
+        )?;
+        let primary = PrimarySlices {
+            q: 0,
+            logslope: 1,
+            h: None,
+            w: None,
+            total: 2,
+        };
+        self.empirical_bms_row_jet_plan(
+            row,
+            &primary,
+            marginal.eta,
+            slope,
+            None,
+            None,
+            scaled_intercept / scale,
+            grid,
+        )
+    }
+
     pub(super) fn empirical_bms_row_order2(
         &self,
         plan: &EmpiricalBmsRowJetPlan,
