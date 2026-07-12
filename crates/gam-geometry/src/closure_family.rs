@@ -382,14 +382,16 @@ fn seed_lanes(gamma: f64, u4: &[f64; 4]) -> (f64x4, f64x4, f64x4, f64x4) {
 /// The smooth penalty closure-coefficient `c(γ)` for the boundary-conductance
 /// MVP `S(γ) = S_open + c(γ)·S_wrap`, with `c(0)=0, c(1)=1`, and its γ-jet.
 ///
-/// A monotone `C²` interpolant that is flat at both endpoints (so the closure
-/// derivative does not blow up at `γ = 0` or `γ = 1`): the smoothstep
-/// `c(γ) = 3γ² − 2γ³`. Returns `(c, c′, c″)`.
+/// A monotone `C²` interpolant that is flat through second order at both
+/// endpoints (so a box-constrained closure Hessian agrees with the constant
+/// extension outside `[0, 1]`): the quintic smootherstep
+/// `c(γ) = 6γ⁵ − 15γ⁴ + 10γ³`. Returns `(c, c′, c″)`.
 pub fn boundary_conductance(gamma: f64) -> (f64, f64, f64) {
     let g = gamma.clamp(0.0, 1.0);
-    let c = 3.0 * g * g - 2.0 * g * g * g;
-    let cp = 6.0 * g - 6.0 * g * g;
-    let cpp = 6.0 - 12.0 * g;
+    let one_minus_g = 1.0 - g;
+    let c = g * g * g * (10.0 + g * (-15.0 + 6.0 * g));
+    let cp = 30.0 * g * g * one_minus_g * one_minus_g;
+    let cpp = 60.0 * g * one_minus_g * (1.0 - 2.0 * g);
     (c, cp, cpp)
 }
 
@@ -457,6 +459,26 @@ pub fn profile_ci_from_grid(grid: &[(f64, f64)], level: f64) -> Result<ClosurePr
     if grid.len() < 2 {
         return Err("closure profile CI needs at least two grid points".into());
     }
+    if !(level.is_finite() && level > 0.0 && level < 1.0) {
+        return Err("closure profile CI level must lie in (0, 1)".into());
+    }
+    for (index, &(gamma, value)) in grid.iter().enumerate() {
+        if !gamma.is_finite() || !value.is_finite() {
+            return Err("closure profile grid has non-finite entries".into());
+        }
+        if !(0.0..=1.0).contains(&gamma) {
+            return Err(format!(
+                "closure profile gamma at index {index} lies outside [0, 1]: {gamma}"
+            ));
+        }
+        if index > 0 && gamma <= grid[index - 1].0 {
+            return Err(format!(
+                "closure profile gamma grid must be strictly increasing; indices {} and {index} are {} and {gamma}",
+                index - 1,
+                grid[index - 1].0
+            ));
+        }
+    }
     let half_chi2 = 0.5 * chi2_1_quantile(level);
 
     // Profile minimiser (ties keep the first occurrence, so `hat_idx` is a
@@ -464,9 +486,6 @@ pub fn profile_ci_from_grid(grid: &[(f64, f64)], level: f64) -> Result<ClosurePr
     let mut hat_idx = 0usize;
     let (mut gamma_hat, mut v_min) = (grid[0].0, grid[0].1);
     for (idx, &(g, v)) in grid.iter().enumerate() {
-        if !g.is_finite() || !v.is_finite() {
-            return Err("closure profile grid has non-finite entries".into());
-        }
         if v < v_min {
             v_min = v;
             gamma_hat = g;
@@ -708,13 +727,22 @@ mod tests {
         }
     }
 
-    /// Boundary conductance endpoints and flatness: c(0)=0, c(1)=1, c′(0)=c′(1)=0.
+    /// Boundary conductance endpoints and C² flatness under the constant
+    /// extension: c(0)=0, c(1)=1 and both derivative channels vanish there.
     #[test]
     fn conductance_endpoints_and_flat() {
-        let (c0, cp0, _) = boundary_conductance(0.0);
-        let (c1, cp1, _) = boundary_conductance(1.0);
+        let (c0, cp0, cpp0) = boundary_conductance(0.0);
+        let (c1, cp1, cpp1) = boundary_conductance(1.0);
         assert!(c0.abs() < 1e-15 && (c1 - 1.0).abs() < 1e-15);
         assert!(cp0.abs() < 1e-15 && cp1.abs() < 1e-15);
+        assert!(cpp0.abs() < 1e-15 && cpp1.abs() < 1e-15);
+
+        for &g in &[-2.0_f64, -0.1] {
+            assert_eq!(boundary_conductance(g), (0.0, 0.0, 0.0));
+        }
+        for &g in &[1.1_f64, 3.0] {
+            assert_eq!(boundary_conductance(g), (1.0, 0.0, 0.0));
+        }
     }
 
     /// The conductance-penalty γ-jet interpolates S_open ⇄ S_circle and its

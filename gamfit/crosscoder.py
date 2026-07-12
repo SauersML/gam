@@ -228,8 +228,12 @@ class Crosscoder:
         # nn.Linear constructors consume the process-global torch RNG. Isolate
         # module construction so fitting a Crosscoder is reproducible without
         # perturbing the caller's stochastic program.
+        initialization_generator = torch.Generator(device="cpu").manual_seed(int(seed))
         with torch.random.fork_rng(devices=[]):
-            torch.manual_seed(int(seed))
+            # `torch.manual_seed` also mutates every accelerator RNG, even for
+            # this CPU module. Install only a private CPU state inside the fork
+            # so CUDA/MPS/XPU stochastic programs remain untouched.
+            torch.set_rng_state(initialization_generator.get_state())
             module = self._build_module()
         module.train()
 

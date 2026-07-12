@@ -39,6 +39,7 @@ use crate::survival::lognormal_kernel::{
     FrailtySpec, HazardLoading, LatentSurvivalEventType, LatentSurvivalRow, LatentSurvivalRowJet,
     log_kernel_bundle,
 };
+use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use gam_problem::MIN_WEIGHT;
 use gam_solve::pirls::LinearInequalityConstraints;
@@ -1087,6 +1088,7 @@ const LATENT_SURVIVAL_PRIMARY_MU: usize = 4;
 const LATENT_SURVIVAL_PRIMARY_LOG_SIGMA: usize = 5;
 const LATENT_SURVIVAL_PRIMARY_DIM: usize = 6;
 
+#[cfg(test)]
 use gam_math::jet_partitions::MultiDirJet as LatentMultiDirJet;
 
 /// Derivatives of `log(x)` through 4th order.
@@ -1253,6 +1255,7 @@ fn latent_kernel_differentiate_terms(
         .collect()
 }
 
+#[cfg(test)]
 fn latent_kernel_term_lists_for_directions(
     base_terms: &[LatentKernelPrimaryTerm],
     directions: &[LatentKernelPrimaryDirection],
@@ -1283,6 +1286,7 @@ fn latent_kernel_term_lists_for_directions(
         .collect()
 }
 
+#[cfg(test)]
 fn latent_kernel_sum_log_jet(
     quadctx: &QuadratureContext,
     base_terms: &[LatentKernelPrimaryTerm],

@@ -18,7 +18,6 @@ gam-sae = { path = "../gam-sae" }
 clap = { version = "4.6.1", features = ["derive"] }
 comfy-table = "7.2.2"
 csv = "1.4.0"
-faer = "0.24.0"
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 npyz = { version = "0.8.4", features = ["half"] }

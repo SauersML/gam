@@ -3388,6 +3388,31 @@ mod patterned_order2_perf_tests {
         (out.value(), out.g(), out.h())
     }
 
+    /// Same generic row program as [`patterned`], with literal identity seeds.
+    /// This exposes every structural dependency mask as a compile-time constant
+    /// after inlining, instead of asking LLVM to unroll `array::from_fn` before
+    /// sparse-jet propagation. It is kept as a separate benchmark variant until
+    /// the generated code and release timing establish whether that distinction
+    /// matters on the production compiler profile.
+    fn patterned_literal_seeds(
+        p: &[f64; SLS_ROW_K],
+        kernel: &SurvivalExactRowKernel,
+    ) -> (f64, [f64; 9], [[f64; 9]; 9]) {
+        let vars: [SlsOrder2; SLS_ROW_K] = [
+            SlsOrder2::variable(p[0], 0),
+            SlsOrder2::variable(p[1], 1),
+            SlsOrder2::variable(p[2], 2),
+            SlsOrder2::variable(p[3], 3),
+            SlsOrder2::variable(p[4], 4),
+            SlsOrder2::variable(p[5], 5),
+            SlsOrder2::variable(p[6], 6),
+            SlsOrder2::variable(p[7], 7),
+            SlsOrder2::variable(p[8], 8),
+        ];
+        let out = sls_row_nll(&vars, kernel).expect("literal-seeded patterned row NLL");
+        (out.value(), out.g(), out.h())
+    }
+
     /// Direct sparse chain-rule schedule used only as the performance baseline.
     /// This deliberately duplicates the calculus in test code so the generic
     /// backend is compared with the strongest plausible hand implementation.
@@ -3489,12 +3514,125 @@ mod patterned_order2_perf_tests {
         (value, gradient, hessian)
     }
 
+    /// Strongest direct row-chain baseline: fuse the two transforms of `u1`,
+    /// visit each index's live upper-triangle support once, and materialize no
+    /// intermediate dense derivative arrays. This is the schedule a successful
+    /// generic compiler must beat; comparison only with [`hand`] would reward
+    /// avoidable repeated 24-pair walks.
+    fn hand_fused(
+        p: &[f64; SLS_ROW_K],
+        kernel: &SurvivalExactRowKernel,
+    ) -> (f64, [f64; 9], [[f64; 9]; 9]) {
+        let entry_exp = (-p[7]).exp();
+        let exit_exp = (-p[6]).exp();
+
+        let mut value = kernel.w * kernel.log_s0;
+        let u0_first = -kernel.w * kernel.r0;
+        let u0_second = -kernel.w * kernel.dr0;
+
+        let censored_weight = kernel.w * (1.0 - kernel.d);
+        let event_weight = kernel.w * kernel.d;
+        let mut u1_first = 0.0;
+        let mut u1_second = 0.0;
+        if censored_weight != 0.0 {
+            value -= censored_weight * kernel.log_s1;
+            u1_first += censored_weight * kernel.r1;
+            u1_second += censored_weight * kernel.dr1;
+        }
+
+        let mut g_first = 0.0;
+        let mut g_second = 0.0;
+        if event_weight != 0.0 {
+            value -= event_weight * (kernel.logphi1 + kernel.log_g);
+            u1_first -= event_weight * kernel.dlogphi1;
+            u1_second -= event_weight * kernel.d2logphi1;
+            g_first = -event_weight * kernel.d_log_g;
+            g_second = -event_weight * kernel.d2_log_g;
+        }
+
+        let u0_g4 = -entry_exp;
+        let u0_g7 = p[4] * entry_exp;
+        let u1_g3 = -exit_exp;
+        let u1_g6 = p[3] * exit_exp;
+        let inner = p[3] * p[8] - p[5];
+        let g3 = exit_exp * p[8];
+        let g5 = -exit_exp;
+        let g6 = -exit_exp * inner;
+        let g8 = exit_exp * p[3];
+
+        let mut gradient = [0.0; SLS_ROW_K];
+        gradient[0] = u0_first;
+        gradient[4] = u0_first * u0_g4;
+        gradient[7] = u0_first * u0_g7;
+        if censored_weight != 0.0 || event_weight != 0.0 {
+            gradient[1] += u1_first;
+            gradient[3] += u1_first * u1_g3;
+            gradient[6] += u1_first * u1_g6;
+        }
+        if event_weight != 0.0 {
+            gradient[2] += g_first;
+            gradient[3] += g_first * g3;
+            gradient[5] += g_first * g5;
+            gradient[6] += g_first * g6;
+            gradient[8] += g_first * g8;
+        }
+
+        let mut hessian = [[0.0; SLS_ROW_K]; SLS_ROW_K];
+        macro_rules! symmetric {
+            ($i:expr, $j:expr, $value:expr) => {{
+                let channel = $value;
+                hessian[$i][$j] += channel;
+                if $i != $j {
+                    hessian[$j][$i] += channel;
+                }
+            }};
+        }
+
+        symmetric!(0, 0, u0_second);
+        symmetric!(0, 4, u0_second * u0_g4);
+        symmetric!(0, 7, u0_second * u0_g7);
+        symmetric!(4, 4, u0_second * u0_g4 * u0_g4);
+        symmetric!(4, 7, u0_second * u0_g4 * u0_g7 + u0_first * entry_exp);
+        symmetric!(7, 7, u0_second * u0_g7 * u0_g7 - u0_first * u0_g7);
+
+        if censored_weight != 0.0 || event_weight != 0.0 {
+            symmetric!(1, 1, u1_second);
+            symmetric!(1, 3, u1_second * u1_g3);
+            symmetric!(1, 6, u1_second * u1_g6);
+            symmetric!(3, 3, u1_second * u1_g3 * u1_g3);
+            symmetric!(3, 6, u1_second * u1_g3 * u1_g6 + u1_first * exit_exp);
+            symmetric!(6, 6, u1_second * u1_g6 * u1_g6 - u1_first * u1_g6);
+        }
+
+        if event_weight != 0.0 {
+            symmetric!(2, 2, g_second);
+            symmetric!(2, 3, g_second * g3);
+            symmetric!(2, 5, g_second * g5);
+            symmetric!(2, 6, g_second * g6);
+            symmetric!(2, 8, g_second * g8);
+            symmetric!(3, 3, g_second * g3 * g3);
+            symmetric!(3, 5, g_second * g3 * g5);
+            symmetric!(3, 6, g_second * g3 * g6 - g_first * exit_exp * p[8]);
+            symmetric!(3, 8, g_second * g3 * g8 + g_first * exit_exp);
+            symmetric!(5, 5, g_second * g5 * g5);
+            symmetric!(5, 6, g_second * g5 * g6 + g_first * exit_exp);
+            symmetric!(5, 8, g_second * g5 * g8);
+            symmetric!(6, 6, g_second * g6 * g6 + g_first * exit_exp * inner);
+            symmetric!(6, 8, g_second * g6 * g8 - g_first * exit_exp * p[3]);
+            symmetric!(8, 8, g_second * g8 * g8);
+        }
+
+        (value, gradient, hessian)
+    }
+
     #[test]
     fn measure_sls_patterned_vs_dense_932() {
         let (p, kernel) = fixture();
         let want = dense(&p, &kernel);
         let got = patterned(&p, &kernel);
+        let literal_seed_result = patterned_literal_seeds(&p, &kernel);
         let hand_result = hand(&p, &kernel);
+        let hand_fused_result = hand_fused(&p, &kernel);
         let close = |a: f64, b: f64, label: &str| {
             let tolerance = 1e-12 * a.abs().max(b.abs()).max(1.0);
             assert!(
@@ -3503,16 +3641,38 @@ mod patterned_order2_perf_tests {
             );
         };
         close(got.0, want.0, "value");
+        close(literal_seed_result.0, want.0, "literal-seed value");
         close(hand_result.0, want.0, "hand value");
+        close(hand_fused_result.0, want.0, "fused-hand value");
         for i in 0..SLS_ROW_K {
             close(got.1[i], want.1[i], &format!("gradient[{i}]"));
+            close(
+                literal_seed_result.1[i],
+                want.1[i],
+                &format!("literal-seed gradient[{i}]"),
+            );
             close(hand_result.1[i], want.1[i], &format!("hand gradient[{i}]"));
+            close(
+                hand_fused_result.1[i],
+                want.1[i],
+                &format!("fused-hand gradient[{i}]"),
+            );
             for j in 0..SLS_ROW_K {
                 close(got.2[i][j], want.2[i][j], &format!("Hessian[{i},{j}]"));
+                close(
+                    literal_seed_result.2[i][j],
+                    want.2[i][j],
+                    &format!("literal-seed Hessian[{i},{j}]"),
+                );
                 close(
                     hand_result.2[i][j],
                     want.2[i][j],
                     &format!("hand Hessian[{i},{j}]"),
+                );
+                close(
+                    hand_fused_result.2[i][j],
+                    want.2[i][j],
+                    &format!("fused-hand Hessian[{i},{j}]"),
                 );
             }
         }
@@ -3520,13 +3680,21 @@ mod patterned_order2_perf_tests {
         let iterations = 2_000_000usize;
         let mut best_dense = f64::INFINITY;
         let mut best_patterned = f64::INFINITY;
+        let mut best_literal_seeds = f64::INFINITY;
         let mut best_hand = f64::INFINITY;
+        let mut best_hand_fused = f64::INFINITY;
         for _ in 0..5 {
             let started = Instant::now();
             for _ in 0..iterations {
                 black_box(hand(black_box(&p), black_box(&kernel)));
             }
             best_hand = best_hand.min(started.elapsed().as_secs_f64());
+
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(hand_fused(black_box(&p), black_box(&kernel)));
+            }
+            best_hand_fused = best_hand_fused.min(started.elapsed().as_secs_f64());
 
             let started = Instant::now();
             for _ in 0..iterations {
@@ -3539,13 +3707,22 @@ mod patterned_order2_perf_tests {
                 black_box(patterned(black_box(&p), black_box(&kernel)));
             }
             best_patterned = best_patterned.min(started.elapsed().as_secs_f64());
+
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(patterned_literal_seeds(black_box(&p), black_box(&kernel)));
+            }
+            best_literal_seeds = best_literal_seeds.min(started.elapsed().as_secs_f64());
         }
         let dense_ns = best_dense * 1e9 / iterations as f64;
         let patterned_ns = best_patterned * 1e9 / iterations as f64;
+        let literal_seeds_ns = best_literal_seeds * 1e9 / iterations as f64;
         let hand_ns = best_hand * 1e9 / iterations as f64;
+        let hand_fused_ns = best_hand_fused * 1e9 / iterations as f64;
         eprintln!(
-            "SLS-PATTERNED-932 hand={hand_ns:.2} ns/row dense={dense_ns:.2} ns/row patterned={patterned_ns:.2} ns/row patterned/hand={:.3} patterned/dense={:.3}",
-            patterned_ns / hand_ns,
+            "SLS-PATTERNED-932 hand={hand_ns:.2} ns/row fused-hand={hand_fused_ns:.2} ns/row dense={dense_ns:.2} ns/row patterned={patterned_ns:.2} ns/row literal-seeds={literal_seeds_ns:.2} ns/row patterned/fused-hand={:.3} literal-seeds/fused-hand={:.3} patterned/dense={:.3}",
+            patterned_ns / hand_fused_ns,
+            literal_seeds_ns / hand_fused_ns,
             patterned_ns / dense_ns,
         );
     }

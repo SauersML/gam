@@ -918,11 +918,11 @@ fn distinct_spherical_orbit(
 /// rows exactly tied. No row-permutation-equivariant rule can choose one member
 /// of such an orbit: a symmetry exchanging two tied rows would have to both
 /// preserve and change that choice. The selector therefore adds the complete
-/// distinct-direction tie orbit atomically. `num_centers` is the nominal target;
-/// only the final atomic orbit may cross it, so the result has fewer than
-/// `2*num_centers` rows. An individual orbit larger than the declared target is
-/// refused as unrepresentable within the requested resource budget rather than
-/// broken by row index. Coincident rows remain one kernel column.
+/// distinct-direction tie class atomically. Because `num_centers` is an exact
+/// resource contract, a class that does not fit in the remaining budget is
+/// refused as unrepresentable rather than truncated by row index. Coincident
+/// rows remain one kernel column; consequently a request exceeding the number
+/// of distinct directions is also refused rather than silently undersized.
 ///
 /// The previous implementation ignored `data` and laid down a fixed golden-angle
 /// (Fibonacci) lattice pinned in the (lat, lon) frame: a rigid rotation moved the
@@ -949,6 +949,11 @@ pub fn select_spherical_farthest_point_centers(
     let n = data.nrows();
     if n < 2 {
         return Err(BasisError::InsufficientColumnsForConstraint { found: n });
+    }
+    if num_centers > n {
+        crate::bail_invalid_basis!(
+            "requested {num_centers} spherical farthest-point centers but only {n} rows are available"
+        );
     }
 
     let to_rad = if radians {
@@ -1003,7 +1008,7 @@ pub fn select_spherical_farthest_point_centers(
         }
     }
 
-    let target = num_centers.min(n);
+    let target = num_centers;
     let seed_class: Vec<usize> = (0..n)
         .filter(|&i| {
             dot_to_sum[i].total_cmp(&dot_to_sum[seed]).is_eq()
@@ -1018,7 +1023,7 @@ pub fn select_spherical_farthest_point_centers(
         );
     }
 
-    let mut selected = Vec::with_capacity(target.saturating_mul(2).min(n));
+    let mut selected = Vec::with_capacity(target);
     let mut chosen = vec![false; n];
     // `max_dot[i]` = `max` over chosen centers `c` of `uᵢ·u_c` = `cos` of the
     // geodesic distance to the NEAREST chosen center. The maximin step picks the
@@ -1092,10 +1097,11 @@ pub fn select_spherical_farthest_point_centers(
             })
             .collect();
         let orbit = distinct_spherical_orbit(&units, &tied_class, &selected);
-        if orbit.len() > target {
+        let remaining = target - selected.len();
+        if orbit.len() > remaining {
             crate::bail_invalid_basis!(
-                "spherical farthest-point symmetry orbit has {} distinct directions, exceeding the requested center budget {target}; use a budget at least as large as the orbit or the harmonic sphere basis",
-                orbit.len()
+                "spherical farthest-point tie class has {} distinct directions but only {remaining} of the exact {target}-center budget remain; choose a compatible center count or the harmonic sphere basis",
+                orbit.len(),
             );
         }
         for &i in &tied_class {
@@ -1118,6 +1124,12 @@ pub fn select_spherical_farthest_point_centers(
         }
     }
 
+    if selected.len() < target {
+        crate::bail_invalid_basis!(
+            "requested {target} distinct spherical farthest-point centers but the data contain only {} numerically distinct directions",
+            selected.len()
+        );
+    }
     if selected.len() < 2 {
         return Err(BasisError::InsufficientColumnsForConstraint {
             found: selected.len(),
@@ -1162,12 +1174,12 @@ mod spherical_farthest_point_symmetry_tests {
         let mut reference: Option<Vec<[f64; 2]>> = None;
         for order in permutations {
             let permuted = permute_rows(&data, &order);
-            let centers = select_spherical_farthest_point_centers(permuted.view(), 2, false)
+            let centers = select_spherical_farthest_point_centers(permuted.view(), 3, false)
                 .expect("the complete three-direction symmetry orbit is representable");
             assert_eq!(
                 centers.nrows(),
                 3,
-                "the nominal two-center target must expand to the complete north/south orbit"
+                "the exact three-center target must contain the complete north/south tie class"
             );
             let center_set = sorted_center_rows(&centers);
             if let Some(expected) = &reference {
@@ -1179,6 +1191,19 @@ mod spherical_farthest_point_symmetry_tests {
                 reference = Some(center_set);
             }
         }
+    }
+
+    #[test]
+    fn incomplete_nonseed_tie_class_is_refused() {
+        let data = array![[0.0_f64, 0.0], [0.0, 0.0], [90.0, 0.0], [-90.0, 0.0]];
+        let error = select_spherical_farthest_point_centers(data.view(), 2, false)
+            .expect_err("one remaining slot cannot split the north/south tie class");
+        assert!(
+            error
+                .to_string()
+                .contains("only 1 of the exact 2-center budget remain"),
+            "unexpected refusal: {error}"
+        );
     }
 
     /// A symmetry orbit is indivisible. If even one orbit is larger than the

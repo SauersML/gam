@@ -1,4 +1,3 @@
-pub mod fidelity_metrics;
 pub mod jet_algebra;
 pub mod jet_partitions;
 pub mod jet_scalar;

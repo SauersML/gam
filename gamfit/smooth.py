@@ -19,10 +19,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Sequence
+from typing import Any, ClassVar, Literal, Sequence
 
-if TYPE_CHECKING:
-    import torch
+from ._basis_protocol import BasisDescriptor as _BasisDescriptor
 
 
 ShapeConstraintLiteral = Literal[
@@ -32,9 +31,6 @@ ShapeConstraintLiteral = Literal[
     "convex",
     "concave",
 ]
-
-
-from ._basis_protocol import BasisDescriptor as _BasisDescriptor
 
 
 def _smooth_kind_name(cls: type) -> str:
@@ -185,21 +181,6 @@ class Smooth(_BasisDescriptor):
             # are rejected with a pointer in `_normalize_smooths`.)
             out["by"] = str(self.by)
         return out
-
-
-def _as_torch_tensor(x: Any, *, name: str) -> "torch.Tensor":
-    """Coerce ``x`` to a torch tensor without copying when possible.
-
-    Used by ``Smooth.evaluate`` overrides. We intentionally do not strip a
-    requires_grad flag: routing through the existing
-    :mod:`gamfit.torch._basis` autograd Functions preserves the analytic
-    VJP back to ``x`` for kernels that expose one.
-    """
-    import torch as _torch
-
-    if isinstance(x, _torch.Tensor):
-        return x
-    return _torch.as_tensor(x, dtype=_torch.float64)
 
 
 @dataclass(slots=True)

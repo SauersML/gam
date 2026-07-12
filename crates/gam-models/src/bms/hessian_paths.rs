@@ -857,6 +857,10 @@ pub(super) struct BernoulliMarginalSlopeFlexRowScratch {
     // only when at least one coefficient-jet channel is nonzero. Reusing this
     // buffer makes the moment compiler allocation-free in the warmed row path.
     pub(super) active_cell_primaries: Vec<usize>,
+    // `H·c_u` actions compiled once per active primary and reused by every
+    // gradient/Hessian contraction in that cell. This turns each pairwise
+    // bilinear form into a four-term dot product.
+    pub(super) cell_moment_actions: Vec<[f64; 4]>,
     // Constant zero coeff slice shared by every SparsePrimaryCoeffJetView call
     // that needs `aa_first..bbb_first`. Sized to `primary_dim` once and never
     // mutated thereafter.
@@ -882,6 +886,7 @@ impl BernoulliMarginalSlopeFlexRowScratch {
             g_au_fixed: vec![[0.0; 4]; primary_dim],
             g_bu_fixed: vec![[0.0; 4]; primary_dim],
             active_cell_primaries: Vec::with_capacity(primary_dim),
+            cell_moment_actions: vec![[0.0; 4]; primary_dim],
             zero_family: vec![[0.0; 4]; primary_dim],
         }
     }

@@ -63,7 +63,6 @@ pub(crate) use manifold::manifold_pyclasses;
 pub(crate) use sklearn::sklearn_metadata;
 
 include!("model/model_ffi.rs");
-include!("model/fidelity_ffi.rs");
 include!("latent/latent_basis_and_sae_ffi.rs");
 include!("latent/latent_basis_and_sae_ffi_tail.rs");
 include!("latent/reml_latent_fit_ffi.rs");

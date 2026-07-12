@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 gamfit = pytest.importorskip("gamfit")
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
 
 def _best_permutation_min_abscorr(a: np.ndarray, b: np.ndarray) -> float:
@@ -72,6 +72,27 @@ def _mean_best_abscorr(t: np.ndarray, aux: np.ndarray) -> float:
     a_std = ac.std(axis=0, keepdims=True) + 1.0e-12
     corr = np.abs((tc / t_std).T @ (ac / a_std) / t.shape[0])
     return float(corr.max(axis=1).mean())
+
+
+def test_identifiable_factor_fit_does_not_mutate_global_torch_rng() -> None:
+    x, aux = _toy_dataset(seed=17)
+    torch.manual_seed(54_321)
+    state_before = torch.random.get_rng_state().clone()
+    gamfit.identifiable_factor_fit(
+        x,
+        aux=aux,
+        n_supervised=3,
+        n_free=1,
+        encoder="linear",
+        max_iter=1,
+        random_state=8,
+        check_identifiability=False,
+    )
+    state_after = torch.random.get_rng_state()
+    assert torch.equal(state_after, state_before), (
+        "identifiable_factor_fit must isolate torch module initialization from "
+        "the caller's global RNG stream"
+    )
 
 
 def test_identifiable_factor_fit_default_auto_weights_issue_790() -> None:

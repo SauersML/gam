@@ -16,24 +16,6 @@ def _extract_reml_score_raw(fit: Any) -> float:
     return float(rust_module().extract_reml_score_raw(fit))
 
 
-def _tierney_kadane_normalizer_from_null_dim(
-    null_dim: float,
-    null_hessian_logdet: float | None = None,
-) -> float:
-    return float(
-        rust_module().tierney_kadane_normalized_score(
-            0.0,
-            float(null_dim),
-            null_hessian_logdet,
-        )
-    )
-
-
-def _extract_edf(fit: Any) -> float | None:
-    edf = rust_module().extract_reml_edf(fit)
-    return None if edf is None else float(edf)
-
-
 def compare_models(
     fits: list[Any] | tuple[Any, ...],
     names: list[str] | tuple[str, ...] | None = None,

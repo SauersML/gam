@@ -792,15 +792,15 @@ pub(crate) struct SaeScheduledRowJets {
 /// Unlike a dense tower, evaluating one Hessian entry is O(1), not an O(K)
 /// contraction of a materialized `∂²z_k` tensor.  The formulas remain valid
 /// for the reduced softmax chart: only the free logit primaries are requested.
-struct SoftmaxMoment<'a> {
-    z: &'a [f64],
+struct SoftmaxMoment<'a, S> {
+    source: &'a S,
     inv_tau: f64,
 }
 
-impl SoftmaxMoment<'_> {
+impl<S: SaeSoftmaxRowProgramSource> SoftmaxMoment<'_, S> {
     #[inline]
     fn expectation_first(&self, atom_j: usize, component_j: f64, mean: f64) -> f64 {
-        self.inv_tau * self.z[atom_j] * (component_j - mean)
+        self.inv_tau * self.source.gate_value(atom_j) * (component_j - mean)
     }
 
     #[inline]
@@ -819,14 +819,17 @@ impl SoftmaxMoment<'_> {
         };
         self.inv_tau
             * self.inv_tau
-            * self.z[atom_j]
-            * (diagonal - self.z[atom_l] * (component_j + component_l - 2.0 * mean))
+            * self.source.gate_value(atom_j)
+            * (diagonal
+                - self.source.gate_value(atom_l) * (component_j + component_l - 2.0 * mean))
     }
 
     #[inline]
     fn gate_first(&self, gated_atom: usize, logit_atom: usize) -> f64 {
         let diagonal = if gated_atom == logit_atom { 1.0 } else { 0.0 };
-        self.inv_tau * self.z[gated_atom] * (diagonal - self.z[logit_atom])
+        self.inv_tau
+            * self.source.gate_value(gated_atom)
+            * (diagonal - self.source.gate_value(logit_atom))
     }
 }
 
@@ -881,9 +884,8 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
             mean[c] += z * component[c];
         }
     }
-    let gate_values: Vec<f64> = (0..k).map(|atom| source.gate_value(atom)).collect();
     let moment = SoftmaxMoment {
-        z: &gate_values,
+        source,
         inv_tau,
     };
 
@@ -985,91 +987,95 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
 }
 
 #[cfg(test)]
-impl SaeSoftmaxRowProgramSource for SaeReconstructionRowProgram {
-    fn n_atoms(&self) -> usize {
-        self.atoms.len()
-    }
+mod tests_schedule_source {
+    use super::*;
 
-    fn out_dim(&self) -> usize {
-        self.out_dim()
-    }
-
-    fn n_primaries(&self) -> usize {
-        self.n_primaries
-    }
-
-    fn primary(&self, slot: usize) -> SaeRowPrimary {
-        for (atom, &candidate) in self.logit_slot.iter().enumerate() {
-            if candidate == Some(slot) {
-                return SaeRowPrimary::Logit { atom };
-            }
+    impl SaeSoftmaxRowProgramSource for SaeReconstructionRowProgram {
+        fn n_atoms(&self) -> usize {
+            self.atoms.len()
         }
-        for (atom, slots) in self.coord_slot.iter().enumerate() {
-            for (axis, &candidate) in slots.iter().enumerate() {
-                if candidate == slot {
-                    return SaeRowPrimary::Coord { atom, axis };
+
+        fn out_dim(&self) -> usize {
+            self.out_dim()
+        }
+
+        fn n_primaries(&self) -> usize {
+            self.n_primaries
+        }
+
+        fn primary(&self, slot: usize) -> SaeRowPrimary {
+            for (atom, &candidate) in self.logit_slot.iter().enumerate() {
+                if candidate == Some(slot) {
+                    return SaeRowPrimary::Logit { atom };
+                }
+            }
+            for (atom, slots) in self.coord_slot.iter().enumerate() {
+                for (axis, &candidate) in slots.iter().enumerate() {
+                    if candidate == slot {
+                        return SaeRowPrimary::Coord { atom, axis };
+                    }
+                }
+            }
+            panic!("row-program primary slot {slot} is not mapped");
+        }
+
+        fn gate_value(&self, atom: usize) -> f64 {
+            self.gate_value[atom]
+        }
+
+        fn atom_is_active(&self, atom: usize) -> bool {
+            self.fixed_gate_value.get(atom).copied().flatten() != Some(0.0)
+        }
+
+        fn fill_decoded(&self, atom: usize, out: &mut [f64]) {
+            out.fill(0.0);
+            for basis in 0..self.atoms[atom].n_basis() {
+                let phi = self.atoms[atom].phi[basis];
+                for (c, value) in out.iter_mut().enumerate() {
+                    *value += phi * self.atoms[atom].decoder[basis][c];
                 }
             }
         }
-        panic!("row-program primary slot {slot} is not mapped");
-    }
 
-    fn gate_value(&self, atom: usize) -> f64 {
-        self.gate_value[atom]
-    }
-
-    fn atom_is_active(&self, atom: usize) -> bool {
-        self.fixed_gate_value.get(atom).copied().flatten() != Some(0.0)
-    }
-
-    fn fill_decoded(&self, atom: usize, out: &mut [f64]) {
-        out.fill(0.0);
-        for basis in 0..self.atoms[atom].n_basis() {
-            let phi = self.atoms[atom].phi[basis];
-            for (c, value) in out.iter_mut().enumerate() {
-                *value += phi * self.atoms[atom].decoder[basis][c];
+        fn fill_decoded_first(&self, atom: usize, axis: usize, out: &mut [f64]) {
+            out.fill(0.0);
+            for basis in 0..self.atoms[atom].n_basis() {
+                let d_phi = self.atoms[atom].d_phi[basis][axis];
+                for (c, value) in out.iter_mut().enumerate() {
+                    *value += d_phi * self.atoms[atom].decoder[basis][c];
+                }
             }
         }
-    }
 
-    fn fill_decoded_first(&self, atom: usize, axis: usize, out: &mut [f64]) {
-        out.fill(0.0);
-        for basis in 0..self.atoms[atom].n_basis() {
-            let d_phi = self.atoms[atom].d_phi[basis][axis];
-            for (c, value) in out.iter_mut().enumerate() {
-                *value += d_phi * self.atoms[atom].decoder[basis][c];
+        fn fill_decoded_second(&self, atom: usize, axis_a: usize, axis_b: usize, out: &mut [f64]) {
+            out.fill(0.0);
+            for basis in 0..self.atoms[atom].n_basis() {
+                let d2_phi = self.atoms[atom].d2_phi[basis][axis_a][axis_b];
+                for (c, value) in out.iter_mut().enumerate() {
+                    *value += d2_phi * self.atoms[atom].decoder[basis][c];
+                }
             }
         }
-    }
 
-    fn fill_decoded_second(&self, atom: usize, axis_a: usize, axis_b: usize, out: &mut [f64]) {
-        out.fill(0.0);
-        for basis in 0..self.atoms[atom].n_basis() {
-            let d2_phi = self.atoms[atom].d2_phi[basis][axis_a][axis_b];
-            for (c, value) in out.iter_mut().enumerate() {
-                *value += d2_phi * self.atoms[atom].decoder[basis][c];
-            }
+        fn n_beta_borders(&self) -> usize {
+            0
         }
-    }
 
-    fn n_beta_borders(&self) -> usize {
-        0
-    }
+        fn beta_border_atom(&self, _border: usize) -> usize {
+            panic!("owned row-program oracle has no beta borders")
+        }
 
-    fn beta_border_atom(&self, _border: usize) -> usize {
-        panic!("owned row-program oracle has no beta borders")
-    }
+        fn beta_border_basis_value(&self, _border: usize) -> f64 {
+            panic!("owned row-program oracle has no beta borders")
+        }
 
-    fn beta_border_basis_value(&self, _border: usize) -> f64 {
-        panic!("owned row-program oracle has no beta borders")
-    }
+        fn beta_border_basis_first(&self, _border: usize, _axis: usize) -> f64 {
+            panic!("owned row-program oracle has no beta borders")
+        }
 
-    fn beta_border_basis_first(&self, _border: usize, _axis: usize) -> f64 {
-        panic!("owned row-program oracle has no beta borders")
-    }
-
-    fn beta_border_output(&self, _border: usize) -> &[f64] {
-        panic!("owned row-program oracle has no beta borders")
+        fn beta_border_output(&self, _border: usize) -> &[f64] {
+            panic!("owned row-program oracle has no beta borders")
+        }
     }
 }
 

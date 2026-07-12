@@ -49,21 +49,24 @@ impl EmpiricalCubicMomentJet2 {
 
     #[inline(always)]
     fn linear(&self, coeff: &[f64; 4]) -> f64 {
-        coeff[0] * self.first[0]
-            + coeff[1] * self.first[1]
-            + coeff[2] * self.first[2]
-            + coeff[3] * self.first[3]
+        dot4(coeff, &self.first)
     }
 
     #[inline(always)]
-    fn bilinear(&self, left: &[f64; 4], right: &[f64; 4]) -> f64 {
+    fn action(&self, right: &[f64; 4]) -> [f64; 4] {
         let h = &self.hankel;
-        let mr0 = h[0] * right[0] + h[1] * right[1] + h[2] * right[2] + h[3] * right[3];
-        let mr1 = h[1] * right[0] + h[2] * right[1] + h[3] * right[2] + h[4] * right[3];
-        let mr2 = h[2] * right[0] + h[3] * right[1] + h[4] * right[2] + h[5] * right[3];
-        let mr3 = h[3] * right[0] + h[4] * right[1] + h[5] * right[2] + h[6] * right[3];
-        left[0] * mr0 + left[1] * mr1 + left[2] * mr2 + left[3] * mr3
+        [
+            h[0] * right[0] + h[1] * right[1] + h[2] * right[2] + h[3] * right[3],
+            h[1] * right[0] + h[2] * right[1] + h[3] * right[2] + h[4] * right[3],
+            h[2] * right[0] + h[3] * right[1] + h[4] * right[2] + h[5] * right[3],
+            h[3] * right[0] + h[4] * right[1] + h[5] * right[2] + h[6] * right[3],
+        ]
     }
+}
+
+#[inline(always)]
+fn dot4(left: &[f64; 4], right: &[f64; 4]) -> f64 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2] + left[3] * right[3]
 }
 
 /// Sparse second-order coefficient-jet schedule compiled for one spline cell.
@@ -87,13 +90,14 @@ impl EmpiricalCubicPrimaryJet2Schedule<'_> {
         f_u: &mut Array1<f64>,
         f_au: &mut Array1<f64>,
         f_uv: &mut Array2<f64>,
+        moment_actions: &mut [[f64; 4]],
         need_hessian: bool,
     ) {
         for &u in self.active {
             f_u[u] += moments.linear(&self.first[u]);
             if need_hessian {
-                f_au[u] +=
-                    moments.linear(&self.a_first[u]) - moments.bilinear(dc_da, &self.first[u]);
+                moment_actions[u] = moments.action(&self.first[u]);
+                f_au[u] += moments.linear(&self.a_first[u]) - dot4(dc_da, &moment_actions[u]);
             }
         }
         if !need_hessian {
@@ -101,7 +105,7 @@ impl EmpiricalCubicPrimaryJet2Schedule<'_> {
         }
         for (active_u, &u) in self.active.iter().enumerate() {
             for &v in &self.active[active_u..] {
-                let mut value = -moments.bilinear(&self.first[u], &self.first[v]);
+                let mut value = -dot4(&self.first[u], &moment_actions[v]);
                 if u == 1 {
                     value += moments.linear(&self.b_first[v]);
                 }
@@ -125,6 +129,87 @@ fn cubic_coeff_jet_channel_is_nonzero(
         || (need_hessian
             && (a_first.iter().any(|&value| value != 0.0)
                 || b_first.iter().any(|&value| value != 0.0)))
+}
+
+#[cfg(test)]
+mod empirical_cubic_moment_tests {
+    use super::*;
+
+    #[test]
+    fn hankel_moment_jet_matches_dense_outer_products() {
+        let nodes = [-3.25, -1.1, -0.0, 0.2, 0.95, 2.7];
+        let weights = [0.03, 0.17, 0.2, 0.25, 0.23, 0.12];
+        let mut compiled = EmpiricalCubicMomentJet2::default();
+        let mut dense_first = [0.0_f64; 4];
+        let mut dense_second = [[0.0_f64; 4]; 4];
+        for (&z, &weight) in nodes.iter().zip(&weights) {
+            let eta = ((0.08 * z - 0.17) * z + 0.31) * z - 0.22;
+            let weighted_pdf = weight * normal_pdf(eta);
+            compiled.push(z, weighted_pdf, eta, true);
+            let p = [1.0, z, z * z, z * z * z];
+            for i in 0..4 {
+                dense_first[i] += weighted_pdf * p[i];
+                for j in 0..4 {
+                    dense_second[i][j] += weighted_pdf * eta * p[i] * p[j];
+                }
+            }
+        }
+
+        let coeffs = [
+            [0.7, -0.2, 0.04, 0.01],
+            [-0.3, 0.8, -0.15, 0.02],
+            [1.1, 0.0, 0.09, -0.03],
+        ];
+        let close = |left: f64, right: f64, label: &str| {
+            let tol = 5e-13 * left.abs().max(right.abs()).max(1.0);
+            assert!(
+                (left - right).abs() <= tol,
+                "{label}: compiled={left:+.16e}, dense={right:+.16e}, tol={tol:.3e}"
+            );
+        };
+        for (u, left) in coeffs.iter().enumerate() {
+            close(
+                compiled.linear(left),
+                dot4(left, &dense_first),
+                &format!("linear[{u}]"),
+            );
+            let action = compiled.action(left);
+            for i in 0..4 {
+                close(
+                    action[i],
+                    (0..4).map(|j| dense_second[i][j] * left[j]).sum(),
+                    &format!("action[{u},{i}]"),
+                );
+            }
+            for (v, right) in coeffs.iter().enumerate() {
+                let dense = (0..4)
+                    .map(|i| {
+                        left[i]
+                            * (0..4)
+                                .map(|j| dense_second[i][j] * right[j])
+                                .sum::<f64>()
+                    })
+                    .sum();
+                close(
+                    dot4(left, &compiled.action(right)),
+                    dense,
+                    &format!("bilinear[{u},{v}]"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn second_only_primary_channel_stays_on_compiled_tape() {
+        let zero = [0.0; 4];
+        let b_first = [0.0, 1.0, 0.0, 0.0];
+        assert!(cubic_coeff_jet_channel_is_nonzero(
+            &zero, &zero, &b_first, true
+        ));
+        assert!(!cubic_coeff_jet_channel_is_nonzero(
+            &zero, &zero, &b_first, false
+        ));
+    }
 }
 
 impl BernoulliMarginalSlopeFamily {
@@ -2734,7 +2819,8 @@ impl BernoulliMarginalSlopeFamily {
     /// with nonzero support, for `O(G + cells·k²)` work instead of the dense
     /// hand loop's `O(G·r²)` work (`k <= r`, and cubic local support keeps `k`
     /// small for ordinary spline bases).
-    /// Byte-parity with the hand twin is pinned to ≤1e-9 by the moment oracle.
+    /// Numerical parity with the independent runtime jet is pinned to ≤1e-9 by
+    /// the value/gradient/full-Hessian moment oracle.
     pub(super) fn flex_grid_calibration_derivs_factored(
         &self,
         empirical_grid: &crate::bms::EmpiricalZGrid,
@@ -2753,6 +2839,7 @@ impl BernoulliMarginalSlopeFamily {
         coeff_au: &mut [[f64; 4]],
         coeff_bu: &mut [[f64; 4]],
         active_primaries: &mut Vec<usize>,
+        moment_actions: &mut [[f64; 4]],
         f_u: &mut Array1<f64>,
         f_au: &mut Array1<f64>,
         f_uv: &mut Array2<f64>,
@@ -2870,8 +2957,8 @@ impl BernoulliMarginalSlopeFamily {
                     empirical_grid.nodes[node_begin]
                 ));
             }
-            let node_end = node_begin
-                + empirical_grid.nodes[node_begin..].partition_point(|&node| node < hi);
+            let node_end =
+                node_begin + empirical_grid.nodes[node_begin..].partition_point(|&node| node < hi);
             node_cursor = node_end;
             if node_begin == node_end {
                 continue;
@@ -2885,7 +2972,7 @@ impl BernoulliMarginalSlopeFamily {
             }
 
             if need_hessian {
-                f_aa += moments.linear(&obs.dc_daa) - moments.bilinear(&obs.dc_da, &obs.dc_da);
+                f_aa += moments.linear(&obs.dc_daa) - dot4(&obs.dc_da, &moments.action(&obs.dc_da));
             }
             EmpiricalCubicPrimaryJet2Schedule {
                 active: active_primaries,
@@ -2893,7 +2980,15 @@ impl BernoulliMarginalSlopeFamily {
                 a_first: coeff_au,
                 b_first: coeff_bu,
             }
-            .contract_into(&moments, &obs.dc_da, f_u, f_au, f_uv, need_hessian);
+            .contract_into(
+                &moments,
+                &obs.dc_da,
+                f_u,
+                f_au,
+                f_uv,
+                moment_actions,
+                need_hessian,
+            );
         }
         if node_cursor != empirical_grid.nodes.len() {
             return Err(format!(
@@ -2932,6 +3027,7 @@ impl BernoulliMarginalSlopeFamily {
             scratch.g_u_fixed.resize(r, [0.0; 4]);
             scratch.g_au_fixed.resize(r, [0.0; 4]);
             scratch.g_bu_fixed.resize(r, [0.0; 4]);
+            scratch.cell_moment_actions.resize(r, [0.0; 4]);
             scratch.zero_family.resize(r, [0.0; 4]);
             if scratch.active_cell_primaries.capacity() < r {
                 scratch.active_cell_primaries.reserve(r);
@@ -2960,6 +3056,7 @@ impl BernoulliMarginalSlopeFamily {
         let coeff_au = &mut scratch.coeff_au;
         let coeff_bu = &mut scratch.coeff_bu;
         let active_cell_primaries = &mut scratch.active_cell_primaries;
+        let cell_moment_actions = &mut scratch.cell_moment_actions;
         let g_u_fixed = &mut scratch.g_u_fixed;
         let g_au_fixed = &mut scratch.g_au_fixed;
         let g_bu_fixed = &mut scratch.g_bu_fixed;
@@ -2988,6 +3085,7 @@ impl BernoulliMarginalSlopeFamily {
                 coeff_au.as_mut_slice(),
                 coeff_bu.as_mut_slice(),
                 active_cell_primaries,
+                cell_moment_actions.as_mut_slice(),
                 f_u,
                 f_au,
                 f_uv,
