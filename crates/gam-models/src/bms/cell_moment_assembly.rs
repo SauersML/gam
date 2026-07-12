@@ -325,14 +325,6 @@ impl BernoulliMarginalSlopeFamily {
         probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
-    #[inline]
-    #[cfg(test)]
-    pub(super) fn unit_primary_direction(r: usize, idx: usize) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(r);
-        out[idx] = 1.0;
-        out
-    }
-
     pub(super) fn empirical_rigid_intercept_for_row(
         &self,
         row: usize,
@@ -925,8 +917,21 @@ impl BernoulliMarginalSlopeFamily {
         point: &[f64],
         direction: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
-        debug_assert_eq!(point.len(), K);
-        debug_assert_eq!(direction.len(), K);
+        let point: &[f64; K] = point.try_into().map_err(|_| {
+            format!(
+                "fixed empirical BMS point length {} != specialization width {K}",
+                point.len()
+            )
+        })?;
+        let direction: &[f64; K] = direction
+            .as_slice()
+            .and_then(|values| values.try_into().ok())
+            .ok_or_else(|| {
+                format!(
+                    "fixed empirical BMS third direction length {} != specialization width {K}",
+                    direction.len()
+                )
+            })?;
         let vars: [FixedRuntimeJet<OneSeed<K>, K>; K] = std::array::from_fn(|axis| {
             FixedRuntimeJet::from_inner(OneSeed::seed_direction(point[axis], axis, direction[axis]))
         });
@@ -950,9 +955,30 @@ impl BernoulliMarginalSlopeFamily {
         direction_u: &Array1<f64>,
         direction_v: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
-        debug_assert_eq!(point.len(), K);
-        debug_assert_eq!(direction_u.len(), K);
-        debug_assert_eq!(direction_v.len(), K);
+        let point: &[f64; K] = point.try_into().map_err(|_| {
+            format!(
+                "fixed empirical BMS point length {} != specialization width {K}",
+                point.len()
+            )
+        })?;
+        let direction_u: &[f64; K] = direction_u
+            .as_slice()
+            .and_then(|values| values.try_into().ok())
+            .ok_or_else(|| {
+                format!(
+                    "fixed empirical BMS fourth first-direction length {} != specialization width {K}",
+                    direction_u.len()
+                )
+            })?;
+        let direction_v: &[f64; K] = direction_v
+            .as_slice()
+            .and_then(|values| values.try_into().ok())
+            .ok_or_else(|| {
+                format!(
+                    "fixed empirical BMS fourth second-direction length {} != specialization width {K}",
+                    direction_v.len()
+                )
+            })?;
         let vars: [FixedRuntimeJet<TwoSeed<K>, K>; K] = std::array::from_fn(|axis| {
             FixedRuntimeJet::from_inner(TwoSeed::seed(
                 point[axis],
@@ -1016,7 +1042,9 @@ impl BernoulliMarginalSlopeFamily {
                 8 => Self::empirical_fixed_third_contracted::<8>(&plan, &point, dir),
                 12 => Self::empirical_fixed_third_contracted::<12>(&plan, &point, dir),
                 18 => Self::empirical_fixed_third_contracted::<18>(&plan, &point, dir),
-                _ => unreachable!("fixed empirical BMS width was matched above"),
+                _ => Err(format!(
+                    "unsupported fixed empirical BMS third specialization width {r}"
+                )),
             };
         }
         let mut contracted = self.empirical_flex_row_third_contracted_many(
@@ -1209,7 +1237,9 @@ impl BernoulliMarginalSlopeFamily {
                 8 => Self::empirical_fixed_fourth_contracted::<8>(&plan, &point, dir_u, dir_v),
                 12 => Self::empirical_fixed_fourth_contracted::<12>(&plan, &point, dir_u, dir_v),
                 18 => Self::empirical_fixed_fourth_contracted::<18>(&plan, &point, dir_u, dir_v),
-                _ => unreachable!("fixed empirical BMS width was matched above"),
+                _ => Err(format!(
+                    "unsupported fixed empirical BMS fourth specialization width {r}"
+                )),
             };
         }
         let pairs = [(dir_u, dir_v)];
@@ -3873,6 +3903,12 @@ mod empirical_flex_jet_oracle_tests {
     use super::*;
     use gam_math::jet_scalar::{DynamicJetArena, DynamicOneSeed, DynamicTwoSeed};
 
+    fn unit_primary_direction(r: usize, idx: usize) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(r);
+        out[idx] = 1.0;
+        out
+    }
+
     /// Test handle bundling a family with one active deviation block and the
     /// primary layout / fixed coefficients the kernel reads.
     struct FlexFixture {
@@ -4457,7 +4493,7 @@ mod empirical_flex_jet_oracle_tests {
                 }
             }
             &[row, column, contracted] => {
-                let direction = BernoulliMarginalSlopeFamily::unit_primary_direction(r, contracted);
+                let direction = unit_primary_direction(r, contracted);
                 let arena = DynamicJetArena::new();
                 let vars = arena.alloc_slice_fill_with(r, |axis| {
                     DynamicOneSeed::seed_direction(p0[axis], axis, direction[axis], r, &arena)
@@ -4467,10 +4503,8 @@ mod empirical_flex_jet_oracle_tests {
                     .contracted_third()[row * r + column]
             }
             &[row, column, contracted_u, contracted_v] => {
-                let direction_u =
-                    BernoulliMarginalSlopeFamily::unit_primary_direction(r, contracted_u);
-                let direction_v =
-                    BernoulliMarginalSlopeFamily::unit_primary_direction(r, contracted_v);
+                let direction_u = unit_primary_direction(r, contracted_u);
+                let direction_v = unit_primary_direction(r, contracted_v);
                 let arena = DynamicJetArena::new();
                 let vars = arena.alloc_slice_fill_with(r, |axis| {
                     DynamicTwoSeed::seed(
@@ -4698,7 +4732,7 @@ mod empirical_flex_jet_oracle_tests {
 
         // Third-contracted along the slope direction e_b: out[u][v] = ∂³ℓ[e_u,e_v,e_b].
         let b = fx.primary.logslope;
-        let dir_b = BernoulliMarginalSlopeFamily::unit_primary_direction(r, b);
+        let dir_b = unit_primary_direction(r, b);
         let third = fx
             .family
             .empirical_flex_row_third_contracted(
@@ -4739,7 +4773,7 @@ mod empirical_flex_jet_oracle_tests {
         }
 
         // Fourth-contracted along (e_b, e_dev0): out[p][q] = ∂⁴ℓ[e_p,e_q,e_b,e_dev0].
-        let dir_dev0 = BernoulliMarginalSlopeFamily::unit_primary_direction(r, dev0);
+        let dir_dev0 = unit_primary_direction(r, dev0);
         let fourth = fx
             .family
             .empirical_flex_row_fourth_contracted(

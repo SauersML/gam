@@ -755,18 +755,6 @@ pub(super) fn unary_derivatives_normal_cdf(x: f64) -> [f64; 5] {
     ]
 }
 
-#[cfg(test)]
-pub(super) fn unary_derivatives_normal_pdf(x: f64) -> [f64; 5] {
-    let pdf = normal_pdf(x);
-    [
-        pdf,
-        -x * pdf,
-        (x * x - 1.0) * pdf,
-        (-x.powi(3) + 3.0 * x) * pdf,
-        (x.powi(4) - 6.0 * x * x + 3.0) * pdf,
-    ]
-}
-
 /// Streaming log-sum-exp update: accumulate `exp(log_term)` into a running
 /// `(log_max, sum)` pair representing `Σ exp(log_term_i) = exp(log_max) · sum`.
 ///
