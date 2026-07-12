@@ -719,13 +719,17 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
         term.reconstruct_with_atom_images_target_aware(target.view(), assignments.view())?;
 
     let mut atom_reports = Vec::with_capacity(k_atoms);
-    for atom_index in 0..k_atoms {
+    for (atom_index, (reconstruction, coords)) in atom_reconstructions
+        .into_iter()
+        .zip(effective_coords)
+        .enumerate()
+    {
         atom_reports.push(SaeOosAtomReport {
             basis_kind: atom_specs[atom_index].basis_kind.clone(),
             decoder: term.atoms[atom_index].decoder_coefficients.clone(),
-            coords: effective_coords[atom_index].clone(),
+            coords,
             assignments: assignments.column(atom_index).to_owned(),
-            reconstruction: atom_reconstructions[atom_index].clone(),
+            reconstruction,
             active_dim: latent_dims[atom_index],
         });
     }
