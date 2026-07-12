@@ -306,11 +306,26 @@ mod tests {
             };
             let p_from = softmax(ArrayView1::from(&z_from));
             for _ in 0..6 {
-                // Small edit: random direction, small magnitude, modest amplitude
-                // — inside the quadratic/in-radius regime.
-                let dt = (lcg(&mut state) - 0.5) * 0.03;
-                let amp = 0.4 + 0.8 * lcg(&mut state);
+                // Pick a chord direction (sign of the latent step); the fitted
+                // periodic decoder's tangent magnitude is large and varies by
+                // row, so we do NOT trust a fixed latent step to yield a small
+                // move. Instead we measure the unit chord and choose the
+                // amplitude to hit a small target RAW-move norm, keeping δ deep
+                // in the quadratic regime while sweeping its magnitude over a
+                // decade so the regression has real range.
+                let dt = (lcg(&mut state) - 0.5) * 0.02;
                 let t_to = (t_from + dt).rem_euclid(tau);
+                let chord: Vec<f64> = {
+                    let t_mat = Array2::from_shape_vec((1, 1), vec![t_to]).unwrap();
+                    let g = atom.decode_at_coords(t_mat.view()).unwrap();
+                    (0..P_OUT).map(|j| scale[j] * g[[0, j]] - z_from[j]).collect()
+                };
+                let chord_norm = chord.iter().map(|&c| c * c).sum::<f64>().sqrt();
+                if !(chord_norm > 0.0) {
+                    continue;
+                }
+                let target_norm = 0.002 + 0.018 * lcg(&mut state);
+                let amp = target_norm / chord_norm;
                 let plan = steer_delta(&term, &metric, 0, row, amp, &[t_from], &[t_to])
                     .expect("steer_delta on calibrated term");
                 let pred = plan.predicted_nats.expect("behavioral dose");
@@ -351,7 +366,7 @@ mod tests {
         let (slope, intercept, r2) = regress(&predicted, &true_kl);
         let max_true = true_kl.iter().cloned().fold(0.0_f64, f64::max);
         assert!(
-            slope > 0.95 && slope < 1.05,
+            slope > 0.97 && slope < 1.03,
             "in-frame calibration slope {slope} must be ≈1 (predicted_nats tracks true KL)"
         );
         assert!(
@@ -359,7 +374,7 @@ mod tests {
             "in-frame calibration intercept {intercept} must be ≈0 vs max KL {max_true}"
         );
         assert!(
-            r2 > 0.99,
+            r2 > 0.995,
             "in-frame calibration R² {r2} must be ≈1 across edit directions"
         );
 
