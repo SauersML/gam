@@ -350,7 +350,21 @@ fn behavior_block_pins_reflection_gauge_that_activation_alone_cannot() {
     let n = 64usize;
     let p_x = 3usize;
     let vocab = 4usize; // p_y = 3
-    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
+    // Order-4 harmonic basis (num_basis = 1 + 2·4 = 9). The planted behavior is a
+    // softmax of harmonic-1 logits, and a softmax is NONLINEAR: its sphere-tangent
+    // coordinates carry the full Bessel tail (harmonics 2,3,4,… with relative
+    // amplitudes I_k(1.4)/I_0(1.4) ≈ 0.29, 0.044, 0.0080, …). An order-2 basis
+    // (harmonics 1,2) truncates at harmonic 3, leaving an IRREDUCIBLE per-row KL
+    // floor (~0.17 at the peak row) that no coupling weight λ_y can beat — the fit
+    // would converge honestly yet miss the strict 10×-finer identification bar
+    // purely for lack of decoder capacity. Order 4 captures the tail through
+    // harmonic 4 (residual starts at harmonic 5, relative amplitude ≈ 0.0011), so
+    // the representable reconstruction clears `worst_kl < 0.1·planted_sep` with
+    // orders of magnitude to spare. NOTE the reflection-PINNING signal itself (the
+    // odd `sin θ` logit) is harmonic 1 and was already representable at order 2 —
+    // raising the order does not change the identification premise, only the
+    // fidelity of the even Bessel harmonics the reconstruction is scored on.
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(9).unwrap());
     // BOTH fits are seeded at the FOLDED coordinate min(i, n−i)/n — the best an
     // activation-only estimator could possibly recover, since it maps mirror
     // rows (identical activations) to one point. The two-block fit must then
@@ -362,9 +376,19 @@ fn behavior_block_pins_reflection_gauge_that_activation_alone_cannot() {
     for i in 0..n {
         let theta = std::f64::consts::TAU * (i as f64 / n as f64);
         // Even functions of θ only: the activation cannot see the sign of θ.
+        // z0..z2 are representable at order 4; the small `cos 7θ` term is a high
+        // EVEN harmonic ABOVE the basis order (7 > 4) that the basis cannot absorb,
+        // so it keeps the anchor residual R_x > 0 — hence the variance-ratio λ_y*
+        // numerator stays positive and the coupling weight is not starved into the
+        // near-degenerate fixed point a perfectly-representable anchor would force
+        // (the same R_x→0 hazard the sibling isometry fixture dodges with its own
+        // wiggle). `cos 7θ` is even, so mirror rows i and n−i stay BIT-identical
+        // (the reflection-symmetry premise the test asserts), and harmonic 7 < the
+        // Nyquist 32 on this 64-point grid, so it is a genuine unrepresented
+        // residual, not an alias of a low harmonic.
         z[[i, 0]] = theta.cos();
         z[[i, 1]] = (2.0 * theta).cos();
-        z[[i, 2]] = 0.5 * (3.0 * theta).cos();
+        z[[i, 2]] = 0.5 * (3.0 * theta).cos() + 0.05 * (7.0 * theta).cos();
         // The behavior DOES see it: an odd sin θ logit.
         let law = softmax(&[1.4 * theta.sin(), 0.8 * theta.cos(), 0.3, 0.0]);
         for j in 0..vocab {
@@ -457,13 +481,10 @@ fn behavior_block_pins_reflection_gauge_that_activation_alone_cannot() {
             n_kl += 1;
         }
     }
-    // DIAGNOSTIC (#2015 gate): the selected λ_y (behavior weight) and WHERE the
-    // worst row sits separate the two hypotheses. Small λ_y ⇒ behavior
-    // under-weighted (selection issue). Large λ_y with a worst row near a mirror
-    // fixed point (θ≈0 → row≈0, or θ≈π → row≈n/2) ⇒ a nonconvex unfolding stall
-    // there; a worst row spread away from the fold with large λ_y ⇒ an irreducible
-    // basis-capacity floor (softmax of harmonic-1 logits carries harmonics ≥3 the
-    // order-2 basis `num_basis=5` cannot represent).
+    // Verification telemetry (#2015): the selected coupling weight and the
+    // worst-row reconstruction. With the order-4 basis the representable behavior
+    // clears the 10×-finer bar with large margin; a REML-selected finite λ_y and a
+    // worst_kl far below `bar` is the expected line.
     eprintln!(
         "[#2015 reflection-gauge] log λ_y={:.6} (λ_y={:.4}), converged={}, sweeps={}, \
          worst_kl={worst_kl:.6} @row {worst_row}/{n}, mean_kl={:.6}, \
