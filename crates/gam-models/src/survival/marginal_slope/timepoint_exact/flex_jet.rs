@@ -80,11 +80,7 @@
 //! ────────────────────────────────────────────────────────────────────────────
 
 use super::*;
-#[cfg(test)]
-use crate::bms::signed_probit_neglog_derivatives_up_to_fourth;
 use crate::bms::signed_probit_neglog_unary_stack;
-#[cfg(test)]
-use crate::inference::probability::signed_probit_logcdf_and_mills_ratio;
 use crate::survival::marginal_slope::gpu;
 
 /// The `[f64; 5]` Faà di Bruno stack of `g(η) = logΦ(−η)` at `η`.
@@ -4970,6 +4966,10 @@ mod hand_vs_jet_bench_tests {
     //! p∈{6,12,24}, asserts ≤1e-12 channel agreement, and quantifies the
     //! transcendental fraction (the 2×logΦ + 2×neglog-deriv calls both paths share).
     use super::*;
+    // Test-only oracle imports live INSIDE the test module — `#[cfg(test)]`
+    // on file-level use statements is scanner-banned (conditional imports).
+    use crate::bms::signed_probit_neglog_derivatives_up_to_fourth;
+    use crate::inference::probability::signed_probit_logcdf_and_mills_ratio;
     use ndarray::{Array1, Array2};
     use std::hint::black_box;
     use std::time::Instant;
