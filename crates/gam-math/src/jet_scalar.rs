@@ -2970,7 +2970,7 @@ impl<const K: usize> JetScalar<K> for crate::jet_tower::Tower4<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jet_tower::{RowNllProgram, Tower4, evaluate_program};
+    use crate::jet_tower::{RowProgram, Tower4, program_full_tower};
 
     /// A small polynomial-plus-unary row expression written ONCE, generically
     /// over `S: JetScalar<2>`, so it can be evaluated against every scalar:
@@ -2983,11 +2983,11 @@ mod tests {
         inner.mul(&radic).sub(&p[1].mul(&p[1]).scale(0.5))
     }
 
-    /// The same expression as a Tower4 `RowNllProgram`, the ground-truth tower.
+    /// The same expression exposed through the canonical generic row-program seam.
     struct ExprProgram {
         p: [f64; 2],
     }
-    impl RowNllProgram<2> for ExprProgram {
+    impl RowProgram<2> for ExprProgram {
         fn n_rows(&self) -> usize {
             1
         }
@@ -2997,7 +2997,7 @@ mod tests {
             }
             Ok(self.p)
         }
-        fn row_nll(&self, row: usize, p: &[Tower4<2>; 2]) -> Result<Tower4<2>, String> {
+        fn eval<S: JetScalar<2>>(&self, row: usize, p: &[S; 2]) -> Result<S, String> {
             if row >= self.n_rows() {
                 return Err(format!("ExprProgram: row {row} out of range"));
             }
@@ -3019,7 +3019,7 @@ mod tests {
     }
 
     fn tower() -> Tower4<2> {
-        evaluate_program(&ExprProgram { p: SEED }, 0).expect("tower")
+        program_full_tower(&ExprProgram { p: SEED }, 0).expect("tower")
     }
 
     /// Order2 reproduces Tower4's value/grad/Hessian channels exactly.
@@ -3387,11 +3387,9 @@ mod tests {
     /// The (test-only) `Tower4: JetScalar` impl is the all-channels oracle scalar:
     /// evaluating the SAME generic `row_expr` at `S = Tower4` (through the
     /// `JetScalar` trait ops) must reproduce, channel-for-channel, the `Tower4`
-    /// obtained from the `RowNllProgram` / inherent-operator path
-    /// (`evaluate_program`). This pins that the trait impl delegates faithfully to
-    /// the inherent `Tower4` arithmetic (so the contracted-scalar oracles above,
-    /// which compare against `evaluate_program`'s tower, are comparing against the
-    /// same algebra the `JetScalar` interface exposes).
+    /// obtained through the canonical `RowProgram` path (`program_full_tower`).
+    /// This pins that the full-tower scalar and the contracted scalar oracles above
+    /// all execute the same generic algebra surface.
     #[test]
     fn tower4_as_jetscalar_matches_program_tower_all_channels() {
         let t = tower();
