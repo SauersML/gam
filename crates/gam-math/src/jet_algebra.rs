@@ -245,9 +245,10 @@ impl CompensatedValue {
     #[inline]
     fn renormalize(hi: f64, lo: f64) -> Self {
         let sum = hi + lo;
+        let virtual_lo = sum - hi;
         Self {
             hi: sum,
-            lo: lo - (sum - hi),
+            lo: (hi - (sum - virtual_lo)) + (lo - virtual_lo),
         }
     }
 
