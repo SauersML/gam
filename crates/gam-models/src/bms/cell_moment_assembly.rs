@@ -2178,6 +2178,83 @@ impl BernoulliMarginalSlopeFamily {
         Ok((terms.objective, terms.grad, terms.hess))
     }
 
+    fn row_sigma_primary_directional_terms(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        direction: &[f64; 2],
+    ) -> Result<(Array1<f64>, Array2<f64>), String> {
+        let primaries = [block_states[0].eta[row], block_states[1].eta[row]];
+        let scale = self.sigma_scale_derivatives()?;
+        let terms = first_parameter_directional_order2_terms(
+            primaries,
+            direction,
+            scale.s,
+            scale.ds,
+            |variables, parameter| {
+                self.row_neglog_canonical_scale_jet(row, block_states, variables, parameter)
+            },
+        )?;
+        Ok((terms.grad, terms.hess))
+    }
+
+    #[cfg(test)]
+    fn row_sigma_primary_terms_multidir_oracle(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        second_sigma: bool,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let zero = Array1::<f64>::zeros(2);
+        let (leading, scales): (Vec<&Array1<f64>>, DirectionalScaleJets) = if second_sigma {
+            (
+                vec![&zero, &zero],
+                DirectionalScaleJets {
+                    obj: Some(self.sigma_scale_jet(2, &[1, 2], &[3])?),
+                    grad: self.sigma_scale_jet(3, &[1, 2], &[3])?,
+                    hess: self.sigma_scale_jet(4, &[1, 2], &[3])?,
+                },
+            )
+        } else {
+            (
+                vec![&zero],
+                DirectionalScaleJets {
+                    obj: Some(self.sigma_scale_jet(1, &[1], &[])?),
+                    grad: self.sigma_scale_jet(2, &[1], &[])?,
+                    hess: self.sigma_scale_jet(3, &[1], &[])?,
+                },
+            )
+        };
+        let terms = directional_obj_grad_hess(2, &leading, &scales, |dirs, scale| {
+            let owned = dirs
+                .iter()
+                .map(|direction| (*direction).clone())
+                .collect::<Vec<_>>();
+            self.row_neglog_directional_with_scale_jet(row, block_states, &owned, scale)
+        })?;
+        Ok((terms.objective, terms.grad, terms.hess))
+    }
+
+    #[cfg(test)]
+    fn row_sigma_primary_directional_terms_multidir_oracle(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        direction: &Array1<f64>,
+    ) -> Result<(Array1<f64>, Array2<f64>), String> {
+        let zero = Array1::<f64>::zeros(2);
+        let scales = DirectionalScaleJets {
+            obj: None,
+            grad: self.sigma_scale_jet(3, &[1], &[])?,
+            hess: self.sigma_scale_jet(4, &[1], &[])?,
+        };
+        let terms = directional_obj_grad_hess(2, &[&zero, direction], &scales, |dirs, scale| {
+            let owned = dirs.iter().map(|axis| (*axis).clone()).collect::<Vec<_>>();
+            self.row_neglog_directional_with_scale_jet(row, block_states, &owned, scale)
+        })?;
+        Ok((terms.grad, terms.hess))
+    }
+
     pub(super) fn accumulate_rigid_sigma_pullback(
         &self,
         row: usize,
@@ -2414,28 +2491,15 @@ impl BernoulliMarginalSlopeFamily {
             .outer_score_subsample
             .as_ref()
             .map(|_| crate::marginal_slope_shared::outer_row_weights_by_index(options, n));
-        // One TwoSeed evaluation carries the frailty-scale direction and the
-        // requested primary direction. Its mixed Order2 channel supplies the
-        // complete primary gradient and Hessian without a unit-axis sweep.
-        let scale = self.sigma_scale_derivatives()?;
         let acc = chunked_row_reduction(
             row_iter.as_slice(),
             || BernoulliBlockHessianAccumulator::new(&slices),
             |row, acc| -> Result<(), String> {
                 let row_dir =
                     self.row_primary_direction_from_flat(row, &slices, &primary, d_beta_flat)?;
-                let primaries = [block_states[0].eta[row], block_states[1].eta[row]];
                 let direction = [row_dir[0], row_dir[1]];
-                let terms = first_parameter_directional_order2_terms(
-                    primaries,
-                    &direction,
-                    scale.s,
-                    scale.ds,
-                    |variables, parameter| {
-                        self.row_neglog_canonical_scale_jet(row, block_states, variables, parameter)
-                    },
-                )?;
-                let mut hess = terms.hess;
+                let (_, mut hess) =
+                    self.row_sigma_primary_directional_terms(row, block_states, &direction)?;
                 if let Some(ref weights) = row_weights {
                     let w = weights[row];
                     if w != 1.0 {
@@ -5505,6 +5569,161 @@ mod empirical_flex_jet_oracle_tests {
                 "{label}[{row},{column}]: legacy {old_value:+.12e} != canonical {new_value:+.12e}"
             );
         }
+    }
+
+    fn assert_sigma_terms_close(
+        label: &str,
+        old: &(f64, Array1<f64>, Array2<f64>),
+        new: &(f64, Array1<f64>, Array2<f64>),
+    ) {
+        let close = |left: f64, right: f64| {
+            (left - right).abs() <= 2e-10 * left.abs().max(right.abs()).max(1.0)
+        };
+        assert!(
+            close(old.0, new.0),
+            "{label} objective: {} != {}",
+            old.0,
+            new.0
+        );
+        for axis in 0..2 {
+            assert!(
+                close(old.1[axis], new.1[axis]),
+                "{label} gradient[{axis}]: {} != {}",
+                old.1[axis],
+                new.1[axis]
+            );
+            for column in 0..2 {
+                assert!(
+                    close(old.2[[axis, column]], new.2[[axis, column]]),
+                    "{label} Hessian[{axis},{column}]: {} != {}",
+                    old.2[[axis, column]],
+                    new.2[[axis, column]]
+                );
+            }
+        }
+    }
+
+    fn timed_sigma(repetitions: usize, mut evaluate: impl FnMut() -> f64) -> u128 {
+        let start = std::time::Instant::now();
+        for _ in 0..repetitions {
+            std::hint::black_box(evaluate());
+        }
+        start.elapsed().as_nanos() / repetitions as u128
+    }
+
+    /// Temporary exact parity and release-speed gate for the sigma cutover.
+    /// The MultiDir side is test-only and is deleted after the pinned MSI run.
+    #[test]
+    fn bms_sigma_nested_jet_matches_multidir_and_benchmarks_932() {
+        let mut fixture = make_fixture(true);
+        fixture.family.score_warp = None;
+        fixture.family.link_dev = None;
+        fixture.family.latent_measure = LatentMeasureKind::StandardNormal;
+        fixture.family.gaussian_frailty_sd = Some(0.7);
+
+        for (case, &(q, slope, z, y, sigma)) in [
+            (-1.2, -0.9, -1.5, 0.0, 0.12),
+            (-0.3, 0.2, 0.4, 1.0, 0.7),
+            (0.25, 0.65, -0.8, 1.0, 1.4),
+            (1.1, -0.45, 1.7, 0.0, 2.5),
+        ]
+        .iter()
+        .enumerate()
+        {
+            fixture.family.z = Arc::new(Array1::from_vec(vec![z]));
+            fixture.family.y = Arc::new(Array1::from_vec(vec![y]));
+            fixture.family.gaussian_frailty_sd = Some(sigma);
+            let states = vec![
+                ParameterBlockState {
+                    beta: Array1::from_vec(vec![q]),
+                    eta: Array1::from_vec(vec![q]),
+                },
+                ParameterBlockState {
+                    beta: Array1::from_vec(vec![slope]),
+                    eta: Array1::from_vec(vec![slope]),
+                },
+            ];
+            for second in [false, true] {
+                let old = fixture
+                    .family
+                    .row_sigma_primary_terms_multidir_oracle(0, &states, second)
+                    .expect("MultiDir sigma terms");
+                let new = fixture
+                    .family
+                    .row_sigma_primary_terms(0, &states, second)
+                    .expect("nested sigma terms");
+                assert_sigma_terms_close(&format!("case={case} second={second}"), &old, &new);
+            }
+
+            let direction_array = Array1::from_vec(vec![0.37, -0.22]);
+            let direction = [direction_array[0], direction_array[1]];
+            let old = fixture
+                .family
+                .row_sigma_primary_directional_terms_multidir_oracle(0, &states, &direction_array)
+                .expect("MultiDir directional sigma terms");
+            let new = fixture
+                .family
+                .row_sigma_primary_directional_terms(0, &states, &direction)
+                .expect("nested directional sigma terms");
+            assert_sigma_terms_close(
+                &format!("case={case} directional"),
+                &(0.0, old.0, old.1),
+                &(0.0, new.0, new.1),
+            );
+        }
+
+        let states = vec![
+            ParameterBlockState {
+                beta: Array1::from_vec(vec![0.25]),
+                eta: Array1::from_vec(vec![0.25]),
+            },
+            ParameterBlockState {
+                beta: Array1::from_vec(vec![0.65]),
+                eta: Array1::from_vec(vec![0.65]),
+            },
+        ];
+        let direction_array = Array1::from_vec(vec![0.37, -0.22]);
+        let direction = [direction_array[0], direction_array[1]];
+        let repetitions = 20_000;
+        for second in [false, true] {
+            let old_ns = timed_sigma(repetitions, || {
+                let terms = fixture
+                    .family
+                    .row_sigma_primary_terms_multidir_oracle(0, &states, second)
+                    .expect("timed MultiDir sigma terms");
+                terms.0 + terms.1.sum() + terms.2.sum()
+            });
+            let new_ns = timed_sigma(repetitions, || {
+                let terms = fixture
+                    .family
+                    .row_sigma_primary_terms(0, &states, second)
+                    .expect("timed nested sigma terms");
+                terms.0 + terms.1.sum() + terms.2.sum()
+            });
+            eprintln!(
+                "BMS932_SIGMA_BENCH channel={} old_ns={old_ns} new_ns={new_ns} speedup={:.3}",
+                if second { "second" } else { "first" },
+                old_ns as f64 / new_ns as f64,
+            );
+        }
+        let old_ns = timed_sigma(repetitions, || {
+            let terms = fixture
+                .family
+                .row_sigma_primary_directional_terms_multidir_oracle(0, &states, &direction_array)
+                .expect("timed MultiDir directional sigma terms");
+            terms.0.sum() + terms.1.sum()
+        });
+        let new_ns = timed_sigma(repetitions, || {
+            let terms = fixture
+                .family
+                .row_sigma_primary_directional_terms(0, &states, &direction)
+                .expect("timed nested directional sigma terms");
+            terms.0.sum() + terms.1.sum()
+        });
+        eprintln!(
+            "BMS932_SIGMA_BENCH channel=directional old_ns={old_ns} new_ns={new_ns} speedup={:.3}",
+            old_ns as f64 / new_ns as f64,
+        );
     }
 
     /// Temporary measurement gate. It is committed so the old/new executable
