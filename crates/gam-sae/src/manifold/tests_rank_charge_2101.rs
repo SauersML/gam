@@ -691,21 +691,23 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
         let scaled = base_decoder.mapv(|v| c * v);
         let scaled_spectrum = spectrum(&scaled);
         assert_eq!(
-            scaled_spectrum.edge, base_spectrum.edge,
+            scaled_spectrum.mp_detection_edge(),
+            base_spectrum.mp_detection_edge(),
             "fixed dispersion and aspect ratio imply a fixed MP edge"
         );
         assert_eq!(
-            scaled_spectrum.basis_edf, base_spectrum.basis_edf,
+            scaled_spectrum.basis_edf(),
+            base_spectrum.basis_edf(),
             "basis EDF must not depend on decoder scale"
         );
         for (axis, (&mu_c, &mu_0)) in scaled_spectrum
-            .mu
+            .reconstruction_energies()
             .iter()
-            .zip(base_spectrum.mu.iter())
+            .zip(base_spectrum.reconstruction_energies().iter())
             .enumerate()
         {
             let expected = c * c * mu_0;
-            let tolerance = 512.0 * f64::EPSILON * expected.max(base_spectrum.edge);
+            let tolerance = 512.0 * f64::EPSILON * expected.max(base_spectrum.mp_detection_edge());
             assert!(
                 (mu_c - expected).abs() <= tolerance,
                 "decoder scaling law failed on mode {axis}: \
@@ -724,15 +726,19 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
         );
     }
 
-    let top_mu = base_spectrum.mu.iter().copied().fold(0.0_f64, f64::max);
+    let top_mu = base_spectrum
+        .reconstruction_energies()
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max);
     let vanished_edge = super::construction::RANK_VANISHED_REL * disp;
     let vanished_transition = (vanished_edge / top_mu).sqrt();
     let mut hard_transitions: Vec<f64> = base_spectrum
-        .mu
+        .reconstruction_energies()
         .iter()
         .copied()
         .filter(|&mu| mu > 0.0)
-        .map(|mu| (base_spectrum.edge / mu).sqrt())
+        .map(|mu| (base_spectrum.mp_detection_edge() / mu).sqrt())
         .collect();
     hard_transitions.sort_by(f64::total_cmp);
     assert!(
@@ -784,9 +790,9 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
     for c in probes {
         let c2 = c * c;
         let hard_rank = base_spectrum
-            .mu
+            .reconstruction_energies()
             .iter()
-            .filter(|&&mu| c2 * mu > base_spectrum.edge)
+            .filter(|&&mu| c2 * mu > base_spectrum.mp_detection_edge())
             .count();
         let expected_rank = if hard_rank > 0 {
             hard_rank
@@ -797,7 +803,7 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
             0
         };
         let d_c = d_eff(&base_decoder.mapv(|value| c * value));
-        let expected_d_eff = expected_rank as f64 * base_spectrum.basis_edf;
+        let expected_d_eff = expected_rank as f64 * base_spectrum.basis_edf();
         let tolerance = 128.0 * f64::EPSILON * expected_d_eff.max(1.0);
         eprintln!("[#2099 transition] c={c:.6e}: expected rank={expected_rank}, d_eff={d_c:.12}");
         assert!(

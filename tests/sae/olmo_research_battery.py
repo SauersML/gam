@@ -19,9 +19,10 @@ command):
      EV-vs-K frontier, reconstruction MSE, sparsity; plus the exact-vs-amortized
      encoder gap (predict() reconstruction vs the fitted reconstruction).
   4. ADJUDICATION (#907/#977) — per recovered atom, the Rust cross-class race
-     (gamfit.adjudicate_atom_shape: circle vs euclidean vs k-cluster mixture on
-     held-out predictive loglik) on the calibrated latent coords, plus a
-     superposition/binding read by prompt kind/role (#975).
+     (smooth circle vs Euclidean Gaussian vs free k-cluster mixture vs
+     constrained ring-of-clusters, selected by held-out predictive stacking)
+     on the calibrated latent coords, plus a superposition/binding read by
+     prompt kind/role (#975).
   5. HILLCLIMB — a small coordinate search over (tau, n_harmonics,
      intrinsic_rank) maximizing held-out EV; report the best config + the climb
      trace.
@@ -169,7 +170,11 @@ def adjudicate(gamfit, coords, seed, mean_l0):
         return gamfit.adjudicate_atom_shape(
             np.ascontiguousarray(coords), folds=5, seed=seed, mean_l0=mean_l0
         )
-    return {"winner": "n/a", "note": "adjudicate_atom_shape unavailable or d_atom!=2"}
+    return {
+        "winner_class": "n/a",
+        "reporting_winner": "n/a",
+        "note": "adjudicate_atom_shape unavailable or d_atom!=2",
+    }
 
 
 def binding_by_attribute(coords, labels):
@@ -328,8 +333,11 @@ def run_battery(data: Path, out_path: Path, seed: int, n_iter: int) -> dict:
             entry["error"] = f"{type(exc).__name__}: {exc}"
         results["adjudication"].append(entry)
         v = entry.get("shape_verdict", {})
-        print(f"  adjudication {layer_name}: shape={v.get('winner', '?')} "
-              f"margin={v.get('circular_margin', float('nan'))}")
+        print(
+            f"  adjudication {layer_name}: class={v.get('winner_class', '?')} "
+            f"reporting={v.get('reporting_winner', '?')} "
+            f"margin={v.get('circular_margin', float('nan'))}"
+        )
 
     # --- experiment 5: hillclimb over (tau, n_harmonics, intrinsic_rank) ----
     z = layers["L25_selfqualia"]
@@ -400,8 +408,12 @@ def print_summary(results: dict) -> None:
         print(f"  recon K={rp.get('K')}: manifold_ev={rp.get('manifold_ev')} linear_ev={rp.get('linear_ev')}")
     for a in results["adjudication"]:
         v = a.get("shape_verdict", {})
-        print(f"  adjudication {a.get('layer')}: {v.get('winner', a.get('error', '?'))} "
-              f"(kind_R={a.get('kind_binding_R')}, role_R={a.get('role_binding_R')})")
+        print(
+            f"  adjudication {a.get('layer')}: "
+            f"class={v.get('winner_class', a.get('error', '?'))} "
+            f"reporting={v.get('reporting_winner', '?')} "
+            f"(kind_R={a.get('kind_binding_R')}, role_R={a.get('role_binding_R')})"
+        )
     print(f"hillclimb best: {results['hillclimb'].get('best')}")
 
 

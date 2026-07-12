@@ -92,6 +92,36 @@ pub(super) struct ReconstructionRankClassification {
     pub top_signal: f64,
 }
 
+/// Convert a reconstruction singular value to per-observation energy without
+/// forming `singular_value²` first. Squaring first can overflow even when the
+/// quotient is representable; normalizing by `√n_eff` before squaring preserves
+/// that representable range. A genuinely unrepresentable energy is an error,
+/// not an infinite direction that silently wins the MP comparison.
+pub(super) fn normalized_reconstruction_energy(
+    singular_value: f64,
+    n_eff: f64,
+) -> Result<f64, String> {
+    if !singular_value.is_finite() || singular_value < 0.0 {
+        return Err(format!(
+            "reconstruction singular value must be finite and non-negative; got {singular_value}"
+        ));
+    }
+    if !n_eff.is_finite() || n_eff <= 0.0 {
+        return Err(format!(
+            "reconstruction energy needs finite positive n_eff; got {n_eff}"
+        ));
+    }
+    let normalized = singular_value / n_eff.sqrt();
+    let energy = normalized * normalized;
+    if !energy.is_finite() {
+        return Err(format!(
+            "per-observation reconstruction energy overflowed for singular value \
+             {singular_value} and n_eff={n_eff}"
+        ));
+    }
+    Ok(energy)
+}
+
 /// Single source of truth for MP detection versus production chargeability.
 ///
 /// Callers supply the per-observation reconstruction-Gram eigenvalues `mu`, the
@@ -99,13 +129,13 @@ pub(super) struct ReconstructionRankClassification {
 /// validated by [`validate_rank_charge_problem`] before production reaches this
 /// helper; [`super::wbic_audit::ReconSpectrum`] stores the same validated values.
 pub(super) fn classify_reconstruction_rank(
-    mu: impl IntoIterator<Item = f64>,
+    mu: &[f64],
     edge: f64,
     r_floor: f64,
 ) -> ReconstructionRankClassification {
     let mut mp_detection_rank = 0usize;
     let mut top_signal = 0.0_f64;
-    for signal in mu {
+    for &signal in mu {
         if signal > edge {
             mp_detection_rank += 1;
         }
@@ -296,11 +326,12 @@ pub(crate) fn realised_rank_charge_dof(
     };
     let edge = crate::null_battery::mp_detection_floor(n_eff, p_out, r_floor)
         .map_err(|error| format!("realised_rank_charge_dof: {error}"))?;
-    let rank = classify_reconstruction_rank(
-        sv.iter().map(|&s| (s * s) / n_eff),
-        edge,
-        r_floor,
-    );
+    let mu = sv
+        .iter()
+        .map(|&singular_value| normalized_reconstruction_energy(singular_value, n_eff))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("realised_rank_charge_dof: {error}"))?;
+    let rank = classify_reconstruction_rank(&mu, edge, r_floor);
     // DETECTION vs DEGENERACY (#2258 real-activation class). MP rank zero
     // conflated two regimes with opposite correct handling:
     //   · VANISHED decoder (a²‖B‖² → 0): the β-mode is degenerate, the

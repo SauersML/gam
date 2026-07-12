@@ -99,6 +99,23 @@ use ndarray::{Array2, ArrayView2};
 
 use super::Side;
 
+/// Stable evaluation of `μ/(μ + edge·log n_eff)` for validated non-negative
+/// inputs. Scaling by `max(μ, edge)` avoids overflow in both the tempered edge
+/// product and the denominator. At an exactly zero edge, zero energy contributes
+/// zero while every positive-energy direction contributes one.
+fn wbic_tempered_rank_fraction(mu: f64, edge: f64, n_eff: f64) -> f64 {
+    if mu == 0.0 {
+        return 0.0;
+    }
+    if edge == 0.0 {
+        return 1.0;
+    }
+    let log_n_eff = n_eff.max(std::f64::consts::E).ln();
+    let scale = mu.max(edge);
+    let scaled_mu = mu / scale;
+    scaled_mu / (scaled_mu + (edge / scale) * log_n_eff)
+}
+
 /// The reconstruction spectrum of ONE atom — the shared substrate both charges
 /// price. `mu` are the reconstruction-Gram eigenvalues `sv(diag(√λ)·Uᵀ·D)²/n_eff`
 /// (with `(λ,U)=eigh(G)`), `edge` the Marchenko–Pastur detection floor
@@ -111,25 +128,59 @@ use super::Side;
 #[derive(Clone, Debug)]
 pub struct ReconSpectrum {
     /// Reconstruction-Gram eigenvalues (per-observation signal+noise energy).
-    pub mu: Vec<f64>,
+    mu: Vec<f64>,
     /// Marchenko–Pastur noise edge the hard rank count thresholds on.
-    pub edge: f64,
+    edge: f64,
     /// Reconstruction dispersion `R`, used by the production vanished-decoder
     /// threshold `RANK_VANISHED_REL·R`.
-    pub dispersion: f64,
+    dispersion: f64,
     /// `tr(G(G+λS)⁻¹)` — the graded effective basis-function count.
-    pub basis_edf: f64,
+    basis_edf: f64,
     /// Effective sample size `Σ_row a²`.
-    pub n_eff: f64,
+    n_eff: f64,
 }
 
 impl ReconSpectrum {
     fn rank_classification(&self) -> super::construction::ReconstructionRankClassification {
-        super::construction::classify_reconstruction_rank(
-            self.mu.iter().copied(),
-            self.edge,
-            self.dispersion,
-        )
+        super::construction::classify_reconstruction_rank(&self.mu, self.edge, self.dispersion)
+    }
+
+    /// Validated per-observation reconstruction-Gram eigenvalues.
+    pub fn reconstruction_energies(&self) -> &[f64] {
+        &self.mu
+    }
+
+    /// Validated Marchenko–Pastur detection edge.
+    pub fn mp_detection_edge(&self) -> f64 {
+        self.edge
+    }
+
+    /// Validated reconstruction dispersion `R`.
+    pub fn dispersion(&self) -> f64 {
+        self.dispersion
+    }
+
+    /// Graded effective basis-function count `tr(G(G+λS)⁻¹)`.
+    pub fn basis_edf(&self) -> f64 {
+        self.basis_edf
+    }
+
+    /// Occupancy-aware effective sample size `Σ_row a²`.
+    pub fn effective_sample_size(&self) -> f64 {
+        self.n_eff
+    }
+
+    /// Audit-only basis-EDF specialization used by the checkpoint dynamics,
+    /// whose identity interpolation design contributes one graded unit per
+    /// reconstruction direction rather than the identity Gram's trace.
+    pub(super) fn with_audit_basis_edf(mut self, basis_edf: f64) -> Result<Self, String> {
+        if !basis_edf.is_finite() || basis_edf < 0.0 {
+            return Err(format!(
+                "audit basis EDF must be finite and non-negative; got {basis_edf}"
+            ));
+        }
+        self.basis_edf = basis_edf;
+        Ok(self)
     }
 
     /// Hard Marchenko–Pastur detection count `Σ_k 1[μ_k > e]`.
@@ -163,16 +214,9 @@ impl ReconSpectrum {
     /// `n_eff` is floored at Euler's number so the tempered edge is never softer
     /// than the hard MP edge.
     pub fn rank_soft(&self) -> f64 {
-        let tempered_edge = self.edge * self.n_eff.max(std::f64::consts::E).ln();
         self.mu
             .iter()
-            .map(|&m| {
-                if tempered_edge > 0.0 {
-                    m / (m + tempered_edge)
-                } else {
-                    1.0
-                }
-            })
+            .map(|&m| wbic_tempered_rank_fraction(m, self.edge, self.n_eff))
             .sum()
     }
 
@@ -198,10 +242,7 @@ impl ReconSpectrum {
     /// `½·rank_chargeable·basis_edf·log N_eff`, including the #2258
     /// minimum-rank promotion for an alive decoder below the MP edge.
     pub fn production_charge(&self) -> f64 {
-        0.5
-            * self.production_chargeable_rank() as f64
-            * self.basis_edf
-            * self.n_eff.max(1.0).ln()
+        0.5 * self.production_chargeable_rank() as f64 * self.basis_edf * self.n_eff.max(1.0).ln()
     }
 
     /// WBIC / singular free-energy charge `½·rank_soft·basis_edf·log N_eff`. Same
@@ -291,7 +332,13 @@ pub fn recon_spectrum(
     };
     let edge = crate::null_battery::mp_detection_floor(n_eff, p_out, r_floor)
         .map_err(|error| format!("recon_spectrum: {error}"))?;
-    let mu: Vec<f64> = sv.iter().map(|&s| (s * s) / n_eff).collect();
+    let mu = sv
+        .iter()
+        .map(|&singular_value| {
+            super::construction::normalized_reconstruction_energy(singular_value, n_eff)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("recon_spectrum: {error}"))?;
     // basis_edf = tr(G(G+λS)⁻¹), the same ridge trace the production core computes.
     let mut mmat = gram.clone();
     if let Some(pen) = smooth_penalty {
@@ -413,13 +460,9 @@ pub fn render_audit_table(rows: &[AuditRow]) -> String {
 /// per-direction term (same `tempered_edge = e·log n_eff`, `n_eff` floored at
 /// `e` so `log n_eff ≥ 1`). Exposed for the sampling cross-check test that
 /// validates the closed form against a genuine tempered-posterior expectation.
-pub fn direction_learning_coefficient(mu: f64, edge: f64, n_eff: f64) -> f64 {
-    let tempered_edge = edge * n_eff.max(std::f64::consts::E).ln();
-    if tempered_edge > 0.0 {
-        0.5 * mu / (mu + tempered_edge)
-    } else {
-        0.5
-    }
+#[cfg(test)]
+fn direction_learning_coefficient(mu: f64, edge: f64, n_eff: f64) -> f64 {
+    0.5 * wbic_tempered_rank_fraction(mu, edge, n_eff)
 }
 
 /// A genuine (non-Laplace) WBIC estimate for a SINGLE scalar-amplitude
@@ -435,7 +478,8 @@ pub fn direction_learning_coefficient(mu: f64, edge: f64, n_eff: f64) -> f64 {
 /// returns the SAME number as the sigmoid up to the prior-shift term, which this
 /// includes so the test sees the full expectation. `log n_eff` uses the same
 /// `n_eff` floored at `e` as production `rank_soft`.
-pub fn sampled_direction_learning_coefficient(mu: f64, edge: f64, n_eff: f64, r_floor: f64) -> f64 {
+#[cfg(test)]
+fn sampled_direction_learning_coefficient(mu: f64, edge: f64, n_eff: f64, r_floor: f64) -> f64 {
     let ln_neff = n_eff.max(std::f64::consts::E).ln();
     if !(ln_neff > 0.0) || !(r_floor > 0.0) || !(n_eff > 0.0) {
         return 0.0;
@@ -482,6 +526,15 @@ pub fn spectrum_from_fit(
     let m = phi.ncols();
     if phi.nrows() != n || w.len() != n {
         return Err("spectrum_from_fit: shape mismatch".into());
+    }
+    if data.iter().any(|value| !value.is_finite()) {
+        return Err("spectrum_from_fit: data must be finite".into());
+    }
+    if phi.iter().any(|value| !value.is_finite()) {
+        return Err("spectrum_from_fit: basis must be finite".into());
+    }
+    if w.iter().any(|weight| !weight.is_finite() || *weight < 0.0) {
+        return Err("spectrum_from_fit: weights must be finite and non-negative".into());
     }
     // Weighted Gram G = ΦᵀWΦ and cross term ΦᵀW·data.
     let mut gram = Array2::<f64>::zeros((m, m));
@@ -641,12 +694,73 @@ mod tests {
 
         assert_eq!(spec.mp_detection_rank(), 0);
         assert_eq!(spec.production_chargeable_rank(), 1);
-        assert_eq!(d_prod, spec.basis_edf);
-        assert_eq!(
-            spec.production_charge(),
-            0.5 * d_prod * n_eff.ln()
-        );
+        assert_eq!(d_prod, spec.basis_edf());
+        assert_eq!(spec.production_charge(), 0.5 * d_prod * n_eff.ln());
         assert_eq!(spec.mp_detection_charge(), 0.0);
+    }
+
+    /// A zero MP edge does not make a zero-energy direction count as one. The
+    /// exact limit of `μ/(μ+edge)` is zero at `μ=0` and one for `μ>0` when
+    /// the edge is zero.
+    #[test]
+    fn zero_edge_soft_rank_distinguishes_zero_from_positive_energy() {
+        let gram = Array2::<f64>::eye(2);
+        let zero = Array2::<f64>::zeros((2, 2));
+        let zero_spec = recon_spectrum(&gram, &zero, 2.0, 2.0, 0.0, 0.0, None).unwrap();
+        assert_eq!(zero_spec.mp_detection_edge(), 0.0);
+        assert_eq!(zero_spec.rank_soft(), 0.0);
+        assert_eq!(zero_spec.mp_detection_rank(), 0);
+        assert_eq!(zero_spec.production_chargeable_rank(), 0);
+        assert_eq!(zero_spec.wbic_charge(), 0.0);
+
+        let mut one_direction = Array2::<f64>::zeros((2, 2));
+        one_direction[[0, 0]] = 1.0;
+        let positive_spec =
+            recon_spectrum(&gram, &one_direction, 2.0, 2.0, 0.0, 0.0, None).unwrap();
+        assert_eq!(positive_spec.mp_detection_edge(), 0.0);
+        assert_eq!(positive_spec.rank_soft(), 1.0);
+        assert_eq!(positive_spec.mp_detection_rank(), 1);
+        assert_eq!(positive_spec.production_chargeable_rank(), 1);
+    }
+
+    /// The WBIC fraction stays finite when either `edge·log(n_eff)` or
+    /// `μ + edge·log(n_eff)` would overflow under direct evaluation.
+    #[test]
+    fn soft_rank_fraction_avoids_finite_input_overflow() {
+        let scale = 0.5 * f64::MAX;
+        let spec = ReconSpectrum {
+            mu: vec![scale],
+            edge: scale,
+            dispersion: 1.0,
+            basis_edf: 1.0,
+            n_eff: f64::MAX,
+        };
+        let expected = 1.0 / (1.0 + f64::MAX.ln());
+        let actual = spec.rank_soft();
+        assert!(actual.is_finite() && actual > 0.0);
+        assert!((actual - expected).abs() <= 8.0 * f64::EPSILON * expected);
+    }
+
+    /// Normalize by `√n_eff` before squaring: `s²` overflows here, while the
+    /// per-observation energy `s²/n_eff = 10²⁰⁰` is finite. Both production
+    /// and the audit must retain that finite energy and classify it identically.
+    #[test]
+    fn extreme_singular_value_has_finite_shared_energy_and_rank() {
+        let gram = Array2::<f64>::eye(1);
+        let decoder = Array2::<f64>::from_elem((1, 1), 1.0e200);
+        let n_eff = 1.0e200;
+        let spec = recon_spectrum(&gram, &decoder, n_eff, 1.0, 1.0, 0.0, None).unwrap();
+        let energy = spec.reconstruction_energies()[0];
+        assert!(energy.is_finite());
+        assert!((energy / 1.0e200 - 1.0).abs() < 1.0e-12);
+        assert_eq!(spec.mp_detection_rank(), 1);
+        assert_eq!(spec.production_chargeable_rank(), 1);
+
+        let d_prod = super::super::construction::realised_rank_charge_dof(
+            &gram, &decoder, n_eff, 1.0, 1.0, 0.0, None,
+        )
+        .unwrap();
+        assert_eq!(d_prod, spec.basis_edf());
     }
 
     #[test]
@@ -729,8 +843,28 @@ mod tests {
         assert_eq!(
             recon_spectrum(&gram, &decoder, 0.0, 3.0, 1.0, 0.0, None)
                 .unwrap()
-                .edge,
+                .mp_detection_edge(),
             0.0
+        );
+    }
+
+    #[test]
+    fn spectrum_fit_rejects_invalid_weights_and_nonfinite_inputs() {
+        let data = Array2::<f64>::zeros((2, 1));
+        let phi = Array2::<f64>::eye(2);
+        assert!(spectrum_from_fit(data.view(), &[-1.0, 2.0], &phi, 1.0, 0.0, None).is_err());
+        assert!(spectrum_from_fit(data.view(), &[f64::NAN, 1.0], &phi, 1.0, 0.0, None).is_err());
+
+        let mut nonfinite_data = data.clone();
+        nonfinite_data[[0, 0]] = f64::INFINITY;
+        assert!(
+            spectrum_from_fit(nonfinite_data.view(), &[1.0, 1.0], &phi, 1.0, 0.0, None,).is_err()
+        );
+
+        let mut nonfinite_phi = phi;
+        nonfinite_phi[[0, 0]] = f64::NAN;
+        assert!(
+            spectrum_from_fit(data.view(), &[1.0, 1.0], &nonfinite_phi, 1.0, 0.0, None,).is_err()
         );
     }
 
@@ -1190,8 +1324,7 @@ mod tests {
         }
         let disk = spectrum_from_fit(data.view(), &w, &phi, 0.12 * 0.12, 0.0, None).unwrap();
         assert!(
-            disk.mp_detection_rank() > 0
-                && disk.rank_soft() < disk.mp_detection_rank() as f64,
+            disk.mp_detection_rank() > 0 && disk.rank_soft() < disk.mp_detection_rank() as f64,
             "disk fixture must have above-edge directions the tempered count discounts: \
              hard={:.3} soft={:.3}",
             disk.mp_detection_rank(),

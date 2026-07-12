@@ -352,7 +352,7 @@ fn atom_learning_spectrum(
     let (n_grid, ambient) = curve.dim();
     let gram = Array2::<f64>::eye(n_grid);
     let decoder = curve.to_owned();
-    let mut spec = recon_spectrum(
+    recon_spectrum(
         &gram,
         &decoder,
         n_grid as f64,
@@ -360,10 +360,9 @@ fn atom_learning_spectrum(
         r_floor,
         0.0,
         None,
-    )?;
+    )?
     // Grid-interpolation basis: one graded unit per reconstruction direction.
-    spec.basis_edf = 1.0;
-    Ok(spec)
+    .with_audit_basis_edf(1.0)
 }
 
 /// Grid-node delete-one jackknife SE of `λ = ½·rank_soft` at one checkpoint. Each

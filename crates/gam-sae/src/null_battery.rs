@@ -114,7 +114,8 @@ pub fn empirical_p_value(
 /// `(n_eff, p, R)`. This is the identical closed-form noise edge the
 /// production rank charge already thresholds on
 /// ([`crate::manifold::construction::realised_rank_charge_dof`], and its
-/// audit twin [`crate::manifold::wbic_audit::ReconSpectrum::edge`]) —
+/// audit twin
+/// [`crate::manifold::wbic_audit::ReconSpectrum::mp_detection_edge`]) —
 /// surfaced standalone so a shape-adjudication caller can report "this is
 /// the smallest signal this sample size and ambient dimension could ever
 /// certify" alongside a verdict, without needing a fitted decoder Gram to
@@ -145,12 +146,35 @@ pub fn mp_detection_floor(n_eff: f64, p: f64, r_floor: f64) -> Result<f64, Strin
         return Ok(0.0);
     }
     let edge = r_floor * (1.0 + (p / n_eff).sqrt()).powi(2);
-    if !edge.is_finite() {
+    if edge.is_finite() {
+        return Ok(edge);
+    }
+
+    // The aspect ratio or its square can overflow even when multiplication by
+    // a small, positive dispersion brings the final edge back into range. The
+    // logarithmic reconstruction evaluates that same product without losing a
+    // representable answer:
+    //   log edge = log R + 2 log(1 + exp(½(log p - log n))).
+    // Keep the direct path above so ordinary inputs retain their exact rounding.
+    let log_sqrt_aspect = 0.5 * (p.ln() - n_eff.ln());
+    let log_multiplier = if log_sqrt_aspect > 0.0 {
+        log_sqrt_aspect + (-log_sqrt_aspect).exp().ln_1p()
+    } else {
+        log_sqrt_aspect.exp().ln_1p()
+    };
+    let log_edge = r_floor.ln() + 2.0 * log_multiplier;
+    if !log_edge.is_finite() || log_edge > f64::MAX.ln() {
         return Err(format!(
             "mp_detection_floor: edge overflowed for n_eff={n_eff}, p={p}, r_floor={r_floor}"
         ));
     }
-    Ok(edge)
+    let recovered_edge = log_edge.exp();
+    if !recovered_edge.is_finite() {
+        return Err(format!(
+            "mp_detection_floor: edge overflowed for n_eff={n_eff}, p={p}, r_floor={r_floor}"
+        ));
+    }
+    Ok(recovered_edge)
 }
 
 /// One member of the standing null battery.
@@ -2607,6 +2631,20 @@ mod tests {
         assert_eq!(
             mp_detection_floor(f64::MIN_POSITIVE, f64::MAX, 0.0).unwrap(),
             0.0
+        );
+    }
+
+    #[test]
+    fn mp_detection_floor_recovers_representable_result_after_intermediate_overflow() {
+        let n_eff = f64::MIN_POSITIVE;
+        let p = f64::MAX;
+        let r_floor = 0.25 * n_eff;
+        let edge = mp_detection_floor(n_eff, p, r_floor).unwrap();
+        let asymptotic = 0.25 * p;
+        assert!(edge.is_finite() && edge > 0.0);
+        assert!(
+            ((edge - asymptotic) / asymptotic).abs() < 2.0e-13,
+            "log-domain MP edge reconstruction drifted: edge={edge:e}, expected≈{asymptotic:e}"
         );
     }
 

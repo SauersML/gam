@@ -32,10 +32,7 @@ impl SaeManifoldTerm {
                 let a = assignments[atom];
                 a * (1.0 - a) / temperature
             }
-            AssignmentMode::ThresholdGate {
-                temperature,
-                ..
-            } if atom == wrt_atom => {
+            AssignmentMode::ThresholdGate { temperature, .. } if atom == wrt_atom => {
                 let a = assignments[atom];
                 a * (1.0 - a) / temperature
             }
@@ -136,8 +133,7 @@ impl SaeManifoldTerm {
                 // the exact matrix used by the value, with no hidden diagonal
                 // regularizer whose differential would otherwise be omitted.
                 let inverse_gram_inverse = inverse.dot(gram).dot(&inverse);
-                gram_differential = (&inverse - &inverse_gram_inverse)
-                    * (0.5 * rank * log_n);
+                gram_differential = (&inverse - &inverse_gram_inverse) * (0.5 * rank * log_n);
                 let inv_g_inv_s = inverse.dot(gram).dot(&inverse).dot(&atom.smooth_penalty);
                 let edf_log_lambda =
                     -lambda[atom_idx] * (0..m).map(|i| inv_g_inv_s[[i, i]]).sum::<f64>();
