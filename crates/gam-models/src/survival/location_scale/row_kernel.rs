@@ -3,7 +3,8 @@ use super::*;
 use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar,
-    MappedOrder2Accumulator, OneSeedBatch, OneSeedLane, Order2Lane, RuntimeJetScalar,
+    MappedOrder2Accumulator, OneSeedBatch, OneSeedLane, Order2AtomChannels, Order2Lane,
+    RuntimeJetScalar,
 };
 use gam_row_macros::row_atom;
 use wide::f64x4;
@@ -649,6 +650,66 @@ fn sls_row_vgh_compiled(
         output.add_composed(&g, SLS_G_AXES, truncate(stack));
     }
     output.into_channels()
+}
+
+/// Hessian-only lowering of the same build-time symbolic atoms used by
+/// [`sls_row_vgh_compiled`]. Only the 24 structurally live upper-triangle
+/// channels exist in the output; no 9×9 primary Hessian is materialized.
+#[inline(always)]
+fn add_composed_hessian_pairs<const N: usize, A: Order2AtomChannels<N>>(
+    output: &mut [f64; SLS_HESSIAN_PAIRS.len()],
+    atom: &A,
+    axes: [usize; N],
+    first: f64,
+    second: f64,
+) {
+    for local_row in 0..N {
+        for local_column in local_row..N {
+            let row = axes[local_row];
+            let column = axes[local_column];
+            let slot = SLS_HESSIAN_PAIR_SLOTS[row][column];
+            debug_assert!(slot < SLS_HESSIAN_PAIRS.len());
+            let mut channel = first * atom.hessian_at(local_row, local_column);
+            channel += second
+                * atom.gradient_at(local_row)
+                * atom.gradient_at(local_column);
+            output[slot] += channel;
+        }
+    }
+}
+
+#[inline(always)]
+fn sls_row_hessian_pairs_compiled(
+    primary: &[f64; SLS_ROW_K],
+    kernel: &SurvivalExactRowKernel,
+) -> [f64; SLS_HESSIAN_PAIRS.len()] {
+    let u0 = sls_index_order2(
+        primary[SLS_U0_AXES[0]],
+        primary[SLS_U0_AXES[1]],
+        primary[SLS_U0_AXES[2]],
+    );
+    let u1 = sls_index_order2(
+        primary[SLS_U1_AXES[0]],
+        primary[SLS_U1_AXES[1]],
+        primary[SLS_U1_AXES[2]],
+    );
+    let g = sls_event_rate_order2(
+        primary[SLS_G_AXES[0]],
+        primary[SLS_G_AXES[1]],
+        primary[SLS_G_AXES[2]],
+        primary[SLS_G_AXES[3]],
+        primary[SLS_G_AXES[4]],
+    );
+    let plan = sls_outer_plan(kernel);
+    let mut output = [0.0; SLS_HESSIAN_PAIRS.len()];
+    add_composed_hessian_pairs(&mut output, &u0, SLS_U0_AXES, plan.u0[1], plan.u0[2]);
+    if let Some(stack) = plan.u1 {
+        add_composed_hessian_pairs(&mut output, &u1, SLS_U1_AXES, stack[1], stack[2]);
+    }
+    if let Some(stack) = plan.g {
+        add_composed_hessian_pairs(&mut output, &g, SLS_G_AXES, stack[1], stack[2]);
+    }
+    output
 }
 
 /// Materialize `X[row, :]` as a dense length-`ncols` vector (no sparse-aware
@@ -1876,7 +1937,7 @@ struct SlsHessianPairGroup {
     right_channel: usize,
     left_design: usize,
     right_design: usize,
-    pairs: Vec<(usize, usize)>,
+    pair_slots: Vec<usize>,
 }
 
 /// The only structurally live upper-triangle pairs of the canonical
@@ -1908,6 +1969,20 @@ const SLS_HESSIAN_PAIRS: [(usize, usize); 24] = [
     (7, 7),
     (8, 8),
 ];
+
+const fn sls_hessian_pair_slots() -> [[usize; SLS_ROW_K]; SLS_ROW_K] {
+    let mut slots = [[SLS_HESSIAN_PAIRS.len(); SLS_ROW_K]; SLS_ROW_K];
+    let mut slot = 0;
+    while slot < SLS_HESSIAN_PAIRS.len() {
+        let (row, column) = SLS_HESSIAN_PAIRS[slot];
+        slots[row][column] = slot;
+        slots[column][row] = slot;
+        slot += 1;
+    }
+    slots
+}
+
+const SLS_HESSIAN_PAIR_SLOTS: [[usize; SLS_ROW_K]; SLS_ROW_K] = sls_hessian_pair_slots();
 
 impl SurvivalLocationScaleFamily {
     pub(crate) const BLOCK_TIME: usize = 0;
@@ -2044,7 +2119,9 @@ impl SurvivalLocationScaleFamily {
         ];
 
         let mut groups: Vec<SlsHessianPairGroup> = Vec::with_capacity(SLS_HESSIAN_PAIRS.len());
-        for (left_channel, right_channel) in SLS_HESSIAN_PAIRS {
+        for (pair_slot, (left_channel, right_channel)) in
+            SLS_HESSIAN_PAIRS.into_iter().enumerate()
+        {
             let (Some(left_design), Some(right_design)) =
                 (design_ids[left_channel], design_ids[right_channel])
             else {
@@ -2053,16 +2130,22 @@ impl SurvivalLocationScaleFamily {
             if let Some(group) = groups.iter_mut().find(|group| {
                 group.left_design == left_design && group.right_design == right_design
             }) {
-                group.pairs.push((left_channel, right_channel));
+                group.pair_slots.push(pair_slot);
             } else {
                 groups.push(SlsHessianPairGroup {
                     left_channel,
                     right_channel,
                     left_design,
                     right_design,
-                    pairs: vec![(left_channel, right_channel)],
+                    pair_slots: vec![pair_slot],
                 });
             }
+        }
+
+        // Block and diagonal consumers cannot observe cross-block groups. Drop
+        // those slots before allocating or evaluating the shared row buffer.
+        if target != SlsCoefficientHessianTarget::DenseFull {
+            groups.retain(|group| group.left_channel / 3 == group.right_channel / 3);
         }
 
         let kernel = self.survival_ls_row_kernel_rescaled(dynamic, deriv_log_scale);
@@ -2072,12 +2155,15 @@ impl SurvivalLocationScaleFamily {
             .into_par_iter()
             .enumerate()
             .try_for_each(|(row, mut row_slots)| -> Result<(), String> {
-                let (_, _, h) = crate::row_kernel::RowKernel::row_kernel(&kernel, row)?;
+                let coefficients = match kernel.row_nll_inputs_opt(row)? {
+                    Some((primary, exact)) => sls_row_hessian_pairs_compiled(&primary, &exact),
+                    None => [0.0; SLS_HESSIAN_PAIRS.len()],
+                };
                 for (slot, group) in groups.iter().enumerate() {
                     let coefficient = group
-                        .pairs
+                        .pair_slots
                         .iter()
-                        .fold(0.0, |sum, &(a, b)| sum + h[a][b]);
+                        .fold(0.0, |sum, &pair_slot| sum + coefficients[pair_slot]);
                     row_slots[slot] = match row_mask {
                         Some(mask) => coefficient * mask[row],
                         None => coefficient,
