@@ -55,8 +55,8 @@ pub(crate) use crate::probability::standard_normal_quantile;
 pub(crate) use crate::spatial_psi_bridge::build_block_spatial_psi_derivatives;
 pub(crate) use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
 pub(crate) use gam_linalg::matrix::{
-    DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
-    dense_rowwise_kronecker,
+    DenseDesignMatrix, DenseDesignOperator, DesignMatrix, FiniteSignedWeightsView, LinearOperator,
+    SymmetricMatrix, dense_rowwise_kronecker,
 };
 pub(crate) use gam_problem::{
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,

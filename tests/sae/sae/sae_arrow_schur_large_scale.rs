@@ -348,7 +348,7 @@ fn data_fit_beta_hessian_kronecker_matches_dense_reference() {
     // broadcasts one `log_lambda_smooth` across all K atoms, #1556), so every
     // atom carries the same strength; atom 0 is representative for the dense
     // reference, which scales the shared smoothness block by a single λ.
-    let lambda_smooth = f.rho.lambda_smooth_for(0);
+    let lambda_smooth = f.rho.lambda_smooth_for(0).unwrap();
 
     // Snapshot per-atom static data needed to build the dense reference.
     let beta_dim = f.term.beta_dim();

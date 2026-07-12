@@ -487,8 +487,8 @@ pub(super) fn pilot_eta_for_link_dev_orthogonalisation(
         return Ok(working_eta);
     }
     let xtwr = marginal_design.compute_xtwy(&w_irls, &residual)?;
-    let mut xtwx = marginal_design
-        .xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(&w_irls)?)?;
+    let mut xtwx =
+        marginal_design.xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(&w_irls)?)?;
     let trace_diag: f64 = (0..p_marg).map(|i| xtwx[[i, i]]).sum();
     let ridge =
         (trace_diag / p_marg as f64).max(PILOT_RIDGE_DIAG_FLOOR) * PILOT_RIDGE_DIAG_FRACTION;

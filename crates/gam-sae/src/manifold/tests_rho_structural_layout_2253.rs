@@ -168,7 +168,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         atomized_criterion.value(),
     );
     let audit_solver = audit_term
-        .outer_gradient_arrow_solver(&audit_cache, &rho_state.lambda_smooth_vec())
+        .outer_gradient_arrow_solver(&audit_cache, &rho_state.lambda_smooth_vec().unwrap())
         .expect("frozen accepted-state outer solver");
     let audit_components = audit_term
         .analytic_outer_rho_gradient_components(
@@ -215,7 +215,7 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let quotient_kkt_norm = kkt_term.quotient_gradient_norm_from_system(
         &kkt_system,
         kkt_norm_sq,
-        &rho_state.lambda_smooth_vec(),
+        &rho_state.lambda_smooth_vec().unwrap(),
     );
     let kkt_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * kkt_term.inner_iterate_scale();
     assert!(
@@ -603,7 +603,7 @@ fn frozen_state_per_coordinate_channel_fd_audit_2253() {
         )
         .expect("frozen accepted-state evidence audit must evaluate");
     let audit_solver = audit_term
-        .outer_gradient_arrow_solver(&audit_cache, &rho_state.lambda_smooth_vec())
+        .outer_gradient_arrow_solver(&audit_cache, &rho_state.lambda_smooth_vec().unwrap())
         .expect("frozen accepted-state outer solver");
     let components = audit_term
         .analytic_outer_rho_gradient_components(

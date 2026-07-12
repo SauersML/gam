@@ -269,7 +269,7 @@ impl SaeManifoldTerm {
         // is scaled by `λ_smooth[k]·penalty_scale`. The minibatch `penalty_scale`
         // multiplies every atom uniformly.
         let lambda_smooth: Vec<f64> = rho
-            .lambda_smooth_vec()
+            .lambda_smooth_vec()?
             .iter()
             .map(|&l| l * penalty_scale)
             .collect();
@@ -305,7 +305,7 @@ impl SaeManifoldTerm {
                 sparsity,
             } if k_atoms > 1 => {
                 let inv_tau = 1.0 / temperature;
-                let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
+                let scale = rho.lambda_sparse()? * sparsity * inv_tau * inv_tau;
                 Some((
                     gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
                         k_atoms,

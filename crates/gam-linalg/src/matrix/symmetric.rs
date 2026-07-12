@@ -357,6 +357,8 @@ pub fn xt_diag_x_symmetric(
             diag.len()
         ));
     }
+    FiniteSignedWeightsView::try_from_array(diag)
+        .map_err(|reason| format!("xt_diag_x_symmetric: {reason}"))?;
     match design {
         DesignMatrix::Dense(x) => Ok(SymmetricMatrix::Dense(x.diag_xtw_x(diag)?)),
         DesignMatrix::Sparse(xs) => {
@@ -631,5 +633,22 @@ mod tests {
     fn max_abs_diag_with_negative_diagonal_entry() {
         let m = SymmetricMatrix::Dense(array![[-5.0_f64, 0.0], [0.0, 3.0]]);
         assert_eq!(m.max_abs_diag(), 5.0);
+    }
+
+    #[test]
+    fn raw_symmetric_gram_rejects_smallest_nonfinite_row_before_sparse_assembly() {
+        let sparse = SparseColMat::try_new_from_triplets(
+            3,
+            1,
+            &[
+                Triplet::new(0, 0, 1.0),
+                Triplet::new(1, 0, 2.0),
+                Triplet::new(2, 0, 3.0),
+            ],
+        )
+        .unwrap();
+        let design = DesignMatrix::Sparse(SparseDesignMatrix::new(sparse));
+        let err = xt_diag_x_symmetric(&design, &array![1.0, f64::NAN, f64::INFINITY]).unwrap_err();
+        assert!(err.contains("row 1"), "unexpected diagnostic: {err}");
     }
 }

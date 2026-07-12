@@ -469,7 +469,8 @@ impl<'a> GamWorkingModel<'a> {
             // sign instead of silently clipping negative-curvature mass.
             _ => gam_linalg::matrix::xt_diag_x_signed(
                 design,
-                gam_linalg::matrix::SignedWeightsView::from_array(weights),
+                gam_linalg::matrix::FiniteSignedWeightsView::try_from_array(weights)
+                    .map_err(EstimationError::InvalidInput)?,
             )
             .map(|h| h.to_dense())
             .map_err(EstimationError::InvalidInput),

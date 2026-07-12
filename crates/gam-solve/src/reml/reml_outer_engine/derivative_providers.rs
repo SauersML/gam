@@ -300,7 +300,7 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         // −Xᵀ diag(c ⊙ Xvₖ) X via the design's matrix-free weighted gram.
         let result = self
             .x_transformed
-            .xt_diag_x_signed_op(SignedWeightsView::from_array(&neg_c_xv))
+            .xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(&neg_c_xv)?)
             .map_err(|e| format!("hessian_derivative_correction xtwx: {e}"))?;
 
         Ok(Some(result))
@@ -377,7 +377,7 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         // Xᵀ diag(weights) X via the design's matrix-free weighted gram.
         let result = self
             .x_transformed
-            .xt_diag_x_signed_op(SignedWeightsView::from_array(&weights))
+            .xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(&weights)?)
             .map_err(|e| format!("hessian_second_derivative_correction xtwx: {e}"))?;
 
         Ok(Some(result))

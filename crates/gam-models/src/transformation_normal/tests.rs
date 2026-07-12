@@ -706,7 +706,9 @@ pub(crate) fn kronecker_dense_fast_paths_match_dense_materialization() {
     let expected_gram = fast_atb(&weight_rows(&dense, &weights), &dense);
 
     let got_transpose = kron.transpose_mul(&v);
-    let got_gram = kron.weighted_gram(&weights, &ResourcePolicy::default_library());
+    let got_gram = kron
+        .weighted_gram(&weights, &ResourcePolicy::default_library())
+        .unwrap();
 
     let transpose_err = (&got_transpose - &expected_transpose)
         .iter()

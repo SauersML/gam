@@ -1967,7 +1967,7 @@ fn smooth_threshold_hdiag_third_derivative_matches_central_difference_1415() {
     let rho = SaeManifoldRho::new(0.7_f64.ln(), -6.0, vec![Array1::<f64>::zeros(1); k]);
 
     let inv_tau = 1.0 / temperature;
-    let sparsity = rho.log_lambda_sparse.exp();
+    let sparsity = rho.lambda_sparse().unwrap();
     // Exact, separately-certified Hessian diagonal P''(ℓ) as a function of ℓ.
     let p2 = |logit: f64| -> f64 {
         let a = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
@@ -1980,7 +1980,7 @@ fn smooth_threshold_hdiag_third_derivative_matches_central_difference_1415() {
         for atom in 0..k {
             let logit = logits[[row, atom]];
             let entry = term.assignment_prior_hdiag_derivative_entry(
-                &rho,
+                sparsity,
                 row,
                 atom,
                 SaeLocalRowVar::Logit { atom },

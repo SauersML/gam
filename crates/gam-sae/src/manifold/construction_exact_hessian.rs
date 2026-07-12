@@ -350,7 +350,7 @@ impl SaeManifoldTerm {
                 sparsity,
             } if k_atoms > 1 => {
                 let inv_tau = 1.0 / temperature;
-                let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
+                let scale = rho.lambda_sparse()? * sparsity * inv_tau * inv_tau;
                 Some((
                     gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
                         k_atoms,
@@ -923,7 +923,9 @@ impl SaeManifoldTerm {
         // `k` carries its own explicit penalty-energy derivative, log|H| trace,
         // and Occam-normalizer derivative.
         let k_smooth = rho.log_lambda_smooth.len();
-        let lambda_smooth_vec = rho.lambda_smooth_vec();
+        let lambda_smooth_vec = rho
+            .lambda_smooth_vec()
+            .map_err(OuterGradientError::internal)?;
         // Explicit `∂loss.smoothness/∂log λ_k = 0.5·λ_k·<B_k, S_k B_k>` (the
         // per-atom split). Its sum is the λ-scaled penalty energy; renormalize to
         // `loss.smoothness` so the total matches the criterion's reported energy

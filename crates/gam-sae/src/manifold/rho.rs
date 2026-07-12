@@ -1,8 +1,6 @@
 use super::*;
-use gam_problem::{
-    checked_exp_log_strength, checked_exp_log_strengths, validate_log_strength,
-};
 pub(crate) use gam_problem::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN};
+use gam_problem::{checked_exp_log_strength, checked_exp_log_strengths, validate_log_strength};
 
 /// Closed numerical domain of every active flat log-strength coordinate.
 ///
@@ -509,7 +507,7 @@ impl SaeManifoldRho {
         Ok(scaled)
     }
 
-    pub(crate) fn lambda_sparse(&self) -> Result<f64, String> {
+    pub fn lambda_sparse(&self) -> Result<f64, String> {
         checked_exp_log_strength(self.log_lambda_sparse)
             .map_err(|error| format!("assignment log strength: {error}"))
     }
@@ -524,7 +522,7 @@ impl SaeManifoldRho {
     /// Computational entry points validate the rho domain before calling this
     /// exact, unsaturated map.
     #[must_use]
-    pub(crate) fn lambda_smooth_for(&self, atom: usize) -> Result<f64, String> {
+    pub fn lambda_smooth_for(&self, atom: usize) -> Result<f64, String> {
         let log_strength = self.log_lambda_smooth.get(atom).copied().ok_or_else(|| {
             format!(
                 "smoothness atom {atom} is outside K={}",
@@ -539,7 +537,7 @@ impl SaeManifoldRho {
     /// order. Convenience for threading per-atom λ into the penalty assemblers
     /// (#1556).
     #[must_use]
-    pub(crate) fn lambda_smooth_vec(&self) -> Result<Vec<f64>, String> {
+    pub fn lambda_smooth_vec(&self) -> Result<Vec<f64>, String> {
         checked_exp_log_strengths(self.log_lambda_smooth.iter().copied())
             .map_err(|error| format!("smoothness log strength: {error}"))
     }
@@ -557,9 +555,7 @@ impl SaeManifoldRho {
         let mut precisions = Vec::with_capacity(self.log_ard.len());
         for (atom, log_block) in self.log_ard.iter().enumerate() {
             let mut block = Array1::<f64>::zeros(log_block.len());
-            for (axis, (&log_alpha, alpha)) in
-                log_block.iter().zip(block.iter_mut()).enumerate()
-            {
+            for (axis, (&log_alpha, alpha)) in log_block.iter().zip(block.iter_mut()).enumerate() {
                 *alpha = checked_exp_log_strength(log_alpha).map_err(|error| {
                     format!("ARD log precision at atom {atom}, axis {axis}: {error}")
                 })?;

@@ -139,7 +139,7 @@ fn rank_charge_deff_accepts_circle_and_neutralises_vanishing() {
         .iter()
         .map(|&a| a * a)
         .sum();
-    let lam = rho.lambda_smooth_vec();
+    let lam = rho.lambda_smooth_vec().unwrap();
     let spectrum = super::wbic_audit::recon_spectrum(
         &grams[0],
         &saved,
@@ -536,7 +536,7 @@ fn rank_charge_shared_primitive_parity() {
         .iter()
         .map(|&a| a * a)
         .sum();
-    let lam = rho.lambda_smooth_vec();
+    let lam = rho.lambda_smooth_vec().unwrap();
     let d_free = super::construction::realised_rank_charge_dof(
         &grams[0],
         &term.atoms[0].decoder_coefficients,
@@ -652,7 +652,7 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
         .iter()
         .map(|&a| a * a)
         .sum();
-    let lam = rho.lambda_smooth_vec();
+    let lam = rho.lambda_smooth_vec().unwrap();
     let p_out = term.output_dim() as f64;
     let base_decoder = term.atoms[0].decoder_coefficients.clone();
     let d_eff = |decoder: &Array2<f64>| -> f64 {

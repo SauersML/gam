@@ -4326,7 +4326,7 @@ impl SaeManifoldTerm {
             }
 
             let mut normal = fast_atb(&weighted_design, &weighted_design);
-            let lambda = rho.lambda_smooth_for(atom);
+            let lambda = rho.lambda_smooth_for(atom)?;
             for left in 0..m {
                 for right in 0..m {
                     let smooth = 0.5
@@ -5966,7 +5966,7 @@ impl SaeManifoldTerm {
             let iterate_scale = self.inner_iterate_scale();
             let grad_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * iterate_scale;
             let step_tolerance = SAE_MANIFOLD_INNER_STEP_REL_TOL * iterate_scale;
-            let lambda_smooth = rho.lambda_smooth_vec();
+            let lambda_smooth = rho.lambda_smooth_vec()?;
             let quotient_grad_norm =
                 self.quotient_gradient_norm_from_system(&sys, grad_norm_sq, &lambda_smooth);
             // Stop only on stationarity in the raw chart or on the identified

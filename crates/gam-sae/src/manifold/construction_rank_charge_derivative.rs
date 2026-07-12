@@ -66,7 +66,7 @@ impl SaeManifoldTerm {
         let mut grams = self.empty_decoder_gram_accumulator();
         self.accumulate_decoder_gram(&mut grams);
         let n_eff = self.per_atom_effective_sample_size();
-        let lambda = rho.lambda_smooth_vec();
+        let lambda = rho.lambda_smooth_vec()?;
         let p = self.output_dim() as f64;
         let mut atom_differentials = Vec::with_capacity(self.k_atoms());
         let mut direct_rho = Array1::<f64>::zeros(rho.to_flat().len());

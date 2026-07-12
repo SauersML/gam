@@ -146,7 +146,7 @@ pub(crate) use gam_linalg::faer_ndarray::FaerEigh;
 
 use crate::model_types::{ActiveLinearConstraintBlock, KktResidualSubspace, ProjectedKktResidual};
 pub(crate) use gam_linalg::matrix::{
-    DesignMatrix, LinearOperator, SignedWeightsView, upper_triangle_pair_from_index,
+    DesignMatrix, FiniteSignedWeightsView, LinearOperator, upper_triangle_pair_from_index,
 };
 pub use gam_problem::{
     ContractedPsiSecondOrderFn, DenseMatrixHyperOperator, DriftDerivResult, EvalMode,

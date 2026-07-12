@@ -18,13 +18,12 @@
 //!   `SignedWeightsView::as_psd` (consolidating the few scan sites that
 //!   still need to ask the question at runtime — e.g. PIRLS step
 //!   acceptance).
-//! * `SignedWeightsView<'_>` is the universal sign-honest view, freely
-//!   constructable from any `&Array1<f64>` / `ArrayView1<'_, f64>` / `&[f64]`.
-//!   The diagonal-Gram kernels and the shared per-row accumulator
-//!   `weighted_crossprod_dense_rows` consume it — they are linear in `w` and
-//!   sign-correct without a PSD precondition (and are reused by the
-//!   asymmetric `X_iᵀ W X_j` path inside `BlockDesignOperator::cross_block`,
-//!   where `c · X v` is genuinely signed).
+//! * `FiniteSignedWeightsView<'_>` is the universal weighted-operator view:
+//!   negative entries are retained, while one deterministic scan rejects the
+//!   first nonfinite row before a Gram/Hessian kernel can mutate output.
+//! * `SignedWeightsView<'_>` is an unvalidated row-geometry borrow for APIs
+//!   that perform their own joint certificate over weights and companion
+//!   arrays. It is deliberately not accepted by weighted matrix operators.
 //!
 //! The view newtypes are zero-cost: `repr(transparent)` over `ArrayView1<'_,
 //! f64>`, with narrow projections so kernel bodies still see the underlying
@@ -84,10 +83,9 @@ impl<'a> FiniteSignedWeightsView<'a> {
 pub struct SignedWeightsView<'a>(ArrayView1<'a, f64>);
 
 impl<'a> SignedWeightsView<'a> {
-    /// Borrow any `ArrayView1<'_, f64>` as a sign-honest weight view. This is
-    /// free of obligation: signed weights are the most general case, and the
-    /// consumers (`weighted_crossprod_dense_rows`, observed-Hessian Gram
-    /// kernels, `BlockDesignOperator::cross_block`) all do sign-correct math.
+    /// Borrow any `ArrayView1<'_, f64>` for row-geometry APIs that perform
+    /// their own full certificate. Weighted matrix operators require
+    /// [`FiniteSignedWeightsView`] instead.
     #[inline]
     pub fn new(view: ArrayView1<'a, f64>) -> Self {
         Self(view)
@@ -223,10 +221,9 @@ impl<'a> PsdWeightsView<'a> {
 /// `ImplicitHyperOperator`, `SparseDirectionalHyperOperator`) cache the
 /// observed-Hessian working weight diagonal as `Arc<Array1<f64>>` and consume
 /// it via several distinct signed kernels inside their `mul_vec` bodies
-/// (`Wᵀ X v`, `Wᵀ X_τ v`, `Xᵀ diag(c ⊙ X_τ β̂) X v`, ...). Encoding the
-/// sign character at the struct boundary closes the residual implicit-sign
-/// gap that the function-boundary [`SignedWeightsView`] / [`PsdWeightsView`]
-/// could not reach: those views are constructed at the kernel call site, so
+/// (`Wᵀ X v`, `Wᵀ X_τ v`, ...). Encoding the sign character at the struct
+/// boundary closes the residual implicit-sign gap that a function-boundary
+/// borrowed view could not reach: those views are constructed at the call site, so
 /// the cached struct field is the only place the sign character could
 /// otherwise leak as untyped `Arc<Array1<f64>>`.
 ///
@@ -251,9 +248,8 @@ impl SignedWeightsArc {
         Self(Arc::new(array))
     }
 
-    /// Borrow as a function-boundary [`SignedWeightsView`] for crossing into
-    /// a signed kernel (`weighted_crossprod_dense_rows`, `xt_diag_x_signed_op`,
-    /// `BlockDesignOperator::cross_block`).
+    /// Borrow as an unvalidated function-boundary [`SignedWeightsView`] for
+    /// row-geometry consumers that perform their own joint certificate.
     #[inline]
     pub fn view_signed(&self) -> SignedWeightsView<'_> {
         SignedWeightsView::from_array(self.0.as_ref())

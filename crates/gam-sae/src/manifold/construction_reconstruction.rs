@@ -379,7 +379,7 @@ impl SaeManifoldTerm {
             2.0 * loss.data_fit
         };
         let smooth_edf: f64 = self
-            .decoder_smoothness_effective_dof_per_atom(cache, &rho.lambda_smooth_vec())
+            .decoder_smoothness_effective_dof_per_atom(cache, &rho.lambda_smooth_vec()?)
             .map_err(|e| format!("reconstruction_dispersion: smooth edf: {e}"))?
             .iter()
             .sum();
@@ -715,7 +715,7 @@ impl SaeManifoldTerm {
         let beta_dim = cache.k;
         let second_jets = self.atom_second_jets()?;
         let border = self.border_channels_for_cache(cache)?;
-        let b_solver = self.outer_gradient_arrow_solver(cache, &rho.lambda_smooth_vec())?;
+        let b_solver = self.outer_gradient_arrow_solver(cache, &rho.lambda_smooth_vec()?)?;
         let fitted_full = self.try_fitted_with_rho(Some(rho), false)?;
         let whitens = self
             .row_metric

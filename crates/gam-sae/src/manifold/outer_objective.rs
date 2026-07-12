@@ -1732,7 +1732,7 @@ impl SaeManifoldOuterObjective {
             let pivot_deficit_is_gauge = !(pivot.is_finite() && pivot >= floor)
                 && self
                     .term
-                    .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())
+                    .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec()?)
                     .is_ok();
             if !(pivot.is_finite() && pivot >= floor) && !pivot_deficit_is_gauge {
                 if eta_step > CURVATURE_WALK_MIN_ETA_STEP {
@@ -2863,7 +2863,7 @@ impl SaeManifoldOuterObjective {
             } else {
                 let solver = self
                     .term
-                    .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())
+                    .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec()?)
                     .map_err(|error| {
                         format!(
                             "SaeManifoldOuterObjective::efs_step: dense assignment-strength \
@@ -2909,7 +2909,7 @@ impl SaeManifoldOuterObjective {
         // overcounted the FS numerator by `(p−r_k)·rank(S_k)` and drove
         // `λ_smooth` too high on frame-active fits.
         let k_smooth = rho.log_lambda_smooth.len();
-        let lambda_smooth_vec = rho.lambda_smooth_vec();
+        let lambda_smooth_vec = rho.lambda_smooth_vec()?;
         let quad_per_atom = self.term.decoder_smoothness_quadratic_form_per_atom();
         // #2080: reuse the SAME shared (probes, S⁻¹·probes) bundle taken once above
         // for the ARD trace. When present, the smoothness EDF is the matrix-free
@@ -3808,9 +3808,12 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // is a typed `OuterGradientError`: it is not a usable derivative and must
         // terminate this evaluation instead of being hidden behind a plain inverse
         // or a differenced value path.
+        let lambda_smooth = rho_state
+            .lambda_smooth_vec()
+            .map_err(EstimationError::RemlOptimizationFailed)?;
         let grad_components = self
             .term
-            .outer_gradient_arrow_solver(&cache, &rho_state.lambda_smooth_vec())
+            .outer_gradient_arrow_solver(&cache, &lambda_smooth)
             .and_then(|solver| {
                 self.term
                     .analytic_outer_rho_gradient_components_with_bundle(

@@ -1648,9 +1648,8 @@ impl Gam784BlockTarget<'_> {
             &self.inverse_link,
             self.prior_weights.view(),
         )?;
-        let half_deviance = gam_linalg::pairwise_reduce::par_pairwise_sum(rows.len(), |i| {
-            rows[i].half_deviance
-        });
+        let half_deviance =
+            gam_linalg::pairwise_reduce::par_pairwise_sum(rows.len(), |i| rows[i].half_deviance);
         let scaled_half_deviance = half_deviance / self.phi;
         if !scaled_half_deviance.is_finite() {
             return Err(EstimationError::InvalidInput(format!(
@@ -1673,10 +1672,7 @@ impl Gam784BlockTarget<'_> {
         Ok((scaled_half_deviance, score))
     }
 
-    pub(crate) fn neg_score_at(
-        &self,
-        eta: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
+    pub(crate) fn neg_score_at(&self, eta: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
         self.likelihood_surface_at(eta).map(|(_, score)| score)
     }
 }

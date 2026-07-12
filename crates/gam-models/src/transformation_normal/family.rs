@@ -384,7 +384,7 @@ impl TransformationNormalFamily {
             config,
         )?;
         let policy = ResourcePolicy::default_library();
-        let x_val_weighted_gram = x_val_kron.weighted_gram(weights, &policy);
+        let x_val_weighted_gram = x_val_kron.weighted_gram(weights, &policy)?;
 
         // ----- 5. CTN-specific smoothing seed from likelihood/penalty scales -----
         let initial_log_lambdas =
@@ -579,7 +579,7 @@ impl TransformationNormalFamily {
             config,
         )?;
         let policy = ResourcePolicy::default_library();
-        let x_val_weighted_gram = x_val_kron.weighted_gram(weights, &policy);
+        let x_val_weighted_gram = x_val_kron.weighted_gram(weights, &policy)?;
 
         let initial_log_lambdas =
             ctn_penalty_scale_log_lambdas(&tensor_penalties, &x_val_weighted_gram);

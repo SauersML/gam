@@ -301,7 +301,7 @@ impl LinearOperator for TensorProductDesignOperator {
         // reductions do not depend on worker scheduling.
         let tail_d = tail_dims.len();
         let pair_count = tail_total * (tail_total + 1) / 2;
-        let blocks: Result<Vec<(usize, usize, Array2<f64>)>, String> = (0..pair_count)
+        let block_results: Vec<Result<(usize, usize, Array2<f64>), String>> = (0..pair_count)
             .into_par_iter()
             .map(|pair_idx| {
                 let (a_flat, b_flat) = upper_triangle_pair_from_index(pair_idx, tail_total);
@@ -343,6 +343,7 @@ impl LinearOperator for TensorProductDesignOperator {
                 Ok((a_flat, b_flat, block))
             })
             .collect();
+        let blocks: Result<Vec<_>, _> = block_results.into_iter().collect();
 
         for (a_flat, b_flat, block) in blocks? {
             // Scatter block into the full xtwx.
@@ -643,7 +644,7 @@ impl LinearOperator for RowwiseKroneckerOperator {
         // in rayon tasks with task-local gamma arrays, then scattered in
         // lexicographic pair order for deterministic reductions.
         let pair_count = p_time * (p_time + 1) / 2;
-        let blocks: Result<Vec<(usize, usize, Array2<f64>)>, String> = (0..pair_count)
+        let block_results: Vec<Result<(usize, usize, Array2<f64>), String>> = (0..pair_count)
             .into_par_iter()
             .map(|pair_idx| {
                 let (t1, t2) = lower_triangle_pair_from_index(pair_idx);
@@ -660,6 +661,7 @@ impl LinearOperator for RowwiseKroneckerOperator {
                     .map(|block| (t1, t2, block))
             })
             .collect();
+        let blocks: Result<Vec<_>, _> = block_results.into_iter().collect();
         for (t1, t2, block) in blocks? {
             // Scatter block into xtwx for both (t1, t2) and (t2, t1).
             for j1 in 0..p_cov {

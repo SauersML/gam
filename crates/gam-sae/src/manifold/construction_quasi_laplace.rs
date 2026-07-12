@@ -793,7 +793,7 @@ impl SaeManifoldTerm {
             // alone as the convergence gate would falsely reject healthy fits.
             let grad_norm_sq: f64 = Self::system_grad_norm_sq(&sys);
             let grad_norm = grad_norm_sq.sqrt();
-            let lambda_smooth = rho_fixed.lambda_smooth_vec();
+            let lambda_smooth = rho_fixed.lambda_smooth_vec()?;
             let quotient_grad_norm =
                 self.quotient_gradient_norm_from_system(&sys, grad_norm_sq, &lambda_smooth);
             let iterate_scale = self.inner_iterate_scale();
@@ -2862,7 +2862,7 @@ impl SaeManifoldTerm {
                 return Ok(0.0);
             }
             let inv_tau = 1.0 / temperature;
-            let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
+            let scale = rho.lambda_sparse()? * sparsity * inv_tau * inv_tau;
             let penalty = gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
                 k_atoms,
                 temperature,
@@ -3073,7 +3073,7 @@ impl SaeManifoldTerm {
                 let inv_tau = temperature.recip();
                 Some((
                     temperature,
-                    rho.lambda_sparse() * sparsity * inv_tau * inv_tau,
+                    rho.lambda_sparse()? * sparsity * inv_tau * inv_tau,
                     gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
                         k_atoms,
                         temperature,
@@ -3245,7 +3245,7 @@ impl SaeManifoldTerm {
                 let inv_tau = 1.0 / temperature;
                 Some((
                     temperature,
-                    rho.lambda_sparse() * sparsity * inv_tau * inv_tau,
+                    rho.lambda_sparse()? * sparsity * inv_tau * inv_tau,
                     gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
                         k_atoms,
                         temperature,
@@ -3684,7 +3684,7 @@ impl SaeManifoldTerm {
 
     pub(crate) fn assignment_prior_hdiag_derivative_entry(
         &self,
-        rho: &SaeManifoldRho,
+        threshold_strength: f64,
         row: usize,
         diag_atom: usize,
         wrt: SaeLocalRowVar,
@@ -3732,7 +3732,7 @@ impl SaeManifoldTerm {
                 // derivative is P'''(ℓ)=(λ/τ³)·s·(1−6a+6a²), because
                 // d/dℓ[s(1−2a)] = (1/τ)s[(1−2a)²−2s] = (1/τ)s(1−6a+6a²).
                 w_row
-                    * rho.lambda_sparse()
+                    * threshold_strength
                     * slope
                     * (1.0 - 6.0 * activation + 6.0 * activation * activation)
                     * inv_tau
@@ -3805,6 +3805,10 @@ impl SaeManifoldTerm {
     ) -> Result<SaeArrowVector, String> {
         self.assignment.validate_rho_domain(rho)?;
         let ard_precisions = rho.ard_precisions()?;
+        let threshold_strength = match self.assignment.mode {
+            AssignmentMode::ThresholdGate { .. } => rho.lambda_sparse()?,
+            _ => 0.0,
+        };
         let n_params = rho.to_flat().len();
         if j >= n_params {
             return Err(format!(
@@ -3841,7 +3845,7 @@ impl SaeManifoldTerm {
             // strength. `∂(penalty)/∂log λ_k = λ_k·S_k C_k` touches ONLY
             // atom `k`'s decoder block; every other atom's RHS is zero.
             let target_atom = j - rho.smooth_flat_start();
-            let lambda = rho.lambda_smooth_for(target_atom);
+            let lambda = rho.lambda_smooth_for(target_atom)?;
             let frames_active = self.last_frames_active && cache.k == self.factored_border_dim();
             let offsets = if frames_active {
                 self.factored_beta_offsets()
@@ -4128,6 +4132,10 @@ impl SaeManifoldTerm {
     ) -> Result<SaeArrowVector, String> {
         self.assignment.validate_rho_domain(rho)?;
         let ard_precisions = rho.ard_precisions()?;
+        let threshold_strength = match self.assignment.mode {
+            AssignmentMode::ThresholdGate { .. } => rho.lambda_sparse()?,
+            _ => 0.0,
+        };
         // Γ_a = tr(H⁻¹ ∂H/∂θ_a) over the inner variables θ (#1006). `H` here is
         // the SAME object the criterion factor builds — Gauss-Newton data
         // curvature plus the prior majorizers / `hessian_diag` diagonals the
@@ -4191,7 +4199,7 @@ impl SaeManifoldTerm {
                 sparsity,
             } if k_atoms > 1 => {
                 let inv_tau = 1.0 / temperature;
-                let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
+                let scale = rho.lambda_sparse()? * sparsity * inv_tau * inv_tau;
                 Some((
                     gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
                         k_atoms,
@@ -4412,7 +4420,7 @@ impl SaeManifoldTerm {
                             dh += match jets.vars[a] {
                                 SaeLocalRowVar::Logit { atom } => self
                                     .assignment_prior_hdiag_derivative_entry(
-                                        rho,
+                                        threshold_strength,
                                         row,
                                         atom,
                                         jets.vars[w],
@@ -4635,7 +4643,7 @@ impl SaeManifoldTerm {
                 sparsity,
             } if k_atoms > 1 => {
                 let inv_tau = 1.0 / temperature;
-                Some(rho.lambda_sparse() * sparsity * inv_tau * inv_tau)
+                Some(rho.lambda_sparse()? * sparsity * inv_tau * inv_tau)
             }
             _ => None,
         };
@@ -4832,7 +4840,7 @@ impl SaeManifoldTerm {
                             dh += match jets.vars[a] {
                                 SaeLocalRowVar::Logit { atom } => self
                                     .assignment_prior_hdiag_derivative_entry(
-                                        rho,
+                                        threshold_strength,
                                         row,
                                         atom,
                                         jets.vars[w],
@@ -4932,7 +4940,7 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
     ) -> Result<SaeOuterRhoGradientComponents, String> {
         self.assignment.validate_rho_domain(rho)?;
-        let solver = self.outer_gradient_arrow_solver(cache, &rho.lambda_smooth_vec())?;
+        let solver = self.outer_gradient_arrow_solver(cache, &rho.lambda_smooth_vec()?)?;
         self.analytic_outer_rho_gradient_components(target, rho, loss, cache, &solver)
             .map_err(|e| e.to_string())
     }
@@ -4989,7 +4997,7 @@ impl SaeManifoldTerm {
             .map_err(|err| format!("SaeManifoldTerm::criterion_as_atoms: {err}"))?;
         let data_fit_priors_value = loss.total() + extra_penalty_energy;
 
-        let solver = self.outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())?;
+        let solver = self.outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec()?)?;
         let components =
             self.analytic_outer_rho_gradient_components(target, rho, &loss, &cache, &solver)?;
         let criterion = SaeCriterion::assemble(

@@ -169,7 +169,11 @@ fn inner_gnorm_vs_budget_trajectory_2015() {
             .expect("reassemble at fitted iterate");
         let gsq = SaeManifoldTerm::system_grad_norm_sq(&sys);
         let g = gsq.sqrt();
-        let qg = term.quotient_gradient_norm_from_system(&sys, gsq, &rho_fixed.lambda_smooth_vec());
+        let qg = term.quotient_gradient_norm_from_system(
+            &sys,
+            gsq,
+            &rho_fixed.lambda_smooth_vec().unwrap(),
+        );
         let pen_obj = term
             .penalized_objective_total(target.view(), &rho_fixed, None, 1.0)
             .unwrap_or(f64::NAN);

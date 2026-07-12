@@ -6232,9 +6232,14 @@ impl<'a> RemlState<'a> {
                 w * centered * centered
             })
             .sum::<f64>();
+        let finite_weights =
+            match gam_linalg::matrix::FiniteSignedWeightsView::try_from_array(&weights_owned) {
+                Ok(weights) => weights,
+                Err(_) => return None,
+            };
         let xtwx = match gam_linalg::matrix::LinearOperator::xt_diag_x_signed_op(
             &self.x,
-            gam_linalg::matrix::SignedWeightsView::from_array(&weights_owned),
+            finite_weights,
         ) {
             Ok(m) => m,
             Err(e) => {

@@ -196,9 +196,12 @@ impl KroneckerDesign {
     ///
     /// Thin wrapper over `weighted_cross_with(self, self, ...)`. Callers thread
     /// a real `ResourcePolicy` so chunk sizing matches the surrounding workload.
-    pub(crate) fn weighted_gram(&self, w: &Array1<f64>, policy: &ResourcePolicy) -> Array2<f64> {
+    pub(crate) fn weighted_gram(
+        &self,
+        w: &Array1<f64>,
+        policy: &ResourcePolicy,
+    ) -> Result<Array2<f64>, String> {
         self.weighted_cross_with(w.view(), self, policy)
-            .expect("validated KroneckerDesign weighted Gram dimensions")
     }
 
     /// Compute `self^T · diag(w) · other` while keeping rowwise-Kronecker
@@ -209,6 +212,8 @@ impl KroneckerDesign {
         other: &KroneckerDesign,
         policy: &ResourcePolicy,
     ) -> Result<Array2<f64>, String> {
+        FiniteSignedWeightsView::try_new(weights)
+            .map_err(|reason| format!("KroneckerDesign::weighted_cross_with: {reason}"))?;
         match (self, other) {
             (
                 KroneckerDesign::KhatriRao { left: a, right: b },
@@ -294,7 +299,7 @@ impl LinearOperator for KroneckerDesign {
         // defaults the resource policy. Internal callers in this file go
         // through `weighted_gram` directly with their own policy.
         let policy = ResourcePolicy::default_library();
-        Ok(self.weighted_gram(weights, &policy))
+        self.weighted_gram(weights, &policy)
     }
 }
 

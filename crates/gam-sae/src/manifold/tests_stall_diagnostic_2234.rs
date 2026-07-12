@@ -82,7 +82,7 @@ fn logdet_audit_point(
         1.0e-6,
     )?;
     let raw_smoothness_sum: f64 = term
-        .decoder_smoothness_value_per_atom(&rho.lambda_smooth_vec())
+        .decoder_smoothness_value_per_atom(&rho.lambda_smooth_vec().unwrap())
         .iter()
         .sum();
     let smooth_renorm = if raw_smoothness_sum.abs() > 0.0 {
@@ -106,7 +106,7 @@ fn logdet_audit_point(
         .reml_extra_penalty_value_total(registry)
         .map_err(|error| error.to_string())?;
     let solver = term
-        .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())
+        .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec().unwrap())
         .map_err(|err| err.to_string())?;
     let exact_chart_gauge_count = term.dense_step_gauge_vectors()?.len();
     let solver_gauge_count = solver.gauge_basis.len();
@@ -148,7 +148,7 @@ fn logdet_audit_point(
     let quotient_kkt_grad_norm = kkt_term.quotient_gradient_norm_from_system(
         &kkt_system,
         kkt_grad_norm_sq,
-        &rho.lambda_smooth_vec(),
+        &rho.lambda_smooth_vec().unwrap(),
     );
     let kkt_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * kkt_term.inner_iterate_scale();
     if !SaeManifoldTerm::quasi_laplace_kkt_stationary(

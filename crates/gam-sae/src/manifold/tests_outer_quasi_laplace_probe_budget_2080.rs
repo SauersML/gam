@@ -417,7 +417,7 @@ fn reactive_entry_reseeds_nonzero_k2_seed_to_strict_separated_root_2080() {
              decoder_norms={decoder_norms:?}, lambda_smooth={:?}",
             assignment_grad_sq.sqrt(),
             chart_grad_sq.sqrt(),
-            entry_rho_state.lambda_smooth_vec(),
+            entry_rho_state.lambda_smooth_vec().unwrap(),
         );
     }
     let entry_eval =
@@ -443,7 +443,7 @@ fn reactive_entry_reseeds_nonzero_k2_seed_to_strict_separated_root_2080() {
     let quotient_kkt = objective.term.quotient_gradient_norm_from_system(
         &system,
         raw_kkt_sq,
-        &committed_rho.lambda_smooth_vec(),
+        &committed_rho.lambda_smooth_vec().unwrap(),
     );
     let tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * objective.term.inner_iterate_scale();
     assert!(

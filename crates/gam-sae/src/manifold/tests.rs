@@ -1774,8 +1774,9 @@ pub(crate) fn threshold_gate_fixed_logit_third_derivative_is_zero_bug4() {
     );
 
     // FREE atom 0 inside the band ⇒ nonzero third derivative (fixture is live).
+    let threshold_strength = rho.lambda_sparse().unwrap();
     let free = term.assignment_prior_hdiag_derivative_entry(
-        &rho,
+        threshold_strength,
         0,
         0,
         SaeLocalRowVar::Logit { atom: 0 },
@@ -1788,7 +1789,7 @@ pub(crate) fn threshold_gate_fixed_logit_third_derivative_is_zero_bug4() {
 
     // FIXED atom 1 ⇒ the θ-adjoint third derivative MUST be exactly zero.
     let fixed = term.assignment_prior_hdiag_derivative_entry(
-        &rho,
+        threshold_strength,
         0,
         1,
         SaeLocalRowVar::Logit { atom: 1 },
@@ -3119,7 +3120,7 @@ pub(crate) fn reconstruction_dispersion_uses_ard_shrunk_coordinate_edf() {
         .reconstruction_dispersion(&loss, &cache, &rho, None)
         .unwrap();
     let smooth_edf: f64 = term
-        .decoder_smoothness_effective_dof_per_atom(&cache, &rho.lambda_smooth_vec())
+        .decoder_smoothness_effective_dof_per_atom(&cache, &rho.lambda_smooth_vec().unwrap())
         .unwrap()
         .iter()
         .sum();
@@ -3198,7 +3199,7 @@ fn matrix_free_smoothness_edf_from_probes_matches_dense_selected_inverse() {
     let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
     let (_delta_t, _delta_beta, cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
-    let lambda = rho.lambda_smooth_vec();
+    let lambda = rho.lambda_smooth_vec().unwrap();
 
     let dense = term
         .decoder_smoothness_effective_dof_per_atom(&cache, &lambda)

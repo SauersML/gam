@@ -2338,10 +2338,8 @@ pub(crate) fn default_custom_family_exact_hessian_hooks_assemble_diagonal_workin
     let expected_h = spec
         .design
         .xt_diag_x_signed_op(
-            FiniteSignedWeightsView::try_from_array(
-                &eta.mapv(|value| 2.0 + value * value),
-            )
-            .unwrap(),
+            FiniteSignedWeightsView::try_from_array(&eta.mapv(|value| 2.0 + value * value))
+                .unwrap(),
         )
         .unwrap();
     assert_eq!(h, expected_h);

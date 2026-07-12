@@ -1543,7 +1543,7 @@ impl SaeManifoldTerm {
         dispersion_r: f64,
     ) -> Result<Vec<f64>, String> {
         self.assignment.validate_rho_domain(rho)?;
-        let lam = rho.lambda_smooth_vec();
+        let lam = rho.lambda_smooth_vec()?;
         // Fixed noise floor R = residual variance (dispersion). Guard finite/positive.
         let r_floor = if dispersion_r.is_finite() && dispersion_r > 0.0 {
             dispersion_r
@@ -1556,8 +1556,10 @@ impl SaeManifoldTerm {
             // Each atom is priced through the shared `realised_rank_charge_dof` core
             // (the SAME fn the #2023 migration gate uses), so dense, #9 streaming, and
             // the tier PROMOTE/DEMOTE sites all adjudicate in one currency.
-            let n_eff_k = n_eff.get(k).copied().unwrap_or(0.0);
-            let lam_k = lam.get(k).copied().unwrap_or(0.0);
+            let n_eff_k = *n_eff.get(k).ok_or_else(|| {
+                format!("rank_dof_from_grams: missing effective sample size for atom {k}")
+            })?;
+            let lam_k = lam[k];
             let d = realised_rank_charge_dof(
                 &grams[k],
                 &self.atoms[k].decoder_coefficients,
@@ -4728,7 +4730,7 @@ impl SaeManifoldTerm {
             rho,
             self.row_loss_weights.as_deref(),
         )?;
-        let smoothness = penalty_scale * self.decoder_smoothness_value(&rho.lambda_smooth_vec());
+        let smoothness = penalty_scale * self.decoder_smoothness_value(&rho.lambda_smooth_vec()?);
         let ard = self.ard_value(rho)?;
         Ok(SaeManifoldLoss {
             data_fit,

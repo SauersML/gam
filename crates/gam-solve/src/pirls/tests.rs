@@ -15,14 +15,15 @@ mod tests {
         DENSE_OUTER_MAX_P, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily,
         WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance,
-        calculate_loglikelihood, calculate_loglikelihood_omitting_constants,
-        compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays,
-        fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical,
-        select_active_set_release, should_log_pirls_decision_summary,
-        should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
-        solve_newton_directionwith_lower_bounds, update_glmvectors, variance_jet_for_weight_family,
-        write_gamma_log_working_state, write_negative_binomial_log_working_state,
-        write_poisson_log_working_state, write_tweedie_log_working_state,
+        calculate_deviance_from_eta, calculate_loglikelihood,
+        calculate_loglikelihood_omitting_constants, compute_constraint_kkt_diagnostics,
+        compute_observed_hessian_curvature_arrays, deviance_eta_row, fit_model_for_fixed_rho,
+        observed_weight_dispatch, observed_weight_noncanonical, select_active_set_release,
+        should_log_pirls_decision_summary, should_use_sparse_native_pirls,
+        solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
+        update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state,
+        write_negative_binomial_log_working_state, write_poisson_log_working_state,
+        write_tweedie_log_working_state,
     };
     use crate::active_set;
     use crate::estimate::EstimationError;
@@ -1803,6 +1804,153 @@ mod tests {
             * (1.5 * (2.0_f64 / 1.0 - 1.0 - (2.0_f64 / 1.0).ln())
                 + 0.75 * (5.0_f64 / 4.0 - 1.0 - (5.0_f64 / 4.0).ln()));
         assert_relative_eq!(dev, expected, epsilon = 1e-12, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn deviance_eta_row_value_and_score_are_one_surface_for_every_glm_family() {
+        let cases = [
+            (ResponseFamily::Gaussian, StandardLink::Identity, -0.4, 0.7),
+            (ResponseFamily::Poisson, StandardLink::Log, 3.0, 0.4),
+            (ResponseFamily::Gamma, StandardLink::Log, 1.7, -0.2),
+            (
+                ResponseFamily::Tweedie { p: 1.45 },
+                StandardLink::Log,
+                2.2,
+                0.3,
+            ),
+            (
+                ResponseFamily::NegativeBinomial {
+                    theta: 1.8,
+                    theta_fixed: true,
+                },
+                StandardLink::Log,
+                4.0,
+                0.6,
+            ),
+            (ResponseFamily::Binomial, StandardLink::Logit, 0.3, -0.8),
+            (
+                ResponseFamily::Beta { phi: 3.5 },
+                StandardLink::Logit,
+                0.35,
+                -0.3,
+            ),
+        ];
+        let prior_weight = 1.3;
+        let h = 2.0e-6;
+        for (family, link, y, eta) in cases {
+            let inverse_link = InverseLink::Standard(link);
+            let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                family.clone(),
+                inverse_link.clone(),
+            ));
+            let row = deviance_eta_row(0, y, eta, &likelihood, &inverse_link, prior_weight)
+                .expect("central deviance row");
+            let plus = deviance_eta_row(0, y, eta + h, &likelihood, &inverse_link, prior_weight)
+                .expect("plus row")
+                .half_deviance;
+            let minus = deviance_eta_row(0, y, eta - h, &likelihood, &inverse_link, prior_weight)
+                .expect("minus row")
+                .half_deviance;
+            let finite_difference = (plus - minus) / (2.0 * h);
+            assert_relative_eq!(
+                row.eta_score,
+                finite_difference,
+                epsilon = 2.0e-7,
+                max_relative = 2.0e-6
+            );
+        }
+    }
+
+    #[test]
+    fn deviance_eta_row_preserves_extreme_balanced_value_and_score_channels() {
+        let canonical = |family, link| {
+            let inverse_link = InverseLink::Standard(link);
+            (
+                GlmLikelihoodSpec::canonical(LikelihoodSpec::new(family, inverse_link.clone())),
+                inverse_link,
+            )
+        };
+
+        let (poisson, log) = canonical(ResponseFamily::Poisson, StandardLink::Log);
+        let far_left = deviance_eta_row(0, 1.0, -1.0e308, &poisson, &log, 1.0)
+            .expect("finite far-left Poisson row");
+        assert_relative_eq!(far_left.half_deviance, 1.0e308, max_relative = 2.0e-15);
+        assert_eq!(far_left.eta_score, -1.0);
+        let ratio_overflow = deviance_eta_row(0, 1.0e10, -700.0, &poisson, &log, 1.0)
+            .expect("Poisson deviance must not form y/mu");
+        assert!(ratio_overflow.half_deviance.is_finite());
+
+        let (negative_binomial, log) = canonical(
+            ResponseFamily::NegativeBinomial {
+                theta: 1.0,
+                theta_fixed: true,
+            },
+            StandardLink::Log,
+        );
+        let nb = deviance_eta_row(0, 2.0, -1.0e308, &negative_binomial, &log, 0.5)
+            .expect("finite far-left NB row");
+        assert_relative_eq!(nb.half_deviance, 1.0e308, max_relative = 2.0e-15);
+        assert_eq!(nb.eta_score, -1.0);
+
+        let (binomial, logit) = canonical(ResponseFamily::Binomial, StandardLink::Logit);
+        let binomial_tail = deviance_eta_row(0, 0.5, -1.0e308, &binomial, &logit, 1.0)
+            .expect("finite logit natural-coordinate tail");
+        assert_relative_eq!(binomial_tail.half_deviance, 5.0e307, max_relative = 2.0e-15);
+        assert_eq!(binomial_tail.eta_score, -0.5);
+
+        let (gaussian, identity) = canonical(ResponseFamily::Gaussian, StandardLink::Identity);
+        let gaussian_balanced = deviance_eta_row(0, 1.0e200, 0.0, &gaussian, &identity, 1.0e-300)
+            .expect("weighted Gaussian square remains finite");
+        assert_relative_eq!(
+            gaussian_balanced.half_deviance,
+            5.0e99,
+            max_relative = 3.0e-14
+        );
+        assert_relative_eq!(
+            gaussian_balanced.eta_score,
+            -1.0e-100,
+            max_relative = 3.0e-14
+        );
+
+        let (gamma, log) = canonical(ResponseFamily::Gamma, StandardLink::Log);
+        let gamma_balanced = deviance_eta_row(0, f64::MAX, -700.0, &gamma, &log, 1.0e-320)
+            .expect("weighted Gamma ratio remains finite");
+        assert!(gamma_balanced.half_deviance.is_finite());
+        assert!(gamma_balanced.eta_score.is_finite());
+
+        let (tweedie, log) = canonical(ResponseFamily::Tweedie { p: 1.5 }, StandardLink::Log);
+        let tweedie_balanced = deviance_eta_row(0, f64::MAX, -700.0, &tweedie, &log, 1.0e-300)
+            .expect("weighted Tweedie power product remains finite");
+        assert!(tweedie_balanced.half_deviance.is_finite());
+        assert!(tweedie_balanced.eta_score.is_finite());
+
+        let ignored = deviance_eta_row(
+            0,
+            f64::NAN,
+            f64::INFINITY,
+            &poisson,
+            &InverseLink::Standard(StandardLink::Log),
+            0.0,
+        )
+        .expect("zero-weight row has exactly zero statistical measure");
+        assert_eq!(ignored.half_deviance, 0.0);
+        assert_eq!(ignored.eta_score, 0.0);
+    }
+
+    #[test]
+    fn deviance_eta_batch_reports_the_smallest_invalid_row_atomically() {
+        let inverse_link = InverseLink::Standard(StandardLink::Log);
+        let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            inverse_link.clone(),
+        ));
+        let y = array![1.0, -1.0, -2.0];
+        let eta = array![0.0, 0.0, 0.0];
+        let weights = array![1.0, 1.0, 1.0];
+        assert!(matches!(
+            calculate_deviance_from_eta(y.view(), &eta, &likelihood, &inverse_link, weights.view(),),
+            Err(EstimationError::PirlsRowGeometryUnrepresentable { row: 1, .. })
+        ));
     }
 
     /// Regression for issue #2126: `calculate_deviance` for a Gamma family must

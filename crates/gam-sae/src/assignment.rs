@@ -1509,7 +1509,7 @@ pub(crate) fn ordered_beta_bernoulli_exact_hessian_minus_majorizer_hvp_weighted(
     }
 
     let (penalty, rho_view) =
-        ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
+        ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights)?;
     let mut delta = penalty.hvp(target.view(), rho_view.view(), direction);
     let channels = penalty.psd_majorizer_logit_third_channels(target.view(), rho_view.view());
     for index in 0..delta.len() {
@@ -1550,7 +1550,7 @@ mod ordered_beta_bernoulli_exact_hessian_tests {
         .unwrap();
 
         let (penalty, rho_view) =
-            ordered_beta_bernoulli_prior_penalty(&assignment, &rho, 1.7, 0.8, None);
+            ordered_beta_bernoulli_prior_penalty(&assignment, &rho, 1.7, 0.8, None).unwrap();
         let target = flat_logits(assignment.logits.view());
         let step = 1.0e-6;
         let plus = &target + &(step * &direction);
@@ -1566,7 +1566,7 @@ mod ordered_beta_bernoulli_exact_hessian_tests {
                 "index {index}: analytic A-B={} expected={} exact_fd={exact_fd}",
                 analytic[index],
                 expected,
-            );
+            )?;
         }
         assert!(
             analytic[2].abs() > 1.0e-6 && analytic[4].abs() > 1.0e-6,
@@ -1629,7 +1629,7 @@ pub(crate) fn assignment_prior_value_weighted(
                 alpha,
                 temperature,
                 row_weights,
-            );
+            )?;
             penalty.value(target.view(), rho_view.view())
         }
         AssignmentMode::ThresholdGate {
@@ -1638,7 +1638,7 @@ pub(crate) fn assignment_prior_value_weighted(
         } => {
             // Sparsity penalty and reconstruction use the same smooth
             // threshold-centered logistic gate as the gradient and Hessian.
-            let sparsity_strength = rho.lambda_sparse();
+            let sparsity_strength = rho.lambda_sparse()?;
             let k = assignment.k_atoms();
             let mut acc = 0.0;
             for (idx, &logit) in target.iter().enumerate() {
@@ -1700,7 +1700,7 @@ pub(crate) fn assignment_prior_log_strength_derivative_weighted(
                 alpha,
                 temperature,
                 row_weights,
-            );
+            )?;
             if penalty.learnable_alpha {
                 penalty.grad_rho(target.view(), rho_view.view())[0]
             } else {
@@ -1760,7 +1760,7 @@ pub(crate) fn assignment_prior_log_strength_hdiag_weighted(
             temperature,
             threshold,
         } => {
-            let sparsity_strength = rho.lambda_sparse();
+            let sparsity_strength = rho.lambda_sparse()?;
             let inv_tau = 1.0 / temperature;
             let inv_tau2 = inv_tau * inv_tau;
             let k = assignment.k_atoms();
@@ -1788,7 +1788,7 @@ pub(crate) fn assignment_prior_log_strength_hdiag_weighted(
                 alpha,
                 temperature,
                 row_weights,
-            );
+            )?;
             let mut d = if penalty.learnable_alpha {
                 penalty.hessian_diag_log_alpha_derivative(target.view(), rho_view.view())
             } else {
@@ -1867,7 +1867,7 @@ pub(crate) fn assignment_prior_log_strength_target_mixed_weighted(
                 alpha,
                 temperature,
                 row_weights,
-            );
+            )?;
             let mut d = penalty.log_alpha_target_mixed_derivative(target.view(), rho_view.view());
             // #Bug4: inert columns carry no mixed derivative.
             mask_fixed_logit_entries(assignment, &mut d);
@@ -1941,7 +1941,7 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
                 alpha,
                 temperature,
                 row_weights,
-            );
+            )?;
             let g = penalty.grad_target(target.view(), rho_view.view());
             let d = penalty
                 .hessian_diag(target.view(), rho_view.view())
@@ -1958,7 +1958,7 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
             // threshold-centered surrogate σ((l−θ)/τ), using the same
             // machine-precision support as the value path. Data-fit JVP support
             // is narrower and follows the hard forward gate.
-            let sparsity_strength = rho.lambda_sparse();
+            let sparsity_strength = rho.lambda_sparse()?;
             let inv_tau = 1.0 / temperature;
             let inv_tau2 = inv_tau * inv_tau;
             let k = assignment.k_atoms();
@@ -2042,7 +2042,7 @@ pub(crate) fn ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
     // fixed-α operator. Fixed-logit columns are zeroed post-hoc below (the channel
     // arrays are not internally column-masked).
     let (penalty, rho_view) =
-        ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights);
+        ordered_beta_bernoulli_prior_penalty(assignment, rho, alpha, temperature, row_weights)?;
     let mut channels = penalty.psd_majorizer_logit_third_channels(target.view(), rho_view.view());
     // #1026/#1033 — zero the log-det third-derivative channels of FIXED-logit
     // atoms (ungated, or all atoms under frozen routing) so the #1006 θ-adjoint

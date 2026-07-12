@@ -302,7 +302,7 @@ fn smooth_rho_derivative_matrix_2156(
     let border = term
         .border_channels_for_cache(cache)
         .expect("border channels");
-    let lambda = rho.lambda_smooth_vec()[atom_idx];
+    let lambda = rho.lambda_smooth_vec().unwrap()[atom_idx];
     for left in &border {
         if left.atom != atom_idx {
             continue;
@@ -336,7 +336,7 @@ fn softmax_sparse_rho_derivative_matrix_2156(
     else {
         panic!("softmax sparse derivative requires softmax mode");
     };
-    let scale = rho.lambda_sparse() * sparsity / (temperature * temperature);
+    let scale = rho.lambda_sparse().unwrap() * sparsity / (temperature * temperature);
     for row in 0..term.n_obs() {
         let assignments =
             crate::assignment::softmax_row(term.assignment.logits.row(row), temperature);
@@ -603,7 +603,7 @@ fn softmax_logit_dual_channel_report_2156(
         }
     }
 
-    let scale = rho.lambda_sparse() * sparsity / (temperature * temperature);
+    let scale = rho.lambda_sparse().unwrap() * sparsity / (temperature * temperature);
     let majorizer_deriv = gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
         term.k_atoms(),
         temperature,
@@ -779,7 +779,7 @@ fn assert_dual_rho_logdet_parity_2156(
         sparse_analytic_half,
     ));
 
-    let lambda_smooth = rho.lambda_smooth_vec();
+    let lambda_smooth = rho.lambda_smooth_vec().unwrap();
     let smooth_analytic = term
         .decoder_smoothness_effective_dof_with_solver_per_atom(cache, &solver, &lambda_smooth)
         .expect("production smoothness rho trace");
@@ -1223,7 +1223,7 @@ pub(crate) fn sae_logdet_theta_adjoint_logit0_dense_trace_localization_2156() {
             temperature,
             sparsity,
         } => {
-            let scale = rho.lambda_sparse() * sparsity / (temperature * temperature);
+            let scale = rho.lambda_sparse().unwrap() * sparsity / (temperature * temperature);
             let row_logits: Vec<f64> = (0..term.k_atoms())
                 .map(|atom| term.assignment.logits[[row, atom]])
                 .collect();

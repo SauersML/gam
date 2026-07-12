@@ -927,6 +927,7 @@ fn build_scale_deviation_operator_typed(
 mod tests {
     use super::*;
     use gam_linalg::matrix::DesignMatrix;
+    use ndarray::array;
 
     fn assert_matrix_close(lhs: &Array2<f64>, rhs: &Array2<f64>, tol: f64, label: &str) {
         assert_eq!(

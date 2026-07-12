@@ -630,7 +630,7 @@ mod smoothness_dof_hutchinson_tests {
         let (_value, _loss, cache) = term
             .penalized_quasi_laplace_criterion_with_cache(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
             .expect("converged cache for the two-atom fixture");
-        let lambda = rho.lambda_smooth_vec();
+        let lambda = rho.lambda_smooth_vec().unwrap();
 
         // Ground truth: the exact column-by-column trace (the `K < threshold`
         // path this fixture actually takes).

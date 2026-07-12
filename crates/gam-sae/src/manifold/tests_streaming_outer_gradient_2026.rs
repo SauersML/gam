@@ -102,7 +102,7 @@ fn streaming_cache_outer_gradient_matches_dense_cache() {
 
     // Assemble the analytic outer ρ-gradient off EACH cache through the identical
     // production path the seed-validation / small-BFGS lane uses.
-    let smooth = rho.lambda_smooth_vec();
+    let smooth = rho.lambda_smooth_vec().unwrap();
     let dense_solver = dense
         .outer_gradient_arrow_solver(&dense_cache, &smooth)
         .expect("dense outer-gradient solver");

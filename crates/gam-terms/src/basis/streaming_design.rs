@@ -318,6 +318,8 @@ trait ChunkedDesign {
                 nrows
             ));
         }
+        gam_linalg::matrix::FiniteSignedWeightsView::try_from_array(weights)
+            .map_err(|reason| format!("{} diag_xtw_x: {reason}", Self::NAME))?;
         let p = self.op_ncols();
         let chunk_rows = self.chunk_rows();
         let starts = (0..nrows).step_by(chunk_rows).collect::<Vec<_>>();

@@ -1041,7 +1041,7 @@ pub(crate) fn outer_gradient_solver_rejects_near_singular_cache_without_matching
     // exact "without a matching gauge" path the test name describes.
     let err = match obj
         .term
-        .outer_gradient_arrow_solver(&cache, &obj.current_rho.lambda_smooth_vec())
+        .outer_gradient_arrow_solver(&cache, &obj.current_rho.lambda_smooth_vec().unwrap())
     {
         Err(err) => err,
         Ok(..) => panic!("near-singular criterion factor without a matching gauge must reject"),
@@ -1194,7 +1194,7 @@ pub(crate) fn outer_gradient_solver_deflates_rank_deficient_decoder_beta_null() 
     // of rejecting with "analytic outer gradient undefined".
     let solver = obj
         .term
-        .outer_gradient_arrow_solver(&cache, &obj.current_rho.lambda_smooth_vec())
+        .outer_gradient_arrow_solver(&cache, &obj.current_rho.lambda_smooth_vec().unwrap())
         .expect("rank-deficient decoder β-null must be deflated, not rejected (#1051/#1273)");
     // The deflated solve must REGULARISE the near-null β response: a plain
     // inverse divides by the 1e-7 pivot and explodes; the deflated solve is

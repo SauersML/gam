@@ -1338,33 +1338,34 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
         //   and add the penalties, so these families report inference / total
         //   edf instead of dropping geometry (and therefore inference) for the
         //   whole fit (#720).
-        let (mut h, working_weights, working_response) = match eval.blockworking_sets.as_slice() {
-            [
-                BlockWorkingSet::Diagonal {
-                    working_response,
-                    working_weights,
-                },
-            ] => {
-                let h = spec
-                    .design
-                    .xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(working_weights)?)?;
-                (h, working_weights.clone(), working_response.clone())
-            }
-            [BlockWorkingSet::ExactNewton { hessian, .. }] => {
-                let h = hessian.to_dense();
-                if h.nrows() != spec.design.ncols() || h.ncols() != spec.design.ncols() {
-                    return Ok(None);
+        let (mut h, working_weights, working_response) =
+            match eval.blockworking_sets.as_slice() {
+                [
+                    BlockWorkingSet::Diagonal {
+                        working_response,
+                        working_weights,
+                    },
+                ] => {
+                    let h = spec.design.xt_diag_x_signed_op(
+                        FiniteSignedWeightsView::try_from_array(working_weights)?,
+                    )?;
+                    (h, working_weights.clone(), working_response.clone())
                 }
-                // The exact-Newton block carries no IRLS pseudo-data; the
-                // trace edf reads only the penalized Hessian, and the
-                // downstream IRLS covariance path is unused for these
-                // families (they report dispersion = 1). Match the joint
-                // multi-block branch's zero-length convention.
-                let working_len = states.first().map(|state| state.eta.len()).unwrap_or(0);
-                (h, Array1::zeros(working_len), Array1::zeros(working_len))
-            }
-            _ => return Ok(None),
-        };
+                [BlockWorkingSet::ExactNewton { hessian, .. }] => {
+                    let h = hessian.to_dense();
+                    if h.nrows() != spec.design.ncols() || h.ncols() != spec.design.ncols() {
+                        return Ok(None);
+                    }
+                    // The exact-Newton block carries no IRLS pseudo-data; the
+                    // trace edf reads only the penalized Hessian, and the
+                    // downstream IRLS covariance path is unused for these
+                    // families (they report dispersion = 1). Match the joint
+                    // multi-block branch's zero-length convention.
+                    let working_len = states.first().map(|state| state.eta.len()).unwrap_or(0);
+                    (h, Array1::zeros(working_len), Array1::zeros(working_len))
+                }
+                _ => return Ok(None),
+            };
         for (k, s) in spec.penalties.iter().enumerate() {
             let s_dense = s.as_dense_cow();
             h.scaled_add(lambdas[k], &*s_dense);
