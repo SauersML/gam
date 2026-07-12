@@ -715,25 +715,17 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
         ridge_ext_coord,
     )?;
     let assignments = term.assignment.assignments();
-    let fitted =
-        term.reconstruct_from_assignments_target_aware(target.view(), assignments.view())?;
+    let (fitted, atom_reconstructions, effective_coords) = term
+        .reconstruct_with_atom_images_target_aware(target.view(), assignments.view())?;
 
     let mut atom_reports = Vec::with_capacity(k_atoms);
-    let mut decoded_row = vec![0.0_f64; p_out];
     for atom_index in 0..k_atoms {
-        let mut reconstruction = Array2::<f64>::zeros((n_obs, p_out));
-        for row in 0..n_obs {
-            term.atoms[atom_index].fill_decoded_row(row, &mut decoded_row);
-            for output in 0..p_out {
-                reconstruction[[row, output]] = decoded_row[output];
-            }
-        }
         atom_reports.push(SaeOosAtomReport {
             basis_kind: atom_specs[atom_index].basis_kind.clone(),
             decoder: term.atoms[atom_index].decoder_coefficients.clone(),
-            coords: term.assignment.coords[atom_index].as_matrix(),
+            coords: effective_coords[atom_index].clone(),
             assignments: assignments.column(atom_index).to_owned(),
-            reconstruction,
+            reconstruction: atom_reconstructions[atom_index].clone(),
             active_dim: latent_dims[atom_index],
         });
     }
@@ -1205,6 +1197,35 @@ mod tests {
             .map(|value| value.abs())
             .fold(0.0_f64, f64::max);
         assert!(max_error <= 1.0e-12, "max reconstruction error={max_error}");
+        let atom_error = (&report.atoms[0].reconstruction - &report.fitted)
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            atom_error <= 1.0e-12,
+            "unit-mass atom image must equal the fitted reconstruction; max error={atom_error}"
+        );
+    }
+
+    #[test]
+    fn typed_oos_report_uses_effective_hybrid_atom_image() {
+        let mut request = periodic_request();
+        request.hybrid_linear_images = vec![AtomLinearImage {
+            atom_idx: 0,
+            t_bar: 0.0,
+            b0: Array1::from_vec(vec![2.0, -1.0]),
+            b1: Array1::from_vec(vec![0.5, 0.25]),
+            v: None,
+        }];
+        let report = run_sae_manifold_oos(request).unwrap();
+        let max_error = (&report.atoms[0].reconstruction - &report.fitted)
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_error <= 1.0e-12,
+            "unit-mass hybrid atom image must equal the hybrid fitted output; max error={max_error}"
+        );
     }
 
     #[test]

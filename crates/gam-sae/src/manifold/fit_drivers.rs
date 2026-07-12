@@ -3654,6 +3654,46 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// #2132 — is there residual structure ABOVE the measured noise floor for a
+    /// co-collapse reseed to land on? The residual `target − current
+    /// reconstruction` is what the WHOLE dictionary leaves uncovered; a collapsed
+    /// (duplicate) atom should be reseeded onto it only when it carries real,
+    /// distinct signal. If the residual is at the noise floor the collapsed atoms
+    /// are genuinely REDUNDANT — nothing distinct is left to represent — so
+    /// reseeding would only re-plant a duplicate onto noise (the reseed-duplication
+    /// spiral). They are demoted (terminal) instead. This is the decidable,
+    /// measured counterpart to the post-hoc disjoint-support detector that
+    /// provably cannot separate duplication from benign tiling.
+    ///
+    /// The floor is MEASURED, not tuned. The residual output-Gram
+    /// (`residualᵀ·residual`, `p×p`) eigenvalues are the per-direction residual
+    /// energies; the leading direction carries signal iff it clears
+    /// [`leading_direction_above_noise_floor`] — `median · log2(#dirs)`, the same
+    /// robust-median Bonferroni floor the #2243 spectral bandwidth uses.
+    pub(crate) fn residual_has_uncovered_signal(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<bool, String> {
+        let residual = self.reconstruction_residual(target, rho)?;
+        if residual.nrows() == 0 || residual.ncols() == 0 {
+            return Ok(false);
+        }
+        // `residualᵀ·residual` (p×p, PSD symmetric): its singular values ARE its
+        // eigenvalues, i.e. the residual's per-direction energies (squared singular
+        // values). p×p keeps the cost off `n` for the wide-output regime.
+        let gram = fast_atb(&residual, &residual);
+        let (_u, energies, _vt) = gram.svd(false, false).map_err(|e| {
+            format!("residual_has_uncovered_signal: residual-Gram SVD failed: {e}")
+        })?;
+        let energies: Vec<f64> = energies
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .collect();
+        Ok(leading_direction_above_noise_floor(&energies))
+    }
+
     /// #2027 co-collapse fix, Part A — GREEDY DISJOINT-SUBSPACE decoder refit.
     ///
     /// The joint decoder least-squares

@@ -54,7 +54,7 @@
 
 use crate::jet_scalar::JetScalar;
 use crate::jet_tower::{
-    KernelChannels, RowNllProgramGeneric, Tower4, generic_full_tower, verify_kernel_channels,
+    KernelChannels, RowProgram, Tower4, program_full_tower, verify_kernel_channels,
 };
 
 /// The production `log-b` σ-link floor `b` (`gam-model-kernels::sigma_link::LOGB_SIGMA_FLOOR`).
@@ -75,14 +75,14 @@ struct GaulssRow {
     a: f64,
 }
 
-/// The `gaulss` family written ONCE as a generic [`RowNllProgramGeneric<2>`] over
+/// The `gaulss` family written ONCE as a generic [`RowProgram<2>`] over
 /// the jet scalar `S`, in the production log-b σ-link parameterization. The body
 /// uses ONLY [`JetScalar`] ops; the per-row data (`y`, `a`) enters as constants.
 struct GaulssLinkRow {
     rows: Vec<GaulssRow>,
 }
 
-impl RowNllProgramGeneric<2> for GaulssLinkRow {
+impl RowProgram<2> for GaulssLinkRow {
     fn n_rows(&self) -> usize {
         self.rows.len()
     }
@@ -96,7 +96,7 @@ impl RowNllProgramGeneric<2> for GaulssLinkRow {
         Ok([r.eta_mu, r.eta_ls])
     }
 
-    fn row_nll_generic<S: JetScalar<2>>(&self, row: usize, p: &[S; 2]) -> Result<S, String> {
+    fn eval<S: JetScalar<2>>(&self, row: usize, p: &[S; 2]) -> Result<S, String> {
         let data = self
             .rows
             .get(row)
@@ -193,7 +193,7 @@ fn gaulss_link_jet_tower_matches_production_observed_score_and_hessian() {
 
     const REL_TOL: f64 = 1e-11;
     for (row, fixture) in rows.iter().enumerate() {
-        let tower: Tower4<2> = generic_full_tower(&program, row).expect("gaulss jet tower");
+        let tower: Tower4<2> = program_full_tower(&program, row).expect("gaulss jet tower");
         let claims = gaulss_observed_closed_form(fixture);
         verify_kernel_channels(&tower, &claims, REL_TOL).unwrap_or_else(|e| {
             panic!(

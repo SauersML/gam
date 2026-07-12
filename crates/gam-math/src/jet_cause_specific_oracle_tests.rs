@@ -36,12 +36,12 @@
 //! and `w_derivative = −2w·ṡ/s³` (event rows), then contracts each through its
 //! design block — i.e. `xᵀ diag(∂³·direction) x`. The `_second_directional_`
 //! variant uses `w·exp·u̇·v̇` and `6w·u̇·v̇/s⁴`. This oracle writes `ℓ` ONCE as a
-//! `RowNllProgramGeneric<3>` and pins the jet's contracted third/fourth against
+//! `RowProgram<3>` and pins the jet's contracted third/fourth against
 //! those EXACT production per-row weight formulas at `rel_tol = 1e-11`.
 
 use crate::jet_scalar::JetScalar;
 use crate::jet_tower::{
-    KernelChannels, RowNllProgramGeneric, Tower4, generic_full_tower, verify_kernel_channels,
+    KernelChannels, RowProgram, Tower4, program_full_tower, verify_kernel_channels,
 };
 
 /// One cause-specific Royston-Parmar fixture. `s` (the spline derivative) is kept
@@ -58,7 +58,7 @@ struct CauseRow {
     has_entry: bool,
 }
 
-/// The cause-specific row NLL written ONCE as a generic [`RowNllProgramGeneric<3>`]
+/// The cause-specific row NLL written ONCE as a generic [`RowProgram<3>`]
 /// over the jet scalar `S`. Primary order: 0 = η1 (exit), 1 = η0 (entry), 2 = s
 /// (spline derivative). The `1{entry}` / `δ` indicators fold the entry and event
 /// terms in or out — a dropped term contributes exact-zero derivative channels,
@@ -67,7 +67,7 @@ struct CauseSpecificRow {
     rows: Vec<CauseRow>,
 }
 
-impl RowNllProgramGeneric<3> for CauseSpecificRow {
+impl RowProgram<3> for CauseSpecificRow {
     fn n_rows(&self) -> usize {
         self.rows.len()
     }
@@ -80,7 +80,7 @@ impl RowNllProgramGeneric<3> for CauseSpecificRow {
         Ok([r.eta1, r.eta0, r.s])
     }
 
-    fn row_nll_generic<S: JetScalar<3>>(&self, row: usize, p: &[S; 3]) -> Result<S, String> {
+    fn eval<S: JetScalar<3>>(&self, row: usize, p: &[S; 3]) -> Result<S, String> {
         let data = self
             .rows
             .get(row)
@@ -220,7 +220,7 @@ fn cause_specific_royston_parmar_jet_tower_matches_production_directional_weight
 
     const REL_TOL: f64 = 1e-11;
     for (row, fixture) in rows.iter().enumerate() {
-        let tower: Tower4<3> = generic_full_tower(&program, row).expect("cause-specific jet tower");
+        let tower: Tower4<3> = program_full_tower(&program, row).expect("cause-specific jet tower");
         let claims = cause_specific_closed_form(fixture, &third_dirs, &fourth_pairs);
         verify_kernel_channels(&tower, &claims, REL_TOL).unwrap_or_else(|e| {
             panic!(

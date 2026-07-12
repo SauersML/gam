@@ -55,7 +55,7 @@
 
 use crate::jet_scalar::JetScalar;
 use crate::jet_tower::{
-    KernelChannels, RowNllProgramGeneric, Tower4, generic_full_tower, verify_kernel_channels,
+    KernelChannels, RowProgram, Tower4, program_full_tower, verify_kernel_channels,
 };
 
 /// One multinomial-logit fixture over `M` active primaries: the active-class
@@ -69,14 +69,14 @@ struct MultRow<const M: usize> {
 }
 
 /// The multinomial-logit family written ONCE as a generic
-/// [`RowNllProgramGeneric<M>`] over the jet scalar `S`. The row NLL body uses
+/// [`RowProgram<M>`] over the jet scalar `S`. The row NLL body uses
 /// ONLY [`JetScalar`] ops (`exp`, `add`, `ln`, `scale`, `sub`); the per-row data
 /// (observed class, weight) enters as plain constants.
 struct MultinomialSoftmaxRow<const M: usize> {
     rows: Vec<MultRow<M>>,
 }
 
-impl<const M: usize> RowNllProgramGeneric<M> for MultinomialSoftmaxRow<M> {
+impl<const M: usize> RowProgram<M> for MultinomialSoftmaxRow<M> {
     fn n_rows(&self) -> usize {
         self.rows.len()
     }
@@ -89,7 +89,7 @@ impl<const M: usize> RowNllProgramGeneric<M> for MultinomialSoftmaxRow<M> {
         Ok(r.eta)
     }
 
-    fn row_nll_generic<S: JetScalar<M>>(&self, row: usize, p: &[S; M]) -> Result<S, String> {
+    fn eval<S: JetScalar<M>>(&self, row: usize, p: &[S; M]) -> Result<S, String> {
         let data = self
             .rows
             .get(row)
@@ -275,7 +275,7 @@ fn assert_vgh<const M: usize>(seed: u64) {
     let rows = make_rows::<M>(seed, 24);
     let program = MultinomialSoftmaxRow { rows: rows.clone() };
     for (row, fixture) in rows.iter().enumerate() {
-        let tower: Tower4<M> = generic_full_tower(&program, row).expect("multinomial jet tower");
+        let tower: Tower4<M> = program_full_tower(&program, row).expect("multinomial jet tower");
         let claims = multinomial_closed_form_vgh(fixture);
         verify_kernel_channels(&tower, &claims, REL_TOL).unwrap_or_else(|e| {
             panic!("M={M} row {row}: softmax closed form disagrees with #932 jet tower: {e}")
@@ -307,7 +307,7 @@ fn assert_third_fourth<const M: usize>(seed: u64) {
         );
     };
     for (row, fixture) in rows.iter().enumerate() {
-        let tower: Tower4<M> = generic_full_tower(&program, row).expect("multinomial jet tower");
+        let tower: Tower4<M> = program_full_tower(&program, row).expect("multinomial jet tower");
         let p = softmax_active(&fixture.eta);
         let w = fixture.w;
         let mut delta = [0.0_f64; M];

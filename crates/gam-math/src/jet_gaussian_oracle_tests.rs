@@ -10,7 +10,7 @@
 //! channels.
 //!
 //! The reusable oracle plumbing already lives in the tree —
-//! [`crate::jet_tower::RowNllProgramGeneric`] (write the row NLL ONCE, generic
+//! [`crate::jet_tower::RowProgram`] (write the row NLL ONCE, generic
 //! over the scalar), the production packed scalars
 //! ([`crate::jet_scalar::Order2`] / [`crate::jet_scalar::OneSeed`] /
 //! [`crate::jet_scalar::TwoSeed`]) that serve the `(v, g, H)` / contracted-third
@@ -32,7 +32,7 @@
 //! points.
 //!
 //! This makes good on the issue's promise that "adding more families later is
-//! straightforward": a new family is a `RowNllProgramGeneric` impl (one
+//! straightforward": a new family is a `RowProgram` impl (one
 //! expression) plus a `verify_kernel_channels` call against its own hand kernel —
 //! no new algebra, no new comparator. The guard is genuine and distinct: the
 //! comparand is external hand calculus for a real exponential family, so any
@@ -67,7 +67,7 @@
 
 use crate::jet_scalar::JetScalar;
 use crate::jet_tower::{
-    KernelChannels, RowNllProgramGeneric, Tower4, generic_full_tower, verify_kernel_channels,
+    KernelChannels, RowProgram, Tower4, program_full_tower, verify_kernel_channels,
 };
 
 /// One Gaussian location-scale fixture: the response `y` and the current
@@ -83,7 +83,7 @@ struct GaussianRow {
 }
 
 /// The Gaussian location-scale family, written ONCE as a generic
-/// [`RowNllProgramGeneric<2>`] over the jet scalar `S`. The row NLL body uses
+/// [`RowProgram<2>`] over the jet scalar `S`. The row NLL body uses
 /// ONLY [`JetScalar`] ops (`sub`, `mul`, `scale`, `add`, `exp`); the per-row data
 /// (`y`) enters as a plain `f64` constant — the single source of truth from which
 /// every derivative channel is then exact by construction.
@@ -91,7 +91,7 @@ struct GaussianLocScaleRow {
     rows: Vec<GaussianRow>,
 }
 
-impl RowNllProgramGeneric<2> for GaussianLocScaleRow {
+impl RowProgram<2> for GaussianLocScaleRow {
     fn n_rows(&self) -> usize {
         self.rows.len()
     }
@@ -105,7 +105,7 @@ impl RowNllProgramGeneric<2> for GaussianLocScaleRow {
         Ok([r.eta, r.s])
     }
 
-    fn row_nll_generic<S: JetScalar<2>>(&self, row: usize, p: &[S; 2]) -> Result<S, String> {
+    fn eval<S: JetScalar<2>>(&self, row: usize, p: &[S; 2]) -> Result<S, String> {
         let data = self
             .rows
             .get(row)
@@ -266,7 +266,7 @@ fn gaussian_loc_scale_jet_tower_matches_hand_derived_via_universal_oracle() {
 
     for (row, fixture) in rows.iter().enumerate() {
         // The mechanically jet-derived dense tower (every channel in one pass).
-        let tower: Tower4<2> = generic_full_tower(&program, row).expect("gaussian jet tower");
+        let tower: Tower4<2> = program_full_tower(&program, row).expect("gaussian jet tower");
 
         // The INDEPENDENT hand-derived channels a hand kernel would claim.
         let claims = gaussian_closed_form_channels(fixture, &third_dirs, &fourth_pairs);
@@ -282,7 +282,7 @@ fn gaussian_loc_scale_jet_tower_matches_hand_derived_via_universal_oracle() {
 
 /// The PRODUCTION packed scalars — `Order2` (value/∇/H), `OneSeed` (contracted
 /// third), `TwoSeed` (contracted fourth) — evaluated on the SAME single
-/// `row_nll_generic` expression must reproduce the hand-derived closed form's
+/// `eval` expression must reproduce the hand-derived closed form's
 /// corresponding channels. This pins the cutover path a family would actually use
 /// (the small packed scalars, not the dense `Tower4`) against external calculus,
 /// with the contraction directions folded into the nilpotent seeds. It is the
@@ -290,7 +290,7 @@ fn gaussian_loc_scale_jet_tower_matches_hand_derived_via_universal_oracle() {
 #[test]
 fn gaussian_loc_scale_packed_scalars_match_hand_derived_contractions() {
     use crate::jet_tower::{
-        generic_fourth_contracted, generic_row_kernel, generic_third_contracted,
+        program_fourth_contracted, program_row_kernel, program_third_contracted,
     };
 
     let mut rng = Lcg(0x0bad_c0de_9322_0203);
@@ -319,7 +319,7 @@ fn gaussian_loc_scale_packed_scalars_match_hand_derived_contractions() {
         let hand = gaussian_closed_form_channels(fixture, &[], &[]);
 
         // Order2: value / gradient / Hessian via the production packed scalar.
-        let (v, g, h) = generic_row_kernel(&program, row).expect("Order2 channel");
+        let (v, g, h) = program_row_kernel(&program, row).expect("Order2 channel");
         close(v, hand.value, &format!("row {row} Order2 value"));
         for i in 0..2 {
             close(
@@ -338,9 +338,9 @@ fn gaussian_loc_scale_packed_scalars_match_hand_derived_contractions() {
 
         // OneSeed: contracted third Σ_c ℓ_{abc}·dir_c via the production scalar,
         // checked against the dense tower's own contraction of t3.
-        let tower: Tower4<2> = generic_full_tower(&program, row).expect("tower");
+        let tower: Tower4<2> = program_full_tower(&program, row).expect("tower");
         for (di, dir) in third_dirs.iter().enumerate() {
-            let third = generic_third_contracted(&program, row, dir).expect("OneSeed third");
+            let third = program_third_contracted(&program, row, dir).expect("OneSeed third");
             let truth = tower.third_contracted(dir);
             for i in 0..2 {
                 for j in 0..2 {
@@ -357,7 +357,7 @@ fn gaussian_loc_scale_packed_scalars_match_hand_derived_contractions() {
         // scalar, checked against the dense tower's own contraction of t4.
         for (ui, u) in third_dirs.iter().enumerate() {
             let v = third_dirs[(ui + 1) % third_dirs.len()];
-            let fourth = generic_fourth_contracted(&program, row, u, &v).expect("TwoSeed fourth");
+            let fourth = program_fourth_contracted(&program, row, u, &v).expect("TwoSeed fourth");
             let truth = tower.fourth_contracted(u, &v);
             for i in 0..2 {
                 for j in 0..2 {

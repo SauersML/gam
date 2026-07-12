@@ -3465,6 +3465,42 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         assignments: ArrayView2<'_, f64>,
     ) -> Result<Array2<f64>, String> {
+        let (fitted, _, _) =
+            self.reconstruct_from_assignments_target_aware_impl(target, assignments, false)?;
+        Ok(fitted)
+    }
+
+    /// Target-aware reconstruction together with each effective, unweighted
+    /// atom image and coordinate block. OOS reporting uses this entry so a
+    /// hybrid-linear verdict changes both the summed reconstruction and the
+    /// per-atom attribution exposed to callers.
+    pub(crate) fn reconstruct_with_atom_images_target_aware(
+        &self,
+        target: ArrayView2<'_, f64>,
+        assignments: ArrayView2<'_, f64>,
+    ) -> Result<(Array2<f64>, Vec<Array2<f64>>, Vec<Array2<f64>>), String> {
+        let (fitted, images, coords) =
+            self.reconstruct_from_assignments_target_aware_impl(target, assignments, true)?;
+        Ok((
+            fitted,
+            images.expect("capture=true materializes atom images"),
+            coords.expect("capture=true materializes effective coordinates"),
+        ))
+    }
+
+    fn reconstruct_from_assignments_target_aware_impl(
+        &self,
+        target: ArrayView2<'_, f64>,
+        assignments: ArrayView2<'_, f64>,
+        capture_atoms: bool,
+    ) -> Result<
+        (
+            Array2<f64>,
+            Option<Vec<Array2<f64>>>,
+            Option<Vec<Array2<f64>>>,
+        ),
+        String,
+    > {
         let n = self.n_obs();
         let p = self.output_dim();
         let k_atoms = self.k_atoms();
@@ -3477,8 +3513,32 @@ impl SaeManifoldTerm {
         }
         let linear_images = self.hybrid_linear_image_map();
         let full_curved = self.reconstruct_from_assignments(assignments, false)?;
+        let mut atom_images = capture_atoms.then(|| {
+            (0..k_atoms)
+                .map(|_| Array2::<f64>::zeros((n, p)))
+                .collect::<Vec<_>>()
+        });
+        let mut effective_coords = capture_atoms.then(|| {
+            self.assignment
+                .coords
+                .iter()
+                .map(|coords| coords.as_matrix())
+                .collect::<Vec<_>>()
+        });
+
         if linear_images.is_empty() {
-            return Ok(full_curved);
+            if let Some(images) = atom_images.as_mut() {
+                let mut decoded = vec![0.0_f64; p];
+                for (atom_index, image) in images.iter_mut().enumerate() {
+                    for row in 0..n {
+                        self.atoms[atom_index].fill_decoded_row(row, &mut decoded);
+                        for output in 0..p {
+                            image[[row, output]] = decoded[output];
+                        }
+                    }
+                }
+            }
+            return Ok((full_curved, atom_images, effective_coords));
         }
 
         let mut out = Array2::<f64>::zeros((n, p));
@@ -3488,7 +3548,7 @@ impl SaeManifoldTerm {
         for row in 0..n {
             for atom_idx in 0..k_atoms {
                 let mass = assignments[[row, atom_idx]];
-                if mass == 0.0 {
+                if mass == 0.0 && !capture_atoms {
                     continue;
                 }
                 if let Some(image) = linear_images.get(&atom_idx) {
@@ -3507,8 +3567,19 @@ impl SaeManifoldTerm {
                         self.assignment.coords[atom_idx].as_matrix()[[row, 0]]
                     };
                     image.fill_row(coordinate, &mut image_row);
+                    if let Some(coords) = effective_coords.as_mut() {
+                        coords[atom_idx][[row, 0]] = coordinate;
+                    }
                 } else {
                     self.atoms[atom_idx].fill_decoded_row(row, &mut image_row);
+                }
+                if let Some(images) = atom_images.as_mut() {
+                    for output in 0..p {
+                        images[atom_idx][[row, output]] = image_row[output];
+                    }
+                }
+                if mass == 0.0 {
+                    continue;
                 }
                 for output in 0..p {
                     out[[row, output]] += mass * image_row[output];
@@ -3516,7 +3587,7 @@ impl SaeManifoldTerm {
             }
         }
         self.add_tier0_mean_inplace(&mut out);
-        Ok(out)
+        Ok((out, atom_images, effective_coords))
     }
 
     /// #1777 — TARGET-AWARE hybrid-collapsed reconstruction: identical to

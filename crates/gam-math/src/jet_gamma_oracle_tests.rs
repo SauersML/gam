@@ -6,7 +6,7 @@
 //! (value / ∇ / H / contracted-third / contracted-fourth) is MECHANICALLY
 //! derived from a single row-NLL expression rather than hand-written. The
 //! reusable machinery already lives in the tree
-//! ([`crate::jet_tower::RowNllProgramGeneric`], the packed
+//! ([`crate::jet_tower::RowProgram`], the packed
 //! [`crate::jet_scalar::Order2`] / [`crate::jet_scalar::OneSeed`] /
 //! [`crate::jet_scalar::TwoSeed`] scalars, the dense [`crate::jet_tower::Tower4`],
 //! and the channel comparator [`crate::jet_tower::verify_kernel_channels`]), and
@@ -62,8 +62,8 @@
 
 use crate::jet_scalar::JetScalar;
 use crate::jet_tower::{
-    Tower4, digamma_derivative_stack, generic_fourth_contracted, generic_full_tower,
-    generic_row_kernel, generic_third_contracted, ln_gamma_derivative_stack,
+    Tower4, digamma_derivative_stack, program_fourth_contracted, program_full_tower,
+    program_row_kernel, program_third_contracted, ln_gamma_derivative_stack,
 };
 
 /// A tiny deterministic LCG so the test points are pseudo-random yet fixed
@@ -95,7 +95,7 @@ struct GammaRow {
 }
 
 /// The Rigby–Stasinopoulos Gamma row NLL, written ONCE as a generic
-/// [`RowNllProgramGeneric<2>`](crate::jet_tower::RowNllProgramGeneric) over the
+/// [`RowProgram<2>`](crate::jet_tower::RowProgram) over the
 /// jet scalar `S`. The body uses ONLY [`JetScalar`] ops (`scale`, `add`, `exp`,
 /// `ln_gamma`); the per-row data (`y`, `log y`) enters as plain `f64` constants —
 /// the single source of truth from which every derivative channel is then exact
@@ -104,7 +104,7 @@ struct GammaLocScaleRow {
     rows: Vec<GammaRow>,
 }
 
-impl crate::jet_tower::RowNllProgramGeneric<2> for GammaLocScaleRow {
+impl crate::jet_tower::RowProgram<2> for GammaLocScaleRow {
     fn n_rows(&self) -> usize {
         self.rows.len()
     }
@@ -118,7 +118,7 @@ impl crate::jet_tower::RowNllProgramGeneric<2> for GammaLocScaleRow {
         Ok([r.p0, r.p1])
     }
 
-    fn row_nll_generic<S: JetScalar<2>>(&self, row: usize, p: &[S; 2]) -> Result<S, String> {
+    fn eval<S: JetScalar<2>>(&self, row: usize, p: &[S; 2]) -> Result<S, String> {
         let data = self
             .rows
             .get(row)
@@ -269,7 +269,7 @@ fn gamma_dispersion_jet_tower_matches_independent_fd_oracle() {
     };
 
     for (row, fixture) in rows.iter().enumerate() {
-        let tower: Tower4<2> = generic_full_tower(&program, row).expect("gamma jet tower");
+        let tower: Tower4<2> = program_full_tower(&program, row).expect("gamma jet tower");
 
         // Value.
         close(
@@ -340,7 +340,7 @@ fn order_counts(axes: &[usize]) -> (usize, usize) {
 
 /// The PRODUCTION packed scalars — `Order2` (value/∇/H), `OneSeed` (contracted
 /// third), `TwoSeed` (contracted fourth) — evaluated on the SAME single
-/// `row_nll_generic` Gamma expression must reproduce the dense `Tower4`
+/// `eval` Gamma expression must reproduce the dense `Tower4`
 /// contractions. This pins the actual cutover path a `ln Γ`-carrying family
 /// would use (the small packed scalars, with the contraction directions folded
 /// into the nilpotent seeds) rather than the dense oracle tower.
@@ -361,10 +361,10 @@ fn gamma_dispersion_packed_scalars_match_dense_tower_contractions() {
     };
 
     for row in 0..rows.len() {
-        let tower: Tower4<2> = generic_full_tower(&program, row).expect("tower");
+        let tower: Tower4<2> = program_full_tower(&program, row).expect("tower");
 
         // Order2: value / gradient / Hessian via the production packed scalar.
-        let (v, g, h) = generic_row_kernel(&program, row).expect("Order2 channel");
+        let (v, g, h) = program_row_kernel(&program, row).expect("Order2 channel");
         close(v, tower.v, &format!("row {row} Order2 value"));
         for i in 0..2 {
             close(g[i], tower.g[i], &format!("row {row} Order2 grad[{i}]"));
@@ -379,7 +379,7 @@ fn gamma_dispersion_packed_scalars_match_dense_tower_contractions() {
 
         // OneSeed: contracted third Σ_c ℓ_{abc}·dir_c vs the dense t3 contraction.
         for (di, dir) in third_dirs.iter().enumerate() {
-            let third = generic_third_contracted(&program, row, dir).expect("OneSeed third");
+            let third = program_third_contracted(&program, row, dir).expect("OneSeed third");
             let truth = tower.third_contracted(dir);
             for i in 0..2 {
                 for j in 0..2 {
@@ -395,7 +395,7 @@ fn gamma_dispersion_packed_scalars_match_dense_tower_contractions() {
         // TwoSeed: contracted fourth Σ_{cd} ℓ_{abcd}·u_c·v_d vs the dense t4.
         for (ui, u) in third_dirs.iter().enumerate() {
             let v = third_dirs[(ui + 1) % third_dirs.len()];
-            let fourth = generic_fourth_contracted(&program, row, u, &v).expect("TwoSeed fourth");
+            let fourth = program_fourth_contracted(&program, row, u, &v).expect("TwoSeed fourth");
             let truth = tower.fourth_contracted(u, &v);
             for i in 0..2 {
                 for j in 0..2 {
@@ -425,7 +425,7 @@ struct AffineComposeRow {
     digamma: bool,
 }
 
-impl crate::jet_tower::RowNllProgramGeneric<2> for AffineComposeRow {
+impl crate::jet_tower::RowProgram<2> for AffineComposeRow {
     fn n_rows(&self) -> usize {
         1
     }
@@ -435,7 +435,7 @@ impl crate::jet_tower::RowNllProgramGeneric<2> for AffineComposeRow {
         }
         Ok([self.p0, self.p1])
     }
-    fn row_nll_generic<S: JetScalar<2>>(&self, row: usize, p: &[S; 2]) -> Result<S, String> {
+    fn eval<S: JetScalar<2>>(&self, row: usize, p: &[S; 2]) -> Result<S, String> {
         if row >= self.n_rows() {
             return Err(format!("AffineComposeRow: row {row} out of range"));
         }
@@ -495,7 +495,7 @@ fn affine_special_function_composition_places_certified_stack_by_order() {
             ln_gamma_derivative_stack(x0)
         };
         let c = [c0, c1];
-        let tower: Tower4<2> = generic_full_tower(&program, 0).expect("affine tower");
+        let tower: Tower4<2> = program_full_tower(&program, 0).expect("affine tower");
 
         let tag = if digamma { "digamma" } else { "ln_gamma" };
         // Value.
