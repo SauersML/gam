@@ -1653,7 +1653,32 @@ pub(crate) fn certify_outer_optimality(
     // decrement scales quadratically with ‖g‖ at fixed direction, that bound is
     // `‖Pg‖·√(objective_tol/Δpred)`, which clears the actual ‖Pg‖ iff
     // `Δpred ≤ objective_tol`.
-    if let Some(hessian) = analytic_hessian.as_ref()
+    // #2269 (c) — MEASURED curvature for the gradient-only path. The rescue
+    // above requires a Hessian; objectives on the gradient-only / matrix-free
+    // lane (hessian_psd = n/a) historically had NO rescue and refused at
+    // small multiples of the band (measured post-desync-retry: |Pg| = 8.24e-4
+    // against 3.66e-4 after 14 iterations — 2.25×, with no way to ask whether
+    // any resolvable descent remains). With the deterministic-reduction stack
+    // the outer criterion is reproducible, so at tiny ρ-dimension the honest
+    // answer is cheap: central differences of the ANALYTIC gradient
+    // (2·n_params extra evaluations, first-order-accurate in the gradient so
+    // immune to value-noise second-differencing) give a measured Hessian for
+    // the SAME decrement certificate. Computed lazily, only on the
+    // would-refuse path (the point currently becomes a hard typed refusal
+    // anyway), only when no analytic Hessian exists, and capped at 3
+    // parameters so the cost stays a handful of evaluations. An indefinite
+    // measured Hessian fails the decrement gate (and the certificate's PSD
+    // gate) exactly as an analytic one would.
+    const FD_CURVATURE_MAX_PARAMS: usize = 3;
+    let fd_hessian: Option<Array2<f64>> = if analytic_hessian.is_none()
+        && layout.n_params <= FD_CURVATURE_MAX_PARAMS
+        && projected_grad_norm > stationarity_bound
+    {
+        fd_outer_hessian_from_gradient(obj, &result.rho)
+    } else {
+        None
+    };
+    if let Some(hessian) = analytic_hessian.as_ref().or(fd_hessian.as_ref())
         && let Some(predicted_decrease) =
             newton_predicted_decrease(hessian, &projected_gradient)
         && predicted_decrease.is_finite()
@@ -1687,6 +1712,7 @@ pub(crate) fn certify_outer_optimality(
         },
         hessian_psd: analytic_hessian
             .as_ref()
+            .or(fd_hessian.as_ref())
             .and_then(certificate_hessian_is_psd),
         lambdas_railed: certificate_railed_lambdas(&result.rho, layout.rho_dim(), config),
     };
@@ -1911,6 +1937,54 @@ pub enum OperatorTrustRegionStopReason {
 /// Do not wrap `run_outer` calls in try/catch with ad-hoc solver recovery.
 /// Callers should declare only the primary capability and, at most, whether
 /// automatic fallback is enabled at all.
+/// Central-difference Hessian of the outer criterion from its ANALYTIC
+/// gradient, for the #2269 gradient-only-path decrement rescue. `None` on any
+/// evaluation failure, length mismatch, or non-finite entry — the caller then
+/// simply has no curvature evidence, exactly as before. The mixed-partial
+/// asymmetry (truncation + residual inner noise) is symmetrized away.
+fn fd_outer_hessian_from_gradient(
+    obj: &mut dyn OuterObjective,
+    rho: &Array1<f64>,
+) -> Option<Array2<f64>> {
+    let n = rho.len();
+    let mut h_mat = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        // Physically small in log-λ space, comfortably above the inner
+        // solve's certified-band noise on the gradient.
+        let h = 1.0e-3 * (1.0 + rho[i].abs());
+        let mut rho_plus = rho.clone();
+        rho_plus[i] += h;
+        let mut rho_minus = rho.clone();
+        rho_minus[i] -= h;
+        let g_plus = obj
+            .eval_with_order(&rho_plus, OuterEvalOrder::ValueAndGradient)
+            .ok()?
+            .gradient;
+        let g_minus = obj
+            .eval_with_order(&rho_minus, OuterEvalOrder::ValueAndGradient)
+            .ok()?
+            .gradient;
+        if g_plus.len() != n || g_minus.len() != n {
+            return None;
+        }
+        for j in 0..n {
+            let value = (g_plus[j] - g_minus[j]) / (2.0 * h);
+            if !value.is_finite() {
+                return None;
+            }
+            h_mat[[i, j]] = value;
+        }
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let symmetric = 0.5 * (h_mat[[i, j]] + h_mat[[j, i]]);
+            h_mat[[i, j]] = symmetric;
+            h_mat[[j, i]] = symmetric;
+        }
+    }
+    Some(h_mat)
+}
+
 pub(crate) fn run_outer(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
