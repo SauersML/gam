@@ -188,6 +188,7 @@ fn gaussian_identity_inner_residual_norm(
             canonical_penalties.len()
         );
     }
+    let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())?;
 
     let mut residual = x.apply(beta);
     residual += &offset;
@@ -196,7 +197,7 @@ fn gaussian_identity_inner_residual_norm(
     let mut gradient = x.apply_transpose(&residual);
 
     for (k, cp) in canonical_penalties.iter().enumerate() {
-        let lambda = rho[k].exp();
+        let lambda = lambdas[k];
         if lambda == 0.0 || cp.rank() == 0 {
             continue;
         }

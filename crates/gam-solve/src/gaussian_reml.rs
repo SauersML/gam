@@ -1365,7 +1365,9 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
             condition_number: f64::INFINITY,
         });
     }
-    let lambdas = rhos.mapv(f64::exp);
+    let lambdas = Array1::from_vec(gam_problem::checked_exp_log_strengths(
+        rhos.iter().copied(),
+    )?);
     let edf = Array1::from_iter(evals.iter().map(|eval| eval.edf));
     let logdet_term = evals
         .iter()
@@ -1404,7 +1406,8 @@ fn gaussian_reml_multi_closed_form_from_parts(
         .map(f64::ln);
     let rho = optimize_rho(&prepared, init_rho)?;
     let eval = prepared.evaluate(rho);
-    let lambda = rho.exp();
+    let lambda = gam_problem::checked_exp_log_strength(rho)
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     let coefficients = prepared.coefficients(lambda);
     let fitted = dense_ab(x, coefficients.view());
     let sigma2 = prepared.sigma2(lambda);
@@ -1434,10 +1437,8 @@ pub fn gaussian_reml_free_b_score(
     penalty: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
 ) -> Result<GaussianRemlFreeBScore, EstimationError> {
-    if !log_lambda.is_finite() {
-        crate::bail_invalid_estim!("Gaussian REML log_lambda must be finite; got {log_lambda}");
-    }
-    let lambda = log_lambda.exp();
+    let lambda = gam_problem::checked_exp_log_strength(log_lambda)
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     let penalty_owned = canonicalize_penalty(penalty);
     let penalty = penalty_owned.view();
     let n = x.nrows();

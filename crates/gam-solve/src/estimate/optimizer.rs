@@ -2577,6 +2577,7 @@ where
         let smoothing_correction_diagonal = if beta_covariance_unscaled.is_some() {
             let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
                 &final_rho,
+                &lambdas,
                 &pirls_res,
                 beta_covariance_unscaled.as_ref(),
                 cov_scale,

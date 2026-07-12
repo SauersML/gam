@@ -13,9 +13,7 @@ use super::binomial_q_derivs::{
     binomial_neglog_q_fourth_derivative_logit_closed_form,
     binomial_neglog_q_fourth_derivative_probit_closed_form,
 };
-use super::dispersion_family::{
-    DISPERSION_ETA_CLAMP, DISPERSION_MIN_CURVATURE, DispersionRowKernel, dispersion_row_kernel,
-};
+use super::dispersion_family::{DispersionRowKernel, dispersion_row_kernel};
 use super::test_support::{binomial_location_scale_nll_tower, dispersion_tweedie_nll_generic};
 use crate::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 
@@ -593,13 +591,13 @@ pub(crate) fn hand_dispersion_row_kernel(
     eta_d: f64,
     prior_weight: f64,
 ) -> DispersionRowKernel {
-    let wi = prior_weight.max(0.0);
-    let em = eta_mu.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
-    let ed = eta_d.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
+    let wi = prior_weight;
+    let em = eta_mu;
+    let ed = eta_d;
     match kind {
         DispersionFamilyKind::NegativeBinomial => {
-            let mu = em.exp().max(1e-300);
-            let theta = ed.exp().max(1e-12);
+            let mu = em.exp();
+            let theta = ed.exp();
             let tpm = theta + mu;
             let tpy = theta + yi;
             let loglik = wi
@@ -626,25 +624,24 @@ pub(crate) fn hand_dispersion_row_kernel(
             // exact score, so the optimum is identical). `tpy` is retained only
             // for the score; the observed-curvature terms are dropped.
             let info_theta = hand_trigamma(theta) - hand_trigamma(tpm) - 1.0 / theta + 1.0 / tpm;
-            let info_pos = info_theta.max(DISPERSION_MIN_CURVATURE);
             DispersionRowKernel {
                 loglik,
                 mean_weight,
                 mean_response,
-                disp_weight: wi * theta * theta * info_pos,
-                disp_response: ed + s_theta / (theta * info_pos),
+                disp_weight: wi * theta * theta * info_theta,
+                disp_response: ed + s_theta / (theta * info_theta),
             }
         }
         DispersionFamilyKind::Gamma => {
-            let mu = em.exp().max(1e-300);
-            let nu = ed.exp().max(1e-12);
-            let y_pos = yi.max(1e-300);
+            let mu = em.exp();
+            let nu = ed.exp();
+            let y_pos = yi;
             let loglik = wi
                 * (nu * nu.ln() - nu * mu.ln() - ln_gamma(nu) + (nu - 1.0) * y_pos.ln()
                     - nu * yi / mu);
             let s_nu = nu.ln() + 1.0 - mu.ln() - statrs::function::gamma::digamma(nu) + y_pos.ln()
                 - yi / mu;
-            let info_nu = (hand_trigamma(nu) - 1.0 / nu).max(DISPERSION_MIN_CURVATURE);
+            let info_nu = hand_trigamma(nu) - 1.0 / nu;
             DispersionRowKernel {
                 loglik,
                 mean_weight: wi * nu,
@@ -654,10 +651,11 @@ pub(crate) fn hand_dispersion_row_kernel(
             }
         }
         DispersionFamilyKind::Beta => {
-            let mu = (1.0 / (1.0 + (-em).exp())).clamp(1e-12, 1.0 - 1e-12);
-            let phi = ed.exp().max(1e-12);
-            let q = (mu * (1.0 - mu)).max(1e-12);
-            let yc = yi.clamp(1e-12, 1.0 - 1e-12);
+            let logit = gam_solve::mixture_link::logit_inverse_link_jet5(em);
+            let mu = logit.mu;
+            let phi = ed.exp();
+            let q = logit.d1;
+            let yc = yi;
             let a = mu * phi;
             let b = (1.0 - mu) * phi;
             let loglik = wi
@@ -668,17 +666,14 @@ pub(crate) fn hand_dispersion_row_kernel(
                 * (statrs::function::gamma::digamma(b) - statrs::function::gamma::digamma(a)
                     + yc.ln()
                     - (1.0 - yc).ln());
-            let info_mu =
-                (phi * phi * (hand_trigamma(a) + hand_trigamma(b))).max(DISPERSION_MIN_CURVATURE);
+            let info_mu = phi * phi * (hand_trigamma(a) + hand_trigamma(b));
             let s_phi = statrs::function::gamma::digamma(phi)
                 - mu * statrs::function::gamma::digamma(a)
                 - (1.0 - mu) * statrs::function::gamma::digamma(b)
                 + mu * yc.ln()
                 + (1.0 - mu) * (1.0 - yc).ln();
-            let info_phi = (mu * mu * hand_trigamma(a)
-                + (1.0 - mu) * (1.0 - mu) * hand_trigamma(b)
-                - hand_trigamma(phi))
-            .max(DISPERSION_MIN_CURVATURE);
+            let info_phi = mu * mu * hand_trigamma(a) + (1.0 - mu) * (1.0 - mu) * hand_trigamma(b)
+                - hand_trigamma(phi);
             DispersionRowKernel {
                 loglik,
                 mean_weight: wi * q * q * info_mu,
@@ -696,8 +691,8 @@ pub(crate) fn hand_dispersion_row_kernel(
             // information `∂²NLL/∂η_d²` is used uniformly (the same Newton
             // curvature the production arm reads off `tower.h[1][1]`), matching
             // the NB/Gamma/Beta dispersion arms.
-            let mu = em.exp().max(1e-300);
-            let phi = (-ed).exp().max(1e-12);
+            let mu = em.exp();
+            let phi = (-ed).exp();
             let two_minus_p = 2.0 - p;
             let one_minus_p = 1.0 - p;
             let mean_weight = wi * mu.powf(two_minus_p) / phi;
@@ -723,7 +718,7 @@ pub(crate) fn hand_dispersion_row_kernel(
                 let info_eta = c / phi;
                 (loglik, s_eta, info_eta)
             };
-            let curvature_eta = info_eta.max(DISPERSION_MIN_CURVATURE);
+            let curvature_eta = if yi > 0.0 { 0.5 } else { info_eta };
             DispersionRowKernel {
                 loglik,
                 mean_weight,
@@ -745,7 +740,7 @@ pub(crate) fn dispersion_row_towers_match_hand_witnesses() {
             -25.0,
             0.7,
         ),
-        (DispersionFamilyKind::NegativeBinomial, 6.0, 2.0, 25.0, 1.3),
+        (DispersionFamilyKind::NegativeBinomial, 6.0, 2.0, 3.0, 1.3),
         (DispersionFamilyKind::Gamma, 0.2, -2.0, -25.0, 0.9),
         (DispersionFamilyKind::Gamma, 9.0, 1.7, 25.0, 1.1),
         (DispersionFamilyKind::Beta, 0.02, -3.0, -20.0, 0.8),
@@ -3485,7 +3480,7 @@ pub(crate) fn zeroweightrows_stay_inactive_in_builtin_diagonal_families() {
 }
 
 #[test]
-pub(crate) fn hard_clamped_poisson_and_gammarows_stay_locally_flat() {
+pub(crate) fn log_link_rows_remain_exact_beyond_former_clamp() {
     let poisson = PoissonLogFamily {
         y: Array1::from_vec(vec![1.0, 2.0, 3.0]),
         weights: Array1::from_vec(vec![1.0, 1.0, 1.0]),
@@ -3502,11 +3497,11 @@ pub(crate) fn hard_clamped_poisson_and_gammarows_stay_locally_flat() {
             working_response,
             working_weights,
         } => {
-            assert_eq!(working_weights[0], 0.0);
-            assert_eq!(working_response[0], poisson_eta[0]);
+            assert_eq!(working_weights[0], poisson_eta[0].exp());
+            assert_ne!(working_response[0], poisson_eta[0]);
             assert!(working_weights[1] > 0.0);
-            assert_eq!(working_weights[2], 0.0);
-            assert_eq!(working_response[2], poisson_eta[2]);
+            assert_eq!(working_weights[2], poisson_eta[2].exp());
+            assert_ne!(working_response[2], poisson_eta[2]);
         }
         BlockWorkingSet::ExactNewton { .. } => panic!("expected diagonal Poisson block"),
     }
@@ -3528,11 +3523,11 @@ pub(crate) fn hard_clamped_poisson_and_gammarows_stay_locally_flat() {
             working_response,
             working_weights,
         } => {
-            assert_eq!(working_weights[0], 0.0);
-            assert_eq!(working_response[0], gamma_eta[0]);
+            assert!(working_weights[0] > 0.0);
+            assert_ne!(working_response[0], gamma_eta[0]);
             assert!(working_weights[1] > 0.0);
-            assert_eq!(working_weights[2], 0.0);
-            assert_eq!(working_response[2], gamma_eta[2]);
+            assert!(working_weights[2] > 0.0);
+            assert_ne!(working_response[2], gamma_eta[2]);
         }
         BlockWorkingSet::ExactNewton { .. } => panic!("expected diagonal Gamma block"),
     }
@@ -7522,7 +7517,7 @@ pub(crate) fn wiggle_geometry_and_generative_use_same_sigma_link_as_core() {
 }
 
 #[test]
-pub(crate) fn poisson_extreme_eta_stays_finite_with_safe_exp() {
+pub(crate) fn poisson_extreme_eta_uses_exact_exp_and_refuses_only_unrepresentable_geometry() {
     use crate::custom_family::{CustomFamily, ParameterBlockState};
     let poisson = PoissonLogFamily {
         y: Array1::from_vec(vec![1.0, 2.0, 3.0]),
@@ -7534,7 +7529,7 @@ pub(crate) fn poisson_extreme_eta_stays_finite_with_safe_exp() {
         eta: extreme_eta,
     }]);
     let eval =
-        eval_result.expect("Poisson evaluate must succeed (finite, saturated) at extreme eta");
+        eval_result.expect("Poisson evaluate must succeed while exact geometry is representable");
     match &eval.blockworking_sets[0] {
         crate::custom_family::BlockWorkingSet::Diagonal {
             working_response,
@@ -7552,6 +7547,15 @@ pub(crate) fn poisson_extreme_eta_stays_finite_with_safe_exp() {
         }
         _ => panic!("expected Diagonal block"),
     }
+
+    let refused = match poisson.evaluate(&[ParameterBlockState {
+        beta: Array1::zeros(0),
+        eta: Array1::from_vec(vec![0.5, 710.0, -0.3]),
+    }]) {
+        Ok(_) => panic!("overflowing exact exp geometry must be refused"),
+        Err(err) => err,
+    };
+    assert!(refused.contains("row 1"), "unexpected refusal: {refused}");
 }
 
 /// The batched outer-gradient override on `BinomialLocationScaleFamily`

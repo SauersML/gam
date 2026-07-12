@@ -33,8 +33,8 @@ pub mod fisher_rao;
 pub mod gauge;
 pub mod identifiability_audit;
 pub mod joint_penalty;
-pub mod log_strength;
 mod linear_constraints;
+pub mod log_strength;
 pub mod monotone_root_error;
 pub mod outer_subsample;
 pub mod penalty_coordinate;
@@ -100,13 +100,12 @@ pub use identifiability_audit::{
     AliasedPair, BlockIdentity, DroppedColumn, IdentifiabilityAudit, MapUniquenessError,
 };
 pub use joint_penalty::{JointPenaltyBundle, JointPenaltyError, JointPenaltySpec};
+pub use linear_constraints::LinearInequalityConstraints;
 pub use log_strength::{
-    IndexedLogStrengthDomainError, LOG_STRENGTH_MAX, LOG_STRENGTH_MIN,
-    LogStrengthDomainError,
+    IndexedLogStrengthDomainError, LOG_STRENGTH_MAX, LOG_STRENGTH_MIN, LogStrengthDomainError,
     checked_exp_log_strength, checked_exp_log_strengths, validate_log_strength,
     validate_log_strengths,
 };
-pub use linear_constraints::LinearInequalityConstraints;
 pub use monotone_root_error::MonotoneRootError;
 pub use penalty_coordinate::PenaltyCoordinate;
 pub use penalty_matrix::PenaltyMatrix;

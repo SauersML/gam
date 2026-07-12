@@ -656,7 +656,12 @@ mod tests {
         // Fixed wrapper must carry a supported physical log-precision.
         let bad_fixed = PenaltyMatrix::Dense(ndarray::Array2::<f64>::eye(2))
             .with_fixed_log_lambda(f64::INFINITY);
-        assert!(bad_fixed.validate(2).unwrap_err().contains("must be finite"));
+        assert!(
+            bad_fixed
+                .validate(2)
+                .unwrap_err()
+                .contains("must be finite")
+        );
 
         let finite_but_out_of_domain = PenaltyMatrix::Dense(ndarray::Array2::<f64>::eye(2))
             .with_fixed_log_lambda(crate::LOG_STRENGTH_MAX + 1.0);

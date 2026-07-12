@@ -650,9 +650,8 @@ fn sas_log_delta_barrier_hessian_matches_gradient_slope() {
 
 fn decode_invariant_test_parts() -> UnifiedFitResultParts {
     let log_lambdas = array![0.2_f64.ln(), 0.8_f64.ln()];
-    let lambdas = log_lambdas.mapv(|value| {
-        gam_problem::checked_exp_log_strength(value).expect("fixture log strength")
-    });
+    let lambdas = log_lambdas
+        .mapv(|value| gam_problem::checked_exp_log_strength(value).expect("fixture log strength"));
     UnifiedFitResultParts {
         blocks: vec![FittedBlock {
             beta: array![0.25, -0.5],

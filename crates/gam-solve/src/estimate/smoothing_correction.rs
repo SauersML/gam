@@ -656,6 +656,7 @@ fn dump_indefinite_rho_hessian_diagnostic(
 pub(crate) fn compute_smoothing_correction(
     reml_state: &RemlState<'_>,
     final_rho: &Array1<f64>,
+    lambdas: &Array1<f64>,
     final_fit: &pirls::PirlsResult,
 ) -> SmoothingCorrectionComputation {
     use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
@@ -672,7 +673,7 @@ pub(crate) fn compute_smoothing_correction(
 
     let n_coeffs_trans = final_fit.beta_transformed.len();
     let n_coeffs_orig = final_fit.reparam_result.qs.nrows();
-    let lambdas: Array1<f64> = final_rho.mapv(f64::exp);
+    debug_assert_eq!(lambdas.len(), final_rho.len());
 
     // Step 1: Compute the Jacobian J = d(beta)/d(rho) in transformed space.
     //

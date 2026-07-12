@@ -2419,9 +2419,7 @@ pub(crate) fn assemble_block_local_s_psi(
         }
         s
     } else if let Some(penalty_idx) = deriv.penalty_index {
-        deriv
-            .s_psi
-            .mapv(|v| per_block_lambdas[penalty_idx] * v)
+        deriv.s_psi.mapv(|v| per_block_lambdas[penalty_idx] * v)
     } else {
         Array2::<f64>::zeros((p_block, p_block))
     }

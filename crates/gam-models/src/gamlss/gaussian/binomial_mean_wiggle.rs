@@ -814,13 +814,8 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             }
             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
                 .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
-            let row_ll = binomial_location_scale_log_likelihood(
-                yi,
-                wi,
-                q,
-                &self.link_kind,
-                jet.mu,
-            )?;
+            let row_ll =
+                binomial_location_scale_log_likelihood(yi, wi, q, &self.link_kind, jet.mu)?;
             let (m1, m2, _) = binomial_neglog_q_derivatives_dispatch(
                 yi,
                 wi,
@@ -831,24 +826,39 @@ impl CustomFamily for BinomialMeanWiggleFamily {
                 jet.d3,
                 &self.link_kind,
             );
-            if !row_ll.is_finite() || !m1.is_finite() || !m2.is_finite() || m2 <= 0.0 {
-                return Err(GamlssError::RowGeometryUnrepresentable {
-                    row: i,
-                    quantity: "binomial mean-wiggle q curvature",
-                    eta: q,
-                    value: m2,
+            for (quantity, value, positive) in [
+                ("binomial mean-wiggle row log likelihood", row_ll, false),
+                ("binomial mean-wiggle q score", m1, false),
+                ("binomial mean-wiggle q curvature", m2, true),
+            ] {
+                if !value.is_finite() || (positive && value <= 0.0) {
+                    return Err(GamlssError::RowGeometryUnrepresentable {
+                        row: i,
+                        quantity,
+                        eta: q,
+                        value,
+                    }
+                    .into());
                 }
-                .into());
             }
             let (z_eta_i, w_eta_i) = if slope == 0.0 {
                 (eta[i], 0.0)
             } else {
                 let weight = m2 * slope * slope;
-                let response = eta[i] - m1 * slope / weight;
-                if !weight.is_finite() || weight <= 0.0 || !response.is_finite() {
+                if !weight.is_finite() || weight <= 0.0 {
                     return Err(GamlssError::RowGeometryUnrepresentable {
                         row: i,
-                        quantity: "binomial mean-wiggle eta working geometry",
+                        quantity: "binomial mean-wiggle eta working weight",
+                        eta: eta[i],
+                        value: weight,
+                    }
+                    .into());
+                }
+                let response = eta[i] - m1 / (m2 * slope);
+                if !response.is_finite() {
+                    return Err(GamlssError::RowGeometryUnrepresentable {
+                        row: i,
+                        quantity: "binomial mean-wiggle eta working response",
                         eta: eta[i],
                         value: response,
                     }

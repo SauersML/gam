@@ -298,27 +298,37 @@ macro_rules! array1_f64_newtype {
         impl Deref for $name {
             type Target = Array1<f64>;
             #[inline]
-            fn deref(&self) -> &Self::Target { &self.0 }
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
         }
 
         impl DerefMut for $name {
             #[inline]
-            fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                &mut self.0
+            }
         }
 
         impl AsRef<Array1<f64>> for $name {
             #[inline]
-            fn as_ref(&self) -> &Array1<f64> { &self.0 }
+            fn as_ref(&self) -> &Array1<f64> {
+                &self.0
+            }
         }
 
         impl From<Array1<f64>> for $name {
             #[inline]
-            fn from(values: Array1<f64>) -> Self { Self(values) }
+            fn from(values: Array1<f64>) -> Self {
+                Self(values)
+            }
         }
 
         impl From<$name> for Array1<f64> {
             #[inline]
-            fn from(values: $name) -> Self { values.0 }
+            fn from(values: $name) -> Self {
+                values.0
+            }
         }
     };
 }
@@ -504,9 +514,7 @@ pub struct LogSmoothingParamsView<'a>(ArrayView1<'a, f64>);
 impl<'a> LogSmoothingParamsView<'a> {
     /// Borrow a smoothing vector only after every coordinate satisfies the
     /// exact shared logarithmic-strength contract.
-    pub fn new(
-        values: ArrayView1<'a, f64>,
-    ) -> Result<Self, crate::IndexedLogStrengthDomainError> {
+    pub fn new(values: ArrayView1<'a, f64>) -> Result<Self, crate::IndexedLogStrengthDomainError> {
         crate::validate_log_strengths(values.iter().copied())?;
         Ok(Self(values))
     }

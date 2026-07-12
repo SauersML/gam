@@ -111,7 +111,10 @@ impl std::fmt::Display for JointPenaltyError {
                 "joint penalty matrix has non-finite entry at ({row},{col}): {value}"
             ),
             Self::InitialLogStrengthOutOfDomain { value } => {
-                write!(f, "joint penalty initial_log_lambda is outside the exact strength domain: {value}")
+                write!(
+                    f,
+                    "joint penalty initial_log_lambda is outside the exact strength domain: {value}"
+                )
             }
             Self::NotSymmetric {
                 row,
@@ -310,9 +313,10 @@ impl JointPenaltyBundle {
                     total_compiled,
                 ));
             }
-            lambdas.push(crate::checked_exp_log_strength(log_lambda).map_err(|error| {
-                format!("joint penalty {i} current log-precision: {error}")
-            })?);
+            lambdas.push(
+                crate::checked_exp_log_strength(log_lambda)
+                    .map_err(|error| format!("joint penalty {i} current log-precision: {error}"))?,
+            );
         }
         Ok(Self {
             specs,
@@ -556,21 +560,14 @@ mod tests {
             .lambdas()
             .iter()
             .zip(bundle.log_lambdas())
-            .zip([
-                crate::LOG_STRENGTH_MIN.exp(),
-                crate::LOG_STRENGTH_MAX.exp(),
-            ])
+            .zip([crate::LOG_STRENGTH_MIN.exp(), crate::LOG_STRENGTH_MAX.exp()])
         {
             assert_eq!(actual.to_bits(), expected.to_bits());
             assert_eq!(actual.to_bits(), log_strength.exp().to_bits());
         }
 
-        let error = JointPenaltyBundle::new(
-            specs,
-            vec![0.0, crate::LOG_STRENGTH_MAX + 1.0],
-            4,
-        )
-        .expect_err("one invalid coordinate refuses the whole bundle");
+        let error = JointPenaltyBundle::new(specs, vec![0.0, crate::LOG_STRENGTH_MAX + 1.0], 4)
+            .expect_err("one invalid coordinate refuses the whole bundle");
         assert!(error.contains("joint penalty 1 current log-precision"));
     }
 

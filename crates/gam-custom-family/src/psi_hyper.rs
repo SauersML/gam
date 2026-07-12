@@ -33,8 +33,8 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     let ranges = block_param_ranges(specs);
     let total = beta_flat.len();
     let per_block = split_log_lambdas(&Array1::from_vec(rho.to_vec()), penalty_counts)?;
-    let per_block_lambdas = exact_lambdas_by_block(&per_block, "psi hyper log strength")
-        .map_err(String::from)?;
+    let per_block_lambdas =
+        exact_lambdas_by_block(&per_block, "psi hyper log strength").map_err(String::from)?;
 
     let mut coords = Vec::new();
     let mut psi_global = 0usize;
@@ -388,8 +388,7 @@ pub fn build_contracted_psi_hook(
         penalty_counts,
     )?);
     let per_block_lambdas = Arc::new(
-        exact_lambdas_by_block(&per_block, "contracted psi log strength")
-            .map_err(String::from)?,
+        exact_lambdas_by_block(&per_block, "contracted psi log strength").map_err(String::from)?,
     );
     let beta_arc = Arc::new(beta_flat.clone());
     let ranges_arc = Arc::new(ranges);
@@ -410,11 +409,8 @@ pub fn build_contracted_psi_hook(
         let (start, end) = ranges_arc[block_idx];
         let p_block = end - start;
         for (local_idx, deriv) in block_derivs.iter().enumerate() {
-            let s_psi_local = assemble_block_local_s_psi(
-                deriv,
-                &per_block_lambdas[block_idx],
-                p_block,
-            );
+            let s_psi_local =
+                assemble_block_local_s_psi(deriv, &per_block_lambdas[block_idx], p_block);
             axes.push(PsiAxis {
                 block: block_idx,
                 local: local_idx,
@@ -762,11 +758,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         let (start, end) = ranges_arc[block_idx];
         let p_block = end - start;
         for (local_idx, deriv) in block_derivs.iter().enumerate() {
-            let s_local = assemble_block_local_s_psi(
-                deriv,
-                &per_block_lambdas[block_idx],
-                p_block,
-            );
+            let s_local = assemble_block_local_s_psi(deriv, &per_block_lambdas[block_idx], p_block);
             // Store the block-local S_ψ matrix when penalty logdet is active;
             // PenaltyPseudologdet methods will handle pseudoinverse and leakage internally.
             let s_local_opt = if s_logdet_block_cache.is_some() {
@@ -897,7 +889,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
 
     // ψ-ψ pair callback
     let ext_ext = {
-        let per_block = Arc::clone(&per_block);
+        let per_block_lambdas = Arc::clone(&per_block_lambdas);
         let derivative_blocks = Arc::clone(&derivative_blocks);
         let specs_arc = Arc::clone(&specs_arc);
         let beta_arc = Arc::clone(&beta_arc);
@@ -1103,8 +1095,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             let ld_s = if rho_cache.block_idx == psi_cache.block_idx {
                 let p_block = rho_cache.end - rho_cache.start;
                 let deriv = &derivative_blocks[psi_cache.block_idx][psi_cache.local_idx];
-                let lambda_k =
-                    per_block_lambdas[rho_cache.block_idx][rho_cache.penalty_idx];
+                let lambda_k = per_block_lambdas[rho_cache.block_idx][rho_cache.penalty_idx];
                 let local = if let Some(ref components) = deriv.s_psi_penalty_components {
                     let mut m = Array2::<f64>::zeros((p_block, p_block));
                     for (penalty_idx, s_part) in components {

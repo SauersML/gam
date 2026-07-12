@@ -1188,10 +1188,9 @@ pub(crate) fn analytic_penalty_row_hessian_fingerprint(
                 hasher.write_f64(p.log_alpha[k]);
                 hasher.write_f64(active_log_alpha);
                 hasher.write_f64(
-                    gam_problem::checked_exp_log_strength(active_log_alpha)
-                        .expect(
-                            "registry rho was validated before parametric row-Hessian fingerprinting",
-                        ),
+                    gam_problem::checked_exp_log_strength(active_log_alpha).expect(
+                        "registry rho was validated before parametric row-Hessian fingerprinting",
+                    ),
                 );
             }
             let raw_beta_offset = p.log_alpha.len();

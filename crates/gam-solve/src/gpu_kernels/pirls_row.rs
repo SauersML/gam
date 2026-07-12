@@ -48,6 +48,7 @@
 use std::sync::OnceLock;
 
 use gam_gpu::gpu_error::GpuError;
+use gam_problem::EstimationError;
 #[cfg(target_os = "linux")]
 use gam_gpu::gpu_error::GpuResultExt;
 
@@ -176,13 +177,41 @@ impl CurvatureMode {
     }
 }
 
-/// Per-row diagnostic flag bits, OR-reduced into `status` on the host.
-pub mod status_flags {
-    pub const ETA_CLAMPED: u32 = 1 << 0;
-    pub const MU_FLOORED: u32 = 1 << 1;
-    pub const NONSMOOTH_BERNOULLI: u32 = 1 << 2;
-    pub const INVALID_RESPONSE: u32 = 1 << 3;
-    pub const ZERO_PRIOR_WEIGHT: u32 = 1 << 4;
+/// Device refusal codes.  Zero is the only success value; a non-zero code
+/// means that the row kernel wrote no numerical outputs for that row.  The
+/// host deterministically selects the smallest failing row and replays the
+/// CPU oracle to recover the full typed [`EstimationError`] (including the
+/// exact offending value).
+pub mod status_codes {
+    pub const OK: u32 = 0;
+    pub const ETA_DOMAIN: u32 = 1;
+    pub const PRIOR_WEIGHT: u32 = 2;
+    pub const RESPONSE: u32 = 3;
+    pub const GAMMA_SHAPE: u32 = 4;
+    pub const INVERSE_LINK: u32 = 5;
+    pub const FISHER_WEIGHT: u32 = 6;
+    pub const OBSERVED_WEIGHT: u32 = 7;
+    pub const GRADIENT: u32 = 8;
+    pub const WORKING_RESPONSE: u32 = 9;
+    pub const DEVIANCE: u32 = 10;
+    pub const FINAL_OUTPUT: u32 = 11;
+
+    pub const fn quantity(code: u32) -> &'static str {
+        match code {
+            ETA_DOMAIN => "inverse-link eta domain",
+            PRIOR_WEIGHT => "prior weight",
+            RESPONSE => "response",
+            GAMMA_SHAPE => "Gamma shape",
+            INVERSE_LINK => "inverse-link jet",
+            FISHER_WEIGHT => "Fisher weight",
+            OBSERVED_WEIGHT => "observed Hessian weight",
+            GRADIENT => "eta gradient",
+            WORKING_RESPONSE => "working response",
+            DEVIANCE => "deviance contribution",
+            FINAL_OUTPUT => "final row output",
+            _ => "unknown GPU PIRLS refusal",
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -218,27 +247,6 @@ pub struct RowOutput {
     pub status: u32,
 }
 
-const ETA_CLAMP: f64 = 700.0;
-const MU_FLOOR_POISSON: f64 = 1.0e-10;
-const MU_FLOOR_GAMMA: f64 = 1.0e-10;
-const MU_FLOOR_BERNOULLI: f64 = 1.0e-12;
-const W_SOLVER_FLOOR: f64 = 1.0e-12;
-/// Cap on `|y − μ|/V(μ)` used to derive the working response for noncanonical
-/// Bernoulli links; matches `bernoulli_exact_working_response` semantics — we
-/// only fall back to `z = η` when `dμ/dη` is non-finite or ≤ 0.
-const DMU_DETA_MIN: f64 = 0.0;
-
-#[inline]
-fn clamp_eta(eta: f64) -> (f64, bool) {
-    if eta > ETA_CLAMP {
-        (ETA_CLAMP, true)
-    } else if eta < -ETA_CLAMP {
-        (-ETA_CLAMP, true)
-    } else {
-        (eta, false)
-    }
-}
-
 /// Reference CPU evaluator for one row. `mode` selects `w_hessian` curvature.
 ///
 /// `gamma_shape` is the Gamma dispersion shape parameter (α > 0). It is only
@@ -249,14 +257,26 @@ pub fn row_reweight_cpu(
     mode: CurvatureMode,
     input: RowInput,
     gamma_shape: f64,
-) -> RowOutput {
+) -> Result<RowOutput, EstimationError> {
+    row_reweight_cpu_at(0, family, mode, input, gamma_shape)
+}
+
+/// Indexed form of [`row_reweight_cpu`], used to reproduce a device refusal
+/// with the correct row in its typed error.
+pub fn row_reweight_cpu_at(
+    row: usize,
+    family: PirlsRowFamily,
+    mode: CurvatureMode,
+    input: RowInput,
+    gamma_shape: f64,
+) -> Result<RowOutput, EstimationError> {
     match family {
-        PirlsRowFamily::GaussianIdentity => row_gaussian_identity(input, mode),
-        PirlsRowFamily::PoissonLog => row_poisson_log(input, mode),
-        PirlsRowFamily::GammaLog => row_gamma_log(input, mode, gamma_shape),
-        PirlsRowFamily::BernoulliLogit => row_bernoulli_logit(input, mode),
-        PirlsRowFamily::BernoulliProbit => row_bernoulli_probit(input, mode),
-        PirlsRowFamily::BernoulliCLogLog => row_bernoulli_cloglog(input, mode),
+        PirlsRowFamily::GaussianIdentity => row_gaussian_identity(row, input, mode),
+        PirlsRowFamily::PoissonLog => row_poisson_log(row, input, mode),
+        PirlsRowFamily::GammaLog => row_gamma_log(row, input, mode, gamma_shape),
+        PirlsRowFamily::BernoulliLogit => row_bernoulli_logit(row, input, mode),
+        PirlsRowFamily::BernoulliProbit => row_bernoulli_probit(row, input, mode),
+        PirlsRowFamily::BernoulliCLogLog => row_bernoulli_cloglog(row, input, mode),
     }
 }
 
@@ -274,358 +294,409 @@ fn select_w_hessian(mode: CurvatureMode, w_fisher: f64, observed_correction: f64
 }
 
 #[inline]
-fn row_gaussian_identity(input: RowInput, mode: CurvatureMode) -> RowOutput {
-    let w = input.prior_weight.max(0.0);
-    let mu = input.eta;
-    let resid = input.y - mu;
-    let dev = w * resid * resid;
-    let status = if input.prior_weight <= 0.0 {
-        status_flags::ZERO_PRIOR_WEIGHT
-    } else {
-        0
-    };
-    // Identity link: Var(Y) is constant in η, so observed == Fisher exactly.
-    let w_hessian = select_w_hessian(mode, w, 0.0);
-    RowOutput {
-        mu,
-        grad_eta: w * resid,
-        w_fisher: w,
-        w_hessian,
-        w_solver: if w_hessian > 0.0 {
-            w_hessian.max(W_SOLVER_FLOOR)
-        } else {
-            0.0
-        },
-        z_fisher: input.y,
-        z_hessian: input.y,
-        deviance: dev,
-        status,
+fn row_error(row: usize, quantity: &'static str, eta: f64, value: f64) -> EstimationError {
+    EstimationError::PirlsRowGeometryUnrepresentable {
+        row,
+        quantity,
+        eta,
+        value,
     }
 }
 
 #[inline]
-fn row_poisson_log(input: RowInput, mode: CurvatureMode) -> RowOutput {
-    let (eta_c, clamped) = clamp_eta(input.eta);
-    let mu_raw = eta_c.exp();
-    let mu_floored = mu_raw < MU_FLOOR_POISSON;
-    let mu = mu_raw.max(MU_FLOOR_POISSON);
-    let w_prior = input.prior_weight.max(0.0);
-    let raw_w = w_prior * mu;
-    let w_fisher = if raw_w > 0.0 {
-        raw_w.max(W_SOLVER_FLOOR)
+fn finite_eta(link: &'static str, eta: f64) -> Result<(), EstimationError> {
+    if eta.is_finite() {
+        Ok(())
     } else {
-        0.0
-    };
+        Err(EstimationError::InverseLinkDomainViolation {
+            link,
+            eta,
+            lower: -f64::MAX,
+            upper: f64::MAX,
+        })
+    }
+}
+
+#[inline]
+fn prior_weight(row: usize, input: RowInput) -> Result<f64, EstimationError> {
+    if input.prior_weight.is_finite() && input.prior_weight >= 0.0 {
+        Ok(input.prior_weight)
+    } else {
+        Err(row_error(
+            row,
+            "prior weight",
+            input.eta,
+            input.prior_weight,
+        ))
+    }
+}
+
+#[inline]
+fn certify_output(row: usize, eta: f64, output: RowOutput) -> Result<RowOutput, EstimationError> {
+    for (quantity, value) in [
+        ("mean", output.mu),
+        ("eta gradient", output.grad_eta),
+        ("Fisher weight", output.w_fisher),
+        ("observed Hessian weight", output.w_hessian),
+        ("solver Hessian weight", output.w_solver),
+        ("Fisher working response", output.z_fisher),
+        ("Hessian working response", output.z_hessian),
+        ("deviance contribution", output.deviance),
+    ] {
+        if !value.is_finite() {
+            return Err(row_error(row, quantity, eta, value));
+        }
+    }
+    Ok(output)
+}
+
+#[inline]
+fn row_gaussian_identity(
+    row: usize,
+    input: RowInput,
+    mode: CurvatureMode,
+) -> Result<RowOutput, EstimationError> {
+    finite_eta("standard identity inverse link", input.eta)?;
+    let w = prior_weight(row, input)?;
+    let mu = input.eta;
+    if w > 0.0 && !input.y.is_finite() {
+        return Err(row_error(row, "Gaussian response", input.eta, input.y));
+    }
     let resid = input.y - mu;
-    // Saturated Poisson deviance: 2 w [y log(y/μ) − (y − μ)], with y log y ≡ 0
-    // when y = 0. The branch matches the reference CPU implementation.
-    let dev_term = if input.y > 0.0 {
-        input.y * (input.y / mu).ln() - resid
+    let (grad_eta, z, dev) = if w == 0.0 {
+        (0.0, input.eta, 0.0)
     } else {
-        -resid
+        (w * resid, input.y, w * resid * resid)
+    };
+    let w_hessian = select_w_hessian(mode, w, 0.0);
+    certify_output(row, input.eta, RowOutput {
+        mu,
+        grad_eta,
+        w_fisher: w,
+        w_hessian,
+        w_solver: w_hessian,
+        z_fisher: z,
+        z_hessian: z,
+        deviance: dev,
+        status: status_codes::OK,
+    })
+}
+
+#[inline]
+fn row_poisson_log(
+    row: usize,
+    input: RowInput,
+    mode: CurvatureMode,
+) -> Result<RowOutput, EstimationError> {
+    let mu = crate::mixture_link::log_link_solver_exp(input.eta)?;
+    let w_prior = prior_weight(row, input)?;
+    if w_prior > 0.0 && !(input.y.is_finite() && input.y >= 0.0) {
+        return Err(row_error(row, "Poisson response", input.eta, input.y));
+    }
+    if w_prior == 0.0 {
+        return certify_output(row, input.eta, RowOutput {
+            mu,
+            z_fisher: input.eta,
+            z_hessian: input.eta,
+            status: status_codes::OK,
+            ..RowOutput::default()
+        });
+    }
+    let w_fisher = w_prior * mu;
+    if !(w_fisher.is_finite() && w_fisher > 0.0) {
+        return Err(row_error(row, "Poisson Fisher weight", input.eta, w_fisher));
+    }
+    let ratio_resid = input.y / mu - 1.0;
+    let z = input.eta + ratio_resid;
+    let grad_eta = w_prior * (input.y - mu);
+    let dev_term = if input.y > 0.0 {
+        input.y * (input.y.ln() - input.eta) - (input.y - mu)
+    } else {
+        mu
     };
     let dev = 2.0 * w_prior * dev_term;
-    let z = eta_c + resid / mu;
-    let mut status = 0u32;
-    if clamped {
-        status |= status_flags::ETA_CLAMPED;
-    }
-    if mu_floored {
-        status |= status_flags::MU_FLOORED;
-    }
-    if input.prior_weight <= 0.0 {
-        status |= status_flags::ZERO_PRIOR_WEIGHT;
-    }
-    if !(input.y.is_finite() && input.y >= 0.0) {
-        status |= status_flags::INVALID_RESPONSE;
-    }
-    // Canonical log link: observed == Fisher (∂²ℓ/∂η² is deterministic in η).
     let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
-    RowOutput {
+    certify_output(row, input.eta, RowOutput {
         mu,
-        grad_eta: w_prior * resid,
+        grad_eta,
         w_fisher,
         w_hessian,
         w_solver: w_hessian,
         z_fisher: z,
         z_hessian: z,
         deviance: dev,
-        status,
-    }
+        status: status_codes::OK,
+    })
 }
 
 #[inline]
-fn row_gamma_log(input: RowInput, mode: CurvatureMode, shape: f64) -> RowOutput {
-    let (eta_c, clamped) = clamp_eta(input.eta);
-    let mu_raw = eta_c.exp();
-    let mu_floored = mu_raw < MU_FLOOR_GAMMA;
-    let mu = mu_raw.max(MU_FLOOR_GAMMA);
-    let w_prior = input.prior_weight.max(0.0);
-    let w_fisher = w_prior * shape;
-    // Stage 5: observed-information weight for Gamma-log.
-    //   -∂²ℓ/∂η² = α · y/μ  (vs Fisher: α).
-    // Correction = w_F · (y/μ − 1). Falls back to Fisher when y == μ
-    // (e.g. saturated y) and when w_F == 0.
-    let obs_correction = if w_fisher > 0.0 && mu > 0.0 && input.y.is_finite() {
-        w_fisher * (input.y / mu - 1.0)
-    } else {
-        0.0
-    };
-    let w_hessian = select_w_hessian(mode, w_fisher, obs_correction);
-    let resid = input.y - mu;
-    // Saturated Gamma deviance: 2 w [−log(y/μ) + (y − μ)/μ].
-    let dev = if input.y > 0.0 {
-        2.0 * w_prior * (-((input.y / mu).ln()) + resid / mu)
-    } else {
-        // y == 0 has zero density under Gamma; carry as +inf deviance via the
-        // INVALID_RESPONSE flag rather than producing a finite spurious value.
-        f64::INFINITY
-    };
-    let z = eta_c + resid / mu;
-    let mut status = 0u32;
-    if clamped {
-        status |= status_flags::ETA_CLAMPED;
+fn row_gamma_log(
+    row: usize,
+    input: RowInput,
+    mode: CurvatureMode,
+    shape: f64,
+) -> Result<RowOutput, EstimationError> {
+    let mu = crate::mixture_link::log_link_solver_exp(input.eta)?;
+    if !(shape.is_finite() && shape > 0.0) {
+        return Err(row_error(row, "Gamma shape", input.eta, shape));
     }
-    if mu_floored {
-        status |= status_flags::MU_FLOORED;
+    let w_prior = prior_weight(row, input)?;
+    if w_prior > 0.0 && !(input.y.is_finite() && input.y > 0.0) {
+        return Err(row_error(row, "Gamma response", input.eta, input.y));
     }
-    if input.prior_weight <= 0.0 {
-        status |= status_flags::ZERO_PRIOR_WEIGHT;
-    }
-    if !(input.y.is_finite() && input.y > 0.0) {
-        status |= status_flags::INVALID_RESPONSE;
-    }
-    RowOutput {
-        mu,
-        grad_eta: w_prior * resid / mu,
-        w_fisher,
-        w_hessian,
-        w_solver: if w_hessian > 0.0 {
-            w_hessian.max(W_SOLVER_FLOOR)
-        } else {
-            0.0
-        },
-        z_fisher: z,
-        z_hessian: z,
-        deviance: dev,
-        status,
-    }
-}
-
-#[inline]
-fn row_bernoulli_logit(input: RowInput, mode: CurvatureMode) -> RowOutput {
-    let (eta_c, clamped) = clamp_eta(input.eta);
-    // Numerically stable σ(η): use tanh(η/2) form to avoid catastrophic
-    // cancellation for large |η|. μ = (1 + tanh(η/2)) / 2.
-    let half = 0.5 * eta_c;
-    let mu_raw = 0.5 * (1.0 + half.tanh());
-    let mu_low = mu_raw < MU_FLOOR_BERNOULLI;
-    let mu_high = mu_raw > 1.0 - MU_FLOOR_BERNOULLI;
-    let mu = mu_raw.clamp(MU_FLOOR_BERNOULLI, 1.0 - MU_FLOOR_BERNOULLI);
-    let w_prior = input.prior_weight.max(0.0);
-    let dmu_deta = mu * (1.0 - mu); // logit canonical: h'(η) = μ(1−μ)
-    let w_fisher = w_prior * dmu_deta; // V(μ) = μ(1−μ), h'(η)² / V = h'(η)
-    let resid = input.y - mu;
-    let grad_eta = w_prior * resid; // priorweight · (y − μ) for logit (canonical)
-    // Saturated Bernoulli deviance: 2 w [y log(y/μ) + (1−y) log((1−y)/(1−μ))].
-    let dev = bernoulli_deviance(input.y, mu, w_prior);
-    let z = bernoulli_z(eta_c, input.y, mu, dmu_deta);
-    let mut status = 0u32;
-    if clamped {
-        status |= status_flags::ETA_CLAMPED;
-    }
-    if mu_low || mu_high {
-        status |= status_flags::MU_FLOORED;
-    }
-    if input.prior_weight <= 0.0 {
-        status |= status_flags::ZERO_PRIOR_WEIGHT;
-    }
-    if !(input.y.is_finite() && (0.0..=1.0).contains(&input.y)) {
-        status |= status_flags::INVALID_RESPONSE;
-    }
-    let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
-    RowOutput {
-        mu,
-        grad_eta,
-        w_fisher,
-        w_hessian,
-        w_solver: if w_hessian > 0.0 {
-            w_hessian.max(W_SOLVER_FLOOR)
-        } else {
-            0.0
-        },
-        z_fisher: z,
-        z_hessian: z,
-        deviance: dev,
-        status,
-    }
-}
-
-#[inline]
-fn row_bernoulli_probit(input: RowInput, mode: CurvatureMode) -> RowOutput {
-    let (eta_c, clamped) = clamp_eta(input.eta);
-    let mu_raw = standard_normal_cdf(eta_c);
-    let mu_low = mu_raw < MU_FLOOR_BERNOULLI;
-    let mu_high = mu_raw > 1.0 - MU_FLOOR_BERNOULLI;
-    let mu = mu_raw.clamp(MU_FLOOR_BERNOULLI, 1.0 - MU_FLOOR_BERNOULLI);
-    let w_prior = input.prior_weight.max(0.0);
-    let dmu_deta = standard_normal_pdf(eta_c); // h'(η) = φ(η)
-    let v = mu * (1.0 - mu);
-    let fisher_per_prior = if v > 0.0 {
-        dmu_deta * dmu_deta / v
-    } else {
-        0.0
-    };
-    let w_fisher = w_prior * fisher_per_prior;
-    let resid = input.y - mu;
-    let grad_eta = if v > 0.0 {
-        w_prior * resid * dmu_deta / v
-    } else {
-        0.0
-    };
-    let dev = bernoulli_deviance(input.y, mu, w_prior);
-    let z = bernoulli_z(eta_c, input.y, mu, dmu_deta);
-    let mut status = 0u32;
-    if clamped {
-        status |= status_flags::ETA_CLAMPED;
-    }
-    if mu_low || mu_high {
-        status |= status_flags::MU_FLOORED;
-    }
-    if input.prior_weight <= 0.0 {
-        status |= status_flags::ZERO_PRIOR_WEIGHT;
-    }
-    if !(input.y.is_finite() && (0.0..=1.0).contains(&input.y)) {
-        status |= status_flags::INVALID_RESPONSE;
-    }
-    // Stage 5: observed-information correction for Bernoulli probit.
-    //   w_obs = w_F + w_p · (y − μ) · [h'/V − h²·V'/V²].
-    // h(η) = φ(η), h'(η) = −η · φ(η); V(μ) = μ(1−μ), V'(μ) = 1 − 2μ.
-    let obs_correction = if v > 0.0 && w_prior > 0.0 {
-        let h_prime = -eta_c * dmu_deta;
-        let v_prime = 1.0 - 2.0 * mu;
-        let bracket = h_prime / v - (dmu_deta * dmu_deta) * v_prime / (v * v);
-        w_prior * resid * bracket
-    } else {
-        0.0
-    };
-    let w_hessian_observed = select_w_hessian(mode, w_fisher, obs_correction);
-    RowOutput {
-        mu,
-        grad_eta,
-        w_fisher,
-        w_hessian: w_hessian_observed,
-        w_solver: {
-            let wh = w_hessian_observed;
-            if wh > 0.0 {
-                wh.max(W_SOLVER_FLOOR)
-            } else {
-                0.0
-            }
-        },
-        z_fisher: z,
-        z_hessian: z,
-        deviance: dev,
-        status,
-    }
-}
-
-#[inline]
-fn row_bernoulli_cloglog(input: RowInput, mode: CurvatureMode) -> RowOutput {
-    let (eta_c, clamped) = clamp_eta(input.eta);
-    // μ = 1 − exp(−exp(η)); numerically stable via expm1 to preserve precision
-    // in the deep negative tail (η ≲ -36) where `1 - exp(-exp(η))` would
-    // catastrophically cancel to 0.
-    let inner = eta_c.exp();
-    let mu_raw = -(-inner).exp_m1();
-    let mu_low = mu_raw < MU_FLOOR_BERNOULLI;
-    let mu_high = mu_raw > 1.0 - MU_FLOOR_BERNOULLI;
-    let mu = mu_raw.clamp(MU_FLOOR_BERNOULLI, 1.0 - MU_FLOOR_BERNOULLI);
-    // h'(η) = dμ/dη = exp(η − exp(η)) = inner · (1 − μ_raw).
-    // Use the unclamped form to avoid biasing the derivative on the saturated edge.
-    let dmu_deta = inner * (1.0 - mu_raw);
-    let w_prior = input.prior_weight.max(0.0);
-    let v = mu * (1.0 - mu);
-    let fisher_per_prior = if v > 0.0 {
-        dmu_deta * dmu_deta / v
-    } else {
-        0.0
-    };
-    let w_fisher = w_prior * fisher_per_prior;
-    let resid = input.y - mu;
-    let grad_eta = if v > 0.0 {
-        w_prior * resid * dmu_deta / v
-    } else {
-        0.0
-    };
-    let dev = bernoulli_deviance(input.y, mu, w_prior);
-    let z = bernoulli_z(eta_c, input.y, mu, dmu_deta);
-    let mut status = 0u32;
-    if clamped {
-        status |= status_flags::ETA_CLAMPED;
-    }
-    if mu_low || mu_high {
-        status |= status_flags::MU_FLOORED;
-    }
-    if input.prior_weight <= 0.0 {
-        status |= status_flags::ZERO_PRIOR_WEIGHT;
-    }
-    if !(input.y.is_finite() && (0.0..=1.0).contains(&input.y)) {
-        status |= status_flags::INVALID_RESPONSE;
-    }
-    // Stage 5: observed-information correction for Bernoulli cloglog.
-    //   w_obs = w_F + w_p · (y − μ) · [h'/V − h²·V'/V²].
-    // h(η) = inner · (1 − μ_raw); h'(η) = h(η) · (1 − inner).
-    // V(μ) = μ(1−μ), V'(μ) = 1 − 2μ.
-    let obs_correction = if v > 0.0 && w_prior > 0.0 {
-        let h_prime = dmu_deta * (1.0 - inner);
-        let v_prime = 1.0 - 2.0 * mu;
-        let bracket = h_prime / v - (dmu_deta * dmu_deta) * v_prime / (v * v);
-        w_prior * resid * bracket
-    } else {
-        0.0
-    };
-    let w_hessian = select_w_hessian(mode, w_fisher, obs_correction);
-    RowOutput {
-        mu,
-        grad_eta,
-        w_fisher,
-        w_hessian,
-        w_solver: if w_hessian > 0.0 {
-            w_hessian.max(W_SOLVER_FLOOR)
-        } else {
-            0.0
-        },
-        z_fisher: z,
-        z_hessian: z,
-        deviance: dev,
-        status,
-    }
-}
-
-#[inline]
-fn bernoulli_deviance(y: f64, mu: f64, w_prior: f64) -> f64 {
     if w_prior == 0.0 {
-        return 0.0;
+        return certify_output(row, input.eta, RowOutput {
+            mu,
+            z_fisher: input.eta,
+            z_hessian: input.eta,
+            status: status_codes::OK,
+            ..RowOutput::default()
+        });
     }
-    let t1 = if y > 0.0 { y * (y / mu).ln() } else { 0.0 };
-    let t2 = if y < 1.0 {
-        (1.0 - y) * ((1.0 - y) / (1.0 - mu)).ln()
-    } else {
-        0.0
+    let w_fisher = w_prior * shape;
+    if !(w_fisher.is_finite() && w_fisher > 0.0) {
+        return Err(row_error(row, "Gamma Fisher weight", input.eta, w_fisher));
+    }
+    let ratio = input.y / mu;
+    let ratio_resid = ratio - 1.0;
+    let w_hessian = match mode {
+        CurvatureMode::Fisher => w_fisher,
+        CurvatureMode::Observed => w_fisher * ratio,
     };
-    2.0 * w_prior * (t1 + t2)
+    if !w_hessian.is_finite() {
+        return Err(row_error(
+            row,
+            "Gamma observed Hessian weight",
+            input.eta,
+            w_hessian,
+        ));
+    }
+    let z = input.eta + ratio_resid;
+    let grad_eta = w_fisher * ratio_resid;
+    let dev = 2.0 * w_prior * shape * (ratio_resid - (input.y.ln() - input.eta));
+    certify_output(row, input.eta, RowOutput {
+        mu,
+        grad_eta,
+        w_fisher,
+        w_hessian,
+        w_solver: w_hessian,
+        z_fisher: z,
+        z_hessian: z,
+        deviance: dev,
+        status: status_codes::OK,
+    })
 }
 
 #[inline]
-fn bernoulli_z(eta_used: f64, y: f64, mu: f64, dmu_deta: f64) -> f64 {
-    if dmu_deta.is_finite() && dmu_deta > DMU_DETA_MIN {
-        let delta = (y - mu) / dmu_deta;
-        if delta.is_finite() {
-            return eta_used + delta;
-        }
+fn bernoulli_response(row: usize, input: RowInput, w: f64) -> Result<(), EstimationError> {
+    if w == 0.0 || (input.y.is_finite() && (0.0..=1.0).contains(&input.y)) {
+        Ok(())
+    } else {
+        Err(row_error(row, "binomial response", input.eta, input.y))
     }
-    eta_used
+}
+
+#[inline]
+fn row_bernoulli_logit(
+    row: usize,
+    input: RowInput,
+    mode: CurvatureMode,
+) -> Result<RowOutput, EstimationError> {
+    finite_eta("standard logit inverse link", input.eta)?;
+    let w_prior = prior_weight(row, input)?;
+    bernoulli_response(row, input, w_prior)?;
+    let tail = (-input.eta.abs()).exp();
+    let denom = 1.0 + tail;
+    let (mu, residual) = if input.eta >= 0.0 {
+        let one_minus_mu = tail / denom;
+        let residual = if input.y == 1.0 {
+            one_minus_mu
+        } else {
+            (input.y - 1.0) + one_minus_mu
+        };
+        (1.0 / denom, residual)
+    } else {
+        let mu = tail / denom;
+        (mu, input.y - mu)
+    };
+    let dmu_deta = tail / (denom * denom);
+    if !(dmu_deta.is_finite() && dmu_deta > 0.0) {
+        return Err(row_error(
+            row,
+            "canonical-logit inverse-link jet",
+            input.eta,
+            dmu_deta,
+        ));
+    }
+    if w_prior == 0.0 {
+        return certify_output(row, input.eta, RowOutput {
+            mu,
+            z_fisher: input.eta,
+            z_hessian: input.eta,
+            status: status_codes::OK,
+            ..RowOutput::default()
+        });
+    }
+    let w_fisher = w_prior * dmu_deta;
+    if !(w_fisher.is_finite() && w_fisher > 0.0) {
+        return Err(row_error(row, "logit Fisher weight", input.eta, w_fisher));
+    }
+    let grad_eta = w_prior * residual;
+    let z = input.eta + residual / dmu_deta;
+    let dev = bernoulli_logit_deviance(input.y, input.eta, w_prior);
+    let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
+    certify_output(row, input.eta, RowOutput {
+        mu,
+        grad_eta,
+        w_fisher,
+        w_hessian,
+        w_solver: w_hessian,
+        z_fisher: z,
+        z_hessian: z,
+        deviance: dev,
+        status: status_codes::OK,
+    })
+}
+
+#[inline]
+fn row_bernoulli_probit(
+    row: usize,
+    input: RowInput,
+    mode: CurvatureMode,
+) -> Result<RowOutput, EstimationError> {
+    finite_eta("standard probit inverse link", input.eta)?;
+    let d1 = standard_normal_pdf(input.eta);
+    row_bernoulli_noncanonical(
+        row,
+        input,
+        mode,
+        standard_normal_cdf(input.eta),
+        d1,
+        -input.eta * d1,
+        (input.eta * input.eta - 1.0) * d1,
+    )
+}
+
+#[inline]
+fn row_bernoulli_cloglog(
+    row: usize,
+    input: RowInput,
+    mode: CurvatureMode,
+) -> Result<RowOutput, EstimationError> {
+    finite_eta("standard complementary-log-log inverse link", input.eta)?;
+    let inner = input.eta.exp();
+    let mu = -(-inner).exp_m1();
+    let complement = (-inner).exp();
+    let d1 = inner * complement;
+    row_bernoulli_noncanonical(
+        row,
+        input,
+        mode,
+        mu,
+        d1,
+        d1 * (1.0 - inner),
+        d1 * (1.0 - 3.0 * inner + inner * inner),
+    )
+}
+
+#[inline]
+fn row_bernoulli_noncanonical(
+    row: usize,
+    input: RowInput,
+    mode: CurvatureMode,
+    mu: f64,
+    d1: f64,
+    d2: f64,
+    d3: f64,
+) -> Result<RowOutput, EstimationError> {
+    let w_prior = prior_weight(row, input)?;
+    bernoulli_response(row, input, w_prior)?;
+    if !(mu.is_finite()
+        && mu > 0.0
+        && mu < 1.0
+        && d1.is_finite()
+        && d1 > 0.0
+        && d2.is_finite()
+        && d3.is_finite())
+    {
+        return Err(row_error(row, "inverse-link jet", input.eta, mu));
+    }
+    if w_prior == 0.0 {
+        return certify_output(row, input.eta, RowOutput {
+            mu,
+            z_fisher: input.eta,
+            z_hessian: input.eta,
+            status: status_codes::OK,
+            ..RowOutput::default()
+        });
+    }
+    let v = mu * (1.0 - mu);
+    let fisher_per_prior = d1 * d1 / v;
+    let w_fisher = w_prior * fisher_per_prior;
+    if !(v.is_finite()
+        && v > 0.0
+        && fisher_per_prior.is_finite()
+        && fisher_per_prior > 0.0
+        && w_fisher.is_finite()
+        && w_fisher > 0.0)
+    {
+        return Err(row_error(row, "Bernoulli Fisher weight", input.eta, w_fisher));
+    }
+    let resid = input.y - mu;
+    let grad_eta = w_prior * resid * d1 / v;
+    let bracket = d2 / v - d1 * d1 * (1.0 - 2.0 * mu) / (v * v);
+    // -d²ℓ/dη² = W_F - prior·(y-μ)·d(h'/V)/dη.
+    let observed_correction = -w_prior * resid * bracket;
+    let w_hessian = select_w_hessian(mode, w_fisher, observed_correction);
+    if !w_hessian.is_finite() {
+        return Err(row_error(
+            row,
+            "Bernoulli observed Hessian weight",
+            input.eta,
+            w_hessian,
+        ));
+    }
+    let z = input.eta + resid / d1;
+    let dev = bernoulli_deviance(input.y, mu, w_prior);
+    certify_output(row, input.eta, RowOutput {
+        mu,
+        grad_eta,
+        w_fisher,
+        w_hessian,
+        w_solver: w_hessian,
+        z_fisher: z,
+        z_hessian: z,
+        deviance: dev,
+        status: status_codes::OK,
+    })
+}
+
+#[inline]
+fn xlogy(x: f64, y: f64) -> f64 {
+    if x == 0.0 { 0.0 } else { x * y.ln() }
+}
+
+#[inline]
+fn softplus(x: f64) -> f64 {
+    x.max(0.0) + (-x.abs()).exp().ln_1p()
+}
+
+#[inline]
+fn bernoulli_logit_deviance(y: f64, eta: f64, w: f64) -> f64 {
+    let log_mu = -softplus(-eta);
+    let log_one_minus_mu = -softplus(eta);
+    2.0 * w
+        * (xlogy(y, y) + xlogy(1.0 - y, 1.0 - y)
+            - y * log_mu
+            - (1.0 - y) * log_one_minus_mu)
+}
+
+#[inline]
+fn bernoulli_deviance(y: f64, mu: f64, w: f64) -> f64 {
+    2.0 * w
+        * (xlogy(y, y) + xlogy(1.0 - y, 1.0 - y)
+            - y * mu.ln()
+            - (1.0 - y) * (-mu).ln_1p())
 }
 
 /// Stable Φ(x) using the complementary error function with the same identity

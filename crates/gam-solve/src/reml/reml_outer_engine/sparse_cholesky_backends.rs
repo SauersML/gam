@@ -1448,7 +1448,8 @@ pub fn compute_block_penalty_logdet_derivs_with_prior_factors(
                 second: Array2::zeros((kb, kb)),
             });
         }
-        let lambdas: Vec<f64> = block_rho.iter().map(|&r| r.exp()).collect();
+        let lambdas = gam_problem::checked_exp_log_strengths(block_rho.iter().copied())
+            .map_err(|error| format!("penalty-logdet block {b}: {error}"))?;
         let mask = prior_factor_mask.map(|m| m[b].as_slice());
         let factor_indices: Vec<usize> = (0..kb)
             .filter(|&k| mask.is_some_and(|m| m.get(k).copied().unwrap_or(false)))

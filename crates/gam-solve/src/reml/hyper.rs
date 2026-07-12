@@ -719,6 +719,7 @@ impl<'a> RemlState<'a> {
     {
         let psi_dim = hyper_dirs.len();
         let k_count = rho.len();
+        let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())?;
 
         let s_tau_list: Vec<Array2<f64>> = penalty_components_per_dir
             .iter()
@@ -736,7 +737,7 @@ impl<'a> RemlState<'a> {
                         }
                         component
                             .matrix
-                            .scaled_add_to(&mut acc, rho[component.penalty_index].exp())?;
+                            .scaled_add_to(&mut acc, lambdas[component.penalty_index])?;
                         Ok(acc)
                     },
                 )
@@ -750,7 +751,7 @@ impl<'a> RemlState<'a> {
             for component in components {
                 let k = component.penalty_index;
                 if k < k_count {
-                    a_k_tau_j_mats[j][k] = Some(component.matrix.scaled_materialize(rho[k].exp()));
+                    a_k_tau_j_mats[j][k] = Some(component.matrix.scaled_materialize(lambdas[k]));
                     ds_k_dtau_j_mats[j][k] = Some(component.matrix.scaled_materialize(1.0));
                 }
             }
@@ -776,7 +777,7 @@ impl<'a> RemlState<'a> {
                         }
                         component
                             .matrix
-                            .scaled_add_to(&mut acc, rho[component.penalty_index].exp())?;
+                            .scaled_add_to(&mut acc, lambdas[component.penalty_index])?;
                         Ok(acc)
                     },
                 )?;
@@ -1321,6 +1322,8 @@ impl<'a> RemlState<'a> {
         for_hessian: bool,
     ) -> Result<Vec<super::reml_outer_engine::HyperCoord>, EstimationError> {
         let psi_dim = hyper_dirs.len();
+        let lambdas =
+            Array1::from_vec(gam_problem::checked_exp_log_strengths(rho.iter().copied())?);
 
         let pirls_result = bundle.pirls_result.as_ref();
         let reparam_result = &pirls_result.reparam_result;
@@ -1469,7 +1472,6 @@ impl<'a> RemlState<'a> {
             } else {
                 reparam_result.canonical_transformed.clone()
             };
-        let lambdas = rho.mapv(f64::exp);
         let penalty_logdet = super::penalty_logdet::PenaltyPseudologdet::from_penalties(
             &ct_eval,
             lambdas.as_slice().unwrap_or(&[]),
@@ -1598,7 +1600,7 @@ impl<'a> RemlState<'a> {
                     }
                     component
                         .matrix
-                        .scaled_add_to(&mut acc, rho[component.penalty_index].exp())?;
+                        .scaled_add_to(&mut acc, lambdas[component.penalty_index])?;
                     Ok(acc)
                 },
             )?;
@@ -2127,11 +2129,9 @@ impl<'a> RemlState<'a> {
         // the ρ-side criterion value/derivatives are projections of (#931):
         // one eigendecomposition per evaluation point, one ridge/threshold
         // convention for `log|Sλ|₊` across ρ and τ alike.
-        let pld = bundle.penalty_pseudologdet_original(
-            &self.canonical_penalties,
-            &rho.mapv(f64::exp).to_vec(),
-            p_dim,
-        )?;
+        let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())?;
+        let pld =
+            bundle.penalty_pseudologdet_original(&self.canonical_penalties, &lambdas, p_dim)?;
 
         // #1033b: conditioned-frame exact ψ-derivatives `(∂G/∂ψ, ∂b/∂ψ)`. In
         // the original basis `self.x()` IS the conditioned design (the same
@@ -2380,7 +2380,8 @@ impl<'a> RemlState<'a> {
         let pirls_result = bundle.pirls_result.as_ref();
         let beta_eval = self.sparse_exact_beta_original(pirls_result);
         let p_dim = beta_eval.len();
-        let lambdas = rho.mapv(f64::exp);
+        let lambdas =
+            Array1::from_vec(gam_problem::checked_exp_log_strengths(rho.iter().copied())?);
 
         if p_dim == 0 {
             let tau_tau_pair_fn =
@@ -2606,7 +2607,8 @@ impl<'a> RemlState<'a> {
                 gam_linalg::faer_ndarray::fast_atv(z, pirls_result.beta_transformed.as_ref());
         }
         let p_dim = beta_eval.len();
-        let lambdas = rho.mapv(f64::exp);
+        let lambdas =
+            Array1::from_vec(gam_problem::checked_exp_log_strengths(rho.iter().copied())?);
 
         let penalty_components_per_dir: Vec<Vec<PenaltyDerivativeComponent>> = hyper_dirs
             .iter()

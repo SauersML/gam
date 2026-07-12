@@ -68,9 +68,7 @@ impl From<IndexedLogStrengthDomainError> for crate::EstimationError {
 /// Validate a logarithmic strength without changing it.
 #[inline]
 pub fn validate_log_strength(log_strength: f64) -> Result<(), LogStrengthDomainError> {
-    if log_strength.is_finite()
-        && (LOG_STRENGTH_MIN..=LOG_STRENGTH_MAX).contains(&log_strength)
-    {
+    if log_strength.is_finite() && (LOG_STRENGTH_MIN..=LOG_STRENGTH_MAX).contains(&log_strength) {
         Ok(())
     } else {
         Err(LogStrengthDomainError {
@@ -111,9 +109,7 @@ pub fn checked_exp_log_strengths(
 /// value is exactly the one whose first and second `rho` derivatives are both
 /// `exp(rho)`.
 #[inline]
-pub fn checked_exp_log_strength(
-    log_strength: f64,
-) -> Result<f64, LogStrengthDomainError> {
+pub fn checked_exp_log_strength(log_strength: f64) -> Result<f64, LogStrengthDomainError> {
     validate_log_strength(log_strength)?;
     Ok(log_strength.exp())
 }

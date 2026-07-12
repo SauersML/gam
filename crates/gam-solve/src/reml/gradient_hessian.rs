@@ -462,7 +462,8 @@ impl<'a> RemlState<'a> {
         free_basis: Option<&Array2<f64>>,
     ) -> Result<(usize, super::reml_outer_engine::PenaltyLogdetDerivs), EstimationError> {
         let logdet_s_start = std::time::Instant::now();
-        let lambdas = rho.mapv(f64::exp);
+        let lambdas =
+            Array1::from_vec(gam_problem::checked_exp_log_strengths(rho.iter().copied())?);
         let ridge = ridge_passport.penalty_logdet_ridge();
 
         // Active-constraint projection consistency (#1380). When an active
@@ -2106,7 +2107,7 @@ impl<'a> RemlState<'a> {
                     rhs,
                 )?)
             };
-            let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+            let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())?;
             let beta = self.sparse_exact_beta_original(pirls_result);
             let firth_op = if reml_robust_jeffreys_link(&self.config).is_some() {
                 let jeffreys_link = self.runtime_inverse_link();
@@ -2261,7 +2262,7 @@ impl<'a> RemlState<'a> {
         } else {
             pirls_result.reparam_result.canonical_transformed.clone()
         };
-        let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+        let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())?;
         let beta = if use_original_basis {
             self.sparse_exact_beta_original(pirls_result)
         } else if let Some(z) = free_basis_opt.as_ref() {
@@ -2605,7 +2606,7 @@ impl<'a> RemlState<'a> {
         // `RemlState`, so the vectors are ρ- and mode-invariant (exact hoist,
         // identical values for every consumer).
         let penalty_scores = bundle.canonical_penalty_scores_at_mode(&self.canonical_penalties)?;
-        let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+        let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())?;
 
         // Dispersion φ used to turn deviance into log-likelihood.
         let phi = match reml_spec(&self.config.likelihood).response {
@@ -4458,7 +4459,7 @@ impl<'a> RemlState<'a> {
         self.arena
             .inner_pirls_solve_count
             .fetch_add(1, Ordering::Relaxed);
-        let decision = self.select_reml_geometry(rho);
+        let decision = self.select_reml_geometry(rho)?;
         match decision.geometry {
             RemlGeometry::SparseExactSpd => {
                 match self.prepare_sparse_eval_bundlewithkey(rho, key.clone()) {
@@ -6409,7 +6410,8 @@ impl<'a> RemlState<'a> {
             )
         })?;
 
-        let lambdas = rho.mapv(f64::exp);
+        let lambdas =
+            Array1::from_vec(gam_problem::checked_exp_log_strengths(rho.iter().copied())?);
         let mut s_lambda = Array2::<f64>::zeros((self.p, self.p));
         for (k, cp) in self.canonical_penalties.iter().enumerate() {
             if k < lambdas.len() && lambdas[k] != 0.0 {

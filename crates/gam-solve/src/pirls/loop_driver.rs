@@ -109,9 +109,7 @@ pub fn nfree_skip_row_element_touches() -> u64 {
     NFREE_SKIP_ROW_ELEMENT_TOUCHES.load(Ordering::Relaxed)
 }
 
-pub(crate) fn exact_lambdas_from_rho(
-    rho: LogSmoothingParamsView<'_>,
-) -> Array1<f64> {
+pub(crate) fn exact_lambdas_from_rho(rho: LogSmoothingParamsView<'_>) -> Array1<f64> {
     rho.exact_exp()
 }
 

@@ -181,23 +181,30 @@ impl LogLinkDiagonalIrlsFamily for PoissonLogFamily {
         if !m.is_finite() || m <= 0.0 {
             return Err(row_geometry_error(row, "Poisson mean exp(eta)", eta, m));
         }
-        // Drop log(y!) constant in objective.
-        let log_lik_increment = prior_w * yi.mul_add(eta, -m);
-        if !log_lik_increment.is_finite() {
-            return Err(row_geometry_error(
-                row,
-                "Poisson log-likelihood contribution",
-                eta,
-                log_lik_increment,
-            ));
-        }
-        let observed_weight = prior_w * m;
+        let observed_weight = scaled_positive_product_quotient(prior_w, 1.0, m, 1.0);
         if !observed_weight.is_finite() || observed_weight <= 0.0 {
             return Err(row_geometry_error(
                 row,
                 "Poisson observed information",
                 eta,
                 observed_weight,
+            ));
+        }
+        // Drop log(y!) constant. Form the weighted `y*eta` term with its
+        // exponent carried separately: `y*eta` may overflow even though the
+        // final prior-weighted contribution is representable.
+        let weighted_y_eta = if yi == 0.0 || eta == 0.0 {
+            0.0
+        } else {
+            scaled_positive_product_quotient(prior_w, yi, eta.abs(), 1.0).copysign(eta)
+        };
+        let log_lik_increment = weighted_y_eta - observed_weight;
+        if !log_lik_increment.is_finite() {
+            return Err(row_geometry_error(
+                row,
+                "Poisson log-likelihood contribution",
+                eta,
+                log_lik_increment,
             ));
         }
         let working_response = eta + (yi / m - 1.0);
@@ -353,8 +360,7 @@ impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
         let eta_term = if eta == 0.0 {
             0.0
         } else {
-            scaled_positive_product_quotient(prior_w, self.shape, eta.abs(), 1.0)
-                .copysign(eta)
+            scaled_positive_product_quotient(prior_w, self.shape, eta.abs(), 1.0).copysign(eta)
         };
         let log_lik_increment = -observed_weight - eta_term;
         if !log_lik_increment.is_finite() {
@@ -580,4 +586,45 @@ fn scaled_positive_product_quotient(a: f64, b: f64, c: f64, d: f64) -> f64 {
     let (mc, ec) = positive_frexp(c);
     let (md, ed) = positive_frexp(d);
     scale_normalized_power_of_two((ma * mb) * (mc / md), ea + eb + ec - ed)
+}
+
+#[cfg(test)]
+mod exact_domain_tests {
+    use super::*;
+
+    #[test]
+    fn scaled_product_quotient_avoids_false_intermediate_overflow_and_underflow() {
+        let got = scaled_positive_product_quotient(1.0e-300, 1.0, 1.0e308, 1.0);
+        assert!((got - 1.0e8).abs() <= 4.0 * f64::EPSILON * 1.0e8);
+        let got = scaled_positive_product_quotient(1.0e-300, 1.0e-200, 1.0e-300);
+        assert!((got - 1.0e-200).abs() <= 4.0 * f64::EPSILON * 1.0e-200);
+    }
+
+    #[test]
+    fn gamma_row_accepts_overflowing_raw_ratio_when_final_geometry_is_finite() {
+        let family = GammaLogFamily {
+            y: Array1::from_vec(vec![1.0e308]),
+            weights: Array1::from_vec(vec![1.0e-300]),
+            shape: 1.0,
+        };
+        let row = family
+            .row_kernel(0, 1.0e308, 0.0, 1.0e-300)
+            .expect("final Gamma geometry is representable");
+        assert!(row.log_lik_increment.is_finite());
+        assert!((row.observed_weight - 1.0e8).abs() <= 4.0 * f64::EPSILON * 1.0e8);
+        assert_eq!(row.working_response, 1.0);
+    }
+
+    #[test]
+    fn poisson_row_scales_y_eta_before_multiplication() {
+        let family = PoissonLogFamily {
+            y: Array1::from_vec(vec![1.0e308]),
+            weights: Array1::from_vec(vec![1.0e-300]),
+        };
+        let row = family
+            .row_kernel(0, 1.0e308, 2.0, 1.0e-300)
+            .expect("weighted Poisson objective is representable");
+        assert!(row.log_lik_increment.is_finite());
+        assert!(row.observed_weight.is_normal());
+    }
 }

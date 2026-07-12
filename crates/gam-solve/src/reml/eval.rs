@@ -254,7 +254,10 @@ pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
         Vec::with_capacity(sigma_points.len());
 
     for rho in sigma_points {
-        let lambdas = rho.mapv(f64::exp);
+        let lambdas = Array1::from_vec(
+            gam_problem::checked_exp_log_strengths(rho.iter().copied())
+                .map_err(|error| gam_gpu::gpu_err!("sigma rho: {error}"))?,
+        );
         let lambdas_slice = lambdas
             .as_slice_memory_order()
             .ok_or_else(|| gam_gpu::gpu_err!("sigma rho lambdas not contiguous"))?;
@@ -642,6 +645,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn compute_smoothing_correction_auto(
         &self,
         final_rho: &Array1<f64>,
+        final_lambdas: &Array1<f64>,
         final_fit: &PirlsResult,
         base_covariance: Option<&Array2<f64>>,
         dispersion_phi: f64,
@@ -650,7 +654,8 @@ impl<'a> RemlState<'a> {
         use SmoothingCorrectionFallbackSeverity::{NumericalFailure, Routine};
 
         // Always compute the fast first-order correction first.
-        let first_order = super::compute_smoothing_correction(self, final_rho, final_fit);
+        let first_order =
+            super::compute_smoothing_correction(self, final_rho, final_lambdas, final_fit);
         let first_order_correction = first_order.correction.clone();
         let first_order_rho_covariance = first_order.rho_covariance.clone();
         let first_order_routine = |correction: Option<Array2<f64>>, reason: &'static str| {
@@ -2397,8 +2402,13 @@ mod smoothing_correction_outcome_tests {
                 .unwrap_or(0.0);
 
             let before = SMOOTHING_CORRECTION_CUBATURE_COUNT.load(Ordering::SeqCst);
+            let final_lambdas = Array1::from_vec(
+                gam_problem::checked_exp_log_strengths(final_rho.iter().copied())
+                    .expect("test rho lies in exact strength domain"),
+            );
             let outcome = state.compute_smoothing_correction_auto(
                 &final_rho,
+                &final_lambdas,
                 final_fit.as_ref(),
                 Some(&base_cov),
                 dispersion_phi,

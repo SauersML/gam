@@ -1429,7 +1429,8 @@ impl<'a> RemlState<'a> {
 
         let nullspace_dim = p_dim.saturating_sub(sparse.penalty_rank) as f64;
         let det2 = if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
-            let lambdas = rho.mapv(f64::exp);
+            let lambdas =
+                Array1::from_vec(gam_problem::checked_exp_log_strengths(rho.iter().copied())?);
             let (_, det2) =
                 self.structural_penalty_logdet_derivatives_block_local(&lambdas, bundle)?;
             Some(det2)
@@ -2052,7 +2053,8 @@ impl<'a> RemlState<'a> {
                 &inner_solution,
                 rho.as_slice().unwrap(),
                 gradient.as_slice().unwrap(),
-            )?;
+            )
+            .map_err(EstimationError::InvalidInput)?;
             let psi_gradient = if hybrid.psi_indices.is_empty() {
                 None
             } else {
@@ -2078,7 +2080,8 @@ impl<'a> RemlState<'a> {
                 &inner_solution,
                 rho.as_slice().unwrap(),
                 gradient.as_slice().unwrap(),
-            )?;
+            )
+            .map_err(EstimationError::InvalidInput)?;
             gam_problem::EfsEval {
                 cost: cost_result.cost,
                 steps,

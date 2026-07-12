@@ -982,7 +982,8 @@ pub(crate) fn try_tangent_projected_evaluate(
     let h_t = z.t().dot(&h_full).dot(&z);
     let h_t_op = DenseSpectralOperator::from_symmetric(&h_t)
         .map_err(|e| format!("tangent H eigendecomposition failed: {e}"))?;
-    let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+    let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())
+        .map_err(|error| format!("tangent-projected rho: {error}"))?;
     let projected_logdet = tangent_penalty_logdet(&z, &solution.penalty_coords, &lambdas, p)?;
     // Project the KKT residual to lift the IFT correction into tangent
     // coordinates: with `q = H⁺_T r = Z (ZᵀHZ)⁻¹ Zᵀ r`, the formulas
