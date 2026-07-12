@@ -3,7 +3,6 @@
 //! first-/second-order sigma joint-psi terms and their directional Hessian.
 
 use super::*;
-use gam_math::nested_dual::JetField;
 
 impl SurvivalMarginalSlopeFamily {
     /// Outer-aware variant of `log_likelihood_only`. When

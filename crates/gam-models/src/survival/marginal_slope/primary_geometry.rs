@@ -445,18 +445,6 @@ pub(crate) struct TimewiggleMarginalPsiRowLift {
     pub(crate) psi_row: Array1<f64>,
 }
 
-/// Returns a reference to the static zero direction in primary space
-/// (an `Array1::zeros(N_PRIMARY)`). Used by sigma-jet contractions to
-/// avoid the per-call `Array1::zeros(primary_dim)` allocation storm in
-/// `row_sigma_primary_terms`, which previously allocated 2-4 fresh zero
-/// slots per kernel invocation and ~30 zero slots per row.
-#[inline]
-pub(crate) fn zero_primary_direction_ref() -> &'static Array1<f64> {
-    use std::sync::OnceLock;
-    static ZERO: OnceLock<Array1<f64>> = OnceLock::new();
-    ZERO.get_or_init(|| Array1::<f64>::zeros(N_PRIMARY))
-}
-
 pub(crate) fn spatial_block_primary_loading(block_idx: usize) -> Result<Array1<f64>, String> {
     match block_idx {
         1 => Ok(Array1::from_vec(vec![1.0, 1.0, 0.0, 0.0])),

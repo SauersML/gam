@@ -56,20 +56,20 @@ pub(crate) use crate::bms::{
 
 pub(crate) use crate::cubic_cell_kernel as exact_kernel;
 
+#[cfg(test)]
 pub(crate) use gam_math::jet_partitions::MultiDirJet;
 
 pub(crate) use crate::survival::lognormal_kernel::FrailtySpec;
 
 pub(crate) use crate::marginal_slope_shared::{
-    DirectionalScaleJets, ObservedDenestedCellPartials, add_optional_matrix, add_optional_vector,
+    ObservedDenestedCellPartials, add_optional_matrix, add_optional_vector,
     add_two_surface_psi_outer, build_denested_partition_cells as shared_denested_partition_cells,
-    chunked_row_reduction, directional_obj_grad_hess, eval_coeff4_at,
-    first_parameter_directional_order2_terms, first_parameter_order2_terms,
+    chunked_row_reduction, eval_coeff4_at, first_parameter_directional_order2_terms,
+    first_parameter_order2_terms,
     is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
     outer_row_weights_by_index, outer_weighted_rows, parameter_block_specs_match_rows,
-    probit_frailty_scale, probit_frailty_scale_multi_dir_jet, psi_derivative_location,
-    scale_coeff4, second_parameter_order2_terms,
+    probit_frailty_scale, psi_derivative_location, scale_coeff4, second_parameter_order2_terms,
 };
 
 pub(crate) use crate::parameter_block::ParameterBlockInput;
