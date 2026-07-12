@@ -230,13 +230,6 @@ pub(crate) struct SurvivalDynamicQScalars {
     pub(crate) qdot_ls: f64,
     pub(crate) qdot_td: f64,
     pub(crate) qdot_lsd: f64,
-    pub(crate) qdot_tt: f64,
-    pub(crate) qdot_tls: f64,
-    pub(crate) qdot_ttd: f64,
-    pub(crate) qdot_tlsd: f64,
-    pub(crate) qdot_ll: f64,
-    pub(crate) qdot_lstd: f64,
-    pub(crate) qdot_llsd: f64,
 }
 
 #[derive(Clone)]
@@ -446,7 +439,6 @@ pub(crate) fn compose_survival_dynamic_q(
     let r = survival_q0dot_from_base(base, eta_t_deriv, eta_ls_deriv);
     let r_t = safe_product(c, eta_ls_deriv);
     let r_ls = safe_sum2(safe_product(c, eta_t_deriv), safe_product(d, eta_ls_deriv));
-    let r_ll = safe_sum2(safe_product(e, eta_t_deriv), safe_product(f, eta_ls_deriv));
     let q_t = safe_product(m1, a);
     let q_ls = safe_product(m1, b);
     let q_tl = safe_sum2(safe_product(m2, safe_product(a, b)), safe_product(m1, c));
@@ -475,34 +467,6 @@ pub(crate) fn compose_survival_dynamic_q(
         qdot_ls: safe_sum2(safe_product(m2, safe_product(b, r)), safe_product(m1, r_ls)),
         qdot_td: q_t,
         qdot_lsd: q_ls,
-        qdot_tt: safe_sum2(
-            safe_product(m3, safe_product(safe_product(a, a), r)),
-            2.0 * safe_product(m2, safe_product(a, r_t)),
-        ),
-        qdot_tls: safe_sum3(
-            safe_product(m3, safe_product(safe_product(a, b), r)),
-            safe_product(
-                m2,
-                safe_sum3(
-                    safe_product(c, r),
-                    safe_product(a, r_ls),
-                    safe_product(b, r_t),
-                ),
-            ),
-            safe_product(m1, safe_product(e, eta_ls_deriv)),
-        ),
-        qdot_ttd: safe_product(m2, safe_product(a, a)),
-        qdot_tlsd: safe_sum2(safe_product(m2, safe_product(a, b)), safe_product(m1, c)),
-        qdot_ll: safe_sum3(
-            safe_product(m3, safe_product(safe_product(b, b), r)),
-            safe_product(
-                m2,
-                safe_sum2(safe_product(d, r), 2.0 * safe_product(b, r_ls)),
-            ),
-            safe_product(m1, r_ll),
-        ),
-        qdot_lstd: safe_sum2(safe_product(m2, safe_product(a, b)), safe_product(m1, c)),
-        qdot_llsd: safe_sum2(safe_product(m2, safe_product(b, b)), safe_product(m1, d)),
     }
 }
 

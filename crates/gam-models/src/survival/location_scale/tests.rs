@@ -2553,54 +2553,6 @@ fn sparse_survival_exact_newton_test_family() -> SurvivalLocationScaleFamily {
     family
 }
 
-#[test]
-fn compose_survival_dynamic_q_uses_correct_qdot_ll_coefficient() {
-    let base = survival_base_q_scalars(0.8, -0.35);
-    let eta_t_deriv = 1.4;
-    let eta_ls_deriv = -0.6;
-    let wiggle_value = 0.2;
-    let dq_dq0 = 1.1;
-    let d2q_dq02 = -0.7;
-    let d3q_dq03 = 0.45;
-
-    let dyn_q = compose_survival_dynamic_q(
-        base,
-        eta_t_deriv,
-        eta_ls_deriv,
-        wiggle_value,
-        dq_dq0,
-        d2q_dq02,
-        d3q_dq03,
-    );
-
-    let a = base.q_t;
-    let b = base.q_ls;
-    let d = base.q_ll;
-    let e = base.q_tl_ls;
-    let f = base.q_ll_ls;
-    let r = safe_sum2(safe_product(a, eta_t_deriv), safe_product(b, eta_ls_deriv));
-    let r_ls = safe_sum2(
-        safe_product(base.q_tl, eta_t_deriv),
-        safe_product(d, eta_ls_deriv),
-    );
-    let r_ll = safe_sum2(safe_product(e, eta_t_deriv), safe_product(f, eta_ls_deriv));
-    let expected = safe_sum3(
-        safe_product(d3q_dq03, safe_product(safe_product(b, b), r)),
-        safe_product(
-            d2q_dq02,
-            safe_sum2(safe_product(d, r), 2.0 * safe_product(b, r_ls)),
-        ),
-        safe_product(dq_dq0, r_ll),
-    );
-
-    assert!(
-        (dyn_q.qdot_ll - expected).abs() <= 1e-12,
-        "qdot_ll mismatch: got {}, expected {}",
-        dyn_q.qdot_ll,
-        expected
-    );
-}
-
 fn survival_exact_newton_threshold_states(beta_threshold: f64) -> Vec<ParameterBlockState> {
     vec![
         ParameterBlockState {
