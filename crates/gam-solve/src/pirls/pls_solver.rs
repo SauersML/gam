@@ -16,7 +16,10 @@ use super::{
     calculate_edfwithworkspace_from_factor, ensure_sparse_positive_definitewithridge,
     solve_sparse_spd,
 };
-use super::{calculate_loglikelihood, computeworkingweight_derivatives_from_eta};
+use super::{
+    calculate_loglikelihood_omitting_constants_from_eta,
+    computeworkingweight_derivatives_from_eta,
+};
 use crate::estimate::EstimationError;
 use faer::sparse::SparseColMat;
 use gam_linalg::faer_ndarray::{FaerLinalgError, array1_to_col_matmut};
@@ -98,7 +101,13 @@ impl GaussianFrozenRows {
                 &eta_owned,
                 weights,
             )?;
-        let log_likelihood = calculate_loglikelihood(y, &eta_owned, likelihood, weights);
+        let log_likelihood = calculate_loglikelihood_omitting_constants_from_eta(
+            y,
+            &eta_owned,
+            likelihood,
+            inverse_link,
+            weights,
+        )?;
         let max_abs_eta = inf_norm(eta_owned.iter().copied());
         Ok(Self {
             eta: eta_owned.into_shared(),

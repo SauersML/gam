@@ -40,7 +40,7 @@ use super::{
     // edf helpers
     calculate_edf_with_penalty,
     calculate_edfwithworkspace_with_penalty,
-    calculate_loglikelihood,
+    calculate_loglikelihood_omitting_constants_from_eta,
     compute_constraint_kkt_diagnostics,
     computeworkingweight_derivatives_from_eta,
     inf_norm,
@@ -1302,7 +1302,13 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                         &final_eta,
                         priorweights_owned.view(),
                     )?;
-                let log_likelihood = calculate_loglikelihood(y, &finalmu, likelihood, priorweights);
+                let log_likelihood = calculate_loglikelihood_omitting_constants_from_eta(
+                    y,
+                    &final_eta,
+                    likelihood,
+                    &config.link_kind,
+                    priorweights,
+                )?;
                 let max_abs_eta = inf_norm(finalmu.iter().copied());
                 ZeroIterRows {
                     final_offset: offset.to_owned().into_shared(),
@@ -1348,7 +1354,13 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 &config.link_kind,
                 priorweights,
             )?;
-            let log_likelihood = calculate_loglikelihood(y, &finalmu, likelihood, priorweights);
+            let log_likelihood = calculate_loglikelihood_omitting_constants_from_eta(
+                y,
+                &final_eta,
+                likelihood,
+                &config.link_kind,
+                priorweights,
+            )?;
             let max_abs_eta = inf_norm(finalmu.iter().copied());
             let (c, d, dmu_deta, d2mu_deta2, d3mu_deta3) =
                 computeworkingweight_derivatives_from_eta(

@@ -180,7 +180,7 @@ pub(crate) fn fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
 /// REML sees a non-finite cost for every seed (issue #2128). Scaling the
 /// gain-ratio objective's deviance by `k` realigns it with the step, the
 /// gradient certificate, and the outer objective (which already carries the same
-/// `k`; see `pointwise_loglikelihood_omitting_constants`).
+/// `k`; see `calculate_loglikelihood_omitting_constants_from_eta`).
 ///
 ///  * Gamma:  weight `prior·shape` ⇒ `k = shape` (`= 1/φ`).
 ///  * Tweedie: weight `prior·μ^{2−p}/φ` ⇒ `k = 1/φ` (the μ-power is already in

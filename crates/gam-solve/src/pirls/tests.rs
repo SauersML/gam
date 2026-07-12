@@ -15,7 +15,7 @@ mod tests {
         DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily,
         WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet,
-        calculate_deviance_from_eta, calculate_loglikelihood,
+        calculate_deviance_from_eta, evaluate_full_log_likelihood_from_eta,
         calculate_loglikelihood_omitting_constants_from_eta, calculate_null_deviance,
         compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays,
         deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale,
@@ -2469,8 +2469,14 @@ mod tests {
         .expect("external Poisson fit should converge");
 
         let eta = x.dot(&result.beta) + &offset;
-        let mu = eta.mapv(f64::exp);
-        let full = calculate_loglikelihood(y.view(), &mu, &likelihood, w.view());
+        let full = evaluate_full_log_likelihood_from_eta(
+            y.view(),
+            eta.view(),
+            &likelihood,
+            w.view(),
+        )
+        .expect("full eta log-likelihood")
+        .total();
         let omit = calculate_loglikelihood_omitting_constants_from_eta(
             y.view(),
             &eta,
@@ -4576,7 +4582,7 @@ mod root_cause_tests {
 }
 
 /// Regression tests for the fully-normalized, scale-aware **reporting**
-/// log-likelihood kernels (`pointwise_loglikelihood` / `calculate_loglikelihood`)
+/// eta-space log-likelihood evaluation
 /// that back the user-facing AIC and PSIS-LOO elpd. These are distinct from the
 /// REML building-block `*_omitting_constants` kernels, which deliberately drop
 /// family/saturated normalizers. Root causes: #1581 (Poisson `−ln Γ(y+1)`),
@@ -4584,8 +4590,8 @@ mod root_cause_tests {
 #[cfg(test)]
 mod reporting_loglikelihood_tests {
     use super::super::{
-        calculate_loglikelihood, calculate_loglikelihood_omitting_constants_from_eta,
-        pointwise_loglikelihood, pointwise_loglikelihood_omitting_constants,
+        calculate_loglikelihood_omitting_constants_from_eta,
+        evaluate_full_log_likelihood_from_eta,
     };
     use gam_problem::{
         GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily,
@@ -4598,6 +4604,32 @@ mod reporting_loglikelihood_tests {
         GlmLikelihoodSpec::canonical(LikelihoodSpec::new(family, InverseLink::Standard(link)))
     }
 
+    fn eta_fixture(mu: &Array1<f64>, link: StandardLink) -> Array1<f64> {
+        match link {
+            StandardLink::Identity => mu.clone(),
+            StandardLink::Log => mu.mapv(f64::ln),
+            StandardLink::Logit => mu.mapv(|value| value.ln() - (-value).ln_1p()),
+            other => panic!("reporting test fixture does not implement {other:?}"),
+        }
+    }
+
+    fn full_at_fixture(
+        y: &Array1<f64>,
+        mu: &Array1<f64>,
+        likelihood: &GlmLikelihoodSpec,
+        weights: &Array1<f64>,
+        link: StandardLink,
+    ) -> super::super::FullLogLikelihoodEvaluation {
+        let eta = eta_fixture(mu, link);
+        evaluate_full_log_likelihood_from_eta(
+            y.view(),
+            eta.view(),
+            likelihood,
+            weights.view(),
+        )
+        .expect("full eta likelihood fixture")
+    }
+
     // ---- #1581: Poisson reporting log-likelihood is a true (negative) log-mass.
     #[test]
     fn poisson_full_loglik_is_log_mass_and_carries_count_normalizer() {
@@ -4606,7 +4638,8 @@ mod reporting_loglikelihood_tests {
         let w = Array1::<f64>::ones(y.len());
         let glm = canonical(ResponseFamily::Poisson, StandardLink::Log);
 
-        let pw = pointwise_loglikelihood(y.view(), &mu, &glm, w.view());
+        let evaluation = full_at_fixture(&y, &mu, &glm, &w, StandardLink::Log);
+        let pw = evaluation.pointwise();
         // Every Poisson pointwise value is a log probability mass ≤ 0.
         for (i, &v) in pw.iter().enumerate() {
             assert!(v <= 0.0, "row {i}: Poisson log-mass must be ≤ 0, got {v}");
@@ -4620,7 +4653,7 @@ mod reporting_loglikelihood_tests {
                 log_term - mui - ln_gamma(yi + 1.0)
             })
             .sum();
-        let total = calculate_loglikelihood(y.view(), &mu, &glm, w.view());
+        let total = evaluation.total();
         assert!((total - analytic).abs() < 1e-10, "{total} vs {analytic}");
         assert!(
             total < 0.0,
@@ -4665,8 +4698,8 @@ mod reporting_loglikelihood_tests {
             StandardLink::Log,
         );
 
-        let ll_pois = calculate_loglikelihood(y.view(), &mu, &poisson, w.view());
-        let ll_nb = calculate_loglikelihood(y.view(), &mu, &negbin, w.view());
+        let ll_pois = full_at_fixture(&y, &mu, &poisson, &w, StandardLink::Log).total();
+        let ll_nb = full_at_fixture(&y, &mu, &negbin, &w, StandardLink::Log).total();
 
         // Both are proper negative log-masses.
         assert!(ll_pois < 0.0 && ll_nb < 0.0, "{ll_pois}, {ll_nb}");
@@ -4697,7 +4730,7 @@ mod reporting_loglikelihood_tests {
             scale: LikelihoodScaleMetadata::FixedDispersion { phi: s2 },
         };
 
-        let ll = calculate_loglikelihood(y.view(), &mu, &glm(sigma2), w.view());
+        let ll = full_at_fixture(&y, &mu, &glm(sigma2), &w, StandardLink::Identity).total();
         // Analytic profiled-Gaussian value −½ Σ[ln(2πσ²) + resid²/σ²].
         let analytic: f64 = y
             .iter()
@@ -4713,7 +4746,14 @@ mod reporting_loglikelihood_tests {
         for &c in &[0.5_f64, 2.0, 10.0] {
             let yc = y.mapv(|v| c * v);
             let muc = mu.mapv(|v| c * v);
-            let llc = calculate_loglikelihood(yc.view(), &muc, &glm(c * c * sigma2), w.view());
+            let llc = full_at_fixture(
+                &yc,
+                &muc,
+                &glm(c * c * sigma2),
+                &w,
+                StandardLink::Identity,
+            )
+            .total();
             let shift = llc - ll;
             assert!(
                 (shift - (-n * c.ln())).abs() < 1e-9,
@@ -4723,8 +4763,8 @@ mod reporting_loglikelihood_tests {
         }
     }
 
-    // A profiled Gaussian whose scale was never concretized must yield NaN, not a
-    // silent unit-variance density — the guard against the #1583 regression.
+    // A profiled Gaussian whose scale was never concretized is rejected, not
+    // silently interpreted as a unit-variance density.
     #[test]
     fn gaussian_full_loglik_requires_concrete_scale() {
         let y = array![1.0, 2.0, 3.0];
@@ -4732,11 +4772,10 @@ mod reporting_loglikelihood_tests {
         let w = Array1::<f64>::ones(y.len());
         let glm = canonical(ResponseFamily::Gaussian, StandardLink::Identity);
         // canonical Gaussian ⇒ ProfiledGaussian ⇒ fixed_phi() == None.
-        let ll = calculate_loglikelihood(y.view(), &mu, &glm, w.view());
-        assert!(
-            ll.is_nan(),
-            "profiled Gaussian without a concrete σ̂² must be NaN, got {ll}"
-        );
+        let eta = eta_fixture(&mu, StandardLink::Identity);
+        let error = evaluate_full_log_likelihood_from_eta(y.view(), eta.view(), &glm, w.view())
+            .expect_err("unresolved profiled Gaussian scale must fail");
+        assert!(error.to_string().contains("explicit positive dispersion"));
     }
 
     // Gaussian prior weights act as inverse-variance scaling (Var = φ/wᵢ): the
@@ -4754,7 +4793,8 @@ mod reporting_loglikelihood_tests {
             ),
             scale: LikelihoodScaleMetadata::FixedDispersion { phi: sigma2 },
         };
-        let pw = pointwise_loglikelihood(y.view(), &mu, &glm, w.view());
+        let evaluation = full_at_fixture(&y, &mu, &glm, &w, StandardLink::Identity);
+        let pw = evaluation.pointwise();
         for i in 0..2 {
             let r = y[i] - mu[i];
             let expect = -0.5
@@ -4776,7 +4816,8 @@ mod reporting_loglikelihood_tests {
         let mu = array![0.1, 0.3, 0.55, 0.9];
         let w = array![3.0, 4.0, 6.0, 2.0];
         let glm = canonical(ResponseFamily::Binomial, StandardLink::Logit);
-        let pw = pointwise_loglikelihood(y.view(), &mu, &glm, w.view());
+        let evaluation = full_at_fixture(&y, &mu, &glm, &w, StandardLink::Logit);
+        let pw = evaluation.pointwise();
         for (i, &v) in pw.iter().enumerate() {
             assert!(
                 v <= 1e-12,
@@ -4794,20 +4835,29 @@ mod reporting_loglikelihood_tests {
         let yb = array![0.0, 1.0, 1.0, 0.0];
         let mub = array![0.2, 0.8, 0.6, 0.4];
         let wb = Array1::<f64>::ones(4);
-        let full = pointwise_loglikelihood(yb.view(), &mub, &glm, wb.view());
-        let omit = pointwise_loglikelihood_omitting_constants(yb.view(), &mub, &glm, wb.view());
+        let full = full_at_fixture(&yb, &mub, &glm, &wb, StandardLink::Logit);
+        let eta = eta_fixture(&mub, StandardLink::Logit);
+        let omit = calculate_loglikelihood_omitting_constants_from_eta(
+            yb.view(),
+            &eta,
+            &glm,
+            &glm.spec.link,
+            wb.view(),
+        )
+        .expect("Bernoulli omitted likelihood");
         for i in 0..4 {
+            let analytic = yb[i] * mub[i].ln() + (1.0 - yb[i]) * (1.0 - mub[i]).ln();
             assert!(
-                (full[i] - omit[i]).abs() < 1e-12,
-                "row {i}: {} vs {}",
-                full[i],
-                omit[i]
+                (full.pointwise()[i] - analytic).abs() < 1e-12,
+                "row {i}: {} vs {analytic}",
+                full.pointwise()[i],
             );
         }
+        assert!((full.total() - omit).abs() < 1e-12);
     }
 
     // Gamma reporting log-likelihood equals the analytic Gamma density (shape
-    // ν = 1/φ, mean μ), summed by calculate_loglikelihood.
+    // ν = 1/φ, mean μ), evaluated on the eta surface.
     #[test]
     fn gamma_full_loglik_matches_density() {
         let y = array![1.8, 0.7, 3.2];
@@ -4816,7 +4866,8 @@ mod reporting_loglikelihood_tests {
         // canonical Gamma ⇒ shape 1 ⇒ ν = 1.
         let glm = canonical(ResponseFamily::Gamma, StandardLink::Log);
         let nu = 1.0_f64;
-        let pw = pointwise_loglikelihood(y.view(), &mu, &glm, w.view());
+        let evaluation = full_at_fixture(&y, &mu, &glm, &w, StandardLink::Log);
+        let pw = evaluation.pointwise();
         for i in 0..3 {
             let a = w[i] * nu;
             let expect =
@@ -4827,7 +4878,7 @@ mod reporting_loglikelihood_tests {
                 pw[i]
             );
         }
-        let total = calculate_loglikelihood(y.view(), &mu, &glm, w.view());
+        let total = evaluation.total();
         assert!((total - pw.sum()).abs() < 1e-12);
     }
 
@@ -4863,7 +4914,13 @@ mod reporting_loglikelihood_tests {
             } else {
                 (y.clone(), mu.clone())
             };
-            let pw = pointwise_loglikelihood(yy.view(), &mm, &glm, w.view());
+            let link = match glm.spec.response {
+                ResponseFamily::Gaussian => StandardLink::Identity,
+                ResponseFamily::Binomial => StandardLink::Logit,
+                _ => StandardLink::Log,
+            };
+            let evaluation = full_at_fixture(&yy, &mm, &glm, &w, link);
+            let pw = evaluation.pointwise();
             for &v in pw.iter() {
                 assert_eq!(
                     v, 0.0,
@@ -4874,15 +4931,16 @@ mod reporting_loglikelihood_tests {
         }
     }
 
-    // calculate_loglikelihood is exactly the sum of the pointwise kernel.
+    // The certified total shares the pointwise kernel.
     #[test]
     fn scalar_equals_sum_of_pointwise() {
         let y = array![0.0, 2.0, 5.0, 1.0];
         let mu = array![1.0, 2.0, 4.0, 1.5];
         let w = array![1.0, 1.0, 2.0, 0.5];
         let glm = canonical(ResponseFamily::Poisson, StandardLink::Log);
-        let pw = pointwise_loglikelihood(y.view(), &mu, &glm, w.view());
-        let total = calculate_loglikelihood(y.view(), &mu, &glm, w.view());
+        let evaluation = full_at_fixture(&y, &mu, &glm, &w, StandardLink::Log);
+        let pw = evaluation.pointwise();
+        let total = evaluation.total();
         assert!((total - pw.sum()).abs() < 1e-12);
     }
 }

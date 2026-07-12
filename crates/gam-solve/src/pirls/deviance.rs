@@ -151,7 +151,7 @@ fn finite_signed_from_log(
 /// partial sum when the final sum is representable.  Scaling by the largest
 /// magnitude keeps every add bounded; Neumaier compensation retains small
 /// residuals across cancellation, and the final rescale happens in log space.
-pub(crate) fn stable_finite_signed_sum(
+pub fn stable_finite_signed_sum(
     values: &[f64],
     context: &'static str,
 ) -> Result<f64, EstimationError> {
@@ -1424,50 +1424,24 @@ pub fn calculate_null_deviance(
 fn eta_log_measure_scale(
     likelihood: &GlmLikelihoodSpec,
 ) -> Result<f64, EstimationError> {
-    use gam_problem::LikelihoodScaleMetadata as Scale;
-
-    match (&likelihood.spec.response, likelihood.scale) {
-        (ResponseFamily::Gamma, Scale::FixedGammaShape { shape })
-        | (ResponseFamily::Gamma, Scale::EstimatedGammaShape { shape }) => {
-            if shape.is_finite() && shape > 0.0 {
-                Ok(shape.ln())
-            } else {
-                crate::bail_invalid_estim!(
-                    "Gamma shape must be finite and positive; got {shape}"
-                )
-            }
-        }
-        (ResponseFamily::Gamma, Scale::FixedDispersion { phi }) => {
-            if phi.is_finite() && phi > 0.0 {
-                // Work with log(shape) = -log(phi), so a mathematically valid
-                // reciprocal that is subnormal (or below the ordinary f64
-                // range) is never rounded to zero before it reaches the row
-                // oracle.
-                Ok(-phi.ln())
-            } else {
-                crate::bail_invalid_estim!(
-                    "Gamma dispersion must be finite and positive; got {phi}"
-                )
-            }
-        }
-        (ResponseFamily::Gamma, scale) => crate::bail_invalid_estim!(
-            "Gamma eta log-likelihood requires explicit shape/dispersion metadata; got {scale:?}"
-        ),
-        (
-            ResponseFamily::Tweedie { .. },
-            Scale::FixedDispersion { phi } | Scale::EstimatedTweediePhi { phi },
-        ) => {
-            if phi.is_finite() && phi > 0.0 {
-                Ok(-phi.ln())
-            } else {
-                crate::bail_invalid_estim!(
-                    "Tweedie dispersion must be finite and positive; got {phi}"
-                )
-            }
-        }
-        (ResponseFamily::Tweedie { .. }, scale) => crate::bail_invalid_estim!(
-            "Tweedie eta log-likelihood requires explicit dispersion metadata; got {scale:?}"
-        ),
+    let scale_error = |error: gam_problem::InvalidLikelihoodScale| {
+        EstimationError::InvalidInput(format!(
+            "{} eta log-likelihood scale: {error}",
+            likelihood.spec.response.name()
+        ))
+    };
+    // Resolve every family, even those whose numeric row scale is one: this is
+    // the ownership boundary that rejects contradictory NB/Beta duplicates and
+    // non-unit Poisson/Binomial metadata before any parallel output exists.
+    likelihood.resolved_scale().map_err(scale_error)?;
+    match &likelihood.spec.response {
+        ResponseFamily::Gamma => likelihood
+            .resolved_gamma_log_shape()
+            .map_err(scale_error),
+        ResponseFamily::Tweedie { .. } => likelihood
+            .resolved_tweedie_log_phi()
+            .map(|log_phi| -log_phi)
+            .map_err(scale_error),
         _ => Ok(0.0),
     }
 }
@@ -1714,12 +1688,6 @@ pub(crate) fn beta_log_normalizer(a: f64, b: f64, sum: f64) -> f64 {
 }
 
 #[inline]
-pub(crate) fn gamma_unit_deviance(yi_c: f64, mui_c: f64) -> f64 {
-    let ratio = yi_c / mui_c;
-    ratio - 1.0 - ratio.ln()
-}
-
-#[inline]
 pub(crate) fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
     if !is_valid_tweedie_power(p) {
         f64::NAN
@@ -1875,19 +1843,12 @@ fn full_log_likelihood_row(
     )?;
     let normalizer = match &likelihood.spec.response {
         ResponseFamily::Gaussian => {
-            let phi = match likelihood.scale {
-                gam_problem::LikelihoodScaleMetadata::FixedDispersion { phi }
-                    if phi.is_finite() && phi > 0.0 => phi,
-                _ => {
-                    return Err(deviance_row_error(
-                        row,
-                        "fully-normalized Gaussian dispersion",
-                        eta,
-                        f64::NAN,
-                    ));
-                }
-            };
-            -0.5 * (LN_2PI + phi.ln() - weight.ln())
+            let log_phi = likelihood.resolved_gaussian_log_phi().map_err(|error| {
+                EstimationError::InvalidInput(format!(
+                    "fully-normalized Gaussian likelihood scale: {error}"
+                ))
+            })?;
+            -0.5 * (LN_2PI + log_phi - weight.ln())
         }
         ResponseFamily::Poisson => {
             let log_factorial = ln_gamma(y + 1.0);
@@ -1973,20 +1934,14 @@ pub fn evaluate_full_log_likelihood_from_eta(
             priorweights.len()
         );
     }
-    crate::estimate::dispersion_from_likelihood(likelihood, 0.0)?;
-    if matches!(
-        likelihood.spec.response,
-        ResponseFamily::Gaussian
-    ) && !matches!(
-        likelihood.scale,
-        gam_problem::LikelihoodScaleMetadata::FixedDispersion { phi }
-            if phi.is_finite() && phi > 0.0
-    ) {
-        crate::bail_invalid_estim!(
-            "fully-normalized Gaussian likelihood requires an explicit positive dispersion"
-        );
-    }
     let log_measure_scale = eta_log_measure_scale(likelihood)?;
+    if matches!(likelihood.spec.response, ResponseFamily::Gaussian) {
+        likelihood.resolved_gaussian_log_phi().map_err(|error| {
+            EstimationError::InvalidInput(format!(
+                "fully-normalized Gaussian likelihood requires an explicit positive dispersion: {error}"
+            ))
+        })?;
+    }
     let rows: Vec<Result<f64, EstimationError>> = (0..eta.len())
         .into_par_iter()
         .map(|row| {

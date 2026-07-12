@@ -2662,12 +2662,13 @@ where
         spec: reported_family.clone(),
         scale: reporting_scale,
     };
-    let log_likelihood = crate::pirls::calculate_loglikelihood(
+    let log_likelihood = crate::pirls::evaluate_full_log_likelihood_from_eta(
         y_o.view(),
-        &pirls_res.finalmu.to_owned(),
+        pirls_res.final_eta.view(),
         &reported_likelihood,
         w_o.view(),
-    );
+    )?
+    .total();
 
     let result = ExternalOptimResult {
         beta: beta_orig_internal,
@@ -2912,7 +2913,7 @@ mod reported_loglikelihood_normalization_tests {
     //! families (breaking any AIC built from it).
     //!
     //! The fix routes the reporting field through the fully-normalized
-    //! `calculate_loglikelihood` kernel and tags it
+    //! full eta-space likelihood evaluation and tags it
     //! `LogLikelihoodNormalization::Full`. This test fits a small Poisson GAM
     //! surface through the real optimizer and asserts the reported field is a
     //! proper (negative) log-mass — the direct, field-level symptom of #2096,

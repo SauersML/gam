@@ -31,7 +31,7 @@ use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use gam_models::wiggle::monotone_wiggle_basis_with_derivative_order;
 use gam_problem::types::{
     GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily,
-    RhoPrior, StandardLink, is_valid_tweedie_power,
+    ResolvedLikelihoodScale, RhoPrior, StandardLink, is_valid_tweedie_power,
 };
 use gam_solve::estimate::reml::FirthDenseOperator;
 use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
@@ -532,6 +532,11 @@ fn resolve_hmc_likelihood(
     likelihood: GlmLikelihoodSpec,
     dispersion: gam_solve::model_types::Dispersion,
 ) -> Result<(GlmLikelihoodSpec, f64), HmcError> {
+    let resolved_scale = likelihood
+        .resolved_scale()
+        .map_err(|error| HmcError::InvalidConfig {
+            reason: format!("HMC likelihood scale metadata is unresolved: {error}"),
+        })?;
     let phi = dispersion.phi();
     let _inv_phi = dispersion
         .reciprocal()
@@ -539,17 +544,30 @@ fn resolve_hmc_likelihood(
             reason: format!("HMC likelihood requires a finite positive dispersion: {error}"),
         })?;
 
-    let expected = gam_solve::estimate::dispersion_from_likelihood(&likelihood, dispersion.sqrt())
-        .map_err(|error| HmcError::InvalidConfig {
-            reason: format!("HMC likelihood scale metadata is inconsistent: {error}"),
-        })?;
-    if expected.phi().to_bits() != phi.to_bits() {
-        return Err(HmcError::InvalidConfig {
-            reason: format!(
-                "HMC dispersion phi={phi} disagrees with likelihood metadata phi={}",
-                expected.phi()
-            ),
-        });
+    if matches!(resolved_scale, ResolvedLikelihoodScale::ProfiledGaussian) {
+        if !dispersion.is_estimated() {
+            return Err(HmcError::InvalidConfig {
+                reason: "profiled-Gaussian HMC requires an estimated fitted dispersion"
+                    .to_string(),
+            });
+        }
+    } else {
+        // The standard-deviation argument is consulted only by the profiled
+        // Gaussian branch handled above. Every resolved non-profiled family
+        // derives its response dispersion entirely from typed metadata.
+        let expected = gam_solve::estimate::dispersion_from_likelihood(&likelihood, f64::NAN)
+            .map_err(|error| HmcError::InvalidConfig {
+                reason: format!("HMC likelihood scale metadata is inconsistent: {error}"),
+            })?;
+        if expected.phi().to_bits() != phi.to_bits()
+            || expected.is_estimated() != dispersion.is_estimated()
+        {
+            return Err(HmcError::InvalidConfig {
+                reason: format!(
+                    "HMC dispersion {dispersion:?} disagrees with likelihood metadata dispersion {expected:?}"
+                ),
+            });
+        }
     }
 
     match (&likelihood.spec.response, &likelihood.spec.link) {
@@ -948,7 +966,7 @@ impl NutsPosterior {
         // so the target curvature must equal `Vb⁻¹ = H/cov_scale`. The
         // likelihood already supplies `−∇²ℓ = (data Fisher info)/cov_scale`
         // (explicitly `/σ²` for profiled Gaussian, implicitly via the working
-        // weight / the `shape ≡ 1/φ` baked into `gamma_log_logp_and_grad` for
+        // weight / the `shape ≡ 1/φ` encoded by the resolved Gamma metadata for
         // the dispersion-carrying families), so the penalty must match it:
         //   penalty_scale = 1/cov_scale.
         // That is `1/σ²` for profiled Gaussian and exactly `1.0` for
@@ -1667,6 +1685,226 @@ mod tests {
         let lo = gam_linalg::utils::stable_logistic(-1000.0);
         assert!((1.0 - 1e-12..=1.0).contains(&hi));
         assert!((0.0..=1e-12).contains(&lo));
+    }
+
+    #[test]
+    fn exact_hmc_family_surfaces_share_value_and_eta_score() {
+        let fixed = |spec: LikelihoodSpec, scale: LikelihoodScaleMetadata| GlmLikelihoodSpec {
+            spec,
+            scale,
+        };
+        let cases = vec![
+            (
+                fixed(
+                    LikelihoodSpec::gaussian_identity(),
+                    LikelihoodScaleMetadata::FixedDispersion { phi: 2.0 },
+                ),
+                array![f64::NAN, -0.4, 1.7],
+            ),
+            (
+                GlmLikelihoodSpec::canonical(LikelihoodSpec::binomial_logit()),
+                array![f64::NAN, 1.0, 0.0],
+            ),
+            (
+                GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(StandardLink::Probit),
+                )),
+                array![f64::NAN, 1.0, 0.0],
+            ),
+            (
+                GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(StandardLink::CLogLog),
+                )),
+                array![f64::NAN, 1.0, 0.0],
+            ),
+            (
+                GlmLikelihoodSpec::canonical(LikelihoodSpec::poisson_log()),
+                array![f64::NAN, 0.0, 3.0],
+            ),
+            (
+                fixed(
+                    LikelihoodSpec::new(
+                        ResponseFamily::Gamma,
+                        InverseLink::Standard(StandardLink::Log),
+                    ),
+                    LikelihoodScaleMetadata::FixedGammaShape { shape: 3.0 },
+                ),
+                array![f64::NAN, 0.4, 2.2],
+            ),
+            (
+                fixed(
+                    LikelihoodSpec::new(
+                        ResponseFamily::Tweedie { p: 1.4 },
+                        InverseLink::Standard(StandardLink::Log),
+                    ),
+                    LikelihoodScaleMetadata::FixedDispersion { phi: 0.7 },
+                ),
+                array![f64::NAN, 0.0, 2.2],
+            ),
+            (
+                fixed(
+                    LikelihoodSpec::new(
+                        ResponseFamily::NegativeBinomial {
+                            theta: 2.5,
+                            theta_fixed: true,
+                        },
+                        InverseLink::Standard(StandardLink::Log),
+                    ),
+                    LikelihoodScaleMetadata::FixedNegBinTheta { theta: 2.5 },
+                ),
+                array![f64::NAN, 0.0, 3.0],
+            ),
+            (
+                fixed(
+                    LikelihoodSpec::new(
+                        ResponseFamily::Beta { phi: 12.0 },
+                        InverseLink::Standard(StandardLink::Logit),
+                    ),
+                    LikelihoodScaleMetadata::EstimatedBetaPhi { phi: 12.0 },
+                ),
+                array![f64::NAN, 0.2, 0.8],
+            ),
+        ];
+        let weights = array![0.0, 1.0e-300, 1.25];
+        let eta = array![0.0, -0.35, 0.6];
+        for (likelihood, y) in cases {
+            let (value, score) = exact_eta_geometry(&likelihood, &y, &weights, &eta)
+                .unwrap_or_else(|error| panic!("{}: {error}", likelihood.spec.pretty_name()));
+            assert!(value.is_finite());
+            assert_eq!(score[0].to_bits(), 0.0_f64.to_bits());
+            assert!(
+                score[1] != 0.0 && score[1].is_finite(),
+                "{} erased a positive tiny weight",
+                likelihood.spec.pretty_name()
+            );
+            let eps = 1.0e-6;
+            let mut plus = eta.clone();
+            let mut minus = eta.clone();
+            plus[2] += eps;
+            minus[2] -= eps;
+            let (vp, _) = exact_eta_geometry(&likelihood, &y, &weights, &plus).unwrap();
+            let (vm, _) = exact_eta_geometry(&likelihood, &y, &weights, &minus).unwrap();
+            let fd = (vp - vm) / (2.0 * eps);
+            let tolerance = 2.0e-5 * (1.0 + fd.abs());
+            assert!(
+                (score[2] - fd).abs() <= tolerance,
+                "{} value/score mismatch: analytic={} fd={fd}",
+                likelihood.spec.pretty_name(),
+                score[2]
+            );
+        }
+    }
+
+    #[test]
+    fn exact_hmc_family_tails_are_finite_when_the_surface_is_representable() {
+        let tail_cases = [
+            (
+                GlmLikelihoodSpec::canonical(LikelihoodSpec::poisson_log()),
+                array![0.0],
+                array![-1000.0],
+            ),
+            (
+                GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(StandardLink::Probit),
+                )),
+                array![1.0],
+                array![-30.0],
+            ),
+            (
+                GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(StandardLink::CLogLog),
+                )),
+                array![1.0],
+                array![-1000.0],
+            ),
+            (
+                GlmLikelihoodSpec {
+                    spec: LikelihoodSpec::new(
+                        ResponseFamily::Gamma,
+                        InverseLink::Standard(StandardLink::Log),
+                    ),
+                    scale: LikelihoodScaleMetadata::FixedGammaShape { shape: 1.0 },
+                },
+                array![1.0],
+                array![1.0e308],
+            ),
+            (
+                GlmLikelihoodSpec {
+                    spec: LikelihoodSpec::new(
+                        ResponseFamily::NegativeBinomial {
+                            theta: 1.0,
+                            theta_fixed: true,
+                        },
+                        InverseLink::Standard(StandardLink::Log),
+                    ),
+                    scale: LikelihoodScaleMetadata::FixedNegBinTheta { theta: 1.0 },
+                },
+                array![2.0],
+                array![1.0e308],
+            ),
+            (
+                GlmLikelihoodSpec {
+                    spec: LikelihoodSpec::new(
+                        ResponseFamily::Beta { phi: 8.0 },
+                        InverseLink::Standard(StandardLink::Logit),
+                    ),
+                    scale: LikelihoodScaleMetadata::EstimatedBetaPhi { phi: 8.0 },
+                },
+                array![0.2],
+                array![-1000.0],
+            ),
+        ];
+        for (likelihood, y, eta) in tail_cases {
+            let (value, score) = exact_eta_geometry(&likelihood, &y, &array![1.0], &eta)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{} tail should be representable: {error}",
+                        likelihood.spec.pretty_name()
+                    )
+                });
+            assert!(value.is_finite());
+            assert!(score[0].is_finite());
+        }
+    }
+
+    #[test]
+    fn hmc_scale_resolution_rejects_inconsistent_metadata_without_defaults() {
+        let inconsistent_nb = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::new(
+                ResponseFamily::NegativeBinomial {
+                    theta: 2.0,
+                    theta_fixed: true,
+                },
+                InverseLink::Standard(StandardLink::Log),
+            ),
+            scale: LikelihoodScaleMetadata::FixedNegBinTheta { theta: 3.0 },
+        };
+        assert!(
+            super::resolve_hmc_likelihood(
+                inconsistent_nb,
+                gam_solve::model_types::Dispersion::UNIT,
+            )
+            .is_err()
+        );
+
+        let unresolved_gamma = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::new(
+                ResponseFamily::Gamma,
+                InverseLink::Standard(StandardLink::Log),
+            ),
+            scale: LikelihoodScaleMetadata::Unspecified,
+        };
+        assert!(
+            super::resolve_hmc_likelihood(
+                unresolved_gamma,
+                gam_solve::model_types::Dispersion::UNIT,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4358,7 +4596,16 @@ impl NutsResult {
 
 #[inline]
 fn sample_standard_normal<R: rand::Rng + ?Sized>(rng: &mut R) -> f64 {
-    let u1 = rng.random::<f64>().max(1e-16);
+    // Box-Muller requires U1 in the open interval (0, 1). Reject the single
+    // exactly-zero lattice point instead of projecting an interval of valid
+    // uniforms onto an arbitrary floor, which creates an atom and truncates
+    // the normal tail.
+    let u1 = loop {
+        let draw = rng.random::<f64>();
+        if draw > 0.0 {
+            break draw;
+        }
+    };
     let u2 = rng.random::<f64>();
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
 }
@@ -5127,6 +5374,13 @@ pub fn run_nuts_sampling_flattened_family(
         }),
         FamilyNutsInputs::Survival(_) => None,
     };
+    if let (Some(resolved), FamilyNutsInputs::Glm(glm)) =
+        (resolved_glm_likelihood.as_ref(), &inputs)
+    {
+        // Validate family/scale ownership before dispatch, including the PG
+        // branch that does not construct a NutsPosterior.
+        resolve_hmc_likelihood(resolved.clone(), glm.dispersion).map_err(String::from)?;
+    }
     if let FamilyNutsInputs::Glm(glm) = &inputs
         && glm.firth_bias_reduction
         && !likelihood_spec_supports_firth(&likelihood)

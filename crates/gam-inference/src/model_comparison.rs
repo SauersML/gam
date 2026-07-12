@@ -171,8 +171,17 @@ pub fn alo_elpd(
     loglik_fitted: ArrayView1<'_, f64>,
     loglik_loo: ArrayView1<'_, f64>,
 ) -> Option<AloElpd> {
+    let elpd = loglik_loo.iter().sum();
+    alo_elpd_with_total(loglik_fitted, loglik_loo, elpd)
+}
+
+fn alo_elpd_with_total(
+    loglik_fitted: ArrayView1<'_, f64>,
+    loglik_loo: ArrayView1<'_, f64>,
+    elpd: f64,
+) -> Option<AloElpd> {
     let n = loglik_loo.len();
-    if n == 0 || loglik_fitted.len() != n {
+    if n == 0 || loglik_fitted.len() != n || !elpd.is_finite() {
         return None;
     }
     if loglik_fitted
@@ -205,7 +214,6 @@ pub fn alo_elpd(
     }
 
     let pointwise = loglik_loo.to_owned();
-    let elpd: f64 = pointwise.iter().sum();
     let mean = elpd / n as f64;
     // SE of the sum of n pointwise contributions: √(n·s²) with the unbiased
     // sample variance (denominator n−1). Undefined for a single observation.
@@ -319,14 +327,15 @@ pub fn model_comparison_from_unified(
     // profiled Gaussian scale concretized into σ̂². For custom / GAMLSS fits with
     // no engine-level family there is no per-row kernel to call, so we fall back
     // to the stored value (those paths supply their own normalized log-lik).
-    let log_lik = fit
-        .likelihood_family
-        .as_ref()
-        .and_then(|spec| {
-            let scale = reporting_scale(spec, &fit.likelihood_scale, phi);
-            full_loglikelihood_at_eta(y, eta_hat, prior_weights, spec, scale)
-        })
-        .unwrap_or(fit.log_likelihood);
+    let log_lik = if let Some(spec) = fit.likelihood_family.as_ref() {
+        let scale = reporting_scale(spec, &fit.likelihood_scale, phi);
+        full_loglikelihood_at_eta(y, eta_hat, prior_weights, spec, scale)?
+    } else {
+        // Custom/GAMLSS engines own their normalized likelihood and do not
+        // advertise an engine-level GLM family. Their stored value is therefore
+        // authoritative, not a fallback from a failed GLM evaluation.
+        fit.log_likelihood
+    };
 
     // An estimated / profiled dispersion is a fitted parameter and adds one
     // degree of freedom to the conditional AIC — mgcv's `2·(edf + 1)` for a
@@ -341,18 +350,20 @@ pub fn model_comparison_from_unified(
     let aic_conditional = -2.0 * log_lik + 2.0 * (edf.conditional + scale_dof);
     let aic_corrected = -2.0 * log_lik + 2.0 * (edf.corrected + scale_dof);
 
-    let loo = alo.and_then(|alo| {
-        let spec = fit.likelihood_family.clone()?;
-        let scale = reporting_scale(&spec, &fit.likelihood_scale, phi);
-        alo_elpd_from_family(
-            y,
-            eta_hat,
-            alo.eta_tilde.view(),
-            prior_weights,
-            &spec,
-            scale,
-        )
-    });
+    let loo = match (alo, fit.likelihood_family.as_ref()) {
+        (Some(alo), Some(spec)) => {
+            let scale = reporting_scale(spec, &fit.likelihood_scale, phi);
+            alo_elpd_from_family(
+                y,
+                eta_hat,
+                alo.eta_tilde.view(),
+                prior_weights,
+                spec,
+                scale,
+            )?
+        }
+        _ => None,
+    };
 
     Ok(ModelComparison {
         log_lik,
@@ -363,10 +374,10 @@ pub fn model_comparison_from_unified(
     })
 }
 
-/// ALO elpd for an engine-level family: map the fitted and ALO leave-one-out
-/// linear predictors through the family inverse link, score both with the
-/// per-row log-likelihood kernel, and compute the ALO elpd plus influence
-/// diagnostic.
+/// ALO elpd for an engine-level family, evaluated directly at the fitted and
+/// leave-one-out linear predictors. No eta-to-mean-to-eta round trip is allowed:
+/// doing so rounds representable tail predictors onto boundary means and
+/// desynchronizes comparison values from the likelihood score surface.
 pub fn alo_elpd_from_family(
     y: ArrayView1<'_, f64>,
     eta_hat: ArrayView1<'_, f64>,
@@ -374,17 +385,9 @@ pub fn alo_elpd_from_family(
     prior_weights: ArrayView1<'_, f64>,
     spec: &LikelihoodSpec,
     scale: gam_problem::types::LikelihoodScaleMetadata,
-) -> Option<AloElpd> {
-    use gam_models::family_runtime::{FamilyStrategy, strategy_for_spec};
-    use gam_solve::pirls::pointwise_loglikelihood;
+) -> Result<Option<AloElpd>, EstimationError> {
+    use gam_solve::pirls::evaluate_full_log_likelihood_from_eta;
 
-    let n = y.len();
-    if eta_hat.len() != n || eta_loo.len() != n || prior_weights.len() != n || n == 0 {
-        return None;
-    }
-    let strategy = strategy_for_spec(spec);
-    let mu_hat = strategy.inverse_link_array(eta_hat).ok()?;
-    let mu_loo = strategy.inverse_link_array(eta_loo).ok()?;
     let glm = GlmLikelihoodSpec {
         spec: spec.clone(),
         scale,
@@ -396,36 +399,32 @@ pub fn alo_elpd_from_family(
     // depend only on yᵢ and the scale, not on μ), so the PSIS importance ratios
     // r_i = exp(ℓ̂_i − ℓ_loo,i) — and hence k̂ — are unchanged; only the absolute
     // elpd is corrected (#1581/#1582/#1583).
-    let ll_hat = pointwise_loglikelihood(y, &mu_hat, &glm, prior_weights);
-    let ll_loo = pointwise_loglikelihood(y, &mu_loo, &glm, prior_weights);
-    alo_elpd(ll_hat.view(), ll_loo.view())
+    let ll_hat = evaluate_full_log_likelihood_from_eta(y, eta_hat, &glm, prior_weights)?;
+    let ll_loo = evaluate_full_log_likelihood_from_eta(y, eta_loo, &glm, prior_weights)?;
+    Ok(alo_elpd_with_total(
+        ll_hat.pointwise(),
+        ll_loo.pointwise(),
+        ll_loo.total(),
+    ))
 }
 
 /// Total fully-normalized log-likelihood at the fitted linear predictor
-/// `eta_hat`: map through the family inverse link and sum the per-row reporting
-/// kernel. `None` when the inverse link fails, the lengths disagree, or the
-/// result is non-finite (so callers fall back to the stored value).
+/// `eta_hat`, without materializing a fitted-mean surrogate.
 fn full_loglikelihood_at_eta(
     y: ArrayView1<'_, f64>,
     eta_hat: ArrayView1<'_, f64>,
     prior_weights: ArrayView1<'_, f64>,
     spec: &LikelihoodSpec,
     scale: gam_problem::types::LikelihoodScaleMetadata,
-) -> Option<f64> {
-    use gam_models::family_runtime::{FamilyStrategy, strategy_for_spec};
-    use gam_solve::pirls::calculate_loglikelihood;
+) -> Result<f64, EstimationError> {
+    use gam_solve::pirls::evaluate_full_log_likelihood_from_eta;
 
-    let n = y.len();
-    if eta_hat.len() != n || prior_weights.len() != n || n == 0 {
-        return None;
-    }
-    let mu_hat = strategy_for_spec(spec).inverse_link_array(eta_hat).ok()?;
     let glm = GlmLikelihoodSpec {
         spec: spec.clone(),
         scale,
     };
-    let ll = calculate_loglikelihood(y, &mu_hat, &glm, prior_weights);
-    ll.is_finite().then_some(ll)
+    evaluate_full_log_likelihood_from_eta(y, eta_hat, &glm, prior_weights)
+        .map(|evaluation| evaluation.total())
 }
 
 /// Concretize the response-scale metadata for the *reporting* log-likelihood.

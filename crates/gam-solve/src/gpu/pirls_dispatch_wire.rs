@@ -103,7 +103,8 @@ mod linux_impl {
     use crate::gpu_kernels::pirls_row::{CurvatureMode, PirlsRowFamily};
     use crate::pirls::{
         ExportedLaplaceCurvature, FirthDiagnostics, HessianCurvatureKind, PirlsCoordinateFrame,
-        PirlsResult, PirlsStatus, WorkingModelPirlsResult, WorkingState, calculate_loglikelihood,
+        PirlsResult, PirlsStatus, WorkingModelPirlsResult, WorkingState,
+        calculate_loglikelihood_omitting_constants_from_eta,
         compute_observed_hessian_curvature_arrays, computeworkingweight_derivatives_from_eta,
     };
     use gam_gpu::cuda_selected;
@@ -574,12 +575,13 @@ mod linux_impl {
             eta: LinearPredictor::new(final_eta.clone()),
             gradient: gradient_total.clone(),
             hessian: penalized_hessian_sym.clone(),
-            log_likelihood: calculate_loglikelihood(
+            log_likelihood: calculate_loglikelihood_omitting_constants_from_eta(
                 input.y,
-                &final_mu,
+                &final_eta,
                 input.likelihood,
+                input.inverse_link,
                 input.priorweights,
-            ),
+            )?,
             deviance,
             penalty_term,
             firth: firth.clone(),
@@ -759,7 +761,8 @@ mod linux_impl {
         input: GpuGaussianPlsInput<'_>,
     ) -> Result<(PirlsResult, WorkingModelPirlsResult), String> {
         use crate::pirls::{
-            array1_l2_norm, calculate_deviance_from_eta, calculate_loglikelihood,
+            array1_l2_norm, calculate_deviance_from_eta,
+            calculate_loglikelihood_omitting_constants_from_eta,
             computeworkingweight_derivatives_from_eta,
         };
         use gam_linalg::matrix::LinearOperator;
@@ -860,8 +863,14 @@ mod linux_impl {
             input.priorweights,
         )
         .map_err(|error| format!("GPU Gaussian deviance evaluation failed: {error}"))?;
-        let log_likelihood =
-            calculate_loglikelihood(input.y, &finalmu, input.likelihood, input.priorweights);
+        let log_likelihood = calculate_loglikelihood_omitting_constants_from_eta(
+            input.y,
+            &eta,
+            input.likelihood,
+            input.inverse_link,
+            input.priorweights,
+        )
+        .map_err(|error| format!("GPU Gaussian log-likelihood evaluation failed: {error}"))?;
 
         // Stabilised Hessian = penalized_hessian + ridge_used·I.
         let mut stab = penalized_hessian.clone();

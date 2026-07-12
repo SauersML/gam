@@ -1905,7 +1905,9 @@ pub enum LikelihoodScaleMetadata {
     /// `FixedGammaShape` vs `EstimatedGammaShape`.
     FixedNegBinTheta { theta: f64 },
     /// The engine does not expose fixed-scale semantics for this family.
-    Unspecified,
+    /// Family has no scalar GLM scale by model definition (currently only
+    /// Royston-Parmar). This is not a missing-value fallback.
+    NoScalarScale,
 }
 
 impl LikelihoodScaleMetadata {
@@ -1969,6 +1971,216 @@ impl LikelihoodScaleMetadata {
     }
 }
 
+/// Positive finite likelihood-scale scalar with its stable log coordinate.
+///
+/// The raw value is retained exactly for ordinary arithmetic while the log is
+/// computed once during validation. Consumers that only need log-density
+/// algebra never materialize a reciprocal (notably Gamma `log(shape)` when the
+/// input contract is a fixed dispersion `phi`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PositiveLikelihoodScale {
+    value: f64,
+    log_value: f64,
+}
+
+impl PositiveLikelihoodScale {
+    fn try_new(value: f64, name: &str) -> Result<Self, InvalidLikelihoodScale> {
+        if !(value.is_finite() && value > 0.0) {
+            return Err(InvalidLikelihoodScale::new(format!(
+                "{name} must be finite and strictly positive, got {value:?}"
+            )));
+        }
+        let log_value = value.ln();
+        if !log_value.is_finite() {
+            return Err(InvalidLikelihoodScale::new(format!(
+                "log({name}) is not representable for {value:?}: {log_value:?}"
+            )));
+        }
+        Ok(Self { value, log_value })
+    }
+
+    #[inline]
+    pub const fn value(self) -> f64 {
+        self.value
+    }
+
+    #[inline]
+    pub const fn log_value(self) -> f64 {
+        self.log_value
+    }
+}
+
+/// Gamma may be resolved from a shape directly or from a fixed dispersion
+/// `phi = 1 / shape`. Keeping the provenance avoids an eager reciprocal that
+/// can overflow even though `log(shape) = -log(phi)` remains representable.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ResolvedGammaScale {
+    Shape(PositiveLikelihoodScale),
+    Dispersion(PositiveLikelihoodScale),
+}
+
+/// Validated, family-aware likelihood-scale ownership.
+///
+/// Unlike [`LikelihoodScaleMetadata`] alone, this enum is constructed jointly
+/// with [`ResponseFamily`]. A value therefore proves both scalar validity and
+/// family/metadata agreement; downstream kernels never need to invent a unit
+/// fallback for a missing or mismatched scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ResolvedLikelihoodScale {
+    ProfiledGaussian,
+    FixedGaussian {
+        phi: PositiveLikelihoodScale,
+    },
+    Unit,
+    Gamma {
+        scale: ResolvedGammaScale,
+        estimated: bool,
+    },
+    Tweedie {
+        phi: PositiveLikelihoodScale,
+        estimated: bool,
+    },
+    BetaPrecision {
+        precision: PositiveLikelihoodScale,
+        estimated: bool,
+    },
+    NegativeBinomial {
+        theta: PositiveLikelihoodScale,
+        estimated: bool,
+    },
+    Unspecified,
+}
+
+impl ResolvedLikelihoodScale {
+    fn wrong_family(self, expected: &str) -> InvalidLikelihoodScale {
+        InvalidLikelihoodScale::new(format!(
+            "resolved likelihood scale {self:?} does not carry {expected}"
+        ))
+    }
+
+    /// `log(shape)` for Gamma without reciprocal materialization.
+    pub fn gamma_log_shape(self) -> Result<f64, InvalidLikelihoodScale> {
+        match self {
+            Self::Gamma {
+                scale: ResolvedGammaScale::Shape(shape),
+                ..
+            } => Ok(shape.log_value()),
+            Self::Gamma {
+                scale: ResolvedGammaScale::Dispersion(phi),
+                ..
+            } => Ok(-phi.log_value()),
+            other => Err(other.wrong_family("a Gamma shape")),
+        }
+    }
+
+    /// Representable Gamma shape. A subnormal fixed dispersion can have a
+    /// finite log-shape but a reciprocal beyond `f64`; that is rejected here,
+    /// at the raw-shape consumer, rather than earlier in log-density code.
+    pub fn gamma_shape(self) -> Result<f64, InvalidLikelihoodScale> {
+        match self {
+            Self::Gamma {
+                scale: ResolvedGammaScale::Shape(shape),
+                ..
+            } => Ok(shape.value()),
+            Self::Gamma {
+                scale: ResolvedGammaScale::Dispersion(phi),
+                ..
+            } => {
+                let shape = 1.0 / phi.value();
+                if shape.is_finite() && shape > 0.0 {
+                    Ok(shape)
+                } else {
+                    Err(InvalidLikelihoodScale::new(format!(
+                        "Gamma shape 1 / phi is not representable for phi={:?}: {shape:?}",
+                        phi.value()
+                    )))
+                }
+            }
+            other => Err(other.wrong_family("a Gamma shape")),
+        }
+    }
+
+    pub fn tweedie_log_phi(self) -> Result<f64, InvalidLikelihoodScale> {
+        match self {
+            Self::Tweedie { phi, .. } => Ok(phi.log_value()),
+            other => Err(other.wrong_family("a Tweedie dispersion")),
+        }
+    }
+
+    pub fn tweedie_phi(self) -> Result<f64, InvalidLikelihoodScale> {
+        match self {
+            Self::Tweedie { phi, .. } => Ok(phi.value()),
+            other => Err(other.wrong_family("a Tweedie dispersion")),
+        }
+    }
+
+    pub fn negative_binomial_log_theta(self) -> Result<f64, InvalidLikelihoodScale> {
+        match self {
+            Self::NegativeBinomial { theta, .. } => Ok(theta.log_value()),
+            other => Err(other.wrong_family("a negative-binomial theta")),
+        }
+    }
+
+    pub fn negative_binomial_theta(self) -> Result<f64, InvalidLikelihoodScale> {
+        match self {
+            Self::NegativeBinomial { theta, .. } => Ok(theta.value()),
+            other => Err(other.wrong_family("a negative-binomial theta")),
+        }
+    }
+
+    pub fn beta_log_precision(self) -> Result<f64, InvalidLikelihoodScale> {
+        match self {
+            Self::BetaPrecision { precision, .. } => Ok(precision.log_value()),
+            other => Err(other.wrong_family("a Beta precision")),
+        }
+    }
+
+    pub fn beta_precision(self) -> Result<f64, InvalidLikelihoodScale> {
+        match self {
+            Self::BetaPrecision { precision, .. } => Ok(precision.value()),
+            other => Err(other.wrong_family("a Beta precision")),
+        }
+    }
+
+    pub fn gaussian_log_phi(self) -> Result<f64, InvalidLikelihoodScale> {
+        match self {
+            Self::FixedGaussian { phi } => Ok(phi.log_value()),
+            other => Err(other.wrong_family("a fixed Gaussian dispersion")),
+        }
+    }
+
+    pub fn gaussian_phi(self) -> Result<f64, InvalidLikelihoodScale> {
+        match self {
+            Self::FixedGaussian { phi } => Ok(phi.value()),
+            other => Err(other.wrong_family("a fixed Gaussian dispersion")),
+        }
+    }
+}
+
+/// Failure to resolve family and scale metadata into one likelihood contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidLikelihoodScale {
+    reason: String,
+}
+
+impl InvalidLikelihoodScale {
+    fn new(reason: String) -> Self {
+        Self { reason }
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for InvalidLikelihoodScale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid resolved likelihood scale: {}", self.reason)
+    }
+}
+
+impl std::error::Error for InvalidLikelihoodScale {}
+
 /// Whether a stored log-likelihood includes response-only normalization constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogLikelihoodNormalization {
@@ -1999,6 +2211,176 @@ impl GlmLikelihoodSpec {
     pub fn canonical(spec: LikelihoodSpec) -> Self {
         let scale = spec.default_scale_metadata();
         Self { spec, scale }
+    }
+
+    /// Resolve and validate response-family plus scale metadata atomically.
+    ///
+    /// This is the only scale-ownership boundary kernels should consume. It
+    /// rejects non-positive/non-finite scalars, wrong metadata variants, and
+    /// duplicated Beta/NB values that disagree bit-for-bit with the family
+    /// selector.
+    pub fn resolved_scale(&self) -> Result<ResolvedLikelihoodScale, InvalidLikelihoodScale> {
+        use LikelihoodScaleMetadata as Metadata;
+        use ResolvedLikelihoodScale as Resolved;
+
+        let positive = |value, name| PositiveLikelihoodScale::try_new(value, name);
+        let mismatch = |expected: &str| {
+            InvalidLikelihoodScale::new(format!(
+                "family {} requires {expected}, got {:?}",
+                self.spec.response.name(),
+                self.scale
+            ))
+        };
+
+        match (&self.spec.response, self.scale) {
+            (ResponseFamily::Gaussian, Metadata::ProfiledGaussian) => {
+                Ok(Resolved::ProfiledGaussian)
+            }
+            (ResponseFamily::Gaussian, Metadata::FixedDispersion { phi }) => {
+                Ok(Resolved::FixedGaussian {
+                    phi: positive(phi, "Gaussian dispersion phi")?,
+                })
+            }
+            (ResponseFamily::Gaussian, _) => {
+                Err(mismatch("ProfiledGaussian or FixedDispersion metadata"))
+            }
+
+            (ResponseFamily::Binomial | ResponseFamily::Poisson, Metadata::FixedDispersion { phi })
+                if phi.to_bits() == 1.0_f64.to_bits() =>
+            {
+                Ok(Resolved::Unit)
+            }
+            (ResponseFamily::Binomial | ResponseFamily::Poisson, _) => {
+                Err(mismatch("exact FixedDispersion { phi: 1.0 } metadata"))
+            }
+
+            (ResponseFamily::Gamma, Metadata::FixedGammaShape { shape }) => {
+                Ok(Resolved::Gamma {
+                    scale: ResolvedGammaScale::Shape(positive(shape, "Gamma shape")?),
+                    estimated: false,
+                })
+            }
+            (ResponseFamily::Gamma, Metadata::EstimatedGammaShape { shape }) => {
+                Ok(Resolved::Gamma {
+                    scale: ResolvedGammaScale::Shape(positive(shape, "Gamma shape")?),
+                    estimated: true,
+                })
+            }
+            (ResponseFamily::Gamma, Metadata::FixedDispersion { phi }) => {
+                Ok(Resolved::Gamma {
+                    scale: ResolvedGammaScale::Dispersion(positive(phi, "Gamma dispersion phi")?),
+                    estimated: false,
+                })
+            }
+            (ResponseFamily::Gamma, _) => Err(mismatch(
+                "FixedGammaShape, EstimatedGammaShape, or FixedDispersion metadata",
+            )),
+
+            (ResponseFamily::Tweedie { .. }, Metadata::EstimatedTweediePhi { phi }) => {
+                Ok(Resolved::Tweedie {
+                    phi: positive(phi, "Tweedie dispersion phi")?,
+                    estimated: true,
+                })
+            }
+            (ResponseFamily::Tweedie { .. }, Metadata::FixedDispersion { phi }) => {
+                Ok(Resolved::Tweedie {
+                    phi: positive(phi, "Tweedie dispersion phi")?,
+                    estimated: false,
+                })
+            }
+            (ResponseFamily::Tweedie { .. }, _) => Err(mismatch(
+                "EstimatedTweediePhi or FixedDispersion metadata",
+            )),
+
+            (ResponseFamily::Beta { phi }, Metadata::EstimatedBetaPhi { phi: metadata_phi }) => {
+                if phi.to_bits() != metadata_phi.to_bits() {
+                    return Err(InvalidLikelihoodScale::new(format!(
+                        "Beta family precision {phi:?} disagrees with metadata precision {metadata_phi:?}"
+                    )));
+                }
+                Ok(Resolved::BetaPrecision {
+                    precision: positive(*phi, "Beta precision")?,
+                    estimated: true,
+                })
+            }
+            (ResponseFamily::Beta { .. }, _) => {
+                Err(mismatch("matching EstimatedBetaPhi metadata"))
+            }
+
+            (
+                ResponseFamily::NegativeBinomial {
+                    theta,
+                    theta_fixed: false,
+                },
+                Metadata::EstimatedNegBinTheta {
+                    theta: metadata_theta,
+                },
+            )
+            | (
+                ResponseFamily::NegativeBinomial {
+                    theta,
+                    theta_fixed: true,
+                },
+                Metadata::FixedNegBinTheta {
+                    theta: metadata_theta,
+                },
+            ) => {
+                if theta.to_bits() != metadata_theta.to_bits() {
+                    return Err(InvalidLikelihoodScale::new(format!(
+                        "negative-binomial family theta {theta:?} disagrees with metadata theta {metadata_theta:?}"
+                    )));
+                }
+                Ok(Resolved::NegativeBinomial {
+                    theta: positive(*theta, "negative-binomial theta")?,
+                    estimated: !matches!(self.scale, Metadata::FixedNegBinTheta { .. }),
+                })
+            }
+            (ResponseFamily::NegativeBinomial { .. }, _) => Err(mismatch(
+                "matching EstimatedNegBinTheta/FixedNegBinTheta metadata and ownership flag",
+            )),
+
+            (ResponseFamily::RoystonParmar, Metadata::Unspecified) => {
+                Ok(Resolved::NoScalarScale)
+            }
+            (ResponseFamily::RoystonParmar, _) => {
+                Err(mismatch("Unspecified metadata (no scalar GLM scale)"))
+            }
+        }
+    }
+
+    #[inline]
+    pub fn resolved_gamma_shape(&self) -> Result<f64, InvalidLikelihoodScale> {
+        self.resolved_scale()?.gamma_shape()
+    }
+
+    #[inline]
+    pub fn resolved_gamma_log_shape(&self) -> Result<f64, InvalidLikelihoodScale> {
+        self.resolved_scale()?.gamma_log_shape()
+    }
+
+    #[inline]
+    pub fn resolved_tweedie_phi(&self) -> Result<f64, InvalidLikelihoodScale> {
+        self.resolved_scale()?.tweedie_phi()
+    }
+
+    #[inline]
+    pub fn resolved_tweedie_log_phi(&self) -> Result<f64, InvalidLikelihoodScale> {
+        self.resolved_scale()?.tweedie_log_phi()
+    }
+
+    #[inline]
+    pub fn resolved_negbin_theta(&self) -> Result<f64, InvalidLikelihoodScale> {
+        self.resolved_scale()?.negative_binomial_theta()
+    }
+
+    #[inline]
+    pub fn resolved_gaussian_log_phi(&self) -> Result<f64, InvalidLikelihoodScale> {
+        self.resolved_scale()?.gaussian_log_phi()
+    }
+
+    #[inline]
+    pub fn resolved_gaussian_phi(&self) -> Result<f64, InvalidLikelihoodScale> {
+        self.resolved_scale()?.gaussian_phi()
     }
 
     #[inline]
@@ -2048,10 +2430,21 @@ impl GlmLikelihoodSpec {
     /// Beta, …) used by predictive-interval construction — a distinct quantity
     /// from the coefficient-covariance scale defined here.
     #[inline]
-    pub fn coefficient_covariance_scale(&self, profiled_gaussian_phi: f64) -> f64 {
-        match self.scale {
+    pub fn coefficient_covariance_scale(
+        &self,
+        profiled_gaussian_phi: f64,
+    ) -> Result<f64, InvalidLikelihoodScale> {
+        match self.resolved_scale()? {
             // Scale-free working weight: restore the profiled variance.
-            LikelihoodScaleMetadata::ProfiledGaussian => profiled_gaussian_phi,
+            ResolvedLikelihoodScale::ProfiledGaussian => {
+                if profiled_gaussian_phi.is_finite() && profiled_gaussian_phi >= 0.0 {
+                    Ok(profiled_gaussian_phi)
+                } else {
+                    Err(InvalidLikelihoodScale::new(format!(
+                        "profiled Gaussian covariance scale must be finite and non-negative, got {profiled_gaussian_phi:?}"
+                    )))
+                }
+            }
             // Working weight already carries the dispersion / full Fisher
             // information, so the stored H is the true penalized Hessian and no
             // further dispersion multiply is warranted.
@@ -2061,11 +2454,11 @@ impl GlmLikelihoodSpec {
             // variants fold their reciprocal-dispersion / precision / φ into W
             // (Tweedie W = prior·μ^{2−p}/φ, so the SE already scales as √φ); and
             // Unspecified families never expose a separate post-hoc scale.
-            LikelihoodScaleMetadata::FixedDispersion { .. }
-            | LikelihoodScaleMetadata::FixedGammaShape { .. }
-            | LikelihoodScaleMetadata::EstimatedGammaShape { .. }
-            | LikelihoodScaleMetadata::EstimatedBetaPhi { .. }
-            | LikelihoodScaleMetadata::EstimatedTweediePhi { .. }
+            ResolvedLikelihoodScale::FixedGaussian { .. }
+            | ResolvedLikelihoodScale::Unit
+            | ResolvedLikelihoodScale::Gamma { .. }
+            | ResolvedLikelihoodScale::BetaPrecision { .. }
+            | ResolvedLikelihoodScale::Tweedie { .. }
             // Negative-Binomial folds `theta` into the working weight
             // `W = μθ/(θ+μ)` (the full NB2 Fisher information), so the stored
             // `H = XᵀWX + S_λ` is already the true penalized Hessian and the
@@ -2073,9 +2466,10 @@ impl GlmLikelihoodSpec {
             // the data's overdispersion entirely through that `theta`-dependent
             // weight (issue #802) — multiplying again would double-count it.
             // The same holds verbatim for a user-fixed `theta` (issue #983).
-            | LikelihoodScaleMetadata::EstimatedNegBinTheta { .. }
-            | LikelihoodScaleMetadata::FixedNegBinTheta { .. }
-            | LikelihoodScaleMetadata::Unspecified => 1.0,
+            | ResolvedLikelihoodScale::NegativeBinomial { .. } => Ok(1.0),
+            ResolvedLikelihoodScale::NoScalarScale => Err(InvalidLikelihoodScale::new(
+                "family has no scalar coefficient-covariance scale".to_string(),
+            )),
         }
     }
 
