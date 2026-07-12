@@ -2157,12 +2157,27 @@ pub fn fit_stagewise_batched(
             frozen_joint_penalized_quasi_laplace(&mut term, target, &rho, registry, base)?;
         let cur_ev = ev_of(&term, target);
 
-        // ── PARALLEL racing: fit every candidate's K=1 sub-problem concurrently ──
-        // Each `race_birth_seed` clones `term` internally and mutates nothing
-        // shared; a candidate whose fit errors is dropped (mirrors the serial
+        // ── SEQUENTIAL racing, PARALLEL rows: fit candidates one at a time ──
+        // This loop was `par_iter()` and it starved the whole machine: running
+        // `race_birth_seed` as a rayon worker makes
+        // `rayon::current_thread_index()` return `Some(_)` for the ENTIRE
+        // nested K=1 joint fit, so every downstream row-fan gate
+        // (`n >= THRESHOLD && current_thread_index().is_none()` in
+        // loss_scaled, CpuBatchedBlockSolver::factor_blocks, the reduced-Schur
+        // row loops) collapsed to its sequential fallback simultaneously. With
+        // only ~2-3 certifiable candidates per round, that meant 2-3 cores
+        // busy and the rest parked for the full n·inner_max_iter solve
+        // (observed live on 44k-row GPT-2 residuals). Candidates are
+        // numerically independent (`race_birth_seed` clones `term`, nothing
+        // folds across candidates) and the row loops are contractually
+        // bit-identical across their parallel/sequential branches
+        // (par_pairwise_sum / tests_parallelism_invariance_1557), so
+        // serializing the outer loop changes no candidate's result — it only
+        // re-enables the wide, high-efficiency row fan inside each one.
+        // A candidate whose fit errors is dropped (mirrors the serial
         // `.ok()`), never aborting the round.
         let raced: Vec<RacedCandidate> = seeds
-            .par_iter()
+            .iter()
             .filter_map(|s| {
                 race_birth_seed(&term, &rho, s, residual.view(), target, registry, base).ok()
             })
