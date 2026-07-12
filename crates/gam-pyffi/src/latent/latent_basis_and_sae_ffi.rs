@@ -405,7 +405,7 @@ fn set_aux_strength_items<'py>(
 /// `exp(log_alpha)` once, before any fit or gradient work.  Keeping both views
 /// prevents value/gradient desynchronization and removes exponentials from the
 /// observation loops and latent-optimizer iterations.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ValidatedDimSelectionPrecisions {
     log: Array1<f64>,
     physical: Array1<f64>,
@@ -421,9 +421,8 @@ impl ValidatedDimSelectionPrecisions {
         }
         let mut physical = Array1::<f64>::zeros(latent_dim);
         for (axis, (&log_alpha, alpha)) in log.iter().zip(physical.iter_mut()).enumerate() {
-            *alpha = gam::checked_exp_log_strength(log_alpha).map_err(|error| {
-                format!("dim_selection_log_precision[{axis}]: {error}")
-            })?;
+            *alpha = gam::checked_exp_log_strength(log_alpha)
+                .map_err(|error| format!("dim_selection_log_precision[{axis}]: {error}"))?;
         }
         Ok(Self {
             log: log.to_owned(),
@@ -445,29 +444,29 @@ impl ValidatedDimSelectionPrecisions {
         let mut scale = 0.0_f64;
         let mut sumsq = 1.0_f64;
         for &coordinate in t.column(axis) {
-                if !coordinate.is_finite() {
-                    return Err(format!(
-                        "latent coordinate on dim-selection axis {axis} must be finite; got \
+            if !coordinate.is_finite() {
+                return Err(format!(
+                    "latent coordinate on dim-selection axis {axis} must be finite; got \
                          {coordinate}"
-                    ));
-                }
-                let magnitude = (multiplier * coordinate).abs();
-                if !magnitude.is_finite() {
-                    return Err(format!(
-                        "dim-selection prior energy is unrepresentable on axis {axis}"
-                    ));
-                }
-                if magnitude == 0.0 {
-                    continue;
-                }
-                if scale < magnitude {
-                    let ratio = scale / magnitude;
-                    sumsq = 1.0 + sumsq * ratio * ratio;
-                    scale = magnitude;
-                } else {
-                    let ratio = magnitude / scale;
-                    sumsq += ratio * ratio;
-                }
+                ));
+            }
+            let magnitude = (multiplier * coordinate).abs();
+            if !magnitude.is_finite() {
+                return Err(format!(
+                    "dim-selection prior energy is unrepresentable on axis {axis}"
+                ));
+            }
+            if magnitude == 0.0 {
+                continue;
+            }
+            if scale < magnitude {
+                let ratio = scale / magnitude;
+                sumsq = 1.0 + sumsq * ratio * ratio;
+                scale = magnitude;
+            } else {
+                let ratio = magnitude / scale;
+                sumsq += ratio * ratio;
+            }
         }
         let energy = if scale == 0.0 {
             0.0
@@ -497,8 +496,7 @@ impl ValidatedDimSelectionPrecisions {
         let mut compensation = 0.0_f64;
         for axis in 0..self.log.len() {
             let energy = self.axis_energy(t, axis)?;
-            let axis_score =
-                energy - 0.5 * t.nrows() as f64 * self.log[axis];
+            let axis_score = energy - 0.5 * t.nrows() as f64 * self.log[axis];
             if !axis_score.is_finite() {
                 return Err(format!(
                     "dim-selection prior score is unrepresentable on axis {axis}"
@@ -518,6 +516,39 @@ impl ValidatedDimSelectionPrecisions {
         } else {
             Err("dim-selection prior score is unrepresentable".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod dim_selection_precision_domain_tests {
+    use super::ValidatedDimSelectionPrecisions;
+    use ndarray::array;
+
+    #[test]
+    fn validates_the_complete_vector_in_axis_order_on_the_shared_domain() {
+        let logs = array![0.0, 701.0, f64::NAN];
+        let error = ValidatedDimSelectionPrecisions::new(logs.view(), 3).unwrap_err();
+        assert!(error.contains("dim_selection_log_precision[1]"));
+        assert!(error.contains("[-700, 700]"));
+    }
+
+    #[test]
+    fn caches_exact_endpoint_precisions_and_scales_large_coordinate_energy() {
+        let logs = array![-700.0, 700.0];
+        let precisions = ValidatedDimSelectionPrecisions::new(logs.view(), 2).unwrap();
+        for axis in 0..2 {
+            assert_eq!(
+                precisions.physical[axis].to_bits(),
+                gam::checked_exp_log_strength(logs[axis]).unwrap().to_bits()
+            );
+        }
+
+        // Squaring 1e200 first overflows, while alpha=exp(-700) makes the final
+        // normalized prior energy representable. The scaled norm preserves it.
+        let tiny = ValidatedDimSelectionPrecisions::new(array![-700.0].view(), 1).unwrap();
+        let coordinates = array![[1.0e200], [-1.0e200]];
+        let energy = tiny.axis_energy(coordinates.view(), 0).unwrap();
+        assert!(energy.is_finite() && energy > 0.0);
     }
 }
 
@@ -1476,14 +1507,13 @@ fn gaussian_reml_fit_latent_impl(
     .map_err(|err| err.to_string())?;
     // Fixes audit-revised claim that ARD / aux-prior REML selection requires
     // normalized priors, not raw quadratic corrections alone.
-    let (mut latent_prior_score, aux_strength_state) =
-        latent_prior_score_and_aux_state_for_t(
-            t_mat.view(),
-            aux_u,
-            aux_family,
-            aux_strength,
-            dim_selection_precision,
-        )?;
+    let (mut latent_prior_score, aux_strength_state) = latent_prior_score_and_aux_state_for_t(
+        t_mat.view(),
+        aux_u,
+        aux_family,
+        aux_strength,
+        dim_selection_precision,
+    )?;
     if let Some(registry) = analytic_penalties {
         latent_prior_score += analytic_penalty_value_for_targets(registry, t_flat, None)?;
     }

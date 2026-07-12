@@ -4,7 +4,7 @@ use faer::Accum;
 use faer::Par;
 use faer::linalg::matmul::matmul;
 use gam_linalg::faer_ndarray::{FaerArrayView, array2_to_matmut, fast_atv, fast_av};
-use gam_linalg::matrix::{DenseDesignOperator, LinearOperator};
+use gam_linalg::matrix::{DenseDesignOperator, FiniteSignedWeightsView, LinearOperator};
 use gam_problem::Gauge;
 use gam_runtime::resource::{MaterializationPolicy, MatrixMaterializationError};
 use ndarray::{Array1, Array2, ArrayViewMut2, s};
@@ -215,6 +215,15 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
         result
     }
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if weights.len() != self.n {
+            return Err(format!(
+                "ChunkedSpatialKernelDesign::diag_xtw_x weight length mismatch: weights={}, nrows={}",
+                weights.len(),
+                self.n
+            ));
+        }
+        FiniteSignedWeightsView::try_from_array(weights)
+            .map_err(|reason| format!("ChunkedSpatialKernelDesign::diag_xtw_x: {reason}"))?;
         let p = self.total_cols;
         // The basis router chose this operator because the dense design was not
         // admitted. Preserve that decision and accumulate XᵀWX from bounded
@@ -440,5 +449,33 @@ mod chunked_kernel_operator_tests {
             dense_design.as_dense_ref().is_none(),
             "chunked kernel operations must not warm a hidden full-design cache"
         );
+    }
+
+    #[test]
+    fn chunked_kernel_gram_is_signed_and_rejects_nonfinite_rows() {
+        let data = Arc::new(array![[1.0], [2.0], [3.0]]);
+        let centers = Arc::new(array![[0.5], [-1.0]]);
+        let kernel = |x: &[f64], c: &[f64]| x[0] + c[0];
+        let op = ChunkedKernelDesignOperator::new(
+            data,
+            centers,
+            kernel,
+            None,
+            None,
+            strict_materialization_policy(),
+        )
+        .unwrap();
+        let dense = op.to_dense();
+        let weights = array![2.0, -3.0, 0.25];
+        let expected = dense
+            .t()
+            .dot(&(&dense * weights.view().insert_axis(ndarray::Axis(1))));
+        let got = op.diag_xtw_x(&weights).unwrap();
+        assert!((&got - &expected).iter().all(|value| value.abs() < 1e-12));
+
+        let err = op
+            .diag_xtw_x(&array![1.0, f64::NAN, f64::INFINITY])
+            .unwrap_err();
+        assert!(err.contains("row 1"), "unexpected diagnostic: {err}");
     }
 }

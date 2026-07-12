@@ -118,6 +118,24 @@ fn signed_log_exp_difference(a: f64, b: f64) -> (f64, f64) {
     }
 }
 
+/// `(sign(a-b), log|a-b|)` for finite signed scalars, including an exact
+/// difference whose ordinary subtraction overflows.
+#[inline]
+fn signed_log_difference(a: f64, b: f64) -> (f64, f64) {
+    let difference = a - b;
+    if difference.is_finite() {
+        return if difference == 0.0 {
+            (0.0, f64::NEG_INFINITY)
+        } else {
+            (difference.signum(), difference.abs().ln())
+        };
+    }
+    // Finite a/b can overflow only when their signs oppose. Their magnitudes
+    // add, and the sign is the sign of `a` (or `-b` when a is zero).
+    let sign = if a != 0.0 { a.signum() } else { -b.signum() };
+    (sign, logaddexp(a.abs().ln(), b.abs().ln()))
+}
+
 #[inline]
 fn expm1_minus_x(x: f64) -> f64 {
     if x.abs() > 0.5 {
@@ -126,6 +144,28 @@ fn expm1_minus_x(x: f64) -> f64 {
     let mut term = 0.5 * x * x;
     let mut sum = term;
     let mut k = 2.0;
+    loop {
+        k += 1.0;
+        term *= x / k;
+        let next = sum + term;
+        if next == sum {
+            return next;
+        }
+        sum = next;
+    }
+}
+
+#[inline]
+fn exprel(x: f64) -> f64 {
+    if x == 0.0 {
+        return 1.0;
+    }
+    if x.abs() > 0.5 {
+        return x.exp_m1() / x;
+    }
+    let mut term = 1.0;
+    let mut sum = term;
+    let mut k = 1.0;
     loop {
         k += 1.0;
         term *= x / k;
@@ -241,6 +281,17 @@ fn log_tweedie_ratio_deviance(log_r: f64, p: f64) -> f64 {
             k += 1.0;
         }
     }
+    if log_r.abs() <= 50.0 {
+        let value = if q <= 0.5 {
+            // Factor q before subtracting the q→0 terms.
+            (log_r * exprel(q * log_r) - log_r.exp_m1()) / (q - 1.0)
+        } else {
+            // Factor p-1 before subtracting the p→1 terms.
+            let a = 1.0 - q;
+            (log_r.exp() * log_r * exprel(-a * log_r) - log_r.exp_m1()) / q
+        };
+        return value.ln();
+    }
     let log_b = log_r - (p - 1.0).ln();
     let log_c = -q.ln();
     let log_a = q * log_r - ((p - 1.0) * q).ln();
@@ -253,7 +304,7 @@ fn log_tweedie_ratio_deviance(log_r: f64, p: f64) -> f64 {
 fn log_tweedie_half_deviance(log_weight: f64, log_y: f64, eta: f64, p: f64) -> f64 {
     let q = 2.0 - p;
     let log_r = log_y - eta;
-    if log_r.abs() <= 0.25 {
+    if log_r.abs() <= 50.0 {
         return log_weight + q * eta + log_tweedie_ratio_deviance(log_r, p);
     }
     // Absolute-coordinate form of
@@ -395,6 +446,27 @@ pub(crate) fn deviance_eta_row(
     inverse_link: &InverseLink,
     prior_weight: f64,
 ) -> Result<DevianceEtaRow, EstimationError> {
+    deviance_eta_row_with_log_measure_scale(
+        row,
+        y,
+        eta,
+        likelihood,
+        inverse_link,
+        prior_weight,
+        0.0,
+    )
+}
+
+#[inline]
+fn deviance_eta_row_with_log_measure_scale(
+    row: usize,
+    y: f64,
+    eta: f64,
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    prior_weight: f64,
+    log_measure_scale: f64,
+) -> Result<DevianceEtaRow, EstimationError> {
     if !(prior_weight.is_finite() && prior_weight >= 0.0) {
         return Err(deviance_row_error(row, "prior weight", eta, prior_weight));
     }
@@ -407,7 +479,15 @@ pub(crate) fn deviance_eta_row(
     if !eta.is_finite() {
         return Err(deviance_row_error(row, "linear predictor", eta, eta));
     }
-    let log_weight = prior_weight.ln();
+    if !log_measure_scale.is_finite() {
+        return Err(deviance_row_error(
+            row,
+            "log likelihood measure scale",
+            eta,
+            log_measure_scale,
+        ));
+    }
+    let log_weight = prior_weight.ln() + log_measure_scale;
     let (half_deviance, eta_score) = match &likelihood.spec.response {
         ResponseFamily::Gaussian => {
             if !y.is_finite() {
@@ -417,11 +497,8 @@ pub(crate) fn deviance_eta_row(
             if !(phi.is_finite() && phi > 0.0) {
                 return Err(deviance_row_error(row, "Gaussian dispersion", eta, phi));
             }
-            let residual = y - eta;
-            if !residual.is_finite() {
-                return Err(deviance_row_error(row, "Gaussian residual", eta, residual));
-            }
-            let half = if residual == 0.0 {
+            let (residual_sign, residual_log_abs) = signed_log_difference(y, eta);
+            let half = if residual_sign == 0.0 {
                 0.0
             } else {
                 finite_signed_from_log(
@@ -429,18 +506,18 @@ pub(crate) fn deviance_eta_row(
                     "Gaussian half-deviance",
                     eta,
                     1.0,
-                    log_weight + 2.0 * residual.abs().ln() - phi.ln() - std::f64::consts::LN_2,
+                    log_weight + 2.0 * residual_log_abs - phi.ln() - std::f64::consts::LN_2,
                 )?
             };
-            let score = if residual == 0.0 {
+            let score = if residual_sign == 0.0 {
                 0.0
             } else {
                 finite_signed_from_log(
                     row,
                     "Gaussian eta score",
                     eta,
-                    -residual.signum(),
-                    log_weight + residual.abs().ln() - phi.ln(),
+                    -residual_sign,
+                    log_weight + residual_log_abs - phi.ln(),
                 )?
             };
             (half, score)
@@ -761,6 +838,24 @@ pub(crate) fn deviance_eta_rows(
     inverse_link: &InverseLink,
     priorweights: ArrayView1<f64>,
 ) -> Result<Vec<DevianceEtaRow>, EstimationError> {
+    deviance_eta_rows_with_log_measure_scale(
+        y,
+        eta,
+        likelihood,
+        inverse_link,
+        priorweights,
+        0.0,
+    )
+}
+
+pub(crate) fn deviance_eta_rows_with_log_measure_scale(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    priorweights: ArrayView1<f64>,
+    log_measure_scale: f64,
+) -> Result<Vec<DevianceEtaRow>, EstimationError> {
     if y.len() != eta.len() || priorweights.len() != eta.len() {
         crate::bail_invalid_estim!(
             "deviance row length mismatch: y={}, eta={}, prior_weights={}",
@@ -771,7 +866,17 @@ pub(crate) fn deviance_eta_rows(
     }
     let rows: Vec<Result<DevianceEtaRow, EstimationError>> = (0..eta.len())
         .into_par_iter()
-        .map(|i| deviance_eta_row(i, y[i], eta[i], likelihood, inverse_link, priorweights[i]))
+        .map(|i| {
+            deviance_eta_row_with_log_measure_scale(
+                i,
+                y[i],
+                eta[i],
+                likelihood,
+                inverse_link,
+                priorweights[i],
+                log_measure_scale,
+            )
+        })
         .collect();
     // Parallel evaluation, ordered certification: the smallest invalid row is
     // deterministic, and no caller-visible output exists until all rows pass.

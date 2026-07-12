@@ -441,10 +441,10 @@ fn ard_rho_derivative_matrix_2156(
     let mut dh = Array2::<f64>::zeros((dim, dim));
     let coord_offsets = term.assignment.coord_offsets();
     let periods = term.assignment.coords[atom].effective_axis_periods();
-    let alpha = rho.log_ard[atom][axis].exp();
+    let alpha = rho.ard_precisions().unwrap()[atom][axis];
     for row in 0..term.n_obs() {
         let t = term.assignment.coords[atom].row(row)[axis];
-        let hess = ArdAxisPrior::eval(alpha, t, periods[axis]).hess.max(0.0);
+        let hess = ArdAxisPrior::eval(alpha, t, periods[axis]).psd_majorizer_hess();
         let mut row_d = Array2::<f64>::zeros((cache.row_dims[row], cache.row_dims[row]));
         match term.last_row_layout.as_ref() {
             Some(layout) => {

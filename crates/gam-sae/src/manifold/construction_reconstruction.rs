@@ -13,7 +13,7 @@ use super::*;
 /// interval.  A tiny excursion at the forward-error scale of the accumulated
 /// trace is snapped to the boundary; a material excursion is a failed trace
 /// certificate, not an EDF that may be silently projected into another model.
-fn certified_ard_axis_edf(
+pub(super) fn certified_ard_axis_edf(
     n_active: f64,
     alpha: f64,
     inverse_trace: f64,
@@ -52,6 +52,26 @@ fn certified_ard_axis_edf(
         ));
     }
     Ok(raw.clamp(0.0, n_active))
+}
+
+#[cfg(test)]
+mod ard_edf_certificate_tests {
+    use super::certified_ard_axis_edf;
+
+    #[test]
+    fn snaps_only_trace_roundoff_at_the_ard_edf_faces() {
+        let n = 8.0;
+        let tiny = 8.0 * f64::EPSILON;
+        assert_eq!(certified_ard_axis_edf(n, 1.0, -tiny, 0, 0).unwrap(), n);
+        assert_eq!(certified_ard_axis_edf(n, 1.0, n + tiny, 0, 0).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn refuses_material_or_nonfinite_ard_edf_excursions() {
+        for trace in [-1.0e-8, 8.0 + 1.0e-8, f64::NAN, f64::INFINITY] {
+            assert!(certified_ard_axis_edf(8.0, 1.0, trace, 2, 3).is_err());
+        }
+    }
 }
 
 fn persisted_atom_basis_values(

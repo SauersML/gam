@@ -411,8 +411,9 @@ fn sae_manifold_fit_model<'py>(
     }
     let has_declared_bases = atom_basis.is_some();
     let basis_seed = match atom_basis {
-        Some(values) => expand_public_fit_values(values, k_atoms, "atom_basis")
-            .map_err(py_value_error)?,
+        Some(values) => {
+            expand_public_fit_values(values, k_atoms, "atom_basis").map_err(py_value_error)?
+        }
         None => {
             let basis = gam::terms::sae::atom_schema::basis_kind_for_topology(
                 atom_topology.as_deref().unwrap_or("auto"),
@@ -422,8 +423,7 @@ fn sae_manifold_fit_model<'py>(
         }
     };
     for basis in &basis_seed {
-        gam::terms::sae::atom_schema::validate_seed_basis_kind(basis)
-            .map_err(py_value_error)?;
+        gam::terms::sae::atom_schema::validate_seed_basis_kind(basis).map_err(py_value_error)?;
     }
     let atom_basis = basis_seed.clone();
     let declared_bases = has_declared_bases.then(|| basis_seed.clone());
@@ -433,8 +433,8 @@ fn sae_manifold_fit_model<'py>(
             .ok_or_else(|| {
                 py_value_error("sae_manifold_fit requires at least one atom".to_string())
             })?;
-        let requested = gam::terms::sae::atom_schema::canonical_topology(topology)
-            .map_err(py_value_error)?;
+        let requested =
+            gam::terms::sae::atom_schema::canonical_topology(topology).map_err(py_value_error)?;
         if resolved != requested {
             return Err(py_value_error(format!(
                 "sae_manifold_fit: atom_basis resolves to topology {resolved:?}, but atom_topology resolves to {requested:?}"
@@ -930,7 +930,9 @@ fn sae_manifold_certify_external<'py>(
     let assignment = match assignment_kind.as_str() {
         "softmax" => gam::terms::sae::manifold::SaeOosAssignmentKind::Softmax,
         "ordered_beta_bernoulli" => {
-            gam::terms::sae::manifold::SaeOosAssignmentKind::OrderedBetaBernoulli { learnable_alpha }
+            gam::terms::sae::manifold::SaeOosAssignmentKind::OrderedBetaBernoulli {
+                learnable_alpha,
+            }
         }
         "threshold_gate" => gam::terms::sae::manifold::SaeOosAssignmentKind::ThresholdGate {
             threshold: threshold_gate_threshold,
@@ -985,7 +987,9 @@ fn sae_manifold_certify_external<'py>(
                 n_obs,
                 p_out,
                 fisher_provenance.as_deref(),
-                fisher_mass_residual_owned.as_ref().map(|values| values.view()),
+                fisher_mass_residual_owned
+                    .as_ref()
+                    .map(|values| values.view()),
             )
             .map_err(py_value_error)?;
             Some(build_sae_fisher_row_metric(request).map_err(py_value_error)?)
@@ -1001,11 +1005,9 @@ fn sae_manifold_certify_external<'py>(
         Some(s) => Some(serde_json::from_str(&s).map_err(serde_json_error_to_pyerr)?),
         None => None,
     };
-    let max_atom_dim = atom_dim
-        .iter()
-        .copied()
-        .max()
-        .ok_or_else(|| py_value_error("sae_manifold_certify_external: atom_dim is empty".to_string()))?;
+    let max_atom_dim = atom_dim.iter().copied().max().ok_or_else(|| {
+        py_value_error("sae_manifold_certify_external: atom_dim is empty".to_string())
+    })?;
     let total_basis: usize = basis_size_list.iter().copied().sum();
     let mut latent_blocks = serde_json::Map::new();
     latent_blocks.insert(
@@ -1057,7 +1059,9 @@ fn sae_manifold_certify_external<'py>(
     // reasoning applies here on the pyffi side; keep this block in sync with
     // `sae_manifold_fit_inner`'s tail if that payload shape changes.
     let seed_refine_random_state = 0u64;
-    let fisher_mass_residual = fisher_mass_residual_owned.as_ref().map(|values| values.view());
+    let fisher_mass_residual = fisher_mass_residual_owned
+        .as_ref()
+        .map(|values| values.view());
     let gam::terms::sae::manifold::SaeFitReport {
         term,
         rho,

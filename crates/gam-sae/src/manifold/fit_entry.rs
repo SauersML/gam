@@ -1082,13 +1082,14 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         .validate_rho_domain(&rho)
         .map_err(SaeFitError::Fit)?;
     let ard_variances: Vec<Option<Array1<f64>>> = rho
-        .log_ard
+        .ard_precisions()
+        .map_err(SaeFitError::Fit)?
         .iter()
-        .map(|log_prec| {
-            if log_prec.is_empty() {
+        .map(|precision| {
+            if precision.is_empty() {
                 None
             } else {
-                Some(log_prec.mapv(|lp| (-lp).exp()))
+                Some(precision.mapv(|alpha| alpha.recip()))
             }
         })
         .collect();
@@ -1424,13 +1425,14 @@ pub fn run_sae_manifold_certify(request: SaeCertifyRequest) -> Result<SaeFitRepo
         .validate_rho_domain(&rho)
         .map_err(SaeFitError::Fit)?;
     let ard_variances: Vec<Option<Array1<f64>>> = rho
-        .log_ard
+        .ard_precisions()
+        .map_err(SaeFitError::Fit)?
         .iter()
-        .map(|log_prec| {
-            if log_prec.is_empty() {
+        .map(|precision| {
+            if precision.is_empty() {
                 None
             } else {
-                Some(log_prec.mapv(|lp| (-lp).exp()))
+                Some(precision.mapv(|alpha| alpha.recip()))
             }
         })
         .collect();

@@ -1911,6 +1911,11 @@ mod tests {
             -1.0e-100,
             max_relative = 3.0e-14
         );
+        let gaussian_overflowing_residual =
+            deviance_eta_row(0, f64::MAX, -f64::MAX, &gaussian, &identity, 1.0e-320)
+                .expect("weighted Gaussian opposite-sign residual remains finite");
+        assert!(gaussian_overflowing_residual.half_deviance.is_finite());
+        assert!(gaussian_overflowing_residual.eta_score.is_finite());
 
         let (gamma, log) = canonical(ResponseFamily::Gamma, StandardLink::Log);
         let gamma_balanced = deviance_eta_row(0, f64::MAX, -700.0, &gamma, &log, 1.0e-320)

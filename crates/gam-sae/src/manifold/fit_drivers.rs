@@ -962,6 +962,7 @@ impl SaeManifoldTerm {
         // side leaves that axis' `α` untransformed. Guarded on the rho/atom-count
         // invariant so a malformed rho leaves the priors untouched rather than
         // panicking during finalization.
+        let ard_precisions = rho.ard_precisions()?;
         if rho.log_ard.len() == self.k_atoms() {
             for atom_idx in 0..self.k_atoms() {
                 let log_ard = &rho.log_ard[atom_idx];
@@ -973,7 +974,7 @@ impl SaeManifoldTerm {
                     let pre = &ard_pre_spread[atom_idx];
                     let stamped: Array1<f64> = (0..log_ard.len())
                         .map(|axis| {
-                            let alpha = log_ard[axis].exp();
+                            let alpha = ard_precisions[atom_idx][axis];
                             let sp_pre = pre.get(axis).copied().unwrap_or(f64::NAN);
                             let sp_post = axis_coordinate_spread(
                                 coords.view(),

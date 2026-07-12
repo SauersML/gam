@@ -4,10 +4,7 @@
 /// error: it is a typed REML convergence failure whose full `OuterResult`
 /// remains the resume/evidence payload.  Keep that distinction instead of
 /// flattening `SaeFitError` through `Display` into `GamError`.
-fn sae_fit_error_to_pyerr(
-    py: Python<'_>,
-    err: gam::terms::sae::manifold::SaeFitError,
-) -> PyErr {
+fn sae_fit_error_to_pyerr(py: Python<'_>, err: gam::terms::sae::manifold::SaeFitError) -> PyErr {
     use gam::terms::sae::manifold::SaeFitError;
 
     let message = err.to_string();
@@ -340,7 +337,11 @@ fn gaussian_reml_optimize_latent<'py>(
                 .as_ref()
                 .riemannian_gradient(best_t.view(), gradient.view())
                 .map_err(|err| py_value_error(err.to_string()))?;
-            riemannian.iter().map(|value| value * value).sum::<f64>().sqrt()
+            riemannian
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt()
         }
         None => f64::INFINITY,
     };
@@ -704,14 +705,13 @@ fn glm_reml_fit_latent_impl(
         &opts,
     )
     .map_err(|err| err.to_string())?;
-    let (mut latent_prior_score, aux_strength_state) =
-        latent_prior_score_and_aux_state_for_t(
-            t_mat.view(),
-            aux_u,
-            aux_family,
-            aux_strength,
-            dim_selection_precision,
-        )?;
+    let (mut latent_prior_score, aux_strength_state) = latent_prior_score_and_aux_state_for_t(
+        t_mat.view(),
+        aux_u,
+        aux_family,
+        aux_strength,
+        dim_selection_precision,
+    )?;
     if let Some(registry) = analytic_penalties {
         latent_prior_score +=
             analytic_penalty_value_for_targets(registry, t_flat, Some(fit.beta.view()))?;
@@ -1124,8 +1124,7 @@ fn glm_reml_fit_latent_backward<'py>(
         }
         grad_aux_log_strength = Some(
             grad_reml_score
-                * (0.5 * stats.strength.mu * stats.residual_sq
-                    - 0.5 * (n_obs * latent_dim) as f64),
+                * (0.5 * stats.strength.mu * stats.residual_sq - 0.5 * (n_obs * latent_dim) as f64),
         );
     }
     if let Some(precisions) = dim_selection_precision.as_ref() {
@@ -1649,9 +1648,6 @@ fn gaussian_reml_fit_formula_dataset_impl(
         reml_score: fit.reml_score,
     })
 }
-
-
-
 
 fn gaussian_reml_fit_batched_impl(
     x: ArrayView2<'_, f64>,

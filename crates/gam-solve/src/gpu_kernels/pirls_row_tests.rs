@@ -189,6 +189,88 @@ fn poisson_score_does_not_materialize_an_overflowing_weighted_response() {
 }
 
 #[test]
+fn poisson_tail_deviance_avoids_dimensionless_overflow_and_rounded_minus_one() {
+    // y/mu is finite, but `(y/mu) * log(y/mu)` is not. The final weighted
+    // deviance is O(10^3), so refusing this row would be a false intermediate
+    // overflow.
+    let eta = crate::mixture_link::LOG_LINK_SOLVER_ETA_MIN;
+    let y = 1.0e4;
+    let prior_weight = 1.0e-4;
+    let left = row_reweight_cpu(
+        PirlsRowFamily::PoissonLog,
+        CurvatureMode::Fisher,
+        RowInput {
+            eta,
+            y,
+            prior_weight,
+        },
+        1.0,
+    )
+    .expect("absolute-coordinate Poisson deviance is representable");
+    let expected_half = prior_weight * y * (y.ln() - eta - 1.0) + left.w_fisher;
+    assert!(left.deviance.is_finite());
+    assert!((left.deviance - 2.0 * expected_half).abs() <= 8.0 * f64::EPSILON * expected_half);
+
+    // y/mu rounds below machine resolution, hence u=(y-mu)/mu rounds to -1;
+    // 0*log(0) in the ratio formula must not poison the representable answer.
+    let right = row_reweight_cpu(
+        PirlsRowFamily::PoissonLog,
+        CurvatureMode::Fisher,
+        RowInput {
+            eta: crate::mixture_link::LOG_LINK_SOLVER_ETA_MAX,
+            y: 1.0,
+            prior_weight: 1.0e-304,
+        },
+        1.0,
+    )
+    .expect("rounded u=-1 has a finite absolute-coordinate deviance");
+    assert!(right.deviance.is_finite() && right.deviance > 0.0);
+}
+
+#[test]
+fn gamma_tail_deviance_avoids_rounded_minus_one() {
+    let eta = crate::mixture_link::LOG_LINK_SOLVER_ETA_MAX;
+    let row = row_reweight_cpu(
+        PirlsRowFamily::GammaLog,
+        CurvatureMode::Fisher,
+        RowInput {
+            eta,
+            y: 1.0,
+            prior_weight: 0.5,
+        },
+        2.0,
+    )
+    .expect("Gamma deviance remains finite when y/mu rounds away");
+    assert_eq!(row.w_fisher, 1.0);
+    assert_eq!(row.grad_eta, -1.0);
+    let expected = 2.0 * (eta - 1.0 + (-eta).exp());
+    assert!((row.deviance - expected).abs() <= 8.0 * f64::EPSILON * expected.abs());
+}
+
+#[test]
+fn fractional_logit_deviance_retains_the_local_quadratic() {
+    let y = 0.3_f64;
+    let response_logit = y.ln() - (-y).ln_1p();
+    let eta = f64::from_bits(response_logit.to_bits() + 1);
+    let row = row_reweight_cpu(
+        PirlsRowFamily::BernoulliLogit,
+        CurvatureMode::Fisher,
+        RowInput {
+            eta,
+            y,
+            prior_weight: 1.0,
+        },
+        1.0,
+    )
+    .unwrap();
+    assert!(
+        row.deviance > 0.0,
+        "one-ULP displacement must not cancel to zero"
+    );
+    assert!(row.deviance.is_finite());
+}
+
+#[test]
 fn observed_noncanonical_weights_are_never_row_projected() {
     for family in [
         PirlsRowFamily::BernoulliProbit,
@@ -222,7 +304,6 @@ fn refusal_replay_selects_the_smallest_bad_row_atomically() {
         status_codes::OK,
         status_codes::RESPONSE,
         status_codes::RESPONSE,
-    ];
     assert!(matches!(
         replay_first_refusal(
             PirlsRowFamily::BernoulliLogit,

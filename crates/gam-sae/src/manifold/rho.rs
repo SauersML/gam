@@ -110,6 +110,29 @@ mod log_strength_domain_tests {
             .validate_log_strength_domain()
             .expect("the active smooth coordinate remains valid");
     }
+
+    #[test]
+    fn physical_accessors_revalidate_public_logs_and_never_reuse_stale_strengths() {
+        let mut rho = fully_active_rho();
+        rho.log_ard[0][0] = LOG_STRENGTH_MIN;
+        assert_eq!(
+            rho.ard_precisions().unwrap()[0][0].to_bits(),
+            LOG_STRENGTH_MIN.exp().to_bits()
+        );
+
+        // Public report/state fields may be mutated by downstream Rust code.
+        // Every physical conversion therefore revalidates current storage; no
+        // cached alpha/lambda can survive this mutation.
+        rho.log_ard[0][0] = LOG_STRENGTH_MAX + 1.0;
+        let error = rho.ard_precisions().unwrap_err();
+        assert!(error.contains("atom 0, axis 0"));
+
+        rho.log_lambda_smooth[0] = f64::NAN;
+        assert!(rho.lambda_smooth_for(0).is_err());
+        assert!(rho.lambda_smooth_vec().is_err());
+        rho.log_lambda_sparse = f64::INFINITY;
+        assert!(rho.lambda_sparse().is_err());
+    }
 }
 
 /// Whether assignment strength contributes an outer penalized quasi-Laplace coordinate.
@@ -551,7 +574,7 @@ impl SaeManifoldRho {
     /// is atomic: no table escapes unless every coordinate lies in the shared
     /// exact log-strength domain, and the first error is deterministic in
     /// `(atom, axis)` order.
-    pub(crate) fn ard_precisions(&self) -> Result<Vec<Array1<f64>>, String> {
+    pub fn ard_precisions(&self) -> Result<Vec<Array1<f64>>, String> {
         let mut precisions = Vec::with_capacity(self.log_ard.len());
         for (atom, log_block) in self.log_ard.iter().enumerate() {
             let mut block = Array1::<f64>::zeros(log_block.len());

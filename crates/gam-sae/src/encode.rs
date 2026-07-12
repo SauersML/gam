@@ -1367,7 +1367,7 @@ fn joint_encode_value_grad_hess(
             );
             value += prior.value;
             grad[start + axis] += prior.grad;
-            hess[[start + axis, start + axis]] += prior.hess.max(0.0);
+            hess[[start + axis, start + axis]] += prior.psd_majorizer_hess();
         }
     }
     Ok((value, grad, hess))

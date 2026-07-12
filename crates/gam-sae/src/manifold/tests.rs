@@ -3126,7 +3126,14 @@ pub(crate) fn reconstruction_dispersion_uses_ard_shrunk_coordinate_edf() {
         .sum();
     let beta_edf = (term.beta_dim() as f64 - smooth_edf).max(0.0);
     let traces = term.ard_inverse_traces(&cache).unwrap();
-    let coord_edf = (n as f64 - alpha * traces[0][0]).clamp(0.0, n as f64);
+    let coord_edf = super::construction_reconstruction::certified_ard_axis_edf(
+        n as f64,
+        alpha,
+        traces[0][0],
+        0,
+        0,
+    )
+    .unwrap();
     let rss = 2.0 * loss.data_fit;
     let expected = rss / ((n * p) as f64 - beta_edf - coord_edf).max(1.0);
     assert_abs_diff_eq!(dispersion, expected, epsilon = 1.0e-10);

@@ -31,6 +31,8 @@ pub(super) fn xt_diag_x_dense(
         }
         .into());
     }
+    FiniteSignedWeightsView::try_from_array(diag)
+        .map_err(|reason| format!("xt_diag_x_dense: {reason}"))?;
     Ok(fast_xt_diag_x(design, diag))
 }
 
@@ -59,6 +61,8 @@ pub(super) fn xt_diag_y_dense(
         }
         .into());
     }
+    FiniteSignedWeightsView::try_from_array(diag)
+        .map_err(|reason| format!("xt_diag_y_dense: {reason}"))?;
     Ok(fast_xt_diag_y(left, diag, right))
 }
 
@@ -95,6 +99,8 @@ pub(super) fn xt_diag_y_design(
             diag.len()
         ));
     }
+    FiniteSignedWeightsView::try_from_array(diag)
+        .map_err(|reason| format!("xt_diag_y_design: {reason}"))?;
     if let (Some(left_dense), Some(right_dense)) = (left.as_dense_ref(), right.as_dense_ref()) {
         return xt_diag_y_dense(left_dense, diag, right_dense);
     }

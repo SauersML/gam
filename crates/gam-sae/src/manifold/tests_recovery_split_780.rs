@@ -441,7 +441,7 @@ pub(crate) fn threshold_gate_assignment_prior_hessian_diag_is_exact_over_logit_s
         .expect("smooth threshold assignment prior hessian diag");
     let inv_tau = 1.0 / temperature;
     let inv_tau2 = inv_tau * inv_tau;
-    let sparsity_strength = rho.log_lambda_sparse.exp();
+    let sparsity_strength = rho.lambda_sparse().unwrap();
 
     assert_eq!(grad.len(), n * k);
     assert_eq!(diag.len(), n * k);

@@ -405,14 +405,18 @@ fn gamma_unit_deviance_near_one(u: f64) -> f64 {
     }
     let mut power = u * u;
     let mut sum = 0.5 * power;
-    for degree in 3..=14 {
+    for degree in 3..=32 {
         power *= u;
         let term = power / f64::from(degree);
-        if degree % 2 == 0 {
-            sum += term;
+        let next = if degree % 2 == 0 {
+            sum + term
         } else {
-            sum -= term;
+            sum - term
+        };
+        if next == sum {
+            break;
         }
+        sum = next;
     }
     sum
 }
@@ -425,11 +429,15 @@ fn poisson_unit_deviance_near_one(u: f64) -> f64 {
     }
     let mut power = u * u;
     let mut sum = 0.5 * power;
-    for degree in 3..=14 {
+    for degree in 3..=32 {
         power *= u;
         let coefficient =
             if degree % 2 == 0 { 1.0 } else { -1.0 } / (f64::from(degree) * f64::from(degree - 1));
-        sum += coefficient * power;
+        let next = sum + coefficient * power;
+        if next == sum {
+            break;
+        }
+        sum = next;
     }
     sum
 }
@@ -496,11 +504,18 @@ fn row_poisson_log(
     let u = (input.y - mu) / mu;
     let dev_base = if input.y == 0.0 {
         w_fisher
-    } else if u.is_finite() {
-        w_fisher * poisson_unit_deviance_near_one(u)
     } else {
-        let weighted_y = w_prior * input.y;
-        weighted_y * (input.y.ln() - input.eta) - weighted_y + w_fisher
+        // Accurate around saturation. In either far tail this dimensionless
+        // ratio can become non-finite before multiplication by a tiny weight;
+        // only then switch to the algebraically identical absolute-coordinate
+        // expression, whose products are balanced independently.
+        let scaled_unit = w_fisher * poisson_unit_deviance_near_one(u);
+        if scaled_unit.is_finite() && scaled_unit >= 0.0 {
+            scaled_unit
+        } else {
+            let weighted_y = positive_mul_div(w_fisher, input.y, mu);
+            weighted_y * (input.y.ln() - input.eta - 1.0) + w_fisher
+        }
     };
     let dev = 2.0 * dev_base;
     let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
@@ -547,8 +562,8 @@ fn row_gamma_log(
     if !(w_fisher.is_finite() && w_fisher > 0.0) {
         return Err(row_error(row, "Gamma Fisher weight", input.eta, w_fisher));
     }
-    let w_hessian = match mode {
-        CurvatureMode::Fisher => w_fisher,
+    let observed_ratio = match mode {
+        CurvatureMode::Fisher => None,
         CurvatureMode::Observed => {
             let weighted_ratio = positive_mul_div(w_fisher, input.y, mu);
             if !(weighted_ratio.is_finite() && weighted_ratio > 0.0) {
@@ -559,9 +574,10 @@ fn row_gamma_log(
                     weighted_ratio,
                 ));
             }
-            weighted_ratio
+            Some(weighted_ratio)
         }
     };
+    let w_hessian = observed_ratio.unwrap_or(w_fisher);
     if !w_hessian.is_finite() {
         return Err(row_error(
             row,
@@ -571,14 +587,26 @@ fn row_gamma_log(
         ));
     }
     let u = (input.y - mu) / mu;
-    let (grad_eta, dev_base) = if u.is_finite() {
-        (w_fisher * u, w_fisher * gamma_unit_deviance_near_one(u))
+    // `u` rounds to exactly -1 when y/mu is a representable but very small
+    // ratio, and the dimensionless expression can overflow for the opposite
+    // tail. Preserve the local-series path whenever it succeeds, then use the
+    // weighted absolute-coordinate identity for those two tail cases.
+    let scaled_unit = w_fisher * gamma_unit_deviance_near_one(u);
+    let need_weighted_ratio = !u.is_finite() || !(scaled_unit.is_finite() && scaled_unit >= 0.0);
+    let weighted_ratio = if need_weighted_ratio {
+        observed_ratio.unwrap_or_else(|| positive_mul_div(w_fisher, input.y, mu))
     } else {
-        let weighted_ratio = positive_mul_div(w_fisher, input.y, mu);
-        (
-            weighted_ratio - w_fisher,
-            weighted_ratio - w_fisher * (1.0 + input.y.ln() - input.eta),
-        )
+        0.0
+    };
+    let grad_eta = if u.is_finite() {
+        w_fisher * u
+    } else {
+        weighted_ratio - w_fisher
+    };
+    let dev_base = if scaled_unit.is_finite() && scaled_unit >= 0.0 {
+        scaled_unit
+    } else {
+        weighted_ratio - w_fisher * (1.0 + input.y.ln() - input.eta)
     };
     let dev = 2.0 * dev_base;
     certify_output(
@@ -770,25 +798,135 @@ fn row_bernoulli_noncanonical(
 }
 
 #[inline]
-fn xlogy(x: f64, y: f64) -> f64 {
-    if x == 0.0 { 0.0 } else { x * y.ln() }
-}
-
-#[inline]
 fn softplus(x: f64) -> f64 {
     x.max(0.0) + (-x.abs()).exp().ln_1p()
 }
 
 #[inline]
+fn expm1_minus_x(x: f64) -> f64 {
+    if x.abs() > 0.5 {
+        return x.exp_m1() - x;
+    }
+    let mut term = 0.5 * x * x;
+    let mut sum = term;
+    let mut degree = 2.0;
+    loop {
+        degree += 1.0;
+        term *= x / degree;
+        let next = sum + term;
+        if next == sum {
+            return next;
+        }
+        sum = next;
+    }
+}
+
+#[inline]
+fn log1p_minus_x(x: f64) -> f64 {
+    if x.abs() > 0.5 {
+        return x.ln_1p() - x;
+    }
+    let mut power = x * x;
+    let mut sign = -1.0;
+    let mut degree = 2.0;
+    let mut sum = sign * power / degree;
+    loop {
+        power *= x;
+        sign = -sign;
+        degree += 1.0;
+        let next = sum + sign * power / degree;
+        if next == sum {
+            return next;
+        }
+        sum = next;
+    }
+}
+
+#[inline]
+fn logistic(x: f64) -> f64 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
+
+/// `KL(sigmoid(a) || sigmoid(b))` without subtracting entropy from cross
+/// entropy. The local branch evaluates only second-order remainders.
+#[inline]
+fn bernoulli_kl_from_logits(a: f64, b: f64) -> f64 {
+    if a == b {
+        return 0.0;
+    }
+    let h = b - a;
+    if h.abs() <= 0.5 {
+        let (p, local_h) = if a <= 0.0 {
+            (logistic(a), h)
+        } else {
+            (logistic(-a), -h)
+        };
+        let em1 = local_h.exp_m1();
+        let x = p * em1;
+        return log1p_minus_x(x) + p * expm1_minus_x(local_h);
+    }
+    if a <= 0.0 {
+        let p = logistic(a);
+        p * (a - b) + softplus(b) - softplus(a)
+    } else {
+        let q = logistic(-a);
+        q * (b - a) + softplus(-b) - softplus(-a)
+    }
+}
+
+/// Accurate Poisson deviance cell `x log(x/m) + m - x`. The local series is
+/// used only when its contraction factor is small, so the loop is short and
+/// deterministic on both CPU and GPU.
+#[inline]
+fn bd0(x: f64, m: f64) -> f64 {
+    if x == 0.0 {
+        return m;
+    }
+    if x == m {
+        return 0.0;
+    }
+    let hi = x.max(m);
+    let lo = x.min(m);
+    if (x - m).abs() / hi < 0.2 {
+        let v = ((x - m) / hi) / (1.0 + lo / hi);
+        let mut sum = (x - m) * v;
+        let mut term = 2.0 * x * v;
+        let v2 = v * v;
+        let mut denominator = 3.0;
+        loop {
+            term *= v2;
+            let next = sum + term / denominator;
+            if next == sum {
+                return next;
+            }
+            sum = next;
+            denominator += 2.0;
+        }
+    }
+    x * (x.ln() - m.ln()) + (m - x)
+}
+
+#[inline]
 fn bernoulli_logit_deviance(y: f64, eta: f64, w: f64) -> f64 {
-    let log_mu = -softplus(-eta);
-    let log_one_minus_mu = -softplus(eta);
-    2.0 * w * (xlogy(y, y) + xlogy(1.0 - y, 1.0 - y) - y * log_mu - (1.0 - y) * log_one_minus_mu)
+    let unit = if y == 0.0 {
+        softplus(eta)
+    } else if y == 1.0 {
+        softplus(-eta)
+    } else {
+        let response_logit = y.ln() - (-y).ln_1p();
+        bernoulli_kl_from_logits(response_logit, eta)
+    };
+    2.0 * w * unit
 }
 
 #[inline]
 fn bernoulli_deviance(y: f64, mu: f64, w: f64) -> f64 {
-    2.0 * w * (xlogy(y, y) + xlogy(1.0 - y, 1.0 - y) - y * mu.ln() - (1.0 - y) * (-mu).ln_1p())
+    2.0 * w * (bd0(y, mu) + bd0(1.0 - y, 1.0 - mu))
 }
 
 /// Stable Φ(x) using the complementary error function with the same identity
@@ -1624,24 +1762,99 @@ __device__ __forceinline__ bool pirls_log_eta_valid(double eta) {
     return eta >= PIRLS_LOG_ETA_MIN && eta <= PIRLS_LOG_ETA_MAX;
 }
 
-__device__ __forceinline__ double xlogy(double x, double y) {
-    return x == 0.0 ? 0.0 : x * log(y);
-}
-
 __device__ __forceinline__ double softplus(double x) {
     return (x > 0.0 ? x : 0.0) + log1p(exp(-fabs(x)));
 }
 
+__device__ __forceinline__ double expm1_minus_x(double x) {
+    if (fabs(x) > 0.5) return expm1(x) - x;
+    double term = 0.5 * x * x;
+    double sum = term;
+    double degree = 2.0;
+    for (;;) {
+        degree += 1.0;
+        term *= x / degree;
+        double next = sum + term;
+        if (next == sum) return next;
+        sum = next;
+    }
+}
+
+__device__ __forceinline__ double log1p_minus_x(double x) {
+    if (fabs(x) > 0.5) return log1p(x) - x;
+    double power = x * x;
+    double sign = -1.0;
+    double degree = 2.0;
+    double sum = sign * power / degree;
+    for (;;) {
+        power *= x;
+        sign = -sign;
+        degree += 1.0;
+        double next = sum + sign * power / degree;
+        if (next == sum) return next;
+        sum = next;
+    }
+}
+
+__device__ __forceinline__ double logistic(double x) {
+    if (x >= 0.0) return 1.0 / (1.0 + exp(-x));
+    double e = exp(x);
+    return e / (1.0 + e);
+}
+
+__device__ __forceinline__ double bernoulli_kl_from_logits(double a, double b) {
+    if (a == b) return 0.0;
+    double h = b - a;
+    if (fabs(h) <= 0.5) {
+        double p = a <= 0.0 ? logistic(a) : logistic(-a);
+        double local_h = a <= 0.0 ? h : -h;
+        double em1 = expm1(local_h);
+        double x = p * em1;
+        return log1p_minus_x(x) + p * expm1_minus_x(local_h);
+    }
+    if (a <= 0.0) {
+        double p = logistic(a);
+        return p * (a - b) + softplus(b) - softplus(a);
+    }
+    double q = logistic(-a);
+    return q * (b - a) + softplus(-b) - softplus(-a);
+}
+
+__device__ __forceinline__ double bd0(double x, double m) {
+    if (x == 0.0) return m;
+    if (x == m) return 0.0;
+    double hi = x > m ? x : m;
+    double lo = x < m ? x : m;
+    if (fabs(x - m) / hi < 0.2) {
+        double v = ((x - m) / hi) / (1.0 + lo / hi);
+        double sum = (x - m) * v;
+        double term = 2.0 * x * v;
+        double v2 = v * v;
+        double denominator = 3.0;
+        for (;;) {
+            term *= v2;
+            double next = sum + term / denominator;
+            if (next == sum) return next;
+            sum = next;
+            denominator += 2.0;
+        }
+    }
+    return x * (log(x) - log(m)) + (m - x);
+}
+
 __device__ __forceinline__ double bernoulli_deviance(double y, double mu, double w) {
-    return 2.0 * w * (xlogy(y, y) + xlogy(1.0 - y, 1.0 - y)
-        - y * log(mu) - (1.0 - y) * log1p(-mu));
+    return 2.0 * w * (bd0(y, mu) + bd0(1.0 - y, 1.0 - mu));
 }
 
 __device__ __forceinline__ double logit_deviance(double y, double eta, double w) {
-    double log_mu = -softplus(-eta);
-    double log_one_minus_mu = -softplus(eta);
-    return 2.0 * w * (xlogy(y, y) + xlogy(1.0 - y, 1.0 - y)
-        - y * log_mu - (1.0 - y) * log_one_minus_mu);
+    double unit;
+    if (y == 0.0) unit = softplus(eta);
+    else if (y == 1.0) unit = softplus(-eta);
+    else {
+        double response_logit = log(y) - log1p(-y);
+        unit = bernoulli_kl_from_logits(response_logit, eta);
+    }
+    return 2.0 * w * unit;
 }
 
 __device__ __forceinline__ double std_norm_cdf(double x) {
@@ -1675,10 +1888,12 @@ __device__ __forceinline__ double gamma_unit_deviance_near_one(double u) {
     if (fabs(u) > 0.125) return u - log1p(u);
     double power = u * u;
     double sum = 0.5 * power;
-    for (int degree = 3; degree <= 14; ++degree) {
+    for (int degree = 3; degree <= 32; ++degree) {
         power *= u;
         double term = power / (double)degree;
-        sum += (degree & 1) ? -term : term;
+        double next = sum + ((degree & 1) ? -term : term);
+        if (next == sum) break;
+        sum = next;
     }
     return sum;
 }
@@ -1687,11 +1902,13 @@ __device__ __forceinline__ double poisson_unit_deviance_near_one(double u) {
     if (fabs(u) > 0.125) return (1.0 + u) * log1p(u) - u;
     double power = u * u;
     double sum = 0.5 * power;
-    for (int degree = 3; degree <= 14; ++degree) {
+    for (int degree = 3; degree <= 32; ++degree) {
         power *= u;
         double coefficient = ((degree & 1) ? -1.0 : 1.0)
             / ((double)degree * (double)(degree - 1));
-        sum += coefficient * power;
+        double next = sum + coefficient * power;
+        if (next == sum) break;
+        sum = next;
     }
     return sum;
 }
@@ -1854,11 +2071,14 @@ fn poisson_log_body(curvature: CurvatureMode) -> String {
             double dev_base;
             if (y_i == 0.0) {{
                 dev_base = w_fisher;
-            }} else if (isfinite(u)) {{
-                dev_base = w_fisher * poisson_unit_deviance_near_one(u);
             }} else {{
-                double weighted_y = wp * y_i;
-                dev_base = weighted_y * (log(y_i) - eta_i) - weighted_y + w_fisher;
+                double scaled_unit = w_fisher * poisson_unit_deviance_near_one(u);
+                if (isfinite(scaled_unit) && scaled_unit >= 0.0) {{
+                    dev_base = scaled_unit;
+                }} else {{
+                    double weighted_y = positive_mul_div(w_fisher, y_i, mu);
+                    dev_base = weighted_y * (log(y_i) - eta_i - 1.0) + w_fisher;
+                }}
             }}
             if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
             dev = 2.0 * dev_base;
@@ -1906,13 +2126,21 @@ fn gamma_log_body(curvature: CurvatureMode) -> String {
         if (!isfinite(w_hessian)) pirls_refuse(&status, PIRLS_OBSERVED_WEIGHT);
         w_solver = w_hessian;
         double u = (y_i - mu) / mu;
+        double scaled_unit = w_fisher * gamma_unit_deviance_near_one(u);
+        bool need_weighted_ratio = !isfinite(u)
+            || !(isfinite(scaled_unit) && scaled_unit >= 0.0);
+        double weighted_ratio = 0.0;
+#ifdef PIRLS_CURVATURE_OBSERVED
+        weighted_ratio = weighted_ratio_observed;
+#else
+        if (need_weighted_ratio)
+            weighted_ratio = positive_mul_div(w_fisher, y_i, mu);
+#endif
+        grad_eta = isfinite(u) ? w_fisher * u : weighted_ratio - w_fisher;
         double dev_base;
-        if (isfinite(u)) {{
-            grad_eta = w_fisher * u;
-            dev_base = w_fisher * gamma_unit_deviance_near_one(u);
+        if (isfinite(scaled_unit) && scaled_unit >= 0.0) {{
+            dev_base = scaled_unit;
         }} else {{
-            double weighted_ratio = positive_mul_div(w_fisher, y_i, mu);
-            grad_eta = weighted_ratio - w_fisher;
             dev_base = weighted_ratio - w_fisher * (1.0 + log(y_i) - eta_i);
         }}
         if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
