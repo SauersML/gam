@@ -3,6 +3,7 @@
 //! first-/second-order sigma joint-psi terms and their directional Hessian.
 
 use super::*;
+use gam_math::nested_dual::JetField;
 
 impl SurvivalMarginalSlopeFamily {
     /// Outer-aware variant of `log_likelihood_only`. When
@@ -90,116 +91,41 @@ impl SurvivalMarginalSlopeFamily {
         shared_is_sigma_aux_index(self.gaussian_frailty_sd, derivative_blocks, psi_index)
     }
 
-    pub(crate) fn sigma_scale_jet(
+    fn sigma_scale_derivatives(
         &self,
-        n_dirs: usize,
-        first_masks: &[usize],
-        second_masks: &[usize],
-    ) -> Result<MultiDirJet, String> {
-        probit_frailty_scale_multi_dir_jet(
-            self.gaussian_frailty_sd,
-            "survival marginal-slope log-sigma auxiliary requested without GaussianShift sigma",
-            n_dirs,
-            first_masks,
-            second_masks,
-        )
+    ) -> Result<crate::survival::lognormal_kernel::ProbitFrailtyScaleJet, String> {
+        let sigma = self.gaussian_frailty_sd.ok_or_else(|| {
+            "survival marginal-slope log-sigma auxiliary requested without GaussianShift sigma"
+                .to_string()
+        })?;
+        Ok(crate::survival::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln()))
     }
 
-    pub(crate) fn row_neglog_directional_with_scale_jet(
+    /// Evaluate the canonical rigid row program with its observed slope already
+    /// lifted through a jet-valued frailty scale. Passing `probit_scale = 1`
+    /// prevents a second scaling inside [`rigid_row_nll`]; probability tails,
+    /// event semantics, and monotonicity remain owned by that single source.
+    fn row_neglog_canonical_scale_jet<S: gam_math::jet_scalar::JetScalar<N_PRIMARY>>(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
-        dirs: &[&Array1<f64>],
-        scale_jet: &MultiDirJet,
-    ) -> Result<f64, String> {
-        let k = dirs.len();
-        if k > 4 {
-            return Err(SurvivalMarginalSlopeError::InvalidInput {
-                reason: format!(
-                    "survival marginal-slope sigma row directional expects 0..=4 directions, got {k}"
-                ),
-            }
-            .into());
-        }
-        if scale_jet.coeffs.len() != (1usize << k) {
-            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-                reason: format!(
-                    "survival marginal-slope sigma scale jet dimension mismatch: coeffs={}, dirs={k}",
-                    scale_jet.coeffs.len()
-                ),
-            }
-            .into());
-        }
-        let wi = self.weights[row];
-        let di = self.event[row];
-        let (z_sum, covariance_ones) = self.exact_shared_score_summary(
-            row,
+        primaries: &[S; N_PRIMARY],
+        scale: &S,
+    ) -> Result<S, String> {
+        let mut inputs = rigid_row_inputs(
+            self,
             block_states,
-            "row_neglog_directional_with_scale_jet",
+            row,
+            "survival marginal-slope sigma canonical row program",
         )?;
-        let q_geom = self.row_dynamic_q_values(row, block_states)?;
-
-        let first = |idx: usize| -> Vec<f64> { dirs.iter().map(|dir| dir[idx]).collect() };
-        let q0_jet = MultiDirJet::linear(k, q_geom.q0, &first(0));
-        let q1_jet = MultiDirJet::linear(k, q_geom.q1, &first(1));
-        let qd1_jet = MultiDirJet::linear(k, q_geom.qd1, &first(2));
-        let g_jet = MultiDirJet::linear(k, block_states[2].eta[row], &first(3));
-
-        let observed_g_jet = g_jet.mul(scale_jet);
-        let one_plus_b2 = MultiDirJet::constant(k, 1.0)
-            .add(&observed_g_jet.mul(&observed_g_jet).scale(covariance_ones));
-        let c_jet = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.coeff(0)));
-
-        let a0_jet = q0_jet.mul(&c_jet);
-        let a1_jet = q1_jet.mul(&c_jet);
-        let ad1_jet = qd1_jet.mul(&c_jet);
-        let z_jet = MultiDirJet::constant(k, z_sum);
-        let eta0_jet = a0_jet.add(&observed_g_jet.mul(&z_jet));
-        let eta1_jet = a1_jet.add(&observed_g_jet.mul(&z_jet));
-
-        let neg_eta0 = eta0_jet.scale(-1.0);
-        let entry_term = neg_eta0
-            .compose_unary(unary_derivatives_neglog_phi(neg_eta0.coeff(0), wi))
-            .scale(-1.0);
-
-        let neg_eta1 = eta1_jet.scale(-1.0);
-        let exit_term = neg_eta1.compose_unary(unary_derivatives_neglog_phi(
-            neg_eta1.coeff(0),
-            wi * (1.0 - di),
-        ));
-
-        let event_density_term = if di > 0.0 {
-            eta1_jet
-                .compose_unary(unary_derivatives_log_normal_pdf(eta1_jet.coeff(0)))
-                .scale(-wi * di)
-        } else {
-            MultiDirJet::zero(k)
-        };
-
-        let qd1_lower = self.time_derivative_lower_bound();
-        let qd1_val = qd1_jet.coeff(0);
-        let ad1_val = ad1_jet.coeff(0);
-        if survival_derivative_guard_violated(qd1_val, qd1_lower) {
-            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
-                reason: format!(
-                    "survival marginal-slope monotonicity violated at row {row}: raw time derivative={qd1_val:.3e} must be at least derivative_guard={qd1_lower:.3e}; transformed time derivative={ad1_val:.3e}"
-                ),
-            }
-            .into());
-        }
-        let time_deriv_term = if di > 0.0 {
-            ad1_jet
-                .compose_unary(unary_derivatives_log(ad1_val))
-                .scale(-wi * di)
-        } else {
-            MultiDirJet::zero(k)
-        };
-
-        Ok(exit_term
-            .add(&entry_term)
-            .add(&event_density_term)
-            .add(&time_deriv_term)
-            .coeff((1usize << k) - 1))
+        inputs.probit_scale = 1.0;
+        let observed_primaries = [
+            primaries[0],
+            primaries[1],
+            primaries[2],
+            primaries[3].mul(scale),
+        ];
+        rigid_row_nll(&observed_primaries, &inputs)
     }
 
     pub(crate) fn row_sigma_primary_terms(
@@ -208,37 +134,23 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         second_sigma: bool,
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        let primary_dim = N_PRIMARY;
-        let zero = zero_primary_direction_ref();
-        // The leading prefix is the fixed number of zero primary directions the
-        // log-sigma hyperderivative differentiates *through*: one for the first
-        // log-sigma derivative, two for the second. The shared
-        // `directional_obj_grad_hess` sweep appends the unit primary directions
-        // for grad/hess on top of this prefix. `sigma_scale_jet` only depends on
-        // the multi-dir spec, not on the row, so each variant is resolved once
-        // here and reused across the objective + grad + hess passes.
-        let (leading, scales): (Vec<&Array1<f64>>, DirectionalScaleJets) = if second_sigma {
-            (
-                vec![zero, zero],
-                DirectionalScaleJets {
-                    obj: Some(self.sigma_scale_jet(2, &[1, 2], &[3])?),
-                    grad: self.sigma_scale_jet(3, &[1, 2], &[3])?,
-                    hess: self.sigma_scale_jet(4, &[1, 2], &[3])?,
+        let primaries = rigid_row_kernel_primaries(self, block_states, row)?;
+        let scale = self.sigma_scale_derivatives()?;
+        let terms = if second_sigma {
+            second_parameter_order2_terms(
+                primaries,
+                scale.s,
+                scale.ds,
+                scale.d2s,
+                |variables, parameter| {
+                    self.row_neglog_canonical_scale_jet(row, block_states, variables, parameter)
                 },
-            )
+            )?
         } else {
-            (
-                vec![zero],
-                DirectionalScaleJets {
-                    obj: Some(self.sigma_scale_jet(1, &[1], &[])?),
-                    grad: self.sigma_scale_jet(2, &[1], &[])?,
-                    hess: self.sigma_scale_jet(3, &[1], &[])?,
-                },
-            )
+            first_parameter_order2_terms(primaries, scale.s, scale.ds, |variables, parameter| {
+                self.row_neglog_canonical_scale_jet(row, block_states, variables, parameter)
+            })?
         };
-        let terms = directional_obj_grad_hess(primary_dim, &leading, &scales, |dirs, scale| {
-            self.row_neglog_directional_with_scale_jet(row, block_states, dirs, scale)
-        })?;
         Ok((terms.objective, terms.grad, terms.hess))
     }
 
@@ -486,19 +398,13 @@ impl SurvivalMarginalSlopeFamily {
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
         let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
-        let primary_dim = N_PRIMARY;
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
-        // Sigma scale jets and the zero primary direction are constant
-        // across rows; resolve once outside the fold instead of rebuilding
-        // per-row (and per (a,b) pair) inside it. The shared
-        // `directional_obj_grad_hess` sweep differentiates *through* the
-        // fixed leading prefix `[zero, row_dir]` (one zero log-sigma slot,
-        // the perturbation direction) and appends the grad/hess unit
-        // directions; `obj: None` suppresses the zeroth-order pass.
-        let scale_grad = self.sigma_scale_jet(3, &[1], &[])?;
-        let scale_hess = self.sigma_scale_jet(4, &[1], &[])?;
-        let zero = zero_primary_direction_ref();
+        // The frailty-scale stack is common to every row. One TwoSeed row
+        // evaluation carries both its sigma direction and the requested
+        // coefficient-space direction; its mixed Order2 channel supplies the
+        // complete primary gradient and Hessian in one pass.
+        let scale = self.sigma_scale_derivatives()?;
         // Bit-deterministic reduction: see `chunked_row_reduction`.
         let acc = chunked_row_reduction(
             row_iter.as_slice(),
@@ -510,17 +416,15 @@ impl SurvivalMarginalSlopeFamily {
                     &slices,
                     d_beta_flat,
                 )?;
-                let scales = DirectionalScaleJets {
-                    obj: None,
-                    grad: scale_grad.clone(),
-                    hess: scale_hess.clone(),
-                };
-                let terms = directional_obj_grad_hess(
-                    primary_dim,
-                    &[zero, &row_dir],
-                    &scales,
-                    |dirs, scale| {
-                        self.row_neglog_directional_with_scale_jet(row, block_states, dirs, scale)
+                let primaries = rigid_row_kernel_primaries(self, block_states, row)?;
+                let direction = std::array::from_fn(|axis| row_dir[axis]);
+                let terms = first_parameter_directional_order2_terms(
+                    primaries,
+                    &direction,
+                    scale.s,
+                    scale.ds,
+                    |variables, parameter| {
+                        self.row_neglog_canonical_scale_jet(row, block_states, variables, parameter)
                     },
                 )?;
                 let mut grad = terms.grad;

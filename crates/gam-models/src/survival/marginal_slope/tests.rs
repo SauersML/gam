@@ -1200,9 +1200,7 @@ impl gam_math::jet_tower::RowProgram<4> for SurvivalMarginalSlopeRigidNllProgram
         // c(g) = sqrt(1 + (s_f g)^2)  — K=1 covariance_ones = 1, exactly the
         // shared MultiDirJet `one_plus_b2 -> sqrt` composition.
         let observed_g = g.scale(s_f);
-        let one_plus_b2 = observed_g
-            .mul(&observed_g)
-            .add(&S::constant(1.0));
+        let one_plus_b2 = observed_g.mul(&observed_g).add(&S::constant(1.0));
         let c = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.value()));
 
         let eta0 = q0.mul(&c).add(&observed_g.scale(z));
@@ -9072,7 +9070,8 @@ fn survival_jeffreys_contracted_trace_hook_beats_pairwise_979() {
         0.2 + 0.05 * ((r + j) as f64).cos() + 0.011 * (j as f64) - 0.003 * (r as f64) / (n as f64)
     });
     let logslope_design = Array2::from_shape_fn((n, p_g), |(r, j)| {
-        0.1 + 0.07 * ((r + 2 * j) as f64).sin() - 0.009 * (j as f64) + 0.004 * (r as f64) / (n as f64)
+        0.1 + 0.07 * ((r + 2 * j) as f64).sin() - 0.009 * (j as f64)
+            + 0.004 * (r as f64) / (n as f64)
     });
 
     let mut family = oracle_rigid_family(n, &z, &weights, &event, None);
@@ -9195,7 +9194,10 @@ fn survival_jeffreys_contracted_trace_hook_beats_pairwise_979() {
 /// or fails.
 #[test]
 fn survival_sparse_tower4_full_t4_matches_dense_oracle_979() {
-    use super::row_kernel::{RIGID_LINEAR_MASK, SparseTower4, rigid_row_inputs, rigid_row_kernel_primaries, rigid_row_nll};
+    use super::row_kernel::{
+        RIGID_LINEAR_MASK, SparseTower4, rigid_row_inputs, rigid_row_kernel_primaries,
+        rigid_row_nll,
+    };
     use gam_math::jet_scalar::JetScalar;
     use gam_math::jet_tower::program_full_tower;
 
