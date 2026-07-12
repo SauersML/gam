@@ -6061,6 +6061,16 @@ mod empirical_flex_jet_oracle_tests {
         (start.elapsed().as_nanos() / repetitions as u128, output)
     }
 
+    fn timed_output<T>(repetitions: usize, mut evaluate: impl FnMut() -> T) -> (u128, T) {
+        let start = std::time::Instant::now();
+        let mut output = evaluate();
+        for _ in 1..repetitions {
+            output = evaluate();
+        }
+        std::hint::black_box(&output);
+        (start.elapsed().as_nanos() / repetitions as u128, output)
+    }
+
     fn assert_sigma_terms_close(
         label: &str,
         old: &(f64, Array1<f64>, Array2<f64>),
@@ -6296,6 +6306,281 @@ mod empirical_flex_jet_oracle_tests {
                 eprintln!(
                     "BMS932_BENCH kind={kind} r={r} channel=t4 old_ns={old_fourth_ns} new_ns={new_fourth_ns} speedup={:.3}",
                     old_fourth_ns as f64 / new_fourth_ns as f64,
+                );
+            }
+        }
+    }
+
+    /// Temporary structural speed/allocation gate for the production batch
+    /// consumers. Repeated one-lane calls are the exact pre-batch traversal;
+    /// the batched side calls the same production helpers used by many-dH,
+    /// trace-gradient, and many-d2H. Deleted after its MSI evidence is pinned.
+    #[test]
+    fn empirical_flex_batch_cutover_benchmark_932() {
+        for is_score_warp in [true, false] {
+            for r in [4_usize, 8, 12, 18] {
+                let fixture = make_benchmark_fixture(is_score_warp, r);
+                let (q, slope, beta, row_ctx) = fixture_state(&fixture);
+                let (beta_h, beta_w) = if is_score_warp {
+                    (Some(&beta), None)
+                } else {
+                    (None, Some(&beta))
+                };
+                let directions = (0..r)
+                    .map(|lane| {
+                        Array1::from_shape_fn(r, |axis| {
+                            let magnitude = ((lane + 2) * (axis + 3) % 17 + 1) as f64 / 19.0;
+                            if (lane + axis) % 2 == 0 {
+                                magnitude
+                            } else {
+                                -0.7 * magnitude
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let gram = (0..r * r)
+                    .map(|idx| ((idx / r + 2 * (idx % r) + 1) as f64) / (3 * r) as f64)
+                    .collect::<Vec<_>>();
+                let ordered_pairs = [
+                    (&directions[0], &directions[1 % r]),
+                    (&directions[1 % r], &directions[0]),
+                    (&directions[2 % r], &directions[3 % r]),
+                    (&directions[3 % r], &directions[2 % r]),
+                    (&directions[0], &directions[(r - 1) % r]),
+                    (&directions[(r - 1) % r], &directions[0]),
+                    (&directions[1 % r], &directions[(r - 2) % r]),
+                    (&directions[(r - 2) % r], &directions[1 % r]),
+                ];
+
+                let third_bytes = || {
+                    EMPIRICAL_BMS_THIRD_WORKSPACE
+                        .with(|workspace| workspace.borrow().allocated_bytes())
+                };
+                let fourth_bytes = || {
+                    EMPIRICAL_BMS_FOURTH_WORKSPACE
+                        .with(|workspace| workspace.borrow().allocated_bytes())
+                };
+                let third_before = third_bytes();
+                let _ = fixture
+                    .family
+                    .empirical_flex_row_third_contracted_many(
+                        0,
+                        &fixture.primary,
+                        q,
+                        slope,
+                        beta_h,
+                        beta_w,
+                        &row_ctx,
+                        &directions,
+                        &fixture.grid,
+                    )
+                    .expect("warm batched third contractions");
+                let third_warm = third_bytes();
+                let _ = fixture
+                    .family
+                    .empirical_flex_row_third_contracted_many(
+                        0,
+                        &fixture.primary,
+                        q,
+                        slope,
+                        beta_h,
+                        beta_w,
+                        &row_ctx,
+                        &directions,
+                        &fixture.grid,
+                    )
+                    .expect("second warm batched third contractions");
+                let third_second = third_bytes();
+                assert_eq!(third_warm, third_second, "warmed third arena grew");
+
+                let (third_repeated_ns, third_repeated) = timed_output(1, || {
+                    directions
+                        .iter()
+                        .map(|direction| {
+                            let mut one = fixture
+                                .family
+                                .empirical_flex_row_third_contracted_many(
+                                    0,
+                                    &fixture.primary,
+                                    q,
+                                    slope,
+                                    beta_h,
+                                    beta_w,
+                                    &row_ctx,
+                                    std::slice::from_ref(direction),
+                                    &fixture.grid,
+                                )
+                                .expect("repeated one-lane third contraction");
+                            one.pop().expect("one direction produces one contraction")
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let (third_batch_ns, third_batch) = timed_output(3, || {
+                    fixture
+                        .family
+                        .empirical_flex_row_third_contracted_many(
+                            0,
+                            &fixture.primary,
+                            q,
+                            slope,
+                            beta_h,
+                            beta_w,
+                            &row_ctx,
+                            &directions,
+                            &fixture.grid,
+                        )
+                        .expect("timed batched third contractions")
+                });
+                for lane in 0..r {
+                    assert_matrix_close(
+                        "timed batched third",
+                        &third_repeated[lane],
+                        &third_batch[lane],
+                    );
+                }
+
+                let (trace_repeated_ns, trace_repeated) = timed_output(1, || {
+                    let mut gradient = Array1::<f64>::zeros(r);
+                    for axis in 0..r {
+                        let mut basis = Array1::<f64>::zeros(r);
+                        basis[axis] = 1.0;
+                        let mut one = fixture
+                            .family
+                            .empirical_flex_row_third_contracted_many(
+                                0,
+                                &fixture.primary,
+                                q,
+                                slope,
+                                beta_h,
+                                beta_w,
+                                &row_ctx,
+                                std::slice::from_ref(&basis),
+                                &fixture.grid,
+                            )
+                            .expect("repeated trace basis contraction");
+                        gradient[axis] = BernoulliMarginalSlopeFamily::row_primary_trace_contract(
+                            &one.pop().expect("one basis produces one contraction"),
+                            &gram,
+                        );
+                    }
+                    gradient
+                });
+                let (trace_batch_ns, trace_batch) = timed_output(3, || {
+                    fixture
+                        .family
+                        .empirical_flex_row_third_trace_gradient(
+                            0,
+                            &fixture.primary,
+                            q,
+                            slope,
+                            beta_h,
+                            beta_w,
+                            &row_ctx,
+                            &gram,
+                            &fixture.grid,
+                        )
+                        .expect("timed batched trace gradient")
+                });
+                for axis in 0..r {
+                    let expected = trace_repeated[axis];
+                    let actual = trace_batch[axis];
+                    assert!(
+                        (expected - actual).abs()
+                            <= 2e-10 * expected.abs().max(actual.abs()).max(1.0)
+                    );
+                }
+
+                let fourth_before = fourth_bytes();
+                let _ = fixture
+                    .family
+                    .empirical_flex_row_fourth_contracted_many_ordered(
+                        0,
+                        &fixture.primary,
+                        q,
+                        slope,
+                        beta_h,
+                        beta_w,
+                        &row_ctx,
+                        &ordered_pairs,
+                        &fixture.grid,
+                    )
+                    .expect("warm batched fourth contractions");
+                let fourth_warm = fourth_bytes();
+                let _ = fixture
+                    .family
+                    .empirical_flex_row_fourth_contracted_many_ordered(
+                        0,
+                        &fixture.primary,
+                        q,
+                        slope,
+                        beta_h,
+                        beta_w,
+                        &row_ctx,
+                        &ordered_pairs,
+                        &fixture.grid,
+                    )
+                    .expect("second warm batched fourth contractions");
+                let fourth_second = fourth_bytes();
+                assert_eq!(fourth_warm, fourth_second, "warmed fourth arena grew");
+                let (fourth_repeated_ns, fourth_repeated) = timed_output(1, || {
+                    ordered_pairs
+                        .iter()
+                        .map(|pair| {
+                            let mut one = fixture
+                                .family
+                                .empirical_flex_row_fourth_contracted_many_ordered(
+                                    0,
+                                    &fixture.primary,
+                                    q,
+                                    slope,
+                                    beta_h,
+                                    beta_w,
+                                    &row_ctx,
+                                    std::slice::from_ref(pair),
+                                    &fixture.grid,
+                                )
+                                .expect("repeated one-lane fourth contraction");
+                            one.pop().expect("one pair produces one contraction")
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let (fourth_batch_ns, fourth_batch) = timed_output(3, || {
+                    fixture
+                        .family
+                        .empirical_flex_row_fourth_contracted_many_ordered(
+                            0,
+                            &fixture.primary,
+                            q,
+                            slope,
+                            beta_h,
+                            beta_w,
+                            &row_ctx,
+                            &ordered_pairs,
+                            &fixture.grid,
+                        )
+                        .expect("timed batched fourth contractions")
+                });
+                for lane in 0..ordered_pairs.len() {
+                    assert_matrix_close(
+                        "timed batched fourth",
+                        &fourth_repeated[lane],
+                        &fourth_batch[lane],
+                    );
+                }
+
+                let kind = if is_score_warp { "score" } else { "link" };
+                eprintln!(
+                    "BMS932_BATCH kind={kind} r={r} channel=t3-many lanes={r} repeated_ns={third_repeated_ns} batch_ns={third_batch_ns} speedup={:.3} workspace_before={third_before} workspace_warm={third_warm} workspace_second={third_second}",
+                    third_repeated_ns as f64 / third_batch_ns as f64,
+                );
+                eprintln!(
+                    "BMS932_BATCH kind={kind} r={r} channel=t3-trace lanes={r} repeated_ns={trace_repeated_ns} batch_ns={trace_batch_ns} speedup={:.3}",
+                    trace_repeated_ns as f64 / trace_batch_ns as f64,
+                );
+                eprintln!(
+                    "BMS932_BATCH kind={kind} r={r} channel=t4-many ordered_lanes={} repeated_ns={fourth_repeated_ns} batch_ns={fourth_batch_ns} speedup={:.3} workspace_before={fourth_before} workspace_warm={fourth_warm} workspace_second={fourth_second}",
+                    ordered_pairs.len(),
+                    fourth_repeated_ns as f64 / fourth_batch_ns as f64,
                 );
             }
         }
