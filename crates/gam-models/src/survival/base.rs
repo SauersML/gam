@@ -3161,8 +3161,8 @@ mod tests {
         use super::*;
         use gam_math::jet_scalar::JetScalar;
         use gam_math::jet_tower::{
-            RowNllProgramGeneric, generic_fourth_contracted, generic_row_kernel,
-            generic_third_contracted,
+            RowProgram, program_fourth_contracted, program_row_kernel,
+            program_third_contracted,
         };
 
         /// The cause-specific row NLL written ONCE through the jet scalar:
@@ -3177,7 +3177,7 @@ mod tests {
             base: [f64; 3],
         }
 
-        impl RowNllProgramGeneric<3> for CauseSpecificJetRow {
+        impl RowProgram<3> for CauseSpecificJetRow {
             fn n_rows(&self) -> usize {
                 1
             }
@@ -3189,7 +3189,7 @@ mod tests {
                 }
                 Ok(self.base)
             }
-            fn row_nll_generic<S: JetScalar<3>>(
+            fn eval<S: JetScalar<3>>(
                 &self,
                 row: usize,
                 p: &[S; 3],
@@ -3262,7 +3262,7 @@ mod tests {
             // ── Value / gradient / Hessian: LIVE evaluate vs jet ──────────────
             let (ll, grad, hess) =
                 evaluate_cause_specific_block(&block, &beta).expect("evaluate block");
-            let (jet_v, jet_g, jet_h) = generic_row_kernel(&prog, 0).expect("jet kernel");
+            let (jet_v, jet_g, jet_h) = program_row_kernel(&prog, 0).expect("jet kernel");
             close(jet_v, -ll, JET_TOL, &format!("{label} value"));
             for a in 0..3 {
                 close(jet_g[a], -grad[a], JET_TOL, &format!("{label} grad[{a}]"));
@@ -3280,7 +3280,7 @@ mod tests {
             let dh = cause_specific_hessian_directional_derivative(&block, &beta, &d_beta)
                 .expect("live third");
             let dir = [d_beta[0], d_beta[1], d_beta[2]];
-            let jet_t3 = generic_third_contracted(&prog, 0, &dir).expect("jet third");
+            let jet_t3 = program_third_contracted(&prog, 0, &dir).expect("jet third");
             for a in 0..3 {
                 for b in 0..3 {
                     close(
@@ -3299,7 +3299,7 @@ mod tests {
             .expect("live fourth");
             let uu = [d_beta[0], d_beta[1], d_beta[2]];
             let vv = [v_beta[0], v_beta[1], v_beta[2]];
-            let jet_t4 = generic_fourth_contracted(&prog, 0, &uu, &vv).expect("jet fourth");
+            let jet_t4 = program_fourth_contracted(&prog, 0, &uu, &vv).expect("jet fourth");
             for a in 0..3 {
                 for b in 0..3 {
                     close(
