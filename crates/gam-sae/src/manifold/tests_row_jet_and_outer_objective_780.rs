@@ -48,6 +48,8 @@ unsafe impl GlobalAlloc for SaeRowJetCountingAllocator {
         pointer
     }
 
+    // SAFETY: this preserves `GlobalAlloc::alloc_zeroed`'s layout contract and
+    // delegates ownership unchanged to the system allocator.
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // SAFETY: `layout` is valid by this method's `GlobalAlloc` contract.
         let pointer = unsafe { System.alloc_zeroed(layout) };
@@ -57,11 +59,15 @@ unsafe impl GlobalAlloc for SaeRowJetCountingAllocator {
         pointer
     }
 
+    // SAFETY: callers must provide the live pointer and matching layout
+    // required by `GlobalAlloc::dealloc`; both are forwarded unchanged.
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         // SAFETY: the caller supplies the matching live `System` allocation.
         unsafe { System.dealloc(pointer, layout) }
     }
 
+    // SAFETY: callers must satisfy `GlobalAlloc::realloc`'s live-allocation
+    // contract; the pointer, layout, and requested size are forwarded unchanged.
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // SAFETY: the caller supplies a live allocation and `new_size` is
         // forwarded unchanged, as required by `GlobalAlloc`.
