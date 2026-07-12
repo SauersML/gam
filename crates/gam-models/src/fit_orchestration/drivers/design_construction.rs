@@ -7760,6 +7760,7 @@ mod glm_eta_observation_fd_tests {
     //! `neghessian_eta_derivative = ∂(neghessian_eta)/∂η`. Pin each against central
     //! finite differences of the assembled log-likelihood / score.
     use super::*;
+    use ndarray::array;
 
     fn one_obs_weight(
         spec: &LikelihoodSpec,

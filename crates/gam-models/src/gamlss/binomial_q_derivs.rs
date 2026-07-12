@@ -675,8 +675,9 @@ mod tests {
             binomial_neglog_q_derivatives_probit_closed_form(1.0, 2.0, f64::NEG_INFINITY),
             (f64::NEG_INFINITY, 2.0, 0.0)
         );
+        let nan_derivatives = binomial_neglog_q_derivatives_probit_closed_form(0.5, 2.0, f64::NAN);
         assert!(
-            binomial_neglog_q_derivatives_probit_closed_form(0.5, 2.0, f64::NAN)
+            [nan_derivatives.0, nan_derivatives.1, nan_derivatives.2]
                 .into_iter()
                 .all(f64::is_nan)
         );

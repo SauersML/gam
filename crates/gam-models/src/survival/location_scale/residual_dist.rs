@@ -44,10 +44,17 @@ mod probit_tail_tests {
             probit_log_survival_and_ratio_derivatives(f64::INFINITY),
             (f64::NEG_INFINITY, f64::INFINITY, 1.0, 0.0, -0.0)
         );
+        let nan_derivatives = probit_log_survival_and_ratio_derivatives(f64::NAN);
         assert!(
-            probit_log_survival_and_ratio_derivatives(f64::NAN)
-                .into_iter()
-                .all(f64::is_nan)
+            [
+                nan_derivatives.0,
+                nan_derivatives.1,
+                nan_derivatives.2,
+                nan_derivatives.3,
+                nan_derivatives.4,
+            ]
+            .into_iter()
+            .all(f64::is_nan)
         );
     }
 

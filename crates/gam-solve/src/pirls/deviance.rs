@@ -1544,14 +1544,7 @@ fn omitted_log_likelihood_row(
             )
         }
         ResponseFamily::NegativeBinomial { theta, .. } => {
-            let saturated = if y == 0.0 {
-                0.0
-            } else {
-                let log_total = logaddexp(theta.ln(), y.ln());
-                ln_gamma(y + theta) - ln_gamma(*theta) - ln_gamma(y + 1.0)
-                    + *theta * (theta.ln() - log_total)
-                    + y * (y.ln() - log_total)
-            };
+            let saturated = negative_binomial_saturated_log_likelihood(y, *theta);
             if !saturated.is_finite() {
                 return Err(deviance_row_error(
                     row,
@@ -1691,6 +1684,12 @@ pub(crate) fn log_gamma_stirling_correction(x: f64) -> f64 {
 #[inline]
 pub(crate) fn log_gamma_large_ratio(base: f64, delta: f64) -> f64 {
     let ratio = delta / base;
+    if ratio == 0.0 {
+        // At this separation the next term is O(delta²/base), below the f64
+        // range. Returning delta*ln(base) also avoids turning the formally
+        // cancelling `(base+delta)*ln1p(ratio)-delta` pair into `-delta`.
+        return delta * base.ln();
+    }
     delta * base.ln() + (base + delta - 0.5) * ratio.ln_1p() - delta
         + log_gamma_stirling_correction(base + delta)
         - log_gamma_stirling_correction(base)
@@ -1752,187 +1751,275 @@ pub(crate) fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
 /// `ln(2π)` — the per-observation Gaussian / saddlepoint normalizer constant.
 pub(crate) const LN_2PI: f64 = 1.837_877_066_409_345_5;
 
-/// Per-observation **fully normalized, scale-aware** log-likelihood — the true
-/// log predictive density on the response's own measure, evaluated at `mu`.
-///
-/// This is the reporting / model-comparison counterpart of
-/// [`pointwise_loglikelihood_omitting_constants`]. The two are deliberately
-/// different functions serving different masters:
-///
-/// * `*_omitting_constants` is the REML/LAML **building block**. It drops every
-///   family- and saturated-likelihood normalizing constant (and the Gaussian
-///   scale): those are independent of β under the fixed-dispersion handling the
-///   outer objective is routed through, so they cancel in the ρ-derivatives and
-///   in any *within-fit* Δ-log-likelihood. Dropping them is not just harmless
-///   there but *necessary* — carrying the Gamma saturated term `shape·ln shape −
-///   lnΓ(shape)` overflows when the per-iterate shape saturates (#359).
-///
-/// * This function is the **reporting** kernel. It is the sole basis for the
-///   user-facing absolute quantities — the `log_likelihood` that feeds the
-///   conditional/corrected AIC and the per-row predictive densities that feed
-///   the PSIS-LOO `elpd`. There the dropped constants do **not** cancel: they
-///   set the sign and magnitude of a single reported number and break
-///   comparability across families (a Poisson fit that dropped `−ln Γ(y+1)`
-///   against an NB fit that kept it; #1581, #1582), and the Gaussian unit-scale
-///   form breaks the change-of-variables law under response rescaling (#1583).
-///
-/// Every closed-form family carries its full normalizer here:
-///   * Gaussian: `−½[ln(2πφ) − ln wᵢ + wᵢ(yᵢ−μᵢ)²/φ]` with `φ = σ̂²` the
-///     estimated residual variance. The scale **must** be concrete: a profiled
-///     Gaussian whose scale was not resolved (`fixed_phi() == None`) yields NaN
-///     rather than silently collapsing to the unit-variance density — that
-///     silent `φ = 1` fallback was the #1583 defect.
-///   * Poisson: adds the `−ln Γ(y+1)` count normalizer.
-///   * Binomial: adds the `ln C(nᵢ, nᵢyᵢ)` coefficient (`nᵢ = wᵢ` trials).
-///   * Gamma: the full saturated normalizer (shape `= 1/φ`).
-///   * Negative-Binomial / Beta: already fully normalized (unchanged).
-///   * Tweedie: the Jorgensen **saddlepoint** density — exact at `y = 0`
-///     (compound-Poisson point mass) and the standard `(2πφ V(y))^{-½}`
-///     approximation for `y > 0`; the only family whose exact EDM normalizer has
-///     no closed form.
-///
-/// All forms obey `elpd(c·y) − elpd(y) = −n·ln c` under an invertible response
-/// rescaling, and every discrete family returns a log-mass `≤ 0`.
-pub fn pointwise_loglikelihood(
-    y: ArrayView1<f64>,
-    mu: &Array1<f64>,
+/// Atomic evaluation of the fully normalized likelihood on the linear-
+/// predictor surface. The total is reduced with the same signed, scale-safe
+/// reducer used by the deviance geometry; it is therefore not recomputed from
+/// a lossy ordinary `Array1::sum` by callers.
+#[derive(Clone, Debug)]
+pub struct FullLogLikelihoodEvaluation {
+    pointwise: Array1<f64>,
+    total: f64,
+}
+
+impl FullLogLikelihoodEvaluation {
+    #[inline]
+    pub fn pointwise(&self) -> ArrayView1<'_, f64> {
+        self.pointwise.view()
+    }
+
+    #[inline]
+    pub fn total(&self) -> f64 {
+        self.total
+    }
+}
+
+#[inline]
+fn scaled_log1p_ratio(large: f64, small: f64) -> f64 {
+    let ratio = small / large;
+    if ratio == 0.0 { small } else { large * ratio.ln_1p() }
+}
+
+/// Stable continuous-extension `ln C(w, wy)`. The direct three-`lnGamma`
+/// expression loses every digit for a large trial count. When both cells are
+/// large, Stirling is combined symbolically into entropy form; when one cell is
+/// small, a single gamma-ratio evaluation avoids subtracting two O(w log w)
+/// values.
+#[inline]
+fn binomial_log_coefficient_from_proportion(w: f64, y: f64) -> f64 {
+    let k = w * y;
+    let other = w * (1.0 - y);
+    let small = k.min(other);
+    let large = k.max(other);
+    if small == 0.0 {
+        return 0.0;
+    }
+    if small < 8.0 {
+        return log_gamma_large_ratio(large + 1.0, small) - ln_gamma(small + 1.0);
+    }
+    let leading = -xlogy(k, y) - xlogy(other, 1.0 - y);
+    let logarithmic = 0.5 * (w.ln() - k.ln() - other.ln()) - HALF_LOG_2PI;
+    leading + logarithmic + log_gamma_stirling_correction(w)
+        - log_gamma_stirling_correction(k)
+        - log_gamma_stirling_correction(other)
+}
+
+/// Saturated NB2 log mass, combined before evaluation. In the all-large branch
+/// every O((y+theta) log(y+theta)) term cancels algebraically, leaving only the
+/// local-limit logarithm and Stirling corrections.
+#[inline]
+fn negative_binomial_saturated_log_likelihood(y: f64, theta: f64) -> f64 {
+    if y == 0.0 {
+        return 0.0;
+    }
+    let log_y = y.ln();
+    let log_theta = theta.ln();
+    let log_total = logaddexp(log_y, log_theta);
+    if y >= 8.0 && theta >= 8.0 {
+        let total = y + theta;
+        return 0.5 * (log_theta - log_total - log_y) - HALF_LOG_2PI
+            + log_gamma_stirling_correction(total)
+            - log_gamma_stirling_correction(theta)
+            - log_gamma_stirling_correction(y);
+    }
+    if y >= theta {
+        let gamma_ratio = log_gamma_large_ratio(y + 1.0, theta - 1.0);
+        gamma_ratio - ln_gamma(theta) + theta * (log_theta - log_total)
+            - scaled_log1p_ratio(y, theta)
+    } else {
+        let gamma_ratio = log_gamma_large_ratio(theta, y);
+        gamma_ratio - ln_gamma(y + 1.0) - scaled_log1p_ratio(theta, y)
+            + y * (log_y - log_total)
+    }
+}
+
+#[inline]
+fn gamma_saturated_log_normalizer(log_shape: f64, weight: f64, y: f64) -> f64 {
+    let log_a = weight.ln() + log_shape;
+    let core = if log_a >= 8.0_f64.ln() {
+        let inv = (-log_a).exp();
+        let inv2 = inv * inv;
+        let correction = inv / 12.0 - inv * inv2 / 360.0 + inv * inv2 * inv2 / 1260.0;
+        0.5 * log_a - HALF_LOG_2PI - correction
+    } else {
+        let a = log_a.exp();
+        if a == 0.0 {
+            // a ln a - a - ln Gamma(a) -> ln a as a -> 0+.
+            log_a
+        } else {
+            a * log_a - a - ln_gamma(a)
+        }
+    };
+    core - y.ln()
+}
+
+#[inline]
+fn full_log_likelihood_row(
+    row: usize,
+    y: f64,
+    eta: f64,
+    weight: f64,
     likelihood: &GlmLikelihoodSpec,
-    priorweights: ArrayView1<f64>,
-) -> Array1<f64> {
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    let n = y.len();
-    let values: Vec<f64> = match &likelihood.spec.response {
+    log_measure_scale: f64,
+    deviance: DevianceEtaRow,
+) -> Result<f64, EstimationError> {
+    if weight == 0.0 {
+        return Ok(0.0);
+    }
+    let omitted = omitted_log_likelihood_row(
+        row,
+        y,
+        eta,
+        weight,
+        &likelihood.spec.response,
+        deviance,
+    )?;
+    let normalizer = match &likelihood.spec.response {
         ResponseFamily::Gaussian => {
-            // φ MUST be concrete (the caller resolves the profiled σ̂² into the
-            // scale metadata). No `unwrap_or(1.0)` — see the #1583 note above.
-            let phi = match likelihood.scale.fixed_phi() {
-                Some(p) if p.is_finite() && p > 0.0 => p,
-                _ => return Array1::from_elem(n, f64::NAN),
+            let phi = match likelihood.scale {
+                gam_problem::LikelihoodScaleMetadata::FixedDispersion { phi }
+                    if phi.is_finite() && phi > 0.0 => phi,
+                _ => {
+                    return Err(deviance_row_error(
+                        row,
+                        "fully-normalized Gaussian dispersion",
+                        eta,
+                        f64::NAN,
+                    ));
+                }
             };
-            let inv_phi = 1.0 / phi;
-            let ln_2pi_phi = LN_2PI + phi.ln();
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let wi = priorweights[i];
-                    if wi <= 0.0 {
-                        // Zero prior weight excludes the observation entirely.
-                        return 0.0;
-                    }
-                    // yᵢ ~ N(μᵢ, φ/wᵢ): ℓᵢ = −½[ln(2πφ) − ln wᵢ + wᵢ(yᵢ−μᵢ)²/φ].
-                    // Only the residual term and the +½ln wᵢ Jacobian carry the
-                    // weight; the 2π·φ normalizer is per-observation.
-                    let resid = y[i] - mu[i];
-                    -0.5 * (ln_2pi_phi - wi.ln() + wi * resid * resid * inv_phi)
-                })
-                .collect()
+            -0.5 * (LN_2PI + phi.ln() - weight.ln())
         }
-        ResponseFamily::Binomial => (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let mui_c = mu[i];
-                let wi = priorweights[i];
-                // ln C(nᵢ, nᵢyᵢ) with nᵢ = wᵢ trials (the continuous extension via
-                // lnΓ matches non-integer prior weights). Zero for Bernoulli
-                // (wᵢ = 1, yᵢ ∈ {0,1}: C(1,0) = C(1,1) = 1).
-                let coef = binomial_log_coefficient(wi, y[i]);
-                coef + wi * (y[i] * mui_c.ln() + (1.0 - y[i]) * (1.0 - mui_c).ln())
-            })
-            .collect(),
-        ResponseFamily::Poisson => (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let mui_c = mu[i];
-                let log_term = if y[i] > 0.0 { y[i] * mui_c.ln() } else { 0.0 };
-                // − ln Γ(y+1) is the count normalizer the REML kernel drops.
-                priorweights[i] * (log_term - mui_c - ln_gamma(y[i] + 1.0))
-            })
-            .collect(),
-        ResponseFamily::Tweedie { p } => {
-            let p = *p;
-            let phi = fixed_glm_dispersion(likelihood);
-            if !is_valid_tweedie_power(p) || !(phi.is_finite() && phi > 0.0) {
-                return Array1::from_elem(n, f64::NAN);
+        ResponseFamily::Poisson => {
+            let log_factorial = ln_gamma(y + 1.0);
+            if !log_factorial.is_finite() {
+                return Err(deviance_row_error(
+                    row,
+                    "Poisson response normalizer",
+                    eta,
+                    log_factorial,
+                ));
             }
-            if validate_tweedie_responses(&y, &priorweights).is_err() {
-                return Array1::from_elem(n, f64::NAN);
+            if log_factorial == 0.0 {
+                0.0
+            } else {
+                finite_signed_from_log(
+                    row,
+                    "weighted Poisson response normalizer",
+                    eta,
+                    -log_factorial.signum(),
+                    weight.ln() + log_factorial.abs().ln(),
+                )?
             }
-            (0..n)
-                .into_par_iter()
-                .map(|i| tweedie_saddlepoint_loglik(y[i], mu[i], priorweights[i], p, phi))
-                .collect()
         }
-        ResponseFamily::NegativeBinomial { theta, .. } => {
-            let theta = *theta;
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    if !valid_negbin_theta(theta) || !valid_count_response(y[i]) {
-                        return f64::NAN;
-                    }
-                    let mui_c = mu[i];
-                    priorweights[i]
-                        * (ln_gamma(y[i] + theta) - ln_gamma(theta) - ln_gamma(y[i] + 1.0)
-                            + theta * (theta.ln() - (theta + mui_c).ln())
-                            + xlogy(y[i], mui_c)
-                            - y[i] * (theta + mui_c).ln())
-                })
-                .collect()
-        }
-        ResponseFamily::Beta { phi } => {
-            let phi = *phi;
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    if !valid_beta_phi(phi) {
-                        return f64::NAN;
-                    }
-                    priorweights[i] * beta_loglikelihood_full_unit(y[i], mu[i], phi)
-                })
-                .collect()
+        ResponseFamily::Binomial => {
+            let value = binomial_log_coefficient_from_proportion(weight, y);
+            if !value.is_finite() {
+                return Err(deviance_row_error(
+                    row,
+                    "binomial response normalizer",
+                    eta,
+                    value,
+                ));
+            }
+            value
         }
         ResponseFamily::Gamma => {
-            let shape = likelihood.gamma_shape().unwrap_or(1.0);
-            if !(shape.is_finite() && shape > 0.0) {
-                return Array1::from_elem(n, f64::NAN);
+            let value = gamma_saturated_log_normalizer(log_measure_scale, weight, y);
+            if !value.is_finite() {
+                return Err(deviance_row_error(
+                    row,
+                    "Gamma response normalizer",
+                    eta,
+                    value,
+                ));
             }
-            (0..n)
-                .into_par_iter()
-                .map(|i| gamma_full_loglik(y[i], mu[i], priorweights[i], shape))
-                .collect()
+            value
         }
-        ResponseFamily::RoystonParmar => vec![f64::NAN; n],
+        ResponseFamily::Tweedie { p } if y > 0.0 => {
+            -0.5 * (LN_2PI - log_measure_scale - weight.ln() + *p * y.ln())
+        }
+        ResponseFamily::Tweedie { .. }
+        | ResponseFamily::NegativeBinomial { .. }
+        | ResponseFamily::Beta { .. } => 0.0,
+        ResponseFamily::RoystonParmar => {
+            return Err(deviance_row_error(
+                row,
+                "Royston-Parmar GLM log-likelihood",
+                eta,
+                eta,
+            ));
+        }
     };
-    Array1::from_vec(values)
+    stable_finite_signed_sum(&[omitted, normalizer], "full log-likelihood row")
 }
 
-/// `ln C(n, n·y)` with `n = w` trials, via the continuous `lnΓ` extension so
-/// non-integer prior weights are handled.
-#[inline]
-pub(crate) fn binomial_log_coefficient(w: f64, y: f64) -> f64 {
-    if !(w.is_finite() && w > 0.0) {
-        return 0.0;
+/// Evaluate the fully normalized likelihood directly on the exact eta-space
+/// deviance geometry. This is the only reporting/ALO likelihood surface: the
+/// fitted value and its pointwise decomposition share one row oracle, zero-
+/// weight rows are dormant before response or eta inspection, invalid rows are
+/// reported deterministically, and no inverse-link round trip can project a
+/// representable eta tail onto a boundary mean.
+pub fn evaluate_full_log_likelihood_from_eta(
+    y: ArrayView1<'_, f64>,
+    eta: ArrayView1<'_, f64>,
+    likelihood: &GlmLikelihoodSpec,
+    priorweights: ArrayView1<'_, f64>,
+) -> Result<FullLogLikelihoodEvaluation, EstimationError> {
+    if y.len() != eta.len() || priorweights.len() != eta.len() {
+        crate::bail_invalid_estim!(
+            "full log-likelihood length mismatch: y={}, eta={}, prior_weights={}",
+            y.len(),
+            eta.len(),
+            priorweights.len()
+        );
     }
-    let k = w * y;
-    let nk = w * (1.0 - y);
-    ln_gamma(w + 1.0) - ln_gamma(k + 1.0) - ln_gamma(nk + 1.0)
-}
-
-/// Full Gamma log-density at mean `mu`, shape `nu = 1/φ`, prior weight `w`
-/// (which scales the shape: `Yᵢ ~ Gamma(shape = w·ν, mean = μ)`).
-#[inline]
-pub(crate) fn gamma_full_loglik(yi: f64, mui: f64, w: f64, nu: f64) -> f64 {
-    if w <= 0.0 {
-        // Zero prior weight excludes the observation (a → 0 would send −lnΓ(a)
-        // to −∞ rather than contributing nothing).
-        return 0.0;
+    crate::estimate::dispersion_from_likelihood(likelihood, 0.0)?;
+    if matches!(
+        likelihood.spec.response,
+        ResponseFamily::Gaussian
+    ) && !matches!(
+        likelihood.scale,
+        gam_problem::LikelihoodScaleMetadata::FixedDispersion { phi }
+            if phi.is_finite() && phi > 0.0
+    ) {
+        crate::bail_invalid_estim!(
+            "fully-normalized Gaussian likelihood requires an explicit positive dispersion"
+        );
     }
-    let a = w * nu;
-    if !(a.is_finite() && a > 0.0 && yi.is_finite() && yi > 0.0 && mui.is_finite() && mui > 0.0) {
-        return f64::NAN;
-    }
-    // a·ln(a/μ) + (a−1)·ln y − a·y/μ − lnΓ(a)
-    a * (a / mui).ln() + (a - 1.0) * yi.ln() - a * yi / mui - ln_gamma(a)
+    let log_measure_scale = eta_log_measure_scale(likelihood)?;
+    let rows: Vec<Result<f64, EstimationError>> = (0..eta.len())
+        .into_par_iter()
+        .map(|row| {
+            let geometry = deviance_eta_row_with_log_measure_scale(
+                row,
+                y[row],
+                eta[row],
+                likelihood,
+                &likelihood.spec.link,
+                priorweights[row],
+                log_measure_scale,
+            )?;
+            full_log_likelihood_row(
+                row,
+                y[row],
+                eta[row],
+                priorweights[row],
+                likelihood,
+                log_measure_scale,
+                geometry,
+            )
+        })
+        .collect();
+    let pointwise = Array1::from_vec(rows.into_iter().collect::<Result<Vec<_>, _>>()?);
+    let total = stable_finite_signed_sum(
+        pointwise.as_slice().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "full log-likelihood pointwise storage is not contiguous".to_string(),
+            )
+        })?,
+        "full log-likelihood reduction",
+    )?;
+    Ok(FullLogLikelihoodEvaluation { pointwise, total })
 }
 
 /// Tweedie **saddlepoint** log-density (prior weight `w` ⇒ `φᵢ = φ/w`). Exact at
@@ -2119,7 +2206,7 @@ pub(crate) fn tweedie_exact_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) 
 /// Total exact Tweedie log-likelihood over all observations — the sum of
 /// [`tweedie_exact_loglik`]. This is the objective a maximum-likelihood profile
 /// of the variance power `p` optimizes (#2105 / #2026); it uses the exact EDM
-/// normalizer rather than the [`pointwise_loglikelihood`] saddlepoint so the
+/// normalizer rather than the reporting saddlepoint approximation so the
 /// recovered `p̂` (and hence the reported dispersion `φ̂` and every SE / interval
 /// scaled by `√φ̂`) is unbiased. Returns `NaN` if the power is out of range, `φ`
 /// is not strictly positive/finite, or a response violates the Tweedie support.
@@ -2139,19 +2226,6 @@ pub fn tweedie_exact_loglik_total(
     gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
         tweedie_exact_loglik(y[i], mu[i], priorweights[i], p, phi)
     })
-}
-
-/// Total fully-normalized log-likelihood — the sum of [`pointwise_loglikelihood`]
-/// over all observations. This is the absolute `log_likelihood` reported to the
-/// user (and the basis of the conditional AIC), distinct from the REML
-/// building-block [`calculate_loglikelihood_omitting_constants_from_eta`].
-pub fn calculate_loglikelihood(
-    y: ArrayView1<f64>,
-    mu: &Array1<f64>,
-    likelihood: &GlmLikelihoodSpec,
-    priorweights: ArrayView1<f64>,
-) -> f64 {
-    pointwise_loglikelihood(y, mu, likelihood, priorweights).sum()
 }
 
 // ---------------------------------------------------------------------------

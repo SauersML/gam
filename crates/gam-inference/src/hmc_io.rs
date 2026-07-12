@@ -518,7 +518,6 @@ impl NutsFamily {
             },
         }
     }
-
 }
 
 /// Resolve and certify the scale metadata consumed by an HMC target.
@@ -671,7 +670,38 @@ fn validate_hmc_arrays(
                 return Err(HmcError::InvalidConfig {
                     reason: format!(
                         "{context}: penalty must be exactly symmetric; ({row},{col})={} but ({col},{row})={}",
-                        penalty[[row, col]], penalty[[col, row]],
+                        penalty[[row, col]],
+                        penalty[[col, row]],
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn first_non_finite<'a>(values: impl IntoIterator<Item = &'a f64>) -> Option<(usize, f64)> {
+    values
+        .into_iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+}
+
+fn validate_exact_symmetric(matrix: ArrayView2<f64>, context: &str) -> Result<(), HmcError> {
+    if matrix.nrows() != matrix.ncols() {
+        return Err(HmcError::DimensionMismatch {
+            reason: format!("{context}: matrix must be square, got {:?}", matrix.dim()),
+        });
+    }
+    for row in 0..matrix.nrows() {
+        for col in (row + 1)..matrix.ncols() {
+            if matrix[[row, col]] != matrix[[col, row]] {
+                return Err(HmcError::InvalidConfig {
+                    reason: format!(
+                        "{context}: matrix must be exactly symmetric; ({row},{col})={} but ({col},{row})={}",
+                        matrix[[row, col]],
+                        matrix[[col, row]],
                     ),
                 });
             }
@@ -1269,23 +1299,6 @@ fn joint_binomial_logp_grad_and_link_grad(
     Ok((ll, grad_beta, grad_link))
 }
 
-fn joint_binomial_logp_and_grad(
-    likelihood: &LikelihoodSpec,
-    data: &SharedData,
-    eta: &Array1<f64>,
-) -> Result<(f64, Array1<f64>), String> {
-    if !matches!(likelihood.response, ResponseFamily::Binomial) {
-        return Err(HmcError::UnsupportedFamily {
-            reason: format!(
-                "{} is not a binomial joint-HMC family",
-                likelihood.pretty_name()
-            ),
-        }
-        .into());
-    }
-    joint_family_logp_and_grad(likelihood, data, eta)
-}
-
 fn joint_family_logp_grad_and_link_grad(
     likelihood: &LikelihoodSpec,
     data: &SharedData,
@@ -1337,8 +1350,7 @@ mod tests {
         FamilyNutsInputs, GlmFlatInputs, JointBetaRhoInputs, JointBetaRhoPosterior,
         LinkWiggleFamilyParams, LinkWigglePosterior, LinkWiggleSplineArtifacts, NutsConfig,
         NutsFamily, NutsPosterior, NutsResult, SharedData, exact_glm_logp_and_grad_into,
-        firth_jeffreys_logp_and_grad,
-        joint_family_logp_and_grad,
+        firth_jeffreys_logp_and_grad, joint_family_logp_and_grad,
         laplace_directional_cubic_diagnostic, laplace_skewness_threshold,
         laplace_trustworthiness_from_skewness, run_joint_beta_rho_sampling,
         run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family,
@@ -1412,9 +1424,9 @@ mod tests {
         let mut spec = family.likelihood_spec();
         let scale = match family {
             NutsFamily::Gaussian => LikelihoodScaleMetadata::ProfiledGaussian,
-            NutsFamily::GammaLog => LikelihoodScaleMetadata::EstimatedGammaShape {
-                shape: parameter,
-            },
+            NutsFamily::GammaLog => {
+                LikelihoodScaleMetadata::EstimatedGammaShape { shape: parameter }
+            }
             NutsFamily::TweedieLog => {
                 spec.response = ResponseFamily::Tweedie { p: parameter };
                 LikelihoodScaleMetadata::EstimatedTweediePhi { phi: 1.0 }
@@ -1664,13 +1676,9 @@ mod tests {
             ResponseFamily::Binomial,
             InverseLink::Standard(StandardLink::CLogLog),
         ));
-        let (ll_y1, score) = exact_eta_geometry(
-            &likelihood,
-            &array![1.0],
-            &array![1.0],
-            &array![eta],
-        )
-        .expect("valid eta");
+        let (ll_y1, score) =
+            exact_eta_geometry(&likelihood, &array![1.0], &array![1.0], &array![eta])
+                .expect("valid eta");
         let residual_y1 = score[0];
         let expected = (1.0 - (-eta.exp()).exp()).ln();
         let wrong_log_one_minus_exp_eta = (1.0 - eta.exp()).ln();
@@ -1679,20 +1687,12 @@ mod tests {
         assert!((ll_y1 - wrong_log_one_minus_exp_eta).abs() > 0.5);
 
         let eps = 1e-6;
-        let (lp, _) = exact_eta_geometry(
-            &likelihood,
-            &array![1.0],
-            &array![1.0],
-            &array![eta + eps],
-        )
-        .expect("valid eta");
-        let (lm, _) = exact_eta_geometry(
-            &likelihood,
-            &array![1.0],
-            &array![1.0],
-            &array![eta - eps],
-        )
-        .expect("valid eta");
+        let (lp, _) =
+            exact_eta_geometry(&likelihood, &array![1.0], &array![1.0], &array![eta + eps])
+                .expect("valid eta");
+        let (lm, _) =
+            exact_eta_geometry(&likelihood, &array![1.0], &array![1.0], &array![eta - eps])
+                .expect("valid eta");
         let fd = (lp - lm) / (2.0 * eps);
         assert!(
             (residual_y1 - fd).abs() < 1e-9,
@@ -1732,13 +1732,9 @@ mod tests {
             ResponseFamily::Binomial,
             InverseLink::Standard(StandardLink::CLogLog),
         ));
-        let (ll_tail, score_tail) = exact_eta_geometry(
-            &cloglog,
-            &array![1.0],
-            &array![1.0],
-            &array![-750.0],
-        )
-        .expect("finite eta is valid");
+        let (ll_tail, score_tail) =
+            exact_eta_geometry(&cloglog, &array![1.0], &array![1.0], &array![-750.0])
+                .expect("finite eta is valid");
         let res_tail = score_tail[0];
         assert!(
             (ll_tail - (-750.0)).abs() < 1e-9,
@@ -1973,8 +1969,8 @@ mod tests {
         };
 
         let mut eta_score = Array1::zeros(eta.len());
-        let (ll, grad) = exact_glm_logp_and_grad_into(&data, &eta, &mut eta_score)
-            .expect("Gamma geometry");
+        let (ll, grad) =
+            exact_glm_logp_and_grad_into(&data, &eta, &mut eta_score).expect("Gamma geometry");
 
         let mut expected_ll = 0.0;
         let mut expected_score = 0.0;
@@ -3107,9 +3103,9 @@ mod tests {
 
         // RoystonParmar must be explicitly rejected (not silently remapped).
         let rp = LikelihoodSpec {
-                response: ResponseFamily::RoystonParmar,
-                link: InverseLink::Standard(StandardLink::Logit),
-            };
+            response: ResponseFamily::RoystonParmar,
+            link: InverseLink::Standard(StandardLink::Logit),
+        };
         let rp_data = data_for(&rp);
         let rp_result = joint_family_logp_and_grad(&rp, &rp_data, &eta);
         assert!(
@@ -5656,7 +5652,7 @@ impl LinkWigglePosterior {
     #[inline]
     fn standardized_z(&self, u: &Array1<f64>) -> (Array1<f64>, Array1<f64>, f64) {
         let (min_u, max_u) = self.spline.knot_range;
-        let rw = (max_u - min_u).max(1e-6);
+        let rw = max_u - min_u;
         let z_raw: Array1<f64> = u.mapv(|v| (v - min_u) / rw);
         let z_c: Array1<f64> = z_raw.mapv(|z| z.clamp(0.0, 1.0));
         (z_raw, z_c, rw)
@@ -5692,6 +5688,81 @@ impl LinkWigglePosterior {
             }
             .into());
         }
+        if y.len() != n_samples || weights.len() != n_samples || mode_beta.len() != p_base {
+            return Err(HmcError::DimensionMismatch {
+                reason: format!(
+                    "LinkWigglePosterior: X={}x{}, y={}, weights={}, mode_beta={}",
+                    n_samples,
+                    p_base,
+                    y.len(),
+                    weights.len(),
+                    mode_beta.len(),
+                ),
+            }
+            .into());
+        }
+        if penalty_base.dim() != (p_base, p_base) || penalty_link.dim() != (p_link, p_link) {
+            return Err(HmcError::DimensionMismatch {
+                reason: format!(
+                    "LinkWigglePosterior: penalty dimensions {:?} and {:?} disagree with blocks {p_base} and {p_link}",
+                    penalty_base.dim(),
+                    penalty_link.dim(),
+                ),
+            }
+            .into());
+        }
+        let (knot_min, knot_max) = spline.knot_range;
+        if !(knot_min.is_finite() && knot_max.is_finite() && knot_max > knot_min) {
+            return Err(HmcError::InvalidConfig {
+                reason: format!(
+                    "LinkWigglePosterior: knot range must be finite and strictly increasing, got ({knot_min}, {knot_max})"
+                ),
+            }
+            .into());
+        }
+        if let Some((index, value)) = spline
+            .knot_vector
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(HmcError::InvalidConfig {
+                reason: format!(
+                    "LinkWigglePosterior: knot vector has non-finite value {value} at index {index}"
+                ),
+            }
+            .into());
+        }
+        for (row, weight) in weights.iter().enumerate() {
+            if !(weight.is_finite() && *weight >= 0.0) {
+                return Err(HmcError::InvalidConfig {
+                    reason: format!(
+                        "LinkWigglePosterior: weight at row {row} must be finite and non-negative, got {weight}"
+                    ),
+                }
+                .into());
+            }
+        }
+        for (label, invalid) in [
+            ("design", first_non_finite(x.iter())),
+            ("base penalty", first_non_finite(penalty_base.iter())),
+            ("link penalty", first_non_finite(penalty_link.iter())),
+            ("base mode", first_non_finite(mode_beta.iter())),
+            ("link mode", first_non_finite(mode_theta.iter())),
+        ] {
+            if let Some((index, value)) = invalid {
+                return Err(HmcError::NonFiniteState {
+                    reason: format!(
+                        "LinkWigglePosterior: {label} has non-finite value {value} at flat index {index}"
+                    ),
+                }
+                .into());
+            }
+        }
+        validate_exact_symmetric(penalty_base, "LinkWigglePosterior base penalty")
+            .map_err(String::from)?;
+        validate_exact_symmetric(penalty_link, "LinkWigglePosterior link penalty")
+            .map_err(String::from)?;
         let (likelihood, cov_scale) = family.resolved_likelihood().map_err(String::from)?;
         if let Some(offset) = offset.as_ref() {
             if offset.len() != n_samples {
@@ -5715,7 +5786,10 @@ impl LinkWigglePosterior {
             validate_binary_responses("binomial link-wiggle NUTS", &y, &weights)
                 .map_err(String::from)?;
         }
-        if matches!(likelihood.spec.response, ResponseFamily::NegativeBinomial { .. }) {
+        if matches!(
+            likelihood.spec.response,
+            ResponseFamily::NegativeBinomial { .. }
+        ) {
             validate_count_responses("negative-binomial link-wiggle NUTS", &y, &weights)
                 .map_err(String::from)?;
         }
@@ -5733,7 +5807,7 @@ impl LinkWigglePosterior {
         )?;
         let chol = whitening.chol;
         let chol_t = whitening.chol_t;
-        Ok(Self {
+        let target = Self {
             x: Arc::new(x.to_owned()),
             y: Arc::new(y.to_owned()),
             weights: Arc::new(weights.to_owned()),
@@ -5750,87 +5824,128 @@ impl LinkWigglePosterior {
             n_samples,
             likelihood,
             cov_scale,
-        })
+        };
+        let mut u_at_mode =
+            gam_linalg::faer_ndarray::fast_av(target.x.as_ref(), target.mode_beta.as_ref());
+        if let Some(offset) = target.offset.as_ref() {
+            u_at_mode += offset.as_ref();
+        }
+        let (_, eta_at_mode) = target.evaluate_link(&u_at_mode, target.mode_theta.as_ref())?;
+        let mut score_at_mode = Array1::zeros(n_samples);
+        gam_solve::pirls::eta_log_likelihood_value_and_score_into(
+            target.y.view(),
+            &eta_at_mode,
+            &target.likelihood,
+            &target.likelihood.spec.link,
+            target.weights.view(),
+            &mut score_at_mode,
+        )
+        .map_err(|error| {
+            format!("link-wiggle likelihood is invalid at the fitted mode: {error}")
+        })?;
+        Ok(target)
     }
 
     /// Evaluate the wiggle basis and compute η = q₀ + B(q₀)·θ with C^1 linear extension.
-    fn evaluate_link(&self, u: &Array1<f64>, theta: &Array1<f64>) -> (Array2<f64>, Array1<f64>) {
+    fn evaluate_link(
+        &self,
+        u: &Array1<f64>,
+        theta: &Array1<f64>,
+    ) -> Result<(Array2<f64>, Array1<f64>), String> {
         let n = u.len();
         if theta.is_empty() {
-            return (Array2::zeros((n, 0)), u.clone());
+            return Ok((Array2::zeros((n, 0)), u.clone()));
         }
 
         let (z_raw, z_c, _) = self.standardized_z(u);
-        let Ok(mut basis) = monotone_wiggle_basis_with_derivative_order(
+        let mut basis = monotone_wiggle_basis_with_derivative_order(
             z_c.view(),
             &self.spline.knot_vector,
             self.spline.degree,
             0,
-        ) else {
-            return (Array2::zeros((n, theta.len())), u.clone());
-        };
+        )
+        .map_err(|error| format!("link-wiggle basis evaluation failed: {error}"))?;
         if basis.ncols() != theta.len() {
-            return (Array2::zeros((n, theta.len())), u.clone());
+            return Err(format!(
+                "link-wiggle basis has {} columns but theta has {}",
+                basis.ncols(),
+                theta.len()
+            ));
         }
 
         // C^1 linear extension outside [0, 1]:
         // B_ext(z_raw) = B(z_c) + (z_raw - z_c) * B'(z_c)
         let mut needs_ext = false;
         for i in 0..n {
-            if (z_raw[i] - z_c[i]).abs() > 1e-12 {
+            if z_raw[i] != z_c[i] {
                 needs_ext = true;
                 break;
             }
         }
-        if needs_ext
-            && let Ok(b_prime) = monotone_wiggle_basis_with_derivative_order(
+        if needs_ext {
+            let b_prime = monotone_wiggle_basis_with_derivative_order(
                 z_c.view(),
                 &self.spline.knot_vector,
                 self.spline.degree,
                 1,
             )
-        {
+            .map_err(|error| format!("link-wiggle derivative basis failed: {error}"))?;
+            if b_prime.ncols() != basis.ncols() {
+                return Err(format!(
+                    "link-wiggle derivative basis has {} columns but value basis has {}",
+                    b_prime.ncols(),
+                    basis.ncols()
+                ));
+            }
             for i in 0..n {
                 let dz = z_raw[i] - z_c[i];
-                if dz.abs() <= 1e-12 {
+                if dz == 0.0 {
                     continue;
                 }
-                for j in 0..basis.ncols().min(b_prime.ncols()) {
+                for j in 0..basis.ncols() {
                     basis[[i, j]] += dz * b_prime[[i, j]];
                 }
             }
         }
-        (
+        Ok((
             basis.clone(),
             u + &gam_linalg::faer_ndarray::fast_av(&basis, theta),
-        )
+        ))
     }
 
     /// Compute dη/dq₀ = 1 + B'(q₀)·θ / range_width (chain-rule factor for β_eta gradient).
-    fn compute_g_prime(&self, u: &Array1<f64>, theta: &Array1<f64>) -> Array1<f64> {
+    fn compute_g_prime(&self, u: &Array1<f64>, theta: &Array1<f64>) -> Result<Array1<f64>, String> {
         let n = u.len();
         let mut g = Array1::<f64>::ones(n);
         let (_, z_c, rw) = self.standardized_z(u);
         if theta.is_empty() {
-            return g;
+            return Ok(g);
         }
 
-        let Ok(b_prime_constrained) = monotone_wiggle_basis_with_derivative_order(
+        let b_prime_constrained = monotone_wiggle_basis_with_derivative_order(
             z_c.view(),
             &self.spline.knot_vector,
             self.spline.degree,
             1,
-        ) else {
-            return g;
-        };
+        )
+        .map_err(|error| format!("link-wiggle chain-rule basis failed: {error}"))?;
         if b_prime_constrained.ncols() != theta.len() {
-            return g;
+            return Err(format!(
+                "link-wiggle chain-rule basis has {} columns but theta has {}",
+                b_prime_constrained.ncols(),
+                theta.len()
+            ));
         }
         let dwiggle_dz = gam_linalg::faer_ndarray::fast_av(&b_prime_constrained, theta);
         ndarray::Zip::from(&mut g)
             .and(&dwiggle_dz)
             .par_for_each(|gi, &dw| *gi = 1.0 + dw / rw);
-        g
+        if let Some((row, value)) = g.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+            return Err(format!(
+                "link-wiggle chain-rule derivative is non-finite at row {row}: {value}"
+            ));
+        }
+        Ok(g)
     }
 
     fn compute_logp_and_grad_into(&self, z: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
@@ -5851,7 +5966,14 @@ impl LinkWigglePosterior {
         if let Some(offset) = self.offset.as_ref() {
             u += offset.as_ref();
         }
-        let (bwiggle, eta) = self.evaluate_link(&u, &theta);
+        let (bwiggle, eta) = match self.evaluate_link(&u, &theta) {
+            Ok(value) => value,
+            Err(error) => {
+                log::warn!("[link-wiggle NUTS] geometry is invalid: {error}");
+                grad.fill(0.0);
+                return f64::NEG_INFINITY;
+            }
+        };
 
         // One exact row oracle owns both the likelihood value and eta score.
         let mut residual = Array1::<f64>::zeros(self.n_samples);
@@ -5891,7 +6013,14 @@ impl LinkWigglePosterior {
 
         // Gradient w.r.t. β_eta: ∂ℓ/∂β = X^T · (residual ⊙ g'(q₀)) − S_base · β
         // where g'(q₀) = dη/dq₀ is the chain-rule factor
-        let g_prime = self.compute_g_prime(&u, &theta);
+        let g_prime = match self.compute_g_prime(&u, &theta) {
+            Ok(value) => value,
+            Err(error) => {
+                log::warn!("[link-wiggle NUTS] chain rule is invalid: {error}");
+                grad.fill(0.0);
+                return f64::NEG_INFINITY;
+            }
+        };
         let r_scaled: Array1<f64> = residual
             .iter()
             .zip(g_prime.iter())
@@ -6746,6 +6875,77 @@ impl JointBetaRhoPosterior {
         let n_beta = x.ncols();
         let n_rho = penalty_canonical.len();
 
+        if y.len() != n_samples
+            || weights.len() != n_samples
+            || mode.len() != n_beta
+            || hessian.dim() != (n_beta, n_beta)
+        {
+            return Err(HmcError::DimensionMismatch {
+                reason: format!(
+                    "Joint HMC geometry mismatch: X={}x{}, y={}, weights={}, mode={}, hessian={:?}",
+                    n_samples,
+                    n_beta,
+                    y.len(),
+                    weights.len(),
+                    mode.len(),
+                    hessian.dim(),
+                ),
+            }
+            .into());
+        }
+        for (label, invalid) in [
+            ("design", first_non_finite(x.iter())),
+            ("mode", first_non_finite(mode.iter())),
+            ("hessian", first_non_finite(hessian.iter())),
+        ] {
+            if let Some((index, value)) = invalid {
+                return Err(HmcError::NonFiniteState {
+                    reason: format!(
+                        "Joint HMC {label} has non-finite value {value} at flat index {index}"
+                    ),
+                }
+                .into());
+            }
+        }
+        if let Some((row, weight)) = weights
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, weight)| !(weight.is_finite() && *weight >= 0.0))
+        {
+            return Err(HmcError::InvalidConfig {
+                reason: format!(
+                    "Joint HMC weight at row {row} must be finite and non-negative, got {weight}"
+                ),
+            }
+            .into());
+        }
+        for (index, penalty) in penalty_canonical.iter().enumerate() {
+            if penalty.total_dim != n_beta
+                || penalty.col_range.end > n_beta
+                || penalty.col_range.start > penalty.col_range.end
+                || penalty.root.ncols() != penalty.col_range.len()
+            {
+                return Err(HmcError::DimensionMismatch {
+                    reason: format!(
+                        "Joint HMC penalty {index} has total_dim={}, range={:?}, root={:?}, expected total dimension {n_beta}",
+                        penalty.total_dim,
+                        penalty.col_range,
+                        penalty.root.dim(),
+                    ),
+                }
+                .into());
+            }
+            if let Some((flat_index, value)) = first_non_finite(penalty.root.iter()) {
+                return Err(HmcError::NonFiniteState {
+                    reason: format!(
+                        "Joint HMC penalty {index} root has non-finite value {value} at flat index {flat_index}"
+                    ),
+                }
+                .into());
+            }
+        }
+
         if let Some(offset) = offset.as_ref() {
             if offset.len() != n_samples {
                 return Err(HmcError::DimensionMismatch {
@@ -6847,6 +7047,20 @@ impl JointBetaRhoPosterior {
         }
         let (likelihood, cov_scale) =
             resolve_hmc_likelihood(likelihood, dispersion).map_err(String::from)?;
+        let mut eta_at_mode = x.dot(&mode);
+        if let Some(offset) = offset.as_ref() {
+            eta_at_mode += offset;
+        }
+        let mut score_at_mode = Array1::zeros(n_samples);
+        gam_solve::pirls::eta_log_likelihood_value_and_score_into(
+            y,
+            &eta_at_mode,
+            &likelihood,
+            &likelihood.spec.link,
+            weights,
+            &mut score_at_mode,
+        )
+        .map_err(|error| format!("joint HMC likelihood is invalid at the fitted mode: {error}"))?;
 
         let whitening = hessian_whitening_transform(
             hessian,

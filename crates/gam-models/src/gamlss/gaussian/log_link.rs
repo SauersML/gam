@@ -596,7 +596,7 @@ mod exact_domain_tests {
     fn scaled_product_quotient_avoids_false_intermediate_overflow_and_underflow() {
         let got = scaled_positive_product_quotient(1.0e-300, 1.0, 1.0e308, 1.0);
         assert!((got - 1.0e8).abs() <= 4.0 * f64::EPSILON * 1.0e8);
-        let got = scaled_positive_product_quotient(1.0e-300, 1.0e-200, 1.0e-300);
+        let got = scaled_positive_product_quotient(1.0e-300, 1.0e-200, 1.0, 1.0e-300);
         assert!((got - 1.0e-200).abs() <= 4.0 * f64::EPSILON * 1.0e-200);
     }
 

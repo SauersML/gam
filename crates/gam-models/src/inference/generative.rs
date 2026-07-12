@@ -100,9 +100,7 @@ pub fn family_noise_parameter(
             LikelihoodScaleMetadata::FixedNegBinTheta {
                 theta: metadata_theta,
             },
-        ) => {
-            positive("negative-binomial theta", metadata_theta)
-        }
+        ) => positive("negative-binomial theta", metadata_theta),
         // Beta precision phi is estimated jointly with the mean (#567/#770); the
         // spec phi is only the seed.
         (
@@ -627,8 +625,7 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
                 if mu == 0.0 {
                     continue;
                 }
-                let log_lambda =
-                    (2.0 - *p) * mu.ln() - phi_i.ln() - (2.0 - *p).ln();
+                let log_lambda = (2.0 - *p) * mu.ln() - phi_i.ln() - (2.0 - *p).ln();
                 let log_scale = phi_i.ln() + (*p - 1.0).ln() + (*p - 1.0) * mu.ln();
                 let lambda = log_lambda.exp();
                 let scale = log_scale.exp();
@@ -927,8 +924,9 @@ mod tests {
                 LikelihoodScaleMetadata::EstimatedNegBinTheta { theta: 2.97 },
                 0.0,
                 &nb,
-            ),
-            Ok(Some(2.97)),
+            )
+            .unwrap(),
+            Some(2.97),
             "NB picker must read theta_hat (#1124), not the seed theta=1"
         );
 
@@ -940,8 +938,9 @@ mod tests {
                 LikelihoodScaleMetadata::EstimatedTweediePhi { phi: 7.25 },
                 0.0,
                 &tw,
-            ),
-            Ok(Some(7.25)),
+            )
+            .unwrap(),
+            Some(7.25),
             "Tweedie picker must read phi_hat (#771), not the variance power p"
         );
 
@@ -952,8 +951,9 @@ mod tests {
                 LikelihoodScaleMetadata::EstimatedBetaPhi { phi: 12.0 },
                 0.0,
                 &beta,
-            ),
-            Ok(Some(12.0)),
+            )
+            .unwrap(),
+            Some(12.0),
             "Beta picker must read phi_hat (#770), not the seed phi=1"
         );
 
@@ -964,8 +964,9 @@ mod tests {
                 LikelihoodScaleMetadata::EstimatedGammaShape { shape: 4.5 },
                 0.123,
                 &gamma,
-            ),
-            Ok(Some(4.5)),
+            )
+            .unwrap(),
+            Some(4.5),
             "Gamma picker must read shape_hat (#678), not the residual-scale fallback"
         );
     }
@@ -976,15 +977,10 @@ mod tests {
     fn family_noise_parameter_rejects_unresolved_fit_metadata() {
         let none = LikelihoodScaleMetadata::ProfiledGaussian;
         assert!(
-            family_noise_parameter(none, 0.0, &LikelihoodSpec::negative_binomial_log(3.5))
-                .is_err()
+            family_noise_parameter(none, 0.0, &LikelihoodSpec::negative_binomial_log(3.5)).is_err()
         );
-        assert!(
-            family_noise_parameter(none, 0.0, &LikelihoodSpec::beta_logit(8.0)).is_err()
-        );
-        assert!(
-            family_noise_parameter(none, 0.0, &LikelihoodSpec::tweedie_log(1.5)).is_err()
-        );
+        assert!(family_noise_parameter(none, 0.0, &LikelihoodSpec::beta_logit(8.0)).is_err());
+        assert!(family_noise_parameter(none, 0.0, &LikelihoodSpec::tweedie_log(1.5)).is_err());
         assert!(family_noise_parameter(none, 2.0, &LikelihoodSpec::gamma_log()).is_err());
     }
 
