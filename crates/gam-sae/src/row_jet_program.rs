@@ -1909,9 +1909,9 @@ impl SaeReconstructionRowProgram {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_math::jet_scalar::JetScalar;
-    // `value`/`add`/… moved to the shared `JetField` base (JetScalar: JetField);
-    // the concrete-typed scalar reads in these tests need it in scope.
+    // The scalar algebra (`value`/`add`/…) these tests read on concrete scalars
+    // lives on the shared `JetField` base now (JetScalar: JetField); JetScalar
+    // itself is no longer named here, so only JetField is imported.
     use gam_math::nested_dual::JetField;
 
     /// Replicate the production hand path (`row_jets_for_logdet`) arithmetic for
