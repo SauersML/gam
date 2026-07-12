@@ -1,16 +1,13 @@
 // Split from tests.rs under the #780 oversized-file gate: recovery-suite +
-// registry/assignment tests from line ~6560 onward. Same module scope via
-// `use super::tests::*` so shared fixtures keep working.
-use super::tests::*;
+// registry/assignment tests from line ~6560 onward. Shared fixtures come via
+// the parent-module glob below.
 use super::*;
 use approx::assert_abs_diff_eq;
-use gam_linalg::faer_ndarray::fast_ata;
 use gam_solve::arrow_schur::{
     ArrowFactorSlab, ArrowHtbetaCache, ArrowPcgDiagnostics, ArrowSolverMode, ArrowUndampedFactors,
 };
 use gam_solve::evidence::arrow_log_det_from_cache;
-use gam_terms::analytic_penalties::ARDPenalty;
-use ndarray::{Array5, array};
+use ndarray::array;
 
 /// Torus T^2 fit on synthetic data with a known two-frequency signal.
 /// Drives a single torus atom through the [`SaeManifoldTerm`] Newton loop
