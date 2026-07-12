@@ -379,7 +379,7 @@ const SOLVE_ROUNDOFF_OPS_PER_DIMENSION: f64 = 256.0;
 
 #[inline]
 fn positive_ulp(value: f64) -> f64 {
-    debug_assert!(value.is_finite() && value >= 0.0);
+    assert!(value.is_finite() && value >= 0.0);
     if value == 0.0 {
         return f64::from_bits(1);
     }
