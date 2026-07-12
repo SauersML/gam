@@ -1761,15 +1761,32 @@ fn survival_ls_joint_directional_derivative_time_varying_body() {
     }
 }
 
-/// #921: the `RowKernel<9>` repackaging must reproduce the bespoke joint
-/// assembly bit-for-bit. We build a non-time-varying, non-wiggle fixture
-/// (the config the kernel covers), then assert the generic row-kernel engine
-/// (`build_row_kernel_cache` → `row_kernel_hessian_dense` /
-/// `row_kernel_log_likelihood`) matches the existing assembly oracle and the
-/// bespoke per-row log-likelihood. The public `exact_newton_joint_hessian`
-/// method now delegates to this RowKernel path for the covered non-wiggle
-/// shape, so the test calls `assemble_joint_hessian_from_quantities`
-/// directly to keep an independent oracle.
+fn packed_sls_dense(
+    family: &SurvivalLocationScaleFamily,
+    states: &[ParameterBlockState],
+    deriv_log_scale: f64,
+) -> Array2<f64> {
+    let dynamic = family
+        .build_dynamic_geometry(states)
+        .expect("packed SLS dynamic geometry");
+    match family
+        .survival_ls_coefficient_hessian(
+            &dynamic,
+            deriv_log_scale,
+            None,
+            SlsCoefficientHessianTarget::DenseFull,
+        )
+        .expect("packed SLS dense Hessian")
+    {
+        SlsCoefficientHessian::DenseFull(dense) => dense,
+        _ => panic!("dense target returned another packed SLS shape"),
+    }
+}
+
+/// #921/#932: the packed 24-pair coefficient lowering must reproduce the
+/// generic `RowKernel<9>` dense pullback. The two paths share only the canonical
+/// row program: one lowers its 24 structural pairs through grouped X'WX calls,
+/// while the oracle materializes the generic per-row 9×9 pullback.
 #[test]
 fn survival_ls_row_kernel_matches_bespoke_assembly() {
     // Row-kernel assembly plus the directional-Hessian FD oracle keep several
@@ -1799,9 +1816,6 @@ fn survival_ls_row_kernel_matches_bespoke_assembly_body() {
     let beta_ls = 0.2_f64;
     let states = survival_exact_newton_test_states(&family, beta_t, beta_thr, beta_ls);
 
-    let q = family
-        .collect_joint_quantities(&states)
-        .expect("collect joint quantities");
     let dynamic = family
         .build_dynamic_geometry(&states)
         .expect("dynamic geometry");
@@ -1814,10 +1828,7 @@ fn survival_ls_row_kernel_matches_bespoke_assembly_body() {
 
     let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("row kernel cache");
     let h_new = row_kernel_hessian_dense(&kernel, &cache, &RowSet::All);
-    let h_old = family
-        .assemble_joint_hessian_from_quantities(&q, &states)
-        .expect("joint Hessian oracle")
-        .expect("joint Hessian oracle present");
+    let h_old = packed_sls_dense(&family, &states, 0.0);
     assert_eq!(h_new.dim(), h_old.dim(), "joint hessian shape");
     for ((a, b), &old) in h_old.indexed_iter() {
         let new = h_new[[a, b]];
@@ -1875,16 +1886,8 @@ fn survival_ls_row_kernel_matches_bespoke_assembly_body() {
         beta_thr - eps * direction[1],
         beta_ls - eps * direction[2],
     );
-    let q_plus = family.collect_joint_quantities(&plus).expect("plus q");
-    let q_minus = family.collect_joint_quantities(&minus).expect("minus q");
-    let h_plus = family
-        .assemble_joint_hessian_from_quantities(&q_plus, &plus)
-        .expect("plus Hessian oracle")
-        .expect("plus Hessian present");
-    let h_minus = family
-        .assemble_joint_hessian_from_quantities(&q_minus, &minus)
-        .expect("minus Hessian oracle")
-        .expect("minus Hessian present");
+    let h_plus = packed_sls_dense(&family, &plus, 0.0);
+    let h_minus = packed_sls_dense(&family, &minus, 0.0);
     let d_fd = (&h_plus - &h_minus) / (2.0 * eps);
     for ((a, b), &fd) in d_fd.indexed_iter() {
         let new = d_new[[a, b]];
@@ -1895,33 +1898,26 @@ fn survival_ls_row_kernel_matches_bespoke_assembly_body() {
     }
 }
 
-/// #932: assembler-level single-source guard for the TIME-VARYING joint
-/// Hessian path across EVERY residual distribution.
+/// #932: packed coefficient-level guard for the time-varying joint Hessian
+/// across every residual distribution.
 ///
 /// `survival_ls_row_kernel_matches_bespoke_assembly` (#921) already pins the
 /// generic row-kernel joint Hessian (`row_kernel_hessian_dense`, sourced from
-/// the once-written `sls_row_nll` through `Order2<9>`) to the bespoke
-/// hand-assembler (`assemble_joint_hessian_from_quantities`). But that fixture
-/// is Gaussian-only and uses the SIMPLE block shape
+/// the once-written `sls_row_nll` through `Order2<9>`) to the packed coefficient
+/// lowering. But that fixture is Gaussian-only and uses the simple block shape
 /// (`x_{threshold,log_sigma}_{entry,deriv} = None`), so it only exercises the
-/// `else` branches of the assembler. The hand-derived `if let Some(x_*_deriv)`
-/// branches — the time-varying blocks with the extra `h_exit_deriv` /
-/// `h_entry` cross-block weight expressions (e.g.
-/// `mxtwx(x_threshold_exit, &h_exit_deriv, x_t_deriv)`,
-/// `-(d2_qdot1·dqdot_t·dqdot_lsd + d1_qdot1·d2qdot_tlsd)`) — are EXACTLY the
-/// #736 dropped/sign-flipped cross-term genus, and no assembler==tower oracle
-/// covered them: they were only checked at the per-row level
+/// smallest alias-resolved plan. Fully time-varying designs exercise all 24
+/// structural pairs, including derivative-design cross terms — exactly the #736
+/// dropped/sign-flipped genus — which previously had only a per-row oracle
 /// (`survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels`),
 /// never assembled into the joint matrix and compared.
 ///
 /// This fills that gap. `survival_ls_joint_oracle_family` populates every
-/// entry/deriv design, so the assembler takes its time-varying branches; the
-/// generic engine builds the same joint Hessian from the single-sourced row
+/// entry/deriv design, so the packed plan retains all 24 groups; the generic
+/// engine builds the same joint Hessian from the single-sourced row
 /// NLL. They must agree to ~1e-9 (no FD: both are analytic), for
 /// Gaussian / Gumbel (Weibull AFT) / Logistic (log-logistic AFT). A dropped
-/// cross-block term in the hand assembler shifts a joint entry well outside
-/// 1e-9 and fails loudly — the assembler-level analogue of the per-row
-/// #736 guard.
+/// structural pair shifts a joint entry well outside 1e-9 and fails loudly.
 #[test]
 fn survival_ls_time_varying_joint_hessian_matches_single_sourced_tower_932() {
     let join_result = std::thread::Builder::new()
@@ -1975,9 +1971,6 @@ fn survival_ls_time_varying_joint_hessian_tower_body() {
         );
         let states = survival_ls_joint_oracle_states(&primaries);
 
-        let q = family
-            .collect_joint_quantities(&states)
-            .expect("collect joint quantities");
         let dynamic = family
             .build_dynamic_geometry(&states)
             .expect("dynamic geometry");
@@ -1993,11 +1986,7 @@ fn survival_ls_time_varying_joint_hessian_tower_body() {
         let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("row kernel cache");
         let h_tower = row_kernel_hessian_dense(&kernel, &cache, &RowSet::All);
 
-        // Bespoke hand assembler (time-varying branches).
-        let h_bespoke = family
-            .assemble_joint_hessian_from_quantities(&q, &states)
-            .expect("bespoke joint Hessian")
-            .expect("bespoke joint Hessian present");
+        let h_bespoke = packed_sls_dense(&family, &states, 0.0);
 
         assert_eq!(
             h_tower.dim(),
@@ -2008,8 +1997,8 @@ fn survival_ls_time_varying_joint_hessian_tower_body() {
             let tower = h_tower[[a, b]];
             assert!(
                 (tower - bespoke).abs() <= 1e-9 * (1.0 + bespoke.abs()),
-                "{distribution:?}: joint Hessian [{a}][{b}] hand-assembler {bespoke} != \
-                 single-sourced tower {tower}"
+                "{distribution:?}: joint Hessian [{a}][{b}] packed {bespoke} != \
+                 generic single-sourced tower {tower}"
             );
         }
 
