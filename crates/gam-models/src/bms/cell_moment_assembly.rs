@@ -5706,7 +5706,7 @@ mod empirical_flex_jet_oracle_tests {
         }
     }
 
-    fn benchmark_runtime(total_dimension: usize) -> DeviationRuntime {
+    fn runtime_for_primary_dimension(total_dimension: usize) -> DeviationRuntime {
         let wanted = total_dimension - 2;
         for n_knots in 5..=40 {
             let knots = Array1::from_iter(
@@ -5730,14 +5730,12 @@ mod empirical_flex_jet_oracle_tests {
             .expect("valid benchmark grid")
     }
 
-    fn make_benchmark_fixture(is_score_warp: bool, total_dimension: usize) -> FlexFixture {
+    fn make_dimension_fixture(is_score_warp: bool, total_dimension: usize) -> FlexFixture {
         let mut fixture = make_fixture(is_score_warp);
-        let runtime = benchmark_runtime(total_dimension);
+        let runtime = runtime_for_primary_dimension(total_dimension);
         let basis_dim = runtime.basis_dim();
-        let grid = benchmark_grid();
         fixture.family.score_warp = is_score_warp.then(|| runtime.clone());
         fixture.family.link_dev = (!is_score_warp).then(|| runtime.clone());
-        fixture.family.latent_measure = LatentMeasureKind::GlobalEmpirical { grid: grid.clone() };
         fixture.primary = PrimarySlices {
             q: 0,
             logslope: 1,
@@ -5750,12 +5748,19 @@ mod empirical_flex_jet_oracle_tests {
             0.06 * ((i as f64) - center) / center.max(1.0)
         });
         fixture.runtime = runtime;
-        fixture.grid = grid;
         assert_eq!(fixture.primary.total, total_dimension);
         fixture
     }
 
-    fn benchmark_state(
+    fn make_benchmark_fixture(is_score_warp: bool, total_dimension: usize) -> FlexFixture {
+        let mut fixture = make_dimension_fixture(is_score_warp, total_dimension);
+        let grid = benchmark_grid();
+        fixture.family.latent_measure = LatentMeasureKind::GlobalEmpirical { grid: grid.clone() };
+        fixture.grid = grid;
+        fixture
+    }
+
+    fn fixture_state(
         fixture: &FlexFixture,
     ) -> (f64, f64, Array1<f64>, BernoulliMarginalSlopeRowExactContext) {
         let q = 0.23_f64;
@@ -5784,6 +5789,173 @@ mod empirical_flex_jet_oracle_tests {
                 degree9_cells: None,
             },
         )
+    }
+
+    fn fixture_block_states(q: f64, slope: f64, beta: &Array1<f64>) -> Vec<ParameterBlockState> {
+        vec![
+            ParameterBlockState {
+                beta: Array1::from_vec(vec![q]),
+                eta: Array1::from_vec(vec![q]),
+            },
+            ParameterBlockState {
+                beta: Array1::from_vec(vec![slope]),
+                eta: Array1::from_vec(vec![slope]),
+            },
+            ParameterBlockState {
+                beta: beta.clone(),
+                eta: Array1::zeros(1),
+            },
+        ]
+    }
+
+    fn assert_matrix_close(label: &str, expected: &Array2<f64>, actual: &Array2<f64>) {
+        assert_eq!(expected.dim(), actual.dim(), "{label} shape");
+        for ((row, column), &expected_value) in expected.indexed_iter() {
+            let actual_value = actual[[row, column]];
+            assert!(
+                (expected_value - actual_value).abs()
+                    <= 2e-10 * expected_value.abs().max(actual_value.abs()).max(1.0),
+                "{label}[{row},{column}]: expected {expected_value:+.12e}, got {actual_value:+.12e}"
+            );
+        }
+    }
+
+    /// Permanent production-wiring oracle for the runtime batch algebras.
+    /// Five directions/pairs cross the four-pair fourth-order chunk boundary;
+    /// lane two is exactly zero. Every batched result is compared to the
+    /// canonical single-contraction path at all specialized widths and both
+    /// empirical FLEX programs, and the trace gradient is independently
+    /// reduced from basis-direction singles.
+    #[test]
+    fn empirical_flex_batched_contractions_match_single_production_932() {
+        for is_score_warp in [true, false] {
+            for r in [4_usize, 8, 12, 18] {
+                let fixture = make_dimension_fixture(is_score_warp, r);
+                let (q, slope, beta, _) = fixture_state(&fixture);
+                let states = fixture_block_states(q, slope, &beta);
+                let cache = fixture
+                    .family
+                    .build_exact_eval_cache(&states)
+                    .expect("empirical FLEX batch oracle cache");
+                assert_eq!(cache.primary.total, r);
+                let row_ctx = BernoulliMarginalSlopeFamily::row_ctx(&cache, 0);
+                let mut directions = (0..5)
+                    .map(|lane| {
+                        Array1::from_shape_fn(r, |axis| {
+                            let magnitude = ((lane + 2) * (axis + 3) % 11 + 1) as f64 / 13.0;
+                            if (lane + axis) % 2 == 0 {
+                                magnitude
+                            } else {
+                                -0.6 * magnitude
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                directions[2].fill(0.0);
+
+                let singles = directions
+                    .iter()
+                    .map(|direction| {
+                        fixture
+                            .family
+                            .row_primary_third_contracted(0, &states, &cache, row_ctx, direction)
+                            .expect("single empirical FLEX third contraction")
+                    })
+                    .collect::<Vec<_>>();
+                let batched = fixture
+                    .family
+                    .row_primary_third_contracted_many_with_moments(
+                        0,
+                        &states,
+                        &cache,
+                        row_ctx,
+                        &directions,
+                    )
+                    .expect("batched empirical FLEX third contractions");
+                for lane in 0..directions.len() {
+                    assert_matrix_close(
+                        &format!("third kind={is_score_warp} r={r} lane={lane}"),
+                        &singles[lane],
+                        &batched[lane],
+                    );
+                }
+                assert!(batched[2].iter().all(|value| value.to_bits() == 0));
+
+                let gram = (0..r * r)
+                    .map(|idx| {
+                        let row = idx / r;
+                        let column = idx % r;
+                        ((row + 2 * column + 1) as f64) / (3 * r) as f64
+                    })
+                    .collect::<Vec<_>>();
+                let mut expected_trace = Array1::<f64>::zeros(r);
+                for axis in 0..r {
+                    let mut basis = Array1::<f64>::zeros(r);
+                    basis[axis] = 1.0;
+                    let third = fixture
+                        .family
+                        .row_primary_third_contracted(0, &states, &cache, row_ctx, &basis)
+                        .expect("basis empirical FLEX third contraction");
+                    expected_trace[axis] =
+                        BernoulliMarginalSlopeFamily::row_primary_trace_contract(&third, &gram);
+                }
+                let actual_trace = fixture
+                    .family
+                    .row_primary_third_trace_gradient_with_moments(
+                        0, &states, &cache, row_ctx, &gram,
+                    )
+                    .expect("batched empirical FLEX trace gradient");
+                for axis in 0..r {
+                    let expected = expected_trace[axis];
+                    let actual = actual_trace[axis];
+                    assert!(
+                        (expected - actual).abs()
+                            <= 2e-10 * expected.abs().max(actual.abs()).max(1.0),
+                        "trace kind={is_score_warp} r={r} axis={axis}: expected {expected:+.12e}, got {actual:+.12e}"
+                    );
+                }
+
+                let pair_indices = [(0, 1), (1, 3), (2, 4), (3, 0), (4, 1)];
+                let direction_pairs = pair_indices
+                    .iter()
+                    .map(|&(u, v)| (&directions[u], &directions[v]))
+                    .collect::<Vec<_>>();
+                let fourth_singles = direction_pairs
+                    .iter()
+                    .map(|&(direction_u, direction_v)| {
+                        fixture
+                            .family
+                            .row_primary_fourth_contracted(
+                                0,
+                                &states,
+                                &cache,
+                                row_ctx,
+                                direction_u,
+                                direction_v,
+                            )
+                            .expect("single empirical FLEX fourth contraction")
+                    })
+                    .collect::<Vec<_>>();
+                let fourth_batched = fixture
+                    .family
+                    .row_primary_fourth_contracted_many(
+                        0,
+                        &states,
+                        &cache,
+                        row_ctx,
+                        &direction_pairs,
+                    )
+                    .expect("batched empirical FLEX fourth contractions");
+                for lane in 0..direction_pairs.len() {
+                    assert_matrix_close(
+                        &format!("fourth kind={is_score_warp} r={r} lane={lane}"),
+                        &fourth_singles[lane],
+                        &fourth_batched[lane],
+                    );
+                }
+                assert!(fourth_batched[2].iter().all(|value| value.to_bits() == 0));
+            }
+        }
     }
 
     fn legacy_empirical_flex_third(
@@ -5887,18 +6059,6 @@ mod empirical_flex_jet_oracle_tests {
         }
         std::hint::black_box(&output);
         (start.elapsed().as_nanos() / repetitions as u128, output)
-    }
-
-    fn assert_benchmark_agreement(label: &str, old: &Array2<f64>, new: &Array2<f64>) {
-        assert_eq!(old.dim(), new.dim());
-        for ((row, column), &old_value) in old.indexed_iter() {
-            let new_value = new[[row, column]];
-            assert!(
-                (old_value - new_value).abs()
-                    <= 1e-8 * old_value.abs().max(new_value.abs()).max(1.0),
-                "{label}[{row},{column}]: legacy {old_value:+.12e} != canonical {new_value:+.12e}"
-            );
-        }
     }
 
     fn assert_sigma_terms_close(
@@ -6064,7 +6224,7 @@ mod empirical_flex_jet_oracle_tests {
         for is_score_warp in [true, false] {
             for r in [4_usize, 8, 12, 18] {
                 let fixture = make_benchmark_fixture(is_score_warp, r);
-                let (q, slope, beta, row_ctx) = benchmark_state(&fixture);
+                let (q, slope, beta, row_ctx) = fixture_state(&fixture);
                 let direction_u = Array1::from_shape_fn(r, |axis| {
                     ((axis + 1) as f64 / r as f64) * if axis % 2 == 0 { 1.0 } else { -0.7 }
                 });
@@ -6096,7 +6256,7 @@ mod empirical_flex_jet_oracle_tests {
                         )
                         .expect("canonical third contraction")
                 });
-                assert_benchmark_agreement("third", &old_third, &new_third);
+                assert_matrix_close("third", &old_third, &new_third);
 
                 let (old_fourth_ns, old_fourth) = timed_matrix(1, || {
                     legacy_empirical_flex_fourth(
@@ -6126,7 +6286,7 @@ mod empirical_flex_jet_oracle_tests {
                         )
                         .expect("canonical fourth contraction")
                 });
-                assert_benchmark_agreement("fourth", &old_fourth, &new_fourth);
+                assert_matrix_close("fourth", &old_fourth, &new_fourth);
 
                 let kind = if is_score_warp { "score" } else { "link" };
                 eprintln!(
