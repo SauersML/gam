@@ -1692,6 +1692,83 @@ mod tests {
         assert!(max_h <= 1e-7, "certificate h parity {max_h:.3e} > 1e-7");
     }
 
+    /// Pin: the CPU atlas routing (`crate::encode::nearest_charts_topk`) and the
+    /// GPU-host routing ([`super::nearest_charts_topk`]) select IDENTICAL charts on
+    /// a shared fixture. Both now funnel through the one shared comparator
+    /// [`crate::encode::select_nearest_charts_topk`] (amplitude gating + `(distance,
+    /// index)` tie-break), so the only remaining way they could diverge is a drift
+    /// between the two recon SOURCES — the CPU's distilled `recon_center` vs the
+    /// GPU-host's per-center basis re-eval (which itself mirrors the CUDA kernel's
+    /// routing, `recon_amp1(eval_basis(center))`). This guards that bit-identity.
+    #[test]
+    fn cpu_gpu_chart_routing_topk_parity() {
+        let (d, deg, p) = (2usize, 2usize, 5usize);
+        let config = AtlasConfig {
+            grid_resolution: 6,
+            ..AtlasConfig::default()
+        };
+        let (atom, atlas) = build_atom_and_atlas(d, deg, p, config);
+        let atom_atlas = &atlas.atoms[0];
+        let dev = EncodeAtomDevice::from_atom_atlas(&atom, atom_atlas, &config).unwrap();
+        assert!(
+            dev.charts.len() > 1,
+            "fixture must have multiple charts to exercise routing (got {})",
+            dev.charts.len()
+        );
+
+        let evaluator = EuclideanPatchEvaluator::new(d, deg).unwrap();
+        // Planted (on-manifold) rows on a coord grid + structured off-manifold rows,
+        // each over a range of amplitudes so the amplitude gating is exercised.
+        let mut rows: Vec<(Vec<f64>, f64)> = Vec::new();
+        for k in 0..36 {
+            let t0 = -0.35 + 0.7 * ((k % 6) as f64) / 5.0;
+            let t1 = -0.35 + 0.7 * ((k / 6) as f64) / 5.0;
+            let coord = Array2::from_shape_fn((1, d), |(_, c)| if c == 0 { t0 } else { t1 });
+            let (phi, _) = evaluator.evaluate(coord.view()).unwrap();
+            let amp = 0.6 + 0.5 * ((k as f64) * 0.17).cos();
+            let mut x = vec![0.0; p];
+            for c in 0..p {
+                let mut r = 0.0;
+                for b in 0..dev.m {
+                    r += phi[[0, b]] * dev.decoder[b * p + c];
+                }
+                x[c] = amp * r;
+            }
+            rows.push((x, amp));
+        }
+        for k in 0..24 {
+            let x = (0..p)
+                .map(|c| 0.4 * (((k * 5 + c * 2) as f64) * 0.29).sin())
+                .collect();
+            let amp = 0.5 + 0.4 * ((k as f64) * 0.13).sin();
+            rows.push((x, amp));
+        }
+
+        let mut scratch = Scratch::new(&dev);
+        let mut compared = 0usize;
+        for (x, amp) in &rows {
+            let xv = Array1::from(x.clone());
+            let cpu = crate::encode::nearest_charts_topk(atom_atlas, xv.view(), *amp, dev.topk);
+            let gpu = nearest_charts_topk(&dev, x, *amp, &mut scratch);
+            assert_eq!(
+                cpu, gpu,
+                "CPU vs GPU top-{} chart routing diverged at amp {amp}: cpu {cpu:?} gpu {gpu:?}",
+                dev.topk
+            );
+            // The single-chart CPU router agrees with the top-1 selection.
+            if let Some((idx, _)) = crate::encode::nearest_chart(atom_atlas, xv.view(), *amp) {
+                assert_eq!(Some(&idx), cpu.first(), "nearest_chart != topk[0] at amp {amp}");
+            }
+            compared += 1;
+        }
+        assert!(compared >= 50, "fixture too small: {compared}");
+        eprintln!(
+            "CPU/GPU routing parity: {compared} rows, top-{} identical (of {} charts)",
+            dev.topk,
+            dev.charts.len()
+        );
+    }
+
     #[test]
     fn emulator_matches_production_certified_encode_2d_quadratic() {
         let (d, deg, p) = (2usize, 2usize, 5usize);
