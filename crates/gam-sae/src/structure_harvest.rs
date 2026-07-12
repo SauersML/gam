@@ -90,9 +90,9 @@ use crate::description_length::{BirthMdlPrescreen, predicted_birth_dl_bits};
 use crate::frames::GrassmannFrame;
 use crate::manifold::{
     AssignmentMode, AtlasSeamKind, GraphStructureSelection, LearnedGraphAtom, OccupancyLaw,
-    SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, SaeReferenceRoughness,
-    SphereChartTransition, UnitSpeedChartTransition, amplitude_concentration_certificate,
-    classify_occupancy_interval,
+    SAE_MAX_PERIODIC_HARMONICS, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
+    SaeManifoldTerm, SaeReferenceRoughness, SphereChartTransition, UnitSpeedChartTransition,
+    amplitude_concentration_certificate, classify_occupancy_interval,
 };
 use crate::migration_ledger::SaeMigrationLedger;
 use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance_for_pairs};
@@ -3488,9 +3488,11 @@ pub struct PrimaryTopologyChoice {
     /// Evidence-selected harmonic resolution for a periodic (circle) winner
     /// (#2243): the number of Fourier harmonics the seed circle carries, chosen
     /// by REML marginal likelihood rather than the historical fixed budget.
-    /// `None` for every non-periodic kind, whose chart resolution is not a
-    /// harmonic count (sphere/torus/möbius carry fixed charts; flat winners
-    /// carry data-scaled Duchon centers).
+    /// `None` for every non-periodic kind, whose chart resolution is either a
+    /// different knob (a torus winner carries its per-axis order in
+    /// `n_torus_harmonics`; a flat/Duchon-sheet winner carries data-scaled
+    /// centers in `n_duchon_centers`) or genuinely fixed (the sphere lat/lon
+    /// chart and the Möbius double-cover basis are fixed-degree constructions).
     pub n_harmonics: Option<usize>,
     /// Evidence-selected thin-plate center count for a Duchon-sheet winner
     /// (#2240, the #2243 resolution-growth pattern lifted to 2-D): the number
@@ -3499,6 +3501,13 @@ pub struct PrimaryTopologyChoice {
     /// every other kind (including a flat `EuclideanPatch` winner, which is
     /// installed as a duchon seed at the builder's default center budget).
     pub n_duchon_centers: Option<usize>,
+    /// Evidence-selected per-axis harmonic order for a torus winner (#2243, the
+    /// resolution-growth pattern lifted to the tensor-product torus): the number
+    /// of Fourier harmonics per circle factor the seeded torus should carry
+    /// (basis size `(2H+1)^d`), chosen by the same REML marginal likelihood the
+    /// topology race scores with rather than the fixed `SAE_DEFAULT_TORUS_HARMONICS`
+    /// budget. `None` for every other kind.
+    pub n_torus_harmonics: Option<usize>,
 }
 
 /// Per-atom topology discovery for the PRIMARY seed dictionary (#2238/#2239).
@@ -3644,6 +3653,7 @@ pub fn discover_primary_atom_topologies(
                 coords
             };
             let mut sheet_coords: Option<Array2<f64>> = None;
+            let mut torus_coords: Option<Array2<f64>> = None;
             if max_dims[atom_idx] >= 2 {
                 // Flat 2-D patch: standardized leading principal projections.
                 let (sd0, sd1) = (cluster_sd(0), cluster_sd(1));
@@ -3769,8 +3779,9 @@ pub fn discover_primary_atom_topologies(
                         ]),
                         latent_dim: 2,
                         evaluator: Arc::new(evaluator),
-                        coords,
+                        coords: coords.clone(),
                     });
+                    torus_coords = Some(coords);
                 }
             }
             if specs.is_empty() {
@@ -3827,11 +3838,33 @@ pub fn discover_primary_atom_topologies(
             } else {
                 None
             };
+            // #2243 — for a torus winner, GROW the per-axis harmonic order by
+            // the same REML evidence (the circle pattern lifted to the tensor-
+            // product torus): the race ran the torus at a fixed low order only
+            // to discriminate topology, but a genuinely toroidal factor with
+            // high-frequency angular content on either circle factor is capped
+            // by that order.
+            let n_torus_harmonics = if fit.basis_kind == SaeAtomBasisKind::Torus {
+                let coords = torus_coords.as_ref().ok_or_else(|| {
+                    format!(
+                        "discover_primary_atom_topologies: torus winner without a 2-D chart for auto atom {atom_idx}"
+                    )
+                })?;
+                Some(select_torus_resolution(
+                    coords.view(),
+                    target,
+                    weights.view(),
+                    rows.len(),
+                )?)
+            } else {
+                None
+            };
             Ok(PrimaryTopologyChoice {
                 basis_kind: fit.basis_kind,
                 latent_dim: fit.latent_dim,
                 n_harmonics,
                 n_duchon_centers,
+                n_torus_harmonics,
             })
         })
         .collect()

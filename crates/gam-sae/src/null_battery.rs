@@ -718,11 +718,7 @@ fn covariance_exact_hadamard_workspace_rows(nrows: usize) -> Result<usize, Strin
 /// A stage owns disjoint row-pair slabs. Rayon may schedule those slabs in any
 /// order, but every scalar follows the same fixed butterfly sequence, making
 /// the result bit-identical across thread counts and schedules.
-fn fwht_rows_in_place(
-    workspace: &mut [f64],
-    rows: usize,
-    cols: usize,
-) -> Result<(), String> {
+fn fwht_rows_in_place(workspace: &mut [f64], rows: usize, cols: usize) -> Result<(), String> {
     if !rows.is_power_of_two() || cols == 0 {
         return Err(format!(
             "Hadamard transform shape must have positive power-of-two rows and positive columns; got {rows} × {cols}"
@@ -743,9 +739,7 @@ fn fwht_rows_in_place(
             .checked_mul(2)
             .ok_or_else(|| "Hadamard stage row count overflowed".to_string())?;
         let slab_scalars = slab_rows.checked_mul(cols).ok_or_else(|| {
-            format!(
-                "Hadamard stage shape overflowed: {slab_rows} rows × {cols} columns"
-            )
+            format!("Hadamard stage shape overflowed: {slab_rows} rows × {cols} columns")
         })?;
         let half_scalars = half.checked_mul(cols).ok_or_else(|| {
             format!("Hadamard half-stage shape overflowed: {half} rows × {cols} columns")
@@ -756,10 +750,23 @@ fn fwht_rows_in_place(
                 workspace.len()
             ));
         }
-        workspace
-            .par_chunks_mut(slab_scalars)
-            .for_each(|slab| {
-                let (upper, lower) = slab.split_at_mut(half_scalars);
+        let slab_count = workspace.len() / slab_scalars;
+        let parallelize_row_pairs = slab_count < rayon::current_num_threads();
+        workspace.par_chunks_mut(slab_scalars).for_each(|slab| {
+            let (upper, lower) = slab.split_at_mut(half_scalars);
+            if parallelize_row_pairs {
+                upper
+                    .par_chunks_mut(cols)
+                    .zip(lower.par_chunks_mut(cols))
+                    .for_each(|(upper_row, lower_row)| {
+                        for col in 0..cols {
+                            let left = upper_row[col];
+                            let right = lower_row[col];
+                            upper_row[col] = left + right;
+                            lower_row[col] = left - right;
+                        }
+                    });
+            } else {
                 for paired_row in 0..half {
                     let row_offset = paired_row * cols;
                     for col in 0..cols {
@@ -770,7 +777,8 @@ fn fwht_rows_in_place(
                         lower[index] = left - right;
                     }
                 }
-            });
+            }
+        });
         half = slab_rows;
     }
     Ok(())
@@ -812,8 +820,7 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
         )
     })?;
     permutation.extend(0..n);
-    let mut permutation_rng =
-        StdRng::seed_from_u64(seed ^ HADAMARD_PERMUTATION_SEED_DOMAIN);
+    let mut permutation_rng = StdRng::seed_from_u64(seed ^ HADAMARD_PERMUTATION_SEED_DOMAIN);
     permutation.shuffle(&mut permutation_rng);
 
     let mut signs = Vec::<f64>::new();
@@ -2223,8 +2230,7 @@ mod tests {
         for axis in 0..expected_mean.len() {
             let scale = expected_mean[axis].abs().max(1.0);
             assert!(
-                (actual_mean[axis] - expected_mean[axis]).abs()
-                    <= mean_relative_tolerance * scale,
+                (actual_mean[axis] - expected_mean[axis]).abs() <= mean_relative_tolerance * scale,
                 "mean {axis} mismatch: expected={} actual={} scale={scale}",
                 expected_mean[axis],
                 actual_mean[axis]
@@ -2236,8 +2242,7 @@ mod tests {
                     * expected.covariance[[right, right]].sqrt())
                 .max(1.0);
                 assert!(
-                    (actual.covariance[[left, right]] - expected.covariance[[left, right]])
-                        .abs()
+                    (actual.covariance[[left, right]] - expected.covariance[[left, right]]).abs()
                         <= covariance_relative_tolerance * scale,
                     "covariance ({left},{right}) mismatch: expected={} actual={} scale={scale}",
                     expected.covariance[[left, right]],
@@ -2503,12 +2508,23 @@ mod tests {
             observed[[row, 1]] = (row as f32 * 0.25).sin();
             observed[[row, 2]] = (row % 17) as f32;
         }
-        let first = per_dimension_shuffle_null_f32(observed.view(), 2262).unwrap();
-        let repeated = per_dimension_shuffle_null_f32(observed.view(), 2262).unwrap();
-        assert_eq!(first, repeated, "float32 shuffle must be seed reproducible");
+        let one_thread = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| per_dimension_shuffle_null_f32(observed.view(), 2262).unwrap());
+        let four_threads = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| per_dimension_shuffle_null_f32(observed.view(), 2262).unwrap());
+        assert_eq!(
+            one_thread, four_threads,
+            "float32 shuffle must be bit-identical across thread counts"
+        );
         for col in 0..observed.ncols() {
             let mut expected = observed.column(col).to_vec();
-            let mut actual = first.column(col).to_vec();
+            let mut actual = one_thread.column(col).to_vec();
             expected.sort_by(f32::total_cmp);
             actual.sort_by(f32::total_cmp);
             assert_eq!(actual, expected, "float32 shuffle changed column {col}");
@@ -2516,71 +2532,115 @@ mod tests {
     }
 
     #[test]
-    fn float32_covariance_control_is_seeded_and_matches_population_moments() {
-        let rows = 16_384usize;
-        let mut observed = Array2::<f32>::zeros((rows, 3));
+    fn covariance_exact_hadamard_handles_odd_rows_and_is_thread_invariant() {
+        let rows = 2_051usize;
+        let mut observed = Array2::<f64>::zeros((rows, 4));
         for row in 0..rows {
-            let phase = (2.0 * PI * row as f64 / rows as f64) as f32;
-            observed[[row, 0]] = 10_000.0 + 2.0 * phase.cos();
-            observed[[row, 1]] = -20_000.0 + 0.8 * phase.cos() + 1.2 * phase.sin();
-            observed[[row, 2]] = 5_000.0 - 0.6 * phase.cos() + 0.3 * phase.sin();
+            let phase = 2.0 * PI * row as f64 / rows as f64;
+            observed[[row, 0]] = 3.0 + 2.0 * phase.cos() + 0.1 * (7.0 * phase).sin();
+            observed[[row, 1]] = -4.0 + 0.8 * phase.cos() + 1.2 * phase.sin();
+            observed[[row, 2]] = 0.5 - 0.6 * phase.cos() + 0.3 * (3.0 * phase).sin();
+            observed[[row, 3]] = 7.25;
         }
-        let draw = covariance_matched_gaussian_null_f32(observed.view(), 2262).unwrap();
-        let repeated = covariance_matched_gaussian_null_f32(observed.view(), 2262).unwrap();
+        let one_thread = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| covariance_exact_hadamard_null(observed.view(), 2262).unwrap());
+        let four_threads = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| covariance_exact_hadamard_null(observed.view(), 2262).unwrap());
         assert_eq!(
-            draw, repeated,
-            "float32 Gaussian control must be reproducible"
+            one_thread, four_threads,
+            "Hadamard control must be bit-identical across thread counts"
         );
+        let different_seed = covariance_exact_hadamard_null(observed.view(), 2263).unwrap();
+        assert_ne!(one_thread, different_seed, "seed must change the control");
+        assert_eq!(one_thread.dim(), observed.dim());
+        assert!(one_thread.column(3).iter().all(|&value| value == 7.25));
+        assert_population_moments_close(observed.view(), one_thread.view(), 2.0e-13, 2.0e-12);
 
-        let target = stable_population_moments_f32(observed.view()).unwrap();
-        let realized = stable_population_moments_f32(draw.view()).unwrap();
-        for axis in 0..observed.ncols() {
-            let target_mean = target.origin[axis] + target.mean_offset[axis];
-            let realized_mean = realized.origin[axis] + realized.mean_offset[axis];
-            let mean_se = target.covariance[[axis, axis]].sqrt() / (rows as f64).sqrt();
-            let quantization = f64::from(f32::EPSILON) * target_mean.abs();
-            assert!(
-                (realized_mean - target_mean).abs() <= 5.0 * mean_se + 2.0 * quantization,
-                "float32 Gaussian mean {axis} mismatch: target={target_mean} realized={realized_mean}"
-            );
+        assert_eq!(
+            covariance_exact_hadamard_workspace_rows(rows).unwrap(),
+            COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS
+        );
+        let mut remaining = rows;
+        let mut blocks = Vec::new();
+        while remaining > 0 {
+            let block = largest_power_of_two_at_most(
+                remaining.min(COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS),
+            )
+            .unwrap();
+            blocks.push(block);
+            remaining -= block;
         }
-        for left in 0..observed.ncols() {
-            for right in 0..observed.ncols() {
-                let scale = target.covariance[[left, left]].sqrt()
-                    * target.covariance[[right, right]].sqrt();
-                assert!(
-                    (realized.covariance[[left, right]] - target.covariance[[left, right]]).abs()
-                        < 0.04 * scale,
-                    "float32 covariance ({left},{right}) mismatch: target={} realized={} scale={scale}",
-                    target.covariance[[left, right]],
-                    realized.covariance[[left, right]],
-                );
-            }
-        }
+        assert_eq!(blocks, vec![1_024, 1_024, 2, 1]);
     }
 
     #[test]
-    fn float32_control_has_only_p_sized_float64_moment_workspace() {
-        let rows = 8_192usize;
-        let cols = 3usize;
+    fn float32_covariance_exact_hadamard_is_native_and_matches_moments() {
+        let rows = 4_099usize;
+        let cols = 4usize;
         let input = Array2::<f32>::from_shape_fn((rows, cols), |(row, col)| {
-            (row as f32 * 0.01 + col as f32).sin()
+            let phase = (2.0 * PI * row as f64 / rows as f64) as f32;
+            match col {
+                0 => 3.0 + 2.0 * phase.cos(),
+                1 => -4.0 + 0.8 * phase.cos() + 1.2 * phase.sin(),
+                2 => 0.5 - 0.6 * phase.cos() + 0.3 * (3.0 * phase).sin(),
+                _ => 7.25,
+            }
         });
-        let moments = stable_population_moments_f32(input.view()).unwrap();
-        assert_eq!(moments.origin.len(), cols);
-        assert_eq!(moments.mean_offset.len(), cols);
-        assert_eq!(moments.covariance.dim(), (cols, cols));
-        let f64_workspace_scalars =
-            moments.origin.len() + moments.mean_offset.len() + moments.covariance.len();
-        assert_eq!(f64_workspace_scalars, 2 * cols + cols * cols);
-        assert!(f64_workspace_scalars < rows * cols);
-
-        let output = covariance_matched_gaussian_null_f32(input.view(), 17).unwrap();
+        let output = covariance_exact_hadamard_null_f32(input.view(), 17).unwrap();
+        let repeated = covariance_exact_hadamard_null_f32(input.view(), 17).unwrap();
+        assert_eq!(
+            output, repeated,
+            "float32 Hadamard seed must replay exactly"
+        );
         assert_eq!(output.dim(), input.dim());
+        assert!(output.column(3).iter().all(|&value| value == 7.25));
         assert_eq!(
             std::mem::size_of_val(output.as_slice().unwrap()),
             rows * cols * std::mem::size_of::<f32>(),
             "the only n×p output allocation must be native float32"
+        );
+        let input_f64 = input.mapv(f64::from);
+        let output_f64 = output.mapv(f64::from);
+        assert_population_moments_close(input_f64.view(), output_f64.view(), 3.0e-6, 3.0e-5);
+    }
+
+    #[test]
+    fn covariance_exact_hadamard_destroys_constant_radius() {
+        let rows = 4_096usize;
+        let circle = Array2::<f64>::from_shape_fn((rows, 2), |(row, col)| {
+            let phase = 2.0 * PI * row as f64 / rows as f64;
+            if col == 0 { phase.cos() } else { phase.sin() }
+        });
+        let control = covariance_exact_hadamard_null(circle.view(), 2262).unwrap();
+        assert_population_moments_close(circle.view(), control.view(), 1.0e-13, 2.0e-12);
+
+        let location = stable_column_location(control.view()).unwrap();
+        let radii = control
+            .rows()
+            .into_iter()
+            .map(|row| {
+                let x = (row[0] - location.origin[0]) - location.mean_offset[0];
+                let y = (row[1] - location.origin[1]) - location.mean_offset[1];
+                x.hypot(y)
+            })
+            .collect::<Vec<_>>();
+        let mean_radius = radii.iter().sum::<f64>() / rows as f64;
+        let radius_sd = (radii
+            .iter()
+            .map(|radius| (radius - mean_radius).powi(2))
+            .sum::<f64>()
+            / rows as f64)
+            .sqrt();
+        assert!(
+            radius_sd / mean_radius > 0.2,
+            "Hadamard control retained the circle's constant radius: CV={}",
+            radius_sd / mean_radius
         );
     }
 

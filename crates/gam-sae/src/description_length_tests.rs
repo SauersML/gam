@@ -975,3 +975,96 @@ fn birth_prescreen_verdict_agrees_with_full_eq4_bits() {
         );
     }
 }
+
+/// #2233 end-to-end selection invariance: a RACE of several birth candidates
+/// straddling the crossover, adjudicated two ways on the SAME planted fixtures —
+///
+/// * the **unscreened race**: every candidate is scored through the production
+///   Eq-4 fixed-distortion scorer and the winner is `argmax` of the true bits
+///   advantage (this is the expensive full refit a birth would trigger);
+/// * the **screened race**: the closed-form [`predicted_birth_dl_bits`]
+///   pre-screen ranks the same candidates from spectra alone (no refit).
+///
+/// The pre-screen's whole contract is that it changes the COST of selection (it
+/// skips the refit of candidates that cannot win) without changing the OUTCOME.
+/// This asserts exactly that: the two races pick the **same winner** and admit
+/// the **same set** of candidates. Per-candidate sign agreement
+/// ([`birth_prescreen_verdict_agrees_with_full_eq4_bits`]) is necessary but not
+/// sufficient for this — two scorers can agree on every sign yet disagree on the
+/// `argmax` among the winners, which would silently change which atom is born.
+///
+/// The candidate merit is graded purely by dictionary overcompleteness `G`: the
+/// support saving `(s−1)·log₂(G/L0)` (and the Eq-4 `log₂C(G,s)−log₂G` it prices)
+/// is strictly increasing in `G`, so the largest-`G` circle is the unambiguous
+/// winner for BOTH scorers, and a basis-rich candidate is the unambiguous loser
+/// for both — a race whose ordering is analytically pinned, not incidental.
+#[test]
+fn birth_prescreen_selects_same_winner_as_unscreened_eq4_race() {
+    // (label, d, n, p, g_dict, basis_m). Circle kind (d=1, s=2) at three graded
+    // dictionary sizes — the support win rises with G, so candidate 2 (G=8192) is
+    // the crossover winner — plus one basis-rich control whose dictionary
+    // surcharge sinks it on both scoreboards.
+    let race: &[(&str, usize, usize, usize, usize, usize)] = &[
+        ("circle_G512", 1, 300, 6, 512, 3),
+        ("circle_G2048", 1, 300, 6, 2048, 3),
+        ("circle_G8192", 1, 300, 6, 8192, 3),
+        ("circle_rich", 1, 300, 6, 2048, 400),
+    ];
+    let winner_idx = 2; // circle_G8192, the largest-support candidate.
+
+    let mut eq4_adv = Vec::with_capacity(race.len());
+    let mut pred = Vec::with_capacity(race.len());
+    for &(_label, d, n, p, g_dict, basis_m) in race {
+        let (adv, pr) = eq4_curved_advantage_and_prescreen(d, n, p, g_dict, basis_m);
+        eq4_adv.push(adv);
+        pred.push(pr);
+    }
+
+    let argmax = |v: &[f64]| -> usize {
+        v.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(i, _)| i)
+            .expect("non-empty race")
+    };
+    let unscreened_winner = argmax(&eq4_adv);
+    let screened_winner = argmax(&pred);
+
+    // Same winner: the pre-screen's argmax is the full Eq-4 race's argmax.
+    assert_eq!(
+        screened_winner, unscreened_winner,
+        "screened pre-screen winner (idx {screened_winner}, {}) must equal the \
+         unscreened Eq-4 race winner (idx {unscreened_winner}, {}); \
+         eq4_adv={eq4_adv:?} pred={pred:?}",
+        race[screened_winner].0, race[unscreened_winner].0
+    );
+    assert_eq!(
+        screened_winner, winner_idx,
+        "the largest-G circle must be the analytically-pinned winner; got {}",
+        race[screened_winner].0
+    );
+
+    // Same admitted set: the candidates the pre-screen proposes (predicted ΔMDL
+    // > 0) are exactly the candidates the full Eq-4 race keeps (advantage > 0) —
+    // the pre-screen never drops a true winner nor admits a true loser.
+    for (i, (&(label, ..), (&adv, &pr))) in race
+        .iter()
+        .zip(eq4_adv.iter().zip(pred.iter()))
+        .enumerate()
+    {
+        assert_eq!(
+            adv > 0.0,
+            pr > 0.0,
+            "candidate {i} ({label}): screened admit ({}) must match unscreened \
+             keep ({}); eq4_adv={adv} pred={pr}",
+            pr > 0.0,
+            adv > 0.0,
+        );
+    }
+    // And the race is a genuine mix (at least one keep and one drop), so the
+    // invariance above is non-trivially exercised.
+    assert!(
+        eq4_adv.iter().any(|&a| a > 0.0) && eq4_adv.iter().any(|&a| a < 0.0),
+        "the race must contain both a winner and a loser; eq4_adv={eq4_adv:?}"
+    );
+}

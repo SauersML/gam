@@ -1481,6 +1481,79 @@ pub(super) fn seed_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize) -> 
     decoder
 }
 
+/// How the initial `K = G·b` block frames are chosen before the alternation.
+///
+/// The alternation ([`advance_block_sparse_state`]) is seed-agnostic — it reaches
+/// the same fixed point from any valid St(b,P) frame set — but the two seeds differ
+/// in cost and in how coherent the starting blocks are, which matters at different
+/// `K` regimes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockSeedPolicy {
+    /// Data-aware block-aware farthest-point pass ([`seed_frames`]). Each block is
+    /// anchored on the row farthest from the completed frames and grown to rank `b`
+    /// by uncovered-energy affinity, so unrelated subspaces never share a block.
+    /// This is the best starting point at moderate `K` (near the intrinsic rank),
+    /// but it costs `O(N·P·G·b)` in a serial corpus pass and is the scaling wall at
+    /// `K ≫ 1`.
+    FarthestPoint,
+    /// Deterministic coordinate-partition seed ([`coordinate_partition_frames`]):
+    /// each block is `b` distinct signed unit coordinate axes drawn from a fixed
+    /// splitmix64 stream, `O(K·b)` with no corpus pass. The large-`K` front door —
+    /// at `K ≫ intrinsic-rank` most atoms are structurally spurious and dead-block
+    /// AuxK revival reseeds them from worst-residual ROWS during the epochs, so the
+    /// coherent farthest-point seed is neither affordable nor load-bearing; the
+    /// streaming lane already uses exactly this seed at `K ≈ 1e4`.
+    CoordinatePartition,
+}
+
+/// Deterministic coordinate-partition block frames: `G` blocks of `b` distinct
+/// signed unit coordinate axes in `ℝ^P`, drawn from a fixed splitmix64 stream keyed
+/// by `(block, axis)`. The result is a valid `K×P` St(b,P) block dictionary (the
+/// `b` axes within a block are distinct coordinates, hence already orthonormal) with
+/// no dependence on `x` — the `O(K·b)` large-`K` seed that sidesteps the serial
+/// farthest-point corpus pass. Requires `b ≤ P` (distinct coordinates per block).
+pub(super) fn coordinate_partition_frames(n_blocks: usize, b: usize, p: usize) -> Array2<f32> {
+    let mut decoder = Array2::<f32>::zeros((n_blocks * b, p));
+    let mut state = 0xd1b5_4a32_d192_ed03u64;
+    for block in 0..n_blocks {
+        let mut used: Vec<usize> = Vec::with_capacity(b);
+        for axis in 0..b {
+            state = splitmix64_block(state ^ block as u64 ^ ((axis as u64) << 32));
+            let mut coord = (state as usize) % p;
+            while used.contains(&coord) {
+                coord = (coord + 1) % p;
+            }
+            used.push(coord);
+            let sign = if (state >> 63) == 0 { 1.0 } else { -1.0 };
+            decoder[[block * b + axis, coord]] = sign;
+        }
+    }
+    decoder
+}
+
+/// splitmix64 mixing step for the deterministic coordinate seed. A local copy so
+/// the seed stream is self-contained and does not depend on any RNG crate.
+fn splitmix64_block(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Choose the initial block dictionary per [`BlockSeedPolicy`].
+fn seed_frames_by_policy(
+    x: ArrayView2<'_, f32>,
+    n_blocks: usize,
+    b: usize,
+    policy: BlockSeedPolicy,
+) -> Array2<f32> {
+    match policy {
+        BlockSeedPolicy::FarthestPoint => seed_frames(x, n_blocks, b),
+        BlockSeedPolicy::CoordinatePartition => coordinate_partition_frames(n_blocks, b, x.ncols()),
+    }
+}
+
 /// Relative Grassmann-projector displacement between two block dictionaries.
 /// For each block this evaluates `||DᵀD-EᵀE||_F` from only `b×b` frame
 /// overlaps. The expression uses the measured projector norms rather than
@@ -2065,9 +2138,27 @@ fn validate(x: ArrayView2<'_, f32>, config: &BlockSparseConfig) -> Result<(), Bl
 /// [`crate::front_door::admit_linear_dictionary`] — an explicit
 /// linear-dictionary request is a modeling choice admitted at ANY `K`, not a
 /// shape-derived demotion.
+///
+/// Seeds with the data-aware [`BlockSeedPolicy::FarthestPoint`] pass. At `K ≫ 1`
+/// that serial `O(N·P·K)` seed dominates the fit; use
+/// [`fit_block_sparse_dictionary_with_seed`] with
+/// [`BlockSeedPolicy::CoordinatePartition`] for the large-`K` front door.
 pub fn fit_block_sparse_dictionary(
     x: ArrayView2<'_, f32>,
     config: &BlockSparseConfig,
+) -> Result<BlockSparseFit, BlockSparseFitError> {
+    fit_block_sparse_dictionary_with_seed(x, config, BlockSeedPolicy::FarthestPoint)
+}
+
+/// [`fit_block_sparse_dictionary`] with an explicit [`BlockSeedPolicy`]. The seed
+/// only sets the starting frames; the returned fixed point is the same seed-agnostic
+/// alternation. This is the caller-supplied seed hook the one-shot lane exposes so a
+/// `K ≈ 1e4` fit can skip the serial farthest-point corpus pass (the analogue of the
+/// streaming lane's [`super::block_stream::BlockSparseStreamState::new_with_decoder`]).
+pub fn fit_block_sparse_dictionary_with_seed(
+    x: ArrayView2<'_, f32>,
+    config: &BlockSparseConfig,
+    seed_policy: BlockSeedPolicy,
 ) -> Result<BlockSparseFit, BlockSparseFitError> {
     validate(x, config)?;
     let n = x.nrows();
@@ -2075,7 +2166,7 @@ pub fn fit_block_sparse_dictionary(
     let b = config.block_size;
     let k = config.block_topk.min(g).max(1);
 
-    let decoder = seed_frames(x, g, b);
+    let decoder = seed_frames_by_policy(x, g, b, seed_policy);
     let gamma = 1.0f32;
     let codes = route_and_code_all(
         x,

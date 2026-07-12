@@ -41,10 +41,58 @@ use ndarray::ArrayView2;
 
 use crate::migration_ledger::{BirthSeed, MoveEvidence, MoveReason, MoveStage, SaeMigrationLedger};
 use crate::sparse_dict::{
-    BlockSparseConfig, BlockSparseFit, CofitConfig, CofitReport, cofit_block_and_curved,
-    fit_block_sparse_dictionary,
+    BlockSeedPolicy, BlockSparseConfig, BlockSparseFit, CofitConfig, CofitReport,
+    cofit_block_and_curved, fit_block_sparse_dictionary_with_seed,
 };
 use crate::tiered::Tier0Mean;
+
+/// Serial farthest-point block seed budget in element-ops (`N·P·G·b`). Above this
+/// the `O(N·P·K)` corpus pass dominates the whole Tier-1 fit (measured to be the
+/// scaling wall at `K ≈ 1e4`, unrelated to routing), so [`TieredSeedPolicy::Auto`]
+/// switches to the `O(K·b)` coordinate-partition seed. Below it the data-aware
+/// farthest-point seed is affordable and gives the more coherent starting blocks.
+const FARTHEST_POINT_SEED_MAX_OPS: u128 = 1_000_000_000;
+
+/// How Tier-1 seeds its `K = G·b` block frames. The default [`Auto`] keeps the
+/// data-aware farthest-point seed at small/moderate `K` and switches to the cheap
+/// coordinate-partition seed once the serial farthest-point pass would dominate —
+/// the "Tier-1 K>small" entry that makes a `K ≈ 1e4` tiered fit tractable end to end
+/// without a caller flag (#2023).
+///
+/// [`Auto`]: TieredSeedPolicy::Auto
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TieredSeedPolicy {
+    /// Pick by the farthest-point seed cost `N·P·G·b` against
+    /// [`FARTHEST_POINT_SEED_MAX_OPS`].
+    #[default]
+    Auto,
+    /// Force the data-aware farthest-point seed regardless of `K`.
+    FarthestPoint,
+    /// Force the cheap coordinate-partition seed regardless of `K`.
+    CoordinatePartition,
+}
+
+impl TieredSeedPolicy {
+    /// Resolve to a concrete [`BlockSeedPolicy`] for a corpus of `n` rows and the
+    /// Tier-1 block geometry (`G` blocks of size `b` in `ℝ^P`).
+    fn resolve(self, n: usize, p: usize, config: &BlockSparseConfig) -> BlockSeedPolicy {
+        match self {
+            TieredSeedPolicy::FarthestPoint => BlockSeedPolicy::FarthestPoint,
+            TieredSeedPolicy::CoordinatePartition => BlockSeedPolicy::CoordinatePartition,
+            TieredSeedPolicy::Auto => {
+                let ops = (n as u128)
+                    * (p as u128)
+                    * (config.n_blocks as u128)
+                    * (config.block_size as u128);
+                if ops > FARTHEST_POINT_SEED_MAX_OPS {
+                    BlockSeedPolicy::CoordinatePartition
+                } else {
+                    BlockSeedPolicy::FarthestPoint
+                }
+            }
+        }
+    }
+}
 
 /// Configuration for [`fit_tiered`]. Internal (in-crate) only — the public
 /// tiered surface was removed in unification Increment 4; this is the seed/cadence
@@ -57,6 +105,10 @@ pub struct TieredFitConfig {
     /// not by this config: the Tier-1 router dispatches each minibatch to the CUDA
     /// block-gate lane when the mode admits it and a runtime is present.
     pub tier1: BlockSparseConfig,
+    /// How Tier-1 seeds its `K` block frames. [`TieredSeedPolicy::Auto`] (default)
+    /// switches to the cheap coordinate-partition seed once the serial
+    /// farthest-point pass would dominate, so a `K ≈ 1e4` tiered fit runs end to end.
+    pub tier1_seed: TieredSeedPolicy,
     /// Whether to run the Tier-2 curved co-fit on the Tier-1 residual (`false` ⇒
     /// Tier-0 + Tier-1 only, the linear-bulk baseline).
     pub tier2_enabled: bool,
@@ -71,6 +123,7 @@ impl TieredFitConfig {
     pub fn linear_bulk(n_blocks: usize, block_size: usize) -> Self {
         Self {
             tier1: BlockSparseConfig::new(n_blocks, block_size),
+            tier1_seed: TieredSeedPolicy::Auto,
             tier2_enabled: false,
             cofit: CofitConfig::default(),
         }
@@ -80,6 +133,7 @@ impl TieredFitConfig {
     pub fn tiered(n_blocks: usize, block_size: usize) -> Self {
         Self {
             tier1: BlockSparseConfig::new(n_blocks, block_size),
+            tier1_seed: TieredSeedPolicy::Auto,
             tier2_enabled: true,
             cofit: CofitConfig::default(),
         }
@@ -124,8 +178,13 @@ pub fn fit_tiered(
     let r0 = tier0.apply(z)?;
     let r0_f32 = r0.mapv(|v| v as f32);
 
-    // Tier 1: block-sparse collapsed-linear bulk on the de-meaned residual.
-    let tier1 = fit_block_sparse_dictionary(r0_f32.view(), &config.tier1)?;
+    // Tier 1: block-sparse collapsed-linear bulk on the de-meaned residual. The
+    // seed policy resolves against the corpus size + block geometry so a K≈1e4 bulk
+    // skips the serial O(N·P·K) farthest-point pass (the large-K entry, #2023).
+    let seed_policy = config
+        .tier1_seed
+        .resolve(r0_f32.nrows(), r0_f32.ncols(), &config.tier1);
+    let tier1 = fit_block_sparse_dictionary_with_seed(r0_f32.view(), &config.tier1, seed_policy)?;
 
     let mut ledger = SaeMigrationLedger::new();
 
@@ -318,5 +377,83 @@ mod fit_tests {
             report.explained_variance,
             ev_lin
         );
+    }
+
+    /// `TieredSeedPolicy::Auto` keeps the data-aware farthest-point seed at small
+    /// `K` and switches to the cheap coordinate-partition seed once the serial
+    /// `N·P·G·b` pass would blow the budget — the "Tier-1 K>small" entry decision.
+    #[test]
+    fn auto_seed_switches_at_the_farthest_point_budget() {
+        // Small geometry (well under the 1e9-op budget) → farthest-point.
+        let small = TieredFitConfig::linear_bulk(8, 2);
+        assert_eq!(
+            small
+                .tier1_seed
+                .resolve(240, 16, &small.tier1),
+            BlockSeedPolicy::FarthestPoint,
+            "small-K tiered fit must keep the data-aware seed"
+        );
+        // K≈1e4 at the #2023 target width (N=1e5, P=64) → N·P·G·b ≫ 1e9 → cheap seed.
+        let large = TieredFitConfig::linear_bulk(2_500, 4);
+        assert_eq!(
+            large.tier1_seed.resolve(100_000, 64, &large.tier1),
+            BlockSeedPolicy::CoordinatePartition,
+            "large-K tiered fit must switch to the coordinate-partition seed"
+        );
+        // Explicit overrides ignore the budget.
+        let mut forced = TieredFitConfig::linear_bulk(2_500, 4);
+        forced.tier1_seed = TieredSeedPolicy::FarthestPoint;
+        assert_eq!(
+            forced.tier1_seed.resolve(100_000, 64, &forced.tier1),
+            BlockSeedPolicy::FarthestPoint
+        );
+        forced.tier1_seed = TieredSeedPolicy::CoordinatePartition;
+        assert_eq!(
+            forced.tier1_seed.resolve(240, 16, &forced.tier1),
+            BlockSeedPolicy::CoordinatePartition
+        );
+    }
+
+    /// The coordinate-partition seed carries a full tiered fit end to end (Tier-0
+    /// mean → Tier-1 bulk on the cheap seed → Tier-2 curved co-fit on the residual),
+    /// producing a finite composed EV and never PC-reseeding. This is the large-`K`
+    /// entry's fit path exercised at a small `K` (the seed is what changes, not the
+    /// engine), so the test stays fast while still driving every stage.
+    #[test]
+    fn coordinate_seed_carries_a_full_tiered_fit() {
+        let n = 240usize;
+        let p = 16usize;
+        let n_circles = 6usize;
+        let mut z = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let ph = (i as f64) * 0.261_799;
+            for c in 0..n_circles {
+                let theta = ph * (1.0 + c as f64 * 0.37) + c as f64;
+                z[[i, 2 * c]] = theta.cos();
+                z[[i, 2 * c + 1]] = theta.sin();
+            }
+            let t = i as f64 / n as f64;
+            z[[i, 12]] = 2.0 * t - 1.0;
+            z[[i, 13]] = 1.0 - 2.0 * t;
+            z[[i, 14]] = 0.01 * (ph * 2.0).sin();
+            z[[i, 15]] = 0.01 * (ph * 3.0).cos();
+        }
+
+        let mut config = TieredFitConfig::tiered(8, 2);
+        config.tier1_seed = TieredSeedPolicy::CoordinatePartition;
+        config.tier1.block_topk = 7;
+        config.tier1.max_epochs = 20;
+        let report =
+            fit_tiered(z.view(), &config).expect("coordinate-seeded tiered fit runs end to end");
+        assert!(
+            report.explained_variance.is_finite() && report.explained_variance > 0.0,
+            "coordinate-seeded composed EV must be finite and positive, got {}",
+            report.explained_variance
+        );
+        assert_eq!(
+            report.ledger.pc_reseed_events, 0,
+            "the coordinate-seeded tiered path must never PC-reseed"
+        );
+        assert!(report.tier2.is_some(), "tiered config must run Tier-2");
     }
 }

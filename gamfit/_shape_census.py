@@ -15,6 +15,7 @@ _ResultT = TypeVar("_ResultT")
 _U64_MAX = (1 << 64) - 1
 _SHUFFLE_SEED_DOMAIN = 0xD1AE_510F
 _HADAMARD_SEED_DOMAIN = 0x4841_DA4D
+_FINITE_SCAN_SCALARS = 1 << 20
 _ControlMatrix = NDArray[np.float32] | NDArray[np.float64]
 
 
@@ -42,6 +43,14 @@ def _u64(value: int, name: str) -> int:
     if not 0 <= value <= _U64_MAX:
         raise ValueError(f"{name} must be in [0, 2**64 - 1]; got {value}")
     return value
+
+
+def _require_finite(matrix: _ControlMatrix) -> None:
+    """Validate finiteness with bounded temporary storage."""
+    flattened = matrix.reshape(-1)
+    for start in range(0, flattened.size, _FINITE_SCAN_SCALARS):
+        if not np.isfinite(flattened[start : start + _FINITE_SCAN_SCALARS]).all():
+            raise ValueError("data must contain only finite values")
 
 
 def run_shape_controlled_census(
@@ -100,8 +109,7 @@ def run_shape_controlled_census(
         raise ValueError(
             f"data must be a nonempty two-dimensional matrix; got shape {source.shape}"
         )
-    if not np.isfinite(source).all():
-        raise ValueError("data must contain only finite values")
+    _require_finite(source)
     source.setflags(write=False)
 
     shuffle_seed = control_seed ^ _SHUFFLE_SEED_DOMAIN
