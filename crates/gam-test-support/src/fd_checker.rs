@@ -13,7 +13,7 @@
 //! [`crate::solver::rho_optimizer::fd_audit`] and is a different (criterion-level,
 //! diagnostic-logging) facility.
 
-use ndarray::Array1;
+use ndarray::{Array1, Array2};
 
 /// Central finite-difference gradient of a scalar objective at `x`.
 ///
@@ -59,6 +59,45 @@ where
     let xp = x + &(direction * eps);
     let xm = x - &(direction * eps);
     (f(&xp) - f(&xm)) / (2.0 * eps)
+}
+
+/// Central finite-difference Hessian of a scalar objective at `x`.
+///
+/// Returns the dense `n×n` matrix whose `(i, j)` entry is the symmetric
+/// four-point central difference
+/// `(f(x + ε·eᵢ + ε·eⱼ) − f(x + ε·eᵢ − ε·eⱼ) − f(x − ε·eᵢ + ε·eⱼ) + f(x − ε·eᵢ − ε·eⱼ)) / (4·ε²)`.
+/// For `i = j` this stencil degenerates to the `2ε`-spaced second difference
+/// `(f(x + 2ε·eᵢ) − 2·f(x) + f(x − 2ε·eᵢ)) / (4·ε²)`, so the same expression
+/// covers the diagonal without a special case. `f` is evaluated `4·n²` times
+/// and the input is never mutated.
+///
+/// Every `(i, j)` and `(j, i)` entry is computed independently; the stencil is
+/// symmetric in `i ↔ j` up to floating-point rounding, so callers that require
+/// exact symmetry should average the result with its transpose.
+pub fn numerical_hessian_central_diff<F>(mut f: F, x: &Array1<f64>, eps: f64) -> Array2<f64>
+where
+    F: FnMut(&Array1<f64>) -> f64,
+{
+    let n = x.len();
+    let mut hess = Array2::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            let mut pp = x.clone();
+            let mut pm = x.clone();
+            let mut mp = x.clone();
+            let mut mm = x.clone();
+            pp[i] += eps;
+            pp[j] += eps;
+            pm[i] += eps;
+            pm[j] -= eps;
+            mp[i] -= eps;
+            mp[j] += eps;
+            mm[i] -= eps;
+            mm[j] -= eps;
+            hess[[i, j]] = (f(&pp) - f(&pm) - f(&mp) + f(&mm)) / (4.0 * eps * eps);
+        }
+    }
+    hess
 }
 
 /// Verify an analytic gradient against the central finite-difference of the
@@ -133,6 +172,14 @@ mod tests {
         let hvp_exact = a.dot(&direction);
         for i in 0..direction.len() {
             assert_abs_diff_eq!(hvp_fd[i], hvp_exact[i], epsilon = 1e-6);
+        }
+
+        // Full central-difference Hessian recovers the constant curvature A.
+        let hess_fd = numerical_hessian_central_diff(objective, &x, 1e-4);
+        for i in 0..x.len() {
+            for j in 0..x.len() {
+                assert_abs_diff_eq!(hess_fd[[i, j]], a[[i, j]], epsilon = 1e-6);
+            }
         }
     }
 
