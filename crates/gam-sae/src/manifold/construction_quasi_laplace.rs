@@ -706,6 +706,16 @@ impl SaeManifoldTerm {
         // #2234 — one progress-gated extra refinement window (see the budget
         // escalation at the non-convergence refusal below). 0 until granted.
         let mut budget_escalation_extra = 0usize;
+        // #2228 certificate-metric-keyed escalation state: the ½λ²/scale
+        // decrement certificate measured at the last budget-limit hit, and a
+        // pure anti-runaway cap on how many certificate-paid windows one
+        // evaluation may earn (the geometric-progress gate below is the real
+        // bound; the cap only guards against a certificate oscillating around
+        // the progress threshold).
+        let mut last_limit_certificate: Option<f64> = None;
+        let mut certificate_escalations = 0usize;
+        const CERTIFICATE_ESCALATION_PROGRESS: f64 = 0.7;
+        const CERTIFICATE_ESCALATION_ANTI_RUNAWAY_CAP: usize = 8;
         // #1051 — objective-stagnation convergence. On an ill-conditioned
         // penalised bilinear fit (the euclidean / Duchon decoder × latent
         // coordinate system on a trivial shape), the inner Newton crawls: each
@@ -1072,6 +1082,78 @@ impl SaeManifoldTerm {
                 // window, once, so the joint fixed point can complete; a state
                 // still moving after that is genuinely non-idempotent and
                 // takes the typed refusal.
+                // #2228 CERTIFICATE-METRIC-KEYED ESCALATION — the general form
+                // of the single-window grant below, measured in the
+                // certificate's own units. At every budget-limit hit, price
+                // the affine-invariant decrement ½λ²/scale on the exact
+                // deflated Hessian (one factor per limit hit — paid only at
+                // limit boundaries, never per iteration):
+                //   · at/below the stall band ⇒ the iterate IS the numerical
+                //     stationary root: accept the cache right here (identical
+                //     doctrine to the stall-branch/final-gate acceptances);
+                //   · DECREASING geometrically since the last limit hit ⇒ the
+                //     walk is converging in the certificate metric even where
+                //     the objective-decrease and gradient tests cannot see it
+                //     (the stiff-valley regime: tiny accepted steps, ‖g‖ may
+                //     legitimately RISE); grant one more window. A fixed
+                //     budget is an arbitrary refusal point in that regime —
+                //     the measured tier-0/wheel failures parked at 1.0034× to
+                //     2.25× over the gradient band with the certificate still
+                //     improving every round;
+                //   · stalled certificate ⇒ fall through to the historical
+                //     branches (single objective-progress window, then the
+                //     typed refusal, whose final gate re-checks the
+                //     certificate one last time).
+                if let Ok(limit_factor) = self.factor_deflated_evidence_with_grad_norms(
+                    &mut sys,
+                    &lambda_smooth,
+                    options,
+                ) {
+                    let decrement_sq = sae_manifold_newton_directional_decrease(
+                        &sys,
+                        limit_factor.delta_t.view(),
+                        limit_factor.delta_beta.view(),
+                    )
+                    .max(0.0);
+                    let limit_scale = self
+                        .penalized_objective_total(target, rho_fixed, registry, 1.0)
+                        .map(|obj| obj.abs() + 1.0)
+                        .unwrap_or(f64::INFINITY);
+                    let predicted_relative_decrease = 0.5 * decrement_sq / limit_scale;
+                    if predicted_relative_decrease <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL {
+                        log::debug!(
+                            "SAE inner limit-boundary decrement acceptance: ‖g‖={grad_norm:.6e} \
+                             (tol {grad_tolerance:.6e}) ½λ²/scale={predicted_relative_decrease:.6e} \
+                             after {total_inner_iter} inner iterations"
+                        );
+                        return Ok(limit_factor.cache);
+                    }
+                    let certificate_improving = last_limit_certificate.is_none_or(|previous| {
+                        predicted_relative_decrease
+                            <= CERTIFICATE_ESCALATION_PROGRESS * previous
+                    });
+                    if certificate_improving
+                        && certificate_escalations < CERTIFICATE_ESCALATION_ANTI_RUNAWAY_CAP
+                    {
+                        certificate_escalations += 1;
+                        last_limit_certificate = Some(predicted_relative_decrease);
+                        let escalation_window = refine_limit.max(1);
+                        budget_escalation_extra = total_inner_iter
+                            .saturating_sub(refine_limit)
+                            .saturating_add(escalation_window);
+                        log::debug!(
+                            "SaeManifoldTerm::penalized_quasi_laplace_criterion: certificate-paid \
+                             window {certificate_escalations} at fixed ρ — ½λ²/scale=\
+                             {predicted_relative_decrease:.6e} still contracting (‖g‖=\
+                             {grad_norm:.6e}, tol {grad_tolerance:.6e}) after {total_inner_iter} \
+                             inner iterations; granting {escalation_window} more"
+                        );
+                        // Skip the loop-bottom refine accounting for this
+                        // round; the widened limit re-enters normally.
+                        continue;
+                    }
+                    last_limit_certificate = Some(predicted_relative_decrease);
+                }
                 if (saw_refine_progress || gradient_stationary) && budget_escalation_extra == 0 {
                     let escalation_window = refine_limit.max(1);
                     // `refine_iteration_limit` is dynamic and may return a
