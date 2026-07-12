@@ -260,6 +260,262 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
     }
 }
 
+/// Build a one-row, full-channel softmax fixture for the #932 schedule benchmark.
+/// Every atom has a live periodic coordinate jet and one beta-border channel, so
+/// the timing covers reconstruction gradient/Hessian, coordinate and mixed blocks,
+/// and beta / beta_deriv / beta_l_deriv rather than the gate-logit-only GPU subset.
+fn softmax_schedule_perf_fixture(
+    k_atoms: usize,
+    p: usize,
+) -> (
+    SaeManifoldTerm,
+    Vec<SaeLocalRowVar>,
+    Vec<Array4<f64>>,
+    Vec<SaeBorderChannel>,
+    Array1<f64>,
+) {
+    let n = 1usize;
+    let m = 3usize;
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m).unwrap());
+    let mut atoms = Vec::with_capacity(k_atoms);
+    let mut coord_blocks = Vec::with_capacity(k_atoms);
+    for atom in 0..k_atoms {
+        let coordinate =
+            Array2::from_shape_vec((n, 1), vec![((atom * 17 + 3) as f64 * 0.037).fract()]).unwrap();
+        let (phi, jet) = evaluator.evaluate(coordinate.view()).unwrap();
+        let decoder = Array2::from_shape_fn((m, p), |(basis, column)| {
+            ((atom * 31 + basis * 11 + column * 7 + 1) as f64 * 0.019).sin()
+        });
+        atoms.push(
+            SaeManifoldAtom::new_with_provided_function_gram(
+                format!("softmax_perf_{atom}"),
+                SaeAtomBasisKind::Periodic,
+                1,
+                phi,
+                jet,
+                decoder,
+                Array2::<f64>::eye(m),
+            )
+            .unwrap()
+            .with_basis_second_jet(evaluator.clone()),
+        );
+        coord_blocks.push(coordinate);
+    }
+    let logits = Array2::from_shape_fn((n, k_atoms), |(_, atom)| {
+        0.7 * ((atom * 13 + 2) as f64 * 0.17).cos() - 0.03 * atom as f64
+    });
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        coord_blocks,
+        vec![LatentManifold::Circle { period: 1.0 }; k_atoms],
+        AssignmentMode::softmax(0.9),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+    let mut vars = Vec::with_capacity(k_atoms.saturating_sub(1) + k_atoms);
+    for atom in 0..k_atoms.saturating_sub(1) {
+        vars.push(SaeLocalRowVar::Logit { atom });
+    }
+    for atom in 0..k_atoms {
+        vars.push(SaeLocalRowVar::Coord { atom, axis: 0 });
+    }
+    let second_jets = term.atom_second_jets().unwrap();
+    let border: Vec<SaeBorderChannel> = (0..k_atoms)
+        .map(|atom| SaeBorderChannel {
+            atom,
+            basis_col: atom % m,
+            index: atom,
+            output: (0..p)
+                .map(|column| ((atom * 5 + column * 3 + 1) as f64 * 0.23).cos())
+                .collect(),
+        })
+        .collect();
+    let assignments = term.assignment.try_assignments_row(0).unwrap();
+    (term, vars, second_jets, border, assignments)
+}
+
+fn row_jet_channel_error(actual: &SaeRowJets, expected: &SaeRowJets) -> (f64, f64) {
+    let mut max_abs = 0.0_f64;
+    let mut scale = 1.0_f64;
+    let mut visit = |a: f64, b: f64| {
+        max_abs = max_abs.max((a - b).abs());
+        scale = scale.max(a.abs()).max(b.abs());
+    };
+    for (a, b) in actual
+        .first
+        .iter()
+        .flatten()
+        .zip(expected.first.iter().flatten())
+    {
+        visit(*a, *b);
+    }
+    for (a, b) in actual
+        .second
+        .iter()
+        .flatten()
+        .flatten()
+        .zip(expected.second.iter().flatten().flatten())
+    {
+        visit(*a, *b);
+    }
+    for (a, b) in actual
+        .beta
+        .iter()
+        .flatten()
+        .zip(expected.beta.iter().flatten())
+    {
+        visit(*a, *b);
+    }
+    for (a, b) in actual
+        .beta_deriv
+        .iter()
+        .flatten()
+        .flatten()
+        .zip(expected.beta_deriv.iter().flatten().flatten())
+    {
+        visit(*a, *b);
+    }
+    for (a, b) in actual
+        .beta_l_deriv
+        .iter()
+        .flatten()
+        .flatten()
+        .zip(expected.beta_l_deriv.iter().flatten().flatten())
+    {
+        visit(*a, *b);
+    }
+    (max_abs, scale)
+}
+
+/// Full-output correctness + release timing gate against the exact pre-change
+/// production hand implementation.  The K sweep demonstrates the intended
+/// complexity change: hand `d2z` contraction O(L²KP) versus the compiled centered
+/// moment's output-optimal O(L²P), while all coordinate and beta channels remain
+/// present and are checked entry by entry.
+#[test]
+pub(crate) fn softmax_compiled_schedule_beats_hand_full_channels_932() {
+    use std::time::{Duration, Instant};
+
+    fn checksum(jets: &SaeRowJets) -> f64 {
+        let first = jets
+            .first
+            .first()
+            .and_then(|row| row.first())
+            .copied()
+            .unwrap_or(0.0);
+        let second = jets
+            .second
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|column| column.first())
+            .copied()
+            .unwrap_or(0.0);
+        let beta = jets
+            .beta
+            .first()
+            .and_then(|row| row.first())
+            .copied()
+            .unwrap_or(0.0);
+        first + second + beta
+    }
+
+    for &k_atoms in &[2usize, 8, 16, 32] {
+        let p = 16usize;
+        let (term, vars, second_jets, border, assignments) =
+            softmax_schedule_perf_fixture(k_atoms, p);
+        let compiled = term
+            .row_jets_for_logdet(0, vars.clone(), assignments.view(), &second_jets, &border)
+            .unwrap();
+        let hand = term.row_jets_for_logdet_hand_reference(
+            0,
+            vars.clone(),
+            assignments.view(),
+            &second_jets,
+            &border,
+        );
+        let (max_abs, scale) = row_jet_channel_error(&compiled, &hand);
+        assert!(
+            max_abs <= 2.0e-12 * scale,
+            "K={k_atoms} compiled vs hand full-channel max abs {max_abs:e}, scale {scale:e}"
+        );
+
+        #[cfg(debug_assertions)]
+        let (repetitions, trials) = (1usize, 1usize);
+        #[cfg(not(debug_assertions))]
+        let (repetitions, trials) = match k_atoms {
+            2 => (20_000usize, 5usize),
+            8 => (2_000usize, 5usize),
+            16 => (400usize, 5usize),
+            32 => (80usize, 5usize),
+            _ => (1usize, 1usize),
+        };
+
+        let mut best_compiled = Duration::MAX;
+        let mut best_hand = Duration::MAX;
+        let mut accumulated = 0.0_f64;
+        for trial in 0..trials {
+            let run_compiled = || {
+                let start = Instant::now();
+                let mut sum = 0.0_f64;
+                for _ in 0..repetitions {
+                    let jets = term
+                        .row_jets_for_logdet(
+                            0,
+                            vars.clone(),
+                            assignments.view(),
+                            &second_jets,
+                            &border,
+                        )
+                        .unwrap();
+                    sum += checksum(&jets);
+                }
+                (start.elapsed(), sum)
+            };
+            let run_hand = || {
+                let start = Instant::now();
+                let mut sum = 0.0_f64;
+                for _ in 0..repetitions {
+                    let jets = term.row_jets_for_logdet_hand_reference(
+                        0,
+                        vars.clone(),
+                        assignments.view(),
+                        &second_jets,
+                        &border,
+                    );
+                    sum += checksum(&jets);
+                }
+                (start.elapsed(), sum)
+            };
+            let ((compiled_time, compiled_sum), (hand_time, hand_sum)) = if trial % 2 == 0 {
+                (run_compiled(), run_hand())
+            } else {
+                let hand_result = run_hand();
+                let compiled_result = run_compiled();
+                (compiled_result, hand_result)
+            };
+            best_compiled = best_compiled.min(compiled_time);
+            best_hand = best_hand.min(hand_time);
+            accumulated += compiled_sum + hand_sum;
+        }
+        assert!(
+            accumulated.is_finite(),
+            "timed channel checksum must be finite"
+        );
+        let compiled_ns = best_compiled.as_nanos() as f64 / repetitions as f64;
+        let hand_ns = best_hand.as_nanos() as f64 / repetitions as f64;
+        eprintln!(
+            "[SAE-SOFTMAX-932] K={k_atoms} P={p} hand={hand_ns:.1} ns/row \
+             compiled={compiled_ns:.1} ns/row ratio={:.4}x max_abs={max_abs:.3e}",
+            compiled_ns / hand_ns
+        );
+        #[cfg(not(debug_assertions))]
+        assert!(
+            compiled_ns <= hand_ns,
+            "K={k_atoms} compiled schedule {compiled_ns:.1} ns/row must beat hand {hand_ns:.1} ns/row"
+        );
+    }
+}
+
 #[test]
 pub(crate) fn ordered_beta_bernoulli_outer_objective_advertises_analytic_gradient() {
     // The ordered Beta--Bernoulli shared-mass third channel is assembled from

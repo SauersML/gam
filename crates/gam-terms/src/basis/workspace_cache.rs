@@ -843,6 +843,60 @@ pub(crate) fn weighted_coefficient_sum_to_zero_transform(
     Ok(z)
 }
 
+const SPHERICAL_CENTER_COINCIDENT_TOL: f64 = 1.0e-12;
+
+#[inline]
+fn spherical_center_dot(a: &[f64; 3], b: &[f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// Lexicographic comparison of the sorted intrinsic distance profiles of two
+/// spherical data rows. `Equal` means the unordered geometry cannot distinguish
+/// the two candidates: choosing one by row index would violate permutation
+/// invariance, so the selector must treat their whole class atomically.
+fn spherical_dot_profile_cmp(units: &[[f64; 3]], i: usize, j: usize) -> std::cmp::Ordering {
+    let mut pi: Vec<f64> = units
+        .iter()
+        .map(|u| spherical_center_dot(&units[i], u))
+        .collect();
+    let mut pj: Vec<f64> = units
+        .iter()
+        .map(|u| spherical_center_dot(&units[j], u))
+        .collect();
+    pi.sort_by(f64::total_cmp);
+    pj.sort_by(f64::total_cmp);
+    for (a, b) in pi.iter().zip(pj.iter()) {
+        let ordering = a.total_cmp(b);
+        if !ordering.is_eq() {
+            return ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Remove coincident directions from one invariant tie class without choosing
+/// between genuinely distinct tied directions. Representatives of coincident
+/// rows are geometrically interchangeable and produce the same kernel column;
+/// every distinct member of the symmetry class is retained.
+fn distinct_spherical_orbit(
+    units: &[[f64; 3]],
+    candidates: &[usize],
+    already_selected: &[usize],
+) -> Vec<usize> {
+    let mut distinct = Vec::with_capacity(candidates.len());
+    'candidate: for &candidate in candidates {
+        for &selected in already_selected.iter().chain(distinct.iter()) {
+            if spherical_center_dot(&units[candidate], &units[selected])
+                >= 1.0 - SPHERICAL_CENTER_COINCIDENT_TOL
+            {
+                continue 'candidate;
+            }
+        }
+        distinct.push(candidate);
+    }
+    distinct
+}
+
 /// Select spherical-spline basis centers by **geodesic** farthest-point sampling
 /// of the data cloud, returning a well-spread subset of the actual data rows.
 ///
@@ -860,6 +914,16 @@ pub(crate) fn weighted_coefficient_sum_to_zero_transform(
 /// invariant to the arbitrary choice of frame (a longitude origin, a tilt, any
 /// element of SO(3)) — matching the rotation-invariant `harmonic` control (#2127).
 ///
+/// On a symmetric cloud, invariant scalar keys can leave several **distinct**
+/// rows exactly tied. No row-permutation-equivariant rule can choose one member
+/// of such an orbit: a symmetry exchanging two tied rows would have to both
+/// preserve and change that choice. The selector therefore adds the complete
+/// distinct-direction tie orbit atomically. `num_centers` is the nominal target;
+/// only the final atomic orbit may cross it, so the result has fewer than
+/// `2*num_centers` rows. An individual orbit larger than the declared target is
+/// refused as unrepresentable within the requested resource budget rather than
+/// broken by row index. Coincident rows remain one kernel column.
+///
 /// The previous implementation ignored `data` and laid down a fixed golden-angle
 /// (Fibonacci) lattice pinned in the (lat, lon) frame: a rigid rotation moved the
 /// data relative to the STATIONARY centers, changed every data-to-center geodesic
@@ -872,8 +936,7 @@ pub(crate) fn weighted_coefficient_sum_to_zero_transform(
 /// invariant tie-breaks — but with geodesic (great-circle) distance in place of
 /// Euclidean distance, which is the correct SO(3) invariant on S². Coincident
 /// data directions are not selected twice (a duplicate center makes the Wahba
-/// Gram singular), so the returned count is `min(num_centers, #distinct data
-/// directions)`.
+/// Gram singular).
 pub fn select_spherical_farthest_point_centers(
     data: ArrayView2<'_, f64>,
     num_centers: usize,
@@ -905,8 +968,6 @@ pub fn select_spherical_farthest_point_centers(
             [cos_lat * lon.cos(), cos_lat * lon.sin(), lat.sin()]
         })
         .collect();
-    let dot = |a: &[f64; 3], b: &[f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-
     // Mean-direction seed key `dot_to_sum[i] = uᵢ·Σⱼuⱼ`. `Σⱼuⱼ` is
     // rotation-EQUIVARIANT (it rotates rigidly with the data), so `argmax` is the
     // SAME physical row in every frame. Using the UNNORMALIZED resultant avoids
@@ -922,56 +983,63 @@ pub fn select_spherical_farthest_point_centers(
         col.sort_by(|a, b| a.total_cmp(b));
         *sum_c = col.iter().sum();
     }
-    let dot_to_sum: Vec<f64> = units.iter().map(|u| dot(u, &sum)).collect();
+    let dot_to_sum: Vec<f64> = units
+        .iter()
+        .map(|u| spherical_center_dot(u, &sum))
+        .collect();
 
-    // Rotation- and permutation-invariant tie-break: the sorted multiset of dots
-    // `{uᵢ·uₗ : l}` is a pure function of the unordered spherical geometry, so it
-    // survives both a rigid rotation and a row permutation. Only genuinely
-    // interchangeable (coincident) rows fall through to the row index.
-    let dot_profile_less = |i: usize, j: usize| -> bool {
-        let mut pi: Vec<f64> = units.iter().map(|u| dot(&units[i], u)).collect();
-        let mut pj: Vec<f64> = units.iter().map(|u| dot(&units[j], u)).collect();
-        pi.sort_by(|a, b| a.total_cmp(b));
-        pj.sort_by(|a, b| a.total_cmp(b));
-        for (a, b) in pi.iter().zip(pj.iter()) {
-            match a.total_cmp(b) {
-                std::cmp::Ordering::Less => return true,
-                std::cmp::Ordering::Greater => return false,
-                std::cmp::Ordering::Equal => {}
-            }
-        }
-        i < j
-    };
-
-    // Seed = the row nearest the mean direction (largest `dot_to_sum`); invariant
-    // ties resolved by the dot-profile, then row index.
+    // Seed class = rows nearest the mean direction (largest `dot_to_sum`), then
+    // lexicographically smallest intrinsic dot profile. If that complete key is
+    // tied, retain the whole symmetry orbit; a row-index tie-break is forbidden.
     let mut seed = 0usize;
     for i in 1..n {
-        let take = dot_to_sum[i] > dot_to_sum[seed]
-            || (dot_to_sum[i] == dot_to_sum[seed] && dot_profile_less(i, seed));
+        let take = match dot_to_sum[i].total_cmp(&dot_to_sum[seed]) {
+            std::cmp::Ordering::Greater => true,
+            std::cmp::Ordering::Less => false,
+            std::cmp::Ordering::Equal => spherical_dot_profile_cmp(&units, i, seed).is_lt(),
+        };
         if take {
             seed = i;
         }
     }
 
     let target = num_centers.min(n);
-    let mut selected = Vec::with_capacity(target);
+    let seed_class: Vec<usize> = (0..n)
+        .filter(|&i| {
+            dot_to_sum[i].total_cmp(&dot_to_sum[seed]).is_eq()
+                && spherical_dot_profile_cmp(&units, i, seed).is_eq()
+        })
+        .collect();
+    let seed_orbit = distinct_spherical_orbit(&units, &seed_class, &[]);
+    if seed_orbit.len() > target {
+        crate::bail_invalid_basis!(
+            "spherical farthest-point seed symmetry orbit has {} distinct directions, exceeding the requested center budget {target}; use a budget at least as large as the orbit or the harmonic sphere basis",
+            seed_orbit.len()
+        );
+    }
+
+    let mut selected = Vec::with_capacity(target.saturating_mul(2).min(n));
     let mut chosen = vec![false; n];
     // `max_dot[i]` = `max` over chosen centers `c` of `uᵢ·u_c` = `cos` of the
     // geodesic distance to the NEAREST chosen center. The maximin step picks the
     // unchosen row MINIMIZING it (farthest from all chosen).
     let mut max_dot = vec![f64::NEG_INFINITY; n];
-    selected.push(seed);
-    chosen[seed] = true;
+    for &i in &seed_class {
+        chosen[i] = true;
+    }
+    selected.extend(seed_orbit);
     for i in 0..n {
-        max_dot[i] = dot(&units[i], &units[seed]);
+        max_dot[i] = selected
+            .iter()
+            .map(|&center| spherical_center_dot(&units[i], &units[center]))
+            .fold(f64::NEG_INFINITY, f64::max);
     }
 
-    // A dot `≥ 1 − COINCIDENT_TOL` is a geodesic angle `≲ 1.4e-6` rad: the
+    // A dot `≥ 1 − SPHERICAL_CENTER_COINCIDENT_TOL` is a geodesic angle
+    // `≲ 1.4e-6` rad: the
     // candidate coincides with an already-chosen center, so selecting it would add
     // a duplicate kernel column and a singular Wahba Gram. Stopping here caps the
     // center set at the number of DISTINCT data directions.
-    const COINCIDENT_TOL: f64 = 1e-12;
     while selected.len() < target {
         let mut best: Option<usize> = None;
         for i in 0..n {
@@ -986,12 +1054,21 @@ pub fn select_spherical_farthest_point_centers(
                     // symmetric clouds and in float arithmetic — break first toward
                     // the MORE PERIPHERAL row (smaller `dot_to_sum`, which spreads
                     // centers outward and is rotation invariant), then by the
-                    // invariant dot-profile, then row index. This keeps the
-                    // selected set invariant under both rotation and permutation.
-                    let take = max_dot[i] < max_dot[b]
-                        || (max_dot[i] == max_dot[b]
-                            && (dot_to_sum[i] < dot_to_sum[b]
-                                || (dot_to_sum[i] == dot_to_sum[b] && dot_profile_less(i, b))));
+                    // invariant dot-profile. A tie after all three keys is a
+                    // symmetry orbit and is completed atomically below.
+                    let take = match max_dot[i].total_cmp(&max_dot[b]) {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Greater => false,
+                        std::cmp::Ordering::Equal => {
+                            match dot_to_sum[i].total_cmp(&dot_to_sum[b]) {
+                                std::cmp::Ordering::Less => true,
+                                std::cmp::Ordering::Greater => false,
+                                std::cmp::Ordering::Equal => {
+                                    spherical_dot_profile_cmp(&units, i, b).is_lt()
+                                }
+                            }
+                        }
+                    };
                     if take {
                         best = Some(i);
                     }
@@ -1002,18 +1079,41 @@ pub fn select_spherical_farthest_point_centers(
             Some(i) => i,
             None => break,
         };
-        if max_dot[next] >= 1.0 - COINCIDENT_TOL {
+        if max_dot[next] >= 1.0 - SPHERICAL_CENTER_COINCIDENT_TOL {
             break;
         }
-        selected.push(next);
-        chosen[next] = true;
+
+        let tied_class: Vec<usize> = (0..n)
+            .filter(|&i| {
+                !chosen[i]
+                    && max_dot[i].total_cmp(&max_dot[next]).is_eq()
+                    && dot_to_sum[i].total_cmp(&dot_to_sum[next]).is_eq()
+                    && spherical_dot_profile_cmp(&units, i, next).is_eq()
+            })
+            .collect();
+        let orbit = distinct_spherical_orbit(&units, &tied_class, &selected);
+        if orbit.len() > target {
+            crate::bail_invalid_basis!(
+                "spherical farthest-point symmetry orbit has {} distinct directions, exceeding the requested center budget {target}; use a budget at least as large as the orbit or the harmonic sphere basis",
+                orbit.len()
+            );
+        }
+        for &i in &tied_class {
+            chosen[i] = true;
+        }
+        if orbit.is_empty() {
+            continue;
+        }
+        selected.extend(orbit.iter().copied());
         for i in 0..n {
             if chosen[i] {
                 continue;
             }
-            let d = dot(&units[i], &units[next]);
-            if d > max_dot[i] {
-                max_dot[i] = d;
+            for &center in &orbit {
+                let d = spherical_center_dot(&units[i], &units[center]);
+                if d > max_dot[i] {
+                    max_dot[i] = d;
+                }
             }
         }
     }
@@ -1032,6 +1132,69 @@ pub fn select_spherical_farthest_point_centers(
         centers[[r, 1]] = data[[idx, 1]];
     }
     Ok(centers)
+}
+
+#[cfg(test)]
+mod spherical_farthest_point_symmetry_tests {
+    use super::*;
+    use ndarray::{Array2, array};
+
+    fn permute_rows(data: &Array2<f64>, order: &[usize]) -> Array2<f64> {
+        Array2::from_shape_fn((order.len(), 2), |(row, col)| data[[order[row], col]])
+    }
+
+    fn sorted_center_rows(centers: &Array2<f64>) -> Vec<[f64; 2]> {
+        let mut rows: Vec<[f64; 2]> = centers.outer_iter().map(|row| [row[0], row[1]]).collect();
+        rows.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+        rows
+    }
+
+    /// The equatorial point is the unique centroid-nearest seed. North and
+    /// south are then exactly tied by every intrinsic key and are exchanged by
+    /// a data symmetry, so selecting either one by row index is impossible to
+    /// reconcile with permutation invariance. The selector must add both as one
+    /// atomic orbit. A duplicate equatorial row remains one kernel column.
+    #[test]
+    fn symmetric_tie_orbit_is_completed_under_every_row_permutation() {
+        let data = array![[0.0_f64, 0.0], [0.0, 0.0], [90.0, 0.0], [-90.0, 0.0]];
+        let permutations = [[0_usize, 1, 2, 3], [0, 1, 3, 2], [2, 0, 3, 1], [3, 1, 2, 0]];
+
+        let mut reference: Option<Vec<[f64; 2]>> = None;
+        for order in permutations {
+            let permuted = permute_rows(&data, &order);
+            let centers = select_spherical_farthest_point_centers(permuted.view(), 2, false)
+                .expect("the complete three-direction symmetry orbit is representable");
+            assert_eq!(
+                centers.nrows(),
+                3,
+                "the nominal two-center target must expand to the complete north/south orbit"
+            );
+            let center_set = sorted_center_rows(&centers);
+            if let Some(expected) = &reference {
+                assert_eq!(
+                    &center_set, expected,
+                    "selected physical center set changed under row permutation"
+                );
+            } else {
+                reference = Some(center_set);
+            }
+        }
+    }
+
+    /// A symmetry orbit is indivisible. If even one orbit is larger than the
+    /// declared resource budget, refusing is the only bounded equivariant
+    /// answer; silently choosing a row-index representative is mathematically
+    /// false and expanding without a bound can turn an O(m) request into O(n).
+    #[test]
+    fn symmetry_orbit_larger_than_center_budget_is_refused() {
+        let antipodal = array![[90.0_f64, 0.0], [-90.0, 0.0]];
+        let error = select_spherical_farthest_point_centers(antipodal.view(), 1, false)
+            .expect_err("a two-direction seed orbit cannot fit a one-center budget");
+        assert!(
+            error.to_string().contains("symmetry orbit"),
+            "unexpected refusal: {error}"
+        );
+    }
 }
 
 /// Auto-derive a streaming row chunk size for dense basis evaluation.

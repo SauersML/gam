@@ -2766,6 +2766,7 @@ impl BernoulliMarginalSlopeFamily {
         use super::exact_kernel as exact;
 
         let cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
+        let mut node_cursor = 0usize;
         for partition_cell in &cells {
             let lo = partition_cell.cell.left;
             let hi = partition_cell.cell.right;
@@ -2862,8 +2863,16 @@ impl BernoulliMarginalSlopeFamily {
                 }
             }
 
-            let node_begin = empirical_grid.nodes.partition_point(|&node| node < lo);
-            let node_end = empirical_grid.nodes.partition_point(|&node| node < hi);
+            let node_begin = node_cursor;
+            if node_begin < empirical_grid.nodes.len() && empirical_grid.nodes[node_begin] < lo {
+                return Err(format!(
+                    "empirical flex moment compiler found grid node {} below the next cell's left edge {lo}",
+                    empirical_grid.nodes[node_begin]
+                ));
+            }
+            let node_end = node_begin
+                + empirical_grid.nodes[node_begin..].partition_point(|&node| node < hi);
+            node_cursor = node_end;
             if node_begin == node_end {
                 continue;
             }
@@ -2885,6 +2894,12 @@ impl BernoulliMarginalSlopeFamily {
                 b_first: coeff_bu,
             }
             .contract_into(&moments, &obs.dc_da, f_u, f_au, f_uv, need_hessian);
+        }
+        if node_cursor != empirical_grid.nodes.len() {
+            return Err(format!(
+                "empirical flex moment compiler consumed {node_cursor} of {} sorted grid nodes",
+                empirical_grid.nodes.len()
+            ));
         }
         Ok(f_aa)
     }

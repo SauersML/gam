@@ -397,6 +397,29 @@ is_target_artifact_corruption() {
     END { exit !found }
   ' "$LOG" 2>/dev/null
 }
+
+# Remove only an incremental profile explicitly named by the corruption log,
+# and only while holding Cargo's own profile lock. build.lock excludes wrapper
+# callers, but legacy/raw cargo bypasses it; `.cargo-lock` closes that race. A
+# missing deps/build artifact needs no deletion at all—Cargo revalidates it on
+# retry—so this helper is reserved for actual incremental metadata loss.
+repair_incremental_state_if_idle() {
+  local profile dir lock
+  for profile in debug release; do
+    dir="$CARGO_TARGET_DIR/$profile/incremental"
+    grep -Fq "$dir/" "$LOG" 2>/dev/null || continue
+    lock="$CARGO_TARGET_DIR/$profile/.cargo-lock"
+    mkdir -p "$CARGO_TARGET_DIR/$profile" || continue
+    exec 6>>"$lock" || continue
+    if flock -n -x 6; then
+      rm -rf "$dir" 2>/dev/null || true
+      flock -u 6
+      echo "[build.sh] removed corrupt $profile incremental state under Cargo's profile lock" >&2
+    else
+      echo "[build.sh] preserving $profile incremental state: Cargo profile lock is active" >&2
+    fi
+  done
+}
 # Is CMD a test/bench RUN that compiles binaries and then EXECUTES them? (A pure
 # build-only invocation — `--no-run`/`--list` — is NOT: it never executes, so it
 # needs no execute phase.) Only these are split into compile+execute below.
@@ -465,8 +488,8 @@ run_under_global_lock() {
     if is_transient; then
       if (( attempt < max )); then
         if is_target_artifact_corruption; then
-          echo "[build.sh] target-artifact loss (concurrent mutation of target/) attempt $attempt/$max — wiping target/debug/incremental + retrying…" >&2
-          rm -rf "$REPO/target/debug/incremental" 2>/dev/null || true
+          echo "[build.sh] target-artifact loss (concurrent mutation of target/) attempt $attempt/$max — retrying…" >&2
+          is_incremental_corruption && repair_incremental_state_if_idle
         elif [[ "${CARGO_BUILD_JOBS:-0}" != "1" ]]; then
           # Repeated OOM won't clear by waiting alone — a lower job count has a
           # strictly lower codegen RAM peak, so shrink to -j1 for the retry.
@@ -492,7 +515,7 @@ run_under_global_lock() {
       wait_for_memory
       t0=$(ep); timeout -k 30 "$TIMEOUT" "${CMD[@]}" >>"$LOG" 2>&1 8>&- 9>&-; code=$?; DUR=$(( DUR + $(ep)-t0 ))
       if is_transient && (( rattempt < max )); then
-        is_target_artifact_corruption && rm -rf "$REPO/target/debug/incremental" 2>/dev/null || true
+        is_incremental_corruption && repair_incremental_state_if_idle
         sleep $(( rattempt * 12 )); continue
       fi
       break

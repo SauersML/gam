@@ -68,9 +68,26 @@ fn g_norm(
     point: ArrayView1<'_, f64>,
     a: ArrayView1<'_, f64>,
 ) -> GeometryResult<f64> {
-    let squared_norm = g_inner(manifold, point, a, a)?;
+    let metric = manifold.metric_tensor(point)?;
+    let metric_times_a = gam_linalg::faer_ndarray::fast_av(&metric.view(), &a);
+    let mut squared_norm = 0.0_f64;
+    let mut absolute_sum = 0.0_f64;
+    for (&left, &right) in a.iter().zip(metric_times_a.iter()) {
+        let term = left * right;
+        squared_norm += term;
+        absolute_sum += term.abs();
+    }
     if !squared_norm.is_finite() {
         return Ok(f64::INFINITY);
+    }
+    // A Riemannian metric is positive definite. Permit only the backward-error
+    // band of the final dot product; clamping a materially negative quadratic
+    // to zero would falsely turn an indefinite metric into a stationary point.
+    let negative_roundoff = 64.0 * f64::EPSILON * absolute_sum;
+    if squared_norm < -negative_roundoff {
+        return Err(crate::manifold::GeometryError::InvalidPoint(
+            "Riemannian metric produced a negative squared norm",
+        ));
     }
     Ok(squared_norm.max(0.0).sqrt())
 }
@@ -299,7 +316,7 @@ impl RiemannianTrustRegion {
             Ok(x)
         } else {
             Err(crate::manifold::GeometryError::NonConvergence {
-                context: "Riemannian trust-region optimization",
+                context: "Riemannian trust-region optimization (relative gradient norm)",
                 iterations,
                 residual,
                 tolerance: self.grad_tol,
@@ -680,7 +697,7 @@ impl RiemannianLBFGS {
             Ok(x)
         } else {
             Err(crate::manifold::GeometryError::NonConvergence {
-                context: "Riemannian L-BFGS optimization",
+                context: "Riemannian L-BFGS optimization (relative gradient norm)",
                 iterations,
                 residual,
                 tolerance: self.grad_tol,
@@ -748,7 +765,55 @@ fn two_loop(
 mod tests {
     use super::*;
     use crate::EuclideanManifold;
-    use ndarray::{Array1, ArrayView1};
+    use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+
+    struct IndefiniteLine;
+
+    impl RiemannianManifold for IndefiniteLine {
+        fn dim(&self) -> usize {
+            1
+        }
+
+        fn tangent_basis(&self, _point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
+            Ok(Array2::eye(1))
+        }
+
+        fn exp_map(
+            &self,
+            point: ArrayView1<'_, f64>,
+            tangent_vec: ArrayView1<'_, f64>,
+        ) -> GeometryResult<Array1<f64>> {
+            Ok(&point.to_owned() + &tangent_vec)
+        }
+
+        fn log_map(
+            &self,
+            p_from: ArrayView1<'_, f64>,
+            p_to: ArrayView1<'_, f64>,
+        ) -> GeometryResult<Array1<f64>> {
+            Ok(&p_to.to_owned() - &p_from)
+        }
+
+        fn parallel_transport(
+            &self,
+            _point_along: ArrayView2<'_, f64>,
+            vec: ArrayView1<'_, f64>,
+        ) -> GeometryResult<Array1<f64>> {
+            Ok(vec.to_owned())
+        }
+
+        fn metric_tensor(&self, _point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
+            Ok(ndarray::array![[-1.0]])
+        }
+
+        fn sectional_curvature(
+            &self,
+            _point: ArrayView1<'_, f64>,
+            _tangent_pair: (ArrayView1<'_, f64>, ArrayView1<'_, f64>),
+        ) -> GeometryResult<f64> {
+            Ok(0.0)
+        }
+    }
 
     /// Scalar objective `f(x) = x²` on the 1-D Euclidean line. Gradient `2x`,
     /// Hessian `2`, exposed as an HVP so the trust region runs Steihaug-CG.
@@ -1012,6 +1077,22 @@ mod tests {
             error,
             crate::manifold::GeometryError::NonConvergence { residual, .. }
                 if residual.is_infinite()
+        ));
+    }
+
+    #[test]
+    fn indefinite_metric_cannot_be_clamped_into_false_stationarity() {
+        let manifold = IndefiniteLine;
+        let mut objective = Square;
+        let x0 = Array1::from_vec(vec![1.0]);
+        let error = RiemannianTrustRegion::default()
+            .minimize(&manifold, &mut objective, x0.view())
+            .expect_err("an indefinite metric is not a Riemannian norm");
+        assert!(matches!(
+            error,
+            crate::manifold::GeometryError::InvalidPoint(
+                "Riemannian metric produced a negative squared norm"
+            )
         ));
     }
 }

@@ -17,6 +17,114 @@ thread_local! {
         std::cell::RefCell::new(gam_math::jet_scalar::DynamicJetArena::new());
 }
 
+/// Zero-copy production adapter for the structure-compiled softmax row program.
+/// It borrows the term's live basis/decoder tensors and the cache-derived primary
+/// layout; no per-row `AtomRowBasisJet` clone is constructed.
+struct ProductionSoftmaxRowProgram<'a> {
+    term: &'a SaeManifoldTerm,
+    row: usize,
+    vars: &'a [SaeLocalRowVar],
+    assignments: ArrayView1<'a, f64>,
+    second_jets: &'a [Array4<f64>],
+    border: &'a [SaeBorderChannel],
+}
+
+impl ProductionSoftmaxRowProgram<'_> {
+    #[inline]
+    fn atom_is_active_inner(&self, atom: usize) -> bool {
+        self.term
+            .last_row_layout
+            .as_ref()
+            .is_none_or(|layout| layout.active_atoms[self.row].binary_search(&atom).is_ok())
+    }
+}
+
+impl crate::row_jet_program::SaeSoftmaxRowProgramSource for ProductionSoftmaxRowProgram<'_> {
+    fn n_atoms(&self) -> usize {
+        self.term.k_atoms()
+    }
+
+    fn out_dim(&self) -> usize {
+        self.term.output_dim()
+    }
+
+    fn n_primaries(&self) -> usize {
+        self.vars.len()
+    }
+
+    fn primary(&self, slot: usize) -> crate::row_jet_program::SaeRowPrimary {
+        match self.vars[slot] {
+            SaeLocalRowVar::Logit { atom } => crate::row_jet_program::SaeRowPrimary::Logit { atom },
+            SaeLocalRowVar::Coord { atom, axis } => {
+                crate::row_jet_program::SaeRowPrimary::Coord { atom, axis }
+            }
+        }
+    }
+
+    fn gate_value(&self, atom: usize) -> f64 {
+        self.assignments[atom]
+    }
+
+    fn atom_is_active(&self, atom: usize) -> bool {
+        self.atom_is_active_inner(atom)
+    }
+
+    fn fill_decoded(&self, atom: usize, out: &mut [f64]) {
+        if self.atom_is_active_inner(atom) {
+            self.term.atoms[atom].fill_decoded_row(self.row, out);
+        } else {
+            out.fill(0.0);
+        }
+    }
+
+    fn fill_decoded_first(&self, atom: usize, axis: usize, out: &mut [f64]) {
+        if self.atom_is_active_inner(atom) {
+            self.term.atoms[atom].fill_decoded_derivative_row(self.row, axis, out);
+        } else {
+            out.fill(0.0);
+        }
+    }
+
+    fn fill_decoded_second(&self, atom: usize, axis_a: usize, axis_b: usize, out: &mut [f64]) {
+        out.fill(0.0);
+        if !self.atom_is_active_inner(atom) {
+            return;
+        }
+        let atom_ref = &self.term.atoms[atom];
+        for basis_col in 0..atom_ref.basis_size() {
+            let d2phi = self.second_jets[atom][[self.row, basis_col, axis_a, axis_b]];
+            if d2phi == 0.0 {
+                continue;
+            }
+            for out_col in 0..atom_ref.output_dim() {
+                out[out_col] += d2phi * atom_ref.decoder_coefficients[[basis_col, out_col]];
+            }
+        }
+    }
+
+    fn n_beta_borders(&self) -> usize {
+        self.border.len()
+    }
+
+    fn beta_border_atom(&self, border: usize) -> usize {
+        self.border[border].atom
+    }
+
+    fn beta_border_basis_value(&self, border: usize) -> f64 {
+        let channel = &self.border[border];
+        self.term.atoms[channel.atom].basis_values[[self.row, channel.basis_col]]
+    }
+
+    fn beta_border_basis_first(&self, border: usize, axis: usize) -> f64 {
+        let channel = &self.border[border];
+        self.term.atoms[channel.atom].basis_jacobian[[self.row, channel.basis_col, axis]]
+    }
+
+    fn beta_border_output(&self, border: usize) -> &[f64] {
+        &self.border[border].output
+    }
+}
+
 impl SaeManifoldTerm {
     pub(crate) fn reconstruction_row_program_for_logdet(
         &self,
@@ -271,6 +379,7 @@ impl SaeManifoldTerm {
     /// derivative, packed as `Σ_b ∂²Φ_b·B_{b,c}` over output columns. Recovered
     /// verbatim from 8404ff658^ (the commit before the #932 jet cutover) for the
     /// reinstated hand `row_jets_for_logdet` path.
+    #[cfg(test)]
     fn decoded_second_row(
         atom: &SaeManifoldAtom,
         second_jet: &Array4<f64>,
@@ -313,7 +422,8 @@ impl SaeManifoldTerm {
     /// Softmax-only: the per-atom-logistic (ordered Beta--Bernoulli / ThresholdGate) modes keep the jet
     /// path (their hand gate prior diverged from the live ordered-geometric
     /// prior, so routing them through the jet is the value-preserving choice).
-    fn fill_row_jets_hand_softmax(
+    #[cfg(test)]
+    fn fill_row_jets_hand_softmax_reference(
         &self,
         row: usize,
         vars: &[SaeLocalRowVar],
@@ -563,33 +673,33 @@ impl SaeManifoldTerm {
             .row_loss_weights
             .as_deref()
             .map_or(1.0, |w| w[row].sqrt());
-        let mut first = vec![vec![0.0_f64; p]; q];
-        let mut second = vec![vec![vec![0.0_f64; p]; q]; q];
-        let mut beta = vec![vec![0.0_f64; p]; border.len()];
-        let mut beta_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
-        let mut beta_l_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
-
-        match self.assignment.mode {
+        let (first, second, beta, beta_deriv, beta_l_deriv) = match self.assignment.mode {
             AssignmentMode::Softmax { temperature, .. } => {
-                // HAND PATH (#932 revert): closed-form reconstruction + β-border
-                // channels, ~25–57× faster than the Tower jet it replaced and
-                // bit-identical (≤1.4e-15). The jet is retained as the oracle that
-                // pins this arithmetic (see `fill_row_jets_hand_softmax`).
+                // Structure-compiled unified row program: the borrowed adapter
+                // reads the same live tensors as the former hand kernel, while
+                // `execute_softmax_row_program` derives all channels from one
+                // sparse softmax-moment schedule.  The generic Tower remains an
+                // independent exact oracle; no copied basis/decoder program and
+                // no dense structural-zero jet are built on this hot path.
                 let inv_tau = 1.0 / temperature;
-                self.fill_row_jets_hand_softmax(
+                let source = ProductionSoftmaxRowProgram {
+                    term: self,
                     row,
-                    &vars,
+                    vars: &vars,
                     assignments,
                     second_jets,
                     border,
-                    inv_tau,
-                    sqrt_row_w,
-                    &mut first,
-                    &mut second,
-                    &mut beta,
-                    &mut beta_deriv,
-                    &mut beta_l_deriv,
+                };
+                let scheduled = crate::row_jet_program::execute_softmax_row_program(
+                    &source, inv_tau, sqrt_row_w,
                 );
+                (
+                    scheduled.first,
+                    scheduled.second,
+                    scheduled.beta,
+                    scheduled.beta_deriv,
+                    scheduled.beta_l_deriv,
+                )
             }
             AssignmentMode::OrderedBetaBernoulli { .. }
             | AssignmentMode::ThresholdGate { .. }
@@ -607,6 +717,11 @@ impl SaeManifoldTerm {
                     assignments,
                     second_jets,
                 )?;
+                let mut first = vec![vec![0.0_f64; p]; q];
+                let mut second = vec![vec![vec![0.0_f64; p]; q]; q];
+                let mut beta = vec![vec![0.0_f64; p]; border.len()];
+                let mut beta_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
+                let mut beta_l_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
                 SAE_ROW_JET_ARENA.with(|cell| {
                     let mut arena = cell.borrow_mut();
                     arena.reset();
@@ -627,8 +742,9 @@ impl SaeManifoldTerm {
                         &mut beta_l_deriv,
                     );
                 });
+                (first, second, beta, beta_deriv, beta_l_deriv)
             }
-        }
+        };
 
         Ok(SaeRowJets {
             vars,
@@ -638,6 +754,55 @@ impl SaeManifoldTerm {
             beta_deriv,
             beta_l_deriv,
         })
+    }
+
+    /// Test/benchmark baseline: the strongest pre-schedule production hand
+    /// kernel, including the same output allocations as `row_jets_for_logdet`.
+    #[cfg(test)]
+    pub(crate) fn row_jets_for_logdet_hand_reference(
+        &self,
+        row: usize,
+        vars: Vec<SaeLocalRowVar>,
+        assignments: ArrayView1<'_, f64>,
+        second_jets: &[Array4<f64>],
+        border: &[SaeBorderChannel],
+    ) -> SaeRowJets {
+        let p = self.output_dim();
+        let q = vars.len();
+        let sqrt_row_w = self
+            .row_loss_weights
+            .as_deref()
+            .map_or(1.0, |w| w[row].sqrt());
+        let mut first = vec![vec![0.0_f64; p]; q];
+        let mut second = vec![vec![vec![0.0_f64; p]; q]; q];
+        let mut beta = vec![vec![0.0_f64; p]; border.len()];
+        let mut beta_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
+        let mut beta_l_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
+        let AssignmentMode::Softmax { temperature, .. } = self.assignment.mode else {
+            panic!("hand softmax reference requires softmax assignment")
+        };
+        self.fill_row_jets_hand_softmax_reference(
+            row,
+            &vars,
+            assignments,
+            second_jets,
+            border,
+            1.0 / temperature,
+            sqrt_row_w,
+            &mut first,
+            &mut second,
+            &mut beta,
+            &mut beta_deriv,
+            &mut beta_l_deriv,
+        );
+        SaeRowJets {
+            vars,
+            first,
+            second,
+            beta,
+            beta_deriv,
+            beta_l_deriv,
+        }
     }
 }
 

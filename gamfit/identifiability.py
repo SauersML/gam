@@ -627,8 +627,10 @@ def _one_fit(
     latent_dim = int(n_supervised) + int(n_free)
 
     gen = torch.Generator(device=x_t.device).manual_seed(int(seed))
-    # Manually seed parameters reproducibly via the Generator above.
-    with torch.no_grad():
+    # Module constructors consume the process-global RNG even though every
+    # parameter is replaced below from `gen`. Fork that state so this library
+    # fit cannot perturb the caller's random stream.
+    with torch.random.fork_rng(devices=[]), torch.no_grad():
         encoder = _build_encoder(p_features, latent_dim, hidden_widths, torch_mod)
         encoder = encoder.to(dtype=x_t.dtype, device=x_t.device)
         for module in encoder.modules():
@@ -638,10 +640,9 @@ def _one_fit(
                 module.weight.uniform_(-bound, bound, generator=gen)
                 module.bias.zero_()
 
-    decoder = nn.Linear(latent_dim, p_features, bias=False).to(
-        dtype=x_t.dtype, device=x_t.device
-    )
-    with torch.no_grad():
+        decoder = nn.Linear(latent_dim, p_features, bias=False).to(
+            dtype=x_t.dtype, device=x_t.device
+        )
         bound = 1.0 / math.sqrt(latent_dim)
         decoder.weight.uniform_(-bound, bound, generator=gen)
 
@@ -830,7 +831,6 @@ def identifiable_factor_fit(
     aux_w = _resolve_weight(aux_prior_weight, "aux_prior_weight")
     mech_w = _resolve_weight(mech_sparsity_weight, "mech_sparsity_weight")
 
-    torch_mod.manual_seed(int(random_state))
     x_t = torch_mod.as_tensor(x_np, dtype=torch_mod.float64)
     aux_t = torch_mod.as_tensor(aux_np, dtype=torch_mod.float64)
 

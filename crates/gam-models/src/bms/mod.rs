@@ -304,7 +304,7 @@ impl EmpiricalZGrid {
         }
         let mut pairs: Vec<(f64, f64)> = nodes.into_iter().zip(weights).collect();
         pairs.sort_by(|left, right| left.0.total_cmp(&right.0));
-        let (nodes, weights) = pairs.into_iter().unzip();
+        let (nodes, weights): (Vec<f64>, Vec<f64>) = pairs.into_iter().unzip();
         validate_empirical_z_grid(&nodes, &weights, context)?;
         Ok(Self { nodes, weights })
     }
@@ -2115,6 +2115,29 @@ mod tests {
     include!(
         "../../../../tests/src_modules/optimization/families_bms_joint_hessian_hvp_correction_tests.rs"
     );
+
+    #[test]
+    fn empirical_grid_constructor_canonicalizes_node_order() {
+        let grid = EmpiricalZGrid::new(
+            vec![1.0, -2.0, 0.5],
+            vec![0.2, 0.3, 0.5],
+            "sorted-grid invariant",
+        )
+        .expect("constructor sorts node/weight pairs");
+        assert_eq!(grid.nodes, vec![-2.0, 0.5, 1.0]);
+        assert_eq!(grid.weights, vec![0.3, 0.5, 0.2]);
+    }
+
+    #[test]
+    fn empirical_grid_validation_rejects_noncanonical_node_order() {
+        let err = validate_empirical_z_grid(
+            &[0.0, -1.0],
+            &[0.5, 0.5],
+            "sorted-grid invariant",
+        )
+        .expect_err("persisted grids must already be canonical");
+        assert!(err.contains("nodes must be sorted ascending"), "{err}");
+    }
 }
 pub(crate) mod axis_direction_search;
 pub(crate) mod cell_moment_assembly;

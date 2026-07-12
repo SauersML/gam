@@ -17,6 +17,8 @@ Numpy-level throughout; no torch build, no cluster, no clock entropy required.
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -249,6 +251,15 @@ def test_tree_reducer_matches_fixed_fold_order() -> None:
     assert np.array_equal(got, ref)
 
 
+def test_tree_reducer_repeated_calls_never_reuse_previous_input() -> None:
+    reducer = TreeReducer([0, 1])
+    first = reducer.reduce({0: np.array([1.0]), 1: np.array([2.0])})
+    second = reducer.reduce({0: np.array([10.0]), 1: np.array([20.0])})
+
+    np.testing.assert_array_equal(first, np.array([3.0]))
+    np.testing.assert_array_equal(second, np.array([30.0]))
+
+
 def test_tree_reducer_resumes_from_checkpoint_bitexact() -> None:
     n_ranks, dim = 6, 5
     partials = _make_partials(n_ranks, dim, seed=9)
@@ -256,25 +267,45 @@ def test_tree_reducer_resumes_from_checkpoint_bitexact() -> None:
     full = TreeReducer(range(n_ranks))
     ref = full.reduce(partials)
 
-    # Reduce on one reducer, checkpoint its finished-subtree cache, restore into
-    # a FRESH reducer, and resume — the resumed result is bit-identical.
-    first = TreeReducer(range(n_ranks))
-    first.reduce(partials)
-    ckpt = first.checkpoint()
+    # Checkpoint state belongs to an explicit immutable-input session, never to
+    # the reusable TreeReducer topology object.
+    first = TreeReducer(range(n_ranks)).start_session(partials, job_id="fit-9")
+    first.reduce()
+    ckpt = json.loads(json.dumps(first.checkpoint()))
 
-    resumed = TreeReducer(range(n_ranks))
+    resumed = TreeReducer(range(n_ranks)).start_session(partials, job_id="fit-9")
     resumed.restore(ckpt)
-    got = resumed.reduce(partials)
+    got = resumed.reduce()
     assert np.array_equal(got, ref)
 
     # Topology guard: a checkpoint for a different rank set is rejected.
-    other = TreeReducer(range(n_ranks + 1))
+    other_partials = {**partials, n_ranks: np.zeros(dim)}
+    other = TreeReducer(range(n_ranks + 1)).start_session(
+        other_partials, job_id="fit-9"
+    )
     try:
         other.restore(ckpt)
     except ValueError:
         pass
     else:  # pragma: no cover - guard must trip
         raise AssertionError("expected a topology-mismatch ValueError on restore")
+
+
+def test_tree_reducer_checkpoint_rejects_cross_job_and_cross_input_restore() -> None:
+    reducer = TreeReducer([0, 1])
+    partials = {0: np.array([1.0, 2.0]), 1: np.array([3.0, 4.0])}
+    session = reducer.start_session(partials, job_id="job-a")
+    session.reduce()
+    checkpoint = session.checkpoint()
+
+    different_job = reducer.start_session(partials, job_id="job-b")
+    with pytest.raises(ValueError, match="job mismatch"):
+        different_job.restore(checkpoint)
+
+    different_partials = {0: np.array([10.0, 20.0]), 1: np.array([30.0, 40.0])}
+    different_input = reducer.start_session(different_partials, job_id="job-a")
+    with pytest.raises(ValueError, match="input fingerprint mismatch"):
+        different_input.restore(checkpoint)
 
 
 def test_tree_reducer_combiner_default_is_sum() -> None:

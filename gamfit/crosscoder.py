@@ -225,8 +225,12 @@ class Crosscoder:
                     f"={self.layer_dims[li]}"
                 )
 
-        torch.manual_seed(int(seed))
-        module = self._build_module()
+        # nn.Linear constructors consume the process-global torch RNG. Isolate
+        # module construction so fitting a Crosscoder is reproducible without
+        # perturbing the caller's stochastic program.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(int(seed))
+            module = self._build_module()
         module.train()
 
         tensors = [torch.as_tensor(a, dtype=torch.float32) for a in arrays]
@@ -243,8 +247,15 @@ class Crosscoder:
         loss_log: list[float] = []
         recon_log: list[float] = []
         l1_log: list[float] = []
+        permutation_generator = torch.Generator(device=x_concat.device).manual_seed(
+            int(seed)
+        )
         for _epoch in range(n_epochs):
-            perm = torch.randperm(n_rows)
+            perm = torch.randperm(
+                n_rows,
+                generator=permutation_generator,
+                device=x_concat.device,
+            )
             epoch_loss = 0.0
             epoch_recon = 0.0
             epoch_l1 = 0.0

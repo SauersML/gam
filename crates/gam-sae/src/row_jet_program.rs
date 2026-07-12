@@ -759,13 +759,7 @@ pub(crate) trait SaeSoftmaxRowProgramSource {
     /// Fill `D_k`, `∂_axis D_k`, and `∂_axis_a axis_b D_k`, respectively.
     fn fill_decoded(&self, atom: usize, out: &mut [f64]);
     fn fill_decoded_first(&self, atom: usize, axis: usize, out: &mut [f64]);
-    fn fill_decoded_second(
-        &self,
-        atom: usize,
-        axis_a: usize,
-        axis_b: usize,
-        out: &mut [f64],
-    );
+    fn fill_decoded_second(&self, atom: usize, axis_a: usize, axis_b: usize, out: &mut [f64]);
 
     fn n_beta_borders(&self) -> usize;
     fn beta_border_atom(&self, border: usize) -> usize;
@@ -899,14 +893,13 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
     for &(slot_j, atom_j) in &logits {
         let dj = &decoded[atom_j * p..(atom_j + 1) * p];
         for c in 0..p {
-            out.first[slot_j][c] =
-                sqrt_row_w * moment.expectation_first(atom_j, dj[c], mean[c]);
+            out.first[slot_j][c] = sqrt_row_w * moment.expectation_first(atom_j, dj[c], mean[c]);
         }
         for &(slot_l, atom_l) in &logits {
             let dl = &decoded[atom_l * p..(atom_l + 1) * p];
             for c in 0..p {
-                out.second[slot_j][slot_l][c] = sqrt_row_w
-                    * moment.expectation_second(atom_j, atom_l, dj[c], dl[c], mean[c]);
+                out.second[slot_j][slot_l][c] =
+                    sqrt_row_w * moment.expectation_second(atom_j, atom_l, dj[c], dl[c], mean[c]);
             }
         }
     }
@@ -978,9 +971,8 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
             if coord_atom != atom {
                 continue;
             }
-            let scalar = sqrt_row_w
-                * source.gate_value(atom)
-                * source.beta_border_basis_first(border, axis);
+            let scalar =
+                sqrt_row_w * source.gate_value(atom) * source.beta_border_basis_first(border, axis);
             for c in 0..p {
                 let mixed = scalar * output[c];
                 out.beta_deriv[slot][border][c] = mixed;
@@ -992,6 +984,7 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
     out
 }
 
+#[cfg(test)]
 impl SaeSoftmaxRowProgramSource for SaeReconstructionRowProgram {
     fn n_atoms(&self) -> usize {
         self.atoms.len()
@@ -1049,13 +1042,7 @@ impl SaeSoftmaxRowProgramSource for SaeReconstructionRowProgram {
         }
     }
 
-    fn fill_decoded_second(
-        &self,
-        atom: usize,
-        axis_a: usize,
-        axis_b: usize,
-        out: &mut [f64],
-    ) {
+    fn fill_decoded_second(&self, atom: usize, axis_a: usize, axis_b: usize, out: &mut [f64]) {
         out.fill(0.0);
         for basis in 0..self.atoms[atom].n_basis() {
             let d2_phi = self.atoms[atom].d2_phi[basis][axis_a][axis_b];
@@ -2056,6 +2043,58 @@ mod tests {
         check_recon_vs_hand::<8>(softmax_fixture_k(4, 1, n_basis, out_dim, inv_tau), inv_tau);
         // K=16: 8 atoms × (1 logit + 1 coord) = 16 primaries.
         check_recon_vs_hand::<16>(softmax_fixture_k(8, 1, n_basis, out_dim, inv_tau), inv_tau);
+    }
+
+    /// The structure-compiled softmax executor and the generic packed Taylor jet
+    /// are independent implementations of the same row program.  Compare every
+    /// reconstruction gradient/Hessian entry across the reduced-logit + coordinate
+    /// layout, including highly imbalanced gates where centered softmax moments
+    /// are most cancellation-sensitive.
+    #[test]
+    fn compiled_softmax_schedule_matches_generic_tower_all_channels_932() {
+        fn check<const K: usize>(mut program: SaeReconstructionRowProgram, inv_tau: f64) {
+            let shift = program
+                .logits
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max)
+                * inv_tau;
+            let exps: Vec<f64> = program
+                .logits
+                .iter()
+                .map(|&logit| (logit * inv_tau - shift).exp())
+                .collect();
+            let denominator: f64 = exps.iter().sum();
+            program.gate_value = exps.iter().map(|&value| value / denominator).collect();
+
+            let compiled = execute_softmax_row_program(&program, inv_tau, 1.0);
+            let generic = program.reconstruction_all_columns_packed::<K>();
+            let mut max_abs = 0.0_f64;
+            let mut scale = 1.0_f64;
+            for (column, tower) in generic.iter().enumerate() {
+                for a in 0..K {
+                    max_abs = max_abs.max((compiled.first[a][column] - tower.g()[a]).abs());
+                    scale = scale.max(tower.g()[a].abs());
+                    for b in 0..K {
+                        max_abs =
+                            max_abs.max((compiled.second[a][b][column] - tower.h()[a][b]).abs());
+                        scale = scale.max(tower.h()[a][b].abs());
+                    }
+                }
+            }
+            assert!(
+                max_abs <= 2.0e-12 * scale,
+                "compiled softmax schedule vs generic tower max abs {max_abs:e}, scale {scale:e}"
+            );
+        }
+
+        let inv_tau = 1.3;
+        check::<8>(softmax_fixture_k(4, 1, 4, 7, inv_tau), inv_tau);
+        check::<16>(softmax_fixture_k(8, 1, 3, 5, inv_tau), inv_tau);
+
+        let mut imbalanced = softmax_fixture_k(4, 1, 4, 7, 4.0);
+        imbalanced.logits = vec![35.0, 2.0, -18.0, -40.0];
+        check::<8>(imbalanced, 4.0);
     }
 
     /// The runtime production backend must remain exact beyond the former
