@@ -2466,10 +2466,11 @@ impl CircularGaussianFit2d {
             return Err("circular Gaussian maximum-likelihood fit did not converge".to_string());
         }
 
+        let fitted_noise_sd = scale * noise_variance.sqrt();
         Self::from_parameters(
             [anchor[0] + scale * center[0], anchor[1] + scale * center[1]],
             scale * radius,
-            scale * scale * noise_variance,
+            fitted_noise_sd * fitted_noise_sd,
         )
         .map_err(|error| format!("circular Gaussian fit produced invalid parameters: {error}"))
     }
@@ -2494,10 +2495,13 @@ impl CircularGaussianFit2d {
         let observed_radius = (x - self.center[0]).hypot(y - self.center[1]);
         let (log_i0_minus_kappa, _) =
             circular_gaussian_bessel_terms(self.radius, observed_radius, self.noise_variance);
+        let standardized_radial_residual =
+            (observed_radius - self.radius) / self.noise_variance.sqrt();
         // Algebraically this is -(r^2+R^2)/(2s)+log I0(kappa), but this
         // rearrangement preserves log I0(kappa) ~= kappa cancellation.
-        -(std::f64::consts::TAU * self.noise_variance).ln()
-            - 0.5 * (observed_radius - self.radius).powi(2) / self.noise_variance
+        -std::f64::consts::TAU.ln()
+            - self.noise_variance.ln()
+            - 0.5 * standardized_radial_residual.powi(2)
             + log_i0_minus_kappa
     }
 
@@ -5535,6 +5539,23 @@ mod tests {
     }
 
     #[test]
+    fn circular_gaussian_density_avoids_extreme_scale_intermediate_overflow() {
+        let noise_variance = f64::MAX / 2.0;
+        let fit =
+            CircularGaussianFit2d::from_parameters([0.0, 0.0], 1.1e154, noise_variance).unwrap();
+        // Both `2πs` and `Rr` overflow if formed directly, although their log
+        // and the ratio `Rr/s` are representable.
+        let center_log_density = fit.log_density(0.0, 0.0);
+        let off_center_log_density = fit.log_density(1.7e154, 0.0);
+        assert!(center_log_density.is_finite());
+        assert!(off_center_log_density.is_finite());
+        let expected_center = -std::f64::consts::TAU.ln()
+            - noise_variance.ln()
+            - 0.5 * (fit.radius() / noise_variance.sqrt()).powi(2);
+        assert_eq!(center_log_density, expected_center);
+    }
+
+    #[test]
     fn union_circles_use_the_shared_normalized_cartesian_density() {
         let data = two_noisy_circles_for_union();
         let config = GaussianMixtureConfig::default();
@@ -5569,8 +5590,9 @@ mod tests {
             fitted_centers[[index, 0]] = center[0];
             fitted_centers[[index, 1]] = center[1];
             let at_center = fit.log_density(center[0], center[1]);
-            let expected = -(std::f64::consts::TAU * fit.noise_variance()).ln()
-                - 0.5 * fit.radius().powi(2) / fit.noise_variance();
+            let expected = -std::f64::consts::TAU.ln()
+                - fit.noise_variance().ln()
+                - 0.5 * (fit.radius() / fit.noise_variance().sqrt()).powi(2);
             assert!(at_center.is_finite());
             assert!((at_center - expected).abs() < 1.0e-12 * (1.0 + expected.abs()));
         }

@@ -2929,6 +2929,17 @@ mod tests {
         assert_eq!(wide_short_plan.tasks, 8);
         assert_eq!(wide_short_plan.column_bands, 2);
         assert_eq!(wide_short_plan.workspace_cols, 3_584);
+
+        let one_block = covariance_exact_hadamard_blocks(17).unwrap();
+        let uneven_tiles = covariance_exact_hadamard_tiles(&one_block[..1], 7, 3).unwrap();
+        assert_eq!(
+            uneven_tiles
+                .iter()
+                .map(|tile| (tile.first_col, tile.cols))
+                .collect::<Vec<_>>(),
+            vec![(0, 3), (3, 2), (5, 2)],
+            "balanced column bands must cover every column exactly once"
+        );
     }
 
     #[test]
