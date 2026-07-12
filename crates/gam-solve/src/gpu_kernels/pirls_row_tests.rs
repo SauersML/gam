@@ -230,17 +230,18 @@ fn generated_sources_have_one_exact_unprojected_contract() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn nvrtc_compiles_every_exact_builtin_mode_when_cuda_is_present() {
+fn nvrtc_compiles_every_exact_builtin_mode_when_cuda_is_present() -> Result<(), GpuError> {
     let Ok(backend) = PirlsRowBackend::probe() else {
-        return;
+        return Ok(());
     };
     for family in PirlsRowFamily::ALL {
         for curvature in [CurvatureMode::Fisher, CurvatureMode::Observed] {
-            backend.module_for(family, curvature).unwrap();
-            backend.module_for_solve(family, curvature).unwrap();
-            backend.module_for_ladder(family, curvature).unwrap();
+            backend.module_for(family, curvature)?;
+            backend.module_for_solve(family, curvature)?;
+            backend.module_for_ladder(family, curvature)?;
         }
     }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

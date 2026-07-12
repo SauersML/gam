@@ -711,7 +711,7 @@ pub(crate) fn logb_dlog_sigma_deta(sigma: f64, d_sigma_deta: f64) -> f64 {
 /// finite `f64`, including subnormals. The mantissa lies in `[1, 2)`.
 #[inline]
 pub(crate) fn positive_frexp(x: f64) -> (f64, i32) {
-    debug_assert!(x.is_finite() && x > 0.0);
+    assert!(x.is_finite() && x > 0.0);
     let bits = x.to_bits();
     let raw_exp = ((bits >> 52) & 0x7ff) as i32;
     let fraction = bits & ((1_u64 << 52) - 1);
@@ -757,10 +757,10 @@ pub(crate) fn scale_normalized_power_of_two(mut mantissa: f64, mut exponent: i32
 /// change a representable final result.
 #[inline]
 pub(crate) fn scaled_positive_product_quotient(a: f64, b: f64, c: f64, d: f64) -> f64 {
-    debug_assert!(a.is_finite() && a > 0.0);
-    debug_assert!(b.is_finite() && b > 0.0);
-    debug_assert!(c.is_finite() && c > 0.0);
-    debug_assert!(d.is_finite() && d > 0.0);
+    assert!(a.is_finite() && a > 0.0);
+    assert!(b.is_finite() && b > 0.0);
+    assert!(c.is_finite() && c > 0.0);
+    assert!(d.is_finite() && d > 0.0);
     let (ma, ea) = positive_frexp(a);
     let (mb, eb) = positive_frexp(b);
     let (mc, ec) = positive_frexp(c);
