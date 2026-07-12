@@ -495,31 +495,12 @@ fn beta_scaled_digamma(c: f64, shape: f64, reciprocal_term: f64) -> f64 {
     }
 }
 
-/// Fallible, atomic row oracle shared by PIRLS deviance evaluation and the
-/// nonlinear REML state cache.  Non-binomial legal likelihood cells are
-/// identity/log/logit canonical, so the log-link branches can use `eta`
-/// directly and avoid every false `y / exp(eta)` intermediate overflow.
-pub(crate) fn deviance_eta_row(
-    row: usize,
-    y: f64,
-    eta: f64,
-    likelihood: &GlmLikelihoodSpec,
-    inverse_link: &InverseLink,
-    prior_weight: f64,
-) -> Result<DevianceEtaRow, EstimationError> {
-    deviance_eta_row_with_log_measure_scale(
-        row,
-        y,
-        eta,
-        likelihood,
-        inverse_link,
-        prior_weight,
-        0.0,
-    )
-}
-
+/// Fallible, atomic single-row deviance/score oracle threading the log-measure
+/// scale. Production deviance/REML paths call this directly with a real
+/// `log_measure_scale`; the deviance unit tests exercise the `scale = 0` case
+/// through a thin local wrapper in the test module.
 #[inline]
-fn deviance_eta_row_with_log_measure_scale(
+pub(crate) fn deviance_eta_row_with_log_measure_scale(
     row: usize,
     y: f64,
     eta: f64,

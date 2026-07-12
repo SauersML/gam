@@ -36,7 +36,7 @@ use super::{
     array1_l2_norm,
     attach_penalty_shift,
     // compute functions
-    calculate_deviance,
+    calculate_deviance_from_eta,
     // edf helpers
     calculate_edf_with_penalty,
     calculate_edfwithworkspace_with_penalty,

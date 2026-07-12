@@ -78,8 +78,6 @@ impl RemlConfig {
         }
     }
 }
-pub(crate) const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
-
 /// Small ridge added to the rho-space LAML Hessian before inversion, for
 /// numerical stability when smoothing parameters are weakly identified.
 ///

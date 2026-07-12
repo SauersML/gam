@@ -977,19 +977,34 @@ pub fn boundary_hit_indices(
 /// infinite even when the matrix is well-scaled). When the spectrum sign is
 /// unknown, inspect inertia directly via [`symmetric_extremes`].
 pub fn symmetric_spectrum_condition_number(matrix: &Array2<f64>) -> f64 {
-    matrix
-        .eigh(Side::Lower)
-        .ok()
-        .map(|(evals, _)| {
-            let min = evals
-                .iter()
-                .fold(f64::INFINITY, |acc, &value| acc.min(value));
-            let max = evals
-                .iter()
-                .fold(f64::NEG_INFINITY, |acc, &value| acc.max(value));
-            max / min.max(1e-12)
-        })
+    symmetric_extremes(matrix)
+        .map(|(min, max)| max / min.max(1e-12))
         .unwrap_or(f64::NAN)
+}
+
+/// Smallest and largest eigenvalues `(λ_min, λ_max)` of a symmetric matrix,
+/// obtained from the symmetric eigensolver. Unlike
+/// [`symmetric_spectrum_condition_number`], this makes **no** positive-definiteness
+/// assumption — it is the primitive for inspecting inertia directly (the sign of
+/// `λ_min` tells whether the matrix is PD). Returns `None` when the matrix is
+/// empty or the eigensolve fails (e.g. non-finite entries), so callers can treat
+/// "spectrum unavailable" distinctly from any concrete eigenvalue.
+pub fn symmetric_extremes(matrix: &Array2<f64>) -> Option<(f64, f64)> {
+    if matrix.nrows() == 0 || matrix.ncols() == 0 {
+        return None;
+    }
+    matrix.eigh(Side::Lower).ok().and_then(|(evals, _)| {
+        if evals.is_empty() {
+            return None;
+        }
+        let min = evals
+            .iter()
+            .fold(f64::INFINITY, |acc, &value| acc.min(value));
+        let max = evals
+            .iter()
+            .fold(f64::NEG_INFINITY, |acc, &value| acc.max(value));
+        Some((min, max))
+    })
 }
 
 pub fn addridge(matrix: &Array2<f64>, ridge: f64) -> Array2<f64> {

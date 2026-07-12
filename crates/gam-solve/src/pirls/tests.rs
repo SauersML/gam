@@ -17,8 +17,9 @@ mod tests {
         WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance,
         calculate_deviance_from_eta, calculate_loglikelihood,
         calculate_loglikelihood_omitting_constants_from_eta, compute_constraint_kkt_diagnostics,
-        compute_observed_hessian_curvature_arrays, deviance_eta_row,
-        deviance_eta_rows_with_log_measure_scale, fit_model_for_fixed_rho,
+        DevianceEtaRow, compute_observed_hessian_curvature_arrays,
+        deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale,
+        fit_model_for_fixed_rho,
         observed_weight_dispatch, observed_weight_noncanonical, select_active_set_release,
         should_log_pirls_decision_summary, should_use_sparse_native_pirls,
         solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
@@ -37,6 +38,29 @@ mod tests {
         Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkComponent, LinkFunction,
         LogSmoothingParamsView, MixtureLinkSpec, ResponseFamily, StandardLink,
     };
+
+    // Test-only zero-log-measure-scale wrapper over the production single-row
+    // deviance/score oracle. Lives in this test module (its only consumer) rather
+    // than as a `#[cfg(test)]`-gated production fn, so the non-test lib build
+    // carries no unreferenced item.
+    fn deviance_eta_row(
+        row: usize,
+        y: f64,
+        eta: f64,
+        likelihood: &GlmLikelihoodSpec,
+        inverse_link: &InverseLink,
+        prior_weight: f64,
+    ) -> Result<DevianceEtaRow, EstimationError> {
+        deviance_eta_row_with_log_measure_scale(
+            row,
+            y,
+            eta,
+            likelihood,
+            inverse_link,
+            prior_weight,
+            0.0,
+        )
+    }
 
     // Full-operator Firth/Jeffreys diagnostics reference (#1575): bit-identical to
     // the production `jeffreys_pirls_diagnostics_from_factor` fast path, used here
