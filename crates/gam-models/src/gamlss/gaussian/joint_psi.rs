@@ -644,17 +644,7 @@ pub(crate) fn gaussian_jointrow_scalars(
     // SAFETY: every `MaybeUninit` slot in each of these arrays was written
     // exactly once in the `for i in 0..nobs` loop above; no slot is read,
     // moved, or dropped before this point.
-    let (
-        obs_weight,
-        w,
-        m,
-        n,
-        standardized_residual,
-        inv_sigma,
-        kappa,
-        kappa_prime,
-        kappa_dprime,
-    ) = unsafe {
+    let (obs_weight, w, m, n, standardized_residual, inv_sigma, kappa, kappa_prime, kappa_dprime) = unsafe {
         (
             obs_weight.assume_init(),
             w.assume_init(),
@@ -1593,11 +1583,7 @@ mod observed_single_source_oracle_tests {
                 }
                 Ok([self.eta_mu, self.eta_ls])
             }
-            fn eval<S: JetScalar<2>>(
-                &self,
-                row: usize,
-                p: &[S; 2],
-            ) -> Result<S, String> {
+            fn eval<S: JetScalar<2>>(&self, row: usize, p: &[S; 2]) -> Result<S, String> {
                 if row != 0 {
                     return Err(format!("GaulssJetRow holds exactly one row; got row {row}"));
                 }

@@ -1392,9 +1392,7 @@ pub struct StaticOrder2Atom<
     hessian: [f64; H],
 }
 
-impl<const N: usize, const H: usize, const G: u128, const Q: u128>
-    StaticOrder2Atom<N, H, G, Q>
-{
+impl<const N: usize, const H: usize, const G: u128, const Q: u128> StaticOrder2Atom<N, H, G, Q> {
     /// Construct a generated atom. `H` must equal `N(N+1)/2`.
     #[inline(always)]
     #[must_use]
@@ -1426,7 +1424,10 @@ impl<const N: usize, const H: usize, const G: u128, const Q: u128>
     #[inline(always)]
     #[must_use]
     pub fn hessian_at(&self, row: usize, column: usize) -> f64 {
-        assert!(row < N && column < N, "static atom Hessian axis out of range");
+        assert!(
+            row < N && column < N,
+            "static atom Hessian axis out of range"
+        );
         let (row, column) = if row <= column {
             (row, column)
         } else {
@@ -1558,16 +1559,12 @@ impl<const K: usize> MappedOrder2Accumulator<K> {
                     let inner = derivatives[1] * atom.hessian_at(local_i, local_j);
                     if outer_live {
                         inner
-                            + derivatives[2]
-                                * atom.gradient_at(local_i)
-                                * atom.gradient_at(local_j)
+                            + derivatives[2] * atom.gradient_at(local_i) * atom.gradient_at(local_j)
                     } else {
                         inner
                     }
                 } else if outer_live {
-                    derivatives[2]
-                        * atom.gradient_at(local_i)
-                        * atom.gradient_at(local_j)
+                    derivatives[2] * atom.gradient_at(local_i) * atom.gradient_at(local_j)
                 } else {
                     packed += 1;
                     continue;
@@ -3089,9 +3086,7 @@ mod tests {
         let p = [0.2_f64, 0.7, -0.4, 0.3];
         let dense_vars: [Order2<K>; K] =
             std::array::from_fn(|axis| Order2::variable(p[axis], axis));
-        let dense_q0 = dense_vars[3]
-            .mul(&dense_vars[1])
-            .add(&dense_vars[3].exp());
+        let dense_q0 = dense_vars[3].mul(&dense_vars[1]).add(&dense_vars[3].exp());
         let dense_q1 = dense_vars[1].mul(&dense_vars[2]).sub(&dense_vars[2]);
         let dense = dense_q0.ln().add(&dense_q1.exp());
 
@@ -3161,14 +3156,7 @@ mod tests {
     fn mapped_order2_accumulator_rejects_out_of_range_axes() {
         let atom = Order2::<1>::variable(0.2, 0);
         let mut lowered = MappedOrder2Accumulator::<2>::zero();
-        lowered.add_composed(
-            &atom,
-            [2],
-            [0.2, 1.0, 0.0],
-            false,
-            [false],
-            [false],
-        );
+        lowered.add_composed(&atom, [2], [0.2, 1.0, 0.0], false, [false], [false]);
     }
 
     #[test]

@@ -439,19 +439,13 @@ fn evaluate_cause_specific_block(
     let eta_exit = fast_av(&block.x_exit, beta) + &block.offset_eta_exit;
     let derivative = fast_av(&block.x_derivative, beta) + &block.offset_derivative_exit;
     let mut log_likelihood = 0.0;
-    let mut gradient_weights: [Array1<f64>; 3] =
-        std::array::from_fn(|_| Array1::<f64>::zeros(n));
-    let mut hessian_weights: [Array1<f64>; 6] =
-        std::array::from_fn(|_| Array1::<f64>::zeros(n));
+    let mut gradient_weights: [Array1<f64>; 3] = std::array::from_fn(|_| Array1::<f64>::zeros(n));
+    let mut hessian_weights: [Array1<f64>; 6] = std::array::from_fn(|_| Array1::<f64>::zeros(n));
 
     for i in 0..n {
-        let Some(input) = cause_specific_atom_input(
-            block,
-            i,
-            eta_entry[i],
-            eta_exit[i],
-            derivative[i],
-        )? else {
+        let Some(input) =
+            cause_specific_atom_input(block, i, eta_entry[i], eta_exit[i], derivative[i])?
+        else {
             continue;
         };
         let atom = cause_specific_row_order2(
@@ -722,13 +716,9 @@ fn cause_specific_hessian_directional_derivative(
     let mut weights: [Array1<f64>; 6] = std::array::from_fn(|_| Array1::zeros(n));
 
     for i in 0..n {
-        let Some(input) = cause_specific_atom_input(
-            block,
-            i,
-            eta_entry[i],
-            eta_exit[i],
-            derivative[i],
-        )? else {
+        let Some(input) =
+            cause_specific_atom_input(block, i, eta_entry[i], eta_exit[i], derivative[i])?
+        else {
             continue;
         };
         let direction = [
@@ -780,13 +770,9 @@ fn cause_specific_hessian_second_directional_derivative(
     let mut weights: [Array1<f64>; 6] = std::array::from_fn(|_| Array1::zeros(n));
 
     for i in 0..n {
-        let Some(input) = cause_specific_atom_input(
-            block,
-            i,
-            eta_entry[i],
-            eta_exit[i],
-            derivative[i],
-        )? else {
+        let Some(input) =
+            cause_specific_atom_input(block, i, eta_entry[i], eta_exit[i], derivative[i])?
+        else {
             continue;
         };
         let direction_u = [
@@ -3255,8 +3241,7 @@ mod tests {
         use super::*;
         use gam_math::jet_scalar::JetScalar;
         use gam_math::jet_tower::{
-            RowProgram, program_fourth_contracted, program_row_kernel,
-            program_third_contracted,
+            RowProgram, program_fourth_contracted, program_row_kernel, program_third_contracted,
         };
 
         /// The cause-specific row NLL written ONCE through the jet scalar:
@@ -3283,11 +3268,7 @@ mod tests {
                 }
                 Ok(self.base)
             }
-            fn eval<S: JetScalar<3>>(
-                &self,
-                row: usize,
-                p: &[S; 3],
-            ) -> Result<S, String> {
+            fn eval<S: JetScalar<3>>(&self, row: usize, p: &[S; 3]) -> Result<S, String> {
                 if row != 0 {
                     return Err(format!(
                         "CauseSpecificJetRow holds exactly one row; got row {row}"

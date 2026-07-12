@@ -643,10 +643,7 @@ fn add_composed_hessian_pairs<const N: usize, const H: usize, A: Order2AtomChann
             let channel = if inner_live {
                 let inner = first * atom.hessian_at(local_row, local_column);
                 if outer_live {
-                    inner
-                        + second
-                            * atom.gradient_at(local_row)
-                            * atom.gradient_at(local_column)
+                    inner + second * atom.gradient_at(local_row) * atom.gradient_at(local_column)
                 } else {
                     inner
                 }
@@ -1596,11 +1593,7 @@ impl gam_math::jet_tower::RowProgram<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         Ok(self.row_primary_values(row))
     }
 
-    fn eval<S: JetScalar<SLS_ROW_K>>(
-        &self,
-        row: usize,
-        p: &[S; SLS_ROW_K],
-    ) -> Result<S, String> {
+    fn eval<S: JetScalar<SLS_ROW_K>>(&self, row: usize, p: &[S; SLS_ROW_K]) -> Result<S, String> {
         match self.row_nll_inputs_opt(row)? {
             Some((_, kernel)) => sls_row_nll(p, &kernel),
             None => Ok(S::constant(0.0)),
@@ -2131,8 +2124,7 @@ impl SurvivalLocationScaleFamily {
         ];
 
         let mut groups: Vec<SlsHessianPairGroup> = Vec::with_capacity(SLS_HESSIAN_PAIRS.len());
-        for (pair_slot, (left_channel, right_channel)) in
-            SLS_HESSIAN_PAIRS.into_iter().enumerate()
+        for (pair_slot, (left_channel, right_channel)) in SLS_HESSIAN_PAIRS.into_iter().enumerate()
         {
             let (Some(left_design), Some(right_design)) =
                 (design_ids[left_channel], design_ids[right_channel])
@@ -2206,8 +2198,8 @@ impl SurvivalLocationScaleFamily {
                 if left_block != right_block {
                     continue;
                 }
-                let left = designs[group.left_channel]
-                    .expect("active survival-LS pair has a left design");
+                let left =
+                    designs[group.left_channel].expect("active survival-LS pair has a left design");
                 let right = designs[group.right_channel]
                     .expect("active survival-LS pair has a right design");
                 let weights = sanitize_survival_weight_vector(&slots.row(slot).to_owned());
@@ -2242,8 +2234,8 @@ impl SurvivalLocationScaleFamily {
         let products = selected
             .into_par_iter()
             .map(|(slot, group)| {
-                let left = designs[group.left_channel]
-                    .expect("active survival-LS pair has a left design");
+                let left =
+                    designs[group.left_channel].expect("active survival-LS pair has a left design");
                 let right = designs[group.right_channel]
                     .expect("active survival-LS pair has a right design");
                 let weights = slots.row(slot).to_owned();
@@ -2259,8 +2251,7 @@ impl SurvivalLocationScaleFamily {
                     let left_block = group.left_channel / 3;
                     let right_block = group.right_channel / 3;
                     let (left_start, left_end) = (offsets[left_block], offsets[left_block + 1]);
-                    let (right_start, right_end) =
-                        (offsets[right_block], offsets[right_block + 1]);
+                    let (right_start, right_end) = (offsets[right_block], offsets[right_block + 1]);
                     dense
                         .slice_mut(s![left_start..left_end, right_start..right_end])
                         .scaled_add(1.0, &product);

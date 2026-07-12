@@ -184,9 +184,7 @@ impl Graph {
         if self.is_zero(right) {
             return left;
         }
-        if let (Some(left), Some(right)) =
-            (self.constant_value(left), self.constant_value(right))
-        {
+        if let (Some(left), Some(right)) = (self.constant_value(left), self.constant_value(right)) {
             return self.constant(left + right);
         }
         self.intern(Node::Add(left, right))
@@ -199,9 +197,7 @@ impl Graph {
         if left == right {
             return self.constant(0.0);
         }
-        if let (Some(left), Some(right)) =
-            (self.constant_value(left), self.constant_value(right))
-        {
+        if let (Some(left), Some(right)) = (self.constant_value(left), self.constant_value(right)) {
             return self.constant(left - right);
         }
         self.intern(Node::Sub(left, right))
@@ -217,9 +213,7 @@ impl Graph {
         if self.is_one(right) {
             return left;
         }
-        if let (Some(left), Some(right)) =
-            (self.constant_value(left), self.constant_value(right))
-        {
+        if let (Some(left), Some(right)) = (self.constant_value(left), self.constant_value(right)) {
             return self.constant(left * right);
         }
         self.intern(Node::Mul(left, right))
@@ -350,7 +344,10 @@ fn call_name(call: &ExprCall) -> Result<&Ident> {
         ));
     };
     path.path.get_ident().ok_or_else(|| {
-        syn::Error::new_spanned(&call.func, "row_atom unary calls must use a bare function name")
+        syn::Error::new_spanned(
+            &call.func,
+            "row_atom unary calls must use a bare function name",
+        )
     })
 }
 
@@ -462,9 +459,15 @@ fn jet_expression(
             let left = jet_expression(left, primaries, constants)?;
             let right = jet_expression(right, primaries, constants)?;
             match op {
-                BinOp::Add(_) => Ok(quote!({ let left = #left; let right = #right; left.add(&right) })),
-                BinOp::Sub(_) => Ok(quote!({ let left = #left; let right = #right; left.sub(&right) })),
-                BinOp::Mul(_) => Ok(quote!({ let left = #left; let right = #right; left.mul(&right) })),
+                BinOp::Add(_) => {
+                    Ok(quote!({ let left = #left; let right = #right; left.add(&right) }))
+                }
+                BinOp::Sub(_) => {
+                    Ok(quote!({ let left = #left; let right = #right; left.sub(&right) }))
+                }
+                BinOp::Mul(_) => {
+                    Ok(quote!({ let left = #left; let right = #right; left.mul(&right) }))
+                }
                 BinOp::Div(_) => Ok(quote!({
                     let left = #left;
                     let right = #right;

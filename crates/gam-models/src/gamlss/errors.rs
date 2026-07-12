@@ -722,8 +722,7 @@ pub(crate) fn positive_frexp(x: f64) -> (f64, i32) {
         let leading = 63_i32 - fraction.leading_zeros() as i32;
         let shift = 52_i32 - leading;
         let normalized = fraction << shift;
-        let mantissa =
-            f64::from_bits((1023_u64 << 52) | (normalized & ((1_u64 << 52) - 1)));
+        let mantissa = f64::from_bits((1023_u64 << 52) | (normalized & ((1_u64 << 52) - 1)));
         (mantissa, -1022 - shift)
     }
 }
@@ -955,8 +954,7 @@ pub(crate) fn gaussian_diagonal_row_kernel(
     } else {
         scaled_signed_product3(obs_weight, standardized_residual, inv_sigma)
     };
-    let log_sigma_working_weight =
-        scaled_positive_product_quotient(obs_weight, kappa, kappa, 0.5);
+    let log_sigma_working_weight = scaled_positive_product_quotient(obs_weight, kappa, kappa, 0.5);
     if !log_sigma_working_weight.is_finite() || log_sigma_working_weight <= 0.0 {
         return Err(GamlssError::RowGeometryUnrepresentable {
             row,
