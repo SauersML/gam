@@ -4766,6 +4766,9 @@ impl SaeManifoldTerm {
             });
         }
         let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
+        registry
+            .validate_rho(rho_global.view())
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let layout = registry.rho_layout();
         let beta = self.flatten_beta();
         let mut value = 0.0_f64;
@@ -4888,6 +4891,9 @@ impl SaeManifoldTerm {
         // does (registry-local rho at zeros), so a learnable decoder-penalty weight
         // is honoured rather than indexing into an empty view.
         let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
+        registry
+            .validate_rho(rho_global.view())
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let layout = registry.rho_layout();
         let beta = self.flatten_beta();
         let mut value = 0.0_f64;
@@ -4930,6 +4936,9 @@ impl SaeManifoldTerm {
         registry: &AnalyticPenaltyRegistry,
     ) -> Result<f64, ArrowSchurError> {
         let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
+        registry
+            .validate_rho(rho_global.view())
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let layout = registry.rho_layout();
         let mut value = 0.0_f64;
         for (penalty, (rho_slice, _tier, _name)) in registry.penalties.iter().zip(layout.iter()) {

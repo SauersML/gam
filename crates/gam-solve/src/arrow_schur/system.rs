@@ -972,6 +972,9 @@ impl ArrowSchurSystem {
         target_beta: ArrayView1<'_, f64>,
         rho_global: ArrayView1<'_, f64>,
     ) -> Result<(), ArrowSchurError> {
+        registry
+            .validate_rho(rho_global)
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let layout = registry.rho_layout();
         let mut penalty_fingerprints = Vec::new();
         self.cross_row_penalties.clear();

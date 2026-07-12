@@ -1363,22 +1363,24 @@ fn stable_population_moments(data: ArrayView2<'_, f64>) -> Result<StablePopulati
     let location = stable_column_location(data)?;
     let n = data.nrows();
     let p = data.ncols();
+    let inverse_sqrt_count = 1.0 / (n as f64).sqrt();
     let mut covariance = Array2::<f64>::zeros((p, p));
     for row in 0..n {
         for left in 0..p {
-            let left_residual =
-                (data[[row, left]] - location.origin[left]) - location.mean_offset[left];
+            let left_residual = ((data[[row, left]] - location.origin[left])
+                - location.mean_offset[left])
+                * inverse_sqrt_count;
             for right in 0..=left {
-                let right_residual =
-                    (data[[row, right]] - location.origin[right]) - location.mean_offset[right];
+                let right_residual = ((data[[row, right]] - location.origin[right])
+                    - location.mean_offset[right])
+                    * inverse_sqrt_count;
                 covariance[[left, right]] += left_residual * right_residual;
             }
         }
     }
-    let inverse_count = 1.0 / n as f64;
     for left in 0..p {
         for right in 0..=left {
-            let value = covariance[[left, right]] * inverse_count;
+            let value = covariance[[left, right]];
             covariance[[left, right]] = value;
             covariance[[right, left]] = value;
         }
@@ -1502,7 +1504,7 @@ pub fn architecture_matched_random_weight_null(
             let centered = (random_weight[[src, j]] - random_weight_location.origin[j])
                 - random_weight_location.mean_offset[j];
             let scaled = if rw_sd[j] > 0.0 {
-                centered * (obs_sd[j] / rw_sd[j])
+                (centered / rw_sd[j]) * obs_sd[j]
             } else {
                 0.0
             };
@@ -2480,7 +2482,9 @@ fn random_orthogonal(p: usize, seed: u64) -> Result<Array2<f64>, String> {
         }
         let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
         if norm <= f64::MIN_POSITIVE {
-            return random_orthogonal(p, seed ^ ((col as u64 + 1) * 0xD1B5_4A32_D192_ED03));
+            return Err(format!(
+                "random orthogonal construction produced a numerically zero residual at column {col}"
+            ));
         }
         for i in 0..p {
             q[[i, col]] = v[i] / norm;
@@ -2506,18 +2510,35 @@ fn stable_column_sd(
     if location.origin.len() != data.ncols() || location.mean_offset.len() != data.ncols() {
         return Err("column-scale location dimension mismatch".to_string());
     }
-    let mut var = Array1::<f64>::zeros(data.ncols());
+    let mut scales = Array1::<f64>::zeros(data.ncols());
+    let mut scaled_sums = Array1::<f64>::ones(data.ncols());
     for row in data.rows() {
         for j in 0..data.ncols() {
             let d = (row[j] - location.origin[j]) - location.mean_offset[j];
-            var[j] += d * d;
+            let magnitude = d.abs();
+            if magnitude == 0.0 {
+                continue;
+            }
+            if scales[j] < magnitude {
+                let ratio = scales[j] / magnitude;
+                scaled_sums[j] = 1.0 + scaled_sums[j] * ratio * ratio;
+                scales[j] = magnitude;
+            } else {
+                let ratio = magnitude / scales[j];
+                scaled_sums[j] += ratio * ratio;
+            }
         }
     }
-    var.mapv_inplace(|value| (value / data.nrows() as f64).sqrt());
-    if var.iter().any(|value| !value.is_finite()) {
+    let mut sd = Array1::<f64>::zeros(data.ncols());
+    for axis in 0..data.ncols() {
+        if scales[axis] > 0.0 {
+            sd[axis] = scales[axis] * (scaled_sums[axis] / data.nrows() as f64).sqrt();
+        }
+    }
+    if sd.iter().any(|value| !value.is_finite()) {
         return Err("stable column-scale accumulation overflowed".to_string());
     }
-    Ok(var)
+    Ok(sd)
 }
 
 fn centered_column(col: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
@@ -2849,6 +2870,43 @@ mod tests {
                 null_sd[pc]
             );
         }
+    }
+
+    #[test]
+    fn matched_control_scales_survive_large_and_tiny_representable_units() {
+        let observed = ndarray::array![
+            [1.0e300, -1.0e300],
+            [-1.0e300, 1.0e300],
+            [0.5e300, -0.5e300],
+            [-0.5e300, 0.5e300],
+        ];
+        let donor = ndarray::array![
+            [1.0e-300, -1.0e-300],
+            [-1.0e-300, 1.0e-300],
+            [0.5e-300, -0.5e-300],
+            [-0.5e-300, 0.5e-300],
+        ];
+        let observed_location = stable_column_location(observed.view()).unwrap();
+        let observed_sd = stable_column_sd(observed.view(), &observed_location).unwrap();
+        assert!(observed_sd.iter().all(|value| value.is_finite() && *value > 0.0));
+        let matched = architecture_matched_random_weight_null(
+            observed.view(),
+            donor.view(),
+            2262,
+        )
+        .unwrap();
+        assert!(matched.iter().all(|value| value.is_finite()));
+
+        let covariance_scale = 1.0e154_f64;
+        let covariance_input = ndarray::array![
+            [covariance_scale, 0.0],
+            [-covariance_scale, 0.0],
+            [0.5 * covariance_scale, 0.0],
+            [-0.5 * covariance_scale, 0.0],
+        ];
+        let moments = stable_population_moments(covariance_input.view()).unwrap();
+        assert!(moments.covariance[[0, 0]].is_finite());
+        assert!(moments.covariance[[0, 0]] > 0.0);
     }
 
     #[test]

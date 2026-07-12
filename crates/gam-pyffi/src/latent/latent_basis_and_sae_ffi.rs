@@ -1293,6 +1293,7 @@ fn analytic_penalty_value_for_targets(
     target_beta: Option<ArrayView1<'_, f64>>,
 ) -> Result<f64, String> {
     let rho = Array1::<f64>::zeros(registry.total_rho_count());
+    registry.validate_rho(rho.view())?;
     let mut value = 0.0_f64;
     for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())
     {

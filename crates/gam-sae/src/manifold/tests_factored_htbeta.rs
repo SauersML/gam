@@ -195,7 +195,9 @@ pub(crate) fn factored_beta_penalty_probing_matches_projected_dense_curvature() 
     let projection = FrameProjection::new(&term);
     let border_dim = term.factored_border_dim();
     let projected = term.project_dense_penalty_to_factored(dense_sys.hbb.view(), &projection);
-    let direct = term.build_factored_beta_penalty_curvature(&registry, 1.0, &projection);
+    let direct = term
+        .build_factored_beta_penalty_curvature(&registry, 1.0, &projection)
+        .unwrap();
     for row in 0..border_dim {
         for col in 0..border_dim {
             assert_abs_diff_eq!(direct[[row, col]], projected[[row, col]], epsilon = 1.0e-10);

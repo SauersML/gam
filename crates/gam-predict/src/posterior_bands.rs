@@ -459,10 +459,7 @@ mod tests {
             ("mean_lower", mean_lower[0]),
             ("mean_upper", mean_upper[0]),
         ] {
-            assert_eq!(
-                v, exact,
-                "{label} must be exact exp(705)"
-            );
+            assert_eq!(v, exact, "{label} must be exact exp(705)");
             assert!(
                 v > historical_projection * 100.0,
                 "{label} must not regress to the historical exp(700) projection; got {v} vs {historical_projection}"

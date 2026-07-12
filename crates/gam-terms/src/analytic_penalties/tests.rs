@@ -664,65 +664,31 @@ fn ordered_beta_bernoulli_row_weighted_channels_are_one_operator_991() {
 }
 
 #[test]
-fn learnable_weights_stay_finite_at_extreme_rho() {
-    for rho in [1000.0_f64, -1000.0] {
-        let resolved = resolve_learnable_weight(0.7, rho);
-        assert!(
-            resolved.is_finite() && resolved > 0.0,
-            "resolved learnable weight must be finite-positive at rho={rho}: {resolved}"
-        );
+fn learnable_weight_effective_log_domain_is_exact_and_unsaturated() {
+    let base = 1.7_f64;
+    let (lower, upper) = learnable_weight_coordinate_domain(base)
+        .unwrap()
+        .expect("positive base has a coordinate domain");
+    for (coordinate, expected_log_strength) in [
+        (lower, LOG_STRENGTH_MIN),
+        (upper, LOG_STRENGTH_MAX),
+    ] {
+        let resolved = resolve_learnable_weight(base, coordinate).unwrap();
+        assert!((resolved.ln() - expected_log_strength).abs() < 1.0e-12);
     }
+    assert!(resolve_learnable_weight(base, lower - 1.0).is_err());
+    assert!(resolve_learnable_weight(base, upper + 1.0).is_err());
 
-    let softmax = SoftmaxAssignmentSparsityPenalty::new(3, 0.8);
-    let logits = array![0.2_f64, -0.1, 0.4];
-    for rho in [array![1000.0_f64], array![-1000.0_f64]] {
-        let value = softmax.value(logits.view(), rho.view());
-        let grad = softmax.grad_target(logits.view(), rho.view());
-        let diag = softmax
-            .hessian_diag(logits.view(), rho.view())
-            .expect("softmax entropy exposes a diagonal Hessian");
-        assert!(value.is_finite(), "softmax value non-finite at rho={rho:?}");
-        assert!(grad.iter().all(|entry| entry.is_finite()));
-        assert!(diag.iter().all(|entry| entry.is_finite()));
-    }
-
-    let jump =
-        SmoothThresholdPenalty::new(PsiSlice::full(2, Some(1)), array![1.0_f64], 0.5, 0.1).unwrap();
-    let jump_target = array![0.0_f64, 0.2];
-    for rho in [array![1000.0_f64], array![-1000.0_f64]] {
-        let value = jump.value(jump_target.view(), rho.view());
-        let grad = jump.grad_target(jump_target.view(), rho.view());
-        let diag = jump
-            .hessian_diag(jump_target.view(), rho.view())
-            .expect("smooth threshold exposes a diagonal Hessian");
-        assert!(
-            value.is_finite(),
-            "smooth-threshold value non-finite at rho={rho:?}"
-        );
-        assert!(grad.iter().all(|entry| entry.is_finite()));
-        assert!(diag.iter().all(|entry| entry.is_finite()));
-    }
-
-    let target = PsiSlice {
-        range: 0..4,
-        latent_dim: Some(2),
-    };
-    let block_sizes = vec![1usize, 1usize];
-    let p = 2usize;
-    let coact = Array2::<f64>::ones((2, 2));
-    let decoder = DecoderIncoherencePenalty::new(target, block_sizes, p, coact, 0.7, true).unwrap();
-    let beta = Array1::<f64>::zeros(4);
-    for rho in [array![1000.0_f64], array![-1000.0_f64]] {
-        let value = decoder.value(beta.view(), rho.view());
-        let grad = decoder.grad_target(beta.view(), rho.view());
-        let hv = decoder.hvp(beta.view(), rho.view(), beta.view());
-        assert!(
-            value.is_finite(),
-            "DecoderIncoherence value non-finite at rho={rho:?}"
-        );
-        assert!(grad.iter().all(|entry| entry.is_finite()));
-        assert!(hv.iter().all(|entry| entry.is_finite()));
-    }
+    // `base > 1` is the subtle old plateau: raw rho=700 was accepted, while
+    // ln(base)+rho was clipped. The legal upper face is shifted inward exactly.
+    assert!(upper < LOG_STRENGTH_MAX);
+    let penalty = OrderedBetaBernoulliPenalty::new(3, base, 0.8, true);
+    penalty
+        .validate_rho(array![upper].view())
+        .expect("exact effective-strength endpoint is valid");
+    assert!(penalty
+        .validate_rho(array![upper + 1.0e-6].view())
+        .is_err());
 }
 
 #[test]

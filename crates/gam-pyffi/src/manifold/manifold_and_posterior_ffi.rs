@@ -2267,6 +2267,9 @@ fn analytic_penalty_value_grad<'py>(
             registry.total_rho_count()
         )));
     }
+    registry
+        .validate_rho(rho_owned.view())
+        .map_err(py_value_error)?;
 
     let mut value = 0.0_f64;
     let mut grad = Array1::<f64>::zeros(target_view.len());
@@ -2373,6 +2376,9 @@ fn analytic_penalty_hvp<'py>(
             registry.total_rho_count()
         )));
     }
+    registry
+        .validate_rho(rho_owned.view())
+        .map_err(py_value_error)?;
 
     let mut out = Array1::<f64>::zeros(target_view.len());
     for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())

@@ -1105,6 +1105,9 @@ impl InverseLinkKernel for InverseLink {
 /// Central family-aware inverse-link jet dispatch.
 ///
 /// For `BinomialSas` and `BinomialMixture`, required state must be provided.
+/// The standard log link is defined here only on the inclusive solver domain
+/// [`LOG_LINK_SOLVER_ETA_MIN`] through [`LOG_LINK_SOLVER_ETA_MAX`]; inputs
+/// outside it return [`EstimationError::InverseLinkDomainViolation`].
 pub fn inverse_link_jet_for_inverse_link(
     link: &InverseLink,
     eta: f64,
@@ -1121,6 +1124,7 @@ pub fn inverse_link_jet_for_inverse_link(
 /// orders together, so this falls back to the full jet for that branch — the
 /// savings come from the parameterised polynomial links (SAS, beta-logistic,
 /// mixture) and the simple analytic links where d2/d3 are pure waste.
+/// Standard-log inputs obey the same solver domain as the full jet.
 pub fn inverse_link_mu_d1_for_inverse_link(
     link: &InverseLink,
     eta: f64,
@@ -1380,6 +1384,8 @@ pub fn inverse_link_pdfthird_derivative_for_inverse_link(
     //   => f''' = sum_j pi_j f_j'''
     //
     // because the mixture weights `pi_j` are constant with respect to `eta`.
+    // Standard-log inputs outside the declared solver domain return the same
+    // typed refusal as the lower-order jet seams.
     inverse_link_pdf_derivative_for_inverse_link(link, eta, PdfDerivativeOrder::Third)
 }
 
@@ -1388,6 +1394,7 @@ pub fn inverse_link_pdfthird_derivative_for_inverse_link(
 /// Extends `inverse_link_pdfthird_derivative_for_inverse_link` by one order.
 /// Used for the outer REML Hessian Q[v_k, v_l] term in survival models,
 /// specifically the `m1 * u_{abcd}` Arbogast contribution.
+/// Standard-log inputs obey the same solver domain as every lower-order seam.
 pub fn inverse_link_pdffourth_derivative_for_inverse_link(
     link: &InverseLink,
     eta: f64,
@@ -2320,6 +2327,10 @@ mod tests {
             assert!(expected.is_finite() && expected > 0.0);
 
             let jet = inverse_link_jet_for_inverse_link(&link, eta).expect("boundary jet");
+            assert_eq!(
+                LinkFunction::Log.jet(eta).expect("kernel boundary jet"),
+                jet
+            );
             assert_eq!(jet.mu, expected);
             assert_eq!(jet.d1, expected);
             assert_eq!(jet.d2, expected);
@@ -2365,6 +2376,12 @@ mod tests {
                 eta,
             );
             assert_log_link_domain_error(
+                LinkFunction::Log
+                    .jet(eta)
+                    .expect_err("kernel jet must refuse"),
+                eta,
+            );
+            assert_log_link_domain_error(
                 inverse_link_mu_d1_for_inverse_link(&link, eta)
                     .expect_err("mu/d1 seam must refuse"),
                 eta,
@@ -2380,8 +2397,7 @@ mod tests {
                 eta,
             );
             assert_log_link_domain_error(
-                inverse_link_jet_for_family(&spec, eta)
-                    .expect_err("family jet seam must refuse"),
+                inverse_link_jet_for_family(&spec, eta).expect_err("family jet seam must refuse"),
                 eta,
             );
         }
@@ -2391,7 +2407,11 @@ mod tests {
     fn log_link_solver_value_gradient_is_consistent_near_both_domain_edges() {
         let link = InverseLink::Standard(StandardLink::Log);
         let h = 1.0e-5;
-        for eta in [LOG_LINK_SOLVER_ETA_MIN + 1.0, 0.0, LOG_LINK_SOLVER_ETA_MAX - 1.0] {
+        for eta in [
+            LOG_LINK_SOLVER_ETA_MIN + 1.0,
+            0.0,
+            LOG_LINK_SOLVER_ETA_MAX - 1.0,
+        ] {
             let jet = inverse_link_jet_for_inverse_link(&link, eta).expect("interior jet");
             let eta_plus = eta + h;
             let eta_minus = eta - h;

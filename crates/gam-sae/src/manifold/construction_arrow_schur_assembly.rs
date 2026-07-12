@@ -2011,7 +2011,7 @@ impl SaeManifoldTerm {
                         registry,
                         penalty_scale,
                         &frame_projection,
-                    ),
+                    )?,
                     None => Array2::<f64>::zeros((
                         frame_projection.border_dim(),
                         frame_projection.border_dim(),
@@ -2280,8 +2280,11 @@ impl SaeManifoldTerm {
         registry: &AnalyticPenaltyRegistry,
         penalty_scale: f64,
         projection: &FrameProjection,
-    ) -> Array2<f64> {
+    ) -> Result<Array2<f64>, ArrowSchurError> {
         let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
+        registry
+            .validate_rho(rho_global.view())
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let layout = registry.rho_layout();
         let target_beta = self.flatten_beta();
         let mut hbb_c = Array2::<f64>::zeros((projection.border_dim(), projection.border_dim()));
@@ -2314,7 +2317,7 @@ impl SaeManifoldTerm {
                 _ => {}
             }
         }
-        hbb_c
+        Ok(hbb_c)
     }
 
     pub(crate) fn add_factored_beta_penalty_curvature_for_penalty(

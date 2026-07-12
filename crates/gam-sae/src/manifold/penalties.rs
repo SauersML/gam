@@ -1685,6 +1685,9 @@ impl SaeManifoldTerm {
         factored_row_projection: Option<&FrameProjection>,
     ) -> Result<SaeBetaPenaltyAssembly, ArrowSchurError> {
         let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
+        registry
+            .validate_rho(rho_global.view())
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let layout = registry.rho_layout();
         let beta = self.flatten_beta();
         let mut beta_assembly = SaeBetaPenaltyAssembly::default();

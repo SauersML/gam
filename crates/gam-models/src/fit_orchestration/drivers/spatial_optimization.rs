@@ -779,6 +779,9 @@ fn analytic_penalty_objective_contribution(
     }
     let target_t = theta.slice(s![t_start..t_end]);
     let rho = theta.slice(s![rho_start..rho_end]);
+    registry
+        .validate_rho(rho)
+        .map_err(EstimationError::InvalidInput)?;
     let mut cost = 0.0_f64;
     let mut gradient = Array1::<f64>::zeros(theta.len());
     for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(registry.rho_layout()) {
@@ -852,6 +855,9 @@ fn add_analytic_penalty_hessian_to_eval(
     }
     let target_t = theta.slice(s![t_start..t_end]);
     let rho = theta.slice(s![rho_start..rho_end]);
+    registry
+        .validate_rho(rho)
+        .map_err(EstimationError::InvalidInput)?;
     for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())
     {
         let rho_local = rho.slice(s![rho_slice]);
@@ -7165,6 +7171,22 @@ fn try_exact_joint_latent_coord_optimization(
     for axis in rho_dim..rho_dim + latent_flat_dim {
         lower[axis] = -latent_bound;
         upper[axis] = latent_bound;
+    }
+    if let Some(registry) = latent.analytic_penalties.as_ref() {
+        let (domain_lower, domain_upper) = registry
+            .rho_domain_bounds()
+            .map_err(EstimationError::InvalidInput)?;
+        let start = rho_dim + latent_flat_dim;
+        for local in 0..analytic_rho_count {
+            lower[start + local] = lower[start + local].max(domain_lower[local]);
+            upper[start + local] = upper[start + local].min(domain_upper[local]);
+            if lower[start + local] >= upper[start + local] {
+                return Err(EstimationError::InvalidInput(format!(
+                    "analytic-penalty rho domain has no searchable interval at coordinate {local}: lower={}, upper={}",
+                    lower[start + local], upper[start + local]
+                )));
+            }
+        }
     }
 
     struct LatentJointContext<'d> {
