@@ -4937,9 +4937,9 @@ mod reporting_loglikelihood_tests {
 /// dispersion `φ̂` and every SE / interval derived from it.
 #[cfg(test)]
 mod tweedie_exact_series_tests {
-    use super::super::{
-        tweedie_exact_loglik, tweedie_exact_loglik_total_from_eta,
-        tweedie_saddlepoint_loglik_approximation, tweedie_series_loglik,
+    use super::super::tweedie_exact_loglik_total_from_eta;
+    use super::super::tweedie_test_support::{
+        tweedie_exact_loglik, tweedie_saddlepoint_loglik_approximation, tweedie_series_loglik,
     };
     use ndarray::Array1;
     use rand::RngExt;

@@ -1820,20 +1820,6 @@ pub(crate) fn beta_log_normalizer(a: f64, b: f64, sum: f64) -> f64 {
         - log_gamma_stirling_correction(b)
 }
 
-#[inline]
-#[cfg(test)]
-pub(crate) fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
-    if !is_valid_tweedie_power(p) {
-        f64::NAN
-    } else if !valid_tweedie_response(yi) {
-        f64::NAN
-    } else if yi == 0.0 {
-        mui_c.powf(2.0 - p) / (2.0 - p)
-    } else {
-        yi.powf(2.0 - p) / ((1.0 - p) * (2.0 - p)) - yi * mui_c.powf(1.0 - p) / (1.0 - p)
-            + mui_c.powf(2.0 - p) / (2.0 - p)
-    }
-}
 
 /// `ln(2π)` — the per-observation Gaussian / saddlepoint normalizer constant.
 pub(crate) const LN_2PI: f64 = 1.837_877_066_409_345_5;
@@ -2128,35 +2114,6 @@ pub fn evaluate_full_log_likelihood_from_eta(
     Ok(FullLogLikelihoodEvaluation { pointwise, total })
 }
 
-/// Tweedie **saddlepoint** log-density (prior weight `w` ⇒ `φᵢ = φ/w`). Exact at
-/// `y = 0` for `1 < p < 2` (compound-Poisson point mass `exp(−wμ^{2−p}/((2−p)φ)`);
-/// the standard `(2πφᵢ V(y))^{-½} exp(−wd/φ)` approximation for `y > 0`, where
-/// `V(y) = y^p` and `d` is the unit deviance. The exponent matches the REML
-/// kernel's `−w·d/φ` term exactly; this only restores the `−½ln(2πφᵢ y^p)`
-/// prefactor. Homogeneous so `elpd(c·y) − elpd(y) = −n ln c` still holds.
-#[inline]
-#[cfg(test)]
-pub(crate) fn tweedie_saddlepoint_loglik_approximation(
-    yi: f64,
-    mui: f64,
-    w: f64,
-    p: f64,
-    phi: f64,
-) -> f64 {
-    if w <= 0.0 {
-        // Zero prior weight excludes the observation (the y>0 prefactor's
-        // −ln wᵢ would otherwise diverge).
-        return 0.0;
-    }
-    let exponent = -w * tweedie_unit_deviance(yi, mui, p) / phi;
-    if yi <= 0.0 {
-        // Exact point mass at zero (no Jacobian prefactor for a mass atom).
-        exponent
-    } else {
-        // φᵢ = φ/w  ⇒  −½ ln(2π (φ/w) y^p).
-        exponent - 0.5 * (LN_2PI + phi.ln() - w.ln() + p * yi.ln())
-    }
-}
 
 /// Exact compound-Poisson–gamma density in log-mean coordinates. A finite work
 /// certificate is part of the contract: an observation whose dominant series
@@ -2361,44 +2318,7 @@ fn tweedie_exact_series_loglik_from_eta(
     }
 }
 
-/// Exact Tweedie (compound Poisson–gamma, `1 < p < 2`) log-density at one
-/// observation, evaluated by the Jørgensen / Dunn–Smyth infinite-series
-/// representation of the exponential-dispersion normalizer.
-///
-/// Unlike [`tweedie_saddlepoint_loglik_approximation`] — which is asymptotically exact only in
-/// the many-jumps (large-λ) limit and biases the maximum-likelihood variance
-/// power **low** at small/moderate λ (#2105) — this is the exact normalized
-/// density. It is what a profile likelihood of `p` must optimize (mgcv's
-/// `ldTweedie` uses the same series for exactly this reason); the saddlepoint's
-/// missing `O(1/λ)` normalizer correction, integrated across the sample, is what
-/// dragged `p̂` down (e.g. `p̂ ≈ 1.33` on `p = 1.5` data) and thereby inflated the
-/// reported Pearson dispersion `φ̂ = Σw(y−μ)²/μ^p / Σw` by `~13%`.
-///
-/// Density (prior weight `w` scales the dispersion, `φᵢ = φ/w`):
-/// ```text
-/// f(0)   = exp(−λ),                               λ = μ^{2−p} / (φᵢ (2−p))
-/// f(y>0) = Σ_{k≥1} Pois(k; λ) · Gamma(y; kα, γ),  α = (2−p)/(p−1),
-///                                                 γ = φᵢ (p−1) μ^{p−1}.
-/// ```
-/// Test adapter for the production eta-space exact-series oracle.
-#[inline]
-#[cfg(test)]
-pub(crate) fn tweedie_series_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
-    if w == 0.0 {
-        return 0.0;
-    }
-    tweedie_exact_series_loglik_from_eta(0, yi, mui.ln(), w, p, phi.ln())
-        .expect("exact Tweedie test fixture")
-}
 
-/// Exact Tweedie log-density. This never switches to a saddlepoint: callers
-/// selecting an exact likelihood always receive the compound-Poisson–gamma
-/// series named by the API.
-#[inline]
-#[cfg(test)]
-pub(crate) fn tweedie_exact_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
-    tweedie_series_loglik(yi, mui, w, p, phi)
-}
 
 /// Total exact Tweedie log-likelihood over all observations. This is the
 /// objective a maximum-likelihood profile of the variance power `p` optimizes
@@ -2476,3 +2396,91 @@ pub fn tweedie_exact_loglik_total_from_eta(
 // module never estimates a covariance internally.
 //
 // Composition with the existing signed-Gram API:
+
+#[cfg(test)]
+pub(crate) mod tweedie_test_support {
+    //! Test-only Tweedie density oracles. They live in a `#[cfg(test)]`
+    //! module (scanner rule: no `#[cfg(test)]` on bare src items) and are
+    //! consumed by `pirls::tests::tweedie_exact_series_tests`.
+    use super::*;
+
+    #[inline]
+    pub(crate) fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
+        if !is_valid_tweedie_power(p) {
+            f64::NAN
+        } else if !valid_tweedie_response(yi) {
+            f64::NAN
+        } else if yi == 0.0 {
+            mui_c.powf(2.0 - p) / (2.0 - p)
+        } else {
+            yi.powf(2.0 - p) / ((1.0 - p) * (2.0 - p)) - yi * mui_c.powf(1.0 - p) / (1.0 - p)
+                + mui_c.powf(2.0 - p) / (2.0 - p)
+        }
+    }
+
+    /// Tweedie **saddlepoint** log-density (prior weight `w` ⇒ `φᵢ = φ/w`). Exact at
+    /// `y = 0` for `1 < p < 2` (compound-Poisson point mass `exp(−wμ^{2−p}/((2−p)φ)`);
+    /// the standard `(2πφᵢ V(y))^{-½} exp(−wd/φ)` approximation for `y > 0`, where
+    /// `V(y) = y^p` and `d` is the unit deviance. The exponent matches the REML
+    /// kernel's `−w·d/φ` term exactly; this only restores the `−½ln(2πφᵢ y^p)`
+    /// prefactor. Homogeneous so `elpd(c·y) − elpd(y) = −n ln c` still holds.
+    #[inline]
+    pub(crate) fn tweedie_saddlepoint_loglik_approximation(
+        yi: f64,
+        mui: f64,
+        w: f64,
+        p: f64,
+        phi: f64,
+    ) -> f64 {
+        if w <= 0.0 {
+            // Zero prior weight excludes the observation (the y>0 prefactor's
+            // −ln wᵢ would otherwise diverge).
+            return 0.0;
+        }
+        let exponent = -w * tweedie_unit_deviance(yi, mui, p) / phi;
+        if yi <= 0.0 {
+            // Exact point mass at zero (no Jacobian prefactor for a mass atom).
+            exponent
+        } else {
+            // φᵢ = φ/w  ⇒  −½ ln(2π (φ/w) y^p).
+            exponent - 0.5 * (LN_2PI + phi.ln() - w.ln() + p * yi.ln())
+        }
+    }
+
+    /// Exact Tweedie (compound Poisson–gamma, `1 < p < 2`) log-density at one
+    /// observation, evaluated by the Jørgensen / Dunn–Smyth infinite-series
+    /// representation of the exponential-dispersion normalizer.
+    ///
+    /// Unlike [`tweedie_saddlepoint_loglik_approximation`] — which is asymptotically exact only in
+    /// the many-jumps (large-λ) limit and biases the maximum-likelihood variance
+    /// power **low** at small/moderate λ (#2105) — this is the exact normalized
+    /// density. It is what a profile likelihood of `p` must optimize (mgcv's
+    /// `ldTweedie` uses the same series for exactly this reason); the saddlepoint's
+    /// missing `O(1/λ)` normalizer correction, integrated across the sample, is what
+    /// dragged `p̂` down (e.g. `p̂ ≈ 1.33` on `p = 1.5` data) and thereby inflated the
+    /// reported Pearson dispersion `φ̂ = Σw(y−μ)²/μ^p / Σw` by `~13%`.
+    ///
+    /// Density (prior weight `w` scales the dispersion, `φᵢ = φ/w`):
+    /// ```text
+    /// f(0)   = exp(−λ),                               λ = μ^{2−p} / (φᵢ (2−p))
+    /// f(y>0) = Σ_{k≥1} Pois(k; λ) · Gamma(y; kα, γ),  α = (2−p)/(p−1),
+    ///                                                 γ = φᵢ (p−1) μ^{p−1}.
+    /// ```
+    /// Test adapter for the production eta-space exact-series oracle.
+    #[inline]
+    pub(crate) fn tweedie_series_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
+        if w == 0.0 {
+            return 0.0;
+        }
+        tweedie_exact_series_loglik_from_eta(0, yi, mui.ln(), w, p, phi.ln())
+            .expect("exact Tweedie test fixture")
+    }
+
+    /// Exact Tweedie log-density. This never switches to a saddlepoint: callers
+    /// selecting an exact likelihood always receive the compound-Poisson–gamma
+    /// series named by the API.
+    #[inline]
+    pub(crate) fn tweedie_exact_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
+        tweedie_series_loglik(yi, mui, w, p, phi)
+    }
+}

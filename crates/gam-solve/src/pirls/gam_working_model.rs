@@ -732,7 +732,6 @@ impl<'a> GamWorkingModel<'a> {
         let deviance = self.likelihood.loglik_deviance(
             self.y,
             &self.workspace.eta_buf,
-            &self.lastmu,
             &self.link_kind,
             self.priorweights,
         )?;
@@ -1118,7 +1117,6 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let deviance = self.likelihood.loglik_deviance(
             self.y,
             &self.workspace.eta_buf,
-            &self.lastmu,
             &self.link_kind,
             self.priorweights,
         )?;

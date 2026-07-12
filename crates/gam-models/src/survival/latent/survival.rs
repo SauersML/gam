@@ -161,7 +161,7 @@ fn checked_weighted_row_value(
     row: usize,
     quantity: &str,
 ) -> Result<f64, String> {
-    debug_assert!(weight.is_finite() && weight > 0.0);
+    assert!(weight.is_finite() && weight > 0.0);
     if !value.is_finite() {
         return Err(format!(
             "latent likelihood row {} has non-finite unweighted {quantity}: {value:?}",

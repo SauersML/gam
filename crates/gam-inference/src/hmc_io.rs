@@ -458,67 +458,7 @@ thread_local! {
     static NUTS_RESIDUAL_SCRATCH: RefCell<Array1<f64>> = RefCell::new(Array1::zeros(0));
 }
 
-/// Whitened log-posterior target with analytical gradients.
-///
-/// Uses Arc for shared data to prevent memory explosion when cloned for chains.
-/// Uses faer for numerically stable Cholesky decomposition.
-/// Family mode for NUTS log-likelihood computation.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NutsFamily {
-    Gaussian,
-    BinomialLogit,
-    BinomialProbit,
-    BinomialCLogLog,
-    PoissonLog,
-    TweedieLog,
-    NegativeBinomialLog,
-    GammaLog,
-}
 
-#[cfg(test)]
-impl NutsFamily {
-    #[inline]
-    fn likelihood_spec(self) -> LikelihoodSpec {
-        match self {
-            Self::Gaussian => LikelihoodSpec {
-                response: ResponseFamily::Gaussian,
-                link: InverseLink::Standard(StandardLink::Identity),
-            },
-            Self::BinomialLogit => LikelihoodSpec {
-                response: ResponseFamily::Binomial,
-                link: InverseLink::Standard(StandardLink::Logit),
-            },
-            Self::BinomialProbit => LikelihoodSpec {
-                response: ResponseFamily::Binomial,
-                link: InverseLink::Standard(StandardLink::Probit),
-            },
-            Self::BinomialCLogLog => LikelihoodSpec {
-                response: ResponseFamily::Binomial,
-                link: InverseLink::Standard(StandardLink::CLogLog),
-            },
-            Self::PoissonLog => LikelihoodSpec {
-                response: ResponseFamily::Poisson,
-                link: InverseLink::Standard(StandardLink::Log),
-            },
-            Self::TweedieLog => LikelihoodSpec {
-                response: ResponseFamily::Tweedie { p: 1.5 },
-                link: InverseLink::Standard(StandardLink::Log),
-            },
-            Self::NegativeBinomialLog => LikelihoodSpec {
-                response: ResponseFamily::NegativeBinomial {
-                    theta: 1.0,
-                    theta_fixed: false,
-                },
-                link: InverseLink::Standard(StandardLink::Log),
-            },
-            Self::GammaLog => LikelihoodSpec {
-                response: ResponseFamily::Gamma,
-                link: InverseLink::Standard(StandardLink::Log),
-            },
-        }
-    }
-}
 
 /// Resolve and certify the scale metadata consumed by an HMC target.
 ///
@@ -1362,10 +1302,71 @@ fn joint_family_logp_and_grad(
 
 #[cfg(test)]
 mod tests {
+
+    /// Whitened log-posterior target with analytical gradients.
+    ///
+    /// Uses Arc for shared data to prevent memory explosion when cloned for chains.
+    /// Uses faer for numerically stable Cholesky decomposition.
+    /// Family mode for NUTS log-likelihood computation.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum NutsFamily {
+        Gaussian,
+        BinomialLogit,
+        BinomialProbit,
+        BinomialCLogLog,
+        PoissonLog,
+        TweedieLog,
+        NegativeBinomialLog,
+        GammaLog,
+    }
+
+    impl NutsFamily {
+        #[inline]
+        fn likelihood_spec(self) -> LikelihoodSpec {
+            match self {
+                Self::Gaussian => LikelihoodSpec {
+                    response: ResponseFamily::Gaussian,
+                    link: InverseLink::Standard(StandardLink::Identity),
+                },
+                Self::BinomialLogit => LikelihoodSpec {
+                    response: ResponseFamily::Binomial,
+                    link: InverseLink::Standard(StandardLink::Logit),
+                },
+                Self::BinomialProbit => LikelihoodSpec {
+                    response: ResponseFamily::Binomial,
+                    link: InverseLink::Standard(StandardLink::Probit),
+                },
+                Self::BinomialCLogLog => LikelihoodSpec {
+                    response: ResponseFamily::Binomial,
+                    link: InverseLink::Standard(StandardLink::CLogLog),
+                },
+                Self::PoissonLog => LikelihoodSpec {
+                    response: ResponseFamily::Poisson,
+                    link: InverseLink::Standard(StandardLink::Log),
+                },
+                Self::TweedieLog => LikelihoodSpec {
+                    response: ResponseFamily::Tweedie { p: 1.5 },
+                    link: InverseLink::Standard(StandardLink::Log),
+                },
+                Self::NegativeBinomialLog => LikelihoodSpec {
+                    response: ResponseFamily::NegativeBinomial {
+                        theta: 1.0,
+                        theta_fixed: false,
+                    },
+                    link: InverseLink::Standard(StandardLink::Log),
+                },
+                Self::GammaLog => LikelihoodSpec {
+                    response: ResponseFamily::Gamma,
+                    link: InverseLink::Standard(StandardLink::Log),
+                },
+            }
+        }
+    }
+
     use super::{
         FamilyNutsInputs, GlmFlatInputs, JointBetaRhoInputs, JointBetaRhoPosterior,
         LinkWiggleFamilyParams, LinkWigglePosterior, LinkWiggleSplineArtifacts, NutsConfig,
-        NutsFamily, NutsPosterior, NutsResult, SharedData, exact_glm_logp_and_grad_into,
+        NutsPosterior, NutsResult, SharedData, exact_glm_logp_and_grad_into,
         firth_jeffreys_logp_and_grad, joint_family_logp_and_grad,
         laplace_directional_cubic_diagnostic, laplace_skewness_threshold,
         laplace_trustworthiness_from_skewness, run_joint_beta_rho_sampling,

@@ -642,7 +642,12 @@ pub fn build_framed_resident_evidence_matvec(
 ) -> Option<crate::arrow_schur::GpuSchurMatvec> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (sys, ridge_t, ridge_beta, apply_budget);
+        // No CUDA runtime exists off Linux. Refuse the same degenerate
+        // requests the Linux path would (mirroring the stubs above), then
+        // report that no resident evidence matvec is available.
+        if sys.k == 0 || !ridge_t.is_finite() || !ridge_beta.is_finite() || apply_budget == 0 {
+            return None;
+        }
         None
     }
     #[cfg(target_os = "linux")]

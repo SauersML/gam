@@ -568,7 +568,7 @@ fn latent_prior_score_and_aux_state_for_t(
         aux_strength_state = Some(stats.strength);
     }
     if let Some(precisions) = dim_selection_precision {
-        debug_assert_eq!(latent_dim, precisions.log.len());
+        assert_eq!(latent_dim, precisions.log.len());
         latent_prior_score += precisions.prior_score(t_mat)?;
     }
     Ok((latent_prior_score, aux_strength_state))

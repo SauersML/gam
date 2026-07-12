@@ -267,7 +267,6 @@ pub(crate) trait WorkingLikelihood {
         &self,
         y: ArrayView1<f64>,
         eta: &Array1<f64>,
-        _mu: &Array1<f64>,
         inverse_link: &InverseLink,
         priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError>;
@@ -437,7 +436,6 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
         &self,
         y: ArrayView1<f64>,
         eta: &Array1<f64>,
-        _mu: &Array1<f64>,
         inverse_link: &InverseLink,
         priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError> {
