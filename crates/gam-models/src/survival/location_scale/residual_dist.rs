@@ -1,5 +1,5 @@
 use super::*;
-use gam_math::probability::normal_logcdf_derivatives;
+use gam_math::probability::{normal_cdf, normal_logcdf_derivatives};
 
 // Layer 2 defense (canonical implementation lives beside the σ-link in
 // `gam_model_kernels::sigma_link` so the fit engine and the prediction
@@ -16,7 +16,7 @@ pub(crate) fn probit_survival_value(eta: f64) -> f64 {
     } else if eta == f64::NEG_INFINITY {
         1.0
     } else {
-        0.5 * erfc(eta / std::f64::consts::SQRT_2)
+        normal_cdf(-eta)
     }
 }
 

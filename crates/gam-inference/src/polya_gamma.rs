@@ -79,7 +79,6 @@ impl PolyaGamma {
 mod tests {
     use super::*;
     use rand::{SeedableRng, rngs::StdRng};
-    use statrs::function::erf::erfc;
 
     fn empirical_mean(c: f64, n: usize, seed: u64) -> f64 {
         let pg = PolyaGamma::new();
@@ -158,7 +157,7 @@ mod tests {
         if x <= 1.0 / (2.0 * std::f64::consts::PI) {
             loop {
                 let k = n as f64 + 0.5;
-                let term = 2.0 * erfc(k / (2.0 * x).sqrt());
+                let term = 4.0 * gam_math::probability::normal_cdf(-k / (2.0 * x).sqrt());
                 sum += if n.is_multiple_of(2) { term } else { -term };
                 if term <= f64::EPSILON {
                     break;

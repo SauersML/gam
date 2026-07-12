@@ -184,7 +184,7 @@ pub struct ScalarSkovgaardResult {
 
 /// Standard normal CDF `Φ`.
 fn normal_cdf(z: f64) -> f64 {
-    0.5 * statrs::function::erf::erfc(-z / std::f64::consts::SQRT_2)
+    gam_math::probability::normal_cdf(z)
 }
 
 /// Two-sided normal-tail p-value `2·Φ(−|z|)`.

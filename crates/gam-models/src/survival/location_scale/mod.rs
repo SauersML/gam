@@ -122,8 +122,6 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterato
 
 use rayon::slice::ParallelSliceMut;
 
-use statrs::function::erf::erfc;
-
 use std::sync::Arc;
 
 mod numeric_guards;

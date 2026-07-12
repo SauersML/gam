@@ -6177,7 +6177,7 @@ fn gumbel_cdf_negative_tail_should_match_expm1_form() {
 #[test]
 fn probit_survival_helper_matches_upper_tail_probability() {
     let eta = 10.0_f64;
-    let stable_survival = 0.5 * statrs::function::erf::erfc(eta / std::f64::consts::SQRT_2);
+    let stable_survival = 0.5 * libm::erfc(eta / std::f64::consts::SQRT_2);
     assert!(stable_survival > 0.0);
     let helper = inverse_link_survival_probvalue(&InverseLink::Standard(StandardLink::Probit), eta);
     assert!(

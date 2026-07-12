@@ -619,8 +619,10 @@ impl SurvivalLocationScaleFamily {
         };
 
         let (h_time, h_tt, h_ll) = if use_outer_parallel {
-            let ((h_time, h_tt), h_ll) =
-                rayon::join(|| rayon::join(assemble_h_time, assemble_h_tt), assemble_h_ll);
+            let ((h_time, h_tt), h_ll) = rayon::join(
+                || rayon::join(assemble_h_time, assemble_h_tt),
+                assemble_h_ll,
+            );
             (h_time?, h_tt?, h_ll?)
         } else {
             (assemble_h_time()?, assemble_h_tt()?, assemble_h_ll()?)

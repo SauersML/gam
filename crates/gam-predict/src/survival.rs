@@ -42,7 +42,7 @@ fn survival_tail_value_from_failure_jet(
             } else if eta == f64::NEG_INFINITY {
                 1.0
             } else {
-                0.5 * statrs::function::erf::erfc(eta / std::f64::consts::SQRT_2)
+                gam_math::probability::normal_cdf(-eta)
             }
         }
         InverseLink::Standard(gam_spec::StandardLink::Logit) => 1.0 / (1.0 + eta.exp()),
