@@ -2162,7 +2162,7 @@ mod tests {
     /// dense `Tower4<2>` evaluation of the same row expression.
     #[test]
     pub(crate) fn order2_matches_dense_tower_all_channels() {
-        use gam_math::jet_scalar::{JetScalar, Order2};
+        use gam_math::jet_scalar::Order2;
         use gam_math::jet_tower::Tower4;
 
         fn check_o2_vs_tower4(label: &str, o2: Order2<2>, t4: Tower4<2>) {
@@ -2243,7 +2243,7 @@ mod tests {
     /// observable float.
     #[test]
     pub(crate) fn pruned_disp_towers_bit_identical_to_full_order2() {
-        use gam_math::jet_scalar::{JetScalar, Order2};
+        use gam_math::jet_scalar::Order2;
 
         // Deterministic LCG so the sweep is reproducible without an rng dep.
         let mut state: u64 = 0x9E3779B97F4A7C15;

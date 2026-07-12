@@ -2135,7 +2135,6 @@ mod gram_inner_contraction_tests {
     use crate::custom_family::{
         JointHessianSource, exact_newton_joint_hessian_source_from_workspace,
     };
-    use gam_math::nested_dual::JetField;
     use gam_problem::ProjectedFactorCache;
     use ndarray::Array2;
 
