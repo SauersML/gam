@@ -108,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         promote_from_residual: false,
         run_structure_search: false,
         run_outer_rho_search: false,
-        structured_residual_passes: None,
+        structured_residual_passes: 0,
         cancel: None,
     })?;
 

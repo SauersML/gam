@@ -1407,7 +1407,7 @@ fn production_circle_coords_at_seed(
         // Unbundled direct path: seed -> single certified fit on the iid
         // likelihood (no structured-residual re-whitening), the deterministic
         // "exactly one fit" contract.
-        structured_residual_passes: Some(0),
+        structured_residual_passes: 0,
         cancel: None,
     })
     .expect("production circle fit");

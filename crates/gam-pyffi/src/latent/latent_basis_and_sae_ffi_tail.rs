@@ -36,8 +36,8 @@ fn sae_manifold_fit_minimal<'py>(
     native_ard_enabled: bool,
     // WP-D output-Fisher shard (#980). `(n, p, r)` f64 factors; presence activates
     // `RowMetric::OutputFisher`. This is the entry point the high-level Python
-    // `sae_manifold_fit` facade routes through, so it carries the shard the same
-    // magic-by-default way as the precomputed-basis `sae_manifold_fit`.
+    // `sae_manifold_fit` facade routes through, so it carries the explicit shard
+    // exactly as the precomputed-basis `sae_manifold_fit` does.
     fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
     fisher_mass_residual: Option<PyReadonlyArray1<'py, f64>>,
     // Harvest provenance tag (#980): same-position `"output_fisher"` (default) or
@@ -52,7 +52,7 @@ fn sae_manifold_fit_minimal<'py>(
     promote_from_residual: bool,
     // Bundled-pipeline stage toggles (#2267) forwarded to `sae_manifold_fit_inner`.
     run_structure_search: bool,
-    structured_residual_passes: Option<usize>,
+    structured_residual_passes: usize,
 ) -> PyResult<Py<PyDict>> {
     // Convert borrowed Python arrays into the typed library seed request.
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
@@ -347,9 +347,9 @@ fn public_fit_penalties(
     fisher_provenance=None,
     row_loss_weights=None,
     separation_barrier_strength_override=None,
-    promote_from_residual=true,
-    run_structure_search=true,
-    structured_residual_passes=None,
+    promote_from_residual=false,
+    run_structure_search=false,
+    structured_residual_passes=0,
 ))]
 // No #[allow(clippy::too_many_arguments)]: this is the flat `#[pyfunction]`
 // kwarg surface Python calls by name (mirroring `sae_manifold_fit_minimal`
@@ -393,7 +393,7 @@ fn sae_manifold_fit_model<'py>(
     separation_barrier_strength_override: Option<f64>,
     promote_from_residual: bool,
     run_structure_search: bool,
-    structured_residual_passes: Option<usize>,
+    structured_residual_passes: usize,
 ) -> PyResult<Py<crate::ManifoldSaeCore>> {
     if k_atoms == 0 {
         return Err(py_value_error(
@@ -886,7 +886,7 @@ fn sae_manifold_predict_oos<'py>(
     ridge_ext_coord = 1.0e-6,
     ridge_beta = 1.0e-6,
     isometry_pin_active = false,
-    run_structure_search = true,
+    run_structure_search = false,
     analytic_penalties = None,
     fisher_factors = None,
     fisher_mass_residual = None,

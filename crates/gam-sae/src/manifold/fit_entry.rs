@@ -51,9 +51,6 @@ use super::{
 
 /// Hard cap on evidence-certified #2021 whitened-residual refit passes.
 pub const STRUCTURED_RESIDUAL_PASSES_MAX: usize = 4;
-/// Canonical structured-residual alternation budget. The iid-only A/B mode was
-/// removed; every production fit starts with this evidence-refined budget.
-pub const STRUCTURED_RESIDUAL_PASSES_DEFAULT: usize = 2;
 
 /// Absolute precision floor on the RELATIVE post-dictionary residual energy
 /// `‖Z − Ẑ‖²_F / ‖Z‖²_F` below which the structured-residual pass is skipped and
@@ -387,14 +384,10 @@ pub struct SaeFitRequest {
     pub promote_from_residual: bool,
     pub run_structure_search: bool,
     pub run_outer_rho_search: bool,
-    /// Number of structured-residual whitening passes (each installs a NEW
-    /// row-metric likelihood and re-runs the entire outer ρ search). `None` =
-    /// the historical default ([`STRUCTURED_RESIDUAL_PASSES_DEFAULT`] = 2);
-    /// `Some(0)` = the UNBUNDLED direct path: seed → single certified fit on
-    /// the iid likelihood. Together with `promote_from_residual = false` and
-    /// `run_structure_search = false` this is the stage-5 "which path did my
-    /// fit take" answer: exactly one.
-    pub structured_residual_passes: Option<usize>,
+    /// Explicit number of structured-residual whitening passes. Each pass
+    /// installs a new row-metric likelihood and re-runs the full outer search;
+    /// zero is the direct seed → single certified fit path.
+    pub structured_residual_passes: usize,
     pub cancel: Option<Arc<AtomicBool>>,
 }
 
@@ -672,8 +665,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     // γ_p = (p+1)/(N+1) ∈ (0,1) trusts the new estimate more each pass while
     // damping the early jump off the iid fit (γ is never 0 or 1, so every pass
     // builds a genuine WhitenedStructured blend).
-    let structured_passes =
-        structured_residual_passes.unwrap_or(STRUCTURED_RESIDUAL_PASSES_DEFAULT);
+    let structured_passes = structured_residual_passes;
     let mut structured_residual_diagnostics: Vec<StructuredResidualPassDiagnostic> = Vec::new();
     if structured_passes > 0 && metric_provenance == "Euclidean" {
         let mut prev_model: Option<StructuredResidualModel> = None;
@@ -709,9 +701,8 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
         // rank `r`. It is derived here and used identically by the producer-side
         // candidate gate and the nursery lineage-dedup below.
         //
-        // `promote_from_residual` is the typed caller flag (default TRUE, #2239:
-        // magic-by-default — the evidence certificate above, not the flag, is the
-        // real gate). `false` pins the historical whitening-without-growth path.
+        // `promote_from_residual` is an explicit typed stage switch. Evidence
+        // gates candidates inside the stage; a direct fit never enters it.
         let mut nursery: Vec<(Array1<f64>, usize)> = Vec::new();
         let mut total_passes = structured_passes;
         let mut pass = 0usize;
@@ -1208,9 +1199,8 @@ pub struct SaeCertifyRequest {
     pub isometry_pin_active: bool,
     pub metric_provenance: &'static str,
     /// #977/#997 evidence-guarded structure search around the installed
-    /// state. Default TRUE at the binding boundary (magic-by-default, the
-    /// same policy the fit entry applies): certification is still a genuine
-    /// dictionary-discovery boundary, not a pass-through of the caller's K.
+    /// state. This is explicit opt-in: evaluation-only certification preserves
+    /// the dictionary the external trainer supplied unless asked to search.
     pub run_structure_search: bool,
     /// No outer search and no inner solve run on this path, so nothing polls
     /// this flag; kept only for typed symmetry with [`SaeFitRequest::cancel`].

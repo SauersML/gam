@@ -1857,13 +1857,10 @@ fn sae_manifold_fit_inner<'py>(
     // Per-fit separation barrier. `None` selects the native data-derived default.
     separation_barrier_strength_override: Option<f64>,
     promote_from_residual: bool,
-    // Bundled-pipeline stage toggles (#2267). `run_structure_search=false` takes the
-    // unbundled direct fit path (no topology race growing K); `structured_residual_passes`
-    // overrides the default number of structured-whitening residual passes
-    // (`None` = the native default of 2, `Some(0)` disables them). A fixed-K sweep
-    // wants exactly `k` atoms and none of these re-searches — see the example.
+    // Explicit composable stages (#2267). The public default is the direct fit;
+    // structure search and each structured-residual likelihood refit are opt-in.
     run_structure_search: bool,
-    structured_residual_passes: Option<usize>,
+    structured_residual_passes: usize,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(serde_json_error_to_pyerr)?),

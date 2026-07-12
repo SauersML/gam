@@ -183,7 +183,7 @@ mod tests {
             promote_from_residual: false,
             run_structure_search: false,
             run_outer_rho_search: false,
-            structured_residual_passes: None,
+            structured_residual_passes: 0,
             cancel: None,
         })
         .expect("primary fit runs")
@@ -371,7 +371,7 @@ mod tests {
             // Isolate the pass-0 iid outer search from the structured-residual
             // alternation (which is intentionally non-identifiable on the clean
             // circle — see this module's fixture note).
-            structured_residual_passes: None,
+            structured_residual_passes: 0,
             cancel: None,
         })
     }
