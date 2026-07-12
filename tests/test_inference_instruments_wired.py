@@ -80,7 +80,9 @@ def test_shape_controlled_census_replays_the_exact_full_pipeline() -> None:
 
 
 def test_shape_controlled_census_rejects_ambiguous_seeds_and_bad_data() -> None:
-    pipeline = lambda matrix, seed: (matrix.shape, seed)
+    def pipeline(matrix: np.ndarray, seed: int) -> tuple[tuple[int, ...], int]:
+        return matrix.shape, seed
+
     with pytest.raises(TypeError, match="control_seed"):
         gamfit.run_shape_controlled_census(np.ones((4, 2)), pipeline, control_seed=True)
     with pytest.raises(ValueError, match="pipeline_seed"):

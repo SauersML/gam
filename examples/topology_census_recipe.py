@@ -1,17 +1,17 @@
 #!/usr/bin/env python
 """Run an honest unsupervised topology census with full-pipeline controls.
 
-The runner calls one user-supplied census function three times: once on the
-observed activation matrix, once on a per-dimension shuffle, and once on a
-covariance-matched Gaussian.  The callable and its seed are identical across
-all three runs.  Only the input matrix changes, so SAE training,
-co-activation grouping, projection, and shape adjudication all remain inside
-the controlled path.
+The runner delegates to ``gamfit.run_shape_controlled_census``, which calls one
+user-supplied census function three times: once on the observed activation
+matrix, once on a per-dimension shuffle, and once on a covariance-matched
+Gaussian. The callable and its seed are identical across all three runs. Only
+the input matrix changes, so SAE training, co-activation grouping, projection,
+and shape adjudication all remain inside the controlled path.
 
 The pipeline callable is supplied as ``MODULE:CALLABLE`` and must have this
 contract::
 
-    def run_census(activations: np.ndarray, *, seed: int) -> Mapping[str, object]:
+    def run_census(activations: np.ndarray, seed: int) -> Mapping[str, object]:
         # Construct every fitted object from scratch on each invocation.
         ...
         return {
@@ -23,11 +23,15 @@ contract::
 
 ``n_circular_wins`` uses the production circular-class verdict: total stacking
 mass of the smooth-circle and ring-of-clusters candidates exceeds total
-non-circular mass.  It is not a count of individual ``winner == "circle"``
-labels.  A ``ring_clusters_k{k}`` winner is already owned by the circular
-class.  The centroid ordering test remains useful as an independent ordering
-diagnostic, especially when a free ``mixture_k{k}`` wins, but it no longer
-"rescues" cyclic clusters from a shape race that omitted their density class.
+non-circular mass. It is not a count of individual
+``reporting_winner == "circle"`` labels. A
+``winner_class == "ring_clusters"`` verdict is already owned by the
+circular class; ``ring_clusters_reporting_k`` names its all-data diagnostic
+fit, while ``ring_clusters_fold_selected_k`` records the leakage-free
+outer-fold orders. The centroid ordering test remains useful as an independent
+ordering diagnostic, especially when the free ``mixture`` class wins, but it
+no longer "rescues" cyclic clusters from a race that omitted their density
+class.
 
 Example::
 
@@ -60,6 +64,7 @@ import argparse
 import importlib
 import json
 import math
+import numbers
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -67,8 +72,7 @@ from typing import Any
 import numpy as np
 
 
-CONTROL_KINDS = ("per_dimension_shuffle", "covariance_matched_gaussian")
-Pipeline = Callable[..., Mapping[str, object]]
+Pipeline = Callable[[np.ndarray, int], Mapping[str, object]]
 
 
 def _nonnegative_integer(value: object, field: str) -> int:
@@ -108,7 +112,14 @@ def _validate_pipeline_summary(payload: object, run_name: str) -> dict[str, obje
             f"from only {adjudicated} adjudications"
         )
 
-    mean_l0 = float(payload["dictionary_mean_l0"])
+    mean_l0_value = payload["dictionary_mean_l0"]
+    if isinstance(mean_l0_value, (bool, np.bool_)) or not isinstance(
+        mean_l0_value, numbers.Real
+    ):
+        raise TypeError(
+            f"pipeline field 'dictionary_mean_l0' must be a real number; got {mean_l0_value!r}"
+        )
+    mean_l0 = float(mean_l0_value)
     if not math.isfinite(mean_l0) or mean_l0 < 0.0:
         raise ValueError(
             f"pipeline run {run_name!r} returned invalid dictionary_mean_l0={mean_l0}"
@@ -123,94 +134,33 @@ def _validate_pipeline_summary(payload: object, run_name: str) -> dict[str, obje
     }
 
 
-def _run_pipeline(
-    pipeline: Pipeline,
-    activations: np.ndarray,
-    *,
-    run_name: str,
-    seed: int,
-) -> dict[str, object]:
-    readonly = activations.view()
-    readonly.setflags(write=False)
-    payload = pipeline(readonly, seed=seed)
-    return _validate_pipeline_summary(payload, run_name)
-
-
-def run_full_pipeline_controls(
-    activations: np.ndarray,
-    pipeline: Pipeline,
-    *,
-    pipeline_seed: int = 11,
-    control_seed: int = 17,
-) -> dict[str, object]:
-    """Run the same complete census on observed data and both matched controls.
-
-    ``pipeline`` receives the same keyword arguments on every invocation and
-    must create a fresh fit from the supplied matrix.  The returned report
-    preserves the two control rates separately and also reports their pooled
-    binomial rate; unequal control denominators are never silently averaged.
-    """
-    if isinstance(pipeline_seed, bool) or not isinstance(pipeline_seed, int):
-        raise TypeError("pipeline_seed must be an integer")
-    if isinstance(control_seed, bool) or not isinstance(control_seed, int):
-        raise TypeError("control_seed must be an integer")
-    if not callable(pipeline):
-        raise TypeError("pipeline must be callable")
-
-    matrix = np.asarray(activations, dtype=np.float64, order="C")
-    if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[1] == 0:
-        raise ValueError(f"activations must be a nonempty two-dimensional matrix; got {matrix.shape}")
-    if not matrix.flags.c_contiguous:
-        matrix = np.ascontiguousarray(matrix)
-    if not np.isfinite(matrix).all():
-        raise ValueError("activations must contain only finite values")
-
-    observed = _run_pipeline(
-        pipeline,
-        matrix,
-        run_name="observed",
-        seed=pipeline_seed,
-    )
-
-    try:
-        import gamfit
-    except ImportError as exc:
-        raise RuntimeError(
-            "full-pipeline controls require a gamfit build exposing shape_matched_control"
-        ) from exc
-
-    controls: dict[str, dict[str, object]] = {}
-    for kind in CONTROL_KINDS:
-        controlled = np.asarray(
-            gamfit.shape_matched_control(matrix, kind=kind, seed=control_seed),
-            dtype=np.float64,
-            order="C",
-        )
-        if controlled.shape != matrix.shape or not np.isfinite(controlled).all():
-            raise RuntimeError(
-                f"shape_matched_control returned invalid {kind!r} matrix {controlled.shape}"
-            )
-        controls[kind] = _run_pipeline(
-            pipeline,
-            controlled,
-            run_name=kind,
-            seed=pipeline_seed,
-        )
-        del controlled
-
+def _validated_control_report(controlled_census: object) -> dict[str, object]:
+    """Validate and summarize a public ``ShapeControlledCensus`` result."""
+    observed = _validate_pipeline_summary(controlled_census.observed, "observed")
+    controls = {
+        "per_dimension_shuffle": _validate_pipeline_summary(
+            controlled_census.per_dimension_shuffle,
+            "per_dimension_shuffle",
+        ),
+        "covariance_matched_gaussian": _validate_pipeline_summary(
+            controlled_census.covariance_matched_gaussian,
+            "covariance_matched_gaussian",
+        ),
+    }
     control_adjudications = sum(int(run["n_adjudicated"]) for run in controls.values())
     control_circular_wins = sum(int(run["n_circular_wins"]) for run in controls.values())
     return {
         "observed": observed,
         "controls": controls,
         "control_false_circle_rates": {
-            kind: controls[kind]["circular_win_rate"] for kind in CONTROL_KINDS
+            kind: run["circular_win_rate"] for kind, run in controls.items()
         },
         "pooled_control_false_circle_rate": (
             control_circular_wins / control_adjudications if control_adjudications else None
         ),
-        "pipeline_seed": pipeline_seed,
-        "control_seed": control_seed,
+        "pipeline_seed": controlled_census.pipeline_seed,
+        "per_dimension_shuffle_seed": controlled_census.per_dimension_shuffle_seed,
+        "covariance_matched_gaussian_seed": controlled_census.covariance_matched_gaussian_seed,
     }
 
 
@@ -244,12 +194,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     loaded = np.load(args.activations, mmap_mode="r", allow_pickle=False)
     if not isinstance(loaded, np.ndarray):
         raise TypeError(f"--activations must name one .npy array; got {type(loaded).__name__}")
-    report = run_full_pipeline_controls(
+    try:
+        import gamfit
+    except ImportError as exc:
+        raise RuntimeError(
+            "the full-pipeline runner requires a gamfit build exposing "
+            "run_shape_controlled_census"
+        ) from exc
+    controlled_census = gamfit.run_shape_controlled_census(
         loaded,
         _load_pipeline(args.pipeline),
         pipeline_seed=args.pipeline_seed,
         control_seed=args.control_seed,
     )
+    report = _validated_control_report(controlled_census)
     encoded = json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n"
     if args.output is None:
         print(encoded, end="")

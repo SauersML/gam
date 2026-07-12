@@ -16,9 +16,11 @@ permutation null, steering-validated):
      ``gamfit.adjudicate_atom_shape`` race on the 2-D coords, paired with the
      centroid circular-ordering diagnostic (``centroid_ordering.py`` next to
      this file). The race owns discrete cyclic structure through its
-     ``ring_clusters_k`` candidate, and ``circle_wins`` compares total circular
-     stacking mass (smooth circle plus ring clusters) with total non-circular
-     mass. The centroid test independently checks angular ordering.
+     ``ring_clusters`` class; ``ring_clusters_reporting_k`` names its all-data
+     diagnostic fit, while ``ring_clusters_fold_selected_k`` records the honest
+     outer-fold orders. ``circle_wins`` compares total circular stacking mass
+     (smooth circle plus ring clusters) with total non-circular mass. The
+     centroid test independently checks angular ordering.
   3. STEER: fit a circle atom on final-position activations of calendar
      continuation prompts (gamfit torch lane), then patch the chord of the
      fitted decoder curve into the residual stream and measure next-token
@@ -414,26 +416,45 @@ def run_concept(model, tok, gamfit_mod, concept: str, words, rec_templates,
     # Diagnose the class that owns the verdict. A circular class win uses the
     # constrained ring candidate's order; otherwise the free mixture's order
     # checks whether a nominally non-circular cluster winner is nevertheless
-    # angularly ordered. The known concept period is only used when the shape
-    # race itself failed and therefore returned no fitted orders.
+    # angularly ordered. An adjudication error or k < 3 is a typed unavailable
+    # diagnostic, never a reason to substitute the known concept period or a
+    # different cluster order.
     if "error" in verdict:
-        tier2_candidate = "known_period_after_adjudication_error"
-        k2 = period
-    elif bool(verdict["circle_wins"]):
-        tier2_candidate = "ring_clusters"
-        k2 = int(verdict["ring_clusters_k"])
+        tier2 = {
+            "status": "not_run",
+            "reason": "shape_adjudication_error",
+            "candidate_class": None,
+            "k": None,
+        }
     else:
-        tier2_candidate = "free_mixture"
-        k2 = int(verdict["mixture_k"])
-    tier2 = centroid_circular_ordering(coords2, max(k2, 3), seed=seed,
-                                       n_null=n_perm)
-    tier2.pop("centers", None)
-    tier2["candidate_class"] = tier2_candidate
-    log(f"  adjudicator: {verdict.get('winner', verdict)}; "
-        f"circular_class_wins={verdict.get('circle_wins')}; "
-        f"centroid diagnostic ({tier2_candidate}, k={k2}): "
-        f"ordered_on_circle={tier2['ordered_on_circle']} "
-        f"(radius_cv={tier2['radius_cv']:.3f}, mc_p={tier2['mc_p']:.4f})")
+        if bool(verdict["circle_wins"]):
+            tier2_candidate = "ring_clusters"
+            k2 = int(verdict["ring_clusters_reporting_k"])
+        else:
+            tier2_candidate = "free_mixture"
+            k2 = int(verdict["mixture_reporting_k"])
+        if k2 < 3:
+            tier2 = {
+                "status": "not_run",
+                "reason": "candidate_order_below_three",
+                "candidate_class": tier2_candidate,
+                "k": k2,
+            }
+        else:
+            tier2 = centroid_circular_ordering(coords2, k2, seed=seed, n_null=n_perm)
+            tier2.pop("centers", None)
+            tier2["status"] = "ok"
+            tier2["candidate_class"] = tier2_candidate
+    if tier2["status"] == "ok":
+        log(f"  adjudicator: reporting_winner={verdict['reporting_winner']}; "
+            f"winner_class={verdict['winner_class']}; "
+            f"circular_class_wins={verdict['circle_wins']}; "
+            f"centroid diagnostic ({tier2['candidate_class']}, k={tier2['k']}): "
+            f"ordered_on_circle={tier2['ordered_on_circle']} "
+            f"(radius_cv={tier2['radius_cv']:.3f}, mc_p={tier2['mc_p']:.4f})")
+    else:
+        log(f"  adjudicator: {verdict.get('reporting_winner', verdict)}; "
+            f"centroid diagnostic unavailable: {tier2['reason']}")
 
     # ---- 3. STEER: circle fit on continuation prompts + chord patching -----
     log(f"=== [{concept}] steering harvest (final position) ===")

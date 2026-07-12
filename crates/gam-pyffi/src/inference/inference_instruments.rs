@@ -1187,11 +1187,12 @@ mod tests {
             }
         }
         let verdict = run_atom_shape_race(coords.view(), 5, 2262, &[5, 7, 9]).unwrap();
-        assert_eq!(verdict.ring_clusters_k, 7);
+        assert_eq!(verdict.ring_clusters_reporting_k, 7);
+        assert_eq!(verdict.winner_class, "ring_clusters");
         assert!(
-            verdict.winner.starts_with("ring_clusters_k7"),
-            "winner={} names={:?} weights={:?} evidence={:?}",
-            verdict.winner,
+            verdict.reporting_winner.starts_with("ring_clusters_k7"),
+            "reporting_winner={} names={:?} weights={:?} evidence={:?}",
+            verdict.reporting_winner,
             verdict.candidate_names,
             verdict.stacking_weights,
             verdict.negative_log_evidence,
@@ -1452,18 +1453,18 @@ mod tests {
 
     #[test]
     fn circular_verdict_aggregates_within_class_stacking_mass() {
-        let names = vec![
-            "circle".to_string(),
-            "euclidean".to_string(),
-            "mixture_k7".to_string(),
-            "ring_clusters_k7".to_string(),
+        let kinds = [
+            gam::solver::AutoTopologyKind::Circle,
+            gam::solver::AutoTopologyKind::Euclidean,
+            gam::solver::AutoTopologyKind::MixtureClass,
+            gam::solver::AutoTopologyKind::RingOfClustersClass,
         ];
         // No individual circular candidate beats Euclidean (0.30 < 0.40), but
         // the circular topology class owns 0.60 total mass. A max-vs-max rule
         // would make the class verdict depend on how finely that class happened
         // to be represented in the candidate list.
         let (circular, noncircular, margin, circle_wins) =
-            circular_stacking_summary(&names, &[0.30, 0.40, 0.0, 0.30]).unwrap();
+            circular_stacking_summary(&kinds, &[0.30, 0.40, 0.0, 0.30]).unwrap();
         assert!((circular - 0.60).abs() < 1e-15);
         assert!((noncircular - 0.40).abs() < 1e-15);
         assert!((margin - 0.20).abs() < 1e-15);
@@ -1505,10 +1506,17 @@ mod tests {
             config,
         )
         .unwrap();
-        let actual = free_mixture_rung_provider_2d(free_coords, ladder, config)(&train, &eval)
-            .expect("outer provider must fit and select only on training rows");
+        let free_trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let actual = free_mixture_rung_provider_2d(
+            free_coords,
+            ladder,
+            config,
+            std::rc::Rc::clone(&free_trace),
+        )(&train, &eval)
+        .expect("outer provider must fit and select only on training rows");
         assert!(train_selected_k >= 2);
         assert_eq!(actual, expected);
+        assert_eq!(&*free_trace.borrow(), &[train_selected_k]);
 
         let clusters = 3usize;
         let per_cluster = 30usize;
@@ -1544,11 +1552,17 @@ mod tests {
             config,
         )
         .unwrap();
-        let ring_actual =
-            ring_cluster_rung_provider_2d(ring_coords, ring_ladder, config)(&ring_train, &ring_eval)
-                .expect("ring provider must fit and select only on training rows");
+        let ring_trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let ring_actual = ring_cluster_rung_provider_2d(
+            ring_coords,
+            ring_ladder,
+            config,
+            std::rc::Rc::clone(&ring_trace),
+        )(&ring_train, &ring_eval)
+        .expect("ring provider must fit and select only on training rows");
         assert!(ring_selected_k >= 3);
         assert_eq!(ring_actual, ring_expected);
+        assert_eq!(&*ring_trace.borrow(), &[ring_selected_k]);
     }
 
     /// #2262 structureless-null control: on pure isotropic Gaussian noise (no
@@ -1587,7 +1601,7 @@ mod tests {
         .expect("matched controls must run cleanly on pure noise, not error out");
 
         assert!(
-            shuffle_verdict.mixture_k >= 2 && gaussian_verdict.mixture_k >= 2,
+            shuffle_verdict.mixture_reporting_k >= 2 && gaussian_verdict.mixture_reporting_k >= 2,
             "the free-mixture candidate must not duplicate the k=1 Euclidean Gaussian"
         );
 
@@ -2233,12 +2247,17 @@ fn gaussian_negative_log_evidence_2d(coords: ArrayView2<'_, f64>) -> Result<f64,
 
 #[derive(Debug, Clone)]
 struct AtomShapeRaceVerdict {
-    winner: String,
+    winner_class: String,
+    reporting_winner: String,
     candidate_names: Vec<String>,
     stacking_weights: Vec<f64>,
     negative_log_evidence: Vec<f64>,
-    mixture_k: usize,
-    ring_clusters_k: usize,
+    mixture_reporting_k: usize,
+    ring_clusters_reporting_k: usize,
+    mixture_fold_selected_k: Vec<usize>,
+    ring_clusters_fold_selected_k: Vec<usize>,
+    mixture_fold_k_histogram: std::collections::BTreeMap<usize, usize>,
+    ring_clusters_fold_k_histogram: std::collections::BTreeMap<usize, usize>,
     circular_stacking_weight: f64,
     noncircular_stacking_weight: f64,
     circular_margin: f64,
@@ -2248,25 +2267,31 @@ struct AtomShapeRaceVerdict {
 }
 
 fn circular_stacking_summary(
-    candidate_names: &[String],
+    candidate_kinds: &[gam::solver::AutoTopologyKind],
     stacking_weights: &[f64],
 ) -> Result<(f64, f64, f64, bool), String> {
-    if candidate_names.len() != stacking_weights.len() || candidate_names.is_empty() {
+    if candidate_kinds.len() != stacking_weights.len() || candidate_kinds.is_empty() {
         return Err(format!(
-            "shape stacking result has {} candidate names but {} weights",
-            candidate_names.len(),
+            "shape stacking result has {} candidate kinds but {} weights",
+            candidate_kinds.len(),
             stacking_weights.len()
         ));
     }
     let mut circular_weight = 0.0_f64;
     let mut noncircular_weight = 0.0_f64;
-    for (name, &weight) in candidate_names.iter().zip(stacking_weights) {
+    for (&kind, &weight) in candidate_kinds.iter().zip(stacking_weights) {
         if !weight.is_finite() || weight < 0.0 {
             return Err(format!(
-                "shape stacking returned invalid weight {weight} for candidate {name}"
+                "shape stacking returned invalid weight {weight} for candidate {}",
+                kind.display_name()
             ));
         }
-        if name.starts_with("circle") || name.starts_with("ring_clusters") {
+        if matches!(
+            kind,
+            gam::solver::AutoTopologyKind::Circle
+                | gam::solver::AutoTopologyKind::RingOfClusters { .. }
+                | gam::solver::AutoTopologyKind::RingOfClustersClass
+        ) {
             circular_weight += weight;
         } else {
             noncircular_weight += weight;
@@ -2363,10 +2388,7 @@ fn free_mixture_rung_predictive_density(
         .iter()
         .find(|fit| fit.k >= 2)
         .ok_or_else(|| "fold-local mixture selection produced no order k >= 2".to_string())?;
-    Ok((
-        fit.k,
-        fit.fit.per_point_log_density(eval)?.to_vec(),
-    ))
+    Ok((fit.k, fit.fit.per_point_log_density(eval)?.to_vec()))
 }
 
 fn ring_cluster_rung_predictive_density(
@@ -2377,27 +2399,26 @@ fn ring_cluster_rung_predictive_density(
 ) -> Result<(usize, Vec<f64>), String> {
     let rung = gam::solver::fit_ring_of_clusters_rung(train, ladder, config)?;
     let fit = rung.winner();
-    Ok((
-        fit.k,
-        fit.fit.per_point_log_density(eval)?.to_vec(),
-    ))
+    Ok((fit.k, fit.fit.per_point_log_density(eval)?.to_vec()))
 }
 
 fn free_mixture_rung_provider_2d(
     coords: Array2<f64>,
     ladder: Vec<usize>,
     config: gam::solver::evidence::GaussianMixtureConfig,
+    selected_orders: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
 ) -> gam::solver::HeldOutDensityProvider<'static> {
     Box::new(move |train: &[usize], eval: &[usize]| {
         let train_coords = gather_shape_rows(coords.view(), train, "mixture training fold")?;
         let eval_coords = gather_shape_rows(coords.view(), eval, "mixture evaluation fold")?;
-        free_mixture_rung_predictive_density(
+        let (selected_k, density) = free_mixture_rung_predictive_density(
             train_coords.view(),
             eval_coords.view(),
             &ladder,
             config,
-        )
-        .map(|(_, density)| density)
+        )?;
+        selected_orders.borrow_mut().push(selected_k);
+        Ok(density)
     })
 }
 
@@ -2405,18 +2426,43 @@ fn ring_cluster_rung_provider_2d(
     coords: Array2<f64>,
     ladder: Vec<usize>,
     config: gam::solver::evidence::GaussianMixtureConfig,
+    selected_orders: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
 ) -> gam::solver::HeldOutDensityProvider<'static> {
     Box::new(move |train: &[usize], eval: &[usize]| {
         let train_coords = gather_shape_rows(coords.view(), train, "ring-cluster training fold")?;
         let eval_coords = gather_shape_rows(coords.view(), eval, "ring-cluster evaluation fold")?;
-        ring_cluster_rung_predictive_density(
+        let (selected_k, density) = ring_cluster_rung_predictive_density(
             train_coords.view(),
             eval_coords.view(),
             &ladder,
             config,
-        )
-        .map(|(_, density)| density)
+        )?;
+        selected_orders.borrow_mut().push(selected_k);
+        Ok(density)
     })
+}
+
+fn finish_fold_order_trace(
+    selected_orders: &std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+    folds: usize,
+    class_name: &str,
+) -> Result<Vec<usize>, String> {
+    let orders = selected_orders.borrow().clone();
+    if orders.len() != folds {
+        return Err(format!(
+            "{class_name} recorded {} fold-local orders for {folds} folds",
+            orders.len()
+        ));
+    }
+    Ok(orders)
+}
+
+fn fold_order_histogram(orders: &[usize]) -> std::collections::BTreeMap<usize, usize> {
+    let mut histogram = std::collections::BTreeMap::new();
+    for &order in orders {
+        *histogram.entry(order).or_insert(0) += 1;
+    }
+    histogram
 }
 
 fn run_atom_shape_race(
@@ -2485,24 +2531,33 @@ fn run_atom_shape_race(
         mixture.fits.iter().find(|fit| fit.k >= 2).ok_or_else(|| {
             "shape mixture refinement produced no eligible order k >= 2".to_string()
         })?;
-    let mixture_k = mixture_winner.k;
+    let mixture_reporting_k = mixture_winner.k;
     let ring_clusters = fit_ring_of_clusters_rung(owned.view(), &ring_cluster_ladder, config)?;
-    let ring_clusters_k = ring_clusters.winner().k;
+    let ring_clusters_reporting_k = ring_clusters.winner().k;
+    let mixture_fold_orders = std::rc::Rc::new(std::cell::RefCell::new(Vec::with_capacity(folds)));
+    let ring_cluster_fold_orders =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::with_capacity(folds)));
+    let candidate_kinds = [
+        AutoTopologyKind::Circle,
+        AutoTopologyKind::Euclidean,
+        AutoTopologyKind::MixtureClass,
+        AutoTopologyKind::RingOfClustersClass,
+    ];
     let candidates = vec![
         CrossClassCandidate {
-            kind: AutoTopologyKind::Circle,
+            kind: candidate_kinds[0],
             negative_log_evidence: ring_negative_log_evidence_2d(owned.view())?,
             certification: EvidenceCertification::Exact,
             density_provider: ring_provider_2d(owned.clone()),
         },
         CrossClassCandidate {
-            kind: AutoTopologyKind::Euclidean,
+            kind: candidate_kinds[1],
             negative_log_evidence: gaussian_negative_log_evidence_2d(owned.view())?,
             certification: EvidenceCertification::Exact,
             density_provider: gaussian_provider_2d(owned.clone()),
         },
         CrossClassCandidate {
-            kind: AutoTopologyKind::Mixture { k: mixture_k },
+            kind: candidate_kinds[2],
             negative_log_evidence: mixture_winner.negative_log_evidence,
             certification: EvidenceCertification::Exact,
             // The displayed/reported k is the full-data final fit. Its outer-CV
@@ -2512,16 +2567,18 @@ fn run_atom_shape_race(
                 owned.clone(),
                 mixture_ladder.clone(),
                 config,
+                std::rc::Rc::clone(&mixture_fold_orders),
             ),
         },
         CrossClassCandidate {
-            kind: AutoTopologyKind::RingOfClusters { k: ring_clusters_k },
+            kind: candidate_kinds[3],
             negative_log_evidence: ring_clusters.winner().negative_log_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: ring_cluster_rung_provider_2d(
                 owned.clone(),
                 ring_cluster_ladder.clone(),
                 config,
+                std::rc::Rc::clone(&ring_cluster_fold_orders),
             ),
         },
     ];
@@ -2534,17 +2591,35 @@ fn run_atom_shape_race(
         .ok_or_else(|| {
             "shape race mixed model classes but returned no stacking result".to_string()
         })?;
-    let winner = verdict.candidate_names[verdict.winner_index].clone();
+    let winner_class = verdict.candidate_names[verdict.winner_index].clone();
+    let reporting_winner = match candidate_kinds[verdict.winner_index] {
+        AutoTopologyKind::MixtureClass => format!("mixture_k{mixture_reporting_k}"),
+        AutoTopologyKind::RingOfClustersClass => {
+            format!("ring_clusters_k{ring_clusters_reporting_k}")
+        }
+        kind => kind.display_name(),
+    };
     let (circular_stacking_weight, noncircular_stacking_weight, circular_margin, circle_wins) =
-        circular_stacking_summary(&verdict.candidate_names, &stacking_weights)?;
+        circular_stacking_summary(&candidate_kinds, &stacking_weights)?;
+    let mixture_fold_selected_k =
+        finish_fold_order_trace(&mixture_fold_orders, folds, "mixture class")?;
+    let ring_clusters_fold_selected_k =
+        finish_fold_order_trace(&ring_cluster_fold_orders, folds, "ring-cluster class")?;
+    let mixture_fold_k_histogram = fold_order_histogram(&mixture_fold_selected_k);
+    let ring_clusters_fold_k_histogram = fold_order_histogram(&ring_clusters_fold_selected_k);
     Ok(AtomShapeRaceVerdict {
         circle_wins,
-        winner,
+        winner_class,
+        reporting_winner,
         candidate_names: verdict.candidate_names,
         stacking_weights,
         negative_log_evidence: verdict.negative_log_evidence,
-        mixture_k,
-        ring_clusters_k,
+        mixture_reporting_k,
+        ring_clusters_reporting_k,
+        mixture_fold_selected_k,
+        ring_clusters_fold_selected_k,
+        mixture_fold_k_histogram,
+        ring_clusters_fold_k_histogram,
         circular_stacking_weight,
         noncircular_stacking_weight,
         circular_margin,
@@ -2612,12 +2687,29 @@ fn atom_shape_verdict_dict<'py>(
     verdict: &AtomShapeRaceVerdict,
 ) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new(py);
-    out.set_item("winner", &verdict.winner)?;
+    out.set_item("winner_class", &verdict.winner_class)?;
+    out.set_item("reporting_winner", &verdict.reporting_winner)?;
     out.set_item("candidate_names", &verdict.candidate_names)?;
     out.set_item("stacking_weights", &verdict.stacking_weights)?;
     out.set_item("negative_log_evidence", &verdict.negative_log_evidence)?;
-    out.set_item("mixture_k", verdict.mixture_k)?;
-    out.set_item("ring_clusters_k", verdict.ring_clusters_k)?;
+    out.set_item("mixture_reporting_k", verdict.mixture_reporting_k)?;
+    out.set_item(
+        "ring_clusters_reporting_k",
+        verdict.ring_clusters_reporting_k,
+    )?;
+    out.set_item("mixture_fold_selected_k", &verdict.mixture_fold_selected_k)?;
+    out.set_item(
+        "ring_clusters_fold_selected_k",
+        &verdict.ring_clusters_fold_selected_k,
+    )?;
+    out.set_item(
+        "mixture_fold_k_histogram",
+        &verdict.mixture_fold_k_histogram,
+    )?;
+    out.set_item(
+        "ring_clusters_fold_k_histogram",
+        &verdict.ring_clusters_fold_k_histogram,
+    )?;
     out.set_item("circular_stacking_weight", verdict.circular_stacking_weight)?;
     out.set_item(
         "noncircular_stacking_weight",

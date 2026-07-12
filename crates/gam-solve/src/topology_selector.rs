@@ -102,12 +102,19 @@ pub enum AutoTopologyKind {
     Mixture {
         k: usize,
     },
+    /// The free-mixture model-selection procedure rather than one fixed order.
+    /// Each outer training fold chooses its own `k` by rank-aware evidence, so
+    /// the resulting predictive column is honest for the whole class.
+    MixtureClass,
     /// `k` tight Gaussian clusters whose centers share one fitted circle
     /// (#2262). This is the density class for discrete cyclic concepts: it
     /// preserves clustered mass while pricing the common circular geometry.
     RingOfClusters {
         k: usize,
     },
+    /// The ring-of-clusters model-selection procedure with order selected
+    /// independently inside each outer training fold.
+    RingOfClustersClass,
     /// Structured-union composite (#907): a small FIXED set of component
     /// structures joined by a hard responsibility split (e.g. circle+circle,
     /// circle+cluster, line+cluster). Like the mixture rung it is a discrete,
@@ -135,7 +142,9 @@ impl AutoTopologyKind {
             AutoTopologyKind::DuchonSheet => "duchon_sheet",
             AutoTopologyKind::ConstantCurvature => "constant_curvature",
             AutoTopologyKind::Mixture { .. } => "mixture",
+            AutoTopologyKind::MixtureClass => "mixture",
             AutoTopologyKind::RingOfClusters { .. } => "ring_clusters",
+            AutoTopologyKind::RingOfClustersClass => "ring_clusters",
             AutoTopologyKind::Union { structure } => structure.as_str(),
         }
     }
@@ -153,11 +162,17 @@ impl AutoTopologyKind {
     /// `true` iff this candidate is the discrete-mixture model class (as
     /// opposed to a smooth manifold / Euclidean latent topology).
     pub const fn is_discrete_mixture(self) -> bool {
-        matches!(self, AutoTopologyKind::Mixture { .. })
+        matches!(
+            self,
+            AutoTopologyKind::Mixture { .. } | AutoTopologyKind::MixtureClass
+        )
     }
 
     pub const fn is_ring_of_clusters(self) -> bool {
-        matches!(self, AutoTopologyKind::RingOfClusters { .. })
+        matches!(
+            self,
+            AutoTopologyKind::RingOfClusters { .. } | AutoTopologyKind::RingOfClustersClass
+        )
     }
 
     /// `true` iff this candidate is the structured-union composite class (#907).
@@ -179,6 +194,9 @@ impl AutoTopologyKind {
             return Ok(AutoTopologyKind::Union { structure });
         }
         if let Some(rest) = normalized.strip_prefix("ring_clusters") {
+            if rest.is_empty() {
+                return Ok(AutoTopologyKind::RingOfClustersClass);
+            }
             let Some(rest) = rest.strip_prefix("_k") else {
                 return Err(format!(
                     "ring-of-clusters candidate must use ring_clusters_k{{n}}; got {value:?}"
@@ -196,12 +214,7 @@ impl AutoTopologyKind {
             // Accept "mixture", "mixture_k7", "mixture7", "mixture_7".
             let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
             if digits.is_empty() {
-                // Bare "mixture" expands to the full ladder; callers that want a
-                // single order pass "mixture_k{n}". Here we default to the
-                // richest ladder order so a singleton request is still valid.
-                return Ok(AutoTopologyKind::Mixture {
-                    k: *MIXTURE_K_LADDER.last().unwrap_or(&7),
-                });
+                return Ok(AutoTopologyKind::MixtureClass);
             }
             let k: usize = digits
                 .parse()
@@ -226,7 +239,7 @@ impl AutoTopologyKind {
                 Ok(AutoTopologyKind::ConstantCurvature)
             }
             other => Err(format!(
-                "topology candidate must be euclidean, circle, sphere, torus, cylinder, duchon_sheet, constant_curvature, mixture[_k{{n}}], ring_clusters_k{{n}}, or a union (union_circle+circle, union_circle+cluster, union_line+cluster); got {other:?}"
+                "topology candidate must be euclidean, circle, sphere, torus, cylinder, duchon_sheet, constant_curvature, mixture[_k{{n}}], ring_clusters[_k{{n}}], or a union (union_circle+circle, union_circle+cluster, union_line+cluster); got {other:?}"
             )),
         }
     }

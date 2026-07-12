@@ -1,12 +1,12 @@
 """Centroid circular-ordering diagnostic: are candidate centers ordered on a ring?
 
 Companion to ``gamfit.adjudicate_atom_shape``. The production race now owns
-discrete cyclic structure through ``ring_clusters_k{k}``, and its
+discrete cyclic structure through its ``ring_clusters`` class, and its
 ``circle_wins`` flag compares the combined stacking mass of the smooth-circle
 and ring-of-clusters candidates against the combined non-circular mass. This
 module is an independent ordering diagnostic: it can corroborate the selected
 ring-cluster order, or test whether the centroids of a winning free
-``mixture_k{k}`` nevertheless exhibit circular order against a matched
+``mixture`` class nevertheless exhibit circular order against a matched
 Gaussian null.
 
 Procedure (validated in the two-tier census of real Qwen3-8B SAE features;
@@ -15,9 +15,11 @@ ring-of-clusters density landed, and correctly failed rings masked past ~1x
 their radius):
 
   1. Seeded k-means on the 2-D coordinates, with k = the adjudicator's
-     ``ring_clusters_k`` when diagnosing its circular candidate, or
-     ``mixture_k`` when diagnosing the free-mixture candidate (k >= 3 is
-     required for a meaningful ring test).
+     ``ring_clusters_reporting_k`` when diagnosing its circular class, or
+     ``mixture_reporting_k`` when diagnosing the free-mixture class (k >= 3
+     is required for a meaningful ring test). The corresponding
+     ``*_fold_selected_k`` values describe honest outer-fold prediction; the
+     reporting order is the all-data fit used for this post-race diagnostic.
   2. Ring statistic on the centroids: coefficient of variation (CV) of
      centroid radii about the centroid mean (low CV = centroids sit on a
      circle), plus angular coverage (max angular gap between sorted
@@ -105,9 +107,9 @@ def centroid_circular_ordering(coords: np.ndarray, k: int, *, seed: int = 0,
                                gap_thresh_deg: float = 150.0) -> dict:
     """Full second-tier test on a ``(n, 2)`` coordinate cloud.
 
-    ``k`` should be the order of the candidate being diagnosed:
-    ``ring_clusters_k`` for the constrained circular candidate or
-    ``mixture_k`` for the free-mixture candidate. Returns a dict with
+    ``k`` should be the all-data reporting order of the class being diagnosed:
+    ``ring_clusters_reporting_k`` for the constrained circular class or
+    ``mixture_reporting_k`` for the free-mixture class. Returns a dict with
     ``radius_cv``, ``max_gap_deg``, ``mc_p``, the centers, and the combined
     verdict ``ordered_on_circle`` (p below threshold AND angular coverage
     without a large gap).
