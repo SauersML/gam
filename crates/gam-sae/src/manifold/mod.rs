@@ -300,6 +300,9 @@ mod tests_streaming_seed_parity_2134;
 mod tests_recovery_split_780;
 
 #[cfg(test)]
+mod tests_intrinsic_seed_swiss_roll_2280;
+
+#[cfg(test)]
 mod tests_unit_speed_inloop_2022;
 
 #[cfg(test)]
