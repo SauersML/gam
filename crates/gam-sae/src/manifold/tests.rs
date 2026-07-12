@@ -232,7 +232,8 @@ pub(crate) fn criterion_gauge_deflation_count_guard_reanchors_then_rejects_runaw
     // no matter how many steps it takes. This is exactly the real-OLMo K=2
     // signature (171→…→113) that the old `k`-event budget wrongly tripped on.
     for c in [50usize, 40, 33, 21, 12, 9, 6, 4, 3, 2] {
-        term.record_criterion_gauge_deflation_count(c, true).unwrap();
+        term.record_criterion_gauge_deflation_count(c, true)
+            .unwrap();
         assert_eq!(term.expected_criterion_gauge_deflated_directions, Some(c));
     }
     assert_eq!(

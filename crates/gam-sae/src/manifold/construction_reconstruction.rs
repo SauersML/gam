@@ -593,10 +593,7 @@ impl SaeManifoldTerm {
 
     /// Explicitly unavailable joint shape uncertainty for a streaming fit whose
     /// execution plan cannot expose the exact joint Schur factor.
-    pub(crate) fn unavailable_shape_uncertainty(
-        &self,
-        dispersion: f64,
-    ) -> SaeShapeUncertainty {
+    pub(crate) fn unavailable_shape_uncertainty(&self, dispersion: f64) -> SaeShapeUncertainty {
         let atoms = self
             .atoms
             .iter()

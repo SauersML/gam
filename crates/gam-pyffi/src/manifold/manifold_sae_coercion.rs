@@ -165,10 +165,7 @@ pub(crate) fn preserve_linear_block_labels(
     if bases.is_empty() || bases.len() != atom_topologies.len() {
         return;
     }
-    let want: Vec<bool> = bases
-        .iter()
-        .map(|b| b == "linear_block")
-        .collect();
+    let want: Vec<bool> = bases.iter().map(|b| b == "linear_block").collect();
     if !want.iter().any(|&w| w) {
         return;
     }
@@ -647,7 +644,10 @@ mod manifold_sae_coercion_tests {
 
     #[test]
     fn topology_and_basis_tokens_are_strict() {
-        assert_eq!(basis_kind_for_topology("circle"), Ok("periodic".to_string()));
+        assert_eq!(
+            basis_kind_for_topology("circle"),
+            Ok("periodic".to_string())
+        );
         assert_eq!(basis_kind_for_topology("auto"), Ok("auto".to_string()));
         for removed in [
             "Periodic-Spline",
@@ -659,7 +659,10 @@ mod manifold_sae_coercion_tests {
             " AUTO ",
             "Weird-Kind",
         ] {
-            assert!(basis_kind_for_topology(removed).is_err(), "removed {removed}");
+            assert!(
+                basis_kind_for_topology(removed).is_err(),
+                "removed {removed}"
+            );
             assert!(gam::terms::sae::atom_schema::validate_seed_basis_kind(removed).is_err());
         }
         assert_eq!(canonical_topology("circle"), Ok("circle".to_string()));
@@ -713,7 +716,11 @@ mod manifold_sae_coercion_tests {
             ("mobius", "mobius"),
             ("finite_set", "finite_set"),
         ] {
-            assert_eq!(basis_to_topology(basis), Ok(topo.to_string()), "basis {basis}");
+            assert_eq!(
+                basis_to_topology(basis),
+                Ok(topo.to_string()),
+                "basis {basis}"
+            );
         }
         assert!(basis_to_topology("Weird-Kind").is_err());
     }

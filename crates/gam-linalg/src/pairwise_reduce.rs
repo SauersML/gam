@@ -414,12 +414,7 @@ where
     par_try_block_fold_range(0, n, &base, &combine).map(Some)
 }
 
-fn par_try_block_fold_range<T, E, B, F>(
-    lo: usize,
-    hi: usize,
-    base: &B,
-    combine: &F,
-) -> Result<T, E>
+fn par_try_block_fold_range<T, E, B, F>(lo: usize, hi: usize, base: &B, combine: &F) -> Result<T, E>
 where
     T: Send,
     E: Send,
@@ -591,7 +586,15 @@ mod tests {
 
     #[test]
     fn par_pairwise_sum_bit_identical_to_sequential() {
-        for n in [0usize, 1, 5, BASE_CHUNK, BASE_CHUNK + 1, 3 * BASE_CHUNK + 17, 5000] {
+        for n in [
+            0usize,
+            1,
+            5,
+            BASE_CHUNK,
+            BASE_CHUNK + 1,
+            3 * BASE_CHUNK + 17,
+            5000,
+        ] {
             let f = |i: usize| ((i as f64) * 0.7318 - 41.0).sin() * 1e6 / ((i + 1) as f64);
             let xs: Vec<f64> = (0..n).map(f).collect();
             let expected = pairwise_sum(&xs);
@@ -676,8 +679,7 @@ mod tests {
         let base = |range: core::ops::Range<usize>| -> f64 {
             range.map(|i| ((i as f64) * 0.317).sin()).sum()
         };
-        let infallible =
-            par_deterministic_block_fold(n, base, |a, b| a + b).expect("n > 0");
+        let infallible = par_deterministic_block_fold(n, base, |a, b| a + b).expect("n > 0");
         let fallible = par_deterministic_try_block_fold(
             n,
             |range| Ok::<f64, String>(base(range)),

@@ -5511,10 +5511,7 @@ fn eval_log_lik(term: &SaeManifoldTerm, shard: &RowBlockShard) -> Result<f64, St
 ///
 /// An undefined or non-PD gate block is a fit failure. It cannot be omitted
 /// without changing the model-selection scalar, so the error is propagated.
-fn gate_block_log_evidence(
-    term: &SaeManifoldTerm,
-    shard: &RowBlockShard,
-) -> Result<f64, String> {
+fn gate_block_log_evidence(term: &SaeManifoldTerm, shard: &RowBlockShard) -> Result<f64, String> {
     use gam_solve::inference::pg_gate_evidence::{GateBlock, pg_gate_evidence};
 
     let logits = &term.assignment.logits;
@@ -5567,9 +5564,8 @@ fn gate_block_log_evidence(
             hess_rest: None,
             h_rest: None,
         };
-        let evidence = pg_gate_evidence(&block).map_err(|error| {
-            format!("gate-block evidence failed for atom {atom}: {error}")
-        })?;
+        let evidence = pg_gate_evidence(&block)
+            .map_err(|error| format!("gate-block evidence failed for atom {atom}: {error}"))?;
         // `neg_log_evidence` is `−log p(gate block)`; the log-likelihood the
         // split-LR consumes is its negation.
         total -= evidence.neg_log_evidence;

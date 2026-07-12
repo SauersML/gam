@@ -293,9 +293,8 @@ impl ManifoldSaePayload {
         }
         let k = payload.basis_kinds.len();
         for (index, basis) in payload.basis_kinds.iter().enumerate() {
-            gam::terms::sae::atom_schema::validate_fitted_basis_kind(basis).map_err(|error| {
-                format!("ManifoldSAE.from_json: basis_kinds[{index}]: {error}")
-            })?;
+            gam::terms::sae::atom_schema::validate_fitted_basis_kind(basis)
+                .map_err(|error| format!("ManifoldSAE.from_json: basis_kinds[{index}]: {error}"))?;
         }
         if payload.atoms.len() != k
             || payload.atom_topologies.len() != k
@@ -343,9 +342,7 @@ impl ManifoldSaePayload {
             .enumerate()
             .map(|(index, block)| {
                 i64::try_from(block.len()).map_err(|_| {
-                    format!(
-                        "ManifoldSAE.from_json: decoder_blocks[{index}] width exceeds i64"
-                    )
+                    format!("ManifoldSAE.from_json: decoder_blocks[{index}] width exceeds i64")
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -481,12 +478,18 @@ mod manifold_sae_payload_serde_tests {
         let mut basis_alias = load_value("golden_full.json");
         basis_alias["basis_kinds"][0] = Value::String("circle".to_string());
         let error = roundtrip_json(&serde_json::to_string(&basis_alias).unwrap()).unwrap_err();
-        assert!(error.contains("basis_kinds[0]") && error.contains("not canonical"), "{error}");
+        assert!(
+            error.contains("basis_kinds[0]") && error.contains("not canonical"),
+            "{error}"
+        );
 
         let mut assignment_alias = load_value("golden_full.json");
         assignment_alias["assignment_label"] = Value::String("TopK".to_string());
         let error = roundtrip_json(&serde_json::to_string(&assignment_alias).unwrap()).unwrap_err();
-        assert!(error.contains("assignment_label") && error.contains("canonical"), "{error}");
+        assert!(
+            error.contains("assignment_label") && error.contains("canonical"),
+            "{error}"
+        );
     }
 
     #[test]

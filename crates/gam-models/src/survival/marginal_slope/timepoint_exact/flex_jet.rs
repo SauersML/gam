@@ -159,7 +159,7 @@ fn flex_row_nll<J: FlexJet>(
     nll
 }
 
-// ── Fused single-allocation Jet2 row-NLL (value/grad/Hessian) ───────────────
+// ── Fused two-allocation Jet2 row-NLL (value/grad/Hessian) ─────────────────
 //
 // The generic [`flex_row_nll`] above is the single source of truth; instantiated
 // at [`Jet2`] it allocates ~18 intermediate `Vec`s (two per `add`/`sub`/`mul`/
@@ -167,10 +167,11 @@ fn flex_row_nll<J: FlexJet>(
 // flex site (one call per row, every PIRLS Hessian assembly), and that allocation
 // churn — not the arithmetic — dominates it. [`fused_row_nll_jet2`] evaluates the
 // **same seven NLL terms in the same left-to-right accumulation order**, but
-// straight into a single preallocated `(g, h)` accumulator: the only heap
-// allocations are the `g`/`h` buffers the caller returns anyway. Measured
-// `2.2×–4.3×` faster (p∈{6,12,24}) and `f64::to_bits`-identical to the generic
-// `Jet2` path channel-for-channel (gate
+// straight into the two `(g, h)` output buffers the caller returns. It reads the
+// ndarray input views in place, fuses all seven terms into one gradient pass and
+// one upper-triangular Hessian pass, and materializes neither copied input
+// tensors nor dense unit-primary tensors for `q1`/`qd1`. It remains
+// `f64::to_bits`-identical to the generic `Jet2` path channel-for-channel (gate
 // [`fused_jet2_row_nll_is_bit_identical_to_generic`], ≥2000 random inputs/​p).
 //
 // Bit-identity holds because every fused expression is the textual image of the
@@ -181,69 +182,13 @@ fn flex_row_nll<J: FlexJet>(
 // and the trailing `·s` of each term).
 struct FusedSrc<'a> {
     v: f64,
-    g: &'a [f64],
-    h: &'a [f64],
+    g: ndarray::ArrayView1<'a, f64>,
+    h: ndarray::ArrayView2<'a, f64>,
 }
 struct FusedOut {
     v: f64,
     g: Vec<f64>,
     h: Vec<f64>,
-}
-
-/// `out = (f∘x)·s` for the leading term — image of `x.compose_unary(d).scale(s)`.
-#[inline]
-fn fused_init_compose_scaled(out: &mut FusedOut, x: &FusedSrc, d: [f64; 5], s: f64, p: usize) {
-    let (f, f1, f2) = (d[0], d[1], d[2]);
-    out.v = f * s;
-    for i in 0..p {
-        out.g[i] = (f1 * x.g[i]) * s;
-    }
-    for i in 0..p {
-        let xi = x.g[i];
-        for j in 0..p {
-            out.h[i * p + j] = (f2 * xi * x.g[j] + f1 * x.h[i * p + j]) * s;
-        }
-    }
-}
-
-/// `out ±= (f∘x)·s` — image of `nll.add/​sub(&x.compose_unary(d).scale(s))`.
-#[inline]
-fn fused_acc_compose_scaled(
-    out: &mut FusedOut,
-    x: &FusedSrc,
-    d: [f64; 5],
-    s: f64,
-    sign: f64,
-    p: usize,
-) {
-    let (f, f1, f2) = (d[0], d[1], d[2]);
-    out.v += sign * (f * s);
-    for i in 0..p {
-        out.g[i] += sign * ((f1 * x.g[i]) * s);
-    }
-    for i in 0..p {
-        let xi = x.g[i];
-        for j in 0..p {
-            let term = (f2 * xi * x.g[j] + f1 * x.h[i * p + j]) * s;
-            out.h[i * p + j] += sign * term;
-        }
-    }
-}
-
-/// `out += (x·x)·s` — image of `nll.add(&x.mul(x).scale(s))`.
-#[inline]
-fn fused_acc_square_scaled(out: &mut FusedOut, x: &FusedSrc, s: f64, p: usize) {
-    out.v += (x.v * x.v) * s;
-    for i in 0..p {
-        out.g[i] += (x.v * x.g[i] + x.g[i] * x.v) * s;
-    }
-    for i in 0..p {
-        let xi = x.g[i];
-        for j in 0..p {
-            let hij = (x.v * x.h[i * p + j] + xi * x.g[j] + x.g[j] * xi + x.h[i * p + j] * x.v) * s;
-            out.h[i * p + j] += hij;
-        }
-    }
 }
 
 /// Fused value/grad/Hessian of the flex row NLL (sans the additive `w·d·ln2π`
@@ -254,8 +199,10 @@ fn fused_row_nll_jet2(
     eta1: &FusedSrc,
     chi1: &FusedSrc,
     d1: &FusedSrc,
-    q1: &FusedSrc,
-    qd1: &FusedSrc,
+    q1: f64,
+    q1_axis: usize,
+    qd1: f64,
+    qd1_axis: usize,
     surv0: [f64; 5],
     surv1: [f64; 5],
     wi: f64,
@@ -263,38 +210,61 @@ fn fused_row_nll_jet2(
     p: usize,
 ) -> FusedOut {
     let wd = wi * di;
+    let exit_scale = -wi * (1.0 - di);
+    let eta_square_scale = 0.5 * wd;
+    let chi_stack = ln_stack(chi1.v);
+    let d_stack = ln_stack(d1.v);
+    let qd_stack = ln_stack(qd1);
     let mut out = FusedOut {
-        v: 0.0,
+        v: surv0[0] * wi,
         g: vec![0.0; p],
         h: vec![0.0; p * p],
     };
-    fused_init_compose_scaled(&mut out, eta0, surv0, wi, p); // w·logΦ(−η₀)
-    fused_acc_compose_scaled(&mut out, eta1, surv1, -wi * (1.0 - di), 1.0, p); // −w(1−d)logΦ(−η₁)
-    fused_acc_square_scaled(&mut out, eta1, 0.5 * wd, p); // +w·d·½η₁²
-    fused_acc_square_scaled(&mut out, q1, 0.5 * wd, p); // +w·d·½q₁²
-    fused_acc_compose_scaled(&mut out, chi1, ln_stack(chi1.v), wd, -1.0, p); // −w·d·logχ₁
-    fused_acc_compose_scaled(&mut out, d1, ln_stack(d1.v), wd, 1.0, p); // +w·d·logD₁
-    fused_acc_compose_scaled(&mut out, qd1, ln_stack(qd1.v), wd, -1.0, p); // −w·d·logqd₁
-    out
-}
+    // Keep the exact generic-expression association order for bit identity.
+    out.v += surv1[0] * exit_scale;
+    out.v += (eta1.v * eta1.v) * eta_square_scale;
+    out.v += (q1 * q1) * eta_square_scale;
+    out.v += -chi_stack[0] * wd;
+    out.v += d_stack[0] * wd;
+    out.v += -qd_stack[0] * wd;
 
-/// Copy a length-`p` gradient view + `p×p` Hessian view into the contiguous
-/// `(g, h)` SoA the fused evaluator reads (contiguity-safe, element-wise copy).
-/// The single input copy the `Jet2` path already pays.
-#[inline]
-fn fused_inputs_from_view(
-    g: ndarray::ArrayView1<'_, f64>,
-    h: ndarray::ArrayView2<'_, f64>,
-    p: usize,
-) -> (Vec<f64>, Vec<f64>) {
-    let gv: Vec<f64> = g.iter().copied().collect();
-    let mut hv = vec![0.0; p * p];
     for i in 0..p {
-        for j in 0..p {
-            hv[i * p + j] = h[[i, j]];
+        let mut value = (surv0[1] * eta0.g[i]) * wi;
+        value += (surv1[1] * eta1.g[i]) * exit_scale;
+        value += (eta1.v * eta1.g[i] + eta1.g[i] * eta1.v) * eta_square_scale;
+        if i == q1_axis {
+            value += (q1 + q1) * eta_square_scale;
+        }
+        value += -((chi_stack[1] * chi1.g[i]) * wd);
+        value += (d_stack[1] * d1.g[i]) * wd;
+        if i == qd1_axis {
+            value += -(qd_stack[1] * wd);
+        }
+        out.g[i] = value;
+    }
+
+    for i in 0..p {
+        for j in i..p {
+            let mut value = (surv0[2] * eta0.g[i] * eta0.g[j] + surv0[1] * eta0.h[[i, j]]) * wi;
+            value += (surv1[2] * eta1.g[i] * eta1.g[j] + surv1[1] * eta1.h[[i, j]]) * exit_scale;
+            value += (eta1.v * eta1.h[[i, j]]
+                + eta1.g[i] * eta1.g[j]
+                + eta1.g[j] * eta1.g[i]
+                + eta1.h[[i, j]] * eta1.v)
+                * eta_square_scale;
+            if i == q1_axis && j == q1_axis {
+                value += 2.0 * eta_square_scale;
+            }
+            value += -(chi_stack[2] * chi1.g[i] * chi1.g[j] + chi_stack[1] * chi1.h[[i, j]]) * wd;
+            value += (d_stack[2] * d1.g[i] * d1.g[j] + d_stack[1] * d1.h[[i, j]]) * wd;
+            if i == qd1_axis && j == qd1_axis {
+                value += -(qd_stack[2] * wd);
+            }
+            out.h[i * p + j] = value;
+            out.h[j * p + i] = value;
         }
     }
-    (gv, hv)
+    out
 }
 
 // ── Jet2: value / gradient / Hessian (runtime K) ───────────────────────────
@@ -797,60 +767,40 @@ impl SurvivalMarginalSlopeFamily {
             let grad = Array1::from(out.g);
             return Ok((value, grad, Array2::zeros((p, p))));
         }
-        // Fused single-allocation Jet2 evaluation: bit-identical to
+        // Fused two-allocation Jet2 evaluation: bit-identical to
         // `flex_row_nll::<Jet2>` (gate `fused_jet2_row_nll_is_bit_identical_to_generic`)
-        // but without the ~18 intermediate `Vec` allocations of the generic op
-        // chain (2.2×–4.3× faster). The four timepoint inputs are flattened into
-        // contiguous SoA (the same single copy `Jet2::from_view` paid); the q₁/qd₁
-        // primaries are unit-gradient/zero-Hessian slices.
+        // but without intermediate `Vec` allocations, copied input tensors, or
+        // dense q₁/qd₁ unit-primary tensors. It reads the four timepoint ndarray
+        // views directly and writes only the returned gradient/Hessian buffers.
         let eta0_h = eta0_h.ok_or("flex fused Jet2: missing eta0 Hessian")?;
         let chi1_h = chi1_h.ok_or("flex fused Jet2: missing chi1 Hessian")?;
         let d1_h = d1_h.ok_or("flex fused Jet2: missing d1 Hessian")?;
         let eta1_h = eta1_h.ok_or("flex fused Jet2: missing eta1 Hessian")?;
-        let (eta0_gv, eta0_hv) = fused_inputs_from_view(eta0_g, eta0_h, p);
-        let (eta1_gv, eta1_hv) = fused_inputs_from_view(eta1_g, eta1_h, p);
-        let (chi1_gv, chi1_hv) = fused_inputs_from_view(chi1_g, chi1_h, p);
-        let (d1_gv, d1_hv) = fused_inputs_from_view(d1_g, d1_h, p);
-        let zero_h = vec![0.0; p * p];
-        let mut q1_g = vec![0.0; p];
-        if primary.q1 < p {
-            q1_g[primary.q1] = 1.0;
-        }
-        let mut qd1_g = vec![0.0; p];
-        if primary.qd1 < p {
-            qd1_g[primary.qd1] = 1.0;
-        }
         let out = fused_row_nll_jet2(
             &FusedSrc {
                 v: eta0_v,
-                g: &eta0_gv,
-                h: &eta0_hv,
+                g: eta0_g,
+                h: eta0_h,
             },
             &FusedSrc {
                 v: eta1_v,
-                g: &eta1_gv,
-                h: &eta1_hv,
+                g: eta1_g,
+                h: eta1_h,
             },
             &FusedSrc {
                 v: chi1_v,
-                g: &chi1_gv,
-                h: &chi1_hv,
+                g: chi1_g,
+                h: chi1_h,
             },
             &FusedSrc {
                 v: d1_v,
-                g: &d1_gv,
-                h: &d1_hv,
+                g: d1_g,
+                h: d1_h,
             },
-            &FusedSrc {
-                v: q1,
-                g: &q1_g,
-                h: &zero_h,
-            },
-            &FusedSrc {
-                v: qd1,
-                g: &qd1_g,
-                h: &zero_h,
-            },
+            q1,
+            primary.q1,
+            qd1,
+            primary.qd1,
             surv0,
             surv1,
             wi,
@@ -4951,42 +4901,31 @@ mod fused_jet2_oracle_tests {
                 );
 
                 // Fused production path.
-                let zero_h = vec![0.0; p * p];
-                let mut qg = vec![0.0; p];
-                qg[qax] = 1.0;
-                let mut qdg = vec![0.0; p];
-                qdg[qdax] = 1.0;
                 let f_out = fused_row_nll_jet2(
                     &FusedSrc {
                         v: e0v,
-                        g: &e0g,
-                        h: &e0h,
+                        g: ndarray::ArrayView1::from(&e0g),
+                        h: ndarray::ArrayView2::from_shape((p, p), &e0h).unwrap(),
                     },
                     &FusedSrc {
                         v: e1v,
-                        g: &e1g,
-                        h: &e1h,
+                        g: ndarray::ArrayView1::from(&e1g),
+                        h: ndarray::ArrayView2::from_shape((p, p), &e1h).unwrap(),
                     },
                     &FusedSrc {
                         v: cv,
-                        g: &cg,
-                        h: &ch,
+                        g: ndarray::ArrayView1::from(&cg),
+                        h: ndarray::ArrayView2::from_shape((p, p), &ch).unwrap(),
                     },
                     &FusedSrc {
                         v: dv,
-                        g: &dg,
-                        h: &dh,
+                        g: ndarray::ArrayView1::from(&dg),
+                        h: ndarray::ArrayView2::from_shape((p, p), &dh).unwrap(),
                     },
-                    &FusedSrc {
-                        v: q1v,
-                        g: &qg,
-                        h: &zero_h,
-                    },
-                    &FusedSrc {
-                        v: qd1v,
-                        g: &qdg,
-                        h: &zero_h,
-                    },
+                    q1v,
+                    qax,
+                    qd1v,
+                    qdax,
                     surv0,
                     surv1,
                     wi,
@@ -5016,8 +4955,8 @@ mod fused_jet2_oracle_tests {
 
 #[cfg(test)]
 mod hand_vs_jet_bench_tests {
-    //! #932 SPEED AUDIT: shipped jet value/grad/Hessian (`fused_row_nll_jet2` +
-    //! the `fused_inputs_from_view` input copies the production
+    //! #932 SPEED AUDIT: shipped jet value/grad/Hessian (`fused_row_nll_jet2` on
+    //! the production ndarray views) vs
     //! `flex_row_nll_value_grad_hess` pays) vs the ORIGINAL HAND probit-chain +
     //! quotient-rule assembly it replaced (recovered verbatim from the pre-cutover
     //! commit `b17785d2a~1`, `flex_sensitivity.rs`). Measures ns/row at
@@ -5127,8 +5066,8 @@ mod hand_vs_jet_bench_tests {
         (row_nll, grad, hess)
     }
 
-    /// The SHIPPED JET path: surv stacks + the `fused_inputs_from_view` contiguous
-    /// copies + `fused_row_nll_jet2` (the exact body of the `want_hess` branch of
+    /// The SHIPPED JET path: surv stacks + direct-view `fused_row_nll_jet2` (the
+    /// exact body of the `want_hess` branch of
     /// `flex_row_nll_value_grad_hess`).
     fn jet_vgh(row: &Row, p: usize) -> (f64, Array1<f64>, Array2<f64>) {
         let Row {
@@ -5156,50 +5095,31 @@ mod hand_vs_jet_bench_tests {
         let (q1_idx, qd1_idx) = (*q1_idx, *qd1_idx);
         let surv0 = surv_stack(eta0).unwrap();
         let surv1 = surv_stack(eta1).unwrap();
-        let (e0g, e0h) = fused_inputs_from_view(eta0_u.view(), eta0_uv.view(), p);
-        let (e1g, e1h) = fused_inputs_from_view(eta1_u.view(), eta1_uv.view(), p);
-        let (cg, ch) = fused_inputs_from_view(chi1_u.view(), chi1_uv.view(), p);
-        let (dg, dh) = fused_inputs_from_view(d1_u.view(), d1_uv.view(), p);
-        let zero_h = vec![0.0; p * p];
-        let mut q1_g = vec![0.0; p];
-        if q1_idx < p {
-            q1_g[q1_idx] = 1.0;
-        }
-        let mut qd1_g = vec![0.0; p];
-        if qd1_idx < p {
-            qd1_g[qd1_idx] = 1.0;
-        }
         let out = fused_row_nll_jet2(
             &FusedSrc {
                 v: eta0,
-                g: &e0g,
-                h: &e0h,
+                g: eta0_u.view(),
+                h: eta0_uv.view(),
             },
             &FusedSrc {
                 v: eta1,
-                g: &e1g,
-                h: &e1h,
+                g: eta1_u.view(),
+                h: eta1_uv.view(),
             },
             &FusedSrc {
                 v: chi1,
-                g: &cg,
-                h: &ch,
+                g: chi1_u.view(),
+                h: chi1_uv.view(),
             },
             &FusedSrc {
                 v: d1,
-                g: &dg,
-                h: &dh,
+                g: d1_u.view(),
+                h: d1_uv.view(),
             },
-            &FusedSrc {
-                v: q1,
-                g: &q1_g,
-                h: &zero_h,
-            },
-            &FusedSrc {
-                v: qd1,
-                g: &qd1_g,
-                h: &zero_h,
-            },
+            q1,
+            q1_idx,
+            qd1,
+            qd1_idx,
             surv0,
             surv1,
             wi,

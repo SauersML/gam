@@ -100,7 +100,10 @@ fn fisher_mass_units_match_analytic_quadratic_form() {
     let predicted_nats = 0.5 * metric.fisher_mass(0, delta_arr.view());
     let analytic_nats = 0.5 * analytic_fisher_quad_form(&p_probs, &delta);
 
-    assert!(analytic_nats > 0.0, "sanity: quadratic form must be positive");
+    assert!(
+        analytic_nats > 0.0,
+        "sanity: quadratic form must be positive"
+    );
     let rel_err = (predicted_nats - analytic_nats).abs() / analytic_nats.abs();
     assert!(
         rel_err < 1e-10,
@@ -130,7 +133,10 @@ fn fisher_mass_quadratic_matches_exact_kl_at_small_delta() {
         let delta_arr = Array1::from_vec(delta.clone());
         let predicted_nats = 0.5 * metric.fisher_mass(0, delta_arr.view());
 
-        assert!(exact_kl > 0.0, "sanity: exact KL must be positive for nonzero delta");
+        assert!(
+            exact_kl > 0.0,
+            "sanity: exact KL must be positive for nonzero delta"
+        );
         last_rel_err = (predicted_nats - exact_kl).abs() / exact_kl.abs();
     }
 

@@ -15,9 +15,9 @@
 #[cfg(test)]
 mod tests {
     use crate::manifold::{
-        SaeCertifyRequest, SaeFitAssignmentKind, SaeFitConfig, SaeFitSeedReport,
-        SaeFitSeedRequest, SaeMinimalSeedReport, SaeMinimalSeedRequest, SaeOuterVerdict,
-        build_sae_fit_seed, build_sae_minimal_seed, run_sae_manifold_certify,
+        SaeCertifyRequest, SaeFitAssignmentKind, SaeFitConfig, SaeFitSeedReport, SaeFitSeedRequest,
+        SaeMinimalSeedReport, SaeMinimalSeedRequest, SaeOuterVerdict, build_sae_fit_seed,
+        build_sae_minimal_seed, run_sae_manifold_certify,
     };
     use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
     use ndarray::Array2;

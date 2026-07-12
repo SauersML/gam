@@ -923,8 +923,7 @@ impl SaeManifoldTerm {
             self.row_loss_weights = None;
             return Ok(());
         }
-        if !weights.iter().all(|w| w.is_finite() && *w >= 0.0)
-            || !weights.iter().any(|w| *w > 0.0)
+        if !weights.iter().all(|w| w.is_finite() && *w >= 0.0) || !weights.iter().any(|w| *w > 0.0)
         {
             return Err(
                 "SaeManifoldTerm::set_row_loss_weights: weights must be finite, nonnegative, \

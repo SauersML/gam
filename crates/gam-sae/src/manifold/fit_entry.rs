@@ -1028,8 +1028,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
             &uncertainty.band_sd,
         ) {
             (None, None, None) => {
-                if uncertainty.decoder_covariance.is_some()
-                    || uncertainty.band_sd_robust.is_some()
+                if uncertainty.decoder_covariance.is_some() || uncertainty.band_sd_robust.is_some()
                 {
                     return Err(SaeFitError::Fit(format!(
                         "atom {atom_idx} has a partial unavailable shape-uncertainty payload"
@@ -1039,7 +1038,11 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
             (Some(coords), Some(mean), Some(sd)) => {
                 if coords.nrows() != mean.nrows()
                     || mean.dim() != sd.dim()
-                    || coords.iter().chain(mean.iter()).chain(sd.iter()).any(|value| !value.is_finite())
+                    || coords
+                        .iter()
+                        .chain(mean.iter())
+                        .chain(sd.iter())
+                        .any(|value| !value.is_finite())
                 {
                     return Err(SaeFitError::Fit(format!(
                         "atom {atom_idx} has inconsistent or non-finite joint shape uncertainty"
@@ -1053,8 +1056,7 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
                     )));
                 }
                 if let Some(robust) = &uncertainty.band_sd_robust
-                    && (robust.dim() != sd.dim()
-                        || robust.iter().any(|value| !value.is_finite()))
+                    && (robust.dim() != sd.dim() || robust.iter().any(|value| !value.is_finite()))
                 {
                     return Err(SaeFitError::Fit(format!(
                         "atom {atom_idx} has inconsistent robust shape uncertainty"
@@ -1363,8 +1365,7 @@ pub fn run_sae_manifold_certify(request: SaeCertifyRequest) -> Result<SaeFitRepo
             &uncertainty.band_sd,
         ) {
             (None, None, None) => {
-                if uncertainty.decoder_covariance.is_some()
-                    || uncertainty.band_sd_robust.is_some()
+                if uncertainty.decoder_covariance.is_some() || uncertainty.band_sd_robust.is_some()
                 {
                     return Err(SaeFitError::Fit(format!(
                         "atom {atom_idx} has a partial unavailable shape-uncertainty payload"
@@ -1374,7 +1375,11 @@ pub fn run_sae_manifold_certify(request: SaeCertifyRequest) -> Result<SaeFitRepo
             (Some(coords), Some(mean), Some(sd)) => {
                 if coords.nrows() != mean.nrows()
                     || mean.dim() != sd.dim()
-                    || coords.iter().chain(mean.iter()).chain(sd.iter()).any(|value| !value.is_finite())
+                    || coords
+                        .iter()
+                        .chain(mean.iter())
+                        .chain(sd.iter())
+                        .any(|value| !value.is_finite())
                 {
                     return Err(SaeFitError::Fit(format!(
                         "atom {atom_idx} has inconsistent or non-finite joint shape uncertainty"
@@ -1388,8 +1393,7 @@ pub fn run_sae_manifold_certify(request: SaeCertifyRequest) -> Result<SaeFitRepo
                     )));
                 }
                 if let Some(robust) = &uncertainty.band_sd_robust
-                    && (robust.dim() != sd.dim()
-                        || robust.iter().any(|value| !value.is_finite()))
+                    && (robust.dim() != sd.dim() || robust.iter().any(|value| !value.is_finite()))
                 {
                     return Err(SaeFitError::Fit(format!(
                         "atom {atom_idx} has inconsistent robust shape uncertainty"

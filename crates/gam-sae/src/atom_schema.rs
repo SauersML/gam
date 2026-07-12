@@ -14,9 +14,7 @@ pub fn validated_n_harmonics(
     raw_n_harmonics: &[i64],
     decoder_widths: &[i64],
 ) -> Result<Vec<i64>, String> {
-    if basis_kinds.len() != raw_n_harmonics.len()
-        || basis_kinds.len() != decoder_widths.len()
-    {
+    if basis_kinds.len() != raw_n_harmonics.len() || basis_kinds.len() != decoder_widths.len() {
         return Err(format!(
             "harmonic metadata length mismatch: basis_kinds={}, n_harmonics={}, decoder_widths={}",
             basis_kinds.len(),
@@ -71,9 +69,8 @@ pub fn canonical_assignment_kind(kind: &str) -> Result<&'static str, String> {
 /// Validate a basis kind that may appear in a converged native artifact.
 pub fn validate_fitted_basis_kind(name: &str) -> Result<(), String> {
     match name {
-        "periodic" | "sphere" | "torus" | "linear" | "linear_block" | "euclidean"
-        | "duchon" | "poincare" | "cylinder" | "mobius" | "finite_set"
-        | "spectral_graph" => Ok(()),
+        "periodic" | "sphere" | "torus" | "linear" | "linear_block" | "euclidean" | "duchon"
+        | "poincare" | "cylinder" | "mobius" | "finite_set" | "spectral_graph" => Ok(()),
         _ => Err(format!(
             "basis kind {name:?} is not canonical; expected one of ['cylinder', 'duchon', \
              'euclidean', 'finite_set', 'linear', 'linear_block', 'mobius', 'periodic', \
@@ -85,8 +82,8 @@ pub fn validate_fitted_basis_kind(name: &str) -> Result<(), String> {
 /// Validate a public fit seed. Discovery-only atom kinds cannot be seeded.
 pub fn validate_seed_basis_kind(name: &str) -> Result<(), String> {
     match name {
-        "periodic" | "sphere" | "torus" | "linear" | "linear_block" | "euclidean"
-        | "duchon" | "poincare" | "mobius" | "auto" => Ok(()),
+        "periodic" | "sphere" | "torus" | "linear" | "linear_block" | "euclidean" | "duchon"
+        | "poincare" | "mobius" | "auto" => Ok(()),
         "cylinder" | "finite_set" => Err(format!(
             "basis kind {name:?} is discovery-only and cannot seed a fit"
         )),
@@ -102,8 +99,8 @@ pub fn validate_seed_basis_kind(name: &str) -> Result<(), String> {
 pub fn basis_kind_for_topology(name: &str) -> Result<String, String> {
     match name {
         "circle" => Ok("periodic".to_string()),
-        "sphere" | "torus" | "linear" | "linear_block" | "euclidean" | "duchon"
-        | "poincare" | "mobius" | "auto" => Ok(name.to_string()),
+        "sphere" | "torus" | "linear" | "linear_block" | "euclidean" | "duchon" | "poincare"
+        | "mobius" | "auto" => Ok(name.to_string()),
         "cylinder" | "finite_set" => Err(format!(
             "topology {name:?} is discovery-only and cannot seed a fit"
         )),
