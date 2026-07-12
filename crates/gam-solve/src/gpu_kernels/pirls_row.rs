@@ -15,7 +15,7 @@
 //! | `grad_eta`   | Score wrt η: ∂ℓ/∂η_i = wᵢ·(yᵢ − μᵢ)·dη/dV for canonical    |
 //! |              | links; equals priorweight·(yᵢ − μᵢ)·h'(ηᵢ)/V(μᵢ) for non-  |
 //! |              | canonical Bernoulli; equals priorweight·(yᵢ − μᵢ) for      |
-//! |              | Gaussian-identity, Poisson-log, Gamma-log.                 |
+//! |              | Gaussian/Poisson and priorweight·shape·(yᵢ/μᵢ−1) for Gamma.|
 //! | `w_fisher`   | Fisher expected weight (priorweight · h'(η)² / V(μ)).      |
 //! |              | Used for inference (Var(β̂)).                              |
 //! | `w_hessian`  | Curvature weight for the Newton/Laplace Hessian.            |
@@ -140,7 +140,7 @@ impl PirlsRowFamily {
     ///
     /// Gamma-LOG is **non-canonical**: the canonical Gamma link is the
     /// reciprocal 1/μ, not log. Under a log link the observed Hessian weight
-    /// is `w_F · y/μ` (shape-independent; the shape cancels), which differs
+    /// is `w_F · y/μ` with `w_F = prior·shape`, which differs
     /// from the Fisher weight `w_F` whenever `y ≠ μ`. Consequently
     /// `CurvatureMode::Observed` produces a different `w_hessian` for
     /// Gamma-log, and it must not be short-circuited via a canonical-family

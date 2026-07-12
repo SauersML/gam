@@ -1940,7 +1940,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 OPERATOR_LAMBDA_LOG_UPPER_CAP,
             )
         } else {
-            raw.max(epsilon_floor_log)
+            raw.clamp(epsilon_floor_log, gam_problem::LOG_STRENGTH_MAX)
         }
     };
     let eps_lower =
@@ -1997,20 +1997,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
 
     let n_theta = initial_theta.len();
 
-    // Clamp theta to the asymmetric epsilon bounds that run_outer's symmetric
-    // rho_bound cannot express directly.
     let theta_bounds = Some((eps_lower.clone(), eps_upper.clone()));
-    let clamp_theta = {
-        let lo = eps_lower;
-        let hi = eps_upper;
-        move |theta: &Array1<f64>| -> Array1<f64> {
-            let mut clamped = theta.clone();
-            for i in 0..clamped.len() {
-                clamped[i] = clamped[i].clamp(lo[i], hi[i]);
-            }
-            clamped
-        }
-    };
 
     let decode_theta =
         |theta: &Array1<f64>| -> Result<DecodedSpatialAdaptiveTheta, EstimationError> {
@@ -2086,7 +2073,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                       theta: &Array1<f64>,
                       order: gam_solve::rho_optimizer::OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
-        let theta = clamp_theta(theta);
+        let decoded = decode_theta(theta)?;
 
         if let Some((cached_theta, cached_cost, cached_grad, cached_hess, cached_warm)) =
             &st.last_eval
@@ -2117,7 +2104,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             });
         }
 
-        let decoded = decode_theta(&theta)?;
         let family_eval =
             base_family.with_adaptive_params(decoded.adaptive_params, zero_quadratic.clone());
         let need_hessian = matches!(
@@ -2174,7 +2160,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 }
             }
             st.last_eval = Some((
-                theta.clone(),
+                theta.to_owned(),
                 result.objective,
                 result.gradient.clone(),
                 result.outer_hessian.clone(),

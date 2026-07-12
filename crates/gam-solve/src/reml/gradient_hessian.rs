@@ -2613,11 +2613,11 @@ impl<'a> RemlState<'a> {
             ResponseFamily::Gaussian => 1.0,
             _ => reml_fixed_glm_dispersion(&self.config.likelihood),
         };
-        let phi = if phi.is_finite() && phi > 0.0 {
-            phi
-        } else {
-            1.0
-        };
+        if !(phi.is_finite() && phi > 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "#784 block-local fallback requires finite positive dispersion; got {phi}"
+            )));
+        }
 
         let x_dense = x_design
             .try_to_dense_arc("#784 block-local fallback requires dense design access")

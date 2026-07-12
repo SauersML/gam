@@ -34,6 +34,46 @@ use ndarray::{Array1, ArrayView1};
 use std::ops::Deref;
 use std::sync::Arc;
 
+/// A sign-honest weight diagonal whose entries have all been certified finite.
+///
+/// The distinction from [`SignedWeightsView`] is operational rather than
+/// algebraic: matrix-free normal products are evaluated many times inside PCG,
+/// so they must certify the row diagonal once at the solve boundary instead of
+/// rescanning it on every matvec.  Negative and signed-zero values are retained
+/// exactly; only `NaN` and infinities are rejected.
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct FiniteSignedWeightsView<'a>(ArrayView1<'a, f64>);
+
+impl<'a> FiniteSignedWeightsView<'a> {
+    /// Certify a signed weight vector.  Failure names the smallest offending
+    /// row, so the result is deterministic and independent of parallelism.
+    #[inline]
+    pub fn try_new(view: ArrayView1<'a, f64>) -> Result<Self, String> {
+        if let Some((row, value)) = view.iter().copied().enumerate().find(|(_, w)| !w.is_finite()) {
+            return Err(format!(
+                "non-finite weight at row {row}: {value:?}; every weight must be finite"
+            ));
+        }
+        Ok(Self(view))
+    }
+
+    #[inline]
+    pub fn try_from_array(array: &'a Array1<f64>) -> Result<Self, String> {
+        Self::try_new(array.view())
+    }
+
+    #[inline]
+    pub fn view(&self) -> ArrayView1<'a, f64> {
+        self.0
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 #[derive(Copy, Clone)]
 #[repr(transparent)]
 pub struct SignedWeightsView<'a>(ArrayView1<'a, f64>);
@@ -110,11 +150,19 @@ impl<'a> PsdWeightsView<'a> {
     /// recheck.
     #[inline]
     pub fn try_new(view: ArrayView1<'a, f64>) -> Result<Self, String> {
-        if view.iter().all(|&w| w >= 0.0) {
-            Ok(Self(view))
-        } else {
-            Err("PsdWeights::try_new: weights must be nonneg (use SignedWeightsView for observed-Hessian assembly)".to_string())
+        for (row, &weight) in view.iter().enumerate() {
+            if !weight.is_finite() {
+                return Err(format!(
+                    "PsdWeightsView::try_new: non-finite weight at row {row}: {weight:?}"
+                ));
+            }
+            if weight < 0.0 {
+                return Err(format!(
+                    "PsdWeightsView::try_new: negative weight at row {row}: {weight:?}; use SignedWeightsView for observed-Hessian assembly"
+                ));
+            }
         }
+        Ok(Self(view))
     }
 
     /// As `try_new`, taking an owned `&Array1<f64>`.

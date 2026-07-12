@@ -326,3 +326,50 @@ fn device_rows_match_cpu_at_log_endpoints_tails_and_tiny_weights() {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_device_row_writes_only_its_status() {
+    let Ok(backend) = PirlsRowBackend::probe() else {
+        return;
+    };
+    let stream = backend.inner.ctx.default_stream();
+    let y_dev = stream.clone_htod(&[1.0, 1.0]).unwrap();
+    let prior_dev = stream.clone_htod(&[1.0, 1.0]).unwrap();
+    let mut out = RowOutputDevBuffers::allocate(&stream, 2).unwrap();
+
+    let valid_eta = stream.clone_htod(&[0.0, 0.0]).unwrap();
+    launch_row_reweight_on_stream(
+        backend,
+        PirlsRowFamily::PoissonLog,
+        CurvatureMode::Fisher,
+        1.0,
+        &stream,
+        2,
+        &valid_eta,
+        &y_dev,
+        &prior_dev,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(stream.clone_dtoh(&out.mu).unwrap(), vec![1.0, 1.0]);
+
+    let invalid_eta = stream.clone_htod(&[701.0, 0.0]).unwrap();
+    launch_row_reweight_on_stream(
+        backend,
+        PirlsRowFamily::PoissonLog,
+        CurvatureMode::Fisher,
+        1.0,
+        &stream,
+        2,
+        &invalid_eta,
+        &y_dev,
+        &prior_dev,
+        &mut out,
+    )
+    .unwrap();
+    let status = stream.clone_dtoh(&out.status).unwrap();
+    let mu = stream.clone_dtoh(&out.mu).unwrap();
+    assert_eq!(status, vec![status_codes::ETA_DOMAIN, status_codes::OK]);
+    assert_eq!(mu, vec![1.0, 1.0]);
+}

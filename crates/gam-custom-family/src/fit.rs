@@ -264,12 +264,27 @@ pub(crate) const EFFECTIVE_DF_FLOOR: f64 = 1.0;
 /// quantity whose collapse the #715/#684 over-shrinkage describes — when the
 /// Fisher curvature vanishes the REML objective flattens in ρ and the optimizer
 /// lets λ drift past the point where this structural edf falls below the floor.
-pub(crate) fn unit_weight_term_edf(gammas: &[f64], rho: f64) -> f64 {
-    let lambda = rho.exp();
+fn unit_weight_term_edf_at_physical_strength(gammas: &[f64], lambda: f64) -> f64 {
     gammas
         .iter()
-        .map(|&g| if g > 0.0 { g / (g + lambda) } else { 0.0 })
+        .map(|&gamma| {
+            if gamma.is_finite() && gamma > 0.0 {
+                1.0 / (1.0 + lambda / gamma)
+            } else {
+                0.0
+            }
+        })
         .sum()
+}
+
+pub(crate) fn unit_weight_term_edf(gammas: &[f64], rho: f64) -> Result<f64, CustomFamilyError> {
+    let lambda = gam_problem::checked_exp_log_strength(rho).map_err(|error| {
+        CustomFamilyError::InvalidInput {
+            context: "unit-weight structural EDF",
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(unit_weight_term_edf_at_physical_strength(gammas, lambda))
 }
 
 /// Generalized eigenvalues `γ_j` of the design column Gram `G = XᵀX` against the
@@ -478,7 +493,19 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
     layout: &PenaltyLabelLayout,
     n_rho: usize,
     ceiling: f64,
-) -> Array1<f64> {
+) -> Result<Array1<f64>, CustomFamilyError> {
+    gam_problem::validate_log_strength(ceiling).map_err(|error| {
+        CustomFamilyError::InvalidInput {
+            context: "effective-DF rho ceiling",
+            reason: error.to_string(),
+        }
+    })?;
+    gam_problem::validate_log_strength(-ceiling).map_err(|error| {
+        CustomFamilyError::InvalidInput {
+            context: "effective-DF rho lower bound",
+            reason: error.to_string(),
+        }
+    })?;
     let mut upper = Array1::<f64>::from_elem(n_rho, ceiling);
     let mut physical = 0usize;
     for spec in specs {
@@ -496,14 +523,14 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
             // floor even unpenalized, the floor is not enforceable for this term
             // (a single-dimension range space with the floor at its own cap), so
             // keep the uniform ceiling.
-            let edf_max = unit_weight_term_edf(&gammas, f64::NEG_INFINITY);
+            let edf_max = unit_weight_term_edf_at_physical_strength(&gammas, 0.0);
             if !(edf_max > EFFECTIVE_DF_FLOOR) {
                 continue;
             }
             // Bisect for ρ* with edf(ρ*) = floor on [−ceiling, ceiling]; edf is
             // monotone decreasing in ρ. If edf at the ceiling still exceeds the
             // floor, the uniform ceiling already retains enough df — keep it.
-            if unit_weight_term_edf(&gammas, ceiling) >= EFFECTIVE_DF_FLOOR {
+            if unit_weight_term_edf(&gammas, ceiling)? >= EFFECTIVE_DF_FLOOR {
                 continue;
             }
             // If the existing lower side of the box has already smoothed this
@@ -517,14 +544,14 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
             // dispersion location-scale smooths whose unit-weight generalized
             // eigenvalues can put the edf=1 crossing just outside the default
             // [-10, 10] rho box.
-            if unit_weight_term_edf(&gammas, -ceiling) <= EFFECTIVE_DF_FLOOR {
+            if unit_weight_term_edf(&gammas, -ceiling)? <= EFFECTIVE_DF_FLOOR {
                 continue;
             }
             let mut lo = -ceiling;
             let mut hi = ceiling;
             for _ in 0..64 {
                 let mid = 0.5 * (lo + hi);
-                if unit_weight_term_edf(&gammas, mid) >= EFFECTIVE_DF_FLOOR {
+                if unit_weight_term_edf(&gammas, mid)? >= EFFECTIVE_DF_FLOOR {
                     lo = mid;
                 } else {
                     hi = mid;
@@ -539,7 +566,7 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
             }
         }
     }
-    upper
+    Ok(upper)
 }
 
 pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -1022,7 +1049,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // λ-upper-side dual of the #752 full-subspace logdet work.
         .with_bounds(
             Array1::<f64>::from_elem(n_rho, options.rho_lower_bound),
-            effective_df_floor_rho_upper_bounds(specs, &label_layout, n_rho, 10.0),
+            effective_df_floor_rho_upper_bounds(specs, &label_layout, n_rho, 10.0)?,
         );
     // Install the seed-screening cap only when initial-rho screening is
     // wanted. A caller that pins an already-identified `initial_rho` and

@@ -169,7 +169,9 @@ fn weight_identifiability(
     let n = activation_target.nrows();
     let px = activation_target.ncols();
     let py = behavior_target.ncols();
-    let lambda = log_lambda_y.exp();
+    let lambda = gam_problem::checked_exp_log_strength(log_lambda_y).map_err(|error| {
+        format!("behavior identifiability received an invalid log strength: {error}")
+    })?;
     let denominator = rx + lambda * ry;
     let curvature = if rx > 0.0 && ry > 0.0 && denominator.is_finite() && denominator > 0.0 {
         0.5 * (n * (px + py)) as f64 * lambda * rx * ry / denominator.powi(2)

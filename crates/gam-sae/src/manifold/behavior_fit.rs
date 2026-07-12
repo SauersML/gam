@@ -277,7 +277,7 @@ impl SaeManifoldTerm {
             let (base_rx, base_scaled) =
                 self.augmented_block_rss(base_aug.view(), rho, &range_layout)?;
             let base_unscaled: Vec<f64> = (0..blocks.len())
-                .map(|i| base_scaled[i] / cur_log_lambda[i].exp())
+                .map(|i| base_scaled[i] / blocks[i].lambda())
                 .collect();
             // Envelope-priced penalty energy `P` of the CURRENT-λ refit (#2228):
             // twice the non-data-fit penalized-objective energy the inner engine
@@ -428,7 +428,14 @@ impl SaeManifoldTerm {
                         // only stops the search from paying an artificial re-fitting tax
                         // proportional to the step.
                         for idx in 0..blocks.len() {
-                            let scale = (0.5 * (trial_ll[idx] - cur_log_lambda[idx])).exp();
+                            let scale = gam_problem::checked_exp_log_strength(
+                                0.5 * (trial_ll[idx] - cur_log_lambda[idx]),
+                            )
+                            .map_err(|error| {
+                                format!(
+                                    "behavior smoothing warm-start rescale is outside the canonical log-strength domain: {error}"
+                                )
+                            })?;
                             if scale != 1.0 {
                                 let range = range_layout.block_range(idx);
                                 for atom in &mut self.atoms {

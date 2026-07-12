@@ -1216,7 +1216,8 @@ impl<'a> GaussianRemlRhoResponse<'a> {
     /// derivative maximum.
     pub fn certified_full_conformal(&self, alpha: f64) -> Result<CertifiedFullConformal, String> {
         let rho0 = self.select_rho(None)?;
-        let lambda0 = rho0.exp();
+        let lambda0 = gam_problem::checked_exp_log_strength(rho0)
+            .map_err(|error| format!("full conformal selected an invalid log strength: {error}"))?;
         let mut s_lambda = Array2::<f64>::zeros((self.p, self.p));
         for i in 0..self.p {
             for j in 0..self.p {

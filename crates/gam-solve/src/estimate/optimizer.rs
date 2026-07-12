@@ -2582,7 +2582,7 @@ where
                 beta_covariance_unscaled.as_ref(),
                 cov_scale,
                 finalgrad_norm,
-            );
+            )?;
             rho_covariance = smoothing_outcome.rho_covariance().cloned();
             smoothing_correction = smoothing_outcome.into_correction();
             None

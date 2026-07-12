@@ -9036,7 +9036,7 @@ pub(crate) fn structural_edf_matches_trace_identity_noncommuting_pair() {
 
     for &lambda in &[1.0_f64, 0.3] {
         let rho = lambda.ln();
-        let edf = unit_weight_term_edf(&gammas, rho);
+        let edf = unit_weight_term_edf(&gammas, rho).expect("finite canonical log strength");
         let trace = trace_g_minv(lambda);
         assert!(
             (edf - trace).abs() < 1e-9,
@@ -9047,7 +9047,8 @@ pub(crate) fn structural_edf_matches_trace_identity_noncommuting_pair() {
     // Sanity: the buggy Rayleigh quotients [1, 0.25] would give 0.7 at λ=1,
     // which the trace identity (≈0.6111) rejects — guard against regression
     // to the diagonal-only computation.
-    let edf_at_one = unit_weight_term_edf(&gammas, 0.0_f64);
+    let edf_at_one =
+        unit_weight_term_edf(&gammas, 0.0_f64).expect("zero is a canonical log strength");
     assert!(
         (edf_at_one - 0.611111_f64).abs() < 1e-5,
         "edf at λ=1 must be ≈0.6111 (true), not 0.7000 (Rayleigh-quotient bug): got {edf_at_one}",
@@ -9103,11 +9104,27 @@ pub(crate) fn structural_edf_quotients_nullspace_range_coupling() {
             ident
         };
         let trace: f64 = g.dot(&m_inv).diag().iter().sum();
-        let edf = 1.0 + unit_weight_term_edf(&gammas, lambda.ln());
+        let edf = 1.0
+            + unit_weight_term_edf(&gammas, lambda.ln())
+                .expect("test lambdas have canonical log strengths");
         assert!(
             (edf - trace).abs() < 1e-9,
             "quotient edf {edf} must equal tr(G(G+λS)⁻¹) {trace} at λ={lambda}",
         );
+    }
+}
+
+#[test]
+fn unit_weight_structural_edf_rejects_noncanonical_log_strengths() {
+    let gammas = [0.25, 1.0, 4.0];
+    for rho in [
+        gam_problem::LOG_STRENGTH_MIN - 1.0,
+        gam_problem::LOG_STRENGTH_MAX + 1.0,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        f64::NAN,
+    ] {
+        assert!(unit_weight_term_edf(&gammas, rho).is_err());
     }
 }
 

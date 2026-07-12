@@ -908,6 +908,8 @@ pub struct CrosscoderLayout {
     /// Per-output-block fitted `log(λ_ℓ)`, parallel to `block_dims`. The honest
     /// per-layer decoder divides by `√λ_ℓ = exp(½·log λ_ℓ)`.
     block_log_lambda: Vec<f64>,
+    /// Exact cached `√λ_ℓ`, parallel to `block_log_lambda`.
+    block_sqrt_lambda: Vec<f64>,
 }
 
 impl CrosscoderLayout {
@@ -942,19 +944,26 @@ impl CrosscoderLayout {
                 ));
             }
         }
-        for (l, &ll) in block_log_lambda.iter().enumerate() {
-            if !ll.is_finite() {
-                return Err(format!(
-                    "CrosscoderLayout::new: block {l} ('{}') log λ is {ll} (not finite)",
-                    labels[l]
-                ));
-            }
-        }
+        gam_problem::validate_log_strengths(block_log_lambda.iter().copied()).map_err(|error| {
+            format!(
+                "CrosscoderLayout::new: block {} ('{}') has invalid log λ: {error}",
+                error.coordinate, labels[error.coordinate]
+            )
+        })?;
+        let block_sqrt_lambda = block_log_lambda
+            .iter()
+            .copied()
+            .map(|log_lambda| {
+                gam_problem::checked_exp_log_strength(0.5 * log_lambda)
+                    .expect("half of a validated log strength remains canonical")
+            })
+            .collect();
         Ok(Self {
             p_x,
             block_dims,
             labels,
             block_log_lambda,
+            block_sqrt_lambda,
         })
     }
 
@@ -966,7 +975,8 @@ impl CrosscoderLayout {
             p_x,
             block_dims: blocks.iter().map(|b| b.block_dim()).collect(),
             labels: blocks.iter().map(|b| b.label.clone()).collect(),
-            block_log_lambda: blocks.iter().map(|b| b.log_lambda).collect(),
+            block_log_lambda: blocks.iter().map(OutputBlock::log_lambda).collect(),
+            block_sqrt_lambda: blocks.iter().map(OutputBlock::sqrt_lambda).collect(),
         }
     }
 
@@ -1025,7 +1035,7 @@ impl CrosscoderLayout {
     /// [`OutputBlock::sqrt_lambda`], so a layout built from the fitted blocks
     /// unscales a decoder bit-for-bit like the by-hand [`OutputBlock::split_honest_decoder`].
     pub fn sqrt_lambda(&self, l: usize) -> f64 {
-        (0.5 * self.block_log_lambda[l]).exp()
+        self.block_sqrt_lambda[l]
     }
 }
 

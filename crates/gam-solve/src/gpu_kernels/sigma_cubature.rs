@@ -19,8 +19,8 @@ pub enum SigmaCubatureGpuError {
 impl std::fmt::Display for SigmaCubatureGpuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Geometry(error) => error.fmt(f),
-            Self::Runtime(error) => error.fmt(f),
+            Self::Geometry(error) => write!(f, "{error}"),
+            Self::Runtime(error) => write!(f, "{error}"),
         }
     }
 }
@@ -113,10 +113,7 @@ pub fn try_gpu_sigma_stream_pool_eval(
     gamma_shape: f64,
     convergence_tol: f64,
     max_iter: usize,
-) -> Result<
-    Option<Vec<Option<(ndarray::Array2<f64>, ndarray::Array1<f64>)>>>,
-    SigmaCubatureGpuError,
-> {
+) -> Result<Option<Vec<(ndarray::Array2<f64>, ndarray::Array1<f64>)>>, SigmaCubatureGpuError> {
     if per_sigma.is_empty() {
         return Ok(Some(Vec::new()));
     }
@@ -131,10 +128,9 @@ pub fn try_gpu_sigma_stream_pool_eval(
             return Ok(None);
         };
         let Some(family) = linux_impl::family_kind_to_row(family_kind) else {
-            return Err(gam_gpu::gpu_err!(
-                "sigma stream pool: family not in JIT-cached set"
-            )
-            .into());
+            return Err(
+                gam_gpu::gpu_err!("sigma stream pool: family not in JIT-cached set").into(),
+            );
         };
         let curvature = linux_impl::curvature_kind_to_row(admission.curvature);
         return linux_impl::stream_pool_eval(
@@ -215,7 +211,7 @@ mod linux_impl {
     use gam_gpu::policy::{PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
     use gam_linalg::utils::matrix_inversewith_regularization;
     use ndarray::{Array1, Array2, ArrayView1};
-    type SigmaPointResult = Option<(Array2<f64>, Array1<f64>)>;
+    type SigmaPointResult = (Array2<f64>, Array1<f64>);
 
     pub(super) fn family_kind_to_row(f: PirlsLoopFamilyKind) -> Option<PirlsRowFamily> {
         match f {
@@ -359,14 +355,12 @@ mod linux_impl {
             // Map H_transformed → H_original, invert, map β_transformed
             // → β_original. Mirrors the CPU path's post-processing.
             let h_orig = hessian_to_original(&loop_out.penalized_hessian, &pt.qs);
-            let cov = matrix_inversewith_regularization(&h_orig, "gpu sigma point")
-                .ok_or_else(|| {
-                    gam_gpu::gpu_err!(
-                        "gpu sigma point: penalised Hessian inverse not well-defined"
-                    )
+            let cov =
+                matrix_inversewith_regularization(&h_orig, "gpu sigma point").ok_or_else(|| {
+                    gam_gpu::gpu_err!("gpu sigma point: penalised Hessian inverse not well-defined")
                 })?;
             let beta_orig = pt.qs.dot(&loop_out.beta);
-            let sigma_result = Some((cov, beta_orig));
+            let sigma_result = (cov, beta_orig);
 
             outcomes.push(sigma_result);
         }
@@ -427,7 +421,7 @@ mod linux_impl {
                     )
                 })?;
             let beta_orig = pt.qs.dot(&pls.beta);
-            outcomes.push(Some((cov, beta_orig)));
+            outcomes.push((cov, beta_orig));
         }
 
         Ok(Some(outcomes))

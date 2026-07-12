@@ -190,7 +190,7 @@ pub(crate) mod cuda {
     impl std::fmt::Display for PirlsGpuLoopError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                Self::Geometry(error) => error.fmt(f),
+                Self::Geometry(error) => write!(f, "{error}"),
                 Self::Runtime(message) => f.write_str(message),
             }
         }
@@ -3621,7 +3621,7 @@ pub fn solve_pirls_step_on_stream_device(
 /// `RidgePassport`, EDF, or penalty term.  `objective_ridge` is the
 /// real model ridge that enters all of those.
 #[cfg(target_os = "linux")]
-pub fn pirls_loop_on_stream(
+pub(crate) fn pirls_loop_on_stream(
     shared: &PirlsGpuSharedData,
     ws: &mut SigmaPirlsGpuWorkspace,
     loop_ws: &mut cuda::PirlsLoopWorkspace,

@@ -350,7 +350,9 @@ mod linux_impl {
         )
         .map_err(|error| match error {
             cuda::PirlsGpuLoopError::Geometry(error) => error,
-            cuda::PirlsGpuLoopError::Runtime(message) => EstimationError::InvalidInput(message),
+            cuda::PirlsGpuLoopError::Runtime(message) => {
+                EstimationError::RemlOptimizationFailed(format!("GPU PIRLS runtime: {message}"))
+            }
         })?;
 
         // --- Assemble PirlsResult + WorkingModelPirlsResult ------------
@@ -742,8 +744,8 @@ mod linux_impl {
     ///
     /// Returns `Some(Ok(...))` when the device solve completed and the full
     /// CPU-oracle surface was assembled; returns `None` when admission was
-    /// denied; returns `Some(Err(...))` on device failure (caller logs and
-    /// falls through to CPU).
+    /// denied; returns `Some(Err(...))` on admitted-device failure, which is
+    /// propagated without a CPU retry.
     pub fn try_gpu_gaussian_pls_dispatch(
         input: GpuGaussianPlsInput<'_>,
     ) -> Option<Result<(PirlsResult, WorkingModelPirlsResult), String>> {

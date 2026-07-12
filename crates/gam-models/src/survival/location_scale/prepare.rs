@@ -858,7 +858,7 @@ pub(crate) fn finalize_survival_location_scale_fit(
     } else {
         None
     };
-    let lambdas = fit.log_lambdas.mapv(f64::exp);
+    let lambdas = fit.lambdas.clone();
     let lambdas_time = lambdas.slice(s![0..prepared.k_time]).to_owned();
     let lambdas_threshold = lambdas
         .slice(s![prepared.k_time..prepared.k_time + prepared.k_threshold])

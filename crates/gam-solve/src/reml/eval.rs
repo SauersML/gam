@@ -124,11 +124,9 @@ pub static SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT: AtomicU64 = AtomicU64::
 /// vector `b_m = Qs · β̂_transformed`. Both are exactly what
 /// [`accumulate_sigma_cubature_total_covariance`] consumes.
 ///
-/// `None` means the sigma point's inner PIRLS fit (or the subsequent Hessian
-/// map / inversion) failed. The caller treats any `None` in the batch as a
-/// cubature-wide numerical failure and falls back to the first-order
-/// correction, identically to the pre-dispatch inline code path.
-pub(crate) type SigmaPointResult = Option<(Array2<f64>, Array1<f64>)>;
+/// A sigma point is either fully represented by this pair or its typed error
+/// aborts the cubature batch; there is no per-point sentinel/fallback surface.
+pub(crate) type SigmaPointResult = (Array2<f64>, Array1<f64>);
 
 /// Predicate: is the device-resident inner PIRLS that the GPU stream-pool
 /// sigma executor needs available in this build/runtime?
@@ -163,8 +161,9 @@ pub(crate) fn device_pirls_stage3_ready() -> bool {
 /// Magic by default: no flags. When [`device_pirls_stage3_ready`] returns
 /// `true` the GPU branch fires for every cubature batch where the problem
 /// geometry justifies it (family in JIT-cached set, `p ≥ 32`,
-/// `n ≥ row_kernel_min_n`, dense design); if the GPU path declines
-/// (`Ok(None)`) or errors, the CPU Rayon oracle runs unchanged.
+/// `n ≥ row_kernel_min_n`, dense design). A pre-admission `Ok(None)` uses the
+/// CPU executor; once admitted, typed geometry/runtime failures propagate and
+/// are never retried on a different implementation.
 pub(crate) fn sigma_cubature_dispatch(
     state: &RemlState<'_>,
     sigma_points: &[Array1<f64>],
@@ -191,7 +190,7 @@ pub(crate) fn sigma_cubature_dispatch(
         }
     }
 
-    Ok(sigma_cubature_evaluate_cpu_rayon(state, sigma_points))
+    sigma_cubature_evaluate_cpu_rayon(state, sigma_points)
 }
 
 /// GPU stream-pool sigma-cubature evaluator.
@@ -215,10 +214,8 @@ pub(crate) fn sigma_cubature_dispatch(
 pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
     state: &RemlState<'_>,
     sigma_points: &[Array1<f64>],
-) -> Result<
-    Option<Vec<SigmaPointResult>>,
-    crate::gpu_kernels::sigma_cubature::SigmaCubatureGpuError,
-> {
+) -> Result<Option<Vec<SigmaPointResult>>, crate::gpu_kernels::sigma_cubature::SigmaCubatureGpuError>
+{
     use crate::gpu::pirls_dispatch_wire::admission_for;
     use crate::gpu_kernels::sigma_cubature::try_gpu_sigma_stream_pool_eval;
     use gam_gpu::device_runtime::GpuRuntime;
@@ -322,22 +319,26 @@ pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
 pub(crate) fn sigma_cubature_evaluate_cpu_rayon(
     state: &RemlState<'_>,
     sigma_points: &[Array1<f64>],
-) -> Vec<SigmaPointResult> {
-    (0..sigma_points.len())
+) -> Result<Vec<SigmaPointResult>, EstimationError> {
+    let rows: Vec<Result<SigmaPointResult, EstimationError>> = (0..sigma_points.len())
         .into_par_iter()
-        .map(|idx| {
-            let fit_point = state
-                .execute_pirls_stateless_for_cubature(&sigma_points[idx])
-                .ok()?;
-            let h_point = map_hessian_to_original_basis(fit_point.as_ref()).ok()?;
-            let cov_point = matrix_inversewith_regularization(&h_point, "auto cubature point")?;
+        .map(|idx| -> Result<SigmaPointResult, EstimationError> {
+            let fit_point = state.execute_pirls_stateless_for_cubature(&sigma_points[idx])?;
+            let h_point = map_hessian_to_original_basis(fit_point.as_ref())?;
+            let cov_point = matrix_inversewith_regularization(&h_point, "auto cubature point")
+                .ok_or_else(|| {
+                    EstimationError::InvalidInput(format!(
+                        "sigma point {idx}: Hessian inverse is not representable"
+                    ))
+                })?;
             let beta_point = fit_point
                 .reparam_result
                 .qs
                 .dot(fit_point.beta_transformed.as_ref());
-            Some((cov_point, beta_point))
+            Ok((cov_point, beta_point))
         })
-        .collect()
+        .collect();
+    rows.into_iter().collect()
 }
 
 /// Accumulate the sigma-point cubature total covariance `V̂_p` from per-point
@@ -654,7 +655,7 @@ impl<'a> RemlState<'a> {
         base_covariance: Option<&Array2<f64>>,
         dispersion_phi: f64,
         finalgrad_norm: f64,
-    ) -> SmoothingCorrectionOutcome {
+    ) -> Result<SmoothingCorrectionOutcome, EstimationError> {
         use SmoothingCorrectionFallbackSeverity::{NumericalFailure, Routine};
 
         // Always compute the fast first-order correction first.
@@ -929,14 +930,7 @@ impl<'a> RemlState<'a> {
         // stream-pool path once `pirls-row-v3` Stage 3 and `bms-flex-v3`
         // Phase 5 land the device-resident inner PIRLS the GPU
         // executor needs.
-        let point_results = sigma_cubature_dispatch(self, &sigma_points);
-
-        if point_results.iter().any(|r| r.is_none()) {
-            return self.finalize_smoothing_outcome(first_order_numerical(
-                first_order_correction,
-                "one or more sigma-point inner PIRLS fits failed",
-            ));
-        }
+        let point_results = sigma_cubature_dispatch(self, &sigma_points)?;
 
         // Dispersion scaling of the curvature (conditional-covariance) term.
         //
@@ -959,7 +953,6 @@ impl<'a> RemlState<'a> {
         // second time anywhere would make the curvature block scale as c⁴ (#582).
         let scaled_pairs: Vec<(Array2<f64>, Array1<f64>)> = point_results
             .into_iter()
-            .flatten()
             .map(|(cov_point, beta_point)| (cov_point.mapv(|v| dispersion_phi * v), beta_point))
             .collect();
         let mut total_cov = accumulate_sigma_cubature_total_covariance(&scaled_pairs, p);
@@ -999,7 +992,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn finalize_smoothing_outcome(
         &self,
         outcome: SmoothingCorrectionOutcome,
-    ) -> SmoothingCorrectionOutcome {
+    ) -> Result<SmoothingCorrectionOutcome, EstimationError> {
         let branch_label = outcome.branch_label();
         match &outcome {
             SmoothingCorrectionOutcome::Cubature {
@@ -1052,7 +1045,7 @@ impl<'a> RemlState<'a> {
                 }
             }
         }
-        outcome
+        Ok(outcome)
     }
 }
 
@@ -2410,14 +2403,16 @@ mod smoothing_correction_outcome_tests {
                 gam_problem::checked_exp_log_strengths(final_rho.iter().copied())
                     .expect("test rho lies in exact strength domain"),
             );
-            let outcome = state.compute_smoothing_correction_auto(
-                &final_rho,
-                &final_lambdas,
-                final_fit.as_ref(),
-                Some(&base_cov),
-                dispersion_phi,
-                finalgrad_norm,
-            );
+            let outcome = state
+                .compute_smoothing_correction_auto(
+                    &final_rho,
+                    &final_lambdas,
+                    final_fit.as_ref(),
+                    Some(&base_cov),
+                    dispersion_phi,
+                    finalgrad_norm,
+                )
+                .expect("smoothing correction evaluation");
             let after = SMOOTHING_CORRECTION_CUBATURE_COUNT.load(Ordering::SeqCst);
 
             let correction = outcome

@@ -47,7 +47,9 @@ mod sparse_hessian;
 pub use sparse_hessian::SparseHessianAccumulator;
 
 mod weights;
-pub use weights::{PsdWeightsView, SignedWeightsArc, SignedWeightsView};
+pub use weights::{
+    FiniteSignedWeightsView, PsdWeightsView, SignedWeightsArc, SignedWeightsView,
+};
 
 /// Typed error for `src/linalg/matrix.rs` operations.  All error sites in this
 /// module construct a `MatrixError` variant; trait method bodies that still
@@ -231,6 +233,29 @@ fn enforce_operator_materialization_policy(
     Ok(())
 }
 
+/// Validate a row-weight diagonal before any output buffer is allocated or
+/// mutated.  The linear weighted operators in this module are defined for all
+/// finite signed weights; `NaN` and infinities have no linear-operator meaning
+/// and are rejected at the smallest offending row.
+#[inline]
+fn certify_signed_weights<'a>(
+    context: &str,
+    weights: &'a Array1<f64>,
+    expected_len: usize,
+) -> Result<FiniteSignedWeightsView<'a>, String> {
+    if weights.len() != expected_len {
+        return Err(MatrixError::DimensionMismatch {
+            reason: format!(
+                "{context} weight length mismatch: weights={}, nrows={expected_len}",
+                weights.len()
+            ),
+        }
+        .into());
+    }
+    FiniteSignedWeightsView::try_from_array(weights)
+        .map_err(|reason| format!("{context}: {reason}"))
+}
+
 fn weighted_crossprod_dense(
     left: &Array2<f64>,
     weights: &Array1<f64>,
@@ -247,6 +272,7 @@ fn weighted_crossprod_dense(
         }
         .into());
     }
+    certify_signed_weights("weighted_crossprod_dense", weights, left.nrows())?;
     Ok(weighted_crossprod_dense_view(left, weights.view(), right))
 }
 
@@ -468,14 +494,19 @@ impl<'a> EmbeddedSquareBlock<'a> {
 struct PenalizedWeightedNormalOperator<'a, O: LinearOperator + ?Sized> {
     operator: &'a O,
     weights: &'a Array1<f64>,
+    finite_weights: FiniteSignedWeightsView<'a>,
     penalty: Option<&'a Array2<f64>>,
     ridge: f64,
 }
 
 impl<'a, O: LinearOperator + ?Sized> PenalizedWeightedNormalOperator<'a, O> {
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        self.operator
-            .apply_weighted_normal(self.weights, vector, self.penalty, self.ridge)
+        self.operator.apply_weighted_normal(
+            self.finite_weights,
+            vector,
+            self.penalty,
+            self.ridge,
+        )
     }
 
     fn jacobi_preconditioner(&self) -> Result<Array1<f64>, String> {
@@ -1626,7 +1657,7 @@ impl LinearOperator for DenseDesignMatrix {
 
     fn apply_weighted_normal(
         &self,
-        weights: &Array1<f64>,
+        weights: FiniteSignedWeightsView<'_>,
         vector: &Array1<f64>,
         penalty: Option<&Array2<f64>>,
         ridge: f64,
@@ -1645,6 +1676,7 @@ impl LinearOperator for DenseDesignMatrix {
         // this Fisher-scoring PCG matvec ((XᵀWX + S + ρI) v) construct their
         // weights through `PsdWeightsView::try_new`. Signed observed-Hessian
         // assembly routes through `xt_diag_x_signed_op` instead.
+        let weights = weights.view();
         match self {
             Self::Materialized(matrix) => {
                 let n = matrix.nrows();
@@ -1710,7 +1742,13 @@ impl LinearOperator for DenseDesignMatrix {
                 }
                 out
             }
-            Self::Lazy(op) => op.apply_weighted_normal(weights, vector, penalty, ridge),
+            Self::Lazy(op) => op.apply_weighted_normal(
+                FiniteSignedWeightsView::try_new(weights)
+                    .expect("finite-weight view invariant must survive reborrow"),
+                vector,
+                penalty,
+                ridge,
+            ),
         }
     }
 
@@ -1916,7 +1954,7 @@ impl LinearOperator for ReparamOperator {
 
     fn apply_weighted_normal(
         &self,
-        weights: &Array1<f64>,
+        weights: FiniteSignedWeightsView<'_>,
         vector: &Array1<f64>,
         penalty: Option<&Array2<f64>>,
         ridge: f64,
@@ -1935,6 +1973,7 @@ impl LinearOperator for ReparamOperator {
         // Fisher-scoring PCG normal-equations matvec; signed observed-Hessian
         // assembly does not reach this path.
         // Qs^T X^T W X Qs v + S v + ridge v
+        let weights = weights.view();
         let qv = self.qs.dot(vector);
         let xqv = self.x_original.apply(&qv);
         let mut wxqv = xqv;
@@ -2104,7 +2143,7 @@ impl RandomEffectOperator {
         &self,
         dense: &Array2<f64>,
         weights: &Array1<f64>,
-    ) -> Array2<f64> {
+    ) -> Result<Array2<f64>, String> {
         assert_eq!(
             dense.nrows(),
             self.n,
@@ -2115,11 +2154,16 @@ impl RandomEffectOperator {
             self.n,
             "RandomEffectOperator::weighted_cross_with_dense weight length mismatch"
         );
+        certify_signed_weights(
+            "RandomEffectOperator::weighted_cross_with_dense",
+            weights,
+            self.n,
+        )?;
         let p_dense = dense.ncols();
         let mut cross = Array2::<f64>::zeros((p_dense, self.num_groups));
         for i in 0..self.n {
             if let Some(g) = self.group_ids[i] {
-                let wi = weights[i].max(0.0);
+                let wi = weights[i];
                 if wi == 0.0 {
                     continue;
                 }
@@ -2128,7 +2172,7 @@ impl RandomEffectOperator {
                 }
             }
         }
-        cross
+        Ok(cross)
     }
 
     /// For two RE operators, compute X_re_a' diag(w) X_re_b → (qa × qb).
@@ -2138,7 +2182,7 @@ impl RandomEffectOperator {
         &self,
         other: &RandomEffectOperator,
         weights: &Array1<f64>,
-    ) -> Array2<f64> {
+    ) -> Result<Array2<f64>, String> {
         assert_eq!(
             other.n, self.n,
             "RandomEffectOperator::weighted_cross_with_re row mismatch"
@@ -2148,16 +2192,21 @@ impl RandomEffectOperator {
             self.n,
             "RandomEffectOperator::weighted_cross_with_re weight length mismatch"
         );
+        certify_signed_weights(
+            "RandomEffectOperator::weighted_cross_with_re",
+            weights,
+            self.n,
+        )?;
         let mut cross = Array2::<f64>::zeros((self.num_groups, other.num_groups));
         for i in 0..self.n {
             if let (Some(a), Some(b)) = (self.group_ids[i], other.group_ids[i]) {
-                let wi = weights[i].max(0.0);
+                let wi = weights[i];
                 if wi != 0.0 {
                     cross[[a, b]] += wi;
                 }
             }
         }
-        cross
+        Ok(cross)
     }
 }
 
@@ -2194,18 +2243,12 @@ impl LinearOperator for RandomEffectOperator {
 
     /// X'WX for a one-hot design is diagonal: D[g,g] = Σ_{i: group[i]=g} w[i].
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
-        if weights.len() != self.n {
-            return Err(format!(
-                "RandomEffectOperator::diag_xtw_x weight length mismatch: weights={}, nrows={}",
-                weights.len(),
-                self.n
-            ));
-        }
+        certify_signed_weights("RandomEffectOperator::diag_xtw_x", weights, self.n)?;
         let q = self.num_groups;
         let mut xtwx = Array2::<f64>::zeros((q, q));
         for i in 0..self.n {
             if let Some(g) = self.group_ids[i] {
-                xtwx[[g, g]] += weights[i].max(0.0);
+                xtwx[[g, g]] += weights[i];
             }
         }
         Ok(xtwx)
@@ -2213,17 +2256,11 @@ impl LinearOperator for RandomEffectOperator {
 
     /// Diagonal of X'WX: per-group weight sums.
     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
-        if weights.len() != self.n {
-            return Err(format!(
-                "RandomEffectOperator::diag_gram weight length mismatch: weights={}, nrows={}",
-                weights.len(),
-                self.n
-            ));
-        }
+        certify_signed_weights("RandomEffectOperator::diag_gram", weights, self.n)?;
         let mut diag = Array1::<f64>::zeros(self.num_groups);
         for i in 0..self.n {
             if let Some(g) = self.group_ids[i] {
-                diag[g] += weights[i].max(0.0);
+                diag[g] += weights[i];
             }
         }
         Ok(diag)
@@ -2232,7 +2269,7 @@ impl LinearOperator for RandomEffectOperator {
     /// Fused X'WXβ + Sβ + ridge·β.  O(n + q).
     fn apply_weighted_normal(
         &self,
-        weights: &Array1<f64>,
+        weights: FiniteSignedWeightsView<'_>,
         vector: &Array1<f64>,
         penalty: Option<&Array2<f64>>,
         ridge: f64,
@@ -2250,10 +2287,11 @@ impl LinearOperator for RandomEffectOperator {
         // Step 1: accumulate per-group weighted β[g] contributions.
         //   group_acc[g] = Σ_{i in group g} w[i]
         //   result[g] = group_acc[g] * vector[g]
+        let weights = weights.view();
         let mut group_wacc = Array1::<f64>::zeros(self.num_groups);
         for i in 0..self.n {
             if let Some(g) = self.group_ids[i] {
-                group_wacc[g] += weights[i].max(0.0);
+                group_wacc[g] += weights[i];
             }
         }
         let mut out = Array1::<f64>::zeros(self.num_groups);
@@ -2286,10 +2324,11 @@ impl DenseDesignOperator for RandomEffectOperator {
                 self.n
             ));
         }
+        certify_signed_weights("RandomEffectOperator::compute_xtwy", weights, self.n)?;
         let mut out = Array1::<f64>::zeros(self.num_groups);
         for i in 0..self.n {
             if let Some(g) = self.group_ids[i] {
-                let wi = weights[i].max(0.0);
+                let wi = weights[i];
                 out[g] += wi * y[i];
             }
         }
@@ -2584,14 +2623,14 @@ impl BlockDesignOperator {
             // ── Dense × RandomEffect ────────────────────────────────────
             (DesignBlock::Dense(d), DesignBlock::RandomEffect(re)) => {
                 if let Some(dense) = d.as_dense_ref() {
-                    Ok(re.weighted_cross_with_dense(dense, weights))
+                    re.weighted_cross_with_dense(dense, weights)
                 } else {
                     self.weighted_cross_chunked(&self.blocks[i], &self.blocks[j], weights)
                 }
             }
             (DesignBlock::RandomEffect(re), DesignBlock::Dense(d)) => {
                 if let Some(dense) = d.as_dense_ref() {
-                    let cross_t = re.weighted_cross_with_dense(dense, weights);
+                    let cross_t = re.weighted_cross_with_dense(dense, weights)?;
                     Ok(cross_t.t().to_owned())
                 } else {
                     self.weighted_cross_chunked(&self.blocks[i], &self.blocks[j], weights)
@@ -2600,7 +2639,7 @@ impl BlockDesignOperator {
 
             // ── RandomEffect × RandomEffect ─────────────────────────────
             (DesignBlock::RandomEffect(re_a), DesignBlock::RandomEffect(re_b)) => {
-                Ok(re_a.weighted_cross_with_re(re_b, weights))
+                re_a.weighted_cross_with_re(re_b, weights)
             }
 
             // ── Intercept × anything ────────────────────────────────────
@@ -2804,13 +2843,7 @@ impl LinearOperator for BlockDesignOperator {
     }
 
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
-        if weights.len() != self.n {
-            return Err(format!(
-                "BlockDesignOperator::diag_xtw_x weight length mismatch: weights={}, nrows={}",
-                weights.len(),
-                self.n
-            ));
-        }
+        certify_signed_weights("BlockDesignOperator::diag_xtw_x", weights, self.n)?;
         let p = self.total_cols;
         let mut result = Array2::<f64>::zeros((p, p));
 
@@ -2876,13 +2909,7 @@ impl LinearOperator for BlockDesignOperator {
     }
 
     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
-        if weights.len() != self.n {
-            return Err(format!(
-                "BlockDesignOperator::diag_gram weight length mismatch: weights={}, nrows={}",
-                weights.len(),
-                self.n
-            ));
-        }
+        certify_signed_weights("BlockDesignOperator::diag_gram", weights, self.n)?;
         let mut out = Array1::<f64>::zeros(self.total_cols);
         for (idx, block) in self.blocks.iter().enumerate() {
             let start = self.col_offsets[idx];
@@ -2895,7 +2922,7 @@ impl LinearOperator for BlockDesignOperator {
 
     fn apply_weighted_normal(
         &self,
-        weights: &Array1<f64>,
+        weights: FiniteSignedWeightsView<'_>,
         vector: &Array1<f64>,
         penalty: Option<&Array2<f64>>,
         ridge: f64,
@@ -2911,10 +2938,11 @@ impl LinearOperator for BlockDesignOperator {
             "BlockDesignOperator::apply_weighted_normal vector length mismatch"
         );
         // Fused: X'W(Xβ) + Sβ + ridge·β
+        let weights = weights.view();
         let xv = self.apply(vector);
         let mut weighted = xv;
         for i in 0..weighted.len() {
-            weighted[i] *= weights[i].max(0.0);
+            weighted[i] *= weights[i];
         }
         let mut out = self.apply_transpose(&weighted);
         if let Some(pen) = penalty {
@@ -2951,11 +2979,12 @@ impl DenseDesignOperator for BlockDesignOperator {
                 self.n
             ));
         }
+        certify_signed_weights("BlockDesignOperator::compute_xtwy", weights, self.n)?;
         let mut wy = Array1::<f64>::zeros(self.n);
         ndarray::Zip::from(&mut wy)
             .and(weights)
             .and(y)
-            .par_for_each(|o, &w, &yi| *o = w.max(0.0) * yi);
+            .par_for_each(|o, &w, &yi| *o = w * yi);
         Ok(self.apply_transpose(&wy))
     }
 
@@ -3997,7 +4026,7 @@ pub trait LinearOperator {
     }
     fn apply_weighted_normal(
         &self,
-        weights: &Array1<f64>,
+        weights: FiniteSignedWeightsView<'_>,
         vector: &Array1<f64>,
         penalty: Option<&Array2<f64>>,
         ridge: f64,
@@ -4012,6 +4041,7 @@ pub trait LinearOperator {
             self.ncols(),
             "apply_weighted_normal vector length mismatch"
         );
+        let weights = weights.view();
         let xv = self.apply(vector);
         let mut weighted_xv = xv;
         for i in 0..weighted_xv.len() {
@@ -4069,6 +4099,11 @@ pub trait LinearOperator {
             ));
         }
         let p = self.ncols();
+        let finite_weights = certify_signed_weights(
+            "solve_system_matrix_free_pcg_with_info_try",
+            weights,
+            self.nrows(),
+        )?;
         for retry in 0..8 {
             let ridge = if baseridge > 0.0 {
                 baseridge * 10f64.powi(retry)
@@ -4078,6 +4113,7 @@ pub trait LinearOperator {
             let normal_op = PenalizedWeightedNormalOperator {
                 operator: self,
                 weights,
+                finite_weights,
                 penalty,
                 ridge,
             };
@@ -4264,7 +4300,7 @@ impl LinearOperator for DesignMatrix {
 
     fn apply_weighted_normal(
         &self,
-        weights: &Array1<f64>,
+        weights: FiniteSignedWeightsView<'_>,
         vector: &Array1<f64>,
         penalty: Option<&Array2<f64>>,
         ridge: f64,
@@ -4279,6 +4315,7 @@ impl LinearOperator for DesignMatrix {
             self.ncols(),
             "DesignMatrix::apply_weighted_normal vector length mismatch"
         );
+        let weights_view = weights.view();
         match self {
             Self::Dense(matrix) => matrix.apply_weighted_normal(weights, vector, penalty, ridge),
             Self::Sparse(_) => {
@@ -4292,7 +4329,7 @@ impl LinearOperator for DesignMatrix {
                     let vals = csr.val();
                     let mut fused = Array1::<f64>::zeros(self.ncols());
                     for i in 0..self.nrows() {
-                        let wi = weights[i].max(0.0);
+                        let wi = weights_view[i];
                         if wi == 0.0 {
                             continue;
                         }
@@ -4315,7 +4352,7 @@ impl LinearOperator for DesignMatrix {
                     let xv = self.apply(vector);
                     let mut weighted_xv = xv;
                     for i in 0..weighted_xv.len() {
-                        weighted_xv[i] *= weights[i].max(0.0);
+                        weighted_xv[i] *= weights_view[i];
                     }
                     self.apply_transpose(&weighted_xv)
                 };
@@ -5995,8 +6032,22 @@ impl DesignMatrix {
         vector: &Array1<f64>,
         penalty: Option<&Array2<f64>>,
         ridge: f64,
-    ) -> Array1<f64> {
-        <Self as LinearOperator>::apply_weighted_normal(self, weights, vector, penalty, ridge)
+    ) -> Result<Array1<f64>, String> {
+        let finite = certify_signed_weights(
+            "DesignMatrix::apply_weighted_normal",
+            weights,
+            self.nrows(),
+        )?;
+        if vector.len() != self.ncols() {
+            return Err(format!(
+                "DesignMatrix::apply_weighted_normal vector length mismatch: vector={}, ncols={}",
+                vector.len(),
+                self.ncols()
+            ));
+        }
+        Ok(<Self as LinearOperator>::apply_weighted_normal(
+            self, finite, vector, penalty, ridge,
+        ))
     }
 
     pub fn solve_system(
