@@ -3484,7 +3484,11 @@ fn race_intrinsic_coords(
     weights: ArrayView1<'_, f64>,
     d_k: usize,
 ) -> Result<Option<(TopologyRaceFit, f64)>, String> {
-    if d_k == 0 || target.nrows() < 3 {
+    // Folds are a d ≥ 2 story: a 1-D manifold has no ambient fold a geodesic
+    // embedding could unroll that a line/circle basis does not already capture,
+    // and the geodesic 1-D embedding of a closed loop is degenerate. Restricting
+    // the challenger to d ≥ 2 also leaves the d = 1 circle-vs-line race untouched.
+    if d_k < 2 || target.nrows() < 3 {
         return Ok(None);
     }
     let embed = crate::manifold::intrinsic_geodesic_embedding(target, d_k)?;
