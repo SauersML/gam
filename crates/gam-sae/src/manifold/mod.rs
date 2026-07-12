@@ -262,8 +262,6 @@ mod tests_collapse_2132;
 mod tests_factored_htbeta;
 
 #[cfg(test)]
-
-#[cfg(test)]
 mod tests_parallelism_invariance_1557;
 
 #[cfg(test)]

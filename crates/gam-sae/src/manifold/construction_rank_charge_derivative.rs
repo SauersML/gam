@@ -1,13 +1,13 @@
-// Analytic differential of the hard Marchenko--Pastur rank charge used by the
+// Analytic differential of the production chargeable-rank penalty used by the
 // quasi-Laplace criterion. This file is included from `construction.rs` and
 // therefore shares that module's imports and private access.
 
-pub(crate) struct HardRankChargeDerivative {
+pub(crate) struct ProductionRankChargeDerivative {
     pub(crate) direct_rho: Array1<f64>,
     pub(crate) theta: SaeArrowVector,
 }
 
-struct HardRankChargeAtomDifferential {
+struct ProductionRankChargeAtomDifferential {
     gram: Array2<f64>,
     occupancy: f64,
 }
@@ -46,23 +46,23 @@ impl SaeManifoldTerm {
     }
 
     /// Differential of
-    /// `C = Σ_k ½ rank_hard,k · basis_edf,k · log(max(N_eff,k, 1))` on one
-    /// fixed MP-rank branch.
+    /// `C = Σ_k ½ rank_chargeable,k · basis_edf,k · log(max(N_eff,k, 1))`
+    /// on one fixed production-rank branch.
     ///
-    /// The hard MP count is integer-valued and therefore locally constant away
-    /// from an eigenvalue/noise-edge crossing. The smooth pieces are
+    /// The chargeable rank is integer-valued and therefore locally constant away
+    /// from an MP-edge crossing or the vanished/alive threshold. The smooth pieces are
     /// `basis_edf = tr(G(G+λS)⁻¹)` and `N_eff = Σ_i a_i²`, with
     /// `G = Σ_i a_i² φ_i φ_iᵀ`. Their exact differential supplies both the
     /// direct `log λ_smooth` channel and the implicit `(logit, t)` response.
-    /// Decoder coefficients affect only the discrete hard-rank branch, so the
+    /// Decoder coefficients affect only the discrete production-rank branch, so the
     /// within-branch beta differential is exactly zero.
-    pub(crate) fn hard_rank_charge_derivative(
+    pub(crate) fn production_rank_charge_derivative(
         &self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
-    ) -> Result<HardRankChargeDerivative, String> {
+    ) -> Result<ProductionRankChargeDerivative, String> {
         let residual = self.reconstruction_residual(target, rho)?;
         let dispersion = self.reconstruction_dispersion(loss, cache, rho, Some(residual.view()))?;
         let mut grams = self.empty_decoder_gram_accumulator();
@@ -94,16 +94,16 @@ impl SaeManifoldTerm {
             // is unchanged). Only a genuinely VANISHED decoder — the
             // Laplace-invalid regime the veto prices +∞ — remains an error
             // here, matching the value side's categorical veto.
-            let rank = spectrum.rank_chargeable(dispersion);
+            let rank = spectrum.production_chargeable_rank() as f64;
             if !(rank > 0.0) {
                 return Err(format!(
-                    "hard_rank_charge_derivative: atom {atom_idx} is on the rank-zero \
+                    "production_rank_charge_derivative: atom {atom_idx} is on the rank-zero \
                      Laplace-invalid branch (vanished decoder)"
                 ));
             }
             let log_n = n_atom.max(1.0).ln();
             if m == 0 || log_n == 0.0 {
-                atom_differentials.push(HardRankChargeAtomDifferential {
+                atom_differentials.push(ProductionRankChargeAtomDifferential {
                     gram: Array2::<f64>::zeros((m, m)),
                     occupancy: 0.0,
                 });
@@ -119,7 +119,7 @@ impl SaeManifoldTerm {
             }
             let factor = penalized_gram.cholesky(Side::Lower).map_err(|error| {
                 format!(
-                    "hard_rank_charge_derivative: atom {atom_idx} penalized Gram \
+                    "production_rank_charge_derivative: atom {atom_idx} penalized Gram \
                      factorization failed: {error}"
                 )
             })?;
@@ -152,7 +152,7 @@ impl SaeManifoldTerm {
             } else {
                 0.0
             };
-            atom_differentials.push(HardRankChargeAtomDifferential {
+            atom_differentials.push(ProductionRankChargeAtomDifferential {
                 gram: gram_differential,
                 occupancy: occupancy_differential,
             });
@@ -209,7 +209,7 @@ impl SaeManifoldTerm {
             }
         }
 
-        Ok(HardRankChargeDerivative {
+        Ok(ProductionRankChargeDerivative {
             direct_rho,
             theta: SaeArrowVector {
                 t: theta_t,

@@ -9,8 +9,8 @@
 //! Gram eigenvalues above the noise edge. Production uses `rank_chargeable`:
 //! it equals `rank_mp` when anything is detected, promotes an MP-rank-zero but
 //! numerically alive decoder to rank one, and leaves only a genuinely vanished
-//! decoder at zero (#2258). The
-//! `½·(·)·log n` Laplace charge is the correct free-energy penalty ONLY for a
+//! decoder at zero (#2258). The `½·(·)·log n` Laplace charge is the correct
+//! free-energy penalty ONLY for a
 //! REGULAR statistical model, where the log-likelihood has a non-degenerate
 //! Hessian at the MLE and the marginal likelihood expands as
 //! `−log Z = n·L_n(ŵ) + (d/2)·log n + O(1)`. Manifold atoms are SINGULAR: gauge
@@ -60,9 +60,10 @@
 //!   the hard step `1[μ_k > e]`. It recovers the regular limit exactly (a
 //!   direction far above the tempered edge contributes `½`, so a full-rank atom
 //!   recovers `½·d_eff·log n = BIC`) and discounts singular directions smoothly
-//!   (`μ_k → 0 ⇒ 0`). The soft and hard charges now cross at `μ_k = e·log n_eff`
-//!   (`λ̂_k = ¼` there); `n_eff` is floored at `e` so `log n_eff ≥ 1` and the
-//!   tempered edge is never SOFTER than the hard MP edge.
+//!   (`μ_k → 0 ⇒ 0`). The soft COUNT has its midpoint at
+//!   `μ_k = e·log n_eff` (`λ̂_k = ¼` there); this is not a crossing with
+//!   the discontinuous hard step. `n_eff` is floored at Euler's number so
+//!   `log n_eff ≥ 1` and the tempered edge is never softer than the hard MP edge.
 //!
 //! CHARGES.
 //! ```text
@@ -100,17 +101,22 @@ use super::Side;
 
 /// The reconstruction spectrum of ONE atom — the shared substrate both charges
 /// price. `mu` are the reconstruction-Gram eigenvalues `sv(diag(√λ)·Uᵀ·D)²/n_eff`
-/// (with `(λ,U)=eigh(G)`), `edge` the Marchenko–Pastur noise floor
-/// `R·(1+√(p/n_eff))²`, `basis_edf = tr(G(G+λS)⁻¹)` the ridge-trace effective
-/// basis count. This is exactly the decomposition inside
-/// [`super::construction::realised_rank_charge_dof`], surfaced so the soft (WBIC)
-/// count can be taken alongside the hard (MP) count.
+/// (with `(λ,U)=eigh(G)`), `edge` the Marchenko–Pastur detection floor
+/// `R·(1+√(p/n_eff))²`, `dispersion` is `R`, and
+/// `basis_edf = tr(G(G+λS)⁻¹)` is the ridge-trace effective basis count. This
+/// is exactly the decomposition inside
+/// [`super::construction::realised_rank_charge_dof`], surfaced so the WBIC soft
+/// count, hard MP detection count, and production chargeable count can be
+/// inspected without changing the production criterion.
 #[derive(Clone, Debug)]
 pub struct ReconSpectrum {
     /// Reconstruction-Gram eigenvalues (per-observation signal+noise energy).
     pub mu: Vec<f64>,
     /// Marchenko–Pastur noise edge the hard rank count thresholds on.
     pub edge: f64,
+    /// Reconstruction dispersion `R`, used by the production vanished-decoder
+    /// threshold `RANK_VANISHED_REL·R`.
+    pub dispersion: f64,
     /// `tr(G(G+λS)⁻¹)` — the graded effective basis-function count.
     pub basis_edf: f64,
     /// Effective sample size `Σ_row a²`.
@@ -118,31 +124,35 @@ pub struct ReconSpectrum {
 }
 
 impl ReconSpectrum {
-    /// Hard Marchenko–Pastur rank count `Σ_k 1[μ_k > e]` (the production `rank_eff`).
-    pub fn rank_hard(&self) -> f64 {
-        self.mu.iter().filter(|&&m| m > self.edge).count() as f64
+    fn rank_classification(&self) -> super::construction::ReconstructionRankClassification {
+        super::construction::classify_reconstruction_rank(
+            self.mu.iter().copied(),
+            self.edge,
+            self.dispersion,
+        )
     }
 
-    /// #2258 detection-vs-degeneracy: the CHARGEABLE rank — the hard MP count,
+    /// Hard Marchenko–Pastur detection count `Σ_k 1[μ_k > e]`.
+    ///
+    /// This is a diagnostic detection rank, not the production chargeable rank:
+    /// an alive decoder can have detection rank zero and still be charged rank
+    /// one by [`Self::production_chargeable_rank`].
+    pub fn mp_detection_rank(&self) -> usize {
+        self.rank_classification().mp_detection_rank
+    }
+
+    /// #2258 production CHARGEABLE rank — the hard MP detection count,
     /// with a below-detection-edge but numerically ALIVE atom promoted to the
     /// minimum non-degenerate rank 1. Mirrors the identical rule inside
-    /// [`super::construction::realised_rank_charge_dof`] (the value side);
+    /// [`super::construction::realised_rank_charge_dof`] through the shared
+    /// [`super::construction::classify_reconstruction_rank`] primitive;
     /// the ρ-derivative MUST take the same branch or the value/gradient pair
     /// desyncs (measured: real-GPT-2 fit priced finite by the promoted value
     /// path, then refused by the derivative's independent rank-zero invariant).
     /// Only a VANISHED decoder (top μ ≤ `RANK_VANISHED_REL`·R — the
     /// Laplace-invalid regime) stays at rank 0.
-    pub fn rank_chargeable(&self, r_floor: f64) -> f64 {
-        let hard = self.rank_hard();
-        if hard > 0.0 {
-            return hard;
-        }
-        let top = self.mu.iter().cloned().fold(0.0_f64, f64::max);
-        if top > super::construction::RANK_VANISHED_REL * r_floor {
-            1.0
-        } else {
-            0.0
-        }
+    pub fn production_chargeable_rank(&self) -> usize {
+        self.rank_classification().production_chargeable_rank
     }
 
     /// WBIC tempered soft count `Σ_k μ_k/(μ_k + e·log n_eff)` — the sigmoid that
@@ -150,8 +160,8 @@ impl ReconSpectrum {
     /// tempered by `β = 1/log n_eff`, the prior is NOT, so the edge carries the
     /// `log n_eff` temperature). Always `≤` the number of directions, each term
     /// `∈ [0, 1)`; a direction at the TEMPERED edge `μ = e·log n_eff` counts `½`.
-    /// `n_eff` is floored at `e` so the tempered edge is never softer than the
-    /// hard MP edge.
+    /// `n_eff` is floored at Euler's number so the tempered edge is never softer
+    /// than the hard MP edge.
     pub fn rank_soft(&self) -> f64 {
         let tempered_edge = self.edge * self.n_eff.max(std::f64::consts::E).ln();
         self.mu
@@ -166,7 +176,12 @@ impl ReconSpectrum {
             .sum()
     }
 
-    /// Production rank / Laplace–BIC charge `½·rank_hard·basis_edf·log N_eff`.
+    /// Theoretical hard-MP detection charge
+    /// `½·rank_mp·basis_edf·log N_eff`.
+    ///
+    /// This is deliberately not called the production charge: #2258 production
+    /// uses [`Self::production_charge`] and can promote an alive, sub-edge atom
+    /// from MP detection rank zero to chargeable rank one.
     ///
     /// #2a — the log-sample-size is the atom's OCCUPANCY-aware effective sample size
     /// `N_eff = Σ_row a²` (`self.n_eff`), NOT the global row count `n`: `N_eff` is the
@@ -175,25 +190,37 @@ impl ReconSpectrum {
     /// `n_eff`). This satisfies inert-row invariance — appending rows on which the
     /// atom's gate is OFF adds 0 to `Σa²` and so must not change the charge — which
     /// `log n` violates. Floored at `N_eff=1` to keep the log non-negative.
-    pub fn rank_charge(&self) -> f64 {
-        0.5 * self.rank_hard() * self.basis_edf * self.n_eff.max(1.0).ln()
+    pub fn mp_detection_charge(&self) -> f64 {
+        0.5 * self.mp_detection_rank() as f64 * self.basis_edf * self.n_eff.max(1.0).ln()
+    }
+
+    /// Actual production Laplace–BIC charge
+    /// `½·rank_chargeable·basis_edf·log N_eff`, including the #2258
+    /// minimum-rank promotion for an alive decoder below the MP edge.
+    pub fn production_charge(&self) -> f64 {
+        0.5
+            * self.production_chargeable_rank() as f64
+            * self.basis_edf
+            * self.n_eff.max(1.0).ln()
     }
 
     /// WBIC / singular free-energy charge `½·rank_soft·basis_edf·log N_eff`. Same
-    /// occupancy-aware `log N_eff` scale as [`Self::rank_charge`] (#2a).
+    /// occupancy-aware `log N_eff` scale as [`Self::production_charge`] (#2a).
     pub fn wbic_charge(&self) -> f64 {
         0.5 * self.rank_soft() * self.basis_edf * self.n_eff.max(1.0).ln()
     }
 
     /// Watanabe learning-coefficient estimate `λ̂ = ½·rank_soft·basis_edf` (`≤ d/2`,
     /// the singular bound); the regular Laplace coefficient is
-    /// `½·rank_hard·basis_edf`.
+    /// `½·rank_mp·basis_edf` for a resolved atom.
     ///
     /// Theorem K: this `λ̂` IS the running complexity `λ(n) = d(−log Z)/d(log n)`
     /// (the coefficient of `ln N_eff` in the atom's evidence charge) evaluated in the
-    /// FINITE-n regime. The default hard charge uses its `n→∞` limit
-    /// `½·rank_hard·basis_edf`; both are the same object, so the soft ledger reduces to
-    /// the hard one away from the MP edge and drops below it near a singularity.
+    /// FINITE-n regime. The hard-MP diagnostic uses its `n→∞` limit
+    /// `½·rank_mp·basis_edf`, so the soft ledger reduces to the hard limit away
+    /// from the edge. Near the edge, the WBIC soft count and production's
+    /// categorical minimum-rank rule answer different questions and have no
+    /// universal ordering.
     ///
     /// SYMMETRY-IS-CHARGE: a truth with a continuous symmetry — a compact stabilizer
     /// of dimension `s` acting on the atom (e.g. the O(2) rotation of a clean circle
@@ -241,6 +268,7 @@ pub fn recon_spectrum(
         return Ok(ReconSpectrum {
             mu: Vec::new(),
             edge: 0.0,
+            dispersion: r_floor,
             basis_edf: 0.0,
             n_eff,
         });
@@ -281,55 +309,68 @@ pub fn recon_spectrum(
     Ok(ReconSpectrum {
         mu,
         edge,
+        dispersion: r_floor,
         basis_edf,
         n_eff,
     })
 }
 
-/// One row of the WBIC-vs-rank-charge disagreement table.
+/// One row of the WBIC-vs-rank-charge audit table.
 #[derive(Clone, Debug)]
 pub struct AuditRow {
     /// Human name of the synthetic population.
     pub name: String,
     /// Rows the atom was fit on.
     pub n: usize,
-    /// Integer MP rank count `rank_eff`.
-    pub rank_hard: f64,
+    /// Integer count of directions above the MP detection edge.
+    pub mp_detection_rank: usize,
+    /// Integer rank the production criterion actually charges, including #2258
+    /// alive-below-edge promotion.
+    pub production_chargeable_rank: usize,
     /// WBIC tempered soft count.
     pub rank_soft: f64,
     /// Graded effective basis count.
     pub basis_edf: f64,
-    /// Production rank / BIC charge `½·rank_hard·basis_edf·log n`.
-    pub rank_charge: f64,
+    /// Theoretical hard-MP detection charge
+    /// `½·rank_mp·basis_edf·log N_eff`.
+    pub mp_detection_charge: f64,
+    /// Actual production rank / BIC charge
+    /// `½·rank_chargeable·basis_edf·log N_eff`.
+    pub production_charge: f64,
     /// WBIC / singular charge `½·rank_soft·basis_edf·log n`.
     pub wbic_charge: f64,
-    /// `rank_charge − wbic_charge` (`≥ 0` when the rank charge over-charges).
-    pub overcharge: f64,
-    /// `overcharge / rank_charge` (fractional over-charge, `NaN` if no charge).
-    pub overcharge_frac: f64,
+    /// Signed `production_charge − wbic_charge`; no universal ordering is
+    /// assumed near the MP edge.
+    pub production_minus_wbic: f64,
+    /// `production_minus_wbic / production_charge` (`NaN` if production charge
+    /// is zero).
+    pub production_delta_fraction: f64,
 }
 
 impl AuditRow {
     /// Price a named atom from its reconstruction spectrum.
     pub fn from_spectrum(name: impl Into<String>, spec: &ReconSpectrum, n: usize) -> Self {
-        let rank_charge = spec.rank_charge();
+        let mp_detection_charge = spec.mp_detection_charge();
+        let production_charge = spec.production_charge();
         let wbic_charge = spec.wbic_charge();
-        let overcharge = rank_charge - wbic_charge;
-        let overcharge_frac = if rank_charge.abs() > 0.0 {
-            overcharge / rank_charge
+        let production_minus_wbic = production_charge - wbic_charge;
+        let production_delta_fraction = if production_charge.abs() > 0.0 {
+            production_minus_wbic / production_charge
         } else {
             f64::NAN
         };
         Self {
             name: name.into(),
             n,
-            rank_hard: spec.rank_hard(),
+            mp_detection_rank: spec.mp_detection_rank(),
+            production_chargeable_rank: spec.production_chargeable_rank(),
             rank_soft: spec.rank_soft(),
             basis_edf: spec.basis_edf,
-            rank_charge,
+            mp_detection_charge,
+            production_charge,
             wbic_charge,
-            overcharge,
-            overcharge_frac,
+            production_minus_wbic,
+            production_delta_fraction,
         }
     }
 }
@@ -339,23 +380,25 @@ impl AuditRow {
 pub fn render_audit_table(rows: &[AuditRow]) -> String {
     let mut out = String::new();
     out.push_str(
-        "population              n   rank_hard rank_soft basis_edf  C_rank   C_wbic  overcharge  frac\n",
+        "population              n   r_mp r_prod  r_soft basis_edf    C_mp  C_prod  C_wbic  prod-wbic    frac\n",
     );
     out.push_str(
-        "----------------------- --- --------- --------- --------- -------- -------- ---------- ------\n",
+        "----------------------- --- ------ ------ ------- -------- ------- ------- ------- ---------- -------\n",
     );
     for r in rows {
         out.push_str(&format!(
-            "{:<23} {:>3} {:>9.3} {:>9.3} {:>9.3} {:>8.3} {:>8.3} {:>10.3} {:>6.3}\n",
+            "{:<23} {:>3} {:>6} {:>6} {:>7.3} {:>8.3} {:>7.3} {:>7.3} {:>7.3} {:>10.3} {:>7.3}\n",
             r.name,
             r.n,
-            r.rank_hard,
+            r.mp_detection_rank,
+            r.production_chargeable_rank,
             r.rank_soft,
             r.basis_edf,
-            r.rank_charge,
+            r.mp_detection_charge,
+            r.production_charge,
             r.wbic_charge,
-            r.overcharge,
-            r.overcharge_frac,
+            r.production_minus_wbic,
+            r.production_delta_fraction,
         ));
     }
     out
@@ -366,7 +409,7 @@ pub fn render_audit_table(rows: &[AuditRow]) -> String {
 /// `edge` at effective sample size `n_eff`: `λ̂_k = ½·μ/(μ + e·log n_eff)`
 /// (header derivation, lines ~40-49). The likelihood is tempered by
 /// `β = 1/log n_eff`, the REML prior is NOT — so the edge carries the
-/// `log n_eff` temperature and this is `½ ×` the production `rank_soft`
+/// `log n_eff` temperature and this is `½ ×` the diagnostic `rank_soft`
 /// per-direction term (same `tempered_edge = e·log n_eff`, `n_eff` floored at
 /// `e` so `log n_eff ≥ 1`). Exposed for the sampling cross-check test that
 /// validates the closed form against a genuine tempered-posterior expectation.
@@ -522,11 +565,10 @@ mod tests {
         Array2::from_shape_fn((n, deg + 1), |(i, c)| t[i].powi(c as i32))
     }
 
-    /// PARITY: the surfaced spectrum's hard count × basis_edf must equal the
-    /// production `realised_rank_charge_dof` d_eff bit-for-bit on the same inputs
-    /// (the audit prices the SAME quantity, then adds the soft count).
+    /// PARITY: the surfaced spectrum's production-chargeable rank × basis EDF
+    /// must equal `realised_rank_charge_dof` on the same resolved inputs.
     #[test]
-    fn spectrum_hard_count_matches_production_deff() {
+    fn spectrum_chargeable_rank_matches_production_deff() {
         let mut s = 0x0B1C_0001_u64;
         let n = 800usize;
         let p = 12usize;
@@ -570,14 +612,41 @@ mod tests {
             &gram, &decoder, n as f64, p as f64, r_floor, 0.0, None,
         )
         .unwrap();
-        let d_audit = spec.rank_hard() * spec.basis_edf;
+        let d_audit = spec.production_chargeable_rank() as f64 * spec.basis_edf;
         eprintln!(
-            "[wbic parity] production d_eff={d_prod:.10}  audit rank_hard·basis_edf={d_audit:.10}"
+            "[wbic parity] production d_eff={d_prod:.10}  \
+             audit rank_chargeable·basis_edf={d_audit:.10}"
         );
         assert!(
             (d_prod - d_audit).abs() < 1e-8,
-            "audit hard d_eff must match production: prod={d_prod} audit={d_audit}"
+            "audit chargeable d_eff must match production: prod={d_prod} audit={d_audit}"
         );
+    }
+
+    /// #2258 parity on the branch the old audit mislabeled: a nonzero decoder
+    /// can sit below the MP detection edge (rank 0) while remaining numerically
+    /// alive, and production charges it at the minimum rank 1. Both paths call
+    /// the same classifier, so this test pins the semantic and numeric contract.
+    #[test]
+    fn weak_signal_detection_zero_is_production_chargeable_one() {
+        let gram = Array2::<f64>::eye(1);
+        let decoder = Array2::<f64>::ones((1, 1));
+        let n_eff = 100.0;
+        let r_floor = 1.0;
+        let spec = recon_spectrum(&gram, &decoder, n_eff, 1.0, r_floor, 0.0, None).unwrap();
+        let d_prod = super::super::construction::realised_rank_charge_dof(
+            &gram, &decoder, n_eff, 1.0, r_floor, 0.0, None,
+        )
+        .unwrap();
+
+        assert_eq!(spec.mp_detection_rank(), 0);
+        assert_eq!(spec.production_chargeable_rank(), 1);
+        assert_eq!(d_prod, spec.basis_edf);
+        assert_eq!(
+            spec.production_charge(),
+            0.5 * d_prod * n_eff.ln()
+        );
+        assert_eq!(spec.mp_detection_charge(), 0.0);
     }
 
     #[test]
@@ -709,9 +778,11 @@ mod tests {
     /// disagreement (hard ≈ soft). (b) A CURVED atom whose spectrum piles at the
     /// edge (a filled DISK) is OVER-charged by the rank charge — `C_rank > C_wbic`
     /// by a quantified margin, the number that reprices its birth/death decision.
-    /// (c) A WEAK circle whose spectrum sits just below the edge is UNDER-charged —
-    /// the hard MP count drops it to zero while the tempered count still pays a
-    /// fractional direction. (d) A pure Gaussian blend prices ~0 under both.
+    /// (c) A WEAK circle whose spectrum sits just below the edge exposes the key
+    /// semantic split: MP detection rank is zero, production chargeable rank is
+    /// one, and WBIC still pays fractional directions. (d) A noise-only fitted
+    /// decoder has the same detection/chargeability split; only an exactly
+    /// vanished decoder has production rank zero.
     #[test]
     fn wbic_audit_disagreement_table() {
         let mut rows: Vec<AuditRow> = Vec::new();
@@ -782,10 +853,9 @@ mod tests {
 
         // (4) NEAR-SINGULAR WEAK CIRCLE — the complementary case: a weak circle
         // whose amplitude sits at the noise scale, so its reconstruction
-        // eigenvalues fall JUST BELOW the MP edge. The hard count drops to 0 (the
-        // rank charge prices this marginal structure at zero — it would birth it
-        // for free), while the tempered soft count still pays ~1 fractional
-        // direction. Direction of disagreement here is UNDER-charge, not over.
+        // eigenvalues fall JUST BELOW the MP edge. The MP detection count drops
+        // to 0, but #2258 production recognizes the decoder as alive and charges
+        // the minimum rank 1; the tempered soft count remains fractional.
         {
             let mut s = 0x4444_u64;
             let turns: Vec<f64> = (0..n).map(|_| lcg(&mut s)).collect();
@@ -832,9 +902,10 @@ mod tests {
             rows.push(AuditRow::from_spectrum("disk (curved)", &spec, n));
         }
 
-        // (6) PLANTED GAUSSIAN BLEND — a low-rank isotropic Gaussian factor: no
-        // circle structure at all, every harmonic direction is noise ⇒ both
-        // charges should be ~0 (nothing above the edge). A sanity floor.
+        // (6) PLANTED GAUSSIAN BLEND — no circle structure, so every harmonic
+        // direction remains below the MP edge. The fitted decoder is nevertheless
+        // nonzero, hence production charges rank 1 rather than treating a weak
+        // noise fit as a vanished decoder.
         {
             let mut s = 0x6666_u64;
             let turns: Vec<f64> = (0..n).map(|_| lcg(&mut s)).collect();
@@ -848,34 +919,49 @@ mod tests {
             }
             let w = vec![1.0_f64; n];
             let spec = spectrum_from_fit(data.view(), &w, &phi, 0.01, 0.0, None).unwrap();
-            rows.push(AuditRow::from_spectrum("gaussian blend (null)", &spec, n));
+            rows.push(AuditRow::from_spectrum("gaussian blend (noise)", &spec, n));
         }
+
+        // (7) EXACT VANISHING — only this degeneracy branch remains production
+        // rank zero. It is distinct from statistical non-detection.
+        rows.push(AuditRow::from_spectrum(
+            "decoder vanished",
+            &ReconSpectrum {
+                mu: vec![0.0; 7],
+                edge: 0.01 * (1.0 + (p as f64 / n as f64).sqrt()).powi(2),
+                dispersion: 0.01,
+                basis_edf: 7.0,
+                n_eff: n as f64,
+            },
+            n,
+        ));
 
         eprintln!("\n{}", render_audit_table(&rows));
 
         // Structural assertions on the disagreement pattern. The disagreement is
         // concentrated at the MP edge (singular / near-singular configs) and runs
-        // in BOTH directions — over-charge when a curved atom's spectrum piles
-        // just above the edge, under-charge when a weak atom's spectrum sits just
-        // below it. Both are the honest Watanabe correction to the hard MP count.
+        // in BOTH directions for the hard-MP diagnostic. Production's separate
+        // minimum-rank rule is surfaced explicitly instead of being mislabeled as
+        // the MP count.
         let get = |name: &str| rows.iter().find(|r| r.name == name).unwrap().clone();
         let line = get("line (regular)");
         let clusters = get("clusters (regular)");
         let near = get("circle near-edge (singular)");
         let disk = get("disk (curved)");
-        let blend = get("gaussian blend (null)");
+        let blend = get("gaussian blend (noise)");
+        let vanished = get("decoder vanished");
 
         // (a) regular atoms (strong directions far above the edge, the rest far
         // below) ⇒ hard ≈ soft, near-zero disagreement in either direction.
         assert!(
-            line.overcharge_frac.abs() < 0.05,
+            line.production_delta_fraction.abs() < 0.05,
             "regular line must show ~no disagreement; frac={:.3}",
-            line.overcharge_frac
+            line.production_delta_fraction
         );
         assert!(
-            clusters.overcharge_frac.abs() < 0.05,
+            clusters.production_delta_fraction.abs() < 0.05,
             "regular clusters must show ~no disagreement; frac={:.3}",
-            clusters.overcharge_frac
+            clusters.production_delta_fraction
         );
         // (b) THE HEADLINE — the disk is a curved atom whose radial spread pushes
         // its two reconstruction directions to the edge: the hard count prices
@@ -884,39 +970,51 @@ mod tests {
         // This is the number that reprices every birth/death decision for singular
         // curved atoms.
         assert!(
-            disk.overcharge > 0.0 && disk.overcharge_frac > 0.15,
-            "curved disk must be OVER-charged (C_rank > C_wbic) by a clear fraction; \
-             overcharge={:.3} frac={:.3}",
-            disk.overcharge,
-            disk.overcharge_frac
+            disk.production_minus_wbic > 0.0 && disk.production_delta_fraction > 0.15,
+            "curved disk must be OVER-charged (C_prod > C_wbic) by a clear fraction; \
+             delta={:.3} frac={:.3}",
+            disk.production_minus_wbic,
+            disk.production_delta_fraction
         );
         assert!(
-            disk.overcharge_frac > line.overcharge_frac + 0.1
-                && disk.overcharge_frac > clusters.overcharge_frac + 0.1,
+            disk.production_delta_fraction > line.production_delta_fraction + 0.1
+                && disk.production_delta_fraction > clusters.production_delta_fraction + 0.1,
             "singular over-charge fraction ({:.3}) must exceed the regular atoms' \
              (line {:.3}, clusters {:.3}) by a clear margin",
-            disk.overcharge_frac,
-            line.overcharge_frac,
-            clusters.overcharge_frac
+            disk.production_delta_fraction,
+            line.production_delta_fraction,
+            clusters.production_delta_fraction
         );
-        // (c) the complementary UNDER-charge: the weak near-edge circle's spectrum
-        // sits BELOW the MP edge, so the hard count drops it to 0 (rank charge
-        // prices this marginal structure at zero — it would birth it for free),
-        // while the tempered count still pays a fractional direction.
+        // (c) the weak near-edge circle is not MP-detected but is production-
+        // chargeable. The two ranks must remain separately visible.
         assert!(
-            near.rank_hard == 0.0 && near.rank_soft > near.rank_hard,
-            "weak near-edge circle must show the hard count dropping below the soft \
-             count (under-charge): hard={:.3} soft={:.3}",
-            near.rank_hard,
+            near.mp_detection_rank == 0
+                && near.production_chargeable_rank == 1
+                && near.rank_soft > 0.0
+                && near.mp_detection_charge == 0.0
+                && near.production_charge > 0.0,
+            "weak near-edge circle must distinguish MP non-detection from production \
+             chargeability: mp={} prod={} soft={:.3}",
+            near.mp_detection_rank,
+            near.production_chargeable_rank,
             near.rank_soft
         );
-        // (d) the null blend: hard count exactly 0; the soft count is negligible.
+        // (d) A fitted noise decoder is alive even when MP-undetected; an exactly
+        // vanished decoder, and only that fixture, stays production rank zero.
         assert!(
-            blend.rank_hard == 0.0 && blend.rank_soft < 0.3,
-            "gaussian blend must price ~0: rank_hard={:.3} rank_soft={:.3}",
-            blend.rank_hard,
+            blend.mp_detection_rank == 0
+                && blend.production_chargeable_rank == 1
+                && blend.rank_soft < 0.3,
+            "noise fit must distinguish MP rank from production rank: \
+             mp={} prod={} soft={:.3}",
+            blend.mp_detection_rank,
+            blend.production_chargeable_rank,
             blend.rank_soft
         );
+        assert_eq!(vanished.mp_detection_rank, 0);
+        assert_eq!(vanished.production_chargeable_rank, 0);
+        assert_eq!(vanished.production_charge, 0.0);
+        assert_eq!(vanished.wbic_charge, 0.0);
     }
 
     /// #2a INERT-ROW INVARIANCE (the correctness criterion for the occupancy scale).
@@ -926,7 +1024,7 @@ mod tests {
     /// satisfies this exactly — the appended zero-weight rows add 0 to Σa² and 0 to the
     /// Gram, so the whole reconstruction spectrum is bit-identical. The OLD global-row
     /// scale (½·d_eff·ln n_obs) VIOLATES it: n_obs grows from N to N+M, inflating the
-    /// charge of a real (rank_hard>0) atom by ½·d_eff·ln((N+M)/N) nats — a spurious
+    /// charge of a real (rank_chargeable>0) atom by ½·d_eff·ln((N+M)/N) nats — a spurious
     /// penalty for exactly the sparse, selective atoms an SAE exists to find.
     #[test]
     fn rank_charge_is_inert_row_invariant() {
@@ -973,23 +1071,29 @@ mod tests {
 
         // THE AXIOM: the fixed charge is bit-identical across the inert-row append.
         assert_eq!(
-            spec_before.rank_charge(),
-            spec_after.rank_charge(),
+            spec_before.production_charge(),
+            spec_after.production_charge(),
             "inert (gate-off) rows must not change the rank charge: before={} after={}",
-            spec_before.rank_charge(),
-            spec_after.rank_charge()
+            spec_before.production_charge(),
+            spec_after.production_charge()
         );
         // N_eff is invariant (that is WHY the charge is); n_obs is not.
         assert_eq!(spec_before.n_eff, spec_after.n_eff);
         // FALSIFY THE OLD SCALE: under ½·d_eff·ln(n_obs) the same append would have
-        // inflated the charge (rank_hard>0, n_obs grows N→N+M), so the two scales are
+        // inflated the charge (rank_chargeable>0, n_obs grows N→N+M), so the two scales are
         // genuinely different and this test would fail on the pre-#2a code.
         assert!(
-            spec_after.rank_hard() > 0.0,
-            "fixture must have a real above-edge atom"
+            spec_after.production_chargeable_rank() > 0,
+            "fixture must have a real chargeable atom"
         );
-        let old_before = 0.5 * spec_before.rank_hard() * spec_before.basis_edf * (n as f64).ln();
-        let old_after = 0.5 * spec_after.rank_hard() * spec_after.basis_edf * (n_aug as f64).ln();
+        let old_before = 0.5
+            * spec_before.production_chargeable_rank() as f64
+            * spec_before.basis_edf
+            * (n as f64).ln();
+        let old_after = 0.5
+            * spec_after.production_chargeable_rank() as f64
+            * spec_after.basis_edf
+            * (n_aug as f64).ln();
         assert!(
             old_after > old_before + 1e-6,
             "the OLD global-n scale WOULD have inflated the charge on inert rows \
@@ -998,31 +1102,34 @@ mod tests {
     }
 
     /// #2a EXPLICIT FORMULA on a known small fixture: the rank charge is
-    /// ½·d_eff·ln N_eff with d_eff = rank_hard·basis_edf and N_eff the occupancy-aware
+    /// ½·d_eff·ln N_eff with d_eff = rank_chargeable·basis_edf and N_eff the occupancy-aware
     /// effective sample size — NOT the global row count. Pins the scale so a regression
     /// back to ln(n) is caught.
     #[test]
     fn rank_charge_equals_half_deff_ln_neff() {
         // One strong direction far above the edge (mu=10 ≫ edge=1) and one far below
-        // (mu=0.01): rank_hard = 1. Small hand-set numbers, no fit.
+        // (mu=0.01): MP and production ranks are both 1. Small hand-set numbers,
+        // no fit.
         let spec = ReconSpectrum {
             mu: vec![10.0, 0.01],
             edge: 1.0,
+            dispersion: 1.0,
             basis_edf: 3.0,
             n_eff: 50.0,
         };
-        assert_eq!(spec.rank_hard(), 1.0);
-        let d_eff = spec.rank_hard() * spec.basis_edf; // 3.0
+        assert_eq!(spec.mp_detection_rank(), 1);
+        assert_eq!(spec.production_chargeable_rank(), 1);
+        let d_eff = spec.production_chargeable_rank() as f64 * spec.basis_edf; // 3.0
         let expected = 0.5 * d_eff * (50.0_f64).ln();
         assert!(
-            (spec.rank_charge() - expected).abs() < 1e-12,
+            (spec.production_charge() - expected).abs() < 1e-12,
             "rank charge must be ½·d_eff·ln(N_eff)={expected}, got {}",
-            spec.rank_charge()
+            spec.production_charge()
         );
         // And it must NOT equal the global-n form for any n != N_eff (here n=5000).
         let global = 0.5 * d_eff * (5000.0_f64).ln();
         assert!(
-            (spec.rank_charge() - global).abs() > 1.0,
+            (spec.production_charge() - global).abs() > 1.0,
             "charge must use N_eff (50), not a global n (5000)"
         );
     }
@@ -1054,12 +1161,13 @@ mod tests {
         }
         let w = vec![1.0_f64; n];
         let clean = spectrum_from_fit(data.view(), &w, &phi, 0.0025, 0.0, None).unwrap();
-        // soft charge == wbic_charge; hard == rank_charge. Reduction: within 5%.
-        assert!(clean.rank_charge() > 0.0);
+        // Soft charge is WBIC; hard production charge uses the chargeable rank.
+        // Reduction: within 5%.
+        assert!(clean.production_charge() > 0.0);
         // soft ≈ hard away from the edge: the two strong directions each count ≈1 under
         // the sigmoid, so the ratio sits near 1 (it can be marginally ABOVE 1 because
         // the far-below-edge harmonics still add a little soft mass the hard step drops).
-        let clean_ratio = clean.wbic_charge() / clean.rank_charge();
+        let clean_ratio = clean.wbic_charge() / clean.production_charge();
         assert!(
             (clean_ratio - 1.0).abs() < 0.05,
             "clean circle: soft ledger must reduce to the hard charge away from the edge \
@@ -1082,22 +1190,23 @@ mod tests {
         }
         let disk = spectrum_from_fit(data.view(), &w, &phi, 0.12 * 0.12, 0.0, None).unwrap();
         assert!(
-            disk.rank_hard() > 0.0 && disk.rank_soft() < disk.rank_hard(),
+            disk.mp_detection_rank() > 0
+                && disk.rank_soft() < disk.mp_detection_rank() as f64,
             "disk fixture must have above-edge directions the tempered count discounts: \
              hard={:.3} soft={:.3}",
-            disk.rank_hard(),
+            disk.mp_detection_rank(),
             disk.rank_soft()
         );
         assert!(
-            disk.wbic_charge() < disk.rank_charge(),
+            disk.wbic_charge() < disk.production_charge(),
             "disk: soft ledger must undercut the hard charge near the edge \
              (soft={:.4} hard={:.4})",
             disk.wbic_charge(),
-            disk.rank_charge()
+            disk.production_charge()
         );
         // The discount must be materially larger for the near-edge disk than for the
         // far-from-edge circle — the whole point of the soft regime.
-        let disk_ratio = disk.wbic_charge() / disk.rank_charge();
+        let disk_ratio = disk.wbic_charge() / disk.production_charge();
         assert!(
             disk_ratio < clean_ratio - 0.1,
             "near-edge soft/hard ratio ({disk_ratio:.3}) must be clearly below the \

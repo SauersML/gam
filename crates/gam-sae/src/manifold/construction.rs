@@ -57,10 +57,13 @@ pub struct StreamingRankInputs {
 /// (m×p), effective sample size `n_eff = Σ_row a²`, output dim `p_out`, noise floor
 /// `r_floor` (dispersion R, assumed already guarded > 0), and smoothness `(lam_smooth,
 /// smooth_penalty)`.
-///   * `rank_eff` = Marchenko–Pastur HARD count on the per-atom reconstruction Gram
+///   * `rank_detected` = Marchenko–Pastur HARD detection count on the per-atom
+///     reconstruction Gram
 ///     `(1/n_eff)·BᵀB`, `B = diag(a)·Φ·D`: eigenvalues = svd(diag(√λ)·Uᵀ·D)²/n_eff with
 ///     `(λ,U)=eigh(gram)`; count those above `R·(1+√(p/n_eff))²` (a real rank-2 circle
-///     → 2, a vanishing decoder → 0).  [#1893/#11]
+///     → 2). `rank_eff` is the production chargeable rank: it equals
+///     `rank_detected` unless the #2258 alive-below-edge rule promotes 0 to 1;
+///     only a vanished decoder remains 0. [#1893/#11]
 ///   * `basis_edf = tr(gram·(gram+λS)⁻¹)`.
 /// This is the source of truth the term-level `rank_dof_from_grams` (dense + #9
 /// streaming) loops, AND that the #2023 migration gate prices linear/curved candidates
@@ -273,7 +276,7 @@ pub(crate) fn realised_rank_charge_dof(
     if m == 0 || n_eff == 0.0 {
         return Ok(0.0);
     }
-    // rank_eff: MP hard count on the reconstruction Gram. U orthogonal ⇒ svd of
+    // MP detection rank on the reconstruction Gram. U orthogonal ⇒ svd of
     // diag(√λ)·Uᵀ·D equals svd of the reconstruction square root G^½·D.
     let (evals, u) = gram
         .eigh(super::Side::Lower)
@@ -298,7 +301,7 @@ pub(crate) fn realised_rank_charge_dof(
         edge,
         r_floor,
     );
-    // DETECTION vs DEGENERACY (#2258 real-activation class). rank_eff == 0
+    // DETECTION vs DEGENERACY (#2258 real-activation class). MP rank zero
     // conflated two regimes with opposite correct handling:
     //   · VANISHED decoder (a²‖B‖² → 0): the β-mode is degenerate, the
     //     β-Schur log-det → −∞ is the Laplace approximation BREAKING DOWN,
@@ -322,15 +325,15 @@ pub(crate) fn realised_rank_charge_dof(
         log::debug!(
             "realised_rank_charge_dof: below-detection-edge atom promoted to rank 1 — \
              top sv²/n_eff={:.6e} vs MP edge={edge:.6e} \
-             (R={r_floor:.6e}, n_eff={n_eff:.3e}, p_out={p_out})"
-            , rank.top_signal
+             (R={r_floor:.6e}, n_eff={n_eff:.3e}, p_out={p_out})",
+            rank.top_signal
         );
     } else if rank.production_chargeable_rank == 0 {
         log::debug!(
             "realised_rank_charge_dof: VANISHED decoder (categorical veto upstream) — \
              top sv²/n_eff={:.6e} ≤ {RANK_VANISHED_REL:.0e}·R (R={r_floor:.6e}, \
-             n_eff={n_eff:.3e}, p_out={p_out})"
-            , rank.top_signal
+             n_eff={n_eff:.3e}, p_out={p_out})",
+            rank.top_signal
         );
     }
     // basis_edf = tr(gram·(gram+λS)⁻¹).

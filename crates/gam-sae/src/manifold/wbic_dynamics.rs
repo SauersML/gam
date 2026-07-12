@@ -105,8 +105,11 @@ pub struct AtomLambdaTrajectory {
     pub lambda: Vec<f64>,
     /// WBIC tempered soft rank count at every checkpoint.
     pub rank_soft: Vec<f64>,
-    /// Hard Marchenko–Pastur rank count at every checkpoint (integer-valued).
-    pub rank_hard: Vec<f64>,
+    /// Hard Marchenko–Pastur detection count at every checkpoint.
+    pub mp_detection_rank: Vec<usize>,
+    /// Rank the production criterion charges at every checkpoint, including the
+    /// #2258 promotion of an alive decoder below the MP detection edge.
+    pub production_chargeable_rank: Vec<usize>,
     /// Consecutive-step jumps with their birth evidence.
     pub jumps: Vec<LambdaJump>,
     /// Per-atom anytime-valid ledger: one calibrated e-value per step under the
@@ -230,7 +233,8 @@ pub fn wbic_lambda_dynamics(input: &WbicDynamicsInput<'_>) -> Result<WbicDynamic
         // --- λ_k(step) time series: the WBIC learning coefficient per checkpoint.
         let mut lambda = Vec::with_capacity(n_checkpoints);
         let mut rank_soft = Vec::with_capacity(n_checkpoints);
-        let mut rank_hard = Vec::with_capacity(n_checkpoints);
+        let mut mp_detection_rank = Vec::with_capacity(n_checkpoints);
+        let mut production_chargeable_rank = Vec::with_capacity(n_checkpoints);
         let mut lambda_se = Vec::with_capacity(n_checkpoints);
         for c in 0..n_checkpoints {
             let curve = input.decoder_grid.slice(ndarray::s![c, atom, .., ..]);
@@ -242,7 +246,8 @@ pub fn wbic_lambda_dynamics(input: &WbicDynamicsInput<'_>) -> Result<WbicDynamic
             })?;
             lambda.push(spec.learning_coefficient());
             rank_soft.push(spec.rank_soft());
-            rank_hard.push(spec.rank_hard());
+            mp_detection_rank.push(spec.mp_detection_rank());
+            production_chargeable_rank.push(spec.production_chargeable_rank());
             lambda_se.push(lambda_jackknife_se(curve, input.r_floor));
         }
 
@@ -296,7 +301,8 @@ pub fn wbic_lambda_dynamics(input: &WbicDynamicsInput<'_>) -> Result<WbicDynamic
             atom_name,
             lambda,
             rank_soft,
-            rank_hard,
+            mp_detection_rank,
+            production_chargeable_rank,
             jumps,
             birth_evidence,
             transports,

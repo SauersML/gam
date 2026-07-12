@@ -725,7 +725,7 @@ impl SaeManifoldTerm {
             .loss(target, rho)
             .map_err(OuterGradientError::internal)?;
         let rank_charge = self
-            .hard_rank_charge_derivative(target, rho, &loss, cache)
+            .production_rank_charge_derivative(target, rho, &loss, cache)
             .map_err(OuterGradientError::internal)?;
         let mut gamma = self
             .logdet_theta_adjoint(rho, cache, solver)
@@ -790,7 +790,7 @@ impl SaeManifoldTerm {
             .loss(target, rho)
             .map_err(OuterGradientError::internal)?;
         let rank_charge = self
-            .hard_rank_charge_derivative(target, rho, &loss, cache)
+            .production_rank_charge_derivative(target, rho, &loss, cache)
             .map_err(OuterGradientError::internal)?;
         let mut gamma = self
             .logdet_theta_adjoint_from_probes(rho, cache, probes, inverse_probes)
@@ -882,7 +882,7 @@ impl SaeManifoldTerm {
         let mut occam = Array1::<f64>::zeros(n_params);
         let mut third_order_correction = Array1::<f64>::zeros(n_params);
         let rank_charge = self
-            .hard_rank_charge_derivative(target, rho, loss, cache)
+            .production_rank_charge_derivative(target, rho, loss, cache)
             .map_err(OuterGradientError::internal)?;
 
         if let Some(sparse_index) = rho.sparse_flat_index() {

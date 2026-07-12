@@ -153,13 +153,13 @@ fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
         )
         .expect("frozen accepted-state gradient components");
     let rank_charge_derivative = audit_term
-        .hard_rank_charge_derivative(
+        .production_rank_charge_derivative(
             gradient_objective.target.view(),
             &rho_state,
             &audit_loss,
             &audit_cache,
         )
-        .expect("frozen accepted-state hard-rank-charge derivative");
+        .expect("frozen accepted-state production-rank-charge derivative");
     let plain_audit_solver = DeflatedArrowSolver::plain(&audit_cache);
     let plain_audit_components = audit_term
         .analytic_outer_rho_gradient_components(

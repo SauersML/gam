@@ -679,9 +679,9 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
     let base_spectrum = spectrum(&base_decoder);
     let d0 = d_eff(&base_decoder);
     assert!(
-        base_spectrum.rank_hard() >= 1.0 && d0 > 0.0,
+        base_spectrum.mp_detection_rank() >= 1 && d0 > 0.0,
         "resolved circle must begin above the MP edge; rank={}, d_eff={d0}",
-        base_spectrum.rank_hard(),
+        base_spectrum.mp_detection_rank(),
     );
 
     // First certify the continuous part of the scaling law. The edge and EDF are
@@ -716,7 +716,7 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
         let old_proxy_shift = 0.5 * (nc.ln() - n0.ln());
         eprintln!(
             "[#2099 scale law] c={c:>4}: hard rank={} | old ½log‖B‖² shift={old_proxy_shift:+.4}",
-            scaled_spectrum.rank_hard(),
+            scaled_spectrum.mp_detection_rank(),
         );
         assert!(
             old_proxy_shift.abs() > 0.1,
