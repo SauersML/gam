@@ -6646,6 +6646,47 @@ mod tests {
         assert_eq!(sz_built.penalties.len(), sz_built.null_eigenvectors.len());
     }
 
+    #[test]
+    fn sz_penalty_metadata_is_emitted_in_matrix_order_2289() {
+        let ds = continuous_x_factor_dataset(180, 4);
+        let mut workspace = crate::basis::BasisWorkspace::new();
+        let spec = factor_smooth_spec_for(
+            "y ~ s(x, g, bs=sz, k=8, double_penalty=true)",
+            &ds,
+        );
+        let built = crate::smooth::build_factor_smooth(
+            ds.values.view(),
+            &spec,
+            "sz_metadata_order",
+            &mut workspace,
+        )
+        .expect("build multi-penalty sz smooth");
+        let n_levels = spec
+            .group_frozen_levels
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or(4);
+
+        assert_eq!(built.penalties.len(), built.penaltyinfo.len());
+        assert!(built.penaltyinfo.len() >= 2 * n_levels);
+        for (idx, (penalty, info)) in built
+            .penalties
+            .iter()
+            .zip(built.penaltyinfo.iter())
+            .enumerate()
+        {
+            let analysis = crate::basis::analyze_penalty_block(penalty).expect("PSD penalty");
+            assert_eq!(info.original_index, idx);
+            assert_eq!(info.effective_rank, analysis.rank, "penalty {idx}");
+        }
+        assert!(built.penaltyinfo[..n_levels]
+            .iter()
+            .all(|info| matches!(info.source, PenaltySource::Primary)));
+        assert!(built.penaltyinfo[n_levels..2 * n_levels]
+            .iter()
+            .all(|info| matches!(info.source, PenaltySource::DoublePenaltyNullspace)));
+    }
+
     /// #1457: `y ~ s(x, by=g) + g` with a BARE categorical `g` must NOT lower to
     /// two `g` design blocks. The bare `+ g` is auto-promoted to a single
     /// penalized random-effect block owning the factor's full level offsets; the

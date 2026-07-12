@@ -8221,7 +8221,15 @@ pub fn build_single_local_smooth_term(
                     }
                 }
             }
-            let mut penalties = Vec::<Array2<f64>>::with_capacity(inner_built.penalties.len());
+            // Keep each emitted matrix, reported REML nullity, and metadata in
+            // one record until the legacy LocalSmoothTermBuild boundary. The
+            // former implementation mutated level-0 metadata in its original
+            // marginal slot but appended later levels, producing a different
+            // order from the marginal-major matrix emission when two marginal
+            // penalties were active (#2289).
+            let mut emissions = Vec::<(Array2<f64>, usize, PenaltyInfo)>::with_capacity(
+                inner_built.penalties.len() * levels.len(),
+            );
             let active_penalty_indices = inner_built
                 .penaltyinfo
                 .iter()
@@ -8294,7 +8302,6 @@ pub fn build_single_local_smooth_term(
             // OWN nullity (a rank-`p` block touching a single level for the free
             // blocks; the coupling block is rank-`p` over the diagonal sum), and
             // the null ridges below record their own nullity.
-            let mut nullspaces = Vec::<usize>::with_capacity(penalties.capacity());
             for (penalty_pos, s_inner) in inner_built.penalties.iter().enumerate() {
                 let info_idx = active_penalty_indices[penalty_pos];
                 let base_info = inner_built.penaltyinfo[info_idx].clone();
@@ -8311,29 +8318,18 @@ pub fn build_single_local_smooth_term(
                     if block.rank == 0 {
                         continue;
                     }
-                    if which_level == 0 {
-                        // Reuse the marginal's own info slot for the first block so
-                        // the existing normalization bookkeeping stays attached.
-                        inner_built.penaltyinfo[info_idx].normalization_scale *= group_scale;
-                        inner_built.penaltyinfo[info_idx].original_index = penalties.len();
-                        inner_built.penaltyinfo[info_idx].effective_rank = block.rank;
-                        inner_built.penaltyinfo[info_idx].nullspace_dim_hint = block.nullity;
-                    } else {
-                        let mut info = base_info.clone();
-                        info.original_index = penalties.len();
-                        info.normalization_scale = base_info.normalization_scale * group_scale;
-                        info.effective_rank = block.rank;
-                        info.nullspace_dim_hint = block.nullity;
-                        info.kronecker_factors = None;
-                        inner_built.penaltyinfo.push(info);
-                    }
-                    penalties.push(block.sym_penalty);
+                    let mut info = base_info.clone();
+                    info.original_index = emissions.len();
+                    info.normalization_scale = base_info.normalization_scale * group_scale;
+                    info.effective_rank = block.rank;
+                    info.nullspace_dim_hint = marginal_nullity;
+                    info.kronecker_factors = None;
                     // The coupling block (which_level == l_minus_one) spans the
                     // marginal range on the diagonal-sum direction; the free
                     // blocks touch one level. Both leave the marginal null space
                     // unpenalized, recorded here so the null ridges below complete
                     // the double penalty.
-                    nullspaces.push(marginal_nullity);
+                    emissions.push((block.sym_penalty, marginal_nullity, info));
                 }
             }
 
@@ -8385,11 +8381,9 @@ pub fn build_single_local_smooth_term(
                         normalize_penalty_in_constrained_space(&stz_pooled_null);
                     let null_block = crate::basis::analyze_penalty_block_with_op(&s_null, None)?;
                     if null_block.rank > 0 {
-                        let original_index = penalties.len();
-                        penalties.push(null_block.sym_penalty);
-                        nullspaces.push(null_block.nullity);
-                        inner_built.penaltyinfo.push(PenaltyInfo {
-                            source: PenaltySource::Primary,
+                        let original_index = emissions.len();
+                        emissions.push((null_block.sym_penalty, null_block.nullity, PenaltyInfo {
+                            source: PenaltySource::DoublePenaltyNullspace,
                             original_index,
                             active: true,
                             effective_rank: null_block.rank,
@@ -8397,22 +8391,40 @@ pub fn build_single_local_smooth_term(
                             nullspace_dim_hint: null_block.nullity,
                             normalization_scale: null_scale,
                             kronecker_factors: None,
-                        });
+                        }));
                     }
                 }
             }
+            let mut penalties = Vec::with_capacity(emissions.len());
+            let mut nullspaces = Vec::with_capacity(emissions.len());
+            let mut penaltyinfo = Vec::with_capacity(emissions.len());
+            for (penalty, nullity, info) in emissions {
+                penalties.push(penalty);
+                nullspaces.push(nullity);
+                penaltyinfo.push(info);
+            }
+            let mut inherited_dropped = inner_built
+                .penaltyinfo
+                .iter()
+                .filter(|info| !info.active)
+                .cloned()
+                .collect::<Vec<_>>();
+            inherited_dropped.extend(std::mem::take(
+                &mut inner_built.pre_dropped_penaltyinfo,
+            ));
             inner_built.dim = p * l_minus_one;
             inner_built.design =
                 DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(dense));
             inner_built.penalties = penalties;
             inner_built.ops = vec![None; inner_built.penalties.len()];
             inner_built.nullspaces = nullspaces;
+            inner_built.penaltyinfo = penaltyinfo;
+            inner_built.pre_dropped_penaltyinfo = inherited_dropped;
             // Invariant: `null_eigenvectors[k]` must mirror `penalties[k]`'s
             // spectral null space. We just rebuilt `inner_built.penalties` from
             // Kronecker-like `S_big` blocks, so the previously-plumbed
             // `null_eigenvectors` (still parallel to the OLD per-level penalty)
             // is stale. Recompute from the rebuilt penalties to restore the
-            // invariant; ditto for the joint-null absorption rotation.
             inner_built.null_eigenvectors =
                 crate::basis::recompute_null_eigenvectors(&inner_built.penalties)?;
             inner_built.joint_null_rotation =
