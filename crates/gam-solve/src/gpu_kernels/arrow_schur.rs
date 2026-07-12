@@ -627,6 +627,30 @@ pub fn gpu_schur_matvec_backend(
     }
 }
 
+/// #1017 evidence lane: a device-resident, RUN-TO-RUN DETERMINISTIC framed
+/// reduced-Schur `S·v` for the SLQ/surrogate `log|S|` matvec, or `None` when the
+/// device/shape declines. CPU and non-Linux always return `None`, so the evidence
+/// matvec is byte-identical there. Unlike `gpu_schur_matvec_backend` (whose
+/// matrix-free branch returns the CPU row-procedural closure), this engages the
+/// resident device apply — but only via an atomics-free reduction, so it upholds
+/// `slq_reduced_schur_log_det`'s determinism contract.
+pub fn build_framed_resident_evidence_matvec(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    apply_budget: usize,
+) -> Option<crate::arrow_schur::GpuSchurMatvec> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (sys, ridge_t, ridge_beta, apply_budget);
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        cuda::build_framed_resident_evidence_matvec(sys, ridge_t, ridge_beta, apply_budget)
+    }
+}
+
 /// Build a row-procedural reduced-Schur matvec for matrix-free SAE Kronecker
 /// systems, eliminating the per-row latent block via cached per-row Cholesky
 /// factors and applying the cross-block through the sparse forward/transpose
@@ -5465,6 +5489,74 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         }
     }
 
+    /// #1017 evidence lane: build a device-resident, RUN-TO-RUN DETERMINISTIC
+    /// framed reduced-Schur `S·v` as the SLQ/surrogate `GpuSchurMatvec`. Uploads
+    /// the ridge-independent framed operands ONCE ([`ResidentSaeFrameHandle`]),
+    /// primes `ainv` at the single evidence `ridge_t`, and returns a closure that
+    /// per apply crosses only `x` (down) and `out` (up): the deterministic host
+    /// penalty ([`super::sae_framed_penalty_matvec_cpu`]) plus the atomics-free
+    /// device reduced-Schur term ([`launch_sae_frame_reduced_schur_det`]). `None`
+    /// on any decline (no device / shape / offload floor / non-PD at this ridge),
+    /// so the caller keeps the CPU row-procedural matvec. A per-apply device fault
+    /// after a validated build is a genuine bug/OOM and panics LOUD (the #1551
+    /// no-silent-CPU discipline) rather than silently degrading the evidence.
+    pub(super) fn build_framed_resident_evidence_matvec(
+        sys: &ArrowSchurSystem,
+        ridge_t: f64,
+        ridge_beta: f64,
+        apply_budget: usize,
+    ) -> Option<crate::arrow_schur::GpuSchurMatvec> {
+        let handle = ResidentSaeFrameHandle::build(sys, apply_budget)?;
+        handle.prime_ainv(sys, ridge_t).ok()?;
+        let data = sys.device_sae_pcg.as_ref()?.clone();
+        let handle = Arc::new(handle);
+        let k = handle.k;
+        let closure: crate::arrow_schur::GpuSchurMatvec =
+            Arc::new(move |x: &Array1<f64>, out: &mut Array1<f64>| {
+                assert_eq!(x.len(), k, "#1017 framed evidence matvec: x.len() != k");
+                assert_eq!(out.len(), k, "#1017 framed evidence matvec: out.len() != k");
+                let module = pcg_vector_module(&handle.ctx)
+                    .expect("#1017 framed evidence matvec: pcg_vector_module unavailable");
+                let x_slice = x
+                    .as_slice()
+                    .expect("#1017 framed evidence matvec: x not contiguous");
+                let x_dev = handle
+                    .stream
+                    .clone_htod(x_slice)
+                    .expect("#1017 framed evidence matvec: htod(x) failed");
+                let mut reduced_dev = handle
+                    .stream
+                    .alloc_zeros::<f64>(k)
+                    .expect("#1017 framed evidence matvec: device alloc failed");
+                {
+                    let mut buffers = handle
+                        .buffers
+                        .lock()
+                        .expect("#1017 framed evidence matvec: resident frame poisoned");
+                    launch_sae_frame_reduced_schur_det(
+                        &handle.stream,
+                        module,
+                        &mut buffers,
+                        &x_dev,
+                        &mut reduced_dev,
+                    )
+                    .expect("#1017 framed evidence matvec: device reduced-Schur launch failed");
+                }
+                let reduced = handle
+                    .stream
+                    .clone_dtoh(&reduced_dev)
+                    .expect("#1017 framed evidence matvec: dtoh(out) failed");
+                let out_slice = out
+                    .as_slice_mut()
+                    .expect("#1017 framed evidence matvec: out not contiguous");
+                super::sae_framed_penalty_matvec_cpu(&data, ridge_beta, x_slice, out_slice);
+                for a in 0..k {
+                    out_slice[a] += reduced[a];
+                }
+            });
+        Some(closure)
+    }
+
     /// #1551 stage-isolating triage seam: run the framed reduced-Schur matvec
     /// `out = S·x` ONCE on the device (no PCG, no offload-floor gate) and return
     /// `out`, so a tiny hand-verifiable fixture can diff it against the CPU oracle
@@ -8150,6 +8242,72 @@ mod tests {
             assert!(
                 gam_gpu::device_runtime::GpuRuntime::global().is_some(),
                 "#1017: deterministic matvec ran but no GPU runtime — unexpected"
+            );
+        }
+    }
+
+    /// #1017 commit-2 gate: the PRODUCTION resident evidence seam
+    /// (`build_framed_resident_evidence_matvec` — `ResidentSaeFrameHandle` upload +
+    /// `prime_ainv` + the returned closure) is apply-to-apply bit-identical AND
+    /// matches the CPU oracle. This exercises the actual `GpuSchurMatvec` the
+    /// SLQ/surrogate lane consumes (upload once, apply many), not just the one-shot
+    /// probe. Fails loud if CUDA is present but the builder declines for a framed
+    /// system that clears the offload floor.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn framed_resident_evidence_matvec_deterministic_and_matches_cpu() {
+        let (sys, data, ridge_t, ridge_beta) = build_framed_evidence_fixture();
+        let border_dim = data.beta_dim;
+        // The apply budget the SLQ evidence lane sizes against (probes × steps),
+        // large enough to clear the device-offload floor.
+        let budget = 32usize * 64usize;
+        let matvec = match super::build_framed_resident_evidence_matvec(
+            &sys, ridge_t, ridge_beta, budget,
+        ) {
+            Some(mv) => mv,
+            None => {
+                assert!(
+                    gam_gpu::device_runtime::GpuRuntime::global().is_none(),
+                    "#1017: CUDA present but the resident evidence matvec builder \
+                     declined — the device apply does not engage for a framed system \
+                     that clears the offload floor"
+                );
+                return;
+            }
+        };
+        let apply = &matvec;
+        let x = Array1::from_shape_fn(border_dim, |a| ((a as f64 + 1.0) * 0.29).sin());
+        let mut out1 = Array1::<f64>::zeros(border_dim);
+        let mut out2 = Array1::<f64>::zeros(border_dim);
+        apply(&x, &mut out1);
+        apply(&x, &mut out2);
+        for a in 0..border_dim {
+            assert_eq!(
+                out1[a].to_bits(),
+                out2[a].to_bits(),
+                "#1017 resident determinism: coord {a} apply-to-apply differs: {:e} vs {:e}",
+                out1[a],
+                out2[a]
+            );
+        }
+        let mut cpu = vec![0.0_f64; border_dim];
+        sae_framed_schur_matvec_cpu(
+            &sys,
+            &data,
+            ridge_t,
+            ridge_beta,
+            x.as_slice().unwrap(),
+            &mut cpu,
+        )
+        .expect("cpu oracle matvec");
+        let scale = cpu.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(1.0);
+        for a in 0..border_dim {
+            let rel = (out1[a] - cpu[a]).abs() / scale;
+            assert!(
+                rel <= 1e-9,
+                "#1017 resident parity: coord {a}: device={:e} cpu={:e} rel={rel:e} (>1e-9)",
+                out1[a],
+                cpu[a],
             );
         }
     }

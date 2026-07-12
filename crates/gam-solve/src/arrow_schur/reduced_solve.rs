@@ -1648,6 +1648,23 @@ pub(crate) fn maybe_build_evidence_gpu_matvec(
         return None;
     }
     gam_gpu::device_runtime::GpuRuntime::global()?;
+    // #1017: framed matrix-free system with resident device operands — prefer the
+    // device-resident DETERMINISTIC reduced-Schur apply (upload operands once,
+    // cross only x/out per apply, atomics-free so the SLQ log|S| determinism
+    // contract holds) over the CPU row-procedural closure `gpu_schur_matvec_backend`
+    // returns for `htbeta_matvec` systems. Declines (no device / shape / non-PD at
+    // this ridge) fall through to the backend/CPU path. Non-Linux/CPU: this always
+    // returns `None` (no `device_sae_pcg`), so the lane is byte-identical.
+    if sys.device_sae_pcg.is_some() {
+        if let Some(matvec) = crate::gpu_kernels::arrow_schur::build_framed_resident_evidence_matvec(
+            sys,
+            ridge_t,
+            ridge_beta,
+            apply_budget.max(1),
+        ) {
+            return Some(matvec);
+        }
+    }
     crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend(sys, ridge_t, ridge_beta).ok()
 }
 
