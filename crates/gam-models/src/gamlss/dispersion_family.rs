@@ -514,60 +514,14 @@ fn order2_ln_gamma<const K: usize>(
 // functions.
 // ============================================================================
 
-/// Order-≤1 `ln Γ` compose: only the value (`d[0] = lnΓ`) and first-derivative
-/// (`d[1] = ψ`) stack slots are consumed by an [`Order1`] jet, so we evaluate
-/// ONLY `lnΓ` and `ψ` — never `ψ′` (trigamma). This is the value/gradient
-/// twin of [`order2_ln_gamma`]; its `(value, g)` channels are bit-identical to
-/// that function's order-≤1 channels because [`Order1`] runs the same Leibniz /
-/// Faà-di-Bruno value+gradient float ops as [`Order2`] (doc on `Order1`).
-#[inline]
-fn order1_ln_gamma<const K: usize>(
-    x: &gam_math::jet_scalar::Order1<K>,
-) -> gam_math::jet_scalar::Order1<K> {
-    x.compose_unary([
-        ln_gamma(x.v),
-        gam_math::jet_tower::digamma(x.v),
-        0.0,
-        0.0,
-        0.0,
-    ])
-}
-
-/// Value+gradient-only NB2 dispersion tower: `θ` is the sole jet variable
-/// (axis 0), `μ` a constant. `value`/`g[0]` reproduce the consumed
-/// `value`/`g[0]` of [`dispersion_nb_disp_order2`] bit-for-bit, but as an
-/// [`Order1`] jet it never evaluates the trigamma (`ψ′`) that the discarded
-/// observed-Hessian channel would need. The NB2 row kernel uses the EXPECTED
-/// (Fisher) information in θ, not the observed Hessian, so `h[0][0]` was pure
-/// discarded work — dropping it here removes two `ψ′` evaluations (at `θ+y`
-/// and `θ`) per NB2 row on top of the tensor-shrink.
-#[inline]
-pub(crate) fn dispersion_nb_disp_order1(
-    yi: f64,
-    mu_value: f64,
-    theta_value: f64,
-    wi: f64,
-) -> gam_math::jet_scalar::Order1<1> {
-    type O1 = gam_math::jet_scalar::Order1<1>;
-
-    let mu = O1::constant(mu_value);
-    let theta = O1::variable(theta_value, 0);
-    let tpm = theta.add(&mu);
-    let theta_plus_y = theta.add(&O1::constant(yi));
-    let loglik = order1_ln_gamma(&theta_plus_y)
-        .sub(&order1_ln_gamma(&theta))
-        .sub(&O1::constant(ln_gamma(yi + 1.0)))
-        .add(&theta.mul(&theta.ln()))
-        .sub(&theta.mul(&tpm.ln()))
-        .add(&mu.ln().scale(yi))
-        .sub(&tpm.ln().scale(yi));
-    loglik.scale(-wi)
-}
-
-// `dispersion_nb_disp_order2` — the `Order2<1>` NB2 dispersion oracle pin used
-// only by `prune_towers_*` — now lives in the `#[cfg(test)] mod tests` below,
-// next to its sole consumer (it is genuinely test-support, not production, so it
-// belongs in a `#[cfg(test)]` mod rather than carrying `allow(dead_code)`).
+// `dispersion_nb_disp_order1` / `dispersion_nb_disp_order2` — the pruned
+// `Order1<1>` / `Order2<1>` NB2 dispersion oracle pins used only by
+// `prune_towers_*` — now live in the `#[cfg(test)] mod tests` below, next to
+// their sole consumer (they are genuinely test-support, not production —
+// the real NB2 dispersion row kernel below computes score/curvature in
+// closed form via `digamma`/`nb_log_precision_fisher_jensen`, never through
+// either jet tower — so they belong in a `#[cfg(test)]` mod rather than
+// carrying `allow(dead_code)`).
 
 /// Pruned single-axis Gamma dispersion tower: `ν` is the sole jet variable
 /// (axis 0), `μ` a constant. Consumed channels match
@@ -1984,11 +1938,60 @@ mod tests {
     use super::*;
     use crate::gamlss::test_support::dispersion_tweedie_nll_generic;
 
+    /// Order-≤1 `ln Γ` compose: only the value (`d[0] = lnΓ`) and first-derivative
+    /// (`d[1] = ψ`) stack slots are consumed by an [`Order1`] jet, so we evaluate
+    /// ONLY `lnΓ` and `ψ` — never `ψ′` (trigamma). This is the value/gradient
+    /// twin of [`order2_ln_gamma`]; its `(value, g)` channels are bit-identical to
+    /// that function's order-≤1 channels because [`Order1`] runs the same Leibniz /
+    /// Faà-di-Bruno value+gradient float ops as [`Order2`] (doc on `Order1`).
+    #[inline]
+    fn order1_ln_gamma<const K: usize>(
+        x: &gam_math::jet_scalar::Order1<K>,
+    ) -> gam_math::jet_scalar::Order1<K> {
+        x.compose_unary([
+            ln_gamma(x.v),
+            gam_math::jet_tower::digamma(x.v),
+            0.0,
+            0.0,
+            0.0,
+        ])
+    }
+
+    /// Value+gradient-only NB2 dispersion tower: `θ` is the sole jet variable
+    /// (axis 0), `μ` a constant. `value`/`g[0]` reproduce the consumed
+    /// `value`/`g[0]` of [`dispersion_nb_disp_order2`] bit-for-bit, but as an
+    /// [`Order1`] jet it never evaluates the trigamma (`ψ′`) that the discarded
+    /// observed-Hessian channel would need. `h[0][0]` is pure discarded work —
+    /// dropping it here removes two `ψ′` evaluations (at `θ+y` and `θ`) per
+    /// evaluation on top of the tensor-shrink.
+    #[inline]
+    fn dispersion_nb_disp_order1(
+        yi: f64,
+        mu_value: f64,
+        theta_value: f64,
+        wi: f64,
+    ) -> gam_math::jet_scalar::Order1<1> {
+        type O1 = gam_math::jet_scalar::Order1<1>;
+
+        let mu = O1::constant(mu_value);
+        let theta = O1::variable(theta_value, 0);
+        let tpm = theta.add(&mu);
+        let theta_plus_y = theta.add(&O1::constant(yi));
+        let loglik = order1_ln_gamma(&theta_plus_y)
+            .sub(&order1_ln_gamma(&theta))
+            .sub(&O1::constant(ln_gamma(yi + 1.0)))
+            .add(&theta.mul(&theta.ln()))
+            .sub(&theta.mul(&tpm.ln()))
+            .add(&mu.ln().scale(yi))
+            .sub(&tpm.ln().scale(yi));
+        loglik.scale(-wi)
+    }
+
     /// Pruned single-axis NB2 dispersion tower: `θ` is the sole jet variable
     /// (axis 0), `μ` a constant. `value`/`g[0]`/`h[0][0]` reproduce the consumed
     /// `value`/`g[1]`/`h[1][1]` of `dispersion_nb_nll_order2` bit-for-bit. The
-    /// `Order2` oracle pin for `prune_towers_match_dense_all_channels`; the
-    /// production NB2 row kernel uses the cheaper `dispersion_nb_disp_order1`.
+    /// `Order2` oracle pin for `prune_towers_match_dense_all_channels`, and the
+    /// `Order1` oracle target for `dispersion_nb_disp_order1` above.
     #[inline]
     fn dispersion_nb_disp_order2(
         yi: f64,

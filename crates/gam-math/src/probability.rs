@@ -260,7 +260,7 @@ pub fn signed_probit_logcdf_and_mills_ratio(x: f64) -> (f64, f64) {
 
 #[inline]
 fn negative_normal_tail_components(x: f64) -> (f64, f64) {
-    debug_assert!(x.is_finite() && x < 0.0);
+    assert!(x.is_finite() && x < 0.0);
     let u = -x / std::f64::consts::SQRT_2;
     (u, erfcx_nonnegative(u))
 }
@@ -326,7 +326,7 @@ struct MillsCorrectionDerivatives {
 
 #[inline]
 fn normal_logcdf_derivatives_left_tail(x: f64) -> [f64; 5] {
-    debug_assert!(x.is_finite() && x <= -4.0);
+    assert!(x.is_finite() && x <= -4.0);
     let t = -x;
     let mut q = MillsCorrectionDerivatives {
         value: 0.0,
@@ -363,7 +363,7 @@ fn normal_logcdf_derivatives_left_tail(x: f64) -> [f64; 5] {
 
 #[inline]
 fn normal_logcdf_derivatives_right_tail(x: f64) -> [f64; 5] {
-    debug_assert!(x.is_finite() && x >= 8.0);
+    assert!(x.is_finite() && x >= 8.0);
     const LOG_SQRT_2PI: f64 = 0.918_938_533_204_672_7;
     let log_cdf = normal_logcdf(x);
     let u = x / std::f64::consts::SQRT_2;
