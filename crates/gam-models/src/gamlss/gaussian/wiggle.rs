@@ -2338,7 +2338,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         }
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
         let mut ll = 0.0;
-        for (k, sampled) in subsample.rows.iter().enumerate() {
+        for sampled in subsample.rows.iter() {
             let i = sampled.index;
             let q = eta_mu[i] + etaw[i];
             let row_ll = gaussian_diagonal_row_kernel(
@@ -2361,7 +2361,6 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
                 }
                 .into());
             }
-            let _ = k;
         }
         Ok(ll)
     }

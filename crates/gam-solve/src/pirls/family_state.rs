@@ -368,11 +368,6 @@ pub(crate) fn write_gamma_log_working_state(
 }
 
 #[inline]
-pub(crate) fn tweedie_log_weight_mu_power(mu: f64, p: f64) -> f64 {
-    mu.powf(2.0 - p)
-}
-
-#[inline]
 pub(crate) fn valid_negbin_theta(theta: f64) -> bool {
     theta.is_finite() && theta > 0.0
 }
