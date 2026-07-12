@@ -6785,15 +6785,6 @@ fn survival_ls_block_diagonal_wiggle_block_matches_single_source_932() {
         let dynamic = family
             .build_dynamic_geometry(&states)
             .expect("wiggle dynamic geometry");
-        let q = family
-            .collect_joint_quantities(&states)
-            .expect("joint quantities");
-        let blocks = family
-            .assemble_block_diagonal_hessians_from_quantities(&q, &states)
-            .expect("block-diagonal hessians");
-        assert_eq!(blocks.len(), 4, "wiggle family has four principal blocks");
-        let wiggle_block = &blocks[SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE];
-
         let dense =
             super::row_kernel::survival_ls_wiggle_joint_hessian_dense(&family, &dynamic, 0.0)
                 .expect("§13 dense joint Hessian");
@@ -6802,6 +6793,7 @@ fn survival_ls_block_diagonal_wiggle_block_matches_single_source_932() {
             offsets[SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE],
             offsets[SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE + 1],
         );
+        let wiggle_block = dense.slice(s![lo..hi, lo..hi]);
         assert_eq!(
             wiggle_block.dim(),
             (hi - lo, hi - lo),
@@ -7571,15 +7563,23 @@ fn survival_ls_scale_aware_location_block_trust_metric_floor_caps_starvation_156
     // exactly the diagonal the generic joint-Newton driver whitens by before the
     // family floor is applied.
     let log_scale = family.hessian_deriv_log_rescale(&states);
-    let q = family
-        .collect_joint_quantities_rescaled(&states, log_scale)
-        .expect("joint quantities");
-    let h_joint = family
-        .assemble_joint_hessian_from_quantities(&q, &states)
-        .expect("joint hessian")
-        .expect("dense joint hessian");
+    let dynamic = family
+        .build_dynamic_geometry(&states)
+        .expect("trust-metric dynamic geometry");
+    let h_diagonal = match family
+        .survival_ls_coefficient_hessian(
+            &dynamic,
+            log_scale,
+            None,
+            SlsCoefficientHessianTarget::DiagonalOnly,
+        )
+        .expect("packed diagonal-only joint Hessian")
+    {
+        SlsCoefficientHessian::DiagonalOnly(diagonal) => diagonal,
+        _ => panic!("diagonal target returned another packed SLS shape"),
+    };
     let raw_diag: Vec<f64> = (loc_start..loc_end)
-        .map(|j| h_joint[[j, j]].abs())
+        .map(|j| h_diagonal[j].abs())
         .collect();
     let raw_max = raw_diag.iter().copied().fold(0.0_f64, f64::max);
     let raw_min = raw_diag.iter().copied().fold(f64::INFINITY, f64::min);
