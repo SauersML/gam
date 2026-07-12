@@ -342,7 +342,7 @@ impl DynamicJetArena {
         self.bump.allocated_bytes()
     }
 
-    #[inline]
+    #[inline(always)]
     fn zeros(&self, len: usize) -> &mut [f64] {
         self.bump.alloc_slice_fill_copy(len, 0.0)
     }
@@ -350,6 +350,7 @@ impl DynamicJetArena {
     /// Allocate and initialize a runtime-sized slice in the arena. Row programs
     /// use this for their primary-scalar arrays so those arrays share the same
     /// reusable workspace as derivative channels.
+    #[inline(always)]
     pub fn alloc_slice_fill_with<T>(&self, len: usize, fill: impl FnMut(usize) -> T) -> &mut [T] {
         self.bump.alloc_slice_fill_with(len, fill)
     }
@@ -525,7 +526,7 @@ impl DynamicOrder2<'_> {
         self.h[row * self.dimension() + col]
     }
 
-    #[inline]
+    #[inline(always)]
     fn assert_compatible(&self, o: &Self) {
         assert_eq!(
             self.g.len(),
@@ -547,6 +548,7 @@ impl DynamicOrder2<'_> {
 impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
     type Workspace = DynamicJetArena;
 
+    #[inline(always)]
     fn constant(c: f64, dimension: usize, arena: &'arena DynamicJetArena) -> Self {
         Self {
             arena,
@@ -556,6 +558,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         }
     }
 
+    #[inline(always)]
     fn variable(x: f64, axis: usize, dimension: usize, arena: &'arena DynamicJetArena) -> Self {
         assert!(
             axis < dimension,
@@ -571,14 +574,17 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         }
     }
 
+    #[inline(always)]
     fn dimension(&self) -> usize {
         self.g.len()
     }
 
+    #[inline(always)]
     fn value(&self) -> f64 {
         self.v
     }
 
+    #[inline(always)]
     fn add(&self, o: &Self) -> Self {
         self.assert_compatible(o);
         let g = self.arena.zeros(self.dimension());
@@ -597,6 +603,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         }
     }
 
+    #[inline(always)]
     fn sub(&self, o: &Self) -> Self {
         self.assert_compatible(o);
         let g = self.arena.zeros(self.dimension());
@@ -615,6 +622,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         }
     }
 
+    #[inline(always)]
     fn mul(&self, o: &Self) -> Self {
         self.assert_compatible(o);
         let n = self.dimension();
@@ -640,10 +648,12 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         }
     }
 
+    #[inline(always)]
     fn neg(&self) -> Self {
         self.scale(-1.0)
     }
 
+    #[inline(always)]
     fn scale(&self, s: f64) -> Self {
         let g = self.arena.zeros(self.dimension());
         let h = self.arena.zeros(self.h.len());
@@ -661,6 +671,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         }
     }
 
+    #[inline(always)]
     fn compose_unary(&self, d: [f64; 5]) -> Self {
         let n = self.dimension();
         let g = self.arena.zeros(n);
@@ -694,6 +705,7 @@ pub struct DynamicOneSeed<'arena> {
 
 impl<'arena> DynamicOneSeed<'arena> {
     /// Seed one primary with the supplied contraction direction component.
+    #[inline(always)]
     #[must_use]
     pub fn seed_direction(
         x: f64,
@@ -709,6 +721,7 @@ impl<'arena> DynamicOneSeed<'arena> {
     }
 
     /// Row-major contracted-third matrix.
+    #[inline(always)]
     #[must_use]
     pub fn contracted_third(&self) -> &[f64] {
         self.eps.h()
@@ -718,6 +731,7 @@ impl<'arena> DynamicOneSeed<'arena> {
 impl<'arena> RuntimeJetScalar<'arena> for DynamicOneSeed<'arena> {
     type Workspace = DynamicJetArena;
 
+    #[inline(always)]
     fn constant(c: f64, dimension: usize, arena: &'arena DynamicJetArena) -> Self {
         Self {
             base: DynamicOrder2::constant(c, dimension, arena),
@@ -725,6 +739,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOneSeed<'arena> {
         }
     }
 
+    #[inline(always)]
     fn variable(x: f64, axis: usize, dimension: usize, arena: &'arena DynamicJetArena) -> Self {
         Self {
             base: DynamicOrder2::variable(x, axis, dimension, arena),
@@ -732,14 +747,17 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOneSeed<'arena> {
         }
     }
 
+    #[inline(always)]
     fn dimension(&self) -> usize {
         self.base.dimension()
     }
 
+    #[inline(always)]
     fn value(&self) -> f64 {
         self.base.value()
     }
 
+    #[inline(always)]
     fn add(&self, o: &Self) -> Self {
         Self {
             base: self.base.add(&o.base),
@@ -747,6 +765,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOneSeed<'arena> {
         }
     }
 
+    #[inline(always)]
     fn sub(&self, o: &Self) -> Self {
         Self {
             base: self.base.sub(&o.base),
@@ -754,6 +773,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOneSeed<'arena> {
         }
     }
 
+    #[inline(always)]
     fn mul(&self, o: &Self) -> Self {
         Self {
             base: self.base.mul(&o.base),
@@ -761,6 +781,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOneSeed<'arena> {
         }
     }
 
+    #[inline(always)]
     fn neg(&self) -> Self {
         Self {
             base: self.base.neg(),
@@ -768,6 +789,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOneSeed<'arena> {
         }
     }
 
+    #[inline(always)]
     fn scale(&self, s: f64) -> Self {
         Self {
             base: self.base.scale(s),
@@ -775,6 +797,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOneSeed<'arena> {
         }
     }
 
+    #[inline(always)]
     fn compose_unary(&self, d: [f64; 5]) -> Self {
         let base = self.base.compose_unary(d);
         let fprime = self.base.compose_unary([d[1], d[2], d[3], d[4], d[4]]);
@@ -798,6 +821,7 @@ pub struct DynamicTwoSeed<'arena> {
 
 impl<'arena> DynamicTwoSeed<'arena> {
     /// Seed one primary with both contraction direction components.
+    #[inline(always)]
     #[must_use]
     pub fn seed(
         x: f64,
@@ -816,6 +840,7 @@ impl<'arena> DynamicTwoSeed<'arena> {
     }
 
     /// Row-major contracted-fourth matrix.
+    #[inline(always)]
     #[must_use]
     pub fn contracted_fourth(&self) -> &[f64] {
         self.eps_del.h()
@@ -825,6 +850,7 @@ impl<'arena> DynamicTwoSeed<'arena> {
 impl<'arena> RuntimeJetScalar<'arena> for DynamicTwoSeed<'arena> {
     type Workspace = DynamicJetArena;
 
+    #[inline(always)]
     fn constant(c: f64, dimension: usize, arena: &'arena DynamicJetArena) -> Self {
         Self {
             base: DynamicOrder2::constant(c, dimension, arena),
@@ -834,6 +860,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicTwoSeed<'arena> {
         }
     }
 
+    #[inline(always)]
     fn variable(x: f64, axis: usize, dimension: usize, arena: &'arena DynamicJetArena) -> Self {
         Self {
             base: DynamicOrder2::variable(x, axis, dimension, arena),
@@ -843,14 +870,17 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicTwoSeed<'arena> {
         }
     }
 
+    #[inline(always)]
     fn dimension(&self) -> usize {
         self.base.dimension()
     }
 
+    #[inline(always)]
     fn value(&self) -> f64 {
         self.base.value()
     }
 
+    #[inline(always)]
     fn add(&self, o: &Self) -> Self {
         Self {
             base: self.base.add(&o.base),
@@ -860,6 +890,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicTwoSeed<'arena> {
         }
     }
 
+    #[inline(always)]
     fn sub(&self, o: &Self) -> Self {
         Self {
             base: self.base.sub(&o.base),
@@ -869,6 +900,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicTwoSeed<'arena> {
         }
     }
 
+    #[inline(always)]
     fn mul(&self, o: &Self) -> Self {
         let base = self.base.mul(&o.base);
         let eps = self.base.mul(&o.eps).add(&self.eps.mul(&o.base));
@@ -887,6 +919,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicTwoSeed<'arena> {
         }
     }
 
+    #[inline(always)]
     fn neg(&self) -> Self {
         Self {
             base: self.base.neg(),
@@ -896,6 +929,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicTwoSeed<'arena> {
         }
     }
 
+    #[inline(always)]
     fn scale(&self, s: f64) -> Self {
         Self {
             base: self.base.scale(s),
@@ -905,6 +939,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicTwoSeed<'arena> {
         }
     }
 
+    #[inline(always)]
     fn compose_unary(&self, d: [f64; 5]) -> Self {
         let base = self.base.compose_unary(d);
         let fprime = self.base.compose_unary([d[1], d[2], d[3], d[4], d[4]]);
