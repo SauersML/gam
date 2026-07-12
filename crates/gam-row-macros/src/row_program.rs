@@ -281,7 +281,8 @@ fn validate_scalar(expression: &Expr, constants: &HashSet<String>) -> Result<()>
                 | BinOp::Le(_)
                 | BinOp::Gt(_)
                 | BinOp::Ge(_)
-        ) => {
+        ) =>
+        {
             validate_scalar(left, constants)?;
             validate_scalar(right, constants)
         }
@@ -325,10 +326,7 @@ fn parse_program_expr(
                     let value = parse_program_expr(arguments[0], bindings, constants, leaves)?;
                     validate_scalar(arguments[1], constants)?;
                     if operation == "scale" {
-                        Ok(ProgramExpr::Scale(
-                            Box::new(value),
-                            arguments[1].clone(),
-                        ))
+                        Ok(ProgramExpr::Scale(Box::new(value), arguments[1].clone()))
                     } else {
                         Ok(ProgramExpr::AddConstant(
                             Box::new(value),
@@ -353,12 +351,15 @@ fn parse_program_expr(
                         ));
                     };
                     let leaf_ident = path_ident(leaf_path)?;
-                    let leaf = leaves.get(&leaf_ident.to_string()).copied().ok_or_else(|| {
-                        syn::Error::new_spanned(
-                            leaf_ident,
-                            format!("unknown row_program leaf `{leaf_ident}`"),
-                        )
-                    })?;
+                    let leaf = leaves
+                        .get(&leaf_ident.to_string())
+                        .copied()
+                        .ok_or_else(|| {
+                            syn::Error::new_spanned(
+                                leaf_ident,
+                                format!("unknown row_program leaf `{leaf_ident}`"),
+                            )
+                        })?;
                     let Expr::Path(value_path) = arguments[1] else {
                         return Err(syn::Error::new_spanned(
                             arguments[1],
@@ -615,10 +616,7 @@ fn cuda_multiply(left: &str, right: &str) -> String {
     }
 }
 
-fn cuda_add_component(
-    left: &Option<String>,
-    right: &Option<String>,
-) -> Option<String> {
+fn cuda_add_component(left: &Option<String>, right: &Option<String>) -> Option<String> {
     match (left, right) {
         (Some(left), Some(right)) => Some(cuda_add(left, right)),
         (Some(value), None) | (None, Some(value)) => Some(value.clone()),
@@ -626,10 +624,7 @@ fn cuda_add_component(
     }
 }
 
-fn cuda_multiply_component(
-    left: &Option<String>,
-    right: &Option<String>,
-) -> Option<String> {
+fn cuda_multiply_component(left: &Option<String>, right: &Option<String>) -> Option<String> {
     match (left, right) {
         (Some(left), Some(right)) => Some(cuda_multiply(left, right)),
         _ => None,
@@ -671,8 +666,7 @@ fn cuda_multiply_jets(left: CudaJet, right: CudaJet) -> CudaJet {
         );
         for other in axis..dimension {
             let index = axis * dimension + other;
-            let inherited_right =
-                cuda_scale_component(&right.hessian[index], &left.value);
+            let inherited_right = cuda_scale_component(&right.hessian[index], &left.value);
             let cross_forward =
                 cuda_multiply_component(&left.gradient[axis], &right.gradient[other]);
             let cross_reverse =
@@ -769,11 +763,7 @@ fn cuda_expression(
             let input = bindings.get(&value.to_string()).cloned().ok_or_else(|| {
                 syn::Error::new_spanned(value, "CUDA compose input is not defined")
             })?;
-            let suffix = if *stack_index == 0 {
-                String::new()
-            } else {
-                format!("_{stack_index}")
-            };
+            let suffix = *stack_index;
             *stack_index += 1;
             let stack = format!("{owner}_stack{suffix}");
             let cuda_leaf = &leaves[*leaf].cuda;
@@ -796,11 +786,9 @@ fn cuda_expression(
                 for other in axis..dimension {
                     let index = axis * dimension + other;
                     let inherited = cuda_scale_component(&input.hessian[index], &first);
-                    let curvature = cuda_multiply_component(
-                        &input.gradient[axis],
-                        &input.gradient[other],
-                    )
-                    .map(|component| cuda_multiply(&second, &component));
+                    let curvature =
+                        cuda_multiply_component(&input.gradient[axis], &input.gradient[other])
+                            .map(|component| cuda_multiply(&second, &component));
                     hessian[index] = cuda_add_component(&inherited, &curvature);
                 }
             }
@@ -877,6 +865,9 @@ fn cuda_source(
     }
     let mut mutable_support = HashMap::<String, CudaSupport>::new();
     let mut cuda_statements = Vec::new();
+    // One source-wide namespace makes temporary declarations collision-free,
+    // including repeated assignments to the same mutable local in one scope.
+    let mut stack_index = 0;
     for statement in statements {
         match statement {
             Statement::Local {
@@ -885,7 +876,6 @@ fn cuda_source(
                 value,
             } => {
                 let mut preludes = Vec::new();
-                let mut stack_index = 0;
                 let value = cuda_expression(
                     value,
                     &name.to_string(),
@@ -918,7 +908,6 @@ fn cuda_source(
                 let mut cuda_assignments = Vec::new();
                 for (target, value) in assignments {
                     let mut preludes = Vec::new();
-                    let mut stack_index = 0;
                     let value = cuda_expression(
                         value,
                         &target.to_string(),
@@ -951,7 +940,6 @@ fn cuda_source(
         }
     }
     let mut preludes = Vec::new();
-    let mut stack_index = 0;
     let result = cuda_expression(
         result,
         "result",
@@ -963,9 +951,7 @@ fn cuda_source(
         &mut preludes,
     )?;
 
-    let mut source = format!(
-        "__device__ __forceinline__ void {name}(\n        {parameters}) {{\n"
-    );
+    let mut source = format!("__device__ __forceinline__ void {name}(\n        {parameters}) {{\n");
     for statement in &cuda_statements {
         match statement {
             CudaStatement::Local(local) => {
@@ -974,10 +960,14 @@ fn cuda_source(
                     mutable_support
                         .get(&local.name)
                         .expect("mutable CUDA support exists")
+                        .clone()
                 } else {
-                    &local.value.support()
+                    local.value.support()
                 };
-                source.push_str(&format!("    double {}_v = {};\n", local.name, local.value.value));
+                source.push_str(&format!(
+                    "    double {}_v = {};\n",
+                    local.name, local.value.value
+                ));
                 for axis in 0..dimension {
                     if support.gradient[axis] {
                         source.push_str(&format!(
@@ -1115,8 +1105,7 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
                         "row_program local name is already defined",
                     ));
                 }
-                let value =
-                    parse_program_expr(&value, &bindings, &constant_names, &leaf_indices)?;
+                let value = parse_program_expr(&value, &bindings, &constant_names, &leaf_indices)?;
                 bindings.insert(name.to_string());
                 if is_mutable {
                     mutable.insert(name.to_string());
@@ -1152,12 +1141,7 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
             }
         }
     }
-    let result = parse_program_expr(
-        &body.result,
-        &bindings,
-        &constant_names,
-        &leaf_indices,
-    )?;
+    let result = parse_program_expr(&body.result, &bindings, &constant_names, &leaf_indices)?;
     for witness in &witnesses {
         if !bindings.contains(&witness.to_string()) {
             return Err(syn::Error::new_spanned(
@@ -1226,6 +1210,27 @@ mod tests {
     use super::*;
     use quote::quote;
 
+    fn emitted_cuda(input: TokenStream2) -> String {
+        let input = syn::parse2::<Input>(input).expect("parse row program");
+        let expanded = expand(input).expect("expand row program");
+        let file = syn::parse2::<syn::File>(expanded).expect("parse macro expansion");
+        file.items
+            .into_iter()
+            .find_map(|item| {
+                let syn::Item::Const(item) = item else {
+                    return None;
+                };
+                let syn::Expr::Lit(expression) = *item.expr else {
+                    return None;
+                };
+                let syn::Lit::Str(source) = expression.lit else {
+                    return None;
+                };
+                Some(source.value())
+            })
+            .expect("expanded CUDA source constant")
+    }
+
     #[test]
     fn emits_one_generic_and_cuda_schedule_with_branch_and_leaves() {
         let input = syn::parse2::<Input>(quote! {
@@ -1274,5 +1279,74 @@ mod tests {
         .expect("parse row program");
         let error = expand(input).expect_err("primary branch must be rejected");
         assert!(error.to_string().contains("unknown row_program scalar `q`"));
+    }
+
+    #[test]
+    fn cuda_formulas_pin_sparse_mul_compose_and_mutable_support_union() {
+        let cuda = emitted_cuda(quote! {
+            fn formulas(x, y; take)
+            leaves { curve => curve_stack => d_curve }
+            witnesses [];
+            {
+                let product = mul(x, y);
+                let curved = compose(curve, product);
+                let mut out = x;
+                if (take > 0.0) { out = add(curved, y); }
+                return out;
+            }
+        });
+
+        for formula in [
+            "double product_g0 = y;",
+            "double product_h0_1 = 1.0;",
+            "double product_g1 = x;",
+            "double curved_g0 = (y * curved_stack0[1]);",
+            "double curved_h0_0 = (curved_stack0[2] * (y * y));",
+            "double curved_h0_1 = (curved_stack0[1] + (curved_stack0[2] * (y * x)));",
+            "double curved_g1 = (x * curved_stack0[1]);",
+            "double curved_h1_1 = (curved_stack0[2] * (x * x));",
+            "double out_g0 = 1.0;",
+            "double out_h0_0 = 0.0;",
+            "double out_h0_1 = 0.0;",
+            "double out_g1 = 0.0;",
+            "double out_h1_1 = 0.0;",
+            "out_g0 = curved_g0;",
+            "out_h0_0 = curved_h0_0;",
+            "out_h0_1 = curved_h0_1;",
+            "out_g1 = (curved_g1 + 1.0);",
+            "out_h1_1 = curved_h1_1;",
+            "row_hessian[0] = out_h0_0;",
+            "row_hessian[1] = out_h0_1;",
+            "row_hessian[2] = out_h0_1;",
+            "row_hessian[3] = out_h1_1;",
+        ] {
+            assert!(
+                cuda.contains(formula),
+                "missing generated formula: {formula}"
+            );
+        }
+        assert!(!cuda.contains("* 0.0"));
+        assert!(!cuda.contains("0.0 *"));
+    }
+
+    #[test]
+    fn cuda_compose_temporaries_are_unique_across_repeated_assignments() {
+        let cuda = emitted_cuda(quote! {
+            fn repeated(q; event)
+            leaves { log => log_stack => d_log }
+            witnesses [];
+            {
+                let mut out = q;
+                if (event > 0.0) {
+                    out = compose(log, out);
+                    out = compose(log, out);
+                }
+                return out;
+            }
+        });
+
+        assert_eq!(cuda.matches("double out_stack0[3]").count(), 1);
+        assert_eq!(cuda.matches("double out_stack1[3]").count(), 1);
+        assert_eq!(cuda.matches("d_log(out_v, out_stack").count(), 2);
     }
 }

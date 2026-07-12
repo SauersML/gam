@@ -82,9 +82,8 @@ fn survival_rowjet_source() -> &'static str {
             !kernel.contains(ROW_PROGRAM_MARKER),
             "survival rowjet CUDA template must contain exactly one row-program marker",
         );
-        let mut source = String::with_capacity(
-            preamble.len() + RIGID_ROW_PROGRAM_CUDA_VGH.len() + kernel.len(),
-        );
+        let mut source =
+            String::with_capacity(preamble.len() + RIGID_ROW_PROGRAM_CUDA_VGH.len() + kernel.len());
         source.push_str(preamble);
         source.push_str(RIGID_ROW_PROGRAM_CUDA_VGH);
         source.push_str(kernel);
@@ -499,15 +498,17 @@ mod tests {
     #[test]
     fn cuda_source_exports_only_the_production_vgh_kernel() {
         let source = survival_rowjet_source();
-        assert_eq!(SURVIVAL_ROWJET_TEMPLATE.matches(ROW_PROGRAM_MARKER).count(), 1);
+        assert_eq!(
+            SURVIVAL_ROWJET_TEMPLATE.matches(ROW_PROGRAM_MARKER).count(),
+            1
+        );
         assert!(!SURVIVAL_ROWJET_TEMPLATE.contains("struct J2"));
         assert!(RIGID_ROW_PROGRAM_CUDA_VGH.contains("void rigid_row_program"));
         assert!(!RIGID_ROW_PROGRAM_CUDA_VGH.contains("j2_"));
+        assert!(!RIGID_ROW_PROGRAM_CUDA_VGH.contains("* 0.0"));
+        assert!(!RIGID_ROW_PROGRAM_CUDA_VGH.contains("0.0 *"));
         assert!(source.contains("survival_rowjet_vgh"));
-        assert_eq!(
-            source.matches("extern \"C\" __global__").count(),
-            1,
-        );
+        assert_eq!(source.matches("extern \"C\" __global__").count(), 1,);
         for removed in [
             "survival_rowjet_no_t4",
             "struct JS1",
