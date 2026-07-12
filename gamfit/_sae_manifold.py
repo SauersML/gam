@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -228,6 +229,95 @@ def sae_manifold_fit(
     )
 
 
+def sae_manifold_certify_external(
+    X: Any,
+    atom_basis: Sequence[str],
+    d_atom: Any,
+    decoder_blocks: Sequence[Any],
+    t_init: Sequence[Any],
+    a_init: Any,
+    log_lambda_smooth: Sequence[float],
+    log_ard: Sequence[Sequence[float]],
+    *,
+    duchon_centers: Sequence[Any | None] | None = None,
+    n_harmonics: Sequence[int | None] | None = None,
+    assignment: str = "softmax",
+    alpha: float = 1.0,
+    tau: float = 0.5,
+    log_lambda_sparse: float = 0.0,
+    learnable_alpha: bool = False,
+    top_k: int | None = None,
+    threshold_gate_threshold: float = 0.0,
+    n_iter: int = 50,
+    learning_rate: float = 0.04,
+    ridge_ext_coord: float = 1.0e-6,
+    ridge_beta: float = 1.0e-6,
+    isometry_pin_active: bool = False,
+    run_structure_search: bool = True,
+    analytic_penalties: Mapping[str, Any] | None = None,
+    fisher_factors: Any = None,
+) -> dict[str, Any]:
+    """Certify an externally-trained (torch-lane) manifold-SAE state (#2266).
+
+    Unlike :func:`sae_manifold_fit`, this runs NO closed-form solve: `t_init`
+    (per-atom trained on-manifold coordinates), `a_init` (trained routing
+    logits), and `decoder_blocks` (per-atom trained decoders) are installed
+    VERBATIM, and the native post-fit certificate/diagnostics pipeline runs
+    directly on that supplied state. `log_lambda_sparse` /
+    `log_lambda_smooth` / `log_ard` must be the terminal regularization state
+    that produced the decoder (the same "regularization the decoder was
+    trained under" contract the frozen-decoder OOS encode carries) — an
+    initial-strength substitute certifies a different model.
+
+    Returns the same report dict shape the native fit's internal payload
+    uses (`certificates`, `structure_certificate`, `atom_inference`,
+    `coordinate_fidelity`, diagnostics, …); `outer_termination.verdict` reads
+    `"external"` rather than a native stationarity certificate, since no
+    optimization ran here. Python only converts user containers to
+    contiguous arrays; validation, dictionary rebuild, certification, and
+    diagnostics are owned by the native evaluation-only entry.
+    """
+    x = _matrix(X)
+    k_atoms = len(atom_basis)
+    fisher, fisher_residual, fisher_provenance = _fisher_arrays(fisher_factors)
+    centers = duchon_centers if duchon_centers is not None else [None] * k_atoms
+    harmonics = n_harmonics if n_harmonics is not None else [None] * k_atoms
+    dims = _atom_dimensions(d_atom)
+    dims = dims * k_atoms if len(dims) == 1 else dims
+    return rust_module().sae_manifold_certify_external(
+        x,
+        list(atom_basis),
+        dims,
+        [np.ascontiguousarray(np.asarray(block, dtype=np.float64)) for block in decoder_blocks],
+        [None if c is None else _matrix(c) for c in centers],
+        [None if h is None else int(h) for h in harmonics],
+        [int(np.asarray(block, dtype=np.float64).shape[0]) for block in decoder_blocks],
+        [_matrix(t) for t in t_init],
+        _matrix(a_init),
+        float(alpha),
+        float(tau),
+        str(assignment),
+        float(log_lambda_sparse),
+        [float(v) for v in log_lambda_smooth],
+        [[float(v) for v in atom_ard] for atom_ard in log_ard],
+        learnable_alpha=bool(learnable_alpha),
+        top_k=None if top_k is None else int(top_k),
+        threshold_gate_threshold=float(threshold_gate_threshold),
+        max_iter=int(n_iter),
+        learning_rate=float(learning_rate),
+        ridge_ext_coord=float(ridge_ext_coord),
+        ridge_beta=float(ridge_beta),
+        isometry_pin_active=bool(isometry_pin_active),
+        run_structure_search=bool(run_structure_search),
+        analytic_penalties=(
+            None if analytic_penalties is None else json.dumps(dict(analytic_penalties))
+        ),
+        fisher_factors=fisher,
+        fisher_mass_residual=fisher_residual,
+        fisher_provenance=fisher_provenance,
+    )
+
+
 def flat_block_assignment(gating: str) -> str:
     """Return the native assignment family for a linear-block gate."""
     return str(rust_module().sae_flat_block_assignment(str(gating)))
@@ -248,5 +338,6 @@ __all__ = [
     "gumbel_linear_schedule",
     "gumbel_reciprocal_iter_schedule",
     "plot",
+    "sae_manifold_certify_external",
     "sae_manifold_fit",
 ]

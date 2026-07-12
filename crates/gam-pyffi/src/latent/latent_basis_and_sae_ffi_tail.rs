@@ -890,7 +890,7 @@ fn sae_manifold_certify_external<'py>(
     duchon_centers: Vec<Option<PyReadonlyArray2<'py, f64>>>,
     n_harmonics_list: Vec<Option<usize>>,
     basis_size_list: Vec<usize>,
-    initial_coords: PyReadonlyArray3<'py, f64>,
+    initial_coords: Vec<PyReadonlyArray2<'py, f64>>,
     initial_logits: PyReadonlyArray2<'py, f64>,
     alpha: f64,
     tau: f64,
@@ -958,19 +958,15 @@ fn sae_manifold_certify_external<'py>(
         })
         .collect();
 
-    let coords_view = initial_coords.as_array();
-    if coords_view.shape()[0] != k_atoms {
+    if initial_coords.len() != k_atoms {
         return Err(py_value_error(format!(
             "sae_manifold_certify_external: initial_coords must carry K={k_atoms} atom blocks; got {}",
-            coords_view.shape()[0]
+            initial_coords.len()
         )));
     }
-    let coords: Vec<Array2<f64>> = (0..k_atoms)
-        .map(|atom_index| {
-            coords_view
-                .index_axis(Axis(0), atom_index)
-                .to_owned()
-        })
+    let coords: Vec<Array2<f64>> = initial_coords
+        .iter()
+        .map(|block| block.as_array().to_owned())
         .collect();
 
     let regularization = gam::terms::sae::manifold::SaeOosRegularization {

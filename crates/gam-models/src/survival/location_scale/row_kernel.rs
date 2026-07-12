@@ -325,33 +325,35 @@ pub(crate) const SLS_ROW_K: usize = 9;
 #[derive(Clone, Copy, Debug)]
 struct SlsHessianPattern;
 
+const SLS_HESSIAN_PAIRS: [(usize, usize); 24] = [
+    (0, 0),
+    (0, 4),
+    (0, 7),
+    (1, 1),
+    (1, 3),
+    (1, 6),
+    (2, 2),
+    (2, 3),
+    (2, 5),
+    (2, 6),
+    (2, 8),
+    (3, 3),
+    (3, 5),
+    (3, 6),
+    (3, 8),
+    (4, 4),
+    (4, 7),
+    (5, 5),
+    (5, 6),
+    (5, 8),
+    (6, 6),
+    (6, 8),
+    (7, 7),
+    (8, 8),
+];
+
 impl HessianPattern<SLS_ROW_K, 24> for SlsHessianPattern {
-    const PAIRS: [(usize, usize); 24] = [
-        (0, 0),
-        (0, 4),
-        (0, 7),
-        (1, 1),
-        (1, 3),
-        (1, 6),
-        (2, 2),
-        (2, 3),
-        (2, 5),
-        (2, 6),
-        (2, 8),
-        (3, 3),
-        (3, 5),
-        (3, 6),
-        (3, 8),
-        (4, 4),
-        (4, 7),
-        (5, 5),
-        (5, 6),
-        (5, 8),
-        (6, 6),
-        (6, 8),
-        (7, 7),
-        (8, 8),
-    ];
+    const PAIRS: [(usize, usize); 24] = SLS_HESSIAN_PAIRS;
 }
 
 type SlsOrder2 = PatternedOrder2<SlsHessianPattern, SLS_ROW_K, 24>;
