@@ -1734,7 +1734,7 @@ mod tests {
         assert!(err.contains("mean_l0"), "error should name mean_l0: {err}");
     }
 
-    /// #2262 detection-reach statement: `detection_floor` surfaced by
+    /// #2262 rank-charge diagnostic: `detection_floor` surfaced by
     /// `adjudicate_atom_shape` must be exactly the same closed-form MP edge
     /// `mp_detection_floor` (and the production reconstruction-Gram pricing)
     /// compute — no independent reimplementation to drift out of sync.
@@ -1764,7 +1764,7 @@ mod tests {
             (Some(n_eff), Some(ambient_p), None),
         ] {
             let error = shape_detection_floor(partial.0, partial.1, partial.2)
-                .expect_err("a partial detection-reach specification must be rejected");
+                .expect_err("a partial rank-charge diagnostic specification must be rejected");
             assert!(error.contains("supplied together"), "{error}");
         }
     }

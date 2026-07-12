@@ -2201,6 +2201,7 @@ impl SaeManifoldTerm {
     /// A genuine frame-orientation evidence correction, if wanted, is a SEPARATE
     /// (λ-independent) Laplace term built from the actual frame Hessian.
     pub(crate) fn reml_occam_term(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
+        rho.validate_log_strength_domain()?;
         let mut acc = 0.0_f64;
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let rank_s = Self::symmetric_rank(&atom.smooth_penalty)?;
@@ -2223,6 +2224,7 @@ impl SaeManifoldTerm {
         &self,
         rho: &SaeManifoldRho,
     ) -> Result<Vec<f64>, String> {
+        rho.validate_log_strength_domain()?;
         let mut out = Vec::with_capacity(self.atoms.len());
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let rank_s = Self::symmetric_rank(&atom.smooth_penalty)?;

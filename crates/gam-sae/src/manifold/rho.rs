@@ -40,6 +40,79 @@ pub enum ArdSharing {
     Shared,
 }
 
+#[cfg(test)]
+mod log_strength_domain_tests {
+    use super::*;
+    use ndarray::array;
+
+    fn fully_active_rho() -> SaeManifoldRho {
+        SaeManifoldRho::new(0.0, 0.0, vec![array![0.0]]).with_log_lambda_block(vec![0.0])
+    }
+
+    #[test]
+    fn every_active_flat_log_strength_has_one_closed_domain() {
+        let rho = fully_active_rho();
+        let dimension = rho.to_flat().len();
+        for endpoint in [LOG_STRENGTH_MIN, LOG_STRENGTH_MAX] {
+            let flat = Array1::from_elem(dimension, endpoint);
+            let rebuilt = rho
+                .from_flat(flat.view())
+                .expect("both exact log-strength endpoints are in-domain");
+            assert_eq!(rebuilt.to_flat(), flat);
+        }
+        assert_eq!(
+            rho.flat_domain_lower_bound().unwrap(),
+            Array1::from_elem(dimension, LOG_STRENGTH_MIN)
+        );
+        assert_eq!(
+            rho.flat_domain_upper_bound().unwrap(),
+            Array1::from_elem(dimension, LOG_STRENGTH_MAX)
+        );
+
+        for coordinate in 0..dimension {
+            for invalid in [
+                LOG_STRENGTH_MIN - 1.0,
+                LOG_STRENGTH_MAX + 1.0,
+                f64::NAN,
+                f64::INFINITY,
+            ] {
+                let mut flat = Array1::zeros(dimension);
+                flat[coordinate] = invalid;
+                let error = rho
+                    .from_flat(flat.view())
+                    .expect_err("every emitted log strength must fail outside the domain");
+                assert!(
+                    error.contains("must be finite and in"),
+                    "coordinate {coordinate}, value {invalid}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn structurally_absent_sparse_placeholder_is_ignored_and_never_scaled() {
+        let rho = SaeManifoldRho::new(
+            f64::INFINITY,
+            0.0,
+            vec![Array1::<f64>::zeros(0)],
+        )
+        .for_assignment(AssignmentMode::softmax(1.0));
+        assert_eq!(rho.sparse_flat_index(), None);
+        rho.validate_log_strength_domain()
+            .expect("a non-coordinate placeholder is outside the objective domain");
+        assert_eq!(rho.to_flat(), array![0.0]);
+
+        let scaled = rho
+            .seed_scaled_by_dispersion_for_assignment(1.0e300, AssignmentMode::softmax(1.0))
+            .expect("dispersion scaling must not touch an absent sparse coordinate");
+        assert_eq!(scaled.log_lambda_sparse, f64::INFINITY);
+        assert_eq!(scaled.to_flat().len(), 1);
+        scaled
+            .validate_log_strength_domain()
+            .expect("the active smooth coordinate remains valid");
+    }
+}
+
 /// Whether assignment strength contributes an outer penalized quasi-Laplace coordinate.
 ///
 /// The stored [`SaeManifoldRho::log_lambda_sparse`] value remains available to
@@ -392,7 +465,9 @@ impl SaeManifoldRho {
         let shift = dispersion.ln();
         let smooth_ard_shift = shift.max(0.0);
         let mut scaled = bound;
-        scaled.log_lambda_sparse += shift;
+        if scaled.sparse_flat_index().is_some() {
+            scaled.log_lambda_sparse += shift;
+        }
         for value in &mut scaled.log_lambda_smooth {
             *value += smooth_ard_shift;
         }
@@ -418,7 +493,7 @@ impl SaeManifoldRho {
         }
         let shift = dispersion.ln();
         let mut scaled = self.clone();
-        if scale_sparse {
+        if scale_sparse && scaled.sparse_flat_index().is_some() {
             scaled.log_lambda_sparse += shift;
         }
         for value in &mut scaled.log_lambda_smooth {
@@ -467,32 +542,41 @@ impl SaeManifoldRho {
     /// deliberately ignored: it is not an objective coordinate and its stored
     /// placeholder cannot affect the corresponding assignment family.
     pub(crate) fn validate_log_strength_domain(&self) -> Result<(), String> {
-        let validate = |kind: &str, value: f64| {
-            if value.is_finite() && (LOG_STRENGTH_MIN..=LOG_STRENGTH_MAX).contains(&value) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "{kind} must be finite and in [{LOG_STRENGTH_MIN}, \
-                     {LOG_STRENGTH_MAX}]; got {value}"
-                ))
-            }
+        let is_valid = |value: f64| {
+            value.is_finite() && (LOG_STRENGTH_MIN..=LOG_STRENGTH_MAX).contains(&value)
         };
-        if self.sparse_flat_index().is_some() {
-            validate("assignment log strength", self.log_lambda_sparse)?;
+        if self.sparse_flat_index().is_some() && !is_valid(self.log_lambda_sparse) {
+            return Err(format!(
+                "assignment log strength must be finite and in [{LOG_STRENGTH_MIN}, \
+                 {LOG_STRENGTH_MAX}]; got {}",
+                self.log_lambda_sparse
+            ));
         }
         for (atom, &value) in self.log_lambda_smooth.iter().enumerate() {
-            validate(&format!("smoothness log strength at atom {atom}"), value)?;
+            if !is_valid(value) {
+                return Err(format!(
+                    "smoothness log strength at atom {atom} must be finite and in \
+                     [{LOG_STRENGTH_MIN}, {LOG_STRENGTH_MAX}]; got {value}"
+                ));
+            }
         }
         for (atom, block) in self.log_ard.iter().enumerate() {
             for (axis, &value) in block.iter().enumerate() {
-                validate(
-                    &format!("ARD log precision at atom {atom}, axis {axis}"),
-                    value,
-                )?;
+                if !is_valid(value) {
+                    return Err(format!(
+                        "ARD log precision at atom {atom}, axis {axis} must be finite and in \
+                         [{LOG_STRENGTH_MIN}, {LOG_STRENGTH_MAX}]; got {value}"
+                    ));
+                }
             }
         }
         for (block, &value) in self.log_lambda_block.iter().enumerate() {
-            validate(&format!("block log strength at block {block}"), value)?;
+            if !is_valid(value) {
+                return Err(format!(
+                    "block log strength at block {block} must be finite and in \
+                     [{LOG_STRENGTH_MIN}, {LOG_STRENGTH_MAX}]; got {value}"
+                ));
+            }
         }
         Ok(())
     }

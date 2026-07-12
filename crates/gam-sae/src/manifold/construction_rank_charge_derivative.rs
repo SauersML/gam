@@ -60,6 +60,7 @@ impl SaeManifoldTerm {
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
     ) -> Result<ProductionRankChargeDerivative, String> {
+        rho.validate_log_strength_domain()?;
         let residual = self.reconstruction_residual(target, rho)?;
         let dispersion = self.reconstruction_dispersion(loss, cache, rho, Some(residual.view()))?;
         let mut grams = self.empty_decoder_gram_accumulator();

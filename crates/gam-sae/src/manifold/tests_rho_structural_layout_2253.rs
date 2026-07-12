@@ -73,6 +73,30 @@ fn fixed_assignment_strength_is_absent_from_flat_rho_layout_2253() {
 }
 
 #[test]
+fn invalid_constructor_rho_is_refused_before_bounds_or_fixed_fit_2253() {
+    let mut bounded = planted_periodic_outer_objective_2253();
+    bounded.baseline_rho.log_lambda_smooth[0] = LOG_STRENGTH_MAX + 1.0;
+    let error = bounded
+        .outer_domain_lower_bound()
+        .expect_err("an invalid constructor-supplied baseline must not be projected into domain");
+    assert!(
+        error.to_string().contains("smoothness log strength"),
+        "unexpected baseline-domain error: {error}"
+    );
+
+    let mut fixed = planted_periodic_outer_objective_2253();
+    let mut flat = fixed.baseline_rho.to_flat();
+    flat[fixed.baseline_rho.ard_flat_index(0, 0)] = LOG_STRENGTH_MIN - 1.0;
+    let error = fixed
+        .fit_at_fixed_rho(flat.view())
+        .expect_err("fixed-rho entry must reject before any inner solve");
+    assert!(
+        error.to_string().contains("ARD log precision"),
+        "unexpected fixed-rho domain error: {error}"
+    );
+}
+
+#[test]
 fn k1_softmax_active_rho_gradient_matches_directional_fd_2253() {
     let mut gradient_objective = planted_periodic_outer_objective_2253();
     let base = gradient_objective.baseline_rho.to_flat();

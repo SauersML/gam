@@ -917,7 +917,8 @@ impl SaeManifoldOuterObjective {
     /// at the same ρ is a no-op. NO-OP entirely when crosscoder pricing is off
     /// (plain SAE byte-identity). Called at the ρ-materialization point of every
     /// `&mut self` eval lane so no inner solve ever reads a stale-scaled target.
-    fn apply_block_scaling(&mut self, rho: &SaeManifoldRho) {
+    fn apply_block_scaling(&mut self, rho: &SaeManifoldRho) -> Result<(), String> {
+        rho.validate_log_strength_domain()?;
         // Disjoint field borrows: the pricing state and the target are rewritten
         // together, so destructure `self` rather than route through a `self`
         // method that would alias both.
@@ -927,12 +928,16 @@ impl SaeManifoldOuterObjective {
             ..
         } = self
         else {
-            return;
+            return Ok(());
         };
         // The builder pinned `block_dims.len() == log_lambda_block.len()`; guard
         // defensively so a mismatched ρ can never scale a wrong column range.
         if rho.log_lambda_block.len() != blocks.block_dims.len() {
-            return;
+            return Err(format!(
+                "crosscoder block log-strength count {} != pricing block count {}",
+                rho.log_lambda_block.len(),
+                blocks.block_dims.len()
+            ));
         }
         // Collect the moved blocks' pristine column spans + scales first, then
         // rewrite in ONE parallel row pass over contiguous row slices. The
@@ -953,7 +958,7 @@ impl SaeManifoldOuterObjective {
             pristine_off += p_l;
         }
         if moved.is_empty() {
-            return;
+            return Ok(());
         }
         let p_x = blocks.p_x;
         let pristine = &blocks.pristine_blocks;
@@ -977,6 +982,7 @@ impl SaeManifoldOuterObjective {
                     }
                 }
             });
+        Ok(())
     }
 
     /// #2231 Inc-B (stage 1) — the block-relevance change-of-variables Jacobian
@@ -2206,7 +2212,7 @@ impl SaeManifoldOuterObjective {
         // before any inner solve reads `self.target`. Every value/refine/member/
         // discovery lane funnels through this one drive, so a single idempotent
         // rewrite keeps them all coherent (no-op for a plain SAE).
-        self.apply_block_scaling(&rho);
+        self.apply_block_scaling(&rho)?;
         // #2080 (a) — install the last value probe's converged inner state when
         // this evaluation re-visits the exact same ρ (the line-search accept
         // pattern). The state IS the inner KKT optimum this solve would converge
@@ -2675,7 +2681,7 @@ impl SaeManifoldOuterObjective {
         let n_params = rho.to_flat().len();
         // #2231 Inc-B — scale the block columns for this ρ before the EFS inner
         // solve reads `self.target` (idempotent; no-op for a plain SAE).
-        self.apply_block_scaling(&rho);
+        self.apply_block_scaling(&rho)?;
         if let Some(beta) = self.seeded_beta.take()
             && beta.len() == self.term.beta_dim()
         {
@@ -3615,7 +3621,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // #2231 Inc-B — scale the block columns for this ρ before either the
         // streaming value path or the dense `penalized_quasi_laplace_criterion_with_cache` below
         // reads `self.target` (idempotent; no-op for a plain SAE).
-        self.apply_block_scaling(&rho_state);
+        self.apply_block_scaling(&rho_state)
+            .map_err(EstimationError::InvalidInput)?;
         // #1026 — matrix-free (streaming) regime: the dense joint-Hessian evidence
         // cache does not exist, so the analytic gradient lane below
         // (`penalized_quasi_laplace_criterion_with_cache` → `outer_gradient_arrow_solver`) cannot run

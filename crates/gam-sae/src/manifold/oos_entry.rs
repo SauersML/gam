@@ -494,6 +494,7 @@ fn build_oos_atom(
 fn build_rho(
     regularization: SaeOosRegularization,
     latent_dims: &[usize],
+    assignment_mode: AssignmentMode,
 ) -> Result<SaeManifoldRho, String> {
     let k_atoms = latent_dims.len();
     let SaeOosRegularization {
@@ -501,11 +502,6 @@ fn build_rho(
         log_lambda_smooth,
         log_ard,
     } = regularization;
-    if !log_lambda_sparse.is_finite() {
-        return Err(format!(
-            "run_sae_manifold_oos: trained log_lambda_sparse must be finite; got {log_lambda_sparse}"
-        ));
-    }
     if log_lambda_smooth.len() != k_atoms
         || !log_lambda_smooth.iter().all(|value| value.is_finite())
     {
@@ -530,11 +526,15 @@ fn build_rho(
         }
         ard.push(Array1::from(values.clone()));
     }
-    Ok(SaeManifoldRho::with_per_atom_smooth(
+    let rho = SaeManifoldRho::with_per_atom_smooth(
         log_lambda_sparse,
         log_lambda_smooth,
         ard,
-    ))
+    )
+    .for_assignment(assignment_mode);
+    rho.validate_log_strength_domain()
+        .map_err(|error| format!("run_sae_manifold_oos: {error}"))?;
+    Ok(rho)
 }
 
 /// Execute frozen-decoder OOS inference from a typed, owned request.
@@ -695,7 +695,7 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
     if !hybrid_linear_images.is_empty() {
         term.set_hybrid_linear_images(hybrid_linear_images.clone())?;
     }
-    let mut rho = build_rho(regularization, &latent_dims)?;
+    let mut rho = build_rho(regularization, &latent_dims, mode)?;
     if cold_coords {
         term.seed_coords_by_decoder_projection(target.view())?;
     }
