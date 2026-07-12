@@ -2104,9 +2104,9 @@ mod jet_tower_oracle_tests {
     //! already carry `verify_kernel_channels` oracles) is an INDEPENDENT
     //! cross-check that this production tower is correct. This module adds it:
     //!
-    //! * an independent [`RowNllProgram<2>`] that writes the row NLL
+    //! * an independent [`RowProgram<2>`] that writes the row NLL
     //!   `ℓ = −w·logΦ((2y−1)·η)`, `η = q·√(1+(s·g)²) + s·g·z` ONCE over generic
-    //!   `Tower4` arithmetic (a different composition order than the fused
+    //!   generic jet arithmetic (a different composition order than the fused
     //!   production `signed` jet → exercises the Leibniz/Faà-di-Bruno layer
     //!   where the #736 cross-block sign-flip bug genus lives), and
     //! * a special-function-independent central-FD witness of the value channel
@@ -2158,7 +2158,7 @@ mod jet_tower_oracle_tests {
         Ok((tower.t3, tower.t4))
     }
     use gam_math::jet_tower::{
-        KernelChannels, RowNllProgram, evaluate_program, verify_kernel_channels,
+        KernelChannels, RowProgram, program_full_tower, verify_kernel_channels,
     };
 
     /// Independent single-expression row NLL for the rigid standard-normal
@@ -2173,7 +2173,7 @@ mod jet_tower_oracle_tests {
         probit_scale: f64,
     }
 
-    impl RowNllProgram<2> for BernoulliRigidStandardNormalNllProgram {
+    impl RowProgram<2> for BernoulliRigidStandardNormalNllProgram {
         fn n_rows(&self) -> usize {
             self.primaries.len()
         }
@@ -2185,7 +2185,11 @@ mod jet_tower_oracle_tests {
                 .ok_or_else(|| format!("bernoulli rigid nll program: row {row} out of range"))
         }
 
-        fn row_nll(&self, row: usize, p: &[Tower4<2>; 2]) -> Result<Tower4<2>, String> {
+        fn eval<S: gam_math::jet_scalar::JetScalar<2>>(
+            &self,
+            row: usize,
+            p: &[S; 2],
+        ) -> Result<S, String> {
             let z = self.z[row];
             let y = self.y[row];
             let w = self.w[row];
@@ -2196,20 +2200,23 @@ mod jet_tower_oracle_tests {
             let eta_marginal = p[0];
             let link = bernoulli_marginal_link_map(
                 &InverseLink::Standard(gam_problem::StandardLink::Probit),
-                eta_marginal.v,
+                eta_marginal.value(),
             )?;
             let q = eta_marginal.compose_unary([link.q, link.q1, link.q2, link.q3, link.q4]);
             let g = p[1];
             // observed slope b = s·g, scale c = √(1 + b²).
-            let observed_slope = g * s;
-            let c = (observed_slope * observed_slope + 1.0).compose_unary(unary_derivatives_sqrt(
-                observed_slope.v * observed_slope.v + 1.0,
+            let observed_slope = g.scale(s);
+            let one_plus_slope_squared = observed_slope
+                .mul(&observed_slope)
+                .add(&S::constant(1.0));
+            let c = one_plus_slope_squared.compose_unary(unary_derivatives_sqrt(
+                one_plus_slope_squared.value(),
             ));
             // η = q·c + b·z, signed margin m = (2y−1)·η.
-            let eta = q * c + observed_slope * z;
-            let signed = eta * (2.0 * y - 1.0);
+            let eta = q.mul(&c).add(&observed_slope.scale(z));
+            let signed = eta.scale(2.0 * y - 1.0);
             // NLL = −w·logΦ(m) via the documented probit neglog stack.
-            Ok(signed.compose_unary(unary_derivatives_neglog_phi(signed.v, w)))
+            Ok(signed.compose_unary(unary_derivatives_neglog_phi(signed.value(), w)))
         }
     }
 
@@ -2254,7 +2261,7 @@ mod jet_tower_oracle_tests {
             };
 
             for row in 0..n {
-                let tower = evaluate_program(&program, row).expect("tower evaluation");
+                let tower = program_full_tower(&program, row).expect("tower evaluation");
 
                 // Production scalar kernel channels (the hand path under audit).
                 let marginal = bernoulli_marginal_link_map(
@@ -2431,17 +2438,15 @@ mod jet_tower_oracle_tests {
     /// generic [`RowProgram<2>`] program seam and its cheap
     /// order-2 / contracted scalar evaluators (`program_row_kernel`,
     /// `program_third_contracted`, `program_fourth_contracted`,
-    /// `program_full_tower`), must agree BIT-FOR-BIT with the dense
-    /// `Tower4`-only [`RowNllProgram`] path (`evaluate_program`). Both write the
-    /// same single-expression NLL — the contracted scalars fold the direction
-    /// into the differentiation, so this pins that the packed channels equal the
-    /// corresponding contractions of the dense tower truth, exercising every
-    /// `generic_*` evaluator end-to-end through a real production consumer.
+    /// `program_full_tower`), must agree BIT-FOR-BIT with an independent generic
+    /// [`RowProgram`] that uses a different composition order. Both write the
+    /// same NLL — the contracted scalars fold the direction into differentiation,
+    /// so this pins that the packed channels equal the corresponding contractions
+    /// of the independent dense tower truth through a real production consumer.
     #[test]
-    fn rigid_bernoulli_generic_program_matches_tower4_program_all_channels() {
+    fn rigid_bernoulli_generic_program_matches_independent_program_all_channels() {
         use gam_math::jet_tower::{
-            program_fourth_contracted, program_full_tower, program_row_kernel,
-            program_third_contracted,
+            program_fourth_contracted, program_row_kernel, program_third_contracted,
         };
 
         let eta = [0.3_f64, -0.7, 0.05, 0.9, -1.2, 2.1, -2.4];
@@ -2461,7 +2466,7 @@ mod jet_tower_oracle_tests {
         };
 
         for &probit_scale in &[1.0_f64, 0.8] {
-            // The dense Tower4-only program over all rows (independent path).
+            // The independent generic program over all rows.
             let tower_program = BernoulliRigidStandardNormalNllProgram {
                 primaries: (0..n).map(|r| [eta[r], g[r]]).collect(),
                 z: z.to_vec(),
@@ -2471,7 +2476,7 @@ mod jet_tower_oracle_tests {
             };
 
             for row in 0..n {
-                let truth = evaluate_program(&tower_program, row).expect("Tower4 program tower");
+                let truth = program_full_tower(&tower_program, row).expect("program tower");
 
                 let marginal = bernoulli_marginal_link_map(
                     &InverseLink::Standard(gam_problem::StandardLink::Probit),
