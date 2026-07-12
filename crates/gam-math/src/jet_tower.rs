@@ -90,15 +90,16 @@
 //!
 //! 1. This module: the algebra + the program seam + the oracle.
 //! 2. Universal oracle: every hand-written `RowKernel` gains a CI test
-//!    asserting channel-by-channel agreement with a `RowNllProgram` written
+//!    asserting channel-by-channel agreement with a [`RowProgram`] written
 //!    once — see [`verify_kernel_channels`]. This alone would have caught
 //!    #736 at introduction.
-//! 3. Migrate error-dense / cold towers to [`derived_row_kernel`] et al.;
-//!    keep hand-tuned hot paths, now verified against the single-expression
-//!    truth instead of being the only definition.
+//! 3. Derive every channel through [`program_row_kernel`],
+//!    [`program_third_contracted`], [`program_fourth_contracted`], or
+//!    [`program_full_tower`], selecting only the representation its consumer
+//!    needs while retaining one expression.
 //! 4. New families (#914/#916/#917 ZI/ordinal/expectile, #921's location-
-//!    scale port) implement ONLY `RowNllProgram` and get an exact
-//!    fourth-order tower for the price of writing the likelihood.
+//!    scale port) implement ONLY [`RowProgram`] and get an exact fourth-order
+//!    tower for the price of writing the likelihood.
 
 use crate::jet_algebra;
 
