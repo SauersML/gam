@@ -461,7 +461,11 @@ impl LatentMeasureKind {
 /// temporary allocation that a `Vec<(node, weight)>` canonicalization would
 /// add to that per-row path.
 fn sort_empirical_node_weight_pairs(nodes: &mut [f64], weights: &mut [f64]) {
-    debug_assert_eq!(nodes.len(), weights.len());
+    assert_eq!(
+        nodes.len(),
+        weights.len(),
+        "empirical grid nodes and weights must remain parallel"
+    );
     fn sift_down(nodes: &mut [f64], weights: &mut [f64], mut root: usize, end: usize) {
         loop {
             let mut child = 2 * root + 1;
