@@ -25,8 +25,6 @@
 # SUBMIT (single job; runs external_topk then the faithful hybrid on the SAME
 # seed-derived split, appends both rows):
 #     sbatch experiments/1026_close/run_faithful_hybrid.sbatch
-# Override the curved decoder-block width if the built model differs:
-#     B=7 sbatch experiments/1026_close/run_faithful_hybrid.sbatch
 #
 #SBATCH --job-name=sae2233_faithful
 #SBATCH --partition=a100-4,a100-8
@@ -35,7 +33,7 @@
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
-#SBATCH --time=08:00:00
+#SBATCH --time=00:30:00
 #SBATCH --output=/projects/standard/hsiehph/sauer354/sae2233_faithful_%j.out
 set -euo pipefail
 
@@ -49,28 +47,25 @@ SEED=${SEED:-0}
 TOP_K=${TOP_K:-32}
 CURVED_ATOMS=${CURVED_ATOMS:-256}
 CURVED_K=${CURVED_K:-2}
-D_ATOM=${D_ATOM:-2}
-# B = curved-atom decoder-block width (basis functions per curved atom). For a
-# Fourier circle of H harmonics B = 2H+1; the product/d_atom torus tier the
-# driver builds may use a different B. The row's bits_dict_params_faithful is
-# ground truth — if false, raise B and resubmit. 7 is a safe default that
-# reserves headroom for the torus basis.
-B=${B:-7}
+D_ATOM=1
+# The circle-class theorem uses the explicit one-dimensional periodic chart.
+# Production builds H=max(1,d_atom), so this decoder width is structural rather
+# than a guessed budget.
+ATOM_TOPOLOGY=circle
+B=$(( 2 * D_ATOM + 1 ))
 # The theorem-faithful flat atom count: k_flat = K - curved_atoms*B, so
 # k_flat*P + curved_atoms*B*P == K*P (dictionaries carry identical params).
 K_FLAT=${K_FLAT:-$(( K - CURVED_ATOMS * B ))}
 if (( K_FLAT < TOP_K )); then
-  echo "FATAL: K_FLAT=$K_FLAT < top_k=$TOP_K (curved tier too wide for this K); lower CURVED_ATOMS/B"; exit 2
+  echo "FATAL: K_FLAT=$K_FLAT < top_k=$TOP_K (curved tier too wide for this K); lower CURVED_ATOMS"; exit 2
 fi
 
 STEPS=${STEPS:-8000}
-CURVED_STEPS=${CURVED_STEPS:-6000}   # the torch ManifoldSAE E-step is the known CPU wall
+MAX_EPOCHS=${MAX_EPOCHS:-30}
 LR=${LR:-1e-3}
 BATCH_SIZE=${BATCH_SIZE:-2048}
 MAX_ROWS=${MAX_ROWS:-120000}
 BITS_MAX_ROWS=${BITS_MAX_ROWS:-8192}
-ATOM_MANIFOLD=${ATOM_MANIFOLD:-product}
-ATOM_BASIS=${ATOM_BASIS:-fourier}
 TAG=${TAG:-faithful-K${K}-kflat${K_FLAT}-s${SEED}}
 
 CHUNK_DIR=${CHUNK_DIR:-$R/creditscope_acts/activations/layer_30_residual_post}
@@ -106,12 +101,11 @@ $PY -u "$DRIVER" --arm external_topk "${COMMON[@]}" \
   --tag "${TAG}-external"
 
 # 2) the theorem-faithful hybrid: curved atoms REPLACE flat ones (--k-flat).
-$PY -u "$DRIVER" --arm hybrid "${COMMON[@]}" \
+$PY -u "$DRIVER" --arm hybrid_rust "${COMMON[@]}" \
   --k-flat "$K_FLAT" \
-  --steps "$STEPS" --curved-steps "$CURVED_STEPS" --lr "$LR" \
+  --steps "$STEPS" --max-epochs "$MAX_EPOCHS" --lr "$LR" \
   --batch-size "$BATCH_SIZE" --d-atom "$D_ATOM" \
   --curved-atoms "$CURVED_ATOMS" --curved-k "$CURVED_K" \
-  --atom-manifold "$ATOM_MANIFOLD" --atom-basis "$ATOM_BASIS" \
+  --atom-topology "$ATOM_TOPOLOGY" \
   --tag "${TAG}-hybrid"
 echo "=== rc=0 DONE $(date) — CHECK bits_dict_params_faithful==true in $OUT ==="
-echo "    if false: the built curved tier is wider than B=$B; rerun with B=<real width>."

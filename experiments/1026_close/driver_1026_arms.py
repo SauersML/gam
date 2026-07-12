@@ -182,9 +182,9 @@ def fit_curved_topk(x_tr, x_te, mean_tr, *, K, top_k, d_atom, topology, max_epoc
 
 def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
                     topology, max_epochs, curved_rows, seed, k_flat=None, collect=None):
-    """ALL-RUST hybrid: gam sae_manifold_fit sparse-code (linear) tier at reduced
-    actives + gam sae_manifold_fit curved TopK tier on the linear residual. Matched
-    per-token active-scalar budget: k_lin + curved_k·(1+d) == top_k.
+    """ALL-RUST hybrid: gam sparse-dictionary linear tier at reduced actives plus
+    a gam manifold-SAE curved TopK tier on the linear residual. Matched per-token
+    active-scalar budget: k_lin + curved_k·(1+d) == top_k.
 
     ``k_flat`` (gam#2233 theorem-faithful config): the linear tier's ATOM COUNT,
     defaulting to ``K``. A faithful crossover test reduces it so
@@ -198,8 +198,8 @@ def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
     print(f"[hybrid_rust] k_flat={k_flat} (external ref K={K}); "
           f"k_lin={k_lin} + curved_k={curved_k}*(1+{d}) == {top_k}", flush=True)
     t0 = time.perf_counter()
-    flat = gamfit.sae_manifold_fit(
-        x_tr, K=k_flat, assignment="softmax", top_k=k_lin, n_iter=max_epochs)
+    flat = gamfit.sparse_dictionary_fit(
+        x_tr, k_flat, active=k_lin, max_epochs=max_epochs)
     tr_tr = flat.transform(x_tr)
     tr_te = flat.transform(x_te)
     flat_recon_tr = flat.reconstruct(tr_tr.indices, tr_tr.codes)
