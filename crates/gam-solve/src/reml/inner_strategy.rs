@@ -99,7 +99,7 @@ impl<'a> RemlState<'a> {
             // the sparsity that justified going sparse in the first
             // place.  Routing to dense is the only cost-gradient-
             // consistent option.
-            return dense_backend("firth_bias_reduction_active", None, None);
+            return Ok(dense_backend("firth_bias_reduction_active", None, None));
         }
         if has_dense_constraints {
             return Ok(dense_backend("constraints_present", None, None));

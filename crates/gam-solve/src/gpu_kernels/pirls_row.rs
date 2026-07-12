@@ -1588,8 +1588,10 @@ pub fn launch_alpha_ladder_on_stream(
 /// so the generated CUDA source cannot drift to a second domain policy.
 #[cfg(target_os = "linux")]
 fn common_device_prolog() -> String {
-    format!(
-        r#"
+    // Brace-heavy CUDA source: keep it a plain raw string literal so every C
+    // brace stays literal (no `format!` grammar to escape), and substitute the
+    // two host solver bounds by unique sentinel token.
+    r#"
 extern "C" {
     double exp(double);
     double log(double);
@@ -1599,8 +1601,8 @@ extern "C" {
     double erfc(double);
 }
 
-static constexpr double PIRLS_LOG_ETA_MIN = {log_eta_min:?};
-static constexpr double PIRLS_LOG_ETA_MAX = {log_eta_max:?};
+static constexpr double PIRLS_LOG_ETA_MIN = __PIRLS_LOG_ETA_MIN__;
+static constexpr double PIRLS_LOG_ETA_MAX = __PIRLS_LOG_ETA_MAX__;
 
 static constexpr unsigned int PIRLS_OK = 0u;
 static constexpr unsigned int PIRLS_ETA_DOMAIN = 1u;
@@ -1701,9 +1703,14 @@ __device__ __forceinline__ bool pirls_outputs_finite(
     return isfinite(mu) && isfinite(grad_eta) && isfinite(w_fisher)
         && isfinite(w_hessian) && isfinite(w_solver) && isfinite(dev);
 }
-"#,
-        log_eta_min = crate::mixture_link::LOG_LINK_SOLVER_ETA_MIN,
-        log_eta_max = crate::mixture_link::LOG_LINK_SOLVER_ETA_MAX,
+"#
+    .replace(
+        "__PIRLS_LOG_ETA_MIN__",
+        &format!("{:?}", crate::mixture_link::LOG_LINK_SOLVER_ETA_MIN),
+    )
+    .replace(
+        "__PIRLS_LOG_ETA_MAX__",
+        &format!("{:?}", crate::mixture_link::LOG_LINK_SOLVER_ETA_MAX),
     )
 }
 

@@ -618,54 +618,45 @@ impl SurvivalLocationScaleFamily {
             }
         };
 
-        let assemble_h_wiggle = || -> Result<Option<Array2<f64>>, String> {
-            // Optional link-wiggle block.
-            if let (Some(xw_exit), Some(xw_entry), Some(xw_qdot)) = (
-                dynamic.wiggle_basis_exit.as_ref(),
-                dynamic.wiggle_basis_entry.as_ref(),
-                dynamic.wiggle_qdot_basis_exit.as_ref(),
-            ) {
-                Ok(Some(
-                    weighted_crossprod_dense_with_parallelism(
-                        xw_exit,
-                        &(-&q.d2_q1),
-                        xw_exit,
-                        product_parallelism,
-                    )? + weighted_crossprod_dense_with_parallelism(
-                        xw_entry,
-                        &(-&q.d2_q0),
-                        xw_entry,
-                        product_parallelism,
-                    )? + weighted_crossprod_dense_with_parallelism(
-                        xw_qdot,
-                        &(-&q.d2_qdot1),
-                        xw_qdot,
-                        product_parallelism,
-                    )?,
-                ))
-            } else {
-                Ok(None)
-            }
-        };
-
-        let (h_time, h_tt, h_ll, h_wiggle) = if use_outer_parallel {
-            let ((h_time, h_tt), (h_ll, h_wiggle)) = rayon::join(
-                || rayon::join(assemble_h_time, assemble_h_tt),
-                || rayon::join(assemble_h_ll, assemble_h_wiggle),
-            );
-            (h_time?, h_tt?, h_ll?, h_wiggle?)
+        let (h_time, h_tt, h_ll) = if use_outer_parallel {
+            let ((h_time, h_tt), h_ll) =
+                rayon::join(|| rayon::join(assemble_h_time, assemble_h_tt), assemble_h_ll);
+            (h_time?, h_tt?, h_ll?)
         } else {
-            (
-                assemble_h_time()?,
-                assemble_h_tt()?,
-                assemble_h_ll()?,
-                assemble_h_wiggle()?,
-            )
+            (assemble_h_time()?, assemble_h_tt()?, assemble_h_ll()?)
         };
 
         let mut blocks = vec![h_time, h_tt, h_ll];
-        if let Some(hww) = h_wiggle {
-            blocks.push(hww);
+
+        // #932: the link-wiggle block Hessian is single-sourced from the §13 warp
+        // row program (`survival_ls_wiggle_joint_hessian_dense`), NOT a bespoke
+        // per-block assembler. The retired `assemble_h_wiggle` summed three
+        // INDEPENDENT single-channel Gauss-Newton terms
+        // (`Xw_exitᵀ(-d2_q1)Xw_exit + Xw_entryᵀ(-d2_q0)Xw_entry +
+        // Xw_qdotᵀ(-d2_qdot1)Xw_qdot`) and DROPPED the exit-index ↔ qdot warp
+        // cross-coupling: one wiggle coefficient `βw_j` warps BOTH the exit index
+        // `q1w = q1 + Σβw·B(q1)` and the qdot multiplier `m1 = 1 + Σβw·B'(q1)`, so
+        // the wiggle-wiggle Hessian carries a mixed
+        // `∂²ℓ/∂q1∂qdot·(∂q1/∂βw)(∂qdot/∂βw)` term the three-way sum omitted
+        // (compare the log-sigma block above, which DOES carry its analogous
+        // exit↔deriv cross term) — a ~15% error at [0][0], the #736
+        // duplicate-derivative genus. This block-diagonal path feeds the live
+        // per-block inner-Newton working set (`FamilyEvaluation`), so it must use
+        // the SAME curvature the joint Newton step and the trust-region floor
+        // already source from §13. `q` here is unrescaled
+        // (`collect_joint_quantities`), matching the §13 `deriv_log_scale = 0.0`
+        // and the other blocks' scale. Building the full §13 dense to slice one
+        // block is heavier than the retired sparse assembler, but it is exact and
+        // only runs for the (uncommon) link-wiggle case.
+        if self.x_link_wiggle.is_some() {
+            let offsets = self.joint_block_offsets();
+            let (lo, hi) = (
+                offsets[Self::BLOCK_LINK_WIGGLE],
+                offsets[Self::BLOCK_LINK_WIGGLE + 1],
+            );
+            let dense =
+                super::row_kernel::survival_ls_wiggle_joint_hessian_dense(self, &dynamic, 0.0)?;
+            blocks.push(dense.slice(ndarray::s![lo..hi, lo..hi]).to_owned());
         }
 
         Ok(blocks)

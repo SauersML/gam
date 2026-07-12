@@ -2138,7 +2138,10 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
                     }
                     BlockWorkingSet::Diagonal {
                         working_response: _,
-                        working_weights,
+                        // The diagonal d2H correction re-derives curvature through
+                        // `diagonalworking_weights_second_directional_derivative`
+                        // (`d2w` below), so the base working weights are unused here.
+                        working_weights: _,
                     } => {
                         let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
                             format!(
