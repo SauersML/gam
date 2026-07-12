@@ -2334,10 +2334,13 @@ impl SaeManifoldOuterObjective {
     /// 2. Between chunks, the same assembled-system KKT residual and quotient
     ///    residual the historical loop gates on, against the identical full
     ///    stationarity tolerance `τ_full`.
-    /// 3. At a stationary iterate, the criterion is priced through the
-    ///    sanctioned FREEZE evaluation (`inner_max_iter == 0`: one undamped
-    ///    factorization at the frozen state) — the same evidence convention as
-    ///    the historical loop's stationary factorization.
+    /// 3. At a stationary iterate, the criterion is priced through the shared
+    ///    evaluator, warm from that iterate on the probe refine budget, so the
+    ///    value is taken at the SAME #2253 idempotent fixed point
+    ///    (`gradient_stationary && criterion_fixed_point`) every other lane
+    ///    prices — never at a merely coarse-KKT state (whose FREEZE-priced
+    ///    value desyncs from the analytic sample at real scale and trips the
+    ///    outer "cost-only vs analytic-sample" certification guard).
     /// 4. If the exact gate is not met within the probe budget, adjudication is
     ///    handed to the shared evaluator, warm from the partially refined state;
     ///    a persistent objective stall without KKT stationarity is a typed
@@ -2419,20 +2422,34 @@ impl SaeManifoldOuterObjective {
             // unlike values and can reject a real descent step (#2253).
             let gate = SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.term.inner_iterate_scale();
             if SaeManifoldTerm::quasi_laplace_kkt_stationary(grad_norm, quotient_grad_norm, gate) {
-                // Price the criterion at the stationary iterate through the
-                // sanctioned FREEZE evaluation (`inner_max_iter == 0`): one
-                // undamped factorization at the frozen state, the same evidence
-                // convention as the historical loop's stationary factorization.
-                // Its remaining refusal classes (border Schur non-PD, cross-row
-                // non-PD) are the typed recoverable probe refusals the outer
-                // bridge already maps to an infeasible trial.
+                // Price the criterion by handing the coarse-KKT iterate to the
+                // shared evaluator, warm, on the probe refine budget — NOT
+                // through a FREEZE (`inner_max_iter == 0`) factorization at
+                // this state. A coarse KKT-band hit is only an admission
+                // signal: the Criterion drive (`eval`/`eval_cost`/the outer
+                // certification) accepts a value only at the #2253 idempotent
+                // fixed point (`gradient_stationary && criterion_fixed_point`,
+                // see `converge_inner_for_undamped_logdet`), and at real scale
+                // the band still admits strict Newton steps that move V by
+                // ~1% — the FREEZE-priced probe value then disagrees with the
+                // analytic-sample value at the SAME ρ and the outer
+                // certification refuses ("cost-only value disagrees with
+                // analytic-sample value"). The shared evaluator polishes from
+                // this stationary iterate to the same fixed point every other
+                // lane prices, so probe and accepted-point values are one
+                // measure; when the iterate is already idempotent it accepts
+                // immediately and the value is unchanged. Its refusal classes
+                // (border Schur non-PD, cross-row non-PD, did-not-converge)
+                // remain the typed recoverable probe refusals the outer bridge
+                // maps to an infeasible trial (with the budget rescue re-trying
+                // on the extended budget first).
                 return self
                     .term
                     .penalized_quasi_laplace_criterion_with_refine_policy_and_lane(
                         self.target.view(),
                         rho,
                         self.registry.as_ref(),
-                        0,
+                        self.inner_max_iter,
                         self.learning_rate,
                         self.ridge_ext_coord,
                         self.ridge_beta,
