@@ -1094,6 +1094,7 @@ mod parity_tests {
     use super::{ClassPenaltyMetric, weighted_penalty_sum};
     use crate::binomial_multi::{BinomialMultiFitInputs, fit_penalized_binomial_multi};
     use crate::multinomial::{MultinomialFitInputs, fit_penalized_multinomial};
+    use gam_test_support::fd_checker::numerical_gradient_central_diff;
     use ndarray::{Array1, Array2};
 
     /// #1587: the `Centered` class-penalty metric is invariant to the arbitrary
@@ -1283,24 +1284,25 @@ mod parity_tests {
         -ll + pen
     }
 
-    /// Central finite-difference gradient of an objective over every entry of a
-    /// `(P, C)` coefficient matrix. The optimum must drive every component to
-    /// ~0; we assert the max |component| against an un-weakened bound.
+    /// Max-norm of the central finite-difference gradient of an objective over
+    /// every entry of a `(P, C)` coefficient matrix. The optimum must drive every
+    /// component to ~0; we assert the max |component| against an un-weakened
+    /// bound. This is a thin matrix reshape over the canonical scalar-objective
+    /// FD helper — the finite-difference math itself lives in
+    /// [`gam_test_support::fd_checker::numerical_gradient_central_diff`].
     fn fd_grad<F: Fn(&Array2<f64>) -> f64>(beta: &Array2<f64>, f: F) -> f64 {
         let (p, c) = beta.dim();
-        let h = 1.0e-6;
-        let mut max_abs = 0.0_f64;
-        for i in 0..p {
-            for a in 0..c {
-                let mut up = beta.clone();
-                let mut dn = beta.clone();
-                up[[i, a]] += h;
-                dn[[i, a]] -= h;
-                let g = (f(&up) - f(&dn)) / (2.0 * h);
-                max_abs = max_abs.max(g.abs());
-            }
-        }
-        max_abs
+        let flat = Array1::from_iter(beta.iter().copied());
+        let grad = numerical_gradient_central_diff(
+            |x: &Array1<f64>| {
+                let m = Array2::from_shape_vec((p, c), x.to_vec())
+                    .expect("row-major reshape of coefficient vector");
+                f(&m)
+            },
+            &flat,
+            1.0e-6,
+        );
+        grad.iter().fold(0.0_f64, |acc, &g| acc.max(g.abs()))
     }
 
     fn binomial_fixture() -> (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>) {

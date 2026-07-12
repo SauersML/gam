@@ -348,6 +348,18 @@ fn hand_grad_hess(fx: &VFixture, p: &[f64]) -> (f64, Vec<f64>, Vec<f64>) {
 
 // ------------------------------------------------------------------
 // 4th-order Richardson central-difference of the hand-path VALUE.
+//
+// These deliberately do NOT route through
+// `gam_test_support::fd_checker`: that helper is the plain two-point
+// central difference (O(h²)), whereas these Richardson-extrapolate two
+// central differences at `h` and `h/2` into an O(h⁴) estimate, and the
+// diagonal second derivative here uses the `h`-spaced three-point stencil
+// `(f(x+h) − 2·f(x) + f(x−h))/h²` rather than the `2h`-spaced four-point
+// stencil the canonical Hessian helper (and `bms::test_support`) use. The
+// tight grad/Hessian gates below (`1e-7` / `1e-5`) are calibrated to this
+// higher-order scheme, so folding it into the plain canonical helper would
+// change the FD numbers. It is an honest higher-order carve-out, not a
+// duplicated copy of the canonical two-point math.
 // ------------------------------------------------------------------
 
 /// 4th-order Richardson first derivative along axis `i`.

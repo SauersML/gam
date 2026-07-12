@@ -425,41 +425,10 @@ pub(crate) fn cell_coeff_jet_ab(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Finite-difference a closure `theta -> value` along axis pairs, returning a
-    /// dense `p×p` Hessian by central differences of central-difference
-    /// gradients. Coarse (`h = 1e-4`), used only to confirm the jet channels have
-    /// the right STRUCTURE; the bit-identity to `Tower2` is the exact gate.
-    fn fd_grad_hess(theta: &[f64], step: f64, f: impl Fn(&[f64]) -> f64) -> (Vec<f64>, Vec<f64>) {
-        let p = theta.len();
-        let mut grad = vec![0.0; p];
-        for i in 0..p {
-            let mut tp = theta.to_vec();
-            let mut tm = theta.to_vec();
-            tp[i] += step;
-            tm[i] -= step;
-            grad[i] = (f(&tp) - f(&tm)) / (2.0 * step);
-        }
-        let mut hess = vec![0.0; p * p];
-        for i in 0..p {
-            for j in 0..p {
-                let mut tpp = theta.to_vec();
-                let mut tpm = theta.to_vec();
-                let mut tmp = theta.to_vec();
-                let mut tmm = theta.to_vec();
-                tpp[i] += step;
-                tpp[j] += step;
-                tpm[i] += step;
-                tpm[j] -= step;
-                tmp[i] -= step;
-                tmp[j] += step;
-                tmm[i] -= step;
-                tmm[j] -= step;
-                hess[i * p + j] = (f(&tpp) - f(&tpm) - f(&tmp) + f(&tmm)) / (4.0 * step * step);
-            }
-        }
-        (grad, hess)
-    }
+    use gam_test_support::fd_checker::{
+        numerical_gradient_central_diff, numerical_hessian_central_diff,
+    };
+    use ndarray::Array1;
 
     /// Pins that the runtime-dimension `Jet2` algebra (add / sub / mul / scale /
     /// compose_unary) carries the order-≤2 channels correctly over a runtime `p`.
@@ -482,7 +451,21 @@ mod tests {
         let z2p1 = z.mul(&z).add(&Jet2::constant(1.0, p));
         let jet = exp_xy.add(&z2p1.mul(&x));
 
-        let (fg, fh) = fd_grad_hess(&theta, 1e-4, scalar);
+        // Central-difference grad/Hessian of the same scalar closure via the
+        // canonical FD harness (coarse `h = 1e-4`); used only to confirm the jet
+        // channels have the right STRUCTURE — the bit-identity to `Tower2` is the
+        // exact gate.
+        let theta_arr = Array1::from_iter(theta.iter().copied());
+        let fg = numerical_gradient_central_diff(
+            |v: &Array1<f64>| scalar(v.as_slice().expect("contiguous theta")),
+            &theta_arr,
+            1e-4,
+        );
+        let fh = numerical_hessian_central_diff(
+            |v: &Array1<f64>| scalar(v.as_slice().expect("contiguous theta")),
+            &theta_arr,
+            1e-4,
+        );
 
         assert!((jet.value() - scalar(&theta)).abs() < 1e-12);
         for i in 0..p {
@@ -494,10 +477,10 @@ mod tests {
             );
             for j in 0..p {
                 assert!(
-                    (jet.h[i * p + j] - fh[i * p + j]).abs() < 1e-4,
+                    (jet.h[i * p + j] - fh[[i, j]]).abs() < 1e-4,
                     "hess[{i},{j}]: jet {} vs fd {}",
                     jet.h[i * p + j],
-                    fh[i * p + j]
+                    fh[[i, j]]
                 );
             }
         }

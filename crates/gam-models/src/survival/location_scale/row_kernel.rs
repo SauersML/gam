@@ -3670,7 +3670,6 @@ impl SurvivalLocationScaleFamily {
             d2_q1,
             d3_q1,
             d1_qdot1,
-            d2_qdot1,
             grad_time_eta_h0: d1_q0,
             grad_time_eta_h1: d1_q1,
             grad_time_eta_d: d1_qdot1,

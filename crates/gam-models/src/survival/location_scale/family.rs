@@ -90,7 +90,6 @@ pub(crate) struct SurvivalRowDerivatives {
     pub(crate) d3_q1: f64,
     /// Exit-only derivatives with respect to qdot1 = dq/dt at the event time.
     pub(crate) d1_qdot1: f64,
-    pub(crate) d2_qdot1: f64,
     pub(crate) grad_time_eta_h0: f64,
     pub(crate) grad_time_eta_h1: f64,
     pub(crate) grad_time_eta_d: f64,
