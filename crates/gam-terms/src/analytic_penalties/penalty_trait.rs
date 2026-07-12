@@ -1,7 +1,7 @@
 use super::*;
 
 pub(crate) const MIN_CONDITIONAL_PRECISION: f64 = 1.0e-12;
-use gam_problem::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN, checked_exp_log_strength};
+pub(crate) use gam_problem::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN, checked_exp_log_strength};
 
 // ---------------------------------------------------------------------------
 // Common trait
