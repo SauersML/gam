@@ -32,6 +32,7 @@
 use crate::cubic_cell_kernel::{self, DenestedPartitionCell, LocalSpanCubic};
 use crate::custom_family::{CustomFamilyBlockPsiDerivative, ParameterBlockSpec};
 use crate::outer_subsample::{OuterScoreSubsample, WeightedOuterRow};
+#[cfg(test)]
 use gam_math::jet_partitions::MultiDirJet;
 use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
 use gam_math::nested_dual::JetField;
@@ -116,6 +117,7 @@ pub fn probit_frailty_scale(gaussian_frailty_sd: Option<f64>) -> f64 {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn probit_frailty_scale_multi_dir_jet(
     gaussian_frailty_sd: Option<f64>,
     missing_sigma_message: &str,
@@ -142,6 +144,7 @@ pub(crate) fn probit_frailty_scale_multi_dir_jet(
 /// frailty kernel with an order-matched [`MultiDirJet`] each time. The `obj`
 /// slot is `Some` only when the caller also wants the zeroth-order objective
 /// (the prefix-only evaluation); psi-Hessian directional sweeps leave it `None`.
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct DirectionalScaleJets {
     pub(crate) obj: Option<MultiDirJet>,
@@ -149,8 +152,8 @@ pub(crate) struct DirectionalScaleJets {
     pub(crate) hess: MultiDirJet,
 }
 
-/// Output of [`directional_obj_grad_hess`]: the (optional) zeroth-order
-/// objective, the full primary gradient, and the symmetric primary Hessian.
+/// One auxiliary-parameter channel's objective, full primary gradient, and
+/// symmetric primary Hessian.
 pub(crate) struct DirectionalPrimaryTerms {
     pub(crate) objective: f64,
     pub(crate) grad: Array1<f64>,
@@ -279,6 +282,7 @@ where
 /// obj/grad/hess loop nest, which is the single most drift-prone piece of the
 /// exact-Newton stack: a stray index or a missing symmetric assignment in one
 /// copy silently destabilizes only that family's optimizer.
+#[cfg(test)]
 pub(crate) fn directional_obj_grad_hess<Eval>(
     primary_dim: usize,
     leading: &[&Array1<f64>],
