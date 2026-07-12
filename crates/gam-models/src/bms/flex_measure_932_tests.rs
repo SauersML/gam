@@ -150,7 +150,7 @@ struct MFixture {
 
 /// Deterministic 65-node grid over [−2.6, 2.6] with a normalized bell-shaped
 /// weight profile — large enough that per-node work dominates per-cell work,
-/// matching the production shape the factored path was built for.
+/// matching the production shape the compiled moment-jet path was built for.
 fn mgrid() -> EmpiricalZGrid {
     let nodes: Vec<f64> = (0..GRID_NODES)
         .map(|i| -2.6 + 5.2 * (i as f64) / ((GRID_NODES - 1) as f64))

@@ -39,8 +39,8 @@ use crate::survival::lognormal_kernel::{
     FrailtySpec, HazardLoading, LatentSurvivalEventType, LatentSurvivalRow, LatentSurvivalRowJet,
     log_kernel_bundle,
 };
-use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
+use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
 use gam_problem::MIN_WEIGHT;
 use gam_solve::pirls::LinearInequalityConstraints;
 use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec, build_term_collection_design};
@@ -1384,9 +1384,8 @@ fn latent_kernel_sum_order2_parts<const K: usize>(
     context: &str,
 ) -> Result<(f64, Vec<Order2<K>>), LatentSurvivalError> {
     let order2_width = 1 + K + K * (K + 1) / 2;
-    let mut term_lists = Vec::<Vec<LatentKernelPrimaryTerm>>::with_capacity(
-        suffixes.len() * order2_width,
-    );
+    let mut term_lists =
+        Vec::<Vec<LatentKernelPrimaryTerm>>::with_capacity(suffixes.len() * order2_width);
 
     for suffix in suffixes {
         let mut append = |axes: &[LatentKernelPrimaryDirection]| {
@@ -1559,7 +1558,9 @@ impl<const K: usize> LatentPrimaryJetBackend<K> for LatentOrder2Backend {
             &suffixes,
             context,
         )?;
-        let mut out = parts.remove(0).compose_unary(latent_unary_derivatives_log(1.0));
+        let mut out = parts
+            .remove(0)
+            .compose_unary(latent_unary_derivatives_log(1.0));
         out.0.v += base_log_sum;
         Ok(out)
     }
@@ -1873,17 +1874,18 @@ fn latent_survival_row_primary_log_jet_multidir_reference(
                 "latent survival numerator",
             )?
         }
-        LatentSurvivalEventType::IntervalCensored =>
+        LatentSurvivalEventType::IntervalCensored => {
             latent_survival_interval_numerator_log_jet_multidir_reference(
-            quadctx,
-            row,
-            q_exit,
-            q_right,
-            mu,
-            sigma,
-            log_sigma_factor,
-            directions,
-        )?,
+                quadctx,
+                row,
+                q_exit,
+                q_right,
+                mu,
+                sigma,
+                log_sigma_factor,
+                directions,
+            )?
+        }
     };
 
     let mut total = numerator.add(&denominator.scale(-1.0));
@@ -2065,13 +2067,12 @@ fn latent_survival_row_primary_jet<const K: usize, B: LatentPrimaryJetBackend<K>
                 sigma,
                 log_sigma_factor,
             };
-            let exit_directions: [LatentKernelPrimaryDirection; K] =
-                std::array::from_fn(|a| {
-                    latent_survival_map_exit_direction(
-                        latent_survival_basis_direction(a),
-                        row.event_type,
-                    )
-                });
+            let exit_directions: [LatentKernelPrimaryDirection; K] = std::array::from_fn(|a| {
+                latent_survival_map_exit_direction(
+                    latent_survival_basis_direction(a),
+                    row.event_type,
+                )
+            });
             match row.event_type {
                 LatentSurvivalEventType::RightCensored => backend
                     .kernel_sum_log(
@@ -2119,9 +2120,9 @@ fn latent_survival_row_primary_jet<const K: usize, B: LatentPrimaryJetBackend<K>
                         )
                         .map_err(|error| error.to_string())?
                 }
-                LatentSurvivalEventType::IntervalCensored => unreachable!(
-                    "interval rows are routed to the dedicated two-boundary branch"
-                ),
+                LatentSurvivalEventType::IntervalCensored => {
+                    unreachable!("interval rows are routed to the dedicated two-boundary branch")
+                }
             }
         }
         LatentSurvivalEventType::IntervalCensored => latent_survival_interval_numerator_jet(
@@ -2145,10 +2146,7 @@ fn latent_survival_row_primary_jet<const K: usize, B: LatentPrimaryJetBackend<K>
         .add(&B::Jet::constant(unloaded_offset)))
 }
 
-fn latent_survival_interval_numerator_jet<
-    const K: usize,
-    B: LatentPrimaryJetBackend<K>,
->(
+fn latent_survival_interval_numerator_jet<const K: usize, B: LatentPrimaryJetBackend<K>>(
     backend: &B,
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
@@ -2248,7 +2246,10 @@ fn latent_survival_row_primary_gradient_hessian(
             sigma,
             log_sigma_factor,
         )?;
-        gradient.as_slice_mut().expect("gradient is contiguous").copy_from_slice(&out.g());
+        gradient
+            .as_slice_mut()
+            .expect("gradient is contiguous")
+            .copy_from_slice(&out.g());
         let hessian = out.h();
         for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
             for b in 0..LATENT_SURVIVAL_PRIMARY_DIM {
@@ -6483,6 +6484,255 @@ mod tests {
                     "interval row primary neg_hess[{j},{k}] mismatch: analytic={analytic}, fd={fd_neg_hess}, abs_err={abs_err}, rel={rel}"
                 );
             }
+        }
+    }
+
+    type LatentFullPrimaryChannels = (f64, Array1<f64>, Array2<f64>, Array2<f64>, Array2<f64>);
+
+    fn latent_full_primary_channels(
+        quadctx: &QuadratureContext,
+        row: &LatentSurvivalRow,
+        include_log_sigma: bool,
+        use_multidir_reference: bool,
+    ) -> LatentFullPrimaryChannels {
+        let q_entry = -1.2;
+        let q_exit = -0.4;
+        let qdot_exit = 0.73;
+        let q_right = 0.5;
+        let mu = -0.15;
+        let sigma = 0.3_f64.exp();
+        let direction_u = array![0.17, -0.11, 0.09, 0.13, -0.07, 0.05];
+        let direction_v = array![-0.08, 0.14, -0.06, 0.04, 0.12, -0.09];
+        if use_multidir_reference {
+            let (value, gradient, hessian) =
+                latent_survival_row_primary_gradient_hessian_multidir_reference(
+                    quadctx,
+                    row,
+                    q_entry,
+                    q_exit,
+                    qdot_exit,
+                    q_right,
+                    mu,
+                    sigma,
+                    include_log_sigma,
+                )
+                .expect("pre-cutover MultiDirJet VGH reference");
+            let third = latent_survival_row_primary_third_contracted_multidir_reference(
+                quadctx,
+                row,
+                q_entry,
+                q_exit,
+                qdot_exit,
+                q_right,
+                mu,
+                sigma,
+                &direction_u,
+                include_log_sigma,
+            )
+            .expect("pre-cutover MultiDirJet third reference");
+            let fourth = latent_survival_row_primary_fourth_contracted_multidir_reference(
+                quadctx,
+                row,
+                q_entry,
+                q_exit,
+                qdot_exit,
+                q_right,
+                mu,
+                sigma,
+                &direction_u,
+                &direction_v,
+                include_log_sigma,
+            )
+            .expect("pre-cutover MultiDirJet fourth reference");
+            (value, gradient, hessian, third, fourth)
+        } else {
+            let (value, gradient, hessian) = latent_survival_row_primary_gradient_hessian(
+                quadctx,
+                row,
+                q_entry,
+                q_exit,
+                qdot_exit,
+                q_right,
+                mu,
+                sigma,
+                include_log_sigma,
+            )
+            .expect("one-pass Order2 VGH");
+            let third = latent_survival_row_primary_third_contracted(
+                quadctx,
+                row,
+                q_entry,
+                q_exit,
+                qdot_exit,
+                q_right,
+                mu,
+                sigma,
+                &direction_u,
+                include_log_sigma,
+            )
+            .expect("one-pass OneSeed third");
+            let fourth = latent_survival_row_primary_fourth_contracted(
+                quadctx,
+                row,
+                q_entry,
+                q_exit,
+                qdot_exit,
+                q_right,
+                mu,
+                sigma,
+                &direction_u,
+                &direction_v,
+                include_log_sigma,
+            )
+            .expect("one-pass TwoSeed fourth");
+            (value, gradient, hessian, third, fourth)
+        }
+    }
+
+    fn assert_latent_full_channels_close(
+        label: &str,
+        got: &LatentFullPrimaryChannels,
+        reference: &LatentFullPrimaryChannels,
+    ) {
+        let mut max_abs = (got.0 - reference.0).abs();
+        let mut max_rel = max_abs / got.0.abs().max(reference.0.abs()).max(1e-13);
+        for (left, right) in got
+            .1
+            .iter()
+            .chain(got.2.iter())
+            .chain(got.3.iter())
+            .chain(got.4.iter())
+            .zip(
+                reference
+                    .1
+                    .iter()
+                    .chain(reference.2.iter())
+                    .chain(reference.3.iter())
+                    .chain(reference.4.iter()),
+            )
+        {
+            let absolute = (left - right).abs();
+            let relative = absolute / left.abs().max(right.abs()).max(1e-13);
+            max_abs = max_abs.max(absolute);
+            max_rel = max_rel.max(relative);
+        }
+        assert!(
+            max_abs <= 5e-11 || max_rel <= 5e-10,
+            "{label}: one-pass channels differ from the pre-cutover MultiDirJet oracle: max_abs={max_abs:e}, max_rel={max_rel:e}"
+        );
+    }
+
+    /// Pins the one-pass scalar layouts to the complete pre-cutover output on
+    /// every event branch and at both live primary dimensions.  This is stronger
+    /// than an FD-only oracle: it covers value, gradient, negative Hessian,
+    /// contracted third, and contracted fourth simultaneously.
+    #[test]
+    fn latent_survival_one_pass_matches_multidir_all_events_all_channels_932() {
+        let quadctx = QuadratureContext::new();
+        let rows = [
+            (
+                "right",
+                LatentSurvivalRow::right_censored(0.3, 0.67, 0.01, 0.02),
+            ),
+            (
+                "exact",
+                LatentSurvivalRow::exact_event(0.3, 0.67, 0.01, 0.02, 0.73, 0.08),
+            ),
+            (
+                "interval",
+                LatentSurvivalRow::interval_censored(0.3, 0.67, 1.65, 0.01, 0.02, 0.05),
+            ),
+        ];
+        for (event, row) in &rows {
+            for include_log_sigma in [false, true] {
+                let reference =
+                    latent_full_primary_channels(&quadctx, row, include_log_sigma, true);
+                let got = latent_full_primary_channels(&quadctx, row, include_log_sigma, false);
+                let dimension = if include_log_sigma { 6 } else { 5 };
+                assert_latent_full_channels_close(
+                    &format!("event={event}, K={dimension}"),
+                    &got,
+                    &reference,
+                );
+            }
+        }
+    }
+
+    fn best_elapsed_seconds(mut run: impl FnMut(), iterations: usize, samples: usize) -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..samples {
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                run();
+            }
+            best = best.min(started.elapsed().as_secs_f64());
+        }
+        best
+    }
+
+    /// Full-output pre-cutover benchmark: the baseline includes all 21/28 VGH
+    /// row sweeps and all 15/21 third/fourth pair sweeps; the candidate returns
+    /// the identical five-channel payload via one Order2, one OneSeed, and one
+    /// TwoSeed row evaluation.  Run with `--release -- --nocapture` for the
+    /// reported ratios; the debug configuration uses one iteration to keep the
+    /// ordinary suite bounded while still enforcing the direction of the win.
+    #[test]
+    fn measure_latent_survival_one_pass_full_output_k5_k6_932() {
+        let quadctx = QuadratureContext::new();
+        let row = LatentSurvivalRow::exact_event(0.3, 0.67, 0.01, 0.02, 0.73, 0.08);
+        let iterations = if cfg!(debug_assertions) { 1 } else { 5 };
+        let samples = if cfg!(debug_assertions) { 1 } else { 3 };
+
+        for include_log_sigma in [false, true] {
+            // Warm every quadrature and code path before sampling.
+            std::hint::black_box(latent_full_primary_channels(
+                &quadctx,
+                &row,
+                include_log_sigma,
+                true,
+            ));
+            std::hint::black_box(latent_full_primary_channels(
+                &quadctx,
+                &row,
+                include_log_sigma,
+                false,
+            ));
+            let reference_seconds = best_elapsed_seconds(
+                || {
+                    std::hint::black_box(latent_full_primary_channels(
+                        std::hint::black_box(&quadctx),
+                        std::hint::black_box(&row),
+                        include_log_sigma,
+                        true,
+                    ));
+                },
+                iterations,
+                samples,
+            );
+            let one_pass_seconds = best_elapsed_seconds(
+                || {
+                    std::hint::black_box(latent_full_primary_channels(
+                        std::hint::black_box(&quadctx),
+                        std::hint::black_box(&row),
+                        include_log_sigma,
+                        false,
+                    ));
+                },
+                iterations,
+                samples,
+            );
+            let dimension = if include_log_sigma { 6 } else { 5 };
+            let reference_us = reference_seconds * 1e6 / iterations as f64;
+            let one_pass_us = one_pass_seconds * 1e6 / iterations as f64;
+            let ratio = one_pass_seconds / reference_seconds;
+            eprintln!(
+                "LATENT-ONE-PASS-932 K={dimension} prechange={reference_us:.3} us/full-output one-pass={one_pass_us:.3} us/full-output ratio={ratio:.4} speedup={:.2}x",
+                1.0 / ratio
+            );
+            assert!(
+                ratio < 1.0,
+                "K={dimension} one-pass full output must beat the strongest exact pre-cutover full-output path: ratio={ratio}"
+            );
         }
     }
 }

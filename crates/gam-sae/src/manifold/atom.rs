@@ -374,6 +374,28 @@ pub(crate) fn bessel_i1(x: f64) -> f64 {
     if x < 0.0 { -value } else { value }
 }
 
+/// Overflow-free `(log I0(η) - |η|, I1(|η|)/I0(|η|))`.
+///
+/// Centering `log I0` by its leading `|η|` term matters for likelihoods such
+/// as the circular Gaussian, where the exponentially large Bessel factor
+/// cancels an equally large quadratic term. Returning the centered value
+/// directly preserves that cancellation even when `|η|` is too large for
+/// `log I0(η) - |η|` to retain any low-order bits.
+pub fn bessel_i0_log_minus_abs_and_ratio(eta: f64) -> (f64, f64) {
+    let ax = eta.abs();
+    if ax < 3.75 {
+        let i0 = bessel_i0(ax);
+        let i1 = bessel_i1(ax);
+        (i0.ln() - ax, i1 / i0)
+    } else {
+        let poly0 = bessel_i0_scaled_poly(ax);
+        let poly1 = bessel_i1_scaled_poly(ax);
+        let centered_log_i0 = -0.5 * ax.ln() + poly0.ln();
+        let ratio = poly1 / poly0;
+        (centered_log_i0, ratio)
+    }
+}
+
 /// Overflow-free `(log I0(η), I1(η)/I0(η))` for `η >= 0`, the only two Bessel
 /// quantities the von-Mises ARD precision normaliser and its ρ-gradient need.
 ///
@@ -391,19 +413,9 @@ pub(crate) fn bessel_i1(x: f64) -> f64 {
 /// and in the *ratio* (`I1/I0 = poly₁/poly₀`), so both are computed from the
 /// bounded scaled polynomials alone — exact for non-degenerate η and finite for
 /// every finite η.
-pub(crate) fn bessel_i0_log_and_ratio(eta: f64) -> (f64, f64) {
-    let ax = eta.abs();
-    if ax < 3.75 {
-        let i0 = bessel_i0(ax);
-        let i1 = bessel_i1(ax);
-        (i0.ln(), i1 / i0)
-    } else {
-        let poly0 = bessel_i0_scaled_poly(ax);
-        let poly1 = bessel_i1_scaled_poly(ax);
-        let log_i0 = ax - 0.5 * ax.ln() + poly0.ln();
-        let ratio = poly1 / poly0;
-        (log_i0, ratio)
-    }
+pub fn bessel_i0_log_and_ratio(eta: f64) -> (f64, f64) {
+    let (centered_log_i0, ratio) = bessel_i0_log_minus_abs_and_ratio(eta);
+    (eta.abs() + centered_log_i0, ratio)
 }
 /// One manifold atom.
 ///

@@ -192,7 +192,10 @@ fn planted_1e4_column_spread_behavior_block_converges_and_matches_well_scaled() 
             layer.reconstruction_r2
         );
     }
-    assert_eq!(ill.kl.infinite_rows, 0, "no fitted row may decode off-simplex");
+    assert_eq!(
+        ill.kl.infinite_rows, 0,
+        "no fitted row may decode off-simplex"
+    );
 
     // The recovered ACTIVATION reconstruction (gauge-invariant: it is decoded
     // output, not an internal coordinate) must match the well-scaled fixture's

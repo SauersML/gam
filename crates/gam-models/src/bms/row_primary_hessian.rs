@@ -2816,7 +2816,7 @@ impl BernoulliMarginalSlopeFamily {
     /// small for ordinary spline bases).
     /// Numerical parity with the independent runtime jet is pinned to ≤1e-9 by
     /// the value/gradient/full-Hessian moment oracle.
-    pub(super) fn flex_grid_calibration_derivs_factored(
+    pub(super) fn flex_grid_calibration_derivs_compiled_jet2(
         &self,
         empirical_grid: &crate::bms::EmpiricalZGrid,
         primary: &PrimarySlices,
@@ -3061,13 +3061,13 @@ impl BernoulliMarginalSlopeFamily {
             // #932 BMS-flex cutover: production routes the empirical-grid
             // calibration derivatives through the per-denested-cell moment
             // compiled factorization (`O(G + cells·k²)`), NOT the
-            // former hand per-node `O(G·r²)` loop. This factored path is pinned
+            // former hand per-node `O(G·r²)` loop. This compiled path is pinned
             // at ≤1e-9 against the independent `empirical_flex_row_nll_jet2` grid
             // jet AND an independent finite difference
             // (`empirical_flex_row_nll_jet2_matches_hand_path_932`,
             // `flex_factored_matches_jet2_degenerate_grids_932`,
             // `hand_flex_grad_hess_matches_independent_fd_*_932`).
-            f_aa = self.flex_grid_calibration_derivs_factored(
+            f_aa = self.flex_grid_calibration_derivs_compiled_jet2(
                 &*empirical_grid,
                 primary,
                 a,

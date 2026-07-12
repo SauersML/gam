@@ -42,6 +42,7 @@ use gam::inference::structure_evidence::{
     select_probe_by_expected_evidence as core_select_probe_by_expected_evidence,
     split_likelihood_log_e_value,
 };
+use gam::terms::sae::manifold::{bessel_i0_log_and_ratio, bessel_i0_log_minus_abs_and_ratio};
 
 use crate::py_value_error;
 
@@ -1201,6 +1202,92 @@ mod tests {
     }
 
     #[test]
+    fn circular_gaussian_density_is_normalized_and_finite_at_center() {
+        // Integrate 2 pi r p(r) dr with composite Simpson quadrature. The
+        // model is a density on Cartesian R^2, so this must be one without a
+        // truncated-radius correction or a singular center convention.
+        const INTERVALS: usize = 200_000;
+        for (radius, noise_variance) in [(0.0, 0.7), (2.0, 0.09), (20.0, 1.0e-4)] {
+            let fit = CircularGaussianFit2d {
+                center: [1.25, -0.75],
+                radius,
+                noise_variance,
+            };
+            assert!(fit.log_density(fit.center[0], fit.center[1]).is_finite());
+
+            let upper = radius + 12.0 * noise_variance.sqrt();
+            let step = upper / INTERVALS as f64;
+            let radial_mass = |r: f64| {
+                if r == 0.0 {
+                    0.0
+                } else {
+                    std::f64::consts::TAU
+                        * r
+                        * fit.log_density(fit.center[0] + r, fit.center[1]).exp()
+                }
+            };
+            let mut weighted_sum = radial_mass(0.0) + radial_mass(upper);
+            for index in 1..INTERVALS {
+                let weight = if index % 2 == 0 { 2.0 } else { 4.0 };
+                weighted_sum += weight * radial_mass(index as f64 * step);
+            }
+            let integral = step * weighted_sum / 3.0;
+            assert!(
+                (integral - 1.0).abs() < 3.0e-6,
+                "circular Gaussian failed to normalize: R={radius} s={noise_variance} integral={integral:.16e}"
+            );
+        }
+    }
+
+    #[test]
+    fn circular_gaussian_mle_satisfies_all_score_equations() {
+        let n = 360usize;
+        let mut coords = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            let angle = std::f64::consts::TAU * row as f64 / n as f64;
+            coords[[row, 0]] = 0.2 + 1.7 * angle.cos() + 0.15 * (2.3 * angle).cos();
+            coords[[row, 1]] = -0.4 + 1.7 * angle.sin() + 0.12 * (4.7 * angle).sin();
+        }
+        let rows = (0..n).collect::<Vec<_>>();
+        let fit = CircularGaussianFit2d::fit(coords.view(), &rows).unwrap();
+        let mut center_score = [0.0_f64; 2];
+        let mut radius_score = 0.0_f64;
+        let mut variance_score = 0.0_f64;
+        for row in 0..n {
+            let dx = coords[[row, 0]] - fit.center[0];
+            let dy = coords[[row, 1]] - fit.center[1];
+            let observed_radius = dx.hypot(dy);
+            let kappa = fit.radius * observed_radius / fit.noise_variance;
+            let (_, bessel_ratio) = bessel_i0_log_and_ratio(kappa);
+            let center_multiplier =
+                (1.0 - fit.radius * bessel_ratio / observed_radius) / fit.noise_variance;
+            center_score[0] += center_multiplier * dx;
+            center_score[1] += center_multiplier * dy;
+            radius_score += (observed_radius * bessel_ratio - fit.radius) / fit.noise_variance;
+            let stable_expected_residual = (observed_radius - fit.radius).powi(2)
+                + 2.0 * fit.radius * observed_radius * (1.0 - bessel_ratio);
+            variance_score += -1.0 / fit.noise_variance
+                + 0.5 * stable_expected_residual / fit.noise_variance.powi(2);
+        }
+        let nf = n as f64;
+        let score_scale = fit.noise_variance.sqrt();
+        assert!(
+            (center_score[0] / nf * score_scale).abs() < 2.0e-8
+                && (center_score[1] / nf * score_scale).abs() < 2.0e-8,
+            "center score did not vanish: {:?}",
+            center_score
+        );
+        assert!(
+            (radius_score / nf * score_scale).abs() < 2.0e-8,
+            "radius score did not vanish: {radius_score}"
+        );
+        assert!(
+            (variance_score / nf * fit.noise_variance).abs() < 2.0e-8,
+            "variance score did not vanish: {variance_score}"
+        );
+    }
+
+    #[test]
     fn smooth_circle_density_and_evidence_are_translation_invariant() {
         let n = 160usize;
         let mut coords = Array2::<f64>::zeros((n, 2));
@@ -1231,6 +1318,128 @@ mod tests {
             (base_evidence - shifted_evidence).abs() < 2.0e-9,
             "translation changed ring evidence: base={base_evidence:.16e}, shifted={shifted_evidence:.16e}"
         );
+    }
+
+    #[test]
+    fn smooth_circle_density_and_evidence_obey_the_2d_scale_law() {
+        let n = 160usize;
+        let scale = 7.25_f64;
+        let mut coords = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            let angle = std::f64::consts::TAU * row as f64 / n as f64;
+            let radius = 2.0 + 0.08 * (3.0 * angle).cos() + 0.03 * (5.0 * angle).sin();
+            coords[[row, 0]] = radius * angle.cos();
+            coords[[row, 1]] = radius * angle.sin();
+        }
+        let scaled = coords.mapv(|value| scale * value);
+        let train = (0..120).collect::<Vec<_>>();
+        let eval = (120..n).collect::<Vec<_>>();
+        let base_density = ring_provider_2d(coords.clone())(&train, &eval).unwrap();
+        let scaled_density = ring_provider_2d(scaled.clone())(&train, &eval).unwrap();
+        for (base, transformed) in base_density.iter().zip(&scaled_density) {
+            let expected = base - 2.0 * scale.ln();
+            assert!(
+                (transformed - expected).abs() < 2.0e-10,
+                "ring density violated p_a(ax)=p(x)/a^2: expected={expected:.16e}, got={transformed:.16e}"
+            );
+        }
+
+        let base_evidence = ring_negative_log_evidence_2d(coords.view()).unwrap();
+        let scaled_evidence = ring_negative_log_evidence_2d(scaled.view()).unwrap();
+        let expected = base_evidence + 2.0 * n as f64 * scale.ln();
+        assert!(
+            (scaled_evidence - expected).abs() < 2.0e-8,
+            "ring evidence violated the 2-D scale law: expected={expected:.16e}, got={scaled_evidence:.16e}"
+        );
+    }
+
+    #[test]
+    fn euclidean_gaussian_is_similarity_equivariant_with_a_normalized_density() {
+        let n = 180usize;
+        let mut coords = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            let phase = std::f64::consts::TAU * row as f64 / n as f64;
+            let x = 2.5 * phase.cos() + 0.35 * (3.0 * phase).sin();
+            let y = 0.4 * x + 0.7 * phase.sin() + 0.12 * (5.0 * phase).cos();
+            coords[[row, 0]] = x;
+            coords[[row, 1]] = y;
+        }
+        let train = (0..135).collect::<Vec<_>>();
+        let eval = (135..n).collect::<Vec<_>>();
+        let baseline = gaussian_provider_2d(coords.clone())(&train, &eval).unwrap();
+
+        // A 2-D similarity x' = a Q x + b changes every normalized Cartesian
+        // log density by exactly -log|det(aQ)| = -2 log(a).  In particular,
+        // the covariance regularizer must scale as a^2 rather than living in
+        // arbitrary absolute coordinate units.
+        let scale = 1.0e-4_f64;
+        let angle = 0.731_f64;
+        let (sin_angle, cos_angle) = angle.sin_cos();
+        let mut transformed = Array2::<f64>::zeros(coords.raw_dim());
+        for row in 0..n {
+            let x = coords[[row, 0]];
+            let y = coords[[row, 1]];
+            transformed[[row, 0]] = 0.25 + scale * (cos_angle * x - sin_angle * y);
+            transformed[[row, 1]] = -0.5 + scale * (sin_angle * x + cos_angle * y);
+        }
+        let changed = gaussian_provider_2d(transformed.clone())(&train, &eval).unwrap();
+        let jacobian_shift = -2.0 * scale.ln();
+        for (&base, &under_similarity) in baseline.iter().zip(&changed) {
+            assert!(
+                (under_similarity - (base + jacobian_shift)).abs() < 2.0e-7,
+                "Gaussian log density violated its similarity Jacobian: base={base:.16e}, transformed={under_similarity:.16e}"
+            );
+        }
+
+        let baseline_evidence = gaussian_negative_log_evidence_2d(coords.view()).unwrap();
+        let transformed_evidence = gaussian_negative_log_evidence_2d(transformed.view()).unwrap();
+        let expected_evidence = baseline_evidence + 2.0 * n as f64 * scale.ln();
+        assert!(
+            (transformed_evidence - expected_evidence).abs() < 2.0e-5,
+            "Gaussian evidence violated its similarity Jacobian: expected={expected_evidence:.16e}, actual={transformed_evidence:.16e}"
+        );
+
+        let mut translated = coords.clone();
+        for mut row in translated.rows_mut() {
+            row[0] += 1.0e6;
+            row[1] -= 2.0e6;
+        }
+        let translated_density = gaussian_provider_2d(translated.clone())(&train, &eval).unwrap();
+        for (&base, &shifted) in baseline.iter().zip(&translated_density) {
+            assert!(
+                (base - shifted).abs() < 2.0e-8,
+                "translation changed Euclidean Gaussian density: base={base:.16e}, shifted={shifted:.16e}"
+            );
+        }
+    }
+
+    #[test]
+    fn euclidean_gaussian_spectral_constraint_stays_positive_on_a_line() {
+        let mut line = Array2::<f64>::zeros((9, 2));
+        for row in 0..line.nrows() {
+            let x = row as f64 - 4.0;
+            line[[row, 0]] = x;
+            line[[row, 1]] = 2.0 * x;
+        }
+        let rows = (0..line.nrows()).collect::<Vec<_>>();
+        let fit = GaussianFit2d::fit(line.view(), &rows).unwrap();
+        let on_line = fit.log_density(0.0, 0.0);
+        let off_line = fit.log_density(-0.02, 0.01);
+        assert!(on_line.is_finite() && off_line.is_finite());
+        assert!(
+            off_line < on_line - 1.0e6,
+            "the constrained covariance must penalize its null direction: on={on_line}, off={off_line}"
+        );
+        assert!(
+            gaussian_negative_log_evidence_2d(line.view())
+                .unwrap()
+                .is_finite()
+        );
+
+        let coincident = Array2::<f64>::from_elem((5, 2), 3.0);
+        let error = GaussianFit2d::fit(coincident.view(), &[0, 1, 2, 3, 4])
+            .expect_err("a zero-dimensional point mass is not a 2-D Gaussian density");
+        assert!(error.contains("zero"), "{error}");
     }
 
     /// #2262 structureless-null control: on pure isotropic Gaussian noise (no
@@ -1524,22 +1733,32 @@ mod tests {
 // predictive-stacking headline picks the winner.
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Fitted radial density for the smooth-circle candidate.
+/// Maximum-likelihood circular-Gaussian fit for the smooth-circle candidate.
 ///
-/// The center is part of the model. Intrinsic coordinates have an arbitrary
-/// translation gauge, so anchoring the ring at `(0, 0)` makes a shape verdict
-/// depend on a coordinate convention rather than on the represented geometry.
-/// Estimating the center from each training fold makes the density exactly
-/// translation equivariant. The corresponding evidence price is four
-/// parameters: center(2), mean radius, and radial variance.
+/// The generative model is
+///
+/// `X = center + radius * U + epsilon`,
+///
+/// where `U` is uniform on the unit circle and
+/// `epsilon ~ N(0, noise_variance * I_2)`. Integrating out `U` gives the proper
+/// Cartesian density
+///
+/// `p(x) = exp(-(r^2 + R^2)/(2s)) I0(Rr/s) / (2 pi s)`.
+///
+/// Unlike a Gaussian density assigned directly to the nonnegative radius, this
+/// is normalized on the plane without a missing truncation normalizer, stays
+/// finite at the center, and has no artificial `1/r` singularity. The center
+/// is fitted jointly with `(R, s)` by exact latent-angle EM updates, rather than
+/// being frozen at the coordinate mean. There are still four interior model
+/// parameters: center(2), radius, and isotropic noise variance.
 #[derive(Debug, Clone, Copy)]
-struct RadialCircleFit2d {
+struct CircularGaussianFit2d {
     center: [f64; 2],
-    mean_radius: f64,
-    radial_variance: f64,
+    radius: f64,
+    noise_variance: f64,
 }
 
-impl RadialCircleFit2d {
+impl CircularGaussianFit2d {
     fn fit(coords: ArrayView2<'_, f64>, rows: &[usize]) -> Result<Self, String> {
         let Some(&anchor_row) = rows.first() else {
             return Err("circle density requires a nonempty training set".to_string());
@@ -1548,75 +1767,195 @@ impl RadialCircleFit2d {
             return Err("circle density received invalid coordinates or row indices".to_string());
         }
 
-        // Accumulate relative to one observed row. This avoids destroying the
-        // low-order bits of a small circle merely because its coordinate chart
-        // carries a large translation.
+        if rows
+            .iter()
+            .any(|&row| !coords[[row, 0]].is_finite() || !coords[[row, 1]].is_finite())
+        {
+            return Err("circle density requires finite training coordinates".to_string());
+        }
+
+        // Work in a dimensionless chart relative to one observed point. This
+        // preserves the low-order bits of a small translated circle and makes
+        // the EM stopping rule and variance floor exactly scale equivariant.
         let anchor = [coords[[anchor_row, 0]], coords[[anchor_row, 1]]];
-        let mut relative_sum = [0.0_f64; 2];
+        let mut scale = 0.0_f64;
         for &row in rows {
-            relative_sum[0] += coords[[row, 0]] - anchor[0];
-            relative_sum[1] += coords[[row, 1]] - anchor[1];
+            let dx = coords[[row, 0]] - anchor[0];
+            let dy = coords[[row, 1]] - anchor[1];
+            if !(dx.is_finite() && dy.is_finite()) {
+                return Err("circle density coordinate range exceeds f64".to_string());
+            }
+            scale = scale.max(dx.hypot(dy));
+        }
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err("circle density requires nonzero spatial extent".to_string());
+        }
+
+        let mut points = Vec::with_capacity(rows.len());
+        let mut mean = [0.0_f64; 2];
+        for &row in rows {
+            let point = [
+                (coords[[row, 0]] - anchor[0]) / scale,
+                (coords[[row, 1]] - anchor[1]) / scale,
+            ];
+            points.push(point);
+            mean[0] += point[0];
+            mean[1] += point[1];
         }
         let count = rows.len() as f64;
-        let center = [
-            anchor[0] + relative_sum[0] / count,
-            anchor[1] + relative_sum[1] / count,
-        ];
-        let mut radii = Vec::with_capacity(rows.len());
-        let mut radius_sum = 0.0_f64;
-        let mut radius_square_sum = 0.0_f64;
-        for &row in rows {
-            let dx = coords[[row, 0]] - center[0];
-            let dy = coords[[row, 1]] - center[1];
-            let radius = dx.hypot(dy);
-            radii.push(radius);
-            radius_sum += radius;
-            radius_square_sum += radius * radius;
+        mean[0] /= count;
+        mean[1] /= count;
+
+        // Moment initialization is exact at the population level for this
+        // model. If q = ||X-E X||^2, then
+        //   E[q] = R^2 + 2s,  Var(q) = 4s(R^2+s),
+        // hence R^4 = E[q]^2-Var(q) and s=(E[q]-R^2)/2.
+        let mut squared_radii = Vec::with_capacity(rows.len());
+        let mut mean_squared_radius = 0.0_f64;
+        for point in &points {
+            let dx = point[0] - mean[0];
+            let dy = point[1] - mean[1];
+            let squared_radius = dx * dx + dy * dy;
+            squared_radii.push(squared_radius);
+            mean_squared_radius += squared_radius;
         }
-        let mean_radius = radius_sum / count;
-        let mut radial_variance = 0.0_f64;
-        for radius in radii {
-            radial_variance += (radius - mean_radius).powi(2);
+        mean_squared_radius /= count;
+        let mut squared_radius_variance = 0.0_f64;
+        for squared_radius in squared_radii {
+            squared_radius_variance += (squared_radius - mean_squared_radius).powi(2);
         }
-        radial_variance /= count;
-        // A zero-width observed ring is a boundary density. Keep the same
-        // explicit interior regularization used by the other Gaussian
-        // candidates, but scale it in data units instead of imposing the old
-        // absolute 1e-9 floor (which broke scale equivariance).
-        let radial_scale_squared = (radius_square_sum / count).max(f64::MIN_POSITIVE);
-        let variance_floor = (64.0 * f64::EPSILON * radial_scale_squared).max(f64::MIN_POSITIVE);
-        radial_variance = radial_variance.max(variance_floor);
-        if !center.iter().all(|value| value.is_finite())
-            || !mean_radius.is_finite()
-            || !radial_variance.is_finite()
+        squared_radius_variance /= count;
+
+        // A noiseless observed circle is an unbounded-likelihood boundary.
+        // Constrain the numerical fit to a scale-relative interior whose width
+        // is at roundoff, not in arbitrary data units.
+        let variance_floor = (64.0 * f64::EPSILON * mean_squared_radius).max(f64::MIN_POSITIVE);
+        let radius_squared = (mean_squared_radius * mean_squared_radius - squared_radius_variance)
+            .max(0.0)
+            .sqrt();
+        let mut radius = radius_squared.sqrt();
+        let mut noise_variance = (0.5 * (mean_squared_radius - radius_squared)).max(variance_floor);
+        let mut center = mean;
+
+        // Exact EM for the latent circle angle. Given current parameters, the
+        // conditional mean of U is A(kappa) * (x-c)/||x-c|| with
+        // A=I1/I0 and kappa=R||x-c||/s. The joint quadratic M-step has the
+        // closed forms below; using the joint center/radius solution avoids the
+        // biased "center = sample mean" plug-in fit.
+        const MAX_EM_ITERATIONS: usize = 4096;
+        const EM_TOLERANCE: f64 = 2.0e-12;
+        let mut posterior_means = vec![[0.0_f64; 2]; points.len()];
+        let mut converged = false;
+        for _ in 0..MAX_EM_ITERATIONS {
+            let mut posterior_mean = [0.0_f64; 2];
+            for (point, latent_mean) in points.iter().zip(&mut posterior_means) {
+                let dx = point[0] - center[0];
+                let dy = point[1] - center[1];
+                let observed_radius = dx.hypot(dy);
+                if observed_radius == 0.0 || radius == 0.0 {
+                    *latent_mean = [0.0, 0.0];
+                } else {
+                    let kappa = radius * observed_radius / noise_variance;
+                    let (_, bessel_ratio) = bessel_i0_log_and_ratio(kappa);
+                    if !(bessel_ratio.is_finite() && (0.0..=1.0).contains(&bessel_ratio)) {
+                        return Err("circle density Bessel ratio left [0, 1]".to_string());
+                    }
+                    let multiplier = bessel_ratio / observed_radius;
+                    *latent_mean = [multiplier * dx, multiplier * dy];
+                }
+                posterior_mean[0] += latent_mean[0];
+                posterior_mean[1] += latent_mean[1];
+            }
+            posterior_mean[0] /= count;
+            posterior_mean[1] /= count;
+
+            let denominator =
+                1.0 - posterior_mean[0] * posterior_mean[0] - posterior_mean[1] * posterior_mean[1];
+            if !(denominator.is_finite() && denominator > 0.0) {
+                return Err("circle density EM radius update is singular".to_string());
+            }
+            let mut radius_numerator = 0.0_f64;
+            for (point, latent_mean) in points.iter().zip(&posterior_means) {
+                radius_numerator +=
+                    latent_mean[0] * (point[0] - mean[0]) + latent_mean[1] * (point[1] - mean[1]);
+            }
+            let next_radius = (radius_numerator / (count * denominator)).max(0.0);
+            let next_center = [
+                mean[0] - next_radius * posterior_mean[0],
+                mean[1] - next_radius * posterior_mean[1],
+            ];
+
+            // Evaluate the expected squared residual as
+            // ||d-R E[U]||^2 + R^2(1-||E[U]||^2), a nonnegative form that
+            // does not catastrophically cancel on a very thin ring.
+            let mut residual_sum = 0.0_f64;
+            for (point, latent_mean) in points.iter().zip(&posterior_means) {
+                let dx = point[0] - next_center[0];
+                let dy = point[1] - next_center[1];
+                let ex = dx - next_radius * latent_mean[0];
+                let ey = dy - next_radius * latent_mean[1];
+                let latent_norm_squared =
+                    latent_mean[0] * latent_mean[0] + latent_mean[1] * latent_mean[1];
+                residual_sum += ex * ex
+                    + ey * ey
+                    + next_radius * next_radius * (1.0 - latent_norm_squared).max(0.0);
+            }
+            let next_noise_variance = (residual_sum / (2.0 * count)).max(variance_floor);
+
+            let parameter_change = (next_center[0] - center[0])
+                .hypot(next_center[1] - center[1])
+                .max((next_radius - radius).abs())
+                .max(
+                    (next_noise_variance - noise_variance).abs()
+                        / (next_noise_variance + noise_variance),
+                );
+            center = next_center;
+            radius = next_radius;
+            noise_variance = next_noise_variance;
+            if parameter_change <= EM_TOLERANCE {
+                converged = true;
+                break;
+            }
+        }
+        if !converged {
+            return Err("circle density maximum-likelihood fit did not converge".to_string());
+        }
+
+        let fitted = Self {
+            center: [anchor[0] + scale * center[0], anchor[1] + scale * center[1]],
+            radius: scale * radius,
+            noise_variance: scale * scale * noise_variance,
+        };
+        if !fitted.center.iter().all(|value| value.is_finite())
+            || !fitted.radius.is_finite()
+            || !(fitted.noise_variance.is_finite() && fitted.noise_variance > 0.0)
         {
             return Err("circle density fit produced non-finite parameters".to_string());
         }
-        Ok(Self {
-            center,
-            mean_radius,
-            radial_variance,
-        })
+        Ok(fitted)
     }
 
     fn log_density(self, x: f64, y: f64) -> f64 {
-        let radius = (x - self.center[0])
-            .hypot(y - self.center[1])
-            .max(f64::MIN_POSITIVE.sqrt());
-        -0.5 * (std::f64::consts::TAU * self.radial_variance).ln()
-            - 0.5 * (radius - self.mean_radius).powi(2) / self.radial_variance
-            - std::f64::consts::TAU.ln()
-            - radius.ln()
+        let observed_radius = (x - self.center[0]).hypot(y - self.center[1]);
+        let kappa = self.radius * observed_radius / self.noise_variance;
+        let (log_i0_minus_kappa, _) = bessel_i0_log_minus_abs_and_ratio(kappa);
+        // Algebraically this is -(r^2+R^2)/(2s)+log I0(kappa), but the
+        // rearrangement preserves the cancellation log I0(kappa) ~= kappa on
+        // thin rings where both terms can be enormous.
+        -(std::f64::consts::TAU * self.noise_variance).ln()
+            - 0.5 * (observed_radius - self.radius).powi(2) / self.noise_variance
+            + log_i0_minus_kappa
     }
 }
 
 /// Held-out log-density of the smooth-circle (ring) candidate on 2-D coords:
-/// radius ~ N(μ, σ²) around a fitted center, angle uniform, plus the
-/// Cartesian→polar `1/r` Jacobian.
+/// a uniform latent point on the fitted circle convolved with isotropic 2-D
+/// Gaussian noise. This is a normalized Cartesian density, including at the
+/// fitted center.
 fn ring_provider_2d(coords: Array2<f64>) -> gam::solver::HeldOutDensityProvider<'static> {
     Box::new(
         move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
-            let fit = RadialCircleFit2d::fit(coords.view(), train)?;
+            let fit = CircularGaussianFit2d::fit(coords.view(), train)?;
             let mut out = Vec::with_capacity(eval.len());
             for &i in eval {
                 if i >= coords.nrows() {
@@ -1629,61 +1968,139 @@ fn ring_provider_2d(coords: Array2<f64>) -> gam::solver::HeldOutDensityProvider<
     )
 }
 
+/// One full Euclidean Gaussian fit in two dimensions.
+///
+/// `origin + mean_offset` is the location, represented in two pieces so a
+/// translated intrinsic chart does not force us to subtract two large,
+/// nearly-equal absolute coordinates when accumulating or evaluating the fit.
+/// The covariance is constrained spectrally, and `precision` plus `log_norm`
+/// are constructed from those exact same constrained eigenvalues.  This is
+/// essential: independently flooring covariance entries and its determinant
+/// does not describe any normalized Gaussian density.
+#[derive(Debug, Clone, Copy)]
+struct GaussianFit2d {
+    origin: [f64; 2],
+    mean_offset: [f64; 2],
+    major_direction: [f64; 2],
+    inverse_eigenvalues: [f64; 2],
+    log_norm: f64,
+}
+
+impl GaussianFit2d {
+    fn fit(coords: ArrayView2<'_, f64>, rows: &[usize]) -> Result<Self, String> {
+        if coords.ncols() != 2 || rows.iter().any(|&row| row >= coords.nrows()) {
+            return Err("Gaussian density received invalid coordinates or row indices".to_string());
+        }
+        if rows.len() < 3 {
+            return Err("Gaussian density needs at least three training rows".to_string());
+        }
+        let origin = [coords[[rows[0], 0]], coords[[rows[0], 1]]];
+        if !origin.iter().all(|value| value.is_finite()) {
+            return Err("Gaussian density requires finite coordinates".to_string());
+        }
+
+        let mut mean_offset = [0.0_f64; 2];
+        for &row in rows {
+            for axis in 0..2 {
+                let relative = coords[[row, axis]] - origin[axis];
+                if !relative.is_finite() {
+                    return Err("Gaussian density requires finite coordinates".to_string());
+                }
+                mean_offset[axis] += relative;
+            }
+        }
+        let count = rows.len() as f64;
+        mean_offset[0] /= count;
+        mean_offset[1] /= count;
+
+        let (mut sxx, mut sxy, mut syy) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for &row in rows {
+            let dx = (coords[[row, 0]] - origin[0]) - mean_offset[0];
+            let dy = (coords[[row, 1]] - origin[1]) - mean_offset[1];
+            sxx += dx * dx;
+            sxy += dx * dy;
+            syy += dy * dy;
+        }
+        sxx /= count;
+        sxy /= count;
+        syy /= count;
+        let trace = sxx + syy;
+        if !(trace.is_finite() && trace > 0.0) || !sxy.is_finite() {
+            return Err(
+                "Gaussian density is undefined for a point cloud with zero or non-finite variance"
+                    .to_string(),
+            );
+        }
+
+        // For [[sxx,sxy],[sxy,syy]], theta is the major-eigenvector angle.
+        // The relative spectral floor is homogeneous in the data units: under
+        // x -> a*x both eigenvalues and the floor multiply by a^2.  The old
+        // absolute entry/determinant floors changed the model under this
+        // harmless re-expression of an intrinsic coordinate chart.
+        let spectral_gap = (sxx - syy).hypot(2.0 * sxy);
+        let largest = (0.5 * (trace + spectral_gap)).max(f64::MIN_POSITIVE);
+        let floor = (64.0 * f64::EPSILON * largest).max(f64::MIN_POSITIVE);
+        let smallest = (0.5 * (trace - spectral_gap)).max(floor);
+        let largest = largest.max(floor);
+        if !smallest.is_finite() || !largest.is_finite() {
+            return Err("Gaussian covariance spectrum is non-finite".to_string());
+        }
+        let theta = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+        let (sin_theta, cos_theta) = theta.sin_cos();
+        let inverse_largest = 1.0 / largest;
+        let inverse_smallest = 1.0 / smallest;
+        let log_norm = -std::f64::consts::TAU.ln() - 0.5 * (largest.ln() + smallest.ln());
+        if !inverse_largest.is_finite() || !inverse_smallest.is_finite() || !log_norm.is_finite() {
+            return Err("Gaussian covariance factorization is non-finite".to_string());
+        }
+        Ok(Self {
+            origin,
+            mean_offset,
+            major_direction: [cos_theta, sin_theta],
+            inverse_eigenvalues: [inverse_largest, inverse_smallest],
+            log_norm,
+        })
+    }
+
+    fn log_density(self, x: f64, y: f64) -> f64 {
+        let dx = (x - self.origin[0]) - self.mean_offset[0];
+        let dy = (y - self.origin[1]) - self.mean_offset[1];
+        // Evaluate in the covariance eigenbasis.  This sum of nonnegative
+        // squares avoids the cancellation of an expanded x' Sigma^-1 x for a
+        // nearly rank-one cloud.
+        let major = self.major_direction[0] * dx + self.major_direction[1] * dy;
+        let minor = -self.major_direction[1] * dx + self.major_direction[0] * dy;
+        let quad = major * major * self.inverse_eigenvalues[0]
+            + minor * minor * self.inverse_eigenvalues[1];
+        self.log_norm - 0.5 * quad
+    }
+}
+
 /// Held-out log-density of the Euclidean candidate: a full 2-D Gaussian (mean +
 /// 2×2 covariance) refit on each fold's training rows.
 fn gaussian_provider_2d(coords: Array2<f64>) -> gam::solver::HeldOutDensityProvider<'static> {
     Box::new(
         move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
-            if train.len() < 3 {
-                return Err("gaussian provider needs >=3 training rows".to_string());
-            }
-            let n = train.len() as f64;
-            let (mut mx, mut my) = (0.0_f64, 0.0_f64);
-            for &i in train {
-                mx += coords[[i, 0]];
-                my += coords[[i, 1]];
-            }
-            mx /= n;
-            my /= n;
-            let (mut sxx, mut sxy, mut syy) = (0.0_f64, 0.0_f64, 0.0_f64);
-            for &i in train {
-                let dx = coords[[i, 0]] - mx;
-                let dy = coords[[i, 1]] - my;
-                sxx += dx * dx;
-                sxy += dx * dy;
-                syy += dy * dy;
-            }
-            sxx = (sxx / n).max(1e-9);
-            syy = (syy / n).max(1e-9);
-            sxy /= n;
-            let mut det = sxx * syy - sxy * sxy;
-            if det <= 1e-12 {
-                sxy *= 0.999;
-                det = (sxx * syy - sxy * sxy).max(1e-12);
-            }
-            let inv_xx = syy / det;
-            let inv_yy = sxx / det;
-            let inv_xy = -sxy / det;
-            let log_norm = -((std::f64::consts::TAU).ln()) - 0.5 * det.ln();
+            let fit = GaussianFit2d::fit(coords.view(), train)?;
             let mut out = Vec::with_capacity(eval.len());
-            for &i in eval {
-                let dx = coords[[i, 0]] - mx;
-                let dy = coords[[i, 1]] - my;
-                let quad = inv_xx * dx * dx + 2.0 * inv_xy * dx * dy + inv_yy * dy * dy;
-                out.push(log_norm - 0.5 * quad);
+            for &row in eval {
+                if row >= coords.nrows() {
+                    return Err("Gaussian density received an invalid evaluation row".to_string());
+                }
+                out.push(fit.log_density(coords[[row, 0]], coords[[row, 1]]));
             }
             Ok(out)
         },
     )
 }
 
-/// Closed-form rank-aware (BIC-form Laplace) negative-log-evidence of the ring
-/// model (4 free params: center(2), radius mean, and variance). Corroborates
-/// the held-out stacking headline; lower is better.
+/// BIC-form Laplace negative-log-evidence of the circular Gaussian (4 interior
+/// parameters: center(2), circle radius, and isotropic noise variance).
+/// Corroborates the held-out stacking headline; lower is better.
 fn ring_negative_log_evidence_2d(coords: ArrayView2<'_, f64>) -> Result<f64, String> {
     let n = coords.nrows();
     let rows = (0..n).collect::<Vec<_>>();
-    let fit = RadialCircleFit2d::fit(coords, &rows)?;
+    let fit = CircularGaussianFit2d::fit(coords, &rows)?;
     let mut log_likelihood = 0.0_f64;
     for row in 0..n {
         log_likelihood += fit.log_density(coords[[row, 0]], coords[[row, 1]]);
@@ -1691,42 +2108,18 @@ fn ring_negative_log_evidence_2d(coords: ArrayView2<'_, f64>) -> Result<f64, Str
     Ok(-log_likelihood + 0.5 * 4.0 * (n as f64).ln())
 }
 
-/// Closed-form rank-aware negative-log-evidence of the full 2-D Gaussian
-/// (5 free params: mean(2) + symmetric 2×2 cov(3)).
-fn gaussian_negative_log_evidence_2d(coords: ArrayView2<'_, f64>) -> f64 {
+/// BIC-form negative-log-evidence of the full 2-D Gaussian (5 free params:
+/// mean(2) + symmetric 2×2 covariance(3)), evaluated under the exact same
+/// fitted density as the held-out provider.
+fn gaussian_negative_log_evidence_2d(coords: ArrayView2<'_, f64>) -> Result<f64, String> {
     let n = coords.nrows();
-    let nf = n as f64;
-    let (mut mx, mut my) = (0.0, 0.0);
-    for i in 0..n {
-        mx += coords[[i, 0]];
-        my += coords[[i, 1]];
-    }
-    mx /= nf;
-    my /= nf;
-    let (mut sxx, mut sxy, mut syy) = (0.0, 0.0, 0.0);
-    for i in 0..n {
-        let dx = coords[[i, 0]] - mx;
-        let dy = coords[[i, 1]] - my;
-        sxx += dx * dx;
-        sxy += dx * dy;
-        syy += dy * dy;
-    }
-    sxx = (sxx / nf).max(1e-9);
-    syy = (syy / nf).max(1e-9);
-    sxy /= nf;
-    let det = (sxx * syy - sxy * sxy).max(1e-12);
-    let inv_xx = syy / det;
-    let inv_yy = sxx / det;
-    let inv_xy = -sxy / det;
-    let log_norm = -((std::f64::consts::TAU).ln()) - 0.5 * det.ln();
+    let rows = (0..n).collect::<Vec<_>>();
+    let fit = GaussianFit2d::fit(coords, &rows)?;
     let mut loglik = 0.0_f64;
-    for i in 0..n {
-        let dx = coords[[i, 0]] - mx;
-        let dy = coords[[i, 1]] - my;
-        let quad = inv_xx * dx * dx + 2.0 * inv_xy * dx * dy + inv_yy * dy * dy;
-        loglik += log_norm - 0.5 * quad;
+    for row in 0..n {
+        loglik += fit.log_density(coords[[row, 0]], coords[[row, 1]]);
     }
-    -loglik + 0.5 * 5.0 * nf.ln()
+    Ok(-loglik + 0.5 * 5.0 * (n as f64).ln())
 }
 
 #[derive(Debug, Clone)]
@@ -1812,7 +2205,7 @@ fn run_atom_shape_race(
         },
         CrossClassCandidate {
             kind: AutoTopologyKind::Euclidean,
-            negative_log_evidence: gaussian_negative_log_evidence_2d(owned.view()),
+            negative_log_evidence: gaussian_negative_log_evidence_2d(owned.view())?,
             certification: EvidenceCertification::Exact,
             density_provider: gaussian_provider_2d(owned.clone()),
         },

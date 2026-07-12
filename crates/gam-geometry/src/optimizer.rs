@@ -70,6 +70,20 @@ fn g_norm(
 ) -> GeometryResult<f64> {
     let metric = manifold.metric_tensor(point)?;
     let metric_times_a = gam_linalg::faer_ndarray::fast_av(&metric.view(), &a);
+    metric_norm_from_product(a, metric_times_a.view())
+}
+
+/// Certify `sqrt(a^T G a)` once the metric product `G a` is available.
+///
+/// The absolute accumulation is part of the backward-error certificate.  It
+/// must itself remain finite: an infinite error scale would make every finite
+/// negative quadratic look like harmless roundoff and could certify a
+/// non-zero vector as having zero norm under an indefinite metric.
+fn metric_norm_from_product(
+    a: ArrayView1<'_, f64>,
+    metric_times_a: ArrayView1<'_, f64>,
+) -> GeometryResult<f64> {
+    check_len("metric norm product", metric_times_a.len(), a.len())?;
     let mut squared_norm = 0.0_f64;
     let mut absolute_sum = 0.0_f64;
     for (&left, &right) in a.iter().zip(metric_times_a.iter()) {
@@ -79,6 +93,11 @@ fn g_norm(
     }
     if !squared_norm.is_finite() {
         return Ok(f64::INFINITY);
+    }
+    if !absolute_sum.is_finite() {
+        return Err(crate::manifold::GeometryError::InvalidPoint(
+            "Riemannian metric norm error bound overflowed",
+        ));
     }
     // A Riemannian metric is positive definite. Permit only the backward-error
     // band of the final dot product; clamping a materially negative quadratic
@@ -1097,6 +1116,24 @@ mod tests {
             error,
             crate::manifold::GeometryError::NonConvergence { residual, .. }
                 if residual.is_infinite()
+        ));
+    }
+
+    #[test]
+    fn overflowed_metric_error_bound_cannot_certify_zero_norm() {
+        // The signed quadratic cancels to zero in this order, while the sum of
+        // absolute terms overflows. Treating an infinite backward-error band
+        // as a valid tolerance would turn this indefinite quadratic into a
+        // zero norm and falsely certify stationarity.
+        let vector = ndarray::array![1.0, 1.0, 1.0, 1.0];
+        let metric_product = ndarray::array![9.0e307, -9.0e307, 9.0e307, -9.0e307];
+        let error = metric_norm_from_product(vector.view(), metric_product.view())
+            .expect_err("an overflowed norm error bound must be rejected");
+        assert!(matches!(
+            error,
+            crate::manifold::GeometryError::InvalidPoint(
+                "Riemannian metric norm error bound overflowed"
+            )
         ));
     }
 

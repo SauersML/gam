@@ -81,8 +81,9 @@ impl GumbelTemperatureSchedule {
                 // annealing (`tau_min < tau_start`) still requires a strictly
                 // decaying rate.
                 let no_decay_needed = self.tau_min >= self.tau_start;
-                let rate_ok =
-                    rate.is_finite() && rate > 0.0 && (rate < 1.0 || (no_decay_needed && rate == 1.0));
+                let rate_ok = rate.is_finite()
+                    && rate > 0.0
+                    && (rate < 1.0 || (no_decay_needed && rate == 1.0));
                 if !rate_ok {
                     return Err(format!(
                         "GumbelTemperatureSchedule::Geometric: rate must be in (0, 1); got {rate}"

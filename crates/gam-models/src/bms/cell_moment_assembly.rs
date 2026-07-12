@@ -4808,12 +4808,12 @@ mod empirical_flex_jet_oracle_tests {
     }
 
     /// #932 BMS-flex cutover INC-1(b) GATE: the per-denested-cell moment
-    /// factorization (production `flex_grid_calibration_derivs_factored`, reached
+    /// compiler (production `flex_grid_calibration_derivs_compiled_jet2`, reached
     /// through `compute_row_analytic_flex_from_parts_into`) reproduces the
     /// INDEPENDENT grid jet `empirical_flex_row_nll_jet2` (value / dense gradient /
     /// full Hessian) to ≤1e-9 on DEGENERATE empirical grids — a sparse grid whose
     /// four nodes leave several denested cells EMPTY and at least one holding a
-    /// single node (the degenerate-moment paths where a factored accumulator
+    /// single node (the degenerate-moment paths where a compiled accumulator
     /// typically diverges from a loop) — over score-warp AND link-deviation,
     /// `b>0` AND `b<0`. The fixture routes the `GlobalEmpirical` branch, i.e. the
     /// production path the cutover replaces; `jet2` is a fully independent
@@ -4902,7 +4902,7 @@ mod empirical_flex_jet_oracle_tests {
                         true,
                         &mut scratch,
                     )
-                    .expect("factored flex path");
+                    .expect("compiled moment-jet flex path");
                 let jet = empirical_flex_row_nll_jet2(&fx, &p0);
                 let label = if is_score_warp {
                     "score-warp"

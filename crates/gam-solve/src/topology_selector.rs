@@ -1779,10 +1779,16 @@ pub fn mixture_density_provider<'a>(
     let owned = data.to_owned();
     Box::new(
         move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
-            let train_mat = gather_rows(owned.view(), train);
-            let fit = fit_gaussian_mixture(train_mat.view(), k.min(train.len().max(1)), config)
+            if k == 0 || k > train.len() {
+                return Err(format!(
+                    "fixed-order mixture k={k} requires at least {k} training rows; fold has {}",
+                    train.len()
+                ));
+            }
+            let train_mat = gather_rows(owned.view(), train, "mixture training")?;
+            let fit = fit_gaussian_mixture(train_mat.view(), k, config)
                 .map_err(|error| error.to_string())?;
-            let eval_mat = gather_rows(owned.view(), eval);
+            let eval_mat = gather_rows(owned.view(), eval, "mixture evaluation")?;
             let dens = fit.per_point_log_density(eval_mat.view())?;
             Ok(dens.to_vec())
         },
@@ -1800,16 +1806,15 @@ pub fn ring_of_clusters_density_provider<'a>(
     let owned = data.to_owned();
     Box::new(
         move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
-            let train_mat = gather_rows(owned.view(), train);
-            let train_k = k.min(train.len());
-            if train_k < 3 {
-                return Err(
-                    "ring-of-clusters held-out fold needs at least three training rows".to_string(),
-                );
+            if k < 3 || k > train.len() {
+                return Err(format!(
+                    "fixed-order ring-of-clusters k={k} requires k >= 3 and at least {k} training rows; fold has {}",
+                    train.len()
+                ));
             }
-            let fit =
-                crate::evidence::fit_ring_gaussian_mixture(train_mat.view(), train_k, config)?;
-            let eval_mat = gather_rows(owned.view(), eval);
+            let train_mat = gather_rows(owned.view(), train, "ring-of-clusters training")?;
+            let fit = crate::evidence::fit_ring_gaussian_mixture(train_mat.view(), k, config)?;
+            let eval_mat = gather_rows(owned.view(), eval, "ring-of-clusters evaluation")?;
             Ok(fit.per_point_log_density(eval_mat.view())?.to_vec())
         },
     )
@@ -1828,8 +1833,8 @@ pub fn union_density_provider<'a>(
     let owned = data.to_owned();
     Box::new(
         move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
-            let train_mat = gather_rows(owned.view(), train);
-            let eval_mat = gather_rows(owned.view(), eval);
+            let train_mat = gather_rows(owned.view(), train, "union training")?;
+            let eval_mat = gather_rows(owned.view(), eval, "union evaluation")?;
             let dens =
                 union_per_point_log_density(train_mat.view(), eval_mat.view(), structure, config)?;
             Ok(dens.to_vec())
@@ -1837,19 +1842,30 @@ pub fn union_density_provider<'a>(
     )
 }
 
-fn gather_rows(data: ArrayView2<'_, f64>, idx: &[usize]) -> Array2<f64> {
+fn gather_rows(
+    data: ArrayView2<'_, f64>,
+    idx: &[usize],
+    context: &str,
+) -> Result<Array2<f64>, String> {
     let d = data.ncols();
     let mut out = Array2::<f64>::zeros((idx.len(), d));
     for (r, &i) in idx.iter().enumerate() {
+        if i >= data.nrows() {
+            return Err(format!(
+                "{context} row index {i} is out of bounds for {} rows",
+                data.nrows()
+            ));
+        }
         for c in 0..d {
             out[[r, c]] = data[[i, c]];
         }
     }
-    out
+    Ok(out)
 }
 
-/// Deterministic contiguous `folds`-way CV partition of `0..n` (no clock
-/// randomness). Returns, for each fold, `(train_indices, eval_indices)`.
+/// Deterministic, seed-shuffled, exactly balanced `folds`-way CV partition of
+/// `0..n` (no clock randomness). Returns `(train_indices, eval_indices)` for
+/// each fold.
 ///
 /// Uses the default stacking seed ([`STACKING_CV_SEED`]); see
 /// [`deterministic_cv_folds_seeded`] for the seed-reproducible variant (#1386).
@@ -1869,30 +1885,31 @@ fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Deterministic, seed-reproducible `folds`-way CV partition of `0..n` (no clock
-/// randomness). The eval fold of sample `i` is `hash(seed, i) % folds`, so:
+/// Deterministic, seed-reproducible, exactly balanced `folds`-way CV partition
+/// of `0..n` (no clock randomness). Rows are ordered by `hash(seed, i)` and
+/// assigned round-robin, so:
 ///   - the same `seed` always reproduces the identical folding (deterministic),
 ///   - different seeds give different (still-deterministic) foldings.
+///   - every requested fold is nonempty and fold sizes differ by at most one.
 ///
 /// This is the seam that makes the `adjudicate_atom_shape` `seed=` kwarg
 /// functional (#1386): it is mixed into the held-out CV partition rather than
-/// being a silent no-op. Returns, for each fold, `(train_indices, eval_indices)`,
-/// dropping any fold whose train or eval set is empty.
+/// being a silent no-op. Invalid requests (`n < 2`, `folds < 2`, or `folds > n`)
+/// return an empty partition; selection-time callers reject them explicitly.
 pub fn deterministic_cv_folds_seeded(
     n: usize,
     folds: usize,
     seed: u64,
 ) -> Vec<(Vec<usize>, Vec<usize>)> {
-    let folds = folds.clamp(2, n.max(2));
-    // Precompute the seed-mixed fold of every sample once.
-    let assign: Vec<usize> = (0..n)
-        .map(|i| {
-            // Mix the seed with the index through a full-avalanche hash so the
-            // partition genuinely depends on both. The modulo keeps fold sizes
-            // balanced in expectation while remaining deterministic.
-            (splitmix64(seed ^ splitmix64(i as u64)) % folds as u64) as usize
-        })
-        .collect();
+    if n < 2 || folds < 2 || folds > n {
+        return Vec::new();
+    }
+    let mut order = (0..n).collect::<Vec<_>>();
+    order.sort_unstable_by_key(|&row| (splitmix64(seed ^ splitmix64(row as u64)), row));
+    let mut assign = vec![0usize; n];
+    for (rank, row) in order.into_iter().enumerate() {
+        assign[row] = rank % folds;
+    }
     let mut out = Vec::with_capacity(folds);
     for f in 0..folds {
         let mut train = Vec::new();
@@ -1904,9 +1921,8 @@ pub fn deterministic_cv_folds_seeded(
                 train.push(i);
             }
         }
-        if !eval.is_empty() && !train.is_empty() {
-            out.push((train, eval));
-        }
+        debug_assert!(!eval.is_empty() && !train.is_empty());
+        out.push((train, eval));
     }
     out
 }
@@ -1925,6 +1941,11 @@ pub fn build_cv_log_density_table(
 ) -> Result<Array2<f64>, String> {
     if providers.is_empty() {
         return Err("stacking table requires at least one candidate provider".to_string());
+    }
+    if n < 2 || folds < 2 || folds > n {
+        return Err(format!(
+            "stacking CV requires 2 <= folds <= n with n >= 2; got folds={folds}, n={n}"
+        ));
     }
     let partition = deterministic_cv_folds_seeded(n, folds, seed);
     if partition.is_empty() {
@@ -2621,6 +2642,30 @@ mod tests {
         Box::new(|_train: &[usize], eval: &[usize]| Ok(vec![0.0; eval.len()]))
     }
 
+    #[test]
+    fn held_out_mixture_candidates_never_change_their_declared_order() {
+        let data = Array2::<f64>::zeros((4, 2));
+        let mixture = mixture_density_provider(data.view(), 3, GaussianMixtureConfig::default());
+        let error = mixture(&[0, 1], &[2])
+            .expect_err("a k=3 candidate must not silently become k=2 on a short fold");
+        assert!(error.contains("fixed-order mixture k=3"), "{error}");
+
+        let ring =
+            ring_of_clusters_density_provider(data.view(), 3, GaussianMixtureConfig::default());
+        let error = ring(&[0, 1], &[2])
+            .expect_err("a k=3 ring candidate must not silently change order on a short fold");
+        assert!(
+            error.contains("fixed-order ring-of-clusters k=3"),
+            "{error}"
+        );
+
+        let invalid_index =
+            mixture_density_provider(data.view(), 1, GaussianMixtureConfig::default());
+        let error = invalid_index(&[0, 9], &[1])
+            .expect_err("public density providers must reject row indices instead of panicking");
+        assert!(error.contains("out of bounds"), "{error}");
+    }
+
     /// #1011/#1012 decision-margin contract on the same-class evidence race:
     /// when the winner's lead over the runner-up is inside the enclosure gap,
     /// the verdict is provisional (`insufficient_margin` set) so the caller must
@@ -2780,6 +2825,23 @@ mod tests {
             ),
             "deterministic_cv_folds must equal the default-seeded folding"
         );
+
+        let balanced = deterministic_cv_folds_seeded(43, FOLDS, 17);
+        assert_eq!(balanced.len(), FOLDS);
+        let eval_sizes = balanced
+            .iter()
+            .map(|(_, eval)| eval.len())
+            .collect::<Vec<_>>();
+        assert_eq!(eval_sizes.iter().sum::<usize>(), 43);
+        assert_eq!(eval_sizes.iter().copied().min(), Some(8));
+        assert_eq!(eval_sizes.iter().copied().max(), Some(9));
+
+        assert!(deterministic_cv_folds_seeded(5, 1, 11).is_empty());
+        assert!(deterministic_cv_folds_seeded(5, 6, 11).is_empty());
+        let providers = vec![trivial_provider()];
+        let error = build_cv_log_density_table(5, 1, 11, &providers)
+            .expect_err("selection must reject rather than silently clamp invalid fold counts");
+        assert!(error.contains("2 <= folds <= n"), "{error}");
     }
 
     /// The unified certificate ladder (#16): `EvidenceCertification::race_verdict`

@@ -116,8 +116,9 @@ fn ln_stack(x: f64) -> [f64; 5] {
 }
 
 /// A runtime-`K` truncated-Taylor scalar: the row loss is written once against
-/// this interface and re-instantiated at [`Jet2`] / [`Jet3`] / [`Jet4`] for the
-/// value/grad/Hessian, contracted-third, and contracted-fourth channels.
+/// this interface and re-instantiated at [`Jet1`] / [`Jet2`] / [`Jet3`] /
+/// [`Jet4`] for gradient-only, value/grad/Hessian, contracted-third, and
+/// contracted-fourth channels.
 trait FlexJet: Sized + Clone {
     /// Highest derivative order represented by this nilpotent algebra.
     /// A value-zero perturbation raised to `ORDER + 1` is identically zero, so
@@ -2378,6 +2379,43 @@ mod moment_engine_tests {
     use crate::marginal_slope_shared::eval_coeff4_at;
     use gam_math::jet_scalar::{Order2, filtered_implicit_solve_scalar};
     use gam_math::jet_tower::Tower2;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    /// Test-only execution policy that runs the historical order-four moment
+    /// construction over a lower-order algebra. The wrapped arithmetic is
+    /// unchanged, so this is an exact pre-optimization timing baseline rather
+    /// than a separately re-derived moment formula.
+    #[derive(Clone)]
+    struct ForcedOrder4<J>(J);
+
+    impl<J: FlexJet> FlexJet for ForcedOrder4<J> {
+        const ORDER: usize = 4;
+
+        fn value(&self) -> f64 {
+            self.0.value()
+        }
+
+        fn add(&self, other: &Self) -> Self {
+            Self(self.0.add(&other.0))
+        }
+
+        fn sub(&self, other: &Self) -> Self {
+            Self(self.0.sub(&other.0))
+        }
+
+        fn mul(&self, other: &Self) -> Self {
+            Self(self.0.mul(&other.0))
+        }
+
+        fn scale(&self, scale: f64) -> Self {
+            Self(self.0.scale(scale))
+        }
+
+        fn compose_unary(&self, derivatives: [f64; 5]) -> Self {
+            Self(self.0.compose_unary(derivatives))
+        }
+    }
 
     // #932-2 cutover: the hand IFT intercept-Hessian lift (`lift_flex_intercept_hessian`
     // + its `lift_intercept_order2` Order2 dispatch) is consumed only by the hand
@@ -3011,6 +3049,210 @@ mod moment_engine_tests {
         }
     }
 
+    /// The order-aware nilpotent schedule must preserve every represented
+    /// channel while eliminating the historical order-four work from Jet1/2.
+    /// `ForcedOrder4` delegates to the identical underlying arithmetic and only
+    /// overrides the execution order, making it an exact pre-change baseline.
+    #[test]
+    fn measure_base_moment_instantiated_order_vs_forced_four_932() {
+        use crate::cubic_cell_kernel::evaluate_cell_moments;
+
+        let cell = DenestedCubicCell {
+            left: -1.2,
+            right: 1.7,
+            c0: 0.25,
+            c1: -0.35,
+            c2: 0.4,
+            c3: 0.15,
+        };
+        let numeric = evaluate_cell_moments(cell, 28)
+            .expect("numeric cell moments")
+            .moments
+            .into_vec();
+        let p = 6usize;
+        let gradient = |scale: f64| -> Vec<f64> {
+            (0..p)
+                .map(|axis| scale * (axis as f64 + 1.0) / p as f64)
+                .collect()
+        };
+        let hessian = |scale: f64| -> Vec<f64> {
+            let mut out = vec![0.0; p * p];
+            for i in 0..p {
+                for j in 0..p {
+                    out[i * p + j] = scale * (i + j + 1) as f64 / (p * p) as f64;
+                }
+            }
+            out
+        };
+
+        let c1: [Jet1; 4] = [
+            Jet1 {
+                v: cell.c0,
+                g: gradient(0.13),
+            },
+            Jet1 {
+                v: cell.c1,
+                g: gradient(-0.21),
+            },
+            Jet1 {
+                v: cell.c2,
+                g: gradient(0.17),
+            },
+            Jet1 {
+                v: cell.c3,
+                g: gradient(0.09),
+            },
+        ];
+        let left1 = Jet1 {
+            v: cell.left,
+            g: gradient(-0.23),
+        };
+        let right1 = Jet1 {
+            v: cell.right,
+            g: gradient(0.31),
+        };
+        let forced_c1 = c1.clone().map(ForcedOrder4);
+        let forced_left1 = ForcedOrder4(left1.clone());
+        let forced_right1 = ForcedOrder4(right1.clone());
+
+        let c2: [Jet2; 4] = [
+            Jet2::from_parts(cell.c0, &gradient(0.13), &hessian(0.017)),
+            Jet2::from_parts(cell.c1, &gradient(-0.21), &hessian(-0.011)),
+            Jet2::from_parts(cell.c2, &gradient(0.17), &hessian(0.019)),
+            Jet2::from_parts(cell.c3, &gradient(0.09), &hessian(-0.007)),
+        ];
+        let left2 = Jet2::from_parts(cell.left, &gradient(-0.23), &hessian(0.013));
+        let right2 = Jet2::from_parts(cell.right, &gradient(0.31), &hessian(-0.015));
+        let forced_c2 = c2.clone().map(ForcedOrder4);
+        let forced_left2 = ForcedOrder4(left2.clone());
+        let forced_right2 = ForcedOrder4(right2.clone());
+
+        let native1 = base_moment_jets(&c1, &left1, true, &right1, true, &numeric);
+        let historical1 = base_moment_jets(
+            &forced_c1,
+            &forced_left1,
+            true,
+            &forced_right1,
+            true,
+            &numeric,
+        );
+        let native2 = base_moment_jets(&c2, &left2, true, &right2, true, &numeric);
+        let historical2 = base_moment_jets(
+            &forced_c2,
+            &forced_left2,
+            true,
+            &forced_right2,
+            true,
+            &numeric,
+        );
+        let close = |got: f64, want: f64, label: &str| {
+            let tolerance = 1e-12 * got.abs().max(want.abs()).max(1.0);
+            assert!((got - want).abs() <= tolerance, "{label}: {got} != {want}");
+        };
+        for n in 0..5 {
+            close(
+                native1[n].v,
+                historical1[n].0.v,
+                &format!("Jet1 M{n} value"),
+            );
+            for i in 0..p {
+                close(
+                    native1[n].g[i],
+                    historical1[n].0.g[i],
+                    &format!("Jet1 M{n} gradient[{i}]"),
+                );
+            }
+            close(
+                native2[n].v,
+                historical2[n].0.v,
+                &format!("Jet2 M{n} value"),
+            );
+            for i in 0..p {
+                close(
+                    native2[n].g[i],
+                    historical2[n].0.g[i],
+                    &format!("Jet2 M{n} gradient[{i}]"),
+                );
+                for j in 0..p {
+                    close(
+                        native2[n].h[i * p + j],
+                        historical2[n].0.h[i * p + j],
+                        &format!("Jet2 M{n} Hessian[{i},{j}]"),
+                    );
+                }
+            }
+        }
+
+        let iterations = if cfg!(debug_assertions) { 4 } else { 5_000 };
+        let mut native1_best = f64::INFINITY;
+        let mut historical1_best = f64::INFINITY;
+        let mut native2_best = f64::INFINITY;
+        let mut historical2_best = f64::INFINITY;
+        for _ in 0..5 {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(base_moment_jets(
+                    black_box(&c1),
+                    black_box(&left1),
+                    true,
+                    black_box(&right1),
+                    true,
+                    black_box(&numeric),
+                ));
+            }
+            native1_best = native1_best.min(start.elapsed().as_secs_f64());
+
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(base_moment_jets(
+                    black_box(&forced_c1),
+                    black_box(&forced_left1),
+                    true,
+                    black_box(&forced_right1),
+                    true,
+                    black_box(&numeric),
+                ));
+            }
+            historical1_best = historical1_best.min(start.elapsed().as_secs_f64());
+
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(base_moment_jets(
+                    black_box(&c2),
+                    black_box(&left2),
+                    true,
+                    black_box(&right2),
+                    true,
+                    black_box(&numeric),
+                ));
+            }
+            native2_best = native2_best.min(start.elapsed().as_secs_f64());
+
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(base_moment_jets(
+                    black_box(&forced_c2),
+                    black_box(&forced_left2),
+                    true,
+                    black_box(&forced_right2),
+                    true,
+                    black_box(&numeric),
+                ));
+            }
+            historical2_best = historical2_best.min(start.elapsed().as_secs_f64());
+        }
+        let to_ns = |seconds: f64| seconds * 1e9 / iterations as f64;
+        let native1_ns = to_ns(native1_best);
+        let historical1_ns = to_ns(historical1_best);
+        let native2_ns = to_ns(native2_best);
+        let historical2_ns = to_ns(historical2_best);
+        eprintln!(
+            "FLEX-MOMENT-ORDER-932 jet1={native1_ns:.2} ns historical-order4-jet1={historical1_ns:.2} ns speedup1={:.3}x jet2={native2_ns:.2} ns historical-order4-jet2={historical2_ns:.2} ns speedup2={:.3}x",
+            historical1_ns / native1_ns,
+            historical2_ns / native2_ns,
+        );
+    }
+
     /// #932 item-2 Phase B-base: the base-moment jet builder `base_moment_jets`
     /// must reproduce the FIRST θ-derivatives of the normalization base moments
     /// `M_0..M_4` (interior `Σ_m S_m M_{n+m}` + moving-edge sliver flux) against a
@@ -3467,7 +3709,7 @@ mod moment_engine_tests {
         // Jet build: single primary (slot 0) = the intercept axis, velocity 1.
         let seeded = |x: f64, vel: f64| {
             let g = vec![vel];
-            Jet2::from_parts(x, &g, &[])
+            Jet1 { v: x, g }
         };
         let cell0 = cell_at(0.0);
         let c_jets = [

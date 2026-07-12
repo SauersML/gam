@@ -4396,42 +4396,60 @@ impl SaeManifoldTerm {
             }
             Ok(acc)
         };
+        // #2228 reduction doctrine: the parallel and sequential branches MUST be
+        // bit-identical, so both reduce the per-row scalars through the SAME
+        // length-only pairwise tree (`pairwise_sum` over base blocks of
+        // `BASE_CHUNK`, combined by `left_split`). The parallel branch drives
+        // that tree with `par_deterministic_try_block_fold` (each base block owns
+        // its own scratch and folds its rows through `pairwise_sum`); the
+        // sequential branch materialises the same per-row scalars and calls
+        // `pairwise_sum` directly. Both are pure functions of the ordered row
+        // values, so a nested K=1 fit (where `current_thread_index()` is `None`
+        // and the parallel branch is taken) matches the top-level serial sweep to
+        // the last bit. A per-chunk running sum would associate differently from
+        // the whole-slice fold and silently perturb the objective (#2228).
         let data_fit = if parallel {
-            use rayon::prelude::*;
-            const CHUNK: usize = 32;
-            let partials: Vec<Result<f64, String>> = (0..n)
-                .into_par_iter()
-                .chunks(CHUNK)
-                .map_init(
-                    || (vec![0.0_f64; p], vec![0.0_f64; p], vec![0.0_f64; k_atoms]),
-                    |(g_buf, fitted_row, assign_buf), idxs| {
-                        // #1557 — pin any faer GEMM reached from this row-parallel
-                        // data-fit chunk to `Par::Seq` (no nested Rayon re-fan); the
-                        // per-row reductions are tiny, so the result is bit-identical.
-                        with_nested_parallel(|| {
-                            let mut acc = 0.0_f64;
-                            for row in idxs {
-                                acc += row_data_fit(row, g_buf, fitted_row, assign_buf)?;
-                            }
-                            Ok(acc)
-                        })
-                    },
-                )
-                .collect();
-            let mut total = 0.0_f64;
-            for partial in partials {
-                total += partial?;
-            }
-            total
+            use gam_linalg::pairwise_reduce::{pairwise_sum, par_deterministic_try_block_fold};
+            par_deterministic_try_block_fold(
+                n,
+                |range: core::ops::Range<usize>| -> Result<f64, String> {
+                    // #1557 — pin any faer GEMM reached from this base block to
+                    // `Par::Seq` (no nested Rayon re-fan); the per-row reductions
+                    // are tiny, so the result is bit-identical.
+                    with_nested_parallel(|| {
+                        let mut g_buf = vec![0.0_f64; p];
+                        let mut fitted_row = vec![0.0_f64; p];
+                        let mut assign_buf = vec![0.0_f64; k_atoms];
+                        let mut block = Vec::with_capacity(range.len());
+                        for row in range {
+                            block.push(row_data_fit(
+                                row,
+                                &mut g_buf,
+                                &mut fitted_row,
+                                &mut assign_buf,
+                            )?);
+                        }
+                        Ok(pairwise_sum(&block))
+                    })
+                },
+                |a, b| Ok(a + b),
+            )?
+            .unwrap_or(0.0)
         } else {
+            use gam_linalg::pairwise_reduce::pairwise_sum;
             let mut g_buf = vec![0.0_f64; p];
             let mut fitted_row = vec![0.0_f64; p];
             let mut assign_buf = vec![0.0_f64; k_atoms];
-            let mut total = 0.0_f64;
+            let mut vals = Vec::with_capacity(n);
             for row in 0..n {
-                total += row_data_fit(row, &mut g_buf, &mut fitted_row, &mut assign_buf)?;
+                vals.push(row_data_fit(
+                    row,
+                    &mut g_buf,
+                    &mut fitted_row,
+                    &mut assign_buf,
+                )?);
             }
-            total
+            pairwise_sum(&vals)
         };
         let assignment_sparsity = crate::assignment::assignment_prior_value_weighted(
             &self.assignment,

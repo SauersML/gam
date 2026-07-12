@@ -525,13 +525,7 @@ pub(crate) fn softmax_compiled_schedule_beats_hand_full_channels_932() {
 
         begin_row_jet_allocation_measurement();
         let allocation_probe_compiled = term
-            .row_jets_for_logdet(
-                0,
-                vars.clone(),
-                assignments.view(),
-                &second_jets,
-                &border,
-            )
+            .row_jets_for_logdet(0, vars.clone(), assignments.view(), &second_jets, &border)
             .unwrap();
         let (compiled_allocations, compiled_bytes) = end_row_jet_allocation_measurement();
         begin_row_jet_allocation_measurement();

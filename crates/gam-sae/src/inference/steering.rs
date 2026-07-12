@@ -1012,7 +1012,11 @@ pub fn collateral_curve(
         let mut frames = Vec::with_capacity(n);
         for row in 0..n {
             let t: Vec<f64> = coords.row(row).to_vec();
-            frames.push(decode_tangents_at(&model.atoms[atom_idx], &t, model.tier0_scale())?);
+            frames.push(decode_tangents_at(
+                &model.atoms[atom_idx],
+                &t,
+                model.tier0_scale(),
+            )?);
         }
         Ok(frames)
     };
