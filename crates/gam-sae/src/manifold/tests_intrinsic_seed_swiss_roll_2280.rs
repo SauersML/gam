@@ -1,41 +1,41 @@
 //! Rolled-sheet recovery regression for the intrinsic-metric seeder (#2240/#2280).
 //!
-//! The thesis (validated in numpy by the geometry owner): on a FOLDED manifold —
-//! a swiss roll, a flat 2-D sheet rolled up in 3-D so that geodesically-distant
-//! points are ambient-close — a LINEAR (PCA) seed keeps the two highest-variance
-//! ambient directions and drops the axis the fold hides, so a flexible decoder
-//! reading the 2-D PCA chart cannot reconstruct the manifold's third ambient
-//! coordinate (its held-out R² caps at the retained variance fraction). The
-//! geodesic (Isomap) seed UNROLLS the sheet into a faithful 2-D chart that carries
-//! every intrinsic coordinate, so the same decoder reconstructs the full ambient
-//! image (held-out R² → 1). On a NON-fold the two seeds are equivalent charts and
-//! tie.
+//! The thesis (validated in numpy by fable-mobius, the geometry owner): on a
+//! FOLDED manifold — a swiss roll, a flat 2-D sheet rolled up in 3-D so that
+//! geodesically-distant points are ambient-close — a global-LINEAR (PCA) seed
+//! projects the two highest-variance ambient directions, a NON-INJECTIVE map that
+//! folds the sheet's layers onto each other; a flexible decoder reading that 2-D
+//! chart cannot separate the collapsed layers, so its held-out reconstruction R²
+//! craters. The geodesic (Isomap) seed unrolls the sheet into a faithful,
+//! single-valued 2-D chart, so the same decoder recovers the full ambient image
+//! (held-out R² → 1). On a NON-fold the two seeds are equivalent charts and tie.
 //!
-//! The reconstruction proxy is a k-nearest-neighbor-in-latent regressor: predict a
-//! held-out row's ambient image from the mean ambient image of its `k` nearest
-//! neighbors IN THE SEED CHART. This measures exactly the property that matters —
-//! whether the chart is a single-valued parameterization of the manifold (latent
-//! neighbors are manifold neighbors). It needs no fit pipeline and is fully
-//! deterministic. Everything here is RNG-free: a fixed lattice, index-strided
-//! held-out split, index-tie-broken neighbor search.
+//! The reconstruction metric is fable-mobius's validated held-out thin-plate-spline
+//! R² (deterministic, RNG-free): fit a thin-plate RBF decoder + affine tail from
+//! the 2-D seed chart to the ambient image on the training rows, predict the
+//! held-out rows, report R². This is the exact objective (grid fixture, decoder,
+//! split, thresholds) her landed numpy/Rust falsifier uses — intrinsic R²=0.9996,
+//! PCA-2 R²=0.825 — lifted here to run against the CANONICAL seeder
+//! [`sae_intrinsic_seed_initial_coords`] and its end-to-end auto-seed path.
 
 use super::*;
-use ndarray::{Array2, ArrayView2};
+use gam_linalg::faer_ndarray::{fast_ata, fast_atb, FaerCholesky};
+use ndarray::{Array2, Array3};
 
-/// Deterministic swiss roll on a `n_t × n_h` lattice: a flat `(arclength, height)`
-/// sheet rolled into 3-D as `(t·cos t, height, t·sin t)` over `turns` revolutions.
-/// The height axis carries a MINORITY of the ambient variance, so a PCA-2 seed
-/// (which keeps the two roll-plane directions) drops it — the fold pathology.
-fn swiss_roll(n_t: usize, n_h: usize, turns: f64, height: f64) -> Array2<f64> {
+/// fable-mobius's deterministic ~2-turn swiss-roll grid in R³ (no RNG): a flat
+/// `(arclength, height)` sheet rolled as `(t·cos t, height, t·sin t)`. Height
+/// carries a minority of the ambient variance, so the PCA-2 projection folds the
+/// roll-plane layers together and drops height.
+fn swiss_roll_grid() -> Array2<f64> {
+    let (n_t, n_h) = (45usize, 10usize);
     let n = n_t * n_h;
     let mut z = Array2::<f64>::zeros((n, 3));
-    let t0 = 1.5 * std::f64::consts::PI;
-    let t_span = turns * std::f64::consts::TAU;
-    for i in 0..n_t {
-        let t = t0 + t_span * (i as f64) / ((n_t - 1) as f64);
-        for j in 0..n_h {
-            let h = height * (j as f64) / ((n_h - 1) as f64);
-            let row = i * n_h + j;
+    for ti in 0..n_t {
+        let t = 1.2 * std::f64::consts::PI
+            + (3.2 - 1.2) * std::f64::consts::PI * ti as f64 / (n_t - 1) as f64;
+        for hi in 0..n_h {
+            let h = 10.0 * hi as f64 / (n_h - 1) as f64;
+            let row = ti * n_h + hi;
             z[[row, 0]] = t * t.cos();
             z[[row, 1]] = h;
             z[[row, 2]] = t * t.sin();
@@ -44,10 +44,11 @@ fn swiss_roll(n_t: usize, n_h: usize, turns: f64, height: f64) -> Array2<f64> {
     z
 }
 
-/// A gentle (nearly flat) sheet: `(u, v, curvature·sin u)` — a genuine 2-D chart
-/// with mild ambient curvature, NOT folded. Both PCA and intrinsic seeds recover
+/// A gentle (nearly flat) sheet: `(u, v, curvature·sin(π u))` — a genuine 2-D
+/// chart with mild ambient curvature, NOT folded. PCA and intrinsic both recover
 /// it, so their reconstruction R² ties.
-fn gentle_sheet(n_u: usize, n_v: usize, curvature: f64) -> Array2<f64> {
+fn gentle_sheet_grid(curvature: f64) -> Array2<f64> {
+    let (n_u, n_v) = (30usize, 15usize);
     let n = n_u * n_v;
     let mut z = Array2::<f64>::zeros((n, 3));
     for i in 0..n_u {
@@ -63,104 +64,149 @@ fn gentle_sheet(n_u: usize, n_v: usize, curvature: f64) -> Array2<f64> {
     z
 }
 
-/// Held-out reconstruction R² of the ambient image from a 2-D latent chart, via a
-/// deterministic kNN-in-latent regressor. Rows with `i % 5 == 0` are held out;
-/// each held-out row is predicted by the mean ambient image of its `k` nearest
-/// TRAIN rows in the chart (ties broken by ascending index). R² is over the
-/// held-out rows, pooled across ambient channels.
-fn knn_latent_holdout_r2(coords: ArrayView2<'_, f64>, ambient: ArrayView2<'_, f64>, k: usize) -> f64 {
-    let n = ambient.nrows();
-    let p = ambient.ncols();
-    let train: Vec<usize> = (0..n).filter(|i| i % 5 != 0).collect();
-    let test: Vec<usize> = (0..n).filter(|i| i % 5 == 0).collect();
-    let kk = k.min(train.len()).max(1);
-
-    // Held-out ambient mean (per channel) for SS_tot.
-    let mut mean = vec![0.0_f64; p];
-    for &t in &test {
-        for c in 0..p {
-            mean[c] += ambient[[t, c]];
+/// Held-out thin-plate-spline reconstruction R² of the ambient image `z` from a
+/// 2-D latent chart `coords` — fable-mobius's exact validated decoder: standardize
+/// coords per-axis, 70 strided thin-plate centers (`0.5·r²·ln r²`) plus an affine
+/// `[1, u, v]` tail, ridge `max_diag·1e-8`, rows with `i % 4 == 0` held out.
+fn heldout_tps_r2(coords: &Array2<f64>, z: &Array2<f64>) -> f64 {
+    let n = z.nrows();
+    let p = z.ncols();
+    let cmean = coords.mean_axis(ndarray::Axis(0)).unwrap();
+    let mut cstd = [0.0_f64; 2];
+    for k in 0..2 {
+        cstd[k] = (coords.column(k).iter().map(|&v| (v - cmean[k]).powi(2)).sum::<f64>()
+            / n as f64)
+            .sqrt()
+            .max(1e-12);
+    }
+    let n_centers = 70usize;
+    let centers: Vec<usize> = (0..n_centers).map(|i| i * (n - 1) / (n_centers - 1)).collect();
+    let width = 3 + n_centers;
+    let mut phi = Array2::<f64>::zeros((n, width));
+    let cs = |row: usize, k: usize| (coords[[row, k]] - cmean[k]) / cstd[k];
+    for row in 0..n {
+        phi[[row, 0]] = 1.0;
+        phi[[row, 1]] = cs(row, 0);
+        phi[[row, 2]] = cs(row, 1);
+        for (ci, &cr) in centers.iter().enumerate() {
+            let r2 = (0..2)
+                .map(|k| {
+                    let d = cs(row, k) - cs(cr, k);
+                    d * d
+                })
+                .sum::<f64>()
+                .max(1e-12);
+            phi[[row, 3 + ci]] = 0.5 * r2 * r2.ln();
         }
     }
-    for m in mean.iter_mut() {
-        *m /= test.len() as f64;
+    let train: Vec<usize> = (0..n).filter(|r| r % 4 != 0).collect();
+    let test: Vec<usize> = (0..n).filter(|r| r % 4 == 0).collect();
+    let phi_tr = phi.select(ndarray::Axis(0), &train);
+    let z_tr = z.select(ndarray::Axis(0), &train);
+    let mut gram = fast_ata(&phi_tr);
+    let scale = gram.diag().iter().copied().fold(0.0_f64, f64::max);
+    for dgn in gram.diag_mut().iter_mut() {
+        *dgn += scale * 1e-8;
     }
-
-    let mut ss_res = 0.0_f64;
-    let mut ss_tot = 0.0_f64;
-    for &t in &test {
-        // k nearest train rows in the latent chart (ascending distance, then index).
-        let mut d: Vec<(f64, usize)> = train
-            .iter()
-            .map(|&tr| {
-                let mut acc = 0.0;
-                for c in 0..coords.ncols() {
-                    let diff = coords[[t, c]] - coords[[tr, c]];
-                    acc += diff * diff;
-                }
-                (acc, tr)
-            })
-            .collect();
-        d.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let rhs = fast_atb(&phi_tr, &z_tr);
+    let decoder = gram.cholesky(faer::Side::Lower).unwrap().solve_mat(&rhs);
+    let mut mean_t = vec![0.0_f64; p];
+    for &row in &test {
         for c in 0..p {
-            let mut pred = 0.0;
-            for &(_, tr) in d.iter().take(kk) {
-                pred += ambient[[tr, c]];
+            mean_t[c] += z[[row, c]];
+        }
+    }
+    for c in 0..p {
+        mean_t[c] /= test.len() as f64;
+    }
+    let (mut resid, mut total) = (0.0_f64, 0.0_f64);
+    for &row in &test {
+        for c in 0..p {
+            let mut fit = 0.0_f64;
+            for a in 0..width {
+                fit += phi[[row, a]] * decoder[[a, c]];
             }
-            pred /= kk as f64;
-            let truth = ambient[[t, c]];
-            ss_res += (truth - pred) * (truth - pred);
-            ss_tot += (truth - mean[c]) * (truth - mean[c]);
+            resid += (z[[row, c]] - fit).powi(2);
+            total += (z[[row, c]] - mean_t[c]).powi(2);
         }
     }
-    if ss_tot <= 0.0 {
-        return 0.0;
-    }
-    1.0 - ss_res / ss_tot
+    1.0 - resid / total
 }
 
-/// Extract an atom's `(n, 2)` latent chart from a `(1, n, d_max)` seed array.
-fn chart_of(seed: &ndarray::Array3<f64>) -> Array2<f64> {
+/// Extract an atom's `(n, 2)` latent chart from a `(K, n, d_max)` seed array.
+fn chart_of(seed: &Array3<f64>, atom_idx: usize) -> Array2<f64> {
     let n = seed.shape()[1];
     let mut out = Array2::<f64>::zeros((n, 2));
     for row in 0..n {
-        out[[row, 0]] = seed[[0, row, 0]];
-        out[[row, 1]] = seed[[0, row, 1]];
+        out[[row, 0]] = seed[[atom_idx, row, 0]];
+        out[[row, 1]] = seed[[atom_idx, row, 1]];
     }
     out
 }
 
-/// ROLLED-SHEET REGRESSION: on a 3-turn swiss roll the intrinsic (geodesic) seed
-/// unrolls the fold into a faithful 2-D chart whose held-out reconstruction R²
-/// clears 0.99, while the PCA-2 seed drops the fold-hidden height axis and caps
-/// well below it. The gap is the whole point of the seeder.
+/// ROLLED-SHEET REGRESSION (the falsifier): the canonical intrinsic seed unrolls
+/// the fold so a thin-plate decoder recovers held-out R² > 0.99, while the PCA-2
+/// seed's non-injective projection collapses the layers and craters below 0.9.
 #[test]
 fn swiss_roll_intrinsic_seed_reconstructs_where_pca_folds() {
-    // Dense lattice: enough height resolution that a kNN-in-latent decoder on the
-    // UNFOLDED chart reconstructs the height channel tightly (intrinsic R² → 1),
-    // while the PCA-2 chart drops height entirely (PC3) regardless of density.
-    let z = swiss_roll(44, 22, 3.0, 13.0);
+    let z = swiss_roll_grid();
     let kinds = vec![SaeAtomBasisKind::Linear];
     let dims = vec![2usize];
 
     let intrinsic = sae_intrinsic_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
     let pca = sae_pca_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
 
-    let r2_intrinsic = knn_latent_holdout_r2(chart_of(&intrinsic).view(), z.view(), 6);
-    let r2_pca = knn_latent_holdout_r2(chart_of(&pca).view(), z.view(), 6);
+    let r2_intrinsic = heldout_tps_r2(&chart_of(&intrinsic, 0), &z);
+    let r2_pca = heldout_tps_r2(&chart_of(&pca, 0), &z);
 
     assert!(
-        r2_intrinsic >= 0.99,
-        "intrinsic geodesic seed must reconstruct the rolled sheet (held-out R² = {r2_intrinsic:.4}, need >= 0.99)"
+        r2_intrinsic > 0.99,
+        "intrinsic geodesic seed must unfold the rolled sheet; intrinsic R²={r2_intrinsic}, pca R²={r2_pca}"
     );
     assert!(
-        r2_pca <= 0.95,
-        "PCA-2 seed must cap below the intrinsic seed on a fold (it drops the \
-         fold-hidden axis); held-out R² = {r2_pca:.4}, expected <= 0.95"
+        r2_pca < 0.9,
+        "the global-linear PCA seed must collapse on a genuine fold (non-injective projection); \
+         intrinsic R²={r2_intrinsic}, pca R²={r2_pca}"
     );
     assert!(
-        r2_intrinsic - r2_pca >= 0.04,
-        "intrinsic seed must clearly beat PCA on the fold: intrinsic {r2_intrinsic:.4} vs PCA {r2_pca:.4}"
+        r2_intrinsic > r2_pca + 0.05,
+        "intrinsic seed must beat PCA on the fold; intrinsic R²={r2_intrinsic}, pca R²={r2_pca}"
+    );
+}
+
+/// END-TO-END PRIMARY (#2280 guardrail, fable-mobius Q2): the FULL auto-seed path
+/// — discover → race → resolve_auto_primary_atoms → minimal_seed — must install the
+/// UNFOLDED geodesic chart as the final seed coordinates, not a PCA-folded rebuild.
+/// This is red unless the winning intrinsic coords actually PROPAGATE through
+/// PrimaryTopologyChoice into the coord block, so it guards the whole verdict→coords
+/// chain, not just the primitive. Asserts the FINAL seed's held-out R² clears 0.99.
+#[test]
+fn swiss_roll_auto_seed_propagates_unfolded_coords_end_to_end() {
+    let z = swiss_roll_grid();
+    let report = build_sae_minimal_seed(SaeMinimalSeedRequest {
+        target: z.view(),
+        atom_basis: vec!["auto".to_string()],
+        atom_dim: vec![2],
+        assignment_kind: SaeFitAssignmentKind::Softmax,
+        alpha: 1.0,
+        tau: 1.0,
+        threshold: 0.0,
+        top_k: None,
+        random_state: 0,
+        initial_logits: None,
+        initial_coords: None,
+    })
+    .expect("auto swiss-roll seed builds");
+    assert_eq!(
+        report.effective_atom_dim[0], 2,
+        "a swiss roll is an intrinsically 2-D sheet; auto discovery must resolve d=2"
+    );
+    let r2 = heldout_tps_r2(&chart_of(&report.initial_coords, 0), &z);
+    assert!(
+        r2 > 0.99,
+        "the auto-seed path must install the UNFOLDED geodesic chart as the final \
+         seed coords (the intrinsic race winner must reach the coordinates, not just \
+         the kind); held-out R²={r2}"
     );
 }
 
@@ -170,32 +216,31 @@ fn swiss_roll_intrinsic_seed_reconstructs_where_pca_folds() {
 /// for (the race would pick either; here we assert both charts' quality directly).
 #[test]
 fn gentle_sheet_intrinsic_and_pca_seeds_tie() {
-    let z = gentle_sheet(28, 20, 0.15);
+    let z = gentle_sheet_grid(0.15);
     let kinds = vec![SaeAtomBasisKind::Linear];
     let dims = vec![2usize];
 
     let intrinsic = sae_intrinsic_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
     let pca = sae_pca_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
 
-    let r2_intrinsic = knn_latent_holdout_r2(chart_of(&intrinsic).view(), z.view(), 6);
-    let r2_pca = knn_latent_holdout_r2(chart_of(&pca).view(), z.view(), 6);
+    let r2_intrinsic = heldout_tps_r2(&chart_of(&intrinsic, 0), &z);
+    let r2_pca = heldout_tps_r2(&chart_of(&pca, 0), &z);
 
     assert!(
-        r2_intrinsic >= 0.95 && r2_pca >= 0.95,
-        "both seeds must reconstruct a gentle sheet well (intrinsic {r2_intrinsic:.4}, PCA {r2_pca:.4})"
+        r2_intrinsic > 0.95 && r2_pca > 0.95,
+        "both seeds must reconstruct a gentle sheet well (intrinsic {r2_intrinsic}, PCA {r2_pca})"
     );
     assert!(
-        (r2_intrinsic - r2_pca).abs() <= 0.05,
-        "on a non-fold the intrinsic and PCA seeds must tie (intrinsic {r2_intrinsic:.4}, PCA {r2_pca:.4})"
+        (r2_intrinsic - r2_pca).abs() < 0.05,
+        "on a non-fold the intrinsic and PCA seeds must tie (intrinsic {r2_intrinsic}, PCA {r2_pca})"
     );
 }
 
-/// The rolled-sheet seed is deterministic run-to-run at the full Array3 contract
-/// (the module core has its own bit-identity test; this pins the production entry
-/// the seed race consumes).
+/// Determinism (fleet law): the Array3 production seed the race consumes is
+/// bit-identical run-to-run (the module core has its own bit-identity test too).
 #[test]
 fn swiss_roll_intrinsic_seed_is_deterministic() {
-    let z = swiss_roll(30, 12, 3.0, 13.0);
+    let z = swiss_roll_grid();
     let kinds = vec![SaeAtomBasisKind::Linear];
     let dims = vec![2usize];
     let a = sae_intrinsic_seed_initial_coords(z.view(), &kinds, &dims).unwrap();
