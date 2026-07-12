@@ -4,6 +4,12 @@
 
 use super::*;
 
+/// Zero/one guard for saturated-deviance evaluation: clamps responses away from
+/// the log singularities of the Binomial (`y·ln y`, `(1−y)·ln(1−y)`) and Gamma
+/// (`ln y`) unit deviances. Matches the historical local constant these
+/// per-family deviance branches shared.
+const EPS: f64 = 1e-8;
+
 #[inline]
 pub(crate) fn xlogy(x: f64, y: f64) -> f64 {
     if x == 0.0 { 0.0 } else { x * y.ln() }
