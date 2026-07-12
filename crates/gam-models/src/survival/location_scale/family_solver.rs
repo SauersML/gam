@@ -205,10 +205,10 @@ impl SurvivalLocationScaleFamily {
             }
             // The step `H δ = g` is solved on a consistent (objective, gradient,
             // Hessian) triple for EVERY residual distribution: `g = ∇ℓ` above is
-            // the block-gradient hand assembler
+            // the block-gradient reduction
             // (`evaluate_log_likelihood_and_block_gradients`) and `H = −∇²ℓ` below
-            // is `assemble_joint_hessian_from_quantities`, but both are pinned to
-            // the ONE single-sourced `sls_row_nll` jet to ≤1e-9 by the analytic
+            // is the packed 24-pair coefficient lowering; both are pinned to the
+            // ONE single-sourced `sls_row_nll` program to ≤1e-9 by the analytic
             // oracles (`survival_ls_block_gradient_matches_single_sourced_tower_932`
             // for the gradient across Gaussian/Gumbel/Logistic on the every-channel
             // time-varying shape;
@@ -539,9 +539,8 @@ impl SurvivalLocationScaleFamily {
 
     /// HT-mask-aware variant of
     /// [`Self::exact_newton_joint_hessian_directional_derivative_rescaled_from_parts`].
-    /// `None` is byte-identical to the pre-refactor expression at every site.
-    /// See [`Self::assemble_joint_hessian_from_quantities_masked`] for the
-    /// row-additivity argument.
+    /// `None` is byte-identical to the full-row expression at every site. The
+    /// mask scales each completed nonlinear row contribution exactly once.
     pub(crate) fn exact_newton_joint_hessian_directional_derivative_rescaled_from_parts_masked(
         &self,
         d_beta_flat: &Array1<f64>,

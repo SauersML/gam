@@ -1788,13 +1788,13 @@ fn packed_sls_dense(
 /// row program: one lowers its 24 structural pairs through grouped X'WX calls,
 /// while the oracle materializes the generic per-row 9×9 pullback.
 #[test]
-fn survival_ls_row_kernel_matches_bespoke_assembly() {
+fn survival_ls_row_kernel_matches_packed_coefficient_lowering() {
     // Row-kernel assembly plus the directional-Hessian FD oracle keep several
     // dense joint Hessians live on the stack; run on a wide-stack thread like
     // the other survival-LS jet-tower oracles.
     let join_result = std::thread::Builder::new()
         .stack_size(64 << 20)
-        .spawn(survival_ls_row_kernel_matches_bespoke_assembly_body)
+        .spawn(survival_ls_row_kernel_matches_packed_coefficient_lowering_body)
         .expect("spawn wide-stack row-kernel oracle thread")
         .join();
     assert!(
@@ -1803,7 +1803,7 @@ fn survival_ls_row_kernel_matches_bespoke_assembly() {
     );
 }
 
-fn survival_ls_row_kernel_matches_bespoke_assembly_body() {
+fn survival_ls_row_kernel_matches_packed_coefficient_lowering_body() {
     use crate::row_kernel::{
         RowSet, build_row_kernel_cache, row_kernel_directional_derivative, row_kernel_gradient,
         row_kernel_hessian_dense, row_kernel_log_likelihood,
@@ -1901,7 +1901,7 @@ fn survival_ls_row_kernel_matches_bespoke_assembly_body() {
 /// #932: packed coefficient-level guard for the time-varying joint Hessian
 /// across every residual distribution.
 ///
-/// `survival_ls_row_kernel_matches_bespoke_assembly` (#921) already pins the
+/// `survival_ls_row_kernel_matches_packed_coefficient_lowering` (#921) pins the
 /// generic row-kernel joint Hessian (`row_kernel_hessian_dense`, sourced from
 /// the once-written `sls_row_nll` through `Order2<9>`) to the packed coefficient
 /// lowering. But that fixture is Gaussian-only and uses the simple block shape
@@ -1986,18 +1986,18 @@ fn survival_ls_time_varying_joint_hessian_tower_body() {
         let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("row kernel cache");
         let h_tower = row_kernel_hessian_dense(&kernel, &cache, &RowSet::All);
 
-        let h_bespoke = packed_sls_dense(&family, &states, 0.0);
+        let h_packed = packed_sls_dense(&family, &states, 0.0);
 
         assert_eq!(
             h_tower.dim(),
-            h_bespoke.dim(),
+            h_packed.dim(),
             "{distribution:?}: joint Hessian shape mismatch"
         );
-        for ((a, b), &bespoke) in h_bespoke.indexed_iter() {
+        for ((a, b), &packed) in h_packed.indexed_iter() {
             let tower = h_tower[[a, b]];
             assert!(
-                (tower - bespoke).abs() <= 1e-9 * (1.0 + bespoke.abs()),
-                "{distribution:?}: joint Hessian [{a}][{b}] packed {bespoke} != \
+                (tower - packed).abs() <= 1e-9 * (1.0 + packed.abs()),
+                "{distribution:?}: joint Hessian [{a}][{b}] packed {packed} != \
                  generic single-sourced tower {tower}"
             );
         }
@@ -6715,9 +6715,7 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
     }
 }
 
-/// #932 (live inner-solver gap): the BLOCK-DIAGONAL per-block Hessian path
-/// (`assemble_block_diagonal_hessians_from_quantities`), which feeds the live
-/// `FamilyEvaluation` inner-Newton per-block working sets, must carry the SAME
+/// #932: the live `evaluate()` block-diagonal target must carry the same
 /// single-sourced §13 curvature for the link-wiggle block as the joint Hessian.
 ///
 /// The retired bespoke `assemble_h_wiggle` summed three INDEPENDENT
@@ -6793,7 +6791,13 @@ fn survival_ls_block_diagonal_wiggle_block_matches_single_source_932() {
             offsets[SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE],
             offsets[SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE + 1],
         );
-        let wiggle_block = dense.slice(s![lo..hi, lo..hi]);
+        let evaluation = family.evaluate(&states).expect("live wiggle block evaluation");
+        let wiggle_block = match &evaluation.blockworking_sets
+            [SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE]
+        {
+            BlockWorkingSet::ExactNewton { hessian, .. } => hessian.to_dense(),
+            _ => panic!("wiggle block must use exact Newton curvature"),
+        };
         assert_eq!(
             wiggle_block.dim(),
             (hi - lo, hi - lo),

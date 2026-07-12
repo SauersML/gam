@@ -307,10 +307,10 @@ pub(crate) fn split_survival_psi_design(
 /// | 7   | eta_ls_entry    | `x_log_sigma_entry` (or log_sigma)  | u0    |
 /// | 8   | eta_ls_deriv    | `x_log_sigma_deriv` (or none)       | g     |
 ///
-/// `H[a][b] = -Σ_i (ell_ii·D_i[a]·D_i[b] + ell_i·D2_i[a][b])` reproduces
-/// `assemble_joint_hessian_from_quantities` term-for-term (verified by the
-/// equivalence test). Indices `i ∈ {u0,u1,g}` are functionally independent so
-/// the index-space derivative tensors are diagonal in `i`.
+/// `H[a][b] = -Σ_i (ell_ii·D_i[a]·D_i[b] + ell_i·D2_i[a][b])` is lowered by
+/// [`SurvivalLocationScaleFamily::survival_ls_coefficient_hessian`] through the
+/// 24 structurally live upper-triangle pairs. Indices `i ∈ {u0,u1,g}` are
+/// functionally independent, so the index-space derivative tensors are diagonal.
 pub(crate) const SLS_ROW_K: usize = 9;
 const SLS_U0_AXES: [usize; 3] = [0, 4, 7];
 const SLS_U1_AXES: [usize; 3] = [1, 3, 6];
@@ -321,7 +321,7 @@ const SLS_G_AXES: [usize; 5] = [2, 3, 5, 6, 8];
 /// [`SurvivalLocationScaleFamily::collect_joint_quantities_rescaled`] and
 /// [`SurvivalLocationScaleFamily::build_dynamic_geometry`]; every trait method
 /// is a pure repackaging of those scalars into linear-predictor primary space,
-/// so the math is identical to the bespoke assembly by construction.
+/// so every coefficient-space target consumes the same row program by construction.
 pub(crate) struct SurvivalLsRowKernel<'a> {
     pub(crate) family: &'a SurvivalLocationScaleFamily,
     pub(crate) dynamic: &'a SurvivalDynamicGeometry,
