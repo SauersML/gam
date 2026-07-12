@@ -14,6 +14,7 @@
 //! rows against the CPU row program.
 
 /// Flattened row-major value, gradient, and Hessian channels for `K = 4`.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SurvivalRowVghChannels {
     pub(crate) value: Vec<f64>,
@@ -22,6 +23,7 @@ pub(crate) struct SurvivalRowVghChannels {
 }
 
 /// Scalar-independent inputs for one rigid survival row.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone)]
 pub(crate) struct SurvivalRowInputs {
     pub(crate) primaries: [f64; 4],
