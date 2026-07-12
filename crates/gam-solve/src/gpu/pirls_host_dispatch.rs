@@ -9,8 +9,8 @@
 //!   (wraps `crate::gpu::pirls_dispatch_wire::try_gpu_pirls_loop_dispatch`).
 //!
 //! Both functions return `Option<Result<..>>`: `Some(Ok(pair))` on a successful
-//! device solve, `Some(Err(..))` on a device error (caller should fall through to
-//! CPU), and `None` when the dispatch criteria are not met.
+//! admitted device solve, `Some(Err(..))` on a typed admitted-device failure,
+//! and `None` only when the dispatch criteria are not met.
 //!
 //! The GPU **kernel** bodies live in `crate::gpu::pirls_gpu` and
 //! `crate::gpu::pirls_dispatch_wire`; this file only owns the
@@ -160,8 +160,8 @@ where
 /// Returns `None` when admission is denied (non-Linux, missing runtime, sparse
 /// or Kronecker design, Firth active, constraints present, or shape/family
 /// outside the dispatch policy). Returns `Some(Ok(pair))` on success and
-/// `Some(Err(..))` on a device error so the caller can fall through to the
-/// CPU LM loop.
+/// `Some(Err(..))` on an admitted-device error; the typed error is propagated
+/// without retrying a different numerical implementation.
 ///
 /// `materialize_reparam` is called lazily — only when the admission shim
 /// confirms the fit is eligible.
@@ -299,15 +299,11 @@ where
                     exported_curvature: exported_curvature_kind,
                 };
                 if let Some(result) = try_gpu_pirls_loop_dispatch(dispatch) {
-                    match result {
-                        Ok(pair) => return Some(Ok(pair)),
-                        Err(err) => {
-                            log::warn!(
-                                "[PIRLS GPU dispatch] device loop returned error, falling back to CPU: {err}"
-                            );
-                            // Error logged; fall through to CPU LM loop.
-                        }
-                    }
+                    // Admission is a numerical execution decision, not a
+                    // speculative fallback. Preserve exact typed row refusals
+                    // and runtime failures instead of silently rerunning a
+                    // different implementation.
+                    return Some(result);
                 }
             }
         }

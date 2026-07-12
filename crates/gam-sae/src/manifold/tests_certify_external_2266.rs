@@ -99,9 +99,13 @@ mod tests {
         // `steering::metric_carries_behavior`); no closed-form-only state is
         // required beyond the fitted term + this metric.
         let p_out = target.ncols();
-        let fisher_u3 = Array3::<f64>::from_shape_fn((N_CIRCLE, p_out, 1), |(_, i, _)| {
-            if i == 0 { 1.0 } else { 0.0 }
-        });
+        let fisher_u3 =
+            Array3::<f64>::from_shape_fn(
+                (N_CIRCLE, p_out, 1),
+                |(_, i, _)| {
+                    if i == 0 { 1.0 } else { 0.0 }
+                },
+            );
         let fisher_metric_request =
             SaeFisherRowMetricRequest::from_tag(fisher_u3.view(), N_CIRCLE, p_out, None, None)
                 .expect("rank-1 output-Fisher metric request");
@@ -230,8 +234,9 @@ mod tests {
             .term
             .row_metric()
             .expect("the installed output-Fisher metric must survive the certify entry verbatim");
-        let plan = steer_delta(&report.term, metric, 0, 0, 0.1, &[0.0], &[0.05])
-            .expect("steer_delta must run on a certify-external term paired with a behavioral metric");
+        let plan = steer_delta(&report.term, metric, 0, 0, 0.1, &[0.0], &[0.05]).expect(
+            "steer_delta must run on a certify-external term paired with a behavioral metric",
+        );
         assert!(
             plan.validity_radius.is_some(),
             "validity_radius must be Some for a certify-external term + behavioral metric — \

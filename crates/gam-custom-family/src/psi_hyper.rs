@@ -2220,8 +2220,8 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
             working_response: _,
             working_weights,
         } => with_block_geometry(family, &inner.block_states, spec, b, |x_dyn, _| {
-            let w = floor_positiveworking_weights(working_weights, options.minweight)?;
-            let (xtwx, _) = weighted_normal_equations(x_dyn, &w, None)?;
+            let w = certify_finite_working_weights(working_weights)?;
+            let (xtwx, _) = weighted_normal_equations(x_dyn, w, None)?;
             diagonal_design = Some(x_dyn.clone());
             Ok(xtwx)
         })?,
@@ -2273,7 +2273,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                 let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
                     format!("missing dynamic design for block {b} diagonal correction")
                 })?;
-                let wwork = floor_positiveworking_weights(working_weights, options.minweight)?;
+                let wwork = certify_finite_working_weights(working_weights)?;
                 let x_dense = x_dyn.to_dense();
                 let n = x_dense.nrows();
 

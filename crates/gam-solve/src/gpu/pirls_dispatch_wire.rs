@@ -7,8 +7,8 @@
 //! loop fully completed and assembled the CPU-oracle-equivalent surface;
 //! returns `None` when admission denied dispatch, the workload is shaped
 //! in a way the GPU loop does not cover yet (sparse-native, Kronecker,
-//! diagonal-penalty, constraints, Firth), or the device call failed in a
-//! way the host wants to retry on CPU.
+//! diagonal-penalty, constraints, Firth). Once admitted, device errors retain
+//! their typed identity and are never retried on a different implementation.
 //!
 //! Linux-only — `pirls_loop_on_stream` is gated behind `target_os =
 //! "linux"`, and so is the entire wire surface. Non-Linux builds expose a
@@ -293,8 +293,7 @@ mod linux_impl {
         if let Some(qs) = input.qs {
             pirls_gpu::upload_qs_pirls(&mut ws, qs).map_err(EstimationError::InvalidInput)?;
         } else {
-            pirls_gpu::upload_qs_identity_pirls(&mut ws)
-                .map_err(EstimationError::InvalidInput)?;
+            pirls_gpu::upload_qs_identity_pirls(&mut ws).map_err(EstimationError::InvalidInput)?;
         }
         let mut loop_ws = pirls_gpu::allocate_pirls_loop_workspace(&shared, &ws)
             .map_err(EstimationError::InvalidInput)?;
@@ -439,8 +438,7 @@ mod linux_impl {
                     input.inverse_link,
                     &final_eta,
                     input.priorweights,
-                )
-                .map_err(|e| format!("derivative recompute failed: {e:?}"))?;
+                )?;
                 (sdmu, sd2, sd3, sc, sd)
             } else {
                 (
@@ -465,8 +463,7 @@ mod linux_impl {
                     input.y,
                     &final_w_solver,
                     input.priorweights,
-                )
-                .map_err(|e| format!("observed-curvature finalisation failed: {e:?}"))?
+                )?
             } else {
                 (finalweights.clone(), final_c.clone(), final_d.clone())
             };

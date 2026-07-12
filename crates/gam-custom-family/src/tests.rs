@@ -1779,32 +1779,23 @@ pub(crate) fn custom_family_default_outer_seed_config_is_tightened_for_expensive
 }
 
 #[test]
-pub(crate) fn floor_positiveworking_weights_preserves_exactzeros() {
-    let weights = array![0.0, 1.0e-16, 0.25];
-    let floored =
-        floor_positiveworking_weights(&weights, 1.0e-6).expect("valid nonnegative weights");
-    assert_eq!(floored[0], 0.0);
-    assert_eq!(floored[1], 1.0e-6);
-    assert_eq!(floored[2], 0.25);
+pub(crate) fn finite_working_weight_certificate_preserves_zero_tiny_and_signed_rows_bit_exactly() {
+    let weights = array![0.0, f64::from_bits(1), 1.0e-16, -1.0e-9, 0.25];
+    let certified = certify_finite_working_weights(&weights).expect("finite signed weights");
+    assert!(std::ptr::eq(certified, &weights));
+    for (actual, expected) in certified.iter().zip(weights.iter()) {
+        assert_eq!(actual.to_bits(), expected.to_bits());
+    }
 }
 
 #[test]
-pub(crate) fn floor_positiveworking_weights_rejects_negative_and_nonfinite() {
-    // A negative weight is indefinite diagonal curvature: coercing it to zero
-    // would swap in a different information matrix. Must reject.
-    let negative = array![0.5, -1.0e-3, 0.25];
-    let err = floor_positiveworking_weights(&negative, 1.0e-6)
-        .expect_err("negative curvature must be rejected, not zeroed");
+pub(crate) fn finite_working_weight_certificate_rejects_nonfinite_rows_atomically() {
+    let nan = array![0.5, f64::NAN];
+    let err = certify_finite_working_weights(&nan).expect_err("NaN curvature must be rejected");
     assert!(err.contains("row 1"), "error should name the row: {err}");
 
-    // NaN previously slipped through `wi <= 0.0` (false for NaN) and became
-    // `minweight` via the NaN-ignoring `f64::max`. Must reject.
-    let nan = array![0.5, f64::NAN];
-    floor_positiveworking_weights(&nan, 1.0e-6)
-        .expect_err("NaN curvature must be rejected, not coerced to minweight");
-
     let inf = array![f64::INFINITY, 0.5];
-    floor_positiveworking_weights(&inf, 1.0e-6).expect_err("infinite curvature must be rejected");
+    certify_finite_working_weights(&inf).expect_err("infinite curvature must be rejected");
 }
 
 #[test]
@@ -3800,7 +3791,6 @@ pub(crate) fn objective_includes_solverridge_quadratic_term() {
         outer_tol: 1e-8,
         outer_rel_cost_tol: None,
         rho_lower_bound: -10.0,
-        minweight: gam_problem::CUSTOM_FAMILY_WEIGHT_FLOOR,
         ridge_floor: 1e-4,
         ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
         use_remlobjective: false,
@@ -3856,7 +3846,6 @@ pub(crate) fn inner_block_accepts_penalty_improving_step_even_if_loglik_drops() 
         outer_tol: 1e-8,
         outer_rel_cost_tol: None,
         rho_lower_bound: -10.0,
-        minweight: gam_problem::CUSTOM_FAMILY_WEIGHT_FLOOR,
         ridge_floor: 0.0,
         ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
         use_remlobjective: false,
@@ -3915,7 +3904,6 @@ pub(crate) fn exact_newton_backtracking_descent_includes_explicit_ridge() {
         outer_tol: 1e-8,
         outer_rel_cost_tol: None,
         rho_lower_bound: -10.0,
-        minweight: gam_problem::CUSTOM_FAMILY_WEIGHT_FLOOR,
         ridge_floor: 1.0,
         ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
         use_remlobjective: false,

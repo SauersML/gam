@@ -1047,10 +1047,8 @@ fn birth_prescreen_selects_same_winner_as_unscreened_eq4_race() {
     // Same admitted set: the candidates the pre-screen proposes (predicted ΔMDL
     // > 0) are exactly the candidates the full Eq-4 race keeps (advantage > 0) —
     // the pre-screen never drops a true winner nor admits a true loser.
-    for (i, (&(label, ..), (&adv, &pr))) in race
-        .iter()
-        .zip(eq4_adv.iter().zip(pred.iter()))
-        .enumerate()
+    for (i, (&(label, ..), (&adv, &pr))) in
+        race.iter().zip(eq4_adv.iter().zip(pred.iter())).enumerate()
     {
         assert_eq!(
             adv > 0.0,

@@ -2543,6 +2543,7 @@ impl WorkingModelSurvival {
                 self.coefficient_dim()
             );
         }
+        let active_lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())?;
 
         // Set λ = exp(ρ) on the active blocks (block order), leaving inactive
         // (λ = 0) blocks untouched, then re-converge the inner mode.
@@ -2556,7 +2557,7 @@ impl WorkingModelSurvival {
         let mut active_idx = 0usize;
         for (block, lambda) in candidate.penalties.blocks.iter().zip(lambdas.iter_mut()) {
             if block.lambda > 0.0 {
-                *lambda = rho[active_idx].exp();
+                *lambda = active_lambdas[active_idx];
                 active_idx += 1;
             }
         }

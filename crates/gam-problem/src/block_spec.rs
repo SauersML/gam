@@ -845,7 +845,7 @@ pub enum BlockWorkingSet {
     Diagonal {
         /// IRLS pseudo-response for this block's linear predictor.
         working_response: Array1<f64>,
-        /// IRLS working weights for this block (non-negative, length n).
+        /// IRLS working curvature for this block (finite signed values, length n).
         ///
         /// For the inner solver, Fisher or observed weights both find the same mode.
         /// For the outer REML/LAML log|H| term, observed weights are the correct
@@ -868,11 +868,9 @@ pub enum BlockWorkingSet {
 }
 
 impl BlockWorkingSet {
-    /// Construct a `Diagonal` working set with the length invariant
-    /// (`working_response.len() == working_weights.len()`) enforced at the
-    /// type boundary. Use this from any new code path that produces a
-    /// diagonal IRLS block; the legacy struct-literal form is preserved for
-    /// existing call sites pending a full migration.
+    /// Construct a `Diagonal` working set with its length and finite-value
+    /// invariants enforced at the type boundary. Signed observed curvature is
+    /// preserved exactly; stabilization belongs to the assembled matrix.
     #[inline]
     pub fn diagonal_checked(
         working_response: Array1<f64>,
@@ -883,6 +881,16 @@ impl BlockWorkingSet {
                 "BlockWorkingSet::Diagonal length mismatch: working_response={}, working_weights={}",
                 working_response.len(),
                 working_weights.len(),
+            ));
+        }
+        if let Some((row, value)) = working_response
+            .iter()
+            .chain(working_weights.iter())
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(format!(
+                "BlockWorkingSet::Diagonal contains a non-finite value at flattened index {row}: {value}"
             ));
         }
         Ok(Self::Diagonal {

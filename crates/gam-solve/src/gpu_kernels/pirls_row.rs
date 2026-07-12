@@ -21,20 +21,17 @@
 //! | `w_hessian`  | Curvature weight for the Newton/Laplace Hessian.            |
 //! |              | == w_fisher on canonical links; observed correction on     |
 //! |              | non-canonical Bernoulli + Gamma-log (Stage 5 populates).   |
-//! | `w_solver`   | Stabilised w_hessian used for Cholesky factorisation       |
-//! |              | (floored away from 0 to keep the factor numerically PD).   |
-//! | `z_fisher`   | Working response computed against w_fisher; the legacy     |
-//! |              | "X' W (z − η) − S β" RHS uses this for the score side.     |
-//! | `z_hessian`  | Working response computed against w_hessian (matches       |
-//! |              | w_solver in Stage 5 observed-curvature mode).               |
+//! | `w_solver`   | Exact `w_hessian` consumed by matrix assembly. Statistical  |
+//! |              | rows are never floored or sign-projected; conditioning is  |
+//! |              | exclusively an assembled-matrix ridge operation.           |
 //! | `deviance`   | Per-row deviance contribution dᵢ; sum aggregated host-side  |
 //! |              | for line search and convergence checks.                    |
-//! | `status`     | Bitmask of per-row diagnostic flags (η clamped, μ floored, |
-//! |              | non-smooth, y validation failure). OR-reduced on host.     |
+//! | `status`     | Zero on success; otherwise a refusal code. A failed thread  |
+//! |              | writes no numerical outputs.                               |
 //!
 //! Two-weight discipline is structural in the contract: the gradient is
-//! emitted **directly** (never reconstructed from `w_hessian · (z_hessian − η)`
-//! because in saturated tails that product carries catastrophic cancellation).
+//! emitted **directly** and never reconstructed from an artificial working
+//! response, because that product is both unnecessary and unstable in tails.
 //!
 //! ## Per-family source layout
 //!
@@ -156,7 +153,7 @@ impl PirlsRowFamily {
     }
 }
 
-/// Curvature surface used to populate `w_hessian` / `w_solver` / `z_hessian`.
+/// Curvature surface used to populate `w_hessian` / `w_solver`.
 ///
 /// `Fisher` is the default and matches the CPU Stage-1 path bit-for-bit. The
 /// `Observed` mode is populated by Stage 5 for non-canonical Bernoulli and
@@ -874,8 +871,8 @@ struct PirlsRowBackendLinux {
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum KernelMode {
-    /// Full final-row kernel (9 outputs: mu, grad_eta, w_fisher, w_hessian,
-    /// w_solver, z_fisher, z_hessian, deviance, status).
+    /// Full final-row kernel (mu, grad_eta, w_hessian, w_solver, deviance,
+    /// status).
     FinalRow,
     /// Solve-row kernel (4 outputs: grad_eta, w_solver, deviance, status).
     SolveRow,
@@ -1088,14 +1085,14 @@ struct JitKey {
 ///
 /// Two levels per the charter:
 /// - **Level A** (`JitFamilySpec::glm`): provide a `(family, link)` enum
-///   value plus an optional shape constant. The generator emits the
+///   value plus the Gamma shape constant. The generator emits the
 ///   matching built-in row body, identical to the cached built-in
 ///   kernel — useful for end-to-end JIT path validation against the
 ///   built-in cache.
 /// - **Level B** (`JitFamilySpec::raw`): provide raw CUDA source for
 ///   the row body. The body must define the same per-row locals the
-///   kernel shell expects: `mu`, `grad_eta`, `w_fisher`, `w_hessian`,
-///   `w_solver`, `z_f`, `z_h`, `dev`, and update `flags`. The shell
+///   kernel shell expects: `mu`, `grad_eta`, `w_hessian`, `w_solver`,
+///   `dev`, and update `status`. The shell
 ///   wraps it in the canonical
 ///   `extern "C" __global__ void pirls_row_jit_{spec_id}(...)`
 ///   signature that [`launch_row_reweight_on_stream`] expects.
@@ -1105,9 +1102,9 @@ pub struct JitFamilySpec {
     /// it as a key so callers must reuse the same `spec_id` for the
     /// same body and pick a new one whenever the body changes.
     pub spec_id: u64,
-    /// CUDA body source. Must read from `eta_c`, `y_i`, `wp`, set
-    /// `flags`, and assign to `mu`, `grad_eta`, `w_fisher`, `w_hessian`,
-    /// `w_solver`, `z_f`, `z_h`, `dev`. See [`common_device_prolog`] for
+    /// CUDA body source. Must read from `eta_i`, `y_i`, `wp`, set
+    /// `status`, and assign to `mu`, `grad_eta`, `w_hessian`, `w_solver`,
+    /// and `dev`. See [`common_device_prolog`] for
     /// the available helpers.
     pub body: String,
 }
@@ -1118,8 +1115,13 @@ impl JitFamilySpec {
     /// built-in cached kernel — useful to validate the JIT pipeline
     /// end-to-end against the built-in numerical reference.
     #[cfg(target_os = "linux")]
-    pub fn glm(spec_id: u64, family: PirlsRowFamily, curvature: CurvatureMode) -> Self {
-        let body = match family {
+    pub fn glm(
+        spec_id: u64,
+        family: PirlsRowFamily,
+        curvature: CurvatureMode,
+        gamma_shape: f64,
+    ) -> Self {
+        let mut body = match family {
             PirlsRowFamily::GaussianIdentity => gaussian_identity_body(curvature),
             PirlsRowFamily::PoissonLog => poisson_log_body(curvature),
             PirlsRowFamily::GammaLog => gamma_log_body(curvature),
@@ -1127,6 +1129,9 @@ impl JitFamilySpec {
             PirlsRowFamily::BernoulliProbit => bernoulli_probit_body(curvature),
             PirlsRowFamily::BernoulliCLogLog => bernoulli_cloglog_body(curvature),
         };
+        if matches!(family, PirlsRowFamily::GammaLog) {
+            body.insert_str(0, &format!("    const double shape = {gamma_shape:?};\n"));
+        }
         Self { spec_id, body }
     }
 
@@ -1198,7 +1203,8 @@ extern "C" __global__ void {kernel_name}(
 
 /// Device-resident per-row output buffers for the GPU row-reweight kernel.
 ///
-/// **final-row mode**: all nine per-[`RowOutput`] fields, length `n`. Written
+/// **final-row mode**: the five production numerical fields plus status,
+/// length `n`. Written
 /// once at convergence by [`launch_row_reweight_on_stream`]. For the hot
 /// inner-loop use [`SolveRowBuffers`]; for line-search use
 /// [`AlphaLadderDevBuffers`].
@@ -1215,7 +1221,7 @@ pub struct RowOutputDevBuffers {
 
 #[cfg(target_os = "linux")]
 impl RowOutputDevBuffers {
-    /// Allocate all nine per-row output buffers (length `n`) on `stream`.
+    /// Allocate all production per-row output buffers (length `n`) on `stream`.
     pub fn allocate(stream: &Arc<cudarc::driver::CudaStream>, n: usize) -> Result<Self, GpuError> {
         let alloc_f64 = |label: &'static str| {
             stream
@@ -1244,7 +1250,7 @@ impl RowOutputDevBuffers {
 /// Allocates only the four fields the PIRLS solver reads on every Newton
 /// iteration: `grad_eta` (score for Xᵀg RHS), `w_solver` (working weight
 /// for XᵀWX assembly), `deviance` (per-row deviance for convergence check),
-/// and `status` (diagnostic flags OR-reduced to a single host u32). Written
+/// and `status` (one exact refusal code per row). Written
 /// by [`launch_solve_row_on_stream`]; used instead of [`RowOutputDevBuffers`]
 /// during the hot inner loop to reduce device memory and kernel store traffic.
 #[cfg(target_os = "linux")]
@@ -1255,7 +1261,7 @@ pub struct SolveRowBuffers {
     pub w_solver: cudarc::driver::CudaSlice<f64>,
     /// Per-row deviance contribution — summed for convergence check.
     pub deviance: cudarc::driver::CudaSlice<f64>,
-    /// Bitmask flags OR-reduced to detect numerical issues.
+    /// Zero on success, otherwise the row's deterministic refusal code.
     pub status: cudarc::driver::CudaSlice<u32>,
     pub n: usize,
 }
@@ -1475,8 +1481,8 @@ pub fn launch_row_reweight_jit_on_stream(
 /// Runs the per-family row math and writes only the four fields needed by the
 /// PIRLS solver on each Newton iteration: `grad_eta`, `w_solver`, `deviance`,
 /// `status`. The CUDA kernel is compiled from a specialised source
-/// (`solve_row_source_for`) that skips the `mu`, `w_fisher`, `w_hessian`,
-/// `z_fisher`, `z_hessian` stores, reducing both bandwidth and register
+/// (`solve_row_source_for`) that skips the `mu` and `w_hessian` stores,
+/// reducing both bandwidth and register
 /// pressure relative to [`launch_row_reweight_on_stream`].
 ///
 /// Call once per Newton step on the accepted η. At convergence, call
@@ -2113,7 +2119,7 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
 ///     f64* grad_eta_out, f64* w_solver_out, f64* deviance_out, u32* status_out)`
 ///
 /// It executes the same per-family math as `cuda_source_for` but skips the
-/// `mu`, `w_fisher`, `w_hessian`, `z_fisher`, `z_hessian` stores, reducing
+/// `mu` and `w_hessian` stores, reducing
 /// both bandwidth and L1/register pressure in the hot Newton iteration.
 #[cfg(target_os = "linux")]
 fn solve_row_source_for(family: PirlsRowFamily, curvature: CurvatureMode) -> String {
@@ -2188,8 +2194,8 @@ const ALPHA_LADDER_CUDA_ARRAY: &str =
 ///
 /// Each thread evaluates `eta_trial = eta[i] + PIRLS_ALPHAS[k] * xd[i]`,
 /// runs the per-family deviance math, and atomically adds to
-/// `objective_out[k]` (double-precision atomic add) and OR-accumulates into
-/// `status_out[k]` (atomic OR on u32).
+/// `objective_out[k]` (double-precision atomic add) and writes the exact row
+/// code to `status_out[k*n+i]`.
 ///
 /// The kernel signature is:
 ///   `(int n, const f64* eta, const f64* xd, const f64* y, const f64* prior_w,
@@ -2209,13 +2215,11 @@ fn ladder_source_for(family: PirlsRowFamily, curvature: CurvatureMode) -> String
         CurvatureMode::Fisher => "#define PIRLS_CURVATURE_FISHER 1",
         CurvatureMode::Observed => "#define PIRLS_CURVATURE_OBSERVED 1",
     };
-    // The body uses the name `eta_i` for the (possibly clamped) linear predictor.
+    // The body uses the name `eta_i` for the exact trial linear predictor.
     // For the ladder we substitute `eta[i] + alpha * xd[i]` as the trial eta,
     // so we define `eta_i` before the body runs. The body's own local variable
-    // of the same name overwrites it in families that clamp eta (e.g. Poisson,
-    // Bernoulli), which is correct — the per-family body reassigns `eta_c` from
-    // the (now trial-eta-valued) `eta_i`. For GaussianIdentity the body reads
-    // `eta_i` directly as `mu`, which is also correct after the substitution.
+    // For GaussianIdentity the body reads `eta_i` directly as `mu`; log-link
+    // bodies certify the shared solver interval and never modify the value.
     // GammaLog ladder kernel also takes `double shape` after `prior_w`.
     let shape_param = if matches!(family, PirlsRowFamily::GammaLog) {
         "    double         shape,\n"
@@ -2260,1401 +2264,5 @@ extern "C" __global__ void {kernel_name}(
 // ────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod pirls_row_gpu_tests {
-    use super::*;
-
-    fn assert_close(label: &str, got: f64, expected: f64, tol: f64) {
-        if !(got.is_finite() && expected.is_finite()) {
-            assert_eq!(
-                got.is_finite(),
-                expected.is_finite(),
-                "{label}: finiteness disagrees (got={got}, expected={expected})"
-            );
-            return;
-        }
-        let diff = (got - expected).abs();
-        let denom = expected.abs().max(1.0);
-        assert!(
-            diff <= tol * denom,
-            "{label}: |{got} - {expected}| = {diff} exceeds tol {tol} (rel denom {denom})"
-        );
-    }
-
-    fn check_family_matches_cpu_reference(family: PirlsRowFamily) {
-        let etas = [-700.0, -3.0, -0.5, 0.0, 0.5, 3.0, 700.0];
-        let ys = match family {
-            PirlsRowFamily::GammaLog => vec![0.5, 1.0, 2.5],
-            PirlsRowFamily::PoissonLog => vec![0.0, 1.0, 5.0],
-            PirlsRowFamily::GaussianIdentity => vec![-1.5, 0.0, 2.0],
-            _ => vec![0.0, 1.0],
-        };
-        let ws = [0.0, 1.0, 2.5];
-        for &eta in &etas {
-            for &y in &ys {
-                for &wp in &ws {
-                    let input = RowInput {
-                        eta,
-                        y,
-                        prior_weight: wp,
-                    };
-                    let out = row_reweight_cpu(family, CurvatureMode::Fisher, input, 1.0);
-                    // Structural invariants of the contract.
-                    assert!(
-                        out.w_fisher >= 0.0,
-                        "{family:?}: w_fisher must be non-negative (got {})",
-                        out.w_fisher
-                    );
-                    assert!(
-                        out.w_solver >= 0.0,
-                        "{family:?}: w_solver must be non-negative (got {})",
-                        out.w_solver
-                    );
-                    if wp > 0.0 && out.w_hessian > 0.0 {
-                        assert!(
-                            out.w_solver >= W_SOLVER_FLOOR,
-                            "{family:?}: w_solver must be floored away from zero when positive (got {})",
-                            out.w_solver
-                        );
-                    }
-                    // grad_eta and (z_fisher - eta) * w_fisher must agree
-                    // when eta is unclamped and w_fisher > 0; this guards the
-                    // "never reconstruct gradient from z" discipline.
-                    if (out.status & status_flags::ETA_CLAMPED) != 0 {
-                        continue;
-                    }
-                    if out.w_fisher > 0.0 && out.z_fisher.is_finite() {
-                        let reconstructed = out.w_fisher * (out.z_fisher - eta);
-                        // Allow loose tolerance — we only require these are
-                        // in the same ballpark; the *exact* gradient is
-                        // grad_eta. Catastrophic cancellation in the
-                        // reconstructed form is the precise reason the
-                        // contract exposes grad_eta directly.
-                        if reconstructed.is_finite() {
-                            let denom = reconstructed.abs().max(out.grad_eta.abs()).max(1.0);
-                            let diff = (reconstructed - out.grad_eta).abs() / denom;
-                            assert!(
-                                diff < 1.0e-6,
-                                "{family:?} eta={eta} y={y} wp={wp}: grad_eta {} vs w·(z−η) {} differ by rel {}",
-                                out.grad_eta,
-                                reconstructed,
-                                diff
-                            );
-                        }
-                    }
-                    // deviance non-negative for valid inputs.
-                    if out.status & status_flags::INVALID_RESPONSE == 0 && wp >= 0.0 {
-                        assert!(
-                            out.deviance >= 0.0 || !out.deviance.is_finite(),
-                            "{family:?} eta={eta} y={y} wp={wp}: deviance must be non-negative for valid inputs (got {})",
-                            out.deviance
-                        );
-                    }
-                    // Final sanity: outputs are finite or carry an explicit
-                    // INVALID_RESPONSE / ZERO_PRIOR_WEIGHT flag.
-                    if out.status
-                        & (status_flags::INVALID_RESPONSE | status_flags::ZERO_PRIOR_WEIGHT)
-                        == 0
-                    {
-                        assert!(
-                            out.mu.is_finite(),
-                            "{family:?} eta={eta} y={y} wp={wp}: mu must be finite for valid inputs"
-                        );
-                        assert!(
-                            out.grad_eta.is_finite(),
-                            "{family:?} eta={eta} y={y} wp={wp}: grad_eta must be finite for valid inputs"
-                        );
-                    }
-                }
-            }
-        }
-        // Pull `assert_close` into the closure type-checker so this function
-        // is the single caller of it across the parity surface — keeps the
-        // helper exercised on every family run.
-        assert_close("self", 0.0, 0.0, 0.0);
-    }
-
-    /// Count how many rows actually carried a positive Fisher weight; tests
-    /// assert non-zero so a silently no-op evaluator (e.g. all-NaN output)
-    /// can't satisfy the per-row invariants vacuously.
-    fn count_active_rows(family: PirlsRowFamily) -> usize {
-        let mut active = 0usize;
-        for &eta in [-700.0, -3.0, 0.0, 3.0, 700.0].iter() {
-            for &y in [0.0, 0.5, 1.0].iter() {
-                for &wp in [1.0, 2.5].iter() {
-                    let out = row_reweight_cpu(
-                        family,
-                        CurvatureMode::Fisher,
-                        RowInput {
-                            eta,
-                            y,
-                            prior_weight: wp,
-                        },
-                        1.0,
-                    );
-                    if out.w_fisher > 0.0 {
-                        active += 1;
-                    }
-                }
-            }
-        }
-        active
-    }
-
-    #[test]
-    fn gaussian_identity_row_invariants() {
-        check_family_matches_cpu_reference(PirlsRowFamily::GaussianIdentity);
-        assert!(count_active_rows(PirlsRowFamily::GaussianIdentity) > 0);
-    }
-
-    #[test]
-    fn poisson_log_row_invariants() {
-        check_family_matches_cpu_reference(PirlsRowFamily::PoissonLog);
-        assert!(count_active_rows(PirlsRowFamily::PoissonLog) > 0);
-    }
-
-    #[test]
-    fn gamma_log_row_invariants() {
-        check_family_matches_cpu_reference(PirlsRowFamily::GammaLog);
-        assert!(count_active_rows(PirlsRowFamily::GammaLog) > 0);
-    }
-
-    #[test]
-    fn bernoulli_logit_row_invariants() {
-        check_family_matches_cpu_reference(PirlsRowFamily::BernoulliLogit);
-        assert!(count_active_rows(PirlsRowFamily::BernoulliLogit) > 0);
-    }
-
-    #[test]
-    fn bernoulli_probit_row_invariants() {
-        check_family_matches_cpu_reference(PirlsRowFamily::BernoulliProbit);
-        assert!(count_active_rows(PirlsRowFamily::BernoulliProbit) > 0);
-    }
-
-    #[test]
-    fn bernoulli_cloglog_row_invariants() {
-        check_family_matches_cpu_reference(PirlsRowFamily::BernoulliCLogLog);
-        assert!(count_active_rows(PirlsRowFamily::BernoulliCLogLog) > 0);
-    }
-
-    /// Gaussian identity must match the trivial CPU formula for any input.
-    #[test]
-    fn gaussian_identity_matches_explicit_formulas() {
-        let out = row_reweight_cpu(
-            PirlsRowFamily::GaussianIdentity,
-            CurvatureMode::Fisher,
-            RowInput {
-                eta: 0.25,
-                y: 1.0,
-                prior_weight: 2.0,
-            },
-            1.0,
-        );
-        assert!(out.mu.is_finite() && out.deviance.is_finite());
-        assert_close("mu", out.mu, 0.25, 0.0);
-        assert_close("grad_eta", out.grad_eta, 2.0 * (1.0 - 0.25), 1e-15);
-        assert_close("w_fisher", out.w_fisher, 2.0, 0.0);
-        assert_close(
-            "deviance",
-            out.deviance,
-            2.0 * (1.0 - 0.25_f64).powi(2),
-            1e-15,
-        );
-    }
-
-    /// Poisson log must match the analytic formula μ = exp(η) and grad_eta = w·(y−μ).
-    #[test]
-    fn poisson_log_matches_explicit_formulas() {
-        let out = row_reweight_cpu(
-            PirlsRowFamily::PoissonLog,
-            CurvatureMode::Fisher,
-            RowInput {
-                eta: 1.5,
-                y: 4.0,
-                prior_weight: 1.0,
-            },
-            1.0,
-        );
-        let expected_mu = (1.5_f64).exp();
-        assert!(expected_mu.is_finite() && out.mu.is_finite());
-        assert_close("mu", out.mu, expected_mu, 1e-15);
-        assert_close("grad_eta", out.grad_eta, 4.0 - expected_mu, 1e-15);
-        assert_close("w_fisher", out.w_fisher, expected_mu, 1e-15);
-    }
-
-    /// Bernoulli logit: closed form for canonical link.
-    #[test]
-    fn bernoulli_logit_matches_explicit_formulas() {
-        let eta: f64 = 0.7;
-        let mu = 1.0 / (1.0 + (-eta).exp());
-        let out = row_reweight_cpu(
-            PirlsRowFamily::BernoulliLogit,
-            CurvatureMode::Fisher,
-            RowInput {
-                eta,
-                y: 1.0,
-                prior_weight: 3.0,
-            },
-            1.0,
-        );
-        assert!(mu > 0.0 && mu < 1.0);
-        assert_close("mu", out.mu, mu, 1e-12);
-        assert_close("w_fisher", out.w_fisher, 3.0 * mu * (1.0 - mu), 1e-12);
-        assert_close("grad_eta", out.grad_eta, 3.0 * (1.0 - mu), 1e-12);
-    }
-
-    /// Eta clamping flag must trip past ±700.
-    #[test]
-    fn eta_clamp_status_flag_trips() {
-        let out = row_reweight_cpu(
-            PirlsRowFamily::PoissonLog,
-            CurvatureMode::Fisher,
-            RowInput {
-                eta: 1000.0,
-                y: 0.0,
-                prior_weight: 1.0,
-            },
-            1.0,
-        );
-        assert!(out.status & status_flags::ETA_CLAMPED != 0);
-    }
-
-    /// `module_for` must lazily compile + cache one module per `(family, curvature)`.
-    /// Skipped on hosts without a CUDA runtime (mac, CI).
-    #[test]
-    fn backend_compiles_one_module_per_family_when_device_present() {
-        // The compiled-backend flag itself is independent of runtime probe
-        // and must agree with the `cfg(target_os = "linux")` selector that
-        // gates the rest of the module-cache code path.
-        assert_eq!(PirlsRowBackend::compiled(), cfg!(target_os = "linux"));
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
-            eprintln!("[pirls_row_gpu test] no CUDA runtime — skipping device compile test");
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            for &family in PirlsRowFamily::ALL.iter() {
-                let m1 = backend
-                    .module_for(family, CurvatureMode::Fisher)
-                    .unwrap_or_else(|err| panic!("compile {family:?}: {err}"));
-                let m2 = backend
-                    .module_for(family, CurvatureMode::Fisher)
-                    .unwrap_or_else(|err| panic!("re-fetch {family:?}: {err}"));
-                assert!(
-                    Arc::ptr_eq(&m1, &m2),
-                    "{family:?}: module cache must return same handle on second call"
-                );
-            }
-        }
-    }
-
-    /// Stage 6: JIT-compiled custom-family kernel through Level A
-    /// (built-in spec) must produce byte-identical outputs to the
-    /// cached built-in kernel on the same inputs. Validates the
-    /// `JitFamilySpec::glm` builder + `cuda_source` shell + JIT module
-    /// cache + `launch_row_reweight_jit_on_stream` end to end against
-    /// the Stage 1 cached built-in path.
-    #[test]
-    fn jit_glm_kernel_matches_builtin_byte_identical() {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
-            eprintln!("[stage_6_jit] no CUDA runtime — skipping");
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let etas = [-2.0_f64, -0.5, 0.3, 1.5];
-            let ys = [0.0_f64, 1.0, 0.0, 1.0];
-            let priors = [1.0_f64, 1.2, 0.8, 1.5];
-            let n = etas.len();
-            let family = PirlsRowFamily::BernoulliLogit;
-            let curvature = CurvatureMode::Fisher;
-            let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let stream = gam_gpu::backend_probe::probe_cuda_backend("pirls_row")
-                .expect("shared backend probe")
-                .stream;
-
-            let mut eta_dev = stream.alloc_zeros::<f64>(n).expect("eta");
-            let mut y_dev = stream.alloc_zeros::<f64>(n).expect("y");
-            let mut prior_dev = stream.alloc_zeros::<f64>(n).expect("prior");
-            stream.memcpy_htod(&etas, &mut eta_dev).expect("up eta");
-            stream.memcpy_htod(&ys, &mut y_dev).expect("up y");
-            stream
-                .memcpy_htod(&priors, &mut prior_dev)
-                .expect("up prior");
-
-            // Built-in path.
-            let mut out_builtin = RowOutputDevBuffers::allocate(&stream, n).expect("alloc builtin");
-            launch_row_reweight_on_stream(
-                backend,
-                family,
-                curvature,
-                1.0,
-                &stream,
-                n,
-                &eta_dev,
-                &y_dev,
-                &prior_dev,
-                &mut out_builtin,
-            )
-            .expect("builtin launch");
-
-            // JIT path through Level A spec (same body, distinct kernel symbol).
-            let spec = JitFamilySpec::glm(0x424c_4c47u64, family, curvature);
-            let mut out_jit = RowOutputDevBuffers::allocate(&stream, n).expect("alloc jit");
-            launch_row_reweight_jit_on_stream(
-                backend,
-                &spec,
-                curvature,
-                &stream,
-                n,
-                &eta_dev,
-                &y_dev,
-                &prior_dev,
-                &mut out_jit,
-            )
-            .expect("jit launch");
-            stream.synchronize().expect("sync");
-
-            // Byte-identical per-field comparison.
-            for (label, b_dev, j_dev) in [
-                ("mu", &out_builtin.mu, &out_jit.mu),
-                ("grad_eta", &out_builtin.grad_eta, &out_jit.grad_eta),
-                ("w_fisher", &out_builtin.w_fisher, &out_jit.w_fisher),
-                ("w_hessian", &out_builtin.w_hessian, &out_jit.w_hessian),
-                ("w_solver", &out_builtin.w_solver, &out_jit.w_solver),
-                ("z_fisher", &out_builtin.z_fisher, &out_jit.z_fisher),
-                ("z_hessian", &out_builtin.z_hessian, &out_jit.z_hessian),
-                ("deviance", &out_builtin.deviance, &out_jit.deviance),
-            ] {
-                let b = stream.clone_dtoh(b_dev).expect("dl builtin");
-                let j = stream.clone_dtoh(j_dev).expect("dl jit");
-                for i in 0..n {
-                    assert_eq!(
-                        b[i].to_bits(),
-                        j[i].to_bits(),
-                        "{label}[{i}]: builtin {} ≠ jit {}",
-                        b[i],
-                        j[i],
-                    );
-                }
-            }
-        }
-    }
-
-    /// Stage 6 Level B: caller-supplied raw CUDA body (no built-in
-    /// family enum) must produce byte-identical outputs to the cached
-    /// built-in `GaussianIdentity` kernel on the same fixture. The
-    /// raw body below is written from scratch — different statement
-    /// layout, different intermediate names — but performs the same
-    /// floating-point operations in the same order as
-    /// `gaussian_identity_body`, so the bit pattern of every output
-    /// must match the built-in kernel exactly.
-    #[test]
-    fn jit_raw_body_kernel_matches_builtin_gaussian_byte_identical() {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
-            eprintln!("[stage_6_jit_raw] no CUDA runtime — skipping");
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            // 256-row deterministic fixture covering positive/negative
-            // residuals, zero residuals, varying prior weights, and a
-            // zero-weight row (exercises the `(wp > 0.0)` branch in
-            // `w_solver`).
-            let n: usize = 256;
-            let mut etas = vec![0.0_f64; n];
-            let mut ys = vec![0.0_f64; n];
-            let mut priors = vec![0.0_f64; n];
-            for i in 0..n {
-                let t = (i as f64) / (n as f64 - 1.0); // 0..=1
-                etas[i] = -3.0 + 6.0 * t;
-                ys[i] = 5.0 * (t - 0.5);
-                priors[i] = if i == 7 {
-                    0.0 // zero-weight row
-                } else {
-                    0.25 + 1.75 * t
-                };
-            }
-
-            let family = PirlsRowFamily::GaussianIdentity;
-            let curvature = CurvatureMode::Fisher;
-            let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let stream = gam_gpu::backend_probe::probe_cuda_backend("pirls_row")
-                .expect("shared backend probe")
-                .stream;
-
-            let mut eta_dev = stream.alloc_zeros::<f64>(n).expect("eta");
-            let mut y_dev = stream.alloc_zeros::<f64>(n).expect("y");
-            let mut prior_dev = stream.alloc_zeros::<f64>(n).expect("prior");
-            stream.memcpy_htod(&etas, &mut eta_dev).expect("up eta");
-            stream.memcpy_htod(&ys, &mut y_dev).expect("up y");
-            stream
-                .memcpy_htod(&priors, &mut prior_dev)
-                .expect("up prior");
-
-            // Built-in Level A Gaussian-identity kernel (reference).
-            let mut out_builtin = RowOutputDevBuffers::allocate(&stream, n).expect("alloc builtin");
-            launch_row_reweight_on_stream(
-                backend,
-                family,
-                curvature,
-                1.0,
-                &stream,
-                n,
-                &eta_dev,
-                &y_dev,
-                &prior_dev,
-                &mut out_builtin,
-            )
-            .expect("builtin launch");
-
-            // Level B raw-body Gaussian-identity kernel. Source is
-            // written by hand against the JitFamilySpec contract: read
-            // eta_i, y_i, wp; assign mu, grad_eta, w_fisher, w_hessian,
-            // w_solver, z_f, z_h, dev. The op sequence matches
-            // `gaussian_identity_body` exactly so the result is
-            // bit-identical to the built-in path.
-            let raw_body = r#"    // level-b raw body: gaussian identity (hand-written)
-    // identity link: mu = eta
-    double mu = eta_i;
-    // ordinary residual on the response scale
-    double resid = y_i - mu;
-    // canonical score contribution
-    double grad_eta = wp * resid;
-    // fisher info per row: weight itself (V(mu)=1, dmu/deta=1)
-    double w_fisher = wp;
-    // observed == fisher for canonical identity link
-    double w_hessian = wp;
-    // solver weight clamps tiny positives to avoid singularity
-    double w_solver = (wp > 0.0) ? fmax(wp, 1e-12) : 0.0;
-    // working response equals raw response on identity link
-    double z_f = y_i;
-    double z_h = y_i;
-    // squared-error contribution to deviance
-    double dev = wp * resid * resid;
-"#;
-            let spec = JitFamilySpec::raw(0x5241_575f_4741_5553u64, raw_body);
-            let mut out_jit = RowOutputDevBuffers::allocate(&stream, n).expect("alloc jit");
-            launch_row_reweight_jit_on_stream(
-                backend,
-                &spec,
-                curvature,
-                &stream,
-                n,
-                &eta_dev,
-                &y_dev,
-                &prior_dev,
-                &mut out_jit,
-            )
-            .expect("jit raw launch");
-            stream.synchronize().expect("sync");
-
-            for (label, b_dev, j_dev) in [
-                ("mu", &out_builtin.mu, &out_jit.mu),
-                ("grad_eta", &out_builtin.grad_eta, &out_jit.grad_eta),
-                ("w_fisher", &out_builtin.w_fisher, &out_jit.w_fisher),
-                ("w_hessian", &out_builtin.w_hessian, &out_jit.w_hessian),
-                ("w_solver", &out_builtin.w_solver, &out_jit.w_solver),
-                ("z_fisher", &out_builtin.z_fisher, &out_jit.z_fisher),
-                ("z_hessian", &out_builtin.z_hessian, &out_jit.z_hessian),
-                ("deviance", &out_builtin.deviance, &out_jit.deviance),
-            ] {
-                let b = stream.clone_dtoh(b_dev).expect("dl builtin");
-                let j = stream.clone_dtoh(j_dev).expect("dl jit raw");
-                for i in 0..n {
-                    assert_eq!(
-                        b[i].to_bits(),
-                        j[i].to_bits(),
-                        "{label}[{i}]: builtin {} ≠ jit-raw {}",
-                        b[i],
-                        j[i],
-                    );
-                }
-            }
-
-            // Direct Level B raw-body → CPU reference parity. Closes
-            // the chain JIT-raw → CPU without going through the
-            // built-in GPU kernel as an intermediary. Gaussian
-            // identity is straight-line scalar arithmetic on both
-            // sides, so we still demand bit-equality on the eight
-            // outputs the CPU evaluator exposes.
-            let mu_j = stream.clone_dtoh(&out_jit.mu).expect("dl jit mu");
-            let g_j = stream.clone_dtoh(&out_jit.grad_eta).expect("dl jit g");
-            let wf_j = stream.clone_dtoh(&out_jit.w_fisher).expect("dl jit wf");
-            let wh_j = stream.clone_dtoh(&out_jit.w_hessian).expect("dl jit wh");
-            let ws_j = stream.clone_dtoh(&out_jit.w_solver).expect("dl jit ws");
-            let zf_j = stream.clone_dtoh(&out_jit.z_fisher).expect("dl jit zf");
-            let zh_j = stream.clone_dtoh(&out_jit.z_hessian).expect("dl jit zh");
-            let d_j = stream.clone_dtoh(&out_jit.deviance).expect("dl jit d");
-            for i in 0..n {
-                let cpu = row_reweight_cpu(
-                    PirlsRowFamily::GaussianIdentity,
-                    curvature,
-                    RowInput {
-                        eta: etas[i],
-                        y: ys[i],
-                        prior_weight: priors[i],
-                    },
-                    1.0,
-                );
-                for (label, cpu_v, jit_v) in [
-                    ("mu", cpu.mu, mu_j[i]),
-                    ("grad_eta", cpu.grad_eta, g_j[i]),
-                    ("w_fisher", cpu.w_fisher, wf_j[i]),
-                    ("w_hessian", cpu.w_hessian, wh_j[i]),
-                    ("w_solver", cpu.w_solver, ws_j[i]),
-                    ("z_fisher", cpu.z_fisher, zf_j[i]),
-                    ("z_hessian", cpu.z_hessian, zh_j[i]),
-                    ("deviance", cpu.deviance, d_j[i]),
-                ] {
-                    assert_eq!(
-                        cpu_v.to_bits(),
-                        jit_v.to_bits(),
-                        "{label}[{i}]: cpu {} ≠ jit-raw {}",
-                        cpu_v,
-                        jit_v,
-                    );
-                }
-            }
-        }
-    }
-
-    /// Stage 5: observed-information curvature mode is now real math
-    /// (no longer a Fisher alias) for Gamma-log, Bernoulli probit, and
-    /// Bernoulli cloglog. Canonical families (Bernoulli logit, Poisson
-    /// log, Gaussian identity) remain == Fisher because canonical
-    /// links have observed == Fisher by construction.
-    #[test]
-    fn observed_curvature_matches_expected_per_family() {
-        // Picks where the math is well-conditioned so that round-off
-        // doesn't dominate the comparison.
-        let probe_eta = 0.4_f64;
-        let probe_y = 1.0_f64;
-        let wp = 1.5_f64;
-        let input = RowInput {
-            eta: probe_eta,
-            y: probe_y,
-            prior_weight: wp,
-        };
-
-        // Canonical families: observed must equal Fisher exactly.
-        for canonical in [
-            PirlsRowFamily::GaussianIdentity,
-            PirlsRowFamily::PoissonLog,
-            PirlsRowFamily::BernoulliLogit,
-        ] {
-            let f = row_reweight_cpu(canonical, CurvatureMode::Fisher, input, 1.0);
-            let o = row_reweight_cpu(canonical, CurvatureMode::Observed, input, 1.0);
-            assert_eq!(
-                f.w_hessian, o.w_hessian,
-                "{canonical:?}: observed must equal Fisher for canonical link"
-            );
-        }
-
-        // Gamma-log (non-canonical): observed = Fisher · (y/μ). Exercise
-        // with shape=1 and shape=2.5 to confirm the plumbing.
-        for &shape in &[1.0_f64, 2.5] {
-            let gf = row_reweight_cpu(
-                PirlsRowFamily::GammaLog,
-                CurvatureMode::Fisher,
-                input,
-                shape,
-            );
-            let go = row_reweight_cpu(
-                PirlsRowFamily::GammaLog,
-                CurvatureMode::Observed,
-                input,
-                shape,
-            );
-            assert!(
-                (go.w_hessian - gf.w_fisher * (probe_y / gf.mu)).abs() <= 1e-12,
-                "Gamma-log observed mismatch (shape={shape}): got={} expected={} (mu={})",
-                go.w_hessian,
-                gf.w_fisher * (probe_y / gf.mu),
-                gf.mu
-            );
-            assert_ne!(
-                gf.w_hessian, go.w_hessian,
-                "Gamma-log: observed must differ from Fisher when y ≠ μ (shape={shape})"
-            );
-        }
-
-        // Bernoulli probit/cloglog: observed must differ from Fisher
-        // generically and must be ≥ 0 at well-behaved interior points
-        // (saturation tail can push it negative; tested elsewhere).
-        for noncanon in [
-            PirlsRowFamily::BernoulliProbit,
-            PirlsRowFamily::BernoulliCLogLog,
-        ] {
-            let f = row_reweight_cpu(noncanon, CurvatureMode::Fisher, input, 1.0);
-            let o = row_reweight_cpu(noncanon, CurvatureMode::Observed, input, 1.0);
-            assert!(
-                (f.w_hessian - o.w_hessian).abs() > 0.0 || (probe_y - f.mu).abs() < 1e-15,
-                "{noncanon:?}: observed should differ from Fisher when y ≠ μ"
-            );
-        }
-    }
-
-    /// Gamma-log CPU reference: `w_fisher` scales linearly with shape;
-    /// observed `w_hessian = w_fisher · y/μ` holds for any positive shape.
-    #[test]
-    fn gamma_log_shape_scaling() {
-        let input = RowInput {
-            eta: 0.5,
-            y: 2.0,
-            prior_weight: 1.0,
-        };
-        let base = row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Fisher, input, 1.0);
-        for &shape in &[0.5_f64, 1.5, 3.0, 10.0] {
-            let r = row_reweight_cpu(
-                PirlsRowFamily::GammaLog,
-                CurvatureMode::Fisher,
-                input,
-                shape,
-            );
-            assert!(
-                (r.w_fisher - shape * base.w_fisher).abs() <= 1e-14,
-                "w_fisher should scale with shape: got {} expected {} (shape={shape})",
-                r.w_fisher,
-                shape * base.w_fisher,
-            );
-            assert_eq!(
-                r.mu.to_bits(),
-                base.mu.to_bits(),
-                "mu must not depend on shape"
-            );
-            let ro = row_reweight_cpu(
-                PirlsRowFamily::GammaLog,
-                CurvatureMode::Observed,
-                input,
-                shape,
-            );
-            let expected_obs = r.w_fisher * (input.y / r.mu);
-            assert!(
-                (ro.w_hessian - expected_obs).abs() <= 1e-13,
-                "observed w_hessian mismatch (shape={shape}): got={} expected={}",
-                ro.w_hessian,
-                expected_obs,
-            );
-        }
-    }
-
-    /// V100 parity for the device-side row launcher.
-    ///
-    /// For every built-in family the launcher's per-row outputs must match
-    /// the CPU `row_reweight_cpu` reference to round-off. Skipped on hosts
-    /// without a CUDA runtime (mac, CI). This is also the production
-    /// caller that justifies the launcher + `RowOutputDevBuffers` surface
-    /// per the dead-pub-scanner rule.
-    #[test]
-    fn launch_row_reweight_matches_cpu_reference_on_device() {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
-            eprintln!("[pirls_row_gpu test] no CUDA runtime — skipping launcher parity test");
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            // Use a small but non-trivial row batch with several y-values per
-            // family. Pick a y that's valid for every family below (0/1 are
-            // valid for Bernoulli; positive for Poisson/Gamma; arbitrary for
-            // Gaussian). Build per-family input vectors.
-            let etas = [-3.0_f64, -0.5, 0.0, 0.5, 3.0, 10.0, -10.0, 1.5];
-            let n = etas.len();
-            let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let stream = gam_gpu::backend_probe::probe_cuda_backend("pirls_row")
-                .expect("shared backend probe")
-                .stream;
-
-            for &family in PirlsRowFamily::ALL.iter() {
-                let ys: Vec<f64> = match family {
-                    PirlsRowFamily::GammaLog | PirlsRowFamily::PoissonLog => {
-                        (0..n).map(|i| 1.0 + 0.5 * (i as f64)).collect()
-                    }
-                    PirlsRowFamily::GaussianIdentity => {
-                        (0..n).map(|i| -1.0 + 0.5 * (i as f64)).collect()
-                    }
-                    _ => (0..n).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 }).collect(),
-                };
-                let priors: Vec<f64> = (0..n).map(|i| 1.0 + 0.25 * (i as f64)).collect();
-
-                // CPU reference.
-                let mut cpu_out = Vec::with_capacity(n);
-                for i in 0..n {
-                    cpu_out.push(row_reweight_cpu(
-                        family,
-                        CurvatureMode::Fisher,
-                        RowInput {
-                            eta: etas[i],
-                            y: ys[i],
-                            prior_weight: priors[i],
-                        },
-                        1.0,
-                    ));
-                }
-
-                // Upload inputs, allocate device outputs, launch, download.
-                let mut eta_dev = stream.alloc_zeros::<f64>(n).expect("alloc eta_dev");
-                let mut y_dev = stream.alloc_zeros::<f64>(n).expect("alloc y_dev");
-                let mut prior_dev = stream.alloc_zeros::<f64>(n).expect("alloc prior_dev");
-                stream
-                    .memcpy_htod(etas.as_slice(), &mut eta_dev)
-                    .expect("upload eta");
-                stream
-                    .memcpy_htod(ys.as_slice(), &mut y_dev)
-                    .expect("upload y");
-                stream
-                    .memcpy_htod(priors.as_slice(), &mut prior_dev)
-                    .expect("upload prior");
-                let mut out = RowOutputDevBuffers::allocate(&stream, n).expect("alloc row buffers");
-                launch_row_reweight_on_stream(
-                    backend,
-                    family,
-                    CurvatureMode::Fisher,
-                    1.0,
-                    &stream,
-                    n,
-                    &eta_dev,
-                    &y_dev,
-                    &prior_dev,
-                    &mut out,
-                )
-                .unwrap_or_else(|err| panic!("launch {family:?}: {err}"));
-                stream.synchronize().expect("stream sync");
-                let mu = stream.clone_dtoh(&out.mu).expect("dl mu");
-                let g = stream.clone_dtoh(&out.grad_eta).expect("dl grad_eta");
-                let wf = stream.clone_dtoh(&out.w_fisher).expect("dl w_fisher");
-                let wh = stream.clone_dtoh(&out.w_hessian).expect("dl w_hessian");
-                let ws_v = stream.clone_dtoh(&out.w_solver).expect("dl w_solver");
-                let zf = stream.clone_dtoh(&out.z_fisher).expect("dl z_fisher");
-                let zh = stream.clone_dtoh(&out.z_hessian).expect("dl z_hessian");
-                let dev = stream.clone_dtoh(&out.deviance).expect("dl deviance");
-
-                let tol = 1e-12;
-                for i in 0..n {
-                    let r = cpu_out[i];
-                    assert_close(&format!("{family:?}/row{i}/mu"), mu[i], r.mu, tol);
-                    assert_close(
-                        &format!("{family:?}/row{i}/grad_eta"),
-                        g[i],
-                        r.grad_eta,
-                        tol,
-                    );
-                    assert_close(
-                        &format!("{family:?}/row{i}/w_fisher"),
-                        wf[i],
-                        r.w_fisher,
-                        tol,
-                    );
-                    assert_close(
-                        &format!("{family:?}/row{i}/w_hessian"),
-                        wh[i],
-                        r.w_hessian,
-                        tol,
-                    );
-                    assert_close(
-                        &format!("{family:?}/row{i}/w_solver"),
-                        ws_v[i],
-                        r.w_solver,
-                        tol,
-                    );
-                    assert_close(
-                        &format!("{family:?}/row{i}/z_fisher"),
-                        zf[i],
-                        r.z_fisher,
-                        tol,
-                    );
-                    assert_close(
-                        &format!("{family:?}/row{i}/z_hessian"),
-                        zh[i],
-                        r.z_hessian,
-                        tol,
-                    );
-                    assert_close(
-                        &format!("{family:?}/row{i}/deviance"),
-                        dev[i],
-                        r.deviance,
-                        tol,
-                    );
-                }
-            }
-        }
-    }
-
-    /// Stage 5 end-to-end V100 parity for `CurvatureMode::Observed`.
-    ///
-    /// 256-row synthetic fixture per family with η ∈ [-6, 6] spanning the
-    /// saturated tails. Two assertions:
-    ///
-    /// 1. Noncanonical families (BernoulliProbit, BernoulliCLogLog,
-    ///    GammaLog): device `w_hessian` under Observed mode matches the
-    ///    CPU `row_reweight_cpu(..., Observed, ..)` reference to
-    ///    `abs ≤ 1e-12` OR `rel ≤ 1e-11`.
-    /// 2. Canonical families (GaussianIdentity, PoissonLog, BernoulliLogit):
-    ///    device `w_hessian` under Observed mode equals device `w_fisher`
-    ///    bit-for-bit (via `to_bits()`) — canonical links have observed
-    ///    information ≡ Fisher information by construction.
-    #[test]
-    fn gpu_observed_parity() {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
-            eprintln!("[gpu_observed_parity] no CUDA runtime — skipping");
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            const N: usize = 256;
-            let etas: Vec<f64> = (0..N)
-                .map(|i| -6.0 + 12.0 * (i as f64) / ((N - 1) as f64))
-                .collect();
-            let priors: Vec<f64> = (0..N)
-                .map(|i| 0.5 + 1.5 * ((i as f64) / (N as f64)))
-                .collect();
-
-            let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let stream = gam_gpu::backend_probe::probe_cuda_backend("pirls_row")
-                .expect("shared backend probe")
-                .stream;
-
-            for &family in PirlsRowFamily::ALL.iter() {
-                let ys: Vec<f64> = match family {
-                    PirlsRowFamily::GammaLog => (0..N).map(|i| 0.25 + 0.05 * (i as f64)).collect(),
-                    PirlsRowFamily::PoissonLog => (0..N).map(|i| (i % 6) as f64).collect(),
-                    PirlsRowFamily::GaussianIdentity => (0..N)
-                        .map(|i| -2.0 + 4.0 * (i as f64) / ((N - 1) as f64))
-                        .collect(),
-                    _ => (0..N).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 }).collect(),
-                };
-
-                let mut eta_dev = stream.alloc_zeros::<f64>(N).expect("alloc eta_dev");
-                let mut y_dev = stream.alloc_zeros::<f64>(N).expect("alloc y_dev");
-                let mut prior_dev = stream.alloc_zeros::<f64>(N).expect("alloc prior_dev");
-                stream
-                    .memcpy_htod(etas.as_slice(), &mut eta_dev)
-                    .expect("upload eta");
-                stream
-                    .memcpy_htod(ys.as_slice(), &mut y_dev)
-                    .expect("upload y");
-                stream
-                    .memcpy_htod(priors.as_slice(), &mut prior_dev)
-                    .expect("upload prior");
-
-                let mut out_obs = RowOutputDevBuffers::allocate(&stream, N).expect("alloc out_obs");
-                launch_row_reweight_on_stream(
-                    backend,
-                    family,
-                    CurvatureMode::Observed,
-                    1.0,
-                    &stream,
-                    N,
-                    &eta_dev,
-                    &y_dev,
-                    &prior_dev,
-                    &mut out_obs,
-                )
-                .unwrap_or_else(|err| panic!("observed launch {family:?}: {err}"));
-                stream.synchronize().expect("stream sync (observed)");
-
-                let wh_obs = stream
-                    .clone_dtoh(&out_obs.w_hessian)
-                    .expect("dl w_hessian (observed)");
-                let wf_obs = stream
-                    .clone_dtoh(&out_obs.w_fisher)
-                    .expect("dl w_fisher (observed)");
-
-                if family.is_canonical() {
-                    for i in 0..N {
-                        assert_eq!(
-                            wh_obs[i].to_bits(),
-                            wf_obs[i].to_bits(),
-                            "{family:?} row {i}: observed w_hessian {} must bit-equal w_fisher {} on canonical link",
-                            wh_obs[i],
-                            wf_obs[i],
-                        );
-                    }
-                } else {
-                    for i in 0..N {
-                        let cpu = row_reweight_cpu(
-                            family,
-                            CurvatureMode::Observed,
-                            RowInput {
-                                eta: etas[i],
-                                y: ys[i],
-                                prior_weight: priors[i],
-                            },
-                            1.0,
-                        );
-                        let got = wh_obs[i];
-                        let exp = cpu.w_hessian;
-                        let abs_err = (got - exp).abs();
-                        let rel_err = if exp.abs() > 0.0 {
-                            abs_err / exp.abs()
-                        } else {
-                            abs_err
-                        };
-                        assert!(
-                            abs_err <= 1.0e-12 || rel_err <= 1.0e-11,
-                            "{family:?} row {i} (eta={}, y={}, wp={}): \
-                             device w_hessian={} vs CPU observed={} (abs={}, rel={})",
-                            etas[i],
-                            ys[i],
-                            priors[i],
-                            got,
-                            exp,
-                            abs_err,
-                            rel_err,
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Task #50 — Stage 5 GPU end-to-end observed-curvature parity at
-    /// n=1000 across **all six** supported families, validating BOTH
-    /// `w_hessian` (Hessian diagonal) AND `grad_eta` (score) against the
-    /// CPU observed-curvature oracle to abs/rel ≤ 1e-9. This is the
-    /// full end-to-end companion to `gpu_observed_parity` (which only
-    /// covered n=256 and only checked `w_hessian` for noncanonical
-    /// families). Gated on a live CUDA runtime; marked `#[ignore]` so
-    /// the v100-bench-runner explicitly opts in via `--ignored`.
-    #[test]
-    fn gpu_observed_parity_end_to_end_n1000() {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
-            eprintln!("[gpu_observed_parity_end_to_end_n1000] no CUDA runtime — skipping");
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            const N: usize = 1000;
-            // Deterministic η grid spanning the saturated tails plus
-            // the near-zero regime where the observed-information
-            // correction term is most active.
-            let etas: Vec<f64> = (0..N)
-                .map(|i| -8.0 + 16.0 * (i as f64) / ((N - 1) as f64))
-                .collect();
-            let priors: Vec<f64> = (0..N)
-                .map(|i| 0.25 + 1.75 * ((i as f64) / (N as f64)))
-                .collect();
-
-            let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let stream = gam_gpu::backend_probe::probe_cuda_backend("pirls_row")
-                .expect("shared backend probe")
-                .stream;
-
-            const TOL: f64 = 1.0e-9;
-
-            for &family in PirlsRowFamily::ALL.iter() {
-                // Family-specific response vectors stay in domain so the
-                // CPU oracle is well-defined for every row.
-                let ys: Vec<f64> = match family {
-                    PirlsRowFamily::GammaLog => {
-                        (0..N).map(|i| 0.10 + 0.05 * ((i % 97) as f64)).collect()
-                    }
-                    PirlsRowFamily::PoissonLog => (0..N).map(|i| (i % 11) as f64).collect(),
-                    PirlsRowFamily::GaussianIdentity => (0..N)
-                        .map(|i| -3.0 + 6.0 * (i as f64) / ((N - 1) as f64))
-                        .collect(),
-                    PirlsRowFamily::BernoulliLogit
-                    | PirlsRowFamily::BernoulliProbit
-                    | PirlsRowFamily::BernoulliCLogLog => {
-                        (0..N).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 }).collect()
-                    }
-                };
-
-                let mut eta_dev = stream.alloc_zeros::<f64>(N).expect("alloc eta_dev");
-                let mut y_dev = stream.alloc_zeros::<f64>(N).expect("alloc y_dev");
-                let mut prior_dev = stream.alloc_zeros::<f64>(N).expect("alloc prior_dev");
-                stream
-                    .memcpy_htod(etas.as_slice(), &mut eta_dev)
-                    .expect("upload eta");
-                stream
-                    .memcpy_htod(ys.as_slice(), &mut y_dev)
-                    .expect("upload y");
-                stream
-                    .memcpy_htod(priors.as_slice(), &mut prior_dev)
-                    .expect("upload prior");
-
-                let mut out_obs = RowOutputDevBuffers::allocate(&stream, N).expect("alloc out_obs");
-                launch_row_reweight_on_stream(
-                    backend,
-                    family,
-                    CurvatureMode::Observed,
-                    1.0,
-                    &stream,
-                    N,
-                    &eta_dev,
-                    &y_dev,
-                    &prior_dev,
-                    &mut out_obs,
-                )
-                .unwrap_or_else(|err| panic!("observed launch {family:?}: {err}"));
-                stream.synchronize().expect("stream sync (observed)");
-
-                let wh_obs = stream
-                    .clone_dtoh(&out_obs.w_hessian)
-                    .expect("dl w_hessian (observed)");
-                let ge_obs = stream
-                    .clone_dtoh(&out_obs.grad_eta)
-                    .expect("dl grad_eta (observed)");
-
-                for i in 0..N {
-                    let cpu = row_reweight_cpu(
-                        family,
-                        CurvatureMode::Observed,
-                        RowInput {
-                            eta: etas[i],
-                            y: ys[i],
-                            prior_weight: priors[i],
-                        },
-                        1.0,
-                    );
-
-                    // H diagonal (w_hessian) parity.
-                    let h_got = wh_obs[i];
-                    let h_exp = cpu.w_hessian;
-                    let h_abs = (h_got - h_exp).abs();
-                    let h_rel = if h_exp.abs() > 0.0 {
-                        h_abs / h_exp.abs()
-                    } else {
-                        h_abs
-                    };
-                    assert!(
-                        h_abs <= TOL || h_rel <= TOL,
-                        "{family:?} row {i} (eta={}, y={}, wp={}): \
-                         observed w_hessian GPU={} vs CPU={} (abs={}, rel={})",
-                        etas[i],
-                        ys[i],
-                        priors[i],
-                        h_got,
-                        h_exp,
-                        h_abs,
-                        h_rel,
-                    );
-
-                    // Gradient (grad_eta) parity — the score does not
-                    // depend on curvature mode, but the CPU oracle here
-                    // is exercised under `Observed` for full
-                    // end-to-end coverage.
-                    let g_got = ge_obs[i];
-                    let g_exp = cpu.grad_eta;
-                    let g_abs = (g_got - g_exp).abs();
-                    let g_rel = if g_exp.abs() > 0.0 {
-                        g_abs / g_exp.abs()
-                    } else {
-                        g_abs
-                    };
-                    assert!(
-                        g_abs <= TOL || g_rel <= TOL,
-                        "{family:?} row {i} (eta={}, y={}, wp={}): \
-                         observed grad_eta GPU={} vs CPU={} (abs={}, rel={})",
-                        etas[i],
-                        ys[i],
-                        priors[i],
-                        g_got,
-                        g_exp,
-                        g_abs,
-                        g_rel,
-                    );
-                }
-            }
-        }
-    }
-
-    /// Task #51 — Stage 6 Level B end-to-end NVRTC JIT parity. For
-    /// each of the 6 supported families we hand-author a raw CUDA
-    /// body that re-derives the family math from scratch (distinct
-    /// variable names + restructured statement order from the
-    /// built-in `*_body` strings), JIT-compile via `JitFamilySpec::raw`
-    /// through the full `launch_row_reweight_jit_on_stream` pipeline,
-    /// and assert all 8 outputs match the CPU `row_reweight_cpu`
-    /// oracle to ≤ 1e-10 on n=1000 rows. Skipped if no CUDA runtime;
-    /// `#[ignore]` so v100-bench-runner picks it up via `--ignored`.
-    #[test]
-    fn gpu_jit_level_b_raw_body_end_to_end_all_families_n1000() {
-        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
-            eprintln!(
-                "[gpu_jit_level_b_raw_body_end_to_end_all_families_n1000] no CUDA runtime — skipping"
-            );
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            const N: usize = 1000;
-            const TOL: f64 = 1.0e-10;
-            let curvature = CurvatureMode::Fisher;
-
-            let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let stream = gam_gpu::backend_probe::probe_cuda_backend("pirls_row")
-                .expect("shared backend probe")
-                .stream;
-
-            // η grid + per-family in-domain response vectors. Mirrors
-            // `gpu_observed_parity_end_to_end_n1000` so the two tests
-            // exercise the same numerical regime through different code
-            // paths (built-in module vs JIT raw body).
-            let etas: Vec<f64> = (0..N)
-                .map(|i| -6.0 + 12.0 * (i as f64) / ((N - 1) as f64))
-                .collect();
-            let priors: Vec<f64> = (0..N)
-                .map(|i| 0.25 + 1.75 * ((i as f64) / (N as f64)))
-                .collect();
-
-            // Hand-authored raw bodies — re-derived from the math, not
-            // copy-pasted from `*_body()`. Helpers (`clamp_eta`,
-            // `std_norm_cdf`, `std_norm_pdf`, `bernoulli_deviance`,
-            // `bernoulli_z`) are provided by `COMMON_DEVICE_PROLOG`.
-            let raw_gaussian = r#"    // raw-body gaussian identity (independent re-derivation)
-    double resp = y_i;
-    double pred = eta_i;
-    double mu = pred;
-    double w_p = wp;
-    double e_resid = resp - pred;
-    double grad_eta = w_p * e_resid;
-    double w_fisher = w_p;
-    double w_hessian = w_p;
-    double w_solver = (w_p > 0.0) ? fmax(w_p, 1e-12) : 0.0;
-    double z_f = resp;
-    double z_h = resp;
-    double dev = w_p * e_resid * e_resid;
-"#;
-
-            let raw_poisson = r#"    // raw-body poisson log (independent re-derivation)
-    double eta_c = clamp_eta(eta_i, &flags);
-    double mu_pre = exp(eta_c);
-    if (mu_pre < 1e-10) flags |= 0x2u;
-    double mu = (mu_pre > 1e-10) ? mu_pre : 1e-10;
-    double wrate = wp * mu;
-    double w_fisher = (wrate > 0.0) ? fmax(wrate, 1e-12) : 0.0;
-    double w_hessian = w_fisher;
-    double w_solver = w_fisher;
-    double pres = y_i - mu;
-    double grad_eta = wp * pres;
-    double z_lin = eta_c + pres / mu;
-    double z_f = z_lin;
-    double z_h = z_lin;
-    double dterm;
-    if (y_i > 0.0) {
-        dterm = y_i * log(y_i / mu) - pres;
-    } else {
-        dterm = -pres;
-    }
-    double dev = 2.0 * wp * dterm;
-    if (!(isfinite(y_i) && y_i >= 0.0)) flags |= 0x8u;
-"#;
-
-            let raw_gamma = r#"    // raw-body gamma log (independent re-derivation; unit shape)
-    double k_shape = 1.0;
-    double eta_c = clamp_eta(eta_i, &flags);
-    double mu_pre = exp(eta_c);
-    if (mu_pre < 1e-10) flags |= 0x2u;
-    double mu = (mu_pre > 1e-10) ? mu_pre : 1e-10;
-    double w_fisher = wp * k_shape;
-    double w_hessian = w_fisher;
-    double w_solver = (w_hessian > 0.0) ? fmax(w_hessian, 1e-12) : 0.0;
-    double pres = y_i - mu;
-    double grad_eta = wp * pres / mu;
-    double z_lin = eta_c + pres / mu;
-    double z_f = z_lin;
-    double z_h = z_lin;
-    double dev;
-    if (y_i > 0.0) {
-        dev = 2.0 * wp * (-log(y_i / mu) + pres / mu);
-    } else {
-        dev = 1.0 / 0.0;
-    }
-    if (!(isfinite(y_i) && y_i > 0.0)) flags |= 0x8u;
-"#;
-
-            let raw_logit = r#"    // raw-body bernoulli logit (independent re-derivation)
-    double eta_c = clamp_eta(eta_i, &flags);
-    double te = tanh(0.5 * eta_c);
-    double mu_pre = 0.5 * (1.0 + te);
-    if (mu_pre < 1e-12 || mu_pre > 1.0 - 1e-12) flags |= 0x2u;
-    double mu = fmin(fmax(mu_pre, 1e-12), 1.0 - 1e-12);
-    double dmu_deta = mu * (1.0 - mu);
-    double w_fisher = wp * dmu_deta;
-    double w_hessian = w_fisher;
-    double w_solver = (w_fisher > 0.0) ? fmax(w_fisher, 1e-12) : 0.0;
-    double bres = y_i - mu;
-    double grad_eta = wp * bres;
-    double dev = bernoulli_deviance(y_i, mu, wp);
-    double z_lin = bernoulli_z(eta_c, y_i, mu, dmu_deta);
-    double z_f = z_lin;
-    double z_h = z_lin;
-    if (!(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0)) flags |= 0x8u;
-"#;
-
-            let raw_probit = r#"    // raw-body bernoulli probit (independent re-derivation; Fisher mode)
-    double eta_c = clamp_eta(eta_i, &flags);
-    double mu_pre = std_norm_cdf(eta_c);
-    if (mu_pre < 1e-12 || mu_pre > 1.0 - 1e-12) flags |= 0x2u;
-    double mu = fmin(fmax(mu_pre, 1e-12), 1.0 - 1e-12);
-    double phi = std_norm_pdf(eta_c);
-    double dmu_deta = phi;
-    double vmu = mu * (1.0 - mu);
-    double w_pp = (vmu > 0.0) ? (phi * phi) / vmu : 0.0;
-    double w_fisher = wp * w_pp;
-    double w_hessian = w_fisher;
-    double w_solver = (w_hessian > 0.0) ? fmax(w_hessian, 1e-12) : 0.0;
-    double bres = y_i - mu;
-    double grad_eta = (vmu > 0.0) ? wp * bres * phi / vmu : 0.0;
-    double dev = bernoulli_deviance(y_i, mu, wp);
-    double z_lin = bernoulli_z(eta_c, y_i, mu, dmu_deta);
-    double z_f = z_lin;
-    double z_h = z_lin;
-    if (!(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0)) flags |= 0x8u;
-"#;
-
-            let raw_cloglog = r#"    // raw-body bernoulli cloglog (independent re-derivation; Fisher mode)
-    double eta_c = clamp_eta(eta_i, &flags);
-    double a = exp(eta_c);
-    double mu_pre = 1.0 - exp(-a);
-    if (mu_pre < 1e-12 || mu_pre > 1.0 - 1e-12) flags |= 0x2u;
-    double mu = fmin(fmax(mu_pre, 1e-12), 1.0 - 1e-12);
-    double dmu_deta = a * (1.0 - mu_pre);
-    double vmu = mu * (1.0 - mu);
-    double w_pp = (vmu > 0.0) ? (dmu_deta * dmu_deta) / vmu : 0.0;
-    double w_fisher = wp * w_pp;
-    double w_hessian = w_fisher;
-    double w_solver = (w_hessian > 0.0) ? fmax(w_hessian, 1e-12) : 0.0;
-    double bres = y_i - mu;
-    double grad_eta = (vmu > 0.0) ? wp * bres * dmu_deta / vmu : 0.0;
-    double dev = bernoulli_deviance(y_i, mu, wp);
-    double z_lin = bernoulli_z(eta_c, y_i, mu, dmu_deta);
-    double z_f = z_lin;
-    double z_h = z_lin;
-    if (!(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0)) flags |= 0x8u;
-"#;
-
-            // (family, raw_body, distinct spec_id, y vector builder).
-            // spec_ids are disjoint 64-bit tags so the JIT module cache
-            // creates one fresh module per family.
-            let cases: [(PirlsRowFamily, &str, u64, fn(usize) -> Vec<f64>); 6] = [
-                (
-                    PirlsRowFamily::GaussianIdentity,
-                    raw_gaussian,
-                    0x5242_3031_4741_5553u64,
-                    |n| {
-                        (0..n)
-                            .map(|i| -3.0 + 6.0 * (i as f64) / ((n - 1) as f64))
-                            .collect()
-                    },
-                ),
-                (
-                    PirlsRowFamily::PoissonLog,
-                    raw_poisson,
-                    0x5242_3032_504f_4953u64,
-                    |n| (0..n).map(|i| (i % 11) as f64).collect(),
-                ),
-                (
-                    PirlsRowFamily::GammaLog,
-                    raw_gamma,
-                    0x5242_3033_474d_414cu64,
-                    |n| (0..n).map(|i| 0.10 + 0.05 * ((i % 97) as f64)).collect(),
-                ),
-                (
-                    PirlsRowFamily::BernoulliLogit,
-                    raw_logit,
-                    0x5242_3034_4c47_4954u64,
-                    |n| (0..n).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 }).collect(),
-                ),
-                (
-                    PirlsRowFamily::BernoulliProbit,
-                    raw_probit,
-                    0x5242_3035_5052_4254u64,
-                    |n| (0..n).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 }).collect(),
-                ),
-                (
-                    PirlsRowFamily::BernoulliCLogLog,
-                    raw_cloglog,
-                    0x5242_3036_434c_4f47u64,
-                    |n| (0..n).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 }).collect(),
-                ),
-            ];
-
-            for (family, raw_body, spec_id, build_y) in cases {
-                let ys: Vec<f64> = build_y(N);
-
-                let mut eta_dev = stream.alloc_zeros::<f64>(N).expect("eta");
-                let mut y_dev = stream.alloc_zeros::<f64>(N).expect("y");
-                let mut prior_dev = stream.alloc_zeros::<f64>(N).expect("prior");
-                stream.memcpy_htod(&etas, &mut eta_dev).expect("up eta");
-                stream.memcpy_htod(&ys, &mut y_dev).expect("up y");
-                stream
-                    .memcpy_htod(&priors, &mut prior_dev)
-                    .expect("up prior");
-
-                let spec = JitFamilySpec::raw(spec_id, raw_body);
-                let mut out_jit = RowOutputDevBuffers::allocate(&stream, N).expect("alloc jit out");
-                launch_row_reweight_jit_on_stream(
-                    backend,
-                    &spec,
-                    curvature,
-                    &stream,
-                    N,
-                    &eta_dev,
-                    &y_dev,
-                    &prior_dev,
-                    &mut out_jit,
-                )
-                .unwrap_or_else(|err| panic!("jit raw-body launch {family:?}: {err}"));
-                stream.synchronize().expect("sync");
-
-                let mu_j = stream.clone_dtoh(&out_jit.mu).expect("dl mu");
-                let ge_j = stream.clone_dtoh(&out_jit.grad_eta).expect("dl g");
-                let wf_j = stream.clone_dtoh(&out_jit.w_fisher).expect("dl wf");
-                let wh_j = stream.clone_dtoh(&out_jit.w_hessian).expect("dl wh");
-                let ws_j = stream.clone_dtoh(&out_jit.w_solver).expect("dl ws");
-                let zf_j = stream.clone_dtoh(&out_jit.z_fisher).expect("dl zf");
-                let zh_j = stream.clone_dtoh(&out_jit.z_hessian).expect("dl zh");
-                let dv_j = stream.clone_dtoh(&out_jit.deviance).expect("dl dv");
-
-                for i in 0..N {
-                    let cpu = row_reweight_cpu(
-                        family,
-                        curvature,
-                        RowInput {
-                            eta: etas[i],
-                            y: ys[i],
-                            prior_weight: priors[i],
-                        },
-                        1.0,
-                    );
-                    for (label, got, exp) in [
-                        ("mu", mu_j[i], cpu.mu),
-                        ("grad_eta", ge_j[i], cpu.grad_eta),
-                        ("w_fisher", wf_j[i], cpu.w_fisher),
-                        ("w_hessian", wh_j[i], cpu.w_hessian),
-                        ("w_solver", ws_j[i], cpu.w_solver),
-                        ("z_fisher", zf_j[i], cpu.z_fisher),
-                        ("z_hessian", zh_j[i], cpu.z_hessian),
-                        ("deviance", dv_j[i], cpu.deviance),
-                    ] {
-                        if !got.is_finite() && !exp.is_finite() {
-                            // Both NaN/inf is a parity match for the
-                            // gamma y=0 → +inf deviance branch.
-                            continue;
-                        }
-                        let abs_err = (got - exp).abs();
-                        let rel_err = if exp.abs() > 0.0 {
-                            abs_err / exp.abs()
-                        } else {
-                            abs_err
-                        };
-                        assert!(
-                            abs_err <= TOL || rel_err <= TOL,
-                            "{family:?} {label}[{i}] (eta={}, y={}, wp={}): \
-                             JIT raw-body={} vs CPU={} (abs={}, rel={})",
-                            etas[i],
-                            ys[i],
-                            priors[i],
-                            got,
-                            exp,
-                            abs_err,
-                            rel_err,
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
+#[path = "pirls_row_tests.rs"]
+mod pirls_row_tests;

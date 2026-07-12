@@ -124,7 +124,10 @@ pub(crate) fn logb_dlog_sigma_deta_preserves_negative_tail_precision() {
         logb_dlog_sigma_deta(sigma, d1) > 0.0,
         "d_sigma_deta / sigma must preserve the remaining tail derivative"
     );
-    assert_eq!(logb_dlog_sigma_deta(f64::INFINITY, f64::INFINITY), 1.0);
+    assert!(
+        logb_dlog_sigma_deta(f64::INFINITY, f64::INFINITY).is_nan(),
+        "an unrepresentable link must be certified by its caller, not projected to an analytic limit"
+    );
 }
 
 pub(crate) fn assert_rel_close(label: &str, actual: f64, expected: f64, tol: f64) {
@@ -3800,7 +3803,7 @@ pub(crate) fn gaussian_diagonal_log_sigma_block_uses_fisher_score_step_in_far_ta
         cached_row_scalars: std::sync::RwLock::new(None),
     };
     let eta_mu = array![0.0];
-    let eta_ls0 = 701.0_f64;
+    let eta_ls0 = 350.0_f64;
     let states_at = |eta_ls: f64| {
         vec![
             ParameterBlockState {
@@ -3825,7 +3828,7 @@ pub(crate) fn gaussian_diagonal_log_sigma_block_uses_fisher_score_step_in_far_ta
             // f64 precision and the IRLS step matches the pure-exp Fisher
             // step. Compute the expectation explicitly from the new link.
             let sigma = logb_sigma_from_eta_scalar(eta_ls0);
-            let inv_s2 = (sigma * sigma).recip();
+            let inv_s2 = sigma.recip() * sigma.recip();
             let dlog = logb_dlog_sigma_deta(sigma, logb_sigma_jet1_scalar(eta_ls0).d1);
             let residual = family.y[0] - eta_mu[0];
             let expected_score = family.weights[0] * (residual * residual * inv_s2 - 1.0) * dlog;
@@ -3863,7 +3866,7 @@ pub(crate) fn gaussian_diagonal_log_sigma_block_uses_fisher_score_step_in_far_ta
 }
 
 #[test]
-pub(crate) fn gaussian_exact_joint_path_stays_finite_in_exp_link_far_tail() {
+pub(crate) fn gaussian_exact_joint_path_refuses_unrepresentable_scale_atomically() {
     let mu_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]]));
     let log_sigma_design =
         DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]]));
@@ -3888,23 +3891,84 @@ pub(crate) fn gaussian_exact_joint_path_stays_finite_in_exp_link_far_tail() {
         },
     ];
 
-    let hessian = family
+    let err = family
         .exact_newton_joint_hessian(&states)
-        .expect("joint hessian")
-        .expect("expected Gaussian exact joint hessian");
+        .expect_err("overflowing Gaussian scale must be refused");
     assert!(
-        hessian.iter().all(|value| value.is_finite()),
-        "far-tail Gaussian exact Hessian should stay finite; got {hessian:?}"
+        err.contains("row 0") && err.contains("Gaussian scale link"),
+        "typed row refusal should identify the first row and quantity: {err}"
     );
+}
 
-    let direction = array![0.25, -0.5];
-    let dh = family
-        .exact_newton_joint_hessian_directional_derivative(&states, &direction)
-        .expect("joint dH")
-        .expect("expected Gaussian exact joint hessian directional derivative");
+#[test]
+pub(crate) fn gaussian_diagonal_geometry_preserves_representable_tiny_fisher_weights() {
+    let family = GaussianLocationScaleFamily {
+        y: array![0.0, 0.0],
+        weights: array![1.0, 1.0],
+        mu_design: None,
+        log_sigma_design: None,
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
+        cached_row_scalars: std::sync::RwLock::new(None),
+    };
+    let states = vec![
+        ParameterBlockState {
+            beta: Array1::zeros(0),
+            eta: array![0.0, 0.0],
+        },
+        ParameterBlockState {
+            beta: Array1::zeros(0),
+            eta: array![200.0, -20.0],
+        },
+    ];
+    let eval = family.evaluate(&states).expect("representable tiny geometry");
+    let location = match &eval.blockworking_sets[GaussianLocationScaleFamily::BLOCK_MU] {
+        BlockWorkingSet::Diagonal {
+            working_weights, ..
+        } => working_weights,
+        _ => panic!("expected diagonal location block"),
+    };
+    let scale = match &eval.blockworking_sets[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA] {
+        BlockWorkingSet::Diagonal {
+            working_weights, ..
+        } => working_weights,
+        _ => panic!("expected diagonal scale block"),
+    };
+    assert!(location[0] > 0.0 && location[0] < 1.0e-12);
+    assert!(scale[1] > 0.0 && scale[1] < 1.0e-12);
+    let sigma0 = logb_sigma_from_eta_scalar(200.0);
+    let expected_location = sigma0.recip() * sigma0.recip();
+    assert_eq!(location[0].to_bits(), expected_location.to_bits());
+    let jet1 = logb_sigma_jet1_scalar(-20.0);
+    let kappa1 = jet1.d1 / jet1.sigma;
+    assert_eq!(scale[1].to_bits(), (2.0 * kappa1 * kappa1).to_bits());
+}
+
+#[test]
+pub(crate) fn gaussian_batch_certification_reports_smallest_unrepresentable_row() {
+    let family = GaussianLocationScaleFamily {
+        y: Array1::zeros(3),
+        weights: Array1::ones(3),
+        mu_design: None,
+        log_sigma_design: None,
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
+        cached_row_scalars: std::sync::RwLock::new(None),
+    };
+    let states = vec![
+        ParameterBlockState {
+            beta: Array1::zeros(0),
+            eta: Array1::zeros(3),
+        },
+        ParameterBlockState {
+            beta: Array1::zeros(0),
+            eta: array![0.0, -400.0, 710.0],
+        },
+    ];
+    let err = family
+        .evaluate(&states)
+        .expect_err("unrepresentable row geometry must be refused");
     assert!(
-        dh.iter().all(|value| value.is_finite()),
-        "far-tail Gaussian exact Hessian directional derivative should stay finite; got {dh:?}"
+        err.contains("row 1") && err.contains("log-scale Fisher information"),
+        "parallel certification must report the smallest failing row: {err}"
     );
 }
 
@@ -3934,11 +3998,11 @@ pub(crate) fn gaussian_location_scale_hotloop_optimized_matches_legacy_and_is_fa
                 wmu[i] = 0.0;
                 zmu[i] = mu[i];
             } else {
-                wmu[i] = floor_positiveweight(w * inv_s2, MIN_WEIGHT);
+                wmu[i] = w * inv_s2;
                 zmu[i] = mu[i] + r;
             }
             let dlogsigma_du = logb_dlog_sigma_deta(sigma, d1);
-            let info_u = floor_positiveweight(2.0 * w * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
+            let info_u = 2.0 * w * dlogsigma_du * dlogsigma_du;
             if info_u == 0.0 {
                 wls[i] = 0.0;
                 zls[i] = eta;
@@ -3968,11 +4032,11 @@ pub(crate) fn gaussian_location_scale_hotloop_optimized_matches_legacy_and_is_fa
                 wmu[i] = 0.0;
                 zmu[i] = mu[i];
             } else {
-                wmu[i] = floor_positiveweight(w * inv_s2, MIN_WEIGHT);
+                wmu[i] = w * inv_s2;
                 zmu[i] = mu[i] + r;
             }
             let dlogsigma_du = logb_dlog_sigma_deta(sigma, d1);
-            let info_u = floor_positiveweight(2.0 * w * dlogsigma_du * dlogsigma_du, MIN_WEIGHT);
+            let info_u = 2.0 * w * dlogsigma_du * dlogsigma_du;
             if info_u == 0.0 {
                 wls[i] = 0.0;
                 zls[i] = eta;

@@ -192,8 +192,11 @@ pub fn fit_tiered(
     // (`certified` + residuals) so callers see exactly which invariants closed. Real
     // failures (validation, polar, routing) still propagate. When the frame fixed
     // point DID certify this is identical to the historical certified path.
-    let tier1 =
-        fit_block_sparse_dictionary_best_effort_with_seed(r0_f32.view(), &config.tier1, seed_policy)?;
+    let tier1 = fit_block_sparse_dictionary_best_effort_with_seed(
+        r0_f32.view(),
+        &config.tier1,
+        seed_policy,
+    )?;
 
     let mut ledger = SaeMigrationLedger::new();
 
@@ -372,8 +375,7 @@ mod fit_tests {
             !report.tier1.convergence.certified,
             "K ≫ rank fit must carry an OPEN certificate; got certified=true \
              (frame_residual={}, tol={})",
-            report.tier1.convergence.frame_residual,
-            report.tier1.convergence.tolerance
+            report.tier1.convergence.frame_residual, report.tier1.convergence.tolerance
         );
         assert!(
             report.tier1.convergence.frame_residual > report.tier1.convergence.tolerance,
@@ -409,9 +411,9 @@ mod fit_tests {
     #[test]
     fn block_best_effort_recovers_the_open_fit_the_err_contract_rejects_2275() {
         use crate::sparse_dict::{
+            BlockSeedPolicy, BlockSparseConfig, BlockSparseFitError,
             fit_block_sparse_dictionary_best_effort_with_seed,
-            fit_block_sparse_dictionary_with_seed, BlockSeedPolicy, BlockSparseConfig,
-            BlockSparseFitError,
+            fit_block_sparse_dictionary_with_seed,
         };
         let n = 96usize;
         let p = 8usize;
@@ -444,7 +446,11 @@ mod fit_tests {
             "best-effort fit at K ≫ rank must be certified=false"
         );
         match err {
-            BlockSparseFitError::NonConvergence { frame_residual, tolerance, .. } => {
+            BlockSparseFitError::NonConvergence {
+                frame_residual,
+                tolerance,
+                ..
+            } => {
                 assert_eq!(
                     tolerance, best.convergence.tolerance,
                     "both entries measure against the same (unsoftened) tolerance"
@@ -534,9 +540,7 @@ mod fit_tests {
         // Small geometry (well under the 1e9-op budget) → farthest-point.
         let small = TieredFitConfig::linear_bulk(8, 2);
         assert_eq!(
-            small
-                .tier1_seed
-                .resolve(240, 16, &small.tier1),
+            small.tier1_seed.resolve(240, 16, &small.tier1),
             BlockSeedPolicy::FarthestPoint,
             "small-K tiered fit must keep the data-aware seed"
         );

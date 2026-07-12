@@ -2090,16 +2090,16 @@ extern "C" __global__ void status_first_ladder(
     ///
     /// Three row-kernel modes occupy separate device buffers:
     /// - `row_solve`: solve-row (4 fields), refreshed each Newton iteration.
-    /// - `alpha_ladder`: candidate-objective (objective[7] + status[7]).
-    /// - `row_final`: final-row (9 fields), written once at convergence.
+    /// - `alpha_ladder`: candidate-objective (objective[7] + status[7*n]).
+    /// - `row_final`: five numerical fields + status, written once at convergence.
     pub struct PirlsLoopWorkspace {
         pub beta_dev: CudaSlice<f64>,
         pub eta_dev: CudaSlice<f64>,
         /// Solve-row buffers: `grad_eta`, `w_solver`, `deviance`, `status`.
         pub row_solve: crate::gpu_kernels::pirls_row::SolveRowBuffers,
-        /// Alpha-ladder buffers: `objective[7]`, `status[7]`.
+        /// Alpha-ladder buffers: `objective[7]`, alpha-major `status[7*n]`.
         pub alpha_ladder: crate::gpu_kernels::pirls_row::AlphaLadderDevBuffers,
-        /// Full final-row buffers: all 9 fields, written once at convergence.
+        /// Full production final-row buffers, written once at convergence.
         pub row_final: crate::gpu_kernels::pirls_row::RowOutputDevBuffers,
         pub direction_dev: CudaSlice<f64>,
         pub xd_dev: CudaSlice<f64>,
@@ -2399,11 +2399,7 @@ extern "C" __global__ void status_first_ladder(
         }
 
         if linear_shift.len() != p {
-            return Err(format!(
-                "linear_shift length {} ≠ p={p}",
-                linear_shift.len()
-            )
-            .into());
+            return Err(format!("linear_shift length {} ≠ p={p}", linear_shift.len()).into());
         }
         if penalty_hessian.dim() != (p, p) {
             return Err(format!(
@@ -2660,10 +2656,7 @@ extern "C" __global__ void status_first_ladder(
                 // direction) must still be accepted so the line
                 // search does not spuriously exhaust at a
                 // stationary point.
-                if candidate_refusals[k].is_none()
-                    && obj_k.is_finite()
-                    && obj_k <= prev_objective
-                {
+                if candidate_refusals[k].is_none() && obj_k.is_finite() && obj_k <= prev_objective {
                     alpha = a;
                     accepted_dev = dev_k;
                     accepted_objective = obj_k;
@@ -2687,10 +2680,8 @@ extern "C" __global__ void status_first_ladder(
                         .stream
                         .clone_dtoh(&shared.y_dev)
                         .map_err(|error| format!("ladder refusal response download: {error}"))?;
-                    let prior_host = ws
-                        .stream
-                        .clone_dtoh(&shared.prior_w_dev)
-                        .map_err(|error| {
+                    let prior_host =
+                        ws.stream.clone_dtoh(&shared.prior_w_dev).map_err(|error| {
                             format!("ladder refusal prior-weight download: {error}")
                         })?;
                     let trial_eta = eta_host[row]
@@ -3012,7 +3003,7 @@ extern "C" __global__ void status_first_ladder(
                         &final_eta,
                         ext.priorweights,
                     )
-                    .map_err(|e| format!("pirls postpass dmu/deta: {e:?}"))?;
+                    .map_err(PirlsGpuLoopError::Geometry)?;
 
                 let (finalweights, solve_c_array, solve_d_array) = match ext.exported_curvature {
                     crate::pirls::HessianCurvatureKind::Observed => {
@@ -3024,7 +3015,7 @@ extern "C" __global__ void status_first_ladder(
                             &final_w_solver,
                             ext.priorweights,
                         )
-                        .map_err(|e| format!("pirls postpass observed curvature: {e:?}"))?
+                        .map_err(PirlsGpuLoopError::Geometry)?
                     }
                     crate::pirls::HessianCurvatureKind::Fisher => {
                         (final_w_solver.clone(), score_c.clone(), score_d.clone())
@@ -3275,11 +3266,7 @@ extern "C" __global__ void status_first_ladder(
         const THREADS: u32 = 1024;
         let n_i = to_i32(n)?;
         let cfg = LaunchConfig {
-            grid_dim: (
-                crate::gpu_kernels::pirls_row::ALPHA_LADDER_LEN as u32,
-                1,
-                1,
-            ),
+            grid_dim: (crate::gpu_kernels::pirls_row::ALPHA_LADDER_LEN as u32, 1, 1),
             block_dim: (THREADS, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -3354,14 +3341,8 @@ extern "C" __global__ void status_first_ladder(
         n: usize,
         label: &'static str,
     ) -> Result<(), PirlsGpuLoopError> {
-        let Some((row, code)) = reduce_status_first(
-            stream,
-            status_first_func,
-            status,
-            n,
-            status_scratch,
-            label,
-        )?
+        let Some((row, code)) =
+            reduce_status_first(stream, status_first_func, status, n, status_scratch, label)?
         else {
             return Ok(());
         };
@@ -4038,7 +4019,8 @@ mod stream_device_parity_tests {
                         prior_weight: prior_w[i],
                     },
                     1.0,
-                );
+                )
+                .expect("CPU PIRLS benchmark row must be representable");
                 w[i] = out.w_solver;
                 g[i] = out.grad_eta;
             }

@@ -72,8 +72,7 @@ pub use block_spec::{
 };
 pub use coefficient_prior_mean::{CoefficientPriorMean, PriorMeanError};
 pub use custom_family_blockwise::{
-    CUSTOM_FAMILY_RIDGE_FLOOR, CUSTOM_FAMILY_WEIGHT_FLOOR, ExactNewtonOuterCurvature,
-    validate_blockspec_consistency,
+    CUSTOM_FAMILY_RIDGE_FLOOR, ExactNewtonOuterCurvature, validate_blockspec_consistency,
 };
 pub use custom_family_error::CustomFamilyError;
 pub use dispersion::Dispersion;

@@ -1003,7 +1003,10 @@ fn farthest_point_seeded_entry_matches_default_byte_for_byte() {
         default_fit.decoder, seeded_fit.decoder,
         "the default entry must be byte-identical to the FarthestPoint seeded entry"
     );
-    assert_eq!(default_fit.explained_variance, seeded_fit.explained_variance);
+    assert_eq!(
+        default_fit.explained_variance,
+        seeded_fit.explained_variance
+    );
     assert_eq!(default_fit.epochs, seeded_fit.epochs);
 }
 

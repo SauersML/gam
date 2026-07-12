@@ -366,10 +366,7 @@ fn reactive_entry_reseeds_nonzero_k2_seed_to_strict_separated_root_2080() {
     let entry_eval_result =
         OuterObjective::eval_with_order(&mut objective, &entry_rho, OuterEvalOrder::Value);
     if let Err(error) = &entry_eval_result {
-        let entry_rho_state = objective
-            .baseline_rho
-            .from_flat(entry_rho.view())
-            .unwrap();
+        let entry_rho_state = objective.baseline_rho.from_flat(entry_rho.view()).unwrap();
         let system = objective
             .term
             .assemble_arrow_schur(z.view(), &entry_rho_state, None)
@@ -1261,7 +1258,14 @@ fn value_lane_prices_at_shared_fixed_point_2228() {
     let v_false = {
         let mut t = term.clone();
         t.penalized_quasi_laplace_criterion_with_cache_refine_policy(
-            z.view(), &rho, None, imi, lr, re, rb, false,
+            z.view(),
+            &rho,
+            None,
+            imi,
+            lr,
+            re,
+            rb,
+            false,
         )
         .expect("coarse-budget bare criterion evaluates")
         .0

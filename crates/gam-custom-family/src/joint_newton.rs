@@ -1548,8 +1548,8 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
                 working_response: _,
                 working_weights,
             } => with_block_geometry(family, states, spec, b, |x_dyn, _| {
-                let w = floor_positiveworking_weights(working_weights, options.minweight)?;
-                let (xtwx, _) = weighted_normal_equations(x_dyn, &w, None)?;
+                let w = certify_finite_working_weights(working_weights)?;
+                let (xtwx, _) = weighted_normal_equations(x_dyn, w, None)?;
                 Ok(xtwx)
             })?,
             BlockWorkingSet::ExactNewton {

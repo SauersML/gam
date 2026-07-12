@@ -211,8 +211,7 @@ impl SaeManifoldTerm {
         // (converged weights) is installed on the term at the end.
         let range_layout = CrosscoderLayout::from_blocks(px, blocks);
         let dims: Vec<usize> = range_layout.block_dims().to_vec();
-        let mut cur_log_lambda: Vec<f64> =
-            blocks.iter().map(OutputBlock::log_lambda).collect();
+        let mut cur_log_lambda: Vec<f64> = blocks.iter().map(OutputBlock::log_lambda).collect();
         let mut trajectories: Vec<Vec<f64>> = vec![Vec::with_capacity(max_sweeps); blocks.len()];
         let mut identifiable = vec![true; blocks.len()];
         let mut converged = false;
@@ -399,115 +398,115 @@ impl SaeManifoldTerm {
             // otherwise non-contractive (fit, λ-update) alternation monotone. The
             // trial threads `(trial_ll, trial_loss)` through the payload.
             let accepted_step = {
-            let mut trial =
-                |s: f64| -> Result<Option<(f64, (Vec<f64>, SaeManifoldLoss))>, String> {
-                    let mut trial_ll = cur_log_lambda.clone();
-                    for idx in 0..blocks.len() {
-                        if identifiable[idx] {
-                            trial_ll[idx] = cur_log_lambda[idx]
-                                + s * (log_lambda_star[idx] - cur_log_lambda[idx]);
-                        }
-                    }
-                    for idx in 0..blocks.len() {
-                        blocks[idx] = blocks[idx].with_log_lambda(trial_ll[idx])?;
-                    }
-                    self.fit_state_restore(&base)?;
-                    // EXACT warm-start reparameterization: the stacked target's block
-                    // columns are `√λ_ℓ·Y_ℓ`, and quadratic β-penalties are scale-
-                    // equivariant (`min_β ‖√λ·y − Φβ‖² + βᵀSβ` maps to
-                    // `λ(‖y − Φb‖² + bᵀSb)` under `β = √λ·b`), so the incumbent fit at
-                    // `λ_cur` maps to the EXACT incumbent at `λ_trial` by scaling each
-                    // behavior block's decoder columns by `√(λ_trial/λ_cur)` (valid
-                    // for a step of EITHER sign). Without this rescale every trial
-                    // starts with a spurious scaled-residual `(√λ_t − √λ_c)²·‖Ŷ‖²`
-                    // that the TRUNCATED inner solve must burn its iteration budget
-                    // removing — which biases the comparison against exactly the
-                    // large closed-form λ jumps the fixed point needs from a distant
-                    // start (the from-0.0 20-sweep-exhaustion failure of
-                    // `reml_selects_lambda_y…`). The rescaled state is the same fit in
-                    // the new parameterization, so this changes no fixed point — it
-                    // only stops the search from paying an artificial re-fitting tax
-                    // proportional to the step.
-                    for idx in 0..blocks.len() {
-                        let scale = (0.5 * (trial_ll[idx] - cur_log_lambda[idx])).exp();
-                        if scale != 1.0 {
-                            let range = range_layout.block_range(idx);
-                            for atom in &mut self.atoms {
-                                let mut cols =
-                                    atom.decoder_coefficients.slice_mut(s![.., range.clone()]);
-                                cols.mapv_inplace(|v| v * scale);
+                let mut trial =
+                    |s: f64| -> Result<Option<(f64, (Vec<f64>, SaeManifoldLoss))>, String> {
+                        let mut trial_ll = cur_log_lambda.clone();
+                        for idx in 0..blocks.len() {
+                            if identifiable[idx] {
+                                trial_ll[idx] = cur_log_lambda[idx]
+                                    + s * (log_lambda_star[idx] - cur_log_lambda[idx]);
                             }
                         }
-                    }
-                    let aug = stack_augmented_target(anchor, blocks)?;
-                    let trial_loss = self.run_joint_fit_arrow_schur(
-                        aug.view(),
-                        rho,
-                        analytic_penalties,
-                        inner_max_iter,
-                        step_size,
-                        ridge_ext_coord,
-                        ridge_beta,
-                    )?;
-                    let (trx, trb_scaled) =
-                        self.augmented_block_rss(aug.view(), rho, &range_layout)?;
-                    let trb_unscaled: Vec<f64> = (0..blocks.len())
-                        .map(|i| trb_scaled[i] / trial_ll[i].exp())
-                        .collect();
-                    // The trial's OWN realized penalty energy `P` at its λ-trial
-                    // fitted state (same `2·(penalized_objective_total − data_fit)`
-                    // as the baseline). This is NOT an envelope correction (the
-                    // envelope is broken; see the note above) — it simply makes both
-                    // sides of the comparison price their fitted-state penalty the
-                    // same way, so `trial_crit` and `baseline_crit` are the SAME
-                    // profiled criterion read at two λ's.
-                    let trial_pen = 2.0
-                        * (self.penalized_objective_total(
+                        for idx in 0..blocks.len() {
+                            blocks[idx] = blocks[idx].with_log_lambda(trial_ll[idx])?;
+                        }
+                        self.fit_state_restore(&base)?;
+                        // EXACT warm-start reparameterization: the stacked target's block
+                        // columns are `√λ_ℓ·Y_ℓ`, and quadratic β-penalties are scale-
+                        // equivariant (`min_β ‖√λ·y − Φβ‖² + βᵀSβ` maps to
+                        // `λ(‖y − Φb‖² + bᵀSb)` under `β = √λ·b`), so the incumbent fit at
+                        // `λ_cur` maps to the EXACT incumbent at `λ_trial` by scaling each
+                        // behavior block's decoder columns by `√(λ_trial/λ_cur)` (valid
+                        // for a step of EITHER sign). Without this rescale every trial
+                        // starts with a spurious scaled-residual `(√λ_t − √λ_c)²·‖Ŷ‖²`
+                        // that the TRUNCATED inner solve must burn its iteration budget
+                        // removing — which biases the comparison against exactly the
+                        // large closed-form λ jumps the fixed point needs from a distant
+                        // start (the from-0.0 20-sweep-exhaustion failure of
+                        // `reml_selects_lambda_y…`). The rescaled state is the same fit in
+                        // the new parameterization, so this changes no fixed point — it
+                        // only stops the search from paying an artificial re-fitting tax
+                        // proportional to the step.
+                        for idx in 0..blocks.len() {
+                            let scale = (0.5 * (trial_ll[idx] - cur_log_lambda[idx])).exp();
+                            if scale != 1.0 {
+                                let range = range_layout.block_range(idx);
+                                for atom in &mut self.atoms {
+                                    let mut cols =
+                                        atom.decoder_coefficients.slice_mut(s![.., range.clone()]);
+                                    cols.mapv_inplace(|v| v * scale);
+                                }
+                            }
+                        }
+                        let aug = stack_augmented_target(anchor, blocks)?;
+                        let trial_loss = self.run_joint_fit_arrow_schur(
                             aug.view(),
                             rho,
                             analytic_penalties,
-                            1.0,
-                        )? - trial_loss.data_fit);
-                    let trial_crit = profiled_penalized_quasi_laplace_criterion(
-                        n_obs,
-                        px,
-                        trx,
-                        &trb_unscaled,
-                        &dims,
-                        &trial_ll,
-                        trial_pen,
-                    )?;
-                    Ok(Some((trial_crit, (trial_ll, trial_loss))))
-                };
+                            inner_max_iter,
+                            step_size,
+                            ridge_ext_coord,
+                            ridge_beta,
+                        )?;
+                        let (trx, trb_scaled) =
+                            self.augmented_block_rss(aug.view(), rho, &range_layout)?;
+                        let trb_unscaled: Vec<f64> = (0..blocks.len())
+                            .map(|i| trb_scaled[i] / trial_ll[i].exp())
+                            .collect();
+                        // The trial's OWN realized penalty energy `P` at its λ-trial
+                        // fitted state (same `2·(penalized_objective_total − data_fit)`
+                        // as the baseline). This is NOT an envelope correction (the
+                        // envelope is broken; see the note above) — it simply makes both
+                        // sides of the comparison price their fitted-state penalty the
+                        // same way, so `trial_crit` and `baseline_crit` are the SAME
+                        // profiled criterion read at two λ's.
+                        let trial_pen = 2.0
+                            * (self.penalized_objective_total(
+                                aug.view(),
+                                rho,
+                                analytic_penalties,
+                                1.0,
+                            )? - trial_loss.data_fit);
+                        let trial_crit = profiled_penalized_quasi_laplace_criterion(
+                            n_obs,
+                            px,
+                            trx,
+                            &trb_unscaled,
+                            &dims,
+                            &trial_ll,
+                            trial_pen,
+                        )?;
+                        Ok(Some((trial_crit, (trial_ll, trial_loss))))
+                    };
 
-            // Backtrack along `+d` toward λ* (initial step 1.0, ×0.5 contraction);
-            // if no forward fraction descends the refit criterion, backtrack along
-            // `−d` away from λ* (initial step −1.0, contraction preserves the sign).
-            // The same trial closure serves both directions — `s` carries the sign.
-            // `accept` is the exact sufficient-decrease test
-            // `trial_crit < baseline_crit − armijo_eps`, direction-agnostic.
-            let forward = backtracking_line_search::<(Vec<f64>, SaeManifoldLoss), String>(
-                BacktrackConfig {
-                    initial_step: 1.0,
-                    contraction: 0.5,
-                    max_steps: MAX_BACKTRACK,
-                },
-                &mut trial,
-                |_s, trial_crit| trial_crit < baseline_crit - armijo_eps,
-            )?;
-            if forward.is_some() {
-                forward
-            } else {
-                backtracking_line_search::<(Vec<f64>, SaeManifoldLoss), String>(
+                // Backtrack along `+d` toward λ* (initial step 1.0, ×0.5 contraction);
+                // if no forward fraction descends the refit criterion, backtrack along
+                // `−d` away from λ* (initial step −1.0, contraction preserves the sign).
+                // The same trial closure serves both directions — `s` carries the sign.
+                // `accept` is the exact sufficient-decrease test
+                // `trial_crit < baseline_crit − armijo_eps`, direction-agnostic.
+                let forward = backtracking_line_search::<(Vec<f64>, SaeManifoldLoss), String>(
                     BacktrackConfig {
-                        initial_step: -1.0,
+                        initial_step: 1.0,
                         contraction: 0.5,
                         max_steps: MAX_BACKTRACK,
                     },
                     &mut trial,
                     |_s, trial_crit| trial_crit < baseline_crit - armijo_eps,
-                )?
-            }
+                )?;
+                if forward.is_some() {
+                    forward
+                } else {
+                    backtracking_line_search::<(Vec<f64>, SaeManifoldLoss), String>(
+                        BacktrackConfig {
+                            initial_step: -1.0,
+                            contraction: 0.5,
+                            max_steps: MAX_BACKTRACK,
+                        },
+                        &mut trial,
+                        |_s, trial_crit| trial_crit < baseline_crit - armijo_eps,
+                    )?
+                }
             };
 
             if let Some(step) = accepted_step {

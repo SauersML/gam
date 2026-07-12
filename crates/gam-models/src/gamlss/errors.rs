@@ -82,16 +82,6 @@ impl From<crate::block_layout::block_count::BlockCountMismatch> for GamlssError 
     }
 }
 
-/// Floor applied to a fitted smoothing parameter λ before `ln(λ)` is taken to
-/// seed an outer-loop `initial_log_lambdas` warm start. A pilot fit can return
-/// λ underflowed to exactly 0 for a deselected (effectively unpenalized) term;
-/// `ln(0) = -inf` would poison the seed, so we floor at the smallest λ that is
-/// still numerically distinguishable from zero in the log-domain rather than a
-/// modelling-meaningful value. `ln(1e-12) ≈ -27.6` sits well below any λ the
-/// outer optimizer would select, so a genuinely tiny pilot λ still seeds the
-/// search near its lower edge.
-pub(crate) const WARMSTART_LOG_LAMBDA_FLOOR: f64 = 1e-12;
-
 pub(crate) const EXACT_DENSE_BLOCK_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 pub(crate) const EXACT_DENSE_TOTAL_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
@@ -819,7 +809,7 @@ pub(crate) fn gaussian_log_sigma_irlsinfo_directional_derivative(
         }
         .into());
     }
-    let dw = scaled_signed_product3(2.0 * info, 1.0 - g, d_eta);
+    let dw = scaled_signed_product3(info, 2.0 * (1.0 - g), d_eta);
     if !dw.is_finite() {
         return Err(GamlssError::RowGeometryUnrepresentable {
             row,

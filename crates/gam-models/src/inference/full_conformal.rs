@@ -1038,7 +1038,8 @@ impl<'a> GaussianRemlRhoResponse<'a> {
         }
         let coef = (n_eff - m0) as f64;
         let r = self.rank_s as f64;
-        let lambda = rho.exp();
+        let lambda = gam_problem::checked_exp_log_strength(rho)
+            .map_err(|error| format!("gaussian REML conformal response: {error}"))?;
 
         // A(λ) = XᵀX + λ S [+ x_* x_*ᵀ].
         let mut a = self.xtx.clone();
@@ -1176,7 +1177,8 @@ impl<'a> GaussianRemlRhoResponse<'a> {
     /// (ρ-re-selecting) full-conformal map, computed exactly per candidate.
     pub fn honest_membership(&self, z: f64, alpha: f64) -> Result<bool, String> {
         let rho = self.select_rho(Some(z))?;
-        let lambda = rho.exp();
+        let lambda = gam_problem::checked_exp_log_strength(rho)
+            .map_err(|error| format!("gaussian REML conformal response: {error}"))?;
         let p = self.p;
         let mut a = self.xtx.clone();
         for i in 0..p {

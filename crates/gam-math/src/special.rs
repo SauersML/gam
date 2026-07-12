@@ -193,11 +193,7 @@ pub fn bessel_i0_centered_terms_from_log_abs(log_abs_eta: f64) -> (f64, f64, f64
     if log_abs_eta <= f64::MAX.ln() {
         return bessel_i0_centered_terms(log_abs_eta.exp());
     }
-    (
-        -0.5 * (std::f64::consts::TAU.ln() + log_abs_eta),
-        1.0,
-        -0.5,
-    )
+    (-0.5 * (std::f64::consts::TAU.ln() + log_abs_eta), 1.0, -0.5)
 }
 
 /// Overflow-free `(log I0(eta) - |eta|, I1(|eta|) / I0(|eta|))`.
@@ -290,10 +286,8 @@ mod tests {
             assert!((derivative - ratio).abs() <= 1.0e-6 + 1.0e-5 * ratio.abs());
 
             let log_step = 1.0e-5_f64;
-            let (centered_plus, _, _) =
-                bessel_i0_centered_terms(eta * log_step.exp());
-            let (centered_minus, _, _) =
-                bessel_i0_centered_terms(eta * (-log_step).exp());
+            let (centered_plus, _, _) = bessel_i0_centered_terms(eta * log_step.exp());
+            let (centered_minus, _, _) = bessel_i0_centered_terms(eta * (-log_step).exp());
             let finite_difference = (centered_plus - centered_minus) / (2.0 * log_step);
             assert!(
                 (finite_difference - scaled_derivative).abs() < 2.0e-5,
@@ -314,15 +308,11 @@ mod tests {
         assert_eq!(bessel_i0_centered_terms(0.0), (0.0, 0.0, 0.0));
 
         let log_eta = 1_200.0;
-        let (centered, ratio, scaled_derivative) =
-            bessel_i0_centered_terms_from_log_abs(log_eta);
+        let (centered, ratio, scaled_derivative) = bessel_i0_centered_terms_from_log_abs(log_eta);
         assert!(centered.is_finite());
         assert_eq!(ratio, 1.0);
         assert_eq!(scaled_derivative, -0.5);
-        assert_eq!(
-            centered,
-            -0.5 * (std::f64::consts::TAU.ln() + log_eta)
-        );
+        assert_eq!(centered, -0.5 * (std::f64::consts::TAU.ln() + log_eta));
     }
 
     #[test]

@@ -612,8 +612,8 @@ impl BehaviorBlock {
     pub fn with_log_lambda_y(&self, log_lambda_y: f64) -> Result<Self, String> {
         let lambda_y = gam_problem::checked_exp_log_strength(log_lambda_y)
             .map_err(|error| format!("BehaviorBlock::with_log_lambda_y: {error}"))?;
-        let sqrt_lambda_y = gam_problem::checked_exp_log_strength(0.5 * log_lambda_y)
-            .map_err(|error| {
+        let sqrt_lambda_y =
+            gam_problem::checked_exp_log_strength(0.5 * log_lambda_y).map_err(|error| {
                 format!("BehaviorBlock::with_log_lambda_y square-root strength: {error}")
             })?;
         let mut next = self.clone();
@@ -817,9 +817,10 @@ impl OutputBlock {
     pub fn with_log_lambda(&self, log_lambda: f64) -> Result<Self, String> {
         let lambda = gam_problem::checked_exp_log_strength(log_lambda)
             .map_err(|error| format!("OutputBlock::with_log_lambda: {error}"))?;
-        let sqrt_lambda = gam_problem::checked_exp_log_strength(0.5 * log_lambda).map_err(
-            |error| format!("OutputBlock::with_log_lambda square-root strength: {error}"),
-        )?;
+        let sqrt_lambda =
+            gam_problem::checked_exp_log_strength(0.5 * log_lambda).map_err(|error| {
+                format!("OutputBlock::with_log_lambda square-root strength: {error}")
+            })?;
         let mut next = self.clone();
         next.log_lambda = log_lambda;
         next.lambda = lambda;

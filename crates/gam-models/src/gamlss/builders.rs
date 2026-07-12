@@ -147,7 +147,25 @@ pub(crate) fn initial_log_lambdas_orzeros(
         }
         .into());
     }
+    gam_problem::validate_log_strengths(lambdas.iter().copied())
+        .map_err(|error| format!("initial_log_lambdas: {error}"))?;
     Ok(lambdas)
+}
+
+fn fitted_log_lambdas(
+    lambdas: &Array1<f64>,
+    context: &str,
+) -> Result<Array1<f64>, String> {
+    lambdas
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(coordinate, value)| {
+            gam_problem::checked_log_strength(value)
+                .map_err(|error| format!("{context} coordinate {coordinate}: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Array1::from_vec)
 }
 
 pub(crate) fn build_two_block_exact_joint_setup(
@@ -620,10 +638,17 @@ pub(crate) fn weighted_binomial_prevalence(
             }
             .into());
         }
-        let weight = floor_positiveweight(wi, MIN_WEIGHT);
-        if weight > 0.0 {
-            weight_sum += weight;
-            success_sum += weight * yi;
+        if !wi.is_finite() || wi < 0.0 {
+            return Err(GamlssError::InvalidInput {
+                reason: format!(
+                    "binomial location-scale warm start requires finite non-negative weights; weight={wi}"
+                ),
+            }
+            .into());
+        }
+        if wi > 0.0 {
+            weight_sum += wi;
+            success_sum += wi * yi;
         }
     }
     if !weight_sum.is_finite() || weight_sum <= 0.0 {
@@ -2819,11 +2844,10 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                         .map(crate::model_types::PenaltySpec::from_blockwise_ref)
                         .collect(),
                     nullspace_dims: vec![],
-                    initial_log_lambdas: Some(
-                        pilot_fit
-                            .lambdas
-                            .mapv(|v| v.max(WARMSTART_LOG_LAMBDA_FLOOR).ln()),
-                    ),
+                    initial_log_lambdas: Some(fitted_log_lambdas(
+                        &pilot_fit.lambdas,
+                        "binomial mean-wiggle pilot lambda",
+                    )?),
                     initial_beta: Some(pilot_fit.beta.clone()),
                 },
                 wiggle_block,
@@ -2886,11 +2910,10 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                     .map(crate::model_types::PenaltySpec::from_blockwise_ref)
                     .collect(),
                 nullspace_dims: vec![],
-                initial_log_lambdas: Some(
-                    pilot_fit
-                        .lambdas
-                        .mapv(|v| v.max(WARMSTART_LOG_LAMBDA_FLOOR).ln()),
-                ),
+                initial_log_lambdas: Some(fitted_log_lambdas(
+                    &pilot_fit.lambdas,
+                    "binomial mean-wiggle pilot lambda",
+                )?),
                 initial_beta: Some(pilot_fit.beta.clone()),
             },
             wiggle_block: wiggle_block.clone(),
@@ -2898,9 +2921,10 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         options,
     )?
     .0;
-    let baseline_log_lambdas = baseline_fit
-        .lambdas
-        .mapv(|v| v.max(WARMSTART_LOG_LAMBDA_FLOOR).ln());
+    let baseline_log_lambdas = fitted_log_lambdas(
+        &baseline_fit.lambdas,
+        "binomial mean-wiggle baseline lambda",
+    )?;
     if baseline_log_lambdas.len() != rho_dim {
         return Err(GamlssError::DimensionMismatch {
             reason: format!(

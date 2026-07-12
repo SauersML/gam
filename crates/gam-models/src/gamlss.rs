@@ -30,7 +30,6 @@
 //! [`binomial_q_derivs`], [`binomial_q_coeffs`], [`validation`],
 //! [`weighted_design_products`], [`row_linalg`], and [`joint_packing`].
 
-use gam_problem::MIN_WEIGHT;
 use gam_terms::basis::{BasisOptions, PenaltyInfo, PenaltySource};
 
 use crate::custom_family::{

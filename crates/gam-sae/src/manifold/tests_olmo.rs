@@ -1231,7 +1231,10 @@ fn planted_curve_oos_split() -> (Array2<f64>, Array2<f64>) {
         z
     };
     // Disjoint grids: train on the integer grid, test on the half-shifted grid.
-    (build(300, 0.0, 0x9E3779B97F4A7C15), build(200, 0.5, 0xD1B54A32D192ED03))
+    (
+        build(300, 0.0, 0x9E3779B97F4A7C15),
+        build(200, 0.5, 0xD1B54A32D192ED03),
+    )
 }
 
 /// #2261 — from a PCA/linear WARM START the curved arm reaches AND beats the
@@ -1307,11 +1310,14 @@ fn curved_warm_start_matches_or_beats_linear_baseline_out_of_sample_2261() {
 /// test's `run_primary`, threading the seed everywhere it is consumed (minimal
 /// seed jitter + seed-refine routing) so different seeds are genuinely different
 /// starts.
-fn production_circle_coords_at_seed(target: &Array2<f64>, random_state: u64) -> ndarray::Array1<f64> {
+fn production_circle_coords_at_seed(
+    target: &Array2<f64>,
+    random_state: u64,
+) -> ndarray::Array1<f64> {
     use crate::manifold::{
-        build_sae_fit_seed, build_sae_minimal_seed, run_sae_manifold_fit, SaeFitAssignmentKind,
-        SaeFitConfig, SaeFitRequest, SaeFitSeedReport, SaeFitSeedRequest, SaeMinimalSeedReport,
-        SaeMinimalSeedRequest,
+        SaeFitAssignmentKind, SaeFitConfig, SaeFitRequest, SaeFitSeedReport, SaeFitSeedRequest,
+        SaeMinimalSeedReport, SaeMinimalSeedRequest, build_sae_fit_seed, build_sae_minimal_seed,
+        run_sae_manifold_fit,
     };
     let assignment_kind = SaeFitAssignmentKind::Softmax;
     let minimal = build_sae_minimal_seed(SaeMinimalSeedRequest {

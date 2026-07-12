@@ -294,15 +294,18 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         let ranges = Self::block_ranges_from_specs(specs);
         let total = ranges.last().map(|(_, end)| *end).unwrap_or(0);
         let theta_dim = rho.len() + psi_dim;
+        let expected_rho = specs.iter().map(|spec| spec.penalties.len()).sum::<usize>();
+        if rho.len() != expected_rho {
+            return Ok(None);
+        }
+        let physical_lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())
+            .map_err(|error| format!("BMS batched outer rho: {error}"))?;
         if total == 0 {
             return Ok(Some(BatchedOuterGradientTerms {
                 objective_theta: Array1::zeros(theta_dim),
                 trace_h_inv_hdot: Array1::zeros(theta_dim),
                 trace_s_pinv_sdot: Array1::zeros(theta_dim),
             }));
-        }
-        if rho.len() != specs.iter().map(|spec| spec.penalties.len()).sum::<usize>() {
-            return Ok(None);
         }
         if total >= 512 {
             return Ok(None);
@@ -368,15 +371,14 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         let mut objective_theta = Array1::<f64>::zeros(theta_dim);
         let mut trace_s_pinv_sdot = Array1::<f64>::zeros(theta_dim);
         let mut penalty_cursor = 0usize;
-        let mut per_block_rho: Vec<Array1<f64>> = Vec::with_capacity(specs.len());
+        let mut per_block_lambdas: Vec<Array1<f64>> = Vec::with_capacity(specs.len());
         let mut penalties_dense: Vec<Vec<Array2<f64>>> = Vec::with_capacity(specs.len());
         for (block_idx, spec) in specs.iter().enumerate() {
             let count = spec.penalties.len();
-            let block_rho = rho
-                .slice(s![penalty_cursor..penalty_cursor + count])
-                .to_owned();
-            let lambdas = block_rho.mapv(f64::exp);
-            per_block_rho.push(block_rho);
+            let lambdas = Array1::from_vec(
+                physical_lambdas[penalty_cursor..penalty_cursor + count].to_vec(),
+            );
+            per_block_lambdas.push(lambdas.clone());
             let (start, end) = ranges[block_idx];
             let beta_block = beta.slice(s![start..end]);
             let mut s_lambda = Array2::<f64>::zeros((end - start, end - start));
@@ -408,8 +410,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         };
         let mut penalty_logdet_blocks = Vec::with_capacity(specs.len());
         penalty_cursor = 0;
-        for (block_idx, block_rho) in per_block_rho.iter().enumerate() {
-            let lambdas = block_rho.mapv(f64::exp).to_vec();
+        for (block_idx, lambdas) in per_block_lambdas.iter().enumerate() {
+            let lambdas = lambdas.to_vec();
             let pld =
                 gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_components(
                     &penalties_dense[block_idx],
@@ -425,7 +427,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             for (local_idx, value) in first.iter().enumerate() {
                 trace_s_pinv_sdot[penalty_cursor + local_idx] = *value;
             }
-            penalty_cursor += block_rho.len();
+            penalty_cursor += lambdas.len();
             penalty_logdet_blocks.push(pld);
         }
         if log_exact_work(self.y.len()) {
@@ -460,7 +462,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             let beta_block = beta.slice(s![start..end]);
             for (local_idx, _penalty) in spec.penalties.iter().enumerate() {
                 let idx = penalty_cursor + local_idx;
-                let lambda = rho[idx].exp();
+                let lambda = physical_lambdas[idx];
                 let dense = &penalties_dense[block_idx][local_idx];
                 trace_h_inv_hdot[idx] +=
                     spectral.trace_logdet_block_local(dense, lambda, start, end);
@@ -547,8 +549,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 let (start, end) = ranges[block_idx];
                 let p_block = end - start;
                 let deriv = &derivative_blocks[block_idx][local_idx];
-                let s_psi_local =
-                    assemble_bms_block_local_s_psi(deriv, &per_block_rho[block_idx], p_block);
+                let s_psi_local = assemble_bms_block_local_s_psi(
+                    deriv,
+                    &per_block_lambdas[block_idx],
+                    p_block,
+                );
                 let beta_block = beta.slice(s![start..end]);
                 let s_psi_beta_local = s_psi_local.dot(&beta_block);
                 objective_theta[idx] =

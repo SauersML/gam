@@ -20,12 +20,12 @@ use std::sync::atomic::AtomicUsize;
 // keeps resolving byte-for-byte.
 pub use gam_problem::{ExactNewtonOuterObjective, ExactOuterDerivativeOrder};
 
-// The IRLS weight floor and block-spec consistency validator are neutral (no
-// `CustomFamily` dependency); they live in `gam-problem`. Coefficient damping
+// The block-spec consistency validator is neutral (no `CustomFamily`
+// dependency), so it lives in `gam-problem`. Coefficient damping
 // deliberately has no model-level default: the custom-family solver derives
 // any transient shift from the current curvature and must converge the
 // undamped score equation.
-pub use gam_problem::{CUSTOM_FAMILY_WEIGHT_FLOOR, validate_blockspec_consistency};
+pub use gam_problem::validate_blockspec_consistency;
 
 /// Exact outer derivative order for families that expose second-order
 /// coefficient geometry.
@@ -60,10 +60,6 @@ pub(crate) fn assert_valid_options(options: &BlockwiseFitOptions, context: &str)
     assert!(
         options.outer_tol.is_finite() && options.outer_tol >= 0.0,
         "{context}: outer_tol must be finite and non-negative"
-    );
-    assert!(
-        options.minweight.is_finite() && options.minweight >= 0.0,
-        "{context}: minweight must be finite and non-negative"
     );
     assert!(
         options.ridge_floor.is_finite() && options.ridge_floor >= 0.0,
@@ -475,7 +471,6 @@ pub struct BlockwiseFitOptions {
     /// the upper effective-df cap or adding family-specific branches inside the
     /// optimizer.
     pub rho_lower_bound: f64,
-    pub minweight: f64,
     /// Optional seed for transient solver damping. The default is zero and the
     /// default [`RidgePolicy`] excludes every damping shift from the quadratic
     /// objective, penalty determinant, and Laplace Hessian. A nonzero value is
@@ -666,7 +661,6 @@ impl Default for BlockwiseFitOptions {
             outer_tol: 1e-5,
             outer_rel_cost_tol: None,
             rho_lower_bound: -10.0,
-            minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
             // Conditioning is solver state, not a coefficient prior. Start at
             // the exact Hessian (zero shift); rank/curvature-aware damping may
             // regularize rejected Newton steps, but none of it enters the

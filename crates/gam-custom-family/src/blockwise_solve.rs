@@ -1160,36 +1160,25 @@ pub(crate) struct BlockUpdateResult {
     pub(crate) active_set: Option<Vec<usize>>,
 }
 
-/// Floor strictly positive working weights at `minweight`, preserving exact
-/// zeros (semantically excluded rows stay excluded).
+/// Certify a diagonal working-curvature vector without changing it.
 ///
-/// The diagonal working-curvature contract requires nonnegative finite
-/// entries: a negative weight is indefinite diagonal curvature and a
-/// non-finite weight is a broken linearization. Coercing either (negatives to
-/// zero, or NaN to `minweight` through the NaN-ignoring `f64::max`) would
-/// silently substitute a different information matrix — the objective,
-/// gradient, and log|H| would then describe a model the family never
-/// evaluated — so both are rejected.
-pub(crate) fn floor_positiveworking_weights(
+/// Signed finite rows are valid for observed Hessians. Conditioning and local
+/// indefiniteness are handled after assembly by the shared matrix-level
+/// ridge/continuation policy; a row-wise floor or sign projection would alter
+/// the score, Hessian, and Laplace determinant into different models.
+pub(crate) fn certify_finite_working_weights(
     working_weights: &Array1<f64>,
-    minweight: f64,
-) -> Result<Array1<f64>, String> {
+) -> Result<&Array1<f64>, String> {
     if let Some((i, &wi)) = working_weights
         .iter()
         .enumerate()
-        .find(|&(_, &wi)| !wi.is_finite() || wi < 0.0)
+        .find(|&(_, &wi)| !wi.is_finite())
     {
         return Err(format!(
-            "invalid diagonal working weight at row {i}: {wi} (the working-curvature \
-             contract requires nonnegative finite entries; negative or non-finite \
-             curvature cannot be coerced without changing the information matrix)"
+            "invalid diagonal working weight at row {i}: {wi} (working curvature must be finite)"
         ));
     }
-    let mut out = Array1::<f64>::zeros(working_weights.len());
-    ndarray::Zip::from(&mut out)
-        .and(working_weights)
-        .par_for_each(|o, &wi| *o = if wi == 0.0 { 0.0 } else { wi.max(minweight) });
-    Ok(out)
+    Ok(working_weights)
 }
 
 pub(crate) trait ParameterBlockUpdater {
@@ -1221,9 +1210,8 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
             .into());
         }
 
-        // Zero-weight observations are semantically excluded and must stay inactive.
-        let w_clamped = floor_positiveworking_weights(self.working_weights, ctx.options.minweight)
-            .map_err(|e| {
+        let working_weights =
+            certify_finite_working_weights(self.working_weights).map_err(|e| {
                 format!(
                     "block {} ({}) diagonal solve: {e}",
                     ctx.block_idx, ctx.spec.name
@@ -1242,7 +1230,8 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
             with_block_geometry(ctx.family, ctx.states, ctx.spec, ctx.block_idx, |x, off| {
                 let mut y_star = self.working_response.clone();
                 y_star -= off;
-                let (mut lhs, rhs_opt) = weighted_normal_equations(x, &w_clamped, Some(&y_star))?;
+                let (mut lhs, rhs_opt) =
+                    weighted_normal_equations(x, working_weights, Some(&y_star))?;
                 let rhs = rhs_opt.ok_or_else(|| {
                     "missing weighted RHS in constrained diagonal solve".to_string()
                 })?;
@@ -1286,12 +1275,12 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
                 // This avoids an O(n) working_response clone.
                 let n = self.working_response.len();
                 let wy = Array1::from_shape_fn(n, |i| {
-                    (self.working_response[i] - off[i]) * w_clamped[i].max(0.0)
+                    (self.working_response[i] - off[i]) * working_weights[i]
                 });
                 let xtwy = x.transpose_vector_multiply(&wy);
                 let beta = x
                     .solve_systemwith_policy(
-                        &w_clamped,
+                        working_weights,
                         &xtwy,
                         Some(ctx.s_lambda),
                         ctx.options.ridge_floor,
@@ -2160,9 +2149,7 @@ pub(crate) const STRICT_SPD_LM_RIDGE_GROWTH: f64 = 10.0;
 // `CUSTOM_FAMILY_RIDGE_FLOOR` (the initial Cholesky-escalation ridge δ) is
 // single-sourced in `gam-problem` (`custom_family_blockwise`). Re-exported here
 // so existing crate-local paths keep resolving after the #1521 carve instead of
-// holding a second definition. (`CUSTOM_FAMILY_WEIGHT_FLOOR`, the IRLS
-// working-weight floor, is referenced only by the unit tests, which reach it
-// through the canonical `gam_problem::` path directly.)
+// holding a second definition.
 pub(crate) use gam_problem::CUSTOM_FAMILY_RIDGE_FLOOR;
 
 /// Relative eigenvalue floor used wherever an eigendecomposition needs to

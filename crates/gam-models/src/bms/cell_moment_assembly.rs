@@ -166,26 +166,26 @@ pub(super) fn fill_link_basis_cell_coeff_jet(
 
 pub(super) fn assemble_bms_block_local_s_psi(
     deriv: &crate::custom_family::CustomFamilyBlockPsiDerivative,
-    per_block_rho: &Array1<f64>,
+    per_block_lambdas: &Array1<f64>,
     p_block: usize,
 ) -> Array2<f64> {
     if let Some(ref components) = deriv.s_psi_penalty_components {
         let mut s_psi = Array2::<f64>::zeros((p_block, p_block));
         for (penalty_idx, s_part) in components {
-            s_part.add_scaled_to(per_block_rho[*penalty_idx].exp(), &mut s_psi);
+            s_part.add_scaled_to(per_block_lambdas[*penalty_idx], &mut s_psi);
         }
         return s_psi;
     }
     if let Some(ref components) = deriv.s_psi_components {
         let mut s_psi = Array2::<f64>::zeros((p_block, p_block));
         for (penalty_idx, s_part) in components {
-            s_psi.scaled_add(per_block_rho[*penalty_idx].exp(), s_part);
+            s_psi.scaled_add(per_block_lambdas[*penalty_idx], s_part);
         }
         s_psi
     } else if let Some(penalty_idx) = deriv.penalty_index {
         deriv
             .s_psi
-            .mapv(|value| per_block_rho[penalty_idx].exp() * value)
+            .mapv(|value| per_block_lambdas[penalty_idx] * value)
     } else {
         Array2::<f64>::zeros((p_block, p_block))
     }

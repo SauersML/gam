@@ -578,7 +578,7 @@ impl std::fmt::Display for EBhError {
             Self::InvalidLogEvidence { claim, value } => {
                 write!(
                     f,
-                    "e-BH log evidence for claim {claim} must not be NaN; got {value}"
+                    "e-BH log evidence for claim {claim} must be finite or -infinity; got {value}"
                 )
             }
         }
@@ -595,14 +595,14 @@ pub fn e_benjamini_hochberg(log_e_values: &[f64], alpha: f64) -> Result<Vec<usiz
     if m == 0 {
         return Ok(Vec::new());
     }
-    // The extended-real endpoints are meaningful: -infinity is the exact
-    // zero e-value and +infinity is decisive evidence on a null-zero-density
-    // event. NaN has no statistical meaning and must fail the entire
-    // certificate rather than being silently recoded as a different claim.
+    // Negative infinity is meaningful: it is the exact zero e-value. NaN has
+    // no statistical meaning, and positive infinity cannot be serialized in
+    // the certificate artifact. Both fail the whole certificate rather than
+    // being silently recoded or capped to a different claim.
     if let Some((claim, &value)) = log_e_values
         .iter()
         .enumerate()
-        .find(|(_, value)| value.is_nan())
+        .find(|(_, value)| value.is_nan() || **value == f64::INFINITY)
     {
         return Err(EBhError::InvalidLogEvidence { claim, value });
     }
@@ -952,9 +952,13 @@ mod tests {
     }
 
     #[test]
-    fn e_bh_orders_infinite_log_e_values_without_comparator_panic() {
-        let log_e = [f64::NEG_INFINITY, f64::INFINITY, 45.0f64.ln(), 1.0f64.ln()];
-        assert_eq!(e_benjamini_hochberg(&log_e, 0.1).unwrap(), vec![1, 2]);
+    fn e_bh_accepts_exact_zero_evidence_but_refuses_positive_infinity() {
+        let log_e = [f64::NEG_INFINITY, 45.0f64.ln(), 1.0f64.ln()];
+        assert_eq!(e_benjamini_hochberg(&log_e, 0.1).unwrap(), vec![1]);
+        assert!(matches!(
+            e_benjamini_hochberg(&[f64::INFINITY], 0.1),
+            Err(EBhError::InvalidLogEvidence { claim: 0, value }) if value == f64::INFINITY
+        ));
     }
 
     /// A NaN has no e-value meaning. The whole certificate must fail at its
