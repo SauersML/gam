@@ -365,14 +365,10 @@ impl<const K: usize> Tower4<K> {
         out
     }
 
-    /// Compose with a unary special-function whose `[f64; 5]` derivative STACK is
-    /// built from the base value through `stack_fn` — the scalar arm of the
-    /// generic-over-[`Lane`](crate::jet_scalar::Lane) compose seam (see
-    /// [`Tower4Lane::compose_unary_with`]). Evaluates `stack_fn(self.v)` ONCE and
-    /// forwards to [`Self::compose_unary`], so it is BIT-IDENTICAL to the explicit
-    /// `self.compose_unary(stack_fn(self.v))`. Writing a program against this seam
-    /// lets it re-instantiate, unchanged, at [`Tower4Lane`] (where each of the four
-    /// lanes carries a DISTINCT base value and `stack_fn` is re-run per lane).
+    /// Compose with a unary special-function whose `[f64; 5]` derivative stack is
+    /// built from the base value through `stack_fn`. Evaluates `stack_fn(self.v)`
+    /// once and forwards to [`Self::compose_unary`], so it is bit-identical to the
+    /// explicit `self.compose_unary(stack_fn(self.v))` form.
     #[inline]
     pub fn compose_unary_with(&self, stack_fn: impl Fn(f64) -> [f64; 5]) -> Self {
         self.compose_unary(stack_fn(self.v))
@@ -1090,13 +1086,10 @@ impl<const K: usize> Tower3<K> {
         out
     }
 
-    /// Compose with a unary special-function whose `[f64; 4]` derivative STACK is
-    /// built from the base value through `stack_fn` — the scalar arm of the
-    /// generic-over-[`Lane`](crate::jet_scalar::Lane) compose seam (see
-    /// [`Tower3Lane::compose_unary_with`]). Evaluates `stack_fn(self.v)` ONCE and
-    /// forwards to [`Self::compose_unary`], so it is BIT-IDENTICAL to the explicit
-    /// `self.compose_unary(stack_fn(self.v))`. The order-≤3 sibling of
-    /// [`Tower4::compose_unary_with`].
+    /// Compose with a unary special-function whose `[f64; 4]` derivative stack is
+    /// built from the base value through `stack_fn`. Evaluates `stack_fn(self.v)`
+    /// once and forwards to [`Self::compose_unary`], so it is bit-identical to the
+    /// explicit form. The order-≤3 sibling of [`Tower4::compose_unary_with`].
     #[inline]
     pub fn compose_unary_with(&self, stack_fn: impl Fn(f64) -> [f64; 4]) -> Self {
         self.compose_unary(stack_fn(self.v))
