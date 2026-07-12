@@ -4823,6 +4823,147 @@ mod moment_engine_tests {
         cmp_mat("d_uv_uv", &dnorm.eps_del.h, &hand.d_uv_uv);
     }
 
+    /// #932 item-2 STEP 4 (TRUNCATION-FREE gate): the nested-dual ORACLE `Dual22`
+    /// instantiation of `flex_timepoint_inputs_generic` reproduces the production
+    /// p-primary `Jet4` instantiation's mixed 4th-order bidirectional contraction
+    /// EXACTLY, via an INDEPENDENT `2 + 2` composition order (not `2 + 1 + 1`).
+    ///
+    /// `Dual22` seeds two scalar directions `s = d1`, `t = d2` (each to 2nd order)
+    /// and reads the `∂²_s ∂²_t` channel `= Σ_abcd ℓ_abcd d1_a d1_b d2_c d2_d`.
+    /// The `Jet4` path seeds `eps = del = d2` — matrix `Σ_cd ℓ_uvcd d2_c d2_d` —
+    /// then contracts both free axes by `d1`; the same scalar by ℓ's symmetry.
+    /// Neither path uses a finite difference nor the incomplete §D hand oracle, so
+    /// this replaces the flex jet4 bidirectional's 1e-3 scalar-FD sanity (the last
+    /// FD-limited seam in the #932 tower) with a machine-precision independent
+    /// check. Several random `(d1, d2)` pin the whole tensor, not one slice.
+    #[test]
+    fn flex_timepoint_inputs_nested_dual_matches_jet4_contraction_932() {
+        let n = 16usize;
+        let family = make_ghw_flex_family(n);
+        let primary = flex_primary_slices(&family);
+        let p = primary.total;
+        let row = 6usize;
+        let g = 0.2_f64;
+
+        let h_len = primary.h.as_ref().map(|r| r.len()).unwrap_or(0);
+        let w_len = primary.w.as_ref().map(|r| r.len()).unwrap_or(0);
+        let beta_h = Array1::from_iter(
+            (0..h_len).map(|i| 0.1 + 0.05 * (i as f64) - 0.02 * ((i % 2) as f64)),
+        );
+        let beta_w = Array1::from_iter(
+            (0..w_len).map(|i| -0.08 + 0.04 * (i as f64) + 0.01 * ((i % 3) as f64)),
+        );
+        let bh = Some(&beta_h);
+        let bw = Some(&beta_w);
+
+        let m_beta = 0.15_f64;
+        let q1 = family.offset_exit[row] + family.marginal_design.to_dense()[[row, 0]] * m_beta;
+        let o_infl = 0.0_f64;
+        let solved = family
+            .solve_row_survival_intercept_with_slot(
+                q1,
+                g,
+                bh,
+                bw,
+                Some((row, SurvivalInterceptSlotKind::Exit)),
+            )
+            .expect("intercept solve");
+        let a1 = solved.0;
+        let cached = family
+            .build_cached_partition(&primary, a1, g, bh, bw)
+            .expect("cached partition");
+        let (obs_coeff, obs_fixed) =
+            observed_fixed_for(&family, &primary, row, a1, g, bh, bw).expect("obs fixed");
+        let cells = cells_from_cached(&cached);
+        let z_obs = family.observed_score_projection(row);
+        let d_check = family
+            .evaluate_survival_denom_d(a1, g, bh, bw)
+            .expect("denom");
+
+        for trial in 0..4usize {
+            let f = trial as f64;
+            let d1 = Array1::from_iter((0..p).map(|c| {
+                0.11 + 0.03 * (c as f64) - 0.02 * (((c + trial) % 2) as f64) + 0.01 * f
+            }));
+            let d2 = Array1::from_iter((0..p).map(|c| {
+                -0.06 + 0.045 * (((c + trial) % 3) as f64) + 0.02 * (c as f64) - 0.015 * f
+            }));
+
+            // Production p-primary Jet4: eps = del = d2 ⇒ matrix Σ_cd ℓ_uvcd d2_c d2_d.
+            let tpl4 = Jet4::primary(0.0, usize::MAX, p, 0.0, 0.0);
+            let b4 = Jet4::primary(g, primary.g, p, d2[primary.g], d2[primary.g]);
+            let du4: Vec<Jet4> = (0..p)
+                .map(|u| Jet4::primary(0.0, u, p, d2[u], d2[u]))
+                .collect();
+            let (eta4, chi4, d4) = flex_timepoint_inputs_generic(
+                &tpl4,
+                &b4,
+                &du4,
+                a1,
+                d_check,
+                primary.g,
+                primary.infl,
+                primary.q1,
+                q1,
+                z_obs,
+                o_infl,
+                obs_coeff,
+                &obs_fixed,
+                &cells,
+            )
+            .expect("generic jet4");
+            let contract = |m: &Vec<f64>| -> f64 {
+                let mut s = 0.0;
+                for u in 0..p {
+                    for v in 0..p {
+                        s += d1[u] * d1[v] * m[u * p + v];
+                    }
+                }
+                s
+            };
+            let eta_ref = contract(&eta4.eps_del.h);
+            let chi_ref = contract(&chi4.eps_del.h);
+            let d_ref = contract(&d4.eps_del.h);
+
+            // Nested-dual ORACLE: s = d1, t = d2 ⇒ channel ∂²_s ∂²_t.
+            let tpl2 = Dual22::seed_directional(0.0, 0.0, 0.0);
+            let b2 = Dual22::seed_directional(g, d1[primary.g], d2[primary.g]);
+            let du2: Vec<Dual22> = (0..p)
+                .map(|u| Dual22::seed_directional(0.0, d1[u], d2[u]))
+                .collect();
+            let (eta2, chi2, d2n) = flex_timepoint_inputs_generic(
+                &tpl2,
+                &b2,
+                &du2,
+                a1,
+                d_check,
+                primary.g,
+                primary.infl,
+                primary.q1,
+                q1,
+                z_obs,
+                o_infl,
+                obs_coeff,
+                &obs_fixed,
+                &cells,
+            )
+            .expect("generic dual22");
+            let eta_got = eta2.channels()[8];
+            let chi_got = chi2.channels()[8];
+            let d_got = d2n.channels()[8];
+
+            let check = |label: &str, got: f64, refv: f64| {
+                assert!(
+                    (got - refv).abs() <= 1e-9 * (1.0 + refv.abs()),
+                    "trial {trial} {label}: nested-dual {got} != jet4 contraction {refv}"
+                );
+            };
+            check("eta_uv_uv", eta_got, eta_ref);
+            check("chi_uv_uv", chi_got, chi_ref);
+            check("d_uv_uv", d_got, d_ref);
+        }
+    }
+
     // ── §3c h/w channels: g+h+w directional/bidirectional gate ──────────────────
     //
     // With score-warp(`h`) AND link-dev(`w`) active, the OBSERVED eta/chi carry the
