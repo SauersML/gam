@@ -2654,7 +2654,6 @@ mod jet_tower_oracle_tests {
 
     #[test]
     fn measure_rigid_vgh_jet_vs_hand_932() {
-        use std::hint::black_box;
         use std::time::Instant;
 
         let eta = [0.3_f64, -0.7, 0.05, 0.9, -1.2, 2.1, -2.4];
@@ -2690,7 +2689,10 @@ mod jet_tower_oracle_tests {
                         + hessian[1][1];
                 }
             }
-            black_box(sum);
+            // Consume the accumulator through a real assertion (black_box is
+            // scanner-banned as a silencer): the branch keeps the summed work
+            // observable to the optimizer and pins finiteness as a bonus.
+            assert!(sum.is_finite(), "hand-kernel accumulator went non-finite");
             best_hand = best_hand.min(start.elapsed().as_secs_f64());
 
             let start = Instant::now();
@@ -2709,7 +2711,7 @@ mod jet_tower_oracle_tests {
                         + hessian[1][1];
                 }
             }
-            black_box(sum);
+            assert!(sum.is_finite(), "jet-kernel accumulator went non-finite");
             best_jet = best_jet.min(start.elapsed().as_secs_f64());
         }
         let rows = (reps * eta.len()) as f64;
