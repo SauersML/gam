@@ -138,15 +138,7 @@ where
                     linear_constraints: linear_constraints.clone(),
                 };
                 if let Some(result) = try_gpu_gaussian_pls_dispatch(gpu_input) {
-                    match result {
-                        Ok(pair) => return Some(Ok(pair)),
-                        Err(err) => {
-                            log::warn!(
-                                "[PIRLS GPU Gaussian PLS] device solve error, falling back to CPU: {err}"
-                            );
-                            // Error logged; fall through to CPU path.
-                        }
-                    }
+                    return Some(result.map_err(EstimationError::InvalidInput));
                 }
             }
         }

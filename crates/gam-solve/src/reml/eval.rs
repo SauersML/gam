@@ -168,11 +168,11 @@ pub(crate) fn device_pirls_stage3_ready() -> bool {
 pub(crate) fn sigma_cubature_dispatch(
     state: &RemlState<'_>,
     sigma_points: &[Array1<f64>],
-) -> Vec<SigmaPointResult> {
+) -> Result<Vec<SigmaPointResult>, EstimationError> {
     if device_pirls_stage3_ready() {
         // Device path: try GPU stream-pool executor first.
         match sigma_cubature_evaluate_gpu_stream_pool(state, sigma_points) {
-            Ok(Some(results)) => return results,
+            Ok(Some(results)) => return Ok(results),
             Ok(None) => {
                 // Device declined (shape / family / policy gate); fall through.
                 log::debug!(
@@ -180,17 +180,18 @@ pub(crate) fn sigma_cubature_dispatch(
                      falling through to CPU Rayon oracle"
                 );
             }
-            Err(e) => {
-                // Device driver / shape failure; log and fall through.
-                log::warn!(
-                    "[sigma-cubature] GPU stream pool error — \
-                     falling through to CPU Rayon oracle: {e:?}"
-                );
+            Err(crate::gpu_kernels::sigma_cubature::SigmaCubatureGpuError::Geometry(error)) => {
+                return Err(error);
+            }
+            Err(crate::gpu_kernels::sigma_cubature::SigmaCubatureGpuError::Runtime(error)) => {
+                return Err(EstimationError::InvalidInput(format!(
+                    "sigma-cubature admitted GPU runtime failure: {error}"
+                )));
             }
         }
     }
 
-    sigma_cubature_evaluate_cpu_rayon(state, sigma_points)
+    Ok(sigma_cubature_evaluate_cpu_rayon(state, sigma_points))
 }
 
 /// GPU stream-pool sigma-cubature evaluator.
@@ -214,7 +215,10 @@ pub(crate) fn sigma_cubature_dispatch(
 pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
     state: &RemlState<'_>,
     sigma_points: &[Array1<f64>],
-) -> Result<Option<Vec<SigmaPointResult>>, gam_gpu::GpuError> {
+) -> Result<
+    Option<Vec<SigmaPointResult>>,
+    crate::gpu_kernels::sigma_cubature::SigmaCubatureGpuError,
+> {
     use crate::gpu::pirls_dispatch_wire::admission_for;
     use crate::gpu_kernels::sigma_cubature::try_gpu_sigma_stream_pool_eval;
     use gam_gpu::device_runtime::GpuRuntime;

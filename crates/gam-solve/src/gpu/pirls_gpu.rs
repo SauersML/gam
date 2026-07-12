@@ -2789,7 +2789,7 @@ extern "C" __global__ void status_first_ladder(
                 && dev_delta <= tol * (1.0 + prev_objective.abs())
             {
                 converged = true;
-                // Final-row mode: write all 9 output fields once at convergence.
+                // Final-row mode: write the full production row surface once.
                 crate::gpu_kernels::pirls_row::launch_row_reweight_on_stream(
                     backend,
                     family,
@@ -2847,7 +2847,7 @@ extern "C" __global__ void status_first_ladder(
             }
         }
 
-        // Final-row mode: write all 9 output fields once at max-iter exit.
+        // Final-row mode: write the full production row surface once at exit.
         crate::gpu_kernels::pirls_row::launch_row_reweight_on_stream(
             backend,
             family,

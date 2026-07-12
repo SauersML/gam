@@ -1613,6 +1613,25 @@ fn exact_spatial_adaptive_penalty_index_set(
     out
 }
 
+fn checked_fit_log_lambdas(
+    lambdas: &Array1<f64>,
+    context: &str,
+) -> Result<Array1<f64>, EstimationError> {
+    let values = lambdas
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(coordinate, lambda)| {
+            gam_problem::checked_log_strength(lambda).map_err(|error| {
+                EstimationError::InvalidInput(format!(
+                    "{context} lambda coordinate {coordinate} is outside the canonical physical-strength domain: {error}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Array1::from_vec(values))
+}
+
 fn build_spatial_adaptive_hyperspecs(cache_count: usize) -> Vec<SpatialAdaptiveHyperSpec> {
     let mut out = Vec::with_capacity(cache_count * 3 + 3);
     for cache_index in 0..cache_count {
@@ -1695,6 +1714,29 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     let adaptive_opts = options.adaptive_regularization.clone().unwrap_or_default();
     let adaptive_penalty_indices = exact_spatial_adaptive_penalty_index_set(runtime_caches);
     let p_total = baseline.design.design.ncols();
+    if baseline.fit.lambdas.len() != baseline.design.penalties.len() {
+        crate::bail_invalid_estim!(
+            "exact spatial adaptive fit received {} baseline lambdas for {} penalties",
+            baseline.fit.lambdas.len(),
+            baseline.design.penalties.len(),
+        );
+    }
+    let baseline_log_lambdas =
+        checked_fit_log_lambdas(&baseline.fit.lambdas, "exact spatial adaptive baseline")?;
+    for (cache_idx, cache) in runtime_caches.iter().enumerate() {
+        for (operator, penalty_idx) in [
+            ("mass", cache.mass_penalty_global_idx),
+            ("tension", cache.tension_penalty_global_idx),
+            ("stiffness", cache.stiffness_penalty_global_idx),
+        ] {
+            if penalty_idx >= baseline.fit.lambdas.len() {
+                crate::bail_invalid_estim!(
+                    "exact spatial adaptive cache {cache_idx} {operator} penalty index {penalty_idx} is out of bounds for {} baseline lambdas",
+                    baseline.fit.lambdas.len(),
+                );
+            }
+        }
+    }
     struct RetainedPenaltySetup {
         global_idx: usize,
         global_penalty: Array2<f64>,
@@ -1723,7 +1765,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                     .get(idx)
                     .copied()
                     .unwrap_or(0),
-                log_lambda: lambda.max(1e-12).ln(),
+                log_lambda: baseline_log_lambdas[idx],
                 col_range: bp.col_range.clone(),
                 hessian_piece: bp.local.mapv(|v| lambda * v),
             })
@@ -1762,15 +1804,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         .par_iter()
         .map(|cache| {
             [
-                baseline.fit.lambdas[cache.mass_penalty_global_idx]
-                    .max(1e-12)
-                    .ln(),
-                baseline.fit.lambdas[cache.tension_penalty_global_idx]
-                    .max(1e-12)
-                    .ln(),
-                baseline.fit.lambdas[cache.stiffness_penalty_global_idx]
-                    .max(1e-12)
-                    .ln(),
+                baseline_log_lambdas[cache.mass_penalty_global_idx],
+                baseline_log_lambdas[cache.tension_penalty_global_idx],
+                baseline_log_lambdas[cache.stiffness_penalty_global_idx],
             ]
         })
         .collect::<Vec<_>>();
@@ -1781,9 +1817,22 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         initial_theta[at + 2] = logs[2];
         at += 3;
     }
-    initial_theta[at] = eps_0_init.max(adaptive_opts.min_epsilon).ln();
-    initial_theta[at + 1] = eps_g_init.max(adaptive_opts.min_epsilon).ln();
-    initial_theta[at + 2] = eps_c_init.max(adaptive_opts.min_epsilon).ln();
+    let minimum_log_epsilon = gam_problem::checked_log_strength(adaptive_opts.min_epsilon)
+        .map_err(|error| {
+            EstimationError::InvalidInput(format!(
+                "adaptive minimum epsilon is outside the canonical positive-strength domain: {error}"
+            ))
+        })?;
+    for (slot, epsilon) in [eps_0_init, eps_g_init, eps_c_init].into_iter().enumerate() {
+        initial_theta[at + slot] =
+            gam_problem::checked_log_strength(epsilon.max(adaptive_opts.min_epsilon)).map_err(
+                |error| {
+                    EstimationError::InvalidInput(format!(
+                        "adaptive initial epsilon coordinate {slot} is outside the canonical positive-strength domain: {error}"
+                    ))
+                },
+            )?;
+    }
 
     let hyperspecs = build_spatial_adaptive_hyperspecs(runtime_caches.len());
     let zero_psi_op: std::sync::Arc<dyn gam_custom_family::CustomFamilyPsiDerivativeOperator> =
@@ -1877,7 +1926,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     const RETAINED_LAMBDA_LOG_UPPER_CAP: f64 = 30.0;
     const OPERATOR_LAMBDA_LOG_LOWER_FLOOR: f64 = -10.0;
     const OPERATOR_LAMBDA_LOG_UPPER_CAP: f64 = 30.0;
-    let epsilon_floor_log = adaptive_opts.min_epsilon.max(1e-12).ln();
+    let epsilon_floor_log = minimum_log_epsilon;
     let anchored_bound = |idx: usize, sign: f64| -> f64 {
         let raw = initial_theta[idx] + sign * UNIFIED_LOG_WINDOW;
         if idx < rho_dim {
@@ -1925,8 +1974,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         ..BlockwiseFitOptions::default()
     };
 
-    use gam_solve::rho_optimizer::OuterProblem;
     use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval};
+    use gam_solve::rho_optimizer::OuterProblem;
 
     struct SpatialAdaptiveOuterState {
         warm_cache: Option<CustomFamilyWarmStart>,
@@ -1937,6 +1986,13 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             HessianValue,
             CustomFamilyWarmStart,
         )>,
+    }
+
+    struct DecodedSpatialAdaptiveTheta {
+        rho: Array1<f64>,
+        retained_lambdas: Array1<f64>,
+        adaptive_params: Vec<SpatialAdaptiveTermHyperParams>,
+        epsilon: [f64; 3],
     }
 
     let n_theta = initial_theta.len();
@@ -1956,29 +2012,43 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         }
     };
 
-    let decode_theta = |theta: &Array1<f64>| -> (Array1<f64>, Vec<SpatialAdaptiveTermHyperParams>) {
-        let rho = theta.slice(s![..rho_dim]).to_owned();
-        let adaptive_lambda_start = rho_dim;
-        let adaptive_lambda_end = adaptive_lambda_start + runtime_caches.len() * 3;
-        let eps = [
-            theta[adaptive_lambda_end].exp(),
-            theta[adaptive_lambda_end + 1].exp(),
-            theta[adaptive_lambda_end + 2].exp(),
-        ];
-        let adaptive_params = runtime_caches
-            .iter()
-            .enumerate()
-            .map(|(cache_idx, _)| SpatialAdaptiveTermHyperParams {
-                lambda: [
-                    theta[adaptive_lambda_start + cache_idx * 3].exp(),
-                    theta[adaptive_lambda_start + cache_idx * 3 + 1].exp(),
-                    theta[adaptive_lambda_start + cache_idx * 3 + 2].exp(),
-                ],
+    let decode_theta =
+        |theta: &Array1<f64>| -> Result<DecodedSpatialAdaptiveTheta, EstimationError> {
+            let physical = gam_problem::checked_exp_log_strengths(theta.iter().copied()).map_err(
+            |error| {
+                EstimationError::InvalidInput(format!(
+                    "exact spatial adaptive outer coordinate is outside the canonical log-strength domain: {error}"
+                ))
+            },
+        )?;
+            let rho = theta.slice(s![..rho_dim]).to_owned();
+            let retained_lambdas = Array1::from_vec(physical[..rho_dim].to_vec());
+            let adaptive_lambda_start = rho_dim;
+            let adaptive_lambda_end = adaptive_lambda_start + runtime_caches.len() * 3;
+            let eps = [
+                physical[adaptive_lambda_end],
+                physical[adaptive_lambda_end + 1],
+                physical[adaptive_lambda_end + 2],
+            ];
+            let adaptive_params = runtime_caches
+                .iter()
+                .enumerate()
+                .map(|(cache_idx, _)| SpatialAdaptiveTermHyperParams {
+                    lambda: [
+                        physical[adaptive_lambda_start + cache_idx * 3],
+                        physical[adaptive_lambda_start + cache_idx * 3 + 1],
+                        physical[adaptive_lambda_start + cache_idx * 3 + 2],
+                    ],
+                    epsilon: eps,
+                })
+                .collect::<Vec<_>>();
+            Ok(DecodedSpatialAdaptiveTheta {
+                rho,
+                retained_lambdas,
+                adaptive_params,
                 epsilon: eps,
             })
-            .collect::<Vec<_>>();
-        (rho, adaptive_params)
-    };
+        };
     let analytic_outer_hessian_available =
         gam_custom_family::joint_exact_analytic_outer_hessian_available()
             && base_family
@@ -2047,8 +2117,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             });
         }
 
-        let (rho, adaptive_params) = decode_theta(&theta);
-        let family_eval = base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
+        let decoded = decode_theta(&theta)?;
+        let family_eval =
+            base_family.with_adaptive_params(decoded.adaptive_params, zero_quadratic.clone());
         let need_hessian = matches!(
             order,
             gam_solve::rho_optimizer::OuterEvalOrder::ValueGradientHessian
@@ -2057,7 +2128,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             &family_eval,
             std::slice::from_ref(&blockspec),
             &outer_opts,
-            &rho,
+            &decoded.rho,
             &derivative_blocks,
             st.warm_cache.as_ref(),
             if need_hessian {
@@ -2168,9 +2239,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         },
         |st: &mut SpatialAdaptiveOuterState,
          theta: &Array1<f64>,
-         order: gam_solve::rho_optimizer::OuterEvalOrder| {
-            eval_outer(st, theta, order)
-        },
+         order: gam_solve::rho_optimizer::OuterEvalOrder| { eval_outer(st, theta, order) },
         Some(|st: &mut SpatialAdaptiveOuterState| {
             st.warm_cache = None;
             st.last_eval = None;
@@ -2294,32 +2363,18 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     // authoritative convergence signal is `outer_converged`.
     let outer_grad_norm: Option<f64> = outer_result.final_grad_norm;
     let theta_star = outer_result.rho;
-    let rho_star = theta_star.slice(s![..rho_dim]).to_owned();
-    let adaptive_lambda_start = rho_dim;
-    let adaptive_lambda_end = adaptive_lambda_start + runtime_caches.len() * 3;
-    let eps_star = [
-        theta_star[adaptive_lambda_end].exp(),
-        theta_star[adaptive_lambda_end + 1].exp(),
-        theta_star[adaptive_lambda_end + 2].exp(),
-    ];
-    let adaptive_params = runtime_caches
-        .iter()
-        .enumerate()
-        .map(|(cache_idx, _)| SpatialAdaptiveTermHyperParams {
-            lambda: [
-                theta_star[adaptive_lambda_start + cache_idx * 3].exp(),
-                theta_star[adaptive_lambda_start + cache_idx * 3 + 1].exp(),
-                theta_star[adaptive_lambda_start + cache_idx * 3 + 2].exp(),
-            ],
-            epsilon: eps_star,
-        })
-        .collect::<Vec<_>>();
+    let DecodedSpatialAdaptiveTheta {
+        rho: _,
+        retained_lambdas,
+        adaptive_params,
+        epsilon: eps_star,
+    } = decode_theta(&theta_star)?;
     let mut fixed_total = Array2::<f64>::zeros((
         baseline.design.design.ncols(),
         baseline.design.design.ncols(),
     ));
     for (idx, penalty) in retained_penalties.iter().enumerate() {
-        fixed_total.scaled_add(rho_star[idx].exp(), penalty);
+        fixed_total.scaled_add(retained_lambdas[idx], penalty);
     }
     let final_family =
         base_family.with_adaptive_params(adaptive_params.clone(), Arc::new(fixed_total.clone()));
@@ -2363,7 +2418,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
 
     let mut full_lambdas = baseline.fit.lambdas.clone();
     for (idx, &global_idx) in retained_global_indices.iter().enumerate() {
-        full_lambdas[global_idx] = rho_star[idx].exp();
+        full_lambdas[global_idx] = retained_lambdas[idx];
     }
     for (cache_idx, cache) in runtime_caches.iter().enumerate() {
         full_lambdas[cache.mass_penalty_global_idx] = adaptive_params[cache_idx].lambda[0];
@@ -2522,7 +2577,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     let fitted = FittedTermCollection {
         fit: {
-            let log_lambdas = full_lambdas.mapv(|v| v.max(1e-300).ln());
+            let log_lambdas =
+                checked_fit_log_lambdas(&full_lambdas, "final exact spatial adaptive fit")?;
             let inf = FitInference {
                 edf_by_block,
                 penalty_block_trace,
@@ -2575,8 +2631,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 lambdas: full_lambdas,
                 likelihood_scale: family.default_scale_metadata(),
                 likelihood_family: Some(family),
-                log_likelihood_normalization:
-                    gam_spec::LogLikelihoodNormalization::UserProvided,
+                log_likelihood_normalization: gam_spec::LogLikelihoodNormalization::UserProvided,
                 log_likelihood: final_eval.obs.log_likelihood,
                 deviance,
                 reml_score: final_fit.penalized_objective,
@@ -2922,8 +2977,7 @@ fn relax_smoothing_rho_prior(
             if !relax {
                 return base.clone();
             }
-            let is_nullspace =
-                matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace);
+            let is_nullspace = matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace);
             // The relaxed per-coordinate prior is FAMILY-AGNOSTIC: the choice
             // depends only on the coordinate's role (bending vs null-space
             // selection) and on whether the data over-determines the model, NOT
@@ -3517,7 +3571,15 @@ fn evaluate_standard_familyobservations(
                 let lmumu = -yi / (mu_i * mu_i);
                 let lmumumu = 2.0 * yi / (mu_i * mu_i * mu_i);
                 let (s, f, nh, nhd) = glm_eta_observation_state(
-                    w, lmu, lmumu, lmumumu, var, d1, jet.d2, jet.d3, MU_DERIV_EPS,
+                    w,
+                    lmu,
+                    lmumu,
+                    lmumumu,
+                    var,
+                    d1,
+                    jet.d2,
+                    jet.d3,
+                    MU_DERIV_EPS,
                 );
                 mu[i] = mu_i;
                 score[i] = s;
@@ -3546,7 +3608,15 @@ fn evaluate_standard_familyobservations(
                 let lmumumu =
                     2.0 * p * mu_i.powf(-p - 1.0) + p * (p + 1.0) * resid * mu_i.powf(-p - 2.0);
                 let (s, f, nh, nhd) = glm_eta_observation_state(
-                    w, lmu, lmumu, lmumumu, var, d1, jet.d2, jet.d3, MU_DERIV_EPS,
+                    w,
+                    lmu,
+                    lmumu,
+                    lmumumu,
+                    var,
+                    d1,
+                    jet.d2,
+                    jet.d3,
+                    MU_DERIV_EPS,
                 );
                 mu[i] = mu_i;
                 score[i] = s;
@@ -3554,8 +3624,8 @@ fn evaluate_standard_familyobservations(
                 neghessian_eta[i] = nh;
                 neghessian_eta_derivative[i] = nhd;
                 // Quasi-log-likelihood (p ≠ 1, 2 in the supported compound range).
-                log_likelihood += w
-                    * (yi * mu_i.powf(1.0 - p) / (1.0 - p) - mu_i.powf(2.0 - p) / (2.0 - p));
+                log_likelihood +=
+                    w * (yi * mu_i.powf(1.0 - p) / (1.0 - p) - mu_i.powf(2.0 - p) / (2.0 - p));
             }
             (ResponseFamily::NegativeBinomial { theta, .. }, _) => {
                 // l(μ) = y·ln μ − (y+θ)·ln(μ+θ) (drop μ-independent terms) ⇒
@@ -3573,10 +3643,18 @@ fn evaluate_standard_familyobservations(
                 let var = mu_i + mu_i * mu_i / theta;
                 let lmu = yi / mu_i - (yi + theta) / mu_plus;
                 let lmumu = -yi / (mu_i * mu_i) + (yi + theta) / (mu_plus * mu_plus);
-                let lmumumu =
-                    2.0 * yi / (mu_i * mu_i * mu_i) - 2.0 * (yi + theta) / (mu_plus * mu_plus * mu_plus);
+                let lmumumu = 2.0 * yi / (mu_i * mu_i * mu_i)
+                    - 2.0 * (yi + theta) / (mu_plus * mu_plus * mu_plus);
                 let (s, f, nh, nhd) = glm_eta_observation_state(
-                    w, lmu, lmumu, lmumumu, var, d1, jet.d2, jet.d3, MU_DERIV_EPS,
+                    w,
+                    lmu,
+                    lmumu,
+                    lmumumu,
+                    var,
+                    d1,
+                    jet.d2,
+                    jet.d3,
+                    MU_DERIV_EPS,
                 );
                 mu[i] = mu_i;
                 score[i] = s;
@@ -3604,10 +3682,17 @@ fn evaluate_standard_familyobservations(
                 let var = mu_i * mu_i;
                 let lmu = yi / (mu_i * mu_i) - 1.0 / mu_i;
                 let lmumu = -2.0 * yi / (mu_i * mu_i * mu_i) + 1.0 / (mu_i * mu_i);
-                let lmumumu =
-                    6.0 * yi / (mu_i * mu_i * mu_i * mu_i) - 2.0 / (mu_i * mu_i * mu_i);
+                let lmumumu = 6.0 * yi / (mu_i * mu_i * mu_i * mu_i) - 2.0 / (mu_i * mu_i * mu_i);
                 let (s, f, nh, nhd) = glm_eta_observation_state(
-                    w, lmu, lmumu, lmumumu, var, d1, jet.d2, jet.d3, MU_DERIV_EPS,
+                    w,
+                    lmu,
+                    lmumu,
+                    lmumumu,
+                    var,
+                    d1,
+                    jet.d2,
+                    jet.d3,
+                    MU_DERIV_EPS,
                 );
                 mu[i] = mu_i;
                 score[i] = s;
@@ -4907,14 +4992,12 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         let (objective_psi_psi, score_psi_psi, hessian_psi_psi) =
             self.adaptive_explicit_second_order_parts(&eval, *hyper_i, *hyper_j)?;
 
-        Ok(Some(
-            gam_problem::ExactNewtonJointPsiSecondOrderTerms {
-                objective_psi_psi,
-                score_psi_psi,
-                hessian_psi_psi,
-                hessian_psi_psi_operator: None,
-            },
-        ))
+        Ok(Some(gam_problem::ExactNewtonJointPsiSecondOrderTerms {
+            objective_psi_psi,
+            score_psi_psi,
+            hessian_psi_psi,
+            hessian_psi_psi_operator: None,
+        }))
     }
 
     fn exact_newton_joint_psihessian_directional_derivative(
@@ -5842,7 +5925,8 @@ fn fit_bounded_term_collection_with_design(
     let cov_scale = glm_likelihood
         .coefficient_covariance_scale(standard_deviation * standard_deviation)
         .max(f64::MIN_POSITIVE);
-    let dispersion = gam_solve::estimate::dispersion_from_likelihood(&glm_likelihood, standard_deviation);
+    let dispersion =
+        gam_solve::estimate::dispersion_from_likelihood(&glm_likelihood, standard_deviation);
     // Apply the dispersion scale to the unscaled inverse, producing the reported
     // `Vb = cov_scale · H_user⁻¹` and its diagonal standard errors. The stored
     // `penalized_hessian` stays UNSCALED (`H_user`) per the dispersion-ownership
@@ -5876,7 +5960,8 @@ fn fit_bounded_term_collection_with_design(
         .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     Ok(FittedTermCollection {
         fit: {
-            let log_lambdas = fit.lambdas.mapv(|v| v.max(1e-300).ln());
+            let log_lambdas =
+                checked_fit_log_lambdas(&fit.lambdas, "final fitted term collection")?;
             let inf = FitInference {
                 edf_by_block,
                 penalty_block_trace,
@@ -5923,8 +6008,7 @@ fn fit_bounded_term_collection_with_design(
                 lambdas: fit.lambdas,
                 likelihood_scale: family.default_scale_metadata(),
                 likelihood_family: Some(family),
-                log_likelihood_normalization:
-                    gam_spec::LogLikelihoodNormalization::UserProvided,
+                log_likelihood_normalization: gam_spec::LogLikelihoodNormalization::UserProvided,
                 log_likelihood: eta_state.log_likelihood,
                 deviance,
                 reml_score: fit.penalized_objective,
@@ -6569,14 +6653,7 @@ fn evaluate_joint_reml_outer_eval_at_theta(
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     order: gam_solve::rho_optimizer::OuterEvalOrder,
     design_revision: Option<u64>,
-) -> Result<
-    (
-        f64,
-        Array1<f64>,
-        gam_problem::HessianValue,
-    ),
-    EstimationError,
-> {
+) -> Result<(f64, Array1<f64>, gam_problem::HessianValue), EstimationError> {
     evaluator.evaluate_with_order(
         &design.design,
         &design.penalties,

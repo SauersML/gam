@@ -980,7 +980,7 @@ impl PirlsRowBackend {
     }
 
     /// Compile (or fetch from cache) the **final-row** kernel module for
-    /// `(family, curvature)`. Writes all 9 output fields.
+    /// `(family, curvature)`. Writes the full production row surface.
     #[cfg(target_os = "linux")]
     pub fn module_for(
         &self,
@@ -1356,7 +1356,7 @@ impl AlphaLadderDevBuffers {
 /// (see `extern "C" __global__ void {kernel_name}(int n, …)` in this file).
 /// `gamma_shape`: active Gamma dispersion shape (α > 0). Forwarded as a
 /// scalar kernel argument only for `PirlsRowFamily::GammaLog`; all other
-/// families compile a 13-argument kernel and ignore this value. Pass `1.0`
+/// families compile a ten-argument kernel and ignore this value. Pass `1.0`
 /// for non-Gamma fits.
 #[cfg(target_os = "linux")]
 pub fn launch_row_reweight_on_stream(
@@ -1411,7 +1411,7 @@ pub fn launch_row_reweight_on_stream(
     builder.arg(&mut out.deviance);
     builder.arg(&mut out.status);
     // SAFETY: kernel signature for non-GammaLog is (n:i32, 3×const f64*,
-    // 8×mut f64*, 1×mut u32*). GammaLog extends this with `double shape`
+    // 5×mut f64*, 1×mut u32*). GammaLog extends this with `double shape`
     // after `prior_w` and before the output buffers — see `cuda_source_for`.
     // Arg order/types match one-for-one. Output buffers were allocated with
     // `n` elements each (validated above); input buffers are caller-supplied
@@ -1755,7 +1755,7 @@ __device__ __forceinline__ bool pirls_outputs_finite(
 ///
 /// The GammaLog kernel has an extra `double shape` parameter after `prior_w`
 /// so the host can forward the active dispersion shape. All other families
-/// use the standard 13-argument signature.
+/// use the standard ten-argument signature.
 #[cfg(target_os = "linux")]
 fn cuda_source_for(family: PirlsRowFamily, curvature: CurvatureMode) -> String {
     let body = match family {

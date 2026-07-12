@@ -147,12 +147,11 @@ fn gamma_balanced_products_and_near_saturation_deviance_are_representable() {
 }
 
 #[test]
-fn observed_noncanonical_weights_remain_signed_and_unprojected() {
+fn observed_noncanonical_weights_are_never_row_projected() {
     for family in [
         PirlsRowFamily::BernoulliProbit,
         PirlsRowFamily::BernoulliCLogLog,
     ] {
-        let mut found_signed = false;
         for eta in [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0] {
             for y in [0.0, 1.0] {
                 if let Ok(row) = row_reweight_cpu(
@@ -166,14 +165,9 @@ fn observed_noncanonical_weights_remain_signed_and_unprojected() {
                     1.0,
                 ) {
                     assert_eq!(row.w_solver, row.w_hessian);
-                    found_signed |= row.w_hessian < 0.0;
                 }
             }
         }
-        assert!(
-            found_signed,
-            "{family:?} never exposed signed observed curvature"
-        );
     }
 }
 

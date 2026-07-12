@@ -597,11 +597,28 @@ fn latent_id_objective_contribution(
             ..
         } => {
             let (log_mu, mu) = match strength {
-                AuxPriorStrength::Fixed(mu) => (mu.ln(), *mu),
+                AuxPriorStrength::Fixed(mu) => (
+                    gam_problem::checked_log_strength(*mu).map_err(|error| {
+                        EstimationError::InvalidInput(format!(
+                            "fixed latent auxiliary-prior precision is outside the canonical physical-strength domain: {error}"
+                        ))
+                    })?,
+                    *mu,
+                ),
                 AuxPriorStrength::Auto => {
-                    let log_mu = theta[cursor];
+                    let log_mu = *theta.get(cursor).ok_or_else(|| {
+                        EstimationError::InvalidInput(format!(
+                            "latent auxiliary-prior precision coordinate {cursor} is missing from theta length {}",
+                            theta.len(),
+                        ))
+                    })?;
                     cursor += 1;
-                    (log_mu, log_mu.exp())
+                    let mu = gam_problem::checked_exp_log_strength(log_mu).map_err(|error| {
+                        EstimationError::InvalidInput(format!(
+                            "latent auxiliary-prior log precision is outside the canonical log-strength domain: {error}"
+                        ))
+                    })?;
+                    (log_mu, mu)
                 }
             };
             let targets = aux_prior_targets(t.view(), u.view(), *family)
@@ -649,11 +666,28 @@ fn latent_id_objective_contribution(
             }
             let mu_slot = cursor;
             let (log_mu, mu) = match strength {
-                AuxPriorStrength::Fixed(mu) => (mu.ln(), *mu),
+                AuxPriorStrength::Fixed(mu) => (
+                    gam_problem::checked_log_strength(*mu).map_err(|error| {
+                        EstimationError::InvalidInput(format!(
+                            "fixed latent isometry precision is outside the canonical physical-strength domain: {error}"
+                        ))
+                    })?,
+                    *mu,
+                ),
                 AuxPriorStrength::Auto => {
-                    let log_mu = theta[cursor];
+                    let log_mu = *theta.get(cursor).ok_or_else(|| {
+                        EstimationError::InvalidInput(format!(
+                            "latent isometry precision coordinate {cursor} is missing from theta length {}",
+                            theta.len(),
+                        ))
+                    })?;
                     cursor += 1;
-                    (log_mu, log_mu.exp())
+                    let mu = gam_problem::checked_exp_log_strength(log_mu).map_err(|error| {
+                        EstimationError::InvalidInput(format!(
+                            "latent isometry log precision is outside the canonical log-strength domain: {error}"
+                        ))
+                    })?;
+                    (log_mu, mu)
                 }
             };
             let residual = &t - reference;
@@ -681,6 +715,12 @@ fn latent_id_objective_contribution(
             // the head's latent-code gradient flows into the `t` block (the
             // arrow-Schur cross-channel coupling).
             let n_coeffs = head.n_coeffs(latent_dim);
+            if cursor + n_coeffs > theta.len() {
+                crate::bail_invalid_estim!(
+                    "latent auxiliary-outcome coefficient block overruns theta: start={cursor}, width={n_coeffs}, theta_len={}",
+                    theta.len(),
+                );
+            }
             let coeffs = theta
                 .slice(ndarray::s![cursor..cursor + n_coeffs])
                 .to_owned();
@@ -705,9 +745,23 @@ fn latent_id_objective_contribution(
         LatentIdMode::AuxPriorDimSelection { .. }
         | LatentIdMode::DimSelection { .. }
         | LatentIdMode::AuxOutcome { .. } => {
+            if cursor + latent_dim > theta.len() {
+                crate::bail_invalid_estim!(
+                    "latent dimension-selection precision block overruns theta: start={cursor}, width={latent_dim}, theta_len={}",
+                    theta.len(),
+                );
+            }
+            let alphas = gam_problem::checked_exp_log_strengths(
+                theta.slice(s![cursor..cursor + latent_dim]).iter().copied(),
+            )
+            .map_err(|error| {
+                EstimationError::InvalidInput(format!(
+                    "latent dimension-selection log precision is outside the canonical log-strength domain: {error}"
+                ))
+            })?;
             for axis in 0..latent_dim {
                 let log_alpha = theta[cursor + axis];
-                let alpha = log_alpha.exp();
+                let alpha = alphas[axis];
                 let mut q_axis = 0.0;
                 for n in 0..n_obs {
                     let flat_idx = n * latent_dim + axis;
@@ -2613,7 +2667,16 @@ fn try_exact_joint_spatial_length_scale_optimization(
         )));
     }
 
-    let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
+    let selected_lambdas = Array1::from_vec(
+        gam_problem::checked_exp_log_strengths(
+            theta_star.slice(s![..rho_dim]).iter().copied(),
+        )
+        .map_err(|error| {
+            EstimationError::InvalidInput(format!(
+                "selected joint spatial smoothing coordinate is outside the canonical log-strength domain: {error}"
+            ))
+        })?,
+    );
     let log_kappa_star =
         SpatialLogKappaCoords::from_theta_tail_with_dims(&theta_star, rho_dim, dims_per_term);
     // #1464 diagnostic (ban-clean): the joint solver's CONVERGED ψ-tail κ for each
@@ -2642,7 +2705,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
         weights,
         offset,
         &optimized_spec,
-        rho_star.as_slice(),
+        selected_lambdas.as_slice(),
         family.clone(),
         options,
     )?;
@@ -3947,7 +4010,7 @@ fn run_exact_joint_spatial_optimization(
                     Some(SmoothBasisSpec::Matern { .. })
                 )
             }),
-    );
+    )?;
 
     let eval_outer = |ctx: &mut &mut SpatialJointContext<'_>,
                       theta: &Array1<f64>,
@@ -6304,10 +6367,24 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     // budget; generic multi-block and latent-coordinate callers retain their
     // family-specific multistart policies.
     initial_seed_only: bool,
-) -> gam_solve::rho_optimizer::OuterProblem {
+) -> Result<gam_solve::rho_optimizer::OuterProblem, EstimationError> {
+    if rho_dim > theta0.len() {
+        crate::bail_invalid_estim!(
+            "exact joint outer problem declares {rho_dim} smoothing coordinates for theta length {}",
+            theta0.len(),
+        );
+    }
     let mut seed_heuristic = theta0.to_vec();
-    for value in &mut seed_heuristic[..rho_dim] {
-        *value = value.exp();
+    let initial_lambdas = gam_problem::checked_exp_log_strengths(
+        theta0.iter().take(rho_dim).copied(),
+    )
+    .map_err(|error| {
+        EstimationError::InvalidInput(format!(
+            "exact joint initial smoothing coordinate is outside the canonical log-strength domain: {error}"
+        ))
+    })?;
+    for (value, lambda) in seed_heuristic[..rho_dim].iter_mut().zip(initial_lambdas) {
+        *value = lambda;
     }
     // Over-smoothing ρ ceiling: widened only for a constant-curvature fit (see
     // the `has_constant_curvature` param doc). Drives both the scalar saturation
@@ -6385,7 +6462,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
             .with_screening_cap(screening_cap)
             .with_screen_initial_rho(true);
     }
-    problem
+    Ok(problem)
 }
 
 pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn, ExactEfsFn, SeedFn>(
@@ -6726,7 +6803,7 @@ where
         // Multi-block optimization has no preceding scalar Matérn endpoint
         // certificate, so retain its family-specific seed cascade.
         false,
-    );
+    )?;
 
     // Helper: collect specs and designs from cache into owned Vecs for closure calls.
     fn collect_specs(cache: &ExactJointDesignCache<'_>) -> Vec<TermCollectionSpec> {
@@ -7429,7 +7506,7 @@ fn try_exact_joint_latent_coord_optimization(
         !constant_curvature_term_indices(resolvedspec).is_empty(),
         // Latent-coordinate optimization is not a profiled Matérn range solve.
         false,
-    );
+    )?;
 
     let eval_outer = |ctx: &mut &mut LatentJointContext<'_>,
                       theta: &Array1<f64>,
@@ -7478,7 +7555,16 @@ fn try_exact_joint_latent_coord_optimization(
     }
 
     let theta_star = result.rho;
-    let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
+    let selected_lambdas = Array1::from_vec(
+        gam_problem::checked_exp_log_strengths(
+            theta_star.slice(s![..rho_dim]).iter().copied(),
+        )
+        .map_err(|error| {
+            EstimationError::InvalidInput(format!(
+                "selected latent-coordinate smoothing coordinate is outside the canonical log-strength domain: {error}"
+            ))
+        })?,
+    );
     let mut final_data = data.to_owned();
     let flat_t = theta_star
         .slice(s![rho_dim..rho_dim + latent_flat_dim])
@@ -7498,7 +7584,7 @@ fn try_exact_joint_latent_coord_optimization(
         weights,
         offset,
         resolvedspec,
-        rho_star.as_slice(),
+        selected_lambdas.as_slice(),
         family,
         options,
     )?;

@@ -3267,7 +3267,12 @@ mod tests {
             for a in 0..3 {
                 close(jet_g[a], -grad[a], JET_TOL, &format!("{label} grad[{a}]"));
                 for b in 0..3 {
-                    close(jet_h[a][b], hess[[a, b]], JET_TOL, &format!("{label} H[{a}][{b}]"));
+                    close(
+                        jet_h[a][b],
+                        hess[[a, b]],
+                        JET_TOL,
+                        &format!("{label} H[{a}][{b}]"),
+                    );
                 }
             }
 
@@ -3288,9 +3293,10 @@ mod tests {
             }
 
             // ── Fourth: LIVE second directional derivative vs jet ─────────────
-            let d2h =
-                cause_specific_hessian_second_directional_derivative(&block, &beta, &d_beta, &v_beta)
-                    .expect("live fourth");
+            let d2h = cause_specific_hessian_second_directional_derivative(
+                &block, &beta, &d_beta, &v_beta,
+            )
+            .expect("live fourth");
             let uu = [d_beta[0], d_beta[1], d_beta[2]];
             let vv = [v_beta[0], v_beta[1], v_beta[2]];
             let jet_t4 = generic_fourth_contracted(&prog, 0, &uu, &vv).expect("jet fourth");
@@ -3319,14 +3325,27 @@ mod tests {
                 }
             }
             // ∂_v of the LIVE third (fixed direction d_beta) vs the LIVE fourth.
-            let dhp = cause_specific_hessian_directional_derivative(&block, &bp_along(&beta, &v_beta, h_fd), &d_beta)
-                .expect("live third +");
-            let dhm = cause_specific_hessian_directional_derivative(&block, &bm_along(&beta, &v_beta, h_fd), &d_beta)
-                .expect("live third -");
+            let dhp = cause_specific_hessian_directional_derivative(
+                &block,
+                &bp_along(&beta, &v_beta, h_fd),
+                &d_beta,
+            )
+            .expect("live third +");
+            let dhm = cause_specific_hessian_directional_derivative(
+                &block,
+                &bm_along(&beta, &v_beta, h_fd),
+                &d_beta,
+            )
+            .expect("live third -");
             for a in 0..3 {
                 for b in 0..3 {
                     let fd = (dhp[[a, b]] - dhm[[a, b]]) / (2.0 * h_fd);
-                    close(d2h[[a, b]], fd, 1e-5, &format!("{label} FD fourth[{a}][{b}]"));
+                    close(
+                        d2h[[a, b]],
+                        fd,
+                        1e-5,
+                        &format!("{label} FD fourth[{a}][{b}]"),
+                    );
                 }
             }
         }

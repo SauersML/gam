@@ -152,10 +152,7 @@ pub(crate) fn initial_log_lambdas_orzeros(
     Ok(lambdas)
 }
 
-fn fitted_log_lambdas(
-    lambdas: &Array1<f64>,
-    context: &str,
-) -> Result<Array1<f64>, String> {
+fn fitted_log_lambdas(lambdas: &Array1<f64>, context: &str) -> Result<Array1<f64>, String> {
     lambdas
         .iter()
         .copied()

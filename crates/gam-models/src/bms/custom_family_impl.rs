@@ -375,9 +375,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         let mut penalties_dense: Vec<Vec<Array2<f64>>> = Vec::with_capacity(specs.len());
         for (block_idx, spec) in specs.iter().enumerate() {
             let count = spec.penalties.len();
-            let lambdas = Array1::from_vec(
-                physical_lambdas[penalty_cursor..penalty_cursor + count].to_vec(),
-            );
+            let lambdas =
+                Array1::from_vec(physical_lambdas[penalty_cursor..penalty_cursor + count].to_vec());
             per_block_lambdas.push(lambdas.clone());
             let (start, end) = ranges[block_idx];
             let beta_block = beta.slice(s![start..end]);
@@ -549,11 +548,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 let (start, end) = ranges[block_idx];
                 let p_block = end - start;
                 let deriv = &derivative_blocks[block_idx][local_idx];
-                let s_psi_local = assemble_bms_block_local_s_psi(
-                    deriv,
-                    &per_block_lambdas[block_idx],
-                    p_block,
-                );
+                let s_psi_local =
+                    assemble_bms_block_local_s_psi(deriv, &per_block_lambdas[block_idx], p_block);
                 let beta_block = beta.slice(s![start..end]);
                 let s_psi_beta_local = s_psi_local.dot(&beta_block);
                 objective_theta[idx] =
