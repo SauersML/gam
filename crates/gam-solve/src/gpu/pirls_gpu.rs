@@ -32,7 +32,7 @@ impl PirlsLoopLikelihoodScale {
         }
     }
 
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(target_os = "linux")]
     fn kernel_argument(
         self,
         family: crate::gpu_kernels::pirls_row::PirlsRowFamily,
@@ -3855,7 +3855,7 @@ pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, S
     gam_gpu::solver::cholesky_lower_gpu(hessian)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod pirls_loop_likelihood_scale_tests {
     use super::PirlsLoopLikelihoodScale;
     use crate::gpu_kernels::pirls_row::PirlsRowFamily;
