@@ -3006,6 +3006,7 @@ impl<const K: usize> crate::nested_dual::JetField for crate::jet_tower::Tower4<K
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nested_dual::JetField;
     use crate::jet_tower::{RowProgram, Tower4, program_full_tower};
 
     /// A small polynomial-plus-unary row expression written ONCE, generically
@@ -4005,6 +4006,7 @@ mod batch_tests {
 #[cfg(test)]
 mod unit_tests {
     use super::{JetScalar, Order1, Order2, filtered_implicit_solve_scalar};
+    use crate::nested_dual::JetField;
 
     // ── Order2 direct property tests ─────────────────────────────────────────
 

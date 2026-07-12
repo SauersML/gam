@@ -51,6 +51,7 @@
 //! ```
 
 use crate::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
+use crate::nested_dual::JetField;
 use crate::jet_tower::{
     RowProgram, Tower4, program_fourth_contracted, program_full_tower, program_row_kernel,
     program_third_contracted,
