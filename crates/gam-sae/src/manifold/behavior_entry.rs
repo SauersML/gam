@@ -291,13 +291,13 @@ pub fn run_auto_sae_behavior_fit(
 impl SaeBehaviorFitReport {
     /// Materialize the stable behavior report shared unchanged by bindings.
     pub fn wire_report(&self) -> Result<SaeBehaviorWireReport, String> {
-        let log_lambda_y = self.behavior_block.log_lambda_y;
+        let log_lambda_y = self.behavior_block.log_lambda_y();
         Ok(SaeBehaviorWireReport {
             crosscoder: self
                 .crosscoder
                 .wire_report(SaeCrosscoderEvaluationConfig::default())?,
             log_lambda_y,
-            lambda_y: log_lambda_y.exp(),
+            lambda_y: self.behavior_block.lambda_y(),
             weight_identifiability: self.weight_identifiability.clone(),
             target_probabilities: array2_to_nested(&self.target_probabilities),
             fitted_probabilities: array2_to_nested(&self.fitted_probabilities),

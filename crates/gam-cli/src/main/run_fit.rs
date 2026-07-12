@@ -736,7 +736,7 @@ fn run_canonical_standard_fit(
                 cascade.num_levels(),
                 cascade.num_centers(),
                 cascade.sigma2,
-                cascade.log_lambda,
+                cascade.log_lambda(),
                 cascade.restricted_loglik,
                 cascade.certificate.solve_rel_residual,
             );

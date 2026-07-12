@@ -468,7 +468,7 @@ pub(crate) fn run_report_residual_cascade(
     feature_columns: &[String],
     fit: &gam::solver::residual_cascade::ResidualCascadeFit,
 ) -> Result<(), String> {
-    let lambda = fit.log_lambda.exp();
+    let lambda = fit.lambda();
     let mut notes = vec![format!(
         "Exact O(n log n) multiresolution residual cascade for s({features}): \
          λ={lambda:.4e}, σ²={sigma2:.4e}, levels={levels}, centers={centers}, \

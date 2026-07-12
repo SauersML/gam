@@ -344,10 +344,7 @@ pub fn recon_spectrum(
     })?;
     let x = factor.solve_mat(gram);
     let raw_basis_edf = (0..m).map(|i| x[[i, i]]).sum::<f64>();
-    if !raw_basis_edf.is_finite() {
-        return Err("recon_spectrum: basis EDF is non-finite".to_string());
-    }
-    let basis_edf = raw_basis_edf.clamp(0.0, m as f64);
+    let basis_edf = super::construction::certified_basis_edf(raw_basis_edf, m, "recon_spectrum")?;
     Ok(ReconSpectrum {
         mu,
         edge,

@@ -241,8 +241,6 @@ pub struct RowOutput {
     pub w_fisher: f64,
     pub w_hessian: f64,
     pub w_solver: f64,
-    pub z_fisher: f64,
-    pub z_hessian: f64,
     pub deviance: f64,
     pub status: u32,
 }
@@ -277,6 +275,51 @@ pub fn row_reweight_cpu_at(
         PirlsRowFamily::BernoulliLogit => row_bernoulli_logit(row, input, mode),
         PirlsRowFamily::BernoulliProbit => row_bernoulli_probit(row, input, mode),
         PirlsRowFamily::BernoulliCLogLog => row_bernoulli_cloglog(row, input, mode),
+    }
+}
+
+/// Recover the typed error represented by a device status vector.  Device
+/// threads write one code per row, so scanning in index order makes concurrent
+/// failures deterministic.  The scalar CPU replay supplies the exact
+/// quantity/value payload without expanding the hot GPU ABI.
+pub fn replay_first_refusal(
+    family: PirlsRowFamily,
+    mode: CurvatureMode,
+    gamma_shape: f64,
+    eta: &[f64],
+    y: &[f64],
+    prior_weight: &[f64],
+    status: &[u32],
+) -> Result<(), EstimationError> {
+    let n = eta.len();
+    if y.len() != n || prior_weight.len() != n || status.len() != n {
+        return Err(EstimationError::InvalidInput(format!(
+            "GPU PIRLS refusal replay length mismatch: eta={n}, y={}, prior_weight={}, status={}",
+            y.len(),
+            prior_weight.len(),
+            status.len(),
+        )));
+    }
+    let Some((row, &code)) = status
+        .iter()
+        .enumerate()
+        .find(|(_, code)| **code != status_codes::OK)
+    else {
+        return Ok(());
+    };
+    let input = RowInput {
+        eta: eta[row],
+        y: y[row],
+        prior_weight: prior_weight[row],
+    };
+    match row_reweight_cpu_at(row, family, mode, input, gamma_shape) {
+        Err(error) => Err(error),
+        Ok(_) => Err(row_error(
+            row,
+            status_codes::quantity(code),
+            input.eta,
+            f64::from(code),
+        )),
     }
 }
 
@@ -339,8 +382,6 @@ fn certify_output(row: usize, eta: f64, output: RowOutput) -> Result<RowOutput, 
         ("Fisher weight", output.w_fisher),
         ("observed Hessian weight", output.w_hessian),
         ("solver Hessian weight", output.w_solver),
-        ("Fisher working response", output.z_fisher),
-        ("Hessian working response", output.z_hessian),
         ("deviance contribution", output.deviance),
     ] {
         if !value.is_finite() {
@@ -363,10 +404,10 @@ fn row_gaussian_identity(
         return Err(row_error(row, "Gaussian response", input.eta, input.y));
     }
     let resid = input.y - mu;
-    let (grad_eta, z, dev) = if w == 0.0 {
-        (0.0, input.eta, 0.0)
+    let (grad_eta, dev) = if w == 0.0 {
+        (0.0, 0.0)
     } else {
-        (w * resid, input.y, w * resid * resid)
+        (w * resid, w * resid * resid)
     };
     let w_hessian = select_w_hessian(mode, w, 0.0);
     certify_output(
@@ -378,8 +419,6 @@ fn row_gaussian_identity(
             w_fisher: w,
             w_hessian,
             w_solver: w_hessian,
-            z_fisher: z,
-            z_hessian: z,
             deviance: dev,
             status: status_codes::OK,
         },
@@ -403,9 +442,7 @@ fn row_poisson_log(
             input.eta,
             RowOutput {
                 mu,
-                z_fisher: input.eta,
-                z_hessian: input.eta,
-                status: status_codes::OK,
+            status: status_codes::OK,
                 ..RowOutput::default()
             },
         );
@@ -416,6 +453,9 @@ fn row_poisson_log(
     }
     let ratio_resid = input.y / mu - 1.0;
     let z = input.eta + ratio_resid;
+    if !z.is_finite() {
+        return Err(row_error(row, "Poisson working response", input.eta, z));
+    }
     let grad_eta = w_prior * (input.y - mu);
     let dev_term = if input.y > 0.0 {
         input.y * (input.y.ln() - input.eta) - (input.y - mu)
@@ -433,8 +473,6 @@ fn row_poisson_log(
             w_fisher,
             w_hessian,
             w_solver: w_hessian,
-            z_fisher: z,
-            z_hessian: z,
             deviance: dev,
             status: status_codes::OK,
         },
@@ -462,9 +500,7 @@ fn row_gamma_log(
             input.eta,
             RowOutput {
                 mu,
-                z_fisher: input.eta,
-                z_hessian: input.eta,
-                status: status_codes::OK,
+            status: status_codes::OK,
                 ..RowOutput::default()
             },
         );
@@ -488,6 +524,9 @@ fn row_gamma_log(
         ));
     }
     let z = input.eta + ratio_resid;
+    if !z.is_finite() {
+        return Err(row_error(row, "Gamma working response", input.eta, z));
+    }
     let grad_eta = w_fisher * ratio_resid;
     let dev = 2.0 * w_prior * shape * (ratio_resid - (input.y.ln() - input.eta));
     certify_output(
@@ -499,8 +538,6 @@ fn row_gamma_log(
             w_fisher,
             w_hessian,
             w_solver: w_hessian,
-            z_fisher: z,
-            z_hessian: z,
             deviance: dev,
             status: status_codes::OK,
         },
@@ -554,9 +591,7 @@ fn row_bernoulli_logit(
             input.eta,
             RowOutput {
                 mu,
-                z_fisher: input.eta,
-                z_hessian: input.eta,
-                status: status_codes::OK,
+            status: status_codes::OK,
                 ..RowOutput::default()
             },
         );
@@ -567,6 +602,14 @@ fn row_bernoulli_logit(
     }
     let grad_eta = w_prior * residual;
     let z = input.eta + residual / dmu_deta;
+    if !z.is_finite() {
+        return Err(row_error(
+            row,
+            "canonical-logit working response",
+            input.eta,
+            z,
+        ));
+    }
     let dev = bernoulli_logit_deviance(input.y, input.eta, w_prior);
     let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
     certify_output(
@@ -578,8 +621,6 @@ fn row_bernoulli_logit(
             w_fisher,
             w_hessian,
             w_solver: w_hessian,
-            z_fisher: z,
-            z_hessian: z,
             deviance: dev,
             status: status_codes::OK,
         },
@@ -655,9 +696,7 @@ fn row_bernoulli_noncanonical(
             input.eta,
             RowOutput {
                 mu,
-                z_fisher: input.eta,
-                z_hessian: input.eta,
-                status: status_codes::OK,
+            status: status_codes::OK,
                 ..RowOutput::default()
             },
         );
@@ -694,6 +733,9 @@ fn row_bernoulli_noncanonical(
         ));
     }
     let z = input.eta + resid / d1;
+    if !z.is_finite() {
+        return Err(row_error(row, "Bernoulli working response", input.eta, z));
+    }
     let dev = bernoulli_deviance(input.y, mu, w_prior);
     certify_output(
         row,
@@ -704,8 +746,6 @@ fn row_bernoulli_noncanonical(
             w_fisher,
             w_hessian,
             w_solver: w_hessian,
-            z_fisher: z,
-            z_hessian: z,
             deviance: dev,
             status: status_codes::OK,
         },
@@ -1067,11 +1107,8 @@ extern "C" __global__ void {kernel_name}(
     const double* __restrict__ prior_w,
     double* __restrict__ mu_out,
     double* __restrict__ grad_eta_out,
-    double* __restrict__ w_fisher_out,
     double* __restrict__ w_hessian_out,
     double* __restrict__ w_solver_out,
-    double* __restrict__ z_fisher_out,
-    double* __restrict__ z_hessian_out,
     double* __restrict__ deviance_out,
     unsigned int* __restrict__ status_out
 ) {{
@@ -1085,11 +1122,8 @@ extern "C" __global__ void {kernel_name}(
     if (status == PIRLS_OK) {{
         mu_out[i] = mu;
         grad_eta_out[i] = grad_eta;
-        w_fisher_out[i] = w_fisher;
         w_hessian_out[i] = w_hessian;
         w_solver_out[i] = w_solver;
-        z_fisher_out[i] = z_f;
-        z_hessian_out[i] = z_h;
         deviance_out[i] = dev;
     }}
     status_out[i] = status;
@@ -1110,11 +1144,8 @@ extern "C" __global__ void {kernel_name}(
 pub struct RowOutputDevBuffers {
     pub mu: cudarc::driver::CudaSlice<f64>,
     pub grad_eta: cudarc::driver::CudaSlice<f64>,
-    pub w_fisher: cudarc::driver::CudaSlice<f64>,
     pub w_hessian: cudarc::driver::CudaSlice<f64>,
     pub w_solver: cudarc::driver::CudaSlice<f64>,
-    pub z_fisher: cudarc::driver::CudaSlice<f64>,
-    pub z_hessian: cudarc::driver::CudaSlice<f64>,
     pub deviance: cudarc::driver::CudaSlice<f64>,
     pub status: cudarc::driver::CudaSlice<u32>,
     pub n: usize,
@@ -1137,11 +1168,8 @@ impl RowOutputDevBuffers {
         Ok(Self {
             mu: alloc_f64("mu")?,
             grad_eta: alloc_f64("grad_eta")?,
-            w_fisher: alloc_f64("w_fisher")?,
             w_hessian: alloc_f64("w_hessian")?,
             w_solver: alloc_f64("w_solver")?,
-            z_fisher: alloc_f64("z_fisher")?,
-            z_hessian: alloc_f64("z_hessian")?,
             deviance: alloc_f64("deviance")?,
             status: alloc_u32("status")?,
             n,
@@ -1313,11 +1341,8 @@ pub fn launch_row_reweight_on_stream(
     }
     builder.arg(&mut out.mu);
     builder.arg(&mut out.grad_eta);
-    builder.arg(&mut out.w_fisher);
     builder.arg(&mut out.w_hessian);
     builder.arg(&mut out.w_solver);
-    builder.arg(&mut out.z_fisher);
-    builder.arg(&mut out.z_hessian);
     builder.arg(&mut out.deviance);
     builder.arg(&mut out.status);
     // SAFETY: kernel signature for non-GammaLog is (n:i32, 3×const f64*,
@@ -1375,11 +1400,8 @@ pub fn launch_row_reweight_jit_on_stream(
     builder.arg(prior_w_dev);
     builder.arg(&mut out.mu);
     builder.arg(&mut out.grad_eta);
-    builder.arg(&mut out.w_fisher);
     builder.arg(&mut out.w_hessian);
     builder.arg(&mut out.w_solver);
-    builder.arg(&mut out.z_fisher);
-    builder.arg(&mut out.z_hessian);
     builder.arg(&mut out.deviance);
     builder.arg(&mut out.status);
     // SAFETY: JIT spec's `cuda_source` builder emits the same kernel
@@ -1608,11 +1630,11 @@ __device__ __forceinline__ double std_norm_pdf(double x) {
 
 __device__ __forceinline__ bool pirls_outputs_finite(
     double mu, double grad_eta, double w_fisher, double w_hessian,
-    double w_solver, double z_f, double z_h, double dev
+    double w_solver, double z, double dev
 ) {
     return isfinite(mu) && isfinite(grad_eta) && isfinite(w_fisher)
-        && isfinite(w_hessian) && isfinite(w_solver) && isfinite(z_f)
-        && isfinite(z_h) && isfinite(dev);
+        && isfinite(w_hessian) && isfinite(w_solver) && isfinite(z)
+        && isfinite(dev);
 }
 "#,
         log_eta_min = crate::mixture_link::LOG_LINK_SOLVER_ETA_MIN,
@@ -1665,11 +1687,8 @@ extern "C" __global__ void {kernel_name}(
     const double* __restrict__ prior_w,
 {shape_param}    double* __restrict__ mu_out,
     double* __restrict__ grad_eta_out,
-    double* __restrict__ w_fisher_out,
     double* __restrict__ w_hessian_out,
     double* __restrict__ w_solver_out,
-    double* __restrict__ z_fisher_out,
-    double* __restrict__ z_hessian_out,
     double* __restrict__ deviance_out,
     unsigned int* __restrict__ status_out
 ) {{
@@ -1683,11 +1702,8 @@ extern "C" __global__ void {kernel_name}(
     if (status == PIRLS_OK) {{
         mu_out[i] = mu;
         grad_eta_out[i] = grad_eta;
-        w_fisher_out[i] = w_fisher;
         w_hessian_out[i] = w_hessian;
         w_solver_out[i] = w_solver;
-        z_fisher_out[i] = z_f;
-        z_hessian_out[i] = z_h;
         deviance_out[i] = dev;
     }}
     status_out[i] = status;
@@ -1715,7 +1731,7 @@ fn gaussian_identity_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
         r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
-    double w_hessian = 0.0, w_solver = 0.0, z_f = 0.0, z_h = 0.0, dev = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, z = 0.0, dev = 0.0;
     if (!isfinite(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
     if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
         pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
@@ -1727,18 +1743,16 @@ fn gaussian_identity_body(curvature: CurvatureMode) -> String {
         w_hessian = wp;
         w_solver = w_hessian;
         if (wp == 0.0) {{
-            z_f = eta_i;
-            z_h = eta_i;
+            z = eta_i;
         }} else {{
             double resid = y_i - mu;
             grad_eta = wp * resid;
-            z_f = y_i;
-            z_h = y_i;
+            z = y_i;
             dev = wp * resid * resid;
         }}
     }}
     if (status == PIRLS_OK && !pirls_outputs_finite(
-            mu, grad_eta, w_fisher, w_hessian, w_solver, z_f, z_h, dev))
+            mu, grad_eta, w_fisher, w_hessian, w_solver, z, dev))
         pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
@@ -1749,7 +1763,7 @@ fn poisson_log_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
         r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
-    double w_hessian = 0.0, w_solver = 0.0, z_f = 0.0, z_h = 0.0, dev = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, z = 0.0, dev = 0.0;
     if (!pirls_log_eta_valid(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
     if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
         pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
@@ -1760,8 +1774,7 @@ fn poisson_log_body(curvature: CurvatureMode) -> String {
         if (!(isfinite(mu) && mu > 0.0)) pirls_refuse(&status, PIRLS_INVERSE_LINK);
     }}
     if (status == PIRLS_OK && wp == 0.0) {{
-        z_f = eta_i;
-        z_h = eta_i;
+        z = eta_i;
     }}
     if (status == PIRLS_OK && wp > 0.0) {{
         w_fisher = wp * mu;
@@ -1773,9 +1786,8 @@ fn poisson_log_body(curvature: CurvatureMode) -> String {
             grad_eta = wp * (y_i - mu);
             if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
             double ratio_resid = y_i / mu - 1.0;
-            z_f = eta_i + ratio_resid;
-            z_h = z_f;
-            if (!isfinite(z_f)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
+            z = eta_i + ratio_resid;
+            if (!isfinite(z)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
             double dev_term = y_i > 0.0
                 ? y_i * (log(y_i) - eta_i) - (y_i - mu)
                 : mu;
@@ -1784,7 +1796,7 @@ fn poisson_log_body(curvature: CurvatureMode) -> String {
         }}
     }}
     if (status == PIRLS_OK && !pirls_outputs_finite(
-            mu, grad_eta, w_fisher, w_hessian, w_solver, z_f, z_h, dev))
+            mu, grad_eta, w_fisher, w_hessian, w_solver, z, dev))
         pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
@@ -1797,7 +1809,7 @@ fn gamma_log_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
         r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
-    double w_hessian = 0.0, w_solver = 0.0, z_f = 0.0, z_h = 0.0, dev = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, z = 0.0, dev = 0.0;
     if (!pirls_log_eta_valid(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
     if (status == PIRLS_OK && !(isfinite(shape) && shape > 0.0))
         pirls_refuse(&status, PIRLS_GAMMA_SHAPE);
@@ -1810,8 +1822,7 @@ fn gamma_log_body(curvature: CurvatureMode) -> String {
         if (!(isfinite(mu) && mu > 0.0)) pirls_refuse(&status, PIRLS_INVERSE_LINK);
     }}
     if (status == PIRLS_OK && wp == 0.0) {{
-        z_f = eta_i;
-        z_h = eta_i;
+        z = eta_i;
     }}
     if (status == PIRLS_OK && wp > 0.0) {{
         w_fisher = wp * shape;
@@ -1828,14 +1839,13 @@ fn gamma_log_body(curvature: CurvatureMode) -> String {
         double ratio_resid = ratio - 1.0;
         grad_eta = w_fisher * ratio_resid;
         if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
-        z_f = eta_i + ratio_resid;
-        z_h = z_f;
-        if (!isfinite(z_f)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
+        z = eta_i + ratio_resid;
+        if (!isfinite(z)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
         dev = 2.0 * wp * shape * (ratio_resid - (log(y_i) - eta_i));
         if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
     }}
     if (status == PIRLS_OK && !pirls_outputs_finite(
-            mu, grad_eta, w_fisher, w_hessian, w_solver, z_f, z_h, dev))
+            mu, grad_eta, w_fisher, w_hessian, w_solver, z, dev))
         pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
@@ -1846,7 +1856,7 @@ fn bernoulli_logit_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
         r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
-    double w_hessian = 0.0, w_solver = 0.0, z_f = 0.0, z_h = 0.0, dev = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, z = 0.0, dev = 0.0;
     if (!isfinite(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
     if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
         pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
@@ -1863,8 +1873,7 @@ fn bernoulli_logit_body(curvature: CurvatureMode) -> String {
             pirls_refuse(&status, PIRLS_INVERSE_LINK);
     }}
     if (status == PIRLS_OK && wp == 0.0) {{
-        z_f = eta_i;
-        z_h = eta_i;
+        z = eta_i;
     }}
     if (status == PIRLS_OK && wp > 0.0) {{
         double residual;
@@ -1881,14 +1890,13 @@ fn bernoulli_logit_body(curvature: CurvatureMode) -> String {
         w_solver = w_hessian;
         grad_eta = wp * residual;
         if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
-        z_f = eta_i + residual / dmu_deta;
-        z_h = z_f;
-        if (!isfinite(z_f)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
+        z = eta_i + residual / dmu_deta;
+        if (!isfinite(z)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
         dev = logit_deviance(y_i, eta_i, wp);
         if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
     }}
     if (status == PIRLS_OK && !pirls_outputs_finite(
-            mu, grad_eta, w_fisher, w_hessian, w_solver, z_f, z_h, dev))
+            mu, grad_eta, w_fisher, w_hessian, w_solver, z, dev))
         pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
@@ -1899,7 +1907,7 @@ fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
         r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
-    double w_hessian = 0.0, w_solver = 0.0, z_f = 0.0, z_h = 0.0, dev = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, z = 0.0, dev = 0.0;
     if (!isfinite(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
     if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
         pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
@@ -1918,8 +1926,7 @@ fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
             pirls_refuse(&status, PIRLS_INVERSE_LINK);
     }}
     if (status == PIRLS_OK && wp == 0.0) {{
-        z_f = eta_i;
-        z_h = eta_i;
+        z = eta_i;
     }}
     if (status == PIRLS_OK && wp > 0.0) {{
         v = mu * (1.0 - mu);
@@ -1940,14 +1947,13 @@ fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
         w_solver = w_hessian;
         grad_eta = wp * resid * dmu_deta / v;
         if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
-        z_f = eta_i + resid / dmu_deta;
-        z_h = z_f;
-        if (!isfinite(z_f)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
+        z = eta_i + resid / dmu_deta;
+        if (!isfinite(z)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
         dev = bernoulli_deviance(y_i, mu, wp);
         if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
     }}
     if (status == PIRLS_OK && !pirls_outputs_finite(
-            mu, grad_eta, w_fisher, w_hessian, w_solver, z_f, z_h, dev))
+            mu, grad_eta, w_fisher, w_hessian, w_solver, z, dev))
         pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )
@@ -1958,7 +1964,7 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
     let tag = curvature_tag(curvature);
     format!(
         r#"{tag}    double mu = 0.0, grad_eta = 0.0, w_fisher = 0.0;
-    double w_hessian = 0.0, w_solver = 0.0, z_f = 0.0, z_h = 0.0, dev = 0.0;
+    double w_hessian = 0.0, w_solver = 0.0, z = 0.0, dev = 0.0;
     if (!isfinite(eta_i)) pirls_refuse(&status, PIRLS_ETA_DOMAIN);
     if (status == PIRLS_OK && !(isfinite(wp) && wp >= 0.0))
         pirls_refuse(&status, PIRLS_PRIOR_WEIGHT);
@@ -1979,8 +1985,7 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
             pirls_refuse(&status, PIRLS_INVERSE_LINK);
     }}
     if (status == PIRLS_OK && wp == 0.0) {{
-        z_f = eta_i;
-        z_h = eta_i;
+        z = eta_i;
     }}
     if (status == PIRLS_OK && wp > 0.0) {{
         v = mu * (1.0 - mu);
@@ -2001,14 +2006,13 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
         w_solver = w_hessian;
         grad_eta = wp * resid * dmu_deta / v;
         if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
-        z_f = eta_i + resid / dmu_deta;
-        z_h = z_f;
-        if (!isfinite(z_f)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
+        z = eta_i + resid / dmu_deta;
+        if (!isfinite(z)) pirls_refuse(&status, PIRLS_WORKING_RESPONSE);
         dev = bernoulli_deviance(y_i, mu, wp);
         if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
     }}
     if (status == PIRLS_OK && !pirls_outputs_finite(
-            mu, grad_eta, w_fisher, w_hessian, w_solver, z_f, z_h, dev))
+            mu, grad_eta, w_fisher, w_hessian, w_solver, z, dev))
         pirls_refuse(&status, PIRLS_FINAL_OUTPUT);
 "#
     )

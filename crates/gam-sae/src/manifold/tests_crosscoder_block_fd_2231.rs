@@ -43,7 +43,8 @@ fn block_log_lambda_gradient_matches_central_difference() {
         &dims,
         &log_lambda,
         penalty_energy,
-    );
+    )
+    .expect("valid block strengths");
     assert_eq!(analytic.len(), block_rss.len());
 
     let h = 1e-6_f64;
@@ -60,7 +61,8 @@ fn block_log_lambda_gradient_matches_central_difference() {
             &dims,
             &plus,
             penalty_energy,
-        );
+        )
+        .expect("valid plus strength");
         let c_minus = profiled_penalized_quasi_laplace_criterion(
             n_obs,
             p_x,
@@ -69,7 +71,8 @@ fn block_log_lambda_gradient_matches_central_difference() {
             &dims,
             &minus,
             penalty_energy,
-        );
+        )
+        .expect("valid minus strength");
         let fd = (c_plus - c_minus) / (2.0 * h);
         let tol = 1e-5 * (1.0 + analytic[l].abs());
         assert!(
@@ -115,7 +118,8 @@ fn gradient_and_efs_step_vanish_at_variance_ratio_fixed_point() {
         &dims,
         &log_lambda,
         penalty_energy,
-    );
+    )
+    .expect("valid block strengths");
     for (l, g) in grad.iter().enumerate() {
         assert!(
             g.abs() < 1e-9,

@@ -285,6 +285,53 @@ pub(super) fn certified_psd_spectrum(
     Ok(certified)
 }
 
+/// Certify the ridge-trace effective dimension
+/// `tr((G + lambda S)^-1 G)`.  For positive-semidefinite `G` and `S` and a
+/// positive-definite penalized Gram matrix the exact value lies in `[0, m]`.
+/// Only roundoff inside the standard dense-solve backward-error envelope may
+/// be snapped to that interval; a larger excursion is a failed numerical
+/// certificate, not an EDF that may be silently projected to a different
+/// model.
+pub(super) fn certified_basis_edf(
+    raw_basis_edf: f64,
+    basis_dim: usize,
+    context: &str,
+) -> Result<f64, String> {
+    if !raw_basis_edf.is_finite() {
+        return Err(format!("{context}: basis EDF is non-finite"));
+    }
+    let upper = basis_dim as f64;
+    let tolerance = 64.0
+        * upper.max(1.0)
+        * f64::EPSILON
+        * raw_basis_edf.abs().max(upper).max(f64::MIN_POSITIVE);
+    if raw_basis_edf < -tolerance || raw_basis_edf > upper + tolerance {
+        return Err(format!(
+            "{context}: basis EDF {raw_basis_edf:.6e} is outside the certified [0, {upper}] interval (roundoff tolerance {tolerance:.6e})"
+        ));
+    }
+    Ok(raw_basis_edf.clamp(0.0, upper))
+}
+
+#[cfg(test)]
+mod basis_edf_certificate_tests {
+    use super::certified_basis_edf;
+
+    #[test]
+    fn snaps_only_backward_error_scale_boundary_drift() {
+        let drift = 64.0 * f64::EPSILON;
+        assert_eq!(certified_basis_edf(-drift, 4, "test").unwrap(), 0.0);
+        assert_eq!(certified_basis_edf(4.0 + drift, 4, "test").unwrap(), 4.0);
+    }
+
+    #[test]
+    fn refuses_material_or_nonfinite_edf_excursions() {
+        for raw in [-1.0e-8, 4.0 + 1.0e-8, f64::NAN, f64::INFINITY] {
+            assert!(certified_basis_edf(raw, 4, "test").is_err());
+        }
+    }
+}
+
 pub(crate) fn realised_rank_charge_dof(
     gram: &Array2<f64>,
     decoder: &Array2<f64>,
@@ -382,10 +429,7 @@ pub(crate) fn realised_rank_charge_dof(
     })?;
     let x = factor.solve_mat(gram); // X = (G+λS)⁻¹ G
     let raw_basis_edf = (0..m).map(|i| x[[i, i]]).sum::<f64>();
-    if !raw_basis_edf.is_finite() {
-        return Err("realised_rank_charge_dof: basis EDF is non-finite".to_string());
-    }
-    let basis_edf = raw_basis_edf.clamp(0.0, m as f64);
+    let basis_edf = certified_basis_edf(raw_basis_edf, m, "realised_rank_charge_dof")?;
     Ok(rank.production_chargeable_rank as f64 * basis_edf)
 }
 

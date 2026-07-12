@@ -211,7 +211,8 @@ impl SaeManifoldTerm {
         // (converged weights) is installed on the term at the end.
         let range_layout = CrosscoderLayout::from_blocks(px, blocks);
         let dims: Vec<usize> = range_layout.block_dims().to_vec();
-        let mut cur_log_lambda: Vec<f64> = blocks.iter().map(|b| b.log_lambda).collect();
+        let mut cur_log_lambda: Vec<f64> =
+            blocks.iter().map(OutputBlock::log_lambda).collect();
         let mut trajectories: Vec<Vec<f64>> = vec![Vec::with_capacity(max_sweeps); blocks.len()];
         let mut identifiable = vec![true; blocks.len()];
         let mut converged = false;
@@ -304,7 +305,7 @@ impl SaeManifoldTerm {
                 &dims,
                 &cur_log_lambda,
                 base_pen,
-            );
+            )?;
             // The improved current-λ fit to fall back to if no λ step is accepted.
             let baseline_state = self.fit_state_snapshot();
             // The term currently holds this baseline fit; record its loss so any
@@ -475,7 +476,7 @@ impl SaeManifoldTerm {
                         &dims,
                         &trial_ll,
                         trial_pen,
-                    );
+                    )?;
                     Ok(Some((trial_crit, (trial_ll, trial_loss))))
                 };
 
@@ -556,7 +557,7 @@ impl SaeManifoldTerm {
             .enumerate()
             .map(|(idx, block)| BlockRemlOutcome {
                 label: block.label.clone(),
-                log_lambda: block.log_lambda,
+                log_lambda: block.log_lambda(),
                 identifiable: identifiable[idx],
                 trajectory: std::mem::take(&mut trajectories[idx]),
             })
@@ -790,7 +791,7 @@ impl SaeManifoldTerm {
         let mut output_blocks = vec![OutputBlock::new(
             "behavior",
             block.target.clone(),
-            block.log_lambda_y,
+            block.log_lambda_y(),
         )?];
         let report = self.run_multiblock_reml_fit(
             activation,
@@ -803,7 +804,7 @@ impl SaeManifoldTerm {
         // Keep the term's installed behavior block in sync with the selected
         // weight — the two-block contract that `behavior_block()` (and hence
         // `split_decoder` / `augmented_target`) reflects the converged λ_y.
-        let fitted_block = block.with_log_lambda_y(output_blocks[0].log_lambda)?;
+        let fitted_block = block.with_log_lambda_y(output_blocks[0].log_lambda())?;
         self.set_behavior_block(fitted_block)?;
 
         let outcome = &report.blocks[0];

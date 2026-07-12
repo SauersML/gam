@@ -867,7 +867,8 @@ fn penalized_gaussian_fit(
         .first()
         .map(|row| row.len())
         .ok_or_else(|| "penalized_gaussian_fit: empty design".to_string())?;
-    let lambda = log_lambda.exp();
+    let lambda = gam_problem::checked_exp_log_strength(log_lambda)
+        .map_err(|error| format!("penalized Gaussian coactivation fit: {error}"))?;
     let mut xtwx = vec![vec![0.0_f64; p]; p];
     let mut xtwy = vec![0.0_f64; p];
     let mut ywy = 0.0_f64;

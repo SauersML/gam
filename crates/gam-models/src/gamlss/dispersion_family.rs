@@ -707,10 +707,10 @@ fn nb_log_precision_fisher_jensen(mu: f64, theta: f64) -> f64 {
         + (inv * inv2 * inv2 / 42.0) * one_minus_r7
 }
 
-/// Gamma row NLL value, plain `f64`, bit-identical to
+/// Gamma row log-likelihood, plain `f64`, bit-identical to
 /// `-dispersion_gamma_disp_order2(..).value()`.
 #[inline]
-fn dispersion_gamma_neg_loglik(yi: f64, y_pos: f64, mu: f64, nu: f64, wi: f64) -> f64 {
+fn dispersion_gamma_loglik(yi: f64, y_pos: f64, mu: f64, nu: f64, wi: f64) -> f64 {
     // NB: the jet forms `μ.recip().scale(yi)` = `(1/μ)·yᵢ` (reciprocal then
     // multiply), NOT `yᵢ/μ` (single divide) — these differ in the last bit, so
     // the value path must reproduce the reciprocal-then-multiply exactly.
@@ -719,10 +719,10 @@ fn dispersion_gamma_neg_loglik(yi: f64, y_pos: f64, mu: f64, nu: f64, wi: f64) -
     -(s * -wi)
 }
 
-/// Beta row NLL value, plain `f64`, bit-identical to
+/// Beta row log-likelihood, plain `f64`, bit-identical to
 /// `-dispersion_beta_nll_order2(..).value()`.
 #[inline]
-fn dispersion_beta_neg_loglik(yi: f64, mu: f64, phi: f64, wi: f64) -> f64 {
+fn dispersion_beta_loglik(yi: f64, mu: f64, phi: f64, wi: f64) -> f64 {
     let one_minus_mu = 1.0 - mu;
     let yc = yi;
     let a = mu * phi;
@@ -732,10 +732,10 @@ fn dispersion_beta_neg_loglik(yi: f64, mu: f64, phi: f64, wi: f64) -> f64 {
     -(s * -wi)
 }
 
-/// Tweedie row NLL value, plain `f64`, bit-identical to
+/// Tweedie row log-likelihood, plain `f64`, bit-identical to
 /// `-dispersion_tweedie_disp_order2(..).value()` (both density branches).
 #[inline]
-fn dispersion_tweedie_neg_loglik(yi: f64, eta_mu: f64, eta_d: f64, p: f64, wi: f64) -> f64 {
+fn dispersion_tweedie_loglik(yi: f64, eta_mu: f64, eta_d: f64, p: f64, wi: f64) -> f64 {
     let one_minus_p = 1.0 - p;
     let two_minus_p = 2.0 - p;
     let mu = eta_mu.exp();
@@ -787,14 +787,14 @@ pub(crate) fn dispersion_row_loglik(
             let mu = em.exp();
             let nu = ed.exp();
             let y_pos = yi;
-            dispersion_gamma_neg_loglik(yi, y_pos, mu, nu, wi)
+            dispersion_gamma_loglik(yi, y_pos, mu, nu, wi)
         }
         DispersionFamilyKind::Beta => {
             let mu = gam_linalg::utils::stable_logistic(em);
             let phi = ed.exp();
-            dispersion_beta_neg_loglik(yi, mu, phi, wi)
+            dispersion_beta_loglik(yi, mu, phi, wi)
         }
-        DispersionFamilyKind::Tweedie { p } => dispersion_tweedie_neg_loglik(yi, em, ed, p, wi),
+        DispersionFamilyKind::Tweedie { p } => dispersion_tweedie_loglik(yi, em, ed, p, wi),
     }
 }
 
@@ -2289,7 +2289,7 @@ mod tests {
                 assert_eq!(bits(full.g()[1]), bits(prn.g()[0]), "gamma grad");
                 assert_eq!(bits(full.h()[1][1]), bits(prn.h()[0][0]), "gamma hess");
                 assert_eq!(
-                    bits(dispersion_gamma_neg_loglik(yi, y_pos, mu, nu, wi)),
+                    bits(dispersion_gamma_loglik(yi, y_pos, mu, nu, wi)),
                     bits(-prn.value()),
                     "gamma value-only"
                 );
@@ -2301,7 +2301,7 @@ mod tests {
                 let yi = next();
                 let full = dispersion_beta_nll_order2(yi, mu, phi, wi);
                 assert_eq!(
-                    bits(dispersion_beta_neg_loglik(yi, mu, phi, wi)),
+                    bits(dispersion_beta_loglik(yi, mu, phi, wi)),
                     bits(-full.value()),
                     "beta value-only"
                 );
@@ -2330,7 +2330,7 @@ mod tests {
                 assert_eq!(bits(full.g()[1]), bits(prn.g()[0]), "tweedie grad");
                 assert_eq!(bits(full.h()[1][1]), bits(prn.h()[0][0]), "tweedie hess");
                 assert_eq!(
-                    bits(dispersion_tweedie_neg_loglik(yi, em, ed, p, wi)),
+                    bits(dispersion_tweedie_loglik(yi, em, ed, p, wi)),
                     bits(-prn.value()),
                     "tweedie value-only"
                 );

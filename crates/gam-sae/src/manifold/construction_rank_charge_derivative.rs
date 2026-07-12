@@ -124,8 +124,12 @@ impl SaeManifoldTerm {
             let inverse = factor.solve_mat(&Array2::<f64>::eye(m));
             let edf_matrix = factor.solve_mat(gram);
             let raw_edf = (0..m).map(|i| edf_matrix[[i, i]]).sum::<f64>();
-            let edf_is_interior = raw_edf > 0.0 && raw_edf < m as f64;
-            let edf = raw_edf.clamp(0.0, m as f64);
+            let edf = super::construction::certified_basis_edf(
+                raw_edf,
+                m,
+                "production_rank_charge_derivative",
+            )?;
+            let edf_is_interior = edf > 0.0 && edf < m as f64;
             let mut gram_differential = Array2::<f64>::zeros((m, m));
             let mut log_lambda_differential = 0.0_f64;
             if edf_is_interior {

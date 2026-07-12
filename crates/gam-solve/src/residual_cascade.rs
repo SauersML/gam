@@ -482,7 +482,7 @@ pub struct ResidualCascadeFit {
     /// Coefficients: `dim+1` polynomial entries, then level blocks.
     pub coeff: Vec<f64>,
     /// Selected (or supplied) log smoothing parameter `log λ = log σ²/τ²`.
-    pub log_lambda: f64,
+    log_lambda: f64,
     /// Profiled (or supplied) observation variance σ².
     pub sigma2: f64,
     /// Restricted log-likelihood at the fit, up to λ- and data-independent
@@ -2438,6 +2438,15 @@ impl CoreScaffold<'_> {
 }
 
 impl ResidualCascadeFit {
+    pub fn log_lambda(&self) -> f64 {
+        self.log_lambda
+    }
+
+    pub fn lambda(&self) -> f64 {
+        gam_problem::checked_exp_log_strength(self.log_lambda)
+            .expect("ResidualCascadeFit construction validates its private log strength")
+    }
+
     /// Posterior `(mean, variance)` at a raw point: the sparse basis row
     /// dotted with the coefficients, and `σ̂²·x'(X'WX+λD)^{−1}x` through one
     /// certified solve.

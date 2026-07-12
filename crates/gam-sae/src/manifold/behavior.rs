@@ -481,7 +481,9 @@ pub struct BehaviorBlock {
     /// `log(λ_y)`; the relative weight of the behavior block. Fixed in Inc2,
     /// REML-selected in Inc3. `λ_y = 1` (log 0) weights nats-in-behavior equally
     /// with the activation reconstruction's own units.
-    pub log_lambda_y: f64,
+    log_lambda_y: f64,
+    lambda_y: f64,
+    sqrt_lambda_y: f64,
 }
 
 impl BehaviorBlock {
@@ -496,17 +498,18 @@ impl BehaviorBlock {
         if activation_dim == 0 {
             return Err("BehaviorBlock::fit: activation_dim must be positive".into());
         }
-        if !log_lambda_y.is_finite() {
-            return Err(format!(
-                "BehaviorBlock::fit: log_lambda_y must be finite; got {log_lambda_y}"
-            ));
-        }
+        let lambda_y = gam_problem::checked_exp_log_strength(log_lambda_y)
+            .map_err(|error| format!("BehaviorBlock::fit: {error}"))?;
+        let sqrt_lambda_y = gam_problem::checked_exp_log_strength(0.5 * log_lambda_y)
+            .map_err(|error| format!("BehaviorBlock::fit square-root strength: {error}"))?;
         let (embedding, target) = SphereTangentEmbedding::fit(prob_rows)?;
         Ok(Self {
             embedding,
             target,
             activation_dim,
             log_lambda_y,
+            lambda_y,
+            sqrt_lambda_y,
         })
     }
 
@@ -522,13 +525,17 @@ impl BehaviorBlock {
 
     /// The behavior block weight `λ_y = exp(log_lambda_y)`.
     pub fn lambda_y(&self) -> f64 {
-        self.log_lambda_y.exp()
+        self.lambda_y
     }
 
     /// `√λ_y`, the per-column scaling applied to the behavior target so a single
     /// shared dispersion realizes the block variance ratio.
     pub fn sqrt_lambda_y(&self) -> f64 {
-        (0.5 * self.log_lambda_y).exp()
+        self.sqrt_lambda_y
+    }
+
+    pub fn log_lambda_y(&self) -> f64 {
+        self.log_lambda_y
     }
 
     /// Stack the activation target `Z` (`n × p_x`) with the `√λ_y`-scaled
@@ -603,13 +610,16 @@ impl BehaviorBlock {
     /// `λ_y` without ever re-embedding. The new augmented target is recovered by
     /// [`Self::augmented_target`] at the updated weight.
     pub fn with_log_lambda_y(&self, log_lambda_y: f64) -> Result<Self, String> {
-        if !log_lambda_y.is_finite() {
-            return Err(format!(
-                "BehaviorBlock::with_log_lambda_y: log_lambda_y must be finite; got {log_lambda_y}"
-            ));
-        }
+        let lambda_y = gam_problem::checked_exp_log_strength(log_lambda_y)
+            .map_err(|error| format!("BehaviorBlock::with_log_lambda_y: {error}"))?;
+        let sqrt_lambda_y = gam_problem::checked_exp_log_strength(0.5 * log_lambda_y)
+            .map_err(|error| {
+                format!("BehaviorBlock::with_log_lambda_y square-root strength: {error}")
+            })?;
         let mut next = self.clone();
         next.log_lambda_y = log_lambda_y;
+        next.lambda_y = lambda_y;
+        next.sqrt_lambda_y = sqrt_lambda_y;
         Ok(next)
     }
 
@@ -750,7 +760,9 @@ pub struct OutputBlock {
     pub target: Array2<f64>,
     /// `log(λ_ℓ)`; the relative inferential weight of this block. Moved by the
     /// closed-form REML variance-ratio update, never a knob.
-    pub log_lambda: f64,
+    log_lambda: f64,
+    lambda: f64,
+    sqrt_lambda: f64,
 }
 
 impl OutputBlock {
@@ -767,15 +779,16 @@ impl OutputBlock {
                 "OutputBlock::new: target must be a non-empty (n × p_ℓ) matrix; got ({n}, {p})"
             ));
         }
-        if !log_lambda.is_finite() {
-            return Err(format!(
-                "OutputBlock::new: log_lambda must be finite; got {log_lambda}"
-            ));
-        }
+        let lambda = gam_problem::checked_exp_log_strength(log_lambda)
+            .map_err(|error| format!("OutputBlock::new: {error}"))?;
+        let sqrt_lambda = gam_problem::checked_exp_log_strength(0.5 * log_lambda)
+            .map_err(|error| format!("OutputBlock::new square-root strength: {error}"))?;
         Ok(Self {
             label: label.into(),
             target,
             log_lambda,
+            lambda,
+            sqrt_lambda,
         })
     }
 
@@ -786,25 +799,31 @@ impl OutputBlock {
 
     /// The block weight `λ_ℓ = exp(log_lambda)`.
     pub fn lambda(&self) -> f64 {
-        self.log_lambda.exp()
+        self.lambda
     }
 
     /// `√λ_ℓ`, the per-column scaling applied to the target so a single shared
     /// dispersion realizes the block's variance ratio.
     pub fn sqrt_lambda(&self) -> f64 {
-        (0.5 * self.log_lambda).exp()
+        self.sqrt_lambda
+    }
+
+    pub fn log_lambda(&self) -> f64 {
+        self.log_lambda
     }
 
     /// A copy re-weighted to a new `log(λ_ℓ)` (the target is untouched, so a REML
     /// sweep re-weights without re-forming `Y_ℓ`).
     pub fn with_log_lambda(&self, log_lambda: f64) -> Result<Self, String> {
-        if !log_lambda.is_finite() {
-            return Err(format!(
-                "OutputBlock::with_log_lambda: log_lambda must be finite; got {log_lambda}"
-            ));
-        }
+        let lambda = gam_problem::checked_exp_log_strength(log_lambda)
+            .map_err(|error| format!("OutputBlock::with_log_lambda: {error}"))?;
+        let sqrt_lambda = gam_problem::checked_exp_log_strength(0.5 * log_lambda).map_err(
+            |error| format!("OutputBlock::with_log_lambda square-root strength: {error}"),
+        )?;
         let mut next = self.clone();
         next.log_lambda = log_lambda;
+        next.lambda = lambda;
+        next.sqrt_lambda = sqrt_lambda;
         Ok(next)
     }
 
@@ -1108,17 +1127,20 @@ pub fn profiled_penalized_quasi_laplace_criterion(
     block_dims: &[usize],
     block_log_lambda: &[f64],
     penalty_energy: f64,
-) -> f64 {
+) -> Result<f64, String> {
+    let lambdas = gam_problem::checked_exp_log_strengths(block_log_lambda.iter().copied())
+        .map_err(|error| format!("profiled block criterion: {error}"))?;
     let n = n_obs as f64;
     let mut p_tilde = p_x as f64;
     let mut pooled = rss_x;
     let mut jac = 0.0_f64;
-    for ((&rss, &dim), &log_lambda) in block_rss_unscaled
+    for (((&rss, &dim), &log_lambda), &lambda) in block_rss_unscaled
         .iter()
         .zip(block_dims.iter())
         .zip(block_log_lambda.iter())
+        .zip(lambdas.iter())
     {
-        pooled += log_lambda.exp() * rss;
+        pooled += lambda * rss;
         p_tilde += dim as f64;
         jac += (dim as f64) * log_lambda;
     }
@@ -1126,9 +1148,9 @@ pub fn profiled_penalized_quasi_laplace_criterion(
     // term — held fixed w.r.t. `log λ_ℓ`, see the item comment above).
     pooled += penalty_energy;
     if !(pooled > 0.0) {
-        return f64::INFINITY;
+        return Ok(f64::INFINITY);
     }
-    0.5 * n * p_tilde * (pooled / (n * p_tilde)).ln() - 0.5 * n * jac
+    Ok(0.5 * n * p_tilde * (pooled / (n * p_tilde)).ln() - 0.5 * n * jac)
 }
 
 /// The analytic outer gradient of [`profiled_penalized_quasi_laplace_criterion`] with respect
@@ -1167,31 +1189,33 @@ pub fn profiled_penalized_quasi_laplace_block_log_lambda_gradient(
     block_dims: &[usize],
     block_log_lambda: &[f64],
     penalty_energy: f64,
-) -> Vec<f64> {
+) -> Result<Vec<f64>, String> {
+    let lambdas = gam_problem::checked_exp_log_strengths(block_log_lambda.iter().copied())
+        .map_err(|error| format!("profiled block gradient: {error}"))?;
     let n = n_obs as f64;
     let mut p_tilde = p_x as f64;
     let mut pooled = rss_x;
-    for ((&rss, &dim), &log_lambda) in block_rss_unscaled
+    for ((&rss, &dim), &lambda) in block_rss_unscaled
         .iter()
         .zip(block_dims.iter())
-        .zip(block_log_lambda.iter())
+        .zip(lambdas.iter())
     {
-        pooled += log_lambda.exp() * rss;
+        pooled += lambda * rss;
         p_tilde += dim as f64;
     }
     pooled += penalty_energy;
     if !(pooled > 0.0) {
-        return vec![0.0; block_rss_unscaled.len()];
+        return Ok(vec![0.0; block_rss_unscaled.len()]);
     }
-    block_rss_unscaled
+    Ok(block_rss_unscaled
         .iter()
         .zip(block_dims.iter())
-        .zip(block_log_lambda.iter())
-        .map(|((&rss, &dim), &log_lambda)| {
-            let lambda_r = log_lambda.exp() * rss;
+        .zip(lambdas.iter())
+        .map(|((&rss, &dim), &lambda)| {
+            let lambda_r = lambda * rss;
             0.5 * n * p_tilde * lambda_r / pooled - 0.5 * n * dim as f64
         })
-        .collect()
+        .collect())
 }
 
 /// The Fellner–Schall / MacKay closed-form fixed-point STEP on each block weight

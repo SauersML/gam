@@ -533,35 +533,62 @@ pub fn run_atom_birth_gate<S, A>(
 /// independence assumptions — atoms sharing every token is fine; that is
 /// exactly the case p-value BH cannot legally handle (PRDS violation) and
 /// e-BH can.
-pub fn e_benjamini_hochberg(log_e_values: &[f64], alpha: f64) -> Vec<usize> {
-    let m = log_e_values.len();
-    if m == 0 || !(alpha.is_finite() && alpha > 0.0) {
-        return Vec::new();
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EBhError {
+    InvalidAlpha { alpha: f64 },
+    InvalidLogEvidence { claim: usize, value: f64 },
+}
+
+impl std::fmt::Display for EBhError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidAlpha { alpha } => {
+                write!(f, "e-BH alpha must be finite and lie in (0, 1); got {alpha}")
+            }
+            Self::InvalidLogEvidence { claim, value } => {
+                write!(f, "e-BH log evidence for claim {claim} must not be NaN; got {value}")
+            }
+        }
     }
-    // Robustness: a degenerate claim can bank a non-finite log e-value (a
-    // NaN from an upstream `(−∞) − (−∞)` split-LR that escaped the source
-    // guard). This is the documented honest FDR surface, so it must NEVER
-    // panic on such input. Treat any NaN as least-evidence (`−∞`): an
-    // undefined/contested claim contributes no evidence, sorts last, and can
-    // never be among the rejections. Finite/±∞ values pass through unchanged;
-    // `total_cmp` then gives a total order on the sanitized keys.
-    let sanitized: Vec<f64> = log_e_values
+}
+
+impl std::error::Error for EBhError {}
+
+pub fn e_benjamini_hochberg(
+    log_e_values: &[f64],
+    alpha: f64,
+) -> Result<Vec<usize>, EBhError> {
+    if !(alpha.is_finite() && alpha > 0.0 && alpha < 1.0) {
+        return Err(EBhError::InvalidAlpha { alpha });
+    }
+    let m = log_e_values.len();
+    if m == 0 {
+        return Ok(Vec::new());
+    }
+    // The extended-real endpoints are meaningful: -infinity is the exact
+    // zero e-value and +infinity is decisive evidence on a null-zero-density
+    // event. NaN has no statistical meaning and must fail the entire
+    // certificate rather than being silently recoded as a different claim.
+    if let Some((claim, &value)) = log_e_values
         .iter()
-        .map(|&v| if v.is_nan() { f64::NEG_INFINITY } else { v })
-        .collect();
+        .enumerate()
+        .find(|(_, value)| value.is_nan())
+    {
+        return Err(EBhError::InvalidLogEvidence { claim, value });
+    }
     let mut order: Vec<usize> = (0..m).collect();
-    order.sort_by(|&a, &b| sanitized[b].total_cmp(&sanitized[a]));
+    order.sort_by(|&a, &b| log_e_values[b].total_cmp(&log_e_values[a]));
     let m_f = m as f64;
     let mut k_star = 0usize;
     for (rank0, &idx) in order.iter().enumerate() {
         let k = (rank0 + 1) as f64;
         // e_(k) ≥ m / (α k)  ⟺  log e_(k) ≥ log m − log α − log k
-        if sanitized[idx] >= m_f.ln() - alpha.ln() - k.ln() {
+        if log_e_values[idx] >= m_f.ln() - alpha.ln() - k.ln() {
             k_star = rank0 + 1;
         }
     }
     order.truncate(k_star);
-    order
+    Ok(order)
 }
 
 /// What one structural claim asserts about the dictionary. One e-process
@@ -668,13 +695,13 @@ impl StructureLedger {
     /// stopping time because each entry is an e-process. Claims not
     /// confirmed are CONTESTED, never rejected (demote-never-reject); they
     /// keep their evidence and are the inputs to the probe-design loop.
-    pub fn certify(&self, alpha: f64) -> StructureCertificate {
+    pub fn certify(&self, alpha: f64) -> Result<StructureCertificate, EBhError> {
         let log_e: Vec<f64> = self
             .claims
             .iter()
             .map(|c| c.evidence.current_e_value_log())
             .collect();
-        let confirmed_idx = e_benjamini_hochberg(&log_e, alpha);
+        let confirmed_idx = e_benjamini_hochberg(&log_e, alpha)?;
         let mut entries: Vec<CertificateEntry> = self
             .claims
             .iter()
@@ -689,7 +716,7 @@ impl StructureLedger {
         for &i in &confirmed_idx {
             entries[i].confirmed = true;
         }
-        StructureCertificate { alpha, entries }
+        Ok(StructureCertificate { alpha, entries })
     }
 }
 

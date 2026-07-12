@@ -177,6 +177,45 @@ pub(crate) mod cuda {
     };
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
+    /// Device/runtime failures stay distinct from exact statistical row
+    /// refusals.  The latter cross the GPU dispatch boundary as their original
+    /// typed [`gam_problem::EstimationError`] instead of being stringified or
+    /// retried on a different numerical path.
+    #[derive(Debug)]
+    pub enum PirlsGpuLoopError {
+        Geometry(gam_problem::EstimationError),
+        Runtime(String),
+    }
+
+    impl std::fmt::Display for PirlsGpuLoopError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Geometry(error) => error.fmt(f),
+                Self::Runtime(message) => f.write_str(message),
+            }
+        }
+    }
+
+    impl std::error::Error for PirlsGpuLoopError {}
+
+    impl From<String> for PirlsGpuLoopError {
+        fn from(message: String) -> Self {
+            Self::Runtime(message)
+        }
+    }
+
+    impl From<&str> for PirlsGpuLoopError {
+        fn from(message: &str) -> Self {
+            Self::Runtime(message.to_owned())
+        }
+    }
+
+    impl From<gam_problem::EstimationError> for PirlsGpuLoopError {
+        fn from(error: gam_problem::EstimationError) -> Self {
+            Self::Geometry(error)
+        }
+    }
+
     /// One-thread reduction over a p×p column-major Cholesky factor's
     /// diagonal, computing `2·Σ ln(L[i,i])` device-side and writing a
     /// single f64 into `out[0]`. The factor's lower-triangular Cholesky
@@ -1970,28 +2009,78 @@ extern "C" __global__ void negate_n(
     v[i] = -v[i];
 }
 
-// OR-reduction over a u32 status array (length n).  Single-block;
-// same launch config as deviance_sum (1 block of 1024 threads).
-// out[0] receives the bitwise-OR of all status[i] for i in [0, n).
-extern "C" __global__ void status_or(
+// Deterministically select the smallest failing row. out[0] is UINT_MAX on
+// success, otherwise the row index; out[1] carries that row's refusal code.
+extern "C" __global__ void status_first(
     const unsigned int* __restrict__ status,
     int n,
     unsigned int* __restrict__ out
 ) {
-    __shared__ unsigned int sm[1024];
+    __shared__ unsigned int sm_row[1024];
+    __shared__ unsigned int sm_code[1024];
     int tid = threadIdx.x;
     int bdim = blockDim.x;
-    unsigned int acc = 0u;
+    unsigned int best_row = 0xffffffffu;
+    unsigned int best_code = 0u;
     for (int i = tid; i < n; i += bdim) {
-        acc |= status[i];
+        unsigned int code = status[i];
+        if (code != 0u && (unsigned int)i < best_row) {
+            best_row = (unsigned int)i;
+            best_code = code;
+        }
     }
-    sm[tid] = acc;
+    sm_row[tid] = best_row;
+    sm_code[tid] = best_code;
     __syncthreads();
     for (int stride = bdim / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) sm[tid] |= sm[tid + stride];
+        if (tid < stride && sm_row[tid + stride] < sm_row[tid]) {
+            sm_row[tid] = sm_row[tid + stride];
+            sm_code[tid] = sm_code[tid + stride];
+        }
         __syncthreads();
     }
-    if (tid == 0) out[0] = sm[0];
+    if (tid == 0) {
+        out[0] = sm_row[0];
+        out[1] = sm_code[0];
+    }
+}
+
+// Same deterministic reduction for the alpha-major [7*n] ladder status
+// matrix. One block handles each alpha; outputs are row[0..7), code[7..14).
+extern "C" __global__ void status_first_ladder(
+    const unsigned int* __restrict__ status,
+    int n,
+    unsigned int* __restrict__ out
+) {
+    __shared__ unsigned int sm_row[1024];
+    __shared__ unsigned int sm_code[1024];
+    int k = blockIdx.x;
+    int tid = threadIdx.x;
+    int bdim = blockDim.x;
+    unsigned int best_row = 0xffffffffu;
+    unsigned int best_code = 0u;
+    const unsigned int* candidate = status + ((long long)k * n);
+    for (int i = tid; i < n; i += bdim) {
+        unsigned int code = candidate[i];
+        if (code != 0u && (unsigned int)i < best_row) {
+            best_row = (unsigned int)i;
+            best_code = code;
+        }
+    }
+    sm_row[tid] = best_row;
+    sm_code[tid] = best_code;
+    __syncthreads();
+    for (int stride = bdim / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && sm_row[tid + stride] < sm_row[tid]) {
+            sm_row[tid] = sm_row[tid + stride];
+            sm_code[tid] = sm_code[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[k] = sm_row[0];
+        out[7 + k] = sm_code[0];
+    }
 }
 "#;
 
@@ -2039,7 +2128,7 @@ extern "C" __global__ void status_or(
                 row_solve: crate::gpu_kernels::pirls_row::SolveRowBuffers::allocate(stream, n)
                     .map_err(|e| format!("pirls loop alloc row_solve: {e}"))?,
                 alpha_ladder: crate::gpu_kernels::pirls_row::AlphaLadderDevBuffers::allocate(
-                    stream,
+                    stream, n,
                 )
                 .map_err(|e| format!("pirls loop alloc alpha_ladder: {e}"))?,
                 row_final: crate::gpu_kernels::pirls_row::RowOutputDevBuffers::allocate(stream, n)
