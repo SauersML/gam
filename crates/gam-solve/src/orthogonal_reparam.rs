@@ -78,11 +78,11 @@
 
 use ndarray::{Array1, Array2, ArrayView2};
 
-use faer::Side;
 use gam_linalg::faer_ndarray::{
     FaerArrayView, factorize_symmetricwith_fallback, fast_ab, fast_xt_diag_x, fast_xt_diag_y,
 };
 use gam_linalg::matrix::FactorizedSystem;
+use faer::Side;
 
 /// Relative ridge (vs. the largest weighted primary-Gram diagonal) added to
 /// `MᵀW M` before forming the projection coefficients `B`. It only regularizes a

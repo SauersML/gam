@@ -232,10 +232,7 @@ fn recover_column_log_amplitudes(
         return (slope, intercept);
     }
     let psi_bar = node_psis.iter().sum::<f64>() / m as f64;
-    let denom = node_psis
-        .iter()
-        .map(|&p| (p - psi_bar).powi(2))
-        .sum::<f64>();
+    let denom = node_psis.iter().map(|&p| (p - psi_bar).powi(2)).sum::<f64>();
     if !(denom > 0.0) {
         return (slope, intercept);
     }

@@ -103,8 +103,11 @@ impl PirlsWorkspace {
         x: &Array2<f64>,
         out: &mut Array2<f64>,
     ) {
-        *out =
-            crate::estimate::reml::assembly::xt_diag_x_dense_into(x, weights, weighted_x_scratch);
+        *out = crate::estimate::reml::assembly::xt_diag_x_dense_into(
+            x,
+            weights,
+            weighted_x_scratch,
+        );
     }
 
     /// Ensure the sparse penalty cache is populated and consistent with `x` and `s_lambda`.

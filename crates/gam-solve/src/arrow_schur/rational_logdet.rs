@@ -355,14 +355,8 @@ impl RationalLogdetPlan {
         let probes_proj = self.projected_probes(basis);
 
         // Shifted solves for the projected probes and (if any) the basis columns.
-        let (shifted, iters_probe) = solve_shift_ladder(
-            matvec,
-            &self.nodes,
-            &order,
-            &probes_proj,
-            cg_rel_tol,
-            cg_max_iters,
-        )?;
+        let (shifted, iters_probe) =
+            solve_shift_ladder(matvec, &self.nodes, &order, &probes_proj, cg_rel_tol, cg_max_iters)?;
         let (deflation_solves, iters_basis) = if basis.is_empty() {
             (Vec::new(), 0)
         } else {
@@ -895,10 +889,7 @@ mod tests {
             "surrogate gradient {grad:.9e} vs its own FD {fd:.9e} (rel {rel:.3e})"
         );
         // Sign sanity: derivative of log det along an SPD direction is positive.
-        assert!(
-            grad > 0.0,
-            "SPD direction must increase log det, got {grad}"
-        );
+        assert!(grad > 0.0, "SPD direction must increase log det, got {grad}");
     }
 
     #[test]
@@ -944,8 +935,8 @@ mod tests {
     fn two_sided_deflation_propagates_bottom_solve_nonconvergence() {
         let a = array![[1.0, 0.0], [0.0, 4.0]];
         let matvec = |v: ArrayView1<f64>| a.dot(&v);
-        let plan =
-            RationalLogdetPlan::build(2, 2, 17, 1.0, 4.0, 1.0e-9).expect("valid rational plan");
+        let plan = RationalLogdetPlan::build(2, 2, 17, 1.0, 4.0, 1.0e-9)
+            .expect("valid rational plan");
         assert!(
             plan.with_two_sided_deflation(&matvec, 0, 1, 1, 91, (1.0e-12, 0))
                 .is_none(),
@@ -1092,9 +1083,7 @@ mod tests {
     /// bookkeeping. Any gap between this and the exact log-det is then split/Q
     /// structure (or quadrature/probe), never CG solve error, since there is none.
     fn evaluate_exact(plan: &RationalLogdetPlan, a: &Array2<f64>) -> RationalLogdetEval {
-        use gam_linalg::triangular::{
-            CholeskyGuard, cholesky_factor_in_place, cholesky_solve_vector,
-        };
+        use gam_linalg::triangular::{CholeskyGuard, cholesky_factor_in_place, cholesky_solve_vector};
         let basis: &[Array1<f64>] = plan
             .deflation
             .as_ref()
@@ -1301,8 +1290,7 @@ mod tests {
         // bias". Fingerprint every probe's sign pattern (dim ≤ 128) and require near
         // all distinct, so an RNG regression that re-aliases the seeds fails HERE
         // rather than resurfacing as a phantom quadrature/split bias.
-        let mut probe_fingerprints: std::collections::HashSet<u128> =
-            std::collections::HashSet::new();
+        let mut probe_fingerprints: std::collections::HashSet<u128> = std::collections::HashSet::new();
         for s in 0..k_seeds {
             let plan = RationalLogdetPlan::build(dim, 32, 9000 + s as u64, lmin, lmax, 1e-9)
                 .expect("plan")
@@ -1474,9 +1462,7 @@ mod tests {
             .map(|_| 10f64.powf(next_uniform(&mut state, -2.0, 2.0)))
             .collect();
         let (a, _) = spd_with_spectrum(dim, &lambdas, 77);
-        let d_lambdas: Vec<f64> = (0..dim)
-            .map(|_| next_uniform(&mut state, 0.1, 1.0))
-            .collect();
+        let d_lambdas: Vec<f64> = (0..dim).map(|_| next_uniform(&mut state, 0.1, 1.0)).collect();
         let (da, _) = spd_with_spectrum(dim, &d_lambdas, 78);
         let matvec = |v: ArrayView1<f64>| a.dot(&v);
         let plan = RationalLogdetPlan::build(dim, 8, 5, 1e-2, 1e2, 1e-9)
@@ -1507,9 +1493,6 @@ mod tests {
             rel < 1e-5,
             "deflated surrogate gradient {grad:.9e} vs its own FD {fd:.9e} (rel {rel:.3e})"
         );
-        assert!(
-            grad > 0.0,
-            "SPD direction must increase log det, got {grad}"
-        );
+        assert!(grad > 0.0, "SPD direction must increase log det, got {grad}");
     }
 }

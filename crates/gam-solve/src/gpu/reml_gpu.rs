@@ -55,12 +55,12 @@ pub fn evidence_derivatives_gpu(input: RemlGpuInput<'_>) -> Result<RemlGpuEviden
 #[cfg(target_os = "linux")]
 mod linux_cuda {
     use super::{RemlGpuEvidence, RemlGpuInput};
-    use cudarc::cusolver::DnHandle;
     use gam_gpu::driver::to_col_major;
     use gam_gpu::solver::{
         cholesky_logdet_from_col_major, context_and_stream, pinned_htod, potrf_in_place,
         potrs_in_place,
     };
+    use cudarc::cusolver::DnHandle;
     use ndarray::Array1;
 
     pub(super) fn evidence_derivatives(input: RemlGpuInput<'_>) -> Result<RemlGpuEvidence, String> {
@@ -132,8 +132,10 @@ mod cpu_fallback {
         for i in 0..p {
             identity[[i, i]] = 1.0;
         }
-        let (_, logdet_hessian) =
-            crate::gpu::pirls_gpu::cholesky_solve_gpu(input.penalized_hessian, identity.view())?;
+        let (_, logdet_hessian) = crate::gpu::pirls_gpu::cholesky_solve_gpu(
+            input.penalized_hessian,
+            identity.view(),
+        )?;
         let mut gradient_rho = Array1::<f64>::zeros(input.derivative_hessians.len());
         for (j, derivative) in input.derivative_hessians.iter().enumerate() {
             let (solved, _) = crate::gpu::pirls_gpu::cholesky_solve_gpu(

@@ -1,7 +1,7 @@
-use faer::sparse::SparseRowMat;
+use gam_terms::construction::KroneckerReparamResult;
 use gam_linalg::faer_ndarray::{fast_ab, fast_atb, fast_atv, fast_av};
 use gam_linalg::matrix::DesignMatrix;
-use gam_terms::construction::KroneckerReparamResult;
+use faer::sparse::SparseRowMat;
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
@@ -116,9 +116,7 @@ impl PirlsPenalty {
 
     pub(super) fn apply(&self, beta: &Array1<f64>) -> Array1<f64> {
         match self {
-            Self::Dense { s_transformed, .. } => {
-                gam_linalg::faer_ndarray::fast_av(s_transformed, beta)
-            }
+            Self::Dense { s_transformed, .. } => gam_linalg::faer_ndarray::fast_av(s_transformed, beta),
             Self::Diagonal { diag, .. } => diag * beta,
         }
     }

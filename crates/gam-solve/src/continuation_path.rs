@@ -358,7 +358,9 @@ impl ContinuationPath {
                 ),
             ));
         }
-        for (index, (&target, &entry)) in rho_target.iter().zip(bounds_upper.iter()).enumerate() {
+        for (index, (&target, &entry)) in
+            rho_target.iter().zip(bounds_upper.iter()).enumerate()
+        {
             if !(target.is_finite() && entry.is_finite() && entry >= target) {
                 return Err(gam_problem::EstimationError::RemlOptimizationFailed(
                     format!(
@@ -371,7 +373,11 @@ impl ContinuationPath {
         // The legal upper box is the literal heavy-penalty endpoint. This uses
         // objective-owned geometry rather than a private log-offset heuristic,
         // and makes rho move under the same `s` as temperature and isometry.
-        let schedules = couple_schedules(bounds_upper.clone(), rho_target, scalars);
+        let schedules = couple_schedules(
+            bounds_upper.clone(),
+            rho_target,
+            scalars,
+        );
         Ok(Self::enter(schedules))
     }
 
@@ -446,12 +452,12 @@ impl ContinuationPath {
         if let Err(install_error) = obj.install_reactive_domain_scalar_state(&scalar_state) {
             return match obj.rollback_reactive_domain_waypoint() {
                 Ok(()) => Err(install_error),
-                Err(rollback_error) => Err(gam_problem::EstimationError::RemlOptimizationFailed(
-                    format!(
+                Err(rollback_error) => Err(
+                    gam_problem::EstimationError::RemlOptimizationFailed(format!(
                         "reactive coupled waypoint installation failed ({install_error}); \
                          full-state rollback also failed ({rollback_error})"
-                    ),
-                )),
+                    )),
+                ),
             };
         }
 
@@ -521,14 +527,13 @@ impl ContinuationPath {
                 }
             }
             Err(failure) => {
-                obj.rollback_reactive_domain_waypoint()
-                    .map_err(|rollback_error| {
-                        gam_problem::EstimationError::RemlOptimizationFailed(format!(
-                            "reactive coupled waypoint failed ({}), and full-state rollback failed \
+                obj.rollback_reactive_domain_waypoint().map_err(|rollback_error| {
+                    gam_problem::EstimationError::RemlOptimizationFailed(format!(
+                        "reactive coupled waypoint failed ({}), and full-state rollback failed \
                          ({rollback_error})",
-                            failure.message()
-                        ))
-                    })?;
+                        failure.message()
+                    ))
+                })?;
                 if entering {
                     return Err(gam_problem::EstimationError::RemlOptimizationFailed(
                         format!(
@@ -603,8 +608,9 @@ mod tests {
             ContinuationScalarState::new(2.0, vec![-0.0, 0.01]).expect("valid entry");
         let scalar_target =
             ContinuationScalarState::new(0.1, vec![1.0, 2.0]).expect("valid target");
-        let contract = ContinuationScalarContract::new(scalar_entry.clone(), scalar_target.clone())
-            .expect("ordered scalar endpoints");
+        let contract =
+            ContinuationScalarContract::new(scalar_entry.clone(), scalar_target.clone())
+                .expect("ordered scalar endpoints");
         assert!(contract.at(1.0).bitwise_eq(&scalar_entry));
         assert!(contract.at(0.0).bitwise_eq(&scalar_target));
 
@@ -639,7 +645,10 @@ mod tests {
         assert!(targets.bitwise_eq(scalar_contract().entry()));
         // Log-ρ at s = 1 is the supplied legal upper-box endpoint.
         let rho = path.schedules.rho_target_at(path.s());
-        assert!(rho.iter().all(|entry| entry.to_bits() == 5.0_f64.to_bits()));
+        assert!(
+            rho.iter()
+                .all(|entry| entry.to_bits() == 5.0_f64.to_bits())
+        );
     }
 
     #[test]
@@ -854,10 +863,7 @@ mod tests {
                 .expect("entry installation")
                 .bitwise_eq(scalar_contract().entry())
         );
-        assert_eq!(
-            obj.rho_evaluated.first(),
-            Some(&Array1::from_vec(vec![5.0, 5.0]))
-        );
+        assert_eq!(obj.rho_evaluated.first(), Some(&Array1::from_vec(vec![5.0, 5.0])));
         assert!(
             !obj.orders.is_empty(),
             "the coupled path should evaluate at least one rho waypoint"

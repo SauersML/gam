@@ -415,9 +415,7 @@ fn dense_design_from_csr(
         let vals = xview.val_of_row(i);
         let cols = xview.col_idx_of_row_raw(i);
         if cols.len() != vals.len() {
-            crate::bail_invalid_estim!(
-                "sparse row structure mismatch: column/value lengths differ"
-            );
+            crate::bail_invalid_estim!("sparse row structure mismatch: column/value lengths differ");
         }
         for (idx, &col) in cols.iter().enumerate() {
             x_dense[[i, col.unbound()]] = vals[idx];
@@ -535,8 +533,9 @@ pub(super) fn solve_newton_direction_dense(
         // redundant fp64 POTRF (the fp32 factor + fp64 refinement already gives
         // a full-fp64-accurate direction). This is where the mixed-precision
         // speedup is actually realized for the inner Newton solve.
-        let solved = crate::gpu::pirls_gpu::cholesky_solve_only_gpu(hessian.view(), rhs.view())
-            .map_err(EstimationError::InvalidInput)?;
+        let solved =
+            crate::gpu::pirls_gpu::cholesky_solve_only_gpu(hessian.view(), rhs.view())
+                .map_err(EstimationError::InvalidInput)?;
         direction_out.assign(&solved.column(0));
         direction_out.mapv_inplace(|v| -v);
         if array_is_finite(direction_out) {
@@ -1391,7 +1390,13 @@ pub(super) fn select_active_set_release(
 ) -> Option<usize> {
     // Second-order correction `(H d)_i`, suppressed on the reflected path (see the
     // parameter note): there the far-field `d` makes it non-model-trustworthy.
-    let second_order = |i: usize| -> f64 { if reflected_step_curvature { 0.0 } else { hd[i] } };
+    let second_order = |i: usize| -> f64 {
+        if reflected_step_curvature {
+            0.0
+        } else {
+            hd[i]
+        }
+    };
     if use_blands {
         for &i in active_idx {
             let lambda_i = gradient[i] + second_order(i);
@@ -1415,7 +1420,8 @@ pub(super) fn select_active_set_release(
             // the classic active-set zigzag (gam#979). A genuinely-negative
             // multiplier (below `-tol`) still releases, so this is a strict
             // no-op at any true constrained optimum where multipliers are >= 0.
-            let tol = 64.0 * f64::EPSILON * gradient[i].abs().max(second_order(i).abs()).max(1.0);
+            let tol =
+                64.0 * f64::EPSILON * gradient[i].abs().max(second_order(i).abs()).max(1.0);
             if lambda_i < -tol && lambda_i < worst {
                 worst = lambda_i;
                 idx = Some(i);
@@ -1561,21 +1567,14 @@ pub fn solve_newton_directionwith_lower_bounds(
         }
         if free_idx.is_empty() {
             let hd = fast_av(kkt_h, direction_out);
-            if let Some(idx) = select_active_set_release(
-                gradient,
-                &hd,
-                &active_idx,
-                use_blands,
-                reflected_step_curvature,
-            ) {
+            if let Some(idx) =
+                select_active_set_release(gradient, &hd, &active_idx, use_blands, reflected_step_curvature)
+            {
                 if kkt_hessian.is_some() {
                     let hd_ref = fast_av(hessian, direction_out);
                     log::warn!(
                         "[gam#979 simple-release/allactive] it={it} idx={idx} beta={:.4e} lower={:.4e} lambda_true={:.4e} lambda_refl={:.4e}",
-                        beta[idx],
-                        lower_bounds[idx],
-                        gradient[idx] + hd[idx],
-                        gradient[idx] + hd_ref[idx],
+                        beta[idx], lower_bounds[idx], gradient[idx] + hd[idx], gradient[idx] + hd_ref[idx],
                     );
                 }
                 active[idx] = false;
@@ -1644,22 +1643,14 @@ pub fn solve_newton_directionwith_lower_bounds(
         // multiplier `λ_i = g_i` instead (gam#979 — see that fn's note). `hd`
         // (true curvature `kkt_h`) is still formed here for the diagnostic log.
         let hd = fast_av(kkt_h, direction_out);
-        if let Some(idx) = select_active_set_release(
-            gradient,
-            &hd,
-            &active_idx,
-            use_blands,
-            reflected_step_curvature,
-        ) {
+        if let Some(idx) =
+            select_active_set_release(gradient, &hd, &active_idx, use_blands, reflected_step_curvature)
+        {
             if kkt_hessian.is_some() {
                 let hd_ref = fast_av(hessian, direction_out);
                 log::warn!(
                     "[gam#979 simple-release] it={it} idx={idx} beta={:.4e} lower={:.4e} lambda_true={:.4e} lambda_refl={:.4e} n_free={n_free} n_active={}",
-                    beta[idx],
-                    lower_bounds[idx],
-                    gradient[idx] + hd[idx],
-                    gradient[idx] + hd_ref[idx],
-                    active_idx.len(),
+                    beta[idx], lower_bounds[idx], gradient[idx] + hd[idx], gradient[idx] + hd_ref[idx], active_idx.len(),
                 );
             }
             active[idx] = false;

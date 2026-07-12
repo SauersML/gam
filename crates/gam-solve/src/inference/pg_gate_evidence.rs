@@ -49,9 +49,9 @@
 //! `F_ω` after the Gaussian integral.
 
 use crate::inference::pg_moments::pg_moments;
-use faer::Side;
 use gam_linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
 use gam_linalg::matrix::FactorizedSystem;
+use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 /// The data of one logit gate block to be evidence-integrated.

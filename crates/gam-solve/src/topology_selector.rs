@@ -173,8 +173,7 @@ impl AutoTopologyKind {
     }
 
     pub fn parse(value: &str) -> Result<Self, String> {
-        let canonical = value.trim().to_ascii_lowercase();
-        if let Some(rest) = canonical.strip_prefix("ring_clusters_k") {
+        if let Some(rest) = value.strip_prefix("ring_clusters_k") {
             if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(format!(
                     "ring-of-clusters candidate must use ring_clusters_k{{n}}; got {value:?}"
@@ -186,14 +185,19 @@ impl AutoTopologyKind {
             if k < 3 {
                 return Err("ring-of-clusters order k must be >= 3".to_string());
             }
+            if rest != k.to_string() {
+                return Err(format!(
+                    "ring-of-clusters candidate must use canonical ring_clusters_k{{n}} without leading zeroes; got {value:?}"
+                ));
+            }
             return Ok(AutoTopologyKind::RingOfClusters { k });
         }
-        if canonical.starts_with("ring_clusters") {
+        if value.starts_with("ring_clusters") {
             return Err(format!(
                 "ring-of-clusters candidate must use ring_clusters_k{{n}}; got {value:?}"
             ));
         }
-        if let Some(rest) = canonical.strip_prefix("mixture_k") {
+        if let Some(rest) = value.strip_prefix("mixture_k") {
             if rest.is_empty() || !rest.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(format!(
                     "mixture candidate must use mixture_k{{n}}; got {value:?}"
@@ -205,34 +209,32 @@ impl AutoTopologyKind {
             if k == 0 {
                 return Err("mixture order k must be >= 1".to_string());
             }
+            if rest != k.to_string() {
+                return Err(format!(
+                    "mixture candidate must use canonical mixture_k{{n}} without leading zeroes; got {value:?}"
+                ));
+            }
             return Ok(AutoTopologyKind::Mixture { k });
         }
-        if canonical.starts_with("mixture") {
+        if value.starts_with("mixture") {
             return Err(format!(
                 "mixture candidate must use mixture_k{{n}}; got {value:?}"
             ));
         }
-        let normalized = canonical.replace('-', "_");
-        if let Some(structure) = parse_union_name(&normalized) {
+        if let Some(structure) = parse_union_name(value) {
             return Ok(AutoTopologyKind::Union { structure });
         }
-        match normalized.as_str() {
-            "euclidean" | "flat" | "euclidean_patch" | "euclideanpatch" => {
-                Ok(AutoTopologyKind::Euclidean)
-            }
-            "circle" | "periodic" | "s1" => Ok(AutoTopologyKind::Circle),
-            "sphere" | "s2" => Ok(AutoTopologyKind::Sphere),
+        match value {
+            "euclidean" => Ok(AutoTopologyKind::Euclidean),
+            "circle" => Ok(AutoTopologyKind::Circle),
+            "sphere" => Ok(AutoTopologyKind::Sphere),
             "torus" => Ok(AutoTopologyKind::Torus),
             "cylinder" => Ok(AutoTopologyKind::Cylinder),
             "mobius" => Ok(AutoTopologyKind::Mobius),
-            "duchon" | "duchon_sheet" | "duchonsheet" | "thin_plate" | "thinplate" => {
-                Ok(AutoTopologyKind::DuchonSheet)
-            }
-            "constant_curvature" | "curv" | "curvature" | "mkappa" | "m_kappa" => {
-                Ok(AutoTopologyKind::ConstantCurvature)
-            }
-            other => Err(format!(
-                "topology candidate must be euclidean, circle, sphere, torus, cylinder, mobius, duchon_sheet, constant_curvature, mixture_k{{n}}, ring_clusters_k{{n}}, or a union (union_circle+circle, union_circle+cluster, union_line+cluster); got {other:?}"
+            "duchon_sheet" => Ok(AutoTopologyKind::DuchonSheet),
+            "constant_curvature" => Ok(AutoTopologyKind::ConstantCurvature),
+            _ => Err(format!(
+                "topology candidate must be an exact canonical name: euclidean, circle, sphere, torus, cylinder, mobius, duchon_sheet, constant_curvature, mixture_k{{n}}, ring_clusters_k{{n}}, union_circle+circle, union_circle+cluster, or union_line+cluster; got {value:?}"
             )),
         }
     }
@@ -375,32 +377,12 @@ impl PredictiveCandidateKind {
     }
 }
 
-/// Parse a structured-union composite name (#907). Accepts the canonical display
-/// tags (`union_circle+circle`, `union_circle+cluster`, `union_line+cluster`)
-/// and tolerant `_`/`-` separators in place of `+`. Returns `None` for any name
-/// that is not a union so [`AutoTopologyKind::parse`] can fall through to the
-/// smooth/mixture variants. Input is assumed already lowercased with `-`→`_`.
-pub fn parse_union_name(normalized: &str) -> Option<UnionStructure> {
-    let Some(rest) = normalized.strip_prefix("union") else {
-        return None;
-    };
-    // Canonicalize component separators: both `+` and the tolerant `_`/`-`
-    // forms collapse to `+`, and any leading separator after the `union`
-    // prefix is dropped (so `union_circle+circle` and `union__circle_circle`
-    // both normalize to `circle+circle`).
-    let body: String = rest
-        .chars()
-        .map(|c| if c == '_' || c == '-' { '+' } else { c })
-        .collect();
-    let body = body.trim_matches('+');
-    match body {
-        "circle+circle" => Some(UnionStructure::CircleCircle),
-        "circle+cluster" | "circle+point+cluster" | "circle+pointcluster" => {
-            Some(UnionStructure::CirclePointCluster)
-        }
-        "line+cluster" | "line+point+cluster" | "line+pointcluster" => {
-            Some(UnionStructure::LineCluster)
-        }
+/// Parse one exact structured-union display name (#907).
+pub fn parse_union_name(value: &str) -> Option<UnionStructure> {
+    match value {
+        "union_circle+circle" => Some(UnionStructure::CircleCircle),
+        "union_circle+cluster" => Some(UnionStructure::CirclePointCluster),
+        "union_line+cluster" => Some(UnionStructure::LineCluster),
         _ => None,
     }
 }
@@ -2189,7 +2171,7 @@ pub fn adjudicate_cross_class_race(
         });
     }
 
-    // Cross-class: build the selection-time held-out density table and stack.
+    // Predictive path: build the selection-time held-out density table and stack.
     let providers: Vec<HeldOutDensityProvider<'_>> =
         candidates.into_iter().map(|c| c.density_provider).collect();
     let table = build_cv_log_density_table(n, folds, seed, &providers)?;
@@ -2576,31 +2558,77 @@ mod tests {
 
     #[test]
     fn fixed_topology_parser_requires_canonical_ordered_density_names() {
-        assert_eq!(
-            AutoTopologyKind::parse("mixture_k7"),
-            Ok(AutoTopologyKind::Mixture { k: 7 })
-        );
-        assert_eq!(
-            AutoTopologyKind::parse("ring_clusters_k5"),
-            Ok(AutoTopologyKind::RingOfClusters { k: 5 })
-        );
-        assert_eq!(
-            AutoTopologyKind::parse("mobius"),
-            Ok(AutoTopologyKind::Mobius)
-        );
+        let canonical = [
+            AutoTopologyKind::Euclidean,
+            AutoTopologyKind::Circle,
+            AutoTopologyKind::Sphere,
+            AutoTopologyKind::Torus,
+            AutoTopologyKind::Cylinder,
+            AutoTopologyKind::Mobius,
+            AutoTopologyKind::DuchonSheet,
+            AutoTopologyKind::ConstantCurvature,
+            AutoTopologyKind::Mixture { k: 7 },
+            AutoTopologyKind::RingOfClusters { k: 5 },
+            AutoTopologyKind::Union {
+                structure: UnionStructure::CircleCircle,
+            },
+            AutoTopologyKind::Union {
+                structure: UnionStructure::CirclePointCluster,
+            },
+            AutoTopologyKind::Union {
+                structure: UnionStructure::LineCluster,
+            },
+        ];
+        for kind in canonical {
+            let displayed = kind.display_name();
+            assert_eq!(
+                AutoTopologyKind::parse(&displayed),
+                Ok(kind),
+                "display/parse must be a bijection for {displayed:?}"
+            );
+        }
 
         for malformed in [
+            " circle",
+            "circle ",
+            "Circle",
+            "MOBIUS",
+            "flat",
+            "euclideanpatch",
+            "euclidean_patch",
+            "periodic",
+            "s1",
+            "s2",
+            "duchon",
+            "duchonsheet",
+            "duchon-sheet",
+            "thin_plate",
+            "thinplate",
+            "curv",
+            "curvature",
+            "mkappa",
+            "m_kappa",
+            "constant-curvature",
             "mixture",
             "mixture7",
             "mixture_7",
             "mixture-k7",
             "mixture_k",
             "mixture_k7junk",
+            "mixture_k07",
             "ring_clusters",
             "ring_clusters7",
             "ring_clusters-k7",
             "ring_clusters_k",
             "ring_clusters_k7junk",
+            "ring_clusters_k07",
+            "union-circle+circle",
+            "union_circle_circle",
+            "union__circle_circle",
+            "union_circle+point+cluster",
+            "union_circle+pointcluster",
+            "union_line+point+cluster",
+            "union_line+pointcluster",
         ] {
             assert!(
                 AutoTopologyKind::parse(malformed).is_err(),
@@ -2827,7 +2855,10 @@ mod tests {
         assert_eq!(verdict.winner_index, 0);
         assert_eq!(
             verdict.candidate_names,
-            ["mixture_class", "ring_clusters_class"]
+            vec![
+                "mixture_class".to_string(),
+                "ring_clusters_class".to_string()
+            ]
         );
     }
 

@@ -144,15 +144,14 @@ pub(crate) use std::sync::{Arc, Mutex};
 
 pub(crate) use gam_linalg::faer_ndarray::FaerEigh;
 
-use crate::model_types::{ActiveLinearConstraintBlock, KktResidualSubspace, ProjectedKktResidual};
 pub(crate) use gam_linalg::matrix::{
     DesignMatrix, LinearOperator, SignedWeightsView, upper_triangle_pair_from_index,
 };
+use crate::model_types::{ActiveLinearConstraintBlock, KktResidualSubspace, ProjectedKktResidual};
 pub use gam_problem::{
     ContractedPsiSecondOrderFn, DenseMatrixHyperOperator, DriftDerivResult, EvalMode,
-    FixedDriftDerivFn, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperCoordPairFn,
-    HyperOperator, ProjectedFactorCache, ProjectedFactorKey, PseudoLogdetMode,
-    SharedFixedDriftDerivFn,
+    FixedDriftDerivFn, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperCoordPairFn, HyperOperator,
+    ProjectedFactorCache, ProjectedFactorKey, PseudoLogdetMode, SharedFixedDriftDerivFn,
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -161,8 +160,8 @@ pub use gam_problem::{
 mod dense_projection;
 mod pseudo_logdet;
 
-pub(crate) use dense_projection::{dense_projected_matrix, dense_trace_projected_factor};
 use gam_linalg::dense;
+pub(crate) use dense_projection::{dense_projected_matrix, dense_trace_projected_factor};
 pub use pseudo_logdet::exact_pseudo_logdet;
 // Re-exported at `pub` (#1521) so the lifted gam-models bms deviation-runtime
 // driver can call `gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold`.

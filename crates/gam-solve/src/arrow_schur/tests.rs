@@ -5258,8 +5258,8 @@ fn rational_reduced_schur_plan_derived_deflates_to_target() {
         40,
         1e-11,
         20_000,
-        k, // deflation_max_rank: resource ceiling with headroom to certify 0.1×bare
-        6, // subspace_iters
+        k,  // deflation_max_rank: resource ceiling with headroom to certify 0.1×bare
+        6,  // subspace_iters
         target_rel,
     )
     .expect("derived plan must build");
@@ -6229,8 +6229,7 @@ fn factor_dense_reduced_schur_reconstructs_original_illconditioned_matrix_2015()
     let x_true = Array1::from_vec(vec![1.0, -2.0, 0.5, 3.0, -1.5, 2.0]);
     let b = schur.dot(&x_true);
     let x_via_equilibrated_factor = solve_via_lower_cholesky(&factor, &b);
-    let reference_factor =
-        cholesky_lower(&schur).expect("planted matrix is PD for direct Cholesky too");
+    let reference_factor = cholesky_lower(&schur).expect("planted matrix is PD for direct Cholesky too");
     let x_via_direct_factor = solve_via_lower_cholesky(&reference_factor, &b);
 
     let mut max_abs = 0.0_f64;

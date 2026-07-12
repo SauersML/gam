@@ -610,9 +610,7 @@ pub fn pointwise_loglikelihood(
             }
             (0..n)
                 .into_par_iter()
-                .map(|i| {
-                    tweedie_saddlepoint_loglik(y[i], mu[i].max(MU_FLOOR), priorweights[i], p, phi)
-                })
+                .map(|i| tweedie_saddlepoint_loglik(y[i], mu[i].max(MU_FLOOR), priorweights[i], p, phi))
                 .collect()
         }
         ResponseFamily::NegativeBinomial { theta, .. } => {
@@ -793,7 +791,8 @@ pub(crate) fn tweedie_series_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64)
     let y_over_scale = yi / gamma_scale;
     // log of the k-th mixture term: Poisson(k; λ) pmf + Gamma(y; kα, γ) pdf.
     let log_term = |k: f64| -> f64 {
-        -lambda + k * ln_lambda - ln_gamma(k + 1.0) + (k * alpha - 1.0) * ln_y
+        -lambda + k * ln_lambda - ln_gamma(k + 1.0)
+            + (k * alpha - 1.0) * ln_y
             - y_over_scale
             - k * alpha * ln_gamma_scale
             - ln_gamma(k * alpha)
@@ -802,9 +801,7 @@ pub(crate) fn tweedie_series_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64)
     // (which reduces to λ when y ≈ μ and tracks large y), so the climb only
     // refines by a few steps at any magnitude; the log-concave summand is
     // unimodal so the climb reaches the global maximum.
-    let mut k_peak = tweedie_series_peak_index(yi, mui, phi_i, p)
-        .round()
-        .max(1.0);
+    let mut k_peak = tweedie_series_peak_index(yi, mui, phi_i, p).round().max(1.0);
     let mut f_peak = log_term(k_peak);
     loop {
         let f_up = log_term(k_peak + 1.0);

@@ -857,22 +857,22 @@ def _centers_dim(centers: Any) -> int | None:
 
 def _infer_candidate_name(topo: Smooth) -> str | None:
     if isinstance(topo, PeriodicSplineCurve):
-        return "Circle"
+        return "circle"
     if isinstance(topo, Sphere):
-        return "Sphere"
+        return "sphere"
     if isinstance(topo, TensorBSpline):
         periodic = tuple(bool(marginal.periodic) for marginal in topo.marginals)
         if periodic == (True, False):
-            return "Cylinder"
+            return "cylinder"
         if periodic == (True, True):
-            return "Torus"
+            return "torus"
     if isinstance(topo, Duchon):
         periodic = tuple(bool(v) for v in topo.periodic_per_axis or ())
         if periodic == (True, False):
-            return "Cylinder"
+            return "cylinder"
         if periodic == (True, True):
-            return "Torus"
-        return "EuclideanPatch"
+            return "torus"
+        return "euclidean"
     return None
 
 
@@ -1267,7 +1267,7 @@ def _normalize_selector_candidates(
     seen: set[str] = set()
     for idx, item in enumerate(raw):
         name, smooth = _candidate_from_item(item, latent_dim, idx)
-        key = name.lower()
+        key = name
         if key in seen:
             raise ValueError(f"duplicate topology candidate {name!r}")
         seen.add(key)
@@ -1295,22 +1295,12 @@ def _candidate_from_item(
 
 
 def _normalize_topology_name(name: str) -> str:
-    normalized = name.strip().lower().replace("-", "_")
-    aliases = {
-        "flat": "euclidean",
-        "euclideanpatch": "euclidean",
-        "euclidean_patch": "euclidean",
-        "periodic": "circle",
-        "s1": "circle",
-        "s2": "sphere",
-    }
-    normalized = aliases.get(normalized, normalized)
-    if normalized not in _DEFAULT_TOPOLOGY_NAMES:
+    if name not in _DEFAULT_TOPOLOGY_NAMES:
         raise ValueError(
-            "topology candidate must be one of: "
+            "topology candidate must be an exact canonical name: "
             + ", ".join(_DEFAULT_TOPOLOGY_NAMES)
         )
-    return normalized
+    return name
 
 
 def _latent_for_topology(latent: LatentCoord, name: str) -> LatentCoord:

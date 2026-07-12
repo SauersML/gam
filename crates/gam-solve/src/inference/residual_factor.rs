@@ -1019,9 +1019,7 @@ fn scaled_second_moment(r: ArrayView2<'_, f64>, row_scale: &Array1<f64>) -> Arra
 
     let mut s = par_deterministic_block_fold(
         n,
-        |range: core::ops::Range<usize>| {
-            scaled_second_moment_chunk(r, row_scale, range.start, range.end)
-        },
+        |range: core::ops::Range<usize>| scaled_second_moment_chunk(r, row_scale, range.start, range.end),
         |mut acc: Array2<f64>, part: Array2<f64>| {
             acc += &part;
             acc

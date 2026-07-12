@@ -1311,14 +1311,13 @@ impl FitConvergenceEvidence {
         // certificate certifies, the inner mode is certified by evidence; a
         // stalled mode the envelope derivative CAN'T certify still refuses,
         // as do all other non-converged statuses unconditionally.
-        let stalled_but_analytically_certified = matches!(
-            parts.pirls_status,
-            crate::pirls::PirlsStatus::StalledAtValidMinimum
-        ) && parts
-            .artifacts
-            .criterion_certificate
-            .as_ref()
-            .is_some_and(|certificate| certificate.certifies());
+        let stalled_but_analytically_certified =
+            matches!(parts.pirls_status, crate::pirls::PirlsStatus::StalledAtValidMinimum)
+                && parts
+                    .artifacts
+                    .criterion_certificate
+                    .as_ref()
+                    .is_some_and(|certificate| certificate.certifies());
         if !parts.pirls_status.is_converged() && !stalled_but_analytically_certified {
             return Err(Self::assembly_error(
                 parts,

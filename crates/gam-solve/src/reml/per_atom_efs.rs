@@ -60,14 +60,14 @@
 //! a design invariant of routing every layer through the same `eval`/`eval_efs`
 //! hooks that the dense path consumes, not a separately maintained surrogate.
 
+use gam_linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
+use gam_linalg::matrix::FactorizedSystem;
 use crate::estimate::EstimationError;
 use crate::rho_optimizer::{OuterCapability, OuterObjective, OuterPlan, OuterResult};
 use faer::Side;
-use gam_linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
-use gam_linalg::matrix::FactorizedSystem;
-use gam_problem::{HessianOperator, HessianValue};
-use ndarray::{Array1, Array2};
 use opt::{BacktrackConfig, backtracking_line_search};
+use gam_problem::{HessianValue, HessianOperator};
+use ndarray::{Array1, Array2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
 
@@ -626,7 +626,9 @@ pub fn run_per_atom_efs(
         final_step_inf = step_inf;
         let margin = cfg.tolerance.max(PER_ATOM_NEGLIGIBLE_STEP);
         let cost_resolved_below_margin = match efs.logdet_enclosure_gap {
-            Some(gap) => crate::logdet_bounds::LogdetEnclosure::gap_resolves_margin(gap, margin),
+            Some(gap) => {
+                crate::logdet_bounds::LogdetEnclosure::gap_resolves_margin(gap, margin)
+            }
             None => true,
         };
         if step_inf < margin {

@@ -163,18 +163,18 @@ pub(crate) mod cuda {
         PirlsGpuInput, PirlsGpuSharedData, PirlsGpuStep, PirlsStepStreamDeviceInput,
         PirlsStepStreamInput, SigmaPirlsGpuWorkspace,
     };
-    use cudarc::cublas::sys::{
-        cublasDdgmm, cublasDgeam, cublasOperation_t, cublasSideMode_t, cublasStatus_t,
-    };
-    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, Gemv, GemvConfig};
-    use cudarc::cusolver::DnHandle;
-    use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
     use gam_gpu::device_cache::PtxModuleCache;
     use gam_gpu::driver::{from_col_major, to_col_major};
     use gam_gpu::solver::{
         check_deferred_potrf_info, check_deferred_potrs_info, context_and_stream, pinned_htod,
         potrf_in_place_reuse, potrf_query_lwork, potrs_in_place_reuse,
     };
+    use cudarc::cublas::sys::{
+        cublasDdgmm, cublasDgeam, cublasOperation_t, cublasSideMode_t, cublasStatus_t,
+    };
+    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, Gemv, GemvConfig};
+    use cudarc::cusolver::DnHandle;
+    use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
     /// One-thread reduction over a p×p column-major Cholesky factor's
@@ -2889,9 +2889,11 @@ extern "C" __global__ void status_or(
                     // (step_lm_lambda was stripped from the export), so
                     // H_pen·β ≈ Xᵀ·grad_eta at a KKT-feasible solution.
                     let grad = penalized_hessian.dot(&beta);
-                    Some(crate::active_set::compute_constraint_kkt_diagnostics(
-                        &beta, &grad, lin,
-                    ))
+                    Some(
+                        crate::active_set::compute_constraint_kkt_diagnostics(
+                            &beta, &grad, lin,
+                        ),
+                    )
                 });
 
                 let ridge_passport = ext.ridge_passport.unwrap_or(default_ridge);
@@ -3442,9 +3444,9 @@ pub fn solve_gaussian_pls_gpu(
 /// drifting away from the GPU formula.
 mod cpu_fallback {
     use super::{PirlsGpuInput, PirlsGpuStep};
+    use gam_linalg::faer_ndarray::FaerCholesky;
     use crate::estimate::reml::assembly::xt_diag_x_dense_into;
     use faer::Side;
-    use gam_linalg::faer_ndarray::FaerCholesky;
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
     pub(super) fn weighted_crossprod_cpu(
@@ -3926,10 +3928,7 @@ mod weighted_crossprod_cpu_fallback_tests {
         for i in 0..p {
             for j in 0..p {
                 let diff = (got[[i, j]] - expected[[i, j]]).abs();
-                assert!(
-                    diff <= 1e-10,
-                    "XtWX[{i},{j}] mismatch: got vs expected diff={diff}"
-                );
+                assert!(diff <= 1e-10, "XtWX[{i},{j}] mismatch: got vs expected diff={diff}");
             }
         }
     }

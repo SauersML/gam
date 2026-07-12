@@ -13,10 +13,12 @@ use super::reml_outer_engine::{
     InnerSolutionBuilder, PenaltyCoordinate, PenaltyLogdetDerivs, PenaltySubspaceTrace,
     RemlLamlResult, penalty_matrix_root, reml_laml_evaluate,
 };
-use crate::model_types::ProjectedKktResidual;
 use gam_linalg::faer_ndarray::fast_xt_diag_y;
+use crate::model_types::ProjectedKktResidual;
 use ndarray::{Array1, Array2};
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator,
+};
 use rayon::slice::ParallelSliceMut;
 use std::sync::Arc;
 
@@ -221,14 +223,7 @@ pub(crate) fn weighted_cross_dense(
         n,
         |range: core::ops::Range<usize>| {
             let mut local = Array2::<f64>::zeros((p, q));
-            accumulate_weighted_cross_rows(
-                &mut local,
-                left,
-                right,
-                weights,
-                range.start,
-                range.end,
-            );
+            accumulate_weighted_cross_rows(&mut local, left, right, weights, range.start, range.end);
             local
         },
         |mut a, b| {

@@ -456,344 +456,344 @@ mod test_support {
     use crate::arrow_schur::ArrowSchurSystem;
 
     /// Why the host-side CPU emulation of the fused Layer D + E pipeline declined.
-    /// These mirror the `ArrowSchurGpuFailure` cases the device host raises so the
-    /// emulator can stand in for the GPU path in a device-free parity harness.
-    #[derive(Debug, Clone, PartialEq)]
-    pub enum FusedCpuError {
-        /// A row block was not positive definite even after `ridge_t`. Carries the
-        /// 0-based row and the 1-based pivot row, matching the kernel status code.
-        RowNotPositiveDefinite { row: usize, pivot: usize },
-        /// The reduced K×K Schur complement `S_β` failed Cholesky at this 1-based
-        /// pivot — the bordered system is rank-deficient at the requested ridges.
-        SchurFactorFailed { pivot: usize },
-        /// The system carries the matrix-free `H_ββ` / `H_tβ` operators the dense
-        /// fused path cannot consume, or degenerate dims. The device host returns
-        /// `Unavailable` / `GpuRequiresDenseSystem` here.
-        Unavailable,
-    }
+/// These mirror the `ArrowSchurGpuFailure` cases the device host raises so the
+/// emulator can stand in for the GPU path in a device-free parity harness.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FusedCpuError {
+    /// A row block was not positive definite even after `ridge_t`. Carries the
+    /// 0-based row and the 1-based pivot row, matching the kernel status code.
+    RowNotPositiveDefinite { row: usize, pivot: usize },
+    /// The reduced K×K Schur complement `S_β` failed Cholesky at this 1-based
+    /// pivot — the bordered system is rank-deficient at the requested ridges.
+    SchurFactorFailed { pivot: usize },
+    /// The system carries the matrix-free `H_ββ` / `H_tβ` operators the dense
+    /// fused path cannot consume, or degenerate dims. The device host returns
+    /// `Unavailable` / `GpuRequiresDenseSystem` here.
+    Unavailable,
+}
 
-    /// Outcome of one emulated fused Arrow-Schur Newton solve. Field-for-field the
-    /// `(δt, δβ, log|H|)` triple the GPU path downloads, so a parity test can
-    /// compare this against [`crate::gpu_kernels::arrow_schur::solve_arrow_newton_step_dense_reference`]
-    /// — the same baseline the V100 Layer C↔D parity test uses on a device.
-    #[derive(Debug, Clone)]
-    pub struct FusedCpuSolution {
-        pub delta_t: Vec<f64>,
-        pub delta_beta: Vec<f64>,
-        pub log_det_hessian: f64,
-    }
+/// Outcome of one emulated fused Arrow-Schur Newton solve. Field-for-field the
+/// `(δt, δβ, log|H|)` triple the GPU path downloads, so a parity test can
+/// compare this against [`crate::gpu_kernels::arrow_schur::solve_arrow_newton_step_dense_reference`]
+/// — the same baseline the V100 Layer C↔D parity test uses on a device.
+#[derive(Debug, Clone)]
+pub struct FusedCpuSolution {
+    pub delta_t: Vec<f64>,
+    pub delta_beta: Vec<f64>,
+    pub log_det_hessian: f64,
+}
 
-    /// Per-block intermediates the forward emulation persists for the back-sub,
-    /// exactly the device buffers `arrow_schur_forward_pgroup` writes back
-    /// (`l_out`, `u_out`, `y_out`) and which `arrow_schur_back_sub_pgroup` reads.
-    /// Stored column-major to match the kernel's global-memory layout 1:1.
-    pub struct FusedRowState {
-        /// `L_i` lower Cholesky of `D_i + ρ_t I`, column-major `p×p`.
-        l: Vec<f64>,
-        /// `u_i = L_i^{-1} g_i`, length `p`.
-        u: Vec<f64>,
-        /// `Y_i = L_i^{-1} B_i`, column-major `p×r`.
-        y: Vec<f64>,
-    }
+/// Per-block intermediates the forward emulation persists for the back-sub,
+/// exactly the device buffers `arrow_schur_forward_pgroup` writes back
+/// (`l_out`, `u_out`, `y_out`) and which `arrow_schur_back_sub_pgroup` reads.
+/// Stored column-major to match the kernel's global-memory layout 1:1.
+pub struct FusedRowState {
+    /// `L_i` lower Cholesky of `D_i + ρ_t I`, column-major `p×p`.
+    l: Vec<f64>,
+    /// `u_i = L_i^{-1} g_i`, length `p`.
+    u: Vec<f64>,
+    /// `Y_i = L_i^{-1} B_i`, column-major `p×r`.
+    y: Vec<f64>,
+}
 
-    /// CPU emulation of the Layer D forward kernel `arrow_schur_forward_pgroup`
-    /// for one row block. Reproduces the kernel's exact scalar arithmetic and
-    /// memory layout:
-    ///
-    /// 1. column-major load of `D_i` (with `ridge_t` folded onto the diagonal)
-    ///    and `B_i` — element `(r, c)` lives at `c * p + r`, the same indexing the
-    ///    kernel's `d_stack[(i*P_MAX + c)*P_MAX + r]` uses within one block;
-    /// 2. in-place lower Cholesky `L_i L_iᵀ = D_i + ρ_t I` (the kernel's
-    ///    single-threaded `tid == 0` factor loop), returning the 1-based pivot row
-    ///    on a non-positive diagonal — the `status_out[i] = j + 1` branch;
-    /// 3. forward solves `L_i u_i = g_i` and `L_i Y_i = B_i` (the kernel's per-row
-    ///    sequential sweeps), each emitting `partial_r[i] = Y_iᵀ u_i` (length `r`)
-    ///    and `partial_s[i] = Y_iᵀ Y_i` (`r×r`, column-major) in the SAME inner-
-    ///    product accumulation order the kernel's final reduction uses.
-    ///
-    /// `partial_s` / `partial_r` are written positive (`+Y_iᵀY_i`, `+Y_iᵀu_i`),
-    /// matching the NVRTC kernel; the host reduction applies the documented signs.
-    /// `log_det_local = 2 Σ_j ln L_i[j,j]` is the block's contribution to `log|H|`.
-    pub fn emulate_forward_block(
-        d_col_major: &[f64],
-        b_col_major: &[f64],
-        g: &[f64],
-        p: usize,
-        r: usize,
-        ridge_t: f64,
-        partial_s: &mut [f64],
-        partial_r: &mut [f64],
-        log_det_local: &mut f64,
-    ) -> Result<FusedRowState, usize> {
-        // ---- Load D_i + ridge_t·I into L (column-major). ----
-        let mut l = d_col_major.to_vec();
-        assert_eq!(l.len(), p * p);
-        for j in 0..p {
-            l[j * p + j] += ridge_t;
+/// CPU emulation of the Layer D forward kernel `arrow_schur_forward_pgroup`
+/// for one row block. Reproduces the kernel's exact scalar arithmetic and
+/// memory layout:
+///
+/// 1. column-major load of `D_i` (with `ridge_t` folded onto the diagonal)
+///    and `B_i` — element `(r, c)` lives at `c * p + r`, the same indexing the
+///    kernel's `d_stack[(i*P_MAX + c)*P_MAX + r]` uses within one block;
+/// 2. in-place lower Cholesky `L_i L_iᵀ = D_i + ρ_t I` (the kernel's
+///    single-threaded `tid == 0` factor loop), returning the 1-based pivot row
+///    on a non-positive diagonal — the `status_out[i] = j + 1` branch;
+/// 3. forward solves `L_i u_i = g_i` and `L_i Y_i = B_i` (the kernel's per-row
+///    sequential sweeps), each emitting `partial_r[i] = Y_iᵀ u_i` (length `r`)
+///    and `partial_s[i] = Y_iᵀ Y_i` (`r×r`, column-major) in the SAME inner-
+///    product accumulation order the kernel's final reduction uses.
+///
+/// `partial_s` / `partial_r` are written positive (`+Y_iᵀY_i`, `+Y_iᵀu_i`),
+/// matching the NVRTC kernel; the host reduction applies the documented signs.
+/// `log_det_local = 2 Σ_j ln L_i[j,j]` is the block's contribution to `log|H|`.
+pub fn emulate_forward_block(
+    d_col_major: &[f64],
+    b_col_major: &[f64],
+    g: &[f64],
+    p: usize,
+    r: usize,
+    ridge_t: f64,
+    partial_s: &mut [f64],
+    partial_r: &mut [f64],
+    log_det_local: &mut f64,
+) -> Result<FusedRowState, usize> {
+    // ---- Load D_i + ridge_t·I into L (column-major). ----
+    let mut l = d_col_major.to_vec();
+    assert_eq!(l.len(), p * p);
+    for j in 0..p {
+        l[j * p + j] += ridge_t;
+    }
+    // ---- In-place lower Cholesky, mirroring the kernel's tid==0 loop. The
+    //      kernel reads/writes L[row][col] in a logically row-indexed shared
+    //      tile; here L is column-major, so L[row][col] == l[col*p + row]. The
+    //      arithmetic (including the inner-product order) is identical. ----
+    for j in 0..p {
+        let mut diag = l[j * p + j];
+        for t in 0..j {
+            let l_jt = l[t * p + j];
+            diag -= l_jt * l_jt;
         }
-        // ---- In-place lower Cholesky, mirroring the kernel's tid==0 loop. The
-        //      kernel reads/writes L[row][col] in a logically row-indexed shared
-        //      tile; here L is column-major, so L[row][col] == l[col*p + row]. The
-        //      arithmetic (including the inner-product order) is identical. ----
-        for j in 0..p {
-            let mut diag = l[j * p + j];
+        if !(diag > 0.0) {
+            return Err(j + 1);
+        }
+        let l_jj = diag.sqrt();
+        l[j * p + j] = l_jj;
+        let inv = 1.0 / l_jj;
+        for row in (j + 1)..p {
+            let mut s = l[j * p + row];
             for t in 0..j {
-                let l_jt = l[t * p + j];
-                diag -= l_jt * l_jt;
+                s -= l[t * p + row] * l[t * p + j];
             }
-            if !(diag > 0.0) {
-                return Err(j + 1);
-            }
-            let l_jj = diag.sqrt();
-            l[j * p + j] = l_jj;
-            let inv = 1.0 / l_jj;
-            for row in (j + 1)..p {
-                let mut s = l[j * p + row];
-                for t in 0..j {
-                    s -= l[t * p + row] * l[t * p + j];
-                }
-                l[j * p + row] = s * inv;
-            }
+            l[j * p + row] = s * inv;
         }
-        *log_det_local += 2.0 * (0..p).map(|j| l[j * p + j].ln()).sum::<f64>();
+    }
+    *log_det_local += 2.0 * (0..p).map(|j| l[j * p + j].ln()).sum::<f64>();
 
-        // ---- Forward solve L u = g (kernel's tid==0 sweep). ----
-        let mut u = g.to_vec();
-        assert_eq!(u.len(), p);
+    // ---- Forward solve L u = g (kernel's tid==0 sweep). ----
+    let mut u = g.to_vec();
+    assert_eq!(u.len(), p);
+    for row in 0..p {
+        let mut s = u[row];
+        for t in 0..row {
+            s -= l[t * p + row] * u[t];
+        }
+        u[row] = s / l[row * p + row];
+    }
+    // ---- Forward solve L Y = B (kernel's per-column sweep). ----
+    let mut y = b_col_major.to_vec();
+    assert_eq!(y.len(), p * r);
+    for c in 0..r {
         for row in 0..p {
-            let mut s = u[row];
+            let mut s = y[c * p + row];
             for t in 0..row {
-                s -= l[t * p + row] * u[t];
+                s -= l[t * p + row] * y[c * p + t];
             }
-            u[row] = s / l[row * p + row];
+            y[c * p + row] = s / l[row * p + row];
         }
-        // ---- Forward solve L Y = B (kernel's per-column sweep). ----
-        let mut y = b_col_major.to_vec();
-        assert_eq!(y.len(), p * r);
-        for c in 0..r {
-            for row in 0..p {
-                let mut s = y[c * p + row];
-                for t in 0..row {
-                    s -= l[t * p + row] * y[c * p + t];
-                }
-                y[c * p + row] = s / l[row * p + row];
-            }
-        }
-
-        // ---- Per-block partial Schur reduction: partial_r = Yᵀu, partial_s = YᵀY.
-        //      Inner-product loop order matches the kernel (sum over rows `r`). ----
-        for c in 0..r {
-            let mut rsum = 0.0;
-            for row in 0..p {
-                rsum += y[c * p + row] * u[row];
-            }
-            partial_r[c] = rsum;
-        }
-        for c in 0..r {
-            for c2 in 0..r {
-                let mut ssum = 0.0;
-                for row in 0..p {
-                    ssum += y[c * p + row] * y[c2 * p + row];
-                }
-                // Column-major (c2 = "tid" axis, c = column): partial_s[c*r + c2].
-                partial_s[c * r + c2] = ssum;
-            }
-        }
-
-        Ok(FusedRowState { l, u, y })
     }
 
-    /// CPU emulation of the Layer E back-substitution kernel
-    /// `arrow_schur_back_sub_pgroup` for one row block:
-    ///     `w_i = u_i + Y_i · δβ`,  `L_iᵀ x_i = w_i`,  `δt_i = -x_i`.
-    /// Mirrors the kernel's bottom-to-top transposed solve and the final negation
-    /// (the kernel writes `-w`). Returns `δt_i` (length `p`).
-    fn emulate_back_sub_block(
-        state: &FusedRowState,
-        delta_beta: &[f64],
-        p: usize,
-        r: usize,
-    ) -> Vec<f64> {
-        // w = u + Y·δβ
-        let mut w = state.u.clone();
-        for c in 0..r {
-            let db = delta_beta[c];
+    // ---- Per-block partial Schur reduction: partial_r = Yᵀu, partial_s = YᵀY.
+    //      Inner-product loop order matches the kernel (sum over rows `r`). ----
+    for c in 0..r {
+        let mut rsum = 0.0;
+        for row in 0..p {
+            rsum += y[c * p + row] * u[row];
+        }
+        partial_r[c] = rsum;
+    }
+    for c in 0..r {
+        for c2 in 0..r {
+            let mut ssum = 0.0;
             for row in 0..p {
-                w[row] += state.y[c * p + row] * db;
+                ssum += y[c * p + row] * y[c2 * p + row];
             }
+            // Column-major (c2 = "tid" axis, c = column): partial_s[c*r + c2].
+            partial_s[c * r + c2] = ssum;
         }
-        // Lᵀ x = w, bottom-to-top (kernel's tid==0 reverse sweep). L is column-
-        // major lower, so Lᵀ[r][t] (t>r) reads L[t][r] == l[r*p + t].
-        for row in (0..p).rev() {
-            let mut s = w[row];
-            for t in (row + 1)..p {
-                s -= state.l[row * p + t] * w[t];
-            }
-            w[row] = s / state.l[row * p + row];
-        }
-        // δt = -x
-        w.iter().map(|v| -v).collect()
     }
 
-    /// Faithful, device-free CPU emulation of the full Layer D + E fused NVRTC
-    /// Arrow-Schur Newton solve (`arrow_schur_forward_pgroup` +
-    /// `arrow_schur_back_sub_pgroup`), with the host-side Schur reduction and
-    /// factorization the dispatch performs between them.
-    ///
-    /// This is the #1017 verification anchor for the fused-kernel **algorithm**:
-    /// the CUDA source can only run on a device, but its arithmetic — the per-row
-    /// Cholesky/forward-solve/`YᵀY`/`Yᵀu` reduction and the back-substitution —
-    /// is exactly reproduced here so its correctness is checkable on any host
-    /// against the dense reference, before any GPU wall-clock is available. The
-    /// loop order and inner-product accumulation order match the kernel so the
-    /// result is deterministic and reproduces the device arithmetic in the same
-    /// accumulation order. Where the order genuinely matches (this host reference
-    /// vs the device) the result is bit-identical; but this is an order-match
-    /// guarantee, not a license to claim a criterion ranking "cannot move" under
-    /// any reassociated reduction — a parallel/reassociated path can still flip a
-    /// near-tie winner within the f64 margin (#1211).
-    ///
-    /// Sign and reduction conventions (from `arrow_schur::solve` host assembly):
-    ///   `S_β = (H_ββ + ρ_β I) − Σ_i Y_iᵀ Y_i`,  `r_β = −g_β + Σ_i Y_iᵀ u_i`,
-    ///   `δβ = S_β^{-1} r_β`,  `δt_i = −L_i^{-ᵀ}(u_i + Y_i δβ)`,
-    ///   `log|H| = Σ_i 2Σ_j ln L_i[j,j] + 2Σ_j ln L_{S_β}[j,j]`.
-    ///
-    /// Returns `RowNotPositiveDefinite` / `SchurFactorFailed` mirroring the GPU
-    /// host's `RidgeBumpRequired` / `SchurFactorFailed`, and `Unavailable` for the
-    /// matrix-free / degenerate-dim cases the dense fused path declines.
-    pub fn emulate_fused_arrow_newton_step(
-        sys: &ArrowSchurSystem,
-        ridge_t: f64,
-        ridge_beta: f64,
-    ) -> Result<FusedCpuSolution, FusedCpuError> {
-        let n = sys.rows.len();
-        let p = sys.d;
-        let r = sys.k;
-        if n == 0 || p == 0 || r == 0 {
-            return Err(FusedCpuError::Unavailable);
-        }
-        // The dense fused path requires materialised slabs (no matrix-free ops),
-        // exactly as `arrow_schur::solve` re-checks before packing.
-        if sys.hbb_matvec.is_some() || sys.htbeta_matvec.is_some() || sys.hbb.dim() != (r, r) {
-            return Err(FusedCpuError::Unavailable);
-        }
+    Ok(FusedRowState { l, u, y })
+}
 
-        // ---- Forward pass: emulate the per-block kernel, accumulating partials. ----
-        let mut states: Vec<FusedRowState> = Vec::with_capacity(n);
-        // Seed S_β with H_ββ + ρ_β I (column-major) and r_β with -g_β, matching the
-        // host seed in `arrow_schur::solve`; fold per-row partials in row order.
-        let mut schur = vec![0.0_f64; r * r];
-        for col in 0..r {
-            for row in 0..r {
-                let mut v = sys.hbb[[row, col]];
-                if row == col {
-                    v += ridge_beta;
-                }
-                schur[col * r + row] = v;
-            }
+/// CPU emulation of the Layer E back-substitution kernel
+/// `arrow_schur_back_sub_pgroup` for one row block:
+///     `w_i = u_i + Y_i · δβ`,  `L_iᵀ x_i = w_i`,  `δt_i = -x_i`.
+/// Mirrors the kernel's bottom-to-top transposed solve and the final negation
+/// (the kernel writes `-w`). Returns `δt_i` (length `p`).
+fn emulate_back_sub_block(
+    state: &FusedRowState,
+    delta_beta: &[f64],
+    p: usize,
+    r: usize,
+) -> Vec<f64> {
+    // w = u + Y·δβ
+    let mut w = state.u.clone();
+    for c in 0..r {
+        let db = delta_beta[c];
+        for row in 0..p {
+            w[row] += state.y[c * p + row] * db;
         }
-        let mut rhs: Vec<f64> = sys.gb.iter().map(|v| -v).collect();
-        let mut log_det = 0.0_f64;
+    }
+    // Lᵀ x = w, bottom-to-top (kernel's tid==0 reverse sweep). L is column-
+    // major lower, so Lᵀ[r][t] (t>r) reads L[t][r] == l[r*p + t].
+    for row in (0..p).rev() {
+        let mut s = w[row];
+        for t in (row + 1)..p {
+            s -= state.l[row * p + t] * w[t];
+        }
+        w[row] = s / state.l[row * p + row];
+    }
+    // δt = -x
+    w.iter().map(|v| -v).collect()
+}
 
-        let mut d_col = vec![0.0_f64; p * p];
-        let mut b_col = vec![0.0_f64; p * r];
-        let mut g_vec = vec![0.0_f64; p];
-        let mut partial_s = vec![0.0_f64; r * r];
-        let mut partial_r = vec![0.0_f64; r];
-        for (i, row) in sys.rows.iter().enumerate() {
-            if row.htt.dim() != (p, p) || row.htbeta.dim() != (p, r) || row.gt.len() != p {
-                return Err(FusedCpuError::Unavailable);
-            }
-            // Column-major pack, ridge folded by the forward emulation (the kernel
-            // adds ridge during the load, so pass the raw D here).
-            for c in 0..p {
-                for rr in 0..p {
-                    d_col[c * p + rr] = row.htt[[rr, c]];
-                }
-            }
-            for c in 0..r {
-                for rr in 0..p {
-                    b_col[c * p + rr] = row.htbeta[[rr, c]];
-                }
-            }
-            for rr in 0..p {
-                g_vec[rr] = row.gt[rr];
-            }
-            let state = emulate_forward_block(
-                &d_col,
-                &b_col,
-                &g_vec,
-                p,
-                r,
-                ridge_t,
-                &mut partial_s,
-                &mut partial_r,
-                &mut log_det,
-            )
-            .map_err(|pivot| FusedCpuError::RowNotPositiveDefinite { row: i, pivot })?;
-            // S_β -= Σ YᵀY ; r_β += Σ Yᵀu  (documented sign convention).
-            for idx in 0..r * r {
-                schur[idx] -= partial_s[idx];
-            }
-            for a in 0..r {
-                rhs[a] += partial_r[a];
-            }
-            states.push(state);
-        }
+/// Faithful, device-free CPU emulation of the full Layer D + E fused NVRTC
+/// Arrow-Schur Newton solve (`arrow_schur_forward_pgroup` +
+/// `arrow_schur_back_sub_pgroup`), with the host-side Schur reduction and
+/// factorization the dispatch performs between them.
+///
+/// This is the #1017 verification anchor for the fused-kernel **algorithm**:
+/// the CUDA source can only run on a device, but its arithmetic — the per-row
+/// Cholesky/forward-solve/`YᵀY`/`Yᵀu` reduction and the back-substitution —
+/// is exactly reproduced here so its correctness is checkable on any host
+/// against the dense reference, before any GPU wall-clock is available. The
+/// loop order and inner-product accumulation order match the kernel so the
+/// result is deterministic and reproduces the device arithmetic in the same
+/// accumulation order. Where the order genuinely matches (this host reference
+/// vs the device) the result is bit-identical; but this is an order-match
+/// guarantee, not a license to claim a criterion ranking "cannot move" under
+/// any reassociated reduction — a parallel/reassociated path can still flip a
+/// near-tie winner within the f64 margin (#1211).
+///
+/// Sign and reduction conventions (from `arrow_schur::solve` host assembly):
+///   `S_β = (H_ββ + ρ_β I) − Σ_i Y_iᵀ Y_i`,  `r_β = −g_β + Σ_i Y_iᵀ u_i`,
+///   `δβ = S_β^{-1} r_β`,  `δt_i = −L_i^{-ᵀ}(u_i + Y_i δβ)`,
+///   `log|H| = Σ_i 2Σ_j ln L_i[j,j] + 2Σ_j ln L_{S_β}[j,j]`.
+///
+/// Returns `RowNotPositiveDefinite` / `SchurFactorFailed` mirroring the GPU
+/// host's `RidgeBumpRequired` / `SchurFactorFailed`, and `Unavailable` for the
+/// matrix-free / degenerate-dim cases the dense fused path declines.
+pub fn emulate_fused_arrow_newton_step(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+) -> Result<FusedCpuSolution, FusedCpuError> {
+    let n = sys.rows.len();
+    let p = sys.d;
+    let r = sys.k;
+    if n == 0 || p == 0 || r == 0 {
+        return Err(FusedCpuError::Unavailable);
+    }
+    // The dense fused path requires materialised slabs (no matrix-free ops),
+    // exactly as `arrow_schur::solve` re-checks before packing.
+    if sys.hbb_matvec.is_some() || sys.htbeta_matvec.is_some() || sys.hbb.dim() != (r, r) {
+        return Err(FusedCpuError::Unavailable);
+    }
 
-        // ---- Central: factor S_β (column-major lower Cholesky) and solve δβ. ----
-        // Same in-place scalar Cholesky as the per-row blocks, on the K×K leaf.
-        for j in 0..r {
-            let mut diag = schur[j * r + j];
-            for t in 0..j {
-                let l_jt = schur[t * r + j];
-                diag -= l_jt * l_jt;
-            }
-            if !(diag > 0.0) {
-                return Err(FusedCpuError::SchurFactorFailed { pivot: j + 1 });
-            }
-            let l_jj = diag.sqrt();
-            schur[j * r + j] = l_jj;
-            let inv = 1.0 / l_jj;
-            for row in (j + 1)..r {
-                let mut s = schur[j * r + row];
-                for t in 0..j {
-                    s -= schur[t * r + row] * schur[t * r + j];
-                }
-                schur[j * r + row] = s * inv;
-            }
-        }
-        log_det += 2.0 * (0..r).map(|j| schur[j * r + j].ln()).sum::<f64>();
-        // Forward then back solve S_β δβ = r_β with the lower factor.
-        let mut delta_beta = rhs;
+    // ---- Forward pass: emulate the per-block kernel, accumulating partials. ----
+    let mut states: Vec<FusedRowState> = Vec::with_capacity(n);
+    // Seed S_β with H_ββ + ρ_β I (column-major) and r_β with -g_β, matching the
+    // host seed in `arrow_schur::solve`; fold per-row partials in row order.
+    let mut schur = vec![0.0_f64; r * r];
+    for col in 0..r {
         for row in 0..r {
-            let mut s = delta_beta[row];
-            for t in 0..row {
-                s -= schur[t * r + row] * delta_beta[t];
+            let mut v = sys.hbb[[row, col]];
+            if row == col {
+                v += ridge_beta;
             }
-            delta_beta[row] = s / schur[row * r + row];
+            schur[col * r + row] = v;
         }
-        for row in (0..r).rev() {
-            let mut s = delta_beta[row];
-            for t in (row + 1)..r {
-                s -= schur[row * r + t] * delta_beta[t];
-            }
-            delta_beta[row] = s / schur[row * r + row];
-        }
-
-        // ---- Backward pass: per-row δt_i = -L_iᵀ⁻¹(u_i + Y_i δβ). ----
-        let mut delta_t = vec![0.0_f64; n * p];
-        for (i, state) in states.iter().enumerate() {
-            let dt = emulate_back_sub_block(state, &delta_beta, p, r);
-            delta_t[i * p..(i + 1) * p].copy_from_slice(&dt);
-        }
-
-        Ok(FusedCpuSolution {
-            delta_t,
-            delta_beta,
-            log_det_hessian: log_det,
-        })
     }
+    let mut rhs: Vec<f64> = sys.gb.iter().map(|v| -v).collect();
+    let mut log_det = 0.0_f64;
+
+    let mut d_col = vec![0.0_f64; p * p];
+    let mut b_col = vec![0.0_f64; p * r];
+    let mut g_vec = vec![0.0_f64; p];
+    let mut partial_s = vec![0.0_f64; r * r];
+    let mut partial_r = vec![0.0_f64; r];
+    for (i, row) in sys.rows.iter().enumerate() {
+        if row.htt.dim() != (p, p) || row.htbeta.dim() != (p, r) || row.gt.len() != p {
+            return Err(FusedCpuError::Unavailable);
+        }
+        // Column-major pack, ridge folded by the forward emulation (the kernel
+        // adds ridge during the load, so pass the raw D here).
+        for c in 0..p {
+            for rr in 0..p {
+                d_col[c * p + rr] = row.htt[[rr, c]];
+            }
+        }
+        for c in 0..r {
+            for rr in 0..p {
+                b_col[c * p + rr] = row.htbeta[[rr, c]];
+            }
+        }
+        for rr in 0..p {
+            g_vec[rr] = row.gt[rr];
+        }
+        let state = emulate_forward_block(
+            &d_col,
+            &b_col,
+            &g_vec,
+            p,
+            r,
+            ridge_t,
+            &mut partial_s,
+            &mut partial_r,
+            &mut log_det,
+        )
+        .map_err(|pivot| FusedCpuError::RowNotPositiveDefinite { row: i, pivot })?;
+        // S_β -= Σ YᵀY ; r_β += Σ Yᵀu  (documented sign convention).
+        for idx in 0..r * r {
+            schur[idx] -= partial_s[idx];
+        }
+        for a in 0..r {
+            rhs[a] += partial_r[a];
+        }
+        states.push(state);
+    }
+
+    // ---- Central: factor S_β (column-major lower Cholesky) and solve δβ. ----
+    // Same in-place scalar Cholesky as the per-row blocks, on the K×K leaf.
+    for j in 0..r {
+        let mut diag = schur[j * r + j];
+        for t in 0..j {
+            let l_jt = schur[t * r + j];
+            diag -= l_jt * l_jt;
+        }
+        if !(diag > 0.0) {
+            return Err(FusedCpuError::SchurFactorFailed { pivot: j + 1 });
+        }
+        let l_jj = diag.sqrt();
+        schur[j * r + j] = l_jj;
+        let inv = 1.0 / l_jj;
+        for row in (j + 1)..r {
+            let mut s = schur[j * r + row];
+            for t in 0..j {
+                s -= schur[t * r + row] * schur[t * r + j];
+            }
+            schur[j * r + row] = s * inv;
+        }
+    }
+    log_det += 2.0 * (0..r).map(|j| schur[j * r + j].ln()).sum::<f64>();
+    // Forward then back solve S_β δβ = r_β with the lower factor.
+    let mut delta_beta = rhs;
+    for row in 0..r {
+        let mut s = delta_beta[row];
+        for t in 0..row {
+            s -= schur[t * r + row] * delta_beta[t];
+        }
+        delta_beta[row] = s / schur[row * r + row];
+    }
+    for row in (0..r).rev() {
+        let mut s = delta_beta[row];
+        for t in (row + 1)..r {
+            s -= schur[row * r + t] * delta_beta[t];
+        }
+        delta_beta[row] = s / schur[row * r + row];
+    }
+
+    // ---- Backward pass: per-row δt_i = -L_iᵀ⁻¹(u_i + Y_i δβ). ----
+    let mut delta_t = vec![0.0_f64; n * p];
+    for (i, state) in states.iter().enumerate() {
+        let dt = emulate_back_sub_block(state, &delta_beta, p, r);
+        delta_t[i * p..(i + 1) * p].copy_from_slice(&dt);
+    }
+
+    Ok(FusedCpuSolution {
+        delta_t,
+        delta_beta,
+        log_det_hessian: log_det,
+    })
+}
 }
 
 #[cfg(test)]
@@ -801,8 +801,8 @@ mod test_support {
 // non-linux these imports are unused under `-D warnings`.
 #[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 mod tests {
-    use super::test_support::*;
     use super::*;
+    use super::test_support::*;
 
     #[cfg(target_os = "linux")] // exercises `ceil_to_template_r`, gated to its linux home (CI tests run on linux)
     #[test]
@@ -877,8 +877,8 @@ mod tests {
     // emulation against the dense reference so the fused kernel's correctness
     // is checkable on any host before a V100/A100 window is available.
     // ----------------------------------------------------------------------
-    use crate::arrow_schur::ArrowSchurSystem;
     use crate::gpu_kernels::arrow_schur::solve_arrow_newton_step_dense_reference;
+    use crate::arrow_schur::ArrowSchurSystem;
 
     /// Deterministic SPD bordered system: per-row `H_tt = JJᵀ + (2+i)I` (PD),
     /// arbitrary `H_tβ`, SPD border `H_ββ = MMᵀ + p·I`, fixed gradients. No RNG
