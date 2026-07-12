@@ -329,9 +329,6 @@ pub(crate) struct SurvivalDynamicGeometry {
     pub(crate) d2qdot_lslsd: Array1<f64>,
     pub(crate) wiggle_basis_exit: Option<Array2<f64>>,
     pub(crate) wiggle_basis_entry: Option<Array2<f64>>,
-    pub(crate) wiggle_basis_d1_exit: Option<Array2<f64>>,
-    pub(crate) wiggle_basis_d1_entry: Option<Array2<f64>>,
-    pub(crate) wiggle_basis_d2_exit: Option<Array2<f64>>,
     pub(crate) wiggle_qdot_basis_exit: Option<Array2<f64>>,
     /// #932: the current link-wiggle coefficient vector βw (the last joint
     /// block's β), captured here so the single-source wiggle RowKernel
@@ -917,9 +914,6 @@ impl SurvivalLocationScaleFamily {
             d2qdot_lslsd,
             wiggle_basis_exit: wiggle_exit.as_ref().map(|w| w.basis.clone()),
             wiggle_basis_entry: wiggle_entry.as_ref().map(|w| w.basis.clone()),
-            wiggle_basis_d1_exit: wiggle_exit.as_ref().map(|w| w.basis_d1.clone()),
-            wiggle_basis_d1_entry: wiggle_entry.as_ref().map(|w| w.basis_d1.clone()),
-            wiggle_basis_d2_exit: wiggle_exit.as_ref().map(|w| w.basis_d2.clone()),
             wiggle_qdot_basis_exit,
             wiggle_beta: if self.x_link_wiggle.is_some() {
                 Some(block_states[Self::BLOCK_LINK_WIGGLE].beta.to_owned())
