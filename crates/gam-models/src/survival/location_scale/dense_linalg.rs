@@ -5,15 +5,6 @@ pub(crate) fn safe_fast_xt_diag_x(x: &Array2<f64>, weights: &Array1<f64>) -> Arr
     fast_xt_diag_x(x, &sanitized)
 }
 
-pub(crate) fn safe_fast_xt_diag_x_with_parallelism(
-    x: &Array2<f64>,
-    weights: &Array1<f64>,
-    par: faer::Par,
-) -> Array2<f64> {
-    let sanitized = sanitize_survival_weight_vector(weights);
-    fast_xt_diag_x_with_parallelism(x, &sanitized, par)
-}
-
 /// Horvitz-Thompson outer-subsample row mask. When `mask` is `None` this
 /// returns `weighted_crossprod_dense(left, weights, right)` verbatim, which is
 /// the byte-identical pre-refactor expression. When `mask` is `Some(m)`, the

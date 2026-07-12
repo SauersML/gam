@@ -3,7 +3,7 @@
 //!
 //! Pure relocation from `survival_location_scale.rs` (issue #780
 //! decomposition): the layered overflow guards (`safe_product`, `safe_sum2/3`,
-//! `safe_product3`, `safe_hadamard_product`, `safe_linear_combo2_arrays`), the
+//! `safe_product3`, `safe_hadamard_product`), the
 //! numerically stable `softplus`, the weight-vector sanitizer, and the
 //! compensated (two-difference) subtraction carrying an explicit roundoff
 //! slack into the monotonicity gate. These are domain-agnostic numerical
@@ -94,32 +94,6 @@ pub(super) fn safe_hadamard_product(
     if out.iter().any(|value| value.is_nan()) {
         return Err(SurvivalLocationScaleError::NumericalFailure {
             reason: "safe_hadamard_product produced NaN values".to_string(),
-        });
-    }
-    Ok(out)
-}
-
-pub(super) fn safe_linear_combo2_arrays(
-    a: &Array1<f64>,
-    b: &Array1<f64>,
-    c: &Array1<f64>,
-    d: &Array1<f64>,
-) -> Result<Array1<f64>, SurvivalLocationScaleError> {
-    if a.len() != b.len() || a.len() != c.len() || a.len() != d.len() {
-        bail_dim_sls!(
-            "safe_linear_combo2_arrays length mismatch: a={}, b={}, c={}, d={}",
-            a.len(),
-            b.len(),
-            c.len(),
-            d.len()
-        );
-    }
-    let out = Array1::from_shape_fn(a.len(), |i| {
-        safe_sum2(safe_product(a[i], b[i]), safe_product(c[i], d[i]))
-    });
-    if out.iter().any(|value| value.is_nan()) {
-        return Err(SurvivalLocationScaleError::NumericalFailure {
-            reason: "safe_linear_combo2_arrays produced NaN values".to_string(),
         });
     }
     Ok(out)

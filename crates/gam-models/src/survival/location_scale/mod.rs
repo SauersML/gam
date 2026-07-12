@@ -51,7 +51,6 @@ use gam_problem::{
 
 use gam_linalg::faer_ndarray::{
     FaerEigh, fast_atb_with_parallelism, fast_atv, fast_av, fast_xt_diag_x,
-    fast_xt_diag_x_with_parallelism,
 };
 
 use crate::location_scale_engine::build_location_scale_exact_joint_setup;
@@ -129,8 +128,8 @@ mod numeric_guards;
 // can reach them through `use super::*` exactly as the pre-split single
 // namespace did. The primitives themselves are `pub(super)` in `numeric_guards`.
 pub(in crate::survival::location_scale) use numeric_guards::{
-    compensated_difference, safe_hadamard_product, safe_linear_combo2_arrays, safe_product,
-    safe_product3, safe_sum2, safe_sum3, sanitize_survival_weight_vector, softplus,
+    compensated_difference, safe_hadamard_product, safe_product, safe_product3, safe_sum2,
+    safe_sum3, sanitize_survival_weight_vector, softplus,
 };
 
 mod constants;
