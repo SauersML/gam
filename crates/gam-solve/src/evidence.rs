@@ -2277,10 +2277,6 @@ impl CircularGaussianFit2d {
     /// Two center coordinates, one radius, and one isotropic noise variance.
     pub const NUM_FREE_PARAMETERS: usize = 4;
 
-    /// A regular four-parameter BIC fit requires strictly more observations
-    /// than parameters.
-    pub const MINIMUM_ROWS: usize = Self::NUM_FREE_PARAMETERS + 1;
-
     /// Construct a circular Gaussian from validated model parameters.
     pub fn from_parameters(
         center: [f64; 2],
@@ -2311,12 +2307,8 @@ impl CircularGaussianFit2d {
                 coords.ncols()
             ));
         }
-        if rows.len() < Self::MINIMUM_ROWS {
-            return Err(format!(
-                "circular Gaussian needs at least {} rows, got {}",
-                Self::MINIMUM_ROWS,
-                rows.len()
-            ));
+        if rows.is_empty() {
+            return Err("circular Gaussian requires a nonempty training set".to_string());
         }
         if rows.iter().any(|&row| row >= coords.nrows()) {
             return Err("circular Gaussian row index is out of bounds".to_string());
@@ -2523,36 +2515,36 @@ impl CircularGaussianFit2d {
             return Err("circular Gaussian likelihood received invalid coordinates or rows"
                 .to_string());
         }
-        let mut log_likelihood = 0.0_f64;
+        let mut log_densities = Vec::with_capacity(rows.len());
         for &row in rows {
             let value = self.log_density(coords[[row, 0]], coords[[row, 1]]);
             if !value.is_finite() {
                 return Err("circular Gaussian likelihood is not finite".to_string());
             }
-            log_likelihood += value;
+            log_densities.push(value);
         }
+        let log_likelihood = pairwise_sum(&log_densities);
         if !log_likelihood.is_finite() {
             return Err("circular Gaussian likelihood sum is not finite".to_string());
         }
         Ok(log_likelihood)
     }
 
-    /// BIC/2 on selected rows; lower is better.
-    pub fn bic(self, coords: ArrayView2<'_, f64>, rows: &[usize]) -> Result<f64, String> {
-        if rows.len() < Self::MINIMUM_ROWS {
-            return Err(format!(
-                "circular Gaussian BIC needs at least {} rows, got {}",
-                Self::MINIMUM_ROWS,
-                rows.len()
-            ));
-        }
-        let log_likelihood = self.log_likelihood(coords, rows)?;
+    /// Fit selected rows and return both the fit and its BIC/2 (lower is
+    /// better). Keeping fitting and evidence evaluation in one operation makes
+    /// it impossible to label a likelihood on unrelated data as fitted BIC.
+    pub fn fit_with_bic(
+        coords: ArrayView2<'_, f64>,
+        rows: &[usize],
+    ) -> Result<(Self, f64), String> {
+        let fit = Self::fit(coords, rows)?;
+        let log_likelihood = fit.log_likelihood(coords, rows)?;
         let bic = -log_likelihood
             + 0.5 * Self::NUM_FREE_PARAMETERS as f64 * (rows.len() as f64).ln();
         if !bic.is_finite() {
             return Err("circular Gaussian BIC is not finite".to_string());
         }
-        Ok(bic)
+        Ok((fit, bic))
     }
 }
 
@@ -2574,6 +2566,11 @@ fn circular_gaussian_bessel_terms(
         return bessel_i0_log_minus_abs_and_ratio(kappa);
     }
     let log_kappa = radius.ln() + observed_radius.ln() - noise_variance.ln();
+    if log_kappa <= f64::MAX.ln() {
+        // The left-to-right product overflowed before a large variance divided
+        // it back into range. Reconstruct the representable ratio from its log.
+        return bessel_i0_log_minus_abs_and_ratio(log_kappa.exp());
+    }
     (
         -0.5 * (std::f64::consts::TAU.ln() + log_kappa),
         1.0,
@@ -2619,8 +2616,9 @@ pub const UNION_STRUCTURE_LADDER: &[UnionStructure] = &[
 /// The per-component generative structure a union pins each responsibility group
 /// to. `Line` and `PointCluster` share the full-covariance Gaussian density
 /// (a line is an anisotropic Gaussian — the covariance, not a different
-/// parameterization, is what distinguishes them); `Circle` is a genuinely
-/// different density on `(radius, angle)`.
+/// parameterization, is what distinguishes them); `Circle` is the proper
+/// Cartesian density of a uniform latent circle convolved with isotropic
+/// Gaussian noise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnionComponentKind {
     Circle,
@@ -2837,7 +2835,7 @@ fn gather_union_rows(data: ArrayView2<'_, f64>, idx: &[usize]) -> Array2<f64> {
 /// Fit a single union component density on its responsibility group and return
 /// `(bic, free_parameter_count)`. `Line` and
 /// `PointCluster` use the full-covariance Gaussian density (a single mixture
-/// component); `Circle` uses the radius/angle generative density below.
+/// component); `Circle` uses [`CircularGaussianFit2d`].
 fn fit_union_component(
     group: ArrayView2<'_, f64>,
     kind: UnionComponentKind,
@@ -2857,82 +2855,32 @@ fn fit_union_component(
             let fit = fit_gaussian_mixture(group, 1, config).map_err(|error| error.to_string())?;
             Ok((fit.bic(), fit.num_free_parameters()))
         }
-        UnionComponentKind::Circle => fit_circle_component_evidence(group, config),
+        UnionComponentKind::Circle => {
+            let rows = union_circle_rows(group)?;
+            let (_, bic) = CircularGaussianFit2d::fit_with_bic(group, &rows)?;
+            Ok((bic, CircularGaussianFit2d::NUM_FREE_PARAMETERS))
+        }
     }
 }
 
-/// BIC/2 of a 2-D *circle* component: data is
-/// modelled as `(r, θ)` with `r ~ N(ρ, σ_r²)` around a fitted center+radius and
-/// `θ` uniform on the circle. Free parameters: center `(cx, cy)`, radius `ρ`,
-/// radial variance `σ_r²` — `P = 4`. The angle is an ancillary uniform with no
-/// free parameter (it carries `−log(2π r)` of density).
-fn fit_circle_component_evidence(
-    group: ArrayView2<'_, f64>,
-    config: GaussianMixtureConfig,
-) -> Result<(f64, usize), String> {
-    let d = group.ncols();
-    if d != 2 {
+/// Apply the structured-union admission policy to one circle group and return
+/// its complete deterministic row set.
+/// The `n > P` rule belongs to this composite ladder; it is not an intrinsic
+/// restriction of circular-Gaussian likelihood fitting or BIC itself.
+fn union_circle_rows(group: ArrayView2<'_, f64>) -> Result<Vec<usize>, String> {
+    let minimum_rows = CircularGaussianFit2d::NUM_FREE_PARAMETERS + 1;
+    if group.nrows() < minimum_rows {
         return Err(format!(
-            "union circle component requires 2-D data, got {d} columns"
+            "union circle component needs at least {minimum_rows} rows, got {}",
+            group.nrows()
         ));
     }
-    let n = group.nrows();
-    let p = 4usize; // cx, cy, radius, radial-variance
-    if n < p + 1 {
-        return Err(format!(
-            "union circle component needs >= {} rows, got {n}",
-            p + 1
-        ));
-    }
-    // Center = data centroid; radius = mean distance to centroid; radial
-    // variance = mean squared radial residual (floored). This is the algebraic
-    // circle-fit optimum for the isotropic radial-Gaussian model and is a pure
-    // function of the data.
-    let mut cx = 0.0_f64;
-    let mut cy = 0.0_f64;
-    for i in 0..n {
-        cx += group[[i, 0]];
-        cy += group[[i, 1]];
-    }
-    cx /= n as f64;
-    cy /= n as f64;
-    let mut radii = vec![0.0_f64; n];
-    let mut radius = 0.0_f64;
-    for i in 0..n {
-        let dx = group[[i, 0]] - cx;
-        let dy = group[[i, 1]] - cy;
-        let r = (dx * dx + dy * dy).sqrt();
-        radii[i] = r;
-        radius += r;
-    }
-    radius /= n as f64;
-    let mut var_r = 0.0_f64;
-    for &r in &radii {
-        let e = r - radius;
-        var_r += e * e;
-    }
-    var_r = (var_r / n as f64).max(config.covariance_floor);
-    let inv_var = 1.0 / var_r;
-    // Total log-likelihood: Σ_i [ −½ log(2π σ_r²) − (r_i−ρ)²/(2σ_r²)
-    //                             − log(2π r_i) ]  (radial Gaussian × uniform θ).
-    let mut loglik = 0.0_f64;
-    let log_2pi = (2.0 * std::f64::consts::PI).ln();
-    for &r in &radii {
-        let e = r - radius;
-        let radial = -0.5 * (log_2pi + var_r.ln()) - 0.5 * e * e * inv_var;
-        let angular = -(log_2pi + r.max(f64::MIN_POSITIVE).ln());
-        loglik += radial + angular;
-    }
-    let bic = -loglik + 0.5 * p as f64 * (n as f64).ln();
-    if !bic.is_finite() {
-        return Err("union circle component BIC is not finite".to_string());
-    }
-    Ok((bic, p))
+    Ok((0..group.nrows()).collect())
 }
 
 /// A fitted union component as a *predictive density* (not just an evidence
-/// scalar): either a full-covariance Gaussian (`Line`/`PointCluster`) or the
-/// radial-Gaussian×uniform-angle circle density. Carries the mixing weight
+/// scalar): either a full-covariance Gaussian (`Line`/`PointCluster`) or a
+/// Gaussian-blurred latent circle. Carries the mixing weight
 /// `π_c = row_count_c / n_train` so a union can be evaluated as the soft mixture
 /// `Σ_c π_c p_c(y)` at held-out rows for cross-class stacking.
 #[derive(Debug, Clone)]
@@ -2943,9 +2891,7 @@ enum UnionComponentDensity {
     },
     Circle {
         log_weight: f64,
-        center: [f64; 2],
-        radius: f64,
-        var_r: f64,
+        fit: CircularGaussianFit2d,
     },
 }
 
@@ -2956,20 +2902,8 @@ impl UnionComponentDensity {
             UnionComponentDensity::Gaussian { log_weight, eval } => {
                 log_weight + eval.log_density(y)
             }
-            UnionComponentDensity::Circle {
-                log_weight,
-                center,
-                radius,
-                var_r,
-            } => {
-                let dx = y[0] - center[0];
-                let dy = y[1] - center[1];
-                let r = (dx * dx + dy * dy).sqrt();
-                let log_2pi = (2.0 * std::f64::consts::PI).ln();
-                let e = r - radius;
-                let radial = -0.5 * (log_2pi + var_r.ln()) - 0.5 * e * e / var_r;
-                let angular = -(log_2pi + r.max(f64::MIN_POSITIVE).ln());
-                log_weight + radial + angular
+            UnionComponentDensity::Circle { log_weight, fit } => {
+                log_weight + fit.log_density(y[0], y[1])
             }
         }
     }
@@ -3012,48 +2946,9 @@ fn fit_union_component_densities(
                 out.push(UnionComponentDensity::Gaussian { log_weight, eval });
             }
             UnionComponentKind::Circle => {
-                let d = group.ncols();
-                if d != 2 {
-                    return Err(format!(
-                        "union circle component density requires 2-D data, got {d} columns"
-                    ));
-                }
-                let n = group.nrows();
-                if n < 5 {
-                    return Err(format!(
-                        "union circle component density needs >= 5 rows, got {n}"
-                    ));
-                }
-                let mut cx = 0.0_f64;
-                let mut cy = 0.0_f64;
-                for i in 0..n {
-                    cx += group[[i, 0]];
-                    cy += group[[i, 1]];
-                }
-                cx /= n as f64;
-                cy /= n as f64;
-                let mut radius = 0.0_f64;
-                let mut radii = vec![0.0_f64; n];
-                for i in 0..n {
-                    let dx = group[[i, 0]] - cx;
-                    let dy = group[[i, 1]] - cy;
-                    let r = (dx * dx + dy * dy).sqrt();
-                    radii[i] = r;
-                    radius += r;
-                }
-                radius /= n as f64;
-                let mut var_r = 0.0_f64;
-                for &r in &radii {
-                    let e = r - radius;
-                    var_r += e * e;
-                }
-                var_r = (var_r / n as f64).max(config.covariance_floor);
-                out.push(UnionComponentDensity::Circle {
-                    log_weight,
-                    center: [cx, cy],
-                    radius,
-                    var_r,
-                });
+                let rows = union_circle_rows(group.view())?;
+                let fit = CircularGaussianFit2d::fit(group.view(), &rows)?;
+                out.push(UnionComponentDensity::Circle { log_weight, fit });
             }
         }
     }

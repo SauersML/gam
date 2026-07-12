@@ -439,6 +439,9 @@ fn behavior_block_pins_reflection_gauge_that_activation_alone_cannot() {
     // the activation-only fit provably cannot represent.
     let mut planted_sep_max = 0.0_f64;
     let mut worst_kl = 0.0_f64;
+    let mut worst_row = 0usize;
+    let mut sum_kl = 0.0_f64;
+    let mut n_kl = 0usize;
     for &(a, b) in &mirror_pairs {
         let sep = SphereTangentEmbedding::exact_kl(probs.row(a), probs.row(b)).unwrap();
         planted_sep_max = planted_sep_max.max(sep);
@@ -446,9 +449,32 @@ fn behavior_block_pins_reflection_gauge_that_activation_alone_cannot() {
             let y_hat = Array1::from_shape_fn(p_y, |j| fitted_b[[row, p_x + j]] * inv);
             let p_hat = block.embedding.decode(y_hat.view()).unwrap();
             let kl = SphereTangentEmbedding::exact_kl(probs.row(row), p_hat.view()).unwrap();
-            worst_kl = worst_kl.max(kl);
+            if kl > worst_kl {
+                worst_kl = kl;
+                worst_row = row;
+            }
+            sum_kl += kl;
+            n_kl += 1;
         }
     }
+    // DIAGNOSTIC (#2015 gate): the selected λ_y (behavior weight) and WHERE the
+    // worst row sits separate the two hypotheses. Small λ_y ⇒ behavior
+    // under-weighted (selection issue). Large λ_y with a worst row near a mirror
+    // fixed point (θ≈0 → row≈0, or θ≈π → row≈n/2) ⇒ a nonconvex unfolding stall
+    // there; a worst row spread away from the fold with large λ_y ⇒ an irreducible
+    // basis-capacity floor (softmax of harmonic-1 logits carries harmonics ≥3 the
+    // order-2 basis `num_basis=5` cannot represent).
+    eprintln!(
+        "[#2015 reflection-gauge] log λ_y={:.6} (λ_y={:.4}), converged={}, sweeps={}, \
+         worst_kl={worst_kl:.6} @row {worst_row}/{n}, mean_kl={:.6}, \
+         planted_sep_max={planted_sep_max:.6}, bar=0.1·sep={:.6}",
+        report.log_lambda_y,
+        report.log_lambda_y.exp(),
+        report.converged,
+        report.sweeps,
+        sum_kl / n_kl as f64,
+        0.1 * planted_sep_max,
+    );
     // The planted behavior really is strongly asymmetric across the mirror...
     assert!(
         planted_sep_max > 0.5,

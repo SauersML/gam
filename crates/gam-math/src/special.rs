@@ -226,6 +226,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn centered_bessel_log_is_finite_and_derivative_consistent() {
+        for eta in [0.25_f64, 1.0, 3.74, 3.76, 12.0, 900.0] {
+            let (centered, ratio) = bessel_i0_log_minus_abs_and_ratio(eta);
+            assert!(centered.is_finite());
+            assert!((0.0..=1.0).contains(&ratio));
+
+            let h = 1.0e-4 * eta.max(1.0);
+            let (plus, _) = bessel_i0_log_and_ratio(eta + h);
+            let (minus, _) = bessel_i0_log_and_ratio(eta - h);
+            let derivative = (plus - minus) / (2.0 * h);
+            assert!((derivative - ratio).abs() <= 1.0e-6 + 1.0e-5 * ratio.abs());
+        }
+        for eta in [1.0e20_f64, 1.0e100, 1.0e300] {
+            let (centered, ratio) = bessel_i0_log_minus_abs_and_ratio(eta);
+            let asymptotic = -0.5 * (std::f64::consts::TAU * eta).ln();
+            assert!(centered.is_finite() && ratio.is_finite());
+            assert!((centered - asymptotic).abs() < 2.0e-8);
+        }
+    }
+
+    #[test]
     fn gauss_legendre_integrates_polynomials_exactly() {
         // An n-point rule is exact for polynomials of degree ≤ 2n−1.
         for n in [1usize, 2, 3, 5, 8, 40, 64] {

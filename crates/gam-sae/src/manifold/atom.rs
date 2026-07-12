@@ -1,5 +1,7 @@
 use super::*;
-use gam_math::special::{bessel_i0_log_and_ratio, bessel_i0_log_minus_abs_and_ratio};
+use gam_math::special::bessel_i0_log_and_ratio;
+#[cfg(test)]
+use gam_math::special::bessel_i0_log_minus_abs_and_ratio;
 
 /// Declared function-space seminorm used by one atom's smoothing prior.
 ///
