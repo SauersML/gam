@@ -383,16 +383,28 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             "cause-specific competing risks with {cause_count} causes are currently supported for --survival-likelihood transformation and weibull"
         ));
     }
-    // All-censored (zero-event) fittability gate. The survival likelihood has
-    // no event score when no row marks a target event, so the inner/outer
-    // solve cannot identify the hazard. The single-hazard engine's structural
-    // checks (in `WorkingModelSurvival::validate_common_inputs`) intentionally
-    // permit construction on censored fixtures so the engine's update_state
-    // / monotonicity-collocation contracts can be unit-tested in isolation;
+    // Zero effective-event-mass fittability gate (#2276). The survival
+    // likelihood has no event score when no row contributes a target event to
+    // the WEIGHTED likelihood — either every row is censored, or every
+    // event-coded row carries zero weight (kernels drop `weight <= 0` rows) —
+    // so the inner/outer solve cannot identify the hazard. Testing raw event
+    // codes here was weight-blind and let a zero-on-events weight column slip
+    // past into a silent non-convergence. `weights` is resolved above; when no
+    // weight column is supplied it is all-ones, so this reduces to the original
+    // raw event-count test. The single-hazard engine's structural checks (in
+    // `WorkingModelSurvival::validate_common_inputs`) intentionally permit
+    // construction on censored fixtures so the engine's update_state /
+    // monotonicity-collocation contracts can be unit-tested in isolation;
     // production fit dispatchers own the fittability gate.
-    if !event_target.iter().any(|&code| code > 0) {
+    let weighted_event_mass: f64 = event_target
+        .iter()
+        .zip(weights.iter())
+        .filter(|(&code, _)| code > 0)
+        .map(|(_, &weight)| weight)
+        .sum();
+    if !(weighted_event_mass > 0.0) {
         return Err(
-            "survival fit requires at least one target event; all rows are censored, so the likelihood has no event score and cannot identify the hazard"
+            "survival fit requires at least one target event with positive weight; every event-coded row is absent or zero-weighted, so the weighted likelihood has no event score and cannot identify the hazard"
                 .to_string(),
         );
     }
