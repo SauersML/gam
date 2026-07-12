@@ -414,29 +414,22 @@ fn jet_expression(expression: &Expr, variables: &[Ident]) -> Result<TokenStream2
     }
 }
 
-fn children(node: &Node) -> &[usize] {
-    match node {
-        Node::Constant(_) | Node::Variable(_) => &[],
-        Node::Neg(value) | Node::Exp(value) | Node::Ln(value) | Node::Sqrt(value) => {
-            std::slice::from_ref(value)
-        }
-        Node::Add(left, right)
-        | Node::Sub(left, right)
-        | Node::Mul(left, right)
-        | Node::Div(left, right) => unsafe {
-            // `left` and `right` are adjacent fields in every binary enum arm.
-            // Avoiding an allocated temporary keeps this traversal allocation-free.
-            std::slice::from_raw_parts(left, 2)
-        },
-    }
-}
-
 fn topological_order(id: usize, graph: &Graph, seen: &mut HashSet<usize>, order: &mut Vec<usize>) {
     if !seen.insert(id) {
         return;
     }
-    for &child in children(&graph.nodes[id]) {
-        topological_order(child, graph, seen, order);
+    match graph.nodes[id] {
+        Node::Constant(_) | Node::Variable(_) => {}
+        Node::Neg(value) | Node::Exp(value) | Node::Ln(value) | Node::Sqrt(value) => {
+            topological_order(value, graph, seen, order);
+        }
+        Node::Add(left, right)
+        | Node::Sub(left, right)
+        | Node::Mul(left, right)
+        | Node::Div(left, right) => {
+            topological_order(left, graph, seen, order);
+            topological_order(right, graph, seen, order);
+        }
     }
     if !matches!(graph.nodes[id], Node::Constant(_) | Node::Variable(_)) {
         order.push(id);
