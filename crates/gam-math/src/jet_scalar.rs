@@ -3950,6 +3950,41 @@ mod tests {
             }
         }
 
+        let fixed_one_v: Vec<FixedRuntimeJet<OneSeed<K>, K>> = (0..K)
+            .map(|axis| FixedRuntimeJet {
+                inner: OneSeed::seed_direction(values[axis], axis, direction_v[axis]),
+            })
+            .collect();
+        let fixed_third_v = expression(&fixed_one_v).into_inner().contracted_third();
+        let batch_workspace = DynamicOneSeedBatchWorkspace::new(2);
+        let directions = [direction_u, direction_v];
+        let batch_vars = batch_workspace.alloc_slice_fill_with(K, |axis| {
+            DynamicOneSeedBatch::seed_directions(
+                values[axis],
+                axis,
+                K,
+                &batch_workspace,
+                |lane| directions[lane][axis],
+            )
+        });
+        let dynamic_batch = expression(batch_vars);
+        assert_eq!(dynamic_batch.lanes(), 2);
+        for lane in 0..2 {
+            let expected = if lane == 0 {
+                &fixed_third
+            } else {
+                &fixed_third_v
+            };
+            for a in 0..K {
+                for b in 0..K {
+                    close(
+                        dynamic_batch.contracted_third(lane)[a * K + b],
+                        expected[a][b],
+                    );
+                }
+            }
+        }
+
         let fixed_two: Vec<FixedRuntimeJet<TwoSeed<K>, K>> = (0..K)
             .map(|axis| FixedRuntimeJet {
                 inner: TwoSeed::seed(values[axis], axis, direction_u[axis], direction_v[axis]),
