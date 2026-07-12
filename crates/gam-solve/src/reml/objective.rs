@@ -260,7 +260,7 @@ impl<'a> RemlState<'a> {
         {
             // Validation and diagnostics (before delegating to unified evaluator).
             let pirls_result = bundle.pirls_result.as_ref();
-            let ridge_used = bundle.ridge_passport.delta;
+            let ridge_used = bundle.ridge_passport.delta();
 
             if !p.is_empty() {
                 let k_lambda = p.len();

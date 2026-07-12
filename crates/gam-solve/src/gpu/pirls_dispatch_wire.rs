@@ -478,7 +478,7 @@ mod linux_impl {
         };
 
         // Stabilised Hessian = penalized_hessian + δI per ridge_passport.
-        let delta = ridge_passport.delta;
+        let delta = ridge_passport.delta();
         let mut stab = penalized_hessian.clone();
         if delta > 0.0 {
             for i in 0..p {
@@ -626,7 +626,6 @@ mod linux_impl {
             penalized_hessian_transformed: penalized_hessian_sym,
             stabilizedhessian_transformed: stabilizedhessian_sym,
             ridge_passport,
-            ridge_used: delta,
             deviance,
             edf: edf_final,
             stable_penalty_term: penalty_term,
@@ -943,9 +942,9 @@ mod linux_impl {
             stabilizedhessian_transformed: stabilizedhessian_sym,
             ridge_passport: RidgePassport::scaled_identity(
                 ridge_used,
-                RidgePolicy::explicit_stabilization_full(),
-            ),
-            ridge_used,
+                RidgePolicy::exact_full_objective(),
+            )
+            .map_err(|error| format!("invalid GPU PIRLS ridge metadata: {error}"))?,
             deviance,
             edf: f64::NAN, // recomputed by outer REML from penalized_hessian + e_transformed
             stable_penalty_term: penalty_term,

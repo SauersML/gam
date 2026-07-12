@@ -4,7 +4,6 @@
 
 use super::*;
 use gam_problem::{ensure_finite_scalar_estimation, validate_all_finite_estimation};
-use opt::{RidgeSchedule, escalate_ridge};
 
 pub(crate) fn screened_outer_warm_start<'a>(
     warm_start: Option<&'a ConstrainedWarmStart>,
@@ -258,9 +257,8 @@ pub(crate) fn validate_lambda_pair_consistency(
 /// `None`, so `edf_total` was unavailable for every custom family even though
 /// the converged geometry already carries the penalized Hessian. This mirrors
 /// the survival-path repair (`survival_transformation_edf`, #565) for the
-/// blockwise engine: the same trace formula, factorized with the same
-/// ridge-retry stabilization so a marginally indefinite Hessian at a boundary
-/// optimum still yields a usable trace instead of dropping inference.
+/// blockwise engine: the same trace formula, evaluated against the exact
+/// fitted penalized Hessian.
 ///
 /// `edf_penalty` is returned aligned 1:1 with the flattened `lambdas`
 /// (one entry per penalty across all blocks), matching the
@@ -292,32 +290,12 @@ pub(crate) fn custom_family_blockwise_edf(
     }
 
     let h_sym = SymmetricMatrix::Dense(penalized_hessian.clone());
-    // Sparse-aware factorization with ridge retry (mirrors estimate.rs and
-    // survival_transformation_edf): a boundary-constrained optimum can leave
-    // the penalized Hessian marginally indefinite, in which case we add the
-    // smallest diagonal shift that restores definiteness so the trace solve
-    // succeeds rather than dropping inference for the whole fit.
-    let factor = {
-        let scale = h_sym.max_abs_diag();
-        let try_ridge = |ridge: f64| -> Option<_> {
-            let candidate = if ridge > 0.0 {
-                h_sym.addridge(ridge).unwrap_or_else(|_| h_sym.clone())
-            } else {
-                h_sym.clone()
-            };
-            candidate.factorize().ok()
-        };
-        // Bare (unridged) attempt first, then 7 geometric escalations from
-        // `scale·1e-10` — the pre-migration budget of 8 total attempts.
-        match try_ridge(0.0) {
-            Some(f) => f,
-            None => escalate_ridge(RidgeSchedule::geometric(scale * 1e-10, 7), try_ridge)
-                .map(|success| success.value)
-                .map_err(|_| {
-                    "custom-family edf: penalized Hessian could not be factorized".to_string()
-                })?,
-        }
-    };
+    // EDF and covariance are properties of the fitted Hessian, not of a
+    // nearby matrix selected because it factors. Refuse invalid curvature
+    // rather than silently reporting inference for a ridge-perturbed estimand.
+    let factor = h_sym.factorize().map_err(|error| {
+        format!("custom-family edf: exact penalized-Hessian factorization failed: {error}")
+    })?;
 
     let mut edf_by_penalty = vec![0.0_f64; expected_rho];
     // Raw per-penalty trace tr_kk = λ_kk·tr(H⁻¹S_kk), aligned with edf_by_penalty

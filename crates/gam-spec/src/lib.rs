@@ -2748,6 +2748,111 @@ mod tests {
     use super::*;
     use ndarray::arr1;
 
+    #[test]
+    fn resolved_likelihood_scale_rejects_missing_and_mismatched_ownership() {
+        let beta_mismatch = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::beta_logit(3.0),
+            scale: LikelihoodScaleMetadata::EstimatedBetaPhi {
+                phi: f64::from_bits(3.0_f64.to_bits() + 1),
+            },
+        };
+        assert!(
+            beta_mismatch
+                .resolved_scale()
+                .expect_err("Beta mirrored precision mismatch must fail")
+                .to_string()
+                .contains("disagrees")
+        );
+
+        let nb_owner_mismatch = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::negative_binomial_log(2.0),
+            scale: LikelihoodScaleMetadata::FixedNegBinTheta { theta: 2.0 },
+        };
+        assert!(
+            nb_owner_mismatch
+                .resolved_scale()
+                .expect_err("NB fixed/estimated ownership mismatch must fail")
+                .to_string()
+                .contains("ownership flag")
+        );
+
+        let gamma_missing = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::gamma_log(),
+            scale: LikelihoodScaleMetadata::Unspecified,
+        };
+        assert!(
+            gamma_missing
+                .resolved_scale()
+                .expect_err("Gamma cannot fabricate a unit shape")
+                .to_string()
+                .contains("GammaShape")
+        );
+
+        let poisson_nonunit = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::poisson_log(),
+            scale: LikelihoodScaleMetadata::FixedDispersion { phi: 2.0 },
+        };
+        assert!(
+            poisson_nonunit
+                .resolved_scale()
+                .expect_err("Poisson scale must be exact unit")
+                .to_string()
+                .contains("phi: 1.0")
+        );
+    }
+
+    #[test]
+    fn resolved_likelihood_scale_preserves_extremes_in_log_coordinates() {
+        let smallest_subnormal = f64::from_bits(1);
+        let gamma_from_phi = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::gamma_log(),
+            scale: LikelihoodScaleMetadata::FixedDispersion {
+                phi: smallest_subnormal,
+            },
+        };
+        assert_eq!(
+            gamma_from_phi
+                .resolved_gamma_log_shape()
+                .expect("Gamma log shape remains representable")
+                .to_bits(),
+            (-smallest_subnormal.ln()).to_bits()
+        );
+        assert!(
+            gamma_from_phi.resolved_gamma_shape().is_err(),
+            "raw reciprocal beyond f64 must fail only at the raw-shape consumer"
+        );
+
+        let gamma_from_shape = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::gamma_log(),
+            scale: LikelihoodScaleMetadata::FixedGammaShape {
+                shape: smallest_subnormal,
+            },
+        };
+        assert_eq!(
+            gamma_from_shape
+                .resolved_gamma_shape()
+                .expect("subnormal shape is still a positive shape")
+                .to_bits(),
+            smallest_subnormal.to_bits()
+        );
+        assert!(gamma_from_shape.resolved_gamma_phi().is_err());
+
+        let tweedie = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::tweedie_log(1.5),
+            scale: LikelihoodScaleMetadata::FixedDispersion {
+                phi: smallest_subnormal,
+            },
+        };
+        assert_eq!(
+            tweedie
+                .resolved_tweedie_phi()
+                .expect("positive subnormal Tweedie phi")
+                .to_bits(),
+            smallest_subnormal.to_bits()
+        );
+        assert!(tweedie.resolved_tweedie_log_phi().unwrap().is_finite());
+    }
+
     // -----------------------------------------------------------------------
     // CoefficientGroupPrior::validate
     // -----------------------------------------------------------------------

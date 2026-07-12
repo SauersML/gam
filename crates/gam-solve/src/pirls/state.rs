@@ -353,11 +353,6 @@ pub struct PirlsResult {
     pub stabilizedhessian_transformed: SymmetricMatrix,
     /// Canonical ridge metadata passport consumed by outer objective/gradient code.
     pub ridge_passport: RidgePassport,
-    // Ridge added to make the stabilized Hessian positive definite. When > 0,
-    // `stable_penalty_term` includes ridge_used * ||beta||^2 (which contributes
-    // 0.5 * ridge_used * ||beta||^2 in -0.5 * (deviance + stable_penalty_term)).
-    // Backward-compatible mirror of `ridge_passport.delta`.
-    pub ridge_used: f64,
 
     // The unpenalized deviance, calculated from mu and y
     pub deviance: f64,
@@ -556,7 +551,6 @@ impl PirlsResult {
             penalized_hessian_transformed: self.penalized_hessian_transformed.clone(),
             stabilizedhessian_transformed: self.stabilizedhessian_transformed.clone(),
             ridge_passport: self.ridge_passport,
-            ridge_used: self.ridge_used,
             deviance: self.deviance,
             edf: self.edf,
             stable_penalty_term: self.stable_penalty_term,
@@ -654,7 +648,6 @@ impl PirlsResult {
             penalized_hessian_transformed: self.penalized_hessian_transformed.clone(),
             stabilizedhessian_transformed: self.stabilizedhessian_transformed.clone(),
             ridge_passport: self.ridge_passport,
-            ridge_used: self.ridge_used,
             used_device: self.used_device,
             deviance: self.deviance,
             edf: self.edf,

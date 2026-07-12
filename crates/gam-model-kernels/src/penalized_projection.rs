@@ -66,7 +66,7 @@ pub fn solve_penalizedweighted_projection(
         &xtwy,
         penalty_system.as_ref(),
         ridge_floor.max(1e-12),
-        RidgePolicy::explicit_stabilization_pospart(),
+        RidgePolicy::solver_only(),
     )?;
     if beta.iter().any(|v| !v.is_finite()) {
         return Err(

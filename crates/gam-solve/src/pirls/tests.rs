@@ -4930,15 +4930,15 @@ mod reporting_loglikelihood_tests {
 }
 
 /// #2105: the exact compound-Poisson–gamma Tweedie density used for variance-
-/// power estimation. The reported AIC uses the saddlepoint approximation, but
-/// the `p`-profile MUST use the exact series (`tweedie_series_loglik` /
-/// `tweedie_exact_loglik_total`): the saddlepoint's missing `O(1/λ)` normalizer
+/// power estimation. Reporting and the `p`-profile both use the exact series
+/// (`tweedie_series_loglik` /
+/// `tweedie_exact_loglik_total_from_eta`): the saddlepoint's missing `O(1/λ)` normalizer
 /// biases the profile maximizer of `p` low, which inflates the reported Pearson
 /// dispersion `φ̂` and every SE / interval derived from it.
 #[cfg(test)]
 mod tweedie_exact_series_tests {
     use super::super::{
-        tweedie_exact_loglik, tweedie_exact_loglik_total,
+        tweedie_exact_loglik, tweedie_exact_loglik_total_from_eta,
         tweedie_saddlepoint_loglik_approximation, tweedie_series_loglik,
     };
     use ndarray::Array1;
@@ -5040,20 +5040,18 @@ mod tweedie_exact_series_tests {
     }
 
     #[test]
-    fn exact_loglik_transitions_seamlessly_to_saddlepoint() {
-        // Above the dominant-index threshold the exact fallback returns the
-        // saddlepoint verbatim (μ = 1e8, p = 1.5 ⇒ index ≈ λ = 4e4 > 1e4).
+    fn exact_loglik_never_switches_to_saddlepoint() {
         let (mu, phi, p) = (1.0e8_f64, 0.5_f64, 1.5_f64);
         let y = mu;
         let exact = tweedie_exact_loglik(y, mu, 1.0, p, phi);
+        let series_at_large_index = tweedie_series_loglik(y, mu, 1.0, p, phi);
         let saddle = tweedie_saddlepoint_loglik_approximation(y, mu, 1.0, p, phi);
+        assert_eq!(exact, series_at_large_index);
         assert!(
-            (exact - saddle).abs() < 1e-12,
-            "above the index threshold the exact path must equal the saddlepoint: \
+            (exact - saddle).abs() < 1e-3,
+            "the separately named approximation should converge toward the exact series: \
              {exact} vs {saddle}"
         );
-        // Just below the threshold the series is used and agrees with the
-        // saddlepoint to O(1/index) — a seamless (small-gap) crossover, no jump.
         let (mu2, phi2) = (5.0e3_f64, 1.0_f64); // index ≈ 283, below threshold
         let series = tweedie_series_loglik(mu2, mu2, 1.0, p, phi2);
         let saddle2 = tweedie_saddlepoint_loglik_approximation(mu2, mu2, 1.0, p, phi2);
@@ -5162,14 +5160,14 @@ mod tweedie_exact_series_tests {
 
         let exact_obj = |p: f64| {
             let phi = pearson_phi(&y, &mu, p);
-            tweedie_exact_loglik_total(y.view(), &mu, w.view(), p, phi)
+            let eta = mu.mapv(f64::ln);
+            tweedie_exact_loglik_total_from_eta(y.view(), eta.view(), w.view(), p, phi)
+                .expect("exact Tweedie profile row")
         };
         let saddle_obj = |p: f64| {
             let phi = pearson_phi(&y, &mu, p);
             (0..n)
-                .map(|i| {
-                    tweedie_saddlepoint_loglik_approximation(y[i], mu[i], w[i], p, phi)
-                })
+                .map(|i| tweedie_saddlepoint_loglik_approximation(y[i], mu[i], w[i], p, phi))
                 .sum::<f64>()
         };
 

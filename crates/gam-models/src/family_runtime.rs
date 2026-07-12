@@ -9,7 +9,7 @@ use crate::quadrature::{
 };
 use crate::survival::lognormal_kernel::latent_cloglog_inverse_link_jet;
 use gam_problem::{
-    InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction, ResponseFamily,
+    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily,
     StandardLink,
 };
 use gam_solve::mixture_link::{
@@ -279,13 +279,12 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             }
             (ResponseFamily::Binomial, InverseLink::Mixture(_)) => {
                 let state = self.require_mixture_state()?;
+                let likelihood = gam_problem::GlmLikelihoodSpec::canonical(
+                    LikelihoodSpec::binomial_mixture(state.clone()),
+                );
                 integrated_family_moments_jet(
                     quadctx,
-                    &LikelihoodSpec::binomial_mixture(state.clone()),
-                    // Binomial variance is pinned by the mean (φ ≡ 1); the mixture
-                    // mean does not depend on `scale`, so pass the canonical
-                    // unit-scale label explicitly.
-                    LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+                    &likelihood,
                     eta,
                     se_eta,
                 )
@@ -380,13 +379,12 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             }
             (ResponseFamily::Binomial, InverseLink::Mixture(_)) => {
                 let state = self.require_mixture_state()?;
+                let likelihood = gam_problem::GlmLikelihoodSpec::canonical(
+                    LikelihoodSpec::binomial_mixture(state.clone()),
+                );
                 let m1 = integrated_family_moments_jet(
                     quadctx,
-                    &LikelihoodSpec::binomial_mixture(state.clone()),
-                    // Binomial variance is pinned by the mean (φ ≡ 1); only the
-                    // integrated mean `m1` is read here, so pass the canonical
-                    // unit-scale label explicitly.
-                    LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+                    &likelihood,
                     eta,
                     se_eta,
                 )?
@@ -456,13 +454,8 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         // — for Gamma/Tweedie this is the estimated-dispersion variant (seeded at
         // the unit value, refined during fitting), never a silent hardcoded φ = 1
         // baked into the integrator (issue #953).
-        integrated_family_moments_jet(
-            quadctx,
-            &self.spec,
-            self.spec.default_scale_metadata(),
-            eta,
-            se_eta,
-        )
+        let likelihood = gam_problem::GlmLikelihoodSpec::canonical(self.spec.clone());
+        integrated_family_moments_jet(quadctx, &likelihood, eta, se_eta)
     }
 }
 

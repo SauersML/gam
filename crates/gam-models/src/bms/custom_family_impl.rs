@@ -361,9 +361,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
 
         let penalty_started = std::time::Instant::now();
         let ridge = options.ridge_floor.max(1e-15);
-        let trace_diagonal_ridge = if options.ridge_policy.include_quadratic_penalty
-            || options.ridge_policy.include_penalty_logdet
-        {
+        let trace_diagonal_ridge = if options.ridge_policy.accounts_for_objective() {
             ridge
         } else {
             0.0
@@ -402,7 +400,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             }
         }
 
-        let penalty_logdet_ridge = if options.ridge_policy.include_penalty_logdet {
+        let penalty_logdet_ridge = if options.ridge_policy.accounts_for_objective() {
             ridge
         } else {
             0.0

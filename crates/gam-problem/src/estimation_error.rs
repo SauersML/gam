@@ -194,6 +194,9 @@ impl core::fmt::Debug for FixedLambdaCheckpoint {
 /// A comprehensive error type for the model estimation process.
 #[derive(thiserror::Error)]
 pub enum EstimationError {
+    #[error(transparent)]
+    InvalidStabilization(#[from] crate::InvalidStabilization),
+
     #[error("Underlying basis function generation failed: {0}")]
     BasisError(#[from] BasisError),
 

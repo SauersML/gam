@@ -75,7 +75,7 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
         .iter()
         .map(|v| v.as_slice())
         .collect();
-    let penalty_logdet_ridge = if options.ridge_policy.include_penalty_logdet {
+    let penalty_logdet_ridge = if options.ridge_policy.accounts_for_objective() {
         ridge
     } else {
         0.0
@@ -1885,18 +1885,12 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
         );
     }
     let ridge = effective_solverridge(options.ridge_floor);
-    let moderidge = if options.ridge_policy.include_quadratic_penalty {
+    let moderidge = if options.ridge_policy.accounts_for_objective() {
         ridge
     } else {
         0.0
     };
-    let extra_logdet_ridge = if options.ridge_policy.include_penalty_logdet
-        && !options.ridge_policy.include_quadratic_penalty
-    {
-        ridge
-    } else {
-        0.0
-    };
+    let extra_logdet_ridge = 0.0;
 
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let ranges = block_param_ranges(specs);

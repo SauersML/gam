@@ -1631,7 +1631,7 @@ pub(crate) fn block_quadratic_penalty(
     ridge_policy: RidgePolicy,
 ) -> f64 {
     let mut value = 0.5 * beta.dot(&s_lambda.dot(beta));
-    if ridge_policy.include_quadratic_penalty {
+    if ridge_policy.accounts_for_objective() {
         value += 0.5 * ridge * beta.dot(beta);
     }
     value
@@ -1657,7 +1657,7 @@ pub(crate) fn block_penalized_hessian_vector(
         }
     };
     hpen += &s_lambda.dot(direction);
-    if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+    if ridge_policy.accounts_for_objective() && ridge > 0.0 {
         hpen.scaled_add(ridge, direction);
     }
     hpen
@@ -1706,7 +1706,7 @@ pub(crate) fn block_penalized_metric_diagonal(
     }
     for j in 0..diagonal.len() {
         diagonal[j] += s_lambda[[j, j]];
-        if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+        if ridge_policy.accounts_for_objective() && ridge > 0.0 {
             diagonal[j] += ridge;
         }
         diagonal[j] = positive_joint_diagonal_entry(diagonal[j]);
@@ -1898,7 +1898,7 @@ pub(crate) fn stable_logdet_with_ridge_policy(
     let mut a = matrix.clone();
     symmetrize_dense_in_place(&mut a);
     let p = a.nrows();
-    let ridge = if ridge_policy.include_penalty_logdet {
+    let ridge = if ridge_policy.accounts_for_objective() {
         effective_solverridge(ridge_floor)
     } else {
         0.0
@@ -1907,18 +1907,14 @@ pub(crate) fn stable_logdet_with_ridge_policy(
         a[[i, i]] += ridge;
     }
 
-    match resolved_ridge_determinant_mode(ridge_policy, p) {
+    match ridge_policy.determinant_mode() {
         RidgeDeterminantMode::Full => {
             let chol = a.cholesky(Side::Lower).map_err(|_| {
                 "cholesky failed while computing full ridge-aware logdet".to_string()
             })?;
             Ok(2.0 * chol.diag().mapv(f64::ln).sum())
         }
-        RidgeDeterminantMode::Auto => Err(
-            "internal: resolved_ridge_determinant_mode must resolve Auto to a concrete mode"
-                .to_string(),
-        ),
-        RidgeDeterminantMode::PositivePart => {
+        RidgeDeterminantMode::PositivePartApproximation => {
             smooth_regularized_logdet_hessian_finite_check(&a, None)?;
             // Smooth-regularized logdet objective, aligned with the gradient
             // operator (`DenseSpectralOperator` in `Smooth` mode):
@@ -2082,20 +2078,6 @@ pub(crate) fn penalty_logdet_cholesky_fallback(
         ),
     }
     .into())
-}
-
-pub(crate) fn resolved_ridge_determinant_mode(
-    ridge_policy: RidgePolicy,
-    dim: usize,
-) -> RidgeDeterminantMode {
-    assert!(
-        dim.checked_add(1).is_some(),
-        "ridge determinant dimension overflow"
-    );
-    match ridge_policy.determinant_mode {
-        RidgeDeterminantMode::Auto => RidgeDeterminantMode::Full,
-        mode => mode,
-    }
 }
 
 pub(crate) fn symmetrize_dense_in_place(matrix: &mut Array2<f64>) {

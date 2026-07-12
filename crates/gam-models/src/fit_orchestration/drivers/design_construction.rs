@@ -7871,6 +7871,123 @@ mod glm_eta_observation_fd_tests {
         one_obs_weight(spec, y, 1.0, eta)
     }
 
+    fn one_obs_resolved(
+        likelihood: &gam_spec::GlmLikelihoodSpec,
+        y: f64,
+        weight: f64,
+        eta: f64,
+    ) -> StandardFamilyObservationState {
+        evaluate_resolved_standard_family_observations(
+            likelihood,
+            None,
+            None,
+            None,
+            &array![y],
+            &array![weight],
+            &array![eta],
+        )
+        .expect("resolved standard family observation state assembles")
+    }
+
+    #[test]
+    fn bounded_gamma_and_tweedie_use_the_resolved_likelihood_scale() {
+        let gamma_unit = gam_spec::GlmLikelihoodSpec {
+            spec: LikelihoodSpec::gamma_log(),
+            scale: gam_spec::LikelihoodScaleMetadata::FixedGammaShape { shape: 1.0 },
+        };
+        let gamma_scaled = gam_spec::GlmLikelihoodSpec {
+            spec: LikelihoodSpec::gamma_log(),
+            scale: gam_spec::LikelihoodScaleMetadata::FixedGammaShape { shape: 8.0 },
+        };
+        let unit = one_obs_resolved(&gamma_unit, 2.3, 0.7, 0.2);
+        let scaled = one_obs_resolved(&gamma_scaled, 2.3, 0.7, 0.2);
+        for (label, actual, base) in [
+            ("Gamma score", scaled.score[0], unit.score[0]),
+            (
+                "Gamma Fisher weight",
+                scaled.fisherweight[0],
+                unit.fisherweight[0],
+            ),
+            (
+                "Gamma observed Hessian",
+                scaled.neghessian_eta[0],
+                unit.neghessian_eta[0],
+            ),
+            (
+                "Gamma Hessian derivative",
+                scaled.neghessian_eta_derivative[0],
+                unit.neghessian_eta_derivative[0],
+            ),
+            (
+                "Gamma log likelihood",
+                scaled.log_likelihood,
+                unit.log_likelihood,
+            ),
+        ] {
+            let expected = 8.0 * base;
+            assert!(
+                (actual - expected).abs() <= 32.0 * f64::EPSILON * expected.abs().max(1.0),
+                "{label} scale mismatch: actual={actual}, expected={expected}"
+            );
+        }
+
+        let tweedie_unit = gam_spec::GlmLikelihoodSpec {
+            spec: LikelihoodSpec::tweedie_log(1.5),
+            scale: gam_spec::LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+        };
+        let tweedie_scaled = gam_spec::GlmLikelihoodSpec {
+            spec: LikelihoodSpec::tweedie_log(1.5),
+            scale: gam_spec::LikelihoodScaleMetadata::FixedDispersion { phi: 0.25 },
+        };
+        let unit = one_obs_resolved(&tweedie_unit, 1.7, 0.8, -0.1);
+        let scaled = one_obs_resolved(&tweedie_scaled, 1.7, 0.8, -0.1);
+        for (actual, base) in [
+            (scaled.score[0], unit.score[0]),
+            (scaled.fisherweight[0], unit.fisherweight[0]),
+            (scaled.neghessian_eta[0], unit.neghessian_eta[0]),
+            (
+                scaled.neghessian_eta_derivative[0],
+                unit.neghessian_eta_derivative[0],
+            ),
+            (scaled.log_likelihood, unit.log_likelihood),
+        ] {
+            let expected = 4.0 * base;
+            assert!((actual - expected).abs() <= 32.0 * f64::EPSILON * expected.abs().max(1.0));
+        }
+    }
+
+    #[test]
+    fn bounded_zero_rows_are_dormant_and_weight_preflight_is_atomic() {
+        let likelihood = gam_spec::GlmLikelihoodSpec::canonical(LikelihoodSpec::poisson_log());
+        let dormant = evaluate_resolved_standard_family_observations(
+            &likelihood,
+            None,
+            None,
+            None,
+            &array![f64::NAN, 2.0],
+            &array![0.0, 1.0],
+            &array![f64::NAN, 0.2],
+        )
+        .expect("zero-weight response and predictor are dormant");
+        assert_eq!(dormant.score[0], 0.0);
+        assert_eq!(dormant.fisherweight[0], 0.0);
+
+        let error = evaluate_resolved_standard_family_observations(
+            &likelihood,
+            None,
+            None,
+            None,
+            &array![f64::NAN, 2.0],
+            &array![1.0, f64::NAN],
+            &array![f64::NAN, 0.2],
+        )
+        .expect_err("later invalid weight must refuse before row evaluation");
+        assert!(
+            error.to_string().contains("row 2 has invalid prior weight"),
+            "unexpected atomic preflight error: {error}"
+        );
+    }
+
     fn check_fd(label: &str, spec: &LikelihoodSpec, y: f64, eta: f64) {
         let h = 1e-5;
         let s0 = one_obs(spec, y, eta);

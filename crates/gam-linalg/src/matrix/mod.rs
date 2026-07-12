@@ -4142,7 +4142,7 @@ pub trait LinearOperator {
             rhs,
             penalty,
             SPD_SOLVE_RIDGE_FLOOR,
-            RidgePolicy::explicit_stabilization_pospart(),
+            RidgePolicy::solver_only(),
         )
     }
     fn solve_systemwith_policy(
@@ -4160,11 +4160,12 @@ pub trait LinearOperator {
                 self.ncols()
             ));
         }
-        let baseridge = if ridge_policy.include_laplacehessian {
-            ridge_floor.max(SPD_SOLVE_RIDGE_FLOOR)
-        } else {
-            0.0
-        };
+        if !(ridge_floor.is_finite() && ridge_floor >= 0.0) {
+            return Err(format!(
+                "solve_systemwith_policy ridge floor must be finite and non-negative, got {ridge_floor:?}"
+            ));
+        }
+        let baseridge = ridge_floor.max(SPD_SOLVE_RIDGE_FLOOR);
         // Try matrix-free PCG first to avoid assembling the dense p×p normal matrix.
         if self.uses_matrix_free_pcg()
             && self.ncols() >= MATRIX_FREE_PCG_MIN_P
@@ -6904,14 +6905,14 @@ mod tests {
                 &rhs,
                 Some(&penalty),
                 ridge_floor,
-                RidgePolicy::explicit_stabilization_pospart(),
+                RidgePolicy::solver_only(),
             )
             .expect("policy solve");
         for i in 0..p {
             // This system is heavily rank-deficient (rank ≤ n = 40, p = 520,
             // p ≫ n) with only a weak ~0.2 diagonal penalty + 1e-8 ridge_floor,
             // so the normal matrix is severely ill-conditioned. Both arms are
-            // matrix-free PCG (explicit vs `explicit_stabilization_pospart`
+            // matrix-free PCG (explicit vs solver-only stabilization
             // policy); they terminate at slightly different points on the
             // near-null manifold. A fixed 1e-6 absolute gate is below what PCG
             // can guarantee at this conditioning; assert a relative tolerance

@@ -2992,8 +2992,9 @@ extern "C" __global__ void status_first_ladder(
         // is a solve-only artefact and must never contaminate EDF / REML.
         let default_ridge = gam_problem::RidgePassport::scaled_identity(
             objective_ridge,
-            gam_linalg::RidgePolicy::explicit_stabilization_full(),
-        );
+            gam_linalg::RidgePolicy::exact_full_objective(),
+        )
+        .map_err(gam_problem::EstimationError::from)?;
 
         let max_abs_eta = final_eta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
 

@@ -1375,18 +1375,12 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
         });
     }
     let ridge = effective_solverridge(options.ridge_floor);
-    let moderidge = if options.ridge_policy.include_quadratic_penalty {
+    let moderidge = if options.ridge_policy.accounts_for_objective() {
         ridge
     } else {
         0.0
     };
-    let extra_logdet_ridge = if options.ridge_policy.include_penalty_logdet
-        && !options.ridge_policy.include_quadratic_penalty
-    {
-        ridge
-    } else {
-        0.0
-    };
+    let extra_logdet_ridge = 0.0;
 
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let ranges = block_param_ranges(specs);
@@ -1496,7 +1490,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                     for (k, s) in spec.penalties.iter().enumerate() {
                         s.add_scaled_to(lambdas[k], &mut s_lambda);
                     }
-                    let ridge_hint = if options.ridge_policy.include_penalty_logdet {
+                    let ridge_hint = if options.ridge_policy.accounts_for_objective() {
                         for d in 0..p {
                             s_lambda[[d, d]] += ridge;
                         }
@@ -2700,18 +2694,12 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         .map_err(CustomFamilyError::from);
     }
     let ridge = effective_solverridge(options.ridge_floor);
-    let moderidge = if options.ridge_policy.include_quadratic_penalty {
+    let moderidge = if options.ridge_policy.accounts_for_objective() {
         ridge
     } else {
         0.0
     };
-    let extra_logdet_ridge = if options.ridge_policy.include_penalty_logdet
-        && !options.ridge_policy.include_quadratic_penalty
-    {
-        ridge
-    } else {
-        0.0
-    };
+    let extra_logdet_ridge = 0.0;
 
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let ranges = block_param_ranges(specs);
@@ -2801,7 +2789,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
                 for (k, s) in spec.penalties.iter().enumerate() {
                     s.add_scaled_to(lambdas[k], &mut s_lambda);
                 }
-                let ridge_hint = if options.ridge_policy.include_penalty_logdet {
+                let ridge_hint = if options.ridge_policy.accounts_for_objective() {
                     for d in 0..p {
                         s_lambda[[d, d]] += ridge;
                     }

@@ -1674,6 +1674,7 @@ pub(crate) fn beta_log_normalizer(a: f64, b: f64, sum: f64) -> f64 {
 }
 
 #[inline]
+#[cfg(test)]
 pub(crate) fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
     if !is_valid_tweedie_power(p) {
         f64::NAN
@@ -1851,6 +1852,9 @@ fn full_log_likelihood_row(
             "full Poisson log-likelihood row",
         );
     }
+    if let ResponseFamily::Tweedie { p } = &likelihood.spec.response {
+        return tweedie_exact_series_loglik_from_eta(row, y, eta, weight, *p, -log_measure_scale);
+    }
     let omitted =
         omitted_log_likelihood_row(row, y, eta, weight, &likelihood.spec.response, deviance)?;
     let normalizer = match &likelihood.spec.response {
@@ -1886,9 +1890,6 @@ fn full_log_likelihood_row(
                 ));
             }
             value
-        }
-        ResponseFamily::Tweedie { p } if y > 0.0 => {
-            -0.5 * (LN_2PI - log_measure_scale - weight.ln() + *p * y.ln())
         }
         ResponseFamily::Tweedie { .. }
         | ResponseFamily::NegativeBinomial { .. }
@@ -1975,6 +1976,7 @@ pub fn evaluate_full_log_likelihood_from_eta(
 /// kernel's `−w·d/φ` term exactly; this only restores the `−½ln(2πφᵢ y^p)`
 /// prefactor. Homogeneous so `elpd(c·y) − elpd(y) = −n ln c` still holds.
 #[inline]
+#[cfg(test)]
 pub(crate) fn tweedie_saddlepoint_loglik_approximation(
     yi: f64,
     mui: f64,
@@ -2003,6 +2005,7 @@ pub(crate) fn tweedie_saddlepoint_loglik_approximation(
 /// approximation. Reduces to the Poisson rate `λ` when `y=μ` and grows with `y`.
 /// Used to start the exact series climb near the peak.
 #[inline]
+#[cfg(test)]
 fn tweedie_series_peak_index(yi: f64, mui: f64, phi_i: f64, p: f64) -> f64 {
     let two_minus_p = 2.0 - p;
     let p_minus_one = p - 1.0;
@@ -2015,6 +2018,183 @@ fn tweedie_series_peak_index(yi: f64, mui: f64, phi_i: f64, p: f64) -> f64 {
     // k* ≈ exp{ [ln λ + α·ln(y/γ) − α·ln α] / (1+α) }.
     let ln_k = (lambda.ln() + alpha * (yi / gamma_scale).ln() - alpha * alpha.ln()) / (1.0 + alpha);
     ln_k.exp().max(1.0)
+}
+
+/// Exact compound-Poisson–gamma density in log-mean coordinates. A finite work
+/// certificate is part of the contract: an observation whose dominant series
+/// index cannot be enumerated exactly in f64, or whose roundoff-negligible tail
+/// needs more than the explicit term budget, is rejected instead of silently
+/// changing to a saddlepoint likelihood.
+fn tweedie_exact_series_loglik_from_eta(
+    row: usize,
+    y: f64,
+    eta: f64,
+    weight: f64,
+    p: f64,
+    log_phi: f64,
+) -> Result<f64, EstimationError> {
+    let q = 2.0 - p;
+    let p_minus_one = p - 1.0;
+    let log_weight = weight.ln();
+    let log_lambda = q * eta + log_weight - log_phi - q.ln();
+    let lambda = log_lambda.exp();
+    if !lambda.is_finite() {
+        return Err(deviance_row_error(
+            row,
+            "exact Tweedie Poisson rate",
+            eta,
+            lambda,
+        ));
+    }
+    if y == 0.0 {
+        return Ok(-lambda);
+    }
+
+    let alpha = q / p_minus_one;
+    let log_y = y.ln();
+    let log_gamma_scale = log_phi - log_weight + p_minus_one.ln() + p_minus_one * eta;
+    let y_over_scale = (log_y - log_gamma_scale).exp();
+    if !y_over_scale.is_finite() {
+        return Err(deviance_row_error(
+            row,
+            "exact Tweedie gamma-scale ratio",
+            eta,
+            y_over_scale,
+        ));
+    }
+    let log_peak_index =
+        (log_lambda + alpha * (log_y - log_gamma_scale) - alpha * alpha.ln()) / (1.0 + alpha);
+    // Above 2^52, `k + 1` is not a distinct f64 and an exact integer-index
+    // series cannot be traversed in this representation.
+    const MAX_EXACT_INDEX: f64 = 4_503_599_627_370_496.0;
+    let peak_index = log_peak_index.exp().max(1.0);
+    if !peak_index.is_finite() || peak_index >= MAX_EXACT_INDEX {
+        return Err(deviance_row_error(
+            row,
+            "exact Tweedie dominant series index",
+            eta,
+            peak_index,
+        ));
+    }
+    let log_term = |k: f64| {
+        -lambda + k * log_lambda - ln_gamma(k + 1.0) + (k * alpha - 1.0) * log_y
+            - y_over_scale
+            - k * alpha * log_gamma_scale
+            - ln_gamma(k * alpha)
+    };
+    const LOG_SUM_CUTOFF: f64 = 37.4;
+    const MAX_EXACT_TERMS: usize = 10_000_000;
+    let mut terms = 1_usize;
+    let mut k_peak = peak_index.round().max(1.0);
+    let mut f_peak = log_term(k_peak);
+    if !f_peak.is_finite() {
+        return Err(deviance_row_error(
+            row,
+            "exact Tweedie peak term",
+            eta,
+            f_peak,
+        ));
+    }
+    loop {
+        let f_up = log_term(k_peak + 1.0);
+        if f_up > f_peak {
+            k_peak += 1.0;
+            f_peak = f_up;
+            terms += 1;
+        } else {
+            break;
+        }
+        if terms > MAX_EXACT_TERMS {
+            return Err(deviance_row_error(
+                row,
+                "exact Tweedie series work certificate",
+                eta,
+                terms as f64,
+            ));
+        }
+    }
+    while k_peak > 1.0 {
+        let f_down = log_term(k_peak - 1.0);
+        if f_down > f_peak {
+            k_peak -= 1.0;
+            f_peak = f_down;
+            terms += 1;
+        } else {
+            break;
+        }
+        if terms > MAX_EXACT_TERMS {
+            return Err(deviance_row_error(
+                row,
+                "exact Tweedie series work certificate",
+                eta,
+                terms as f64,
+            ));
+        }
+    }
+    let mut accumulator = 1.0_f64;
+    let mut k = k_peak + 1.0;
+    loop {
+        let difference = log_term(k) - f_peak;
+        if difference < -LOG_SUM_CUTOFF {
+            break;
+        }
+        if !difference.is_finite() {
+            return Err(deviance_row_error(
+                row,
+                "exact Tweedie upper series term",
+                eta,
+                difference,
+            ));
+        }
+        accumulator += difference.exp();
+        k += 1.0;
+        terms += 1;
+        if terms > MAX_EXACT_TERMS {
+            return Err(deviance_row_error(
+                row,
+                "exact Tweedie series work certificate",
+                eta,
+                terms as f64,
+            ));
+        }
+    }
+    let mut k = k_peak - 1.0;
+    while k >= 1.0 {
+        let difference = log_term(k) - f_peak;
+        if difference < -LOG_SUM_CUTOFF {
+            break;
+        }
+        if !difference.is_finite() {
+            return Err(deviance_row_error(
+                row,
+                "exact Tweedie lower series term",
+                eta,
+                difference,
+            ));
+        }
+        accumulator += difference.exp();
+        k -= 1.0;
+        terms += 1;
+        if terms > MAX_EXACT_TERMS {
+            return Err(deviance_row_error(
+                row,
+                "exact Tweedie series work certificate",
+                eta,
+                terms as f64,
+            ));
+        }
+    }
+    let value = f_peak + accumulator.ln();
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(deviance_row_error(
+            row,
+            "exact Tweedie log-likelihood",
+            eta,
+            value,
+        ))
+    }
 }
 
 /// Exact Tweedie (compound Poisson–gamma, `1 < p < 2`) log-density at one
@@ -2041,6 +2221,7 @@ fn tweedie_series_peak_index(yi: f64, mui: f64, phi_i: f64, p: f64) -> f64 {
 /// and the tails are accumulated outward until they fall `LOG_SUM_CUTOFF` below
 /// the peak.
 #[inline]
+#[cfg(test)]
 pub(crate) fn tweedie_series_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
     if w <= 0.0 {
         // Zero prior weight excludes the observation (matches the saddlepoint).
@@ -2123,33 +2304,74 @@ pub(crate) fn tweedie_series_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64)
 /// selecting an exact likelihood always receive the compound-Poisson–gamma
 /// series named by the API.
 #[inline]
+#[cfg(test)]
 pub(crate) fn tweedie_exact_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
     tweedie_series_loglik(yi, mui, w, p, phi)
 }
 
-/// Total exact Tweedie log-likelihood over all observations — the sum of
-/// [`tweedie_exact_loglik`]. This is the objective a maximum-likelihood profile
-/// of the variance power `p` optimizes (#2105 / #2026); it uses the exact EDM
-/// normalizer rather than the reporting saddlepoint approximation so the
+/// Total exact Tweedie log-likelihood over all observations. This is the
+/// objective a maximum-likelihood profile of the variance power `p` optimizes
+/// (#2105 / #2026); it uses the exact EDM normalizer, so the
 /// recovered `p̂` (and hence the reported dispersion `φ̂` and every SE / interval
-/// scaled by `√φ̂`) is unbiased. Returns `NaN` if the power is out of range, `φ`
-/// is not strictly positive/finite, or a response violates the Tweedie support.
-pub fn tweedie_exact_loglik_total(
+/// scaled by `√φ̂`) is unbiased. Invalid rows and exact-series work/
+/// representability failures are returned explicitly; this API never changes
+/// likelihood families to finish an expensive row.
+pub fn tweedie_exact_loglik_total_from_eta(
     y: ArrayView1<f64>,
-    mu: &Array1<f64>,
+    eta: ArrayView1<f64>,
     priorweights: ArrayView1<f64>,
     p: f64,
     phi: f64,
-) -> f64 {
+) -> Result<f64, EstimationError> {
+    if y.len() != eta.len() || priorweights.len() != eta.len() {
+        crate::bail_invalid_estim!(
+            "exact Tweedie likelihood length mismatch: y={}, eta={}, prior_weights={}",
+            y.len(),
+            eta.len(),
+            priorweights.len()
+        );
+    }
     if !is_valid_tweedie_power(p) || !(phi.is_finite() && phi > 0.0) {
-        return f64::NAN;
+        crate::bail_invalid_estim!(
+            "exact Tweedie likelihood requires p in (1,2) and positive finite phi; got p={p}, phi={phi}"
+        );
     }
-    if validate_tweedie_responses(&y, &priorweights).is_err() {
-        return f64::NAN;
-    }
-    gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
-        tweedie_exact_loglik(y[i], mu[i], priorweights[i], p, phi)
-    })
+    let rows: Vec<Result<f64, EstimationError>> = (0..y.len())
+        .into_par_iter()
+        .map(|row| {
+            let weight = priorweights[row];
+            if !(weight.is_finite() && weight >= 0.0) {
+                return Err(deviance_row_error(
+                    row,
+                    "exact Tweedie prior weight",
+                    f64::NAN,
+                    weight,
+                ));
+            }
+            if weight == 0.0 {
+                return Ok(0.0);
+            }
+            if !valid_tweedie_response(y[row]) {
+                return Err(deviance_row_error(
+                    row,
+                    "exact Tweedie response",
+                    f64::NAN,
+                    y[row],
+                ));
+            }
+            if !eta[row].is_finite() {
+                return Err(deviance_row_error(
+                    row,
+                    "exact Tweedie linear predictor",
+                    eta[row],
+                    eta[row],
+                ));
+            }
+            tweedie_exact_series_loglik_from_eta(row, y[row], eta[row], weight, p, phi.ln())
+        })
+        .collect();
+    let values = rows.into_iter().collect::<Result<Vec<_>, _>>()?;
+    stable_finite_signed_sum(&values, "exact Tweedie likelihood reduction")
 }
 
 // ---------------------------------------------------------------------------

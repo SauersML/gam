@@ -1166,9 +1166,9 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
         for ((r, c), v) in pirls_result.reparam_result.s_transformed.indexed_iter() {
             j[[r, c]] += v;
         }
-        if pirls_result.ridge_used > 0.0 {
+        if pirls_result.ridge_passport.delta() > 0.0 {
             for d in 0..j.nrows() {
-                j[[d, d]] += pirls_result.ridge_used;
+                j[[d, d]] += pirls_result.ridge_passport.delta();
             }
         }
         j
@@ -1229,7 +1229,7 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
     // genuine guard: ~1e4× the observed residual yet ~370× tighter than the
     // original miss, and robust to cross-platform PIRLS-convergence jitter.
     assert_eq!(
-        pirls_result.ridge_used, 0.0,
+        pirls_result.ridge_passport.delta(), 0.0,
         "well-conditioned n=20 SAS fit must take no stabilization ridge; \
          a nonzero ridge would mean the IFT Jacobian and the FD re-solve no \
          longer linearize the same system (gam#855)"
@@ -1339,7 +1339,7 @@ fn sas_true_score_beta_jacobian_matchesfd_at_seed19() {
         .expect("pirls_result");
     let beta0 = pirls_result.beta_transformed.as_ref().clone();
     let s_transformed = pirls_result.reparam_result.s_transformed.clone();
-    let ridge = pirls_result.ridge_used;
+    let ridge = pirls_result.ridge_passport.delta();
     let x_dense = match &pirls_result.x_transformed {
         DesignMatrix::Dense(x_dense) => x_dense.to_dense(),
         DesignMatrix::Sparse(_) => {
@@ -1515,7 +1515,7 @@ fn sas_pirlshessian_matches_true_score_jacobian_at_seed19() {
         .expect("pirls_result");
     let beta0 = pirls_result.beta_transformed.as_ref().clone();
     let s_transformed = pirls_result.reparam_result.s_transformed.clone();
-    let ridge = pirls_result.ridge_used;
+    let ridge = pirls_result.ridge_passport.delta();
     let x_dense = match &pirls_result.x_transformed {
         DesignMatrix::Dense(x_dense) => x_dense.to_dense(),
         DesignMatrix::Sparse(_) => {

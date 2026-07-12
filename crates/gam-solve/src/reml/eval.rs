@@ -814,12 +814,21 @@ impl<'a> RemlState<'a> {
                 .map(|&v| v.abs())
                 .fold(0.0, f64::max)
                 .max(AUTO_CUBATURE_HESSIAN_RIDGE_ABS);
-        let cubature_ridge = gam_problem::StabilizationLedger::approximation_only(
+        let cubature_ridge = match gam_problem::StabilizationLedger::approximation_only(
             ridge,
             gam_problem::StabilizationRule::FixedConstant,
-        );
+        ) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                log::warn!("sigma cubature refused invalid ridge metadata: {error}");
+                return self.finalize_smoothing_outcome(first_order_numerical(
+                    first_order_correction,
+                    "rho Hessian produced invalid cubature-ridge metadata",
+                ));
+            }
+        };
         for i in 0..n_rho {
-            hessian_rho[[i, i]] += cubature_ridge.delta;
+            hessian_rho[[i, i]] += cubature_ridge.delta();
         }
         let hessian_rho_inv = match gam_linalg::utils::certified_spd_inverse(
             &hessian_rho,

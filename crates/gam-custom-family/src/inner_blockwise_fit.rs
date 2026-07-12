@@ -455,7 +455,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // the Newton step rhs / KKT residual which ADD `∇Φ` to `∇L − Sβ`.
 
         let joint_mode_diagonal_ridge =
-            if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty {
+            if ridge > 0.0 && options.ridge_policy.accounts_for_objective() {
                 ridge
             } else {
                 0.0
@@ -3885,7 +3885,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         .fold(0.0_f64, f64::max),
                 );
                 let mut penalty_block = s_lambdas[block_idx].dot(&states[block_idx].beta);
-                if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+                if options.ridge_policy.accounts_for_objective() && ridge > 0.0 {
                     penalty_block += &states[block_idx].beta.mapv(|v| ridge * v);
                 }
                 block_penalty_norms.push(
@@ -4839,7 +4839,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         .ok()
                         .map(|mut h_pen| {
                             let model_diagonal_ridge =
-                                if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+                                if options.ridge_policy.accounts_for_objective() && ridge > 0.0 {
                                     ridge
                                 } else {
                                     0.0
@@ -6256,7 +6256,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             let (rhs_block, hpen_delta_full): (Array1<f64>, Array1<f64>) = match work {
                 BlockWorkingSet::ExactNewton { gradient, .. } => {
                     let mut rhs = gradient - &s_lambda.dot(&beta_old);
-                    if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+                    if options.ridge_policy.accounts_for_objective() && ridge > 0.0 {
                         rhs.scaled_add(-ridge, &beta_old);
                     }
                     let hpen = block_penalized_hessian_vector(
@@ -6282,7 +6282,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     let w_resid = &resid * working_weights;
                     let mut rhs = solver_design.transpose_vector_multiply(&w_resid);
                     rhs -= &s_lambda.dot(&beta_old);
-                    if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+                    if options.ridge_policy.accounts_for_objective() && ridge > 0.0 {
                         rhs.scaled_add(-ridge, &beta_old);
                     }
                     let hpen = block_penalized_hessian_vector(
@@ -6314,7 +6314,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 eta_checkpoint.restore_eta(&mut states[b]);
                 if let BlockWorkingSet::ExactNewton { gradient, .. } = work {
                     let mut raw_descent = gradient - &s_lambda.dot(&beta_old);
-                    if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+                    if options.ridge_policy.accounts_for_objective() && ridge > 0.0 {
                         raw_descent -= &beta_old.mapv(|v| ridge * v);
                     }
                     let (descent_dir, descent_metric_norm) = truncate_block_step_to_metric_radius(
@@ -6652,7 +6652,7 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
             .collect()
     };
     let total_p_joint: usize = ranges_joint.last().map_or(0, |r| r.1);
-    let joint_mode_diagonal_ridge = if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty
+    let joint_mode_diagonal_ridge = if ridge > 0.0 && options.ridge_policy.accounts_for_objective()
     {
         ridge
     } else {

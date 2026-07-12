@@ -345,23 +345,22 @@ pub(super) fn assemble_pirls_result(
     x_transformed: DesignMatrix,
     coordinate_frame: PirlsCoordinateFrame,
     linear_constraints_transformed: Option<LinearInequalityConstraints>,
-) -> PirlsResult {
+) -> Result<PirlsResult, EstimationError> {
     // #1868: the full-assembly path is legitimately O(n) (this is the one-off
     // final fit, not a per-callback n-free skip); wrap its freshly-realised row
     // arrays in the shared `ArcArray1` representation (`.into_shared()` moves the
     // owned buffer into an `Arc`, O(1)). `finalmu`/`solvemu` share one handle.
     let final_eta_arr = working_summary.state.eta.as_ref().clone();
     let finalmu_shared = finalmu.clone().into_shared();
-    PirlsResult {
+    Ok(PirlsResult {
         likelihood,
         beta_transformed: working_summary.beta.clone(),
         penalized_hessian_transformed,
         stabilizedhessian_transformed,
         ridge_passport: RidgePassport::scaled_identity(
             working_summary.state.ridge_used,
-            RidgePolicy::explicit_stabilization_full(),
-        ),
-        ridge_used: working_summary.state.ridge_used,
+            RidgePolicy::exact_full_objective(),
+        )?,
         deviance: working_summary.state.deviance,
         edf,
         stable_penalty_term: penalty_term,
@@ -399,7 +398,7 @@ pub(super) fn assemble_pirls_result(
         used_device: false,
         cache_compacted: false,
         min_penalized_deviance: working_summary.min_penalized_deviance,
-    }
+    })
 }
 
 pub(super) fn detect_logit_instability(
@@ -1202,7 +1201,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         let beta_transformed = pls_result.beta;
         let penalized_hessian = pls_result.penalized_hessian;
         let edf = pls_result.edf;
-        let baseridge = pls_result.ridge_used;
+        let baseridge = pls_result.ridge_passport.delta();
 
         // eta = offset + X Qs beta (composed, no materialization) unless a
         // design-moving ψ tensor cache explicitly says the surface rows are a
@@ -1486,9 +1485,8 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             stabilizedhessian_transformed: stabilizedhessian,
             ridge_passport: RidgePassport::scaled_identity(
                 ridge_used,
-                RidgePolicy::explicit_stabilization_full(),
-            ),
-            ridge_used,
+                RidgePolicy::exact_full_objective(),
+            )?,
             deviance,
             edf,
             stable_penalty_term: penalty_term,
@@ -1567,7 +1565,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         } else {
             glm_first_step_gram.cloned()
         },
-    );
+    )?;
 
     // Apply integrated (GHQ) likelihood if per-observation SE is provided.
     // This is used by the calibrator to coherently account for base prediction uncertainty.
@@ -2206,7 +2204,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         x_transformed_final,
         coordinate_frame,
         linear_constraints,
-    );
+    )?;
 
     Ok((pirls_result, working_summary))
 }

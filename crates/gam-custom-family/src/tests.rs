@@ -3799,7 +3799,7 @@ pub(crate) fn objective_includes_solverridge_quadratic_term() {
         outer_rel_cost_tol: None,
         rho_lower_bound: -10.0,
         ridge_floor: 1e-4,
-        ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
+        ridge_policy: RidgePolicy::positive_part_approximate_objective(),
         use_remlobjective: false,
         compute_covariance: false,
         use_outer_hessian: false,
@@ -3854,7 +3854,7 @@ pub(crate) fn inner_block_accepts_penalty_improving_step_even_if_loglik_drops() 
         outer_rel_cost_tol: None,
         rho_lower_bound: -10.0,
         ridge_floor: 0.0,
-        ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
+        ridge_policy: RidgePolicy::positive_part_approximate_objective(),
         use_remlobjective: false,
         compute_covariance: false,
         use_outer_hessian: false,
@@ -3912,7 +3912,7 @@ pub(crate) fn exact_newton_backtracking_descent_includes_explicit_ridge() {
         outer_rel_cost_tol: None,
         rho_lower_bound: -10.0,
         ridge_floor: 1.0,
-        ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
+        ridge_policy: RidgePolicy::positive_part_approximate_objective(),
         use_remlobjective: false,
         compute_covariance: false,
         use_outer_hessian: false,
@@ -5225,10 +5225,10 @@ pub(crate) fn pseudo_laplace_exact_newton_rejects_indefinite_hessian() {
 pub(crate) fn auto_determinant_mode_is_exact_full_logdet_policy() {
     let h = array![[6.0, 0.8, 0.1], [0.8, 4.5, 0.4], [0.1, 0.4, 3.2]];
     let exact =
-        stable_logdet_with_ridge_policy(&h, 1e-8, RidgePolicy::explicit_stabilization_full_exact())
+        stable_logdet_with_ridge_policy(&h, 1e-8, RidgePolicy::exact_full_objective())
             .expect("exact logdet");
     let auto =
-        stable_logdet_with_ridge_policy(&h, 1e-8, RidgePolicy::explicit_stabilization_full())
+        stable_logdet_with_ridge_policy(&h, 1e-8, RidgePolicy::exact_full_objective())
             .expect("auto logdet");
     assert!((auto - exact).abs() < 1e-12, "auto={auto}, exact={exact}");
 }
@@ -5248,7 +5248,11 @@ pub(crate) fn indefinite_hessian_uses_smooth_regularized_logdet() {
     // cost/gradient mismatch that broke BFGS line search.
     let h = array![[-1.0, 0.0], [0.0, 2.0]];
     let logdet =
-        stable_logdet_with_ridge_policy(&h, 1e-12, RidgePolicy::explicit_stabilization_pospart())
+        stable_logdet_with_ridge_policy(
+            &h,
+            1e-12,
+            RidgePolicy::positive_part_approximate_objective(),
+        )
             .expect("smooth-regularized logdet must be finite for indefinite H");
     assert!(
         logdet.is_finite(),
@@ -5751,7 +5755,7 @@ pub(crate) fn block_solve_sparse_matches_dense() {
         &w,
         &s_lambda,
         1e-12,
-        RidgePolicy::explicit_stabilization_pospart(),
+        RidgePolicy::positive_part_approximate_objective(),
     )
     .expect("dense solve should succeed");
 
@@ -5761,7 +5765,7 @@ pub(crate) fn block_solve_sparse_matches_dense() {
         &w,
         &s_lambda,
         1e-12,
-        RidgePolicy::explicit_stabilization_pospart(),
+        RidgePolicy::positive_part_approximate_objective(),
     )
     .expect("sparse solve should succeed");
 
@@ -5862,7 +5866,7 @@ pub(crate) fn block_solve_falls_backwhen_llt_rejects_indefinite_system() {
         &w,
         &s_lambda,
         1e-12,
-        RidgePolicy::explicit_stabilization_pospart(),
+        RidgePolicy::positive_part_approximate_objective(),
     )
     .expect("fallback solve should succeed");
 
@@ -7548,7 +7552,7 @@ pub(crate) fn joint_stationarity_from_gradient_projects_coupled_linear_constrain
         std::slice::from_ref(&spec),
         &s_lambdas,
         0.0,
-        RidgePolicy::explicit_stabilization_full(),
+        RidgePolicy::exact_full_objective(),
         &[Some(constraints.clone())],
         None,
         None,
@@ -7561,7 +7565,7 @@ pub(crate) fn joint_stationarity_from_gradient_projects_coupled_linear_constrain
         &[state.clone()],
         &s_lambdas,
         0.0,
-        RidgePolicy::explicit_stabilization_full(),
+        RidgePolicy::exact_full_objective(),
         &[Some(constraints.clone())],
         None,
         None,
@@ -7580,7 +7584,7 @@ pub(crate) fn joint_stationarity_from_gradient_projects_coupled_linear_constrain
         &[spec],
         &s_lambdas,
         0.0,
-        RidgePolicy::explicit_stabilization_full(),
+        RidgePolicy::exact_full_objective(),
         &[Some(constraints)],
         None,
         None,
@@ -7636,7 +7640,7 @@ pub(crate) fn stationarity_projects_valid_lower_bound_multiplier_but_keeps_wrong
         std::slice::from_ref(&spec),
         &s_lambdas,
         0.0,
-        RidgePolicy::explicit_stabilization_full(),
+        RidgePolicy::exact_full_objective(),
         &[None],
         None,
         Some(&lower_bounds),
@@ -7653,7 +7657,7 @@ pub(crate) fn stationarity_projects_valid_lower_bound_multiplier_but_keeps_wrong
         std::slice::from_ref(&spec),
         &s_lambdas,
         0.0,
-        RidgePolicy::explicit_stabilization_full(),
+        RidgePolicy::exact_full_objective(),
         &[None],
         None,
         None,
@@ -7694,7 +7698,7 @@ pub(crate) fn kkt_residual_uses_cached_joint_gradient_without_re_evaluating_fami
         std::slice::from_ref(&state),
         std::slice::from_ref(&s_lambda),
         0.0,
-        RidgePolicy::explicit_stabilization_full(),
+        RidgePolicy::exact_full_objective(),
         None,
         Some(&cached_gradient),
         None,
@@ -7745,7 +7749,7 @@ pub(crate) fn projected_stationarity_vector_uses_penalized_residual_not_raw_scor
         std::slice::from_ref(&spec),
         std::slice::from_ref(&s_lambda),
         0.0,
-        RidgePolicy::explicit_stabilization_full(),
+        RidgePolicy::exact_full_objective(),
         &[None],
         None,
         None,
@@ -8464,7 +8468,7 @@ pub(crate) fn blockwise_trust_region_uses_penalized_metric_not_raw_coefficient_s
         raw_delta,
         radius,
         0.0,
-        RidgePolicy::explicit_stabilization_pospart(),
+        RidgePolicy::positive_part_approximate_objective(),
     )
     .expect("block metric truncation should succeed");
     assert!(
@@ -8518,7 +8522,7 @@ pub(crate) fn blockwise_trust_region_never_reverts_to_raw_beta_norm_on_indefinit
         raw_delta,
         radius,
         0.0,
-        RidgePolicy::explicit_stabilization_pospart(),
+        RidgePolicy::positive_part_approximate_objective(),
     )
     .expect("block metric truncation should succeed");
     assert!(
@@ -8661,7 +8665,7 @@ pub(crate) fn kkt_refusal_report_classifies_rank_deficient_hpen_third_block() {
         Some(&source),
         total_p,
         0.0,
-        RidgePolicy::explicit_stabilization_full(),
+        RidgePolicy::exact_full_objective(),
         1.0e-9,
         1.0e-3,
         1.0,
@@ -8858,7 +8862,7 @@ pub(crate) fn rank_deficient_hpen_canary_fires_on_large_scale_shaped_failure() {
         Some(&source),
         total_p,
         0.0,
-        RidgePolicy::explicit_stabilization_full(),
+        RidgePolicy::exact_full_objective(),
         0.0,
         1.0e-3,
         1.0,
@@ -8975,7 +8979,7 @@ pub(crate) fn rank_deficient_hpen_canary_disappears_after_nullspace_absorption()
         Some(&source),
         total_p,
         0.0,
-        RidgePolicy::explicit_stabilization_full(),
+        RidgePolicy::exact_full_objective(),
         0.0,
         0.0,
         1.0,

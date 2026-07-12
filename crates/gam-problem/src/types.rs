@@ -7,7 +7,7 @@ pub use gam_linalg::{RidgeDeterminantMode, RidgePolicy};
 pub use gam_spec::*;
 
 /// Storage form of the ridge penalty matrix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RidgeMatrixForm {
     /// Ridge matrix is `delta * I`.
     ScaledIdentity,

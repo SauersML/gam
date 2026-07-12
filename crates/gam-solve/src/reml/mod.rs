@@ -4967,16 +4967,9 @@ impl PenaltySubspaceCacheKey {
         }
         let penalty_matrix_fingerprint = hasher.finish();
         let mut ridge_hasher = DefaultHasher::new();
-        ridge_passport.delta.to_bits().hash(&mut ridge_hasher);
-        (ridge_passport.matrix_form as u8).hash(&mut ridge_hasher);
-        ridge_passport
-            .policy
-            .include_penalty_logdet
-            .hash(&mut ridge_hasher);
-        ridge_passport
-            .policy
-            .include_laplacehessian
-            .hash(&mut ridge_hasher);
+        ridge_passport.delta().to_bits().hash(&mut ridge_hasher);
+        ridge_passport.matrix_form().hash(&mut ridge_hasher);
+        ridge_passport.policy().hash(&mut ridge_hasher);
         let ridge_passport_signature = ridge_hasher.finish();
         Self {
             penalty_matrix_fingerprint,

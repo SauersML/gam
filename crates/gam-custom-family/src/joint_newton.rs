@@ -1357,7 +1357,7 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
             // construction, compute the value from the SAME canonical
             // `PenaltyPseudologdet` the gradient differentiates, with the same
             // dense penalty components, the same λ, and the same ridge.
-            let ridge = if options.ridge_policy.include_penalty_logdet {
+            let ridge = if options.ridge_policy.accounts_for_objective() {
                 effective_solverridge(options.ridge_floor)
             } else {
                 0.0
@@ -3398,7 +3398,7 @@ pub(crate) fn compute_kkt_refusal_report(
         .enumerate()
         .map(|(b, _)| {
             let mut penalty_block = s_lambdas[b].dot(&states[b].beta);
-            if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+            if ridge_policy.accounts_for_objective() && ridge > 0.0 {
                 penalty_block += &states[b].beta.mapv(|v| ridge * v);
             }
             penalty_block
@@ -3468,7 +3468,7 @@ pub(crate) fn compute_kkt_refusal_report(
         && let Ok(mut h_joint) =
             materialize_joint_hessian_source(source, total_p, "KKT refusal diagnostic spectrum")
     {
-        let model_diagonal_ridge = if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+        let model_diagonal_ridge = if ridge_policy.accounts_for_objective() && ridge > 0.0 {
             ridge
         } else {
             0.0
@@ -4235,7 +4235,7 @@ pub(crate) fn projected_residual_range_space_per_block_inf(
         "penalty-null-space per-block certificate spectrum",
     )
     .ok()?;
-    let model_diagonal_ridge = if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+    let model_diagonal_ridge = if ridge_policy.accounts_for_objective() && ridge > 0.0 {
         ridge
     } else {
         0.0
@@ -4292,7 +4292,7 @@ pub(crate) fn projected_residual_range_space_inf(
         "penalty-null-space certificate spectrum",
     )
     .ok()?;
-    let model_diagonal_ridge = if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+    let model_diagonal_ridge = if ridge_policy.accounts_for_objective() && ridge > 0.0 {
         ridge
     } else {
         0.0

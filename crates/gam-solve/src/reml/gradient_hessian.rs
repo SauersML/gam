@@ -447,7 +447,7 @@ impl<'a> RemlState<'a> {
             .read()
             .unwrap()
             .as_ref()
-            .map(|bundle| bundle.ridge_passport.delta)
+            .map(|bundle| bundle.ridge_passport.delta())
     }
 
     pub(crate) fn dense_penalty_logdet_derivs(
@@ -6487,7 +6487,7 @@ impl<'a> RemlState<'a> {
             x_sparse,
             &hessian_weights,
             &s_lambda,
-            ridge_passport.delta,
+            ridge_passport.delta(),
             precomputed_xtwx,
         )?;
         let lambdas_slice = lambdas.as_slice().ok_or_else(|| {

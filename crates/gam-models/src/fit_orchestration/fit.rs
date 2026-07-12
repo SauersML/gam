@@ -1,5 +1,4 @@
 use super::*;
-use opt::{RidgeSchedule, escalate_ridge};
 
 pub(crate) fn survival_inverse_link_has_free_parameters(link: &InverseLink) -> bool {
     match link {
@@ -325,11 +324,11 @@ mod standard_convergence_gate_tests {
 /// Refits the mean/dispersion GLM at `Tweedie { p }` reusing the existing fit
 /// machinery (no reimplementation), reconstructs the fitted mean
 /// `μ = exp(Xβ̂ + offset)` on the log link, and evaluates the **exact** Jørgensen
-/// compound-Poisson–gamma log-density (`gam_solve::pirls::tweedie_exact_loglik_total`)
+/// compound-Poisson–gamma log-density (`gam_solve::pirls::tweedie_exact_loglik_total_from_eta`)
 /// at the estimated dispersion `φ̂(p)`.
 ///
 /// CRITICAL (#2105): the objective must be the *exact* EDM density, NOT the
-/// saddlepoint approximation the fit reports for AIC. The saddlepoint is exact
+/// separately named saddlepoint approximation. The saddlepoint is exact
 /// only in the many-jumps (large Poisson-rate λ) limit; at the moderate λ of a
 /// typical Tweedie fit its missing `O(1/λ)` normalizer correction, summed across
 /// the sample, biases the profile maximizer **low** (e.g. `p̂ ≈ 1.33` on `p = 1.5`
@@ -352,12 +351,12 @@ fn tweedie_profile_loglik(request: &StandardFitRequest<'_>, p: f64) -> Option<f6
     // μ = g⁻¹(Xβ̂ + offset); the Tweedie family is fixed to the log link by
     // `resolve_family`, so g⁻¹ = exp. `design.apply` reproduces the fitted
     // linear predictor exactly (same contract the expectile/predict paths use).
-    let mut mu = fitted.design.design.apply(&fitted.fit.beta);
-    if mu.len() != request.y.len() {
+    let mut eta = fitted.design.design.apply(&fitted.fit.beta);
+    if eta.len() != request.y.len() {
         return None;
     }
-    mu += request.offset.as_ref();
-    mu.mapv_inplace(f64::exp);
+    eta += request.offset.as_ref();
+    let mu = eta.mapv(f64::exp);
     // Profile the dispersion out at this `p` with the SAME prior-weighted Pearson
     // moment estimator the inner solver uses to report the Tweedie `φ̂`
     // (`estimate_tweedie_phi_from_eta`): `φ̂ = Σ wᵢ (yᵢ − μᵢ)² / μᵢ^p / Σ wᵢ`.
@@ -385,16 +384,17 @@ fn tweedie_profile_loglik(request: &StandardFitRequest<'_>, p: f64) -> Option<f6
     }
     let phi = (weighted_pearson / total_weight).clamp(PHI_MIN, PHI_MAX);
     // Evaluate the EXACT compound-Poisson–gamma density at φ̂(p) — the profile
-    // objective mgcv's `tw()` maximizes. Using the saddlepoint here (as the AIC
-    // path does) is what biased `p̂` low and inflated `φ̂` (#2105).
-    let ll = gam_solve::pirls::tweedie_exact_loglik_total(
+    // objective mgcv's `tw()` maximizes. Using a saddlepoint here is what biased
+    // `p̂` low and inflated `φ̂` (#2105).
+    let ll = gam_solve::pirls::tweedie_exact_loglik_total_from_eta(
         request.y.view(),
-        &mu,
+        eta.view(),
         request.weights.view(),
         p,
         phi,
-    );
-    ll.is_finite().then_some(ll)
+    )
+    .ok()?;
+    Some(ll)
 }
 
 /// Estimate the Tweedie variance power `p ∈ (1, 2)` by profile likelihood, mgcv
@@ -1278,30 +1278,13 @@ fn survival_transformation_edf(
     let h_dense = state.hessian.to_dense();
     let p = h_dense.nrows();
     let h_sym = gam_linalg::matrix::SymmetricMatrix::Dense(h_dense.clone());
-    // Sparse-aware factorization with ridge retry (mirrors estimate.rs) so a
-    // marginally indefinite Hessian at a boundary-constrained optimum still
-    // yields a usable trace rather than aborting the whole fit.
-    let factor = {
-        let scale = h_sym.max_abs_diag();
-        let try_ridge = |ridge: f64| -> Option<_> {
-            let candidate = if ridge > 0.0 {
-                h_sym.addridge(ridge).unwrap_or_else(|_| h_sym.clone())
-            } else {
-                h_sym.clone()
-            };
-            candidate.factorize().ok()
-        };
-        // Bare (unridged) attempt first, then 7 geometric escalations from
-        // `scale·1e-10` — the pre-migration budget of 8 total attempts.
-        match try_ridge(0.0) {
-            Some(f) => f,
-            None => escalate_ridge(RidgeSchedule::geometric(scale * 1e-10, 7), try_ridge)
-                .map(|success| success.value)
-                .map_err(|_| {
-                    "survival edf: penalized Hessian could not be factorized".to_string()
-                })?,
-        }
-    };
+    // EDF is an exact trace of the fitted (unperturbed) penalized Hessian.
+    // Factoring a different, ridged matrix silently changes the estimand, so a
+    // singular/indefinite fitted Hessian is an inference failure rather than a
+    // license to manufacture a nearby covariance.
+    let factor = h_sym.factorize().map_err(|error| {
+        format!("survival edf: exact penalized-Hessian factorization failed: {error}")
+    })?;
     let mut edf_by_block = vec![0.0_f64; penalty_blocks.len()];
     // Raw per-block penalty trace tr_kk = λ_kk·tr(H⁻¹S_kk) (issue #1219).
     let mut penalty_block_trace = vec![0.0_f64; penalty_blocks.len()];
@@ -1421,17 +1404,16 @@ fn optimize_survival_transformation_smoothing(
     // Full λ vector (smoothing blocks + fixed ridge), used to rebuild each
     // candidate model. The ridge entries (indices >= num_smoothing) are frozen.
     let seed_lambdas: Vec<f64> = penalty_blocks.iter().map(|b| b.lambda).collect();
-    let seed_log_lambdas =
-        seed_lambdas
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(coordinate, value)| {
-                gam_problem::checked_log_strength(value).map_err(|error| {
-                    format!("survival transformation seed lambda {coordinate}: {error}")
-                })
+    let seed_log_lambdas = seed_lambdas
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(coordinate, value)| {
+            gam_problem::checked_log_strength(value).map_err(|error| {
+                format!("survival transformation seed lambda {coordinate}: {error}")
             })
-            .collect::<Result<Vec<_>, _>>()?;
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let seed_rho = Array1::from_vec(seed_log_lambdas[..num_smoothing].to_vec());
 
     // Memoize the most recent (ρ, cost, gradient) triple. The outer BFGS bridge
@@ -2128,9 +2110,8 @@ fn survival_transformation_log_lambdas(
         .iter()
         .enumerate()
         .map(|(coordinate, block)| {
-            gam_problem::checked_log_strength(block.lambda).map_err(|error| {
-                format!("survival transformation penalty {coordinate}: {error}")
-            })
+            gam_problem::checked_log_strength(block.lambda)
+                .map_err(|error| format!("survival transformation penalty {coordinate}: {error}"))
         })
         .collect()
 }

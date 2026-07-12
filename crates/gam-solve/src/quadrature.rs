@@ -3179,8 +3179,7 @@ pub fn integrated_inverse_link_jetwith_state(
 #[inline]
 pub fn integrated_family_moments_jet(
     quadctx: &QuadratureContext,
-    likelihood: &LikelihoodSpec,
-    scale: LikelihoodScaleMetadata,
+    likelihood: &GlmLikelihoodSpec,
     eta: f64,
     se_eta: f64,
 ) -> Result<IntegratedMomentsJet, EstimationError> {
@@ -3195,10 +3194,14 @@ pub fn integrated_family_moments_jet(
     // Pull parameterized link state from the spec itself; these helpers return
     // `None` for `InverseLink::Standard`, which is what every non-parameterized
     // dispatch arm expects.
-    let mixture_link_state: Option<&MixtureLinkState> = likelihood.link.mixture_state();
-    let sas_link_state: Option<&SasLinkState> = likelihood.link.sas_state();
-    match &likelihood.response {
-        ResponseFamily::Binomial => match &likelihood.link {
+    let resolved_scale = likelihood
+        .resolved_scale()
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+    let spec = &likelihood.spec;
+    let mixture_link_state: Option<&MixtureLinkState> = spec.link.mixture_state();
+    let sas_link_state: Option<&SasLinkState> = spec.link.sas_state();
+    match &spec.response {
+        ResponseFamily::Binomial => match &spec.link {
             InverseLink::Standard(StandardLink::Logit) => {
                 let jet = integrated_inverse_link_jet(quadctx, LinkFunction::Logit, e, se)?;
                 let mean = jet.mean;
@@ -3293,14 +3296,19 @@ pub fn integrated_family_moments_jet(
                 "Binomial response paired with unsupported standard link {other:?} for integrated moments"
             ))),
         },
-        ResponseFamily::Gaussian => Ok(IntegratedMomentsJet {
-            mean: e,
-            variance: 1.0,
-            d1: 1.0,
-            d2: 0.0,
-            d3: 0.0,
-            mode: IntegratedExpectationMode::ExactClosedForm,
-        }),
+        ResponseFamily::Gaussian => {
+            let variance = resolved_scale
+                .gaussian_phi()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+            Ok(IntegratedMomentsJet {
+                mean: e,
+                variance,
+                d1: 1.0,
+                d2: 0.0,
+                d3: 0.0,
+                mode: IntegratedExpectationMode::ExactClosedForm,
+            })
+        }
         ResponseFamily::RoystonParmar => {
             let jet = integrated_inverse_link_jetwith_state(
                 quadctx,
@@ -3320,12 +3328,15 @@ pub fn integrated_family_moments_jet(
                 mode: jet.mode,
             })
         }
-        ResponseFamily::Beta { phi } => {
+        ResponseFamily::Beta { .. } => {
+            let precision = resolved_scale
+                .beta_precision()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
             let jet = integrated_inverse_link_jet(quadctx, LinkFunction::Logit, e, se)?;
             let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
             Ok(IntegratedMomentsJet {
                 mean,
-                variance: (mean * (1.0 - mean) / (1.0 + phi.max(1e-12))).max(PROB_EPS),
+                variance: (mean * (1.0 - mean) / (1.0 + precision)).max(PROB_EPS),
                 d1: jet.d1,
                 d2: jet.d2,
                 d3: jet.d3,
@@ -3352,28 +3363,25 @@ pub fn integrated_family_moments_jet(
             // than assumed unit. A Gamma/Tweedie response whose `scale` does not
             // carry the dispersion is a metadata bug and is rejected, not silently
             // collapsed to φ = 1 (issue #953).
-            let variance = match &likelihood.response {
+            let variance = match &spec.response {
                 ResponseFamily::Poisson => mean,
                 ResponseFamily::Tweedie { p } => {
-                    let phi = scale.fixed_phi().ok_or_else(|| {
-                        EstimationError::InvalidInput(format!(
-                            "Tweedie integrated variance requires dispersion φ in the scale \
-                             metadata (Var = φ·μ^p); got {scale:?} with no φ"
-                        ))
-                    })?;
+                    let phi = resolved_scale
+                        .tweedie_phi()
+                        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
                     phi * mean.powf(*p)
                 }
-                ResponseFamily::NegativeBinomial { theta, .. } => {
-                    mean + mean * mean / theta.max(1e-12)
+                ResponseFamily::NegativeBinomial { .. } => {
+                    let theta = resolved_scale.negative_binomial_theta().map_err(|error| {
+                        EstimationError::InvalidInput(error.to_string())
+                    })?;
+                    mean + mean * mean / theta
                 }
                 ResponseFamily::Gamma => {
-                    let shape = scale.gamma_shape().ok_or_else(|| {
-                        EstimationError::InvalidInput(format!(
-                            "Gamma integrated variance requires the shape k in the scale \
-                             metadata (Var = μ²/k = φ·μ²); got {scale:?} with no shape"
-                        ))
-                    })?;
-                    mean * mean / shape.max(1e-12)
+                    let phi = resolved_scale
+                        .gamma_phi()
+                        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+                    phi * mean * mean
                 }
                 // Unreachable: this match arm is only entered for the four families
                 // in the enclosing `Poisson | Tweedie | NegativeBinomial | Gamma`
@@ -3384,6 +3392,12 @@ pub fn integrated_family_moments_jet(
                     )));
                 }
             };
+            if !(variance.is_finite() && variance >= 0.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "integrated {} variance is not representable: {variance:?}",
+                    spec.response.name()
+                )));
+            }
             Ok(IntegratedMomentsJet {
                 mean,
                 variance,
@@ -6579,10 +6593,10 @@ mod tests {
             gam_problem::types::LatentCLogLogState::new(0.4).expect("valid latent cloglog state");
         let spec =
             LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::LatentCLogLog(latent));
+        let likelihood = GlmLikelihoodSpec::canonical(spec);
         let err = integrated_family_moments_jet(
             &ctx,
-            &spec,
-            LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            &likelihood,
             0.2,
             0.5,
         )
@@ -6599,10 +6613,10 @@ mod tests {
         })
         .expect("sas state should reconstruct from raw parameters");
         let spec = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(sas));
+        let likelihood = GlmLikelihoodSpec::canonical(spec);
         let out = integrated_family_moments_jet(
             &ctx,
-            &spec,
-            LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            &likelihood,
             0.2,
             0.5,
         )
@@ -6623,10 +6637,10 @@ mod tests {
         })
         .expect("single-component probit mixture state");
         let spec = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Mixture(state));
+        let likelihood = GlmLikelihoodSpec::canonical(spec);
         let out = integrated_family_moments_jet(
             &ctx,
-            &spec,
-            LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            &likelihood,
             0.7,
             1.3,
         )
@@ -6648,10 +6662,10 @@ mod tests {
         })
         .expect("single-component logit mixture state");
         let spec = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Mixture(state));
+        let likelihood = GlmLikelihoodSpec::canonical(spec);
         let out = integrated_family_moments_jet(
             &ctx,
-            &spec,
-            LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            &likelihood,
             1.1,
             0.8,
         )
@@ -6680,10 +6694,10 @@ mod tests {
             ResponseFamily::Binomial,
             InverseLink::Mixture(state.clone()),
         );
+        let likelihood = GlmLikelihoodSpec::canonical(spec);
         let out = integrated_family_moments_jet(
             &ctx,
-            &spec,
-            LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            &likelihood,
             0.2,
             0.5,
         )
@@ -6712,10 +6726,13 @@ mod tests {
         let p = 1.5_f64;
         let phi = 2.0_f64;
         let tweedie = LikelihoodSpec::tweedie_log(p);
+        let tweedie_likelihood = GlmLikelihoodSpec {
+            spec: tweedie.clone(),
+            scale: LikelihoodScaleMetadata::EstimatedTweediePhi { phi },
+        };
         let out = integrated_family_moments_jet(
             &ctx,
-            &tweedie,
-            LikelihoodScaleMetadata::EstimatedTweediePhi { phi },
+            &tweedie_likelihood,
             e,
             se,
         )
@@ -6728,10 +6745,13 @@ mod tests {
         // Gamma shape k = 4: Var = m² / k = φ·m² with φ = 1/k (old code: m², i.e. k = 1).
         let shape = 4.0_f64;
         let gamma = LikelihoodSpec::gamma_log();
+        let gamma_likelihood = GlmLikelihoodSpec {
+            spec: gamma.clone(),
+            scale: LikelihoodScaleMetadata::EstimatedGammaShape { shape },
+        };
         let out = integrated_family_moments_jet(
             &ctx,
-            &gamma,
-            LikelihoodScaleMetadata::EstimatedGammaShape { shape },
+            &gamma_likelihood,
             e,
             se,
         )
@@ -6743,10 +6763,10 @@ mod tests {
 
         // Poisson is φ ≡ 1, Var = m, independent of the (unit) scale label.
         let poisson = LikelihoodSpec::poisson_log();
+        let poisson_likelihood = GlmLikelihoodSpec::canonical(poisson);
         let out = integrated_family_moments_jet(
             &ctx,
-            &poisson,
-            LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            &poisson_likelihood,
             e,
             se,
         )
@@ -6756,10 +6776,10 @@ mod tests {
         // NB2 with theta = 3: Var = m + m²/θ, unchanged by this fix.
         let theta = 3.0_f64;
         let nb = LikelihoodSpec::negative_binomial_log(theta);
+        let nb_likelihood = GlmLikelihoodSpec::canonical(nb);
         let out = integrated_family_moments_jet(
             &ctx,
-            &nb,
-            LikelihoodScaleMetadata::EstimatedNegBinTheta { theta },
+            &nb_likelihood,
             e,
             se,
         )
@@ -6767,30 +6787,36 @@ mod tests {
         assert_relative_eq!(out.variance, m + m * m / theta, epsilon = 1e-12);
 
         // Missing Gamma dispersion metadata is rejected, not silently φ = 1.
+        let missing_gamma = GlmLikelihoodSpec {
+            spec: gamma,
+            scale: LikelihoodScaleMetadata::Unspecified,
+        };
         let err = integrated_family_moments_jet(
             &ctx,
-            &gamma,
-            LikelihoodScaleMetadata::Unspecified,
+            &missing_gamma,
             e,
             se,
         )
         .expect_err("gamma without a shape in the scale metadata must error");
         assert!(
-            format!("{err}").contains("Gamma integrated variance requires the shape"),
+            format!("{err}").contains("GammaShape"),
             "unexpected error message: {err}"
         );
 
         // Likewise a Tweedie response with no dispersion φ in the metadata.
+        let missing_tweedie = GlmLikelihoodSpec {
+            spec: tweedie,
+            scale: LikelihoodScaleMetadata::Unspecified,
+        };
         let err = integrated_family_moments_jet(
             &ctx,
-            &tweedie,
-            LikelihoodScaleMetadata::Unspecified,
+            &missing_tweedie,
             e,
             se,
         )
         .expect_err("tweedie without a φ in the scale metadata must error");
         assert!(
-            format!("{err}").contains("Tweedie integrated variance requires dispersion"),
+            format!("{err}").contains("EstimatedTweediePhi"),
             "unexpected error message: {err}"
         );
     }

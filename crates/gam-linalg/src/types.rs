@@ -5,12 +5,12 @@ use serde::{Deserialize, Serialize};
 /// There is deliberately no `Auto`: callers must decide whether they are
 /// evaluating the exact SPD determinant or a named positive-part
 /// approximation before constructing the policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RidgeDeterminantMode {
     /// Exact full log-determinant of the ridged SPD matrix.
     Full,
-    /// Positive-part pseudo-determinant. This changes the estimand and is
-    /// therefore explicitly an approximation.
+    /// Smooth positive-part spectral determinant approximation. This changes
+    /// the estimand and is therefore explicitly named as an approximation.
     PositivePartApproximation,
 }
 
@@ -19,7 +19,7 @@ pub enum RidgeDeterminantMode {
 /// The former public boolean matrix admitted contradictory states such as a
 /// quadratic penalty without the corresponding Hessian. This enum has only
 /// the three coherent inhabitants used by the engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RidgePolicy {
     /// Ridge is an explicit part of the exact objective: quadratic, penalty
     /// normalizer, and Laplace Hessian all include it, using a full SPD logdet.
@@ -51,13 +51,12 @@ impl RidgePolicy {
     }
 
     #[inline]
-    pub const fn determinant_mode(self) -> Option<RidgeDeterminantMode> {
+    pub const fn determinant_mode(self) -> RidgeDeterminantMode {
         match self {
-            Self::ExactFullObjective => Some(RidgeDeterminantMode::Full),
+            Self::ExactFullObjective | Self::SolverOnly => RidgeDeterminantMode::Full,
             Self::PositivePartApproximateObjective => {
-                Some(RidgeDeterminantMode::PositivePartApproximation)
+                RidgeDeterminantMode::PositivePartApproximation
             }
-            Self::SolverOnly => None,
         }
     }
 
@@ -75,7 +74,7 @@ mod ridge_policy_tests {
     fn exact_policy_is_homogeneous_and_full() {
         let policy = RidgePolicy::exact_full_objective();
         assert!(policy.accounts_for_objective());
-        assert_eq!(policy.determinant_mode(), Some(RidgeDeterminantMode::Full));
+        assert_eq!(policy.determinant_mode(), RidgeDeterminantMode::Full);
         assert!(!policy.is_approximation());
     }
 
@@ -85,7 +84,7 @@ mod ridge_policy_tests {
         assert!(policy.accounts_for_objective());
         assert_eq!(
             policy.determinant_mode(),
-            Some(RidgeDeterminantMode::PositivePartApproximation)
+            RidgeDeterminantMode::PositivePartApproximation
         );
         assert!(policy.is_approximation());
     }
@@ -94,6 +93,6 @@ mod ridge_policy_tests {
     fn solver_only_policy_cannot_enter_objective_accounting() {
         let policy = RidgePolicy::solver_only();
         assert!(!policy.accounts_for_objective());
-        assert_eq!(policy.determinant_mode(), None);
+        assert_eq!(policy.determinant_mode(), RidgeDeterminantMode::Full);
     }
 }

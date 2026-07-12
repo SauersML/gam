@@ -800,9 +800,6 @@ mod tests {
     fn default_custom_family_objective_is_coefficient_ridge_free() {
         let options = BlockwiseFitOptions::default();
         assert_eq!(options.ridge_floor, 0.0);
-        assert!(options.ridge_policy.rho_independent);
-        assert!(!options.ridge_policy.include_quadratic_penalty);
-        assert!(!options.ridge_policy.include_penalty_logdet);
-        assert!(!options.ridge_policy.include_laplacehessian);
+        assert!(!options.ridge_policy.accounts_for_objective());
     }
 }

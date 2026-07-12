@@ -640,7 +640,7 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>
             _ => return Ok(None),
         };
         let mut residual = s_lambdas[b].dot(&states[b].beta) - gradient;
-        if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+        if ridge_policy.accounts_for_objective() && ridge > 0.0 {
             residual += &states[b].beta.mapv(|v| ridge * v);
         }
         let block_active_hint = block_active_sets
@@ -826,7 +826,7 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm_from_gradient(
         let width = specs[b].design.ncols();
         let mut residual =
             s_lambdas[b].dot(&states[b].beta) - gradient.slice(ndarray::s![offset..offset + width]);
-        if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+        if ridge_policy.accounts_for_objective() && ridge > 0.0 {
             residual += &states[b].beta.mapv(|v| ridge * v);
         }
         // gam#979 box-bound (simple lower bound) KKT residual. `residual` here is
@@ -903,7 +903,7 @@ pub(crate) fn exact_newton_joint_stationarity_vector_from_gradient(
         let start = offset;
         let end = offset + width;
         let mut block = s_lambdas[b].dot(&states[b].beta) - gradient.slice(ndarray::s![start..end]);
-        if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+        if ridge_policy.accounts_for_objective() && ridge > 0.0 {
             block += &states[b].beta.mapv(|v| ridge * v);
         }
         residual.slice_mut(ndarray::s![start..end]).assign(&block);
@@ -1014,7 +1014,7 @@ pub(crate) fn exact_newton_joint_projected_stationarity_vector_from_gradient(
         if let Some(js) = joint_penalty_score {
             block += &js.slice(ndarray::s![start..end]);
         }
-        if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+        if ridge_policy.accounts_for_objective() && ridge > 0.0 {
             block += &states[b].beta.mapv(|v| ridge * v);
         }
         if let Some(constraints) = block_constraints[b].as_ref() {
