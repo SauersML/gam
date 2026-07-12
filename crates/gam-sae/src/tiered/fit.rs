@@ -322,26 +322,18 @@ mod fit_tests {
         // Tier-0 mean captured the +1 / -0.5 offsets it was given.
         assert!(report.tier0.mean.iter().all(|m| m.is_finite()));
         assert!(report.tier2.is_none(), "linear_bulk disables Tier-2");
-        // The `certified` bool is populated on the returned certificate regardless of
-        // whether this well-posed fit closes to the 1e-6 frame tolerance (#2275); the
-        // certified-vs-open distinction is asserted directly in
-        // `tiered_returns_best_effort_open_certificate_at_k_gg_rank_2275`. Here we only
-        // require the field to be readable alongside a finite frame residual.
-        let certified = report.tier1.convergence.certified;
         assert!(
-            report.tier1.convergence.frame_residual.is_finite(),
-            "frame residual must be finite (certified={certified})"
+            report.tier1.convergence.frame_residual <= report.tier1.convergence.tolerance,
+            "every returned tiered fit must carry a closed frame certificate"
         );
     }
 
     /// #2275: at `K ≫ intrinsic-rank` the frame-projector fixed point legitimately
     /// does not certify — ~`K − rank` blocks are structurally spurious and AuxK
     /// revival churns their frames every epoch, pinning `frame_residual` above
-    /// tolerance. The best-effort completion path must RETURN a tiered fit (Tier-1
-    /// best-effort + Tier-2 on its residual) carrying a typed OPEN certificate,
-    /// instead of collapsing to `Err` and never running Tier-2 (the old contract).
+    /// tolerance. Such an iterate must be refused before Tier-2 consumes it.
     #[test]
-    fn tiered_returns_best_effort_open_certificate_at_k_gg_rank_2275() {
+    fn tiered_refuses_open_certificate_at_k_gg_rank_2275() {
         // Rank-1 planted structure (a single direction in cols 0,1) in P=8, fit with
         // K = G·b = 16 blocks of size b=1: ~15 blocks are structurally spurious.
         let n = 96usize;
@@ -357,54 +349,16 @@ mod fit_tests {
         config.tier1.aux_k = 4; // revival ON: spurious frames churn -> cannot certify
         config.tier1.max_epochs = 40;
 
-        // The Err-contract entry would error out here; the best-effort tiered path
-        // returns instead — that IS the #2275 acceptance criterion.
-        let report = fit_tiered(z.view(), &config)
-            .expect("#2275: best-effort tiered fit must RETURN at K ≫ rank, not error");
-
-        // Typed OPEN certificate: not certified, and the residual quantifies how open.
-        assert!(
-            !report.tier1.convergence.certified,
-            "K ≫ rank fit must carry an OPEN certificate; got certified=true \
-             (frame_residual={}, tol={})",
-            report.tier1.convergence.frame_residual, report.tier1.convergence.tolerance
-        );
-        assert!(
-            report.tier1.convergence.frame_residual > report.tier1.convergence.tolerance,
-            "an open certificate must report frame_residual above tolerance; got {} <= {}",
-            report.tier1.convergence.frame_residual,
-            report.tier1.convergence.tolerance
-        );
-        assert!(
-            report.tier1.explained_variance.is_finite(),
-            "best-effort Tier-1 EV must be finite"
-        );
-        // Tier-2 RAN on the best-effort Tier-1 residual — today it never would.
-        assert!(
-            report.tier2.is_some(),
-            "#2275: Tier-2 must run on the best-effort Tier-1 residual"
-        );
-        assert!(
-            report.explained_variance.is_finite(),
-            "composed EV must be finite on the best-effort path"
-        );
-        // No tolerance softening: the tolerance the fit was measured against is the
-        // configured one, unchanged.
-        assert_eq!(
-            report.tier1.convergence.tolerance, config.tier1.tolerance,
-            "#2275 must NOT soften tolerance; the open certificate uses the configured tol"
-        );
+        fit_tiered(z.view(), &config)
+            .expect_err("Tier-2 must never consume an unconverged Tier-1 iterate");
     }
 
-    /// #2275: the certified Err-contract entry and the best-effort entry agree on the
-    /// SAME fixed point at the block level — the Err-contract rejects a K ≫ rank fit
-    /// while the best-effort entry returns it with `certified=false` and matching
-    /// open residuals (no silent softening, just a typed completion).
+    /// #2275: the block entry returns typed nonconvergence with the configured
+    /// tolerance and open residual; it never mints an uncertified fit.
     #[test]
-    fn block_best_effort_recovers_the_open_fit_the_err_contract_rejects_2275() {
+    fn block_sparse_open_fixed_point_is_a_typed_error_2275() {
         use crate::sparse_dict::{
             BlockSeedPolicy, BlockSparseConfig, BlockSparseFitError,
-            fit_block_sparse_dictionary_best_effort_with_seed,
             fit_block_sparse_dictionary_with_seed,
         };
         let n = 96usize;
@@ -426,33 +380,16 @@ mod fit_tests {
             BlockSeedPolicy::FarthestPoint,
         )
         .expect_err("Err-contract entry must reject the non-certified K ≫ rank fit");
-        let best = fit_block_sparse_dictionary_best_effort_with_seed(
-            x.view(),
-            &config,
-            BlockSeedPolicy::FarthestPoint,
-        )
-        .expect("best-effort entry must RETURN the same fit with an open certificate");
-
-        assert!(
-            !best.convergence.certified,
-            "best-effort fit at K ≫ rank must be certified=false"
-        );
         match err {
             BlockSparseFitError::NonConvergence {
                 frame_residual,
                 tolerance,
                 ..
             } => {
-                assert_eq!(
-                    tolerance, best.convergence.tolerance,
-                    "both entries measure against the same (unsoftened) tolerance"
-                );
+                assert_eq!(tolerance, config.tolerance);
                 assert!(
-                    frame_residual > tolerance
-                        && best.convergence.frame_residual > best.convergence.tolerance,
-                    "both report the SAME open frame residual above tolerance \
-                     (err={frame_residual}, best={})",
-                    best.convergence.frame_residual
+                    frame_residual > tolerance,
+                    "the typed error must report the open frame residual"
                 );
             }
             other => panic!("expected NonConvergence, got {other:?}"),
