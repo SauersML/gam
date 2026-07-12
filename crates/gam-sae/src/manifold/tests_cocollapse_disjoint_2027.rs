@@ -372,3 +372,114 @@ pub(crate) fn structural_coherence_detector_fires_on_duplicate_not_orthogonal_20
         hit.2
     );
 }
+
+/// #2132 #2b — build a K=3 periodic term whose three atoms ALL decode into the
+/// SAME 2-D output plane (the first-harmonic sin/cos map onto output columns 0
+/// and 1 of a `p`-dim output), so the union output-frame rank `R = 2 < K = 3`
+/// and the dictionary is OVERCOMPLETE. `duplicate = true` makes atoms 0 and 1 a
+/// TRUE duplicate (identical decoder AND identical chart/phase) with atom 2 on a
+/// distinct phase; `duplicate = false` gives all three DISTINCT phases (identical
+/// decoder, different charts) — benign pigeonhole sharing.
+fn overcomplete_k3_planar_term(n: usize, p: usize, m: usize, duplicate: bool) -> SaeManifoldTerm {
+    let d = 1usize;
+    let k = 3usize;
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m).unwrap());
+    let mut basis_values = Array3::<f64>::zeros((k, n, m));
+    let mut basis_jacobian = Array4::<f64>::zeros((k, n, m, d));
+    let mut decoder = Array3::<f64>::zeros((k, m, p));
+    let mut penalties = Array3::<f64>::zeros((k, m, m));
+    let mut coords_vec: Vec<Array2<f64>> = Vec::new();
+    for atom in 0..k {
+        // atoms 0,1 share phase 0 when duplicating (atom 2 shifted); otherwise all
+        // three phases are distinct.
+        let phase = if duplicate {
+            if atom == 2 {
+                1.0 / 3.0
+            } else {
+                0.0
+            }
+        } else {
+            atom as f64 / k as f64
+        };
+        let mut coords = Array2::<f64>::zeros((n, d));
+        for row in 0..n {
+            coords[[row, 0]] = ((row as f64) / (n as f64) + phase).rem_euclid(1.0);
+        }
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        basis_values.slice_mut(s![atom, .., ..]).assign(&phi);
+        basis_jacobian.slice_mut(s![atom, .., .., ..]).assign(&jet);
+        penalties
+            .slice_mut(s![atom, .., ..])
+            .assign(&Array2::<f64>::eye(m));
+        // Every atom decodes the first harmonic into the (e0, e1) output plane
+        // (sin → col 0, cos → col 1), so all three output frames span the same
+        // 2-D subspace ⇒ union rank 2 < k = 3 (overcomplete).
+        decoder[[atom, 1, 0]] = 1.0;
+        decoder[[atom, 2, 1]] = 1.0;
+        coords_vec.push(coords);
+    }
+    let logits = Array2::<f64>::zeros((n, k));
+    let mut evaluators: Vec<Option<Arc<dyn SaeBasisSecondJet>>> = Vec::new();
+    for _ in 0..k {
+        evaluators.push(Some(evaluator.clone()));
+    }
+    term_from_padded_blocks_with_mode(
+        n,
+        p,
+        &vec![SaeAtomBasisKind::Periodic; k],
+        basis_values.view(),
+        basis_jacobian.view(),
+        &vec![m; k],
+        &vec![d; k],
+        decoder.view(),
+        penalties.view(),
+        logits.view(),
+        &coords_vec,
+        AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false),
+        &evaluators,
+    )
+    .unwrap()
+}
+
+/// #2132 #2b — an OVERCOMPLETE (`K > R`) true duplicate must be detected. The old
+/// union-frame-rank gate returned NO collapsed pairs whenever `K > R`, which
+/// DISABLED the detector exactly in the overcomplete regime where duplicates are
+/// most likely (the second-stage contribution-cosine verdict was never reached).
+/// #2b keeps the detector alive overcomplete — it drops only the pigeonhole-
+/// forced PASS-1 frame prune — so PASS 2 flags the true duplicate (0,1). This
+/// fixture is genuinely overcomplete (three atoms in a 2-D output plane, R=2<K=3).
+#[test]
+pub(crate) fn overcomplete_duplicate_is_detected_past_the_k_gt_r_gate_2132() {
+    let term = overcomplete_k3_planar_term(96, 4, 5, true);
+    let hit = term
+        .structural_coherence_collapse_detected()
+        .unwrap()
+        .expect(
+            "an overcomplete (K>R) true duplicate must be flagged now that the detector \
+             reaches PASS 2 past the K>R gate",
+        );
+    assert_eq!((hit.0, hit.1), (0, 1), "the duplicate pair is (0, 1)");
+    assert!(
+        hit.2 > 0.9,
+        "overcomplete duplicate contribution cosine must be ~1, got {}",
+        hit.2
+    );
+}
+
+/// #2132 #2b — the overcomplete detector must NOT false-fire on benign pigeonhole
+/// sharing. Same K=3-in-a-2-plane geometry but all three atoms carry DISTINCT
+/// phases (identical decoder, different charts): every output frame overlaps by
+/// pigeonhole, yet the PASS-2 contribution cosine sits at the independence null,
+/// so nothing is flagged (the `ordered_beta_bernoulli` false-positive the K>R gate was
+/// originally meant to avoid — now avoided by the verdict stage, not by disabling
+/// the detector).
+#[test]
+pub(crate) fn overcomplete_distinct_phases_stay_silent_2132() {
+    let term = overcomplete_k3_planar_term(96, 4, 5, false);
+    assert!(
+        term.structural_coherence_collapse_detected()
+            .unwrap()
+            .is_none(),
+        "benign overcomplete pigeonhole sharing (distinct phases) must NOT be flagged"
+    );
+}

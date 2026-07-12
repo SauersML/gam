@@ -3877,40 +3877,46 @@ impl SaeManifoldTerm {
         let frames = (0..k)
             .map(|atom| crate::manifold::certificate::certificate_output_frame(self, atom))
             .collect::<Result<Vec<_>, String>>()?;
-        // OVERCOMPLETE GATE (ordered_beta_bernoulli_default_alpha false-positive root cause). A shared
-        // output subspace is evidence of a REDUNDANT atom only when the dictionary is
-        // NOT overcomplete relative to the output space it actually occupies. Let
-        // `R = dim(⋃_k col Q_k)` be the effective output rank — the dimension spanned
-        // by the atoms' orthonormal decoder output frames. When `K > R`, pigeonhole
-        // FORCES output-frame sharing: `K` curved atoms cannot each claim a private
-        // output direction inside an `R < K`-dim space, so every co-firing pair MUST
-        // overlap while encoding DISTINCT charts/phases — benign over-completeness, not
-        // duplication (measured on `ordered_beta_bernoulli_default_alpha`: 8 curved atoms in a ~6-dim
-        // output, every frame-coherent pair reconstructs EV≈0.99 with contribution
-        // cosine at the independence null; firing the reseed here burns the iteration
-        // budget — guards-on 12-iter EV 0.697 vs guards-off 0.990). Restrict the whole
-        // detector to `K ≤ R`, where a shared output frame is genuine evidence of a
-        // redundant atom and the PASS-2 contribution-cosine verdict then separates a
-        // true duplicate from a merely-correlated pair. `R` is READ from the frames at
-        // hand (numeric rank of the stacked orthonormal frames), never a config knob.
+        // OVERCOMPLETE GATE (#2132 #2b — the union-frame-rank gate). Let
+        // `R = dim(⋃_k col Q_k)` be the effective output rank spanned by the atoms'
+        // orthonormal decoder output frames. When `K > R`, pigeonhole FORCES
+        // output-frame sharing: `K` curved atoms cannot each claim a private output
+        // direction inside an `R < K`-dim space, so every co-firing pair MUST overlap
+        // in output subspace even when encoding DISTINCT charts/phases — the PASS-1
+        // frame-coherence prune is therefore UNINFORMATIVE overcomplete (it admits
+        // everything) and false-fired the old frame-only detector (`ordered_beta_bernoulli_default_alpha`:
+        // 8 curved atoms in a ~6-dim output, every frame-coherent pair EV≈0.99 with
+        // contribution cosine at the independence null).
+        //
+        // The old code turned that off by returning NO collapsed pairs whenever
+        // `K > R` — but that also DISABLED the PASS-2 contribution-cosine verdict, the
+        // one measure that stays valid overcomplete and is exactly what separates a
+        // true duplicate (same gated rows ⇒ collinear contributions) from benign
+        // pigeonhole sharing (distinct phases ⇒ contribution cosine at the null). So a
+        // genuine overcomplete duplicate — the regime where duplicates are MOST likely
+        // — went undetected. The gate now only DROPS THE FRAME PRUNE (admitting every
+        // pair as a candidate so PASS 2 can adjudicate it), never the verdict. `R` is
+        // READ from the frames at hand (numeric rank of the stacked orthonormal
+        // frames), never a config knob.
         let effective_output_rank = union_output_frame_rank(&frames, p);
-        if k > effective_output_rank {
-            return Ok(Vec::new());
-        }
+        let overcomplete = k > effective_output_rank;
         // PASS 1 — output-SUBSPACE overlap CANDIDATES. A pair enters the guard only
         // when its decoder output frames overlap beyond the random-frame null
-        // `½(μ_null+1)`. This is a cheap prune, NOT the verdict: sharing an output
-        // subspace is FORCED for an over-complete (`K > rank`) manifold dictionary
-        // (several curved atoms cannot avoid the ≤`p`-dim output space) and is not
-        // itself co-collapse. Orthogonal-output atoms have coherence≈0 and never
-        // become candidates (their contributions are also uncorrelated), so nothing
-        // functionally-redundant is pruned here.
+        // `½(μ_null+1)` — a cheap prune, NOT the verdict. Orthogonal-output atoms have
+        // coherence≈0 and never become candidates (their contributions are also
+        // uncorrelated), so nothing functionally-redundant is pruned here. Overcomplete
+        // (`K > R`), frame overlap is pigeonhole-forced and thus useless as a prune, so
+        // every pair is admitted and PASS 2 decides.
         let mut candidates: Vec<(usize, usize)> = Vec::new();
         for j in 0..k {
             for kk in (j + 1)..k {
                 let rj = frames[j].ncols();
                 let rk = frames[kk].ncols();
                 if rj == 0 || rk == 0 {
+                    continue;
+                }
+                if overcomplete {
+                    candidates.push((j, kk));
                     continue;
                 }
                 let overlap = fast_atb(&frames[j], &frames[kk]);
@@ -4006,8 +4012,18 @@ impl SaeManifoldTerm {
                     }
                 }
                 // Contribution unavailable (decoder-only detector call before any
-                // gated design): keep the subspace verdict rather than lose it.
-                _ => 1.0,
+                // gated design). For a `K ≤ R` candidate the frame-coherence prune
+                // already established output-subspace overlap, so keep that verdict
+                // (1.0); an OVERCOMPLETE candidate was admitted WITHOUT any frame
+                // check, so with no contribution there is no evidence at all — do not
+                // flag it (0.0).
+                _ => {
+                    if overcomplete {
+                        0.0
+                    } else {
+                        1.0
+                    }
+                }
             };
             if contribution_cos > contribution_bar {
                 collapsed.push((j, kk, contribution_cos, contribution_bar));
