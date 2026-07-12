@@ -2384,6 +2384,26 @@ impl SaeManifoldOuterObjective {
         let budget = chunk.saturating_mul(4).max(16);
         let mut spent = 0usize;
         let mut rho_fixed = rho.clone();
+        // Net-descent witness across the cheap probe budget: the KKT residual
+        // after the FIRST chunk. When the probe exhausts its budget WITHOUT
+        // reaching the coarse-KKT gate (the branch below), it must still decide
+        // whether to price on the cheap (`false`, 4×) or the fully-converged
+        // (`true`, 16×/64× progress-gated) refine budget. The analytic gradient
+        // the outer BFGS descends is the implicit derivative through the FULLY
+        // converged inner fixed point (`penalized_quasi_laplace_criterion_with_cache`,
+        // `refine_progress_extension = true`). A value probe that stops at the
+        // cheap budget short of that fixed point prices a DIFFERENT (under-
+        // converged) inner root than the gradient's — at real scale (n≈44k,
+        // ill-conditioned inner solve the coarse budget cannot converge) they
+        // differ by ~1%, so no line-search step descends the value while pointing
+        // down the gradient: BFGS dies with `StepSizeTooSmall` at iteration 1 and
+        // the outer certification refuses ("cost-only value disagrees with
+        // analytic-sample value"). A probe still driving ‖g‖ DOWN at budget
+        // exhaustion is a FEASIBLE slow inner solve — price it at the SAME
+        // converged fixed point the gradient uses. A probe with NO net descent is
+        // stuck/infeasible and keeps the cheap fast-refusing budget, so the #2080
+        // wide-`p` line-search probe-grind does not return.
+        let mut entry_grad_norm: Option<f64> = None;
         loop {
             let grant = chunk.min(budget - spent);
             self.term.run_joint_fit_arrow_schur(
@@ -2412,6 +2432,9 @@ impl SaeManifoldOuterObjective {
                 ));
             }
             let grad_norm = grad_norm_sq.sqrt();
+            if entry_grad_norm.is_none() {
+                entry_grad_norm = Some(grad_norm);
+            }
             let lambda_smooth = rho_fixed.lambda_smooth_vec();
             let quotient_grad_norm =
                 self.term
@@ -2465,11 +2488,18 @@ impl SaeManifoldOuterObjective {
             }
             if spent >= budget {
                 // Gate not met within the probe budget: hand adjudication back
-                // to the shared evaluator, whose objective-stall path is
-                // diagnostic-only and returns the canonical typed
-                // "did not converge" refusal without KKT — warm from the current
-                // partially-refined state. This lane never mints a refusal of
-                // its own for this class.
+                // to the shared evaluator, warm from the current partially-
+                // refined state. A probe that drove the KKT residual DOWN over the
+                // budget is a feasible slow inner solve short of the fixed point —
+                // give it the fully-converged (progress-extended) refine budget so
+                // its VALUE matches the fixed point the analytic gradient
+                // differentiates (else BFGS cannot step; see the `entry_grad_norm`
+                // note above). A probe with NO net descent is stuck/infeasible:
+                // keep the cheap budget, whose objective-stall path is
+                // diagnostic-only and returns the canonical typed "did not
+                // converge" refusal without KKT (this lane never mints a refusal
+                // of its own), so the #2080 wide-`p` probe-grind does not return.
+                let feasible_progress = entry_grad_norm.is_some_and(|entry| grad_norm < entry);
                 return self
                     .term
                     .penalized_quasi_laplace_criterion_with_refine_policy_and_lane(
@@ -2480,7 +2510,7 @@ impl SaeManifoldOuterObjective {
                         self.learning_rate,
                         self.ridge_ext_coord,
                         self.ridge_beta,
-                        false,
+                        feasible_progress,
                         self.surrogate_lane.as_mut(),
                     );
             }

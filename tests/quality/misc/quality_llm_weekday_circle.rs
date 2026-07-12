@@ -210,7 +210,7 @@ fn race_shape(data: &Array2<f64>) -> ShapeVerdict {
         },
         PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Mixture { k: mixture_k }),
-            negative_log_evidence: rung.winner().negative_log_evidence,
+            negative_log_evidence: rung.winner().bic,
             certification: EvidenceCertification::Exact,
             density_provider: mixture_density_provider(data.view(), mixture_k, cfg),
         },

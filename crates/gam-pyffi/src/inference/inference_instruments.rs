@@ -1469,11 +1469,7 @@ mod tests {
             off_line < on_line - 1.0e6,
             "the constrained covariance must penalize its null direction: on={on_line}, off={off_line}"
         );
-        assert!(
-            gaussian_bic_2d(line.view())
-                .unwrap()
-                .is_finite()
-        );
+        assert!(gaussian_bic_2d(line.view()).unwrap().is_finite());
 
         let coincident = Array2::<f64>::from_elem((5, 2), 3.0);
         let error = GaussianFit2d::fit(coincident.view(), &[0, 1, 2, 3, 4])

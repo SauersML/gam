@@ -159,19 +159,15 @@ struct RaceOutcome {
 
 fn run_race(data: &Array2<f64>) -> RaceOutcome {
     let cfg = GaussianMixtureConfig::default();
-    // In-class mixture rung: sweep the fixed ladder, pick the rank-aware
-    // Laplace-evidence winner.
+    // In-class mixture rung: sweep the fixed ladder and pick the BIC winner.
     let rung = fit_mixture_rung(data.view(), MIXTURE_K_LADDER, cfg)
         .expect("mixture rung must fit at least one order");
     let mix_winner = rung.winner();
     let mixture_k = mix_winner.k;
-    let mixture_evidence = mix_winner.negative_log_evidence;
+    let mixture_evidence = mix_winner.bic;
 
-    // Smooth-circle rank-aware evidence: a 2-parameter ring model (r_bar,
-    // sigma_r) plus uniform angle. Score on the SAME negative-log-evidence
-    // scale: -loglik + 1/2 P log(n) is the BIC-form Laplace; here we report the
-    // closed-form ring evidence as corroboration only (the headline is
-    // stacking).
+    // Smooth-circle BIC: a 2-parameter ring model (r_bar, sigma_r) plus
+    // uniform angle. This is corroboration only (the headline is stacking).
     let circle_evidence = ring_negative_log_evidence(data.view());
 
     let circle_provider = ring_density_provider(data.view());
@@ -342,11 +338,7 @@ fn mixture_rung_prices_order_by_free_parameters() {
             "mixture k={} free-parameter count must be (k-1) + k*d + k*d(d+1)/2",
             fit.k
         );
-        assert!(
-            fit.negative_log_evidence.is_finite(),
-            "rank-aware Laplace evidence must be finite for k={}",
-            fit.k
-        );
+        assert!(fit.bic.is_finite(), "BIC must be finite for k={}", fit.k);
     }
 }
 

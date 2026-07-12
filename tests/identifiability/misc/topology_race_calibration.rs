@@ -184,7 +184,7 @@ fn run_race(data: &Array2<f64>) -> Draw {
         },
         PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Mixture { k: mix_winner.k }),
-            negative_log_evidence: mix_winner.negative_log_evidence,
+            negative_log_evidence: mix_winner.bic,
             certification: EvidenceCertification::Exact,
             density_provider: mixture_density_provider(data.view(), mix_winner.k, cfg),
         },
@@ -205,7 +205,7 @@ fn run_race(data: &Array2<f64>) -> Draw {
     Draw {
         circle_won,
         winner_weight: stacking.weights[verdict.winner_index],
-        log_bf_circle_over_mixture: mix_winner.negative_log_evidence - circle_nle,
+        log_bf_circle_over_mixture: mix_winner.bic - circle_nle,
     }
 }
 

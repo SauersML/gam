@@ -410,7 +410,7 @@ def run_concept(model, tok, gamfit_mod, concept: str, words, rec_templates,
             seed=seed + 11,
             matched_controls=False,
         ))
-        verdict.pop("negative_log_evidence", None)
+        verdict.pop("bic", None)
     except Exception as exc:  # noqa: BLE001
         verdict = {"error": f"{type(exc).__name__}: {exc}"}
     # Diagnose the class that owns the verdict. A circular class win uses the

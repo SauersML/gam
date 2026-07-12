@@ -1392,7 +1392,7 @@ impl MixtureRungResult {
 /// and stops as soon as the running winner is bracketed (both immediate
 /// neighbours fitted and worse), so this cap only binds on a pathological
 /// BIC profile that keeps improving monotonically past the ladder — a
-/// regime the rank-aware parameter pricing rules out for any real cluster
+/// regime the BIC parameter price rules out for any real cluster
 /// structure. It exists so the sweep stays a bounded pure function of the
 /// data, never a runaway loop.
 pub const MIXTURE_REFINEMENT_MAX_PROBES: usize = 16;
@@ -1434,12 +1434,16 @@ pub fn fit_mixture_rung(
             Ok(fit) => {
                 let num_parameters = fit.num_free_parameters();
                 let bic = fit.bic();
-                fits.push(MixtureRungFit {
-                    k,
-                    fit,
-                    num_parameters,
-                    bic,
-                });
+                if bic.is_finite() {
+                    fits.push(MixtureRungFit {
+                        k,
+                        fit,
+                        num_parameters,
+                        bic,
+                    });
+                } else {
+                    errors.push(format!("mixture k={k} BIC is not finite"));
+                }
             }
             Err(e) => errors.push(format!("mixture k={k} fit: {e}")),
         }
@@ -1545,12 +1549,19 @@ pub fn fit_ring_of_clusters_rung(
             return;
         }
         match crate::evidence::fit_ring_gaussian_mixture(data, k, config) {
-            Ok(fit) => fits.push(RingOfClustersRungFit {
-                k,
-                num_parameters: fit.num_free_parameters(),
-                bic: fit.bic(),
-                fit,
-            }),
+            Ok(fit) => {
+                let bic = fit.bic();
+                if bic.is_finite() {
+                    fits.push(RingOfClustersRungFit {
+                        k,
+                        num_parameters: fit.num_free_parameters(),
+                        bic,
+                        fit,
+                    });
+                } else {
+                    errors.push(format!("ring-of-clusters k={k} BIC is not finite"));
+                }
+            }
             Err(error) => errors.push(format!("ring-of-clusters k={k} fit: {error}")),
         }
     };
@@ -1612,26 +1623,20 @@ pub fn fit_ring_of_clusters_rung(
 // ===========================================================================
 
 /// One fitted entry of the structured-union rung: the composite structure, its
-/// summed rank-aware Laplace **negative** log evidence (the SUM `Σ_c V_c` of its
-/// components, each scored through the identical [`crate::evidence::laplace_evidence`]
-/// entry point used by the smooth rungs and the mixture rung), and the TOTAL
-/// free-parameter count across components (the complexity price). Lower
-/// negative-log-evidence wins.
+/// summed component BIC/2, and the total free-parameter count across components.
+/// Lower is better.
 #[derive(Debug, Clone)]
 pub struct UnionRungFit {
     pub structure: UnionStructure,
     pub fit: UnionStructureFit,
-    /// `Σ_c P_c` — total free-parameter count across all components. This is the
-    /// complexity quantity that the summed `+ ½ Σ_c P_c log(2π)` normalizer
-    /// charges, so a union is strictly more expensive than either pure rung.
+    /// `Σ_c P_c` — total free-parameter count across all components.
     pub total_parameters: usize,
-    /// `Σ_c V_c` — summed rank-aware Laplace negative log evidence.
+    /// Summed component BIC/2.
     pub negative_log_evidence: f64,
 }
 
 /// Result of fitting the whole fixed union ladder: every fitted composite plus
-/// the index of the in-class winner (lowest summed rank-aware Laplace
-/// negative-log-evidence).
+/// the index of the in-class winner (lowest summed BIC).
 #[derive(Debug, Clone)]
 pub struct UnionRungResult {
     pub fits: Vec<UnionRungFit>,
@@ -1646,10 +1651,9 @@ impl UnionRungResult {
 
 /// Fit the structured-union rung over the FIXED ladder
 /// [`crate::evidence::UNION_STRUCTURE_LADDER`] and rank in-class by
-/// summed rank-aware Laplace evidence. Each composite is hard-split into one
+/// summed BIC. Each composite is hard-split into one
 /// responsibility group per component (reusing the mixture rung's deterministic
-/// seeding + EM), each component is REML/Laplace-fit on its group, and the
-/// per-component evidences are SUMMED. Composites whose groups are too small to
+/// seeding + EM), and each component is fit on its group. Composites whose groups are too small to
 /// identify their structure are skipped (they never enter the race rather than
 /// scoring spuriously well). Deterministic: the split and the component fits are
 /// pure functions of the data.
@@ -1658,7 +1662,7 @@ pub fn fit_union_rung(
     config: GaussianMixtureConfig,
 ) -> Result<UnionRungResult, String> {
     // `fit_union_ladder` already fits the fixed ladder and ranks best-first by
-    // summed rank-aware evidence (cheaper composite wins ties). Re-wrap each
+    // summed BIC (cheaper composite wins ties). Re-wrap each
     // fit with its complexity price for the rung view.
     let ladder = fit_union_ladder(data, config)?;
     let fits: Vec<UnionRungFit> = ladder

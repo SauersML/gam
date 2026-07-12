@@ -223,7 +223,7 @@ fn run_race(data: &Array2<f64>) -> Verdict {
         },
         PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Mixture { k: mixture_k }),
-            negative_log_evidence: mix_winner.negative_log_evidence,
+            negative_log_evidence: mix_winner.bic,
             certification: EvidenceCertification::Exact,
             density_provider: mixture_density_provider(data.view(), mixture_k, cfg),
         },

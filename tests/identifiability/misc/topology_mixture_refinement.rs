@@ -104,12 +104,7 @@ fn fit(data: &Array2<f64>) -> MixtureRungResult {
 /// not by creeping or by the probe cap.
 fn assert_bracketed(rung: &MixtureRungResult, label: &str) {
     let winner = rung.winner();
-    let nle_of = |k: usize| -> Option<f64> {
-        rung.fits
-            .iter()
-            .find(|f| f.k == k)
-            .map(|f| f.negative_log_evidence)
-    };
+    let nle_of = |k: usize| -> Option<f64> { rung.fits.iter().find(|f| f.k == k).map(|f| f.bic) };
     if winner.k > 1 {
         let lower = nle_of(winner.k - 1).unwrap_or_else(|| {
             panic!(
@@ -118,10 +113,10 @@ fn assert_bracketed(rung: &MixtureRungResult, label: &str) {
             )
         });
         assert!(
-            lower > winner.negative_log_evidence,
+            lower > winner.bic,
             "{label}: lower neighbour k={} must score worse ({lower:.2} vs {:.2})",
             winner.k - 1,
-            winner.negative_log_evidence
+            winner.bic
         );
     }
     let upper = nle_of(winner.k + 1).unwrap_or_else(|| {
@@ -131,10 +126,10 @@ fn assert_bracketed(rung: &MixtureRungResult, label: &str) {
         )
     });
     assert!(
-        upper > winner.negative_log_evidence,
+        upper > winner.bic,
         "{label}: upper neighbour k={} must score worse ({upper:.2} vs {:.2})",
         winner.k + 1,
-        winner.negative_log_evidence
+        winner.bic
     );
 }
 

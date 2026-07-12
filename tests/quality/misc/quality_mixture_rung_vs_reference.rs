@@ -347,40 +347,31 @@ emit("best_bic", [best_bic])
 
 // ---------------------------------------------------------------------------
 // Shared race construction: build the cross-class candidate list (one smooth
-// circle + the full mixture ladder), each carrying its rank-aware Laplace
-// negative-log-evidence and a per-fold held-out-density provider, then hand it to
-// gam's adjudicator.
+// circle + the full mixture ladder), each carrying its BIC-form corroborating
+// score and a per-fold held-out-density provider, then hand it to gam's
+// adjudicator.
 // ---------------------------------------------------------------------------
 
-/// One mixture order's rank-aware Laplace negative-log-evidence, looked up from
-/// the in-class fit so the cross-class candidate carries the SAME corroboration
-/// scalar the same-class path would.
+/// One mixture order's BIC score, matching the in-class rung criterion.
 fn mixture_nle_for_k(
     data: ArrayView2<'_, f64>,
     k: usize,
     cfg: GaussianMixtureConfig,
 ) -> Result<f64, String> {
     let fit = fit_gaussian_mixture(data, k, cfg).map_err(|error| error.to_string())?;
-    fit.laplace_negative_log_evidence(data)
+    Ok(fit.bic())
 }
 
-/// A continuous-circle negative-log-evidence on a comparable scale: the
-/// full-data negative total log predictive density of the ring model plus a
-/// rank-aware `½·P·log(2π)`-style parameter price for its `P = 4` free
-/// parameters (center 2, radius 1, radial std 1). This is corroboration only —
-/// the headline for the cross-class race is stacking, not this scalar — but it
-/// keeps the candidate's `negative_log_evidence` on the same axis as the
-/// mixtures'.
+/// A continuous-circle BIC/2 on the same scale as the mixtures, with `P = 4`
+/// free parameters (center 2, radius 1, radial std 1). This is corroboration
+/// only; the cross-class headline is stacking.
 fn circle_nle(data: ArrayView2<'_, f64>) -> Result<f64, String> {
     let ring = CircleRingDensity::fit(data)?;
     let total_log_dens: f64 = (0..data.nrows())
         .map(|i| ring.log_density(data[[i, 0]], data[[i, 1]]))
         .sum();
     const CIRCLE_FREE_PARAMS: f64 = 4.0;
-    const LOG_2PI: f64 = 1.8378770664093453_f64;
-    // −V = loglik − ½ P log(2π) on the smooth-rung sign convention → negate to a
-    // "lower is better" negative-log-evidence: NLE = −loglik + ½ P log(2π).
-    Ok(-total_log_dens + 0.5 * CIRCLE_FREE_PARAMS * LOG_2PI)
+    Ok(-total_log_dens + 0.5 * CIRCLE_FREE_PARAMS * (data.nrows() as f64).ln())
 }
 
 /// Build the cross-class candidate vector: smooth circle + every mixture order in

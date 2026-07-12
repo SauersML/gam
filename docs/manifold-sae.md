@@ -476,8 +476,8 @@ are reporting/deployment fits and never choose an outer predictive model. The
 same training rows alone determine the fold's translation and RMS gauge, which
 is applied to its evaluation rows with the common Cartesian Jacobian restored;
 held-out outliers therefore cannot activate a mixture covariance floor through
-preprocessing. The
-two mixture rungs also carry certified, rank-aware Laplace evidence.
+preprocessing. All four reporting fits also carry BIC/2 corroboration on the
+common `-loglik + P log(n)/2` scale.
 `winner_class` names the best predictive model-selection procedure, while
 `reporting_winner` names its all-data fitted representative. The circular
 topology verdict instead aggregates
@@ -511,7 +511,7 @@ Returns a dict:
 | `mixture_fold_selected_k` / `ring_clusters_fold_selected_k` | training-only order selected in each outer fold |
 | `mixture_fold_k_histogram` / `ring_clusters_fold_k_histogram` | counts of the fold-local orders, for stability/provenance |
 | `candidate_names` / `stacking_weights` | injective predictive-column names (`"circle"`, `"euclidean"`, `"mixture_class"`, `"ring_clusters_class"`) and held-out stacking weights |
-| `negative_log_evidence` | per-candidate rank-aware negative log evidence |
+| `bic` | per-candidate BIC/2 corroborating score, `-loglik + P log(n)/2` |
 | `headline` | `"stacking"` or `"evidence"` — which criterion produced the verdict |
 | `is_cross_class` | bool, the race crossed shape classes |
 | `matched_controls` | full verdicts after shuffling these supplied coordinates and replacing them by a covariance-matched Gaussian |

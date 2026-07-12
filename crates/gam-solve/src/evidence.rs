@@ -1579,7 +1579,7 @@ fn mixture_m_step(
         .any(|mass| !mass.is_finite() || *mass <= 0.0)
     {
         return Err(
-            "M-step reached a zero-mass component; the requested mixture order is on a singular boundary and has no interior Laplace evidence"
+            "M-step reached a zero-mass component; the requested mixture order has no interior fitted density"
                 .to_string(),
         );
     }
@@ -2257,15 +2257,10 @@ pub fn fit_ring_gaussian_mixture(
 // structures than by any single pure rung.
 //
 // Each component is fit on its responsibility group as its own parametric
-// generative density and scored through the SAME rank-aware Laplace /
-// Tierney-Kadane normalizer used by the smooth rungs and the mixture rung:
-// `−V_c = loglik_c − ½ log|H_c| + ½ P_c log(2π)` with `H_c` the observed
-// empirical-Fisher (BHHH) information `Σ s_i s_iᵀ` at the component optimum
-// (`rank(S)=0`, fully likelihood-identified). The union's evidence is the SUM
-// `V = Σ_c V_c` (the components partition the rows, so their log-likelihoods
-// add and their Hessians are block-diagonal — `log|H| = Σ_c log|H_c|`). The
-// complexity price is the TOTAL free-parameter count across all components,
-// which is exactly what the summed `+ ½ Σ_c P_c log(2π)` normalizer charges.
+// generative density and scored by BIC/2, the same invariant criterion used by
+// every other parametric shape candidate. The union's score is the sum of its
+// component scores. Its complexity price is therefore the total
+// `½ Σ_c P_c log(n_c)` over responsibility groups.
 // A union is therefore strictly more expensive than either pure component, so
 // it can only win when the structured split buys enough likelihood to pay for
 // its extra parameters — the negative-control discipline of #907.
@@ -2335,7 +2330,7 @@ impl UnionStructure {
 
 /// One fitted component of a union: its pinned structure, the rows it owns
 /// (after the hard responsibility split), its free-parameter count, and its
-/// rank-aware Laplace negative-log-evidence on the common scale.
+/// BIC-form negative-log-evidence on the common scale.
 #[derive(Debug, Clone)]
 pub struct UnionComponentFit {
     pub kind: UnionComponentKind,
@@ -2345,13 +2340,13 @@ pub struct UnionComponentFit {
 }
 
 /// A fitted structured-union candidate: the composite kind, the per-component
-/// fits, the SUMMED rank-aware Laplace negative-log-evidence, and the TOTAL
+/// fits, the summed BIC-form negative-log-evidence, and the total
 /// free-parameter count across components (the complexity price).
 #[derive(Debug, Clone)]
 pub struct UnionStructureFit {
     pub structure: UnionStructure,
     pub components: Vec<UnionComponentFit>,
-    /// `Σ_c V_c` — summed rank-aware Laplace negative-log-evidence (lower wins).
+    /// Summed component BIC/2 (lower wins).
     pub negative_log_evidence: f64,
     /// `Σ_c P_c` — total free-parameter count across components.
     pub total_parameters: usize,
@@ -2410,8 +2405,8 @@ pub fn union_responsibility_split(
 }
 
 /// Fit one structured-union candidate: hard-split the rows into one group per
-/// component, fit each component's pinned density, and SUM the rank-aware
-/// Laplace negative-log-evidence. The complexity price is the total
+/// component, fit each component's pinned density, and sum BIC/2. The
+/// complexity price is the total
 /// free-parameter count across components.
 ///
 /// Returns an error if any component group is too small to identify its
@@ -2455,8 +2450,8 @@ pub fn fit_union_structure(
     })
 }
 
-/// Fit the whole fixed union ladder and rank in-class by summed rank-aware
-/// Laplace evidence (lower wins). Composites that fail to fit (e.g. a group too
+/// Fit the whole fixed union ladder and rank in-class by summed BIC (lower
+/// wins). Composites that fail to fit (e.g. a group too
 /// small to identify a circle) are skipped. Returns the fitted ladder sorted
 /// best-first.
 pub fn fit_union_ladder(
@@ -2509,7 +2504,7 @@ fn gather_union_rows(data: ArrayView2<'_, f64>, idx: &[usize]) -> Array2<f64> {
 }
 
 /// Fit a single union component density on its responsibility group and return
-/// `(rank_aware_negative_log_evidence, free_parameter_count)`. `Line` and
+/// `(bic, free_parameter_count)`. `Line` and
 /// `PointCluster` use the full-covariance Gaussian density (a single mixture
 /// component); `Circle` uses the radius/angle generative density below.
 fn fit_union_component(
@@ -2519,9 +2514,8 @@ fn fit_union_component(
 ) -> Result<(f64, usize), String> {
     match kind {
         UnionComponentKind::Line | UnionComponentKind::PointCluster => {
-            // A single full-covariance Gaussian is the k=1 mixture: reuse its
-            // exact rank-aware Laplace evidence so a union component is on the
-            // identical scale as a mixture component.
+            // A single full-covariance Gaussian is the k=1 mixture, so reuse
+            // its exact BIC calculation.
             if group.nrows() < group.ncols() + 1 {
                 return Err(format!(
                     "union gaussian component needs >= {} rows, got {}",
@@ -2530,20 +2524,17 @@ fn fit_union_component(
                 ));
             }
             let fit = fit_gaussian_mixture(group, 1, config).map_err(|error| error.to_string())?;
-            let nle = fit.laplace_negative_log_evidence(group)?;
-            Ok((nle, fit.num_free_parameters()))
+            Ok((fit.bic(), fit.num_free_parameters()))
         }
         UnionComponentKind::Circle => fit_circle_component_evidence(group, config),
     }
 }
 
-/// Rank-aware Laplace negative-log-evidence of a 2-D *circle* component: data is
+/// BIC/2 of a 2-D *circle* component: data is
 /// modelled as `(r, θ)` with `r ~ N(ρ, σ_r²)` around a fitted center+radius and
 /// `θ` uniform on the circle. Free parameters: center `(cx, cy)`, radius `ρ`,
 /// radial variance `σ_r²` — `P = 4`. The angle is an ancillary uniform with no
-/// free parameter (it carries `−log(2π r)` of density). The Hessian is the
-/// observed empirical-Fisher `I + Σ s_i s_iᵀ` in `(cx, cy, ρ, log σ_r²)`
-/// coordinates, fed through the SAME [`laplace_evidence`] entry point.
+/// free parameter (it carries `−log(2π r)` of density).
 fn fit_circle_component_evidence(
     group: ArrayView2<'_, f64>,
     config: GaussianMixtureConfig,
@@ -2601,64 +2592,11 @@ fn fit_circle_component_evidence(
         let angular = -(log_2pi + r.max(f64::MIN_POSITIVE).ln());
         loglik += radial + angular;
     }
-    // Observed empirical-Fisher in (cx, cy, ρ, s) with s = log σ_r².
-    // Per-row scores:
-    //   ∂/∂cx log = (e/σ_r²) · (−dx/r)            (r decreases as center moves +x toward point)
-    //   ∂/∂cy log = (e/σ_r²) · (−dy/r)
-    //   ∂/∂ρ  log = e/σ_r²
-    //   ∂/∂s  log = −½ + e²/(2σ_r²)               (s = log σ_r²)
-    let mut info = Array2::<f64>::zeros((p, p));
-    let mut score = [0.0_f64; 4];
-    for i in 0..n {
-        let dx = group[[i, 0]] - cx;
-        let dy = group[[i, 1]] - cy;
-        let r = radii[i].max(f64::MIN_POSITIVE);
-        let e = radii[i] - radius;
-        let ee = e * inv_var;
-        score[0] = ee * (-dx / r);
-        score[1] = ee * (-dy / r);
-        score[2] = ee;
-        score[3] = -0.5 + 0.5 * e * e * inv_var;
-        for a in 0..p {
-            let sa = score[a];
-            if sa == 0.0 {
-                continue;
-            }
-            for b in 0..p {
-                info[[a, b]] += sa * score[b];
-            }
-        }
+    let bic = -loglik + 0.5 * p as f64 * (n as f64).ln();
+    if !bic.is_finite() {
+        return Err("union circle component BIC is not finite".to_string());
     }
-    // Symmetrize and add the unit-information prior ridge `I` (same fixed prior
-    // as the mixture path) so `log|H|` is well-defined for any `n`.
-    for a in 0..p {
-        for b in (a + 1)..p {
-            let avg = 0.5 * (info[[a, b]] + info[[b, a]]);
-            info[[a, b]] = avg;
-            info[[b, a]] = avg;
-        }
-        info[[a, a]] += 1.0;
-    }
-    let apply_info = |x: &[f64]| -> Vec<f64> {
-        let mut out = vec![0.0_f64; p];
-        for r in 0..p {
-            let mut acc = 0.0_f64;
-            for c in 0..p {
-                acc += info[[r, c]] * x[c];
-            }
-            out[r] = acc;
-        }
-        out
-    };
-    let hvp = EvidenceHvpLogDet {
-        dim: p,
-        apply: &apply_info,
-    };
-    let v = laplace_evidence(EvidenceLogDetSource::Hvp(hvp), 0.0, -loglik, p as f64, 0.0);
-    if !v.is_finite() {
-        return Err("union circle component Laplace evidence is not finite".to_string());
-    }
-    Ok((v, p))
+    Ok((bic, p))
 }
 
 /// A fitted union component as a *predictive density* (not just an evidence
@@ -5120,8 +5058,7 @@ mod tests {
         // tolerance.
         let objective_scale = 1.0;
         let recorded_step = -1.4e-13;
-        let uncertainty =
-            gaussian_mixture_monotonicity_uncertainty(objective_scale, 0.0, 0.0);
+        let uncertainty = gaussian_mixture_monotonicity_uncertainty(objective_scale, 0.0, 0.0);
         let certificate = GaussianMixtureCertificate {
             mean_log_likelihood: -objective_scale,
             mean_log_likelihood_gain: recorded_step,
@@ -5174,9 +5111,7 @@ mod tests {
             (f64::EPSILON.sqrt() * objective_scale).max(recorded_reduction_bound),
             "reported uncertainty must come from the composite-map and reduction bounds"
         );
-        assert!(
-            certificate.mean_log_likelihood_gain >= -certificate.monotonicity_uncertainty
-        );
+        assert!(certificate.mean_log_likelihood_gain >= -certificate.monotonicity_uncertainty);
         assert!(certificate.objective_residual <= certificate.objective_tolerance);
         assert!(certificate.parameter_residual <= certificate.parameter_tolerance);
     }
@@ -5306,10 +5241,32 @@ mod tests {
             assert!((resumed - uninterrupted).abs() <= 1.0e-10);
         }
 
-        assert!(
-            resumed
-                .laplace_negative_log_evidence(other_data.view())
-                .is_err()
+        assert!(resumed.bic().is_finite());
+    }
+
+    #[test]
+    fn gaussian_mixture_bic_is_finite_with_an_active_covariance_floor() {
+        // Component zero is exactly one-dimensional: its x coordinate never
+        // changes, so the constrained MLE has one covariance eigenvalue at the
+        // configured floor. The old BHHH determinant had identically-zero
+        // mean-x and covariance-xy score columns and therefore rejected this
+        // perfectly valid constrained predictive density as non-SPD.
+        let per_cluster = 45usize;
+        let mut data = Array2::<f64>::zeros((2 * per_cluster, 2));
+        for sample in 0..per_cluster {
+            let phase = std::f64::consts::TAU * sample as f64 / per_cluster as f64;
+            data[[2 * sample, 0]] = -2.0;
+            data[[2 * sample, 1]] = 0.08 * phase.sin();
+            data[[2 * sample + 1, 0]] = 2.0 + 0.12 * phase.cos();
+            data[[2 * sample + 1, 1]] = 0.08 * phase.sin();
+        }
+        let fit = fit_gaussian_mixture(data.view(), 2, GaussianMixtureConfig::default())
+            .expect("the covariance floor defines a valid constrained mixture fit");
+        let bic = fit.bic();
+        assert!(bic.is_finite());
+        assert_eq!(
+            bic,
+            -fit.loglik + 0.5 * fit.num_free_parameters() as f64 * (data.nrows() as f64).ln()
         );
     }
 
@@ -5351,16 +5308,48 @@ mod tests {
         assert!((fit.center()[1] + 0.3).abs() < 0.05);
         assert!((fit.radius() - 2.0).abs() < 0.05);
         assert!(fit.variance().is_finite() && fit.variance() > 0.0);
-        assert!(fit
-            .per_point_log_density(data.view())
-            .unwrap()
-            .iter()
-            .all(|value| value.is_finite()));
-        assert!(fit.laplace_negative_log_evidence(data.view()).unwrap().is_finite());
+        assert!(
+            fit.per_point_log_density(data.view())
+                .unwrap()
+                .iter()
+                .all(|value| value.is_finite())
+        );
+        assert!(fit.bic().is_finite());
 
         let free = fit_gaussian_mixture(data.view(), 7, config).unwrap();
         assert_eq!(free.num_free_parameters(), 41);
         assert!(fit.num_free_parameters() < free.num_free_parameters());
+    }
+
+    #[test]
+    fn ring_certificate_uses_identifiable_component_means() {
+        // The points (.3, ±sqrt(.91)) lie on both unit circles centered at
+        // (0, 0) and (.6, 0). Repeating one point gives three labelled
+        // components. Thus center and directions move by O(1) while every
+        // component mean—and therefore the represented mixture density—is
+        // bit-identical.
+        let y = 0.91_f64.sqrt();
+        let weights = Array1::from_vec(vec![0.2, 0.3, 0.5]);
+        let previous = RingMixtureState {
+            weights: weights.clone(),
+            center: Array1::from_vec(vec![0.0, 0.0]),
+            radius: 1.0,
+            directions: Array2::from_shape_vec((3, 2), vec![0.3, y, 0.3, -y, 0.3, y]).unwrap(),
+            variance: 0.25,
+            mean_log_likelihood: -1.0,
+            completed_iterations: 10,
+        };
+        let next = RingMixtureState {
+            weights,
+            center: Array1::from_vec(vec![0.6, 0.0]),
+            radius: 1.0,
+            directions: Array2::from_shape_vec((3, 2), vec![-0.3, y, -0.3, -y, -0.3, y]).unwrap(),
+            variance: 0.25,
+            mean_log_likelihood: -1.0,
+            completed_iterations: 11,
+        };
+        assert!(relative_parameter_step(previous.center[0], next.center[0]) > 0.5);
+        assert_eq!(ring_identifiable_parameter_residual(&previous, &next), 0.0);
     }
 
     #[test]
