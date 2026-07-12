@@ -76,6 +76,89 @@ use gam_solve::pirls::dense_block_xtwx;
 use ndarray::{Array1, Array2, Array3, ArrayView2};
 use std::sync::{Arc, Mutex};
 
+/// Production [`gam_math::jet_tower::RowProgram`] for one reference-coded
+/// multinomial-logit row.
+///
+/// Active-class logits are the `M` primaries and class `M` is the implicit
+/// reference with logit zero. The generic row NLL is the mechanical tower
+/// oracle for the retained normalized-softmax/Fisher lowerings in this module;
+/// production parity tests invoke this type directly rather than restating its
+/// expression under `cfg(test)`.
+#[derive(Clone, Copy, Debug)]
+pub struct MultinomialLogitRowProgram<const M: usize> {
+    eta: [f64; M],
+    observed_class: usize,
+    weight: f64,
+}
+
+impl<const M: usize> MultinomialLogitRowProgram<M> {
+    /// Construct one validated row. `observed_class == M` selects the implicit
+    /// reference class.
+    pub fn new(eta: [f64; M], observed_class: usize, weight: f64) -> Result<Self, String> {
+        if M == 0 {
+            return Err("MultinomialLogitRowProgram requires at least one active class".into());
+        }
+        if observed_class > M {
+            return Err(format!(
+                "MultinomialLogitRowProgram observed class {observed_class} exceeds reference class {M}"
+            ));
+        }
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(format!(
+                "MultinomialLogitRowProgram weight must be finite and non-negative, got {weight}"
+            ));
+        }
+        if let Some((axis, value)) = eta
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(format!(
+                "MultinomialLogitRowProgram eta[{axis}] must be finite, got {value}"
+            ));
+        }
+        Ok(Self {
+            eta,
+            observed_class,
+            weight,
+        })
+    }
+
+    fn require_row(row: usize) -> Result<(), String> {
+        if row != 0 {
+            return Err(format!(
+                "MultinomialLogitRowProgram holds exactly one row; got row {row}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<const M: usize> gam_math::jet_tower::RowProgram<M> for MultinomialLogitRowProgram<M> {
+    fn n_rows(&self) -> usize {
+        1
+    }
+
+    fn primaries(&self, row: usize) -> Result<[f64; M], String> {
+        Self::require_row(row)?;
+        Ok(self.eta)
+    }
+
+    fn eval<S: JetScalar<M>>(&self, row: usize, p: &[S; M]) -> Result<S, String> {
+        Self::require_row(row)?;
+        let mut normalizer = S::constant(1.0);
+        for primary in p {
+            normalizer = normalizer.add(&primary.exp());
+        }
+        let mut nll = normalizer.ln().scale(self.weight);
+        if self.observed_class < M {
+            nll = nll.sub(&p[self.observed_class].scale(self.weight));
+        }
+        Ok(nll)
+    }
+}
+
 /// Nilpotent coefficient selected from the canonical multinomial perturbation
 /// program below. `OneSeed<0>` selects the first directional derivative;
 /// `TwoSeed<0>` selects the mixed second directional derivative. There are no
@@ -2329,50 +2412,10 @@ mod tests {
     /// coefficient loud without retaining separate production calculus.
     mod jet_single_source_932 {
         use super::*;
-        use gam_math::jet_scalar::JetScalar;
         use gam_math::jet_tower::{
-            RowProgram, program_fourth_contracted, program_row_kernel, program_third_contracted,
+            program_fourth_contracted, program_row_kernel, program_third_contracted,
         };
         use std::sync::Arc;
-
-        /// The multinomial-logit row NLL written ONCE through the jet scalar:
-        /// `ℓ(η) = w·ln(1 + Σ_a e^{η_a}) − w·η_obs`. The active-class log-odds are
-        /// the `M` primaries; the reference class `M` is pinned at `η ≡ 0`.
-        struct MultinomialJetRow<const M: usize> {
-            eta: [f64; M],
-            obs: usize,
-            w: f64,
-        }
-
-        impl<const M: usize> RowProgram<M> for MultinomialJetRow<M> {
-            fn n_rows(&self) -> usize {
-                1
-            }
-            fn primaries(&self, row: usize) -> Result<[f64; M], String> {
-                if row != 0 {
-                    return Err(format!(
-                        "MultinomialJetRow holds exactly one row; got row {row}"
-                    ));
-                }
-                Ok(self.eta)
-            }
-            fn eval<S: JetScalar<M>>(&self, row: usize, p: &[S; M]) -> Result<S, String> {
-                if row != 0 {
-                    return Err(format!(
-                        "MultinomialJetRow holds exactly one row; got row {row}"
-                    ));
-                }
-                let mut z = S::constant(1.0);
-                for a in 0..M {
-                    z = z.add(&p[a].exp());
-                }
-                let mut ell = z.ln().scale(self.w);
-                if self.obs < M {
-                    ell = ell.sub(&p[self.obs].scale(self.w));
-                }
-                Ok(ell)
-            }
-        }
 
         /// Build a single-row `K = M + 1` family with the design collapsed to the
         /// `1×1` identity (`P = 1`, `X = [[1.0]]`), so the coefficient-space
@@ -2487,7 +2530,8 @@ mod tests {
                 let obs = trial % (M + 1);
                 let w = rng.uniform(0.25, 2.5);
                 let family = single_row_family(obs, w, M + 1);
-                let prog = MultinomialJetRow { eta, obs, w };
+                let prog = crate::multinomial_reml::MultinomialLogitRowProgram::new(eta, obs, w)
+                    .expect("valid multinomial row program");
 
                 // ── Jet ORACLE vs LIVE production (≤1e-9) ──────────────────────
                 let (jet_v, jet_g, jet_h) = program_row_kernel(&prog, 0).expect("jet row kernel");
