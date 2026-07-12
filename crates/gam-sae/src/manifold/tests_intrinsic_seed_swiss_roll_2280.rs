@@ -136,7 +136,10 @@ fn chart_of(seed: &ndarray::Array3<f64>) -> Array2<f64> {
 /// well below it. The gap is the whole point of the seeder.
 #[test]
 fn swiss_roll_intrinsic_seed_reconstructs_where_pca_folds() {
-    let z = swiss_roll(40, 14, 3.0, 13.0);
+    // Dense lattice: enough height resolution that a kNN-in-latent decoder on the
+    // UNFOLDED chart reconstructs the height channel tightly (intrinsic R² → 1),
+    // while the PCA-2 chart drops height entirely (PC3) regardless of density.
+    let z = swiss_roll(44, 22, 3.0, 13.0);
     let kinds = vec![SaeAtomBasisKind::Linear];
     let dims = vec![2usize];
 
