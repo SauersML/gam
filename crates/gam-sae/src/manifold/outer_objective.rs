@@ -436,12 +436,6 @@ pub struct OuterProbeTelemetry {
     /// budget and were RESCUED by a one-shot retry at the accepted-point drive
     /// (full budget) instead of being misclassified as the infeasibility wall.
     pub budget_rescued_value_probes: usize,
-    /// Inner Newton iteration GRANTS issued by the line-search value-probe lane
-    /// (`line_search_probe_criterion`): the sum of
-    /// `run_joint_fit_arrow_schur` iteration budgets handed out across its
-    /// chunks. Grants spent inside the streaming/freeze evaluator or after the
-    /// exact probe budget is exhausted are not observable from this lane.
-    pub probe_inner_iterations: usize,
     /// Basin-bundle lower-envelope telemetry (see [`BasinBundle`]). The outer
     /// value lanes evaluate `V*(ρ) = min_b V_b(ρ)` over a memory-admitted bundle of saved
     /// inner basins instead of the single hysteretic warm-start trajectory
@@ -534,10 +528,6 @@ enum ProbeInnerDrive {
     /// `penalized_quasi_laplace_criterion_with_refine_policy` (accepted-basin evaluations, the
     /// cross-seed ranking / EFS value lane, streaming fits).
     Criterion { refine_progress_extension: bool },
-    /// Exact line-search probe lane (`line_search_probe_criterion`): chunked
-    /// inner Newton with the same full KKT stationarity gate as accepted-point
-    /// evaluations, plus probe-lane iteration telemetry.
-    LineSearchProbe,
 }
 
 /// #2231 Inc-B (stage 1) — crosscoder block-relevance PRICING state.
@@ -2183,10 +2173,9 @@ impl SaeManifoldOuterObjective {
     }
 
     /// As [`Self::evaluate_with_refine_policy`], but with the inner `(t, β)`
-    /// drive selected by [`ProbeInnerDrive`]: the historical criterion drive or
-    /// the exact line-search probe lane ([`Self::line_search_probe_criterion`]).
-    /// Everything around the inner drive — the probe handoff install, seeded-β
-    /// warm start, amortized latent warm start, and collapse ledger — is shared.
+    /// drive selected by [`ProbeInnerDrive`]. Everything around the inner drive —
+    /// the probe handoff install, seeded-β warm start, amortized latent warm
+    /// start, and collapse ledger — is shared.
     fn evaluate_with_inner_drive(
         &mut self,
         rho_flat: ArrayView1<'_, f64>,
@@ -2270,7 +2259,6 @@ impl SaeManifoldOuterObjective {
                     refine_progress_extension,
                     self.surrogate_lane.as_mut(),
                 )?,
-            ProbeInnerDrive::LineSearchProbe => self.line_search_probe_criterion(&rho)?,
         };
         let beta_hat = self.term.flatten_beta();
         // ONE criterion everywhere. Every outer lane — BFGS/ARC descent, the
@@ -2308,183 +2296,6 @@ impl SaeManifoldOuterObjective {
         self.current_rho = rho;
         self.last_loss = Some(loss);
         Ok((cost, beta_hat))
-    }
-
-    /// Joint inner KKT gradient norm² read straight off the assembled system —
-    /// bit-identical arithmetic to the stationarity residual
-    /// `converge_inner_for_undamped_logdet` computes (Σᵢ‖g_t⁽ⁱ⁾‖² + ‖g_β‖²).
-    fn inner_kkt_grad_norm_sq(sys: &ArrowSchurSystem) -> f64 {
-        sys.rows
-            .iter()
-            .map(|row| row.gt.iter().map(|&v| v * v).sum::<f64>())
-            .sum::<f64>()
-            + sys.gb.iter().map(|&v| v * v).sum::<f64>()
-    }
-
-    /// Exact line-search value-probe criterion.
-    ///
-    /// Structure — a faithful, counted port of the historical probe drive
-    /// (`penalized_quasi_laplace_criterion_with_cache_refine_policy` at
-    /// `refine_progress_extension == false`):
-    ///
-    /// 1. Chunks of the SAME inner Newton driver
-    ///    (`run_joint_fit_arrow_schur`), chunk width `inner_max_iter` and the
-    ///    identical total probe budget `max(4·inner_max_iter, 16)` the
-    ///    historical probe refine loop grants.
-    /// 2. Between chunks, the same assembled-system KKT residual and quotient
-    ///    residual the historical loop gates on, against the identical full
-    ///    stationarity tolerance `τ_full`.
-    /// 3. At a stationary iterate, the criterion is priced through the shared
-    ///    evaluator, warm from that iterate on the probe refine budget, so the
-    ///    value is taken at the SAME #2253 idempotent fixed point
-    ///    (`gradient_stationary && criterion_fixed_point`) every other lane
-    ///    prices — never at a merely coarse-KKT state (whose FREEZE-priced
-    ///    value desyncs from the analytic sample at real scale and trips the
-    ///    outer "cost-only vs analytic-sample" certification guard).
-    /// 4. If the exact gate is not met within the probe budget, adjudication is
-    ///    handed to the shared evaluator, warm from the partially refined state;
-    ///    a persistent objective stall without KKT stationarity is a typed
-    ///    "did not converge" refusal —
-    ///    this lane cannot introduce a new refusal class.
-    ///
-    /// Regimes with no dense per-round assembly (streaming / matrix-free) and
-    /// the `inner_max_iter == 0` freeze contract bypass the lane entirely and
-    /// keep the historical evaluator byte-for-byte.
-    fn line_search_probe_criterion(
-        &mut self,
-        rho: &SaeManifoldRho,
-    ) -> Result<(f64, SaeManifoldLoss), String> {
-        let plan = self.term.streaming_plan();
-        let admitted = plan.admitted_or_error(
-            self.term.n_obs(),
-            self.term.output_dim(),
-            self.term.k_atoms(),
-        )?;
-        if self.inner_max_iter == 0 || admitted.streaming || !plan.direct_logdet_admitted() {
-            return self
-                .term
-                .penalized_quasi_laplace_criterion_with_refine_policy_and_lane(
-                    self.target.view(),
-                    rho,
-                    self.registry.as_ref(),
-                    self.inner_max_iter,
-                    self.learning_rate,
-                    self.ridge_ext_coord,
-                    self.ridge_beta,
-                    false,
-                    self.surrogate_lane.as_mut(),
-                );
-        }
-        // Identical chunk width and total budget as the historical PROBE path:
-        // `penalized_quasi_laplace_criterion_with_cache_refine_policy` grants `inner_max_iter`
-        // up front, then refine rounds of `inner_max_iter` each, up to the
-        // probe refine limit `value_probe_base_refine_iter =
-        // max(4·inner_max_iter, 16)`.
-        let chunk = self.inner_max_iter.max(1);
-        let budget = chunk.saturating_mul(4).max(16);
-        let mut spent = 0usize;
-        let mut rho_fixed = rho.clone();
-        loop {
-            let grant = chunk.min(budget - spent);
-            self.term.run_joint_fit_arrow_schur(
-                self.target.view(),
-                &mut rho_fixed,
-                self.registry.as_ref(),
-                grant,
-                self.learning_rate,
-                self.ridge_ext_coord,
-                self.ridge_beta,
-            )?;
-            spent += grant;
-            self.probe_telemetry.probe_inner_iterations = self
-                .probe_telemetry
-                .probe_inner_iterations
-                .saturating_add(grant);
-            let sys =
-                self.term
-                    .assemble_arrow_schur(self.target.view(), rho, self.registry.as_ref())?;
-            let grad_norm_sq = Self::inner_kkt_grad_norm_sq(&sys);
-            if !grad_norm_sq.is_finite() {
-                return Err(format!(
-                    "SaeManifoldTerm::penalized_quasi_laplace_criterion: undamped inner KKT residual is non-finite \
-                     at the line-search probe iterate (‖g‖²={grad_norm_sq}); the joint \
-                     Hessian assembly is degenerate at this ρ"
-                ));
-            }
-            let grad_norm = grad_norm_sq.sqrt();
-            let lambda_smooth = rho_fixed.lambda_smooth_vec();
-            let quotient_grad_norm =
-                self.term
-                    .quotient_gradient_norm_from_system(&sys, grad_norm_sq, &lambda_smooth);
-            // The exact full stationarity tolerance used by the accepted-point
-            // criterion. Line-search comparisons must evaluate one coherent
-            // objective; an inexact inner solve would make Armijo/Wolfe compare
-            // unlike values and can reject a real descent step (#2253).
-            let gate = SAE_MANIFOLD_INNER_GRAD_REL_TOL * self.term.inner_iterate_scale();
-            if SaeManifoldTerm::quasi_laplace_kkt_stationary(grad_norm, quotient_grad_norm, gate) {
-                // Price the criterion by handing the coarse-KKT iterate to the
-                // shared evaluator, warm, on the probe refine budget — NOT
-                // through a FREEZE (`inner_max_iter == 0`) factorization at
-                // this state. A coarse KKT-band hit is only an admission
-                // signal: the Criterion drive (`eval`/`eval_cost`/the outer
-                // certification) accepts a value only at the #2253 idempotent
-                // fixed point (`gradient_stationary && criterion_fixed_point`,
-                // see `converge_inner_for_undamped_logdet`), and at real scale
-                // the band still admits strict Newton steps that move V by
-                // ~1% — the FREEZE-priced probe value then disagrees with the
-                // analytic-sample value at the SAME ρ and the outer
-                // certification refuses ("cost-only value disagrees with
-                // analytic-sample value"). The shared evaluator polishes from
-                // this stationary iterate to the same fixed point every other
-                // lane prices, so probe and accepted-point values are one
-                // measure; when the iterate is already idempotent it accepts
-                // immediately and the value is unchanged. Its refusal classes
-                // (border Schur non-PD, cross-row non-PD, did-not-converge)
-                // remain the typed recoverable probe refusals the outer bridge
-                // maps to an infeasible trial (with the budget rescue re-trying
-                // on the extended budget first). The polish must run on the
-                // progress-extended refine budget: the probe's coarse budget
-                // stops short of the idempotent fixed point every other lane
-                // prices, and the resulting probe-vs-analytic value gap grows
-                // with how far the coarse KKT band sits from the settled
-                // iterate (measured 1.2x-320x over the certification roundoff
-                // bound at the same rho).
-                return self
-                    .term
-                    .penalized_quasi_laplace_criterion_with_refine_policy_and_lane(
-                        self.target.view(),
-                        rho,
-                        self.registry.as_ref(),
-                        self.inner_max_iter,
-                        self.learning_rate,
-                        self.ridge_ext_coord,
-                        self.ridge_beta,
-                        true,
-                        self.surrogate_lane.as_mut(),
-                    );
-            }
-            if spent >= budget {
-                // Gate not met within the probe budget: hand adjudication back
-                // to the shared evaluator, whose objective-stall path is
-                // diagnostic-only and returns the canonical typed
-                // "did not converge" refusal without KKT — warm from the current
-                // partially-refined state. This lane never mints a refusal of
-                // its own for this class.
-                return self
-                    .term
-                    .penalized_quasi_laplace_criterion_with_refine_policy_and_lane(
-                        self.target.view(),
-                        rho,
-                        self.registry.as_ref(),
-                        self.inner_max_iter,
-                        self.learning_rate,
-                        self.ridge_ext_coord,
-                        self.ridge_beta,
-                        false,
-                        self.surrogate_lane.as_mut(),
-                    );
-            }
-        }
     }
 
     /// Fit the SAE inner problem once at a caller-selected rho, committing the
@@ -4061,7 +3872,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // `gradient_stationary && criterion_fixed_point` root). The line
                 // search can only accept a step when the value it ranks prices
                 // the SAME inner state that gradient differentiates. The former
-                // `LineSearchProbe` drive priced a FREEZE / coarse-KKT iterate
+                // line-search-probe drive priced a FREEZE / coarse-KKT iterate
                 // that at real scale (n≈44k, ill-conditioned inner solve) sits
                 // ~1% off that fixed point, so NO step reduced the ranked value
                 // while pointing down the gradient — BFGS backtracked to

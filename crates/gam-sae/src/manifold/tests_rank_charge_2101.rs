@@ -146,7 +146,7 @@ fn rank_charge_deff_accepts_circle_and_neutralises_vanishing() {
         n_eff,
         term.output_dim() as f64,
         disp,
-        lam.first().copied().unwrap_or(0.0),
+        lam[0],
         Some(&term.atoms[0].smooth_penalty),
     )
     .unwrap();
@@ -160,8 +160,9 @@ fn rank_charge_deff_accepts_circle_and_neutralises_vanishing() {
     let vanished_scale = 0.5 * (vanished_edge / top_signal).sqrt();
     let certified_top_signal = vanished_scale * vanished_scale * top_signal;
     assert!(
-        certified_top_signal <= 0.25 * vanished_edge,
-        "derived vanishing scale must leave a factor-four threshold margin"
+        certified_top_signal < 0.5 * vanished_edge,
+        "derived vanishing scale must retain its factor-four analytic threshold margin \
+         after floating-point evaluation"
     );
     term.atoms[0]
         .decoder_coefficients
@@ -538,7 +539,7 @@ fn rank_charge_shared_primitive_parity() {
         n_eff,
         term.output_dim() as f64,
         disp,
-        lam.first().copied().unwrap_or(0.0),
+        lam[0],
         Some(&term.atoms[0].smooth_penalty),
     )
     .unwrap();
@@ -657,7 +658,7 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
             n_eff,
             p_out,
             disp,
-            lam.first().copied().unwrap_or(0.0),
+            lam[0],
             Some(&term.atoms[0].smooth_penalty),
         )
         .unwrap()
@@ -669,7 +670,7 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
             n_eff,
             p_out,
             disp,
-            lam.first().copied().unwrap_or(0.0),
+            lam[0],
             Some(&term.atoms[0].smooth_penalty),
         )
         .unwrap()

@@ -597,9 +597,11 @@ seeded blockwise orthogonal Walsh-Hadamard mixing. Every block transform `Q`
 satisfies `QᵀQ = I` and `Q1 = 1`, so the complete control preserves the
 empirical mean and centered cross-product exactly in real arithmetic while
 destroying rowwise radii and nonlinear manifold geometry. Its work is
-`O(np log B)` with `B ≤ 1024`, and peak transform storage is at most
-`min(8, ceil(n / B), worker_threads) × B × p` float64 scalars rather than a
-corpus-sized covariance matrix or factor.
+`O(np log B)` with `B ≤ 1024`. Independent row blocks fill the worker pool on
+tall inputs; short, wide inputs split those blocks into deterministic column
+bands so each FWHT tile remains cache-local. Peak transform storage is at most
+`min(8, worker_threads) × B × p` float64 scalars (usually less after banding),
+rather than a corpus-sized covariance matrix or factor.
 Float32 activation corpora produce float32 controls; float64 inputs remain
 float64. The callback contract requires a fresh deterministic fit and receives
 the same `pipeline_seed` for all three runs.

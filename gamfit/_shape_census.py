@@ -75,8 +75,10 @@ def run_shape_controlled_census(
     callbacks. An already C-contiguous native input is retained as a read-only
     view without a corpus-sized source copy. Other layouts and dtypes are
     normalized exactly once. The covariance-exact transform uses at most
-    ``min(8, ceil(n / B), worker_threads)`` bounded ``B × p`` float64
-    workspaces with ``B <= 1024``; it never forms a ``p × p`` covariance or a
+    ``min(8, worker_threads)`` bounded row-block/column-band float64
+    workspaces whose total size is at most that many ``B × p`` matrices, with
+    ``B <= 1024``. Wide inputs are column-banded, so the realized storage is
+    smaller; the transform never forms a ``p × p`` covariance or a
     corpus-sized float64 copy of float32 input.
 
     The controls are generated at pipeline entry, not from a fitted 2-D chart:

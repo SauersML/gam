@@ -79,11 +79,11 @@ pub use evidence::{
     StackingCertificate, StackingCheckpoint, StackingConfig, StackingError, StackingWeights,
     TopologyCandidate, TopologyKind, TopologyScoreScale, TopologySelectOptions,
     UNION_STRUCTURE_LADDER, UnionComponentFit, UnionComponentKind, UnionStructure,
-    UnionStructureFit, evidence_grad_rho,
-    evidence_hessian_log_det, evidence_ift_gradient_correction, fit_gaussian_mixture,
-    fit_ring_gaussian_mixture, fit_union_ladder, fit_union_structure, hessian_log_det_from_hvp,
-    laplace_evidence, resume_gaussian_mixture, resume_stacking_weights, select_topology,
-    solve_stacking_weights, union_per_point_log_density, union_responsibility_split,
+    UnionStructureFit, evidence_grad_rho, evidence_hessian_log_det,
+    evidence_ift_gradient_correction, fit_gaussian_mixture, fit_ring_gaussian_mixture,
+    fit_union_ladder, fit_union_structure, hessian_log_det_from_hvp, laplace_evidence,
+    resume_gaussian_mixture, resume_stacking_weights, select_topology, solve_stacking_weights,
+    union_per_point_log_density, union_responsibility_split,
 };
 pub use topology_selector::{
     AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider, MIXTURE_K_LADDER,

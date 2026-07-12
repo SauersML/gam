@@ -1210,12 +1210,8 @@ mod tests {
         // truncated-radius correction or a singular center convention.
         const INTERVALS: usize = 200_000;
         for (radius, noise_variance) in [(0.0, 0.7), (2.0, 0.09), (20.0, 1.0e-4)] {
-            let fit = CircularGaussianFit2d::from_parameters(
-                [1.25, -0.75],
-                radius,
-                noise_variance,
-            )
-            .unwrap();
+            let fit = CircularGaussianFit2d::from_parameters([1.25, -0.75], radius, noise_variance)
+                .unwrap();
             let center = fit.center();
             assert!(fit.log_density(center[0], center[1]).is_finite());
 
@@ -1225,9 +1221,7 @@ mod tests {
                 if r == 0.0 {
                     0.0
                 } else {
-                    std::f64::consts::TAU
-                        * r
-                        * fit.log_density(center[0] + r, center[1]).exp()
+                    std::f64::consts::TAU * r * fit.log_density(center[0] + r, center[1]).exp()
                 }
             };
             let mut weighted_sum = radial_mass(0.0) + radial_mass(upper);
@@ -1273,8 +1267,8 @@ mod tests {
             radius_score += (observed_radius * bessel_ratio - radius) / noise_variance;
             let stable_expected_residual = (observed_radius - radius).powi(2)
                 + 2.0 * radius * observed_radius * (1.0 - bessel_ratio);
-            variance_score += -1.0 / noise_variance
-                + 0.5 * stable_expected_residual / noise_variance.powi(2);
+            variance_score +=
+                -1.0 / noise_variance + 0.5 * stable_expected_residual / noise_variance.powi(2);
         }
         let nf = n as f64;
         let score_scale = noise_variance.sqrt();
@@ -2724,9 +2718,11 @@ pub(crate) fn shape_matched_control<'py>(
 ///
 /// Unlike [`shape_matched_control`], this entry point never widens the full
 /// `n × p` input or output matrix. The covariance-exact branch transforms
-/// independent power-of-two row blocks in at most
-/// `min(8, ceil(n / B), worker_threads)` bounded `B × p` float64 workspaces,
-/// with `B <= 1024`; it never forms a `p × p` covariance or eigendecomposition.
+/// independent power-of-two row-block/column-band tiles in at most
+/// `min(8, worker_threads)` bounded float64 workspaces. Their total size never
+/// exceeds that many `B × p` matrices, with `B <= 1024`, and column banding
+/// makes the realized storage smaller for wide inputs. It never forms a
+/// `p × p` covariance or eigendecomposition.
 #[pyfunction]
 #[pyo3(signature = (data, kind, seed = 11))]
 pub(crate) fn shape_matched_control_f32<'py>(

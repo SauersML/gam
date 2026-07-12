@@ -21,10 +21,11 @@
 //! TWO PLANTED REGIMES at matched signal-to-noise:
 //!
 //!   (A) TRUE CONTINUOUS CIRCLE — points drawn uniformly in angle on a ring of
-//!       radius `R` with isotropic radial jitter `σ`. The ground truth is a
-//!       one-dimensional continuous manifold (S¹). The mixture rung, no matter
-//!       its `k`, is the WRONG model class: it cannot put mass on the continuum
-//!       between its centers. gam MUST select the smooth circle, NOT the mixture.
+//!       radius `R` with isotropic Cartesian Gaussian jitter `σ`. The ground
+//!       truth is a one-dimensional continuous manifold (S¹). The mixture rung,
+//!       no matter its `k`, is the WRONG model class: it cannot put mass on the
+//!       continuum between its centers. gam MUST select the smooth circle, NOT
+//!       the mixture.
 //!
 //!   (B) TRUE k-CLUSTER DISCRETE MIXTURE — points drawn from `K_TRUE` well
 //!       separated isotropic Gaussian blobs (NOT on a ring) with the same jitter
@@ -67,7 +68,9 @@
 //! weakened to pass. All math is in Rust; Python is reached only through the
 //! reference harness shell.
 
-use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig, fit_gaussian_mixture};
+use gam::solver::evidence::{
+    CircularGaussianFit2d, GaussianMixtureConfig, StackingConfig, fit_gaussian_mixture,
+};
 use gam::solver::topology_selector::{
     AutoTopologyKind, EvidenceCertification, HeldOutDensityProvider, MIXTURE_K_LADDER,
     PredictiveCandidateKind, PredictiveRaceCandidate, STACKING_CV_FOLDS, STACKING_CV_SEED,
@@ -154,128 +157,12 @@ fn plant_clusters(n: usize, k: usize, separation: f64, sigma: f64, seed: u64) ->
 }
 
 // ---------------------------------------------------------------------------
-// Smooth-circle held-out density provider (the caller owns the smooth model;
-// the adjudicator only owns the mixture provider). This is a genuinely
-// CONTINUOUS density on the ring: it fits center + radius from the training
-// rows, then models each point as radius ~ Normal(R, σ_r) with angle UNIFORM on
-// [0, 2π). Crucially this places probability mass on the WHOLE ring, so it can
-// predict held-out points anywhere on the circle — including the interpolated
-// gaps a discrete mixture cannot reach.
+// Smooth-circle held-out density provider. The proper Cartesian model is a
+// uniform latent circle convolved with isotropic 2-D Gaussian noise, fitted by
+// the same production implementation used by the topology race and structured
+// unions. It places mass on the whole ring and remains normalized and finite at
+// its center.
 // ---------------------------------------------------------------------------
-
-/// Solve the 3×3 system `m · x = v` by Cramer's rule. Returns `None` when the
-/// coefficient matrix is (numerically) singular so the caller can fall back.
-fn solve3x3(m: &[[f64; 3]; 3], v: &[f64; 3]) -> Option<[f64; 3]> {
-    let det3 = |a: &[[f64; 3]; 3]| -> f64 {
-        a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
-            - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
-            + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0])
-    };
-    let det = det3(m);
-    let scale = m
-        .iter()
-        .flat_map(|row| row.iter())
-        .fold(0.0_f64, |acc, &e| acc + e * e)
-        .sqrt();
-    if det.abs() <= 1e-12 * (1.0 + scale) {
-        return None;
-    }
-    let mut out = [0.0_f64; 3];
-    for (col, slot) in out.iter_mut().enumerate() {
-        let mut mc = *m;
-        for row in 0..3 {
-            mc[row][col] = v[row];
-        }
-        *slot = det3(&mc) / det;
-    }
-    Some(out)
-}
-
-struct CircleRingDensity {
-    cx: f64,
-    cy: f64,
-    radius: f64,
-    sigma_r: f64,
-}
-
-impl CircleRingDensity {
-    fn fit(rows: ArrayView2<'_, f64>) -> Result<Self, String> {
-        let n = rows.nrows();
-        if n < 2 {
-            return Err("circle ring fit needs >= 2 rows".to_string());
-        }
-        let nf = n as f64;
-        // Estimate the centre by an algebraic (Kåsa) least-squares circle fit, NOT
-        // the raw point centroid. For a full ring the centroid is a badly biased
-        // circle-centre estimator — its sampling error is O(radius/√n), which for
-        // this fixture displaces the centre by ~0.2 and inflates the fitted radial
-        // spread from the true 0.18 to 0.25, crippling the ring's held-out
-        // density. The algebraic fit minimises Σ(x²+y² − 2·cx·x − 2·cy·y − w)²
-        // over (cx, cy, w) — linear normal equations — and recovers the true
-        // centre/radius, so the continuous ring predicts the interpolated gaps as
-        // well as the geometry allows. It degrades gracefully: on (near-)collinear
-        // rows the 3×3 system is singular and we fall back to the centroid.
-        let (mut sx, mut sy, mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
-        let (mut sb, mut sxb, mut syb) = (0.0, 0.0, 0.0);
-        for i in 0..n {
-            let x = rows[[i, 0]];
-            let y = rows[[i, 1]];
-            let b = x * x + y * y;
-            sx += x;
-            sy += y;
-            sxx += x * x;
-            syy += y * y;
-            sxy += x * y;
-            sb += b;
-            sxb += x * b;
-            syb += y * b;
-        }
-        // M·[cx, cy, w] = v for the design columns [2x, 2y, 1] against target b:
-        //   M = [[4Σx², 4Σxy, 2Σx], [4Σxy, 4Σy², 2Σy], [2Σx, 2Σy, n]],
-        //   v = [2Σxb, 2Σyb, Σb].
-        let m = [
-            [4.0 * sxx, 4.0 * sxy, 2.0 * sx],
-            [4.0 * sxy, 4.0 * syy, 2.0 * sy],
-            [2.0 * sx, 2.0 * sy, nf],
-        ];
-        let v = [2.0 * sxb, 2.0 * syb, sb];
-        let (cx, cy) = match solve3x3(&m, &v) {
-            Some([cx, cy, w]) if (w + cx * cx + cy * cy) > 0.0 => (cx, cy),
-            _ => (sx / nf, sy / nf),
-        };
-        let radii: Vec<f64> = (0..n)
-            .map(|i| {
-                let dx = rows[[i, 0]] - cx;
-                let dy = rows[[i, 1]] - cy;
-                (dx * dx + dy * dy).sqrt()
-            })
-            .collect();
-        let radius = radii.iter().sum::<f64>() / nf;
-        let var = radii.iter().map(|r| (r - radius).powi(2)).sum::<f64>() / nf;
-        // Floor the radial std away from zero for numerical safety (matches the
-        // mixture's covariance floor in spirit; fixed, not tuned).
-        let sigma_r = var.sqrt().max(1e-3);
-        Ok(Self {
-            cx,
-            cy,
-            radius,
-            sigma_r,
-        })
-    }
-
-    /// log p(point) = log[ Normal(r; R, σ_r) ] - log(2π r), the change of
-    /// variables for (radius, uniform-angle) on the plane:
-    ///   p(x, y) dx dy = p_r(r) * (1/2π) dr dθ,  with dx dy = r dr dθ,
-    /// so the planar density is p_r(r) / (2π r).
-    fn log_density(&self, x: f64, y: f64) -> f64 {
-        let dx = x - self.cx;
-        let dy = y - self.cy;
-        let r = (dx * dx + dy * dy).sqrt().max(1e-12);
-        let z = (r - self.radius) / self.sigma_r;
-        let log_pr = -0.5 * z * z - (self.sigma_r * (TWO_PI).sqrt()).ln();
-        log_pr - (TWO_PI * r).ln()
-    }
-}
 
 /// Build a continuous-circle held-out-density provider mirroring the mixture
 /// provider contract from `topology_selector`: it refits the ring on the
@@ -291,7 +178,8 @@ fn circle_density_provider<'a>(data: ArrayView2<'a, f64>) -> HeldOutDensityProvi
                     train_mat[[r, c]] = owned[[i, c]];
                 }
             }
-            let ring = CircleRingDensity::fit(train_mat.view())?;
+            let train_rows = (0..train_mat.nrows()).collect::<Vec<_>>();
+            let ring = CircularGaussianFit2d::fit(train_mat.view(), &train_rows)?;
             Ok(eval
                 .iter()
                 .map(|&i| ring.log_density(owned[[i, 0]], owned[[i, 1]]))
@@ -363,15 +251,12 @@ fn mixture_nle_for_k(
 }
 
 /// A continuous-circle BIC/2 on the same scale as the mixtures, with `P = 4`
-/// free parameters (center 2, radius 1, radial std 1). This is corroboration
-/// only; the cross-class headline is stacking.
+/// free parameters (center 2, radius 1, isotropic noise variance 1). This is
+/// corroboration only; the cross-class headline is stacking.
 fn circle_nle(data: ArrayView2<'_, f64>) -> Result<f64, String> {
-    let ring = CircleRingDensity::fit(data)?;
-    let total_log_dens: f64 = (0..data.nrows())
-        .map(|i| ring.log_density(data[[i, 0]], data[[i, 1]]))
-        .sum();
-    const CIRCLE_FREE_PARAMS: f64 = 4.0;
-    Ok(-total_log_dens + 0.5 * CIRCLE_FREE_PARAMS * (data.nrows() as f64).ln())
+    let rows = (0..data.nrows()).collect::<Vec<_>>();
+    let (_, bic) = CircularGaussianFit2d::fit_with_bic(data, &rows)?;
+    Ok(bic)
 }
 
 /// Build the cross-class candidate vector: smooth circle + every mixture order in
@@ -543,11 +428,13 @@ fn circle_regime_gam_selects_smooth_circle_not_mixture_via_interpolated_holdout(
         eval_mat[[r, 1]] = data[[i, 1]];
     }
 
-    let ring = CircleRingDensity::fit(train_mat.view()).expect("ring fit on circle train");
-    let circle_mean_logdens: f64 = eval
-        .iter()
-        .map(|&i| ring.log_density(data[[i, 0]], data[[i, 1]]))
-        .sum::<f64>()
+    let train_rows = (0..train_mat.nrows()).collect::<Vec<_>>();
+    let ring = CircularGaussianFit2d::fit(train_mat.view(), &train_rows)
+        .expect("ring fit on circle train");
+    let eval_rows = (0..eval_mat.nrows()).collect::<Vec<_>>();
+    let circle_mean_logdens = ring
+        .log_likelihood(eval_mat.view(), &eval_rows)
+        .expect("circle scores held-out interpolated points")
         / eval.len() as f64;
 
     // Best mixture order by held-out density at the interpolated eval points.

@@ -2376,15 +2376,12 @@ impl CircularGaussianFit2d {
         // A noiseless observed circle is an unbounded-likelihood boundary.
         // Keep the numerical optimizer in a scale-relative interior whose
         // width is roundoff, rather than imposing a floor in data units.
-        let variance_floor =
-            (64.0 * f64::EPSILON * mean_squared_radius).max(f64::MIN_POSITIVE);
-        let radius_squared = (mean_squared_radius * mean_squared_radius
-            - squared_radius_variance)
+        let variance_floor = (64.0 * f64::EPSILON * mean_squared_radius).max(f64::MIN_POSITIVE);
+        let radius_squared = (mean_squared_radius * mean_squared_radius - squared_radius_variance)
             .max(0.0)
             .sqrt();
         let mut radius = radius_squared.sqrt();
-        let mut noise_variance =
-            (0.5 * (mean_squared_radius - radius_squared)).max(variance_floor);
+        let mut noise_variance = (0.5 * (mean_squared_radius - radius_squared)).max(variance_floor);
         let mut center = mean;
 
         // Exact EM for the latent circle angle. Given current parameters, the
@@ -2406,8 +2403,7 @@ impl CircularGaussianFit2d {
                 } else {
                     let (_, bessel_ratio) =
                         circular_gaussian_bessel_terms(radius, observed_radius, noise_variance);
-                    if !(bessel_ratio.is_finite() && (0.0..=1.0).contains(&bessel_ratio))
-                    {
+                    if !(bessel_ratio.is_finite() && (0.0..=1.0).contains(&bessel_ratio)) {
                         return Err("circular Gaussian Bessel ratio left [0, 1]".to_string());
                     }
                     let multiplier = bessel_ratio / observed_radius;
@@ -2512,8 +2508,9 @@ impl CircularGaussianFit2d {
         rows: &[usize],
     ) -> Result<f64, String> {
         if coords.ncols() != 2 || rows.iter().any(|&row| row >= coords.nrows()) {
-            return Err("circular Gaussian likelihood received invalid coordinates or rows"
-                .to_string());
+            return Err(
+                "circular Gaussian likelihood received invalid coordinates or rows".to_string(),
+            );
         }
         let mut log_densities = Vec::with_capacity(rows.len());
         for &row in rows {
@@ -2539,8 +2536,8 @@ impl CircularGaussianFit2d {
     ) -> Result<(Self, f64), String> {
         let fit = Self::fit(coords, rows)?;
         let log_likelihood = fit.log_likelihood(coords, rows)?;
-        let bic = -log_likelihood
-            + 0.5 * Self::NUM_FREE_PARAMETERS as f64 * (rows.len() as f64).ln();
+        let bic =
+            -log_likelihood + 0.5 * Self::NUM_FREE_PARAMETERS as f64 * (rows.len() as f64).ln();
         if !bic.is_finite() {
             return Err("circular Gaussian BIC is not finite".to_string());
         }
@@ -2571,10 +2568,7 @@ fn circular_gaussian_bessel_terms(
         // it back into range. Reconstruct the representable ratio from its log.
         return bessel_i0_log_minus_abs_and_ratio(log_kappa.exp());
     }
-    (
-        -0.5 * (std::f64::consts::TAU.ln() + log_kappa),
-        1.0,
-    )
+    (-0.5 * (std::f64::consts::TAU.ln() + log_kappa), 1.0)
 }
 //
 // A *union* candidate is a small FIXED composite of named component structures
@@ -5519,6 +5513,76 @@ mod tests {
             }
         }
         data
+    }
+
+    fn two_noisy_circles_for_union() -> Array2<f64> {
+        let rows_per_circle = 96usize;
+        let mut data = Array2::<f64>::zeros((2 * rows_per_circle, 2));
+        for (circle, (center, radius)) in [([-4.0_f64, 0.3_f64], 1.2_f64), ([4.0, -0.2], 0.9)]
+            .into_iter()
+            .enumerate()
+        {
+            for sample in 0..rows_per_circle {
+                let angle = std::f64::consts::TAU * sample as f64 / rows_per_circle as f64;
+                let noisy_radius =
+                    radius + 0.045 * (3.0 * angle).cos() + 0.018 * (5.0 * angle).sin();
+                let row = circle * rows_per_circle + sample;
+                data[[row, 0]] = center[0] + noisy_radius * angle.cos();
+                data[[row, 1]] = center[1] + noisy_radius * angle.sin();
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn union_circles_use_the_shared_normalized_cartesian_density() {
+        let data = two_noisy_circles_for_union();
+        let config = GaussianMixtureConfig::default();
+        let groups = union_responsibility_split(data.view(), 2, config).unwrap();
+        assert_eq!(groups.len(), 2);
+
+        let mut direct_component_bics = Vec::with_capacity(groups.len());
+        for rows in &groups {
+            assert!(rows.len() > CircularGaussianFit2d::NUM_FREE_PARAMETERS);
+            let group = gather_union_rows(data.view(), rows);
+            let group_rows = (0..group.nrows()).collect::<Vec<_>>();
+            let (_, bic) = CircularGaussianFit2d::fit_with_bic(group.view(), &group_rows).unwrap();
+            direct_component_bics.push(bic);
+        }
+        let direct_bic = pairwise_sum(&direct_component_bics);
+        let union = fit_union_structure(data.view(), UnionStructure::CircleCircle, config).unwrap();
+        assert_eq!(
+            union.total_parameters,
+            2 * CircularGaussianFit2d::NUM_FREE_PARAMETERS
+        );
+        assert!((union.bic - direct_bic).abs() < 1.0e-12);
+
+        let densities =
+            fit_union_component_densities(data.view(), UnionStructure::CircleCircle, config)
+                .unwrap();
+        let mut fitted_centers = Array2::<f64>::zeros((densities.len(), 2));
+        for (index, density) in densities.iter().enumerate() {
+            let UnionComponentDensity::Circle { fit, .. } = density else {
+                panic!("circle+circle union produced a non-circle density");
+            };
+            let center = fit.center();
+            fitted_centers[[index, 0]] = center[0];
+            fitted_centers[[index, 1]] = center[1];
+            let at_center = fit.log_density(center[0], center[1]);
+            let expected = -(std::f64::consts::TAU * fit.noise_variance()).ln()
+                - 0.5 * fit.radius().powi(2) / fit.noise_variance();
+            assert!(at_center.is_finite());
+            assert!((at_center - expected).abs() < 1.0e-12 * (1.0 + expected.abs()));
+        }
+
+        let held_out = union_per_point_log_density(
+            data.view(),
+            fitted_centers.view(),
+            UnionStructure::CircleCircle,
+            config,
+        )
+        .unwrap();
+        assert!(held_out.iter().all(|value| value.is_finite()));
     }
 
     #[test]
