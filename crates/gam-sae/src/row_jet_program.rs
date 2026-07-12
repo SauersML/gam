@@ -779,6 +779,15 @@ pub(crate) struct SaeScheduledRowJets {
     n_beta: usize,
 }
 
+thread_local! {
+    /// Warm per-worker workspace for the structure-compiled softmax row. The
+    /// returned channels own their single packed allocation; decoded components,
+    /// their expectation, and derivative scratch never escape the call and are
+    /// therefore reused across rows on the same worker.
+    static SAE_SOFTMAX_ROW_WORKSPACE: std::cell::RefCell<Vec<f64>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl SaeScheduledRowJets {
     pub(crate) fn zeros(q: usize, p: usize, n_beta: usize) -> Self {
         let first = q.checked_mul(p);
@@ -982,176 +991,183 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
     let work_len = decoded_len
         .checked_add(tail_len)
         .expect("SAE row-program total workspace length overflow");
-    let mut work = vec![0.0_f64; work_len];
-    let (decoded, tail) = work.split_at_mut(decoded_len);
-    let (mean, scratch) = tail.split_at_mut(p);
-    for atom in 0..k {
-        if !source.atom_is_active(atom) {
-            continue;
+    SAE_SOFTMAX_ROW_WORKSPACE.with(|workspace| {
+        let mut workspace = workspace.borrow_mut();
+        if workspace.len() < work_len {
+            workspace.resize(work_len, 0.0);
         }
-        let component = &mut decoded[atom * p..(atom + 1) * p];
-        source.fill_decoded(atom, component);
-        let z = source.gate_value(atom);
-        for c in 0..p {
-            mean[c] += z * component[c];
+        let work = &mut workspace[..work_len];
+        work.fill(0.0);
+        let (decoded, tail) = work.split_at_mut(decoded_len);
+        let (mean, scratch) = tail.split_at_mut(p);
+        for atom in 0..k {
+            if !source.atom_is_active(atom) {
+                continue;
+            }
+            let component = &mut decoded[atom * p..(atom + 1) * p];
+            source.fill_decoded(atom, component);
+            let z = source.gate_value(atom);
+            for c in 0..p {
+                mean[c] += z * component[c];
+            }
         }
-    }
-    let moment = SoftmaxMoment { source, inv_tau };
-    // Every logit derivative depends on the centered component `C_k = D_k -
-    // E[D]`. Center once here so each Hessian output becomes a two-coefficient
-    // vector combination instead of rebuilding `D_j + D_l - 2E[D]`.
-    for atom in 0..k {
-        let component = &mut decoded[atom * p..(atom + 1) * p];
-        for c in 0..p {
-            component[c] -= mean[c];
+        let moment = SoftmaxMoment { source, inv_tau };
+        // Every logit derivative depends on the centered component `C_k = D_k -
+        // E[D]`. Center once here so each Hessian output becomes a two-coefficient
+        // vector combination instead of rebuilding `D_j + D_l - 2E[D]`.
+        for atom in 0..k {
+            let component = &mut decoded[atom * p..(atom + 1) * p];
+            for c in 0..p {
+                component[c] -= mean[c];
+            }
         }
-    }
 
-    // Logit gradient and Hessian are centered softmax moments.  This is the
-    // asymptotic win: O(L²P) for L free logits, versus O(L²KP) in the hand
-    // `d2z[j][l][k] · decoded[k]` contraction and still more in a dense jet.
-    for slot_j in 0..q {
-        let SaeRowPrimary::Logit { atom: atom_j } = source.primary(slot_j) else {
-            continue;
-        };
-        let centered_j = &decoded[atom_j * p..(atom_j + 1) * p];
-        let first_coefficient = sqrt_row_w * moment.expectation_first_coefficient(atom_j);
-        for (target, &value) in out.first_mut(slot_j).iter_mut().zip(centered_j) {
-            *target = first_coefficient * value;
-        }
-        for slot_l in 0..q {
-            let SaeRowPrimary::Logit { atom: atom_l } = source.primary(slot_l) else {
+        // Logit gradient and Hessian are centered softmax moments.  This is the
+        // asymptotic win: O(L²P) for L free logits, versus O(L²KP) in the hand
+        // `d2z[j][l][k] · decoded[k]` contraction and still more in a dense jet.
+        for slot_j in 0..q {
+            let SaeRowPrimary::Logit { atom: atom_j } = source.primary(slot_j) else {
                 continue;
             };
-            let centered_l = &decoded[atom_l * p..(atom_l + 1) * p];
-            let (j_coefficient, l_coefficient) =
-                moment.expectation_second_coefficients(atom_j, atom_l);
-            let j_coefficient = sqrt_row_w * j_coefficient;
-            let l_coefficient = sqrt_row_w * l_coefficient;
-            for (c, target) in out.second_mut(slot_j, slot_l).iter_mut().enumerate() {
-                *target = j_coefficient * centered_j[c] + l_coefficient * centered_l[c];
+            let centered_j = &decoded[atom_j * p..(atom_j + 1) * p];
+            let first_coefficient = sqrt_row_w * moment.expectation_first_coefficient(atom_j);
+            for (target, &value) in out.first_mut(slot_j).iter_mut().zip(centered_j) {
+                *target = first_coefficient * value;
+            }
+            for slot_l in 0..q {
+                let SaeRowPrimary::Logit { atom: atom_l } = source.primary(slot_l) else {
+                    continue;
+                };
+                let centered_l = &decoded[atom_l * p..(atom_l + 1) * p];
+                let (j_coefficient, l_coefficient) =
+                    moment.expectation_second_coefficients(atom_j, atom_l);
+                let j_coefficient = sqrt_row_w * j_coefficient;
+                let l_coefficient = sqrt_row_w * l_coefficient;
+                for (c, target) in out.second_mut(slot_j, slot_l).iter_mut().enumerate() {
+                    *target = j_coefficient * centered_j[c] + l_coefficient * centered_l[c];
+                }
             }
         }
-    }
 
-    // Each coordinate belongs to exactly one component.  Its first jet is
-    // scaled by z_k; differentiating that gate supplies every logit×coord block.
-    for coord_slot in 0..q {
-        let SaeRowPrimary::Coord { atom, axis } = source.primary(coord_slot) else {
-            continue;
-        };
-        if !source.atom_is_active(atom) {
-            continue;
-        }
-        source.fill_decoded_first(atom, axis, scratch);
-        let z = source.gate_value(atom);
-        let coordinate_coefficient = z * sqrt_row_w;
-        for (target, &value) in out.first_mut(coord_slot).iter_mut().zip(&*scratch) {
-            *target = coordinate_coefficient * value;
-        }
-        for logit_slot in 0..q {
-            let SaeRowPrimary::Logit { atom: logit_atom } = source.primary(logit_slot) else {
+        // Each coordinate belongs to exactly one component.  Its first jet is
+        // scaled by z_k; differentiating that gate supplies every logit×coord block.
+        for coord_slot in 0..q {
+            let SaeRowPrimary::Coord { atom, axis } = source.primary(coord_slot) else {
                 continue;
             };
-            let coefficient = moment.gate_first(atom, logit_atom) * sqrt_row_w;
-            for (target, &value) in out
-                .second_mut(logit_slot, coord_slot)
-                .iter_mut()
-                .zip(&*scratch)
-            {
-                *target = coefficient * value;
+            if !source.atom_is_active(atom) {
+                continue;
             }
-            for (target, &value) in out
-                .second_mut(coord_slot, logit_slot)
-                .iter_mut()
-                .zip(&*scratch)
-            {
-                *target = coefficient * value;
+            source.fill_decoded_first(atom, axis, scratch);
+            let z = source.gate_value(atom);
+            let coordinate_coefficient = z * sqrt_row_w;
+            for (target, &value) in out.first_mut(coord_slot).iter_mut().zip(&*scratch) {
+                *target = coordinate_coefficient * value;
+            }
+            for logit_slot in 0..q {
+                let SaeRowPrimary::Logit { atom: logit_atom } = source.primary(logit_slot) else {
+                    continue;
+                };
+                let coefficient = moment.gate_first(atom, logit_atom) * sqrt_row_w;
+                for (target, &value) in out
+                    .second_mut(logit_slot, coord_slot)
+                    .iter_mut()
+                    .zip(&*scratch)
+                {
+                    *target = coefficient * value;
+                }
+                for (target, &value) in out
+                    .second_mut(coord_slot, logit_slot)
+                    .iter_mut()
+                    .zip(&*scratch)
+                {
+                    *target = coefficient * value;
+                }
             }
         }
-    }
 
-    // Coordinate×coordinate curvature is block diagonal by atom.  The basis
-    // source supplies the local quadratic jet, so no cross-atom zeros are built.
-    for slot_a in 0..q {
-        let SaeRowPrimary::Coord {
-            atom: atom_a,
-            axis: axis_a,
-        } = source.primary(slot_a)
-        else {
-            continue;
-        };
-        if !source.atom_is_active(atom_a) {
-            continue;
-        }
-        for slot_b in 0..q {
+        // Coordinate×coordinate curvature is block diagonal by atom.  The basis
+        // source supplies the local quadratic jet, so no cross-atom zeros are built.
+        for slot_a in 0..q {
             let SaeRowPrimary::Coord {
-                atom: atom_b,
-                axis: axis_b,
-            } = source.primary(slot_b)
+                atom: atom_a,
+                axis: axis_a,
+            } = source.primary(slot_a)
             else {
                 continue;
             };
-            if atom_a != atom_b {
+            if !source.atom_is_active(atom_a) {
                 continue;
             }
-            source.fill_decoded_second(atom_a, axis_a, axis_b, scratch);
-            let coefficient = source.gate_value(atom_a) * sqrt_row_w;
-            for (target, &value) in out.second_mut(slot_a, slot_b).iter_mut().zip(&*scratch) {
-                *target = coefficient * value;
+            for slot_b in 0..q {
+                let SaeRowPrimary::Coord {
+                    atom: atom_b,
+                    axis: axis_b,
+                } = source.primary(slot_b)
+                else {
+                    continue;
+                };
+                if atom_a != atom_b {
+                    continue;
+                }
+                source.fill_decoded_second(atom_a, axis_a, axis_b, scratch);
+                let coefficient = source.gate_value(atom_a) * sqrt_row_w;
+                for (target, &value) in out.second_mut(slot_a, slot_b).iter_mut().zip(&*scratch) {
+                    *target = coefficient * value;
+                }
             }
         }
-    }
 
-    // A beta border is `s = z_k Phi_b` times a constant output vector.  The same
-    // gate moment primitive emits its logit derivative; its coordinate derivative
-    // is the source basis jet.  beta_deriv and beta_l_deriv are mathematically the
-    // same mixed channel because reconstruction is linear in beta.
-    for border in 0..n_beta {
-        let atom = source.beta_border_atom(border);
-        if !source.atom_is_active(atom) {
-            continue;
-        }
-        let phi = source.beta_border_basis_value(border);
-        let output = source.beta_border_output(border);
-        let base = source.gate_value(atom) * phi * sqrt_row_w;
-        for (target, &value) in out.beta_mut(border).iter_mut().zip(output) {
-            *target = base * value;
-        }
-        for slot in 0..q {
-            let SaeRowPrimary::Logit { atom: logit_atom } = source.primary(slot) else {
-                continue;
-            };
-            let scalar = moment.gate_first(atom, logit_atom) * phi * sqrt_row_w;
-            for (target, &value) in out.beta_deriv_mut(slot, border).iter_mut().zip(output) {
-                *target = scalar * value;
-            }
-            for (target, &value) in out.beta_l_deriv_mut(slot, border).iter_mut().zip(output) {
-                *target = scalar * value;
-            }
-        }
-        for slot in 0..q {
-            let SaeRowPrimary::Coord {
-                atom: coord_atom,
-                axis,
-            } = source.primary(slot)
-            else {
-                continue;
-            };
-            if coord_atom != atom {
+        // A beta border is `s = z_k Phi_b` times a constant output vector.  The same
+        // gate moment primitive emits its logit derivative; its coordinate derivative
+        // is the source basis jet.  beta_deriv and beta_l_deriv are mathematically the
+        // same mixed channel because reconstruction is linear in beta.
+        for border in 0..n_beta {
+            let atom = source.beta_border_atom(border);
+            if !source.atom_is_active(atom) {
                 continue;
             }
-            let scalar =
-                source.gate_value(atom) * source.beta_border_basis_first(border, axis) * sqrt_row_w;
-            for (target, &value) in out.beta_deriv_mut(slot, border).iter_mut().zip(output) {
-                *target = scalar * value;
+            let phi = source.beta_border_basis_value(border);
+            let output = source.beta_border_output(border);
+            let base = source.gate_value(atom) * phi * sqrt_row_w;
+            for (target, &value) in out.beta_mut(border).iter_mut().zip(output) {
+                *target = base * value;
             }
-            for (target, &value) in out.beta_l_deriv_mut(slot, border).iter_mut().zip(output) {
-                *target = scalar * value;
+            for slot in 0..q {
+                let SaeRowPrimary::Logit { atom: logit_atom } = source.primary(slot) else {
+                    continue;
+                };
+                let scalar = moment.gate_first(atom, logit_atom) * phi * sqrt_row_w;
+                for (target, &value) in out.beta_deriv_mut(slot, border).iter_mut().zip(output) {
+                    *target = scalar * value;
+                }
+                for (target, &value) in out.beta_l_deriv_mut(slot, border).iter_mut().zip(output) {
+                    *target = scalar * value;
+                }
+            }
+            for slot in 0..q {
+                let SaeRowPrimary::Coord {
+                    atom: coord_atom,
+                    axis,
+                } = source.primary(slot)
+                else {
+                    continue;
+                };
+                if coord_atom != atom {
+                    continue;
+                }
+                let scalar = source.gate_value(atom)
+                    * source.beta_border_basis_first(border, axis)
+                    * sqrt_row_w;
+                for (target, &value) in out.beta_deriv_mut(slot, border).iter_mut().zip(output) {
+                    *target = scalar * value;
+                }
+                for (target, &value) in out.beta_l_deriv_mut(slot, border).iter_mut().zip(output) {
+                    *target = scalar * value;
+                }
             }
         }
-    }
-
+    });
     out
 }
 
@@ -2315,13 +2331,13 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(atom, &value)| {
-                    let displaced = value
-                        + if atom == logit_atom {
+                    let displaced = q(value)
+                        + q(if atom == logit_atom {
                             displacement
                         } else {
                             0.0
-                        };
-                    (q(displaced) * q(inv_tau) - q(shifted_max)).exp()
+                        });
+                    (displaced * q(inv_tau) - q(shifted_max)).exp()
                 })
                 .collect();
             let denominator = exps

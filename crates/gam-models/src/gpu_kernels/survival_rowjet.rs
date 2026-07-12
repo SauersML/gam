@@ -331,6 +331,14 @@ pub fn survival_rigid_row_jets_device_only(
         .map_err(|e| e.to_string())
 }
 
+#[cfg(all(target_os = "linux", test))]
+fn survival_rigid_row_vgh_device_only(
+    rows: &[SurvivalRowInputs],
+    probit_scale: f64,
+) -> Result<SurvivalRowVghChannels, String> {
+    device::survival_rigid_row_vgh_device(rows, probit_scale).map_err(|error| error.to_string())
+}
+
 /// The NVRTC source: a byte-faithful port of the seeded-jet arithmetic.
 /// `K=4` is fixed for the rigid survival primaries, so the kernel is compiled
 /// once (no shape macros). Full f64, no fast-math.
@@ -340,8 +348,7 @@ pub const SURVIVAL_ROWJET_SOURCE: &str = include_str!("survival_rowjet_kernel.cu
 #[cfg(target_os = "linux")]
 mod device {
     use super::{
-        SURVIVAL_ROWJET_SOURCE, SurvivalRowInputs, SurvivalRowJetChannels,
-        SurvivalRowVghChannels,
+        SURVIVAL_ROWJET_SOURCE, SurvivalRowInputs, SurvivalRowJetChannels, SurvivalRowVghChannels,
     };
     use gam_gpu::gpu_error::{GpuError, GpuResultExt};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -461,7 +468,9 @@ mod device {
         let cov_d = stream.clone_htod(&cov).gpu_ctx("vgh htod cov")?;
         let mut value_d = stream.alloc_zeros::<f64>(n).gpu_ctx("vgh alloc value")?;
         let mut grad_d = stream.alloc_zeros::<f64>(n * 4).gpu_ctx("vgh alloc grad")?;
-        let mut hess_d = stream.alloc_zeros::<f64>(n * 16).gpu_ctx("vgh alloc hess")?;
+        let mut hess_d = stream
+            .alloc_zeros::<f64>(n * 16)
+            .gpu_ctx("vgh alloc hess")?;
 
         let n_i32 = i32::try_from(n)
             .map_err(|_| gam_gpu::gpu_err!("survival_rowjet_vgh n={n} overflows i32"))?;
@@ -493,10 +502,18 @@ mod device {
         let mut value = vec![0.0_f64; n];
         let mut grad = vec![0.0_f64; n * 4];
         let mut hess = vec![0.0_f64; n * 16];
-        stream.memcpy_dtoh(&value_d, &mut value).gpu_ctx("vgh dtoh value")?;
-        stream.memcpy_dtoh(&grad_d, &mut grad).gpu_ctx("vgh dtoh grad")?;
-        stream.memcpy_dtoh(&hess_d, &mut hess).gpu_ctx("vgh dtoh hess")?;
-        stream.synchronize().gpu_ctx("survival_rowjet_vgh synchronize")?;
+        stream
+            .memcpy_dtoh(&value_d, &mut value)
+            .gpu_ctx("vgh dtoh value")?;
+        stream
+            .memcpy_dtoh(&grad_d, &mut grad)
+            .gpu_ctx("vgh dtoh grad")?;
+        stream
+            .memcpy_dtoh(&hess_d, &mut hess)
+            .gpu_ctx("vgh dtoh hess")?;
+        stream
+            .synchronize()
+            .gpu_ctx("survival_rowjet_vgh synchronize")?;
         Ok(SurvivalRowVghChannels { value, grad, hess })
     }
 
@@ -915,6 +932,12 @@ mod tests {
         assert_channel_parity("third", &cpu.third, &got.third);
         assert_channel_parity("fourth", &cpu.fourth, &got.fourth);
 
+        let cpu_vgh = survival_rigid_row_vgh_cpu(&rows, 0.7);
+        let got_vgh = survival_rigid_row_vgh(&rows, 0.7);
+        assert_channel_parity("VGH value", &cpu_vgh.value, &got_vgh.value);
+        assert_channel_parity("VGH grad", &cpu_vgh.grad, &got_vgh.grad);
+        assert_channel_parity("VGH hess", &cpu_vgh.hess, &got_vgh.hess);
+
         // Anti-false-green: if a CUDA runtime is present the dispatcher MUST have
         // exercised the device kernel above (n > DEVICE_ROW_THRESHOLD), not the
         // silent CPU fallback. Prove the device path itself runs and matches —
@@ -927,7 +950,64 @@ mod tests {
             assert_channel_parity("device hess", &cpu.hess, &dev.hess);
             assert_channel_parity("device third", &cpu.third, &dev.third);
             assert_channel_parity("device fourth", &cpu.fourth, &dev.fourth);
+
+            let dev_vgh = survival_rigid_row_vgh_device_only(&rows, 0.7)
+                .expect("CUDA runtime present but survival_rowjet_vgh could not run");
+            assert_channel_parity("device VGH value", &cpu_vgh.value, &dev_vgh.value);
+            assert_channel_parity("device VGH grad", &cpu_vgh.grad, &dev_vgh.grad);
+            assert_channel_parity("device VGH hess", &cpu_vgh.hess, &dev_vgh.hess);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "explicit admitted-GPU end-to-end performance harness"]
+    fn measure_device_vgh_vs_zero_seed_high_orders_932() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+            eprintln!("DEVICE PATH UNAVAILABLE");
+            return;
+        }
+        let rows = fixture(1_000_000);
+        let zero = [0.0_f64; 4];
+        let warm_vgh =
+            survival_rigid_row_vgh_device_only(&rows, 0.7).expect("warm dedicated VGH kernel");
+        let warm_seeded = survival_rigid_row_jets_device_only(&rows, 0.7, &zero, &zero, &zero)
+            .expect("warm zero-seed high-order kernel");
+        assert_channel_parity("warm VGH value", &warm_seeded.value, &warm_vgh.value);
+        assert_channel_parity("warm VGH grad", &warm_seeded.grad, &warm_vgh.grad);
+        assert_channel_parity("warm VGH hess", &warm_seeded.hess, &warm_vgh.hess);
+
+        let mut vgh_best = f64::INFINITY;
+        let mut seeded_best = f64::INFINITY;
+        for _ in 0..5 {
+            let start = Instant::now();
+            black_box(
+                survival_rigid_row_vgh_device_only(black_box(&rows), 0.7)
+                    .expect("timed dedicated VGH kernel"),
+            );
+            vgh_best = vgh_best.min(start.elapsed().as_secs_f64());
+
+            let start = Instant::now();
+            black_box(
+                survival_rigid_row_jets_device_only(black_box(&rows), 0.7, &zero, &zero, &zero)
+                    .expect("timed zero-seed high-order kernel"),
+            );
+            seeded_best = seeded_best.min(start.elapsed().as_secs_f64());
+        }
+        eprintln!(
+            "SURVIVAL-RIGID-VGH-GPU-932 rows={} zero-seed-all-orders={:.3} ms dedicated-vgh={:.3} ms speedup={:.3}x",
+            rows.len(),
+            seeded_best * 1e3,
+            vgh_best * 1e3,
+            seeded_best / vgh_best,
+        );
+        assert!(
+            vgh_best < seeded_best,
+            "dedicated VGH GPU path must beat zero-seed high-order path"
+        );
     }
 
     /// Edge-regime fixture: rows deliberately placed in the hard corners of the

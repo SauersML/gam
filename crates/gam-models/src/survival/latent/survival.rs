@@ -1174,113 +1174,113 @@ impl LatentSurvivalPrimaryPoint {
 
 #[cfg(test)]
 mod test_support_kernel_recurrence {
-use super::*;
-use std::collections::BTreeMap;
+    use super::*;
+    use std::collections::BTreeMap;
 
-fn latent_kernel_accumulate_term(
-    terms: &mut BTreeMap<(usize, usize, usize, usize), f64>,
-    term: LatentKernelPrimaryTerm,
-    scale: f64,
-) {
-    if scale == 0.0 || term.coeff == 0.0 {
-        return;
+    fn latent_kernel_accumulate_term(
+        terms: &mut BTreeMap<(usize, usize, usize, usize), f64>,
+        term: LatentKernelPrimaryTerm,
+        scale: f64,
+    ) {
+        if scale == 0.0 || term.coeff == 0.0 {
+            return;
+        }
+        *terms
+            .entry((term.q_exp, term.qdot_power, term.tau_exp, term.k))
+            .or_insert(0.0) += scale * term.coeff;
     }
-    *terms
-        .entry((term.q_exp, term.qdot_power, term.tau_exp, term.k))
-        .or_insert(0.0) += scale * term.coeff;
-}
 
-pub(super) fn latent_kernel_differentiate_terms(
-    terms: &[LatentKernelPrimaryTerm],
-    dir: LatentKernelPrimaryDirection,
-) -> Vec<LatentKernelPrimaryTerm> {
-    let mut out = BTreeMap::<(usize, usize, usize, usize), f64>::new();
-    for term in terms {
-        if dir.dq != 0.0 {
-            if term.q_exp > 0 {
-                latent_kernel_accumulate_term(&mut out, *term, dir.dq * term.q_exp as f64);
+    pub(super) fn latent_kernel_differentiate_terms(
+        terms: &[LatentKernelPrimaryTerm],
+        dir: LatentKernelPrimaryDirection,
+    ) -> Vec<LatentKernelPrimaryTerm> {
+        let mut out = BTreeMap::<(usize, usize, usize, usize), f64>::new();
+        for term in terms {
+            if dir.dq != 0.0 {
+                if term.q_exp > 0 {
+                    latent_kernel_accumulate_term(&mut out, *term, dir.dq * term.q_exp as f64);
+                }
+                latent_kernel_accumulate_term(
+                    &mut out,
+                    LatentKernelPrimaryTerm {
+                        q_exp: term.q_exp + 1,
+                        k: term.k + 1,
+                        ..*term
+                    },
+                    -dir.dq,
+                );
             }
-            latent_kernel_accumulate_term(
-                &mut out,
-                LatentKernelPrimaryTerm {
-                    q_exp: term.q_exp + 1,
-                    k: term.k + 1,
-                    ..*term
-                },
-                -dir.dq,
-            );
-        }
-        if dir.dmu != 0.0 {
-            if term.k > 0 {
-                latent_kernel_accumulate_term(&mut out, *term, dir.dmu * term.k as f64);
+            if dir.dmu != 0.0 {
+                if term.k > 0 {
+                    latent_kernel_accumulate_term(&mut out, *term, dir.dmu * term.k as f64);
+                }
+                latent_kernel_accumulate_term(
+                    &mut out,
+                    LatentKernelPrimaryTerm {
+                        q_exp: term.q_exp + 1,
+                        k: term.k + 1,
+                        ..*term
+                    },
+                    -dir.dmu,
+                );
             }
-            latent_kernel_accumulate_term(
-                &mut out,
-                LatentKernelPrimaryTerm {
-                    q_exp: term.q_exp + 1,
-                    k: term.k + 1,
-                    ..*term
-                },
-                -dir.dmu,
-            );
-        }
-        if dir.dtau != 0.0 {
-            if term.tau_exp > 0 {
-                latent_kernel_accumulate_term(&mut out, *term, dir.dtau * term.tau_exp as f64);
+            if dir.dtau != 0.0 {
+                if term.tau_exp > 0 {
+                    latent_kernel_accumulate_term(&mut out, *term, dir.dtau * term.tau_exp as f64);
+                }
+                let kf = term.k as f64;
+                latent_kernel_accumulate_term(
+                    &mut out,
+                    LatentKernelPrimaryTerm {
+                        tau_exp: term.tau_exp + 2,
+                        ..*term
+                    },
+                    dir.dtau * kf * kf,
+                );
+                latent_kernel_accumulate_term(
+                    &mut out,
+                    LatentKernelPrimaryTerm {
+                        q_exp: term.q_exp + 1,
+                        tau_exp: term.tau_exp + 2,
+                        k: term.k + 1,
+                        ..*term
+                    },
+                    -dir.dtau * (2.0 * kf + 1.0),
+                );
+                latent_kernel_accumulate_term(
+                    &mut out,
+                    LatentKernelPrimaryTerm {
+                        q_exp: term.q_exp + 2,
+                        tau_exp: term.tau_exp + 2,
+                        k: term.k + 2,
+                        ..*term
+                    },
+                    dir.dtau,
+                );
             }
-            let kf = term.k as f64;
-            latent_kernel_accumulate_term(
-                &mut out,
-                LatentKernelPrimaryTerm {
-                    tau_exp: term.tau_exp + 2,
-                    ..*term
-                },
-                dir.dtau * kf * kf,
-            );
-            latent_kernel_accumulate_term(
-                &mut out,
-                LatentKernelPrimaryTerm {
-                    q_exp: term.q_exp + 1,
-                    tau_exp: term.tau_exp + 2,
-                    k: term.k + 1,
-                    ..*term
-                },
-                -dir.dtau * (2.0 * kf + 1.0),
-            );
-            latent_kernel_accumulate_term(
-                &mut out,
-                LatentKernelPrimaryTerm {
-                    q_exp: term.q_exp + 2,
-                    tau_exp: term.tau_exp + 2,
-                    k: term.k + 2,
-                    ..*term
-                },
-                dir.dtau,
-            );
+            if dir.dqd != 0.0 && term.qdot_power > 0 {
+                latent_kernel_accumulate_term(
+                    &mut out,
+                    LatentKernelPrimaryTerm {
+                        qdot_power: term.qdot_power - 1,
+                        ..*term
+                    },
+                    dir.dqd * term.qdot_power as f64,
+                );
+            }
         }
-        if dir.dqd != 0.0 && term.qdot_power > 0 {
-            latent_kernel_accumulate_term(
-                &mut out,
-                LatentKernelPrimaryTerm {
-                    qdot_power: term.qdot_power - 1,
-                    ..*term
-                },
-                dir.dqd * term.qdot_power as f64,
-            );
-        }
-    }
-    out.into_iter()
-        .filter_map(|((q_exp, qdot_power, tau_exp, k), coeff)| {
-            (coeff != 0.0).then_some(LatentKernelPrimaryTerm {
-                coeff,
-                q_exp,
-                qdot_power,
-                tau_exp,
-                k,
+        out.into_iter()
+            .filter_map(|((q_exp, qdot_power, tau_exp, k), coeff)| {
+                (coeff != 0.0).then_some(LatentKernelPrimaryTerm {
+                    coeff,
+                    q_exp,
+                    qdot_power,
+                    tau_exp,
+                    k,
+                })
             })
-        })
-        .collect()
-}
+            .collect()
+    }
 }
 
 // Fourth-order latent-kernel recurrences have a small finite support. Keeping
@@ -1418,116 +1418,114 @@ fn latent_kernel_term_sequence_inline(
 
 #[cfg(test)]
 mod test_support_multidir_kernel {
-use super::*;
-use super::test_support_kernel_recurrence::latent_kernel_differentiate_terms;
-use gam_math::jet_partitions::MultiDirJet as LatentMultiDirJet;
+    use super::test_support_kernel_recurrence::latent_kernel_differentiate_terms;
+    use super::*;
+    use gam_math::jet_partitions::MultiDirJet as LatentMultiDirJet;
 
-fn latent_kernel_term_lists_for_directions(
-    base_terms: &[LatentKernelPrimaryTerm],
-    directions: &[LatentKernelPrimaryDirection],
-) -> Vec<Vec<LatentKernelPrimaryTerm>> {
-    fn build_mask(
-        mask: usize,
+    fn latent_kernel_term_lists_for_directions(
         base_terms: &[LatentKernelPrimaryTerm],
         directions: &[LatentKernelPrimaryDirection],
-        cache: &mut [Option<Vec<LatentKernelPrimaryTerm>>],
-    ) -> Vec<LatentKernelPrimaryTerm> {
-        if let Some(existing) = &cache[mask] {
-            return existing.clone();
+    ) -> Vec<Vec<LatentKernelPrimaryTerm>> {
+        fn build_mask(
+            mask: usize,
+            base_terms: &[LatentKernelPrimaryTerm],
+            directions: &[LatentKernelPrimaryDirection],
+            cache: &mut [Option<Vec<LatentKernelPrimaryTerm>>],
+        ) -> Vec<LatentKernelPrimaryTerm> {
+            if let Some(existing) = &cache[mask] {
+                return existing.clone();
+            }
+            let built = if mask == 0 {
+                base_terms.to_vec()
+            } else {
+                let bit = 1usize << mask.trailing_zeros();
+                let prev = build_mask(mask ^ bit, base_terms, directions, cache);
+                latent_kernel_differentiate_terms(&prev, directions[bit.trailing_zeros() as usize])
+            };
+            cache[mask] = Some(built.clone());
+            built
         }
-        let built = if mask == 0 {
-            base_terms.to_vec()
-        } else {
-            let bit = 1usize << mask.trailing_zeros();
-            let prev = build_mask(mask ^ bit, base_terms, directions, cache);
-            latent_kernel_differentiate_terms(&prev, directions[bit.trailing_zeros() as usize])
-        };
-        cache[mask] = Some(built.clone());
-        built
+
+        let mut cache = vec![None; 1usize << directions.len()];
+        (0..cache.len())
+            .map(|mask| build_mask(mask, base_terms, directions, &mut cache))
+            .collect()
     }
 
-    let mut cache = vec![None; 1usize << directions.len()];
-    (0..cache.len())
-        .map(|mask| build_mask(mask, base_terms, directions, &mut cache))
-        .collect()
-}
-
-pub(super) fn latent_kernel_sum_log_jet(
-    quadctx: &QuadratureContext,
-    base_terms: &[LatentKernelPrimaryTerm],
-    state: LatentKernelPrimaryState,
-    directions: &[LatentKernelPrimaryDirection],
-    context: &str,
-) -> Result<LatentMultiDirJet, LatentSurvivalError> {
-    let term_lists = latent_kernel_term_lists_for_directions(base_terms, directions);
-    let max_k = term_lists
-        .iter()
-        .flat_map(|terms| terms.iter().map(|term| term.k))
-        .max()
-        .unwrap_or(0);
-    let bundle =
-        log_kernel_bundle(quadctx, state.q.exp(), state.mu, state.sigma, max_k).map_err(|e| {
-            LatentSurvivalError::NumericalFailure {
+    pub(super) fn latent_kernel_sum_log_jet(
+        quadctx: &QuadratureContext,
+        base_terms: &[LatentKernelPrimaryTerm],
+        state: LatentKernelPrimaryState,
+        directions: &[LatentKernelPrimaryDirection],
+        context: &str,
+    ) -> Result<LatentMultiDirJet, LatentSurvivalError> {
+        let term_lists = latent_kernel_term_lists_for_directions(base_terms, directions);
+        let max_k = term_lists
+            .iter()
+            .flat_map(|terms| terms.iter().map(|term| term.k))
+            .max()
+            .unwrap_or(0);
+        let bundle = log_kernel_bundle(quadctx, state.q.exp(), state.mu, state.sigma, max_k)
+            .map_err(|e| LatentSurvivalError::NumericalFailure {
                 reason: format!("{context} kernel evaluation failed: {e}"),
-            }
-        })?;
+            })?;
 
-    let evaluate_terms =
-        |terms: &[LatentKernelPrimaryTerm]| -> Result<(f64, f64), LatentSurvivalError> {
-            let mut log_mags = Vec::new();
-            let mut signs = Vec::new();
-            for term in terms {
-                if term.coeff == 0.0 {
-                    continue;
+        let evaluate_terms =
+            |terms: &[LatentKernelPrimaryTerm]| -> Result<(f64, f64), LatentSurvivalError> {
+                let mut log_mags = Vec::new();
+                let mut signs = Vec::new();
+                for term in terms {
+                    if term.coeff == 0.0 {
+                        continue;
+                    }
+                    if term.qdot_power > 0 && !(state.qdot.is_finite() && state.qdot > 0.0) {
+                        return Err(LatentSurvivalError::NumericalFailure {
+                            reason: format!(
+                                "{context} requires positive finite qdot for exact-event directional terms, got {}",
+                                state.qdot
+                            ),
+                        });
+                    }
+                    let log_qdot = if term.qdot_power > 0 {
+                        state.qdot.ln()
+                    } else {
+                        0.0
+                    };
+                    let log_mag = term.coeff.abs().ln()
+                        + term.q_exp as f64 * state.q
+                        + term.tau_exp as f64 * state.log_sigma_factor
+                        + term.qdot_power as f64 * log_qdot
+                        + bundle.get(term.k);
+                    log_mags.push(log_mag);
+                    signs.push(term.coeff.signum());
                 }
-                if term.qdot_power > 0 && !(state.qdot.is_finite() && state.qdot > 0.0) {
-                    return Err(LatentSurvivalError::NumericalFailure {
-                        reason: format!(
-                            "{context} requires positive finite qdot for exact-event directional terms, got {}",
-                            state.qdot
-                        ),
-                    });
+                if log_mags.is_empty() {
+                    return Ok((f64::NEG_INFINITY, 0.0));
                 }
-                let log_qdot = if term.qdot_power > 0 {
-                    state.qdot.ln()
-                } else {
-                    0.0
-                };
-                let log_mag = term.coeff.abs().ln()
-                    + term.q_exp as f64 * state.q
-                    + term.tau_exp as f64 * state.log_sigma_factor
-                    + term.qdot_power as f64 * log_qdot
-                    + bundle.get(term.k);
-                log_mags.push(log_mag);
-                signs.push(term.coeff.signum());
-            }
-            if log_mags.is_empty() {
-                return Ok((f64::NEG_INFINITY, 0.0));
-            }
-            Ok(signed_log_sum_exp(&log_mags, &signs))
-        };
+                Ok(signed_log_sum_exp(&log_mags, &signs))
+            };
 
-    let (base_log_sum, base_sign) = evaluate_terms(&term_lists[0])?;
-    if !(base_log_sum.is_finite() && base_sign > 0.0) {
-        return Err(LatentSurvivalError::NumericalFailure {
-            reason: format!("{context} produced a non-positive signed kernel sum"),
-        });
+        let (base_log_sum, base_sign) = evaluate_terms(&term_lists[0])?;
+        if !(base_log_sum.is_finite() && base_sign > 0.0) {
+            return Err(LatentSurvivalError::NumericalFailure {
+                reason: format!("{context} produced a non-positive signed kernel sum"),
+            });
+        }
+
+        let mut normalized = LatentMultiDirJet::constant(directions.len(), 1.0);
+        for mask in 1..term_lists.len() {
+            let (log_abs, sign) = evaluate_terms(&term_lists[mask])?;
+            normalized.coeffs[mask] = if !log_abs.is_finite() || sign == 0.0 {
+                0.0
+            } else {
+                sign * (log_abs - base_log_sum).exp()
+            };
+        }
+
+        let mut out = normalized.compose_unary(latent_unary_derivatives_log(1.0));
+        out.coeffs[0] += base_log_sum;
+        Ok(out)
     }
-
-    let mut normalized = LatentMultiDirJet::constant(directions.len(), 1.0);
-    for mask in 1..term_lists.len() {
-        let (log_abs, sign) = evaluate_terms(&term_lists[mask])?;
-        normalized.coeffs[mask] = if !log_abs.is_finite() || sign == 0.0 {
-            0.0
-        } else {
-            sign * (log_abs - base_log_sum).exp()
-        };
-    }
-
-    let mut out = normalized.compose_unary(latent_unary_derivatives_log(1.0));
-    out.coeffs[0] += base_log_sum;
-    Ok(out)
-}
 }
 
 /// A one-pass analytic lift of a latent kernel sum into an order-specific jet.
@@ -1949,255 +1947,255 @@ fn latent_survival_map_right_direction(
 
 #[cfg(test)]
 mod test_support_multidir_row {
-use super::*;
-use super::test_support_multidir_kernel::latent_kernel_sum_log_jet;
-use gam_math::jet_partitions::MultiDirJet as LatentMultiDirJet;
+    use super::test_support_multidir_kernel::latent_kernel_sum_log_jet;
+    use super::*;
+    use gam_math::jet_partitions::MultiDirJet as LatentMultiDirJet;
 
-pub(super) fn latent_survival_row_primary_log_jet_multidir_reference(
-    quadctx: &QuadratureContext,
-    row: &LatentSurvivalRow,
-    q_entry: f64,
-    q_exit: f64,
-    qdot_exit: f64,
-    q_right: f64,
-    mu: f64,
-    sigma: f64,
-    log_sigma_factor: f64,
-    directions: &[LatentSurvivalPrimaryDirection],
-) -> Result<LatentMultiDirJet, String> {
-    let entry_state = LatentKernelPrimaryState {
-        q: q_entry,
-        qdot: 1.0,
-        mu,
-        sigma,
-        log_sigma_factor,
-    };
-    let entry_directions = directions
-        .iter()
-        .copied()
-        .map(latent_survival_map_entry_direction)
-        .collect::<Vec<_>>();
+    pub(super) fn latent_survival_row_primary_log_jet_multidir_reference(
+        quadctx: &QuadratureContext,
+        row: &LatentSurvivalRow,
+        point: LatentSurvivalPrimaryPoint,
+        directions: &[LatentSurvivalPrimaryDirection],
+    ) -> Result<LatentMultiDirJet, String> {
+        let LatentSurvivalPrimaryPoint {
+            q_entry,
+            q_exit,
+            qdot_exit,
+            q_right,
+            mu,
+            sigma,
+        } = point;
+        let log_sigma_factor = point.log_sigma_factor();
+        let entry_state = LatentKernelPrimaryState {
+            q: q_entry,
+            qdot: 1.0,
+            mu,
+            sigma,
+            log_sigma_factor,
+        };
+        let entry_directions = directions
+            .iter()
+            .copied()
+            .map(latent_survival_map_entry_direction)
+            .collect::<Vec<_>>();
 
-    let denominator = latent_kernel_sum_log_jet(
-        quadctx,
-        &[LatentKernelPrimaryTerm {
+        let denominator = latent_kernel_sum_log_jet(
+            quadctx,
+            &[LatentKernelPrimaryTerm {
+                coeff: 1.0,
+                q_exp: 0,
+                qdot_power: 0,
+                tau_exp: 0,
+                k: 0,
+            }],
+            entry_state,
+            &entry_directions,
+            "latent survival denominator",
+        )?;
+
+        // The numerator for right-censoring / exact events is a single-state log-sum
+        // kernel at the exit mass. Interval censoring is the difference of two
+        // single-state kernels at DIFFERENT masses (L at `q_exit`, R at `q_right`),
+        // so it is assembled by `latent_survival_interval_numerator_log_jet` below.
+        let numerator = match row.event_type {
+            LatentSurvivalEventType::RightCensored | LatentSurvivalEventType::ExactEvent => {
+                let exit_state = LatentKernelPrimaryState {
+                    q: q_exit,
+                    qdot: qdot_exit,
+                    mu,
+                    sigma,
+                    log_sigma_factor,
+                };
+                let exit_directions = directions
+                    .iter()
+                    .copied()
+                    .map(|dir| latent_survival_map_exit_direction(dir, row.event_type))
+                    .collect::<Vec<_>>();
+                let numerator_terms = match row.event_type {
+                    LatentSurvivalEventType::RightCensored => vec![LatentKernelPrimaryTerm {
+                        coeff: 1.0,
+                        q_exp: 0,
+                        qdot_power: 0,
+                        tau_exp: 0,
+                        k: 0,
+                    }],
+                    LatentSurvivalEventType::ExactEvent => {
+                        let mut terms = Vec::new();
+                        if row.hazard_unloaded > 0.0 {
+                            terms.push(LatentKernelPrimaryTerm {
+                                coeff: row.hazard_unloaded,
+                                q_exp: 0,
+                                qdot_power: 0,
+                                tau_exp: 0,
+                                k: 0,
+                            });
+                        }
+                        terms.push(LatentKernelPrimaryTerm {
+                            coeff: 1.0,
+                            q_exp: 1,
+                            qdot_power: 1,
+                            tau_exp: 0,
+                            k: 1,
+                        });
+                        terms
+                    }
+                    LatentSurvivalEventType::IntervalCensored => {
+                        // Interval-censored rows are routed to the dedicated two-state
+                        // numerator branch (the outer match arm below), so this inner
+                        // arm is not reached; a clean error rather than a panic guards
+                        // against a future routing change.
+                        return Err(
+                            "interval-censored row reached the single-state numerator branch; \
+                         it must take the dedicated two-state branch"
+                                .to_string(),
+                        );
+                    }
+                };
+                latent_kernel_sum_log_jet(
+                    quadctx,
+                    &numerator_terms,
+                    exit_state,
+                    &exit_directions,
+                    "latent survival numerator",
+                )?
+            }
+            LatentSurvivalEventType::IntervalCensored => {
+                latent_survival_interval_numerator_log_jet_multidir_reference(
+                    quadctx, row, point, directions,
+                )?
+            }
+        };
+
+        let mut total = numerator.add(&denominator.scale(-1.0));
+        // For interval rows the unloaded exit mass is folded into the per-boundary
+        // coefficients `exp(-mass_unloaded_{left,right})` inside the two-state
+        // numerator, so only the (constant) unloaded-entry term remains here; for
+        // right-censoring / exact events the exit/entry unloaded masses are an
+        // additive constant on the log-likelihood.
+        match row.event_type {
+            LatentSurvivalEventType::IntervalCensored => {
+                total.coeffs[0] += row.mass_unloaded_entry;
+            }
+            _ => {
+                total.coeffs[0] += -row.mass_unloaded_exit + row.mass_unloaded_entry;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Interval-censored numerator jet `log[ c_L·K_{0,M_L} − c_R·K_{0,M_R} ]` where
+    /// `M_L = exp(q_exit)`, `M_R = exp(q_right)`, `c_L = exp(-mass_unloaded_left)`
+    /// and `c_R = exp(-mass_unloaded_right)`.
+    ///
+    /// This is the dynamic-time analogue of the static
+    /// [`LatentSurvivalRowJet::interval_censored`] kernel: the interval likelihood
+    /// is the difference of two BOUNDARY survival masses, each a single-state
+    /// order-0 kernel, but at two DISTINCT cumulative masses. Because the two
+    /// boundaries respond to different time functionals (`q_exit` vs `q_right`) we
+    /// cannot fold them into one `latent_kernel_sum_log_jet` state. Instead we:
+    ///   1. build each boundary's `log K_{0,M}` jet at its own state, with its own
+    ///      direction map (left → `dq_exit`, right → `dq_right`; both share
+    ///      `mu`/`sigma`),
+    ///   2. lift each to the LINEAR domain via `exp` (a unary composition whose five
+    ///      derivatives at value `v` are all `exp(v)`), scaled by its coefficient
+    ///      `c_L` (resp. `−c_R`),
+    ///   3. add the two linear-domain jets, and
+    ///   4. drop back to the log domain via the same `log` unary composition the
+    ///      single-state path uses.
+    /// Every multi-direction coefficient (value, score, neg-Hessian, 3rd, 4th)
+    /// follows by the Faà-di-Bruno composition already implemented in
+    /// `MultiDirJet::compose_unary`, so the derivative reductions are consistent
+    /// with the exact-event/right-censored branches by construction.
+    fn latent_survival_interval_numerator_log_jet_multidir_reference(
+        quadctx: &QuadratureContext,
+        row: &LatentSurvivalRow,
+        point: LatentSurvivalPrimaryPoint,
+        directions: &[LatentSurvivalPrimaryDirection],
+    ) -> Result<LatentMultiDirJet, String> {
+        let LatentSurvivalPrimaryPoint {
+            q_exit,
+            q_right,
+            mu,
+            sigma,
+            ..
+        } = point;
+        let log_sigma_factor = point.log_sigma_factor();
+        let single_k0 = [LatentKernelPrimaryTerm {
             coeff: 1.0,
             q_exp: 0,
             qdot_power: 0,
             tau_exp: 0,
             k: 0,
-        }],
-        entry_state,
-        &entry_directions,
-        "latent survival denominator",
-    )?;
+        }];
 
-    // The numerator for right-censoring / exact events is a single-state log-sum
-    // kernel at the exit mass. Interval censoring is the difference of two
-    // single-state kernels at DIFFERENT masses (L at `q_exit`, R at `q_right`),
-    // so it is assembled by `latent_survival_interval_numerator_log_jet` below.
-    let numerator = match row.event_type {
-        LatentSurvivalEventType::RightCensored | LatentSurvivalEventType::ExactEvent => {
-            let exit_state = LatentKernelPrimaryState {
-                q: q_exit,
-                qdot: qdot_exit,
-                mu,
-                sigma,
-                log_sigma_factor,
-            };
-            let exit_directions = directions
-                .iter()
-                .copied()
-                .map(|dir| latent_survival_map_exit_direction(dir, row.event_type))
-                .collect::<Vec<_>>();
-            let numerator_terms = match row.event_type {
-                LatentSurvivalEventType::RightCensored => vec![LatentKernelPrimaryTerm {
-                    coeff: 1.0,
-                    q_exp: 0,
-                    qdot_power: 0,
-                    tau_exp: 0,
-                    k: 0,
-                }],
-                LatentSurvivalEventType::ExactEvent => {
-                    let mut terms = Vec::new();
-                    if row.hazard_unloaded > 0.0 {
-                        terms.push(LatentKernelPrimaryTerm {
-                            coeff: row.hazard_unloaded,
-                            q_exp: 0,
-                            qdot_power: 0,
-                            tau_exp: 0,
-                            k: 0,
-                        });
-                    }
-                    terms.push(LatentKernelPrimaryTerm {
-                        coeff: 1.0,
-                        q_exp: 1,
-                        qdot_power: 1,
-                        tau_exp: 0,
-                        k: 1,
-                    });
-                    terms
-                }
-                LatentSurvivalEventType::IntervalCensored => {
-                    // Interval-censored rows are routed to the dedicated two-state
-                    // numerator branch (the outer match arm below), so this inner
-                    // arm is not reached; a clean error rather than a panic guards
-                    // against a future routing change.
-                    return Err(
-                        "interval-censored row reached the single-state numerator branch; \
-                         it must take the dedicated two-state branch"
-                            .to_string(),
-                    );
-                }
-            };
-            latent_kernel_sum_log_jet(
-                quadctx,
-                &numerator_terms,
-                exit_state,
-                &exit_directions,
-                "latent survival numerator",
-            )?
-        }
-        LatentSurvivalEventType::IntervalCensored => {
-            latent_survival_interval_numerator_log_jet_multidir_reference(
-                quadctx,
-                row,
-                q_exit,
-                q_right,
-                mu,
-                sigma,
-                log_sigma_factor,
-                directions,
-            )?
-        }
-    };
+        let left_state = LatentKernelPrimaryState {
+            q: q_exit,
+            qdot: 1.0,
+            mu,
+            sigma,
+            log_sigma_factor,
+        };
+        let right_state = LatentKernelPrimaryState {
+            q: q_right,
+            qdot: 1.0,
+            mu,
+            sigma,
+            log_sigma_factor,
+        };
+        let left_directions = directions
+            .iter()
+            .copied()
+            .map(latent_survival_map_left_direction)
+            .collect::<Vec<_>>();
+        let right_directions = directions
+            .iter()
+            .copied()
+            .map(latent_survival_map_right_direction)
+            .collect::<Vec<_>>();
 
-    let mut total = numerator.add(&denominator.scale(-1.0));
-    // For interval rows the unloaded exit mass is folded into the per-boundary
-    // coefficients `exp(-mass_unloaded_{left,right})` inside the two-state
-    // numerator, so only the (constant) unloaded-entry term remains here; for
-    // right-censoring / exact events the exit/entry unloaded masses are an
-    // additive constant on the log-likelihood.
-    match row.event_type {
-        LatentSurvivalEventType::IntervalCensored => {
-            total.coeffs[0] += row.mass_unloaded_entry;
-        }
-        _ => {
-            total.coeffs[0] += -row.mass_unloaded_exit + row.mass_unloaded_entry;
-        }
-    }
-    Ok(total)
-}
+        let log_left = latent_kernel_sum_log_jet(
+            quadctx,
+            &single_k0,
+            left_state,
+            &left_directions,
+            "latent survival interval left boundary",
+        )?;
+        let log_right = latent_kernel_sum_log_jet(
+            quadctx,
+            &single_k0,
+            right_state,
+            &right_directions,
+            "latent survival interval right boundary",
+        )?;
 
-/// Interval-censored numerator jet `log[ c_L·K_{0,M_L} − c_R·K_{0,M_R} ]` where
-/// `M_L = exp(q_exit)`, `M_R = exp(q_right)`, `c_L = exp(-mass_unloaded_left)`
-/// and `c_R = exp(-mass_unloaded_right)`.
-///
-/// This is the dynamic-time analogue of the static
-/// [`LatentSurvivalRowJet::interval_censored`] kernel: the interval likelihood
-/// is the difference of two BOUNDARY survival masses, each a single-state
-/// order-0 kernel, but at two DISTINCT cumulative masses. Because the two
-/// boundaries respond to different time functionals (`q_exit` vs `q_right`) we
-/// cannot fold them into one `latent_kernel_sum_log_jet` state. Instead we:
-///   1. build each boundary's `log K_{0,M}` jet at its own state, with its own
-///      direction map (left → `dq_exit`, right → `dq_right`; both share
-///      `mu`/`sigma`),
-///   2. lift each to the LINEAR domain via `exp` (a unary composition whose five
-///      derivatives at value `v` are all `exp(v)`), scaled by its coefficient
-///      `c_L` (resp. `−c_R`),
-///   3. add the two linear-domain jets, and
-///   4. drop back to the log domain via the same `log` unary composition the
-///      single-state path uses.
-/// Every multi-direction coefficient (value, score, neg-Hessian, 3rd, 4th)
-/// follows by the Faà-di-Bruno composition already implemented in
-/// `MultiDirJet::compose_unary`, so the derivative reductions are consistent
-/// with the exact-event/right-censored branches by construction.
-fn latent_survival_interval_numerator_log_jet_multidir_reference(
-    quadctx: &QuadratureContext,
-    row: &LatentSurvivalRow,
-    q_exit: f64,
-    q_right: f64,
-    mu: f64,
-    sigma: f64,
-    log_sigma_factor: f64,
-    directions: &[LatentSurvivalPrimaryDirection],
-) -> Result<LatentMultiDirJet, String> {
-    let single_k0 = [LatentKernelPrimaryTerm {
-        coeff: 1.0,
-        q_exp: 0,
-        qdot_power: 0,
-        tau_exp: 0,
-        k: 0,
-    }];
+        // Lift each boundary's log-kernel jet to the linear domain and scale by the
+        // unloaded-mass prefactor. exp''''(v) = exp(v) for all orders, so the unary
+        // derivative tower is `[exp(v); exp(v); exp(v); exp(v); exp(v)]`.
+        let c_left = (-row.mass_unloaded_left).exp();
+        let c_right = (-row.mass_unloaded_right).exp();
+        let exp_left_value = log_left.coeff(0).exp();
+        let exp_right_value = log_right.coeff(0).exp();
+        let linear_left = log_left.compose_unary([exp_left_value; 5]).scale(c_left);
+        let linear_right = log_right.compose_unary([exp_right_value; 5]).scale(c_right);
 
-    let left_state = LatentKernelPrimaryState {
-        q: q_exit,
-        qdot: 1.0,
-        mu,
-        sigma,
-        log_sigma_factor,
-    };
-    let right_state = LatentKernelPrimaryState {
-        q: q_right,
-        qdot: 1.0,
-        mu,
-        sigma,
-        log_sigma_factor,
-    };
-    let left_directions = directions
-        .iter()
-        .copied()
-        .map(latent_survival_map_left_direction)
-        .collect::<Vec<_>>();
-    let right_directions = directions
-        .iter()
-        .copied()
-        .map(latent_survival_map_right_direction)
-        .collect::<Vec<_>>();
-
-    let log_left = latent_kernel_sum_log_jet(
-        quadctx,
-        &single_k0,
-        left_state,
-        &left_directions,
-        "latent survival interval left boundary",
-    )?;
-    let log_right = latent_kernel_sum_log_jet(
-        quadctx,
-        &single_k0,
-        right_state,
-        &right_directions,
-        "latent survival interval right boundary",
-    )?;
-
-    // Lift each boundary's log-kernel jet to the linear domain and scale by the
-    // unloaded-mass prefactor. exp''''(v) = exp(v) for all orders, so the unary
-    // derivative tower is `[exp(v); exp(v); exp(v); exp(v); exp(v)]`.
-    let c_left = (-row.mass_unloaded_left).exp();
-    let c_right = (-row.mass_unloaded_right).exp();
-    let exp_left_value = log_left.coeff(0).exp();
-    let exp_right_value = log_right.coeff(0).exp();
-    let linear_left = log_left.compose_unary([exp_left_value; 5]).scale(c_left);
-    let linear_right = log_right.compose_unary([exp_right_value; 5]).scale(c_right);
-
-    let linear_numerator = linear_left.add(&linear_right.scale(-1.0));
-    let base = linear_numerator.coeff(0);
-    if !(base.is_finite() && base > 0.0) {
-        return Err(LatentSurvivalError::NumericalFailure {
+        let linear_numerator = linear_left.add(&linear_right.scale(-1.0));
+        let base = linear_numerator.coeff(0);
+        if !(base.is_finite() && base > 0.0) {
+            return Err(LatentSurvivalError::NumericalFailure {
             reason: format!(
                 "latent survival interval numerator must be a positive survival-mass difference, \
                  got c_L*K0(M_L) - c_R*K0(M_R) = {base}; require M_L < M_R (i.e. L < R)"
             ),
         }
         .into());
+        }
+        // Drop back to the log domain. `latent_unary_derivatives_log(base)` is the
+        // unary derivative tower of `ln` at the positive base value, so the composed
+        // value channel is `ln(base)` and the higher coefficients are the
+        // log-of-a-difference score / curvature, consistent with the single-state
+        // log-sum path (which composes `ln` at its normalised base of 1).
+        Ok(linear_numerator.compose_unary(latent_unary_derivatives_log(base)))
     }
-    // Drop back to the log domain. `latent_unary_derivatives_log(base)` is the
-    // unary derivative tower of `ln` at the positive base value, so the composed
-    // value channel is `ln(base)` and the higher coefficients are the
-    // log-of-a-difference score / curvature, consistent with the single-state
-    // log-sum path (which composes `ln` at its normalised base of 1).
-    Ok(linear_numerator.compose_unary(latent_unary_derivatives_log(base)))
-}
 }
 
 /// The single latent-survival row program, instantiated at an order-two,
@@ -2208,14 +2206,17 @@ fn latent_survival_row_primary_jet<const K: usize, B: LatentPrimaryJetBackend<K>
     backend: &B,
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
-    q_entry: f64,
-    q_exit: f64,
-    qdot_exit: f64,
-    q_right: f64,
-    mu: f64,
-    sigma: f64,
-    log_sigma_factor: f64,
+    point: LatentSurvivalPrimaryPoint,
 ) -> Result<B::Jet, String> {
+    let LatentSurvivalPrimaryPoint {
+        q_entry,
+        q_exit,
+        qdot_exit,
+        mu,
+        sigma,
+        ..
+    } = point;
+    let log_sigma_factor = point.log_sigma_factor();
     let entry_state = LatentKernelPrimaryState {
         q: q_entry,
         qdot: 1.0,
@@ -2243,7 +2244,7 @@ fn latent_survival_row_primary_jet<const K: usize, B: LatentPrimaryJetBackend<K>
         .map_err(|error| error.to_string())?;
 
     let numerator = match row.event_type {
-        LatentSurvivalEventType::RightCensored | LatentSurvivalEventType::ExactEvent => {
+        LatentSurvivalEventType::RightCensored => {
             let exit_state = LatentKernelPrimaryState {
                 q: q_exit,
                 qdot: qdot_exit,
@@ -2257,68 +2258,67 @@ fn latent_survival_row_primary_jet<const K: usize, B: LatentPrimaryJetBackend<K>
                     row.event_type,
                 )
             });
-            match row.event_type {
-                LatentSurvivalEventType::RightCensored => backend
-                    .kernel_sum_log(
-                        quadctx,
-                        &[LatentKernelPrimaryTerm {
-                            coeff: 1.0,
-                            q_exp: 0,
-                            qdot_power: 0,
-                            tau_exp: 0,
-                            k: 0,
-                        }],
-                        exit_state,
-                        &exit_directions,
-                        "latent survival numerator",
-                    )
-                    .map_err(|error| error.to_string())?,
-                LatentSurvivalEventType::ExactEvent => {
-                    // A zero unloaded-hazard term is retained in the stack
-                    // array but disappears in the signed-log evaluator and all
-                    // derivative recurrences.  This avoids a per-row Vec while
-                    // preserving the exact loaded-only branch.
-                    let numerator_terms = [
-                        LatentKernelPrimaryTerm {
-                            coeff: row.hazard_unloaded,
-                            q_exp: 0,
-                            qdot_power: 0,
-                            tau_exp: 0,
-                            k: 0,
-                        },
-                        LatentKernelPrimaryTerm {
-                            coeff: 1.0,
-                            q_exp: 1,
-                            qdot_power: 1,
-                            tau_exp: 0,
-                            k: 1,
-                        },
-                    ];
-                    backend
-                        .kernel_sum_log(
-                            quadctx,
-                            &numerator_terms,
-                            exit_state,
-                            &exit_directions,
-                            "latent survival numerator",
-                        )
-                        .map_err(|error| error.to_string())?
-                }
-                LatentSurvivalEventType::IntervalCensored => {
-                    unreachable!("interval rows are routed to the dedicated two-boundary branch")
-                }
-            }
+            backend
+                .kernel_sum_log(
+                    quadctx,
+                    &[LatentKernelPrimaryTerm {
+                        coeff: 1.0,
+                        q_exp: 0,
+                        qdot_power: 0,
+                        tau_exp: 0,
+                        k: 0,
+                    }],
+                    exit_state,
+                    &exit_directions,
+                    "latent survival numerator",
+                )
+                .map_err(|error| error.to_string())?
         }
-        LatentSurvivalEventType::IntervalCensored => latent_survival_interval_numerator_jet(
-            backend,
-            quadctx,
-            row,
-            q_exit,
-            q_right,
-            mu,
-            sigma,
-            log_sigma_factor,
-        )?,
+        LatentSurvivalEventType::ExactEvent => {
+            let exit_state = LatentKernelPrimaryState {
+                q: q_exit,
+                qdot: qdot_exit,
+                mu,
+                sigma,
+                log_sigma_factor,
+            };
+            let exit_directions: [LatentKernelPrimaryDirection; K] = std::array::from_fn(|a| {
+                latent_survival_map_exit_direction(
+                    latent_survival_basis_direction(a),
+                    LatentSurvivalEventType::ExactEvent,
+                )
+            });
+            // A zero unloaded-hazard term remains in this stack array but the
+            // signed-log evaluator and derivative recurrences discard it.
+            let numerator_terms = [
+                LatentKernelPrimaryTerm {
+                    coeff: row.hazard_unloaded,
+                    q_exp: 0,
+                    qdot_power: 0,
+                    tau_exp: 0,
+                    k: 0,
+                },
+                LatentKernelPrimaryTerm {
+                    coeff: 1.0,
+                    q_exp: 1,
+                    qdot_power: 1,
+                    tau_exp: 0,
+                    k: 1,
+                },
+            ];
+            backend
+                .kernel_sum_log(
+                    quadctx,
+                    &numerator_terms,
+                    exit_state,
+                    &exit_directions,
+                    "latent survival numerator",
+                )
+                .map_err(|error| error.to_string())?
+        }
+        LatentSurvivalEventType::IntervalCensored => {
+            latent_survival_interval_numerator_jet(backend, quadctx, row, point)?
+        }
     };
 
     let unloaded_offset = match row.event_type {
@@ -2334,12 +2334,16 @@ fn latent_survival_interval_numerator_jet<const K: usize, B: LatentPrimaryJetBac
     backend: &B,
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
-    q_exit: f64,
-    q_right: f64,
-    mu: f64,
-    sigma: f64,
-    log_sigma_factor: f64,
+    point: LatentSurvivalPrimaryPoint,
 ) -> Result<B::Jet, String> {
+    let LatentSurvivalPrimaryPoint {
+        q_exit,
+        q_right,
+        mu,
+        sigma,
+        ..
+    } = point;
+    let log_sigma_factor = point.log_sigma_factor();
     let single_k0 = [LatentKernelPrimaryTerm {
         coeff: 1.0,
         q_exp: 0,
@@ -2405,27 +2409,15 @@ fn latent_survival_interval_numerator_jet<const K: usize, B: LatentPrimaryJetBac
 fn latent_survival_row_primary_gradient_hessian(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
-    q_entry: f64,
-    q_exit: f64,
-    qdot_exit: f64,
-    q_right: f64,
-    mu: f64,
-    sigma: f64,
+    point: LatentSurvivalPrimaryPoint,
     include_log_sigma: bool,
 ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-    let log_sigma_factor = if sigma > 0.0 { sigma.ln() } else { 0.0 };
     if include_log_sigma {
         let out = latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_DIM, _>(
             &LatentOrder2Backend,
             quadctx,
             row,
-            q_entry,
-            q_exit,
-            qdot_exit,
-            q_right,
-            mu,
-            sigma,
-            log_sigma_factor,
+            point,
         )?;
         let out_gradient = out.g();
         let hessian = out.h();
@@ -2442,13 +2434,7 @@ fn latent_survival_row_primary_gradient_hessian(
             &LatentOrder2Backend,
             quadctx,
             row,
-            q_entry,
-            q_exit,
-            qdot_exit,
-            q_right,
-            mu,
-            sigma,
-            log_sigma_factor,
+            point,
         )?;
         let out_gradient = out.g();
         let out_hessian = out.h();
@@ -2477,45 +2463,24 @@ fn latent_survival_row_primary_gradient_hessian(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn latent_survival_row_primary_one_seed_fixed_sigma(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
-    q_entry: f64,
-    q_exit: f64,
-    qdot_exit: f64,
-    q_right: f64,
-    mu: f64,
-    sigma: f64,
+    point: LatentSurvivalPrimaryPoint,
     direction: &Array1<f64>,
 ) -> Result<OneSeed<LATENT_SURVIVAL_PRIMARY_LOG_SIGMA>, String> {
     let backend = LatentOneSeedBackend {
         direction: std::array::from_fn(|a| direction[a]),
     };
     latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_LOG_SIGMA, _>(
-        &backend,
-        quadctx,
-        row,
-        q_entry,
-        q_exit,
-        qdot_exit,
-        q_right,
-        mu,
-        sigma,
-        if sigma > 0.0 { sigma.ln() } else { 0.0 },
+        &backend, quadctx, row, point,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn latent_survival_row_primary_two_seed_fixed_sigma(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
-    q_entry: f64,
-    q_exit: f64,
-    qdot_exit: f64,
-    q_right: f64,
-    mu: f64,
-    sigma: f64,
+    point: LatentSurvivalPrimaryPoint,
     direction_u: &Array1<f64>,
     direction_v: &Array1<f64>,
 ) -> Result<TwoSeed<LATENT_SURVIVAL_PRIMARY_LOG_SIGMA>, String> {
@@ -2524,47 +2489,23 @@ fn latent_survival_row_primary_two_seed_fixed_sigma(
         direction_v: std::array::from_fn(|a| direction_v[a]),
     };
     latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_LOG_SIGMA, _>(
-        &backend,
-        quadctx,
-        row,
-        q_entry,
-        q_exit,
-        qdot_exit,
-        q_right,
-        mu,
-        sigma,
-        if sigma > 0.0 { sigma.ln() } else { 0.0 },
+        &backend, quadctx, row, point,
     )
 }
 
 fn latent_survival_row_primary_third_contracted(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
-    q_entry: f64,
-    q_exit: f64,
-    qdot_exit: f64,
-    q_right: f64,
-    mu: f64,
-    sigma: f64,
+    point: LatentSurvivalPrimaryPoint,
     direction: &Array1<f64>,
     include_log_sigma: bool,
 ) -> Result<Array2<f64>, String> {
-    let log_sigma_factor = if sigma > 0.0 { sigma.ln() } else { 0.0 };
     if include_log_sigma {
         let backend = LatentOneSeedBackend {
             direction: std::array::from_fn(|a| direction[a]),
         };
         let out = latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_DIM, _>(
-            &backend,
-            quadctx,
-            row,
-            q_entry,
-            q_exit,
-            qdot_exit,
-            q_right,
-            mu,
-            sigma,
-            log_sigma_factor,
+            &backend, quadctx, row, point,
         )?;
         let third = out.contracted_third();
         Ok(Array2::from_shape_fn(
@@ -2572,9 +2513,7 @@ fn latent_survival_row_primary_third_contracted(
             |(a, b)| -third[a][b],
         ))
     } else {
-        let out = latent_survival_row_primary_one_seed_fixed_sigma(
-            quadctx, row, q_entry, q_exit, qdot_exit, q_right, mu, sigma, direction,
-        )?;
+        let out = latent_survival_row_primary_one_seed_fixed_sigma(quadctx, row, point, direction)?;
         let third = out.contracted_third();
         Ok(Array2::from_shape_fn(
             (LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM),
@@ -2589,37 +2528,21 @@ fn latent_survival_row_primary_third_contracted(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn latent_survival_row_primary_fourth_contracted(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
-    q_entry: f64,
-    q_exit: f64,
-    qdot_exit: f64,
-    q_right: f64,
-    mu: f64,
-    sigma: f64,
+    point: LatentSurvivalPrimaryPoint,
     direction_u: &Array1<f64>,
     direction_v: &Array1<f64>,
     include_log_sigma: bool,
 ) -> Result<Array2<f64>, String> {
-    let log_sigma_factor = if sigma > 0.0 { sigma.ln() } else { 0.0 };
     if include_log_sigma {
         let backend = LatentTwoSeedBackend {
             direction_u: std::array::from_fn(|a| direction_u[a]),
             direction_v: std::array::from_fn(|a| direction_v[a]),
         };
         let out = latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_DIM, _>(
-            &backend,
-            quadctx,
-            row,
-            q_entry,
-            q_exit,
-            qdot_exit,
-            q_right,
-            mu,
-            sigma,
-            log_sigma_factor,
+            &backend, quadctx, row, point,
         )?;
         let fourth = out.contracted_fourth();
         Ok(Array2::from_shape_fn(
@@ -2630,12 +2553,7 @@ fn latent_survival_row_primary_fourth_contracted(
         let out = latent_survival_row_primary_two_seed_fixed_sigma(
             quadctx,
             row,
-            q_entry,
-            q_exit,
-            qdot_exit,
-            q_right,
-            mu,
-            sigma,
+            point,
             direction_u,
             direction_v,
         )?;
@@ -2655,186 +2573,136 @@ fn latent_survival_row_primary_fourth_contracted(
 
 #[cfg(test)]
 mod test_support_multidir_channels {
-use super::*;
-use super::test_support_multidir_row::latent_survival_row_primary_log_jet_multidir_reference;
+    use super::test_support_multidir_row::latent_survival_row_primary_log_jet_multidir_reference;
+    use super::*;
 
-pub(super) fn latent_survival_row_primary_gradient_hessian_multidir_reference(
-    quadctx: &QuadratureContext,
-    row: &LatentSurvivalRow,
-    q_entry: f64,
-    q_exit: f64,
-    qdot_exit: f64,
-    q_right: f64,
-    mu: f64,
-    sigma: f64,
-    include_log_sigma: bool,
-) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-    let log_sigma_factor = if sigma > 0.0 { sigma.ln() } else { 0.0 };
-    let mut gradient = Array1::<f64>::zeros(LATENT_SURVIVAL_PRIMARY_DIM);
-    let mut neg_hessian =
-        Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
-    let active_primary = if include_log_sigma {
-        LATENT_SURVIVAL_PRIMARY_DIM
-    } else {
-        LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
-    };
-    let log_lik = latent_survival_row_primary_log_jet_multidir_reference(
-        quadctx,
-        row,
-        q_entry,
-        q_exit,
-        qdot_exit,
-        q_right,
-        mu,
-        sigma,
-        log_sigma_factor,
-        &[],
-    )?
-    .coeff(0);
-    for a in 0..active_primary {
-        let dir_a = latent_survival_basis_direction(a);
-        gradient[a] = latent_survival_row_primary_log_jet_multidir_reference(
-            quadctx,
-            row,
-            q_entry,
-            q_exit,
-            qdot_exit,
-            q_right,
-            mu,
-            sigma,
-            log_sigma_factor,
-            &[dir_a],
-        )?
-        .coeff(1);
-        for b in a..active_primary {
-            let coeff = latent_survival_row_primary_log_jet_multidir_reference(
+    pub(super) fn latent_survival_row_primary_gradient_hessian_multidir_reference(
+        quadctx: &QuadratureContext,
+        row: &LatentSurvivalRow,
+        point: LatentSurvivalPrimaryPoint,
+        include_log_sigma: bool,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let mut gradient = Array1::<f64>::zeros(LATENT_SURVIVAL_PRIMARY_DIM);
+        let mut neg_hessian =
+            Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
+        let active_primary = if include_log_sigma {
+            LATENT_SURVIVAL_PRIMARY_DIM
+        } else {
+            LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
+        };
+        let log_lik =
+            latent_survival_row_primary_log_jet_multidir_reference(quadctx, row, point, &[])?
+                .coeff(0);
+        for a in 0..active_primary {
+            let dir_a = latent_survival_basis_direction(a);
+            gradient[a] = latent_survival_row_primary_log_jet_multidir_reference(
                 quadctx,
                 row,
-                q_entry,
-                q_exit,
-                qdot_exit,
-                q_right,
-                mu,
-                sigma,
-                log_sigma_factor,
-                &[dir_a, latent_survival_basis_direction(b)],
+                point,
+                &[dir_a],
             )?
-            .coeff(3);
-            neg_hessian[[a, b]] = -coeff;
-            neg_hessian[[b, a]] = -coeff;
+            .coeff(1);
+            for b in a..active_primary {
+                let coeff = latent_survival_row_primary_log_jet_multidir_reference(
+                    quadctx,
+                    row,
+                    point,
+                    &[dir_a, latent_survival_basis_direction(b)],
+                )?
+                .coeff(3);
+                neg_hessian[[a, b]] = -coeff;
+                neg_hessian[[b, a]] = -coeff;
+            }
         }
+        Ok((log_lik, gradient, neg_hessian))
     }
-    Ok((log_lik, gradient, neg_hessian))
-}
 
-pub(super) fn latent_survival_row_primary_third_contracted_multidir_reference(
-    quadctx: &QuadratureContext,
-    row: &LatentSurvivalRow,
-    q_entry: f64,
-    q_exit: f64,
-    qdot_exit: f64,
-    q_right: f64,
-    mu: f64,
-    sigma: f64,
-    direction: &Array1<f64>,
-    include_log_sigma: bool,
-) -> Result<Array2<f64>, String> {
-    let log_sigma_factor = if sigma > 0.0 { sigma.ln() } else { 0.0 };
-    let active_primary = if include_log_sigma {
-        LATENT_SURVIVAL_PRIMARY_DIM
-    } else {
-        LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
-    };
-    let dir = LatentSurvivalPrimaryDirection {
-        dq_entry: direction[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
-        dq_exit: direction[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
-        dqdot_exit: direction[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
-        dq_right: direction[LATENT_SURVIVAL_PRIMARY_Q_RIGHT],
-        dmu: direction[LATENT_SURVIVAL_PRIMARY_MU],
-        dlog_sigma: direction[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA],
-    };
-    let mut out = Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
-    for a in 0..active_primary {
-        let dir_a = latent_survival_basis_direction(a);
-        for b in a..active_primary {
-            let coeff = latent_survival_row_primary_log_jet_multidir_reference(
-                quadctx,
-                row,
-                q_entry,
-                q_exit,
-                qdot_exit,
-                q_right,
-                mu,
-                sigma,
-                log_sigma_factor,
-                &[dir_a, latent_survival_basis_direction(b), dir],
-            )?
-            .coeff(7);
-            out[[a, b]] = -coeff;
-            out[[b, a]] = -coeff;
+    pub(super) fn latent_survival_row_primary_third_contracted_multidir_reference(
+        quadctx: &QuadratureContext,
+        row: &LatentSurvivalRow,
+        point: LatentSurvivalPrimaryPoint,
+        direction: &Array1<f64>,
+        include_log_sigma: bool,
+    ) -> Result<Array2<f64>, String> {
+        let active_primary = if include_log_sigma {
+            LATENT_SURVIVAL_PRIMARY_DIM
+        } else {
+            LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
+        };
+        let dir = LatentSurvivalPrimaryDirection {
+            dq_entry: direction[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
+            dq_exit: direction[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
+            dqdot_exit: direction[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
+            dq_right: direction[LATENT_SURVIVAL_PRIMARY_Q_RIGHT],
+            dmu: direction[LATENT_SURVIVAL_PRIMARY_MU],
+            dlog_sigma: direction[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA],
+        };
+        let mut out =
+            Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
+        for a in 0..active_primary {
+            let dir_a = latent_survival_basis_direction(a);
+            for b in a..active_primary {
+                let coeff = latent_survival_row_primary_log_jet_multidir_reference(
+                    quadctx,
+                    row,
+                    point,
+                    &[dir_a, latent_survival_basis_direction(b), dir],
+                )?
+                .coeff(7);
+                out[[a, b]] = -coeff;
+                out[[b, a]] = -coeff;
+            }
         }
+        Ok(out)
     }
-    Ok(out)
-}
 
-pub(super) fn latent_survival_row_primary_fourth_contracted_multidir_reference(
-    quadctx: &QuadratureContext,
-    row: &LatentSurvivalRow,
-    q_entry: f64,
-    q_exit: f64,
-    qdot_exit: f64,
-    q_right: f64,
-    mu: f64,
-    sigma: f64,
-    direction_u: &Array1<f64>,
-    direction_v: &Array1<f64>,
-    include_log_sigma: bool,
-) -> Result<Array2<f64>, String> {
-    let log_sigma_factor = if sigma > 0.0 { sigma.ln() } else { 0.0 };
-    let active_primary = if include_log_sigma {
-        LATENT_SURVIVAL_PRIMARY_DIM
-    } else {
-        LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
-    };
-    let dir_u = LatentSurvivalPrimaryDirection {
-        dq_entry: direction_u[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
-        dq_exit: direction_u[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
-        dqdot_exit: direction_u[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
-        dq_right: direction_u[LATENT_SURVIVAL_PRIMARY_Q_RIGHT],
-        dmu: direction_u[LATENT_SURVIVAL_PRIMARY_MU],
-        dlog_sigma: direction_u[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA],
-    };
-    let dir_v = LatentSurvivalPrimaryDirection {
-        dq_entry: direction_v[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
-        dq_exit: direction_v[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
-        dqdot_exit: direction_v[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
-        dq_right: direction_v[LATENT_SURVIVAL_PRIMARY_Q_RIGHT],
-        dmu: direction_v[LATENT_SURVIVAL_PRIMARY_MU],
-        dlog_sigma: direction_v[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA],
-    };
-    let mut out = Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
-    for a in 0..active_primary {
-        let dir_a = latent_survival_basis_direction(a);
-        for b in a..active_primary {
-            let coeff = latent_survival_row_primary_log_jet_multidir_reference(
-                quadctx,
-                row,
-                q_entry,
-                q_exit,
-                qdot_exit,
-                q_right,
-                mu,
-                sigma,
-                log_sigma_factor,
-                &[dir_a, latent_survival_basis_direction(b), dir_u, dir_v],
-            )?
-            .coeff(15);
-            out[[a, b]] = -coeff;
-            out[[b, a]] = -coeff;
+    pub(super) fn latent_survival_row_primary_fourth_contracted_multidir_reference(
+        quadctx: &QuadratureContext,
+        row: &LatentSurvivalRow,
+        point: LatentSurvivalPrimaryPoint,
+        direction_u: &Array1<f64>,
+        direction_v: &Array1<f64>,
+        include_log_sigma: bool,
+    ) -> Result<Array2<f64>, String> {
+        let active_primary = if include_log_sigma {
+            LATENT_SURVIVAL_PRIMARY_DIM
+        } else {
+            LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
+        };
+        let dir_u = LatentSurvivalPrimaryDirection {
+            dq_entry: direction_u[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
+            dq_exit: direction_u[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
+            dqdot_exit: direction_u[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
+            dq_right: direction_u[LATENT_SURVIVAL_PRIMARY_Q_RIGHT],
+            dmu: direction_u[LATENT_SURVIVAL_PRIMARY_MU],
+            dlog_sigma: direction_u[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA],
+        };
+        let dir_v = LatentSurvivalPrimaryDirection {
+            dq_entry: direction_v[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
+            dq_exit: direction_v[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
+            dqdot_exit: direction_v[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
+            dq_right: direction_v[LATENT_SURVIVAL_PRIMARY_Q_RIGHT],
+            dmu: direction_v[LATENT_SURVIVAL_PRIMARY_MU],
+            dlog_sigma: direction_v[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA],
+        };
+        let mut out =
+            Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
+        for a in 0..active_primary {
+            let dir_a = latent_survival_basis_direction(a);
+            for b in a..active_primary {
+                let coeff = latent_survival_row_primary_log_jet_multidir_reference(
+                    quadctx,
+                    row,
+                    point,
+                    &[dir_a, latent_survival_basis_direction(b), dir_u, dir_v],
+                )?
+                .coeff(15);
+                out[[a, b]] = -coeff;
+                out[[b, a]] = -coeff;
+            }
         }
+        Ok(out)
     }
-    Ok(out)
-}
 }
 
 #[derive(Clone)]
@@ -3255,15 +3123,18 @@ impl LatentSurvivalFamily {
                     qdot_exit[row_idx],
                     q_right[row_idx],
                 )?;
+                let point = LatentSurvivalPrimaryPoint {
+                    q_entry: q_entry[row_idx],
+                    q_exit: q_exit[row_idx],
+                    qdot_exit: qdot_exit[row_idx],
+                    q_right: q_right[row_idx],
+                    mu: mu[row_idx],
+                    sigma,
+                };
                 let (row_ll, primary_gradient, _) = latent_survival_row_primary_gradient_hessian(
                     &self.quadctx,
                     &row,
-                    q_entry[row_idx],
-                    q_exit[row_idx],
-                    qdot_exit[row_idx],
-                    q_right[row_idx],
-                    mu[row_idx],
-                    sigma,
+                    point,
                     include_log_sigma,
                 )?;
                 acc.ll += wi * row_ll;
@@ -3341,15 +3212,18 @@ impl LatentSurvivalFamily {
                 qdot_exit[row_idx],
                 q_right[row_idx],
             )?;
+            let point = LatentSurvivalPrimaryPoint {
+                q_entry: q_entry[row_idx],
+                q_exit: q_exit[row_idx],
+                qdot_exit: qdot_exit[row_idx],
+                q_right: q_right[row_idx],
+                mu: mu[row_idx],
+                sigma,
+            };
             let (_, primary_gradient, _) = latent_survival_row_primary_gradient_hessian(
                 &self.quadctx,
                 &row,
-                q_entry[row_idx],
-                q_exit[row_idx],
-                qdot_exit[row_idx],
-                q_right[row_idx],
-                mu[row_idx],
-                sigma,
+                point,
                 include_log_sigma,
             )
             .map_err(|reason| LatentSurvivalError::NumericalFailure { reason })?;
@@ -3535,12 +3409,14 @@ impl LatentSurvivalFamily {
                 latent_survival_row_primary_gradient_hessian(
                     &self.quadctx,
                     &row,
-                    q_entry[row_idx],
-                    q_exit[row_idx],
-                    qdot_exit[row_idx],
-                    q_right[row_idx],
-                    mu[row_idx],
-                    sigma,
+                    LatentSurvivalPrimaryPoint {
+                        q_entry: q_entry[row_idx],
+                        q_exit: q_exit[row_idx],
+                        qdot_exit: qdot_exit[row_idx],
+                        q_right: q_right[row_idx],
+                        mu: mu[row_idx],
+                        sigma,
+                    },
                     include_log_sigma,
                 )?;
             ll += wi * row_ll;
@@ -3595,12 +3471,14 @@ impl LatentSurvivalFamily {
                     latent_survival_row_primary_gradient_hessian(
                         &self.quadctx,
                         &row,
-                        q_entry[row_idx],
-                        q_exit[row_idx],
-                        qdot_exit[row_idx],
-                        q_right[row_idx],
-                        mu[row_idx],
-                        sigma,
+                        LatentSurvivalPrimaryPoint {
+                            q_entry: q_entry[row_idx],
+                            q_exit: q_exit[row_idx],
+                            qdot_exit: qdot_exit[row_idx],
+                            q_right: q_right[row_idx],
+                            mu: mu[row_idx],
+                            sigma,
+                        },
                         include_log_sigma,
                     )?;
                 acc.ll += wi * row_ll;
@@ -3667,12 +3545,14 @@ impl LatentSurvivalFamily {
                 let third = latent_survival_row_primary_third_contracted(
                     &self.quadctx,
                     &row,
-                    q_entry[row_idx],
-                    q_exit[row_idx],
-                    qdot_exit[row_idx],
-                    q_right[row_idx],
-                    mu[row_idx],
-                    sigma,
+                    LatentSurvivalPrimaryPoint {
+                        q_entry: q_entry[row_idx],
+                        q_exit: q_exit[row_idx],
+                        qdot_exit: qdot_exit[row_idx],
+                        q_right: q_right[row_idx],
+                        mu: mu[row_idx],
+                        sigma,
+                    },
                     &direction,
                     include_log_sigma,
                 )?;
@@ -3735,12 +3615,14 @@ impl LatentSurvivalFamily {
                 let fourth = latent_survival_row_primary_fourth_contracted(
                     &self.quadctx,
                     &row,
-                    q_entry[row_idx],
-                    q_exit[row_idx],
-                    qdot_exit[row_idx],
-                    q_right[row_idx],
-                    mu[row_idx],
-                    sigma,
+                    LatentSurvivalPrimaryPoint {
+                        q_entry: q_entry[row_idx],
+                        q_exit: q_exit[row_idx],
+                        qdot_exit: qdot_exit[row_idx],
+                        q_right: q_right[row_idx],
+                        mu: mu[row_idx],
+                        sigma,
+                    },
                     &direction_u,
                     &direction_v,
                     include_log_sigma,
@@ -4431,12 +4313,14 @@ impl LatentBinaryFamily {
                 latent_survival_row_primary_gradient_hessian(
                     &self.quadctx,
                     &row,
-                    q_entry[row_idx],
-                    q_exit[row_idx],
-                    1.0,
-                    q_exit[row_idx],
-                    mu[row_idx],
-                    self.latent_sd,
+                    LatentSurvivalPrimaryPoint {
+                        q_entry: q_entry[row_idx],
+                        q_exit: q_exit[row_idx],
+                        qdot_exit: 1.0,
+                        q_right: q_exit[row_idx],
+                        mu: mu[row_idx],
+                        sigma: self.latent_sd,
+                    },
                     false,
                 )?;
             let binary = binary_from_log_survival(row_log_survival, self.event_target[row_idx])?;
@@ -4499,12 +4383,14 @@ impl LatentBinaryFamily {
                 latent_survival_row_primary_gradient_hessian(
                     &self.quadctx,
                     &row,
-                    q_entry[row_idx],
-                    q_exit[row_idx],
-                    1.0,
-                    q_exit[row_idx],
-                    mu[row_idx],
-                    self.latent_sd,
+                    LatentSurvivalPrimaryPoint {
+                        q_entry: q_entry[row_idx],
+                        q_exit: q_exit[row_idx],
+                        qdot_exit: 1.0,
+                        q_right: q_exit[row_idx],
+                        mu: mu[row_idx],
+                        sigma: self.latent_sd,
+                    },
                     false,
                 )
                 .map_err(|reason| LatentSurvivalError::NumericalFailure { reason })?;
@@ -4554,12 +4440,14 @@ impl LatentBinaryFamily {
             let row_jet = latent_survival_row_primary_one_seed_fixed_sigma(
                 &self.quadctx,
                 &row,
-                q_entry[row_idx],
-                q_exit[row_idx],
-                1.0,
-                q_exit[row_idx],
-                mu[row_idx],
-                self.latent_sd,
+                LatentSurvivalPrimaryPoint {
+                    q_entry: q_entry[row_idx],
+                    q_exit: q_exit[row_idx],
+                    qdot_exit: 1.0,
+                    q_right: q_exit[row_idx],
+                    mu: mu[row_idx],
+                    sigma: self.latent_sd,
+                },
                 &direction,
             )?;
             let binary =
@@ -4650,12 +4538,14 @@ impl LatentBinaryFamily {
             let row_jet = latent_survival_row_primary_two_seed_fixed_sigma(
                 &self.quadctx,
                 &row,
-                q_entry[row_idx],
-                q_exit[row_idx],
-                1.0,
-                q_exit[row_idx],
-                mu[row_idx],
-                self.latent_sd,
+                LatentSurvivalPrimaryPoint {
+                    q_entry: q_entry[row_idx],
+                    q_exit: q_exit[row_idx],
+                    qdot_exit: 1.0,
+                    q_right: q_exit[row_idx],
+                    mu: mu[row_idx],
+                    sigma: self.latent_sd,
+                },
                 &direction_u,
                 &direction_v,
             )?;
@@ -4837,12 +4727,14 @@ impl LatentJointHessianFamily for LatentSurvivalFamily {
             let (_, _, primary_hessian) = latent_survival_row_primary_gradient_hessian(
                 &self.quadctx,
                 &row,
-                q_entry[row_idx],
-                q_exit[row_idx],
-                qdot_exit[row_idx],
-                q_right[row_idx],
-                mu[row_idx],
-                sigma,
+                LatentSurvivalPrimaryPoint {
+                    q_entry: q_entry[row_idx],
+                    q_exit: q_exit[row_idx],
+                    qdot_exit: qdot_exit[row_idx],
+                    q_right: q_right[row_idx],
+                    mu: mu[row_idx],
+                    sigma,
+                },
                 include_log_sigma,
             )?;
             let primary_dir = self.row_primary_direction_from_flat(row_idx, slices, v);
@@ -4909,12 +4801,14 @@ impl LatentJointHessianFamily for LatentBinaryFamily {
                 latent_survival_row_primary_gradient_hessian(
                     &self.quadctx,
                     &row,
-                    q_entry[row_idx],
-                    q_exit[row_idx],
-                    1.0,
-                    q_exit[row_idx],
-                    mu[row_idx],
-                    self.latent_sd,
+                    LatentSurvivalPrimaryPoint {
+                        q_entry: q_entry[row_idx],
+                        q_exit: q_exit[row_idx],
+                        qdot_exit: 1.0,
+                        q_right: q_exit[row_idx],
+                        mu: mu[row_idx],
+                        sigma: self.latent_sd,
+                    },
                     false,
                 )?;
             let binary = binary_from_log_survival(row_log_survival, self.event_target[row_idx])?;
@@ -5471,12 +5365,12 @@ impl CustomFamily for LatentBinaryFamily {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::test_support_multidir_channels::{
         latent_survival_row_primary_fourth_contracted_multidir_reference,
         latent_survival_row_primary_gradient_hessian_multidir_reference,
         latent_survival_row_primary_third_contracted_multidir_reference,
     };
+    use super::*;
     use crate::custom_family::BlockWorkingSet;
     use gam_linalg::matrix::DenseDesignMatrix;
     use ndarray::array;
@@ -5695,7 +5589,17 @@ mod tests {
         let mu = primary[LATENT_SURVIVAL_PRIMARY_MU];
         let sigma = primary[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA].exp();
         latent_survival_row_primary_gradient_hessian(
-            quadctx, row, q_entry, q_exit, qdot_exit, q_right, mu, sigma, true,
+            quadctx,
+            row,
+            LatentSurvivalPrimaryPoint {
+                q_entry,
+                q_exit,
+                qdot_exit,
+                q_right,
+                mu,
+                sigma,
+            },
+            true,
         )
         .expect("row primary evaluation")
         .0
@@ -6427,14 +6331,20 @@ mod tests {
         let sum_exit: f64 = residuals.exit.sum();
         let sum_deriv: f64 = residuals.derivative.sum();
 
+        #[derive(Clone, Copy)]
+        enum TimeOffsetChannel {
+            Entry,
+            Exit,
+            Derivative,
+        }
+
         // `−ℓ` after shifting one time channel's eta by a constant δ.
-        let neg_ll_with_offset = |channel: usize, delta: f64| -> f64 {
+        let neg_ll_with_offset = |channel: TimeOffsetChannel, delta: f64| -> f64 {
             let mut shifted = states.clone();
             let slice = match channel {
-                0 => s![0..n],
-                1 => s![n..2 * n],
-                2 => s![2 * n..3 * n],
-                _ => unreachable!(),
+                TimeOffsetChannel::Entry => s![0..n],
+                TimeOffsetChannel::Exit => s![n..2 * n],
+                TimeOffsetChannel::Derivative => s![2 * n..3 * n],
             };
             shifted[LatentSurvivalFamily::BLOCK_TIME]
                 .eta
@@ -6447,9 +6357,15 @@ mod tests {
         };
 
         let h = 1e-6;
-        let fd_entry = (neg_ll_with_offset(0, h) - neg_ll_with_offset(0, -h)) / (2.0 * h);
-        let fd_exit = (neg_ll_with_offset(1, h) - neg_ll_with_offset(1, -h)) / (2.0 * h);
-        let fd_deriv = (neg_ll_with_offset(2, h) - neg_ll_with_offset(2, -h)) / (2.0 * h);
+        let fd_entry = (neg_ll_with_offset(TimeOffsetChannel::Entry, h)
+            - neg_ll_with_offset(TimeOffsetChannel::Entry, -h))
+            / (2.0 * h);
+        let fd_exit = (neg_ll_with_offset(TimeOffsetChannel::Exit, h)
+            - neg_ll_with_offset(TimeOffsetChannel::Exit, -h))
+            / (2.0 * h);
+        let fd_deriv = (neg_ll_with_offset(TimeOffsetChannel::Derivative, h)
+            - neg_ll_with_offset(TimeOffsetChannel::Derivative, -h))
+            / (2.0 * h);
 
         assert!(
             (sum_entry - fd_entry).abs() <= 1e-5 * fd_entry.abs().max(1.0),
@@ -6636,12 +6552,14 @@ mod tests {
         let (_, gradient, neg_hessian) = latent_survival_row_primary_gradient_hessian(
             &quadctx,
             &row,
-            primary[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
-            primary[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
-            primary[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
-            primary[LATENT_SURVIVAL_PRIMARY_Q_RIGHT],
-            primary[LATENT_SURVIVAL_PRIMARY_MU],
-            sigma,
+            LatentSurvivalPrimaryPoint {
+                q_entry: primary[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
+                q_exit: primary[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
+                qdot_exit: primary[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
+                q_right: primary[LATENT_SURVIVAL_PRIMARY_Q_RIGHT],
+                mu: primary[LATENT_SURVIVAL_PRIMARY_MU],
+                sigma,
+            },
             true,
         )
         .expect("analytic row primary gradient/hessian");
@@ -6737,12 +6655,14 @@ mod tests {
         let (_, gradient, neg_hessian) = latent_survival_row_primary_gradient_hessian(
             &quadctx,
             &row,
-            primary[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
-            primary[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
-            primary[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
-            primary[LATENT_SURVIVAL_PRIMARY_Q_RIGHT],
-            primary[LATENT_SURVIVAL_PRIMARY_MU],
-            sigma,
+            LatentSurvivalPrimaryPoint {
+                q_entry: primary[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
+                q_exit: primary[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
+                qdot_exit: primary[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
+                q_right: primary[LATENT_SURVIVAL_PRIMARY_Q_RIGHT],
+                mu: primary[LATENT_SURVIVAL_PRIMARY_MU],
+                sigma,
+            },
             true,
         )
         .expect("analytic interval row primary gradient/hessian");
@@ -6802,18 +6722,12 @@ mod tests {
 
     type LatentFullPrimaryChannels = (f64, Array1<f64>, Array2<f64>, Array2<f64>, Array2<f64>);
 
-    #[allow(clippy::too_many_arguments)]
     fn latent_full_primary_channels_at(
         quadctx: &QuadratureContext,
         row: &LatentSurvivalRow,
         include_log_sigma: bool,
         use_multidir_reference: bool,
-        q_entry: f64,
-        q_exit: f64,
-        qdot_exit: f64,
-        q_right: f64,
-        mu: f64,
-        sigma: f64,
+        point: LatentSurvivalPrimaryPoint,
     ) -> LatentFullPrimaryChannels {
         let direction_u = array![
             0.17,
@@ -6836,24 +6750,14 @@ mod tests {
                 latent_survival_row_primary_gradient_hessian_multidir_reference(
                     quadctx,
                     row,
-                    q_entry,
-                    q_exit,
-                    qdot_exit,
-                    q_right,
-                    mu,
-                    sigma,
+                    point,
                     include_log_sigma,
                 )
                 .expect("pre-cutover MultiDirJet VGH reference");
             let third = latent_survival_row_primary_third_contracted_multidir_reference(
                 quadctx,
                 row,
-                q_entry,
-                q_exit,
-                qdot_exit,
-                q_right,
-                mu,
-                sigma,
+                point,
                 &direction_u,
                 include_log_sigma,
             )
@@ -6861,12 +6765,7 @@ mod tests {
             let fourth = latent_survival_row_primary_fourth_contracted_multidir_reference(
                 quadctx,
                 row,
-                q_entry,
-                q_exit,
-                qdot_exit,
-                q_right,
-                mu,
-                sigma,
+                point,
                 &direction_u,
                 &direction_v,
                 include_log_sigma,
@@ -6877,24 +6776,14 @@ mod tests {
             let (value, gradient, hessian) = latent_survival_row_primary_gradient_hessian(
                 quadctx,
                 row,
-                q_entry,
-                q_exit,
-                qdot_exit,
-                q_right,
-                mu,
-                sigma,
+                point,
                 include_log_sigma,
             )
             .expect("one-pass Order2 VGH");
             let third = latent_survival_row_primary_third_contracted(
                 quadctx,
                 row,
-                q_entry,
-                q_exit,
-                qdot_exit,
-                q_right,
-                mu,
-                sigma,
+                point,
                 &direction_u,
                 include_log_sigma,
             )
@@ -6902,12 +6791,7 @@ mod tests {
             let fourth = latent_survival_row_primary_fourth_contracted(
                 quadctx,
                 row,
-                q_entry,
-                q_exit,
-                qdot_exit,
-                q_right,
-                mu,
-                sigma,
+                point,
                 &direction_u,
                 &direction_v,
                 include_log_sigma,
@@ -6928,12 +6812,14 @@ mod tests {
             row,
             include_log_sigma,
             use_multidir_reference,
-            -1.2,
-            -0.4,
-            0.73,
-            0.5,
-            -0.15,
-            0.3_f64.exp(),
+            LatentSurvivalPrimaryPoint {
+                q_entry: -1.2,
+                q_exit: -0.4,
+                qdot_exit: 0.73,
+                q_right: 0.5,
+                mu: -0.15,
+                sigma: 0.3_f64.exp(),
+            },
         )
     }
 
@@ -7021,30 +6907,23 @@ mod tests {
         for (name, q_entry, q_exit, qdot, q_right, mu, sigma) in regimes {
             let row =
                 LatentSurvivalRow::exact_event(q_entry.exp(), q_exit.exp(), 0.01, 0.04, qdot, 0.07);
+            let point = LatentSurvivalPrimaryPoint {
+                q_entry,
+                q_exit,
+                qdot_exit: qdot,
+                q_right,
+                mu,
+                sigma,
+            };
             for include_log_sigma in [false, true] {
-                let reference = latent_full_primary_channels_at(
-                    &quadctx,
-                    &row,
-                    include_log_sigma,
-                    true,
-                    q_entry,
-                    q_exit,
-                    qdot,
-                    q_right,
-                    mu,
-                    sigma,
-                );
+                let reference =
+                    latent_full_primary_channels_at(&quadctx, &row, include_log_sigma, true, point);
                 let got = latent_full_primary_channels_at(
                     &quadctx,
                     &row,
                     include_log_sigma,
                     false,
-                    q_entry,
-                    q_exit,
-                    qdot,
-                    q_right,
-                    mu,
-                    sigma,
+                    point,
                 );
                 let dimension = if include_log_sigma { 6 } else { 5 };
                 assert_latent_full_channels_close(
@@ -7155,6 +7034,14 @@ mod tests {
         let q_right = 0.5;
         let mu = -0.15;
         let sigma = 0.3_f64.exp();
+        let point = LatentSurvivalPrimaryPoint {
+            q_entry,
+            q_exit,
+            qdot_exit,
+            q_right,
+            mu,
+            sigma,
+        };
         let iterations = if cfg!(debug_assertions) { 1 } else { 5 };
         let samples = if cfg!(debug_assertions) { 1 } else { 3 };
 
@@ -7182,12 +7069,7 @@ mod tests {
                         latent_survival_row_primary_gradient_hessian_multidir_reference(
                             std::hint::black_box(&quadctx),
                             std::hint::black_box(&row),
-                            q_entry,
-                            q_exit,
-                            qdot_exit,
-                            q_right,
-                            mu,
-                            sigma,
+                            point,
                             include_log_sigma,
                         )
                         .expect("prechange VGH benchmark"),
@@ -7198,12 +7080,7 @@ mod tests {
                         latent_survival_row_primary_gradient_hessian(
                             std::hint::black_box(&quadctx),
                             std::hint::black_box(&row),
-                            q_entry,
-                            q_exit,
-                            qdot_exit,
-                            q_right,
-                            mu,
-                            sigma,
+                            point,
                             include_log_sigma,
                         )
                         .expect("one-pass VGH benchmark"),
@@ -7218,12 +7095,7 @@ mod tests {
                         latent_survival_row_primary_third_contracted_multidir_reference(
                             std::hint::black_box(&quadctx),
                             std::hint::black_box(&row),
-                            q_entry,
-                            q_exit,
-                            qdot_exit,
-                            q_right,
-                            mu,
-                            sigma,
+                            point,
                             std::hint::black_box(&direction_u),
                             include_log_sigma,
                         )
@@ -7235,12 +7107,7 @@ mod tests {
                         latent_survival_row_primary_third_contracted(
                             std::hint::black_box(&quadctx),
                             std::hint::black_box(&row),
-                            q_entry,
-                            q_exit,
-                            qdot_exit,
-                            q_right,
-                            mu,
-                            sigma,
+                            point,
                             std::hint::black_box(&direction_u),
                             include_log_sigma,
                         )
@@ -7256,12 +7123,7 @@ mod tests {
                         latent_survival_row_primary_fourth_contracted_multidir_reference(
                             std::hint::black_box(&quadctx),
                             std::hint::black_box(&row),
-                            q_entry,
-                            q_exit,
-                            qdot_exit,
-                            q_right,
-                            mu,
-                            sigma,
+                            point,
                             std::hint::black_box(&direction_u),
                             std::hint::black_box(&direction_v),
                             include_log_sigma,
@@ -7274,12 +7136,7 @@ mod tests {
                         latent_survival_row_primary_fourth_contracted(
                             std::hint::black_box(&quadctx),
                             std::hint::black_box(&row),
-                            q_entry,
-                            q_exit,
-                            qdot_exit,
-                            q_right,
-                            mu,
-                            sigma,
+                            point,
                             std::hint::black_box(&direction_u),
                             std::hint::black_box(&direction_v),
                             include_log_sigma,
@@ -7317,12 +7174,7 @@ mod tests {
                             latent_survival_row_primary_gradient_hessian_multidir_reference(
                                 &quadctx,
                                 &row,
-                                q_entry,
-                                q_exit,
-                                qdot_exit,
-                                q_right,
-                                mu,
-                                sigma,
+                                point,
                                 include_log_sigma,
                             )
                             .expect("prechange combined VGH"),
@@ -7332,12 +7184,7 @@ mod tests {
                                 latent_survival_row_primary_third_contracted_multidir_reference(
                                     &quadctx,
                                     &row,
-                                    q_entry,
-                                    q_exit,
-                                    qdot_exit,
-                                    q_right,
-                                    mu,
-                                    sigma,
+                                    point,
                                     direction,
                                     include_log_sigma,
                                 )
@@ -7348,12 +7195,7 @@ mod tests {
                             latent_survival_row_primary_fourth_contracted_multidir_reference(
                                 &quadctx,
                                 &row,
-                                q_entry,
-                                q_exit,
-                                qdot_exit,
-                                q_right,
-                                mu,
-                                sigma,
+                                point,
                                 &direction_u,
                                 &direction_v,
                                 include_log_sigma,
@@ -7369,16 +7211,7 @@ mod tests {
                             };
                             std::hint::black_box(
                                 latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_DIM, _>(
-                                    &backend,
-                                    &quadctx,
-                                    &row,
-                                    q_entry,
-                                    q_exit,
-                                    qdot_exit,
-                                    q_right,
-                                    mu,
-                                    sigma,
-                                    sigma.ln(),
+                                    &backend, &quadctx, &row, point,
                                 )
                                 .expect("combined K6 TwoSeed"),
                             );
@@ -7387,12 +7220,7 @@ mod tests {
                                 latent_survival_row_primary_two_seed_fixed_sigma(
                                     &quadctx,
                                     &row,
-                                    q_entry,
-                                    q_exit,
-                                    qdot_exit,
-                                    q_right,
-                                    mu,
-                                    sigma,
+                                    point,
                                     &direction_u,
                                     &direction_v,
                                 )
