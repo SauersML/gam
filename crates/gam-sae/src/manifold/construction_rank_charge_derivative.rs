@@ -87,11 +87,18 @@ impl SaeManifoldTerm {
                 lambda[atom_idx],
                 Some(&atom.smooth_penalty),
             )?;
-            let rank = spectrum.rank_hard();
+            // #2258 — the CHARGEABLE rank, not the raw hard MP count: the
+            // value path promotes a below-detection-edge-but-alive atom to
+            // rank 1, and the derivative must take the SAME branch (the
+            // promoted rank is locally constant, so the differential's form
+            // is unchanged). Only a genuinely VANISHED decoder — the
+            // Laplace-invalid regime the veto prices +∞ — remains an error
+            // here, matching the value side's categorical veto.
+            let rank = spectrum.rank_chargeable(dispersion);
             if !(rank > 0.0) {
                 return Err(format!(
                     "hard_rank_charge_derivative: atom {atom_idx} is on the rank-zero \
-                     Laplace-invalid branch"
+                     Laplace-invalid branch (vanished decoder)"
                 ));
             }
             let log_n = n_atom.max(1.0).ln();

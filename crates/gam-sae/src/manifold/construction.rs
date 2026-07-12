@@ -61,6 +61,16 @@ pub struct StreamingRankInputs {
 /// This is the source of truth the term-level `rank_dof_from_grams` (dense + #9
 /// streaming) loops, AND that the #2023 migration gate prices linear/curved candidates
 /// through — so PROMOTE (birth) and DEMOTE (hybrid split) adjudicate in ONE currency.
+/// #2258 detection-vs-degeneracy threshold: a rank-0 atom whose top
+/// reconstruction-Gram eigenvalue exceeds `RANK_VANISHED_REL · R` is ALIVE
+/// (below the MP detection edge, not degenerate) and is promoted to the
+/// minimum chargeable rank 1; at or below it the decoder has genuinely
+/// vanished and the categorical Laplace-validity veto applies. Shared by the
+/// value path here and the ρ-derivative
+/// ([`super::wbic_audit::ReconSpectrum::rank_chargeable`]) so the pair can
+/// never desync.
+pub(crate) const RANK_VANISHED_REL: f64 = 1.0e-9;
+
 pub(crate) fn realised_rank_charge_dof(
     gram: &Array2<f64>,
     decoder: &Array2<f64>,
@@ -117,8 +127,7 @@ pub(crate) fn realised_rank_charge_dof(
         let top_sv = sv.iter().cloned().fold(0.0_f64, f64::max);
         top_sv * top_sv / n_eff
     };
-    const VANISHED_REL: f64 = 1.0e-9;
-    if rank_eff == 0.0 && top_signal > VANISHED_REL * r_floor {
+    if rank_eff == 0.0 && top_signal > RANK_VANISHED_REL * r_floor {
         log::debug!(
             "realised_rank_charge_dof: below-detection-edge atom promoted to rank 1 — \
              top sv²/n_eff={top_signal:.6e} vs MP edge={edge:.6e} \

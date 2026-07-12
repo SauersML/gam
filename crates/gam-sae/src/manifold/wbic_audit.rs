@@ -116,6 +116,28 @@ impl ReconSpectrum {
         self.mu.iter().filter(|&&m| m > self.edge).count() as f64
     }
 
+    /// #2258 detection-vs-degeneracy: the CHARGEABLE rank — the hard MP count,
+    /// with a below-detection-edge but numerically ALIVE atom promoted to the
+    /// minimum non-degenerate rank 1. Mirrors the identical rule inside
+    /// [`super::construction::realised_rank_charge_dof`] (the value side);
+    /// the ρ-derivative MUST take the same branch or the value/gradient pair
+    /// desyncs (measured: real-GPT-2 fit priced finite by the promoted value
+    /// path, then refused by the derivative's independent rank-zero invariant).
+    /// Only a VANISHED decoder (top μ ≤ `RANK_VANISHED_REL`·R — the
+    /// Laplace-invalid regime) stays at rank 0.
+    pub fn rank_chargeable(&self, r_floor: f64) -> f64 {
+        let hard = self.rank_hard();
+        if hard > 0.0 {
+            return hard;
+        }
+        let top = self.mu.iter().cloned().fold(0.0_f64, f64::max);
+        if top > super::construction::RANK_VANISHED_REL * r_floor {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
     /// WBIC tempered soft count `Σ_k μ_k/(μ_k + e·log n_eff)` — the sigmoid that
     /// replaces the hard step (derivation in the module header: the likelihood is
     /// tempered by `β = 1/log n_eff`, the prior is NOT, so the edge carries the
