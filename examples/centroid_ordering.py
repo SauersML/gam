@@ -94,6 +94,22 @@ def _center_points(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return centered, location
 
 
+def _certify_psd_spectrum(eigenvalues: np.ndarray, trace: float) -> np.ndarray:
+    """Reject material indefiniteness and zero the full backward-error band."""
+    spectrum = np.asarray(eigenvalues, dtype=np.float64)
+    if spectrum.ndim != 1 or spectrum.size == 0 or not np.isfinite(spectrum).all():
+        raise ValueError("covariance eigenspectrum must be a nonempty finite vector")
+    if not np.isfinite(trace) or trace <= 0.0:
+        raise ValueError("covariance trace must be positive and finite")
+    tolerance = 64.0 * spectrum.size * np.finfo(np.float64).eps * trace
+    if float(spectrum.min()) < -tolerance:
+        raise ValueError(
+            "centroid covariance is materially indefinite: "
+            f"minimum eigenvalue {float(spectrum.min()):.6e}"
+        )
+    return np.where(spectrum <= tolerance, 0.0, spectrum)
+
+
 def kmeans_centroids(coords: np.ndarray, k: int, seed: int = 0,
                      iters: int = 100) -> np.ndarray:
     """Certified seeded Lloyd k-means on ``(n, 2)`` coordinates."""
@@ -209,16 +225,10 @@ def ring_mc_pvalue(centers: np.ndarray, observed_cv: float, n_null: int = 2000,
     if not np.isfinite(trace) or trace <= 0.0:
         raise ValueError("centroid covariance must have positive finite trace")
     eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-    tolerance = 64.0 * covariance.shape[0] * np.finfo(np.float64).eps * trace
-    if float(eigenvalues.min()) < -tolerance:
-        raise ValueError(
-            "centroid covariance is materially indefinite: "
-            f"minimum eigenvalue {float(eigenvalues.min()):.6e}"
-        )
     # An exact zero eigenvalue may return as either sign at backward-error
     # scale. Certify and zero that whole envelope so a rank-deficient null never
     # acquires artificial off-subspace noise.
-    eigenvalues = np.where(eigenvalues <= tolerance, 0.0, eigenvalues)
+    eigenvalues = _certify_psd_spectrum(eigenvalues, trace)
     factor = eigenvectors * np.sqrt(eigenvalues)[None, :]
     rng = np.random.default_rng(seed)
     k = c.shape[0]

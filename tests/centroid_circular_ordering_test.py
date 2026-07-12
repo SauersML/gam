@@ -104,6 +104,14 @@ class CentroidCircularOrderingTest(unittest.TestCase):
         np.testing.assert_allclose(centers[0], coords.mean(axis=0), atol=1.0e-15)
 
     def test_rank_deficient_gaussian_null_needs_no_ridge(self) -> None:
+        trace = 1.0
+        tolerance = 64.0 * 2.0 * np.finfo(np.float64).eps * trace
+        certified = _CO._certify_psd_spectrum(
+            np.array([0.5 * tolerance, trace]), trace
+        )
+        self.assertEqual(float(certified[0]), 0.0)
+        self.assertEqual(float(certified[1]), trace)
+
         angle = 0.731
         direction = np.array([np.cos(angle), np.sin(angle)])
         coordinate = np.arange(7, dtype=np.float64) - 3.0
