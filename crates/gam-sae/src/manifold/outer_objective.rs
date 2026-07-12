@@ -308,6 +308,13 @@ pub enum SaeOuterVerdict {
     /// No outer ρ-search ran: the caller pinned ρ, so only the inner solve's
     /// KKT certificate applies.
     FixedRho,
+    /// #2266 — neither an outer ρ-search NOR an inner solve ran: the decoder /
+    /// coordinates / gate logits / ρ were installed verbatim from an
+    /// externally-trained (e.g. torch-lane) fit by
+    /// `run_sae_manifold_certify` (#2266). There is no first-order
+    /// stationarity certificate for this state — only the post-fit
+    /// diagnostics/certificates computed AT it.
+    External,
 }
 
 impl SaeOuterVerdict {
@@ -317,6 +324,7 @@ impl SaeOuterVerdict {
         match self {
             Self::Search(via) => via.as_str(),
             Self::FixedRho => "fixed_rho",
+            Self::External => "external",
         }
     }
 }
