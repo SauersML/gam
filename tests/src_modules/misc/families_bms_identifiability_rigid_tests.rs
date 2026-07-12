@@ -22,6 +22,20 @@ use crate::custom_family::{CustomFamily, ExactOuterDerivativeOrder};
 
 use ndarray::array;
 
+/// Standard normal PDF's own derivative stack (as opposed to
+/// [`unary_derivatives_normal_cdf`]'s CDF stack). No production row path
+/// differentiates the bare PDF; this oracle test does.
+fn unary_derivatives_normal_pdf(x: f64) -> [f64; 5] {
+    let pdf = normal_pdf(x);
+    [
+        pdf,
+        -x * pdf,
+        (x * x - 1.0) * pdf,
+        (-x.powi(3) + 3.0 * x) * pdf,
+        (x.powi(4) - 6.0 * x * x + 3.0) * pdf,
+    ]
+}
+
 #[inline]
 fn bernoulli_marginal_slope_probit_link() -> InverseLink {
     InverseLink::Standard(StandardLink::Probit)
