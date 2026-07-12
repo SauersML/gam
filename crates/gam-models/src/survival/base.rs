@@ -6,6 +6,7 @@ use crate::model_types::EstimationError;
 use gam_linalg::faer_ndarray::{fast_atv, fast_av, fast_xt_diag_x, fast_xt_diag_y};
 use gam_linalg::matrix::SymmetricMatrix;
 use gam_problem::{Coefficients, LinearPredictor};
+use gam_row_macros::row_atom;
 use gam_solve::pirls::{
     LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState, array1_l2_norm,
 };
@@ -320,6 +321,109 @@ fn validate_cause_specific_block(
     Ok(())
 }
 
+row_atom! {
+    fn cause_specific_row [order2, third, fourth](
+        eta_exit,
+        eta_entry,
+        derivative;
+        weight,
+        entry_active,
+        event
+    ) {
+        weight
+            * (exp(eta_exit)
+                - entry_active * exp(eta_entry)
+                - event * (eta_exit + ln(derivative)))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CauseSpecificAtomInput {
+    primary: [f64; 3],
+    weight: f64,
+    entry_active: f64,
+    event: f64,
+}
+
+/// Validate one live row and canonicalise inactive entry/event primaries to
+/// finite neutral values. The symbolic atom still receives the activity flags,
+/// so every derivative of an inactive term is exactly zero without evaluating
+/// `0 * exp(overflow)` or `0 * ln(nonpositive)`.
+fn cause_specific_atom_input(
+    block: &CauseSpecificRoystonParmarBlock,
+    row: usize,
+    eta_entry: f64,
+    eta_exit: f64,
+    derivative: f64,
+) -> Result<Option<CauseSpecificAtomInput>, SurvivalError> {
+    let weight = block.sampleweight[row];
+    if weight <= 0.0 {
+        return Ok(None);
+    }
+    if block.age_exit[row] < block.age_entry[row] {
+        bail_invalid_surv!("age_exit < age_entry at row {row}");
+    }
+    let entry_active = block.age_entry[row] > ENTRY_AT_ORIGIN_THRESHOLD;
+    let event = block.event_target[row] > 0;
+    let eta_entry = if entry_active { eta_entry } else { 0.0 };
+    let derivative = if event {
+        if !(derivative.is_finite() && derivative > 0.0) {
+            return Err(SurvivalError::NumericalFailure {
+                reason: format!(
+                    "cause-specific survival derivative must be positive at row {row}, got {derivative}"
+                ),
+            });
+        }
+        derivative
+    } else {
+        1.0
+    };
+    let h_exit = eta_exit.exp();
+    let h_entry = eta_entry.exp();
+    if !(h_exit.is_finite() && h_entry.is_finite()) {
+        return Err(SurvivalError::NumericalFailure {
+            reason: format!("non-finite cumulative hazard at row {row}"),
+        });
+    }
+    Ok(Some(CauseSpecificAtomInput {
+        primary: [eta_exit, eta_entry, derivative],
+        weight,
+        entry_active: f64::from(entry_active),
+        event: f64::from(event),
+    }))
+}
+
+const CAUSE_SPECIFIC_PRIMARY_PAIRS: [(usize, usize); 6] =
+    [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2)];
+
+/// Pull all six primary-Hessian channels through the three coefficient-design
+/// Jacobians. Current cross channels are symbolically zero, so their matrix
+/// products are skipped; if the row expression later gains a coupling, that
+/// generated channel becomes live automatically rather than being dropped by a
+/// hand-maintained diagonal assumption.
+fn cause_specific_pullback_hessian(
+    block: &CauseSpecificRoystonParmarBlock,
+    weights: &[Array1<f64>; 6],
+) -> Array2<f64> {
+    let designs = [&block.x_exit, &block.x_entry, &block.x_derivative];
+    let p = block.x_exit.ncols();
+    let mut hessian = Array2::<f64>::zeros((p, p));
+    for (slot, &(left, right)) in CAUSE_SPECIFIC_PRIMARY_PAIRS.iter().enumerate() {
+        let channel = &weights[slot];
+        if channel.iter().all(|&value| value == 0.0) {
+            continue;
+        }
+        if left == right {
+            hessian += &fast_xt_diag_x(designs[left], channel);
+        } else {
+            let cross = fast_xt_diag_y(designs[left], channel, designs[right]);
+            hessian += &cross;
+            hessian += &cross.t();
+        }
+    }
+    hessian
+}
+
 fn evaluate_cause_specific_block(
     block: &CauseSpecificRoystonParmarBlock,
     beta: &Array1<f64>,
@@ -335,56 +439,45 @@ fn evaluate_cause_specific_block(
     let eta_exit = fast_av(&block.x_exit, beta) + &block.offset_eta_exit;
     let derivative = fast_av(&block.x_derivative, beta) + &block.offset_derivative_exit;
     let mut log_likelihood = 0.0;
-    let mut w_exit = Array1::<f64>::zeros(n);
-    let mut w_entry = Array1::<f64>::zeros(n);
-    let mut w_event = Array1::<f64>::zeros(n);
-    let mut w_event_inv_deriv = Array1::<f64>::zeros(n);
-    let mut w_event_outer = Array1::<f64>::zeros(n);
+    let mut gradient_weights: [Array1<f64>; 3] =
+        std::array::from_fn(|_| Array1::<f64>::zeros(n));
+    let mut hessian_weights: [Array1<f64>; 6] =
+        std::array::from_fn(|_| Array1::<f64>::zeros(n));
 
     for i in 0..n {
-        let weight = block.sampleweight[i];
-        if weight <= 0.0 {
+        let Some(input) = cause_specific_atom_input(
+            block,
+            i,
+            eta_entry[i],
+            eta_exit[i],
+            derivative[i],
+        )? else {
             continue;
+        };
+        let atom = cause_specific_row_order2(
+            input.primary[0],
+            input.primary[1],
+            input.primary[2],
+            input.weight,
+            input.entry_active,
+            input.event,
+        );
+        log_likelihood -= atom.value();
+        let gradient = atom.gradient();
+        for axis in 0..3 {
+            gradient_weights[axis][i] = -gradient[axis];
         }
-        if block.age_exit[i] < block.age_entry[i] {
-            bail_invalid_surv!("age_exit < age_entry at row {i}");
-        }
-        let has_entry = block.age_entry[i] > ENTRY_AT_ORIGIN_THRESHOLD;
-        let h_exit = eta_exit[i].exp();
-        let h_entry = if has_entry { eta_entry[i].exp() } else { 0.0 };
-        if !(h_exit.is_finite() && h_entry.is_finite()) {
-            return Err(SurvivalError::NumericalFailure {
-                reason: format!("non-finite cumulative hazard at row {i}"),
-            });
-        }
-        log_likelihood -= weight * (h_exit - h_entry);
-        w_exit[i] = weight * h_exit;
-        w_entry[i] = weight * h_entry;
-        if block.event_target[i] > 0 {
-            let deriv = derivative[i];
-            if !(deriv.is_finite() && deriv > 0.0) {
-                return Err(SurvivalError::NumericalFailure {
-                    reason: format!(
-                        "cause-specific survival derivative must be positive at row {i}, got {deriv}"
-                    ),
-                });
-            }
-            log_likelihood += weight * (eta_exit[i] + deriv.ln());
-            w_event[i] = weight;
-            w_event_inv_deriv[i] = weight / deriv;
-            w_event_outer[i] = weight / (deriv * deriv);
+        for (slot, &(left, right)) in CAUSE_SPECIFIC_PRIMARY_PAIRS.iter().enumerate() {
+            hessian_weights[slot][i] = atom.hessian_at(left, right);
         }
     }
 
-    let mut nll_gradient = fast_atv(&block.x_exit, &w_exit);
-    nll_gradient -= &fast_atv(&block.x_entry, &w_entry);
-    nll_gradient -= &fast_atv(&block.x_exit, &w_event);
-    nll_gradient -= &fast_atv(&block.x_derivative, &w_event_inv_deriv);
-    let gradient = -nll_gradient;
-
-    let mut hessian = fast_xt_diag_x(&block.x_exit, &w_exit);
-    hessian -= &fast_xt_diag_x(&block.x_entry, &w_entry);
-    hessian += &fast_xt_diag_x(&block.x_derivative, &w_event_outer);
+    let designs = [&block.x_exit, &block.x_entry, &block.x_derivative];
+    let mut gradient = Array1::<f64>::zeros(p);
+    for axis in 0..3 {
+        gradient += &fast_atv(designs[axis], &gradient_weights[axis]);
+    }
+    let hessian = cause_specific_pullback_hessian(block, &hessian_weights);
     Ok((log_likelihood, gradient, hessian))
 }
 
@@ -606,17 +699,8 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
     }
 }
 
-/// The LIVE third-order tower `∂_dir H` for the cause-specific NLL: the
-/// per-predictor directional weights (`w_exit`, `w_entry`, `w_derivative`)
-/// scattered through the exit / entry / derivative designs.
-///
-/// #932 documented performance exception: this diagonal-in-(η1,η0,s) closed form
-/// (and its fourth-order sibling `cause_specific_hessian_second_directional_derivative`)
-/// STAYS in the production Newton path; it is not cut over to the generic gam-math
-/// `Tower4` jet, which would materialise a full per-row dense 4th-order tensor on
-/// this inner-solve path. It is instead pinned as a non-ignored jet oracle at
-/// ≤1e-9, with an independent central-difference witness, in
-/// `tests::jet_cause_specific_production_parity::cause_specific_live_tower_matches_jet_and_fd`.
+/// The live third-order coefficient Hessian, lowered at build time from the same
+/// [`cause_specific_row`] expression as value/gradient/Hessian.
 fn cause_specific_hessian_directional_derivative(
     block: &CauseSpecificRoystonParmarBlock,
     beta: &Array1<f64>,
@@ -634,39 +718,42 @@ fn cause_specific_hessian_directional_derivative(
     let d_eta_entry = fast_av(&block.x_entry, d_beta);
     let d_eta_exit = fast_av(&block.x_exit, d_beta);
     let d_derivative = fast_av(&block.x_derivative, d_beta);
-    let mut w_exit = Array1::<f64>::zeros(block.event_target.len());
-    let mut w_entry = Array1::<f64>::zeros(block.event_target.len());
-    let mut w_derivative = Array1::<f64>::zeros(block.event_target.len());
+    let n = block.event_target.len();
+    let mut weights: [Array1<f64>; 6] = std::array::from_fn(|_| Array1::zeros(n));
 
-    for i in 0..block.event_target.len() {
-        let weight = block.sampleweight[i];
-        if weight <= 0.0 {
+    for i in 0..n {
+        let Some(input) = cause_specific_atom_input(
+            block,
+            i,
+            eta_entry[i],
+            eta_exit[i],
+            derivative[i],
+        )? else {
             continue;
-        }
-        let has_entry = block.age_entry[i] > ENTRY_AT_ORIGIN_THRESHOLD;
-        w_exit[i] = weight * eta_exit[i].exp() * d_eta_exit[i];
-        if has_entry {
-            w_entry[i] = weight * eta_entry[i].exp() * d_eta_entry[i];
-        }
-        if block.event_target[i] > 0 {
-            let deriv = derivative[i];
-            if !(deriv.is_finite() && deriv > 0.0) {
-                return Err(SurvivalError::NumericalFailure {
-                    reason: format!(
-                        "cause-specific survival derivative must be positive at row {i}, got {deriv}"
-                    ),
-                });
-            }
-            w_derivative[i] = -2.0 * weight * d_derivative[i] / (deriv * deriv * deriv);
+        };
+        let direction = [
+            d_eta_exit[i],
+            d_eta_entry[i] * input.entry_active,
+            d_derivative[i] * input.event,
+        ];
+        let matrix = cause_specific_row_third_contracted(
+            input.primary[0],
+            input.primary[1],
+            input.primary[2],
+            input.weight,
+            input.entry_active,
+            input.event,
+            &direction,
+        );
+        for (slot, &(left, right)) in CAUSE_SPECIFIC_PRIMARY_PAIRS.iter().enumerate() {
+            weights[slot][i] = matrix[left][right];
         }
     }
-
-    let mut d_hessian = fast_xt_diag_x(&block.x_exit, &w_exit);
-    d_hessian -= &fast_xt_diag_x(&block.x_entry, &w_entry);
-    d_hessian += &fast_xt_diag_x(&block.x_derivative, &w_derivative);
-    Ok(d_hessian)
+    Ok(cause_specific_pullback_hessian(block, &weights))
 }
 
+/// The live fourth-order coefficient Hessian, lowered at build time from the
+/// same [`cause_specific_row`] expression as every lower channel.
 fn cause_specific_hessian_second_directional_derivative(
     block: &CauseSpecificRoystonParmarBlock,
     beta: &Array1<f64>,
@@ -689,37 +776,44 @@ fn cause_specific_hessian_second_directional_derivative(
     let v_eta_entry = fast_av(&block.x_entry, d_beta_v);
     let v_eta_exit = fast_av(&block.x_exit, d_beta_v);
     let v_derivative = fast_av(&block.x_derivative, d_beta_v);
-    let mut w_exit = Array1::<f64>::zeros(block.event_target.len());
-    let mut w_entry = Array1::<f64>::zeros(block.event_target.len());
-    let mut w_derivative = Array1::<f64>::zeros(block.event_target.len());
+    let n = block.event_target.len();
+    let mut weights: [Array1<f64>; 6] = std::array::from_fn(|_| Array1::zeros(n));
 
-    for i in 0..block.event_target.len() {
-        let weight = block.sampleweight[i];
-        if weight <= 0.0 {
+    for i in 0..n {
+        let Some(input) = cause_specific_atom_input(
+            block,
+            i,
+            eta_entry[i],
+            eta_exit[i],
+            derivative[i],
+        )? else {
             continue;
-        }
-        let has_entry = block.age_entry[i] > ENTRY_AT_ORIGIN_THRESHOLD;
-        w_exit[i] = weight * eta_exit[i].exp() * u_eta_exit[i] * v_eta_exit[i];
-        if has_entry {
-            w_entry[i] = weight * eta_entry[i].exp() * u_eta_entry[i] * v_eta_entry[i];
-        }
-        if block.event_target[i] > 0 {
-            let deriv = derivative[i];
-            if !(deriv.is_finite() && deriv > 0.0) {
-                return Err(SurvivalError::NumericalFailure {
-                    reason: format!(
-                        "cause-specific survival derivative must be positive at row {i}, got {deriv}"
-                    ),
-                });
-            }
-            w_derivative[i] = 6.0 * weight * u_derivative[i] * v_derivative[i] / deriv.powi(4);
+        };
+        let direction_u = [
+            u_eta_exit[i],
+            u_eta_entry[i] * input.entry_active,
+            u_derivative[i] * input.event,
+        ];
+        let direction_v = [
+            v_eta_exit[i],
+            v_eta_entry[i] * input.entry_active,
+            v_derivative[i] * input.event,
+        ];
+        let matrix = cause_specific_row_fourth_contracted(
+            input.primary[0],
+            input.primary[1],
+            input.primary[2],
+            input.weight,
+            input.entry_active,
+            input.event,
+            &direction_u,
+            &direction_v,
+        );
+        for (slot, &(left, right)) in CAUSE_SPECIFIC_PRIMARY_PAIRS.iter().enumerate() {
+            weights[slot][i] = matrix[left][right];
         }
     }
-
-    let mut d2_hessian = fast_xt_diag_x(&block.x_exit, &w_exit);
-    d2_hessian -= &fast_xt_diag_x(&block.x_entry, &w_entry);
-    d2_hessian += &fast_xt_diag_x(&block.x_derivative, &w_derivative);
-    Ok(d2_hessian)
+    Ok(cause_specific_pullback_hessian(block, &weights))
 }
 
 pub fn survival_event_code_from_value(value: f64, row_index: usize) -> Result<u8, String> {
