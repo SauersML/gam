@@ -1802,15 +1802,6 @@ pub fn evaluate_program<const K: usize, P: RowNllProgram<K> + ?Sized>(
     prog.row_nll(row, &vars)
 }
 
-/// Mechanically derived `row_kernel` channel: `(nll, ∇, H)`.
-pub fn derived_row_kernel<const K: usize, P: RowNllProgram<K> + ?Sized>(
-    prog: &P,
-    row: usize,
-) -> Result<(f64, [f64; K], [[f64; K]; K]), String> {
-    let t = evaluate_program(prog, row)?;
-    Ok((t.v, t.g, t.h))
-}
-
 // ── The canonical single-source seam (#932 consolidation) ────────────
 //
 // `RowProgram<K>` is the ONE row-program interface #932 converges every family
