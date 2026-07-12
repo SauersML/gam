@@ -3235,8 +3235,8 @@ mod tests {
     /// `cause_specific_hessian_second_directional_derivative`) and pins each
     /// channel against the universal gam-math jet at ≤1e-9, plus an independent
     /// central-difference witness of the live third/fourth against the live lower
-    /// order. The live hand tower is retained (documented performance exception at
-    /// the code site).
+    /// order. Production now derives every channel from its generated row
+    /// expression; this independently restated test program is only an oracle.
     mod jet_cause_specific_production_parity {
         use super::*;
         use gam_math::jet_scalar::JetScalar;
