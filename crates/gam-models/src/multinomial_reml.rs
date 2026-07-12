@@ -958,39 +958,17 @@ impl MultinomialFamily {
         eta: ArrayView2<'_, f64>,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Array3<f64>, String> {
-        let n = self.weights.len();
+        let p = self.design.ncols();
         let m = self.active_classes();
-        let probs_full = self.row_probabilities(eta);
-        let d_eta = self.d_eta_from_d_beta(d_beta_flat)?;
-        let mut out = Array3::<f64>::zeros((n, m, m));
-        let mut dp = vec![0.0_f64; m];
-        for row in 0..n {
-            let w = self.weights[row];
-            if w == 0.0 {
-                continue;
-            }
-            // Per-row scalar s = Σ_c p_c · d_η_c, where `d_η` is supplied
-            // only for active classes — the reference class contributes 0
-            // because `η_{K-1} ≡ 0` is constant under any β-direction.
-            let mut s = 0.0_f64;
-            for a in 0..m {
-                s += probs_full[[row, a]] * d_eta[[row, a]];
-            }
-            for a in 0..m {
-                dp[a] = probs_full[[row, a]] * (d_eta[[row, a]] - s);
-            }
-            for a in 0..m {
-                let pa = probs_full[[row, a]];
-                out[[row, a, a]] = w * (dp[a] - 2.0 * dp[a] * pa);
-                for b in (a + 1)..m {
-                    let pb = probs_full[[row, b]];
-                    let off = w * (-(dp[a] * pb + pa * dp[b]));
-                    out[[row, a, b]] = off;
-                    out[[row, b, a]] = off;
-                }
-            }
+        if d_beta_flat.len() != m * p {
+            return Err(format!(
+                "MultinomialFamily direction length {} != (K-1)·P = {}",
+                d_beta_flat.len(),
+                m * p
+            ));
         }
-        Ok(out)
+        let probs_full = self.row_probabilities(eta);
+        Ok(self.directional_fisher_jet_rows(probs_full.view(), d_beta_flat))
     }
 
     /// Per-row `M×M` first-directional Fisher jet `Ĵ[row]` from frozen row
@@ -1000,21 +978,10 @@ impl MultinomialFamily {
     /// `assemble_directional_derivatives_from_probs`: it returns the
     /// per-row `M×M` block `Ĵ[row,a,b]` such that the dense directional
     /// derivative is exactly `B_d[(a,i),(b,j)] = Σ_row Ĵ[row,a,b]·X[row,i]·X[row,j]`.
-    /// The per-row arithmetic (`d_η`, `s`, `dp`, `jaa`, `jab`) is byte-identical
-    /// to the dense assembly, so a matrix-free contraction against `Ĵ` reproduces
-    /// the dense `Fᵀ B_d F` projection up to the associativity of the row sum.
-    ///
-    /// #932 documented performance exception: this hand closed form (and its
-    /// second-directional sibling below) is the third/fourth-order derivative
-    /// tower that the #1082 near-separable Jeffreys/Firth solve runs in its
-    /// per-inner-cycle hot path. It is NOT cut over to the generic gam-math
-    /// `Tower4` jet: the jet would replace only this per-row `M×M` kernel, but the
-    /// hot path fuses it with an X-factored β-space scatter, and materialising a
-    /// full per-row/per-axis dense 4th-order tower regresses the same
-    /// order-of-magnitude the sibling SAE softmax cutover measured (25–57×). The
-    /// jet is instead pinned as a non-ignored oracle against THIS live function,
-    /// with an independent finite-difference witness, in
-    /// `tests::jet_single_source_932::multinomial_live_tower_matches_jet_and_fd`.
+    /// Its derivative arithmetic comes from [`softmax_fisher_perturbation`], the
+    /// same normalized-softmax expression as every other live first/fourth-order
+    /// consumer. Only the direction projection and X-factored scatter remain
+    /// specialized; neither is calculus.
     fn directional_fisher_jet_rows(
         &self,
         probs_full: ArrayView2<'_, f64>,
@@ -1026,13 +993,15 @@ impl MultinomialFamily {
         let design = self.design.view();
         let mut out = Array3::<f64>::zeros((n, m, m));
         let mut d_eta = vec![0.0_f64; m];
-        let mut dp = vec![0.0_f64; m];
+        let mut normalized = vec![<OneSeed<0> as JetScalar<0>>::constant(0.0); m];
+        let out_flat = out
+            .as_slice_mut()
+            .expect("owned Fisher jet must be contiguous");
         for row in 0..n {
             let w = self.weights[row];
             if w == 0.0 {
                 continue;
             }
-            let mut s = 0.0_f64;
             for a in 0..m {
                 let base = a * p;
                 let mut eta_dir = 0.0_f64;
@@ -1040,21 +1009,17 @@ impl MultinomialFamily {
                     eta_dir += design[[row, i]] * direction[base + i];
                 }
                 d_eta[a] = eta_dir;
-                s += probs_full[[row, a]] * eta_dir;
             }
-            for a in 0..m {
-                dp[a] = probs_full[[row, a]] * (d_eta[a] - s);
-            }
-            for a in 0..m {
-                let pa = probs_full[[row, a]];
-                out[[row, a, a]] = w * (dp[a] - 2.0 * dp[a] * pa);
-                for b in (a + 1)..m {
-                    let pb = probs_full[[row, b]];
-                    let off = w * (-(dp[a] * pb + pa * dp[b]));
-                    out[[row, a, b]] = off;
-                    out[[row, b, a]] = off;
-                }
-            }
+            let row_start = row * m * m;
+            softmax_fisher_perturbation::<OneSeed<0>>(
+                m,
+                w,
+                |a| probs_full[[row, a]],
+                |a| d_eta[a],
+                |_| 0.0,
+                &mut normalized,
+                &mut out_flat[row_start..row_start + m * m],
+            );
         }
         out
     }
@@ -1078,16 +1043,15 @@ impl MultinomialFamily {
         let mut out = Array3::<f64>::zeros((n, m, m));
         let mut d_eta_u = vec![0.0_f64; m];
         let mut d_eta_v = vec![0.0_f64; m];
-        let mut dp_u = vec![0.0_f64; m];
-        let mut dp_v = vec![0.0_f64; m];
-        let mut ddp = vec![0.0_f64; m];
+        let mut normalized = vec![<TwoSeed<0> as JetScalar<0>>::constant(0.0); m];
+        let out_flat = out
+            .as_slice_mut()
+            .expect("owned Fisher jet must be contiguous");
         for row in 0..n {
             let w = self.weights[row];
             if w == 0.0 {
                 continue;
             }
-            let mut s_u = 0.0_f64;
-            let mut s_v = 0.0_f64;
             for a in 0..m {
                 let base = a * p;
                 let mut eta_u = 0.0_f64;
@@ -1099,33 +1063,17 @@ impl MultinomialFamily {
                 }
                 d_eta_u[a] = eta_u;
                 d_eta_v[a] = eta_v;
-                s_u += probs_full[[row, a]] * eta_u;
-                s_v += probs_full[[row, a]] * eta_v;
             }
-            for a in 0..m {
-                let pa = probs_full[[row, a]];
-                dp_u[a] = pa * (d_eta_u[a] - s_u);
-                dp_v[a] = pa * (d_eta_v[a] - s_v);
-            }
-            let mut ds_u_dv = 0.0_f64;
-            for a in 0..m {
-                ds_u_dv += dp_v[a] * d_eta_u[a];
-            }
-            for a in 0..m {
-                let pa = probs_full[[row, a]];
-                ddp[a] = dp_v[a] * (d_eta_u[a] - s_u) - pa * ds_u_dv;
-            }
-            for a in 0..m {
-                let pa = probs_full[[row, a]];
-                out[[row, a, a]] = w * (ddp[a] - 2.0 * ddp[a] * pa - 2.0 * dp_u[a] * dp_v[a]);
-                for b in (a + 1)..m {
-                    let pb = probs_full[[row, b]];
-                    let off =
-                        w * (-(ddp[a] * pb + dp_u[a] * dp_v[b] + dp_v[a] * dp_u[b] + pa * ddp[b]));
-                    out[[row, a, b]] = off;
-                    out[[row, b, a]] = off;
-                }
-            }
+            let row_start = row * m * m;
+            softmax_fisher_perturbation::<TwoSeed<0>>(
+                m,
+                w,
+                |a| probs_full[[row, a]],
+                |a| d_eta_u[a],
+                |a| d_eta_v[a],
+                &mut normalized,
+                &mut out_flat[row_start..row_start + m * m],
+            );
         }
         out
     }
@@ -1200,56 +1148,18 @@ impl MultinomialFamily {
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
     ) -> Result<Array3<f64>, String> {
-        let n = self.weights.len();
+        let p = self.design.ncols();
         let m = self.active_classes();
-        let probs_full = self.row_probabilities(eta);
-        let d_eta_u = self.d_eta_from_d_beta(d_beta_u)?;
-        let d_eta_v = self.d_eta_from_d_beta(d_beta_v)?;
-        let mut out = Array3::<f64>::zeros((n, m, m));
-        let mut dp_u = vec![0.0_f64; m];
-        let mut dp_v = vec![0.0_f64; m];
-        let mut ddp = vec![0.0_f64; m];
-        for row in 0..n {
-            let w = self.weights[row];
-            if w == 0.0 {
-                continue;
-            }
-            let mut s_u = 0.0_f64;
-            let mut s_v = 0.0_f64;
-            for a in 0..m {
-                s_u += probs_full[[row, a]] * d_eta_u[[row, a]];
-                s_v += probs_full[[row, a]] * d_eta_v[[row, a]];
-            }
-            for a in 0..m {
-                let pa = probs_full[[row, a]];
-                dp_u[a] = pa * (d_eta_u[[row, a]] - s_u);
-                dp_v[a] = pa * (d_eta_v[[row, a]] - s_v);
-            }
-            // ∂s^u/∂t_v = Σ_c dp_v[c] · d_η^u_c.
-            let mut ds_u_dv = 0.0_f64;
-            for c in 0..m {
-                ds_u_dv += dp_v[c] * d_eta_u[[row, c]];
-            }
-            for a in 0..m {
-                let pa = probs_full[[row, a]];
-                ddp[a] = dp_v[a] * (d_eta_u[[row, a]] - s_u) + pa * (-ds_u_dv);
-            }
-            // D²H_{a,b} = w · ( δ_ab · ddp_a
-            //                   − ddp_a p_b − dp_u_a dp_v_b
-            //                   − dp_v_a dp_u_b − p_a ddp_b )
-            for a in 0..m {
-                let pa = probs_full[[row, a]];
-                out[[row, a, a]] = w * (ddp[a] - 2.0 * ddp[a] * pa - 2.0 * dp_u[a] * dp_v[a]);
-                for b in (a + 1)..m {
-                    let pb = probs_full[[row, b]];
-                    let off =
-                        w * (-(ddp[a] * pb + dp_u[a] * dp_v[b] + dp_v[a] * dp_u[b] + pa * ddp[b]));
-                    out[[row, a, b]] = off;
-                    out[[row, b, a]] = off;
-                }
-            }
+        let dim = m * p;
+        if d_beta_u.len() != dim || d_beta_v.len() != dim {
+            return Err(format!(
+                "MultinomialFamily second-directional pair lengths {} and {} != (K-1)·P = {dim}",
+                d_beta_u.len(),
+                d_beta_v.len()
+            ));
         }
-        Ok(out)
+        let probs_full = self.row_probabilities(eta);
+        Ok(self.second_directional_fisher_jet_rows(probs_full.view(), d_beta_u, d_beta_v))
     }
 
     /// Assemble the FULL set of canonical-axis joint-Hessian directional
@@ -1310,6 +1220,8 @@ impl MultinomialFamily {
                 let a0 = axis / p;
                 let i0 = axis % p;
                 let mut mat = vec![0.0_f64; dim * dim];
+                let mut normalized = vec![<OneSeed<0> as JetScalar<0>>::constant(0.0); m];
+                let mut jhat = vec![0.0_f64; m * m];
                 for row in 0..n {
                     let w = self.weights[row];
                     if w == 0.0 {
@@ -1319,25 +1231,15 @@ impl MultinomialFamily {
                     if xi0 == 0.0 {
                         continue;
                     }
-                    let pa0 = probs_full[[row, a0]];
-                    // Ĵ_{a0}[c,d] (the X[row,i0]-free per-row jet) using the SAME
-                    // closed form as `directional_fisher_jet`:
-                    //   dp̂_c = p_c (δ_{c,a0} − p_{a0}),
-                    //   Ĵ[c,c] = w (dp̂_c − 2 dp̂_c p_c),
-                    //   Ĵ[c,d] = −w (dp̂_c p_d + p_c dp̂_d)   (c ≠ d).
-                    let mut jhat = vec![0.0_f64; m * m];
-                    for c in 0..m {
-                        let pc = probs_full[[row, c]];
-                        let dpc = pc * (if c == a0 { 1.0 } else { 0.0 } - pa0);
-                        jhat[c * m + c] = w * (dpc - 2.0 * dpc * pc);
-                        for d in (c + 1)..m {
-                            let pd = probs_full[[row, d]];
-                            let dpd = pd * (if d == a0 { 1.0 } else { 0.0 } - pa0);
-                            let off = w * (-(dpc * pd + pc * dpd));
-                            jhat[c * m + d] = off;
-                            jhat[d * m + c] = off;
-                        }
-                    }
+                    softmax_fisher_perturbation::<OneSeed<0>>(
+                        m,
+                        w,
+                        |c| probs_full[[row, c]],
+                        |c| if c == a0 { 1.0 } else { 0.0 },
+                        |_| 0.0,
+                        &mut normalized,
+                        &mut jhat,
+                    );
                     // Scatter `X[row,i0] · Ĵ_{a0}[c,d] · X[row,i] X[row,j]` into
                     // this axis's `(dim,dim)` block (output-major: block `(c,d)`
                     // at rows `c·P..`, cols `d·P..`).
@@ -1440,6 +1342,8 @@ impl MultinomialFamily {
                 let a0 = axis / p;
                 let i0 = axis % p;
                 let mut mat = vec![0.0_f64; dim * dim];
+                let mut normalized = vec![<TwoSeed<0> as JetScalar<0>>::constant(0.0); m];
+                let mut jhat = vec![0.0_f64; m * m];
                 for row in 0..n {
                     let w = self.weights[row];
                     if w == 0.0 {
@@ -1449,48 +1353,15 @@ impl MultinomialFamily {
                     if xi0 == 0.0 {
                         continue;
                     }
-                    // δ-only quantities for this row.
-                    let mut s_u = 0.0_f64;
-                    for c in 0..m {
-                        s_u += probs_full[[row, c]] * d_eta_u[[row, c]];
-                    }
-                    let mut dp_u = vec![0.0_f64; m];
-                    for c in 0..m {
-                        dp_u[c] = probs_full[[row, c]] * (d_eta_u[[row, c]] - s_u);
-                    }
-                    let pa0 = probs_full[[row, a0]];
-                    // a0-specific (X-free) v-side quantities.
-                    let mut dp_v_hat = vec![0.0_f64; m];
-                    let mut ds_u_dv = 0.0_f64;
-                    for c in 0..m {
-                        let pc = probs_full[[row, c]];
-                        let v = pc * (if c == a0 { 1.0 } else { 0.0 } - pa0);
-                        dp_v_hat[c] = v;
-                        ds_u_dv += v * d_eta_u[[row, c]];
-                    }
-                    let mut ddp_hat = vec![0.0_f64; m];
-                    for c in 0..m {
-                        let pc = probs_full[[row, c]];
-                        ddp_hat[c] = dp_v_hat[c] * (d_eta_u[[row, c]] - s_u) - pc * ds_u_dv;
-                    }
-                    // Ĵ²_{a0}[c,d] (the X[row,i0]-free per-row second jet),
-                    // matching `second_directional_fisher_jet` term-for-term.
-                    let mut jhat = vec![0.0_f64; m * m];
-                    for a in 0..m {
-                        let pa = probs_full[[row, a]];
-                        jhat[a * m + a] =
-                            w * (ddp_hat[a] * (1.0 - 2.0 * pa) - 2.0 * dp_u[a] * dp_v_hat[a]);
-                        for b in (a + 1)..m {
-                            let pb = probs_full[[row, b]];
-                            let off = -w
-                                * (ddp_hat[a] * pb
-                                    + dp_u[a] * dp_v_hat[b]
-                                    + dp_v_hat[a] * dp_u[b]
-                                    + pa * ddp_hat[b]);
-                            jhat[a * m + b] = off;
-                            jhat[b * m + a] = off;
-                        }
-                    }
+                    softmax_fisher_perturbation::<TwoSeed<0>>(
+                        m,
+                        w,
+                        |c| probs_full[[row, c]],
+                        |c| d_eta_u[[row, c]],
+                        |c| if c == a0 { 1.0 } else { 0.0 },
+                        &mut normalized,
+                        &mut jhat,
+                    );
                     // Scatter `X[row,i0] · Ĵ²_{a0}[c,d] · X[row,i] X[row,j]` into
                     // this axis's `(dim,dim)` block (output-major).
                     for c in 0..m {
@@ -2212,8 +2083,7 @@ mod tests {
         use super::*;
         use gam_math::jet_scalar::JetScalar;
         use gam_math::jet_tower::{
-            RowProgram, program_fourth_contracted, program_row_kernel,
-            program_third_contracted,
+            RowProgram, program_fourth_contracted, program_row_kernel, program_third_contracted,
         };
         use std::sync::Arc;
 
@@ -2238,11 +2108,7 @@ mod tests {
                 }
                 Ok(self.eta)
             }
-            fn eval<S: JetScalar<M>>(
-                &self,
-                row: usize,
-                p: &[S; M],
-            ) -> Result<S, String> {
+            fn eval<S: JetScalar<M>>(&self, row: usize, p: &[S; M]) -> Result<S, String> {
                 if row != 0 {
                     return Err(format!(
                         "MultinomialJetRow holds exactly one row; got row {row}"
