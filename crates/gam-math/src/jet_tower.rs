@@ -1788,20 +1788,6 @@ pub trait RowNllProgram<const K: usize>: Send + Sync {
     fn row_nll(&self, row: usize, p: &[Tower4<K>; K]) -> Result<Tower4<K>, String>;
 }
 
-/// Evaluate a program's full tower at the current primaries for one row.
-///
-/// One call yields every `RowKernel` calculus channel; callers that need
-/// several contractions of the same row should hold the returned tower and
-/// contract repeatedly rather than re-evaluating.
-pub fn evaluate_program<const K: usize, P: RowNllProgram<K> + ?Sized>(
-    prog: &P,
-    row: usize,
-) -> Result<Tower4<K>, String> {
-    let p = prog.primaries(row)?;
-    let vars: [Tower4<K>; K] = std::array::from_fn(|a| Tower4::variable(p[a], a));
-    prog.row_nll(row, &vars)
-}
-
 // ── The canonical single-source seam (#932 consolidation) ────────────
 //
 // `RowProgram<K>` is the ONE row-program interface #932 converges every family
