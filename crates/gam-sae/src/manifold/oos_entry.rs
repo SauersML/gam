@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
 use gam_terms::basis::{DuchonNullspaceOrder, duchon_sae_atom_penalty, monomial_exponents};
 use ndarray::{Array1, Array2, Array3, ArrayView2, s};
 
@@ -18,8 +19,9 @@ use crate::inference::steering::{SteerPlan, steer_delta};
 use super::{
     AssignmentMode, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,
     MobiusHarmonicEvaluator, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeBasisSecondJet, SaeManifoldAtom, SaeManifoldLoss, SaeManifoldRho,
-    SaeManifoldTerm, SaeStreamingPlan, SphereChartEvaluator, TorusHarmonicEvaluator,
+    SaeBasisEvaluator, SaeBasisSecondJet, SaeCertifyRequest, SaeFitError, SaeFitReport,
+    SaeManifoldAtom, SaeManifoldLoss, SaeManifoldRho, SaeManifoldTerm, SaeStreamingPlan,
+    SphereChartEvaluator, TorusHarmonicEvaluator, run_sae_manifold_certify,
     sae_pca_seed_initial_coords,
 };
 
