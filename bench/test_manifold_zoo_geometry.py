@@ -62,6 +62,7 @@ def test_native_objects_satisfy_independent_implicit_invariants() -> None:
         np.abs(np.hypot(swiss[:, 0], swiss[:, 2]) - swiss_parameters[:, 0])
     ) < 1.0e-12
     assert np.max(np.abs(swiss[:, 1] - swiss_parameters[:, 1])) < 1.0e-12
+    assert np.ptp(swiss[:, 1]) > 20.0, "Swiss roll sheet height collapsed toward a loop"
 
     helix, helix_parameters = ZOO["helix"].sampler(rng, 50_000)
     assert np.max(np.abs(helix[:, 0] ** 2 + helix[:, 1] ** 2 - 1.0)) < 1.0e-12

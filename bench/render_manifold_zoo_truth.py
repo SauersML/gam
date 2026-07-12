@@ -38,7 +38,7 @@ SUBTITLES = {
     "sphere": "x² + y² + z² = 1",
     "torus": "(√(x²+y²)−1)² + z² = 0.4²",
     "mobius": "one half-twist",
-    "swiss": "radius = angle",
+    "swiss": "radius = angle  ·  height ∈ [−10.5, 10.5]",
     "helix": "radius = 1  ·  z = 0.25 angle",
 }
 

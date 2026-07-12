@@ -69,7 +69,12 @@ from typing import Any
 import numpy as np
 
 from bench._synth_sae_metrics import _hungarian_max_numpy
-from bench.manifold_zoo_geometry import CURVED_CYCLE, ZOO, validate_analytic_sample
+from bench.manifold_zoo_geometry import (
+    CURVED_CYCLE,
+    GEOMETRY_REVISION,
+    ZOO,
+    validate_analytic_sample,
+)
 from gamfit._description_length import FittedFeaturizer, description_length
 
 _CALIBRATION_N = 50_000  # their per-instance center+RMS calibration sample size
@@ -666,8 +671,10 @@ def dump_clouds(
     payload["meta_json"] = np.frombuffer(
         json.dumps(
             {
-                "schema": "joint-manifold-sae-analytic-clouds-v2",
+                "schema": "joint-manifold-sae-analytic-clouds-v3",
                 "coordinate_space": "native-analytic",
+                "coordinate_dtype": "float64",
+                "geometry_revision": GEOMETRY_REVISION,
                 "featurizer": fitted.name,
                 "joint_fit": fitted.name == "ours_rust",
                 "fit_config": (fitted.extras or {}).get("fit_config"),

@@ -15,6 +15,8 @@ import numpy as np
 
 
 Sampler = Callable[[np.random.Generator, int], tuple[np.ndarray, np.ndarray]]
+GEOMETRY_REVISION = "analytic-zoo-v2-standard-swiss-height"
+SWISS_HALF_HEIGHT = 10.5
 
 
 @dataclass(frozen=True)
@@ -118,7 +120,7 @@ def _mobius(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
 
 def _swiss_roll(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
     angle = rng.uniform(1.5 * np.pi, 4.5 * np.pi, size=n)
-    height = rng.uniform(-1.0, 1.0, size=n)
+    height = rng.uniform(-SWISS_HALF_HEIGHT, SWISS_HALF_HEIGHT, size=n)
     parameters = np.column_stack((angle, height))
     return analytic_points("swiss", parameters), parameters
 
@@ -202,7 +204,10 @@ def validate_analytic_sample(
     elif kind == "mobius":
         domains = ((0.0, tau), (-0.5, 0.5))
     elif kind == "swiss":
-        domains = ((1.5 * np.pi, 4.5 * np.pi), (-1.0, 1.0))
+        domains = (
+            (1.5 * np.pi, 4.5 * np.pi),
+            (-SWISS_HALF_HEIGHT, SWISS_HALF_HEIGHT),
+        )
     elif kind == "helix":
         domains = ((0.0, 4.0 * np.pi),)
     else:

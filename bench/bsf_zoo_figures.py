@@ -40,7 +40,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from bench.manifold_zoo_geometry import first_coordinate_hue, validate_analytic_sample
+from bench.manifold_zoo_geometry import (
+    GEOMETRY_REVISION,
+    first_coordinate_hue,
+    validate_analytic_sample,
+)
 
 SURFACE = "#fcfcfb"
 INK = "#0b0b0b"
@@ -246,10 +250,14 @@ def _atlas_cloud_records(
     records: dict[str, dict[str, Any]] = {}
     with np.load(path) as store:
         meta = _cloud_meta(store)
-        if meta.get("schema") != "joint-manifold-sae-analytic-clouds-v2":
+        if meta.get("schema") != "joint-manifold-sae-analytic-clouds-v3":
             raise ValueError("cloud file does not use the native analytic joint-fit schema")
         if meta.get("coordinate_space") != "native-analytic":
             raise ValueError("cloud file does not contain native analytic coordinates")
+        if meta.get("coordinate_dtype") != "float64":
+            raise ValueError("cloud file quantized the native analytic coordinates")
+        if meta.get("geometry_revision") != GEOMETRY_REVISION:
+            raise ValueError("cloud file uses a stale analytic geometry revision")
         if meta.get("featurizer") != "ours_rust" or meta.get("joint_fit") is not True:
             raise ValueError("cloud file is not a joint Rust Manifold SAE fit")
         data_config = meta.get("data_config") or {}
@@ -282,13 +290,18 @@ def _atlas_cloud_records(
             if matched_atom in matched_atoms:
                 raise ValueError(f"joint cloud file reuses learned atom {matched_atom}")
             matched_atoms.add(matched_atom)
-            truth = np.asarray(store[f"true_{index}"], dtype=float)
-            theta = np.asarray(store[f"theta_{index}"], dtype=float)
+            truth_raw = store[f"true_{index}"]
+            recovered_raw = store[f"rec_{index}"]
+            theta_raw = store[f"theta_{index}"]
+            if any(array.dtype != np.float64 for array in (truth_raw, recovered_raw, theta_raw)):
+                raise ValueError(f"joint cloud file quantized persisted {kind} coordinates")
+            truth = np.asarray(truth_raw, dtype=float)
+            theta = np.asarray(theta_raw, dtype=float)
             validate_analytic_sample(kind, truth, theta)
             records[kind] = {
                 "path": path,
                 "true": truth,
-                "recovered": np.asarray(store[f"rec_{index}"], dtype=float),
+                "recovered": np.asarray(recovered_raw, dtype=float),
                 "theta": theta,
                 "r2": float(factor["r2"]),
             }
