@@ -241,7 +241,7 @@ pub fn recon_spectrum(
     let (evals, u) = gram
         .eigh(Side::Lower)
         .map_err(|e| format!("recon_spectrum: eigh(G): {e}"))?;
-    let evals = super::construction::certified_gram_spectrum(evals.view())?;
+    let evals = super::construction::certified_psd_spectrum(evals.view(), "rank-charge Gram")?;
     let mut scaled = u.t().dot(decoder);
     let cols = scaled.ncols();
     for i in 0..m {
@@ -615,6 +615,35 @@ mod tests {
         assert!(production(&indefinite, &decoder, 10.0, 3.0, 1.0, 1.0, Some(&penalty)).is_err());
         assert!(
             recon_spectrum(&indefinite, &decoder, 10.0, 3.0, 1.0, 1.0, Some(&penalty)).is_err()
+        );
+
+        // The inverse failure mode is just as invalid: a positive Gram can
+        // hide a negative smoothing direction while G+lambda*S remains SPD.
+        let indefinite_penalty =
+            Array2::from_shape_vec((2, 2), vec![0.0, 0.0, 0.0, -0.25]).unwrap();
+        assert!(
+            production(
+                &gram,
+                &decoder,
+                10.0,
+                3.0,
+                1.0,
+                1.0,
+                Some(&indefinite_penalty),
+            )
+            .is_err()
+        );
+        assert!(
+            recon_spectrum(
+                &gram,
+                &decoder,
+                10.0,
+                3.0,
+                1.0,
+                1.0,
+                Some(&indefinite_penalty),
+            )
+            .is_err()
         );
 
         assert_eq!(

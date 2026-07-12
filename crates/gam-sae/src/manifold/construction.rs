@@ -164,6 +164,10 @@ pub(super) fn validate_rank_charge_problem(
                 }
             }
         }
+        let (penalty_eigenvalues, _) = penalty
+            .eigh(super::Side::Lower)
+            .map_err(|error| format!("rank-charge smooth-penalty eigendecomposition: {error}"))?;
+        certified_psd_spectrum(penalty_eigenvalues.view(), "rank-charge smooth penalty")?;
     }
     Ok(())
 }
@@ -172,11 +176,12 @@ pub(super) fn validate_rank_charge_problem(
 /// negative eigenvalues inside the symmetric eigensolver's backward-error
 /// envelope are numerical zero; a material negative direction is invalid data,
 /// not a direction the rank charge may silently discard.
-pub(super) fn certified_gram_spectrum(
+pub(super) fn certified_psd_spectrum(
     eigenvalues: ArrayView1<'_, f64>,
+    matrix_name: &str,
 ) -> Result<Vec<f64>, String> {
     if eigenvalues.iter().any(|value| !value.is_finite()) {
-        return Err("rank-charge Gram eigenspectrum is non-finite".to_string());
+        return Err(format!("{matrix_name} eigenspectrum is non-finite"));
     }
     let scale = eigenvalues
         .iter()
@@ -187,7 +192,7 @@ pub(super) fn certified_gram_spectrum(
     for (axis, &eigenvalue) in eigenvalues.iter().enumerate() {
         if eigenvalue < -tolerance {
             return Err(format!(
-                "rank-charge Gram is materially indefinite: eigenvalue {axis}={eigenvalue:.6e} is below -{tolerance:.6e}"
+                "{matrix_name} is materially indefinite: eigenvalue {axis}={eigenvalue:.6e} is below -{tolerance:.6e}"
             ));
         }
         certified.push(eigenvalue.max(0.0));
@@ -222,7 +227,7 @@ pub(crate) fn realised_rank_charge_dof(
     let (evals, u) = gram
         .eigh(super::Side::Lower)
         .map_err(|e| format!("realised_rank_charge_dof: eigh(G): {e}"))?;
-    let evals = certified_gram_spectrum(evals.view())?;
+    let evals = certified_psd_spectrum(evals.view(), "rank-charge Gram")?;
     let mut scaled = u.t().dot(decoder);
     let cols = scaled.ncols();
     for i in 0..m {
