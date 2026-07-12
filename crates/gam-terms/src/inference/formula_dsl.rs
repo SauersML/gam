@@ -294,7 +294,10 @@ fn extract_rhs_terms(rhs: Pair<'_, Rule>) -> Result<Vec<String>, String> {
 /// * `a` produces `{a}` — one main effect.
 /// * `a:b` produces `{a:b}` — one interaction.
 /// * `a*b` produces `{a, b, a:b}` — crossing (expanded).
-/// * `a/b` produces `{a, a:b}` — nesting.
+/// * `a/b` produces `{a, a:b}` — nesting. Nesting is hierarchical: each `/`
+///   crosses its right operand with the product of ALL variables on its left,
+///   so `a/b/c` produces `{a, a:b, a:b:c}` (never a spurious `a:c`) and
+///   `a*b/c` produces `{a, b, a:b, a:b:c}`, matching R/mgcv `terms()`.
 /// * `(a + b + ... )^n` produces every non-empty subset of `{a, b, ...}` of
 ///   size at most `n`, each subset being one interaction.
 /// * `+` unions two term sets; `-` is rejected.
