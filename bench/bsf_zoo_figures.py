@@ -392,8 +392,9 @@ def fig_all_zoos_atlas(
     )
     fig.text(
         0.055, 0.915,
-        "Eight exact analytic factors superposed per sample, recovered by one shared "
-        f"{fit_config['atoms']}-atom Top-{fit_config['top_k']} Rust Manifold SAE",
+        f"Eight exact analytic factor types, {data_config['l0']} superposed per sample, "
+        f"recovered by one shared {fit_config['atoms']}-atom "
+        f"Top-{fit_config['top_k']} Rust Manifold SAE",
         ha="left", va="top", fontsize=11.2, color=INK_2,
     )
     fig.text(
