@@ -1953,7 +1953,7 @@ pub fn residual_moment_spec(residuals: ArrayView2<'_, f64>) -> Result<ResidualMo
     validate_matrix(residuals, "residual moment donor")?;
     let StablePopulationMoments {
         location,
-        covariance: mut covariance,
+        mut covariance,
     } = stable_population_moments(residuals)?;
     let mean = location.absolute_mean()?;
     let n = residuals.nrows();
@@ -3013,10 +3013,6 @@ fn standard_normal(rng: &mut StdRng) -> f64 {
     let u1: f64 = rng.random_range(f64::MIN_POSITIVE..1.0);
     let u2: f64 = rng.random_range(0.0..1.0);
     (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
-}
-
-fn stable_column_mean(data: ArrayView2<'_, f64>) -> Result<Array1<f64>, String> {
-    stable_column_location(data)?.absolute_mean()
 }
 
 fn stable_column_sd(
