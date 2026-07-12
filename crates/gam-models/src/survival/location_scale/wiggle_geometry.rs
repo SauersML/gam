@@ -43,13 +43,6 @@ pub(crate) struct SurvivalDynamicGeometryRowsMut<'a> {
     pub(crate) dqdot_ls: &'a mut [f64],
     pub(crate) dqdot_td: &'a mut [f64],
     pub(crate) dqdot_lsd: &'a mut [f64],
-    pub(crate) d2qdot_tt: &'a mut [f64],
-    pub(crate) d2qdot_tls: &'a mut [f64],
-    pub(crate) d2qdot_ttd: &'a mut [f64],
-    pub(crate) d2qdot_tlsd: &'a mut [f64],
-    pub(crate) d2qdot_ls: &'a mut [f64],
-    pub(crate) d2qdot_lstd: &'a mut [f64],
-    pub(crate) d2qdot_lslsd: &'a mut [f64],
 }
 
 impl<'a> SurvivalDynamicGeometryRowsMut<'a> {
@@ -78,13 +71,6 @@ impl<'a> SurvivalDynamicGeometryRowsMut<'a> {
         let (dqdot_ls_l, dqdot_ls_r) = self.dqdot_ls.split_at_mut(mid);
         let (dqdot_td_l, dqdot_td_r) = self.dqdot_td.split_at_mut(mid);
         let (dqdot_lsd_l, dqdot_lsd_r) = self.dqdot_lsd.split_at_mut(mid);
-        let (d2qdot_tt_l, d2qdot_tt_r) = self.d2qdot_tt.split_at_mut(mid);
-        let (d2qdot_tls_l, d2qdot_tls_r) = self.d2qdot_tls.split_at_mut(mid);
-        let (d2qdot_ttd_l, d2qdot_ttd_r) = self.d2qdot_ttd.split_at_mut(mid);
-        let (d2qdot_tlsd_l, d2qdot_tlsd_r) = self.d2qdot_tlsd.split_at_mut(mid);
-        let (d2qdot_ls_l, d2qdot_ls_r) = self.d2qdot_ls.split_at_mut(mid);
-        let (d2qdot_lstd_l, d2qdot_lstd_r) = self.d2qdot_lstd.split_at_mut(mid);
-        let (d2qdot_lslsd_l, d2qdot_lslsd_r) = self.d2qdot_lslsd.split_at_mut(mid);
 
         (
             Self {
@@ -107,13 +93,6 @@ impl<'a> SurvivalDynamicGeometryRowsMut<'a> {
                 dqdot_ls: dqdot_ls_l,
                 dqdot_td: dqdot_td_l,
                 dqdot_lsd: dqdot_lsd_l,
-                d2qdot_tt: d2qdot_tt_l,
-                d2qdot_tls: d2qdot_tls_l,
-                d2qdot_ttd: d2qdot_ttd_l,
-                d2qdot_tlsd: d2qdot_tlsd_l,
-                d2qdot_ls: d2qdot_ls_l,
-                d2qdot_lstd: d2qdot_lstd_l,
-                d2qdot_lslsd: d2qdot_lslsd_l,
             },
             Self {
                 q_exit: q_exit_r,
@@ -135,13 +114,6 @@ impl<'a> SurvivalDynamicGeometryRowsMut<'a> {
                 dqdot_ls: dqdot_ls_r,
                 dqdot_td: dqdot_td_r,
                 dqdot_lsd: dqdot_lsd_r,
-                d2qdot_tt: d2qdot_tt_r,
-                d2qdot_tls: d2qdot_tls_r,
-                d2qdot_ttd: d2qdot_ttd_r,
-                d2qdot_tlsd: d2qdot_tlsd_r,
-                d2qdot_ls: d2qdot_ls_r,
-                d2qdot_lstd: d2qdot_lstd_r,
-                d2qdot_lslsd: d2qdot_lslsd_r,
             },
         )
     }
@@ -241,13 +213,6 @@ pub(crate) fn fill_survival_dynamic_geometry_rows_serial(
         rows.dqdot_ls[offset] = exit_dyn.qdot_ls;
         rows.dqdot_td[offset] = exit_dyn.qdot_td;
         rows.dqdot_lsd[offset] = exit_dyn.qdot_lsd;
-        rows.d2qdot_tt[offset] = exit_dyn.qdot_tt;
-        rows.d2qdot_tls[offset] = exit_dyn.qdot_tls;
-        rows.d2qdot_ttd[offset] = exit_dyn.qdot_ttd;
-        rows.d2qdot_tlsd[offset] = exit_dyn.qdot_tlsd;
-        rows.d2qdot_ls[offset] = exit_dyn.qdot_ll;
-        rows.d2qdot_lstd[offset] = exit_dyn.qdot_lstd;
-        rows.d2qdot_lslsd[offset] = exit_dyn.qdot_llsd;
     }
 }
 
@@ -320,13 +285,6 @@ pub(crate) struct SurvivalDynamicGeometry {
     pub(crate) dqdot_ls: Array1<f64>,
     pub(crate) dqdot_td: Array1<f64>,
     pub(crate) dqdot_lsd: Array1<f64>,
-    pub(crate) d2qdot_tt: Array1<f64>,
-    pub(crate) d2qdot_tls: Array1<f64>,
-    pub(crate) d2qdot_ttd: Array1<f64>,
-    pub(crate) d2qdot_tlsd: Array1<f64>,
-    pub(crate) d2qdot_ls: Array1<f64>,
-    pub(crate) d2qdot_lstd: Array1<f64>,
-    pub(crate) d2qdot_lslsd: Array1<f64>,
     pub(crate) wiggle_basis_exit: Option<Array2<f64>>,
     pub(crate) wiggle_basis_entry: Option<Array2<f64>>,
     pub(crate) wiggle_qdot_basis_exit: Option<Array2<f64>>,
@@ -739,13 +697,6 @@ impl SurvivalLocationScaleFamily {
         let mut dqdot_ls = Array1::<f64>::zeros(n);
         let mut dqdot_td = Array1::<f64>::zeros(n);
         let mut dqdot_lsd = Array1::<f64>::zeros(n);
-        let mut d2qdot_tt = Array1::<f64>::zeros(n);
-        let mut d2qdot_tls = Array1::<f64>::zeros(n);
-        let mut d2qdot_ttd = Array1::<f64>::zeros(n);
-        let mut d2qdot_tlsd = Array1::<f64>::zeros(n);
-        let mut d2qdot_ls = Array1::<f64>::zeros(n);
-        let mut d2qdot_lstd = Array1::<f64>::zeros(n);
-        let mut d2qdot_lslsd = Array1::<f64>::zeros(n);
 
         let dynamic_row_inputs = SurvivalDynamicGeometryRowInputs {
             eta_t_exit: eta_t_exit.view(),
@@ -810,27 +761,6 @@ impl SurvivalLocationScaleFamily {
             dqdot_lsd: dqdot_lsd
                 .as_slice_mut()
                 .expect("dqdot_lsd must be contiguous"),
-            d2qdot_tt: d2qdot_tt
-                .as_slice_mut()
-                .expect("d2qdot_tt must be contiguous"),
-            d2qdot_tls: d2qdot_tls
-                .as_slice_mut()
-                .expect("d2qdot_tls must be contiguous"),
-            d2qdot_ttd: d2qdot_ttd
-                .as_slice_mut()
-                .expect("d2qdot_ttd must be contiguous"),
-            d2qdot_tlsd: d2qdot_tlsd
-                .as_slice_mut()
-                .expect("d2qdot_tlsd must be contiguous"),
-            d2qdot_ls: d2qdot_ls
-                .as_slice_mut()
-                .expect("d2qdot_ls must be contiguous"),
-            d2qdot_lstd: d2qdot_lstd
-                .as_slice_mut()
-                .expect("d2qdot_lstd must be contiguous"),
-            d2qdot_lslsd: d2qdot_lslsd
-                .as_slice_mut()
-                .expect("d2qdot_lslsd must be contiguous"),
         };
         fill_survival_dynamic_geometry_rows(dynamic_rows, 0, &dynamic_row_inputs);
 
@@ -905,13 +835,6 @@ impl SurvivalLocationScaleFamily {
             dqdot_ls,
             dqdot_td,
             dqdot_lsd,
-            d2qdot_tt,
-            d2qdot_tls,
-            d2qdot_ttd,
-            d2qdot_tlsd,
-            d2qdot_ls,
-            d2qdot_lstd,
-            d2qdot_lslsd,
             wiggle_basis_exit: wiggle_exit.as_ref().map(|w| w.basis.clone()),
             wiggle_basis_entry: wiggle_entry.as_ref().map(|w| w.basis.clone()),
             wiggle_qdot_basis_exit,
