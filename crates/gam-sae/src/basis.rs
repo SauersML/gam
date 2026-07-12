@@ -876,6 +876,384 @@ impl SaeBasisThirdJet for SphereChartEvaluator {
     }
 }
 
+/// One real spherical-harmonic column `Y_l^m`, fixed at construction.
+///
+/// Each column factors as `R_{l,m}(lat) · T_m(lon)` — a pure-latitude
+/// amplitude times a pure-longitude phase — so its full jet in `(lat, lon)` is
+/// the separable outer product of the two per-axis derivative tables. The
+/// latitude amplitude is `R_{l,m}(lat) = N_{l,m} · cos(lat)^{|m|} · Q(sin lat)`,
+/// where `Q = d^{|m|}/du^{|m|} P_l(u)` is the `|m|`-th `u`-derivative of the
+/// Legendre polynomial (the associated-Legendre function's polynomial part) and
+/// `N_{l,m}` is the orthonormalization constant. The `(-1)^m` Condon–Shortley
+/// phase is intentionally dropped: it is a per-column sign the decoder absorbs
+/// and it has no effect on the span, orthonormality, or reconstruction.
+#[derive(Debug, Clone)]
+struct SphHarmonicColumn {
+    /// Signed order `m ∈ [-l, l]`: `m ≥ 0` uses `cos(m·lon)`, `m < 0` uses
+    /// `sin(|m|·lon)`.
+    m: i64,
+    /// `|m|`, the `cos(lat)` power and the Legendre `u`-derivative order.
+    am: usize,
+    /// Orthonormalization constant `N_{l,m}` (includes the `√2` for `m ≠ 0`).
+    norm: f64,
+    /// `Q = d^{|m|}/du^{|m|} P_l(u)`, ascending powers of `u = sin(lat)`.
+    assoc: Vec<f64>,
+    /// `true` iff `l ≥ 2` — the curved (η-dialed) refinement above the base
+    /// monopole+dipole sphere embedding.
+    curved: bool,
+}
+
+/// Real orthonormal spherical-harmonic evaluator on `S^2`, charted by
+/// `(lat, lon)` with `x = cos(lat)cos(lon)`, `y = cos(lat)sin(lon)`,
+/// `z = sin(lat)` (matching [`SphereChartEvaluator`]).
+///
+/// This is the rotation-covariant basis the fixed 7-column
+/// [`SphereChartEvaluator`] is not: its columns are the `(degree+1)²` real
+/// spherical harmonics `Y_l^m`, `l = 0..=degree`, `m = -l..=l`, an orthonormal
+/// basis for every band-limited field on the sphere. The degree-2 chart spans
+/// only `[1, x, y, z, xy, yz, xz]` — the monopole, the dipole, and *three of the
+/// five* quadrupoles — so it cannot represent `x²−y²`, `3z²−1`, or any `l ≥ 3`
+/// content; a genuinely sphere-class field with higher-degree structure is
+/// out of its span. This evaluator closes that resolution gap, with the working
+/// degree chosen by [`select_spherical_harmonic_degree`] under the same
+/// spectral-noise-floor bandwidth doctrine the torus/circle already use.
+///
+/// **Smoothness / poles.** Every column is a polynomial in `sin(lat)`,
+/// `cos(lat)`, `sin(m·lon)`, `cos(m·lon)`, all entire, so the map and its jets
+/// are globally `C^∞` in `(lat, lon)` — latitude is never clamped here. The
+/// pole gauge degeneracy is intrinsic to the lat/lon chart, not this basis: at
+/// `cos(lat) = 0` every `m ≠ 0` harmonic and its longitude derivative vanish, so
+/// all longitudes collapse to one physical point. That is handled exactly where
+/// [`SphereChartEvaluator`] handles it — by the retraction / tangent projection
+/// enforcing the `lat ∈ [-π/2, π/2]` box and the pole-seam seeding (issue
+/// #1890) — never by truncating a derivative.
+#[derive(Debug, Clone)]
+pub struct SphericalHarmonicEvaluator {
+    degree: usize,
+    columns: Vec<SphHarmonicColumn>,
+}
+
+/// Legendre polynomials `P_0..=P_degree` as ascending-power coefficient vectors,
+/// via the exact three-term recurrence `l·P_l = (2l-1)·u·P_{l-1} − (l-1)·P_{l-2}`.
+fn legendre_polynomials(degree: usize) -> Vec<Vec<f64>> {
+    let mut polys: Vec<Vec<f64>> = Vec::with_capacity(degree + 1);
+    polys.push(vec![1.0]);
+    if degree >= 1 {
+        polys.push(vec![0.0, 1.0]);
+    }
+    for l in 2..=degree {
+        let prev = &polys[l - 1];
+        let prev2 = &polys[l - 2];
+        let mut next = vec![0.0_f64; l + 1];
+        // (2l-1)·u·P_{l-1}
+        for (k, &coeff) in prev.iter().enumerate() {
+            next[k + 1] += (2 * l - 1) as f64 * coeff;
+        }
+        // −(l-1)·P_{l-2}
+        for (k, &coeff) in prev2.iter().enumerate() {
+            next[k] -= (l - 1) as f64 * coeff;
+        }
+        let inv = 1.0 / l as f64;
+        for c in next.iter_mut() {
+            *c *= inv;
+        }
+        polys.push(next);
+    }
+    polys
+}
+
+/// `order`-th derivative of an ascending-power polynomial (exact).
+fn polynomial_derivative(coeffs: &[f64], order: usize) -> Vec<f64> {
+    let mut c = coeffs.to_vec();
+    for _ in 0..order {
+        if c.len() <= 1 {
+            return vec![0.0];
+        }
+        c = (1..c.len()).map(|k| k as f64 * c[k]).collect();
+    }
+    c
+}
+
+/// Orthonormalization constant `N_{l,m} = √((2l+1)/(4π) · (l−|m|)!/(l+|m|)!)`,
+/// times `√2` for `m ≠ 0` (the real-harmonic combination of `±m`).
+fn spherical_harmonic_norm(l: usize, m: i64) -> f64 {
+    let am = m.unsigned_abs() as usize;
+    let mut ratio = 1.0_f64; // (l-am)! / (l+am)!
+    for k in (l - am + 1)..=(l + am) {
+        ratio /= k as f64;
+    }
+    let base = ((2 * l + 1) as f64 / (4.0 * std::f64::consts::PI) * ratio).sqrt();
+    if m == 0 { base } else { base * std::f64::consts::SQRT_2 }
+}
+
+/// One-dimensional order-3 jet `[f, f', f'', f''']` product (Leibniz).
+#[inline]
+fn sph_jet_mul(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+    [
+        a[0] * b[0],
+        a[1] * b[0] + a[0] * b[1],
+        a[2] * b[0] + 2.0 * a[1] * b[1] + a[0] * b[2],
+        a[3] * b[0] + 3.0 * a[2] * b[1] + 3.0 * a[1] * b[2] + a[0] * b[3],
+    ]
+}
+
+impl SphericalHarmonicEvaluator {
+    pub fn new(degree: usize) -> Result<Self, String> {
+        let polys = legendre_polynomials(degree);
+        let mut columns = Vec::with_capacity((degree + 1) * (degree + 1));
+        for l in 0..=degree {
+            for m in -(l as i64)..=(l as i64) {
+                let am = m.unsigned_abs() as usize;
+                columns.push(SphHarmonicColumn {
+                    m,
+                    am,
+                    norm: spherical_harmonic_norm(l, m),
+                    assoc: polynomial_derivative(&polys[l], am),
+                    curved: l >= 2,
+                });
+            }
+        }
+        Ok(Self { degree, columns })
+    }
+
+    pub fn degree(&self) -> usize {
+        self.degree
+    }
+
+    pub fn basis_size(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Latitude amplitude jet `[R, R', R'', R''']` of a column via order-3 jet
+    /// arithmetic in `lat`: `R = N · cos(lat)^{|m|} · Q(sin lat)`.
+    fn lat_table(&self, col: &SphHarmonicColumn, lat: f64) -> [f64; 4] {
+        let (s, c) = lat.sin_cos();
+        let slat = [s, c, -s, -c];
+        let clat = [c, -s, -c, s];
+        let mut pow = [1.0, 0.0, 0.0, 0.0];
+        for _ in 0..col.am {
+            pow = sph_jet_mul(pow, clat);
+        }
+        // Horner evaluation of Q at slat.
+        let mut acc = [0.0, 0.0, 0.0, 0.0];
+        for &coeff in col.assoc.iter().rev() {
+            acc = sph_jet_mul(acc, slat);
+            acc[0] += coeff;
+        }
+        let mut r = sph_jet_mul(pow, acc);
+        for value in r.iter_mut() {
+            *value *= col.norm;
+        }
+        r
+    }
+
+    /// Longitude phase jet `[T, T', T'', T''']`: `cos(m·lon)` for `m ≥ 0`,
+    /// `sin(|m|·lon)` for `m < 0`.
+    fn lon_table(m: i64, lon: f64) -> [f64; 4] {
+        if m == 0 {
+            return [1.0, 0.0, 0.0, 0.0];
+        }
+        let mf = m.unsigned_abs() as f64;
+        let (s, c) = (mf * lon).sin_cos();
+        if m > 0 {
+            [c, -mf * s, -mf * mf * c, mf * mf * mf * s]
+        } else {
+            [s, mf * c, -mf * mf * s, -mf * mf * mf * c]
+        }
+    }
+
+    fn check_coords(&self, coords: ArrayView2<'_, f64>, what: &str) -> Result<(), String> {
+        if coords.ncols() != 2 {
+            return Err(format!(
+                "SphericalHarmonicEvaluator::{what}: expected latent_dim == 2 (lat, lon), got {}",
+                coords.ncols()
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl SaeBasisEvaluator for SphericalHarmonicEvaluator {
+    fn phi_eta_split(&self, n_basis: usize) -> Result<PhiEtaSplit, String> {
+        let expected = self.basis_size();
+        if n_basis != expected {
+            return Err(format!(
+                "SphericalHarmonicEvaluator::phi_eta_split: n_basis {n_basis} != evaluator width {expected}"
+            ));
+        }
+        // Base (η-invariant) block: monopole + dipole `l ≤ 1` (the base sphere
+        // embedding). The quadrupole and higher harmonics `l ≥ 2` are the
+        // η-dialed curvature refinement, mirroring the fixed sphere chart.
+        let curved = self.columns.iter().map(|col| col.curved).collect::<Vec<_>>();
+        Ok(PhiEtaSplit::from_curved_mask(curved))
+    }
+
+    /// The `(l, m)` triangular indexing is not a clean per-axis tensor product.
+    fn factor_basis_sizes(&self) -> Option<(usize, usize)> {
+        None
+    }
+
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+        Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
+        Some(<Self as SaeBasisThirdJet>::third_jet(self, coords))
+    }
+
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
+        self.check_coords(coords, "evaluate")?;
+        let n = coords.nrows();
+        let m = self.basis_size();
+        let mut phi = Array2::<f64>::zeros((n, m));
+        let mut jet = Array3::<f64>::zeros((n, m, 2));
+        for row in 0..n {
+            let lat = coords[[row, 0]];
+            let lon = coords[[row, 1]];
+            for (col_idx, col) in self.columns.iter().enumerate() {
+                let r = self.lat_table(col, lat);
+                let t = Self::lon_table(col.m, lon);
+                phi[[row, col_idx]] = r[0] * t[0];
+                jet[[row, col_idx, 0]] = r[1] * t[0];
+                jet[[row, col_idx, 1]] = r[0] * t[1];
+            }
+        }
+        Ok((phi, jet))
+    }
+}
+
+impl SaeBasisSecondJet for SphericalHarmonicEvaluator {
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
+        self.check_coords(coords, "second_jet")?;
+        let n = coords.nrows();
+        let m = self.basis_size();
+        let mut h = Array4::<f64>::zeros((n, m, 2, 2));
+        for row in 0..n {
+            let lat = coords[[row, 0]];
+            let lon = coords[[row, 1]];
+            for (col_idx, col) in self.columns.iter().enumerate() {
+                let r = self.lat_table(col, lat);
+                let t = Self::lon_table(col.m, lon);
+                // Separable column: ∂^{p+q}/∂lat^p ∂lon^q = R^{(p)} · T^{(q)}.
+                h[[row, col_idx, 0, 0]] = r[2] * t[0];
+                h[[row, col_idx, 0, 1]] = r[1] * t[1];
+                h[[row, col_idx, 1, 0]] = r[1] * t[1];
+                h[[row, col_idx, 1, 1]] = r[0] * t[2];
+            }
+        }
+        Ok(h)
+    }
+}
+
+impl SaeBasisThirdJet for SphericalHarmonicEvaluator {
+    fn third_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array5<f64>, String> {
+        self.check_coords(coords, "third_jet")?;
+        let n = coords.nrows();
+        let m = self.basis_size();
+        let mut t3 = Array5::<f64>::zeros((n, m, 2, 2, 2));
+        for row in 0..n {
+            let lat = coords[[row, 0]];
+            let lon = coords[[row, 1]];
+            for (col_idx, col) in self.columns.iter().enumerate() {
+                let r = self.lat_table(col, lat);
+                let t = Self::lon_table(col.m, lon);
+                for axis_a in 0..2 {
+                    for axis_b in 0..2 {
+                        for axis_c in 0..2 {
+                            // Separable: the mixed derivative depends only on how
+                            // many of the three operators are latitude (axis 0).
+                            let n_lat = (axis_a == 0) as usize
+                                + (axis_b == 0) as usize
+                                + (axis_c == 0) as usize;
+                            t3[[row, col_idx, axis_a, axis_b, axis_c]] = r[n_lat] * t[3 - n_lat];
+                        }
+                    }
+                }
+            }
+        }
+        Ok(t3)
+    }
+}
+
+/// Select the working spherical-harmonic degree by the spectral-noise-floor
+/// bandwidth doctrine: fit the full `max_degree` basis on the chart, form the
+/// per-degree mean coefficient energy `E_l = ‖coefficients at degree l‖² /
+/// (2l+1)`, and cut at the largest cliff in that spectrum — the degree above
+/// which the energy collapses to the noise floor. This is the sphere analogue
+/// of the torus/circle bandwidth selection and the Duchon-sheet resolution
+/// ladder: no tuned resolution constant, the data's own spectrum sets the band.
+///
+/// Returns the smallest sufficient degree in `0..=max_degree`. If the spectrum
+/// has no pronounced floor (every degree carries signal), the full `max_degree`
+/// is kept.
+pub fn select_spherical_harmonic_degree(
+    coords: ArrayView2<'_, f64>,
+    target: ArrayView2<'_, f64>,
+    max_degree: usize,
+) -> Result<usize, String> {
+    use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
+    use faer::Side;
+
+    if coords.nrows() != target.nrows() {
+        return Err(format!(
+            "select_spherical_harmonic_degree: coords rows {} != target rows {}",
+            coords.nrows(),
+            target.nrows()
+        ));
+    }
+    if max_degree == 0 {
+        return Ok(0);
+    }
+    let evaluator = SphericalHarmonicEvaluator::new(max_degree)?;
+    let (phi, _) = evaluator.evaluate(coords)?;
+    // Ridge-stabilized normal-equations fit of the full basis to the target.
+    let mut gram = fast_ata(&phi);
+    let scale = gram.diag().iter().copied().fold(0.0_f64, f64::max);
+    let ridge = if scale > 0.0 { scale } else { 1.0 } * 1e-9;
+    for d in gram.diag_mut().iter_mut() {
+        *d += ridge;
+    }
+    let rhs = fast_atb(&phi, &target.to_owned());
+    let decoder = gram
+        .cholesky(Side::Lower)
+        .map_err(|err| format!("select_spherical_harmonic_degree: gram factorization failed: {err:?}"))?
+        .solve_mat(&rhs);
+
+    // Per-degree mean coefficient energy over the (2l+1) orders and all outputs.
+    let mut energy = vec![0.0_f64; max_degree + 1];
+    let mut col = 0usize;
+    for (l, e) in energy.iter_mut().enumerate() {
+        let width = 2 * l + 1;
+        let mut acc = 0.0_f64;
+        for _ in 0..width {
+            for out in 0..decoder.ncols() {
+                acc += decoder[[col, out]] * decoder[[col, out]];
+            }
+            col += 1;
+        }
+        *e = acc / width as f64;
+    }
+
+    // Largest downward cliff `E_l / E_{l+1}`: the boundary between signal and
+    // the noise floor. Require a decisive factor (100×) before trusting it as a
+    // floor; otherwise keep the full band.
+    let mut cut = max_degree;
+    let mut best_ratio = 1.0_f64;
+    for l in 0..max_degree {
+        let hi = energy[l];
+        let lo = energy[l + 1].max(f64::MIN_POSITIVE);
+        let ratio = hi / lo;
+        if ratio > best_ratio {
+            best_ratio = ratio;
+            cut = l;
+        }
+    }
+    if best_ratio < 100.0 {
+        cut = max_degree;
+    }
+    Ok(cut)
+}
+
 /// Tensor-product periodic harmonic evaluator for a `d`-dimensional torus
 /// `T^d = (S^1)^d`. The basis is the tensor product over each axis of the
 /// 1-D circle basis, stored **sine-first** within each harmonic (matching the
@@ -2757,6 +3135,209 @@ impl SaeBasisThirdJet for AnchorIndicatorEvaluator {
 mod tests {
     use super::*;
     use ndarray::{Array2, Array3};
+
+    /// Deterministic splitmix64 stream in `[0, 1)` for reproducible fixtures.
+    fn uniform_stream(seed: u64) -> impl FnMut() -> f64 {
+        let mut state = seed;
+        move || {
+            state = state.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^= z >> 31;
+            (z >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// Least-squares decoder on `train_rows`, held-out R² on `test_rows`.
+    fn heldout_r2(
+        phi: &Array2<f64>,
+        target: &Array2<f64>,
+        train_rows: &[usize],
+        test_rows: &[usize],
+    ) -> f64 {
+        use faer::Side;
+        use gam_linalg::faer_ndarray::FaerCholesky;
+        let p = phi.ncols();
+        let q = target.ncols();
+        let mut gram = Array2::<f64>::zeros((p, p));
+        let mut rhs = Array2::<f64>::zeros((p, q));
+        for &row in train_rows {
+            for a in 0..p {
+                for b in 0..p {
+                    gram[[a, b]] += phi[[row, a]] * phi[[row, b]];
+                }
+                for c in 0..q {
+                    rhs[[a, c]] += phi[[row, a]] * target[[row, c]];
+                }
+            }
+        }
+        let scale = gram.diag().iter().copied().fold(0.0_f64, f64::max);
+        for d in gram.diag_mut().iter_mut() {
+            *d += scale * 64.0 * f64::EPSILON;
+        }
+        let decoder = gram.cholesky(Side::Lower).unwrap().solve_mat(&rhs);
+        let mut mean = vec![0.0_f64; q];
+        for &row in test_rows {
+            for c in 0..q {
+                mean[c] += target[[row, c]];
+            }
+        }
+        for v in mean.iter_mut() {
+            *v /= test_rows.len() as f64;
+        }
+        let (mut residual, mut total) = (0.0_f64, 0.0_f64);
+        for &row in test_rows {
+            for c in 0..q {
+                let mut fit = 0.0_f64;
+                for a in 0..p {
+                    fit += phi[[row, a]] * decoder[[a, c]];
+                }
+                residual += (target[[row, c]] - fit).powi(2);
+                total += (target[[row, c]] - mean[c]).powi(2);
+            }
+        }
+        1.0 - residual / total
+    }
+
+    /// A band-limited field on `S²` (degree ≤ 3) lies exactly in the real
+    /// spherical-harmonic span, so the `Y_l^m` basis reconstructs held-out rows
+    /// to near-exactness — while the fixed degree-2 lat/lon chart, which spans
+    /// only `[1, x, y, z, xy, yz, xz]` (missing two quadrupoles and every `l ≥ 3`
+    /// mode), cannot. That gap is the whole point of #2243's sphere-resolution
+    /// follow-up. The bandwidth selector must also recover the planted degree 3
+    /// from a noisy over-fit at degree 6. No reference tool is asserted against;
+    /// the fixed chart is a baseline we beat on held-out reconstruction.
+    #[test]
+    fn spherical_harmonic_recovers_bandlimited_field_and_beats_fixed_chart() {
+        let mut rng = uniform_stream(0xACE1);
+        let n = 3000usize;
+        let mut coords = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            // Uniform on the sphere: lat = asin(U(-1,1)), lon = U(0, 2π).
+            coords[[row, 0]] = (2.0 * rng() - 1.0).asin();
+            coords[[row, 1]] = std::f64::consts::TAU * rng();
+        }
+        // Plant a degree-3 field: random decoder over the 16 real harmonics.
+        let planted = SphericalHarmonicEvaluator::new(3).unwrap();
+        let (basis3, _) = planted.evaluate(coords.view()).unwrap();
+        let p_out = 6usize;
+        let mut decoder = Array2::<f64>::zeros((basis3.ncols(), p_out));
+        for a in 0..basis3.ncols() {
+            for c in 0..p_out {
+                decoder[[a, c]] = 2.0 * rng() - 1.0;
+            }
+        }
+        let target = basis3.dot(&decoder);
+
+        let test_rows: Vec<usize> = (0..n).filter(|r| r % 4 == 0).collect();
+        let train_rows: Vec<usize> = (0..n).filter(|r| r % 4 != 0).collect();
+
+        let sh_r2 = heldout_r2(&basis3, &target, &train_rows, &test_rows);
+        let (fixed_phi, _) = SphereChartEvaluator.evaluate(coords.view()).unwrap();
+        let fixed_r2 = heldout_r2(&fixed_phi, &target, &train_rows, &test_rows);
+
+        assert!(
+            sh_r2 > 0.999,
+            "the spherical-harmonic basis must reconstruct a band-limited sphere \
+             field to near-exactness; SH held-out R²={sh_r2}, fixed-chart R²={fixed_r2}"
+        );
+        assert!(
+            fixed_r2 < 0.9,
+            "the fixed degree-2 chart must NOT reach the higher-degree field \
+             (its span omits two quadrupoles and every l≥3 mode); \
+             SH held-out R²={sh_r2}, fixed-chart R²={fixed_r2}"
+        );
+        assert!(
+            sh_r2 > fixed_r2,
+            "the spherical-harmonic basis must beat the fixed chart on held-out \
+             reconstruction; SH held-out R²={sh_r2}, fixed-chart R²={fixed_r2}"
+        );
+
+        // Bandwidth selection: a noisy fit at max_degree=6 must cut back to the
+        // planted degree 3 at the spectral noise floor.
+        let mut noisy = target.clone();
+        for row in 0..n {
+            for c in 0..p_out {
+                noisy[[row, c]] += 0.01 * (2.0 * rng() - 1.0);
+            }
+        }
+        let selected =
+            select_spherical_harmonic_degree(coords.view(), noisy.view(), 6).unwrap();
+        assert_eq!(
+            selected, 3,
+            "spectral-noise-floor bandwidth selection must recover the planted degree 3"
+        );
+    }
+
+    /// The analytic Hessian and third jet must match finite differences of the
+    /// lower jet (the Newton solver consumes them). Order-1 FD of a lower
+    /// analytic derivative is well-conditioned, unlike a raw high-order FD of the
+    /// value, so this pins every entry: `second_jet` against a central
+    /// difference of the `evaluate` jet, and `third_jet` against a central
+    /// difference of `second_jet`.
+    #[test]
+    fn spherical_harmonic_jets_match_finite_differences() {
+        let evaluator = SphericalHarmonicEvaluator::new(4).unwrap();
+        let coords = Array2::from_shape_vec(
+            (4, 2),
+            vec![0.3, 0.7, -0.9, 2.1, 1.2, -1.3, -0.1, 4.0],
+        )
+        .unwrap();
+        let h = 1e-5;
+        let m = evaluator.basis_size();
+        let hess = evaluator.second_jet(coords.view()).unwrap();
+        let third = evaluator.third_jet(coords.view()).unwrap();
+
+        let shifted = |axis: usize, step: f64| -> Array2<f64> {
+            let mut c = coords.clone();
+            for row in 0..c.nrows() {
+                c[[row, axis]] += step;
+            }
+            c
+        };
+
+        // second_jet vs central FD of the analytic first jet.
+        let mut max_h_err = 0.0_f64;
+        for axis in 0..2 {
+            let (_, jp) = evaluator.evaluate(shifted(axis, h).view()).unwrap();
+            let (_, jm) = evaluator.evaluate(shifted(axis, -h).view()).unwrap();
+            for row in 0..coords.nrows() {
+                for col in 0..m {
+                    for other in 0..2 {
+                        let fd = (jp[[row, col, other]] - jm[[row, col, other]]) / (2.0 * h);
+                        max_h_err = max_h_err.max((hess[[row, col, other, axis]] - fd).abs());
+                    }
+                }
+            }
+        }
+        assert!(
+            max_h_err < 1e-4,
+            "spherical-harmonic Hessian must match FD of the first jet; max err {max_h_err}"
+        );
+
+        // third_jet vs central FD of the analytic Hessian.
+        let mut max_t_err = 0.0_f64;
+        for axis in 0..2 {
+            let hp = evaluator.second_jet(shifted(axis, h).view()).unwrap();
+            let hm = evaluator.second_jet(shifted(axis, -h).view()).unwrap();
+            for row in 0..coords.nrows() {
+                for col in 0..m {
+                    for a in 0..2 {
+                        for b in 0..2 {
+                            let fd = (hp[[row, col, a, b]] - hm[[row, col, a, b]]) / (2.0 * h);
+                            max_t_err =
+                                max_t_err.max((third[[row, col, a, b, axis]] - fd).abs());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            max_t_err < 1e-4,
+            "spherical-harmonic third jet must match FD of the Hessian; max err {max_t_err}"
+        );
+    }
 
     #[test]
     fn mobius_basis_is_invariant_under_deck_transform() {
