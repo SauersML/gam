@@ -1566,7 +1566,7 @@ mod ordered_beta_bernoulli_exact_hessian_tests {
                 "index {index}: analytic A-B={} expected={} exact_fd={exact_fd}",
                 analytic[index],
                 expected,
-            )?;
+            );
         }
         assert!(
             analytic[2].abs() > 1.0e-6 && analytic[4].abs() > 1.0e-6,

@@ -76,7 +76,7 @@ fn qwen_real_activation_behavior_fit_selects_identifiable_lambda_y() {
     assert!(ident.activation_residual_variance > 0.0);
     assert!(ident.behavior_residual_variance > 0.0);
     assert!(ident.log_lambda_curvature > 0.0);
-    assert!(report.behavior_block.log_lambda_y.is_finite());
+    assert!(report.behavior_block.log_lambda_y().is_finite());
 
     // The fitted behavior decodes to exact distributions with finite KL on
     // every row — the honest summary must not hide an infinite row.
@@ -136,5 +136,5 @@ fn zz2015_tiny_inner_crawl_terminates() {
     })
     .expect("tiny inner-crawl repro: the inner solve must TERMINATE (converge), not refuse");
     assert_eq!(report.crosscoder.layers.len(), 2);
-    assert!(report.behavior_block.log_lambda_y.is_finite());
+    assert!(report.behavior_block.log_lambda_y().is_finite());
 }
