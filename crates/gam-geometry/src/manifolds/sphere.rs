@@ -1099,3 +1099,110 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod parallel_transport_tests {
+    use super::*;
+    use ndarray::array;
+
+    /// Non-antipodal fixture with a genuinely 3-D geodesic (both endpoints
+    /// have nonzero components on all three axes, so `parallel_transport`'s
+    /// `v − (⟨v,to⟩/(1+⟨from,to⟩))(from+to)` formula is exercised in full,
+    /// not on a degenerate in-plane special case). `[`SphereManifold`]`'s
+    /// `parallel_transport` had no direct test anywhere in this crate before
+    /// this module — `grassmann.rs`'s transport delegates straight to it
+    /// (see [`GrassmannManifold::parallel_transport`]) and was likewise
+    /// untested.
+    fn fixture() -> (SphereManifold, Array1<f64>, Array1<f64>) {
+        let m = SphereManifold::new(2);
+        let p = array![1.0, 0.0, 0.0];
+        let raw = array![1.0, 1.0, 1.0];
+        let q = &raw / norm(raw.view());
+        (m, p, q)
+    }
+
+    fn path2(a: &Array1<f64>, b: &Array1<f64>) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((2, a.len()));
+        out.row_mut(0).assign(a);
+        out.row_mut(1).assign(b);
+        out
+    }
+
+    /// Parallel transport is a linear isometry between tangent spaces:
+    /// `⟨Γ(u), Γ(v)⟩ = ⟨u, v⟩`. The sphere carries the embedded (identity)
+    /// metric, so the plain ambient dot product is the Riemannian one.
+    #[test]
+    fn parallel_transport_preserves_inner_product() {
+        let (m, p, q) = fixture();
+        let path = path2(&p, &q);
+        // Tangent at p: orthogonal to p, i.e. zero first coordinate.
+        let u = array![0.0, 1.0, 0.4];
+        let v = array![0.0, -0.3, 1.2];
+
+        let tu = m.parallel_transport(path.view(), u.view()).expect("Γ(u)");
+        let tv = m.parallel_transport(path.view(), v.view()).expect("Γ(v)");
+
+        // Transported vectors must land back in the tangent space at q.
+        assert!(
+            dot(tu.view(), q.view()).abs() <= 1e-10,
+            "Γ(u) not tangent at q"
+        );
+        assert!(
+            dot(tv.view(), q.view()).abs() <= 1e-10,
+            "Γ(v) not tangent at q"
+        );
+
+        let before = dot(u.view(), v.view());
+        let after = dot(tu.view(), tv.view());
+        assert!(
+            (before - after).abs() <= 1e-10 * before.abs().max(1.0),
+            "parallel transport is not an isometry: ⟨u,v⟩={before:.12e}, ⟨Γu,Γv⟩={after:.12e}"
+        );
+    }
+
+    /// Transporting the initial velocity of the `p→q` geodesic gives the
+    /// negative of the `q→p` geodesic's initial velocity:
+    /// `Γ_{p→q}(log_p q) = −log_q p`.
+    #[test]
+    fn parallel_transport_matches_geodesic_velocity_identity() {
+        let (m, p, q) = fixture();
+        let forward = path2(&p, &q);
+        let v_p_to_q = m.log_map(p.view(), q.view()).expect("log_p(q)");
+        let v_q_to_p = m.log_map(q.view(), p.view()).expect("log_q(p)");
+
+        let transported = m
+            .parallel_transport(forward.view(), v_p_to_q.view())
+            .expect("Γ(log_p q)");
+        for (i, (&t, &v)) in transported.iter().zip(v_q_to_p.iter()).enumerate() {
+            assert!(
+                (t + v).abs() <= 1e-9 * v.abs().max(1.0),
+                "component {i}: Γ(log_p q)={t:.12e}, −log_q p={:.12e}",
+                -v
+            );
+        }
+    }
+
+    /// Transporting forward `p→q` then back `q→p` recovers the original
+    /// tangent vector exactly.
+    #[test]
+    fn parallel_transport_round_trip_is_identity() {
+        let (m, p, q) = fixture();
+        let forward = path2(&p, &q);
+        let backward = path2(&q, &p);
+        let u = array![0.0, 0.6, -0.2];
+
+        let out = m
+            .parallel_transport(forward.view(), u.view())
+            .expect("Γ_{p→q}(u)");
+        let back = m
+            .parallel_transport(backward.view(), out.view())
+            .expect("Γ_{q→p}(Γ_{p→q}(u))");
+
+        for (i, (&b, &orig)) in back.iter().zip(u.iter()).enumerate() {
+            assert!(
+                (b - orig).abs() <= 1e-9 * orig.abs().max(1.0),
+                "component {i}: round-trip {b:.12e} vs original {orig:.12e}"
+            );
+        }
+    }
+}
