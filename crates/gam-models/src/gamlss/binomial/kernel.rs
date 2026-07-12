@@ -589,45 +589,6 @@ pub(crate) fn binomial_location_scale_nll_gradient(
     Ok(out.g())
 }
 
-/// Dense `Tower4<2>` builder for the binomial location-scale row NLL: the
-/// all-channels evaluation of [`binomial_location_scale_nll_generic`]. Retained
-/// only as the #932 test oracle; production consumers instantiate exactly the
-/// derivative order they read.
-#[cfg(test)]
-#[inline]
-pub(crate) fn binomial_location_scale_nll_tower(
-    y: f64,
-    weight: f64,
-    eta_t: f64,
-    eta_ls: f64,
-    q_value: f64,
-    mu: f64,
-    dmu_dq: f64,
-    d2mu_dq2: f64,
-    d3mu_dq3: f64,
-    link_kind: &InverseLink,
-    include_fourth: bool,
-) -> Result<gam_math::jet_tower::Tower4<2>, String> {
-    use gam_math::jet_tower::Tower4;
-    binomial_location_scale_nll_generic::<Tower4<2>>(
-        y,
-        weight,
-        eta_t,
-        eta_ls,
-        q_value,
-        mu,
-        dmu_dq,
-        d2mu_dq2,
-        d3mu_dq3,
-        link_kind,
-        include_fourth,
-        // The Tower4 builder is the value/gradient/oracle consumer: it needs the
-        // exact `−ll` value channel.
-        true,
-        |x, axis| Tower4::<2>::variable(x, axis),
-    )
-}
-
 /// SIMD 4-rows-per-pass evaluation of the binomial location-scale row NLL at the
 /// packed [`OneSeedBatch`] directional scalar, returning the contracted-third
 /// tensor `Σ_c ℓ_{xyc} dir_c` for FOUR rows at once. The op graph mirrors
@@ -902,6 +863,41 @@ mod packed_scalar_oracle_tests {
     use super::*;
     use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
     use gam_problem::{InverseLink, StandardLink};
+
+    /// Dense all-channel oracle for the packed-scalar tests below. Production
+    /// consumers instantiate only the derivative order they read, so this
+    /// intentionally lives inside the private test module.
+    #[inline]
+    fn binomial_location_scale_nll_tower(
+        y: f64,
+        weight: f64,
+        eta_t: f64,
+        eta_ls: f64,
+        q_value: f64,
+        mu: f64,
+        dmu_dq: f64,
+        d2mu_dq2: f64,
+        d3mu_dq3: f64,
+        link_kind: &InverseLink,
+        include_fourth: bool,
+    ) -> Result<gam_math::jet_tower::Tower4<2>, String> {
+        use gam_math::jet_tower::Tower4;
+        binomial_location_scale_nll_generic::<Tower4<2>>(
+            y,
+            weight,
+            eta_t,
+            eta_ls,
+            q_value,
+            mu,
+            dmu_dq,
+            d2mu_dq2,
+            d3mu_dq3,
+            link_kind,
+            include_fourth,
+            true,
+            |x, axis| Tower4::<2>::variable(x, axis),
+        )
+    }
 
     fn rel_close(a: f64, b: f64, label: &str) {
         let band = 1e-9 + 1e-9 * a.abs().max(b.abs());
