@@ -6860,38 +6860,30 @@ impl ManifoldSaeCore {
     }
 
     /// Target-dose steering (gh#2263): solve for the amplitude that lands a
-    /// requested output-KL dose `target_nats` on atom `atom_k`'s chord, instead
-    /// of asking the caller for a meaningless raw amplitude. Returns the
+    /// requested output-KL dose on one atom chord, instead of asking the caller
+    /// for a meaningless raw amplitude. The required `request` mapping contains
+    /// `atom_k`, `metric_row`, `target_nats`, `t_from`, `t_to`, `tol_rel`,
+    /// `max_iter`, and `readout_tol_rel`. Returns the
     /// closed-form seed `a0 = sqrt(2 q*/(dgᵀ M dg))` plus, when a `probe`
     /// (a Python callable `a → measured KL in nats`, a patched forward) is
     /// supplied, the closed-loop-corrected amplitude, the measured KL, and the
     /// dual radii (`chart_radius` as shipped + `readout_kl_radius`). Reuses the
     /// SAME frozen-dictionary rebuild as `steer`.
-    #[pyo3(signature = (
-        atom_k,
-        metric_row,
-        target_nats,
-        t_from,
-        t_to,
-        tol_rel = 1e-2,
-        max_iter = 12,
-        readout_tol_rel = 1e-1,
-        probe = None
-    ))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (request, probe = None))]
     fn steer_to_target<'py>(
         &self,
         py: Python<'py>,
-        atom_k: usize,
-        metric_row: usize,
-        target_nats: f64,
-        t_from: PyReadonlyArray1<'py, f64>,
-        t_to: PyReadonlyArray1<'py, f64>,
-        tol_rel: f64,
-        max_iter: usize,
-        readout_tol_rel: f64,
+        request: &Bound<'py, PyDict>,
         probe: Option<PyObject>,
     ) -> PyResult<Py<PyDict>> {
+        let ManifoldSteerToTargetRequest {
+            atom_k,
+            metric_row,
+            target_nats,
+            t_from,
+            t_to,
+            config,
+        } = ManifoldSteerToTargetRequest::from_pydict(request)?;
         let inner = &self.inner;
         // Same frozen-dictionary marshalling as `steer` (kept inline so the two
         // steering entries rebuild from identical handle state).
@@ -6944,11 +6936,6 @@ impl ManifoldSaeCore {
             })
             .transpose()?;
 
-        let config = gam::inference::steering::TargetDoseConfig {
-            tol_rel,
-            max_iter,
-            readout_tol_rel,
-        };
         // Wrap the optional Python patched-forward into a Rust FnMut(a) -> KL.
         let mut probe_boxed: Option<Box<dyn FnMut(f64) -> Result<f64, String>>> =
             probe.map(|obj| {
@@ -6968,26 +6955,28 @@ impl ManifoldSaeCore {
         let probe_ref = probe_boxed.as_deref_mut();
 
         let plan = steer_to_target_from_arrays(
-            atom_k,
-            metric_row,
-            target_nats,
-            config,
-            t_from.as_array(),
-            t_to.as_array(),
-            &inner.basis_kinds,
-            &atom_dim,
-            &decoder_views,
-            &duchon_owned,
-            &n_harm,
-            &basis_sizes,
-            &coord_views,
-            logits_owned.view(),
-            inner.assignment.as_str(),
-            top_k,
-            inner.tau,
-            inner.alpha,
-            inner.threshold_gate_threshold,
-            self.fisher_metric.clone(),
+            SteerToTargetArraysRequest {
+                atom_k,
+                metric_row,
+                target_nats,
+                config,
+                t_from: t_from.view(),
+                t_to: t_to.view(),
+                atom_basis: &inner.basis_kinds,
+                atom_dim: &atom_dim,
+                decoder_blocks: &decoder_views,
+                duchon_centers: &duchon_owned,
+                n_harmonics_list: &n_harm,
+                basis_size_list: &basis_sizes,
+                coords: &coord_views,
+                logits: logits_owned.view(),
+                assignment_kind: inner.assignment.as_str(),
+                top_k,
+                tau: inner.tau,
+                alpha: inner.alpha,
+                threshold_gate_threshold: inner.threshold_gate_threshold,
+                fisher_metric: self.fisher_metric.clone(),
+            },
             probe_ref,
         )?;
         target_dose_plan_to_pydict(py, plan)

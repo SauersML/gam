@@ -15,7 +15,8 @@ use ndarray::{Array1, Array2, Array3, ArrayView2, s};
 
 use crate::hybrid_split::AtomLinearImage;
 use crate::inference::steering::{
-    steer_delta, steer_to_target_nats, PatchedForwardKl, SteerPlan, TargetDoseConfig, TargetDosePlan,
+    PatchedForwardKl, SteerPlan, TargetDoseConfig, TargetDosePlan, TargetDoseRequest, steer_delta,
+    steer_to_target_nats,
 };
 
 use super::{
@@ -801,9 +802,8 @@ pub struct SaeSteerRequest {
 /// ([`run_sae_manifold_steer`]) and the target-dose steer
 /// ([`run_sae_manifold_steer_to_target`]) so both rebuild the trained dictionary
 /// bit-for-bit through one path. `caller` names the caller in error messages.
-#[allow(clippy::too_many_arguments)]
-fn build_steer_term(
-    caller: &str,
+struct SteerTermRequest {
+    caller: &'static str,
     atom_specs: Vec<SaeOosAtomSpec>,
     coords: Vec<Array2<f64>>,
     logits: Array2<f64>,
@@ -814,7 +814,22 @@ fn build_steer_term(
     fisher_metric: Option<gam_problem::RowMetric>,
     atom_k: usize,
     metric_row: usize,
-) -> Result<SaeManifoldTerm, String> {
+}
+
+fn build_steer_term(request: SteerTermRequest) -> Result<SaeManifoldTerm, String> {
+    let SteerTermRequest {
+        caller,
+        atom_specs,
+        coords,
+        logits,
+        assignment,
+        top_k,
+        alpha,
+        tau,
+        fisher_metric,
+        atom_k,
+        metric_row,
+    } = request;
     let k_atoms = atom_specs.len();
     if k_atoms == 0 {
         return Err(format!("{caller}: at least one atom is required"));
@@ -947,9 +962,9 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
         t_to,
     } = request;
     finite_positive("amplitude", amplitude)?;
-    let term = build_steer_term(
-        "run_sae_manifold_steer",
-        atoms,
+    let term = build_steer_term(SteerTermRequest {
+        caller: "run_sae_manifold_steer",
+        atom_specs: atoms,
         coords,
         logits,
         assignment,
@@ -959,7 +974,7 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
         fisher_metric,
         atom_k,
         metric_row,
-    )?;
+    })?;
     // The metric the dose is measured through: the installed per-row metric, or a
     // bit-identical Euclidean metric (geometry-only; dose degrades to None).
     let euclidean = gam_problem::RowMetric::euclidean(term.n_obs(), term.output_dim())?;
@@ -1026,9 +1041,9 @@ pub fn run_sae_manifold_steer_to_target(
         target_nats,
         config,
     } = request;
-    let term = build_steer_term(
-        "run_sae_manifold_steer_to_target",
-        atoms,
+    let term = build_steer_term(SteerTermRequest {
+        caller: "run_sae_manifold_steer_to_target",
+        atom_specs: atoms,
         coords,
         logits,
         assignment,
@@ -1038,18 +1053,20 @@ pub fn run_sae_manifold_steer_to_target(
         fisher_metric,
         atom_k,
         metric_row,
-    )?;
+    })?;
     let euclidean = gam_problem::RowMetric::euclidean(term.n_obs(), term.output_dim())?;
     let metric = term.row_metric().unwrap_or(&euclidean);
     steer_to_target_nats(
         &term,
         metric,
-        atom_k,
-        metric_row,
-        &t_from,
-        &t_to,
-        target_nats,
-        config,
+        TargetDoseRequest {
+            atom_k,
+            metric_row,
+            t_from: &t_from,
+            t_to: &t_to,
+            target_nats,
+            config,
+        },
         probe,
     )
 }

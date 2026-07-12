@@ -1512,30 +1512,104 @@ fn steer_delta_with_metric_from_arrays(
 /// TARGET output-KL dose (gh#2263). Mirrors [`steer_delta_with_metric_from_arrays`]
 /// but drives the target-dose entry; the optional `probe` (a patched-forward KL
 /// callback) drives the closed-loop correction and the readout-KL radius.
-#[allow(clippy::too_many_arguments)]
-fn steer_to_target_from_arrays(
+struct SteerToTargetArraysRequest<'a> {
     atom_k: usize,
     metric_row: usize,
     target_nats: f64,
     config: gam::inference::steering::TargetDoseConfig,
-    t_from: ndarray::ArrayView1<'_, f64>,
-    t_to: ndarray::ArrayView1<'_, f64>,
-    atom_basis: &[String],
-    atom_dim: &[usize],
-    decoder_blocks: &[ndarray::ArrayView2<'_, f64>],
-    duchon_centers: &[Option<Array2<f64>>],
-    n_harmonics_list: &[Option<usize>],
-    basis_size_list: &[usize],
-    coords: &[ndarray::ArrayView2<'_, f64>],
-    logits: ndarray::ArrayView2<'_, f64>,
-    assignment_kind: &str,
+    t_from: ndarray::ArrayView1<'a, f64>,
+    t_to: ndarray::ArrayView1<'a, f64>,
+    atom_basis: &'a [String],
+    atom_dim: &'a [usize],
+    decoder_blocks: &'a [ndarray::ArrayView2<'a, f64>],
+    duchon_centers: &'a [Option<Array2<f64>>],
+    n_harmonics_list: &'a [Option<usize>],
+    basis_size_list: &'a [usize],
+    coords: &'a [ndarray::ArrayView2<'a, f64>],
+    logits: ndarray::ArrayView2<'a, f64>,
+    assignment_kind: &'a str,
     top_k: Option<usize>,
     tau: f64,
     alpha: f64,
     threshold_gate_threshold: f64,
     fisher_metric: Option<gam::inference::row_metric::RowMetric>,
+}
+
+/// Typed extraction of the public `ManifoldSaeCore.steer_to_target` mapping.
+/// Every dose and solver field is required; optionality belongs only to the
+/// separate patched-forward probe.
+struct ManifoldSteerToTargetRequest {
+    atom_k: usize,
+    metric_row: usize,
+    target_nats: f64,
+    t_from: Array1<f64>,
+    t_to: Array1<f64>,
+    config: gam::inference::steering::TargetDoseConfig,
+}
+
+fn required_steer_to_target_item<'py>(
+    request: &Bound<'py, PyDict>,
+    key: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    request.get_item(key)?.ok_or_else(|| {
+        py_value_error(format!(
+            "ManifoldSaeCore.steer_to_target: request is missing required key {key:?}"
+        ))
+    })
+}
+
+impl ManifoldSteerToTargetRequest {
+    fn from_pydict(request: &Bound<'_, PyDict>) -> PyResult<Self> {
+        let t_from = required_steer_to_target_item(request, "t_from")?
+            .extract::<PyReadonlyArray1<'_, f64>>()?
+            .as_array()
+            .to_owned();
+        let t_to = required_steer_to_target_item(request, "t_to")?
+            .extract::<PyReadonlyArray1<'_, f64>>()?
+            .as_array()
+            .to_owned();
+        Ok(Self {
+            atom_k: required_steer_to_target_item(request, "atom_k")?.extract()?,
+            metric_row: required_steer_to_target_item(request, "metric_row")?.extract()?,
+            target_nats: required_steer_to_target_item(request, "target_nats")?.extract()?,
+            t_from,
+            t_to,
+            config: gam::inference::steering::TargetDoseConfig {
+                tol_rel: required_steer_to_target_item(request, "tol_rel")?.extract()?,
+                max_iter: required_steer_to_target_item(request, "max_iter")?.extract()?,
+                readout_tol_rel: required_steer_to_target_item(request, "readout_tol_rel")?
+                    .extract()?,
+            },
+        })
+    }
+}
+
+fn steer_to_target_from_arrays(
+    request: SteerToTargetArraysRequest<'_>,
     probe: Option<&mut gam::inference::steering::PatchedForwardKl<'_>>,
 ) -> PyResult<gam::inference::steering::TargetDosePlan> {
+    let SteerToTargetArraysRequest {
+        atom_k,
+        metric_row,
+        target_nats,
+        config,
+        t_from,
+        t_to,
+        atom_basis,
+        atom_dim,
+        decoder_blocks,
+        duchon_centers,
+        n_harmonics_list,
+        basis_size_list,
+        coords,
+        logits,
+        assignment_kind,
+        top_k,
+        tau,
+        alpha,
+        threshold_gate_threshold,
+        fisher_metric,
+    } = request;
     let assignment_kind = canonicalize_assignment_kind(assignment_kind).map_err(py_value_error)?;
     let k_atoms = atom_basis.len();
     if atom_dim.len() != k_atoms

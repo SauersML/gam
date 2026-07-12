@@ -39,7 +39,9 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2};
 
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
-use gam::inference::steering::{steer_delta, steer_to_target_nats, TargetDoseConfig};
+use gam::inference::steering::{
+    TargetDoseConfig, TargetDoseRequest, steer_delta, steer_to_target_nats,
+};
 use gam::terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
 use gam::terms::{
     sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment,
@@ -456,12 +458,14 @@ fn target_dose_closed_form_seed_hits_dose_exactly() {
     let plan = steer_to_target_nats(
         &term,
         &metric,
-        0,
-        0,
-        &[t0],
-        &[t0 + delta],
-        target,
-        TargetDoseConfig::default(),
+        TargetDoseRequest {
+            atom_k: 0,
+            metric_row: 0,
+            t_from: &[t0],
+            t_to: &[t0 + delta],
+            target_nats: target,
+            config: TargetDoseConfig::default(),
+        },
         None,
     )
     .expect("target-dose plan");
@@ -487,7 +491,10 @@ fn target_dose_closed_form_seed_hits_dose_exactly() {
     );
     // Unvalidated closed form: no probe ⇒ not converged, no measurement, no
     // readout-KL radius; the chart radius is still reported.
-    assert!(!plan.converged, "closed form is unvalidated without a probe");
+    assert!(
+        !plan.converged,
+        "closed form is unvalidated without a probe"
+    );
     assert!(plan.measured_nats.is_none());
     assert_eq!(plan.iterations, 0);
     assert!(plan.readout_kl_radius.is_none());
@@ -515,18 +522,23 @@ fn target_dose_exact_probe_converges_in_one_step() {
     let plan = steer_to_target_nats(
         &term,
         &metric,
-        0,
-        0,
-        &[t0],
-        &[t0 + delta],
-        target,
-        TargetDoseConfig::default(),
+        TargetDoseRequest {
+            atom_k: 0,
+            metric_row: 0,
+            t_from: &[t0],
+            t_to: &[t0 + delta],
+            target_nats: target,
+            config: TargetDoseConfig::default(),
+        },
         Some(&mut probe as &mut dyn FnMut(f64) -> Result<f64, String>),
     )
     .expect("target-dose plan");
 
     assert!(plan.converged, "exact-quadratic probe must converge");
-    assert_eq!(plan.iterations, 1, "the seed already hits the target exactly");
+    assert_eq!(
+        plan.iterations, 1,
+        "the seed already hits the target exactly"
+    );
     let measured = plan.measured_nats.expect("measured");
     assert!(
         (measured - target).abs() / target < 1e-9,
@@ -566,12 +578,14 @@ fn target_dose_saturating_probe_secant_corrects_upward() {
     let plan = steer_to_target_nats(
         &term,
         &metric,
-        0,
-        0,
-        &[t0],
-        &[t0 + delta],
-        target,
-        TargetDoseConfig::default(),
+        TargetDoseRequest {
+            atom_k: 0,
+            metric_row: 0,
+            t_from: &[t0],
+            t_to: &[t0 + delta],
+            target_nats: target,
+            config: TargetDoseConfig::default(),
+        },
         Some(&mut probe as &mut dyn FnMut(f64) -> Result<f64, String>),
     )
     .expect("target-dose plan");
@@ -593,7 +607,10 @@ fn target_dose_saturating_probe_secant_corrects_upward() {
         plan.amplitude,
         plan.seed_amplitude
     );
-    assert!(plan.iterations >= 2, "correction must take at least one secant step");
+    assert!(
+        plan.iterations >= 2,
+        "correction must take at least one secant step"
+    );
     // The seed dose (quad = target = 0.5) already departs from the saturating
     // measured (0.5 vs 0.39, 22% > 10% readout tol), so no probed amplitude was in
     // readout tolerance ⇒ the readout-KL radius is honestly unestablished here.

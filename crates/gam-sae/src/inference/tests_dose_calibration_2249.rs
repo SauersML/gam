@@ -38,10 +38,12 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::inference::steering::{TargetDoseConfig, steer_delta, steer_to_target_nats};
+    use crate::inference::steering::{
+        TargetDoseConfig, TargetDoseRequest, steer_delta, steer_to_target_nats,
+    };
     use crate::manifold::{
-        SaeFitAssignmentKind, SaeFitConfig, SaeFitSeedReport, SaeFitSeedRequest,
-        SaeFisherRowMetricRequest, SaeManifoldTerm, SaeMinimalSeedReport, SaeMinimalSeedRequest,
+        SaeFisherRowMetricRequest, SaeFitAssignmentKind, SaeFitConfig, SaeFitSeedReport,
+        SaeFitSeedRequest, SaeManifoldTerm, SaeMinimalSeedReport, SaeMinimalSeedRequest,
         build_sae_fit_seed, build_sae_minimal_seed,
     };
     use gam_problem::RowMetric;
@@ -175,10 +177,11 @@ mod tests {
 
         // A placeholder rank-1 output-Fisher so the seed installs a behavioral
         // metric; it is replaced below with the full categorical Fisher.
-        let dummy_u = Array3::<f64>::from_shape_fn(
-            (N_CIRCLE, P_OUT, 1),
-            |(_, i, _)| if i == 0 { 1.0 } else { 0.0 },
-        );
+        let dummy_u =
+            Array3::<f64>::from_shape_fn(
+                (N_CIRCLE, P_OUT, 1),
+                |(_, i, _)| if i == 0 { 1.0 } else { 0.0 },
+            );
         let dummy_metric =
             SaeFisherRowMetricRequest::from_tag(dummy_u.view(), N_CIRCLE, P_OUT, None, None)
                 .expect("placeholder metric request");
@@ -247,7 +250,8 @@ mod tests {
             }
         }
         let metric = categorical_fisher_metric(&z_raw);
-        term.set_row_metric(metric).expect("install calibrated metric");
+        term.set_row_metric(metric)
+            .expect("install calibrated metric");
         let metric = term.row_metric().expect("metric installed").clone();
         let angles: Array1<f64> = Array1::from_shape_fn(N_CIRCLE, |i| coords[[i, 0]]);
         (term, metric, angles)
@@ -407,12 +411,14 @@ mod tests {
         let seed_plan = steer_to_target_nats(
             &term,
             &metric,
-            0,
-            row,
-            &[t_from],
-            &[t_to],
-            target_nats,
-            TargetDoseConfig::default(),
+            TargetDoseRequest {
+                atom_k: 0,
+                metric_row: row,
+                t_from: &[t_from],
+                t_to: &[t_to],
+                target_nats,
+                config: TargetDoseConfig::default(),
+            },
             None,
         )
         .expect("closed-form seed");
@@ -427,7 +433,10 @@ mod tests {
             "seed amplitude {} must be sqrt(q*/unit_nats) = {expect_a0}",
             seed_plan.seed_amplitude
         );
-        assert!(!seed_plan.converged, "probe-free seed is unvalidated by construction");
+        assert!(
+            !seed_plan.converged,
+            "probe-free seed is unvalidated by construction"
+        );
 
         // Model-in-the-loop probe: exact categorical KL of the applied chord.
         let z_from_probe = z_from.clone();
@@ -445,17 +454,22 @@ mod tests {
         let plan = steer_to_target_nats(
             &term,
             &metric,
-            0,
-            row,
-            &[t_from],
-            &[t_to],
-            target_nats,
-            TargetDoseConfig::default(),
+            TargetDoseRequest {
+                atom_k: 0,
+                metric_row: row,
+                t_from: &[t_from],
+                t_to: &[t_to],
+                target_nats,
+                config: TargetDoseConfig::default(),
+            },
             Some(&mut probe),
         )
         .expect("target-dose loop with exact-KL probe");
 
-        assert!(plan.converged, "target-dose loop must converge on the exact-KL probe");
+        assert!(
+            plan.converged,
+            "target-dose loop must converge on the exact-KL probe"
+        );
         let measured = plan.measured_nats.expect("measured dose");
         assert!(
             (measured - target_nats).abs() / target_nats <= 2.0e-2,

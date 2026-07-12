@@ -606,6 +606,27 @@ impl Default for TargetDoseConfig {
     }
 }
 
+/// One target-dose solve on a fixed atom chord.
+///
+/// The model and row metric remain explicit execution context; everything that
+/// identifies and tunes the requested dose is carried together so callers
+/// cannot accidentally reorder a train of homogeneous scalar/slice arguments.
+#[derive(Clone, Copy, Debug)]
+pub struct TargetDoseRequest<'a> {
+    /// The atom whose coordinate is being steered.
+    pub atom_k: usize,
+    /// Exact fitted row whose output-Fisher block prices the move.
+    pub metric_row: usize,
+    /// Source on-manifold coordinate.
+    pub t_from: &'a [f64],
+    /// Target on-manifold coordinate, which fixes the chord direction.
+    pub t_to: &'a [f64],
+    /// Requested output-KL dose in nats.
+    pub target_nats: f64,
+    /// Closed-loop correction tuning.
+    pub config: TargetDoseConfig,
+}
+
 /// The amplitude that realizes a target output-KL dose on one atom's chord, plus
 /// the explicit dual-radius contract (gh#2249/#2263).
 #[derive(Clone, Debug)]
@@ -678,18 +699,20 @@ fn probe_kl(probe: &mut PatchedForwardKl<'_>, a: f64) -> Result<f64, String> {
 /// measured curve and opportunistically records the readout-KL radius. With
 /// `probe = None` the result is the unvalidated closed-form seed: pure math and
 /// plumbing, no model in the loop.
-#[allow(clippy::too_many_arguments)]
 pub fn steer_to_target_nats(
     model: &SaeManifoldTerm,
     metric: &RowMetric,
-    atom_k: usize,
-    metric_row: usize,
-    t_from: &[f64],
-    t_to: &[f64],
-    target_nats: f64,
-    config: TargetDoseConfig,
+    request: TargetDoseRequest<'_>,
     probe: Option<&mut PatchedForwardKl<'_>>,
 ) -> Result<TargetDosePlan, String> {
+    let TargetDoseRequest {
+        atom_k,
+        metric_row,
+        t_from,
+        t_to,
+        target_nats,
+        config,
+    } = request;
     if !(target_nats.is_finite() && target_nats > 0.0) {
         return Err(format!(
             "steer_to_target_nats: target_nats must be finite and positive, got {target_nats}"
@@ -765,8 +788,8 @@ pub fn steer_to_target_nats(
         return Ok(plan);
     }
     // Quadratic-informed second point: if KL ≈ c·a², a·sqrt(q*/kl) lands near q*.
-    let mut a_curr = (a_prev * (target_nats / kl_prev.max(f64::MIN_POSITIVE)).sqrt())
-        .max(f64::MIN_POSITIVE);
+    let mut a_curr =
+        (a_prev * (target_nats / kl_prev.max(f64::MIN_POSITIVE)).sqrt()).max(f64::MIN_POSITIVE);
     while plan.iterations < config.max_iter {
         let kl_curr = probe_kl(probe, a_curr)?;
         plan.iterations += 1;
