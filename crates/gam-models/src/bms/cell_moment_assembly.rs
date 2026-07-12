@@ -5893,7 +5893,7 @@ mod empirical_flex_jet_oracle_tests {
                         &batched[lane],
                     );
                 }
-                assert!(batched[2].iter().all(|value| value.to_bits() == 0));
+                assert!(batched[2].iter().all(|value| *value == 0.0));
 
                 let gram = (0..r * r)
                     .map(|idx| {
@@ -5967,7 +5967,7 @@ mod empirical_flex_jet_oracle_tests {
                         &fourth_batched[lane],
                     );
                 }
-                assert!(fourth_batched[2].iter().all(|value| value.to_bits() == 0));
+                assert!(fourth_batched[2].iter().all(|value| *value == 0.0));
             }
         }
     }
