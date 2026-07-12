@@ -678,22 +678,18 @@ mod tests {
         use gam_terms::analytic_penalties::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN};
 
         let rho = array![LOG_STRENGTH_MIN, 0.0, LOG_STRENGTH_MAX];
-        let lambda = exact_lambdas_from_rho(LogSmoothingParamsView::new(rho.view())).unwrap();
+        let lambda = exact_lambdas_from_rho(
+            LogSmoothingParamsView::new(rho.view()).expect("closed strength domain"),
+        );
         for i in 0..rho.len() {
             assert_eq!(lambda[i].to_bits(), rho[i].exp().to_bits());
         }
 
         let invalid = array![0.0, LOG_STRENGTH_MAX + 1.0, LOG_STRENGTH_MIN - 1.0];
-        let err = exact_lambdas_from_rho(LogSmoothingParamsView::new(invalid.view()))
-            .expect_err("out-of-domain rho must not be capped");
-        assert!(matches!(
-            err,
-            EstimationError::LogStrengthDomainViolation {
-                coordinate: 1,
-                value,
-                ..
-            } if value == LOG_STRENGTH_MAX + 1.0
-        ));
+        let err = LogSmoothingParamsView::new(invalid.view())
+            .expect_err("out-of-domain rho must be refused before exponentiation");
+        assert_eq!(err.coordinate, 1);
+        assert_eq!(err.value, LOG_STRENGTH_MAX + 1.0);
     }
 
     #[test]
@@ -1037,7 +1033,8 @@ mod tests {
             kronecker_factored: None,
         };
         let (fit, _) = fit_model_for_fixed_rho(
-            LogSmoothingParamsView::new(rho.view()),
+            LogSmoothingParamsView::new(rho.view())
+                .expect("test rho lies in exact strength domain"),
             problem,
             penalty,
             &config,
@@ -1611,7 +1608,8 @@ mod tests {
         };
 
         let (fit, _) = fit_model_for_fixed_rho(
-            LogSmoothingParamsView::new(rho.view()),
+            LogSmoothingParamsView::new(rho.view())
+                .expect("test rho lies in exact strength domain"),
             PirlsProblem {
                 x: x.view(),
                 offset: offset.view(),
@@ -2223,7 +2221,8 @@ mod tests {
         };
 
         let (result, _) = fit_model_for_fixed_rho(
-            LogSmoothingParamsView::new(rho.view()),
+            LogSmoothingParamsView::new(rho.view())
+                .expect("test rho lies in exact strength domain"),
             PirlsProblem {
                 x: x.view(),
                 offset: offset.view(),
@@ -2303,7 +2302,8 @@ mod tests {
         };
 
         let (fit, _) = fit_model_for_fixed_rho(
-            LogSmoothingParamsView::new(rho.view()),
+            LogSmoothingParamsView::new(rho.view())
+                .expect("test rho lies in exact strength domain"),
             PirlsProblem {
                 x: x.view(),
                 offset: offset.view(),
@@ -3765,7 +3765,8 @@ mod root_cause_tests {
 
         let (result, trace) = capture_pirls_penalized_deviance(|| {
             fit_model_for_fixed_rho(
-                LogSmoothingParamsView::new(rho.view()),
+                LogSmoothingParamsView::new(rho.view())
+                    .expect("test rho lies in exact strength domain"),
                 PirlsProblem {
                     x: x_data.view(),
                     offset: offset.view(),
@@ -3850,7 +3851,8 @@ mod root_cause_tests {
 
         let (result, trace) = capture_pirls_penalized_deviance(|| {
             fit_model_for_fixed_rho(
-                LogSmoothingParamsView::new(rho.view()),
+                LogSmoothingParamsView::new(rho.view())
+                    .expect("test rho lies in exact strength domain"),
                 PirlsProblem {
                     x: x_data.view(),
                     offset: offset.view(),
@@ -3955,7 +3957,8 @@ mod root_cause_tests {
 
             let (result, trace) = capture_pirls_penalized_deviance(|| {
                 fit_model_for_fixed_rho(
-                    LogSmoothingParamsView::new(rho.view()),
+                    LogSmoothingParamsView::new(rho.view())
+                        .expect("test rho lies in exact strength domain"),
                     PirlsProblem {
                         x: x_data.view(),
                         offset: offset.view(),

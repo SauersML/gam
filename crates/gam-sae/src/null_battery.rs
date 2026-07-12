@@ -28,8 +28,9 @@ pub const COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS: usize = 1_024;
 /// concurrency never exceeds this cap or the active Rayon pool's thread count,
 /// and the bands partition `p`, so transform memory remains bounded both by
 /// `8 * 1024 * p * sizeof(f64)` and by the 128-MiB active-workspace budget,
-/// independently of the corpus row count. Binary tail blocks reuse the same
-/// workspaces in later waves.
+/// independently of the corpus row count. The separate dense mean-fixing
+/// reflection owns one `n`-vector plus `O(p)` scales/projections. Binary tail
+/// blocks reuse the tile workspaces in later waves.
 pub const COVARIANCE_EXACT_HADAMARD_MAX_PARALLEL_WORKSPACES: usize = 8;
 
 /// Maximum aggregate float64 workspace actively transformed in parallel.
@@ -596,22 +597,33 @@ pub fn phase_randomized_surrogate(
     validate_matrix(data, "phase-randomized input")?;
     let n = data.nrows();
     let p = data.ncols();
+    let location = stable_column_location(data)?;
     let mut out = Array2::<f64>::zeros((n, p));
     let mut rng = StdRng::seed_from_u64(seed);
     for col in 0..p {
+        let mut residual_scale = 0.0_f64;
+        for &value in data.column(col) {
+            residual_scale = residual_scale.max(location.centered_value(value, col)?.abs());
+        }
+        if residual_scale == 0.0 {
+            for row in 0..n {
+                out[[row, col]] = location.compose_centered(0.0, col)?;
+            }
+            continue;
+        }
         let mut re = vec![0.0_f64; n];
         let mut im = vec![0.0_f64; n];
         for k in 0..n {
             for t in 0..n {
                 let angle = -2.0 * PI * (k as f64) * (t as f64) / (n as f64);
-                let x = data[[t, col]];
+                let x = location.centered_value(data[[t, col]], col)? / residual_scale;
                 re[k] += x * angle.cos();
                 im[k] += x * angle.sin();
             }
         }
         let last_paired = (n.saturating_sub(1)) / 2;
         for k in 1..=last_paired {
-            let amp = (re[k] * re[k] + im[k] * im[k]).sqrt();
+            let amp = re[k].hypot(im[k]);
             let phase = rng.random_range(0.0..(2.0 * PI));
             re[k] = amp * phase.cos();
             im[k] = amp * phase.sin();
@@ -629,9 +641,18 @@ pub fn phase_randomized_surrogate(
                 let angle = 2.0 * PI * (k as f64) * (t as f64) / (n as f64);
                 acc += re[k] * angle.cos() - im[k] * angle.sin();
             }
-            out[[t, col]] = acc / (n as f64);
+            let centered = balanced_finite_product(
+                acc,
+                1.0 / n as f64,
+                residual_scale,
+                "phase-randomized inverse transform",
+            )?;
+            out[[t, col]] = location.compose_centered(centered, col).map_err(|error| {
+                format!("phase-randomized output failed at row {t}, column {col}: {error}")
+            })?;
         }
     }
+    validate_matrix(out.view(), "phase-randomized output")?;
     Ok(out)
 }
 
@@ -1003,18 +1024,29 @@ fn fwht_rows_in_place(workspace: &mut [f64], rows: usize, cols: usize) -> Result
 /// Unit vector orthogonal to the all-ones direction. Its Householder
 /// reflection `Q = I - 2vv'` fixes the empirical mean, is dense for every
 /// `n >= 3`, and costs one projection plus one rank-one update instead of an
-/// `n x n` matrix. A seeded row permutation randomizes which observation is
-/// the distinguished final coordinate.
+/// `n x n` matrix. A seeded row permutation randomizes the balanced positive
+/// and negative coordinates of `v`.
 fn dense_fixed_mean_householder_vector(n: usize) -> Result<Vec<f64>, String> {
     if n < 3 {
         return Err(format!(
             "covariance-exact geometry destruction requires at least three rows; with n={n}, every mean-fixing orthogonal map is only a row permutation"
         ));
     }
-    let n_float = n as f64;
-    let small = (n_float * (n_float - 1.0)).sqrt().recip();
-    let large = -((n - 1) as f64) * small;
-    if !(small.is_finite() && small > 0.0 && large.is_finite()) {
+    let (positive_count, negative_count, positive, negative) = if n.is_multiple_of(2) {
+        let magnitude = (n as f64).sqrt().recip();
+        (n / 2, n / 2, magnitude, -magnitude)
+    } else {
+        let negative_count = n / 2;
+        let positive_count = negative_count + 1;
+        let positive = ((negative_count as f64) / (positive_count as f64 * n as f64)).sqrt();
+        let negative = -((positive_count as f64) / (negative_count as f64 * n as f64)).sqrt();
+        (positive_count, negative_count, positive, negative)
+    };
+    if !(positive.is_finite()
+        && positive > 0.0
+        && negative.is_finite()
+        && negative < 0.0)
+    {
         return Err("could not construct the dense fixed-mean Householder vector".to_string());
     }
     let mut vector = Vec::new();
@@ -1023,8 +1055,8 @@ fn dense_fixed_mean_householder_vector(n: usize) -> Result<Vec<f64>, String> {
             "could not allocate dense fixed-mean Householder vector ({n} float64 scalars): {error}"
         )
     })?;
-    vector.resize(n, small);
-    vector[n - 1] = large;
+    vector.resize(positive_count, positive);
+    vector.resize(positive_count + negative_count, negative);
     Ok(vector)
 }
 
@@ -1050,11 +1082,7 @@ fn is_walsh_character(signs: &[f64]) -> bool {
     true
 }
 
-fn fill_hadamard_signs(
-    signs: &mut [f64],
-    seed: u64,
-    block: HadamardBlock,
-) -> Result<(), String> {
+fn fill_hadamard_signs(signs: &mut [f64], seed: u64, block: HadamardBlock) -> Result<(), String> {
     if signs.len() != block.rows || !block.rows.is_power_of_two() {
         return Err("Hadamard sign workspace does not match its block".to_string());
     }
@@ -1091,7 +1119,7 @@ fn fill_hadamard_signs(
 fn transform_covariance_exact_hadamard_tile<T: NativeControlScalar>(
     data: &ArrayView2<'_, T>,
     permutation: &[usize],
-    origin: &[f64],
+    location: &StableColumnLocation,
     column_scale: &[f64],
     householder_projection: &[f64],
     householder_vector: &[f64],
@@ -1119,7 +1147,7 @@ fn transform_covariance_exact_hadamard_tile<T: NativeControlScalar>(
         || block_end > permutation.len()
         || tile.cols == 0
         || column_end > p
-        || origin.len() != p
+        || location.mean.len() != p
         || column_scale.len() != p
         || householder_projection.len() != p
         || householder_vector.len() != permutation.len()
@@ -1155,19 +1183,18 @@ fn transform_covariance_exact_hadamard_tile<T: NativeControlScalar>(
         }
         for local_col in 0..tile.cols {
             let col = tile.first_col + local_col;
-            // Transform in the first-row residual chart. This prevents a large
-            // absolute origin from erasing small covariance-bearing residuals
-            // while Q·1 = 1 restores the same origin exactly.
-            let relative = data[[source_row, col]].widen() - origin[col];
+            // Transform in the shared stable residual chart. This prevents a
+            // large absolute origin or antipodal finite range from erasing
+            // covariance-bearing residuals while Q·1 = 1 restores the same
+            // chart location.
+            let relative = location.centered_value(data[[source_row, col]].widen(), col)?;
             let normalized_relative = if column_scale[col] > 0.0 {
                 relative / column_scale[col]
             } else {
                 0.0
             };
-            let mixed_relative = (-2.0 * householder_vector[permuted_row]).mul_add(
-                householder_projection[col],
-                normalized_relative,
-            );
+            let mixed_relative = (-2.0 * householder_vector[permuted_row])
+                .mul_add(householder_projection[col], normalized_relative);
             let scaled = mixed_relative * inverse_rows;
             if !scaled.is_finite() {
                 return Err(format!(
@@ -1214,13 +1241,7 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
         )
     })?;
 
-    let mut origin = Vec::<f64>::new();
-    origin.try_reserve_exact(p).map_err(|error| {
-        format!(
-            "could not allocate covariance-exact Hadamard origin ({p} float64 scalars): {error}"
-        )
-    })?;
-    origin.extend((0..p).map(|col| data[[0, col]].widen()));
+    let location = stable_column_location(data)?;
     let mut permutation = Vec::<usize>::new();
     permutation.try_reserve_exact(n).map_err(|error| {
         format!(
@@ -1241,13 +1262,7 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
     column_scale.resize(p, 0.0);
     for &source_row in &permutation {
         for col in 0..p {
-            let relative = data[[source_row, col]].widen() - origin[col];
-            if !relative.is_finite() {
-                return Err(format!(
-                    "{} covariance-exact Hadamard residual range is not representable at input row {source_row}, column {col}",
-                    T::TYPE_NAME
-                ));
-            }
+            let relative = location.centered_value(data[[source_row, col]].widen(), col)?;
             column_scale[col] = column_scale[col].max(relative.abs());
         }
     }
@@ -1272,7 +1287,7 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
     for (permuted_row, &source_row) in permutation.iter().enumerate() {
         for col in 0..p {
             let normalized_relative = if column_scale[col] > 0.0 {
-                (data[[source_row, col]].widen() - origin[col]) / column_scale[col]
+                location.centered_value(data[[source_row, col]].widen(), col)? / column_scale[col]
             } else {
                 0.0
             };
@@ -1354,7 +1369,7 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
                 transform_covariance_exact_hadamard_tile(
                     &data,
                     &permutation,
-                    &origin,
+                    &location,
                     &column_scale,
                     &householder_projection,
                     &householder_vector,
@@ -1392,8 +1407,13 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
                 let output_row = tile.block.start + local_row;
                 for local_col in 0..tile.cols {
                     let col = tile.first_col + local_col;
-                    let value = workspace[local_row * tile.cols + local_col]
-                        .mul_add(column_scale[col], origin[col]);
+                    let centered = balanced_finite_product(
+                        workspace[local_row * tile.cols + local_col],
+                        column_scale[col],
+                        1.0,
+                        "covariance-exact Hadamard output residual",
+                    )?;
+                    let value = location.compose_centered(centered, col)?;
                     out[[output_row, col]] = T::narrow(value).ok_or_else(|| {
                         format!(
                             "{} covariance-exact Hadamard output overflowed at row {output_row}, column {col}",
@@ -1553,26 +1573,33 @@ fn neumaier_add(sum: &mut f64, correction: &mut f64, term: f64) -> Result<(), St
 /// average in a max-absolute unit chart handles antipodal finite values without
 /// ever forming their unrepresentable difference. Downstream centering fails
 /// only when the physical-coordinate residual itself is not representable.
-fn stable_column_location(data: ArrayView2<'_, f64>) -> Result<StableColumnLocation, String> {
-    validate_matrix(data, "stable-column-location input")?;
+fn stable_column_location<T: NativeControlScalar>(
+    data: ArrayView2<'_, T>,
+) -> Result<StableColumnLocation, String> {
+    if data.nrows() == 0 || data.ncols() == 0 {
+        return Err("stable-column-location input must be nonempty".to_string());
+    }
+    if data.iter().any(|value| !(*value).widen().is_finite()) {
+        return Err("stable-column-location input must be finite".to_string());
+    }
     let count = data.nrows() as f64;
     let mut mean = Array1::<f64>::zeros(data.ncols());
     let mut chart_origin = Array1::<f64>::zeros(data.ncols());
     let mut offset_scale = Array1::<f64>::zeros(data.ncols());
     let mut normalized_offset = Array1::<f64>::zeros(data.ncols());
     for axis in 0..data.ncols() {
-        let origin = data[[0, axis]];
+        let origin = data[[0, axis]].widen();
         let relative_chart_is_representable = data
             .column(axis)
             .iter()
-            .all(|&value| (value - origin).is_finite());
+            .all(|&value| (value.widen() - origin).is_finite());
         let mut sum = 0.0_f64;
         let mut correction = 0.0_f64;
         if relative_chart_is_representable {
             let residual_scale = data
                 .column(axis)
                 .iter()
-                .map(|&value| (value - origin).abs())
+                .map(|&value| (value.widen() - origin).abs())
                 .fold(0.0_f64, f64::max);
             if residual_scale == 0.0 {
                 mean[axis] = origin;
@@ -1580,7 +1607,11 @@ fn stable_column_location(data: ArrayView2<'_, f64>) -> Result<StableColumnLocat
                 continue;
             }
             for &value in data.column(axis).iter() {
-                neumaier_add(&mut sum, &mut correction, (value - origin) / residual_scale)?;
+                neumaier_add(
+                    &mut sum,
+                    &mut correction,
+                    (value.widen() - origin) / residual_scale,
+                )?;
             }
             let axis_normalized_offset = (sum + correction) / count;
             // Fusing the scale restoration with the translated origin avoids
@@ -1594,14 +1625,14 @@ fn stable_column_location(data: ArrayView2<'_, f64>) -> Result<StableColumnLocat
             let absolute_scale = data
                 .column(axis)
                 .iter()
-                .map(|value| value.abs())
+                .map(|value| (*value).widen().abs())
                 .fold(0.0_f64, f64::max);
             if absolute_scale == 0.0 {
                 mean[axis] = 0.0;
                 continue;
             }
             for &value in data.column(axis).iter() {
-                neumaier_add(&mut sum, &mut correction, value / absolute_scale)?;
+                neumaier_add(&mut sum, &mut correction, value.widen() / absolute_scale)?;
             }
             let axis_normalized_offset = (sum + correction) / count;
             mean[axis] = axis_normalized_offset * absolute_scale;
@@ -3613,6 +3644,16 @@ mod tests {
     }
 
     #[test]
+    fn compensated_accumulation_retains_one_cancellation_residual() {
+        let mut sum = 0.0;
+        let mut correction = 0.0;
+        for term in [1.0e16, 1.0, -1.0e16] {
+            neumaier_add(&mut sum, &mut correction, term).unwrap();
+        }
+        assert_eq!(sum + correction, 1.0);
+    }
+
+    #[test]
     fn architecture_match_refuses_positive_target_scale_from_constant_donor() {
         let observed = ndarray::array![[-1.0], [0.0], [1.0], [2.0]];
         let donor = ndarray::array![[7.0], [7.0], [7.0], [7.0]];
@@ -3779,6 +3820,44 @@ mod tests {
             .map(|block| block.rows)
             .collect::<Vec<_>>();
         assert_eq!(blocks, vec![1_024, 1_024, 2, 1]);
+    }
+
+    #[test]
+    fn covariance_exact_hadamard_excludes_permutation_only_maps() {
+        for rows in [4usize, 8, 16] {
+            for seed in 0..256u64 {
+                let block = HadamardBlock {
+                    start: 0,
+                    rows,
+                    ordinal: 0,
+                };
+                let mut signs = vec![1.0; rows];
+                fill_hadamard_signs(&mut signs, seed, block).unwrap();
+                assert!(
+                    !is_walsh_character(&signs),
+                    "seed {seed} produced a permutation-only sign character for B={rows}"
+                );
+            }
+        }
+
+        let input = ndarray::array![[0.0, 0.0], [1.0, 0.0], [0.0, 2.0]];
+        let mixed = covariance_exact_hadamard_null(input.view(), 2262).unwrap();
+        assert_population_moments_close(input.view(), mixed.view(), 2.0e-14, 2.0e-13);
+        let preserves_every_column_multiset = (0..input.ncols()).all(|col| {
+            let mut before = input.column(col).to_vec();
+            let mut after = mixed.column(col).to_vec();
+            before.sort_by(f64::total_cmp);
+            after.sort_by(f64::total_cmp);
+            before == after
+        });
+        assert!(
+            !preserves_every_column_multiset,
+            "the three-row covariance-exact control reduced to a row permutation"
+        );
+
+        let impossible = ndarray::array![[0.0], [1.0]];
+        let error = covariance_exact_hadamard_null(impossible.view(), 1).unwrap_err();
+        assert!(error.contains("at least three rows"), "{error}");
     }
 
     #[test]
@@ -4098,6 +4177,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn phase_randomization_is_translation_and_scale_equivariant_at_extreme_range() {
+        let rows = 64usize;
+        let base = Array2::from_shape_fn((rows, 2), |(row, col)| {
+            let phase = std::f64::consts::TAU * row as f64 / rows as f64;
+            if col == 0 {
+                phase.cos() + 0.2 * (5.0 * phase).sin()
+            } else {
+                0.7 * phase.sin() - 0.3 * (3.0 * phase).cos()
+            }
+        });
+        let scale = 1.0e200_f64;
+        let shifts = [3.0e200_f64, -2.0e200_f64];
+        let extreme = Array2::from_shape_fn(base.raw_dim(), |(row, col)| {
+            base[[row, col]].mul_add(scale, shifts[col])
+        });
+        let reference = phase_randomized_surrogate(base.view(), 907).unwrap();
+        let transformed = phase_randomized_surrogate(extreme.view(), 907).unwrap();
+        assert!(transformed.iter().all(|value| value.is_finite()));
+        for row in 0..rows {
+            for col in 0..2 {
+                let normalized = (transformed[[row, col]] - shifts[col]) / scale;
+                assert!(
+                    (normalized - reference[[row, col]]).abs() <= 2.0e-12,
+                    "phase surrogate lost translation/scale equivariance at ({row},{col}): normalized={normalized}, reference={}",
+                    reference[[row, col]]
+                );
+            }
+        }
+
+        let constant = Array2::from_elem((8, 2), 1.0e300_f64);
+        assert_eq!(
+            phase_randomized_surrogate(constant.view(), 11).unwrap(),
+            constant
+        );
     }
 
     #[test]

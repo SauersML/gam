@@ -310,8 +310,6 @@ impl JointPenaltyBundle {
                     total_compiled,
                 ));
             }
-            spec.validate()
-                .map_err(|error| format!("joint penalty {i}: {error}"))?;
             lambdas.push(crate::checked_exp_log_strength(log_lambda).map_err(|error| {
                 format!("joint penalty {i} current log-precision: {error}")
             })?);

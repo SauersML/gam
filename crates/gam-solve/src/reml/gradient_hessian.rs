@@ -6871,7 +6871,7 @@ impl<'a> RemlState<'a> {
             };
             let pirls_start = std::time::Instant::now();
             let result = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
-                LogSmoothingParamsView::new(rho.view()),
+                LogSmoothingParamsView::new(rho.view())?,
                 problem,
                 penalty,
                 &pirls_config,
@@ -7321,7 +7321,7 @@ impl<'a> RemlState<'a> {
 
         let pirls_start = std::time::Instant::now();
         let result = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
-            LogSmoothingParamsView::new(rho.view()),
+            LogSmoothingParamsView::new(rho.view())?,
             problem,
             penalty,
             &pirls_config,

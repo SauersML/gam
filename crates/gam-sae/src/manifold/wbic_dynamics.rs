@@ -40,11 +40,9 @@
 //!   [`e_benjamini_hochberg`] over the atoms' peak birth e-values is the
 //!   cross-atom multiple-testing wrapper. A confirmed positive jump is a BIRTH.
 
-use gam_terms::inference::structure_evidence::{
-    ClaimKind, StructureLedger, e_benjamini_hochberg, log_e_from_p_calibrator,
-};
+use gam_math::probability::normal_logsf;
+use gam_terms::inference::structure_evidence::{ClaimKind, StructureLedger, e_benjamini_hochberg};
 use ndarray::{Array2, ArrayView2, ArrayView4};
-use statrs::distribution::{ContinuousCDF, Normal};
 
 use super::wbic_audit::{ReconSpectrum, recon_spectrum};
 use crate::inference::layer_transport::{ChartTopology, LayerTransportReport, fit_layer_transport};
@@ -454,7 +452,7 @@ fn best_effort_transport(
 /// Mirrors [`super::super::inference::checkpoint_dynamics`]: the in-sample ratio
 /// `exp(½ z²)` is NOT an e-value (its H0 expectation diverges), so we map the jump
 /// to its two-sided normal p-value `p = 2(1 − Φ(|z|))` and route it through the
-/// frozen κ = ½ p→e calibrator [`log_e_from_p_calibrator`], which satisfies
+/// frozen κ = ½ p→e calibrator `log e = log(1/2) - 1/2 log p`, which satisfies
 /// `E_{H0}[e(P)] ≤ 1` for any superuniform p — a genuine e-value that compounds
 /// validly into the atom's birth e-process.
 fn no_jump_log_e_value(z: f64) -> Result<f64, String> {
@@ -463,15 +461,20 @@ fn no_jump_log_e_value(z: f64) -> Result<f64, String> {
             "no-jump evidence requires a finite studentized jump; got {z}"
         ));
     }
-    let normal =
-        Normal::new(0.0, 1.0).map_err(|e| format!("standard normal construction failed: {e}"))?;
-    let p: f64 = 2.0 * normal.sf(z.abs());
-    if !(p.is_finite() && p > 0.0 && p <= 1.0) {
+    let log_p = std::f64::consts::LN_2 + normal_logsf(z.abs());
+    if !(log_p.is_finite() && log_p <= 0.0) {
         return Err(format!(
-            "two-sided normal tail is not representable for studentized jump {z}: p={p}"
+            "two-sided normal log-tail is not representable for studentized jump {z}: log_p={log_p}"
         ));
     }
-    log_e_from_p_calibrator(p)
+    let log_e = -std::f64::consts::LN_2 - 0.5 * log_p;
+    if log_e.is_finite() {
+        Ok(log_e)
+    } else {
+        Err(format!(
+            "no-jump calibrated log-e is not representable for studentized jump {z}: {log_e}"
+        ))
+    }
 }
 
 /// Render the `λ_k(step)` trajectories to a plain-text block (for the demo / test
@@ -509,6 +512,16 @@ pub fn render_lambda_dynamics(report: &WbicDynamicsReport, checkpoint_ids: &[Str
 mod tests {
     use super::*;
     use ndarray::Array4;
+
+    #[test]
+    fn no_jump_log_e_remains_representable_beyond_probability_underflow() {
+        let moderate = no_jump_log_e_value(8.0).unwrap();
+        let deep = no_jump_log_e_value(40.0).unwrap();
+        assert!(moderate.is_finite() && deep.is_finite() && deep > moderate);
+        assert_eq!(deep, no_jump_log_e_value(-40.0).unwrap());
+        assert!(no_jump_log_e_value(f64::NAN).is_err());
+        assert!(no_jump_log_e_value(f64::INFINITY).is_err());
+    }
 
     fn lcg(s: &mut u64) -> f64 {
         *s = s

@@ -135,8 +135,11 @@ pub(crate) fn assemble_custom_family_fit_result(
         outer_converged,
         joint_log_lambdas,
     } = assembly;
-    let lambdas = rho_physical.mapv(f64::exp);
-    let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
+    let log_lambdas = rho_physical;
+    let lambdas = exact_lambdas_from_log_strengths(
+        &log_lambdas,
+        "custom-family fitted log strength",
+    )?;
     let (block_states, covariance_conditional, geometry, precomputed_edf) =
         if let Some(canonical) = canonical {
             let precomputed_edf = reduced_blockwise_edf(geometry.as_ref(), canonical, &lambdas);

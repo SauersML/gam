@@ -2,6 +2,9 @@ use super::*;
 
 pub struct ExternalOptimResult {
     pub beta: Array1<f64>,
+    /// Canonical optimized log-strengths. Physical `lambdas` are derived from
+    /// this vector through the shared exact-domain conversion.
+    pub log_lambdas: Array1<f64>,
     pub lambdas: Array1<f64>,
     pub likelihood_family: LikelihoodSpec,
     pub likelihood_scale: LikelihoodScaleMetadata,

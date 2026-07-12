@@ -1924,7 +1924,7 @@ where
             reml_state.gaussian_fixed_cache_if_eligible()
         };
         let pirls_res_pair = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
-            LogSmoothingParamsView::new(final_rho.view()),
+            LogSmoothingParamsView::new(final_rho.view())?,
             pirls::PirlsProblem {
                 x: reml_state.x(),
                 offset: offset_o.view(),
@@ -2026,7 +2026,8 @@ where
         .qs
         .dot(pirls_res.beta_transformed.as_ref());
 
-    let lambdas = final_rho.mapv(f64::exp);
+    let log_lambdas = final_rho.clone();
+    let lambdas = LogSmoothingParamsView::new(log_lambdas.view())?.exact_exp();
     let p_dim = pirls_res.beta_transformed.len();
     let penalty_rank_total = pirls_res.reparam_result.e_transformed.nrows();
     let mp = (p_dim as f64 - penalty_rank_total as f64).max(0.0);
@@ -2854,6 +2855,7 @@ where
 
     let result = ExternalOptimResult {
         beta: beta_orig_internal,
+        log_lambdas,
         lambdas: lambdas.to_owned(),
         likelihood_family: reported_family,
         likelihood_scale: likelihood_scale_field,

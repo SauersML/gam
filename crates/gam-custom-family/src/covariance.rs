@@ -1201,7 +1201,10 @@ pub(crate) fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + '
     };
     for (b, spec) in specs.iter().enumerate() {
         let (start, end) = ranges[b];
-        let lambdas = per_block_log_lambdas[b].mapv(f64::exp);
+        let lambdas = exact_lambdas_from_log_strengths(
+            &per_block_log_lambdas[b],
+            &format!("joint covariance block {b} log strength"),
+        )?;
         let mut s_lambda = Array2::<f64>::zeros((end - start, end - start));
         for (k, s) in spec.penalties.iter().enumerate() {
             s.add_scaled_to(lambdas[k], &mut s_lambda);
@@ -1318,7 +1321,10 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
             return Ok(None);
         };
         let spec = &specs[0];
-        let lambdas = per_block_log_lambdas[0].mapv(f64::exp);
+        let lambdas = exact_lambdas_from_log_strengths(
+            &per_block_log_lambdas[0],
+            "single-block geometry log strength",
+        )?;
         // The penalized joint Hessian `H_pen = H_lik + Σ_k λ_k S_k` is the exact
         // mgcv quantity the trace edf `p − Σ_k λ_k·tr(H_pen⁻¹ S_k)` consumes. Two
         // single-block working-set shapes reach here:
@@ -1375,7 +1381,7 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
         // symmetry with the multi-block branch.)
         if let Some(bundle) = options.joint_penalties.as_deref()
             && !bundle.is_empty()
-            && h.nrows() == bundle.specs.first().map(|s| s.dim()).unwrap_or(h.nrows())
+            && h.nrows() == bundle.specs()[0].dim()
         {
             bundle.add_to_matrix(&mut h);
         }
@@ -1418,7 +1424,10 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
         let Some(block_log_lambdas) = per_block_log_lambdas.get(block_idx) else {
             return Ok(None);
         };
-        let lambdas = block_log_lambdas.mapv(f64::exp);
+        let lambdas = exact_lambdas_from_log_strengths(
+            block_log_lambdas,
+            &format!("joint geometry block {block_idx} log strength"),
+        )?;
         if lambdas.len() != spec.penalties.len() {
             return Ok(None);
         }

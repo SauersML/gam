@@ -1691,14 +1691,12 @@ fn log_lambdas_match_lambdas(log_lambdas: &Array1<f64>, lambdas: &Array1<f64>) -
     if log_lambdas.len() != lambdas.len() {
         return false;
     }
-    log_lambdas
-        .iter()
-        .zip(lambdas.iter())
-        .all(|(&log_lam, &lam)| {
-            let canonical = lam.max(1e-300).ln();
-            let tol = 1e-12 * (1.0 + canonical.abs());
-            (log_lam - canonical).abs() <= tol
-        })
+    log_lambdas.iter().zip(lambdas.iter()).all(
+        |(&log_lam, &lam)| match gam_problem::checked_exp_log_strength(log_lam) {
+            Ok(expected) => lam.to_bits() == expected.to_bits(),
+            Err(_) => false,
+        },
+    )
 }
 
 /// Vertically stack a per-block `Array1<f64>` field (selected by `field`) into

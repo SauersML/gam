@@ -111,26 +111,8 @@ pub fn nfree_skip_row_element_touches() -> u64 {
 
 pub(crate) fn exact_lambdas_from_rho(
     rho: LogSmoothingParamsView<'_>,
-) -> Result<Array1<f64>, EstimationError> {
-    use gam_terms::analytic_penalties::{
-        LOG_STRENGTH_MAX, LOG_STRENGTH_MIN, checked_exp_log_strength,
-    };
-    let values = rho
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(coordinate, value)| {
-            checked_exp_log_strength(value).map_err(|_| {
-                EstimationError::LogStrengthDomainViolation {
-                    coordinate,
-                    value,
-                    lower: LOG_STRENGTH_MIN,
-                    upper: LOG_STRENGTH_MAX,
-                }
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Array1::from_vec(values))
+) -> Array1<f64> {
+    rho.exact_exp()
 }
 
 pub(super) fn default_beta_guess_external(
@@ -854,7 +836,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         glm_first_step_gram,
     } = problem;
     let quadctx = crate::quadrature::QuadratureContext::new();
-    let lambdas = exact_lambdas_from_rho(rho)?;
+    let lambdas = exact_lambdas_from_rho(rho);
     let lambdas_slice = lambdas.as_slice_memory_order().ok_or_else(|| {
         EstimationError::InvalidInput("non-contiguous lambda storage".to_string())
     })?;

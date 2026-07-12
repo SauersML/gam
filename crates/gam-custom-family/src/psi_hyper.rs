@@ -1477,7 +1477,10 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                 .map(|b| {
                     let spec = &specs[b];
                     let p = spec.design.ncols();
-                    let lambdas = per_block[b].mapv(f64::exp);
+                    let lambdas = exact_lambdas_from_log_strengths(
+                        &per_block[b],
+                        &format!("psi hyper logdet block {b} log strength"),
+                    )?;
                     let mut s_lambda = Array2::<f64>::zeros((p, p));
                     for (k, s) in spec.penalties.iter().enumerate() {
                         s.add_scaled_to(lambdas[k], &mut s_lambda);
@@ -2779,7 +2782,10 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
             .map(|b| {
                 let spec = &specs[b];
                 let p = spec.design.ncols();
-                let lambdas = per_block[b].mapv(f64::exp);
+                let lambdas = exact_lambdas_from_log_strengths(
+                    &per_block[b],
+                    &format!("psi fixed-point logdet block {b} log strength"),
+                )?;
                 let mut s_lambda = Array2::<f64>::zeros((p, p));
                 for (k, s) in spec.penalties.iter().enumerate() {
                     s.add_scaled_to(lambdas[k], &mut s_lambda);

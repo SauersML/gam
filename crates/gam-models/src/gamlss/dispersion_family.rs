@@ -154,47 +154,6 @@ pub const FAMILY_GAMMA_LOCATION_SCALE: &str = "gamma-location-scale";
 pub const FAMILY_BETA_LOCATION_SCALE: &str = "beta-location-scale";
 pub const FAMILY_TWEEDIE_LOCATION_SCALE: &str = "tweedie-location-scale";
 
-/// `η` magnitude clamp shared by both channels (mirrors PIRLS `ETA_CLAMP`):
-/// keeps `exp(η)` and the logit jet away from overflow while staying in the
-/// smooth interior of every link.
-pub(super) const DISPERSION_ETA_CLAMP: f64 = 30.0;
-
-/// Derivative of the shared η clamp: 1 in the interior, 0 outside.
-///
-/// Every row likelihood in this module is evaluated at `clamp(η)`, so outside
-/// the clamp the implemented objective is locally CONSTANT in the raw
-/// predictor and every score/curvature channel of that predictor must vanish.
-/// Emitting the interior derivatives there hands the optimizer gradients and
-/// Hessians of a different function than the one being evaluated (the
-/// single-block Gaussian log-scale path already zeros its derivatives outside
-/// its clamp; this multi-block path must do the same).
-#[inline]
-fn eta_clamp_slope(eta: f64) -> f64 {
-    if eta.abs() <= DISPERSION_ETA_CLAMP {
-        1.0
-    } else {
-        0.0
-    }
-}
-
-/// Fold the clamp slope into one channel's IRLS working `(weight, response)`.
-/// On the zero-slope branch the channel contributes no score and no curvature
-/// and the response pins at the clamped predictor so downstream finiteness
-/// checks hold.
-#[inline]
-fn clamped_working_pair(slope: f64, eta_clamped: f64, weight: f64, step: f64) -> (f64, f64) {
-    if slope == 0.0 {
-        (0.0, eta_clamped)
-    } else {
-        (weight, eta_clamped + step)
-    }
-}
-/// Floor for a per-row IRLS working weight / curvature so the block normal
-/// equations stay positive-definite. The working *response* always carries the
-/// exact score, so the stationary point (penalised score = 0) is independent
-/// of this floor; it only conditions the inner solve.
-pub(super) const DISPERSION_MIN_CURVATURE: f64 = 1e-12;
-
 /// Row count above which the per-row dispersion-kernel map fans out across
 /// rayon workers (only when not already running on a worker, to avoid nested
 /// oversubscription). Below it the serial map beats the fork/join overhead.
@@ -275,7 +234,7 @@ mod test_support {
         let mu = S::variable(mu_value, 0);
         let phi = S::variable(phi_value, 1);
         let one_minus_mu = S::constant(1.0).sub(&mu);
-        let yc = yi.clamp(1e-12, 1.0 - 1e-12);
+        let yc = yi;
         let a = mu.mul(&phi);
         let b = one_minus_mu.mul(&phi);
         // phi.ln_gamma() - a.ln_gamma() - b.ln_gamma()
@@ -360,7 +319,7 @@ pub(crate) fn dispersion_beta_nll_order2(
     let mu = O2::variable(mu_value, 0);
     let phi = O2::variable(phi_value, 1);
     let one_minus_mu = O2::constant(1.0).sub(&mu);
-    let yc = yi.clamp(1e-12, 1.0 - 1e-12);
+    let yc = yi;
     let a = mu.mul(&phi);
     let b = one_minus_mu.mul(&phi);
     let loglik = order2_ln_gamma(&phi)
@@ -559,7 +518,7 @@ fn dispersion_gamma_neg_loglik(yi: f64, y_pos: f64, mu: f64, nu: f64, wi: f64) -
 #[inline]
 fn dispersion_beta_neg_loglik(yi: f64, mu: f64, phi: f64, wi: f64) -> f64 {
     let one_minus_mu = 1.0 - mu;
-    let yc = yi.clamp(1e-12, 1.0 - 1e-12);
+    let yc = yi;
     let a = mu * phi;
     let b = one_minus_mu * phi;
     let s = ln_gamma(phi) - ln_gamma(a) - ln_gamma(b)
@@ -592,7 +551,7 @@ fn dispersion_tweedie_neg_loglik(yi: f64, eta_mu: f64, eta_d: f64, p: f64, wi: f
 }
 
 /// Value-only row negative log-likelihood for one observation — the pruned hot
-/// path for [`CustomFamily::log_likelihood_only`]. Mirrors the link/clamp
+/// path for [`CustomFamily::log_likelihood_only`]. Mirrors the exact-link
 /// preamble of [`dispersion_row_kernel`] exactly, then evaluates ONLY the value
 /// channel (no gradient/Hessian, no digamma/trigamma). Returns `row.loglik`
 /// `to_bits`-identically.
@@ -611,14 +570,8 @@ pub(crate) fn dispersion_row_loglik(
         return 0.0;
     }
     let wi = prior_weight;
-    let em = eta_mu.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
-    let ed = eta_d.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
-    // With |η| ≤ DISPERSION_ETA_CLAMP the link outputs are strictly positive
-    // and finite (exp ∈ [9.4e-14, 1.1e13], logistic ∈ (9.4e-14, 1−9.4e-14)),
-    // so no parameter-space floor is applied: a floor that binds INSIDE the
-    // clamp band would make the value locally constant while the derivative
-    // channels keep the unfloored chain — the same value/derivative desync
-    // the clamp slope exists to prevent.
+    let em = eta_mu;
+    let ed = eta_d;
     match kind {
         DispersionFamilyKind::NegativeBinomial => {
             let mu = em.exp();
@@ -628,11 +581,11 @@ pub(crate) fn dispersion_row_loglik(
         DispersionFamilyKind::Gamma => {
             let mu = em.exp();
             let nu = ed.exp();
-            let y_pos = yi.max(1e-300);
+            let y_pos = yi;
             dispersion_gamma_neg_loglik(yi, y_pos, mu, nu, wi)
         }
         DispersionFamilyKind::Beta => {
-            let mu = 1.0 / (1.0 + (-em).exp());
+            let mu = gam_linalg::utils::stable_logistic(em);
             let phi = ed.exp();
             dispersion_beta_neg_loglik(yi, mu, phi, wi)
         }
@@ -640,7 +593,7 @@ pub(crate) fn dispersion_row_loglik(
     }
 }
 
-/// Observed η-space row NLL tower: BOTH clamped predictors are jet variables
+/// Observed η-space row NLL tower: both exact predictors are jet variables
 /// (`η_μ` axis 0, `η_d` axis 1) and the full mean-link / precision-link
 /// chains are carried by the jet algebra, so `h()` is the exact per-row
 /// OBSERVED Hessian in `(η_μ, η_d)` — including the inverse-link
@@ -677,7 +630,7 @@ pub(crate) fn dispersion_eta_nll_order2(
         DispersionFamilyKind::Gamma => {
             let mu = eta_mu.exp();
             let nu = eta_d.exp();
-            let y_pos = yi.max(1e-300);
+            let y_pos = yi;
             let loglik = nu
                 .mul(&nu.ln())
                 .sub(&nu.mul(&mu.ln()))
@@ -690,7 +643,7 @@ pub(crate) fn dispersion_eta_nll_order2(
             let mu = eta_mu.scale(-1.0).exp().add(&O2::constant(1.0)).recip();
             let phi = eta_d.exp();
             let one_minus_mu = O2::constant(1.0).sub(&mu);
-            let yc = yi.clamp(1e-12, 1.0 - 1e-12);
+            let yc = yi;
             let a = mu.mul(&phi);
             let b = one_minus_mu.mul(&phi);
             let loglik = order2_ln_gamma(&phi)
@@ -729,9 +682,7 @@ pub(crate) fn dispersion_eta_nll_order2(
 }
 
 /// Per-row observed `(∂²NLL/∂η_μ², ∂²NLL/∂η_μ∂η_d, ∂²NLL/∂η_d²)` weights for
-/// the exact joint Hessian, with the η-clamp slopes folded in: a channel
-/// outside its clamp is locally constant in the raw predictor, so every
-/// second derivative involving it is exactly zero.
+/// the exact joint Hessian at the supplied predictors.
 pub(crate) fn dispersion_row_observed_hessian_weights(
     kind: DispersionFamilyKind,
     yi: f64,
@@ -742,17 +693,9 @@ pub(crate) fn dispersion_row_observed_hessian_weights(
     if prior_weight <= 0.0 {
         return (0.0, 0.0, 0.0);
     }
-    let mean_slope = eta_clamp_slope(eta_mu);
-    let disp_slope = eta_clamp_slope(eta_d);
-    let em = eta_mu.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
-    let ed = eta_d.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
-    let tower = dispersion_eta_nll_order2(kind, yi, em, ed, prior_weight);
+    let tower = dispersion_eta_nll_order2(kind, yi, eta_mu, eta_d, prior_weight);
     let h = tower.h();
-    (
-        mean_slope * h[0][0],
-        mean_slope * disp_slope * h[0][1],
-        disp_slope * h[1][1],
-    )
+    (h[0][0], h[0][1], h[1][1])
 }
 
 #[inline]
@@ -779,8 +722,8 @@ pub(super) fn dispersion_row_kernel(
     eta_d: f64,
     prior_weight: f64,
 ) -> DispersionRowKernel {
-    let em = eta_mu.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
-    let ed = eta_d.clamp(-DISPERSION_ETA_CLAMP, DISPERSION_ETA_CLAMP);
+    let em = eta_mu;
+    let ed = eta_d;
     // Zero-weight rows are excluded from the likelihood (and exempt from the
     // boundary support validation): return exact zeros rather than letting
     // `0 · (±inf)` poison the objective sum.
@@ -794,14 +737,6 @@ pub(super) fn dispersion_row_kernel(
         };
     }
     let wi = prior_weight;
-    // Clamp slopes: outside the η clamp the row likelihood is locally
-    // constant in the raw predictor, so that channel's score and curvature
-    // must vanish (see `eta_clamp_slope`). With |η| ≤ clamp the link outputs
-    // are strictly positive/finite, so no parameter-space floor is applied —
-    // a floor binding inside the clamp band would reintroduce the same
-    // value/derivative desync on the θ/ν/φ/μ chains.
-    let mean_slope = eta_clamp_slope(eta_mu);
-    let disp_slope = eta_clamp_slope(eta_d);
     match kind {
         DispersionFamilyKind::NegativeBinomial => {
             let mu = em.exp();

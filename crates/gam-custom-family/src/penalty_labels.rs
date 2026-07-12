@@ -83,10 +83,10 @@ pub(crate) fn penalty_label_layout_with_joint(
     for (block_idx, spec) in specs.iter().enumerate() {
         for penalty_idx in 0..spec.penalties.len() {
             if let Some(fixed) = spec.penalties[penalty_idx].fixed_log_lambda() {
-                if !fixed.is_finite() {
+                if let Err(error) = gam_problem::validate_log_strength(fixed) {
                     return Err(CustomFamilyError::ConstraintViolation {
                         reason: format!(
-                            "block {block_idx} penalty {penalty_idx} fixed log-precision is non-finite: {fixed}"
+                            "block {block_idx} penalty {penalty_idx} fixed log-precision: {error}"
                         ),
                     }
                     .into());
@@ -100,9 +100,16 @@ pub(crate) fn penalty_label_layout_with_joint(
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("__block_{block_idx}_penalty_{penalty_idx}"));
             let rho0 = spec.initial_log_lambdas[penalty_idx];
+            gam_problem::validate_log_strength(rho0).map_err(|error| {
+                CustomFamilyError::ConstraintViolation {
+                    reason: format!(
+                        "block {block_idx} penalty {penalty_idx} initial log-precision: {error}"
+                    ),
+                }
+            })?;
             let outer = if let Some(&outer) = label_to_outer.get(&label) {
                 let first = initial[outer];
-                if first.is_finite() && rho0.is_finite() && (first - rho0).abs() > 1e-10 {
+                if (first - rho0).abs() > 1e-10 {
                     return Err(CustomFamilyError::ConstraintViolation { reason: format!(
                         "precision label '{label}' has inconsistent initial log-precisions: {first} and {rho0}"
                     ) }.into());
@@ -126,6 +133,10 @@ pub(crate) fn penalty_label_layout_with_joint(
     // λ_t smooths every class). A new label creates a fresh coordinate.
     let mut joint_to_outer = Vec::<usize>::with_capacity(joint_specs.len());
     for (joint_idx, spec) in joint_specs.iter().enumerate() {
+        spec.validate()
+            .map_err(|error| CustomFamilyError::ConstraintViolation {
+                reason: format!("joint penalty {joint_idx}: {error}"),
+            })?;
         let label = spec
             .label
             .clone()

@@ -198,7 +198,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         }
 
         let p = spec.design.ncols();
-        let lambdas = block_log_lambda.mapv(f64::exp);
+        let lambdas = exact_lambdas_from_log_strengths(
+            block_log_lambda,
+            &format!("inner block {b} log strength"),
+        )?;
         let mut s_lambda = Array2::<f64>::zeros((p, p));
         for (k, s) in spec.penalties.iter().enumerate() {
             s.add_scaled_to(lambdas[k], &mut s_lambda);

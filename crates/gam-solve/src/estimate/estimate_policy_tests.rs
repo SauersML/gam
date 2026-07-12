@@ -649,15 +649,19 @@ fn sas_log_delta_barrier_hessian_matches_gradient_slope() {
 }
 
 fn decode_invariant_test_parts() -> UnifiedFitResultParts {
+    let log_lambdas = array![0.2_f64.ln(), 0.8_f64.ln()];
+    let lambdas = log_lambdas.mapv(|value| {
+        gam_problem::checked_exp_log_strength(value).expect("fixture log strength")
+    });
     UnifiedFitResultParts {
         blocks: vec![FittedBlock {
             beta: array![0.25, -0.5],
             role: BlockRole::Mean,
             edf: 1.5,
-            lambdas: array![0.2, 0.8],
+            lambdas: lambdas.clone(),
         }],
-        log_lambdas: array![0.2_f64.max(1e-300).ln(), 0.8_f64.max(1e-300).ln()],
-        lambdas: array![0.2, 0.8],
+        log_lambdas,
+        lambdas,
         likelihood_family: Some(LikelihoodSpec::new(
             ResponseFamily::Gaussian,
             InverseLink::Standard(StandardLink::Identity),
@@ -897,13 +901,13 @@ fn unified_fit_validation_rejects_edf_smoothing_parameter_drift() {
 }
 
 #[test]
-fn unified_fit_validation_accepts_persisted_log_lambda_roundoff() {
+fn unified_fit_validation_rejects_any_log_lambda_drift() {
     let mut fit = decode_invariant_test_fit();
     fit.log_lambdas[0] += 5e-14;
-    assert!(
-        fit.validate_numeric_finiteness().is_ok(),
-        "sub-ulp persisted log-lambda roundoff should remain valid"
-    );
+    let err = fit
+        .validate_numeric_finiteness()
+        .expect_err("canonical log strengths must not drift from physical strengths");
+    assert!(err.to_string().contains("log_lambdas must equal"));
 }
 
 #[test]

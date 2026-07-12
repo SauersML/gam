@@ -1330,7 +1330,10 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
         let spec = &specs[b];
         let (start, end) = ranges[b];
         let p = end - start;
-        let lambdas = block_log_lambdas[b].mapv(f64::exp);
+        let lambdas = exact_lambdas_from_log_strengths(
+            &block_log_lambdas[b],
+            &format!("joint logdet block {b} log strength"),
+        )?;
         let mut s_lambda = Array2::<f64>::zeros((p, p));
         for (k, s) in spec.penalties.iter().enumerate() {
             s.add_scaled_to(lambdas[k], &mut s_lambda);

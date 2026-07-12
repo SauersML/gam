@@ -54,6 +54,17 @@ impl std::fmt::Display for IndexedLogStrengthDomainError {
 
 impl std::error::Error for IndexedLogStrengthDomainError {}
 
+impl From<IndexedLogStrengthDomainError> for crate::EstimationError {
+    fn from(error: IndexedLogStrengthDomainError) -> Self {
+        Self::LogStrengthDomainViolation {
+            coordinate: error.coordinate,
+            value: error.value,
+            lower: LOG_STRENGTH_MIN,
+            upper: LOG_STRENGTH_MAX,
+        }
+    }
+}
+
 /// Validate a logarithmic strength without changing it.
 #[inline]
 pub fn validate_log_strength(log_strength: f64) -> Result<(), LogStrengthDomainError> {

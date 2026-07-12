@@ -2404,24 +2404,28 @@ pub(crate) fn assemble_block_local_s_psi(
     deriv: &CustomFamilyBlockPsiDerivative,
     per_block_rho: &Array1<f64>,
     p_block: usize,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, String> {
+    let lambdas = exact_lambdas_from_log_strengths(
+        per_block_rho,
+        "block-local psi penalty log strength",
+    )?;
     if let Some(ref components) = deriv.s_psi_penalty_components {
         let mut s = Array2::<f64>::zeros((p_block, p_block));
         for (penalty_idx, s_part) in components {
-            s_part.add_scaled_to(per_block_rho[*penalty_idx].exp(), &mut s);
+            s_part.add_scaled_to(lambdas[*penalty_idx], &mut s);
         }
-        return s;
+        return Ok(s);
     }
     if let Some(ref components) = deriv.s_psi_components {
         let mut s = Array2::<f64>::zeros((p_block, p_block));
         for (penalty_idx, s_part) in components {
-            s.scaled_add(per_block_rho[*penalty_idx].exp(), s_part);
+            s.scaled_add(lambdas[*penalty_idx], s_part);
         }
-        s
+        Ok(s)
     } else if let Some(penalty_idx) = deriv.penalty_index {
-        deriv.s_psi.mapv(|v| per_block_rho[penalty_idx].exp() * v)
+        Ok(deriv.s_psi.mapv(|v| lambdas[penalty_idx] * v))
     } else {
-        Array2::<f64>::zeros((p_block, p_block))
+        Ok(Array2::<f64>::zeros((p_block, p_block)))
     }
 }
 
@@ -2436,36 +2440,40 @@ pub(crate) fn assemble_block_local_s_psi_psi(
     local_j: usize,
     per_block_rho: &Array1<f64>,
     p_block: usize,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, String> {
+    let lambdas = exact_lambdas_from_log_strengths(
+        per_block_rho,
+        "block-local psi-psi penalty log strength",
+    )?;
     if let Some(ref parts) = deriv_i.s_psi_psi_penalty_components {
         let mut s = Array2::<f64>::zeros((p_block, p_block));
         if let Some(pair_parts) = parts.get(local_j) {
             for (penalty_idx, s_part) in pair_parts {
-                s_part.add_scaled_to(per_block_rho[*penalty_idx].exp(), &mut s);
+                s_part.add_scaled_to(lambdas[*penalty_idx], &mut s);
             }
         }
-        return s;
+        return Ok(s);
     }
     if let Some(ref parts) = deriv_i.s_psi_psi_components {
         let mut s = Array2::<f64>::zeros((p_block, p_block));
         if let Some(pair_parts) = parts.get(local_j) {
             for (penalty_idx, s_part) in pair_parts {
-                s.scaled_add(per_block_rho[*penalty_idx].exp(), s_part);
+                s.scaled_add(lambdas[*penalty_idx], s_part);
             }
         }
-        s
+        Ok(s)
     } else if let Some(ref parts) = deriv_i.s_psi_psi {
         if let Some(s_part) = parts.get(local_j) {
             if let Some(penalty_index) = deriv_i.penalty_index {
-                s_part.mapv(|v| per_block_rho[penalty_index].exp() * v)
+                Ok(s_part.mapv(|v| lambdas[penalty_index] * v))
             } else {
-                Array2::<f64>::zeros((p_block, p_block))
+                Ok(Array2::<f64>::zeros((p_block, p_block)))
             }
         } else {
-            Array2::<f64>::zeros((p_block, p_block))
+            Ok(Array2::<f64>::zeros((p_block, p_block)))
         }
     } else {
-        Array2::<f64>::zeros((p_block, p_block))
+        Ok(Array2::<f64>::zeros((p_block, p_block)))
     }
 }
 

@@ -7,6 +7,24 @@
 use super::*;
 use opt::{RidgeSchedule, escalate_ridge};
 
+/// Convert one already-semantic log-smoothing vector to physical strengths.
+/// This is the only custom-family conversion seam: it rejects the first bad
+/// coordinate and never clamps or floors either representation.
+pub(crate) fn exact_lambdas_from_log_strengths(
+    log_strengths: &Array1<f64>,
+    label: &str,
+) -> Result<Array1<f64>, CustomFamilyError> {
+    let mut lambdas = Vec::with_capacity(log_strengths.len());
+    for (coordinate, &value) in log_strengths.iter().enumerate() {
+        lambdas.push(gam_problem::checked_exp_log_strength(value).map_err(|error| {
+            CustomFamilyError::ConstraintViolation {
+                reason: format!("{label} coordinate {coordinate}: {error}"),
+            }
+        })?);
+    }
+    Ok(Array1::from_vec(lambdas))
+}
+
 pub(crate) fn aggregate_labeled_hessian(
     hessian: &Array2<f64>,
     layout: &PenaltyLabelLayout,
@@ -287,6 +305,16 @@ pub(crate) fn split_log_lambdas(
             ),
         }
         .into());
+    }
+    // Certify the complete vector before producing any partial block output.
+    // Every downstream physical conversion is therefore dominated by the
+    // shared exact-domain contract even when it operates block-by-block.
+    for (coordinate, &value) in flat.iter().enumerate() {
+        gam_problem::validate_log_strength(value).map_err(|error| {
+            CustomFamilyError::ConstraintViolation {
+                reason: format!("log-smoothing vector coordinate {coordinate}: {error}"),
+            }
+        })?;
     }
     let mut out = Vec::with_capacity(penalty_counts.len());
     let mut at = 0usize;

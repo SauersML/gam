@@ -119,11 +119,8 @@ impl PenaltyMatrix {
             }
             Self::Labeled { inner, .. } => inner.validate(expected_dim),
             Self::Fixed { log_lambda, inner } => {
-                if !log_lambda.is_finite() {
-                    return Err(format!(
-                        "fixed penalty log-precision is non-finite: {log_lambda}"
-                    ));
-                }
+                crate::validate_log_strength(*log_lambda)
+                    .map_err(|error| format!("fixed penalty log-precision: {error}"))?;
                 inner.validate(expected_dim)
             }
         }
@@ -656,10 +653,19 @@ mod tests {
         let nan = PenaltyMatrix::Dense(array![[f64::NAN, 0.0], [0.0, 1.0]]);
         assert!(nan.validate(2).unwrap_err().contains("non-finite"));
 
-        // Fixed wrapper must carry a finite physical log-precision.
+        // Fixed wrapper must carry a supported physical log-precision.
         let bad_fixed = PenaltyMatrix::Dense(ndarray::Array2::<f64>::eye(2))
             .with_fixed_log_lambda(f64::INFINITY);
-        assert!(bad_fixed.validate(2).unwrap_err().contains("non-finite"));
+        assert!(bad_fixed.validate(2).unwrap_err().contains("must be finite"));
+
+        let finite_but_out_of_domain = PenaltyMatrix::Dense(ndarray::Array2::<f64>::eye(2))
+            .with_fixed_log_lambda(crate::LOG_STRENGTH_MAX + 1.0);
+        assert!(
+            finite_but_out_of_domain
+                .validate(2)
+                .unwrap_err()
+                .contains("must be finite and in")
+        );
     }
 
     #[test]

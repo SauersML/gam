@@ -115,10 +115,10 @@ pub fn validate_blockspec_consistency(specs: &[ParameterBlockSpec]) -> Result<Ve
             .into());
         }
         for (k, &log_lambda) in spec.initial_log_lambdas.iter().enumerate() {
-            if !log_lambda.is_finite() {
+            if let Err(error) = crate::validate_log_strength(log_lambda) {
                 return Err(CustomFamilyError::ConstraintViolation {
                     reason: format!(
-                        "block {b} initial log-precision {k} is non-finite: {log_lambda}"
+                        "block {b} initial log-precision {k}: {error}"
                     ),
                 }
                 .into());
