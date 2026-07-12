@@ -1305,88 +1305,49 @@ pub(crate) fn schur_matvec<B: BatchedBlockSolver + Sync>(
     // The reduced-Schur point-elimination term: `out -= Σ_i H_βt^(i) (H_tt^(i))⁻¹
     // H_tβ^(i) x`. Each row contributes an independent length-`K` vector, so for
     // the SAE LLM shape (#1017) this is the matvec's whole cost and is
-    // embarrassingly parallel. Run it under rayon over fixed row chunks, summing
-    // the per-chunk partials in chunk order so the f64 reduction is bit-identical
-    // run-to-run regardless of thread scheduling (the #1017 verification gate).
-    // This is deterministic and within the chunk-reassociation margin of serial,
-    // so the criterion ranking is stable except for candidates that tie inside
-    // that f64 margin — not an exact no-move guarantee (#1211). Stay
-    // sequential when already inside a rayon worker (the topology race fans
-    // candidates with `run_topology_race_parallel`) to avoid nested-rayon
-    // oversubscription — the same guard `HyperOperator::mul_mat` uses. The
-    // `parallel` gate above authorizes this loop too.
+    // embarrassingly parallel — reduced below through the deterministic pairwise
+    // tree (see the block-fold comment) rather than a chunk-order fold.
     let p = resident.map(|r| r.p).unwrap_or(0);
-    if parallel {
-        use rayon::prelude::*;
-        const CHUNK: usize = 64;
-        let n = sys.rows.len();
-        let partials: Vec<Array1<f64>> = (0..n)
-            .into_par_iter()
-            .chunks(CHUNK)
-            .map(|idxs| {
-                let mut acc = Array1::<f64>::zeros(k);
-                if let Some(res) = resident {
-                    // Resident path: each matvec is gather → factored di×p GEMVs
-                    // → scatter, reading only the pre-staged `(L_i, Y_i)` (no
-                    // per-iteration solve, no dense p×p block).
-                    let mut gather = vec![0.0_f64; p];
-                    let mut prod = vec![0.0_f64; p];
-                    let mut w = vec![0.0_f64; res.max_di()];
-                    for i in idxs {
-                        res.row_into(i, x, &mut acc, &mut gather, &mut prod, &mut w);
-                    }
-                } else {
-                    let mut local = Array1::<f64>::zeros(sys.d);
-                    for i in idxs {
-                        schur_matvec_row_into(
-                            sys,
-                            htt_factors,
-                            x,
-                            backend,
-                            i,
-                            &mut local,
-                            &mut acc,
-                        );
-                    }
+    // #2228 determinism: the per-row length-`k` contributions
+    // (`Σ_i H_βt^(i)(H_tt^(i))⁻¹ H_tβ^(i) x`) are reduced through the length-only
+    // pairwise tree so the result is bit-identical across thread count AND to the
+    // sequential fold — parallel and nested-serial evaluation agree to the last
+    // bit, removing the #1017/#1211 chunk-reassociation margin that let the
+    // criterion ranking depend on the driver. The tree self-serializes below
+    // `BASE_CHUNK` rows (a base block is folded directly with no `rayon::join`),
+    // so small systems and nested topology-race calls stay single-threaded
+    // without a separate branch that could associate the round-off differently.
+    // The resident path gathers → factored `di×p` GEMVs → scatter; the direct
+    // path does a per-row block solve — both ADD their row's contribution into a
+    // block-local accumulator, so splitting the row sum across the tree is exact.
+    let n_rows = sys.rows.len();
+    let contribution = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+        n_rows,
+        |range: core::ops::Range<usize>| {
+            let mut acc = Array1::<f64>::zeros(k);
+            if let Some(res) = resident {
+                let mut gather = vec![0.0_f64; p];
+                let mut prod = vec![0.0_f64; p];
+                let mut w = vec![0.0_f64; res.max_di()];
+                for i in range {
+                    res.row_into(i, x, &mut acc, &mut gather, &mut prod, &mut w);
                 }
-                acc
-            })
-            .collect();
-        // Deterministic ordered reduction: fold chunk partials left-to-right.
-        for acc in &partials {
-            for a in 0..k {
-                out[a] -= acc[a];
+            } else {
+                let mut local = Array1::<f64>::zeros(sys.d);
+                for i in range {
+                    schur_matvec_row_into(sys, htt_factors, x, backend, i, &mut local, &mut acc);
+                }
             }
-        }
-    } else if let Some(res) = resident {
-        let mut acc = Array1::<f64>::zeros(k);
-        let mut gather = vec![0.0_f64; p];
-        let mut prod = vec![0.0_f64; p];
-        let mut w = vec![0.0_f64; res.max_di()];
-        for i in 0..sys.rows.len() {
-            res.row_into(i, x, &mut acc, &mut gather, &mut prod, &mut w);
-        }
+            acc
+        },
+        |mut a: Array1<f64>, b: Array1<f64>| {
+            a += &b;
+            a
+        },
+    );
+    if let Some(acc) = contribution {
         for a in 0..k {
             out[a] -= acc[a];
-        }
-    } else {
-        // Allocate scratch at max_d; per-row slice is `..di`.
-        let mut local = Array1::<f64>::zeros(sys.d);
-        let mut neg_contrib = Array1::<f64>::zeros(k);
-        for i in 0..sys.rows.len() {
-            neg_contrib.fill(0.0);
-            schur_matvec_row_into(
-                sys,
-                htt_factors,
-                x,
-                backend,
-                i,
-                &mut local,
-                &mut neg_contrib,
-            );
-            for a in 0..k {
-                out[a] -= neg_contrib[a];
-            }
         }
     }
 }

@@ -1567,116 +1567,85 @@ impl StreamingArrowSchur {
         // non-SAE callers, or when already inside a rayon worker (the topology
         // race fans candidates with `run_topology_race_parallel`) to avoid
         // nested-rayon oversubscription — the same gate `schur_matvec` uses.
-        let parallel = (end - start) >= SCHUR_MATVEC_PARALLEL_ROW_MIN
-            && rayon::current_thread_index().is_none();
-        if parallel {
-            use rayon::prelude::*;
-            const CHUNK: usize = 64;
-            // Bind `&self` so the per-row body borrows only the immutable
-            // streaming state. Each row contributes `+H_βt^(i)(H_tt^(i))⁻¹ g_t^(i)`
-            // (length `k`) to the reduced RHS and `−H_βt^(i)(H_tt^(i))⁻¹ H_tβ^(i)`
-            // (`k×k`) to the reduced Schur complement; both are written INTO a
-            // worker-private `(rhs_part, s_part)` pair so the chunk partials fold
-            // back in chunk order — bit-identical run-to-run regardless of thread
-            // scheduling (the #1017 verification gate). The chunk fold reassociates
-            // the row sum relative to serial, so the criterion ranking is stable
-            // only up to that f64 margin; a near-tie winner inside the margin can
-            // flip — not an exact no-move guarantee (#1211).
-            let this: &Self = self;
-            let row_into = |row_idx: usize,
-                            rhs_part: &mut Array1<f64>,
-                            s_part: &mut Array2<f64>,
-                            stack: &mut ChunkSchurStack|
-             -> Result<(), ArrowSchurError> {
-                let row = (this.row_builder)(row_idx)?;
-                let di = row.htt.nrows();
-                this.validate_row(row_idx, &row)?;
-                let htbeta = this.row_htbeta(row_idx, &row, di);
-                let factor = this.factor_row(&row, ridge_t, di, row_idx)?;
-                let v = backend.solve_block_vector(factor.view(), row.gt.view());
-                for c in 0..di {
-                    let vc = v[c];
-                    if vc == 0.0 {
-                        continue;
-                    }
-                    for a in 0..k {
-                        rhs_part[a] += htbeta[[c, a]] * vc;
-                    }
+        // #2228 determinism: reduce the per-row contributions —
+        // `+H_βt^(i)(H_tt^(i))⁻¹ g_t^(i)` (length `k`, into the reduced RHS) and
+        // `−H_βt^(i)(H_tt^(i))⁻¹ H_tβ^(i)` (`k×k`, into the reduced Schur
+        // complement) — through the length-only pairwise tree. The within-chunk
+        // association is then bit-identical across thread count AND to the
+        // sequential fold, removing the #1017/#1211 chunk-reassociation margin
+        // that let the criterion ranking depend on the driver. The tree
+        // self-serializes below `BASE_CHUNK` rows (a base block is folded directly
+        // with no `rayon::join`), so the handful-of-rows callers and nested
+        // topology-race calls stay single-threaded without a separate branch.
+        // Each streaming chunk's tree result folds into the seeded running
+        // `self.{rhs,s}_acc` (which carry `H_ββ + ridge·I`) in chunk order.
+        let this: &Self = self;
+        let row_into = |row_idx: usize,
+                        rhs_part: &mut Array1<f64>,
+                        s_part: &mut Array2<f64>,
+                        stack: &mut ChunkSchurStack|
+         -> Result<(), ArrowSchurError> {
+            let row = (this.row_builder)(row_idx)?;
+            let di = row.htt.nrows();
+            this.validate_row(row_idx, &row)?;
+            let htbeta = this.row_htbeta(row_idx, &row, di);
+            let factor = this.factor_row(&row, ridge_t, di, row_idx)?;
+            let v = backend.solve_block_vector(factor.view(), row.gt.view());
+            for c in 0..di {
+                let vc = v[c];
+                if vc == 0.0 {
+                    continue;
                 }
-                match mode {
-                    // InexactPCG differs from Direct only in how the *reduced*
-                    // system is solved, not in how it is assembled, so it shares
-                    // the dense Schur subtraction here (see the serial branch).
-                    ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG => {
-                        let solved = backend.solve_block_matrix(factor.view(), htbeta.view());
-                        stack.subtract_or_stack(&backend, s_part, &htbeta, &solved);
-                    }
-                    ArrowSolverMode::SqrtBA => {
-                        let whitened =
-                            backend.sqrt_solve_block_matrix(factor.view(), htbeta.view());
-                        stack.subtract_or_stack(&backend, s_part, &whitened, &whitened);
-                    }
-                }
-                Ok(())
-            };
-            let partials: Vec<(Array1<f64>, Array2<f64>)> = (start..end)
-                .into_par_iter()
-                .chunks(CHUNK)
-                .map(|idxs| {
-                    let mut rhs_part = Array1::<f64>::zeros(k);
-                    let mut s_part = Array2::<f64>::zeros((k, k));
-                    // Dense-support rows accumulate into ONE stacked GEMM per
-                    // chunk instead of a per-row scalar scatter; sparse rows
-                    // keep the nnz-scaled scatter (see `ChunkSchurStack`).
-                    let mut stack = ChunkSchurStack::new(k);
-                    for i in idxs {
-                        row_into(i, &mut rhs_part, &mut s_part, &mut stack)?;
-                    }
-                    stack.flush(&mut s_part);
-                    Ok::<_, ArrowSchurError>((rhs_part, s_part))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            // Deterministic ordered reduction: fold chunk partials left-to-right.
-            // `block_gemm_subtract` already subtracted into each `s_part`, so the
-            // partials carry the negative Schur contribution; add them in.
-            for (rhs_part, s_part) in &partials {
                 for a in 0..k {
-                    self.rhs_acc[a] += rhs_part[a];
-                }
-                self.s_acc += s_part;
-            }
-        } else {
-            // Serial path accumulates DIRECTLY into the running `self.{rhs,s}_acc`
-            // (which carry the `reset_accumulator` seed `H_ββ + ridge·I`), exactly
-            // as before — bit-for-bit unchanged for the handful-of-rows callers.
-            for row_idx in start..end {
-                let row = (self.row_builder)(row_idx)?;
-                let di = row.htt.nrows();
-                self.validate_row(row_idx, &row)?;
-                let htbeta = self.row_htbeta(row_idx, &row, di);
-                let factor = self.factor_row(&row, ridge_t, di, row_idx)?;
-                let v = backend.solve_block_vector(factor.view(), row.gt.view());
-                for c in 0..di {
-                    let vc = v[c];
-                    if vc == 0.0 {
-                        continue;
-                    }
-                    for a in 0..k {
-                        self.rhs_acc[a] += htbeta[[c, a]] * vc;
-                    }
-                }
-                match mode {
-                    ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG => {
-                        let solved = backend.solve_block_matrix(factor.view(), htbeta.view());
-                        backend.block_gemm_subtract(&mut self.s_acc, &htbeta, &solved);
-                    }
-                    ArrowSolverMode::SqrtBA => {
-                        let whitened =
-                            backend.sqrt_solve_block_matrix(factor.view(), htbeta.view());
-                        backend.block_gemm_subtract(&mut self.s_acc, &whitened, &whitened);
-                    }
+                    rhs_part[a] += htbeta[[c, a]] * vc;
                 }
             }
+            match mode {
+                // InexactPCG differs from Direct only in how the *reduced* system
+                // is solved, not how it is assembled, so it shares this Schur
+                // subtraction.
+                ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG => {
+                    let solved = backend.solve_block_matrix(factor.view(), htbeta.view());
+                    stack.subtract_or_stack(&backend, s_part, &htbeta, &solved);
+                }
+                ArrowSolverMode::SqrtBA => {
+                    let whitened = backend.sqrt_solve_block_matrix(factor.view(), htbeta.view());
+                    stack.subtract_or_stack(&backend, s_part, &whitened, &whitened);
+                }
+            }
+            Ok(())
+        };
+        let contribution = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            end - start,
+            |range: core::ops::Range<usize>| -> Result<(Array1<f64>, Array2<f64>), ArrowSchurError> {
+                let mut rhs_part = Array1::<f64>::zeros(k);
+                let mut s_part = Array2::<f64>::zeros((k, k));
+                // Dense-support rows accumulate into ONE stacked GEMM per base
+                // block instead of a per-row scalar scatter; sparse rows keep the
+                // nnz-scaled scatter (see `ChunkSchurStack`).
+                let mut stack = ChunkSchurStack::new(k);
+                for local in range {
+                    row_into(start + local, &mut rhs_part, &mut s_part, &mut stack)?;
+                }
+                stack.flush(&mut s_part);
+                Ok((rhs_part, s_part))
+            },
+            |(mut ra, mut sa): (Array1<f64>, Array2<f64>),
+             (rb, sb): (Array1<f64>, Array2<f64>)|
+             -> Result<(Array1<f64>, Array2<f64>), ArrowSchurError> {
+                ra += &rb;
+                sa += &sb;
+                Ok((ra, sa))
+            },
+        )?;
+        // `subtract_or_stack`/`flush` already subtracted into each `s_part`, so the
+        // partials carry the NEGATIVE Schur contribution; add them into the seeded
+        // running accumulators.
+        if let Some((rhs_part, s_part)) = contribution {
+            for a in 0..k {
+                self.rhs_acc[a] += rhs_part[a];
+            }
+            self.s_acc += &s_part;
         }
         Ok(())
     }
