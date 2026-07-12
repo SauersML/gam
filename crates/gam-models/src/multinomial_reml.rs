@@ -369,6 +369,7 @@ mod fisher_lowering_release_gate {
     use std::hint::black_box;
     use std::time::Instant;
 
+    #[unsafe(no_mangle)]
     #[inline(never)]
     fn live_first(
         probability: &[f64],
@@ -388,6 +389,7 @@ mod fisher_lowering_release_gate {
         );
     }
 
+    #[unsafe(no_mangle)]
     #[inline(never)]
     fn live_second(
         probability: &[f64],
@@ -408,6 +410,7 @@ mod fisher_lowering_release_gate {
         );
     }
 
+    #[unsafe(no_mangle)]
     #[inline(never)]
     fn strongest_hand_first(
         probability: &[f64],
@@ -435,6 +438,7 @@ mod fisher_lowering_release_gate {
         }
     }
 
+    #[unsafe(no_mangle)]
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn strongest_hand_second(
