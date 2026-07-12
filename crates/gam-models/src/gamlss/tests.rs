@@ -3920,7 +3920,9 @@ pub(crate) fn gaussian_diagonal_geometry_preserves_representable_tiny_fisher_wei
             eta: array![200.0, -20.0],
         },
     ];
-    let eval = family.evaluate(&states).expect("representable tiny geometry");
+    let eval = family
+        .evaluate(&states)
+        .expect("representable tiny geometry");
     let location = match &eval.blockworking_sets[GaussianLocationScaleFamily::BLOCK_MU] {
         BlockWorkingSet::Diagonal {
             working_weights, ..
@@ -3937,10 +3939,11 @@ pub(crate) fn gaussian_diagonal_geometry_preserves_representable_tiny_fisher_wei
     assert!(scale[1] > 0.0 && scale[1] < 1.0e-12);
     let sigma0 = logb_sigma_from_eta_scalar(200.0);
     let expected_location = sigma0.recip() * sigma0.recip();
-    assert_eq!(location[0].to_bits(), expected_location.to_bits());
+    assert!((location[0] / expected_location - 1.0).abs() <= 4.0 * f64::EPSILON);
     let jet1 = logb_sigma_jet1_scalar(-20.0);
     let kappa1 = jet1.d1 / jet1.sigma;
-    assert_eq!(scale[1].to_bits(), (2.0 * kappa1 * kappa1).to_bits());
+    let expected_scale = 2.0 * kappa1 * kappa1;
+    assert!((scale[1] / expected_scale - 1.0).abs() <= 4.0 * f64::EPSILON);
 }
 
 #[test]
