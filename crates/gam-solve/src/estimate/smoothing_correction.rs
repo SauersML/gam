@@ -292,7 +292,6 @@ pub(crate) struct InvertedRhoHessian {
     pub inverse: Array2<f64>,
     pub active_rank: usize,
     pub structural_zero: usize,
-    pub min_eigenvalue: f64,
     pub used_structural_pseudoinverse: bool,
     pub eigenvalue_backward_error_bound: f64,
     pub eigenvalues: Array1<f64>,
@@ -387,8 +386,9 @@ fn penalty_map_structural_nullity(
     let zero_bound = eigenpair_backward_error_bound(&gram, &eigenvalues, &eigenvectors)?;
     let minimum = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
     if minimum < -zero_bound {
+        let neg_zero_bound = -zero_bound;
         return Err(format!(
-            "penalty-map Gram matrix has negative eigenvalue {minimum:.3e} below backward-error bound {-zero_bound:.3e}"
+            "penalty-map Gram matrix has negative eigenvalue {minimum:.3e} below backward-error bound {neg_zero_bound:.3e}"
         ));
     }
     let rank = eigenvalues
@@ -418,7 +418,6 @@ pub(crate) fn invert_identified_rho_hessian(
             inverse: certified.into_inverse(),
             active_rank: n,
             structural_zero: 0,
-            min_eigenvalue: f64::NAN,
             used_structural_pseudoinverse: false,
             eigenvalue_backward_error_bound: 0.0,
             eigenvalues: Array1::<f64>::zeros(0),
@@ -433,8 +432,9 @@ pub(crate) fn invert_identified_rho_hessian(
     let zero_bound = eigenpair_backward_error_bound(hessian_rho, &eigenvalues, &eigenvectors)?;
     let min_eigenvalue = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
     if min_eigenvalue < -zero_bound {
+        let neg_zero_bound = -zero_bound;
         return Err(format!(
-            "rho Hessian has negative curvature {min_eigenvalue:.3e} below eigensolver backward-error bound {-zero_bound:.3e}"
+            "rho Hessian has negative curvature {min_eigenvalue:.3e} below eigensolver backward-error bound {neg_zero_bound:.3e}"
         ));
     }
 
@@ -498,7 +498,6 @@ pub(crate) fn invert_identified_rho_hessian(
         inverse,
         active_rank,
         structural_zero,
-        min_eigenvalue,
         used_structural_pseudoinverse: true,
         eigenvalue_backward_error_bound: zero_bound,
         eigenvalues,

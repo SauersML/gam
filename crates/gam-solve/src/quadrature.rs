@@ -3364,7 +3364,7 @@ pub fn integrated_family_moments_jet(
                     let phi = resolved_scale
                         .tweedie_phi()
                         .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-                    phi * mean.powf(p)
+                    phi * mean.powf(*p)
                 }
                 ResponseFamily::NegativeBinomial { .. } => {
                     let theta = resolved_scale.negative_binomial_theta().map_err(|error| {
