@@ -257,7 +257,7 @@ def sae_manifold_certify_external(
     ridge_ext_coord: float = 1.0e-6,
     ridge_beta: float = 1.0e-6,
     isometry_pin_active: bool = False,
-    run_structure_search: bool = True,
+    run_structure_search: bool = False,
     analytic_penalties: Mapping[str, Any] | None = None,
     fisher_factors: Any = None,
 ) -> dict[str, Any]:
