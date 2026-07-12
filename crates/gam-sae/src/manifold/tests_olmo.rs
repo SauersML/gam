@@ -1300,6 +1300,183 @@ fn curved_warm_start_matches_or_beats_linear_baseline_out_of_sample_2261() {
     );
 }
 
+/// Run the production circle readout (`build_sae_minimal_seed` →
+/// `build_sae_fit_seed` → `run_sae_manifold_fit`, single periodic atom, the
+/// unbundled direct path) at a given `random_state` and return the converged
+/// per-row circle coordinate `t_i ∈ [0,1)`. Mirrors the #2023 tier-0 primary path
+/// test's `run_primary`, threading the seed everywhere it is consumed (minimal
+/// seed jitter + seed-refine routing) so different seeds are genuinely different
+/// starts.
+fn production_circle_coords_at_seed(target: &Array2<f64>, random_state: u64) -> ndarray::Array1<f64> {
+    use crate::manifold::{
+        build_sae_fit_seed, build_sae_minimal_seed, run_sae_manifold_fit, SaeFitAssignmentKind,
+        SaeFitConfig, SaeFitRequest, SaeFitSeedReport, SaeFitSeedRequest, SaeMinimalSeedReport,
+        SaeMinimalSeedRequest,
+    };
+    let assignment_kind = SaeFitAssignmentKind::Softmax;
+    let minimal = build_sae_minimal_seed(SaeMinimalSeedRequest {
+        target: target.view(),
+        atom_basis: vec!["periodic".to_string()],
+        atom_dim: vec![1],
+        assignment_kind,
+        alpha: 1.0,
+        tau: 1.0,
+        threshold: 0.0,
+        top_k: None,
+        random_state,
+        initial_logits: None,
+        initial_coords: None,
+    })
+    .expect("minimal seed");
+    let SaeMinimalSeedReport {
+        atom_basis,
+        effective_atom_dim,
+        atom_centers,
+        basis_values,
+        basis_jacobian,
+        basis_sizes,
+        decoder_coefficients,
+        smooth_penalties,
+        initial_logits,
+        initial_coords,
+        refine_routing,
+    } = minimal;
+    let registry = AnalyticPenaltyRegistry::new();
+    let seed = build_sae_fit_seed(SaeFitSeedRequest {
+        target: target.view(),
+        atom_basis: &atom_basis,
+        atom_dim: &effective_atom_dim,
+        atom_centers: &atom_centers,
+        basis_values: basis_values.view(),
+        basis_jacobian: basis_jacobian.view(),
+        basis_sizes: &basis_sizes,
+        decoder_coefficients: decoder_coefficients.view(),
+        smooth_penalties: smooth_penalties.view(),
+        initial_logits: initial_logits.view(),
+        initial_coords: initial_coords.view(),
+        alpha: 1.0,
+        tau: 1.0,
+        learnable_alpha: false,
+        assignment_kind,
+        sparsity_strength: 1.0,
+        smoothness: 1.0,
+        max_iter: 12,
+        learning_rate: 1.0,
+        ridge_ext_coord: 1.0e-6,
+        ridge_beta: 1.0e-6,
+        top_k: None,
+        threshold: 0.0,
+        native_ard_enabled: true,
+        seed_refine_routing: refine_routing,
+        seed_refine_random_state: random_state,
+        data_row_reseed: false,
+        fit_config: SaeFitConfig::default(),
+        temperature_schedule: None,
+        fisher_metric: None,
+        row_loss_weights: None,
+        registry: &registry,
+    })
+    .expect("fit seed");
+    let SaeFitSeedReport {
+        base_term,
+        initial_rho,
+        isometry_pin_active,
+        metric_provenance,
+    } = seed;
+    let report = run_sae_manifold_fit(SaeFitRequest {
+        base_term,
+        target: target.clone(),
+        registry,
+        initial_rho,
+        max_iter: 12,
+        learning_rate: 1.0,
+        ridge_ext_coord: 1.0e-6,
+        ridge_beta: 1.0e-6,
+        alpha: 1.0,
+        isometry_pin_active,
+        metric_provenance,
+        promote_from_residual: false,
+        run_structure_search: false,
+        run_outer_rho_search: false,
+        // Unbundled direct path: seed -> single certified fit on the iid
+        // likelihood (no structured-residual re-whitening), the deterministic
+        // "exactly one fit" contract.
+        structured_residual_passes: Some(0),
+        cancel: None,
+    })
+    .expect("production circle fit");
+    let coords = report.term.assignment.coords[0].as_matrix();
+    ndarray::Array1::from_iter((0..coords.nrows()).map(|i| coords[[i, 0]]))
+}
+
+/// #2260 — MEASURE cross-seed stability of the production circle readout on a
+/// LARGER-model activation cloud (Qwen-3.5-9B layer-21, PCA-64).
+///
+/// #2260 reported the gradient (torch-lane) circle fit's calendar orderings
+/// spanning 0.67–0.97 across seeds at EV≈0.98 on OLMo-2-7B — i.e. high
+/// reconstruction did not certify a stable latent parameterization. That lane
+/// (torch-Adam, random cold init) has since been deleted; the surviving
+/// production path seeds the circle coordinate DETERMINISTICALLY as
+/// `atan2(PC2, PC1)` off the data (`sae_pca_seed_initial_coords` takes no
+/// `random_state`), so `random_state` only perturbs a 1e-3 logit jitter and the
+/// seed-refine routing — not the coordinate itself. The empirical question this
+/// pins: does that leave any residual cross-seed spread in the CONVERGED readout?
+///
+/// It runs the production fit at five seeds (42–46) on the closest in-tree
+/// larger-model cloud and reports the O(2)-aligned cross-seed circular
+/// concordance (the exact statistic #2260 asks to be reported alongside EV). This
+/// is a MEASUREMENT: it prints the min/mean aligned score and asserts only that
+/// the readout is well-posed and finite, so the close-vs-keep-open verdict for
+/// #2260 is read off the printed numbers rather than baked into an a-priori
+/// threshold.
+#[test]
+fn production_circle_readout_cross_seed_concordance_2260() {
+    let path = olmo_fixture_path("qwen35_9b_actsL21_pca64_2000.npy");
+    let full = read_npy_f32_2d(&path);
+    // First 800 rows keep the fit bounded while preserving the 64-dim ambient
+    // subspace that gives a circle room to wander out-of-plane (#2260's mechanism).
+    let n = 800.min(full.nrows());
+    let z = full.slice(s![..n, ..]).to_owned();
+    let seeds = [42u64, 43, 44, 45, 46];
+    let mut coord_rows = Array2::<f64>::zeros((seeds.len(), n));
+    for (r, &seed) in seeds.iter().enumerate() {
+        let coords = production_circle_coords_at_seed(&z, seed);
+        assert_eq!(coords.len(), n, "seed {seed}: one coordinate per row");
+        assert!(
+            coords.iter().all(|v| v.is_finite()),
+            "seed {seed}: converged circle coordinate must be finite"
+        );
+        coord_rows.row_mut(r).assign(&coords);
+    }
+    let report = crate::circular_concordance::circular_concordance(coord_rows.view(), 1.0)
+        .expect("circular concordance over the five seed replicates");
+    let min_aligned = report.minimum_aligned_score;
+    let mean_aligned = report.mean_aligned_score;
+    eprintln!(
+        "[#2260] Qwen-9B L21 production circle readout, seeds 42-46 (N={n}): \
+         cross-seed circular concordance min={min_aligned:?} mean={mean_aligned:?}  \
+         (torch-lane reported 0.67-0.97 spread; 1.0 = seed-identical ordering)"
+    );
+    for pair in &report.pairs {
+        eprintln!(
+            "[#2260]   pair ({},{}) aligned={:?} reflected={:?}",
+            pair.left, pair.right, pair.aligned_score, pair.reflected
+        );
+    }
+    // Well-posedness only — every replicate must span a 2-D circle embedding so
+    // the aligned score is meaningful (not a degenerate collapse), and the score
+    // must be reported. The numeric verdict lives in the printed line above.
+    assert!(
+        report.coverage.iter().all(|c| c.well_posed),
+        "every seed's circle embedding must be well-posed (2-D span) for the \
+         concordance to be meaningful"
+    );
+    assert!(
+        min_aligned.is_some() && mean_aligned.is_some(),
+        "cross-seed aligned concordance must be computable across the five seeds"
+    );
+}
+
 /// Certified-encode soundness near a SELF-CROSSING manifold. The figure-eight atom
 /// `m(t) = (cos 2πt, sin 4πt)` self-crosses at the origin (t=0.25 and t=0.75 →
 /// (0,0)), so a target near the crossing has two competing reconstruction minima.
