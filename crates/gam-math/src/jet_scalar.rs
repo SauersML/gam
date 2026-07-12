@@ -3723,6 +3723,9 @@ mod batch_tests {
         JetScalar, Lane, OneSeed, OneSeedBatch, OneSeedLane, Order2, Order2Batch, Order2Lane,
         TwoSeed, TwoSeedBatch, TwoSeedLane,
     };
+    // The scalar-field algebra (`value`, `add`, …) lives on the shared `JetField`
+    // base now, so the concrete-typed channel reads below need it in scope.
+    use crate::nested_dual::JetField;
 
     /// The ops the witness row expression needs, so ONE generic body evaluates
     /// at the production [`Order2<K>`], the new scalar [`Order2Lane<f64, K>`],
