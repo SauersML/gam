@@ -638,7 +638,9 @@ pub fn random_rotation_null(data: ArrayView2<'_, f64>, seed: u64) -> Result<Arra
     validate_matrix(data, "random-rotation input")?;
     let p = data.ncols();
     let q = random_orthogonal(p, seed)?;
-    Ok(data.dot(&q))
+    let rotated = data.dot(&q);
+    validate_matrix(rotated.view(), "random-rotation output")?;
+    Ok(rotated)
 }
 
 /// Deterministically seeded token-row shuffle.
@@ -1321,6 +1323,9 @@ pub fn matched_spectrum_gaussian_null(
 
 struct StableColumnLocation {
     mean: Array1<f64>,
+    origin: Array1<f64>,
+    offset_scale: Array1<f64>,
+    normalized_offset: Array1<f64>,
 }
 
 impl StableColumnLocation {
@@ -1332,7 +1337,8 @@ impl StableColumnLocation {
     }
 
     fn centered_value(&self, value: f64, axis: usize) -> Result<f64, String> {
-        let centered = value - self.mean[axis];
+        let relative = value - self.origin[axis];
+        let centered = (-self.normalized_offset[axis]).mul_add(self.offset_scale[axis], relative);
         if !centered.is_finite() {
             return Err(format!(
                 "centered value is not representable on column {axis}"
@@ -1384,6 +1390,9 @@ fn stable_column_location(data: ArrayView2<'_, f64>) -> Result<StableColumnLocat
     validate_matrix(data, "stable-column-location input")?;
     let count = data.nrows() as f64;
     let mut mean = Array1::<f64>::zeros(data.ncols());
+    let mut chart_origin = Array1::<f64>::zeros(data.ncols());
+    let mut offset_scale = Array1::<f64>::zeros(data.ncols());
+    let mut normalized_offset = Array1::<f64>::zeros(data.ncols());
     for axis in 0..data.ncols() {
         let origin = data[[0, axis]];
         let relative_chart_is_representable = data
@@ -1400,6 +1409,7 @@ fn stable_column_location(data: ArrayView2<'_, f64>) -> Result<StableColumnLocat
                 .fold(0.0_f64, f64::max);
             if residual_scale == 0.0 {
                 mean[axis] = origin;
+                chart_origin[axis] = origin;
                 continue;
             }
             for &value in data.column(axis).iter() {
@@ -1409,11 +1419,14 @@ fn stable_column_location(data: ArrayView2<'_, f64>) -> Result<StableColumnLocat
                     (value - origin) / residual_scale,
                 )?;
             }
-            let normalized_offset = (sum + correction) / count;
+            let axis_normalized_offset = (sum + correction) / count;
             // Fusing the scale restoration with the translated origin avoids
             // double-rounding a subnormal offset before it can change the
             // correctly rounded absolute mean.
-            mean[axis] = normalized_offset.mul_add(residual_scale, origin);
+            mean[axis] = axis_normalized_offset.mul_add(residual_scale, origin);
+            chart_origin[axis] = origin;
+            offset_scale[axis] = residual_scale;
+            normalized_offset[axis] = axis_normalized_offset;
         } else {
             let absolute_scale = data
                 .column(axis)
@@ -1427,13 +1440,21 @@ fn stable_column_location(data: ArrayView2<'_, f64>) -> Result<StableColumnLocat
             for &value in data.column(axis).iter() {
                 neumaier_add(&mut sum, &mut correction, value / absolute_scale)?;
             }
-            mean[axis] = ((sum + correction) / count) * absolute_scale;
+            let axis_normalized_offset = (sum + correction) / count;
+            mean[axis] = axis_normalized_offset * absolute_scale;
+            offset_scale[axis] = absolute_scale;
+            normalized_offset[axis] = axis_normalized_offset;
         }
     }
     if mean.iter().any(|value| !value.is_finite()) {
         return Err("stable column-mean accumulation overflowed".to_string());
     }
-    Ok(StableColumnLocation { mean })
+    Ok(StableColumnLocation {
+        mean,
+        origin: chart_origin,
+        offset_scale,
+        normalized_offset,
+    })
 }
 
 struct StablePopulationMoments {
@@ -1722,25 +1743,42 @@ pub fn residual_surrogate_matching(
 /// Estimate the moment specification used by [`residual_surrogate_from_moments`].
 pub fn residual_moment_spec(residuals: ArrayView2<'_, f64>) -> Result<ResidualMomentSpec, String> {
     validate_matrix(residuals, "residual moment donor")?;
-    let mean = stable_column_mean(residuals)?;
-    let centered = centered_matrix(residuals)?;
-    let n = centered.nrows();
-    let denom = if n > 1 { (n - 1) as f64 } else { 1.0 };
-    let covariance = centered.t().dot(&centered) / denom;
+    let StablePopulationMoments {
+        location,
+        covariance: mut covariance,
+    } = stable_population_moments(residuals)?;
+    let mean = location.absolute_mean()?;
+    let n = residuals.nrows();
+    if n > 1 {
+        let sample_factor = n as f64 / (n - 1) as f64;
+        covariance.mapv_inplace(|value| value * sample_factor);
+        if covariance.iter().any(|value| !value.is_finite()) {
+            return Err("residual sample covariance is not representable in float64".to_string());
+        }
+    }
     let mut kurtosis_sum = 0.0_f64;
     let mut kurtosis_count = 0usize;
-    for j in 0..centered.ncols() {
-        let mut second = 0.0_f64;
-        let mut fourth = 0.0_f64;
-        for i in 0..centered.nrows() {
-            let v = centered[[i, j]];
-            let v2 = v * v;
-            second += v2;
-            fourth += v2 * v2;
+    for j in 0..residuals.ncols() {
+        let mut scale = 0.0_f64;
+        for &value in residuals.column(j) {
+            scale = scale.max(location.centered_value(value, j)?.abs());
         }
-        second /= n as f64;
-        fourth /= n as f64;
-        if second > f64::MIN_POSITIVE {
+        if scale == 0.0 {
+            continue;
+        }
+        let mut second = 0.0_f64;
+        let mut second_correction = 0.0_f64;
+        let mut fourth = 0.0_f64;
+        let mut fourth_correction = 0.0_f64;
+        for i in 0..residuals.nrows() {
+            let v = location.centered_value(residuals[[i, j]], j)? / scale;
+            let v2 = v * v;
+            neumaier_add(&mut second, &mut second_correction, v2)?;
+            neumaier_add(&mut fourth, &mut fourth_correction, v2 * v2)?;
+        }
+        second = (second + second_correction) / n as f64;
+        fourth = (fourth + fourth_correction) / n as f64;
+        if second > 0.0 {
             kurtosis_sum += (fourth / (second * second) - 3.0).max(0.0);
             kurtosis_count += 1;
         }
@@ -1778,14 +1816,21 @@ pub fn inject_circle_spike(
     }
     let mut rng = StdRng::seed_from_u64(seed);
     let basis = random_orthogonal(p, seed ^ 0xA53A_9E1D_2C6B_7F40)?;
-    let rms = matrix_rms(noise);
-    let amp = snr * rms * (p as f64).sqrt();
+    let rms = matrix_rms(noise)?;
+    let amp = balanced_nonnegative_product(snr, rms, (p as f64).sqrt(), "circle spike amplitude")?;
     let phase0 = rng.random_range(0.0..(2.0 * PI));
     let mut out = noise.to_owned();
     for i in 0..n {
         let theta = phase0 + 2.0 * PI * (i as f64) / (n as f64);
         for j in 0..p {
-            out[[i, j]] += amp * (theta.cos() * basis[[j, 0]] + theta.sin() * basis[[j, 1]]);
+            let direction = theta.cos() * basis[[j, 0]] + theta.sin() * basis[[j, 1]];
+            let value = amp.mul_add(direction, noise[[i, j]]);
+            if !value.is_finite() {
+                return Err(format!(
+                    "circle spike output is not representable at row {i}, column {j}"
+                ));
+            }
+            out[[i, j]] = value;
         }
     }
     Ok(out)
@@ -1809,21 +1854,33 @@ pub fn inject_torus_spike(
     }
     let mut rng = StdRng::seed_from_u64(seed);
     let basis = random_orthogonal(p, seed ^ 0x7055_1A7E_4D2C_A11B)?;
-    let rms = matrix_rms(noise);
-    let amp = snr * rms * ((p as f64) / 2.0).sqrt();
+    let rms = matrix_rms(noise)?;
+    let amp = balanced_nonnegative_product(
+        snr,
+        rms,
+        ((p as f64) / 2.0).sqrt(),
+        "torus spike amplitude",
+    )?;
     let phase0 = rng.random_range(0.0..(2.0 * PI));
     let phase1 = rng.random_range(0.0..(2.0 * PI));
     let winding = coprime_winding(n);
     let mut out = noise.to_owned();
     for i in 0..n {
         let theta = phase0 + 2.0 * PI * (i as f64) / (n as f64);
-        let phi = phase1 + 2.0 * PI * ((winding * i) % n) as f64 / (n as f64);
+        let wound_index = ((winding as u128 * i as u128) % n as u128) as usize;
+        let phi = phase1 + 2.0 * PI * wound_index as f64 / n as f64;
         for j in 0..p {
-            out[[i, j]] += amp
-                * (theta.cos() * basis[[j, 0]]
-                    + theta.sin() * basis[[j, 1]]
-                    + phi.cos() * basis[[j, 2]]
-                    + phi.sin() * basis[[j, 3]]);
+            let direction = theta.cos() * basis[[j, 0]]
+                + theta.sin() * basis[[j, 1]]
+                + phi.cos() * basis[[j, 2]]
+                + phi.sin() * basis[[j, 3]];
+            let value = amp.mul_add(direction, noise[[i, j]]);
+            if !value.is_finite() {
+                return Err(format!(
+                    "torus spike output is not representable at row {i}, column {j}"
+                ));
+            }
+            out[[i, j]] = value;
         }
     }
     Ok(out)
@@ -1856,13 +1913,20 @@ pub fn default_spike_in_detection_pipeline(
             data.ncols()
         ));
     }
-    let eigenvalues = leading_covariance_eigenvalues(data, rank + 1)?;
+    let (eigenvalues, total_energy) = centered_covariance_spectrum(data, rank + 1)?;
     let statistic = match shape {
         SpikeInShape::Circle => harmonic_circle_detector_stat(data)?,
         SpikeInShape::Torus => {
-            let total = centered_total_energy(data)?;
-            let rank_sum = eigenvalues.iter().take(rank).sum::<f64>().max(0.0);
-            if total > 0.0 { rank_sum / total } else { 0.0 }
+            let rank_sum = eigenvalues.iter().take(rank).sum::<f64>();
+            if total_energy > 0.0 {
+                certify_unit_interval(
+                    rank_sum / total_energy,
+                    data.ncols().saturating_mul(128),
+                    "torus rank-energy fraction",
+                )?
+            } else {
+                0.0
+            }
         }
     };
     // reporting-only: heuristic promotion floors on the shape detector statistic;
@@ -2047,8 +2111,9 @@ pub fn first_two_ordered_circle_stat(data: ArrayView2<'_, f64>) -> Result<f64, S
     if n < 4 {
         return Err("first-two circle statistic requires at least four rows".to_string());
     }
-    let x = centered_column(data.column(0))?;
-    let y = centered_column(data.column(1))?;
+    let centered = centered_unit_chart(data.slice(ndarray::s![.., 0..2]))?;
+    let x = centered.column(0);
+    let y = centered.column(1);
     let mut pos_re = 0.0_f64;
     let mut pos_im = 0.0_f64;
     let mut neg_re = 0.0_f64;
@@ -2070,19 +2135,32 @@ pub fn first_two_ordered_circle_stat(data: ArrayView2<'_, f64>) -> Result<f64, S
         let j = (i + 1) % n;
         signed_area += x[i] * y[j] - y[i] * x[j];
     }
-    if energy <= 0.0 {
+    if energy == 0.0 {
         return Ok(0.0);
     }
     let pos = pos_re * pos_re + pos_im * pos_im;
     let neg = neg_re * neg_re + neg_im * neg_im;
-    let winding_balance = (pos - neg).max(0.0) / (pos + neg).max(f64::MIN_POSITIVE);
+    let harmonic_energy = pos + neg;
+    let winding_balance = if harmonic_energy > 0.0 {
+        (pos - neg).max(0.0) / harmonic_energy
+    } else {
+        0.0
+    };
     // Parseval-normalized energy in the ordered frequency-1 mode. A coherent
     // circle attains one; unstructured architecture-matched activations put only
     // O(1/n) of their energy in this single Fourier mode. The previous statistic
     // computed these coefficients but omitted their concentration, allowing a
     // chance high-area noise polygon to outrank the planted circle.
-    let harmonic_concentration = ((pos + neg) / (n as f64 * energy)).clamp(0.0, 1.0);
-    let area_scale = signed_area.abs() / energy.max(f64::MIN_POSITIVE);
+    let harmonic_concentration = certify_unit_interval(
+        harmonic_energy / (n as f64 * energy),
+        n.saturating_mul(16),
+        "ordered-circle harmonic concentration",
+    )?;
+    let area_scale = certify_unit_interval(
+        signed_area.abs() / energy,
+        n.saturating_mul(8),
+        "ordered-circle signed-area scale",
+    )?;
     Ok(winding_balance * harmonic_concentration * area_scale)
 }
 
@@ -2092,27 +2170,39 @@ pub fn first_two_energy_fraction(data: ArrayView2<'_, f64>) -> Result<f64, Strin
     if data.ncols() < 2 {
         return Err("first-two energy requires at least two columns".to_string());
     }
-    let centered = centered_matrix(data)?;
-    let total = centered.iter().map(|v| v * v).sum::<f64>();
-    if total <= 0.0 {
+    let centered = centered_unit_chart(data)?;
+    let mut total = ScaledSumSquares::default();
+    let mut first_two = ScaledSumSquares::default();
+    for i in 0..centered.nrows() {
+        for j in 0..centered.ncols() {
+            total.add(centered[[i, j]])?;
+            if j < 2 {
+                first_two.add(centered[[i, j]])?;
+            }
+        }
+    }
+    if total.scale == 0.0 {
         return Ok(0.0);
     }
-    let mut first_two = 0.0_f64;
-    for i in 0..centered.nrows() {
-        first_two += centered[[i, 0]] * centered[[i, 0]] + centered[[i, 1]] * centered[[i, 1]];
-    }
-    Ok(first_two / total)
+    certify_unit_interval(
+        scaled_square_ratio(first_two, total)?,
+        data.len(),
+        "first-two energy fraction",
+    )
 }
 
 /// Basis-invariant rank-two covariance energy fraction.
 pub fn top_two_energy_fraction(data: ArrayView2<'_, f64>) -> Result<f64, String> {
     validate_matrix(data, "top-two energy input")?;
-    let total = centered_total_energy(data)?;
-    if total <= 0.0 {
+    let (eigenvalues, total) = centered_covariance_spectrum(data, 2)?;
+    if total == 0.0 {
         return Ok(0.0);
     }
-    let eigenvalues = leading_covariance_eigenvalues(data, 2)?;
-    Ok(eigenvalues.iter().sum::<f64>() / total)
+    certify_unit_interval(
+        eigenvalues.iter().sum::<f64>() / total,
+        data.ncols().saturating_mul(128),
+        "top-two covariance energy fraction",
+    )
 }
 
 /// Frequency-1 circle detector calibrated by the phase-randomized null.
@@ -2130,7 +2220,7 @@ pub fn harmonic_circle_detector_stat(data: ArrayView2<'_, f64>) -> Result<f64, S
             "harmonic-circle detector requires at least four rows and two columns".to_string(),
         );
     }
-    let centered = centered_matrix(data)?;
+    let centered = centered_unit_chart(data)?;
     let mut cos_coeff = Array1::<f64>::zeros(p);
     let mut sin_coeff = Array1::<f64>::zeros(p);
     for i in 0..n {
@@ -2145,13 +2235,13 @@ pub fn harmonic_circle_detector_stat(data: ArrayView2<'_, f64>) -> Result<f64, S
     }
 
     let mut plane = Vec::with_capacity(2);
-    append_unit_residual(&mut plane, cos_coeff);
-    append_unit_residual(&mut plane, sin_coeff);
+    append_unit_residual(&mut plane, cos_coeff)?;
+    append_unit_residual(&mut plane, sin_coeff)?;
     if plane.len() < 2 {
         return Ok(0.0);
     }
 
-    let mut total_plane_energy = 0.0_f64;
+    let mut total_plane_energy = ScaledSumSquares::default();
     let mut plane_cos = vec![0.0_f64; plane.len()];
     let mut plane_sin = vec![0.0_f64; plane.len()];
     for i in 0..n {
@@ -2163,23 +2253,28 @@ pub fn harmonic_circle_detector_stat(data: ArrayView2<'_, f64>) -> Result<f64, S
             for j in 0..p {
                 score += centered[[i, j]] * direction[j];
             }
-            total_plane_energy += score * score;
+            total_plane_energy.add(score)?;
             plane_cos[axis] += score * c;
             plane_sin[axis] += score * s;
         }
     }
-    if total_plane_energy <= f64::MIN_POSITIVE {
+    if total_plane_energy.scale == 0.0 {
         return Ok(0.0);
     }
 
-    let coefficient_energy = plane_cos
-        .iter()
-        .chain(plane_sin.iter())
-        .map(|v| v * v)
-        .sum::<f64>();
-    let harmonic_ss = (2.0 / n as f64) * coefficient_energy;
-    let harmonic_fraction = (harmonic_ss / total_plane_energy).clamp(0.0, 1.0);
-    let circle_balance = quadrature_balance(&plane_cos, &plane_sin);
+    let mut coefficient_energy = ScaledSumSquares::default();
+    for &value in plane_cos.iter().chain(plane_sin.iter()) {
+        coefficient_energy.add(value)?;
+    }
+    let scale_ratio = coefficient_energy.scale / total_plane_energy.scale;
+    let normalized_scale_ratio = scale_ratio * (2.0 / n as f64).sqrt();
+    let harmonic_fraction = certify_unit_interval(
+        normalized_scale_ratio * normalized_scale_ratio
+            * (coefficient_energy.scaled_sum / total_plane_energy.scaled_sum),
+        n.saturating_mul(p).saturating_mul(32),
+        "harmonic-circle Fourier energy fraction",
+    )?;
+    let circle_balance = quadrature_balance(&plane_cos, &plane_sin)?;
     Ok(harmonic_fraction * circle_balance)
 }
 
@@ -2248,15 +2343,11 @@ fn circle_topology_audit_from_harmonic_stat(
     eigenvalues: &[f64],
 ) -> TopologyAuditReport {
     let expected = SpikeInShape::Circle.expected_betti();
-    let leading = eigenvalues
-        .first()
-        .copied()
-        .unwrap_or(0.0)
-        .max(f64::MIN_POSITIVE);
+    let leading = eigenvalues.first().copied().unwrap_or(0.0).max(0.0);
     let second = eigenvalues.get(1).copied().unwrap_or(0.0).max(0.0);
     let tail = eigenvalues.get(2).copied().unwrap_or(0.0).max(0.0);
-    let spectral_balance = second / leading;
-    let residual_tail_energy = tail / second.max(f64::MIN_POSITIVE);
+    let spectral_balance = nonnegative_ratio(second, leading);
+    let residual_tail_energy = nonnegative_ratio(tail, second);
     let accepted = statistic >= 0.10; // reporting-only: heuristic acceptance floor for the reported Betti verdict.
     let measured = if accepted { expected } else { (1, 0, 0) };
     TopologyAuditReport {
@@ -2280,19 +2371,15 @@ fn topology_audit_from_spectrum(
 ) -> TopologyAuditReport {
     let rank = shape.signal_rank();
     let expected = shape.expected_betti();
-    let leading = eigenvalues
-        .first()
-        .copied()
-        .unwrap_or(0.0)
-        .max(f64::MIN_POSITIVE);
+    let leading = eigenvalues.first().copied().unwrap_or(0.0).max(0.0);
     let rank_tail = eigenvalues.get(rank).copied().unwrap_or(0.0).max(0.0);
     let weakest_signal = eigenvalues
         .get(rank.saturating_sub(1))
         .copied()
         .unwrap_or(0.0)
         .max(0.0);
-    let spectral_balance = weakest_signal / leading;
-    let residual_tail_energy = rank_tail / weakest_signal.max(f64::MIN_POSITIVE);
+    let spectral_balance = nonnegative_ratio(weakest_signal, leading);
+    let residual_tail_energy = nonnegative_ratio(rank_tail, weakest_signal);
     // reporting-only: heuristic spectral operating points gating the reported
     // topology-audit verdict; not derived and not used as numeric estimates.
     let accepted = match shape {
@@ -2320,16 +2407,36 @@ fn topology_audit_from_spectrum(
     }
 }
 
-fn leading_covariance_eigenvalues(
+/// Leading eigenvalues and total energy of the centered covariance Gram in a
+/// shared unit chart. Both quantities carry the same omitted physical scale,
+/// which cancels in every detector ratio.
+fn centered_covariance_spectrum(
     data: ArrayView2<'_, f64>,
     count: usize,
-) -> Result<Vec<f64>, String> {
+) -> Result<(Vec<f64>, f64), String> {
     validate_matrix(data, "leading covariance eigenvalue input")?;
-    if count == 0 {
-        return Ok(Vec::new());
+    let centered = centered_unit_chart(data)?;
+    let mut total_accumulator = ScaledSumSquares::default();
+    for &value in &centered {
+        total_accumulator.add(value)?;
     }
-    let centered = centered_matrix(data)?;
+    let total = if total_accumulator.scale == 0.0 {
+        0.0
+    } else {
+        total_accumulator.scale
+            * total_accumulator.scale
+            * total_accumulator.scaled_sum
+    };
+    if !total.is_finite() {
+        return Err("unit-chart centered energy is not representable".to_string());
+    }
+    if count == 0 || total == 0.0 {
+        return Ok((Vec::new(), total));
+    }
     let mut cov = centered.t().dot(&centered);
+    if cov.iter().any(|value| !value.is_finite()) {
+        return Err("unit-chart covariance Gram is non-finite".to_string());
+    }
     let mut eigenvalues = Vec::with_capacity(count.min(cov.nrows()));
     for idx in 0..count.min(cov.nrows()) {
         let seed = mix_seed(0x5151_0000, idx as u64, cov.nrows() as u64);
@@ -2343,16 +2450,7 @@ fn leading_covariance_eigenvalues(
             }
         }
     }
-    Ok(eigenvalues)
-}
-
-fn centered_total_energy(data: ArrayView2<'_, f64>) -> Result<f64, String> {
-    let centered = centered_matrix(data)?;
-    let total = centered.iter().map(|value| value * value).sum::<f64>();
-    if !total.is_finite() {
-        return Err("centered total energy overflowed".to_string());
-    }
-    Ok(total)
+    Ok((eigenvalues, total))
 }
 
 fn cholesky_lower(matrix: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
@@ -2421,35 +2519,131 @@ fn gcd(mut a: usize, mut b: usize) -> usize {
     a
 }
 
-fn append_unit_residual(plane: &mut Vec<Array1<f64>>, mut candidate: Array1<f64>) {
-    for direction in plane.iter() {
-        let dot = candidate.dot(direction);
-        for j in 0..candidate.len() {
-            candidate[j] -= dot * direction[j];
+fn append_unit_residual(
+    plane: &mut Vec<Array1<f64>>,
+    mut candidate: Array1<f64>,
+) -> Result<(), String> {
+    // Two modified-Gram-Schmidt passes retain orthogonality when the two
+    // harmonic coefficient vectors are nearly collinear.
+    for _ in 0..2 {
+        for direction in plane.iter() {
+            let dot = candidate.dot(direction);
+            if !dot.is_finite() {
+                return Err("harmonic-plane orthogonalization produced a non-finite dot product"
+                    .to_string());
+            }
+            for j in 0..candidate.len() {
+                candidate[j] -= dot * direction[j];
+            }
         }
     }
-    let norm = candidate.iter().map(|v| v * v).sum::<f64>().sqrt();
-    if norm > f64::MIN_POSITIVE {
+    let mut norm_accumulator = ScaledSumSquares::default();
+    for &value in &candidate {
+        norm_accumulator.add(value)?;
+    }
+    let norm = norm_accumulator.norm()?;
+    if norm > 0.0 {
         candidate.mapv_inplace(|v| v / norm);
         plane.push(candidate);
     }
+    Ok(())
 }
 
-fn quadrature_balance(cos_coeff: &[f64], sin_coeff: &[f64]) -> f64 {
+fn quadrature_balance(cos_coeff: &[f64], sin_coeff: &[f64]) -> Result<f64, String> {
+    if cos_coeff.len() != sin_coeff.len() {
+        return Err("quadrature coefficient lengths differ".to_string());
+    }
+    let scale = cos_coeff
+        .iter()
+        .chain(sin_coeff)
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max);
+    if scale == 0.0 {
+        return Ok(0.0);
+    }
     let mut aa = 0.0_f64;
     let mut bb = 0.0_f64;
-    let mut ab = 0.0_f64;
     for (&c, &s) in cos_coeff.iter().zip(sin_coeff.iter()) {
+        let c = c / scale;
+        let s = s / scale;
         aa += c * c;
         bb += s * s;
-        ab += c * s;
     }
     let trace = aa + bb;
-    if trace <= f64::MIN_POSITIVE {
-        return 0.0;
+    if trace == 0.0 {
+        return Ok(0.0);
     }
-    let det = (aa * bb - ab * ab).max(0.0);
-    (2.0 * det.sqrt() / trace).clamp(0.0, 1.0)
+    // Lagrange's identity evaluates the Gram determinant as a sum of squares,
+    // avoiding the catastrophic `aa*bb - ab^2` subtraction near collinearity.
+    let mut determinant = 0.0_f64;
+    for left in 0..cos_coeff.len() {
+        for right in 0..left {
+            let cross = (cos_coeff[left] / scale) * (sin_coeff[right] / scale)
+                - (cos_coeff[right] / scale) * (sin_coeff[left] / scale);
+            determinant += cross * cross;
+        }
+    }
+    certify_unit_interval(
+        2.0 * determinant.sqrt() / trace,
+        cos_coeff.len().saturating_mul(32),
+        "harmonic quadrature balance",
+    )
+}
+
+fn nonnegative_ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator > 0.0 {
+        numerator / denominator
+    } else if numerator == 0.0 {
+        0.0
+    } else {
+        f64::INFINITY
+    }
+}
+
+fn scaled_square_ratio(
+    numerator: ScaledSumSquares,
+    denominator: ScaledSumSquares,
+) -> Result<f64, String> {
+    if denominator.scale == 0.0 {
+        return if numerator.scale == 0.0 {
+            Ok(0.0)
+        } else {
+            Err("square ratio has a zero denominator and positive numerator".to_string())
+        };
+    }
+    if numerator.scale == 0.0 {
+        return Ok(0.0);
+    }
+    let scale_ratio = numerator.scale / denominator.scale;
+    let ratio = scale_ratio * scale_ratio * numerator.scaled_sum / denominator.scaled_sum;
+    if ratio.is_finite() {
+        Ok(ratio)
+    } else {
+        Err("square ratio is not representable in float64".to_string())
+    }
+}
+
+/// Project a theoretically unit-interval quantity only inside a forward-error
+/// envelope derived from the number of accumulated floating-point terms.
+/// Values outside that envelope are a broken invariant, not something a clamp
+/// may conceal.
+fn certify_unit_interval(value: f64, term_count: usize, name: &str) -> Result<f64, String> {
+    if !value.is_finite() {
+        return Err(format!("{name} is non-finite: {value}"));
+    }
+    let accumulated = term_count.max(1) as f64 * (0.5 * f64::EPSILON);
+    if accumulated >= 0.25 {
+        return Err(format!(
+            "{name} cannot be certified at float64 precision for {term_count} accumulated terms"
+        ));
+    }
+    let tolerance = 64.0 * accumulated / (1.0 - accumulated);
+    if value < -tolerance || value > 1.0 + tolerance {
+        return Err(format!(
+            "{name} left [0, 1] beyond its {tolerance:.3e} roundoff envelope: {value}"
+        ));
+    }
+    Ok(value.clamp(0.0, 1.0))
 }
 
 fn validate_matrix(data: ArrayView2<'_, f64>, name: &str) -> Result<(), String> {
@@ -2584,17 +2778,27 @@ fn random_orthogonal(p: usize, seed: u64) -> Result<Array2<f64>, String> {
         for i in 0..p {
             v[i] = standard_normal(&mut rng);
         }
-        for prev in 0..col {
-            let mut dot = 0.0_f64;
-            for i in 0..p {
-                dot += v[i] * q[[i, prev]];
-            }
-            for i in 0..p {
-                v[i] -= dot * q[[i, prev]];
+        // Reorthogonalized modified Gram-Schmidt (the DGKS remedy). A second
+        // pass preserves the Haar construction in exact arithmetic while
+        // preventing a nearly dependent residual from leaking covariance
+        // under the advertised orthogonal rotation.
+        for _ in 0..2 {
+            for prev in 0..col {
+                let mut dot = 0.0_f64;
+                for i in 0..p {
+                    dot += v[i] * q[[i, prev]];
+                }
+                for i in 0..p {
+                    v[i] -= dot * q[[i, prev]];
+                }
             }
         }
-        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm <= f64::MIN_POSITIVE {
+        let mut norm_accumulator = ScaledSumSquares::default();
+        for &value in &v {
+            norm_accumulator.add(value)?;
+        }
+        let norm = norm_accumulator.norm()?;
+        if norm == 0.0 {
             return Err(format!(
                 "random orthogonal construction produced a numerically zero residual at column {col}"
             ));
@@ -2735,6 +2939,40 @@ fn matrix_rms(data: ArrayView2<'_, f64>) -> Result<f64, String> {
         accumulator.add(value)?;
     }
     accumulator.rms(count)
+}
+
+/// Multiply three finite nonnegative factors in an order that cannot overflow
+/// or underflow before a representable final product. Pairing the smallest and
+/// largest factor first balances exponents; with `a <= b <= c`, an overflow in
+/// `a*c` implies `a >= 1` and hence the final product is also unrepresentable,
+/// while an underflow to zero implies `c < 1` and later multiplication cannot
+/// restore a representable value.
+fn balanced_nonnegative_product(
+    first: f64,
+    second: f64,
+    third: f64,
+    name: &str,
+) -> Result<f64, String> {
+    let mut factors = [first, second, third];
+    if factors
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return Err(format!(
+            "{name} factors must be finite and nonnegative; got {factors:?}"
+        ));
+    }
+    factors.sort_by(f64::total_cmp);
+    let product = (factors[0] * factors[2]) * factors[1];
+    if product == 0.0 && factors.iter().all(|value| *value > 0.0) {
+        Err(format!(
+            "{name} is positive but underflows the float64 output domain"
+        ))
+    } else if product.is_finite() {
+        Ok(product)
+    } else {
+        Err(format!("{name} is not representable in float64"))
+    }
 }
 
 fn dominant_eigenvector(matrix: ArrayView2<'_, f64>, seed: u64) -> Result<Array1<f64>, String> {

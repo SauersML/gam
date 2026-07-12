@@ -346,7 +346,8 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
             let jet =
                 crate::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta_used)?;
             let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
-                inverse_link, eta_used,
+                inverse_link,
+                eta_used,
             )?;
             let (w_obs, c_obs, d_obs) = observed_weight_dispatch(
                 weight_family,

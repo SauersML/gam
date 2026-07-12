@@ -59,12 +59,7 @@ struct ExactLogLinkWorkingRow {
 }
 
 #[inline]
-fn unrepresentable(
-    row: usize,
-    quantity: &'static str,
-    eta: f64,
-    value: f64,
-) -> EstimationError {
+fn unrepresentable(row: usize, quantity: &'static str, eta: f64, value: f64) -> EstimationError {
     EstimationError::PirlsRowGeometryUnrepresentable {
         row,
         quantity,
@@ -104,9 +99,7 @@ fn unit_weight(weight: &WorkingWeight, mu: f64) -> f64 {
 #[inline]
 fn curvature_terms(curvature: &WorkingCurvature, mu: f64, weight: f64) -> (f64, f64) {
     match *curvature {
-        WorkingCurvature::Proportional { c_ratio, d_ratio } => {
-            (c_ratio * weight, d_ratio * weight)
-        }
+        WorkingCurvature::Proportional { c_ratio, d_ratio } => (c_ratio * weight, d_ratio * weight),
         WorkingCurvature::NegativeBinomial { theta } => {
             // r = theta / (theta + mu), evaluated without an overflowing sum.
             let r = if theta >= mu {
@@ -144,12 +137,7 @@ fn exact_log_link_row(
 
     let unit_weight = unit_weight(&rule.weight, mu);
     if !(unit_weight.is_finite() && unit_weight > 0.0) {
-        return Err(unrepresentable(
-            row,
-            "unit Fisher weight",
-            eta,
-            unit_weight,
-        ));
+        return Err(unrepresentable(row, "unit Fisher weight", eta, unit_weight));
     }
     let weight = prior_weight * unit_weight;
     if !(weight.is_finite() && weight > 0.0) {
@@ -166,12 +154,7 @@ fn exact_log_link_row(
 }
 
 #[inline]
-fn exact_working_response(
-    row: usize,
-    eta: f64,
-    y: f64,
-    mu: f64,
-) -> Result<f64, EstimationError> {
+fn exact_working_response(row: usize, eta: f64, y: f64, mu: f64) -> Result<f64, EstimationError> {
     // `y / mu - 1` avoids losing the residual to `y - mu` when both are large,
     // while retaining the exact algebraic PIRLS score carrier.
     let z = eta + y / mu - 1.0;

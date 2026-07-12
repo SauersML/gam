@@ -123,8 +123,7 @@ pub fn update_glmvectors(
             Ok(())
         }
         LinkFunction::Identity => {
-            write_identityworking_state(y, eta, priorweights, mu, weights, z, derivatives);
-            Ok(())
+            write_identityworking_state(y, eta, priorweights, mu, weights, z, derivatives)
         }
         LinkFunction::Log => {
             write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives)
@@ -284,9 +283,7 @@ pub fn update_glmvectors_integrated_for_link(
                     se[i].hypot(state.latent_sd),
                 )?
             } else if matches!(inverse_link, InverseLink::Standard(StandardLink::Logit)) {
-                crate::quadrature::integrated_logit_inverse_link_jet_pirls(
-                    quadctx, eta[i], se[i],
-                )?
+                crate::quadrature::integrated_logit_inverse_link_jet_pirls(quadctx, eta[i], se[i])?
             } else {
                 crate::quadrature::integrated_inverse_link_jetwith_state(
                     quadctx,
@@ -303,8 +300,7 @@ pub fn update_glmvectors_integrated_for_link(
                 d2: jet.d2,
                 d3: jet.d3,
             };
-            let geometry =
-                bernoulli_geometry_from_jet(i, eta[i], y[i], priorweights[i], jet)?;
+            let geometry = bernoulli_geometry_from_jet(i, eta[i], y[i], priorweights[i], jet)?;
             Ok(CertifiedBernoulliRow { geometry, jet })
         })
         .collect();
@@ -611,13 +607,7 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
                     } else {
                         standard_inverse_link_jet(inverse_link, eta[i])?
                     };
-                    certify_bernoulli_row(
-                        inverse_link,
-                        i,
-                        eta[i],
-                        jet.mu,
-                        priorweights[i],
-                    )
+                    certify_bernoulli_row(inverse_link, i, eta[i], jet.mu, priorweights[i])
                 })
                 .collect();
             let certified: Vec<CertifiedBernoulliRow> =

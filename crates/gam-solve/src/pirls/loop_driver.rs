@@ -1775,7 +1775,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 y,
                 working_summary.state.eta.as_ref(),
                 priorweights,
-            );
+            )?;
             let prior_shape = working_model.likelihood.gamma_shape().unwrap_or(1.0);
             let rel_change =
                 (refreshed_shape - prior_shape).abs() / prior_shape.max(f64::MIN_POSITIVE);
@@ -1858,7 +1858,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                     working_summary.state.eta.as_ref(),
                     priorweights,
                     p,
-                );
+                )?;
                 let prior_phi = working_model.likelihood.fixed_phi().unwrap_or(1.0);
                 let rel_change =
                     (refreshed_phi - prior_phi).abs() / prior_phi.max(f64::MIN_POSITIVE);
@@ -1945,7 +1945,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 y,
                 working_summary.state.eta.as_ref(),
                 priorweights,
-            );
+            )?;
             let prior_phi = working_model.likelihood.fixed_phi().unwrap_or(1.0);
             let rel_change = (refreshed_phi - prior_phi).abs() / prior_phi.max(f64::MIN_POSITIVE);
             // Install the refreshed φ (updates BOTH the `Beta { phi }` family
@@ -2027,7 +2027,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 y,
                 working_summary.state.eta.as_ref(),
                 priorweights,
-            );
+            )?;
             let prior_theta = working_model.likelihood.negbin_theta().unwrap_or(1.0);
             let rel_change =
                 (refreshed_theta - prior_theta).abs() / prior_theta.max(f64::MIN_POSITIVE);

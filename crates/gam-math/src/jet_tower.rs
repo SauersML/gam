@@ -4678,57 +4678,10 @@ mod tests {
     }
 }
 
-#[inline]
-fn log1mexp_positive(a: f64) -> f64 {
-    assert!(a >= 0.0, "log1mexp_positive requires a >= 0: a={a}");
-    if a > core::f64::consts::LN_2 {
-        (-(-a).exp()).ln_1p()
-    } else if a > 0.0 {
-        (-(-a).exp_m1()).ln()
-    } else {
-        f64::NEG_INFINITY
-    }
-}
-
-#[inline]
-fn signed_probit_logcdf_and_mills_ratio(x: f64) -> (f64, f64) {
-    if x == f64::INFINITY {
-        return (0.0, 0.0);
-    }
-    if x == f64::NEG_INFINITY {
-        return (f64::NEG_INFINITY, f64::INFINITY);
-    }
-    if x.is_nan() {
-        return (f64::NAN, f64::NAN);
-    }
-    if x < 0.0 {
-        let u = -x / std::f64::consts::SQRT_2;
-        let ex = crate::probability::erfcx_nonnegative(u).max(1e-300);
-        let log_cdf = -u * u + (0.5 * ex).ln();
-        let lambda = (2.0 / std::f64::consts::PI).sqrt() / ex;
-        (log_cdf, lambda)
-    } else {
-        let cdf = crate::probability::normal_cdf(x).clamp(1e-300, 1.0);
-        let lambda = crate::probability::normal_pdf(x) / cdf;
-        (cdf.ln(), lambda)
-    }
-}
-
 /// Stable derivative stack for `log Phi(x)` through fourth order.
 #[inline]
 pub fn unary_derivatives_normal_logcdf(x: f64) -> [f64; 5] {
-    let (log_cdf, lambda) = signed_probit_logcdf_and_mills_ratio(x);
-    let lambda2 = lambda * lambda;
-    let lambda3 = lambda2 * lambda;
-    let x2 = x * x;
-    [
-        log_cdf,
-        lambda,
-        -lambda * (x + lambda),
-        lambda * (x2 - 1.0 + 3.0 * x * lambda + 2.0 * lambda2),
-        -lambda
-            * ((x * x2 - 3.0 * x) + (7.0 * x2 - 4.0) * lambda + 12.0 * x * lambda2 + 6.0 * lambda3),
-    ]
+    crate::probability::normal_logcdf_derivatives(x)
 }
 
 /// Stable derivative stack for `log(1 - exp(-x))`, `x > 0`, through fourth order.
@@ -4736,7 +4689,7 @@ pub fn unary_derivatives_normal_logcdf(x: f64) -> [f64; 5] {
 pub fn unary_derivatives_log1mexp_positive(x: f64) -> [f64; 5] {
     let r = 1.0 / x.exp_m1();
     [
-        log1mexp_positive(x),
+        crate::probability::log1mexp_positive(x),
         r,
         -r * (1.0 + r),
         r * (1.0 + r) * (1.0 + 2.0 * r),

@@ -27,8 +27,9 @@ This is the un-forced division of labor:
       Repeat the complete Stage-0 -> Stage-1b callback from scratch on an
       independent per-dimension shuffle and covariance-matched Gaussian of the
       original activations, with the identical pipeline seed. The reported
-      false-circle floor therefore includes SAE, grouping, projection, and
-      adjudicator artifacts; it is not a post-PCA coordinate control.
+      control circular-win counts therefore include SAE, grouping, projection,
+      and adjudicator artifacts; they are not a post-PCA coordinate control or
+      a calibrated false-positive rate.
 
   Honest report:
       Count groups that adjudicate as genuinely CURVED (circle beats the cluster
@@ -655,9 +656,9 @@ def main() -> int:
             f"dead_frac={sae['dead_feature_fraction']:.3f}; "
             f"circular={run['n_circular_wins']}/{run['n_adjudicated']}; "
             f"winners={run['winner_breakdown']}"
-        )
+    )
     print(
-        "pooled matched-control false-circle floor: "
+        "pooled matched-control circular-win rate (descriptive, not calibrated FPR): "
         f"{control_wins}/{control_adjudicated}"
         + (
             f" ({100.0 * control_wins / control_adjudicated:.1f}%)"

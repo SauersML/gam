@@ -728,9 +728,13 @@ impl<'a> GamWorkingModel<'a> {
             }
         }
 
-        let deviance = self
-            .likelihood
-            .loglik_deviance(self.y, &self.lastmu, self.priorweights)?;
+        let deviance = self.likelihood.loglik_deviance(
+            self.y,
+            &self.workspace.eta_buf,
+            &self.lastmu,
+            &self.link_kind,
+            self.priorweights,
+        )?;
         let penalty_term = self.penalty.shifted_quadratic(beta.as_ref());
         // Finiteness is a property of the (deviance, penalty) pair regardless of
         // the family dispersion scale `k` applied later in the gain ratio, so the
@@ -788,7 +792,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // because a fresh model is built per inner solve. See issue #511.
         if self.likelihood.scale.gamma_shape_is_estimated() && !self.gamma_shape_locked {
             let shape =
-                estimate_gamma_shape_from_eta(self.y, &self.workspace.eta_buf, self.priorweights);
+                estimate_gamma_shape_from_eta(self.y, &self.workspace.eta_buf, self.priorweights)?;
             self.likelihood = self.likelihood.clone().with_gamma_shape(shape);
             self.gamma_shape_locked = true;
         }
@@ -802,7 +806,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // the mean smooth was over-penalized / under-fit on precise data.
         if self.likelihood.scale.beta_phi_is_estimated() && !self.beta_phi_locked {
             let phi =
-                estimate_beta_phi_from_eta(self.y, &self.workspace.eta_buf, self.priorweights);
+                estimate_beta_phi_from_eta(self.y, &self.workspace.eta_buf, self.priorweights)?;
             self.likelihood = self.likelihood.clone().with_beta_phi(phi);
             self.beta_phi_locked = true;
         }
@@ -821,7 +825,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     &self.workspace.eta_buf,
                     self.priorweights,
                     p,
-                );
+                )?;
                 self.likelihood = self.likelihood.clone().with_tweedie_phi(phi);
                 self.tweedie_phi_locked = true;
             }
@@ -837,7 +841,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // coefficient/η SE ignored the data's overdispersion.
         if self.likelihood.scale.negbin_theta_is_estimated() && !self.negbin_theta_locked {
             let theta =
-                estimate_negbin_theta_from_eta(self.y, &self.workspace.eta_buf, self.priorweights);
+                estimate_negbin_theta_from_eta(self.y, &self.workspace.eta_buf, self.priorweights)?;
             self.likelihood = self.likelihood.clone().with_negbin_theta(theta);
             self.negbin_theta_locked = true;
         }
@@ -1044,9 +1048,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         if self.workspace.matvec_buf.len() != n {
             self.workspace.matvec_buf = Array1::zeros(n);
         }
-        self.workspace
-            .matvec_buf
-            .assign(&self.lasthessian_weights);
+        self.workspace.matvec_buf.assign(&self.lasthessian_weights);
         let solver_weights = std::mem::take(&mut self.workspace.matvec_buf);
 
         let (penalized_hessian, sparsehessian, ridge_used) = if matches!(
@@ -1080,15 +1082,21 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         //
         // This keeps the PIRLS fixed point aligned with the stabilized Hessian
         // that drives log|H| and the implicit-gradient correction.
-        let deviance = self
-            .likelihood
-            .loglik_deviance(self.y, &self.lastmu, self.priorweights)?;
-        let log_likelihood = calculate_loglikelihood_omitting_constants(
+        let deviance = self.likelihood.loglik_deviance(
             self.y,
+            &self.workspace.eta_buf,
+            &self.lastmu,
+            &self.link_kind,
+            self.priorweights,
+        )?;
+        let log_likelihood = calculate_loglikelihood_omitting_constants_from_eta(
+            self.y,
+            &self.workspace.eta_buf,
             &self.lastmu,
             &self.likelihood,
+            &self.link_kind,
             self.priorweights,
-        );
+        )?;
 
         let mut penalty_term = self.penalty.shifted_quadratic(beta.as_ref());
         let mut ridge_grad_norm = 0.0;

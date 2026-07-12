@@ -4083,11 +4083,9 @@ impl<'a> RemlState<'a> {
         &self,
         pr: &PirlsResult,
     ) -> Result<(Array2<f64>, RidgePassport), EstimationError> {
-        // Use the same stabilized H = X' W X + S + δI that PIRLS built,
-        // where W = `solver_weights = max(W_obs, floor(W_F))` keeps H PD.
-        // The OUTER analytic operator constructs ∂H/∂ψ from the same
-        // floored W (via `outer_hessian_curvature_arrays`), so log|H| and
-        // its trace gradient live on a single, consistent surface.
+        // Use the same stabilized H = X' W X + S + delta I that PIRLS built.
+        // W is the exact signed statistical curvature; only the assembled
+        // matrix receives the explicit, rho-independent stabilization ridge.
         let h = &pr.stabilizedhessian_transformed;
         if h.factorize().is_ok() {
             return Ok((h.to_dense(), pr.ridge_passport));

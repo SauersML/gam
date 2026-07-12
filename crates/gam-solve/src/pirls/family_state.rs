@@ -96,12 +96,7 @@ fn canonical_logit_working_response(
     dmu_deta: f64,
 ) -> Result<f64, EstimationError> {
     if !(y.is_finite() && (0.0..=1.0).contains(&y)) {
-        return Err(unrepresentable_bernoulli(
-            row,
-            "binomial response",
-            eta,
-            y,
-        ));
+        return Err(unrepresentable_bernoulli(row, "binomial response", eta, y));
     }
     let tail = (-eta.abs()).exp();
     let residual = if eta >= 0.0 {
@@ -183,12 +178,7 @@ pub(crate) fn bernoulli_geometry_from_jet(
     let mu = jet.mu;
     let v = mu * (1.0 - mu);
     if !(v.is_finite() && v > 0.0) {
-        return Err(unrepresentable_bernoulli(
-            row,
-            "Bernoulli variance",
-            eta,
-            v,
-        ));
+        return Err(unrepresentable_bernoulli(row, "Bernoulli variance", eta, v));
     }
     if priorweight == 0.0 {
         return Ok(WorkingBernoulliGeometry {
@@ -216,8 +206,7 @@ pub(crate) fn bernoulli_geometry_from_jet(
     let n2 = 2.0 * (jet.d2 * jet.d2 + jet.d1 * jet.d3);
     let numer1 = n1 * v - n0 * v1;
     let c = priorweight * numer1 / (v * v);
-    let d = priorweight
-        * ((n2 * v - n0 * v2) / (v * v) - 2.0 * numer1 * v1 / (v * v * v));
+    let d = priorweight * ((n2 * v - n0 * v2) / (v * v) - 2.0 * numer1 * v1 / (v * v * v));
     if !c.is_finite() {
         return Err(unrepresentable_bernoulli(row, "dW/deta", eta, c));
     }
@@ -263,10 +252,41 @@ pub(crate) fn write_identityworking_state(
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
-) {
-    mu.assign(eta);
-    weights.assign(&priorweights);
-    z.assign(&y);
+) -> Result<(), EstimationError> {
+    for i in 0..eta.len() {
+        if !eta[i].is_finite() {
+            return Err(EstimationError::InverseLinkDomainViolation {
+                link: "standard identity inverse link",
+                eta: eta[i],
+                lower: -f64::MAX,
+                upper: f64::MAX,
+            });
+        }
+        if !(priorweights[i].is_finite() && priorweights[i] >= 0.0) {
+            return Err(unrepresentable_bernoulli(
+                i,
+                "prior weight",
+                eta[i],
+                priorweights[i],
+            ));
+        }
+        if priorweights[i] > 0.0 && !y[i].is_finite() {
+            return Err(unrepresentable_bernoulli(
+                i,
+                "identity-link response",
+                eta[i],
+                y[i],
+            ));
+        }
+    }
+    ndarray::Zip::indexed(mu)
+        .and(weights)
+        .and(z)
+        .par_for_each(|i, mu_i, weight_i, z_i| {
+            *mu_i = eta[i];
+            *weight_i = priorweights[i];
+            *z_i = if priorweights[i] == 0.0 { eta[i] } else { y[i] };
+        });
     if let Some(derivs) = derivatives {
         derivs.c.fill(0.0);
         derivs.d.fill(0.0);
@@ -274,6 +294,7 @@ pub(crate) fn write_identityworking_state(
         derivs.d2mu_deta2.fill(0.0);
         derivs.d3mu_deta3.fill(0.0);
     }
+    Ok(())
 }
 
 /// Working state for Poisson with a log link.
@@ -346,8 +367,6 @@ pub(crate) fn write_gamma_log_working_state(
     )
 }
 
-pub const BETA_MU_EPS: f64 = 1.0e-12;
-
 #[inline]
 pub(crate) fn tweedie_log_weight_mu_power(mu: f64, p: f64) -> f64 {
     mu.powf(2.0 - p)
@@ -419,11 +438,6 @@ pub(crate) fn validate_tweedie_responses(
         }
     }
     Ok(())
-}
-
-#[inline]
-pub(crate) fn safe_beta_mu(mu: f64) -> f64 {
-    mu.clamp(BETA_MU_EPS, 1.0 - BETA_MU_EPS)
 }
 
 #[inline]
@@ -628,12 +642,7 @@ pub(crate) fn exact_beta_logit_row(
         return Err(unrepresentable_bernoulli(row, "beta dW/deta", eta, c));
     }
     if !d.is_finite() {
-        return Err(unrepresentable_bernoulli(
-            row,
-            "beta d2W/deta2",
-            eta,
-            d,
-        ));
+        return Err(unrepresentable_bernoulli(row, "beta d2W/deta2", eta, d));
     }
     Ok(ExactBetaLogitRow {
         mu,

@@ -4,19 +4,164 @@
 
 use super::*;
 
-pub(crate) const BINOMIAL_MU_EPS: f64 = 1e-12;
-
-/// Clamp `mu` away from 0 and 1 so `mu.ln()` and `(1 - mu).ln()` are finite.
-/// Centralized to keep deviance and log-likelihood symmetric — both must use
-/// the same floor or the log-lik / deviance identity drifts near saturation.
-#[inline]
-pub(crate) fn safe_mu_for_binomial(mu: f64) -> f64 {
-    mu.clamp(BINOMIAL_MU_EPS, 1.0 - BINOMIAL_MU_EPS)
-}
-
 #[inline]
 pub(crate) fn xlogy(x: f64, y: f64) -> f64 {
     if x == 0.0 { 0.0 } else { x * y.ln() }
+}
+
+#[inline]
+fn softplus(x: f64) -> f64 {
+    x.max(0.0) + (-x.abs()).exp().ln_1p()
+}
+
+#[inline]
+fn binomial_log_probabilities(
+    inverse_link: &InverseLink,
+    eta: f64,
+    mu: f64,
+) -> Result<(f64, f64), EstimationError> {
+    if matches!(inverse_link, InverseLink::Standard(StandardLink::Logit)) {
+        if !eta.is_finite() {
+            return Err(EstimationError::InverseLinkDomainViolation {
+                link: "standard logit inverse link",
+                eta,
+                lower: -f64::MAX,
+                upper: f64::MAX,
+            });
+        }
+        return Ok((-softplus(-eta), -softplus(eta)));
+    }
+    if mu.is_finite() && mu > 0.0 && mu < 1.0 {
+        Ok((mu.ln(), (-mu).ln_1p()))
+    } else {
+        Err(EstimationError::PirlsRowGeometryUnrepresentable {
+            row: 0,
+            quantity: "binomial log-probabilities",
+            eta,
+            value: mu,
+        })
+    }
+}
+
+pub(crate) fn calculate_deviance_from_eta(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    mu: &Array1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    priorweights: ArrayView1<f64>,
+) -> Result<f64, EstimationError> {
+    if !matches!(likelihood.spec.response, ResponseFamily::Binomial) {
+        let value = calculate_deviance(y, mu, likelihood, priorweights);
+        if value.is_finite() {
+            return Ok(value);
+        }
+        crate::bail_invalid_estim!("deviance is not representable on the certified PIRLS state");
+    }
+    let rows: Vec<Result<f64, EstimationError>> = (0..y.len())
+        .into_par_iter()
+        .map(|i| {
+            let wi = priorweights[i];
+            if !(wi.is_finite() && wi >= 0.0) {
+                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "prior weight",
+                    eta: eta[i],
+                    value: wi,
+                });
+            }
+            if wi == 0.0 {
+                return Ok(0.0);
+            }
+            let (log_mu, log_one_minus_mu) =
+                binomial_log_probabilities(inverse_link, eta[i], mu[i]).map_err(|_| {
+                    EstimationError::PirlsRowGeometryUnrepresentable {
+                        row: i,
+                        quantity: "binomial log-probabilities",
+                        eta: eta[i],
+                        value: mu[i],
+                    }
+                })?;
+            let yi = y[i];
+            let value = 2.0
+                * wi
+                * (xlogy(yi, yi) + xlogy(1.0 - yi, 1.0 - yi)
+                    - yi * log_mu
+                    - (1.0 - yi) * log_one_minus_mu);
+            if value.is_finite() && value >= 0.0 {
+                Ok(value)
+            } else {
+                Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "binomial deviance contribution",
+                    eta: eta[i],
+                    value,
+                })
+            }
+        })
+        .collect();
+    let rows: Vec<f64> = rows.into_iter().collect::<Result<_, _>>()?;
+    let value = gam_linalg::pairwise_reduce::par_pairwise_sum(rows.len(), |i| rows[i]);
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        crate::bail_invalid_estim!("binomial deviance reduction exceeded f64 range")
+    }
+}
+
+pub(crate) fn calculate_loglikelihood_omitting_constants_from_eta(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    mu: &Array1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    priorweights: ArrayView1<f64>,
+) -> Result<f64, EstimationError> {
+    if !matches!(likelihood.spec.response, ResponseFamily::Binomial) {
+        let value = calculate_loglikelihood_omitting_constants(y, mu, likelihood, priorweights);
+        if value.is_finite() {
+            return Ok(value);
+        }
+        crate::bail_invalid_estim!(
+            "log-likelihood is not representable on the certified PIRLS state"
+        );
+    }
+    let rows: Vec<Result<f64, EstimationError>> = (0..y.len())
+        .into_par_iter()
+        .map(|i| {
+            let wi = priorweights[i];
+            if wi == 0.0 {
+                return Ok(0.0);
+            }
+            let (log_mu, log_one_minus_mu) =
+                binomial_log_probabilities(inverse_link, eta[i], mu[i]).map_err(|_| {
+                    EstimationError::PirlsRowGeometryUnrepresentable {
+                        row: i,
+                        quantity: "binomial log-probabilities",
+                        eta: eta[i],
+                        value: mu[i],
+                    }
+                })?;
+            let value = wi * (y[i] * log_mu + (1.0 - y[i]) * log_one_minus_mu);
+            if value.is_finite() {
+                Ok(value)
+            } else {
+                Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "binomial log-likelihood contribution",
+                    eta: eta[i],
+                    value,
+                })
+            }
+        })
+        .collect();
+    let rows: Vec<f64> = rows.into_iter().collect::<Result<_, _>>()?;
+    let value = gam_linalg::pairwise_reduce::par_pairwise_sum(rows.len(), |i| rows[i]);
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        crate::bail_invalid_estim!("binomial log-likelihood reduction exceeded f64 range")
+    }
 }
 
 #[inline]
@@ -92,10 +237,12 @@ pub(crate) fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
     if !valid_beta_phi(phi) || !valid_beta_response(yi) {
         return f64::NAN;
     }
-    let mui_c = safe_beta_mu(mui);
-    let a = (mui_c * phi).max(BETA_MU_EPS);
-    let b = ((1.0 - mui_c) * phi).max(BETA_MU_EPS);
-    beta_log_normalizer(a, b, phi) + phi * xlogy(mui_c, yi) + phi * xlogy(1.0 - mui_c, 1.0 - yi)
+    if !(mui.is_finite() && mui > 0.0 && mui < 1.0) {
+        return f64::NAN;
+    }
+    let a = mui * phi;
+    let b = (1.0 - mui) * phi;
+    beta_log_normalizer(a, b, phi) + phi * xlogy(mui, yi) + phi * xlogy(1.0 - mui, 1.0 - yi)
         - yi.ln()
         - (1.0 - yi).ln()
 }
@@ -115,11 +262,6 @@ pub fn calculate_deviance(
     likelihood: &GlmLikelihoodSpec,
     priorweights: ArrayView1<f64>,
 ) -> f64 {
-    const EPS: f64 = 1e-8;
-    // Match the μ floor used by the shared PIRLS log-link working-state engine
-    // (`MIN_MU = 1e-10` in `log_link_working_state`) so deviance / weights
-    // stay self-consistent when the linear predictor saturates.
-    const MU_FLOOR: f64 = 1e-10;
     match &likelihood.spec.response {
         ResponseFamily::Binomial => {
             let total_residual: f64 = RowSet::All.par_reduce_fold(
@@ -127,12 +269,7 @@ pub fn calculate_deviance(
                 || 0.0_f64,
                 |acc, i, _row_weight| {
                     let yi = y[i];
-                    // Inverse links (probit, cloglog, logit) can saturate to
-                    // exactly 0 or 1 in finite precision; clamp before ln so
-                    // the deviance sum stays finite. Uses the same floor as
-                    // the log-likelihood site below to keep the two reductions
-                    // self-consistent.
-                    let mui_c = safe_mu_for_binomial(mu[i]);
+                    let mui_c = mu[i];
                     let wi = priorweights[i];
                     let term1 = if yi > EPS {
                         yi * (yi.ln() - mui_c.ln())
@@ -172,7 +309,7 @@ pub fn calculate_deviance(
         ResponseFamily::Poisson => {
             let total: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
                 let yi = y[i];
-                let mui_c = mu[i].max(MU_FLOOR);
+                let mui_c = mu[i];
                 priorweights[i] * poisson_unit_deviance(yi, mui_c)
             });
             2.0 * total
@@ -197,7 +334,7 @@ pub fn calculate_deviance(
             }
             let total: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
                 let yi = y[i];
-                let mui_c = mu[i].max(MU_FLOOR);
+                let mui_c = mu[i];
                 priorweights[i] * tweedie_unit_deviance(yi, mui_c, p)
             });
             2.0 * total
@@ -206,7 +343,7 @@ pub fn calculate_deviance(
             let theta = *theta;
             let total: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
                 let yi = y[i];
-                let mui_c = mu[i].max(MU_FLOOR);
+                let mui_c = mu[i];
                 priorweights[i] * negative_binomial_unit_deviance(yi, mui_c, theta)
             });
             2.0 * total
@@ -232,7 +369,7 @@ pub fn calculate_deviance(
             // 1 − D_resid/D_null` is a pure ratio of like-scaled deviances.
             let total: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
                 let yi_c = y[i].max(EPS);
-                let mui_c = mu[i].max(MU_FLOOR);
+                let mui_c = mu[i];
                 priorweights[i] * gamma_unit_deviance(yi_c, mui_c)
             });
             2.0 * total
@@ -264,10 +401,6 @@ pub fn pointwise_loglikelihood_omitting_constants(
     likelihood: &GlmLikelihoodSpec,
     priorweights: ArrayView1<f64>,
 ) -> Array1<f64> {
-    // Same μ floor as PIRLS log-link working-state writers; see note in
-    // `calculate_deviance` above.
-    const MU_FLOOR: f64 = 1e-10;
-    const EPS: f64 = 1e-8;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = y.len();
     let values: Vec<f64> = match &likelihood.spec.response {
@@ -294,17 +427,14 @@ pub fn pointwise_loglikelihood_omitting_constants(
         ResponseFamily::Binomial => (0..n)
             .into_par_iter()
             .map(|i| {
-                // Share the deviance helper so both reductions floor mu at
-                // the same epsilon — otherwise the deviance / log-lik identity
-                // drifts whenever the link saturates.
-                let mui_c = safe_mu_for_binomial(mu[i]);
+                let mui_c = mu[i];
                 priorweights[i] * (y[i] * mui_c.ln() + (1.0 - y[i]) * (1.0 - mui_c).ln())
             })
             .collect(),
         ResponseFamily::Poisson => (0..n)
             .into_par_iter()
             .map(|i| {
-                let mui_c = mu[i].max(MU_FLOOR);
+                let mui_c = mu[i];
                 let log_term = if y[i] > 0.0 { y[i] * mui_c.ln() } else { 0.0 };
                 priorweights[i] * (log_term - mui_c)
             })
@@ -322,7 +452,7 @@ pub fn pointwise_loglikelihood_omitting_constants(
                 .into_par_iter()
                 .map(|i| {
                     let yi = y[i];
-                    let mui_c = mu[i].max(MU_FLOOR);
+                    let mui_c = mu[i];
                     -priorweights[i] * tweedie_unit_deviance(yi, mui_c, p) / phi
                 })
                 .collect()
@@ -339,7 +469,7 @@ pub fn pointwise_loglikelihood_omitting_constants(
                     if !valid_count_response(yi) {
                         return f64::NAN;
                     }
-                    let mui_c = mu[i].max(MU_FLOOR);
+                    let mui_c = mu[i];
                     priorweights[i]
                         * (ln_gamma(yi + theta) - ln_gamma(theta) - ln_gamma(yi + 1.0)
                             + theta * (theta.ln() - (theta + mui_c).ln())
@@ -364,11 +494,7 @@ pub fn pointwise_loglikelihood_omitting_constants(
             let shape = likelihood.gamma_shape().unwrap_or(1.0);
             (0..n)
                 .into_par_iter()
-                .map(|i| {
-                    let yi_c = y[i].max(EPS);
-                    let mui_c = mu[i].max(MU_FLOOR);
-                    -priorweights[i] * shape * gamma_unit_deviance(yi_c, mui_c)
-                })
+                .map(|i| -priorweights[i] * shape * gamma_unit_deviance(y[i], mu[i]))
                 .collect()
         }
         ResponseFamily::RoystonParmar => vec![f64::NAN; n],
@@ -382,9 +508,6 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
     likelihood: &GlmLikelihoodSpec,
     priorweights: ArrayView1<f64>,
 ) -> f64 {
-    // Same μ floor as PIRLS log-link working-state writers; see note in
-    // `calculate_deviance` above.
-    const MU_FLOOR: f64 = 1e-10;
     let n = y.len();
     match &likelihood.spec.response {
         ResponseFamily::Gaussian => {
@@ -405,14 +528,11 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
             })
         }
         ResponseFamily::Binomial => gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
-            // Share the deviance helper so both reductions floor mu at
-            // the same epsilon — otherwise the deviance / log-lik identity
-            // drifts whenever the link saturates.
-            let mui_c = safe_mu_for_binomial(mu[i]);
+            let mui_c = mu[i];
             priorweights[i] * (y[i] * mui_c.ln() + (1.0 - y[i]) * (1.0 - mui_c).ln())
         }),
         ResponseFamily::Poisson => gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
-            let mui_c = mu[i].max(MU_FLOOR);
+            let mui_c = mu[i];
             let log_term = if y[i] > 0.0 { y[i] * mui_c.ln() } else { 0.0 };
             priorweights[i] * (log_term - mui_c)
         }),
@@ -434,7 +554,7 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                 if !valid_count_response(yi) {
                     return f64::NAN;
                 }
-                let mui_c = mu[i].max(MU_FLOOR);
+                let mui_c = mu[i];
                 priorweights[i]
                     * (ln_gamma(yi + theta) - ln_gamma(theta) - ln_gamma(yi + 1.0)
                         + theta * (theta.ln() - (theta + mui_c).ln())
@@ -548,8 +668,6 @@ pub fn pointwise_loglikelihood(
     likelihood: &GlmLikelihoodSpec,
     priorweights: ArrayView1<f64>,
 ) -> Array1<f64> {
-    const MU_FLOOR: f64 = 1e-10;
-    const EPS: f64 = 1e-8;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = y.len();
     let values: Vec<f64> = match &likelihood.spec.response {
@@ -581,7 +699,7 @@ pub fn pointwise_loglikelihood(
         ResponseFamily::Binomial => (0..n)
             .into_par_iter()
             .map(|i| {
-                let mui_c = safe_mu_for_binomial(mu[i]);
+                let mui_c = mu[i];
                 let wi = priorweights[i];
                 // ln C(nᵢ, nᵢyᵢ) with nᵢ = wᵢ trials (the continuous extension via
                 // lnΓ matches non-integer prior weights). Zero for Bernoulli
@@ -593,7 +711,7 @@ pub fn pointwise_loglikelihood(
         ResponseFamily::Poisson => (0..n)
             .into_par_iter()
             .map(|i| {
-                let mui_c = mu[i].max(MU_FLOOR);
+                let mui_c = mu[i];
                 let log_term = if y[i] > 0.0 { y[i] * mui_c.ln() } else { 0.0 };
                 // − ln Γ(y+1) is the count normalizer the REML kernel drops.
                 priorweights[i] * (log_term - mui_c - ln_gamma(y[i] + 1.0))
@@ -610,9 +728,7 @@ pub fn pointwise_loglikelihood(
             }
             (0..n)
                 .into_par_iter()
-                .map(|i| {
-                    tweedie_saddlepoint_loglik(y[i], mu[i].max(MU_FLOOR), priorweights[i], p, phi)
-                })
+                .map(|i| tweedie_saddlepoint_loglik(y[i], mu[i], priorweights[i], p, phi))
                 .collect()
         }
         ResponseFamily::NegativeBinomial { theta, .. } => {
@@ -623,7 +739,7 @@ pub fn pointwise_loglikelihood(
                     if !valid_negbin_theta(theta) || !valid_count_response(y[i]) {
                         return f64::NAN;
                     }
-                    let mui_c = mu[i].max(MU_FLOOR);
+                    let mui_c = mu[i];
                     priorweights[i]
                         * (ln_gamma(y[i] + theta) - ln_gamma(theta) - ln_gamma(y[i] + 1.0)
                             + theta * (theta.ln() - (theta + mui_c).ln())
@@ -651,11 +767,7 @@ pub fn pointwise_loglikelihood(
             }
             (0..n)
                 .into_par_iter()
-                .map(|i| {
-                    let yi_c = y[i].max(EPS);
-                    let mui_c = mu[i].max(MU_FLOOR);
-                    gamma_full_loglik(yi_c, mui_c, priorweights[i], shape)
-                })
+                .map(|i| gamma_full_loglik(y[i], mu[i], priorweights[i], shape))
                 .collect()
         }
         ResponseFamily::RoystonParmar => vec![f64::NAN; n],
@@ -664,15 +776,14 @@ pub fn pointwise_loglikelihood(
 }
 
 /// `ln C(n, n·y)` with `n = w` trials, via the continuous `lnΓ` extension so
-/// non-integer prior weights are handled. The two count arguments `n·y` and
-/// `n·(1−y)` are floored at 0 to absorb tiny negative round-off at `y ∈ {0,1}`.
+/// non-integer prior weights are handled.
 #[inline]
 pub(crate) fn binomial_log_coefficient(w: f64, y: f64) -> f64 {
     if !(w.is_finite() && w > 0.0) {
         return 0.0;
     }
-    let k = (w * y).max(0.0);
-    let nk = (w * (1.0 - y)).max(0.0);
+    let k = w * y;
+    let nk = w * (1.0 - y);
     ln_gamma(w + 1.0) - ln_gamma(k + 1.0) - ln_gamma(nk + 1.0)
 }
 
@@ -685,7 +796,10 @@ pub(crate) fn gamma_full_loglik(yi: f64, mui: f64, w: f64, nu: f64) -> f64 {
         // to −∞ rather than contributing nothing).
         return 0.0;
     }
-    let a = (w * nu).max(f64::MIN_POSITIVE);
+    let a = w * nu;
+    if !(a.is_finite() && a > 0.0 && yi.is_finite() && yi > 0.0 && mui.is_finite() && mui > 0.0) {
+        return f64::NAN;
+    }
     // a·ln(a/μ) + (a−1)·ln y − a·y/μ − lnΓ(a)
     a * (a / mui).ln() + (a - 1.0) * yi.ln() - a * yi / mui - ln_gamma(a)
 }
@@ -885,7 +999,6 @@ pub fn tweedie_exact_loglik_total(
     p: f64,
     phi: f64,
 ) -> f64 {
-    const MU_FLOOR: f64 = 1e-10;
     if !is_valid_tweedie_power(p) || !(phi.is_finite() && phi > 0.0) {
         return f64::NAN;
     }
@@ -893,7 +1006,7 @@ pub fn tweedie_exact_loglik_total(
         return f64::NAN;
     }
     gam_linalg::pairwise_reduce::par_pairwise_sum(y.len(), |i| {
-        tweedie_exact_loglik(y[i], mu[i].max(MU_FLOOR), priorweights[i], p, phi)
+        tweedie_exact_loglik(y[i], mu[i], priorweights[i], p, phi)
     })
 }
 

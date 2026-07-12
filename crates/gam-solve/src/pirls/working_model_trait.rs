@@ -266,7 +266,9 @@ pub(crate) trait WorkingLikelihood {
     fn loglik_deviance(
         &self,
         y: ArrayView1<f64>,
+        eta: &Array1<f64>,
         mu: &Array1<f64>,
+        inverse_link: &InverseLink,
         priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError>;
 }
@@ -401,18 +403,16 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (ResponseFamily::Gamma, _, _) => {
-                write_gamma_log_working_state(
-                    y,
-                    eta,
-                    priorweights,
-                    self.gamma_shape().unwrap_or(1.0),
-                    mu,
-                    weights,
-                    z,
-                    derivatives,
-                )
-            }
+            (ResponseFamily::Gamma, _, _) => write_gamma_log_working_state(
+                y,
+                eta,
+                priorweights,
+                self.gamma_shape().unwrap_or(1.0),
+                mu,
+                weights,
+                z,
+                derivatives,
+            ),
             (ResponseFamily::RoystonParmar, _, _) => Err(EstimationError::InvalidInput(
                 "RoystonParmar is survival-specific and not a GLM IRLS family".to_string(),
             )),
@@ -422,12 +422,14 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
     fn loglik_deviance(
         &self,
         y: ArrayView1<f64>,
+        eta: &Array1<f64>,
         mu: &Array1<f64>,
+        inverse_link: &InverseLink,
         priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError> {
         if matches!(self.spec.response, ResponseFamily::Tweedie { .. }) {
             validate_tweedie_responses(&y, &priorweights)?;
         }
-        Ok(calculate_deviance(y, mu, self, priorweights))
+        calculate_deviance_from_eta(y, eta, mu, self, inverse_link, priorweights)
     }
 }
