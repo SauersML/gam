@@ -715,8 +715,8 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
         ridge_ext_coord,
     )?;
     let assignments = term.assignment.assignments();
-    let (fitted, atom_reconstructions, effective_coords) = term
-        .reconstruct_with_atom_images_target_aware(target.view(), assignments.view())?;
+    let (fitted, atom_reconstructions, effective_coords) =
+        term.reconstruct_with_atom_images_target_aware(target.view(), assignments.view())?;
 
     let mut atom_reports = Vec::with_capacity(k_atoms);
     for atom_index in 0..k_atoms {
