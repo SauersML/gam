@@ -3462,7 +3462,7 @@ fn reactive_rho_domain_upper(
         if let Some(scale) = reactive_smooth_curvature_scale(&entry_term, &assignments, atom_idx)? {
             largest_native_scale = largest_native_scale.max(scale);
             let index = rho.smooth_flat_index(atom_idx);
-            let target_strength = SaeManifoldRho::stable_exp_strength(target[index]);
+            let target_strength = target[index].exp();
             upper[index] = target_strength.max(scale).ln();
         }
         for axis in 0..rho.log_ard[atom_idx].len() {
@@ -3471,7 +3471,7 @@ fn reactive_rho_domain_upper(
             {
                 largest_native_scale = largest_native_scale.max(scale);
                 let index = rho.ard_flat_index(atom_idx, axis);
-                let target_strength = SaeManifoldRho::stable_exp_strength(target[index]);
+                let target_strength = target[index].exp();
                 upper[index] = upper[index].max(target_strength.max(scale).ln());
             }
         }
@@ -3491,7 +3491,7 @@ fn reactive_rho_domain_upper(
         )
         && largest_native_scale > 0.0
     {
-        let target_strength = SaeManifoldRho::stable_exp_strength(target[index]);
+        let target_strength = target[index].exp();
         upper[index] = target_strength.max(largest_native_scale).ln();
     }
 
@@ -3902,14 +3902,22 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // which the outer certification then rejected against the
                 // idempotent analytic sample ("cost-only value disagrees with
                 // analytic-sample value"). Price through the SAME `Criterion`
-                // drive `eval`/`eval_cost` use — warm-started from the probe
-                // handoff and rescued to the extended budget on a non-convergence
-                // refusal (`value_probe_with_budget_rescue`) — so value, gradient,
-                // and certification are one coherent objective. At small n the
-                // former probe and this drive coincide (both reach the fixed point
-                // within the base budget), so this is a no-op for the tier0 fits.
+                // drive the GRADIENT lane (`eval` →
+                // `penalized_quasi_laplace_criterion_with_cache`) and the outer
+                // certification use — the FULL-refine budget
+                // (`refine_progress_extension = true`), NOT eval_cost's coarse
+                // ranking budget: the line-search value must price the SAME
+                // idempotent fixed point the gradient differentiates and the cert
+                // samples, or a coarse iterate ~1% off it (real scale, #2228) makes
+                // every step fail Armijo (StepSizeTooSmall) and the shipped coarse
+                // value then fails the cert value-agreement gate. eval_cost keeps the
+                // coarse budget (#1029/#2138 ranking contract); this Value lane does
+                // NOT. At small n both budgets reach the fixed point so this is a
+                // no-op (tier0 unchanged); the regression test
+                // `value_lane_prices_at_shared_fixed_point` pins the invariant so a
+                // future rewrite reintroducing `false` here goes red.
                 let drive = ProbeInnerDrive::Criterion {
-                    refine_progress_extension: false,
+                    refine_progress_extension: true,
                 };
                 let (cost, beta_hat) = match self.value_probe_with_budget_rescue(rho.view(), drive)
                 {
@@ -4060,11 +4068,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
 
     fn outer_domain_upper_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
         self.baseline_rho
-            .validate_ard_log_strength_domain()
+            .validate_log_strength_domain()
             .map_err(EstimationError::InvalidInput)?;
-        let ard_upper = self.baseline_rho.ard_flat_domain_upper_bound();
+        let log_strength_upper = self.baseline_rho.flat_domain_upper_bound();
         let Some(contract) = self.reactive_domain_scalar_contract()? else {
-            return Ok(ard_upper);
+            return Ok(log_strength_upper);
         };
         // The reactive entry replaces the invalid common cold dictionary with a
         // deterministic disjoint-chart placement. Derive the legal rho face
@@ -4092,9 +4100,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
             contract.entry().assignment_temperature,
         )
         .map_err(EstimationError::RemlOptimizationFailed)?;
-        if let Some(ard_upper) = ard_upper {
+        if let Some(log_strength_upper) = log_strength_upper {
             for index in 0..reactive_upper.len() {
-                reactive_upper[index] = reactive_upper[index].min(ard_upper[index]);
+                reactive_upper[index] = reactive_upper[index].min(log_strength_upper[index]);
             }
         }
         Ok(Some(reactive_upper))
@@ -4102,9 +4110,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
 
     fn outer_domain_lower_bound(&self) -> Result<Option<Array1<f64>>, EstimationError> {
         self.baseline_rho
-            .validate_ard_log_strength_domain()
+            .validate_log_strength_domain()
             .map_err(EstimationError::InvalidInput)?;
-        Ok(self.baseline_rho.ard_flat_domain_lower_bound())
+        Ok(self.baseline_rho.flat_domain_lower_bound())
     }
 
     /// Dense K≥2 joint fits may have undefined quasi-Laplace score at the literal

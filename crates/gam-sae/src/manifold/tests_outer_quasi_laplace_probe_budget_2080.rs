@@ -1221,3 +1221,86 @@ fn profile_wide_p_criterion_cost_2080() {
         );
     }
 }
+
+/// #2228 regression — the line-search Value lane must price the shared inner
+/// fixed point. The BFGS/ARC cost probe (`OuterEvalOrder::Value`) ranks steps
+/// whose direction came from the gradient lane's exact implicit `∇f`, computed
+/// at the FULLY converged idempotent inner root
+/// (`penalized_quasi_laplace_criterion_with_cache`, `refine_progress_extension =
+/// true`); the outer certification samples that same root. In the
+/// ill-conditioned wide-`p` / over-smoothed regime a COARSE probe
+/// (`refine_progress_extension = false`, the cheap ranking budget) sits ~1% off
+/// that root, so (a) no step reduces the coarsely-ranked value while pointing
+/// down the analytic gradient — BFGS backtracks to `StepSizeTooSmall` at
+/// iteration 1 — and (b) the shipped coarse terminal value fails the outer cert
+/// value-agreement gate ("cost-only value disagrees with analytic-sample value",
+/// #2228). This pins probe == analytic within the certification roundoff bound at
+/// an admitted iterate, so a future rewrite that reintroduces the coarse budget on
+/// the Value lane goes red here instead of silently shipping the desync.
+#[test]
+fn value_lane_prices_at_shared_fixed_point_2228() {
+    let n = 96usize;
+    let p = 48usize;
+    let z = one_circle_wide_target(n, p, 0.05);
+    let (term, seed_dispersion) = two_circle_periodic_term(z.view(), 1, 2);
+    let mode = AssignmentMode::ordered_beta_bernoulli(1.0, 1.0, false);
+    let imi = 8usize;
+    let (lr, re, rb) = (0.04_f64, 1.0e-6_f64, 1.0e-6_f64);
+    // Over-smoothed rho: the undamped Laplace log-det is worst-conditioned here, so
+    // the inner (t,beta) solve needs progress-extension refinement beyond the
+    // coarse probe budget to reach the fixed point. The sanity check below asserts
+    // the fixture actually exercises that regime (else the invariant is vacuous).
+    let rho = SaeManifoldRho::new(0.02_f64.ln(), 4.0_f64, vec![array![0.0]])
+        .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)
+        .unwrap();
+    let rho_flat = rho.to_flat();
+
+    // Sanity: the coarse (false) and full (true) refine budgets MUST disagree by
+    // more than the certification roundoff bound at this rho, else the invariant
+    // assertion below would pass vacuously on any fixture.
+    let v_false = {
+        let mut t = term.clone();
+        t.penalized_quasi_laplace_criterion_with_cache_refine_policy(
+            z.view(), &rho, None, imi, lr, re, rb, false,
+        )
+        .expect("coarse-budget bare criterion evaluates")
+        .0
+    };
+    let v_true = {
+        let mut t = term.clone();
+        t.penalized_quasi_laplace_criterion_with_cache(z.view(), &rho, None, imi, lr, re, rb)
+            .expect("full-budget bare criterion evaluates")
+            .0
+    };
+    let regime_bound = f64::EPSILON.sqrt() * v_false.abs().max(v_true.abs()).max(1.0);
+    assert!(
+        (v_false - v_true).abs() > regime_bound,
+        "fixture must exercise the coarse-vs-full under-refinement regime, else this \
+         test is vacuous: v_false={v_false:.16e}, v_true={v_true:.16e}, diff={:.3e} \
+         <= regime_bound={regime_bound:.3e} (strengthen the fixture)",
+        (v_false - v_true).abs()
+    );
+
+    // Invariant: the line-search Value lane prices the SAME fixed point the
+    // analytic gradient lane differentiates, within the certification roundoff
+    // bound (the exact gate `rho_optimizer::run` enforces at fit end).
+    let mut obj_v =
+        SaeManifoldOuterObjective::new(term.clone(), z.clone(), None, rho.clone(), imi, lr, re, rb);
+    let value_lane = OuterObjective::eval_with_order(&mut obj_v, &rho_flat, OuterEvalOrder::Value)
+        .expect("value lane evaluates")
+        .cost;
+    let mut obj_g =
+        SaeManifoldOuterObjective::new(term.clone(), z.clone(), None, rho.clone(), imi, lr, re, rb);
+    let analytic =
+        OuterObjective::eval_with_order(&mut obj_g, &rho_flat, OuterEvalOrder::ValueAndGradient)
+            .expect("gradient lane evaluates")
+            .cost;
+    let cert_bound = f64::EPSILON.sqrt() * value_lane.abs().max(analytic.abs()).max(1.0);
+    assert!(
+        (value_lane - analytic).abs() <= cert_bound,
+        "#2228: line-search Value lane must price the analytic fixed point within the \
+         certification roundoff bound: value_lane={value_lane:.16e}, \
+         analytic={analytic:.16e}, diff={:.3e}, bound={cert_bound:.3e}",
+        (value_lane - analytic).abs()
+    );
+}
