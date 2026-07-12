@@ -12,16 +12,26 @@ overridden via `family=`.
 | Response column | Inferred family | Default link |
 | --- | --- | --- |
 | Binary `{0, 1}` | binomial | logit |
-| Continuous numeric | Gaussian | identity |
-| Non-negative integer with log link | Poisson | log |
-| Otherwise, with log link | Gamma | log |
+| Non-negative integer counts (auto) | Poisson | log |
+| Other continuous numeric | Gaussian | identity |
 | `Surv(entry, exit, event)` | survival | depends on `survival_likelihood` |
 
-When the log link is set, Poisson vs Gamma is chosen automatically
-by whether the response is integer-valued — `family=` is optional:
+A numeric response auto-routes to **Poisson/log on the bare `y ~ s(x)` path**
+(no `family=`, no `link=`) when it has the **count signature**: every value is
+finite, `>= 0`, and exactly integer-valued, with at least one value `>= 2`. Any
+other numeric response is Gaussian/identity. (A `{0, 1}` column is binary, not a
+count; the `>= 2` requirement is what separates counts from a binary column.)
+
+> **Ordinal caveat.** An integer rating column such as `0..5` matches the count
+> signature and therefore auto-routes to Poisson/log. If you want it treated as
+> a continuous/Gaussian response, pass `family="gaussian"` explicitly.
+
+When `link="log"` is pinned *without* a `family=`, Poisson vs Gamma is chosen
+automatically by whether the response is integer-valued — `family=` is optional:
 
 ```python
-gamfit.fit(df, "y ~ s(x)", link="log")     # auto-routes Poisson/Gamma
+gamfit.fit(df, "y ~ s(x)")                 # integer counts -> Poisson/log (auto)
+gamfit.fit(df, "y ~ s(x)", link="log")     # log pinned: Poisson (integer) / Gamma (else)
 gamfit.fit(df, "y ~ s(x)", family="poisson", link="log")  # explicit
 ```
 

@@ -830,7 +830,15 @@ def fit(
         parentheses such as ``"bernoulli(probit)"``. Specialized values include
         ``"gaussian-location-scale"`` when ``noise_formula`` is supplied,
         ``"bernoulli-marginal-slope"``, ``"royston-parmar"``, and
-        ``"transformation-normal"``.
+        ``"transformation-normal"``. With ``family="auto"`` (the default) the
+        response's values select the family on the bare ``y ~ s(x)`` path: a
+        ``{0, 1}`` column is binomial/logit, a non-negative integer **count**
+        column (finite, ``>= 0``, integer-valued, with at least one value
+        ``>= 2``) is Poisson/log, and any other numeric column is
+        Gaussian/identity. An explicit ``family=`` always overrides this
+        inference — e.g. pass ``family="gaussian"`` to fit an integer rating
+        column such as ``0..5`` (which matches the count signature) as a
+        continuous response.
     offset:
         Name of the offset column. Corresponds to ``--offset-column``.
     weights:
