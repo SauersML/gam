@@ -706,14 +706,19 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
             // (`maybe_build_evidence_gpu_matvec`) and otherwise to the CPU
             // `schur_matvec` resident row-factor lane — both matrix-free.
             //
-            // What is NOT yet device-resident at massive K: for the matrix-free
-            // Kronecker system (`sys.htbeta_matvec.is_some()`, the production
-            // border), `gpu_schur_matvec_backend` returns the CPU row-procedural
-            // apply (`build_row_procedural_matvec`), so the applies run on rayon.
-            // The device-resident framed apply the PCG hot loop already runs
-            // (`ResidentSaeFrameHandle` + `launch_sae_frame_matvec`, #1551
-            // parity-tested) is the operator to feed here; that wiring is the
-            // remaining increment.
+            // Device residency at massive K (#1017, LANDED): when the framed
+            // matrix-free system carries `sys.device_sae_pcg` (the production
+            // SAE border), `maybe_build_evidence_gpu_matvec` builds the
+            // device-resident DETERMINISTIC framed apply the PCG hot loop
+            // already runs (`ResidentSaeFrameHandle` + `launch_sae_frame_matvec`,
+            // #1551 parity-tested), uploading the ridge-independent operands once
+            // and crossing only `x`/`out` per Lanczos apply — measured 97% GPU
+            // util over the SLQ loop. The CPU row-procedural closure
+            // `gpu_schur_matvec_backend` returns for `htbeta_matvec` systems
+            // (`build_row_procedural_matvec`, applies on rayon) is now only the
+            // FALLBACK: taken when no `device_sae_pcg` is installed (e.g. the
+            // legacy sparse lane) or when the framed builder declines the
+            // shape/device/ridge.
             //
             // On any failure forming/factoring the Schur (non-PD pivot the LM
             // escalation must respond to), surface the error rather than returning a
@@ -738,12 +743,11 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
                 // without materialising `S`.
                 // #1017 Phase-3: run the SLQ log|S| probes on the SAME resident
                 // device `S·v` this Direct path already solves the step through,
-                // built once for the evaluation. This closes the "device-apply
-                // plumbing / remaining future work" noted above: with the operator
-                // engaged, every Lanczos apply runs on device (no `O(k²)` dense
-                // assembly, no per-apply host round-trip); when it declines the
-                // shape/device the byte-identical CPU resident row-factor lane is
-                // staged instead.
+                // built once for the evaluation. With the operator engaged every
+                // Lanczos apply runs on device (no `O(k²)` dense assembly, no
+                // per-apply host round-trip); when it declines the shape/device
+                // the byte-identical CPU resident row-factor lane is staged
+                // instead.
                 let device_matvec = crate::arrow_schur::maybe_build_evidence_gpu_matvec(
                     sys,
                     ridge_t,
