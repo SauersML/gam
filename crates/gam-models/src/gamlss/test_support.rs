@@ -8,6 +8,43 @@
 //! shape `dead_code` cannot see and the build-time ban-scanner rejects.
 
 use gam_math::jet_scalar::JetScalar;
+use gam_problem::InverseLink;
+
+/// Dense all-channel binomial location-scale oracle shared by the packed
+/// scalar unit tests and the family-level behavior tests. Production consumers
+/// instantiate only the derivative order they read.
+#[inline]
+pub(crate) fn binomial_location_scale_nll_tower(
+    y: f64,
+    weight: f64,
+    eta_t: f64,
+    eta_ls: f64,
+    q_value: f64,
+    mu: f64,
+    dmu_dq: f64,
+    d2mu_dq2: f64,
+    d3mu_dq3: f64,
+    link_kind: &InverseLink,
+    include_fourth: bool,
+) -> Result<gam_math::jet_tower::Tower4<2>, String> {
+    use gam_math::jet_tower::Tower4;
+
+    super::binomial_location_scale_nll_generic::<Tower4<2>>(
+        y,
+        weight,
+        eta_t,
+        eta_ls,
+        q_value,
+        mu,
+        dmu_dq,
+        d2mu_dq2,
+        d3mu_dq3,
+        link_kind,
+        include_fourth,
+        true,
+        |x, axis| Tower4::<2>::variable(x, axis),
+    )
+}
 
 /// Tweedie compound Poisson–Gamma row NLL written ONCE over a generic
 /// [`JetScalar<2>`], seeded directly on the PREDICTOR primaries `(η_μ, η_d)`

@@ -16,7 +16,7 @@ use super::binomial_q_derivs::{
 use super::dispersion_family::{
     DISPERSION_ETA_CLAMP, DISPERSION_MIN_CURVATURE, DispersionRowKernel, dispersion_row_kernel,
 };
-use super::test_support::dispersion_tweedie_nll_generic;
+use super::test_support::{binomial_location_scale_nll_tower, dispersion_tweedie_nll_generic};
 use crate::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 
 /// Dense `Tower4<2>` Tweedie row NLL oracle: the #932 all-channels instantiation
