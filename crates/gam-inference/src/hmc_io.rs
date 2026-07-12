@@ -1778,7 +1778,13 @@ mod tests {
             stable_penalty_term: 0.0,
             penalized_objective: 0.0,
             used_device: false,
-            outer_iterations: 1,
+            // Fixed-fit semantics (outer_iterations = 0): these hand-built
+            // fixtures carry no analytic stationarity certificate, and the
+            // #2255 assembly gate correctly refuses an
+            // iterations-ran-but-uncertified state. The fixtures never
+            // exercised an outer search; declaring them fixed-ρ fits states
+            // what they actually are.
+            outer_iterations: 0,
             outer_converged: true,
             outer_gradient_norm: None,
             standard_deviation: 1.0,
@@ -1907,7 +1913,13 @@ mod tests {
             stable_penalty_term: 0.0,
             penalized_objective: 0.0,
             used_device: false,
-            outer_iterations: 1,
+            // Fixed-fit semantics (outer_iterations = 0): these hand-built
+            // fixtures carry no analytic stationarity certificate, and the
+            // #2255 assembly gate correctly refuses an
+            // iterations-ran-but-uncertified state. The fixtures never
+            // exercised an outer search; declaring them fixed-ρ fits states
+            // what they actually are.
+            outer_iterations: 0,
             outer_converged: true,
             outer_gradient_norm: None,
             standard_deviation: 1.0,
