@@ -1,7 +1,8 @@
 // NVRTC device source for the survival marginal-slope rigid per-row NLL jet.
 // Compiled by `survival_rowjet.rs` via `cudarc::nvrtc::compile_ptx` (full f64,
-// no fast-math). Byte-faithful port of the CPU `rigid_row_nll` seeded-jet
-// arithmetic. K is fixed to 4 (rigid survival primaries q0,q1,qd1,g).
+// no fast-math). Operation-faithful port of the CPU `rigid_row_nll` seeded-jet
+// arithmetic, using the platform's full-precision erfc primitive on each side.
+// K is fixed to 4 (rigid survival primaries q0,q1,qd1,g).
 //
 // Provenance: derived from the measured standalone prototype
 // `src/gpu/proto/survival_marginal_slope_jet_932.cu` (device == CPU to 4.7e-12
@@ -32,111 +33,18 @@
 #define NAN (__longlong_as_double(0x7ff8000000000000LL))
 #endif
 
-// ─── statrs Boost-derived erf polynomial, ported verbatim ───────────────
-// These coefficient tables and the erf_impl control flow are a byte-faithful
-// port of statrs 0.18 `function::erf` (the CPU oracle's erfc). The device
-// must call THIS, not CUDA's intrinsic erfc: the two rational approximations
-// differ ~1e-10 relative, and the deep probit-tail derivative jet amplifies
-// that to ~5e-8 — blowing the 1e-9 GPU↔CPU parity gate (measured on a V100).
-// Horner evaluation with --fmad=false reproduces the CPU rounding exactly.
-__constant__ double EI_AN[8] = { 0.00337916709551257388990745, -0.00073695653048167948530905, -0.374732337392919607868241, 0.0817442448733587196071743, -0.0421089319936548595203468, 0.0070165709512095756344528, -0.00495091255982435110337458, 0.000871646599037922480317225 };
-__constant__ double EI_AD[8] = { 1.0, -0.218088218087924645390535, 0.412542972725442099083918, -0.0841891147873106755410271, 0.0655338856400241519690695, -0.0120019604454941768171266, 0.00408165558926174048329689, -0.000615900721557769691924509 };
-__constant__ double EI_BN[6] = { -0.0361790390718262471360258, 0.292251883444882683221149, 0.281447041797604512774415, 0.125610208862766947294894, 0.0274135028268930549240776, 0.00250839672168065762786937 };
-__constant__ double EI_BD[6] = { 1.0, 1.8545005897903486499845, 1.43575803037831418074962, 0.582827658753036572454135, 0.124810476932949746447682, 0.0113724176546353285778481 };
-__constant__ double EI_CN[7] = { -0.0397876892611136856954425, 0.153165212467878293257683, 0.191260295600936245503129, 0.10276327061989304213645, 0.029637090615738836726027, 0.0046093486780275489468812, 0.000307607820348680180548455 };
-__constant__ double EI_CD[7] = { 1.0, 1.95520072987627704987886, 1.64762317199384860109595, 0.768238607022126250082483, 0.209793185936509782784315, 0.0319569316899913392596356, 0.00213363160895785378615014 };
-__constant__ double EI_DN[7] = { -0.0300838560557949717328341, 0.0538578829844454508530552, 0.0726211541651914182692959, 0.0367628469888049348429018, 0.00964629015572527529605267, 0.00133453480075291076745275, 0.778087599782504251917881e-4 };
-__constant__ double EI_DD[8] = { 1.0, 1.75967098147167528287343, 1.32883571437961120556307, 0.552528596508757581287907, 0.133793056941332861912279, 0.0179509645176280768640766, 0.00104712440019937356634038, -0.106640381820357337177643e-7 };
-__constant__ double EI_EN[7] = { -0.0117907570137227847827732, 0.014262132090538809896674, 0.0202234435902960820020765, 0.00930668299990432009042239, 0.00213357802422065994322516, 0.00025022987386460102395382, 0.120534912219588189822126e-4 };
-__constant__ double EI_ED[7] = { 1.0, 1.50376225203620482047419, 0.965397786204462896346934, 0.339265230476796681555511, 0.0689740649541569716897427, 0.00771060262491768307365526, 0.000371421101531069302990367 };
-__constant__ double EI_FN[7] = { -0.00546954795538729307482955, 0.00404190278731707110245394, 0.0054963369553161170521356, 0.00212616472603945399437862, 0.000394984014495083900689956, 0.365565477064442377259271e-4, 0.135485897109932323253786e-5 };
-__constant__ double EI_FD[8] = { 1.0, 1.21019697773630784832251, 0.620914668221143886601045, 0.173038430661142762569515, 0.0276550813773432047594539, 0.00240625974424309709745382, 0.891811817251336577241006e-4, -0.465528836283382684461025e-11 };
-__constant__ double EI_GN[6] = { -0.00270722535905778347999196, 0.0013187563425029400461378, 0.00119925933261002333923989, 0.00027849619811344664248235, 0.267822988218331849989363e-4, 0.923043672315028197865066e-6 };
-__constant__ double EI_GD[7] = { 1.0, 0.814632808543141591118279, 0.268901665856299542168425, 0.0449877216103041118694989, 0.00381759663320248459168994, 0.000131571897888596914350697, 0.404815359675764138445257e-11 };
-__constant__ double EI_HN[6] = { -0.00109946720691742196814323, 0.000406425442750422675169153, 0.000274499489416900707787024, 0.465293770646659383436343e-4, 0.320955425395767463401993e-5, 0.778286018145020892261936e-7 };
-__constant__ double EI_HD[6] = { 1.0, 0.588173710611846046373373, 0.139363331289409746077541, 0.0166329340417083678763028, 0.00100023921310234908642639, 0.24254837521587225125068e-4 };
-__constant__ double EI_IN[5] = { -0.00056907993601094962855594, 0.000169498540373762264416984, 0.518472354581100890120501e-4, 0.382819312231928859704678e-5, 0.824989931281894431781794e-7 };
-__constant__ double EI_ID[6] = { 1.0, 0.339637250051139347430323, 0.043472647870310663055044, 0.00248549335224637114641629, 0.535633305337152900549536e-4, -0.117490944405459578783846e-12 };
-__constant__ double EI_JN[5] = { -0.000241313599483991337479091, 0.574224975202501512365975e-4, 0.115998962927383778460557e-4, 0.581762134402593739370875e-6, 0.853971555085673614607418e-8 };
-__constant__ double EI_JD[5] = { 1.0, 0.233044138299687841018015, 0.0204186940546440312625597, 0.000797185647564398289151125, 0.117019281670172327758019e-4 };
-__constant__ double EI_KN[5] = { -0.000146674699277760365803642, 0.162666552112280519955647e-4, 0.269116248509165239294897e-5, 0.979584479468091935086972e-7, 0.101994647625723465722285e-8 };
-__constant__ double EI_KD[5] = { 1.0, 0.165907812944847226546036, 0.0103361716191505884359634, 0.000286593026373868366935721, 0.298401570840900340874568e-5 };
-__constant__ double EI_LN[5] = { -0.583905797629771786720406e-4, 0.412510325105496173512992e-5, 0.431790922420250949096906e-6, 0.993365155590013193345569e-8, 0.653480510020104699270084e-10 };
-__constant__ double EI_LD[5] = { 1.0, 0.105077086072039915406159, 0.00414278428675475620830226, 0.726338754644523769144108e-4, 0.477818471047398785369849e-6 };
-__constant__ double EI_MN[4] = { -0.196457797609229579459841e-4, 0.157243887666800692441195e-5, 0.543902511192700878690335e-7, 0.317472492369117710852685e-9 };
-__constant__ double EI_MD[5] = { 1.0, 0.052803989240957632204885, 0.000926876069151753290378112, 0.541011723226630257077328e-5, 0.535093845803642394908747e-15 };
-__constant__ double EI_NN[4] = { -0.789224703978722689089794e-5, 0.622088451660986955124162e-6, 0.145728445676882396797184e-7, 0.603715505542715364529243e-10 };
-__constant__ double EI_ND[4] = { 1.0, 0.0375328846356293715248719, 0.000467919535974625308126054, 0.193847039275845656900547e-5 };
-
-// Horner polynomial evaluation, identical order to statrs `evaluate::polynomial`:
-// sum = coeff[n-1]; for c in coeff[0..n-1] reversed: sum = c + z*sum.
-__device__ __forceinline__ double ei_poly(double z, const double* c, int n){
-    if(n==0) return 0.0;
-    double sum=c[n-1];
-    for(int i=n-2;i>=0;--i) sum = c[i] + z*sum;
-    return sum;
-}
-
-// Byte-faithful port of statrs 0.18 `erf_impl(z, inv)` for z >= 0. The negative
-// branch of statrs's `erf_impl` is a pure sign/reflection of the z>=0 result, so
-// it is handled inline by the callers (`erf_statrs`/`erfc_statrs`) WITHOUT device
-// recursion: recursion under this deep-jet kernel (heavy per-thread stack +
-// `__launch_bounds__(128,1)`) overflows the launch's local-memory stack and
-// faults with CUDA_ERROR_ILLEGAL_ADDRESS. This formulation is recursion-free.
-__device__ double erf_impl_pos(double z, bool inv){
-    // z is guaranteed >= 0 here (callers reflect negatives).
-    double result;
-    if(z<0.5){
-        if(z<1e-10){
-            result = z*1.125 + z*0.003379167095512573896158903121545171688;
-        }else{
-            result = z*1.125 + z*ei_poly(z,EI_AN,8)/ei_poly(z,EI_AD,8);
-        }
-    }else if(z<110.0){
-        double r,b;
-        if(z<0.75){ r=ei_poly(z-0.5,EI_BN,6)/ei_poly(z-0.5,EI_BD,6); b=0.3440242112; }
-        else if(z<1.25){ r=ei_poly(z-0.75,EI_CN,7)/ei_poly(z-0.75,EI_CD,7); b=0.419990927; }
-        else if(z<2.25){ r=ei_poly(z-1.25,EI_DN,7)/ei_poly(z-1.25,EI_DD,8); b=0.4898625016; }
-        else if(z<3.5){ r=ei_poly(z-2.25,EI_EN,7)/ei_poly(z-2.25,EI_ED,7); b=0.5317370892; }
-        else if(z<5.25){ r=ei_poly(z-3.5,EI_FN,7)/ei_poly(z-3.5,EI_FD,8); b=0.5489973426; }
-        else if(z<8.0){ r=ei_poly(z-5.25,EI_GN,6)/ei_poly(z-5.25,EI_GD,7); b=0.5571740866; }
-        else if(z<11.5){ r=ei_poly(z-8.0,EI_HN,6)/ei_poly(z-8.0,EI_HD,6); b=0.5609807968; }
-        else if(z<17.0){ r=ei_poly(z-11.5,EI_IN,5)/ei_poly(z-11.5,EI_ID,6); b=0.5626493692; }
-        else if(z<24.0){ r=ei_poly(z-17.0,EI_JN,5)/ei_poly(z-17.0,EI_JD,5); b=0.5634598136; }
-        else if(z<38.0){ r=ei_poly(z-24.0,EI_KN,5)/ei_poly(z-24.0,EI_KD,5); b=0.5638477802; }
-        else if(z<60.0){ r=ei_poly(z-38.0,EI_LN,5)/ei_poly(z-38.0,EI_LD,5); b=0.5640528202; }
-        else if(z<85.0){ r=ei_poly(z-60.0,EI_MN,4)/ei_poly(z-60.0,EI_MD,5); b=0.5641309023; }
-        else { r=ei_poly(z-85.0,EI_NN,4)/ei_poly(z-85.0,EI_ND,4); b=0.5641584396; }
-        double g=exp(-z*z)/z;
-        result = g*b + g*r;
-    }else{
-        result = 0.0;
-    }
-    if(inv && z>=0.5) return result;
-    else if(z>=0.5 || inv) return 1.0 - result;
-    else return result;
-}
-
-// statrs `erfc` wrapper. NaN/Inf branches mirror statrs's `erfc` exactly; the
-// finite path reproduces statrs `erf_impl(x, inv=true)` including its z<0
-// reflection, but inlined (no device recursion). For x<0:
-//   z<-0.5 : erfc(x) = 2 - erfc(-x)        = 2 - erf_impl_pos(-x, true)
-//   -0.5<=x<0 : erfc(x) = 1 + erf(-x)      = 1 + erf_impl_pos(-x, false)
-__device__ __forceinline__ double erfc_statrs(double x){
-    if(isnan(x)) return NAN;
-    if(x==INFINITY) return 0.0;
-    if(x==-INFINITY) return 2.0;
-    if(x>=0.0) return erf_impl_pos(x,true);
-    if(x<-0.5) return 2.0 - erf_impl_pos(-x,true);
-    return 1.0 + erf_impl_pos(-x,false);
-}
-
-// ---- transcendentals, bit-mirroring the Rust f64 ops ----
+// The host probability primitive uses high-accuracy libm::erfc. CUDA's
+// full-precision erfc intrinsic is its device-native counterpart: both are
+// accurate to the f64 ULP floor, unlike the retired statrs polynomial whose
+// ~1e-10 error poisoned the normal-log-CDF tower. Keeping the intrinsic also
+// removes fourteen coefficient tables and a large branch ladder from every
+// row-jet kernel's instruction footprint.
+// ---- transcendentals, matching the host primitive contract ----
 // erfcx_nonnegative (src/inference/probability.rs)
 __device__ __forceinline__ double erfcx_nn(double x){
     if(!isfinite(x)) return x>0.0 ? 0.0 : INFINITY;
     if(x<=0.0) return 1.0;
-    if(x<26.0) return exp(fmin(x*x,700.0))*erfc_statrs(x);
+    if(x<26.0) return exp(fmin(x*x,700.0))*erfc(x);
     double inv=1.0/x, inv2=inv*inv;
     double poly=1.0-0.5*inv2+0.75*inv2*inv2-1.875*inv2*inv2*inv2+6.5625*inv2*inv2*inv2*inv2;
     return inv*poly/sqrt(M_PI);
@@ -145,7 +53,7 @@ __device__ __forceinline__ double normal_pdf(double x){
     const double INV_SQRT_2PI=0.3989422804014327;
     return INV_SQRT_2PI*exp(-0.5*x*x);
 }
-__device__ __forceinline__ double normal_cdf(double x){ return 0.5*erfc_statrs(-x/M_SQRT2); }
+__device__ __forceinline__ double normal_cdf(double x){ return 0.5*erfc(-x/M_SQRT2); }
 __device__ __forceinline__ void sp_logcdf_mills(double x, double*lc, double*lam){
     if(x==INFINITY){*lc=0.0;*lam=0.0;return;}
     if(x==-INFINITY){*lc=-INFINITY;*lam=INFINITY;return;}

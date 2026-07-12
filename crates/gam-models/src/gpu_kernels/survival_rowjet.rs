@@ -58,8 +58,10 @@
 //!
 //! # Single source, exactly
 //!
-//! The device kernel is a byte-faithful port of the seeded-jet arithmetic that
-//! the CPU `rigid_row_nll` runs:
+//! The device kernel is an operation-faithful port of the seeded-jet arithmetic
+//! that the CPU `rigid_row_nll` runs. Its probability leaf uses CUDA's
+//! full-precision `erfc`, the device counterpart of the host's high-accuracy
+//! `libm::erfc`; no lower-accuracy compatibility polynomial is retained:
 //!
 //!   * `J2`  — order-2 `(v, g, H)` over `K=4` primaries (mirrors `Order2<4>`);
 //!   * `JS1` — one-seed jet whose ε-Hessian channel IS `Σ_c ℓ_{abc} dir_c`
