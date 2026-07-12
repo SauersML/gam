@@ -5,6 +5,7 @@
 use super::*;
 
 use gam_math::jet_scalar::JetScalar;
+use gam_row_macros::row_program;
 
 // ── Static-sparsity (v,g,H) scalar (#932 perf) ─────────────────────────
 //
@@ -868,6 +869,54 @@ pub(crate) fn rigid_row_inputs(
     })
 }
 
+row_program! {
+    pub(crate) fn rigid_row_program(
+        q0, q1, qd1, g;
+        wi, di, z_sum, covariance_ones, probit_scale
+    )
+    leaves {
+        sqrt => unary_derivatives_sqrt => d_sqrt,
+        neglog_phi => unary_derivatives_neglog_phi => neglog_phi_stack,
+        log_normal_pdf => unary_derivatives_log_normal_pdf => d_lognormpdf,
+        log => unary_derivatives_log => d_log,
+    }
+    witnesses [neg_eta0, neg_eta1, adjusted_derivative];
+    {
+        let observed_g = scale(g, probit_scale);
+        let one_plus_b2 = add_constant(
+            scale(mul(observed_g, observed_g), covariance_ones),
+            1.0
+        );
+        let correction = compose(sqrt, one_plus_b2);
+        let observed_gz = scale(observed_g, z_sum);
+        let eta0 = add(mul(q0, correction), observed_gz);
+        let eta1 = add(mul(q1, correction), observed_gz);
+        let adjusted_derivative = mul(qd1, correction);
+
+        let neg_eta0 = scale(eta0, -1.0);
+        let entry = scale(compose(neglog_phi, neg_eta0, wi), -1.0);
+        let neg_eta1 = scale(eta1, -1.0);
+        let exit = compose(neglog_phi, neg_eta1, wi * (1.0 - di));
+
+        let mut event_density = zero();
+        let mut time_derivative = zero();
+        if (di > 0.0) {
+            event_density = scale(
+                compose(log_normal_pdf, eta1),
+                -(wi * di)
+            );
+            time_derivative = scale(
+                compose(log, adjusted_derivative),
+                -(wi * di)
+            );
+        }
+        return add(
+            add(exit, entry),
+            add(event_density, time_derivative)
+        );
+    }
+}
+
 /// The rigid survival marginal-slope row negative log-likelihood, written ONCE
 /// over a generic [`JetScalar<4>`] so a single expression yields every
 /// derivative channel a consumer needs (#736/#932 single-source contract):
@@ -900,28 +949,23 @@ pub(crate) fn rigid_row_nll<S: JetScalar<4>>(
         qd1_lower,
     } = *inputs;
 
-    let q0 = &vars[0];
-    let q1 = &vars[1];
-    let qd1 = &vars[2];
-    let g = &vars[3];
+    let (nll, [neg_eta0, neg_eta1, adjusted_derivative]) = rigid_row_program(
+        &vars[0],
+        &vars[1],
+        &vars[2],
+        &vars[3],
+        wi,
+        di,
+        z_sum,
+        covariance_ones,
+        probit_scale,
+    );
 
-    let observed_g = g.scale(probit_scale);
-    let one_plus_b2 = observed_g
-        .mul(&observed_g)
-        .scale(covariance_ones)
-        .add(&S::constant(1.0));
-    let c = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.value()));
-
-    let observed_gz = observed_g.scale(z_sum);
-    let eta0 = q0.mul(&c).add(&observed_gz);
-    let eta1 = q1.mul(&c).add(&observed_gz);
-    let ad1 = qd1.mul(&c);
-
-    if survival_derivative_guard_violated(qd1.value(), qd1_lower) {
+    if survival_derivative_guard_violated(vars[2].value(), qd1_lower) {
         return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
             reason: format!(
                 "survival marginal-slope monotonicity violated at row {row}: raw time derivative={:.3e} must be at least derivative_guard={:.3e}; transformed time derivative={:.3e}",
-                qd1.value(), qd1_lower, ad1.value()
+                vars[2].value(), qd1_lower, adjusted_derivative
             ),
         }
         .into());
@@ -946,34 +990,9 @@ pub(crate) fn rigid_row_nll<S: JetScalar<4>>(
         }
     };
 
-    let neg_eta0 = eta0.neg();
-    reject_nonfinite_margin(neg_eta0.value(), wi)?;
-    let entry = neg_eta0
-        .compose_unary(unary_derivatives_neglog_phi(neg_eta0.value(), wi))
-        .scale(-1.0);
-
-    let neg_eta1 = eta1.neg();
-    reject_nonfinite_margin(neg_eta1.value(), wi * (1.0 - di))?;
-    let exit = neg_eta1.compose_unary(unary_derivatives_neglog_phi(
-        neg_eta1.value(),
-        wi * (1.0 - di),
-    ));
-
-    let event_density = if di > 0.0 {
-        eta1.compose_unary(unary_derivatives_log_normal_pdf(eta1.value()))
-            .scale(-wi * di)
-    } else {
-        S::constant(0.0)
-    };
-
-    let time_deriv = if di > 0.0 {
-        ad1.compose_unary(unary_derivatives_log(ad1.value()))
-            .scale(-wi * di)
-    } else {
-        S::constant(0.0)
-    };
-
-    Ok(exit.add(&entry).add(&event_density).add(&time_deriv))
+    reject_nonfinite_margin(neg_eta0, wi)?;
+    reject_nonfinite_margin(neg_eta1, wi * (1.0 - di))?;
+    Ok(nll)
 }
 
 /// #932: the canonical single-source seam. The row NLL is written ONCE as
