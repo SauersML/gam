@@ -1,4 +1,5 @@
-use statrs::function::{beta::inv_beta_reg, erf::erfc};
+use libm::erfc;
+use statrs::function::beta::inv_beta_reg;
 
 const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
 const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
@@ -39,7 +40,7 @@ pub fn normal_pdf(x: f64) -> f64 {
 /// polynomial surrogate surface.
 #[inline]
 pub fn normal_cdf(x: f64) -> f64 {
-    0.5 * statrs::function::erf::erfc(-x / std::f64::consts::SQRT_2)
+    0.5 * erfc(-x / std::f64::consts::SQRT_2)
 }
 
 /// Scaled complementary error function `erfcx(x) = exp(x²) · erfc(x)`,
@@ -619,7 +620,7 @@ mod tests {
 
     #[test]
     fn erfcx_small_positive_matches_direct() {
-        use statrs::function::erf::erfc;
+        use libm::erfc;
         for &x in &[0.1_f64, 0.5, 1.0, 5.0, 10.0, 25.0] {
             let got = erfcx_nonnegative(x);
             let expected = (x * x).exp() * erfc(x);
@@ -666,6 +667,41 @@ mod tests {
     fn erfcx_preserves_representable_subnormal_tail() {
         let tail = erfcx_nonnegative(f64::MAX);
         assert!(tail > 0.0 && tail.is_subnormal(), "erfcx(MAX)={tail:e}");
+    }
+
+    /// Absolute-accuracy pin against an EXTERNAL high-precision reference
+    /// (mpmath, dps=60) spanning the direct branch `[0.1, 26)`. This is the
+    /// root-cause guard: the previous `exp(x²)·erfc(x)` direct form was built on
+    /// `statrs::erfc`, whose ~1e-10 relative accuracy silently poisoned every
+    /// downstream probit / Mills / log-CDF derivative. The `1e-13` tolerance is
+    /// far below what any ~1e-10 `erfc` can meet, so a regression to a
+    /// low-accuracy complementary error function fails here immediately —
+    /// independent of the seam-continuity check above.
+    #[test]
+    fn erfcx_matches_high_precision_reference() {
+        // (x, mpmath exp(x²)·erfc(x) at dps=60, rounded to f64).
+        let refs: &[(f64, f64)] = &[
+            (0.1, 0.89645697996912664),
+            (0.5, 0.61569034419292587),
+            (1.0, 0.427583576155807),
+            (2.0, 0.25539567631050574),
+            (3.5, 0.1552936556088943),
+            (6.0, 0.092776567800538354),
+            (9.0, 0.062307724037774684),
+            (13.0, 0.043271921864609693),
+            (18.0, 0.03129571781590521),
+            (22.0, 0.025618570005879453),
+            (25.5, 0.022108108052519827),
+            (25.9999, 0.021683668126370212),
+        ];
+        for &(x, reference) in refs {
+            let got = erfcx_nonnegative(x);
+            let rel = (got - reference).abs() / reference.abs();
+            assert!(
+                rel < 1.0e-13,
+                "erfcx({x}) = {got:.17e}, reference {reference:.17e}, rel {rel:.3e} >= 1e-13"
+            );
+        }
     }
 
     // ── log1mexp_positive ─────────────────────────────────────────────────────
@@ -979,6 +1015,96 @@ mod tests {
                 assert!(
                     relative < 2.0e-5,
                     "x={x}, order={order}: fd={finite_difference:e}, expected={expected:e}, rel={relative:e}"
+                );
+            }
+        }
+    }
+
+    /// Absolute-accuracy pin of the full `ln Φ(x)` derivative tower against an
+    /// EXTERNAL high-precision reference (mpmath, dps=60), covering all three
+    /// branches (continued-fraction left tail at x=−4, the moderate Mills
+    /// recurrence for x∈(−4, 8), and both signs). Before the `erfc` root-cause
+    /// fix the moderate branch's `λ = φ/Φ` inherited `statrs::erfc`'s ~1e-10
+    /// error, so `f''` was wrong by ~1e-9 near the −4 seam; this pins every
+    /// entry to `2e-11` relative, catching that regression head-on rather than
+    /// through a seam-straddling finite difference.
+    #[test]
+    fn normal_logcdf_derivative_tower_matches_high_precision_reference() {
+        // (x, [value, f', f'', f''', f''''] from mpmath at dps=60).
+        let refs: &[(f64, [f64; 5])] = &[
+            (
+                -4.0,
+                [
+                    -10.360101486527291,
+                    4.2256071444894711,
+                    -0.95332716160257737,
+                    0.017856339307658426,
+                    0.0095065764315958691,
+                ],
+            ),
+            (
+                -2.0,
+                [
+                    -3.7831843336820319,
+                    2.3732155328228409,
+                    -0.88572089958591874,
+                    0.059355861291565813,
+                    0.039421993865946813,
+                ],
+            ),
+            (
+                -1.0,
+                [
+                    -1.8410216450092635,
+                    1.5251352761609812,
+                    -0.80090233442965121,
+                    0.11693119540604883,
+                    0.07917498368074563,
+                ],
+            ),
+            (
+                -0.3,
+                [
+                    -0.96210281816885066,
+                    0.99816596885848332,
+                    -0.69688551072964971,
+                    0.18398317992442132,
+                    0.11037564722092704,
+                ],
+            ),
+            (
+                0.5,
+                [
+                    -0.36894641528865639,
+                    0.50916043383703349,
+                    -0.5138245643036329,
+                    0.27099012446870783,
+                    0.088167801929197554,
+                ],
+            ),
+            (
+                2.0,
+                [
+                    -0.023012909328963488,
+                    0.055247862678989959,
+                    -0.11354805168857645,
+                    0.18439481503247759,
+                    -0.18785468561160969,
+                ],
+            ),
+        ];
+        // The moderate-branch statrs regression produced ~1e-9 errors in f'';
+        // 1e-10 catches that head-on while respecting the deep-left-tail
+        // continued-fraction branch's inherent ~2e-11 accuracy in f'''' (its
+        // 32-level derivative propagation, not the `erfc` path this pins).
+        for &(x, reference) in refs {
+            let got = normal_logcdf_derivatives(x);
+            for (order, (&g, &r)) in got.iter().zip(reference.iter()).enumerate() {
+                let rel = (g - r).abs() / r.abs().max(1.0e-3);
+                assert!(
+                    rel < 1.0e-10,
+                    "normal_logcdf_derivatives({x})[{order}] = {g:.17e}, reference {r:.17e}, \
+                     rel {rel:.3e} >= 1e-10"
                 );
             }
         }
