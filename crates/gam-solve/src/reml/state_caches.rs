@@ -1575,12 +1575,14 @@ pub(crate) const MIN_IMPORTANCE_ESS_FRACTION: f64 = 0.10;
 /// (exactly quadratic) curvature cancels and the remainder reduces to a
 /// family-uniform expression in the deviance plus the explicit penalty score:
 ///
-///   ΔF(t) = (1/2φ)[D(μ(η̂ + Xδ)) − D(μ(η̂))]   (= −[ℓ(β̂+δ) − ℓ(β̂)])
+///   ΔF(t) = [D(η̂ + Xδ) − D(η̂)]/(2φ)          (= −[ℓ(β̂+δ) − ℓ(β̂)])
 ///           + (S β̂)·δ                          (penalty-score channel)
 ///           − ½ Σ_i W_i (Xδ)_i².               (likelihood-curvature subtraction)
 ///
-/// `D` is the family deviance (`calculate_deviance`), so this works uniformly
-/// across every GLM family/link without per-family score code. The only place
+/// `D/2` and its η-score come from one fallible family row oracle; `φ = 1` for
+/// families whose reported deviance already carries the likelihood scale
+/// (including fixed-scale Gaussian and Beta), and is the EDM dispersion for
+/// unscaled Gamma/Tweedie deviance. The only place
 /// ρ appears *explicitly* (with δ held fixed in coefficient space) is the
 /// penalty-score term, giving the exact explicit ρ-gradient
 ///   ∂ΔF/∂ρ_k = λ_k (S_k β̂)·δ.
@@ -1603,7 +1605,7 @@ pub(crate) struct Gam784BlockTarget<'t> {
     /// Family/link spec for the deviance and the inverse link.
     pub(crate) likelihood: GlmLikelihoodSpec,
     pub(crate) inverse_link: InverseLink,
-    /// Dispersion φ used to scale the deviance into a log-likelihood.
+    /// Divisor converting reported half-deviance to negative log-likelihood.
     pub(crate) phi: f64,
     /// Penalty scores `S_k β̂` per canonical penalty (unscaled by λ_k).
     /// Shared from the eval bundle's once-per-inner-solution cache
@@ -1624,56 +1626,58 @@ impl Gam784BlockTarget<'_> {
         (delta, s)
     }
 
-    /// Per-row score `∂(D(η)/2φ)/∂η` at the given linear predictor.
-    ///
-    /// Mirrors `calculate_deviance`'s per-family μ-floors so this is the
-    /// exact η-derivative of the SAME deviance the value channel sums:
-    /// `dD_i/dμ = −2·w_i·(y_i − μ_i)/V(μ_i) · s_fam` (the exponential-family
-    /// unit-deviance identity, exact for Binomial/Poisson/Gamma/NB/Tweedie/
-    /// Gaussian — the families `block_local_sampled_correction` admits),
-    /// `s_fam` being the internal dispersion division the Gaussian and
-    /// Tweedie branches of `calculate_deviance` apply. The trailing `/(2φ)`
-    /// matches the excess definition `[D_disp − D_base]/(2φ)`.
-    ///
-    /// Rows whose inverse-link jet is infeasible return 0: the value channel
-    /// scores such draws as `ΔF = ∞` (zero importance weight), so their score
-    /// is never consumed.
-    pub(crate) fn neg_score_at(&self, eta: &Array1<f64>) -> Array1<f64> {
-        let spec_response = reml_spec(&self.likelihood).response.clone();
-        let family = pirls::weight_family_for_glm_likelihood(&self.likelihood);
-        let fam_scale = match &spec_response {
-            ResponseFamily::Gaussian | ResponseFamily::Tweedie { .. } => {
-                1.0 / self.likelihood.fixed_phi().unwrap_or(1.0)
-            }
-            _ => 1.0,
-        };
-        // Same floors as `calculate_deviance`: binomial clamps μ to
-        // [1e-12, 1−1e-12]; the remaining families floor μ at 1e-10.
-        const BINOMIAL_MU_EPS: f64 = 1e-12;
-        const MU_FLOOR: f64 = 1e-10;
-        let is_binomial = matches!(spec_response, ResponseFamily::Binomial);
-        let mut out = Array1::<f64>::zeros(eta.len());
-        for i in 0..eta.len() {
-            let jet = match crate::mixture_link::inverse_link_jet_for_inverse_link(
-                &self.inverse_link,
-                eta[i],
-            ) {
-                Ok(jet) => jet,
-                Err(_) => continue,
-            };
-            let mu_c = if is_binomial {
-                jet.mu.clamp(BINOMIAL_MU_EPS, 1.0 - BINOMIAL_MU_EPS)
-            } else {
-                jet.mu.max(MU_FLOOR)
-            };
-            let v = pirls::variance_jet_for_weight_family(family, mu_c).v;
-            if !(v.is_finite() && v > 0.0) {
-                continue;
-            }
-            let d_dev_d_mu = -2.0 * self.prior_weights[i] * (self.y[i] - mu_c) / v * fam_scale;
-            out[i] = d_dev_d_mu * jet.d1 / (2.0 * self.phi);
+    /// Evaluate `D(eta)/(2 phi)` and its full per-row eta gradient atomically.
+    /// The row oracle owns both channels, including canonical logit tails and
+    /// log-coordinate Bregman algebra for every log-link family.  An invalid
+    /// row therefore invalidates the entire draw; no zero-score surrogate is
+    /// ever paired with a different objective value.
+    pub(crate) fn likelihood_surface_at(
+        &self,
+        eta: &Array1<f64>,
+    ) -> Result<(f64, Array1<f64>), EstimationError> {
+        if !(self.phi.is_finite() && self.phi > 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "#784 likelihood scale must be finite and positive; got {}",
+                self.phi
+            )));
         }
-        out
+        let rows = crate::pirls::deviance_eta_rows(
+            self.y.view(),
+            eta,
+            &self.likelihood,
+            &self.inverse_link,
+            self.prior_weights.view(),
+        )?;
+        let half_deviance = gam_linalg::pairwise_reduce::par_pairwise_sum(rows.len(), |i| {
+            rows[i].half_deviance
+        });
+        let scaled_half_deviance = half_deviance / self.phi;
+        if !scaled_half_deviance.is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "#784 scaled half-deviance is not representable: {scaled_half_deviance}"
+            )));
+        }
+        let mut score = Array1::<f64>::zeros(rows.len());
+        for (i, row) in rows.into_iter().enumerate() {
+            let value = row.eta_score / self.phi;
+            if !value.is_finite() {
+                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "scaled deviance eta score",
+                    eta: eta[i],
+                    value,
+                });
+            }
+            score[i] = value;
+        }
+        Ok((scaled_half_deviance, score))
+    }
+
+    pub(crate) fn neg_score_at(
+        &self,
+        eta: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        self.likelihood_surface_at(eta).map(|(_, score)| score)
     }
 }
 
@@ -1692,27 +1696,12 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
 
     fn excess(&self, t: &Array1<f64>) -> f64 {
         let (delta, s) = self.displacement(t);
-        // Displaced mean μ(η̂ + s) via the inverse-link jet (family-uniform).
-        let mut mu_disp = Array1::<f64>::zeros(self.eta_hat.len());
-        for i in 0..self.eta_hat.len() {
-            let eta_i = self.eta_hat[i] + s[i];
-            match crate::mixture_link::inverse_link_jet_for_inverse_link(&self.inverse_link, eta_i)
-            {
-                Ok(jet) => mu_disp[i] = jet.mu,
-                Err(_) => return f64::INFINITY,
-            }
-        }
-        let dev_disp = crate::pirls::calculate_deviance(
-            self.y.view(),
-            &mu_disp,
-            &self.likelihood,
-            self.prior_weights.view(),
-        );
-        if !dev_disp.is_finite() {
+        let eta_disp = &self.eta_hat + &s;
+        let Ok((scaled_half_deviance, _score)) = self.likelihood_surface_at(&eta_disp) else {
             return f64::INFINITY;
-        }
-        // −[ℓ(β̂+δ) − ℓ(β̂)] = (1/2φ)[D_disp − D_base].
-        let neg_loglik_diff = (dev_disp - self.base_deviance) / (2.0 * self.phi);
+        };
+        // −[ℓ(β̂+δ) − ℓ(β̂)] = [D_disp − D_base]/(2φ).
+        let neg_loglik_diff = scaled_half_deviance - self.base_deviance / (2.0 * self.phi);
         // Penalty-score channel (S β̂)·δ = Σ_k λ_k (S_k β̂)·δ.
         let mut penalty_term = 0.0_f64;
         for (score, &lam) in self.penalty_scores.iter().zip(self.lambdas.iter()) {
@@ -1744,77 +1733,27 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
         grad
     }
 
-    fn displaced_neg_score(&self, t: &Array1<f64>) -> Array1<f64> {
+    fn displaced_neg_score(&self, t: &Array1<f64>) -> Result<Array1<f64>, String> {
         let (_delta, s) = self.displacement(t);
         self.neg_score_at(&(&self.eta_hat + &s))
+            .map_err(|error| error.to_string())
     }
 
-    fn base_neg_score(&self) -> Array1<f64> {
+    fn base_neg_score(&self) -> Result<Array1<f64>, String> {
         self.neg_score_at(&self.eta_hat)
+            .map_err(|error| error.to_string())
     }
 
-    /// Fused excess + displaced score sharing ONE design matvec `s = X_t δ` and
-    /// ONE inverse-link jet sweep at `η̂ + s`. The jet yields both `μ` (the
-    /// deviance/excess channel) and `d1 = dμ/dη` (the score channel), so the
-    /// per-draw O(n·p) matvec and O(n) jet evaluation — previously paid twice
-    /// (once in `excess`, once in `displaced_neg_score`) — are paid once. The
-    /// summed value is bit-identical to the separate calls: `excess` reads
-    /// `jet.mu` and `displaced_neg_score` reads the SAME jet's `d1`/`mu` floors,
-    /// which this method reproduces exactly (#784, #1082).
+    /// Fused excess + displaced score sharing one design matvec `s = X_t δ`
+    /// and one atomic row-oracle sweep at `η̂ + s`. Each row's value and score
+    /// are evaluated together on the same unprojected surface (#784, #1082).
     fn excess_with_displaced_neg_score(&self, t: &Array1<f64>) -> (f64, Option<Array1<f64>>) {
         let (delta, s) = self.displacement(t);
-        let n = self.eta_hat.len();
-
-        // Family constants mirrored from `neg_score_at` / `calculate_deviance`.
-        let spec_response = reml_spec(&self.likelihood).response.clone();
-        let family = pirls::weight_family_for_glm_likelihood(&self.likelihood);
-        let fam_scale = match &spec_response {
-            ResponseFamily::Gaussian | ResponseFamily::Tweedie { .. } => {
-                1.0 / self.likelihood.fixed_phi().unwrap_or(1.0)
-            }
-            _ => 1.0,
-        };
-        const BINOMIAL_MU_EPS: f64 = 1e-12;
-        const MU_FLOOR: f64 = 1e-10;
-        let is_binomial = matches!(spec_response, ResponseFamily::Binomial);
-
-        // One jet sweep: collect μ (unclamped, for the deviance — matching
-        // `excess`) and the per-row score (clamped μ, for `displaced_neg_score`).
-        let mut mu_disp = Array1::<f64>::zeros(n);
-        let mut ngs = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let eta_i = self.eta_hat[i] + s[i];
-            let jet = match crate::mixture_link::inverse_link_jet_for_inverse_link(
-                &self.inverse_link,
-                eta_i,
-            ) {
-                Ok(jet) => jet,
-                // `excess` returns +∞ on an infeasible inverse-link jet.
-                Err(_) => return (f64::INFINITY, None),
-            };
-            mu_disp[i] = jet.mu;
-            let mu_c = if is_binomial {
-                jet.mu.clamp(BINOMIAL_MU_EPS, 1.0 - BINOMIAL_MU_EPS)
-            } else {
-                jet.mu.max(MU_FLOOR)
-            };
-            let v = pirls::variance_jet_for_weight_family(family, mu_c).v;
-            if v.is_finite() && v > 0.0 {
-                let d_dev_d_mu = -2.0 * self.prior_weights[i] * (self.y[i] - mu_c) / v * fam_scale;
-                ngs[i] = d_dev_d_mu * jet.d1 / (2.0 * self.phi);
-            }
-        }
-
-        let dev_disp = crate::pirls::calculate_deviance(
-            self.y.view(),
-            &mu_disp,
-            &self.likelihood,
-            self.prior_weights.view(),
-        );
-        if !dev_disp.is_finite() {
+        let eta_disp = &self.eta_hat + &s;
+        let Ok((scaled_half_deviance, ngs)) = self.likelihood_surface_at(&eta_disp) else {
             return (f64::INFINITY, None);
-        }
-        let neg_loglik_diff = (dev_disp - self.base_deviance) / (2.0 * self.phi);
+        };
+        let neg_loglik_diff = scaled_half_deviance - self.base_deviance / (2.0 * self.phi);
         let mut penalty_term = 0.0_f64;
         for (score, &lam) in self.penalty_scores.iter().zip(self.lambdas.iter()) {
             penalty_term += lam * score.dot(&delta);
@@ -1871,64 +1810,19 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
         // replacing `n_draws` separate `fast_av(x_transformed, δ_s)` calls.
         let s_all = gam_linalg::faer_ndarray::fast_ab(self.x_transformed, &delta_all);
 
-        // Family constants mirrored from `excess_with_displaced_neg_score`.
-        let spec_response = reml_spec(&self.likelihood).response.clone();
-        let family = pirls::weight_family_for_glm_likelihood(&self.likelihood);
-        let fam_scale = match &spec_response {
-            ResponseFamily::Gaussian | ResponseFamily::Tweedie { .. } => {
-                1.0 / self.likelihood.fixed_phi().unwrap_or(1.0)
-            }
-            _ => 1.0,
-        };
-        const BINOMIAL_MU_EPS: f64 = 1e-12;
-        const MU_FLOOR: f64 = 1e-10;
-        let is_binomial = matches!(spec_response, ResponseFamily::Binomial);
-
         let mut out = Vec::with_capacity(n_draws);
-        let mut mu_disp = Array1::<f64>::zeros(n);
-        let mut ngs = Array1::<f64>::zeros(n);
         let mut delta = Array1::<f64>::zeros(self.block_vecs.nrows());
-        'draw: for sidx in 0..n_draws {
+        for sidx in 0..n_draws {
             let s_col = s_all.column(sidx);
-            ngs.fill(0.0);
-            // One jet sweep at η̂ + s, identical to the serial fused path.
+            let mut eta_disp = self.eta_hat.clone();
             for i in 0..n {
-                let eta_i = self.eta_hat[i] + s_col[i];
-                let jet = match crate::mixture_link::inverse_link_jet_for_inverse_link(
-                    &self.inverse_link,
-                    eta_i,
-                ) {
-                    Ok(jet) => jet,
-                    Err(_) => {
-                        out.push((f64::INFINITY, None));
-                        continue 'draw;
-                    }
-                };
-                mu_disp[i] = jet.mu;
-                let mu_c = if is_binomial {
-                    jet.mu.clamp(BINOMIAL_MU_EPS, 1.0 - BINOMIAL_MU_EPS)
-                } else {
-                    jet.mu.max(MU_FLOOR)
-                };
-                let v = pirls::variance_jet_for_weight_family(family, mu_c).v;
-                if v.is_finite() && v > 0.0 {
-                    let d_dev_d_mu =
-                        -2.0 * self.prior_weights[i] * (self.y[i] - mu_c) / v * fam_scale;
-                    ngs[i] = d_dev_d_mu * jet.d1 / (2.0 * self.phi);
-                }
+                eta_disp[i] += s_col[i];
             }
-
-            let dev_disp = crate::pirls::calculate_deviance(
-                self.y.view(),
-                &mu_disp,
-                &self.likelihood,
-                self.prior_weights.view(),
-            );
-            if !dev_disp.is_finite() {
+            let Ok((scaled_half_deviance, ngs)) = self.likelihood_surface_at(&eta_disp) else {
                 out.push((f64::INFINITY, None));
                 continue;
-            }
-            let neg_loglik_diff = (dev_disp - self.base_deviance) / (2.0 * self.phi);
+            };
+            let neg_loglik_diff = scaled_half_deviance - self.base_deviance / (2.0 * self.phi);
             delta.assign(&delta_all.column(sidx));
             let mut penalty_term = 0.0_f64;
             for (score, &lam) in self.penalty_scores.iter().zip(self.lambdas.iter()) {
@@ -1940,7 +1834,7 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
             }
             let excess = neg_loglik_diff + penalty_term - 0.5 * curv;
             if excess.is_finite() {
-                out.push((excess, Some(ngs.clone())));
+                out.push((excess, Some(ngs)));
             } else {
                 out.push((excess, None));
             }

@@ -267,7 +267,7 @@ pub(crate) trait WorkingLikelihood {
         &self,
         y: ArrayView1<f64>,
         eta: &Array1<f64>,
-        mu: &Array1<f64>,
+        _mu: &Array1<f64>,
         inverse_link: &InverseLink,
         priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError>;
@@ -423,13 +423,13 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
         &self,
         y: ArrayView1<f64>,
         eta: &Array1<f64>,
-        mu: &Array1<f64>,
+        _mu: &Array1<f64>,
         inverse_link: &InverseLink,
         priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError> {
         if matches!(self.spec.response, ResponseFamily::Tweedie { .. }) {
             validate_tweedie_responses(&y, &priorweights)?;
         }
-        calculate_deviance_from_eta(y, eta, mu, self, inverse_link, priorweights)
+        calculate_deviance_from_eta(y, eta, self, inverse_link, priorweights)
     }
 }

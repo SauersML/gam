@@ -1918,6 +1918,11 @@ fn gaussian_reml_fit_latent_backward<'py>(
     let t_view = t.as_array();
     let y_view = y.as_array();
     let penalty_view = penalty.as_array();
+    let dim_selection_precision = dim_selection_log_precision
+        .as_ref()
+        .map(|values| ValidatedDimSelectionPrecisions::new(values.as_array(), latent_dim))
+        .transpose()
+        .map_err(py_value_error)?;
     let effective_weights = latent_scalar_weights_with_fisher(
         n_obs,
         weights.as_ref().map(|w| w.as_array()),
@@ -2030,38 +2035,21 @@ fn gaussian_reml_fit_latent_backward<'py>(
                 * (0.5 * stats.strength.mu * stats.residual_sq - 0.5 * (n_obs * latent_dim) as f64),
         );
     }
-    if let Some(log_prec) = dim_selection_log_precision.as_ref() {
-        let lp = log_prec.as_array();
-        if lp.len() != latent_dim {
-            return Err(py_value_error(format!(
-                "dim_selection_log_precision length {} must equal latent_dim {}",
-                lp.len(),
-                latent_dim
-            )));
-        }
+    if let Some(precisions) = dim_selection_precision.as_ref() {
         let mut grad_log_prec = Array1::<f64>::zeros(latent_dim);
         for n in 0..n_obs {
             for a in 0..latent_dim {
-                let prec = lp[a].exp();
+                let prec = precisions.physical[a];
                 if grad_reml_score != 0.0 {
                     grad_t[n * latent_dim + a] += grad_reml_score * prec * t_mat[[n, a]];
                 }
             }
         }
         for a in 0..latent_dim {
-            let log_alpha = lp[a];
-            let prec = log_alpha.exp();
-            if !(prec.is_finite() && prec > 0.0) {
-                return Err(py_value_error(format!(
-                    "dim_selection_log_precision[{a}] must exponentiate to a finite positive precision"
-                )));
-            }
-            let mut sq = 0.0_f64;
-            for n in 0..n_obs {
-                let v = t_mat[[n, a]];
-                sq += v * v;
-            }
-            grad_log_prec[a] = grad_reml_score * (0.5 * prec * sq - 0.5 * (n_obs as f64));
+            let energy = precisions
+                .axis_energy(t_mat.view(), a)
+                .map_err(py_value_error)?;
+            grad_log_prec[a] = grad_reml_score * (energy - 0.5 * n_obs as f64);
         }
         grad_dim_selection_log_precision = Some(grad_log_prec);
     }
@@ -2102,7 +2090,7 @@ struct LatentOuterProblem {
     penalty: Array2<f64>,
     weights: Option<Array1<f64>>,
     aux_u: Option<Array2<f64>>,
-    dim_selection: Option<Array1<f64>>,
+    dim_selection: Option<ValidatedDimSelectionPrecisions>,
     family: AuxPriorFamily,
     aux_strength: Option<f64>,
     init_lambda: Option<f64>,
@@ -2174,7 +2162,7 @@ impl LatentOuterProblem {
             self.aux_u.as_ref().map(|a| a.view()),
             self.family,
             self.aux_strength,
-            self.dim_selection.as_ref().map(|a| a.view()),
+            self.dim_selection.as_ref(),
         )?;
         let value = fit.reml_score + prior_score;
         if !value.is_finite() {
@@ -2211,10 +2199,10 @@ impl LatentOuterProblem {
                 }
             }
         }
-        if let Some(log_prec) = self.dim_selection.as_ref() {
+        if let Some(precisions) = self.dim_selection.as_ref() {
             for n in 0..self.n_obs {
                 for a in 0..self.latent_dim {
-                    let prec = log_prec[a].exp();
+                    let prec = precisions.physical[a];
                     grad_t[n * self.latent_dim + a] += prec * t_mat[[n, a]];
                 }
             }

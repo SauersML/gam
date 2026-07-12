@@ -297,12 +297,12 @@ impl SymmetricMatrix {
 /// Callers in PIRLS should select `_signed` for observed-Hessian / Newton
 /// curvature assembly and `_psd` for Fisher-scoring updates where the working
 /// weights are guaranteed nonneg. The sign character is now encoded in the
-/// argument types: `xt_diag_x_signed` takes a `SignedWeightsView<'_>` (free
-/// construction), and `xt_diag_x_psd` takes a `PsdWeightsView<'_>` (one-time
-/// `try_new` scan at the call site).
+/// argument types: `xt_diag_x_signed` takes a `FiniteSignedWeightsView<'_>` and
+/// `xt_diag_x_psd` takes a `PsdWeightsView<'_>`; both perform a deterministic
+/// one-time certificate at their construction site.
 pub fn xt_diag_x_signed(
     design: &DesignMatrix,
-    diag: SignedWeightsView<'_>,
+    diag: FiniteSignedWeightsView<'_>,
 ) -> Result<SymmetricMatrix, String> {
     xt_diag_x_symmetric(design, &diag.view().to_owned())
 }

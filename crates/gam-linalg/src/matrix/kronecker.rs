@@ -656,7 +656,7 @@ impl LinearOperator for RowwiseKroneckerOperator {
                     .and(&time_t2)
                     .for_each(|g, &w, &a, &b| *g = w * a * b);
                 self.cov
-                    .xt_diag_x_signed_op(SignedWeightsView::from_array(&gamma))
+                    .xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(&gamma)?)
                     .map(|block| (t1, t2, block))
             })
             .collect();

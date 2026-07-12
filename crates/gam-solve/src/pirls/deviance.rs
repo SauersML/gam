@@ -49,69 +49,743 @@ fn binomial_log_probabilities(
     }
 }
 
+/// One observation's exact deviance surface in linear-predictor coordinates.
+///
+/// `half_deviance` is `D_i / 2`; `eta_score` is its derivative with respect to
+/// the SAME `eta` used to evaluate the value.  Keeping the pair inseparable is
+/// important: the block-local REML correction consumes both and must never
+/// differentiate a projected/floored surrogate of the objective it sampled.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DevianceEtaRow {
+    pub(crate) half_deviance: f64,
+    pub(crate) eta_score: f64,
+}
+
+#[inline]
+fn deviance_row_error(
+    row: usize,
+    quantity: &'static str,
+    eta: f64,
+    value: f64,
+) -> EstimationError {
+    EstimationError::PirlsRowGeometryUnrepresentable {
+        row,
+        quantity,
+        eta,
+        value,
+    }
+}
+
+#[inline]
+fn finite_signed_from_log(
+    row: usize,
+    quantity: &'static str,
+    eta: f64,
+    sign: f64,
+    log_abs: f64,
+) -> Result<f64, EstimationError> {
+    if log_abs == f64::NEG_INFINITY || sign == 0.0 {
+        return Ok(0.0);
+    }
+    if !log_abs.is_finite() {
+        return Err(deviance_row_error(row, quantity, eta, log_abs));
+    }
+    let magnitude = log_abs.exp();
+    let value = sign * magnitude;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(deviance_row_error(row, quantity, eta, value))
+    }
+}
+
+#[inline]
+fn logaddexp(a: f64, b: f64) -> f64 {
+    let hi = a.max(b);
+    let lo = a.min(b);
+    if hi == f64::NEG_INFINITY {
+        f64::NEG_INFINITY
+    } else {
+        hi + (lo - hi).exp().ln_1p()
+    }
+}
+
+/// `(sign(exp(a) - exp(b)), log(abs(exp(a) - exp(b))))` without materializing
+/// either exponential.  The exact-zero case is represented as `(0, -inf)`.
+#[inline]
+fn signed_log_exp_difference(a: f64, b: f64) -> (f64, f64) {
+    if a == b {
+        (0.0, f64::NEG_INFINITY)
+    } else if a > b {
+        (1.0, a + (-(b - a).exp()).ln_1p())
+    } else {
+        (-1.0, b + (-(a - b).exp()).ln_1p())
+    }
+}
+
+#[inline]
+fn expm1_minus_x(x: f64) -> f64 {
+    if x.abs() > 0.5 {
+        return x.exp_m1() - x;
+    }
+    let mut term = 0.5 * x * x;
+    let mut sum = term;
+    let mut k = 2.0;
+    loop {
+        k += 1.0;
+        term *= x / k;
+        let next = sum + term;
+        if next == sum {
+            return next;
+        }
+        sum = next;
+    }
+}
+
+#[inline]
+fn log1p_minus_x(x: f64) -> f64 {
+    if x.abs() > 0.5 {
+        return x.ln_1p() - x;
+    }
+    let mut power = x * x;
+    let mut sign = -1.0;
+    let mut k = 2.0;
+    let mut sum = sign * power / k;
+    loop {
+        power *= x;
+        sign = -sign;
+        k += 1.0;
+        let next = sum + sign * power / k;
+        if next == sum {
+            return next;
+        }
+        sum = next;
+    }
+}
+
+/// `log|1-exp(x)|`, excluding the exact-zero point `x = 0`.
+#[inline]
+fn log_abs_one_minus_exp(x: f64) -> f64 {
+    if x > 0.0 {
+        x + (-( -x).exp()).ln_1p()
+    } else {
+        (-x.exp()).ln_1p()
+    }
+}
+
+/// `log(r log r - r + 1)` from `log(r)`.  This is the dimensionless
+/// Poisson Bregman deviance; its series removes the double cancellation at
+/// `r = 1`, while its two outer branches never form `r` when it is enormous.
+#[inline]
+fn log_poisson_ratio_deviance(log_r: f64) -> f64 {
+    if log_r == 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if log_r.abs() <= 0.5 {
+        let mut term = 0.5 * log_r * log_r;
+        let mut sum = term;
+        let mut k = 2.0;
+        loop {
+            let ratio = k / ((k + 1.0) * (k - 1.0));
+            term *= log_r * ratio;
+            let next = sum + term;
+            if next == sum {
+                return next.ln();
+            }
+            sum = next;
+            k += 1.0;
+        }
+    } else if log_r >= 1.0 {
+        log_r + ((log_r - 1.0) + (-log_r).exp()).ln()
+    } else if log_r > 0.0 {
+        log_r + ((-log_r).exp() - (1.0 - log_r)).ln()
+    } else {
+        (-(log_r.exp() * (1.0 - log_r))).ln_1p()
+    }
+}
+
+/// `log(r - 1 - log r)` from `log r` (Gamma unit deviance).
+#[inline]
+fn log_gamma_ratio_deviance(log_r: f64) -> f64 {
+    if log_r == 0.0 {
+        f64::NEG_INFINITY
+    } else if log_r.abs() <= 0.5 {
+        expm1_minus_x(log_r).ln()
+    } else if log_r > 0.0 {
+        log_r + (1.0 - (1.0 + log_r) * (-log_r).exp()).ln()
+    } else {
+        ((-1.0 - log_r) + log_r.exp()).ln()
+    }
+}
+
+/// `log f_p(r)` for the Tweedie unit deviance
+/// `d(y,mu) = mu^(2-p) f_p(y/mu)`.  Near one, a binomial series retains the
+/// quadratic limit.  Away from one, a signed log-sum-exp keeps all three power
+/// terms scaled even when `y/mu` is outside the f64 exponential range.
+#[inline]
+fn log_tweedie_ratio_deviance(log_r: f64, p: f64) -> f64 {
+    let q = 2.0 - p;
+    if log_r == f64::NEG_INFINITY {
+        return -q.ln();
+    }
+    if log_r == 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if log_r.abs() <= 0.25 {
+        let u = log_r.exp_m1();
+        let mut term = 0.5 * u * u;
+        let mut sum = term;
+        let mut k = 2.0;
+        loop {
+            term *= u * (q - k) / (k + 1.0);
+            let next = sum + term;
+            if next == sum {
+                return next.ln();
+            }
+            sum = next;
+            k += 1.0;
+        }
+    }
+    let log_b = log_r - (p - 1.0).ln();
+    let log_c = -q.ln();
+    let log_a = q * log_r - ((p - 1.0) * q).ln();
+    let scale = log_b.max(log_c).max(log_a);
+    let normalized = (log_b - scale).exp() + (log_c - scale).exp() - (log_a - scale).exp();
+    scale + normalized.ln()
+}
+
+#[inline]
+fn logistic(x: f64) -> f64 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
+
+/// Bernoulli KL in natural coordinates: `KL(sigmoid(a) || sigmoid(b))`.
+/// The local identity uses only second-order remainders; the tail branches
+/// orient the event so the reference probability never rounds to one.
+#[inline]
+fn bernoulli_kl_from_logits(a: f64, b: f64) -> f64 {
+    if a == b {
+        return 0.0;
+    }
+    let h = b - a;
+    if h.abs() <= 0.5 {
+        // Orient toward the rarer reference event.  Without this swap a large
+        // positive `a` rounds `sigmoid(a)` to one and erases a representable
+        // right-tail KL channel.
+        let (p, local_h) = if a <= 0.0 {
+            (logistic(a), h)
+        } else {
+            (logistic(-a), -h)
+        };
+        let em1 = local_h.exp_m1();
+        let x = p * em1;
+        return log1p_minus_x(x) + p * expm1_minus_x(local_h);
+    }
+    if a <= 0.0 {
+        let p = logistic(a);
+        p * (a - b) + softplus(b) - softplus(a)
+    } else {
+        let q = logistic(-a);
+        q * (b - a) + softplus(-b) - softplus(-a)
+    }
+}
+
+#[inline]
+fn logit_probability_pair(eta: f64) -> (f64, f64) {
+    if eta >= 0.0 {
+        let tail = (-eta).exp();
+        let one_minus_mu = tail / (1.0 + tail);
+        (1.0 - one_minus_mu, one_minus_mu)
+    } else {
+        let tail = eta.exp();
+        let mu = tail / (1.0 + tail);
+        (mu, 1.0 - mu)
+    }
+}
+
+/// Accurate `x log(x/m) + m - x` for finite `x >= 0`, `m > 0` when the
+/// represented means are available.  This is used for the two Bernoulli KL
+/// cells, where the complementary logit probability is retained explicitly.
+#[inline]
+fn bd0(x: f64, m: f64) -> f64 {
+    if x == 0.0 {
+        return m;
+    }
+    if x == m {
+        return 0.0;
+    }
+    let hi = x.max(m);
+    let lo = x.min(m);
+    let relative_gap = (x - m).abs() / hi;
+    if relative_gap < 0.2 {
+        let v = ((x - m) / hi) / (1.0 + lo / hi);
+        let mut sum = (x - m) * v;
+        let mut ej = 2.0 * (x * v);
+        let v2 = v * v;
+        let mut denominator = 3.0;
+        loop {
+            ej *= v2;
+            let next = sum + ej / denominator;
+            if next == sum {
+                return next;
+            }
+            sum = next;
+            denominator += 2.0;
+        }
+    }
+    x * (x.ln() - m.ln()) + (m - x)
+}
+
+#[inline]
+fn beta_scaled_digamma(c: f64, shape: f64, reciprocal_term: f64) -> f64 {
+    if shape < 1.0 {
+        c * digamma(shape + 1.0) - reciprocal_term
+    } else {
+        c * digamma(shape)
+    }
+}
+
+/// Fallible, atomic row oracle shared by PIRLS deviance evaluation and the
+/// nonlinear REML state cache.  Non-binomial legal likelihood cells are
+/// identity/log/logit canonical, so the log-link branches can use `eta`
+/// directly and avoid every false `y / exp(eta)` intermediate overflow.
+pub(crate) fn deviance_eta_row(
+    row: usize,
+    y: f64,
+    eta: f64,
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    prior_weight: f64,
+) -> Result<DevianceEtaRow, EstimationError> {
+    if !(prior_weight.is_finite() && prior_weight >= 0.0) {
+        return Err(deviance_row_error(
+            row,
+            "prior weight",
+            eta,
+            prior_weight,
+        ));
+    }
+    let jet = crate::mixture_link::inverse_link_mu_d1_for_inverse_link(inverse_link, eta)
+        .map_err(|_| deviance_row_error(row, "inverse-link value/derivative", eta, eta))?;
+    if !(jet.0.is_finite() && jet.1.is_finite()) {
+        return Err(deviance_row_error(
+            row,
+            "inverse-link value/derivative",
+            eta,
+            jet.0,
+        ));
+    }
+    if prior_weight == 0.0 {
+        return Ok(DevianceEtaRow {
+            half_deviance: 0.0,
+            eta_score: 0.0,
+        });
+    }
+    let log_weight = prior_weight.ln();
+    let (half_deviance, eta_score) = match &likelihood.spec.response {
+        ResponseFamily::Gaussian => {
+            if !y.is_finite() {
+                return Err(deviance_row_error(row, "Gaussian response", eta, y));
+            }
+            let phi = likelihood.fixed_phi().unwrap_or(1.0);
+            if !(phi.is_finite() && phi > 0.0) {
+                return Err(deviance_row_error(row, "Gaussian dispersion", eta, phi));
+            }
+            let residual = y - jet.0;
+            if !residual.is_finite() {
+                return Err(deviance_row_error(
+                    row,
+                    "Gaussian residual",
+                    eta,
+                    residual,
+                ));
+            }
+            let half = if residual == 0.0 {
+                0.0
+            } else {
+                finite_signed_from_log(
+                    row,
+                    "Gaussian half-deviance",
+                    eta,
+                    1.0,
+                    log_weight + 2.0 * residual.abs().ln() - phi.ln() - std::f64::consts::LN_2,
+                )?
+            };
+            let score = if residual == 0.0 || jet.1 == 0.0 {
+                0.0
+            } else {
+                finite_signed_from_log(
+                    row,
+                    "Gaussian eta score",
+                    eta,
+                    -residual.signum() * jet.1.signum(),
+                    log_weight + residual.abs().ln() + jet.1.abs().ln() - phi.ln(),
+                )?
+            };
+            (half, score)
+        }
+        ResponseFamily::Poisson => {
+            if !valid_count_response(y) {
+                return Err(deviance_row_error(row, "Poisson response", eta, y));
+            }
+            let log_r = if y == 0.0 {
+                f64::NEG_INFINITY
+            } else {
+                y.ln() - eta
+            };
+            let log_half = if y == 0.0 {
+                log_weight + eta
+            } else {
+                log_weight + eta + log_poisson_ratio_deviance(log_r)
+            };
+            let half = finite_signed_from_log(
+                row,
+                "Poisson half-deviance",
+                eta,
+                1.0,
+                log_half,
+            )?;
+            let (score_sign, score_log_abs) = if y == 0.0 {
+                (1.0, eta)
+            } else {
+                signed_log_exp_difference(eta, y.ln())
+            };
+            let score = finite_signed_from_log(
+                row,
+                "Poisson eta score",
+                eta,
+                score_sign,
+                log_weight + score_log_abs,
+            )?;
+            (half, score)
+        }
+        ResponseFamily::Gamma => {
+            if !(y.is_finite() && y > 0.0) {
+                return Err(deviance_row_error(row, "Gamma response", eta, y));
+            }
+            let log_r = y.ln() - eta;
+            let half = finite_signed_from_log(
+                row,
+                "Gamma half-deviance",
+                eta,
+                1.0,
+                log_weight + log_gamma_ratio_deviance(log_r),
+            )?;
+            let score_sign = if log_r > 0.0 { -1.0 } else { 1.0 };
+            let score = finite_signed_from_log(
+                row,
+                "Gamma eta score",
+                eta,
+                score_sign,
+                log_weight + log_abs_one_minus_exp(log_r),
+            )?;
+            (half, score)
+        }
+        ResponseFamily::Tweedie { p } => {
+            if !is_valid_tweedie_power(*p) {
+                return Err(deviance_row_error(row, "Tweedie power", eta, *p));
+            }
+            if !valid_tweedie_response(y) {
+                return Err(deviance_row_error(row, "Tweedie response", eta, y));
+            }
+            let log_r = if y == 0.0 {
+                f64::NEG_INFINITY
+            } else {
+                y.ln() - eta
+            };
+            let q = 2.0 - *p;
+            let half = finite_signed_from_log(
+                row,
+                "Tweedie half-deviance",
+                eta,
+                1.0,
+                log_weight + q * eta + log_tweedie_ratio_deviance(log_r, *p),
+            )?;
+            let (score_sign, score_log_abs) = if y == 0.0 {
+                (1.0, 0.0)
+            } else if log_r > 0.0 {
+                (-1.0, log_abs_one_minus_exp(log_r))
+            } else {
+                (1.0, log_abs_one_minus_exp(log_r))
+            };
+            let score = finite_signed_from_log(
+                row,
+                "Tweedie eta score",
+                eta,
+                score_sign,
+                log_weight + q * eta + score_log_abs,
+            )?;
+            (half, score)
+        }
+        ResponseFamily::NegativeBinomial { theta, .. } => {
+            if !valid_negbin_theta(*theta) {
+                return Err(deviance_row_error(
+                    row,
+                    "negative-binomial theta",
+                    eta,
+                    *theta,
+                ));
+            }
+            if !valid_count_response(y) {
+                return Err(deviance_row_error(
+                    row,
+                    "negative-binomial response",
+                    eta,
+                    y,
+                ));
+            }
+            let log_theta = theta.ln();
+            let log_r = if y == 0.0 {
+                f64::NEG_INFINITY
+            } else {
+                y.ln() - eta
+            };
+            let kl = if y == 0.0 {
+                softplus(eta - log_theta)
+            } else {
+                bernoulli_kl_from_logits(y.ln() - log_theta, eta - log_theta)
+            };
+            if !(kl.is_finite() && kl >= 0.0) {
+                return Err(deviance_row_error(
+                    row,
+                    "negative-binomial deviance ratio",
+                    eta,
+                    kl,
+                ));
+            }
+            let log_total = if y == 0.0 {
+                log_theta
+            } else {
+                logaddexp(y.ln(), log_theta)
+            };
+            let half = if kl == 0.0 {
+                0.0
+            } else {
+                finite_signed_from_log(
+                    row,
+                    "negative-binomial half-deviance",
+                    eta,
+                    1.0,
+                    log_weight + log_total + kl.ln(),
+                )?
+            };
+            let log_information_scale = log_theta + eta - logaddexp(log_theta, eta);
+            let (score_sign, score_log_abs) = if y == 0.0 {
+                (1.0, 0.0)
+            } else if log_r > 0.0 {
+                (-1.0, log_abs_one_minus_exp(log_r))
+            } else {
+                (1.0, log_abs_one_minus_exp(log_r))
+            };
+            let score = finite_signed_from_log(
+                row,
+                "negative-binomial eta score",
+                eta,
+                score_sign,
+                log_weight + log_information_scale + score_log_abs,
+            )?;
+            (half, score)
+        }
+        ResponseFamily::Binomial => {
+            if !(y.is_finite() && (0.0..=1.0).contains(&y)) {
+                return Err(deviance_row_error(row, "binomial response", eta, y));
+            }
+            let (log_mu, log_one_minus_mu) =
+                binomial_log_probabilities(inverse_link, eta, jet.0).map_err(|_| {
+                    deviance_row_error(row, "binomial log-probabilities", eta, jet.0)
+                })?;
+            let half_unit = if matches!(inverse_link, InverseLink::Standard(StandardLink::Logit)) {
+                let (mu, one_minus_mu) = logit_probability_pair(eta);
+                bd0(y, mu) + bd0(1.0 - y, one_minus_mu)
+            } else {
+                xlogy(y, y) + xlogy(1.0 - y, 1.0 - y)
+                    - y * log_mu
+                    - (1.0 - y) * log_one_minus_mu
+            };
+            if !(half_unit.is_finite() && half_unit >= 0.0) {
+                return Err(deviance_row_error(
+                    row,
+                    "binomial half-deviance",
+                    eta,
+                    half_unit,
+                ));
+            }
+            let half = if half_unit == 0.0 {
+                0.0
+            } else {
+                finite_signed_from_log(
+                    row,
+                    "binomial half-deviance",
+                    eta,
+                    1.0,
+                    log_weight + half_unit.ln(),
+                )?
+            };
+            let score_unit = if matches!(inverse_link, InverseLink::Standard(StandardLink::Logit)) {
+                let (mu, one_minus_mu) = logit_probability_pair(eta);
+                if eta >= 0.0 {
+                    (1.0 - y) - one_minus_mu
+                } else {
+                    mu - y
+                }
+            } else if jet.0 <= 0.5 {
+                (jet.1 / jet.0) * ((jet.0 - y) / (1.0 - jet.0))
+            } else {
+                (jet.1 / (1.0 - jet.0)) * ((jet.0 - y) / jet.0)
+            };
+            let score = if score_unit == 0.0 {
+                0.0
+            } else {
+                finite_signed_from_log(
+                    row,
+                    "binomial eta score",
+                    eta,
+                    score_unit.signum(),
+                    log_weight + score_unit.abs().ln(),
+                )?
+            };
+            (half, score)
+        }
+        ResponseFamily::Beta { phi } => {
+            if !valid_beta_phi(*phi) {
+                return Err(deviance_row_error(row, "beta precision", eta, *phi));
+            }
+            if !valid_beta_response(y) {
+                return Err(deviance_row_error(row, "beta response", eta, y));
+            }
+            if !(jet.0 >= 0.0 && jet.0 <= 1.0 && jet.1 > 0.0) {
+                return Err(deviance_row_error(row, "beta-logit inverse link", eta, jet.0));
+            }
+            let (mu, one_minus_mu) = logit_probability_pair(eta);
+            let a = mu * *phi;
+            let b = one_minus_mu * *phi;
+            if !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0) {
+                return Err(deviance_row_error(row, "beta shape", eta, a.max(b)));
+            }
+            let saturated = beta_loglikelihood_full_unit(y, y, *phi);
+            let fitted = beta_log_normalizer(a, b, *phi)
+                + *phi * xlogy(mu, y)
+                + *phi * xlogy(one_minus_mu, 1.0 - y)
+                - y.ln()
+                - (1.0 - y).ln();
+            let half_unit = saturated - fitted;
+            if !half_unit.is_finite() {
+                return Err(deviance_row_error(
+                    row,
+                    "beta half-deviance",
+                    eta,
+                    half_unit,
+                ));
+            }
+            let half = if half_unit == 0.0 {
+                0.0
+            } else {
+                finite_signed_from_log(
+                    row,
+                    "beta half-deviance",
+                    eta,
+                    half_unit.signum(),
+                    log_weight + half_unit.abs().ln(),
+                )?
+            };
+            let c = *phi * jet.1;
+            if !c.is_finite() {
+                return Err(deviance_row_error(row, "beta score scale", eta, c));
+            }
+            let scaled_psi_a = beta_scaled_digamma(c, a, one_minus_mu);
+            let scaled_psi_b = beta_scaled_digamma(c, b, mu);
+            let logit_y = y.ln() - (1.0 - y).ln();
+            let score_unit = scaled_psi_a - scaled_psi_b - c * logit_y;
+            if !score_unit.is_finite() {
+                return Err(deviance_row_error(
+                    row,
+                    "beta eta score",
+                    eta,
+                    score_unit,
+                ));
+            }
+            let score = if score_unit == 0.0 {
+                0.0
+            } else {
+                finite_signed_from_log(
+                    row,
+                    "beta eta score",
+                    eta,
+                    score_unit.signum(),
+                    log_weight + score_unit.abs().ln(),
+                )?
+            };
+            (half, score)
+        }
+        ResponseFamily::RoystonParmar => {
+            return Err(deviance_row_error(
+                row,
+                "Royston-Parmar GLM deviance",
+                eta,
+                eta,
+            ));
+        }
+    };
+    Ok(DevianceEtaRow {
+        half_deviance,
+        eta_score,
+    })
+}
+
+pub(crate) fn deviance_eta_rows(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    priorweights: ArrayView1<f64>,
+) -> Result<Vec<DevianceEtaRow>, EstimationError> {
+    if y.len() != eta.len() || priorweights.len() != eta.len() {
+        crate::bail_invalid_estim!(
+            "deviance row length mismatch: y={}, eta={}, prior_weights={}",
+            y.len(),
+            eta.len(),
+            priorweights.len()
+        );
+    }
+    let rows: Vec<Result<DevianceEtaRow, EstimationError>> = (0..eta.len())
+        .into_par_iter()
+        .map(|i| {
+            deviance_eta_row(
+                i,
+                y[i],
+                eta[i],
+                likelihood,
+                inverse_link,
+                priorweights[i],
+            )
+        })
+        .collect();
+    // Parallel evaluation, ordered certification: the smallest invalid row is
+    // deterministic, and no caller-visible output exists until all rows pass.
+    rows.into_iter().collect()
+}
+
 pub(crate) fn calculate_deviance_from_eta(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
-    mu: &Array1<f64>,
     likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
     priorweights: ArrayView1<f64>,
 ) -> Result<f64, EstimationError> {
-    if !matches!(likelihood.spec.response, ResponseFamily::Binomial) {
-        let value = calculate_deviance(y, mu, likelihood, priorweights);
-        if value.is_finite() {
-            return Ok(value);
-        }
-        crate::bail_invalid_estim!("deviance is not representable on the certified PIRLS state");
-    }
-    let rows: Vec<Result<f64, EstimationError>> = (0..y.len())
-        .into_par_iter()
-        .map(|i| {
-            let wi = priorweights[i];
-            if !(wi.is_finite() && wi >= 0.0) {
-                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                    row: i,
-                    quantity: "prior weight",
-                    eta: eta[i],
-                    value: wi,
-                });
-            }
-            if wi == 0.0 {
-                return Ok(0.0);
-            }
-            let (log_mu, log_one_minus_mu) =
-                binomial_log_probabilities(inverse_link, eta[i], mu[i]).map_err(|_| {
-                    EstimationError::PirlsRowGeometryUnrepresentable {
-                        row: i,
-                        quantity: "binomial log-probabilities",
-                        eta: eta[i],
-                        value: mu[i],
-                    }
-                })?;
-            let yi = y[i];
-            let value = 2.0
-                * wi
-                * (xlogy(yi, yi) + xlogy(1.0 - yi, 1.0 - yi)
-                    - yi * log_mu
-                    - (1.0 - yi) * log_one_minus_mu);
-            if value.is_finite() && value >= 0.0 {
-                Ok(value)
-            } else {
-                Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                    row: i,
-                    quantity: "binomial deviance contribution",
-                    eta: eta[i],
-                    value,
-                })
-            }
-        })
-        .collect();
-    let rows: Vec<f64> = rows.into_iter().collect::<Result<_, _>>()?;
-    let value = gam_linalg::pairwise_reduce::par_pairwise_sum(rows.len(), |i| rows[i]);
+    let rows = deviance_eta_rows(y, eta, likelihood, inverse_link, priorweights)?;
+    let half = gam_linalg::pairwise_reduce::par_pairwise_sum(rows.len(), |i| {
+        rows[i].half_deviance
+    });
+    let value = 2.0 * half;
     if value.is_finite() {
         Ok(value)
     } else {
-        crate::bail_invalid_estim!("binomial deviance reduction exceeded f64 range")
+        crate::bail_invalid_estim!("deviance reduction exceeded f64 range")
     }
 }
 

@@ -509,9 +509,9 @@ impl SaeManifoldRho {
         Ok(scaled)
     }
 
-    pub(crate) fn lambda_sparse(&self) -> f64 {
+    pub(crate) fn lambda_sparse(&self) -> Result<f64, String> {
         checked_exp_log_strength(self.log_lambda_sparse)
-            .expect("assignment-strength access follows rho-domain validation")
+            .map_err(|error| format!("assignment log strength: {error}"))
     }
 
     /// Number of atoms `K` carried by the per-atom smoothness vector.
@@ -524,18 +524,24 @@ impl SaeManifoldRho {
     /// Computational entry points validate the rho domain before calling this
     /// exact, unsaturated map.
     #[must_use]
-    pub(crate) fn lambda_smooth_for(&self, atom: usize) -> f64 {
-        checked_exp_log_strength(self.log_lambda_smooth[atom])
-            .expect("smoothness-strength access follows rho-domain validation")
+    pub(crate) fn lambda_smooth_for(&self, atom: usize) -> Result<f64, String> {
+        let log_strength = self.log_lambda_smooth.get(atom).copied().ok_or_else(|| {
+            format!(
+                "smoothness atom {atom} is outside K={}",
+                self.log_lambda_smooth.len()
+            )
+        })?;
+        checked_exp_log_strength(log_strength)
+            .map_err(|error| format!("smoothness log strength at atom {atom}: {error}"))
     }
 
     /// All `K` per-atom smoothness strengths `exp(log_lambda_smooth[k])`, atom
     /// order. Convenience for threading per-atom λ into the penalty assemblers
     /// (#1556).
     #[must_use]
-    pub(crate) fn lambda_smooth_vec(&self) -> Vec<f64> {
+    pub(crate) fn lambda_smooth_vec(&self) -> Result<Vec<f64>, String> {
         checked_exp_log_strengths(self.log_lambda_smooth.iter().copied())
-            .expect("smoothness-strength access follows rho-domain validation")
+            .map_err(|error| format!("smoothness log strength: {error}"))
     }
 
     /// Validate and materialize the complete per-atom ARD precision table once.

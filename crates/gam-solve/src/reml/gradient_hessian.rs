@@ -2608,9 +2608,15 @@ impl<'a> RemlState<'a> {
         let penalty_scores = bundle.canonical_penalty_scores_at_mode(&self.canonical_penalties)?;
         let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())?;
 
-        // Dispersion φ used to turn deviance into log-likelihood.
+        // Scale converting the REPORTED deviance into negative log-likelihood.
+        // Gaussian's reported deviance already includes a fixed dispersion;
+        // Beta's deviance is defined directly as twice a saturated-loglikelihood
+        // difference and already contains its precision.  Dividing either a
+        // second time would change the sampled objective. Gamma and Tweedie,
+        // by contrast, deliberately report unscaled deviance and need their
+        // EDM dispersion here.
         let phi = match reml_spec(&self.config.likelihood).response {
-            ResponseFamily::Gaussian => 1.0,
+            ResponseFamily::Gaussian | ResponseFamily::Beta { .. } => 1.0,
             _ => reml_fixed_glm_dispersion(&self.config.likelihood),
         };
         if !(phi.is_finite() && phi > 0.0) {
@@ -2708,7 +2714,9 @@ impl<'a> RemlState<'a> {
         let x = x_dense.as_ref();
         let n_rows = x.nrows();
         let xv = x.dot(&target.block_vecs); // n × m
-        let ngs_base = target.base_neg_score();
+        let ngs_base = target
+            .base_neg_score()
+            .map_err(EstimationError::InvalidInput)?;
 
         // σ²_i = E_p[s_i²] and the shared n×m intermediates.
         let xv_ett = xv.dot(&moments.e_tt); // n × m

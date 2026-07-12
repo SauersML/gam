@@ -472,7 +472,7 @@ pub(crate) fn weighted_normal_equations(
         .into());
     }
 
-    let xtwx = x.xt_diag_x_signed_op(SignedWeightsView::from_array(w))?;
+    let xtwx = x.xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(w)?)?;
     let xtwy = if let Some(y) = y_star {
         Some(x.compute_xtwy(w, y)?)
     } else {

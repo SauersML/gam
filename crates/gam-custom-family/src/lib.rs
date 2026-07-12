@@ -64,7 +64,7 @@ pub(crate) use gam_solve::pirls::solve_newton_directionwith_lower_bounds;
 pub(crate) use faer::Side;
 pub(crate) use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_atb, fast_av};
 pub(crate) use gam_linalg::matrix::{
-    DesignMatrix, LinearOperator, SignedWeightsView, SymmetricMatrix,
+    DesignMatrix, FiniteSignedWeightsView, LinearOperator, SymmetricMatrix,
 };
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, s};
 pub(crate) use std::any::Any;

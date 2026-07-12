@@ -184,9 +184,10 @@ pub trait BlockExcessTarget {
     /// Per-row displaced score `∂(D(η̂+s(t))/2φ)/∂η` evaluated at `η̂ + s(t)`
     /// (length = number of observation rows): the only per-draw ingredient of
     /// the exact-gradient channels (b)–(d) the assembly side cannot reconstruct.
-    fn displaced_neg_score(&self, t: &Array1<f64>) -> Array1<f64>;
+    /// A row-domain failure rejects the complete score atomically.
+    fn displaced_neg_score(&self, t: &Array1<f64>) -> Result<Array1<f64>, String>;
     /// The same per-row score channel at the undisplaced mode `η̂`.
-    fn base_neg_score(&self) -> Array1<f64>;
+    fn base_neg_score(&self) -> Result<Array1<f64>, String>;
 
     /// Fused `(excess(t), displaced_neg_score(t))`. The returned score is `None`
     /// exactly when the excess is non-finite (an infeasible draw the sampler
@@ -195,7 +196,10 @@ pub trait BlockExcessTarget {
     fn excess_with_displaced_neg_score(&self, t: &Array1<f64>) -> (f64, Option<Array1<f64>>) {
         let excess = self.excess(t);
         if excess.is_finite() {
-            (excess, Some(self.displaced_neg_score(t)))
+            match self.displaced_neg_score(t) {
+                Ok(score) => (excess, Some(score)),
+                Err(_) => (f64::INFINITY, None),
+            }
         } else {
             (excess, None)
         }

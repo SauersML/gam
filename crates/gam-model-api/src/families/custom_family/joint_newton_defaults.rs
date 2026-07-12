@@ -1,6 +1,6 @@
 use crate::families::custom_family::family_trait::CustomFamily;
 use gam_linalg::faer_ndarray::fast_atb;
-use gam_linalg::matrix::{LinearOperator, SignedWeightsView};
+use gam_linalg::matrix::{FiniteSignedWeightsView, LinearOperator};
 use gam_problem::{BlockWorkingSet, CustomFamilyError, ParameterBlockSpec, ParameterBlockState};
 use ndarray::{Array1, Array2, s};
 
@@ -138,7 +138,7 @@ pub(crate) fn exact_newton_joint_hessian_from_working_sets<F: CustomFamily + ?Si
                 working_weights, ..
             } => spec
                 .design
-                .xt_diag_x_signed_op(SignedWeightsView::from_array(working_weights))?,
+                .xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(working_weights)?)?,
         };
         if dense.nrows() != p_block || dense.ncols() != p_block {
             return Err(CustomFamilyError::DimensionMismatch { reason: format!(
@@ -369,7 +369,7 @@ pub(crate) fn exact_newton_joint_hessian_directional_derivative_from_working_set
                     )?
                     .map(|dw| {
                         let mut local = solver_design
-                            .xt_diag_x_signed_op(SignedWeightsView::from_array(&dw))?;
+                            .xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(&dw)?)?;
                         local += &geometry_correction;
                         Ok::<Array2<f64>, String>(local)
                     })

@@ -11,7 +11,7 @@
 //! no behavior change.
 
 use gam_linalg::faer_ndarray::{fast_xt_diag_x, fast_xt_diag_y};
-use gam_linalg::matrix::{DesignMatrix, LinearOperator, SignedWeightsView};
+use gam_linalg::matrix::{DesignMatrix, FiniteSignedWeightsView, LinearOperator};
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut2, s};
 
 use super::GamlssError;
@@ -73,7 +73,7 @@ pub(super) fn xt_diag_x_design(
             diag.len()
         ));
     }
-    design.xt_diag_x_signed_op(SignedWeightsView::from_array(diag))
+    design.xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(diag)?)
 }
 
 pub(super) fn xt_diag_y_design(

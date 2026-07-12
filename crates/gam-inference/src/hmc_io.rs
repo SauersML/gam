@@ -3487,15 +3487,15 @@ mod tests {
         fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
             t.mapv(|x| self.a * x.powi(4))
         }
-        fn displaced_neg_score(&self, t: &Array1<f64>) -> Array1<f64> {
+        fn displaced_neg_score(&self, t: &Array1<f64>) -> Result<Array1<f64>, String> {
             // The synthetic oracle has no observation rows: its ΔF carries no
             // deviance channel, so the per-row score moment is empty and the
             // (b)–(d) channel assembly contracts against nothing.
             assert_eq!(t.len(), self.block_dim(), "displacement dim mismatch");
-            Array1::zeros(0)
+            Ok(Array1::zeros(0))
         }
-        fn base_neg_score(&self) -> Array1<f64> {
-            Array1::zeros(0)
+        fn base_neg_score(&self) -> Result<Array1<f64>, String> {
+            Ok(Array1::zeros(0))
         }
     }
 
@@ -3607,12 +3607,13 @@ mod tests {
         fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
             t.mapv(|x| 0.01 * x)
         }
-        fn displaced_neg_score(&self, t: &Array1<f64>) -> Array1<f64> {
-            self.excess_and_ngs(&self.s_of(t)).1
+        fn displaced_neg_score(&self, t: &Array1<f64>) -> Result<Array1<f64>, String> {
+            Ok(self.excess_and_ngs(&self.s_of(t)).1)
         }
-        fn base_neg_score(&self) -> Array1<f64> {
-            self.excess_and_ngs(&self.s_of(&Array1::zeros(self.block_dim())))
-                .1
+        fn base_neg_score(&self) -> Result<Array1<f64>, String> {
+            Ok(self
+                .excess_and_ngs(&self.s_of(&Array1::zeros(self.block_dim())))
+                .1)
         }
         fn excess_with_displaced_neg_score_batch(
             &self,
@@ -6877,7 +6878,7 @@ pub fn block_sampled_marginal_correction<T: BlockExcessTarget + ?Sized>(
     // `exp(max_old − max_new) ≤ 1`, so each per-draw relative weight is ≤ 1
     // and the sums never overflow. Infeasible / divergent draws contribute
     // zero weight rather than poisoning the estimate.
-    let n_obs = target.base_neg_score().len();
+    let n_obs = target.base_neg_score()?.len();
     let mut max_lw = f64::NEG_INFINITY;
     let mut sum_w = 0.0_f64;
     let mut sum_w2 = 0.0_f64;

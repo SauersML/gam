@@ -1432,7 +1432,7 @@ fn ordered_beta_bernoulli_prior_penalty(
     base_alpha: f64,
     temperature: f64,
     row_weights: Option<&[f64]>,
-) -> (OrderedBetaBernoulliPenalty, Array1<f64>) {
+) -> Result<(OrderedBetaBernoulliPenalty, Array1<f64>), String> {
     let learnable = assignment.effective_alpha_is_learnable();
     let alpha_eff = if learnable {
         base_alpha
@@ -1458,10 +1458,10 @@ fn ordered_beta_bernoulli_prior_penalty(
     let rho_view = if learnable {
         Array1::from_vec(vec![rho.log_lambda_sparse])
     } else {
-        penalty.weight = rho.lambda_sparse();
+        penalty.weight = rho.lambda_sparse()?;
         Array1::zeros(0)
     };
-    (penalty, rho_view)
+    Ok((penalty, rho_view))
 }
 
 /// Apply the exact ordered Beta--Bernoulli logit Hessian minus the diagonal

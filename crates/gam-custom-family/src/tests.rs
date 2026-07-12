@@ -2293,7 +2293,9 @@ impl CustomFamily for DefaultDiagonalExactHookFamily {
         let v_eta = spec.design.apply(v);
         assert_eq!(block_states[0].eta.len(), u_eta.len());
         spec.design
-            .xt_diag_x_signed_op(SignedWeightsView::from_array(&((&u_eta * &v_eta) * 2.0)))
+            .xt_diag_x_signed_op(
+                FiniteSignedWeightsView::try_from_array(&((&u_eta * &v_eta) * 2.0)).unwrap(),
+            )
             .map(Some)
     }
 }
@@ -2335,9 +2337,12 @@ pub(crate) fn default_custom_family_exact_hessian_hooks_assemble_diagonal_workin
         .expect("diagonal working sets should assemble an exact joint Hessian");
     let expected_h = spec
         .design
-        .xt_diag_x_signed_op(SignedWeightsView::from_array(
-            &eta.mapv(|value| 2.0 + value * value),
-        ))
+        .xt_diag_x_signed_op(
+            FiniteSignedWeightsView::try_from_array(
+                &eta.mapv(|value| 2.0 + value * value),
+            )
+            .unwrap(),
+        )
         .unwrap();
     assert_eq!(h, expected_h);
 
@@ -2353,7 +2358,9 @@ pub(crate) fn default_custom_family_exact_hessian_hooks_assemble_diagonal_workin
     let d_eta = spec.design.apply(&direction);
     let expected_dh = spec
         .design
-        .xt_diag_x_signed_op(SignedWeightsView::from_array(&((&eta * &d_eta) * 2.0)))
+        .xt_diag_x_signed_op(
+            FiniteSignedWeightsView::try_from_array(&((&eta * &d_eta) * 2.0)).unwrap(),
+        )
         .unwrap();
     assert_eq!(dh, expected_dh);
 
@@ -2364,7 +2371,9 @@ pub(crate) fn default_custom_family_exact_hessian_hooks_assemble_diagonal_workin
     let beta_eta = spec.design.apply(&beta);
     let expected_d2h = spec
         .design
-        .xt_diag_x_signed_op(SignedWeightsView::from_array(&((&d_eta * &beta_eta) * 2.0)))
+        .xt_diag_x_signed_op(
+            FiniteSignedWeightsView::try_from_array(&((&d_eta * &beta_eta) * 2.0)).unwrap(),
+        )
         .unwrap();
     assert_eq!(d2h, expected_d2h);
 }

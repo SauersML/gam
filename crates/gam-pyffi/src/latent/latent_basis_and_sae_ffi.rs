@@ -398,14 +398,136 @@ fn set_aux_strength_items<'py>(
     Ok(())
 }
 
+/// Atomically validated diagonal latent precision state.
+///
+/// Python supplies logarithmic precisions.  This carrier validates the whole
+/// vector against the engine's one exact log-strength domain and materializes
+/// `exp(log_alpha)` once, before any fit or gradient work.  Keeping both views
+/// prevents value/gradient desynchronization and removes exponentials from the
+/// observation loops and latent-optimizer iterations.
+#[derive(Clone)]
+struct ValidatedDimSelectionPrecisions {
+    log: Array1<f64>,
+    physical: Array1<f64>,
+}
+
+impl ValidatedDimSelectionPrecisions {
+    fn new(log: ArrayView1<'_, f64>, latent_dim: usize) -> Result<Self, String> {
+        if log.len() != latent_dim {
+            return Err(format!(
+                "dim_selection_log_precision length {} must equal latent_dim {latent_dim}",
+                log.len()
+            ));
+        }
+        let mut physical = Array1::<f64>::zeros(latent_dim);
+        for (axis, (&log_alpha, alpha)) in log.iter().zip(physical.iter_mut()).enumerate() {
+            *alpha = gam::checked_exp_log_strength(log_alpha).map_err(|error| {
+                format!("dim_selection_log_precision[{axis}]: {error}")
+            })?;
+        }
+        Ok(Self {
+            log: log.to_owned(),
+            physical,
+        })
+    }
+
+    /// `0.5*alpha_axis*||t_axis||^2`, evaluated by a scaled sum-of-squares so
+    /// `t^2` cannot overflow before multiplication by a small precision.
+    fn axis_energy(&self, t: ArrayView2<'_, f64>, axis: usize) -> Result<f64, String> {
+        if t.ncols() != self.log.len() || axis >= self.log.len() {
+            return Err(format!(
+                "dim-selection precision has {} axes but latent coordinates have {}",
+                self.log.len(),
+                t.ncols()
+            ));
+        }
+        let multiplier = (0.5 * self.physical[axis]).sqrt();
+        let mut scale = 0.0_f64;
+        let mut sumsq = 1.0_f64;
+        for &coordinate in t.column(axis) {
+                if !coordinate.is_finite() {
+                    return Err(format!(
+                        "latent coordinate on dim-selection axis {axis} must be finite; got \
+                         {coordinate}"
+                    ));
+                }
+                let magnitude = (multiplier * coordinate).abs();
+                if !magnitude.is_finite() {
+                    return Err(format!(
+                        "dim-selection prior energy is unrepresentable on axis {axis}"
+                    ));
+                }
+                if magnitude == 0.0 {
+                    continue;
+                }
+                if scale < magnitude {
+                    let ratio = scale / magnitude;
+                    sumsq = 1.0 + sumsq * ratio * ratio;
+                    scale = magnitude;
+                } else {
+                    let ratio = magnitude / scale;
+                    sumsq += ratio * ratio;
+                }
+        }
+        let energy = if scale == 0.0 {
+            0.0
+        } else {
+            scale * scale * sumsq
+        };
+        if energy.is_finite() {
+            Ok(energy)
+        } else {
+            Err(format!(
+                "dim-selection prior energy is unrepresentable on axis {axis}"
+            ))
+        }
+    }
+
+    /// Normalized Gaussian ARD negative-log prior
+    /// `sum_a [0.5*alpha_a*||t_a||^2 - 0.5*n*log(alpha_a)]`.
+    fn prior_score(&self, t: ArrayView2<'_, f64>) -> Result<f64, String> {
+        if t.ncols() != self.log.len() {
+            return Err(format!(
+                "dim-selection precision has {} axes but latent coordinates have {}",
+                self.log.len(),
+                t.ncols()
+            ));
+        }
+        let mut total = 0.0_f64;
+        let mut compensation = 0.0_f64;
+        for axis in 0..self.log.len() {
+            let energy = self.axis_energy(t, axis)?;
+            let axis_score =
+                energy - 0.5 * t.nrows() as f64 * self.log[axis];
+            if !axis_score.is_finite() {
+                return Err(format!(
+                    "dim-selection prior score is unrepresentable on axis {axis}"
+                ));
+            }
+            let updated = total + axis_score;
+            compensation += if total.abs() >= axis_score.abs() {
+                (total - updated) + axis_score
+            } else {
+                (axis_score - updated) + total
+            };
+            total = updated;
+        }
+        let score = total + compensation;
+        if score.is_finite() {
+            Ok(score)
+        } else {
+            Err("dim-selection prior score is unrepresentable".to_string())
+        }
+    }
+}
+
 fn latent_prior_score_and_aux_state_for_t(
     t_mat: ArrayView2<'_, f64>,
     aux_u: Option<ArrayView2<'_, f64>>,
     aux_family: AuxPriorFamily,
     aux_strength: Option<f64>,
-    dim_selection_precision: Option<ArrayView1<'_, f64>>,
+    dim_selection_precision: Option<&ValidatedDimSelectionPrecisions>,
 ) -> Result<(f64, Option<LatentAuxStrengthState>), String> {
-    let n_obs = t_mat.nrows();
     let latent_dim = t_mat.ncols();
     let mut latent_prior_score = 0.0_f64;
     let mut aux_strength_state = None;
@@ -414,29 +536,9 @@ fn latent_prior_score_and_aux_state_for_t(
         latent_prior_score += stats.score;
         aux_strength_state = Some(stats.strength);
     }
-    if let Some(log_prec) = dim_selection_precision {
-        if log_prec.len() != latent_dim {
-            return Err(format!(
-                "dim_selection_log_precision length {} must equal latent_dim {}",
-                log_prec.len(),
-                latent_dim
-            ));
-        }
-        for a in 0..latent_dim {
-            let log_alpha = log_prec[a];
-            let alpha = log_alpha.exp();
-            if !(alpha.is_finite() && alpha > 0.0) {
-                return Err(format!(
-                    "dim_selection_log_precision[{a}] must exponentiate to a finite positive precision"
-                ));
-            }
-            let mut sq = 0.0_f64;
-            for n in 0..n_obs {
-                let v = t_mat[[n, a]];
-                sq += v * v;
-            }
-            latent_prior_score += 0.5 * alpha * sq - 0.5 * (n_obs as f64) * log_alpha;
-        }
+    if let Some(precisions) = dim_selection_precision {
+        debug_assert_eq!(latent_dim, precisions.log.len());
+        latent_prior_score += precisions.prior_score(t_mat)?;
     }
     Ok((latent_prior_score, aux_strength_state))
 }
@@ -1330,7 +1432,7 @@ fn gaussian_reml_fit_latent_impl(
     aux_u: Option<ArrayView2<'_, f64>>,
     aux_family: AuxPriorFamily,
     aux_strength: Option<f64>,
-    dim_selection_precision: Option<ArrayView1<'_, f64>>,
+    dim_selection_precision: Option<&ValidatedDimSelectionPrecisions>,
     analytic_penalties: Option<&AnalyticPenaltyRegistry>,
     periodic: Option<&[Option<f64>]>,
 ) -> Result<
@@ -1374,37 +1476,14 @@ fn gaussian_reml_fit_latent_impl(
     .map_err(|err| err.to_string())?;
     // Fixes audit-revised claim that ARD / aux-prior REML selection requires
     // normalized priors, not raw quadratic corrections alone.
-    let mut latent_prior_score = 0.0_f64;
-    let mut aux_strength_state = None;
-    if let Some(u_view) = aux_u {
-        let stats = latent_aux_prior_stats(t_mat.view(), u_view, aux_family, aux_strength)?;
-        latent_prior_score += stats.score;
-        aux_strength_state = Some(stats.strength);
-    }
-    if let Some(log_prec) = dim_selection_precision {
-        if log_prec.len() != latent_dim {
-            return Err(format!(
-                "dim_selection_log_precision length {} must equal latent_dim {}",
-                log_prec.len(),
-                latent_dim
-            ));
-        }
-        for a in 0..latent_dim {
-            let log_alpha = log_prec[a];
-            let alpha = log_alpha.exp();
-            if !(alpha.is_finite() && alpha > 0.0) {
-                return Err(format!(
-                    "dim_selection_log_precision[{a}] must exponentiate to a finite positive precision"
-                ));
-            }
-            let mut sq = 0.0_f64;
-            for n in 0..n_obs {
-                let v = t_mat[[n, a]];
-                sq += v * v;
-            }
-            latent_prior_score += 0.5 * alpha * sq - 0.5 * (n_obs as f64) * log_alpha;
-        }
-    }
+    let (mut latent_prior_score, aux_strength_state) =
+        latent_prior_score_and_aux_state_for_t(
+            t_mat.view(),
+            aux_u,
+            aux_family,
+            aux_strength,
+            dim_selection_precision,
+        )?;
     if let Some(registry) = analytic_penalties {
         latent_prior_score += analytic_penalty_value_for_targets(registry, t_flat, None)?;
     }
@@ -1490,7 +1569,9 @@ fn gaussian_reml_fit_latent<'py>(
     let aux_u_values = aux_u.as_ref().map(|a| a.as_array().to_owned());
     let dim_selection_values = dim_selection_log_precision
         .as_ref()
-        .map(|a| a.as_array().to_owned());
+        .map(|values| ValidatedDimSelectionPrecisions::new(values.as_array(), latent_dim))
+        .transpose()
+        .map_err(py_value_error)?;
     let tensor_knots_values = tensor_knots_concat
         .as_ref()
         .map(|a| a.as_array().to_owned());
@@ -1517,7 +1598,7 @@ fn gaussian_reml_fit_latent<'py>(
                 aux_u_values.as_ref().map(|a| a.view()),
                 family,
                 aux_strength,
-                dim_selection_values.as_ref().map(|a| a.view()),
+                dim_selection_values.as_ref(),
             )
             .map_err(py_value_error)?;
             let analytic_score =
@@ -1567,7 +1648,7 @@ fn gaussian_reml_fit_latent<'py>(
                 aux_u_values.as_ref().map(|a| a.view()),
                 family,
                 aux_strength,
-                dim_selection_values.as_ref().map(|a| a.view()),
+                dim_selection_values.as_ref(),
                 Some(&registry),
                 // Standalone fit entrypoint: no manifold/chart, open Euclidean.
                 None,

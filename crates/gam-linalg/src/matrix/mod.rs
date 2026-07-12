@@ -3941,9 +3941,10 @@ pub trait LinearOperator {
     /// but not guaranteed PSD (so consumers cannot assume the `SymmetricMatrix`
     /// PSD contract). Default impl delegates to `diag_xtw_x` for legacy
     /// operators; overriding impls may take a sign-aware fast path.
-    fn xt_diag_x_signed_op(&self, weights: SignedWeightsView<'_>) -> Result<Array2<f64>, String> {
-        FiniteSignedWeightsView::try_new(weights.view())
-            .map_err(|reason| format!("LinearOperator::xt_diag_x_signed_op: {reason}"))?;
+    fn xt_diag_x_signed_op(
+        &self,
+        weights: FiniteSignedWeightsView<'_>,
+    ) -> Result<Array2<f64>, String> {
         self.diag_xtw_x(&weights.view().to_owned())
     }
 
@@ -6125,11 +6126,11 @@ impl From<&DesignMatrix> for DesignBlock {
 mod tests {
     use super::{
         BlockDesignOperator, CoefficientTransformOperator, DenseDesignMatrix, DenseDesignOperator,
-        DesignBlock, DesignMatrix, EmbeddedColumnBlock, MultiChannelOperator, PsdWeightsView,
-        ReparamOperator, ResidualisedDesignOperator, RowwiseKroneckerOperator, SignedWeightsView,
-        SparseDesignMatrix, dense_operator_to_dense_by_chunks, dense_transpose_weighted_response,
-        fast_atv, fast_av, streaming_sparse_csc_xt_diag_x, weighted_crossprod_dense_view,
-        xt_diag_x_symmetric,
+        DesignBlock, DesignMatrix, EmbeddedColumnBlock, FiniteSignedWeightsView,
+        MultiChannelOperator, PsdWeightsView, ReparamOperator, ResidualisedDesignOperator,
+        RowwiseKroneckerOperator, SparseDesignMatrix, dense_operator_to_dense_by_chunks,
+        dense_transpose_weighted_response, fast_atv, fast_av, streaming_sparse_csc_xt_diag_x,
+        weighted_crossprod_dense_view, xt_diag_x_symmetric,
     };
     use crate::matrix::LinearOperator;
     use crate::test_support::no_densify_design;
@@ -7288,7 +7289,7 @@ mod tests {
 
         let got = <DesignMatrix as LinearOperator>::xt_diag_x_signed_op(
             &design,
-            SignedWeightsView::from_array(&weights),
+            FiniteSignedWeightsView::try_from_array(&weights).unwrap(),
         )
         .unwrap();
         let mut reference = Array2::<f64>::zeros((p, p));

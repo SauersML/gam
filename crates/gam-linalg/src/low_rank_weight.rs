@@ -333,7 +333,7 @@ fn transpose_design_times_dense(
 mod tests {
     use super::*;
     use crate::faer_ndarray::fast_ab;
-    use crate::matrix::{DesignMatrix, LinearOperator, SignedWeightsView};
+    use crate::matrix::{DesignMatrix, FiniteSignedWeightsView, LinearOperator};
     use ndarray::array;
 
     /// Build a tiny dense design and a corresponding `DesignMatrix::Dense`.
@@ -401,7 +401,7 @@ mod tests {
         let lr = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
 
         let mut xtwx = design
-            .xt_diag_x_signed_op(SignedWeightsView::from_array(&d))
+            .xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(&d).unwrap())
             .unwrap();
         lr.add_low_rank_xtwx_correction(&design, &mut xtwx).unwrap();
 
@@ -464,7 +464,7 @@ mod tests {
         assert!(lr.is_rank_zero());
 
         let mut xtwx = design
-            .xt_diag_x_signed_op(SignedWeightsView::from_array(&d))
+            .xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(&d).unwrap())
             .unwrap();
         let baseline = xtwx.clone();
         lr.add_low_rank_xtwx_correction(&design, &mut xtwx).unwrap();
@@ -545,7 +545,7 @@ mod tests {
         let lr = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
 
         let a = design
-            .xt_diag_x_signed_op(SignedWeightsView::from_array(&d))
+            .xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(&d).unwrap())
             .unwrap(); // p × p
         let a_inv = small_inverse(&a);
         let uhat = lr.project_u(&design).unwrap(); // p × r

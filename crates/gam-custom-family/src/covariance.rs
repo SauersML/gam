@@ -1345,13 +1345,9 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
                     working_weights,
                 },
             ] => {
-                let Some(h) = spec
+                let h = spec
                     .design
-                    .xt_diag_x_signed_op(SignedWeightsView::from_array(working_weights))
-                    .ok()
-                else {
-                    return Ok(None);
-                };
+                    .xt_diag_x_signed_op(FiniteSignedWeightsView::try_from_array(working_weights)?)?;
                 (h, working_weights.clone(), working_response.clone())
             }
             [BlockWorkingSet::ExactNewton { hessian, .. }] => {
