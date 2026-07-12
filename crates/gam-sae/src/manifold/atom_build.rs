@@ -567,18 +567,20 @@ pub fn sae_build_padded_basis_stacks(
 /// PCA seed. Periodic atoms get `n_harmonics = max(1, d_atom)`; Duchon atoms
 /// get deterministic center indices from the PCA seed.
 ///
-/// `duchon_center_overrides` (aligned with `atom_basis`) carries the
-/// evidence-selected thin-plate center count for a #2240 Duchon-sheet
-/// discovery winner (`resolve_auto_primary_atoms`); `None` entries keep the
-/// economy budget below. Overrides are clamped to the same identifiability
-/// floor and to `n_obs`.
+/// `resolution_overrides` (aligned with `atom_basis`) carries the evidence-
+/// selected basis-native resolution for an auto-discovery winner
+/// (`resolve_auto_primary_atoms`), interpreted per the atom's resolved basis
+/// kind: the thin-plate center count for a #2240 Duchon-sheet winner (clamped to
+/// the identifiability floor and to `n_obs`), or the per-axis harmonic order for
+/// a #2243 torus winner (clamped to the dense guard). `None` entries keep the
+/// fixed economy budget below.
 pub fn sae_build_atom_plans(
     z: ArrayView2<'_, f64>,
     atom_basis: &[String],
     atom_dim: &[usize],
     seed_coords: ArrayView3<'_, f64>,
     random_state: u64,
-    duchon_center_overrides: &[Option<usize>],
+    resolution_overrides: &[Option<usize>],
 ) -> Result<Vec<SaeAtomBuildPlan>, String> {
     let k_atoms = atom_basis.len();
     let n_obs = z.nrows();
@@ -589,10 +591,10 @@ pub fn sae_build_atom_plans(
             atom_dim.len()
         ));
     }
-    if duchon_center_overrides.len() != k_atoms {
+    if resolution_overrides.len() != k_atoms {
         return Err(format!(
-            "sae_build_atom_plans: duchon_center_overrides length {} must equal atom_basis length {k_atoms}",
-            duchon_center_overrides.len()
+            "sae_build_atom_plans: resolution_overrides length {} must equal atom_basis length {k_atoms}",
+            resolution_overrides.len()
         ));
     }
     if seed_shape[0] != k_atoms || seed_shape[1] != n_obs {
@@ -661,10 +663,15 @@ pub fn sae_build_atom_plans(
             SaeAtomBasisKind::Torus => {
                 // Torus of dim `d` uses a tensor-product periodic harmonic
                 // basis of size `(2H+1)^d`. The user's `atom_dim` selects
-                // the latent dimension; `n_harmonics` defaults to
-                // `SAE_DEFAULT_TORUS_HARMONICS`. The design grows
-                // exponentially in `d`, so reject runaway combinations.
-                let h = SAE_DEFAULT_TORUS_HARMONICS;
+                // the latent dimension; the per-axis order `H` defaults to
+                // `SAE_DEFAULT_TORUS_HARMONICS` but a #2243 auto-discovery
+                // winner carries its evidence-selected order in the resolution
+                // override (which the selector already bounds by the same dense
+                // guard checked below). The design grows exponentially in `d`,
+                // so reject runaway combinations.
+                let h = resolution_overrides[atom_idx]
+                    .map(|selected| selected.max(1))
+                    .unwrap_or(SAE_DEFAULT_TORUS_HARMONICS);
                 let evaluator = TorusHarmonicEvaluator::new(d, h)?;
                 let basis_size = evaluator.basis_size();
                 if basis_size > SAE_MAX_PERIODIC_HARMONICS * 4 {
@@ -701,7 +708,7 @@ pub fn sae_build_atom_plans(
                 // evidence-selected center count; honor it (clamped to the
                 // identifiability floor and the row count) instead of the
                 // fixed economy ceiling.
-                let n_centers = match duchon_center_overrides[atom_idx] {
+                let n_centers = match resolution_overrides[atom_idx] {
                     Some(selected) => selected.min(n_obs).max(lo),
                     None => n_obs.min(hi).max(lo),
                 };

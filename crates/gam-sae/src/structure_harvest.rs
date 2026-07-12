@@ -4111,6 +4111,138 @@ fn select_periodic_resolution(
     Ok(best_h)
 }
 
+/// Evidence-driven per-axis harmonic order for a torus primary winner (#2243 —
+/// the circle resolution-growth pattern lifted to the tensor-product torus).
+/// The historical fixed order (`SAE_DEFAULT_TORUS_HARMONICS = 3`) under-resolves
+/// a genuinely toroidal factor whose angular content on either circle factor
+/// runs above third order, capping reconstruction below the fidelity the data
+/// supports even once the topology is right. This selects the per-axis order by
+/// the SAME proper closed-form REML marginal likelihood the topology race scores
+/// with (`fit_topology_candidate` → `raw_reml`, complexity-priced through
+/// `log|H| − log|λS|₊` + profiled dispersion, so lower is better), taking the
+/// GLOBAL evidence minimum over the candidate orders (the angular spectrum can
+/// have gaps, so the evidence is not guaranteed unimodal in resolution).
+///
+/// Two hard, data-derived bounds keep the search finite and free of any tuned
+/// resolution constant:
+///
+/// * the identifiability limit `(2H + 1)^2 < n_cluster` — the tensor-product
+///   torus design has `(2H+1)^d` columns (`d = 2`), and the weighted REML cannot
+///   be identified with more basis columns than the cluster has observations —
+///   intersected with the seed builder's dense guard `(2H+1)^2 ≤ 4·SAE_MAX_PERIODIC_HARMONICS`,
+///   so the selected order always builds;
+/// * a spectral bandwidth — the largest PER-AXIS order carrying non-numerical-
+///   zero energy at any joint harmonic `(h₀, h₁)` in the weighted 2-D angular
+///   periodogram. Orders above it add only basis columns the complexity term
+///   would charge for, so they can never be the evidence optimum. The `1e-12` is
+///   a numerical-zero guard (indistinguishable from absent), NOT a smoothing
+///   threshold.
+///
+/// `n_cluster` too small for even a single per-axis harmonic, or a target with
+/// no angular energy, returns an error (the caller surfaces it as a discovery
+/// failure rather than silently pinning a resolution).
+fn select_torus_resolution(
+    torus_coords: ArrayView2<'_, f64>,
+    target: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    n_cluster: usize,
+) -> Result<usize, String> {
+    let n_obs = target.nrows();
+    let p_out = target.ncols();
+    // Solve (2H+1)^2 < n_cluster for the identifiability ceiling on the per-axis
+    // order, intersected with the seed builder's dense guard.
+    let axis_ceiling = |limit: f64| -> usize {
+        let root = limit.sqrt();
+        if root <= 1.0 {
+            1
+        } else {
+            (((root - 1.0) / 2.0).floor() as usize).max(1)
+        }
+    };
+    let ident_ceiling = axis_ceiling(n_cluster as f64);
+    let dense_ceiling = axis_ceiling((SAE_MAX_PERIODIC_HARMONICS * 4) as f64);
+    let hard_ceiling = ident_ceiling.min(dense_ceiling).max(1);
+    // Weighted joint angular periodogram over the bounded (h₀, h₁) grid; keep
+    // the per-axis order of every cell so the bandwidth prune can be resolved
+    // once the peak is known.
+    let mut peak_energy = 0.0_f64;
+    let mut cells: Vec<(usize, f64)> = Vec::new();
+    for h0 in 0..=hard_ceiling {
+        for h1 in 0..=hard_ceiling {
+            if h0 == 0 && h1 == 0 {
+                continue;
+            }
+            let mut energy = 0.0_f64;
+            for col in 0..p_out {
+                let (mut re, mut im) = (0.0_f64, 0.0_f64);
+                for row in 0..n_obs {
+                    let w = weights[row];
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let angle = std::f64::consts::TAU
+                        * (h0 as f64 * torus_coords[[row, 0]]
+                            + h1 as f64 * torus_coords[[row, 1]]);
+                    re += w * target[[row, col]] * angle.cos();
+                    im += w * target[[row, col]] * angle.sin();
+                }
+                energy += re * re + im * im;
+            }
+            peak_energy = peak_energy.max(energy);
+            cells.push((h0.max(h1), energy));
+        }
+    }
+    if !(peak_energy > 0.0) {
+        return Err(
+            "select_torus_resolution: the torus winner carries no angular energy".to_string(),
+        );
+    }
+    let energy_floor = peak_energy * 1e-12;
+    let bandwidth = cells
+        .iter()
+        .filter(|(_, energy)| *energy > energy_floor)
+        .map(|(order, _)| *order)
+        .max()
+        .unwrap_or(1);
+    let ceiling = bandwidth.min(hard_ceiling).max(1);
+    let mut best_h = 0usize;
+    let mut best_score = f64::INFINITY;
+    for h in 1..=ceiling {
+        let evaluator = match TorusHarmonicEvaluator::new(2, h) {
+            Ok(evaluator) => evaluator,
+            Err(_) => continue,
+        };
+        let spec = TopologyCandidateSpec {
+            kind: AutoTopologyKind::Torus,
+            basis_kind: SaeAtomBasisKind::Torus,
+            manifold: LatentManifold::Product(vec![
+                LatentManifold::Circle { period: 1.0 },
+                LatentManifold::Circle { period: 1.0 },
+            ]),
+            latent_dim: 2,
+            evaluator: Arc::new(evaluator),
+            coords: torus_coords.to_owned(),
+        };
+        // `raw_reml` is the proper REML evidence (lower is better) on a common
+        // `n_obs`, so comparing it directly selects the same order the race
+        // machinery would (see `select_periodic_resolution`).
+        let score = match fit_topology_candidate(&spec, target, weights) {
+            Ok(evidence) => evidence.raw_reml,
+            Err(_) => continue,
+        };
+        if score.is_finite() && score < best_score {
+            best_score = score;
+            best_h = h;
+        }
+    }
+    if best_h == 0 {
+        return Err(
+            "select_torus_resolution: no fittable harmonic order for the torus winner".to_string(),
+        );
+    }
+    Ok(best_h)
+}
+
 /// Resolve every `"auto"` entry of a primary seed dictionary to the concrete
 /// basis-kind string + latent dimension the fit-entry evidence race selects
 /// (#2238/#2239). This is the SINGLE place the auto policy lives — the FFI
@@ -4133,9 +4265,12 @@ fn select_periodic_resolution(
 ///   the old periodic default; callers that require a fixed topology must name
 ///   that topology explicitly.
 ///
-/// Returns the per-atom Duchon center-count overrides (aligned with
-/// `atom_basis`; `None` everywhere except Duchon-sheet winners), for the seed
-/// plan builder to honor.
+/// Returns the per-atom basis-native RESOLUTION overrides (aligned with
+/// `atom_basis`; `None` for every atom whose resolution is not evidence-grown).
+/// The knob is interpreted per the resolved basis kind — Duchon center count for
+/// a flat/Duchon-sheet winner (#2240), per-axis harmonic order for a torus
+/// winner (#2243) — which is unambiguous since each atom carries exactly one
+/// basis kind. The seed plan builder reads it in the arm for that kind.
 pub fn resolve_auto_primary_atoms(
     target: ArrayView2<'_, f64>,
     labels: &[usize],
@@ -4149,9 +4284,9 @@ pub fn resolve_auto_primary_atoms(
             atom_dim.len()
         ));
     }
-    let mut duchon_center_overrides: Vec<Option<usize>> = vec![None; k_atoms];
+    let mut resolution_overrides: Vec<Option<usize>> = vec![None; k_atoms];
     if !atom_basis.iter().any(|basis| basis == "auto") {
-        return Ok(duchon_center_overrides);
+        return Ok(resolution_overrides);
     }
     let choices = discover_primary_atom_topologies(target, labels, k_atoms, atom_dim)?;
     for atom_idx in 0..k_atoms {
@@ -4161,8 +4296,15 @@ pub fn resolve_auto_primary_atoms(
         let choice = &choices[atom_idx];
         match choice.basis_kind {
             SaeAtomBasisKind::Torus => {
+                // #2243 — the latent dimension stays the manifold dimension; the
+                // evidence-selected per-axis harmonic order rides the resolution
+                // override so the seed builder grows the torus past its fixed
+                // `SAE_DEFAULT_TORUS_HARMONICS` budget. `None` cannot occur for a
+                // torus winner (discovery always selects an order), but a missing
+                // value conservatively leaves the builder's default.
                 atom_basis[atom_idx] = "torus".to_string();
                 atom_dim[atom_idx] = choice.latent_dim;
+                resolution_overrides[atom_idx] = choice.n_torus_harmonics;
             }
             SaeAtomBasisKind::Sphere => {
                 atom_basis[atom_idx] = "sphere".to_string();
@@ -4183,7 +4325,7 @@ pub fn resolve_auto_primary_atoms(
                 // picked (the #2243 pattern in 2-D).
                 atom_basis[atom_idx] = "duchon".to_string();
                 atom_dim[atom_idx] = choice.latent_dim;
-                duchon_center_overrides[atom_idx] = choice.n_duchon_centers;
+                resolution_overrides[atom_idx] = choice.n_duchon_centers;
             }
             SaeAtomBasisKind::Periodic => {
                 atom_basis[atom_idx] = "periodic".to_string();
@@ -4205,7 +4347,7 @@ pub fn resolve_auto_primary_atoms(
             }
         }
     }
-    Ok(duchon_center_overrides)
+    Ok(resolution_overrides)
 }
 
 /// A small neutral routing logit a born atom is seeded at: large enough that the
@@ -5759,8 +5901,8 @@ pub fn rounds_to_json(rounds: &[SearchLedger]) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::manifold::{
-        AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
-        SaeBasisEvaluator, SaeManifoldAtom,
+        AssignmentMode, PeriodicHarmonicEvaluator, SAE_DEFAULT_TORUS_HARMONICS, SaeAssignment,
+        SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom,
     };
     use gam_solve::structure_search::{CollapseAction, CollapseEvent};
     use gam_terms::latent::LatentManifold;
@@ -6069,6 +6211,98 @@ mod tests {
         assert!(
             default_r2 < 0.75,
             "the 2-harmonic default cannot represent the 4th-harmonic half of the energy (R²={default_r2:.4})"
+        );
+    }
+
+    /// #2243 — a torus winner's per-axis harmonic ORDER is grown by evidence,
+    /// not pinned to the fixed `SAE_DEFAULT_TORUS_HARMONICS = 3` budget. The
+    /// planted toroidal factor carries the fundamental on axis 0 and the 5th
+    /// harmonic on axis 1 with a GAP (orders 2, 3, 4 absent on that axis), which
+    /// (a) the order-3 default structurally cannot represent — half the energy
+    /// lives at 5f — and (b) defeats a naive "stop at the first non-improving
+    /// order" rule, exercising the global-argmin robustness of the selector.
+    #[test]
+    fn select_torus_resolution_grows_past_default_over_harmonic_gap_2243() {
+        use gam_solve::AutoTopologyKind;
+        use ndarray::Array1;
+
+        // Full g×g angular grid so the integer harmonics below Nyquist (g/2) are
+        // exactly resolvable: fundamental on axis 0, 5th harmonic on axis 1.
+        let g = 20usize;
+        let n = g * g;
+        let mut coords = Array2::<f64>::zeros((n, 2));
+        let mut target = Array2::<f64>::zeros((n, 4));
+        for i in 0..g {
+            for j in 0..g {
+                let row = i * g + j;
+                let t0 = i as f64 / g as f64;
+                let t1 = j as f64 / g as f64;
+                coords[[row, 0]] = t0;
+                coords[[row, 1]] = t1;
+                let a0 = std::f64::consts::TAU * t0;
+                let a1 = std::f64::consts::TAU * t1;
+                target[[row, 0]] = a0.cos();
+                target[[row, 1]] = a0.sin();
+                target[[row, 2]] = (5.0 * a1).cos();
+                target[[row, 3]] = (5.0 * a1).sin();
+            }
+        }
+        let weights = Array1::<f64>::ones(n);
+
+        let selected = select_torus_resolution(coords.view(), target.view(), weights.view(), n)
+            .expect("resolution selection must succeed on a supported toroidal signal");
+        assert!(
+            selected >= 5,
+            "the 5th-harmonic content (past a gap) requires at least order 5; the fixed \
+             order-3 default under-resolves it (selected={selected})"
+        );
+
+        // Reconstruction: the selected order recovers the whole signal while the
+        // fixed order-3 default cannot touch the 5f half of the energy.
+        let torus_r2 = |h: usize| -> f64 {
+            let spec = TopologyCandidateSpec {
+                kind: AutoTopologyKind::Torus,
+                basis_kind: SaeAtomBasisKind::Torus,
+                manifold: LatentManifold::Product(vec![
+                    LatentManifold::Circle { period: 1.0 },
+                    LatentManifold::Circle { period: 1.0 },
+                ]),
+                latent_dim: 2,
+                evaluator: Arc::new(TorusHarmonicEvaluator::new(2, h).expect("torus evaluator")),
+                coords: coords.clone(),
+            };
+            let fit = fit_topology_candidate(&spec, target.view(), weights.view())
+                .expect("candidate fit")
+                .fit_handle;
+            let recon = fit.phi.dot(&fit.decoder);
+            let (mut ss_res, mut ss_tot) = (0.0_f64, 0.0_f64);
+            for col in 0..4 {
+                let mut mean = 0.0;
+                for row in 0..n {
+                    mean += target[[row, col]];
+                }
+                mean /= n as f64;
+                for row in 0..n {
+                    let r = target[[row, col]] - recon[[row, col]];
+                    ss_res += r * r;
+                    let c = target[[row, col]] - mean;
+                    ss_tot += c * c;
+                }
+            }
+            1.0 - ss_res / ss_tot.max(1e-12)
+        };
+        let default_r2 = torus_r2(SAE_DEFAULT_TORUS_HARMONICS);
+        let selected_r2 = torus_r2(selected);
+        eprintln!(
+            "[resolution-2243] torus R²: default(order {SAE_DEFAULT_TORUS_HARMONICS})={default_r2:.4} selected({selected})={selected_r2:.4}"
+        );
+        assert!(
+            selected_r2 > 0.99,
+            "the evidence-selected order must recover the signal (R²={selected_r2:.4})"
+        );
+        assert!(
+            default_r2 < 0.75,
+            "the order-3 default cannot represent the 5th-harmonic half of the energy (R²={default_r2:.4})"
         );
     }
 
