@@ -46,7 +46,7 @@ fn build_framed_fixture(
     n_atoms: usize,
     p: usize,
     seed: u64,
-) -> (ArrowSchurSystem, DeviceSaePcgData, f64, f64) {
+) -> (ArrowSchurSystem, std::sync::Arc<DeviceSaePcgData>, f64, f64) {
     let ranks: Vec<usize> = (0..n_atoms)
         .map(|k| if k % 4 == 0 { p } else { 2 + (k % 3) })
         .collect();
@@ -191,6 +191,12 @@ fn build_framed_fixture(
             row_htbeta,
         }),
     };
+    // Attach the resident operands to the system: the builder path
+    // (`build_framed_resident_evidence_matvec`) reads `sys.device_sae_pcg`, while
+    // the one-shot probe / CPU oracle take `data` explicitly. Keep an Arc handle
+    // for those direct calls.
+    let data = std::sync::Arc::new(data);
+    sys.set_device_sae_pcg_allocation(data.clone());
     (sys, data, 1e-7, 1e-6)
 }
 
