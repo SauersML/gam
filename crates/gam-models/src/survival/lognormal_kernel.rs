@@ -561,7 +561,7 @@ impl LogKernelSumJet {
         let max_k_needed = t0.k.max(t1.k) + 4;
         let bundle0 = log_kernel_bundle(quadctx, t0.m, mu, sigma, max_k_needed)?;
         let mut overall_mode = bundle0.mode;
-        let bundle1_owned = if (t0.m - t1.m).abs() < 1e-300 {
+        let bundle1_owned = if t0.m == t1.m {
             None
         } else {
             let bundle1 = log_kernel_bundle(quadctx, t1.m, mu, sigma, max_k_needed)?;
@@ -675,7 +675,7 @@ impl LogKernelSumJet {
         for term in terms {
             if !log_bundles
                 .iter()
-                .any(|(m, _)| (*m - term.m).abs() < 1e-300)
+                .any(|(m, _)| *m == term.m)
             {
                 let b = log_kernel_bundle(quadctx, term.m, mu, sigma, max_k_needed)?;
                 overall_mode = worst_mode(overall_mode, b.mode);
@@ -686,7 +686,7 @@ impl LogKernelSumJet {
         let get_lb = |m: f64| -> &LogLognormalKernelBundle {
             &log_bundles
                 .iter()
-                .find(|(bm, _)| (*bm - m).abs() < 1e-300)
+                .find(|(bm, _)| *bm == m)
                 .unwrap()
                 .1
         };
@@ -1114,8 +1114,7 @@ impl LatentSurvivalRowJet {
         sigma: f64,
         row: &LatentSurvivalRow,
     ) -> Result<Self, EstimationError> {
-        let has_unloaded =
-            row.mass_unloaded_exit.abs() > 1e-300 || row.mass_unloaded_entry.abs() > 1e-300;
+        let has_unloaded = row.mass_unloaded_exit != 0.0 || row.mass_unloaded_entry != 0.0;
 
         // Loaded mass for the kernel terms: when unloaded mass is present,
         // mass_exit contains only the loaded component; otherwise it is the
@@ -1131,7 +1130,7 @@ impl LatentSurvivalRowJet {
         };
 
         let num = LogKernelSumJet::single_term(quadctx, 0, mass_exit_loaded, mu, sigma)?;
-        if mass_entry_loaded > 1e-300 {
+        if mass_entry_loaded > 0.0 {
             let den = LogKernelSumJet::single_term(quadctx, 0, mass_entry_loaded, mu, sigma)?;
             Ok(Self {
                 log_lik: unloaded_offset + num.value - den.value,
@@ -1165,14 +1164,14 @@ impl LatentSurvivalRowJet {
         row: &LatentSurvivalRow,
     ) -> Result<Self, EstimationError> {
         let unloaded_offset =
-            if row.mass_unloaded_exit.abs() > 1e-300 || row.mass_unloaded_entry.abs() > 1e-300 {
+            if row.mass_unloaded_exit != 0.0 || row.mass_unloaded_entry != 0.0 {
                 -row.mass_unloaded_exit + row.mass_unloaded_entry
             } else {
                 0.0
             };
         let num = exact_event_kernel_jet(quadctx, row, mu, sigma)?;
 
-        if row.mass_entry > 1e-300 {
+        if row.mass_entry > 0.0 {
             let den = LogKernelSumJet::single_term(quadctx, 0, row.mass_entry, mu, sigma)?;
             Ok(Self {
                 log_lik: unloaded_offset + num.value - den.value,
@@ -1217,7 +1216,7 @@ impl LatentSurvivalRowJet {
         ];
         let num = LogKernelSumJet::evaluate(quadctx, &num_terms, mu, sigma)?;
 
-        if row.mass_entry > 1e-300 {
+        if row.mass_entry > 0.0 {
             let den = LogKernelSumJet::single_term(quadctx, 0, row.mass_entry, mu, sigma)?;
             Ok(Self {
                 log_lik: num.value + row.mass_unloaded_entry - den.value,

@@ -2853,13 +2853,13 @@ struct LatentSurvivalJointSlices {
 
 #[derive(Clone)]
 struct LatentSurvivalJointGradientAccum {
-    ll: f64,
+    ll: CompensatedRowSum,
     gradient: Array1<f64>,
 }
 
 #[derive(Clone)]
 struct LatentSurvivalJointDenseAccum {
-    ll: f64,
+    ll: CompensatedRowSum,
     gradient: Array1<f64>,
     hessian: Array2<f64>,
 }
@@ -2867,6 +2867,30 @@ struct LatentSurvivalJointDenseAccum {
 #[derive(Clone)]
 struct LatentSurvivalDenseHessianAccum {
     hessian: Array2<f64>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CompensatedRowSum {
+    sum: f64,
+    correction: f64,
+}
+
+impl CompensatedRowSum {
+    #[inline]
+    fn add(&mut self, value: f64) {
+        let next = self.sum + value;
+        if self.sum.abs() >= value.abs() {
+            self.correction += (self.sum - next) + value;
+        } else {
+            self.correction += (value - next) + self.sum;
+        }
+        self.sum = next;
+    }
+
+    #[inline]
+    fn value(self) -> f64 {
+        self.sum + self.correction
+    }
 }
 
 /// Process latent-survival rows in fixed contiguous chunks, using one
@@ -3263,7 +3287,7 @@ impl LatentSurvivalFamily {
         let acc = deterministic_latent_survival_row_reduction(
             self.event_target.len(),
             || LatentSurvivalJointGradientAccum {
-                ll: 0.0,
+                ll: CompensatedRowSum::default(),
                 gradient: Array1::<f64>::zeros(total),
             },
             |row_idx, acc| {
@@ -3292,12 +3316,12 @@ impl LatentSurvivalFamily {
                     point,
                     include_log_sigma,
                 )?;
-                acc.ll += checked_weighted_row_value(
+                acc.ll.add(checked_weighted_row_value(
                     wi,
                     row_ll,
                     row_idx,
                     "log likelihood",
-                )?;
+                )?);
                 self.add_pullback_primary_gradient(
                     &mut acc.gradient,
                     row_idx,
@@ -3308,13 +3332,13 @@ impl LatentSurvivalFamily {
                 Ok(())
             },
             |total_acc, chunk_acc| {
-                total_acc.ll += chunk_acc.ll;
+                total_acc.ll.add(chunk_acc.ll.value());
                 total_acc.gradient += &chunk_acc.gradient;
             },
         )?;
-        require_finite_likelihood_scalar(acc.ll, "log likelihood")?;
+        let ll = require_finite_likelihood_scalar(acc.ll.value(), "log likelihood")?;
         require_finite_likelihood_vector(&acc.gradient, "gradient")?;
-        Ok((acc.ll, acc.gradient))
+        Ok((ll, acc.gradient))
     }
 
     /// Per-row residuals of the unpenalized NLL with respect to the three
@@ -3571,7 +3595,7 @@ impl LatentSurvivalFamily {
         let sigma = self.latent_sd(block_states)?;
         let slices = self.joint_slices();
         let include_log_sigma = slices.log_sigma.is_some();
-        let mut ll = 0.0;
+        let mut ll = CompensatedRowSum::default();
         let mut gradient = Array1::<f64>::zeros(slices.total);
         let p_time = slices.time.len();
         let p_mean = slices.mean.len();
@@ -3608,7 +3632,12 @@ impl LatentSurvivalFamily {
                     },
                     include_log_sigma,
                 )?;
-            ll += checked_weighted_row_value(wi, row_ll, row_idx, "log likelihood")?;
+            ll.add(checked_weighted_row_value(
+                wi,
+                row_ll,
+                row_idx,
+                "log likelihood",
+            )?);
             self.add_pullback_primary_gradient(
                 &mut gradient,
                 row_idx,
@@ -3630,7 +3659,7 @@ impl LatentSurvivalFamily {
                 hess_log_sigma.as_mut(),
             )?;
         }
-        require_finite_likelihood_scalar(ll, "log likelihood")?;
+        let ll = require_finite_likelihood_scalar(ll.value(), "log likelihood")?;
         require_finite_likelihood_vector(&gradient, "gradient")?;
         require_finite_likelihood_matrix(&hess_time, "time Hessian")?;
         require_finite_likelihood_matrix(&hess_mean, "mean Hessian")?;
@@ -3655,7 +3684,7 @@ impl LatentSurvivalFamily {
         let acc = deterministic_latent_survival_row_reduction(
             self.event_target.len(),
             || LatentSurvivalJointDenseAccum {
-                ll: 0.0,
+                ll: CompensatedRowSum::default(),
                 gradient: Array1::<f64>::zeros(total),
                 hessian: Array2::<f64>::zeros((total, total)),
             },
@@ -3685,12 +3714,12 @@ impl LatentSurvivalFamily {
                         },
                         include_log_sigma,
                     )?;
-                acc.ll += checked_weighted_row_value(
+                acc.ll.add(checked_weighted_row_value(
                     wi,
                     row_ll,
                     row_idx,
                     "log likelihood",
-                )?;
+                )?);
                 self.add_pullback_primary_gradient(
                     &mut acc.gradient,
                     row_idx,
@@ -3713,15 +3742,15 @@ impl LatentSurvivalFamily {
                 Ok(())
             },
             |total_acc, chunk_acc| {
-                total_acc.ll += chunk_acc.ll;
+                total_acc.ll.add(chunk_acc.ll.value());
                 total_acc.gradient += &chunk_acc.gradient;
                 total_acc.hessian += &chunk_acc.hessian;
             },
         )?;
-        require_finite_likelihood_scalar(acc.ll, "log likelihood")?;
+        let ll = require_finite_likelihood_scalar(acc.ll.value(), "log likelihood")?;
         require_finite_likelihood_vector(&acc.gradient, "gradient")?;
         require_finite_likelihood_matrix(&acc.hessian, "Hessian")?;
-        Ok((acc.ll, acc.gradient, acc.hessian))
+        Ok((ll, acc.gradient, acc.hessian))
     }
 
     fn exact_newton_joint_hessian_directional_derivative_dense(
@@ -4213,43 +4242,52 @@ struct BinaryFromLogSurvival {
     outer_scale_second: f64,
 }
 
-/// Analytic source of truth for the directional derivatives of
-/// ℓ(s) = log(1 - exp(s)) at s = `log_survival`. Returns
-/// `(ℓ, ℓ', ℓ'', ℓ''', ℓ'''')`. All consumer scales (`grad_scale`,
-/// `neg_hess_scale`, `outer_scale`, and their two derivatives each)
-/// are derived from this single function so the sign/algebra cannot
-/// drift between sites.
-#[inline]
-fn binary_log_survival_scales(survival: f64, event_prob: f64) -> (f64, f64, f64, f64, f64) {
-    // ℓ(s)   = log(1 - exp(s)) = log(event_prob)
-    // dS/ds  = S,    dP/ds = -S        (S=survival, P=event_prob)
-    // ℓ'(s)  = -S/P
-    // ℓ''(s) = d/ds[-S/P] = -S/P²        (since P + S = 1)
-    // ℓ'''(s) = d/ds[-S/P²] = -S(1 + S)/P³
-    // ℓ''''(s) = d/ds[-S(1+S)/P³]
-    //          = -S/P³ - 3S²/P³ - 6S²(1+S)/P⁴ - ... ; expanded form below.
+/// Analytic source of truth for derivatives of
+/// `ell(s) = log(1 - exp(s))`, evaluated directly in the log-survival
+/// coordinate `s < 0`.
+///
+/// `P = -expm1(s)` avoids cancellation when survival is near one. Writing the
+/// derivative algebra in terms of the odds `r = exp(s) / P` avoids the `P^2`,
+/// `P^3`, and `P^4` intermediates that previously underflowed before a finite
+/// ratio could be formed. Any genuinely unrepresentable derivative is rejected.
+fn binary_log_survival_scales(
+    log_survival: f64,
+) -> Result<(f64, f64, f64, f64, f64), LatentSurvivalError> {
+    if !log_survival.is_finite() || log_survival >= 0.0 {
+        return Err(LatentSurvivalError::NumericalFailure {
+            reason: format!(
+                "latent-binary requires finite log survival < 0 for an observed event, got {log_survival:?}"
+            ),
+        });
+    }
+    let event_prob = -log_survival.exp_m1();
+    if !(event_prob.is_finite() && event_prob > 0.0) {
+        return Err(LatentSurvivalError::NumericalFailure {
+            reason: format!(
+                "latent-binary event probability is not representable from log survival {log_survival:?}"
+            ),
+        });
+    }
     let log_lik = event_prob.ln();
-    let p = event_prob;
-    let p2 = p * p;
-    let p3 = p2 * p;
-    let p4 = p3 * p;
-    let s = survival;
-    let s2 = s * s;
-    let s3 = s2 * s;
-    let ell_prime = -s / p;
-    let ell_pp = -s / p2;
-    let ell_ppp = -s * (1.0 + s) / p3;
-    // ℓ''''(s) = -S·(1 + 4S + S²) / P⁴ - 3·S²·(1+S)/P⁴? Use the equivalent
-    // expansion that matches the prior closed form:
-    //   d/ds[-S(1+S)/P³] = -(S + 2S²)/P³ - 3·S·(1+S)·S/P⁴
-    //                    = -(S + 2S²)/P³ - 3S²(1+S)/P⁴
-    // Combining over P⁴: -(S + 2S²)·P/P⁴ - 3S²(1+S)/P⁴
-    //                  = -[S·P + 2S²·P + 3S² + 3S³] / P⁴
-    // With P = 1 - S: S·P = S - S²; 2S²·P = 2S² - 2S³.
-    //   numerator = -[S - S² + 2S² - 2S³ + 3S² + 3S³] = -[S + 4S² + S³].
-    // So ℓ''''(s) = -(S + 4S² + S³) / P⁴.
-    let ell_pppp = -(s + 4.0 * s2 + s3) / p4;
-    (log_lik, ell_prime, ell_pp, ell_ppp, ell_pppp)
+    let odds = (log_survival - log_lik).exp();
+    let one_plus_odds = 1.0 + odds;
+    let ell_prime = -odds;
+    let ell_pp = -odds * one_plus_odds;
+    let ell_ppp = ell_pp * (1.0 + 2.0 * odds);
+    let ell_pppp = ell_pp * (1.0 + 6.0 * odds + 6.0 * odds * odds);
+    let scales = [log_lik, ell_prime, ell_pp, ell_ppp, ell_pppp];
+    if let Some((order, value)) = scales
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(LatentSurvivalError::NumericalFailure {
+            reason: format!(
+                "latent-binary log-survival derivative order {order} is not representable at {log_survival:?}: {value:?}"
+            ),
+        });
+    }
+    Ok((log_lik, ell_prime, ell_pp, ell_ppp, ell_pppp))
 }
 
 fn binary_from_log_survival(
@@ -4274,25 +4312,8 @@ fn binary_from_log_survival(
             reason: format!("latent-binary requires event targets in {{0,1}}, got {event}"),
         });
     }
-    // Cap log S(t) strictly below zero so the event probability
-    // `1 - exp(log S)` stays strictly positive even when the survival
-    // probability rounds to exactly 1 (log S == 0): a zero event probability
-    // would make the binary log-likelihood `log(event_prob)` diverge. The cap
-    // is at the f64 resolution near 1.0, so it never perturbs a genuinely
-    // informative survival value.
-    const MAX_LOG_SURVIVAL: f64 = -1e-15;
-    let log_survival = log_survival.min(MAX_LOG_SURVIVAL);
-    let survival = log_survival.exp();
-    let event_prob = 1.0 - survival;
-    if !(event_prob.is_finite() && event_prob > 0.0) {
-        return Err(LatentSurvivalError::NumericalFailure {
-            reason: format!(
-                "latent-binary encountered non-positive event probability from log survival {log_survival}"
-            ),
-        });
-    }
     let (log_lik, ell_prime, ell_pp, ell_ppp, ell_pppp) =
-        binary_log_survival_scales(survival, event_prob);
+        binary_log_survival_scales(log_survival)?;
     let grad_scale = ell_prime;
     let neg_hess_scale = ell_prime; // coefficient on (-d²s/dβ²); equals ℓ'.
     let outer_scale = -ell_pp;
@@ -4536,7 +4557,7 @@ impl LatentBinaryFamily {
             .map_err(String::from)?;
         let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
         let slices = self.joint_slices();
-        let mut ll = 0.0;
+        let mut ll = CompensatedRowSum::default();
         let mut gradient = Array1::<f64>::zeros(slices.total);
         let mut hessian = Array2::<f64>::zeros((slices.total, slices.total));
         for row_idx in 0..self.event_target.len() {
@@ -4561,12 +4582,12 @@ impl LatentBinaryFamily {
                     false,
                 )?;
             let binary = binary_from_log_survival(row_log_survival, self.event_target[row_idx])?;
-            ll += checked_weighted_row_value(
+            ll.add(checked_weighted_row_value(
                 wi,
                 binary.log_lik,
                 row_idx,
                 "binary log likelihood",
-            )?;
+            )?);
             let primary_gradient = binary.grad_scale * &survival_gradient;
             let mut primary_hessian = binary.grad_scale * survival_hessian;
             for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
@@ -4595,7 +4616,7 @@ impl LatentBinaryFamily {
                 &weighted_primary_hessian,
             );
         }
-        require_finite_likelihood_scalar(ll, "binary log likelihood")?;
+        let ll = require_finite_likelihood_scalar(ll.value(), "binary log likelihood")?;
         require_finite_likelihood_vector(&gradient, "binary gradient")?;
         require_finite_likelihood_matrix(&hessian, "binary Hessian")?;
         Ok((ll, gradient, hessian))
@@ -5338,10 +5359,11 @@ impl CustomFamily for LatentSurvivalFamily {
                 checked_weighted_row_value(wi, jet.log_lik, i, "log likelihood")
             })
             .collect();
-        require_finite_likelihood_scalar(
-            contributions?.into_iter().sum(),
-            "log likelihood",
-        )
+        let mut total = CompensatedRowSum::default();
+        for contribution in contributions? {
+            total.add(contribution);
+        }
+        require_finite_likelihood_scalar(total.value(), "log likelihood")
     }
 
     fn block_linear_constraints(
@@ -5461,7 +5483,7 @@ impl CustomFamily for LatentBinaryFamily {
         let p_time = self.x_time_exit.ncols();
         let p_mean = self.x_mean.ncols();
 
-        let mut ll = 0.0;
+        let mut ll = CompensatedRowSum::default();
         let mut grad_time = Array1::<f64>::zeros(p_time);
         let mut hess_time = Array2::<f64>::zeros((p_time, p_time));
         let mut grad_mean = Array1::<f64>::zeros(p_mean);
@@ -5486,12 +5508,12 @@ impl CustomFamily for LatentBinaryFamily {
                 LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], self.latent_sd)
                     .map_err(|e| format!("LatentBinaryFamily row {i}: {e}"))?;
             let binary = binary_from_log_survival(survival_jet.log_lik, self.event_target[i])?;
-            ll += checked_weighted_row_value(
+            ll.add(checked_weighted_row_value(
                 wi,
                 binary.log_lik,
                 i,
                 "binary log likelihood",
-            )?;
+            )?);
 
             self.x_mean
                 .row_chunk_into(i..i + 1, mean_row_buf.view_mut())
@@ -5589,7 +5611,7 @@ impl CustomFamily for LatentBinaryFamily {
             }
         }
 
-        require_finite_likelihood_scalar(ll, "binary log likelihood")?;
+        let ll = require_finite_likelihood_scalar(ll.value(), "binary log likelihood")?;
         require_finite_likelihood_vector(&grad_time, "binary time gradient")?;
         require_finite_likelihood_vector(&grad_mean, "binary mean gradient")?;
         require_finite_likelihood_matrix(&hess_time, "binary time Hessian")?;
@@ -5613,7 +5635,7 @@ impl CustomFamily for LatentBinaryFamily {
         let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-binary")
             .map_err(String::from)?;
         let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
-        let mut ll = 0.0;
+        let mut ll = CompensatedRowSum::default();
         for i in 0..self.event_target.len() {
             let wi = weights.at(i);
             if wi == 0.0 {
@@ -5624,14 +5646,14 @@ impl CustomFamily for LatentBinaryFamily {
                 LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], self.latent_sd)
                     .map_err(|e| format!("LatentBinaryFamily row {i}: {e}"))?;
             let binary = binary_from_log_survival(survival_jet.log_lik, self.event_target[i])?;
-            ll += checked_weighted_row_value(
+            ll.add(checked_weighted_row_value(
                 wi,
                 binary.log_lik,
                 i,
                 "binary log likelihood",
-            )?;
+            )?);
         }
-        require_finite_likelihood_scalar(ll, "binary log likelihood")
+        require_finite_likelihood_scalar(ll.value(), "binary log likelihood")
     }
 
     fn block_linear_constraints(

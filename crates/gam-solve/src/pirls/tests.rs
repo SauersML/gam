@@ -14,7 +14,7 @@ mod tests {
     use super::{
         DENSE_OUTER_MAX_P, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily,
-        WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance,
+        WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet,
         calculate_deviance_from_eta, calculate_loglikelihood,
         calculate_loglikelihood_omitting_constants_from_eta, compute_constraint_kkt_diagnostics,
         compute_observed_hessian_curvature_arrays, deviance_eta_row,
@@ -1792,15 +1792,19 @@ mod tests {
         let y = array![2.0, 5.0];
         let mu = array![1.0, 4.0];
         let w = array![1.5, 0.75];
-        let dev = calculate_deviance(
+        let eta = mu.mapv(f64::ln);
+        let inverse_link = InverseLink::Standard(StandardLink::Log);
+        let dev = calculate_deviance_from_eta(
             y.view(),
-            &mu,
+            &eta,
             &GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Gamma,
-                InverseLink::Standard(StandardLink::Log),
+                inverse_link.clone(),
             )),
+            &inverse_link,
             w.view(),
-        );
+        )
+        .expect("Gamma eta deviance must be representable");
         let expected = 2.0
             * (1.5 * (2.0_f64 / 1.0 - 1.0 - (2.0_f64 / 1.0).ln())
                 + 0.75 * (5.0_f64 / 4.0 - 1.0 - (5.0_f64 / 4.0).ln()));
@@ -2050,7 +2054,16 @@ mod tests {
         // scaled-deviance code path (× shape) would have been exercised.
         assert_eq!(likelihood.gamma_shape(), Some(shape));
 
-        let dev = calculate_deviance(y.view(), &mu, &likelihood, w.view());
+        let eta = mu.mapv(f64::ln);
+        let inverse_link = InverseLink::Standard(StandardLink::Log);
+        let dev = calculate_deviance_from_eta(
+            y.view(),
+            &eta,
+            &likelihood,
+            &inverse_link,
+            w.view(),
+        )
+        .expect("Gamma eta deviance must be representable");
 
         let sum_unit: f64 = w
             .iter()
@@ -2102,7 +2115,16 @@ mod tests {
         // old scaled-deviance code path (÷ φ) would have been exercised.
         assert_eq!(likelihood.fixed_phi(), Some(phi));
 
-        let dev = calculate_deviance(y.view(), &mu, &likelihood, w.view());
+        let eta = mu.mapv(f64::ln);
+        let inverse_link = InverseLink::Standard(StandardLink::Log);
+        let dev = calculate_deviance_from_eta(
+            y.view(),
+            &eta,
+            &likelihood,
+            &inverse_link,
+            w.view(),
+        )
+        .expect("Tweedie eta deviance must be representable");
 
         // Unscaled reference: 2·Σ wᵢ·d(yᵢ, μᵢ) with the Tweedie unit deviance
         // `d = y^{2-p}/((1-p)(2-p)) - y·μ^{1-p}/(1-p) + μ^{2-p}/(2-p)`.

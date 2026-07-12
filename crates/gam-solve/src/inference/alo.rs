@@ -181,7 +181,10 @@ impl fmt::Display for AloExactScalarError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             AloExactScalarError::EvaluationFailed { eta, ref reason } => {
-                write!(f, "score/curvature evaluation failed at eta={eta:.6e}: {reason}")
+                write!(
+                    f,
+                    "score/curvature evaluation failed at eta={eta:.6e}: {reason}"
+                )
             }
             AloExactScalarError::NonFiniteScoreCurvature {
                 eta,
@@ -338,16 +341,6 @@ fn alo_eta_exact_frozen_curvature(
     })
 }
 
-#[inline]
-fn bayesvar_eta(phi: f64, x_hinv_x: f64) -> f64 {
-    phi * x_hinv_x
-}
-
-#[inline]
-fn sandwichvar_eta_from_meat(phi: f64, meat_quad: f64) -> f64 {
-    phi * meat_quad
-}
-
 /// Evaluate `rhs' solution` after a residual-certified SPD solve. Neumaier
 /// compensation is the allocation-free hot path. Only an overflowed,
 /// underflowed, or non-positive cancellation result pays for the signed-log
@@ -358,6 +351,15 @@ fn spd_quadratic_after_certified_solve(
     rhs: ArrayView1<'_, f64>,
     solution: ArrayView1<'_, f64>,
 ) -> Result<f64, AloError> {
+    if rhs.len() != solution.len() {
+        return Err(AloError::LooComputationFailed {
+            reason: format!(
+                "ALO certified quadratic dimension mismatch at row {row}: rhs={}, solution={}",
+                rhs.len(),
+                solution.len()
+            ),
+        });
+    }
     let mut sum = 0.0_f64;
     let mut compensation = 0.0_f64;
     let mut rhs_nonzero = false;
@@ -434,6 +436,15 @@ fn finite_weighted_square_sum(
     weights: ArrayView1<'_, f64>,
     values: &[f64],
 ) -> Result<f64, AloError> {
+    if weights.len() != values.len() {
+        return Err(AloError::LooComputationFailed {
+            reason: format!(
+                "ALO sandwich quadratic dimension mismatch for observation {observation}: weights={}, values={}",
+                weights.len(),
+                values.len()
+            ),
+        });
+    }
     let mut sum = 0.0_f64;
     let mut compensation = 0.0_f64;
     let mut has_mathematically_positive_term = false;
@@ -524,6 +535,39 @@ fn finite_nonnegative_product(
         return Err(AloError::LooComputationFailed {
             reason: format!(
                 "ALO {quantity} lies outside the positive finite f64 range at row {row}: log_magnitude={log_magnitude}"
+            ),
+        });
+    }
+    Ok(value)
+}
+
+fn finite_signed_product(
+    row: usize,
+    quantity: &'static str,
+    left: f64,
+    right: f64,
+) -> Result<f64, AloError> {
+    if !left.is_finite() || !right.is_finite() {
+        return Err(AloError::LooComputationFailed {
+            reason: format!(
+                "ALO {quantity} requires finite factors at row {row}: left={left}, right={right}"
+            ),
+        });
+    }
+    if left == 0.0 || right == 0.0 {
+        return Ok(0.0);
+    }
+    let direct = left * right;
+    if direct.is_finite() && direct != 0.0 {
+        return Ok(direct);
+    }
+    let log_magnitude = left.abs().ln() + right.abs().ln();
+    let value = left.signum() * right.signum() * log_magnitude.exp();
+    if !value.is_finite() || value == 0.0 {
+        return Err(AloError::LooComputationFailed {
+            reason: format!(
+                "ALO {quantity} lies outside the nonzero finite f64 range at row {row}: sign={}, log_magnitude={log_magnitude}",
+                left.signum() * right.signum()
             ),
         });
     }
@@ -640,10 +684,7 @@ fn compute_alo_diagnostics_from_pirls_impl(
 /// Gaussian already carry their full scale in the working Hessian and therefore
 /// all have coefficient-covariance multiplier one.
 fn alo_covariance_scale(base: &pirls::PirlsResult) -> Result<f64, AloError> {
-    let dispersion = match (
-        &base.likelihood.spec.response,
-        base.likelihood.scale,
-    ) {
+    let dispersion = match (&base.likelihood.spec.response, base.likelihood.scale) {
         (ResponseFamily::Gaussian, LikelihoodScaleMetadata::ProfiledGaussian) => {
             let rss = base.deviance;
             if !(rss.is_finite() && rss >= 0.0) {
@@ -796,45 +837,46 @@ fn compute_alo_diagnostics_from_pirls_inner(
     // numerator and derivative are exactly zero, the row has no representable
     // local influence and c_i is exactly zero; every other nonrepresentable
     // ratio is an explicit error.
-    let canonical_scale: Option<Array1<f64>> =
-        if alo_link_needs_exact_curvature_refinement(&base.likelihood) {
-            let mut c = Array1::<f64>::zeros(n);
-            for i in 0..n {
-                let dmu = base.solve_dmu_deta[i];
-                let w_h = base.finalweights[i];
-                if !dmu.is_finite() || !w_h.is_finite() || dmu < 0.0 || w_h < 0.0 {
-                    return Err(AloError::WeightInvalid {
-                        reason: format!(
-                            "canonical ALO requires finite non-negative local derivative and curvature; row {i} has dmu_deta={dmu}, weight={w_h}"
-                        ),
-                    });
-                }
-                let scale = if dmu == 0.0 {
-                    if w_h == 0.0 {
-                        0.0
-                    } else {
-                        return Err(AloError::LooComputationFailed {
-                            reason: format!(
-                                "canonical ALO scale is undefined at row {i}: nonzero curvature {w_h} divided by zero inverse-link derivative"
-                            ),
-                        });
-                    }
+    let canonical_scale: Option<Array1<f64>> = if alo_link_needs_exact_curvature_refinement(
+        &base.likelihood,
+    ) {
+        let mut c = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let dmu = base.solve_dmu_deta[i];
+            let w_h = base.finalweights[i];
+            if !dmu.is_finite() || !w_h.is_finite() || dmu < 0.0 || w_h < 0.0 {
+                return Err(AloError::WeightInvalid {
+                    reason: format!(
+                        "canonical ALO requires finite non-negative local derivative and curvature; row {i} has dmu_deta={dmu}, weight={w_h}"
+                    ),
+                });
+            }
+            let scale = if dmu == 0.0 {
+                if w_h == 0.0 {
+                    0.0
                 } else {
-                    w_h / dmu
-                };
-                if !scale.is_finite() || scale < 0.0 || (w_h > 0.0 && scale == 0.0) {
                     return Err(AloError::LooComputationFailed {
                         reason: format!(
-                            "canonical ALO scale is not representable at row {i}: weight={w_h}, dmu_deta={dmu}, scale={scale}"
+                            "canonical ALO scale is undefined at row {i}: nonzero curvature {w_h} divided by zero inverse-link derivative"
                         ),
                     });
                 }
-                c[i] = scale;
+            } else {
+                w_h / dmu
+            };
+            if !scale.is_finite() || scale < 0.0 || (w_h > 0.0 && scale == 0.0) {
+                return Err(AloError::LooComputationFailed {
+                    reason: format!(
+                        "canonical ALO scale is not representable at row {i}: weight={w_h}, dmu_deta={dmu}, scale={scale}"
+                    ),
+                });
             }
-            Some(c)
-        } else {
-            None
-        };
+            c[i] = scale;
+        }
+        Some(c)
+    } else {
+        None
+    };
 
     let inv_link_for_closure = base.likelihood.spec.link.clone();
     let score_curvature_closure = canonical_scale.as_ref().map(|scale| {
@@ -1181,20 +1223,18 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
             // storage order chosen inside the factor API.
             let rhs_col = rhs_view.column(local_col);
             let solution_col = s_chunk.column(local_col);
-            let x_hinv_x =
-                spd_quadratic_after_certified_solve(obs, rhs_col, solution_col)?;
+            let x_hinv_x = spd_quadratic_after_certified_solve(obs, rhs_col, solution_col)?;
             // The bread uses the observed Hessian surface. For a non-canonical
             // link W_H is signed, so the exact row leverage W_H,i x_i'H^-1x_i
             // can be negative even though the assembled penalized H is SPD.
             // Projecting that row to zero changes both the ALO denominator and
             // corrected predictor; only the separate score-covariance meat is
             // PSD (and uses W_S below).
-            let ai = w_h[obs] * x_hinv_x;
+            let ai = finite_signed_product(obs, "leverage", w_h[obs], x_hinv_x)?;
             aii[obs] = ai;
             x_hinv_x_diag[obs] = x_hinv_x;
 
-            let var_bayes =
-                finite_nonnegative_product(obs, "Bayesian variance", phi, x_hinv_x)?;
+            let var_bayes = finite_nonnegative_product(obs, "Bayesian variance", phi, x_hinv_x)?;
             let xs_slice = xs_chunk_storage.col_as_slice(local_col);
             // Sandwich meat is the SCORE covariance Xᵀ diag(W_S) X (Fisher,
             // PSD by construction), not the observed-information Hessian
@@ -1282,11 +1322,6 @@ fn validate_alo_solve_setup(input: &AloInput, n: usize, p: usize) -> Result<(), 
                 h.nrows(),
                 h.ncols()
             ),
-        });
-    }
-    if h.iter().any(|v| !v.is_finite()) {
-        return Err(AloError::InvalidInput {
-            reason: "ALO diagnostics require a finite dense exact penalized Hessian".to_string(),
         });
     }
     let vector_lengths = [
@@ -2168,8 +2203,8 @@ pub fn compute_multiblock_alo_leverages(
 mod tests {
     use super::{
         ALO_EXACT_SCALAR_MAX_ITERS, AloExactScalarError, AloInput, alo_eta_exact_frozen_curvature,
-        alo_eta_updatewith_offset, bayesvar_eta, compute_alo_from_input_inner,
-        percentile_from_sorted, percentile_index, sandwichvar_eta_from_meat,
+        alo_eta_updatewith_offset, compute_alo_from_input_inner, finite_weighted_square_sum,
+        percentile_from_sorted, percentile_index, spd_quadratic_after_certified_solve,
     };
     use gam_linalg::matrix::{PsdWeightsView, SignedWeightsView};
     use gam_problem::LinkFunction;
@@ -2253,10 +2288,9 @@ mod tests {
     fn alo_exact_frozen_curvature_converges_to_fixed_point() {
         let eta_hat = 1.0;
         let a_ii = 0.4;
-        let got = alo_eta_exact_frozen_curvature(eta_hat, a_ii, &|eta| {
-            Ok((0.5 * (eta - 2.0), 0.5))
-        })
-        .expect("linear scalar fixed point should converge in one Newton step");
+        let got =
+            alo_eta_exact_frozen_curvature(eta_hat, a_ii, &|eta| Ok((0.5 * (eta - 2.0), 0.5)))
+                .expect("linear scalar fixed point should converge in one Newton step");
         assert!((got - 0.75).abs() < 1e-12);
     }
 
@@ -2309,23 +2343,19 @@ mod tests {
     }
 
     #[test]
-    fn gaussian_unpenalized_direct_sandwich_equals_bayes() {
-        // In a Gaussian linear model with H = X'WX, direct meat
-        // x_i'H^{-1}X'WXH^{-1}x_i equals x_i'H^{-1}x_i.
-        let phi = 2.5;
-        let x_hinv_x = 0.3;
-        let vb = bayesvar_eta(phi, x_hinv_x);
-        let vs = sandwichvar_eta_from_meat(phi, x_hinv_x);
-        assert!((vb - vs).abs() < 1e-12);
-    }
+    fn alo_scale_safe_quadratics_preserve_tiny_weights_without_false_overflow() {
+        let weights = Array1::from_vec(vec![1e-300, 2.0]);
+        let values = [1e200, 3.0];
+        let meat = finite_weighted_square_sum(0, weights.view(), &values)
+            .expect("weighted square sum is representable");
+        assert!(meat.is_finite());
+        assert!((meat - 1e100).abs() <= 8.0 * f64::EPSILON * 1e100);
 
-    #[test]
-    fn sandwich_from_direct_meat_scales_by_phi() {
-        let phi = 1.7;
-        let meat_quad = 0.358;
-        let got = sandwichvar_eta_from_meat(phi, meat_quad);
-        let expected = phi * meat_quad;
-        assert!((got - expected).abs() < 1e-12);
+        let rhs = Array1::from_vec(vec![2.0, -1.0]);
+        let solution = Array1::from_vec(vec![1.5, 0.5]);
+        let quadratic =
+            spd_quadratic_after_certified_solve(0, rhs.view(), solution.view()).unwrap();
+        assert_eq!(quadratic, 2.5);
     }
 
     #[test]
@@ -2364,10 +2394,7 @@ mod tests {
         // Pre-fix arithmetic check: the OLD W_H meat would be materially negative
         // for the larger-x rows, so the old code returned LooComputationFailed.
         let old_meat_obs1 = x[[1, 0]] * x[[1, 0]] / (h * h) * sum_wh_x2;
-        assert!(
-            phi * old_meat_obs1 < -super::variance_negative_tolerance(phi * old_meat_obs1.abs()),
-            "the pre-fix W_H meat must be materially negative (guard would trip)"
-        );
+        assert!(phi * old_meat_obs1 < 0.0, "the pre-fix W_H meat is signed");
 
         let working_response = Array1::from_vec(vec![0.3, -0.2, 0.5, 0.1, -0.4]);
         let eta = Array1::from_vec(vec![0.2, 0.1, 0.4, -0.1, 0.05]);

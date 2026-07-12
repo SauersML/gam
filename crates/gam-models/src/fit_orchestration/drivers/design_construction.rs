@@ -3154,9 +3154,9 @@ impl BlockEffectiveJacobian for BoundedEffectiveJacobian {
                     state.beta.len(),
                 ));
             }
-            if state.beta.iter().any(|v| v.is_nan()) {
+            if state.beta.iter().any(|v| !v.is_finite()) {
                 return Err(
-                    "BoundedEffectiveJacobian::effective_jacobian_at: beta contains NaN"
+                    "BoundedEffectiveJacobian::effective_jacobian_at: beta contains a non-finite value"
                         .to_string(),
                 );
             }
@@ -3166,12 +3166,24 @@ impl BlockEffectiveJacobian for BoundedEffectiveJacobian {
             .slice(ndarray::s![rows.start..rows.end, ..])
             .to_owned();
         for term in &self.bounded_terms {
+            if term.col_idx >= p {
+                return Err(format!(
+                    "BoundedEffectiveJacobian::effective_jacobian_at: bounded column {} is outside {p} columns",
+                    term.col_idx
+                ));
+            }
             let theta = if state.beta.is_empty() {
                 0.0
             } else {
                 state.beta[term.col_idx]
             };
             let (_, _, db_dtheta, _, _) = bounded_latent_derivatives(theta, term.min, term.max);
+            if !(db_dtheta.is_finite() && db_dtheta > 0.0) {
+                return Err(format!(
+                    "BoundedEffectiveJacobian::effective_jacobian_at: bounded column {} has unrepresentable derivative {db_dtheta} at theta={theta}",
+                    term.col_idx
+                ));
+            }
             jac.column_mut(term.col_idx).mapv_inplace(|v| v * db_dtheta);
         }
         Ok(jac)
@@ -3192,7 +3204,7 @@ struct BoundedLinearFamily {
     bounded_terms: Vec<BoundedLinearTermMeta>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct StandardFamilyObservationState {
     eta: Array1<f64>,
     mu: Array1<f64>,
@@ -3392,7 +3404,12 @@ pub fn sample_bounded_latent_posterior_internal(
 #[inline]
 fn standard_normal_draw<R: rand::Rng + ?Sized>(rng: &mut R) -> f64 {
     use rand::RngExt as _;
-    let u1 = rng.random::<f64>().max(1e-16);
+    let u1 = loop {
+        let candidate = rng.random::<f64>();
+        if candidate > 0.0 {
+            break candidate;
+        }
+    };
     let u2 = rng.random::<f64>();
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
 }
@@ -3400,16 +3417,41 @@ fn standard_normal_draw<R: rand::Rng + ?Sized>(rng: &mut R) -> f64 {
 /// Solve `Lᵀ x = b` for a lower-triangular `L` (back substitution), writing the
 /// result into `out`. Used to turn a standard-normal `b` into a draw with
 /// covariance `(L Lᵀ)^{-1}`.
-fn solve_lower_transpose_into(l: &Array2<f64>, b: &Array1<f64>, out: &mut Array1<f64>) {
+fn solve_lower_transpose_into(
+    l: &Array2<f64>,
+    b: &Array1<f64>,
+    out: &mut Array1<f64>,
+) -> Result<(), EstimationError> {
     let p = l.nrows();
+    if l.ncols() != p || b.len() != p || out.len() != p {
+        crate::bail_invalid_estim!(
+            "bounded triangular solve dimension mismatch: L={}x{}, b={}, out={}",
+            l.nrows(),
+            l.ncols(),
+            b.len(),
+            out.len()
+        );
+    }
     for i in (0..p).rev() {
         let mut acc = b[i];
         for j in (i + 1)..p {
             acc -= l[(j, i)] * out[j];
         }
         let diag = l[(i, i)];
-        out[i] = if diag.abs() > 0.0 { acc / diag } else { 0.0 };
+        if !(diag.is_finite() && diag > 0.0 && acc.is_finite()) {
+            crate::bail_invalid_estim!(
+                "bounded triangular solve has invalid row {i}: diagonal={diag}, residual={acc}"
+            );
+        }
+        let value = acc / diag;
+        if !value.is_finite() {
+            crate::bail_invalid_estim!(
+                "bounded triangular solve produced a non-finite value at row {i}: {acc}/{diag}"
+            );
+        }
+        out[i] = value;
     }
+    Ok(())
 }
 
 fn bounded_latent_derivatives(theta: f64, min: f64, max: f64) -> (f64, f64, f64, f64, f64) {
@@ -3423,15 +3465,28 @@ fn bounded_latent_derivatives(theta: f64, min: f64, max: f64) -> (f64, f64, f64,
     (beta, z, db_dtheta, d2b_dtheta2, d3b_dtheta3)
 }
 
-fn bounded_prior_terms(theta: f64, prior: &BoundedCoefficientPriorSpec) -> (f64, f64, f64, f64) {
+fn bounded_prior_terms(
+    theta: f64,
+    prior: &BoundedCoefficientPriorSpec,
+) -> Result<(f64, f64, f64, f64), String> {
+    if !theta.is_finite() {
+        return Err(format!(
+            "bounded coefficient prior requires a finite latent coordinate, got {theta}"
+        ));
+    }
     let (a, b) = match prior {
         // `None` means constrained MLE with no extra prior term on the bounded coefficient.
-        BoundedCoefficientPriorSpec::None => return (0.0, 0.0, 0.0, 0.0),
+        BoundedCoefficientPriorSpec::None => return Ok((0.0, 0.0, 0.0, 0.0)),
         // Uniform on the normalized user-scale coefficient z in (0, 1). In latent space this is
         // exactly the Jacobian term for the logistic transform, up to an additive width constant.
         BoundedCoefficientPriorSpec::Uniform => (1.0, 1.0),
         BoundedCoefficientPriorSpec::Beta { a, b } => (*a, *b),
     };
+    if !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0) {
+        return Err(format!(
+            "bounded coefficient Beta prior requires finite positive shapes, got ({a}, {b})"
+        ));
+    }
     let jet = logit_inverse_link_jet5(theta);
     let z = jet.mu;
     // log(sigmoid(theta)) = -softplus(-theta) and
@@ -3443,7 +3498,16 @@ fn bounded_prior_terms(theta: f64, prior: &BoundedCoefficientPriorSpec) -> (f64,
     let grad = a - (a + b) * z;
     let neghess = (a + b) * jet.d1;
     let neghess_derivative = (a + b) * jet.d2;
-    (logp, grad, neghess, neghess_derivative)
+    let terms = (logp, grad, neghess, neghess_derivative);
+    if [terms.0, terms.1, terms.2, terms.3]
+        .iter()
+        .any(|value| !value.is_finite())
+    {
+        return Err(format!(
+            "bounded coefficient prior geometry is not representable at theta={theta}: {terms:?}"
+        ));
+    }
+    Ok(terms)
 }
 
 #[derive(Clone, Copy)]
@@ -3897,13 +3961,13 @@ fn validate_bounded_observation_inputs(
             family.link.link_function().name()
         );
     }
-    match family.response {
-        ResponseFamily::Tweedie { p } if !(p.is_finite() && p > 1.0 && p < 2.0) => {
+    match &family.response {
+        ResponseFamily::Tweedie { p } if !(p.is_finite() && *p > 1.0 && *p < 2.0) => {
             crate::bail_invalid_estim!(
                 "bounded Tweedie power must be finite and strictly inside (1, 2), got {p}"
             );
         }
-        ResponseFamily::NegativeBinomial { theta, .. } if !(theta.is_finite() && theta > 0.0) => {
+        ResponseFamily::NegativeBinomial { theta, .. } if !(theta.is_finite() && *theta > 0.0) => {
             crate::bail_invalid_estim!(
                 "bounded negative-binomial theta must be finite and positive, got {theta}"
             );
@@ -3918,11 +3982,19 @@ fn validate_bounded_observation_inputs(
         if !eta[i].is_finite() {
             return Err(bounded_row_error(i, "linear predictor", eta[i], eta[i]));
         }
+        if !y[i].is_finite() {
+            return Err(bounded_row_error(
+                i,
+                "bounded-family response",
+                eta[i],
+                y[i],
+            ));
+        }
         if wi == 0.0 {
             continue;
         }
         let yi = y[i];
-        let valid = match family.response {
+        let valid = match &family.response {
             ResponseFamily::Gaussian => yi.is_finite(),
             ResponseFamily::Binomial => yi.is_finite() && (0.0..=1.0).contains(&yi),
             ResponseFamily::Poisson | ResponseFamily::NegativeBinomial { .. } => {
@@ -3947,7 +4019,7 @@ fn exact_standard_observation_row(
     weight: f64,
     eta: f64,
 ) -> Result<ExactStandardObservationRow, EstimationError> {
-    match family.response {
+    match &family.response {
         ResponseFamily::Gaussian => {
             if weight == 0.0 {
                 return Ok(ExactStandardObservationRow::zero_weight(eta));
@@ -4047,6 +4119,7 @@ fn exact_standard_observation_row(
             )
         }
         ResponseFamily::Tweedie { p } => {
+            let p = *p;
             let mu = inverse_link_jet_for_inverse_link(&family.link, eta)?.mu;
             if weight == 0.0 {
                 return Ok(ExactStandardObservationRow::zero_weight(mu));
@@ -4105,6 +4178,7 @@ fn exact_standard_observation_row(
             )
         }
         ResponseFamily::NegativeBinomial { theta, .. } => {
+            let theta = *theta;
             let mu = inverse_link_jet_for_inverse_link(&family.link, eta)?.mu;
             if weight == 0.0 {
                 return Ok(ExactStandardObservationRow::zero_weight(mu));
@@ -5641,46 +5715,86 @@ impl BoundedLinearFamily {
     fn bounded_term_derivative_data(
         &self,
         latent_beta: &Array1<f64>,
-    ) -> (
-        Array1<f64>,
-        Array1<f64>,
-        Array1<f64>,
-        Array1<f64>,
-        Array1<f64>,
-    ) {
+    ) -> Result<
+        (
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+        ),
+        String,
+    > {
         let p = latent_beta.len();
+        if p != self.design.ncols() || latent_beta.iter().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "bounded coefficient geometry requires {} finite latent coefficients, got {}",
+                self.design.ncols(),
+                p
+            ));
+        }
         let mut beta_user = latent_beta.clone();
         let mut jac_diag = Array1::<f64>::ones(p);
         let mut second_diag = Array1::<f64>::zeros(p);
         let mut third_diag = Array1::<f64>::zeros(p);
         let mut priorthird = Array1::<f64>::zeros(p);
         for term in &self.bounded_terms {
+            let width = term.max - term.min;
+            if term.col_idx >= p
+                || !term.min.is_finite()
+                || !term.max.is_finite()
+                || !(width.is_finite() && width > 0.0)
+            {
+                return Err(format!(
+                    "bounded coefficient geometry has invalid column/bounds: col={}, p={p}, bounds=({}, {})",
+                    term.col_idx, term.min, term.max
+                ));
+            }
             let (beta, _, db_dtheta, d2b_dtheta2, d3b_dtheta3) =
                 bounded_latent_derivatives(latent_beta[term.col_idx], term.min, term.max);
+            if [beta, db_dtheta, d2b_dtheta2, d3b_dtheta3]
+                .iter()
+                .any(|value| !value.is_finite())
+            {
+                return Err(format!(
+                    "bounded coefficient transform is not representable at column {} and theta={}",
+                    term.col_idx, latent_beta[term.col_idx]
+                ));
+            }
             beta_user[term.col_idx] = beta;
             jac_diag[term.col_idx] = db_dtheta;
             second_diag[term.col_idx] = d2b_dtheta2;
             third_diag[term.col_idx] = d3b_dtheta3;
             let (_, _, _, prior_neghess_derivative) =
-                bounded_prior_terms(latent_beta[term.col_idx], &term.prior);
+                bounded_prior_terms(latent_beta[term.col_idx], &term.prior)?;
             priorthird[term.col_idx] = prior_neghess_derivative;
         }
-        (beta_user, jac_diag, second_diag, third_diag, priorthird)
+        Ok((beta_user, jac_diag, second_diag, third_diag, priorthird))
     }
 
-    fn user_beta_and_jacobian(&self, latent_beta: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
-        let (beta_user, jac_diag, _, _, _) = self.bounded_term_derivative_data(latent_beta);
-        (beta_user, jac_diag)
+    fn user_beta_and_jacobian(
+        &self,
+        latent_beta: &Array1<f64>,
+    ) -> Result<(Array1<f64>, Array1<f64>), String> {
+        let (beta_user, jac_diag, _, _, _) = self.bounded_term_derivative_data(latent_beta)?;
+        Ok((beta_user, jac_diag))
     }
 
-    fn nonlinear_offset_from_latent(&self, latent_beta: &Array1<f64>) -> Array1<f64> {
+    fn nonlinear_offset_from_latent(
+        &self,
+        latent_beta: &Array1<f64>,
+    ) -> Result<Array1<f64>, String> {
+        self.bounded_term_derivative_data(latent_beta)?;
         let mut offset = self.offset.clone();
         for term in &self.bounded_terms {
             let (beta, _, _) =
                 bounded_latent_to_user(latent_beta[term.col_idx], term.min, term.max);
             offset.scaled_add(beta, &self.design.column(term.col_idx));
         }
-        offset
+        if offset.iter().any(|value| !value.is_finite()) {
+            return Err("bounded nonlinear offset is not representable".to_string());
+        }
+        Ok(offset)
     }
 
     fn effective_design_for_latent(&self, jac_diag: &Array1<f64>) -> Array2<f64> {
@@ -5709,10 +5823,10 @@ impl BoundedLinearFamily {
         String,
     > {
         let (_, jac_diag, second_diag, third_diag, priorthird) =
-            self.bounded_term_derivative_data(latent_beta);
+            self.bounded_term_derivative_data(latent_beta)?;
         let x_eff = self.effective_design_for_latent(&jac_diag);
         let eta =
-            self.designzeroed.dot(latent_beta) + self.nonlinear_offset_from_latent(latent_beta);
+            self.designzeroed.dot(latent_beta) + self.nonlinear_offset_from_latent(latent_beta)?;
         let obs = evaluate_standard_familyobservations(
             self.family.clone(),
             self.latent_cloglog_state.as_ref(),
@@ -5729,7 +5843,7 @@ impl BoundedLinearFamily {
         let mut prior_loglik = 0.0;
         for term in &self.bounded_terms {
             let (logp, grad, neghess, _) =
-                bounded_prior_terms(latent_beta[term.col_idx], &term.prior);
+                bounded_prior_terms(latent_beta[term.col_idx], &term.prior)?;
             prior_loglik += logp;
             priorgrad[term.col_idx] += grad;
             prior_neghess[[term.col_idx, term.col_idx]] += neghess;
@@ -5830,7 +5944,7 @@ impl CustomFamily for BoundedLinearFamily {
         let (obs, _, _, _, second_diag, third_diag, priorthird) =
             self.exacthessian_andgradient(latent_beta)?;
 
-        let (_, jac_diag, _, _, _) = self.bounded_term_derivative_data(latent_beta);
+        let (_, jac_diag, _, _, _) = self.bounded_term_derivative_data(latent_beta)?;
         let x_eff = self.effective_design_for_latent(&jac_diag);
         let deta = x_eff.dot(d_beta_flat);
         let d_neghess_eta = &obs.neghessian_eta_derivative * &deta;
@@ -5889,7 +6003,7 @@ impl CustomFamily for BoundedLinearFamily {
         }
         let offset = self.nonlinear_offset_from_latent(
             &expect_single_block_state(block_states, "bounded linear family")?.beta,
-        );
+        )?;
         let x = if spec.design.ncols() == self.designzeroed.ncols() {
             self.designzeroed.clone()
         } else {
@@ -5929,7 +6043,7 @@ impl CustomFamily for BoundedLinearFamily {
             ))
             .into());
         }
-        let (_, jac_diag, _, _, _) = self.bounded_term_derivative_data(&block_states[0].beta);
+        let (_, jac_diag, _, _, _) = self.bounded_term_derivative_data(&block_states[0].beta)?;
         let mut d_offset = Array1::<f64>::zeros(self.offset.len());
         let has_drift = self
             .bounded_terms
@@ -6346,7 +6460,9 @@ fn fit_bounded_term_collection_with_design(
     .map_err(EstimationError::CustomFamily)?;
 
     let latent_beta = fit.block_states[0].beta.clone();
-    let (beta_user_internal, jac_diag) = family_adapter.user_beta_and_jacobian(&latent_beta);
+    let (beta_user_internal, jac_diag) = family_adapter
+        .user_beta_and_jacobian(&latent_beta)
+        .map_err(EstimationError::InvalidInput)?;
     let beta_user = conditioning.backtransform_beta(&beta_user_internal);
 
     let (eta_state, h_data, _, _) = family_adapter
@@ -7608,12 +7724,21 @@ mod glm_eta_observation_fd_tests {
     //! finite differences of the assembled log-likelihood / score.
     use super::*;
 
-    fn one_obs(spec: &LikelihoodSpec, y: f64, eta: f64) -> StandardFamilyObservationState {
+    fn one_obs_weight(
+        spec: &LikelihoodSpec,
+        y: f64,
+        weight: f64,
+        eta: f64,
+    ) -> StandardFamilyObservationState {
         let yv = Array1::from_vec(vec![y]);
-        let wv = Array1::from_vec(vec![1.0]);
+        let wv = Array1::from_vec(vec![weight]);
         let ev = Array1::from_vec(vec![eta]);
         evaluate_standard_familyobservations(spec.clone(), None, None, None, &yv, &wv, &ev)
             .expect("standard family observation state assembles")
+    }
+
+    fn one_obs(spec: &LikelihoodSpec, y: f64, eta: f64) -> StandardFamilyObservationState {
+        one_obs_weight(spec, y, 1.0, eta)
     }
 
     fn check_fd(label: &str, spec: &LikelihoodSpec, y: f64, eta: f64) {
@@ -7680,5 +7805,94 @@ mod glm_eta_observation_fd_tests {
         };
         check_fd("tweedie y=2", &tweedie, 2.0, 0.25);
         check_fd("tweedie y=0.5", &tweedie, 0.5, -0.15);
+    }
+
+    #[test]
+    fn logit_observation_geometry_carries_the_prior_weight_everywhere() {
+        let eta = 1.75;
+        let y = 0.3;
+        let weight = 7.25;
+        let state = one_obs_weight(&LikelihoodSpec::binomial_logit(), y, weight, eta);
+        let jet = logit_inverse_link_jet5(eta);
+        assert_eq!(state.fisherweight[0], weight * jet.d1);
+        assert_eq!(state.neghessian_eta[0], weight * jet.d1);
+        assert_eq!(state.neghessian_eta_derivative[0], weight * jet.d2);
+        assert_eq!(state.score[0], weight * (y - jet.mu));
+    }
+
+    #[test]
+    fn tiny_positive_and_zero_weights_are_not_projected() {
+        let tiny = 1e-200;
+        let logit = one_obs_weight(&LikelihoodSpec::binomial_logit(), 0.4, tiny, 0.0);
+        assert_eq!(logit.fisherweight[0], 0.25 * tiny);
+        assert!(logit.fisherweight[0] < 1e-190);
+
+        let zero = one_obs_weight(&LikelihoodSpec::gaussian_identity(), 3.0, 0.0, -2.0);
+        assert_eq!(zero.score[0], 0.0);
+        assert_eq!(zero.fisherweight[0], 0.0);
+        assert_eq!(zero.neghessian_eta[0], 0.0);
+        assert_eq!(zero.neghessian_eta_derivative[0], 0.0);
+        assert_eq!(zero.log_likelihood, 0.0);
+        assert_eq!(exact_standard_working_response(&zero).unwrap()[0], -2.0);
+    }
+
+    #[test]
+    fn log_link_tails_balance_tiny_weights_before_certification() {
+        let poisson = one_obs_weight(&LikelihoodSpec::poisson_log(), 0.0, 1e-300, 700.0);
+        assert!(poisson.fisherweight[0].is_finite() && poisson.fisherweight[0] > 1.0);
+        assert!(poisson.score[0].is_finite());
+        assert!(poisson.log_likelihood.is_finite());
+
+        let gamma = one_obs_weight(&LikelihoodSpec::gamma_log(), 1.0, 1e-300, -700.0);
+        assert!(gamma.neghessian_eta[0].is_finite() && gamma.neghessian_eta[0] > 1.0);
+        assert!(gamma.score[0].is_finite());
+        assert!(gamma.log_likelihood.is_finite());
+    }
+
+    #[test]
+    fn invalid_weights_and_nonfinite_inputs_are_refused_in_row_order() {
+        let family = LikelihoodSpec::gaussian_identity();
+        let y = array![1.0, 2.0];
+        let eta = array![0.0, 0.0];
+        for weights in [array![-1.0, 1.0], array![f64::NAN, 1.0]] {
+            let err = evaluate_standard_familyobservations(
+                family.clone(),
+                None,
+                None,
+                None,
+                &y,
+                &weights,
+                &eta,
+            )
+            .expect_err("invalid prior weight must be refused");
+            assert!(err.to_string().contains("row 0"), "{err}");
+        }
+
+        let err = evaluate_standard_familyobservations(
+            family,
+            None,
+            None,
+            None,
+            &array![f64::NAN],
+            &array![0.0],
+            &array![0.0],
+        )
+        .expect_err("a non-finite response may not hide behind zero weight");
+        assert!(err.to_string().contains("row 0"), "{err}");
+    }
+
+    #[test]
+    fn unrepresentable_cloglog_curvature_is_refused_without_a_floor() {
+        let err = evaluate_standard_familyobservations(
+            LikelihoodSpec::binomial_cloglog(),
+            None,
+            None,
+            None,
+            &array![1.0],
+            &array![1.0],
+            &array![18.0],
+        )
+        .expect_err("mathematically sub-f64 Fisher information must be refused");
+        assert!(err.to_string().contains("Fisher weight"), "{err}");
     }
 }

@@ -15,8 +15,8 @@
 // `matern_nfree_rekey_topology_tests.rs`.
 #[cfg(test)]
 mod adaptive_bounded_duchon_tests {
-    use super::*;
     use super::test_support::SingleBlockExactJointDesignCacheTestExt;
+    use super::*;
     // Basis spec types this fixture builds adaptive/bounded designs from.
     // `CenterStrategy` and `MaternIdentifiability` already arrive via `super::*`
     // (the drivers' explicit `gam_terms::basis` import), so re-listing them would
@@ -138,7 +138,8 @@ mod adaptive_bounded_duchon_tests {
         assert_reparam_penalty_symmetric("base", &base_design);
 
         let frozen = freeze_term_collection_from_design(&spec, &base_design).expect("freeze spec");
-        let frozen_design = build_term_collection_design(data.view(), &frozen).expect("frozen rebuild");
+        let frozen_design =
+            build_term_collection_design(data.view(), &frozen).expect("frozen rebuild");
         assert_design_penalties_symmetric("frozen", &frozen_design);
         assert_reparam_penalty_symmetric("frozen", &frozen_design);
 
@@ -774,8 +775,11 @@ mod adaptive_bounded_duchon_tests {
     #[test]
     fn bounded_uniform_prior_matches_beta_one_one_terms() {
         let theta = 0.7;
-        let uniform = bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Uniform);
-        let beta11 = bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Beta { a: 1.0, b: 1.0 });
+        let uniform = bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Uniform)
+            .expect("uniform prior geometry");
+        let beta11 =
+            bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Beta { a: 1.0, b: 1.0 })
+                .expect("Beta(1,1) prior geometry");
         assert!((uniform.0 - beta11.0).abs() < 1e-12);
         assert!((uniform.1 - beta11.1).abs() < 1e-12);
         assert!((uniform.2 - beta11.2).abs() < 1e-12);
@@ -785,15 +789,33 @@ mod adaptive_bounded_duchon_tests {
     #[test]
     fn boundednone_prior_has_no_extra_latentobjective_terms() {
         let theta = 0.7;
-        let none = bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::None);
+        let none = bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::None)
+            .expect("flat prior geometry");
         assert_eq!(none, (0.0, 0.0, 0.0, 0.0));
 
-        let uniform = bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Uniform);
+        let uniform = bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Uniform)
+            .expect("uniform prior geometry");
         assert!(uniform.0.is_finite());
         assert!(uniform.0 < 0.0);
         assert!(uniform.1.abs() > 1e-6);
         assert!(uniform.2 > 0.0);
         assert!(uniform.3.is_finite());
+    }
+
+    #[test]
+    fn bounded_prior_tail_value_and_derivatives_share_the_logit_surface() {
+        let theta = 40.0;
+        let terms =
+            bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 3.0 })
+                .expect("tail prior geometry");
+        let jet = logit_inverse_link_jet5(theta);
+        let expected_value = -2.0 * gam_linalg::utils::stable_softplus(-theta)
+            - 3.0 * gam_linalg::utils::stable_softplus(theta);
+        assert_eq!(terms.0, expected_value);
+        assert_eq!(terms.2, 5.0 * jet.d1);
+        assert_eq!(terms.3, 5.0 * jet.d2);
+        assert!(terms.2 > 0.0, "the representable tail curvature was lost");
+        assert!(terms.3 < 0.0, "right-tail curvature must be decreasing");
     }
 
     #[test]
@@ -1177,8 +1199,8 @@ mod adaptive_bounded_duchon_tests {
 
     #[test]
     fn posterior_snr_weighting_suppresses_noise_and_preserves_edge() {
-        use gam_linalg::faer_ndarray::FaerCholesky;
         use faer::Side;
+        use gam_linalg::faer_ndarray::FaerCholesky;
 
         let m = 41usize;
         let h = 1.0 / (m as f64 - 1.0);
@@ -1768,11 +1790,12 @@ mod adaptive_bounded_duchon_tests {
             },
         )
         .expect("baseline fit");
-        let runtime_caches =
-            extract_spatial_operator_runtime_caches(&spec, &baseline.design).expect("runtime caches");
+        let runtime_caches = extract_spatial_operator_runtime_caches(&spec, &baseline.design)
+            .expect("runtime caches");
         assert_eq!(runtime_caches.len(), 1);
-        let (eps_0, eps_g, eps_c) = compute_initial_epsilons(&baseline.fit.beta, &runtime_caches, 1e-8)
-            .expect("initial epsilons");
+        let (eps_0, eps_g, eps_c) =
+            compute_initial_epsilons(&baseline.fit.beta, &runtime_caches, 1e-8)
+                .expect("initial epsilons");
         let (base_family, blockspec, derivative_blocks) =
             build_spatial_adaptive_joint_hyper_scaffold(&baseline, &runtime_caches, &y, n);
         let outer_opts = BlockwiseFitOptions {
@@ -1945,13 +1968,22 @@ mod adaptive_bounded_duchon_tests {
 
     #[test]
     fn non_logit_binomial_tailobservations_stay_finite() {
-        let eta = array![12.0, -12.0, 18.0, -18.0];
         let y = array![0.0, 1.0, 1.0, 0.0];
-        let weights = Array1::ones(eta.len());
-        for family in [
-            LikelihoodSpec::binomial_probit(),
-            LikelihoodSpec::binomial_cloglog(),
+        for (family, eta) in [
+            (
+                LikelihoodSpec::binomial_probit(),
+                array![12.0, -12.0, 18.0, -18.0],
+            ),
+            // At eta=18 the cloglog Fisher information is mathematically below
+            // f64 support; exact geometry correctly refuses that trial instead
+            // of injecting curvature. These are still extreme but representable
+            // asymmetric tails.
+            (
+                LikelihoodSpec::binomial_cloglog(),
+                array![5.0, -18.0, 4.0, -30.0],
+            ),
         ] {
+            let weights = Array1::ones(eta.len());
             let obs = evaluate_standard_familyobservations(
                 family.clone(),
                 None,
@@ -2025,7 +2057,8 @@ mod adaptive_bounded_duchon_tests {
         };
 
         let design = build_term_collection_design(data.view(), &spec).expect("design");
-        let caches = extract_spatial_operator_runtime_caches(&spec, &design).expect("runtime caches");
+        let caches =
+            extract_spatial_operator_runtime_caches(&spec, &design).expect("runtime caches");
         assert_eq!(caches.len(), 1);
         let cache = &caches[0];
         let s0 = {
@@ -2058,7 +2091,8 @@ mod adaptive_bounded_duchon_tests {
         );
 
         let p_total = design.design.ncols();
-        let err0 = (&s0_global - &design.penalties[cache.mass_penalty_global_idx].to_global(p_total))
+        let err0 = (&s0_global
+            - &design.penalties[cache.mass_penalty_global_idx].to_global(p_total))
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max);
@@ -2113,7 +2147,8 @@ mod adaptive_bounded_duchon_tests {
 
         let design = build_term_collection_design(data.view(), &spec).expect("design");
         assert_eq!(design.penalties.len(), 4);
-        let caches = extract_spatial_operator_runtime_caches(&spec, &design).expect("runtime caches");
+        let caches =
+            extract_spatial_operator_runtime_caches(&spec, &design).expect("runtime caches");
         assert_eq!(caches.len(), 1);
         let cache = &caches[0];
         let s0 = {
@@ -2146,7 +2181,8 @@ mod adaptive_bounded_duchon_tests {
         );
 
         let p_total = design.design.ncols();
-        let err0 = (&s0_global - &design.penalties[cache.mass_penalty_global_idx].to_global(p_total))
+        let err0 = (&s0_global
+            - &design.penalties[cache.mass_penalty_global_idx].to_global(p_total))
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max);
@@ -2302,7 +2338,8 @@ mod adaptive_bounded_duchon_tests {
         let state = CharbonnierScalarBlockState::from_signal(signal.clone(), epsilon);
         let h = 1e-5;
         let value = |eta_value: f64| {
-            CharbonnierScalarBlockState::from_signal(signal.clone(), eta_value.exp()).penalty_value()
+            CharbonnierScalarBlockState::from_signal(signal.clone(), eta_value.exp())
+                .penalty_value()
         };
         let gradfd = (value(eta + h) - value(eta - h)) / (2.0 * h);
         let hessfd = (value(eta + h) - 2.0 * value(eta) + value(eta - h)) / (h * h);
@@ -2319,7 +2356,8 @@ mod adaptive_bounded_duchon_tests {
         }
 
         let eval_hess = |eta_value: f64| {
-            CharbonnierScalarBlockState::from_signal(signal.clone(), eta_value.exp()).betahessian_diag()
+            CharbonnierScalarBlockState::from_signal(signal.clone(), eta_value.exp())
+                .betahessian_diag()
         };
         let betahessfd = (&eval_hess(eta + h) - &eval_hess(eta - h)) / (2.0 * h);
         for i in 0..signal.len() {
@@ -2332,7 +2370,9 @@ mod adaptive_bounded_duchon_tests {
         };
         let second_mixedfd = (&eval_log_grad(eta + h) - &eval_log_grad(eta - h)) / (2.0 * h);
         for i in 0..signal.len() {
-            assert!((state.log_epsilon_beta_mixed_second_coeff()[i] - second_mixedfd[i]).abs() < 1e-5);
+            assert!(
+                (state.log_epsilon_beta_mixed_second_coeff()[i] - second_mixedfd[i]).abs() < 1e-5
+            );
         }
 
         let eval_log_hess = |eta_value: f64| {
@@ -2341,7 +2381,9 @@ mod adaptive_bounded_duchon_tests {
         };
         let second_hessfd = (&eval_log_hess(eta + h) - &eval_log_hess(eta - h)) / (2.0 * h);
         for i in 0..signal.len() {
-            assert!((state.log_epsilon_betahessian_second_diag()[i] - second_hessfd[i]).abs() < 1e-4);
+            assert!(
+                (state.log_epsilon_betahessian_second_diag()[i] - second_hessfd[i]).abs() < 1e-4
+            );
         }
     }
 
@@ -2373,7 +2415,8 @@ mod adaptive_bounded_duchon_tests {
         let analytic = state.log_epsilon_betahessian_directional_diag(&direction);
         let evalhess = |step: f64| {
             let shifted = &signal + &(direction.mapv(|v| step * v));
-            CharbonnierScalarBlockState::from_signal(shifted, epsilon).log_epsilon_betahessian_diag()
+            CharbonnierScalarBlockState::from_signal(shifted, epsilon)
+                .log_epsilon_betahessian_diag()
         };
         let fd = (&evalhess(h) - &evalhess(-h)) / (2.0 * h);
         for i in 0..signal.len() {
@@ -2433,7 +2476,9 @@ mod adaptive_bounded_duchon_tests {
         let analytic_second_mixed = state.log_epsilon_beta_mixed_second_blocks();
         for k in 0..blocks.nrows() {
             for axis in 0..blocks.ncols() {
-                assert!((analytic_second_mixed[[k, axis]] - second_mixedfd[[k, axis]]).abs() < 1e-5);
+                assert!(
+                    (analytic_second_mixed[[k, axis]] - second_mixedfd[[k, axis]]).abs() < 1e-5
+                );
             }
         }
 
@@ -2733,7 +2778,8 @@ mod adaptive_bounded_duchon_tests {
             cov_latent[[1, 1]]
         );
         let corr_emp = cov01 / (var0.sqrt() * var1.sqrt());
-        let corr_truth = cov_latent[[0, 1]] / (cov_latent[[0, 0]].sqrt() * cov_latent[[1, 1]].sqrt());
+        let corr_truth =
+            cov_latent[[0, 1]] / (cov_latent[[0, 0]].sqrt() * cov_latent[[1, 1]].sqrt());
         assert!(
             corr_truth.abs() > 0.2,
             "fixture must carry real correlation, got {corr_truth}"

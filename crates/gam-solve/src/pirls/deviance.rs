@@ -29,6 +29,91 @@ fn binomial_log_probabilities(mu: f64) -> Option<(f64, f64)> {
     }
 }
 
+const HALF_LOG_2PI: f64 = 0.918_938_533_204_672_7;
+
+/// `(log Phi(x), d log Phi(x) / dx)` from one tail representation.
+///
+/// Below -8, evaluating `erfc` and then differentiating its rounded result
+/// loses the Mills ratio. The asymptotic log-CDF and inverse-Mills expansion
+/// retain both channels through the last representable normal tail. Above that
+/// threshold the erfc expression is accurate and its analytic score shares the
+/// exact returned value.
+#[inline]
+fn log_standard_normal_cdf_and_score(x: f64) -> (f64, f64) {
+    if x < -8.0 {
+        let t = -x;
+        let t2 = t * t;
+        if !t2.is_finite() {
+            return (f64::NEG_INFINITY, t);
+        }
+        let inv = 1.0 / t;
+        let inv2 = inv * inv;
+        let tail_series = 1.0
+            + inv2
+                * (-1.0
+                    + inv2
+                        * (3.0
+                            + inv2
+                                * (-15.0
+                                    + inv2 * (105.0 + inv2 * (-945.0 + inv2 * 10_395.0)))));
+        let log_cdf = -0.5 * t2 - t.ln() - HALF_LOG_2PI + tail_series.ln();
+        let inverse_mills = t
+            + inv
+                * (1.0
+                    + inv2
+                        * (-2.0
+                            + inv2 * (10.0 + inv2 * (-74.0 + inv2 * (706.0 - 8_162.0 * inv2)))));
+        (log_cdf, inverse_mills)
+    } else {
+        let erfc = statrs::function::erf::erfc(-x * std::f64::consts::FRAC_1_SQRT_2);
+        let log_cdf = erfc.ln() - std::f64::consts::LN_2;
+        let log_pdf = -0.5 * x * x - HALF_LOG_2PI;
+        (log_cdf, (log_pdf - log_cdf).exp())
+    }
+}
+
+/// Stable Bernoulli log-probabilities and negative-log-likelihood score for
+/// the standard probit link.
+#[inline]
+fn probit_binomial_geometry(y: f64, eta: f64) -> (f64, f64, f64) {
+    let (log_mu, dlog_mu) = log_standard_normal_cdf_and_score(eta);
+    let (log_one_minus_mu, dlog_survival_at_neg_eta) =
+        log_standard_normal_cdf_and_score(-eta);
+    let negative_score = if y == 1.0 {
+        -dlog_mu
+    } else if y == 0.0 {
+        dlog_survival_at_neg_eta
+    } else {
+        (1.0 - y) * dlog_survival_at_neg_eta - y * dlog_mu
+    };
+    (log_mu, log_one_minus_mu, negative_score)
+}
+
+/// Stable Bernoulli log-probabilities and negative-log-likelihood score for
+/// the complementary-log-log link.
+#[inline]
+fn cloglog_binomial_geometry(y: f64, eta: f64) -> (f64, f64, f64) {
+    let t = eta.exp();
+    if t == 0.0 {
+        // log(1-exp(-exp(eta))) -> eta and its derivative -> 1.
+        return (eta, -0.0, -y);
+    }
+    if !t.is_finite() {
+        let negative_score = if y == 1.0 { -0.0 } else { f64::INFINITY };
+        return (0.0, f64::NEG_INFINITY, negative_score);
+    }
+    let log_mu = log_abs_one_minus_exp(-t);
+    let dlog_mu = (eta - t - log_mu).exp();
+    let negative_score = if y == 1.0 {
+        -dlog_mu
+    } else if y == 0.0 {
+        t
+    } else {
+        (1.0 - y) * t - y * dlog_mu
+    };
+    (log_mu, -t, negative_score)
+}
+
 /// One observation's exact deviance surface in linear-predictor coordinates.
 ///
 /// `half_deviance` is `D_i / 2`; `eta_score` is its derivative with respect to
@@ -760,7 +845,16 @@ fn deviance_eta_row_with_log_measure_scale(
                 return Err(deviance_row_error(row, "binomial response", eta, y));
             }
             let is_logit = matches!(inverse_link, InverseLink::Standard(StandardLink::Logit));
-            let jet = if is_logit {
+            let standard_geometry = match inverse_link {
+                InverseLink::Standard(StandardLink::Probit) => {
+                    Some(probit_binomial_geometry(y, eta))
+                }
+                InverseLink::Standard(StandardLink::CLogLog) => {
+                    Some(cloglog_binomial_geometry(y, eta))
+                }
+                _ => None,
+            };
+            let jet = if is_logit || standard_geometry.is_some() {
                 None
             } else {
                 let jet =
@@ -785,6 +879,8 @@ fn deviance_eta_row_with_log_measure_scale(
             };
             let (log_mu, log_one_minus_mu) = if is_logit {
                 (-softplus(-eta), -softplus(eta))
+            } else if let Some((log_mu, log_one_minus_mu, _)) = standard_geometry {
+                (log_mu, log_one_minus_mu)
             } else {
                 let jet = jet.expect("non-logit binomial branch has an inverse-link jet");
                 binomial_log_probabilities(jet.0).ok_or_else(|| {
@@ -794,7 +890,14 @@ fn deviance_eta_row_with_log_measure_scale(
             let half_unit = if is_logit {
                 logit_half_deviance_unit(y, eta)
             } else {
-                xlogy(y, y) + xlogy(1.0 - y, 1.0 - y) - y * log_mu - (1.0 - y) * log_one_minus_mu
+                let cross_entropy = if y == 1.0 {
+                    -log_mu
+                } else if y == 0.0 {
+                    -log_one_minus_mu
+                } else {
+                    -y * log_mu - (1.0 - y) * log_one_minus_mu
+                };
+                xlogy(y, y) + xlogy(1.0 - y, 1.0 - y) + cross_entropy
             };
             if !(half_unit.is_finite() && half_unit >= 0.0) {
                 return Err(deviance_row_error(
@@ -822,6 +925,20 @@ fn deviance_eta_row_with_log_measure_scale(
                 } else {
                     mu - y
                 };
+                if score_unit == 0.0 {
+                    (0.0, f64::NEG_INFINITY)
+                } else {
+                    (score_unit.signum(), log_weight + score_unit.abs().ln())
+                }
+            } else if let Some((_, _, score_unit)) = standard_geometry {
+                if !score_unit.is_finite() {
+                    return Err(deviance_row_error(
+                        row,
+                        "binomial eta score",
+                        eta,
+                        score_unit,
+                    ));
+                }
                 if score_unit == 0.0 {
                     (0.0, f64::NEG_INFINITY)
                 } else {
@@ -855,19 +972,40 @@ fn deviance_eta_row_with_log_measure_scale(
             if !valid_beta_response(y) {
                 return Err(deviance_row_error(row, "beta response", eta, y));
             }
+            if !matches!(inverse_link, InverseLink::Standard(StandardLink::Logit)) {
+                return Err(deviance_row_error(
+                    row,
+                    "beta inverse link (logit required)",
+                    eta,
+                    eta,
+                ));
+            }
+            let log_mu = -softplus(-eta);
+            let log_one_minus_mu = -softplus(eta);
             let (mu, one_minus_mu) = logit_probability_pair(eta);
             let tail = (-eta.abs()).exp();
             let dmu = tail / ((1.0 + tail) * (1.0 + tail));
-            if !(dmu.is_finite() && dmu > 0.0) {
+            if !(dmu.is_finite() && dmu >= 0.0) {
                 return Err(deviance_row_error(row, "beta-logit derivative", eta, dmu));
             }
             let a = mu * *phi;
             let b = one_minus_mu * *phi;
-            if !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0) {
+            if !(a.is_finite() && a >= 0.0 && b.is_finite() && b >= 0.0) {
                 return Err(deviance_row_error(row, "beta shape", eta, a.max(b)));
             }
             let saturated = beta_loglikelihood_full_unit(y, y, *phi);
-            let fitted = beta_log_normalizer(a, b, *phi)
+            let log_normalizer = if a < f64::MIN_POSITIVE {
+                // Γ(a) = Γ(1+a)/a, and b rounds exactly to phi once the
+                // logit-tail shape is subnormal. Thus
+                // ln Γ(phi)-ln Γ(a)-ln Γ(b) -> ln(a), which remains
+                // representable through log_a even when a itself underflows.
+                phi.ln() + log_mu
+            } else if b < f64::MIN_POSITIVE {
+                phi.ln() + log_one_minus_mu
+            } else {
+                beta_log_normalizer(a, b, *phi)
+            };
+            let fitted = log_normalizer
                 + *phi * xlogy(mu, y)
                 + *phi * xlogy(one_minus_mu, 1.0 - y)
                 - y.ln()
@@ -994,13 +1132,13 @@ pub(crate) fn calculate_deviance_from_eta(
     }
 }
 
-pub(crate) fn calculate_loglikelihood_omitting_constants_from_eta(
+fn eta_log_likelihood_geometry_omitting_constants(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
     priorweights: ArrayView1<f64>,
-) -> Result<f64, EstimationError> {
+) -> Result<(f64, Vec<DevianceEtaRow>), EstimationError> {
     let log_measure_scale = match &likelihood.spec.response {
         ResponseFamily::Gamma => {
             let shape = likelihood.gamma_shape().ok_or_else(|| {
@@ -1149,8 +1287,64 @@ pub(crate) fn calculate_loglikelihood_omitting_constants_from_eta(
             }
         })
         .collect();
-    let rows: Vec<f64> = rows.into_iter().collect::<Result<_, _>>()?;
-    stable_finite_signed_sum(&rows, "log-likelihood reduction")
+    let log_likelihood_rows: Vec<f64> = rows.into_iter().collect::<Result<_, _>>()?;
+    let value = stable_finite_signed_sum(&log_likelihood_rows, "log-likelihood reduction")?;
+    Ok((value, deviance_rows))
+}
+
+/// Evaluate one exact GLM log-likelihood surface and its linear-predictor
+/// score in a single atomic operation.
+///
+/// The returned value omits response-only normalization constants. This does
+/// not change an HMC target, likelihood ratio, or derivative. `eta_score[i]`
+/// is `d log L / d eta_i` for that same value. The row oracle evaluates a zero
+/// prior-weight row before inspecting its response or predictor, preserves its
+/// contribution as exact zero, and uses log-domain family formulas in
+/// representable tails. On error, `eta_score` is left untouched; parallel row
+/// evaluation is collected in row order so the first invalid row is
+/// deterministic.
+pub fn eta_log_likelihood_value_and_score_into(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    priorweights: ArrayView1<f64>,
+    eta_score: &mut Array1<f64>,
+) -> Result<f64, EstimationError> {
+    if eta_score.len() != eta.len() {
+        crate::bail_invalid_estim!(
+            "eta log-likelihood score length mismatch: output={}, eta={}",
+            eta_score.len(),
+            eta.len(),
+        );
+    }
+    let (value, rows) = eta_log_likelihood_geometry_omitting_constants(
+        y,
+        eta,
+        likelihood,
+        inverse_link,
+        priorweights,
+    )?;
+    let score = Array1::from_iter(rows.into_iter().map(|row| -row.eta_score));
+    eta_score.assign(&score);
+    Ok(value)
+}
+
+pub(crate) fn calculate_loglikelihood_omitting_constants_from_eta(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    likelihood: &GlmLikelihoodSpec,
+    inverse_link: &InverseLink,
+    priorweights: ArrayView1<f64>,
+) -> Result<f64, EstimationError> {
+    eta_log_likelihood_geometry_omitting_constants(
+        y,
+        eta,
+        likelihood,
+        inverse_link,
+        priorweights,
+    )
+    .map(|(value, _)| value)
 }
 
 #[inline]

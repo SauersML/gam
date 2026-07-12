@@ -81,8 +81,10 @@ pub trait LatentIntervalModel {
 ///
 /// Checks, in order: frailty resolution, non-empty data, per-spec length
 /// agreement (including `unloaded_hazard_exit` when the model carries it),
-/// the derivative guard, every per-row interval/event/weight/unloaded-mass
-/// invariant, and the time block's row/column/offset shape. Returns the
+/// the derivative guard, an atomic whole-vector weight preflight, every active
+/// per-row interval/event/unloaded-mass invariant, and the time block's
+/// row/column/offset shape. Exact-zero rows are dormant after the weight
+/// preflight and their response geometry is never inspected. Returns the
 /// resolved (possibly learnable) latent sigma on success.
 pub fn validate_latent_interval_inputs<M: LatentIntervalModel>(
     data: ArrayView2<'_, f64>,
@@ -124,6 +126,17 @@ pub fn validate_latent_interval_inputs<M: LatentIntervalModel>(
             ),
         });
     }
+    for (i, &weight) in row.weights.iter().enumerate() {
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(LatentSurvivalError::InvalidDataset {
+                reason: format!(
+                    "{context} row {} has invalid weight {}; expected a finite non-negative weight",
+                    i + 1,
+                    weight
+                ),
+            });
+        }
+    }
     for i in 0..n {
         let entry = row.age_entry[i];
         let exit = row.age_exit[i];
@@ -132,6 +145,9 @@ pub fn validate_latent_interval_inputs<M: LatentIntervalModel>(
         let unloaded_entry = row.unloaded_mass_entry[i];
         let unloaded_exit = row.unloaded_mass_exit[i];
         let unloaded_hazard = row.unloaded_hazard_exit.map(|hazard| hazard[i]);
+        if weight == 0.0 {
+            continue;
+        }
         if !entry.is_finite() || !exit.is_finite() {
             return Err(LatentSurvivalError::InvalidDataset {
                 reason: format!(
@@ -168,15 +184,6 @@ pub fn validate_latent_interval_inputs<M: LatentIntervalModel>(
                     "{context} row {} has invalid event target {}; expected 0 or 1",
                     i + 1,
                     event
-                ),
-            });
-        }
-        if !weight.is_finite() || weight < 0.0 {
-            return Err(LatentSurvivalError::InvalidDataset {
-                reason: format!(
-                    "{context} row {} has invalid weight {}; expected a finite non-negative weight",
-                    i + 1,
-                    weight
                 ),
             });
         }

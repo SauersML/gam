@@ -759,7 +759,7 @@ mod linux_impl {
         input: GpuGaussianPlsInput<'_>,
     ) -> Result<(PirlsResult, WorkingModelPirlsResult), String> {
         use crate::pirls::{
-            array1_l2_norm, calculate_deviance, calculate_loglikelihood,
+            array1_l2_norm, calculate_deviance_from_eta, calculate_loglikelihood,
             computeworkingweight_derivatives_from_eta,
         };
         use gam_linalg::matrix::LinearOperator;
@@ -852,7 +852,14 @@ mod linux_impl {
         let gradient_norm = array1_l2_norm(&gradient);
         let max_abs_eta = inf_norm(finalmu.iter().copied());
 
-        let deviance = calculate_deviance(input.y, &finalmu, input.likelihood, input.priorweights);
+        let deviance = calculate_deviance_from_eta(
+            input.y,
+            &eta,
+            input.likelihood,
+            input.inverse_link,
+            input.priorweights,
+        )
+        .map_err(|error| format!("GPU Gaussian deviance evaluation failed: {error}"))?;
         let log_likelihood =
             calculate_loglikelihood(input.y, &finalmu, input.likelihood, input.priorweights);
 
