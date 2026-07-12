@@ -13,6 +13,7 @@ use crate::survival::marginal_slope::flex_oracle_structs_tests::{
     coeff4_composite_bilinear, coeff4_fixed_bilinear, neg_cell_of, poly_add_jets, poly_coeff_mask,
     poly_mul_jets, poly_scale_jets, scalar_composite_bilinear,
 };
+use gam_math::jet_partitions::MultiDirJet;
 
 #[inline]
 fn eval_poly_slice(coefficients: &[f64], z: f64) -> f64 {

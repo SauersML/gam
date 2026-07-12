@@ -366,11 +366,9 @@ enum FisherOutputSchedule {
     ContiguousFull,
 }
 
-#[cfg(target_arch = "x86_64")]
 const AVX2_WITHOUT_AVX512: bool =
-    cfg!(target_feature = "avx2") && !cfg!(target_feature = "avx512f");
-#[cfg(not(target_arch = "x86_64"))]
-const AVX2_WITHOUT_AVX512: bool = false;
+    cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
+        && !cfg!(all(target_arch = "x86_64", target_feature = "avx512f"));
 
 /// Select a storage schedule for the same elementwise [`fisher_entry`]
 /// expression. First-order M=32 favors contiguous rows on AVX2-only targets,

@@ -11,6 +11,7 @@ use crate::survival::marginal_slope::flex_oracle_structs_tests::{
     COEFF_SUPPORT_GHW, COEFF_SUPPORT_GW, SurvivalFlexTimepointDirectionalExact, neg_cell_of,
     poly_add_jets, poly_coeff_mask, poly_mul_jets, poly_scale_jets,
 };
+use gam_math::jet_partitions::MultiDirJet;
 
 #[inline]
 fn eval_poly_slice(coefficients: &[f64], z: f64) -> f64 {

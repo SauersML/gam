@@ -56,9 +56,6 @@ pub(crate) use crate::bms::{
 
 pub(crate) use crate::cubic_cell_kernel as exact_kernel;
 
-#[cfg(test)]
-pub(crate) use gam_math::jet_partitions::MultiDirJet;
-
 pub(crate) use crate::survival::lognormal_kernel::FrailtySpec;
 
 pub(crate) use crate::marginal_slope_shared::{

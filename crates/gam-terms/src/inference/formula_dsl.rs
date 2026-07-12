@@ -1026,7 +1026,6 @@ mod tests {
     /// Collect the WR term labels of a parsed formula in `:`-joined form,
     /// matching R/mgcv `attr(terms(...), "term.labels")` so nesting/crossing
     /// expansions can be pinned against ground truth.
-    #[cfg(test)]
     fn wr_term_labels(formula: &str) -> Vec<String> {
         let parsed = parse_formula(formula).unwrap_or_else(|e| panic!("parse {formula}: {e}"));
         parsed

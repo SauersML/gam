@@ -525,47 +525,73 @@ fn witness_dependencies(statements: &[Statement], witnesses: &[Ident]) -> HashSe
     }
 }
 
-fn collect_scalar_expression_dependencies(expression: &Expr, dependencies: &mut HashSet<String>) {
+fn collect_scalar_expression_dependencies(
+    expression: &Expr,
+    dependencies: &mut HashSet<String>,
+) -> Result<()> {
     match expression {
         Expr::Path(path) => {
             if let Some(ident) = path.path.get_ident() {
                 dependencies.insert(ident.to_string());
             }
+            Ok(())
         }
         Expr::Paren(ExprParen { expr, .. }) | Expr::Group(ExprGroup { expr, .. }) => {
-            collect_scalar_expression_dependencies(expr, dependencies);
+            collect_scalar_expression_dependencies(expr, dependencies)
         }
-        Expr::Unary(ExprUnary { expr, .. }) => {
-            collect_scalar_expression_dependencies(expr, dependencies);
+        Expr::Unary(ExprUnary {
+            op: UnOp::Neg(_),
+            expr,
+            ..
+        }) => {
+            collect_scalar_expression_dependencies(expr, dependencies)
         }
-        Expr::Binary(ExprBinary { left, right, .. }) => {
-            collect_scalar_expression_dependencies(left, dependencies);
-            collect_scalar_expression_dependencies(right, dependencies);
+        Expr::Binary(ExprBinary {
+            left, op, right, ..
+        }) if matches!(
+            op,
+            BinOp::Add(_)
+                | BinOp::Sub(_)
+                | BinOp::Mul(_)
+                | BinOp::Div(_)
+                | BinOp::Eq(_)
+                | BinOp::Ne(_)
+                | BinOp::Lt(_)
+                | BinOp::Le(_)
+                | BinOp::Gt(_)
+                | BinOp::Ge(_)
+        ) => {
+            collect_scalar_expression_dependencies(left, dependencies)?;
+            collect_scalar_expression_dependencies(right, dependencies)
         }
-        Expr::Lit(_) => {}
-        _ => unreachable!("validated row_program scalar grammar"),
+        Expr::Lit(literal) if numeric_literal(literal) => Ok(()),
+        _ => Err(syn::Error::new_spanned(
+            expression,
+            "unsupported row_program scalar dependency expression",
+        )),
     }
 }
 
 fn collect_program_scalar_dependencies(
     expression: &ProgramExpr,
     dependencies: &mut HashSet<String>,
-) {
+) -> Result<()> {
     match expression {
-        ProgramExpr::Path(_) | ProgramExpr::Zero => {}
+        ProgramExpr::Path(_) | ProgramExpr::Zero => Ok(()),
         ProgramExpr::Neg(value) => collect_program_scalar_dependencies(value, dependencies),
         ProgramExpr::Scale(value, scalar) | ProgramExpr::AddConstant(value, scalar) => {
-            collect_program_scalar_dependencies(value, dependencies);
-            collect_scalar_expression_dependencies(scalar, dependencies);
+            collect_program_scalar_dependencies(value, dependencies)?;
+            collect_scalar_expression_dependencies(scalar, dependencies)
         }
         ProgramExpr::Add(left, right) | ProgramExpr::Mul(left, right) => {
-            collect_program_scalar_dependencies(left, dependencies);
-            collect_program_scalar_dependencies(right, dependencies);
+            collect_program_scalar_dependencies(left, dependencies)?;
+            collect_program_scalar_dependencies(right, dependencies)
         }
         ProgramExpr::Compose { arguments, .. } => {
             for argument in arguments {
-                collect_scalar_expression_dependencies(argument, dependencies);
+                collect_scalar_expression_dependencies(argument, dependencies)?;
             }
+            Ok(())
         }
     }
 }
@@ -573,14 +599,14 @@ fn collect_program_scalar_dependencies(
 fn witness_scalar_dependencies(
     statements: &[Statement],
     jet_dependencies: &HashSet<String>,
-) -> HashSet<String> {
+) -> Result<HashSet<String>> {
     let mut dependencies = HashSet::new();
     for statement in statements {
         match statement {
             Statement::Local { name, value, .. }
                 if jet_dependencies.contains(&name.to_string()) =>
             {
-                collect_program_scalar_dependencies(value, &mut dependencies);
+                collect_program_scalar_dependencies(value, &mut dependencies)?;
             }
             Statement::If {
                 condition,
@@ -589,18 +615,18 @@ fn witness_scalar_dependencies(
                 let mut condition_is_needed = false;
                 for (target, value) in assignments {
                     if jet_dependencies.contains(&target.to_string()) {
-                        collect_program_scalar_dependencies(value, &mut dependencies);
+                        collect_program_scalar_dependencies(value, &mut dependencies)?;
                         condition_is_needed = true;
                     }
                 }
                 if condition_is_needed {
-                    collect_scalar_expression_dependencies(condition, &mut dependencies);
+                    collect_scalar_expression_dependencies(condition, &mut dependencies)?;
                 }
             }
             Statement::Local { .. } => {}
         }
     }
-    dependencies
+    Ok(dependencies)
 }
 
 fn scalar_cuda(expression: &Expr, constants: &HashSet<String>) -> Result<String> {
@@ -1343,7 +1369,7 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
     let witness_count = witnesses.len();
     let scalar_witness_dependencies = witness_dependencies(&statements, &witnesses);
     let scalar_witness_scalar_dependencies =
-        witness_scalar_dependencies(&statements, &scalar_witness_dependencies);
+        witness_scalar_dependencies(&statements, &scalar_witness_dependencies)?;
     let scalar_witness_statements = statements.iter().filter_map(|statement| match statement {
         Statement::Local {
             name,
@@ -1414,8 +1440,8 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
             #(#constants: f64),*
         ) -> (S, [f64; #witness_count]) {
             #(#rust_statements)*
-            let __row_program_result = #rust_result;
-            (__row_program_result, [#(#witness_values),*])
+            let emitted_row_program_value = #rust_result;
+            (emitted_row_program_value, [#(#witness_values),*])
         }
 
         #scalar_witness_function
