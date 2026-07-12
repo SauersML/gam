@@ -6726,6 +6726,115 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
     }
 }
 
+/// #932 (live inner-solver gap): the BLOCK-DIAGONAL per-block Hessian path
+/// (`assemble_block_diagonal_hessians_from_quantities`), which feeds the live
+/// `FamilyEvaluation` inner-Newton per-block working sets, must carry the SAME
+/// single-sourced §13 curvature for the link-wiggle block as the joint Hessian.
+///
+/// The retired bespoke `assemble_h_wiggle` summed three INDEPENDENT
+/// single-channel Gauss-Newton terms
+/// (`Xw_exitᵀ(-d2_q1)Xw_exit + Xw_entryᵀ(-d2_q0)Xw_entry +
+/// Xw_qdotᵀ(-d2_qdot1)Xw_qdot`) and DROPPED the exit-index ↔ qdot warp
+/// cross-coupling: one wiggle coefficient `βw_j` warps BOTH the exit index
+/// `q1w = q1 + Σβw·B(q1)` (through `B(q1)`) AND the qdot multiplier
+/// `m1 = 1 + Σβw·B'(q1)` (through `B'(q1)`), so the wiggle-wiggle Hessian
+/// carries a mixed `∂²ℓ/∂q1∂qdot·(∂q1/∂βw)(∂qdot/∂βw)` term the three-way sum
+/// omitted (compare the log-sigma block, which DOES carry its analogous
+/// exit↔deriv cross term). That drop mis-scaled the inner LINK_WIGGLE Newton
+/// step by ~15% at `[0][0]` — the #736 duplicate-derivative genus. The
+/// block-diagonal wiggle block must now equal the `[wiggle, wiggle]` sub-block
+/// of the §13 single source (`survival_ls_wiggle_joint_hessian_dense`) exactly.
+///
+/// The coupling is only live at NONZERO wiggle coefficients, so the fixture
+/// seeds monotone-feasible (nonnegative) `βw` rather than the zero warp the
+/// other wiggle gates use.
+#[test]
+fn survival_ls_block_diagonal_wiggle_block_matches_single_source_932() {
+    let primaries: Vec<[f64; SLS_ROW_K]> = vec![
+        [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
+        [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
+    ];
+    let event = [1.0, 1.0, 1.0, 1.0];
+    let weight = [1.0, 0.8, 1.2, 1.1];
+    let n = primaries.len();
+    let q0_exit = Array1::from_shape_fn(n, |i| {
+        primaries[i][1] - primaries[i][3] * (-primaries[i][6]).exp()
+    });
+    let knots = array![-2.5, -2.5, -2.5, -2.5, 3.2, 3.2, 3.2, 3.2];
+    let degree = 3usize;
+    let xwiggle =
+        survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::value())
+            .expect("wiggle design B(q0_exit)");
+    let pw = xwiggle.ncols();
+    assert!(pw >= 2, "fixture must have a multi-column wiggle basis, got {pw}");
+
+    for distribution in [
+        ResidualDistribution::Gaussian,
+        ResidualDistribution::Gumbel,
+        ResidualDistribution::Logistic,
+    ] {
+        let inverse_link = residual_distribution_inverse_link(distribution);
+        let mut family =
+            survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+        family.x_link_wiggle = Some(DesignMatrix::Dense(
+            gam_linalg::matrix::DenseDesignMatrix::from(xwiggle.clone()),
+        ));
+        family.wiggle_knots = Some(knots.clone());
+        family.wiggle_degree = Some(degree);
+
+        // Nonzero, monotone-feasible (nonnegative) wiggle coefficients so the
+        // warp coupling term the bespoke assembler dropped is actually live.
+        let betaw = Array1::from_shape_fn(pw, |b| 0.2 + 0.05 * b as f64);
+        let mut states = survival_ls_joint_oracle_states(&primaries);
+        states.push(ParameterBlockState {
+            eta: xwiggle.dot(&betaw),
+            beta: betaw,
+        });
+
+        let dynamic = family
+            .build_dynamic_geometry(&states)
+            .expect("wiggle dynamic geometry");
+        let q = family
+            .collect_joint_quantities(&states)
+            .expect("joint quantities");
+        let blocks = family
+            .assemble_block_diagonal_hessians_from_quantities(&q, &states)
+            .expect("block-diagonal hessians");
+        assert_eq!(blocks.len(), 4, "wiggle family has four principal blocks");
+        let wiggle_block = &blocks[SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE];
+
+        let dense =
+            super::row_kernel::survival_ls_wiggle_joint_hessian_dense(&family, &dynamic, 0.0)
+                .expect("§13 dense joint Hessian");
+        let offsets = family.joint_block_offsets();
+        let (lo, hi) = (
+            offsets[SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE],
+            offsets[SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE + 1],
+        );
+        assert_eq!(
+            wiggle_block.dim(),
+            (hi - lo, hi - lo),
+            "block-diagonal wiggle block shape"
+        );
+
+        for i in 0..(hi - lo) {
+            for j in 0..(hi - lo) {
+                let bd = wiggle_block[[i, j]];
+                let ss = dense[[lo + i, lo + j]];
+                assert!(
+                    (bd - ss).abs() <= 1e-9 * (1.0 + ss.abs()),
+                    "{distribution:?}: block-diagonal wiggle Hessian [{i}][{j}] = {bd:.9e} \
+                     disagrees with the §13 single source {ss:.9e} \
+                     (drift {:.3e}) — the dropped exit↔qdot warp coupling",
+                    (bd - ss).abs()
+                );
+            }
+        }
+    }
+}
+
 /// Runtime-sized #932 regression: a valid cubic link-wiggle basis wider than
 /// the retired 11-column const-generic ceiling must run every production packed
 /// derivative channel. This exercises the actual survival family/kernel rather
