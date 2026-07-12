@@ -903,11 +903,11 @@ row_program! {
         if (di > 0.0) {
             event_density = scale(
                 compose(log_normal_pdf, eta1),
-                -(wi * di)
+                (-wi) * di
             );
             time_derivative = scale(
                 compose(log, adjusted_derivative),
-                -(wi * di)
+                (-wi) * di
             );
         }
         return add(
