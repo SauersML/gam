@@ -177,14 +177,12 @@ use crate::estimate::EstimationError;
 use crate::mixture_link::{
     beta_logistic_inverse_link_jet, component_inverse_link_jet, sas_inverse_link_jet,
 };
-use gam_math::probability::erfcx_nonnegative;
+use gam_math::probability::{erfcx_nonnegative, normal_logcdf};
 use gam_math::special::stable_polynomial_times_exp_neg as cloglog_stable_poly_times_exp_neg;
 use gam_problem::types::{
     GlmLikelihoodSpec, InverseLink, LinkComponent, LinkFunction, MixtureLinkState, ResponseFamily,
     SasLinkState, StandardLink,
 };
-use statrs::function::erf::erfc;
-
 /// Number of quadrature points (7-point rule is exact for polynomials up to degree 13)
 const N_POINTS: usize = 7;
 const SQRT_2: f64 = std::f64::consts::SQRT_2;
@@ -2099,11 +2097,13 @@ fn log_half_erfc_stable(u: f64) -> f64 {
     // term becomes negligible, so we switch to
     //   erfc(u) = exp(-u^2) erfcx(u),  u > 0,
     // and carry the -u^2 contribution in log-space. For u <= 0, erfc(u) is
-    // O(1) and direct evaluation is safe.
+    // O(1): 0.5*erfc(u) = Phi(-u*sqrt(2)), so log(0.5*erfc(u)) is exactly
+    // normal_logcdf(-u*sqrt(2)) — reusing the full-precision (libm-erfc) primitive
+    // instead of statrs::erfc (which carried ~1e-10 relative error, #932).
     if u > 0.0 {
         -u * u + (0.5 * erfcx_nonnegative(u)).ln()
     } else {
-        (0.5 * erfc(u)).ln()
+        normal_logcdf(-u * SQRT_2)
     }
 }
 
@@ -5000,6 +5000,35 @@ pub fn cloglog_ghq_derivatives_adaptive(
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// Pins `log_half_erfc_stable` (both the `u > 0` erfcx branch and the
+    /// `u <= 0` `normal_logcdf` branch) against an external high-precision
+    /// reference (mpmath, dps=50) for `log(0.5·erfc(u))`. Guards the #932
+    /// root-cause fix: the `u <= 0` branch previously routed through
+    /// `statrs::erfc` (~1e-10 relative error); the 1e-12 tolerance here fails
+    /// on any regression to a low-accuracy complementary error function.
+    #[test]
+    fn log_half_erfc_stable_matches_high_precision_reference() {
+        let refs: &[(f64, f64)] = &[
+            (-3.0, -1.1045309498499094e-5),
+            (-1.5, -0.017092677825984745),
+            (-0.5, -0.27410803278438573),
+            (0.0, -0.69314718055994531),
+            (0.7, -1.8257336940742865),
+            (2.0, -6.0580884451765829),
+            (5.0, -27.89403672609738),
+            (12.0, -147.75386135854695),
+        ];
+        for &(u, reference) in refs {
+            let got = log_half_erfc_stable(u);
+            let rel = (got - reference).abs() / reference.abs().max(1.0e-6);
+            assert!(
+                rel < 1.0e-12,
+                "log_half_erfc_stable({u}) = {got:.17e}, reference {reference:.17e}, \
+                 rel {rel:.3e} >= 1e-12"
+            );
+        }
+    }
 
     pub(crate) fn cloglog_posterior_meanwith_deriv_gamma_reference(
         mu: f64,
