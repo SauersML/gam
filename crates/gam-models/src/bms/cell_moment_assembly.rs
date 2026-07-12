@@ -12,8 +12,8 @@ use super::*;
 
 use crate::fnv1a::Fnv1a;
 use gam_math::jet_scalar::{
-    DynamicJetArena, DynamicOneSeed, DynamicOrder1, DynamicOrder2, DynamicTwoSeed,
-    RuntimeJetScalar, filtered_implicit_solve_runtime_scalar,
+    DynamicJetArena, DynamicOneSeed, DynamicTwoSeed, RuntimeJetScalar,
+    filtered_implicit_solve_runtime_scalar,
 };
 
 #[derive(Clone)]
@@ -49,11 +49,6 @@ pub(super) struct EmpiricalBmsRowJetPlan {
     observed: EmpiricalBmsIndexJetPlan,
     pub(super) observed_sign: f64,
     pub(super) observed_neglog_stack: [f64; 5],
-}
-
-pub(super) struct EmpiricalBmsRowJetOutput<S> {
-    pub(super) nll: S,
-    pub(super) intercept: S,
 }
 
 impl EmpiricalBmsRowJetPlan {
@@ -97,7 +92,7 @@ impl EmpiricalBmsRowJetPlan {
         vars: &[S],
         lift_iters: usize,
         workspace: &'arena S::Workspace,
-    ) -> Result<EmpiricalBmsRowJetOutput<S>, String> {
+    ) -> Result<S, String> {
         let dimension = self.primary.total;
         if vars.len() != dimension {
             return Err(format!(
@@ -129,8 +124,7 @@ impl EmpiricalBmsRowJetPlan {
         let signed = self
             .index_jet(&intercept, vars, &self.observed, workspace)
             .scale(self.observed_sign);
-        let nll = signed.compose_unary(self.observed_neglog_stack);
-        Ok(EmpiricalBmsRowJetOutput { nll, intercept })
+        Ok(signed.compose_unary(self.observed_neglog_stack))
     }
 }
 
@@ -320,6 +314,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
+    #[cfg(test)]
     pub(super) fn unit_primary_direction(r: usize, idx: usize) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(r);
         out[idx] = 1.0;
@@ -912,54 +907,7 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
-    pub(super) fn empirical_bms_row_order2(
-        &self,
-        plan: &EmpiricalBmsRowJetPlan,
-        point: &[f64],
-    ) -> Result<(f64, Array1<f64>, Array2<f64>, Array1<f64>), String> {
-        let dimension = plan.primary.total;
-        if point.len() != dimension {
-            return Err(format!(
-                "empirical BMS order-2 point length {} != {dimension}",
-                point.len()
-            ));
-        }
-        let arena = DynamicJetArena::new();
-        let vars = arena.alloc_slice_fill_with(dimension, |axis| {
-            DynamicOrder2::variable(point[axis], axis, dimension, &arena)
-        });
-        let out = plan.evaluate(vars, 2, &arena)?;
-        let gradient = Array1::from_vec(out.nll.g().to_vec());
-        let hessian = Array2::from_shape_vec((dimension, dimension), out.nll.h().to_vec())
-            .map_err(|error| format!("empirical BMS Hessian shape: {error}"))?;
-        let intercept_gradient = Array1::from_vec(out.intercept.g().to_vec());
-        Ok((out.nll.v, gradient, hessian, intercept_gradient))
-    }
-
-    pub(super) fn empirical_bms_row_order1(
-        &self,
-        plan: &EmpiricalBmsRowJetPlan,
-        point: &[f64],
-    ) -> Result<(f64, Array1<f64>, Array1<f64>), String> {
-        let dimension = plan.primary.total;
-        if point.len() != dimension {
-            return Err(format!(
-                "empirical BMS order-1 point length {} != {dimension}",
-                point.len()
-            ));
-        }
-        let arena = DynamicJetArena::new();
-        let vars = arena.alloc_slice_fill_with(dimension, |axis| {
-            DynamicOrder1::variable(point[axis], axis, dimension, &arena)
-        });
-        let out = plan.evaluate(vars, 1, &arena)?;
-        Ok((
-            out.nll.v,
-            Array1::from_vec(out.nll.g().to_vec()),
-            Array1::from_vec(out.intercept.g().to_vec()),
-        ))
-    }
-
+    #[cfg(test)]
     pub(super) fn primary_component_jet(
         n_dirs: usize,
         base: f64,
@@ -980,6 +928,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(MultiDirJet::linear(n_dirs, base, &first))
     }
 
+    #[cfg(test)]
     pub(super) fn local_cubic_value_jet(
         cubic: exact_kernel::LocalSpanCubic,
         x: &MultiDirJet,
@@ -994,6 +943,7 @@ impl BernoulliMarginalSlopeFamily {
             .add(&t3.scale(cubic.c3))
     }
 
+    #[cfg(test)]
     pub(super) fn local_cubic_first_derivative_jet(
         cubic: exact_kernel::LocalSpanCubic,
         x: &MultiDirJet,
@@ -1006,6 +956,7 @@ impl BernoulliMarginalSlopeFamily {
             .add(&t2.scale(3.0 * cubic.c3))
     }
 
+    #[cfg(test)]
     pub(super) fn empirical_flex_eta_and_eta_a_jet_at_z(
         &self,
         primary: &PrimarySlices,
@@ -1080,6 +1031,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok((eta, eta_a))
     }
 
+    #[cfg(test)]
     pub(super) fn empirical_flex_calibration_jets(
         &self,
         primary: &PrimarySlices,
@@ -1106,6 +1058,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok((f, f_a))
     }
 
+    #[cfg(test)]
     pub(super) fn empirical_flex_neglog_jet(
         &self,
         row: usize,
@@ -1338,7 +1291,7 @@ impl BernoulliMarginalSlopeFamily {
         let vars = arena.alloc_slice_fill_with(r, |axis| {
             DynamicOneSeed::seed_direction(point[axis], axis, dir[axis], r, &arena)
         });
-        let jet = plan.evaluate(vars, 3, &arena)?.nll;
+        let jet = plan.evaluate(vars, 3, &arena)?;
         Array2::from_shape_vec((r, r), jet.contracted_third().to_vec())
             .map_err(|error| format!("empirical BMS third-contraction shape: {error}"))
     }
@@ -1385,7 +1338,7 @@ impl BernoulliMarginalSlopeFamily {
         let vars = arena.alloc_slice_fill_with(r, |axis| {
             DynamicTwoSeed::seed(point[axis], axis, dir_u[axis], dir_v[axis], r, &arena)
         });
-        let jet = plan.evaluate(vars, 4, &arena)?.nll;
+        let jet = plan.evaluate(vars, 4, &arena)?;
         Array2::from_shape_vec((r, r), jet.contracted_fourth().to_vec())
             .map_err(|error| format!("empirical BMS fourth-contraction shape: {error}"))
     }

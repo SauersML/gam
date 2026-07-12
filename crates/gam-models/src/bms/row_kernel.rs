@@ -320,7 +320,7 @@ impl gam_math::jet_tower::RowProgram<2> for BernoulliRigidRowKernel {
                     gam_math::jet_scalar::FixedRuntimeJet::from_inner(p[1]),
                 ];
                 plan.evaluate(&vars, 4, &())
-                    .map(|output| output.nll.into_inner())
+                    .map(gam_math::jet_scalar::FixedRuntimeJet::into_inner)
             }
         }
     }

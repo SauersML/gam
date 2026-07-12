@@ -755,6 +755,7 @@ pub(super) fn unary_derivatives_normal_cdf(x: f64) -> [f64; 5] {
     ]
 }
 
+#[cfg(test)]
 pub(super) fn unary_derivatives_normal_pdf(x: f64) -> [f64; 5] {
     let pdf = normal_pdf(x);
     [
