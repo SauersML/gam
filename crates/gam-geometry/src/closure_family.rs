@@ -427,43 +427,59 @@ pub fn profile_ci_from_grid(grid: &[(f64, f64)], level: f64) -> Result<ClosurePr
     }
     let half_chi2 = 0.5 * chi2_1_quantile(level);
 
-    // Profile minimiser.
+    // Profile minimiser (ties keep the first occurrence, so `hat_idx` is a
+    // single well-defined grid index to walk outward from below).
+    let mut hat_idx = 0usize;
     let (mut gamma_hat, mut v_min) = (grid[0].0, grid[0].1);
-    for &(g, v) in grid {
+    for (idx, &(g, v)) in grid.iter().enumerate() {
         if !g.is_finite() || !v.is_finite() {
             return Err("closure profile grid has non-finite entries".into());
         }
         if v < v_min {
             v_min = v;
             gamma_hat = g;
+            hat_idx = idx;
         }
     }
 
-    // Wilks set: contiguous-or-not membership by linear interpolation of the
-    // crossing 2[V(γ) − V̂] = χ². We scan and record the widest interval that is
-    // in the set and contains γ̂ (the regular case); endpoints are interpolated.
+    // Wilks set: the CI is the single connected component of
+    // `{γ : V(γ) − V̂ ≤ χ²/2}` that contains γ̂, found by walking outward from
+    // `hat_idx` in each direction and stopping (with a linearly-interpolated
+    // crossing) at the first rejected neighbour. A profile that dips back
+    // in-set further out (e.g. a second, shallower local minimum) must NOT be
+    // unioned into the reported interval — that would report a "confidence
+    // interval" spanning clearly-rejected γ in between, which is not a
+    // confidence set at all.
     let in_set = |v: f64| v - v_min <= half_chi2 + 1e-12;
+    let target = v_min + half_chi2;
+
     let mut ci_lo = gamma_hat;
+    let mut i = hat_idx;
+    while i > 0 {
+        let (g0, v0) = grid[i - 1];
+        let (g1, v1) = grid[i];
+        if in_set(v0) {
+            ci_lo = g0;
+            i -= 1;
+        } else {
+            let t = ((target - v1) / (v0 - v1)).clamp(0.0, 1.0);
+            ci_lo = g1 + t * (g0 - g1);
+            break;
+        }
+    }
+
     let mut ci_hi = gamma_hat;
-    for w in grid.windows(2) {
-        let (g0, v0) = w[0];
-        let (g1, v1) = w[1];
-        let (a0, a1) = (in_set(v0), in_set(v1));
-        if a0 {
-            ci_lo = ci_lo.min(g0);
-            ci_hi = ci_hi.max(g0);
-        }
-        if a1 {
-            ci_lo = ci_lo.min(g1);
-            ci_hi = ci_hi.max(g1);
-        }
-        if a0 != a1 {
-            // Linear crossing of the χ² threshold between g0 and g1.
-            let target = v_min + half_chi2;
+    let mut i = hat_idx;
+    while i + 1 < grid.len() {
+        let (g0, v0) = grid[i];
+        let (g1, v1) = grid[i + 1];
+        if in_set(v1) {
+            ci_hi = g1;
+            i += 1;
+        } else {
             let t = ((target - v0) / (v1 - v0)).clamp(0.0, 1.0);
-            let g_cross = g0 + t * (g1 - g0);
-            ci_lo = ci_lo.min(g_cross);
-            ci_hi = ci_hi.max(g_cross);
+            ci_hi = g0 + t * (g1 - g0);
+            break;
         }
     }
     ci_lo = ci_lo.clamp(0.0, 1.0);
@@ -658,6 +674,43 @@ mod tests {
         let ci = profile_ci_from_grid(&grid, 0.95).unwrap();
         assert!(ci.ci_includes_circle);
         assert!(!ci.singular_boundary);
+    }
+
+    /// A bimodal profile — a deep global minimum at γ = 0.6 plus an isolated,
+    /// shallower dip elsewhere that also happens to lie inside the Wilks
+    /// threshold — must report only the connected in-set region around γ̂, not
+    /// a union that swallows the clearly-rejected γ in between (the region
+    /// around γ = 0.3 sits far above the threshold and must stay excluded).
+    #[test]
+    fn profile_ci_excludes_disjoint_in_set_region() {
+        let v = |g: f64| -> f64 {
+            if g < 0.35 {
+                // Isolated dip near γ = 0.2, shallow enough to be in-set on
+                // its own, but separated from γ̂ by clearly-rejected points.
+                100.1 + 40.0 * (g - 0.2).powi(2)
+            } else {
+                100.0 + 50.0 * (g - 0.6).powi(2)
+            }
+        };
+        let grid: Vec<(f64, f64)> = (0..=100)
+            .map(|k| k as f64 / 100.0)
+            .map(|g| (g, v(g)))
+            .collect();
+        let ci = profile_ci_from_grid(&grid, 0.95).unwrap();
+        assert!((ci.gamma_hat - 0.6).abs() < 0.02, "γ̂ {}", ci.gamma_hat);
+        // The disjoint dip near γ = 0.2 must not be unioned in: γ = 0.4 (well
+        // above threshold, V=110) sits between it and γ̂ and must be rejected.
+        assert!(
+            ci.ci_lo > 0.4,
+            "CI lower bound {} wrongly reaches into the disjoint region",
+            ci.ci_lo
+        );
+        let half_width = (chi2_1_quantile(0.95) / (2.0 * 50.0)).sqrt();
+        assert!(
+            (ci.ci_lo - (0.6 - half_width)).abs() < 0.02,
+            "ci_lo {} should match the connected-component crossing near γ̂",
+            ci.ci_lo
+        );
     }
 
     /// A profile that keeps improving toward γ = 0 with the floor as the
