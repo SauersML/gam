@@ -2065,9 +2065,7 @@ impl BernoulliMarginalSlopeFamily {
             "bernoulli marginal-slope log-sigma auxiliary requested without GaussianShift sigma"
                 .to_string()
         })?;
-        Ok(crate::survival::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(
-            sigma.ln(),
-        ))
+        Ok(crate::survival::lognormal_kernel::ProbitFrailtyScaleJet::from_log_sigma(sigma.ln()))
     }
 
     /// Evaluate the canonical rigid standard-normal row program with the slope
@@ -2160,35 +2158,23 @@ impl BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         second_sigma: bool,
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        let primary_dim = 2usize;
-        let zero = Array1::<f64>::zeros(primary_dim);
-        // The leading prefix is the fixed number of zero primary directions the
-        // log-sigma hyperderivative differentiates *through*: one for the first
-        // log-sigma derivative, two for the second. The shared sweep appends the
-        // unit primary directions for grad/hess on top of this prefix.
-        let (leading, scales): (Vec<&Array1<f64>>, DirectionalScaleJets) = if second_sigma {
-            (
-                vec![&zero, &zero],
-                DirectionalScaleJets {
-                    obj: Some(self.sigma_scale_jet(2, &[1, 2], &[3])?),
-                    grad: self.sigma_scale_jet(3, &[1, 2], &[3])?,
-                    hess: self.sigma_scale_jet(4, &[1, 2], &[3])?,
+        let primaries = [block_states[0].eta[row], block_states[1].eta[row]];
+        let scale = self.sigma_scale_derivatives()?;
+        let terms = if second_sigma {
+            second_parameter_order2_terms(
+                primaries,
+                scale.s,
+                scale.ds,
+                scale.d2s,
+                |variables, parameter| {
+                    self.row_neglog_canonical_scale_jet(row, block_states, variables, parameter)
                 },
-            )
+            )?
         } else {
-            (
-                vec![&zero],
-                DirectionalScaleJets {
-                    obj: Some(self.sigma_scale_jet(1, &[1], &[])?),
-                    grad: self.sigma_scale_jet(2, &[1], &[])?,
-                    hess: self.sigma_scale_jet(3, &[1], &[])?,
-                },
-            )
+            first_parameter_order2_terms(primaries, scale.s, scale.ds, |variables, parameter| {
+                self.row_neglog_canonical_scale_jet(row, block_states, variables, parameter)
+            })?
         };
-        let terms = directional_obj_grad_hess(primary_dim, &leading, &scales, |dirs, scale| {
-            let owned: Vec<Array1<f64>> = dirs.iter().map(|d| (*d).clone()).collect();
-            self.row_neglog_directional_with_scale_jet(row, block_states, &owned, scale)
-        })?;
         Ok((terms.objective, terms.grad, terms.hess))
     }
 
@@ -2428,33 +2414,25 @@ impl BernoulliMarginalSlopeFamily {
             .outer_score_subsample
             .as_ref()
             .map(|_| crate::marginal_slope_shared::outer_row_weights_by_index(options, n));
-        // Sigma scale jets and the zero primary direction are constant across
-        // rows; resolve once outside the fold. The shared
-        // `directional_obj_grad_hess` sweep differentiates *through* the fixed
-        // leading prefix `[zero, row_dir]` (one zero log-sigma slot, the
-        // perturbation direction) and appends the grad/hess unit directions;
-        // `obj: None` suppresses the zeroth-order pass.
-        let scale_grad = self.sigma_scale_jet(3, &[1], &[])?;
-        let scale_hess = self.sigma_scale_jet(4, &[1], &[])?;
-        let zero = Array1::<f64>::zeros(primary.total);
+        // One TwoSeed evaluation carries the frailty-scale direction and the
+        // requested primary direction. Its mixed Order2 channel supplies the
+        // complete primary gradient and Hessian without a unit-axis sweep.
+        let scale = self.sigma_scale_derivatives()?;
         let acc = chunked_row_reduction(
             row_iter.as_slice(),
             || BernoulliBlockHessianAccumulator::new(&slices),
             |row, acc| -> Result<(), String> {
                 let row_dir =
                     self.row_primary_direction_from_flat(row, &slices, &primary, d_beta_flat)?;
-                let scales = DirectionalScaleJets {
-                    obj: None,
-                    grad: scale_grad.clone(),
-                    hess: scale_hess.clone(),
-                };
-                let terms = directional_obj_grad_hess(
-                    primary.total,
-                    &[&zero, &row_dir],
-                    &scales,
-                    |dirs, scale| {
-                        let owned: Vec<Array1<f64>> = dirs.iter().map(|d| (*d).clone()).collect();
-                        self.row_neglog_directional_with_scale_jet(row, block_states, &owned, scale)
+                let primaries = [block_states[0].eta[row], block_states[1].eta[row]];
+                let direction = [row_dir[0], row_dir[1]];
+                let terms = first_parameter_directional_order2_terms(
+                    primaries,
+                    &direction,
+                    scale.s,
+                    scale.ds,
+                    |variables, parameter| {
+                        self.row_neglog_canonical_scale_jet(row, block_states, variables, parameter)
                     },
                 )?;
                 let mut hess = terms.hess;
