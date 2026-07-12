@@ -626,6 +626,10 @@ pub(crate) fn softmax_compiled_schedule_beats_hand_full_channels_932() {
             "K={k_atoms} compiled allocations {compiled_allocations}/{compiled_bytes}B must not \
              exceed hand {hand_allocations}/{hand_bytes}B"
         );
+        assert_eq!(
+            compiled_allocations, 2,
+            "K={k_atoms} warmed full row must allocate only the owned vars and one packed channel buffer"
+        );
 
         #[cfg(debug_assertions)]
         let (repetitions, trials) = (1usize, 1usize);

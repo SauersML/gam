@@ -3021,7 +3021,6 @@ impl BernoulliMarginalSlopeFamily {
             scratch.g_u_fixed.resize(r, [0.0; 4]);
             scratch.g_au_fixed.resize(r, [0.0; 4]);
             scratch.g_bu_fixed.resize(r, [0.0; 4]);
-            scratch.cell_moment_actions.resize(r, [0.0; 4]);
             scratch.zero_family.resize(r, [0.0; 4]);
             if scratch.active_cell_primaries.capacity() < r {
                 scratch.active_cell_primaries.reserve(r);
@@ -3050,7 +3049,6 @@ impl BernoulliMarginalSlopeFamily {
         let coeff_au = &mut scratch.coeff_au;
         let coeff_bu = &mut scratch.coeff_bu;
         let active_cell_primaries = &mut scratch.active_cell_primaries;
-        let cell_moment_actions = &mut scratch.cell_moment_actions;
         let g_u_fixed = &mut scratch.g_u_fixed;
         let g_au_fixed = &mut scratch.g_au_fixed;
         let g_bu_fixed = &mut scratch.g_bu_fixed;
@@ -3079,7 +3077,10 @@ impl BernoulliMarginalSlopeFamily {
                 coeff_au.as_mut_slice(),
                 coeff_bu.as_mut_slice(),
                 active_cell_primaries,
-                cell_moment_actions.as_mut_slice(),
+                // The observed-point coefficient tape is dead until the
+                // calibration pass returns, then explicitly overwritten below.
+                // Reuse it for `H·c_u` actions: no cold-only scratch allocation.
+                g_u_fixed.as_mut_slice(),
                 f_u,
                 f_au,
                 f_uv,
