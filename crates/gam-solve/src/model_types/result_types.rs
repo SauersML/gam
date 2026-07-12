@@ -1298,7 +1298,27 @@ impl FitConvergenceEvidence {
         // Only strict inner convergence can mint a fit. Near-stationary stalled
         // checkpoints remain useful diagnostics, but returning one as a model
         // would conflate a widened KKT band with convergence.
-        if !parts.pirls_status.is_converged() {
+        //
+        // ONE measurement-over-taxonomy exception (#2273):
+        // `StalledAtValidMinimum` is the classifier's 10×-KKT-band +
+        // valid-minimum-curvature verdict, and the perfect-separation Firth
+        // rescue routinely lands there with the OUTER criterion certificate —
+        // which differentiates the stationary envelope THROUGH this inner
+        // mode — certifying with a measured stationarity residual orders of
+        // magnitude inside its bound (measured: 8.3e-11 against 1.2e-3,
+        // refused solely on the status enum, so the documented Firth
+        // separation rescue produced no model at all). When the analytic
+        // certificate certifies, the inner mode is certified by evidence; a
+        // stalled mode the envelope derivative CAN'T certify still refuses,
+        // as do all other non-converged statuses unconditionally.
+        let stalled_but_analytically_certified =
+            matches!(parts.pirls_status, crate::pirls::PirlsStatus::StalledAtValidMinimum)
+                && parts
+                    .artifacts
+                    .criterion_certificate
+                    .as_ref()
+                    .is_some_and(|certificate| certificate.certifies());
+        if !parts.pirls_status.is_converged() && !stalled_but_analytically_certified {
             return Err(Self::assembly_error(
                 parts,
                 "outer evidence was not considered because the inner mode is uncertified"
