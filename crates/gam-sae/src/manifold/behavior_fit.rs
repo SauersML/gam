@@ -316,10 +316,42 @@ impl SaeManifoldTerm {
                 any_update = true;
             }
 
-            if !any_update || max_delta <= log_lambda_tol {
-                // Either every block is held (no weight can move) or the λ fixed
-                // point is within tolerance — converged in the documented sense.
-                // The term holds the current-λ baseline fit, which is the answer.
+            // Decrement doctrine for the λ sweep (the same predicted-decrease
+            // authority the inner engine uses): with residuals HELD at the
+            // current-λ refit, the profiled criterion is exactly evaluable at
+            // λ*, and the closed-form λ* is its per-block minimizer given those
+            // residuals — so `baseline_crit − C(λ*)` is the largest decrease
+            // the FULL closed-form move could possibly deliver this sweep.
+            // Near the fixed point that decrease shrinks QUADRATICALLY in the
+            // remaining log-λ gap while the Armijo floor is a fixed relative
+            // epsilon, so there is a guaranteed annulus (`max_delta > tol` but
+            // `ΔC_pred ≤ armijo_eps`) where NO fraction of the step can ever
+            // pass `trial < baseline − armijo_eps`: treating that as a stall
+            // reported `converged = false` for a λ that HAS settled to the
+            // criterion's own measurement floor (seen live: trajectory settles
+            // to 6+ digits, flag says false). A λ resolved below the
+            // acceptance test's resolution is converged.
+            let armijo_eps = 1e-9 * (1.0 + baseline_crit.abs());
+            let predicted_decrease = if any_update {
+                baseline_crit
+                    - profiled_penalized_quasi_laplace_criterion(
+                        n_obs,
+                        px,
+                        base_rx,
+                        &base_unscaled,
+                        &dims,
+                        &log_lambda_star,
+                    )
+            } else {
+                0.0
+            };
+
+            if !any_update || max_delta <= log_lambda_tol || predicted_decrease <= armijo_eps {
+                // Every block held (no weight can move), the λ fixed point
+                // within tolerance, or the full closed-form move's attainable
+                // decrease below the line search's own resolution — converged
+                // in the documented sense. The term holds the current-λ
+                // baseline fit, which is the answer.
                 converged = true;
                 for idx in 0..blocks.len() {
                     trajectories[idx].push(cur_log_lambda[idx]);
@@ -334,7 +366,6 @@ impl SaeManifoldTerm {
             // comparison isolates the λ move; the criterion penalises λ→0, so a step
             // that would abandon a block is rejected — the fix that makes the
             // otherwise non-contractive (fit, λ-update) alternation monotone.
-            let armijo_eps = 1e-9 * (1.0 + baseline_crit.abs());
             // Backtracking line search on the closed-form λ step, migrated onto
             // the shared `opt` primitive. `trial(s)` evaluates the step
             // of scale `s` (always well defined here, so never `Ok(None)`) and
@@ -425,11 +456,12 @@ impl SaeManifoldTerm {
                 // the improved current-λ fit (`baseline_state`, no worse than the
                 // sweep-entry state) at the unchanged weights and stop.
                 //
-                // F4 — honest flag. This branch is reached ONLY after the
-                // `max_delta ≤ log_lambda_tol` gate above FAILED, so the closed-form
-                // λ* still wants a > tol move: the λ fixed-point iteration did NOT
-                // meet its tolerance. A step that then fails the line search is a
-                // STALL (the truncated inner solve cannot resolve the tiny
+                // F4 — honest flag. This branch is reached ONLY after BOTH
+                // convergence gates above FAILED: the closed-form λ* still wants
+                // a > tol move AND its held-residual predicted decrease exceeds
+                // the Armijo resolution — a realizable improvement existed on
+                // paper. A step that then fails the line search is a genuine
+                // STALL (the truncated inner solve cannot resolve the
                 // coordinated improvement the move needs), not tolerance-
                 // convergence. Leaving `converged = false` keeps the flag honest in
                 // BOTH directions — `true` only when λ actually settled (or every
