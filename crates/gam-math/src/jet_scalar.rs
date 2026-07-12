@@ -69,7 +69,7 @@
 /// channel set differs. A row loss written once against this interface yields a
 /// different channel set per instantiation, all exact for the channel they serve
 /// (doc §A.0).
-pub trait JetScalar<const K: usize>: Copy {
+pub trait JetScalar<const K: usize>: crate::nested_dual::JetField + Copy {
     /// A constant: value `c`, every derivative channel zero.
     fn constant(c: f64) -> Self;
 
