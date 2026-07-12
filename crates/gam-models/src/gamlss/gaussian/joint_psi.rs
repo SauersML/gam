@@ -3,6 +3,34 @@
 // so `use super::*;` makes the sibling-concern symbols this module references
 // resolve through the parent namespace.
 use super::*;
+use gam_row_macros::row_atom;
+
+// Stable local coordinates for the Gaussian location-scale row NLL. At the
+// expansion point `delta_mu = delta_eta = 0`, the log-b link gives
+// `sigma(eta + delta_eta) / sigma(eta) = (1-kappa) + kappa*exp(delta_eta)`.
+// The perturbed standardized residual is therefore
+// `(standardized_residual - delta_mu*inv_sigma) / scale_ratio`. Every runtime
+// constant is already certified by `gaussian_diagonal_row_kernel`, so this one
+// expression retains the production extreme-value semantics while build-time
+// differentiation emits exact observed H, contracted t3, and contracted t4.
+row_atom! {
+    fn gaussian_normalized_row [order2, third, fourth](
+        delta_mu,
+        delta_eta;
+        obs_weight,
+        standardized_residual,
+        inv_sigma,
+        kappa
+    ) {
+        obs_weight * ln((1.0 - kappa) + kappa * exp(delta_eta))
+            + 0.5
+                * obs_weight
+                * (standardized_residual - delta_mu * inv_sigma)
+                * (standardized_residual - delta_mu * inv_sigma)
+                / ((1.0 - kappa) + kappa * exp(delta_eta))
+                / ((1.0 - kappa) + kappa * exp(delta_eta))
+    }
+}
 
 pub(crate) struct LocationScaleJointPsiDirection {
     pub(crate) block_idx: usize,
@@ -403,6 +431,10 @@ pub struct GaussianJointRowScalars {
     pub(crate) w: Array1<f64>,
     pub(crate) m: Array1<f64>,
     pub(crate) n: Array1<f64>,
+    /// Stable `(y - mu) / sigma` at the expansion point.
+    pub(crate) standardized_residual: Array1<f64>,
+    /// Stable `1 / sigma` at the expansion point.
+    pub(crate) inv_sigma: Array1<f64>,
     /// κ = (dσ/dη_ls)/σ for the active sigma link.
     /// The cross Hessian block H_{μ,ls} carries an overall κ factor and the
     /// scale-scale block H_{ls,ls} carries κ².
@@ -584,6 +616,8 @@ pub(crate) fn gaussian_jointrow_scalars(
     let mut w = Array1::<f64>::uninit(nobs);
     let mut m = Array1::<f64>::uninit(nobs);
     let mut n = Array1::<f64>::uninit(nobs);
+    let mut standardized_residual = Array1::<f64>::uninit(nobs);
+    let mut inv_sigma = Array1::<f64>::uninit(nobs);
     let mut kappa = Array1::<f64>::uninit(nobs);
     let mut kappa_prime = Array1::<f64>::uninit(nobs);
     let mut kappa_dprime = Array1::<f64>::uninit(nobs);
@@ -601,6 +635,8 @@ pub(crate) fn gaussian_jointrow_scalars(
         w[i].write(row.joint_w);
         m[i].write(row.joint_m);
         n[i].write(row.joint_n);
+        standardized_residual[i].write(row.standardized_residual);
+        inv_sigma[i].write(row.inv_sigma);
         kappa[i].write(row.kappa);
         kappa_prime[i].write(row.kappa_prime);
         kappa_dprime[i].write(row.kappa_dprime);
@@ -608,12 +644,24 @@ pub(crate) fn gaussian_jointrow_scalars(
     // SAFETY: every `MaybeUninit` slot in each of these arrays was written
     // exactly once in the `for i in 0..nobs` loop above; no slot is read,
     // moved, or dropped before this point.
-    let (obs_weight, w, m, n, kappa, kappa_prime, kappa_dprime) = unsafe {
+    let (
+        obs_weight,
+        w,
+        m,
+        n,
+        standardized_residual,
+        inv_sigma,
+        kappa,
+        kappa_prime,
+        kappa_dprime,
+    ) = unsafe {
         (
             obs_weight.assume_init(),
             w.assume_init(),
             m.assume_init(),
             n.assume_init(),
+            standardized_residual.assume_init(),
+            inv_sigma.assume_init(),
             kappa.assume_init(),
             kappa_prime.assume_init(),
             kappa_dprime.assume_init(),
@@ -624,63 +672,44 @@ pub(crate) fn gaussian_jointrow_scalars(
         w,
         m,
         n,
+        standardized_residual,
+        inv_sigma,
         kappa,
         kappa_prime,
         kappa_dprime,
     })
 }
 
-/// The LIVE third-order tower `∂_dir H_obs` (directional derivative of the
-/// observed joint Hessian along the β-direction `(dotmu, dot_eta)`), returned as
-/// the row weights `(w_u, c_u, d_u) = (∂H_μμ, ∂H_μls, ∂H_lsls)`.
-///
-/// #932 documented performance exception: this κ-chain-rule closed form (and its
-/// fourth-order sibling `gaussian_jointsecond_directionalweights`) STAYS in the
-/// production outer-Hessian drift; it is not cut over to the generic gam-math
-/// `Tower4` jet, which would materialise a full per-row 4th-order tensor on this
-/// hot path. It is instead pinned as a non-ignored jet oracle at ≤1e-9, with an
-/// independent central-difference witness, in
-/// `observed_single_source_oracle_tests::jet_third_fourth_oracle` /
-/// `first_directional_weights_match_observed_finite_difference`.
+/// Live third-order observed-Hessian contraction emitted from the same stable
+/// [`gaussian_normalized_row`] expression as the observed Hessian.
 pub(crate) fn gaussian_joint_first_directionalweights(
     scalars: &GaussianJointRowScalars,
     dotmu: &Array1<f64>,
     dot_eta: &Array1<f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
     let nobs = scalars.w.len();
-    let mut w_u = Array1::<f64>::uninit(nobs);
-    let mut c_u = Array1::<f64>::uninit(nobs);
-    let mut d_u = Array1::<f64>::uninit(nobs);
+    let mut w_u = Array1::<f64>::zeros(nobs);
+    let mut c_u = Array1::<f64>::zeros(nobs);
+    let mut d_u = Array1::<f64>::zeros(nobs);
     for i in 0..nobs {
-        let wi = scalars.w[i];
-        let mi = scalars.m[i];
-        let ni = scalars.n[i];
-        let ki = scalars.kappa[i];
-        let kpi = scalars.kappa_prime[i];
-        let kdpi = scalars.kappa_dprime[i];
-        let ai = scalars.obs_weight[i];
-        let dm = dotmu[i];
-        let de = dot_eta[i];
-        // κ-scaled log-sigma direction.
-        let sde = ki * de;
-        w_u[i].write(-2.0 * wi * sde);
-        // + 2·κ'·m·de: dκ/dη chain-rule from σ = b + e^η.
-        c_u[i].write(ki * (-2.0 * wi * dm - 4.0 * mi * sde) + 2.0 * mi * kpi * de);
-        // Directional derivative of the OBSERVED h_ll = κ'(a−n) + 2κ²n:
-        //   ∂h/∂η_μ = −2m(2κ²−κ'),
-        //   ∂h/∂η_ls = κ''(a−n) + 6κκ'n − 4κ³n.
-        let a_coef = 2.0 * ki * ki - kpi;
-        d_u[i].write(
-            -2.0 * mi * a_coef * dm
-                + (kdpi * (ai - ni) + (6.0 * ki * kpi - 4.0 * ki * ki * ki) * ni) * de,
+        let matrix = gaussian_normalized_row_third_contracted(
+            0.0,
+            0.0,
+            scalars.obs_weight[i],
+            scalars.standardized_residual[i],
+            scalars.inv_sigma[i],
+            scalars.kappa[i],
+            &[dotmu[i], dot_eta[i]],
         );
+        w_u[i] = matrix[0][0];
+        c_u[i] = matrix[0][1];
+        d_u[i] = matrix[1][1];
     }
-    // SAFETY: every slot of `w_u`, `c_u`, `d_u` was written exactly once
-    // inside the loop above (one `.write(...)` per index per array).
-    let (w_u, c_u, d_u) = unsafe { (w_u.assume_init(), c_u.assume_init(), d_u.assume_init()) };
     (w_u, c_u, d_u)
 }
 
+/// Live fourth-order observed-Hessian contraction emitted from the same stable
+/// [`gaussian_normalized_row`] expression as every lower curvature channel.
 pub(crate) fn gaussian_jointsecond_directionalweights(
     scalars: &GaussianJointRowScalars,
     dotmu_u: &Array1<f64>,
@@ -689,55 +718,24 @@ pub(crate) fn gaussian_jointsecond_directionalweights(
     dot_etav: &Array1<f64>,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
     let nobs = scalars.w.len();
-    let mut w_uv = Array1::<f64>::uninit(nobs);
-    let mut c_uv = Array1::<f64>::uninit(nobs);
-    let mut d_uv = Array1::<f64>::uninit(nobs);
+    let mut w_uv = Array1::<f64>::zeros(nobs);
+    let mut c_uv = Array1::<f64>::zeros(nobs);
+    let mut d_uv = Array1::<f64>::zeros(nobs);
     for i in 0..nobs {
-        let wi = scalars.w[i];
-        let mi = scalars.m[i];
-        let ki = scalars.kappa[i];
-        let kpi = scalars.kappa_prime[i];
-        let kdpi = scalars.kappa_dprime[i];
-        let ai = scalars.obs_weight[i];
-        let dmu = dotmu_u[i];
-        let dmv = dotmuv[i];
-        let deu = dot_eta_u[i];
-        let dev = dot_etav[i];
-        // κ-scaled log-sigma directions.
-        let sdeu = ki * deu;
-        let sdev = ki * dev;
-        let de_sym = dmu * dev + dmv * deu;
-        let de_eta = deu * dev;
-        // − 2·κ'·w·deu·dev: ∂²w/∂η² = 4wκ² − 2wκ'.
-        w_uv[i].write(4.0 * wi * sdeu * sdev - 2.0 * wi * kpi * de_eta);
-        // − 2·κ'·w·sym + 2·m·(κ''−6·κ·κ')·deu·dev from d²(2mκ).
-        c_uv[i].write(
-            ki * (4.0 * wi * (dmu * sdev + dmv * sdeu) + 8.0 * mi * sdeu * sdev)
-                - 2.0 * wi * kpi * de_sym
-                + 2.0 * mi * (kdpi - 6.0 * ki * kpi) * de_eta,
+        let matrix = gaussian_normalized_row_fourth_contracted(
+            0.0,
+            0.0,
+            scalars.obs_weight[i],
+            scalars.standardized_residual[i],
+            scalars.inv_sigma[i],
+            scalars.kappa[i],
+            &[dotmu_u[i], dot_eta_u[i]],
+            &[dotmuv[i], dot_etav[i]],
         );
-        // d²/du dv of the OBSERVED h_ll = κ'(a−n) + 2κ²n (β-directions are
-        // linear, so no direction-curvature terms). With A = 2κ²−κ',
-        // E = 6κκ'−4κ³−κ'', and the logb-link identity κ''' = κ''(1−2κ)−2κ'²:
-        //   ∂²h/∂η_μ²      = 2wA,
-        //   ∂²h/∂η_μ∂η_ls  = m(8κ³ − 12κκ' + 2κ'')   (≡ ∂²h_μls/∂η_ls², ∂³ℓ symmetry),
-        //   ∂²h/∂η_ls²     = κ'''a − 2κnE + n(6κ'² + 6κκ'' − 12κ²κ' − κ''').
-        let ni = scalars.n[i];
-        let a_coef = 2.0 * ki * ki - kpi;
-        let e_coef = 6.0 * ki * kpi - 4.0 * ki * ki * ki - kdpi;
-        let ktp = kdpi * (1.0 - 2.0 * ki) - 2.0 * kpi * kpi;
-        d_uv[i].write(
-            2.0 * wi * a_coef * (dmu * dmv)
-                + mi * (8.0 * ki * ki * ki - 12.0 * ki * kpi + 2.0 * kdpi) * de_sym
-                + (ktp * ai - 2.0 * ki * ni * e_coef
-                    + ni * (6.0 * kpi * kpi + 6.0 * ki * kdpi - 12.0 * ki * ki * kpi - ktp))
-                    * de_eta,
-        );
+        w_uv[i] = matrix[0][0];
+        c_uv[i] = matrix[0][1];
+        d_uv[i] = matrix[1][1];
     }
-    // SAFETY: every slot of `w_uv`, `c_uv`, `d_uv` was written exactly once
-    // inside the loop above.
-    let (w_uv, c_uv, d_uv) =
-        unsafe { (w_uv.assume_init(), c_uv.assume_init(), d_uv.assume_init()) };
     (w_uv, c_uv, d_uv)
 }
 
@@ -1049,10 +1047,23 @@ pub(crate) fn gaussian_joint_psi_mixed_driftweights(
 pub(crate) fn gaussian_locscale_observed_joint_row_coeffs(
     rows: &GaussianJointRowScalars,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
-    let mm = rows.w.clone();
-    let ml = 2.0 * &rows.kappa * &rows.m;
-    let ll = &rows.kappa_prime * (&rows.obs_weight - &rows.n)
-        + 2.0 * &rows.kappa * &rows.kappa * &rows.n;
+    let n = rows.obs_weight.len();
+    let mut mm = Array1::<f64>::zeros(n);
+    let mut ml = Array1::<f64>::zeros(n);
+    let mut ll = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let atom = gaussian_normalized_row_order2(
+            0.0,
+            0.0,
+            rows.obs_weight[row],
+            rows.standardized_residual[row],
+            rows.inv_sigma[row],
+            rows.kappa[row],
+        );
+        mm[row] = atom.hessian_at(0, 0);
+        ml[row] = atom.hessian_at(0, 1);
+        ll[row] = atom.hessian_at(1, 1);
+    }
     (mm, ml, ll)
 }
 
