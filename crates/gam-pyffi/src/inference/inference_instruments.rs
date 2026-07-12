@@ -1355,6 +1355,37 @@ mod tests {
     }
 
     #[test]
+    fn held_out_values_do_not_choose_smooth_candidate_gauges() {
+        let train_rows = 120usize;
+        let eval_rows = 24usize;
+        let mut coords = Array2::<f64>::zeros((train_rows + eval_rows, 2));
+        for row in 0..coords.nrows() {
+            let angle = std::f64::consts::TAU * row as f64 / coords.nrows() as f64;
+            let radius = 1.8 + 0.06 * (5.0 * angle).cos();
+            coords[[row, 0]] = 0.4 + radius * angle.cos();
+            coords[[row, 1]] = -0.7 + radius * angle.sin();
+        }
+        let train = (0..train_rows).collect::<Vec<_>>();
+        let eval = (train_rows..train_rows + eval_rows).collect::<Vec<_>>();
+        let circle_baseline = ring_provider_2d(coords.clone())(&train, &eval).unwrap();
+        let gaussian_baseline = gaussian_provider_2d(coords.clone())(&train, &eval).unwrap();
+
+        let perturbed_slot = eval_rows - 1;
+        coords[[train_rows + perturbed_slot, 0]] = 1.0e12;
+        coords[[train_rows + perturbed_slot, 1]] = -1.0e12;
+        let circle_perturbed = ring_provider_2d(coords.clone())(&train, &eval).unwrap();
+        let gaussian_perturbed = gaussian_provider_2d(coords)(&train, &eval).unwrap();
+        assert_eq!(
+            &circle_perturbed[..perturbed_slot],
+            &circle_baseline[..perturbed_slot]
+        );
+        assert_eq!(
+            &gaussian_perturbed[..perturbed_slot],
+            &gaussian_baseline[..perturbed_slot]
+        );
+    }
+
+    #[test]
     fn euclidean_gaussian_is_similarity_equivariant_with_a_normalized_density() {
         let n = 180usize;
         let mut coords = Array2::<f64>::zeros((n, 2));
@@ -1495,21 +1526,24 @@ mod tests {
         }
         let train = (0..train_rows).collect::<Vec<_>>();
         let eval = (train_rows..train_rows + eval_rows).collect::<Vec<_>>();
-        let train_coords = gather_shape_rows(free_coords.view(), &train, "test train").unwrap();
-        let eval_coords = gather_shape_rows(free_coords.view(), &eval, "test eval").unwrap();
         let config = GaussianMixtureConfig::default();
         let ladder = vec![2usize, 3];
-        let (train_selected_k, expected) = free_mixture_rung_predictive_density(
+        let (train_coords, eval_coords, log_volume_scale) =
+            canonical_shape_fold(free_coords.view(), &train, &eval, "test mixture").unwrap();
+        let (train_selected_k, mut expected) = free_mixture_rung_predictive_density(
             train_coords.view(),
             eval_coords.view(),
             &ladder,
             config,
         )
         .unwrap();
+        for value in &mut expected {
+            *value -= log_volume_scale;
+        }
         let free_trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let actual = free_mixture_rung_provider_2d(
-            free_coords,
-            ladder,
+            free_coords.clone(),
+            ladder.clone(),
             config,
             std::rc::Rc::clone(&free_trace),
         )(&train, &eval)
@@ -1517,6 +1551,29 @@ mod tests {
         assert!(train_selected_k >= 2);
         assert_eq!(actual, expected);
         assert_eq!(&*free_trace.borrow(), &[train_selected_k]);
+
+        // A held-out outlier may change its own predictive density, but it must
+        // not change the training gauge, selected order, or any other held-out
+        // row. The former full-data canonicalization failed this contract when
+        // its absolute mixture covariance floor became active.
+        let mut perturbed_free_coords = free_coords;
+        let perturbed_slot = eval_rows - 1;
+        perturbed_free_coords[[train_rows + perturbed_slot, 0]] = 1.0e12;
+        perturbed_free_coords[[train_rows + perturbed_slot, 1]] = -1.0e12;
+        let perturbed_free_trace =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let perturbed_actual = free_mixture_rung_provider_2d(
+            perturbed_free_coords,
+            ladder,
+            config,
+            std::rc::Rc::clone(&perturbed_free_trace),
+        )(&train, &eval)
+        .expect("held-out values must not alter mixture training preprocessing");
+        assert_eq!(
+            &perturbed_actual[..perturbed_slot],
+            &actual[..perturbed_slot]
+        );
+        assert_eq!(&*perturbed_free_trace.borrow(), &[train_selected_k]);
 
         let clusters = 3usize;
         let per_cluster = 30usize;
@@ -1540,22 +1597,28 @@ mod tests {
         let ring_train = (0..clusters * per_cluster).collect::<Vec<_>>();
         let ring_eval =
             (clusters * per_cluster..clusters * per_cluster + eval_rows).collect::<Vec<_>>();
-        let ring_train_coords =
-            gather_shape_rows(ring_coords.view(), &ring_train, "ring test train").unwrap();
-        let ring_eval_coords =
-            gather_shape_rows(ring_coords.view(), &ring_eval, "ring test eval").unwrap();
         let ring_ladder = vec![3usize, 4];
-        let (ring_selected_k, ring_expected) = ring_cluster_rung_predictive_density(
+        let (ring_train_coords, ring_eval_coords, ring_log_volume_scale) = canonical_shape_fold(
+            ring_coords.view(),
+            &ring_train,
+            &ring_eval,
+            "test ring cluster",
+        )
+        .unwrap();
+        let (ring_selected_k, mut ring_expected) = ring_cluster_rung_predictive_density(
             ring_train_coords.view(),
             ring_eval_coords.view(),
             &ring_ladder,
             config,
         )
         .unwrap();
+        for value in &mut ring_expected {
+            *value -= ring_log_volume_scale;
+        }
         let ring_trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let ring_actual = ring_cluster_rung_provider_2d(
-            ring_coords,
-            ring_ladder,
+            ring_coords.clone(),
+            ring_ladder.clone(),
             config,
             std::rc::Rc::clone(&ring_trace),
         )(&ring_train, &ring_eval)
@@ -1563,6 +1626,25 @@ mod tests {
         assert!(ring_selected_k >= 3);
         assert_eq!(ring_actual, ring_expected);
         assert_eq!(&*ring_trace.borrow(), &[ring_selected_k]);
+
+        let mut perturbed_ring_coords = ring_coords;
+        let perturbed_ring_slot = eval_rows - 1;
+        perturbed_ring_coords[[clusters * per_cluster + perturbed_ring_slot, 0]] = -1.0e12;
+        perturbed_ring_coords[[clusters * per_cluster + perturbed_ring_slot, 1]] = 1.0e12;
+        let perturbed_ring_trace =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let perturbed_ring_actual = ring_cluster_rung_provider_2d(
+            perturbed_ring_coords,
+            ring_ladder,
+            config,
+            std::rc::Rc::clone(&perturbed_ring_trace),
+        )(&ring_train, &ring_eval)
+        .expect("held-out values must not alter ring-cluster training preprocessing");
+        assert_eq!(
+            &perturbed_ring_actual[..perturbed_ring_slot],
+            &ring_actual[..perturbed_ring_slot]
+        );
+        assert_eq!(&*perturbed_ring_trace.borrow(), &[ring_selected_k]);
     }
 
     /// #2262 structureless-null control: on pure isotropic Gaussian noise (no
@@ -2078,13 +2160,13 @@ impl CircularGaussianFit2d {
 fn ring_provider_2d(coords: Array2<f64>) -> gam::solver::HeldOutDensityProvider<'static> {
     Box::new(
         move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
-            let fit = CircularGaussianFit2d::fit(coords.view(), train)?;
-            let mut out = Vec::with_capacity(eval.len());
-            for &i in eval {
-                if i >= coords.nrows() {
-                    return Err("circle density received an invalid evaluation row".to_string());
-                }
-                out.push(fit.log_density(coords[[i, 0]], coords[[i, 1]]));
+            let (train_coords, eval_coords, log_volume_scale) =
+                canonical_shape_fold(coords.view(), train, eval, "circle density")?;
+            let train_rows = (0..train_coords.nrows()).collect::<Vec<_>>();
+            let fit = CircularGaussianFit2d::fit(train_coords.view(), &train_rows)?;
+            let mut out = Vec::with_capacity(eval_coords.nrows());
+            for row in eval_coords.rows() {
+                out.push(fit.log_density(row[0], row[1]) - log_volume_scale);
             }
             Ok(out)
         },
@@ -2204,13 +2286,13 @@ impl GaussianFit2d {
 fn gaussian_provider_2d(coords: Array2<f64>) -> gam::solver::HeldOutDensityProvider<'static> {
     Box::new(
         move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
-            let fit = GaussianFit2d::fit(coords.view(), train)?;
-            let mut out = Vec::with_capacity(eval.len());
-            for &row in eval {
-                if row >= coords.nrows() {
-                    return Err("Gaussian density received an invalid evaluation row".to_string());
-                }
-                out.push(fit.log_density(coords[[row, 0]], coords[[row, 1]]));
+            let (train_coords, eval_coords, log_volume_scale) =
+                canonical_shape_fold(coords.view(), train, eval, "Gaussian density")?;
+            let train_rows = (0..train_coords.nrows()).collect::<Vec<_>>();
+            let fit = GaussianFit2d::fit(train_coords.view(), &train_rows)?;
+            let mut out = Vec::with_capacity(eval_coords.nrows());
+            for row in eval_coords.rows() {
+                out.push(fit.log_density(row[0], row[1]) - log_volume_scale);
             }
             Ok(out)
         },
@@ -2312,43 +2394,116 @@ fn circular_stacking_summary(
     ))
 }
 
-/// Fix the arbitrary translation and uniform-scale gauge of a 2-D intrinsic
-/// chart before *any* candidate is fitted.  The common transformation has no
-/// shape content, and using one canonical chart keeps fixed numerical
-/// constraints inside the mixture solvers from turning coordinate units into
-/// topology evidence.
-fn canonical_shape_coordinates(coords: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    if coords.ncols() != 2 || coords.nrows() == 0 || !coords.iter().all(|value| value.is_finite()) {
-        return Err("shape coordinates must be a nonempty finite (n, 2) matrix".to_string());
+#[derive(Clone, Copy)]
+struct ShapeCoordinateGauge {
+    anchor: [f64; 2],
+    mean_offset: [f64; 2],
+    scale: f64,
+}
+
+/// Fit the translation and uniform-scale gauge from training rows only.
+///
+/// The mean is accumulated as a sequence of convex combinations, so neither
+/// `n * mean` nor a large absolute chart origin can overflow. The RMS uses the
+/// LAPACK `lassq` scaling recurrence rather than summing raw squares.
+fn fit_shape_coordinate_gauge(
+    training: ArrayView2<'_, f64>,
+    context: &str,
+) -> Result<ShapeCoordinateGauge, String> {
+    if training.ncols() != 2
+        || training.nrows() == 0
+        || !training.iter().all(|value| value.is_finite())
+    {
+        return Err(format!(
+            "{context} training coordinates must be a nonempty finite (n, 2) matrix"
+        ));
     }
-    let anchor = [coords[[0, 0]], coords[[0, 1]]];
-    let count = coords.nrows() as f64;
+    let anchor = [training[[0, 0]], training[[0, 1]]];
     let mut mean_offset = [0.0_f64; 2];
+    for row in 0..training.nrows() {
+        let count = (row + 1) as f64;
+        let previous_weight = (count - 1.0) / count;
+        let new_weight = 1.0 / count;
+        for axis in 0..2 {
+            let relative = training[[row, axis]] - anchor[axis];
+            if !relative.is_finite() {
+                return Err(format!(
+                    "{context} training coordinate range overflowed on axis {axis}"
+                ));
+            }
+            mean_offset[axis] =
+                previous_weight * mean_offset[axis] + new_weight * relative;
+        }
+    }
+
+    let mut norm_scale = 0.0_f64;
+    let mut scaled_sum_squares = 1.0_f64;
+    for row in training.rows() {
+        for axis in 0..2 {
+            let centered = (row[axis] - anchor[axis]) - mean_offset[axis];
+            if !centered.is_finite() {
+                return Err(format!(
+                    "{context} centered training coordinate overflowed on axis {axis}"
+                ));
+            }
+            let magnitude = centered.abs();
+            if magnitude == 0.0 {
+                continue;
+            }
+            if norm_scale < magnitude {
+                scaled_sum_squares = 1.0
+                    + scaled_sum_squares * (norm_scale / magnitude) * (norm_scale / magnitude);
+                norm_scale = magnitude;
+            } else {
+                scaled_sum_squares += (magnitude / norm_scale) * (magnitude / norm_scale);
+            }
+        }
+    }
+    let scale = norm_scale * (scaled_sum_squares / training.nrows() as f64).sqrt();
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(format!(
+            "{context} training coordinates have zero or non-finite centered scale"
+        ));
+    }
+    Ok(ShapeCoordinateGauge {
+        anchor,
+        mean_offset,
+        scale,
+    })
+}
+
+fn apply_shape_coordinate_gauge(
+    coords: ArrayView2<'_, f64>,
+    gauge: ShapeCoordinateGauge,
+    context: &str,
+) -> Result<Array2<f64>, String> {
+    if coords.ncols() != 2 || !coords.iter().all(|value| value.is_finite()) {
+        return Err(format!(
+            "{context} coordinates must be a finite (n, 2) matrix"
+        ));
+    }
+    let mut canonical = Array2::<f64>::zeros(coords.raw_dim());
     for row in 0..coords.nrows() {
-        mean_offset[0] += coords[[row, 0]] - anchor[0];
-        mean_offset[1] += coords[[row, 1]] - anchor[1];
+        for axis in 0..2 {
+            let value = ((coords[[row, axis]] - gauge.anchor[axis])
+                - gauge.mean_offset[axis])
+                / gauge.scale;
+            if !value.is_finite() {
+                return Err(format!(
+                    "{context} canonical coordinate overflowed at row {row}, axis {axis}"
+                ));
+            }
+            canonical[[row, axis]] = value;
+        }
     }
-    mean_offset[0] /= count;
-    mean_offset[1] /= count;
-    let mut centered = Array2::<f64>::zeros(coords.raw_dim());
-    let mut squared_scale = 0.0_f64;
-    for row in 0..coords.nrows() {
-        let x = (coords[[row, 0]] - anchor[0]) - mean_offset[0];
-        let y = (coords[[row, 1]] - anchor[1]) - mean_offset[1];
-        centered[[row, 0]] = x;
-        centered[[row, 1]] = y;
-        squared_scale += x * x + y * y;
-    }
-    squared_scale /= count;
-    if !(squared_scale.is_finite() && squared_scale > 0.0) {
-        return Err("shape coordinates have zero or non-finite centered scale".to_string());
-    }
-    let scale = squared_scale.sqrt();
-    centered.mapv_inplace(|value| value / scale);
-    if centered.iter().any(|value| !value.is_finite()) {
-        return Err("canonical shape coordinates are non-finite".to_string());
-    }
-    Ok(centered)
+    Ok(canonical)
+}
+
+/// Canonicalize one reporting fit from all of its rows. Outer-CV providers use
+/// [`canonical_shape_fold`] instead so held-out rows cannot choose their gauge.
+fn canonical_shape_coordinates(coords: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+    let gauge = fit_shape_coordinate_gauge(coords, "shape")?;
+    apply_shape_coordinate_gauge(coords, gauge, "shape")
 }
 
 fn gather_shape_rows(
@@ -2367,6 +2522,30 @@ fn gather_shape_rows(
         gathered.row_mut(target).assign(&coords.row(source));
     }
     Ok(gathered)
+}
+
+/// Derive one candidate-common chart from an outer fold's training rows and
+/// apply it to both train and evaluation rows. Densities are fitted in this
+/// dimensionless chart; `log_volume_scale = log(scale²)` converts their scores
+/// back to proper densities in the caller's original coordinate units.
+fn canonical_shape_fold(
+    coords: ArrayView2<'_, f64>,
+    train: &[usize],
+    eval: &[usize],
+    context: &str,
+) -> Result<(Array2<f64>, Array2<f64>, f64), String> {
+    let training = gather_shape_rows(coords, train, &format!("{context} training fold"))?;
+    let evaluation = gather_shape_rows(coords, eval, &format!("{context} evaluation fold"))?;
+    let gauge = fit_shape_coordinate_gauge(training.view(), context)?;
+    let log_volume_scale = 2.0 * gauge.scale.ln();
+    if !log_volume_scale.is_finite() {
+        return Err(format!("{context} coordinate Jacobian is non-finite"));
+    }
+    Ok((
+        apply_shape_coordinate_gauge(training.view(), gauge, context)?,
+        apply_shape_coordinate_gauge(evaluation.view(), gauge, context)?,
+        log_volume_scale,
+    ))
 }
 
 /// Select the free-cluster order using only an outer fold's training rows, then
@@ -2409,14 +2588,17 @@ fn free_mixture_rung_provider_2d(
     selected_orders: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
 ) -> gam::solver::HeldOutDensityProvider<'static> {
     Box::new(move |train: &[usize], eval: &[usize]| {
-        let train_coords = gather_shape_rows(coords.view(), train, "mixture training fold")?;
-        let eval_coords = gather_shape_rows(coords.view(), eval, "mixture evaluation fold")?;
-        let (selected_k, density) = free_mixture_rung_predictive_density(
+        let (train_coords, eval_coords, log_volume_scale) =
+            canonical_shape_fold(coords.view(), train, eval, "mixture density")?;
+        let (selected_k, mut density) = free_mixture_rung_predictive_density(
             train_coords.view(),
             eval_coords.view(),
             &ladder,
             config,
         )?;
+        for value in &mut density {
+            *value -= log_volume_scale;
+        }
         selected_orders.borrow_mut().push(selected_k);
         Ok(density)
     })
@@ -2429,14 +2611,17 @@ fn ring_cluster_rung_provider_2d(
     selected_orders: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
 ) -> gam::solver::HeldOutDensityProvider<'static> {
     Box::new(move |train: &[usize], eval: &[usize]| {
-        let train_coords = gather_shape_rows(coords.view(), train, "ring-cluster training fold")?;
-        let eval_coords = gather_shape_rows(coords.view(), eval, "ring-cluster evaluation fold")?;
-        let (selected_k, density) = ring_cluster_rung_predictive_density(
+        let (train_coords, eval_coords, log_volume_scale) =
+            canonical_shape_fold(coords.view(), train, eval, "ring-cluster density")?;
+        let (selected_k, mut density) = ring_cluster_rung_predictive_density(
             train_coords.view(),
             eval_coords.view(),
             &ladder,
             config,
         )?;
+        for value in &mut density {
+            *value -= log_volume_scale;
+        }
         selected_orders.borrow_mut().push(selected_k);
         Ok(density)
     })
@@ -2490,8 +2675,12 @@ fn run_atom_shape_race(
     if !coords.iter().all(|value| value.is_finite()) {
         return Err("adjudicate_atom_shape: coords must be finite".to_string());
     }
-    let owned = canonical_shape_coordinates(coords)?;
-    let n = owned.nrows();
+    // Full-data coordinates are canonicalized only for reporting fits and
+    // corroborative evidences. Every outer-CV provider below receives the raw
+    // chart and derives its gauge from that fold's training rows alone.
+    let reporting_coords = canonical_shape_coordinates(coords)?;
+    let raw_coords = coords.to_owned();
+    let n = raw_coords.nrows();
     let config = GaussianMixtureConfig::default();
     // `Euclidean` already is the one-component full Gaussian. Letting the
     // mixture rung choose k=1 inserts the identical predictive density twice,
@@ -2520,7 +2709,7 @@ fn run_atom_shape_race(
             "adjudicate_atom_shape: k_ladder must contain a ring-cluster order k >= 3".to_string(),
         );
     }
-    let mixture = fit_mixture_rung(owned.view(), &mixture_ladder, config)?;
+    let mixture = fit_mixture_rung(reporting_coords.view(), &mixture_ladder, config)?;
     // Local order refinement deliberately probes immediate neighbours and may
     // therefore fit k=1 while bracketing a k=2 coarse rung.  That fit is useful
     // to the in-class search but is ineligible for this race: Euclidean already
@@ -2532,7 +2721,8 @@ fn run_atom_shape_race(
             "shape mixture refinement produced no eligible order k >= 2".to_string()
         })?;
     let mixture_reporting_k = mixture_winner.k;
-    let ring_clusters = fit_ring_of_clusters_rung(owned.view(), &ring_cluster_ladder, config)?;
+    let ring_clusters =
+        fit_ring_of_clusters_rung(reporting_coords.view(), &ring_cluster_ladder, config)?;
     let ring_clusters_reporting_k = ring_clusters.winner().k;
     let mixture_fold_orders = std::rc::Rc::new(std::cell::RefCell::new(Vec::with_capacity(folds)));
     let ring_cluster_fold_orders =
@@ -2546,15 +2736,15 @@ fn run_atom_shape_race(
     let candidates = vec![
         CrossClassCandidate {
             kind: candidate_kinds[0],
-            negative_log_evidence: ring_negative_log_evidence_2d(owned.view())?,
+            negative_log_evidence: ring_negative_log_evidence_2d(reporting_coords.view())?,
             certification: EvidenceCertification::Exact,
-            density_provider: ring_provider_2d(owned.clone()),
+            density_provider: ring_provider_2d(raw_coords.clone()),
         },
         CrossClassCandidate {
             kind: candidate_kinds[1],
-            negative_log_evidence: gaussian_negative_log_evidence_2d(owned.view())?,
+            negative_log_evidence: gaussian_negative_log_evidence_2d(reporting_coords.view())?,
             certification: EvidenceCertification::Exact,
-            density_provider: gaussian_provider_2d(owned.clone()),
+            density_provider: gaussian_provider_2d(raw_coords.clone()),
         },
         CrossClassCandidate {
             kind: candidate_kinds[2],
@@ -2562,9 +2752,10 @@ fn run_atom_shape_race(
             certification: EvidenceCertification::Exact,
             // The displayed/reported k is the full-data final fit. Its outer-CV
             // predictive column independently selects k on each training fold,
-            // so held-out rows cannot leak into model-order selection.
+            // and derives its chart gauge from those same rows, so held-out
+            // rows cannot leak into either preprocessing or model selection.
             density_provider: free_mixture_rung_provider_2d(
-                owned.clone(),
+                raw_coords.clone(),
                 mixture_ladder.clone(),
                 config,
                 std::rc::Rc::clone(&mixture_fold_orders),
@@ -2575,7 +2766,7 @@ fn run_atom_shape_race(
             negative_log_evidence: ring_clusters.winner().negative_log_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: ring_cluster_rung_provider_2d(
-                owned.clone(),
+                raw_coords,
                 ring_cluster_ladder.clone(),
                 config,
                 std::rc::Rc::clone(&ring_cluster_fold_orders),

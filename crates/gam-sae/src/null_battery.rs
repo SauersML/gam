@@ -589,6 +589,8 @@ pub fn token_shuffle_null(data: ArrayView2<'_, f64>, seed: u64) -> Result<Array2
 /// The independently seeded permutations break cross-dimensional geometry; in
 /// particular, this is the matched shuffle control required for an unordered
 /// circle census, whereas [`token_shuffle_null`] leaves that point cloud intact.
+/// Column seeds depend only on `(seed, column)`, so cache-line column bands can
+/// execute in parallel with bit-identical output under every Rayon schedule.
 pub fn per_dimension_shuffle_null(
     data: ArrayView2<'_, f64>,
     seed: u64,
@@ -677,25 +679,43 @@ fn per_dimension_shuffle_null_impl<T: NativeControlScalar>(
     let n = data.nrows();
     let p = data.ncols();
     let mut out = fallible_native_output::<T>(n, p, "per-dimension-shuffle")?;
-    out.axis_iter_mut(Axis(1))
+    // Give each Rayon task a cache-line-wide band of columns. Parallelizing
+    // single strided columns would make workers repeatedly write the same cache
+    // lines in every C-order output row. A band retains independent column
+    // permutations while eliminating almost all false sharing and reusing one
+    // Fisher-Yates index buffer across the task's columns.
+    let column_band_width = (64 / std::mem::size_of::<T>()).max(1);
+    out.axis_chunks_iter_mut(Axis(1), column_band_width)
         .into_par_iter()
         .enumerate()
-        .try_for_each(|(col, mut output_column)| -> Result<(), String> {
+        .try_for_each(|(band, mut output_band)| -> Result<(), String> {
+            let first_col = band.checked_mul(column_band_width).ok_or_else(|| {
+                format!(
+                    "per-dimension-shuffle column-band index overflowed: band {band} × width {column_band_width}"
+                )
+            })?;
             let mut order = Vec::<usize>::new();
             order.try_reserve_exact(n).map_err(|error| {
                 format!(
-                    "could not allocate per-dimension-shuffle row order for column {col} ({n} indices): {error}"
+                    "could not allocate per-dimension-shuffle row order for column band starting at {first_col} ({n} indices): {error}"
                 )
             })?;
             order.extend(0..n);
-            let mut rng = StdRng::seed_from_u64(mix_seed(
-                seed,
-                PER_DIMENSION_SHUFFLE_SEED_DOMAIN,
-                col as u64,
-            ));
-            order.shuffle(&mut rng);
-            for (destination, &source) in order.iter().enumerate() {
-                output_column[destination] = data[[source, col]];
+            for local_col in 0..output_band.ncols() {
+                let col = first_col + local_col;
+                for (row, slot) in order.iter_mut().enumerate() {
+                    *slot = row;
+                }
+                let mut rng = StdRng::seed_from_u64(mix_seed(
+                    seed,
+                    PER_DIMENSION_SHUFFLE_SEED_DOMAIN,
+                    col as u64,
+                ));
+                order.shuffle(&mut rng);
+                let mut output_column = output_band.column_mut(local_col);
+                for (destination, &source) in order.iter().enumerate() {
+                    output_column[destination] = data[[source, col]];
+                }
             }
             Ok(())
         })?;
