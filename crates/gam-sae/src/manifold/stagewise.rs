@@ -1902,7 +1902,7 @@ fn race_birth_seed(
     // onto disjoint rows. Pinning `Par::Seq` here makes the born state a pure
     // function of the inputs; the rayon ROW fan-out inside the fit is untouched
     // (this scope only governs faer). Matches the `run_joint_fit` inner scope.
-    let _faer_seq_race = gam_linalg::faer_ndarray::FaerSequentialScope::enter();
+    let faer_seq_race_guard = gam_linalg::faer_ndarray::FaerSequentialScope::enter();
     let k = term.k_atoms();
     let n = term.assignment.logits.nrows();
     let born_move = match &seed.circle_coords {
@@ -1965,7 +1965,7 @@ fn race_birth_seed(
     let born_logit_col: Vec<f64> = (0..n)
         .map(|r| cand_term.assignment.logits[[r, k]])
         .collect();
-    Ok(RacedCandidate {
+    let raced_candidate = RacedCandidate {
         born_atom: cand_term.atoms[k].clone(),
         born_coord: cand_term.assignment.coords[k].clone(),
         born_logit_col,
@@ -1976,7 +1976,9 @@ fn race_birth_seed(
         penalized_quasi_laplace,
         ev,
         energy: seed.energy,
-    })
+    };
+    drop(faer_seq_race_guard);
+    Ok(raced_candidate)
 }
 
 /// Append an ALREADY-FITTED born atom (its decoder/coords/logit column produced
