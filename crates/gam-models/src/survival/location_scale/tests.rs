@@ -1532,7 +1532,7 @@ fn survival_ls_packed_directional_high_curvature_body() {
     use crate::row_kernel::RowKernel;
     use gam_math::jet_tower::program_full_tower;
 
-    // Channel layout (matches `SurvivalLsJointNllProgram::row_nll`):
+    // Channel layout (matches `SurvivalLsJointNllProgram::eval`):
     //   [0]=t_entry [1]=t_exit [2]=t_deriv [3]=thr_exit [4]=thr_entry
     //   [5]=thr_deriv [6]=lσ_exit [7]=lσ_entry [8]=lσ_deriv.
     // These rows drive `u0,u1` deep into the tail and `g` small-positive:
