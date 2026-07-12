@@ -42,6 +42,7 @@ import numpy as np
 
 from bench.manifold_zoo_geometry import (
     GEOMETRY_REVISION,
+    declared_atom_spec,
     first_coordinate_hue,
     validate_analytic_sample,
 )
@@ -194,9 +195,8 @@ def fig_gallery(clouds_dir: Path, out: Path, *, max_factors: int = 8) -> None:
     for r, meta in enumerate(factors):
         i = meta["factor"]
         theta = np.asarray(ref[f"theta_{i}"])
-        hue = theta[:, 0]
-        cyclic = meta["kind"] in ("circle", "torus", "mobius")
-        cmap = plt.get_cmap("twilight" if cyclic else "viridis")
+        hue, cmap_name = _atlas_hue(meta["kind"], theta)
+        cmap = plt.get_cmap(cmap_name)
         panels = [("true", ref[f"true_{i}"])]
         for name in col_order:
             store = stores[name]
@@ -210,9 +210,10 @@ def fig_gallery(clouds_dir: Path, out: Path, *, max_factors: int = 8) -> None:
             ax = fig.add_subplot(n_rows, n_cols, r * n_cols + c + 1, projection="3d")
             ax.set_facecolor(SURFACE)
             if cloud is not None:
-                ax.scatter(cloud[:, 0], cloud[:, 1],
-                           cloud[:, 2] if cloud.shape[1] > 2 else np.zeros(len(cloud)),
-                           c=hue[: len(cloud)], cmap=cmap, s=2.2, alpha=0.75,
+                cloud_3d = _pad_cloud(np.asarray(cloud, dtype=float))
+                ax.scatter(cloud_3d[:, 0], cloud_3d[:, 1], cloud_3d[:, 2],
+                           c=hue[: len(cloud_3d)], cmap=cmap, vmin=0.0, vmax=1.0,
+                           s=2.2, alpha=0.75,
                            linewidths=0)
                 ax.set_xlim(-lim, lim)
                 ax.set_ylim(-lim, lim)
@@ -274,6 +275,13 @@ def _atlas_cloud_records(
             raise ValueError("joint fit must use one shared atom bank of size eight")
         if fit_config.get("top_k") != data_config.get("l0"):
             raise ValueError("joint fit Top-K must match the planted row support")
+        expected_bases, expected_dims = declared_atom_spec(ATLAS_KINDS, len(ATLAS_KINDS))
+        if fit_config.get("topology_mode") != "declared":
+            raise ValueError("joint fit must use the exact declared analytic topologies")
+        if fit_config.get("declared_bases") != expected_bases:
+            raise ValueError("joint fit chart families do not match the analytic zoo")
+        if fit_config.get("declared_dims") != expected_dims:
+            raise ValueError("joint fit intrinsic dimensions do not match the analytic zoo")
         if meta.get("matching") != "hungarian-exact-one-to-one":
             raise ValueError("joint fit must use exact one-to-one atom/factor matching")
         if meta.get("n_unique_matched_atoms") != len(ATLAS_KINDS):
