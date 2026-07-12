@@ -339,49 +339,55 @@ impl SaeManifoldTerm {
                 any_update = true;
             }
 
-            // Decrement doctrine for the λ sweep (the same predicted-decrease
-            // authority the inner engine uses): with residuals HELD at the
-            // current-λ refit, the profiled criterion is exactly evaluable at
-            // λ*, and the closed-form λ* is its per-block minimizer given those
-            // residuals — so `baseline_crit − C(λ*)` is the largest decrease
-            // the FULL closed-form move could possibly deliver this sweep.
-            // Near the fixed point that decrease shrinks QUADRATICALLY in the
-            // remaining log-λ gap while the Armijo floor is a fixed relative
-            // epsilon, so there is a guaranteed annulus (`max_delta > tol` but
-            // `ΔC_pred ≤ armijo_eps`) where NO fraction of the step can ever
-            // pass `trial < baseline − armijo_eps`: treating that as a stall
-            // reported `converged = false` for a λ that HAS settled to the
-            // criterion's own measurement floor (seen live: trajectory settles
-            // to 6+ digits, flag says false). A λ resolved below the
-            // acceptance test's resolution is converged.
+            // Sufficient-decrease floor for the line search's Armijo test. It is
+            // the ONLY authority that decides both a λ move and convergence below:
+            // the closed-form λ* is used solely as a search DIRECTION, never as a
+            // claimed criterion stationary point, so no `predicted_decrease` gate
+            // that prices the closed form against HELD residuals is consulted (that
+            // gate desynced from the refit — see the envelope note below).
             let armijo_eps = 1e-9 * (1.0 + baseline_crit.abs());
-            let predicted_decrease = if any_update {
-                baseline_crit
-                    - profiled_penalized_quasi_laplace_criterion(
-                        n_obs,
-                        px,
-                        base_rx,
-                        &base_unscaled,
-                        &dims,
-                        &log_lambda_star,
-                        base_pen,
-                    )
-            } else {
-                0.0
-            };
 
-            if !any_update || max_delta <= log_lambda_tol || predicted_decrease <= armijo_eps {
-                // Every block held (no weight can move), the λ fixed point
-                // within tolerance, or the full closed-form move's attainable
-                // decrease below the line search's own resolution — converged
-                // in the documented sense. The term holds the current-λ
-                // baseline fit, which is the answer.
+            if !any_update || max_delta <= log_lambda_tol {
+                // Every identifiable block held (no weight can move) or the closed
+                // form proposes no move beyond tolerance — the EFS fixed point. The
+                // term holds the current-λ baseline fit, which is the answer.
                 converged = true;
                 for idx in 0..blocks.len() {
                     trajectories[idx].push(cur_log_lambda[idx]);
                 }
                 break;
             }
+
+            // ENVELOPE-FREE CONVERGENCE (#2015). The prior fix priced a penalty
+            // energy `P = 2·(penalized_objective − data_fit)` into the pooled
+            // dispersion to restore the envelope theorem, so the closed-form λ*
+            // (the per-block variance-ratio root at HELD residuals) would be the
+            // profiled criterion's stationary point and `baseline_crit − C(λ*)`
+            // a valid predicted decrease. That envelope is BROKEN: the sweep-first
+            // inner engine (`converge_inner_for_undamped_logdet`) converges to the
+            // penalized quasi-Laplace fixed point, whose stationarity condition
+            // ∂(data_fit + penalty + logdet)/∂θ̂ = 0 leaves ∂(data_fit + penalty)/∂θ̂
+            // = −∂logdet/∂θ̂ ≠ 0 — `penalized_objective_total` excludes the Laplace
+            // log-determinant, so pricing `P` cancels only the penalty gradient,
+            // not the logdet one. Hence `∂pooled'/∂θ̂ ≠ 0`, the profiled criterion's
+            // TOTAL λ-derivative keeps non-vanishing dR_x/dλ, dR_ℓ/dλ, dP/dλ terms
+            // (mediated by dθ̂/dλ), and the closed-form λ* is NOT the stationary
+            // point of the criterion the trials actually evaluate (C at REFIT
+            // residuals). Symptom: λ* proposed a `> tol` move whose held-residual
+            // predicted decrease exceeded `armijo_eps`, yet every backtracking
+            // fraction of the REFIT criterion failed Armijo — the sweep parked at a
+            // bit-identical λ with `converged = false` (the planted-ratio failure).
+            //
+            // The fix is to let the EXACT refit criterion decide everything. The
+            // closed form only orients the 1-D search direction `d = λ* − λ_cur`;
+            // acceptance and convergence are read off `C(refit(λ))`, guaranteeing
+            // consistency by construction. We backtrack along `+d` AND, if no
+            // forward fraction descends, along `−d`: if neither direction lowers
+            // the refit criterion below `baseline_crit − armijo_eps`, then λ_cur is
+            // a local minimiser of the exact criterion along the closed-form axis
+            // to the search resolution — a GENUINE fixed point, so `converged =
+            // true`. Only a realizable descent the search actually captured (in
+            // either direction) keeps the sweep moving.
 
             // Armijo backtracking on the profiled criterion: take the largest
             // fraction `s` of the closed-form log-λ step whose refit strictly beats
