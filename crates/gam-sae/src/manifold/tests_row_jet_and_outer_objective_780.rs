@@ -424,55 +424,110 @@ fn softmax_schedule_perf_fixture(
     (term, vars, second_jets, border, assignments)
 }
 
-fn row_jet_channel_error(actual: &SaeRowJets, expected: &SaeRowJets) -> (f64, f64) {
+/// Exact nested-buffer shape returned by the pre-#932 hand implementation. It
+/// deliberately remains test-local: production has one packed row allocation,
+/// while this type preserves the historical allocation/performance baseline.
+struct LegacySaeRowJets {
+    vars: Vec<SaeLocalRowVar>,
+    first: Vec<Vec<f64>>,
+    second: Vec<Vec<Vec<f64>>>,
+    beta: Vec<Vec<f64>>,
+    beta_deriv: Vec<Vec<Vec<f64>>>,
+    beta_l_deriv: Vec<Vec<Vec<f64>>>,
+}
+
+fn row_jets_for_logdet_hand_reference(
+    term: &SaeManifoldTerm,
+    row: usize,
+    vars: Vec<SaeLocalRowVar>,
+    assignments: ArrayView1<'_, f64>,
+    second_jets: &[Array4<f64>],
+    border: &[SaeBorderChannel],
+) -> LegacySaeRowJets {
+    let p = term.output_dim();
+    let q = vars.len();
+    let sqrt_row_w = term
+        .row_loss_weights
+        .as_deref()
+        .map_or(1.0, |weights| weights[row].sqrt());
+    let mut first = vec![vec![0.0_f64; p]; q];
+    let mut second = vec![vec![vec![0.0_f64; p]; q]; q];
+    let mut beta = vec![vec![0.0_f64; p]; border.len()];
+    let mut beta_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
+    let mut beta_l_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
+    let AssignmentMode::Softmax { temperature, .. } = term.assignment.mode else {
+        panic!("hand softmax reference requires softmax assignment")
+    };
+    term.fill_row_jets_hand_softmax_reference(
+        row,
+        &vars,
+        assignments,
+        second_jets,
+        border,
+        1.0 / temperature,
+        sqrt_row_w,
+        &mut first,
+        &mut second,
+        &mut beta,
+        &mut beta_deriv,
+        &mut beta_l_deriv,
+    );
+    LegacySaeRowJets {
+        vars,
+        first,
+        second,
+        beta,
+        beta_deriv,
+        beta_l_deriv,
+    }
+}
+
+fn row_jet_channel_error(actual: &SaeRowJets, expected: &LegacySaeRowJets) -> (f64, f64) {
+    assert_eq!(actual.vars.len(), expected.vars.len());
+    let q = expected.vars.len();
+    let p = expected.first.first().map_or(0, Vec::len);
+    let n_beta = expected.beta.len();
+    assert_eq!(actual.channels.q(), q);
+    assert_eq!(actual.channels.p(), p);
+    assert_eq!(actual.channels.n_beta(), n_beta);
     let mut max_abs = 0.0_f64;
     let mut scale = 1.0_f64;
     let mut visit = |a: f64, b: f64| {
         max_abs = max_abs.max((a - b).abs());
         scale = scale.max(a.abs()).max(b.abs());
     };
-    for (a, b) in actual
-        .first
-        .iter()
-        .flatten()
-        .zip(expected.first.iter().flatten())
-    {
-        visit(*a, *b);
+    for a in 0..q {
+        for (&actual_value, &expected_value) in actual.first(a).iter().zip(&expected.first[a]) {
+            visit(actual_value, expected_value);
+        }
+        for b in 0..q {
+            for (&actual_value, &expected_value) in
+                actual.second(a, b).iter().zip(&expected.second[a][b])
+            {
+                visit(actual_value, expected_value);
+            }
+        }
+        for beta in 0..n_beta {
+            for (&actual_value, &expected_value) in actual
+                .beta_deriv(a, beta)
+                .iter()
+                .zip(&expected.beta_deriv[a][beta])
+            {
+                visit(actual_value, expected_value);
+            }
+            for (&actual_value, &expected_value) in actual
+                .beta_l_deriv(a, beta)
+                .iter()
+                .zip(&expected.beta_l_deriv[a][beta])
+            {
+                visit(actual_value, expected_value);
+            }
+        }
     }
-    for (a, b) in actual
-        .second
-        .iter()
-        .flatten()
-        .flatten()
-        .zip(expected.second.iter().flatten().flatten())
-    {
-        visit(*a, *b);
-    }
-    for (a, b) in actual
-        .beta
-        .iter()
-        .flatten()
-        .zip(expected.beta.iter().flatten())
-    {
-        visit(*a, *b);
-    }
-    for (a, b) in actual
-        .beta_deriv
-        .iter()
-        .flatten()
-        .flatten()
-        .zip(expected.beta_deriv.iter().flatten().flatten())
-    {
-        visit(*a, *b);
-    }
-    for (a, b) in actual
-        .beta_l_deriv
-        .iter()
-        .flatten()
-        .flatten()
-        .zip(expected.beta_l_deriv.iter().flatten().flatten())
-    {
-        visit(*a, *b);
+    for beta in 0..n_beta {
+        for (&actual_value, &expected_value) in actual.beta(beta).iter().zip(&expected.beta[beta]) {
+            visit(actual_value, expected_value);
+        }
     }
     (max_abs, scale)
 }
@@ -486,7 +541,23 @@ fn row_jet_channel_error(actual: &SaeRowJets, expected: &SaeRowJets) -> (f64, f6
 pub(crate) fn softmax_compiled_schedule_beats_hand_full_channels_932() {
     use std::time::{Duration, Instant};
 
-    fn checksum(jets: &SaeRowJets) -> f64 {
+    fn compiled_checksum(jets: &SaeRowJets) -> f64 {
+        let first = (!jets.vars.is_empty())
+            .then(|| jets.first(0).first().copied())
+            .flatten()
+            .unwrap_or(0.0);
+        let second = (!jets.vars.is_empty())
+            .then(|| jets.second(0, 0).first().copied())
+            .flatten()
+            .unwrap_or(0.0);
+        let beta = (jets.channels.n_beta() != 0)
+            .then(|| jets.beta(0).first().copied())
+            .flatten()
+            .unwrap_or(0.0);
+        first + second + beta
+    }
+
+    fn hand_checksum(jets: &LegacySaeRowJets) -> f64 {
         let first = jets
             .first
             .first()
@@ -509,14 +580,15 @@ pub(crate) fn softmax_compiled_schedule_beats_hand_full_channels_932() {
         first + second + beta
     }
 
-    for &k_atoms in &[2usize, 8, 16, 32] {
+    for &k_atoms in &[1usize, 2, 8, 16, 32, 64] {
         let p = 16usize;
         let (term, vars, second_jets, border, assignments) =
             softmax_schedule_perf_fixture(k_atoms, p);
         let compiled = term
             .row_jets_for_logdet(0, vars.clone(), assignments.view(), &second_jets, &border)
             .unwrap();
-        let hand = term.row_jets_for_logdet_hand_reference(
+        let hand = row_jets_for_logdet_hand_reference(
+            &term,
             0,
             vars.clone(),
             assignments.view(),
@@ -535,7 +607,8 @@ pub(crate) fn softmax_compiled_schedule_beats_hand_full_channels_932() {
             .unwrap();
         let (compiled_allocations, compiled_bytes) = end_row_jet_allocation_measurement();
         begin_row_jet_allocation_measurement();
-        let allocation_probe_hand = term.row_jets_for_logdet_hand_reference(
+        let allocation_probe_hand = row_jets_for_logdet_hand_reference(
+            &term,
             0,
             vars.clone(),
             assignments.view(),
@@ -544,7 +617,9 @@ pub(crate) fn softmax_compiled_schedule_beats_hand_full_channels_932() {
         );
         let (hand_allocations, hand_bytes) = end_row_jet_allocation_measurement();
         assert!(
-            (checksum(&allocation_probe_compiled) + checksum(&allocation_probe_hand)).is_finite(),
+            (compiled_checksum(&allocation_probe_compiled)
+                + hand_checksum(&allocation_probe_hand))
+            .is_finite(),
             "allocation probes must materialize finite full channels"
         );
         assert!(
@@ -557,10 +632,12 @@ pub(crate) fn softmax_compiled_schedule_beats_hand_full_channels_932() {
         let (repetitions, trials) = (1usize, 1usize);
         #[cfg(not(debug_assertions))]
         let (repetitions, trials) = match k_atoms {
+            1 => (20_000usize, 5usize),
             2 => (20_000usize, 5usize),
             8 => (2_000usize, 5usize),
             16 => (400usize, 5usize),
             32 => (80usize, 5usize),
+            64 => (10usize, 5usize),
             _ => (1usize, 1usize),
         };
 
@@ -581,7 +658,7 @@ pub(crate) fn softmax_compiled_schedule_beats_hand_full_channels_932() {
                             &border,
                         )
                         .unwrap();
-                    sum += checksum(&jets);
+                    sum += compiled_checksum(&jets);
                 }
                 (start.elapsed(), sum)
             };
@@ -589,14 +666,15 @@ pub(crate) fn softmax_compiled_schedule_beats_hand_full_channels_932() {
                 let start = Instant::now();
                 let mut sum = 0.0_f64;
                 for _ in 0..repetitions {
-                    let jets = term.row_jets_for_logdet_hand_reference(
+                    let jets = row_jets_for_logdet_hand_reference(
+                        &term,
                         0,
                         vars.clone(),
                         assignments.view(),
                         &second_jets,
                         &border,
                     );
-                    sum += checksum(&jets);
+                    sum += hand_checksum(&jets);
                 }
                 (start.elapsed(), sum)
             };

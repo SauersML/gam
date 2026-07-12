@@ -377,15 +377,6 @@ impl SaeManifoldTerm {
 mod tests_softmax_hand_reference {
     use super::*;
 
-    pub(crate) struct LegacySaeRowJets {
-        pub(crate) vars: Vec<SaeLocalRowVar>,
-        pub(crate) first: Vec<Vec<f64>>,
-        pub(crate) second: Vec<Vec<Vec<f64>>>,
-        pub(crate) beta: Vec<Vec<f64>>,
-        pub(crate) beta_deriv: Vec<Vec<Vec<f64>>>,
-        pub(crate) beta_l_deriv: Vec<Vec<Vec<f64>>>,
-    }
-
     impl SaeManifoldTerm {
         /// `∂²g_k/∂t_{ik,axis_a}∂t_{ik,axis_b}` for one row/atom: the decoded second
         /// derivative, packed as `Σ_b ∂²Φ_b·B_{b,c}` over output columns. Recovered
@@ -667,53 +658,6 @@ mod tests_softmax_hand_reference {
             }
         }
 
-        /// Full-row allocation-equivalent wrapper around the pre-schedule hand
-        /// kernel, retained only as the release benchmark's historical baseline.
-        pub(crate) fn row_jets_for_logdet_hand_reference(
-            &self,
-            row: usize,
-            vars: Vec<SaeLocalRowVar>,
-            assignments: ArrayView1<'_, f64>,
-            second_jets: &[Array4<f64>],
-            border: &[SaeBorderChannel],
-        ) -> LegacySaeRowJets {
-            let p = self.output_dim();
-            let q = vars.len();
-            let sqrt_row_w = self
-                .row_loss_weights
-                .as_deref()
-                .map_or(1.0, |w| w[row].sqrt());
-            let mut first = vec![vec![0.0_f64; p]; q];
-            let mut second = vec![vec![vec![0.0_f64; p]; q]; q];
-            let mut beta = vec![vec![0.0_f64; p]; border.len()];
-            let mut beta_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
-            let mut beta_l_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
-            let AssignmentMode::Softmax { temperature, .. } = self.assignment.mode else {
-                panic!("hand softmax reference requires softmax assignment")
-            };
-            self.fill_row_jets_hand_softmax_reference(
-                row,
-                &vars,
-                assignments,
-                second_jets,
-                border,
-                1.0 / temperature,
-                sqrt_row_w,
-                &mut first,
-                &mut second,
-                &mut beta,
-                &mut beta_deriv,
-                &mut beta_l_deriv,
-            );
-            LegacySaeRowJets {
-                vars,
-                first,
-                second,
-                beta,
-                beta_deriv,
-                beta_l_deriv,
-            }
-        }
     }
 }
 

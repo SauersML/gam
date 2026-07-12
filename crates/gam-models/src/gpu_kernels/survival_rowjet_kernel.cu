@@ -189,6 +189,40 @@ __device__ __forceinline__ void d_lognormpdf(double x,double o[5]){
 
 struct RowIn{ double wi,di,z_sum,cov_ones,probit_scale; };
 
+// ---- Order-2 jet: exactly value + gradient + Hessian, no seeded high-order state ----
+struct J2{ double v; double g[K]; double h[K][K]; };
+__device__ __forceinline__ J2 j2_const(double c){
+    J2 r; r.v=c;
+    for(int i=0;i<K;i++){ r.g[i]=0.0; for(int j=0;j<K;j++) r.h[i][j]=0.0; }
+    return r;
+}
+__device__ __forceinline__ J2 j2_var(double x,int a){ J2 r=j2_const(x); r.g[a]=1.0; return r; }
+__device__ __forceinline__ J2 j2_scale(const J2&a,double s){
+    J2 r; r.v=a.v*s;
+    for(int i=0;i<K;i++){ r.g[i]=a.g[i]*s; for(int j=0;j<K;j++) r.h[i][j]=a.h[i][j]*s; }
+    return r;
+}
+__device__ __forceinline__ J2 j2_add(const J2&a,const J2&b){
+    J2 r; r.v=a.v+b.v;
+    for(int i=0;i<K;i++){ r.g[i]=a.g[i]+b.g[i]; for(int j=0;j<K;j++) r.h[i][j]=a.h[i][j]+b.h[i][j]; }
+    return r;
+}
+__device__ __forceinline__ J2 j2_addc(const J2&a,double c){ J2 r=a; r.v+=c; return r; }
+__device__ __forceinline__ J2 j2_mul(const J2&a,const J2&b){
+    J2 r=j2_const(a.v*b.v);
+    for(int i=0;i<K;i++) r.g[i]=a.v*b.g[i]+a.g[i]*b.v;
+    for(int i=0;i<K;i++)for(int j=0;j<K;j++)
+        r.h[i][j]=a.v*b.h[i][j]+a.g[i]*b.g[j]+a.g[j]*b.g[i]+a.h[i][j]*b.v;
+    return r;
+}
+__device__ __forceinline__ J2 j2_compose(const J2&a,const double f[5]){
+    double f1=f[1],f2=f[2]; J2 r=j2_const(f[0]);
+    for(int i=0;i<K;i++) r.g[i]=f1*a.g[i];
+    for(int i=0;i<K;i++)for(int j=0;j<K;j++)
+        r.h[i][j]=f1*a.h[i][j]+f2*a.g[i]*a.g[j];
+    return r;
+}
+
 // ---- OneSeed jet: value+grad+hess + eps-derivatives (eps seeds x_a += eps*dir[a]) ----
 // dh = the eps-Hessian channel = sum_c t3[a][b][c] dir[c].
 struct JS1{ double v; double g[K]; double h[K][K]; double dv; double dg[K]; double dh[K][K]; };
