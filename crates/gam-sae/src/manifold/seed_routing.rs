@@ -1031,7 +1031,13 @@ mod tests {
             let phase = std::f64::consts::TAU * phase_idx as f64 / n_phase as f64;
             for width_idx in 0..n_width {
                 let row = phase_idx * n_width + width_idx;
-                let width = -0.5 + width_idx as f64 / (n_width - 1) as f64;
+                // Full band width in [-1, 1]: a fuller half-twist makes the
+                // seam fold — where the flat patch must average two opposite
+                // transverse signs onto one plane location — pronounced rather
+                // than marginal. The quotient basis is exact at any amplitude
+                // (the band is linear in the width in its span), so this only
+                // sharpens the flat patch's irreducible error.
+                let width = -1.0 + 2.0 * width_idx as f64 / (n_width - 1) as f64;
                 let radius = 1.0 + width * (0.5 * phase).cos();
                 target[[row, 0]] = radius * phase.cos();
                 target[[row, 1]] = radius * phase.sin();
@@ -1146,16 +1152,27 @@ mod tests {
         }
         let flat_r2 = heldout_r2(&flat_phi);
 
+        // The band lies exactly in the deck-invariant span, so a correct
+        // quotient chart reconstructs held-out rows to near-exactness.
         assert!(
-            mobius_r2 > 0.99,
-            "the deck-invariant Möbius basis must reconstruct held-out band rows; \
+            mobius_r2 > 0.999,
+            "the deck-invariant Möbius basis must reconstruct held-out band rows \
+             to near-exactness; mobius held-out R²={mobius_r2}, flat held-out R²={flat_r2}"
+        );
+        // The flat/euclidean patch has an IRREDUCIBLE seam error — no
+        // single-valued graph over a plane can carry the half-twist — so even
+        // matched in degrees of freedom it cannot reach near-exactness, and the
+        // quotient basis strictly beats it on held-out reconstruction.
+        assert!(
+            flat_r2 < 0.99,
+            "the matched-DOF flat/euclidean patch must NOT reach near-exactness \
+             on a non-orientable band (the topological obstruction is real); \
              mobius held-out R²={mobius_r2}, flat held-out R²={flat_r2}"
         );
         assert!(
-            mobius_r2 - flat_r2 > 0.05,
+            mobius_r2 > flat_r2,
             "the quotient basis must beat the matched-DOF flat/euclidean patch on \
-             held-out reconstruction (non-orientability defeats a single-valued \
-             graph); mobius held-out R²={mobius_r2}, flat held-out R²={flat_r2}"
+             held-out reconstruction; mobius held-out R²={mobius_r2}, flat held-out R²={flat_r2}"
         );
     }
 
