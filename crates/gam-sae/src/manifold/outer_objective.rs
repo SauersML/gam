@@ -3880,6 +3880,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                         &cache,
                         &solver,
                         None,
+                        None,
                     )
             })
             .map_err(|err| EstimationError::RemlOptimizationFailed(err.to_string()))?;

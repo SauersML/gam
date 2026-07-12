@@ -528,6 +528,119 @@ fn assignment_strength_trace_from_probes_matches_dense_softmax() {
     assert_abs_diff_eq!(matrix_free_gradient, dense_gradient, epsilon = 1.0e-8);
 }
 
+/// #2080(A) massive-K completion: the COMPLETE matrix-free outer ρ-gradient
+/// (all coordinates — sparse assignment strength, per-atom smoothness, per-atom
+/// ARD, plus the single-adjoint IFT correction on each) must equal the dense
+/// complete gradient bit-close. The matrix-free assembler routes its three trace
+/// channels through the `(z, S⁻¹z)` probe bundle AND its single adjoint solve
+/// `a = A⁺Γ` through `solve_exact_stationarity_matrix_free` (reduced-Schur CG),
+/// with `DeflatedArrowSolver::plain` for the cheap per-row coordinate-block
+/// subtractions — the K≥4096 route. Full-basis probes with an exact reduced-Schur
+/// inverse make the bundle identity exact, so any gap is a matrix-free-adjoint or
+/// channel defect, not stochastic-CG noise. This is the all-coordinate analogue of
+/// `assignment_strength_trace_from_probes_matches_dense_softmax` (which pins only
+/// the sparse coordinate) and the massive-K analogue of
+/// `streaming_cache_outer_gradient_matches_dense_cache`.
+#[test]
+fn complete_matrix_free_outer_gradient_matches_dense_softmax() {
+    let (n, p, k) = (24usize, 2usize, 2usize);
+    let term = build_softmax_term(n, p, k);
+    let rho = SaeManifoldRho::new(
+        0.7_f64.ln(),
+        0.8_f64.ln(),
+        vec![Array1::from_elem(1, 1.2_f64.ln()); k],
+    );
+    // A deterministic residual around this term's own nonzero reconstruction
+    // keeps the fixture on the positive-rank Laplace branch (same rationale as
+    // the sibling sparse-coordinate test).
+    let fitted = term
+        .try_fitted_for_rho(&rho)
+        .expect("softmax positive-rank fixture reconstruction");
+    let target = Array2::<f64>::from_shape_fn((n, p), |(row, col)| {
+        fitted[[row, col]] + 1.0e-3 * ((row + 2 * col) as f64 * 0.17).sin()
+    });
+
+    let system = term
+        .assemble_full_matrix_free_evidence_system(target.view(), &rho, None, None)
+        .expect("softmax matrix-free evidence system");
+    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let (_, _, cache) = solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &options)
+        .expect("direct factorization");
+    assert!(
+        cache.deflated_row_directions.iter().all(Vec::is_empty),
+        "the probe identity is defined on the plain undeflated fixture"
+    );
+
+    // Exact full-basis reduced-Schur inverse probe bundle (no CG error).
+    let border_dim = cache.k;
+    let sqrt_dim = (border_dim as f64).sqrt();
+    let probes = (0..border_dim)
+        .map(|column| {
+            let mut probe = Array1::<f64>::zeros(border_dim);
+            probe[column] = sqrt_dim;
+            probe
+        })
+        .collect::<Vec<_>>();
+    let inverse_probes = probes
+        .iter()
+        .map(|probe| {
+            cache
+                .schur_inverse_apply(probe.view())
+                .expect("exact reduced-Schur inverse probe")
+        })
+        .collect::<Vec<_>>();
+
+    let plain_solver = DeflatedArrowSolver::plain(&cache);
+    let loss = term.loss(target.view(), &rho).expect("softmax loss");
+
+    // Dense complete gradient (all coordinates), the production reference.
+    let dense = term
+        .analytic_outer_rho_gradient_components(target.view(), &rho, &loss, &cache, &plain_solver)
+        .expect("dense complete outer gradient")
+        .gradient();
+
+    // Matrix-free complete gradient: from-probes trace channels + matrix-free
+    // single adjoint (`Some(system)`).
+    let matrix_free = term
+        .analytic_outer_rho_gradient_components_with_bundle(
+            target.view(),
+            &rho,
+            &loss,
+            &cache,
+            &plain_solver,
+            Some((&probes, &inverse_probes)),
+            Some(&system),
+        )
+        .expect("matrix-free complete outer gradient")
+        .gradient();
+
+    assert_eq!(
+        dense.len(),
+        matrix_free.len(),
+        "matrix-free gradient has a different ρ dimension than the dense one"
+    );
+    // Non-trivial: a zero gradient would make the parity check vacuous.
+    let g2: f64 = dense.iter().map(|v| v * v).sum();
+    assert!(
+        g2 > 1.0e-10 && g2.is_finite(),
+        "the dense complete gradient must be non-trivial to make parity meaningful; ‖g‖²={g2}"
+    );
+    let mut max_abs = 0.0_f64;
+    for (i, (d, m)) in dense.iter().zip(matrix_free.iter()).enumerate() {
+        assert!(
+            d.is_finite() && m.is_finite(),
+            "gradient component {i} must be finite (dense={d}, matrix_free={m})"
+        );
+        max_abs = max_abs.max((d - m).abs());
+        assert_abs_diff_eq!(d, m, epsilon = 1.0e-8);
+    }
+    eprintln!(
+        "[complete_matrix_free_outer_gradient] max|dense-matrix_free| over {} coords = {:.3e}",
+        dense.len(),
+        max_abs
+    );
+}
+
 /// End-to-end: the whitened streaming penalized quasi-Laplace criterion (`penalized_quasi_laplace_criterion_streaming_
 /// exact`) must COMPLETE with a finite value rather than surfacing the
 /// `cost-only streaming route is required` hard-error class. The streaming lane is

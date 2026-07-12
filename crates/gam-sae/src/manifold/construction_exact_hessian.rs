@@ -842,7 +842,7 @@ impl SaeManifoldTerm {
         solver: &DeflatedArrowSolver<'_>,
     ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
         self.analytic_outer_rho_gradient_components_with_bundle(
-            target, rho, loss, cache, solver, None,
+            target, rho, loss, cache, solver, None, None,
         )
     }
 
@@ -861,15 +861,21 @@ impl SaeManifoldTerm {
     /// deflated rows (the plain-S⁻¹ bundle cannot reconstruct the Daleckii–Krein
     /// correction), routing those fits to the dense channel.
     ///
-    /// The complete all-coordinate assembler remains dense-solver-bound: its IFT
-    /// correction requires one exact-stationarity solve per active outer
-    /// coordinate and still accepts a [`DeflatedArrowSolver`]. Production
-    /// Hybrid-EFS deliberately does not route the scalable fit through that O(K)
-    /// surface. It evaluates the sole non-FS assignment-strength coordinate with
-    /// [`Self::analytic_assignment_strength_gradient_matrix_free`] and leaves the
-    /// simultaneous smoothness/ARD block on Fellner-Schall updates. The `Some`
-    /// branch here is retained for exact dense/bundle parity of the complete
-    /// derivative, not as the production matrix-free route.
+    /// The complete all-coordinate assembler is single-adjoint (#2080-A): the IFT
+    /// correction `−½·⟨Γ, A⁺ g_ρ_l⟩` over every outer coordinate collapses to ONE
+    /// exact-stationarity solve `a = A⁺Γ` plus O(K) cheap `⟨a, g_ρ_l⟩`
+    /// contractions (self-adjointness of `A⁺`; see the collapse below). That
+    /// single adjoint solve is the ONLY solver-bound step, so the whole assembler
+    /// runs matrix-free at massive K: pass `matrix_free_system = Some(system)` to
+    /// route it through [`Self::solve_exact_stationarity_matrix_free`] (the
+    /// reduced-Schur CG on the reassembled undamped operator) with
+    /// `solver = DeflatedArrowSolver::plain(cache)` for the cheap per-row
+    /// `coordinate_block_*` subtractions — the K≥4096, direct-logdet-not-admitted
+    /// route, mirroring [`Self::analytic_assignment_strength_gradient_matrix_free`].
+    /// Pass `matrix_free_system = None` to use the dense [`DeflatedArrowSolver`]
+    /// adjoint (the direct-logdet-admitted route). Both produce the same complete
+    /// derivative; the from-probes trace channels and the matrix-free adjoint
+    /// convert together as one all-or-nothing matrix-free cluster (invariant #1).
     pub(crate) fn analytic_outer_rho_gradient_components_with_bundle(
         &self,
         target: ArrayView2<'_, f64>,
@@ -878,6 +884,7 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
         inverse_probe_bundle: Option<(&[Array1<f64>], &[Array1<f64>])>,
+        matrix_free_system: Option<&ArrowSchurSystem>,
     ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
         self.assignment
             .validate_rho_domain(rho)
@@ -1095,16 +1102,24 @@ impl SaeManifoldTerm {
         // so the collapse is EXACT, not an approximation, while dropping the outer
         // IFT cost from `O(P_ρ)` solves to one. `solve_exact_stationarity_is_self_adjoint_2080`
         // pins the self-adjointness this identity rests on.
-        let adjoint = self
-            .solve_exact_stationarity(rho, target, cache, solver, &gamma)
-            .map_err(|err| {
-                OuterGradientError::classify_arrow_solver_error(
-                    &err,
-                    OuterGradientError::NonIdentifiable {
-                        reason: err.clone(),
-                    },
-                )
-            })?;
+        // The single adjoint solve `a = A⁺Γ` — the only solver-bound step. At
+        // massive K (`matrix_free_system = Some`) it rides the reduced-Schur CG on
+        // the reassembled undamped operator; otherwise the dense deflated arrow
+        // solver. Both realize the same self-adjoint `A⁺` action.
+        let adjoint = match matrix_free_system {
+            Some(system) => {
+                self.solve_exact_stationarity_matrix_free(rho, target, cache, system, &gamma)
+            }
+            None => self.solve_exact_stationarity(rho, target, cache, solver, &gamma),
+        }
+        .map_err(|err| {
+            OuterGradientError::classify_arrow_solver_error(
+                &err,
+                OuterGradientError::NonIdentifiable {
+                    reason: err.clone(),
+                },
+            )
+        })?;
         let block_tail_start = n_params - rho.log_lambda_block.len();
         for coord in 0..n_params {
             let rhs = if coord >= block_tail_start && !rho.log_lambda_block.is_empty() {
