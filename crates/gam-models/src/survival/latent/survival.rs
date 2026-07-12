@@ -1611,7 +1611,7 @@ fn latent_kernel_sum_order2_parts<const K: usize>(
             return Ok(0.0);
         }
         let terms = latent_kernel_term_sequence_inline(base_terms, axes, suffix);
-        debug_assert!(
+        assert!(
             !terms.spilled(),
             "latent derivative support exceeded the inline allocation-free capacity: {} > {}",
             terms.len(),
@@ -7065,12 +7065,16 @@ mod tests {
                 iterations,
                 samples,
             );
+            let pair_count = dimension * (dimension + 1) / 2;
+            let vgh_reference_bundle_allocs = 2 * (1 + dimension + pair_count);
+            let contracted_reference_bundle_allocs = 2 * pair_count;
             eprintln!(
-                "LATENT-ONE-PASS-932 K={dimension} VGH prechange={vgh_reference_us:.3}us one-pass={vgh_one_pass_us:.3}us ratio={vgh_ratio:.4} speedup={:.2}x; T3 prechange={third_reference_us:.3}us one-pass={third_one_pass_us:.3}us ratio={third_ratio:.4} speedup={:.2}x; T4 prechange={fourth_reference_us:.3}us one-pass={fourth_one_pass_us:.3}us ratio={fourth_ratio:.4} speedup={:.2}x; FULL prechange={full_reference_us:.3}us one-pass={full_one_pass_us:.3}us ratio={full_ratio:.4} speedup={:.2}x",
+                "LATENT-ONE-PASS-932 K={dimension} VGH prechange={vgh_reference_us:.3}us one-pass={vgh_one_pass_us:.3}us ratio={vgh_ratio:.4} speedup={:.2}x bundle-Vec-allocs={vgh_reference_bundle_allocs}->2; T3 prechange={third_reference_us:.3}us one-pass={third_one_pass_us:.3}us ratio={third_ratio:.4} speedup={:.2}x bundle-Vec-allocs={contracted_reference_bundle_allocs}->2; T4 prechange={fourth_reference_us:.3}us one-pass={fourth_one_pass_us:.3}us ratio={fourth_ratio:.4} speedup={:.2}x bundle-Vec-allocs={contracted_reference_bundle_allocs}->2; FULL prechange={full_reference_us:.3}us one-pass={full_one_pass_us:.3}us ratio={full_ratio:.4} speedup={:.2}x bundle-Vec-allocs={}->6; derivative-plan-heap-allocs=0 output-ndarray-allocs=4->4",
                 1.0 / vgh_ratio,
                 1.0 / third_ratio,
                 1.0 / fourth_ratio,
                 1.0 / full_ratio,
+                vgh_reference_bundle_allocs + 2 * contracted_reference_bundle_allocs,
             );
             for (channel, ratio) in [
                 ("VGH", vgh_ratio),

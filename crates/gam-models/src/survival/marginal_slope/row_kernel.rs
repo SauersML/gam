@@ -1056,7 +1056,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     fn batched_value_grad_hess_all(
         &self,
     ) -> Option<Result<(Vec<f64>, Vec<[f64; 4]>, Vec<[[f64; 4]; 4]>), String>> {
-        use crate::gpu_kernels::survival_rowjet::{SurvivalRowInputs, survival_rigid_row_jets};
+        use crate::gpu_kernels::survival_rowjet::{SurvivalRowInputs, survival_rigid_row_vgh};
         let n = self.family.n;
         let probit_scale = self.family.probit_frailty_scale();
         let qd1_lower = self.family.time_derivative_lower_bound();
@@ -1091,10 +1091,9 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
             // path, which raises the precise error.
             Err(_) => return None,
         };
-        // (v,g,H) only — the third/fourth direction args are unused for the
-        // value cache; pass zeros.
-        let zero = [0.0_f64; 4];
-        let ch = survival_rigid_row_jets(&rows, probit_scale, &zero, &zero, &zero);
+        // V/G/H-only dispatch: the CPU route evaluates one SparseOrder2 program
+        // per row and allocates no discarded high-order channel buffers.
+        let ch = survival_rigid_row_vgh(&rows, probit_scale);
         let mut grads = vec![[0.0_f64; 4]; n];
         let mut hesss = vec![[[0.0_f64; 4]; 4]; n];
         for row in 0..n {

@@ -107,6 +107,17 @@ pub struct SurvivalRowJetChannels {
     pub fourth: Vec<f64>,
 }
 
+/// Per-row value/gradient/Hessian channels for consumers that request no
+/// contracted third or fourth derivative. Keeping this shape distinct prevents
+/// a VGH cache fill from allocating two `n×16` outputs and evaluating two
+/// additional seeded algebras whose results would be discarded.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SurvivalRowVghChannels {
+    pub(crate) value: Vec<f64>,
+    pub(crate) grad: Vec<f64>,
+    pub(crate) hess: Vec<f64>,
+}
+
 /// The scalar-independent per-row inputs the kernel consumes: the four primaries
 /// `(q0,q1,qd1,g)` and the row scalars `(w,d,z_sum,cov_ones)`. `probit_scale` is
 /// shared across all rows (a scalar kernel argument). These are exactly the
@@ -126,6 +137,58 @@ pub struct SurvivalRowInputs {
 /// measurement put the kernel/CPU crossover well under 1e5 rows; 1e5 is a
 /// conservative break-even that keeps small-fit latency on the CPU.
 pub const DEVICE_ROW_THRESHOLD: usize = 100_000;
+
+#[inline]
+fn rigid_cpu_row_inputs(
+    row: usize,
+    input: &SurvivalRowInputs,
+    probit_scale: f64,
+) -> RigidRowInputs {
+    RigidRowInputs {
+        row,
+        wi: input.wi,
+        di: input.di,
+        z_sum: input.z_sum,
+        covariance_ones: input.cov_ones,
+        probit_scale,
+        // The batch caller validates the monotonicity guard before dispatch.
+        // Keep this evaluator a pure derivative program over admitted rows.
+        qd1_lower: f64::NEG_INFINITY,
+    }
+}
+
+/// CPU VGH-only execution: one instantiation of the unified row program per
+/// row, with exactly the three requested output buffers.
+#[must_use]
+pub(crate) fn survival_rigid_row_vgh_cpu(
+    rows: &[SurvivalRowInputs],
+    probit_scale: f64,
+) -> SurvivalRowVghChannels {
+    use crate::survival::marginal_slope::row_kernel::{
+        RIGID_LINEAR_MASK, SparseOrder2, rigid_row_nll,
+    };
+    use gam_math::jet_scalar::JetScalar;
+
+    let n = rows.len();
+    let mut value = vec![0.0_f64; n];
+    let mut grad = vec![0.0_f64; n * 4];
+    let mut hess = vec![0.0_f64; n * 16];
+    for (row, input) in rows.iter().enumerate() {
+        let in_row = rigid_cpu_row_inputs(row, input, probit_scale);
+        let p = input.primaries;
+        let vars: [SparseOrder2<RIGID_LINEAR_MASK>; 4] =
+            std::array::from_fn(|axis| SparseOrder2::variable(p[axis], axis));
+        if let Ok(out) = rigid_row_nll(&vars, &in_row) {
+            value[row] = out.value();
+            grad[row * 4..row * 4 + 4].copy_from_slice(&out.g());
+            let row_hessian = out.h();
+            for a in 0..4 {
+                hess[row * 16 + a * 4..row * 16 + a * 4 + 4].copy_from_slice(&row_hessian[a]);
+            }
+        }
+    }
+    SurvivalRowVghChannels { value, grad, hess }
+}
 
 /// CPU reference / fallback: build every row's channels from the SAME unified jet
 /// the production `RowKernel` consumes (`rigid_row_nll` at `Order2`/`OneSeed`/
@@ -150,19 +213,7 @@ pub fn survival_rigid_row_jets_cpu(
     let mut third = vec![0.0_f64; n * 16];
     let mut fourth = vec![0.0_f64; n * 16];
     for (row, inp) in rows.iter().enumerate() {
-        let in_row = RigidRowInputs {
-            row,
-            wi: inp.wi,
-            di: inp.di,
-            z_sum: inp.z_sum,
-            covariance_ones: inp.cov_ones,
-            probit_scale,
-            // The CPU monotonicity guard floor: the device kernel does not
-            // re-derive it (the caller pre-validates the primaries before
-            // building the batch), so use the always-pass sentinel here to
-            // keep the oracle a pure derivative comparison.
-            qd1_lower: f64::NEG_INFINITY,
-        };
+        let in_row = rigid_cpu_row_inputs(row, inp, probit_scale);
         // (v, g, H) at the static-sparsity Order2 scalar (production hot path).
         let p = inp.primaries;
         let vars: [SparseOrder2<RIGID_LINEAR_MASK>; 4] =
@@ -240,6 +291,37 @@ pub fn survival_rigid_row_jets(
         }
     }
     survival_rigid_row_jets_cpu(rows, probit_scale, dir, dir_u, dir_v)
+}
+
+/// General VGH-only entry point. CPU execution evaluates exactly one
+/// `SparseOrder2` row program and allocates no high-order outputs. Large admitted
+/// GPU batches retain the existing device route for now; its result is narrowed
+/// at the boundary, while a dedicated J2 CUDA entry point is measured separately
+/// before replacing that kernel.
+#[must_use]
+pub(crate) fn survival_rigid_row_vgh(
+    rows: &[SurvivalRowInputs],
+    probit_scale: f64,
+) -> SurvivalRowVghChannels {
+    #[cfg(target_os = "linux")]
+    {
+        if rows.len() >= DEVICE_ROW_THRESHOLD {
+            let zero = [0.0_f64; 4];
+            match device::survival_rigid_row_jets_device(rows, probit_scale, &zero, &zero, &zero) {
+                Ok(out) => {
+                    return SurvivalRowVghChannels {
+                        value: out.value,
+                        grad: out.grad,
+                        hess: out.hess,
+                    };
+                }
+                Err(error) => {
+                    log::info!("[GPU] survival VGH device path fell back to CPU: {error}");
+                }
+            }
+        }
+    }
+    survival_rigid_row_vgh_cpu(rows, probit_scale)
 }
 
 /// Diagnostic: run ONLY the device path and return its `Result` (the error
@@ -525,6 +607,56 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn vgh_only_cpu_matches_full_dispatch_and_removes_unused_orders_932() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let rows = fixture(512);
+        let zero = [0.0_f64; 4];
+        let full = survival_rigid_row_jets_cpu(&rows, 0.7, &zero, &zero, &zero);
+        let vgh = survival_rigid_row_vgh_cpu(&rows, 0.7);
+        assert_eq!(vgh.value, full.value, "VGH-only values");
+        assert_eq!(vgh.grad, full.grad, "VGH-only gradients");
+        assert_eq!(vgh.hess, full.hess, "VGH-only Hessians");
+
+        let iterations = if cfg!(debug_assertions) { 2 } else { 500 };
+        let mut full_best = f64::INFINITY;
+        let mut vgh_best = f64::INFINITY;
+        for _ in 0..5 {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(survival_rigid_row_jets_cpu(
+                    black_box(&rows),
+                    0.7,
+                    &zero,
+                    &zero,
+                    &zero,
+                ));
+            }
+            full_best = full_best.min(start.elapsed().as_secs_f64());
+
+            let start = Instant::now();
+            for _ in 0..iterations {
+                black_box(survival_rigid_row_vgh_cpu(black_box(&rows), 0.7));
+            }
+            vgh_best = vgh_best.min(start.elapsed().as_secs_f64());
+        }
+        let rows_evaluated = (iterations * rows.len()) as f64;
+        let full_ns = full_best * 1e9 / rows_evaluated;
+        let vgh_ns = vgh_best * 1e9 / rows_evaluated;
+        eprintln!(
+            "SURVIVAL-RIGID-VGH-932 full-all-orders={full_ns:.2} ns/row vgh-only={vgh_ns:.2} ns/row speedup={:.3}x",
+            full_ns / vgh_ns,
+        );
+        if !cfg!(debug_assertions) {
+            assert!(
+                vgh_ns < full_ns,
+                "VGH-only dispatcher must beat discarded-order baseline: {vgh_ns} vs {full_ns} ns/row"
+            );
         }
     }
 

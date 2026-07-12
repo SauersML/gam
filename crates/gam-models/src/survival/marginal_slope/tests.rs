@@ -8945,15 +8945,29 @@ fn survival_jeffreys_contracted_trace_hessian_matches_fd_of_trace() {
         array![0.5, -0.4, 0.3, 0.6, -0.2],
         array![-0.3, 0.5, -0.6, 0.2, 0.4],
     ];
+    // `tr(W·H(β))` is a second derivative of the row NLL, so its central
+    // second difference probes the FOURTH β-derivative and carries an
+    // `(h²/12)·(sixth-derivative-of-NLL)` truncation term. For the probit /
+    // log-φ composite that sixth derivative summed over rows is large enough
+    // that a single-`h` difference at `h=1e-3` sits right at the 1e-5 relative
+    // tolerance on the `g`-spanning directions. Richardson-extrapolate two
+    // central differences (`h`, `h/2`) to cancel the O(h²) term and validate
+    // the analytic to O(h⁴). This is a strictly stronger check than the raw
+    // difference: it cannot mask a genuine O(1) analytic error (both `D(h)`
+    // and `D(h/2)` would then be wrong by ≈the same O(1) amount and the
+    // combination stays wrong) — it only removes the discretization artifact.
     let eps = 1e-3;
+    let center = trace_of_hessian_at(&beta0);
     for (idx, dir) in directions.iter().enumerate() {
-        let step: Array1<f64> = dir.mapv(|v| v * eps);
-        let beta_plus: Array1<f64> = &beta0 + &step;
-        let beta_minus: Array1<f64> = &beta0 - &step;
-        let plus = trace_of_hessian_at(&beta_plus);
-        let minus = trace_of_hessian_at(&beta_minus);
-        let center = trace_of_hessian_at(&beta0);
-        let fd_second = (plus - 2.0 * center + minus) / (eps * eps);
+        let central_second = |h: f64| -> f64 {
+            let step: Array1<f64> = dir.mapv(|v| v * h);
+            let plus = trace_of_hessian_at(&(&beta0 + &step));
+            let minus = trace_of_hessian_at(&(&beta0 - &step));
+            (plus - 2.0 * center + minus) / (h * h)
+        };
+        let d_h = central_second(eps);
+        let d_h2 = central_second(eps * 0.5);
+        let fd_second = (4.0 * d_h2 - d_h) / 3.0;
         let analytic_quad = dir.dot(&analytic.dot(dir));
         let rel = (fd_second - analytic_quad).abs() / fd_second.abs().max(1.0);
         assert!(
