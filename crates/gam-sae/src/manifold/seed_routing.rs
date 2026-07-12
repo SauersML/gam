@@ -1004,6 +1004,71 @@ mod tests {
         );
     }
 
+    /// The recovery must stay exact under an ANISOTROPIC embedding, where the
+    /// transverse extent and the radial modulation carry different scales
+    /// (`σ_radial ≠ σ_transverse`). An audit flagged the independent per-axis
+    /// standardization as a possible bias source — `arg((r/σ_r + i·u/σ_u)²) ≠
+    /// arg((r + i·u)²)` under anisotropy. But that per-axis standardization is
+    /// exactly the remedy, not a bug: each `σ` absorbs its own axis's embedding
+    /// scale, so the normalized half-angle plane is restored to isotropy and the
+    /// recovered width stays proportional to the true width. The chart azimuth
+    /// `s` comes from the center-circle angle, independent of either scale. So a
+    /// non-degenerate anisotropic band (here transverse 3×, radial modulation
+    /// 0.7×, minimum radius 0.3 > 0) must still reconstruct exactly. (Only a
+    /// GEOMETRICALLY degenerate band — radial modulation so large the radius
+    /// crosses zero — breaks, which is a different, out-of-model pathology.)
+    #[test]
+    fn mobius_double_cover_seed_is_robust_to_anisotropic_embedding() {
+        use crate::basis::{MobiusHarmonicEvaluator, SaeBasisEvaluator};
+
+        let n_phase = 64usize;
+        let n_width = 9usize;
+        let n = n_phase * n_width;
+        let (radial_scale, transverse_scale) = (0.7_f64, 3.0_f64);
+        let mut target = Array2::<f64>::zeros((n, 3));
+        for phase_idx in 0..n_phase {
+            let phase = std::f64::consts::TAU * phase_idx as f64 / n_phase as f64;
+            for width_idx in 0..n_width {
+                let row = phase_idx * n_width + width_idx;
+                let width = -1.0 + 2.0 * width_idx as f64 / (n_width - 1) as f64;
+                let radius = 1.0 + radial_scale * width * (0.5 * phase).cos();
+                target[[row, 0]] = radius * phase.cos();
+                target[[row, 1]] = radius * phase.sin();
+                target[[row, 2]] = transverse_scale * width * (0.5 * phase).sin();
+            }
+        }
+        let rows: Vec<usize> = (0..n).collect();
+        let coords = mobius_double_cover_coords_from_projection(target.view(), &rows)
+            .expect("the anisotropic band has an identifiable double-cover chart");
+        let evaluator = MobiusHarmonicEvaluator::new(3, 2).unwrap();
+        let (phi, _) = evaluator.evaluate(coords.view()).unwrap();
+        let mut gram = fast_ata(&phi);
+        let scale = gram.diag().iter().copied().fold(0.0_f64, f64::max);
+        for diagonal in gram.diag_mut().iter_mut() {
+            *diagonal += scale * 64.0 * f64::EPSILON;
+        }
+        let rhs = fast_atb(&phi, &target);
+        let decoder = gram.cholesky(Side::Lower).unwrap().solve_mat(&rhs);
+        let fitted = phi.dot(&decoder);
+        let mean = target.mean_axis(ndarray::Axis(0)).unwrap();
+        let total = target
+            .rows()
+            .into_iter()
+            .map(|row| {
+                row.iter()
+                    .zip(mean.iter())
+                    .map(|(&value, &center)| (value - center).powi(2))
+                    .sum::<f64>()
+            })
+            .sum::<f64>();
+        let residual = (&target - &fitted).mapv(|value| value * value).sum();
+        let r2 = 1.0 - residual / total;
+        assert!(
+            r2 > 0.999_999,
+            "the width recovery must stay exact under anisotropic radial/transverse scaling; R²={r2}"
+        );
+    }
+
     /// Held-out objective-quality discriminator for #2240: on a planted Möbius
     /// band, the deck-invariant quotient basis must GENERALIZE (decoder fit on a
     /// train split, scored on disjoint held-out rows) while the flat/euclidean
