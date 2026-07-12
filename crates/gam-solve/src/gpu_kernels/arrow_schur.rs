@@ -2925,6 +2925,46 @@ extern "C" __global__ void arrow_sae_frame_scatter_h_det(
     out[a] = -acc;
 }
 
+/* #1017 evidence-lane WARP-COOPERATIVE apply_h: hvec[i][c] = Σ_a H_tβ[i][c,a]·x[a].
+   One WARP owns (row, c): lane `l` strides `a = l, l+32, …` over the contiguous
+   `H_tβ[i][c,·]` slab (fully coalesced across the warp) and a fixed-order
+   __shfl_down tree reduces to lane 0. Replaces the shared `arrow_sae_frame_apply_h`
+   (256-thread block, only `q_i` threads active, stride-`k` uncoalesced reads) on
+   the evidence path ONLY — the shared kernel is untouched (step-PCG relies on it).
+   Reduction order is fixed (lane stride + tree), so the result is run-to-run
+   bit-stable; it differs from the scalar kernel only by ULP reassociation, within
+   the ≤1e-9 parity gate. Launch: block = max_q·32 (≤1024), grid.x = n_rows;
+   warp `w = threadIdx.x/32` handles `c = w` for `w < q_i`. */
+extern "C" __global__ void arrow_sae_frame_apply_h_warp(
+    const double* __restrict__ x,
+    const int* __restrict__ htb_ptr,
+    const double* __restrict__ htb,
+    const int* __restrict__ q_of,
+    double* __restrict__ hvec,
+    int k,
+    int max_q,
+    int n_rows
+) {
+    int row = blockIdx.x;
+    if (row >= n_rows) { return; }
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int q = q_of[row];
+    if (warp >= q) { return; }
+    int base = htb_ptr[row] + warp * k;
+    double acc = 0.0;
+    for (int a = lane; a < k; a += 32) {
+        acc += htb[base + a] * x[a];
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    }
+    if (lane == 0) {
+        hvec[row * max_q + warp] = acc;
+    }
+}
+
 /* Frame Jacobi diagonal subtraction: diag[a] -= Σ_c Σ_d H_tβ[c,a]·ainv[c,d]·H_tβ[d,a]. */
 extern "C" __global__ void arrow_sae_frame_diag_sub(
     double* __restrict__ diag,
@@ -4921,12 +4961,21 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         let k_i32 = checked_i32(buffers.k)?;
         let max_q_i32 = checked_i32(buffers.max_q)?;
         let n_rows_i32 = checked_i32(buffers.n_rows)?;
-        // hvec[i][c] = Σ_a H_tβ[i][c,a]·x[a].
+        // hvec[i][c] = Σ_a H_tβ[i][c,a]·x[a] — warp-cooperative (one warp per
+        // (row, c), coalesced reads). Block = max_q·32 threads (one warp per
+        // possible c), grid.x = n_rows.
         {
             let kernel = module
-                .load_function("arrow_sae_frame_apply_h")
+                .load_function("arrow_sae_frame_apply_h_warp")
                 .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-            let cfg = frame_grid(buffers.max_q, buffers.n_rows)?;
+            let block = checked_i32(buffers.max_q)?
+                .checked_mul(32)
+                .ok_or(ArrowSchurGpuFailure::Unavailable)? as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (checked_i32(buffers.n_rows)? as u32, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            };
             let mut b = stream.launch_builder(&kernel);
             b.arg(x)
                 .arg(&buffers.htb_ptr)
@@ -4937,7 +4986,8 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 .arg(&max_q_i32)
                 .arg(&n_rows_i32);
             // SAFETY: dense cross-block + pointers + hvec are live buffers sized
-            // for (n_rows × max_q) / (n_rows × k); the kernel guards q_i and k.
+            // for (n_rows × max_q) / (n_rows × k); block = max_q·32 ≤ 1024, each
+            // warp guards `warp < q_i` and strides `a < k`.
             unsafe { b.launch(cfg) }.map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         }
         // svec[i] = ainv_i · hvec_i.
