@@ -32,6 +32,7 @@ mod block_scoring_gpu;
 mod block_stream;
 mod codes;
 mod cofit;
+mod cofit_arrow;
 mod coordinate;
 mod scoring;
 #[cfg(target_os = "linux")]
@@ -67,6 +68,7 @@ pub use block_stream::{
 };
 pub use codes::SparseCode;
 pub use cofit::{CofitConfig, CofitReport, CofitRound, cofit_block_and_curved};
+pub use cofit_arrow::{ArrowCofitConfig, ArrowCofitReport, cofit_linear_via_arrow};
 pub use coordinate::{
     BlockCoordinateReport, BlockMeasureCoordinateReport, FiringCoordinate, MeasureSpikeCoordinate,
     MeasureValuedCode, block_firing_coordinates, block_measure_valued_codes,
