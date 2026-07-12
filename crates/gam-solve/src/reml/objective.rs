@@ -3445,18 +3445,10 @@ mod tk_math_tests {
             for &eta in &etas {
                 let jet = sas_inverse_link_jet(eta, state.epsilon, state.log_delta)
                     .expect("finite SAS eta");
-                let h4 = sas_inverse_link_pdfthird_derivative(
-                    eta,
-                    state.epsilon,
-                    state.log_delta,
-                )
-                .expect("finite SAS eta");
-                let h5 = sas_inverse_link_pdffourth_derivative(
-                    eta,
-                    state.epsilon,
-                    state.log_delta,
-                )
-                .expect("finite SAS eta");
+                let h4 = sas_inverse_link_pdfthird_derivative(eta, state.epsilon, state.log_delta)
+                    .expect("finite SAS eta");
+                let h5 = sas_inverse_link_pdffourth_derivative(eta, state.epsilon, state.log_delta)
+                    .expect("finite SAS eta");
                 // Cross-check the Result-returning dispatch path used by
                 // `hessian_cde_arrays` against the direct closed-form
                 // helpers — both must return the same h₄, h₅.

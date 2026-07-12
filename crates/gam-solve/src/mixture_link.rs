@@ -48,7 +48,7 @@ fn latent_cloglog_point_jet(
 }
 
 #[inline]
-fn log_link_solver_exp(eta: f64) -> Result<f64, EstimationError> {
+pub(crate) fn log_link_solver_exp(eta: f64) -> Result<f64, EstimationError> {
     if !(LOG_LINK_SOLVER_ETA_MIN..=LOG_LINK_SOLVER_ETA_MAX).contains(&eta) {
         return Err(EstimationError::InverseLinkDomainViolation {
             link: "standard log inverse link",
@@ -1373,12 +1373,7 @@ impl PdfDerivativeOrder {
         })
     }
 
-    fn sas(
-        self,
-        eta: f64,
-        epsilon: f64,
-        log_delta: f64,
-    ) -> Result<f64, EstimationError> {
+    fn sas(self, eta: f64, epsilon: f64, log_delta: f64) -> Result<f64, EstimationError> {
         match self {
             Self::Third => sas_inverse_link_pdfthird_derivative(eta, epsilon, log_delta),
             Self::Fourth => sas_inverse_link_pdffourth_derivative(eta, epsilon, log_delta),
@@ -1470,9 +1465,10 @@ pub fn inverse_link_pdffourth_derivative_for_inverse_link(
 }
 
 #[inline]
-fn royston_parmar_inverse_link_jet(
-    eta: f64,
-) -> Result<InverseLinkJet, EstimationError> {
+/// Exact Royston-Parmar survival jet `S(eta) = exp(-exp(eta))` for every finite
+/// `f64` eta. Scaled polynomial tails preserve representable derivatives after
+/// the survival value itself underflows; non-finite eta is a typed refusal.
+fn royston_parmar_inverse_link_jet(eta: f64) -> Result<InverseLinkJet, EstimationError> {
     let eta = finite_inverse_link_eta("Royston-Parmar survival inverse link", eta)?;
     let hazard = eta.exp();
     let survival = (-hazard).exp();
@@ -2034,6 +2030,11 @@ pub fn beta_logistic_inverse_link_jetwith_param_partials(
 /// SAS inverse-link jet for:
 ///   mu(eta) = Phi(sinh(delta * asinh(eta) + epsilon)),
 ///   delta = exp(B * tanh(log_delta / B)), B = SAS_LOG_DELTA_BOUND.
+///
+/// The mathematical solver domain is every finite `f64` eta. Non-finite eta
+/// returns [`EstimationError::InverseLinkDomainViolation`]; no value is
+/// substituted. The asinh derivatives are evaluated through a scaled jet so
+/// both finite endpoints of the domain remain numerically well defined.
 pub fn sas_inverse_link_jet(
     eta: f64,
     epsilon: f64,
@@ -2067,6 +2068,8 @@ pub fn sas_inverse_link_jet(
     Ok(chain_inverse_link_jet(base, z1, z2, z3))
 }
 
+/// Fourth eta derivative of the SAS inverse-link CDF on the same finite domain
+/// as [`sas_inverse_link_jet`].
 pub fn sas_inverse_link_pdfthird_derivative(
     eta: f64,
     epsilon: f64,
@@ -2162,6 +2165,8 @@ pub fn sas_inverse_link_pdfthird_derivative(
 /// The mu = Phi(z) expansion at order 5 uses probit derivatives:
 ///   mu^(5) = Phi5*z1^5 + 10*Phi4*z1^3*z2 + 15*Phi3*z1*z2^2 + 10*Phi3*z1^2*z3
 ///            + 10*Phi2*z2*z3 + 5*Phi2*z1*z4 + Phi1*z5
+///
+/// Non-finite eta is rejected by the shared SAS finite-domain contract.
 pub fn sas_inverse_link_pdffourth_derivative(
     eta: f64,
     epsilon: f64,
@@ -2235,6 +2240,9 @@ pub fn sas_inverse_link_pdffourth_derivative(
     Ok(canonicalzero(out))
 }
 
+/// SAS eta jet plus epsilon/log-delta partial jets. This is fallible for the
+/// same reason as the value jet: eta must be finite, and no non-finite eta is
+/// silently replaced.
 pub fn sas_inverse_link_jetwith_param_partials(
     eta: f64,
     epsilon: f64,
@@ -2364,6 +2372,31 @@ mod tests {
         }
     }
 
+    fn assert_finite_eta_domain_error(
+        error: EstimationError,
+        expected_link: &'static str,
+        eta: f64,
+    ) {
+        match error {
+            EstimationError::InverseLinkDomainViolation {
+                link,
+                eta: rejected,
+                lower,
+                upper,
+            } => {
+                assert_eq!(link, expected_link);
+                if eta.is_nan() {
+                    assert!(rejected.is_nan());
+                } else {
+                    assert_eq!(rejected, eta);
+                }
+                assert_eq!(lower, -f64::MAX);
+                assert_eq!(upper, f64::MAX);
+            }
+            other => panic!("expected typed finite-eta domain refusal, got {other}"),
+        }
+    }
+
     #[test]
     fn log_link_solver_boundaries_are_inclusive_exact_exp_jets() {
         let link = InverseLink::Standard(StandardLink::Log);
@@ -2474,6 +2507,171 @@ mod tests {
                 "log-link value/gradient mismatch at eta={eta}: analytic={}, finite_difference={}, relative_error={relative_error}",
                 jet.d1,
                 finite_difference
+            );
+        }
+    }
+
+    #[test]
+    fn sas_all_derivative_seams_refuse_nonfinite_eta_with_one_typed_contract() {
+        let state = sas_link_state_from_raw(0.25, -0.35).expect("SAS state");
+        let link = InverseLink::Sas(state);
+        for eta in [f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
+            assert_finite_eta_domain_error(
+                sas_inverse_link_jet(eta, state.epsilon, state.log_delta)
+                    .expect_err("SAS full jet must refuse"),
+                "SAS inverse link",
+                eta,
+            );
+            assert_finite_eta_domain_error(
+                sas_inverse_link_mu_d1(eta, state.epsilon, state.log_delta)
+                    .expect_err("SAS mu/d1 must refuse"),
+                "SAS inverse link",
+                eta,
+            );
+            assert_finite_eta_domain_error(
+                sas_inverse_link_pdfthird_derivative(eta, state.epsilon, state.log_delta)
+                    .expect_err("SAS fourth derivative must refuse"),
+                "SAS inverse link",
+                eta,
+            );
+            assert_finite_eta_domain_error(
+                sas_inverse_link_pdffourth_derivative(eta, state.epsilon, state.log_delta)
+                    .expect_err("SAS fifth derivative must refuse"),
+                "SAS inverse link",
+                eta,
+            );
+            assert_finite_eta_domain_error(
+                sas_inverse_link_jetwith_param_partials(eta, state.epsilon, state.log_delta)
+                    .expect_err("SAS parameter partials must refuse"),
+                "SAS inverse link",
+                eta,
+            );
+            assert_finite_eta_domain_error(
+                inverse_link_jet_for_inverse_link(&link, eta).expect_err("SAS kernel must refuse"),
+                "SAS inverse link",
+                eta,
+            );
+            assert_finite_eta_domain_error(
+                inverse_link_mu_d1_for_inverse_link(&link, eta)
+                    .expect_err("SAS fast dispatch must refuse"),
+                "SAS inverse link",
+                eta,
+            );
+            assert_finite_eta_domain_error(
+                inverse_link_pdfthird_derivative_for_inverse_link(&link, eta)
+                    .expect_err("SAS fourth-derivative dispatch must refuse"),
+                "SAS inverse link",
+                eta,
+            );
+            assert_finite_eta_domain_error(
+                inverse_link_pdffourth_derivative_for_inverse_link(&link, eta)
+                    .expect_err("SAS fifth-derivative dispatch must refuse"),
+                "SAS inverse link",
+                eta,
+            );
+        }
+    }
+
+    #[test]
+    fn sas_jets_are_finite_at_both_finite_f64_domain_edges() {
+        let state = sas_link_state_from_raw(0.25, -0.35).expect("SAS state");
+        for eta in [-f64::MAX, f64::MAX] {
+            let jet = sas_inverse_link_jet(eta, state.epsilon, state.log_delta)
+                .expect("finite SAS boundary jet");
+            let partials =
+                sas_inverse_link_jetwith_param_partials(eta, state.epsilon, state.log_delta)
+                    .expect("finite SAS boundary partials");
+            let h4 = sas_inverse_link_pdfthird_derivative(eta, state.epsilon, state.log_delta)
+                .expect("finite SAS boundary fourth derivative");
+            let h5 = sas_inverse_link_pdffourth_derivative(eta, state.epsilon, state.log_delta)
+                .expect("finite SAS boundary fifth derivative");
+            for value in [
+                jet.mu,
+                jet.d1,
+                jet.d2,
+                jet.d3,
+                partials.jet.mu,
+                partials.jet.d1,
+                partials.jet.d2,
+                partials.jet.d3,
+                partials.djet_depsilon.mu,
+                partials.djet_depsilon.d1,
+                partials.djet_depsilon.d2,
+                partials.djet_depsilon.d3,
+                partials.djet_dlog_delta.mu,
+                partials.djet_dlog_delta.d1,
+                partials.djet_dlog_delta.d2,
+                partials.djet_dlog_delta.d3,
+                h4,
+                h5,
+            ] {
+                assert!(
+                    value.is_finite(),
+                    "non-finite SAS boundary jet at eta={eta}: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn royston_parmar_exact_jet_has_no_former_minus_thirty_plateau() {
+        let left =
+            royston_parmar_inverse_link_jet(-30.0 - 1.0e-6).expect("finite Royston-Parmar eta");
+        let center = royston_parmar_inverse_link_jet(-30.0).expect("finite Royston-Parmar eta");
+        let right =
+            royston_parmar_inverse_link_jet(-30.0 + 1.0e-6).expect("finite Royston-Parmar eta");
+
+        assert!(
+            left.d1 < 0.0,
+            "the exact left tail must not be a constant plateau"
+        );
+        assert!(center.d1 < 0.0 && right.d1 < 0.0);
+        let left_relative = ((left.d1 - center.d1) / center.d1).abs();
+        let right_relative = ((right.d1 - center.d1) / center.d1).abs();
+        assert!(
+            left_relative < 2.0e-6,
+            "left derivative kink: {left_relative}"
+        );
+        assert!(
+            right_relative < 2.0e-6,
+            "right derivative kink: {right_relative}"
+        );
+
+        for eta in [-f64::MAX, -40.0, -30.0, 0.0, 7.0, 30.0, 40.0, f64::MAX] {
+            let jet = royston_parmar_inverse_link_jet(eta).expect("finite Royston-Parmar eta");
+            for value in [jet.mu, jet.d1, jet.d2, jet.d3] {
+                assert!(
+                    value.is_finite(),
+                    "non-finite Royston-Parmar jet at eta={eta}: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn royston_parmar_seams_refuse_nonfinite_eta_instead_of_clamping() {
+        let spec = LikelihoodSpec::new(
+            ResponseFamily::RoystonParmar,
+            InverseLink::Standard(StandardLink::Identity),
+        );
+        for eta in [f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
+            assert_finite_eta_domain_error(
+                royston_parmar_inverse_link_jet(eta)
+                    .expect_err("direct Royston-Parmar jet must refuse"),
+                "Royston-Parmar survival inverse link",
+                eta,
+            );
+            assert_finite_eta_domain_error(
+                inverse_link_jet_for_family(&spec, eta)
+                    .expect_err("solver Royston-Parmar jet must refuse"),
+                "Royston-Parmar survival inverse link",
+                eta,
+            );
+            assert_finite_eta_domain_error(
+                inverse_link_jet_for_family_public(&spec, eta)
+                    .expect_err("public Royston-Parmar jet must refuse"),
+                "Royston-Parmar survival inverse link",
+                eta,
             );
         }
     }

@@ -3567,27 +3567,26 @@ where
 
 #[inline]
 fn integrated_probit_jet(mu: f64, sigma: f64) -> IntegratedInverseLinkJet {
-    if sigma <= 1e-10 {
-        let z = mu.clamp(-30.0, 30.0);
-        let clamp_active = z != mu;
-        let pdf = gam_math::probability::normal_pdf(z);
+    // If Z ~ N(mu, sigma^2), E[Phi(Z)] = Phi(mu / sqrt(1+sigma^2)).
+    // This identity is exact at sigma=0 too, so there is no degenerate branch
+    // and no reason to project mu. `hypot` keeps the scale finite for every
+    // finite sigma. Once the Gaussian density underflows, all represented
+    // derivatives are the exact zero tail limit; return before forming z^2.
+    let s = sigma.hypot(1.0);
+    let z = mu / s;
+    let mean = gam_math::probability::normal_cdf(z);
+    let pdf = gam_math::probability::normal_pdf(z);
+    if pdf == 0.0 {
         return IntegratedInverseLinkJet {
-            mean: gam_math::probability::normal_cdf(z),
-            d1: if clamp_active { 0.0 } else { pdf },
-            d2: if clamp_active { 0.0 } else { -z * pdf },
-            d3: if clamp_active {
-                0.0
-            } else {
-                (z * z - 1.0) * pdf
-            },
+            mean,
+            d1: 0.0,
+            d2: 0.0,
+            d3: 0.0,
             mode: IntegratedExpectationMode::ExactClosedForm,
         };
     }
-    let s = (1.0 + sigma * sigma).sqrt();
-    let z = mu / s;
-    let pdf = gam_math::probability::normal_pdf(z);
     IntegratedInverseLinkJet {
-        mean: gam_math::probability::normal_cdf(z),
+        mean,
         d1: pdf / s,
         d2: -z * pdf / (s * s),
         d3: (z * z - 1.0) * pdf / (s * s * s),
@@ -6017,11 +6016,18 @@ mod tests {
     }
 
     #[test]
-    fn test_degenerate_probit_and_logit_jets_are_flat_on_active_clamps() {
-        let probit = integrated_probit_jet(-40.0, 0.0);
-        assert_eq!(probit.d1, 0.0);
-        assert_eq!(probit.d2, 0.0);
-        assert_eq!(probit.d3, 0.0);
+    fn test_degenerate_probit_jet_is_exact_beyond_former_clamp() {
+        let mu = -30.1;
+        let probit = integrated_probit_jet(mu, 0.0);
+        let pdf = gam_math::probability::normal_pdf(mu);
+        assert!(
+            pdf > 0.0,
+            "test point must have a represented Gaussian tail"
+        );
+        assert_eq!(probit.mean, gam_math::probability::normal_cdf(mu));
+        assert_eq!(probit.d1, pdf);
+        assert_eq!(probit.d2, -mu * pdf);
+        assert_eq!(probit.d3, (mu * mu - 1.0) * pdf);
 
         let logit = component_point_jet(LinkComponent::Logit, -710.0);
         assert_eq!(logit.1, 0.0);

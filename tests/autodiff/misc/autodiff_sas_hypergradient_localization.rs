@@ -361,8 +361,8 @@ fn sas_epsilon_partialfd_at_problem_point() {
     let eta = -1.2;
     let epsilon = -0.4;
     let log_delta = -0.3;
-    let out = sas_inverse_link_jetwith_param_partials(eta, epsilon, log_delta)
-        .expect("finite SAS eta");
+    let out =
+        sas_inverse_link_jetwith_param_partials(eta, epsilon, log_delta).expect("finite SAS eta");
     let h = 1e-6;
 
     let ep_p = gam::mixture_link::sas_inverse_link_jet(eta, epsilon + h, log_delta)
