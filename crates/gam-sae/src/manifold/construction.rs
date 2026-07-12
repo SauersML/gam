@@ -93,6 +93,19 @@ pub(crate) fn realised_rank_charge_dof(
     };
     let edge = r_floor * (1.0 + (p_out / n_eff).sqrt()).powi(2);
     let rank_eff = sv.iter().filter(|&&s| (s * s) / n_eff > edge).count() as f64;
+    if rank_eff == 0.0 {
+        // A zero effective rank triggers the categorical Laplace-validity veto
+        // upstream (criterion → +∞), so when it fires the NUMBERS must be on
+        // the record: an inflated noise floor R (e.g. an edf≈n dispersion at a
+        // small fixture) silently vetoes real atoms.
+        let top_sv = sv.iter().cloned().fold(0.0_f64, f64::max);
+        log::debug!(
+            "realised_rank_charge_dof: rank_eff=0 — top sv²/n_eff={:.6e} vs MP edge={:.6e} \
+             (R={r_floor:.6e}, n_eff={n_eff:.3e}, p_out={p_out})",
+            top_sv * top_sv / n_eff,
+            edge,
+        );
+    }
     // basis_edf = tr(gram·(gram+λS)⁻¹).
     let mut mmat = gram.clone();
     if let Some(pen) = smooth_penalty {
