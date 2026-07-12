@@ -195,14 +195,63 @@ fn checked_weighted_row_matrix(
 ) -> Result<Array2<f64>, String> {
     let mut weighted = Array2::<f64>::zeros(values.dim());
     for ((left, right), &value) in values.indexed_iter() {
-        weighted[[left, right]] = checked_weighted_row_value(
-            weight,
-            value,
-            row,
-            &format!("{quantity}[{left},{right}]"),
-        )?;
+        if !value.is_finite() {
+            return Err(format!(
+                "latent likelihood row {} has non-finite unweighted {quantity}[{left},{right}]: {value:?}",
+                row + 1
+            ));
+        }
+        let product = weight * value;
+        if !product.is_finite() || (value != 0.0 && product == 0.0) {
+            return Err(format!(
+                "latent likelihood row {} weighted {quantity}[{left},{right}] is not representable: {weight:?} * {value:?}",
+                row + 1
+            ));
+        }
+        weighted[[left, right]] = product;
     }
     Ok(weighted)
+}
+
+fn require_finite_likelihood_scalar(value: f64, quantity: &str) -> Result<f64, String> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(format!(
+            "latent likelihood accumulated {quantity} is not representable: {value:?}"
+        ))
+    }
+}
+
+fn require_finite_likelihood_vector(
+    values: &Array1<f64>,
+    quantity: &str,
+) -> Result<(), String> {
+    if let Some((index, &value)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(format!(
+            "latent likelihood accumulated {quantity}[{index}] is not representable: {value:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn require_finite_likelihood_matrix(
+    values: &Array2<f64>,
+    quantity: &str,
+) -> Result<(), String> {
+    if let Some(((row, col), &value)) = values
+        .indexed_iter()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(format!(
+            "latent likelihood accumulated {quantity}[{row},{col}] is not representable: {value:?}"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -2961,7 +3010,12 @@ impl LatentSurvivalFamily {
             ),
             (LATENT_SURVIVAL_PRIMARY_Q_RIGHT, self.x_time_right.row(row)),
         ] {
-            let scale = weight * primary_gradient[primary_idx];
+            let scale = checked_weighted_row_value(
+                weight,
+                primary_gradient[primary_idx],
+                row,
+                "primary gradient",
+            )?;
             if scale == 0.0 {
                 continue;
             }
@@ -2973,7 +3027,12 @@ impl LatentSurvivalFamily {
             }
         }
 
-        let mean_scale = weight * primary_gradient[LATENT_SURVIVAL_PRIMARY_MU];
+        let mean_scale = checked_weighted_row_value(
+            weight,
+            primary_gradient[LATENT_SURVIVAL_PRIMARY_MU],
+            row,
+            "mean gradient",
+        )?;
         if mean_scale != 0.0 {
             self.x_mean
                 .axpy_row_into(
@@ -2992,7 +3051,12 @@ impl LatentSurvivalFamily {
         }
 
         if let Some(log_sigma) = &slices.log_sigma {
-            target[log_sigma.start] += weight * primary_gradient[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA];
+            target[log_sigma.start] += checked_weighted_row_value(
+                weight,
+                primary_gradient[LATENT_SURVIVAL_PRIMARY_LOG_SIGMA],
+                row,
+                "log-sigma gradient",
+            )?;
         }
         Ok(())
     }
@@ -3228,7 +3292,12 @@ impl LatentSurvivalFamily {
                     point,
                     include_log_sigma,
                 )?;
-                acc.ll += wi * row_ll;
+                acc.ll += checked_weighted_row_value(
+                    wi,
+                    row_ll,
+                    row_idx,
+                    "log likelihood",
+                )?;
                 self.add_pullback_primary_gradient(
                     &mut acc.gradient,
                     row_idx,
@@ -3243,6 +3312,8 @@ impl LatentSurvivalFamily {
                 total_acc.gradient += &chunk_acc.gradient;
             },
         )?;
+        require_finite_likelihood_scalar(acc.ll, "log likelihood")?;
+        require_finite_likelihood_vector(&acc.gradient, "gradient")?;
         Ok((acc.ll, acc.gradient))
     }
 
@@ -3320,16 +3391,40 @@ impl LatentSurvivalFamily {
             )
             .map_err(|reason| LatentSurvivalError::NumericalFailure { reason })?;
             // ∂NLL/∂o_ch = −w · ∂(log-likelihood)/∂q_ch.
-            entry[row_idx] = -wi * primary_gradient[LATENT_SURVIVAL_PRIMARY_Q_ENTRY];
-            exit[row_idx] = -wi * primary_gradient[LATENT_SURVIVAL_PRIMARY_Q_EXIT];
-            derivative[row_idx] = -wi * primary_gradient[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT];
+            entry[row_idx] = -checked_weighted_row_value(
+                wi,
+                primary_gradient[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
+                row_idx,
+                "entry-offset score",
+            )
+            .map_err(|reason| LatentSurvivalError::NumericalFailure { reason })?;
+            exit[row_idx] = -checked_weighted_row_value(
+                wi,
+                primary_gradient[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
+                row_idx,
+                "exit-offset score",
+            )
+            .map_err(|reason| LatentSurvivalError::NumericalFailure { reason })?;
+            derivative[row_idx] = -checked_weighted_row_value(
+                wi,
+                primary_gradient[LATENT_SURVIVAL_PRIMARY_QDOT_EXIT],
+                row_idx,
+                "derivative-offset score",
+            )
+            .map_err(|reason| LatentSurvivalError::NumericalFailure { reason })?;
             // Interval upper-bound (`R`) channel. `q_right` shares the time-block
             // coefficients but carries its OWN baseline-θ η-offset evaluated at
             // `R` (`o_R(θ)`), so the profile-NLL θ-gradient must include it.
             // `∂(log-likelihood)/∂q_right` is exactly 0 for non-interval rows
             // (the `Q_RIGHT` channel is inert there), so this is 0 except on
             // interval-censored rows.
-            right[row_idx] = -wi * primary_gradient[LATENT_SURVIVAL_PRIMARY_Q_RIGHT];
+            right[row_idx] = -checked_weighted_row_value(
+                wi,
+                primary_gradient[LATENT_SURVIVAL_PRIMARY_Q_RIGHT],
+                row_idx,
+                "right-offset score",
+            )
+            .map_err(|reason| LatentSurvivalError::NumericalFailure { reason })?;
         }
         Ok(crate::survival::OffsetChannelResiduals {
             exit,
@@ -3513,7 +3608,7 @@ impl LatentSurvivalFamily {
                     },
                     include_log_sigma,
                 )?;
-            ll += wi * row_ll;
+            ll += checked_weighted_row_value(wi, row_ll, row_idx, "log likelihood")?;
             self.add_pullback_primary_gradient(
                 &mut gradient,
                 row_idx,
@@ -3521,13 +3616,26 @@ impl LatentSurvivalFamily {
                 &primary_gradient,
                 wi,
             )?;
+            let weighted_primary_hessian = checked_weighted_row_matrix(
+                wi,
+                &primary_hessian,
+                row_idx,
+                "primary Hessian",
+            )?;
             self.add_pullback_primary_block_diagonals(
                 row_idx,
-                &(wi * primary_hessian),
+                &weighted_primary_hessian,
                 &mut hess_time,
                 &mut hess_mean,
                 hess_log_sigma.as_mut(),
             )?;
+        }
+        require_finite_likelihood_scalar(ll, "log likelihood")?;
+        require_finite_likelihood_vector(&gradient, "gradient")?;
+        require_finite_likelihood_matrix(&hess_time, "time Hessian")?;
+        require_finite_likelihood_matrix(&hess_mean, "mean Hessian")?;
+        if let Some(hessian) = hess_log_sigma.as_ref() {
+            require_finite_likelihood_matrix(hessian, "log-sigma Hessian")?;
         }
         Ok((ll, gradient, hess_time, hess_mean, hess_log_sigma))
     }
@@ -3577,7 +3685,12 @@ impl LatentSurvivalFamily {
                         },
                         include_log_sigma,
                     )?;
-                acc.ll += wi * row_ll;
+                acc.ll += checked_weighted_row_value(
+                    wi,
+                    row_ll,
+                    row_idx,
+                    "log likelihood",
+                )?;
                 self.add_pullback_primary_gradient(
                     &mut acc.gradient,
                     row_idx,
@@ -3585,11 +3698,17 @@ impl LatentSurvivalFamily {
                     &primary_gradient,
                     wi,
                 )?;
+                let weighted_primary_hessian = checked_weighted_row_matrix(
+                    wi,
+                    &primary_hessian,
+                    row_idx,
+                    "primary Hessian",
+                )?;
                 self.add_pullback_primary_hessian(
                     &mut acc.hessian,
                     row_idx,
                     &slices,
-                    &(wi * primary_hessian),
+                    &weighted_primary_hessian,
                 )?;
                 Ok(())
             },
@@ -3599,6 +3718,9 @@ impl LatentSurvivalFamily {
                 total_acc.hessian += &chunk_acc.hessian;
             },
         )?;
+        require_finite_likelihood_scalar(acc.ll, "log likelihood")?;
+        require_finite_likelihood_vector(&acc.gradient, "gradient")?;
+        require_finite_likelihood_matrix(&acc.hessian, "Hessian")?;
         Ok((acc.ll, acc.gradient, acc.hessian))
     }
 
@@ -3654,11 +3776,13 @@ impl LatentSurvivalFamily {
                     &direction,
                     include_log_sigma,
                 )?;
+                let weighted_third =
+                    checked_weighted_row_matrix(wi, &third, row_idx, "contracted third")?;
                 self.add_pullback_primary_hessian(
                     &mut acc.hessian,
                     row_idx,
                     &slices,
-                    &(wi * third),
+                    &weighted_third,
                 )?;
                 Ok(())
             },
@@ -3666,6 +3790,7 @@ impl LatentSurvivalFamily {
                 total_acc.hessian += &chunk_acc.hessian;
             },
         )?;
+        require_finite_likelihood_matrix(&acc.hessian, "directional Hessian derivative")?;
         Ok(acc.hessian)
     }
 
@@ -3727,11 +3852,13 @@ impl LatentSurvivalFamily {
                     &direction_v,
                     include_log_sigma,
                 )?;
+                let weighted_fourth =
+                    checked_weighted_row_matrix(wi, &fourth, row_idx, "contracted fourth")?;
                 self.add_pullback_primary_hessian(
                     &mut acc.hessian,
                     row_idx,
                     &slices,
-                    &(wi * fourth),
+                    &weighted_fourth,
                 )?;
                 Ok(())
             },
@@ -3739,6 +3866,7 @@ impl LatentSurvivalFamily {
                 total_acc.hessian += &chunk_acc.hessian;
             },
         )?;
+        require_finite_likelihood_matrix(&acc.hessian, "second directional Hessian derivative")?;
         Ok(acc.hessian)
     }
 }
@@ -4257,12 +4385,17 @@ impl LatentBinaryFamily {
         slices: &LatentSurvivalJointSlices,
         primary_gradient: &Array1<f64>,
         weight: f64,
-    ) {
+    ) -> Result<(), String> {
         for (primary_idx, time_vec) in [
             (LATENT_SURVIVAL_PRIMARY_Q_ENTRY, self.x_time_entry.row(row)),
             (LATENT_SURVIVAL_PRIMARY_Q_EXIT, self.x_time_exit.row(row)),
         ] {
-            let scale = weight * primary_gradient[primary_idx];
+            let scale = checked_weighted_row_value(
+                weight,
+                primary_gradient[primary_idx],
+                row,
+                "binary primary gradient",
+            )?;
             if scale == 0.0 {
                 continue;
             }
@@ -4274,7 +4407,12 @@ impl LatentBinaryFamily {
             }
         }
 
-        let mean_scale = weight * primary_gradient[LATENT_SURVIVAL_PRIMARY_MU];
+        let mean_scale = checked_weighted_row_value(
+            weight,
+            primary_gradient[LATENT_SURVIVAL_PRIMARY_MU],
+            row,
+            "binary mean gradient",
+        )?;
         if mean_scale != 0.0 {
             self.x_mean
                 .axpy_row_into(
@@ -4282,19 +4420,16 @@ impl LatentBinaryFamily {
                     mean_scale,
                     &mut target.slice_mut(s![slices.mean.clone()]),
                 )
-                // SAFETY: `slices.mean` sized at construction to match
-                // `x_mean.ncols()`; an error means caller-side shape drift,
-                // an invariant violation. A swallowed sentinel would silently
-                // corrupt the joint gradient, so fail loudly instead.
-                .unwrap_or_else(|error| {
-                    panic!(
+                .map_err(|error| {
+                    format!(
                         "latent binary mean gradient pullback dimension mismatch: row={row}, mean_slice={:?}, target_len={}, x_mean_cols={}, error={error}",
                         slices.mean,
                         target.len(),
                         self.x_mean.ncols()
                     )
-                });
+                })?;
         }
+        Ok(())
     }
 
     fn add_pullback_primary_hessian(
@@ -4426,7 +4561,12 @@ impl LatentBinaryFamily {
                     false,
                 )?;
             let binary = binary_from_log_survival(row_log_survival, self.event_target[row_idx])?;
-            ll += wi * binary.log_lik;
+            ll += checked_weighted_row_value(
+                wi,
+                binary.log_lik,
+                row_idx,
+                "binary log likelihood",
+            )?;
             let primary_gradient = binary.grad_scale * &survival_gradient;
             let mut primary_hessian = binary.grad_scale * survival_hessian;
             for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
@@ -4441,14 +4581,23 @@ impl LatentBinaryFamily {
                 &slices,
                 &primary_gradient,
                 wi,
-            );
+            )?;
+            let weighted_primary_hessian = checked_weighted_row_matrix(
+                wi,
+                &primary_hessian,
+                row_idx,
+                "binary primary Hessian",
+            )?;
             self.add_pullback_primary_hessian(
                 &mut hessian,
                 row_idx,
                 &slices,
-                &(wi * primary_hessian),
+                &weighted_primary_hessian,
             );
         }
+        require_finite_likelihood_scalar(ll, "binary log likelihood")?;
+        require_finite_likelihood_vector(&gradient, "binary gradient")?;
+        require_finite_likelihood_matrix(&hessian, "binary Hessian")?;
         Ok((ll, gradient, hessian))
     }
 
@@ -4499,10 +4648,20 @@ impl LatentBinaryFamily {
                 .map_err(|reason| LatentSurvivalError::NumericalFailure { reason })?;
             let binary = binary_from_log_survival(row_log_survival, self.event_target[row_idx])?;
             // ∂NLL/∂o_ch = −w · grad_scale · ∂(log S)/∂q_ch.
-            entry[row_idx] =
-                -wi * binary.grad_scale * survival_gradient[LATENT_SURVIVAL_PRIMARY_Q_ENTRY];
-            exit[row_idx] =
-                -wi * binary.grad_scale * survival_gradient[LATENT_SURVIVAL_PRIMARY_Q_EXIT];
+            entry[row_idx] = -checked_weighted_row_value(
+                wi,
+                binary.grad_scale * survival_gradient[LATENT_SURVIVAL_PRIMARY_Q_ENTRY],
+                row_idx,
+                "binary entry-offset score",
+            )
+            .map_err(|reason| LatentSurvivalError::NumericalFailure { reason })?;
+            exit[row_idx] = -checked_weighted_row_value(
+                wi,
+                binary.grad_scale * survival_gradient[LATENT_SURVIVAL_PRIMARY_Q_EXIT],
+                row_idx,
+                "binary exit-offset score",
+            )
+            .map_err(|reason| LatentSurvivalError::NumericalFailure { reason })?;
         }
         Ok(crate::survival::OffsetChannelResiduals {
             exit,
@@ -4605,8 +4764,11 @@ impl LatentBinaryFamily {
                             * (g_u[a] * survival_gradient[b] + survival_gradient[a] * g_u[b]);
                 }
             }
-            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * primary));
+            let weighted_primary =
+                checked_weighted_row_matrix(wi, &primary, row_idx, "binary contracted third")?;
+            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &weighted_primary);
         }
+        require_finite_likelihood_matrix(&out, "binary directional Hessian derivative")?;
         Ok(out)
     }
 
@@ -4718,8 +4880,11 @@ impl LatentBinaryFamily {
                                 + survival_gradient[a] * g_uv[b]);
                 }
             }
-            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * primary));
+            let weighted_primary =
+                checked_weighted_row_matrix(wi, &primary, row_idx, "binary contracted fourth")?;
+            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &weighted_primary);
         }
+        require_finite_likelihood_matrix(&out, "binary second directional Hessian derivative")?;
         Ok(out)
     }
 }
@@ -4850,6 +5015,7 @@ impl LatentJointHessianFamily for LatentSurvivalFamily {
             let primary_hv = primary_hessian.dot(&primary_dir);
             self.add_pullback_primary_gradient(out, row_idx, slices, &primary_hv, wi)?;
         }
+        require_finite_likelihood_vector(out, "Hessian matvec")?;
         Ok(true)
     }
 
@@ -4929,8 +5095,9 @@ impl LatentJointHessianFamily for LatentBinaryFamily {
             for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
                 primary_hv[a] += binary.outer_scale * survival_gradient[a] * outer_dot;
             }
-            self.add_pullback_primary_gradient(out, row_idx, slices, &primary_hv, wi);
+            self.add_pullback_primary_gradient(out, row_idx, slices, &primary_hv, wi)?;
         }
+        require_finite_likelihood_vector(out, "binary Hessian matvec")?;
         Ok(true)
     }
 
@@ -5168,10 +5335,13 @@ impl CustomFamily for LatentSurvivalFamily {
                 let row = self.build_row_at(i, q_entry[i], q_exit[i], qdot_exit[i], q_right[i])?;
                 let jet = LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], latent_sd)
                     .map_err(|e| format!("LatentSurvivalFamily row {i}: {e}"))?;
-                Ok(wi * jet.log_lik)
+                checked_weighted_row_value(wi, jet.log_lik, i, "log likelihood")
             })
             .collect();
-        Ok(contributions?.into_iter().sum())
+        require_finite_likelihood_scalar(
+            contributions?.into_iter().sum(),
+            "log likelihood",
+        )
     }
 
     fn block_linear_constraints(
@@ -5316,60 +5486,114 @@ impl CustomFamily for LatentBinaryFamily {
                 LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], self.latent_sd)
                     .map_err(|e| format!("LatentBinaryFamily row {i}: {e}"))?;
             let binary = binary_from_log_survival(survival_jet.log_lik, self.event_target[i])?;
-            ll += wi * binary.log_lik;
+            ll += checked_weighted_row_value(
+                wi,
+                binary.log_lik,
+                i,
+                "binary log likelihood",
+            )?;
 
             self.x_mean
                 .row_chunk_into(i..i + 1, mean_row_buf.view_mut())
                 .map_err(|e| format!("LatentBinaryFamily row {i} mean row_chunk: {e}"))?;
             let mean_vec = mean_row_buf.row(0);
-            let mean_grad_scale = wi * binary.grad_scale * survival_jet.score;
+            let mean_grad_scale = checked_weighted_row_value(
+                wi,
+                binary.grad_scale * survival_jet.score,
+                i,
+                "binary mean gradient scale",
+            )?;
             for j in 0..p_mean {
                 grad_mean[j] += mean_grad_scale * mean_vec[j];
             }
-            let mean_neg_hess = wi
-                * (binary.neg_hess_scale * survival_jet.neg_hessian
-                    + binary.outer_scale * survival_jet.score * survival_jet.score);
+            let mean_neg_hess = checked_weighted_row_value(
+                wi,
+                binary.neg_hess_scale * survival_jet.neg_hessian
+                    + binary.outer_scale * survival_jet.score * survival_jet.score,
+                i,
+                "binary mean Hessian scale",
+            )?;
             dense_outer_accumulate(&mut hess_mean, mean_neg_hess, mean_vec);
 
             let time_jet =
                 latent_survival_time_jet(&self.quadctx, &row, 0.0, mu[i], self.latent_sd)?;
             let t_entry = self.x_time_entry.row(i);
             let t_exit = self.x_time_exit.row(i);
+            let time_gradient_scale = checked_weighted_row_value(
+                wi,
+                binary.grad_scale,
+                i,
+                "binary time gradient scale",
+            )?;
             for j in 0..p_time {
-                grad_time[j] += wi
-                    * binary.grad_scale
+                grad_time[j] += time_gradient_scale
                     * (time_jet.grad_entry * t_entry[j] + time_jet.grad_exit * t_exit[j]);
             }
+            let entry_hessian_scale = checked_weighted_row_value(
+                wi,
+                binary.neg_hess_scale * time_jet.neg_hess_entry,
+                i,
+                "binary entry Hessian scale",
+            )?;
             dense_outer_accumulate(
                 &mut hess_time,
-                wi * binary.neg_hess_scale * time_jet.neg_hess_entry,
+                entry_hessian_scale,
                 t_entry,
             );
+            let exit_hessian_scale = checked_weighted_row_value(
+                wi,
+                binary.neg_hess_scale * time_jet.neg_hess_exit,
+                i,
+                "binary exit Hessian scale",
+            )?;
             dense_outer_accumulate(
                 &mut hess_time,
-                wi * binary.neg_hess_scale * time_jet.neg_hess_exit,
+                exit_hessian_scale,
                 t_exit,
             );
             if binary.outer_scale != 0.0 {
+                let entry_outer_scale = checked_weighted_row_value(
+                    wi,
+                    binary.outer_scale * time_jet.grad_entry * time_jet.grad_entry,
+                    i,
+                    "binary entry outer Hessian scale",
+                )?;
                 dense_outer_accumulate(
                     &mut hess_time,
-                    wi * binary.outer_scale * time_jet.grad_entry * time_jet.grad_entry,
+                    entry_outer_scale,
                     t_entry,
                 );
+                let exit_outer_scale = checked_weighted_row_value(
+                    wi,
+                    binary.outer_scale * time_jet.grad_exit * time_jet.grad_exit,
+                    i,
+                    "binary exit outer Hessian scale",
+                )?;
                 dense_outer_accumulate(
                     &mut hess_time,
-                    wi * binary.outer_scale * time_jet.grad_exit * time_jet.grad_exit,
+                    exit_outer_scale,
                     t_exit,
                 );
+                let cross_outer_scale = checked_weighted_row_value(
+                    wi,
+                    binary.outer_scale * time_jet.grad_entry * time_jet.grad_exit,
+                    i,
+                    "binary cross outer Hessian scale",
+                )?;
                 dense_symmetric_cross_accumulate(
                     &mut hess_time,
-                    wi * binary.outer_scale * time_jet.grad_entry * time_jet.grad_exit,
+                    cross_outer_scale,
                     t_entry,
                     t_exit,
                 );
             }
         }
 
+        require_finite_likelihood_scalar(ll, "binary log likelihood")?;
+        require_finite_likelihood_vector(&grad_time, "binary time gradient")?;
+        require_finite_likelihood_vector(&grad_mean, "binary mean gradient")?;
+        require_finite_likelihood_matrix(&hess_time, "binary time Hessian")?;
+        require_finite_likelihood_matrix(&hess_mean, "binary mean Hessian")?;
         Ok(FamilyEvaluation {
             log_likelihood: ll,
             blockworking_sets: vec![
@@ -5399,10 +5623,15 @@ impl CustomFamily for LatentBinaryFamily {
             let survival_jet =
                 LatentSurvivalRowJet::evaluate(&self.quadctx, &row, mu[i], self.latent_sd)
                     .map_err(|e| format!("LatentBinaryFamily row {i}: {e}"))?;
-            ll +=
-                wi * binary_from_log_survival(survival_jet.log_lik, self.event_target[i])?.log_lik;
+            let binary = binary_from_log_survival(survival_jet.log_lik, self.event_target[i])?;
+            ll += checked_weighted_row_value(
+                wi,
+                binary.log_lik,
+                i,
+                "binary log likelihood",
+            )?;
         }
-        Ok(ll)
+        require_finite_likelihood_scalar(ll, "binary log likelihood")
     }
 
     fn block_linear_constraints(

@@ -7,6 +7,7 @@ use faer::{Accum, Par};
 use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky};
 use gam_linalg::matrix::{PsdWeightsView, SignedWeightsView};
 use gam_linalg::utils::certified_spd_factorize;
+use gam_math::probability::signed_log_sum_exp;
 use gam_problem::{Dispersion, LikelihoodScaleMetadata, LinkFunction, ResponseFamily};
 use ndarray::{Array1, Array2, ArrayView1, ShapeBuilder, s};
 use opt::{BacktrackConfig, backtracking_line_search};
@@ -119,10 +120,13 @@ pub type AloScalarScoreCurvature<'a> =
 /// slow without ever exceeding O(1) work per observation.
 const ALO_EXACT_SCALAR_MAX_ITERS: usize = 64;
 
-/// Absolute convergence tolerance on the scalar residual `r(η)` for the exact
-/// frozen-curvature ALO fixed point. Well below the `1e-2` predictive bar the
-/// LOO comparison asserts, so the refinement is not the limiting error term.
-const ALO_EXACT_SCALAR_TOL: f64 = 1e-12;
+/// Backward-error allowance for the three-term scalar residual
+/// `η - η̂ - a·ℓ'(η)`. It scales with the largest term and shrinks all the way
+/// to exact zero, so small predictors do not inherit an absolute error floor.
+#[inline]
+fn alo_scalar_residual_allowance(eta: f64, eta_hat: f64, score_step: f64) -> f64 {
+    32.0 * f64::EPSILON * eta.abs().max(eta_hat.abs()).max(score_step.abs())
+}
 
 /// Solve the frozen-curvature ALO leave-`i`-out fixed point exactly.
 ///
@@ -168,6 +172,7 @@ enum AloExactScalarError {
     MaxIterations {
         iterations: usize,
         residual: f64,
+        tolerance: f64,
         eta: f64,
     },
 }
@@ -202,20 +207,20 @@ impl fmt::Display for AloExactScalarError {
             AloExactScalarError::MaxIterations {
                 iterations,
                 residual,
+                tolerance,
                 eta,
             } => write!(
                 f,
-                "did not converge within {iterations} iterations: residual={residual:.6e}, eta={eta:.6e}, tol={ALO_EXACT_SCALAR_TOL:.1e}"
+                "did not converge within {iterations} iterations: residual={residual:.6e}, eta={eta:.6e}, backward-error allowance={tolerance:.6e}"
             ),
         }
     }
 }
 
 /// Maximum number of step halvings in the backtracking line search that
-/// globalizes the scalar Newton iteration. `2^{-40}` shrinks a unit step well
-/// below `ALO_EXACT_SCALAR_TOL` relative to any η of practical magnitude, so a
-/// row that cannot make progress within this budget is genuinely stalled rather
-/// than merely under-damped.
+/// globalizes the scalar Newton iteration. `2^{-40}` shrinks a unit step below
+/// one ulp relative to an ordinary finite η, so a row that cannot make progress
+/// within this budget is genuinely stalled rather than merely under-damped.
 const ALO_EXACT_SCALAR_BACKTRACKS: usize = 40;
 
 #[inline]
@@ -247,7 +252,7 @@ fn alo_eta_exact_frozen_curvature(
     //      satisfies (½r²)'·d = r·jac·(−r/jac) = −r² < 0 for any finite nonzero
     //      jac, so halving the step until |r| strictly decreases never leaves
     //      the basin even if a full step would overshoot the maximum.
-    let residual_and_jac = |eta: f64| -> Result<(f64, f64), AloExactScalarError> {
+    let residual_and_jac = |eta: f64| -> Result<(f64, f64, f64), AloExactScalarError> {
         let (ell_prime, ell_double) =
             score_curvature(eta).map_err(|error| AloExactScalarError::EvaluationFailed {
                 eta,
@@ -260,13 +265,29 @@ fn alo_eta_exact_frozen_curvature(
                 ell_double,
             });
         }
-        Ok((eta - eta_hat - a_ii * ell_prime, 1.0 - a_ii * ell_double))
+        let score_step = a_ii * ell_prime;
+        let residual = eta - eta_hat - score_step;
+        let jacobian = 1.0 - a_ii * ell_double;
+        let tolerance = alo_scalar_residual_allowance(eta, eta_hat, score_step);
+        if !score_step.is_finite()
+            || !residual.is_finite()
+            || !jacobian.is_finite()
+            || !tolerance.is_finite()
+        {
+            return Err(AloExactScalarError::NonFiniteStep {
+                eta,
+                residual,
+                jacobian,
+                next: f64::NAN,
+            });
+        }
+        Ok((residual, jacobian, tolerance))
     };
 
     let mut eta = eta_hat;
-    let (mut residual, mut jac) = residual_and_jac(eta)?;
+    let (mut residual, mut jac, mut tolerance) = residual_and_jac(eta)?;
     for _ in 0..ALO_EXACT_SCALAR_MAX_ITERS {
-        if residual.abs() <= ALO_EXACT_SCALAR_TOL {
+        if residual.abs() <= tolerance {
             return Ok(eta);
         }
         if jac == 0.0 || !jac.is_finite() {
@@ -295,7 +316,9 @@ fn alo_eta_exact_frozen_curvature(
                 let trial = eta - t * step;
                 Ok(residual_and_jac(trial)
                     .ok()
-                    .map(|(r_trial, j_trial)| (r_trial.abs(), (trial, r_trial, j_trial))))
+                    .map(|(r_trial, j_trial, tol_trial)| {
+                        (r_trial.abs(), (trial, r_trial, j_trial, tol_trial))
+                    }))
             },
             |_t, merit| merit < residual.abs(),
         ) {
@@ -305,11 +328,12 @@ fn alo_eta_exact_frozen_curvature(
         let Some(step) = accepted else {
             break;
         };
-        (eta, residual, jac) = step.payload;
+        (eta, residual, jac, tolerance) = step.payload;
     }
     Err(AloExactScalarError::MaxIterations {
         iterations: ALO_EXACT_SCALAR_MAX_ITERS,
         residual,
+        tolerance,
         eta,
     })
 }
@@ -324,10 +348,186 @@ fn sandwichvar_eta_from_meat(phi: f64, meat_quad: f64) -> f64 {
     phi * meat_quad
 }
 
-#[inline]
-fn variance_negative_tolerance(scale: f64) -> f64 {
-    // Tight relative tolerance for cancellation from x'H^{-1}x - ||E t||^2 - ridge||t||^2.
-    1e-12 * scale.abs().max(1.0)
+/// Evaluate `rhs' solution` after a residual-certified SPD solve. Neumaier
+/// compensation is the allocation-free hot path. Only an overflowed,
+/// underflowed, or non-positive cancellation result pays for the signed-log
+/// reconstruction, which can distinguish an unrepresentable result from a
+/// silently wrong sign without multiplying two huge coordinates first.
+fn spd_quadratic_after_certified_solve(
+    row: usize,
+    rhs: ArrayView1<'_, f64>,
+    solution: ArrayView1<'_, f64>,
+) -> Result<f64, AloError> {
+    let mut sum = 0.0_f64;
+    let mut compensation = 0.0_f64;
+    let mut rhs_nonzero = false;
+    let mut fast_path_finite = true;
+    for (&left, &right) in rhs.iter().zip(solution.iter()) {
+        if !left.is_finite() || !right.is_finite() {
+            return Err(AloError::LooComputationFailed {
+                reason: format!(
+                    "ALO certified solve produced a non-finite quadratic coordinate at row {row}: rhs={left}, solution={right}"
+                ),
+            });
+        }
+        rhs_nonzero |= left != 0.0;
+        let term = left * right;
+        if !term.is_finite() {
+            fast_path_finite = false;
+            continue;
+        }
+        let next = sum + term;
+        if !next.is_finite() {
+            fast_path_finite = false;
+            continue;
+        }
+        compensation += if sum.abs() >= term.abs() {
+            (sum - next) + term
+        } else {
+            (term - next) + sum
+        };
+        sum = next;
+    }
+    let fast = sum + compensation;
+    if !rhs_nonzero {
+        return Ok(0.0);
+    }
+    if fast_path_finite && fast.is_finite() && fast > 0.0 {
+        return Ok(fast);
+    }
+
+    let mut log_magnitudes = Vec::with_capacity(rhs.len());
+    let mut signs = Vec::with_capacity(rhs.len());
+    for (&left, &right) in rhs.iter().zip(solution.iter()) {
+        if left == 0.0 || right == 0.0 {
+            log_magnitudes.push(f64::NEG_INFINITY);
+            signs.push(0.0);
+        } else {
+            log_magnitudes.push(left.abs().ln() + right.abs().ln());
+            signs.push(left.signum() * right.signum());
+        }
+    }
+    let (log_magnitude, sign) = signed_log_sum_exp(&log_magnitudes, &signs);
+    if sign <= 0.0 || !log_magnitude.is_finite() {
+        return Err(AloError::LooComputationFailed {
+            reason: format!(
+                "ALO SPD quadratic could not be represented as strictly positive at row {row}: sign={sign}, log_magnitude={log_magnitude}, fast_value={fast}"
+            ),
+        });
+    }
+    let value = log_magnitude.exp();
+    if !value.is_finite() || value == 0.0 {
+        return Err(AloError::LooComputationFailed {
+            reason: format!(
+                "ALO SPD quadratic lies outside the nonzero finite f64 range at row {row}: log_magnitude={log_magnitude}"
+            ),
+        });
+    }
+    Ok(value)
+}
+
+/// Sum `weights[i] * values[i]^2` without forming `values[i]^2` first.
+/// Every term is non-negative by contract. A logarithmic reconstruction is
+/// needed only if direct products or the positive accumulation leave f64.
+fn finite_weighted_square_sum(
+    observation: usize,
+    weights: ArrayView1<'_, f64>,
+    values: &[f64],
+) -> Result<f64, AloError> {
+    let mut sum = 0.0_f64;
+    let mut compensation = 0.0_f64;
+    let mut has_mathematically_positive_term = false;
+    let mut fast_path_finite = true;
+    for (&weight, &value) in weights.iter().zip(values.iter()) {
+        if !weight.is_finite() || weight < 0.0 || !value.is_finite() {
+            return Err(AloError::LooComputationFailed {
+                reason: format!(
+                    "ALO sandwich quadratic has an invalid coordinate for observation {observation}: weight={weight}, value={value}"
+                ),
+            });
+        }
+        if weight == 0.0 || value == 0.0 {
+            continue;
+        }
+        has_mathematically_positive_term = true;
+        let term = (weight * value) * value;
+        if !term.is_finite() || term == 0.0 {
+            fast_path_finite = false;
+            continue;
+        }
+        let next = sum + term;
+        if !next.is_finite() {
+            fast_path_finite = false;
+            continue;
+        }
+        compensation += if sum.abs() >= term {
+            (sum - next) + term
+        } else {
+            (term - next) + sum
+        };
+        sum = next;
+    }
+    let fast = sum + compensation;
+    if !has_mathematically_positive_term {
+        return Ok(0.0);
+    }
+    if fast_path_finite && fast.is_finite() && fast > 0.0 {
+        return Ok(fast);
+    }
+
+    let mut log_magnitudes = Vec::with_capacity(values.len());
+    let mut signs = Vec::with_capacity(values.len());
+    for (&weight, &value) in weights.iter().zip(values.iter()) {
+        if weight == 0.0 || value == 0.0 {
+            log_magnitudes.push(f64::NEG_INFINITY);
+            signs.push(0.0);
+        } else {
+            log_magnitudes.push(weight.ln() + 2.0 * value.abs().ln());
+            signs.push(1.0);
+        }
+    }
+    let (log_magnitude, sign) = signed_log_sum_exp(&log_magnitudes, &signs);
+    let value = log_magnitude.exp();
+    if sign != 1.0 || !value.is_finite() || value == 0.0 {
+        return Err(AloError::LooComputationFailed {
+            reason: format!(
+                "ALO sandwich quadratic lies outside the positive finite f64 range for observation {observation}: sign={sign}, log_magnitude={log_magnitude}"
+            ),
+        });
+    }
+    Ok(value)
+}
+
+fn finite_nonnegative_product(
+    row: usize,
+    quantity: &'static str,
+    left: f64,
+    right: f64,
+) -> Result<f64, AloError> {
+    if !(left.is_finite() && left >= 0.0 && right.is_finite() && right >= 0.0) {
+        return Err(AloError::LooComputationFailed {
+            reason: format!(
+                "ALO {quantity} requires finite non-negative factors at row {row}: left={left}, right={right}"
+            ),
+        });
+    }
+    if left == 0.0 || right == 0.0 {
+        return Ok(0.0);
+    }
+    let direct = left * right;
+    if direct.is_finite() && direct > 0.0 {
+        return Ok(direct);
+    }
+    let log_magnitude = left.ln() + right.ln();
+    let value = log_magnitude.exp();
+    if !value.is_finite() || value == 0.0 {
+        return Err(AloError::LooComputationFailed {
+            reason: format!(
+                "ALO {quantity} lies outside the positive finite f64 range at row {row}: log_magnitude={log_magnitude}"
+            ),
+        });
+    }
+    Ok(value)
 }
 
 const LEVERAGE_HIGH_THRESHOLD: f64 = 0.99;
@@ -980,15 +1180,9 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
             // with its native ndarray strides so this path does not assume a
             // storage order chosen inside the factor API.
             let rhs_col = rhs_view.column(local_col);
-            let rhs_slice = rhs_col.as_slice().expect("column-major col contiguous");
-
-            let mut x_hinv_x = 0.0f64;
-            // Fused dot product over the current solve column.
-            for k in 0..p {
-                let sval = s_chunk[[k, local_col]];
-                let xval = rhs_slice[k];
-                x_hinv_x = sval.mul_add(xval, x_hinv_x);
-            }
+            let solution_col = s_chunk.column(local_col);
+            let x_hinv_x =
+                spd_quadratic_after_certified_solve(obs, rhs_col, solution_col)?;
             // The bread uses the observed Hessian surface. For a non-canonical
             // link W_H is signed, so the exact row leverage W_H,i x_i'H^-1x_i
             // can be negative even though the assembled penalized H is SPD.
@@ -999,48 +1193,19 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
             aii[obs] = ai;
             x_hinv_x_diag[obs] = x_hinv_x;
 
-            let var_bayes = bayesvar_eta(phi, x_hinv_x);
+            let var_bayes =
+                finite_nonnegative_product(obs, "Bayesian variance", phi, x_hinv_x)?;
             let xs_slice = xs_chunk_storage.col_as_slice(local_col);
-            let mut meat_quad = 0.0f64;
-            for row in 0..n {
-                let xs = xs_slice[row];
-                // Sandwich meat is the SCORE covariance Xᵀ diag(W_S) X (Fisher,
-                // PSD by construction), not the observed-information Hessian
-                // weight W_H: the estimator is Var = H⁻¹·Cov(score)·H⁻¹ with the
-                // bread H = Xᵀ W_H X + S. For non-canonical links W_H ≠ W_S (and
-                // W_H can be negative), so using W_H here gives a wrong — even
-                // negative — sandwich SE. See `AloInput::score_weights`.
-                meat_quad += w_s[row] * xs * xs;
-            }
-            let var_sandwich = sandwichvar_eta_from_meat(phi, meat_quad);
+            // Sandwich meat is the SCORE covariance Xᵀ diag(W_S) X (Fisher,
+            // PSD by construction), not the observed-information Hessian
+            // weight W_H. The scale-safe sum preserves that non-negative
+            // contract without projecting a signed result after the fact.
+            let meat_quad = finite_weighted_square_sum(obs, w_s, xs_slice)?;
+            let var_sandwich =
+                finite_nonnegative_product(obs, "sandwich variance", phi, meat_quad)?;
 
-            if !var_bayes.is_finite() || !var_sandwich.is_finite() {
-                return Err(AloError::LooComputationFailed {
-                    reason: format!(
-                        "ALO variance is not finite at row {obs}: bayes={var_bayes:.6e}, sandwich={var_sandwich:.6e}"
-                    ),
-                });
-            }
-            let bayes_tol = variance_negative_tolerance(phi * x_hinv_x.abs());
-            if var_bayes < -bayes_tol {
-                return Err(AloError::LooComputationFailed {
-                    reason: format!(
-                        "ALO Bayesian variance is materially negative at row {obs}: var={var_bayes:.6e}, tol={bayes_tol:.6e}"
-                    ),
-                });
-            }
-            let sandwich_scale = phi * meat_quad.abs().max(x_hinv_x.abs());
-            let sandwich_tol = variance_negative_tolerance(sandwich_scale);
-            if var_sandwich < -sandwich_tol {
-                return Err(AloError::LooComputationFailed {
-                    reason: format!(
-                        "ALO sandwich variance is materially negative at row {obs}: var={var_sandwich:.6e}, tol={sandwich_tol:.6e}"
-                    ),
-                });
-            }
-
-            se_bayes[obs] = var_bayes.max(0.0).sqrt();
-            se_sandwich[obs] = var_sandwich.max(0.0).sqrt();
+            se_bayes[obs] = var_bayes.sqrt();
+            se_sandwich[obs] = var_sandwich.sqrt();
         }
     }
 

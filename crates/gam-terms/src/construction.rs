@@ -2942,12 +2942,6 @@ pub fn kronecker_reparameterization_engine_with_invariant(
     })
 }
 
-/// 2-norm condition number of a matrix.  Implementation lives in
-/// `gam-linalg` (the canonical home for numeric matrix utilities);
-/// re-exported to keep `crate::construction::calculate_condition_number`
-/// resolving for all existing callers.
-pub use gam_linalg::utils::calculate_condition_number;
-
 #[cfg(test)]
 mod tests {
     use super::{
