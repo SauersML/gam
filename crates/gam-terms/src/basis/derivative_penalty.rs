@@ -157,8 +157,8 @@ pub fn cyclic_bspline_derivative_penalty_matrix(
 }
 
 /// Maps the open spline's modeling interval to `[0, 1]`. Assembly in this
-/// dimensionless coordinate keeps the evaluator's numerical knot-span floor
-/// relative to the modeled domain rather than to the user's physical units.
+/// dimensionless coordinate keeps the exact assembly independent of the user's
+/// physical units.
 fn normalized_open_knot_vector(
     knot_vector: ArrayView1<f64>,
     degree: usize,
@@ -174,16 +174,6 @@ fn normalized_open_knot_vector(
     }
     let normalized = knot_vector.mapv(|knot| (knot - left) / domain_scale);
     validate_knot_spans_nondegenerate(normalized.view(), degree)?;
-    for k in degree..num_basis {
-        let width = normalized[k + 1] - normalized[k];
-        if width > 0.0 && width <= KNOT_SPAN_DEGENERACY_FLOOR {
-            return Err(BasisError::InvalidKnotVector(format!(
-                "positive knot span [{}, {}] has relative width {width:.3e}, too small for stable exact roughness assembly",
-                knot_vector[k],
-                knot_vector[k + 1]
-            )));
-        }
-    }
     Ok((normalized, domain_scale))
 }
 
@@ -654,7 +644,7 @@ mod tests {
             let mut ws = BsplineDerivativeWorkspace::new();
             for k in degree..num_basis {
                 let (a, b) = (knots[k], knots[k + 1]);
-                if b - a <= KNOT_SPAN_DEGENERACY_FLOOR {
+                if b <= a {
                     continue;
                 }
                 for (node, weight) in nodes.iter().zip(weights.iter()) {

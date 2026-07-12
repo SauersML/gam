@@ -67,7 +67,6 @@ pub(crate) fn evaluate_splines_at_point_full_support_into(
     scratch.all_prev.resize(zero_degree_len, 0.0);
     scratch.all_prev.fill(0.0);
 
-    let span_floor = knot_span_degeneracy_floor(knots);
     let last_knot = knots[num_knots - 1];
     for i in 0..zero_degree_len {
         if (knots[i] <= x && x < knots[i + 1]) || (x == last_knot && i + 1 == zero_degree_len) {
@@ -87,14 +86,14 @@ pub(crate) fn evaluate_splines_at_point_full_support_into(
 
         for i in 0..level_len {
             let denom_left = knots[i + d] - knots[i];
-            let left = if denom_left.abs() > span_floor {
+            let left = if !knot_span_is_degenerate(denom_left) {
                 ((x - knots[i]) / denom_left) * scratch.all_prev[i]
             } else {
                 0.0
             };
 
             let denom_right = knots[i + d + 1] - knots[i + 1];
-            let right = if denom_right.abs() > span_floor {
+            let right = if !knot_span_is_degenerate(denom_right) {
                 ((knots[i + d + 1] - x) / denom_right) * scratch.all_prev[i + 1]
             } else {
                 0.0
@@ -198,9 +197,6 @@ pub(super) fn generate_full_knot_vector_quantile(
     if minval == maxval {
         return Err(BasisError::DegenerateRange(num_internal_knots));
     }
-    let scale = (maxval - minval).abs().max(1.0);
-    let tol = 1e-12 * scale;
-
     let total_knots = num_internal_knots + 2 * (degree + 1);
     let mut knots = Vec::with_capacity(total_knots);
     for _ in 0..=degree {
@@ -211,7 +207,7 @@ pub(super) fn generate_full_knot_vector_quantile(
         let mut support = Vec::with_capacity(sorted.len());
         let mut last: Option<f64> = None;
         for &x in &sorted {
-            if x <= minval + tol || x >= maxval - tol {
+            if x <= minval || x >= maxval {
                 continue;
             }
             if last.map(|prev| (x - prev).abs() <= tol).unwrap_or(false) {
@@ -318,7 +314,6 @@ pub(crate) fn evaluate_spline_local_values(
         }
     };
 
-    let span_floor = knot_span_degeneracy_floor(knots);
     let left = &mut scratch.left;
     let right = &mut scratch.right;
     let n = &mut scratch.n;
@@ -332,7 +327,7 @@ pub(crate) fn evaluate_spline_local_values(
         let mut saved = 0.0;
         for r in 0..d {
             let den = right[r + 1] + left[d - r];
-            let temp = if den.abs() > span_floor { n[r] / den } else { 0.0 };
+            let temp = if !knot_span_is_degenerate(den) { n[r] / den } else { 0.0 };
             n[r] = saved + right[r + 1] * temp;
             saved = left[d - r] * temp;
         }
@@ -438,8 +433,12 @@ pub(super) fn cumulative_bspline_offsets_into(
 }
 
 #[cfg(test)]
-mod degeneracy_floor_tests {
+mod knot_scale_invariance_tests {
     use super::*;
+    use crate::basis::{
+        create_difference_penalty_matrix, evaluate_bspline_derivative_scalar,
+        evaluate_bsplinesecond_derivative_scalar,
+    };
     use ndarray::Array1;
 
     /// Clamped cubic knot vector with interior knots at `frac * scale` for
@@ -476,8 +475,8 @@ mod degeneracy_floor_tests {
     /// on a small-magnitude domain exactly as it does at unit scale. The old
     /// *absolute* `1e-12` knot-span floor zeroed legitimate distinct-but-small
     /// spans once the domain shrank below it, collapsing whole basis rows to
-    /// zero. With the relative floor the basis values are invariant to a uniform
-    /// rescaling of the knots and the evaluation point.
+    /// zero. Exact repeated-knot detection leaves every distinct span live, so
+    /// the basis values are invariant to a uniform rescaling of knots and x.
     #[test]
     fn bspline_partition_of_unity_is_scale_invariant() {
         let degree = 3;
@@ -491,8 +490,8 @@ mod degeneracy_floor_tests {
         // Tiny-scale domain (magnitude 1e-12): the smallest distinct knot span
         // here is 0.2e-12 = 2e-13, well below the old absolute 1e-12 floor, so
         // the pre-fix recurrence zeroed its de Boor terms and the row sums
-        // collapsed. The relative floor (1e-12 * extent = 1e-24) leaves every
-        // span live, so the sums stay 1.
+        // collapsed. Structural equality leaves every distinct span live, so
+        // the sums stay 1.
         let scale = 1e-12;
         let tiny_knots = clamped_cubic_knots(scale);
         for &frac in &[0.05, 0.3, 0.55, 0.72, 0.95] {
@@ -502,6 +501,52 @@ mod degeneracy_floor_tests {
                 "scale-invariance broken: partition sum {s} != 1 at x={} (scale {scale})",
                 frac * scale
             );
+        }
+    }
+
+    #[test]
+    fn bspline_derivatives_transform_covariantly_under_coordinate_scaling() {
+        let degree = 3;
+        let scale = 1e-12;
+        let knots = clamped_cubic_knots(1.0);
+        let tiny_knots = clamped_cubic_knots(scale);
+        let num_basis = knots.len() - degree - 1;
+        let mut d1 = vec![0.0; num_basis];
+        let mut d1_tiny = vec![0.0; num_basis];
+        let mut d2 = vec![0.0; num_basis];
+        let mut d2_tiny = vec![0.0; num_basis];
+        evaluate_bspline_derivative_scalar(0.37, knots.view(), degree, &mut d1).unwrap();
+        evaluate_bspline_derivative_scalar(
+            0.37 * scale,
+            tiny_knots.view(),
+            degree,
+            &mut d1_tiny,
+        )
+        .unwrap();
+        evaluate_bsplinesecond_derivative_scalar(0.37, knots.view(), degree, &mut d2).unwrap();
+        evaluate_bsplinesecond_derivative_scalar(
+            0.37 * scale,
+            tiny_knots.view(),
+            degree,
+            &mut d2_tiny,
+        )
+        .unwrap();
+
+        for i in 0..num_basis {
+            assert!((d1_tiny[i] * scale - d1[i]).abs() < 1e-10);
+            assert!((d2_tiny[i] * scale * scale - d2[i]).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn divided_difference_penalty_is_invariant_on_tiny_coordinate_domains() {
+        let unit = Array1::from(vec![0.0, 0.1, 0.35, 0.7, 1.0]);
+        let scale = 1e-14;
+        let tiny = unit.mapv(|x| x * scale);
+        let reference = create_difference_penalty_matrix(5, 2, Some(unit.view())).unwrap();
+        let observed = create_difference_penalty_matrix(5, 2, Some(tiny.view())).unwrap();
+        for (&left, &right) in reference.iter().zip(observed.iter()) {
+            assert!((left - right).abs() < 1e-10);
         }
     }
 
