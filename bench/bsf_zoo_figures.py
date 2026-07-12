@@ -40,7 +40,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from bench.manifold_zoo_geometry import first_coordinate_hue
+from bench.manifold_zoo_geometry import first_coordinate_hue, validate_analytic_sample
 
 SURFACE = "#fcfcfb"
 INK = "#0b0b0b"
@@ -282,11 +282,14 @@ def _atlas_cloud_records(
             if matched_atom in matched_atoms:
                 raise ValueError(f"joint cloud file reuses learned atom {matched_atom}")
             matched_atoms.add(matched_atom)
+            truth = np.asarray(store[f"true_{index}"], dtype=float)
+            theta = np.asarray(store[f"theta_{index}"], dtype=float)
+            validate_analytic_sample(kind, truth, theta)
             records[kind] = {
                 "path": path,
-                "true": np.asarray(store[f"true_{index}"], dtype=float),
+                "true": truth,
                 "recovered": np.asarray(store[f"rec_{index}"], dtype=float),
-                "theta": np.asarray(store[f"theta_{index}"], dtype=float),
+                "theta": theta,
                 "r2": float(factor["r2"]),
             }
     missing = [kind for kind in ATLAS_KINDS if kind not in records]

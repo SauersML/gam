@@ -645,12 +645,16 @@ def dump_clouds(
         recovered_local = m_hat @ factor.frame.T
         recovered_native = recovered_local * factor.sigma + factor.mu[None, :]
         validate_analytic_sample(p["kind"], true_native, contribs[i]["theta"][take])
-        payload[f"true_{i}"] = true_native.astype(np.float32)
-        payload[f"rec_{i}"] = recovered_native.astype(np.float32)
-        payload[f"theta_{i}"] = contribs[i]["theta"][take].astype(np.float32)
+        payload[f"true_{i}"] = np.ascontiguousarray(true_native, dtype=np.float64)
+        payload[f"rec_{i}"] = np.ascontiguousarray(recovered_native, dtype=np.float64)
+        payload[f"theta_{i}"] = np.ascontiguousarray(
+            contribs[i]["theta"][take], dtype=np.float64
+        )
         if fitted.atom_intrinsic_coords is not None and not isinstance(p["matched_atom"], list):
             coords = fitted.atom_intrinsic_coords(int(p["matched_atom"]))
-            payload[f"learned_theta_{i}"] = np.asarray(coords)[rows][take].astype(np.float32)
+            payload[f"learned_theta_{i}"] = np.ascontiguousarray(
+                np.asarray(coords)[rows][take], dtype=np.float64
+            )
         meta.append(
             {
                 "factor": i,
