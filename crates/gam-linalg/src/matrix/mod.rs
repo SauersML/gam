@@ -27,7 +27,6 @@ const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
 /// solve. Near `f64` precision: large enough to lift an exactly-singular system
 /// off zero so the factorization succeeds, small enough not to bias a
 /// well-conditioned solve. Acts as a floor on any caller-supplied `ridge_floor`.
-const SPD_SOLVE_RIDGE_FLOOR: f64 = 1e-15;
 const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
 const CHUNKED_DENSE_MATERIALIZATION_BYTES: usize = 8 * 1024 * 1024;
 const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
@@ -4043,70 +4042,43 @@ pub trait LinearOperator {
             weights,
             self.nrows(),
         )?;
-        for retry in 0..8 {
-            let ridge = if baseridge > 0.0 {
-                baseridge * 10f64.powi(retry)
-            } else {
-                0.0
-            };
-            let normal_op = PenalizedWeightedNormalOperator {
-                operator: self,
-                weights,
-                finite_weights,
-                penalty,
-                ridge,
-            };
-            let preconditioner = normal_op.jacobi_preconditioner()?;
-            let attempt_started = std::time::Instant::now();
-            let solved = crate::utils::solve_spd_pcg_with_info(
-                |v| normal_op.apply(v),
-                rhs,
-                &preconditioner,
-                MATRIX_FREE_PCG_REL_TOL,
-                MATRIX_FREE_PCG_MAX_ITER.max(4 * p),
-            );
-            let elapsed = attempt_started.elapsed().as_secs_f64();
-            // Progress diagnostics for the matrix-free inner solve. The happy
-            // path (retry==0, converged) logs at debug to stay quiet inside the
-            // inner-Newton loop; any ridge escalation — the trust-region-retry
-            // analog and a strong signal that the operator is ill-conditioned —
-            // logs at info so a slow fit shows whether time is going into CG
-            // iterations, repeated HVPs, or escalation churn.
-            match solved {
-                Some((solution, info)) if solution.iter().all(|v| v.is_finite()) => {
-                    if retry > 0 {
-                        log::info!(
-                            "[matrix-free PCG] converged after ridge escalation: p={p} retry={retry} ridge={ridge:.3e} iters={} converged={} rel_resid={:.3e} elapsed={elapsed:.3}s",
-                            info.iterations,
-                            info.converged,
-                            info.relative_residual_norm,
-                        );
-                    } else {
-                        log::debug!(
-                            "[matrix-free PCG] solved: p={p} iters={} converged={} rel_resid={:.3e} elapsed={elapsed:.3}s",
-                            info.iterations,
-                            info.converged,
-                            info.relative_residual_norm,
-                        );
-                    }
-                    return Ok((solution, info));
-                }
-                Some((_, info)) => {
-                    log::info!(
-                        "[matrix-free PCG] non-finite solution, escalating ridge: p={p} retry={retry} ridge={ridge:.3e} iters={} converged={} rel_resid={:.3e} elapsed={elapsed:.3}s",
-                        info.iterations,
-                        info.converged,
-                        info.relative_residual_norm,
-                    );
-                }
-                None => {
-                    log::info!(
-                        "[matrix-free PCG] CG breakdown (non-SPD/NaN), escalating ridge: p={p} retry={retry} ridge={ridge:.3e} elapsed={elapsed:.3}s",
-                    );
-                }
-            }
+        if !(baseridge.is_finite() && baseridge >= 0.0) {
+            return Err(format!(
+                "matrix-free PCG ridge must be finite and non-negative, got {baseridge:?}"
+            ));
         }
-        Err("matrix-free PCG failed after ridge retries".to_string())
+        let normal_op = PenalizedWeightedNormalOperator {
+            operator: self,
+            weights,
+            finite_weights,
+            penalty,
+            ridge: baseridge,
+        };
+        let preconditioner = normal_op.jacobi_preconditioner()?;
+        let attempt_started = std::time::Instant::now();
+        let (solution, info) = crate::utils::solve_spd_pcg_with_info(
+            |v| normal_op.apply(v),
+            rhs,
+            &preconditioner,
+            MATRIX_FREE_PCG_REL_TOL,
+            MATRIX_FREE_PCG_MAX_ITER.max(4 * p),
+        )
+        .ok_or_else(|| {
+            format!(
+                "matrix-free PCG broke down for explicitly requested ridge {baseridge:.3e}"
+            )
+        })?;
+        if !solution.iter().all(|value| value.is_finite()) {
+            return Err("matrix-free PCG produced a non-finite solution".to_string());
+        }
+        log::debug!(
+            "[matrix-free PCG] solved: p={p} ridge={baseridge:.3e} iters={} converged={} rel_resid={:.3e} elapsed={:.3}s",
+            info.iterations,
+            info.converged,
+            info.relative_residual_norm,
+            attempt_started.elapsed().as_secs_f64(),
+        );
+        Ok((solution, info))
     }
     fn factorize_system(
         &self,
@@ -4141,7 +4113,7 @@ pub trait LinearOperator {
             weights,
             rhs,
             penalty,
-            SPD_SOLVE_RIDGE_FLOOR,
+            0.0,
             RidgePolicy::solver_only(),
         )
     }
@@ -4165,16 +4137,13 @@ pub trait LinearOperator {
                 "solve_systemwith_policy ridge floor must be finite and non-negative, got {ridge_floor:?}"
             ));
         }
-        let baseridge = ridge_floor.max(SPD_SOLVE_RIDGE_FLOOR);
-        // Try matrix-free PCG first to avoid assembling the dense p×p normal matrix.
-        if self.uses_matrix_free_pcg()
-            && self.ncols() >= MATRIX_FREE_PCG_MIN_P
-            && let Ok(solution) =
-                self.solve_system_matrix_free_pcg_try(weights, rhs, penalty, baseridge)
-        {
-            return Ok(solution);
+        let ridge = ridge_floor;
+        // The size policy selects exactly one algorithm. A failed matrix-free
+        // solve is surfaced; silently switching algorithms or escalating ridge
+        // would change both performance and the solved system.
+        if self.uses_matrix_free_pcg() && self.ncols() >= MATRIX_FREE_PCG_MIN_P {
+            return self.solve_system_matrix_free_pcg_try(weights, rhs, penalty, ridge);
         }
-        // Fallback: assemble dense system and solve via Cholesky with ridge retries.
         let mut system = self.diag_xtw_x(weights)?;
         if let Some(pen) = penalty {
             if pen.nrows() != system.nrows() || pen.ncols() != system.ncols() {
@@ -4188,9 +4157,26 @@ pub trait LinearOperator {
             }
             system += pen;
         }
-        crate::utils::StableSolver::new("linear operator system")
-            .solvevectorwithridge_retries(&system, rhs, baseridge)
-            .ok_or_else(|| "solve_systemwith_policy failed after ridge retries".to_string())
+        if ridge > 0.0 {
+            for diagonal in 0..system.nrows() {
+                system[[diagonal, diagonal]] += ridge;
+            }
+        }
+        let factor = crate::utils::StableSolver::new("linear operator system")
+            .factorize(&system)
+            .map_err(|error| {
+                format!(
+                    "solve_systemwith_policy ({ridge_policy:?}) exact factorization failed at ridge {ridge:.3e}: {error:?}"
+                )
+            })?;
+        let mut solution = rhs.clone();
+        let mut solution_matrix = crate::faer_ndarray::array1_to_col_matmut(&mut solution);
+        factor.solve_in_place(solution_matrix.as_mut());
+        if solution.iter().all(|value| value.is_finite()) {
+            Ok(solution)
+        } else {
+            Err("solve_systemwith_policy produced a non-finite solution".to_string())
+        }
     }
 }
 
@@ -6023,7 +6009,7 @@ impl DesignMatrix {
             weights,
             rhs,
             penalty,
-            ridge_floor.max(SPD_SOLVE_RIDGE_FLOOR),
+            ridge_floor,
         )
     }
 
@@ -6039,7 +6025,7 @@ impl DesignMatrix {
             weights,
             rhs,
             penalty,
-            ridge_floor.max(SPD_SOLVE_RIDGE_FLOOR),
+            ridge_floor,
         )
     }
 

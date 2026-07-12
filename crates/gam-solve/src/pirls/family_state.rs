@@ -374,7 +374,7 @@ pub(crate) fn valid_negbin_theta(theta: f64) -> bool {
 
 #[inline]
 pub(crate) fn valid_count_response(y: f64) -> bool {
-    y.is_finite() && y >= 0.0 && (y - y.round()).abs() <= 1e-9
+    y.is_finite() && y >= 0.0 && y == y.round()
 }
 
 pub(crate) fn validate_count_responses(

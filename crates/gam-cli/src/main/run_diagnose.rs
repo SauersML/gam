@@ -273,11 +273,23 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         ]));
         summary.add_row(Row::from(vec![
             Cell::new("edf (corrected, WPS)"),
-            Cell::new(format!("{:.4}", comparison.edf.corrected)),
+            Cell::new(
+                comparison
+                    .edf
+                    .corrected
+                    .map(|value| format!("{value:.4}"))
+                    .unwrap_or_else(|| "n/a".to_string()),
+            ),
         ]));
         summary.add_row(Row::from(vec![
             Cell::new("rho-uncertainty df"),
-            Cell::new(format!("{:.4}", comparison.edf.rho_uncertainty_df())),
+            Cell::new(
+                comparison
+                    .edf
+                    .rho_uncertainty_df()
+                    .map(|value| format!("{value:.4}"))
+                    .unwrap_or_else(|| "n/a".to_string()),
+            ),
         ]));
         summary.add_row(Row::from(vec![
             Cell::new("AIC (conditional)"),
@@ -285,7 +297,12 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         ]));
         summary.add_row(Row::from(vec![
             Cell::new("AIC (corrected)"),
-            Cell::new(format!("{:.4}", comparison.aic_corrected)),
+            Cell::new(
+                comparison
+                    .aic_corrected
+                    .map(|value| format!("{value:.4}"))
+                    .unwrap_or_else(|| "n/a".to_string()),
+            ),
         ]));
         if let Some(loo) = comparison.loo.as_ref() {
             let se = loo

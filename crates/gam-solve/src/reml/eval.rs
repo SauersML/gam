@@ -72,6 +72,12 @@ pub enum SmoothingCorrectionOutcome {
         reason: &'static str,
         severity: SmoothingCorrectionFallbackSeverity,
     },
+    /// Exact first-order geometry was unavailable. The typed reason is
+    /// preserved instead of presenting a missing matrix as a routine skip.
+    Unavailable {
+        reason: SmoothingCorrectionUnavailable,
+        rho_covariance: Option<Array2<f64>>,
+    },
 }
 
 impl SmoothingCorrectionOutcome {
@@ -84,6 +90,7 @@ impl SmoothingCorrectionOutcome {
         match self {
             SmoothingCorrectionOutcome::Cubature { correction, .. } => Some(correction),
             SmoothingCorrectionOutcome::FirstOrder { correction, .. } => correction,
+            SmoothingCorrectionOutcome::Unavailable { .. } => None,
         }
     }
 
@@ -93,7 +100,8 @@ impl SmoothingCorrectionOutcome {
     pub fn rho_covariance(&self) -> Option<&Array2<f64>> {
         match self {
             SmoothingCorrectionOutcome::Cubature { rho_covariance, .. }
-            | SmoothingCorrectionOutcome::FirstOrder { rho_covariance, .. } => {
+            | SmoothingCorrectionOutcome::FirstOrder { rho_covariance, .. }
+            | SmoothingCorrectionOutcome::Unavailable { rho_covariance, .. } => {
                 rho_covariance.as_ref()
             }
         }
@@ -103,6 +111,7 @@ impl SmoothingCorrectionOutcome {
     pub fn branch_label(&self) -> &'static str {
         match self {
             SmoothingCorrectionOutcome::Cubature { .. } => "cubature",
+            SmoothingCorrectionOutcome::Unavailable { .. } => "unavailable",
             SmoothingCorrectionOutcome::FirstOrder { severity, .. } => match severity {
                 SmoothingCorrectionFallbackSeverity::Routine => "first-order (routine)",
                 SmoothingCorrectionFallbackSeverity::NumericalFailure => {
@@ -283,19 +292,21 @@ pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
         });
     }
 
-    // Gamma dispersion shape is required only by the Gamma row kernel. The
-    // current GPU ABI carries a scalar slot for every family, so non-Gamma
-    // admissions use its documented inert value after their own scale contract
-    // has been validated; Gamma can no longer silently inherit that value.
-    let gamma_shape = match likelihood_spec.spec.response {
-        ResponseFamily::Gamma => likelihood_spec
-            .resolved_gamma_shape()
-            .map_err(|error| gam_gpu::gpu_err!("sigma Gamma scale: {error}"))?,
+    // Carry the row-kernel scalar as a typed family contract. Non-Gamma
+    // admissions have no synthetic shape value; the final CUDA ABI receives a
+    // poison value only after matching the discriminant against the row family.
+    let likelihood_scale = match likelihood_spec.spec.response {
+        ResponseFamily::Gamma => crate::gpu::pirls_gpu::PirlsLoopLikelihoodScale::gamma_shape(
+            likelihood_spec
+                .resolved_gamma_shape()
+                .map_err(|error| gam_gpu::gpu_err!("sigma Gamma scale: {error}"))?,
+        )
+        .map_err(|error| gam_gpu::gpu_err!("sigma Gamma scale: {error}"))?,
         _ => {
             likelihood_spec
                 .resolved_scale()
                 .map_err(|error| gam_gpu::gpu_err!("sigma likelihood scale: {error}"))?;
-            1.0
+            crate::gpu::pirls_gpu::PirlsLoopLikelihoodScale::non_gamma()
         }
     };
 
@@ -306,7 +317,7 @@ pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
         state.offset.view(),
         &per_sigma,
         admission,
-        gamma_shape,
+        likelihood_scale,
         state.config.pirls_convergence_tolerance,
         state.config.max_iterations,
     )
@@ -678,6 +689,12 @@ impl<'a> RemlState<'a> {
             super::compute_smoothing_correction(self, final_rho, final_lambdas, final_fit);
         let first_order_correction = first_order.correction.clone();
         let first_order_rho_covariance = first_order.rho_covariance.clone();
+        if let SmoothingCorrectionStatus::Unavailable(reason) = first_order.status.clone() {
+            return self.finalize_smoothing_outcome(SmoothingCorrectionOutcome::Unavailable {
+                reason,
+                rho_covariance: first_order_rho_covariance,
+            });
+        }
         let first_order_routine = |correction: Option<Array2<f64>>, reason: &'static str| {
             SmoothingCorrectionOutcome::FirstOrder {
                 correction,
@@ -1076,6 +1093,13 @@ impl<'a> RemlState<'a> {
                         );
                     }
                 }
+            }
+            SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
+                SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+                log::warn!(
+                    "[smoothing-correction] branch=unavailable reason={reason:?} failure_count={}",
+                    SMOOTHING_CORRECTION_NUMERICAL_FAILURE_COUNT.load(Ordering::Relaxed),
+                );
             }
         }
         Ok(outcome)

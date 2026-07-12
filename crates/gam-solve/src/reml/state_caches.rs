@@ -1548,7 +1548,7 @@ pub(crate) fn reml_fixed_glm_dispersion(
                 "profiled Gaussian has no fixed REML dispersion".to_string(),
             ));
         }
-        Scale::NoScalarScale => {
+        Scale::Unspecified => {
             return Err(EstimationError::InvalidInput(
                 "family has no scalar GLM dispersion".to_string(),
             ));

@@ -91,7 +91,7 @@ pub fn dispersion_from_likelihood(
                 known(beta_dispersion)
             }
         }
-        Scale::NoScalarScale => Err(invalid(
+        Scale::Unspecified => Err(invalid(
             "Royston-Parmar has no GLM scalar response dispersion".to_string(),
         )),
     }

@@ -177,7 +177,7 @@ pub(crate) fn fixed_glm_dispersion(
         // Beta precision is already inside its variance/Fisher geometry; it is
         // not an exponential-dispersion phi multiplier.
         Scale::BetaPrecision { .. } => Ok(1.0),
-        Scale::NoScalarScale => Err(EstimationError::InvalidInput(
+        Scale::Unspecified => Err(EstimationError::InvalidInput(
             "family has no fixed GLM dispersion".to_string(),
         )),
     }

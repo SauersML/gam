@@ -300,11 +300,24 @@ mod linux_impl {
             .map_err(EstimationError::InvalidInput)?;
 
         let lm_ridge = input.initial_lm_lambda.unwrap_or(1e-6);
-        // Forward the active Gamma shape so the GammaLog kernel uses the
-        // correct dispersion. Defaults to 1.0 (unit-shape Gamma / Poisson
-        // analogue) when the spec does not carry an explicit shape — this
-        // matches the CPU PIRLS path's `gamma_shape().unwrap_or(1.0)` fallback.
-        let gamma_shape = input.likelihood.gamma_shape().unwrap_or(1.0);
+        let likelihood_scale = match family {
+            PirlsRowFamily::GammaLog => pirls_gpu::PirlsLoopLikelihoodScale::gamma_shape(
+                input
+                    .likelihood
+                    .resolved_gamma_shape()
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,
+            )
+            .map_err(EstimationError::InvalidInput)?,
+            _ => {
+                // Validate family and metadata even though these kernels have
+                // no scalar likelihood parameter in their ABI contract.
+                input
+                    .likelihood
+                    .resolved_scale()
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+                pirls_gpu::PirlsLoopLikelihoodScale::non_gamma()
+            }
+        };
         let qs_view = input.qs;
         let firth_default = FirthDiagnostics::Inactive;
         // Sanity-check that the host-side enum maps round-trip; if a future
@@ -338,7 +351,7 @@ mod linux_impl {
             &mut loop_ws,
             family,
             curvature,
-            gamma_shape,
+            likelihood_scale,
             input.initial_beta,
             input.s_transformed,
             input.linear_shift,

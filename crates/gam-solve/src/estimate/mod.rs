@@ -98,7 +98,8 @@ pub(crate) use prefit::validate_penalty_specs;
 pub(crate) use smoothing_correction::{
     AUTO_CUBATURE_BOUNDARY_MARGIN, AUTO_CUBATURE_MAX_BETA_DIM, AUTO_CUBATURE_MAX_EIGENVECTORS,
     AUTO_CUBATURE_MAX_RHO_DIM, AUTO_CUBATURE_TARGET_VAR_FRAC, RHO_SOFT_PRIOR_SHARPNESS,
-    RHO_SOFT_PRIOR_WEIGHT, RemlConfig, compute_smoothing_correction, smooth_floor_dp,
+    RHO_SOFT_PRIOR_WEIGHT, RemlConfig, SmoothingCorrectionStatus,
+    SmoothingCorrectionUnavailable, compute_smoothing_correction, smooth_floor_dp,
 };
 // #1521 carve: the spatial-optimization driver reads the unified rho bound as
 // `gam_solve::estimate::RHO_BOUND`.

@@ -57,32 +57,39 @@ pub struct AloElpd {
 pub struct CorrectedEdf {
     /// `tr(F)` with `F = H⁻¹X'WX`, conditional on `λ̂`.
     pub conditional: f64,
-    /// `τ = tr(F) + tr(X'WX · Σ_ρ)`, the exact WPS corrected EDF. Equals
-    /// [`Self::conditional`] when no smoothing correction is available (e.g.
-    /// `K = 0`, or the post-fit IFT solve was skipped).
-    pub corrected: f64,
+    /// `τ = tr(F) + tr(X'WX · Σ_ρ)`, when its exact inputs were retained.
+    pub corrected: Option<f64>,
+    /// Typed provenance for an unavailable correction. `None` means either the
+    /// correction is available or `K=0` proved it is exactly zero.
+    pub unavailable_reason: Option<CorrectedEdfUnavailable>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrectedEdfUnavailable {
+    MissingWeightedGram,
+    MissingSmoothingCorrection,
+    MissingCovarianceScale,
 }
 
 impl CorrectedEdf {
     /// The per-fit measurement the issue calls out: how much λ-uncertainty is
     /// inflating the user's model-choice complexity penalty, `τ − tr(F)`.
-    pub fn rho_uncertainty_df(&self) -> f64 {
-        self.corrected - self.conditional
+    pub fn rho_uncertainty_df(&self) -> Option<f64> {
+        self.corrected.map(|value| value - self.conditional)
     }
 }
 
 /// The full comparison payload reported alongside a fit's evidence headline.
 #[derive(Debug, Clone)]
 pub struct ModelComparison {
-    /// Log-likelihood at the converged mode (the engine's
-    /// constants-omitted value — see note on cross-fit comparability below).
+    /// Fully normalized log-likelihood at the converged mode.
     pub log_lik: f64,
     /// Conditional and WPS-corrected effective degrees of freedom.
     pub edf: CorrectedEdf,
     /// `−2·ℓ + 2·edf_conditional` (treats `λ̂` as known).
     pub aic_conditional: f64,
     /// `−2·ℓ + 2·edf_corrected` (Wood–Pya–Säfken).
-    pub aic_corrected: f64,
+    pub aic_corrected: Option<f64>,
     /// Zero-refit ALO predictive comparison, when ALO diagnostics and the per-row
     /// family kernel are available.
     pub loo: Option<AloElpd>,
@@ -107,13 +114,54 @@ pub fn corrected_edf(
     edf_conditional: f64,
     weighted_gram: Option<ArrayView2<'_, f64>>,
     smoothing_correction: Option<ArrayView2<'_, f64>>,
-    phi: f64,
-) -> CorrectedEdf {
-    let correction = wps_correction_term(weighted_gram, smoothing_correction, phi);
-    CorrectedEdf {
-        conditional: edf_conditional,
-        corrected: edf_conditional + correction,
+    covariance_scale: Option<f64>,
+    smoothing_dimension: usize,
+) -> Result<CorrectedEdf, EstimationError> {
+    if !edf_conditional.is_finite() || edf_conditional < 0.0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "conditional EDF must be finite and non-negative; got {edf_conditional}"
+        )));
     }
+    if smoothing_dimension == 0 {
+        return Ok(CorrectedEdf {
+            conditional: edf_conditional,
+            corrected: Some(edf_conditional),
+            unavailable_reason: None,
+        });
+    }
+    let Some(xwx) = weighted_gram else {
+        return Ok(CorrectedEdf {
+            conditional: edf_conditional,
+            corrected: None,
+            unavailable_reason: Some(CorrectedEdfUnavailable::MissingWeightedGram),
+        });
+    };
+    let Some(correction) = smoothing_correction else {
+        return Ok(CorrectedEdf {
+            conditional: edf_conditional,
+            corrected: None,
+            unavailable_reason: Some(CorrectedEdfUnavailable::MissingSmoothingCorrection),
+        });
+    };
+    let Some(scale) = covariance_scale else {
+        return Ok(CorrectedEdf {
+            conditional: edf_conditional,
+            corrected: None,
+            unavailable_reason: Some(CorrectedEdfUnavailable::MissingCovarianceScale),
+        });
+    };
+    let extra = wps_correction_term(xwx, correction, scale)?;
+    let corrected = edf_conditional + extra;
+    if !corrected.is_finite() {
+        return Err(EstimationError::InvalidInput(
+            "corrected EDF is outside f64 range".into(),
+        ));
+    }
+    Ok(CorrectedEdf {
+        conditional: edf_conditional,
+        corrected: Some(corrected),
+        unavailable_reason: None,
+    })
 }
 
 /// `tr(X'WX · Σ_ρ)` with `Σ_ρ = smoothing_correction / φ` and `X'WX` the
@@ -121,32 +169,70 @@ pub fn corrected_edf(
 /// non-square, dimension-mismatched, or non-finite. Nonnegative by
 /// construction (both factors are symmetric PSD).
 fn wps_correction_term(
-    weighted_gram: Option<ArrayView2<'_, f64>>,
-    smoothing_correction: Option<ArrayView2<'_, f64>>,
-    phi: f64,
-) -> f64 {
-    let (Some(xwx), Some(corr)) = (weighted_gram, smoothing_correction) else {
-        return 0.0;
-    };
+    xwx: ArrayView2<'_, f64>,
+    corr: ArrayView2<'_, f64>,
+    covariance_scale: f64,
+) -> Result<f64, EstimationError> {
     let k = xwx.nrows();
-    if k == 0
-        || xwx.ncols() != k
+    if k == 0 || xwx.ncols() != k
         || corr.nrows() != k
         || corr.ncols() != k
-        || !(phi.is_finite() && phi > 0.0)
     {
-        return 0.0;
+        return Err(EstimationError::InvalidInput(format!(
+            "WPS correction dimension mismatch: XWX={:?}, correction={:?}",
+            xwx.dim(),
+            corr.dim()
+        )));
     }
-    // tr(X'WX · corr/φ) = (1/φ) Σ_{ij} X'WX_{ij} corr_{ji}; both symmetric, so
-    // this is the nonnegative tr(A^½ B A^½).
-    let mut trace = 0.0;
+    if !(covariance_scale.is_finite() && covariance_scale > 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "WPS coefficient covariance scale must be finite and positive; got {covariance_scale}"
+        )));
+    }
+    let max_x = xwx.iter().copied().map(f64::abs).fold(0.0, f64::max);
+    let max_c = corr.iter().copied().map(f64::abs).fold(0.0, f64::max);
+    if !max_x.is_finite() || !max_c.is_finite() {
+        return Err(EstimationError::InvalidInput(
+            "WPS inputs contain a non-finite matrix entry".into(),
+        ));
+    }
+    if max_x == 0.0 || max_c == 0.0 {
+        return Ok(0.0);
+    }
+    let mut normalized_terms = Vec::with_capacity(k * k);
     for i in 0..k {
         for j in 0..k {
-            trace += xwx[[i, j]] * corr[[j, i]];
+            normalized_terms.push((xwx[[i, j]] / max_x) * (corr[[j, i]] / max_c));
         }
     }
-    trace /= phi;
-    if trace.is_finite() { trace } else { 0.0 }
+    let mut normalized = gam_solve::pirls::stable_finite_signed_sum(
+        &normalized_terms,
+        "WPS normalized trace",
+    )?;
+    let absolute_sum: f64 = normalized_terms.iter().map(|value| value.abs()).sum();
+    let operations = normalized_terms.len() as f64;
+    let roundoff = operations * f64::EPSILON * absolute_sum;
+    if normalized < 0.0 {
+        if normalized >= -roundoff {
+            normalized = 0.0;
+        } else {
+            return Err(EstimationError::InvalidInput(format!(
+                "WPS PSD trace is negative beyond roundoff: normalized={normalized}, bound={roundoff}"
+            )));
+        }
+    }
+    if normalized == 0.0 {
+        return Ok(0.0);
+    }
+    let log_value = normalized.ln() + max_x.ln() + max_c.ln() - covariance_scale.ln();
+    let value = log_value.exp();
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(EstimationError::InvalidInput(
+            "WPS correction is outside f64 range".into(),
+        ))
+    }
 }
 
 /// ALO elpd from ALO-corrected leave-one-out predictions.
@@ -280,12 +366,12 @@ fn alo_elpd_with_total(
 #[derive(Debug, Clone)]
 pub struct ComparisonReport {
     /// `Σᵢ (elpd_aᵢ − elpd_bᵢ)`; positive favours `a`.
-    pub delta_elpd: f64,
+    pub delta_elpd: Option<f64>,
     /// SE of `delta_elpd` from the pointwise paired differences,
     /// `√(n · Var(elpd_aᵢ − elpd_bᵢ))`.
-    pub delta_elpd_se: f64,
+    pub delta_elpd_se: Option<f64>,
     /// `AIC_corrected(a) − AIC_corrected(b)`; negative favours `a`.
-    pub delta_aic_corrected: f64,
+    pub delta_aic_corrected: Option<f64>,
     /// `false` when the two fits have a different number of observations and the
     /// paired predictive difference could not be formed; `delta_elpd` is then
     /// `NaN` and only the AIC gap is meaningful.
@@ -296,36 +382,86 @@ pub struct ComparisonReport {
 /// row-by-row, so the two fits must have been computed on
 /// the same response in the same order; we refuse the paired difference when the
 /// observation counts disagree and surface only the AIC gap.
-pub fn compare(a: &ModelComparison, b: &ModelComparison) -> ComparisonReport {
-    let delta_aic_corrected = a.aic_corrected - b.aic_corrected;
+pub fn compare(
+    a: &ModelComparison,
+    b: &ModelComparison,
+) -> Result<ComparisonReport, EstimationError> {
+    let delta_aic_corrected = match (a.aic_corrected, b.aic_corrected) {
+        (Some(left), Some(right)) => {
+            let difference = left - right;
+            if !difference.is_finite() {
+                return Err(EstimationError::InvalidInput(
+                    "corrected-AIC difference is outside f64 range".into(),
+                ));
+            }
+            Some(difference)
+        }
+        _ => None,
+    };
     match (&a.loo, &b.loo) {
         (Some(la), Some(lb))
             if la.pointwise.len() == lb.pointwise.len() && !la.pointwise.is_empty() =>
         {
             let n = la.pointwise.len();
-            let diff: Array1<f64> = &la.pointwise - &lb.pointwise;
-            let delta_elpd: f64 = diff.iter().sum();
+            let mut diff = Array1::zeros(n);
+            for row in 0..n {
+                let value = la.pointwise[row] - lb.pointwise[row];
+                if !value.is_finite() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "paired elpd difference is outside f64 range at row {row}"
+                    )));
+                }
+                diff[row] = value;
+            }
+            let values: Vec<f64> = diff.iter().copied().collect();
+            let delta_elpd = gam_solve::pirls::stable_finite_signed_sum(
+                &values,
+                "paired elpd reduction",
+            )?;
             let mean = delta_elpd / n as f64;
             // Unbiased sample variance (n−1) of the paired differences; the SE
             // of the summed difference is √(n·s²).
-            let var = if n > 1 {
-                diff.iter().map(|&d| (d - mean) * (d - mean)).sum::<f64>() / (n - 1) as f64
+            let se = if n > 1 {
+                let max_deviation = diff
+                    .iter()
+                    .map(|&value| (value - mean).abs())
+                    .fold(0.0_f64, f64::max);
+                if max_deviation == 0.0 {
+                    Some(0.0)
+                } else {
+                    let scaled_sum_squares: f64 = diff
+                        .iter()
+                        .map(|&value| {
+                            let scaled = (value - mean) / max_deviation;
+                            scaled * scaled
+                        })
+                        .sum();
+                    let multiplier =
+                        (n as f64 * scaled_sum_squares / (n - 1) as f64).sqrt();
+                    let value = max_deviation * multiplier;
+                    if !value.is_finite() {
+                        return Err(EstimationError::InvalidInput(
+                            "paired elpd standard error is outside f64 range".into(),
+                        ));
+                    }
+                    Some(value)
+                }
             } else {
-                f64::NAN
+                None
             };
-            ComparisonReport {
-                delta_elpd,
-                delta_elpd_se: (n as f64 * var).sqrt(),
+            Ok(ComparisonReport {
+                delta_elpd: Some(delta_elpd),
+                delta_elpd_se: se,
                 delta_aic_corrected,
                 rows_aligned: true,
-            }
+            })
         }
-        _ => ComparisonReport {
-            delta_elpd: f64::NAN,
-            delta_elpd_se: f64::NAN,
+        _ => Ok(ComparisonReport {
+            delta_elpd: None,
+            delta_elpd_se: None,
             delta_aic_corrected,
             rows_aligned: false,
-        },
+        }),
     }
 }
 
@@ -348,13 +484,34 @@ pub fn model_comparison_from_unified(
     alo: Option<&AloDiagnostics>,
 ) -> Result<ModelComparison, EstimationError> {
     let phi = fit.dispersion_phi()?;
-    let edf_conditional = fit.edf_total().unwrap_or(f64::NAN);
+    let edf_conditional = fit.edf_total().ok_or_else(|| {
+        EstimationError::InvalidInput(
+            "model comparison requires a retained conditional EDF".into(),
+        )
+    })?;
+    let covariance_scale = fit
+        .likelihood_family
+        .as_ref()
+        .map(|spec| {
+            GlmLikelihoodSpec {
+                spec: spec.clone(),
+                scale: fit.likelihood_scale,
+            }
+            .coefficient_covariance_scale(phi)
+            .map_err(|error| {
+                EstimationError::InvalidInput(format!(
+                    "model-comparison coefficient covariance scale: {error}"
+                ))
+            })
+        })
+        .transpose()?;
     let edf = corrected_edf(
         edf_conditional,
         fit.weighted_gram().map(|g| g.view()),
         fit.smoothing_correction().map(|c| c.view()),
-        phi,
-    );
+        covariance_scale,
+        fit.log_lambdas.len(),
+    )?;
 
     // The user-facing `log_likelihood` (and the AIC / elpd derived from it) must
     // be the *fully normalized, scale-aware* absolute log-likelihood — not the
@@ -385,7 +542,9 @@ pub fn model_comparison_from_unified(
         .unwrap_or(0.0);
 
     let aic_conditional = -2.0 * log_lik + 2.0 * (edf.conditional + scale_dof);
-    let aic_corrected = -2.0 * log_lik + 2.0 * (edf.corrected + scale_dof);
+    let aic_corrected = edf
+        .corrected
+        .map(|corrected| -2.0 * log_lik + 2.0 * (corrected + scale_dof));
 
     let loo = match (alo, fit.likelihood_family.as_ref()) {
         (Some(alo), Some(spec)) => {

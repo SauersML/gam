@@ -114,7 +114,6 @@ fn pool_size(m: usize) -> usize {
 /// runtime), `Err(_)` on driver / shape failure.
 /// `x_original`: Original (pre-reparameterization) dense design matrix X_original, shape n × p.
 /// Uploaded to device once and reused across all sigma points.
-/// `gamma_shape`: Active Gamma dispersion shape (α > 0). Pass `1.0` for non-Gamma families.
 pub fn try_gpu_sigma_stream_pool_eval(
     x_original: ndarray::ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -122,7 +121,7 @@ pub fn try_gpu_sigma_stream_pool_eval(
     offset: ArrayView1<'_, f64>,
     per_sigma: &[SigmaPointGpuInput],
     admission: gam_gpu::policy::PirlsLoopAdmission,
-    gamma_shape: f64,
+    likelihood_scale: crate::gpu::pirls_gpu::PirlsLoopLikelihoodScale,
     convergence_tol: f64,
     max_iter: usize,
 ) -> Result<Option<Vec<(ndarray::Array2<f64>, ndarray::Array1<f64>)>>, SigmaCubatureGpuError> {
@@ -153,7 +152,7 @@ pub fn try_gpu_sigma_stream_pool_eval(
             per_sigma,
             family,
             curvature,
-            gamma_shape,
+            likelihood_scale,
             convergence_tol,
             max_iter,
         );
@@ -167,7 +166,7 @@ pub fn try_gpu_sigma_stream_pool_eval(
         log::trace!(
             "[sigma stream pool] non-Linux target: skipping dispatch \
              (x_original={}x{}, y_len={}, prior_w_len={}, offset_len={}, \
-              n_sigma={}, family={:?}, curvature={:?}, gamma_shape={}, \
+              n_sigma={}, family={:?}, curvature={:?}, likelihood_scale={:?}, \
               tol={}, max_iter={})",
             x_original.nrows(),
             x_original.ncols(),
@@ -177,7 +176,7 @@ pub fn try_gpu_sigma_stream_pool_eval(
             per_sigma.len(),
             admission.family,
             admission.curvature,
-            gamma_shape,
+            likelihood_scale,
             convergence_tol,
             max_iter,
         );
@@ -263,7 +262,7 @@ mod linux_impl {
         per_sigma: &[SigmaPointGpuInput],
         family: PirlsRowFamily,
         curvature: CurvatureMode,
-        gamma_shape: f64,
+        likelihood_scale: crate::gpu::pirls_gpu::PirlsLoopLikelihoodScale,
         convergence_tol: f64,
         max_iter: usize,
     ) -> Result<Option<Vec<SigmaPointResult>>, SigmaCubatureGpuError> {
@@ -339,7 +338,7 @@ mod linux_impl {
                 loop_ws,
                 family,
                 curvature,
-                gamma_shape,
+                likelihood_scale,
                 beta0.view(),
                 pt.s_transformed.view(),
                 pt.linear_shift.view(),

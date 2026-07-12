@@ -34,24 +34,39 @@ const HALF_LOG_2PI: f64 = 0.918_938_533_204_672_7;
 /// exact returned value.
 #[inline]
 fn log_standard_normal_cdf_and_score(x: f64) -> (f64, f64) {
-    if x < -8.0 {
+    if x < -12.0 {
         let t = -x;
         let t2 = t * t;
         if !t2.is_finite() {
             return (f64::NEG_INFINITY, t);
         }
-        let inv = 1.0 / t;
-        let inv2 = inv * inv;
-        let tail_series = 1.0
-            + inv2
-                * (-1.0
-                    + inv2
-                        * (3.0
-                            + inv2 * (-15.0 + inv2 * (105.0 + inv2 * (-945.0 + inv2 * 10_395.0)))));
-        let log_cdf = -0.5 * t2 - t.ln() - HALF_LOG_2PI + tail_series.ln();
-        let inverse_mills = t + inv
-            * (1.0
-                + inv2 * (-2.0 + inv2 * (10.0 + inv2 * (-74.0 + inv2 * (706.0 - 8_162.0 * inv2)))));
+        // Phi(-t) = phi(t)/t * S(t),
+        // S(t) ~ sum_n (-1)^n (2n-1)!! / t^(2n). Add the alternating,
+        // decreasing terms until the next one cannot alter either S or S'.
+        // If asymptotic terms begin growing first, the smallest-term truncation
+        // has the standard alternating remainder bound.
+        let mut series = 1.0_f64;
+        let mut derivative = 0.0_f64;
+        let mut term = 1.0_f64;
+        let inv_t2 = 1.0 / t2;
+        for n in 1..=1024 {
+            let next_term = term * -((2 * n - 1) as f64) * inv_t2;
+            if next_term.abs() >= term.abs() {
+                break;
+            }
+            let next_series = series + next_term;
+            let derivative_term = -2.0 * n as f64 * next_term / t;
+            let next_derivative = derivative + derivative_term;
+            term = next_term;
+            if next_series == series && next_derivative == derivative {
+                break;
+            }
+            series = next_series;
+            derivative = next_derivative;
+        }
+        let log_cdf = -0.5 * t2 - t.ln() - HALF_LOG_2PI + series.ln();
+        // d/dx log Phi(x) = -d/dt log Phi(-t).
+        let inverse_mills = t + 1.0 / t - derivative / series;
         (log_cdf, inverse_mills)
     } else {
         let erfc = statrs::function::erf::erfc(-x * std::f64::consts::FRAC_1_SQRT_2);
@@ -316,6 +331,8 @@ fn log1p_minus_x(x: f64) -> f64 {
 fn log_abs_one_minus_exp(x: f64) -> f64 {
     if x > 0.0 {
         x + (-(-x).exp()).ln_1p()
+    } else if x > -std::f64::consts::LN_2 {
+        (-x.exp_m1()).ln()
     } else {
         (-x.exp()).ln_1p()
     }
@@ -1638,11 +1655,28 @@ pub(crate) fn calculate_loglikelihood_omitting_constants_from_eta(
 pub(crate) fn log_gamma_stirling_correction(x: f64) -> f64 {
     let inv = 1.0 / x;
     let inv2 = inv * inv;
-    inv / 12.0 - inv * inv2 / 360.0 + inv * inv2 * inv2 / 1260.0
+    inv * (1.0 / 12.0
+        + inv2
+            * (-1.0 / 360.0
+                + inv2
+                    * (1.0 / 1260.0
+                        + inv2
+                            * (-1.0 / 1680.0
+                                + inv2
+                                    * (1.0 / 1188.0
+                                        + inv2
+                                            * (-691.0 / 360_360.0
+                                                + inv2
+                                                    * (1.0 / 156.0
+                                                        - inv2 * 3617.0 / 122_400.0)))))))
 }
 
 #[inline]
 pub(crate) fn log_gamma_large_ratio(base: f64, delta: f64) -> f64 {
+    let shifted = base + delta;
+    if base < 8.0 || shifted < 8.0 {
+        return ln_gamma(shifted) - ln_gamma(base);
+    }
     let ratio = delta / base;
     if ratio == 0.0 {
         // At this separation the next term is O(delta²/base), below the f64
@@ -1651,16 +1685,12 @@ pub(crate) fn log_gamma_large_ratio(base: f64, delta: f64) -> f64 {
         return delta * base.ln();
     }
     delta * base.ln() + (base + delta - 0.5) * ratio.ln_1p() - delta
-        + log_gamma_stirling_correction(base + delta)
+        + log_gamma_stirling_correction(shifted)
         - log_gamma_stirling_correction(base)
 }
 
 #[inline]
 pub(crate) fn beta_log_normalizer(a: f64, b: f64, sum: f64) -> f64 {
-    let direct = ln_gamma(sum) - ln_gamma(a) - ln_gamma(b);
-    if direct.is_finite() {
-        return direct;
-    }
     let small = a.min(b);
     let large = a.max(b);
     if small < 8.0 {
@@ -1833,6 +1863,33 @@ fn full_log_likelihood_row(
 ) -> Result<f64, EstimationError> {
     if weight == 0.0 {
         return Ok(0.0);
+    }
+    let exact_integer = |value: f64| value.is_finite() && value >= 0.0 && value == value.round();
+    match &likelihood.spec.response {
+        ResponseFamily::Poisson
+        | ResponseFamily::NegativeBinomial { .. }
+        | ResponseFamily::Beta { .. } => {
+            if !exact_integer(weight) {
+                return Err(deviance_row_error(
+                    row,
+                    "fully-normalized frequency weight (exact positive integer required)",
+                    eta,
+                    weight,
+                ));
+            }
+        }
+        ResponseFamily::Binomial => {
+            let successes = weight * y;
+            if !exact_integer(weight) || !exact_integer(successes) {
+                return Err(deviance_row_error(
+                    row,
+                    "fully-normalized binomial trials/successes (exact integers required)",
+                    eta,
+                    successes,
+                ));
+            }
+        }
+        _ => {}
     }
     if matches!(&likelihood.spec.response, ResponseFamily::Poisson) {
         let saturated = poisson_saturated_log_likelihood(y);

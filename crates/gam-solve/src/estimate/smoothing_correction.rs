@@ -219,9 +219,9 @@ pub(crate) fn smooth_floor_dp(dp: f64, scale: f64) -> (f64, f64, f64) {
 ///   - and H_{kℓ} terms containing fourth-likelihood derivatives.
 ///
 /// This routine obtains V_ρ^{-1} from the analytic rho-space Hessian selected
-/// by `compute_lamlhessian_consistent`, then regularizes before inversion.
-/// If that analytic Hessian is unavailable, the correction is skipped rather
-/// than synthesized numerically.
+/// by `compute_lamlhessian_consistent`, then inverts its explicitly identified
+/// subspace without perturbing the matrix. If exact geometry is unavailable,
+/// the typed status records why; no substitute Hessian is used.
 ///
 /// Notes on omitted higher-order terms:
 /// - The exact `E[A(rho)]` and `Var(b(rho))` can be written with the Gaussian
@@ -244,6 +244,39 @@ pub(crate) struct SmoothingCorrectionComputation {
     /// use this to decide whether higher-order corrections are even
     /// meaningful — they aren't when V_ρ is rank-deficient.
     pub active_rank: Option<usize>,
+    pub status: SmoothingCorrectionStatus,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SmoothingCorrectionStatus {
+    Computed,
+    NotApplicableNoSmoothingParameters,
+    ZeroNoIdentifiedOuterDirections,
+    Unavailable(SmoothingCorrectionUnavailable),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SmoothingCorrectionUnavailable {
+    ObjectiveInnerHessian {
+        error: String,
+    },
+    InnerHessianDimension {
+        rows: usize,
+        cols: usize,
+        coefficients: usize,
+    },
+    InnerHessianNotPositiveDefinite,
+    SensitivitySolve,
+    OuterHessian {
+        error: String,
+    },
+    OuterHessianEigendecomposition,
+    NonFiniteCorrection,
+    MateriallyIndefiniteCorrection {
+        min_eigenvalue: f64,
+        tolerance: f64,
+    },
+    CorrectionEigendecomposition,
 }
 
 /// Result of pseudo-inverting the rho-space LAML Hessian on the identified subspace.
@@ -666,6 +699,7 @@ pub(crate) fn compute_smoothing_correction(
             hessian_rho: None,
             rho_covariance: None,
             active_rank: None,
+            status: SmoothingCorrectionStatus::NotApplicableNoSmoothingParameters,
         };
     }
 
@@ -686,24 +720,33 @@ pub(crate) fn compute_smoothing_correction(
     // Use the same objective-consistent inner Hessian surface used by REML:
     // - non-Firth: H = X'W_HX + S (+ stabilization if present)
     // - Firth logit: H_total = H - d²Phi/dβ²
-    // Fallback to PIRLS stabilized Hessian only if bundle recovery fails.
-    //
     // Conclusion:
     //   J[:,k] = dβ̂/dρ_k must use the Jacobian of the actual stationarity
     //   system G*(β,ρ)=0, i.e. H_total for Firth-adjusted fits. Using only
     //   X'W_HX+S here would be inconsistent with the fitted objective and would
     //   misstate smoothing-parameter uncertainty propagation.
-    let h_trans = reml_state
-        .objective_innerhessian(final_rho)
-        .unwrap_or_else(|_| final_fit.stabilizedhessian_transformed.to_dense());
+    let h_trans = match reml_state.objective_innerhessian(final_rho) {
+        Ok(hessian) => hessian,
+        Err(error) => {
+            return SmoothingCorrectionComputation {
+                correction: None,
+                hessian_rho: None,
+                rho_covariance: None,
+                active_rank: None,
+                status: SmoothingCorrectionStatus::Unavailable(
+                    SmoothingCorrectionUnavailable::ObjectiveInnerHessian {
+                        error: error.to_string(),
+                    },
+                ),
+            };
+        }
+    };
 
     // The IFT solve below feeds length-`n_coeffs_trans` right-hand sides into
     // the Cholesky factor of `h_trans`, and faer asserts `rhs.len() == factor.n()`.
     // A Hessian that does not match the coefficient dimension (e.g. a degenerate
     // 0×0 placeholder from a geometry backend that failed to materialize a real
     // dense inner Hessian) would otherwise abort the whole fit inside the solve.
-    // Bail to the no-correction branch exactly like the Cholesky-`Err` guard
-    // below, so the post-fit smoothing correction is simply skipped.
     if h_trans.nrows() != n_coeffs_trans || h_trans.ncols() != n_coeffs_trans {
         log::warn!(
             "smoothing-correction inner Hessian shape {}x{} does not match coefficient dimension {}; skipping.",
@@ -716,6 +759,13 @@ pub(crate) fn compute_smoothing_correction(
             hessian_rho: None,
             rho_covariance: None,
             active_rank: None,
+            status: SmoothingCorrectionStatus::Unavailable(
+                SmoothingCorrectionUnavailable::InnerHessianDimension {
+                    rows: h_trans.nrows(),
+                    cols: h_trans.ncols(),
+                    coefficients: n_coeffs_trans,
+                },
+            ),
         };
     }
 
@@ -729,6 +779,9 @@ pub(crate) fn compute_smoothing_correction(
                 hessian_rho: None,
                 rho_covariance: None,
                 active_rank: None,
+                status: SmoothingCorrectionStatus::Unavailable(
+                    SmoothingCorrectionUnavailable::InnerHessianNotPositiveDefinite,
+                ),
             };
         }
     };
@@ -788,6 +841,9 @@ pub(crate) fn compute_smoothing_correction(
                     hessian_rho: None,
                     rho_covariance: None,
                     active_rank: None,
+                    status: SmoothingCorrectionStatus::Unavailable(
+                        SmoothingCorrectionUnavailable::SensitivitySolve,
+                    ),
                 };
             }
         };
@@ -809,6 +865,11 @@ pub(crate) fn compute_smoothing_correction(
                 hessian_rho: None,
                 rho_covariance: None,
                 active_rank: None,
+                status: SmoothingCorrectionStatus::Unavailable(
+                    SmoothingCorrectionUnavailable::OuterHessian {
+                        error: err.to_string(),
+                    },
+                ),
             };
         }
     };
@@ -836,6 +897,9 @@ pub(crate) fn compute_smoothing_correction(
                 hessian_rho: Some(hessian_rho),
                 rho_covariance: None,
                 active_rank: None,
+                status: SmoothingCorrectionStatus::Unavailable(
+                    SmoothingCorrectionUnavailable::OuterHessianEigendecomposition,
+                ),
             };
         }
     };
@@ -864,6 +928,7 @@ pub(crate) fn compute_smoothing_correction(
             hessian_rho: Some(hessian_rho),
             rho_covariance: Some(inverted.inverse),
             active_rank: Some(0),
+            status: SmoothingCorrectionStatus::ZeroNoIdentifiedOuterDirections,
         };
     }
 
@@ -928,6 +993,9 @@ pub(crate) fn compute_smoothing_correction(
             hessian_rho: Some(hessian_rho),
             rho_covariance: Some(rho_covariance),
             active_rank: Some(active_rank_used),
+            status: SmoothingCorrectionStatus::Unavailable(
+                SmoothingCorrectionUnavailable::NonFiniteCorrection,
+            ),
         };
     }
 
@@ -977,11 +1045,26 @@ pub(crate) fn compute_smoothing_correction(
                     hessian_rho: Some(hessian_rho),
                     rho_covariance: Some(rho_covariance),
                     active_rank: Some(active_rank_used),
+                    status: SmoothingCorrectionStatus::Unavailable(
+                        SmoothingCorrectionUnavailable::MateriallyIndefiniteCorrection {
+                            min_eigenvalue: min_eig,
+                            tolerance: neg_tol,
+                        },
+                    ),
                 };
             }
         }
         Err(_) => {
             log::warn!("Eigendecomposition failed for smoothing correction validation.");
+            return SmoothingCorrectionComputation {
+                correction: None,
+                hessian_rho: Some(hessian_rho),
+                rho_covariance: Some(rho_covariance),
+                active_rank: Some(active_rank_used),
+                status: SmoothingCorrectionStatus::Unavailable(
+                    SmoothingCorrectionUnavailable::CorrectionEigendecomposition,
+                ),
+            };
         }
     }
     SmoothingCorrectionComputation {
@@ -989,5 +1072,6 @@ pub(crate) fn compute_smoothing_correction(
         hessian_rho: Some(hessian_rho),
         rho_covariance: Some(rho_covariance),
         active_rank: Some(active_rank_used),
+        status: SmoothingCorrectionStatus::Computed,
     }
 }

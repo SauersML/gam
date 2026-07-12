@@ -8532,7 +8532,11 @@ pub fn smooth_term_lr_inference_forspec(
     // Full design as a dense n×p array for the Lawley pair-matrix reduction.
     let full_design_dense = full.design.design.to_dense();
     let influence = full.fit.coefficient_influence();
-    let family_disp = lawley_dispersion_for_family(&family, &full.fit);
+    let fitted_likelihood = resolved_likelihood_for_fit(&full.fit)?;
+    let family_disp = lawley_dispersion_for_family(&fitted_likelihood, &full.fit)?;
+    let coefficient_covariance_scale = fitted_likelihood
+        .coefficient_covariance_scale(family_disp)
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
 
     // The penalty-block cursor walks the same block order the summary table
     // uses: any leading linear/random-effect penalty blocks first (skipped
@@ -8604,12 +8608,17 @@ pub fn smooth_term_lr_inference_forspec(
         // collapse; `edf` and `null_dim` never exceed `edf1` in a healthy fit.
         // This mirrors the summary Wald path, which floors its reference at the
         // statistic's own rank for the same reason.
-        let rho_uncertainty_df = wps_block_uncertainty_df(
+        let rho_uncertainty_df = match wps_block_uncertainty_df(
             full.fit.weighted_gram(),
             full.fit.smoothing_correction(),
             &coeff_range,
-            family_disp,
-        );
+            coefficient_covariance_scale,
+        )? {
+            // Missing correction artifacts explicitly mean that this optional
+            // WPS term was not computed; the base Wood reference df remains.
+            Some(extra_df) => extra_df,
+            None => 0.0,
+        };
         let ref_df = (wood_reference_df(influence, &coeff_range)
             .unwrap_or(0.0)
             .max(edf)
@@ -8678,7 +8687,11 @@ pub fn smooth_term_lr_inference_forspec(
         ) {
             let kappas: Option<Vec<_>> = (0..n)
                 .map(|i| {
-                    known_scale_expected_jets_with_dispersion(&family, eta[i], family_disp)
+                    known_scale_expected_jets_with_dispersion(
+                        &fitted_likelihood.spec,
+                        eta[i],
+                        family_disp,
+                    )
                         .and_then(|jets| jets.kappas().ok())
                 })
                 .collect();
@@ -8767,58 +8780,98 @@ pub fn smooth_term_lr_inference_forspec(
     Ok(out)
 }
 
-/// The dispersion `φ` Lawley needs for the family's cumulant scaling: Gaussian
-/// `σ̂²`, Gamma `1/shape`, and `1` for the scale-free Poisson/Binomial.
-fn lawley_dispersion_for_family(family: &LikelihoodSpec, fit: &UnifiedFitResult) -> f64 {
-    match family.response {
-        gam_spec::ResponseFamily::Gaussian => {
-            let sd = fit.standard_deviation;
-            (sd * sd).max(f64::MIN_POSITIVE)
-        }
-        gam_spec::ResponseFamily::Gamma => {
-            let shape = fit.standard_deviation;
-            if shape.is_finite() && shape > 0.0 {
-                1.0 / shape
-            } else {
-                1.0
-            }
-        }
-        _ => 1.0,
-    }
+fn resolved_likelihood_for_fit(
+    fit: &UnifiedFitResult,
+) -> Result<gam_spec::GlmLikelihoodSpec, EstimationError> {
+    let spec = fit.likelihood_family.as_ref().ok_or_else(|| {
+        EstimationError::InvalidInput(
+            "smooth-term LR inference requires an engine-level GLM likelihood".to_string(),
+        )
+    })?;
+    gam_spec::GlmLikelihoodSpec::try_new(spec.clone(), fit.likelihood_scale.clone())
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))
+}
+
+/// The response dispersion `phi` Lawley needs for cumulant scaling. This is
+/// deliberately distinct from the coefficient-covariance multiplier used by
+/// the WPS trace below: Gamma Lawley uses `1 / shape`, while its PIRLS Hessian
+/// already carries `shape` and therefore has covariance multiplier one.
+fn lawley_dispersion_for_family(
+    likelihood: &gam_spec::GlmLikelihoodSpec,
+    fit: &UnifiedFitResult,
+) -> Result<f64, EstimationError> {
+    gam_solve::estimate::dispersion_from_likelihood(likelihood, fit.standard_deviation)
+        .map(|dispersion| dispersion.phi())
 }
 
 fn wps_block_uncertainty_df(
     weighted_gram: Option<&Array2<f64>>,
     smoothing_correction: Option<&Array2<f64>>,
     coeff_range: &Range<usize>,
-    phi: f64,
-) -> f64 {
+    coefficient_covariance_scale: f64,
+) -> Result<Option<f64>, EstimationError> {
     let (Some(xwx), Some(corr)) = (weighted_gram, smoothing_correction) else {
-        return 0.0;
+        return Ok(None);
     };
     let (start, end) = (coeff_range.start, coeff_range.end);
-    if start >= end
-        || end > xwx.nrows()
-        || end > xwx.ncols()
-        || end > corr.nrows()
-        || end > corr.ncols()
-        || !(phi.is_finite() && phi > 0.0)
-    {
-        return 0.0;
+    if start >= end {
+        return Err(EstimationError::InvalidInput(format!(
+            "WPS coefficient block must be non-empty, got {coeff_range:?}"
+        )));
+    }
+    if xwx.nrows() != xwx.ncols() || corr.nrows() != corr.ncols() {
+        return Err(EstimationError::InvalidInput(format!(
+            "WPS matrices must be square, got X'WX={}x{} and correction={}x{}",
+            xwx.nrows(),
+            xwx.ncols(),
+            corr.nrows(),
+            corr.ncols()
+        )));
+    }
+    if xwx.dim() != corr.dim() || end > xwx.nrows() {
+        return Err(EstimationError::InvalidInput(format!(
+            "WPS block {coeff_range:?} is incompatible with X'WX={:?} and correction={:?}",
+            xwx.dim(),
+            corr.dim()
+        )));
+    }
+    if !(coefficient_covariance_scale.is_finite() && coefficient_covariance_scale > 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "WPS coefficient-covariance scale must be finite and strictly positive, got {coefficient_covariance_scale:?}"
+        )));
     }
 
-    let mut trace = 0.0;
+    let mut trace = gam_linalg::utils::KahanSum::default();
     for i in start..end {
         for j in start..end {
-            trace += xwx[[i, j]] * corr[[j, i]];
+            let gram_value = xwx[[i, j]];
+            let correction_value = corr[[j, i]];
+            if !gram_value.is_finite() || !correction_value.is_finite() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "WPS trace has non-finite matrix entry at ({i}, {j}): X'WX={gram_value:?}, correction-transpose={correction_value:?}"
+                )));
+            }
+            let product = gram_value * correction_value;
+            if !product.is_finite() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "WPS trace product is not representable at ({i}, {j}): {gram_value:?} * {correction_value:?}"
+                )));
+            }
+            trace.add(product);
         }
     }
-    trace /= phi;
-    if trace.is_finite() && trace > 0.0 {
-        trace
-    } else {
-        0.0
+    let trace = trace.sum() / coefficient_covariance_scale;
+    if !trace.is_finite() {
+        return Err(EstimationError::InvalidInput(format!(
+            "WPS corrected-EDF trace is not representable after coefficient scale {coefficient_covariance_scale:?}: {trace:?}"
+        )));
     }
+    if trace < 0.0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "WPS corrected-EDF trace must be non-negative, got {trace:?}"
+        )));
+    }
+    Ok(Some(trace))
 }
 
 /// Wood's smoothing-selection-corrected reference d.f. `edf1 = 2·tr(F_jj) −

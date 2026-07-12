@@ -1,5 +1,57 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
+/// Family-aware scalar contract for the built-in GPU PIRLS row kernels.
+///
+/// The CUDA kernel ABI still has one `double` slot shared by every built-in
+/// family, but only Gamma is allowed to populate it. Non-Gamma callers carry
+/// an explicit discriminant instead of manufacturing a unit Gamma shape; the
+/// final ABI conversion writes a NaN poison value so any future accidental
+/// non-Gamma read fails loudly rather than silently becoming unit scale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PirlsLoopLikelihoodScale(PirlsLoopLikelihoodScaleKind);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PirlsLoopLikelihoodScaleKind {
+    NonGamma,
+    GammaShape(f64),
+}
+
+impl PirlsLoopLikelihoodScale {
+    #[inline]
+    pub const fn non_gamma() -> Self {
+        Self(PirlsLoopLikelihoodScaleKind::NonGamma)
+    }
+
+    pub fn gamma_shape(shape: f64) -> Result<Self, String> {
+        if shape.is_finite() && shape > 0.0 {
+            Ok(Self(PirlsLoopLikelihoodScaleKind::GammaShape(shape)))
+        } else {
+            Err(format!(
+                "GPU PIRLS Gamma shape must be finite and strictly positive, got {shape:?}"
+            ))
+        }
+    }
+
+    fn kernel_argument(
+        self,
+        family: crate::gpu_kernels::pirls_row::PirlsRowFamily,
+    ) -> Result<f64, String> {
+        use crate::gpu_kernels::pirls_row::PirlsRowFamily;
+        match (family, self.0) {
+            (PirlsRowFamily::GammaLog, PirlsLoopLikelihoodScaleKind::GammaShape(shape)) => {
+                Ok(shape)
+            }
+            (PirlsRowFamily::GammaLog, PirlsLoopLikelihoodScaleKind::NonGamma) => Err(
+                "GPU Gamma row kernel requires an explicit resolved Gamma shape".to_string(),
+            ),
+            (_, PirlsLoopLikelihoodScaleKind::NonGamma) => Ok(f64::NAN),
+            (_, PirlsLoopLikelihoodScaleKind::GammaShape(shape)) => Err(format!(
+                "GPU non-Gamma row kernel {family:?} received Gamma shape {shape:?}"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PirlsGpuInput<'a> {
     pub x: ArrayView2<'a, f64>,
@@ -3636,8 +3688,7 @@ pub(crate) fn pirls_loop_on_stream(
     loop_ws: &mut cuda::PirlsLoopWorkspace,
     family: crate::gpu_kernels::pirls_row::PirlsRowFamily,
     curvature: crate::gpu_kernels::pirls_row::CurvatureMode,
-    // Active Gamma dispersion shape (α > 0). Pass `1.0` for non-Gamma fits.
-    gamma_shape: f64,
+    likelihood_scale: PirlsLoopLikelihoodScale,
     beta0: ndarray::ArrayView1<'_, f64>,
     penalty_hessian: ndarray::ArrayView2<'_, f64>,
     // Linear shift `b` for the shifted-quadratic penalty `βᵀSβ−2βᵀb+c`.
@@ -3651,6 +3702,9 @@ pub(crate) fn pirls_loop_on_stream(
     tol: f64,
     extra: Option<&cuda::PirlsLoopExtra<'_>>,
 ) -> Result<cuda::PirlsLoopOutcome, cuda::PirlsGpuLoopError> {
+    let gamma_shape = likelihood_scale
+        .kernel_argument(family)
+        .map_err(cuda::PirlsGpuLoopError::Runtime)?;
     cuda::pirls_loop(
         shared,
         ws,
@@ -3995,7 +4049,7 @@ mod stream_device_parity_tests {
                 &mut loop_ws,
                 PirlsRowFamily::BernoulliLogit,
                 CurvatureMode::Fisher,
-                1.0,
+                PirlsLoopLikelihoodScale::non_gamma(),
                 beta0.view(),
                 penalty.view(),
                 linear_shift_zero.view(),
@@ -4108,7 +4162,7 @@ mod stream_device_parity_tests {
             &mut loop_ws,
             crate::gpu_kernels::pirls_row::PirlsRowFamily::GaussianIdentity,
             crate::gpu_kernels::pirls_row::CurvatureMode::Fisher,
-            1.0,
+            PirlsLoopLikelihoodScale::non_gamma(),
             beta0.view(),
             penalty.view(),
             linear_shift_zero.view(),

@@ -813,7 +813,7 @@ impl ResponseFamily {
     ///   * A strictly-binary numeric response (`Binary` kind, or `Numeric`
     ///     with only `{0, 1}` values) maps to `Binomial`.
     ///   * A non-negative integer-valued count response (every value finite,
-    ///     `>= 0`, and within [`COUNT_INTEGER_TOL`] of an integer) that reaches
+    ///     `>= 0`, and exactly integer-valued) that reaches
     ///     beyond the binary `{0, 1}` window (i.e. carries at least one value
     ///     `>= 2`) maps to `Poisson` (log link). This is the "magic-by-default"
     ///     count detection: mgcv/statsmodels users expect `0,1,2,3,...` to fit a
@@ -845,16 +845,16 @@ impl ResponseFamily {
                     return Ok(Self::Binomial);
                 }
                 // Count signature: every value finite, non-negative, and an
-                // integer within `COUNT_INTEGER_TOL`, with at least one value
+                // exactly integer, with at least one value
                 // `>= 2` so it is not the (already-handled) binary case and not
                 // a degenerate all-zero column. A single fractional or negative
                 // value disqualifies the whole response, keeping continuous and
                 // signed data on the conservative Gaussian default.
                 let count = !y.is_empty()
                     && y.iter().all(|v| {
-                        v.is_finite() && *v >= 0.0 && (*v - v.round()).abs() <= COUNT_INTEGER_TOL
+                        v.is_finite() && *v >= 0.0 && *v == v.round()
                     })
-                    && y.iter().any(|v| *v >= 2.0 - COUNT_INTEGER_TOL);
+                    && y.iter().any(|v| *v >= 2.0);
                 if count {
                     Ok(Self::Poisson)
                 } else {
@@ -959,7 +959,6 @@ pub const GAUSSIAN_MIN_SAMPLE_SD: f64 = 1.0e-10;
 /// (CSV parse, integer→double promotion) that accumulate ULP-scale error well
 /// above `1e-12`; `1e-9` admits those without ever matching genuinely
 /// continuous data, whose fractional parts are O(1).
-pub const COUNT_INTEGER_TOL: f64 = 1.0e-9;
 
 /// Classifier for a [`ResponseDegeneracy`]. Each variant carries the family-
 /// specific evidence the caller needs to format a useful message without
@@ -2223,12 +2222,41 @@ pub enum LogLikelihoodNormalization {
 /// deviance / log-likelihood / weight evaluation without a separate side
 /// channel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "UncheckedGlmLikelihoodSpec")]
 pub struct GlmLikelihoodSpec {
     pub spec: LikelihoodSpec,
     pub scale: LikelihoodScaleMetadata,
 }
 
+/// Serde-only wire representation. Deserialization must pass through
+/// `GlmLikelihoodSpec::try_new` so persisted contradictory family/metadata
+/// pairs never enter the runtime as a `GlmLikelihoodSpec`.
+#[derive(Deserialize)]
+struct UncheckedGlmLikelihoodSpec {
+    spec: LikelihoodSpec,
+    scale: LikelihoodScaleMetadata,
+}
+
+impl TryFrom<UncheckedGlmLikelihoodSpec> for GlmLikelihoodSpec {
+    type Error = InvalidLikelihoodScale;
+
+    fn try_from(unchecked: UncheckedGlmLikelihoodSpec) -> Result<Self, Self::Error> {
+        Self::try_new(unchecked.spec, unchecked.scale)
+    }
+}
+
 impl GlmLikelihoodSpec {
+    /// Construct a likelihood only when family and scale metadata jointly form
+    /// one valid scalar-ownership contract.
+    pub fn try_new(
+        spec: LikelihoodSpec,
+        scale: LikelihoodScaleMetadata,
+    ) -> Result<Self, InvalidLikelihoodScale> {
+        let likelihood = Self { spec, scale };
+        likelihood.resolved_scale()?;
+        Ok(likelihood)
+    }
+
     /// Build a `GlmLikelihoodSpec` from a `LikelihoodSpec`, deriving the
     /// canonical default scale metadata for the response family.
     #[inline]
@@ -2799,6 +2827,28 @@ mod tests {
                 .to_string()
                 .contains("phi: 1.0")
         );
+    }
+
+    #[test]
+    fn glm_likelihood_deserialization_validates_family_and_scale_atomically() {
+        let invalid = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::beta_logit(3.0),
+            scale: LikelihoodScaleMetadata::EstimatedBetaPhi { phi: 4.0 },
+        };
+        let encoded = serde_json::to_string(&invalid).expect("serialize test payload");
+        let error = serde_json::from_str::<GlmLikelihoodSpec>(&encoded)
+            .expect_err("contradictory family/metadata bytes must be rejected");
+        assert!(error.to_string().contains("disagrees"));
+
+        let valid = GlmLikelihoodSpec::try_new(
+            LikelihoodSpec::negative_binomial_log(2.0),
+            LikelihoodScaleMetadata::EstimatedNegBinTheta { theta: 2.0 },
+        )
+        .expect("valid likelihood");
+        let encoded = serde_json::to_string(&valid).expect("serialize valid likelihood");
+        let decoded: GlmLikelihoodSpec =
+            serde_json::from_str(&encoded).expect("deserialize valid likelihood");
+        assert_eq!(decoded, valid);
     }
 
     #[test]

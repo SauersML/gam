@@ -524,11 +524,9 @@ pub(super) fn solve_newton_direction_dense(
 
     // Validate: bare Cholesky on a near-singular H produces huge spurious
     // step magnitudes in the null direction. If `‖H·δ + g‖∞ / (1+‖g‖∞)` is
-    // not small the H is rank-deficient (eigenvalue below floating-point
-    // resolution); fall through to the rank-revealing pseudoinverse path
-    // which projects rhs onto range(H) before inverting and zeroes the
-    // null-direction component of δ. This is the same arithmetic the
-    // outer IFT correction uses via penalty_subspace_trace.
+    // not small, the purported direction does not solve the requested
+    // unperturbed system. Surface that failure to the LM controller rather
+    // than silently changing the system or replacing it with a pseudoinverse.
     let validation_residual = {
         let h_delta = hessian.dot(direction_out);
         h_delta
@@ -540,25 +538,9 @@ pub(super) fn solve_newton_direction_dense(
     let g_inf = gradient.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
     let rel = validation_residual / (1.0 + g_inf);
     if !rel.is_finite() || rel > 1.0e-3 {
-        // Construct rhs = -gradient (note the gradient is the un-negated
-        // ∇f at β; the Newton equation is H·δ = -g) and reach for the
-        // pseudoinverse path. `solve_with_pseudoinverse_fallback` handles
-        // its own ridge retries and falls back to truncated-eigh
-        // pseudoinverse if Cholesky residual is high.
-        let rhs = gradient.mapv(|v| -v);
-        if let Some(pseudo) = StableSolver::new("pirls newton direction (pseudoinverse fallback)")
-            .solve_with_pseudoinverse_fallback(hessian, &rhs, 1.0e-10, 1.0e-3, 1.0e-10)
-        {
-            direction_out.assign(&pseudo);
-            log::info!(
-                "[STAGE] PIRLS dense newton solve backend=CPU p={} elapsed={:.3}s route=\"{} + pseudoinverse fallback (rel={:.3e} > 1e-3)\"",
-                p,
-                dense_solve_start.elapsed().as_secs_f64(),
-                cpu_route,
-                rel,
-            );
-            return Ok(());
-        }
+        return Err(EstimationError::InvalidInput(format!(
+            "PIRLS Newton direction failed its unperturbed linear-system certificate: relative residual {rel:.3e} exceeds 1e-3"
+        )));
     }
     if array_is_finite(direction_out) {
         log::info!(
