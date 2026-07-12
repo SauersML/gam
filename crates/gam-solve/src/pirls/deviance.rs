@@ -4,12 +4,6 @@
 
 use super::*;
 
-/// Zero/one guard for saturated-deviance evaluation: clamps responses away from
-/// the log singularities of the Binomial (`y·ln y`, `(1−y)·ln(1−y)`) and Gamma
-/// (`ln y`) unit deviances. Matches the historical local constant these
-/// per-family deviance branches shared.
-const EPS: f64 = 1e-8;
-
 #[inline]
 pub(crate) fn xlogy(x: f64, y: f64) -> f64 {
     if x == 0.0 { 0.0 } else { x * y.ln() }
@@ -1345,8 +1339,22 @@ pub fn calculate_null_deviance(
             let mean = response_mean("Binomial null model", |value| {
                 value.is_finite() && (0.0..=1.0).contains(&value)
             })?;
-            if mean == 0.0 || mean == 1.0 {
+            let mut all_zero = true;
+            let mut all_one = true;
+            for row in 0..y.len() {
+                if priorweights[row] == 0.0 {
+                    continue;
+                }
+                all_zero &= y[row] == 0.0;
+                all_one &= y[row] == 1.0;
+            }
+            if all_zero || all_one {
                 return Ok(0.0);
+            }
+            if !(mean > 0.0 && mean < 1.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Binomial interior null mean is not representable inside (0,1): {mean}"
+                )));
             }
             let inverse_link = InverseLink::Standard(StandardLink::Logit);
             (
@@ -1403,7 +1411,191 @@ pub fn calculate_null_deviance(
         }
     };
     let eta = Array1::from_elem(y.len(), eta_value);
-    calculate_deviance_from_eta(y, &eta, &null_likelihood, &inverse_link, priorweights)
+    let deviance =
+        calculate_deviance_from_eta(y, &eta, &null_likelihood, &inverse_link, priorweights)?;
+    if deviance < 0.0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "intercept-only deviance must be non-negative; got {deviance}"
+        )));
+    }
+    Ok(deviance)
+}
+
+fn eta_log_measure_scale(
+    likelihood: &GlmLikelihoodSpec,
+) -> Result<f64, EstimationError> {
+    use gam_problem::LikelihoodScaleMetadata as Scale;
+
+    match (&likelihood.spec.response, likelihood.scale) {
+        (ResponseFamily::Gamma, Scale::FixedGammaShape { shape })
+        | (ResponseFamily::Gamma, Scale::EstimatedGammaShape { shape }) => {
+            if shape.is_finite() && shape > 0.0 {
+                Ok(shape.ln())
+            } else {
+                crate::bail_invalid_estim!(
+                    "Gamma shape must be finite and positive; got {shape}"
+                )
+            }
+        }
+        (ResponseFamily::Gamma, Scale::FixedDispersion { phi }) => {
+            if phi.is_finite() && phi > 0.0 {
+                // Work with log(shape) = -log(phi), so a mathematically valid
+                // reciprocal that is subnormal (or below the ordinary f64
+                // range) is never rounded to zero before it reaches the row
+                // oracle.
+                Ok(-phi.ln())
+            } else {
+                crate::bail_invalid_estim!(
+                    "Gamma dispersion must be finite and positive; got {phi}"
+                )
+            }
+        }
+        (ResponseFamily::Gamma, scale) => crate::bail_invalid_estim!(
+            "Gamma eta log-likelihood requires explicit shape/dispersion metadata; got {scale:?}"
+        ),
+        (
+            ResponseFamily::Tweedie { .. },
+            Scale::FixedDispersion { phi } | Scale::EstimatedTweediePhi { phi },
+        ) => {
+            if phi.is_finite() && phi > 0.0 {
+                Ok(-phi.ln())
+            } else {
+                crate::bail_invalid_estim!(
+                    "Tweedie dispersion must be finite and positive; got {phi}"
+                )
+            }
+        }
+        (ResponseFamily::Tweedie { .. }, scale) => crate::bail_invalid_estim!(
+            "Tweedie eta log-likelihood requires explicit dispersion metadata; got {scale:?}"
+        ),
+        _ => Ok(0.0),
+    }
+}
+
+#[inline]
+fn omitted_log_likelihood_row(
+    row: usize,
+    y: f64,
+    eta: f64,
+    prior_weight: f64,
+    response: &ResponseFamily,
+    deviance: DevianceEtaRow,
+) -> Result<f64, EstimationError> {
+    if prior_weight == 0.0 {
+        return Ok(0.0);
+    }
+    let log_weight = prior_weight.ln();
+    let weighted_unit =
+        |quantity: &'static str, unit: f64| -> Result<f64, EstimationError> {
+            if unit == 0.0 {
+                Ok(0.0)
+            } else {
+                finite_signed_from_log(
+                    row,
+                    quantity,
+                    eta,
+                    unit.signum(),
+                    log_weight + unit.abs().ln(),
+                )
+            }
+        };
+    match response {
+        ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::Tweedie { .. } => {
+            Ok(-deviance.half_deviance)
+        }
+        ResponseFamily::Poisson => {
+            if y == 0.0 {
+                finite_signed_from_log(
+                    row,
+                    "Poisson log-likelihood",
+                    eta,
+                    -1.0,
+                    log_weight + eta,
+                )
+            } else if eta > 0.0 {
+                let (sign, log_abs) = signed_log_exp_difference(y.ln() + eta.ln(), eta);
+                finite_signed_from_log(
+                    row,
+                    "Poisson log-likelihood",
+                    eta,
+                    sign,
+                    log_weight + log_abs,
+                )
+            } else if eta < 0.0 {
+                finite_signed_from_log(
+                    row,
+                    "Poisson log-likelihood",
+                    eta,
+                    -1.0,
+                    log_weight + logaddexp(y.ln() + (-eta).ln(), eta),
+                )
+            } else {
+                Ok(-prior_weight)
+            }
+        }
+        ResponseFamily::Binomial => {
+            let saturated = xlogy(y, y) + xlogy(1.0 - y, 1.0 - y);
+            stable_finite_signed_sum(
+                &[
+                    weighted_unit("binomial saturated log-likelihood", saturated)?,
+                    -deviance.half_deviance,
+                ],
+                "binomial log-likelihood row",
+            )
+        }
+        ResponseFamily::NegativeBinomial { theta, .. } => {
+            let saturated = if y == 0.0 {
+                0.0
+            } else {
+                let log_total = logaddexp(theta.ln(), y.ln());
+                ln_gamma(y + theta) - ln_gamma(*theta) - ln_gamma(y + 1.0)
+                    + *theta * (theta.ln() - log_total)
+                    + y * (y.ln() - log_total)
+            };
+            if !saturated.is_finite() {
+                return Err(deviance_row_error(
+                    row,
+                    "negative-binomial saturated log-likelihood",
+                    eta,
+                    saturated,
+                ));
+            }
+            stable_finite_signed_sum(
+                &[
+                    weighted_unit(
+                        "negative-binomial saturated log-likelihood",
+                        saturated,
+                    )?,
+                    -deviance.half_deviance,
+                ],
+                "negative-binomial log-likelihood row",
+            )
+        }
+        ResponseFamily::Beta { phi } => {
+            let saturated = beta_loglikelihood_full_unit(y, y, *phi);
+            if !saturated.is_finite() {
+                return Err(deviance_row_error(
+                    row,
+                    "beta saturated log-likelihood",
+                    eta,
+                    saturated,
+                ));
+            }
+            stable_finite_signed_sum(
+                &[
+                    weighted_unit("beta saturated log-likelihood", saturated)?,
+                    -deviance.half_deviance,
+                ],
+                "beta log-likelihood row",
+            )
+        }
+        ResponseFamily::RoystonParmar => Err(deviance_row_error(
+            row,
+            "Royston-Parmar GLM log-likelihood",
+            eta,
+            eta,
+        )),
+    }
 }
 
 fn eta_log_likelihood_geometry_omitting_constants(
@@ -1413,29 +1605,7 @@ fn eta_log_likelihood_geometry_omitting_constants(
     inverse_link: &InverseLink,
     priorweights: ArrayView1<f64>,
 ) -> Result<(f64, Vec<DevianceEtaRow>), EstimationError> {
-    let log_measure_scale = match &likelihood.spec.response {
-        ResponseFamily::Gamma => {
-            let shape = likelihood.gamma_shape().ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "Gamma eta log-likelihood requires explicit shape metadata".to_string(),
-                )
-            })?;
-            if !(shape.is_finite() && shape > 0.0) {
-                crate::bail_invalid_estim!("Gamma shape must be finite and positive; got {shape}");
-            }
-            shape.ln()
-        }
-        ResponseFamily::Tweedie { .. } => {
-            let phi = fixed_glm_dispersion(likelihood);
-            if !(phi.is_finite() && phi > 0.0) {
-                crate::bail_invalid_estim!(
-                    "Tweedie dispersion must be finite and positive; got {phi}"
-                );
-            }
-            -phi.ln()
-        }
-        _ => 0.0,
-    };
+    let log_measure_scale = eta_log_measure_scale(likelihood)?;
     let deviance_rows = deviance_eta_rows_with_log_measure_scale(
         y.view(),
         eta,
@@ -1447,118 +1617,14 @@ fn eta_log_likelihood_geometry_omitting_constants(
     let rows: Vec<Result<f64, EstimationError>> = (0..y.len())
         .into_par_iter()
         .map(|i| {
-            let weight = priorweights[i];
-            if weight == 0.0 {
-                return Ok(0.0);
-            }
-            let log_weight = weight.ln();
-            let weighted_unit =
-                |quantity: &'static str, unit: f64| -> Result<f64, EstimationError> {
-                    if unit == 0.0 {
-                        Ok(0.0)
-                    } else {
-                        finite_signed_from_log(
-                            i,
-                            quantity,
-                            eta[i],
-                            unit.signum(),
-                            log_weight + unit.abs().ln(),
-                        )
-                    }
-                };
-            match &likelihood.spec.response {
-                ResponseFamily::Gaussian
-                | ResponseFamily::Gamma
-                | ResponseFamily::Tweedie { .. } => Ok(-deviance_rows[i].half_deviance),
-                ResponseFamily::Poisson => {
-                    let value = if y[i] == 0.0 {
-                        finite_signed_from_log(
-                            i,
-                            "Poisson log-likelihood",
-                            eta[i],
-                            -1.0,
-                            log_weight + eta[i],
-                        )?
-                    } else if eta[i] > 0.0 {
-                        let (sign, log_abs) =
-                            signed_log_exp_difference(y[i].ln() + eta[i].ln(), eta[i]);
-                        finite_signed_from_log(
-                            i,
-                            "Poisson log-likelihood",
-                            eta[i],
-                            sign,
-                            log_weight + log_abs,
-                        )?
-                    } else if eta[i] < 0.0 {
-                        finite_signed_from_log(
-                            i,
-                            "Poisson log-likelihood",
-                            eta[i],
-                            -1.0,
-                            log_weight + logaddexp(y[i].ln() + (-eta[i]).ln(), eta[i]),
-                        )?
-                    } else {
-                        -weight
-                    };
-                    Ok(value)
-                }
-                ResponseFamily::Binomial => {
-                    let saturated = xlogy(y[i], y[i]) + xlogy(1.0 - y[i], 1.0 - y[i]);
-                    let weighted_saturated =
-                        weighted_unit("binomial saturated log-likelihood", saturated)?;
-                    stable_finite_signed_sum(
-                        &[weighted_saturated, -deviance_rows[i].half_deviance],
-                        "binomial log-likelihood row",
-                    )
-                }
-                ResponseFamily::NegativeBinomial { theta, .. } => {
-                    let saturated = if y[i] == 0.0 {
-                        0.0
-                    } else {
-                        let log_total = logaddexp(theta.ln(), y[i].ln());
-                        ln_gamma(y[i] + theta) - ln_gamma(*theta) - ln_gamma(y[i] + 1.0)
-                            + *theta * (theta.ln() - log_total)
-                            + y[i] * (y[i].ln() - log_total)
-                    };
-                    if !saturated.is_finite() {
-                        return Err(deviance_row_error(
-                            i,
-                            "negative-binomial saturated log-likelihood",
-                            eta[i],
-                            saturated,
-                        ));
-                    }
-                    let weighted_saturated =
-                        weighted_unit("negative-binomial saturated log-likelihood", saturated)?;
-                    stable_finite_signed_sum(
-                        &[weighted_saturated, -deviance_rows[i].half_deviance],
-                        "negative-binomial log-likelihood row",
-                    )
-                }
-                ResponseFamily::Beta { phi } => {
-                    let saturated = beta_loglikelihood_full_unit(y[i], y[i], *phi);
-                    if !saturated.is_finite() {
-                        return Err(deviance_row_error(
-                            i,
-                            "beta saturated log-likelihood",
-                            eta[i],
-                            saturated,
-                        ));
-                    }
-                    let weighted_saturated =
-                        weighted_unit("beta saturated log-likelihood", saturated)?;
-                    stable_finite_signed_sum(
-                        &[weighted_saturated, -deviance_rows[i].half_deviance],
-                        "beta log-likelihood row",
-                    )
-                }
-                ResponseFamily::RoystonParmar => Err(deviance_row_error(
-                    i,
-                    "Royston-Parmar GLM log-likelihood",
-                    eta[i],
-                    eta[i],
-                )),
-            }
+            omitted_log_likelihood_row(
+                i,
+                y[i],
+                eta[i],
+                priorweights[i],
+                &likelihood.spec.response,
+                deviance_rows[i],
+            )
         })
         .collect();
     let log_likelihood_rows: Vec<f64> = rows.into_iter().collect::<Result<_, _>>()?;
@@ -1649,11 +1715,6 @@ pub(crate) fn beta_log_normalizer(a: f64, b: f64, sum: f64) -> f64 {
 }
 
 #[inline]
-pub(crate) fn poisson_unit_deviance(yi: f64, mui_c: f64) -> f64 {
-    xlogy(yi, yi / mui_c) - (yi - mui_c)
-}
-
-#[inline]
 pub(crate) fn gamma_unit_deviance(yi_c: f64, mui_c: f64) -> f64 {
     let ratio = yi_c / mui_c;
     ratio - 1.0 - ratio.ln()
@@ -1674,16 +1735,6 @@ pub(crate) fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
 }
 
 #[inline]
-pub(crate) fn negative_binomial_unit_deviance(yi: f64, mui_c: f64, theta: f64) -> f64 {
-    if !valid_negbin_theta(theta) || !valid_count_response(yi) {
-        return f64::NAN;
-    }
-    let y_term = xlogy(yi, (yi * (theta + mui_c)) / (mui_c * (theta + yi)));
-    let theta_term = theta * ((theta + mui_c) / (theta + yi)).ln();
-    theta_term + y_term
-}
-
-#[inline]
 pub(crate) fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
     if !valid_beta_phi(phi) || !valid_beta_response(yi) {
         return f64::NAN;
@@ -1696,138 +1747,6 @@ pub(crate) fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
     beta_log_normalizer(a, b, phi) + phi * xlogy(mui, yi) + phi * xlogy(1.0 - mui, 1.0 - yi)
         - yi.ln()
         - (1.0 - yi).ln()
-}
-
-#[inline]
-pub(crate) fn beta_unit_deviance(yi: f64, mui: f64, phi: f64) -> f64 {
-    if !valid_beta_response(yi) {
-        return f64::NAN;
-    }
-    beta_loglikelihood_full_unit(yi, yi, phi) - beta_loglikelihood_full_unit(yi, mui, phi)
-}
-
-#[inline]
-/// Per-observation log-likelihood (with the same family-specific constants
-/// dropped as [`calculate_loglikelihood_omitting_constants_from_eta`]) evaluated at the
-/// supplied fitted means `mu`.
-///
-/// This is the single source of truth for the per-row likelihood kernel: the
-/// scalar aggregate sums this vector, and the model-comparison machinery
-/// (`crate::inference::model_comparison`) evaluates it at ALO-corrected means
-/// to form pointwise predictive densities for PSIS-LOO. Because the same
-/// family-independent constants are omitted in every evaluation, the dropped
-/// constants cancel exactly in any *difference* of log-likelihoods — paired
-/// Δelpd between two fits on the same response, and the self-normalized PSIS
-/// importance ratios — so the omission is harmless for comparison channels.
-///
-/// For the deviance-parameterized families (Tweedie, Gamma) the per-row value
-/// is `-0.5 ·` the per-row scaled unit deviance, matching the aggregate exactly
-/// row by row.
-pub fn pointwise_loglikelihood_omitting_constants(
-    y: ArrayView1<f64>,
-    mu: &Array1<f64>,
-    likelihood: &GlmLikelihoodSpec,
-    priorweights: ArrayView1<f64>,
-) -> Array1<f64> {
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    let n = y.len();
-    let values: Vec<f64> = match &likelihood.spec.response {
-        ResponseFamily::Gaussian => {
-            // Gaussian log-likelihood (constants dropped) is
-            //     -0.5 * prior_i * (y_i - mu_i)^2 / phi.
-            // `ProfiledGaussian` returns no fixed phi and falls back to phi=1,
-            // preserving the historical profiled-sigma behaviour. A caller that
-            // fixes phi gets the scaled form that matches the IRLS weights and
-            // the scaled deviance in `calculate_deviance`.
-            let phi = likelihood.scale.fixed_phi().unwrap_or(1.0);
-            if !(phi.is_finite() && phi > 0.0) {
-                return Array1::from_elem(n, f64::NAN);
-            }
-            let inv_phi = 1.0 / phi;
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let resid = y[i] - mu[i];
-                    -0.5 * priorweights[i] * resid * resid * inv_phi
-                })
-                .collect()
-        }
-        ResponseFamily::Binomial => (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let mui_c = mu[i];
-                priorweights[i] * (y[i] * mui_c.ln() + (1.0 - y[i]) * (1.0 - mui_c).ln())
-            })
-            .collect(),
-        ResponseFamily::Poisson => (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let mui_c = mu[i];
-                let log_term = if y[i] > 0.0 { y[i] * mui_c.ln() } else { 0.0 };
-                priorweights[i] * (log_term - mui_c)
-            })
-            .collect(),
-        ResponseFamily::Tweedie { p } => {
-            let p = *p;
-            let phi = fixed_glm_dispersion(likelihood);
-            if !is_valid_tweedie_power(p) || !(phi.is_finite() && phi > 0.0) {
-                return Array1::from_elem(n, f64::NAN);
-            }
-            if validate_tweedie_responses(&y, &priorweights).is_err() {
-                return Array1::from_elem(n, f64::NAN);
-            }
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let yi = y[i];
-                    let mui_c = mu[i];
-                    -priorweights[i] * tweedie_unit_deviance(yi, mui_c, p) / phi
-                })
-                .collect()
-        }
-        ResponseFamily::NegativeBinomial { theta, .. } => {
-            let theta = *theta;
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    if !valid_negbin_theta(theta) {
-                        return f64::NAN;
-                    }
-                    let yi = y[i];
-                    if !valid_count_response(yi) {
-                        return f64::NAN;
-                    }
-                    let mui_c = mu[i];
-                    priorweights[i]
-                        * (ln_gamma(yi + theta) - ln_gamma(theta) - ln_gamma(yi + 1.0)
-                            + theta * (theta.ln() - (theta + mui_c).ln())
-                            + xlogy(yi, mui_c)
-                            - yi * (theta + mui_c).ln())
-                })
-                .collect()
-        }
-        ResponseFamily::Beta { phi } => {
-            let phi = *phi;
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    if !valid_beta_phi(phi) {
-                        return f64::NAN;
-                    }
-                    priorweights[i] * beta_loglikelihood_full_unit(y[i], mu[i], phi)
-                })
-                .collect()
-        }
-        ResponseFamily::Gamma => {
-            let shape = likelihood.gamma_shape().unwrap_or(1.0);
-            (0..n)
-                .into_par_iter()
-                .map(|i| -priorweights[i] * shape * gamma_unit_deviance(y[i], mu[i]))
-                .collect()
-        }
-        ResponseFamily::RoystonParmar => vec![f64::NAN; n],
-    };
-    Array1::from_vec(values)
 }
 
 /// `ln(2π)` — the per-observation Gaussian / saddlepoint normalizer constant.

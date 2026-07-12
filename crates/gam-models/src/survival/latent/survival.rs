@@ -4196,7 +4196,7 @@ fn build_latent_survival_row(
     Ok(row)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct BinaryFromLogSurvival {
     log_lik: f64,
     /// dℓ/ds where s = log_survival and ℓ = log_lik. For event=1 this is
@@ -6156,7 +6156,7 @@ mod tests {
 
     #[test]
     fn binary_log_survival_math_is_cancellation_free_and_derivative_order_aware() {
-        let near_one_survival = -1.0e-16;
+        let near_one_survival: f64 = -1.0e-16;
         let expected = (-near_one_survival.exp_m1()).ln();
         let got = binary_log_likelihood_from_log_survival(near_one_survival, 1)
             .expect("near-boundary binary event likelihood");
