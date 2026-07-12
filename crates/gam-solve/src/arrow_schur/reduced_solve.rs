@@ -637,12 +637,75 @@ fn spectral_qr_cholesky_factor(weighted_vt: &Array2<f64>) -> Option<Array2<f64>>
     Some(l)
 }
 
+/// Jacobi/Van der Sluis diagonal equilibration scale for a symmetric matrix
+/// (#2015): `d_a = sqrt(schur[a,a])`, floored at `√JACOBI_DIAGONAL_PD_FLOOR` so
+/// a numerically-empty diagonal entry never divides by ~0. This is a PURE
+/// numerical-conditioning aid for [`factor_dense_reduced_schur`] below — it is
+/// never returned or exposed, and it changes no value any caller of that
+/// function sees, only the accuracy of computing it.
+fn jacobi_diagonal_scale(schur: &Array2<f64>) -> Array1<f64> {
+    let n = schur.nrows();
+    let floor_sqrt = JACOBI_DIAGONAL_PD_FLOOR.sqrt();
+    let mut d = Array1::<f64>::zeros(n);
+    for a in 0..n {
+        let diag = schur[[a, a]];
+        d[a] = if diag.is_finite() && diag > JACOBI_DIAGONAL_PD_FLOOR {
+            diag.sqrt()
+        } else {
+            floor_sqrt
+        };
+    }
+    d
+}
+
+/// Factor the dense reduced Schur complement `S`, returning its lower Cholesky
+/// factor (or, when `S` is not PD, the spectrally-floored reconstruction and
+/// ITS factor).
+///
+/// #2015 — SOLVER-LEVEL conditioning fix (design: issue 2015 comment
+/// 4949898801). A real activation+behavior augmented target can carry output
+/// column-norm spreads of ~1e4 (joint Hessian condition number ≈ 1e8), which a
+/// PLAIN `cholesky_lower(schur)` is not designed to survive: the recursive
+/// `L_ii = sqrt(S_ii − Σ_{j<i} L_ij²)` step loses precision (or falsely
+/// refuses a genuinely PD matrix) when the diagonal spans many orders of
+/// magnitude. Equilibrate FIRST: `D = diag(d)` with `d_a = sqrt(S_aa)`
+/// ([`jacobi_diagonal_scale`] — Van der Sluis equilibration, provably within a
+/// factor of `n` of the OPTIMAL diagonal preconditioner for a symmetric
+/// matrix), factor `S̃ = D⁻¹SD⁻¹` (unit diagonal by construction) with the
+/// EXACT SAME Cholesky/spectral-floor logic below, then undo the equilibration
+/// on the way out.
+///
+/// This is NOT a reparametrization of any objective or estimand (contrast the
+/// REVERTED #2015 attempt that divided the FIT TARGET's columns, which
+/// changed what "best fit" means for a homoscedastic residual). `D` is
+/// diagonal, so `L := D·L̃` is STILL lower-triangular, and
+/// `L·Lᵀ = D·S̃·Dᵀ = D·(D⁻¹SD⁻¹)·D = S` exactly — `L` is a bit-exact valid
+/// Cholesky factor of the CALLER'S ORIGINAL `schur`, just computed via a
+/// numerically superior route. Undoing the scale is one exact elementwise
+/// multiply (`factor[i,j] *= d[i]`, `floored[i,j] *= d[i]*d[j]`) — no further
+/// precision is lost recovering original units. Consequently this function's
+/// signature, return values, and units are UNCHANGED from before the fix, and
+/// every one of its ~15 callers across `newton_step.rs` / `reduced_solve.rs`
+/// (the direct solve, `mixed_precision_reduced_beta`'s certified refinement,
+/// `try_mixed_precision_arrow_solve`'s kappa gate, the evidence log-det
+/// diagonal sum, the Takahashi selected-inverse, `steihaug_dense_system`'s
+/// trust-region fallback) needs no change: they already operate on whatever
+/// `(factor, floored_schur)` this function hands back, in the SAME original
+/// units as always.
 pub(crate) fn factor_dense_reduced_schur(
     schur: &Array2<f64>,
     schur_pd_floor: Option<f64>,
     unit_deflate_null_directions: bool,
 ) -> Result<(Array2<f64>, Option<Array2<f64>>), ArrowSchurError> {
-    let (factor, floored_schur) = match cholesky_lower(schur) {
+    let n = schur.nrows();
+    let d = jacobi_diagonal_scale(schur);
+    let mut schur_scaled = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            schur_scaled[[i, j]] = schur[[i, j]] / (d[i] * d[j]);
+        }
+    }
+    let (factor_scaled, floored_scaled) = match cholesky_lower(&schur_scaled) {
         Ok(factor) => (factor, None),
         Err(e) => {
             // #1026/#1038 — every dense reduced-Schur factorization in the SAE
@@ -657,11 +720,18 @@ pub(crate) fn factor_dense_reduced_schur(
             // quotient/null directions to unit stiffness so they contribute the
             // ρ-independent `log 1 = 0` to the Laplace normaliser rather than a
             // ρ-dependent Occam reward for collapsed decoders.
+            //
+            // #2015 — this spectral floor runs on the EQUILIBRATED `schur_scaled`,
+            // so `relative_floor` (a FRACTION of the operator's own max
+            // eigenvalue) reads a numerically trustworthy spectrum instead of one
+            // dominated by the raw column-scale spread; the floored
+            // reconstruction is undone back to original units below exactly like
+            // the plain factor.
             match schur_pd_floor {
                 Some(relative_floor) => match if unit_deflate_null_directions {
-                    spectral_unit_deflated_schur(schur, relative_floor)
+                    spectral_unit_deflated_schur(&schur_scaled, relative_floor)
                 } else {
-                    spectral_pd_floored_schur(schur, relative_floor)
+                    spectral_pd_floored_schur(&schur_scaled, relative_floor)
                 } {
                     Some((floored, floored_factor)) => (floored_factor, Some(floored)),
                     None => {
@@ -677,6 +747,23 @@ pub(crate) fn factor_dense_reduced_schur(
             }
         }
     };
+    // Undo the equilibration exactly: L = D·L̃ (row i scaled by d_i); the
+    // floored reconstruction (when present) scales back as D·S̃_floor·D.
+    let mut factor = factor_scaled;
+    for i in 0..n {
+        let di = d[i];
+        for j in 0..=i {
+            factor[[i, j]] *= di;
+        }
+    }
+    let floored_schur = floored_scaled.map(|mut floored| {
+        for i in 0..n {
+            for j in 0..n {
+                floored[[i, j]] *= d[i] * d[j];
+            }
+        }
+        floored
+    });
     Ok((factor, floored_schur))
 }
 

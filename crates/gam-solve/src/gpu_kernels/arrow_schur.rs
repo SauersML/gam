@@ -1311,6 +1311,14 @@ pub fn solve_arrow_newton_step_dense_reference(
         h[[n * d + c, n * d + c]] += ridge_beta;
         rhs[n * d + c] = -sys.gb[c];
     }
+    // #2015 — this GPU/device-reference dense factorization is INDEPENDENT of
+    // the CPU dense reduced-Schur path's Jacobi/Van der Sluis diagonal
+    // equilibration fix (`gam_solve::arrow_schur::reduced_solve::factor_dense_reduced_schur`).
+    // Both paths are exact (a correctly-formed Cholesky of the true joint/Schur
+    // matrix), so no correctness gap exists between them, but this path does
+    // not yet get the CPU path's improved conditioning on an ill-scaled `H`;
+    // porting the same equilibrate-then-reconstruct technique here is a
+    // deliberate follow-up, not done in this change.
     let factor = cholesky_factor_in_place(h.view(), CholeskyGuard::NonnegativePivot)
         .ok_or_else(|| "dense reference Cholesky failed".to_string())?;
     let mut log_det = 0.0_f64;

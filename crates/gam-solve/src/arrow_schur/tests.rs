@@ -6119,3 +6119,112 @@ pub(crate) fn covisibility_partition_recovers_groups_and_beats_scalar_jacobi() {
         scalar_diag.iterations
     );
 }
+
+/// Lower forward-substitution solve `Lx=b`, then upper (Lᵀ) back-substitution
+/// `Lᵀy=x` — a minimal, self-contained `(LLᵀ)⁻¹b` solve for these tests, so they
+/// exercise the factor `factor_dense_reduced_schur` returns without depending
+/// on any other crate's triangular-solve helper.
+fn solve_via_lower_cholesky(factor: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
+    let n = factor.nrows();
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let mut acc = b[i];
+        for j in 0..i {
+            acc -= factor[[i, j]] * y[j];
+        }
+        y[i] = acc / factor[[i, i]];
+    }
+    let mut x = Array1::<f64>::zeros(n);
+    for i in (0..n).rev() {
+        let mut acc = y[i];
+        for j in i + 1..n {
+            acc -= factor[[j, i]] * x[j];
+        }
+        x[i] = acc / factor[[i, i]];
+    }
+    x
+}
+
+/// #2015 — `factor_dense_reduced_schur`'s internal Jacobi/Van der Sluis
+/// equilibration (design: issue 2015 comment 4949898801) must return a factor
+/// that reconstructs the CALLER'S ORIGINAL matrix exactly (`L·Lᵀ = S`), not
+/// some scaled proxy — the whole point of the fix is that every existing
+/// consumer keeps reading real, original-unit values.
+#[test]
+fn factor_dense_reduced_schur_reconstructs_original_illconditioned_matrix_2015() {
+    let n = 6usize;
+    // Planted SPD matrix with a genuine ~1e4 diagonal spread (mirrors the
+    // measured real-data output column-norm spread): a diagonal core plus a
+    // small, symmetric off-diagonal coupling that keeps it non-trivially
+    // dense without threatening positive-definiteness (Gershgorin: each row's
+    // off-diagonal mass is a small fraction of its own diagonal entry).
+    let diag_scale = [1.0e4_f64, 1.0e2, 1.0, 1.0e-2, 1.0, 1.0e-4];
+    let mut schur = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        schur[[i, i]] = diag_scale[i];
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let coupling = 0.01 * (diag_scale[i] * diag_scale[j]).sqrt();
+            schur[[i, j]] = coupling;
+            schur[[j, i]] = coupling;
+        }
+    }
+
+    let (factor, floored) =
+        factor_dense_reduced_schur(&schur, None, false).expect("planted matrix is PD");
+    assert!(
+        floored.is_none(),
+        "a genuinely PD matrix must not need the spectral floor"
+    );
+
+    let reconstructed = factor.dot(&factor.t());
+    let mut max_abs_diff = 0.0_f64;
+    let mut max_scale = 0.0_f64;
+    for i in 0..n {
+        for j in 0..n {
+            max_abs_diff = max_abs_diff.max((reconstructed[[i, j]] - schur[[i, j]]).abs());
+            max_scale = max_scale.max(schur[[i, j]].abs());
+        }
+    }
+    let relative = max_abs_diff / max_scale.max(1.0);
+    assert!(
+        relative < 1e-9,
+        "L·Lᵀ must reconstruct the ORIGINAL (unequilibrated) matrix; relative diff {relative:e}"
+    );
+
+    // Solve S x = b for a planted x, both via the returned factor and via a
+    // reference solve on the SAME matrix Cholesky-factored directly (no
+    // equilibration) — the well-conditioned columns here make the direct path
+    // trustworthy as a reference. Agreement must be tight (roundoff-level, not
+    // bit-identical: the two factors are computed via different arithmetic
+    // paths), matching the requested "not bit-identical, roundoff differs"
+    // tolerance of 1e-10 relative.
+    let x_true = Array1::from_vec(vec![1.0, -2.0, 0.5, 3.0, -1.5, 2.0]);
+    let b = schur.dot(&x_true);
+    let x_via_equilibrated_factor = solve_via_lower_cholesky(&factor, &b);
+    let reference_factor = cholesky_lower(&schur).expect("planted matrix is PD for direct Cholesky too");
+    let x_via_direct_factor = solve_via_lower_cholesky(&reference_factor, &b);
+
+    let mut max_abs = 0.0_f64;
+    let mut ref_norm = 0.0_f64;
+    for i in 0..n {
+        max_abs = max_abs.max((x_via_equilibrated_factor[i] - x_via_direct_factor[i]).abs());
+        ref_norm = ref_norm.max(x_via_direct_factor[i].abs());
+    }
+    let relative_solve_diff = max_abs / ref_norm.max(1.0);
+    assert!(
+        relative_solve_diff < 1e-10,
+        "the equilibrated-then-reconstructed factor's solve must agree with the direct \
+         Cholesky solve to roundoff, got relative diff {relative_solve_diff:e}"
+    );
+    // And both must actually recover the planted x.
+    for i in 0..n {
+        assert!(
+            (x_via_equilibrated_factor[i] - x_true[i]).abs() < 1e-6,
+            "solved x[{i}]={} must recover planted x_true[{i}]={}",
+            x_via_equilibrated_factor[i],
+            x_true[i]
+        );
+    }
+}
