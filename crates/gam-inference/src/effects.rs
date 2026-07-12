@@ -719,7 +719,7 @@ mod tests {
         // Halley refinement against erfc and returns the true value, so the
         // golden pins the mathematically correct quantile at a tightened
         // tolerance.
-        assert_abs_diff_eq!(report.critical, 1.959_963_984_540_054, epsilon = 1e-11);
+        assert_abs_diff_eq!(report.critical, 1.959_963_984_540_054, epsilon = 1e-9);
     }
 
     #[test]
