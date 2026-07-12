@@ -13,9 +13,6 @@
 //! arithmetic. Direct device tests cover both ordinary and probability-tail
 //! rows against the CPU row program.
 
-#[cfg(test)]
-use crate::survival::marginal_slope::row_kernel::RigidRowInputs;
-
 /// Flattened row-major value, gradient, and Hessian channels for `K = 4`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SurvivalRowVghChannels {
