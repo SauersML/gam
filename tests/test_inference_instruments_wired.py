@@ -170,7 +170,15 @@ def test_float32_shape_controls_preserve_dtype_seed_marginals_and_covariance(
     np.testing.assert_array_less(np.abs(realized_covariance - target_covariance), tolerance)
 
 
-def test_shape_controlled_census_converts_non_native_dtype_once_to_float64() -> None:
+def test_shape_controlled_census_converts_non_native_dtype_once_to_float64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gamfit._shape_census as shape_census
+
+    def forbid_float32_control(*args, **kwargs):
+        raise AssertionError("non-float32 census dispatched through the float32 native control")
+
+    monkeypatch.setattr(shape_census, "shape_matched_control_f32", forbid_float32_control)
     source = np.arange(96, dtype=np.int16).reshape(32, 3)
 
     class CountingArrayLike:

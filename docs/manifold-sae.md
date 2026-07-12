@@ -539,10 +539,16 @@ OLMo-2 weekday/month token sets, plus injected synthetic controls):
    adjudicator circle wins in double-digit percentages of groups. Never
    interpret raw circle-win rates without running the byte-identical pipeline
    on matched structureless controls.
-3. **2-D PCA masks low-relative-variance rings.** A genuine ring sharing its
-   group with a linear factor at ~1× its radius is already lost after a top-2
-   variance projection, and at 2× the adjudicator prefers a cluster mixture
-   (validated by injection). Absence of circle wins is not absence of circles.
+3. **A fixed top-2 PCA masks low-relative-variance rings.** A genuine ring
+   sharing its group with a linear factor at ~1× its radius is already lost
+   after a top-2 variance projection, and at 2× the adjudicator prefers a
+   cluster mixture (validated by injection). The real-Qwen census now factors
+   each group contribution in group-width rather than ambient dimension,
+   variance-normalizes the retained PCs, selects the most circle-like PC pair
+   on discovery-only rows, and adjudicates that fixed chart on disjoint rows.
+   This label-free search recovers the injected low-variance PC2/PC3 ring while
+   preventing projection selection from seeing the headline rows. Record the
+   selected PC pair and discovery score beside every verdict.
 
 ### Running an unsupervised census honestly
 

@@ -15,9 +15,11 @@ This is the un-forced division of labor:
       features whose joint code lives in a low-D subspace.
 
   Stage 1b (gam adjudicates, gamfit.adjudicate_atom_shape):
-      For each group, project the group's per-token SAE codes to a 2-D intrinsic
-      coordinate (PCA of the group's code submatrix) and hand it to gam's
-      cross-class adjudicator. gam auto-decides circular vs euclidean vs the
+      For each group, factor its activation-space decoder contribution through
+      a thin group-width QR/PCA, search variance-normalized PC pairs on
+      discovery-only rows with a label-free circle score, and project disjoint
+      evaluation rows through the selected chart. Hand those untouched rows to
+      gam's cross-class adjudicator. gam auto-decides circular vs euclidean vs the
       free-mixture class on HELD-OUT predictive loglik. Discrete orders are
       selected inside each outer training fold. NO topology is forced.
 
@@ -320,6 +322,7 @@ def adjudicate_groups(
     log=print,
 ):
     verdicts = []
+    failures = []
     mean_l0 = float(np.count_nonzero(evaluation_codes, axis=1).mean())
     for gi, members in enumerate(groups):
         projected = group_coords_2d(
@@ -333,6 +336,14 @@ def adjudicate_groups(
         )
         if projected is None:
             log(f"  group {gi:3d} ({members.size} feats): no certifiable 2-D chart, skipped")
+            failures.append(
+                {
+                    "group": gi,
+                    "n_features": int(members.size),
+                    "stage": "subspace_selection",
+                    "reason": "no_certifiable_2d_chart",
+                }
+            )
             continue
         coords, subspace = projected
         try:
@@ -345,6 +356,14 @@ def adjudicate_groups(
             )
         except Exception as exc:  # noqa: BLE001
             log(f"  group {gi:3d}: adjudication error: {exc}")
+            failures.append(
+                {
+                    "group": gi,
+                    "n_features": int(members.size),
+                    "stage": "shape_adjudication",
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            )
             continue
         rec = {
             "group": gi,
@@ -376,7 +395,7 @@ def adjudicate_groups(
         log(f"  group {gi:3d} ({members.size:3d} feats, {coords.shape[0]:4d} rows): "
             f"{v['winner_class']:16s} margin={v['circular_margin']:+.4f} "
             f"reporting={v['reporting_winner']} pcs={subspace['selected_pc_axes']}")
-    return verdicts
+    return verdicts, failures
 
 
 def run_complete_census_pipeline(
@@ -450,7 +469,7 @@ def run_complete_census_pipeline(
     )
     log(f"=== Stage 1b: gam cross-class adjudication of {len(groups)} groups ===")
     decoder = model.W_dec.detach().cpu().numpy()
-    verdicts = adjudicate_groups(
+    verdicts, failures = adjudicate_groups(
         gamfit,
         discovery_codes,
         evaluation_codes,
@@ -479,6 +498,7 @@ def run_complete_census_pipeline(
         "dictionary_mean_l0": dictionary_mean_l0,
         "winner_breakdown": dict(winner_breakdown),
         "verdicts": verdicts,
+        "failures": failures,
         "wall_seconds": time.time() - run_started,
     }
 

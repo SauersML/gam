@@ -445,7 +445,12 @@ def run_concept(model, tok, gamfit_mod, concept: str, words, rec_templates,
             tier2.pop("centers", None)
             tier2["status"] = "ok"
             tier2["candidate_class"] = tier2_candidate
-    if tier2["status"] == "ok":
+    if "error" in verdict:
+        log(
+            f"  adjudicator failed: {verdict['error']}; "
+            f"centroid diagnostic unavailable: {tier2['reason']}"
+        )
+    elif tier2["status"] == "ok":
         log(f"  adjudicator: reporting_winner={verdict['reporting_winner']}; "
             f"winner_class={verdict['winner_class']}; "
             f"circular_class_wins={verdict['circle_wins']}; "
@@ -453,7 +458,7 @@ def run_concept(model, tok, gamfit_mod, concept: str, words, rec_templates,
             f"ordered_on_circle={tier2['ordered_on_circle']} "
             f"(radius_cv={tier2['radius_cv']:.3f}, mc_p={tier2['mc_p']:.4f})")
     else:
-        log(f"  adjudicator: {verdict.get('reporting_winner', verdict)}; "
+        log(f"  adjudicator: {verdict['reporting_winner']}; "
             f"centroid diagnostic unavailable: {tier2['reason']}")
 
     # ---- 3. STEER: circle fit on continuation prompts + chord patching -----
