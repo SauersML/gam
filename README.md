@@ -375,8 +375,7 @@ you pay to take part. So the bar to *contribute* is zero:
 - **Beginners welcome.** You don't need REML, Rust, or PyO3 to help. A
   confusing error message, a typo, a docs gap, or "why does it do this?"
   is a real contribution.
-- **AI is allowed.** Wrote it with Claude, Copilot, or an agent? Fine —
-  mention it or don't.
+- **AI is allowed.** Wrote it with Claude, Codex, or a some other agent? Great.
 - **Any feature request, however far-fetched.** "Can it do X?" is useful
   even when the answer is no — it shows how people want to use this.
 - **No template, no checklist, no CLA, no guidelines.** Have fun.
