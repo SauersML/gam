@@ -212,10 +212,7 @@ impl BernoulliRigidRowKernel {
                 let built: RigidThirdFull = (0..n)
                     .into_par_iter()
                     .map(|row| {
-                        let marginal_eta = self.block_states[0].eta[row];
-                        let marginal = self.family.marginal_link_map(marginal_eta)?;
-                        let slope = self.block_states[1].eta[row];
-                        self.family.rigid_row_third_full(row, marginal, slope)
+                        gam_math::jet_tower::program_full_tower(self, row).map(|tower| tower.t3)
                     })
                     .collect::<Result<Vec<_>, String>>()
                     .expect(
@@ -258,10 +255,7 @@ impl BernoulliRigidRowKernel {
                 let built: RigidFourthFull = (0..n)
                     .into_par_iter()
                     .map(|row| {
-                        let marginal_eta = self.block_states[0].eta[row];
-                        let marginal = self.family.marginal_link_map(marginal_eta)?;
-                        let slope = self.block_states[1].eta[row];
-                        self.family.rigid_row_fourth_full(row, marginal, slope)
+                        gam_math::jet_tower::program_full_tower(self, row).map(|tower| tower.t4)
                     })
                     .collect::<Result<Vec<_>, String>>()
                     .expect(
@@ -280,6 +274,58 @@ impl BernoulliRigidRowKernel {
     }
 }
 
+impl gam_math::jet_tower::RowProgram<2> for BernoulliRigidRowKernel {
+    fn n_rows(&self) -> usize {
+        self.family.y.len()
+    }
+
+    fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
+        if row >= self.family.y.len() {
+            return Err(format!("BernoulliRigidRowKernel: row {row} out of range"));
+        }
+        Ok([self.block_states[0].eta[row], self.block_states[1].eta[row]])
+    }
+
+    fn eval<S: gam_math::jet_scalar::JetScalar<2>>(
+        &self,
+        row: usize,
+        p: &[S; 2],
+    ) -> Result<S, String> {
+        if row >= self.family.y.len() {
+            return Err(format!("BernoulliRigidRowKernel: row {row} out of range"));
+        }
+        let marginal = self
+            .family
+            .marginal_link_map(self.block_states[0].eta[row])?;
+        let slope = self.block_states[1].eta[row];
+        match self
+            .family
+            .latent_measure
+            .empirical_grid_for_training_row(row)?
+        {
+            None => rigid_standard_normal_row_nll_generic(
+                p,
+                marginal,
+                self.family.z[row],
+                self.family.y[row],
+                self.family.weights[row],
+                self.family.probit_frailty_scale(),
+            ),
+            Some(grid) => {
+                let plan = self
+                    .family
+                    .empirical_rigid_bms_row_jet_plan(row, marginal, slope, &grid)?;
+                let vars = [
+                    gam_math::jet_scalar::FixedRuntimeJet::from_inner(p[0]),
+                    gam_math::jet_scalar::FixedRuntimeJet::from_inner(p[1]),
+                ];
+                plan.evaluate(&vars, 4, &())
+                    .map(|output| output.nll.into_inner())
+            }
+        }
+    }
+}
+
 impl RowKernel<2> for BernoulliRigidRowKernel {
     fn n_rows(&self) -> usize {
         self.family.y.len()
@@ -289,10 +335,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     }
 
     fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
-        let marginal_eta = self.block_states[0].eta[row];
-        let marginal = self.family.marginal_link_map(marginal_eta)?;
-        let g = self.block_states[1].eta[row];
-        self.family.rigid_row_kernel_eval(row, marginal, g)
+        gam_math::jet_tower::program_row_kernel(self, row)
     }
 
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 2] {
