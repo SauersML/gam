@@ -6867,7 +6867,8 @@ impl ManifoldSaeCore {
     /// closed-form seed `a0 = sqrt(2 q*/(dgᵀ M dg))` plus, when a `probe`
     /// (a Python callable `a → measured KL in nats`, a patched forward) is
     /// supplied, the closed-loop-corrected amplitude, the measured KL, and the
-    /// dual radii (`chart_radius` as shipped + `readout_kl_radius`). Reuses the
+    /// exact activation `delta`, measured-validation state, and dual radii
+    /// (`validity_radius` + `readout_kl_radius`). Reuses the
     /// SAME frozen-dictionary rebuild as `steer`.
     #[pyo3(signature = (request, probe = None))]
     fn steer_to_target<'py>(

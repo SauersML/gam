@@ -1019,7 +1019,7 @@ pub struct SaeSteerToTargetRequest {
 
 /// Solve for the amplitude that realizes `target_nats` on atom `atom_k`'s chord.
 /// The optional `probe` (a patched-forward KL callback, `a → KL`) drives the
-/// closed-loop secant correction and the readout-KL radius; with `probe = None`
+/// bracketed closed-loop correction and the readout-KL radius; with `probe = None`
 /// the returned [`TargetDosePlan`] is the unvalidated closed-form seed.
 pub fn run_sae_manifold_steer_to_target(
     request: SaeSteerToTargetRequest,

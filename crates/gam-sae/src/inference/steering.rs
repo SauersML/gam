@@ -715,6 +715,29 @@ fn probe_kl(probe: &mut PatchedForwardKl<'_>, a: f64) -> Result<f64, TargetDoseE
     Ok(kl)
 }
 
+fn record_readout_probe(
+    amplitude: f64,
+    measured: f64,
+    predicted: f64,
+    tolerance: f64,
+    first_failure: &mut Option<f64>,
+    radius: &mut Option<f64>,
+) {
+    let agrees = predicted > 0.0 && (measured - predicted).abs() / predicted <= tolerance;
+    if agrees {
+        if (*first_failure).is_none_or(|failed| amplitude < failed) {
+            *radius = Some((*radius).map_or(amplitude, |current| current.max(amplitude)));
+        }
+    } else {
+        *first_failure = Some(
+            (*first_failure).map_or(amplitude, |failed| failed.min(amplitude)),
+        );
+        if (*radius).is_some_and(|current| current >= amplitude) {
+            *radius = None;
+        }
+    }
+}
+
 /// Solve for the amplitude that lands a target output-KL dose `target_nats` (in
 /// nats) on atom `atom_k`'s chord from `t_from` to `t_to` (gh#2263 target-dose
 /// surface — `amplitude = 1` has no universal meaning, the dose does).
@@ -724,8 +747,9 @@ fn probe_kl(probe: &mut PatchedForwardKl<'_>, a: f64) -> Result<f64, TargetDoseE
 /// correctly scaled only because the chord and the metric now share the raw
 /// activation frame (gh#2249, `ace3b9af3`; a Tier-0 σ-mis-scale on `dg` would
 /// have poisoned `a0`). Past the readout-KL radius the true KL saturates, so an
-/// optional `probe` (a patched forward) drives a secant correction onto the
-/// measured curve and opportunistically records the readout-KL radius. With
+/// optional `probe` (a patched forward) constructs a first-crossing bracket and
+/// solves it with a safeguarded secant, while recording the contiguous
+/// readout-KL radius. With
 /// `probe = None` the result is the unvalidated closed-form seed: pure math and
 /// plumbing, no model in the loop.
 pub fn steer_to_target_nats(
@@ -809,25 +833,6 @@ pub fn steer_to_target_nats(
     // fails the contract, no later probe at or beyond it can enlarge the radius.
     let mut first_readout_failure: Option<f64> = None;
     let mut readout_kl_radius: Option<f64> = None;
-    let mut record_readout = |amplitude: f64, measured: f64| {
-        let predicted = quad(amplitude);
-        let agrees = predicted > 0.0
-            && (measured - predicted).abs() / predicted <= config.readout_tol_rel;
-        if agrees {
-            if first_readout_failure.is_none_or(|failed| amplitude < failed) {
-                readout_kl_radius = Some(
-                    readout_kl_radius.map_or(amplitude, |radius| radius.max(amplitude)),
-                );
-            }
-        } else {
-            first_readout_failure = Some(
-                first_readout_failure.map_or(amplitude, |failed| failed.min(amplitude)),
-            );
-            if readout_kl_radius.is_some_and(|radius| radius >= amplitude) {
-                readout_kl_radius = None;
-            }
-        }
-    };
 
     // Establish a genuine first-crossing bracket [lo, hi], starting from the
     // exact point KL(0)=0 and expanding the closed-form seed until the measured
@@ -838,7 +843,14 @@ pub fn steer_to_target_nats(
     let mut hi_a = seed_amplitude;
     let mut hi_kl = probe_kl(probe, hi_a)?;
     probes += 1;
-    record_readout(hi_a, hi_kl);
+    record_readout_probe(
+        hi_a,
+        hi_kl,
+        quad(hi_a),
+        config.readout_tol_rel,
+        &mut first_readout_failure,
+        &mut readout_kl_radius,
+    );
     if (hi_kl - target_nats).abs() / target_nats <= config.tol_rel {
         return finish(hi_a, Some(hi_kl), probes, readout_kl_radius);
     }
@@ -854,7 +866,14 @@ pub fn steer_to_target_nats(
         let next_a = hi_a * 2.0;
         let next_kl = probe_kl(probe, next_a)?;
         probes += 1;
-        record_readout(next_a, next_kl);
+        record_readout_probe(
+            next_a,
+            next_kl,
+            quad(next_a),
+            config.readout_tol_rel,
+            &mut first_readout_failure,
+            &mut readout_kl_radius,
+        );
         if next_kl <= hi_kl {
             return Err(TargetDoseError::UnreachableTarget {
                 target_nats,
@@ -883,7 +902,14 @@ pub fn steer_to_target_nats(
         };
         let measured = probe_kl(probe, candidate)?;
         probes += 1;
-        record_readout(candidate, measured);
+        record_readout_probe(
+            candidate,
+            measured,
+            quad(candidate),
+            config.readout_tol_rel,
+            &mut first_readout_failure,
+            &mut readout_kl_radius,
+        );
         if (measured - target_nats).abs() / target_nats <= config.tol_rel {
             return finish(candidate, Some(measured), probes, readout_kl_radius);
         }
