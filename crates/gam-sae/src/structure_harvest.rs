@@ -7070,28 +7070,38 @@ mod tests {
     /// without it K could never grow.
     #[test]
     fn residual_bearing_fit_harvests_birth_proposal() {
-        // A single circle atom routed on every row; its fitted reconstruction
-        // leaves a structured residual (R = −fitted has rank > 1 across the p=4
-        // output channels), so the whitened residual-factor subspace is
-        // non-empty and the birth channel mines a candidate direction.
+        // An OVERCOMPLETE dictionary (G = 8 atoms, exactly one active per token ⇒
+        // L0 = 1) so the #2233 birth pre-screen the harvest channel now embeds
+        // (`predicted_birth_dl_bits`) sees a real support saving log₂(G/L0) = 3
+        // bits/token — the term that funds a curved birth. A single-atom dictionary
+        // (G = 1, log₂(G/L0) = 0) offers ZERO overcompleteness and a lone LINEAR
+        // residual direction earns no code saving either, so the pre-screen
+        // correctly refuses to birth there: growth pays only once a curved atom
+        // spares the extra active slots a flat span would spend.
         let n = 40usize;
-        let active: Vec<Vec<bool>> = (0..n).map(|_| vec![true]).collect();
+        let k = 8usize;
+        let active: Vec<Vec<bool>> = (0..n)
+            .map(|row| (0..k).map(|atom| atom == row % k).collect())
+            .collect();
         let (term, rho) = planted_term(&active);
-        // Inject a clear shared-direction (rank-1) factor into the residuals that
-        // varies smoothly with the per-row activity coordinate, so the whitened
-        // residual-factor evidence ladder selects rank ≥ 1: every row gets a
-        // multiple of the same unit output direction `u`, scaled by a per-row
-        // amplitude. This is the unexplained shared structure a born atom would
-        // absorb.
+        // Inject a genuinely CURVED (rank-2) residual: a zero-mean circle living in
+        // the 2-plane spanned by two ORTHONORMAL output directions `u ⟂ v`. Its two
+        // factor coordinates carry balanced, common-mode-free energy (an isotropic
+        // 2-D cloud, not a dominant shared direction), so the LOCAL ambient span the
+        // pre-screen measures on the candidate's own firing rows is ≈ 2 ⇒ priced as
+        // a circle (d = 1, code term 0) with a positive support saving. This is the
+        // curved structure a born atom absorbs — the birth the theorem admits.
         let p = term.output_dim();
         let mut residuals = Array2::<f64>::zeros((n, p));
         let u = [0.6_f64, -0.4, 0.5, -0.3];
+        let v = [0.4_f64, 0.6, 0.3, 0.5]; // u · v = 0, ‖u‖ = ‖v‖
+        let un: f64 = u.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let vn: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
         for row in 0..n {
-            // A non-constant per-row amplitude so the factor is genuine shared
-            // structure (not absorbed by the diagonal noise floor).
-            let amp = 1.0 + (row as f64) / (n as f64);
-            for c in 0..p {
-                residuals[[row, c]] = amp * u[c % u.len()];
+            let theta = std::f64::consts::TAU * (row as f64) / (n as f64);
+            let (s, c) = theta.sin_cos();
+            for out in 0..p {
+                residuals[[row, out]] = 2.0 * (c * u[out] / un + s * v[out] / vn);
             }
         }
         let params = HarvestParams {
