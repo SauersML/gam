@@ -1081,9 +1081,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     fn batched_value_grad_hess_all(
         &self,
     ) -> Option<Result<(Vec<f64>, Vec<[f64; 4]>, Vec<[[f64; 4]; 4]>), String>> {
-        use crate::gpu_kernels::survival_rowjet::{
-            SurvivalRowInputs, survival_rigid_row_vgh, survival_rigid_row_vgh_device_selected,
-        };
+        use crate::gpu_kernels::survival_rowjet::survival_rigid_row_vgh_device_selected;
 
         let n = self.family.n;
         if !survival_rigid_row_vgh_device_selected(n) {
@@ -1092,6 +1090,9 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
 
         #[cfg(target_os = "linux")]
         {
+            use crate::gpu_kernels::survival_rowjet::{
+                SurvivalRowInputs, survival_rigid_row_vgh,
+            };
             let probit_scale = self.family.probit_frailty_scale();
             let qd1_lower = self.family.time_derivative_lower_bound();
             // Gather per-row inputs in parallel (the pure-f64 score summary + primary
