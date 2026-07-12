@@ -81,6 +81,7 @@ use std::sync::{Arc, Mutex};
 /// `TwoSeed<0>` selects the mixed second directional derivative. There are no
 /// primary axes because this program differentiates only along supplied
 /// coefficient-space directions.
+///
 /// The pair of coefficient-space directions a Fisher perturbation is seeded
 /// along. First-directional seeds consume only `u`; the mixed second-directional
 /// seed consumes both. Bundling the pair keeps a single `seed` signature across
@@ -254,6 +255,12 @@ fn write_static_fisher<S: FisherPerturbation, F: Fn(usize) -> f64, const M: usiz
 /// zero and one, so this performs no transcendental calls. Instantiating the
 /// same expression at `OneSeed<0>` or `TwoSeed<0>` yields every live first- and
 /// second-directional Fisher path without a dense class-axis derivative tower.
+/// Only live nilpotent coefficients survive between phases: one contiguous
+/// weighted first channel or three mixed-second channels. The generated output
+/// lowering specializes the common Fisher entry at `M=2,3,8,32` and uses a
+/// contiguous full-row form from `M=64`, while arbitrary widths retain the same
+/// triangular expression. These are storage/loop lowerings of this expression,
+/// not independent derivative formulas.
 #[inline(always)]
 fn softmax_fisher_perturbation<S: FisherPerturbation>(
     m: usize,
@@ -2544,21 +2551,18 @@ mod tests {
     use gam_problem::DenseMatrixHyperOperator;
     use ndarray::array;
 
-    /// #932 production single-source parity: the LIVE multinomial hand tower
+    /// #932 production single-source parity: the live multinomial tower
     /// (`joint_loglik_and_gradient_from_probs`, `hessian_matvec_into_with_probs`,
     /// and the third/fourth `directional_fisher_jet_rows` /
-    /// `second_directional_fisher_jet_rows` closed forms that the #1082
-    /// Jeffreys/Firth inner cycle runs) is pinned, by INVOKING PRODUCTION, against
-    /// the universal gam-math jet — and against an independent finite-difference
-    /// witness that never touches the jet.
+    /// `second_directional_fisher_jet_rows` coefficient projections that the
+    /// #1082 Jeffreys/Firth inner cycle runs) is pinned, by INVOKING PRODUCTION,
+    /// against the universal gam-math jet — and against an independent
+    /// finite-difference witness that never touches the jet.
     ///
-    /// The live hand tower is deliberately RETAINED (documented performance
-    /// exception at the code sites): the generic per-row `Tower4` cannot replace
-    /// the X-factored β-space scatter the hot path assembles without the same
-    /// order-of-magnitude regression the sibling SAE softmax cutover measured
-    /// (25–57×). This module is the non-ignored oracle that makes the retained
-    /// hand tower non-divergent: any dropped or sign-flipped term in the live
-    /// closed forms is loud here.
+    /// Production differentiates the one normalized-softmax Fisher expression
+    /// through compact nilpotent channels; only the X-factored coefficient-space
+    /// scatter is specialized. This module makes any dropped or sign-flipped
+    /// coefficient loud without retaining separate production calculus.
     mod jet_single_source_932 {
         use super::*;
         use gam_math::jet_scalar::JetScalar;
@@ -2756,7 +2760,7 @@ mod tests {
                     }
                 }
 
-                // Third + fourth directional Fisher jets from the live closed forms.
+                // Third + fourth directional Fisher jets from the live generated expression.
                 let dir: [f64; M] = std::array::from_fn(|_| rng.uniform(-1.5, 1.5));
                 let u: [f64; M] = std::array::from_fn(|_| rng.uniform(-1.5, 1.5));
                 let jet_third = program_third_contracted(&prog, 0, &dir).expect("jet third");
@@ -4221,16 +4225,15 @@ mod tests {
     // #932 doctrine oracle for the softmax directional / second-directional
     // joint-Hessian assembly.
     //
-    // The production hand path builds the per-canonical-axis derivatives of the
+    // The production generated path builds the per-canonical-axis derivatives of the
     // joint softmax Fisher Hessian `H(β) = block(Xᵀ W(β) X)`,
     // `W = diag(p) − p pᵀ`, in one fused row sweep
     // (`assemble_all_axis_directional_derivatives`,
-    // `assemble_all_axis_second_directional_derivatives`). Those hand
-    // `diag(p)−ppᵀ` directional assemblies are FAST and STAY in production, but
-    // — exactly like every other #932 family — they must be pinned to a
-    // MECHANICAL single source so a dropped or mis-weighted softmax-Jacobian
-    // term (the #736/#947 bug genus) is caught here, not in a silently wrong
-    // outer Jeffreys drift.
+    // `assemble_all_axis_second_directional_derivatives`). Their
+    // `diag(p)−ppᵀ` coefficients come from the same normalized-softmax
+    // perturbation expression as the general-direction path. This independent
+    // finite-difference oracle catches a dropped or mis-weighted coefficient
+    // (the #736/#947 bug genus), not divergence between production formulas.
     //
     // MECHANICAL SOURCE (independent of the assembly under test):
     //  * `H(β) = exact_newton_joint_hessian(β)` is the STATIC joint Fisher
