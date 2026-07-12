@@ -11,9 +11,6 @@ use crate::estimate::penalty::{
 use crate::estimate::prefit::{
     reject_prefit_binomial_separation, reject_prefit_unpenalized_rank_deficiency,
 };
-use crate::estimate::reml::eval::{
-    AUTO_CUBATURE_HESSIAN_RIDGE_ABS, AUTO_CUBATURE_HESSIAN_RIDGE_REL,
-};
 use crate::estimate::smoothing_correction::AUTO_CUBATURE_MAX_EIGENVECTORS;
 use gam_linalg::matrix::FactorizedSystem;
 use gam_linalg::utils::KahanSum;
@@ -181,139 +178,6 @@ fn reserve_factorized_inference_state(
             log::info!("Factorized inference state could not be fully reserved: {error}");
             None
         }
-    }
-}
-
-struct DiagonalSmoothingCorrection {
-    diagonal: Option<Array1<f64>>,
-    rho_covariance: Option<Array2<f64>>,
-}
-
-/// Diagonal of the low-rank smoothing correction `J V_rho J'` without ever
-/// materializing its p×p product. `mode_response` stores `H⁻¹ ∂g/∂rho`;
-/// the IFT Jacobian is its negative, which cancels in the covariance
-/// congruence.
-fn low_rank_covariance_diagonal(
-    mode_response: ndarray::ArrayView2<'_, f64>,
-    rho_covariance: &Array2<f64>,
-) -> Option<Array1<f64>> {
-    let (p, k) = mode_response.dim();
-    if rho_covariance.dim() != (k, k) {
-        return None;
-    }
-    let mut diagonal = Array1::<f64>::zeros(p);
-    for i in 0..p {
-        let row = mode_response.row(i);
-        let mut value = KahanSum::default();
-        for a in 0..k {
-            for b in 0..k {
-                value.add(row[a] * rho_covariance[[a, b]] * row[b]);
-            }
-        }
-        let value = value.sum();
-        if !value.is_finite() {
-            return None;
-        }
-        // `rho_covariance` is the positive-eigenvalue pseudo-inverse, so this
-        // quadratic form is non-negative in exact arithmetic. Remove only a
-        // roundoff sign; no curvature direction has been discarded here.
-        diagonal[i] = value.max(0.0);
-    }
-    Some(diagonal)
-}
-
-/// First-order smoothing-parameter correction for the factorized inference
-/// path. The outer Hessian is only k×k and the cached IFT mode responses are
-/// p×k, so peak storage is linear in p for fixed smoothing dimension.
-fn compute_diagonal_smoothing_correction(
-    reml_state: &crate::estimate::reml::RemlState<'_>,
-    final_rho: &Array1<f64>,
-) -> DiagonalSmoothingCorrection {
-    if final_rho.is_empty() {
-        return DiagonalSmoothingCorrection {
-            diagonal: None,
-            rho_covariance: None,
-        };
-    }
-    let mut rho_hessian = match reml_state.compute_lamlhessian_consistent(final_rho) {
-        Ok(hessian) => hessian,
-        Err(error) => {
-            log::warn!("Outer Hessian unavailable for diagonal smoothing correction: {error}");
-            return DiagonalSmoothingCorrection {
-                diagonal: None,
-                rho_covariance: None,
-            };
-        }
-    };
-    gam_linalg::matrix::symmetrize_in_place(&mut rho_hessian);
-    // Match the established first-order smoothing-correction V_rho exactly:
-    // one relative ridge with the shared absolute floor, then the same
-    // identified-subspace inverse. This keeps dense and diagonal inference on
-    // one rho-covariance definition.
-    gam_linalg::utils::add_relative_diag_ridge(
-        &mut rho_hessian,
-        AUTO_CUBATURE_HESSIAN_RIDGE_REL,
-        AUTO_CUBATURE_HESSIAN_RIDGE_ABS,
-    );
-    let Some(inverted) =
-        crate::estimate::smoothing_correction::invert_regularized_rho_hessian(&rho_hessian)
-    else {
-        log::warn!("Outer Hessian inversion failed for diagonal smoothing correction");
-        return DiagonalSmoothingCorrection {
-            diagonal: None,
-            rho_covariance: None,
-        };
-    };
-    let rho_covariance = inverted.inverse;
-    if inverted.active_rank == 0 {
-        return DiagonalSmoothingCorrection {
-            diagonal: None,
-            rho_covariance: Some(rho_covariance),
-        };
-    }
-
-    // `cached_ift_rho_mode_response_cols` clones the cache payload. Reserve
-    // both the resident cache matrix and that temporary clone as one atomic
-    // linear-memory live set before asking for it.
-    let p = reml_state.p;
-    let k = final_rho.len();
-    let Ok(_mode_response_reservation) = gam_runtime::resource::MemoryGovernor::global()
-        .try_reserve_dense_f64_copies(p, k, 2, "diagonal smoothing-correction IFT mode responses")
-    else {
-        return DiagonalSmoothingCorrection {
-            diagonal: None,
-            rho_covariance: Some(rho_covariance),
-        };
-    };
-    let cache_guard = reml_state.ift_warm_start_cache.read().unwrap();
-    let Some(cache) = cache_guard.as_ref() else {
-        return DiagonalSmoothingCorrection {
-            diagonal: None,
-            rho_covariance: Some(rho_covariance),
-        };
-    };
-    if cache.rho.len() != final_rho.len()
-        || cache
-            .rho
-            .iter()
-            .zip(final_rho.iter())
-            .any(|(&cached, &final_value)| cached.to_bits() != final_value.to_bits())
-    {
-        return DiagonalSmoothingCorrection {
-            diagonal: None,
-            rho_covariance: Some(rho_covariance),
-        };
-    }
-    let Some(mode_response) = reml_state.cached_ift_rho_mode_response_cols(cache) else {
-        return DiagonalSmoothingCorrection {
-            diagonal: None,
-            rho_covariance: Some(rho_covariance),
-        };
-    };
-    let diagonal = low_rank_covariance_diagonal(mode_response.view(), &rho_covariance);
-    DiagonalSmoothingCorrection {
-        diagonal,
-        rho_covariance: Some(rho_covariance),
     }
 }
 
@@ -2495,7 +2359,7 @@ where
         // correction lands on the same c² variance scale as `Vb = cov_scale·H_opt⁻¹`
         // (#582); the var_beta = Cov_ρ[β̂] block is already on that scale and
         // stays unscaled.
-        let smoothing_correction_diagonal = if beta_covariance_unscaled.is_some() {
+        if beta_covariance_unscaled.is_some() {
             let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
                 &final_rho,
                 &lambdas,
@@ -2506,12 +2370,7 @@ where
             )?;
             rho_covariance = smoothing_outcome.rho_covariance().cloned();
             smoothing_correction = smoothing_outcome.into_correction();
-            None
-        } else {
-            let diagonal_outcome = compute_diagonal_smoothing_correction(&reml_state, &final_rho);
-            rho_covariance = diagonal_outcome.rho_covariance;
-            diagonal_outcome.diagonal
-        };
+        }
 
         // Tier-0 marginal-smoothing certificate (#938): while the REML objective
         // is still live, sample the outer criterion around the converged ρ̂ to
@@ -2675,44 +2534,37 @@ where
             (Some(base_cov), Some(corr)) if base_cov.as_array().dim() == corr.dim() => {
                 let mut corrected = base_cov.as_array().clone();
                 corrected += corr;
-                if let Some(a_bc) = bias_correction_jacobian.as_ref()
-                    && a_bc.dim() == corrected.dim()
-                {
+                if let Some(a_bc) = bias_correction_jacobian.as_ref() {
+                    if a_bc.dim() != corrected.dim() {
+                        return Err(EstimationError::RemlOptimizationFailed(format!(
+                            "bias-correction Jacobian shape {:?} does not match corrected covariance {:?}",
+                            a_bc.dim(),
+                            corrected.dim()
+                        )));
+                    }
                     corrected = a_bc.dot(&corrected).dot(&a_bc.t());
                 }
                 gam_linalg::matrix::symmetrize_in_place(&mut corrected);
                 Some(corrected)
             }
-            (Some(_), Some(corr)) => {
-                log::warn!(
-                    "Skipping corrected covariance: dimension mismatch (base {:?}, corr {:?})",
-                    beta_covariance.as_ref().map(|c| c.as_array().dim()),
-                    Some(corr.dim())
-                );
-                None
+            (Some(base), Some(corr)) => {
+                return Err(EstimationError::RemlOptimizationFailed(format!(
+                    "base covariance shape {:?} does not match smoothing correction {:?}",
+                    base.as_array().dim(),
+                    corr.dim()
+                )));
             }
             _ => None,
         };
         beta_standard_errors_corrected = beta_covariance_corrected
             .as_ref()
             .map(se_from_covariance)
-            .or_else(|| {
-                let base = beta_standard_errors.as_ref()?;
-                let correction = smoothing_correction_diagonal.as_ref()?;
-                if base.len() != correction.len() {
-                    log::warn!(
-                        "Skipping corrected standard errors: base length {} != smoothing diagonal length {}",
-                        base.len(),
-                        correction.len(),
-                    );
-                    return None;
-                }
-                Some(Array1::from_iter(
-                    base.iter()
-                        .zip(correction.iter())
-                        .map(|(&se, &delta)| (se * se + delta.max(0.0)).sqrt()),
+            .transpose()
+            .map_err(|error| {
+                EstimationError::RemlOptimizationFailed(format!(
+                    "corrected coefficient covariance is not a valid standard-error source: {error}"
                 ))
-            });
+            })?;
     }
     let inference = opts.compute_inference.then(|| FitInference {
         edf_by_block,
@@ -2777,20 +2629,31 @@ where
         }
         _ => {}
     }
+    if zero_covariance_boundary {
+        return Err(EstimationError::InvalidInput(
+            "the general REML reporting path reached the degenerate profiled-Gaussian boundary sigma^2 = 0, where no finite normalized Gaussian density exists; exact constant-response fits must use the dedicated deterministic-Gaussian shortcut"
+                .to_string(),
+        ));
+    }
     // The fully-normalized reporting kernel (#2096) reads a CONCRETE dispersion
     // `φ = σ̂²` for Gaussian off `likelihood.scale`. A profiled Gaussian carries
     // only the `ProfiledGaussian` marker (`fixed_phi() == None`), which the
     // kernel maps to NaN by contract (the #1583 no-silent-`φ=1` rule) — so the
     // reported `log_likelihood` (and the AIC built from it) came out NaN for
-    // every Gaussian fit. Resolve the profiled residual scale `σ̂²` (the
-    // `standard_deviation` computed above, floored like `cov_scale`) into the
-    // reporting spec here. This is a REPORTING-only substitution: the persisted
-    // `likelihood_scale` field below stays `ProfiledGaussian` so downstream
-    // consumers still see that the scale was profiled, not user-fixed.
+    // every non-degenerate Gaussian fit. Resolve a positive profiled residual
+    // scale `σ̂²` into the reporting spec exactly. The validated boundary
+    // estimate `σ̂² = 0` deliberately stays `ProfiledGaussian`: an ordinary
+    // normalized Lebesgue density does not exist there, and relabeling it as a
+    // positive fixed dispersion would falsify both provenance and density. This
+    // is a REPORTING-only substitution: the persisted `likelihood_scale` field
+    // below stays `ProfiledGaussian` so downstream consumers still see that the
+    // scale was profiled, not user-fixed.
     let reporting_scale = match (&reported_family.response, likelihood_scale_field) {
-        (ResponseFamily::Gaussian, LikelihoodScaleMetadata::ProfiledGaussian) => {
+        (ResponseFamily::Gaussian, LikelihoodScaleMetadata::ProfiledGaussian)
+            if !zero_covariance_boundary =>
+        {
             LikelihoodScaleMetadata::FixedDispersion {
-                phi: (standard_deviation * standard_deviation).max(f64::MIN_POSITIVE),
+                phi: standard_deviation * standard_deviation,
             }
         }
         _ => likelihood_scale_field,

@@ -1,5 +1,4 @@
-use crate::estimate::EstimationError;
-use crate::estimate::{FitGeometry, UnifiedFitResult};
+use crate::estimate::{EstimationError, FitGeometry, UnifiedFitResult, dispersion_from_likelihood};
 use crate::pirls;
 use faer::Mat as FaerMat;
 use faer::linalg::matmul::matmul;
@@ -7,8 +6,8 @@ use faer::prelude::ReborrowMut;
 use faer::{Accum, Par};
 use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky};
 use gam_linalg::matrix::{PsdWeightsView, SignedWeightsView};
-use gam_linalg::utils::StableSolver;
-use gam_problem::LinkFunction;
+use gam_linalg::utils::certified_spd_factorize;
+use gam_problem::{Dispersion, LikelihoodScaleMetadata, LinkFunction, ResponseFamily};
 use ndarray::{Array1, Array2, ArrayView1, ShapeBuilder, s};
 use opt::{BacktrackConfig, backtracking_line_search};
 use std::convert::Infallible;
@@ -342,14 +341,24 @@ const MULTIBLOCK_ALO_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// scalar-leverage path. Sizes the reusable `(p, .)` and `(e_rank, .)` scratch
 /// buffers so the dense multi-RHS solve stays BLAS-3 (good cache reuse) without
 /// materializing all `n` columns at once. The final batch is the remainder.
-const ALO_RHS_BLOCK_COLS: usize = 8192;
+const ALO_MAX_RHS_BLOCK_COLS: usize = 8192;
 
-/// Relative tolerance for accepting the input penalised Hessian `H` as
-/// symmetric. We require `|H_ij − H_ji| ≤ HESSIAN_SYMMETRY_REL_TOL ·
-/// max(|H_ij|, |H_ji|, 1)`. `1e-8` matches the loosest tolerance any
-/// upstream symmetrisation pass leaves on the matrix and is tight enough
-/// that a genuinely asymmetric Hessian (a real bug) is caught.
-const HESSIAN_SYMMETRY_REL_TOL: f64 = 1e-8;
+/// Choose the scalar ALO solve width from the actual live scratch footprint.
+///
+/// One column retains `X'H^-1` input (`p`), the certified solution and its
+/// product/residual workspaces (conservatively `4p`), and `X H^-1 x_i` (`n`).
+/// The old fixed width of 8192 made the supposedly blocked `n x width` scratch
+/// consume multiple GiB on ordinary large fits. Saturating dimension arithmetic
+/// makes even an impossible allocation request resolve to a one-column attempt
+/// instead of wrapping the budget calculation.
+#[inline]
+fn alo_rhs_block_cols(n: usize, p: usize) -> usize {
+    let scalars_per_col = n.saturating_add(p.saturating_mul(5)).max(1);
+    let bytes_per_col = std::mem::size_of::<f64>().saturating_mul(scalars_per_col);
+    (MULTIBLOCK_ALO_MEMORY_BUDGET_BYTES / bytes_per_col.max(1))
+        .max(1)
+        .min(ALO_MAX_RHS_BLOCK_COLS)
+}
 
 /// Diagonal ridge added to the local block precision when its LU pivot is
 /// below [`LU_PIVOT_SINGULAR_TOL`]. Matches the legacy `eps = 1e-6`
@@ -422,9 +431,78 @@ fn multiblock_alo_parallel_leverage_chunk_size(
 fn compute_alo_diagnostics_from_pirls_impl(
     base: &pirls::PirlsResult,
     y: ArrayView1<f64>,
-    link: LinkFunction,
 ) -> Result<AloDiagnostics, EstimationError> {
-    compute_alo_diagnostics_from_pirls_inner(base, y, link).map_err(EstimationError::from)
+    compute_alo_diagnostics_from_pirls_inner(base, y).map_err(EstimationError::from)
+}
+
+/// Resolve the multiplier on `H^-1` from the likelihood metadata and the
+/// converged profiled-Gaussian residual geometry. This is deliberately not a
+/// link switch: Gamma, Tweedie, Beta, NB, Poisson, Binomial, and fixed-scale
+/// Gaussian already carry their full scale in the working Hessian and therefore
+/// all have coefficient-covariance multiplier one.
+fn alo_covariance_scale(base: &pirls::PirlsResult) -> Result<f64, AloError> {
+    let dispersion = match (
+        &base.likelihood.spec.response,
+        base.likelihood.scale,
+    ) {
+        (ResponseFamily::Gaussian, LikelihoodScaleMetadata::ProfiledGaussian) => {
+            let rss = base.deviance;
+            if !(rss.is_finite() && rss >= 0.0) {
+                return Err(AloError::InvalidInput {
+                    reason: format!(
+                        "ALO requires a finite non-negative profiled-Gaussian residual sum of squares; got {rss}"
+                    ),
+                });
+            }
+            let mut positive_rows = 0usize;
+            for (row, &weight) in base.finalweights.iter().enumerate() {
+                if !weight.is_finite() || weight < 0.0 {
+                    return Err(AloError::WeightInvalid {
+                        reason: format!(
+                            "profiled-Gaussian ALO requires finite non-negative converged weights; row {row} has {weight}"
+                        ),
+                    });
+                }
+                positive_rows += usize::from(weight > 0.0);
+            }
+            let residual_dof = positive_rows as f64 - base.edf;
+            if !(residual_dof.is_finite() && residual_dof > 0.0) {
+                return Err(AloError::InvalidInput {
+                    reason: format!(
+                        "profiled-Gaussian ALO requires positive residual degrees of freedom; positive_rows={positive_rows}, edf={}, residual_dof={residual_dof}",
+                        base.edf
+                    ),
+                });
+            }
+            let phi = rss / residual_dof;
+            if !phi.is_finite() || (rss > 0.0 && phi == 0.0) {
+                return Err(AloError::InvalidInput {
+                    reason: format!(
+                        "profiled-Gaussian ALO residual variance is not representable: rss={rss}, residual_dof={residual_dof}, phi={phi}"
+                    ),
+                });
+            }
+            Dispersion::estimated(phi).map_err(|error| AloError::InvalidInput {
+                reason: format!("invalid profiled-Gaussian ALO dispersion: {error}"),
+            })?
+        }
+        _ => dispersion_from_likelihood(&base.likelihood, 0.0).map_err(|error| {
+            AloError::InvalidInput {
+                reason: format!("ALO could not resolve likelihood scale metadata: {error}"),
+            }
+        })?,
+    };
+    let scale = base
+        .likelihood
+        .coefficient_covariance_scale(dispersion.phi());
+    if !(scale.is_finite() && scale > 0.0) {
+        return Err(AloError::InvalidInput {
+            reason: format!(
+                "ALO coefficient covariance is unavailable at non-positive or non-finite scale {scale}"
+            ),
+        });
+    }
+    Ok(scale)
 }
 
 /// True when the fitted GLM uses a *curved* canonical link, so that the row NLL
@@ -451,7 +529,6 @@ fn alo_link_needs_exact_curvature_refinement(likelihood: &gam_problem::GlmLikeli
 fn compute_alo_diagnostics_from_pirls_inner(
     base: &pirls::PirlsResult,
     y: ArrayView1<f64>,
-    link: LinkFunction,
 ) -> Result<AloDiagnostics, AloError> {
     let x_dense_arc = base
         .x_transformed
@@ -460,33 +537,7 @@ fn compute_alo_diagnostics_from_pirls_inner(
     let x_dense = x_dense_arc.as_ref();
     let n = x_dense.nrows();
 
-    // Compute dispersion parameter.
-    let phi = match link {
-        LinkFunction::Log => 1.0,
-        LinkFunction::Logit
-        | LinkFunction::Probit
-        | LinkFunction::CLogLog
-        | LinkFunction::LogLog
-        | LinkFunction::Cauchit
-        | LinkFunction::Sas
-        | LinkFunction::BetaLogistic => 1.0,
-        LinkFunction::Identity => {
-            let rss: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
-                let r = y[i] - base.finalmu[i];
-                base.finalweights[i] * r * r
-            });
-            // Effective sample size for dispersion (#584): a zero prior weight
-            // makes w_i·r_i² = 0, so the row is already excluded from the RSS
-            // numerator and must be excluded from the denominator too. Count only
-            // positive-weight rows, exactly as the main optimizer path does
-            // (optimizer.rs ~1567); using the raw row count over a zero-excluding
-            // numerator biases φ̂ low and shrinks every ALO SE.
-            let n_pos = (0..n).filter(|&i| base.finalweights[i] > 0.0).count();
-            let dof = (n_pos as f64) - base.edf;
-            let denom = dof.max(1.0);
-            rss / denom
-        }
-    };
+    let phi = alo_covariance_scale(base)?;
 
     // ALO needs the exact penalized Hessian materialized densely for chunked
     // column solves via StableSolver.  The PIRLS export path validates the
@@ -832,10 +883,11 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
 
     validate_alo_solve_setup(input, n, p)?;
 
-    let factor = StableSolver::new("alo penalized hessian")
-        .factorize(input.penalized_hessian)
-        .map_err(|_| AloError::InfluenceMatrixFailed {
-            condition_number: f64::INFINITY,
+    let factor = certified_spd_factorize(input.penalized_hessian, "ALO penalized Hessian")
+        .map_err(|error| AloError::InvalidInput {
+            reason: format!(
+                "ALO requires an unperturbed positive-definite penalized Hessian with a certified solve: {error}"
+            ),
         })?;
 
     let xt = x_dense.t();
@@ -846,7 +898,7 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
     let mut se_bayes = Array1::<f64>::zeros(n);
     let mut se_sandwich = Array1::<f64>::zeros(n);
 
-    let block_cols = ALO_RHS_BLOCK_COLS;
+    let block_cols = alo_rhs_block_cols(n, p);
     // Allocate the RHS scratch in column-major (Fortran) order so its column
     // slices are contiguous and align with faer's column-major solve output.
     // This removes redundant `xrow = x_dense.row(obs)` indirection inside the
@@ -868,18 +920,22 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
             .assign(&xt.slice(s![.., chunk_start..chunk_end]));
 
         let rhs_chunkview = rhs_chunk_buf.slice(s![.., ..width]);
-        let rhs_chunk = FaerArrayView::new(&rhs_chunkview);
-        // s_chunk is owned column-major faer storage; its column slices are
-        // contiguous and can be read directly via `col_as_slice` — no need to
-        // materialize a parallel ndarray copy.
-        let s_chunk = factor.solve(rhs_chunk.as_ref());
+        let rhs_chunk = rhs_chunkview.to_owned();
+        let (s_chunk, _solve_certificate) = factor.solve_matrix(&rhs_chunk).map_err(|error| {
+            AloError::LooComputationFailed {
+                reason: format!(
+                    "ALO penalized-Hessian solve could not be certified for rows {chunk_start}..{chunk_end}: {error}"
+                ),
+            }
+        })?;
+        let s_chunk_view = FaerArrayView::new(&s_chunk);
 
         let mut xs_target = xs_chunk_storage.as_mut().subcols_mut(0, width);
         matmul(
             xs_target.rb_mut(),
             Accum::Replace,
             x_dense_view.as_ref(),
-            s_chunk.as_ref(),
+            s_chunk_view.as_ref(),
             1.0,
             Par::Seq,
         );
@@ -888,17 +944,16 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
 
         for local_col in 0..width {
             let obs = chunk_start + local_col;
-            // rhs is column-major Fortran ndarray; faer Mat columns are
-            // contiguous by construction. Both accesses borrow the existing
-            // storage directly — no per-column copy.
+            // The RHS stays column-major; the certified solution is indexed
+            // with its native ndarray strides so this path does not assume a
+            // storage order chosen inside the factor API.
             let rhs_col = rhs_view.column(local_col);
             let rhs_slice = rhs_col.as_slice().expect("column-major col contiguous");
-            let s_slice = s_chunk.col_as_slice(local_col);
 
             let mut x_hinv_x = 0.0f64;
             // Fused dot product over the current solve column.
             for k in 0..p {
-                let sval = s_slice[k];
+                let sval = s_chunk[[k, local_col]];
                 let xval = rhs_slice[k];
                 x_hinv_x = sval.mul_add(xval, x_hinv_x);
             }
@@ -1037,22 +1092,6 @@ fn validate_alo_solve_setup(input: &AloInput, n: usize, p: usize) -> Result<(), 
             reason: "ALO diagnostics require a finite dense exact penalized Hessian".to_string(),
         });
     }
-    for i in 0..p {
-        for j in 0..i {
-            let a = h[[i, j]];
-            let b = h[[j, i]];
-            let scale = a.abs().max(b.abs()).max(1.0);
-            if (a - b).abs() > HESSIAN_SYMMETRY_REL_TOL * scale {
-                return Err(AloError::InvalidInput {
-                    reason: format!(
-                        "ALO diagnostics require a symmetric dense exact penalized Hessian; entries ({i},{j}) and ({j},{i}) differ by {:.3e}",
-                        (a - b).abs()
-                    ),
-                });
-            }
-        }
-    }
-
     let vector_lengths = [
         ("hessian_weights", input.hessian_weights.len()),
         ("score_weights", input.score_weights.len()),
@@ -1111,7 +1150,6 @@ fn validate_alo_solve_setup(input: &AloInput, n: usize, p: usize) -> Result<(), 
 pub fn compute_alo_diagnostics_from_fit(
     fit: &UnifiedFitResult,
     y: ArrayView1<f64>,
-    link: LinkFunction,
 ) -> Result<AloDiagnostics, EstimationError> {
     let pirls = fit
         .artifacts
@@ -1123,7 +1161,7 @@ pub fn compute_alo_diagnostics_from_fit(
                     .to_string(),
         })
         .map_err(EstimationError::from)?;
-    compute_alo_diagnostics_from_pirls_impl(pirls, y, link)
+    compute_alo_diagnostics_from_pirls_impl(pirls, y)
 }
 
 /// Compute ALO diagnostics from a `UnifiedFitResult`.
@@ -1155,9 +1193,8 @@ pub fn compute_alo_diagnostics_from_unified(
 pub fn compute_alo_diagnostics_from_pirls(
     base: &pirls::PirlsResult,
     y: ArrayView1<f64>,
-    link: LinkFunction,
 ) -> Result<AloDiagnostics, EstimationError> {
-    compute_alo_diagnostics_from_pirls_impl(base, y, link)
+    compute_alo_diagnostics_from_pirls_impl(base, y)
 }
 
 /// Exact (one-step) case-deletion influence from a converged PIRLS fit, via
@@ -1181,7 +1218,6 @@ pub fn compute_alo_diagnostics_from_pirls(
 pub fn compute_case_deletion_from_pirls(
     base: &pirls::PirlsResult,
     y: ArrayView1<f64>,
-    link: LinkFunction,
 ) -> Result<Option<crate::sensitivity::CaseDeletionInfluence>, EstimationError> {
     let x_dense_arc = base
         .x_transformed
@@ -1194,25 +1230,7 @@ pub fn compute_case_deletion_from_pirls(
         return Ok(None);
     }
 
-    // Dispersion φ matches the ALO entry point: estimated RSS/(n_pos−edf) for
-    // the Gaussian identity link, fixed at 1 for the single-parameter families.
-    // Zero-weight rows contribute nothing to the RSS, so they must not inflate
-    // the residual degrees of freedom either (#584 weighting consistency).
-    let phi = match link {
-        LinkFunction::Identity => {
-            let rss: f64 = gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
-                let r = y[i] - base.finalmu[i];
-                base.finalweights[i] * r * r
-            });
-            let n_pos = (0..n).filter(|&i| base.finalweights[i] > 0.0).count();
-            let dof = (n_pos as f64) - base.edf;
-            rss / dof.max(1.0)
-        }
-        _ => 1.0,
-    };
-    if !(phi.is_finite() && phi > 0.0) {
-        return Ok(None);
-    }
+    let phi = alo_covariance_scale(base).map_err(EstimationError::from)?;
 
     // The same dense stabilized penalized Hessian ALO materializes; the one
     // factored inverse every sensitivity channel shares.

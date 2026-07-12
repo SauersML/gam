@@ -2251,7 +2251,7 @@ impl UnifiedFitResult {
 
         let check_product = |label: &str, value: f64, multiplier: f64| {
             let product = value * multiplier;
-            if product.is_finite() {
+            if product.is_finite() && !(value != 0.0 && product == 0.0) {
                 Ok(())
             } else {
                 Err(EstimationError::InvalidInput(format!(
@@ -2401,26 +2401,31 @@ impl UnifiedFitResult {
     /// `inference` block was dropped (e.g. `core_saved_fit_result` stores
     /// `inference: None`): the cached `dispersion()` is then `None`, but the
     /// scale is still recoverable and identical to the value used at fit time.
-    /// When the cached block is present its dispersion is preferred verbatim so
-    /// the two paths never diverge. Families without a scalar response scale
-    /// return an error instead of adopting a fictitious unit dispersion.
+    /// A cached inference dispersion is accepted only when it agrees exactly
+    /// with the scale reconstructed from the family contract. Families without
+    /// a scalar response scale return an error instead of adopting a fictitious
+    /// unit dispersion.
     pub fn dispersion_phi(&self) -> Result<f64, EstimationError> {
-        if let Some(dispersion) = self.dispersion() {
-            return Ok(dispersion.phi());
-        }
-        match &self.likelihood_family {
-            Some(spec) => {
-                let glm = GlmLikelihoodSpec {
-                    spec: spec.clone(),
-                    scale: self.likelihood_scale.clone(),
-                };
-                Ok(dispersion_from_likelihood(&glm, self.standard_deviation)?.phi())
-            }
-            None => Err(EstimationError::InvalidInput(
+        let spec = self.likelihood_family.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
                 "this fit has no engine-level family and therefore no scalar response dispersion"
                     .to_string(),
-            )),
+            )
+        })?;
+        let glm = GlmLikelihoodSpec {
+            spec: spec.clone(),
+            scale: self.likelihood_scale,
+        };
+        let resolved = dispersion_from_likelihood(&glm, self.standard_deviation)?;
+        if let Some(cached) = self.dispersion()
+            && cached != resolved
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "cached inference dispersion {:?} disagrees with family-resolved dispersion {:?}",
+                cached, resolved
+            )));
         }
+        Ok(resolved.phi())
     }
 
     /// Multiplier that turns the stored unscaled inverse penalized Hessian

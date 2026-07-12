@@ -207,7 +207,7 @@ pub struct CertifiedSpdFactor<'a> {
     matrix: &'a Array2<f64>,
     matrix_max_abs: f64,
     factor: FaerCholeskyFactor,
-    label: &'a str,
+    label: String,
 }
 
 impl CertifiedSpdFactor<'_> {
@@ -219,7 +219,7 @@ impl CertifiedSpdFactor<'_> {
     ) -> Result<CertifiedSymmetricSolution, CertifiedSymmetricSolveError> {
         if rhs.len() != self.matrix.nrows() {
             return Err(CertifiedSymmetricSolveError::InvalidRhsShape {
-                label: self.label.to_string(),
+                label: self.label.clone(),
                 expected: self.matrix.nrows(),
                 actual: rhs.len(),
             });
@@ -231,7 +231,7 @@ impl CertifiedSpdFactor<'_> {
             self.matrix_max_abs,
             &rhs_matrix,
             &solution,
-            self.label,
+            &self.label,
         )?;
         Ok(CertifiedSymmetricSolution {
             solution: solution.column(0).to_owned(),
@@ -247,7 +247,7 @@ impl CertifiedSpdFactor<'_> {
     ) -> Result<(Array2<f64>, SymmetricSolveCertificate), CertifiedSymmetricSolveError> {
         if rhs.nrows() != self.matrix.nrows() {
             return Err(CertifiedSymmetricSolveError::InvalidRhsShape {
-                label: self.label.to_string(),
+                label: self.label.clone(),
                 expected: self.matrix.nrows(),
                 actual: rhs.nrows(),
             });
@@ -258,7 +258,7 @@ impl CertifiedSpdFactor<'_> {
             self.matrix_max_abs,
             rhs,
             &solution,
-            self.label,
+            &self.label,
         )?;
         Ok((solution, certificate))
     }
@@ -275,7 +275,7 @@ impl CertifiedSpdFactor<'_> {
             self.matrix_max_abs,
             &rhs,
             &inverse,
-            self.label,
+            &self.label,
         )?;
         Ok(CertifiedSpdInverse {
             inverse,
@@ -650,7 +650,7 @@ pub fn certified_symmetric_solve(
 /// diagonal jitter, spectral repair, or an indefinite LDLT/LBLT route.
 pub fn certified_spd_factorize<'a>(
     matrix: &'a Array2<f64>,
-    label: &'a str,
+    label: &str,
 ) -> Result<CertifiedSpdFactor<'a>, CertifiedSymmetricSolveError> {
     let matrix_max_abs = validate_finite_symmetric_matrix(matrix, label)?;
     let factor = matrix.cholesky(Side::Lower).map_err(|error| {
@@ -663,7 +663,7 @@ pub fn certified_spd_factorize<'a>(
         matrix,
         matrix_max_abs,
         factor,
-        label,
+        label: label.to_string(),
     })
 }
 

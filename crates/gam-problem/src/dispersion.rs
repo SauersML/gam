@@ -183,12 +183,6 @@ impl Dispersion {
     }
 }
 
-impl Default for Dispersion {
-    fn default() -> Self {
-        Self::UNIT
-    }
-}
-
 impl From<Dispersion> for DispersionWire {
     fn from(value: Dispersion) -> Self {
         Self {
