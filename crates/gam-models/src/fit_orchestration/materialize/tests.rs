@@ -874,6 +874,91 @@ fn survival_one_positive_weight_event_passes_fittability_gate_issue_2276() {
     }
 }
 
+/// #2276 hardening: per-cause identifiability for competing risks. Codes
+/// `{0, 1, 2}` with cause 1 carrying a positive-weight event but cause 2's only
+/// event zero-weighted: the TOTAL weighted event mass is positive (cause 1), so
+/// the total gate passes, yet cause 2's cause-specific hazard block is
+/// unidentifiable and must be rejected before the fit.
+#[test]
+fn competing_risks_zero_weight_cause_rejected_before_fit_issue_2276() {
+    let data = competing_risks_weighted_dataset([1.0, 2.0, 1.0, 0.0], [1.0, 0.0, 1.0, 1.0]);
+    let config = FitConfig {
+        survival_likelihood: "transformation".to_string(),
+        weight_column: Some("w".to_string()),
+        ..FitConfig::default()
+    };
+
+    let err = materialize("Surv(age_entry, age_exit, event) ~ bmi", &data, &config)
+        .err()
+        .expect("a competing-risks cause with only zero-weight events must fail before fit");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cause 2 of 2") && msg.contains("positive weight"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// #2276 hardening control: when EVERY modeled cause carries a positive-weight
+/// event, the per-cause gate must not trip (the fit may still fail downstream
+/// for unrelated reasons, but never with the unidentifiable-cause message).
+#[test]
+fn competing_risks_all_causes_weighted_passes_per_cause_gate_issue_2276() {
+    let data = competing_risks_weighted_dataset([1.0, 2.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]);
+    let config = FitConfig {
+        survival_likelihood: "transformation".to_string(),
+        weight_column: Some("w".to_string()),
+        ..FitConfig::default()
+    };
+
+    if let Err(err) = materialize("Surv(age_entry, age_exit, event) ~ bmi", &data, &config) {
+        assert!(
+            !err.to_string().contains("unidentifiable"),
+            "all causes carrying a positive-weight event must not trip the per-cause gate: {err}"
+        );
+    }
+}
+
+/// Two-cause competing-risks dataset (`event` codes `{0, 1, 2}`) with a weight
+/// column `w`, parallel to `codes`/`weights`.
+fn competing_risks_weighted_dataset(codes: [f64; 4], weights: [f64; 4]) -> Dataset {
+    let continuous = |name: &str| SchemaColumn {
+        name: name.to_string(),
+        kind: ColumnKindTag::Continuous,
+        levels: vec![],
+    };
+    let entry = [40.0, 41.0, 42.0, 44.0];
+    let exit = [43.0, 46.0, 47.0, 49.0];
+    let bmi = [22.0, 24.0, 27.0, 29.0];
+    let mut values = Array2::<f64>::zeros((4, 5));
+    for i in 0..4 {
+        values[[i, 0]] = entry[i];
+        values[[i, 1]] = exit[i];
+        values[[i, 2]] = codes[i];
+        values[[i, 3]] = bmi[i];
+        values[[i, 4]] = weights[i];
+    }
+    Dataset {
+        headers: vec![
+            "age_entry".to_string(),
+            "age_exit".to_string(),
+            "event".to_string(),
+            "bmi".to_string(),
+            "w".to_string(),
+        ],
+        values,
+        schema: DataSchema {
+            columns: vec![
+                continuous("age_entry"),
+                continuous("age_exit"),
+                continuous("event"),
+                continuous("bmi"),
+                continuous("w"),
+            ],
+        },
+        column_kinds: vec![ColumnKindTag::Continuous; 5],
+    }
+}
+
 /// #2277: a bracketed interval-censored row (`event >= 1`) whose right boundary
 /// equals its left boundary is a zero-width interval; the kernel term
 /// `log[S(L) − S(R)] = log 0 = −∞` would poison the whole fit. Materialization

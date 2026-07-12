@@ -1438,6 +1438,44 @@ mod tests {
         );
     }
 
+    /// #2277 hardening: a NARROW interval-censored window (S(L) ≈ S(R)) must
+    /// stay numerically stable. The interval contribution `log[S(L) − S(R)]` is
+    /// evaluated in the log domain (sign-aware log-sum-exp + `log1mexp`), never
+    /// as a probability-space `S(L) − S(R)` subtraction, so for a small gap
+    /// `Δ = M_R − M_L` the interval mass is `≈ |S'(M_L)|·Δ` and the
+    /// log-likelihood behaves as `const + log Δ` — finite and accurate down to
+    /// gaps where subtracting two nearly-equal survival probabilities would
+    /// catastrophically cancel. Pin the log-linear-in-Δ law: the shared,
+    /// cancellation-prone `const` drops out of the difference, leaving exactly
+    /// `log(Δ₁/Δ₂)`.
+    #[test]
+    fn survival_narrow_interval_is_log_domain_stable_issue_2277() {
+        let ctx = QuadratureContext::new();
+        let (mu, sigma, m_l) = (0.0_f64, 0.6_f64, 1.0_f64);
+        let ll = |gap: f64| {
+            let row = LatentSurvivalRow::interval_censored(0.0, m_l, m_l + gap, 0.0, 0.0, 0.0);
+            LatentSurvivalRowJet::evaluate(&ctx, &row, mu, sigma)
+                .unwrap()
+                .log_lik
+        };
+        let (g1, g2) = (1e-8_f64, 1e-12_f64);
+        let ll1 = ll(g1);
+        let ll2 = ll(g2);
+        assert!(
+            ll1.is_finite() && ll2.is_finite(),
+            "narrow-interval log-lik must stay finite: ll1={ll1}, ll2={ll2}"
+        );
+        // const + log Δ ⇒ ll(g1) − ll(g2) = log(g1/g2), independent of the
+        // shared const a probability-space subtraction would destroy here.
+        let expected = (g1 / g2).ln();
+        assert!(
+            (ll1 - ll2 - expected).abs() < 1e-5,
+            "narrow interval must follow the log-domain log(Δ) law: \
+             ll(g1)-ll(g2)={}, expected {expected}",
+            ll1 - ll2
+        );
+    }
+
     #[test]
     fn survival_interval_censored_neg_hessian_fd() {
         // Second μ-derivative of ℓ = log[S(L) − S(R)] for the interval kernel,
