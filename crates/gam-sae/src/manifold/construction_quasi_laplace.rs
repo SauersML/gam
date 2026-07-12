@@ -3805,10 +3805,6 @@ impl SaeManifoldTerm {
     ) -> Result<SaeArrowVector, String> {
         self.assignment.validate_rho_domain(rho)?;
         let ard_precisions = self.validated_ard_precisions(rho)?;
-        let threshold_strength = match self.assignment.mode {
-            AssignmentMode::ThresholdGate { .. } => rho.lambda_sparse()?,
-            _ => 0.0,
-        };
         let n_params = rho.to_flat().len();
         if j >= n_params {
             return Err(format!(
@@ -4571,6 +4567,14 @@ impl SaeManifoldTerm {
     ) -> Result<SaeArrowVector, String> {
         self.assignment.validate_rho_domain(rho)?;
         let ard_precisions = self.validated_ard_precisions(rho)?;
+        // Threshold-gate sparsity strength for the assignment-prior H-diagonal
+        // derivative (#1006/#1556): the ThresholdGate penalty differentiates
+        // `λ_sparse`, every other assignment mode contributes zero. Same binding
+        // the dense adjoint path builds; the probe path consumes it identically.
+        let threshold_strength = match self.assignment.mode {
+            AssignmentMode::ThresholdGate { .. } => rho.lambda_sparse()?,
+            _ => 0.0,
+        };
         if cache.arrow_log_det().is_none() {
             return Err(
                 "logdet_theta_adjoint_from_probes: cache lacks an authoritative joint-Hessian \
