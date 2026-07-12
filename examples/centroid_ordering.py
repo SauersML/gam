@@ -7,7 +7,7 @@ and ring-of-clusters candidates against the combined non-circular mass. This
 module is an independent ordering diagnostic: it can corroborate the selected
 ring-cluster order, or test whether the centroids of a winning free
 ``mixture`` class nevertheless exhibit circular order against a matched
-Gaussian null.
+conditional-randomization null.
 
 Procedure (validated in the two-tier census of real Qwen3-8B SAE features;
 the same construction historically exposed calendar circles before the
@@ -24,10 +24,13 @@ their radius):
      centroid radii about the centroid mean (low CV = centroids sit on a
      circle), plus angular coverage (max angular gap between sorted
      centroid angles; a big gap = an arc or a clump, not a ring).
-  3. Monte-Carlo null: centroid sets drawn in a centered, uniformly scaled
-     chart from a 2-D Gaussian with the observed covariance shape;
-     rank-deficient covariance remains exactly rank-deficient (no arbitrary
-     ridge); p = P(null CV <= observed CV).
+  3. Full-pipeline conditional-randomization null: independently permute each
+     coordinate column, preserving both empirical marginals exactly while
+     destroying their pairing, then rerun the same seeded Lloyd fit on every
+     draw. The plus-one p-value is
+     P(permuted fitted-centroid CV <= observed CV). Randomizing already-fitted
+     centroids is invalid because k-means quantization itself is part of the
+     statistic.
 
 Caveat carried over from the census: sparse non-negative codes pushed
 through per-group 2-D PCA produce ring-like centroid arrangements on
@@ -92,22 +95,6 @@ def _center_points(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if not np.isfinite(centered).all() or not np.isfinite(location).all():
         raise ValueError("centered point coordinates are non-finite")
     return centered, location
-
-
-def _certify_psd_spectrum(eigenvalues: np.ndarray, trace: float) -> np.ndarray:
-    """Reject material indefiniteness and zero the full backward-error band."""
-    spectrum = np.asarray(eigenvalues, dtype=np.float64)
-    if spectrum.ndim != 1 or spectrum.size == 0 or not np.isfinite(spectrum).all():
-        raise ValueError("covariance eigenspectrum must be a nonempty finite vector")
-    if not np.isfinite(trace) or trace <= 0.0:
-        raise ValueError("covariance trace must be positive and finite")
-    tolerance = 64.0 * spectrum.size * np.finfo(np.float64).eps * trace
-    if float(spectrum.min()) < -tolerance:
-        raise ValueError(
-            "centroid covariance is materially indefinite: "
-            f"minimum eigenvalue {float(spectrum.min()):.6e}"
-        )
-    return np.where(spectrum <= tolerance, 0.0, spectrum)
 
 
 def kmeans_centroids(coords: np.ndarray, k: int, seed: int = 0,
@@ -203,42 +190,43 @@ def ring_stats(centers: np.ndarray) -> tuple[float, float]:
     return cv, float(np.degrees(gaps.max()))
 
 
-def ring_mc_pvalue(centers: np.ndarray, observed_cv: float, n_null: int = 2000,
-                   seed: int = 0) -> float:
-    """P(null radius-CV <= observed) with null centroid sets drawn from a
-    2-D Gaussian matched to the observed covariance shape in a stable centered
-    chart. Translation and uniform scale cancel from radius CV exactly."""
-    c = _finite_points(centers, "centers", 3)
+def ring_mc_pvalue(coords: np.ndarray, k: int, observed_cv: float,
+                   n_null: int = 2000, control_seed: int = 0,
+                   kmeans_seed: int = 0) -> float:
+    """Conditional-randomization P(null fitted-centroid CV <= observed).
+
+    Every draw independently permutes each coordinate column, preserving both
+    empirical marginals exactly while removing cross-coordinate pairing. The
+    same seeded Lloyd map used for the observation is refitted on every draw.
+    This calibrates the complete statistic: fitted centroids are dependent
+    estimators and must not themselves be treated as iid null observations.
+    Ties count in the lower tail and the plus-one correction is applied once.
+    """
+    points = _finite_points(coords, "coords", 3)
+    k = _positive_integer(k, "k")
+    if k < 3:
+        raise ValueError(f"need k >= 3 centroids to test a ring; got k={k}")
+    if k > points.shape[0]:
+        raise ValueError(f"k={k} exceeds the {points.shape[0]} coordinate rows")
     if not np.isfinite(observed_cv) or observed_cv < 0.0:
         raise ValueError(f"observed_cv must be finite and non-negative; got {observed_cv}")
     n_null = _positive_integer(n_null, "n_null")
-    seed = _seed(seed)
-    centered, _ = _center_points(c)
-    coordinate_scale = float(np.max(np.abs(centered)))
-    if not np.isfinite(coordinate_scale) or coordinate_scale <= 0.0:
-        raise ValueError("centroid covariance must have positive finite scale")
-    normalized = centered / coordinate_scale
-    covariance = normalized.T @ normalized / (c.shape[0] - 1)
-    if not np.isfinite(covariance).all():
-        raise ValueError("centroid covariance is non-finite")
-    trace = float(np.trace(covariance))
-    if not np.isfinite(trace) or trace <= 0.0:
-        raise ValueError("centroid covariance must have positive finite trace")
-    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-    # An exact zero eigenvalue may return as either sign at backward-error
-    # scale. Certify and zero that whole envelope so a rank-deficient null never
-    # acquires artificial off-subspace noise.
-    eigenvalues = _certify_psd_spectrum(eigenvalues, trace)
-    factor = eigenvectors * np.sqrt(eigenvalues)[None, :]
-    rng = np.random.default_rng(seed)
-    k = c.shape[0]
+    control_seed = _seed(control_seed)
+    kmeans_seed = _seed(kmeans_seed)
+    rng = np.random.default_rng(control_seed)
+    base_order = np.arange(points.shape[0])
+    row_order = base_order.copy()
+    permuted = np.empty_like(points)
     hits = 0
     for _ in range(n_null):
-        # The statistic recenters every draw, so generate directly in the
-        # centered chart. Adding a huge observed origin would only reintroduce
-        # cancellation without changing the mathematical null distribution.
-        z = rng.standard_normal((k, 2)) @ factor.T
-        cv, _ = ring_stats(z)
+        for column in range(points.shape[1]):
+            # Reset before each independent Fisher-Yates permutation. Reusing
+            # the index buffer avoids allocating two O(n) orders per draw.
+            row_order[:] = base_order
+            rng.shuffle(row_order)
+            permuted[:, column] = points[row_order, column]
+        null_centers = kmeans_centroids(permuted, k, seed=kmeans_seed)
+        cv, _ = ring_stats(null_centers)
         if cv <= observed_cv:
             hits += 1
     return (hits + 1) / (n_null + 1)
@@ -272,7 +260,15 @@ def centroid_circular_ordering(coords: np.ndarray, k: int, *, seed: int = 0,
         )
     centers = kmeans_centroids(coords, k, seed=seed)
     cv, gap = ring_stats(centers)
-    p = ring_mc_pvalue(centers, cv, n_null=n_null, seed=seed ^ 0xCE17_202)
+    control_seed = seed ^ 0xCE17_202
+    p = ring_mc_pvalue(
+        coords,
+        k,
+        cv,
+        n_null=n_null,
+        control_seed=control_seed,
+        kmeans_seed=seed,
+    )
     return {
         "k": int(k),
         "centers": centers,
@@ -280,6 +276,12 @@ def centroid_circular_ordering(coords: np.ndarray, k: int, *, seed: int = 0,
         "max_gap_deg": float(gap),
         "mc_p": float(p),
         "ordered_on_circle": bool(p < p_thresh and gap < gap_thresh_deg),
-        "params": {"seed": seed, "n_null": n_null, "p_thresh": p_thresh,
-                   "gap_thresh_deg": gap_thresh_deg},
+        "params": {
+            "seed": seed,
+            "control_seed": control_seed,
+            "null_kind": "independent_column_permutation",
+            "n_null": n_null,
+            "p_thresh": p_thresh,
+            "gap_thresh_deg": gap_thresh_deg,
+        },
     }

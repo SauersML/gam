@@ -1174,9 +1174,8 @@ mod tests {
             let (sin_angle, cos_angle) = angle.sin_cos();
             for sample in 0..per_cluster {
                 let phase = std::f64::consts::TAU * sample as f64 / per_cluster as f64;
-                // This is a cloud, not a constant-radius micro-circle: the
-                // varying local radius keeps the Gaussian scale direction
-                // identifiable in the empirical-Fisher evidence calculation.
+                // This is a cloud, not a constant-radius micro-circle, so the
+                // planted candidate is a genuine Gaussian cluster model.
                 let local_radius = 0.04 * (1.0 + 0.3 * (3.0 * phase).cos());
                 let radial_noise = local_radius * phase.cos();
                 let tangent_noise = local_radius * phase.sin();
@@ -1191,11 +1190,11 @@ mod tests {
         assert_eq!(verdict.winner_class, "ring_clusters");
         assert!(
             verdict.reporting_winner.starts_with("ring_clusters_k7"),
-            "reporting_winner={} names={:?} weights={:?} evidence={:?}",
+            "reporting_winner={} names={:?} weights={:?} bic={:?}",
             verdict.reporting_winner,
             verdict.candidate_names,
             verdict.stacking_weights,
-            verdict.negative_log_evidence,
+            verdict.bic,
         );
         assert!(verdict.circle_wins);
         assert!(verdict.circular_margin > 0.0);
@@ -1313,8 +1312,8 @@ mod tests {
                 "translation changed held-out ring density: base={base:.16e}, shifted={shifted:.16e}"
             );
         }
-        let base_evidence = ring_negative_log_evidence_2d(coords.view()).unwrap();
-        let shifted_evidence = ring_negative_log_evidence_2d(translated.view()).unwrap();
+        let base_evidence = ring_bic_2d(coords.view()).unwrap();
+        let shifted_evidence = ring_bic_2d(translated.view()).unwrap();
         assert!(
             (base_evidence - shifted_evidence).abs() < 2.0e-9,
             "translation changed ring evidence: base={base_evidence:.16e}, shifted={shifted_evidence:.16e}"
@@ -1345,8 +1344,8 @@ mod tests {
             );
         }
 
-        let base_evidence = ring_negative_log_evidence_2d(coords.view()).unwrap();
-        let scaled_evidence = ring_negative_log_evidence_2d(scaled.view()).unwrap();
+        let base_evidence = ring_bic_2d(coords.view()).unwrap();
+        let scaled_evidence = ring_bic_2d(scaled.view()).unwrap();
         let expected = base_evidence + 2.0 * n as f64 * scale.ln();
         assert!(
             (scaled_evidence - expected).abs() < 2.0e-8,
@@ -1431,8 +1430,8 @@ mod tests {
             );
         }
 
-        let baseline_evidence = gaussian_negative_log_evidence_2d(coords.view()).unwrap();
-        let transformed_evidence = gaussian_negative_log_evidence_2d(transformed.view()).unwrap();
+        let baseline_evidence = gaussian_bic_2d(coords.view()).unwrap();
+        let transformed_evidence = gaussian_bic_2d(transformed.view()).unwrap();
         let expected_evidence = baseline_evidence + 2.0 * n as f64 * scale.ln();
         assert!(
             (transformed_evidence - expected_evidence).abs() < 2.0e-5,
@@ -1471,7 +1470,7 @@ mod tests {
             "the constrained covariance must penalize its null direction: on={on_line}, off={off_line}"
         );
         assert!(
-            gaussian_negative_log_evidence_2d(line.view())
+            gaussian_bic_2d(line.view())
                 .unwrap()
                 .is_finite()
         );
@@ -2297,10 +2296,10 @@ fn gaussian_provider_2d(coords: Array2<f64>) -> gam::solver::HeldOutDensityProvi
     )
 }
 
-/// BIC-form Laplace negative-log-evidence of the circular Gaussian (4 interior
-/// parameters: center(2), circle radius, and isotropic noise variance).
-/// Corroborates the held-out stacking headline; lower is better.
-fn ring_negative_log_evidence_2d(coords: ArrayView2<'_, f64>) -> Result<f64, String> {
+/// BIC/2 of the circular Gaussian (4 parameters: center(2), circle radius, and
+/// isotropic noise variance). Corroborates the held-out stacking headline;
+/// lower is better.
+fn ring_bic_2d(coords: ArrayView2<'_, f64>) -> Result<f64, String> {
     let n = coords.nrows();
     let rows = (0..n).collect::<Vec<_>>();
     let fit = CircularGaussianFit2d::fit(coords, &rows)?;
@@ -2311,10 +2310,10 @@ fn ring_negative_log_evidence_2d(coords: ArrayView2<'_, f64>) -> Result<f64, Str
     Ok(-log_likelihood + 0.5 * 4.0 * (n as f64).ln())
 }
 
-/// BIC-form negative-log-evidence of the full 2-D Gaussian (5 free params:
+/// BIC/2 of the full 2-D Gaussian (5 free params:
 /// mean(2) + symmetric 2×2 covariance(3)), evaluated under the exact same
 /// fitted density as the held-out provider.
-fn gaussian_negative_log_evidence_2d(coords: ArrayView2<'_, f64>) -> Result<f64, String> {
+fn gaussian_bic_2d(coords: ArrayView2<'_, f64>) -> Result<f64, String> {
     let n = coords.nrows();
     let rows = (0..n).collect::<Vec<_>>();
     let fit = GaussianFit2d::fit(coords, &rows)?;
@@ -2331,7 +2330,7 @@ struct AtomShapeRaceVerdict {
     reporting_winner: String,
     candidate_names: Vec<String>,
     stacking_weights: Vec<f64>,
-    negative_log_evidence: Vec<f64>,
+    bic: Vec<f64>,
     mixture_reporting_k: usize,
     ring_clusters_reporting_k: usize,
     mixture_fold_selected_k: Vec<usize>,
@@ -2727,19 +2726,19 @@ fn run_atom_shape_race(
     let candidates = vec![
         PredictiveRaceCandidate {
             kind: candidate_kinds[0],
-            negative_log_evidence: ring_negative_log_evidence_2d(reporting_coords.view())?,
+            negative_log_evidence: ring_bic_2d(reporting_coords.view())?,
             certification: EvidenceCertification::Exact,
             density_provider: ring_provider_2d(raw_coords.clone()),
         },
         PredictiveRaceCandidate {
             kind: candidate_kinds[1],
-            negative_log_evidence: gaussian_negative_log_evidence_2d(reporting_coords.view())?,
+            negative_log_evidence: gaussian_bic_2d(reporting_coords.view())?,
             certification: EvidenceCertification::Exact,
             density_provider: gaussian_provider_2d(raw_coords.clone()),
         },
         PredictiveRaceCandidate {
             kind: candidate_kinds[2],
-            negative_log_evidence: mixture_winner.negative_log_evidence,
+            negative_log_evidence: mixture_winner.bic,
             certification: EvidenceCertification::Exact,
             // The displayed/reported k is the full-data final fit. Its outer-CV
             // predictive column independently selects k on each training fold,
@@ -2754,7 +2753,7 @@ fn run_atom_shape_race(
         },
         PredictiveRaceCandidate {
             kind: candidate_kinds[3],
-            negative_log_evidence: ring_clusters.winner().negative_log_evidence,
+            negative_log_evidence: ring_clusters.winner().bic,
             certification: EvidenceCertification::Exact,
             density_provider: ring_cluster_rung_provider_2d(
                 raw_coords,
@@ -2797,7 +2796,7 @@ fn run_atom_shape_race(
         reporting_winner,
         candidate_names: verdict.candidate_names,
         stacking_weights,
-        negative_log_evidence: verdict.negative_log_evidence,
+        bic: verdict.negative_log_evidence,
         mixture_reporting_k,
         ring_clusters_reporting_k,
         mixture_fold_selected_k,
@@ -2875,7 +2874,7 @@ fn atom_shape_verdict_dict<'py>(
     out.set_item("reporting_winner", &verdict.reporting_winner)?;
     out.set_item("candidate_names", &verdict.candidate_names)?;
     out.set_item("stacking_weights", &verdict.stacking_weights)?;
-    out.set_item("negative_log_evidence", &verdict.negative_log_evidence)?;
+    out.set_item("bic", &verdict.bic)?;
     out.set_item("mixture_reporting_k", verdict.mixture_reporting_k)?;
     out.set_item(
         "ring_clusters_reporting_k",

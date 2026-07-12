@@ -1361,22 +1361,20 @@ pub fn bic_score(deviance: f64, n_obs: usize, basis_size: usize) -> Result<f64, 
 // ===========================================================================
 
 /// One fitted entry of the discrete-mixture rung: the mixture order `k`, the
-/// fitted Gaussian mixture, and its rank-aware Laplace **negative** log evidence
-/// computed through the SAME [`crate::evidence::laplace_evidence`]
-/// entry point used by the smooth rungs. Lower negative-log-evidence is better.
+/// fitted Gaussian mixture, and its BIC-form negative log evidence. Lower is
+/// better.
 #[derive(Debug, Clone)]
 pub struct MixtureRungFit {
     pub k: usize,
     pub fit: crate::evidence::GaussianMixtureFit,
-    /// Free-parameter count `P` — the quantity that enters the rank-aware
-    /// normalizer as `dim(H) − rank(S) = P − 0`.
+    /// Free-parameter count `P` in the `P log(n) / 2` BIC price.
     pub num_parameters: usize,
-    /// Rank-aware Laplace negative log evidence on the smooth-rung scale.
-    pub negative_log_evidence: f64,
+    /// `-loglik + P log(n) / 2`, on the smooth parametric candidates' scale.
+    pub bic: f64,
 }
 
 /// Result of fitting the whole mixture ladder: every fitted order plus the index
-/// of the in-class winner (lowest rank-aware Laplace negative-log-evidence).
+/// of the in-class winner (lowest BIC).
 #[derive(Debug, Clone)]
 pub struct MixtureRungResult {
     pub fits: Vec<MixtureRungFit>,
@@ -1393,16 +1391,15 @@ impl MixtureRungResult {
 /// coarse-ladder winner may probe. Refinement walks one neighbour at a time
 /// and stops as soon as the running winner is bracketed (both immediate
 /// neighbours fitted and worse), so this cap only binds on a pathological
-/// evidence profile that keeps improving monotonically past the ladder — a
+/// BIC profile that keeps improving monotonically past the ladder — a
 /// regime the rank-aware parameter pricing rules out for any real cluster
 /// structure. It exists so the sweep stays a bounded pure function of the
 /// data, never a runaway loop.
 pub const MIXTURE_REFINEMENT_MAX_PROBES: usize = 16;
 
 /// Fit the discrete-mixture rung over a fixed `k`-ladder, then **refine
-/// locally around the winner**, and rank in-class by rank-aware Laplace
-/// evidence. Each order is priced by its own free-parameter count entering the
-/// `−½ (dim(H) − rank(S)) log(2π)` normalizer. Deterministic: the seeding is
+/// locally around the winner**, and rank in-class by BIC. Each order is priced
+/// by its own free-parameter count. Deterministic: the seeding is
 /// the basis k-means farthest-point init, EM is a pure map, and the refinement
 /// order is a pure function of the fitted scores.
 ///
@@ -1434,18 +1431,16 @@ pub fn fit_mixture_rung(
             return;
         }
         match fit_gaussian_mixture(data, k, config) {
-            Ok(fit) => match fit.laplace_negative_log_evidence(data) {
-                Ok(nle) => {
-                    let num_parameters = fit.num_free_parameters();
-                    fits.push(MixtureRungFit {
-                        k,
-                        fit,
-                        num_parameters,
-                        negative_log_evidence: nle,
-                    });
-                }
-                Err(e) => errors.push(format!("mixture k={k} evidence: {e}")),
-            },
+            Ok(fit) => {
+                let num_parameters = fit.num_free_parameters();
+                let bic = fit.bic();
+                fits.push(MixtureRungFit {
+                    k,
+                    fit,
+                    num_parameters,
+                    bic,
+                });
+            }
             Err(e) => errors.push(format!("mixture k={k} fit: {e}")),
         }
     };
@@ -1465,16 +1460,15 @@ pub fn fit_mixture_rung(
     }
 
     // Local refinement: bracket the running winner. The running winner uses
-    // the same rule as the final ranking (lower negative-log-evidence, ties to
-    // the smaller k), so refinement and ranking can never disagree about who
-    // the winner is.
+    // the same rule as the final ranking (lower BIC, ties to the smaller k), so
+    // refinement and ranking can never disagree about who the winner is.
     let mut probes = 0usize;
     while probes < MIXTURE_REFINEMENT_MAX_PROBES {
         let best_k = fits
             .iter()
             .min_by(|a, b| {
-                a.negative_log_evidence
-                    .partial_cmp(&b.negative_log_evidence)
+                a.bic
+                    .partial_cmp(&b.bic)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then(a.k.cmp(&b.k))
             })
@@ -1489,12 +1483,12 @@ pub fn fit_mixture_rung(
         try_order(k, &mut fits, &mut errors, &mut attempted);
         probes += 1;
     }
-    // In-class winner-take-all on the rank-aware evidence scale (lower wins).
+    // In-class winner-take-all on the BIC scale (lower wins).
     let ranked = rank_priority_candidates(
         fits.into_iter()
             .enumerate()
             .map(|(idx, row)| {
-                let score = row.negative_log_evidence;
+                let score = row.bic;
                 let tie = row.k; // simpler (smaller k) wins ties
                 PriorityCandidate::new(row, idx, score, tie)
             })
@@ -1515,7 +1509,7 @@ pub struct RingOfClustersRungFit {
     pub k: usize,
     pub fit: crate::evidence::RingGaussianMixtureFit,
     pub num_parameters: usize,
-    pub negative_log_evidence: f64,
+    pub bic: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -1532,8 +1526,8 @@ impl RingOfClustersRungResult {
 
 /// Fit and locally refine the constrained ring-of-clusters order ladder.
 /// Orders below three are structurally incapable of identifying a circle and
-/// are excluded. Ranking uses the same certified empirical-Fisher Laplace
-/// evidence as the free Gaussian-mixture rung.
+/// are excluded. Ranking uses the same BIC-form criterion as the free
+/// Gaussian-mixture rung and the smooth parametric shape candidates.
 pub fn fit_ring_of_clusters_rung(
     data: ArrayView2<'_, f64>,
     ladder: &[usize],
@@ -1551,17 +1545,12 @@ pub fn fit_ring_of_clusters_rung(
             return;
         }
         match crate::evidence::fit_ring_gaussian_mixture(data, k, config) {
-            Ok(fit) => match fit.laplace_negative_log_evidence(data) {
-                Ok(negative_log_evidence) => fits.push(RingOfClustersRungFit {
-                    k,
-                    num_parameters: fit.num_free_parameters(),
-                    fit,
-                    negative_log_evidence,
-                }),
-                Err(error) => {
-                    errors.push(format!("ring-of-clusters k={k} evidence: {error}"));
-                }
-            },
+            Ok(fit) => fits.push(RingOfClustersRungFit {
+                k,
+                num_parameters: fit.num_free_parameters(),
+                bic: fit.bic(),
+                fit,
+            }),
             Err(error) => errors.push(format!("ring-of-clusters k={k} fit: {error}")),
         }
     };
@@ -1583,8 +1572,8 @@ pub fn fit_ring_of_clusters_rung(
         let best_k = fits
             .iter()
             .min_by(|left, right| {
-                left.negative_log_evidence
-                    .partial_cmp(&right.negative_log_evidence)
+                left.bic
+                    .partial_cmp(&right.bic)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then(left.k.cmp(&right.k))
             })
@@ -1603,7 +1592,7 @@ pub fn fit_ring_of_clusters_rung(
         fits.into_iter()
             .enumerate()
             .map(|(index, fit)| {
-                let score = fit.negative_log_evidence;
+                let score = fit.bic;
                 let tie = fit.k;
                 PriorityCandidate::new(fit, index, score, tie)
             })

@@ -103,39 +103,73 @@ class CentroidCircularOrderingTest(unittest.TestCase):
         centers = _CO.kmeans_centroids(coords, 1, seed=17)
         np.testing.assert_allclose(centers[0], coords.mean(axis=0), atol=1.0e-15)
 
-    def test_rank_deficient_gaussian_null_needs_no_ridge(self) -> None:
-        trace = 1.0
-        tolerance = 64.0 * 2.0 * np.finfo(np.float64).eps * trace
-        certified = _CO._certify_psd_spectrum(
-            np.array([0.5 * tolerance, trace]), trace
-        )
-        self.assertEqual(float(certified[0]), 0.0)
-        self.assertEqual(float(certified[1]), trace)
-
-        angle = 0.731
-        direction = np.array([np.cos(angle), np.sin(angle)])
-        coordinate = np.arange(7, dtype=np.float64) - 3.0
-        centers = np.array([1.0e6, -2.0e6]) + coordinate[:, None] * direction
-        observed_cv, _ = _CO.ring_stats(centers)
-        _, _, right = np.linalg.svd(
-            centers - centers.mean(axis=0, keepdims=True), full_matrices=False
-        )
-        fitted_direction = right[0]
-        original_ring_stats = _CO.ring_stats
-
-        def certify_rank_one(draw: np.ndarray) -> tuple[float, float]:
-            centered = draw - draw.mean(axis=0, keepdims=True)
-            off_axis = (
-                centered[:, 0] * fitted_direction[1]
-                - centered[:, 1] * fitted_direction[0]
+    def test_conditional_randomization_refits_lloyd_and_preserves_marginals(
+        self,
+    ) -> None:
+        coords = np.column_stack(
+            (
+                np.arange(12, dtype=np.float64),
+                np.array([5, 1, 9, 2, 8, 0, 7, 3, 11, 4, 10, 6], dtype=np.float64),
             )
-            self.assertLess(float(np.max(np.abs(off_axis))), 1.0e-12)
-            return original_ring_stats(draw)
+        )
+        pristine = coords.copy()
+        base_order = np.arange(coords.shape[0])
 
-        with mock.patch.object(_CO, "ring_stats", side_effect=certify_rank_one):
-            p_value = _CO.ring_mc_pvalue(centers, observed_cv, n_null=64, seed=3)
-        self.assertGreater(p_value, 0.0)
-        self.assertLessEqual(p_value, 1.0)
+        class CertifiedShuffle:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def shuffle(self, order: np.ndarray) -> None:
+                np.testing.assert_array_equal(order, base_order)
+                draw = self.calls // 2
+                if self.calls % 2 == 0:
+                    order[:] = np.roll(base_order, draw + 1)
+                else:
+                    order[:] = np.roll(base_order[::-1], draw + 2)
+                self.calls += 1
+
+        shuffle = CertifiedShuffle()
+        fitted_inputs: list[np.ndarray] = []
+
+        def certify_refit(draw: np.ndarray, k: int, seed: int) -> np.ndarray:
+            self.assertEqual(k, 3)
+            self.assertEqual(seed, 17)
+            for column in range(coords.shape[1]):
+                np.testing.assert_array_equal(
+                    np.sort(draw[:, column]), np.sort(coords[:, column])
+                )
+            fitted_inputs.append(draw.copy())
+            return np.array([[1.0, 0.0], [-0.5, 0.75], [-0.5, -0.75]])
+
+        with (
+            mock.patch.object(
+                _CO.np.random, "default_rng", return_value=shuffle
+            ) as make_rng,
+            mock.patch.object(_CO, "kmeans_centroids", side_effect=certify_refit),
+            mock.patch.object(
+                _CO,
+                "ring_stats",
+                side_effect=[(0.10, 120.0), (0.20, 120.0), (0.40, 120.0)],
+            ),
+        ):
+            p_value = _CO.ring_mc_pvalue(
+                coords,
+                3,
+                0.20,
+                n_null=3,
+                control_seed=23,
+                kmeans_seed=17,
+            )
+
+        make_rng.assert_called_once_with(23)
+        self.assertEqual(shuffle.calls, 6)
+        self.assertEqual(len(fitted_inputs), 3)
+        np.testing.assert_array_equal(fitted_inputs[0][:, 0], coords[np.roll(base_order, 1), 0])
+        np.testing.assert_array_equal(
+            fitted_inputs[0][:, 1], coords[np.roll(base_order[::-1], 2), 1]
+        )
+        np.testing.assert_array_equal(coords, pristine)
+        self.assertEqual(p_value, 0.75, "ties and the plus-one correction must count")
 
 
 if __name__ == "__main__":

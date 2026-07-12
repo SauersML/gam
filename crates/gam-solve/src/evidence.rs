@@ -783,17 +783,20 @@ pub fn stacked_predictive_mean(
 //
 // A `k`-component full-covariance Gaussian mixture fitted by deterministic
 // k-means++-style seeding (reusing `terms::basis` farthest-point k-means) plus
-// EM to a tolerance. It is priced by its free-parameter count and scored
-// through the SAME rank-aware Laplace/Tierney-Kadane normalizer as the smooth
-// topology candidates: `−V = loglik − ½ log|H| + ½ P log(2π)` with the
-// `−½ (dim(H) − rank(S)) log(2π)` normalizer evaluated at `dim(H) = P`,
-// `rank(S) = 0` (a fully likelihood-identified, unpenalized parametric model,
-// so every free parameter is unpenalized null-space). The Hessian log-det
-// `log|H|` is the observed (empirical-Fisher / BHHH) information
-// `H = Σ_i s_i s_iᵀ`, the exact, finite, SPD observed-information surrogate at
-// the EM optimum, fed through the same `laplace_evidence` entry point used by
-// the smooth rungs so the two model classes are comparable on the evidence
-// scale.
+// EM to a tolerance. It is priced by its free-parameter count with the
+// invariant BIC approximation to negative log evidence,
+//
+//     BIC/2 = -loglik + (P/2) log(n).
+//
+// BIC is intentional here. An outer product of per-observation scores is not
+// an observed Hessian and need not be full-rank even when the likelihood has
+// curvature (an exactly centered Gaussian mean is the simplest counterexample).
+// Moreover, the covariance-floor constraint can put a component on a boundary,
+// where an interior SPD Laplace expansion is mathematically invalid. Without a
+// declared parameter prior and its Jacobian, a raw Hessian determinant would
+// also change under reparameterization. The smooth parametric shape candidates
+// use this same BIC-form score, so every shape-race corroborating score now has
+// one finite, parameterization-invariant meaning.
 
 /// Convergence + ladder controls for the discrete-mixture rung. All fields are
 /// fixed (no clock randomness, no env): deterministic seeding makes the fitted
@@ -948,7 +951,6 @@ pub struct GaussianMixtureFit {
     /// EM iterations taken.
     iterations: usize,
     certificate: GaussianMixtureCertificate,
-    data_fingerprint: Fingerprint,
 }
 
 impl GaussianMixtureFit {
@@ -993,9 +995,12 @@ impl GaussianMixtureFit {
             ));
         }
         let n = data.nrows();
-        let mut comp = vec![GaussianComponentEval::new(self.d); self.k];
+        let mut comp = Vec::with_capacity(self.k);
         for j in 0..self.k {
-            comp[j] = GaussianComponentEval::factor(self.means.row(j), &self.covariances[j])?;
+            comp.push(GaussianComponentEval::factor(
+                self.means.row(j),
+                &self.covariances[j],
+            )?);
         }
         let mut out = Array1::<f64>::zeros(n);
         let log_w: Vec<f64> = self.weights.iter().map(|w| w.ln()).collect();
@@ -1015,175 +1020,11 @@ impl GaussianMixtureFit {
         Ok(out)
     }
 
-    /// Rank-aware Laplace **negative** log evidence on the SAME scale as the
-    /// smooth topology rungs. `−V = loglik − ½ log|H| + ½ P log(2π)`, realised
-    /// by calling [`laplace_evidence`] with `residual_objective = −loglik`,
-    /// `penalty_log_det = 0`, `penalty_rank = 0`, `effective_dim = P`, and
-    /// `log|H|` the observed empirical-Fisher information at the optimum.
-    ///
-    /// The Laplace expansion is only meaningful at a stationary point:
-    /// [`fit_gaussian_mixture`] enforces this by returning a typed error
-    /// whenever EM exhausts its budget without monotone ascent plus both the
-    /// objective and full parameter-map residual certificates. The private fit
-    /// state and training-data fingerprint prevent an uncertified or unrelated
-    /// mode from reaching evidence comparison.
-    pub fn laplace_negative_log_evidence(&self, data: ArrayView2<'_, f64>) -> Result<f64, String> {
-        if data.nrows() != self.n_obs
-            || data.ncols() != self.d
-            || mixture_data_fingerprint(data) != self.data_fingerprint
-        {
-            return Err(
-                "mixture Laplace evidence must be evaluated on the exact data whose certified EM fixed point is stored in this fit"
-                    .to_string(),
-            );
-        }
-        let p = self.num_free_parameters();
-        let information = self.empirical_fisher_information(data)?;
-        if information.nrows() != p {
-            return Err(format!(
-                "mixture empirical-Fisher information has dim {} but expected free-parameter count {p}",
-                information.nrows()
-            ));
-        }
-        let apply_info = |x: &[f64]| -> Vec<f64> {
-            let mut out = vec![0.0_f64; p];
-            for r in 0..p {
-                let mut acc = 0.0_f64;
-                for c in 0..p {
-                    acc += information[[r, c]] * x[c];
-                }
-                out[r] = acc;
-            }
-            out
-        };
-        let hvp = EvidenceHvpLogDet {
-            dim: p,
-            apply: &apply_info,
-        };
-        let v = laplace_evidence(
-            EvidenceLogDetSource::Hvp(hvp),
-            0.0,
-            -self.loglik,
-            p as f64,
-            0.0,
-        );
-        if !v.is_finite() {
-            return Err("mixture Laplace evidence is not finite".to_string());
-        }
-        Ok(v)
-    }
-
-    /// Observed empirical-Fisher (BHHH) information `H = Σ_i s_i s_iᵀ`, where
-    /// `s_i = ∇_θ log p(y_i)` is the per-observation score in the
-    /// free-parameter coordinates: softmax-logit mixing weights (`k − 1`),
-    /// component means (`k·d`), and the lower-triangular covariance entries
-    /// (`k · d(d+1)/2`) of each component, in that block order. This SPD matrix
-    /// is the genuine observed-information surrogate evaluated at the EM
-    /// optimum — its dimension is exactly `P`, which is what enters the
-    /// rank-aware normalizer.
-    fn empirical_fisher_information(
-        &self,
-        data: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        if data.ncols() != self.d {
-            return Err(format!(
-                "mixture information expects {} columns, got {}",
-                self.d,
-                data.ncols()
-            ));
-        }
-        let n = data.nrows();
-        let p = self.num_free_parameters();
-        let cov_per = self.d * (self.d + 1) / 2;
-        // Precompute per-component evaluators (mean, precision = Σ⁻¹).
-        let mut comp = Vec::with_capacity(self.k);
-        for j in 0..self.k {
-            comp.push(GaussianComponentEval::factor(
-                self.means.row(j),
-                &self.covariances[j],
-            )?);
-        }
-        let log_w: Vec<f64> = self.weights.iter().map(|w| w.ln()).collect();
-
-        let mean_base = self.k - 1;
-        let cov_base = mean_base + self.k * self.d;
-
-        let mut info = Array2::<f64>::zeros((p, p));
-        let mut score = vec![0.0_f64; p];
-        for i in 0..n {
-            let row = data.row(i);
-            // Responsibilities r_j = w_j N_j / Σ.
-            let mut log_terms = vec![0.0_f64; self.k];
-            let mut max_term = f64::NEG_INFINITY;
-            for j in 0..self.k {
-                let lt = log_w[j] + comp[j].log_density(row);
-                log_terms[j] = lt;
-                if lt > max_term {
-                    max_term = lt;
-                }
-            }
-            let log_mix = log_sum_exp(&log_terms, max_term);
-            let resp: Vec<f64> = log_terms.iter().map(|lt| (lt - log_mix).exp()).collect();
-
-            for s in score.iter_mut() {
-                *s = 0.0;
-            }
-            // Softmax-logit mixing score: ∂/∂α_j log p = r_j − w_j for the free
-            // logits j = 1..k-1 (component 0 is the reference / pinned logit).
-            for j in 1..self.k {
-                score[j - 1] = resp[j] - self.weights[j];
-            }
-            // Mean score: ∂/∂μ_j log p = r_j · Σ_j⁻¹ (y − μ_j).
-            // Covariance score (lower-tri entries): ∂/∂Σ_j contracted through
-            // the symmetric chain rule, r_j · ½ (Σ⁻¹ v vᵀ Σ⁻¹ − Σ⁻¹) with
-            // off-diagonal entries doubled for the symmetric parameterization.
-            for j in 0..self.k {
-                let prec_v = comp[j].precision_times_residual(row); // Σ⁻¹ (y − μ_j)
-                let mbo = mean_base + j * self.d;
-                for c in 0..self.d {
-                    score[mbo + c] = resp[j] * prec_v[c];
-                }
-                let cbo = cov_base + j * cov_per;
-                let mut idx = 0usize;
-                for a in 0..self.d {
-                    for b in 0..=a {
-                        let outer = prec_v[a] * prec_v[b];
-                        let prec_ab = comp[j].precision[[a, b]];
-                        let mut g = 0.5 * (outer - prec_ab);
-                        if a != b {
-                            // Off-diagonal entry appears twice in the symmetric
-                            // matrix, so its free-parameter derivative doubles.
-                            g *= 2.0;
-                        }
-                        score[cbo + idx] = resp[j] * g;
-                        idx += 1;
-                    }
-                }
-            }
-            // Accumulate outer product s_i s_iᵀ.
-            for r in 0..p {
-                let sr = score[r];
-                if sr == 0.0 {
-                    continue;
-                }
-                for c in 0..p {
-                    info[[r, c]] += sr * score[c];
-                }
-            }
-        }
-        // Symmetrize the empirical Fisher. No ridge or prior may be added here:
-        // the certified mode optimizes the pure mixture likelihood, so its
-        // objective and Hessian must describe that same Laplace integral.
-        // Rank-deficient information is therefore an evidence error, not an
-        // excuse to manufacture comparability with an unmodelled prior.
-        for r in 0..p {
-            for c in (r + 1)..p {
-                let avg = 0.5 * (info[[r, c]] + info[[c, r]]);
-                info[[r, c]] = avg;
-                info[[c, r]] = avg;
-            }
-        }
-        Ok(info)
+    /// Schwarz BIC approximation to negative log evidence, divided by two so
+    /// it shares the ordinary negative-log-likelihood scale used by the shape
+    /// race. Lower is better.
+    pub fn bic(&self) -> f64 {
+        -self.loglik + 0.5 * self.num_free_parameters() as f64 * (self.n_obs as f64).ln()
     }
 }
 
@@ -1198,15 +1039,6 @@ struct GaussianComponentEval {
 }
 
 impl GaussianComponentEval {
-    fn new(d: usize) -> Self {
-        Self {
-            mean: Array1::zeros(d),
-            precision: Array2::eye(d),
-            log_norm: 0.0,
-            d,
-        }
-    }
-
     fn factor(mean: ArrayView1<'_, f64>, cov: &Array2<f64>) -> Result<Self, String> {
         let d = mean.len();
         if cov.nrows() != d || cov.ncols() != d {
@@ -1579,7 +1411,6 @@ fn run_gaussian_mixture_em(
                 loglik,
                 iterations: checkpoint.completed_iterations,
                 certificate,
-                data_fingerprint,
             });
         }
         if additional_updates == config.max_iter {
@@ -1883,8 +1714,8 @@ fn constrained_data_covariance(
 //
 // with free mixture weights, a shared center/radius, one angle per component,
 // and a shared isotropic variance. Its `2k + 3` continuous parameters are
-// priced in the same empirical-Fisher Laplace evidence as the unconstrained
-// mixture's `6k - 1` parameters in two dimensions.
+// priced by the same BIC-form criterion as the unconstrained mixture's `6k - 1`
+// parameters in two dimensions.
 
 /// Certified Gaussian mixture whose component centers lie on one fitted circle.
 #[derive(Debug, Clone)]
@@ -1899,7 +1730,6 @@ pub struct RingGaussianMixtureFit {
     loglik: f64,
     iterations: usize,
     certificate: GaussianMixtureCertificate,
-    data_fingerprint: Fingerprint,
 }
 
 impl RingGaussianMixtureFit {
@@ -1954,102 +1784,10 @@ impl RingGaussianMixtureFit {
         )
     }
 
-    pub fn laplace_negative_log_evidence(&self, data: ArrayView2<'_, f64>) -> Result<f64, String> {
-        if data.nrows() != self.n_obs
-            || data.ncols() != 2
-            || ring_mixture_data_fingerprint(data) != self.data_fingerprint
-        {
-            return Err(
-                "ring-of-clusters Laplace evidence must use the exact data stored in the certified fit"
-                    .to_string(),
-            );
-        }
-        let information = self.empirical_fisher_information(data)?;
-        let p = self.num_free_parameters();
-        let apply_info = |x: &[f64]| -> Vec<f64> {
-            let mut out = vec![0.0; p];
-            for row in 0..p {
-                for col in 0..p {
-                    out[row] += information[[row, col]] * x[col];
-                }
-            }
-            out
-        };
-        let value = laplace_evidence(
-            EvidenceLogDetSource::Hvp(EvidenceHvpLogDet {
-                dim: p,
-                apply: &apply_info,
-            }),
-            0.0,
-            -self.loglik,
-            p as f64,
-            0.0,
-        );
-        if !value.is_finite() {
-            return Err(
-                "ring-of-clusters empirical Fisher is rank deficient; Laplace evidence is undefined"
-                    .to_string(),
-            );
-        }
-        Ok(value)
-    }
-
-    fn empirical_fisher_information(
-        &self,
-        data: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        let weight_base = 0usize;
-        let center_base = self.k - 1;
-        let log_radius_index = center_base + 2;
-        let angle_base = log_radius_index + 1;
-        let log_sigma_index = angle_base + self.k;
-        let p = log_sigma_index + 1;
-
-        let responsibilities = ring_mixture_responsibilities(
-            data,
-            &self.weights,
-            &self.center,
-            self.radius,
-            &self.directions,
-            self.variance,
-        )?;
-        let mut information = Array2::<f64>::zeros((p, p));
-        let mut score = vec![0.0; p];
-        for row in 0..data.nrows() {
-            score.fill(0.0);
-            for component in 1..self.k {
-                score[weight_base + component - 1] =
-                    responsibilities[[row, component]] - self.weights[component];
-            }
-            for component in 0..self.k {
-                let responsibility = responsibilities[[row, component]];
-                let ux = self.directions[[component, 0]];
-                let uy = self.directions[[component, 1]];
-                let dx = data[[row, 0]] - self.center[0] - self.radius * ux;
-                let dy = data[[row, 1]] - self.center[1] - self.radius * uy;
-                score[center_base] += responsibility * dx / self.variance;
-                score[center_base + 1] += responsibility * dy / self.variance;
-                score[log_radius_index] +=
-                    responsibility * self.radius * (dx * ux + dy * uy) / self.variance;
-                score[angle_base + component] =
-                    responsibility * self.radius * (-dx * uy + dy * ux) / self.variance;
-                score[log_sigma_index] +=
-                    responsibility * (-2.0 + (dx * dx + dy * dy) / self.variance);
-            }
-            for left in 0..p {
-                for right in 0..p {
-                    information[[left, right]] += score[left] * score[right];
-                }
-            }
-        }
-        for left in 0..p {
-            for right in (left + 1)..p {
-                let symmetric = 0.5 * (information[[left, right]] + information[[right, left]]);
-                information[[left, right]] = symmetric;
-                information[[right, left]] = symmetric;
-            }
-        }
-        Ok(information)
+    /// Schwarz BIC approximation to negative log evidence, divided by two so
+    /// it is on the ordinary negative-log-likelihood scale. Lower is better.
+    pub fn bic(&self) -> f64 {
+        -self.loglik + 0.5 * self.num_free_parameters() as f64 * (self.n_obs as f64).ln()
     }
 }
 
@@ -2062,10 +1800,6 @@ struct RingMixtureState {
     variance: f64,
     mean_log_likelihood: f64,
     completed_iterations: usize,
-}
-
-fn ring_mixture_data_fingerprint(data: ArrayView2<'_, f64>) -> Fingerprint {
-    evidence_matrix_fingerprint("ring-gaussian-mixture-em-v1", data)
 }
 
 fn ring_component_means(
@@ -2127,26 +1861,6 @@ fn ring_mixture_log_terms(
     Ok((terms, row_log_likelihoods))
 }
 
-fn ring_mixture_responsibilities(
-    data: ArrayView2<'_, f64>,
-    weights: &Array1<f64>,
-    center: &Array1<f64>,
-    radius: f64,
-    directions: &Array2<f64>,
-    variance: f64,
-) -> Result<Array2<f64>, String> {
-    let (terms, row_log_likelihoods) =
-        ring_mixture_log_terms(data, weights, center, radius, directions, variance)?;
-    let mut responsibilities = Array2::<f64>::zeros(terms.raw_dim());
-    for row in 0..terms.nrows() {
-        for component in 0..terms.ncols() {
-            responsibilities[[row, component]] =
-                (terms[[row, component]] - row_log_likelihoods[row]).exp();
-        }
-    }
-    Ok(responsibilities)
-}
-
 fn ring_mixture_e_step(
     data: ArrayView2<'_, f64>,
     state: &RingMixtureState,
@@ -2187,35 +1901,43 @@ fn relative_parameter_step(previous: f64, next: f64) -> f64 {
     (next - previous).abs() / previous.abs().max(next.abs()).max(1.0)
 }
 
-fn ring_parameter_residual(previous: &RingMixtureState, next: &RingMixtureState) -> f64 {
-    previous
+/// Distance between two ring-mixture states in identifiable density space.
+///
+/// `center`, `radius`, and `directions` are only a factorization of the actual
+/// component means `m_j = center + radius * direction_j`. Near a large-radius
+/// (locally flat) circle those factors can move appreciably while cancelling in
+/// every `m_j`; requiring the factors themselves to stop is therefore neither
+/// necessary for distributional convergence nor invariant to the chosen circle
+/// chart. We instead certify weights, component means in noise-standardized
+/// units, and log variance. Component labels remain aligned because the E/M
+/// maps preserve their responsibility-column order; no sorting or relabeling
+/// occurs between `previous` and `next`.
+fn ring_identifiable_parameter_residual(
+    previous: &RingMixtureState,
+    next: &RingMixtureState,
+) -> f64 {
+    let previous_means =
+        ring_component_means(&previous.center, previous.radius, &previous.directions);
+    let next_means = ring_component_means(&next.center, next.radius, &next.directions);
+    let noise_scale = previous
+        .variance
+        .sqrt()
+        .max(next.variance.sqrt())
+        .max(f64::MIN_POSITIVE);
+    let weight_residual = previous
         .weights
         .iter()
         .zip(next.weights.iter())
-        .map(|(&left, &right)| relative_parameter_step(left, right))
-        .chain(
-            previous
-                .center
-                .iter()
-                .zip(next.center.iter())
-                .map(|(&left, &right)| relative_parameter_step(left, right)),
-        )
-        .chain(std::iter::once(relative_parameter_step(
-            previous.radius,
-            next.radius,
-        )))
-        .chain(
-            previous
-                .directions
-                .iter()
-                .zip(next.directions.iter())
-                .map(|(&left, &right)| relative_parameter_step(left, right)),
-        )
-        .chain(std::iter::once(relative_parameter_step(
-            previous.variance,
-            next.variance,
-        )))
-        .fold(0.0, f64::max)
+        .map(|(&left, &right)| (right - left).abs())
+        .fold(0.0, f64::max);
+    let mean_residual = previous_means
+        .rows()
+        .into_iter()
+        .zip(next_means.rows())
+        .map(|(left, right)| (right[0] - left[0]).hypot(right[1] - left[1]) / noise_scale)
+        .fold(0.0, f64::max);
+    let variance_residual = (next.variance / previous.variance).ln().abs();
+    weight_residual.max(mean_residual).max(variance_residual)
 }
 
 fn fit_weighted_component_circle(
@@ -2460,7 +2182,6 @@ pub fn fit_ring_gaussian_mixture(
         mean_log_likelihood: f64::NAN,
         completed_iterations: 0,
     };
-    let data_fingerprint = ring_mixture_data_fingerprint(data);
     for additional_updates in 0..=config.max_iter {
         let (responsibilities, current_mean, current_roundoff) = ring_mixture_e_step(data, &state)?;
         state.mean_log_likelihood = current_mean;
@@ -2470,7 +2191,7 @@ pub fn fit_ring_gaussian_mixture(
         let objective_scale = current_mean.abs().max(next_mean.abs()).max(1.0);
         let objective_step = next_mean - current_mean;
         let objective_residual = objective_step.abs() / objective_scale;
-        let parameter_residual = ring_parameter_residual(&state, &next);
+        let parameter_residual = ring_identifiable_parameter_residual(&state, &next);
         let monotonicity_uncertainty = gaussian_mixture_monotonicity_uncertainty(
             objective_scale,
             current_roundoff,
@@ -2507,7 +2228,6 @@ pub fn fit_ring_gaussian_mixture(
                 loglik,
                 iterations: state.completed_iterations,
                 certificate,
-                data_fingerprint,
             });
         }
         if additional_updates == config.max_iter {
