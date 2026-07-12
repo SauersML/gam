@@ -1320,9 +1320,14 @@ pub(crate) fn validate_duchon_kernel_orders(
     if !s_order.is_finite() || s_order < 0.0 {
         crate::bail_invalid_basis!("Duchon spectral power must be finite and ≥ 0; got s={s_order}");
     }
-    if length_scale.is_none() && p_order < 2 && 2.0 * s_order >= k_dim as f64 {
+    if length_scale.is_none() && 2.0 * s_order >= k_dim as f64 {
+        // The `2s >= d` boundary is INDEPENDENT of the nullspace degree p (it
+        // cancels in the CPD-order-vs-p derivation above, #2278): a former
+        // `p_order < 2` conjunct here wrongly let `p >= 2` configs (e.g. d=2,
+        // Linear nullspace p=2, explicit power s=1) bypass the check and build a
+        // penalty from a kernel that is not CPD on the nullspace complement.
         crate::bail_invalid_basis!(
-            "pure Duchon requires power < dimension/2 for nullspace degree < {p_order}; got power={s_order}, dimension={k_dim}"
+            "pure Duchon requires spectral power < dimension/2 (2s < d), independent of nullspace degree; got power={s_order}, dimension={k_dim}"
         );
     }
     let spectral_order = 2.0 * (p_order as f64 + s_order);
@@ -2380,6 +2385,34 @@ mod duchon_hybrid_psd_tests {
     use super::*;
     use faer::Side;
     use gam_linalg::faer_ndarray::FaerEigh;
+
+    /// #2278: the pure-Duchon CPD-adequacy boundary `2s >= d` is INDEPENDENT of
+    /// the nullspace degree `p` (it cancels in the derivation above), so it must
+    /// reject for all `p` — not only `p < 2`. Regression for the former spurious
+    /// `p_order < 2` conjunct.
+    #[test]
+    fn pure_duchon_cpd_guard_is_nullspace_degree_independent_issue_2278() {
+        // d = 2, Linear nullspace (p = 2), explicit integer power s = 1:
+        // 2s = 2 >= d = 2 is ill-posed and previously slipped through.
+        let err = validate_duchon_kernel_orders(None, 2, 1.0, 2)
+            .expect_err("pure Duchon d=2, p=2, s=1 (2s>=d) must be rejected as ill-posed");
+        let BasisError::InvalidInput(msg) = err else {
+            panic!("expected an InvalidInput well-posedness error, got {err}");
+        };
+        assert!(
+            msg.contains("dimension/2") || msg.contains("2s < d"),
+            "message must name the CPD/well-posedness cause: {msg}"
+        );
+        // The p < 2 sibling that was already rejected still is (no regression).
+        assert!(validate_duchon_kernel_orders(None, 1, 1.0, 2).is_err());
+        // Control: a well-posed pure config (default fractional power
+        // s = (d-1)/2 = 0.5 at p = 2, giving 2s = 1 < d = 2) must still build —
+        // the guard must not over-reject.
+        assert!(validate_duchon_kernel_orders(None, 2, 0.5, 2).is_ok());
+        // Control: the hybrid (Matérn-blended) path is exempt (CPD order 0), so
+        // even 2s >= d builds — the `length_scale.is_none()` gate is preserved.
+        assert!(validate_duchon_kernel_orders(Some(1.0), 2, 1.0, 2).is_ok());
+    }
 
     /// #1033: the capped-sample diameter estimate must be n-STABLE on a fixed
     /// point cloud. A uniform grid on `[-3, 3]` has a fixed true diameter (6.0)
