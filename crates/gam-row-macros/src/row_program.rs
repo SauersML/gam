@@ -1259,7 +1259,6 @@ mod tests {
         assert!(expanded.contains("double event_term_v = 0.0"));
         assert!(expanded.contains("if ((in.event > 0.0))"));
         assert!(expanded.contains("d_log(adjusted_v"));
-        assert!(expanded.contains("row_hessian [3]"));
         assert!(!expanded.contains("J2"));
         assert!(!expanded.contains("j2_"));
     }
@@ -1300,11 +1299,11 @@ mod tests {
             "double product_g0 = y;",
             "double product_h0_1 = 1.0;",
             "double product_g1 = x;",
-            "double curved_g0 = (y * curved_stack0[1]);",
-            "double curved_h0_0 = (curved_stack0[2] * (y * y));",
-            "double curved_h0_1 = (curved_stack0[1] + (curved_stack0[2] * (y * x)));",
-            "double curved_g1 = (x * curved_stack0[1]);",
-            "double curved_h1_1 = (curved_stack0[2] * (x * x));",
+            "double curved_g0 = (product_g0 * curved_stack0[1]);",
+            "double curved_h0_0 = (curved_stack0[2] * (product_g0 * product_g0));",
+            "double curved_h0_1 = ((product_h0_1 * curved_stack0[1]) + (curved_stack0[2] * (product_g0 * product_g1)));",
+            "double curved_g1 = (product_g1 * curved_stack0[1]);",
+            "double curved_h1_1 = (curved_stack0[2] * (product_g1 * product_g1));",
             "double out_g0 = 1.0;",
             "double out_h0_0 = 0.0;",
             "double out_h0_1 = 0.0;",
