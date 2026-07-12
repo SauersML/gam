@@ -155,19 +155,9 @@ impl ReconSpectrum {
         self.edge
     }
 
-    /// Validated reconstruction dispersion `R`.
-    pub fn dispersion(&self) -> f64 {
-        self.dispersion
-    }
-
     /// Graded effective basis-function count `tr(G(G+λS)⁻¹)`.
     pub fn basis_edf(&self) -> f64 {
         self.basis_edf
-    }
-
-    /// Occupancy-aware effective sample size `Σ_row a²`.
-    pub fn effective_sample_size(&self) -> f64 {
-        self.n_eff
     }
 
     /// Audit-only basis-EDF specialization used by the checkpoint dynamics,
@@ -210,7 +200,8 @@ impl ReconSpectrum {
     /// replaces the hard step (derivation in the module header: the likelihood is
     /// tempered by `β = 1/log n_eff`, the prior is NOT, so the edge carries the
     /// `log n_eff` temperature). Always `≤` the number of directions, each term
-    /// `∈ [0, 1)`; a direction at the TEMPERED edge `μ = e·log n_eff` counts `½`.
+    /// `∈ [0, 1]` (the value 1 occurs only at zero edge with positive energy); a
+    /// direction at the TEMPERED edge `μ = e·log n_eff` counts `½`.
     /// `n_eff` is floored at Euler's number so the tempered edge is never softer
     /// than the hard MP edge.
     pub fn rank_soft(&self) -> f64 {
@@ -352,7 +343,11 @@ pub fn recon_spectrum(
         format!("recon_spectrum: G + lambda*S is not positive definite: {error}")
     })?;
     let x = factor.solve_mat(gram);
-    let basis_edf = (0..m).map(|i| x[[i, i]]).sum::<f64>().clamp(0.0, m as f64);
+    let raw_basis_edf = (0..m).map(|i| x[[i, i]]).sum::<f64>();
+    if !raw_basis_edf.is_finite() {
+        return Err("recon_spectrum: basis EDF is non-finite".to_string());
+    }
+    let basis_edf = raw_basis_edf.clamp(0.0, m as f64);
     Ok(ReconSpectrum {
         mu,
         edge,
@@ -384,7 +379,7 @@ pub struct AuditRow {
     /// Actual production rank / BIC charge
     /// `½·rank_chargeable·basis_edf·log N_eff`.
     pub production_charge: f64,
-    /// WBIC / singular charge `½·rank_soft·basis_edf·log n`.
+    /// WBIC / singular charge `½·rank_soft·basis_edf·log N_eff`.
     pub wbic_charge: f64,
     /// Signed `production_charge − wbic_charge`; no universal ordering is
     /// assumed near the MP edge.
@@ -412,7 +407,7 @@ impl AuditRow {
             mp_detection_rank: spec.mp_detection_rank(),
             production_chargeable_rank: spec.production_chargeable_rank(),
             rank_soft: spec.rank_soft(),
-            basis_edf: spec.basis_edf,
+            basis_edf: spec.basis_edf(),
             mp_detection_charge,
             production_charge,
             wbic_charge,
@@ -458,8 +453,9 @@ pub fn render_audit_table(rows: &[AuditRow]) -> String {
 /// `β = 1/log n_eff`, the REML prior is NOT — so the edge carries the
 /// `log n_eff` temperature and this is `½ ×` the diagnostic `rank_soft`
 /// per-direction term (same `tempered_edge = e·log n_eff`, `n_eff` floored at
-/// `e` so `log n_eff ≥ 1`). Exposed for the sampling cross-check test that
-/// validates the closed form against a genuine tempered-posterior expectation.
+/// Euler's number so `log n_eff ≥ 1`). Used by the sampling cross-check test
+/// that validates the closed form against a genuine tempered-posterior
+/// expectation.
 #[cfg(test)]
 fn direction_learning_coefficient(mu: f64, edge: f64, n_eff: f64) -> f64 {
     0.5 * wbic_tempered_rank_fraction(mu, edge, n_eff)
@@ -665,7 +661,7 @@ mod tests {
             &gram, &decoder, n as f64, p as f64, r_floor, 0.0, None,
         )
         .unwrap();
-        let d_audit = spec.production_chargeable_rank() as f64 * spec.basis_edf;
+        let d_audit = spec.production_chargeable_rank() as f64 * spec.basis_edf();
         eprintln!(
             "[wbic parity] production d_eff={d_prod:.10}  \
              audit rank_chargeable·basis_edf={d_audit:.10}"
@@ -699,9 +695,10 @@ mod tests {
         assert_eq!(spec.mp_detection_charge(), 0.0);
     }
 
-    /// A zero MP edge does not make a zero-energy direction count as one. The
-    /// exact limit of `μ/(μ+edge)` is zero at `μ=0` and one for `μ>0` when
-    /// the edge is zero.
+    /// A zero MP edge does not make a zero-energy direction count as one. At the
+    /// indeterminate `(energy, edge) = (0, 0)` boundary, the model-consistent
+    /// convention is zero complexity for zero signal; positive energy against an
+    /// exactly zero edge counts as one resolved direction.
     #[test]
     fn zero_edge_soft_rank_distinguishes_zero_from_positive_energy() {
         let gram = Array2::<f64>::eye(2);
@@ -1253,7 +1250,7 @@ mod tests {
         };
         assert_eq!(spec.mp_detection_rank(), 1);
         assert_eq!(spec.production_chargeable_rank(), 1);
-        let d_eff = spec.production_chargeable_rank() as f64 * spec.basis_edf; // 3.0
+        let d_eff = spec.production_chargeable_rank() as f64 * spec.basis_edf(); // 3.0
         let expected = 0.5 * d_eff * (50.0_f64).ln();
         assert!(
             (spec.production_charge() - expected).abs() < 1e-12,
@@ -1326,7 +1323,7 @@ mod tests {
         assert!(
             disk.mp_detection_rank() > 0 && disk.rank_soft() < disk.mp_detection_rank() as f64,
             "disk fixture must have above-edge directions the tempered count discounts: \
-             hard={:.3} soft={:.3}",
+             hard={} soft={:.3}",
             disk.mp_detection_rank(),
             disk.rank_soft()
         );

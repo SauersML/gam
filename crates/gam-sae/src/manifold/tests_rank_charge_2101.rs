@@ -150,7 +150,11 @@ fn rank_charge_deff_accepts_circle_and_neutralises_vanishing() {
         Some(&term.atoms[0].smooth_penalty),
     )
     .unwrap();
-    let top_signal = spectrum.mu.iter().copied().fold(0.0_f64, f64::max);
+    let top_signal = spectrum
+        .reconstruction_energies()
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max);
     let vanished_edge = super::construction::RANK_VANISHED_REL * disp;
     assert!(
         top_signal > vanished_edge && vanished_edge > 0.0,
