@@ -485,18 +485,22 @@ pub(crate) fn overcomplete_distinct_phases_stay_silent_2132() {
 }
 
 /// Two circles of UNEQUAL amplitude on disjoint output-channel parities: circle A
-/// (unit amplitude) on the even channels {0, 2}, circle B (`amp_b < 1`) on the odd
-/// channels {1, 3}, driven by incommensurate phases so the circles are not row-
-/// aligned. A DOMINATES, so a co-collapse reseed that seeds both atoms from the
+/// (unit amplitude, winding 1) on the even channels {0, 2}, circle B (`amp_b < 1`)
+/// on the odd channels {1, 3}. Circle B winds THREE times per revolution of A, a
+/// harmonic index BEYOND the atoms' order-2 (`m = 5`) chart span, so neither
+/// circle lies in the other's harmonic reach: atom A's decoder cannot absorb B as
+/// one of its own harmonics (which an absorbable 2× winding would let it do,
+/// collapsing the residual to zero and making the second reseed correctly
+/// terminal). A DOMINATES, so a co-collapse reseed that seeds both atoms from the
 /// same residual reads circle A for BOTH (re-collision); only a sequential-
-/// deflation reseed — peel A onto atom 0, then seed atom 1 from the remainder —
-/// separates them onto the two disjoint circles.
+/// deflation reseed — peel A onto atom 0, then seed atom 1 from what A genuinely
+/// leaves behind (circle B) — separates them onto the two disjoint circles.
 fn two_amplitude_circle_target(n: usize, amp_b: f64) -> Array2<f64> {
     let p = 4usize;
     let mut z = Array2::<f64>::zeros((n, p));
     for row in 0..n {
         let ta = std::f64::consts::TAU * (row as f64) / (n as f64);
-        let tb = std::f64::consts::TAU * (2.0 * row as f64 + 0.37) / (n as f64);
+        let tb = std::f64::consts::TAU * (3.0 * row as f64 + 0.37) / (n as f64);
         z[[row, 0]] = ta.cos();
         z[[row, 2]] = ta.sin();
         z[[row, 1]] = amp_b * tb.cos();
