@@ -3160,11 +3160,9 @@ impl EncodeAtlas {
                     let mut best_c = 0usize;
                     let mut best_d = f64::INFINITY;
                     for c in 0..valid_charts.len() {
-                        let mut dist = 0.0;
-                        for (r, xv) in recon_centers.row(c).iter().zip(x_row.iter()) {
-                            let diff = z * r - xv;
-                            dist += diff * diff;
-                        }
+                        // Shared F1 metric — allocation-free (no per-row/chart Vec),
+                        // so the massive-K fast route stays near-flat as K grows.
+                        let dist = amplitude_scaled_center_dist(recon_centers.row(c), x_row, z);
                         if dist < best_d {
                             best_d = dist;
                             best_c = c;
@@ -3816,11 +3814,7 @@ pub(crate) fn amortized_predict_row(
         if chart.certified_radius <= 0.0 {
             continue;
         }
-        let mut dist = 0.0;
-        for (r, xv) in chart.recon_center.iter().zip(x.iter()) {
-            let diff = amplitude * r - xv;
-            dist += diff * diff;
-        }
+        let dist = amplitude_scaled_center_dist(chart.recon_center.view(), x, amplitude);
         if dist < best_dist {
             best_dist = dist;
             best_ci = Some(ci);
@@ -3925,6 +3919,31 @@ pub(crate) fn center_amortized_jacobian(
     Some((a1, recon))
 }
 
+/// The single F1 routing metric: the amplitude-scaled center-reconstruction
+/// distance `Σ_j (z·m₁_j − x_j)²`, where `m₁` is the amplitude-1 center
+/// reconstruction `recon_center` and `z` is the row amplitude. Computed as the
+/// DIRECT squared distance in element order — never the algebraically-equal but
+/// cancellation-prone expansion `z²‖m₁‖² − 2z·(x·m₁)`, which loses ~‖x‖²·ε and can
+/// FLIP the argmin between two charts whose reconstructions coincide to rounding
+/// (period-wrapped seam charts). Every router — [`nearest_chart`],
+/// [`select_nearest_charts_topk`], the batched `amortized_encode_batch_fast`
+/// routing, and [`amortized_predict_row`] — scores through THIS function, so they
+/// break near-ties identically. `#[inline]` keeps it zero-overhead on the
+/// allocation-free massive-K fast-encode paths.
+#[inline]
+pub(crate) fn amplitude_scaled_center_dist(
+    recon: ArrayView1<'_, f64>,
+    x: ArrayView1<'_, f64>,
+    amplitude: f64,
+) -> f64 {
+    let mut dist = 0.0;
+    for (r, xv) in recon.iter().zip(x.iter()) {
+        let diff = amplitude * r - xv;
+        dist += diff * diff;
+    }
+    dist
+}
+
 /// The shared chart-routing comparator: the SINGLE amplitude-gating + tie-break
 /// decision every chart-routing top-k selection funnels through, so the CPU
 /// atlas encode ([`nearest_chart`], [`nearest_charts_topk`]) and the GPU-host
@@ -3964,12 +3983,7 @@ pub(crate) fn select_nearest_charts_topk(
         if !recon_into(idx, &mut recon) {
             continue;
         }
-        // Amplitude-scaled center distance, accumulated in place.
-        let mut dist = 0.0;
-        for (r, xv) in recon.iter().zip(x.iter()) {
-            let diff = amplitude * r - xv;
-            dist += diff * diff;
-        }
+        let dist = amplitude_scaled_center_dist(ArrayView1::from(recon.as_slice()), x, amplitude);
         scored.push((idx, dist));
     }
     // Sort by distance, then chart index for a deterministic, first-wins order.
