@@ -2460,13 +2460,19 @@ impl SaeManifoldOuterObjective {
         self.fit_verdict = None;
         self.terminal_penalized_quasi_laplace_criterion = None;
         let rho_state = self.baseline_rho.from_flat(rho_flat.clone());
-        let (cost, _) = self.evaluate_with_refine_policy(rho_flat, true)?;
-        let cost = cost + self.block_jacobian(&rho_state);
+        let (criterion, _) = self.evaluate_with_refine_policy(rho_flat, true)?;
+        let jacobian = self.block_jacobian(&rho_state);
+        let cost = criterion + jacobian;
         if !cost.is_finite() {
-            return Err(
-                "SaeManifoldOuterObjective::fit_at_fixed_rho: penalized quasi-Laplace criterion is infeasible at the requested rho"
-                    .to_string(),
-            );
+            // Decompose the non-finite total so the failure names its source:
+            // an ∞ criterion is the infeasibility sentinel (which component
+            // refused is logged at the mapping sites), while a non-finite
+            // block Jacobian is its own defect class.
+            return Err(format!(
+                "SaeManifoldOuterObjective::fit_at_fixed_rho: penalized quasi-Laplace criterion \
+                 is infeasible at the requested rho (criterion={criterion:.6e}, \
+                 block_jacobian={jacobian:.6e})"
+            ));
         }
         self.terminal_penalized_quasi_laplace_criterion = Some(cost);
         self.fit_verdict = Some(SaeOuterVerdict::FixedRho);
