@@ -50,6 +50,9 @@ fn sae_manifold_fit_minimal<'py>(
     // Per-fit separation-barrier configuration. `None` selects the native default.
     separation_barrier_strength_override: Option<f64>,
     promote_from_residual: bool,
+    // Bundled-pipeline stage toggles (#2267) forwarded to `sae_manifold_fit_inner`.
+    run_structure_search: bool,
+    structured_residual_passes: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
     // Convert borrowed Python arrays into the typed library seed request.
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
@@ -123,6 +126,8 @@ fn sae_manifold_fit_minimal<'py>(
         row_w,
         separation_barrier_strength_override,
         promote_from_residual,
+        run_structure_search,
+        structured_residual_passes,
     )?;
     // Post-search atom plans are emitted by the shared fit entry from the final
     // variable-K dictionary; the minimal binding never patches the payload.
@@ -343,6 +348,8 @@ fn public_fit_penalties(
     row_loss_weights=None,
     separation_barrier_strength_override=None,
     promote_from_residual=true,
+    run_structure_search=true,
+    structured_residual_passes=None,
 ))]
 // No #[allow(clippy::too_many_arguments)]: this is the flat `#[pyfunction]`
 // kwarg surface Python calls by name (mirroring `sae_manifold_fit_minimal`
@@ -385,6 +392,8 @@ fn sae_manifold_fit_model<'py>(
     row_loss_weights: Option<PyReadonlyArray1<'py, f64>>,
     separation_barrier_strength_override: Option<f64>,
     promote_from_residual: bool,
+    run_structure_search: bool,
+    structured_residual_passes: Option<usize>,
 ) -> PyResult<Py<crate::ManifoldSaeCore>> {
     if k_atoms == 0 {
         return Err(py_value_error(
@@ -509,6 +518,8 @@ fn sae_manifold_fit_model<'py>(
         row_loss_weights,
         separation_barrier_strength_override,
         promote_from_residual,
+        run_structure_search,
+        structured_residual_passes,
     )?;
     let raw = crate::manifold::manifold_sae_coercion::py_any_to_json_value(raw.bind(py).as_any())?;
     let fisher_nested = fisher_factors.map(|array| {

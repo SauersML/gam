@@ -58,22 +58,26 @@ LABELS = {
     "oracle": "Oracle (true subspaces)",
 }
 KIND_ORDER = ["segment", "circle", "disk", "sphere", "torus", "mobius", "swiss", "helix"]
-ATLAS_KINDS = ["circle", "helix", "sphere", "torus", "mobius", "swiss"]
+ATLAS_KINDS = ["segment", "circle", "disk", "sphere", "torus", "mobius", "swiss", "helix"]
 ATLAS_LABELS = {
+    "segment": ("Segment", "bounded · 1D"),
     "circle": ("Circle", "closed · 1D"),
-    "helix": ("Helix", "open · 1D"),
+    "disk": ("Disk", "bounded · 2D"),
     "sphere": ("Sphere", "closed · 2D"),
     "torus": ("Torus", "product · 2D"),
     "mobius": ("Möbius", "non-orientable · 2D"),
     "swiss": ("Swiss roll", "open · 2D"),
+    "helix": ("Helix", "open · 1D"),
 }
 ATLAS_CAMERA = {
+    "segment": (20, -58),
     "circle": (28, -58),
-    "helix": (22, -52),
+    "disk": (26, -55),
     "sphere": (22, -42),
     "torus": (30, -52),
     "mobius": (28, -62),
     "swiss": (24, -60),
+    "helix": (22, -52),
 }
 
 
@@ -291,7 +295,7 @@ def _atlas_scatter(
     ax.set_xlim(center[0] - radius, center[0] + radius)
     ax.set_ylim(center[1] - radius, center[1] + radius)
     ax.set_zlim(center[2] - radius, center[2] + radius)
-    ax.set_box_aspect((1.0, 1.0, 1.0))
+    ax.set_box_aspect((1.0, 1.0, 1.0), zoom=1.24)
     ax.set_proj_type("ortho")
     ax.view_init(elev=camera[0], azim=camera[1])
     ax.set_axis_off()
@@ -310,10 +314,11 @@ def fig_all_zoos_atlas(
     records = _atlas_cloud_records(clouds_dir)
     smooth = plt.imread(smooth_zoo)
 
-    fig = plt.figure(figsize=(16.8, 9.3), dpi=210, facecolor=SURFACE)
+    n_kinds = len(ATLAS_KINDS)
+    fig = plt.figure(figsize=(21.0, 13.8), dpi=210, facecolor=SURFACE)
     grid = fig.add_gridspec(
-        3, 6, height_ratios=(1.0, 1.0, 0.92), hspace=0.01, wspace=0.015,
-        left=0.055, right=0.995, top=0.875, bottom=0.055,
+        3, n_kinds, height_ratios=(1.0, 1.0, 1.65), hspace=0.01, wspace=0.015,
+        left=0.055, right=0.995, top=0.82, bottom=0.04,
     )
     for column, kind in enumerate(ATLAS_KINDS):
         record = records[kind]
@@ -348,28 +353,24 @@ def fig_all_zoos_atlas(
         )
 
     fig.text(
-        0.017, 0.705, "PLANTED", rotation=90, ha="center", va="center",
+        0.017, 0.712, "PLANTED", rotation=90, ha="center", va="center",
         fontsize=8.5, color=INK_MUTED, fontweight="bold",
     )
     fig.text(
-        0.017, 0.435, "MANIFOLD SAE", rotation=90, ha="center", va="center",
+        0.017, 0.498, "MANIFOLD SAE", rotation=90, ha="center", va="center",
         fontsize=8.5, color=SERIES["ours_rust"], fontweight="bold",
     )
 
     smooth_ax = fig.add_subplot(grid[2, :])
     smooth_ax.imshow(smooth)
     smooth_ax.set_axis_off()
-    smooth_ax.set_title(
-        "GAM SMOOTH ZOO  ·  four fitted geometries on the same observations",
-        fontsize=9.5, color=INK_2, loc="left", pad=3, fontweight="semibold",
-    )
 
     fig.text(
         0.055, 0.962, "THE GEOMETRY ZOO", ha="left", va="top",
         fontsize=23, color=INK, fontweight="bold",
     )
     fig.text(
-        0.055, 0.921,
+        0.055, 0.915,
         "What was planted, what the Rust Manifold SAE recovered, and how GAM smooths see one surface",
         ha="left", va="top", fontsize=11.2, color=INK_2,
     )

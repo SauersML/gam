@@ -640,15 +640,15 @@ def dump_clouds(
 ) -> None:
     # Deterministic by factor index so every featurizer dumps the SAME factors
     # and the gallery columns are directly comparable.
-    curved = [p for p in recovery["per_factor"] if p["kind"] != "segment"]
-    curved.sort(key=lambda p: p["factor"])
+    candidates = list(recovery["per_factor"])
+    candidates.sort(key=lambda p: p["factor"])
     seen_kinds: dict[str, int] = {}
     picks = []
-    for p in curved:  # first instance of each curved kind, then wrap around
+    for p in candidates:  # first instance of each kind, then wrap around
         if seen_kinds.get(p["kind"], 0) == 0:
             picks.append(p)
             seen_kinds[p["kind"]] = 1
-    picks = (picks + [p for p in curved if p not in picks])[:max_factors]
+    picks = (picks + [p for p in candidates if p not in picks])[:max_factors]
     payload: dict[str, np.ndarray] = {}
     meta: list[dict[str, Any]] = []
     for p in picks:

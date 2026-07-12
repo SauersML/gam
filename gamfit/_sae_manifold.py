@@ -162,6 +162,8 @@ def sae_manifold_fit(
     weights: Any = None,
     separation_barrier_strength: float | None = None,
     promote_from_residual: bool = True,
+    run_structure_search: bool = True,
+    structured_residual_passes: int | None = None,
 ) -> ManifoldSAE:
     """Fit and return the immutable Rust-owned manifold-SAE model.
 
@@ -226,6 +228,10 @@ def sae_manifold_fit(
             else float(separation_barrier_strength)
         ),
         promote_from_residual=bool(promote_from_residual),
+        run_structure_search=bool(run_structure_search),
+        structured_residual_passes=(
+            None if structured_residual_passes is None else int(structured_residual_passes)
+        ),
     )
 
 
