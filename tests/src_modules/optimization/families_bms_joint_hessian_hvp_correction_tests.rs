@@ -176,7 +176,7 @@ fn make_flex_hvp_cache_test_family(
 }
 
 /// gam#683: the axis-projected fast path inside
-/// `row_primary_{third,fourth}_contracted_recompute` must reproduce the
+/// `row_primary_{third,fourth}_contracted` must reproduce the
 /// slow per-(row, direction) cell-walk workers it replaces, for the
 /// single-axis directions every outer-derivative consumer builds. Equality
 /// holds by (bi)linearity of the contraction; the tolerance only absorbs
@@ -196,7 +196,7 @@ fn bernoulli_flex_axis_tensor_cache_matches_slow_recompute() {
         let row_ctx = BernoulliMarginalSlopeFamily::row_ctx(&cache, row);
         let zero_dir = Array1::<f64>::zeros(r);
         let zero_third = family
-            .row_primary_third_contracted_recompute(row, &states, &cache, row_ctx, &zero_dir)
+            .row_primary_third_contracted(row, &states, &cache, row_ctx, &zero_dir)
             .expect("zero third fast path");
         assert!(
             zero_third.iter().all(|&value| value == 0.0),
@@ -205,7 +205,7 @@ fn bernoulli_flex_axis_tensor_cache_matches_slow_recompute() {
         let mut q_dir = Array1::<f64>::zeros(r);
         q_dir[q] = 1.25;
         let zero_fourth = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row, &states, &cache, row_ctx, &zero_dir, &q_dir,
             )
             .expect("zero fourth fast path");
@@ -228,7 +228,7 @@ fn bernoulli_flex_axis_tensor_cache_matches_slow_recompute() {
             "batched zero third direction must return exact zeros"
         );
         let q_single = family
-            .row_primary_third_contracted_recompute(row, &states, &cache, row_ctx, &q_dir)
+            .row_primary_third_contracted(row, &states, &cache, row_ctx, &q_dir)
             .expect("single q third fast path");
         for (a, b) in batched[1].iter().zip(q_single.iter()) {
             assert!(
@@ -242,10 +242,10 @@ fn bernoulli_flex_axis_tensor_cache_matches_slow_recompute() {
                 let mut dir = Array1::<f64>::zeros(r);
                 dir[axis] = s;
                 let fast = family
-                    .row_primary_third_contracted_recompute(row, &states, &cache, row_ctx, &dir)
+                    .row_primary_third_contracted(row, &states, &cache, row_ctx, &dir)
                     .expect("fast third");
                 let slow = family
-                    .row_primary_third_contracted_recompute_with_moments(
+                    .row_primary_third_contracted_with_moments(
                         row, &states, &cache, row_ctx, &dir,
                     )
                     .expect("slow third");
@@ -265,17 +265,17 @@ fn bernoulli_flex_axis_tensor_cache_matches_slow_recompute() {
                 let mut dv = Array1::<f64>::zeros(r);
                 dv[av] = sv;
                 let fast = family
-                    .row_primary_fourth_contracted_recompute(
+                    .row_primary_fourth_contracted(
                         row, &states, &cache, row_ctx, &du, &dv,
                     )
                     .expect("fast fourth");
                 let ordered = family
-                    .row_primary_fourth_contracted_recompute_ordered(
+                    .row_primary_fourth_contracted_ordered(
                         row, &states, &cache, row_ctx, &du, &dv,
                     )
                     .expect("slow fourth ordered");
                 let swapped = family
-                    .row_primary_fourth_contracted_recompute_ordered(
+                    .row_primary_fourth_contracted_ordered(
                         row, &states, &cache, row_ctx, &dv, &du,
                     )
                     .expect("slow fourth swapped");

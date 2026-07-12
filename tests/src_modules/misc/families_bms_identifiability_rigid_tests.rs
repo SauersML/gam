@@ -789,7 +789,7 @@ fn row_primary_third_trace_many_matches_single_direction_contracts() {
             .expect("many-direction row trace");
         for (dir_idx, row_dir) in row_dirs.iter().enumerate() {
             let third = family
-                .row_primary_third_contracted_recompute(row, &states, &cache, row_ctx, row_dir)
+                .row_primary_third_contracted(row, &states, &cache, row_ctx, row_dir)
                 .unwrap_or_else(|e| panic!("{} failed: {:?}", "single-direction third contraction", e));
             let single = BernoulliMarginalSlopeFamily::row_primary_trace_contract(&third, &gram);
             let denom = single.abs().max(many[dir_idx].abs()).max(1.0);
@@ -999,7 +999,7 @@ fn row_primary_fourth_contracted_rejects_bad_direction_lengths() {
     let good_dir = array![0.0, 1.0];
 
     let err = family
-        .row_primary_fourth_contracted_recompute_ordered(
+        .row_primary_fourth_contracted_ordered(
             0,
             &block_states,
             &cache,
@@ -4529,12 +4529,12 @@ fn h_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir_u)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
             .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_third_contracted_recompute failed: {e}")
+                panic!("row {row}: row_primary_third_contracted failed: {e}")
             });
         let fourth = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -4543,7 +4543,7 @@ fn h_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
                 &dir_v,
             )
             .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_fourth_contracted_recompute failed: {e}")
+                panic!("row {row}: row_primary_fourth_contracted failed: {e}")
             });
 
         assert_eq!(third.dim(), (total, total));
@@ -4645,12 +4645,12 @@ fn w_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir_u)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
             .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_third_contracted_recompute failed: {e}")
+                panic!("row {row}: row_primary_third_contracted failed: {e}")
             });
         let fourth = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -4659,7 +4659,7 @@ fn w_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
                 &dir_v,
             )
             .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_fourth_contracted_recompute failed: {e}")
+                panic!("row {row}: row_primary_fourth_contracted failed: {e}")
             });
 
         assert_eq!(third.dim(), (total, total));
@@ -4729,12 +4729,12 @@ fn dual_flex_row_primary_higher_order_contractions_are_finite_and_symmetric() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir_u)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
             .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_third_contracted_recompute failed: {e}")
+                panic!("row {row}: row_primary_third_contracted failed: {e}")
             });
         let fourth = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -4743,7 +4743,7 @@ fn dual_flex_row_primary_higher_order_contractions_are_finite_and_symmetric() {
                 &dir_v,
             )
             .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_fourth_contracted_recompute failed: {e}")
+                panic!("row {row}: row_primary_fourth_contracted failed: {e}")
             });
 
         assert_eq!(third.dim(), (total, total));
@@ -4791,12 +4791,12 @@ fn dual_flex_row_primary_higher_order_zero_direction_returns_zero() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &zero)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &zero)
             .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_third_contracted_recompute failed: {e}")
+                panic!("row {row}: row_primary_third_contracted failed: {e}")
             });
         let fourth = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -4805,7 +4805,7 @@ fn dual_flex_row_primary_higher_order_zero_direction_returns_zero() {
                 &zero,
             )
             .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_fourth_contracted_recompute failed: {e}")
+                panic!("row {row}: row_primary_fourth_contracted failed: {e}")
             });
 
         assert!(
@@ -4831,12 +4831,12 @@ fn h_only_row_primary_higher_order_zero_direction_returns_zero() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &zero)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &zero)
             .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_third_contracted_recompute failed: {e}")
+                panic!("row {row}: row_primary_third_contracted failed: {e}")
             });
         let fourth = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -4845,7 +4845,7 @@ fn h_only_row_primary_higher_order_zero_direction_returns_zero() {
                 &zero,
             )
             .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_fourth_contracted_recompute failed: {e}")
+                panic!("row {row}: row_primary_fourth_contracted failed: {e}")
             });
 
         assert!(
@@ -4871,12 +4871,12 @@ fn w_only_row_primary_higher_order_zero_direction_returns_zero() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &zero)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &zero)
             .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_third_contracted_recompute failed: {e}")
+                panic!("row {row}: row_primary_third_contracted failed: {e}")
             });
         let fourth = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -4885,7 +4885,7 @@ fn w_only_row_primary_higher_order_zero_direction_returns_zero() {
                 &zero,
             )
             .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_fourth_contracted_recompute failed: {e}")
+                panic!("row {row}: row_primary_fourth_contracted failed: {e}")
             });
 
         assert!(
@@ -5004,7 +5004,7 @@ fn dual_flex_row_primary_fourth_direction_swap_is_symmetric() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let forward = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -5014,7 +5014,7 @@ fn dual_flex_row_primary_fourth_direction_swap_is_symmetric() {
             )
             .unwrap_or_else(|e| panic!("row {row}: forward fourth contraction failed: {e}"));
         let swapped = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -5071,10 +5071,10 @@ fn dual_flex_row_primary_higher_order_direction_sign_rules_hold() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir_u)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
             .unwrap_or_else(|e| panic!("row {row}: third contraction failed: {e}"));
         let third_neg = family
-            .row_primary_third_contracted_recompute(
+            .row_primary_third_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -5083,7 +5083,7 @@ fn dual_flex_row_primary_higher_order_direction_sign_rules_hold() {
             )
             .unwrap_or_else(|e| panic!("row {row}: negated third contraction failed: {e}"));
         let fourth = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -5093,7 +5093,7 @@ fn dual_flex_row_primary_higher_order_direction_sign_rules_hold() {
             )
             .unwrap_or_else(|e| panic!("row {row}: fourth contraction failed: {e}"));
         let fourth_neg_u = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -5147,7 +5147,7 @@ fn h_only_row_primary_fourth_direction_swap_is_symmetric() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let forward = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -5157,7 +5157,7 @@ fn h_only_row_primary_fourth_direction_swap_is_symmetric() {
             )
             .unwrap_or_else(|e| panic!("row {row}: forward fourth contraction failed: {e}"));
         let swapped = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -5207,7 +5207,7 @@ fn w_only_row_primary_fourth_direction_swap_is_symmetric() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let forward = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -5217,7 +5217,7 @@ fn w_only_row_primary_fourth_direction_swap_is_symmetric() {
             )
             .unwrap_or_else(|e| panic!("row {row}: forward fourth contraction failed: {e}"));
         let swapped = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -5260,13 +5260,13 @@ fn h_only_row_primary_higher_order_direction_sign_rules_hold() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir)
             .unwrap_or_else(|e| panic!("row {row}: third contraction failed: {e}"));
         let third_neg = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &neg_dir)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &neg_dir)
             .unwrap_or_else(|e| panic!("row {row}: negated third contraction failed: {e}"));
         let fourth = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -5276,7 +5276,7 @@ fn h_only_row_primary_higher_order_direction_sign_rules_hold() {
             )
             .unwrap_or_else(|e| panic!("row {row}: fourth contraction failed: {e}"));
         let fourth_neg = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -5323,13 +5323,13 @@ fn w_only_row_primary_higher_order_direction_sign_rules_hold() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir)
             .unwrap_or_else(|e| panic!("row {row}: third contraction failed: {e}"));
         let third_neg = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &neg_dir)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &neg_dir)
             .unwrap_or_else(|e| panic!("row {row}: negated third contraction failed: {e}"));
         let fourth = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -5339,7 +5339,7 @@ fn w_only_row_primary_higher_order_direction_sign_rules_hold() {
             )
             .unwrap_or_else(|e| panic!("row {row}: fourth contraction failed: {e}"));
         let fourth_neg = family
-            .row_primary_fourth_contracted_recompute(
+            .row_primary_fourth_contracted(
                 row,
                 &block_states,
                 &cache,
@@ -5564,13 +5564,13 @@ fn dual_flex_row_primary_third_direction_is_linear() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third_u = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir_u)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
             .unwrap_or_else(|e| panic!("row {row}: third contraction u failed: {e}"));
         let third_v = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir_v)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_v)
             .unwrap_or_else(|e| panic!("row {row}: third contraction v failed: {e}"));
         let third_sum = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir_sum)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_sum)
             .unwrap_or_else(|e| panic!("row {row}: third contraction sum failed: {e}"));
 
         for i in 0..total {
@@ -5615,13 +5615,13 @@ fn h_only_row_primary_third_direction_is_linear() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third_u = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir_u)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
             .unwrap_or_else(|e| panic!("row {row}: third contraction u failed: {e}"));
         let third_v = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir_v)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_v)
             .unwrap_or_else(|e| panic!("row {row}: third contraction v failed: {e}"));
         let third_sum = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir_sum)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_sum)
             .unwrap_or_else(|e| panic!("row {row}: third contraction sum failed: {e}"));
 
         for i in 0..total {
@@ -5666,13 +5666,13 @@ fn w_only_row_primary_third_direction_is_linear() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third_u = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir_u)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
             .unwrap_or_else(|e| panic!("row {row}: third contraction u failed: {e}"));
         let third_v = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir_v)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_v)
             .unwrap_or_else(|e| panic!("row {row}: third contraction v failed: {e}"));
         let third_sum = family
-            .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir_sum)
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_sum)
             .unwrap_or_else(|e| panic!("row {row}: third contraction sum failed: {e}"));
 
         for i in 0..total {
