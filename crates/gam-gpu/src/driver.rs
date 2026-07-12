@@ -232,8 +232,36 @@ fn cuda_userspace_preload_paths() -> Result<Vec<PathBuf>, String> {
     Ok(Vec::new())
 }
 
+/// The CUDA component a userspace library path belongs to, taken from its
+/// SONAME stem (`libcublas.so.12` -> `cublas`, `libnvJitLink.so.12` ->
+/// `nvJitLink`). Used to reason about which mapped libraries are the same
+/// component sourced from different roots.
+#[cfg(target_os = "linux")]
+fn cuda_library_component(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_prefix("lib")?.split(".so").next()?;
+    if stem.is_empty() {
+        None
+    } else {
+        Some(stem.to_string())
+    }
+}
+
+/// The CUDA *compute* libraries. These are handle-based and share context /
+/// workspace state with whatever copy the process already initialised, so a
+/// second copy must never be mapped from a different root — that split is the
+/// double-free / `NOT_INITIALIZED` hazard the mapped-stack continuation exists
+/// to avoid. `cudart` / `nvJitLink` are runtime/driver-adjacent and tolerate a
+/// redundant duplicate (dlopen-by-SONAME binds one deterministically).
+#[cfg(target_os = "linux")]
+fn is_cuda_compute_component(component: &str) -> bool {
+    matches!(component, "cublas" | "cublasLt" | "cusolver" | "cusparse")
+}
+
 #[cfg(target_os = "linux")]
 fn complete_mapped_cuda_stack(mapped: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+
     let mut candidates = Vec::new();
     for path in mapped {
         if let Some(root) = nvidia_package_root_for_library(path)
@@ -247,17 +275,71 @@ fn complete_mapped_cuda_stack(mapped: &[PathBuf]) -> Result<Vec<PathBuf>, String
             candidates.push(stack);
         }
     }
-    for stack in candidates {
-        let stack = dedup_paths(stack);
-        if mapped.iter().all(|mapped_path| {
-            let mapped_path = mapped_path
-                .canonicalize()
-                .unwrap_or_else(|_| mapped_path.clone());
-            stack.iter().any(|candidate| candidate == &mapped_path)
-        }) {
+
+    // Canonical path + component for every mapped library, computed once.
+    let mapped_meta: Vec<(PathBuf, Option<String>)> = mapped
+        .iter()
+        .map(|m| (canonical(m), cuda_library_component(m)))
+        .collect();
+
+    // Fast path: a single complete stack that contains EVERY mapped library.
+    // This is the unchanged behaviour for a process whose CUDA userspace all
+    // comes from one root (a pure system toolkit or a pure pip-wheel stack).
+    for stack in &candidates {
+        let stack = dedup_paths(stack.clone());
+        let stack_canon: Vec<PathBuf> = stack.iter().map(|c| canonical(c)).collect();
+        if mapped_meta
+            .iter()
+            .all(|(m, _)| stack_canon.iter().any(|c| c == m))
+        {
             return Ok(stack);
         }
     }
+
+    // Split-stack path: a process can legitimately map a system `libcudart`
+    // (pulled onto the default loader path by ldconfig) alongside a host
+    // framework's pip-wheel stack (e.g. PyTorch's `nvidia-*-cu12` wheels), so
+    // NO single complete stack contains every mapped path. Continue a stack
+    // only when the process is genuinely using ALL of it, and only tolerate a
+    // benign duplicate — never a split of the handle-based compute libraries:
+    //
+    //   (a) every library in the candidate stack is already mapped — we
+    //       CONTINUE a stack the process runs on, we never introduce a library
+    //       from a partially-present root; and
+    //   (b) every mapped library is either part of that stack or a redundant
+    //       duplicate of a NON-compute component (`cudart` / `nvJitLink`) the
+    //       stack already provides. A mapped compute library (`cuBLAS` /
+    //       `cuSOLVER` / `cuSPARSE`) from another root is a genuine split and
+    //       disqualifies the candidate — mapping a second copy is the
+    //       double-free / `NOT_INITIALIZED` hazard this continuation avoids.
+    //
+    // Libraries mixed across two partially-mapped roots satisfy neither, so the
+    // conservative refusal below still fires for them.
+    for stack in candidates {
+        let stack = dedup_paths(stack);
+        let stack_canon: Vec<PathBuf> = stack.iter().map(|c| canonical(c)).collect();
+        let fully_mapped = stack_canon
+            .iter()
+            .all(|s| mapped_meta.iter().any(|(m, _)| m == s));
+        if !fully_mapped {
+            continue;
+        }
+        let consistent = mapped_meta.iter().all(|(m, component)| {
+            if stack_canon.iter().any(|s| s == m) {
+                return true;
+            }
+            match component {
+                Some(component) if !is_cuda_compute_component(component) => stack
+                    .iter()
+                    .any(|s| cuda_library_component(s).as_deref() == Some(component)),
+                _ => false,
+            }
+        });
+        if consistent {
+            return Ok(stack);
+        }
+    }
+
     Err(format!(
         "CUDA userspace is already mapped from no single complete stack: {}",
         mapped
@@ -871,5 +953,37 @@ mod tests {
             .expect_err("libraries from two mapped roots must not be mixed");
 
         assert!(error.contains("no single complete stack"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapped_pytorch_stack_with_redundant_system_cudart_is_continued() {
+        // A process can map a system `libcudart` (pulled onto the default
+        // loader path by ldconfig) alongside PyTorch's complete pip-wheel
+        // stack. The whole pip stack is mapped; the extra system cudart is a
+        // redundant duplicate of a non-compute component, so the pip stack is
+        // continued rather than the GPU being refused (gam issue #2259).
+        let temp = tempfile::tempdir().expect("temporary CUDA tree");
+        let pip = fake_nvidia_stack(&temp.path().join("site-packages").join("nvidia"));
+
+        // A stray system cudart from an unrelated toolkit directory (no
+        // complete stack of its own next to it).
+        let sys_dir = temp.path().join("usr").join("local").join("cuda").join("lib");
+        std::fs::create_dir_all(&sys_dir).expect("system lib dir");
+        let sys_cudart = sys_dir.join("libcudart.so.12");
+        std::fs::write(&sys_cudart, []).expect("system cudart");
+
+        // Everything from the pip stack is mapped, plus the redundant cudart.
+        let mut mapped = pip.clone();
+        mapped.push(sys_cudart);
+
+        let selected =
+            complete_mapped_cuda_stack(&mapped).expect("continue the fully-mapped pip stack");
+
+        assert_eq!(selected.len(), pip.len());
+        assert!(pip.iter().all(|path| {
+            let canonical = path.canonicalize().expect("canonical fake library");
+            selected.contains(&canonical)
+        }));
     }
 }
