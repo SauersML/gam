@@ -1757,13 +1757,35 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let (ll, block_gradients) =
             self.evaluate_log_likelihood_and_block_gradients(block_states)?;
 
-        // Block-diagonal direct path — assemble only the principal blocks
-        // the inner solver consumes. The cross blocks (h_ht, h_hl, h_hw,
-        // h_tl, h_tw, h_lw) are not required by per-block working sets, so
-        // we never materialize them. See `assemble_block_diagonal_hessians_from_quantities`.
-        let q = self.collect_joint_quantities(block_states)?;
-        let block_hessians =
-            self.assemble_block_diagonal_hessians_from_quantities(&q, block_states)?;
+        // Every non-wiggle block is a view of the same packed 24-pair row
+        // program lowering. Cross-block groups are never materialized for this
+        // target. Link-wiggle geometry has a beta-dependent Jacobian and uses its
+        // canonical runtime-sized row program, then slices the same dense result.
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        let block_hessians = if self.x_link_wiggle.is_some() {
+            let dense = super::row_kernel::survival_ls_wiggle_joint_hessian_dense(
+                self, &dynamic, 0.0,
+            )?;
+            let offsets = self.joint_block_offsets();
+            offsets
+                .windows(2)
+                .map(|bounds| {
+                    dense
+                        .slice(s![bounds[0]..bounds[1], bounds[0]..bounds[1]])
+                        .to_owned()
+                })
+                .collect()
+        } else {
+            match self.survival_ls_coefficient_hessian(
+                &dynamic,
+                0.0,
+                None,
+                SlsCoefficientHessianTarget::BlockDiagonal,
+            )? {
+                SlsCoefficientHessian::BlockDiagonal(blocks) => blocks,
+                _ => unreachable!("block-diagonal SLS target returned another shape"),
+            }
+        };
         if block_hessians.len() != block_gradients.len() {
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                 "SurvivalLocationScaleFamily evaluate block count mismatch: gradients={}, hessians={}",
