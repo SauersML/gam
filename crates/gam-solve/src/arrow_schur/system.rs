@@ -1563,10 +1563,7 @@ impl StreamingArrowSchur {
         let k = self.k;
         // Per-row factor + two block solves + a `k×k` GEMM subtract is the whole
         // assembly cost at the SAE LLM shape (#1017); the rows are independent so
-        // the chunk fans across cores. Stay sequential for the handful-of-rows
-        // non-SAE callers, or when already inside a rayon worker (the topology
-        // race fans candidates with `run_topology_race_parallel`) to avoid
-        // nested-rayon oversubscription — the same gate `schur_matvec` uses.
+        // the reduction fans across cores.
         // #2228 determinism: reduce the per-row contributions —
         // `+H_βt^(i)(H_tt^(i))⁻¹ g_t^(i)` (length `k`, into the reduced RHS) and
         // `−H_βt^(i)(H_tt^(i))⁻¹ H_tβ^(i)` (`k×k`, into the reduced Schur
