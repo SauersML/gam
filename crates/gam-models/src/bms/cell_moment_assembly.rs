@@ -12,7 +12,7 @@ use super::*;
 
 use crate::fnv1a::Fnv1a;
 use gam_math::jet_scalar::{
-    DynamicJetArena, DynamicOneSeedBatch, DynamicOneSeedBatchWorkspace, DynamicTwoSeed,
+    DynamicJetArena, DynamicJetBatchWorkspace, DynamicOneSeedBatch, DynamicTwoSeed,
     FixedRuntimeJet, OneSeed, RuntimeJetScalar, TwoSeed, filtered_implicit_solve_runtime_scalar,
 };
 
@@ -20,8 +20,8 @@ thread_local! {
     /// Per-worker empirical FLEX third-order workspace. The largest batch is
     /// retained across rows, so a warmed worker does not revisit the global
     /// allocator for the runtime-sized jet tape.
-    static EMPIRICAL_BMS_THIRD_WORKSPACE: std::cell::RefCell<DynamicOneSeedBatchWorkspace> =
-        std::cell::RefCell::new(DynamicOneSeedBatchWorkspace::new(1));
+    static EMPIRICAL_BMS_THIRD_WORKSPACE: std::cell::RefCell<DynamicJetBatchWorkspace> =
+        std::cell::RefCell::new(DynamicJetBatchWorkspace::new(1));
     /// Per-worker empirical FLEX fourth-order workspace for the general-width
     /// two-seed path.
     static EMPIRICAL_BMS_FOURTH_WORKSPACE: std::cell::RefCell<DynamicJetArena> =
