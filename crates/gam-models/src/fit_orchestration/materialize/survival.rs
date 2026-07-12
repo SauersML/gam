@@ -74,7 +74,9 @@ pub(crate) fn materialize_survival<'a>(
     // Interval-censored `SurvInterval(L, R, event)`: `exit_col` carried the
     // LEFT boundary `L` (resolved into `age_exit` above), and `interval_right_col`
     // carries the RIGHT boundary `R`. The kernel's interval contribution
-    // `log[S(L) − S(R)]` requires a finite `R ≥ L` per row (`event >= 0.5`); a
+    // `log[S(L) − S(R)]` requires a finite `R > L` per row (`event >= 0.5`) —
+    // the interval mass `P(L < T ≤ R) = S(L) − S(R)` is positive only for a
+    // strictly wider-than-zero bracket (`R == L` gives `log 0 = −∞`); a
     // row with `event < 0.5` is right-censored at `L` (its `R` is ignored). We
     // resolve `age_right` here so the downstream latent time stack can evaluate
     // the baseline at `R`.
