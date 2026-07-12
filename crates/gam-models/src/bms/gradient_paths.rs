@@ -1496,13 +1496,13 @@ pub(crate) fn rigid_standard_normal_signed_margin<S: gam_math::jet_scalar::JetSc
 }
 
 /// One row of rigid standard-normal Bernoulli data as a generic
-/// [`RowNllProgramGeneric<2>`] (#932 production wiring).
+/// [`RowProgram<2>`] (#932 production wiring).
 ///
 /// This is the genuine production consumer of the generic program seam: the row
 /// NLL is written ONCE in [`rigid_standard_normal_row_nll_generic`] over
 /// `S: JetScalar<2>`, and this single-row program routes it through the
 /// [`gam_math::jet_tower`] `generic_*` evaluators
-/// ([`generic_full_tower`](gam_math::jet_tower::generic_full_tower) for
+/// ([`program_full_tower`](gam_math::jet_tower::program_full_tower) for
 /// the uncontracted tensors, and the cheap order-2 / contracted scalars for the
 /// value/grad/Hessian and directional channels). Primaries are
 /// `[marginal η, slope g]`; the marginal link map and per-row data
@@ -1516,7 +1516,7 @@ pub(crate) struct RigidStandardNormalRow {
     pub(crate) probit_scale: f64,
 }
 
-impl gam_math::jet_tower::RowNllProgramGeneric<2> for RigidStandardNormalRow {
+impl gam_math::jet_tower::RowProgram<2> for RigidStandardNormalRow {
     fn n_rows(&self) -> usize {
         1
     }
@@ -1528,7 +1528,7 @@ impl gam_math::jet_tower::RowNllProgramGeneric<2> for RigidStandardNormalRow {
         Ok([self.marginal.eta_value(), self.g])
     }
 
-    fn row_nll_generic<S: gam_math::jet_scalar::JetScalar<2>>(
+    fn eval<S: gam_math::jet_scalar::JetScalar<2>>(
         &self,
         row: usize,
         p: &[S; 2],
@@ -1559,9 +1559,9 @@ pub(crate) fn rigid_standard_normal_tower(
     // #932 cutover: the full uncontracted tower comes from the SAME single
     // generic row-NLL expression every other channel consumer derives from,
     // routed through the generic program seam evaluated at the all-channels
-    // `Tower4` scalar. `generic_full_tower` seeds `[marginal η, g]` exactly as
+    // `Tower4` scalar. `program_full_tower` seeds `[marginal η, g]` exactly as
     // the previous inline `Tower4::variable` form did, so this is bit-identical
-    // while giving `RowNllProgramGeneric` a genuine production consumer.
+    // while giving `RowProgram` a genuine production consumer.
     let program = RigidStandardNormalRow {
         marginal,
         g,
@@ -1570,7 +1570,7 @@ pub(crate) fn rigid_standard_normal_tower(
         w,
         probit_scale,
     };
-    gam_math::jet_tower::generic_full_tower(&program, 0)
+    gam_math::jet_tower::program_full_tower(&program, 0)
 }
 
 /// Branch-free `signed`-margin jet for the rigid standard-normal row kernel.
@@ -1701,7 +1701,7 @@ pub(super) fn rigid_standard_normal_row_kernel(
 ) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
     // #932 cutover: value/gradient/Hessian derive from the SAME single generic
     // row-NLL expression (`rigid_standard_normal_row_nll_generic`) every other
-    // channel consumer uses, routed through the `RowNllProgramGeneric` seam at the
+    // channel consumer uses, routed through the `RowProgram` seam at the
     // packed `Order2<2>` scalar — there is no longer a hand-assembled `Tower2<2>`
     // here. Seeds `[marginal η, g]` exactly as the deleted inline form did, so it
     // is bit-identical (the `rigid_bernoulli_*_agrees_with_jet_tower_program_all_channels`
@@ -1715,7 +1715,7 @@ pub(super) fn rigid_standard_normal_row_kernel(
         w,
         probit_scale,
     };
-    gam_math::jet_tower::generic_row_kernel(&program, 0)
+    gam_math::jet_tower::program_row_kernel(&program, 0)
 }
 
 /// Mixed `(primary, z)` second derivative of the rigid standard-normal row
@@ -2428,10 +2428,10 @@ mod jet_tower_oracle_tests {
     }
 
     /// #932 production wiring: the rigid Bernoulli row, routed through the
-    /// generic [`RowNllProgramGeneric<2>`] program seam and its cheap
-    /// order-2 / contracted scalar evaluators (`generic_row_kernel`,
-    /// `generic_third_contracted`, `generic_fourth_contracted`,
-    /// `generic_full_tower`), must agree BIT-FOR-BIT with the dense
+    /// generic [`RowProgram<2>`] program seam and its cheap
+    /// order-2 / contracted scalar evaluators (`program_row_kernel`,
+    /// `program_third_contracted`, `program_fourth_contracted`,
+    /// `program_full_tower`), must agree BIT-FOR-BIT with the dense
     /// `Tower4`-only [`RowNllProgram`] path (`evaluate_program`). Both write the
     /// same single-expression NLL — the contracted scalars fold the direction
     /// into the differentiation, so this pins that the packed channels equal the
@@ -2440,8 +2440,8 @@ mod jet_tower_oracle_tests {
     #[test]
     fn rigid_bernoulli_generic_program_matches_tower4_program_all_channels() {
         use gam_math::jet_tower::{
-            generic_fourth_contracted, generic_full_tower, generic_row_kernel,
-            generic_third_contracted,
+            program_fourth_contracted, program_full_tower, program_row_kernel,
+            program_third_contracted,
         };
 
         let eta = [0.3_f64, -0.7, 0.05, 0.9, -1.2, 2.1, -2.4];
@@ -2487,9 +2487,9 @@ mod jet_tower_oracle_tests {
                     probit_scale,
                 };
 
-                // generic_full_tower must reproduce the dense tower in EVERY
+                // program_full_tower must reproduce the dense tower in EVERY
                 // channel (v, g, H, t3, t4).
-                let full = generic_full_tower(&program, 0).expect("generic full tower");
+                let full = program_full_tower(&program, 0).expect("generic full tower");
                 close(full.v, truth.v, "full value");
                 for a in 0..2 {
                     close(full.g[a], truth.g[a], "full grad");
@@ -2504,9 +2504,9 @@ mod jet_tower_oracle_tests {
                     }
                 }
 
-                // generic_row_kernel (Order2) must equal the tower's (v, g, H).
+                // program_row_kernel (Order2) must equal the tower's (v, g, H).
                 let (val, grad, hess) =
-                    generic_row_kernel(&program, 0).expect("generic row kernel");
+                    program_row_kernel(&program, 0).expect("generic row kernel");
                 close(val, truth.v, "order2 value");
                 for a in 0..2 {
                     close(grad[a], truth.g[a], "order2 grad");
@@ -2515,10 +2515,10 @@ mod jet_tower_oracle_tests {
                     }
                 }
 
-                // generic_third_contracted (OneSeed) must equal the dense
+                // program_third_contracted (OneSeed) must equal the dense
                 // tower's third contraction for each direction.
                 for dir in &dirs {
-                    let third = generic_third_contracted(&program, 0, dir)
+                    let third = program_third_contracted(&program, 0, dir)
                         .expect("generic third contracted");
                     let truth3 = truth.third_contracted(dir);
                     for a in 0..2 {
@@ -2528,11 +2528,11 @@ mod jet_tower_oracle_tests {
                     }
                 }
 
-                // generic_fourth_contracted (TwoSeed) must equal the dense
+                // program_fourth_contracted (TwoSeed) must equal the dense
                 // tower's fourth contraction for each direction pair.
                 for (i, u) in dirs.iter().enumerate() {
                     let v = dirs[(i + 1) % dirs.len()];
-                    let fourth = generic_fourth_contracted(&program, 0, u, &v)
+                    let fourth = program_fourth_contracted(&program, 0, u, &v)
                         .expect("generic fourth contracted");
                     let truth4 = truth.fourth_contracted(u, &v);
                     for a in 0..2 {
