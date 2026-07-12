@@ -289,7 +289,7 @@ mod tests {
             let derivative = (plus - minus) / (2.0 * h);
             assert!((derivative - ratio).abs() <= 1.0e-6 + 1.0e-5 * ratio.abs());
 
-            let log_step = 1.0e-5;
+            let log_step = 1.0e-5_f64;
             let (centered_plus, _, _) =
                 bessel_i0_centered_terms(eta * log_step.exp());
             let (centered_minus, _, _) =

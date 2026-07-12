@@ -2778,19 +2778,17 @@ pub(crate) fn shape_matched_control_f32<'py>(
 /// with [`shape_matched_control`] and rerun every stage. Non-dictionary callers
 /// can explicitly disable `matched_controls` and receive no control-rate claim.
 ///
-/// #2262 detection-reach statement: when `n_eff`, `ambient_p`, and
+/// #2262 rank-detection diagnostic: when `n_eff`, `ambient_p`, and
 /// `dispersion_r` are all supplied (the atom's occupancy-weighted effective
-/// sample size, the pre-projection ambient dictionary width, and the residual
+/// sample size, the ambient output width used by rank pricing, and the residual
 /// dispersion `R`), the returned dict also carries `detection_floor` — the
-/// Marchenko–Pastur noise edge `R·(1+√(ambient_p/n_eff))²` below which no
-/// reconstruction direction at this sample size and ambient dimension can be
-/// distinguished from noise (the identical closed-form edge the production
-/// rank charge thresholds on; see
-/// [`gam::terms::sae::null_battery::mp_detection_floor`]). A masked ring whose
-/// true signal energy sits below this floor is architecturally undetectable
-/// by the race regardless of the verdict returned, so this is a statement
-/// about detection reach, not a substitute for the verdict. Omit all three to
-/// leave `detection_floor` as `None`; supplying only a subset is an error.
+/// Marchenko–Pastur edge `R·(1+√(ambient_p/n_eff))²` that the production rank
+/// charge uses to classify a reconstruction direction as MP-detected (see
+/// [`gam::terms::sae::null_battery::mp_detection_floor`]). This is a
+/// rank-charge diagnostic, not an information-theoretic limit: the predictive
+/// 2-D shape race does not consume it, and a below-edge direction does not
+/// negate or override the returned shape verdict. Omit all three to leave
+/// `detection_floor` as `None`; supplying only a subset is an error.
 #[pyfunction]
 #[pyo3(
     signature = (coords, folds = 5, seed = 11, k_ladder = None, mean_l0 = None, matched_controls = true, n_eff = None, ambient_p = None, dispersion_r = None)

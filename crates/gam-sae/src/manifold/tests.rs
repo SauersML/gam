@@ -5319,6 +5319,55 @@ fn ard_atom_and_coord(
     (atom, manifold, coords)
 }
 
+/// The periodic ARD partition is a centered Bessel expression. At large
+/// precision, separately forming `-eta + log I0(eta)` rounds both terms to the
+/// same enormous float and loses the `-½ log(2πη)` normalizer; likewise
+/// `eta·(I1/I0-1)` becomes zero after the ratio rounds to one. Pin both the
+/// value and its log-precision derivative in that regime.
+#[test]
+pub(crate) fn periodic_ard_centered_bessel_value_gradient_survive_huge_precision() {
+    let n = 3usize;
+    let coords = Array2::<f64>::zeros((n, 1));
+    let manifold = LatentManifold::Circle { period: 1.0 };
+    let (atom, manifold, coords) = ard_atom_and_coord("circle", manifold, coords);
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, 1)),
+        vec![coords],
+        vec![manifold],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+    let log_alpha = 690.0_f64;
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![log_alpha]]);
+
+    let value = term.ard_value(&rho).unwrap();
+    let log_eta = log_alpha - 2.0 * std::f64::consts::TAU.ln();
+    let expected = -0.5 * n as f64 * (std::f64::consts::TAU.ln() + log_eta);
+    assert!(value.is_finite());
+    assert!(
+        (value - expected).abs() < 2.0e-8,
+        "centered periodic normalizer drifted: value={value}, expected={expected}"
+    );
+
+    let derivative = term.ard_log_precision_explicit_derivatives(&rho).unwrap()[0][0];
+    assert!(derivative.is_finite());
+    assert!(
+        (derivative + 0.5 * n as f64).abs() < 1.0e-12,
+        "periodic normalizer derivative lost its -n/2 limit: {derivative}"
+    );
+
+    let step = 1.0e-4;
+    let plus = SaeManifoldRho::new(0.0, 0.0, vec![array![log_alpha + step]]);
+    let minus = SaeManifoldRho::new(0.0, 0.0, vec![array![log_alpha - step]]);
+    let finite_difference =
+        (term.ard_value(&plus).unwrap() - term.ard_value(&minus).unwrap()) / (2.0 * step);
+    assert!(
+        (finite_difference - derivative).abs() < 2.0e-7,
+        "periodic ARD value/gradient mismatch: analytic={derivative}, finite_difference={finite_difference}"
+    );
+}
+
 /// F6 (fit-level composition): the native ARD energy on a coordinate-
 /// HETEROGENEOUS `{circle d=1, patch d=2, linear d=1}` dictionary is *exactly*
 /// the sum of the per-atom ARD energies — the same per-atom-additive

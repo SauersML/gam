@@ -2,7 +2,7 @@
 //! helpers for `SaeManifoldTerm`, moved verbatim out of construction.rs to keep it
 //! under the 10k-line ban gate. Pure code move, no logic change.
 use super::*;
-use gam_math::special::bessel_i0_log_and_ratio;
+use gam_math::special::bessel_i0_centered_terms_from_log_abs;
 
 impl SaeManifoldTerm {
     /// Per-atom, per-axis coordinate sum-of-squares `‖t_kj‖² = Σ_i t_{i,k,j}²`.
@@ -730,7 +730,9 @@ impl SaeManifoldTerm {
             }
             let periods = coord.effective_axis_periods();
             for axis in 0..d {
-                let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom_idx][axis]);
+                let raw_log_alpha = rho.log_ard[atom_idx][axis];
+                let log_alpha = SaeManifoldRho::clamped_log_strength(raw_log_alpha);
+                let alpha = log_alpha.exp();
                 let period = periods[axis];
                 let mut energy_deriv = 0.0_f64;
                 for row in 0..coord.n_obs() {
@@ -741,17 +743,24 @@ impl SaeManifoldTerm {
                 let normalizer_deriv = match period {
                     None => -0.5 * n_eff,
                     Some(p) => {
-                        let kappa = std::f64::consts::TAU / p;
-                        let eta = alpha / (kappa * kappa);
-                        // d/d(log α) of `n[-η + log I0(η)]` = `n η (I1/I0 - 1)`.
-                        // The ratio is computed without forming `e^{η}`, so it
-                        // stays finite for large `η` instead of the `inf/inf =
-                        // NaN` that `bessel_i1(η)/bessel_i0(η)` produces (#1113).
-                        let ratio = bessel_i0_log_and_ratio(eta).1;
-                        n_eff * eta * (-1.0 + ratio)
+                        let log_eta =
+                            log_alpha + 2.0 * (p.ln() - std::f64::consts::TAU.ln());
+                        // d/d(log α) of `n[-η + log I0(η)]` is
+                        // `n·η·(I1/I0−1)`. The centered primitive evaluates the
+                        // complete product, so its `−½` large-η limit survives
+                        // after the ordinary ratio has rounded to one and even
+                        // when η itself is not representable.
+                        n_eff * bessel_i0_centered_terms_from_log_abs(log_eta).2
                     }
                 };
-                atom_out[axis] = energy_deriv + normalizer_deriv;
+                atom_out[axis] = if log_alpha == raw_log_alpha {
+                    energy_deriv + normalizer_deriv
+                } else {
+                    // `ard_value` is constant outside the finite-strength band
+                    // because both its energy and normalizer use the same
+                    // clamped log precision.
+                    0.0
+                };
             }
             out.push(atom_out);
         }

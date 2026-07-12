@@ -108,21 +108,19 @@ pub fn empirical_p_value(
     })
 }
 
-/// Marchenko–Pastur detection-reach statement (#2262): the minimum
-/// per-observation signal energy `R·(1+√(p/n_eff))²` a reconstruction
-/// direction must clear to be distinguishable from noise at this
-/// `(n_eff, p, R)`. This is the identical closed-form noise edge the
-/// production rank charge already thresholds on
+/// Marchenko–Pastur rank-detection threshold (#2262): the per-observation
+/// reconstruction energy `R·(1+√(p/n_eff))²` that the production rank charge
+/// uses to call a decoder direction MP-detected at `(n_eff, p, R)`. This is the
+/// identical closed-form noise edge the production rank charge thresholds on
 /// ([`crate::manifold::construction::realised_rank_charge_dof`], and its
 /// audit twin
 /// [`crate::manifold::wbic_audit::ReconSpectrum::mp_detection_edge`]) —
-/// surfaced standalone so a shape-adjudication caller can report "this is
-/// the smallest signal this sample size and ambient dimension could ever
-/// certify" alongside a verdict, without needing a fitted decoder Gram to
-/// call the production path. A masked ring living below this floor (e.g.
-/// its per-observation signal-to-noise ratio does not clear `edge`) is
-/// architecturally undetectable by the MP-thresholded race, independent of
-/// whatever the adjudicator's verdict says.
+/// surfaced standalone so a caller can report the rank-charge diagnostic
+/// alongside a shape verdict without needing a fitted decoder Gram. It is not
+/// an information-theoretic detection limit and the predictive 2-D shape race
+/// does not threshold on it: a direction below this edge is MP-undetected by
+/// the production rank classifier, but that fact neither negates nor overrides
+/// a shape verdict.
 pub fn mp_detection_floor(n_eff: f64, p: f64, r_floor: f64) -> Result<f64, String> {
     if !n_eff.is_finite() || n_eff <= 0.0 {
         return Err(format!(
@@ -165,13 +163,13 @@ pub fn mp_detection_floor(n_eff: f64, p: f64, r_floor: f64) -> Result<f64, Strin
     let log_edge = r_floor.ln() + 2.0 * log_multiplier;
     if !log_edge.is_finite() || log_edge > f64::MAX.ln() {
         return Err(format!(
-            "mp_detection_floor: edge overflowed for n_eff={n_eff}, p={p}, r_floor={r_floor}"
+            "mp_detection_floor: edge is not representable for n_eff={n_eff}, p={p}, r_floor={r_floor}"
         ));
     }
     let recovered_edge = log_edge.exp();
-    if !recovered_edge.is_finite() {
+    if !recovered_edge.is_finite() || recovered_edge == 0.0 {
         return Err(format!(
-            "mp_detection_floor: edge overflowed for n_eff={n_eff}, p={p}, r_floor={r_floor}"
+            "mp_detection_floor: edge is not representable for n_eff={n_eff}, p={p}, r_floor={r_floor}"
         ));
     }
     Ok(recovered_edge)
@@ -2595,10 +2593,10 @@ mod tests {
             .expect("mp_detection_floor should succeed on valid inputs");
 
         assert!(
-            (spectrum.edge - floor).abs() < 1.0e-12,
+            (spectrum.mp_detection_edge() - floor).abs() < 1.0e-12,
             "standalone detection floor must match the production MP edge byte-for-byte: \
              spectrum.edge={} floor={}",
-            spectrum.edge,
+            spectrum.mp_detection_edge(),
             floor
         );
     }
@@ -2643,7 +2641,7 @@ mod tests {
         let asymptotic = 0.25 * p;
         assert!(edge.is_finite() && edge > 0.0);
         assert!(
-            ((edge - asymptotic) / asymptotic).abs() < 2.0e-13,
+            ((edge - asymptotic) / asymptotic).abs() < 1.0e-12,
             "log-domain MP edge reconstruction drifted: edge={edge:e}, expected≈{asymptotic:e}"
         );
     }

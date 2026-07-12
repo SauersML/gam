@@ -517,7 +517,7 @@ Returns a dict:
 | `matched_controls` | full verdicts after shuffling these supplied coordinates and replacing them by a covariance-matched Gaussian |
 | `control_false_circle_floor` | circular-win fraction across those two adjudicator-input controls |
 | `dictionary_mean_l0` | the dictionary sparsity supplied alongside the rate |
-| `detection_floor` | Marchenko–Pastur reconstruction-energy edge when `n_eff`, `ambient_p`, and `dispersion_r` are supplied together; otherwise `None` |
+| `detection_floor` | Marchenko–Pastur reconstruction-energy threshold used by production rank pricing when `n_eff`, `ambient_p`, and `dispersion_r` are supplied together; otherwise `None`. Diagnostic only: the predictive shape race does not threshold on it. |
 
 Either mixture EM can refuse to certify convergence (a `GamError`). That is a
 typed missing adjudication, not a negative topology verdict; record it as such

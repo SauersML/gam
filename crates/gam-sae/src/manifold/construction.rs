@@ -1,5 +1,5 @@
 use super::*;
-use gam_math::special::bessel_i0_log_and_ratio;
+use gam_math::special::bessel_i0_centered_terms_from_log_abs;
 
 // ── Theorem K: the rank charge is a RUNNING COMPLEXITY λ(n) ──────────────────
 //
@@ -380,7 +380,11 @@ pub(crate) fn realised_rank_charge_dof(
         format!("realised_rank_charge_dof: G + lambda*S is not positive definite: {error}")
     })?;
     let x = factor.solve_mat(gram); // X = (G+λS)⁻¹ G
-    let basis_edf = (0..m).map(|i| x[[i, i]]).sum::<f64>().clamp(0.0, m as f64);
+    let raw_basis_edf = (0..m).map(|i| x[[i, i]]).sum::<f64>();
+    if !raw_basis_edf.is_finite() {
+        return Err("realised_rank_charge_dof: basis EDF is non-finite".to_string());
+    }
+    let basis_edf = raw_basis_edf.clamp(0.0, m as f64);
     Ok(rank.production_chargeable_rank as f64 * basis_edf)
 }
 
@@ -5106,12 +5110,12 @@ impl SaeManifoldTerm {
             // wrapped (Circle) axes and the Gaussian on Euclidean axes.
             let periods = coord.effective_axis_periods();
             for axis in 0..d {
-                let log_alpha = rho.log_ard[atom_idx][axis];
+                let log_alpha = SaeManifoldRho::clamped_log_strength(rho.log_ard[atom_idx][axis]);
                 // Clamp the log-precision before exponentiating: a raw
                 // `exp(log_ard)` overflows to `inf` for `log_ard ≳ 709`, and the
                 // `inf` precision then poisons the ARD energy / curvature with
                 // `inf · 0.0 = NaN` (#742, Issue 4).
-                let alpha = SaeManifoldRho::stable_exp_strength(log_alpha);
+                let alpha = log_alpha.exp();
                 let period = periods[axis];
                 let mut energy = 0.0;
                 for row in 0..n {
@@ -5134,11 +5138,11 @@ impl SaeManifoldTerm {
                         acc += energy - 0.5 * n_eff * log_alpha;
                     }
                     Some(p) => {
-                        let kappa = std::f64::consts::TAU / p;
-                        let eta = alpha / (kappa * kappa);
-                        // Overflow-free `log I0(η)`; `bessel_i0(η).ln()` would be
-                        // `+inf` for `η ≳ 709` (#1113).
-                        let log_i0 = bessel_i0_log_and_ratio(eta).0;
+                        // Evaluate η = αP²/(2π)² in log space: both η and the
+                        // intermediate κ² can leave the float range even when
+                        // the centered log-partition remains representable.
+                        let log_eta = log_alpha + 2.0 * (p.ln() - std::f64::consts::TAU.ln());
+                        let centered_log_i0 = bessel_i0_centered_terms_from_log_abs(log_eta).0;
                         // EXACT von-Mises precision log-partition. The partition over
                         // one period is `Z(α) = ∫₀ᴾ exp[-V] dt = P·e^{-η}·I0(η)` (sub
                         // `u=κt`, `dt = P/(2π) du`), so `log Z = log P − η + log I0(η)`.
@@ -5148,7 +5152,7 @@ impl SaeManifoldTerm {
                         // `P=2π`) by `n_eff·ln P` in the absolute prior evidence that
                         // cross-topology/K model comparison consumes. `ln P` is
                         // ρ-independent, so no inner gradient / FD channel is affected.
-                        acc += energy + n_eff * (p.ln() - eta + log_i0);
+                        acc += energy + n_eff * (p.ln() + centered_log_i0);
                     }
                 }
             }
