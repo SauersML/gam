@@ -2925,6 +2925,61 @@ extern "C" __global__ void arrow_sae_frame_scatter_h_det(
     out[a] = -acc;
 }
 
+/* #1017 evidence-lane 2-STAGE deterministic scatter, STAGE 1 (partials):
+   partial[chunk][a] = Σ_{row∈chunk} Σ_c H_tβ[row][c,a]·svec[row,c], for the
+   contiguous row range [chunk·rows_per_chunk, …). grid = (⌈k/256⌉, n_chunks);
+   thread owns (a, chunk). Replaces the single-strip `arrow_sae_frame_scatter_h_det`
+   (⌈k/256⌉ CTAs — only 4 at k=911, one thread serial over ALL n_rows, ~94% of a
+   72-SM A10 idle) with ⌈k/256⌉·n_chunks CTAs. Rows are summed in fixed order
+   within the chunk and the chunks are reduced in order by stage 2, so the result
+   is a FIXED reassociation of the same ordered row sum — run-to-run bit-stable
+   (the SLQ log|S| determinism contract) and within the ≤1e-9 CPU-oracle gate. */
+extern "C" __global__ void arrow_sae_frame_scatter_h_det_partial(
+    const double* __restrict__ svec,
+    const int* __restrict__ htb_ptr,
+    const double* __restrict__ htb,
+    const int* __restrict__ q_of,
+    double* __restrict__ partial,
+    int k,
+    int max_q,
+    int n_rows,
+    int rows_per_chunk
+) {
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= k) { return; }
+    int chunk = blockIdx.y;
+    int row0 = chunk * rows_per_chunk;
+    int row1 = row0 + rows_per_chunk;
+    if (row1 > n_rows) { row1 = n_rows; }
+    double acc = 0.0;
+    for (int row = row0; row < row1; ++row) {
+        int q = q_of[row];
+        int hbase = htb_ptr[row];
+        int sbase = row * max_q;
+        for (int c = 0; c < q; ++c) {
+            acc += htb[hbase + c * k + a] * svec[sbase + c];
+        }
+    }
+    partial[(long long)chunk * k + a] = acc;
+}
+
+/* #1017 STAGE 2 (reduce): out[a] = -Σ_chunk partial[chunk][a], chunks summed in
+   fixed order 0..n_chunks. One thread per output coord `a`; ⌈k/256⌉ CTAs. */
+extern "C" __global__ void arrow_sae_frame_scatter_h_det_reduce(
+    const double* __restrict__ partial,
+    double* __restrict__ out,
+    int k,
+    int n_chunks
+) {
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= k) { return; }
+    double acc = 0.0;
+    for (int chunk = 0; chunk < n_chunks; ++chunk) {
+        acc += partial[(long long)chunk * k + a];
+    }
+    out[a] = -acc;
+}
+
 /* #1017 evidence-lane WARP-COOPERATIVE apply_h: hvec[i][c] = Σ_a H_tβ[i][c,a]·x[a].
    One WARP owns (row, c): lane `l` strides `a = l, l+32, …` over the contiguous
    `H_tβ[i][c,·]` slab (fully coalesced across the warp) and a fixed-order
@@ -4648,9 +4703,28 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         ainv: CudaSlice<f64>,
         hvec: CudaSlice<f64>,
         svec: CudaSlice<f64>,
+        // #1017 2-stage deterministic scatter scratch: partial[n_chunks × k]
+        // holds each row-chunk's reduced-Schur contribution before the fixed-order
+        // reduce. Ridge-independent shape (derived from n_rows), so it is allocated
+        // once with the resident frame and reused across every apply.
+        scatter_partial: CudaSlice<f64>,
+        n_chunks: usize,
+        rows_per_chunk: usize,
         n_rows: usize,
         k: usize,
         max_q: usize,
+    }
+
+    /// #1017 chunking for the 2-stage deterministic reduced-Schur scatter: split
+    /// the `n_rows` row reduction into contiguous chunks so stage 1 launches
+    /// `⌈k/256⌉·n_chunks` CTAs (vs the single-strip `⌈k/256⌉`). ~128 chunks fills a
+    /// 72-SM A10 with several CTAs even at small `k`, while keeping the partial
+    /// buffer (`n_chunks·k`) small and the stage-2 reduce (`n_chunks` adds) cheap.
+    fn scatter_chunking(n_rows: usize) -> (usize, usize) {
+        let target_chunks = 128usize;
+        let rows_per_chunk = n_rows.div_ceil(target_chunks).max(1);
+        let n_chunks = n_rows.div_ceil(rows_per_chunk).max(1);
+        (rows_per_chunk, n_chunks)
     }
 
     fn flatten_device_sae_frame_data(
@@ -4691,6 +4765,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 .clone_htod(v)
                 .map_err(|_| ArrowSchurGpuFailure::Unavailable)
         };
+        let (rows_per_chunk, n_chunks) = scatter_chunking(host.n_rows);
         Ok(DeviceSaeFrameBuffers {
             s_off: htod_i(&host.s_off)?,
             s_m: htod_i(&host.s_m)?,
@@ -4720,6 +4795,11 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             svec: stream
                 .alloc_zeros::<f64>(host.n_rows * host.max_q)
                 .map_err(|_| ArrowSchurGpuFailure::Unavailable)?,
+            scatter_partial: stream
+                .alloc_zeros::<f64>(n_chunks * host.k)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?,
+            n_chunks,
+            rows_per_chunk,
             n_rows: host.n_rows,
             k: host.k,
             max_q: host.max_q,
@@ -5007,13 +5087,18 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             // and n_rows·max_q; the kernel guards row/coord bounds.
             unsafe { b.launch(cfg) }.map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         }
-        // out[a] = -Σ_i Σ_c H_tβ[i][c,a]·svec[i,c]  (deterministic; one thread per a).
+        // out[a] = -Σ_i Σ_c H_tβ[i][c,a]·svec[i,c] — 2-stage DETERMINISTIC scatter.
+        // Stage 1: partial[chunk][a] over contiguous row chunks, launching
+        // ⌈k/256⌉·n_chunks CTAs (vs the single-strip ⌈k/256⌉ = 4 at k=911 that left
+        // ~94% of the SMs idle). Rows summed in fixed order within each chunk.
+        let k_blocks = ((buffers.k as u32).saturating_add(255) / 256).max(1);
         {
             let kernel = module
-                .load_function("arrow_sae_frame_scatter_h_det")
+                .load_function("arrow_sae_frame_scatter_h_det_partial")
                 .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let rows_per_chunk_i32 = checked_i32(buffers.rows_per_chunk)?;
             let cfg = LaunchConfig {
-                grid_dim: (((buffers.k as u32).saturating_add(255) / 256).max(1), 1, 1),
+                grid_dim: (k_blocks, checked_i32(buffers.n_chunks)? as u32, 1),
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
@@ -5022,12 +5107,34 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                 .arg(&buffers.htb_ptr)
                 .arg(&buffers.htb)
                 .arg(&buffers.q_of)
-                .arg(&mut *out)
+                .arg(&mut buffers.scatter_partial)
                 .arg(&k_i32)
                 .arg(&max_q_i32)
-                .arg(&n_rows_i32);
-            // SAFETY: svec/cross-block/out are live buffers sized for n_rows·max_q
-            // / n_rows·k / k; the kernel writes one in-bounds out[a] per a<k.
+                .arg(&n_rows_i32)
+                .arg(&rows_per_chunk_i32);
+            // SAFETY: svec/cross-block are live buffers; scatter_partial is sized
+            // n_chunks·k; each thread writes one in-bounds partial[chunk·k+a], a<k.
+            unsafe { b.launch(cfg) }.map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        }
+        // Stage 2: out[a] = -Σ_chunk partial[chunk][a], chunks reduced in fixed
+        // order — the fixed reassociation that keeps the scatter deterministic.
+        {
+            let kernel = module
+                .load_function("arrow_sae_frame_scatter_h_det_reduce")
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let n_chunks_i32 = checked_i32(buffers.n_chunks)?;
+            let cfg = LaunchConfig {
+                grid_dim: (k_blocks, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b = stream.launch_builder(&kernel);
+            b.arg(&buffers.scatter_partial)
+                .arg(&mut *out)
+                .arg(&k_i32)
+                .arg(&n_chunks_i32);
+            // SAFETY: scatter_partial sized n_chunks·k, out sized k; one in-bounds
+            // out[a] written per a<k.
             unsafe { b.launch(cfg) }.map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         }
         Ok(())

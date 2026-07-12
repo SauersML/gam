@@ -1,12 +1,38 @@
 use super::*;
 
-/// Absolute floor below which a B-spline knot span (`t_{i+k} - t_i`) is treated
-/// as degenerate: the corresponding Cox–de Boor / derivative-recurrence
-/// denominator is then skipped (its term contributes zero), and a zero-support
-/// basis function is rejected. Set well above `f64::EPSILON` so that knot
-/// vectors with near-coincident knots are caught before the division amplifies
-/// rounding noise, yet far below any meaningful covariate-scale knot spacing.
+/// Fraction of a knot vector's total extent (`t_last - t_first`) below which a
+/// B-spline knot span (`t_{i+k} - t_i`) is treated as degenerate: the
+/// corresponding Cox–de Boor / derivative-recurrence denominator is then skipped
+/// (its term contributes zero), and a zero-support basis function is rejected.
+///
+/// This is a *relative* tolerance, always applied through
+/// [`knot_span_degeneracy_floor`], never as an absolute span. The de Boor terms
+/// are scale-free ratios `(x - t_i) / (t_{i+k} - t_i)`, so degeneracy is an
+/// intrinsic property of the knot *pattern*, not of the covariate's magnitude.
+/// Using an absolute floor silently zeroed legitimate distinct-but-small spans
+/// on small-magnitude domains (e.g. `x ~ 1e-8`), collapsing whole basis rows to
+/// zero and breaking partition-of-unity. Set well above `f64::EPSILON` so that
+/// near-coincident knots are still caught before the division amplifies rounding
+/// noise, yet far below any meaningful fractional knot spacing.
 pub(crate) const KNOT_SPAN_DEGENERACY_FLOOR: f64 = 1e-12;
+
+/// Absolute span below which a knot difference on `knots` is degenerate,
+/// obtained by scaling [`KNOT_SPAN_DEGENERACY_FLOOR`] by the knot vector's total
+/// extent `t_last - t_first`. Keeps Cox–de Boor / derivative evaluation
+/// scale-invariant: uniformly rescaling the knots (and the evaluation point)
+/// rescales every span and the extent by the same factor, so the set of spans
+/// judged degenerate — and therefore every basis value — is unchanged. An
+/// exactly-repeated knot (the only true degeneracy in a clamped/valid vector)
+/// has span `0` and is still rejected, since the floor is `0` only for the
+/// pathological all-coincident vector.
+#[inline]
+pub(crate) fn knot_span_degeneracy_floor(knots: ArrayView1<f64>) -> f64 {
+    let n = knots.len();
+    if n < 2 {
+        return 0.0;
+    }
+    KNOT_SPAN_DEGENERACY_FLOOR * (knots[n - 1] - knots[0]).abs()
+}
 
 /// Absolute distance by which a covariate value must lie outside the clamped
 /// B-spline domain before the linear extrapolation correction is applied; below
@@ -616,9 +642,10 @@ pub(crate) fn validate_knot_spans_nondegenerate(
         return Ok(());
     }
     let num_basis = knot_vector.len() - degree - 1;
+    let span_floor = knot_span_degeneracy_floor(knot_vector);
     for i in 0..num_basis {
         let span = knot_vector[i + degree + 1] - knot_vector[i];
-        if span <= KNOT_SPAN_DEGENERACY_FLOOR {
+        if span <= span_floor {
             return Err(BasisError::InvalidKnotVector(format!(
                 "basis function {i} has zero support: t[i+degree+1]-t[i]={span:.3e} must be > 0"
             )));
@@ -721,16 +748,17 @@ pub(crate) fn evaluate_splines_derivative_sparse_intowith_lower(
         lower_scratch,
     );
 
+    let span_floor = knot_span_degeneracy_floor(knotview);
     let mut full_derivative = vec![0.0; num_basis];
     for i in 0..num_basis {
         let denom_left = knotview[i + degree] - knotview[i];
         let denom_right = knotview[i + degree + 1] - knotview[i + 1];
-        let left_term = if denom_left.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
+        let left_term = if denom_left.abs() > span_floor {
             lowervalues[i] / denom_left
         } else {
             0.0
         };
-        let right_term = if denom_right.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
+        let right_term = if denom_right.abs() > span_floor {
             lowervalues[i + 1] / denom_right
         } else {
             0.0

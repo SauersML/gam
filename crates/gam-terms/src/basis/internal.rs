@@ -67,6 +67,7 @@ pub(crate) fn evaluate_splines_at_point_full_support_into(
     scratch.all_prev.resize(zero_degree_len, 0.0);
     scratch.all_prev.fill(0.0);
 
+    let span_floor = knot_span_degeneracy_floor(knots);
     let last_knot = knots[num_knots - 1];
     for i in 0..zero_degree_len {
         if (knots[i] <= x && x < knots[i + 1]) || (x == last_knot && i + 1 == zero_degree_len) {
@@ -86,14 +87,14 @@ pub(crate) fn evaluate_splines_at_point_full_support_into(
 
         for i in 0..level_len {
             let denom_left = knots[i + d] - knots[i];
-            let left = if denom_left.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
+            let left = if denom_left.abs() > span_floor {
                 ((x - knots[i]) / denom_left) * scratch.all_prev[i]
             } else {
                 0.0
             };
 
             let denom_right = knots[i + d + 1] - knots[i + 1];
-            let right = if denom_right.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
+            let right = if denom_right.abs() > span_floor {
                 ((knots[i + d + 1] - x) / denom_right) * scratch.all_prev[i + 1]
             } else {
                 0.0
@@ -317,6 +318,7 @@ pub(crate) fn evaluate_spline_local_values(
         }
     };
 
+    let span_floor = knot_span_degeneracy_floor(knots);
     let left = &mut scratch.left;
     let right = &mut scratch.right;
     let n = &mut scratch.n;
@@ -330,7 +332,7 @@ pub(crate) fn evaluate_spline_local_values(
         let mut saved = 0.0;
         for r in 0..d {
             let den = right[r + 1] + left[d - r];
-            let temp = if den.abs() > 1e-12 { n[r] / den } else { 0.0 };
+            let temp = if den.abs() > span_floor { n[r] / den } else { 0.0 };
             n[r] = saved + right[r + 1] * temp;
             saved = left[d - r] * temp;
         }
@@ -432,5 +434,101 @@ pub(super) fn cumulative_bspline_offsets_into(
         }
         running += local[offset];
         offsets[j] = running;
+    }
+}
+
+#[cfg(test)]
+mod degeneracy_floor_tests {
+    use super::*;
+    use ndarray::Array1;
+
+    /// Clamped cubic knot vector with interior knots at `frac * scale` for
+    /// `frac in {0.2, 0.4, 0.6, 0.8}` on `[0, scale]`.
+    fn clamped_cubic_knots(scale: f64) -> Array1<f64> {
+        let interior = [0.2, 0.4, 0.6, 0.8];
+        let mut v = vec![0.0; 4];
+        v.extend(interior.iter().map(|f| f * scale));
+        v.extend(std::iter::repeat(scale).take(4));
+        Array1::from(v)
+    }
+
+    fn partition_sum_at(x: f64, knots: ArrayView1<f64>, degree: usize) -> f64 {
+        let num_basis = knots.len() - degree - 1;
+        // Local (workhorse) path.
+        let mut scratch = BsplineScratch::new(degree);
+        let mut local = vec![0.0; degree + 1];
+        let start = evaluate_splines_sparse_into(x, degree, knots, &mut local, &mut scratch);
+        let local_sum: f64 = local.iter().sum();
+        // Full-support path — must agree with the local path on partition of unity.
+        let mut full = vec![0.0; num_basis];
+        let mut full_scratch = BsplineScratch::new(degree);
+        evaluate_splines_at_point_full_support_into(x, degree, knots, &mut full, &mut full_scratch);
+        let full_sum: f64 = full.iter().sum();
+        assert!(
+            (local_sum - full_sum).abs() < 1e-9,
+            "local ({local_sum}) and full-support ({full_sum}) partition sums disagree at x={x}, start={start}"
+        );
+        local_sum
+    }
+
+    /// Regression for #2292: the Cox–de Boor recurrence is scale-free (its terms
+    /// are ratios `(x - t_i)/(t_{i+k} - t_i)`), so partition-of-unity must hold
+    /// on a small-magnitude domain exactly as it does at unit scale. The old
+    /// *absolute* `1e-12` knot-span floor zeroed legitimate distinct-but-small
+    /// spans once the domain shrank below it, collapsing whole basis rows to
+    /// zero. With the relative floor the basis values are invariant to a uniform
+    /// rescaling of the knots and the evaluation point.
+    #[test]
+    fn bspline_partition_of_unity_is_scale_invariant() {
+        let degree = 3;
+        // Unit-scale sanity: partition of unity holds (this is the control).
+        let ref_knots = clamped_cubic_knots(1.0);
+        for &frac in &[0.05, 0.3, 0.55, 0.72, 0.95] {
+            let s = partition_sum_at(frac, ref_knots.view(), degree);
+            assert!((s - 1.0).abs() < 1e-12, "unit-scale partition sum {s} != 1 at {frac}");
+        }
+
+        // Tiny-scale domain (magnitude 1e-12): the smallest distinct knot span
+        // here is 0.2e-12 = 2e-13, well below the old absolute 1e-12 floor, so
+        // the pre-fix recurrence zeroed its de Boor terms and the row sums
+        // collapsed. The relative floor (1e-12 * extent = 1e-24) leaves every
+        // span live, so the sums stay 1.
+        let scale = 1e-12;
+        let tiny_knots = clamped_cubic_knots(scale);
+        for &frac in &[0.05, 0.3, 0.55, 0.72, 0.95] {
+            let s = partition_sum_at(frac * scale, tiny_knots.view(), degree);
+            assert!(
+                (s - 1.0).abs() < 1e-9,
+                "scale-invariance broken: partition sum {s} != 1 at x={} (scale {scale})",
+                frac * scale
+            );
+        }
+    }
+
+    /// The relative floor must NOT mask a genuine exactly-repeated-knot
+    /// degeneracy: a basis function whose `degree + 1` span collapses to exactly
+    /// zero (`t[i+degree+1] == t[i]`) still has zero support and must be
+    /// rejected by `validate_knot_spans_nondegenerate`, at any scale.
+    #[test]
+    fn exact_repeated_knot_degeneracy_still_rejected() {
+        let degree = 2;
+        for &scale in &[1.0, 1e-12] {
+            // t[3] == t[0] == 0 -> basis function 0 has zero support.
+            let knots = Array1::from(vec![
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                scale,
+                scale,
+                scale,
+            ]);
+            let err = validate_knot_spans_nondegenerate(knots.view(), degree)
+                .expect_err("zero-support basis must be rejected at scale {scale}");
+            assert!(
+                matches!(err, BasisError::InvalidKnotVector(_)),
+                "expected InvalidKnotVector, got {err:?} at scale {scale}"
+            );
+        }
     }
 }
