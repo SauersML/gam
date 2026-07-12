@@ -24,6 +24,7 @@ class ZooType:
     name: str
     intrinsic_dim: int
     span_dim: int
+    atom_basis: str
     sampler: Sampler
 
 
@@ -135,17 +136,28 @@ ZOO_ORDER = ("segment", "circle", "disk", "sphere", "torus", "mobius", "swiss", 
 ZOO: dict[str, ZooType] = {
     spec.name: spec
     for spec in (
-        ZooType("segment", 1, 1, _segment),
-        ZooType("circle", 1, 2, _circle),
-        ZooType("disk", 2, 2, _disk),
-        ZooType("sphere", 2, 3, _sphere),
-        ZooType("torus", 2, 3, _torus),
-        ZooType("mobius", 2, 3, _mobius),
-        ZooType("swiss", 2, 3, _swiss_roll),
-        ZooType("helix", 1, 3, _helix),
+        ZooType("segment", 1, 1, "euclidean", _segment),
+        ZooType("circle", 1, 2, "periodic", _circle),
+        ZooType("disk", 2, 2, "duchon", _disk),
+        ZooType("sphere", 2, 3, "sphere", _sphere),
+        ZooType("torus", 2, 3, "torus", _torus),
+        ZooType("mobius", 2, 3, "mobius", _mobius),
+        ZooType("swiss", 2, 3, "duchon", _swiss_roll),
+        ZooType("helix", 1, 3, "duchon", _helix),
     )
 }
 CURVED_CYCLE = list(ZOO_ORDER[1:])
+
+
+def declared_atom_spec(kinds: list[str], atoms: int) -> tuple[list[str], list[int]]:
+    """Return the exact one-atom-per-factor Rust chart declaration."""
+    if atoms != len(kinds):
+        raise ValueError(
+            "declared topology requires exactly one fitted atom per planted factor; "
+            f"got atoms={atoms} and factors={len(kinds)}"
+        )
+    specs = [ZOO[kind] for kind in kinds]
+    return [spec.atom_basis for spec in specs], [spec.intrinsic_dim for spec in specs]
 
 
 def first_coordinate_hue(kind: str, parameters: np.ndarray) -> np.ndarray:

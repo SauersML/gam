@@ -74,12 +74,12 @@ from bench.manifold_zoo_geometry import (
     CURVED_CYCLE,
     GEOMETRY_REVISION,
     ZOO,
+    declared_atom_spec,
     validate_analytic_sample,
 )
 from gamfit._description_length import FittedFeaturizer, description_length
 
 _CALIBRATION_N = 50_000  # their per-instance center+RMS calibration sample size
-
 
 @dataclass(frozen=True)
 class FactorInstance:
@@ -367,11 +367,23 @@ def _fit_flat_topk(
 
 def _fit_ours_rust(
     train_x: np.ndarray, test_x: np.ndarray, *, atoms: int, top_k: int | None,
-    n_iter: int, seed: int,
+    n_iter: int, seed: int, declared_kinds: list[str] | None,
 ) -> FittedFeaturizer:
-    """The production Rust REML path at its DEFAULTS (magic by default)."""
+    """Fit one production Rust REML manifold SAE to every factor jointly."""
     import gamfit
 
+    declared_bases: list[str] | None = None
+    declared_dims: list[int] | None = None
+    topology_options: dict[str, Any] = {}
+    if declared_kinds is not None:
+        declared_bases, declared_dims = declared_atom_spec(declared_kinds, atoms)
+        topology_options = {
+            "d_atom": declared_dims,
+            "atom_basis": declared_bases,
+            "run_structure_search": False,
+            "promote_from_residual": False,
+            "structured_residual_passes": 0,
+        }
     fit_start = time.perf_counter()
     fit = gamfit.sae_manifold_fit(
         X=train_x,
@@ -380,6 +392,7 @@ def _fit_ours_rust(
         top_k=top_k,
         n_iter=n_iter,
         random_state=seed,
+        **topology_options,
     )
     fit_seconds = time.perf_counter() - fit_start
 
@@ -425,6 +438,9 @@ def _fit_ours_rust(
                 "atoms": atoms,
                 "top_k": top_k,
                 "assignment": "topk" if top_k is not None else "softmax",
+                "topology_mode": "declared" if declared_kinds is not None else "search",
+                "declared_bases": declared_bases,
+                "declared_dims": declared_dims,
             },
             "profile": {
                 "native_fit_seconds": fit_seconds,
@@ -734,6 +750,14 @@ def main() -> int:
     parser.add_argument("--flat-k", type=int, default=None,
                         help="Active latents for the flat SAE (default: L0 * mean span).")
     parser.add_argument("--rust-iters", type=int, default=40)
+    parser.add_argument(
+        "--declared-topologies",
+        action="store_true",
+        help=(
+            "fit one joint SAE with the exact chart family and intrinsic dimension "
+            "declared by each analytic zoo factor; disables topology/residual re-search"
+        ),
+    )
     parser.add_argument("--steps", type=int, default=4000)
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -787,6 +811,7 @@ def main() -> int:
         "llm_contexts": args.llm_contexts,
         "n_train": args.n_train, "n_test": args.n_test,
         "atoms": atoms, "top_k": top_k, "flat_width": flat_width, "flat_k": flat_k,
+        "topology_mode": "declared" if args.declared_topologies else "search",
         "seed": args.seed, "span_sum": span_sum,
     }
     with out_path.open("a") as fh:
@@ -807,6 +832,7 @@ def main() -> int:
                 fitted = _fit_ours_rust(
                     train_x, test_x, atoms=atoms, top_k=top_k,
                     n_iter=args.rust_iters, seed=args.seed,
+                    declared_kinds=data.kinds if args.declared_topologies else None,
                 )
             except Exception as error:
                 # A failed/non-converged manifold arm is scientific output, not
