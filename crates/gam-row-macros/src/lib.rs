@@ -841,9 +841,11 @@ pub fn row_atom(input: TokenStream) -> TokenStream {
 }
 
 /// Define one backend-neutral row program and emit its generic `JetScalar`
-/// evaluator plus an order-2 CUDA `J2` function body. The declaration owns the
-/// complete algebraic schedule; stable unary primitives are explicit leaves
-/// mapped to one Rust derivative-stack builder and one CUDA stack function.
+/// evaluator plus a symbolically sparse order-2 CUDA function. The declaration
+/// owns the complete algebraic schedule; stable unary primitives are explicit
+/// leaves mapped to one Rust derivative-stack builder and one CUDA stack
+/// function. CUDA computes each nonzero gradient and packed Hessian component
+/// directly from the SSA graph, then scatters Hessian symmetry at the output.
 #[proc_macro]
 pub fn row_program(input: TokenStream) -> TokenStream {
     match row_program::expand(parse_macro_input!(input as row_program::Input)) {

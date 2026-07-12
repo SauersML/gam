@@ -492,49 +492,283 @@ fn scalar_cuda(expression: &Expr, constants: &HashSet<String>) -> Result<String>
     }
 }
 
+#[derive(Clone)]
+struct CudaJet {
+    value: String,
+    gradient: Vec<Option<String>>,
+    // Only entries with a <= b are populated. The generated CUDA computes the
+    // packed triangle once and scatters it symmetrically at the output seam.
+    hessian: Vec<Option<String>>,
+}
+
+#[derive(Clone)]
+struct CudaSupport {
+    gradient: Vec<bool>,
+    hessian: Vec<bool>,
+}
+
+impl CudaSupport {
+    fn empty(dimension: usize) -> Self {
+        Self {
+            gradient: vec![false; dimension],
+            hessian: vec![false; dimension * dimension],
+        }
+    }
+
+    fn include(&mut self, jet: &CudaJet) {
+        for (present, component) in self.gradient.iter_mut().zip(&jet.gradient) {
+            *present |= component.is_some();
+        }
+        for (present, component) in self.hessian.iter_mut().zip(&jet.hessian) {
+            *present |= component.is_some();
+        }
+    }
+}
+
+impl CudaJet {
+    fn zero(dimension: usize) -> Self {
+        Self {
+            value: "0.0".to_string(),
+            gradient: vec![None; dimension],
+            hessian: vec![None; dimension * dimension],
+        }
+    }
+
+    fn primary(name: &str, axis: usize, dimension: usize) -> Self {
+        let mut out = Self::zero(dimension);
+        out.value = name.to_string();
+        out.gradient[axis] = Some("1.0".to_string());
+        out
+    }
+
+    fn support(&self) -> CudaSupport {
+        let mut support = CudaSupport::empty(self.gradient.len());
+        support.include(self);
+        support
+    }
+
+    fn reference(name: &str, support: &CudaSupport, dimension: usize) -> Self {
+        let mut out = Self::zero(dimension);
+        out.value = format!("{name}_v");
+        for axis in 0..dimension {
+            if support.gradient[axis] {
+                out.gradient[axis] = Some(format!("{name}_g{axis}"));
+            }
+            for other in axis..dimension {
+                let index = axis * dimension + other;
+                if support.hessian[index] {
+                    out.hessian[index] = Some(format!("{name}_h{axis}_{other}"));
+                }
+            }
+        }
+        out
+    }
+}
+
+fn cuda_is_zero(value: &str) -> bool {
+    value == "0.0"
+}
+
+fn cuda_is_one(value: &str) -> bool {
+    value == "1.0"
+}
+
+fn cuda_is_negative_one(value: &str) -> bool {
+    matches!(value, "-1.0" | "-(1.0)" | "(-1.0)")
+}
+
+fn cuda_negate(value: &str) -> String {
+    if cuda_is_zero(value) {
+        "0.0".to_string()
+    } else if cuda_is_negative_one(value) {
+        "1.0".to_string()
+    } else if cuda_is_one(value) {
+        "-1.0".to_string()
+    } else {
+        format!("-({value})")
+    }
+}
+
+fn cuda_add(left: &str, right: &str) -> String {
+    if cuda_is_zero(left) {
+        right.to_string()
+    } else if cuda_is_zero(right) {
+        left.to_string()
+    } else {
+        format!("({left} + {right})")
+    }
+}
+
+fn cuda_multiply(left: &str, right: &str) -> String {
+    if cuda_is_zero(left) || cuda_is_zero(right) {
+        "0.0".to_string()
+    } else if cuda_is_one(left) {
+        right.to_string()
+    } else if cuda_is_one(right) {
+        left.to_string()
+    } else if cuda_is_negative_one(left) {
+        cuda_negate(right)
+    } else if cuda_is_negative_one(right) {
+        cuda_negate(left)
+    } else {
+        format!("({left} * {right})")
+    }
+}
+
+fn cuda_add_component(
+    left: &Option<String>,
+    right: &Option<String>,
+) -> Option<String> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(cuda_add(left, right)),
+        (Some(value), None) | (None, Some(value)) => Some(value.clone()),
+        (None, None) => None,
+    }
+}
+
+fn cuda_multiply_component(
+    left: &Option<String>,
+    right: &Option<String>,
+) -> Option<String> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(cuda_multiply(left, right)),
+        _ => None,
+    }
+}
+
+fn cuda_scale_component(component: &Option<String>, scalar: &str) -> Option<String> {
+    component
+        .as_ref()
+        .map(|component| cuda_multiply(component, scalar))
+}
+
+fn cuda_add_jets(left: CudaJet, right: CudaJet) -> CudaJet {
+    CudaJet {
+        value: cuda_add(&left.value, &right.value),
+        gradient: left
+            .gradient
+            .iter()
+            .zip(&right.gradient)
+            .map(|(left, right)| cuda_add_component(left, right))
+            .collect(),
+        hessian: left
+            .hessian
+            .iter()
+            .zip(&right.hessian)
+            .map(|(left, right)| cuda_add_component(left, right))
+            .collect(),
+    }
+}
+
+fn cuda_multiply_jets(left: CudaJet, right: CudaJet) -> CudaJet {
+    let dimension = left.gradient.len();
+    let mut gradient = vec![None; dimension];
+    let mut hessian = vec![None; dimension * dimension];
+    for axis in 0..dimension {
+        gradient[axis] = cuda_add_component(
+            &cuda_scale_component(&right.gradient[axis], &left.value),
+            &cuda_scale_component(&left.gradient[axis], &right.value),
+        );
+        for other in axis..dimension {
+            let index = axis * dimension + other;
+            let inherited_right =
+                cuda_scale_component(&right.hessian[index], &left.value);
+            let cross_forward =
+                cuda_multiply_component(&left.gradient[axis], &right.gradient[other]);
+            let cross_reverse =
+                cuda_multiply_component(&left.gradient[other], &right.gradient[axis]);
+            let inherited_left = cuda_scale_component(&left.hessian[index], &right.value);
+            hessian[index] = cuda_add_component(
+                &cuda_add_component(
+                    &cuda_add_component(&inherited_right, &cross_forward),
+                    &cross_reverse,
+                ),
+                &inherited_left,
+            );
+        }
+    }
+    CudaJet {
+        value: cuda_multiply(&left.value, &right.value),
+        gradient,
+        hessian,
+    }
+}
+
 fn cuda_expression(
     expression: &ProgramExpr,
     owner: &str,
     leaves: &[Leaf],
     constants: &HashSet<String>,
+    bindings: &HashMap<String, CudaJet>,
+    dimension: usize,
     stack_index: &mut usize,
     preludes: &mut Vec<String>,
-) -> Result<String> {
+) -> Result<CudaJet> {
     let mut child = |expression: &ProgramExpr| {
         cuda_expression(
             expression,
             owner,
             leaves,
             constants,
+            bindings,
+            dimension,
             stack_index,
             preludes,
         )
     };
     match expression {
-        ProgramExpr::Path(ident) => Ok(ident.to_string()),
-        ProgramExpr::Zero => Ok("j2_const(0.0)".to_string()),
-        ProgramExpr::Neg(value) => Ok(format!("j2_scale({}, -1.0)", child(value)?)),
-        ProgramExpr::Scale(value, scalar) => Ok(format!(
-            "j2_scale({}, {})",
-            child(value)?,
-            scalar_cuda(scalar, constants)?
-        )),
-        ProgramExpr::AddConstant(value, scalar) => Ok(format!(
-            "j2_addc({}, {})",
-            child(value)?,
-            scalar_cuda(scalar, constants)?
-        )),
-        ProgramExpr::Add(left, right) => {
-            Ok(format!("j2_add({}, {})", child(left)?, child(right)?))
+        ProgramExpr::Path(ident) => bindings.get(&ident.to_string()).cloned().ok_or_else(|| {
+            syn::Error::new_spanned(ident, "CUDA row_program binding is not defined")
+        }),
+        ProgramExpr::Zero => Ok(CudaJet::zero(dimension)),
+        ProgramExpr::Neg(value) => {
+            let value = child(value)?;
+            Ok(CudaJet {
+                value: cuda_negate(&value.value),
+                gradient: value
+                    .gradient
+                    .iter()
+                    .map(|component| component.as_ref().map(|value| cuda_negate(value)))
+                    .collect(),
+                hessian: value
+                    .hessian
+                    .iter()
+                    .map(|component| component.as_ref().map(|value| cuda_negate(value)))
+                    .collect(),
+            })
         }
-        ProgramExpr::Mul(left, right) => {
-            Ok(format!("j2_mul({}, {})", child(left)?, child(right)?))
+        ProgramExpr::Scale(value, scalar) => {
+            let value = child(value)?;
+            let scalar = scalar_cuda(scalar, constants)?;
+            Ok(CudaJet {
+                value: cuda_multiply(&value.value, &scalar),
+                gradient: value
+                    .gradient
+                    .iter()
+                    .map(|component| cuda_scale_component(component, &scalar))
+                    .collect(),
+                hessian: value
+                    .hessian
+                    .iter()
+                    .map(|component| cuda_scale_component(component, &scalar))
+                    .collect(),
+            })
         }
+        ProgramExpr::AddConstant(value, scalar) => {
+            let mut value = child(value)?;
+            value.value = cuda_add(&value.value, &scalar_cuda(scalar, constants)?);
+            Ok(value)
+        }
+        ProgramExpr::Add(left, right) => Ok(cuda_add_jets(child(left)?, child(right)?)),
+        ProgramExpr::Mul(left, right) => Ok(cuda_multiply_jets(child(left)?, child(right)?)),
         ProgramExpr::Compose {
             leaf,
             value,
             arguments,
         } => {
+            let input = bindings.get(&value.to_string()).cloned().ok_or_else(|| {
+                syn::Error::new_spanned(value, "CUDA compose input is not defined")
+            })?;
             let suffix = if *stack_index == 0 {
                 String::new()
             } else {
@@ -543,18 +777,75 @@ fn cuda_expression(
             *stack_index += 1;
             let stack = format!("{owner}_stack{suffix}");
             let cuda_leaf = &leaves[*leaf].cuda;
-            let mut leaf_arguments = vec![format!("{value}.v")];
+            let mut leaf_arguments = vec![input.value.clone()];
             for argument in arguments {
                 leaf_arguments.push(scalar_cuda(argument, constants)?);
             }
             leaf_arguments.push(stack.clone());
             preludes.push(format!(
-                "    double {stack}[3];\n    {cuda_leaf}({});",
+                "double {stack}[3];\n{cuda_leaf}({});",
                 leaf_arguments.join(", ")
             ));
-            Ok(format!("j2_compose({value}, {stack})"))
+
+            let first = format!("{stack}[1]");
+            let second = format!("{stack}[2]");
+            let mut gradient = vec![None; dimension];
+            let mut hessian = vec![None; dimension * dimension];
+            for axis in 0..dimension {
+                gradient[axis] = cuda_scale_component(&input.gradient[axis], &first);
+                for other in axis..dimension {
+                    let index = axis * dimension + other;
+                    let inherited = cuda_scale_component(&input.hessian[index], &first);
+                    let curvature = cuda_multiply_component(
+                        &input.gradient[axis],
+                        &input.gradient[other],
+                    )
+                    .map(|component| cuda_multiply(&second, &component));
+                    hessian[index] = cuda_add_component(&inherited, &curvature);
+                }
+            }
+            Ok(CudaJet {
+                value: format!("{stack}[0]"),
+                gradient,
+                hessian,
+            })
         }
     }
+}
+
+struct CudaLocal {
+    name: String,
+    mutable: bool,
+    value: CudaJet,
+    preludes: Vec<String>,
+}
+
+struct CudaAssignment {
+    target: String,
+    value: CudaJet,
+    preludes: Vec<String>,
+}
+
+enum CudaStatement {
+    Local(CudaLocal),
+    If {
+        condition: String,
+        assignments: Vec<CudaAssignment>,
+    },
+}
+
+fn cuda_push_preludes(source: &mut String, preludes: &[String], indentation: &str) {
+    for prelude in preludes {
+        for line in prelude.lines() {
+            source.push_str(indentation);
+            source.push_str(line);
+            source.push('\n');
+        }
+    }
+}
+
+fn cuda_component(component: &Option<String>) -> &str {
+    component.as_deref().unwrap_or("0.0")
 }
 
 fn cuda_source(
@@ -565,18 +856,34 @@ fn cuda_source(
     statements: &[Statement],
     result: &ProgramExpr,
 ) -> Result<String> {
+    let dimension = primaries.len();
     let parameters = primaries
         .iter()
-        .map(|primary| format!("J2 {primary}"))
-        .chain(std::iter::once("const RowIn& in".to_string()))
+        .map(|primary| format!("double {primary}"))
+        .chain([
+            "const RowIn& in".to_string(),
+            "double* row_value".to_string(),
+            "double* row_gradient".to_string(),
+            "double* row_hessian".to_string(),
+        ])
         .collect::<Vec<_>>()
         .join(", ");
-    let mut source = format!(
-        "__device__ __forceinline__ J2 {name}(\n        {parameters}) {{\n"
-    );
+    let mut bindings = HashMap::<String, CudaJet>::new();
+    for (axis, primary) in primaries.iter().enumerate() {
+        bindings.insert(
+            primary.to_string(),
+            CudaJet::primary(&primary.to_string(), axis, dimension),
+        );
+    }
+    let mut mutable_support = HashMap::<String, CudaSupport>::new();
+    let mut cuda_statements = Vec::new();
     for statement in statements {
         match statement {
-            Statement::Local { name, value, .. } => {
+            Statement::Local {
+                name,
+                mutable,
+                value,
+            } => {
                 let mut preludes = Vec::new();
                 let mut stack_index = 0;
                 let value = cuda_expression(
@@ -584,23 +891,31 @@ fn cuda_source(
                     &name.to_string(),
                     leaves,
                     constants,
+                    &bindings,
+                    dimension,
                     &mut stack_index,
                     &mut preludes,
                 )?;
-                for prelude in preludes {
-                    source.push_str(&prelude);
-                    source.push('\n');
+                let support = value.support();
+                if *mutable {
+                    mutable_support.insert(name.to_string(), support.clone());
                 }
-                source.push_str(&format!("    J2 {name} = {value};\n"));
+                bindings.insert(
+                    name.to_string(),
+                    CudaJet::reference(&name.to_string(), &support, dimension),
+                );
+                cuda_statements.push(CudaStatement::Local(CudaLocal {
+                    name: name.to_string(),
+                    mutable: *mutable,
+                    value,
+                    preludes,
+                }));
             }
             Statement::If {
                 condition,
                 assignments,
             } => {
-                source.push_str(&format!(
-                    "    if ({}) {{\n",
-                    scalar_cuda(condition, constants)?
-                ));
+                let mut cuda_assignments = Vec::new();
                 for (target, value) in assignments {
                     let mut preludes = Vec::new();
                     let mut stack_index = 0;
@@ -609,17 +924,29 @@ fn cuda_source(
                         &target.to_string(),
                         leaves,
                         constants,
+                        &bindings,
+                        dimension,
                         &mut stack_index,
                         &mut preludes,
                     )?;
-                    for prelude in preludes {
-                        source.push_str("    ");
-                        source.push_str(&prelude);
-                        source.push('\n');
-                    }
-                    source.push_str(&format!("        {target} = {value};\n"));
+                    let support = mutable_support
+                        .get_mut(&target.to_string())
+                        .expect("validated mutable CUDA target");
+                    support.include(&value);
+                    bindings.insert(
+                        target.to_string(),
+                        CudaJet::reference(&target.to_string(), support, dimension),
+                    );
+                    cuda_assignments.push(CudaAssignment {
+                        target: target.to_string(),
+                        value,
+                        preludes,
+                    });
                 }
-                source.push_str("    }\n");
+                cuda_statements.push(CudaStatement::If {
+                    condition: scalar_cuda(condition, constants)?,
+                    assignments: cuda_assignments,
+                });
             }
         }
     }
@@ -630,14 +957,108 @@ fn cuda_source(
         "result",
         leaves,
         constants,
+        &bindings,
+        dimension,
         &mut stack_index,
         &mut preludes,
     )?;
-    for prelude in preludes {
-        source.push_str(&prelude);
-        source.push('\n');
+
+    let mut source = format!(
+        "__device__ __forceinline__ void {name}(\n        {parameters}) {{\n"
+    );
+    for statement in &cuda_statements {
+        match statement {
+            CudaStatement::Local(local) => {
+                cuda_push_preludes(&mut source, &local.preludes, "    ");
+                let support = if local.mutable {
+                    mutable_support
+                        .get(&local.name)
+                        .expect("mutable CUDA support exists")
+                } else {
+                    &local.value.support()
+                };
+                source.push_str(&format!("    double {}_v = {};\n", local.name, local.value.value));
+                for axis in 0..dimension {
+                    if support.gradient[axis] {
+                        source.push_str(&format!(
+                            "    double {}_g{axis} = {};\n",
+                            local.name,
+                            cuda_component(&local.value.gradient[axis]),
+                        ));
+                    }
+                    for other in axis..dimension {
+                        let index = axis * dimension + other;
+                        if support.hessian[index] {
+                            source.push_str(&format!(
+                                "    double {}_h{axis}_{other} = {};\n",
+                                local.name,
+                                cuda_component(&local.value.hessian[index]),
+                            ));
+                        }
+                    }
+                }
+            }
+            CudaStatement::If {
+                condition,
+                assignments,
+            } => {
+                source.push_str(&format!("    if ({condition}) {{\n"));
+                for assignment in assignments {
+                    cuda_push_preludes(&mut source, &assignment.preludes, "        ");
+                    let support = mutable_support
+                        .get(&assignment.target)
+                        .expect("mutable CUDA assignment support exists");
+                    source.push_str(&format!(
+                        "        {}_v = {};\n",
+                        assignment.target, assignment.value.value,
+                    ));
+                    for axis in 0..dimension {
+                        if support.gradient[axis] {
+                            source.push_str(&format!(
+                                "        {}_g{axis} = {};\n",
+                                assignment.target,
+                                cuda_component(&assignment.value.gradient[axis]),
+                            ));
+                        }
+                        for other in axis..dimension {
+                            let index = axis * dimension + other;
+                            if support.hessian[index] {
+                                source.push_str(&format!(
+                                    "        {}_h{axis}_{other} = {};\n",
+                                    assignment.target,
+                                    cuda_component(&assignment.value.hessian[index]),
+                                ));
+                            }
+                        }
+                    }
+                }
+                source.push_str("    }\n");
+            }
+        }
     }
-    source.push_str(&format!("    return {result};\n}}\n"));
+    cuda_push_preludes(&mut source, &preludes, "    ");
+    source.push_str(&format!("    *row_value = {};\n", result.value));
+    for axis in 0..dimension {
+        source.push_str(&format!(
+            "    row_gradient[{axis}] = {};\n",
+            cuda_component(&result.gradient[axis]),
+        ));
+        for other in axis..dimension {
+            let index = axis * dimension + other;
+            let component = cuda_component(&result.hessian[index]);
+            source.push_str(&format!(
+                "    row_hessian[{}] = {component};\n",
+                axis * dimension + other,
+            ));
+            if axis != other {
+                source.push_str(&format!(
+                    "    row_hessian[{}] = {component};\n",
+                    other * dimension + axis,
+                ));
+            }
+        }
+    }
+    source.push_str("}\n");
     Ok(source)
 }
 
@@ -783,7 +1204,7 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
         &result,
     )?;
     let cuda_literal = Literal::string(&cuda);
-    let cuda_name = format_ident!("{}_CUDA_J2", name.to_string().to_uppercase());
+    let cuda_name = format_ident!("{}_CUDA_VGH", name.to_string().to_uppercase());
 
     Ok(quote! {
         #[inline(always)]
@@ -829,11 +1250,13 @@ mod tests {
         .expect("parse row program");
         let expanded = expand(input).expect("expand row program").to_string();
         assert!(expanded.contains("JetScalar < 2usize >"));
-        assert!(expanded.contains("SAMPLE_CUDA_J2"));
-        assert!(expanded.contains("J2 event_term = j2_const(0.0)"));
+        assert!(expanded.contains("SAMPLE_CUDA_VGH"));
+        assert!(expanded.contains("double event_term_v = 0.0"));
         assert!(expanded.contains("if ((in.event > 0.0))"));
-        assert!(expanded.contains("d_log(adjusted.v"));
-        assert!(expanded.contains("return j2_add(adjusted, event_term)"));
+        assert!(expanded.contains("d_log(adjusted_v"));
+        assert!(expanded.contains("row_hessian [3]"));
+        assert!(!expanded.contains("J2"));
+        assert!(!expanded.contains("j2_"));
     }
 
     #[test]

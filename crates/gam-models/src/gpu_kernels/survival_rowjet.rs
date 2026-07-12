@@ -14,7 +14,7 @@
 //! rows against the CPU row program.
 
 #[cfg(target_os = "linux")]
-use crate::survival::marginal_slope::row_kernel::RIGID_ROW_PROGRAM_CUDA_J2;
+use crate::survival::marginal_slope::row_kernel::RIGID_ROW_PROGRAM_CUDA_VGH;
 
 /// Flattened row-major value, gradient, and Hessian channels for `K = 4`.
 #[cfg(target_os = "linux")]
@@ -62,13 +62,14 @@ pub(crate) fn survival_rigid_row_vgh(
 }
 
 /// CUDA substrate for the four rigid survival primaries. The stable primitive
-/// leaves, `J2` operations, and launch plumbing live here; the algebraic row
-/// schedule is generated from the canonical Rust declaration.
+/// leaves and launch plumbing live here; the algebraic row schedule and its
+/// nonzero value/gradient/packed-Hessian expressions are generated from the
+/// canonical Rust declaration.
 #[cfg(target_os = "linux")]
 const SURVIVAL_ROWJET_TEMPLATE: &str = include_str!("survival_rowjet_kernel.cu");
 
 #[cfg(target_os = "linux")]
-const ROW_PROGRAM_MARKER: &str = "// __GAM_ROW_PROGRAM_CUDA_J2__";
+const ROW_PROGRAM_MARKER: &str = "// __GAM_ROW_PROGRAM_CUDA_VGH__";
 
 #[cfg(target_os = "linux")]
 fn survival_rowjet_source() -> &'static str {
@@ -82,10 +83,10 @@ fn survival_rowjet_source() -> &'static str {
             "survival rowjet CUDA template must contain exactly one row-program marker",
         );
         let mut source = String::with_capacity(
-            preamble.len() + RIGID_ROW_PROGRAM_CUDA_J2.len() + kernel.len(),
+            preamble.len() + RIGID_ROW_PROGRAM_CUDA_VGH.len() + kernel.len(),
         );
         source.push_str(preamble);
-        source.push_str(RIGID_ROW_PROGRAM_CUDA_J2);
+        source.push_str(RIGID_ROW_PROGRAM_CUDA_VGH);
         source.push_str(kernel);
         source
     })
@@ -499,8 +500,9 @@ mod tests {
     fn cuda_source_exports_only_the_production_vgh_kernel() {
         let source = survival_rowjet_source();
         assert_eq!(SURVIVAL_ROWJET_TEMPLATE.matches(ROW_PROGRAM_MARKER).count(), 1);
-        assert!(!SURVIVAL_ROWJET_TEMPLATE.contains("J2 nll_j2"));
-        assert!(RIGID_ROW_PROGRAM_CUDA_J2.contains("J2 rigid_row_program"));
+        assert!(!SURVIVAL_ROWJET_TEMPLATE.contains("struct J2"));
+        assert!(RIGID_ROW_PROGRAM_CUDA_VGH.contains("void rigid_row_program"));
+        assert!(!RIGID_ROW_PROGRAM_CUDA_VGH.contains("j2_"));
         assert!(source.contains("survival_rowjet_vgh"));
         assert_eq!(
             source.matches("extern \"C\" __global__").count(),
@@ -510,6 +512,8 @@ mod tests {
             "survival_rowjet_no_t4",
             "struct JS1",
             "struct JS2",
+            "struct J2",
+            "j2_",
             "nll_j2",
             "nll_js1",
             "nll_js2",

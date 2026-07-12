@@ -1,9 +1,7 @@
 // NVRTC device source for the survival marginal-slope rigid per-row V/G/H jet.
 // This is the order-2 CUDA lowering of the canonical CPU `rigid_row_nll`
-// program. K is fixed to the four rigid primaries (q0, q1, qd1, g), and every
-// operation uses full f64 arithmetic without fast-math.
-
-#define K 4
+// program. The generated schedule differentiates its SSA graph symbolically,
+// computes only nonzero channels, and uses full f64 arithmetic without fast-math.
 
 // NVRTC does not include <math.h>/<cmath>, so define the constants it omits.
 #ifndef M_PI
@@ -126,83 +124,7 @@ struct RowIn {
     double probit_scale;
 };
 
-struct J2 {
-    double v;
-    double g[K];
-    double h[K][K];
-};
-
-__device__ __forceinline__ J2 j2_const(double value) {
-    J2 out;
-    out.v = value;
-    for (int a = 0; a < K; ++a) {
-        out.g[a] = 0.0;
-        for (int b = 0; b < K; ++b) out.h[a][b] = 0.0;
-    }
-    return out;
-}
-
-__device__ __forceinline__ J2 j2_var(double value, int axis) {
-    J2 out = j2_const(value);
-    out.g[axis] = 1.0;
-    return out;
-}
-
-__device__ __forceinline__ J2 j2_scale(const J2& value, double scale) {
-    J2 out;
-    out.v = value.v * scale;
-    for (int a = 0; a < K; ++a) {
-        out.g[a] = value.g[a] * scale;
-        for (int b = 0; b < K; ++b) out.h[a][b] = value.h[a][b] * scale;
-    }
-    return out;
-}
-
-__device__ __forceinline__ J2 j2_add(const J2& left, const J2& right) {
-    J2 out;
-    out.v = left.v + right.v;
-    for (int a = 0; a < K; ++a) {
-        out.g[a] = left.g[a] + right.g[a];
-        for (int b = 0; b < K; ++b) out.h[a][b] = left.h[a][b] + right.h[a][b];
-    }
-    return out;
-}
-
-__device__ __forceinline__ J2 j2_addc(const J2& value, double constant) {
-    J2 out = value;
-    out.v += constant;
-    return out;
-}
-
-__device__ __forceinline__ J2 j2_mul(const J2& left, const J2& right) {
-    J2 out = j2_const(left.v * right.v);
-    for (int a = 0; a < K; ++a) {
-        out.g[a] = left.v * right.g[a] + left.g[a] * right.v;
-    }
-    for (int a = 0; a < K; ++a) {
-        for (int b = 0; b < K; ++b) {
-            out.h[a][b] = left.v * right.h[a][b]
-                + left.g[a] * right.g[b]
-                + left.g[b] * right.g[a]
-                + left.h[a][b] * right.v;
-        }
-    }
-    return out;
-}
-
-__device__ __forceinline__ J2 j2_compose(const J2& value, const double stack[3]) {
-    J2 out = j2_const(stack[0]);
-    for (int a = 0; a < K; ++a) out.g[a] = stack[1] * value.g[a];
-    for (int a = 0; a < K; ++a) {
-        for (int b = 0; b < K; ++b) {
-            out.h[a][b] = stack[1] * value.h[a][b]
-                + stack[2] * value.g[a] * value.g[b];
-        }
-    }
-    return out;
-}
-
-// __GAM_ROW_PROGRAM_CUDA_J2__
+// __GAM_ROW_PROGRAM_CUDA_VGH__
 
 extern "C" __global__ void __launch_bounds__(128, 1) survival_rowjet_vgh(
         int n,
@@ -226,19 +148,13 @@ extern "C" __global__ void __launch_bounds__(128, 1) survival_rowjet_vgh(
     in.z_sum = z_sum[row];
     in.covariance_ones = cov_ones[row];
     in.probit_scale = probit_scale;
-    J2 out = rigid_row_program(
-        j2_var(q0[row], 0),
-        j2_var(q1[row], 1),
-        j2_var(qd1[row], 2),
-        j2_var(g[row], 3),
-        in);
-    out_value[row] = out.v;
-    for (int a = 0; a < K; ++a) {
-        out_gradient[(size_t)row * K + a] = out.g[a];
-    }
-    for (int a = 0; a < K; ++a) {
-        for (int b = 0; b < K; ++b) {
-            out_hessian[(size_t)row * K * K + a * K + b] = out.h[a][b];
-        }
-    }
+    rigid_row_program(
+        q0[row],
+        q1[row],
+        qd1[row],
+        g[row],
+        in,
+        &out_value[row],
+        &out_gradient[(size_t)row * 4],
+        &out_hessian[(size_t)row * 16]);
 }
