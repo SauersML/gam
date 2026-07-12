@@ -1888,21 +1888,6 @@ fn race_birth_seed(
     registry: Option<&AnalyticPenaltyRegistry>,
     config: &StagewiseConfig,
 ) -> Result<RacedCandidate, String> {
-    // #2228 determinism: pin faer's process-global parallelism to `Par::Seq` for
-    // the WHOLE candidate race, not just the inner `run_joint_fit_arrow_schur`
-    // (which enters its own scope). The pre-fit `activate_residual_frame` seed
-    // (an `FaerSvd`/`FaerEigh` of the residual) and the post-fit evidence /
-    // EV read faer's HIGH-LEVEL solvers, which key off the process-global policy
-    // — NOT `effective_global_parallelism`, so the `with_nested_parallel` row
-    // guards do not reach them. Under the outer `seeds.par_iter()` the saturated
-    // pool ran those solvers inline (effectively sequential); serializing the
-    // outer race (`seeds.iter()`) leaves the pool idle, so faer's spindle pool
-    // fans out and its reduction reassociates run-to-run and between the serial
-    // and batched drivers — perturbing the born atom's frame and its leakage
-    // onto disjoint rows. Pinning `Par::Seq` here makes the born state a pure
-    // function of the inputs; the rayon ROW fan-out inside the fit is untouched
-    // (this scope only governs faer). Matches the `run_joint_fit` inner scope.
-    let faer_seq_race_guard = gam_linalg::faer_ndarray::FaerSequentialScope::enter();
     let k = term.k_atoms();
     let n = term.assignment.logits.nrows();
     let born_move = match &seed.circle_coords {
@@ -1977,7 +1962,6 @@ fn race_birth_seed(
         ev,
         energy: seed.energy,
     };
-    drop(faer_seq_race_guard);
     Ok(raced_candidate)
 }
 
