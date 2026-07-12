@@ -3208,7 +3208,10 @@ struct BoundedLinearFamily {
 #[derive(Clone, Debug)]
 struct StandardFamilyObservationState {
     eta: Array1<f64>,
-    mu: Array1<f64>,
+    // Populated by the evaluator but not yet consumed on the lib path; the
+    // underscore keeps deny-warnings green until its reader lands — rename
+    // back to `mu` with the first consumer.
+    _mu: Array1<f64>,
     score: Array1<f64>,
     fisherweight: Array1<f64>,
     neghessian_eta: Array1<f64>,
@@ -4365,7 +4368,7 @@ fn evaluate_resolved_standard_family_observations(
 
     Ok(StandardFamilyObservationState {
         eta: eta.clone(),
-        mu,
+        _mu: mu,
         score,
         fisherweight,
         neghessian_eta,
