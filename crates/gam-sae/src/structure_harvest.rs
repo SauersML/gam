@@ -3623,6 +3623,14 @@ pub struct PrimaryTopologyChoice {
     /// topology race scores with rather than the fixed `SAE_DEFAULT_TORUS_HARMONICS`
     /// budget. `None` for every other kind.
     pub n_torus_harmonics: Option<usize>,
+    /// The `(n, latent_dim)` seed chart to install for this atom when the
+    /// INTRINSIC-metric seed won the primary race (#2240/#2280). `Some` only when
+    /// the geodesic (Isomap) embedding beat the PCA chart on evidence: a
+    /// swiss-roll-class fold must be seeded UNFOLDED, so the winning intrinsic
+    /// coordinates ride out of the race rather than being re-creased by the linear
+    /// PCA seed downstream. `None` when the PCA seed won (the default seed path
+    /// already reproduces its chart) — every non-auto atom carries `None`.
+    pub coords: Option<Array2<f64>>,
 }
 
 /// Per-atom topology discovery for the PRIMARY seed dictionary (#2238/#2239).
@@ -3930,12 +3938,16 @@ pub fn discover_primary_atom_topologies(
                     }
                     _ => None,
                 };
+            // When the intrinsic seed wins, its unfolded chart both drives the
+            // Duchon-center growth (`sheet_coords`) AND must be installed as the
+            // atom's final seed coordinates (`winning_intrinsic_chart`) so the
+            // downstream PCA seed does not re-crease the fold.
+            let mut winning_intrinsic_chart: Option<Array2<f64>> = None;
             let fit = match (pca_winner, intrinsic_challenger) {
                 (Some((p_fit, p_score)), Some((i_fit, i_score, i_chart))) => {
                     if i_score < p_score {
-                        // The unfolded sheet won: its chart drives the winner's
-                        // Duchon-center resolution growth below.
-                        sheet_coords = Some(i_chart);
+                        sheet_coords = Some(i_chart.clone());
+                        winning_intrinsic_chart = Some(i_chart);
                         i_fit
                     } else {
                         p_fit
@@ -3943,7 +3955,8 @@ pub fn discover_primary_atom_topologies(
                 }
                 (Some((p_fit, _)), None) => p_fit,
                 (None, Some((i_fit, _, i_chart))) => {
-                    sheet_coords = Some(i_chart);
+                    sheet_coords = Some(i_chart.clone());
+                    winning_intrinsic_chart = Some(i_chart);
                     i_fit
                 }
                 (None, None) => {
@@ -4008,12 +4021,25 @@ pub fn discover_primary_atom_topologies(
             } else {
                 None
             };
+            // Install the winning intrinsic chart, projected to the resolved
+            // latent dimension, only when the intrinsic seed actually won.
+            let coords = winning_intrinsic_chart.map(|chart| {
+                let d = fit.latent_dim.min(chart.ncols());
+                let mut out = Array2::<f64>::zeros((chart.nrows(), fit.latent_dim));
+                for row in 0..chart.nrows() {
+                    for col in 0..d {
+                        out[[row, col]] = chart[[row, col]];
+                    }
+                }
+                out
+            });
             Ok(PrimaryTopologyChoice {
                 basis_kind: fit.basis_kind,
                 latent_dim: fit.latent_dim,
                 n_harmonics,
                 n_duchon_centers,
                 n_torus_harmonics,
+                coords,
             })
         })
         .collect()
@@ -4440,18 +4466,21 @@ fn select_torus_resolution(
 ///   the old periodic default; callers that require a fixed topology must name
 ///   that topology explicitly.
 ///
-/// Returns the per-atom basis-native RESOLUTION overrides (aligned with
-/// `atom_basis`; `None` for every atom whose resolution is not evidence-grown).
-/// The knob is interpreted per the resolved basis kind — Duchon center count for
-/// a flat/Duchon-sheet winner (#2240), per-axis harmonic order for a torus
-/// winner (#2243) — which is unambiguous since each atom carries exactly one
-/// basis kind. The seed plan builder reads it in the arm for that kind.
+/// Returns `(resolution_overrides, coord_overrides)`, both aligned with
+/// `atom_basis`. `resolution_overrides[k]` is the per-atom basis-native
+/// resolution knob (`None` unless evidence-grown), interpreted per the resolved
+/// basis kind — Duchon center count for a flat/Duchon-sheet winner (#2240),
+/// per-axis harmonic order for a torus winner (#2243). `coord_overrides[k]` is the
+/// UNFOLDED geodesic seed chart to install when the intrinsic-metric seed won the
+/// primary race (#2280), `None` when the PCA seed won (the common path) — the
+/// caller overrides that atom's coordinate block with it so a folded factor is
+/// seeded unrolled rather than re-creased by the linear PCA seed.
 pub fn resolve_auto_primary_atoms(
     target: ArrayView2<'_, f64>,
     labels: &[usize],
     atom_basis: &mut [String],
     atom_dim: &mut [usize],
-) -> Result<Vec<Option<usize>>, String> {
+) -> Result<(Vec<Option<usize>>, Vec<Option<Array2<f64>>>), String> {
     let k_atoms = atom_basis.len();
     if atom_dim.len() != k_atoms {
         return Err(format!(
@@ -4460,8 +4489,12 @@ pub fn resolve_auto_primary_atoms(
         ));
     }
     let mut resolution_overrides: Vec<Option<usize>> = vec![None; k_atoms];
+    // Per-atom seed-chart overrides: `Some` only where the intrinsic-metric seed
+    // won the primary race (#2240/#2280), so the caller installs the UNFOLDED
+    // geodesic chart instead of the PCA seed for that atom.
+    let mut coord_overrides: Vec<Option<Array2<f64>>> = vec![None; k_atoms];
     if !atom_basis.iter().any(|basis| basis == "auto") {
-        return Ok(resolution_overrides);
+        return Ok((resolution_overrides, coord_overrides));
     }
     let choices = discover_primary_atom_topologies(target, labels, k_atoms, atom_dim)?;
     for atom_idx in 0..k_atoms {
@@ -4492,6 +4525,8 @@ pub fn resolve_auto_primary_atoms(
             SaeAtomBasisKind::EuclideanPatch => {
                 atom_basis[atom_idx] = "duchon".to_string();
                 atom_dim[atom_idx] = choice.latent_dim;
+                // If the intrinsic seed won, install its unfolded chart (#2280).
+                coord_overrides[atom_idx] = choice.coords.clone();
             }
             SaeAtomBasisKind::Duchon => {
                 // #2240 — the rich thin-plate sheet won the race outright.
@@ -4501,6 +4536,9 @@ pub fn resolve_auto_primary_atoms(
                 atom_basis[atom_idx] = "duchon".to_string();
                 atom_dim[atom_idx] = choice.latent_dim;
                 resolution_overrides[atom_idx] = choice.n_duchon_centers;
+                // If the intrinsic seed won, install its unfolded chart (#2280)
+                // so the thin-plate sheet is anchored on the unrolled fold.
+                coord_overrides[atom_idx] = choice.coords.clone();
             }
             SaeAtomBasisKind::Periodic => {
                 atom_basis[atom_idx] = "periodic".to_string();
@@ -4522,7 +4560,7 @@ pub fn resolve_auto_primary_atoms(
             }
         }
     }
-    Ok(resolution_overrides)
+    Ok((resolution_overrides, coord_overrides))
 }
 
 /// A small neutral routing logit a born atom is seeded at: large enough that the

@@ -3676,6 +3676,18 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
     ) -> Result<bool, String> {
         let residual = self.reconstruction_residual(target, rho)?;
+        self.residual_view_has_uncovered_signal(residual.view())
+    }
+
+    /// [`Self::residual_has_uncovered_signal`] on an EXPLICIT residual matrix.
+    /// The whole-guard gate recomputes the residual from `rho`; the sequential
+    /// co-collapse reseed instead peels the residual atom-by-atom and needs the
+    /// SAME measured-noise-floor test on each intermediate remainder, so the
+    /// floor logic lives here and both callers share it.
+    fn residual_view_has_uncovered_signal(
+        &self,
+        residual: ArrayView2<'_, f64>,
+    ) -> Result<bool, String> {
         if residual.nrows() == 0 || residual.ncols() == 0 {
             return Ok(false);
         }
@@ -3692,6 +3704,92 @@ impl SaeManifoldTerm {
             .filter(|v| v.is_finite() && *v >= 0.0)
             .collect();
         Ok(leading_direction_above_noise_floor(&energies))
+    }
+
+    /// #2132 — SEQUENTIAL-DEFLATION birth reseed for CURVED co-collapsed atoms.
+    ///
+    /// The co-collapse guard reseeds SEVERAL duplicate atoms in one call. Seeding
+    /// them all from the SAME residual re-reads its one leading structure for
+    /// every atom, so they re-collide immediately — the disjoint-PC offset only
+    /// helps when the uncovered residual is high rank, but a co-collapsed
+    /// dictionary typically leaves ONE low-rank structure uncovered (`pc_pairs = 1`
+    /// ⇒ every atom draws PC-pair 0). Peel instead: seed atom 0's chart from the
+    /// current residual via the shared chart-aware curved seed
+    /// ([`Self::seed_atom_chart_coords`]), fit its provisional gated decoder,
+    /// SUBTRACT its fit, and seed atom 1 from what atom 0 left behind — the
+    /// block-nursery sequential-composition principle, so each reborn atom charts
+    /// a DISJOINT chunk of the uncovered residual. The measured noise-floor
+    /// terminator ([`Self::residual_view_has_uncovered_signal`]) breaks the
+    /// sequence the moment the peeled remainder hits the floor: the remaining
+    /// duplicates carry nothing distinct, so reseeding them would only re-plant a
+    /// duplicate onto noise. The provisional decoders exist only to deflate; the
+    /// guard's subsequent [`Self::refit_decoder_sequential_deflation`] fits the
+    /// final decoders on these freshly-separated charts. Returns the atoms
+    /// actually reseeded (the prefix before the terminator fired).
+    ///
+    /// Seeds through the SHARED seed entrypoint, so when the curved seed's backend
+    /// gains an intrinsic-metric embedding the reseed inherits it unchanged; the
+    /// disjointness MECHANISM (sequential deflation) is independent of the seed
+    /// SOURCE (PC read or geodesic embedding).
+    pub(crate) fn reseed_curved_atoms_sequential_deflation(
+        &mut self,
+        atoms: &[usize],
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<Vec<usize>, String> {
+        if atoms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = self.n_obs();
+        let p = self.output_dim();
+        if n == 0 || p == 0 {
+            return Ok(Vec::new());
+        }
+        // Peel from the WHOLE-dictionary residual: the KEPT atoms' structure is
+        // already subtracted, so each reborn atom charts a disjoint chunk of what
+        // the dictionary as a whole leaves uncovered.
+        let mut residual = self.reconstruction_residual(target, rho)?;
+        let mut reseeded = Vec::new();
+        for &atom in atoms {
+            // Terminator: once the peeled remainder is at the measured noise floor
+            // there is no distinct structure left for the remaining duplicates to
+            // chart — stop rather than re-plant a duplicate onto noise.
+            if !self.residual_view_has_uncovered_signal(residual.view())? {
+                break;
+            }
+            // 1. Seed THIS atom's chart from the current (peeled) residual via the
+            //    shared chart-aware seed, then refresh its basis at the new chart.
+            self.seed_atom_chart_coords(atom, n, residual.view(), None)?;
+            // 2. Fit a provisional gated decoder (`diag(a_·atom)·Φ_atom`) on the
+            //    fresh chart and deflate the residual by its fit, so the NEXT atom
+            //    reads a disjoint remainder.
+            let m = self.atoms[atom].basis_size();
+            let mut design = Array2::<f64>::zeros((n, m));
+            for row in 0..n {
+                let assignments = self.assignment.try_assignments_row(row)?;
+                let gate = assignments[atom];
+                for col in 0..m {
+                    design[[row, col]] = gate * self.atoms[atom].basis_values[[row, col]];
+                }
+            }
+            let beta = solve_design_least_squares(design.view(), residual.view())?;
+            if beta.dim() != (m, p) {
+                return Err(format!(
+                    "SaeManifoldTerm::reseed_curved_atoms_sequential_deflation: atom {atom} \
+                     beta shape {:?} != ({m}, {p})",
+                    beta.dim()
+                ));
+            }
+            let fit = design.dot(&beta);
+            residual = &residual - &fit;
+            for col in 0..m {
+                for out in 0..p {
+                    self.atoms[atom].decoder_coefficients[[col, out]] = beta[[col, out]];
+                }
+            }
+            reseeded.push(atom);
+        }
+        Ok(reseeded)
     }
 
     /// #2027 co-collapse fix, Part A — GREEDY DISJOINT-SUBSPACE decoder refit.

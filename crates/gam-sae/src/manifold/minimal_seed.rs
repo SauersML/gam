@@ -74,7 +74,7 @@ pub fn build_sae_minimal_seed(
     } else {
         None
     };
-    let overrides = if let Some(labels) = auto_labels.as_ref() {
+    let (overrides, coord_overrides) = if let Some(labels) = auto_labels.as_ref() {
         crate::structure_harvest::resolve_auto_primary_atoms(
             request.target,
             labels,
@@ -82,7 +82,7 @@ pub fn build_sae_minimal_seed(
             &mut request.atom_dim,
         )?
     } else {
-        vec![None; k_atoms]
+        (vec![None; k_atoms], vec![None; k_atoms])
     };
     let basis_kinds: Vec<SaeAtomBasisKind> = request
         .atom_basis
@@ -91,6 +91,21 @@ pub fn build_sae_minimal_seed(
         .collect();
     let mut seed_coords =
         sae_pca_seed_initial_coords(request.target, &basis_kinds, &request.atom_dim)?;
+    // #2240/#2280 — install the UNFOLDED geodesic chart for any auto atom whose
+    // intrinsic-metric seed won the primary evidence race, overriding the PCA seed
+    // that would otherwise re-crease a swiss-roll-class fold. `coord_overrides` is
+    // `None` for every atom where the PCA seed won (the common path), so this
+    // leaves the default seed bit-identical off a fold.
+    for (atom_idx, chart) in coord_overrides.iter().enumerate() {
+        if let Some(chart) = chart {
+            let d = chart.ncols().min(seed_coords.shape()[2]);
+            for row in 0..n_obs.min(chart.nrows()) {
+                for col in 0..d {
+                    seed_coords[[atom_idx, row, col]] = chart[[row, col]];
+                }
+            }
+        }
+    }
     if basis_kinds
         .iter()
         .any(|kind| matches!(kind, SaeAtomBasisKind::Mobius))
