@@ -562,11 +562,7 @@ fn collect_program_scalar_dependencies(
             collect_program_scalar_dependencies(left, dependencies);
             collect_program_scalar_dependencies(right, dependencies);
         }
-        ProgramExpr::Compose {
-            arguments,
-            value: _,
-            ..
-        } => {
+        ProgramExpr::Compose { arguments, .. } => {
             for argument in arguments {
                 collect_scalar_expression_dependencies(argument, dependencies);
             }
@@ -1613,5 +1609,26 @@ mod tests {
         assert!(!witness.contains("log_stack"));
         assert!(!witness.contains("discarded"));
         assert!(!witness.contains("event : f64"));
+    }
+
+    #[test]
+    fn scalar_witness_schedule_retains_needed_branch_condition() {
+        let witness = emitted_function(
+            quote! {
+                fn branched(q; event, unused)
+                leaves {}
+                witnesses [out];
+                {
+                    let mut out = zero();
+                    if (event > 0.0) { out = q; }
+                    return out;
+                }
+            },
+            "branched_witnesses",
+        );
+
+        assert!(witness.contains("q : f64"));
+        assert!(witness.contains("event : f64"));
+        assert!(!witness.contains("unused : f64"));
     }
 }
