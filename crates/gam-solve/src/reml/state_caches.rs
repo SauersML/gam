@@ -1599,6 +1599,8 @@ pub(crate) struct Gam784BlockTarget<'t> {
     pub(crate) eta_hat: Array1<f64>,
     /// Per-row observed weights `W_i` (the likelihood Hessian diagonal).
     pub(crate) weights_obs: Array1<f64>,
+    /// `ln|W_i|` (`-inf` for exact zero), certified once at target creation.
+    pub(crate) weights_obs_log_abs: Array1<f64>,
     /// Response y and prior weights for the deviance.
     pub(crate) y: Array1<f64>,
     pub(crate) prior_weights: Array1<f64>,
@@ -1651,13 +1653,11 @@ impl Gam784BlockTarget<'_> {
             self.prior_weights.view(),
             -self.phi.ln(),
         )?;
-        let half_deviance =
-            gam_linalg::pairwise_reduce::par_pairwise_sum(rows.len(), |i| rows[i].half_deviance);
-        if !half_deviance.is_finite() {
-            return Err(EstimationError::InvalidInput(format!(
-                "#784 scaled half-deviance is not representable: {half_deviance}"
-            )));
-        }
+        let half_values: Vec<f64> = rows.iter().map(|row| row.half_deviance).collect();
+        let half_deviance = crate::pirls::stable_finite_signed_sum(
+            &half_values,
+            "#784 scaled half-deviance",
+        )?;
         let mut score = Array1::<f64>::zeros(rows.len());
         for (i, row) in rows.into_iter().enumerate() {
             let value = row.eta_score;
@@ -1676,6 +1676,73 @@ impl Gam784BlockTarget<'_> {
 
     pub(crate) fn neg_score_at(&self, eta: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
         self.likelihood_surface_at(eta).map(|(_, score)| score)
+    }
+
+    /// `sum_i W_i s_i^2` on an exponent-scaled signed surface.  Squaring `s_i`
+    /// before multiplying by a tiny `W_i` can overflow even when the weighted
+    /// term is finite; scaling every term by the largest log magnitude avoids
+    /// that false refusal.  One deterministic Neumaier pass preserves signed
+    /// observed-curvature cancellation.
+    pub(crate) fn observed_quadratic(
+        &self,
+        s: ndarray::ArrayView1<'_, f64>,
+    ) -> Result<f64, EstimationError> {
+        if s.len() != self.weights_obs.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "#784 observed quadratic length mismatch: scores={}, weights={}",
+                s.len(),
+                self.weights_obs.len()
+            )));
+        }
+        let mut max_log = f64::NEG_INFINITY;
+        let mut log_terms = Vec::with_capacity(s.len());
+        for i in 0..s.len() {
+            if !s[i].is_finite() {
+                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "#784 displacement score",
+                    eta: self.eta_hat[i],
+                    value: s[i],
+                });
+            }
+            let log_term = if self.weights_obs[i] == 0.0 || s[i] == 0.0 {
+                f64::NEG_INFINITY
+            } else {
+                self.weights_obs_log_abs[i] + 2.0 * s[i].abs().ln()
+            };
+            max_log = max_log.max(log_term);
+            log_terms.push(log_term);
+        }
+        if max_log == f64::NEG_INFINITY {
+            return Ok(0.0);
+        }
+        let mut sum = 0.0_f64;
+        let mut compensation = 0.0_f64;
+        for i in 0..s.len() {
+            if log_terms[i] == f64::NEG_INFINITY {
+                continue;
+            }
+            let term = self.weights_obs[i].signum() * (log_terms[i] - max_log).exp();
+            let next = sum + term;
+            compensation += if sum.abs() >= term.abs() {
+                (sum - next) + term
+            } else {
+                (term - next) + sum
+            };
+            sum = next;
+        }
+        let normalized = sum + compensation;
+        if normalized == 0.0 {
+            return Ok(0.0);
+        }
+        let value = normalized.signum() * (max_log + normalized.abs().ln()).exp();
+        if value.is_finite() {
+            Ok(value)
+        } else {
+            Err(EstimationError::InvalidInput(
+                "#784 signed observed quadratic is outside f64 range".to_string(),
+            ))
+        }
     }
 }
 
@@ -1706,10 +1773,9 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
             penalty_term += lam * score.dot(&delta);
         }
         // Likelihood-curvature subtraction ½ Σ_i W_i s_i².
-        let mut curv = 0.0_f64;
-        for i in 0..s.len() {
-            curv += self.weights_obs[i] * s[i] * s[i];
-        }
+        let Ok(curv) = self.observed_quadratic(s.view()) else {
+            return f64::INFINITY;
+        };
         neg_loglik_diff + penalty_term - 0.5 * curv
     }
 
@@ -1755,10 +1821,9 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
         for (score, &lam) in self.penalty_scores.iter().zip(self.lambdas.iter()) {
             penalty_term += lam * score.dot(&delta);
         }
-        let mut curv = 0.0_f64;
-        for i in 0..s.len() {
-            curv += self.weights_obs[i] * s[i] * s[i];
-        }
+        let Ok(curv) = self.observed_quadratic(s.view()) else {
+            return (f64::INFINITY, None);
+        };
         let excess = neg_loglik_diff + penalty_term - 0.5 * curv;
         if excess.is_finite() {
             (excess, Some(ngs))
@@ -1825,10 +1890,10 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
             for (score, &lam) in self.penalty_scores.iter().zip(self.lambdas.iter()) {
                 penalty_term += lam * score.dot(&delta);
             }
-            let mut curv = 0.0_f64;
-            for i in 0..n {
-                curv += self.weights_obs[i] * s_col[i] * s_col[i];
-            }
+            let Ok(curv) = self.observed_quadratic(s_col) else {
+                out.push((f64::INFINITY, None));
+                continue;
+            };
             let excess = neg_loglik_diff + penalty_term - 0.5 * curv;
             if excess.is_finite() {
                 out.push((excess, Some(ngs)));
@@ -1837,5 +1902,46 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod exact_deviance_state_cache_tests {
+    use super::*;
+    use ndarray::{array, Array2};
+
+    #[test]
+    fn observed_quadratic_scales_before_squaring_and_preserves_sign() {
+        let x = Array2::<f64>::zeros((2, 1));
+        let weights_obs = array![1.0e-320, -1.0e-320];
+        let weights_obs_log_abs = weights_obs.mapv(|weight| weight.abs().ln());
+        let target = Gam784BlockTarget {
+            x_transformed: &x,
+            block_vecs: Array2::zeros((1, 1)),
+            block_lambdas: array![1.0],
+            eta_hat: array![0.0, 0.0],
+            weights_obs,
+            weights_obs_log_abs,
+            y: array![0.0, 0.0],
+            prior_weights: array![1.0, 1.0],
+            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Poisson,
+                InverseLink::Standard(StandardLink::Log),
+            )),
+            inverse_link: InverseLink::Standard(StandardLink::Log),
+            phi: 1.0,
+            penalty_scores: Arc::new(Vec::new()),
+            lambdas: Vec::new(),
+            base_scaled_half_deviance: 0.0,
+            base_neg_score_at_mode: array![0.0, 0.0],
+        };
+        let s = array![1.0e200, 5.0e199];
+        let observed = target
+            .observed_quadratic(s.view())
+            .expect("weighted quadratic");
+        let first = (target.weights_obs[0].ln() + 2.0 * s[0].ln()).exp();
+        let second = (target.weights_obs[1].abs().ln() + 2.0 * s[1].ln()).exp();
+        let expected = first - second;
+        approx::assert_relative_eq!(observed, expected, max_relative = 2.0e-14);
     }
 }

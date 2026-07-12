@@ -94,6 +94,53 @@ fn finite_signed_from_log(
     }
 }
 
+/// Deterministic signed reduction that cannot overflow on an intermediate
+/// partial sum when the final sum is representable.  Scaling by the largest
+/// magnitude keeps every add bounded; Neumaier compensation retains small
+/// residuals across cancellation, and the final rescale happens in log space.
+pub(crate) fn stable_finite_signed_sum(
+    values: &[f64],
+    context: &'static str,
+) -> Result<f64, EstimationError> {
+    let mut max_abs = 0.0_f64;
+    for (index, &value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "{context}: non-finite value at index {index}: {value}"
+            )));
+        }
+        max_abs = max_abs.max(value.abs());
+    }
+    if max_abs == 0.0 {
+        return Ok(0.0);
+    }
+    let mut sum = 0.0_f64;
+    let mut compensation = 0.0_f64;
+    for &value in values {
+        let term = value / max_abs;
+        let next = sum + term;
+        compensation += if sum.abs() >= term.abs() {
+            (sum - next) + term
+        } else {
+            (term - next) + sum
+        };
+        sum = next;
+    }
+    let normalized = sum + compensation;
+    if normalized == 0.0 {
+        return Ok(0.0);
+    }
+    let log_abs = max_abs.ln() + normalized.abs().ln();
+    let result = normalized.signum() * log_abs.exp();
+    if result.is_finite() {
+        Ok(result)
+    } else {
+        Err(EstimationError::InvalidInput(format!(
+            "{context}: final signed reduction is outside f64 range"
+        )))
+    }
+}
+
 #[inline]
 fn logaddexp(a: f64, b: f64) -> f64 {
     let hi = a.max(b);
@@ -174,6 +221,19 @@ fn exprel(x: f64) -> f64 {
             return next;
         }
         sum = next;
+    }
+}
+
+#[inline]
+fn log_exprel(x: f64) -> f64 {
+    if x == 0.0 {
+        0.0
+    } else if x.abs() <= 0.5 {
+        exprel(x).ln()
+    } else if x > 0.0 {
+        x + (-(-x).exp()).ln_1p() - x.ln()
+    } else {
+        (-x.exp()).ln_1p() - (-x).ln()
     }
 }
 
@@ -281,43 +341,65 @@ fn log_tweedie_ratio_deviance(log_r: f64, p: f64) -> f64 {
             k += 1.0;
         }
     }
-    if log_r.abs() <= 50.0 {
-        let value = if q <= 0.5 {
-            // Factor q before subtracting the q→0 terms.
-            (log_r * exprel(q * log_r) - log_r.exp_m1()) / (q - 1.0)
+    // Factor whichever boundary exponent is smaller before subtraction.  Every
+    // term remains in log magnitude, so this is stable both for p=nextafter(1)
+    // and p=nextafter(2), and for log-ratios far outside the exp() range.
+    if log_r > 0.0 {
+        if q <= 0.5 {
+            let log_large = log_abs_one_minus_exp(log_r);
+            let log_small = log_r.ln() + log_exprel(q * log_r);
+            let (_, log_difference) = signed_log_exp_difference(log_large, log_small);
+            log_difference - (1.0 - q).ln()
         } else {
-            // Factor p-1 before subtracting the p→1 terms.
             let a = 1.0 - q;
-            (log_r.exp() * log_r * exprel(-a * log_r) - log_r.exp_m1()) / q
-        };
-        return value.ln();
+            let log_large = log_r + log_r.ln() + log_exprel(-a * log_r);
+            let log_small = log_abs_one_minus_exp(log_r);
+            let (_, log_difference) = signed_log_exp_difference(log_large, log_small);
+            log_difference - q.ln()
+        }
+    } else if q <= 0.5 {
+        let log_large = (-log_r).ln() + log_exprel(q * log_r);
+        let log_small = log_abs_one_minus_exp(log_r);
+        let (_, log_difference) = signed_log_exp_difference(log_large, log_small);
+        log_difference - (1.0 - q).ln()
+    } else {
+        let a = 1.0 - q;
+        let log_large = log_abs_one_minus_exp(log_r);
+        let log_small = log_r + (-log_r).ln() + log_exprel(-a * log_r);
+        let (_, log_difference) = signed_log_exp_difference(log_large, log_small);
+        log_difference - q.ln()
     }
-    let log_b = log_r - (p - 1.0).ln();
-    let log_c = -q.ln();
-    let log_a = q * log_r - ((p - 1.0) * q).ln();
-    let scale = log_b.max(log_c).max(log_a);
-    let normalized = (log_b - scale).exp() + (log_c - scale).exp() - (log_a - scale).exp();
-    scale + normalized.ln()
 }
 
 #[inline]
 fn log_tweedie_half_deviance(log_weight: f64, log_y: f64, eta: f64, p: f64) -> f64 {
     let q = 2.0 - p;
     let log_r = log_y - eta;
-    if log_r.abs() <= 50.0 {
+    if log_r <= 50.0 {
         return log_weight + q * eta + log_tweedie_ratio_deviance(log_r, p);
     }
-    // Absolute-coordinate form of
-    //   y mu^(1-p)/(p-1) + mu^(2-p)/(2-p)
-    //     - y^(2-p)/((p-1)(2-p)).
-    // Combining `q*eta + log f(y/mu)` would subtract two O(|eta|)
-    // logarithms in the far left tail and can erase the finite remainder.
-    let log_b = log_weight + log_y + (1.0 - p) * eta - (p - 1.0).ln();
-    let log_c = log_weight + q * eta - q.ln();
-    let log_a = log_weight + q * log_y - ((p - 1.0) * q).ln();
-    let scale = log_b.max(log_c).max(log_a);
-    let normalized = (log_b - scale).exp() + (log_c - scale).exp() - (log_a - scale).exp();
-    scale + normalized.ln()
+    if q <= 0.5 {
+        // Here p-1 is bounded away from zero, so the absolute three-term form
+        // has no boundary-coefficient cancellation.  It also avoids adding
+        // q*eta to an O(log_r) ratio exponent in the far left mean tail.
+        let log_b = log_y + (1.0 - p) * eta - (p - 1.0).ln();
+        let log_c = q * eta - q.ln();
+        let log_a = q * log_y - ((p - 1.0) * q).ln();
+        let scale = log_b.max(log_c).max(log_a);
+        let normalized =
+            (log_b - scale).exp() + (log_c - scale).exp() - (log_a - scale).exp();
+        log_weight + scale + normalized.ln()
+    } else {
+        // Factor a=p-1 symbolically before forming absolute exponents:
+        // mu^q f = [y mu^-a t exprel(-a t) - mu^q expm1(t)]/q.
+        // This remains accurate at p=nextafter(1) without subtracting the two
+        // raw O(1/a) Tweedie terms.
+        let a = 1.0 - q;
+        let log_large = log_y - a * eta + log_r.ln() + log_exprel(-a * log_r);
+        let log_small = q * eta + log_abs_one_minus_exp(log_r);
+        let (_, log_difference) = signed_log_exp_difference(log_large, log_small);
+        log_weight + log_difference - q.ln()
+    }
 }
 
 #[inline]
@@ -701,7 +783,7 @@ fn deviance_eta_row_with_log_measure_scale(
                         .map_err(|_| {
                             deviance_row_error(row, "inverse-link value/derivative", eta, eta)
                         })?;
-                if !(jet.0.is_finite() && jet.1.is_finite()) {
+                if !(jet.0.is_finite() && jet.0 > 0.0 && jet.0 < 1.0 && jet.1.is_finite() && jet.1 > 0.0) {
                     return Err(deviance_row_error(
                         row,
                         "inverse-link value/derivative",
@@ -743,30 +825,41 @@ fn deviance_eta_row_with_log_measure_scale(
                     log_weight + half_unit.ln(),
                 )?
             };
-            let score_unit = if is_logit {
+            let (score_sign, score_log_abs) = if is_logit {
                 let (mu, one_minus_mu) = logit_probability_pair(eta);
-                if eta >= 0.0 {
+                let score_unit = if eta >= 0.0 {
                     (1.0 - y) - one_minus_mu
                 } else {
                     mu - y
+                };
+                if score_unit == 0.0 {
+                    (0.0, f64::NEG_INFINITY)
+                } else {
+                    (score_unit.signum(), log_weight + score_unit.abs().ln())
                 }
             } else {
                 let jet = jet.expect("non-logit binomial branch has an inverse-link jet");
-                if jet.0 <= 0.5 {
-                    (jet.1 / jet.0) * ((jet.0 - y) / (1.0 - jet.0))
+                let residual = jet.0 - y;
+                if residual == 0.0 {
+                    (0.0, f64::NEG_INFINITY)
                 } else {
-                    (jet.1 / (1.0 - jet.0)) * ((jet.0 - y) / jet.0)
+                    (
+                        residual.signum(),
+                        log_weight + jet.1.ln() + residual.abs().ln()
+                            - jet.0.ln()
+                            - (1.0 - jet.0).ln(),
+                    )
                 }
             };
-            let score = if score_unit == 0.0 {
+            let score = if score_sign == 0.0 {
                 0.0
             } else {
                 finite_signed_from_log(
                     row,
                     "binomial eta score",
                     eta,
-                    score_unit.signum(),
-                    log_weight + score_unit.abs().ln(),
+                    score_sign,
+                    score_log_abs,
                 )?
             };
             (half, score)
@@ -914,7 +1007,8 @@ pub(crate) fn calculate_deviance_from_eta(
     priorweights: ArrayView1<f64>,
 ) -> Result<f64, EstimationError> {
     let rows = deviance_eta_rows(y, eta, likelihood, inverse_link, priorweights)?;
-    let half = gam_linalg::pairwise_reduce::par_pairwise_sum(rows.len(), |i| rows[i].half_deviance);
+    let half_values: Vec<f64> = rows.iter().map(|row| row.half_deviance).collect();
+    let half = stable_finite_signed_sum(&half_values, "deviance half-sum")?;
     let value = 2.0 * half;
     if value.is_finite() {
         Ok(value)

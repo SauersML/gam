@@ -14,9 +14,7 @@ use crate::estimate::prefit::{
 use crate::estimate::reml::eval::{
     AUTO_CUBATURE_HESSIAN_RIDGE_ABS, AUTO_CUBATURE_HESSIAN_RIDGE_REL,
 };
-use crate::estimate::smoothing_correction::{
-    AUTO_CUBATURE_MAX_EIGENVECTORS, MAX_FACTORIZATION_ATTEMPTS,
-};
+use crate::estimate::smoothing_correction::AUTO_CUBATURE_MAX_EIGENVECTORS;
 use gam_linalg::matrix::FactorizedSystem;
 use gam_linalg::utils::KahanSum;
 use gam_problem::dispersion_cov::se_from_covariance;
@@ -24,87 +22,17 @@ use gam_problem::{SeedConfig, SeedRiskProfile};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-/// Max-abs entry of `H·H⁻¹ − I` — a scale-free trustworthiness probe for a
-/// computed inverse. It is `≈ κ(H)·ε` for a faithful inverse but blows up to
-/// `O(δ/σ_min)` when [`matrix_inversewith_regularization`] had to add a large
-/// stabilization ridge `δ` (an ill-conditioned Hessian, e.g. a smoothing
-/// parameter saturated at the ρ rail). That ridge is a `NumericalPerturbation`
-/// the covariance callers treat as absent, yet it uniformly inflates `H` and so
-/// shrinks EVERY posterior variance — collapsing the reported standard errors
-/// (#2123: a `te(x,z)` fit that lands on the ρ₁ rail read ΣSE≈0.16 vs the
-/// correct ≈13). This probe detects that regime so the covariance can fall back
-/// to a ridge-free spectral inverse.
-fn inverse_identity_defect(h: &Array2<f64>, h_inv: &Array2<f64>) -> f64 {
-    let p = h.nrows();
-    let prod = h.dot(h_inv);
-    let mut worst = 0.0_f64;
-    for i in 0..p {
-        for j in 0..p {
-            let target = if i == j { 1.0 } else { 0.0 };
-            worst = worst.max((prod[[i, j]] - target).abs());
-        }
-    }
-    worst
-}
-
-/// Ridge-free symmetric (pseudo-)inverse from the eigendecomposition:
-/// `H⁻¹ = Σ_i (1/σ_i) u_i u_iᵀ`, inverting only eigenvalues above a relative
-/// floor `σ_max·rel_floor` (numerical nulls contribute nothing). Unlike an
-/// additive-ridge inverse this leaves the well-determined directions' variances
-/// intact while heavily-penalized directions collapse to ~0 variance on their
-/// own — the correct posterior covariance at any conditioning. Returns `None`
-/// if the eigendecomposition fails or the spectrum is degenerate.
-fn spectral_symmetric_inverse(h: &Array2<f64>) -> Option<Array2<f64>> {
-    let (evals, evecs) = h.eigh(Side::Lower).ok()?;
-    let p = h.nrows();
-    let max_ev = evals.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
-    if !(max_ev > 0.0) {
-        return None;
-    }
-    // Only genuine numerical nulls (≈0 relative to the top eigenvalue) are
-    // dropped; the smallest data-supported eigenvalue of a penalized Hessian is
-    // O(n)≫floor, so its variance is retained exactly.
-    let floor = max_ev * 1e-14;
-    let mut scaled = evecs.clone();
-    for j in 0..p {
-        let inv_ev = if evals[j] > floor {
-            1.0 / evals[j]
-        } else {
-            0.0
-        };
-        for i in 0..p {
-            scaled[[i, j]] *= inv_ev;
-        }
-    }
-    let inv = scaled.dot(&evecs.t());
-    inv.iter().all(|v| v.is_finite()).then_some(inv)
-}
-
-/// Posterior covariance inverse `H⁻¹` that stays faithful when `H` is
-/// ill-conditioned. Uses the fast regularized-Cholesky inverse whenever it is
-/// trustworthy (the common well-conditioned case — bit-identical to before),
-/// and falls back to the ridge-free [`spectral_symmetric_inverse`] only when the
-/// stabilization ridge materially perturbed the result, which is exactly when it
-/// would otherwise collapse the SEs (#2123 ρ-rail).
-fn posterior_covariance_inverse(h: &Array2<f64>, label: &str) -> Option<Array2<f64>> {
-    let regularized = matrix_inversewith_regularization(h, label);
-    if let Some(ref inv) = regularized
-        && inverse_identity_defect(h, inv) <= 1e-6
-    {
-        return regularized;
-    }
-    // The regularized inverse was materially perturbed by its ridge (or failed);
-    // recompute a spectral inverse that does not ridge the well-determined block.
-    match spectral_symmetric_inverse(h) {
-        Some(spectral) => {
-            log::debug!(
-                "[cov#2123] posterior covariance: regularized inverse untrustworthy \
-                 (ill-conditioned Hessian, likely a saturated ρ); using ridge-free spectral inverse"
-            );
-            Some(spectral)
-        }
-        None => regularized,
-    }
+/// Unscaled posterior covariance `H⁻¹` of the supplied Hessian.
+///
+/// This is deliberately neither an additive-ridge inverse nor a truncated
+/// pseudoinverse: both would change the covariance estimand.  A singular or
+/// numerically unrepresentable Hessian is a typed failure, while success has
+/// already passed the shared scale-aware residual certificate in `gam-linalg`.
+fn posterior_covariance_inverse(
+    h: &Array2<f64>,
+    label: &str,
+) -> Result<Array2<f64>, gam_linalg::utils::CertifiedSymmetricSolveError> {
+    certified_spd_inverse(h, label).map(gam_linalg::utils::CertifiedSpdInverse::into_inverse)
 }
 
 /// Scale-free KKT residual for the Negative-Binomial conditional ML problem in
@@ -2060,7 +1988,7 @@ where
         .compute_inference
         .then(|| reserve_dense_covariance_bundle(pirls_res.reparam_result.qs.nrows()))
         .flatten();
-    let mut factorized_inference_reservation =
+    let factorized_inference_reservation =
         if opts.compute_inference && dense_covariance_reservation.is_none() {
             reserve_factorized_inference_state(pirls_res.reparam_result.qs.nrows())
         } else {
@@ -2071,53 +1999,14 @@ where
         // EDF by block using stabilized H and penalty roots in transformed basis.
         let h = &pirls_res.stabilizedhessian_transformed;
         let p_dim = h.nrows();
-        // Sparse-aware factorization with ridge retry — no densification.
-        // Uses SymmetricMatrix::factorize() -> sparse Cholesky for sparse,
-        // dense Cholesky for dense.
-        let factor = {
-            let scale = h.max_abs_diag();
-            let min_step = scale * 1e-10;
-            let mut try_factorize = |ridge: f64| {
-                let candidate = if ridge > 0.0 {
-                    match h.addridge(ridge) {
-                        Ok(c) => c,
-                        Err(_) => h.clone(),
-                    }
-                } else {
-                    h.clone()
-                };
-                candidate.factorize().ok()
-            };
-            // Bare (unridged) factorization first, then the shared geometric
-            // ridge escalation; the bare try counts toward the attempt budget.
-            match try_factorize(0.0) {
-                Some(f) => f,
-                None => match opt::escalate_ridge(
-                    opt::RidgeSchedule::geometric(min_step, MAX_FACTORIZATION_ATTEMPTS - 1),
-                    &mut try_factorize,
-                ) {
-                    Ok(success) => {
-                        // This ridged factor is reused for the reported standard
-                        // errors, covariance, and bias correction below, so those
-                        // quantities are stabilized approximations, not the exact
-                        // (unridged) Hessian-based values.
-                        log::warn!(
-                            "Inference Hessian was rank-deficient and required a stabilizing \
-                             ridge {:.3e}; reported standard errors, covariance, and bias \
-                             correction are computed from the ridge-stabilized factor and are \
-                             approximations, not exact unridged values",
-                            success.ridge,
-                        );
-                        success.value
-                    }
-                    Err(_) => {
-                        return Err(EstimationError::ModelIsIllConditioned {
-                            condition_number: f64::INFINITY,
-                        });
-                    }
-                },
-            }
-        };
+        // Factor the exact Hessian already minted by PIRLS. Any objective-level
+        // ridge is already present in this matrix and its RidgePassport; this
+        // inference layer is not allowed to add another unaccounted diagonal.
+        let factor = h.factorize_spd().map_err(|reason| {
+            EstimationError::RemlOptimizationFailed(format!(
+                "exact inference Hessian factorization failed: {reason}"
+            ))
+        })?;
         let mut traces = vec![0.0f64; k];
         for (kk, cp) in pirls_res
             .reparam_result
@@ -2191,18 +2080,10 @@ where
 
         // Reconcile the EDF accounting with the influence matrix F = H⁻¹X'WX.
         //
-        // The block-trace channel above factorizes the TRANSFORMED stabilized
-        // Hessian with a bespoke 10×-escalation ridge loop. On rank-deficient
-        // spatial-smooth corners (degenerate-Hessian thin-plate fits) that loop
-        // can take an enormous ridge, inflating Σ tr_kk toward `p` and collapsing
-        // `edf_total = p − Σ tr_kk` onto its floor `mp` (e.g. 1.0 for a single
-        // smooth) even though the fitted surface — and the influence matrix `F`
-        // that the prediction, dispersion, and per-term EDF all consume — has
-        // legitimately spent ~70 EDF (issue #1356). The authoritative model
-        // definition of EDF is the influence-matrix trace; the per-term EDF
-        // (`FitResult::per_term_edf`) reads `tr(F)` over each block. Recompute the
-        // per-block penalty traces from the SAME rank-revealing inverse `F` uses
-        // (`matrix_inversewith_regularization` of the original-basis Hessian), so
+        // The authoritative model definition of EDF is the influence-matrix
+        // trace; the per-term EDF (`FitResult::per_term_edf`) reads `tr(F)` over
+        // each block. Recompute the per-block penalty traces from the SAME exact
+        // inverse `F` uses, so
         // `edf_total = p − Σ tr_kk = tr(F)`, `Σ edf_by_block = edf_total`, and the
         // total can never fall below a single term's own EDF. Done before the
         // dispersion `σ̂² = RSS/(n − edf_total)` is formed so it, too, uses the
@@ -2221,21 +2102,16 @@ where
             let p_orig = pirls_res.reparam_result.qs.nrows();
             if dense_covariance_reservation.is_some() {
                 let h_orig = map_hessian_to_original_basis(&pirls_res)?;
-                // Use the SAME inverse the influence matrix `F = I − H⁻¹S` is
-                // built from (`posterior_covariance_inverse`, below), not the bare
-                // ridged `matrix_inversewith_regularization`. In the near-linear /
-                // large-λ regime `H` is ill-conditioned, so the regularized inverse
-                // is materially perturbed by its ridge (`inverse_identity_defect >
-                // 1e-6`) and `posterior_covariance_inverse` falls back to the
-                // ridge-free spectral inverse. `F` (and hence `tr(F)`) takes that
-                // spectral branch while this reconciliation, on the bare ridged
-                // inverse, did not — so `tr_kk = λ_kk·tr(H⁻¹S_kk)` was contracted
-                // against a DIFFERENT `H⁻¹` than `F`, breaking the exact identity
-                // `edf_total = p − Σ tr_kk = tr(F)` by the ridge perturbation (the
-                // #1027 basis/PSD-floor inconsistency, ~2.4e-5 on a heavily-smoothed
-                // `s(x)`). Sharing `posterior_covariance_inverse` makes both traces
-                // read the identical `H⁻¹`, restoring the identity to round-off.
-                if let Some(h_inv) = posterior_covariance_inverse(&h_orig, "edf reconciliation") {
+                // Sharing one certified SPD inverse makes the block traces and
+                // influence matrix read the identical `H⁻¹`. Failure is not a
+                // request to silently change rank or add a diagonal perturbation.
+                let h_inv = posterior_covariance_inverse(&h_orig, "edf reconciliation")
+                    .map_err(|error| {
+                        EstimationError::RemlOptimizationFailed(format!(
+                            "EDF reconciliation requires an exact SPD Hessian inverse: {error}"
+                        ))
+                    })?;
+                {
                     let qs = &pirls_res.reparam_result.qs;
                     let p_t = qs.ncols();
                     let mut traces_f = vec![0.0f64; k];
@@ -2463,22 +2339,15 @@ where
         let beta_covariance_unscaled: Option<Array2<f64>> = if dense_covariance_reservation
             .is_some()
         {
-            match posterior_covariance_inverse(&penalized_hessian, "posterior covariance") {
-                Some(h_inv) => Some(h_inv),
-                None => {
-                    log::warn!(
-                        "posterior covariance inversion failed (p={p_cov}): \
-                         falling back to solve-on-demand standard errors"
-                    );
-                    // Release the optional 24-matrix live-set charge before
-                    // the chunked path asks the governor for workspaces,
-                    // then retain only the factor/precision state that is
-                    // genuinely still live.
-                    drop(dense_covariance_reservation.take());
-                    factorized_inference_reservation = reserve_factorized_inference_state(p_cov);
-                    None
-                }
-            }
+            Some(
+                posterior_covariance_inverse(&penalized_hessian, "posterior covariance").map_err(
+                    |error| {
+                        EstimationError::RemlOptimizationFailed(format!(
+                            "posterior covariance requires an exact SPD Hessian inverse: {error}"
+                        ))
+                    },
+                )?,
+            )
         } else {
             None
         };

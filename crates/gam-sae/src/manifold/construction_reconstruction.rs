@@ -54,9 +54,46 @@ pub(super) fn certified_ard_axis_edf(
     Ok(raw.clamp(0.0, n_active))
 }
 
+/// Project a Hutchinson ARD-EDF estimate onto its known parameter space.
+///
+/// Individual grouped diagonal estimates can leave `[0, n_active]` by sampling
+/// noise even when the exact trace is valid. Euclidean projection onto this
+/// closed interval is the constrained estimator: for every true EDF in the
+/// interval it cannot increase squared error. This is deliberately distinct
+/// from the exact-trace certificate above and is used only on the declared
+/// massive-K stochastic trace lane.
+fn projected_hutchinson_ard_axis_edf(
+    n_active: f64,
+    alpha: f64,
+    inverse_trace_estimate: f64,
+    atom: usize,
+    axis: usize,
+) -> Result<f64, String> {
+    if !(n_active.is_finite()
+        && n_active >= 0.0
+        && alpha.is_finite()
+        && alpha > 0.0
+        && inverse_trace_estimate.is_finite())
+    {
+        return Err(format!(
+            "reconstruction_dispersion: stochastic ARD EDF inputs at atom {atom}, axis \
+             {axis} must be finite with non-negative active count and positive precision; \
+             got n_active={n_active}, alpha={alpha}, trace={inverse_trace_estimate}"
+        ));
+    }
+    let estimate = n_active - alpha * inverse_trace_estimate;
+    if !estimate.is_finite() {
+        return Err(format!(
+            "reconstruction_dispersion: stochastic ARD EDF estimate is unrepresentable at \
+             atom {atom}, axis {axis}"
+        ));
+    }
+    Ok(estimate.clamp(0.0, n_active))
+}
+
 #[cfg(test)]
 mod ard_edf_certificate_tests {
-    use super::certified_ard_axis_edf;
+    use super::{certified_ard_axis_edf, projected_hutchinson_ard_axis_edf};
 
     #[test]
     fn snaps_only_trace_roundoff_at_the_ard_edf_faces() {
@@ -71,6 +108,18 @@ mod ard_edf_certificate_tests {
         for trace in [-1.0e-8, 8.0 + 1.0e-8, f64::NAN, f64::INFINITY] {
             assert!(certified_ard_axis_edf(8.0, 1.0, trace, 2, 3).is_err());
         }
+    }
+
+    #[test]
+    fn stochastic_trace_lane_uses_the_declared_constrained_estimator() {
+        assert_eq!(
+            projected_hutchinson_ard_axis_edf(8.0, 1.0, -2.0, 0, 0).unwrap(),
+            8.0
+        );
+        assert_eq!(
+            projected_hutchinson_ard_axis_edf(8.0, 1.0, 10.0, 0, 0).unwrap(),
+            0.0
+        );
     }
 }
 
@@ -335,13 +384,14 @@ impl SaeManifoldTerm {
     ///   * decoder β: `beta_dim − tr(λ_smooth · S_β⁻¹ · ⊕_k S_k⊗I_p)`, the
     ///     smoothness effective-dof already assembled for the Fellner-Schall
     ///     step (penalty-shrunk directions do not cost a full parameter);
-    ///   * latent coordinates: enabled ARD axes use the exact ARD-shrunk trace
+    ///   * latent coordinates: enabled ARD axes use the ARD-shrunk trace
     ///     `Σ_k Σ_j (n_active_k − α_{kj}·tr_{kj}(H⁻¹))`; atoms with disabled
     ///     native ARD charge the full active coordinate count because those
     ///     latent variables are estimated without an ARD precision.
     ///
-    /// The coordinate term is the **exact** ARD-shrunk effective dof of the
-    /// latent block: along axis `(k,j)` the MacKay/Fellner-Schall edf is
+    /// Below the declared massive-K threshold the coordinate term is the exact
+    /// ARD-shrunk effective dof of the latent block: along axis `(k,j)` the
+    /// MacKay/Fellner-Schall edf is
     /// `n_active_k − α_{kj}·tr_{kj}(H⁻¹)`, the well-determined-direction count
     /// after the ARD prior `α_{kj}` shrinks each coordinate. `tr_{kj}(H⁻¹)` is
     /// the same posterior-variance trace [`Self::ard_inverse_traces`] assembles
@@ -351,8 +401,10 @@ impl SaeManifoldTerm {
     /// over: `n` for the dense full-support layout, or the number of rows where
     /// atom `k` is active for the compact active-set layout (inactive
     /// prior-dominated coordinates contribute 0 to both the trace and the
-    /// count, hence 0 edf). The residual dof is floored at 1 so `φ̂` stays
-    /// finite and positive.
+    /// count, hence 0 edf). At massive K the selected-inverse diagonal is the
+    /// declared Hutchinson estimate; its grouped EDF is projected onto the exact
+    /// `[0,n_active_k]` parameter space, which cannot increase squared error.
+    /// The residual dof is floored at 1 so `φ̂` stays finite and positive.
     /// `residual` is the per-row reconstruction residual `f(θ̂) − y` (n×p) at the
     /// same state that produced `cache`. When supplied it engages the #2133 SURE
     /// within-basin second-order deflation correction
@@ -416,8 +468,9 @@ impl SaeManifoldTerm {
             self.beta_dim() as f64
         };
         let beta_edf = (raw_decoder_dof - smooth_edf).max(0.0);
-        // Exact ARD-shrunk latent-coordinate edf, reusing the EFS trace cache.
+        // ARD-shrunk latent-coordinate EDF, reusing the EFS trace cache.
         let ard_precisions = self.validated_ard_precisions(rho)?;
+        let stochastic_ard_trace = self.k_atoms() >= Self::ARD_TRACE_HUTCHINSON_MIN_ATOMS;
         let traces = self
             .ard_inverse_traces(cache)
             .map_err(|e| format!("reconstruction_dispersion: ARD traces: {e}"))?;
@@ -447,7 +500,11 @@ impl SaeManifoldTerm {
             }
             for j in 0..d_k {
                 let alpha = ard_precisions[k][j];
-                let edf_kj = certified_ard_axis_edf(n_active_k, alpha, traces[k][j], k, j)?;
+                let edf_kj = if stochastic_ard_trace {
+                    projected_hutchinson_ard_axis_edf(n_active_k, alpha, traces[k][j], k, j)?
+                } else {
+                    certified_ard_axis_edf(n_active_k, alpha, traces[k][j], k, j)?
+                };
                 coord_edf += edf_kj;
             }
         }

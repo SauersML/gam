@@ -2035,6 +2035,30 @@ impl FaerCholeskyFactor {
     }
 }
 
+impl crate::matrix::FactorizedSystem for FaerCholeskyFactor {
+    fn solve(&self, rhs: &Array1<f64>) -> Result<Array1<f64>, String> {
+        let out = self.solvevec(rhs);
+        if out.iter().all(|value| value.is_finite()) {
+            Ok(out)
+        } else {
+            Err("strict Cholesky solve produced non-finite values".to_string())
+        }
+    }
+
+    fn solvemulti(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String> {
+        let out = self.solve_mat(rhs);
+        if out.iter().all(|value| value.is_finite()) {
+            Ok(out)
+        } else {
+            Err("strict Cholesky multi-solve produced non-finite values".to_string())
+        }
+    }
+
+    fn logdet(&self) -> f64 {
+        cholesky_factor_logdet(self.factor.L())
+    }
+}
+
 pub trait FaerCholesky {
     fn cholesky(&self, side: Side) -> Result<FaerCholeskyFactor, FaerLinalgError>;
 }

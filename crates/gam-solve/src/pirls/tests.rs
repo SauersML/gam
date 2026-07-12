@@ -22,6 +22,7 @@ mod tests {
         observed_weight_dispatch, observed_weight_noncanonical, select_active_set_release,
         should_log_pirls_decision_summary, should_use_sparse_native_pirls,
         solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
+        stable_finite_signed_sum,
         update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state,
         write_negative_binomial_log_working_state, write_poisson_log_working_state,
         write_tweedie_log_working_state,
@@ -1942,6 +1943,30 @@ mod tests {
         assert!(tweedie_balanced.half_deviance.is_finite());
         assert!(tweedie_balanced.eta_score.is_finite());
 
+        for p in [
+            f64::from_bits(1.0_f64.to_bits() + 1),
+            f64::from_bits(2.0_f64.to_bits() - 1),
+        ] {
+            let (boundary, log) =
+                canonical(ResponseFamily::Tweedie { p }, StandardLink::Log);
+            for eta in [-100.0, 100.0] {
+                let row = deviance_eta_row(0, 1.0, eta, &boundary, &log, 1.0)
+                    .expect("Tweedie boundary-power row");
+                let h = 1.0e-5;
+                let plus = deviance_eta_row(0, 1.0, eta + h, &boundary, &log, 1.0)
+                    .expect("boundary plus")
+                    .half_deviance;
+                let minus = deviance_eta_row(0, 1.0, eta - h, &boundary, &log, 1.0)
+                    .expect("boundary minus")
+                    .half_deviance;
+                assert_relative_eq!(
+                    row.eta_score,
+                    (plus - minus) / (2.0 * h),
+                    max_relative = 2.0e-6
+                );
+            }
+        }
+
         let ignored = deviance_eta_row(
             0,
             f64::NAN,
@@ -1991,6 +2016,16 @@ mod tests {
             calculate_deviance_from_eta(y.view(), &eta, &likelihood, &inverse_link, weights.view(),),
             Err(EstimationError::PirlsRowGeometryUnrepresentable { row: 1, .. })
         ));
+    }
+
+    #[test]
+    fn signed_deviance_reduction_avoids_partial_sum_overflow() {
+        let values = [f64::MAX, f64::MAX, -f64::MAX];
+        assert_eq!(
+            stable_finite_signed_sum(&values, "signed deviance witness")
+                .expect("representable final sum"),
+            f64::MAX
+        );
     }
 
     /// Regression for issue #2126: `calculate_deviance` for a Gamma family must

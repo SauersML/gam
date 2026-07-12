@@ -2,7 +2,7 @@ use crate::LinalgError;
 use crate::faer_ndarray::{
     FaerArrayView, FaerLinalgError, array2_to_matmut, factorize_symmetricwith_fallback,
 };
-use crate::faer_ndarray::{FaerCholesky, FaerEigh, FaerSvd};
+use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::matrix::symmetrize_in_place;
 use crate::pcg::{DotReduction, PcgCoreResult, PcgDiagnostics, PcgStop, pcg_core};
 use faer::Side;
@@ -144,54 +144,6 @@ pub fn inf_norm<I: IntoIterator<Item = f64>>(values: I) -> f64 {
     values.into_iter().fold(0.0_f64, |acc, x| acc.max(x.abs()))
 }
 
-pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, FaerLinalgError> {
-    let (rows, cols) = matrix.dim();
-    if rows == 0 || cols == 0 {
-        return Ok(1.0);
-    }
-
-    // Fast path for (near-)symmetric square matrices.
-    if rows == cols {
-        let mut max_abs = 0.0_f64;
-        let mut max_asym = 0.0_f64;
-        for i in 0..rows {
-            for j in 0..cols {
-                max_abs = max_abs.max(matrix[[i, j]].abs());
-            }
-            for j in 0..i {
-                let diff = (matrix[[i, j]] - matrix[[j, i]]).abs();
-                if diff > max_asym {
-                    max_asym = diff;
-                }
-            }
-        }
-        let sym_tol = max_abs.max(1.0) * 1e-12;
-        if max_asym <= sym_tol {
-            let (evals, _) = matrix.eigh(Side::Lower)?;
-            let mut max_abs_eval = 0.0_f64;
-            let mut min_abs_eval = f64::INFINITY;
-            for &lam in evals.iter() {
-                let s = lam.abs();
-                max_abs_eval = max_abs_eval.max(s);
-                min_abs_eval = min_abs_eval.min(s);
-            }
-            if min_abs_eval < 1e-12 {
-                return Ok(f64::INFINITY);
-            }
-            return Ok(max_abs_eval / min_abs_eval);
-        }
-    }
-
-    // General matrix fallback.
-    let (_, s, _) = matrix.svd(false, false)?;
-    let max_sv = s.iter().fold(0.0_f64, |max, &val| max.max(val));
-    let min_sv = s.iter().fold(f64::INFINITY, |min, &val| min.min(val));
-    if min_sv < 1e-12 {
-        return Ok(f64::INFINITY);
-    }
-    Ok(max_sv / min_sv)
-}
-
 const MAX_SOLVE_RETRIES: usize = 8;
 
 /// A posteriori certificate for an unperturbed symmetric linear solve.
@@ -240,14 +192,14 @@ impl CertifiedSymmetricSolution {
     }
 }
 
-/// Certified inverse of an unperturbed symmetric matrix.
+/// Certified inverse of an unperturbed symmetric positive-definite matrix.
 #[derive(Debug)]
-pub struct CertifiedSymmetricInverse {
+pub struct CertifiedSpdInverse {
     inverse: Array2<f64>,
     certificate: SymmetricSolveCertificate,
 }
 
-impl CertifiedSymmetricInverse {
+impl CertifiedSpdInverse {
     #[inline]
     pub fn inverse(&self) -> &Array2<f64> {
         &self.inverse
@@ -308,6 +260,8 @@ pub enum CertifiedSymmetricSolveError {
     },
     #[error("{label}: unperturbed symmetric factorization failed: {reason}")]
     Factorization { label: String, reason: String },
+    #[error("{label}: matrix is not strictly positive definite: {reason}")]
+    NotPositiveDefinite { label: String, reason: String },
     #[error("{label}: solution entry ({row}, {col}) is non-finite: {value:?}")]
     NonFiniteSolution {
         label: String,
@@ -555,25 +509,36 @@ pub fn certified_symmetric_solve(
     })
 }
 
-/// Invert a symmetric matrix without an additive perturbation or spectral
-/// truncation.  The inverse is accepted only when the finite, symmetric input
-/// factorizes and `A * A^-1 = I` satisfies the scale-aware backward-error
-/// certificate returned with it.
-pub fn certified_symmetric_inverse(
+/// Invert a symmetric positive-definite matrix without an additive
+/// perturbation or spectral truncation.
+///
+/// Strict, unjittered Cholesky is the positive-definiteness certificate.  The
+/// inverse is then accepted only when `A * A^-1 = I` also satisfies the
+/// scale-aware backward-error certificate returned with it.  In particular,
+/// this routine never routes through the repaired eigendecomposition API or an
+/// LDLT/LBLT factorization that could bless an indefinite covariance.
+pub fn certified_spd_inverse(
     matrix: &Array2<f64>,
     label: &str,
-) -> Result<CertifiedSymmetricInverse, CertifiedSymmetricSolveError> {
+) -> Result<CertifiedSpdInverse, CertifiedSymmetricSolveError> {
+    let matrix_max_abs = validate_symmetric_matrix(matrix, label)?;
     let rhs = Array2::<f64>::eye(matrix.nrows());
-    let (mut inverse, _) = certified_symmetric_matrix_solve(matrix, &rhs, label)?;
+    let factor = matrix.cholesky(Side::Lower).map_err(|error| {
+        CertifiedSymmetricSolveError::NotPositiveDefinite {
+            label: label.to_string(),
+            reason: error.to_string(),
+        }
+    })?;
+    let mut inverse = rhs.clone();
+    factor.solve_mat_in_place(&mut inverse);
     // A symmetric factorization can accumulate a few asymmetric round-off bits
     // when solving all identity columns.  This projection changes only those
     // solve-roundoff bits and is followed by a fresh certificate against the
     // original, unperturbed matrix.
     symmetrize_in_place(&mut inverse);
-    let matrix_max_abs = max_abs_matrix(matrix);
     let certificate =
         certify_symmetric_matrix_solution(matrix, matrix_max_abs, &rhs, &inverse, label)?;
-    Ok(CertifiedSymmetricInverse {
+    Ok(CertifiedSpdInverse {
         inverse,
         certificate,
     })
@@ -890,28 +855,6 @@ pub fn symmetric_spectrum_condition_number(matrix: &Array2<f64>) -> f64 {
         .unwrap_or(f64::NAN)
 }
 
-/// Estimate min/max eigenvalues of a symmetric matrix via a short
-/// `eigh` call. Used by the inertia-aware stabilization rule below.
-/// Returns `None` if the eigensolver fails.
-pub fn symmetric_extremes(matrix: &Array2<f64>) -> Option<(f64, f64)> {
-    let (evals, _) = matrix.eigh(Side::Lower).ok()?;
-    let mut min = f64::INFINITY;
-    let mut max = f64::NEG_INFINITY;
-    for &v in evals.iter() {
-        if v < min {
-            min = v;
-        }
-        if v > max {
-            max = v;
-        }
-    }
-    if min.is_finite() && max.is_finite() {
-        Some((min, max))
-    } else {
-        None
-    }
-}
-
 pub fn addridge(matrix: &Array2<f64>, ridge: f64) -> Array2<f64> {
     if ridge <= 0.0 {
         return matrix.clone();
@@ -1150,117 +1093,6 @@ where
             );
         }
         None
-    }
-}
-
-#[derive(Clone)]
-pub struct RidgePlanner {
-    cond_estimate: Option<f64>,
-    ridge: f64,
-    attempts: usize,
-    scale: f64,
-}
-
-impl RidgePlanner {
-    pub fn new(matrix: &Array2<f64>) -> Self {
-        let scale = max_abs_diag(matrix);
-        let min_step = scale * 1e-10;
-        // Most Hessians factorize on the first attempt. Avoid an eager exact
-        // condition-number decomposition here and only pay for spectral
-        // diagnostics after an actual factorization failure.
-        //
-        // RidgePlanner is *strictly* a numerical-perturbation device: the
-        // perturbation is applied so a Cholesky factorization succeeds for
-        // an inverse / linear solve, and the matrix the caller hands back
-        // to the rest of the system is the unperturbed one.
-        Self {
-            cond_estimate: None,
-            ridge: min_step,
-            attempts: 0,
-            scale,
-        }
-    }
-
-    pub fn ridge(&self) -> f64 {
-        self.ridge
-    }
-
-    #[inline]
-    fn estimate_conditionwithridge(&self, matrix: &Array2<f64>, ridge: f64) -> Option<f64> {
-        let regularized = if ridge > 0.0 {
-            addridge(matrix, ridge)
-        } else {
-            matrix.clone()
-        };
-        calculate_condition_number(&regularized)
-            .ok()
-            .filter(|c| c.is_finite() && *c > 0.0)
-    }
-
-    pub fn bumpwith_matrix(&mut self, matrix: &Array2<f64>) {
-        self.attempts += 1;
-        let min_step = self.scale * 1e-10;
-        let base = self.ridge.max(min_step);
-
-        // Primary rule: inertia-target. Estimate λ_min(H) on the unperturbed
-        // matrix; pick δ so that λ_min(H + δ I) ≥ τ for an SPD floor τ tied
-        // to the matrix scale. This is a defensible "make it positive
-        // definite by exactly the amount needed" rule, in contrast with
-        // condition-number sqrt heuristics that happen to land in the same
-        // ballpark only by coincidence.
-        let spd_floor = self.scale * 1e-8;
-        let mut next_ridge = if let Some((lam_min, _lam_max)) = symmetric_extremes(matrix) {
-            // δ = max(min_step, τ - λ_min). Multiply by a small safety
-            // factor (1.5×) on the deficit so a single eigensolver round-off
-            // does not leave us a hair below τ on the first retry.
-            let deficit = (spd_floor - lam_min).max(0.0);
-            let proposal = (1.5 * deficit).max(base * 1.5).max(min_step);
-            // Cap escalation per attempt so we don't shoot past what's
-            // needed when λ_min is wildly negative; the surrounding loop
-            // will re-bump up to MAX_FACTORIZATION_ATTEMPTS times.
-            proposal.min(base * 10.0)
-        } else {
-            f64::NAN
-        };
-
-        // Fallback rule: condition-number heuristic. Used only when the
-        // eigensolver itself failed (rare, usually means a non-finite
-        // matrix or extreme scaling).
-        if !next_ridge.is_finite() {
-            let cond_now = self.estimate_conditionwithridge(matrix, base);
-            self.cond_estimate = cond_now;
-            next_ridge = if let Some(cond) = cond_now {
-                let ratio = cond / HESSIAN_CONDITION_TARGET;
-                let mut multiplier = if ratio > 1.0 {
-                    ratio.sqrt().clamp(1.5, 10.0)
-                } else {
-                    (2.0 + self.attempts as f64).clamp(3.0, 10.0)
-                };
-                let mut proposal = base * multiplier;
-                if let Some(cond_next) = self.estimate_conditionwithridge(matrix, proposal)
-                    && cond_next > cond * 0.9
-                    && ratio > 1.0
-                {
-                    multiplier = (multiplier * 1.8).clamp(2.0, 10.0);
-                    proposal = base * multiplier;
-                }
-                proposal.max(min_step)
-            } else if self.ridge <= 0.0 {
-                min_step
-            } else {
-                (base * 10.0).max(min_step)
-            };
-        }
-
-        if !next_ridge.is_finite() || next_ridge <= 0.0 {
-            next_ridge = self.scale;
-        }
-
-        self.ridge = next_ridge;
-    }
-
-    pub fn attempts(&self) -> usize {
-        self.attempts
     }
 }
 
@@ -1566,25 +1398,9 @@ pub fn solve_dense_block_system(
     rhs: &Array1<f64>,
     context: &str,
 ) -> Result<Array1<f64>, String> {
-    let mut rhs2 = Array2::<f64>::zeros((rhs.len(), 1));
-    for i in 0..rhs.len() {
-        rhs2[[i, 0]] = rhs[i];
-    }
-    let factor =
-        factorize_symmetricwith_fallback(FaerArrayView::new(hessian).as_ref(), Side::Lower)
-            .map_err(|err| format!("{context} factorization failed: {err}"))?;
-    {
-        let mut rhs_view = array2_to_matmut(&mut rhs2);
-        factor.solve_in_place(rhs_view.as_mut());
-    }
-    let mut out = Array1::<f64>::zeros(rhs.len());
-    for i in 0..rhs.len() {
-        out[i] = rhs2[[i, 0]];
-    }
-    if out.iter().any(|v| !v.is_finite()) {
-        return Err(format!("{context} solve produced non-finite coefficients"));
-    }
-    Ok(out)
+    certified_symmetric_solve(hessian, rhs, context)
+        .map(CertifiedSymmetricSolution::into_solution)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

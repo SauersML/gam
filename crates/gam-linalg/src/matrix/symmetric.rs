@@ -3,6 +3,7 @@
 //! public paths `crate::matrix::{SymmetricMatrix, xt_diag_x_*, ...}` stay stable.
 
 use super::*;
+use crate::faer_ndarray::FaerCholesky;
 
 /// A unified representation of a symmetric matrix, typically an assembled Hessian.
 #[derive(Clone, Debug)]
@@ -91,6 +92,27 @@ impl SymmetricMatrix {
                     .map_err(|e| format!("Sparse SymmetricMatrix factorization failed: {e:?}"))?;
                 Ok(Box::new(factor))
             }
+        }
+    }
+
+    /// Strict factorization for covariance and other SPD-only estimands.
+    ///
+    /// No LDLT/LBLT route and no diagonal jitter is admitted: dense matrices
+    /// must pass an unperturbed Cholesky factorization, while sparse matrices
+    /// use the existing exact sparse-SPD factorization.
+    pub fn factorize_spd(&self) -> Result<Box<dyn FactorizedSystem>, String> {
+        match self {
+            Self::Dense(matrix) => matrix
+                .cholesky(faer::Side::Lower)
+                .map(|factor| Box::new(factor) as Box<dyn FactorizedSystem>)
+                .map_err(|error| {
+                    format!("Dense SymmetricMatrix strict SPD factorization failed: {error}")
+                }),
+            Self::Sparse(matrix) => crate::sparse_exact::factorize_sparse_spd(matrix)
+                .map(|factor| Box::new(factor) as Box<dyn FactorizedSystem>)
+                .map_err(|error| {
+                    format!("Sparse SymmetricMatrix strict SPD factorization failed: {error:?}")
+                }),
         }
     }
 

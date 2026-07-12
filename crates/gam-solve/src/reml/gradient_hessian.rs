@@ -2639,24 +2639,32 @@ impl<'a> RemlState<'a> {
             self.weights,
             -phi.ln(),
         )?;
-        let base_scaled_half_deviance = gam_linalg::pairwise_reduce::par_pairwise_sum(
-            base_rows.len(),
-            |i| base_rows[i].half_deviance,
-        );
-        if !base_scaled_half_deviance.is_finite() {
-            return Err(EstimationError::InvalidInput(format!(
-                "#784 base scaled half-deviance is not representable: {base_scaled_half_deviance}"
-            )));
-        }
+        let base_half_values: Vec<f64> =
+            base_rows.iter().map(|row| row.half_deviance).collect();
+        let base_scaled_half_deviance = crate::pirls::stable_finite_signed_sum(
+            &base_half_values,
+            "#784 base scaled half-deviance",
+        )?;
         let base_neg_score_at_mode =
             Array1::from_iter(base_rows.into_iter().map(|row| row.eta_score));
+        gam_linalg::matrix::FiniteSignedWeightsView::try_new(pirls_result.finalweights.view())
+            .map_err(EstimationError::InvalidInput)?;
+        let weights_obs = pirls_result.finalweights.to_owned();
+        let weights_obs_log_abs = weights_obs.mapv(|weight| {
+            if weight == 0.0 {
+                f64::NEG_INFINITY
+            } else {
+                weight.abs().ln()
+            }
+        });
 
         let target = Gam784BlockTarget {
             x_transformed: x_dense.as_ref(),
             block_vecs,
             block_lambdas,
             eta_hat,
-            weights_obs: pirls_result.finalweights.to_owned(),
+            weights_obs,
+            weights_obs_log_abs,
             y: self.y.to_owned(),
             prior_weights: self.weights.to_owned(),
             likelihood: self.config.likelihood.clone(),

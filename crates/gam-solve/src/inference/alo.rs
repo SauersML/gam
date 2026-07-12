@@ -91,9 +91,7 @@ pub struct AloDiagnostics {
     /// Frequentist sandwich-style standard error on eta:
     /// sqrt(phi * x_i^T H^{-1} X^T W X H^{-1} x_i).
     pub se_sandwich: Array1<f64>,
-    pub pred_identity: Array1<f64>,
     pub leverage: Array1<f64>,
-    pub fisherweights: Array1<f64>,
 }
 
 #[inline]
@@ -488,9 +486,6 @@ fn compute_alo_diagnostics_from_pirls_inner(
         }
     };
 
-    let e = &base.reparam_result.e_transformed;
-    let ridge = base.ridge_passport.laplacehessianridge().max(0.0);
-
     // ALO needs the exact penalized Hessian materialized densely for chunked
     // column solves via StableSolver.  The PIRLS export path validates the
     // matrix instead of falling back to a numerical Hessian approximation.
@@ -573,8 +568,6 @@ fn compute_alo_diagnostics_from_pirls_inner(
         offset: &alo_final_offset,
         link,
         phi,
-        penalty_root: if e.nrows() > 0 { Some(e) } else { None },
-        ridge,
         score_curvature: score_curvature_ref,
     };
 
@@ -727,11 +720,6 @@ pub struct AloInput<'a> {
     pub link: LinkFunction,
     /// Dispersion parameter φ. For non-Gaussian families this is 1.0.
     pub phi: f64,
-    /// Optional penalty square root E with E^T E = S(λ) (rank × p) for sandwich SE.
-    /// When `None`, sandwich SE is set equal to Bayesian SE.
-    pub penalty_root: Option<&'a Array2<f64>>,
-    /// Ridge added to the Hessian for logdet surface.
-    pub ridge: f64,
     /// Optional per-row score/curvature evaluator `(i, η) → (ℓ_i'(η), ℓ_i''(η))`.
     ///
     /// When supplied, the leave-`i`-out predictor is obtained by solving the
@@ -774,8 +762,6 @@ impl<'a> AloInput<'a> {
             offset,
             link,
             phi,
-            penalty_root: None,
-            ridge: 0.0,
             score_curvature: None,
         }
     }
@@ -820,8 +806,6 @@ impl<'a> AloInput<'a> {
             offset,
             link,
             phi,
-            penalty_root: None,
-            ridge: 0.0,
             score_curvature: None,
         }
     }
@@ -869,11 +853,9 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
     // per-observation loop: rhs_chunk_buf already holds X^T at the right cols.
     let mut rhs_chunk_buf = Array2::<f64>::zeros((p, block_cols).f());
     // Reusable faer column-major buffer for X*S, where S = H^{-1}X_i for the
-    // current RHS chunk.  The sandwich SE must use the same frozen-curvature
-    // meat as the exact LOO reference, `X' W X`, directly; reconstructing it as
-    // `H - S_penalty - ridge*I` is brittle because the exported stabilized
-    // Hessian may include curvature/stabilization details that are not exactly
-    // represented by the penalty root plus public ridge scalar.
+    // current RHS chunk. The sandwich SE uses the same frozen-curvature meat
+    // as the exact LOO reference, `X' W_S X`, directly; no redundant penalty
+    // root or ridge surrogate is carried through this API.
     let mut xs_chunk_storage = FaerMat::<f64>::zeros(n, block_cols);
     let x_dense_view = FaerArrayView::new(x_dense);
 
@@ -920,7 +902,13 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
                 let xval = rhs_slice[k];
                 x_hinv_x = sval.mul_add(xval, x_hinv_x);
             }
-            let ai = w_h[obs].max(0.0) * x_hinv_x;
+            // The bread uses the observed Hessian surface. For a non-canonical
+            // link W_H is signed, so the exact row leverage W_H,i x_i'H^-1x_i
+            // can be negative even though the assembled penalized H is SPD.
+            // Projecting that row to zero changes both the ALO denominator and
+            // corrected predictor; only the separate score-covariance meat is
+            // PSD (and uses W_S below).
+            let ai = w_h[obs] * x_hinv_x;
             aii[obs] = ai;
             x_hinv_x_diag[obs] = x_hinv_x;
 
@@ -1029,9 +1017,7 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
         eta_tilde,
         se_bayes,
         se_sandwich,
-        pred_identity: eta_hat.clone(),
         leverage: aii,
-        fisherweights: w_h.to_owned(),
     })
 }
 
@@ -1086,9 +1072,18 @@ fn validate_alo_solve_setup(input: &AloInput, n: usize, p: usize) -> Result<(), 
             reason: "ALO diagnostics require finite Hessian-side weights".to_string(),
         });
     }
-    if input.score_weights.view().iter().any(|v| !v.is_finite()) {
+    if let Some((row, value)) = input
+        .score_weights
+        .view()
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite() || *value < 0.0)
+    {
         return Err(AloError::WeightInvalid {
-            reason: "ALO diagnostics require finite score-side weights".to_string(),
+            reason: format!(
+                "ALO diagnostics require finite non-negative score-side weights; row {row} has {value:?}"
+            ),
         });
     }
     if input.working_response.iter().any(|v| !v.is_finite()) {
@@ -1108,29 +1103,6 @@ fn validate_alo_solve_setup(input: &AloInput, n: usize, p: usize) -> Result<(), 
                 input.phi
             ),
         });
-    }
-    if !input.ridge.is_finite() || input.ridge < 0.0 {
-        return Err(AloError::InvalidInput {
-            reason: format!(
-                "ALO diagnostics require a finite non-negative Hessian ridge; got {}",
-                input.ridge
-            ),
-        });
-    }
-    if let Some(e) = input.penalty_root {
-        if e.ncols() != p {
-            return Err(AloError::InvalidInput {
-                reason: format!(
-                    "ALO diagnostics require penalty root to have {p} columns; got {}",
-                    e.ncols()
-                ),
-            });
-        }
-        if e.iter().any(|v| !v.is_finite()) {
-            return Err(AloError::InvalidInput {
-                reason: "ALO diagnostics require finite penalty-root entries".to_string(),
-            });
-        }
     }
     Ok(())
 }
@@ -2106,8 +2078,6 @@ mod tests {
             offset: &offset,
             link: LinkFunction::Logit,
             phi: 1.0,
-            penalty_root: None,
-            ridge: 0.0,
             score_curvature: Some(&score_curvature),
         };
 
@@ -2198,8 +2168,6 @@ mod tests {
             offset: &offset,
             link: LinkFunction::Probit,
             phi,
-            penalty_root: None,
-            ridge: 0.0,
             score_curvature: None,
         };
 
@@ -2215,7 +2183,18 @@ mod tests {
                 "row {obs}: se_sandwich={} expected={expected}",
                 diag.se_sandwich[obs]
             );
+            let expected_leverage = w_h_vec[obs] * x[[obs, 0]] * x[[obs, 0]] / h;
+            assert!(
+                (diag.leverage[obs] - expected_leverage).abs()
+                    <= 1e-12 * expected_leverage.abs().max(1.0),
+                "row {obs}: signed leverage={} expected={expected_leverage}",
+                diag.leverage[obs]
+            );
         }
+        assert!(
+            diag.leverage[1] < 0.0,
+            "negative observed curvature must remain signed"
+        );
     }
 
     #[test]
