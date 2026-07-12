@@ -121,7 +121,7 @@ impl AnalyticPenalty for ARDPenalty {
         let n_obs = target.len() / d;
         let mut acc = 0.0;
         for j in 0..d {
-            let lam_j = resolve_learnable_weight(self.weight, rho[self.rho_indices[j]]);
+            let lam_j = validated_learnable_weight(self.weight, rho[self.rho_indices[j]]);
             let mut sq = 0.0;
             for n in 0..n_obs {
                 let v = target[n * d + j];
@@ -137,7 +137,7 @@ impl AnalyticPenalty for ARDPenalty {
         let n_obs = target.len() / d;
         let mut g = Array1::<f64>::zeros(target.len());
         for j in 0..d {
-            let lam_j = resolve_learnable_weight(self.weight, rho[self.rho_indices[j]]);
+            let lam_j = validated_learnable_weight(self.weight, rho[self.rho_indices[j]]);
             for n in 0..n_obs {
                 g[n * d + j] = lam_j * target[n * d + j];
             }
@@ -154,7 +154,7 @@ impl AnalyticPenalty for ARDPenalty {
         let n_obs = target.len() / d;
         let mut diag = Array1::<f64>::zeros(target.len());
         for j in 0..d {
-            let lam_j = resolve_learnable_weight(self.weight, rho[self.rho_indices[j]]);
+            let lam_j = validated_learnable_weight(self.weight, rho[self.rho_indices[j]]);
             for n in 0..n_obs {
                 diag[n * d + j] = lam_j;
             }
@@ -168,7 +168,7 @@ impl AnalyticPenalty for ARDPenalty {
         let n_obs = target.len() / d;
         let mut out = Array1::<f64>::zeros(self.rho_count());
         for j in 0..d {
-            let lam_j = resolve_learnable_weight(self.weight, rho[self.rho_indices[j]]);
+            let lam_j = validated_learnable_weight(self.weight, rho[self.rho_indices[j]]);
             let mut sq = 0.0;
             for n in 0..n_obs {
                 let v = target[n * d + j];

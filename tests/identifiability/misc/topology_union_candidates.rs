@@ -499,17 +499,12 @@ fn fit_union_candidate_prices_by_total_parameter_count() {
         fit.total_parameters, fit.fit.total_parameters,
         "rung total_parameters must mirror the inner UnionStructureFit"
     );
-    let per_point = union_per_point_log_density(
-        data.view(),
-        data.view(),
-        UnionStructure::CircleCircle,
-        cfg,
-    )
-    .expect("the fitted union must score its training rows");
+    let per_point =
+        union_per_point_log_density(data.view(), data.view(), UnionStructure::CircleCircle, cfg)
+            .expect("the fitted union must score its training rows");
     let log_likelihood: f64 = per_point.iter().sum();
     assert!(
-        (fit.fit.log_likelihood - log_likelihood).abs()
-            <= 1e-9 * (1.0 + log_likelihood.abs()),
+        (fit.fit.log_likelihood - log_likelihood).abs() <= 1e-9 * (1.0 + log_likelihood.abs()),
         "training and predictive paths must use the same normalized mixture likelihood"
     );
     let expected_bic =

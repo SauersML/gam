@@ -122,7 +122,7 @@ impl RowPrecisionPriorPenalty {
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
-            resolve_learnable_weight(self.weight, rho[self.rho_index])
+            validated_learnable_weight(self.weight, rho[self.rho_index])
         } else {
             self.weight
         }
@@ -348,6 +348,7 @@ impl AnalyticPenalty for RowPrecisionPriorPenalty {
     }
 
     impl_learnable_weight_rho_count!();
+    impl_learnable_weight_domain!(weight);
 
     fn name(&self) -> &str {
         "row_precision_prior"
@@ -501,7 +502,7 @@ impl IvaeRidgeMeanGauge {
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
-            resolve_learnable_weight(self.weight, rho[self.rho_index])
+            validated_learnable_weight(self.weight, rho[self.rho_index])
         } else {
             self.weight
         }
@@ -704,6 +705,7 @@ impl AnalyticPenalty for IvaeRidgeMeanGauge {
     }
 
     impl_learnable_weight_rho_count!();
+    impl_learnable_weight_domain!(weight);
 
     fn name(&self) -> &str {
         "ivae_ridge_mean_gauge"
@@ -938,14 +940,14 @@ impl ParametricRowPrecisionPriorPenalty {
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
-            resolve_learnable_weight(self.weight, rho[self.weight_offset()])
+            validated_learnable_weight(self.weight, rho[self.weight_offset()])
         } else {
             self.weight
         }
     }
 
     fn lambda_at(&self, n: usize, k: usize, rho: ArrayView1<'_, f64>) -> f64 {
-        let alpha = stable_exp_log_precision(self.active_log_alpha(k, rho));
+        let alpha = validated_exp_log_strength(self.active_log_alpha(k, rho));
         let beta = gam_linalg::utils::stable_softplus(self.active_raw_beta(k, rho));
         MIN_CONDITIONAL_PRECISION + alpha + beta * self.dist2(n, k, rho)
     }
@@ -1088,7 +1090,7 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
         let mut grad_weight_direct = 0.0;
         for k in 0..d {
             let log_alpha = self.active_log_alpha(k, rho);
-            let alpha = stable_exp_log_precision(log_alpha);
+            let alpha = validated_exp_log_strength(log_alpha);
             let raw_beta = self.active_raw_beta(k, rho);
             let beta = gam_linalg::utils::stable_softplus(raw_beta);
             let beta_jac = gam_linalg::utils::stable_logistic(raw_beta);

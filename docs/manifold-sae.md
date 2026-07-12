@@ -517,7 +517,7 @@ Returns a dict:
 | `headline` | `"stacking"` or `"evidence"` — which criterion produced the verdict |
 | `is_cross_class` | bool, the race crossed shape classes |
 | `matched_controls` | full verdicts after shuffling these supplied coordinates and replacing them by a covariance-matched Gaussian |
-| `control_false_circle_floor` | circular-win fraction across those two adjudicator-input controls |
+| `control_circular_win_fraction` | descriptive circular-win fraction across the two adjudicator-input controls (`0`, `1/2`, or `1`); not a false-positive-rate or floor estimate |
 | `dictionary_mean_l0` | the dictionary sparsity supplied alongside the rate |
 | `detection_floor` | Marchenko–Pastur reconstruction-energy threshold used by production rank pricing when `n_eff`, `ambient_p`, and `dispersion_r` are supplied together; otherwise `None`. Diagnostic only: the predictive shape race does not threshold on it. |
 
@@ -571,7 +571,8 @@ rules keep the verdict rates meaningful:
   false-circle floor (measured floors reached double digits), never raw.
 
 The controls embedded in `adjudicate_atom_shape` begin at its 2-D coordinate
-input, so they isolate the adjudicator's own false-circle floor. A full census
+input, so their two verdicts diagnose the adjudicator itself; their descriptive
+fraction is not a false-positive-rate estimate. A full census
 must also catch artifacts introduced by SAE training, co-activation grouping,
 and projection/subspace search. Use `run_shape_controlled_census` at pipeline
 entry. It invokes the exact same deterministic `(matrix, seed)` callback on the

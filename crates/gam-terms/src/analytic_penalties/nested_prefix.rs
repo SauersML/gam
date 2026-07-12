@@ -141,7 +141,7 @@ impl NestedPrefixPenalty {
         self.prefix_sizes
             .iter()
             .enumerate()
-            .map(|(k, _)| resolve_learnable_weight(self.shell_weights[k], rho[self.rho_indices[k]]))
+            .map(|(k, _)| validated_learnable_weight(self.shell_weights[k], rho[self.rho_indices[k]]))
             .collect()
     }
 

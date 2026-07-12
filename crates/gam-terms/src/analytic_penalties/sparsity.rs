@@ -405,7 +405,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     }
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
-        let lambda = resolve_learnable_weight(self.weight, rho[0]);
+        let lambda = validated_learnable_weight(self.weight, rho[0]);
         let n = target.len() / self.k_atoms;
         let values: Vec<f64> = target.iter().copied().collect();
         let mut acc = 0.0;
@@ -423,7 +423,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     }
 
     fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        let lambda = resolve_learnable_weight(self.weight, rho[0]);
+        let lambda = validated_learnable_weight(self.weight, rho[0]);
         let n = target.len() / self.k_atoms;
         let values: Vec<f64> = target.iter().copied().collect();
         let mut out = Array1::<f64>::zeros(target.len());
@@ -468,7 +468,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         // This matches `hvp(...) . e_k` analytically (see derivation in the
         // bug-fix comment on `hvp`) and gives Newton/Arrow-Schur callers a
         // principled diagonal surrogate without per-row dense factorization.
-        let lambda = resolve_learnable_weight(self.weight, rho[0]);
+        let lambda = validated_learnable_weight(self.weight, rho[0]);
         let inv_tau = 1.0 / self.temperature;
         let scale = lambda * inv_tau * inv_tau;
         let n = target.len() / self.k_atoms;
@@ -507,7 +507,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         below. `hessian_diag` returns the analytic diagonal extracted from
         this HVP by setting v = e_k row-by-row.
         */
-        let lambda = resolve_learnable_weight(self.weight, rho[0]);
+        let lambda = validated_learnable_weight(self.weight, rho[0]);
         assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
         let n = target.len() / self.k_atoms;
         let values: Vec<f64> = target.iter().copied().collect();
@@ -561,7 +561,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         // (see `psd_majorizer_abs_row_sums`): a genuine PSD diagonal with
         // `D ⪰ H` and `D ⪰ 0`. Coordinate-indexed, so the inherited
         // `psd_majorizer_hvp` applies `D` as a diagonal operator consistently.
-        let lambda = resolve_learnable_weight(self.weight, rho[0]);
+        let lambda = validated_learnable_weight(self.weight, rho[0]);
         let inv_tau = 1.0 / self.temperature;
         let scale = lambda * inv_tau * inv_tau;
         let n = target.len() / self.k_atoms;
@@ -656,7 +656,7 @@ impl SparsityPenalty {
 
     /// Resolve `(strength, eps_or_delta)` from the current ρ view.
     fn resolved(&self, rho: ArrayView1<'_, f64>) -> (f64, f64) {
-        let strength = resolve_learnable_weight(self.weight, rho[self.strength_rho_index]);
+        let strength = validated_learnable_weight(self.weight, rho[self.strength_rho_index]);
         let smoothing = match (self.eps_rho_index, self.kind) {
             // A learnable smoothing `exp(rho)` underflows to exact `0.0` for
             // `rho ≲ -745`, which reintroduces a non-differentiable kink and a
@@ -1174,7 +1174,7 @@ impl SmoothThresholdPenalty {
         // A learnable threshold `θ·exp(rho)` overflows to `inf` for large `rho`;
         // the downstream gate `σ((l−θ)/τ)` then evaluates `inf·gate = NaN`. Clamp
         // the log-magnitude so the threshold stays a finite normal.
-        resolve_learnable_weight(self.thresholds[axis], rho[axis])
+        validated_learnable_weight(self.thresholds[axis], rho[axis])
     }
 
     pub(crate) fn sigmoid_gate(&self, x: f64) -> f64 {

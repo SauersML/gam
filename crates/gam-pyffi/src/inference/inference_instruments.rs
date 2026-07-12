@@ -1690,12 +1690,12 @@ mod tests {
     /// #2262 structureless-null control: on pure isotropic Gaussian noise (no
     /// ring, no cluster structure whatsoever) both matched controls must still
     /// run cleanly end to end and produce a well-formed
-    /// `control_false_circle_floor` in `{0.0, 0.5, 1.0}` — the exact quantity
-    /// the issue's false-circle-floor claim is built from. This exercises the
+    /// `control_circular_win_fraction` in `{0.0, 0.5, 1.0}` — a descriptive
+    /// two-control result, not a false-positive-rate or floor estimate. This exercises the
     /// SAME `matched_control_verdicts` path `adjudicate_atom_shape` calls, just
     /// without the Python boundary.
     #[test]
-    fn matched_controls_report_a_well_formed_false_circle_floor_on_pure_noise_2262() {
+    fn matched_controls_report_a_well_formed_circular_win_fraction_on_pure_noise_2262() {
         use rand::SeedableRng;
         use rand::rngs::StdRng;
         use rand_distr::{Distribution, Normal};
@@ -1713,14 +1713,15 @@ mod tests {
         // second free-mixture candidate. The race must remove that duplicate
         // before fitting and stacking.
         let ladder = [1usize, 5, 7, 9];
-        let (shuffle_verdict, gaussian_verdict, false_circle_floor) = matched_control_verdicts(
-            coords.view(),
-            5,
-            2262,
-            &ladder,
-            Some(80.0), // plausible healthy-dictionary mean L0
-        )
-        .expect("matched controls must run cleanly on pure noise, not error out");
+        let (shuffle_verdict, gaussian_verdict, control_circular_win_fraction) =
+            matched_control_verdicts(
+                coords.view(),
+                5,
+                2262,
+                &ladder,
+                Some(80.0), // plausible healthy-dictionary mean L0
+            )
+            .expect("matched controls must run cleanly on pure noise, not error out");
 
         assert!(
             shuffle_verdict.mixture_reporting_k >= 2 && gaussian_verdict.mixture_reporting_k >= 2,
@@ -1728,21 +1729,21 @@ mod tests {
         );
 
         assert!(
-            (0.0..=1.0).contains(&false_circle_floor),
-            "false-circle floor must be a rate in [0, 1]: {false_circle_floor}"
+            (0.0..=1.0).contains(&control_circular_win_fraction),
+            "two-control circular-win fraction must lie in [0, 1]: {control_circular_win_fraction}"
         );
         assert!(
-            (false_circle_floor - 0.0).abs() < 1e-12
-                || (false_circle_floor - 0.5).abs() < 1e-12
-                || (false_circle_floor - 1.0).abs() < 1e-12,
-            "false-circle floor must be exactly {{0, 1/2, 1}} for a two-control average: got {false_circle_floor}"
+            (control_circular_win_fraction - 0.0).abs() < 1e-12
+                || (control_circular_win_fraction - 0.5).abs() < 1e-12
+                || (control_circular_win_fraction - 1.0).abs() < 1e-12,
+            "two-control circular-win fraction must be exactly {{0, 1/2, 1}}: got {control_circular_win_fraction}"
         );
         assert_eq!(
-            false_circle_floor,
+            control_circular_win_fraction,
             (usize::from(shuffle_verdict.circle_wins) + usize::from(gaussian_verdict.circle_wins))
                 as f64
                 / 2.0,
-            "reported floor must equal the mean of the two controls' own circle_wins flags"
+            "reported fraction must equal the mean of the two controls' own circle_wins flags"
         );
 
         // mean_l0 is mandatory: omitting it must be a clean error, not a panic
@@ -2691,8 +2692,9 @@ fn run_atom_shape_race(
 
 /// Run the two matched structureless controls (#2262) for one shape
 /// adjudication and return `(shuffle_verdict, gaussian_verdict,
-/// false_circle_floor)`. Pulled out of the pyfunction body so it is directly
-/// unit-testable on pure-noise fixtures without a Python interpreter.
+/// control_circular_win_fraction)`. The last value is descriptive across the
+/// two controls, not an estimated false-positive rate. Pulled out of the
+/// pyfunction body so it is directly unit-testable without Python.
 fn matched_control_verdicts(
     coords_view: ArrayView2<'_, f64>,
     folds: usize,
@@ -2716,10 +2718,14 @@ fn matched_control_verdicts(
     let gaussian = covariance_matched_gaussian_null(coords_view, seed ^ 0xC0A4_71A1)?;
     let shuffle_verdict = run_atom_shape_race(shuffled.view(), folds, seed, ladder)?;
     let gaussian_verdict = run_atom_shape_race(gaussian.view(), folds, seed, ladder)?;
-    let false_circle_floor = (usize::from(shuffle_verdict.circle_wins)
+    let control_circular_win_fraction = (usize::from(shuffle_verdict.circle_wins)
         + usize::from(gaussian_verdict.circle_wins)) as f64
         / 2.0;
-    Ok((shuffle_verdict, gaussian_verdict, false_circle_floor))
+    Ok((
+        shuffle_verdict,
+        gaussian_verdict,
+        control_circular_win_fraction,
+    ))
 }
 
 fn shape_detection_floor(
@@ -2877,7 +2883,8 @@ pub(crate) fn shape_matched_control_f32<'py>(
 /// default, the identical race also runs on an independent per-dimension
 /// shuffle and a covariance-matched Gaussian of these supplied coordinates;
 /// `mean_l0` is then required and is emitted beside this adjudicator-input
-/// false-circle floor. To audit artifacts introduced by earlier
+/// two-control circular-win fraction. That `{0, 1/2, 1}` value is descriptive,
+/// not a false-positive-rate estimate. To audit artifacts introduced by earlier
 /// SAE/grouping/PCA stages, generate each control at the pipeline entry with
 /// [`shape_matched_control`] and rerun every stage. Non-dictionary callers can
 /// explicitly disable `matched_controls` and receive no control-rate claim.
@@ -2927,7 +2934,7 @@ pub(crate) fn adjudicate_atom_shape<'py>(
     out.set_item("detection_floor", detection_floor)?;
 
     if matched_controls {
-        let (shuffle_verdict, gaussian_verdict, false_circle_floor) =
+        let (shuffle_verdict, gaussian_verdict, control_circular_win_fraction) =
             matched_control_verdicts(coords_view, folds, seed, &ladder, mean_l0)
                 .map_err(py_value_error)?;
         let controls = PyDict::new(py);
@@ -2940,10 +2947,13 @@ pub(crate) fn adjudicate_atom_shape<'py>(
             atom_shape_verdict_dict(py, &gaussian_verdict)?,
         )?;
         out.set_item("matched_controls", controls)?;
-        out.set_item("control_false_circle_floor", false_circle_floor)?;
+        out.set_item(
+            "control_circular_win_fraction",
+            control_circular_win_fraction,
+        )?;
     } else {
         out.set_item("matched_controls", py.None())?;
-        out.set_item("control_false_circle_floor", py.None())?;
+        out.set_item("control_circular_win_fraction", py.None())?;
     }
     Ok(out)
 }

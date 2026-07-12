@@ -87,6 +87,13 @@ def test_shape_controlled_census_rejects_ambiguous_seeds_and_bad_data() -> None:
         gamfit.run_shape_controlled_census(np.ones((4, 2)), pipeline, control_seed=True)
     with pytest.raises(ValueError, match="pipeline_seed"):
         gamfit.run_shape_controlled_census(np.ones((4, 2)), pipeline, pipeline_seed=-1)
+    accepted = gamfit.run_shape_controlled_census(
+        np.ones((4, 2)),
+        pipeline,
+        control_seed=np.uint64(17),
+        pipeline_seed=np.int64(23),
+    )
+    assert accepted.pipeline_seed == 23
     with pytest.raises(ValueError, match="finite"):
         gamfit.run_shape_controlled_census(
             np.array([[1.0, np.nan], [2.0, 3.0]]), pipeline
@@ -94,6 +101,10 @@ def test_shape_controlled_census_rejects_ambiguous_seeds_and_bad_data() -> None:
     with pytest.raises(TypeError, match="complex dtype"):
         gamfit.run_shape_controlled_census(
             np.ones((4, 2), dtype=np.complex64) * (1.0 + 2.0j), pipeline
+        )
+    with pytest.raises(TypeError, match="complex dtype"):
+        gamfit.run_shape_controlled_census(
+            [[1.0 + 2.0j, 3.0], [4.0, 5.0]], pipeline
         )
 
 

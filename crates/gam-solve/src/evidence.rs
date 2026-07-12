@@ -1106,8 +1106,7 @@ impl GaussianComponentEval {
         for axis in 0..d {
             precision[[axis, axis]] = inverse_variance;
         }
-        let log_norm =
-            -0.5 * d as f64 * ((2.0 * std::f64::consts::PI).ln() + variance.ln());
+        let log_norm = -0.5 * d as f64 * ((2.0 * std::f64::consts::PI).ln() + variance.ln());
         if !log_norm.is_finite() {
             return Err("isotropic Gaussian log normalizer is non-finite".to_string());
         }
@@ -2777,9 +2776,9 @@ pub fn union_responsibility_split(
 /// every unique role permutation. Each assignment is then scored as one
 /// normalized soft mixture on every training row.
 ///
-/// Returns an error if any component group is too small to identify its
-/// structure (so an over-priced or non-identifiable composite simply does not
-/// enter the race rather than scoring spuriously well).
+/// Returns an error if no role assignment identifies every component. The
+/// fixed-ladder caller propagates that failure for the whole declared family;
+/// it never ranks a survivor subset.
 pub fn fit_union_structure(
     data: ArrayView2<'_, f64>,
     structure: UnionStructure,
@@ -2976,8 +2975,7 @@ fn fit_union_density_from_groups(
             if !log_likelihood.is_finite() {
                 return Err("union training log likelihood is non-finite".to_string());
             }
-            let bic = -log_likelihood
-                + 0.5 * total_parameters as f64 * (train.nrows() as f64).ln();
+            let bic = -log_likelihood + 0.5 * total_parameters as f64 * (train.nrows() as f64).ln();
             if !bic.is_finite() {
                 return Err("union normalized soft-mixture BIC is non-finite".to_string());
             }
@@ -3195,6 +3193,9 @@ fn fit_isotropic_gaussian_component(
         if !mean[axis].is_finite() {
             return Err("union isotropic point mean is non-finite".to_string());
         }
+        // Residuals and the eventual evaluator must refer to the same rounded,
+        // representable mean parameter.
+        mean_offset[axis] = mean[axis] - origin[axis];
     }
 
     let scalar_count = n
@@ -3215,11 +3216,10 @@ fn fit_isotropic_gaussian_component(
     let variance = if residual_scale == 0.0 {
         covariance_floor
     } else {
-        let normalized_squares = residuals
-            .iter()
-            .map(|residual| (residual / residual_scale).powi(2))
-            .collect::<Vec<_>>();
-        let normalized_mean_square = pairwise_sum(&normalized_squares) / scalar_count as f64;
+        for residual in &mut residuals {
+            *residual = (*residual / residual_scale).powi(2);
+        }
+        let normalized_mean_square = pairwise_sum(&residuals) / scalar_count as f64;
         let rms = residual_scale * normalized_mean_square.sqrt();
         let unconstrained = rms * rms;
         if !unconstrained.is_finite() {
@@ -3236,6 +3236,9 @@ fn score_union_components(
 ) -> Result<Array1<f64>, String> {
     if components.is_empty() {
         return Err("union density requires at least one component".to_string());
+    }
+    if eval.iter().any(|coordinate| !coordinate.is_finite()) {
+        return Err("union eval coordinates must be finite".to_string());
     }
     for component in components {
         if component.dimension() != eval.ncols() {
@@ -5968,10 +5971,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(forward.components[0].kind, UnionComponentKind::Circle);
-        assert_eq!(
-            forward.components[1].kind,
-            UnionComponentKind::PointCluster
-        );
+        assert_eq!(forward.components[1].kind, UnionComponentKind::PointCluster);
         assert_eq!(
             reversed.components[0].kind,
             UnionComponentKind::PointCluster
@@ -6032,7 +6032,10 @@ mod tests {
             GaussianMixtureConfig::default(),
         )
         .unwrap();
-        assert_eq!(reversed.components[0].kind, UnionComponentKind::PointCluster);
+        assert_eq!(
+            reversed.components[0].kind,
+            UnionComponentKind::PointCluster
+        );
         assert_eq!(reversed.components[1].kind, UnionComponentKind::Line);
         assert!((fit.bic - reversed.bic).abs() <= 1.0e-12 * (1.0 + fit.bic.abs()));
     }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Callable, Generic, TypeVar
 
 import numpy as np
@@ -38,11 +39,12 @@ class ShapeControlledCensus(Generic[_ResultT]):
 
 
 def _u64(value: int, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
         raise TypeError(f"{name} must be an integer in [0, 2**64 - 1]")
-    if not 0 <= value <= _U64_MAX:
-        raise ValueError(f"{name} must be in [0, 2**64 - 1]; got {value}")
-    return value
+    result = int(value)
+    if not 0 <= result <= _U64_MAX:
+        raise ValueError(f"{name} must be in [0, 2**64 - 1]; got {result}")
+    return result
 
 
 def _require_finite(matrix: _ControlMatrix) -> None:
@@ -97,6 +99,13 @@ def run_shape_controlled_census(
         input_dtype = np.dtype(declared_dtype) if declared_dtype is not None else None
     except TypeError:
         input_dtype = None
+    normalized_input = data
+    # Array-like containers such as nested Python lists have no declared dtype.
+    # Materialize them once without coercion so complex values are rejected
+    # rather than silently losing their imaginary part in a float conversion.
+    if input_dtype is None:
+        normalized_input = np.asarray(data)
+        input_dtype = normalized_input.dtype
     if input_dtype is not None and input_dtype.kind == "c":
         raise TypeError(
             f"data must be real-valued; complex dtype {input_dtype} is not supported"
@@ -110,7 +119,7 @@ def run_shape_controlled_census(
     # np.asarray reuses an already native C-contiguous array and performs the
     # only normalization allocation otherwise. A view lets us enforce an
     # internal read-only contract without changing the caller's writeable flag.
-    normalized = np.asarray(data, dtype=source_dtype, order="C")
+    normalized = np.asarray(normalized_input, dtype=source_dtype, order="C")
     source = normalized.view()
     if source.ndim != 2 or source.shape[0] == 0 or source.shape[1] == 0:
         raise ValueError(

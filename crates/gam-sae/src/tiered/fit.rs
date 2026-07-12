@@ -302,7 +302,11 @@ mod fit_tests {
         }
         let mut config = TieredFitConfig::linear_bulk(3, 2);
         config.tier1.block_topk = 2;
-        config.tier1.max_epochs = 8;
+        // K=6 over ~2 planted planes leaves under-utilised blocks; give the frame
+        // fixed point AuxK revival + enough epochs to certify (the same budget the
+        // block-lane `coordinate_partition_seed_fits_end_to_end` test certifies at).
+        config.tier1.aux_k = 3;
+        config.tier1.max_epochs = 200;
 
         let report = fit_tiered(z.view(), &config).expect("tiered fit runs");
         assert!(
@@ -351,14 +355,19 @@ mod fit_tests {
         // all six circles plus the bulk.
         let mut lin = TieredFitConfig::linear_bulk(8, 2);
         lin.tier1.block_topk = 7;
-        lin.tier1.max_epochs = 20;
+        // 8 blocks over 7 planes (6 circles + bulk) leaves a spare block; AuxK
+        // revival + enough epochs let the frame fixed point certify so fit_tiered
+        // returns rather than erroring on non-convergence.
+        lin.tier1.aux_k = 3;
+        lin.tier1.max_epochs = 200;
         let lin_report = fit_tiered(z.view(), &lin).expect("linear-bulk fit runs");
         let ev_lin = lin_report.explained_variance;
 
         // Tiered (Tier-1 + Tier-2 curved co-fit on the residual): same Tier-1.
         let mut tiered = TieredFitConfig::tiered(8, 2);
         tiered.tier1.block_topk = 7;
-        tiered.tier1.max_epochs = 20;
+        tiered.tier1.aux_k = 3;
+        tiered.tier1.max_epochs = 200;
         let report = fit_tiered(z.view(), &tiered).expect("tiered fit runs");
 
         assert_eq!(
@@ -442,7 +451,11 @@ mod fit_tests {
         let mut config = TieredFitConfig::tiered(8, 2);
         config.tier1_seed = TieredSeedPolicy::CoordinatePartition;
         config.tier1.block_topk = 7;
-        config.tier1.max_epochs = 20;
+        // The coordinate seed is a colder start than farthest-point, so give the
+        // frame fixed point AuxK revival + enough epochs to certify (Tier-1 must
+        // return Ok for the Tier-2 co-fit to run).
+        config.tier1.aux_k = 3;
+        config.tier1.max_epochs = 200;
         let report =
             fit_tiered(z.view(), &config).expect("coordinate-seeded tiered fit runs end to end");
         assert!(

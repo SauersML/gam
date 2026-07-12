@@ -156,7 +156,7 @@ impl OrderedBetaBernoulliPenalty {
 
     fn resolved_alpha(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_alpha {
-            resolve_learnable_weight(self.alpha, rho[0])
+            validated_learnable_weight(self.alpha, rho[0])
         } else {
             self.alpha
         }
