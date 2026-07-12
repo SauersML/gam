@@ -85,11 +85,11 @@ class FactorInstance:
     def draw(
         self, rng: np.random.Generator, n: int
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return ambient contribution, intrinsic parameters, and native points."""
+        """Return ambient contribution, intrinsic parameters, and raw native points."""
         raw, theta = ZOO[self.kind].sampler(rng, n)
         validate_analytic_sample(self.kind, raw, theta)
         local = (raw - self.mu[None, :]) / self.sigma
-        return local @ self.frame, theta, local
+        return local @ self.frame, theta, raw
 
 
 class ZooData:
@@ -158,6 +158,11 @@ class ZooData:
                 )
         for kind in kinds:
             zoo = ZOO[kind]
+            if d_ambient < zoo.span_dim:
+                raise ValueError(
+                    f"ambient dimension {d_ambient} cannot isometrically embed "
+                    f"{kind} with native span {zoo.span_dim}"
+                )
             raw, calibration_parameters = zoo.sampler(rng, _CALIBRATION_N)
             validate_analytic_sample(kind, raw, calibration_parameters)
             mu = raw.mean(axis=0)
@@ -229,11 +234,11 @@ class ZooData:
                             "rows": idx,
                             "m": np.zeros((0, self.d_ambient)),
                             "theta": np.zeros((0, ZOO[factor.kind].intrinsic_dim)),
-                            "local": np.zeros((0, ZOO[factor.kind].span_dim)),
+                            "native": np.zeros((0, ZOO[factor.kind].span_dim)),
                         }
                     )
                 continue
-            m_i, theta, local = factor.draw(rng, idx.size)
+            m_i, theta, native = factor.draw(rng, idx.size)
             if self.dgp == "llm":
                 # Mean-one lognormal amplitude per firing, scaled by the
                 # feature's power-law importance; the ground-truth
@@ -243,11 +248,15 @@ class ZooData:
                     size=idx.size,
                 )
                 m_i = amps[:, None] * m_i
-                local = amps[:, None] * local
             x[idx] += m_i
             if contribs is not None:
                 contribs.append(
-                    {"rows": idx, "m": m_i, "theta": theta, "local": local}
+                    {
+                        "rows": idx,
+                        "m": m_i,
+                        "theta": theta,
+                        "native": native,
+                    }
                 )
         if self.dgp == "llm" and self.noise > 0.0:
             # Dense unstructured residual — deliberately NOT part of any
@@ -621,7 +630,7 @@ def dump_clouds(
         if rows.size > max_points:
             take = np.random.default_rng(0).choice(rows.size, size=max_points, replace=False)
         factor = data.factors[i]
-        true_local = contribs[i]["local"][take]
+        true_native = contribs[i]["native"][take]
         if isinstance(p["matched_atom"], list):
             _, m_hat_all = _greedy_flat_match(
                 fitted, rows, contribs[i]["m"], ZOO[p["kind"]].span_dim
@@ -634,7 +643,6 @@ def dump_clouds(
         # analytic coordinates. No displayed-point PCA, SVD, UMAP, or learned
         # projection is involved.
         recovered_local = m_hat @ factor.frame.T
-        true_native = true_local * factor.sigma + factor.mu[None, :]
         recovered_native = recovered_local * factor.sigma + factor.mu[None, :]
         validate_analytic_sample(p["kind"], true_native, contribs[i]["theta"][take])
         payload[f"true_{i}"] = true_native.astype(np.float32)

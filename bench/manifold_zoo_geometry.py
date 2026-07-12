@@ -25,78 +25,108 @@ class ZooType:
     sampler: Sampler
 
 
+def analytic_points(kind: str, parameters: np.ndarray) -> np.ndarray:
+    """Evaluate one zoo object's canonical analytic parameterization."""
+    parameters = np.asarray(parameters, dtype=float)
+    if parameters.ndim != 2:
+        raise ValueError(f"{kind} parameters must be a matrix; got {parameters.shape}")
+    if kind == "segment":
+        return parameters[:, :1].copy()
+    if kind == "circle":
+        angle = parameters[:, 0]
+        return np.column_stack((np.cos(angle), np.sin(angle)))
+    if kind == "disk":
+        radius, angle = parameters.T
+        return np.column_stack((radius * np.cos(angle), radius * np.sin(angle)))
+    if kind == "sphere":
+        polar, azimuth = parameters.T
+        return np.column_stack(
+            (
+                np.sin(polar) * np.cos(azimuth),
+                np.sin(polar) * np.sin(azimuth),
+                np.cos(polar),
+            )
+        )
+    if kind == "torus":
+        azimuth, tube_angle = parameters.T
+        ring_radius = 1.0 + 0.4 * np.cos(tube_angle)
+        return np.column_stack(
+            (
+                ring_radius * np.cos(azimuth),
+                ring_radius * np.sin(azimuth),
+                0.4 * np.sin(tube_angle),
+            )
+        )
+    if kind == "mobius":
+        angle, width = parameters.T
+        radial = 1.0 + width * np.cos(0.5 * angle)
+        return np.column_stack(
+            (
+                radial * np.cos(angle),
+                radial * np.sin(angle),
+                width * np.sin(0.5 * angle),
+            )
+        )
+    if kind == "swiss":
+        angle, height = parameters.T
+        return np.column_stack((angle * np.cos(angle), height, angle * np.sin(angle)))
+    if kind == "helix":
+        angle = parameters[:, 0]
+        return np.column_stack((np.cos(angle), np.sin(angle), 0.25 * angle))
+    raise ValueError(f"unknown analytic zoo kind {kind!r}")
+
+
 def _segment(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
     t = rng.uniform(-1.0, 1.0, size=n)
-    return t[:, None], t[:, None]
+    parameters = t[:, None]
+    return analytic_points("segment", parameters), parameters
 
 
 def _circle(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
     angle = rng.uniform(0.0, 2.0 * np.pi, size=n)
-    points = np.column_stack((np.cos(angle), np.sin(angle)))
-    return points, angle[:, None]
+    parameters = angle[:, None]
+    return analytic_points("circle", parameters), parameters
 
 
 def _disk(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
     angle = rng.uniform(0.0, 2.0 * np.pi, size=n)
     radius = np.sqrt(rng.uniform(0.0, 1.0, size=n))
-    points = np.column_stack((radius * np.cos(angle), radius * np.sin(angle)))
-    return points, np.column_stack((radius, angle))
+    parameters = np.column_stack((radius, angle))
+    return analytic_points("disk", parameters), parameters
 
 
 def _sphere(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
     azimuth = rng.uniform(0.0, 2.0 * np.pi, size=n)
     polar = np.arccos(rng.uniform(-1.0, 1.0, size=n))
-    points = np.column_stack(
-        (
-            np.sin(polar) * np.cos(azimuth),
-            np.sin(polar) * np.sin(azimuth),
-            np.cos(polar),
-        )
-    )
-    return points, np.column_stack((polar, azimuth))
+    parameters = np.column_stack((polar, azimuth))
+    return analytic_points("sphere", parameters), parameters
 
 
 def _torus(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
-    major_radius = 1.0
-    minor_radius = 0.4
     azimuth = rng.uniform(0.0, 2.0 * np.pi, size=n)
     tube_angle = rng.uniform(0.0, 2.0 * np.pi, size=n)
-    ring_radius = major_radius + minor_radius * np.cos(tube_angle)
-    points = np.column_stack(
-        (
-            ring_radius * np.cos(azimuth),
-            ring_radius * np.sin(azimuth),
-            minor_radius * np.sin(tube_angle),
-        )
-    )
-    return points, np.column_stack((azimuth, tube_angle))
+    parameters = np.column_stack((azimuth, tube_angle))
+    return analytic_points("torus", parameters), parameters
 
 
 def _mobius(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
     angle = rng.uniform(0.0, 2.0 * np.pi, size=n)
     width = rng.uniform(-0.5, 0.5, size=n)
-    radial = 1.0 + width * np.cos(0.5 * angle)
-    points = np.column_stack(
-        (
-            radial * np.cos(angle),
-            radial * np.sin(angle),
-            width * np.sin(0.5 * angle),
-        )
-    )
-    return points, np.column_stack((angle, width))
+    parameters = np.column_stack((angle, width))
+    return analytic_points("mobius", parameters), parameters
 
 
 def _swiss_roll(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
     angle = rng.uniform(1.5 * np.pi, 4.5 * np.pi, size=n)
     height = rng.uniform(-1.0, 1.0, size=n)
-    points = np.column_stack((angle * np.cos(angle), height, angle * np.sin(angle)))
-    return points, np.column_stack((angle, height))
+    parameters = np.column_stack((angle, height))
+    return analytic_points("swiss", parameters), parameters
 
 
 def _helix(rng: np.random.Generator, n: int) -> tuple[np.ndarray, np.ndarray]:
     angle = rng.uniform(0.0, 4.0 * np.pi, size=n)
-    points = np.column_stack((np.cos(angle), np.sin(angle), 0.25 * angle))
-    return points, angle[:, None]
+    parameters = angle[:, None]
+    return analytic_points("helix", parameters), parameters
 
 
 ZOO_ORDER = ("segment", "circle", "disk", "sphere", "torus", "mobius", "swiss", "helix")
@@ -114,6 +144,28 @@ ZOO: dict[str, ZooType] = {
     )
 }
 CURVED_CYCLE = list(ZOO_ORDER[1:])
+
+
+def first_coordinate_hue(kind: str, parameters: np.ndarray) -> np.ndarray:
+    """Normalize the first planted coordinate on its exact analytic domain."""
+    if parameters.ndim != 2 or parameters.shape[1] != ZOO[kind].intrinsic_dim:
+        raise ValueError(f"invalid {kind} parameter block {parameters.shape}")
+    value = parameters[:, 0]
+    if kind == "segment":
+        hue = 0.5 * (value + 1.0)
+    elif kind in {"circle", "torus", "mobius"}:
+        hue = value / (2.0 * np.pi)
+    elif kind == "disk":
+        hue = value
+    elif kind == "sphere":
+        hue = value / np.pi
+    elif kind == "swiss":
+        hue = (value - 1.5 * np.pi) / (3.0 * np.pi)
+    elif kind == "helix":
+        hue = value / (4.0 * np.pi)
+    else:
+        raise ValueError(f"unknown analytic zoo kind {kind!r}")
+    return np.clip(hue, 0.0, 1.0)
 
 
 def validate_analytic_sample(
@@ -136,55 +188,32 @@ def validate_analytic_sample(
     if not np.isfinite(points).all() or not np.isfinite(parameters).all():
         raise ValueError(f"{kind} sampler returned non-finite values")
 
+    tau = 2.0 * np.pi
     if kind == "segment":
-        expected = parameters[:, :1]
+        domains = ((-1.0, 1.0),)
     elif kind == "circle":
-        angle = parameters[:, 0]
-        expected = np.column_stack((np.cos(angle), np.sin(angle)))
+        domains = ((0.0, tau),)
     elif kind == "disk":
-        radius, angle = parameters.T
-        if np.any((radius < 0.0) | (radius > 1.0)):
-            raise ValueError("disk radius escaped [0, 1]")
-        expected = np.column_stack((radius * np.cos(angle), radius * np.sin(angle)))
+        domains = ((0.0, 1.0), (0.0, tau))
     elif kind == "sphere":
-        polar, azimuth = parameters.T
-        expected = np.column_stack(
-            (
-                np.sin(polar) * np.cos(azimuth),
-                np.sin(polar) * np.sin(azimuth),
-                np.cos(polar),
-            )
-        )
+        domains = ((0.0, np.pi), (0.0, tau))
     elif kind == "torus":
-        azimuth, tube_angle = parameters.T
-        ring_radius = 1.0 + 0.4 * np.cos(tube_angle)
-        expected = np.column_stack(
-            (
-                ring_radius * np.cos(azimuth),
-                ring_radius * np.sin(azimuth),
-                0.4 * np.sin(tube_angle),
-            )
-        )
+        domains = ((0.0, tau), (0.0, tau))
     elif kind == "mobius":
-        angle, width = parameters.T
-        radial = 1.0 + width * np.cos(0.5 * angle)
-        expected = np.column_stack(
-            (
-                radial * np.cos(angle),
-                radial * np.sin(angle),
-                width * np.sin(0.5 * angle),
-            )
-        )
+        domains = ((0.0, tau), (-0.5, 0.5))
     elif kind == "swiss":
-        angle, height = parameters.T
-        expected = np.column_stack((angle * np.cos(angle), height, angle * np.sin(angle)))
+        domains = ((1.5 * np.pi, 4.5 * np.pi), (-1.0, 1.0))
     elif kind == "helix":
-        angle = parameters[:, 0]
-        expected = np.column_stack((np.cos(angle), np.sin(angle), 0.25 * angle))
+        domains = ((0.0, 4.0 * np.pi),)
     else:
         raise ValueError(f"unknown analytic zoo kind {kind!r}")
+    for axis, (lower, upper) in enumerate(domains):
+        values = parameters[:, axis]
+        if np.any((values < lower - atol) | (values > upper + atol)):
+            raise ValueError(f"{kind} parameter axis {axis} escaped [{lower}, {upper}]")
+
+    expected = analytic_points(kind, parameters)
 
     error = float(np.max(np.abs(points - expected), initial=0.0))
     if error > atol:
         raise ValueError(f"{kind} defining-equation error {error:.3e} exceeds {atol:.3e}")
-

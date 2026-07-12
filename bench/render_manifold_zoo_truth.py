@@ -13,13 +13,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from bench.manifold_zoo_geometry import ZOO, ZOO_ORDER, validate_analytic_sample
+from bench.manifold_zoo_geometry import (
+    ZOO,
+    ZOO_ORDER,
+    first_coordinate_hue,
+    validate_analytic_sample,
+)
 
 
 CAMERAS = {
     "segment": (20, -58),
-    "circle": (25, -58),
-    "disk": (55, -70),
+    "circle": (90, -90),
+    "disk": (90, -90),
     "sphere": (20, -42),
     "torus": (28, -52),
     "mobius": (26, -62),
@@ -44,8 +49,7 @@ def _pad(points: np.ndarray) -> np.ndarray:
 
 def _scatter(ax: Any, kind: str, points: np.ndarray, parameters: np.ndarray) -> None:
     cloud = _pad(points)
-    hue = parameters[:, 0]
-    hue = (hue - hue.min()) / max(float(np.ptp(hue)), 1.0e-12)
+    hue = first_coordinate_hue(kind, parameters)
     cmap = "twilight" if kind in {"circle", "torus", "mobius"} else "viridis"
     ax.scatter(
         cloud[:, 0],
@@ -126,4 +130,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

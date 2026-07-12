@@ -40,6 +40,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from bench.manifold_zoo_geometry import first_coordinate_hue
+
 SURFACE = "#fcfcfb"
 INK = "#0b0b0b"
 INK_2 = "#52514e"
@@ -71,8 +73,8 @@ ATLAS_LABELS = {
 }
 ATLAS_CAMERA = {
     "segment": (20, -58),
-    "circle": (28, -58),
-    "disk": (26, -55),
+    "circle": (90, -90),
+    "disk": (90, -90),
     "sphere": (22, -42),
     "torus": (30, -52),
     "mobius": (28, -62),
@@ -302,12 +304,10 @@ def _pad_cloud(cloud: np.ndarray) -> np.ndarray:
 
 
 def _atlas_hue(kind: str, theta: np.ndarray) -> tuple[np.ndarray, str]:
-    values = np.asarray(theta[:, 0], dtype=float)
+    values = first_coordinate_hue(kind, np.asarray(theta, dtype=float))
     if kind in ("circle", "torus", "mobius"):
-        return np.mod(values, 2.0 * np.pi) / (2.0 * np.pi), "twilight"
-    lo, hi = float(values.min()), float(values.max())
-    scale = hi - lo
-    return (values - lo) / (scale if scale > 0.0 else 1.0), "viridis"
+        return values, "twilight"
+    return values, "viridis"
 
 
 def _atlas_scatter(
@@ -444,7 +444,7 @@ def fig_all_zoos_atlas(
     fig.text(
         0.995, 0.018,
         f"gam {source_sha[:12]}  ·  Manifold-SAE {amm_source_sha[:12]}  ·  "
-        "held-out clouds  ·  color = planted intrinsic coordinate",
+        "held-out clouds  ·  color = first planted coordinate on its exact domain",
         ha="right", va="bottom", fontsize=7.5, color=INK_MUTED,
     )
     fig.savefig(out, facecolor=SURFACE, bbox_inches="tight", pad_inches=0.12)
