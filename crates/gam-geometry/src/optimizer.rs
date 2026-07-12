@@ -68,7 +68,11 @@ fn g_norm(
     point: ArrayView1<'_, f64>,
     a: ArrayView1<'_, f64>,
 ) -> GeometryResult<f64> {
-    Ok(g_inner(manifold, point, a, a)?.max(0.0).sqrt())
+    let squared_norm = g_inner(manifold, point, a, a)?;
+    if !squared_norm.is_finite() {
+        return Ok(f64::INFINITY);
+    }
+    Ok(squared_norm.max(0.0).sqrt())
 }
 
 /// Shift-invariant relative-gradient stationarity measure
@@ -173,6 +177,21 @@ impl RiemannianTrustRegion {
         let mut x = initial.to_owned();
         let d = manifold.ambient_dim();
         check_len("trust-region initial point", x.len(), d)?;
+        if !(self.radius.is_finite() && self.radius > 0.0) {
+            return Err(crate::manifold::GeometryError::InvalidPoint(
+                "trust-region radius must be finite and positive",
+            ));
+        }
+        if !(self.max_radius.is_finite() && self.max_radius > 0.0) {
+            return Err(crate::manifold::GeometryError::InvalidPoint(
+                "trust-region maximum radius must be finite and positive",
+            ));
+        }
+        if !(self.grad_tol.is_finite() && self.grad_tol >= 0.0) {
+            return Err(crate::manifold::GeometryError::InvalidPoint(
+                "trust-region gradient tolerance must be finite and non-negative",
+            ));
+        }
 
         // Establish the trust-region invariant `0 < Δ_k ≤ Δmax` *before* the
         // first step, not just on later expansions. The expansion rule below
@@ -189,9 +208,16 @@ impl RiemannianTrustRegion {
         // used as the shift-invariant scale in the relative stationarity test
         // (see `relative_stationarity`).
         let mut grad0_norm: Option<f64> = None;
+        let mut iterations = 0usize;
 
         for _ in 0..self.max_iter {
             let (f_curr, grad_e) = objective.value_gradient(x.view())?;
+            if !f_curr.is_finite() {
+                return Err(crate::manifold::GeometryError::InvalidPoint(
+                    "trust-region objective returned a non-finite value",
+                ));
+            }
+            iterations += 1;
             // Raise the ambient Euclidean differential to the *Riemannian*
             // gradient through the manifold metric. Merely projecting onto the
             // tangent space is the Riemannian gradient only for the embedded
@@ -255,7 +281,30 @@ impl RiemannianTrustRegion {
                 x = trial_x;
             }
         }
-        Ok(x)
+        // Returning a point is a mathematical claim: it must satisfy the same
+        // first-order certificate that controls the loop. Budget exhaustion,
+        // a collapsed radius, or a failed model step is not success merely
+        // because the last iterate is finite.
+        let (f_final, grad_e_final) = objective.value_gradient(x.view())?;
+        if !f_final.is_finite() {
+            return Err(crate::manifold::GeometryError::InvalidPoint(
+                "trust-region objective returned a non-finite terminal value",
+            ));
+        }
+        let grad_final = manifold.riemannian_gradient(x.view(), grad_e_final.view())?;
+        let grad_final_norm = g_norm(manifold, x.view(), grad_final.view())?;
+        let grad0 = grad0_norm.unwrap_or(grad_final_norm);
+        let residual = relative_stationarity(grad_final_norm, grad0);
+        if residual <= self.grad_tol {
+            Ok(x)
+        } else {
+            Err(crate::manifold::GeometryError::NonConvergence {
+                context: "Riemannian trust-region optimization",
+                iterations,
+                residual,
+                tolerance: self.grad_tol,
+            })
+        }
     }
 
     /// Solve `min_{‖η‖_g ≤ Δ} m(η)` and return `(η, m(0) − m(η), hit_boundary)`.
@@ -477,8 +526,23 @@ impl RiemannianLBFGS {
         let mut x = initial.to_owned();
         let d = manifold.ambient_dim();
         check_len("L-BFGS initial point", x.len(), d)?;
+        if !(self.step_size.is_finite() && self.step_size > 0.0) {
+            return Err(crate::manifold::GeometryError::InvalidPoint(
+                "L-BFGS step size must be finite and positive",
+            ));
+        }
+        if !(self.grad_tol.is_finite() && self.grad_tol >= 0.0) {
+            return Err(crate::manifold::GeometryError::InvalidPoint(
+                "L-BFGS gradient tolerance must be finite and non-negative",
+            ));
+        }
         let mut history: Vec<SecantPair> = Vec::new();
         let (mut f_curr, grad_e0) = objective.value_gradient(x.view())?;
+        if !f_curr.is_finite() {
+            return Err(crate::manifold::GeometryError::InvalidPoint(
+                "L-BFGS objective returned a non-finite value",
+            ));
+        }
         // Riemannian gradient (metric-raised), not a bare tangent projection —
         // see the trust region above and issue #955. The secant pairs, two-loop
         // recursion, and Armijo slope are all metric inner products, so they
@@ -490,11 +554,8 @@ impl RiemannianLBFGS {
         let armijo_c: f64 = constants::ARMIJO_C1;
         let alpha_min: f64 = 1.0e-16;
         let alpha_max: f64 = 1.0e16;
-        let initial_step = if self.step_size.is_finite() && self.step_size > 0.0 {
-            self.step_size
-        } else {
-            1.0
-        };
+        let initial_step = self.step_size;
+        let mut iterations = 0usize;
         for _ in 0..self.max_iter {
             // Shift-invariant (relative) stationarity test, identical in form to
             // the trust region's (see `relative_stationarity`): the current
@@ -507,6 +568,7 @@ impl RiemannianLBFGS {
             if relative_stationarity(grad_norm, grad0_norm) <= self.grad_tol {
                 break;
             }
+            iterations += 1;
             let direction = two_loop(manifold, x.view(), grad.view(), &history)?;
             let direction = -&direction;
             let slope = g_inner(manifold, x.view(), grad.view(), direction.view())?;
@@ -612,7 +674,18 @@ impl RiemannianLBFGS {
                 }
             }
         }
-        Ok(x)
+        let grad_norm = g_norm(manifold, x.view(), grad.view())?;
+        let residual = relative_stationarity(grad_norm, grad0_norm);
+        if residual <= self.grad_tol {
+            Ok(x)
+        } else {
+            Err(crate::manifold::GeometryError::NonConvergence {
+                context: "Riemannian L-BFGS optimization",
+                iterations,
+                residual,
+                tolerance: self.grad_tol,
+            })
+        }
     }
 }
 
@@ -875,5 +948,70 @@ mod tests {
                 x_ref[i]
             );
         }
+    }
+
+    #[test]
+    fn optimizers_refuse_nonstationary_zero_budget_iterates() {
+        let manifold = EuclideanManifold::new(1);
+        let x0 = Array1::from_vec(vec![1.0]);
+
+        let mut trust_objective = Square;
+        let trust = RiemannianTrustRegion {
+            max_iter: 0,
+            ..RiemannianTrustRegion::default()
+        };
+        let trust_error = trust
+            .minimize(&manifold, &mut trust_objective, x0.view())
+            .expect_err("a zero-budget nonstationary trust-region run must not mint a point");
+        assert!(matches!(
+            trust_error,
+            crate::manifold::GeometryError::NonConvergence {
+                iterations: 0,
+                residual,
+                ..
+            } if residual > trust.grad_tol
+        ));
+
+        let mut lbfgs_objective = Square;
+        let lbfgs = RiemannianLBFGS {
+            max_iter: 0,
+            ..RiemannianLBFGS::default()
+        };
+        let lbfgs_error = lbfgs
+            .minimize(&manifold, &mut lbfgs_objective, x0.view())
+            .expect_err("a zero-budget nonstationary L-BFGS run must not mint a point");
+        assert!(matches!(
+            lbfgs_error,
+            crate::manifold::GeometryError::NonConvergence {
+                iterations: 0,
+                residual,
+                ..
+            } if residual > lbfgs.grad_tol
+        ));
+    }
+
+    #[test]
+    fn nonfinite_gradient_cannot_be_misread_as_zero_norm() {
+        struct NanGradient;
+        impl RiemannianObjective for NanGradient {
+            fn value_gradient(
+                &mut self,
+                _point: ArrayView1<'_, f64>,
+            ) -> GeometryResult<(f64, Array1<f64>)> {
+                Ok((0.0, Array1::from_vec(vec![f64::NAN])))
+            }
+        }
+
+        let manifold = EuclideanManifold::new(1);
+        let x0 = Array1::zeros(1);
+        let mut objective = NanGradient;
+        let error = RiemannianTrustRegion::default()
+            .minimize(&manifold, &mut objective, x0.view())
+            .expect_err("NaN gradient must never certify stationarity");
+        assert!(matches!(
+            error,
+            crate::manifold::GeometryError::NonConvergence { residual, .. }
+                if residual.is_infinite()
+        ));
     }
 }

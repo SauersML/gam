@@ -258,6 +258,8 @@ pub struct PenalizedDirectionAnnotation {
 pub enum CompilerError {
     /// Operator/Hessian/ordering dimensions are inconsistent.
     DimensionMismatch(String),
+    /// A supplied row metric is not a finite positive-semidefinite weight.
+    InvalidMetric(String),
     /// A block degenerated to zero residual span — fully aliased by the
     /// cumulative anchor in the row metric.
     FullyAliased { block_idx: usize, reason: String },
@@ -269,6 +271,7 @@ impl std::fmt::Display for CompilerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CompilerError::DimensionMismatch(msg) => write!(f, "dimension mismatch: {msg}"),
+            CompilerError::InvalidMetric(msg) => write!(f, "invalid row metric: {msg}"),
             CompilerError::FullyAliased { block_idx, reason } => {
                 write!(f, "block {block_idx} fully aliased: {reason}")
             }
@@ -1719,11 +1722,18 @@ pub fn orthogonalize_design_blocks(
             weight.len()
         )));
     }
-    // sqrt(W) row scale (clamp tiny-negative to zero — the pilot Hessian
-    // diagonal is PSD-clamped upstream, but guard against round-off).
+    // sqrt(W) row scale. The pilot Hessian is PSD-clamped upstream; accepting
+    // a negative or non-finite value here would silently change the requested
+    // metric and can turn an aliased direction into an apparently independent
+    // one. Reject the invalid mathematical object at the boundary.
     let mut sqrt_w = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let wi = weight[i].max(0.0);
+        let wi = weight[i];
+        if !wi.is_finite() || wi < 0.0 {
+            return Err(CompilerError::InvalidMetric(format!(
+                "weight[{i}] must be finite and non-negative; got {wi}"
+            )));
+        }
         sqrt_w[i] = wi.sqrt();
     }
 
@@ -3101,6 +3111,26 @@ mod tests {
         assert_eq!(ortho.direction_annotations[2].raw_width, 1);
         assert_eq!(ortho.direction_annotations[2].kept_width, 1);
         assert_eq!(ortho.dropped, vec![(1, 2)]);
+    }
+
+    #[test]
+    fn orthogonalization_rejects_invalid_row_metric_weights() {
+        let design = Array2::from_shape_fn((4, 1), |(row, _)| row as f64 + 1.0);
+        for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+            let result = orthogonalize_design_blocks(
+                std::slice::from_ref(&design),
+                &[1],
+                &[1.0, invalid, 1.0, 1.0],
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("an invalid W-metric must be rejected, not silently clamped"),
+            };
+            assert!(
+                matches!(error, CompilerError::InvalidMetric(_)),
+                "unexpected error for weight {invalid}: {error}"
+            );
+        }
     }
 
     #[test]

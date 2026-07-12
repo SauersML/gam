@@ -9,6 +9,7 @@ use ndarray::{Array1, ArrayView1, arr1};
 /// checked with no numerical slack.
 struct Linear {
     grad: Array1<f64>,
+    evaluated_points: Vec<Array1<f64>>,
 }
 
 impl RiemannianObjective for Linear {
@@ -16,6 +17,7 @@ impl RiemannianObjective for Linear {
         &mut self,
         point: ArrayView1<'_, f64>,
     ) -> gam::GeometryResult<(f64, Array1<f64>)> {
+        self.evaluated_points.push(point.to_owned());
         Ok((point.dot(&self.grad), self.grad.clone()))
     }
 }
@@ -32,6 +34,7 @@ fn trust_region_first_step_respects_max_radius() {
     // Unit-norm gradient ⇒ the Cauchy step length equals `Δ` exactly.
     let mut objective = Linear {
         grad: arr1(&[3.0 / 5.0, 4.0 / 5.0]),
+        evaluated_points: Vec::new(),
     };
     let max_radius = 1.0;
     let solver = RiemannianTrustRegion {
@@ -41,11 +44,16 @@ fn trust_region_first_step_respects_max_radius() {
         grad_tol: 0.0,
     };
     let x0 = arr1(&[0.0, 0.0]);
-    let x1 = solver
+    let error = solver
         .minimize(&manifold, &mut objective, x0.view())
-        .expect("trust-region minimize should succeed");
+        .expect_err("a linear objective has no stationary point and must not be minted");
+    assert!(matches!(error, gam::GeometryError::NonConvergence { .. }));
 
-    let step_norm = (&x1 - &x0).mapv(|v| v * v).sum().sqrt();
+    let step_norm = objective
+        .evaluated_points
+        .iter()
+        .map(|point| (point - &x0).mapv(|v| v * v).sum().sqrt())
+        .fold(0.0_f64, f64::max);
     assert!(
         step_norm <= max_radius + 1.0e-12,
         "first trust-region step norm {step_norm} exceeded the max_radius cap {max_radius}; \

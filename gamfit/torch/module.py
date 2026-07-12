@@ -1,10 +1,9 @@
 """GAM as a torch ``nn.Module`` — for embedding inside neural networks.
 
-The :class:`GAM` module holds smooth-term specs and their structural
-parameters (centers, knots) as buffers. Each forward pass refits the
-coefficients via Gaussian REML against the provided response (training
-mode), or evaluates cached coefficients at the provided points
-(inference mode after ``.freeze()``).
+The :class:`GAM` module holds smooth-term specs as its architecture. Each
+forward pass refits coefficients via Gaussian REML against the provided
+response (training mode), or evaluates persistent coefficient buffers at the
+provided points (inference mode after ``.freeze()``).
 
 This is the drop-in for sparse-coding, manifold-discovery, and similar
 architectures where positions are emitted by upstream neural layers and
@@ -26,10 +25,10 @@ from .fit import FitResult, fit
 class GAM(nn.Module):
     """Multi-smooth additive GAM as a ``nn.Module``.
 
-    Construction takes a list of :class:`Smooth` specs. Their structural
-    parameters (centers / knots) become buffers (saved/loaded with
-    ``state_dict``, not trained by Adam). Coefficients are runtime — they
-    flow from each REML fit and are not parameters.
+    Construction takes a list of :class:`Smooth` specs defining the module
+    architecture. Coefficients flow from each REML fit and are not parameters;
+    :meth:`freeze` snapshots them as persistent buffers saved by ``state_dict``
+    and migrated by :meth:`~torch.nn.Module.to`.
 
     Forward modes
     -------------
@@ -204,6 +203,38 @@ class GAM(nn.Module):
         # zero-length registered buffers.  Resize each destination to the saved
         # block before nn.Module performs its ordinary checked copy.  The current
         # module device is retained; dtype follows the saved fit exactly.
+        saved_blocks = [
+            state_dict.get(prefix + self._coefficient_buffer_name(index))
+            for index in range(len(self.smooths))
+        ]
+        provided_blocks = sum(block is not None for block in saved_blocks)
+        if 0 < provided_blocks < len(self.smooths):
+            error_msgs.append(
+                "A GAM state_dict must provide every frozen coefficient buffer "
+                f"or none of them; found {provided_blocks} of {len(self.smooths)}."
+            )
+        nonempty_blocks = [
+            block
+            for block in saved_blocks
+            if isinstance(block, torch.Tensor) and block.numel() > 0
+        ]
+        if nonempty_blocks and len(nonempty_blocks) != len(self.smooths):
+            error_msgs.append(
+                "A frozen GAM state must contain one non-empty coefficient "
+                f"block per smooth; found {len(nonempty_blocks)} for "
+                f"{len(self.smooths)} smooths."
+            )
+        output_dims = {
+            int(block.shape[1])
+            for block in nonempty_blocks
+            if block.dim() == 2 and 0 not in block.shape
+        }
+        if len(output_dims) > 1:
+            error_msgs.append(
+                "Frozen GAM coefficient blocks in state_dict do not share one "
+                f"output dimension: {sorted(output_dims)}."
+            )
+
         for index in range(len(self.smooths)):
             name = self._coefficient_buffer_name(index)
             key = prefix + name

@@ -193,8 +193,23 @@ fn lbfgs_inverse_hessian_should_converge_to_true_hessian_inverse_for_quadratic()
 #[test]
 fn trust_region_step_should_never_exceed_radius() {
     let m = EuclideanManifold::new(2);
-    let mut obj = QuadObjective {
+    struct RecordingQuadObjective {
+        h: Array2<f64>,
+        evaluated_points: Vec<Array1<f64>>,
+    }
+    impl RiemannianObjective for RecordingQuadObjective {
+        fn value_gradient(
+            &mut self,
+            point: ndarray::ArrayView1<'_, f64>,
+        ) -> gam::geometry::GeometryResult<(f64, Array1<f64>)> {
+            self.evaluated_points.push(point.to_owned());
+            let hp = self.h.dot(&point.to_owned());
+            Ok((0.5 * point.dot(&hp), hp))
+        }
+    }
+    let mut obj = RecordingQuadObjective {
         h: array![[1.0, 0.0], [0.0, 1.0]],
+        evaluated_points: Vec::new(),
     };
     let opt = RiemannianTrustRegion {
         radius: 0.05,
@@ -203,10 +218,20 @@ fn trust_region_step_should_never_exceed_radius() {
         grad_tol: 0.0,
     };
     let x0 = array![1.0, 0.0];
-    let x1 = opt.minimize(&m, &mut obj, x0.view()).unwrap();
-    let step = &x1 - &x0;
+    let error = opt
+        .minimize(&m, &mut obj, x0.view())
+        .expect_err("one radius-limited step cannot certify this nonstationary point");
+    assert!(matches!(
+        error,
+        gam::geometry::GeometryError::NonConvergence { .. }
+    ));
+    let step_norm = obj
+        .evaluated_points
+        .iter()
+        .map(|point| norm(&(point - &x0)))
+        .fold(0.0_f64, f64::max);
     assert!(
-        norm(&step) <= 0.05 + 1.0e-12,
+        step_norm <= 0.05 + 1.0e-12,
         "Trust-region proposed step must stay within the trust radius"
     );
 }

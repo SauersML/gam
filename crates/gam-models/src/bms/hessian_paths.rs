@@ -852,10 +852,11 @@ pub(super) struct BernoulliMarginalSlopeFlexRowScratch {
     pub(super) g_u_fixed: Vec<[f64; 4]>,
     pub(super) g_au_fixed: Vec<[f64; 4]>,
     pub(super) g_bu_fixed: Vec<[f64; 4]>,
-    // Per-cell eta_u buffer for the empirical-grid branch; reused across cells
-    // and rows. `Vec<f64>` rather than `Array1` because indexing as
-    // `eta_u[idx]` after a `clear()`/`resize()` matches the previous code path.
-    pub(super) eta_u_cell: Vec<f64>,
+    // Sparse primary schedule compiled for one empirical-grid cell. The
+    // logslope direction is always present; deviation directions are retained
+    // only when at least one coefficient-jet channel is nonzero. Reusing this
+    // buffer makes the moment compiler allocation-free in the warmed row path.
+    pub(super) active_cell_primaries: Vec<usize>,
     // Constant zero coeff slice shared by every SparsePrimaryCoeffJetView call
     // that needs `aa_first..bbb_first`. Sized to `primary_dim` once and never
     // mutated thereafter.
@@ -880,7 +881,7 @@ impl BernoulliMarginalSlopeFlexRowScratch {
             g_u_fixed: vec![[0.0; 4]; primary_dim],
             g_au_fixed: vec![[0.0; 4]; primary_dim],
             g_bu_fixed: vec![[0.0; 4]; primary_dim],
-            eta_u_cell: vec![0.0; primary_dim],
+            active_cell_primaries: Vec::with_capacity(primary_dim),
             zero_family: vec![[0.0; 4]; primary_dim],
         }
     }

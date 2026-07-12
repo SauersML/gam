@@ -12,7 +12,7 @@
 //! `u = 2πs/W ∈ [0, 2π]`. The basis is
 //!
 //! ```text
-//! Φ_m(s; γ) = [cos(m γ u), sin(m γ u)],   γ = 2π / L ∈ [0, 1].
+//! Φ_m(s; γ) = [cos(m γ u), sin(m γ u)],   γ = W / period ∈ [0, 1].
 //! ```
 //!
 //! * `γ = 1`: the window is one full period, endpoints are identified — the
@@ -70,7 +70,7 @@ pub struct ClosureFamily {
 /// finite window, rather than only for the special case `window = 2pi`.
 #[inline]
 fn closure_coordinate(s: f64, window: f64) -> f64 {
-    std::f64::consts::TAU * s / window
+    (s / window) * std::f64::consts::TAU
 }
 
 /// Seed the stable trigonometric recurrence for the base angle `φ`.
@@ -647,12 +647,15 @@ mod tests {
         let s = array![0.0, 0.17, 1.9, 3.65, 5.8, 7.11, window];
         let scaled_s = &s * scale;
         let base = ClosureFamily::new(9, window).expect("valid base window");
-        let scaled =
-            ClosureFamily::new(9, window * scale).expect("valid rescaled window");
+        let scaled = ClosureFamily::new(9, window * scale).expect("valid rescaled window");
         let (v0, d0, dd0) = base.design_jet(s.view(), gamma);
         let (v1, d1, dd1) = scaled.design_jet(scaled_s.view(), gamma);
 
-        for (label, lhs, rhs) in [("value", v0, v1), ("d_gamma", d0, d1), ("dd_gamma", dd0, dd1)] {
+        for (label, lhs, rhs) in [
+            ("value", v0, v1),
+            ("d_gamma", d0, d1),
+            ("dd_gamma", dd0, dd1),
+        ] {
             let max_error = lhs
                 .iter()
                 .zip(rhs.iter())
@@ -676,10 +679,11 @@ mod tests {
     }
 
     /// The analytic γ-jet of the basis matches a central finite difference at
-    /// an interior γ and across the γ → 0 Taylor limit.
+    /// an interior γ and across the γ → 0 Taylor limit. The deliberately
+    /// non-canonical window makes this exercise the `2π/window` chain factor.
     #[test]
     fn basis_gamma_jet_matches_fd() {
-        let fam = ClosureFamily::new(3, std::f64::consts::TAU).expect("valid window");
+        let fam = ClosureFamily::new(3, 5.3).expect("valid window");
         let s = 0.8_f64;
         for &g0 in &[1.0_f64, 0.5, 0.05, 1e-6] {
             let (_, dg, dgg) = fam.row_jet(s, g0);
@@ -1010,11 +1014,11 @@ mod tests {
     /// The four-rows-per-pass `f64x4` assembly in `design`/`design_jet` must be
     /// **bit-identical** to the scalar single-row path it replaces — each SIMD
     /// lane is plain IEEE `f64`, so there is no accuracy change, only throughput.
-        /// Covers non-multiple-of-4 row counts (the scalar remainder) and `H = 0`.
+    /// Covers non-multiple-of-4 row counts (the scalar remainder) and `H = 0`.
     #[test]
     fn simd_design_is_bit_identical_to_scalar_rows() {
         for &h in &[0usize, 1, 3, 7, 16] {
-            let fam = ClosureFamily::new(h, std::f64::consts::TAU).expect("valid window");
+            let fam = ClosureFamily::new(h, 7.3).expect("valid window");
             // n deliberately not a multiple of 4 to exercise the remainder.
             let n = 11;
             let s: Vec<f64> = (0..n).map(|k| (k as f64) * 0.37 - 1.9).collect();

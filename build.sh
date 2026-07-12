@@ -353,25 +353,49 @@ wait_for_memory() {
 }
 # An OOM-SIGKILL of a child rustc makes cargo exit 101 (NOT 137) with
 # "(signal: 9, SIGKILL)" in its output — indistinguishable from a real compile
-# error by exit code alone. Detect timeout / direct-signal / OOM and treat them
-# as TRANSIENT: never cached, auto-retried. Uses globals: code, $LOG.
+# error by exit code alone. A concurrently-mutated target tree likewise reports
+# exit 101 even though no source is wrong. Detect both classes as TRANSIENT:
+# never cache them, and auto-retry. Uses globals: code, $LOG.
 is_transient() {
   (( code == 124 )) && return 0        # timeout(1) wall-clock kill
   (( code >= 128 )) && return 0        # killed by a signal directly
   (( code == 0 ))   && return 1
   grep -qiE 'signal: 9|SIGKILL|process did not exit successfully.*signal|: Killed|out of memory|Cannot allocate memory|memory allocation of .* bytes failed|LLVM ERROR: out of memory' "$LOG" 2>/dev/null \
-    || is_incremental_corruption
+    || is_target_artifact_corruption
 }
-# Incremental-state corruption: a CONCURRENT cargo (another session / a codex
-# launchd job that bypasses this single-flight gate) touching the same target/
-# dir can delete target/debug/incremental mid-build, yielding "failed to
-# create query cache" / "failed to move dependency graph … No such file or
-# directory". That is an INFRASTRUCTURE failure, not a code error — treat it as
-# transient and wipe the incremental dir before retrying so the rebuild starts
-# from clean incremental state.
+# Incremental-state corruption: a concurrent cargo touching the same target can
+# delete target/debug/incremental mid-build. This is one specialization of the
+# target-artifact loss classified below.
 is_incremental_corruption() {
   (( code == 0 )) && return 1
   grep -qiE 'failed to (create|move|open|read|write).*(query cache|dependency graph|incremental)|incremental compilation.*(No such file|cannot|failed)|query-cache\.bin|dep-graph\.(part\.)?bin' "$LOG" 2>/dev/null
+}
+
+# Missing target artifacts are infrastructure corruption, not Rust diagnostics.
+# In particular, an emergency cleaner historically removed target/debug/{deps,
+# build} during rustc, producing misleading source-red errors such as missing
+# extern .rmeta files, vanished linker .o files, or an absent rmeta temp dir.
+# Require BOTH an absolute path inside this invocation's target directory and a
+# disappearance marker, so a genuinely missing source/input elsewhere remains a
+# stable, cacheable failure.
+is_target_artifact_corruption() {
+  (( code == 0 )) && return 1
+  is_incremental_corruption && return 0
+  # E0463 is rustc's crate-artifact lookup failure. Cargo resolves declared
+  # dependencies before invoking rustc, so this diagnostic means an expected
+  # rlib/rmeta/sysroot artifact vanished or is unreadable; an undeclared source
+  # import is E0432/E0433 instead and remains a stable code failure.
+  grep -qE "^error\[E0463\]: can't find crate for" "$LOG" 2>/dev/null && return 0
+  # One awk avoids a grep -q pipeline: under `pipefail`, an early successful
+  # consumer can SIGPIPE its producer and accidentally turn a match into 141.
+  awk -v target="$CARGO_TARGET_DIR/" '
+    index($0, target) &&
+      $0 ~ /(No such file or directory|does not exist|errno=2|cannot be open\(\)ed)/ {
+        found = 1
+        exit
+      }
+    END { exit !found }
+  ' "$LOG" 2>/dev/null
 }
 # Is CMD a test/bench RUN that compiles binaries and then EXECUTES them? (A pure
 # build-only invocation — `--no-run`/`--list` — is NOT: it never executes, so it
@@ -398,7 +422,7 @@ is_test_run() {
 # run-lock ($RUNLOCK). A compile and a test-execution can then overlap (bounded to
 # one of each — the small-RAM invariant still holds, since execution is far
 # lighter than codegen). Non-test requests are unchanged: whole run under $LOCK.
-# The incremental-corruption handler is the backstop if a concurrent compile
+# The target-artifact-loss handler is the backstop if a concurrent compile
 # perturbs target/ during the execute phase. GAM_NO_SPLIT=1 forces the old
 # everything-under-one-lock behavior.
 run_under_global_lock() {
@@ -440,8 +464,8 @@ run_under_global_lock() {
     fi
     if is_transient; then
       if (( attempt < max )); then
-        if is_incremental_corruption; then
-          echo "[build.sh] incremental-state corruption (concurrent cargo on target/) attempt $attempt/$max — wiping target/debug/incremental + retrying…" >&2
+        if is_target_artifact_corruption; then
+          echo "[build.sh] target-artifact loss (concurrent mutation of target/) attempt $attempt/$max — wiping target/debug/incremental + retrying…" >&2
           rm -rf "$REPO/target/debug/incremental" 2>/dev/null || true
         elif [[ "${CARGO_BUILD_JOBS:-0}" != "1" ]]; then
           # Repeated OOM won't clear by waiting alone — a lower job count has a
@@ -468,7 +492,7 @@ run_under_global_lock() {
       wait_for_memory
       t0=$(ep); timeout -k 30 "$TIMEOUT" "${CMD[@]}" >>"$LOG" 2>&1 8>&- 9>&-; code=$?; DUR=$(( DUR + $(ep)-t0 ))
       if is_transient && (( rattempt < max )); then
-        is_incremental_corruption && rm -rf "$REPO/target/debug/incremental" 2>/dev/null || true
+        is_target_artifact_corruption && rm -rf "$REPO/target/debug/incremental" 2>/dev/null || true
         sleep $(( rattempt * 12 )); continue
       fi
       break
@@ -541,7 +565,7 @@ run_request() {
   if [[ -n "${GAM_FORCE:-}" ]]; then
     run_under_global_lock
     if is_transient; then
-      record "$REQ" "FORCE(transient)" "$code" "$DUR"; echo "TRANSIENT FAILURE ($code, OOM/timeout) — retry"; exit 75
+      record "$REQ" "FORCE(transient)" "$code" "$DUR"; echo "TRANSIENT FAILURE ($code, OOM/timeout/target-artifact loss) — retry"; exit 75
     fi
     write_cache; { (( code == 0 )) && is_full_lib_compile && : >"$CACHEDIR/super.$TREE"; } || true
     record "$REQ" "FORCE" "$code" "$DUR"; finish "$code" "FORCE"
@@ -553,7 +577,7 @@ run_request() {
   if [[ "${CACHEABLE:-1}" != 1 || -n "${GAM_NO_CACHE:-}" ]]; then
     run_under_global_lock
     if is_transient; then
-      record "$REQ" "n/a(transient)" "$code" "$DUR"; echo "TRANSIENT FAILURE ($code, OOM/timeout) — retry"; exit 75
+      record "$REQ" "n/a(transient)" "$code" "$DUR"; echo "TRANSIENT FAILURE ($code, OOM/timeout/target-artifact loss) — retry"; exit 75
     fi
     record "$REQ" "n/a" "$code" "$DUR"; finish "$code" "n/a"
   fi
@@ -592,7 +616,7 @@ run_request() {
   if is_transient; then
     code=75; write_request_result "$REQHASH"
     record "$REQ" "MISS(transient)" "$code" "$DUR"; flock -u 7
-    echo "TRANSIENT FAILURE ($code, OOM/timeout) — retry"; exit 75
+    echo "TRANSIENT FAILURE ($code, OOM/timeout/target-artifact loss) — retry"; exit 75
   fi
   write_cache; write_request_result "$REQHASH"
   { (( code == 0 )) && is_full_lib_compile && : >"$CACHEDIR/super.$TREE"; } || true

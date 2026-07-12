@@ -725,6 +725,368 @@ impl SaeReconstructionRowProgram {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// STRUCTURE-COMPILED SOFTMAX ROW PROGRAM
+//
+// A dense generic jet represents every primary in every intermediate, including
+// the structural-zero cross-atom coordinate blocks.  The interface below is the
+// same row program as a borrowed semantic source: gate masses, decoded component
+// values, their coordinate jets, and beta-border basis channels.  The executor
+// compiles that dependency graph into the nonzero order-2 blocks.  There is one
+// softmax-moment definition, shared by reconstruction, coordinate cross terms,
+// and beta borders; the fixed-size Tower program remains its independent oracle.
+
+/// One primary in the sparse dependency graph of an SAE reconstruction row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaeRowPrimary {
+    Logit { atom: usize },
+    Coord { atom: usize, axis: usize },
+}
+
+/// Borrowed semantic input to the structure-compiled softmax row program.
+///
+/// Production implements this directly over ndarray views, so compiling a row
+/// does not clone its basis/decoder tensors.  The owned
+/// [`SaeReconstructionRowProgram`] implements it too, which lets the exact same
+/// executor run against the generic Taylor-tower oracle in tests.
+pub(crate) trait SaeSoftmaxRowProgramSource {
+    fn n_atoms(&self) -> usize;
+    fn out_dim(&self) -> usize;
+    fn n_primaries(&self) -> usize;
+    fn primary(&self, slot: usize) -> SaeRowPrimary;
+    fn gate_value(&self, atom: usize) -> f64;
+    fn atom_is_active(&self, atom: usize) -> bool;
+
+    /// Fill `D_k`, `∂_axis D_k`, and `∂_axis_a axis_b D_k`, respectively.
+    fn fill_decoded(&self, atom: usize, out: &mut [f64]);
+    fn fill_decoded_first(&self, atom: usize, axis: usize, out: &mut [f64]);
+    fn fill_decoded_second(
+        &self,
+        atom: usize,
+        axis_a: usize,
+        axis_b: usize,
+        out: &mut [f64],
+    );
+
+    fn n_beta_borders(&self) -> usize;
+    fn beta_border_atom(&self, border: usize) -> usize;
+    fn beta_border_basis_value(&self, border: usize) -> f64;
+    fn beta_border_basis_first(&self, border: usize, axis: usize) -> f64;
+    fn beta_border_output(&self, border: usize) -> &[f64];
+}
+
+/// Complete order-≤2 channels emitted by [`execute_softmax_row_program`].
+/// The layout matches the log-det consumer without an intermediate dense jet.
+pub(crate) struct SaeScheduledRowJets {
+    pub first: Vec<Vec<f64>>,
+    pub second: Vec<Vec<Vec<f64>>>,
+    pub beta: Vec<Vec<f64>>,
+    pub beta_deriv: Vec<Vec<Vec<f64>>>,
+    pub beta_l_deriv: Vec<Vec<Vec<f64>>>,
+}
+
+/// The derivative algebra of `Y = Σ_k z_k D_k`, where `z = softmax(r ℓ)`.
+///
+/// This is the single softmax primitive used by the compiled row program.  Its
+/// centered-moment form is algebraically identical to propagating an order-2 jet:
+///
+/// ```text
+/// ∂_j Y     = r z_j (D_j - Y)
+/// ∂_jl Y    = r² z_j [δ_jl(D_j-Y) - z_l(D_j + D_l - 2Y)]
+/// ∂_j z_k   = r z_k (δ_kj - z_j)
+/// ```
+///
+/// Unlike a dense tower, evaluating one Hessian entry is O(1), not an O(K)
+/// contraction of a materialized `∂²z_k` tensor.  The formulas remain valid
+/// for the reduced softmax chart: only the free logit primaries are requested.
+struct SoftmaxMoment<'a> {
+    z: &'a [f64],
+    inv_tau: f64,
+}
+
+impl SoftmaxMoment<'_> {
+    #[inline]
+    fn expectation_first(&self, atom_j: usize, component_j: f64, mean: f64) -> f64 {
+        self.inv_tau * self.z[atom_j] * (component_j - mean)
+    }
+
+    #[inline]
+    fn expectation_second(
+        &self,
+        atom_j: usize,
+        atom_l: usize,
+        component_j: f64,
+        component_l: f64,
+        mean: f64,
+    ) -> f64 {
+        let diagonal = if atom_j == atom_l {
+            component_j - mean
+        } else {
+            0.0
+        };
+        self.inv_tau
+            * self.inv_tau
+            * self.z[atom_j]
+            * (diagonal - self.z[atom_l] * (component_j + component_l - 2.0 * mean))
+    }
+
+    #[inline]
+    fn gate_first(&self, gated_atom: usize, logit_atom: usize) -> f64 {
+        let diagonal = if gated_atom == logit_atom { 1.0 } else { 0.0 };
+        self.inv_tau * self.z[gated_atom] * (diagonal - self.z[logit_atom])
+    }
+}
+
+/// Execute the complete softmax reconstruction row as a sparse order-2 jet.
+///
+/// The evaluator is generic over the borrowed row source, but its arithmetic is
+/// fixed by [`SoftmaxMoment`].  It writes every value/gradient/Hessian channel
+/// consumed by the SAE log-det path: reconstruction logit and coordinate blocks,
+/// same-atom coordinate curvature, logit×coordinate blocks, and decoder-beta
+/// border value/mixed channels.  Cross-atom coordinate blocks are exact zeros by
+/// dependency, so they are allocated zero and never evaluated.
+pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
+    source: &S,
+    inv_tau: f64,
+    sqrt_row_w: f64,
+) -> SaeScheduledRowJets {
+    let k = source.n_atoms();
+    let p = source.out_dim();
+    let q = source.n_primaries();
+    let n_beta = source.n_beta_borders();
+    let mut out = SaeScheduledRowJets {
+        first: vec![vec![0.0; p]; q],
+        second: vec![vec![vec![0.0; p]; q]; q],
+        beta: vec![vec![0.0; p]; n_beta],
+        beta_deriv: vec![vec![vec![0.0; p]; n_beta]; q],
+        beta_l_deriv: vec![vec![vec![0.0; p]; n_beta]; q],
+    };
+
+    // Compile the row's variable layout once.  Dense softmax uses the reduced
+    // K-1 logit chart; compact active-set rows may contain coordinates only.
+    let mut logits = Vec::with_capacity(q.min(k));
+    let mut coords = Vec::with_capacity(q);
+    for slot in 0..q {
+        match source.primary(slot) {
+            SaeRowPrimary::Logit { atom } => logits.push((slot, atom)),
+            SaeRowPrimary::Coord { atom, axis } => coords.push((slot, atom, axis)),
+        }
+    }
+
+    // Component values and their softmax expectation.  Inactive components are
+    // the exact zero function but their probability still normalizes active gates.
+    let mut decoded = vec![0.0_f64; k * p];
+    let mut mean = vec![0.0_f64; p];
+    for atom in 0..k {
+        if !source.atom_is_active(atom) {
+            continue;
+        }
+        let component = &mut decoded[atom * p..(atom + 1) * p];
+        source.fill_decoded(atom, component);
+        let z = source.gate_value(atom);
+        for c in 0..p {
+            mean[c] += z * component[c];
+        }
+    }
+    let gate_values: Vec<f64> = (0..k).map(|atom| source.gate_value(atom)).collect();
+    let moment = SoftmaxMoment {
+        z: &gate_values,
+        inv_tau,
+    };
+
+    // Logit gradient and Hessian are centered softmax moments.  This is the
+    // asymptotic win: O(L²P) for L free logits, versus O(L²KP) in the hand
+    // `d2z[j][l][k] · decoded[k]` contraction and still more in a dense jet.
+    for &(slot_j, atom_j) in &logits {
+        let dj = &decoded[atom_j * p..(atom_j + 1) * p];
+        for c in 0..p {
+            out.first[slot_j][c] =
+                sqrt_row_w * moment.expectation_first(atom_j, dj[c], mean[c]);
+        }
+        for &(slot_l, atom_l) in &logits {
+            let dl = &decoded[atom_l * p..(atom_l + 1) * p];
+            for c in 0..p {
+                out.second[slot_j][slot_l][c] = sqrt_row_w
+                    * moment.expectation_second(atom_j, atom_l, dj[c], dl[c], mean[c]);
+            }
+        }
+    }
+
+    // Each coordinate belongs to exactly one component.  Its first jet is
+    // scaled by z_k; differentiating that gate supplies every logit×coord block.
+    let mut scratch = vec![0.0_f64; p];
+    for &(coord_slot, atom, axis) in &coords {
+        if !source.atom_is_active(atom) {
+            continue;
+        }
+        source.fill_decoded_first(atom, axis, &mut scratch);
+        let z = source.gate_value(atom);
+        for c in 0..p {
+            out.first[coord_slot][c] = sqrt_row_w * z * scratch[c];
+        }
+        for &(logit_slot, logit_atom) in &logits {
+            let coefficient = sqrt_row_w * moment.gate_first(atom, logit_atom);
+            for c in 0..p {
+                let mixed = coefficient * scratch[c];
+                out.second[logit_slot][coord_slot][c] = mixed;
+                out.second[coord_slot][logit_slot][c] = mixed;
+            }
+        }
+    }
+
+    // Coordinate×coordinate curvature is block diagonal by atom.  The basis
+    // source supplies the local quadratic jet, so no cross-atom zeros are built.
+    for &(slot_a, atom_a, axis_a) in &coords {
+        if !source.atom_is_active(atom_a) {
+            continue;
+        }
+        for &(slot_b, atom_b, axis_b) in &coords {
+            if atom_a != atom_b {
+                continue;
+            }
+            source.fill_decoded_second(atom_a, axis_a, axis_b, &mut scratch);
+            let coefficient = sqrt_row_w * source.gate_value(atom_a);
+            for c in 0..p {
+                out.second[slot_a][slot_b][c] = coefficient * scratch[c];
+            }
+        }
+    }
+
+    // A beta border is `s = z_k Phi_b` times a constant output vector.  The same
+    // gate moment primitive emits its logit derivative; its coordinate derivative
+    // is the source basis jet.  beta_deriv and beta_l_deriv are mathematically the
+    // same mixed channel because reconstruction is linear in beta.
+    for border in 0..n_beta {
+        let atom = source.beta_border_atom(border);
+        if !source.atom_is_active(atom) {
+            continue;
+        }
+        let phi = source.beta_border_basis_value(border);
+        let output = source.beta_border_output(border);
+        let base = sqrt_row_w * source.gate_value(atom) * phi;
+        for c in 0..p {
+            out.beta[border][c] = base * output[c];
+        }
+        for &(slot, logit_atom) in &logits {
+            let scalar = sqrt_row_w * moment.gate_first(atom, logit_atom) * phi;
+            for c in 0..p {
+                let mixed = scalar * output[c];
+                out.beta_deriv[slot][border][c] = mixed;
+                out.beta_l_deriv[slot][border][c] = mixed;
+            }
+        }
+        for &(slot, coord_atom, axis) in &coords {
+            if coord_atom != atom {
+                continue;
+            }
+            let scalar = sqrt_row_w
+                * source.gate_value(atom)
+                * source.beta_border_basis_first(border, axis);
+            for c in 0..p {
+                let mixed = scalar * output[c];
+                out.beta_deriv[slot][border][c] = mixed;
+                out.beta_l_deriv[slot][border][c] = mixed;
+            }
+        }
+    }
+
+    out
+}
+
+impl SaeSoftmaxRowProgramSource for SaeReconstructionRowProgram {
+    fn n_atoms(&self) -> usize {
+        self.atoms.len()
+    }
+
+    fn out_dim(&self) -> usize {
+        self.out_dim()
+    }
+
+    fn n_primaries(&self) -> usize {
+        self.n_primaries
+    }
+
+    fn primary(&self, slot: usize) -> SaeRowPrimary {
+        for (atom, &candidate) in self.logit_slot.iter().enumerate() {
+            if candidate == Some(slot) {
+                return SaeRowPrimary::Logit { atom };
+            }
+        }
+        for (atom, slots) in self.coord_slot.iter().enumerate() {
+            for (axis, &candidate) in slots.iter().enumerate() {
+                if candidate == slot {
+                    return SaeRowPrimary::Coord { atom, axis };
+                }
+            }
+        }
+        panic!("row-program primary slot {slot} is not mapped");
+    }
+
+    fn gate_value(&self, atom: usize) -> f64 {
+        self.gate_value[atom]
+    }
+
+    fn atom_is_active(&self, atom: usize) -> bool {
+        self.fixed_gate_value.get(atom).copied().flatten() != Some(0.0)
+    }
+
+    fn fill_decoded(&self, atom: usize, out: &mut [f64]) {
+        out.fill(0.0);
+        for basis in 0..self.atoms[atom].n_basis() {
+            let phi = self.atoms[atom].phi[basis];
+            for (c, value) in out.iter_mut().enumerate() {
+                *value += phi * self.atoms[atom].decoder[basis][c];
+            }
+        }
+    }
+
+    fn fill_decoded_first(&self, atom: usize, axis: usize, out: &mut [f64]) {
+        out.fill(0.0);
+        for basis in 0..self.atoms[atom].n_basis() {
+            let d_phi = self.atoms[atom].d_phi[basis][axis];
+            for (c, value) in out.iter_mut().enumerate() {
+                *value += d_phi * self.atoms[atom].decoder[basis][c];
+            }
+        }
+    }
+
+    fn fill_decoded_second(
+        &self,
+        atom: usize,
+        axis_a: usize,
+        axis_b: usize,
+        out: &mut [f64],
+    ) {
+        out.fill(0.0);
+        for basis in 0..self.atoms[atom].n_basis() {
+            let d2_phi = self.atoms[atom].d2_phi[basis][axis_a][axis_b];
+            for (c, value) in out.iter_mut().enumerate() {
+                *value += d2_phi * self.atoms[atom].decoder[basis][c];
+            }
+        }
+    }
+
+    fn n_beta_borders(&self) -> usize {
+        0
+    }
+
+    fn beta_border_atom(&self, _border: usize) -> usize {
+        panic!("owned row-program oracle has no beta borders")
+    }
+
+    fn beta_border_basis_value(&self, _border: usize) -> f64 {
+        panic!("owned row-program oracle has no beta borders")
+    }
+
+    fn beta_border_basis_first(&self, _border: usize, _axis: usize) -> f64 {
+        panic!("owned row-program oracle has no beta borders")
+    }
+
+    fn beta_border_output(&self, _border: usize) -> &[f64] {
+        panic!("owned row-program oracle has no beta borders")
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // 4-ROW SIMD BATCH (the jet's throughput lever over hand-scalar code)
 //
 // The hot per-row jet kernels (`reconstruction_all_columns_packed`,

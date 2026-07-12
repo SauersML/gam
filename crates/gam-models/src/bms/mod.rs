@@ -288,11 +288,23 @@ pub struct EmpiricalZGrid {
 
 impl EmpiricalZGrid {
     /// Construct a grid whose node/weight invariants (equal length ≥ 2, finite
-    /// nodes, finite positive weights, weights summing to 1 within 1e-8) are
-    /// enforced up-front. Prefer this over building the struct literally;
-    /// every code path that goes through `new` is guaranteed to satisfy the
-    /// same contract that `validate_empirical_z_grid` checks on read.
+    /// ascending nodes, finite positive weights, weights summing to 1 within
+    /// 1e-8) are enforced up-front. Input pairs are sorted by node so hot
+    /// denested-cell kernels can consume contiguous buckets without searching
+    /// the whole grid. Prefer this over building the struct literally; every
+    /// code path that goes through `new` satisfies the same contract that
+    /// `validate_empirical_z_grid` checks on read.
     pub fn new(nodes: Vec<f64>, weights: Vec<f64>, context: &str) -> Result<Self, String> {
+        if nodes.len() != weights.len() {
+            return Err(format!(
+                "{context} empirical latent measure node/weight length mismatch: nodes={}, weights={}",
+                nodes.len(),
+                weights.len()
+            ));
+        }
+        let mut pairs: Vec<(f64, f64)> = nodes.into_iter().zip(weights).collect();
+        pairs.sort_by(|left, right| left.0.total_cmp(&right.0));
+        let (nodes, weights) = pairs.into_iter().unzip();
         validate_empirical_z_grid(&nodes, &weights, context)?;
         Ok(Self { nodes, weights })
     }
@@ -471,6 +483,7 @@ pub(crate) fn validate_empirical_z_grid(
         ));
     }
     let mut total = 0.0;
+    let mut previous_node = f64::NEG_INFINITY;
     for (idx, (&node, &weight)) in nodes.iter().zip(weights.iter()).enumerate() {
         if !node.is_finite() {
             return Err(format!(
@@ -482,6 +495,13 @@ pub(crate) fn validate_empirical_z_grid(
                 "{context} empirical latent measure weight {idx} must be finite and positive, got {weight}"
             ));
         }
+        if node < previous_node {
+            return Err(format!(
+                "{context} empirical latent measure nodes must be sorted ascending, but node {idx} ({node}) is below node {} ({previous_node})",
+                idx - 1
+            ));
+        }
+        previous_node = node;
         total += weight;
     }
     if !(total.is_finite() && (total - 1.0).abs() <= 1e-8) {
