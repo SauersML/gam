@@ -9030,6 +9030,147 @@ fn survival_jeffreys_contracted_trace_hessian_matches_fd_of_trace() {
     }
 }
 
+/// gam#979 perf datapoint + large-`p` correctness cross-check: the O(n·p²)
+/// contracted-trace hook vs the `p(p+1)/2` pairwise second-directional
+/// completion it replaces, at the issue's repro scale (`matern(...,
+/// centers≈20)` ⇒ `p_marginal = p_logslope = 20`, total `p = 41`).
+///
+/// This is the mechanism behind the #979 rescope: the exact Firth/Jeffreys
+/// second-order completion is gated on
+/// `joint_jeffreys_information_contracted_trace_hessian_available()`. Before the
+/// hook that gate was `false` and the completion NEVER ran (the inner Newton
+/// under-modelled curvature near a Firth-active mode ⇒ the near-separation
+/// crawl / 2400 s large_scale timeouts). The completion could not simply be
+/// switched on with the generic pairwise fallback because that costs
+/// `p(p+1)/2` full-data row-streamed second-directional Hessian passes
+/// (`O(n·p⁴)`) — "hundreds of passes" at production p, far too slow to run every
+/// endgame cycle. The hook produces the identical completion in ONE `O(n·p²)`
+/// family pass, cheap enough to run every cycle.
+///
+/// Marked `#[ignore]`: it is a wall-clock benchmark (unsuitable for shared-node
+/// CI timing) that also builds all `p(p+1)/2` pairwise passes, so it is slow by
+/// construction. Run on demand with `--ignored --nocapture`. When run it ALSO
+/// pins the hook to the independent pairwise path over the FULL `p×p` matrix
+/// (truncation-free, via `uᵀ∇²tr(W·H)v = tr(W·∂²H/∂β_u∂β_v)`), a strictly
+/// larger correctness surface than the 7-direction gate above.
+#[test]
+#[ignore = "wall-clock perf benchmark (#979); run with --ignored --nocapture"]
+fn survival_jeffreys_contracted_trace_hook_beats_pairwise_979() {
+    let n = 6000usize;
+    let z: Vec<f64> = (0..n).map(|r| ((r as f64) * 0.29).sin() * 0.9).collect();
+    let weights: Vec<f64> = (0..n).map(|r| 0.6 + 0.4 * ((r % 5) as f64) / 5.0).collect();
+    let event: Vec<f64> = (0..n).map(|r| ((r % 3 == 0) as u8) as f64).collect();
+
+    let p_m = 20usize;
+    let p_g = 20usize;
+    let marginal_design = Array2::from_shape_fn((n, p_m), |(r, j)| {
+        0.2 + 0.05 * ((r + j) as f64).cos() + 0.011 * (j as f64) - 0.003 * (r as f64) / (n as f64)
+    });
+    let logslope_design = Array2::from_shape_fn((n, p_g), |(r, j)| {
+        0.1 + 0.07 * ((r + 2 * j) as f64).sin() - 0.009 * (j as f64) + 0.004 * (r as f64) / (n as f64)
+    });
+
+    let mut family = oracle_rigid_family(n, &z, &weights, &event, None);
+    family.marginal_design = DesignMatrix::from(marginal_design.clone());
+    family.logslope_design = DesignMatrix::from(logslope_design.clone());
+
+    let total = 1 + p_m + p_g;
+    let specs = vec![
+        dummy_blockspec(1),
+        dummy_blockspec(p_m),
+        dummy_blockspec(p_g),
+    ];
+
+    let beta0 = Array1::from_shape_fn(total, |i| 0.1 + 0.03 * ((i as f64) * 1.7).sin());
+    let beta_time = beta0.slice(ndarray::s![0..1]).to_owned();
+    let beta_marginal = beta0.slice(ndarray::s![1..1 + p_m]).to_owned();
+    let beta_logslope = beta0.slice(ndarray::s![1 + p_m..total]).to_owned();
+    let states0 = vec![
+        ParameterBlockState {
+            beta: beta_time,
+            eta: Array1::zeros(n),
+        },
+        ParameterBlockState {
+            beta: beta_marginal.clone(),
+            eta: marginal_design.dot(&beta_marginal),
+        },
+        ParameterBlockState {
+            beta: beta_logslope.clone(),
+            eta: logslope_design.dot(&beta_logslope),
+        },
+    ];
+
+    let mut w_raw = Array2::<f64>::zeros((total, total));
+    for i in 0..total {
+        for j in 0..total {
+            w_raw[[i, j]] = ((i * 7 + j * 11 + 2) % 13) as f64 * 0.1 - 0.6;
+        }
+    }
+    let w = (&w_raw + &w_raw.t()).mapv(|v| v * 0.5);
+
+    // ── Hook: ONE O(n·p²) family pass ────────────────────────────────────
+    let t_hook = std::time::Instant::now();
+    let hook = family
+        .joint_jeffreys_information_contracted_trace_hessian_with_specs(&states0, &specs, &w)
+        .expect("contracted trace hessian call")
+        .expect("rigid path must supply the contracted completion");
+    let hook_secs = t_hook.elapsed().as_secs_f64();
+    assert_eq!(hook.dim(), (total, total));
+
+    // ── Pairwise: p(p+1)/2 full second-directional passes (what the hook
+    // replaces), reconstructing the SAME ∇²_β tr(W·H) via the truncation-free
+    // identity uᵀ∇²tr(W·H)v = tr(W·∂²H/∂β_u∂β_v). ─────────────────────────
+    let unit = |a: usize| -> Array1<f64> {
+        let mut e = Array1::<f64>::zeros(total);
+        e[a] = 1.0;
+        e
+    };
+    let t_pair = std::time::Instant::now();
+    let mut pairwise = Array2::<f64>::zeros((total, total));
+    for a in 0..total {
+        let ea = unit(a);
+        for b in a..total {
+            let eb = unit(b);
+            let huv = family
+                .exact_newton_joint_hessiansecond_directional_derivative(&states0, &ea, &eb)
+                .expect("second directional derivative call")
+                .expect("rigid path must supply the second directional derivative");
+            let val = (&w * &huv).sum();
+            pairwise[[a, b]] = val;
+            pairwise[[b, a]] = val;
+        }
+    }
+    let pair_secs = t_pair.elapsed().as_secs_f64();
+
+    // Correctness: the cheap hook equals the expensive pairwise assembly over
+    // the full p×p matrix, truncation-free.
+    let mut max_rel = 0.0_f64;
+    for a in 0..total {
+        for b in 0..total {
+            let rel = (hook[[a, b]] - pairwise[[a, b]]).abs() / pairwise[[a, b]].abs().max(1.0);
+            max_rel = max_rel.max(rel);
+        }
+    }
+    let n_pairwise_passes = total * (total + 1) / 2;
+    eprintln!(
+        "[979 perf] n={n} p={total} (p_m={p_m} p_g={p_g}) | hook={hook_secs:.4}s (1 pass) | \
+         pairwise={pair_secs:.4}s ({n_pairwise_passes} passes) | speedup={:.1}× | \
+         hook-vs-pairwise max_rel={max_rel:.3e}",
+        pair_secs / hook_secs.max(1e-12)
+    );
+    assert!(
+        max_rel < 1e-9,
+        "hook completion disagrees with pairwise assembly at large p: max_rel={max_rel:.3e}"
+    );
+    // The hook must be dramatically cheaper than the pairwise fallback it
+    // replaces; the theoretical ratio is ~p(p+1)/2, we require a very
+    // conservative ≥20× to stay robust to shared-node timing noise.
+    assert!(
+        hook_secs * 20.0 < pair_secs,
+        "hook not materially faster than pairwise: hook={hook_secs:.4}s pairwise={pair_secs:.4}s"
+    );
+}
+
 /// gam#979 isolation gate: does `SurvivalMarginalSlopeRowKernel`'s
 /// static-sparsity `SparseTower4<RIGID_LINEAR_MASK>` build the SAME full
 /// `t4` (all 256 entries, not just the 3 `fourth_contracted(u,v)` direction
