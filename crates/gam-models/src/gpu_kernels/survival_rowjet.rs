@@ -4,16 +4,16 @@
 //! `(value, gradient[4], Hessian[4][4])`. Large admitted batches execute the
 //! order-2 CUDA lowering of
 //! [`crate::survival::marginal_slope::row_kernel::rigid_row_nll`]; smaller or
-//! unavailable-device batches execute that same canonical row program at the
-//! CPU `SparseOrder2` scalar. Contracted third/fourth derivatives have separate
-//! live CPU consumers whose directions vary by row and are intentionally not
-//! part of this batch API.
+//! unavailable-device batches use the ordinary per-row cache path. Contracted
+//! third/fourth derivatives have separate live CPU consumers whose directions
+//! vary by row and are intentionally not part of this batch API.
 //!
 //! The CUDA leaf uses native full-precision `erfc`, while NVRTC compilation
 //! disables FMA contraction for close agreement with separately rounded host
 //! arithmetic. Direct device tests cover both ordinary and probability-tail
 //! rows against the CPU row program.
 
+#[cfg(test)]
 use crate::survival::marginal_slope::row_kernel::RigidRowInputs;
 
 /// Flattened row-major value, gradient, and Hessian channels for `K = 4`.
@@ -38,6 +38,22 @@ pub(crate) struct SurvivalRowInputs {
 #[cfg(target_os = "linux")]
 const DEVICE_ROW_THRESHOLD: usize = 100_000;
 
+/// Whether this batch is admitted to the production CUDA V/G/H path.
+#[inline]
+#[must_use]
+pub(crate) const fn survival_rigid_row_vgh_device_selected(n_rows: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        n_rows >= DEVICE_ROW_THRESHOLD
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = n_rows;
+        false
+    }
+}
+
+#[cfg(test)]
 #[inline]
 fn rigid_cpu_row_inputs(
     row: usize,
@@ -57,6 +73,7 @@ fn rigid_cpu_row_inputs(
 }
 
 /// CPU execution of the canonical row program at its order-2 scalar.
+#[cfg(test)]
 #[must_use]
 fn survival_rigid_row_vgh_cpu(
     rows: &[SurvivalRowInputs],
@@ -88,24 +105,19 @@ fn survival_rigid_row_vgh_cpu(
     SurvivalRowVghChannels { value, grad, hess }
 }
 
-/// Production V/G/H dispatcher for the all-row cache build.
+/// Execute an already-admitted production V/G/H batch on CUDA.
+#[cfg(target_os = "linux")]
 #[must_use]
 pub(crate) fn survival_rigid_row_vgh(
     rows: &[SurvivalRowInputs],
     probit_scale: f64,
-) -> SurvivalRowVghChannels {
-    #[cfg(target_os = "linux")]
-    {
-        if rows.len() >= DEVICE_ROW_THRESHOLD {
-            match device::survival_rigid_row_vgh_device(rows, probit_scale) {
-                Ok(out) => return out,
-                Err(error) => {
-                    log::info!("[GPU] survival VGH device path fell back to CPU: {error}");
-                }
-            }
-        }
-    }
-    survival_rigid_row_vgh_cpu(rows, probit_scale)
+) -> Result<SurvivalRowVghChannels, String> {
+    assert!(
+        survival_rigid_row_vgh_device_selected(rows.len()),
+        "survival VGH CUDA execution requires an admitted batch",
+    );
+    device::survival_rigid_row_vgh_device(rows, probit_scale)
+        .map_err(|error| format!("survival VGH device execution failed: {error}"))
 }
 
 /// Order-2 CUDA lowering for the four rigid survival primaries.
@@ -221,13 +233,9 @@ mod device {
         let wi_device = stream.clone_htod(&wi).gpu_ctx("vgh htod wi")?;
         let di_device = stream.clone_htod(&di).gpu_ctx("vgh htod di")?;
         let z_sum_device = stream.clone_htod(&z_sum).gpu_ctx("vgh htod z_sum")?;
-        let cov_ones_device = stream
-            .clone_htod(&cov_ones)
-            .gpu_ctx("vgh htod cov_ones")?;
+        let cov_ones_device = stream.clone_htod(&cov_ones).gpu_ctx("vgh htod cov_ones")?;
         let mut value_device = stream.alloc_zeros::<f64>(n).gpu_ctx("vgh alloc value")?;
-        let mut grad_device = stream
-            .alloc_zeros::<f64>(n * 4)
-            .gpu_ctx("vgh alloc grad")?;
+        let mut grad_device = stream.alloc_zeros::<f64>(n * 4).gpu_ctx("vgh alloc grad")?;
         let mut hess_device = stream
             .alloc_zeros::<f64>(n * 16)
             .gpu_ctx("vgh alloc hess")?;
@@ -236,11 +244,7 @@ mod device {
             .map_err(|_| gam_gpu::gpu_err!("survival_rowjet_vgh n={n} overflows i32"))?;
         const THREADS_PER_BLOCK: u32 = 128;
         let config = LaunchConfig {
-            grid_dim: (
-                ((n as u32).div_ceil(THREADS_PER_BLOCK)).max(1),
-                1,
-                1,
-            ),
+            grid_dim: (((n as u32).div_ceil(THREADS_PER_BLOCK)).max(1), 1, 1),
             block_dim: (THREADS_PER_BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -291,8 +295,7 @@ mod tests {
         rows: &[SurvivalRowInputs],
         probit_scale: f64,
     ) -> Result<SurvivalRowVghChannels, String> {
-        device::survival_rigid_row_vgh_device(rows, probit_scale)
-            .map_err(|error| error.to_string())
+        device::survival_rigid_row_vgh_device(rows, probit_scale).map_err(|error| error.to_string())
     }
 
     fn fixture(n: usize) -> Vec<SurvivalRowInputs> {
@@ -354,8 +357,7 @@ mod tests {
                 assert!((expected.g()[a] - out.grad[row * 4 + a]).abs() <= 1e-12);
                 for b in 0..4 {
                     assert!(
-                        (expected.h()[a][b] - out.hess[row * 16 + a * 4 + b]).abs()
-                            <= 1e-12,
+                        (expected.h()[a][b] - out.hess[row * 16 + a * 4 + b]).abs() <= 1e-12,
                         "Hessian mismatch at row {row}, ({a}, {b})",
                     );
                 }
@@ -371,9 +373,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn assert_channel_parity(name: &str, cpu: &[f64], device: &[f64]) {
         assert_eq!(cpu.len(), device.len(), "{name} channel length");
-        let scale = cpu.iter().fold(0.0_f64, |current, value| {
-            current.max(value.abs())
-        });
+        let scale = cpu
+            .iter()
+            .fold(0.0_f64, |current, value| current.max(value.abs()));
         let tolerance = PARITY_ABS_TOLERANCE + PARITY_REL_TOLERANCE * scale;
         let (worst_index, worst) = cpu
             .iter()
@@ -394,7 +396,7 @@ mod tests {
     fn admitted_dispatch_and_device_path_match_cpu_vgh() {
         let rows = fixture(DEVICE_ROW_THRESHOLD + 1024);
         let cpu = survival_rigid_row_vgh_cpu(&rows, 0.7);
-        let dispatched = survival_rigid_row_vgh(&rows, 0.7);
+        let dispatched = survival_rigid_row_vgh(&rows, 0.7).expect("admitted CUDA VGH batch");
         assert_channel_parity("dispatched value", &cpu.value, &dispatched.value);
         assert_channel_parity("dispatched gradient", &cpu.grad, &dispatched.grad);
         assert_channel_parity("dispatched Hessian", &cpu.hess, &dispatched.hess);

@@ -736,18 +736,26 @@ pub fn build_row_kernel_cache<const K: usize>(
             // GPU fast path (#932-GPU): a kernel that can evaluate every row's
             // primary (v,g,H) in one batched device pass returns the three
             // parallel n-length vectors here. The result is the SAME unified
-            // jet (≤1e-9), so the cache is bit-close; on `None` or any error
-            // we fall through to the per-row CPU loop below.
-            if let Some(Ok((bv, bg, bh))) = kern.batched_value_grad_hess_all() {
-                if bv.len() == n && bg.len() == n && bh.len() == n {
-                    return Ok(RowKernelCache {
-                        n,
-                        p,
-                        nll: bv,
-                        gradients: bg,
-                        hessians: bh,
-                    });
+            // jet (≤1e-9), so the cache is bit-close. `None` means no batched
+            // path was selected. Once selected, errors and malformed channel
+            // lengths fail loudly rather than silently retrying per row.
+            if let Some(batched) = kern.batched_value_grad_hess_all() {
+                let (bv, bg, bh) = batched?;
+                if bv.len() != n || bg.len() != n || bh.len() != n {
+                    return Err(format!(
+                        "batched row-kernel channel lengths ({}, {}, {}) do not match n={n}",
+                        bv.len(),
+                        bg.len(),
+                        bh.len(),
+                    ));
                 }
+                return Ok(RowKernelCache {
+                    n,
+                    p,
+                    nll: bv,
+                    gradients: bg,
+                    hessians: bh,
+                });
             }
             // Pool-aware block size (issue #1045): a few-per-worker partition of
             // the row range instead of one task per 256-row arrow tile, so the
