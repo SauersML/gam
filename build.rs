@@ -4783,9 +4783,12 @@ fn enforce_production_derivative_specializations(root: &Path) {
                 continue;
             }
             let trimmed = line.trim();
-            let row_kernel_impl = (trimmed.starts_with("impl ") || trimmed.starts_with("impl<"))
-                && trimmed.contains("RowKernel<")
-                && trimmed.contains(" for ");
+            let row_kernel_impl = trimmed
+                .split_once(" for ")
+                .is_some_and(|(implementation, _)| {
+                    (implementation.starts_with("impl ") || implementation.starts_with("impl<"))
+                        && implementation.contains("RowKernel<")
+                });
             if row_kernel_impl
                 && !specialization_site_is_registered(
                     DerivativeSpecializationKind::RowKernel,
