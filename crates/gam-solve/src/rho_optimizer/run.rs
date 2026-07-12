@@ -639,7 +639,12 @@ impl OuterProblem {
         let objective_lower = obj.outer_domain_lower_bound()?;
         let objective_upper = obj.outer_domain_upper_bound()?;
         if objective_lower.is_some() || objective_upper.is_some() {
-            install_objective_domain(&mut config, self.n_params, objective_lower, objective_upper)?;
+            install_objective_domain(
+                &mut config,
+                self.n_params,
+                objective_lower,
+                objective_upper,
+            )?;
         }
         let Some(session) = config.cache_session.clone() else {
             return run_outer(obj, &config, context);
@@ -1123,9 +1128,8 @@ pub(crate) fn certificate_hessian_is_psd(hessian: &Array2<f64>) -> Option<bool> 
 /// [`certificate_hessian_is_psd`] so the definiteness verdict and this decrement
 /// agree on the same regularized operator. Returns `None` when the shapes are
 /// malformed, an entry is non-finite, the shifted factor is not PD, or the
-/// resulting quadratic form is negative (a PD factor rules that sign out up to
-/// roundoff, which this guard absorbs; the caller then falls back to the
-/// gradient-only bound).
+/// resulting quadratic form is negative (which a PD factor rules out; retained
+/// as a roundoff guard).
 pub(crate) fn newton_predicted_decrease(hessian: &Array2<f64>, grad: &Array1<f64>) -> Option<f64> {
     let n = hessian.nrows();
     if n == 0 || hessian.ncols() != n || grad.len() != n {
@@ -2545,7 +2549,7 @@ pub(crate) fn outer_bounds_template(config: &OuterConfig, n: usize) -> (Array1<f
 /// box. The resulting box is stored back on `config`, making it the one source
 /// consumed by seed projection, continuation entry, every solver, and terminal
 /// projected-stationarity certification.
-pub(crate) fn install_objective_domain(
+fn install_objective_domain(
     config: &mut OuterConfig,
     n_params: usize,
     objective_lower: Option<Array1<f64>>,
@@ -2596,7 +2600,7 @@ pub(crate) fn install_objective_domain(
         }
         if !(lower[index].is_finite() && upper[index].is_finite() && lower[index] < upper[index]) {
             return Err(EstimationError::InvalidInput(format!(
-                "outer objective-domain intersection has no finite searchable interval at coordinate {index}: lower={}, upper={}; a closed scalar endpoint may be valid for fixed-rho evaluation, but an active optimizer coordinate requires lower < upper",
+                "outer objective-domain intersection is empty or non-finite at coordinate {index}: lower={}, upper={}",
                 lower[index], upper[index]
             )));
         }
