@@ -42,7 +42,7 @@ mod tests;
 pub use curvature::*;
 pub use deviance::*;
 pub(crate) use dispersion::*;
-pub use family_state::*;
+pub(crate) use family_state::*;
 pub(crate) use gam_working_model::*;
 pub use glm_update::*;
 pub use low_rank::*;
