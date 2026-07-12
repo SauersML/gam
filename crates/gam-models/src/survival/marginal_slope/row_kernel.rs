@@ -827,6 +827,61 @@ impl SurvivalMarginalSlopeRowKernel {
     }
 }
 
+#[cfg(test)]
+mod rigid_row_admission_tests {
+    use super::*;
+
+    fn inputs(wi: f64, di: f64) -> RigidRowInputs {
+        RigidRowInputs {
+            row: 7,
+            wi,
+            di,
+            z_sum: 0.0,
+            covariance_ones: 1.0,
+            probit_scale: 1.0,
+            qd1_lower: 0.0,
+        }
+    }
+
+    fn admit(primaries: [f64; 4], inputs: &RigidRowInputs) -> Result<(), String> {
+        let [neg_eta0, neg_eta1, adjusted_derivative] = rigid_row_program_witnesses(
+            primaries[0],
+            primaries[1],
+            primaries[2],
+            primaries[3],
+            inputs.wi,
+            inputs.di,
+            inputs.z_sum,
+            inputs.covariance_ones,
+            inputs.probit_scale,
+        );
+        validate_rigid_row_admission(
+            primaries[2],
+            inputs,
+            neg_eta0,
+            neg_eta1,
+            adjusted_derivative,
+        )
+    }
+
+    #[test]
+    fn scalar_gpu_admission_witnesses_match_cpu_signed_margin_domain() {
+        for primaries in [[f64::NAN, 0.0, 1.0, 0.0], [0.0, f64::INFINITY, 1.0, 0.0]] {
+            let error = admit(primaries, &inputs(1.0, 0.0))
+                .expect_err("active non-finite signed margin must be rejected");
+            assert!(error.contains("non-finite signed margin"));
+        }
+
+        admit(
+            [f64::NEG_INFINITY, f64::NEG_INFINITY, 1.0, 0.0],
+            &inputs(1.0, 0.0),
+        )
+        .expect("positive-infinity signed margins are the admitted saturated tail");
+        admit([f64::NAN, f64::NAN, 1.0, 0.0], &inputs(0.0, 0.0))
+            .expect("zero-weight margins do not contribute to the row");
+    }
+}
+
 pub(crate) fn rigid_row_kernel_primaries(
     family: &SurvivalMarginalSlopeFamily,
     block_states: &[ParameterBlockState],
@@ -941,13 +996,12 @@ pub(crate) fn rigid_row_nll<S: JetScalar<4>>(
     inputs: &RigidRowInputs,
 ) -> Result<S, String> {
     let RigidRowInputs {
-        row,
         wi,
         di,
         z_sum,
         covariance_ones,
         probit_scale,
-        qd1_lower,
+        ..
     } = *inputs;
 
     let (nll, [neg_eta0, neg_eta1, adjusted_derivative]) = rigid_row_program(
@@ -962,11 +1016,39 @@ pub(crate) fn rigid_row_nll<S: JetScalar<4>>(
         probit_scale,
     );
 
-    if survival_derivative_guard_violated(vars[2].value(), qd1_lower) {
+    validate_rigid_row_admission(
+        vars[2].value(),
+        inputs,
+        neg_eta0,
+        neg_eta1,
+        adjusted_derivative,
+    )?;
+    Ok(nll)
+}
+
+/// Apply the scalar domain contract shared by the ordinary row evaluator and
+/// the already-admitted GPU gather. The three witnesses come from the same
+/// [`row_program!`] declaration: directly from the generic program on CPU and
+/// from its dependency-sliced scalar witness schedule during GPU admission.
+fn validate_rigid_row_admission(
+    qd1: f64,
+    inputs: &RigidRowInputs,
+    neg_eta0: f64,
+    neg_eta1: f64,
+    adjusted_derivative: f64,
+) -> Result<(), String> {
+    let RigidRowInputs {
+        row,
+        wi,
+        di,
+        qd1_lower,
+        ..
+    } = *inputs;
+    if survival_derivative_guard_violated(qd1, qd1_lower) {
         return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
             reason: format!(
                 "survival marginal-slope monotonicity violated at row {row}: raw time derivative={:.3e} must be at least derivative_guard={:.3e}; transformed time derivative={:.3e}",
-                vars[2].value(), qd1_lower, adjusted_derivative
+                qd1, qd1_lower, adjusted_derivative
             ),
         }
         .into());
@@ -993,7 +1075,7 @@ pub(crate) fn rigid_row_nll<S: JetScalar<4>>(
 
     reject_nonfinite_margin(neg_eta0, wi)?;
     reject_nonfinite_margin(neg_eta1, wi * (1.0 - di))?;
-    Ok(nll)
+    Ok(())
 }
 
 /// #932: the canonical single-source seam. The row NLL is written ONCE as
@@ -1060,8 +1142,9 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     /// cache path. Once admitted, probe/compile/launch/transfer failures are
     /// returned and never hidden by a CPU retry.
     ///
-    /// The host gather validates the monotonicity guard before launch because the
-    /// device kernel consumes already-admitted primaries.
+    /// The host gather applies the canonical derivative and signed-margin domain
+    /// checks before launch because the device kernel consumes already-admitted
+    /// primaries.
     fn batched_value_grad_hess_all(
         &self,
     ) -> Option<Result<(Vec<f64>, Vec<[f64; 4]>, Vec<[[f64; 4]; 4]>), String>> {
@@ -1076,7 +1159,6 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         {
             use crate::gpu_kernels::survival_rowjet::{SurvivalRowInputs, survival_rigid_row_vgh};
             let probit_scale = self.family.probit_frailty_scale();
-            let qd1_lower = self.family.time_derivative_lower_bound();
             // Gather per-row inputs in parallel (the pure-f64 score summary + primary
             // projections — the same quantities the per-row path computes).
             let gather: Result<Vec<SurvivalRowInputs>, String> = (0..n)
@@ -1089,22 +1171,24 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
                         row,
                         "survival marginal-slope rigid row kernel (batched)",
                     )?;
-                    if survival_derivative_guard_violated(p[2], qd1_lower) {
-                        let observed_g = p[3] * probit_scale;
-                        let correction =
-                            (1.0 + observed_g * observed_g * inputs.covariance_ones).sqrt();
-                        return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
-                            reason: format!(
-                                "survival marginal-slope monotonicity violated at row {row}: \
-                             raw time derivative={:.3e} must be at least \
-                             derivative_guard={qd1_lower:.3e}; transformed time \
-                             derivative={:.3e}",
-                                p[2],
-                                p[2] * correction,
-                            ),
-                        }
-                        .into());
-                    }
+                    let [neg_eta0, neg_eta1, adjusted_derivative] = rigid_row_program_witnesses(
+                        p[0],
+                        p[1],
+                        p[2],
+                        p[3],
+                        inputs.wi,
+                        inputs.di,
+                        inputs.z_sum,
+                        inputs.covariance_ones,
+                        probit_scale,
+                    );
+                    validate_rigid_row_admission(
+                        p[2],
+                        &inputs,
+                        neg_eta0,
+                        neg_eta1,
+                        adjusted_derivative,
+                    )?;
                     Ok(SurvivalRowInputs {
                         primaries: p,
                         wi: inputs.wi,

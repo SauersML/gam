@@ -440,6 +440,91 @@ fn rust_expression(expression: &ProgramExpr, leaves: &[Leaf]) -> TokenStream2 {
     }
 }
 
+fn rust_scalar_expression(expression: &ProgramExpr, leaves: &[Leaf]) -> TokenStream2 {
+    match expression {
+        ProgramExpr::Path(ident) => quote!(#ident),
+        ProgramExpr::Zero => quote!(0.0),
+        ProgramExpr::Neg(value) => {
+            let value = rust_scalar_expression(value, leaves);
+            quote!(-(#value))
+        }
+        ProgramExpr::Scale(value, scalar) => {
+            let value = rust_scalar_expression(value, leaves);
+            quote!((#value) * (#scalar))
+        }
+        ProgramExpr::AddConstant(value, scalar) => {
+            let value = rust_scalar_expression(value, leaves);
+            quote!((#value) + (#scalar))
+        }
+        ProgramExpr::Add(left, right) => {
+            let left = rust_scalar_expression(left, leaves);
+            let right = rust_scalar_expression(right, leaves);
+            quote!((#left) + (#right))
+        }
+        ProgramExpr::Mul(left, right) => {
+            let left = rust_scalar_expression(left, leaves);
+            let right = rust_scalar_expression(right, leaves);
+            quote!((#left) * (#right))
+        }
+        ProgramExpr::Compose {
+            leaf,
+            value,
+            arguments,
+        } => {
+            let rust_leaf = &leaves[*leaf].rust;
+            quote!(#rust_leaf(#value, #(#arguments),*)[0])
+        }
+    }
+}
+
+fn collect_dependencies(expression: &ProgramExpr, dependencies: &mut HashSet<String>) {
+    match expression {
+        ProgramExpr::Path(ident) => {
+            dependencies.insert(ident.to_string());
+        }
+        ProgramExpr::Zero => {}
+        ProgramExpr::Neg(value)
+        | ProgramExpr::Scale(value, _)
+        | ProgramExpr::AddConstant(value, _) => collect_dependencies(value, dependencies),
+        ProgramExpr::Add(left, right) | ProgramExpr::Mul(left, right) => {
+            collect_dependencies(left, dependencies);
+            collect_dependencies(right, dependencies);
+        }
+        ProgramExpr::Compose { value, .. } => {
+            dependencies.insert(value.to_string());
+        }
+    }
+}
+
+fn witness_dependencies(statements: &[Statement], witnesses: &[Ident]) -> HashSet<String> {
+    let mut dependencies = witnesses
+        .iter()
+        .map(ToString::to_string)
+        .collect::<HashSet<_>>();
+    loop {
+        let previous_len = dependencies.len();
+        for statement in statements.iter().rev() {
+            match statement {
+                Statement::Local { name, value, .. } => {
+                    if dependencies.contains(&name.to_string()) {
+                        collect_dependencies(value, &mut dependencies);
+                    }
+                }
+                Statement::If { assignments, .. } => {
+                    for (target, value) in assignments {
+                        if dependencies.contains(&target.to_string()) {
+                            collect_dependencies(value, &mut dependencies);
+                        }
+                    }
+                }
+            }
+        }
+        if dependencies.len() == previous_len {
+            return dependencies;
+        }
+    }
+}
+
 fn scalar_cuda(expression: &Expr, constants: &HashSet<String>) -> Result<String> {
     match expression {
         Expr::Path(path) => {
@@ -1178,6 +1263,52 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
     let rust_result = rust_expression(&result, &leaves);
     let witness_values = witnesses.iter().map(|witness| quote!(#witness.value()));
     let witness_count = witnesses.len();
+    let scalar_witness_dependencies = witness_dependencies(&statements, &witnesses);
+    let scalar_witness_statements = statements.iter().filter_map(|statement| match statement {
+        Statement::Local {
+            name,
+            mutable,
+            value,
+        } if scalar_witness_dependencies.contains(&name.to_string()) => {
+            let value = rust_scalar_expression(value, &leaves);
+            Some(if *mutable {
+                quote!(let mut #name = #value;)
+            } else {
+                quote!(let #name = #value;)
+            })
+        }
+        Statement::If {
+            condition,
+            assignments,
+        } => {
+            let assignments = assignments
+                .iter()
+                .filter(|(target, _)| scalar_witness_dependencies.contains(&target.to_string()))
+                .map(|(target, value)| {
+                    let value = rust_scalar_expression(value, &leaves);
+                    quote!(#target = #value;)
+                })
+                .collect::<Vec<_>>();
+            (!assignments.is_empty()).then(|| quote!(if #condition { #(#assignments)* }))
+        }
+        Statement::Local { .. } => None,
+    });
+    let scalar_witness_name = format_ident!("{}_witnesses", name);
+    let scalar_witness_function = if witnesses.is_empty() {
+        quote!()
+    } else {
+        let scalar_witness_values = witnesses.iter();
+        quote! {
+            #[inline(always)]
+            #visibility fn #scalar_witness_name(
+                #(#primaries: f64,)*
+                #(#constants: f64),*
+            ) -> [f64; #witness_count] {
+                #(#scalar_witness_statements)*
+                [#(#scalar_witness_values),*]
+            }
+        }
+    };
     let dimension = primaries.len();
     let cuda = cuda_source(
         &name,
@@ -1200,6 +1331,8 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
             let __row_program_result = #rust_result;
             (__row_program_result, [#(#witness_values),*])
         }
+
+        #scalar_witness_function
 
         #visibility const #cuda_name: &str = #cuda_literal;
     })
@@ -1229,6 +1362,21 @@ mod tests {
                 Some(source.value())
             })
             .expect("expanded CUDA source constant")
+    }
+
+    fn emitted_function(input: TokenStream2, name: &str) -> String {
+        let input = syn::parse2::<Input>(input).expect("parse row program");
+        let expanded = expand(input).expect("expand row program");
+        let file = syn::parse2::<syn::File>(expanded).expect("parse macro expansion");
+        file.items
+            .into_iter()
+            .find_map(|item| {
+                let syn::Item::Fn(item) = item else {
+                    return None;
+                };
+                (item.sig.ident == name).then(|| quote!(#item).to_string())
+            })
+            .expect("expanded function")
     }
 
     #[test]
@@ -1347,5 +1495,32 @@ mod tests {
         assert_eq!(cuda.matches("double out_stack0[3]").count(), 1);
         assert_eq!(cuda.matches("double out_stack1[3]").count(), 1);
         assert_eq!(cuda.matches("d_log(out_v, out_stack").count(), 2);
+    }
+
+    #[test]
+    fn scalar_witness_schedule_is_dependency_sliced_from_the_same_program() {
+        let witness = emitted_function(
+            quote! {
+                fn sliced(q, g; event)
+                leaves {
+                    sqrt => sqrt_stack => d_sqrt,
+                    log => log_stack => d_log,
+                }
+                witnesses [adjusted];
+                {
+                    let square = add_constant(mul(g, g), 1.0);
+                    let correction = compose(sqrt, square);
+                    let adjusted = mul(q, correction);
+                    let discarded = compose(log, adjusted);
+                    return add(adjusted, discarded);
+                }
+            },
+            "sliced_witnesses",
+        );
+
+        assert!(witness.contains("sqrt_stack"));
+        assert!(witness.contains("adjusted"));
+        assert!(!witness.contains("log_stack"));
+        assert!(!witness.contains("discarded"));
     }
 }
