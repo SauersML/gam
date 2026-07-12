@@ -2652,7 +2652,7 @@ fn matched_control_verdicts(
         ));
     }
     use gam::terms::sae::null_battery::{
-        covariance_matched_gaussian_null, per_dimension_shuffle_null,
+        covariance_exact_hadamard_null, per_dimension_shuffle_null,
     };
     let shuffled = per_dimension_shuffle_null(coords_view, seed ^ 0xD1AE_510F)?;
     let gaussian = covariance_matched_gaussian_null(coords_view, seed ^ 0xC0A4_71A1)?;
@@ -2744,9 +2744,9 @@ pub(crate) fn shape_matched_control<'py>(
     let data = data.as_array();
     let control = match kind {
         "per_dimension_shuffle" => per_dimension_shuffle_null(data, seed),
-        "covariance_matched_gaussian" => covariance_matched_gaussian_null(data, seed),
+        "covariance_exact_hadamard" => covariance_exact_hadamard_null(data, seed),
         other => Err(format!(
-            "shape_matched_control: kind must be per_dimension_shuffle or covariance_matched_gaussian; got {other:?}"
+            "shape_matched_control: kind must be per_dimension_shuffle or covariance_exact_hadamard; got {other:?}"
         )),
     }
     .map_err(py_value_error)?;
@@ -2755,9 +2755,10 @@ pub(crate) fn shape_matched_control<'py>(
 
 /// Float32-preserving structureless control for full-pipeline censuses.
 ///
-/// Unlike [`shape_matched_control`], this entry point never widens the `n × p`
-/// input or output matrix. The covariance-matched branch still accumulates its
-/// `O(p²)` moment/eigendecomposition workspace in float64.
+/// Unlike [`shape_matched_control`], this entry point never widens the full
+/// `n × p` input or output matrix. The covariance-exact branch transforms one
+/// power-of-two row block at a time in a bounded `B × p` float64 workspace,
+/// with `B <= 1024`; it never forms a `p × p` covariance or eigendecomposition.
 #[pyfunction]
 #[pyo3(signature = (data, kind, seed = 11))]
 pub(crate) fn shape_matched_control_f32<'py>(
@@ -2767,16 +2768,16 @@ pub(crate) fn shape_matched_control_f32<'py>(
     seed: u64,
 ) -> PyResult<Bound<'py, numpy::PyArray2<f32>>> {
     use gam::terms::sae::null_battery::{
-        covariance_matched_gaussian_null_f32, per_dimension_shuffle_null_f32,
+        covariance_exact_hadamard_null_f32, per_dimension_shuffle_null_f32,
     };
     use numpy::IntoPyArray;
 
     let data = data.as_array();
     let control = match kind {
         "per_dimension_shuffle" => per_dimension_shuffle_null_f32(data, seed),
-        "covariance_matched_gaussian" => covariance_matched_gaussian_null_f32(data, seed),
+        "covariance_exact_hadamard" => covariance_exact_hadamard_null_f32(data, seed),
         other => Err(format!(
-            "shape_matched_control_f32: kind must be per_dimension_shuffle or covariance_matched_gaussian; got {other:?}"
+            "shape_matched_control_f32: kind must be per_dimension_shuffle or covariance_exact_hadamard; got {other:?}"
         )),
     }
     .map_err(py_value_error)?;

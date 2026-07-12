@@ -626,6 +626,265 @@ pub fn per_dimension_shuffle_null_f32(
     Ok(out)
 }
 
+trait HadamardScalar: Copy + Default {
+    const TYPE_NAME: &'static str;
+
+    fn widen(self) -> f64;
+    fn narrow(value: f64) -> Option<Self>;
+}
+
+impl HadamardScalar for f64 {
+    const TYPE_NAME: &'static str = "float64";
+
+    fn widen(self) -> f64 {
+        self
+    }
+
+    fn narrow(value: f64) -> Option<Self> {
+        value.is_finite().then_some(value)
+    }
+}
+
+impl HadamardScalar for f32 {
+    const TYPE_NAME: &'static str = "float32";
+
+    fn widen(self) -> f64 {
+        f64::from(self)
+    }
+
+    fn narrow(value: f64) -> Option<Self> {
+        let narrowed = value as f32;
+        (value.is_finite() && narrowed.is_finite()).then_some(narrowed)
+    }
+}
+
+fn largest_power_of_two_at_most(value: usize) -> Result<usize, String> {
+    if value == 0 {
+        return Err("Hadamard block size must be positive".to_string());
+    }
+    Ok(1usize << (usize::BITS - value.leading_zeros() - 1))
+}
+
+fn covariance_exact_hadamard_workspace_rows(nrows: usize) -> Result<usize, String> {
+    largest_power_of_two_at_most(nrows.min(COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS))
+}
+
+/// In-place, unnormalised Sylvester fast Walsh-Hadamard transform over rows.
+///
+/// A stage owns disjoint row-pair slabs. Rayon may schedule those slabs in any
+/// order, but every scalar follows the same fixed butterfly sequence, making
+/// the result bit-identical across thread counts and schedules.
+fn fwht_rows_in_place(
+    workspace: &mut [f64],
+    rows: usize,
+    cols: usize,
+) -> Result<(), String> {
+    if !rows.is_power_of_two() || cols == 0 {
+        return Err(format!(
+            "Hadamard transform shape must have positive power-of-two rows and positive columns; got {rows} × {cols}"
+        ));
+    }
+    let expected_scalars = rows.checked_mul(cols).ok_or_else(|| {
+        format!("Hadamard transform shape overflowed: {rows} rows × {cols} columns")
+    })?;
+    if workspace.len() != expected_scalars {
+        return Err(format!(
+            "Hadamard transform workspace has {} scalars, expected {expected_scalars} for {rows} × {cols}",
+            workspace.len()
+        ));
+    }
+    let mut half = 1usize;
+    while half < rows {
+        let slab_rows = half
+            .checked_mul(2)
+            .ok_or_else(|| "Hadamard stage row count overflowed".to_string())?;
+        let slab_scalars = slab_rows.checked_mul(cols).ok_or_else(|| {
+            format!(
+                "Hadamard stage shape overflowed: {slab_rows} rows × {cols} columns"
+            )
+        })?;
+        if workspace.len() % slab_scalars != 0 {
+            return Err(format!(
+                "Hadamard stage slab of {slab_scalars} scalars does not divide workspace length {}",
+                workspace.len()
+            ));
+        }
+        workspace
+            .par_chunks_mut(slab_scalars)
+            .for_each(|slab| {
+                let (upper, lower) = slab.split_at_mut(half * cols);
+                for paired_row in 0..half {
+                    let row_offset = paired_row * cols;
+                    for col in 0..cols {
+                        let index = row_offset + col;
+                        let left = upper[index];
+                        let right = lower[index];
+                        upper[index] = left + right;
+                        lower[index] = left - right;
+                    }
+                }
+            });
+        half = slab_rows;
+    }
+    Ok(())
+}
+
+fn covariance_exact_hadamard_null_impl<T: HadamardScalar>(
+    data: ArrayView2<'_, T>,
+    seed: u64,
+) -> Result<Array2<T>, String> {
+    let n = data.nrows();
+    let p = data.ncols();
+    let workspace_rows = covariance_exact_hadamard_workspace_rows(n)?;
+    let workspace_scalars = workspace_rows.checked_mul(p).ok_or_else(|| {
+        format!(
+            "{} covariance-exact Hadamard workspace shape overflowed: {workspace_rows} rows × {p} columns",
+            T::TYPE_NAME
+        )
+    })?;
+    let mut workspace = Vec::<f64>::new();
+    workspace.try_reserve_exact(workspace_scalars).map_err(|error| {
+        format!(
+            "could not allocate {} covariance-exact Hadamard workspace ({workspace_rows} × {p} float64 scalars): {error}",
+            T::TYPE_NAME
+        )
+    })?;
+    workspace.resize(workspace_scalars, 0.0);
+
+    let origin = (0..p)
+        .map(|col| data[[0, col]].widen())
+        .collect::<Vec<_>>();
+    let mut permutation = (0..n).collect::<Vec<_>>();
+    let mut permutation_rng =
+        StdRng::seed_from_u64(seed ^ HADAMARD_PERMUTATION_SEED_DOMAIN);
+    permutation.shuffle(&mut permutation_rng);
+
+    let mut signs = vec![1.0_f64; workspace_rows];
+    let output_scalars = n.checked_mul(p).ok_or_else(|| {
+        format!(
+            "{} covariance-exact Hadamard output shape overflowed: {n} rows × {p} columns",
+            T::TYPE_NAME
+        )
+    })?;
+    let mut output_storage = Vec::<T>::new();
+    output_storage
+        .try_reserve_exact(output_scalars)
+        .map_err(|error| {
+            format!(
+                "could not allocate {} covariance-exact Hadamard output ({n} × {p} native scalars): {error}",
+                T::TYPE_NAME
+            )
+        })?;
+    output_storage.resize(output_scalars, T::default());
+    let mut out = Array2::<T>::from_shape_vec((n, p), output_storage).map_err(|error| {
+        format!(
+            "could not construct {} covariance-exact Hadamard output with shape {n} × {p}: {error}",
+            T::TYPE_NAME
+        )
+    })?;
+    let mut block_start = 0usize;
+    let mut block_ordinal = 0usize;
+    while block_start < n {
+        let block_rows = largest_power_of_two_at_most(
+            (n - block_start).min(COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS),
+        )?;
+        let block_scalars = block_rows.checked_mul(p).ok_or_else(|| {
+            format!(
+                "{} covariance-exact Hadamard block shape overflowed: {block_rows} rows × {p} columns",
+                T::TYPE_NAME
+            )
+        })?;
+        let block_workspace = &mut workspace[..block_scalars];
+        let inverse_rows = 1.0 / block_rows as f64;
+
+        for local_row in 0..block_rows {
+            let source_row = permutation[block_start + local_row];
+            for col in 0..p {
+                // Transform in the first-row residual chart. This prevents a
+                // large absolute origin from erasing small covariance-bearing
+                // residuals while Q·1 = 1 restores the same origin exactly.
+                let relative = data[[source_row, col]].widen() - origin[col];
+                let scaled = relative * inverse_rows;
+                if !scaled.is_finite() {
+                    return Err(format!(
+                        "{} covariance-exact Hadamard residual overflowed at input row {source_row}, column {col}",
+                        T::TYPE_NAME
+                    ));
+                }
+                block_workspace[local_row * p + col] = scaled;
+            }
+        }
+
+        fwht_rows_in_place(block_workspace, block_rows, p)?;
+        let mut sign_rng = StdRng::seed_from_u64(mix_seed(
+            seed ^ HADAMARD_SIGN_SEED_DOMAIN,
+            block_ordinal as u64,
+            block_rows as u64,
+        ));
+        signs[0] = 1.0;
+        for sign in &mut signs[1..block_rows] {
+            *sign = if sign_rng.random_range(0..2) == 0 {
+                -1.0
+            } else {
+                1.0
+            };
+        }
+        for local_row in 0..block_rows {
+            let sign = signs[local_row];
+            for col in 0..p {
+                block_workspace[local_row * p + col] *= sign;
+            }
+        }
+        fwht_rows_in_place(block_workspace, block_rows, p)?;
+
+        for local_row in 0..block_rows {
+            let output_row = block_start + local_row;
+            for col in 0..p {
+                let value = origin[col] + block_workspace[local_row * p + col];
+                out[[output_row, col]] = T::narrow(value).ok_or_else(|| {
+                    format!(
+                        "{} covariance-exact Hadamard output overflowed at row {output_row}, column {col}",
+                        T::TYPE_NAME
+                    )
+                })?;
+            }
+        }
+        block_start += block_rows;
+        block_ordinal += 1;
+    }
+    Ok(out)
+}
+
+/// Seeded structureless control preserving empirical mean and full covariance.
+///
+/// Rows are globally permuted, partitioned greedily into power-of-two blocks no
+/// larger than [`COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS`], and transformed by
+/// `Q = H D H / B` in each block. `H` is the unnormalised Sylvester Hadamard
+/// matrix and the first Rademacher sign in `D` is fixed to +1. Therefore
+/// `Q'Q = I` and `Q·1 = 1`: mean and centered cross-product are invariant in
+/// exact arithmetic, while rowwise radii and nonlinear manifold geometry are
+/// mixed. Peak transform storage is one bounded `B × p` float64 workspace.
+pub fn covariance_exact_hadamard_null(
+    data: ArrayView2<'_, f64>,
+    seed: u64,
+) -> Result<Array2<f64>, String> {
+    validate_matrix(data, "covariance-exact Hadamard input")?;
+    covariance_exact_hadamard_null_impl(data, seed)
+}
+
+/// Float32-output form of [`covariance_exact_hadamard_null`].
+///
+/// The bounded transform workspace uses float64 arithmetic, but no corpus-sized
+/// float64 matrix is ever allocated; input scalars are widened block by block
+/// and output scalars are narrowed directly into the `n × p` float32 result.
+pub fn covariance_exact_hadamard_null_f32(
+    data: ArrayView2<'_, f32>,
+    seed: u64,
+) -> Result<Array2<f32>, String> {
+    validate_matrix_f32(data, "float32 covariance-exact Hadamard input")?;
+    covariance_exact_hadamard_null_impl(data, seed)
+}
+
 /// Gaussian matched-spectrum null for a matrix already expressed in principal-
 /// component coordinates.
 ///
@@ -738,59 +997,6 @@ fn stable_population_moments(data: ArrayView2<'_, f64>) -> Result<StablePopulati
     })
 }
 
-/// Float32-input population moments with float64 accumulation.
-///
-/// The only float64 allocations have shapes `p`, `p`, and `p × p`. Input
-/// scalars are widened one at a time, so this path cannot create an `n × p`
-/// float64 copy of the activation matrix.
-fn stable_population_moments_f32(
-    data: ArrayView2<'_, f32>,
-) -> Result<StablePopulationMoments, String> {
-    validate_matrix_f32(data, "float32 stable-population-moments input")?;
-    let n = data.nrows();
-    let p = data.ncols();
-    let origin = data.row(0).mapv(f64::from);
-    let mut mean_offset = Array1::<f64>::zeros(p);
-    for row in 0..n {
-        let count = (row + 1) as f64;
-        for axis in 0..p {
-            let relative = f64::from(data[[row, axis]]) - origin[axis];
-            mean_offset[axis] += (relative - mean_offset[axis]) / count;
-        }
-    }
-    if mean_offset.iter().any(|value| !value.is_finite()) {
-        return Err("float32 stable column-mean accumulation overflowed".to_string());
-    }
-
-    let mut covariance = Array2::<f64>::zeros((p, p));
-    for row in 0..n {
-        for left in 0..p {
-            let left_residual = (f64::from(data[[row, left]]) - origin[left]) - mean_offset[left];
-            for right in 0..=left {
-                let right_residual =
-                    (f64::from(data[[row, right]]) - origin[right]) - mean_offset[right];
-                covariance[[left, right]] += left_residual * right_residual;
-            }
-        }
-    }
-    let inverse_count = 1.0 / n as f64;
-    for left in 0..p {
-        for right in 0..=left {
-            let value = covariance[[left, right]] * inverse_count;
-            covariance[[left, right]] = value;
-            covariance[[right, left]] = value;
-        }
-    }
-    if covariance.iter().any(|value| !value.is_finite()) {
-        return Err("float32 stable covariance accumulation overflowed".to_string());
-    }
-    Ok(StablePopulationMoments {
-        origin,
-        mean_offset,
-        covariance,
-    })
-}
-
 /// Certify that a symmetric covariance eigenspectrum is positive semidefinite
 /// up to the backward error of its eigendecomposition. A negative eigenvalue
 /// no larger than `64 * p * eps * trace` in magnitude is numerical zero; a
@@ -866,54 +1072,6 @@ pub fn covariance_matched_gaussian_null(
                     "covariance-matched Gaussian draw overflowed at row {row}, column {col}"
                 ));
             }
-        }
-    }
-    Ok(out)
-}
-
-/// Float32-preserving covariance-matched Gaussian control.
-///
-/// Stable means, covariance, and its eigendecomposition are computed in
-/// float64, but their storage is only `O(p²)`. The input stays float32 and the
-/// `n × p` output is allocated directly as float32, so peak matrix storage does
-/// not include an `n × p` float64 conversion.
-pub fn covariance_matched_gaussian_null_f32(
-    data: ArrayView2<'_, f32>,
-    seed: u64,
-) -> Result<Array2<f32>, String> {
-    use faer::Side;
-    use gam_linalg::faer_ndarray::FaerEigh;
-
-    validate_matrix_f32(data, "float32 covariance-matched Gaussian input")?;
-    let n = data.nrows();
-    let p = data.ncols();
-    let moments = stable_population_moments_f32(data)?;
-    let covariance_trace = moments.covariance.diag().sum();
-    let (eigenvalues, eigenvectors) = moments.covariance.eigh(Side::Lower).map_err(|error| {
-        format!("float32 covariance-matched Gaussian eigendecomposition failed: {error}")
-    })?;
-    let eigenvalues = certified_covariance_spectrum(eigenvalues.view(), covariance_trace)?;
-
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut out = Array2::<f32>::zeros((n, p));
-    let mut scaled_normal = vec![0.0_f64; p];
-    for row in 0..n {
-        for axis in 0..p {
-            scaled_normal[axis] = eigenvalues[axis].sqrt() * standard_normal(&mut rng);
-        }
-        for col in 0..p {
-            let mut relative_draw = moments.mean_offset[col];
-            for axis in 0..p {
-                relative_draw += eigenvectors[[col, axis]] * scaled_normal[axis];
-            }
-            let value = moments.origin[col] + relative_draw;
-            let value_f32 = value as f32;
-            if !value.is_finite() || !value_f32.is_finite() {
-                return Err(format!(
-                    "float32 covariance-matched Gaussian draw overflowed at row {row}, column {col}"
-                ));
-            }
-            out[[row, col]] = value_f32;
         }
     }
     Ok(out)
