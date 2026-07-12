@@ -426,9 +426,9 @@ impl BernoulliMarginalSlopeFamily {
     /// for the **rigid** empirical-grid Bernoulli kernel, in primary
     /// coordinates `(m = marginal_eta, g = slope)`.
     ///
-    /// Replaces the second-order `empirical_rigid_neglog_jet` path — a 4-slot
-    /// [`MultiDirJet`] driven through six Newton intercept-refinement passes
-    /// per row — with the exact implicit-function-theorem solution. The
+    /// Replaces the historical four-channel bitmask jet and its six Newton
+    /// intercept-refinement passes per row with the exact
+    /// implicit-function-theorem solution. The
     /// intercept `a(m, g)` is the same scalar fixed point the jet converges to
     /// ([`Self::empirical_rigid_intercept_for_row`]); its derivatives follow in
     /// closed form from the grid calibration
@@ -486,9 +486,9 @@ impl BernoulliMarginalSlopeFamily {
 
     /// Closed-form uncontracted **third**-derivative tensor of the rigid
     /// empirical-grid row negative log-likelihood, in primary coordinates
-    /// `(m = marginal_eta, g = slope)`. Replaces the 6-direction
-    /// `empirical_rigid_neglog_jet` (a 64-coefficient `MultiDirJet` driven
-    /// through six Newton intercept passes) used by [`Self::rigid_row_third_full`].
+    /// `(m = marginal_eta, g = slope)`. Replaces the historical 64-coefficient
+    /// bitmask jet and its six Newton intercept passes used by
+    /// [`Self::rigid_row_third_full`].
     ///
     /// Continues the implicit-function-theorem program of
     /// [`Self::empirical_rigid_primary_grad_hess_closed_form`] one order higher.
@@ -529,9 +529,9 @@ impl BernoulliMarginalSlopeFamily {
 
     /// Closed-form uncontracted **fourth**-derivative tensor of the rigid
     /// empirical-grid row negative log-likelihood, in primary coordinates
-    /// `(m = marginal_eta, g = slope)`. Replaces the 8-direction
-    /// `empirical_rigid_neglog_jet` (a 256-coefficient `MultiDirJet` through six
-    /// Newton intercept passes) used by [`Self::rigid_row_fourth_full`].
+    /// `(m = marginal_eta, g = slope)`. Replaces the historical 256-coefficient
+    /// bitmask jet and its six Newton intercept passes used by
+    /// [`Self::rigid_row_fourth_full`].
     ///
     /// Same implicit-function-theorem program as
     /// [`Self::empirical_rigid_third_full_closed_form`], one order higher.
@@ -1950,9 +1950,9 @@ impl BernoulliMarginalSlopeFamily {
             //   * `empirical_rigid_neglog_only` (empirical-grid): the
             //     converged scalar intercept (from
             //     `empirical_rigid_intercept_for_row`'s warm-start cache) plus
-            //     a single probit log-CDF eval, skipping the four-direction
-            //     `MultiDirJet` construction and its six Newton-refinement
-            //     passes (the line search reads no derivative coefficients).
+            //     a single probit log-CDF eval, skipping derivative-plan
+            //     construction and evaluation (the line search reads no
+            //     derivative coefficients).
             // The returned value is bit-equivalent to
             // `rigid_row_kernel_eval(...).0` at the same row state.
             let b = &block_states[1].eta;
@@ -3846,30 +3846,29 @@ mod empirical_flex_jet_oracle_tests {
     //! #932 deployment for the BMS rigid **empirical-grid FLEX** Bernoulli
     //! kernel (score-warp / link-deviation deviation blocks).
     //!
-    //! The flex path builds the row NLL as a `MultiDirJet` tower
-    //! (`empirical_flex_neglog_jet`): a per-jet Newton refines the intercept
-    //! over the latent grid (`empirical_flex_calibration_jets`), the score-warp
-    //! cubic basis enters multiplicatively on the slope through `b·Σβ_h·b_h(z)`,
-    //! and the link-deviation cubic enters as `Σβ_w·b_w(u)` composed at the
-    //! observed index `u`. `row_{third,fourth}_contracted` then read
-    //! contracted directional derivatives off that jet. NONE of that higher-dim
-    //! `(q, b, β_h, β_w)` tower was guarded by an independent oracle — only the
-    //! rigid (no-deviation) empirical and standard-normal paths were.
+    //! The production flex path freezes one [`EmpiricalBmsRowJetPlan`] at the
+    //! scalar row state, then evaluates that single expression over the packed
+    //! [`RuntimeJetScalar`] algebra required by each consumer. The score-warp
+    //! basis enters multiplicatively through `b·Σβ_h·b_h(z)` and the
+    //! link-deviation basis enters as `Σβ_w·b_w(u)` at `u = a + b·z`; the
+    //! filtered implicit solve lifts the calibrated intercept in the same
+    //! evaluation. Third/fourth contractions are read directly from the
+    //! one-/two-seed result, without a dense derivative tensor.
     //!
     //! This module adds the missing guard along the same discipline as
     //! `empirical_rigid_jet_oracle`: an INDEPENDENT finite-difference witness
     //! that
     //!   * re-solves the flex calibration intercept root
     //!     `Σ_k π_k Φ(η(a; x_k)) = μ(q)` with its OWN secant/Newton iteration
-    //!     (the eta map re-derived here, sharing no jet-Newton code), and
+    //!     (the eta map re-derived here, sharing no row-plan code), and
     //!   * evaluates the basis through the SEPARATE `DeviationRuntime::design` /
-    //!     `first_derivative_design` API (not the production
-    //!     `for_each_basis_cubic_at` / `local_cubic_value_jet` jet path),
+    //!     `first_derivative_design` API rather than the production plan's
+    //!     frozen local-cubic derivative stacks,
     //!
     //! then central-differences `ℓ(q, b, β_h, β_w)` to first/second/third/fourth
-    //! order and compares against the production jet's `coeff` channels and the
-    //! contracted tensors. A companion test plants a cross-block sign
-    //! flip and asserts the witness rejects it.
+    //! order and compares against the production scalar and contracted
+    //! channels. A companion test plants a cross-block sign flip and asserts
+    //! the witness rejects it.
 
     use super::*;
     use gam_math::jet_scalar::{DynamicJetArena, DynamicOneSeed, DynamicTwoSeed};
@@ -4145,14 +4144,14 @@ mod empirical_flex_jet_oracle_tests {
     // carries percent-level truncation. Rather than chase Richardson levels,
     // build a SECOND, fully exact witness from an INDEPENDENT jet kernel:
     //
-    //   * the implicit intercept `a(θ)` is solved as an exact `Tower4` via
-    //     `jet_tower::implicit_solve` (a different jet layout — dense symmetric
-    //     tensors — and a different intercept algorithm — per-order linear
-    //     correction — than production's bitmask `MultiDirJet` Newton), and
+    //   * the implicit intercept `a(θ)` is solved as an exact dense-symmetric
+    //     `Tower4` via `jet_tower::implicit_solve`, independently assembled
+    //     from the scalar fixture rather than the production runtime row plan,
+    //     and
     //   * the I-spline deviation basis enters through its OWN
     //     `DeviationRuntime::{first,second,third}_derivative_design` stacks
-    //     (production uses the `local_cubic_*_jet` path), composed onto the `u`
-    //     tower by Faà di Bruno.
+    //     (production freezes local-cubic derivative stacks in its row plan),
+    //     composed onto the `u` tower by Faà di Bruno.
     //
     // Both the production jet and this tower compute the SAME analytic
     // derivatives, so they must agree to ~1e-9 with no truncation tolerance —
@@ -5491,5 +5490,4 @@ mod empirical_flex_jet_oracle_tests {
             }
         }
     }
-
 }

@@ -22,10 +22,6 @@ use crate::marginal_slope_shared::{
     outer_weighted_rows, parameter_block_specs_match_rows, probit_frailty_scale,
     psi_derivative_location, scale_coeff4, second_parameter_order2_terms,
 };
-#[cfg(test)]
-use crate::marginal_slope_shared::{
-    DirectionalScaleJets, directional_obj_grad_hess, probit_frailty_scale_multi_dir_jet,
-};
 use crate::model_types::UnifiedFitResult;
 use crate::outer_subsample::WeightedOuterRow;
 use crate::parameter_block::ParameterBlockInput;
@@ -41,8 +37,6 @@ use crate::spatial_psi_bridge::build_block_spatial_psi_derivatives;
 use crate::survival::lognormal_kernel::FrailtySpec;
 use crate::wiggle::initializewiggle_knots_from_seed;
 use gam_linalg::matrix::{DesignMatrix, SymmetricMatrix};
-#[cfg(test)]
-use gam_math::jet_partitions::MultiDirJet;
 use gam_problem::{
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     HyperOperator, InverseLink, StandardLink, WigglePenaltyConfig,
