@@ -240,8 +240,12 @@ pub struct BirthMdlPrescreen {
 /// * the **support** term `(ŝ−1)·log₂(G/L0)` credits the extra active slots the
 ///   flat span spends that the single curved atom does not — the term that scales
 ///   with dictionary overcompleteness;
-/// * the **dictionary surcharge** `(m−ŝ)·P·½log₂(N)` is the BIC rank charge the
-///   richer curved decoder pays.
+/// * the **signed dictionary** term `−(m−ŝ)·P·½log₂(N)` is the BIC decoder-parameter
+///   delta: a SURCHARGE when the curved basis is wider than the flat span it
+///   replaces (m>ŝ, e.g. an H-harmonic circle m=2H+1>2), and a genuine SAVING when
+///   it is narrower (m<ŝ) — the principal win for a high-codimension manifold
+///   spanning many ambient directions on a compact basis (`ŝ ≥ m`). Never clamped:
+///   the delta is an exact decoder-column count, so its sign never over-admits.
 ///
 /// The second-order residual (Eckart–Young) term `Δresid ≥ 0` is OMITTED: the
 /// pre-screen therefore under-credits the birth, so it can only DEFER a proposal
@@ -261,11 +265,17 @@ pub fn predicted_birth_dl_bits(p: &BirthMdlPrescreen) -> f64 {
     let n = p.n_tokens.max(0.0);
     let saving = p.rho.clamp(0.0, 1.0) * n * (code_bits + support_bits);
     // `½log₂(N)` needs N ≥ 2 to be non-negative; a degenerate token count charges
-    // no surcharge. `(m−ŝ)` is clamped ≥ 0 so a basis narrower than the span never
-    // credits a spurious dictionary saving.
+    // no dictionary term. The dictionary delta `−(m−ŝ)·P·½log₂N` is SIGNED: a charge
+    // when the curved basis is wider than the flat span it replaces (m>ŝ), and a
+    // genuine SAVING when it is narrower (m<ŝ) — the principal Eq-4 win for a
+    // high-codimension manifold carried by a compact basis (`s ≥ m`). The BIC
+    // decoder-parameter delta is exact (a difference of decoder column counts), so
+    // crediting its sign never over-admits a birth; the pre-screen's conservatism
+    // comes solely from omitting the Eckart–Young residual term, never from clamping
+    // this one (a clamp would indefinitely defer exactly the births the theorem targets).
     let log2_n = if n >= 2.0 { n.log2() } else { 0.0 };
-    let surcharge = (p.basis_size as f64 - span).max(0.0) * p.p_out as f64 * 0.5 * log2_n;
-    saving - surcharge
+    let dictionary_delta = (p.basis_size as f64 - span) * p.p_out as f64 * 0.5 * log2_n;
+    saving - dictionary_delta
 }
 
 /// One rung of the description-length ladder — a featurizer's reporting inputs.

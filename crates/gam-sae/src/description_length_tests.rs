@@ -792,6 +792,60 @@ fn birth_prescreen_matches_hand_computed_crossover() {
     assert!((scalar_rate_bits(3.0, 1.0) - scalar_rate).abs() < 1e-12);
 }
 
+/// #2233 signed-dictionary regression: a HIGH-CODIMENSION birth whose curved basis
+/// is NARROWER than the flat span it replaces (`m < ŝ`) must be CREDITED the exact
+/// dictionary saving `+(ŝ−m)·P·½log₂N`, not clamped to zero. This is the theorem's
+/// principal win for a manifold spanning many ambient directions on a compact basis
+/// (a shell/high-genus kind), which an earlier `(m−ŝ).max(0)` clamp defers
+/// indefinitely. The saving is an exact decoder-column-count delta, so crediting it
+/// never over-admits — the pre-screen still under-credits (Eckart–Young residual
+/// omitted) and the e-process gate stays sole arbiter.
+#[test]
+fn birth_prescreen_credits_dictionary_saving_when_basis_narrower_than_span() {
+    // ŝ=8 ambient span, compact basis m=5 (< ŝ), d=2. N=1000, P=8, G=1024, L0=32.
+    let p = BirthMdlPrescreen {
+        rho: 0.05,
+        span: 8.0,
+        intrinsic_dim: 2,
+        basis_size: 5,
+        signal_var: 3.0,
+        noise_floor: 1.0,
+        n_tokens: 1000.0,
+        p_out: 8,
+        g_dict: 1024,
+        l0: 32.0,
+    };
+    let log2_n = 1000.0_f64.log2();
+    // saving = ρN·[(ŝ−d−1)·½log₂3 + (ŝ−1)·log₂(G/L0)]
+    let code = (8.0 - 2.0 - 1.0) * scalar_rate_bits(3.0, 1.0);
+    let support = (8.0 - 1.0) * (1024.0_f64 / 32.0).log2();
+    let saving = 0.05 * 1000.0 * (code + support);
+    // signed dictionary delta = (m−ŝ)·P·½log₂N = (5−8)·8·½·log₂N  (NEGATIVE ⇒ saving)
+    let dict_delta = (5.0 - 8.0) * 8.0 * 0.5 * log2_n;
+    let expected = saving - dict_delta; // saving − (negative) = saving + |dict_delta|
+    let got = predicted_birth_dl_bits(&p);
+    assert!(
+        (got - expected).abs() < 1e-9,
+        "signed-dictionary bits {got} != hand value {expected}"
+    );
+    // The dictionary term is a genuine SAVING: the prediction strictly exceeds the
+    // code+support saving alone (the old clamp would have returned exactly `saving`).
+    assert!(
+        got > saving + 1.0,
+        "a narrower-than-span basis (m<ŝ) must be CREDITED the dictionary saving: \
+         got {got}, saving-alone {saving} (a zero-clamp regression)"
+    );
+    // Monotonicity: an even narrower basis earns a strictly larger saving.
+    let narrower = predicted_birth_dl_bits(&BirthMdlPrescreen {
+        basis_size: 3,
+        ..p
+    });
+    assert!(
+        narrower > got,
+        "a narrower basis must earn a larger dictionary saving: m=3 {narrower} <= m=5 {got}"
+    );
+}
+
 /// A planted `s = d+1` kind (circle `d=1`, sphere `d=2`): `s` orthogonal
 /// equal-energy signal columns (distinct-frequency cosines are discretely
 /// orthogonal on evenly spaced angles, so each carries variance `r²/2` and the
