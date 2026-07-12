@@ -316,6 +316,7 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
     ) -> Result<f64, String> {
         self.assignment.validate_rho_domain(rho)?;
+        let ard_precisions = rho.ard_precisions()?;
         let n = self.n_obs();
         let p = self.output_dim();
         if residual.dim() != (n, p) {
@@ -368,11 +369,10 @@ impl SaeManifoldTerm {
                     return;
                 }
                 for axis in 0..d {
-                    let alpha = rho.log_ard[k][axis].exp();
+                    let alpha = ard_precisions[k][axis];
                     let t = coord.row(row)[axis];
                     let v_pp = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis])
-                        .hess
-                        .max(0.0);
+                        .psd_majorizer_hess();
                     // GN coordinate curvature htt = a_k²·(g')ᵀ M g'.
                     self.atoms[k].fill_decoded_derivative_row(row, axis, g1.as_mut_slice());
                     let htt = if whitens {
@@ -708,6 +708,7 @@ impl SaeManifoldTerm {
                 self.k_atoms()
             ));
         }
+        let ard_precisions = rho.ard_precisions()?;
         let n = self.n_obs() as f64;
         // HT row weighting: this is the ρ-derivative of `ard_value` (the `explicit`
         // outer-gradient channel), so it carries the identical per-row inclusion
@@ -733,7 +734,7 @@ impl SaeManifoldTerm {
             let periods = coord.effective_axis_periods();
             for axis in 0..d {
                 let log_alpha = rho.log_ard[atom_idx][axis];
-                let alpha = log_alpha.exp();
+                let alpha = ard_precisions[atom_idx][axis];
                 let period = periods[axis];
                 let mut energy_deriv = 0.0_f64;
                 for row in 0..coord.n_obs() {
@@ -768,6 +769,9 @@ impl SaeManifoldTerm {
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
         self.assignment
             .validate_rho_domain(rho)
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
+        let ard_precisions = rho
+            .ard_precisions()
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         // RAW selected-inverse diagonal: the per-axis diagonal contraction uses
         // the DEFLATED inverse; the full kept-subspace + rotation deflation
@@ -867,10 +871,10 @@ impl SaeManifoldTerm {
                         let d = coord.latent_dim();
                         let block_start = starts[pos];
                         for axis in 0..d {
-                            let alpha = rho.log_ard[k][axis].exp();
+                            let alpha = ard_precisions[k][axis];
                             let t = coord.row(row)[axis];
                             let prior = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis]);
-                            let hess = w_row * prior.hess.max(0.0);
+                            let hess = w_row * prior.psd_majorizer_hess();
                             let s = block_start + axis;
                             traces[k][axis] += 0.5 * inv_diag[row_base + s] * hess;
                             traces[k][axis] -= 0.5 * slot_correction(s, hess);
@@ -886,10 +890,10 @@ impl SaeManifoldTerm {
                         let d = coord.latent_dim();
                         let block_start = coord_offsets[k];
                         for axis in 0..d {
-                            let alpha = rho.log_ard[k][axis].exp();
+                            let alpha = ard_precisions[k][axis];
                             let t = coord.row(row)[axis];
                             let prior = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis]);
-                            let hess = w_row * prior.hess.max(0.0);
+                            let hess = w_row * prior.psd_majorizer_hess();
                             let s = block_start + axis;
                             traces[k][axis] += 0.5 * inv_diag[row_base + s] * hess;
                             traces[k][axis] -= 0.5 * slot_correction(s, hess);
@@ -917,6 +921,9 @@ impl SaeManifoldTerm {
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
         self.assignment
             .validate_rho_domain(rho)
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
+        let ard_precisions = rho
+            .ard_precisions()
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let row_weights = self.row_loss_weights.as_deref();
         let coord_offsets = self.assignment.coord_offsets();
@@ -964,10 +971,10 @@ impl SaeManifoldTerm {
                 .and_then(Option::as_ref);
             let row_weight = row_weights.map_or(1.0, |weights| weights[row]);
             let mut accumulate = |atom: usize, axis: usize, slot: usize| {
-                let alpha = rho.log_ard[atom][axis].exp();
+                let alpha = ard_precisions[atom][axis];
                 let t = self.assignment.coords[atom].row(row)[axis];
                 let prior = ArdAxisPrior::eval(alpha, t, periods[atom][axis]);
-                let curvature = row_weight * prior.hess.max(0.0);
+                let curvature = row_weight * prior.psd_majorizer_hess();
                 let mut trace = inverse[[slot, slot]] * curvature;
                 if !directions.is_empty() && curvature != 0.0 {
                     let mut derivative = Array2::<f64>::zeros((q, q));
@@ -1057,6 +1064,9 @@ impl SaeManifoldTerm {
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
         self.assignment
             .validate_rho_domain(rho)
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
+        let ard_precisions = rho
+            .ard_precisions()
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let m = probes.len();
         if m == 0 || sinv_probes.len() != m {
@@ -1175,10 +1185,10 @@ impl SaeManifoldTerm {
                 let coord = &self.assignment.coords[k];
                 let d = coord.latent_dim();
                 for axis in 0..d {
-                    let alpha = rho.log_ard[k][axis].exp();
+                    let alpha = ard_precisions[k][axis];
                     let t = coord.row(row)[axis];
                     let prior = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis]);
-                    let hess = w_row * prior.hess.max(0.0);
+                    let hess = w_row * prior.psd_majorizer_hess();
                     let s = block_start + axis;
                     traces[k][axis] += 0.5 * inv_diag_local[s] * hess;
                 }

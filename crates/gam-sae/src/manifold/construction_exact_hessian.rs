@@ -338,6 +338,7 @@ impl SaeManifoldTerm {
             .iter()
             .map(|coord| coord.effective_axis_periods())
             .collect();
+        let ard_precisions = rho.ard_precisions()?;
 
         // Optional softmax exact-entropy-minus-majorizer delta operator (#1419).
         let softmax_delta: Option<(
@@ -539,10 +540,10 @@ impl SaeManifoldTerm {
                 if rho.log_ard[atom].is_empty() {
                     continue;
                 }
-                let alpha = rho.log_ard[atom][axis].exp();
+                let alpha = ard_precisions[atom][axis];
                 let t_val = self.assignment.coords[atom].row(row)[axis];
                 let prior = ArdAxisPrior::eval(alpha, t_val, ard_axis_periods[atom][axis]);
-                let neg = prior.hess.min(0.0);
+                let neg = prior.negative_hessian_remainder();
                 if neg != 0.0 {
                     out.t[base + a] += w_row * neg * v_t[a];
                 }

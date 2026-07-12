@@ -1041,6 +1041,29 @@ mod tests {
     }
 
     #[test]
+    fn scale_deviation_operator_gram_preserves_signed_weights() {
+        let primary = array![[1.0], [2.0], [-1.0], [0.5]];
+        let noise = array![[1.0, 2.0], [3.0, -1.0], [0.5, 4.0], [-2.0, 1.5]];
+        let transform = ScaleDeviationTransform::identity(1, 2, 0);
+        let design = build_scale_deviation_operator(
+            DesignMatrix::Dense(DenseDesignMatrix::from(primary)),
+            DesignMatrix::Dense(DenseDesignMatrix::from(noise.clone())),
+            &transform,
+        )
+        .unwrap();
+        let weights = array![2.0, -3.0, 0.25, -1.5];
+        let expected = noise
+            .t()
+            .dot(&(&noise * weights.view().insert_axis(ndarray::Axis(1))));
+        let got = design.diag_xtw_x(&weights).unwrap();
+        assert_matrix_close(&got, &expected, 1e-12, "signed scale-deviation Gram");
+
+        let bad = array![1.0, f64::NAN, f64::INFINITY, 1.0];
+        let err = design.diag_xtw_x(&bad).unwrap_err();
+        assert!(err.contains("row 1"), "unexpected diagnostic: {err}");
+    }
+
+    #[test]
     fn scale_deviation_transform_rank_deficient_primary_matches_design_path() {
         let n = 384;
         let p_primary = 4;

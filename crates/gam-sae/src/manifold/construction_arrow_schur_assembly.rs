@@ -182,6 +182,7 @@ impl SaeManifoldTerm {
         forced_layout: ForcedRowLayout,
     ) -> Result<ArrowSchurSystem, String> {
         self.assignment.validate_rho_domain(rho)?;
+        let ard_precisions = rho.ard_precisions()?;
         if !(penalty_scale.is_finite() && penalty_scale > 0.0) {
             return Err(format!(
                 "SaeManifoldTerm::assemble_arrow_schur_scaled: penalty_scale must be finite and positive; got {penalty_scale}"
@@ -1110,12 +1111,12 @@ impl SaeManifoldTerm {
                                     // a fixed prior only damps the Newton step — it does not
                                     // move the stationary point (the gradient, which sets the
                                     // fixed point, stays the exact `V'`).
-                                    let alpha = rho.log_ard[k][axis].exp();
+                                    let alpha = ard_precisions[k][axis];
                                     let prior =
                                         ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
                                     block.gt[starts[j] + axis] += w_row * prior.grad;
                                     block.htt[[starts[j] + axis, starts[j] + axis]] +=
-                                        w_row * prior.hess.max(0.0);
+                                        w_row * prior.psd_majorizer_hess();
                                 }
                             }
                         } else {
@@ -1140,11 +1141,12 @@ impl SaeManifoldTerm {
                                     // branch above for why `max(V'', 0)` is required to keep
                                     // `htt` PD (the exact `V'' = α·cos κt` is indefinite past a
                                     // quarter period and breaks the Schur/log-det Cholesky).
-                                    let alpha = rho.log_ard[atom_idx][axis].exp();
+                                    let alpha = ard_precisions[atom_idx][axis];
                                     let prior =
                                         ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
                                     block.gt[off + axis] += w_row * prior.grad;
-                                    block.htt[[off + axis, off + axis]] += w_row * prior.hess.max(0.0);
+                                    block.htt[[off + axis, off + axis]] +=
+                                        w_row * prior.psd_majorizer_hess();
                                 }
                             }
                         }

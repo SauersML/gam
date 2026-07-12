@@ -301,6 +301,24 @@ impl ArdAxisPrior {
             }
         }
     }
+
+    /// Positive-semidefinite curvature used by the Newton/Schur majorizer.
+    ///
+    /// This is deliberately not the exact prior Hessian on a periodic axis:
+    /// the exact `alpha*cos(kappa*t)` remains signed.  The factorized inner
+    /// solver and its Laplace log determinant declare this positive-part
+    /// operator, so every derivative of that operator must call this seam.
+    #[inline]
+    pub(crate) fn psd_majorizer_hess(self) -> f64 {
+        self.hess.max(0.0)
+    }
+
+    /// Signed correction that turns the PSD majorizer back into the exact
+    /// prior Hessian: `hess = psd_majorizer_hess + negative_hessian_remainder`.
+    #[inline]
+    pub(crate) fn negative_hessian_remainder(self) -> f64 {
+        self.hess.min(0.0)
+    }
 }
 
 /// One manifold atom.

@@ -171,6 +171,24 @@ fn gamma_fisher_does_not_materialize_an_unused_overflowing_observed_weight() {
 }
 
 #[test]
+fn poisson_score_does_not_materialize_an_overflowing_weighted_response() {
+    let row = row_reweight_cpu(
+        PirlsRowFamily::PoissonLog,
+        CurvatureMode::Fisher,
+        RowInput {
+            eta: 0.0,
+            y: 2.0,
+            prior_weight: 9.0e307,
+        },
+        1.0,
+    )
+    .expect("canonical score and deviance remain representable");
+    assert_eq!(row.w_fisher, 9.0e307);
+    assert_eq!(row.grad_eta, 9.0e307);
+    assert!(row.deviance.is_finite() && row.deviance > 0.0);
+}
+
+#[test]
 fn observed_noncanonical_weights_are_never_row_projected() {
     for family in [
         PirlsRowFamily::BernoulliProbit,

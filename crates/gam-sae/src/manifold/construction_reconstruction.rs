@@ -8,6 +8,52 @@
 
 use super::*;
 
+/// Certify the ARD identity
+/// `edf = n_active - alpha * tr(H^-1)` against its exact `[0, n_active]`
+/// interval.  A tiny excursion at the forward-error scale of the accumulated
+/// trace is snapped to the boundary; a material excursion is a failed trace
+/// certificate, not an EDF that may be silently projected into another model.
+fn certified_ard_axis_edf(
+    n_active: f64,
+    alpha: f64,
+    inverse_trace: f64,
+    atom: usize,
+    axis: usize,
+) -> Result<f64, String> {
+    if !(n_active.is_finite() && n_active >= 0.0) {
+        return Err(format!(
+            "reconstruction_dispersion: ARD active count at atom {atom}, axis {axis} \
+             must be finite and non-negative; got {n_active}"
+        ));
+    }
+    if !(alpha.is_finite() && alpha > 0.0 && inverse_trace.is_finite()) {
+        return Err(format!(
+            "reconstruction_dispersion: ARD precision/trace at atom {atom}, axis {axis} \
+             must be finite with positive precision; got alpha={alpha}, trace={inverse_trace}"
+        ));
+    }
+    let shrinkage = alpha * inverse_trace;
+    let raw = n_active - shrinkage;
+    if !shrinkage.is_finite() || !raw.is_finite() {
+        return Err(format!(
+            "reconstruction_dispersion: ARD EDF arithmetic is unrepresentable at atom \
+             {atom}, axis {axis} (n_active={n_active}, alpha={alpha}, trace={inverse_trace})"
+        ));
+    }
+    let tolerance = 64.0
+        * n_active.max(1.0)
+        * f64::EPSILON
+        * (n_active.abs() + shrinkage.abs()).max(f64::MIN_POSITIVE);
+    if raw < -tolerance || raw > n_active + tolerance {
+        return Err(format!(
+            "reconstruction_dispersion: ARD EDF at atom {atom}, axis {axis} is \
+             {raw:.6e}, outside certified [0, {n_active}] (roundoff tolerance \
+             {tolerance:.6e}; alpha={alpha:.6e}, trace={inverse_trace:.6e})"
+        ));
+    }
+    Ok(raw.clamp(0.0, n_active))
+}
+
 fn persisted_atom_basis_values(
     kind: &SaeAtomBasisKind,
     coords: ArrayView2<'_, f64>,
@@ -354,6 +400,7 @@ impl SaeManifoldTerm {
         let traces = self
             .ard_inverse_traces(cache)
             .map_err(|e| format!("reconstruction_dispersion: ARD traces: {e}"))?;
+        let ard_precisions = rho.ard_precisions()?;
         if rho.log_ard.len() != self.atoms.len() {
             return Err(format!(
                 "reconstruction_dispersion: ρ has {} ARD atoms but term has {}",
@@ -392,9 +439,8 @@ impl SaeManifoldTerm {
                 continue;
             }
             for j in 0..d_k {
-                let alpha = rho.log_ard[k][j].exp();
-                // edf_kj ∈ [0, n_active_k]; clamp against numerical drift.
-                let edf_kj = (n_active_k - alpha * traces[k][j]).clamp(0.0, n_active_k);
+                let alpha = ard_precisions[k][j];
+                let edf_kj = certified_ard_axis_edf(n_active_k, alpha, traces[k][j], k, j)?;
                 coord_edf += edf_kj;
             }
         }

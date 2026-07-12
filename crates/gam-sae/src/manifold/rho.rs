@@ -1,4 +1,7 @@
 use super::*;
+use gam_problem::{
+    checked_exp_log_strength, checked_exp_log_strengths, validate_log_strength,
+};
 pub(crate) use gam_problem::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN};
 
 /// Closed numerical domain of every active flat log-strength coordinate.
@@ -506,8 +509,9 @@ impl SaeManifoldRho {
         Ok(scaled)
     }
 
-    pub fn lambda_sparse(&self) -> f64 {
-        self.log_lambda_sparse.exp()
+    pub(crate) fn lambda_sparse(&self) -> f64 {
+        checked_exp_log_strength(self.log_lambda_sparse)
+            .expect("assignment-strength access follows rho-domain validation")
     }
 
     /// Number of atoms `K` carried by the per-atom smoothness vector.
@@ -520,16 +524,43 @@ impl SaeManifoldRho {
     /// Computational entry points validate the rho domain before calling this
     /// exact, unsaturated map.
     #[must_use]
-    pub fn lambda_smooth_for(&self, atom: usize) -> f64 {
-        self.log_lambda_smooth[atom].exp()
+    pub(crate) fn lambda_smooth_for(&self, atom: usize) -> f64 {
+        checked_exp_log_strength(self.log_lambda_smooth[atom])
+            .expect("smoothness-strength access follows rho-domain validation")
     }
 
     /// All `K` per-atom smoothness strengths `exp(log_lambda_smooth[k])`, atom
     /// order. Convenience for threading per-atom λ into the penalty assemblers
     /// (#1556).
     #[must_use]
-    pub fn lambda_smooth_vec(&self) -> Vec<f64> {
-        self.log_lambda_smooth.iter().map(|&v| v.exp()).collect()
+    pub(crate) fn lambda_smooth_vec(&self) -> Vec<f64> {
+        checked_exp_log_strengths(self.log_lambda_smooth.iter().copied())
+            .expect("smoothness-strength access follows rho-domain validation")
+    }
+
+    /// Validate and materialize the complete per-atom ARD precision table once.
+    ///
+    /// ARD consumers call this before entering their row/atom kernels and reuse
+    /// the returned physical precisions.  That gives value, gradient, Hessian,
+    /// trace, and IFT channels the identical `alpha = exp(log_alpha)` map while
+    /// avoiding a transcendental evaluation for every observation.  Validation
+    /// is atomic: no table escapes unless every coordinate lies in the shared
+    /// exact log-strength domain, and the first error is deterministic in
+    /// `(atom, axis)` order.
+    pub(crate) fn ard_precisions(&self) -> Result<Vec<Array1<f64>>, String> {
+        let mut precisions = Vec::with_capacity(self.log_ard.len());
+        for (atom, log_block) in self.log_ard.iter().enumerate() {
+            let mut block = Array1::<f64>::zeros(log_block.len());
+            for (axis, (&log_alpha, alpha)) in
+                log_block.iter().zip(block.iter_mut()).enumerate()
+            {
+                *alpha = checked_exp_log_strength(log_alpha).map_err(|error| {
+                    format!("ARD log precision at atom {atom}, axis {axis}: {error}")
+                })?;
+            }
+            precisions.push(block);
+        }
+        Ok(precisions)
     }
 
     /// Validate every log-strength represented in the flat outer layout against
@@ -537,10 +568,9 @@ impl SaeManifoldRho {
     /// deliberately ignored: it is not an objective coordinate and its stored
     /// placeholder cannot affect the corresponding assignment family.
     pub(crate) fn validate_log_strength_domain(&self) -> Result<(), String> {
-        let is_valid = |value: f64| {
-            value.is_finite() && (LOG_STRENGTH_MIN..=LOG_STRENGTH_MAX).contains(&value)
-        };
-        if self.sparse_flat_index().is_some() && !is_valid(self.log_lambda_sparse) {
+        if self.sparse_flat_index().is_some()
+            && validate_log_strength(self.log_lambda_sparse).is_err()
+        {
             return Err(format!(
                 "assignment log strength must be finite and in [{LOG_STRENGTH_MIN}, \
                  {LOG_STRENGTH_MAX}]; got {}",
@@ -548,7 +578,7 @@ impl SaeManifoldRho {
             ));
         }
         for (atom, &value) in self.log_lambda_smooth.iter().enumerate() {
-            if !is_valid(value) {
+            if validate_log_strength(value).is_err() {
                 return Err(format!(
                     "smoothness log strength at atom {atom} must be finite and in \
                      [{LOG_STRENGTH_MIN}, {LOG_STRENGTH_MAX}]; got {value}"
@@ -557,7 +587,7 @@ impl SaeManifoldRho {
         }
         for (atom, block) in self.log_ard.iter().enumerate() {
             for (axis, &value) in block.iter().enumerate() {
-                if !is_valid(value) {
+                if validate_log_strength(value).is_err() {
                     return Err(format!(
                         "ARD log precision at atom {atom}, axis {axis} must be finite and in \
                          [{LOG_STRENGTH_MIN}, {LOG_STRENGTH_MAX}]; got {value}"
@@ -566,7 +596,7 @@ impl SaeManifoldRho {
             }
         }
         for (block, &value) in self.log_lambda_block.iter().enumerate() {
-            if !is_valid(value) {
+            if validate_log_strength(value).is_err() {
                 return Err(format!(
                     "block log strength at block {block} must be finite and in \
                      [{LOG_STRENGTH_MIN}, {LOG_STRENGTH_MAX}]; got {value}"

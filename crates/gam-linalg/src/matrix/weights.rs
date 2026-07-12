@@ -50,7 +50,12 @@ impl<'a> FiniteSignedWeightsView<'a> {
     /// row, so the result is deterministic and independent of parallelism.
     #[inline]
     pub fn try_new(view: ArrayView1<'a, f64>) -> Result<Self, String> {
-        if let Some((row, value)) = view.iter().copied().enumerate().find(|(_, w)| !w.is_finite()) {
+        if let Some((row, value)) = view
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, w)| !w.is_finite())
+        {
             return Err(format!(
                 "non-finite weight at row {row}: {value:?}; every weight must be finite"
             ));
@@ -130,11 +135,7 @@ impl<'a> SignedWeightsView<'a> {
     /// scan was previously inlined as `weights.iter().any(|&w| w < 0.0)`).
     #[inline]
     pub fn as_psd(self) -> Option<PsdWeightsView<'a>> {
-        if self.0.iter().all(|&w| w >= 0.0) {
-            Some(PsdWeightsView(self.0))
-        } else {
-            None
-        }
+        PsdWeightsView::try_new(self.0).ok()
     }
 }
 
@@ -391,7 +392,7 @@ mod tests {
         assert_eq!((*w)[0], 10.0);
         assert_eq!((*w)[1], 20.0);
     }
-}
+
     #[test]
     fn finite_signed_view_preserves_negative_and_signed_zero() {
         let a = array![-3.5_f64, -0.0, 2.0];
@@ -408,3 +409,4 @@ mod tests {
             .expect("non-finite weights must fail certification");
         assert!(err.contains("row 1"), "unexpected diagnostic: {err}");
     }
+}

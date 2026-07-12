@@ -893,6 +893,45 @@ mod tests {
         assert_eq!(out.row(0).to_vec(), vec![1.0, 2.0, 0.0, 0.0, 2.0, 4.0]);
     }
 
+    #[test]
+    fn tensor_and_rowwise_kronecker_grams_preserve_signed_weights() {
+        let left = Arc::new(array![[1.0, 2.0], [3.0, -1.0], [0.5, 4.0]]);
+        let right = Arc::new(array![[2.0, -0.5], [1.0, 3.0], [-2.0, 1.5]]);
+        let weights = array![2.0, -3.0, 0.25];
+
+        let tensor = TensorProductDesignOperator::new(vec![left.clone(), right.clone()]).unwrap();
+        let tensor_dense = tensor.to_dense();
+        let expected = tensor_dense
+            .t()
+            .dot(&(&tensor_dense * weights.view().insert_axis(Axis(1))));
+        let got = tensor.diag_xtw_x(&weights).unwrap();
+        assert!((&got - &expected).iter().all(|value| value.abs() < 1e-12));
+        let got_diag = tensor.diag_gram(&weights).unwrap();
+        assert!(
+            (&got_diag - &expected.diag())
+                .iter()
+                .all(|value| value.abs() < 1e-12)
+        );
+
+        let rowwise = RowwiseKroneckerOperator::new(
+            DesignMatrix::Dense(DenseDesignMatrix::from(left.as_ref().clone())),
+            right,
+        )
+        .unwrap();
+        let rowwise_dense = rowwise.to_dense();
+        let expected = rowwise_dense
+            .t()
+            .dot(&(&rowwise_dense * weights.view().insert_axis(Axis(1))));
+        let got = rowwise.diag_xtw_x(&weights).unwrap();
+        assert!((&got - &expected).iter().all(|value| value.abs() < 1e-12));
+        let got_diag = rowwise.diag_gram(&weights).unwrap();
+        assert!(
+            (&got_diag - &expected.diag())
+                .iter()
+                .all(|value| value.abs() < 1e-12)
+        );
+    }
+
     // ── lower_triangle_pair_from_index ────────────────────────────────────────
 
     #[test]

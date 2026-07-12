@@ -5144,6 +5144,7 @@ impl SaeManifoldTerm {
                 self.k_atoms()
             ));
         }
+        let ard_precisions = rho.ard_precisions()?;
         let n = self.n_obs();
         // Design-honesty weights change the relative contribution of rows while
         // preserving total sample mass: `set_row_loss_weights` normalizes them to
@@ -5168,7 +5169,7 @@ impl SaeManifoldTerm {
             let periods = coord.effective_axis_periods();
             for axis in 0..d {
                 let log_alpha = rho.log_ard[atom_idx][axis];
-                let alpha = log_alpha.exp();
+                let alpha = ard_precisions[atom_idx][axis];
                 let period = periods[axis];
                 let mut energy = 0.0;
                 for row in 0..n {

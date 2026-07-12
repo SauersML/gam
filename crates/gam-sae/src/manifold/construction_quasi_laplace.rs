@@ -3767,15 +3767,11 @@ impl SaeManifoldTerm {
 
     pub(crate) fn ard_majorized_hessian_derivative(
         &self,
-        rho: &SaeManifoldRho,
+        alpha: f64,
         row: usize,
         atom: usize,
         axis: usize,
     ) -> f64 {
-        if rho.log_ard[atom].is_empty() {
-            return 0.0;
-        }
-        let alpha = rho.log_ard[atom][axis].exp();
         let periods = self.assignment.coords[atom].effective_axis_periods();
         let t = self.assignment.coords[atom].row(row)[axis];
         let prior = ArdAxisPrior::eval(alpha, t, periods[axis]);
@@ -3808,6 +3804,7 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
     ) -> Result<SaeArrowVector, String> {
         self.assignment.validate_rho_domain(rho)?;
+        let ard_precisions = rho.ard_precisions()?;
         let n_params = rho.to_flat().len();
         if j >= n_params {
             return Err(format!(
@@ -3888,7 +3885,7 @@ impl SaeManifoldTerm {
                     if rho.ard_flat_index(atom, axis) != j {
                         continue;
                     }
-                    let alpha = rho.log_ard[atom][axis].exp();
+                    let alpha = ard_precisions[atom][axis];
                     let periods = self.assignment.coords[atom].effective_axis_periods();
                     let row_w = self.row_loss_weights.as_deref();
                     for row in 0..self.n_obs() {
@@ -4130,6 +4127,7 @@ impl SaeManifoldTerm {
         joint_block: bool,
     ) -> Result<SaeArrowVector, String> {
         self.assignment.validate_rho_domain(rho)?;
+        let ard_precisions = rho.ard_precisions()?;
         // Γ_a = tr(H⁻¹ ∂H/∂θ_a) over the inner variables θ (#1006). `H` here is
         // the SAME object the criterion factor builds — Gauss-Newton data
         // curvature plus the prior majorizers / `hessian_diag` diagonals the
@@ -4420,8 +4418,15 @@ impl SaeManifoldTerm {
                                         jets.vars[w],
                                         ordered_beta_bernoulli_channels.as_ref(),
                                     ),
-                                SaeLocalRowVar::Coord { atom, axis } if a == w => {
-                                    self.ard_majorized_hessian_derivative(rho, row, atom, axis)
+                                SaeLocalRowVar::Coord { atom, axis }
+                                    if a == w && !ard_precisions[atom].is_empty() =>
+                                {
+                                    self.ard_majorized_hessian_derivative(
+                                        ard_precisions[atom][axis],
+                                        row,
+                                        atom,
+                                        axis,
+                                    )
                                 }
                                 _ => 0.0,
                             };
@@ -4557,6 +4562,7 @@ impl SaeManifoldTerm {
         sinv_probes: &[Array1<f64>],
     ) -> Result<SaeArrowVector, String> {
         self.assignment.validate_rho_domain(rho)?;
+        let ard_precisions = rho.ard_precisions()?;
         if cache.arrow_log_det().is_none() {
             return Err(
                 "logdet_theta_adjoint_from_probes: cache lacks an authoritative joint-Hessian \
@@ -4832,8 +4838,15 @@ impl SaeManifoldTerm {
                                         jets.vars[w],
                                         ordered_beta_bernoulli_channels.as_ref(),
                                     ),
-                                SaeLocalRowVar::Coord { atom, axis } if a == w => {
-                                    self.ard_majorized_hessian_derivative(rho, row, atom, axis)
+                                SaeLocalRowVar::Coord { atom, axis }
+                                    if a == w && !ard_precisions[atom].is_empty() =>
+                                {
+                                    self.ard_majorized_hessian_derivative(
+                                        ard_precisions[atom][axis],
+                                        row,
+                                        atom,
+                                        axis,
+                                    )
                                 }
                                 _ => 0.0,
                             };

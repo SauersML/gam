@@ -133,24 +133,6 @@ impl PirlsRowFamily {
             Self::GammaLog => "pirls_ladder_gamma_log",
         }
     }
-
-    /// True for `(response, canonical-link)` pairs where observed information
-    /// equals Fisher information exactly, so `w_hessian == w_fisher` for both
-    /// curvature modes.
-    ///
-    /// Gamma-LOG is **non-canonical**: the canonical Gamma link is the
-    /// reciprocal 1/μ, not log. Under a log link the observed Hessian weight
-    /// is `w_F · y/μ` with `w_F = prior·shape`, which differs
-    /// from the Fisher weight `w_F` whenever `y ≠ μ`. Consequently
-    /// `CurvatureMode::Observed` produces a different `w_hessian` for
-    /// Gamma-log, and it must not be short-circuited via a canonical-family
-    /// check.
-    pub const fn is_canonical(self) -> bool {
-        match self {
-            Self::BernoulliLogit | Self::PoissonLog | Self::GaussianIdentity => true,
-            Self::GammaLog | Self::BernoulliProbit | Self::BernoulliCLogLog => false,
-        }
-    }
 }
 
 /// Curvature surface used to populate `w_hessian` / `w_solver`.
@@ -237,7 +219,6 @@ pub struct RowOutput {
     pub w_hessian: f64,
     pub w_solver: f64,
     pub deviance: f64,
-    pub status: u32,
 }
 
 /// Reference CPU evaluator for one row. `mode` selects `w_hessian` curvature.
@@ -482,7 +463,6 @@ fn row_gaussian_identity(
             w_hessian,
             w_solver: w_hessian,
             deviance: dev,
-            status: status_codes::OK,
         },
     )
 }
@@ -504,7 +484,6 @@ fn row_poisson_log(
             input.eta,
             RowOutput {
                 mu,
-                status: status_codes::OK,
                 ..RowOutput::default()
             },
         );
@@ -513,17 +492,15 @@ fn row_poisson_log(
     if !(w_fisher.is_finite() && w_fisher > 0.0) {
         return Err(row_error(row, "Poisson Fisher weight", input.eta, w_fisher));
     }
-    let weighted_y = w_prior * input.y;
-    let grad_eta = weighted_y - w_fisher;
+    let grad_eta = w_prior * (input.y - mu);
+    let u = (input.y - mu) / mu;
     let dev_base = if input.y == 0.0 {
         w_fisher
+    } else if u.is_finite() {
+        w_fisher * poisson_unit_deviance_near_one(u)
     } else {
-        let u = (input.y - mu) / mu;
-        if u.abs() <= 0.125 {
-            w_fisher * poisson_unit_deviance_near_one(u)
-        } else {
-            weighted_y * (input.y.ln() - input.eta) - weighted_y + w_fisher
-        }
+        let weighted_y = w_prior * input.y;
+        weighted_y * (input.y.ln() - input.eta) - weighted_y + w_fisher
     };
     let dev = 2.0 * dev_base;
     let w_hessian = select_w_hessian(mode, w_fisher, 0.0);
@@ -537,7 +514,6 @@ fn row_poisson_log(
             w_hessian,
             w_solver: w_hessian,
             deviance: dev,
-            status: status_codes::OK,
         },
     )
 }
@@ -563,7 +539,6 @@ fn row_gamma_log(
             input.eta,
             RowOutput {
                 mu,
-                status: status_codes::OK,
                 ..RowOutput::default()
             },
         );
@@ -616,7 +591,6 @@ fn row_gamma_log(
             w_hessian,
             w_solver: w_hessian,
             deviance: dev,
-            status: status_codes::OK,
         },
     )
 }
@@ -668,7 +642,6 @@ fn row_bernoulli_logit(
             input.eta,
             RowOutput {
                 mu,
-                status: status_codes::OK,
                 ..RowOutput::default()
             },
         );
@@ -690,7 +663,6 @@ fn row_bernoulli_logit(
             w_hessian,
             w_solver: w_hessian,
             deviance: dev,
-            status: status_codes::OK,
         },
     )
 }
@@ -710,7 +682,6 @@ fn row_bernoulli_probit(
         standard_normal_cdf(input.eta),
         d1,
         -input.eta * d1,
-        (input.eta * input.eta - 1.0) * d1,
     )
 }
 
@@ -725,15 +696,7 @@ fn row_bernoulli_cloglog(
     let mu = -(-inner).exp_m1();
     let complement = (-inner).exp();
     let d1 = inner * complement;
-    row_bernoulli_noncanonical(
-        row,
-        input,
-        mode,
-        mu,
-        d1,
-        d1 * (1.0 - inner),
-        d1 * (1.0 - 3.0 * inner + inner * inner),
-    )
+    row_bernoulli_noncanonical(row, input, mode, mu, d1, d1 * (1.0 - inner))
 }
 
 #[inline]
@@ -744,18 +707,10 @@ fn row_bernoulli_noncanonical(
     mu: f64,
     d1: f64,
     d2: f64,
-    d3: f64,
 ) -> Result<RowOutput, EstimationError> {
     let w_prior = prior_weight(row, input)?;
     bernoulli_response(row, input, w_prior)?;
-    if !(mu.is_finite()
-        && mu > 0.0
-        && mu < 1.0
-        && d1.is_finite()
-        && d1 > 0.0
-        && d2.is_finite()
-        && d3.is_finite())
-    {
+    if !(mu.is_finite() && mu > 0.0 && mu < 1.0 && d1.is_finite() && d1 > 0.0 && d2.is_finite()) {
         return Err(row_error(row, "inverse-link jet", input.eta, mu));
     }
     if w_prior == 0.0 {
@@ -764,7 +719,6 @@ fn row_bernoulli_noncanonical(
             input.eta,
             RowOutput {
                 mu,
-                status: status_codes::OK,
                 ..RowOutput::default()
             },
         );
@@ -811,7 +765,6 @@ fn row_bernoulli_noncanonical(
             w_hessian,
             w_solver: w_hessian,
             deviance: dev,
-            status: status_codes::OK,
         },
     )
 }
@@ -1889,18 +1842,18 @@ fn poisson_log_body(curvature: CurvatureMode) -> String {
         if (status == PIRLS_OK) {{
             w_hessian = w_fisher;
             w_solver = w_hessian;
-            double weighted_y = wp * y_i;
-            grad_eta = weighted_y - w_fisher;
-            if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
+            grad_eta = wp * (y_i - mu);
+            double u = (y_i - mu) / mu;
             double dev_base;
             if (y_i == 0.0) {{
                 dev_base = w_fisher;
+            }} else if (isfinite(u)) {{
+                dev_base = w_fisher * poisson_unit_deviance_near_one(u);
             }} else {{
-                double u = (y_i - mu) / mu;
-                dev_base = fabs(u) <= 0.125
-                    ? w_fisher * poisson_unit_deviance_near_one(u)
-                    : weighted_y * (log(y_i) - eta_i) - weighted_y + w_fisher;
+                double weighted_y = wp * y_i;
+                dev_base = weighted_y * (log(y_i) - eta_i) - weighted_y + w_fisher;
             }}
+            if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
             dev = 2.0 * dev_base;
             if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
         }}
@@ -2024,15 +1977,14 @@ fn bernoulli_probit_body(curvature: CurvatureMode) -> String {
     if (status == PIRLS_OK && wp > 0.0
             && !(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0))
         pirls_refuse(&status, PIRLS_RESPONSE);
-    double dmu_deta = 0.0, d2mu_deta2 = 0.0, d3mu_deta3 = 0.0, v = 0.0;
+    double dmu_deta = 0.0, d2mu_deta2 = 0.0, v = 0.0;
     if (status == PIRLS_OK) {{
         mu = std_norm_cdf(eta_i);
         dmu_deta = std_norm_pdf(eta_i);
         d2mu_deta2 = -eta_i * dmu_deta;
-        d3mu_deta3 = (eta_i * eta_i - 1.0) * dmu_deta;
         if (!(isfinite(mu) && mu > 0.0 && mu < 1.0
                 && isfinite(dmu_deta) && dmu_deta > 0.0
-                && isfinite(d2mu_deta2) && isfinite(d3mu_deta3)))
+                && isfinite(d2mu_deta2)))
             pirls_refuse(&status, PIRLS_INVERSE_LINK);
     }}
     if (status == PIRLS_OK && wp > 0.0) {{
@@ -2076,17 +2028,16 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
     if (status == PIRLS_OK && wp > 0.0
             && !(isfinite(y_i) && y_i >= 0.0 && y_i <= 1.0))
         pirls_refuse(&status, PIRLS_RESPONSE);
-    double inner = 0.0, dmu_deta = 0.0, d2mu_deta2 = 0.0, d3mu_deta3 = 0.0, v = 0.0;
+    double inner = 0.0, dmu_deta = 0.0, d2mu_deta2 = 0.0, v = 0.0;
     if (status == PIRLS_OK) {{
         inner = exp(eta_i);
         double complement = exp(-inner);
         mu = -expm1(-inner);
         dmu_deta = inner * complement;
         d2mu_deta2 = dmu_deta * (1.0 - inner);
-        d3mu_deta3 = dmu_deta * (1.0 - 3.0 * inner + inner * inner);
         if (!(isfinite(mu) && mu > 0.0 && mu < 1.0
                 && isfinite(dmu_deta) && dmu_deta > 0.0
-                && isfinite(d2mu_deta2) && isfinite(d3mu_deta3)))
+                && isfinite(d2mu_deta2)))
             pirls_refuse(&status, PIRLS_INVERSE_LINK);
     }}
     if (status == PIRLS_OK && wp > 0.0) {{
