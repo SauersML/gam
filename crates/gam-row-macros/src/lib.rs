@@ -257,7 +257,7 @@ impl Graph {
         }
         let node = self.nodes[id].clone();
         let derivative = match node {
-            Node::Constant(_) => self.constant(0.0),
+            Node::Constant(_) | Node::Parameter(_) => self.constant(0.0),
             Node::Variable(axis) => self.constant(f64::from(axis == variable)),
             Node::Add(left, right) => {
                 let left = self.derivative(left, variable);
