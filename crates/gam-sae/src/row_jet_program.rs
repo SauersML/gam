@@ -1910,6 +1910,9 @@ impl SaeReconstructionRowProgram {
 mod tests {
     use super::*;
     use gam_math::jet_scalar::JetScalar;
+    // `value`/`add`/… moved to the shared `JetField` base (JetScalar: JetField);
+    // the concrete-typed scalar reads in these tests need it in scope.
+    use gam_math::nested_dual::JetField;
 
     /// Replicate the production hand path (`row_jets_for_logdet`) arithmetic for
     /// the reconstruction `first`/`second` channels of ONE output column, from
