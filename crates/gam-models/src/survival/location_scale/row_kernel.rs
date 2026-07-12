@@ -621,24 +621,47 @@ fn sls_row_vgh_compiled(
 /// [`sls_row_vgh_compiled`]. Only the 24 structurally live upper-triangle
 /// channels exist in the output; no 9×9 primary Hessian is materialized.
 #[inline(always)]
-fn add_composed_hessian_pairs<const N: usize, A: Order2AtomChannels<N>>(
+fn add_composed_hessian_pairs<const N: usize, const H: usize, A: Order2AtomChannels<N>>(
     output: &mut [f64; SLS_HESSIAN_PAIRS.len()],
     atom: &A,
     axes: [usize; N],
     first: f64,
     second: f64,
+    add: [bool; H],
 ) {
+    assert!(H == N * (N + 1) / 2);
+    let mut packed = 0;
     for local_row in 0..N {
         for local_column in local_row..N {
             let row = axes[local_row];
             let column = axes[local_column];
             let slot = SLS_HESSIAN_PAIR_SLOTS[row][column];
             debug_assert!(slot < SLS_HESSIAN_PAIRS.len());
-            let mut channel = first * atom.hessian_at(local_row, local_column);
-            channel += second
-                * atom.gradient_at(local_row)
-                * atom.gradient_at(local_column);
-            output[slot] += channel;
+            let inner_live = A::HESSIAN_BITS & (1u128 << packed) != 0;
+            let outer_live = A::GRADIENT_BITS & (1u128 << local_row) != 0
+                && A::GRADIENT_BITS & (1u128 << local_column) != 0;
+            let channel = if inner_live {
+                let inner = first * atom.hessian_at(local_row, local_column);
+                if outer_live {
+                    inner
+                        + second
+                            * atom.gradient_at(local_row)
+                            * atom.gradient_at(local_column)
+                } else {
+                    inner
+                }
+            } else if outer_live {
+                second * atom.gradient_at(local_row) * atom.gradient_at(local_column)
+            } else {
+                packed += 1;
+                continue;
+            };
+            if add[packed] {
+                output[slot] += channel;
+            } else {
+                output[slot] = channel;
+            }
+            packed += 1;
         }
     }
 }
@@ -667,12 +690,36 @@ fn sls_row_hessian_pairs_compiled(
     );
     let plan = sls_outer_plan(kernel);
     let mut output = [0.0; SLS_HESSIAN_PAIRS.len()];
-    add_composed_hessian_pairs(&mut output, &u0, SLS_U0_AXES, plan.u0[1], plan.u0[2]);
+    add_composed_hessian_pairs(
+        &mut output,
+        &u0,
+        SLS_U0_AXES,
+        plan.u0[1],
+        plan.u0[2],
+        [false; 6],
+    );
     if let Some(stack) = plan.u1 {
-        add_composed_hessian_pairs(&mut output, &u1, SLS_U1_AXES, stack[1], stack[2]);
+        add_composed_hessian_pairs(
+            &mut output,
+            &u1,
+            SLS_U1_AXES,
+            stack[1],
+            stack[2],
+            [false; 6],
+        );
     }
     if let Some(stack) = plan.g {
-        add_composed_hessian_pairs(&mut output, &g, SLS_G_AXES, stack[1], stack[2]);
+        add_composed_hessian_pairs(
+            &mut output,
+            &g,
+            SLS_G_AXES,
+            stack[1],
+            stack[2],
+            [
+                false, false, false, false, false, true, false, true, false, false, false, false,
+                true, false, false,
+            ],
+        );
     }
     output
 }
