@@ -8,18 +8,19 @@
 //!
 //! ## The period-extension chart
 //!
-//! On the observed coordinate window `s ∈ [0, 2π]` the basis is
+//! On the observed coordinate window `s ∈ [0, W]`, write
+//! `u = 2πs/W ∈ [0, 2π]`. The basis is
 //!
 //! ```text
-//! Φ_m(s; γ) = [cos(m γ s), sin(m γ s)],   γ = 2π / L ∈ [0, 1].
+//! Φ_m(s; γ) = [cos(m γ u), sin(m γ u)],   γ = 2π / L ∈ [0, 1].
 //! ```
 //!
 //! * `γ = 1`: the window is one full period, endpoints are identified — the
 //!   current circle.
 //! * `0 < γ < 1`: the data occupy an arc of a larger periodic chart, so the
 //!   endpoint seam is not forced closed.
-//! * `γ = 0`: the removable interval/Taylor limit — `sin(m γ s)/(m γ) → s`,
-//!   `1 − cos(m γ s) → ½ m² γ² s²`, so after the rank-stabilising gauge the
+//! * `γ = 0`: the removable interval/Taylor limit — `sin(m γ u)/(m γ) → u`,
+//!   `1 − cos(m γ u) → ½ m² γ² u²`, so after the rank-stabilising gauge the
 //!   columns become an interval (polynomial) basis.
 //!
 //! This is the **support-moving** version. The cheap MVP, implemented in
@@ -56,9 +57,20 @@ use wide::f64x4;
 #[derive(Clone, Debug)]
 pub struct ClosureFamily {
     /// Number of harmonic pairs.
-    pub harmonics: usize,
+    harmonics: usize,
     /// Observed window length `[0, window]`.
-    pub window: f64,
+    window: f64,
+}
+
+/// Canonical angular coordinate on an observed window.
+///
+/// The closure parameter is dimensionless: rescaling both the coordinate and
+/// its window must leave the basis unchanged. Mapping `s in [0, window]` to
+/// `u = 2pi*s/window` makes `gamma = 1` exactly one full turn for every positive
+/// finite window, rather than only for the special case `window = 2pi`.
+#[inline]
+fn closure_coordinate(s: f64, window: f64) -> f64 {
+    std::f64::consts::TAU * s / window
 }
 
 /// Seed the stable trigonometric recurrence for the base angle `φ`.
@@ -79,8 +91,13 @@ fn recurrence_seed(phi: f64) -> (f64, f64, f64, f64) {
 
 impl ClosureFamily {
     /// Build a closure family of `harmonics` Fourier pairs on `[0, window]`.
-    pub fn new(harmonics: usize, window: f64) -> Self {
-        Self { harmonics, window }
+    pub fn new(harmonics: usize, window: f64) -> Result<Self, String> {
+        if !window.is_finite() || window <= 0.0 {
+            return Err(format!(
+                "closure-family window must be finite and positive; got {window}"
+            ));
+        }
+        Ok(Self { harmonics, window })
     }
 
     /// Number of raw basis columns: constant + `2·harmonics` Fourier columns.
@@ -94,15 +111,16 @@ impl ClosureFamily {
     ///
     /// ## Why this beats the per-harmonic transcendental
     ///
-    /// The angle `θ_m = m·γ·s` is **affine in γ** (`∂θ_m/∂γ = m·s`, `∂²θ_m/∂γ² =
+    /// With `u = 2π·s/window`, the angle `θ_m = m·γ·u` is **affine in γ**
+    /// (`∂θ_m/∂γ = m·u`, `∂²θ_m/∂γ² =
     /// 0`), so the entire γ-jet of a column is a fixed scaling of its value:
-    /// `cos` column `(cos θ_m, −sin θ_m·m·s, −cos θ_m·(m·s)²)`, `sin` column
-    /// `(sin θ_m, cos θ_m·m·s, −sin θ_m·(m·s)²)`. The only transcendental work is
+    /// `cos` column `(cos θ_m, −sin θ_m·m·u, −cos θ_m·(m·u)²)`, `sin` column
+    /// `(sin θ_m, cos θ_m·m·u, −sin θ_m·(m·u)²)`. The only transcendental work is
     /// therefore the `cos θ_m`/`sin θ_m` ladder for `m = 1..=H`.
     ///
     /// The earlier form called `sin_cos` once **per harmonic** — `H` libm
     /// transcendentals per row, each on the progressively larger argument
-    /// `m·γ·s`. We instead seed a single `sin_cos(φ/2)` (`φ = γ·s`) and run the
+    /// `m·γ·u`. We instead seed a single `sin_cos(φ/2)` (`φ = γ·u`) and run the
     /// numerically stable trigonometric recurrence (Singleton / Numerical
     /// Recipes §5.5):
     ///
@@ -113,8 +131,8 @@ impl ClosureFamily {
     /// ```
     ///
     /// One transcendental per row instead of `H`, ~2–2.6× faster. Because the
-    /// recurrence never forms the large argument `m·γ·s` (whose unavoidable f64
-    /// rounding is `ε·m·γ·s`), it is in fact **more accurate** than the old
+    /// recurrence never forms the large argument `m·γ·u` (whose unavoidable f64
+    /// rounding is `ε·m·γ·u`), it is in fact **more accurate** than the old
     /// per-harmonic libm calls: across 2000 inputs × `H ∈ {4,8,16,32,64,128}`
     /// its max absolute error vs an extended-precision (double-double) reference
     /// is 0.72–0.92× that of the old form at every `H` (see the
@@ -134,9 +152,10 @@ impl ClosureFamily {
         if self.harmonics == 0 {
             return;
         }
-        let (alpha, beta, mut cs, mut sn) = recurrence_seed(gamma * s);
+        let u = closure_coordinate(s, self.window);
+        let (alpha, beta, mut cs, mut sn) = recurrence_seed(gamma * u);
         for m in 1..=self.harmonics {
-            let ms = m as f64 * s; // ∂θ_m/∂γ
+            let ms = m as f64 * u; // ∂θ_m/∂γ
             let ci = 2 * m - 1;
             let si = 2 * m;
             // cos column: v=cos, ∂γ=-sin·θ_g, ∂²γ=-cos·θ_g².
@@ -163,7 +182,8 @@ impl ClosureFamily {
         if self.harmonics == 0 {
             return;
         }
-        let (alpha, beta, mut cs, mut sn) = recurrence_seed(gamma * s);
+        let u = closure_coordinate(s, self.window);
+        let (alpha, beta, mut cs, mut sn) = recurrence_seed(gamma * u);
         for m in 1..=self.harmonics {
             value[2 * m - 1] = cs;
             value[2 * m] = sn;
@@ -174,7 +194,8 @@ impl ClosureFamily {
         }
     }
 
-    /// Raw design row `Φ(s; γ) = [1, cos(γs), sin(γs), cos(2γs), …]` and its γ-jet.
+    /// Raw design row `Φ(s; γ) = [1, cos(γu), sin(γu), cos(2γu), …]`
+    /// and its γ-jet, where `u = 2π·s/window`.
     ///
     /// Returns `(value, d/dγ, d²/dγ²)` per column — the support-moving basis and
     /// its exact first/second closure derivatives in one pass. The constant
@@ -220,8 +241,13 @@ impl ClosureFamily {
         let mut i = 0;
         if h > 0 {
             while i + 4 <= n {
-                let s4 = [s[i], s[i + 1], s[i + 2], s[i + 3]];
-                let (alpha, beta, mut cc, mut sn) = seed_lanes(gamma, &s4);
+                let u4 = [
+                    closure_coordinate(s[i], self.window),
+                    closure_coordinate(s[i + 1], self.window),
+                    closure_coordinate(s[i + 2], self.window),
+                    closure_coordinate(s[i + 3], self.window),
+                ];
+                let (alpha, beta, mut cc, mut sn) = seed_lanes(gamma, &u4);
                 for l in 0..4 {
                     pv[(i + l) * d] = 1.0;
                 }
@@ -271,15 +297,20 @@ impl ClosureFamily {
         let mut i = 0;
         if h > 0 {
             while i + 4 <= n {
-                let s4 = [s[i], s[i + 1], s[i + 2], s[i + 3]];
-                let (alpha, beta, mut cc, mut sn) = seed_lanes(gamma, &s4);
-                let svec = f64x4::from(s4);
+                let u4 = [
+                    closure_coordinate(s[i], self.window),
+                    closure_coordinate(s[i + 1], self.window),
+                    closure_coordinate(s[i + 2], self.window),
+                    closure_coordinate(s[i + 3], self.window),
+                ];
+                let (alpha, beta, mut cc, mut sn) = seed_lanes(gamma, &u4);
+                let uvec = f64x4::from(u4);
                 for l in 0..4 {
                     pv[(i + l) * d] = 1.0;
                 }
                 for m in 1..=h {
                     let (ci, si) = (2 * m - 1, 2 * m);
-                    let ms = svec * f64x4::splat(m as f64); // ∂θ_m/∂γ
+                    let ms = uvec * f64x4::splat(m as f64); // ∂θ_m/∂γ
                     // Same per-lane association as the scalar hand-fold.
                     let cca = cc.to_array();
                     let sna = sn.to_array();
@@ -320,20 +351,21 @@ impl ClosureFamily {
     }
 }
 
-/// Seed four independent recurrence lanes for base angles `φ_l = γ·s_l`.
+/// Seed four independent recurrence lanes for canonical base angles
+/// `φ_l = γ·u_l`, where `u_l = 2π·s_l/window`.
 ///
 /// Returns `(α, β, cos φ, sin φ)` as `f64x4` lanes. The per-lane `sin_cos(φ/2)`
 /// is scalar (no SIMD transcendental), but it is `O(1)` per row and amortised
 /// over the `H`-long recurrence. Lane `l` reproduces [`recurrence_seed`]
 /// bit-for-bit.
 #[inline]
-fn seed_lanes(gamma: f64, s4: &[f64; 4]) -> (f64x4, f64x4, f64x4, f64x4) {
+fn seed_lanes(gamma: f64, u4: &[f64; 4]) -> (f64x4, f64x4, f64x4, f64x4) {
     let mut al = [0.0; 4];
     let mut be = [0.0; 4];
     let mut ca = [0.0; 4];
     let mut sa = [0.0; 4];
     for l in 0..4 {
-        let (a, b, c, s) = recurrence_seed(gamma * s4[l]);
+        let (a, b, c, s) = recurrence_seed(gamma * u4[l]);
         al[l] = a;
         be[l] = b;
         ca[l] = c;
@@ -574,7 +606,7 @@ mod tests {
     /// columns `[1, cos(s), sin(s), …]`.
     #[test]
     fn gamma_one_is_circle_basis() {
-        let fam = ClosureFamily::new(2, std::f64::consts::TAU);
+        let fam = ClosureFamily::new(2, std::f64::consts::TAU).expect("valid window");
         let s = 1.3_f64;
         let (v, _, _) = fam.row_jet(s, 1.0);
         assert!((v[0] - 1.0).abs() < 1e-15);
@@ -584,11 +616,70 @@ mod tests {
         assert!((v[4] - (2.0 * s).sin()).abs() < 1e-14);
     }
 
+    /// `gamma = 1` means one full turn on EVERY observed window, not only on
+    /// the canonical `2pi` window. Consequently the two endpoints have the
+    /// same value in every Fourier column.
+    #[test]
+    fn gamma_one_closes_every_positive_window() {
+        for &window in &[0.125_f64, 3.7, 10.0, 1.0e6] {
+            let fam = ClosureFamily::new(8, window).expect("valid window");
+            let (left, _, _) = fam.row_jet(0.0, 1.0);
+            let (right, _, _) = fam.row_jet(window, 1.0);
+            for col in 0..fam.raw_dim() {
+                assert!(
+                    (left[col] - right[col]).abs() < 2.0e-13,
+                    "window={window}, column={col}: left={} right={}",
+                    left[col],
+                    right[col]
+                );
+            }
+        }
+    }
+
+    /// The closure coordinate is dimensionless. A change of measurement units
+    /// `s -> a*s`, `window -> a*window` therefore leaves the value and both
+    /// gamma-derivative channels invariant.
+    #[test]
+    fn basis_and_gamma_jets_are_invariant_to_coordinate_rescaling() {
+        let window = 7.3_f64;
+        let scale = 3.7_f64;
+        let gamma = 0.63_f64;
+        let s = array![0.0, 0.17, 1.9, 3.65, 5.8, 7.11, window];
+        let scaled_s = &s * scale;
+        let base = ClosureFamily::new(9, window).expect("valid base window");
+        let scaled =
+            ClosureFamily::new(9, window * scale).expect("valid rescaled window");
+        let (v0, d0, dd0) = base.design_jet(s.view(), gamma);
+        let (v1, d1, dd1) = scaled.design_jet(scaled_s.view(), gamma);
+
+        for (label, lhs, rhs) in [("value", v0, v1), ("d_gamma", d0, d1), ("dd_gamma", dd0, dd1)] {
+            let max_error = lhs
+                .iter()
+                .zip(rhs.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                max_error < 2.0e-11,
+                "{label} changed under coordinate rescaling: max error {max_error:.3e}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonpositive_or_nonfinite_window_is_rejected() {
+        for window in [0.0_f64, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                ClosureFamily::new(2, window).is_err(),
+                "invalid window {window} was accepted"
+            );
+        }
+    }
+
     /// The analytic γ-jet of the basis matches a central finite difference at
     /// an interior γ and across the γ → 0 Taylor limit.
     #[test]
     fn basis_gamma_jet_matches_fd() {
-        let fam = ClosureFamily::new(3, std::f64::consts::TAU);
+        let fam = ClosureFamily::new(3, std::f64::consts::TAU).expect("valid window");
         let s = 0.8_f64;
         for &g0 in &[1.0_f64, 0.5, 0.05, 1e-6] {
             let (_, dg, dgg) = fam.row_jet(s, g0);
@@ -839,9 +930,9 @@ mod tests {
         }
     }
 
-    /// Exact double-double argument `m·γ·s` (`m` a small integer).
-    fn dd_arg(m: usize, gamma: f64, s: f64) -> Dd {
-        let (p, e) = two_prod(gamma, s);
+    /// Exact double-double argument `m·γ·u` (`m` a small integer).
+    fn dd_arg(m: usize, gamma: f64, u: f64) -> Dd {
+        let (p, e) = two_prod(gamma, u);
         Dd { hi: p, lo: e }.mul_f(m as f64)
     }
 
@@ -872,19 +963,20 @@ mod tests {
             (seed >> 11) as f64 / (1u64 << 53) as f64
         };
         for &h in &[4usize, 8, 16, 32, 64, 128] {
-            let fam = ClosureFamily::new(h, std::f64::consts::TAU);
+            let fam = ClosureFamily::new(h, std::f64::consts::TAU).expect("valid window");
             let mut max_old = 0.0f64;
             let mut max_new = 0.0f64;
             for _ in 0..2000 {
                 let s = (rng() * 2.0 - 1.0) * std::f64::consts::TAU;
                 let gamma = rng();
+                let u = closure_coordinate(s, std::f64::consts::TAU);
                 let (val, dg, dgg) = fam.row_jet(s, gamma);
                 for m in 1..=h {
-                    let (ts, tc) = dd_sincos(dd_arg(m, gamma, s));
+                    let (ts, tc) = dd_sincos(dd_arg(m, gamma, u));
                     let (tcf, tsf) = (tc.to_f64(), ts.to_f64());
-                    let ms = m as f64 * s;
+                    let ms = m as f64 * u;
                     let (cs_new, sn_new) = (val[2 * m - 1], val[2 * m]);
-                    // OLD: per-harmonic libm on the large argument m·γ·s.
+                    // OLD: per-harmonic libm on the large argument m·γ·u.
                     let (osn, ocs) = (gamma * ms).sin_cos();
                     // Accuracy gate on the transcendental VALUE channels (cos/sin
                     // are O(1), so absolute ≈ relative). The γ-jet channels are
@@ -918,11 +1010,11 @@ mod tests {
     /// The four-rows-per-pass `f64x4` assembly in `design`/`design_jet` must be
     /// **bit-identical** to the scalar single-row path it replaces — each SIMD
     /// lane is plain IEEE `f64`, so there is no accuracy change, only throughput.
-    /// Covers non-multiple-of-4 row counts (the scalar remainder) and `H = 0`.
+        /// Covers non-multiple-of-4 row counts (the scalar remainder) and `H = 0`.
     #[test]
     fn simd_design_is_bit_identical_to_scalar_rows() {
         for &h in &[0usize, 1, 3, 7, 16] {
-            let fam = ClosureFamily::new(h, std::f64::consts::TAU);
+            let fam = ClosureFamily::new(h, std::f64::consts::TAU).expect("valid window");
             // n deliberately not a multiple of 4 to exercise the remainder.
             let n = 11;
             let s: Vec<f64> = (0..n).map(|k| (k as f64) * 0.37 - 1.9).collect();

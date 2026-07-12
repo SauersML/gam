@@ -1200,6 +1200,39 @@ mod tests {
         assert_eq!(verdict.candidate_names.len(), 4);
     }
 
+    #[test]
+    fn smooth_circle_density_and_evidence_are_translation_invariant() {
+        let n = 160usize;
+        let mut coords = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            let angle = std::f64::consts::TAU * row as f64 / n as f64;
+            let radius = 2.0 + 0.08 * (3.0 * angle).cos() + 0.03 * (5.0 * angle).sin();
+            coords[[row, 0]] = radius * angle.cos();
+            coords[[row, 1]] = radius * angle.sin();
+        }
+        let mut translated = coords.clone();
+        for mut row in translated.rows_mut() {
+            row[0] += 137.25;
+            row[1] -= 91.75;
+        }
+        let train = (0..120).collect::<Vec<_>>();
+        let eval = (120..n).collect::<Vec<_>>();
+        let base_density = ring_provider_2d(coords.clone())(&train, &eval).unwrap();
+        let shifted_density = ring_provider_2d(translated.clone())(&train, &eval).unwrap();
+        for (base, shifted) in base_density.iter().zip(&shifted_density) {
+            assert!(
+                (base - shifted).abs() < 2.0e-11,
+                "translation changed held-out ring density: base={base:.16e}, shifted={shifted:.16e}"
+            );
+        }
+        let base_evidence = ring_negative_log_evidence_2d(coords.view()).unwrap();
+        let shifted_evidence = ring_negative_log_evidence_2d(translated.view()).unwrap();
+        assert!(
+            (base_evidence - shifted_evidence).abs() < 2.0e-9,
+            "translation changed ring evidence: base={base_evidence:.16e}, shifted={shifted_evidence:.16e}"
+        );
+    }
+
     /// #2262 structureless-null control: on pure isotropic Gaussian noise (no
     /// ring, no cluster structure whatsoever) both matched controls must still
     /// run cleanly end to end and produce a well-formed
@@ -1222,7 +1255,10 @@ mod tests {
             coords[[row, 1]] = normal.sample(&mut rng);
         }
 
-        let ladder = [5usize, 7, 9];
+        // Include k=1 deliberately: it is the Euclidean candidate, not a
+        // second free-mixture candidate. The race must remove that duplicate
+        // before fitting and stacking.
+        let ladder = [1usize, 5, 7, 9];
         let (shuffle_verdict, gaussian_verdict, false_circle_floor) = matched_control_verdicts(
             coords.view(),
             5,
@@ -1231,6 +1267,11 @@ mod tests {
             Some(80.0), // plausible healthy-dictionary mean L0
         )
         .expect("matched controls must run cleanly on pure noise, not error out");
+
+        assert!(
+            shuffle_verdict.mixture_k >= 2 && gaussian_verdict.mixture_k >= 2,
+            "the free-mixture candidate must not duplicate the k=1 Euclidean Gaussian"
+        );
 
         assert!(
             (0.0..=1.0).contains(&false_circle_floor),
@@ -1275,6 +1316,21 @@ mod tests {
             (floor - expected).abs() < 1e-12,
             "floor={floor} expected={expected}"
         );
+        assert_eq!(
+            shape_detection_floor(Some(n_eff), Some(ambient_p), Some(dispersion_r)).unwrap(),
+            Some(expected)
+        );
+        assert_eq!(shape_detection_floor(None, None, None).unwrap(), None);
+        for partial in [
+            (Some(n_eff), None, None),
+            (None, Some(ambient_p), None),
+            (None, None, Some(dispersion_r)),
+            (Some(n_eff), Some(ambient_p), None),
+        ] {
+            let error = shape_detection_floor(partial.0, partial.1, partial.2)
+                .expect_err("a partial detection-reach specification must be rejected");
+            assert!(error.contains("supplied together"), "{error}");
+        }
     }
 
     #[test]
@@ -1468,28 +1524,105 @@ mod tests {
 // predictive-stacking headline picks the winner.
 // ───────────────────────────────────────────────────────────────────────────
 
+/// Fitted radial density for the smooth-circle candidate.
+///
+/// The center is part of the model. Intrinsic coordinates have an arbitrary
+/// translation gauge, so anchoring the ring at `(0, 0)` makes a shape verdict
+/// depend on a coordinate convention rather than on the represented geometry.
+/// Estimating the center from each training fold makes the density exactly
+/// translation equivariant. The corresponding evidence price is four
+/// parameters: center(2), mean radius, and radial variance.
+#[derive(Debug, Clone, Copy)]
+struct RadialCircleFit2d {
+    center: [f64; 2],
+    mean_radius: f64,
+    radial_variance: f64,
+}
+
+impl RadialCircleFit2d {
+    fn fit(coords: ArrayView2<'_, f64>, rows: &[usize]) -> Result<Self, String> {
+        let Some(&anchor_row) = rows.first() else {
+            return Err("circle density requires a nonempty training set".to_string());
+        };
+        if coords.ncols() != 2 || rows.iter().any(|&row| row >= coords.nrows()) {
+            return Err("circle density received invalid coordinates or row indices".to_string());
+        }
+
+        // Accumulate relative to one observed row. This avoids destroying the
+        // low-order bits of a small circle merely because its coordinate chart
+        // carries a large translation.
+        let anchor = [coords[[anchor_row, 0]], coords[[anchor_row, 1]]];
+        let mut relative_sum = [0.0_f64; 2];
+        for &row in rows {
+            relative_sum[0] += coords[[row, 0]] - anchor[0];
+            relative_sum[1] += coords[[row, 1]] - anchor[1];
+        }
+        let count = rows.len() as f64;
+        let center = [
+            anchor[0] + relative_sum[0] / count,
+            anchor[1] + relative_sum[1] / count,
+        ];
+        let mut radii = Vec::with_capacity(rows.len());
+        let mut radius_sum = 0.0_f64;
+        let mut radius_square_sum = 0.0_f64;
+        for &row in rows {
+            let dx = coords[[row, 0]] - center[0];
+            let dy = coords[[row, 1]] - center[1];
+            let radius = dx.hypot(dy);
+            radii.push(radius);
+            radius_sum += radius;
+            radius_square_sum += radius * radius;
+        }
+        let mean_radius = radius_sum / count;
+        let mut radial_variance = 0.0_f64;
+        for radius in radii {
+            radial_variance += (radius - mean_radius).powi(2);
+        }
+        radial_variance /= count;
+        // A zero-width observed ring is a boundary density. Keep the same
+        // explicit interior regularization used by the other Gaussian
+        // candidates, but scale it in data units instead of imposing the old
+        // absolute 1e-9 floor (which broke scale equivariance).
+        let radial_scale_squared = (radius_square_sum / count).max(f64::MIN_POSITIVE);
+        let variance_floor = (64.0 * f64::EPSILON * radial_scale_squared).max(f64::MIN_POSITIVE);
+        radial_variance = radial_variance.max(variance_floor);
+        if !center.iter().all(|value| value.is_finite())
+            || !mean_radius.is_finite()
+            || !radial_variance.is_finite()
+        {
+            return Err("circle density fit produced non-finite parameters".to_string());
+        }
+        Ok(Self {
+            center,
+            mean_radius,
+            radial_variance,
+        })
+    }
+
+    fn log_density(self, x: f64, y: f64) -> f64 {
+        let radius = (x - self.center[0])
+            .hypot(y - self.center[1])
+            .max(f64::MIN_POSITIVE.sqrt());
+        -0.5 * (std::f64::consts::TAU * self.radial_variance).ln()
+            - 0.5 * (radius - self.mean_radius).powi(2) / self.radial_variance
+            - std::f64::consts::TAU.ln()
+            - radius.ln()
+    }
+}
+
 /// Held-out log-density of the smooth-circle (ring) candidate on 2-D coords:
-/// radius ~ N(μ, σ²) fit on the training rows, angle uniform, plus the
-/// Cartesian→polar `1/r` Jacobian. Byte-identical in form to the ring provider
-/// the in-tree weekday-circle gate uses.
+/// radius ~ N(μ, σ²) around a fitted center, angle uniform, plus the
+/// Cartesian→polar `1/r` Jacobian.
 fn ring_provider_2d(coords: Array2<f64>) -> gam::solver::HeldOutDensityProvider<'static> {
     Box::new(
         move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
-            if train.is_empty() {
-                return Err("ring provider got empty training set".to_string());
-            }
-            let r_of =
-                |i: usize| -> f64 { (coords[[i, 0]].powi(2) + coords[[i, 1]].powi(2)).sqrt() };
-            let n = train.len() as f64;
-            let mean: f64 = train.iter().map(|&i| r_of(i)).sum::<f64>() / n;
-            let var: f64 =
-                (train.iter().map(|&i| (r_of(i) - mean).powi(2)).sum::<f64>() / n).max(1e-9);
-            let log_norm = -0.5 * (std::f64::consts::TAU * var).ln();
-            let log_angle = -(std::f64::consts::TAU).ln();
+            let fit = RadialCircleFit2d::fit(coords.view(), train)?;
             let mut out = Vec::with_capacity(eval.len());
             for &i in eval {
-                let r = r_of(i).max(1e-9);
-                out.push(log_norm - 0.5 * (r - mean).powi(2) / var + log_angle - r.ln());
+                if i >= coords.nrows() {
+                    return Err("circle density received an invalid evaluation row".to_string());
+                }
+                out.push(fit.log_density(coords[[i, 0]], coords[[i, 1]]));
             }
             Ok(out)
         },
@@ -1545,23 +1678,17 @@ fn gaussian_provider_2d(coords: Array2<f64>) -> gam::solver::HeldOutDensityProvi
 }
 
 /// Closed-form rank-aware (BIC-form Laplace) negative-log-evidence of the ring
-/// model (2 free params: radius mean + variance). Corroborates the held-out
-/// stacking headline; lower is better.
-fn ring_negative_log_evidence_2d(coords: ArrayView2<'_, f64>) -> f64 {
+/// model (4 free params: center(2), radius mean, and variance). Corroborates
+/// the held-out stacking headline; lower is better.
+fn ring_negative_log_evidence_2d(coords: ArrayView2<'_, f64>) -> Result<f64, String> {
     let n = coords.nrows();
-    let r: Vec<f64> = (0..n)
-        .map(|i| (coords[[i, 0]].powi(2) + coords[[i, 1]].powi(2)).sqrt())
-        .collect();
-    let mean = r.iter().sum::<f64>() / n as f64;
-    let var = (r.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64).max(1e-9);
-    let log_norm = -0.5 * (std::f64::consts::TAU * var).ln();
-    let log_angle = -(std::f64::consts::TAU).ln();
-    let mut loglik = 0.0_f64;
-    for &ri in &r {
-        let ri = ri.max(1e-9);
-        loglik += log_norm - 0.5 * (ri - mean).powi(2) / var + log_angle - ri.ln();
+    let rows = (0..n).collect::<Vec<_>>();
+    let fit = RadialCircleFit2d::fit(coords, &rows)?;
+    let mut log_likelihood = 0.0_f64;
+    for row in 0..n {
+        log_likelihood += fit.log_density(coords[[row, 0]], coords[[row, 1]]);
     }
-    -loglik + 0.5 * 2.0 * (n as f64).ln()
+    Ok(-log_likelihood + 0.5 * 4.0 * (n as f64).ln())
 }
 
 /// Closed-form rank-aware negative-log-evidence of the full 2-D Gaussian
@@ -1645,14 +1772,41 @@ fn run_atom_shape_race(
     let owned = coords.to_owned();
     let n = owned.nrows();
     let config = GaussianMixtureConfig::default();
-    let mixture = fit_mixture_rung(owned.view(), k_ladder, config)?;
+    // `Euclidean` already is the one-component full Gaussian. Letting the
+    // mixture rung choose k=1 inserts the identical predictive density twice,
+    // so the stacking optimum is non-identifiable and the reported weights
+    // depend on candidate ordering. The free *cluster* contender begins at two
+    // components; the circular cluster model begins at three.
+    let mixture_ladder = k_ladder
+        .iter()
+        .copied()
+        .filter(|&k| k >= 2)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if mixture_ladder.is_empty() {
+        return Err(
+            "adjudicate_atom_shape: k_ladder must contain a free-mixture order k >= 2".to_string(),
+        );
+    }
+    let ring_cluster_ladder = mixture_ladder
+        .iter()
+        .copied()
+        .filter(|&k| k >= 3)
+        .collect::<Vec<_>>();
+    if ring_cluster_ladder.is_empty() {
+        return Err(
+            "adjudicate_atom_shape: k_ladder must contain a ring-cluster order k >= 3".to_string(),
+        );
+    }
+    let mixture = fit_mixture_rung(owned.view(), &mixture_ladder, config)?;
     let mixture_k = mixture.winner().k;
-    let ring_clusters = fit_ring_of_clusters_rung(owned.view(), k_ladder, config)?;
+    let ring_clusters = fit_ring_of_clusters_rung(owned.view(), &ring_cluster_ladder, config)?;
     let ring_clusters_k = ring_clusters.winner().k;
     let candidates = vec![
         CrossClassCandidate {
             kind: AutoTopologyKind::Circle,
-            negative_log_evidence: ring_negative_log_evidence_2d(owned.view()),
+            negative_log_evidence: ring_negative_log_evidence_2d(owned.view())?,
             certification: EvidenceCertification::Exact,
             density_provider: ring_provider_2d(owned.clone()),
         },
@@ -1751,6 +1905,24 @@ fn matched_control_verdicts(
     Ok((shuffle_verdict, gaussian_verdict, false_circle_floor))
 }
 
+fn shape_detection_floor(
+    n_eff: Option<f64>,
+    ambient_p: Option<f64>,
+    dispersion_r: Option<f64>,
+) -> Result<Option<f64>, String> {
+    match (n_eff, ambient_p, dispersion_r) {
+        (None, None, None) => Ok(None),
+        (Some(n_eff), Some(ambient_p), Some(dispersion_r)) => {
+            gam::terms::sae::null_battery::mp_detection_floor(n_eff, ambient_p, dispersion_r)
+                .map(Some)
+        }
+        _ => Err(
+            "adjudicate_atom_shape: n_eff, ambient_p, and dispersion_r must be supplied together"
+                .to_string(),
+        ),
+    }
+}
+
 fn atom_shape_verdict_dict<'py>(
     py: Python<'py>,
     verdict: &AtomShapeRaceVerdict,
@@ -1830,8 +2002,8 @@ pub(crate) fn shape_matched_control<'py>(
 /// [`gam::terms::sae::null_battery::mp_detection_floor`]). A masked ring whose
 /// true signal energy sits below this floor is architecturally undetectable
 /// by the race regardless of the verdict returned, so this is a statement
-/// about detection reach, not a substitute for the verdict. Omitting any of
-/// the three inputs leaves `detection_floor` as `None`.
+/// about detection reach, not a substitute for the verdict. Omit all three to
+/// leave `detection_floor` as `None`; supplying only a subset is an error.
 #[pyfunction]
 #[pyo3(
     signature = (coords, folds = 5, seed = 11, k_ladder = None, mean_l0 = None, matched_controls = true, n_eff = None, ambient_p = None, dispersion_r = None)
@@ -1855,13 +2027,8 @@ pub(crate) fn adjudicate_atom_shape<'py>(
     let out = atom_shape_verdict_dict(py, &observed)?;
     out.set_item("dictionary_mean_l0", mean_l0)?;
 
-    let detection_floor = match (n_eff, ambient_p, dispersion_r) {
-        (Some(n_eff), Some(ambient_p), Some(dispersion_r)) => Some(
-            gam::terms::sae::null_battery::mp_detection_floor(n_eff, ambient_p, dispersion_r)
-                .map_err(py_value_error)?,
-        ),
-        _ => None,
-    };
+    let detection_floor =
+        shape_detection_floor(n_eff, ambient_p, dispersion_r).map_err(py_value_error)?;
     out.set_item("detection_floor", detection_floor)?;
 
     if matched_controls {

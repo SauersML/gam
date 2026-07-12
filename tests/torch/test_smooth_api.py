@@ -282,13 +282,54 @@ def test_gam_module_train_then_freeze_then_eval():
     assert [name for name, _ in model.named_parameters()] == []
 
 
+def test_gam_frozen_coefficients_are_persistent_migrating_buffers(monkeypatch):
+    import importlib
+
+    gam_module = importlib.import_module("gamfit.torch.module")
+    source = torch.arange(6, dtype=torch.float64).reshape(6, 1)
+
+    class FakeFitResult:
+        coefficients = [source]
+
+    monkeypatch.setattr(gam_module, "fit", lambda *_args, **_kwargs: FakeFitResult())
+    model = gt.GAM([gt.Duchon(centers=_centers(6), m=2)])
+    model.freeze(torch.zeros(4), torch.zeros(4))
+
+    # freeze() is a snapshot, not an alias into the returned FitResult.
+    source.fill_(-1.0)
+    frozen = model._frozen_coefficients()
+    assert frozen is not None
+    assert torch.equal(frozen[0], torch.arange(6, dtype=torch.float64).reshape(6, 1))
+
+    state = model.state_dict()
+    assert list(state) == ["_frozen_coefficient_0"]
+
+    restored = gt.GAM([gt.Duchon(centers=_centers(6), m=2)])
+    restored.load_state_dict(state)
+    restored_frozen = restored._frozen_coefficients()
+    assert restored_frozen is not None
+    assert torch.equal(restored_frozen[0], frozen[0])
+
+    restored.to(dtype=torch.float32)
+    migrated = restored._frozen_coefficients()
+    assert migrated is not None
+    assert migrated[0].dtype == torch.float32
+
+    # The meta device exercises nn.Module's device migration machinery on CPU CI
+    # without requiring CUDA hardware.
+    restored.to(device="meta")
+    on_meta = restored._frozen_coefficients()
+    assert on_meta is not None
+    assert on_meta[0].device.type == "meta"
+
+
 @pytest.mark.parametrize("block_count", [1, 3])
 def test_gam_frozen_eval_rejects_points_block_count_mismatch(block_count):
     model = gt.GAM([
         gt.Duchon(centers=_centers(6), m=2),
         gt.Duchon(centers=_centers(7), m=2),
     ])
-    model._frozen_coefs = [torch.zeros(6, 1), torch.zeros(7, 1)]
+    model._install_frozen_coefficients([torch.zeros(6, 1), torch.zeros(7, 1)])
     model.eval()
 
     with pytest.raises(
@@ -304,14 +345,11 @@ def test_gam_frozen_eval_rejects_coefficient_block_count_mismatch(block_count):
         gt.Duchon(centers=_centers(6), m=2),
         gt.Duchon(centers=_centers(7), m=2),
     ])
-    model._frozen_coefs = [torch.zeros(6, 1)] * block_count
-    model.eval()
-
     with pytest.raises(
         RuntimeError,
-        match=rf"{block_count} frozen coefficient blocks for 2 smooths",
+        match=rf"{block_count} coefficient blocks for 2 smooths",
     ):
-        model(torch.zeros(4))
+        model._install_frozen_coefficients([torch.zeros(6, 1)] * block_count)
 
 
 @pytest.mark.parametrize("block_count", [1, 3])
@@ -337,6 +375,6 @@ def test_gam_freeze_rejects_fit_coefficient_block_count_mismatch(
     ):
         model.freeze(torch.zeros(4), torch.zeros(4))
 
-    assert model._frozen_coefs is None
+    assert model._frozen_coefficients() is None
     assert model.last_fit is None
     assert model.training

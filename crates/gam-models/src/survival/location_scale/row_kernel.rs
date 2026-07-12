@@ -533,6 +533,7 @@ impl SurvivalLsRowKernel<'_> {
 /// `[f64; 5]` derivative stack on the kernel and entered through
 /// [`JetScalar::compose_unary`]. There is exactly one source for value and every
 /// derivative order (the #736/#932 single-source contract).
+#[inline(always)]
 pub(crate) fn sls_row_nll<S: JetScalar<SLS_ROW_K>>(
     vars: &[S; SLS_ROW_K],
     kernel: &SurvivalExactRowKernel,
