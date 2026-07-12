@@ -1152,8 +1152,11 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
             Some(Ok((ch.value, grads, hesss)))
         }
 
+        // Non-Linux hosts can never pass device admission (the selector is
+        // `cfg!(target_os = "linux") && …`), so the early `None` above is the
+        // only exit and the per-row cache path handles every row.
         #[cfg(not(target_os = "linux"))]
-        unreachable!("non-Linux survival VGH batch cannot pass device admission")
+        None
     }
 
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 4] {

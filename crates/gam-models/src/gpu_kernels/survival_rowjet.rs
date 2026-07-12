@@ -32,74 +32,13 @@ pub(crate) struct SurvivalRowInputs {
 }
 
 /// Minimum row count that amortises probe, transfer, and launch costs.
-#[cfg(target_os = "linux")]
 const DEVICE_ROW_THRESHOLD: usize = 100_000;
 
 /// Whether this batch is admitted to the production CUDA V/G/H path.
 #[inline]
 #[must_use]
 pub(crate) const fn survival_rigid_row_vgh_device_selected(n_rows: usize) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        n_rows >= DEVICE_ROW_THRESHOLD
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = n_rows;
-        false
-    }
-}
-
-#[cfg(test)]
-#[inline]
-fn rigid_cpu_row_inputs(
-    row: usize,
-    input: &SurvivalRowInputs,
-    probit_scale: f64,
-) -> RigidRowInputs {
-    RigidRowInputs {
-        row,
-        wi: input.wi,
-        di: input.di,
-        z_sum: input.z_sum,
-        covariance_ones: input.cov_ones,
-        probit_scale,
-        // The batch caller validates the monotonicity guard before dispatch.
-        qd1_lower: f64::NEG_INFINITY,
-    }
-}
-
-/// CPU execution of the canonical row program at its order-2 scalar.
-#[cfg(test)]
-#[must_use]
-fn survival_rigid_row_vgh_cpu(
-    rows: &[SurvivalRowInputs],
-    probit_scale: f64,
-) -> SurvivalRowVghChannels {
-    use crate::survival::marginal_slope::row_kernel::{
-        RIGID_LINEAR_MASK, SparseOrder2, rigid_row_nll,
-    };
-    use gam_math::jet_scalar::JetScalar;
-
-    let n = rows.len();
-    let mut value = vec![0.0_f64; n];
-    let mut grad = vec![0.0_f64; n * 4];
-    let mut hess = vec![0.0_f64; n * 16];
-    for (row, input) in rows.iter().enumerate() {
-        let in_row = rigid_cpu_row_inputs(row, input, probit_scale);
-        let p = input.primaries;
-        let vars: [SparseOrder2<RIGID_LINEAR_MASK>; 4] =
-            std::array::from_fn(|axis| SparseOrder2::variable(p[axis], axis));
-        if let Ok(out) = rigid_row_nll(&vars, &in_row) {
-            value[row] = out.value();
-            grad[row * 4..row * 4 + 4].copy_from_slice(&out.g());
-            let row_hessian = out.h();
-            for a in 0..4 {
-                hess[row * 16 + a * 4..row * 16 + a * 4 + 4].copy_from_slice(&row_hessian[a]);
-            }
-        }
-    }
-    SurvivalRowVghChannels { value, grad, hess }
+    cfg!(target_os = "linux") && n_rows >= DEVICE_ROW_THRESHOLD
 }
 
 /// Execute an already-admitted production V/G/H batch on CUDA.
@@ -286,6 +225,58 @@ mod device {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::survival::marginal_slope::row_kernel::RigidRowInputs;
+
+    #[inline]
+    fn rigid_cpu_row_inputs(
+        row: usize,
+        input: &SurvivalRowInputs,
+        probit_scale: f64,
+    ) -> RigidRowInputs {
+        RigidRowInputs {
+            row,
+            wi: input.wi,
+            di: input.di,
+            z_sum: input.z_sum,
+            covariance_ones: input.cov_ones,
+            probit_scale,
+            // The batch caller validates the monotonicity guard before dispatch.
+            qd1_lower: f64::NEG_INFINITY,
+        }
+    }
+
+    /// CPU execution of the canonical row program at its order-2 scalar.
+    #[must_use]
+    fn survival_rigid_row_vgh_cpu(
+        rows: &[SurvivalRowInputs],
+        probit_scale: f64,
+    ) -> SurvivalRowVghChannels {
+        use crate::survival::marginal_slope::row_kernel::{
+            RIGID_LINEAR_MASK, SparseOrder2, rigid_row_nll,
+        };
+        use gam_math::jet_scalar::JetScalar;
+
+        let n = rows.len();
+        let mut value = vec![0.0_f64; n];
+        let mut grad = vec![0.0_f64; n * 4];
+        let mut hess = vec![0.0_f64; n * 16];
+        for (row, input) in rows.iter().enumerate() {
+            let in_row = rigid_cpu_row_inputs(row, input, probit_scale);
+            let p = input.primaries;
+            let vars: [SparseOrder2<RIGID_LINEAR_MASK>; 4] =
+                std::array::from_fn(|axis| SparseOrder2::variable(p[axis], axis));
+            if let Ok(out) = rigid_row_nll(&vars, &in_row) {
+                value[row] = out.value();
+                grad[row * 4..row * 4 + 4].copy_from_slice(&out.g());
+                let row_hessian = out.h();
+                for a in 0..4 {
+                    hess[row * 16 + a * 4..row * 16 + a * 4 + 4]
+                        .copy_from_slice(&row_hessian[a]);
+                }
+            }
+        }
+        SurvivalRowVghChannels { value, grad, hess }
+    }
 
     #[cfg(target_os = "linux")]
     fn survival_rigid_row_vgh_device_only(
