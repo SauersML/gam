@@ -56,6 +56,12 @@ class CentroidCircularOrderingTest(unittest.TestCase):
         self.assertLess(out["mc_p"], 0.05)
         self.assertLess(out["radius_cv"], 0.2)
         self.assertLess(out["max_gap_deg"], 150.0)
+        self.assertEqual(out["params"]["kmeans_seed"], 0)
+        self.assertEqual(out["params"]["control_seed"], 0xCE17_202)
+        self.assertEqual(
+            out["params"]["null_model"],
+            "per_dimension_permutation_full_pipeline",
+        )
 
     def test_shuffled_ring_fails(self) -> None:
         rng = np.random.default_rng(1)

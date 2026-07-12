@@ -50,6 +50,8 @@ import numpy as np
 __all__ = ["kmeans_centroids", "ring_stats", "ring_mc_pvalue",
            "centroid_circular_ordering"]
 
+_CONDITIONAL_RANDOMIZATION_SEED_DOMAIN = 0xCE17_202
+
 
 def _finite_points(values: np.ndarray, name: str, min_rows: int) -> np.ndarray:
     raw = np.asarray(values)
@@ -260,7 +262,7 @@ def centroid_circular_ordering(coords: np.ndarray, k: int, *, seed: int = 0,
         )
     centers = kmeans_centroids(coords, k, seed=seed)
     cv, gap = ring_stats(centers)
-    control_seed = seed ^ 0xCE17_202
+    control_seed = seed ^ _CONDITIONAL_RANDOMIZATION_SEED_DOMAIN
     p = ring_mc_pvalue(
         coords,
         k,
@@ -277,9 +279,9 @@ def centroid_circular_ordering(coords: np.ndarray, k: int, *, seed: int = 0,
         "mc_p": float(p),
         "ordered_on_circle": bool(p < p_thresh and gap < gap_thresh_deg),
         "params": {
-            "seed": seed,
             "control_seed": control_seed,
-            "null_kind": "independent_column_permutation",
+            "kmeans_seed": seed,
+            "null_model": "per_dimension_permutation_full_pipeline",
             "n_null": n_null,
             "p_thresh": p_thresh,
             "gap_thresh_deg": gap_thresh_deg,
