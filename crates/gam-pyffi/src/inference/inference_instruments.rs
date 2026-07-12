@@ -1560,8 +1560,7 @@ mod tests {
         let perturbed_slot = eval_rows - 1;
         perturbed_free_coords[[train_rows + perturbed_slot, 0]] = 1.0e12;
         perturbed_free_coords[[train_rows + perturbed_slot, 1]] = -1.0e12;
-        let perturbed_free_trace =
-            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let perturbed_free_trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let perturbed_actual = free_mixture_rung_provider_2d(
             perturbed_free_coords,
             ladder,
@@ -1631,8 +1630,7 @@ mod tests {
         let perturbed_ring_slot = eval_rows - 1;
         perturbed_ring_coords[[clusters * per_cluster + perturbed_ring_slot, 0]] = -1.0e12;
         perturbed_ring_coords[[clusters * per_cluster + perturbed_ring_slot, 1]] = 1.0e12;
-        let perturbed_ring_trace =
-            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let perturbed_ring_trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let perturbed_ring_actual = ring_cluster_rung_provider_2d(
             perturbed_ring_coords,
             ring_ladder,
@@ -2426,8 +2424,7 @@ fn fit_shape_coordinate_gauge(
                     "{context} training coordinate range overflowed on axis {axis}"
                 ));
             }
-            mean_offset[axis] =
-                previous_weight * mean_offset[axis] + new_weight * relative;
+            mean_offset[axis] = previous_weight * mean_offset[axis] + new_weight * relative;
         }
     }
 
@@ -2446,8 +2443,8 @@ fn fit_shape_coordinate_gauge(
                 continue;
             }
             if norm_scale < magnitude {
-                scaled_sum_squares = 1.0
-                    + scaled_sum_squares * (norm_scale / magnitude) * (norm_scale / magnitude);
+                scaled_sum_squares =
+                    1.0 + scaled_sum_squares * (norm_scale / magnitude) * (norm_scale / magnitude);
                 norm_scale = magnitude;
             } else {
                 scaled_sum_squares += (magnitude / norm_scale) * (magnitude / norm_scale);
@@ -2480,8 +2477,7 @@ fn apply_shape_coordinate_gauge(
     let mut canonical = Array2::<f64>::zeros(coords.raw_dim());
     for row in 0..coords.nrows() {
         for axis in 0..2 {
-            let value = ((coords[[row, axis]] - gauge.anchor[axis])
-                - gauge.mean_offset[axis])
+            let value = ((coords[[row, axis]] - gauge.anchor[axis]) - gauge.mean_offset[axis])
                 / gauge.scale;
             if !value.is_finite() {
                 return Err(format!(
@@ -2654,7 +2650,7 @@ fn run_atom_shape_race(
     use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
     use gam::solver::topology_selector::EvidenceCertification;
     use gam::solver::{
-        AutoTopologyKind, PredictiveRaceCandidate, Headline, PredictiveCandidateKind,
+        AutoTopologyKind, Headline, PredictiveCandidateKind, PredictiveRaceCandidate,
         adjudicate_predictive_race, fit_mixture_rung, fit_ring_of_clusters_rung,
     };
 
