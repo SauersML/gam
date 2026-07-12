@@ -991,6 +991,161 @@ mod tests {
         );
     }
 
+    /// Held-out objective-quality discriminator for #2240: on a planted Möbius
+    /// band, the deck-invariant quotient basis must GENERALIZE (decoder fit on a
+    /// train split, scored on disjoint held-out rows) while the flat/euclidean
+    /// alternative the zoo would otherwise pick — a degree-3 polynomial patch
+    /// over the top-two principal coordinates, matched in degrees of freedom —
+    /// cannot. The failure is topological, not a resolution deficit: a Möbius
+    /// band is non-orientable, so near the seam the two band edges collapse onto
+    /// (almost) the same principal-plane location with OPPOSITE transverse sign;
+    /// any single-valued graph over that plane must average them and eats a
+    /// systematic residual there. Both arms recover their chart unsupervised from
+    /// the full embedding, so the only thing under test is the basis's ability to
+    /// descend to the quotient. No reference tool is asserted-close-to; euclidean
+    /// is a baseline we beat on held-out reconstruction.
+    #[test]
+    fn mobius_quotient_basis_beats_flat_patch_on_heldout_band() {
+        use crate::basis::{MobiusHarmonicEvaluator, SaeBasisEvaluator};
+
+        // A noiseless planted band: the ground truth is exact, so any held-out
+        // shortfall is the basis failing to represent the topology, not noise.
+        let n_phase = 96usize;
+        let n_width = 11usize;
+        let n = n_phase * n_width;
+        let mut target = Array2::<f64>::zeros((n, 3));
+        for phase_idx in 0..n_phase {
+            let phase = std::f64::consts::TAU * phase_idx as f64 / n_phase as f64;
+            for width_idx in 0..n_width {
+                let row = phase_idx * n_width + width_idx;
+                let width = -0.5 + width_idx as f64 / (n_width - 1) as f64;
+                let radius = 1.0 + width * (0.5 * phase).cos();
+                target[[row, 0]] = radius * phase.cos();
+                target[[row, 1]] = radius * phase.sin();
+                target[[row, 2]] = width * (0.5 * phase).sin();
+            }
+        }
+        // Interleaved 3:1 train/test mask so both splits cover the whole band
+        // (every phase and every width appears on each side of the split).
+        let is_test: Vec<bool> = (0..n).map(|row| row % 4 == 0).collect();
+        let train_rows: Vec<usize> = (0..n).filter(|&row| !is_test[row]).collect();
+        let test_rows: Vec<usize> = (0..n).filter(|&row| is_test[row]).collect();
+
+        // Least-squares decoder on `train_rows`, held-out R² on `test_rows`,
+        // measured against the per-target-column mean of the held-out block.
+        let heldout_r2 = |phi: &Array2<f64>| -> f64 {
+            let mut gram = Array2::<f64>::zeros((phi.ncols(), phi.ncols()));
+            let mut rhs = Array2::<f64>::zeros((phi.ncols(), target.ncols()));
+            for &row in &train_rows {
+                for a in 0..phi.ncols() {
+                    for b in 0..phi.ncols() {
+                        gram[[a, b]] += phi[[row, a]] * phi[[row, b]];
+                    }
+                    for c in 0..target.ncols() {
+                        rhs[[a, c]] += phi[[row, a]] * target[[row, c]];
+                    }
+                }
+            }
+            let scale = gram.diag().iter().copied().fold(0.0_f64, f64::max);
+            for diagonal in gram.diag_mut().iter_mut() {
+                *diagonal += scale * 64.0 * f64::EPSILON;
+            }
+            let decoder = gram.cholesky(Side::Lower).unwrap().solve_mat(&rhs);
+            let mut mean = vec![0.0_f64; target.ncols()];
+            for &row in &test_rows {
+                for c in 0..target.ncols() {
+                    mean[c] += target[[row, c]];
+                }
+            }
+            for value in mean.iter_mut() {
+                *value /= test_rows.len() as f64;
+            }
+            let mut residual = 0.0_f64;
+            let mut total = 0.0_f64;
+            for &row in &test_rows {
+                for c in 0..target.ncols() {
+                    let mut fitted = 0.0_f64;
+                    for a in 0..phi.ncols() {
+                        fitted += phi[[row, a]] * decoder[[a, c]];
+                    }
+                    residual += (target[[row, c]] - fitted).powi(2);
+                    total += (target[[row, c]] - mean[c]).powi(2);
+                }
+            }
+            1.0 - residual / total
+        };
+
+        // Möbius arm: production quotient-coordinate recovery + production
+        // H=3, D=2 deck-invariant basis (10 columns).
+        let all_rows: Vec<usize> = (0..n).collect();
+        let coords = mobius_double_cover_coords_from_projection(target.view(), &all_rows)
+            .expect("the planted band has an identifiable double-cover chart");
+        let evaluator = MobiusHarmonicEvaluator::new(3, 2).unwrap();
+        let (mobius_phi, _) = evaluator.evaluate(coords.view()).unwrap();
+        let mobius_r2 = heldout_r2(&mobius_phi);
+
+        // Flat/euclidean arm: top-two principal coordinates of the same
+        // embedding, expanded to a degree-3 monomial patch. Ten columns
+        // {1, u, v, u², uv, v², u³, u²v, uv², v³} match the Möbius basis size,
+        // so the comparison isolates topology, not raw degrees of freedom.
+        let mut mean3 = [0.0_f64; 3];
+        for &row in &all_rows {
+            for c in 0..3 {
+                mean3[c] += target[[row, c]];
+            }
+        }
+        for value in mean3.iter_mut() {
+            *value /= n as f64;
+        }
+        let mut centered = Array2::<f64>::zeros((n, 3));
+        for row in 0..n {
+            for c in 0..3 {
+                centered[[row, c]] = target[[row, c]] - mean3[c];
+            }
+        }
+        let (_u, _s, vt_opt) = centered.svd(false, true).expect("principal directions");
+        let vt = vt_opt.expect("Vt");
+        let pc1 = vt.row(0);
+        let pc2 = vt.row(1);
+        let mut flat_phi = Array2::<f64>::zeros((n, 10));
+        for row in 0..n {
+            let mut u = 0.0_f64;
+            let mut v = 0.0_f64;
+            for c in 0..3 {
+                u += centered[[row, c]] * pc1[c];
+                v += centered[[row, c]] * pc2[c];
+            }
+            let cols = [
+                1.0,
+                u,
+                v,
+                u * u,
+                u * v,
+                v * v,
+                u * u * u,
+                u * u * v,
+                u * v * v,
+                v * v * v,
+            ];
+            for (col, value) in cols.iter().enumerate() {
+                flat_phi[[row, col]] = *value;
+            }
+        }
+        let flat_r2 = heldout_r2(&flat_phi);
+
+        assert!(
+            mobius_r2 > 0.99,
+            "the deck-invariant Möbius basis must reconstruct held-out band rows; \
+             mobius held-out R²={mobius_r2}, flat held-out R²={flat_r2}"
+        );
+        assert!(
+            mobius_r2 - flat_r2 > 0.05,
+            "the quotient basis must beat the matched-DOF flat/euclidean patch on \
+             held-out reconstruction (non-orientability defeats a single-valued \
+             graph); mobius held-out R²={mobius_r2}, flat held-out R²={flat_r2}"
+        );
+    }
+
     /// Regression test for issue #174: the joint LSQ seed for K=2 ordered Beta--Bernoulli
     /// must produce a non-zero decoder and a residual smaller than the
     /// trivial zero-decoder baseline. Without this seed the joint Newton
