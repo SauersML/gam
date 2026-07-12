@@ -33,6 +33,8 @@ use crate::cubic_cell_kernel::{self, DenestedPartitionCell, LocalSpanCubic};
 use crate::custom_family::{CustomFamilyBlockPsiDerivative, ParameterBlockSpec};
 use crate::outer_subsample::{OuterScoreSubsample, WeightedOuterRow};
 use gam_math::jet_partitions::MultiDirJet;
+use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
+use gam_math::nested_dual::JetField;
 use ndarray::{Array1, Array2, Axis};
 use std::ops::Range;
 use std::sync::Arc;
@@ -153,6 +155,111 @@ pub(crate) struct DirectionalPrimaryTerms {
     pub(crate) objective: f64,
     pub(crate) grad: Array1<f64>,
     pub(crate) hess: Array2<f64>,
+}
+
+fn order2_primary_terms<const K: usize>(channel: Order2<K>) -> DirectionalPrimaryTerms {
+    let gradient = channel.g();
+    let hessian = channel.h();
+    DirectionalPrimaryTerms {
+        objective: channel.value(),
+        grad: Array1::from_vec(gradient.to_vec()),
+        hess: Array2::from_shape_fn((K, K), |(row, column)| hessian[row][column]),
+    }
+}
+
+/// Differentiate a generic order-two primary program once with respect to one
+/// auxiliary scalar parameter.
+///
+/// The primary variables carry their ordinary value/gradient/Hessian seeds in
+/// the [`OneSeed::base`] channel while `parameter` carries only the auxiliary
+/// derivative in [`OneSeed::eps`]. The resulting epsilon `Order2` therefore is
+/// the auxiliary derivative of the objective, its complete primary gradient,
+/// and its complete primary Hessian. This replaces the old
+/// `1 + K + K(K+1)/2` separate bitmask-jet evaluations with one evaluation of
+/// the same row expression.
+pub(crate) fn first_parameter_order2_terms<const K: usize, Eval>(
+    primaries: [f64; K],
+    parameter: f64,
+    parameter_first: f64,
+    eval: Eval,
+) -> Result<DirectionalPrimaryTerms, String>
+where
+    Eval: FnOnce(&[OneSeed<K>; K], &OneSeed<K>) -> Result<OneSeed<K>, String>,
+{
+    let zero = <Order2<K> as JetScalar<K>>::constant(0.0);
+    let variables = std::array::from_fn(|axis| OneSeed {
+        base: <Order2<K> as JetScalar<K>>::variable(primaries[axis], axis),
+        eps: zero,
+    });
+    let parameter_jet = OneSeed {
+        base: <Order2<K> as JetScalar<K>>::constant(parameter),
+        eps: <Order2<K> as JetScalar<K>>::constant(parameter_first),
+    };
+    eval(&variables, &parameter_jet).map(|output| order2_primary_terms(output.eps))
+}
+
+/// Differentiate a generic order-two primary program once to second order in
+/// one auxiliary scalar parameter.
+///
+/// Both nilpotent directions represent the same external coordinate. Seeding
+/// `eps_del` with the parameter's own second derivative supplies the complete
+/// chain rule, and the output `eps_del` channel contains the second auxiliary
+/// derivative of `(objective, primary gradient, primary Hessian)`.
+pub(crate) fn second_parameter_order2_terms<const K: usize, Eval>(
+    primaries: [f64; K],
+    parameter: f64,
+    parameter_first: f64,
+    parameter_second: f64,
+    eval: Eval,
+) -> Result<DirectionalPrimaryTerms, String>
+where
+    Eval: FnOnce(&[TwoSeed<K>; K], &TwoSeed<K>) -> Result<TwoSeed<K>, String>,
+{
+    let zero = <Order2<K> as JetScalar<K>>::constant(0.0);
+    let variables = std::array::from_fn(|axis| TwoSeed {
+        base: <Order2<K> as JetScalar<K>>::variable(primaries[axis], axis),
+        eps: zero,
+        del: zero,
+        eps_del: zero,
+    });
+    let parameter_jet = TwoSeed {
+        base: <Order2<K> as JetScalar<K>>::constant(parameter),
+        eps: <Order2<K> as JetScalar<K>>::constant(parameter_first),
+        del: <Order2<K> as JetScalar<K>>::constant(parameter_first),
+        eps_del: <Order2<K> as JetScalar<K>>::constant(parameter_second),
+    };
+    eval(&variables, &parameter_jet).map(|output| order2_primary_terms(output.eps_del))
+}
+
+/// Differentiate an order-two primary program once in an auxiliary parameter
+/// and once along a primary-space direction, in one [`TwoSeed`] evaluation.
+/// The mixed `eps_del` `Order2` supplies the directional derivative of the
+/// auxiliary objective/gradient/Hessian without rebuilding the row program for
+/// every unit primary axis.
+pub(crate) fn first_parameter_directional_order2_terms<const K: usize, Eval>(
+    primaries: [f64; K],
+    direction: &[f64; K],
+    parameter: f64,
+    parameter_first: f64,
+    eval: Eval,
+) -> Result<DirectionalPrimaryTerms, String>
+where
+    Eval: FnOnce(&[TwoSeed<K>; K], &TwoSeed<K>) -> Result<TwoSeed<K>, String>,
+{
+    let zero = <Order2<K> as JetScalar<K>>::constant(0.0);
+    let variables = std::array::from_fn(|axis| TwoSeed {
+        base: <Order2<K> as JetScalar<K>>::variable(primaries[axis], axis),
+        eps: zero,
+        del: <Order2<K> as JetScalar<K>>::constant(direction[axis]),
+        eps_del: zero,
+    });
+    let parameter_jet = TwoSeed {
+        base: <Order2<K> as JetScalar<K>>::constant(parameter),
+        eps: <Order2<K> as JetScalar<K>>::constant(parameter_first),
+        del: zero,
+        eps_del: zero,
+    };
+    eval(&variables, &parameter_jet).map(|output| order2_primary_terms(output.eps_del))
 }
 
 /// Shared exact-Newton primary directional sweep for the marginal-slope
