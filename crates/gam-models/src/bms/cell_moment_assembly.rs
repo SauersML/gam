@@ -15,7 +15,6 @@ use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOneSeed, DynamicTwoSeed, RuntimeJetScalar,
     filtered_implicit_solve_runtime_scalar,
 };
-use gam_math::nested_dual::JetField;
 
 #[derive(Clone)]
 pub(super) struct EmpiricalBmsIndexJetPlan {
