@@ -1216,7 +1216,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                         }
 
                         let (coeff_qq, coeff_qg, coeff_gg) =
-                            crate::bms::cell_moment_assembly::BernoulliMarginalSlopeFamily::rigid_row_contracted_trace_hessian_coefficients(
+                            BernoulliMarginalSlopeFamily::rigid_row_contracted_trace_hessian_coefficients(
                                 &fourth[row],
                                 trace_qq,
                                 trace_qg,

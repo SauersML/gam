@@ -231,7 +231,9 @@ pub fn measure_atom_transport_between(
     }
 
     // Honest-units source and target decoders, both `M × p` in the SAME ambient.
-    let physical_decoder = atom_ref.full_width_decoder();
+    // #2015 — undo any Tier-0 column-equilibration scale first (a no-op on the
+    // historical unequilibrated path).
+    let physical_decoder = term.tier0_unscaled_full_width_decoder(atom);
     let b_src = honest_layer_decoder(&physical_decoder, layout, source)?;
     let b_tgt = honest_layer_decoder(&physical_decoder, layout, target)?;
     if b_src.ncols() != b_tgt.ncols() {

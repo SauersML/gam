@@ -565,19 +565,31 @@ impl SaeManifoldTerm {
             ));
         }
         let inv = 1.0 / layout.sqrt_lambda(l);
-        // Materialize the full-width decoder before crossing the layer boundary;
-        // the fit may use a reduced Grassmann coordinate internally.
-        let physical = self.atoms[k].full_width_decoder();
-        let range = layout.block_range(l);
-        let scaled = physical.slice(s![.., range.clone()]);
-        let mut out = scaled.mapv(|value| inv * value);
-        if let Some(tier0_scale) = self.tier0_scale() {
-            for (local_col, global_col) in range.enumerate() {
-                let column_scale = tier0_scale[global_col];
-                out.column_mut(local_col).mapv_inplace(|v| v * column_scale);
+        // Materialize the full-width decoder (Tier-0 column scale already
+        // undone) before crossing the layer boundary; the fit may use a
+        // reduced Grassmann coordinate internally.
+        let physical = self.tier0_unscaled_full_width_decoder(k);
+        let scaled = physical.slice(s![.., layout.block_range(l)]);
+        Ok(scaled.mapv(|value| inv * value))
+    }
+
+    /// The full-width (augmented) decoder of atom `k`, with the Tier-0
+    /// column-equilibration scale (#2015; [`Self::set_tier0_scale`],
+    /// `crosscoder_fit::equilibrate_crosscoder_columns`) undone column-by-column
+    /// when one is installed — a strict no-op on the historical (unequilibrated)
+    /// path. Every consumer that carves an honest per-layer decoder out of the
+    /// full augmented width ([`Self::layer_decoder`] above, the crosscoder
+    /// drift/transport reports) starts from this, so an equilibration scale
+    /// installed by the crosscoder fit entry is undone exactly once, in one
+    /// place, rather than re-derived at each call site.
+    pub(crate) fn tier0_unscaled_full_width_decoder(&self, k: usize) -> Array2<f64> {
+        let mut decoder = self.atoms[k].full_width_decoder();
+        if let Some(scale) = self.tier0_scale() {
+            for (col, &s) in scale.iter().enumerate() {
+                decoder.column_mut(col).mapv_inplace(|v| v * s);
             }
         }
-        Ok(out)
+        decoder
     }
 
     /// Snapshot the ENTIRE mutable fit state a λ line-search trial perturbs, so a

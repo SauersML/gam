@@ -1035,18 +1035,14 @@ pub fn run_sae_crosscoder_fit(
     let mut layers = Vec::with_capacity(1 + request.blocks.len());
     let anchor_fitted = scaled_fitted.slice(s![.., 0..p_x]).to_owned();
     // #2015 — the internal decoder decodes the EQUILIBRATED anchor columns
-    // (Z/column_scale); multiply each column back by its own column_scale to
-    // expose the honest raw-Z decoder (mirrors `layer_decoder`'s un-scaling
-    // for the non-anchor blocks).
-    let anchor_decoders = term
-        .atoms
-        .iter()
-        .map(|atom| {
-            let mut decoder = atom.full_width_decoder().slice(s![.., 0..p_x]).to_owned();
-            for (col, &column_scale) in request.column_scale.iter().take(p_x).enumerate() {
-                decoder.column_mut(col).mapv_inplace(|v| v * column_scale);
-            }
-            decoder
+    // (Z/column_scale); `tier0_unscaled_full_width_decoder` undoes that per
+    // column before the anchor slice is taken, exposing the honest raw-Z
+    // decoder (mirrors `layer_decoder`'s un-scaling for the non-anchor blocks).
+    let anchor_decoders = (0..term.k_atoms())
+        .map(|k| {
+            term.tier0_unscaled_full_width_decoder(k)
+                .slice(s![.., 0..p_x])
+                .to_owned()
         })
         .collect();
     layers.push(CrosscoderLayerFit {

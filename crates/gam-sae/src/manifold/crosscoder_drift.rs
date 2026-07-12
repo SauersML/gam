@@ -227,7 +227,9 @@ pub fn measure_crosscoder_drift(
     let per_atom: Vec<Vec<LayerStepDrift>> = (0..num_atoms)
         .into_par_iter()
         .map(|k| {
-            let decoder = term.atoms[k].full_width_decoder();
+            // #2015 — undo any Tier-0 column-equilibration scale before slicing
+            // per-layer decoders (a no-op on the historical unequilibrated path).
+            let decoder = term.tier0_unscaled_full_width_decoder(k);
             // Honest-units decoder at each layer, once per atom (reused across steps).
             let mut honest: Vec<Array2<f64>> = Vec::with_capacity(layer_chain.len());
             for &layer in &layer_chain {
