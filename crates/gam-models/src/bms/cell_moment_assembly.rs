@@ -12,9 +12,21 @@ use super::*;
 
 use crate::fnv1a::Fnv1a;
 use gam_math::jet_scalar::{
-    DynamicJetArena, DynamicOneSeed, DynamicTwoSeed, RuntimeJetScalar,
-    filtered_implicit_solve_runtime_scalar,
+    DynamicJetArena, DynamicOneSeed, DynamicOneSeedBatch, DynamicOneSeedBatchWorkspace,
+    DynamicTwoSeed, RuntimeJetScalar, filtered_implicit_solve_runtime_scalar,
 };
+
+thread_local! {
+    /// Per-worker empirical FLEX third-order workspace. The largest batch is
+    /// retained across rows, so a warmed worker does not revisit the global
+    /// allocator for the runtime-sized jet tape.
+    static EMPIRICAL_BMS_THIRD_WORKSPACE: std::cell::RefCell<DynamicOneSeedBatchWorkspace> =
+        std::cell::RefCell::new(DynamicOneSeedBatchWorkspace::new(1));
+    /// Per-worker empirical FLEX fourth-order workspace for the general-width
+    /// two-seed path.
+    static EMPIRICAL_BMS_FOURTH_WORKSPACE: std::cell::RefCell<DynamicJetArena> =
+        std::cell::RefCell::new(DynamicJetArena::new());
+}
 
 #[derive(Clone)]
 pub(super) struct EmpiricalBmsIndexJetPlan {
@@ -1263,15 +1275,59 @@ impl BernoulliMarginalSlopeFamily {
         dir: &Array1<f64>,
         grid: &EmpiricalZGrid,
     ) -> Result<Array2<f64>, String> {
+        let mut contracted = self.empirical_flex_row_third_contracted_many(
+            row,
+            primary,
+            q,
+            b,
+            beta_h,
+            beta_w,
+            row_ctx,
+            std::slice::from_ref(dir),
+            grid,
+        )?;
+        Ok(contracted
+            .pop()
+            .expect("one empirical BMS direction produces one contraction"))
+    }
+
+    /// Evaluate every requested third contraction in one canonical row-plan
+    /// traversal. The order-two base is shared by all direction lanes and the
+    /// per-worker bump retains its high-water mark across rows.
+    pub(super) fn empirical_flex_row_third_contracted_many(
+        &self,
+        row: usize,
+        primary: &PrimarySlices,
+        q: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        row_dirs: &[Array1<f64>],
+        grid: &EmpiricalZGrid,
+    ) -> Result<Vec<Array2<f64>>, String> {
         let r = primary.total;
-        if dir.len() != r {
+        if row_dirs.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some((lane, direction)) = row_dirs
+            .iter()
+            .enumerate()
+            .find(|(_, direction)| direction.len() != r)
+        {
             return Err(format!(
-                "bernoulli empirical flex third contraction direction length {} != primary dimension {r}",
-                dir.len()
+                "bernoulli empirical flex third contraction direction {lane} length {} != primary dimension {r}",
+                direction.len()
             ));
         }
-        if dir.iter().all(|value| *value == 0.0) {
-            return Ok(Array2::<f64>::zeros((r, r)));
+        if row_dirs
+            .iter()
+            .all(|direction| direction.iter().all(|value| *value == 0.0))
+        {
+            return Ok(row_dirs
+                .iter()
+                .map(|_| Array2::<f64>::zeros((r, r)))
+                .collect());
         }
         if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
             return Err("non-finite empirical flexible row context in third contraction".into());
@@ -1287,13 +1343,91 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        let arena = DynamicJetArena::new();
-        let vars = arena.alloc_slice_fill_with(r, |axis| {
-            DynamicOneSeed::seed_direction(point[axis], axis, dir[axis], r, &arena)
-        });
-        let jet = plan.evaluate(vars, 3, &arena)?;
-        Array2::from_shape_vec((r, r), jet.contracted_third().to_vec())
-            .map_err(|error| format!("empirical BMS third-contraction shape: {error}"))
+        EMPIRICAL_BMS_THIRD_WORKSPACE.with(|workspace| {
+            let mut workspace = workspace.borrow_mut();
+            workspace.reset(row_dirs.len());
+            let vars = workspace.alloc_slice_fill_with(r, |axis| {
+                DynamicOneSeedBatch::seed_directions(
+                    point[axis],
+                    axis,
+                    r,
+                    &workspace,
+                    |lane| row_dirs[lane][axis],
+                )
+            });
+            let jet = plan.evaluate(vars, 3, &workspace)?;
+            (0..row_dirs.len())
+                .map(|lane| {
+                    Array2::from_shape_vec((r, r), jet.contracted_third(lane).to_vec()).map_err(
+                        |error| format!("empirical BMS third-contraction shape: {error}"),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// Trace-contract every Hessian index of the full third derivative in one
+    /// row-plan evaluation. Lane `c` is seeded by basis direction `e_c`, then
+    /// reduced immediately to `sum_ab gram[ab] * d3[abc]`; no rank-three
+    /// tensor is materialized.
+    pub(super) fn empirical_flex_row_third_trace_gradient(
+        &self,
+        row: usize,
+        primary: &PrimarySlices,
+        q: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        gram: &[f64],
+        grid: &EmpiricalZGrid,
+    ) -> Result<Array1<f64>, String> {
+        let r = primary.total;
+        if gram.len() != r * r {
+            return Err(format!(
+                "bernoulli empirical flex third trace gram length {} != {}",
+                gram.len(),
+                r * r
+            ));
+        }
+        if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
+            return Err("non-finite empirical flexible row context in third trace gradient".into());
+        }
+        let plan = self.empirical_bms_row_jet_plan(
+            row,
+            primary,
+            q,
+            b,
+            beta_h,
+            beta_w,
+            row_ctx.intercept,
+            grid,
+        )?;
+        let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
+        EMPIRICAL_BMS_THIRD_WORKSPACE.with(|workspace| {
+            let mut workspace = workspace.borrow_mut();
+            workspace.reset(r);
+            let vars = workspace.alloc_slice_fill_with(r, |axis| {
+                DynamicOneSeedBatch::seed_directions(
+                    point[axis],
+                    axis,
+                    r,
+                    &workspace,
+                    |lane| f64::from(lane == axis),
+                )
+            });
+            let jet = plan.evaluate(vars, 3, &workspace)?;
+            let mut gradient = Array1::<f64>::zeros(r);
+            for lane in 0..r {
+                gradient[lane] = jet
+                    .contracted_third(lane)
+                    .iter()
+                    .zip(gram)
+                    .map(|(third, weight)| third * weight)
+                    .sum();
+            }
+            Ok(gradient)
+        })
     }
 
     pub(super) fn empirical_flex_row_fourth_contracted(
@@ -1334,13 +1468,16 @@ impl BernoulliMarginalSlopeFamily {
             grid,
         )?;
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
-        let arena = DynamicJetArena::new();
-        let vars = arena.alloc_slice_fill_with(r, |axis| {
-            DynamicTwoSeed::seed(point[axis], axis, dir_u[axis], dir_v[axis], r, &arena)
-        });
-        let jet = plan.evaluate(vars, 4, &arena)?;
-        Array2::from_shape_vec((r, r), jet.contracted_fourth().to_vec())
-            .map_err(|error| format!("empirical BMS fourth-contraction shape: {error}"))
+        EMPIRICAL_BMS_FOURTH_WORKSPACE.with(|arena| {
+            let mut arena = arena.borrow_mut();
+            arena.reset();
+            let vars = arena.alloc_slice_fill_with(r, |axis| {
+                DynamicTwoSeed::seed(point[axis], axis, dir_u[axis], dir_v[axis], r, &arena)
+            });
+            let jet = plan.evaluate(vars, 4, &arena)?;
+            Array2::from_shape_vec((r, r), jet.contracted_fourth().to_vec())
+                .map_err(|error| format!("empirical BMS fourth-contraction shape: {error}"))
+        })
     }
 
     pub(super) fn rigid_row_kernel_eval(
