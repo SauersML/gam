@@ -673,7 +673,7 @@ pub(crate) fn compute_smoothing_correction(
 
     let n_coeffs_trans = final_fit.beta_transformed.len();
     let n_coeffs_orig = final_fit.reparam_result.qs.nrows();
-    debug_assert_eq!(lambdas.len(), final_rho.len());
+    assert_eq!(lambdas.len(), final_rho.len());
 
     // Step 1: Compute the Jacobian J = d(beta)/d(rho) in transformed space.
     //

@@ -232,7 +232,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 ));
             }
         }
-        debug_assert_eq!(bundle.specs().len(), bundle.log_lambdas().len());
+        assert_eq!(bundle.specs().len(), bundle.log_lambdas().len());
     }
     let mut cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; specs.len()];
     if let Some(seed) = warm_start
