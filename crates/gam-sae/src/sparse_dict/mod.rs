@@ -48,7 +48,8 @@ pub use block::{
     block_gates, block_projections_row, block_sparse_dictionary_block_coords,
     block_sparse_dictionary_lift_block, block_sparse_dictionary_project_residual,
     block_sparse_dictionary_transform, fit_block_sparse_dictionary,
-    fit_block_sparse_dictionary_with_seed, reconstruct_block_sparse_rows, reconstruct_row,
+    fit_block_sparse_dictionary_best_effort_with_seed, fit_block_sparse_dictionary_with_seed,
+    reconstruct_block_sparse_rows, reconstruct_row,
     route_row_blocks, row_loss,
 };
 pub use block_chart::{

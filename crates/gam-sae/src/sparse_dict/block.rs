@@ -2165,10 +2165,11 @@ pub fn fit_block_sparse_dictionary(
 /// alternation. This is the caller-supplied seed hook the one-shot lane exposes so a
 /// `K ≈ 1e4` fit can skip the serial farthest-point corpus pass (the analogue of the
 /// streaming lane's [`super::block_stream::BlockSparseStreamState::new_with_decoder`]).
-pub fn fit_block_sparse_dictionary_with_seed(
+fn fit_block_sparse_dictionary_with_seed_inner(
     x: ArrayView2<'_, f32>,
     config: &BlockSparseConfig,
     seed_policy: BlockSeedPolicy,
+    best_effort: bool,
 ) -> Result<BlockSparseFit, BlockSparseFitError> {
     validate(x, config)?;
     let n = x.nrows();
@@ -2253,7 +2254,13 @@ pub fn fit_block_sparse_dictionary_with_seed(
         }
     }
 
-    if !converged {
+    // Certified Err-contract: a non-certified fit collapses to `NonConvergence`
+    // BEFORE finalization, byte-identical to the historical contract (the reported
+    // `explained_variance` is the pre-γ-refresh `state` EV). The best-effort entry
+    // instead finalizes the same best fixed point and returns it with
+    // `certified: false` so the caller (e.g. `fit_tiered` at K ≫ rank) can run the
+    // next tier on its residual with the open certificate attached (#2275).
+    if !converged && !best_effort {
         return Err(BlockSparseFitError::NonConvergence {
             epochs: epochs_run,
             explained_variance: state.explained_variance,
@@ -2267,6 +2274,7 @@ pub fn fit_block_sparse_dictionary_with_seed(
             polar_failures,
         });
     }
+    let certified = converged;
 
     let BlockSparseState {
         mut decoder,
@@ -2364,10 +2372,45 @@ pub fn fit_block_sparse_dictionary_with_seed(
             accepted_births,
             polar_failures,
             tolerance: config.tolerance,
+            certified,
         },
         block_topk: k,
         block_size: b,
     })
+}
+
+/// [`fit_block_sparse_dictionary`] with an explicit [`BlockSeedPolicy`]. The seed
+/// only sets the starting frames; the returned fixed point is the same seed-agnostic
+/// alternation. This is the caller-supplied seed hook the one-shot lane exposes so a
+/// `K ≈ 1e4` fit can skip the serial farthest-point corpus pass (the analogue of the
+/// streaming lane's [`super::block_stream::BlockSparseStreamState::new_with_decoder`]).
+///
+/// **Certified Err contract:** returns `Err(NonConvergence)` if the frame-projector
+/// fixed point does not certify to `config.tolerance`. Byte-identical to the historical
+/// behaviour. For the K ≫ rank best-effort path see
+/// [`fit_block_sparse_dictionary_best_effort_with_seed`].
+pub fn fit_block_sparse_dictionary_with_seed(
+    x: ArrayView2<'_, f32>,
+    config: &BlockSparseConfig,
+    seed_policy: BlockSeedPolicy,
+) -> Result<BlockSparseFit, BlockSparseFitError> {
+    fit_block_sparse_dictionary_with_seed_inner(x, config, seed_policy, false)
+}
+
+/// Best-effort variant of [`fit_block_sparse_dictionary_with_seed`]: when the
+/// frame-projector fixed point does not certify (the well-posed `K ≫ intrinsic-rank`
+/// regime where ~`K − rank` blocks are structurally spurious, #2275), return the best
+/// fixed point reached with `convergence.certified = false` and the open residuals,
+/// instead of an opaque `Err`. Real failures (validation, polar subsolve, routing)
+/// still propagate as `Err`. The certified case is identical to the Err-contract entry.
+/// This is the completion path `fit_tiered` uses so Tier-2 can run on the Tier-1
+/// residual at the tiered architecture's design scale.
+pub fn fit_block_sparse_dictionary_best_effort_with_seed(
+    x: ArrayView2<'_, f32>,
+    config: &BlockSparseConfig,
+    seed_policy: BlockSeedPolicy,
+) -> Result<BlockSparseFit, BlockSparseFitError> {
+    fit_block_sparse_dictionary_with_seed_inner(x, config, seed_policy, true)
 }
 
 /// Overwrite `gates[i,j] = γ·‖x_i D_{g}ᵀ‖₂` for the packed routing, so the stored

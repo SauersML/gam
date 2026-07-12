@@ -42,7 +42,7 @@ use ndarray::ArrayView2;
 use crate::migration_ledger::{BirthSeed, MoveEvidence, MoveReason, MoveStage, SaeMigrationLedger};
 use crate::sparse_dict::{
     BlockSeedPolicy, BlockSparseConfig, BlockSparseFit, CofitConfig, CofitReport,
-    cofit_block_and_curved, fit_block_sparse_dictionary_with_seed,
+    cofit_block_and_curved, fit_block_sparse_dictionary_best_effort_with_seed,
 };
 use crate::tiered::Tier0Mean;
 
@@ -184,7 +184,16 @@ pub fn fit_tiered(
     let seed_policy = config
         .tier1_seed
         .resolve(r0_f32.nrows(), r0_f32.ncols(), &config.tier1);
-    let tier1 = fit_block_sparse_dictionary_with_seed(r0_f32.view(), &config.tier1, seed_policy)?;
+    // Best-effort completion (#2275): at `K ≫ intrinsic-rank` the frame-projector
+    // fixed point legitimately does not certify (~`K − rank` structurally spurious
+    // blocks pinned above tolerance), which used to collapse to `Err` and skip
+    // Tier-2 entirely. Take the best fixed point reached and run Tier-2 on its
+    // residual regardless; the open certificate rides on `tier1.convergence`
+    // (`certified` + residuals) so callers see exactly which invariants closed. Real
+    // failures (validation, polar, routing) still propagate. When the frame fixed
+    // point DID certify this is identical to the historical certified path.
+    let tier1 =
+        fit_block_sparse_dictionary_best_effort_with_seed(r0_f32.view(), &config.tier1, seed_policy)?;
 
     let mut ledger = SaeMigrationLedger::new();
 
@@ -321,6 +330,135 @@ mod fit_tests {
         // Tier-0 mean captured the +1 / -0.5 offsets it was given.
         assert!(report.tier0.mean.iter().all(|m| m.is_finite()));
         assert!(report.tier2.is_none(), "linear_bulk disables Tier-2");
+        // Certified-path guard (#2275): a well-posed small-K fit that reaches its
+        // frame fixed point reports a CLOSED certificate.
+        assert!(
+            report.tier1.convergence.certified,
+            "well-posed K≈rank fit must certify; frame_residual={}",
+            report.tier1.convergence.frame_residual
+        );
+    }
+
+    /// #2275: at `K ≫ intrinsic-rank` the frame-projector fixed point legitimately
+    /// does not certify — ~`K − rank` blocks are structurally spurious and AuxK
+    /// revival churns their frames every epoch, pinning `frame_residual` above
+    /// tolerance. The best-effort completion path must RETURN a tiered fit (Tier-1
+    /// best-effort + Tier-2 on its residual) carrying a typed OPEN certificate,
+    /// instead of collapsing to `Err` and never running Tier-2 (the old contract).
+    #[test]
+    fn tiered_returns_best_effort_open_certificate_at_k_gg_rank_2275() {
+        // Rank-1 planted structure (a single direction in cols 0,1) in P=8, fit with
+        // K = G·b = 16 blocks of size b=1: ~15 blocks are structurally spurious.
+        let n = 96usize;
+        let p = 8usize;
+        let mut z = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let t = (i as f64) * 0.2;
+            z[[i, 0]] = t.cos();
+            z[[i, 1]] = t.sin();
+        }
+        let mut config = TieredFitConfig::tiered(16, 1); // K=16 ≫ intrinsic rank
+        config.tier1.block_topk = 4;
+        config.tier1.aux_k = 4; // revival ON: spurious frames churn -> cannot certify
+        config.tier1.max_epochs = 40;
+
+        // The Err-contract entry would error out here; the best-effort tiered path
+        // returns instead — that IS the #2275 acceptance criterion.
+        let report = fit_tiered(z.view(), &config)
+            .expect("#2275: best-effort tiered fit must RETURN at K ≫ rank, not error");
+
+        // Typed OPEN certificate: not certified, and the residual quantifies how open.
+        assert!(
+            !report.tier1.convergence.certified,
+            "K ≫ rank fit must carry an OPEN certificate; got certified=true \
+             (frame_residual={}, tol={})",
+            report.tier1.convergence.frame_residual,
+            report.tier1.convergence.tolerance
+        );
+        assert!(
+            report.tier1.convergence.frame_residual > report.tier1.convergence.tolerance,
+            "an open certificate must report frame_residual above tolerance; got {} <= {}",
+            report.tier1.convergence.frame_residual,
+            report.tier1.convergence.tolerance
+        );
+        assert!(
+            report.tier1.explained_variance.is_finite(),
+            "best-effort Tier-1 EV must be finite"
+        );
+        // Tier-2 RAN on the best-effort Tier-1 residual — today it never would.
+        assert!(
+            report.tier2.is_some(),
+            "#2275: Tier-2 must run on the best-effort Tier-1 residual"
+        );
+        assert!(
+            report.explained_variance.is_finite(),
+            "composed EV must be finite on the best-effort path"
+        );
+        // No tolerance softening: the tolerance the fit was measured against is the
+        // configured one, unchanged.
+        assert_eq!(
+            report.tier1.convergence.tolerance, config.tier1.tolerance,
+            "#2275 must NOT soften tolerance; the open certificate uses the configured tol"
+        );
+    }
+
+    /// #2275: the certified Err-contract entry and the best-effort entry agree on the
+    /// SAME fixed point at the block level — the Err-contract rejects a K ≫ rank fit
+    /// while the best-effort entry returns it with `certified=false` and matching
+    /// open residuals (no silent softening, just a typed completion).
+    #[test]
+    fn block_best_effort_recovers_the_open_fit_the_err_contract_rejects_2275() {
+        use crate::sparse_dict::{
+            fit_block_sparse_dictionary_best_effort_with_seed,
+            fit_block_sparse_dictionary_with_seed, BlockSeedPolicy, BlockSparseConfig,
+            BlockSparseFitError,
+        };
+        let n = 96usize;
+        let p = 8usize;
+        let mut x = Array2::<f32>::zeros((n, p));
+        for i in 0..n {
+            let t = (i as f32) * 0.2;
+            x[[i, 0]] = t.cos();
+            x[[i, 1]] = t.sin();
+        }
+        let mut config = BlockSparseConfig::new(16, 1);
+        config.block_topk = 4;
+        config.aux_k = 4;
+        config.max_epochs = 40;
+
+        let err = fit_block_sparse_dictionary_with_seed(
+            x.view(),
+            &config,
+            BlockSeedPolicy::FarthestPoint,
+        )
+        .expect_err("Err-contract entry must reject the non-certified K ≫ rank fit");
+        let best = fit_block_sparse_dictionary_best_effort_with_seed(
+            x.view(),
+            &config,
+            BlockSeedPolicy::FarthestPoint,
+        )
+        .expect("best-effort entry must RETURN the same fit with an open certificate");
+
+        assert!(
+            !best.convergence.certified,
+            "best-effort fit at K ≫ rank must be certified=false"
+        );
+        match err {
+            BlockSparseFitError::NonConvergence { frame_residual, tolerance, .. } => {
+                assert_eq!(
+                    tolerance, best.convergence.tolerance,
+                    "both entries measure against the same (unsoftened) tolerance"
+                );
+                assert!(
+                    frame_residual > tolerance
+                        && best.convergence.frame_residual > best.convergence.tolerance,
+                    "both report the SAME open frame residual above tolerance \
+                     (err={frame_residual}, best={})",
+                    best.convergence.frame_residual
+                );
+            }
+            other => panic!("expected NonConvergence, got {other:?}"),
+        }
     }
 
     /// Planted 6-circle + linear-bulk mixture (#2023 acceptance): the tiered fit
