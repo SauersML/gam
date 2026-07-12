@@ -230,35 +230,54 @@ def fig_gallery(clouds_dir: Path, out: Path, *, max_factors: int = 8) -> None:
     plt.close(fig)
 
 
-def _atlas_cloud_records(clouds_dir: Path) -> dict[str, dict[str, Any]]:
-    """Load exactly one newest-code ours_rust cloud record per atlas kind."""
+def _atlas_cloud_records(
+    clouds_dir: Path,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Load one joint newest-code ours_rust fit containing every atlas kind."""
+    paths = sorted(clouds_dir.rglob("clouds_ours_rust*.npz"))
+    if len(paths) != 1:
+        raise ValueError(
+            "the atlas requires exactly one joint ours_rust cloud file; "
+            f"found {len(paths)}"
+        )
+    path = paths[0]
     records: dict[str, dict[str, Any]] = {}
-    for path in sorted(clouds_dir.rglob("clouds_ours_rust*.npz")):
-        with np.load(path) as store:
-            meta = _cloud_meta(store)
-            if meta.get("featurizer") != "ours_rust":
+    with np.load(path) as store:
+        meta = _cloud_meta(store)
+        if meta.get("schema") != "joint-manifold-sae-clouds-v1":
+            raise ValueError("cloud file does not use the joint-fit schema")
+        if meta.get("featurizer") != "ours_rust" or meta.get("joint_fit") is not True:
+            raise ValueError("cloud file is not a joint Rust Manifold SAE fit")
+        data_config = meta.get("data_config") or {}
+        if data_config.get("kinds") != ATLAS_KINDS:
+            raise ValueError(
+                "joint fit must contain the eight analytic zoo factors in atlas order"
+            )
+        fit_config = meta.get("fit_config") or {}
+        if fit_config.get("assignment") != "topk":
+            raise ValueError("joint fit must use a shared Top-K sparse assignment")
+        if fit_config.get("atoms") != len(ATLAS_KINDS):
+            raise ValueError("joint fit must use one shared atom bank of size eight")
+        if fit_config.get("top_k") != data_config.get("l0"):
+            raise ValueError("joint fit Top-K must match the planted row support")
+        for factor in meta["factors"]:
+            kind = str(factor["kind"])
+            if kind not in ATLAS_KINDS:
                 continue
-            for factor in meta["factors"]:
-                kind = str(factor["kind"])
-                if kind not in ATLAS_KINDS:
-                    continue
-                if kind in records:
-                    raise ValueError(
-                        f"multiple ours_rust cloud records for {kind}: "
-                        f"{records[kind]['path']} and {path}"
-                    )
-                index = int(factor["factor"])
-                records[kind] = {
-                    "path": path,
-                    "true": np.asarray(store[f"true_{index}"], dtype=float),
-                    "recovered": np.asarray(store[f"rec_{index}"], dtype=float),
-                    "theta": np.asarray(store[f"theta_{index}"], dtype=float),
-                    "r2": float(factor["r2"]),
-                }
+            if kind in records:
+                raise ValueError(f"joint cloud file contains duplicate kind {kind}")
+            index = int(factor["factor"])
+            records[kind] = {
+                "path": path,
+                "true": np.asarray(store[f"true_{index}"], dtype=float),
+                "recovered": np.asarray(store[f"rec_{index}"], dtype=float),
+                "theta": np.asarray(store[f"theta_{index}"], dtype=float),
+                "r2": float(factor["r2"]),
+            }
     missing = [kind for kind in ATLAS_KINDS if kind not in records]
     if missing:
         raise ValueError(f"atlas is missing ours_rust clouds for: {', '.join(missing)}")
-    return records
+    return records, meta
 
 
 def _pad_cloud(cloud: np.ndarray) -> np.ndarray:
@@ -311,7 +330,9 @@ def fig_all_zoos_atlas(
     """One fitted atlas: planted manifolds, Manifold SAE, and GAM smooth zoo."""
     if not source_sha:
         raise ValueError("source_sha is required for a provenance-bearing atlas")
-    records = _atlas_cloud_records(clouds_dir)
+    records, cloud_meta = _atlas_cloud_records(clouds_dir)
+    data_config = cloud_meta["data_config"]
+    fit_config = cloud_meta["fit_config"]
     smooth = plt.imread(smooth_zoo)
 
     n_kinds = len(ATLAS_KINDS)
@@ -357,7 +378,7 @@ def fig_all_zoos_atlas(
         fontsize=8.5, color=INK_MUTED, fontweight="bold",
     )
     fig.text(
-        0.017, 0.498, "MANIFOLD SAE", rotation=90, ha="center", va="center",
+        0.017, 0.498, "ONE JOINT MANIFOLD SAE", rotation=90, ha="center", va="center",
         fontsize=8.5, color=SERIES["ours_rust"], fontweight="bold",
     )
 
@@ -371,8 +392,15 @@ def fig_all_zoos_atlas(
     )
     fig.text(
         0.055, 0.915,
-        "What was planted, what the Rust Manifold SAE recovered, and how GAM smooths see one surface",
+        "Eight exact analytic factors superposed per sample, recovered by one shared "
+        f"{fit_config['atoms']}-atom Top-{fit_config['top_k']} Rust Manifold SAE",
         ha="left", va="top", fontsize=11.2, color=INK_2,
+    )
+    fig.text(
+        0.055, 0.884,
+        f"Nuisance-free toy DGP · row support {data_config['l0']} · "
+        f"ambient R^{data_config['ambient']} · held-out atom images from native decoding",
+        ha="left", va="top", fontsize=8.8, color=INK_MUTED,
     )
     fig.text(
         0.995, 0.018,

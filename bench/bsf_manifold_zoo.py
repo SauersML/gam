@@ -474,6 +474,11 @@ def _fit_ours_rust(
         extras={
             "basis_kinds": list(fit.basis_kinds),
             "atom_dims": list(fit.atom_dims),
+            "fit_config": {
+                "atoms": atoms,
+                "top_k": top_k,
+                "assignment": "topk" if top_k is not None else "softmax",
+            },
             "profile": {
                 "native_fit_seconds": fit_seconds,
                 "heldout_oos_seconds": oos_seconds,
@@ -677,7 +682,23 @@ def dump_clouds(
             payload[f"learned_theta_{i}"] = np.asarray(coords)[rows][take].astype(np.float32)
         meta.append({"factor": i, "kind": p["kind"], "r2": p["r2"]})
     payload["meta_json"] = np.frombuffer(
-        json.dumps({"featurizer": fitted.name, "factors": meta}).encode(), dtype=np.uint8
+        json.dumps(
+            {
+                "schema": "joint-manifold-sae-clouds-v1",
+                "featurizer": fitted.name,
+                "joint_fit": fitted.name == "ours_rust",
+                "fit_config": (fitted.extras or {}).get("fit_config"),
+                "data_config": {
+                    "factors": data.m_factors,
+                    "ambient": data.d_ambient,
+                    "l0": data.l0,
+                    "kinds": data.kinds,
+                    "dgp": data.dgp,
+                },
+                "factors": meta,
+            }
+        ).encode(),
+        dtype=np.uint8,
     )
     np.savez_compressed(path, **payload)
 
@@ -765,6 +786,12 @@ def main() -> int:
         "record": "config",
         "factors": factors, "ambient": args.ambient, "l0": args.l0,
         "curved_fraction": args.curved_fraction, "kinds": data.kinds,
+        "dgp": args.dgp,
+        "llm_zipf": args.llm_zipf,
+        "llm_importance": args.llm_importance,
+        "llm_amp_sigma": args.llm_amp_sigma,
+        "llm_noise": args.llm_noise,
+        "llm_contexts": args.llm_contexts,
         "n_train": args.n_train, "n_test": args.n_test,
         "atoms": atoms, "top_k": top_k, "flat_width": flat_width, "flat_k": flat_k,
         "seed": args.seed, "span_sum": span_sum,
