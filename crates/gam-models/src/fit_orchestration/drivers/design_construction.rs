@@ -1201,9 +1201,13 @@ fn extract_spatial_operator_runtime_caches(
         .zip(design.smooth.terms.iter())
         .enumerate()
     {
-        let Some(global_base_idx) = smooth_term_penalty_index(spec, design, term_idx) else {
+        let Some(global_range) = design
+            .smooth_term_penalty_range(term_idx)
+            .map_err(EstimationError::InvalidInput)?
+        else {
             continue;
         };
+        let global_base_idx = global_range.start;
         let mut active_local_idx = 0usize;
         let mut mass_local_idx = None;
         let mut tension_local_idx = None;
@@ -7535,39 +7539,6 @@ fn exact_joint_spatial_outer_hessian_available(
     family_supported && design.design.ncols() > 0
 }
 
-fn smooth_term_penalty_index(
-    spec: &TermCollectionSpec,
-    design: &TermCollectionDesign,
-    term_idx: usize,
-) -> Option<usize> {
-    if term_idx >= design.smooth.terms.len() || term_idx >= spec.smooth_terms.len() {
-        return None;
-    }
-    if design.smooth.terms[term_idx].penalties_local.is_empty() {
-        return None;
-    }
-    let linear_penalties = spec
-        .linear_terms
-        .iter()
-        .filter(|t| t.double_penalty)
-        .count()
-        * 2;
-    let random_penalties = design
-        .random_effect_ranges
-        .iter()
-        .filter(|(_, range)| !range.is_empty())
-        .count();
-    let smooth_offset = linear_penalties + random_penalties;
-    let local_offset = design
-        .smooth
-        .terms
-        .iter()
-        .take(term_idx)
-        .map(|term| term.penalties_local.len())
-        .sum::<usize>();
-    Some(smooth_offset + local_offset)
-}
-
 fn try_build_spatial_term_log_kappa_derivativeinfo(
     data: ArrayView2<'_, f64>,
     resolvedspec: &TermCollectionSpec,
@@ -7588,9 +7559,13 @@ fn try_build_spatial_term_log_kappa_derivativeinfo(
     else {
         return Ok(None);
     };
-    let Some(penalty_start) = smooth_term_penalty_index(resolvedspec, design, term_idx) else {
+    let Some(penalty_range) = design
+        .smooth_term_penalty_range(term_idx)
+        .map_err(EstimationError::InvalidInput)?
+    else {
         return Ok(None);
     };
+    let penalty_start = penalty_range.start;
     if s_psi_components_local.is_empty() || s_psi_psi_components_local.is_empty() {
         return Ok(None);
     }
@@ -7724,9 +7699,13 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
     if d == 0 {
         return Ok(None);
     }
-    let Some(penalty_start) = smooth_term_penalty_index(resolvedspec, design, term_idx) else {
+    let Some(penalty_range) = design
+        .smooth_term_penalty_range(term_idx)
+        .map_err(EstimationError::InvalidInput)?
+    else {
         return Ok(None);
     };
+    let penalty_start = penalty_range.start;
     let p_total = design.design.ncols();
     let smooth_start = p_total.saturating_sub(design.smooth.total_smooth_cols());
     let global_range = (smooth_start + smooth_term.coeff_range.start)

@@ -22,9 +22,9 @@ mod adaptive_bounded_duchon_tests {
     // (the drivers' explicit `gam_terms::basis` import), so re-listing them would
     // collide (E0252); every other name is pulled in explicitly here.
     use gam_terms::basis::{
-        BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, DuchonBasisSpec,
-        DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternNu,
-        OneDimensionalBoundary, SpatialIdentifiability,
+        BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
+        DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec,
+        MaternNu, OneDimensionalBoundary, SpatialIdentifiability,
     };
     // The `AdaptiveRegularizationOptions` knob the bounded/adaptive fits set lives
     // in gam-solve's model_types; `super::*` does not re-export it into this scope.
@@ -40,6 +40,85 @@ mod adaptive_bounded_duchon_tests {
         two_block_exact_joint_hyper_setup,
     };
     use ndarray::array;
+
+    #[test]
+    fn spatial_penalty_ranges_follow_realized_global_layout_2287() {
+        let data = array![
+            [1.0, 0.0, 0.00],
+            [2.0, 1.0, 0.14],
+            [3.0, 0.0, 0.29],
+            [4.0, 1.0, 0.43],
+            [5.0, 0.0, 0.57],
+            [6.0, 1.0, 0.71],
+            [7.0, 0.0, 0.86],
+            [8.0, 1.0, 1.00],
+        ];
+        let smooth = |name: &str| SmoothTermSpec {
+            name: name.to_string(),
+            basis: SmoothBasisSpec::BSpline1D {
+                feature_col: 2,
+                spec: BSplineBasisSpec {
+                    degree: 3,
+                    penalty_order: 2,
+                    knotspec: BSplineKnotSpec::Generate {
+                        data_range: (0.0, 1.0),
+                        num_internal_knots: 4,
+                    },
+                    double_penalty: false,
+                    identifiability: BSplineIdentifiability::None,
+                    boundary_conditions: BSplineBoundaryConditions::default(),
+                    boundary: OneDimensionalBoundary::Open,
+                },
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        };
+        let spec = TermCollectionSpec {
+            // Exactly one function-space ridge is emitted for this term.
+            linear_terms: vec![LinearTermSpec {
+                name: "linear".to_string(),
+                feature_col: 0,
+                feature_cols: vec![0],
+                categorical_levels: vec![],
+                double_penalty: true,
+                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                coefficient_min: None,
+                coefficient_max: None,
+            }],
+            // The non-empty coefficient range is intentionally unpenalized and
+            // therefore contributes no global penalty block.
+            random_effect_terms: vec![RandomEffectTermSpec {
+                name: "unpenalized_group".to_string(),
+                feature_col: 1,
+                drop_first_level: false,
+                penalized: false,
+                frozen_levels: Some(vec![0, 1]),
+                lenient_unseen: true,
+            }],
+            smooth_terms: vec![smooth("first_smooth"), smooth("second_smooth")],
+        };
+        let design = build_term_collection_design(data.view(), &spec).expect("mixed design");
+
+        assert_eq!(design.leading_penalty_blocks_before_smooth(), 1);
+        let first = design
+            .smooth_term_penalty_range(0)
+            .expect("consistent layout")
+            .expect("penalized first smooth");
+        let second = design
+            .smooth_term_penalty_range(1)
+            .expect("consistent layout")
+            .expect("penalized second smooth");
+        assert_eq!(first.start, 1);
+        assert_eq!(second.start, first.end);
+        assert_eq!(
+            design.penaltyinfo[first.start].termname.as_deref(),
+            Some("first_smooth")
+        );
+        assert_eq!(
+            design.penaltyinfo[second.start].termname.as_deref(),
+            Some("second_smooth")
+        );
+    }
 
     #[test]
     fn pure_duchon_aniso_penalties_stay_symmetric_through_freeze_and_cache() {

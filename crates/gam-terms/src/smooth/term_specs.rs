@@ -2396,6 +2396,60 @@ impl TermCollectionDesign {
             .count()
     }
 
+    /// Global flat-penalty range owned by one realized smooth term.
+    ///
+    /// This is the only supported translation from a smooth-local penalty
+    /// index to the model-global smoothing-parameter layout. The prefix comes
+    /// from the metadata recorded alongside the matrices that were actually
+    /// emitted; it must not be reconstructed from term specs or coefficient
+    /// ranges, because unpenalized effects have columns but no penalty block.
+    pub fn smooth_term_penalty_range(
+        &self,
+        term_idx: usize,
+    ) -> Result<Option<Range<usize>>, String> {
+        let Some(term) = self.smooth.terms.get(term_idx) else {
+            return Ok(None);
+        };
+        if term.penalties_local.is_empty() {
+            return Ok(None);
+        }
+
+        let leading = self.leading_penalty_blocks_before_smooth();
+        let smooth_count = self
+            .smooth
+            .terms
+            .iter()
+            .map(|smooth| smooth.penalties_local.len())
+            .sum::<usize>();
+        let expected = leading
+            .checked_add(smooth_count)
+            .ok_or_else(|| "term-collection penalty count overflow".to_string())?;
+        if expected != self.penalties.len() || self.penaltyinfo.len() != self.penalties.len() {
+            return Err(format!(
+                "term-collection penalty layout is inconsistent: {leading} leading blocks + \
+                 {smooth_count} smooth blocks = {expected}, but there are {} penalties and {} \
+                 metadata records",
+                self.penalties.len(),
+                self.penaltyinfo.len()
+            ));
+        }
+
+        let local_offset = self
+            .smooth
+            .terms
+            .iter()
+            .take(term_idx)
+            .map(|smooth| smooth.penalties_local.len())
+            .sum::<usize>();
+        let start = leading
+            .checked_add(local_offset)
+            .ok_or_else(|| "smooth penalty offset overflow".to_string())?;
+        let end = start
+            .checked_add(term.penalties_local.len())
+            .ok_or_else(|| "smooth penalty range overflow".to_string())?;
+        Ok(Some(start..end))
+    }
+
     /// Convert blockwise penalties to `PenaltyMatrix::Blockwise` without
     /// expanding to `p_total × p_total`. This is the preferred path for
     /// family modules that accept `Vec<PenaltyMatrix>`.
