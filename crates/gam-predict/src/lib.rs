@@ -4191,6 +4191,7 @@ mod tests {
             penalty_block_trace: vec![],
             edf_total: p as f64,
             smoothing_correction: None,
+            smoothing_correction_method: None,
             penalized_hessian: Array2::<f64>::eye(p).into(),
             working_weights: Array1::zeros(0),
             working_response: Array1::zeros(0),

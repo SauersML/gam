@@ -8800,7 +8800,14 @@ fn lawley_dispersion_for_family(
     likelihood: &gam_spec::GlmLikelihoodSpec,
     fit: &UnifiedFitResult,
 ) -> Result<f64, EstimationError> {
-    gam_solve::estimate::dispersion_from_likelihood(likelihood, fit.standard_deviation)
+    let profiled_standard_deviation = matches!(
+        likelihood
+            .resolved_scale()
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,
+        gam_spec::ResolvedLikelihoodScale::ProfiledGaussian
+    )
+    .then_some(fit.standard_deviation);
+    gam_solve::estimate::dispersion_from_likelihood(likelihood, profiled_standard_deviation)
         .map(|dispersion| dispersion.phi())
 }
 

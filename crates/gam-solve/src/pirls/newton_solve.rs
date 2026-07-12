@@ -4,7 +4,6 @@
 //! active-set KKT machinery, and the soft-acceptance progress test.
 
 use super::*;
-use opt::{RidgeSchedule, escalate_ridge};
 
 pub(crate) const DENSE_OUTER_MAX_P: usize = 1024;
 
@@ -517,7 +516,7 @@ pub(super) fn solve_newton_direction_dense(
 
     let cpu_route = String::from("CPU stable solver");
 
-    let factor = StableSolver::new("pirls newton direction")
+    let factor = StableSolver::new()
         .factorize(hessian)
         .map_err(EstimationError::LinearSystemSolveFailed)?;
     solve_direction_with_dense_factor(&factor, gradient, direction_out);
@@ -1219,54 +1218,20 @@ pub(crate) fn solve_subsystem_direction(
     if out.len() != n {
         *out = Array1::zeros(n);
     }
-    // Try direct factorization first.
-    if let Ok(factor) = StableSolver::new("pirls bounded subsystem").factorize_any(&h_sub) {
-        out.assign(&g_sub);
-        let mut rhs = array1_to_col_matmut(out);
-        factor.solve_in_place(rhs.as_mut());
-        out.mapv_inplace(|v| -v);
-        if array_is_finite(out) {
-            return Ok(());
-        }
+    let factor = StableSolver::new()
+        .factorize_any(&h_sub)
+        .map_err(EstimationError::LinearSystemSolveFailed)?;
+    out.assign(&g_sub);
+    let mut rhs = array1_to_col_matmut(out);
+    factor.solve_in_place(rhs.as_mut());
+    out.mapv_inplace(|value| -value);
+    if array_is_finite(out) {
+        Ok(())
+    } else {
+        Err(EstimationError::InvalidInput(
+            "PIRLS constrained subsystem solve produced a non-finite direction".to_string(),
+        ))
     }
-    // Factorization failed or produced non-finite values — the reduced Hessian
-    // is singular or nearly so (common on underdetermined problems).  Add a
-    // diagonal ridge and retry with geometrically increasing strength.
-    let diag_scale = (0..n)
-        .map(|i| h_sub[[i, i]].abs())
-        .fold(0.0_f64, f64::max)
-        .max(1.0);
-    let mut h_reg = h_sub.to_owned();
-    if escalate_ridge(RidgeSchedule::geometric(1e-8 * diag_scale, 12), |tau| {
-        for i in 0..n {
-            h_reg[[i, i]] = h_sub[[i, i]] + tau;
-        }
-        let factor = StableSolver::new("pirls bounded subsystem ridge")
-            .factorize(&h_reg)
-            .ok()?;
-        out.assign(&g_sub);
-        let mut rhs = array1_to_col_matmut(out);
-        factor.solve_in_place(rhs.as_mut());
-        out.mapv_inplace(|v| -v);
-        array_is_finite(out).then_some(())
-    })
-    .is_ok()
-    {
-        return Ok(());
-    }
-    // All ridge attempts failed — fall back to steepest descent on the
-    // free subspace: d = -g / ||g||, scaled to a conservative step.
-    let gnorm = g_sub.dot(&g_sub).sqrt();
-    if gnorm > 0.0 {
-        let scale = 1.0 / gnorm.max(diag_scale);
-        for i in 0..n {
-            out[i] = -g_sub[i] * scale;
-        }
-        return Ok(());
-    }
-    // Zero gradient — already at optimum on this subspace.
-    out.fill(0.0);
-    Ok(())
 }
 
 pub(super) fn linear_constraints_from_lower_bounds(

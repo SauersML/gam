@@ -4098,7 +4098,7 @@ pub trait LinearOperator {
             }
             system += pen;
         }
-        let factor = crate::utils::StableSolver::new("linear operator system")
+        let factor = crate::utils::StableSolver::new()
             .factorize(&system)
             .map_err(|e| format!("factorize_system failed: {e:?}"))?;
         Ok(Box::new(factor))
@@ -4162,7 +4162,7 @@ pub trait LinearOperator {
                 system[[diagonal, diagonal]] += ridge;
             }
         }
-        let factor = crate::utils::StableSolver::new("linear operator system")
+        let factor = crate::utils::StableSolver::new()
             .factorize(&system)
             .map_err(|error| {
                 format!(
@@ -4769,7 +4769,7 @@ impl DesignMatrix {
             }
             system += pen;
         }
-        let factor = crate::utils::StableSolver::new("linear operator system")
+        let factor = crate::utils::StableSolver::new()
             .factorize(&system)
             .map_err(|e| format!("factorize_system failed: {e:?}"))?;
         Ok(Box::new(factor))
@@ -6229,9 +6229,14 @@ mod tests {
                 h[[i, i]] += ridge;
             }
         }
-        StableSolver::new("matrix-free pcg exact reference")
-            .solvevectorwithridge_retries(&h, rhs, 0.0)
-            .expect("exact reference solve")
+        let factor = StableSolver::new()
+            .factorize(&h)
+            .expect("exact reference factorization");
+        let mut solution = rhs.clone();
+        let mut solution_matrix = crate::faer_ndarray::array1_to_col_matmut(&mut solution);
+        factor.solve_in_place(solution_matrix.as_mut());
+        assert!(solution.iter().all(|value| value.is_finite()));
+        solution
     }
 
     #[test]

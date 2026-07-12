@@ -2030,7 +2030,7 @@ where
                 // iterate is β̂ + d. Factorize the BARE (undamped) penalized
                 // Hessian — `state.hessian` carries no LM ridge (the damping
                 // lived only on the throwaway `regularized` clone in the loop).
-                let direction = StableSolver::new("pirls undamped newton polish")
+                let direction = StableSolver::new()
                     .factorize(bare_h)
                     .ok()
                     .map(|factor| {

@@ -851,9 +851,8 @@ impl ResponseFamily {
                 // value disqualifies the whole response, keeping continuous and
                 // signed data on the conservative Gaussian default.
                 let count = !y.is_empty()
-                    && y.iter().all(|v| {
-                        v.is_finite() && *v >= 0.0 && *v == v.round()
-                    })
+                    && y.iter()
+                        .all(|v| v.is_finite() && *v >= 0.0 && *v == v.round())
                     && y.iter().any(|v| *v >= 2.0);
                 if count {
                     Ok(Self::Poisson)
@@ -2297,33 +2296,28 @@ impl GlmLikelihoodSpec {
                 Err(mismatch("ProfiledGaussian or FixedDispersion metadata"))
             }
 
-            (ResponseFamily::Binomial | ResponseFamily::Poisson, Metadata::FixedDispersion { phi })
-                if phi.to_bits() == 1.0_f64.to_bits() =>
-            {
-                Ok(Resolved::Unit)
-            }
+            (
+                ResponseFamily::Binomial | ResponseFamily::Poisson,
+                Metadata::FixedDispersion { phi },
+            ) if phi.to_bits() == 1.0_f64.to_bits() => Ok(Resolved::Unit),
             (ResponseFamily::Binomial | ResponseFamily::Poisson, _) => {
                 Err(mismatch("exact FixedDispersion { phi: 1.0 } metadata"))
             }
 
-            (ResponseFamily::Gamma, Metadata::FixedGammaShape { shape }) => {
-                Ok(Resolved::Gamma {
-                    scale: ResolvedGammaScale::Shape(positive(shape, "Gamma shape")?),
-                    estimated: false,
-                })
-            }
+            (ResponseFamily::Gamma, Metadata::FixedGammaShape { shape }) => Ok(Resolved::Gamma {
+                scale: ResolvedGammaScale::Shape(positive(shape, "Gamma shape")?),
+                estimated: false,
+            }),
             (ResponseFamily::Gamma, Metadata::EstimatedGammaShape { shape }) => {
                 Ok(Resolved::Gamma {
                     scale: ResolvedGammaScale::Shape(positive(shape, "Gamma shape")?),
                     estimated: true,
                 })
             }
-            (ResponseFamily::Gamma, Metadata::FixedDispersion { phi }) => {
-                Ok(Resolved::Gamma {
-                    scale: ResolvedGammaScale::Dispersion(positive(phi, "Gamma dispersion phi")?),
-                    estimated: false,
-                })
-            }
+            (ResponseFamily::Gamma, Metadata::FixedDispersion { phi }) => Ok(Resolved::Gamma {
+                scale: ResolvedGammaScale::Dispersion(positive(phi, "Gamma dispersion phi")?),
+                estimated: false,
+            }),
             (ResponseFamily::Gamma, _) => Err(mismatch(
                 "FixedGammaShape, EstimatedGammaShape, or FixedDispersion metadata",
             )),
@@ -2340,9 +2334,9 @@ impl GlmLikelihoodSpec {
                     estimated: false,
                 })
             }
-            (ResponseFamily::Tweedie { .. }, _) => Err(mismatch(
-                "EstimatedTweediePhi or FixedDispersion metadata",
-            )),
+            (ResponseFamily::Tweedie { .. }, _) => {
+                Err(mismatch("EstimatedTweediePhi or FixedDispersion metadata"))
+            }
 
             (ResponseFamily::Beta { phi }, Metadata::EstimatedBetaPhi { phi: metadata_phi }) => {
                 if phi.to_bits() != metadata_phi.to_bits() {
@@ -2355,9 +2349,7 @@ impl GlmLikelihoodSpec {
                     estimated: true,
                 })
             }
-            (ResponseFamily::Beta { .. }, _) => {
-                Err(mismatch("matching EstimatedBetaPhi metadata"))
-            }
+            (ResponseFamily::Beta { .. }, _) => Err(mismatch("matching EstimatedBetaPhi metadata")),
 
             (
                 ResponseFamily::NegativeBinomial {
@@ -2391,9 +2383,7 @@ impl GlmLikelihoodSpec {
                 "matching EstimatedNegBinTheta/FixedNegBinTheta metadata and ownership flag",
             )),
 
-            (ResponseFamily::RoystonParmar, Metadata::Unspecified) => {
-                Ok(Resolved::Unspecified)
-            }
+            (ResponseFamily::RoystonParmar, Metadata::Unspecified) => Ok(Resolved::Unspecified),
             (ResponseFamily::RoystonParmar, _) => {
                 Err(mismatch("Unspecified metadata (no scalar GLM scale)"))
             }

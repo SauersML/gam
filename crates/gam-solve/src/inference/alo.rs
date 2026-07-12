@@ -726,7 +726,7 @@ fn alo_covariance_scale(base: &pirls::PirlsResult) -> Result<f64, AloError> {
                 reason: format!("invalid profiled-Gaussian ALO dispersion: {error}"),
             })?
         }
-        _ => dispersion_from_likelihood(&base.likelihood, 0.0).map_err(|error| {
+        _ => dispersion_from_likelihood(&base.likelihood, None).map_err(|error| {
             AloError::InvalidInput {
                 reason: format!("ALO could not resolve likelihood scale metadata: {error}"),
             }

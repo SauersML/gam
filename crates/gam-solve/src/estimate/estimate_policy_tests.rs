@@ -13,7 +13,7 @@ use super::prefit::{
 use super::reml::hyper::link_binomial_aux;
 use super::*;
 use crate::mixture_link::{sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials};
-use gam_linalg::utils::{StableSolver, max_abs_diag};
+use gam_linalg::utils::StableSolver;
 use gam_problem::{
     InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, SeedRiskProfile, StandardLink,
 };
@@ -684,6 +684,12 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
             penalty_block_trace: vec![],
             edf_total: 1.5,
             smoothing_correction: Some(array![[0.2, 0.0], [0.0, 0.2]]),
+            smoothing_correction_method: Some(
+                crate::model_types::SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
+                    active_rank: 1,
+                    rho_dimension: 1,
+                },
+            ),
             penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]].into(),
             working_weights: array![1.0, 0.5, 0.75],
             working_response: array![0.1, 0.2, 0.3],
@@ -1173,14 +1179,13 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
         }
         j
     };
-    let stable_solver = StableSolver::new("sas dbeta exact test");
-    let mut dbeta_exact = stable_solver
-        .solvevectorwithridge_retries(
-            &score_beta_jacobian,
-            &rhs,
-            max_abs_diag(&score_beta_jacobian) * 1e-12,
-        )
-        .expect("observed-jacobian solve for dbeta");
+    let factor = StableSolver::new()
+        .factorize(&score_beta_jacobian)
+        .expect("observed-jacobian factorization for dbeta");
+    let mut dbeta_exact = rhs.clone();
+    let mut dbeta_matrix = gam_linalg::faer_ndarray::array1_to_col_matmut(&mut dbeta_exact);
+    factor.solve_in_place(dbeta_matrix.as_mut());
+    assert!(dbeta_exact.iter().all(|value| value.is_finite()));
     dbeta_exact *= d_eps_d_raw;
 
     let fd_h = 1e-4 * (1.0 + theta[1].abs());

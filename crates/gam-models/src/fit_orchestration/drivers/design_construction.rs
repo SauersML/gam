@@ -2582,6 +2582,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 penalty_block_trace,
                 edf_total,
                 smoothing_correction: None,
+                smoothing_correction_method: None,
                 // Boundary adapter: wrap the raw `Array2<f64>` Hessian as
                 // `UnscaledPrecision` for the newtype storage.
                 penalized_hessian: penalized_hessian.clone().into(),
@@ -6496,7 +6497,7 @@ fn fit_bounded_term_collection_with_design(
     }
 
     let glm_likelihood = gam_spec::GlmLikelihoodSpec::canonical(family);
-    glm_likelihood
+    let resolved_likelihood_scale = glm_likelihood
         .resolved_scale()
         .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     let is_beta_logistic = glm_likelihood.spec.is_binomial_beta_logistic();
@@ -6693,7 +6694,10 @@ fn fit_bounded_term_collection_with_design(
     // the per-family scale is `GlmLikelihoodSpec::coefficient_covariance_scale`
     // / `dispersion_from_likelihood`, reused verbatim so the bounded path can
     // never drift from the standard contract (gam#1514).
-    let standard_deviation = if glm_likelihood.spec.is_gaussian_identity() {
+    let profiled_gaussian_standard_deviation = if matches!(
+        resolved_likelihood_scale,
+        gam_spec::ResolvedLikelihoodScale::ProfiledGaussian
+    ) {
         let residual_dof = if options.compute_inference {
             y.len() as f64 - edf_total
         } else {
@@ -6716,12 +6720,15 @@ fn fit_bounded_term_collection_with_design(
                 "bounded Gaussian residual variance is not representable: {deviance}/{residual_dof}"
             )));
         }
-        variance.sqrt()
+        Some(variance.sqrt())
     } else {
-        1.0
+        None
     };
-    let dispersion =
-        gam_solve::estimate::dispersion_from_likelihood(&glm_likelihood, standard_deviation)?;
+    let dispersion = gam_solve::estimate::dispersion_from_likelihood(
+        &glm_likelihood,
+        profiled_gaussian_standard_deviation,
+    )?;
+    let standard_deviation = dispersion.phi().sqrt();
     let cov_scale = glm_likelihood
         .coefficient_covariance_scale(dispersion.phi())
         .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
@@ -6772,6 +6779,7 @@ fn fit_bounded_term_collection_with_design(
                 penalty_block_trace,
                 edf_total,
                 smoothing_correction: None,
+                smoothing_correction_method: None,
                 // Boundary adapter: `penalized_hessian` storage is now
                 // `UnscaledPrecision`.
                 penalized_hessian: penalized_hessian.clone().into(),

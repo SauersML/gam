@@ -25,63 +25,13 @@ fn binomial_log_probabilities(mu: f64) -> Option<(f64, f64)> {
 
 const HALF_LOG_2PI: f64 = 0.918_938_533_204_672_7;
 
-/// `(log Phi(x), d log Phi(x) / dx)` from one tail representation.
-///
-/// Below -8, evaluating `erfc` and then differentiating its rounded result
-/// loses the Mills ratio. The asymptotic log-CDF and inverse-Mills expansion
-/// retain both channels through the last representable normal tail. Above that
-/// threshold the erfc expression is accurate and its analytic score shares the
-/// exact returned value.
-#[inline]
-fn log_standard_normal_cdf_and_score(x: f64) -> (f64, f64) {
-    if x < -12.0 {
-        let t = -x;
-        let t2 = t * t;
-        if !t2.is_finite() {
-            return (f64::NEG_INFINITY, t);
-        }
-        // Phi(-t) = phi(t)/t * S(t),
-        // S(t) ~ sum_n (-1)^n (2n-1)!! / t^(2n). Add the alternating,
-        // decreasing terms until the next one cannot alter either S or S'.
-        // If asymptotic terms begin growing first, the smallest-term truncation
-        // has the standard alternating remainder bound.
-        let mut series = 1.0_f64;
-        let mut derivative = 0.0_f64;
-        let mut term = 1.0_f64;
-        let inv_t2 = 1.0 / t2;
-        for n in 1..=1024 {
-            let next_term = term * -((2 * n - 1) as f64) * inv_t2;
-            if next_term.abs() >= term.abs() {
-                break;
-            }
-            let next_series = series + next_term;
-            let derivative_term = -2.0 * n as f64 * next_term / t;
-            let next_derivative = derivative + derivative_term;
-            term = next_term;
-            if next_series == series && next_derivative == derivative {
-                break;
-            }
-            series = next_series;
-            derivative = next_derivative;
-        }
-        let log_cdf = -0.5 * t2 - t.ln() - HALF_LOG_2PI + series.ln();
-        // d/dx log Phi(x) = -d/dt log Phi(-t).
-        let inverse_mills = t + 1.0 / t - derivative / series;
-        (log_cdf, inverse_mills)
-    } else {
-        let erfc = statrs::function::erf::erfc(-x * std::f64::consts::FRAC_1_SQRT_2);
-        let log_cdf = erfc.ln() - std::f64::consts::LN_2;
-        let log_pdf = -0.5 * x * x - HALF_LOG_2PI;
-        (log_cdf, (log_pdf - log_cdf).exp())
-    }
-}
-
 /// Stable Bernoulli log-probabilities and negative-log-likelihood score for
 /// the standard probit link.
 #[inline]
 fn probit_binomial_geometry(y: f64, eta: f64) -> (f64, f64, f64) {
-    let (log_mu, dlog_mu) = log_standard_normal_cdf_and_score(eta);
-    let (log_one_minus_mu, dlog_survival_at_neg_eta) = log_standard_normal_cdf_and_score(-eta);
+    let (log_mu, dlog_mu) = gam_math::probability::signed_probit_logcdf_and_mills_ratio(eta);
+    let (log_one_minus_mu, dlog_survival_at_neg_eta) =
+        gam_math::probability::signed_probit_logcdf_and_mills_ratio(-eta);
     let negative_score = if y == 1.0 {
         -dlog_mu
     } else if y == 0.0 {
@@ -330,11 +280,9 @@ fn log1p_minus_x(x: f64) -> f64 {
 #[inline]
 fn log_abs_one_minus_exp(x: f64) -> f64 {
     if x > 0.0 {
-        x + (-(-x).exp()).ln_1p()
-    } else if x > -std::f64::consts::LN_2 {
-        (-x.exp_m1()).ln()
+        x + gam_math::probability::log1mexp_positive(x)
     } else {
-        (-x.exp()).ln_1p()
+        gam_math::probability::log1mexp_positive(-x)
     }
 }
 
@@ -1317,7 +1265,9 @@ pub fn calculate_null_deviance(
         // The null deviance is scale-free for several families, but accepting
         // contradictory family/metadata state here would let reporting bless a
         // fit that covariance and sampling correctly reject.
-        crate::estimate::dispersion_from_likelihood(likelihood, 0.0)?;
+        likelihood
+            .resolved_scale()
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     }
     let response_mean =
         |domain: &'static str, valid: fn(f64) -> bool| -> Result<f64, EstimationError> {
@@ -2098,40 +2048,67 @@ fn tweedie_exact_series_loglik_from_eta(
             y_over_scale,
         ));
     }
-    let log_peak_index =
-        (log_lambda + alpha * (log_y - log_gamma_scale) - alpha * alpha.ln()) / (1.0 + alpha);
-    let peak_index = log_peak_index.exp().max(1.0);
-    if !peak_index.is_finite() {
-        return Err(deviance_row_error(
-            row,
-            "exact Tweedie dominant series index",
-            eta,
-            peak_index,
-        ));
-    }
     const MAX_EXACT_TERMS: usize = 100_000;
-    let work_limit = |required_terms_lower_bound: f64| {
-        EstimationError::ExactTweedieSeriesWorkLimit {
+    let work_limit =
+        |required_terms_lower_bound: f64| EstimationError::ExactTweedieSeriesWorkLimit {
             row,
             required_terms_lower_bound,
             budget: MAX_EXACT_TERMS,
+        };
+    let log_term = |k: f64| -> Result<f64, EstimationError> {
+        let components = [
+            -lambda,
+            k * log_lambda,
+            -ln_gamma(k + 1.0),
+            (k * alpha - 1.0) * log_y,
+            -y_over_scale,
+            -k * alpha * log_gamma_scale,
+            -ln_gamma(k * alpha),
+        ];
+        let value = stable_finite_signed_sum(&components, "exact Tweedie series term")?;
+        let absolute_sum: f64 = components.iter().map(|component| component.abs()).sum();
+        let input_roundoff_bound = 16.0 * f64::EPSILON * absolute_sum;
+        if !absolute_sum.is_finite()
+            || input_roundoff_bound > 1.0e-10 * value.abs().max(1.0)
+        {
+            return Err(deviance_row_error(
+                row,
+                "exact Tweedie series-term cancellation certificate",
+                eta,
+                input_roundoff_bound,
+            ));
         }
+        Ok(value)
     };
-    let rounded_peak = peak_index.round().max(1.0);
-    // The lower tail is finite and must be summed all the way to k=1. Thus the
-    // rounded peak alone is a rigorous lower bound on required work.
-    if rounded_peak > MAX_EXACT_TERMS as f64 {
-        return Err(work_limit(rounded_peak));
+    let budget_k = MAX_EXACT_TERMS as f64;
+    let budget_term = log_term(budget_k)?;
+    let after_budget_term = log_term(budget_k + 1.0)?;
+    if !budget_term.is_finite() || !after_budget_term.is_finite() {
+        return Err(deviance_row_error(
+            row,
+            "exact Tweedie mode bracket",
+            eta,
+            budget_term.min(after_budget_term),
+        ));
     }
-    let log_term = |k: f64| {
-        -lambda + k * log_lambda - ln_gamma(k + 1.0) + (k * alpha - 1.0) * log_y
-            - y_over_scale
-            - k * alpha * log_gamma_scale
-            - ln_gamma(k * alpha)
-    };
-    let mut terms = 1_usize;
-    let mut k_peak = rounded_peak;
-    let mut f_peak = log_term(k_peak);
+    if after_budget_term > budget_term {
+        return Err(work_limit(budget_k + 1.0));
+    }
+    // Strict concavity makes the adjacent difference decrease monotonically,
+    // so binary search finds the true discrete mode inside the certified
+    // [1, budget] bracket.
+    let mut lower = 1_usize;
+    let mut upper = MAX_EXACT_TERMS;
+    while lower < upper {
+        let midpoint = lower + (upper - lower) / 2;
+        if log_term(midpoint as f64 + 1.0)? > log_term(midpoint as f64)? {
+            lower = midpoint + 1;
+        } else {
+            upper = midpoint;
+        }
+    }
+    let k_peak = lower as f64;
+    let f_peak = log_term(k_peak)?;
     if !f_peak.is_finite() {
         return Err(deviance_row_error(
             row,
@@ -2140,32 +2117,7 @@ fn tweedie_exact_series_loglik_from_eta(
             f_peak,
         ));
     }
-    loop {
-        let f_up = log_term(k_peak + 1.0);
-        if f_up > f_peak {
-            k_peak += 1.0;
-            f_peak = f_up;
-            terms += 1;
-        } else {
-            break;
-        }
-        if terms > MAX_EXACT_TERMS {
-            return Err(work_limit(terms as f64));
-        }
-    }
-    while k_peak > 1.0 {
-        let f_down = log_term(k_peak - 1.0);
-        if f_down > f_peak {
-            k_peak -= 1.0;
-            f_peak = f_down;
-            terms += 1;
-        } else {
-            break;
-        }
-        if terms > MAX_EXACT_TERMS {
-            return Err(work_limit(terms as f64));
-        }
-    }
+    let mut terms = 1_usize;
     let compensated_add = |sum: &mut f64, compensation: &mut f64, term: f64| {
         let next = *sum + term;
         *compensation += if sum.abs() >= term.abs() {
@@ -2182,7 +2134,7 @@ fn tweedie_exact_series_loglik_from_eta(
     // heuristic truncation is needed or permitted.
     let mut k = k_peak - 1.0;
     while k >= 1.0 {
-        let difference = log_term(k) - f_peak;
+        let difference = log_term(k)? - f_peak;
         if difference.is_nan() || difference == f64::INFINITY {
             return Err(deviance_row_error(
                 row,
@@ -2205,7 +2157,7 @@ fn tweedie_exact_series_loglik_from_eta(
     // change the compensated f64 accumulator.
     let mut k = k_peak + 1.0;
     loop {
-        let difference = log_term(k) - f_peak;
+        let difference = log_term(k)? - f_peak;
         if difference == f64::NEG_INFINITY {
             break;
         }
@@ -2223,7 +2175,7 @@ fn tweedie_exact_series_loglik_from_eta(
             return Err(work_limit(terms as f64));
         }
 
-        let next_difference = log_term(k + 1.0) - f_peak;
+        let next_difference = log_term(k + 1.0)? - f_peak;
         if next_difference == f64::NEG_INFINITY {
             break;
         }
@@ -2237,8 +2189,8 @@ fn tweedie_exact_series_loglik_from_eta(
         }
         let log_ratio = next_difference - difference;
         if log_ratio < 0.0 {
-            let ratio = log_ratio.exp();
-            let remaining_bound = next_difference.exp() / (1.0 - ratio);
+            let one_minus_ratio = -log_ratio.exp_m1();
+            let remaining_bound = next_difference.exp() / one_minus_ratio;
             let represented_sum = accumulator + compensation;
             if represented_sum + remaining_bound == represented_sum {
                 break;

@@ -1671,6 +1671,7 @@ fn survival_unified_fit_result(
         penalty_block_trace,
         edf_total,
         smoothing_correction: None,
+        smoothing_correction_method: None,
         penalized_hessian: penalized_hessian.into(),
         working_weights: Array1::zeros(0),
         working_response: Array1::zeros(0),

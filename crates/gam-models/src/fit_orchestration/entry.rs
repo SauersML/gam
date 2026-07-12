@@ -658,6 +658,7 @@ fn constant_gaussian_standard_fit(
         penalty_block_trace,
         edf_total,
         smoothing_correction: None,
+        smoothing_correction_method: None,
         penalized_hessian: penalized_hessian_precision.clone(),
         working_weights: weights.clone(),
         working_response: working_response.clone(),

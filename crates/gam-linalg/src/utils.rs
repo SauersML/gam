@@ -145,7 +145,6 @@ pub fn inf_norm<I: IntoIterator<Item = f64>>(values: I) -> f64 {
     values.into_iter().fold(0.0_f64, |acc, x| acc.max(x.abs()))
 }
 
-const MAX_SOLVE_RETRIES: usize = 8;
 
 /// A posteriori certificate for an unperturbed symmetric linear solve.
 ///
@@ -614,7 +613,7 @@ fn certified_symmetric_matrix_solve(
             });
         }
     }
-    let factor = StableSolver::new(label)
+    let factor = StableSolver::new()
         .factorize(matrix)
         .map_err(|error| CertifiedSymmetricSolveError::Factorization {
             label: label.to_string(),
@@ -703,13 +702,11 @@ impl KahanSum {
     }
 }
 
-pub struct StableSolver<'a> {
-    label: &'a str,
-}
+pub struct StableSolver;
 
-impl<'a> StableSolver<'a> {
-    pub fn new(label: &'a str) -> Self {
-        Self { label }
+impl StableSolver {
+    pub const fn new() -> Self {
+        Self
     }
 
     pub fn factorize(
@@ -734,159 +731,6 @@ impl<'a> StableSolver<'a> {
         factorize_symmetricwith_fallback(view.as_ref(), Side::Lower)
     }
 
-    pub fn solvevectorwithridge_retries(
-        &self,
-        matrix: &Array2<f64>,
-        rhs: &Array1<f64>,
-        baseridge: f64,
-    ) -> Option<Array1<f64>> {
-        let p = matrix.nrows();
-        if matrix.ncols() != p || rhs.len() != p {
-            return None;
-        }
-
-        // Scale the ridge by the matrix's diagonal magnitude so it is
-        // *rank-revealing* rather than absolute. A fixed `baseridge = 1e-10`
-        // is meaningless for a Hessian whose largest diagonal is `O(1e8)`
-        // (relative perturbation `1e-18` — well below f64 round-off) and
-        // simultaneously over-regularises a diagonal of `O(1e-5)`. Anchoring
-        // the ridge to `max_abs_diag(H)` makes the relative regularisation
-        // strength independent of how the family scales its likelihood, so
-        // null directions (eigenvalues < ridge) get treated consistently
-        // across blocks. Without this, the joint-Newton solver returns
-        // proposals with `|prop|∞ ≈ |g|/σ_min(H) = O(1e5–1e12)` because the
-        // absolute `1e-10` ridge cannot reach the smallest eigenvalue of an
-        // O(1e-5)-scale block while the largest block has `σ_max = 1e8`.
-        let diag_scale = max_abs_diag(matrix);
-        for retry in 0..MAX_SOLVE_RETRIES {
-            let ridge = if baseridge > 0.0 {
-                baseridge * diag_scale * 10f64.powi(retry as i32)
-            } else {
-                0.0
-            };
-            let h = addridge(matrix, ridge);
-            let factor = match self.factorize(&h) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            let mut out = rhs.clone();
-            let mut out_mat = crate::faer_ndarray::array1_to_col_matmut(&mut out);
-            factor.solve_in_place(out_mat.as_mut());
-            if out.iter().all(|v| v.is_finite()) {
-                return Some(out);
-            }
-        }
-        None
-    }
-
-    /// Solve `matrix · δ = rhs` with a rank-revealing fallback for the
-    /// case where `matrix` has a near-null subspace aligned with `rhs`.
-    ///
-    /// First attempts the regularised Cholesky path
-    /// (`solvevectorwithridge_retries`). If the produced δ satisfies the
-    /// linear equation well (`‖matrix·δ − rhs‖∞ / (1 + ‖rhs‖∞) < rel_tol`),
-    /// returns it. Otherwise the matrix has a real null subspace and the
-    /// Tikhonov-regularised Newton step leaves a residual of magnitude
-    /// ≈ ‖rhs_null‖ — the joint-Newton convergence test then fails
-    /// (`linearized_rel ≈ 1`) and the seed is rejected.
-    ///
-    /// In that case we fall back to the truncated-eigendecomposition
-    /// pseudoinverse:
-    ///
-    /// ```text
-    /// δ = Σ_k (uₖᵀ rhs / λₖ) · uₖ      for k with |λₖ| > cutoff
-    /// ```
-    ///
-    /// where `(λₖ, uₖ)` are the eigenpairs of `matrix` (assumed symmetric).
-    /// Components in `null(matrix)` (i.e. |λₖ| ≤ cutoff) are *excluded* from
-    /// the sum. This is the unique minimum-norm least-squares solution to
-    /// `matrix · δ ≈ rhs`. For components of `rhs` in `range(matrix)`, δ
-    /// solves the equation exactly; for components in `null(matrix)`, δ has
-    /// zero contribution (no spurious huge step) and the joint-Newton's
-    /// constrained-stationary certificate sees a *correctly small*
-    /// projected residual.
-    ///
-    /// The cutoff is `rank_tol × max(|λ|)`, the standard rank-revealing
-    /// threshold. For p ≲ a few hundred (joint Newton at large scale
-    /// has p = 33) the eigendecomposition is sub-millisecond and saves
-    /// the entire outer optimisation from rejecting ill-conditioned ρ.
-    pub fn solve_with_pseudoinverse_fallback(
-        &self,
-        matrix: &Array2<f64>,
-        rhs: &Array1<f64>,
-        baseridge: f64,
-        rel_tol: f64,
-        rank_tol: f64,
-    ) -> Option<Array1<f64>> {
-        use crate::faer_ndarray::FaerEigh;
-        use faer::Side;
-
-        let p = matrix.nrows();
-        if matrix.ncols() != p || rhs.len() != p {
-            return None;
-        }
-
-        // First try the regularised Cholesky path.
-        let delta = self.solvevectorwithridge_retries(matrix, rhs, baseridge)?;
-
-        // Compute the linear residual ‖matrix·δ − rhs‖∞ / (1 + ‖rhs‖∞)
-        // — the same quantity the joint-Newton convergence test reads off as
-        // `linearized_next_kkt_inf` / (1 + `old_kkt_inf`).
-        let matrix_delta = matrix.dot(&delta);
-        let residual_inf = matrix_delta
-            .iter()
-            .zip(rhs.iter())
-            .map(|(h, r)| (h - r).abs())
-            .fold(0.0_f64, f64::max);
-        let rhs_inf = rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-        let rel = residual_inf / (1.0 + rhs_inf);
-
-        if rel.is_finite() && rel < rel_tol {
-            return Some(delta);
-        }
-
-        // Rank-deficient. Use truncated eigendecomposition pseudoinverse.
-        let (eigvals, eigvecs) = matrix.eigh(Side::Lower).ok()?;
-        let max_abs_eig = eigvals.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-        if !max_abs_eig.is_finite() || max_abs_eig <= 0.0 {
-            return Some(delta);
-        }
-        let cutoff = rank_tol * max_abs_eig;
-
-        let mut pseudo = Array1::<f64>::zeros(p);
-        let mut excluded = 0usize;
-        for k in 0..p {
-            let lam = eigvals[k];
-            if !lam.is_finite() || lam.abs() <= cutoff {
-                excluded += 1;
-                continue;
-            }
-            let u_k = eigvecs.column(k);
-            let proj = u_k.iter().zip(rhs.iter()).map(|(u, r)| u * r).sum::<f64>();
-            let scale = proj / lam;
-            for i in 0..p {
-                pseudo[i] += scale * u_k[i];
-            }
-        }
-
-        if !pseudo.iter().all(|v| v.is_finite()) {
-            return Some(delta);
-        }
-
-        log::debug!(
-            "[{}] pseudoinverse fallback engaged: rel = {:.3e} > rel_tol = {:.3e}, \
-             excluded {} of {} eigenvalues below cutoff = {:.3e} × max |λ| = {:.3e}",
-            self.label,
-            rel,
-            rel_tol,
-            excluded,
-            p,
-            rank_tol,
-            max_abs_eig,
-        );
-
-        Some(pseudo)
-    }
 }
 
 pub fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
@@ -934,20 +778,6 @@ pub fn predict_gam_dimension_mismatch_message(
         ));
     }
     None::<String>
-}
-
-pub fn add_relative_diag_ridge(matrix: &mut Array2<f64>, scale: f64, floor: f64) -> f64 {
-    let ridge = scale
-        * matrix
-            .diag()
-            .iter()
-            .map(|&value| value.abs())
-            .fold(0.0, f64::max)
-            .max(floor);
-    for idx in 0..matrix.nrows() {
-        matrix[[idx, idx]] += ridge;
-    }
-    ridge
 }
 
 pub fn boundary_hit_indices(
@@ -1838,7 +1668,7 @@ mod tests {
         ];
         let rhs = array![1.0, -0.5, 2.0, 0.75];
         let precond = h.diag().to_owned();
-        let factor = super::StableSolver::new("synthetic dense reference")
+        let factor = super::StableSolver::new()
             .factorize(&h)
             .expect("dense SPD reference");
         let mut dense = rhs.clone();

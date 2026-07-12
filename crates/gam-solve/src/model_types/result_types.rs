@@ -8,14 +8,14 @@ use gam_linalg::utils::stack_offsets;
 use gam_problem::{
     GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodScaleMetadata, LikelihoodSpec,
     LogLikelihoodNormalization, MixtureLinkSpec, MixtureLinkState, ResponseFamily, SasLinkSpec,
-    SasLinkState, StandardLink,
+    SasLinkState, StabilizationLedger, StandardLink,
 };
 
 pub use gam_problem::ExecutionPath;
 
 pub fn dispersion_from_likelihood(
     likelihood: &GlmLikelihoodSpec,
-    standard_deviation: f64,
+    profiled_gaussian_standard_deviation: Option<f64>,
 ) -> Result<Dispersion, EstimationError> {
     use gam_problem::ResolvedLikelihoodScale as Scale;
 
@@ -36,8 +36,23 @@ pub fn dispersion_from_likelihood(
         .resolved_scale()
         .map_err(|error| invalid(error.to_string()))?;
 
+    if !matches!(resolved, Scale::ProfiledGaussian)
+        && profiled_gaussian_standard_deviation.is_some()
+    {
+        return Err(invalid(
+            "a profiled Gaussian standard deviation was supplied for a non-profiled likelihood"
+                .to_string(),
+        ));
+    }
+
     match resolved {
         Scale::ProfiledGaussian => {
+            let standard_deviation = profiled_gaussian_standard_deviation.ok_or_else(|| {
+                invalid(
+                    "profiled Gaussian requires an explicit fitted standard deviation"
+                        .to_string(),
+                )
+            })?;
             if !(standard_deviation.is_finite() && standard_deviation >= 0.0) {
                 return Err(invalid(format!(
                     "profiled Gaussian standard deviation must be finite and non-negative, got {standard_deviation}"
@@ -140,6 +155,7 @@ mod per_term_edf_tests {
                 penalty_block_trace: Vec::new(),
                 edf_total: 28.0,
                 smoothing_correction: None,
+                smoothing_correction_method: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(36)),
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
@@ -226,6 +242,7 @@ mod per_term_edf_tests {
                 penalty_block_trace: vec![3.0],
                 edf_total,
                 smoothing_correction: None,
+                smoothing_correction_method: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
@@ -298,6 +315,7 @@ mod per_term_edf_tests {
                 penalty_block_trace: traces,
                 edf_total,
                 smoothing_correction: None,
+                smoothing_correction_method: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
@@ -492,6 +510,7 @@ mod per_term_edf_tests {
                 penalty_block_trace: traces,
                 edf_total: p as f64,
                 smoothing_correction: None,
+                smoothing_correction_method: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
@@ -1063,6 +1082,24 @@ impl std::fmt::Debug for FitArtifacts {
     }
 }
 
+/// Serialized provenance of a retained smoothing-uncertainty correction.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum SmoothingCorrectionMethod {
+    /// First-order IFT propagation on the explicitly identified outer-Hessian
+    /// subspace, with no perturbation of either inner or outer covariance.
+    FirstOrderIdentifiedSubspace {
+        active_rank: usize,
+        rho_dimension: usize,
+    },
+    /// Sigma-point integration is a named approximation. Its explicit rho-
+    /// Hessian perturbation is retained so it cannot be reported as exact WPS.
+    SigmaPointCubature {
+        rank: usize,
+        n_points: usize,
+        rho_hessian_stabilization: StabilizationLedger,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FitInference {
     pub edf_by_block: Vec<f64>,
@@ -1083,6 +1120,9 @@ pub struct FitInference {
     pub penalty_block_trace: Vec<f64>,
     pub edf_total: f64,
     pub smoothing_correction: Option<Array2<f64>>,
+    /// Method that produced `smoothing_correction`. Required whenever a matrix
+    /// is present; `None` means no correction was retained.
+    pub smoothing_correction_method: Option<SmoothingCorrectionMethod>,
     /// Raw penalised Hessian `H = X'W_HX + S(λ)` with NO dispersion scaling.
     /// Stored as [`UnscaledPrecision`] so callers that need the φ-scaled
     /// covariance `Vb` know they must pair this with [`Self::dispersion`].
@@ -2383,7 +2423,13 @@ impl UnifiedFitResult {
             spec: spec.clone(),
             scale: self.likelihood_scale,
         };
-        let resolved = dispersion_from_likelihood(&glm, self.standard_deviation)?;
+        let profiled_standard_deviation = matches!(
+            glm.resolved_scale()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,
+            gam_problem::ResolvedLikelihoodScale::ProfiledGaussian
+        )
+        .then_some(self.standard_deviation);
+        let resolved = dispersion_from_likelihood(&glm, profiled_standard_deviation)?;
         if let Some(cached) = self.dispersion()
             && cached != resolved
         {
@@ -2414,7 +2460,14 @@ impl UnifiedFitResult {
                     spec: spec.clone(),
                     scale: self.likelihood_scale.clone(),
                 };
-                let dispersion = dispersion_from_likelihood(&glm, self.standard_deviation)?;
+                let profiled_standard_deviation = matches!(
+                    glm.resolved_scale()
+                        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,
+                    gam_problem::ResolvedLikelihoodScale::ProfiledGaussian
+                )
+                .then_some(self.standard_deviation);
+                let dispersion =
+                    dispersion_from_likelihood(&glm, profiled_standard_deviation)?;
                 glm.coefficient_covariance_scale(dispersion.phi())
                     .map_err(|error| EstimationError::InvalidInput(error.to_string()))
             }
@@ -2531,6 +2584,12 @@ impl UnifiedFitResult {
         self.inference
             .as_ref()
             .and_then(|inf| inf.smoothing_correction.as_ref())
+    }
+
+    pub fn smoothing_correction_method(&self) -> Option<SmoothingCorrectionMethod> {
+        self.inference
+            .as_ref()
+            .and_then(|inference| inference.smoothing_correction_method)
     }
 
     /// Total effective degrees of freedom.

@@ -734,6 +734,7 @@ pub fn blockwise_fit_from_parts(
             penalty_block_trace: penalty_trace,
             edf_total,
             smoothing_correction: None,
+            smoothing_correction_method: None,
             penalized_hessian: geom.penalized_hessian.clone(),
             working_weights: geom.working_weights.clone(),
             working_response: geom.working_response.clone(),

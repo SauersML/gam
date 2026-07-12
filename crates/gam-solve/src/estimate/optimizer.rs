@@ -677,17 +677,24 @@ where
         reml_state.enable_persistent_warm_start_disk();
     }
     reml_state.setwarm_start_original_beta(warm_start_beta);
-    let estimates_negbin_theta = cfg.likelihood.negbin_theta_is_estimated();
-    if estimates_negbin_theta {
-        let theta_seed = cfg
-            .likelihood
-            .negbin_theta()
-            .filter(|theta| theta.is_finite() && *theta > 0.0)
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "estimated Negative-Binomial theta requires a finite positive seed".to_string(),
-                )
-            })?
+    let resolved_likelihood_scale = cfg
+        .likelihood
+        .resolved_scale()
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+    let estimates_negbin_theta = matches!(
+        resolved_likelihood_scale,
+        gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
+            estimated: true,
+            ..
+        }
+    );
+    if let gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
+        theta,
+        estimated: true,
+    } = resolved_likelihood_scale
+    {
+        let theta_seed = theta
+            .value()
             .clamp(pirls::NEGBIN_THETA_MIN, pirls::NEGBIN_THETA_MAX);
         // Treat the estimated family value as a warm-start coordinate. This
         // makes an exhaustion checkpoint resumable by reconstructing the same
@@ -2125,24 +2132,45 @@ where
     // df computed just above from tr(λ_k · H⁻¹ S_k), and is exactly the residual
     // df mgcv uses. When inference is off, edf_total is unavailable, so the MLE
     // RSS/n is returned instead.
-    let standard_deviation = match &pirls_res.likelihood.spec.response {
-        ResponseFamily::Gaussian => {
+    let resolved_likelihood_scale = pirls_res
+        .likelihood
+        .resolved_scale()
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+    let profiled_gaussian_standard_deviation = match resolved_likelihood_scale {
+        gam_problem::ResolvedLikelihoodScale::ProfiledGaussian => {
             let denom = if opts.compute_inference {
-                (n - edf_total).max(1.0)
+                n - edf_total
             } else {
-                n.max(1.0)
+                n
             };
-            (weighted_rss / denom).sqrt()
+            if !(denom.is_finite() && denom > 0.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "profiled Gaussian residual degrees of freedom must be finite and positive, got {denom:?}"
+                )));
+            }
+            if !(weighted_rss.is_finite() && weighted_rss >= 0.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "profiled Gaussian weighted RSS must be finite and non-negative, got {weighted_rss:?}"
+                )));
+            }
+            let variance = weighted_rss / denom;
+            if !variance.is_finite() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "profiled Gaussian residual variance is not representable: {weighted_rss:?}/{denom:?}"
+                )));
+            }
+            Some(variance.sqrt())
         }
-        ResponseFamily::Gamma => pirls_res.likelihood.gamma_shape().unwrap_or(1.0),
-        ResponseFamily::Binomial
-        | ResponseFamily::Tweedie { .. }
-        | ResponseFamily::NegativeBinomial { .. }
-        | ResponseFamily::Beta { .. }
-        | ResponseFamily::Poisson
-        | ResponseFamily::RoystonParmar => 1.0,
+        _ => None,
     };
-    let dispersion = dispersion_from_likelihood(&pirls_res.likelihood, standard_deviation)?;
+    let dispersion = dispersion_from_likelihood(
+        &pirls_res.likelihood,
+        profiled_gaussian_standard_deviation,
+    )?;
+    // Persist the square root of the resolved response dispersion for every
+    // scalar-scale family. It is never an overloaded Gamma shape or an inert
+    // unit placeholder; family-specific inference consumes the typed metadata.
+    let standard_deviation = dispersion.phi().sqrt();
 
     // Explicit dispersion contract for coefficient covariance matrices:
     // Vb = H⁻¹ · cov_scale, where the stored penalized Hessian is always
@@ -2369,8 +2397,17 @@ where
                 cov_scale,
                 finalgrad_norm,
             )?;
-            rho_covariance = smoothing_outcome.rho_covariance().cloned();
-            smoothing_correction = smoothing_outcome.into_correction();
+            match smoothing_outcome {
+                super::reml::SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "exact smoothing-corrected covariance unavailable: {reason:?}"
+                    )));
+                }
+                outcome => {
+                    rho_covariance = outcome.rho_covariance().cloned();
+                    smoothing_correction = outcome.into_correction();
+                }
+            }
         }
 
         // Tier-0 marginal-smoothing certificate (#938): while the REML objective

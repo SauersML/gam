@@ -149,7 +149,7 @@ fn solve_newton_direction_dense(
         *direction_out = Array1::zeros(gradient.len());
     }
 
-    let factor = StableSolver::new("active-set newton direction")
+    let factor = StableSolver::new()
         .factorize(hessian)
         .map_err(EstimationError::LinearSystemSolveFailed)?;
     direction_out.assign(gradient);

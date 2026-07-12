@@ -69,6 +69,7 @@ pub enum CorrectedEdfUnavailable {
     MissingWeightedGram,
     MissingSmoothingCorrection,
     MissingCovarianceScale,
+    MissingMethodProvenance,
 }
 
 impl CorrectedEdf {
@@ -116,6 +117,7 @@ pub fn corrected_edf(
     smoothing_correction: Option<ArrayView2<'_, f64>>,
     covariance_scale: Option<f64>,
     smoothing_dimension: usize,
+    method_certified_exact: bool,
 ) -> Result<CorrectedEdf, EstimationError> {
     if !edf_conditional.is_finite() || edf_conditional < 0.0 {
         return Err(EstimationError::InvalidInput(format!(
@@ -127,6 +129,13 @@ pub fn corrected_edf(
             conditional: edf_conditional,
             corrected: Some(edf_conditional),
             unavailable_reason: None,
+        });
+    }
+    if !method_certified_exact {
+        return Ok(CorrectedEdf {
+            conditional: edf_conditional,
+            corrected: None,
+            unavailable_reason: Some(CorrectedEdfUnavailable::MissingMethodProvenance),
         });
     }
     let Some(xwx) = weighted_gram else {
@@ -174,10 +183,7 @@ fn wps_correction_term(
     covariance_scale: f64,
 ) -> Result<f64, EstimationError> {
     let k = xwx.nrows();
-    if k == 0 || xwx.ncols() != k
-        || corr.nrows() != k
-        || corr.ncols() != k
-    {
+    if k == 0 || xwx.ncols() != k || corr.nrows() != k || corr.ncols() != k {
         return Err(EstimationError::InvalidInput(format!(
             "WPS correction dimension mismatch: XWX={:?}, correction={:?}",
             xwx.dim(),
@@ -205,10 +211,8 @@ fn wps_correction_term(
             normalized_terms.push((xwx[[i, j]] / max_x) * (corr[[j, i]] / max_c));
         }
     }
-    let mut normalized = gam_solve::pirls::stable_finite_signed_sum(
-        &normalized_terms,
-        "WPS normalized trace",
-    )?;
+    let mut normalized =
+        gam_solve::pirls::stable_finite_signed_sum(&normalized_terms, "WPS normalized trace")?;
     let absolute_sum: f64 = normalized_terms.iter().map(|value| value.abs()).sum();
     let operations = normalized_terms.len() as f64;
     let roundoff = operations * f64::EPSILON * absolute_sum;
@@ -414,10 +418,8 @@ pub fn compare(
                 diff[row] = value;
             }
             let values: Vec<f64> = diff.iter().copied().collect();
-            let delta_elpd = gam_solve::pirls::stable_finite_signed_sum(
-                &values,
-                "paired elpd reduction",
-            )?;
+            let delta_elpd =
+                gam_solve::pirls::stable_finite_signed_sum(&values, "paired elpd reduction")?;
             let mean = delta_elpd / n as f64;
             // Unbiased sample variance (n−1) of the paired differences; the SE
             // of the summed difference is √(n·s²).
@@ -436,8 +438,7 @@ pub fn compare(
                             scaled * scaled
                         })
                         .sum();
-                    let multiplier =
-                        (n as f64 * scaled_sum_squares / (n - 1) as f64).sqrt();
+                    let multiplier = (n as f64 * scaled_sum_squares / (n - 1) as f64).sqrt();
                     let value = max_deviation * multiplier;
                     if !value.is_finite() {
                         return Err(EstimationError::InvalidInput(
@@ -485,9 +486,7 @@ pub fn model_comparison_from_unified(
 ) -> Result<ModelComparison, EstimationError> {
     let phi = fit.dispersion_phi()?;
     let edf_conditional = fit.edf_total().ok_or_else(|| {
-        EstimationError::InvalidInput(
-            "model comparison requires a retained conditional EDF".into(),
-        )
+        EstimationError::InvalidInput("model comparison requires a retained conditional EDF".into())
     })?;
     let covariance_scale = fit
         .likelihood_family
@@ -511,6 +510,7 @@ pub fn model_comparison_from_unified(
         fit.smoothing_correction().map(|c| c.view()),
         covariance_scale,
         fit.log_lambdas.len(),
+        false,
     )?;
 
     // The user-facing `log_likelihood` (and the AIC / elpd derived from it) must

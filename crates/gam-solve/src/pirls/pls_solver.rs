@@ -471,7 +471,7 @@ pub(super) fn solve_penalized_least_squares_implicit(
     // exactly; fall back to the Tikhonov nugget only when the bare factorization
     // actually fails. The augmented RHS `r + δμ` keeps the fallback a Tikhonov
     // regularization centered at the prior-mean target.
-    let bare_factor = StableSolver::new("pirls implicit pls")
+    let bare_factor = StableSolver::new()
         .factorize(&penalized_hessian)
         .ok();
     let (factor, ridge_used) = if let Some(factor) = bare_factor {
@@ -484,7 +484,7 @@ pub(super) fn solve_penalized_least_squares_implicit(
                 regularizedhessian[[i, i]] += nugget;
             }
         }
-        let factor = StableSolver::new("pirls implicit pls")
+        let factor = StableSolver::new()
             .factorize(&regularizedhessian)
             .map_err(EstimationError::LinearSystemSolveFailed)?;
         (factor, nugget)

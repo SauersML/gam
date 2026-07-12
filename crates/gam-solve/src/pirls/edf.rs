@@ -208,7 +208,7 @@ pub(super) fn calculate_edfwithworkspace(
         }
     }
 
-    let factor = StableSolver::new("pirls edf workspace")
+    let factor = StableSolver::new()
         .factorize(penalized_hessian)
         .map_err(|_| EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
@@ -307,7 +307,7 @@ pub(super) fn calculate_edfwithworkspace_from_diagonal_penalty(
         workspace.final_aug_matrix[[idx, col]] = 1.0;
     }
 
-    let factor = StableSolver::new("pirls diagonal edf workspace")
+    let factor = StableSolver::new()
         .factorize(penalized_hessian)
         .map_err(|_| EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,

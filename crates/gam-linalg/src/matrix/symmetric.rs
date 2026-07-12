@@ -82,7 +82,7 @@ impl SymmetricMatrix {
     pub fn factorize(&self) -> Result<Box<dyn FactorizedSystem>, String> {
         match self {
             Self::Dense(mat) => {
-                let factor = crate::utils::StableSolver::new("unnamed")
+                let factor = crate::utils::StableSolver::new()
                     .factorize(mat)
                     .map_err(|e| format!("Dense SymmetricMatrix factorization failed: {e:?}"))?;
                 Ok(Box::new(factor))

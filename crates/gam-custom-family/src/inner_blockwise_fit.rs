@@ -6805,7 +6805,7 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
                 }
             }
         } else {
-            let solver = gam_linalg::utils::StableSolver::new("joint polish");
+            let solver = gam_linalg::utils::StableSolver::new();
             let factor = match solver.factorize(&h_dense) {
                 Ok(factor) => factor,
                 Err(_) => break,

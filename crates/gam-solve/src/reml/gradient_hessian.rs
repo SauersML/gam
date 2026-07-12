@@ -6965,6 +6965,10 @@ impl<'a> RemlState<'a> {
 
         let (pirls_result, _) = pirls_result?; // Propagate error if it occurred
         let pirls_result = Arc::new(pirls_result);
+        let resolved_likelihood_scale = pirls_result
+            .likelihood
+            .resolved_scale()
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
         // Capture the data-driven NB θ from the first converged non-screening
         // λ-search solve and freeze it for the rest of the search (#1082). The
         // first solve still estimated θ from the seed η (this branch only runs
@@ -6974,16 +6978,22 @@ impl<'a> RemlState<'a> {
         // solves use a tiny inner budget and a partial mode, so they are never
         // the source of the frozen value.
         if !in_screening
-            && pirls_result.likelihood.negbin_theta_is_estimated()
+            && matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
+                    estimated: true,
+                    ..
+                }
+            )
             && self.frozen_negbin_theta.load(Ordering::Relaxed) == 0
             && matches!(
                 pirls_result.status,
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
             )
-            && let Some(theta) = pirls_result.likelihood.negbin_theta()
-            && theta.is_finite()
-            && theta > 0.0
         {
+            let theta = resolved_likelihood_scale
+                .negative_binomial_theta()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
             self.frozen_negbin_theta
                 .store(theta.to_bits(), Ordering::Relaxed);
             log::info!(
@@ -6999,16 +7009,22 @@ impl<'a> RemlState<'a> {
         // would have used — we simply stop letting it drift (and reward dispersion
         // inflation) on subsequent outer evaluations.
         if !in_screening
-            && pirls_result.likelihood.tweedie_phi_is_estimated()
+            && matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Tweedie {
+                    estimated: true,
+                    ..
+                }
+            )
             && self.frozen_tweedie_phi.load(Ordering::Relaxed) == 0
             && matches!(
                 pirls_result.status,
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
             )
-            && let Some(phi) = pirls_result.likelihood.fixed_phi()
-            && phi.is_finite()
-            && phi > 0.0
         {
+            let phi = resolved_likelihood_scale
+                .tweedie_phi()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
             self.frozen_tweedie_phi
                 .store(phi.to_bits(), Ordering::Relaxed);
             log::info!(
@@ -7026,16 +7042,22 @@ impl<'a> RemlState<'a> {
         // the curvature `H = k·XᵀX + λS` and the data-fit `k·½D` jump with ρ and
         // rails λ to the over-smoothed corner) on subsequent outer evaluations.
         if !in_screening
-            && pirls_result.likelihood.scale.gamma_shape_is_estimated()
+            && matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Gamma {
+                    estimated: true,
+                    ..
+                }
+            )
             && self.frozen_gamma_shape.load(Ordering::Relaxed) == 0
             && matches!(
                 pirls_result.status,
                 pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum
             )
-            && let Some(shape) = pirls_result.likelihood.gamma_shape()
-            && shape.is_finite()
-            && shape > 0.0
         {
+            let shape = resolved_likelihood_scale
+                .gamma_shape()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
             self.frozen_gamma_shape
                 .store(shape.to_bits(), Ordering::Relaxed);
             log::info!(
