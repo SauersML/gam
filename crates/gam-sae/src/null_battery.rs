@@ -88,9 +88,9 @@ pub fn empirical_p_value(
 /// architecturally undetectable by the MP-thresholded race, independent of
 /// whatever the adjudicator's verdict says.
 pub fn mp_detection_floor(n_eff: f64, p: f64, r_floor: f64) -> Result<f64, String> {
-    if !(n_eff > 0.0) {
+    if !n_eff.is_finite() || n_eff <= 0.0 {
         return Err(format!(
-            "mp_detection_floor: n_eff must be positive; got {n_eff}"
+            "mp_detection_floor: n_eff must be finite and positive; got {n_eff}"
         ));
     }
     if !p.is_finite() || p < 0.0 {
@@ -103,7 +103,19 @@ pub fn mp_detection_floor(n_eff: f64, p: f64, r_floor: f64) -> Result<f64, Strin
             "mp_detection_floor: r_floor must be finite and non-negative; got {r_floor}"
         ));
     }
-    Ok(r_floor * (1.0 + (p / n_eff).sqrt()).powi(2))
+    // Zero residual dispersion has an exactly zero edge. Handle it before the
+    // aspect ratio so valid zero-noise inputs cannot manufacture `0 * inf =
+    // NaN` when `p / n_eff` exceeds the representable range.
+    if r_floor == 0.0 {
+        return Ok(0.0);
+    }
+    let edge = r_floor * (1.0 + (p / n_eff).sqrt()).powi(2);
+    if !edge.is_finite() {
+        return Err(format!(
+            "mp_detection_floor: edge overflowed for n_eff={n_eff}, p={p}, r_floor={r_floor}"
+        ));
+    }
+    Ok(edge)
 }
 
 /// One member of the standing null battery.
@@ -1895,10 +1907,16 @@ mod tests {
     fn mp_detection_floor_rejects_invalid_inputs() {
         assert!(mp_detection_floor(0.0, 10.0, 1.0).is_err());
         assert!(mp_detection_floor(-1.0, 10.0, 1.0).is_err());
+        assert!(mp_detection_floor(f64::INFINITY, 10.0, 1.0).is_err());
         assert!(mp_detection_floor(50.0, -1.0, 1.0).is_err());
         assert!(mp_detection_floor(50.0, 10.0, -1.0).is_err());
         assert!(mp_detection_floor(50.0, f64::NAN, 1.0).is_err());
         assert!(mp_detection_floor(50.0, 10.0, f64::INFINITY).is_err());
+        assert!(mp_detection_floor(f64::MIN_POSITIVE, f64::MAX, 1.0).is_err());
+        assert_eq!(
+            mp_detection_floor(f64::MIN_POSITIVE, f64::MAX, 0.0).unwrap(),
+            0.0
+        );
     }
 
     #[test]
