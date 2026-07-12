@@ -3531,6 +3531,90 @@ fn analytic_outer_gradient_with_bundle_matches_dense_assembly() {
     );
 }
 
+/// #2080(A) clobber-armor: the single adjoint solve that collapses the
+/// per-coordinate IFT correction `−½·⟨Γ, A⁺ g_ρ_l⟩` into `−½·⟨A⁺Γ, g_ρ_l⟩`
+/// (`analytic_outer_rho_gradient_components_with_bundle`, dropping the outer IFT
+/// cost from `O(P_ρ)` solves to one) is valid iff the exact-stationarity operator
+/// `A⁺` is SELF-ADJOINT. Pin exactly that: on the converged fixture,
+/// `⟨A⁺u, v⟩ == ⟨u, A⁺v⟩` for two production IFT right-hand sides. A future
+/// rewrite that breaks `A`'s symmetry or the deflation's `B`-orthogonality (the
+/// only ways the collapse could silently diverge from the per-coordinate form)
+/// turns this red.
+#[test]
+fn solve_exact_stationarity_is_self_adjoint_2080() {
+    let n = 24usize;
+    let p = 2usize;
+    let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.25) / n as f64);
+    let (phi, jet) = periodic_basis(&coords);
+    let decoder = array![[0.30, -0.10], [1.20, 0.20], [0.10, 1.10]];
+    assert_eq!(decoder.ncols(), p);
+    let mut target = phi.dot(&decoder);
+    for row in 0..n {
+        target[[row, 0]] += 1.0e-3 * (0.37 * row as f64).sin();
+        target[[row, 1]] += 1.0e-3 * (0.29 * row as f64).cos();
+    }
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
+        "periodic",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        decoder,
+        Array2::<f64>::eye(3),
+    )
+    .unwrap()
+    .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, 1)),
+        vec![coords],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+    let rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![250.0_f64.ln()]]);
+    let sys = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .unwrap();
+    let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+    let (_delta_t, _delta_beta, cache) =
+        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
+    let solver = DeflatedArrowSolver::plain(&cache);
+
+    let n_params = rho.to_flat().len();
+    assert!(n_params >= 2, "fixture must expose ≥2 outer coordinates");
+    // Two production IFT right-hand sides (the sparse coordinate and the smooth
+    // coordinate), so the test exercises A⁺ on genuine, distinct arrow vectors.
+    let u = term
+        .outer_rho_gradient_ift_rhs(&rho, 0, &cache)
+        .unwrap();
+    let v = term
+        .outer_rho_gradient_ift_rhs(&rho, n_params - 1, &cache)
+        .unwrap();
+    let a_u = term
+        .solve_exact_stationarity(&rho, target.view(), &cache, &solver, &u)
+        .unwrap();
+    let a_v = term
+        .solve_exact_stationarity(&rho, target.view(), &cache, &solver, &v)
+        .unwrap();
+    // ⟨A⁺u, v⟩ vs ⟨u, A⁺v⟩ (pub arrow-vector fields; no type import needed).
+    let lhs = a_u.t.iter().zip(v.t.iter()).map(|(a, b)| a * b).sum::<f64>()
+        + a_u.beta.iter().zip(v.beta.iter()).map(|(a, b)| a * b).sum::<f64>();
+    let rhs = u.t.iter().zip(a_v.t.iter()).map(|(a, b)| a * b).sum::<f64>()
+        + u.beta.iter().zip(a_v.beta.iter()).map(|(a, b)| a * b).sum::<f64>();
+    let scale = lhs.abs().max(rhs.abs()).max(1.0);
+    assert!(
+        (lhs - rhs).abs() <= 1.0e-6 * scale,
+        "solve_exact_stationarity must be self-adjoint (the #2080(A) single-adjoint \
+         IFT identity): ⟨A⁺u,v⟩={lhs} vs ⟨u,A⁺v⟩={rhs}"
+    );
+    // Non-vacuity: the cross term must be a genuine, resolvable, finite contribution.
+    assert!(
+        scale > 1.0 && lhs.is_finite() && rhs.is_finite(),
+        "self-adjoint pin must be non-trivial and finite: lhs={lhs} rhs={rhs}"
+    );
+}
+
 #[test]
 pub(crate) fn latent_block_inverse_diagonal_hutchinson_matches_exact_trace() {
     // The matrix-free Hutchinson estimator of `diag((H⁻¹)_tt)` (the #1777 fold

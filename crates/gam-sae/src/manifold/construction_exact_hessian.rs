@@ -1084,6 +1084,27 @@ impl SaeManifoldTerm {
         // contraction below then completes the block gradient with the same
         // `−½·Γᵀθ̂_ρ` channel every other coordinate carries; the explicit data
         // + Jacobian parts stay with the eval lane's `block_log_lambda_gradient`.
+        // #2080(A): collapse the per-coordinate IFT solves into ONE adjoint solve.
+        // The implicit correction is `−½·⟨Γ, A⁺ g_ρ_l⟩` for every outer coordinate
+        // `l`. The exact θθ-Hessian `A = ∇²_θθ L` is symmetric and its near-null
+        // deflation is a symmetric `B`-orthogonal projection, so `A⁺` is
+        // self-adjoint and `⟨Γ, A⁺ g_ρ_l⟩ = ⟨A⁺Γ, g_ρ_l⟩ = ⟨a, g_ρ_l⟩` with the
+        // adjoint `a = A⁺Γ` solved ONCE. A near-null pencil direction contributes
+        // `g_i r_i / μ_i` only when BOTH Γ and `g_ρ_l` excite it, in which case the
+        // forward (per-coordinate) and this adjoint solve deflate it identically —
+        // so the collapse is EXACT, not an approximation, while dropping the outer
+        // IFT cost from `O(P_ρ)` solves to one. `solve_exact_stationarity_is_self_adjoint_2080`
+        // pins the self-adjointness this identity rests on.
+        let adjoint = self
+            .solve_exact_stationarity(rho, target, cache, solver, &gamma)
+            .map_err(|err| {
+                OuterGradientError::classify_arrow_solver_error(
+                    &err,
+                    OuterGradientError::NonIdentifiable {
+                        reason: err.clone(),
+                    },
+                )
+            })?;
         let block_tail_start = n_params - rho.log_lambda_block.len();
         for coord in 0..n_params {
             let rhs = if coord >= block_tail_start && !rho.log_lambda_block.is_empty() {
@@ -1103,22 +1124,12 @@ impl SaeManifoldTerm {
                 self.outer_rho_gradient_ift_rhs(rho, coord, cache)
                     .map_err(OuterGradientError::internal)?
             };
-            let solved = self
-                .solve_exact_stationarity(rho, target, cache, solver, &rhs)
-                .map_err(|err| {
-                    OuterGradientError::classify_arrow_solver_error(
-                        &err,
-                        OuterGradientError::NonIdentifiable {
-                            reason: err.clone(),
-                        },
-                    )
-                })?;
             let mut dot = 0.0_f64;
-            for idx in 0..gamma.t.len() {
-                dot += gamma.t[idx] * solved.t[idx];
+            for idx in 0..adjoint.t.len() {
+                dot += adjoint.t[idx] * rhs.t[idx];
             }
-            for idx in 0..gamma.beta.len() {
-                dot += gamma.beta[idx] * solved.beta[idx];
+            for idx in 0..adjoint.beta.len() {
+                dot += adjoint.beta[idx] * rhs.beta[idx];
             }
             third_order_correction[coord] = -0.5 * dot;
         }
