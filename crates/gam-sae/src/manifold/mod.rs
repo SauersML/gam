@@ -406,6 +406,8 @@ mod lambda_smooth_1556_tests;
 mod tests_behavior_isometry_2015;
 #[cfg(test)]
 mod tests_behavior_twoblock_rung2;
+#[cfg(test)]
+mod tests_behavior_column_equilibration_2015;
 
 #[cfg(test)]
 mod tests_crosscoder_multiblock;
