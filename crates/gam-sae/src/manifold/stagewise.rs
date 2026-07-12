@@ -2071,8 +2071,6 @@ pub fn fit_stagewise_batched(
     sample_weights: Option<&[f64]>,
     config: &BatchedStagewiseConfig,
 ) -> Result<BatchedStagewiseResult, String> {
-    use rayon::prelude::*;
-
     let n = target.nrows();
     if seed.k_atoms() != 1 {
         return Err(format!(
