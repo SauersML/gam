@@ -17,7 +17,8 @@ mod tests {
         WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance,
         calculate_deviance_from_eta, calculate_loglikelihood,
         calculate_loglikelihood_omitting_constants, compute_constraint_kkt_diagnostics,
-        compute_observed_hessian_curvature_arrays, deviance_eta_row, fit_model_for_fixed_rho,
+        compute_observed_hessian_curvature_arrays, deviance_eta_row,
+        deviance_eta_rows_with_log_measure_scale, fit_model_for_fixed_rho,
         observed_weight_dispatch, observed_weight_noncanonical, select_active_set_release,
         should_log_pirls_decision_summary, should_use_sparse_native_pirls,
         solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
@@ -1891,6 +1892,18 @@ mod tests {
             .expect("finite far-left NB row");
         assert_relative_eq!(nb.half_deviance, 1.0e308, max_relative = 2.0e-15);
         assert_eq!(nb.eta_score, -1.0);
+        let (nb_positive_tail, log) = canonical(
+            ResponseFamily::NegativeBinomial {
+                theta: 3.0,
+                theta_fixed: true,
+            },
+            StandardLink::Log,
+        );
+        let nb_positive =
+            deviance_eta_row(0, 2.0, 1.0e308, &nb_positive_tail, &log, 0.25)
+                .expect("finite far-right NB score/value");
+        assert_relative_eq!(nb_positive.eta_score, 0.75, max_relative = 2.0e-15);
+        assert!(nb_positive.half_deviance.is_finite());
 
         let (binomial, logit) = canonical(ResponseFamily::Binomial, StandardLink::Logit);
         let binomial_tail = deviance_eta_row(0, 0.5, -1.0e308, &binomial, &logit, 1.0)
@@ -1940,6 +1953,28 @@ mod tests {
         .expect("zero-weight row has exactly zero statistical measure");
         assert_eq!(ignored.half_deviance, 0.0);
         assert_eq!(ignored.eta_score, 0.0);
+
+        let eta = array![-1000.0];
+        let y = array![0.0];
+        let weights = array![1.0];
+        assert_eq!(
+            deviance_eta_row(0, 0.0, eta[0], &poisson, &log, 1.0)
+                .expect("raw underflowed Poisson row")
+                .half_deviance,
+            0.0
+        );
+        let phi = f64::from_bits(1);
+        let scaled = deviance_eta_rows_with_log_measure_scale(
+            y.view(),
+            &eta,
+            &poisson,
+            &log,
+            weights.view(),
+            -phi.ln(),
+        )
+        .expect("scale is folded in before materializing the row");
+        assert!(scaled[0].half_deviance.is_finite() && scaled[0].half_deviance > 0.0);
+        assert!(scaled[0].eta_score.is_finite() && scaled[0].eta_score > 0.0);
     }
 
     #[test]

@@ -417,17 +417,10 @@ impl SaeManifoldTerm {
         };
         let beta_edf = (raw_decoder_dof - smooth_edf).max(0.0);
         // Exact ARD-shrunk latent-coordinate edf, reusing the EFS trace cache.
+        let ard_precisions = self.validated_ard_precisions(rho)?;
         let traces = self
             .ard_inverse_traces(cache)
             .map_err(|e| format!("reconstruction_dispersion: ARD traces: {e}"))?;
-        let ard_precisions = rho.ard_precisions()?;
-        if rho.log_ard.len() != self.atoms.len() {
-            return Err(format!(
-                "reconstruction_dispersion: ρ has {} ARD atoms but term has {}",
-                rho.log_ard.len(),
-                self.atoms.len()
-            ));
-        }
         let mut coord_edf = 0.0_f64;
         for (k, atom) in self.atoms.iter().enumerate() {
             let d_k = atom.latent_dim;
@@ -439,12 +432,6 @@ impl SaeManifoldTerm {
                 ));
             }
             let ard_len = rho.log_ard[k].len();
-            if ard_len != 0 && ard_len != d_k {
-                return Err(format!(
-                    "reconstruction_dispersion: ARD shape mismatch at atom {k} \
-                     (log_ard={ard_len}, d_k={d_k})"
-                ));
-            }
             // Scalar count matched to the trace support (see fn doc).
             let n_active_k = match self.last_row_layout {
                 Some(ref layout) => layout

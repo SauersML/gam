@@ -1081,8 +1081,8 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitReport
     term.assignment
         .validate_rho_domain(&rho)
         .map_err(SaeFitError::Fit)?;
-    let ard_variances: Vec<Option<Array1<f64>>> = rho
-        .ard_precisions()
+    let ard_variances: Vec<Option<Array1<f64>>> = term
+        .validated_ard_precisions(&rho)
         .map_err(SaeFitError::Fit)?
         .iter()
         .map(|precision| {
@@ -1424,8 +1424,8 @@ pub fn run_sae_manifold_certify(request: SaeCertifyRequest) -> Result<SaeFitRepo
     term.assignment
         .validate_rho_domain(&rho)
         .map_err(SaeFitError::Fit)?;
-    let ard_variances: Vec<Option<Array1<f64>>> = rho
-        .ard_precisions()
+    let ard_variances: Vec<Option<Array1<f64>>> = term
+        .validated_ard_precisions(&rho)
         .map_err(SaeFitError::Fit)?
         .iter()
         .map(|precision| {

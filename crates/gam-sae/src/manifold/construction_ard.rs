@@ -1,10 +1,37 @@
 //! ARD (automatic relevance determination) coordinate-precision + latent-block
-//! helpers for `SaeManifoldTerm`, moved verbatim out of construction.rs to keep it
-//! under the 10k-line ban gate. Pure code move, no logic change.
+//! helpers for `SaeManifoldTerm`, split out of `construction.rs` to keep that
+//! file under the 10k-line ban gate.
 use super::*;
 use gam_math::special::bessel_i0_centered_terms_from_log_abs;
 
 impl SaeManifoldTerm {
+    /// Validate the ARD table against this term's atom geometry and materialize
+    /// each physical precision exactly once. This is the structural choke point
+    /// shared by assembly, value, traces, exact-Hessian, and IFT channels.
+    pub(crate) fn validated_ard_precisions(
+        &self,
+        rho: &SaeManifoldRho,
+    ) -> Result<Vec<Array1<f64>>, String> {
+        if rho.log_ard.len() != self.k_atoms() {
+            return Err(format!(
+                "ARD rho has {} atom blocks but term has {} atoms",
+                rho.log_ard.len(),
+                self.k_atoms()
+            ));
+        }
+        for (atom, coordinate) in self.assignment.coords.iter().enumerate() {
+            let stored = rho.log_ard[atom].len();
+            let dimension = coordinate.latent_dim();
+            if stored != 0 && stored != dimension {
+                return Err(format!(
+                    "ARD rho atom {atom} has {stored} axes; expected 0 (disabled) or \
+                     latent dimension {dimension}"
+                ));
+            }
+        }
+        rho.ard_precisions()
+    }
+
     /// Per-atom, per-axis coordinate sum-of-squares `‖t_kj‖² = Σ_i t_{i,k,j}²`.
     ///
     /// This is the data-fit sufficient statistic for the ARD precision update
@@ -316,7 +343,7 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
     ) -> Result<f64, String> {
         self.assignment.validate_rho_domain(rho)?;
-        let ard_precisions = rho.ard_precisions()?;
+        let ard_precisions = self.validated_ard_precisions(rho)?;
         let n = self.n_obs();
         let p = self.output_dim();
         if residual.dim() != (n, p) {
@@ -701,14 +728,7 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
     ) -> Result<Vec<Array1<f64>>, String> {
         self.assignment.validate_rho_domain(rho)?;
-        if rho.log_ard.len() != self.k_atoms() {
-            return Err(format!(
-                "ARD rho has {} atoms but term has {}",
-                rho.log_ard.len(),
-                self.k_atoms()
-            ));
-        }
-        let ard_precisions = rho.ard_precisions()?;
+        let ard_precisions = self.validated_ard_precisions(rho)?;
         let n = self.n_obs() as f64;
         // HT row weighting: this is the ρ-derivative of `ard_value` (the `explicit`
         // outer-gradient channel), so it carries the identical per-row inclusion
@@ -724,12 +744,6 @@ impl SaeManifoldTerm {
             if rho.log_ard[atom_idx].is_empty() {
                 out.push(atom_out);
                 continue;
-            }
-            if rho.log_ard[atom_idx].len() != d {
-                return Err(format!(
-                    "ARD rho atom {atom_idx} has len {} but atom dim is {d}",
-                    rho.log_ard[atom_idx].len()
-                ));
             }
             let periods = coord.effective_axis_periods();
             for axis in 0..d {
@@ -770,8 +784,8 @@ impl SaeManifoldTerm {
         self.assignment
             .validate_rho_domain(rho)
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
-        let ard_precisions = rho
-            .ard_precisions()
+        let ard_precisions = self
+            .validated_ard_precisions(rho)
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         // RAW selected-inverse diagonal: the per-axis diagonal contraction uses
         // the DEFLATED inverse; the full kept-subspace + rotation deflation
@@ -922,8 +936,8 @@ impl SaeManifoldTerm {
         self.assignment
             .validate_rho_domain(rho)
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
-        let ard_precisions = rho
-            .ard_precisions()
+        let ard_precisions = self
+            .validated_ard_precisions(rho)
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let row_weights = self.row_loss_weights.as_deref();
         let coord_offsets = self.assignment.coord_offsets();
@@ -1065,8 +1079,8 @@ impl SaeManifoldTerm {
         self.assignment
             .validate_rho_domain(rho)
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
-        let ard_precisions = rho
-            .ard_precisions()
+        let ard_precisions = self
+            .validated_ard_precisions(rho)
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let m = probes.len();
         if m == 0 || sinv_probes.len() != m {

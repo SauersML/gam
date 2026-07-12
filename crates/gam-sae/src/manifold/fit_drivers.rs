@@ -959,42 +959,39 @@ impl SaeManifoldTerm {
         // exact exponential map as the fit's `ArdAxisPrior`; an atom with no
         // fitted coordinate prior (`rho.log_ard[k]` empty) is left `None`
         // (prior-free encode, unchanged). A degenerate/non-finite spread on either
-        // side leaves that axis' `α` untransformed. Guarded on the rho/atom-count
-        // invariant so a malformed rho leaves the priors untouched rather than
-        // panicking during finalization.
-        let ard_precisions = rho.ard_precisions()?;
-        if rho.log_ard.len() == self.k_atoms() {
-            for atom_idx in 0..self.k_atoms() {
-                let log_ard = &rho.log_ard[atom_idx];
-                self.atoms[atom_idx].ard_precisions = if log_ard.is_empty() {
-                    None
-                } else {
-                    let coords = self.assignment.coords[atom_idx].as_matrix();
-                    let periods = self.assignment.coords[atom_idx].effective_axis_periods();
-                    let pre = &ard_pre_spread[atom_idx];
-                    let stamped: Array1<f64> = (0..log_ard.len())
-                        .map(|axis| {
-                            let alpha = ard_precisions[atom_idx][axis];
-                            let sp_pre = pre.get(axis).copied().unwrap_or(f64::NAN);
-                            let sp_post = axis_coordinate_spread(
-                                coords.view(),
-                                axis,
-                                periods.get(axis).copied().flatten(),
-                            );
-                            if sp_pre.is_finite()
-                                && sp_post.is_finite()
-                                && sp_pre > ARD_SPREAD_FLOOR
-                                && sp_post > ARD_SPREAD_FLOOR
-                            {
-                                alpha * sp_pre / sp_post
-                            } else {
-                                alpha
-                            }
-                        })
-                        .collect();
-                    Some(stamped)
-                };
-            }
+        // side leaves that axis' `α` untransformed. A malformed rho is rejected
+        // by the structural precision-table certificate before finalization.
+        let ard_precisions = self.validated_ard_precisions(rho)?;
+        for atom_idx in 0..self.k_atoms() {
+            let log_ard = &rho.log_ard[atom_idx];
+            self.atoms[atom_idx].ard_precisions = if log_ard.is_empty() {
+                None
+            } else {
+                let coords = self.assignment.coords[atom_idx].as_matrix();
+                let periods = self.assignment.coords[atom_idx].effective_axis_periods();
+                let pre = &ard_pre_spread[atom_idx];
+                let stamped: Array1<f64> = (0..log_ard.len())
+                    .map(|axis| {
+                        let alpha = ard_precisions[atom_idx][axis];
+                        let sp_pre = pre.get(axis).copied().unwrap_or(f64::NAN);
+                        let sp_post = axis_coordinate_spread(
+                            coords.view(),
+                            axis,
+                            periods.get(axis).copied().flatten(),
+                        );
+                        if sp_pre.is_finite()
+                            && sp_post.is_finite()
+                            && sp_pre > ARD_SPREAD_FLOOR
+                            && sp_post > ARD_SPREAD_FLOOR
+                        {
+                            alpha * sp_pre / sp_post
+                        } else {
+                            alpha
+                        }
+                    })
+                    .collect();
+                Some(stamped)
+            };
         }
 
         Ok(())

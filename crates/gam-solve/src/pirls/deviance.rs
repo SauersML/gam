@@ -650,18 +650,41 @@ fn deviance_eta_row_with_log_measure_scale(
                     log_weight + log_total + kl.ln(),
                 )?
             };
-            let log_denominator = logaddexp(log_theta, eta);
-            let (score_sign, log_mu_minus_y) = if y == 0.0 {
-                (1.0, eta)
+            let log_y = if y == 0.0 {
+                f64::NEG_INFINITY
             } else {
-                signed_log_exp_difference(eta, y.ln())
+                y.ln()
+            };
+            let score_sign = if eta >= log_y { 1.0 } else { -1.0 };
+            let score_log_abs = if eta >= log_theta {
+                // Factor mu from both |mu-y| and theta+mu. This retains
+                // log(w*theta) when eta is O(MAX), instead of subtracting two
+                // rounded copies of eta and silently returning unit scale.
+                let log_difference_over_mu = if y == 0.0 {
+                    0.0
+                } else if eta >= log_y {
+                    log_abs_one_minus_exp(log_y - eta)
+                } else {
+                    (log_y - eta) + log_abs_one_minus_exp(eta - log_y)
+                };
+                log_weight + log_theta + log_difference_over_mu
+                    - (log_theta - eta).exp().ln_1p()
+            } else {
+                // Factor theta from the denominator; its numerator factor then
+                // cancels exactly before any floating-point subtraction.
+                let (_, log_mu_minus_y) = if y == 0.0 {
+                    (1.0, eta)
+                } else {
+                    signed_log_exp_difference(eta, log_y)
+                };
+                log_weight + log_mu_minus_y - (eta - log_theta).exp().ln_1p()
             };
             let score = finite_signed_from_log(
                 row,
                 "negative-binomial eta score",
                 eta,
                 score_sign,
-                log_weight + log_theta + log_mu_minus_y - log_denominator,
+                score_log_abs,
             )?;
             (half, score)
         }

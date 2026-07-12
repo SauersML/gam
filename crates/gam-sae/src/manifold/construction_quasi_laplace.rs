@@ -3804,7 +3804,7 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
     ) -> Result<SaeArrowVector, String> {
         self.assignment.validate_rho_domain(rho)?;
-        let ard_precisions = rho.ard_precisions()?;
+        let ard_precisions = self.validated_ard_precisions(rho)?;
         let threshold_strength = match self.assignment.mode {
             AssignmentMode::ThresholdGate { .. } => rho.lambda_sparse()?,
             _ => 0.0,
@@ -4131,7 +4131,7 @@ impl SaeManifoldTerm {
         joint_block: bool,
     ) -> Result<SaeArrowVector, String> {
         self.assignment.validate_rho_domain(rho)?;
-        let ard_precisions = rho.ard_precisions()?;
+        let ard_precisions = self.validated_ard_precisions(rho)?;
         let threshold_strength = match self.assignment.mode {
             AssignmentMode::ThresholdGate { .. } => rho.lambda_sparse()?,
             _ => 0.0,
@@ -4570,7 +4570,7 @@ impl SaeManifoldTerm {
         sinv_probes: &[Array1<f64>],
     ) -> Result<SaeArrowVector, String> {
         self.assignment.validate_rho_domain(rho)?;
-        let ard_precisions = rho.ard_precisions()?;
+        let ard_precisions = self.validated_ard_precisions(rho)?;
         if cache.arrow_log_det().is_none() {
             return Err(
                 "logdet_theta_adjoint_from_probes: cache lacks an authoritative joint-Hessian \

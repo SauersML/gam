@@ -1613,8 +1613,10 @@ pub(crate) struct Gam784BlockTarget<'t> {
     pub(crate) penalty_scores: Arc<Vec<Array1<f64>>>,
     /// `λ_k = e^{ρ_k}` per canonical penalty, aligned with `penalty_scores`.
     pub(crate) lambdas: Vec<f64>,
-    /// Deviance at the base mode.
-    pub(crate) base_deviance: f64,
+    /// Certified `D(eta_hat)/(2 phi)` on the exact row surface.
+    pub(crate) base_scaled_half_deviance: f64,
+    /// Its per-row eta gradient, cached once for the sampler moment channels.
+    pub(crate) base_neg_score_at_mode: Array1<f64>,
 }
 
 impl Gam784BlockTarget<'_> {
@@ -1641,24 +1643,24 @@ impl Gam784BlockTarget<'_> {
                 self.phi
             )));
         }
-        let rows = crate::pirls::deviance_eta_rows(
+        let rows = crate::pirls::deviance_eta_rows_with_log_measure_scale(
             self.y.view(),
             eta,
             &self.likelihood,
             &self.inverse_link,
             self.prior_weights.view(),
+            -self.phi.ln(),
         )?;
         let half_deviance =
             gam_linalg::pairwise_reduce::par_pairwise_sum(rows.len(), |i| rows[i].half_deviance);
-        let scaled_half_deviance = half_deviance / self.phi;
-        if !scaled_half_deviance.is_finite() {
+        if !half_deviance.is_finite() {
             return Err(EstimationError::InvalidInput(format!(
-                "#784 scaled half-deviance is not representable: {scaled_half_deviance}"
+                "#784 scaled half-deviance is not representable: {half_deviance}"
             )));
         }
         let mut score = Array1::<f64>::zeros(rows.len());
         for (i, row) in rows.into_iter().enumerate() {
-            let value = row.eta_score / self.phi;
+            let value = row.eta_score;
             if !value.is_finite() {
                 return Err(EstimationError::PirlsRowGeometryUnrepresentable {
                     row: i,
@@ -1669,7 +1671,7 @@ impl Gam784BlockTarget<'_> {
             }
             score[i] = value;
         }
-        Ok((scaled_half_deviance, score))
+        Ok((half_deviance, score))
     }
 
     pub(crate) fn neg_score_at(&self, eta: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
@@ -1697,7 +1699,7 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
             return f64::INFINITY;
         };
         // −[ℓ(β̂+δ) − ℓ(β̂)] = [D_disp − D_base]/(2φ).
-        let neg_loglik_diff = scaled_half_deviance - self.base_deviance / (2.0 * self.phi);
+        let neg_loglik_diff = scaled_half_deviance - self.base_scaled_half_deviance;
         // Penalty-score channel (S β̂)·δ = Σ_k λ_k (S_k β̂)·δ.
         let mut penalty_term = 0.0_f64;
         for (score, &lam) in self.penalty_scores.iter().zip(self.lambdas.iter()) {
@@ -1736,8 +1738,7 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
     }
 
     fn base_neg_score(&self) -> Result<Array1<f64>, String> {
-        self.neg_score_at(&self.eta_hat)
-            .map_err(|error| error.to_string())
+        Ok(self.base_neg_score_at_mode.clone())
     }
 
     /// Fused excess + displaced score sharing one design matvec `s = X_t δ`
@@ -1749,7 +1750,7 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
         let Ok((scaled_half_deviance, ngs)) = self.likelihood_surface_at(&eta_disp) else {
             return (f64::INFINITY, None);
         };
-        let neg_loglik_diff = scaled_half_deviance - self.base_deviance / (2.0 * self.phi);
+        let neg_loglik_diff = scaled_half_deviance - self.base_scaled_half_deviance;
         let mut penalty_term = 0.0_f64;
         for (score, &lam) in self.penalty_scores.iter().zip(self.lambdas.iter()) {
             penalty_term += lam * score.dot(&delta);
@@ -1818,7 +1819,7 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
                 out.push((f64::INFINITY, None));
                 continue;
             };
-            let neg_loglik_diff = scaled_half_deviance - self.base_deviance / (2.0 * self.phi);
+            let neg_loglik_diff = scaled_half_deviance - self.base_scaled_half_deviance;
             delta.assign(&delta_all.column(sidx));
             let mut penalty_term = 0.0_f64;
             for (score, &lam) in self.penalty_scores.iter().zip(self.lambdas.iter()) {

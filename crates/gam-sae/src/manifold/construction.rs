@@ -5139,14 +5139,7 @@ impl SaeManifoldTerm {
 
     pub(crate) fn ard_value(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
         self.assignment.validate_rho_domain(rho)?;
-        if rho.log_ard.len() != self.k_atoms() {
-            return Err(format!(
-                "ARD rho has {} atoms but term has {}",
-                rho.log_ard.len(),
-                self.k_atoms()
-            ));
-        }
-        let ard_precisions = rho.ard_precisions()?;
+        let ard_precisions = self.validated_ard_precisions(rho)?;
         let n = self.n_obs();
         // Design-honesty weights change the relative contribution of rows while
         // preserving total sample mass: `set_row_loss_weights` normalizes them to
@@ -5159,12 +5152,6 @@ impl SaeManifoldTerm {
             let d = coord.latent_dim();
             if rho.log_ard[atom_idx].is_empty() {
                 continue;
-            }
-            if rho.log_ard[atom_idx].len() != d {
-                return Err(format!(
-                    "ARD rho atom {atom_idx} has len {} but atom dim is {d}",
-                    rho.log_ard[atom_idx].len()
-                ));
             }
             // Per-axis periodicity selects the smooth von-Mises energy on
             // wrapped (Circle) axes and the Gaussian on Euclidean axes.

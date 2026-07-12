@@ -150,6 +150,11 @@ fn gaussian_reml_optimize_latent<'py>(
         }
     };
     let sigma_eff_mode = SigmaEffMode::parse(&sigma_eff_mode).map_err(py_value_error)?;
+    let dim_selection_values = dim_selection_log_precision
+        .as_ref()
+        .map(|values| ValidatedDimSelectionPrecisions::new(values.as_array(), latent_dim))
+        .transpose()
+        .map_err(py_value_error)?;
     if n_restarts == 0 {
         return Err(py_value_error("n_restarts must be at least 1".to_string()));
     }
@@ -220,11 +225,6 @@ fn gaussian_reml_optimize_latent<'py>(
         fisher_values.as_ref().map(|w| w.view()),
     )
     .map_err(py_value_error)?;
-    let dim_selection_values = dim_selection_log_precision
-        .as_ref()
-        .map(|values| ValidatedDimSelectionPrecisions::new(values.as_array(), latent_dim))
-        .transpose()
-        .map_err(py_value_error)?;
     let tensor_knots_values = tensor_knots_concat
         .as_ref()
         .map(|a| a.as_array().to_owned());

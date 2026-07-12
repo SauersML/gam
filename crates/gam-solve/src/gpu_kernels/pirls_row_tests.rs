@@ -304,6 +304,7 @@ fn refusal_replay_selects_the_smallest_bad_row_atomically() {
         status_codes::OK,
         status_codes::RESPONSE,
         status_codes::RESPONSE,
+    ];
     assert!(matches!(
         replay_first_refusal(
             PirlsRowFamily::BernoulliLogit,

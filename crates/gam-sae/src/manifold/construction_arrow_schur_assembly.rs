@@ -182,7 +182,7 @@ impl SaeManifoldTerm {
         forced_layout: ForcedRowLayout,
     ) -> Result<ArrowSchurSystem, String> {
         self.assignment.validate_rho_domain(rho)?;
-        let ard_precisions = rho.ard_precisions()?;
+        let ard_precisions = self.validated_ard_precisions(rho)?;
         if !(penalty_scale.is_finite() && penalty_scale > 0.0) {
             return Err(format!(
                 "SaeManifoldTerm::assemble_arrow_schur_scaled: penalty_scale must be finite and positive; got {penalty_scale}"
@@ -196,34 +196,18 @@ impl SaeManifoldTerm {
                 target.dim()
             ));
         }
-        if rho.log_ard.len() != self.k_atoms() {
-            return Err(format!(
-                "SaeManifoldTerm::assemble_arrow_schur: log_ard length {} != K {}",
-                rho.log_ard.len(),
-                self.k_atoms()
-            ));
-        }
         // `lambda_smooth` is indexed per-atom in the smoothness gradient/curvature
         // assembly (`lambda_smooth[atom_idx]`); a too-short vector (e.g. a growth
         // move that grew `k_atoms()` without extending ρ — #1556) would panic deep
         // in the assembly loop with an opaque index-out-of-bounds. Validate it here
-        // alongside `log_ard` so the contract violation surfaces as a clear Err.
+        // alongside the centrally validated ARD table so the contract violation
+        // surfaces as a clear Err.
         if rho.log_lambda_smooth.len() != self.k_atoms() {
             return Err(format!(
                 "SaeManifoldTerm::assemble_arrow_schur: log_lambda_smooth length {} != K {}",
                 rho.log_lambda_smooth.len(),
                 self.k_atoms()
             ));
-        }
-        for (atom_idx, coord) in self.assignment.coords.iter().enumerate() {
-            let ard_len = rho.log_ard[atom_idx].len();
-            let d = coord.latent_dim();
-            if ard_len != 0 && ard_len != d {
-                return Err(format!(
-                    "SaeManifoldTerm::assemble_arrow_schur: log_ard atom {atom_idx} \
-                     has len {ard_len}; expected 0 (disabled) or atom dim {d}"
-                ));
-            }
         }
         // `smooth_penalty` is the validated reference-function Gram and is fixed
         // for the lifetime of this objective. Basis reparameterizations

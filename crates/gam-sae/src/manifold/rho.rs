@@ -117,7 +117,9 @@ mod log_strength_domain_tests {
         rho.log_ard[0][0] = LOG_STRENGTH_MIN;
         assert_eq!(
             rho.ard_precisions().unwrap()[0][0].to_bits(),
-            LOG_STRENGTH_MIN.exp().to_bits()
+            checked_exp_log_strength(LOG_STRENGTH_MIN)
+                .unwrap()
+                .to_bits()
         );
 
         // Public report/state fields may be mutated by downstream Rust code.
@@ -530,6 +532,9 @@ impl SaeManifoldRho {
         Ok(scaled)
     }
 
+    /// Physical assignment strength on the shared exact domain. This remains
+    /// fallible because the public report fields may be edited after fitting;
+    /// conversion always reads and validates current storage.
     pub fn lambda_sparse(&self) -> Result<f64, String> {
         checked_exp_log_strength(self.log_lambda_sparse)
             .map_err(|error| format!("assignment log strength: {error}"))
@@ -542,8 +547,7 @@ impl SaeManifoldRho {
     }
 
     /// Smoothness strength `exp(log_lambda_smooth[k])` for atom `k` (#1556).
-    /// Computational entry points validate the rho domain before calling this
-    /// exact, unsaturated map.
+    /// The exact, unsaturated map revalidates current public storage.
     #[must_use]
     pub fn lambda_smooth_for(&self, atom: usize) -> Result<f64, String> {
         let log_strength = self.log_lambda_smooth.get(atom).copied().ok_or_else(|| {
@@ -558,7 +562,8 @@ impl SaeManifoldRho {
 
     /// All `K` per-atom smoothness strengths `exp(log_lambda_smooth[k])`, atom
     /// order. Convenience for threading per-atom λ into the penalty assemblers
-    /// (#1556).
+    /// (#1556). The vector is returned only after every coordinate validates, so
+    /// a caller never observes a partially converted table.
     #[must_use]
     pub fn lambda_smooth_vec(&self) -> Result<Vec<f64>, String> {
         checked_exp_log_strengths(self.log_lambda_smooth.iter().copied())

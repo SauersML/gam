@@ -2629,20 +2629,43 @@ impl<'a> RemlState<'a> {
             .try_to_dense_arc("#784 block-local fallback requires dense design access")
             .map_err(EstimationError::InvalidInput)?;
 
+        let eta_hat = pirls_result.final_eta.to_owned();
+        let inverse_link = self.runtime_inverse_link();
+        let base_rows = crate::pirls::deviance_eta_rows_with_log_measure_scale(
+            self.y,
+            &eta_hat,
+            &self.config.likelihood,
+            &inverse_link,
+            self.weights,
+            -phi.ln(),
+        )?;
+        let base_scaled_half_deviance = gam_linalg::pairwise_reduce::par_pairwise_sum(
+            base_rows.len(),
+            |i| base_rows[i].half_deviance,
+        );
+        if !base_scaled_half_deviance.is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "#784 base scaled half-deviance is not representable: {base_scaled_half_deviance}"
+            )));
+        }
+        let base_neg_score_at_mode =
+            Array1::from_iter(base_rows.into_iter().map(|row| row.eta_score));
+
         let target = Gam784BlockTarget {
             x_transformed: x_dense.as_ref(),
             block_vecs,
             block_lambdas,
-            eta_hat: pirls_result.final_eta.to_owned(),
+            eta_hat,
             weights_obs: pirls_result.finalweights.to_owned(),
             y: self.y.to_owned(),
             prior_weights: self.weights.to_owned(),
             likelihood: self.config.likelihood.clone(),
-            inverse_link: self.runtime_inverse_link(),
+            inverse_link,
             phi,
             penalty_scores,
             lambdas,
-            base_deviance: pirls_result.deviance,
+            base_scaled_half_deviance,
+            base_neg_score_at_mode,
         };
 
         let sampled = sampler

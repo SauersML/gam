@@ -338,7 +338,7 @@ impl SaeManifoldTerm {
             .iter()
             .map(|coord| coord.effective_axis_periods())
             .collect();
-        let ard_precisions = rho.ard_precisions()?;
+        let ard_precisions = self.validated_ard_precisions(rho)?;
 
         // Optional softmax exact-entropy-minus-majorizer delta operator (#1419).
         let softmax_delta: Option<(
