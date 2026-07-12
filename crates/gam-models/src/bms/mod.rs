@@ -289,20 +289,12 @@ pub struct EmpiricalZGrid {
 impl EmpiricalZGrid {
     /// Construct a grid whose node/weight invariants (equal length ≥ 2, finite
     /// ascending nodes, finite positive weights, weights summing to 1 within
-    /// 1e-8) are enforced up-front. Input pairs are sorted by node so hot
-    /// denested-cell kernels can consume contiguous buckets without searching
-    /// the whole grid. Prefer this over building the struct literally; every
-    /// code path that goes through `new` satisfies the same contract that
-    /// `validate_empirical_z_grid` checks on read.
-    pub fn new(mut nodes: Vec<f64>, mut weights: Vec<f64>, context: &str) -> Result<Self, String> {
-        if nodes.len() != weights.len() {
-            return Err(format!(
-                "{context} empirical latent measure node/weight length mismatch: nodes={}, weights={}",
-                nodes.len(),
-                weights.len()
-            ));
-        }
-        sort_empirical_node_weight_pairs(&mut nodes, &mut weights);
+    /// 1e-8) are enforced up-front. Sorted order is part of the input contract
+    /// so hot denested-cell kernels can consume contiguous buckets without a
+    /// constructor-side reorder or allocation. Prefer this over building the
+    /// struct literally; every code path that goes through `new` satisfies the
+    /// same contract that `validate_empirical_z_grid` checks on read.
+    pub fn new(nodes: Vec<f64>, weights: Vec<f64>, context: &str) -> Result<Self, String> {
         validate_empirical_z_grid(&nodes, &weights, context)?;
         Ok(Self { nodes, weights })
     }
@@ -464,9 +456,10 @@ impl LatentMeasureKind {
 }
 
 /// Allocation-free heapsort of parallel empirical node/weight storage.
-/// `EmpiricalZGrid::new` owns both vectors, so moving pairs in place avoids the
-/// third temporary allocation that a `Vec<(node, weight)>` canonicalization
-/// would add to the per-row local-mixture path.
+/// Used by the local-mixture constructor, whose concatenated sorted component
+/// grids are not globally ordered. Moving pairs in place avoids the third
+/// temporary allocation that a `Vec<(node, weight)>` canonicalization would
+/// add to that per-row path.
 fn sort_empirical_node_weight_pairs(nodes: &mut [f64], weights: &mut [f64]) {
     debug_assert_eq!(nodes.len(), weights.len());
     fn sift_down(nodes: &mut [f64], weights: &mut [f64], mut root: usize, end: usize) {
@@ -577,7 +570,9 @@ pub(crate) fn combine_empirical_grids(
     for weight in &mut weights {
         *weight /= total;
     }
-    EmpiricalZGrid::new(nodes, weights, "local empirical latent combined grid")
+    sort_empirical_node_weight_pairs(&mut nodes, &mut weights);
+    validate_empirical_z_grid(&nodes, &weights, "local empirical latent combined grid")?;
+    Ok(EmpiricalZGrid { nodes, weights })
 }
 
 #[derive(Clone, Debug)]
@@ -2150,21 +2145,21 @@ mod tests {
     );
 
     #[test]
-    fn empirical_grid_constructor_canonicalizes_node_order() {
+    fn empirical_grid_constructor_preserves_canonical_node_order() {
         let grid = EmpiricalZGrid::new(
-            vec![1.0, -2.0, 0.5],
-            vec![0.2, 0.3, 0.5],
+            vec![-2.0, 0.5, 1.0],
+            vec![0.3, 0.5, 0.2],
             "sorted-grid invariant",
         )
-        .expect("constructor sorts node/weight pairs");
+        .expect("canonical sorted grid");
         assert_eq!(grid.nodes, vec![-2.0, 0.5, 1.0]);
         assert_eq!(grid.weights, vec![0.3, 0.5, 0.2]);
     }
 
     #[test]
-    fn empirical_grid_validation_rejects_noncanonical_node_order() {
-        let err = validate_empirical_z_grid(&[0.0, -1.0], &[0.5, 0.5], "sorted-grid invariant")
-            .expect_err("persisted grids must already be canonical");
+    fn empirical_grid_constructor_rejects_noncanonical_node_order() {
+        let err = EmpiricalZGrid::new(vec![0.0, -1.0], vec![0.5, 0.5], "sorted-grid invariant")
+            .expect_err("constructed grids must already be canonical");
         assert!(err.contains("nodes must be sorted ascending"), "{err}");
     }
 }

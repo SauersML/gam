@@ -247,8 +247,8 @@ pub fn sae_row_jets_cpu_softmax(
 
 /// Gate-only adapter for the same structure-compiled row program used by the
 /// complete CPU log-det path.  Decoded values are component constants and every
-/// primary is a logit; coordinate and beta methods are therefore unreachable by
-/// the schedule and return the corresponding empty/zero channel.
+/// primary is a logit; coordinate and beta methods are therefore unreachable and
+/// fail loudly if the schedule ever violates that structural contract.
 struct GateOnlySoftmaxRowProgram<'a> {
     input: &'a SaeSoftmaxRowInputs,
     gate_value: Vec<f64>,
@@ -277,40 +277,48 @@ impl SaeSoftmaxRowProgramSource for GateOnlySoftmaxRowProgram<'_> {
         self.gate_value[atom]
     }
 
-    fn atom_is_active(&self, _atom: usize) -> bool {
-        true
+    fn atom_is_active(&self, atom: usize) -> bool {
+        atom < self.k
     }
 
     fn fill_decoded(&self, atom: usize, out: &mut [f64]) {
         out.copy_from_slice(&self.input.decoded[atom * self.p..(atom + 1) * self.p]);
     }
 
-    fn fill_decoded_first(&self, _atom: usize, _axis: usize, out: &mut [f64]) {
-        out.fill(0.0);
+    fn fill_decoded_first(&self, _: usize, _: usize, _: &mut [f64]) {
+        // SAFETY: every primary returned by this source is `Logit`, so the
+        // compiled schedule can never request a coordinate derivative.
+        panic!("gate-only softmax source has no decoded coordinate-first channel")
     }
 
-    fn fill_decoded_second(&self, _atom: usize, _axis_a: usize, _axis_b: usize, out: &mut [f64]) {
-        out.fill(0.0);
+    fn fill_decoded_second(&self, _: usize, _: usize, _: usize, _: &mut [f64]) {
+        // SAFETY: every primary returned by this source is `Logit`, so the
+        // compiled schedule can never request coordinate curvature.
+        panic!("gate-only softmax source has no decoded coordinate-second channel")
     }
 
     fn n_beta_borders(&self) -> usize {
         0
     }
 
-    fn beta_border_atom(&self, _border: usize) -> usize {
-        0
+    fn beta_border_atom(&self, _: usize) -> usize {
+        // SAFETY: `n_beta_borders()` is zero, so no border accessor is reachable.
+        panic!("gate-only softmax source has no beta borders")
     }
 
-    fn beta_border_basis_value(&self, _border: usize) -> f64 {
-        0.0
+    fn beta_border_basis_value(&self, _: usize) -> f64 {
+        // SAFETY: `n_beta_borders()` is zero, so no border accessor is reachable.
+        panic!("gate-only softmax source has no beta borders")
     }
 
-    fn beta_border_basis_first(&self, _border: usize, _axis: usize) -> f64 {
-        0.0
+    fn beta_border_basis_first(&self, _: usize, _: usize) -> f64 {
+        // SAFETY: `n_beta_borders()` is zero, so no border accessor is reachable.
+        panic!("gate-only softmax source has no beta borders")
     }
 
-    fn beta_border_output(&self, _border: usize) -> &[f64] {
-        &[]
+    fn beta_border_output(&self, _: usize) -> &[f64] {
+        // SAFETY: `n_beta_borders()` is zero, so no border accessor is reachable.
+        panic!("gate-only softmax source has no beta borders")
     }
 }
 

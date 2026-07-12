@@ -40,8 +40,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import math
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
@@ -120,7 +122,9 @@ def build_reduction_tree(rank_ids: Sequence[int]) -> ReductionTree:
     balanced tree whose left subtree is always folded before the right, fixing
     the accumulation order before any partial is produced.
     """
-    raw_ids = [int(rank) for rank in rank_ids]
+    raw_ids = [
+        _coerce_rank_id(rank, context="build_reduction_tree") for rank in rank_ids
+    ]
     if len(set(raw_ids)) != len(raw_ids):
         raise ValueError("build_reduction_tree rank ids must be unique")
     ids = sorted(raw_ids)
@@ -177,15 +181,47 @@ def _default_combine(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-_CHECKPOINT_SCHEMA = "gamfit.reduction-session.v1"
+_CHECKPOINT_SCHEMA = "gamfit.reduction-session.v2"
 _DEFAULT_COMBINE_ID = "elementwise-f64-sum.v1"
+_CANONICAL_DTYPE = np.dtype("<f8")
+_CHECKPOINT_KEYS = frozenset(
+    {
+        "schema",
+        "job_id",
+        "topology",
+        "rank_ids",
+        "combine_id",
+        "input_fingerprint",
+        "entries",
+        "cache_fingerprint",
+    }
+)
+_ENTRY_KEYS = frozenset({"signature", "shape", "dtype", "data"})
+
+
+def _coerce_rank_id(value: Any, *, context: str) -> int:
+    """Return an exact integral rank id without lossy Python coercions."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+        raise TypeError(
+            f"{context} rank ids must be integers (not bools or floats); "
+            f"got {value!r}"
+        )
+    return int(value)
 
 
 def _coerce_partials(
     rank_ids: Sequence[int], partials: Mapping[int, Any]
 ) -> dict[int, np.ndarray]:
+    normalized: dict[int, Any] = {}
+    for raw_rank, value in partials.items():
+        rank = _coerce_rank_id(raw_rank, context="reduction partial")
+        if rank in normalized:
+            raise ValueError(
+                f"reduction partial rank ids collide after normalization: {rank}"
+            )
+        normalized[rank] = value
     expected = set(rank_ids)
-    actual = set(partials)
+    actual = set(normalized)
     missing = sorted(expected - actual)
     unexpected = sorted(actual - expected, key=repr)
     if missing or unexpected:
@@ -196,7 +232,9 @@ def _coerce_partials(
     # A session owns an immutable snapshot.  Copy even an already-contiguous f64
     # input so caller mutation after start_session cannot change the job identity.
     return {
-        rank: np.array(_to_numpy_f64(partials[rank]), dtype=np.float64, copy=True, order="C")
+        rank: np.array(
+            _to_numpy_f64(normalized[rank]), dtype=np.float64, copy=True, order="C"
+        )
         for rank in rank_ids
     }
 
@@ -204,6 +242,18 @@ def _coerce_partials(
 def _hash_field(digest: Any, value: bytes) -> None:
     digest.update(len(value).to_bytes(8, "little", signed=False))
     digest.update(value)
+
+
+def _canonical_f64_bytes(array: np.ndarray) -> bytes:
+    """Encode a float64 array as canonical C-order little-endian bytes."""
+    native = np.ascontiguousarray(array, dtype=np.float64)
+    return native.astype(_CANONICAL_DTYPE, copy=False).tobytes(order="C")
+
+
+def _arrays_bitwise_equal(left: np.ndarray, right: np.ndarray) -> bool:
+    return left.shape == right.shape and (
+        _canonical_f64_bytes(left) == _canonical_f64_bytes(right)
+    )
 
 
 def _input_fingerprint(
@@ -219,15 +269,15 @@ def _input_fingerprint(
     _hash_field(digest, job_id.encode("utf-8"))
     _hash_field(digest, topology.encode("utf-8"))
     _hash_field(digest, combine_id.encode("utf-8"))
+    _hash_field(digest, _CANONICAL_DTYPE.str.encode("ascii"))
     for rank in rank_ids:
         array = np.ascontiguousarray(leaves[rank], dtype=np.float64)
-        canonical = array.astype(np.dtype("<f8"), copy=False)
         _hash_field(digest, str(rank).encode("ascii"))
         _hash_field(
             digest,
             ",".join(str(int(size)) for size in array.shape).encode("ascii"),
         )
-        _hash_field(digest, canonical.tobytes(order="C"))
+        _hash_field(digest, _canonical_f64_bytes(array))
     return digest.hexdigest()
 
 
@@ -261,7 +311,15 @@ def _reduce_subtree(
         # Left ALWAYS before right — the fixed accumulation order.
         left_value = _reduce_subtree(tree.left, leaves, combine, cache)
         right_value = _reduce_subtree(tree.right, leaves, combine, cache)
-        value = np.ascontiguousarray(combine(left_value, right_value), dtype=np.float64)
+        # A custom combiner never receives cache-owned storage. It may mutate
+        # either argument or return one of them without corrupting a leaf or a
+        # previously-computed subtree. Copy its result as well so references
+        # retained by user code cannot mutate the cache after return.
+        combined = combine(
+            np.array(left_value, dtype=np.float64, copy=True, order="C"),
+            np.array(right_value, dtype=np.float64, copy=True, order="C"),
+        )
+        value = np.array(combined, dtype=np.float64, copy=True, order="C")
     cache[signature] = value
     return value
 
@@ -274,7 +332,8 @@ def _encoded_cache_entries(cache: Mapping[str, np.ndarray]) -> list[dict[str, An
             {
                 "signature": signature,
                 "shape": list(array.shape),
-                "data": base64.b64encode(array.tobytes(order="C")).decode("ascii"),
+                "dtype": _CANONICAL_DTYPE.str,
+                "data": base64.b64encode(_canonical_f64_bytes(array)).decode("ascii"),
             }
         )
     return entries
@@ -289,8 +348,36 @@ def _cache_fingerprint(input_fingerprint: str, entries: Sequence[Mapping[str, An
             digest,
             ",".join(str(int(size)) for size in entry["shape"]).encode("ascii"),
         )
+        _hash_field(digest, entry["dtype"].encode("ascii"))
         _hash_field(digest, str(entry["data"]).encode("ascii"))
     return digest.hexdigest()
+
+
+def _require_exact_keys(
+    mapping: Mapping[Any, Any], expected: frozenset[str], *, context: str
+) -> None:
+    """Reject missing, unknown, non-string, and repeated object keys."""
+    keys = list(mapping.keys())
+    if any(not isinstance(key, str) for key in keys):
+        raise ValueError(f"{context} keys must all be strings")
+    if len(keys) != len(set(keys)):
+        raise ValueError(f"{context} repeats an object key")
+    actual = set(keys)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unknown = sorted(actual - expected)
+        raise ValueError(
+            f"{context} keys mismatch: missing={missing}, unknown={unknown}"
+        )
+
+
+def _json_object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"reduction checkpoint JSON repeats key {key!r}")
+        result[key] = value
+    return result
 
 
 class TreeReducer:
@@ -401,6 +488,11 @@ class ReductionSession:
 
     def restore(self, checkpoint: Mapping[str, Any]) -> None:
         """Transactionally restore a checkpoint for this exact session only."""
+        if not isinstance(checkpoint, Mapping):
+            raise ValueError("reduction checkpoint must be a mapping")
+        _require_exact_keys(
+            checkpoint, _CHECKPOINT_KEYS, context="reduction checkpoint"
+        )
         if checkpoint.get("schema") != _CHECKPOINT_SCHEMA:
             raise ValueError(
                 f"unsupported reduction checkpoint schema {checkpoint.get('schema')!r}; "
@@ -413,7 +505,13 @@ class ReductionSession:
             )
         if checkpoint.get("topology") != self.tree.signature():
             raise ValueError("reduction checkpoint topology mismatch")
-        if checkpoint.get("rank_ids") != list(self.rank_ids):
+        checkpoint_rank_ids = checkpoint.get("rank_ids")
+        if not isinstance(checkpoint_rank_ids, list) or any(
+            isinstance(rank, bool) or type(rank) is not int
+            for rank in checkpoint_rank_ids
+        ):
+            raise ValueError("reduction checkpoint rank_ids must be a list of integers")
+        if checkpoint_rank_ids != list(self.rank_ids):
             raise ValueError("reduction checkpoint rank-id mismatch")
         if checkpoint.get("combine_id") != self.combine_id:
             raise ValueError("reduction checkpoint combiner mismatch")
@@ -424,13 +522,72 @@ class ReductionSession:
             )
 
         raw_entries = checkpoint.get("entries")
-        if not isinstance(raw_entries, (list, tuple)):
-            raise ValueError("reduction checkpoint entries must be a sequence")
+        if not isinstance(raw_entries, list):
+            raise ValueError("reduction checkpoint entries must be a list")
         if not all(isinstance(entry, Mapping) for entry in raw_entries):
             raise ValueError("reduction checkpoint entry must be a mapping")
+
+        normalized_entries: list[dict[str, Any]] = []
+        decoded_entries: list[tuple[str, tuple[int, ...], bytes]] = []
+        for entry in raw_entries:
+            _require_exact_keys(
+                entry, _ENTRY_KEYS, context="reduction checkpoint entry"
+            )
+            signature = entry["signature"]
+            if not isinstance(signature, str):
+                raise ValueError("reduction checkpoint entry signature must be a string")
+            raw_shape = entry["shape"]
+            if not isinstance(raw_shape, list) or any(
+                isinstance(size, bool) or type(size) is not int
+                for size in raw_shape
+            ):
+                raise ValueError(
+                    f"reduction checkpoint entry {signature!r} shape must be "
+                    "a list of integers"
+                )
+            shape = tuple(raw_shape)
+            if any(size < 0 for size in shape):
+                raise ValueError(
+                    f"reduction checkpoint entry {signature!r} has a negative shape"
+                )
+            if entry["dtype"] != _CANONICAL_DTYPE.str or not isinstance(
+                entry["dtype"], str
+            ):
+                raise ValueError(
+                    f"reduction checkpoint entry {signature!r} dtype must be "
+                    f"{_CANONICAL_DTYPE.str!r}"
+                )
+            data = entry["data"]
+            if not isinstance(data, str):
+                raise ValueError(
+                    f"reduction checkpoint entry {signature!r} data must be a string"
+                )
+            try:
+                data.encode("ascii")
+                raw = base64.b64decode(data, validate=True)
+            except (UnicodeEncodeError, ValueError) as exc:
+                raise ValueError(
+                    f"malformed reduction checkpoint entry {signature!r} data"
+                ) from exc
+            expected_bytes = math.prod(shape) * _CANONICAL_DTYPE.itemsize
+            if len(raw) != expected_bytes:
+                raise ValueError(
+                    f"reduction checkpoint subtree {signature!r} has {len(raw)} "
+                    f"bytes; expected {expected_bytes} for shape {shape}"
+                )
+            normalized_entries.append(
+                {
+                    "signature": signature,
+                    "shape": list(shape),
+                    "dtype": _CANONICAL_DTYPE.str,
+                    "data": data,
+                }
+            )
+            decoded_entries.append((signature, shape, raw))
+
         try:
             cache_fingerprint = _cache_fingerprint(
-                self.input_fingerprint, raw_entries
+                self.input_fingerprint, normalized_entries
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("malformed reduction checkpoint entries") from exc
@@ -439,8 +596,7 @@ class ReductionSession:
 
         allowed_signatures = _tree_signatures(self.tree)
         restored: dict[str, np.ndarray] = {}
-        for entry in raw_entries:
-            signature = str(entry.get("signature"))
+        for signature, shape, raw in decoded_entries:
             if signature not in allowed_signatures:
                 raise ValueError(
                     f"reduction checkpoint contains unknown subtree {signature!r}"
@@ -449,23 +605,11 @@ class ReductionSession:
                 raise ValueError(
                     f"reduction checkpoint repeats subtree {signature!r}"
                 )
-            try:
-                shape = tuple(int(size) for size in entry["shape"])
-                if any(size < 0 for size in shape):
-                    raise ValueError("negative shape dimension")
-                raw = base64.b64decode(str(entry["data"]), validate=True)
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"malformed reduction checkpoint entry {signature!r}"
-                ) from exc
-            expected_bytes = math.prod(shape) * 8
-            if len(raw) != expected_bytes:
-                raise ValueError(
-                    f"reduction checkpoint subtree {signature!r} has {len(raw)} "
-                    f"bytes; expected {expected_bytes} for shape {shape}"
-                )
             restored[signature] = (
-                np.frombuffer(raw, dtype=np.float64).reshape(shape).copy()
+                np.frombuffer(raw, dtype=_CANONICAL_DTYPE)
+                .astype(np.float64, copy=False)
+                .reshape(shape)
+                .copy(order="C")
             )
 
         # A cached leaf must be the exact session input. Internal cache entries
@@ -473,11 +617,46 @@ class ReductionSession:
         for rank in self.rank_ids:
             signature = str(rank)
             cached_leaf = restored.get(signature)
-            if cached_leaf is not None and not np.array_equal(
-                cached_leaf.view(np.uint64), self._leaves[rank].view(np.uint64)
+            if cached_leaf is not None and not _arrays_bitwise_equal(
+                cached_leaf, self._leaves[rank]
             ):
                 raise ValueError(
                     f"reduction checkpoint leaf {rank} does not match session input"
                 )
 
+        # The adjacent SHA-256 detects accidental damage, but is not an
+        # authenticity primitive: a producer can rewrite both an internal
+        # value and its digest. Validate every restored subtree against a fresh
+        # evaluation from the immutable leaves under the declared combiner.
+        # `_reduce_subtree` isolates combiner mutations, so validation itself
+        # cannot alter session inputs or existing cache state.
+        non_leaf_signatures = set(restored) - {str(rank) for rank in self.rank_ids}
+        if non_leaf_signatures:
+            expected_cache: dict[str, np.ndarray] = {}
+            _reduce_subtree(
+                self.tree, self._leaves, self._combine, expected_cache
+            )
+            for signature in non_leaf_signatures:
+                if not _arrays_bitwise_equal(
+                    restored[signature], expected_cache[signature]
+                ):
+                    raise ValueError(
+                        f"reduction checkpoint subtree {signature!r} does not "
+                        "match deterministic reduction"
+                    )
+
         self._cache = restored
+
+    def restore_json(self, payload: str | bytes | bytearray) -> None:
+        """Parse and restore JSON while rejecting duplicate object keys."""
+        if not isinstance(payload, (str, bytes, bytearray)):
+            raise TypeError("reduction checkpoint JSON must be str or bytes")
+        try:
+            checkpoint = json.loads(
+                payload, object_pairs_hook=_json_object_without_duplicates
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            raise ValueError("malformed reduction checkpoint JSON") from exc
+        if not isinstance(checkpoint, Mapping):
+            raise ValueError("reduction checkpoint JSON root must be an object")
+        self.restore(checkpoint)

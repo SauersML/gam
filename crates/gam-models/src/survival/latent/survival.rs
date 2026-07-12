@@ -45,6 +45,8 @@ use gam_problem::MIN_WEIGHT;
 use gam_solve::pirls::LinearInequalityConstraints;
 use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec, build_term_collection_design};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
+use smallvec::SmallVec;
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -1150,6 +1152,7 @@ struct LatentKernelPrimaryState {
     log_sigma_factor: f64,
 }
 
+#[cfg(test)]
 fn latent_kernel_accumulate_term(
     terms: &mut BTreeMap<(usize, usize, usize, usize), f64>,
     term: LatentKernelPrimaryTerm,
@@ -1163,6 +1166,7 @@ fn latent_kernel_accumulate_term(
         .or_insert(0.0) += scale * term.coeff;
 }
 
+#[cfg(test)]
 fn latent_kernel_differentiate_terms(
     terms: &[LatentKernelPrimaryTerm],
     dir: LatentKernelPrimaryDirection,
@@ -1253,6 +1257,139 @@ fn latent_kernel_differentiate_terms(
             })
         })
         .collect()
+}
+
+// Fourth-order latent-kernel recurrences have a small finite support. Keeping
+// the sorted support inline removes the BTreeMap node allocation and output-Vec
+// allocation that the pre-cutover directional oracle intentionally retains.
+// The all-event/K=5/K=6 oracle below asserts this capacity never spills.
+const LATENT_TERM_INLINE_CAPACITY: usize = 64;
+type LatentTermBuffer = SmallVec<[LatentKernelPrimaryTerm; LATENT_TERM_INLINE_CAPACITY]>;
+
+#[inline]
+fn latent_kernel_accumulate_term_inline(
+    terms: &mut LatentTermBuffer,
+    term: LatentKernelPrimaryTerm,
+    scale: f64,
+) {
+    if scale == 0.0 || term.coeff == 0.0 {
+        return;
+    }
+    let contribution = scale * term.coeff;
+    if let Some(existing) = terms.iter_mut().find(|existing| {
+        existing.q_exp == term.q_exp
+            && existing.qdot_power == term.qdot_power
+            && existing.tau_exp == term.tau_exp
+            && existing.k == term.k
+    }) {
+        existing.coeff += contribution;
+    } else {
+        terms.push(LatentKernelPrimaryTerm {
+            coeff: contribution,
+            ..term
+        });
+    }
+}
+
+fn latent_kernel_differentiate_terms_inline(
+    terms: &[LatentKernelPrimaryTerm],
+    dir: LatentKernelPrimaryDirection,
+) -> LatentTermBuffer {
+    let mut out = LatentTermBuffer::new();
+    for term in terms {
+        if dir.dq != 0.0 {
+            if term.q_exp > 0 {
+                latent_kernel_accumulate_term_inline(&mut out, *term, dir.dq * term.q_exp as f64);
+            }
+            latent_kernel_accumulate_term_inline(
+                &mut out,
+                LatentKernelPrimaryTerm {
+                    q_exp: term.q_exp + 1,
+                    k: term.k + 1,
+                    ..*term
+                },
+                -dir.dq,
+            );
+        }
+        if dir.dmu != 0.0 {
+            if term.k > 0 {
+                latent_kernel_accumulate_term_inline(&mut out, *term, dir.dmu * term.k as f64);
+            }
+            latent_kernel_accumulate_term_inline(
+                &mut out,
+                LatentKernelPrimaryTerm {
+                    q_exp: term.q_exp + 1,
+                    k: term.k + 1,
+                    ..*term
+                },
+                -dir.dmu,
+            );
+        }
+        if dir.dtau != 0.0 {
+            if term.tau_exp > 0 {
+                latent_kernel_accumulate_term_inline(
+                    &mut out,
+                    *term,
+                    dir.dtau * term.tau_exp as f64,
+                );
+            }
+            let kf = term.k as f64;
+            latent_kernel_accumulate_term_inline(
+                &mut out,
+                LatentKernelPrimaryTerm {
+                    tau_exp: term.tau_exp + 2,
+                    ..*term
+                },
+                dir.dtau * kf * kf,
+            );
+            latent_kernel_accumulate_term_inline(
+                &mut out,
+                LatentKernelPrimaryTerm {
+                    q_exp: term.q_exp + 1,
+                    tau_exp: term.tau_exp + 2,
+                    k: term.k + 1,
+                    ..*term
+                },
+                -dir.dtau * (2.0 * kf + 1.0),
+            );
+            latent_kernel_accumulate_term_inline(
+                &mut out,
+                LatentKernelPrimaryTerm {
+                    q_exp: term.q_exp + 2,
+                    tau_exp: term.tau_exp + 2,
+                    k: term.k + 2,
+                    ..*term
+                },
+                dir.dtau,
+            );
+        }
+        if dir.dqd != 0.0 && term.qdot_power > 0 {
+            latent_kernel_accumulate_term_inline(
+                &mut out,
+                LatentKernelPrimaryTerm {
+                    qdot_power: term.qdot_power - 1,
+                    ..*term
+                },
+                dir.dqd * term.qdot_power as f64,
+            );
+        }
+    }
+    out.retain(|term| term.coeff != 0.0);
+    out.sort_unstable_by_key(|term| (term.q_exp, term.qdot_power, term.tau_exp, term.k));
+    out
+}
+
+fn latent_kernel_term_sequence_inline(
+    base_terms: &[LatentKernelPrimaryTerm],
+    axes: &[LatentKernelPrimaryDirection],
+    suffix: &[LatentKernelPrimaryDirection],
+) -> LatentTermBuffer {
+    let mut terms = LatentTermBuffer::from_slice(base_terms);
+    terms.retain(|term| term.coeff != 0.0);
+    for direction in axes.iter().chain(suffix.iter()) {
+        terms = latent_kernel_differentiate_terms_inline(&terms, *direction);
+    }
+    terms
 }
 
 #[cfg(test)]
@@ -1382,35 +1519,36 @@ fn latent_kernel_sum_order2_parts<const K: usize>(
     primary_directions: &[LatentKernelPrimaryDirection; K],
     suffixes: &[&[LatentKernelPrimaryDirection]],
     context: &str,
-) -> Result<(f64, Vec<Order2<K>>), LatentSurvivalError> {
-    let order2_width = 1 + K + K * (K + 1) / 2;
-    let mut term_lists =
-        Vec::<Vec<LatentKernelPrimaryTerm>>::with_capacity(suffixes.len() * order2_width);
-
-    for suffix in suffixes {
-        let mut append = |axes: &[LatentKernelPrimaryDirection]| {
-            let mut terms = base_terms.to_vec();
-            for direction in axes.iter().chain(suffix.iter()) {
-                terms = latent_kernel_differentiate_terms(&terms, *direction);
-            }
-            term_lists.push(terms);
-        };
-        append(&[]);
-        for a in 0..K {
-            append(&[primary_directions[a]]);
+) -> Result<(f64, [Order2<K>; 4]), LatentSurvivalError> {
+    assert!(
+        !suffixes.is_empty() && suffixes.len() <= 4,
+        "latent kernel lift supports one to four order-two parts"
+    );
+    let base_max_k = base_terms.iter().map(|term| term.k).max().unwrap_or(0);
+    let k_increment = |direction: &LatentKernelPrimaryDirection| {
+        if direction.dtau != 0.0 {
+            2
+        } else if direction.dq != 0.0 || direction.dmu != 0.0 {
+            1
+        } else {
+            0
         }
-        for a in 0..K {
-            for b in a..K {
-                append(&[primary_directions[a], primary_directions[b]]);
-            }
-        }
-    }
-
-    let max_k = term_lists
+    };
+    // Every emitted part carries a full order-two base.  The largest requested
+    // recurrence is therefore two primary differentiations plus the largest
+    // nilpotent suffix.  This exact support bound lets us build the one shared
+    // bundle before constructing any individual derivative term list.
+    let max_primary_increment = primary_directions
         .iter()
-        .flat_map(|terms| terms.iter().map(|term| term.k))
+        .map(&k_increment)
         .max()
         .unwrap_or(0);
+    let max_suffix_increment = suffixes
+        .iter()
+        .map(|suffix| suffix.iter().map(&k_increment).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    let max_k = base_max_k + 2 * max_primary_increment + max_suffix_increment;
     let bundle =
         log_kernel_bundle(quadctx, state.q.exp(), state.mu, state.sigma, max_k).map_err(|e| {
             LatentSurvivalError::NumericalFailure {
@@ -1420,8 +1558,8 @@ fn latent_kernel_sum_order2_parts<const K: usize>(
 
     let evaluate_terms =
         |terms: &[LatentKernelPrimaryTerm]| -> Result<(f64, f64), LatentSurvivalError> {
-            let mut log_mags = Vec::with_capacity(terms.len());
-            let mut signs = Vec::with_capacity(terms.len());
+            let mut log_mags = SmallVec::<[f64; LATENT_TERM_INLINE_CAPACITY]>::new();
+            let mut signs = SmallVec::<[f64; LATENT_TERM_INLINE_CAPACITY]>::new();
             for term in terms {
                 if term.coeff == 0.0 {
                     continue;
@@ -1454,14 +1592,32 @@ fn latent_kernel_sum_order2_parts<const K: usize>(
             Ok(signed_log_sum_exp(&log_mags, &signs))
         };
 
-    let (base_log_sum, base_sign) = evaluate_terms(&term_lists[0])?;
+    let (base_log_sum, base_sign) = evaluate_terms(base_terms)?;
     if !(base_log_sum.is_finite() && base_sign > 0.0) {
         return Err(LatentSurvivalError::NumericalFailure {
             reason: format!("{context} produced a non-positive signed kernel sum"),
         });
     }
-    let normalized = |terms: &[LatentKernelPrimaryTerm]| -> Result<f64, LatentSurvivalError> {
-        let (log_abs, sign) = evaluate_terms(terms)?;
+    let normalized = |axes: &[LatentKernelPrimaryDirection],
+                      suffix: &[LatentKernelPrimaryDirection]|
+     -> Result<f64, LatentSurvivalError> {
+        let is_zero = |direction: &LatentKernelPrimaryDirection| {
+            direction.dq == 0.0
+                && direction.dqd == 0.0
+                && direction.dmu == 0.0
+                && direction.dtau == 0.0
+        };
+        if axes.iter().chain(suffix.iter()).any(is_zero) {
+            return Ok(0.0);
+        }
+        let terms = latent_kernel_term_sequence_inline(base_terms, axes, suffix);
+        debug_assert!(
+            !terms.spilled(),
+            "latent derivative support exceeded the inline allocation-free capacity: {} > {}",
+            terms.len(),
+            LATENT_TERM_INLINE_CAPACITY
+        );
+        let (log_abs, sign) = evaluate_terms(&terms)?;
         Ok(if !log_abs.is_finite() || sign == 0.0 {
             0.0
         } else {
@@ -1469,33 +1625,29 @@ fn latent_kernel_sum_order2_parts<const K: usize>(
         })
     };
 
-    let mut parts = Vec::with_capacity(suffixes.len());
-    let mut cursor = 0usize;
-    for part in 0..suffixes.len() {
+    let mut parts = [Order2::<K>::constant(0.0); 4];
+    for (part, suffix) in suffixes.iter().enumerate() {
         let value = if part == 0 {
             // The base is the kernel divided by itself.  Keep this literal 1.0,
             // matching the old `MultiDirJet::constant(..., 1.0)` construction.
             1.0
         } else {
-            normalized(&term_lists[cursor])?
+            normalized(&[], suffix)?
         };
-        cursor += 1;
         let mut tower = gam_math::jet_tower::Tower2::<K>::constant(value);
         for a in 0..K {
-            tower.g[a] = normalized(&term_lists[cursor])?;
-            cursor += 1;
+            tower.g[a] = normalized(&[primary_directions[a]], suffix)?;
         }
         for a in 0..K {
             for b in a..K {
-                let derivative = normalized(&term_lists[cursor])?;
-                cursor += 1;
+                let derivative =
+                    normalized(&[primary_directions[a], primary_directions[b]], suffix)?;
                 tower.h[a][b] = derivative;
                 tower.h[b][a] = derivative;
             }
         }
-        parts.push(Order2(tower));
+        parts[part] = Order2(tower);
     }
-    debug_assert_eq!(cursor, term_lists.len());
     Ok((base_log_sum, parts))
 }
 
@@ -1550,7 +1702,7 @@ impl<const K: usize> LatentPrimaryJetBackend<K> for LatentOrder2Backend {
         context: &str,
     ) -> Result<Self::Jet, LatentSurvivalError> {
         let suffixes: [&[LatentKernelPrimaryDirection]; 1] = [&[]];
-        let (base_log_sum, mut parts) = latent_kernel_sum_order2_parts(
+        let (base_log_sum, parts) = latent_kernel_sum_order2_parts(
             quadctx,
             base_terms,
             state,
@@ -1558,9 +1710,7 @@ impl<const K: usize> LatentPrimaryJetBackend<K> for LatentOrder2Backend {
             &suffixes,
             context,
         )?;
-        let mut out = parts
-            .remove(0)
-            .compose_unary(latent_unary_derivatives_log(1.0));
+        let mut out = parts[0].compose_unary(latent_unary_derivatives_log(1.0));
         out.0.v += base_log_sum;
         Ok(out)
     }
@@ -6489,18 +6639,19 @@ mod tests {
 
     type LatentFullPrimaryChannels = (f64, Array1<f64>, Array2<f64>, Array2<f64>, Array2<f64>);
 
-    fn latent_full_primary_channels(
+    #[allow(clippy::too_many_arguments)]
+    fn latent_full_primary_channels_at(
         quadctx: &QuadratureContext,
         row: &LatentSurvivalRow,
         include_log_sigma: bool,
         use_multidir_reference: bool,
+        q_entry: f64,
+        q_exit: f64,
+        qdot_exit: f64,
+        q_right: f64,
+        mu: f64,
+        sigma: f64,
     ) -> LatentFullPrimaryChannels {
-        let q_entry = -1.2;
-        let q_exit = -0.4;
-        let qdot_exit = 0.73;
-        let q_right = 0.5;
-        let mu = -0.15;
-        let sigma = 0.3_f64.exp();
         let direction_u = array![0.17, -0.11, 0.09, 0.13, -0.07, 0.05];
         let direction_v = array![-0.08, 0.14, -0.06, 0.04, 0.12, -0.09];
         if use_multidir_reference {
@@ -6589,6 +6740,26 @@ mod tests {
         }
     }
 
+    fn latent_full_primary_channels(
+        quadctx: &QuadratureContext,
+        row: &LatentSurvivalRow,
+        include_log_sigma: bool,
+        use_multidir_reference: bool,
+    ) -> LatentFullPrimaryChannels {
+        latent_full_primary_channels_at(
+            quadctx,
+            row,
+            include_log_sigma,
+            use_multidir_reference,
+            -1.2,
+            -0.4,
+            0.73,
+            0.5,
+            -0.15,
+            0.3_f64.exp(),
+        )
+    }
+
     fn assert_latent_full_channels_close(
         label: &str,
         got: &LatentFullPrimaryChannels,
@@ -6658,6 +6829,56 @@ mod tests {
         }
     }
 
+    /// Exact-event tail audit: small/large loaded masses, displaced frailty
+    /// locations, narrow/wide scales, and the learnable-scale axis all retain
+    /// every channel of the signed-log MultiDirJet oracle.  These are analytic
+    /// cross-oracles, not finite differences in a cancellation-prone tail.
+    #[test]
+    fn latent_survival_one_pass_exact_tails_match_multidir_all_channels_932() {
+        let quadctx = QuadratureContext::new();
+        let regimes = [
+            ("tiny-mass-left", -14.0, -10.0, 0.31, 0.0, -5.0, 0.08),
+            ("large-mass-right", 2.0, 6.0, 1.7, 0.0, 3.5, 0.45),
+            ("wide-frailty", -3.0, 1.5, 0.62, 0.0, -1.8, 4.0),
+        ];
+        for (name, q_entry, q_exit, qdot, q_right, mu, sigma) in regimes {
+            let row =
+                LatentSurvivalRow::exact_event(q_entry.exp(), q_exit.exp(), 0.01, 0.04, qdot, 0.07);
+            for include_log_sigma in [false, true] {
+                let reference = latent_full_primary_channels_at(
+                    &quadctx,
+                    &row,
+                    include_log_sigma,
+                    true,
+                    q_entry,
+                    q_exit,
+                    qdot,
+                    q_right,
+                    mu,
+                    sigma,
+                );
+                let got = latent_full_primary_channels_at(
+                    &quadctx,
+                    &row,
+                    include_log_sigma,
+                    false,
+                    q_entry,
+                    q_exit,
+                    qdot,
+                    q_right,
+                    mu,
+                    sigma,
+                );
+                let dimension = if include_log_sigma { 6 } else { 5 };
+                assert_latent_full_channels_close(
+                    &format!("exact-tail={name}, K={dimension}"),
+                    &got,
+                    &reference,
+                );
+            }
+        }
+    }
+
     fn best_elapsed_seconds(mut run: impl FnMut(), iterations: usize, samples: usize) -> f64 {
         let mut best = f64::INFINITY;
         for _ in 0..samples {
@@ -6670,6 +6891,23 @@ mod tests {
         best
     }
 
+    fn measured_channel_ratio(
+        mut reference: impl FnMut(),
+        mut one_pass: impl FnMut(),
+        iterations: usize,
+        samples: usize,
+    ) -> (f64, f64, f64) {
+        reference();
+        one_pass();
+        let reference_seconds = best_elapsed_seconds(&mut reference, iterations, samples);
+        let one_pass_seconds = best_elapsed_seconds(&mut one_pass, iterations, samples);
+        (
+            reference_seconds * 1e6 / iterations as f64,
+            one_pass_seconds * 1e6 / iterations as f64,
+            one_pass_seconds / reference_seconds,
+        )
+    }
+
     /// Full-output pre-cutover benchmark: the baseline includes all 21/28 VGH
     /// row sweeps and all 15/21 third/fourth pair sweeps; the candidate returns
     /// the identical five-channel payload via one Order2, one OneSeed, and one
@@ -6680,24 +6918,134 @@ mod tests {
     fn measure_latent_survival_one_pass_full_output_k5_k6_932() {
         let quadctx = QuadratureContext::new();
         let row = LatentSurvivalRow::exact_event(0.3, 0.67, 0.01, 0.02, 0.73, 0.08);
+        let q_entry = -1.2;
+        let q_exit = -0.4;
+        let qdot_exit = 0.73;
+        let q_right = 0.5;
+        let mu = -0.15;
+        let sigma = 0.3_f64.exp();
+        let direction_u = array![0.17, -0.11, 0.09, 0.13, -0.07, 0.05];
+        let direction_v = array![-0.08, 0.14, -0.06, 0.04, 0.12, -0.09];
         let iterations = if cfg!(debug_assertions) { 1 } else { 5 };
         let samples = if cfg!(debug_assertions) { 1 } else { 3 };
 
         for include_log_sigma in [false, true] {
-            // Warm every quadrature and code path before sampling.
-            std::hint::black_box(latent_full_primary_channels(
-                &quadctx,
-                &row,
-                include_log_sigma,
-                true,
-            ));
-            std::hint::black_box(latent_full_primary_channels(
-                &quadctx,
-                &row,
-                include_log_sigma,
-                false,
-            ));
-            let reference_seconds = best_elapsed_seconds(
+            let dimension = if include_log_sigma { 6 } else { 5 };
+            let (vgh_reference_us, vgh_one_pass_us, vgh_ratio) = measured_channel_ratio(
+                || {
+                    std::hint::black_box(
+                        latent_survival_row_primary_gradient_hessian_multidir_reference(
+                            std::hint::black_box(&quadctx),
+                            std::hint::black_box(&row),
+                            q_entry,
+                            q_exit,
+                            qdot_exit,
+                            q_right,
+                            mu,
+                            sigma,
+                            include_log_sigma,
+                        )
+                        .expect("prechange VGH benchmark"),
+                    );
+                },
+                || {
+                    std::hint::black_box(
+                        latent_survival_row_primary_gradient_hessian(
+                            std::hint::black_box(&quadctx),
+                            std::hint::black_box(&row),
+                            q_entry,
+                            q_exit,
+                            qdot_exit,
+                            q_right,
+                            mu,
+                            sigma,
+                            include_log_sigma,
+                        )
+                        .expect("one-pass VGH benchmark"),
+                    );
+                },
+                iterations,
+                samples,
+            );
+            let (third_reference_us, third_one_pass_us, third_ratio) = measured_channel_ratio(
+                || {
+                    std::hint::black_box(
+                        latent_survival_row_primary_third_contracted_multidir_reference(
+                            std::hint::black_box(&quadctx),
+                            std::hint::black_box(&row),
+                            q_entry,
+                            q_exit,
+                            qdot_exit,
+                            q_right,
+                            mu,
+                            sigma,
+                            std::hint::black_box(&direction_u),
+                            include_log_sigma,
+                        )
+                        .expect("prechange third benchmark"),
+                    );
+                },
+                || {
+                    std::hint::black_box(
+                        latent_survival_row_primary_third_contracted(
+                            std::hint::black_box(&quadctx),
+                            std::hint::black_box(&row),
+                            q_entry,
+                            q_exit,
+                            qdot_exit,
+                            q_right,
+                            mu,
+                            sigma,
+                            std::hint::black_box(&direction_u),
+                            include_log_sigma,
+                        )
+                        .expect("one-pass third benchmark"),
+                    );
+                },
+                iterations,
+                samples,
+            );
+            let (fourth_reference_us, fourth_one_pass_us, fourth_ratio) = measured_channel_ratio(
+                || {
+                    std::hint::black_box(
+                        latent_survival_row_primary_fourth_contracted_multidir_reference(
+                            std::hint::black_box(&quadctx),
+                            std::hint::black_box(&row),
+                            q_entry,
+                            q_exit,
+                            qdot_exit,
+                            q_right,
+                            mu,
+                            sigma,
+                            std::hint::black_box(&direction_u),
+                            std::hint::black_box(&direction_v),
+                            include_log_sigma,
+                        )
+                        .expect("prechange fourth benchmark"),
+                    );
+                },
+                || {
+                    std::hint::black_box(
+                        latent_survival_row_primary_fourth_contracted(
+                            std::hint::black_box(&quadctx),
+                            std::hint::black_box(&row),
+                            q_entry,
+                            q_exit,
+                            qdot_exit,
+                            q_right,
+                            mu,
+                            sigma,
+                            std::hint::black_box(&direction_u),
+                            std::hint::black_box(&direction_v),
+                            include_log_sigma,
+                        )
+                        .expect("one-pass fourth benchmark"),
+                    );
+                },
+                iterations,
+                samples,
+            );
+            let (full_reference_us, full_one_pass_us, full_ratio) = measured_channel_ratio(
                 || {
                     std::hint::black_box(latent_full_primary_channels(
                         std::hint::black_box(&quadctx),
@@ -6706,10 +7054,6 @@ mod tests {
                         true,
                     ));
                 },
-                iterations,
-                samples,
-            );
-            let one_pass_seconds = best_elapsed_seconds(
                 || {
                     std::hint::black_box(latent_full_primary_channels(
                         std::hint::black_box(&quadctx),
@@ -6721,18 +7065,24 @@ mod tests {
                 iterations,
                 samples,
             );
-            let dimension = if include_log_sigma { 6 } else { 5 };
-            let reference_us = reference_seconds * 1e6 / iterations as f64;
-            let one_pass_us = one_pass_seconds * 1e6 / iterations as f64;
-            let ratio = one_pass_seconds / reference_seconds;
             eprintln!(
-                "LATENT-ONE-PASS-932 K={dimension} prechange={reference_us:.3} us/full-output one-pass={one_pass_us:.3} us/full-output ratio={ratio:.4} speedup={:.2}x",
-                1.0 / ratio
+                "LATENT-ONE-PASS-932 K={dimension} VGH prechange={vgh_reference_us:.3}us one-pass={vgh_one_pass_us:.3}us ratio={vgh_ratio:.4} speedup={:.2}x; T3 prechange={third_reference_us:.3}us one-pass={third_one_pass_us:.3}us ratio={third_ratio:.4} speedup={:.2}x; T4 prechange={fourth_reference_us:.3}us one-pass={fourth_one_pass_us:.3}us ratio={fourth_ratio:.4} speedup={:.2}x; FULL prechange={full_reference_us:.3}us one-pass={full_one_pass_us:.3}us ratio={full_ratio:.4} speedup={:.2}x",
+                1.0 / vgh_ratio,
+                1.0 / third_ratio,
+                1.0 / fourth_ratio,
+                1.0 / full_ratio,
             );
-            assert!(
-                ratio < 1.0,
-                "K={dimension} one-pass full output must beat the strongest exact pre-cutover full-output path: ratio={ratio}"
-            );
+            for (channel, ratio) in [
+                ("VGH", vgh_ratio),
+                ("T3", third_ratio),
+                ("T4", fourth_ratio),
+                ("full", full_ratio),
+            ] {
+                assert!(
+                    ratio < 1.0,
+                    "K={dimension} one-pass {channel} must beat the exact pre-cutover path: ratio={ratio}"
+                );
+            }
         }
     }
 }

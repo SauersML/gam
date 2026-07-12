@@ -2392,26 +2392,32 @@ mod moment_engine_tests {
     impl<J: FlexJet> FlexJet for ForcedOrder4<J> {
         const ORDER: usize = 4;
 
+        #[inline(always)]
         fn value(&self) -> f64 {
             self.0.value()
         }
 
+        #[inline(always)]
         fn add(&self, other: &Self) -> Self {
             Self(self.0.add(&other.0))
         }
 
+        #[inline(always)]
         fn sub(&self, other: &Self) -> Self {
             Self(self.0.sub(&other.0))
         }
 
+        #[inline(always)]
         fn mul(&self, other: &Self) -> Self {
             Self(self.0.mul(&other.0))
         }
 
+        #[inline(always)]
         fn scale(&self, scale: f64) -> Self {
             Self(self.0.scale(scale))
         }
 
+        #[inline(always)]
         fn compose_unary(&self, derivatives: [f64; 5]) -> Self {
             Self(self.0.compose_unary(derivatives))
         }

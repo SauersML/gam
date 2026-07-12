@@ -1003,40 +1003,29 @@ fn scaled_second_moment_chunk(
 /// `S = (1/n) Σ_n (r_n r_nᵀ) / c(z_n)` — the O(N·p²) scale-deflated second moment
 /// that dominates each alternation sweep of the residual-factor fit.
 ///
-/// Parallelized over FIXED contiguous row chunks whose `p×p` partials are summed
-/// in CHUNK ORDER, so the result is bit-reproducible and independent of the thread
-/// count (the estimator's determinism contract holds) — it differs from a single
-/// running row-sum only in the harmless grouping of accumulation round-off, which
-/// the trailing symmetrization already absorbs. Engaged only above a row threshold
-/// (the serial path stays exact on small inputs and avoids rayon overhead) and only
-/// when NOT already inside a rayon worker (the same nesting discipline the
-/// Arrow-Schur solve uses — a nested call runs the serial reduction so an outer
-/// parallel region keeps its cores).
+/// Reduced over the deterministic length-only pairwise tree
+/// [`par_deterministic_block_fold`]: the `p×p` partial of each `BASE_CHUNK`-row
+/// base block is combined by the same `left_split` association regardless of
+/// thread count OR nesting, so the result is a pure function of the ordered rows
+/// (#2228 reduction doctrine — parallel and nested-serial evaluation are
+/// bit-identical, not merely run-to-run reproducible). The tree self-serializes
+/// below `BASE_CHUNK` rows (a base block is folded directly with no `rayon::join`),
+/// so small inputs and nested calls stay on a single thread without a separate
+/// branch that could associate the round-off differently.
 fn scaled_second_moment(r: ArrayView2<'_, f64>, row_scale: &Array1<f64>) -> Array2<f64> {
-    use rayon::prelude::*;
-    const PARALLEL_ROW_MIN: usize = 8192;
-    const CHUNK_ROWS: usize = 2048;
+    use gam_linalg::pairwise_reduce::par_deterministic_block_fold;
     let n = r.nrows();
     let p = r.ncols();
 
-    let mut s = if n >= PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
-        let n_chunks = n.div_ceil(CHUNK_ROWS);
-        let partials: Vec<Array2<f64>> = (0..n_chunks)
-            .into_par_iter()
-            .map(|c| {
-                let lo = c * CHUNK_ROWS;
-                let hi = ((c + 1) * CHUNK_ROWS).min(n);
-                scaled_second_moment_chunk(r, row_scale, lo, hi)
-            })
-            .collect();
-        let mut acc = Array2::<f64>::zeros((p, p));
-        for part in &partials {
-            acc += part;
-        }
-        acc
-    } else {
-        scaled_second_moment_chunk(r, row_scale, 0, n)
-    };
+    let mut s = par_deterministic_block_fold(
+        n,
+        |range: core::ops::Range<usize>| scaled_second_moment_chunk(r, row_scale, range.start, range.end),
+        |mut acc: Array2<f64>, part: Array2<f64>| {
+            acc += &part;
+            acc
+        },
+    )
+    .unwrap_or_else(|| Array2::<f64>::zeros((p, p)));
 
     s.mapv_inplace(|v| v / n as f64);
     // Symmetrize against accumulation round-off.

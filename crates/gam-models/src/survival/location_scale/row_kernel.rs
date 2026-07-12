@@ -3684,6 +3684,18 @@ mod patterned_order2_perf_tests {
         for d in [0.0, 1.0] {
             let mut endpoint_kernel = kernel;
             endpoint_kernel.d = d;
+            if d == 0.0 {
+                endpoint_kernel.logphi1 = f64::NAN;
+                endpoint_kernel.dlogphi1 = f64::NAN;
+                endpoint_kernel.d2logphi1 = f64::NAN;
+                endpoint_kernel.log_g = f64::NAN;
+                endpoint_kernel.d_log_g = f64::NAN;
+                endpoint_kernel.d2_log_g = f64::NAN;
+            } else {
+                endpoint_kernel.log_s1 = f64::NAN;
+                endpoint_kernel.r1 = f64::NAN;
+                endpoint_kernel.dr1 = f64::NAN;
+            }
             let endpoint_want = dense(&p, &endpoint_kernel);
             let endpoint_got = hand_fused(&p, &endpoint_kernel);
             close(endpoint_got.0, endpoint_want.0, "fused-hand endpoint value");

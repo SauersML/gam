@@ -413,7 +413,7 @@ pub fn bessel_i0_log_minus_abs_and_ratio(eta: f64) -> (f64, f64) {
 /// and in the *ratio* (`I1/I0 = poly₁/poly₀`), so both are computed from the
 /// bounded scaled polynomials alone — exact for non-degenerate η and finite for
 /// every finite η.
-pub fn bessel_i0_log_and_ratio(eta: f64) -> (f64, f64) {
+pub(crate) fn bessel_i0_log_and_ratio(eta: f64) -> (f64, f64) {
     let (centered_log_i0, ratio) = bessel_i0_log_minus_abs_and_ratio(eta);
     (eta.abs() + centered_log_i0, ratio)
 }
@@ -1491,6 +1491,27 @@ mod tests {
             (ratio_1 - 0.446_389_221_869_1_f64).abs() < 1.0e-6,
             "I1/I0(1) reference mismatch, got {ratio_1}"
         );
+    }
+
+    #[test]
+    fn centered_bessel_log_preserves_thin_ring_cancellation() {
+        for &eta in &[0.0_f64, 1.0, 3.74, 3.76, 900.0] {
+            let (log_i0, ratio) = bessel_i0_log_and_ratio(eta);
+            let (centered, centered_ratio) = bessel_i0_log_minus_abs_and_ratio(eta);
+            assert!((centered + eta.abs() - log_i0).abs() < 2.0e-13);
+            assert_eq!(centered_ratio, ratio);
+        }
+
+        // Forming log(I0(eta))-eta cannot retain this O(log eta) remainder
+        // once eta dwarfs the f64 mantissa. The centered branch never forms
+        // either exponentially/linearly large term and remains informative.
+        for &eta in &[1.0e20_f64, 1.0e100, 1.0e300] {
+            let (centered, ratio) = bessel_i0_log_minus_abs_and_ratio(eta);
+            let asymptotic = -0.5 * (std::f64::consts::TAU * eta).ln();
+            assert!(centered.is_finite() && ratio.is_finite());
+            assert!((centered - asymptotic).abs() < 2.0e-8);
+            assert!((0.0..=1.0).contains(&ratio));
+        }
     }
 
     #[test]

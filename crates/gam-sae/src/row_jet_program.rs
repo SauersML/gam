@@ -1057,19 +1057,19 @@ mod tests_schedule_source {
             0
         }
 
-        fn beta_border_atom(&self, _border: usize) -> usize {
+        fn beta_border_atom(&self, _: usize) -> usize {
             panic!("owned row-program oracle has no beta borders")
         }
 
-        fn beta_border_basis_value(&self, _border: usize) -> f64 {
+        fn beta_border_basis_value(&self, _: usize) -> f64 {
             panic!("owned row-program oracle has no beta borders")
         }
 
-        fn beta_border_basis_first(&self, _border: usize, _axis: usize) -> f64 {
+        fn beta_border_basis_first(&self, _: usize, _: usize) -> f64 {
             panic!("owned row-program oracle has no beta borders")
         }
 
-        fn beta_border_output(&self, _border: usize) -> &[f64] {
+        fn beta_border_output(&self, _: usize) -> &[f64] {
             panic!("owned row-program oracle has no beta borders")
         }
     }

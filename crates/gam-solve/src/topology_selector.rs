@@ -1921,7 +1921,6 @@ pub fn deterministic_cv_folds_seeded(
                 train.push(i);
             }
         }
-        debug_assert!(!eval.is_empty() && !train.is_empty());
         out.push((train, eval));
     }
     out

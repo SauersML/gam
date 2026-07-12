@@ -4332,10 +4332,11 @@ impl SaeManifoldTerm {
         // into ONE row-parallel pass that never materialises the fitted matrix:
         // each row decodes its atoms into per-worker scratch, differences
         // against the target, and contributes its scalar `0.5·w·‖r‖²` to a
-        // chunk-ordered fold (bit-identical run-to-run). Per-worker scratch
-        // (`map_init`) keeps the only allocations one `g_buf`/`fitted_row` pair
-        // per rayon thread rather than per row. Stay sequential inside a worker
-        // (the topology race owns the outer pool) to avoid nested
+        // deterministic length-only pairwise tree (bit-identical across thread
+        // count AND nesting — see the fold below). Per-block scratch keeps the
+        // only allocations one `g_buf`/`fitted_row`/`assign_buf` triple per base
+        // block rather than per row, and each base block pins its faer GEMMs to
+        // `Par::Seq` (the topology race owns the outer pool) to avoid nested
         // oversubscription.
         let parallel = n >= SAE_LOSS_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
         let row_data_fit = |row: usize,

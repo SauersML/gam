@@ -42,7 +42,7 @@ use gam::inference::structure_evidence::{
     select_probe_by_expected_evidence as core_select_probe_by_expected_evidence,
     split_likelihood_log_e_value,
 };
-use gam::terms::sae::manifold::{bessel_i0_log_and_ratio, bessel_i0_log_minus_abs_and_ratio};
+use gam::terms::sae::manifold::bessel_i0_log_minus_abs_and_ratio;
 
 use crate::py_value_error;
 
@@ -1258,7 +1258,7 @@ mod tests {
             let dy = coords[[row, 1]] - fit.center[1];
             let observed_radius = dx.hypot(dy);
             let kappa = fit.radius * observed_radius / fit.noise_variance;
-            let (_, bessel_ratio) = bessel_i0_log_and_ratio(kappa);
+            let (_, bessel_ratio) = bessel_i0_log_minus_abs_and_ratio(kappa);
             let center_multiplier =
                 (1.0 - fit.radius * bessel_ratio / observed_radius) / fit.noise_variance;
             center_score[0] += center_multiplier * dx;
@@ -1382,6 +1382,14 @@ mod tests {
             transformed[[row, 0]] = 0.25 + scale * (cos_angle * x - sin_angle * y);
             transformed[[row, 1]] = -0.5 + scale * (sin_angle * x + cos_angle * y);
         }
+        let canonical = canonical_shape_coordinates(coords.view()).unwrap();
+        let transformed_canonical = canonical_shape_coordinates(transformed.view()).unwrap();
+        for row in 0..n {
+            let expected_x = cos_angle * canonical[[row, 0]] - sin_angle * canonical[[row, 1]];
+            let expected_y = sin_angle * canonical[[row, 0]] + cos_angle * canonical[[row, 1]];
+            assert!((transformed_canonical[[row, 0]] - expected_x).abs() < 2.0e-11);
+            assert!((transformed_canonical[[row, 1]] - expected_y).abs() < 2.0e-11);
+        }
         let changed = gaussian_provider_2d(transformed.clone())(&train, &eval).unwrap();
         let jacobian_shift = -2.0 * scale.ln();
         for (&base, &under_similarity) in baseline.iter().zip(&changed) {
@@ -1440,6 +1448,26 @@ mod tests {
         let error = GaussianFit2d::fit(coincident.view(), &[0, 1, 2, 3, 4])
             .expect_err("a zero-dimensional point mass is not a 2-D Gaussian density");
         assert!(error.contains("zero"), "{error}");
+    }
+
+    #[test]
+    fn circular_verdict_aggregates_within_class_stacking_mass() {
+        let names = vec![
+            "circle".to_string(),
+            "euclidean".to_string(),
+            "mixture_k7".to_string(),
+            "ring_clusters_k7".to_string(),
+        ];
+        // No individual circular candidate beats Euclidean (0.30 < 0.40), but
+        // the circular topology class owns 0.60 total mass. A max-vs-max rule
+        // would make the class verdict depend on how finely that class happened
+        // to be represented in the candidate list.
+        let (circular, noncircular, margin, circle_wins) =
+            circular_stacking_summary(&names, &[0.30, 0.40, 0.0, 0.30]).unwrap();
+        assert!((circular - 0.60).abs() < 1e-15);
+        assert!((noncircular - 0.40).abs() < 1e-15);
+        assert!((margin - 0.20).abs() < 1e-15);
+        assert!(circle_wins);
     }
 
     /// #2262 structureless-null control: on pure isotropic Gaussian noise (no
@@ -1856,7 +1884,7 @@ impl CircularGaussianFit2d {
                     *latent_mean = [0.0, 0.0];
                 } else {
                     let kappa = radius * observed_radius / noise_variance;
-                    let (_, bessel_ratio) = bessel_i0_log_and_ratio(kappa);
+                    let (_, bessel_ratio) = bessel_i0_log_minus_abs_and_ratio(kappa);
                     if !(bessel_ratio.is_finite() && (0.0..=1.0).contains(&bessel_ratio)) {
                         return Err("circle density Bessel ratio left [0, 1]".to_string());
                     }
@@ -2130,10 +2158,91 @@ struct AtomShapeRaceVerdict {
     negative_log_evidence: Vec<f64>,
     mixture_k: usize,
     ring_clusters_k: usize,
+    circular_stacking_weight: f64,
+    noncircular_stacking_weight: f64,
     circular_margin: f64,
     circle_wins: bool,
     is_cross_class: bool,
     headline: &'static str,
+}
+
+fn circular_stacking_summary(
+    candidate_names: &[String],
+    stacking_weights: &[f64],
+) -> Result<(f64, f64, f64, bool), String> {
+    if candidate_names.len() != stacking_weights.len() || candidate_names.is_empty() {
+        return Err(format!(
+            "shape stacking result has {} candidate names but {} weights",
+            candidate_names.len(),
+            stacking_weights.len()
+        ));
+    }
+    let mut circular_weight = 0.0_f64;
+    let mut noncircular_weight = 0.0_f64;
+    for (name, &weight) in candidate_names.iter().zip(stacking_weights) {
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(format!(
+                "shape stacking returned invalid weight {weight} for candidate {name}"
+            ));
+        }
+        if name.starts_with("circle") || name.starts_with("ring_clusters") {
+            circular_weight += weight;
+        } else {
+            noncircular_weight += weight;
+        }
+    }
+    let total = circular_weight + noncircular_weight;
+    if !total.is_finite() || (total - 1.0).abs() > 64.0 * f64::EPSILON.sqrt() {
+        return Err(format!(
+            "shape stacking weights must have unit mass; got {total}"
+        ));
+    }
+    let circular_margin = circular_weight - noncircular_weight;
+    Ok((
+        circular_weight,
+        noncircular_weight,
+        circular_margin,
+        circular_margin > 0.0,
+    ))
+}
+
+/// Fix the arbitrary translation and uniform-scale gauge of a 2-D intrinsic
+/// chart before *any* candidate is fitted.  The common transformation has no
+/// shape content, and using one canonical chart keeps fixed numerical
+/// constraints inside the mixture solvers from turning coordinate units into
+/// topology evidence.
+fn canonical_shape_coordinates(coords: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+    if coords.ncols() != 2 || coords.nrows() == 0 || !coords.iter().all(|value| value.is_finite()) {
+        return Err("shape coordinates must be a nonempty finite (n, 2) matrix".to_string());
+    }
+    let anchor = [coords[[0, 0]], coords[[0, 1]]];
+    let count = coords.nrows() as f64;
+    let mut mean_offset = [0.0_f64; 2];
+    for row in 0..coords.nrows() {
+        mean_offset[0] += coords[[row, 0]] - anchor[0];
+        mean_offset[1] += coords[[row, 1]] - anchor[1];
+    }
+    mean_offset[0] /= count;
+    mean_offset[1] /= count;
+    let mut centered = Array2::<f64>::zeros(coords.raw_dim());
+    let mut squared_scale = 0.0_f64;
+    for row in 0..coords.nrows() {
+        let x = (coords[[row, 0]] - anchor[0]) - mean_offset[0];
+        let y = (coords[[row, 1]] - anchor[1]) - mean_offset[1];
+        centered[[row, 0]] = x;
+        centered[[row, 1]] = y;
+        squared_scale += x * x + y * y;
+    }
+    squared_scale /= count;
+    if !(squared_scale.is_finite() && squared_scale > 0.0) {
+        return Err("shape coordinates have zero or non-finite centered scale".to_string());
+    }
+    let scale = squared_scale.sqrt();
+    centered.mapv_inplace(|value| value / scale);
+    if centered.iter().any(|value| !value.is_finite()) {
+        return Err("canonical shape coordinates are non-finite".to_string());
+    }
+    Ok(centered)
 }
 
 fn run_atom_shape_race(
@@ -2162,7 +2271,7 @@ fn run_atom_shape_race(
     if !coords.iter().all(|value| value.is_finite()) {
         return Err("adjudicate_atom_shape: coords must be finite".to_string());
     }
-    let owned = coords.to_owned();
+    let owned = canonical_shape_coordinates(coords)?;
     let n = owned.nrows();
     let config = GaussianMixtureConfig::default();
     // `Euclidean` already is the one-component full Gaussian. Letting the
@@ -2193,7 +2302,17 @@ fn run_atom_shape_race(
         );
     }
     let mixture = fit_mixture_rung(owned.view(), &mixture_ladder, config)?;
-    let mixture_k = mixture.winner().k;
+    // Local order refinement deliberately probes immediate neighbours and may
+    // therefore fit k=1 while bracketing a k=2 coarse rung.  That fit is useful
+    // to the in-class search but is ineligible for this race: Euclidean already
+    // represents the one-component full Gaussian. Select the best ranked
+    // eligible fit after refinement instead of accidentally reintroducing the
+    // duplicate column we removed from the input ladder.
+    let mixture_winner =
+        mixture.fits.iter().find(|fit| fit.k >= 2).ok_or_else(|| {
+            "shape mixture refinement produced no eligible order k >= 2".to_string()
+        })?;
+    let mixture_k = mixture_winner.k;
     let ring_clusters = fit_ring_of_clusters_rung(owned.view(), &ring_cluster_ladder, config)?;
     let ring_clusters_k = ring_clusters.winner().k;
     let candidates = vec![
@@ -2211,7 +2330,7 @@ fn run_atom_shape_race(
         },
         CrossClassCandidate {
             kind: AutoTopologyKind::Mixture { k: mixture_k },
-            negative_log_evidence: mixture.winner().negative_log_evidence,
+            negative_log_evidence: mixture_winner.negative_log_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: mixture_density_provider(owned.view(), mixture_k, config),
         },
@@ -2226,36 +2345,28 @@ fn run_atom_shape_race(
             ),
         },
     ];
-    let candidate_count = candidates.len();
     let verdict =
         adjudicate_cross_class_race(n, candidates, folds, seed, StackingConfig::default())?;
     let stacking_weights = verdict
         .stacking
         .as_ref()
         .map(|stacking| stacking.weights.to_vec())
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            "shape race mixed model classes but returned no stacking result".to_string()
+        })?;
     let winner = verdict.candidate_names[verdict.winner_index].clone();
-    let circular_margin = if stacking_weights.len() == candidate_count {
-        let (mut circular_best, mut noncircular_best) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
-        for (name, &weight) in verdict.candidate_names.iter().zip(&stacking_weights) {
-            if name.starts_with("circle") || name.starts_with("ring_clusters") {
-                circular_best = circular_best.max(weight);
-            } else {
-                noncircular_best = noncircular_best.max(weight);
-            }
-        }
-        circular_best - noncircular_best
-    } else {
-        f64::NAN
-    };
+    let (circular_stacking_weight, noncircular_stacking_weight, circular_margin, circle_wins) =
+        circular_stacking_summary(&verdict.candidate_names, &stacking_weights)?;
     Ok(AtomShapeRaceVerdict {
-        circle_wins: winner.starts_with("circle") || winner.starts_with("ring_clusters"),
+        circle_wins,
         winner,
         candidate_names: verdict.candidate_names,
         stacking_weights,
         negative_log_evidence: verdict.negative_log_evidence,
         mixture_k,
         ring_clusters_k,
+        circular_stacking_weight,
+        noncircular_stacking_weight,
         circular_margin,
         is_cross_class: verdict.is_cross_class,
         headline: match verdict.headline {
@@ -2327,6 +2438,11 @@ fn atom_shape_verdict_dict<'py>(
     out.set_item("negative_log_evidence", &verdict.negative_log_evidence)?;
     out.set_item("mixture_k", verdict.mixture_k)?;
     out.set_item("ring_clusters_k", verdict.ring_clusters_k)?;
+    out.set_item("circular_stacking_weight", verdict.circular_stacking_weight)?;
+    out.set_item(
+        "noncircular_stacking_weight",
+        verdict.noncircular_stacking_weight,
+    )?;
     out.set_item("circular_margin", verdict.circular_margin)?;
     out.set_item("circle_wins", verdict.circle_wins)?;
     out.set_item("is_cross_class", verdict.is_cross_class)?;
@@ -2371,8 +2487,10 @@ pub(crate) fn shape_matched_control<'py>(
 /// ring-of-clusters mixture whose centers share one fitted circle. The headline
 /// is held-out predictive stacking through the exact production race machinery.
 /// Returns the winner, per-candidate weights/evidences, both selected mixture
-/// orders, and the best circular candidate's margin over the best non-circular
-/// contender.
+/// orders, and the total circular stacking mass minus the total non-circular
+/// stacking mass. Aggregating within topology class makes `circle_wins`
+/// invariant to splitting predictive mass between the smooth-circle and
+/// ring-of-clusters candidates; `winner` remains the best individual candidate.
 ///
 /// `coords` is the `(n, 2)` intrinsic-coordinate matrix (e.g. `fit.coords[0]`
 /// from `sae_manifold_fit`). `folds`/`seed` control the deterministic CV folding
