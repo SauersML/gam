@@ -7,9 +7,9 @@
 //! is the latent position. The exact joint Newton calculus consumes the first
 //! through fourth derivatives `m1..m4 = d^kF/dq^k`.
 //!
-//! Probit, logit, and cloglog have stable closed forms (the fast path); any
-//! other link falls back to the generic inverse-link jet plus the analytic
-//! fourth derivative of the inverse-link pdf. All functions here are pure.
+//! Probit, logit, and cloglog each expose one stable four-entry primitive stack;
+//! every consumer selects its required prefix from that stack. Other links use
+//! the same generic inverse-link jet composition. All functions here are pure.
 
 use gam_math::jet_tower::{Tower3, Tower4};
 use gam_math::probability::normal_logcdf_derivatives;
@@ -343,15 +343,8 @@ pub(super) fn binomial_neglog_q_derivatives_logit_closed_form(
     // with G = logistic CDF. All three are exact derivatives of the evaluated
     // softplus loss F(q) = w[(1-y)q + softplus(-q)]:
     //   m1 = w(p - y),  m2 = ws,  m3 = ws(1 - 2p),  with s = p(1-p).
-    if weight == 0.0 || !q.is_finite() {
-        return (0.0, 0.0, 0.0);
-    }
-    let (p, s) = logit_probability_and_variance(q);
-
-    let m1 = weight * (p - y);
-    let m2 = weight * s;
-    let m3 = weight * s * (1.0 - 2.0 * p);
-    (m1, m2, m3)
+    let stack = binomial_neglog_q_derivatives_logit_stack(y, weight, q);
+    (stack[0], stack[1], stack[2])
 }
 
 #[inline]
@@ -368,13 +361,24 @@ pub(super) fn binomial_neglog_q_fourth_derivative_logit_closed_form(
     // even-order derivatives of the canonical Bernoulli NLL are functions
     // of p alone. The y-dependence cancels out in the chain rule because
     // the logit is the canonical link.
+    binomial_neglog_q_derivatives_logit_stack(x, weight, q)[3]
+}
+
+#[inline]
+fn binomial_neglog_q_derivatives_logit_stack(y: f64, weight: f64, q: f64) -> [f64; 4] {
     if weight == 0.0 || !q.is_finite() {
-        return 0.0;
+        return [0.0; 4];
     }
     // Exact `s = p(1-p)` via the cancellation-free tail form — see
-    // `logit_probability_and_variance`. m4 depends only on s.
-    let (_p, s) = logit_probability_and_variance(q);
-    weight * s * (1.0 - 6.0 * s)
+    // `logit_probability_and_variance`.
+    let (p, s) = logit_probability_and_variance(q);
+    let weighted_variance = weight * s;
+    [
+        weight * (p - y),
+        weighted_variance,
+        weighted_variance * (1.0 - 2.0 * p),
+        weighted_variance * (1.0 - 6.0 * s),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -466,31 +470,8 @@ pub(super) fn binomial_neglog_q_derivatives_cloglog_closed_form(
 ) -> (f64, f64, f64) {
     // Returns (m1, m2, m3) for F(q) = -w[y log G(q) + (1-y) log(1-G(q))]
     // with G = cloglog CDF: G(q) = 1 - exp(-exp(q)).
-    if weight == 0.0 || !q.is_finite() {
-        return (0.0, 0.0, 0.0);
-    }
-    let z = q.exp(); // z = e^q; may be large but that's handled below
-    let h = cloglog_stable_h(z);
-    let y0 = 1.0 - y;
-    let y0_term = if y0 == 0.0 { 0.0 } else { y0 * z };
-
-    // y=0 branch: all derivatives equal w*z (since F_{y=0} = w*e^q).
-    // y=1 branch: uses the h-polynomial forms.
-    // General y: linear combination.
-    //
-    // Once h rounds to 0, the y=1 contribution has already underflowed to 0
-    // in f64. Returning the remaining y=0 branch here avoids 0 * inf products
-    // when q is deep in the right tail.
-    if y == 0.0 || h == 0.0 {
-        let base = weight * y0_term;
-        return (base, base, base);
-    }
-
-    let m1 = weight * (y0_term - y * h);
-    let m2 = weight * (y0_term + y * h * (h + z - 1.0));
-    let m3 =
-        weight * (y0_term - y * h * (2.0 * h * h + 3.0 * (z - 1.0) * h + z * z - 3.0 * z + 1.0));
-    (m1, m2, m3)
+    let stack = binomial_neglog_q_derivatives_cloglog_stack(y, weight, q);
+    (stack[0], stack[1], stack[2])
 }
 
 #[inline]
@@ -501,15 +482,22 @@ pub(super) fn binomial_neglog_q_fourth_derivative_cloglog_closed_form(
 ) -> f64 {
     // Returns m4 = d^4F/dq^4 for cloglog link.
     // m4 = w[(1-y)z + yh(6h^3 + 12(z-1)h^2 + (7z^2-18z+7)h + z^3-6z^2+7z-1)]
+    binomial_neglog_q_derivatives_cloglog_stack(y, weight, q)[3]
+}
+
+#[inline]
+fn binomial_neglog_q_derivatives_cloglog_stack(y: f64, weight: f64, q: f64) -> [f64; 4] {
     if weight == 0.0 || !q.is_finite() {
-        return 0.0;
+        return [0.0; 4];
     }
     let z = q.exp();
     let h = cloglog_stable_h(z);
     let y0 = 1.0 - y;
     let y0_term = if y0 == 0.0 { 0.0 } else { y0 * z };
+    // Once h rounds to zero, the y=1 contribution is below precision. Avoid
+    // forming its `0 * inf` right-tail polynomials.
     if y == 0.0 || h == 0.0 {
-        return weight * y0_term;
+        return [weight * y0_term; 4];
     }
     let h2 = h * h;
     let h3 = h2 * h;
@@ -519,7 +507,12 @@ pub(super) fn binomial_neglog_q_fourth_derivative_cloglog_closed_form(
         - 6.0 * z2
         + 7.0 * z
         - 1.0;
-    weight * (y0_term + y * h * y1_poly)
+    [
+        weight * (y0_term - y * h),
+        weight * (y0_term + y * h * (h + z - 1.0)),
+        weight * (y0_term - y * h * (2.0 * h2 + 3.0 * (z - 1.0) * h + z2 - 3.0 * z + 1.0)),
+        weight * (y0_term + y * h * y1_poly),
+    ]
 }
 
 #[inline]
@@ -558,9 +551,9 @@ pub(super) fn binomial_neglog_q_fourth_derivative_from_jet(
 // Unified exact dispatch for binomial m1–m4
 // ---------------------------------------------------------------------------
 //
-// Closed forms remain the fast path for Probit, Logit, and CLogLog, but the
-// exact joint Newton calculus is not restricted to those links. When no
-// closed form is available, we use the generic inverse-link jet plus the
+// Stable primitive stacks serve Probit, Logit, and CLogLog, but the exact joint
+// Newton calculus is not restricted to those links. Every other link uses the
+// generic inverse-link jet plus the
 // analytic third derivative of the inverse-link pdf (f''' = μ'''', the fourth
 // derivative of the inverse-link CDF).
 // ---------------------------------------------------------------------------
