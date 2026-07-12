@@ -255,7 +255,7 @@ fn run_race(data: &Array2<f64>) -> RaceOutcome {
         fit_union_rung(data.view(), cfg).expect("union rung must fit at least one composite");
     let union_winner = rung.winner();
     let union_structure = union_winner.structure;
-    let union_evidence = union_winner.negative_log_evidence;
+    let union_evidence = union_winner.bic;
 
     // Pure-rung evidences (corroboration only; the headline is stacking).
     let ring_evidence = ring_negative_log_evidence(data.view());
@@ -498,21 +498,16 @@ fn fit_union_candidate_prices_by_total_parameter_count() {
         "rung total_parameters must mirror the inner UnionStructureFit"
     );
     // Summed evidence equals the sum of the per-component negative-log-evidences.
-    let summed: f64 = fit
-        .fit
-        .components
-        .iter()
-        .map(|c| c.negative_log_evidence)
-        .sum();
+    let summed: f64 = fit.fit.components.iter().map(|c| c.bic).sum();
     assert!(
-        (fit.negative_log_evidence - summed).abs() <= 1e-9 * (1.0 + summed.abs()),
+        (fit.bic - summed).abs() <= 1e-9 * (1.0 + summed.abs()),
         "union negative-log-evidence must be the SUM of component evidences \
          (got {:.6}, sum {:.6})",
-        fit.negative_log_evidence,
+        fit.bic,
         summed,
     );
     assert!(
-        fit.negative_log_evidence.is_finite(),
+        fit.bic.is_finite(),
         "summed rank-aware Laplace evidence must be finite"
     );
     let total_component_params: usize = fit.fit.components.iter().map(|c| c.num_parameters).sum();

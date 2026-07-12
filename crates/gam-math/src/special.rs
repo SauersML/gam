@@ -80,6 +80,97 @@ pub fn stable_polynomial_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
     scale * tail
 }
 
+/// Large-argument (`|x| >= 3.75`) Abramowitz & Stegun 9.8.2 polynomial for the
+/// exponentially scaled modified Bessel function `I0`:
+/// `sqrt(x) exp(-x) I0(x)`. Factoring out the common `exp(x) / sqrt(x)`
+/// envelope lets the log partition and `I1 / I0` ratio be evaluated without
+/// overflow.
+#[inline]
+fn bessel_i0_scaled_polynomial(ax: f64) -> f64 {
+    let y = 3.75 / ax;
+    0.39894228
+        + y * (0.01328592
+            + y * (0.00225319
+                + y * (-0.00157565
+                    + y * (0.00916281
+                        + y * (-0.02057706
+                            + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377)))))))
+}
+
+/// Large-argument (`|x| >= 3.75`) Abramowitz & Stegun 9.8.4 polynomial for the
+/// exponentially scaled modified Bessel function `I1`. Its envelope is the
+/// same as [`bessel_i0_scaled_polynomial`], so it cancels exactly in `I1 / I0`.
+#[inline]
+fn bessel_i1_scaled_polynomial(ax: f64) -> f64 {
+    let y = 3.75 / ax;
+    0.39894228
+        + y * (-0.03988024
+            + y * (-0.00362018
+                + y * (0.00163801
+                    + y * (-0.01031555
+                        + y * (0.02282967
+                            + y * (-0.02895312 + y * (0.01787654 - y * 0.00420059)))))))
+}
+
+#[inline]
+fn bessel_i0_small(ax: f64) -> f64 {
+    let t = ax / 3.75;
+    let t2 = t * t;
+    1.0 + t2
+        * (3.5156229
+            + t2 * (3.0899424
+                + t2 * (1.2067492 + t2 * (0.2659732 + t2 * (0.0360768 + t2 * 0.0045813)))))
+}
+
+#[inline]
+fn bessel_i1_small(ax: f64) -> f64 {
+    let t = ax / 3.75;
+    let t2 = t * t;
+    ax * (0.5
+        + t2
+            * (0.87890594
+                + t2
+                    * (0.51498869
+                        + t2
+                            * (0.15084934
+                                + t2
+                                    * (0.02658733
+                                        + t2 * (0.00301532 + t2 * 0.00032411))))))
+}
+
+/// Overflow-free `(log I0(eta) - |eta|, I1(|eta|) / I0(|eta|))`.
+///
+/// Centering the logarithm by its leading `|eta|` term is essential whenever a
+/// likelihood cancels the Bessel growth against an equally large quadratic,
+/// as in a Gaussian-blurred circle. The large-argument branch never forms
+/// `exp(|eta|)`, and therefore remains finite beyond the ordinary exponential
+/// overflow threshold and up to the largest finite `f64`.
+pub fn bessel_i0_log_minus_abs_and_ratio(eta: f64) -> (f64, f64) {
+    let ax = eta.abs();
+    if ax < 3.75 {
+        let i0 = bessel_i0_small(ax);
+        let i1 = bessel_i1_small(ax);
+        (i0.ln() - ax, i1 / i0)
+    } else {
+        let polynomial_0 = bessel_i0_scaled_polynomial(ax);
+        let polynomial_1 = bessel_i1_scaled_polynomial(ax);
+        (
+            -0.5 * ax.ln() + polynomial_0.ln(),
+            polynomial_1 / polynomial_0,
+        )
+    }
+}
+
+/// Overflow-free `(log I0(eta), I1(|eta|) / I0(|eta|))`.
+///
+/// Consumers whose formulas cancel the leading `|eta|` term should use
+/// [`bessel_i0_log_minus_abs_and_ratio`] directly, rather than forming that
+/// cancellation after this function returns.
+pub fn bessel_i0_log_and_ratio(eta: f64) -> (f64, f64) {
+    let (centered_log_i0, ratio) = bessel_i0_log_minus_abs_and_ratio(eta);
+    (eta.abs() + centered_log_i0, ratio)
+}
+
 /// Gauss-Legendre nodes and weights on `[-1, 1]` for `n` points, computed via
 /// Newton iteration on the Legendre-polynomial roots (Bonnet's three-term
 /// recurrence, cosine initial guess). Returns `(nodes, weights)` with nodes

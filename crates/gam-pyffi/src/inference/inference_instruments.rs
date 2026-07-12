@@ -2662,7 +2662,7 @@ fn run_atom_shape_race(
         return Err("adjudicate_atom_shape: coords must be finite".to_string());
     }
     // Full-data coordinates are canonicalized only for reporting fits and
-    // corroborative evidences. Every outer-CV provider below receives the raw
+    // corroborating BIC/2 scores. Every outer-CV provider below receives the raw
     // chart and derives its gauge from that fold's training rows alone.
     let reporting_coords = canonical_shape_coordinates(coords)?;
     let raw_coords = coords.to_owned();
@@ -2982,7 +2982,7 @@ pub(crate) fn shape_matched_control_f32<'py>(
 /// mappings summarize them. `mixture_reporting_k` and
 /// `ring_clusters_reporting_k` are separate all-data fits for interpretation and
 /// final deployment. The result also returns per-class stacking weights and
-/// full-data evidences. Aggregating the smooth-circle and ring-cluster weights
+/// full-data BIC/2 corroborating scores. Aggregating the smooth-circle and ring-cluster weights
 /// makes `circle_wins` invariant to an arbitrary split of predictive mass inside
 /// the circular class; `circular_margin` is circular minus non-circular mass.
 ///

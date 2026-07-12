@@ -1632,7 +1632,7 @@ pub struct UnionRungFit {
     /// `Σ_c P_c` — total free-parameter count across all components.
     pub total_parameters: usize,
     /// Summed component BIC/2.
-    pub negative_log_evidence: f64,
+    pub bic: f64,
 }
 
 /// Result of fitting the whole fixed union ladder: every fitted composite plus
@@ -1670,7 +1670,7 @@ pub fn fit_union_rung(
         .map(|fit| UnionRungFit {
             structure: fit.structure,
             total_parameters: fit.total_parameters,
-            negative_log_evidence: fit.negative_log_evidence,
+            bic: fit.bic,
             fit,
         })
         .collect();
@@ -1695,7 +1695,7 @@ pub fn fit_union_candidate(
     Ok(UnionRungFit {
         structure: fit.structure,
         total_parameters: fit.total_parameters,
-        negative_log_evidence: fit.negative_log_evidence,
+        bic: fit.bic,
         fit,
     })
 }

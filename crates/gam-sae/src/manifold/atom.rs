@@ -1,4 +1,5 @@
 use super::*;
+use gam_math::special::{bessel_i0_log_and_ratio, bessel_i0_log_minus_abs_and_ratio};
 
 /// Declared function-space seminorm used by one atom's smoothing prior.
 ///
@@ -303,120 +304,6 @@ impl ArdAxisPrior {
     }
 }
 
-/// Large-argument (`|x| >= 3.75`) Abramowitz & Stegun 9.8.2 polynomial for the
-/// *exponentially-scaled* `I0`: `√x · e^{−x} · I0(x) ≈ poly(3.75/x)`. Factoring
-/// the `e^{x}/√x` envelope out lets the log-partition and the `I1/I0` ratio be
-/// computed without ever materialising `e^{x}` (which overflows to `+inf` for
-/// `x ≳ 709`, see [`bessel_i0_log_and_ratio`]).
-pub(crate) fn bessel_i0_scaled_poly(ax: f64) -> f64 {
-    let y = 3.75 / ax;
-    0.39894228
-        + y * (0.01328592
-            + y * (0.00225319
-                + y * (-0.00157565
-                    + y * (0.00916281
-                        + y * (-0.02057706
-                            + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377)))))))
-}
-
-/// Large-argument (`|x| >= 3.75`) Abramowitz & Stegun 9.8.4 polynomial for the
-/// *exponentially-scaled* `I1`: `√x · e^{−x} · I1(x) ≈ poly(3.75/x)`. Pairs with
-/// [`bessel_i0_scaled_poly`] so their shared `e^{x}/√x` envelope cancels exactly
-/// in the `I1/I0` ratio.
-pub(crate) fn bessel_i1_scaled_poly(ax: f64) -> f64 {
-    let y = 3.75 / ax;
-    0.39894228
-        + y * (-0.03988024
-            + y * (-0.00362018
-                + y * (0.00163801
-                    + y * (-0.01031555
-                        + y * (0.02282967
-                            + y * (-0.02895312 + y * (0.01787654 - y * 0.00420059)))))))
-}
-
-/// Modified Bessel function of the first kind, order zero, `I0(x)`.
-///
-/// Abramowitz & Stegun 9.8.1 (|x| <= 3.75) and 9.8.2 (|x| > 3.75) polynomial
-/// approximations; relative error < 1.6e-7 / 1.9e-7 respectively, which is far
-/// below the precision tolerance the ARD normaliser is read at. `I0` is even,
-/// so only `|x|` enters. Used for the exact von-Mises precision log-partition.
-pub(crate) fn bessel_i0(x: f64) -> f64 {
-    let ax = x.abs();
-    if ax < 3.75 {
-        let t = x / 3.75;
-        let t2 = t * t;
-        1.0 + t2
-            * (3.5156229
-                + t2 * (3.0899424
-                    + t2 * (1.2067492 + t2 * (0.2659732 + t2 * (0.0360768 + t2 * 0.0045813)))))
-    } else {
-        (ax.exp() / ax.sqrt()) * bessel_i0_scaled_poly(ax)
-    }
-}
-
-/// Modified Bessel function of the first kind, order one, `I1(x)`.
-///
-/// Uses the Abramowitz & Stegun approximations paired with [`bessel_i0`]. This is
-/// needed only for the derivative of the periodic ARD precision normalizer
-/// `log I0(η)`, whose derivative is `I1(η) / I0(η)`.
-pub(crate) fn bessel_i1(x: f64) -> f64 {
-    let ax = x.abs();
-    let value = if ax < 3.75 {
-        let t = x / 3.75;
-        let t2 = t * t;
-        ax * (0.5
-            + t2 * (0.87890594
-                + t2 * (0.51498869
-                    + t2 * (0.15084934 + t2 * (0.02658733 + t2 * (0.00301532 + t2 * 0.00032411))))))
-    } else {
-        (ax.exp() / ax.sqrt()) * bessel_i1_scaled_poly(ax)
-    };
-    if x < 0.0 { -value } else { value }
-}
-
-/// Overflow-free `(log I0(η) - |η|, I1(|η|)/I0(|η|))`.
-///
-/// Centering `log I0` by its leading `|η|` term matters for likelihoods such
-/// as the circular Gaussian, where the exponentially large Bessel factor
-/// cancels an equally large quadratic term. Returning the centered value
-/// directly preserves that cancellation even when `|η|` is too large for
-/// `log I0(η) - |η|` to retain any low-order bits.
-pub fn bessel_i0_log_minus_abs_and_ratio(eta: f64) -> (f64, f64) {
-    let ax = eta.abs();
-    if ax < 3.75 {
-        let i0 = bessel_i0(ax);
-        let i1 = bessel_i1(ax);
-        (i0.ln() - ax, i1 / i0)
-    } else {
-        let poly0 = bessel_i0_scaled_poly(ax);
-        let poly1 = bessel_i1_scaled_poly(ax);
-        let centered_log_i0 = -0.5 * ax.ln() + poly0.ln();
-        let ratio = poly1 / poly0;
-        (centered_log_i0, ratio)
-    }
-}
-
-/// Overflow-free `(log I0(η), I1(η)/I0(η))` for `η >= 0`, the only two Bessel
-/// quantities the von-Mises ARD precision normaliser and its ρ-gradient need.
-///
-/// The naive `bessel_i0(η).ln()` and `bessel_i1(η)/bessel_i0(η)` both route
-/// through `e^{η}/√η`, which overflows to `+inf` once `η ≳ 709`. Two `+inf`s
-/// then divide to `NaN`, poisoning the very first outer ρ-gradient on
-/// large-norm / ill-conditioned checkpoints (issue #1113: a dispersion-inflated
-/// ARD seed pushes `η = α/κ²` past the overflow threshold at iter 0). For a
-/// periodic circle atom (`κ = 2π`) this fires for any seed precision
-/// `α ≳ 2.8e4`, well inside the reachable seed range.
-///
-/// We never form `e^{η}`. For the small branch (`η < 3.75`) the A&S series are
-/// finite, so we evaluate them directly. For the large branch the shared
-/// `e^{η}/√η` envelope cancels in the *log* (`log I0 = η − ½ ln η + ln poly`)
-/// and in the *ratio* (`I1/I0 = poly₁/poly₀`), so both are computed from the
-/// bounded scaled polynomials alone — exact for non-degenerate η and finite for
-/// every finite η.
-pub(crate) fn bessel_i0_log_and_ratio(eta: f64) -> (f64, f64) {
-    let (centered_log_i0, ratio) = bessel_i0_log_minus_abs_and_ratio(eta);
-    (eta.abs() + centered_log_i0, ratio)
-}
 /// One manifold atom.
 ///
 /// `basis_values` is `Phi_k(t_{ik})`, shape `(N, M_k)`.

@@ -54,6 +54,7 @@ use gam_linalg::lanczos::{
 };
 use gam_linalg::pairwise_reduce::{BASE_CHUNK, pairwise_sum};
 use gam_linalg::triangular::cholesky_solve_vector;
+use gam_math::special::bessel_i0_log_minus_abs_and_ratio;
 
 pub const ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD: usize = 1024;
 const EVIDENCE_LOGDET_SLQ_PROBES: usize = 16;
@@ -2246,8 +2247,338 @@ pub fn fit_ring_gaussian_mixture(
 }
 
 // ---------------------------------------------------------------------------
-// Structured-union candidates (#907)
+// Circular Gaussian density and structured-union candidates (#907)
 // ---------------------------------------------------------------------------
+
+/// Maximum-likelihood fit of a Gaussian-blurred circle in two dimensions.
+///
+/// The generative model is
+///
+/// `X = center + radius * U + epsilon`,
+///
+/// where `U` is uniform on the unit circle and
+/// `epsilon ~ N(0, noise_variance * I_2)`. Integrating out `U` gives the proper
+/// Cartesian density
+///
+/// `p(x) = exp(-(r^2 + R^2)/(2s)) I0(Rr/s) / (2 pi s)`.
+///
+/// Unlike a Gaussian density assigned directly to the nonnegative radius, this
+/// density is normalized on the plane, remains finite at the center, and has no
+/// artificial `1/r` singularity. The center is fitted jointly with `(R, s)` by
+/// latent-angle EM instead of being frozen at the coordinate mean.
+#[derive(Debug, Clone, Copy)]
+pub struct CircularGaussianFit2d {
+    center: [f64; 2],
+    radius: f64,
+    noise_variance: f64,
+}
+
+impl CircularGaussianFit2d {
+    /// Two center coordinates, one radius, and one isotropic noise variance.
+    pub const NUM_FREE_PARAMETERS: usize = 4;
+
+    /// A regular four-parameter BIC fit requires strictly more observations
+    /// than parameters.
+    pub const MINIMUM_ROWS: usize = Self::NUM_FREE_PARAMETERS + 1;
+
+    /// Construct a circular Gaussian from validated model parameters.
+    pub fn from_parameters(
+        center: [f64; 2],
+        radius: f64,
+        noise_variance: f64,
+    ) -> Result<Self, String> {
+        if !center.iter().all(|value| value.is_finite()) {
+            return Err("circular Gaussian center must be finite".to_string());
+        }
+        if !(radius.is_finite() && radius >= 0.0) {
+            return Err("circular Gaussian radius must be finite and nonnegative".to_string());
+        }
+        if !(noise_variance.is_finite() && noise_variance > 0.0) {
+            return Err("circular Gaussian noise variance must be finite and positive".to_string());
+        }
+        Ok(Self {
+            center,
+            radius,
+            noise_variance,
+        })
+    }
+
+    /// Fit selected rows of a finite two-column coordinate matrix.
+    pub fn fit(coords: ArrayView2<'_, f64>, rows: &[usize]) -> Result<Self, String> {
+        if coords.ncols() != 2 {
+            return Err(format!(
+                "circular Gaussian requires 2-D data, got {} columns",
+                coords.ncols()
+            ));
+        }
+        if rows.len() < Self::MINIMUM_ROWS {
+            return Err(format!(
+                "circular Gaussian needs at least {} rows, got {}",
+                Self::MINIMUM_ROWS,
+                rows.len()
+            ));
+        }
+        if rows.iter().any(|&row| row >= coords.nrows()) {
+            return Err("circular Gaussian row index is out of bounds".to_string());
+        }
+        if rows
+            .iter()
+            .any(|&row| !coords[[row, 0]].is_finite() || !coords[[row, 1]].is_finite())
+        {
+            return Err("circular Gaussian requires finite training coordinates".to_string());
+        }
+
+        // Work in a dimensionless chart relative to one observed point. This
+        // preserves the low-order bits of a small translated circle and makes
+        // the stopping rule and variance floor scale equivariant.
+        let anchor_row = rows[0];
+        let anchor = [coords[[anchor_row, 0]], coords[[anchor_row, 1]]];
+        let mut scale = 0.0_f64;
+        for &row in rows {
+            let dx = coords[[row, 0]] - anchor[0];
+            let dy = coords[[row, 1]] - anchor[1];
+            if !(dx.is_finite() && dy.is_finite()) {
+                return Err("circular Gaussian coordinate range exceeds f64".to_string());
+            }
+            scale = scale.max(dx.hypot(dy));
+        }
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err("circular Gaussian requires nonzero spatial extent".to_string());
+        }
+
+        let mut points = Vec::with_capacity(rows.len());
+        let mut mean = [0.0_f64; 2];
+        for &row in rows {
+            let point = [
+                (coords[[row, 0]] - anchor[0]) / scale,
+                (coords[[row, 1]] - anchor[1]) / scale,
+            ];
+            points.push(point);
+            mean[0] += point[0];
+            mean[1] += point[1];
+        }
+        let count = rows.len() as f64;
+        mean[0] /= count;
+        mean[1] /= count;
+
+        // Moment initialization is exact at the population level. For
+        // q = ||X-E X||^2,
+        //   E[q] = R^2 + 2s,  Var(q) = 4s(R^2+s),
+        // hence R^4 = E[q]^2-Var(q) and s=(E[q]-R^2)/2.
+        let mut squared_radii = Vec::with_capacity(rows.len());
+        let mut mean_squared_radius = 0.0_f64;
+        for point in &points {
+            let dx = point[0] - mean[0];
+            let dy = point[1] - mean[1];
+            let squared_radius = dx * dx + dy * dy;
+            squared_radii.push(squared_radius);
+            mean_squared_radius += squared_radius;
+        }
+        mean_squared_radius /= count;
+        let mut squared_radius_variance = 0.0_f64;
+        for squared_radius in squared_radii {
+            squared_radius_variance += (squared_radius - mean_squared_radius).powi(2);
+        }
+        squared_radius_variance /= count;
+
+        // A noiseless observed circle is an unbounded-likelihood boundary.
+        // Keep the numerical optimizer in a scale-relative interior whose
+        // width is roundoff, rather than imposing a floor in data units.
+        let variance_floor =
+            (64.0 * f64::EPSILON * mean_squared_radius).max(f64::MIN_POSITIVE);
+        let radius_squared = (mean_squared_radius * mean_squared_radius
+            - squared_radius_variance)
+            .max(0.0)
+            .sqrt();
+        let mut radius = radius_squared.sqrt();
+        let mut noise_variance =
+            (0.5 * (mean_squared_radius - radius_squared)).max(variance_floor);
+        let mut center = mean;
+
+        // Exact EM for the latent circle angle. Given current parameters, the
+        // conditional mean of U is A(kappa) * (x-c)/||x-c|| with
+        // A=I1/I0 and kappa=R||x-c||/s. Solving the joint quadratic M-step for
+        // center and radius avoids the biased `center = sample mean` plug-in.
+        const MAX_EM_ITERATIONS: usize = 4096;
+        const EM_TOLERANCE: f64 = 2.0e-12;
+        let mut posterior_means = vec![[0.0_f64; 2]; points.len()];
+        let mut converged = false;
+        for _ in 0..MAX_EM_ITERATIONS {
+            let mut posterior_mean = [0.0_f64; 2];
+            for (point, latent_mean) in points.iter().zip(&mut posterior_means) {
+                let dx = point[0] - center[0];
+                let dy = point[1] - center[1];
+                let observed_radius = dx.hypot(dy);
+                if observed_radius == 0.0 || radius == 0.0 {
+                    *latent_mean = [0.0, 0.0];
+                } else {
+                    let (_, bessel_ratio) =
+                        circular_gaussian_bessel_terms(radius, observed_radius, noise_variance);
+                    if !(bessel_ratio.is_finite() && (0.0..=1.0).contains(&bessel_ratio))
+                    {
+                        return Err("circular Gaussian Bessel ratio left [0, 1]".to_string());
+                    }
+                    let multiplier = bessel_ratio / observed_radius;
+                    *latent_mean = [multiplier * dx, multiplier * dy];
+                }
+                posterior_mean[0] += latent_mean[0];
+                posterior_mean[1] += latent_mean[1];
+            }
+            posterior_mean[0] /= count;
+            posterior_mean[1] /= count;
+
+            let denominator =
+                1.0 - posterior_mean[0] * posterior_mean[0] - posterior_mean[1] * posterior_mean[1];
+            if !(denominator.is_finite() && denominator > 0.0) {
+                return Err("circular Gaussian EM radius update is singular".to_string());
+            }
+            let mut radius_numerator = 0.0_f64;
+            for (point, latent_mean) in points.iter().zip(&posterior_means) {
+                radius_numerator +=
+                    latent_mean[0] * (point[0] - mean[0]) + latent_mean[1] * (point[1] - mean[1]);
+            }
+            let next_radius = (radius_numerator / (count * denominator)).max(0.0);
+            let next_center = [
+                mean[0] - next_radius * posterior_mean[0],
+                mean[1] - next_radius * posterior_mean[1],
+            ];
+
+            // Evaluate E||X-c-RU||^2 in an explicitly nonnegative form to
+            // avoid catastrophic cancellation on a very thin ring.
+            let mut residual_sum = 0.0_f64;
+            for (point, latent_mean) in points.iter().zip(&posterior_means) {
+                let dx = point[0] - next_center[0];
+                let dy = point[1] - next_center[1];
+                let ex = dx - next_radius * latent_mean[0];
+                let ey = dy - next_radius * latent_mean[1];
+                let latent_norm_squared =
+                    latent_mean[0] * latent_mean[0] + latent_mean[1] * latent_mean[1];
+                residual_sum += ex * ex
+                    + ey * ey
+                    + next_radius * next_radius * (1.0 - latent_norm_squared).max(0.0);
+            }
+            let next_noise_variance = (residual_sum / (2.0 * count)).max(variance_floor);
+
+            let parameter_change = (next_center[0] - center[0])
+                .hypot(next_center[1] - center[1])
+                .max((next_radius - radius).abs())
+                .max(
+                    (next_noise_variance - noise_variance).abs()
+                        / (next_noise_variance + noise_variance),
+                );
+            center = next_center;
+            radius = next_radius;
+            noise_variance = next_noise_variance;
+            if parameter_change <= EM_TOLERANCE {
+                converged = true;
+                break;
+            }
+        }
+        if !converged {
+            return Err("circular Gaussian maximum-likelihood fit did not converge".to_string());
+        }
+
+        Self::from_parameters(
+            [anchor[0] + scale * center[0], anchor[1] + scale * center[1]],
+            scale * radius,
+            scale * scale * noise_variance,
+        )
+        .map_err(|error| format!("circular Gaussian fit produced invalid parameters: {error}"))
+    }
+
+    /// Fitted circle center.
+    pub const fn center(self) -> [f64; 2] {
+        self.center
+    }
+
+    /// Fitted latent-circle radius.
+    pub const fn radius(self) -> f64 {
+        self.radius
+    }
+
+    /// Fitted isotropic Cartesian noise variance per coordinate.
+    pub const fn noise_variance(self) -> f64 {
+        self.noise_variance
+    }
+
+    /// Proper Cartesian log density at `(x, y)`.
+    pub fn log_density(self, x: f64, y: f64) -> f64 {
+        let observed_radius = (x - self.center[0]).hypot(y - self.center[1]);
+        let (log_i0_minus_kappa, _) =
+            circular_gaussian_bessel_terms(self.radius, observed_radius, self.noise_variance);
+        // Algebraically this is -(r^2+R^2)/(2s)+log I0(kappa), but this
+        // rearrangement preserves log I0(kappa) ~= kappa cancellation.
+        -(std::f64::consts::TAU * self.noise_variance).ln()
+            - 0.5 * (observed_radius - self.radius).powi(2) / self.noise_variance
+            + log_i0_minus_kappa
+    }
+
+    /// Sum the fitted log density over selected rows.
+    pub fn log_likelihood(
+        self,
+        coords: ArrayView2<'_, f64>,
+        rows: &[usize],
+    ) -> Result<f64, String> {
+        if coords.ncols() != 2 || rows.iter().any(|&row| row >= coords.nrows()) {
+            return Err("circular Gaussian likelihood received invalid coordinates or rows"
+                .to_string());
+        }
+        let mut log_likelihood = 0.0_f64;
+        for &row in rows {
+            let value = self.log_density(coords[[row, 0]], coords[[row, 1]]);
+            if !value.is_finite() {
+                return Err("circular Gaussian likelihood is not finite".to_string());
+            }
+            log_likelihood += value;
+        }
+        if !log_likelihood.is_finite() {
+            return Err("circular Gaussian likelihood sum is not finite".to_string());
+        }
+        Ok(log_likelihood)
+    }
+
+    /// BIC/2 on selected rows; lower is better.
+    pub fn bic(self, coords: ArrayView2<'_, f64>, rows: &[usize]) -> Result<f64, String> {
+        if rows.len() < Self::MINIMUM_ROWS {
+            return Err(format!(
+                "circular Gaussian BIC needs at least {} rows, got {}",
+                Self::MINIMUM_ROWS,
+                rows.len()
+            ));
+        }
+        let log_likelihood = self.log_likelihood(coords, rows)?;
+        let bic = -log_likelihood
+            + 0.5 * Self::NUM_FREE_PARAMETERS as f64 * (rows.len() as f64).ln();
+        if !bic.is_finite() {
+            return Err("circular Gaussian BIC is not finite".to_string());
+        }
+        Ok(bic)
+    }
+}
+
+/// Stable Bessel terms for `kappa = radius * observed_radius / variance`.
+/// The ordinary finite branch retains the shared approximation exactly. If the
+/// product itself overflows, only the leading asymptotic
+/// `log I0(kappa)-kappa = -log(2 pi kappa)/2 + O(1/kappa)` is representable;
+/// `I1/I0` rounds to one at that scale.
+fn circular_gaussian_bessel_terms(
+    radius: f64,
+    observed_radius: f64,
+    noise_variance: f64,
+) -> (f64, f64) {
+    if radius == 0.0 || observed_radius == 0.0 {
+        return (0.0, 0.0);
+    }
+    let kappa = radius * observed_radius / noise_variance;
+    if kappa.is_finite() {
+        return bessel_i0_log_minus_abs_and_ratio(kappa);
+    }
+    let log_kappa = radius.ln() + observed_radius.ln() - noise_variance.ln();
+    (
+        -0.5 * (std::f64::consts::TAU.ln() + log_kappa),
+        1.0,
+    )
+}
 //
 // A *union* candidate is a small FIXED composite of named component structures
 // joined by a hard row-responsibility split. Unlike the discrete-mixture rung
@@ -2336,7 +2667,7 @@ pub struct UnionComponentFit {
     pub kind: UnionComponentKind,
     pub row_count: usize,
     pub num_parameters: usize,
-    pub negative_log_evidence: f64,
+    pub bic: f64,
 }
 
 /// A fitted structured-union candidate: the composite kind, the per-component
@@ -2347,7 +2678,7 @@ pub struct UnionStructureFit {
     pub structure: UnionStructure,
     pub components: Vec<UnionComponentFit>,
     /// Summed component BIC/2 (lower wins).
-    pub negative_log_evidence: f64,
+    pub bic: f64,
     /// `Σ_c P_c` — total free-parameter count across components.
     pub total_parameters: usize,
 }
@@ -2428,7 +2759,7 @@ pub fn fit_union_structure(
         let (nle, p) = fit_union_component(group.view(), *kind, config)?;
         if !nle.is_finite() {
             return Err(format!(
-                "union {} component {:?} produced non-finite evidence",
+                "union {} component {:?} produced non-finite BIC",
                 structure.as_str(),
                 kind
             ));
@@ -2439,13 +2770,13 @@ pub fn fit_union_structure(
             kind: *kind,
             row_count: rows.len(),
             num_parameters: p,
-            negative_log_evidence: nle,
+            bic: nle,
         });
     }
     Ok(UnionStructureFit {
         structure,
         components: fits,
-        negative_log_evidence: total_nle,
+        bic: total_nle,
         total_parameters,
     })
 }
@@ -2480,7 +2811,7 @@ pub fn fit_union_ladder(
         fits.into_iter()
             .enumerate()
             .map(|(idx, row)| {
-                let score = row.negative_log_evidence;
+                let score = row.bic;
                 let tie = row.total_parameters; // cheaper composite wins ties
                 PriorityCandidate::new(row, idx, score, tie)
             })

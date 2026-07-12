@@ -4084,14 +4084,30 @@ impl OuterObjective for SaeManifoldOuterObjective {
             OuterEvalOrder::Value => {
                 // The `Value` order is the BFGS / ARC LINE-SEARCH cost probe
                 // (see `solver/rho_optimizer/bridges.rs`). Its cost is compared
-                // against steps whose direction came from `eval`'s penalized quasi-Laplace
-                // `∇f` — the same single criterion every lane prices.
-                // Line-search comparisons use the exact same inner KKT gate as
-                // the accepted-point value/gradient lane. Comparing a loosened
-                // trial value with a tight anchor is not one coherent objective
-                // and caused real descent steps to fail Wolfe at iteration zero
-                // on the frozen #2253 circle fit.
-                let drive = ProbeInnerDrive::LineSearchProbe;
+                // against steps whose DIRECTION came from `eval`'s penalized
+                // quasi-Laplace `∇f`, which is the exact implicit derivative
+                // through the FULLY converged inner fixed point
+                // (`penalized_quasi_laplace_criterion_with_cache`, the idempotent
+                // `gradient_stationary && criterion_fixed_point` root). The line
+                // search can only accept a step when the value it ranks prices
+                // the SAME inner state that gradient differentiates. The former
+                // `LineSearchProbe` drive priced a FREEZE / coarse-KKT iterate
+                // that at real scale (n≈44k, ill-conditioned inner solve) sits
+                // ~1% off that fixed point, so NO step reduced the ranked value
+                // while pointing down the gradient — BFGS backtracked to
+                // `StepSizeTooSmall` at iteration 1 and shipped the coarse value,
+                // which the outer certification then rejected against the
+                // idempotent analytic sample ("cost-only value disagrees with
+                // analytic-sample value"). Price through the SAME `Criterion`
+                // drive `eval`/`eval_cost` use — warm-started from the probe
+                // handoff and rescued to the extended budget on a non-convergence
+                // refusal (`value_probe_with_budget_rescue`) — so value, gradient,
+                // and certification are one coherent objective. At small n the
+                // former probe and this drive coincide (both reach the fixed point
+                // within the base budget), so this is a no-op for the tier0 fits.
+                let drive = ProbeInnerDrive::Criterion {
+                    refine_progress_extension: false,
+                };
                 let (cost, beta_hat) = match self.value_probe_with_budget_rescue(rho.view(), drive)
                 {
                     Ok(evaluated) => evaluated,
