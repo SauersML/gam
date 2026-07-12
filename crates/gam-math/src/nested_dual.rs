@@ -211,6 +211,29 @@ impl Dual22 {
         Dual2::constant(Dual2::<f64>::variable(x))
     }
 
+    /// Seed a primary at value `base` that moves as `base + s·d1 + t·d2` under the
+    /// two independent scalar directions `s` (outer `a`) and `t` (inner `b`):
+    /// `∂/∂a = d1`, `∂/∂b = d2`, all second-and-higher self-derivatives zero
+    /// (the primary is affine in `s, t`). This is what a directional
+    /// bidirectional contraction along arbitrary weight vectors `d1, d2` needs —
+    /// seed every primary `i` with `seed_directional(base_i, d1_i, d2_i)`, run
+    /// the program, and read `channels()[8]` (`∂²_a ∂²_b`) for
+    /// `Σ_{a,b,c,d} ℓ_{abcd}·d1_a d1_b d2_c d2_d`.
+    #[inline]
+    pub fn seed_directional(base: f64, d1: f64, d2: f64) -> Self {
+        Dual2 {
+            // value carries the inner (`t`) direction on its `g` channel.
+            v: Dual2::<f64> {
+                v: base,
+                g: d2,
+                h: 0.0,
+            },
+            // outer (`s`) first derivative is `d1`, itself constant in `t`.
+            g: Dual2::<f64>::constant(d1),
+            h: Dual2::<f64>::constant(0.0),
+        }
+    }
+
     /// The nine channels this nested dual represents, keyed to the two-primary
     /// [`crate::jet_tower::Tower4`] indices `0` (outer `a`) and `1` (inner `b`):
     /// `(value, ∂a, ∂b, ∂aa, ∂ab, ∂bb, ∂aab, ∂abb, ∂aabb)`.
@@ -349,6 +372,66 @@ mod nested_dual_tower4_oracle_tests {
             }
         }
         eprintln!("[nested-dual #932] Dual2<Dual2> vs Tower4<2> max_rel over 4 points = {max_rel:.3e}");
+    }
+
+    /// The directional seeding (arbitrary weight vectors `d1`, `d2`) reproduces
+    /// the engine tower's fully-contracted derivatives:
+    ///   `∂_s f      = Σ_a g_a d1_a`,
+    ///   `∂_t f      = Σ_a g_a d2_a`,
+    ///   `∂_s∂_t f   = Σ_{ab} h_ab d1_a d2_b`,
+    ///   `∂²_s∂²_t f = Σ_{abcd} ℓ_abcd d1_a d1_b d2_c d2_d`,
+    /// the last being exactly the bidirectional 4th-order contraction a flex
+    /// Jet4 gate needs (`ℓ_{dir1,dir1,dir2,dir2}`), FD-free. This is the seeding
+    /// the flex-geometry consumer will use.
+    #[test]
+    fn nested_dual2_directional_matches_tower4_contraction_932() {
+        let d1 = [0.7_f64, -0.3_f64];
+        let d2 = [0.4_f64, 0.9_f64];
+        let points = [(0.31_f64, -0.42_f64), (-0.85, 0.17), (1.2, -0.6)];
+        let mut max_rel = 0.0_f64;
+        for &(x0, x1) in &points {
+            let t0 = Tower4::<2>::variable(x0, 0);
+            let t1 = Tower4::<2>::variable(x1, 1);
+            let tower = program(&t0, &t1);
+
+            // Full engine contractions.
+            let mut c_s = 0.0;
+            let mut c_t = 0.0;
+            let mut c_st = 0.0;
+            let mut c_sstt = 0.0;
+            for a in 0..2 {
+                c_s += tower.g[a] * d1[a];
+                c_t += tower.g[a] * d2[a];
+                for b in 0..2 {
+                    c_st += tower.h[a][b] * d1[a] * d2[b];
+                    for cc in 0..2 {
+                        for dd in 0..2 {
+                            c_sstt +=
+                                tower.t4[a][b][cc][dd] * d1[a] * d1[b] * d2[cc] * d2[dd];
+                        }
+                    }
+                }
+            }
+
+            let p0 = Dual22::seed_directional(x0, d1[0], d2[0]);
+            let p1 = Dual22::seed_directional(x1, d1[1], d2[1]);
+            let ch = program(&p0, &p1).channels();
+
+            for (label, got, want) in [
+                ("d_s", ch[1], c_s),
+                ("d_t", ch[2], c_t),
+                ("d_st", ch[4], c_st),
+                ("d_sstt", ch[8], c_sstt),
+            ] {
+                let rel = (got - want).abs() / want.abs().max(1.0);
+                max_rel = max_rel.max(rel);
+                assert!(
+                    rel <= 1e-12,
+                    "point ({x0},{x1}) {label}: nested {got:.16e} != tower-contraction {want:.16e} (rel {rel:.3e})"
+                );
+            }
+        }
+        eprintln!("[nested-dual #932] directional Dual2<Dual2> vs Tower4<2> contraction max_rel = {max_rel:.3e}");
     }
 
     /// Symmetry guard: the mixed channels are order-independent — `∂a∂b == ∂b∂a`
