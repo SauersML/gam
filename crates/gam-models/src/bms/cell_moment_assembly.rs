@@ -1630,18 +1630,19 @@ impl BernoulliMarginalSlopeFamily {
                     row_ll,
                 );
             }
-            let total: Result<f64, String> = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
-                weighted_rows.len(),
-                |range| -> Result<f64, String> {
-                    let mut ll = 0.0;
-                    for wr in &weighted_rows[range] {
-                        ll += wr.weight * row_ll(wr.index)?;
-                    }
-                    Ok(ll)
-                },
-                |left, right| -> Result<_, String> { Ok(left + right) },
-            )
-            .map(|opt| opt.unwrap_or(0.0));
+            let total: Result<f64, String> =
+                gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                    weighted_rows.len(),
+                    |range| -> Result<f64, String> {
+                        let mut ll = 0.0;
+                        for wr in &weighted_rows[range] {
+                            ll += wr.weight * row_ll(wr.index)?;
+                        }
+                        Ok(ll)
+                    },
+                    |left, right| -> Result<_, String> { Ok(left + right) },
+                )
+                .map(|opt| opt.unwrap_or(0.0));
             return total;
         }
         let beta_h = self.score_beta(block_states)?;
@@ -1672,18 +1673,19 @@ impl BernoulliMarginalSlopeFamily {
                 row_ll,
             );
         }
-        let total: Result<f64, String> = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
-            weighted_rows.len(),
-            |range| -> Result<f64, String> {
-                let mut ll = 0.0;
-                for wr in &weighted_rows[range] {
-                    ll += wr.weight * row_ll(wr.index)?;
-                }
-                Ok(ll)
-            },
-            |left, right| -> Result<_, String> { Ok(left + right) },
-        )
-        .map(|opt| opt.unwrap_or(0.0));
+        let total: Result<f64, String> =
+            gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+                weighted_rows.len(),
+                |range| -> Result<f64, String> {
+                    let mut ll = 0.0;
+                    for wr in &weighted_rows[range] {
+                        ll += wr.weight * row_ll(wr.index)?;
+                    }
+                    Ok(ll)
+                },
+                |left, right| -> Result<_, String> { Ok(left + right) },
+            )
+            .map(|opt| opt.unwrap_or(0.0));
         total
     }
 

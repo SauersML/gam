@@ -799,28 +799,17 @@ struct SoftmaxMoment<'a, S> {
 
 impl<S: SaeSoftmaxRowProgramSource> SoftmaxMoment<'_, S> {
     #[inline]
-    fn expectation_first(&self, atom_j: usize, component_j: f64, mean: f64) -> f64 {
-        self.inv_tau * self.source.gate_value(atom_j) * (component_j - mean)
+    fn expectation_first_coefficient(&self, atom_j: usize) -> f64 {
+        self.inv_tau * self.source.gate_value(atom_j)
     }
 
     #[inline]
-    fn expectation_second(
-        &self,
-        atom_j: usize,
-        atom_l: usize,
-        component_j: f64,
-        component_l: f64,
-        mean: f64,
-    ) -> f64 {
-        let diagonal = if atom_j == atom_l {
-            component_j - mean
-        } else {
-            0.0
-        };
-        self.inv_tau
-            * self.inv_tau
-            * self.source.gate_value(atom_j)
-            * (diagonal - self.source.gate_value(atom_l) * (component_j + component_l - 2.0 * mean))
+    fn expectation_second_coefficients(&self, atom_j: usize, atom_l: usize) -> (f64, f64) {
+        let z_j = self.source.gate_value(atom_j);
+        let z_l = self.source.gate_value(atom_l);
+        let diagonal = if atom_j == atom_l { 1.0 } else { 0.0 };
+        let common = self.inv_tau * self.inv_tau * z_j;
+        (common * (diagonal - z_l), -common * z_l)
     }
 
     #[inline]
@@ -884,20 +873,34 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
         }
     }
     let moment = SoftmaxMoment { source, inv_tau };
+    // Every logit derivative depends on the centered component `C_k = D_k -
+    // E[D]`. Center once here so each Hessian output becomes a two-coefficient
+    // vector combination instead of rebuilding `D_j + D_l - 2E[D]`.
+    for atom in 0..k {
+        let component = &mut decoded[atom * p..(atom + 1) * p];
+        for c in 0..p {
+            component[c] -= mean[c];
+        }
+    }
 
     // Logit gradient and Hessian are centered softmax moments.  This is the
     // asymptotic win: O(L²P) for L free logits, versus O(L²KP) in the hand
     // `d2z[j][l][k] · decoded[k]` contraction and still more in a dense jet.
     for &(slot_j, atom_j) in &logits {
-        let dj = &decoded[atom_j * p..(atom_j + 1) * p];
+        let centered_j = &decoded[atom_j * p..(atom_j + 1) * p];
+        let first_coefficient = sqrt_row_w * moment.expectation_first_coefficient(atom_j);
         for c in 0..p {
-            out.first[slot_j][c] = sqrt_row_w * moment.expectation_first(atom_j, dj[c], mean[c]);
+            out.first[slot_j][c] = first_coefficient * centered_j[c];
         }
         for &(slot_l, atom_l) in &logits {
-            let dl = &decoded[atom_l * p..(atom_l + 1) * p];
+            let centered_l = &decoded[atom_l * p..(atom_l + 1) * p];
+            let (j_coefficient, l_coefficient) =
+                moment.expectation_second_coefficients(atom_j, atom_l);
+            let j_coefficient = sqrt_row_w * j_coefficient;
+            let l_coefficient = sqrt_row_w * l_coefficient;
             for c in 0..p {
                 out.second[slot_j][slot_l][c] =
-                    sqrt_row_w * moment.expectation_second(atom_j, atom_l, dj[c], dl[c], mean[c]);
+                    j_coefficient * centered_j[c] + l_coefficient * centered_l[c];
             }
         }
     }

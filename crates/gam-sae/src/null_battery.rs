@@ -6,7 +6,7 @@
 //! nulls, run an arbitrary scalar audit on observed and null data, and attach a
 //! spike-in power curve for a manufactured circle inside real residual noise.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -593,16 +593,60 @@ pub fn matched_spectrum_gaussian_null(
     seed: u64,
 ) -> Result<Array2<f64>, String> {
     validate_matrix(pc_scores, "matched-spectrum PC scores")?;
-    let mean = column_mean(pc_scores);
-    let sd = column_sd(pc_scores, mean.view());
+    let location = stable_column_location(pc_scores)?;
+    let sd = stable_column_sd(pc_scores, &location)?;
     let mut rng = StdRng::seed_from_u64(seed);
     let mut out = Array2::<f64>::zeros(pc_scores.raw_dim());
     for row in 0..out.nrows() {
         for pc in 0..out.ncols() {
-            out[[row, pc]] = mean[pc] + sd[pc] * standard_normal(&mut rng);
+            let relative_draw = location.mean_offset[pc] + sd[pc] * standard_normal(&mut rng);
+            out[[row, pc]] = location.origin[pc] + relative_draw;
+            if !out[[row, pc]].is_finite() {
+                return Err(format!(
+                    "matched-spectrum Gaussian draw overflowed at row {row}, column {pc}"
+                ));
+            }
         }
     }
     Ok(out)
+}
+
+struct StableColumnLocation {
+    origin: Array1<f64>,
+    mean_offset: Array1<f64>,
+}
+
+impl StableColumnLocation {
+    fn absolute_mean(&self) -> Result<Array1<f64>, String> {
+        let mean = &self.origin + &self.mean_offset;
+        if mean.iter().any(|value| !value.is_finite()) {
+            return Err("column mean overflowed in absolute coordinates".to_string());
+        }
+        Ok(mean)
+    }
+}
+
+/// Shared translation-stable column location. Means are accumulated in the
+/// residual chart `x - first_row`, then retained as `(origin, mean_offset)` so
+/// downstream centering never needs to subtract two large absolute means.
+fn stable_column_location(data: ArrayView2<'_, f64>) -> Result<StableColumnLocation, String> {
+    validate_matrix(data, "stable-column-location input")?;
+    let origin = data.row(0).to_owned();
+    let mut mean_offset = Array1::<f64>::zeros(data.ncols());
+    for row in 0..data.nrows() {
+        let count = (row + 1) as f64;
+        for axis in 0..data.ncols() {
+            let relative = data[[row, axis]] - origin[axis];
+            mean_offset[axis] += (relative - mean_offset[axis]) / count;
+        }
+    }
+    if mean_offset.iter().any(|value| !value.is_finite()) {
+        return Err("stable column-mean accumulation overflowed".to_string());
+    }
+    Ok(StableColumnLocation {
+        origin,
+        mean_offset,
+    })
 }
 
 struct StablePopulationMoments {
@@ -611,56 +655,39 @@ struct StablePopulationMoments {
     covariance: Array2<f64>,
 }
 
-/// Translation-stable multivariate Welford moments.  Coordinates are first
+/// Translation-stable two-pass population moments. Coordinates are first
 /// expressed relative to an observed row, preventing a large chart origin from
 /// erasing the small residuals whose covariance is the object being matched.
 fn stable_population_moments(data: ArrayView2<'_, f64>) -> Result<StablePopulationMoments, String> {
-    validate_matrix(data, "stable-moment input")?;
+    let location = stable_column_location(data)?;
     let n = data.nrows();
     let p = data.ncols();
-    let origin = data.row(0).to_owned();
-    let mut mean_offset = Array1::<f64>::zeros(p);
-    let mut second_moment = Array2::<f64>::zeros((p, p));
-    let mut relative = vec![0.0_f64; p];
-    let mut delta = vec![0.0_f64; p];
-    let mut residual = vec![0.0_f64; p];
+    let mut covariance = Array2::<f64>::zeros((p, p));
     for row in 0..n {
-        let count = (row + 1) as f64;
-        for axis in 0..p {
-            relative[axis] = data[[row, axis]] - origin[axis];
-            delta[axis] = relative[axis] - mean_offset[axis];
-            mean_offset[axis] += delta[axis] / count;
-            residual[axis] = relative[axis] - mean_offset[axis];
-        }
         for left in 0..p {
+            let left_residual =
+                (data[[row, left]] - location.origin[left]) - location.mean_offset[left];
             for right in 0..=left {
-                // The two products are equal in exact arithmetic. Averaging
-                // them preserves symmetry under independently rounded mean
-                // updates without privileging a coordinate ordering.
-                second_moment[[left, right]] +=
-                    0.5 * (delta[left] * residual[right] + delta[right] * residual[left]);
+                let right_residual =
+                    (data[[row, right]] - location.origin[right]) - location.mean_offset[right];
+                covariance[[left, right]] += left_residual * right_residual;
             }
         }
     }
     let inverse_count = 1.0 / n as f64;
-    let mut covariance = Array2::<f64>::zeros((p, p));
     for left in 0..p {
         for right in 0..=left {
-            let value = second_moment[[left, right]] * inverse_count;
+            let value = covariance[[left, right]] * inverse_count;
             covariance[[left, right]] = value;
             covariance[[right, left]] = value;
         }
     }
-    if mean_offset
-        .iter()
-        .chain(covariance.iter())
-        .any(|value| !value.is_finite())
-    {
+    if covariance.iter().any(|value| !value.is_finite()) {
         return Err("stable mean/covariance accumulation overflowed".to_string());
     }
     Ok(StablePopulationMoments {
-        origin,
-        mean_offset,
+        origin: location.origin,
+        mean_offset: location.mean_offset,
         covariance,
     })
 }
@@ -763,21 +790,27 @@ pub fn architecture_matched_random_weight_null(
     let n = observed.nrows();
     let p = observed.ncols();
     let mut rng = StdRng::seed_from_u64(seed);
-    let obs_mean = column_mean(observed);
-    let obs_sd = column_sd(observed, obs_mean.view());
-    let rw_mean = column_mean(random_weight);
-    let rw_sd = column_sd(random_weight, rw_mean.view());
+    let observed_location = stable_column_location(observed)?;
+    let obs_sd = stable_column_sd(observed, &observed_location)?;
+    let random_weight_location = stable_column_location(random_weight)?;
+    let rw_sd = stable_column_sd(random_weight, &random_weight_location)?;
     let mut out = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         let src = rng.random_range(0..random_weight.nrows());
         for j in 0..p {
-            let centered = random_weight[[src, j]] - rw_mean[j];
+            let centered = (random_weight[[src, j]] - random_weight_location.origin[j])
+                - random_weight_location.mean_offset[j];
             let scaled = if rw_sd[j] > 0.0 {
                 centered * (obs_sd[j] / rw_sd[j])
             } else {
                 0.0
             };
-            out[[i, j]] = obs_mean[j] + scaled;
+            out[[i, j]] = observed_location.origin[j] + (observed_location.mean_offset[j] + scaled);
+            if !out[[i, j]].is_finite() {
+                return Err(format!(
+                    "architecture-matched draw overflowed at row {i}, column {j}"
+                ));
+            }
         }
     }
     Ok(out)
@@ -795,13 +828,13 @@ pub fn empirical_residual_bootstrap(
     validate_matrix(residuals, "empirical residual bootstrap input")?;
     let n = residuals.nrows();
     let p = residuals.ncols();
-    let mean = column_mean(residuals);
+    let location = stable_column_location(residuals)?;
     let mut rng = StdRng::seed_from_u64(seed);
     let mut out = Array2::<f64>::zeros((n, p));
     for i in 0..n {
         let src = rng.random_range(0..n);
         for j in 0..p {
-            out[[i, j]] = residuals[[src, j]] - mean[j];
+            out[[i, j]] = (residuals[[src, j]] - location.origin[j]) - location.mean_offset[j];
         }
     }
     Ok(out)
@@ -873,8 +906,8 @@ pub fn residual_surrogate_matching(
 /// Estimate the moment specification used by [`residual_surrogate_from_moments`].
 pub fn residual_moment_spec(residuals: ArrayView2<'_, f64>) -> Result<ResidualMomentSpec, String> {
     validate_matrix(residuals, "residual moment donor")?;
-    let mean = column_mean(residuals);
-    let centered = centered_matrix(residuals);
+    let mean = stable_column_mean(residuals)?;
+    let centered = centered_matrix(residuals)?;
     let n = centered.nrows();
     let denom = if n > 1 { (n - 1) as f64 } else { 1.0 };
     let covariance = centered.t().dot(&centered) / denom;
@@ -1011,7 +1044,7 @@ pub fn default_spike_in_detection_pipeline(
     let statistic = match shape {
         SpikeInShape::Circle => harmonic_circle_detector_stat(data)?,
         SpikeInShape::Torus => {
-            let total = centered_total_energy(data);
+            let total = centered_total_energy(data)?;
             let rank_sum = eigenvalues.iter().take(rank).sum::<f64>().max(0.0);
             if total > 0.0 { rank_sum / total } else { 0.0 }
         }
@@ -1198,8 +1231,8 @@ pub fn first_two_ordered_circle_stat(data: ArrayView2<'_, f64>) -> Result<f64, S
     if n < 4 {
         return Err("first-two circle statistic requires at least four rows".to_string());
     }
-    let x = centered_column(data.column(0));
-    let y = centered_column(data.column(1));
+    let x = centered_column(data.column(0))?;
+    let y = centered_column(data.column(1))?;
     let mut pos_re = 0.0_f64;
     let mut pos_im = 0.0_f64;
     let mut neg_re = 0.0_f64;
@@ -1243,7 +1276,7 @@ pub fn first_two_energy_fraction(data: ArrayView2<'_, f64>) -> Result<f64, Strin
     if data.ncols() < 2 {
         return Err("first-two energy requires at least two columns".to_string());
     }
-    let centered = centered_matrix(data);
+    let centered = centered_matrix(data)?;
     let total = centered.iter().map(|v| v * v).sum::<f64>();
     if total <= 0.0 {
         return Ok(0.0);
@@ -1258,7 +1291,7 @@ pub fn first_two_energy_fraction(data: ArrayView2<'_, f64>) -> Result<f64, Strin
 /// Basis-invariant rank-two covariance energy fraction.
 pub fn top_two_energy_fraction(data: ArrayView2<'_, f64>) -> Result<f64, String> {
     validate_matrix(data, "top-two energy input")?;
-    let total = centered_total_energy(data);
+    let total = centered_total_energy(data)?;
     if total <= 0.0 {
         return Ok(0.0);
     }
@@ -1281,7 +1314,7 @@ pub fn harmonic_circle_detector_stat(data: ArrayView2<'_, f64>) -> Result<f64, S
             "harmonic-circle detector requires at least four rows and two columns".to_string(),
         );
     }
-    let centered = centered_matrix(data);
+    let centered = centered_matrix(data)?;
     let mut cos_coeff = Array1::<f64>::zeros(p);
     let mut sin_coeff = Array1::<f64>::zeros(p);
     for i in 0..n {
@@ -1479,7 +1512,7 @@ fn leading_covariance_eigenvalues(
     if count == 0 {
         return Ok(Vec::new());
     }
-    let centered = centered_matrix(data);
+    let centered = centered_matrix(data)?;
     let mut cov = centered.t().dot(&centered);
     let mut eigenvalues = Vec::with_capacity(count.min(cov.nrows()));
     for idx in 0..count.min(cov.nrows()) {
@@ -1497,9 +1530,13 @@ fn leading_covariance_eigenvalues(
     Ok(eigenvalues)
 }
 
-fn centered_total_energy(data: ArrayView2<'_, f64>) -> f64 {
-    let centered = centered_matrix(data);
-    centered.iter().map(|v| v * v).sum::<f64>()
+fn centered_total_energy(data: ArrayView2<'_, f64>) -> Result<f64, String> {
+    let centered = centered_matrix(data)?;
+    let total = centered.iter().map(|value| value * value).sum::<f64>();
+    if !total.is_finite() {
+        return Err("centered total energy overflowed".to_string());
+    }
+    Ok(total)
 }
 
 fn cholesky_lower(matrix: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
@@ -1731,37 +1768,48 @@ fn standard_normal(rng: &mut StdRng) -> f64 {
     (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
 }
 
-fn column_mean(data: ArrayView2<'_, f64>) -> Array1<f64> {
-    let mut mean = Array1::<f64>::zeros(data.ncols());
-    for row in data.rows() {
-        mean += &row;
-    }
-    mean / data.nrows() as f64
+fn stable_column_mean(data: ArrayView2<'_, f64>) -> Result<Array1<f64>, String> {
+    stable_column_location(data)?.absolute_mean()
 }
 
-fn column_sd(data: ArrayView2<'_, f64>, mean: ArrayView1<'_, f64>) -> Array1<f64> {
+fn stable_column_sd(
+    data: ArrayView2<'_, f64>,
+    location: &StableColumnLocation,
+) -> Result<Array1<f64>, String> {
+    if location.origin.len() != data.ncols() || location.mean_offset.len() != data.ncols() {
+        return Err("column-scale location dimension mismatch".to_string());
+    }
     let mut var = Array1::<f64>::zeros(data.ncols());
     for row in data.rows() {
         for j in 0..data.ncols() {
-            let d = row[j] - mean[j];
+            let d = (row[j] - location.origin[j]) - location.mean_offset[j];
             var[j] += d * d;
         }
     }
-    var.mapv(|v| (v / data.nrows() as f64).sqrt())
-}
-
-fn centered_column(col: ArrayView1<'_, f64>) -> Array1<f64> {
-    let mean = col.iter().sum::<f64>() / col.len() as f64;
-    col.mapv(|v| v - mean)
-}
-
-fn centered_matrix(data: ArrayView2<'_, f64>) -> Array2<f64> {
-    let mean = column_mean(data);
-    let mut out = data.to_owned();
-    for mut row in out.rows_mut() {
-        row -= &mean;
+    var.mapv_inplace(|value| (value / data.nrows() as f64).sqrt());
+    if var.iter().any(|value| !value.is_finite()) {
+        return Err("stable column-scale accumulation overflowed".to_string());
     }
-    out
+    Ok(var)
+}
+
+fn centered_column(col: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
+    let matrix = col.insert_axis(Axis(1));
+    let location = stable_column_location(matrix.view())?;
+    Ok(matrix
+        .column(0)
+        .mapv(|value| (value - location.origin[0]) - location.mean_offset[0]))
+}
+
+fn centered_matrix(data: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+    let location = stable_column_location(data)?;
+    let mut out = Array2::<f64>::zeros(data.raw_dim());
+    for row in 0..data.nrows() {
+        for col in 0..data.ncols() {
+            out[[row, col]] = (data[[row, col]] - location.origin[col]) - location.mean_offset[col];
+        }
+    }
+    Ok(out)
 }
 
 fn matrix_rms(data: ArrayView2<'_, f64>) -> f64 {
@@ -1940,10 +1988,12 @@ mod tests {
         let repeated = matched_spectrum_gaussian_null(scores.view(), 72).expect("matched null");
         assert_eq!(first, repeated, "seeded null draws must be reproducible");
 
-        let observed_mean = column_mean(scores.view());
-        let observed_sd = column_sd(scores.view(), observed_mean.view());
-        let null_mean = column_mean(first.view());
-        let null_sd = column_sd(first.view(), null_mean.view());
+        let observed_location = stable_column_location(scores.view()).unwrap();
+        let observed_mean = observed_location.absolute_mean().unwrap();
+        let observed_sd = stable_column_sd(scores.view(), &observed_location).unwrap();
+        let null_location = stable_column_location(first.view()).unwrap();
+        let null_mean = null_location.absolute_mean().unwrap();
+        let null_sd = stable_column_sd(first.view(), &null_location).unwrap();
         for pc in 0..scores.ncols() {
             let mean_se = observed_sd[pc] / (rows as f64).sqrt();
             assert!(
@@ -2014,12 +2064,14 @@ mod tests {
         assert_eq!(draw, repeated, "seeded Gaussian null must be reproducible");
 
         let empirical_covariance = |data: ArrayView2<'_, f64>| {
-            let mean = column_mean(data);
+            let location = stable_column_location(data).unwrap();
             let mut covariance = Array2::<f64>::zeros((data.ncols(), data.ncols()));
             for row in data.rows() {
                 for a in 0..data.ncols() {
                     for b in 0..data.ncols() {
-                        covariance[[a, b]] += (row[a] - mean[a]) * (row[b] - mean[b]);
+                        let da = (row[a] - location.origin[a]) - location.mean_offset[a];
+                        let db = (row[b] - location.origin[b]) - location.mean_offset[b];
+                        covariance[[a, b]] += da * db;
                     }
                 }
             }
@@ -2111,6 +2163,77 @@ mod tests {
                         .abs()
                         < 2.0e-12,
                     "orthogonal covariance law failed at ({left},{right})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_null_generators_share_stable_large_origin_centering() {
+        let rows = 2_048usize;
+        let mut observed = Array2::<f64>::zeros((rows, 2));
+        let mut donor = Array2::<f64>::zeros((rows, 2));
+        for row in 0..rows {
+            let phase = std::f64::consts::TAU * row as f64 / rows as f64;
+            observed[[row, 0]] = 1.7 * phase.cos() + 0.2 * (3.0 * phase).sin();
+            observed[[row, 1]] = 0.5 * observed[[row, 0]] + 0.8 * phase.sin();
+            donor[[row, 0]] = 0.9 * (2.0 * phase).cos() + 0.3 * phase.sin();
+            donor[[row, 1]] = -0.4 * donor[[row, 0]] + 0.6 * (3.0 * phase).cos();
+        }
+        let shift = [1.0e12_f64, -2.0e12_f64];
+        let donor_shift = [-0.75e12_f64, 1.25e12_f64];
+        let mut shifted_observed = observed.clone();
+        let mut shifted_donor = donor.clone();
+        for row in 0..rows {
+            for axis in 0..2 {
+                shifted_observed[[row, axis]] += shift[axis];
+                shifted_donor[[row, axis]] += donor_shift[axis];
+            }
+        }
+
+        let spectrum = matched_spectrum_gaussian_null(observed.view(), 71).unwrap();
+        let shifted_spectrum = matched_spectrum_gaussian_null(shifted_observed.view(), 71).unwrap();
+        let architecture =
+            architecture_matched_random_weight_null(observed.view(), donor.view(), 73).unwrap();
+        let shifted_architecture = architecture_matched_random_weight_null(
+            shifted_observed.view(),
+            shifted_donor.view(),
+            73,
+        )
+        .unwrap();
+        let bootstrap = empirical_residual_bootstrap(observed.view(), 79).unwrap();
+        let shifted_bootstrap = empirical_residual_bootstrap(shifted_observed.view(), 79).unwrap();
+        for row in 0..rows {
+            for axis in 0..2 {
+                assert!(
+                    (shifted_spectrum[[row, axis]] - shift[axis] - spectrum[[row, axis]]).abs()
+                        < 2.0e-3,
+                    "matched-spectrum translation law failed at ({row},{axis})"
+                );
+                assert!(
+                    (shifted_architecture[[row, axis]] - shift[axis] - architecture[[row, axis]])
+                        .abs()
+                        < 2.0e-3,
+                    "architecture-matched translation law failed at ({row},{axis})"
+                );
+                assert!(
+                    (shifted_bootstrap[[row, axis]] - bootstrap[[row, axis]]).abs() < 3.0e-4,
+                    "residual-bootstrap centering failed at ({row},{axis})"
+                );
+            }
+        }
+
+        let base_circle = first_two_ordered_circle_stat(observed.view()).unwrap();
+        let shifted_circle = first_two_ordered_circle_stat(shifted_observed.view()).unwrap();
+        assert!((shifted_circle - base_circle).abs() < 3.0e-4);
+        let base_spec = residual_moment_spec(observed.view()).unwrap();
+        let shifted_spec = residual_moment_spec(shifted_observed.view()).unwrap();
+        for left in 0..2 {
+            for right in 0..2 {
+                assert!(
+                    (shifted_spec.covariance[[left, right]] - base_spec.covariance[[left, right]])
+                        .abs()
+                        < 3.0e-4
                 );
             }
         }

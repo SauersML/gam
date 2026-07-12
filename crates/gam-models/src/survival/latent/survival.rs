@@ -2380,9 +2380,6 @@ fn latent_survival_row_primary_gradient_hessian(
     include_log_sigma: bool,
 ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
     let log_sigma_factor = if sigma > 0.0 { sigma.ln() } else { 0.0 };
-    let mut gradient = Array1::<f64>::zeros(LATENT_SURVIVAL_PRIMARY_DIM);
-    let mut neg_hessian =
-        Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
     if include_log_sigma {
         let out = latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_DIM, _>(
             &LatentOrder2Backend,
@@ -2396,17 +2393,16 @@ fn latent_survival_row_primary_gradient_hessian(
             sigma,
             log_sigma_factor,
         )?;
-        gradient
-            .as_slice_mut()
-            .expect("gradient is contiguous")
-            .copy_from_slice(&out.g());
+        let out_gradient = out.g();
         let hessian = out.h();
-        for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
-            for b in 0..LATENT_SURVIVAL_PRIMARY_DIM {
-                neg_hessian[[a, b]] = -hessian[a][b];
-            }
-        }
-        Ok((out.value(), gradient, neg_hessian))
+        Ok((
+            out.value(),
+            Array1::from_shape_fn(LATENT_SURVIVAL_PRIMARY_DIM, |a| out_gradient[a]),
+            Array2::from_shape_fn(
+                (LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM),
+                |(a, b)| -hessian[a][b],
+            ),
+        ))
     } else {
         let out = latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_LOG_SIGMA, _>(
             &LatentOrder2Backend,
@@ -2420,14 +2416,91 @@ fn latent_survival_row_primary_gradient_hessian(
             sigma,
             log_sigma_factor,
         )?;
-        for a in 0..LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
-            gradient[a] = out.g()[a];
-            for b in 0..LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
-                neg_hessian[[a, b]] = -out.h()[a][b];
-            }
-        }
-        Ok((out.value(), gradient, neg_hessian))
+        let out_gradient = out.g();
+        let out_hessian = out.h();
+        Ok((
+            out.value(),
+            Array1::from_shape_fn(LATENT_SURVIVAL_PRIMARY_DIM, |a| {
+                if a < LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
+                    out_gradient[a]
+                } else {
+                    0.0
+                }
+            }),
+            Array2::from_shape_fn(
+                (LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM),
+                |(a, b)| {
+                    if a < LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
+                        && b < LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
+                    {
+                        -out_hessian[a][b]
+                    } else {
+                        0.0
+                    }
+                },
+            ),
+        ))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn latent_survival_row_primary_one_seed_fixed_sigma(
+    quadctx: &QuadratureContext,
+    row: &LatentSurvivalRow,
+    q_entry: f64,
+    q_exit: f64,
+    qdot_exit: f64,
+    q_right: f64,
+    mu: f64,
+    sigma: f64,
+    direction: &Array1<f64>,
+) -> Result<OneSeed<LATENT_SURVIVAL_PRIMARY_LOG_SIGMA>, String> {
+    let backend = LatentOneSeedBackend {
+        direction: std::array::from_fn(|a| direction[a]),
+    };
+    latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_LOG_SIGMA, _>(
+        &backend,
+        quadctx,
+        row,
+        q_entry,
+        q_exit,
+        qdot_exit,
+        q_right,
+        mu,
+        sigma,
+        if sigma > 0.0 { sigma.ln() } else { 0.0 },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn latent_survival_row_primary_two_seed_fixed_sigma(
+    quadctx: &QuadratureContext,
+    row: &LatentSurvivalRow,
+    q_entry: f64,
+    q_exit: f64,
+    qdot_exit: f64,
+    q_right: f64,
+    mu: f64,
+    sigma: f64,
+    direction_u: &Array1<f64>,
+    direction_v: &Array1<f64>,
+) -> Result<TwoSeed<LATENT_SURVIVAL_PRIMARY_LOG_SIGMA>, String> {
+    let backend = LatentTwoSeedBackend {
+        direction_u: std::array::from_fn(|a| direction_u[a]),
+        direction_v: std::array::from_fn(|a| direction_v[a]),
+    };
+    latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_LOG_SIGMA, _>(
+        &backend,
+        quadctx,
+        row,
+        q_entry,
+        q_exit,
+        qdot_exit,
+        q_right,
+        mu,
+        sigma,
+        if sigma > 0.0 { sigma.ln() } else { 0.0 },
+    )
 }
 
 fn latent_survival_row_primary_third_contracted(
@@ -2443,8 +2516,6 @@ fn latent_survival_row_primary_third_contracted(
     include_log_sigma: bool,
 ) -> Result<Array2<f64>, String> {
     let log_sigma_factor = if sigma > 0.0 { sigma.ln() } else { 0.0 };
-    let mut result =
-        Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
     if include_log_sigma {
         let backend = LatentOneSeedBackend {
             direction: std::array::from_fn(|a| direction[a]),
@@ -2462,35 +2533,26 @@ fn latent_survival_row_primary_third_contracted(
             log_sigma_factor,
         )?;
         let third = out.contracted_third();
-        for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
-            for b in 0..LATENT_SURVIVAL_PRIMARY_DIM {
-                result[[a, b]] = -third[a][b];
-            }
-        }
+        Ok(Array2::from_shape_fn(
+            (LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM),
+            |(a, b)| -third[a][b],
+        ))
     } else {
-        let backend = LatentOneSeedBackend {
-            direction: std::array::from_fn(|a| direction[a]),
-        };
-        let out = latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_LOG_SIGMA, _>(
-            &backend,
-            quadctx,
-            row,
-            q_entry,
-            q_exit,
-            qdot_exit,
-            q_right,
-            mu,
-            sigma,
-            log_sigma_factor,
+        let out = latent_survival_row_primary_one_seed_fixed_sigma(
+            quadctx, row, q_entry, q_exit, qdot_exit, q_right, mu, sigma, direction,
         )?;
         let third = out.contracted_third();
-        for a in 0..LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
-            for b in 0..LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
-                result[[a, b]] = -third[a][b];
-            }
-        }
+        Ok(Array2::from_shape_fn(
+            (LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM),
+            |(a, b)| {
+                if a < LATENT_SURVIVAL_PRIMARY_LOG_SIGMA && b < LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
+                    -third[a][b]
+                } else {
+                    0.0
+                }
+            },
+        ))
     }
-    Ok(result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2508,8 +2570,6 @@ fn latent_survival_row_primary_fourth_contracted(
     include_log_sigma: bool,
 ) -> Result<Array2<f64>, String> {
     let log_sigma_factor = if sigma > 0.0 { sigma.ln() } else { 0.0 };
-    let mut result =
-        Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
     if include_log_sigma {
         let backend = LatentTwoSeedBackend {
             direction_u: std::array::from_fn(|a| direction_u[a]),
@@ -2528,18 +2588,12 @@ fn latent_survival_row_primary_fourth_contracted(
             log_sigma_factor,
         )?;
         let fourth = out.contracted_fourth();
-        for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
-            for b in 0..LATENT_SURVIVAL_PRIMARY_DIM {
-                result[[a, b]] = -fourth[a][b];
-            }
-        }
+        Ok(Array2::from_shape_fn(
+            (LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM),
+            |(a, b)| -fourth[a][b],
+        ))
     } else {
-        let backend = LatentTwoSeedBackend {
-            direction_u: std::array::from_fn(|a| direction_u[a]),
-            direction_v: std::array::from_fn(|a| direction_v[a]),
-        };
-        let out = latent_survival_row_primary_jet::<LATENT_SURVIVAL_PRIMARY_LOG_SIGMA, _>(
-            &backend,
+        let out = latent_survival_row_primary_two_seed_fixed_sigma(
             quadctx,
             row,
             q_entry,
@@ -2548,16 +2602,21 @@ fn latent_survival_row_primary_fourth_contracted(
             q_right,
             mu,
             sigma,
-            log_sigma_factor,
+            direction_u,
+            direction_v,
         )?;
         let fourth = out.contracted_fourth();
-        for a in 0..LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
-            for b in 0..LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
-                result[[a, b]] = -fourth[a][b];
-            }
-        }
+        Ok(Array2::from_shape_fn(
+            (LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM),
+            |(a, b)| {
+                if a < LATENT_SURVIVAL_PRIMARY_LOG_SIGMA && b < LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
+                    -fourth[a][b]
+                } else {
+                    0.0
+                }
+            },
+        ))
     }
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -4451,21 +4510,11 @@ impl LatentBinaryFamily {
             }
             let row =
                 self.build_right_censored_row_at(row_idx, q_entry[row_idx], q_exit[row_idx])?;
-            let (row_log_survival, survival_gradient, survival_hessian) =
-                latent_survival_row_primary_gradient_hessian(
-                    &self.quadctx,
-                    &row,
-                    q_entry[row_idx],
-                    q_exit[row_idx],
-                    1.0,
-                    q_exit[row_idx],
-                    mu[row_idx],
-                    self.latent_sd,
-                    false,
-                )?;
-            let binary = binary_from_log_survival(row_log_survival, self.event_target[row_idx])?;
             let direction = self.row_primary_direction_from_flat(row_idx, &slices, d_beta_flat);
-            let third = latent_survival_row_primary_third_contracted(
+            // OneSeed already carries the ordinary value/gradient/Hessian in
+            // its base part.  Reuse those channels for the binary outer chain
+            // instead of running a separate Order2 row first.
+            let row_jet = latent_survival_row_primary_one_seed_fixed_sigma(
                 &self.quadctx,
                 &row,
                 q_entry[row_idx],
@@ -4475,8 +4524,43 @@ impl LatentBinaryFamily {
                 mu[row_idx],
                 self.latent_sd,
                 &direction,
-                false,
             )?;
+            let binary =
+                binary_from_log_survival(row_jet.base.value(), self.event_target[row_idx])?;
+            let base_gradient = row_jet.base.g();
+            let base_hessian = row_jet.base.h();
+            let contracted_third = row_jet.contracted_third();
+            let survival_gradient = Array1::from_shape_fn(LATENT_SURVIVAL_PRIMARY_DIM, |a| {
+                if a < LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
+                    base_gradient[a]
+                } else {
+                    0.0
+                }
+            });
+            let survival_hessian = Array2::from_shape_fn(
+                (LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM),
+                |(a, b)| {
+                    if a < LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
+                        && b < LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
+                    {
+                        -base_hessian[a][b]
+                    } else {
+                        0.0
+                    }
+                },
+            );
+            let third = Array2::from_shape_fn(
+                (LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM),
+                |(a, b)| {
+                    if a < LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
+                        && b < LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
+                    {
+                        -contracted_third[a][b]
+                    } else {
+                        0.0
+                    }
+                },
+            );
             let g_u = -survival_hessian.dot(&direction);
             let t_u = survival_gradient.dot(&direction);
             let mut primary = binary.grad_scale * third;
@@ -4520,46 +4604,13 @@ impl LatentBinaryFamily {
             }
             let row =
                 self.build_right_censored_row_at(row_idx, q_entry[row_idx], q_exit[row_idx])?;
-            let (row_log_survival, survival_gradient, survival_hessian) =
-                latent_survival_row_primary_gradient_hessian(
-                    &self.quadctx,
-                    &row,
-                    q_entry[row_idx],
-                    q_exit[row_idx],
-                    1.0,
-                    q_exit[row_idx],
-                    mu[row_idx],
-                    self.latent_sd,
-                    false,
-                )?;
-            let binary = binary_from_log_survival(row_log_survival, self.event_target[row_idx])?;
             let direction_u = self.row_primary_direction_from_flat(row_idx, &slices, d_beta_u_flat);
             let direction_v = self.row_primary_direction_from_flat(row_idx, &slices, d_beta_v_flat);
-            let third_u = latent_survival_row_primary_third_contracted(
-                &self.quadctx,
-                &row,
-                q_entry[row_idx],
-                q_exit[row_idx],
-                1.0,
-                q_exit[row_idx],
-                mu[row_idx],
-                self.latent_sd,
-                &direction_u,
-                false,
-            )?;
-            let third_v = latent_survival_row_primary_third_contracted(
-                &self.quadctx,
-                &row,
-                q_entry[row_idx],
-                q_exit[row_idx],
-                1.0,
-                q_exit[row_idx],
-                mu[row_idx],
-                self.latent_sd,
-                &direction_v,
-                false,
-            )?;
-            let fourth = latent_survival_row_primary_fourth_contracted(
+            // One TwoSeed row contains the base VGH, both one-seed Hessians,
+            // and the mixed two-seed Hessian.  The previous composition ran
+            // four complete rows (Order2 + OneSeed(u) + OneSeed(v) +
+            // TwoSeed(u,v)) to recover these same channels.
+            let row_jet = latent_survival_row_primary_two_seed_fixed_sigma(
                 &self.quadctx,
                 &row,
                 q_entry[row_idx],
@@ -4570,8 +4621,41 @@ impl LatentBinaryFamily {
                 self.latent_sd,
                 &direction_u,
                 &direction_v,
-                false,
             )?;
+            let binary =
+                binary_from_log_survival(row_jet.base.value(), self.event_target[row_idx])?;
+            let base_gradient = row_jet.base.g();
+            let base_hessian = row_jet.base.h();
+            let contracted_third_u = row_jet.eps.h();
+            let contracted_third_v = row_jet.del.h();
+            let contracted_fourth = row_jet.contracted_fourth();
+            let survival_gradient = Array1::from_shape_fn(LATENT_SURVIVAL_PRIMARY_DIM, |a| {
+                if a < LATENT_SURVIVAL_PRIMARY_LOG_SIGMA {
+                    base_gradient[a]
+                } else {
+                    0.0
+                }
+            });
+            let pad_matrix =
+                |matrix: &[[f64; LATENT_SURVIVAL_PRIMARY_LOG_SIGMA];
+                      LATENT_SURVIVAL_PRIMARY_LOG_SIGMA]| {
+                    Array2::from_shape_fn(
+                        (LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM),
+                        |(a, b)| {
+                            if a < LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
+                                && b < LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
+                            {
+                                -matrix[a][b]
+                            } else {
+                                0.0
+                            }
+                        },
+                    )
+                };
+            let survival_hessian = pad_matrix(&base_hessian);
+            let third_u = pad_matrix(&contracted_third_u);
+            let third_v = pad_matrix(&contracted_third_v);
+            let fourth = pad_matrix(&contracted_fourth);
             let g_u = -survival_hessian.dot(&direction_u);
             let g_v = -survival_hessian.dot(&direction_v);
             let g_uv = -third_v.dot(&direction_u);

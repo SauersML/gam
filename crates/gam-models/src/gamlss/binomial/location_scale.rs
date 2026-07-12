@@ -163,7 +163,7 @@ impl BinomialLocationScaleFamily {
         let gradient_pairs: Result<Vec<(f64, f64)>, String> = (0..n)
             .into_par_iter()
             .map(|i| {
-                let tower = binomial_location_scale_nll_tower(
+                let gradient = binomial_location_scale_nll_gradient(
                     y_slice[i],
                     w_slice[i],
                     eta_t_slice[i],
@@ -174,9 +174,8 @@ impl BinomialLocationScaleFamily {
                     core.d2mu_dq2[i],
                     core.d3mu_dq3[i],
                     link_kind,
-                    false,
                 )?;
-                Ok((-tower.g[0], -tower.g[1]))
+                Ok((-gradient[0], -gradient[1]))
             })
             .collect();
         for (i, (g_t, g_ls)) in gradient_pairs?.into_iter().enumerate() {
@@ -2386,7 +2385,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         let gradient_pairs: Result<Vec<(f64, f64)>, String> = (0..n)
             .into_par_iter()
             .map(|i| {
-                let tower = binomial_location_scale_nll_tower(
+                let gradient = binomial_location_scale_nll_gradient(
                     y_slice_e[i],
                     w_slice_e[i],
                     eta_t_slice_e[i],
@@ -2397,9 +2396,8 @@ impl CustomFamily for BinomialLocationScaleFamily {
                     core.d2mu_dq2[i],
                     core.d3mu_dq3[i],
                     link_kind_e,
-                    false,
                 )?;
-                Ok((-tower.g[0], -tower.g[1]))
+                Ok((-gradient[0], -gradient[1]))
             })
             .collect();
         for (i, (g_t, g_ls)) in gradient_pairs?.into_iter().enumerate() {

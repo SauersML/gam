@@ -1296,7 +1296,8 @@ mod runaway_tests {
             "BMS spatial setup rho holds every learned marginal/logslope/auxiliary penalty; the #461 absorber ridge occupies the trailing marginal slot"
         );
         assert_eq!(
-            setup.theta0()[1], 2.5,
+            setup.theta0()[1],
+            2.5,
             "absorber ridge seeds the trailing marginal rho coordinate at the ln(n) leakage scale"
         );
     }
