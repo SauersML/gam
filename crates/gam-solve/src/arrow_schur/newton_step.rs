@@ -698,13 +698,22 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
             //     cache's `schur_log_det_override` and leave `schur_factor = None`,
             //     so the Laplace normaliser reads the SLQ value directly.
             //
-            // MEMORY note (do not over-read): SLQ here is FLOP-matrix-free, not yet
-            // MEMORY-matrix-free — it still assembles the dense `S` (`O(k²)`) to
-            // supply `S·v`. A fully memory-matrix-free evidence path additionally
-            // needs the device-resident reduced-Schur apply (`Σ_i Y_iᵀ(Y_i x)`,
-            // the same operator the PCG hot loop already runs on-device) fed as the
-            // SLQ `matvec`; wiring that closure here removes the `O(k²)` assembly
-            // too. That device-apply plumbing is the remaining future work.
+            // RESIDENCY note (#1017): SLQ here is now both FLOP- and
+            // MEMORY-matrix-free — no dense `k×k` `S` is ever formed (see the
+            // IMPORTANT block below and `slq_reduced_schur_log_det`). Every
+            // Lanczos apply goes through `ReducedSchurOperator::apply`, which
+            // routes to the device `GpuSchurMatvec` when one is built
+            // (`maybe_build_evidence_gpu_matvec`) and otherwise to the CPU
+            // `schur_matvec` resident row-factor lane — both matrix-free.
+            //
+            // What is NOT yet device-resident at massive K: for the matrix-free
+            // Kronecker system (`sys.htbeta_matvec.is_some()`, the production
+            // border), `gpu_schur_matvec_backend` returns the CPU row-procedural
+            // apply (`build_row_procedural_matvec`), so the applies run on rayon.
+            // The device-resident framed apply the PCG hot loop already runs
+            // (`ResidentSaeFrameHandle` + `launch_sae_frame_matvec`, #1551
+            // parity-tested) is the operator to feed here; that wiring is the
+            // remaining increment.
             //
             // On any failure forming/factoring the Schur (non-PD pivot the LM
             // escalation must respond to), surface the error rather than returning a
