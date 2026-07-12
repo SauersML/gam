@@ -1,6 +1,6 @@
 //! SAE reconstruction row-jet on the GPU (#932 → A100 cutover).
 //!
-//! The SAE quasi-Laplace SAE engine needs, per row, the order-2 derivative tower of the
+//! The SAE quasi-Laplace engine needs, per row, the order-2 derivative tower of the
 //! reconstruction
 //!
 //! ```text
@@ -14,7 +14,14 @@
 //! curvature `H_tt = ⟨J_a,J_b⟩` and the θ-adjoint `Γ_a = tr(H⁻¹ ∂H/∂θ_a)` are
 //! both contractions of these).
 //!
-//! On the CPU this is the dense softmax gate Hessian: `K×K` per output column,
+//! This module currently accelerates the **gate-logit subspace** of that tower:
+//! decoded values are device inputs and therefore constants with respect to the
+//! `K` seeded logit primaries. It does not yet emit latent-coordinate or
+//! logit×coordinate channels from the basis Jacobian/Hessian tensors. It must
+//! not be described or wired as the complete production row jet until those
+//! inputs and channels are present.
+//!
+//! On the CPU the covered subspace is the dense softmax gate Hessian: `K×K` per output column,
 //! built from `K` exp-jets sharing one reciprocal jet — irreducibly `O(K³)` per
 //! row even after the #932 denominator-sharing / column-hoisting wins. On an
 //! A100 the per-row work is embarrassingly parallel across `n` rows and the
@@ -66,10 +73,9 @@ pub struct SaeRowJetChannels {
 /// A single softmax row's inputs for the batched device kernel: the `K` gate
 /// logits and the per-atom decoded value `decoded_{k,c} = Σ_b Φ_b(t_k)·B_{b,c}`
 /// for every output column `c` (the basis/decoder contraction the gate is
-/// multiplied by). For the softmax K³ bottleneck the gate logits are the
-/// primaries; the latent-coordinate primaries enter through `decoded` exactly as
-/// the CPU basis tower carries them, so adding coordinate slots needs no new
-/// chain rule (the device port mirrors the same `Order2` arithmetic).
+/// multiplied by). The gate logits are the only primaries in this device
+/// program. `decoded` is constant input: latent-coordinate derivatives require
+/// separate `d_decoded` / `d2_decoded` inputs and are not represented here.
 #[derive(Debug, Clone)]
 pub struct SaeSoftmaxRowInputs {
     /// `[K]` gate logits ℓ_k.
@@ -234,8 +240,8 @@ pub fn sae_row_jets_cpu_softmax(
 /// shape: `K` gate-logit primaries, decoded values fed as constant per-atom
 /// "single-basis" decoders so `decoded_{k,c}` is reproduced exactly. The latent
 /// coordinate primaries are not seeded here (the K³ softmax Hessian is the gate
-/// logits); the general path that also seeds coords reuses the SAME program and
-/// the SAME device arithmetic — only more slots.
+/// logits). The complete CPU program also seeds coordinates; the current device
+/// input/kernel does not.
 fn softmax_program(
     inp: &SaeSoftmaxRowInputs,
     k: usize,
