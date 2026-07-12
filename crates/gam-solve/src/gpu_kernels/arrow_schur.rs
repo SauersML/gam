@@ -1270,6 +1270,30 @@ pub fn framed_schur_matvec_once_on_device(
     cuda::framed_schur_matvec_once_on_device(sys, data, ridge_t, ridge_beta, x)
 }
 
+/// #1017 evidence-lane probe: the DETERMINISTIC framed reduced-Schur matvec
+/// `out = S·x` (host penalty + atomics-free device reduced-Schur term), computed
+/// once. The test harness diffs it against [`sae_framed_schur_matvec_cpu`] AND
+/// runs it twice to prove run-to-run bit stability — the two gates that let this
+/// operator feed the SLQ `log|S|` evidence lane without breaking its determinism
+/// contract.
+#[doc(hidden)]
+#[cfg(target_os = "linux")]
+pub fn framed_reduced_schur_det_once_on_device(
+    sys: &ArrowSchurSystem,
+    data: &DeviceSaePcgData,
+    ridge_t: f64,
+    ridge_beta: f64,
+    x: &Array1<f64>,
+) -> Result<Array1<f64>, ArrowSchurGpuFailure> {
+    if sys.k != data.beta_dim || x.len() != data.beta_dim || data.p == 0 {
+        return Err(ArrowSchurGpuFailure::Unavailable);
+    }
+    if data.frame.is_none() {
+        return Err(ArrowSchurGpuFailure::Unavailable);
+    }
+    cuda::framed_reduced_schur_det_once_on_device(sys, data, ridge_t, ridge_beta, x)
+}
+
 /// Reference dense back-end used by tests and as the fallback when the
 /// GPU declines. Kept here (not in `arrow_schur_gpu.rs`) so the validation
 /// suite has one canonical baseline.
@@ -2839,6 +2863,37 @@ extern "C" __global__ void arrow_sae_frame_scatter_h(
         acc += htb[hbase + c * k + a] * svec[row * max_q + c];
     }
     atomicAdd(&out[a], -acc);
+}
+
+/* #1017 evidence-lane DETERMINISTIC reduced-Schur scatter:
+   out[a] = -Σ_i Σ_c H_tβ[i][c,a]·svec[i,c]. One thread owns output coord `a` and
+   sums the rows in fixed index order 0..n_rows — NO atomics, so the result is
+   run-to-run bit-stable (the SLQ log|S| determinism contract). Same arithmetic as
+   arrow_sae_frame_scatter_h; only the reduction order is pinned (there the sum
+   over rows is an atomicAdd race). The shared atomic kernel is left untouched —
+   the step-PCG relies on it. `out` is fully assigned (no init needed). */
+extern "C" __global__ void arrow_sae_frame_scatter_h_det(
+    const double* __restrict__ svec,
+    const int* __restrict__ htb_ptr,
+    const double* __restrict__ htb,
+    const int* __restrict__ q_of,
+    double* __restrict__ out,
+    int k,
+    int max_q,
+    int n_rows
+) {
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= k) { return; }
+    double acc = 0.0;
+    for (int row = 0; row < n_rows; ++row) {
+        int q = q_of[row];
+        int hbase = htb_ptr[row];
+        int sbase = row * max_q;
+        for (int c = 0; c < q; ++c) {
+            acc += htb[hbase + c * k + a] * svec[sbase + c];
+        }
+    }
+    out[a] = -acc;
 }
 
 /* Frame Jacobi diagonal subtraction: diag[a] -= Σ_c Σ_d H_tβ[c,a]·ainv[c,d]·H_tβ[d,a]. */
@@ -4818,6 +4873,87 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         Ok(())
     }
 
+    /// #1017 evidence lane: the DETERMINISTIC device reduced-Schur term
+    /// `out[a] = -Σ_i H_βt^(i)(H_tt^(i)+ρ_t I)⁻¹H_tβ^(i)x`. Reuses the per-row
+    /// `apply_h`→`apply_ainv` chain (each output written by a single thread — no
+    /// cross-thread race) and the atomics-free `arrow_sae_frame_scatter_h_det`
+    /// (one thread per output coord, fixed row order), so the value is run-to-run
+    /// bit-stable. This is the reduced-Schur half of `S·x` ONLY; the penalty side
+    /// `(P_ββ + ρ_β I)x` is added by the caller on the host via the already
+    /// deterministic `sae_framed_penalty_matvec_cpu`. `out` is fully assigned.
+    /// `ainv` must already be primed for the target `ρ_t` in `buffers`.
+    fn launch_sae_frame_reduced_schur_det(
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        buffers: &mut DeviceSaeFrameBuffers,
+        x: &CudaSlice<f64>,
+        out: &mut CudaSlice<f64>,
+    ) -> Result<(), ArrowSchurGpuFailure> {
+        let k_i32 = checked_i32(buffers.k)?;
+        let max_q_i32 = checked_i32(buffers.max_q)?;
+        let n_rows_i32 = checked_i32(buffers.n_rows)?;
+        // hvec[i][c] = Σ_a H_tβ[i][c,a]·x[a].
+        {
+            let kernel = module
+                .load_function("arrow_sae_frame_apply_h")
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let cfg = frame_grid(buffers.max_q, buffers.n_rows)?;
+            let mut b = stream.launch_builder(&kernel);
+            b.arg(x)
+                .arg(&buffers.htb_ptr)
+                .arg(&buffers.htb)
+                .arg(&buffers.q_of)
+                .arg(&mut buffers.hvec)
+                .arg(&k_i32)
+                .arg(&max_q_i32)
+                .arg(&n_rows_i32);
+            // SAFETY: dense cross-block + pointers + hvec are live buffers sized
+            // for (n_rows × max_q) / (n_rows × k); the kernel guards q_i and k.
+            unsafe { b.launch(cfg) }.map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        }
+        // svec[i] = ainv_i · hvec_i.
+        {
+            let kernel = module
+                .load_function("arrow_sae_frame_apply_ainv")
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let cfg = frame_grid(buffers.max_q, buffers.n_rows)?;
+            let mut b = stream.launch_builder(&kernel);
+            b.arg(&buffers.ainv)
+                .arg(&buffers.hvec)
+                .arg(&buffers.q_of)
+                .arg(&mut buffers.svec)
+                .arg(&max_q_i32)
+                .arg(&n_rows_i32);
+            // SAFETY: ainv/hvec/svec are live buffers sized for n_rows·max_q²
+            // and n_rows·max_q; the kernel guards row/coord bounds.
+            unsafe { b.launch(cfg) }.map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        }
+        // out[a] = -Σ_i Σ_c H_tβ[i][c,a]·svec[i,c]  (deterministic; one thread per a).
+        {
+            let kernel = module
+                .load_function("arrow_sae_frame_scatter_h_det")
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let cfg = LaunchConfig {
+                grid_dim: (((buffers.k as u32).saturating_add(255) / 256).max(1), 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b = stream.launch_builder(&kernel);
+            b.arg(&buffers.svec)
+                .arg(&buffers.htb_ptr)
+                .arg(&buffers.htb)
+                .arg(&buffers.q_of)
+                .arg(&mut *out)
+                .arg(&k_i32)
+                .arg(&max_q_i32)
+                .arg(&n_rows_i32);
+            // SAFETY: svec/cross-block/out are live buffers sized for n_rows·max_q
+            // / n_rows·k / k; the kernel writes one in-bounds out[a] per a<k.
+            unsafe { b.launch(cfg) }.map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        }
+        Ok(())
+    }
+
     fn launch_sae_frame_diag_sub(
         stream: &Arc<CudaStream>,
         module: &Arc<CudaModule>,
@@ -4899,6 +5035,63 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         let out = stream
             .clone_dtoh(&out_dev)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        Ok(Array1::from_vec(out))
+    }
+
+    /// #1017 evidence-lane probe: the DETERMINISTIC framed reduced-Schur matvec
+    /// `out = S·x` computed once (host penalty via `sae_framed_penalty_matvec_cpu`
+    /// + the atomics-free device reduced-Schur term
+    /// [`launch_sae_frame_reduced_schur_det`]). Mirrors
+    /// [`framed_schur_matvec_once_on_device`] but produces a run-to-run bit-stable
+    /// result, so the test harness uses it as BOTH the CPU-parity oracle
+    /// comparison and the run-twice determinism probe. No PCG, no offload gate.
+    pub(super) fn framed_reduced_schur_det_once_on_device(
+        sys: &ArrowSchurSystem,
+        data: &DeviceSaePcgData,
+        ridge_t: f64,
+        ridge_beta: f64,
+        x: &Array1<f64>,
+    ) -> Result<Array1<f64>, ArrowSchurGpuFailure> {
+        let k = x.len();
+        if k == 0 || data.beta_dim != k || sys.k != k {
+            return Err(ArrowSchurGpuFailure::Unavailable);
+        }
+        let frame = data
+            .frame
+            .as_ref()
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let runtime = gam_gpu::device_runtime::GpuRuntime::global()
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let ctx = gam_gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let stream = ctx
+            .new_stream()
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let vector_module = pcg_vector_module(&ctx)?;
+        let mut buffers = flatten_device_sae_frame_data(sys, data, frame, ridge_t, &stream)?;
+        let x_slice = x.as_slice().ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let x_dev = stream
+            .clone_htod(x_slice)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut reduced_dev = stream
+            .alloc_zeros::<f64>(k)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        launch_sae_frame_reduced_schur_det(
+            &stream,
+            vector_module,
+            &mut buffers,
+            &x_dev,
+            &mut reduced_dev,
+        )?;
+        let reduced = stream
+            .clone_dtoh(&reduced_dev)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        // out = (P_ββ + ρ_β I)x  (deterministic host penalty)  +  reduced (= -Σ term).
+        let mut out = vec![0.0_f64; k];
+        super::sae_framed_penalty_matvec_cpu(data, ridge_beta, x_slice, &mut out);
+        for a in 0..k {
+            out[a] += reduced[a];
+        }
         Ok(Array1::from_vec(out))
     }
 
@@ -7675,6 +7868,261 @@ mod tests {
                 "#1551: matvec ran but no GPU runtime — unexpected"
             );
             assert!(worst <= 1e-9, "framed matvec parity worst rel = {worst:e}");
+        }
+    }
+
+    /// Framed SAE fixture (mix of framed `r<p` and identity-ride `r==p` atoms, a
+    /// few off-diagonal cross blocks, dense per-row `H_tβ`, `n=400` rows) sized to
+    /// clear the device-offload floor. Returns `(sys, data, ρ_t, ρ_β)`. Used by
+    /// the #1017 evidence-matvec gate.
+    #[cfg(target_os = "linux")]
+    fn build_framed_evidence_fixture() -> (ArrowSchurSystem, DeviceSaePcgData, f64, f64) {
+        use crate::arrow_schur::{
+            DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock,
+            FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp,
+        };
+        let p = 6usize;
+        let n_atoms = 8usize;
+        let ranks: Vec<usize> = (0..n_atoms)
+            .map(|k| if k % 2 == 0 { 3usize } else { p })
+            .collect();
+        let basis_sizes: Vec<usize> = (0..n_atoms).map(|_| 3usize).collect();
+        let mut border_offsets = Vec::with_capacity(n_atoms);
+        let mut acc = 0usize;
+        for k in 0..n_atoms {
+            border_offsets.push(acc);
+            acc += basis_sizes[k] * ranks[k];
+        }
+        let border_dim = acc;
+
+        let mut state = 0x1017_5111_0901_4c0du64;
+        let mut sample = || -> f64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / ((1u64 << 31) as f64) - 1.0
+        };
+        let mut frames: Vec<Array2<f64>> = Vec::new();
+        for k in 0..n_atoms {
+            let r = ranks[k];
+            let mut u = Array2::<f64>::zeros((p, r));
+            for i in 0..p {
+                for j in 0..r {
+                    u[[i, j]] = if r == p && i == j {
+                        1.0
+                    } else if r == p {
+                        0.0
+                    } else {
+                        sample()
+                    };
+                }
+            }
+            frames.push(u);
+        }
+        let w_of = |i: usize, j: usize| {
+            let (ui, uj) = (&frames[i], &frames[j]);
+            let (ri, rj) = (ranks[i], ranks[j]);
+            let mut w = Array2::<f64>::zeros((ri, rj));
+            for a in 0..ri {
+                for b in 0..rj {
+                    let mut s = 0.0;
+                    for c in 0..p {
+                        s += ui[[c, a]] * uj[[c, b]];
+                    }
+                    w[[a, b]] = s;
+                }
+            }
+            w
+        };
+        let mut pairs: Vec<(usize, usize)> = (0..n_atoms).map(|k| (k, k)).collect();
+        for &(i, j) in &[(0usize, 1usize), (2, 4), (3, 6)] {
+            pairs.push((i, j));
+            pairs.push((j, i));
+        }
+        let mut frame_blocks = Vec::new();
+        for &(i, j) in &pairs {
+            let (mi, mj) = (basis_sizes[i], basis_sizes[j]);
+            let mut g = Array2::<f64>::zeros((mi, mj));
+            for r in 0..mi {
+                for c in 0..mj {
+                    g[[r, c]] = 0.25 * sample();
+                }
+            }
+            if i == j {
+                for r in 0..mi.min(mj) {
+                    g[[r, r]] += mi as f64 + 2.0;
+                }
+            }
+            frame_blocks.push(FactoredFrameGBlock {
+                atom_i: i,
+                atom_j: j,
+                g,
+                w: w_of(i, j),
+            });
+        }
+        let mut smooth_blocks = Vec::new();
+        let mut smooth_ranks = Vec::new();
+        for k in 0..n_atoms {
+            let m = basis_sizes[k];
+            let mut a = Array2::<f64>::zeros((m, m));
+            for r in 0..m {
+                for c in 0..m {
+                    a[[r, c]] = 0.2 * sample();
+                }
+            }
+            let mut s = a.t().dot(&a);
+            for r in 0..m {
+                s[[r, r]] += 1.0;
+            }
+            smooth_blocks.push(DeviceSaeSmoothBlock {
+                global_offset: border_offsets[k],
+                factor_a: s,
+            });
+            smooth_ranks.push(ranks[k]);
+        }
+        let n = 400usize;
+        let q = 4usize;
+        let mut sys = ArrowSchurSystem::new(n, q, border_dim);
+        let mut row_htbeta = Vec::new();
+        for i in 0..n {
+            let mut a = Array2::<f64>::zeros((q, q));
+            for r in 0..q {
+                for c in 0..q {
+                    a[[r, c]] = sample();
+                }
+            }
+            let mut htt = a.t().dot(&a);
+            for r in 0..q {
+                htt[[r, r]] += q as f64 + 1.0;
+            }
+            sys.rows[i].htt = htt;
+            let mut slab = vec![0.0_f64; q * border_dim];
+            for c in 0..q {
+                for col in 0..border_dim {
+                    let v = 0.02 * sample();
+                    slab[c * border_dim + col] = v;
+                    sys.rows[i].htbeta[[c, col]] = v;
+                }
+            }
+            row_htbeta.push(slab);
+        }
+        let data_op =
+            FactoredFrameKroneckerOp::new(ranks.clone(), basis_sizes.clone(), frame_blocks.clone())
+                .expect("frame op");
+        let mut hbb = data_op.to_dense();
+        for k in 0..n_atoms {
+            let op = IdentityRightKroneckerPenaltyOp {
+                factor_a: smooth_blocks[k].factor_a.clone(),
+                p: ranks[k],
+                global_offset: border_offsets[k],
+                k: border_dim,
+            };
+            let d = op.to_dense();
+            for r in 0..border_dim {
+                for c in 0..border_dim {
+                    hbb[[r, c]] += d[[r, c]];
+                }
+            }
+        }
+        sys.hbb = hbb;
+        let data = DeviceSaePcgData {
+            p,
+            beta_dim: border_dim,
+            a_phi: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+            local_jac: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+            smooth_blocks,
+            sparse_g_blocks: Vec::new(),
+            frame: Some(DeviceSaeFrameData {
+                ranks: ranks.clone(),
+                basis_sizes: basis_sizes.clone(),
+                border_offsets: border_offsets.clone(),
+                frame_blocks,
+                smooth_ranks,
+                row_htbeta,
+            }),
+        };
+        (sys, data, 1e-7, 1e-6)
+    }
+
+    /// #1017 evidence-lane gates for the device-resident DETERMINISTIC framed
+    /// reduced-Schur matvec that feeds SLQ `log|S|`: (1) it matches the CPU oracle
+    /// `sae_framed_schur_matvec_cpu` to ≤1e-9, and (2) it is run-to-run
+    /// bit-identical — the determinism contract the atomic step-PCG matvec cannot
+    /// satisfy, which is exactly why a SEPARATE atomics-free kernel is required to
+    /// let this operator feed the evidence lane. Fails loud if CUDA is present but
+    /// the seam declines; skips only when no device exists.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn framed_reduced_schur_det_matvec_deterministic_and_matches_cpu() {
+        let (sys, data, ridge_t, ridge_beta) = build_framed_evidence_fixture();
+        let border_dim = data.beta_dim;
+        let mut probes: Vec<Array1<f64>> = Vec::new();
+        probes.push(Array1::from_shape_fn(border_dim, |a| {
+            ((a as f64 + 1.0) * 0.41).cos()
+        }));
+        for axis in [0usize, border_dim / 2, border_dim - 1] {
+            let mut e = Array1::<f64>::zeros(border_dim);
+            e[axis] = 1.0;
+            probes.push(e);
+        }
+        let mut any_ran = false;
+        for (pi, x) in probes.iter().enumerate() {
+            let dev1 = match super::framed_reduced_schur_det_once_on_device(
+                &sys, &data, ridge_t, ridge_beta, x,
+            ) {
+                Ok(out) => out,
+                Err(failure) => {
+                    assert!(
+                        gam_gpu::device_runtime::GpuRuntime::global().is_none(),
+                        "#1017: CUDA present but the deterministic framed matvec \
+                         declined/faulted (probe {pi}, tag: {failure:?})"
+                    );
+                    return;
+                }
+            };
+            any_ran = true;
+            // (2) run-twice bit-identical — the determinism gate.
+            let dev2 = super::framed_reduced_schur_det_once_on_device(
+                &sys, &data, ridge_t, ridge_beta, x,
+            )
+            .expect("second deterministic matvec launch");
+            for a in 0..border_dim {
+                assert_eq!(
+                    dev1[a].to_bits(),
+                    dev2[a].to_bits(),
+                    "#1017 determinism: probe {pi} coord {a} run-to-run differs: {:e} vs {:e}",
+                    dev1[a],
+                    dev2[a]
+                );
+            }
+            // (1) parity vs the bit-for-bit CPU oracle.
+            let mut cpu = vec![0.0_f64; border_dim];
+            sae_framed_schur_matvec_cpu(
+                &sys,
+                &data,
+                ridge_t,
+                ridge_beta,
+                x.as_slice().unwrap(),
+                &mut cpu,
+            )
+            .expect("cpu oracle matvec");
+            let scale = cpu.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(1.0);
+            for a in 0..border_dim {
+                let rel = (dev1[a] - cpu[a]).abs() / scale;
+                assert!(
+                    rel <= 1e-9,
+                    "#1017 parity: probe {pi} coord {a}: device={:e} cpu={:e} rel={rel:e} \
+                     (>1e-9) — deterministic framed S·x diverges from the CPU oracle",
+                    dev1[a],
+                    cpu[a],
+                );
+            }
+        }
+        if any_ran {
+            assert!(
+                gam_gpu::device_runtime::GpuRuntime::global().is_some(),
+                "#1017: deterministic matvec ran but no GPU runtime — unexpected"
+            );
         }
     }
 }
