@@ -32,7 +32,7 @@ authoring sandbox. Everything is argparse-driven (no hardcoded homes).
 
 MSI launch:
     python3 experiments/steering_e1/run_e1.py \
-        --model gpt2 --layer-index 7 --k-atoms 1 --harmonics 3 \
+        --model gpt2 --layer-index 7 --k-atoms 1 \
         --out-dir experiments/steering_e1/out --seed 20260709
 """
 from __future__ import annotations
@@ -230,18 +230,23 @@ def _phase_r2(signal: np.ndarray, day_indices: np.ndarray) -> float:
     return 1.0 - float(np.sum(resid ** 2)) / max(tss, 1e-30)
 
 
-def select_weekday_atom(model, day_indices: np.ndarray) -> int:
-    """Atom whose fitted coordinate best tracks the day-of-week phase."""
+def select_weekday_atom(model, day_indices: np.ndarray) -> tuple[int, int]:
+    """Return the weekday atom and its train-split chart orientation."""
     best_k, best = 0, -np.inf
+    best_orientation = 1
+    truth = np.exp(1j * TAU * day_indices.astype(np.float64) / 7.0)
     for k in range(len(model.coords)):
         c = np.asarray(model.coords[k], dtype=float)
         coord = c[:, 0] if c.ndim == 2 else c
-        # Circular coordinate -> score cos and sin of it against the phase design.
-        score = max(_phase_r2(np.cos(coord), day_indices), _phase_r2(np.sin(coord), day_indices))
+        chart = np.exp(1j * TAU * coord)
+        forward = abs(np.mean(truth * np.conj(chart)))
+        reverse = abs(np.mean(truth * chart))
+        score = max(forward, reverse) ** 2
+        orientation = 1 if forward >= reverse else -1
         if score > best:
-            best, best_k = score, k
-    log(f"weekday atom = {best_k} (phase R2={best:.4f})")
-    return best_k
+            best, best_k, best_orientation = score, k, orientation
+    log(f"weekday atom = {best_k} (circular R2={best:.4f}, orientation={best_orientation:+d})")
+    return best_k, best_orientation
 
 
 def select_flat_direction(flat_fit, X, day_indices):
@@ -267,8 +272,8 @@ def select_flat_direction(flat_fit, X, day_indices):
 
 
 # --------------------------------------------------------------------------- #
-def steer_records(model, tokenizer, layer, atom, base_examples, base_rows, base_coords,
-                  base_amplitudes,
+def steer_records(lm_model, sae_model, tokenizer, layer, atom, chart_orientation,
+                  base_examples, metric_rows, base_coords, base_amplitudes,
                   candidate_ids, flat_dir, ks, lift=None):
     """Run manifold + flat steering across base examples × rotation counts k.
 
@@ -277,16 +282,16 @@ def steer_records(model, tokenizer, layer, atom, base_examples, base_rows, base_
     """
     records: list[dict[str, Any]] = []
     for base, metric_row, t0_in, amplitude in zip(
-        base_examples, base_rows, base_coords, base_amplitudes
+        base_examples, metric_rows, base_coords, base_amplitudes
     ):
         b = base.day_index
         base_probs = restricted_probs(base.logits, candidate_ids)
         t0 = np.atleast_1d(np.asarray(t0_in, dtype=np.float64)).reshape(-1)
         for k in ks:
-            dcoord = k * TAU / 7.0
+            dcoord = chart_orientation * k / 7.0
             t_to = t0.copy()
             t_to[0] = t0[0] + dcoord  # circle retract wraps mod period Rust-side
-            plan = model.steer(int(atom), int(metric_row), float(amplitude), t0, t_to)
+            plan = sae_model.steer(int(atom), int(metric_row), float(amplitude), t0, t_to)
             delta = np.asarray(plan["delta"], dtype=np.float64)
             if lift is not None:
                 # Exact ambient lift through the orthonormal PCA rows.
@@ -295,14 +300,14 @@ def steer_records(model, tokenizer, layer, atom, base_examples, base_rows, base_
 
             # --- on-manifold arm ---
             patched = base.activation + torch.from_numpy(delta.astype(np.float32))
-            pl = run_patched(model, tokenizer, layer, base.prompt, patched)
+            pl = run_patched(lm_model, tokenizer, layer, base.prompt, patched)
             man_probs = restricted_probs(pl, candidate_ids)
             man_kl = max(full_vocab_kl(base.logits, pl), 0.0)
 
             # --- flat control: matched-norm fixed-direction addition ---
             flat_delta = np.linalg.norm(delta) * flat_dir
             patched_f = base.activation + torch.from_numpy(flat_delta.astype(np.float32))
-            pl_f = run_patched(model, tokenizer, layer, base.prompt, patched_f)
+            pl_f = run_patched(lm_model, tokenizer, layer, base.prompt, patched_f)
             flat_probs = restricted_probs(pl_f, candidate_ids)
             flat_kl = max(full_vocab_kl(base.logits, pl_f), 0.0)
 
@@ -328,6 +333,7 @@ def steer_records(model, tokenizer, layer, atom, base_examples, base_rows, base_
                     "target_prob_plus": float(probs[(b + k) % 7]),
                     "target_prob_minus": float(probs[(b - k) % 7]),
                     "base_target_prob_plus": float(base_probs[(b + k) % 7]),
+                    "base_target_prob_minus": float(base_probs[(b - k) % 7]),
                     "kl_base_to_patched": kl,
                     "weekday_probs": [float(x) for x in probs],
                 })
@@ -335,19 +341,16 @@ def steer_records(model, tokenizer, layer, atom, base_examples, base_rows, base_
 
 
 def summarize(records, ks):
-    """Per-arm: cyclic-advance steering accuracy (best of ± orientation), mean
-    target-day probability, mean collateral KL, and the dose-response series."""
+    """Forward cyclic accuracy fixed by the fit-split orientation and dose response."""
     out: dict[str, Any] = {}
     for arm in ("manifold", "flat"):
         rs = [r for r in records if r["arm"] == arm]
         if not rs:
             continue
-        # Orientation: the fit's circle sign is arbitrary; score both directions.
-        acc_plus = np.mean([r["realized_top_index"] == (r["base_day_index"] + r["k"]) % 7 for r in rs])
-        acc_minus = np.mean([r["realized_top_index"] == (r["base_day_index"] - r["k"]) % 7 for r in rs])
-        orient = "+" if acc_plus >= acc_minus else "-"
-        acc = float(max(acc_plus, acc_minus))
-        tp_key = "target_prob_plus" if orient == "+" else "target_prob_minus"
+        acc = float(np.mean([
+            r["realized_top_index"] == (r["base_day_index"] + r["k"]) % 7 for r in rs
+        ]))
+        tp_key = "target_prob_plus"
         dose = {}
         for k in ks:
             rk = [r for r in rs if r["k"] == k]
@@ -356,7 +359,7 @@ def summarize(records, ks):
                 "mean_kl": float(np.mean([r["kl_base_to_patched"] for r in rk])) if rk else float("nan"),
             }
         out[arm] = {
-            "orientation": orient,
+            "orientation": "fit-split",
             "cyclic_advance_accuracy": acc,
             "mean_target_prob": float(np.mean([r[tp_key] for r in rs])),
             "mean_kl": float(np.mean([r["kl_base_to_patched"] for r in rs])),
@@ -415,9 +418,9 @@ def parse_args() -> argparse.Namespace:
                     help="0-based block index to capture/patch (Engels GPT-2 calendar SAE is layer 7)")
     ap.add_argument("--k-atoms", type=int, default=1, help="manifold SAE atom count K")
     ap.add_argument("--flat-k", type=int, default=32, help="flat-SAE dictionary size (control)")
-    ap.add_argument("--harmonics", type=int, default=3)
     ap.add_argument("--n-iter", type=int, default=60)
-    ap.add_argument("--max-k", type=int, default=6, help="max rotation count; sweeps k=1..max_k (2π/7 each)")
+    ap.add_argument("--max-k", type=int, default=6,
+                    help="max rotation count; each step is 1/7 of the period-one chart")
     ap.add_argument("--candidate-prefix", default=" ")
     ap.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="fp32")
     ap.add_argument("--seed", type=int, default=20260709)
@@ -441,14 +444,15 @@ def main() -> int:
     candidate_ids = candidate_token_ids(tok, args.candidate_prefix)
     log(f"candidate ids: {dict(zip(WEEKDAYS, candidate_ids))}")
 
-    log("collecting weekday activation cloud (fit + base templates)")
+    log("collecting disjoint fit and held-out weekday activation clouds")
     fit_examples = collect_cloud(model_lm, tok, layer, FIT_TEMPLATES)
     base_examples = collect_cloud(model_lm, tok, layer, BASE_TEMPLATES)
-    all_examples = fit_examples + base_examples
-    X_ambient = np.ascontiguousarray(
-        np.stack([ex.activation.numpy().astype(np.float64) for ex in all_examples]))
-    day_indices = np.asarray([ex.day_index for ex in all_examples])
-    log(f"cloud X shape {X_ambient.shape}")
+    X_fit_ambient = np.ascontiguousarray(
+        np.stack([ex.activation.numpy().astype(np.float64) for ex in fit_examples]))
+    X_base_ambient = np.ascontiguousarray(
+        np.stack([ex.activation.numpy().astype(np.float64) for ex in base_examples]))
+    fit_day_indices = np.asarray([ex.day_index for ex in fit_examples])
+    log(f"fit X shape {X_fit_ambient.shape}; held-out X shape {X_base_ambient.shape}")
 
     # Wide-p treatment (same methodology as the committed OLMo fixtures): fit in
     # a per-layer PCA chart. The steering DELTAS are lifted back to ambient
@@ -457,69 +461,81 @@ def main() -> int:
     # Raw 3.5k-dim/84-row clouds put outer REML in the wide-p pathological
     # regime (probe 2026-07-10: all preprocessing variants refused); rank-r PCA
     # is where the calendar circle lives anyway (rank ~2-3).
-    if args.pca_dim and args.pca_dim < X_ambient.shape[1]:
-        mu = X_ambient.mean(0, keepdims=True)
-        Xc = X_ambient - mu
-        _, svals, vt = np.linalg.svd(Xc, full_matrices=False)
+    if args.pca_dim and args.pca_dim < X_fit_ambient.shape[1]:
+        mu = X_fit_ambient.mean(0, keepdims=True)
+        X_fit_centered = X_fit_ambient - mu
+        _, svals, vt = np.linalg.svd(X_fit_centered, full_matrices=False)
         r = int(min(args.pca_dim, vt.shape[0]))
         lift = np.ascontiguousarray(vt[:r])            # (r, p) orthonormal rows
-        X = np.ascontiguousarray(Xc @ lift.T)          # (n, r) fit chart
+        X_fit = np.ascontiguousarray(X_fit_centered @ lift.T)
+        X_base = np.ascontiguousarray((X_base_ambient - mu) @ lift.T)
         evr = float((svals[:r] ** 2).sum() / max((svals ** 2).sum(), 1e-30))
-        log(f"PCA chart: {X.shape} (explained variance {evr:.4f})")
+        log(f"train-only PCA chart: {X_fit.shape} (fit explained variance {evr:.4f})")
     else:
         lift = None
-        X = X_ambient
+        X_fit = X_fit_ambient
+        X_base = X_base_ambient
 
     log("fitting gamfit.sae_manifold_fit (periodic circle, softmax assignment)")
-    model = gamfit.sae_manifold_fit(
-        X, K=args.k_atoms, d_atom=1, atom_topology="circle", assignment="softmax",
+    sae_model = gamfit.sae_manifold_fit(
+        X_fit, K=args.k_atoms, d_atom=1, atom_topology="circle", assignment="softmax",
         n_iter=args.n_iter, random_state=args.seed)
-    fit_ev = float(1.0 - np.sum((X - np.asarray(model.fitted)) ** 2)
-                   / max(np.sum((X - X.mean(0)) ** 2), 1e-30))
-    atom = select_weekday_atom(model, day_indices)
+    fit_ev = float(1.0 - np.sum((X_fit - np.asarray(sae_model.fitted)) ** 2)
+                   / max(np.sum((X_fit - X_fit.mean(0)) ** 2), 1e-30))
+    atom, chart_orientation = select_weekday_atom(sae_model, fit_day_indices)
 
     log("fitting flat-SAE control (gamfit.sparse_dictionary_fit)")
     flat_fit = gamfit.sparse_dictionary_fit(
-        X.astype(np.float32), min(args.flat_k, X.shape[0] - 1), active=1, max_epochs=40)
-    flat_dir, flat_lat = select_flat_direction(flat_fit, X.astype(np.float32), day_indices)
+        X_fit.astype(np.float32), min(args.flat_k, X_fit.shape[0] - 1),
+        active=1, max_epochs=40)
+    flat_dir, flat_lat = select_flat_direction(
+        flat_fit, X_fit.astype(np.float32), fit_day_indices)
     if lift is not None:
         flat_dir = np.asarray(flat_dir, dtype=np.float64) @ lift
         norm = np.linalg.norm(flat_dir)
         if norm > 0:
             flat_dir = flat_dir / norm
 
-    # Steering coordinate for a base example = its fitted row coordinate. Base
-    # rows are the last len(base_examples) rows of X (all_examples order).
-    base_row0 = len(fit_examples)
-    coord_atom = np.asarray(model.coords[atom], dtype=float)
-    base_rows = [base_row0 + i for i in range(len(base_examples))]
-    base_coords = [coord_atom[row] for row in base_rows]
-    base_amplitudes = [float(model.assignments[row, atom]) for row in base_rows]
+    # OOS chart state is inferred without refitting. `steer` accepts a fitted-row
+    # metric index, so each held-out point uses the nearest fitted point on the
+    # period-one circle; under the default Euclidean metric this choice is exactly
+    # immaterial, and it remains the chart-local choice for row-varying metrics.
+    base_latents = sae_model.converged_latents(X_base)
+    base_coords_array = np.asarray(base_latents["coords"][atom], dtype=float)
+    base_assignments = np.asarray(base_latents["assignments"], dtype=float)
+    fit_coords_array = np.asarray(sae_model.coords[atom], dtype=float)
+    fit_turns = fit_coords_array[:, 0]
+    base_turns = base_coords_array[:, 0]
+    metric_rows = []
+    for turn in base_turns:
+        circular_distance = np.abs((fit_turns - turn + 0.5) % 1.0 - 0.5)
+        metric_rows.append(int(np.argmin(circular_distance)))
+    base_coords = [base_coords_array[row] for row in range(len(base_examples))]
+    base_amplitudes = [float(base_assignments[row, atom]) for row in range(len(base_examples))]
 
     ks = list(range(1, args.max_k + 1))
     log(f"steering {len(base_examples)} base contexts × k∈{ks} (manifold + flat)")
-    records = steer_records(model, tok, layer, atom, base_examples, base_rows, base_coords,
-                            base_amplitudes,
-                            candidate_ids, flat_dir, ks, lift=lift)
+    records = steer_records(
+        model_lm, sae_model, tok, layer, atom, chart_orientation,
+        base_examples, metric_rows, base_coords, base_amplitudes,
+        candidate_ids, flat_dir, ks, lift=lift)
     summary = summarize(records, ks)
 
     meta = {
         "model": args.model, "layer_index": args.layer_index, "k_atoms": args.k_atoms,
-        "harmonics": args.harmonics, "flat_k": int(flat_fit.decoder.shape[0]),
+        "flat_k": int(flat_fit.decoder.shape[0]),
         "flat_latent": int(flat_lat), "weekday_atom": int(atom), "fit_ev": fit_ev,
+        "chart_orientation": int(chart_orientation),
         "n_fit_rows": int(len(fit_examples)), "n_base_rows": int(len(base_examples)),
         "seed": args.seed,
     }
     write_outputs(Path(args.out_dir), meta, records, summary)
 
-    # E2 (gam#2234): the collateral-damage curve, read off the records just
-    # written. A failure here must not sink the E1 run, so it is best-effort.
-    try:
-        import analyze_collateral
+    # E2 (gam#2234) is part of the acceptance result, so analysis failures are
+    # fatal rather than silently converting a missing verdict into a successful E1.
+    import analyze_collateral
 
-        analyze_collateral.run(Path(args.out_dir))
-    except Exception as exc:  # noqa: BLE001 — E2 is a downstream read-off
-        log(f"E2 collateral analysis skipped: {exc}")
+    analyze_collateral.run(Path(args.out_dir))
 
     for arm in ("manifold", "flat"):
         s = summary.get(arm)

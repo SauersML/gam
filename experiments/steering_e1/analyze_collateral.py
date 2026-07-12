@@ -2,17 +2,16 @@
 
 E1 (`run_e1.py`) already sweeps rotation dose `k` for BOTH intervention arms
 (on-manifold code rotation vs matched-norm flat-direction addition) and records,
-per `(base context, k, arm)`, the achieved effect (probability the steered model
-places on the intended target weekday) and the collateral (full-vocab
+per `(base context, k, arm)`, the achieved effect (probability mass moved onto
+the intended target weekday) and the collateral (full-vocab
 `KL(base || patched)`). E2 is the read-off the #2234 thesis lives or dies on:
 
     "For each intervention family, sweep achieved-effect vs collateral KL. The
      on-manifold curve should sit strictly below flat steering's — curved
      features are the right control knobs."
 
-This module consumes `e1_records.jsonl` (+ `e1_summary.json` for each arm's
-fitted circle orientation) and produces the effect→collateral efficiency
-frontier per arm plus the strict-dominance verdict, with NO model in the loop
+This module consumes `e1_records.jsonl` and produces the effect→collateral
+efficiency frontier per arm plus the strict-dominance verdict, with NO model in the loop
 (pure numpy over the recorded points), so it re-runs cheaply on any E1 output.
 
 The frontier is `g_arm(e) = min collateral over recorded points whose achieved
@@ -55,38 +54,18 @@ def load_records(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def arm_orientations(summary_path: Path, records: list[dict[str, Any]]) -> dict[str, str]:
-    """Each arm's fitted-circle orientation (+/-). Prefer the E1 summary; fall
-    back to recomputing from the records (the same rule `run_e1.summarize` uses)
-    so E2 works on a records-only drop."""
-    if summary_path.exists():
-        summary = json.loads(summary_path.read_text()).get("summary", {})
-        orient = {arm: summary[arm]["orientation"] for arm in ARMS if arm in summary}
-        if set(orient) == set(ARMS):
-            return orient
-    orient = {}
-    for arm in ARMS:
-        rs = [r for r in records if r["arm"] == arm]
-        if not rs:
-            continue
-        acc_plus = np.mean([r["realized_top_index"] == (r["base_day_index"] + r["k"]) % 7 for r in rs])
-        acc_minus = np.mean([r["realized_top_index"] == (r["base_day_index"] - r["k"]) % 7 for r in rs])
-        orient[arm] = "+" if acc_plus >= acc_minus else "-"
-    return orient
-
-
-def arm_points(records: list[dict[str, Any]], arm: str, orient: str) -> np.ndarray:
+def arm_points(records: list[dict[str, Any]], arm: str) -> np.ndarray:
     """`(effect, collateral)` per recorded intervention for one arm. Effect =
-    probability the steered model places on the intended target weekday (oriented
-    to the arm's fitted circle sign); collateral = full-vocab KL(base||patched).
-    Rows with the trivial no-op dose (k=0) are excluded — there is no effect to
-    price there."""
-    key = "target_prob_plus" if orient == "+" else "target_prob_minus"
-    pts = [
-        (float(r[key]), float(r["kl_base_to_patched"]))
-        for r in records
-        if r["arm"] == arm and int(r["k"]) != 0
-    ]
+    probability mass moved onto the forward target weekday, using the orientation
+    fixed on the fit split; collateral = full-vocab KL(base||patched). Only
+    positive-effect interventions belong on an efficiency frontier."""
+    pts = []
+    for record in records:
+        if record["arm"] != arm or int(record["k"]) == 0:
+            continue
+        effect = float(record["target_prob_plus"]) - float(record["base_target_prob_plus"])
+        if effect > 0.0:
+            pts.append((effect, float(record["kl_base_to_patched"])))
     return np.asarray(pts, dtype=np.float64).reshape(-1, 2)
 
 
@@ -103,8 +82,8 @@ def frontier(points: np.ndarray, grid: np.ndarray) -> np.ndarray:
     return out
 
 
-def analyze(records: list[dict[str, Any]], orient: dict[str, str]) -> dict[str, Any]:
-    pts = {arm: arm_points(records, arm, orient.get(arm, "+")) for arm in ARMS}
+def analyze(records: list[dict[str, Any]]) -> dict[str, Any]:
+    pts = {arm: arm_points(records, arm) for arm in ARMS}
     for arm in ARMS:
         if pts[arm].size == 0:
             raise ValueError(f"arm '{arm}' has no non-trivial steering records")
@@ -138,15 +117,8 @@ def analyze(records: list[dict[str, Any]], orient: dict[str, str]) -> dict[str, 
         for i, e in enumerate(grid)
     ]
 
-    manifold_dominates = (
-        np.isfinite(dominance_fraction)
-        and dominance_fraction >= 0.5
-        and np.isfinite(eff_ratio["manifold"])
-        and np.isfinite(eff_ratio["flat"])
-        and eff_ratio["manifold"] < eff_ratio["flat"]
-    )
+    manifold_dominates = bool(gap.size and np.all(gap > 0.0))
     return {
-        "orientation": orient,
         "n_points": {arm: int(pts[arm].shape[0]) for arm in ARMS},
         "effect_range": {"lo": float(lo), "hi": float(hi)},
         "collateral_efficiency": eff_ratio,  # collateral KL per unit achieved effect
@@ -165,7 +137,7 @@ def write_report(out_dir: Path, result: dict[str, Any]) -> None:
     lines = [
         "# E2 — Collateral-damage curve (gam#2234)",
         "",
-        "Achieved effect = P(steered model → intended target weekday); collateral =",
+        "Achieved effect = probability mass moved onto the intended target weekday; collateral =",
         "full-vocab `KL(base || patched)`. The frontier `g(e)` is the least collateral",
         "at which each arm buys at least effect `e` — the honest matched-EFFECT",
         "comparison (the arms reach different effects at the same dose).",
@@ -197,8 +169,7 @@ def write_report(out_dir: Path, result: dict[str, Any]) -> None:
 
 def run(e1_dir: Path) -> dict[str, Any]:
     records = load_records(e1_dir / "e1_records.jsonl")
-    orient = arm_orientations(e1_dir / "e1_summary.json", records)
-    result = analyze(records, orient)
+    result = analyze(records)
     write_report(e1_dir, result)
     log(
         f"manifold_dominates={result['manifold_dominates']} "
@@ -212,7 +183,7 @@ def run(e1_dir: Path) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--e1-dir", default="experiments/steering_e1/out",
-                    help="directory holding e1_records.jsonl (+ e1_summary.json)")
+                    help="directory holding e1_records.jsonl")
     return ap.parse_args()
 
 
