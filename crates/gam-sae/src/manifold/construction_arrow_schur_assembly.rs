@@ -181,7 +181,7 @@ impl SaeManifoldTerm {
         dense_beta_penalty_probe_max_dim: usize,
         forced_layout: ForcedRowLayout,
     ) -> Result<ArrowSchurSystem, String> {
-        rho.validate_ard_log_strength_domain()?;
+        rho.validate_log_strength_domain()?;
         if !(penalty_scale.is_finite() && penalty_scale > 0.0) {
             return Err(format!(
                 "SaeManifoldTerm::assemble_arrow_schur_scaled: penalty_scale must be finite and positive; got {penalty_scale}"
@@ -1110,8 +1110,7 @@ impl SaeManifoldTerm {
                                     // a fixed prior only damps the Newton step — it does not
                                     // move the stationary point (the gradient, which sets the
                                     // fixed point, stays the exact `V'`).
-                                    let alpha =
-                                        SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
+                                    let alpha = rho.log_ard[k][axis].exp();
                                     let prior =
                                         ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
                                     block.gt[starts[j] + axis] += w_row * prior.grad;
@@ -1141,9 +1140,7 @@ impl SaeManifoldTerm {
                                     // branch above for why `max(V'', 0)` is required to keep
                                     // `htt` PD (the exact `V'' = α·cos κt` is indefinite past a
                                     // quarter period and breaks the Schur/log-det Cholesky).
-                                    let alpha = SaeManifoldRho::stable_exp_strength(
-                                        rho.log_ard[atom_idx][axis],
-                                    );
+                                    let alpha = rho.log_ard[atom_idx][axis].exp();
                                     let prior =
                                         ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
                                     block.gt[off + axis] += w_row * prior.grad;

@@ -182,12 +182,19 @@ def ring_stats(centers: np.ndarray) -> tuple[float, float]:
     """
     c = _finite_points(centers, "centers", 3)
     c, _ = _center_points(c)
-    r = np.linalg.norm(c, axis=1)
+    # Radius CV and angles are exactly scale-invariant. Normalize before either
+    # calculation so finite centroids whose raw squares overflow (for example,
+    # coordinates around 1e307) retain their representable geometry.
+    coordinate_scale = float(np.max(np.abs(c)))
+    if not np.isfinite(coordinate_scale) or coordinate_scale <= 0.0:
+        raise ValueError("centroid ring is unidentified at zero radius")
+    normalized = c / coordinate_scale
+    r = np.hypot(normalized[:, 0], normalized[:, 1])
     mean_radius = float(r.mean())
     if not np.isfinite(mean_radius) or mean_radius <= 0.0:
         raise ValueError("centroid ring is unidentified at zero radius")
     cv = float(r.std() / mean_radius)
-    ang = np.sort(np.arctan2(c[:, 1], c[:, 0]))
+    ang = np.sort(np.arctan2(normalized[:, 1], normalized[:, 0]))
     gaps = np.diff(np.concatenate([ang, [ang[0] + 2 * np.pi]]))
     return cv, float(np.degrees(gaps.max()))
 

@@ -2207,13 +2207,7 @@ impl SaeManifoldTerm {
             // Penalized decoder dimension: `r_k` coordinate channels carry the
             // `S_k` roughness penalty (full-`B` path ⇒ `r_k == p`).
             let penalized_channel_dim = atom.border_frame_rank() * rank_s;
-            // The SAME clamped log-strength the penalty/Hessian channels
-            // exponentiate: past the ±700 band λ_eff is constant, so the
-            // normalizer must be too — a raw coordinate would let the criterion
-            // drift linearly while the model it scores is frozen. (The outer
-            // walk is bounded at |ρ| ≤ 30, so the band is unreachable in
-            // production; this keeps the two conventions identical anyway.)
-            let log_lambda = SaeManifoldRho::clamped_log_strength(rho.log_lambda_smooth[atom_idx]);
+            let log_lambda = rho.log_lambda_smooth[atom_idx];
             acc += 0.5 * (penalized_channel_dim as f64) * log_lambda;
         }
         // `V = … − occam`, so the net occam SUBTRACTS the penalty normalizer.
@@ -2221,9 +2215,8 @@ impl SaeManifoldTerm {
     }
 
     /// Per-atom derivative `∂(occam)/∂log λ_smooth[k]` (#1556): atom `k`'s entry
-    /// is `½·r_k·rank(S_k)` inside the ±700 clamp band and `0` outside it
-    /// (where [`Self::reml_occam_term`] reads the clamped, constant
-    /// log-strength), matching the per-atom Occam term exactly. The
+    /// is `½·r_k·rank(S_k)` throughout the validated log-strength domain,
+    /// matching the per-atom Occam term exactly. The
     /// unpenalized-frame `frame_dim` term carries no `log λ` dependence and is
     /// absent from both. Returns one entry per atom in atom order.
     pub(crate) fn reml_occam_log_lambda_smooth_derivative(
@@ -2234,13 +2227,7 @@ impl SaeManifoldTerm {
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let rank_s = Self::symmetric_rank(&atom.smooth_penalty)?;
             let penalized_channel_dim = atom.border_frame_rank() * rank_s;
-            let raw = rho.log_lambda_smooth[atom_idx];
-            let inside_band = SaeManifoldRho::clamped_log_strength(raw) == raw;
-            out.push(if inside_band {
-                0.5 * (penalized_channel_dim as f64)
-            } else {
-                0.0
-            });
+            out.push(0.5 * (penalized_channel_dim as f64));
         }
         Ok(out)
     }
@@ -3780,7 +3767,7 @@ impl SaeManifoldTerm {
         if rho.log_ard[atom].is_empty() {
             return 0.0;
         }
-        let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom][axis]);
+        let alpha = rho.log_ard[atom][axis].exp();
         let periods = self.assignment.coords[atom].effective_axis_periods();
         let t = self.assignment.coords[atom].row(row)[axis];
         let prior = ArdAxisPrior::eval(alpha, t, periods[axis]);
@@ -3812,7 +3799,7 @@ impl SaeManifoldTerm {
         j: usize,
         cache: &ArrowFactorCache,
     ) -> Result<SaeArrowVector, String> {
-        rho.validate_ard_log_strength_domain()?;
+        rho.validate_log_strength_domain()?;
         let n_params = rho.to_flat().len();
         if j >= n_params {
             return Err(format!(
@@ -3893,7 +3880,7 @@ impl SaeManifoldTerm {
                     if rho.ard_flat_index(atom, axis) != j {
                         continue;
                     }
-                    let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom][axis]);
+                    let alpha = rho.log_ard[atom][axis].exp();
                     let periods = self.assignment.coords[atom].effective_axis_periods();
                     let row_w = self.row_loss_weights.as_deref();
                     for row in 0..self.n_obs() {
@@ -4134,7 +4121,7 @@ impl SaeManifoldTerm {
         solver: &DeflatedArrowSolver<'_>,
         joint_block: bool,
     ) -> Result<SaeArrowVector, String> {
-        rho.validate_ard_log_strength_domain()?;
+        rho.validate_log_strength_domain()?;
         // Γ_a = tr(H⁻¹ ∂H/∂θ_a) over the inner variables θ (#1006). `H` here is
         // the SAME object the criterion factor builds — Gauss-Newton data
         // curvature plus the prior majorizers / `hessian_diag` diagonals the
@@ -4561,7 +4548,7 @@ impl SaeManifoldTerm {
         probes: &[Array1<f64>],
         sinv_probes: &[Array1<f64>],
     ) -> Result<SaeArrowVector, String> {
-        rho.validate_ard_log_strength_domain()?;
+        rho.validate_log_strength_domain()?;
         if cache.arrow_log_det().is_none() {
             return Err(
                 "logdet_theta_adjoint_from_probes: cache lacks an authoritative joint-Hessian \

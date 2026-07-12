@@ -324,7 +324,7 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         v: &SaeArrowVector,
     ) -> Result<SaeArrowVector, String> {
-        rho.validate_ard_log_strength_domain()?;
+        rho.validate_log_strength_domain()?;
         let p = self.output_dim();
         let n = self.n_obs();
         let k_atoms = self.k_atoms();
@@ -539,7 +539,7 @@ impl SaeManifoldTerm {
                 if rho.log_ard[atom].is_empty() {
                     continue;
                 }
-                let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom][axis]);
+                let alpha = rho.log_ard[atom][axis].exp();
                 let t_val = self.assignment.coords[atom].row(row)[axis];
                 let prior = ArdAxisPrior::eval(alpha, t_val, ard_axis_periods[atom][axis]);
                 let neg = prior.hess.min(0.0);
@@ -685,7 +685,8 @@ impl SaeManifoldTerm {
             &self.assignment,
             rho,
             self.row_loss_weights.as_deref(),
-        );
+        )
+        .map_err(OuterGradientError::internal)?;
         let correction = -0.5 * sae_inner(gamma, response);
         let gradient = explicit + logdet_trace + correction;
         if !gradient.is_finite() {
@@ -877,7 +878,7 @@ impl SaeManifoldTerm {
         solver: &DeflatedArrowSolver<'_>,
         inverse_probe_bundle: Option<(&[Array1<f64>], &[Array1<f64>])>,
     ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
-        rho.validate_ard_log_strength_domain()
+        rho.validate_log_strength_domain()
             .map_err(OuterGradientError::internal)?;
         let n_params = rho.to_flat().len();
         let mut explicit = Array1::<f64>::zeros(n_params);
@@ -894,7 +895,8 @@ impl SaeManifoldTerm {
                     &self.assignment,
                     rho,
                     self.row_loss_weights.as_deref(),
-                );
+                )
+                .map_err(OuterGradientError::internal)?;
             // ordered Beta--Bernoulli concentration controls only the Beta--Bernoulli prior. The
             // final reconstruction gate is `sigmoid(logit/tau)`, so the data
             // likelihood and its Gauss--Newton blocks have no direct alpha

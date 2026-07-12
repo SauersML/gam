@@ -692,7 +692,7 @@ impl SaeManifoldTerm {
     ) -> Result<(), String> {
         use crate::chart_canonicalization::{CHART_RECOMPOSITION_REL_TOL, CanonicalChartTopology};
 
-        rho.validate_ard_log_strength_domain()?;
+        rho.validate_log_strength_domain()?;
 
         // #F3 — capture the PRE-canonicalization coordinate spread per atom/axis.
         // The ARD precisions are stamped AFTER the reparameterization below (see the
@@ -956,7 +956,7 @@ impl SaeManifoldTerm {
         // `α_a = exp(log_ard[k][a])` is the REML precision in the FIT chart;
         // `α'_a = α_a · spread_pre / spread_post` re-expresses it against the
         // canonical chart's realized coordinate spread. Uses the identical
-        // `stable_exp_strength` map as the fit's `ArdAxisPrior`; an atom with no
+        // exact exponential map as the fit's `ArdAxisPrior`; an atom with no
         // fitted coordinate prior (`rho.log_ard[k]` empty) is left `None`
         // (prior-free encode, unchanged). A degenerate/non-finite spread on either
         // side leaves that axis' `α` untransformed. Guarded on the rho/atom-count
@@ -973,7 +973,7 @@ impl SaeManifoldTerm {
                     let pre = &ard_pre_spread[atom_idx];
                     let stamped: Array1<f64> = (0..log_ard.len())
                         .map(|axis| {
-                            let alpha = SaeManifoldRho::stable_exp_strength(log_ard[axis]);
+                            let alpha = log_ard[axis].exp();
                             let sp_pre = pre.get(axis).copied().unwrap_or(f64::NAN);
                             let sp_post = axis_coordinate_spread(
                                 coords.view(),

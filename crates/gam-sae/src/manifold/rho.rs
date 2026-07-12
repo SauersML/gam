@@ -1,12 +1,12 @@
 use super::*;
 
-/// Closed numerical domain of every learnable ARD log precision.
+/// Closed numerical domain of every active flat log-strength coordinate.
 ///
 /// These are real parameter-domain endpoints, not saturation points: callers
 /// reject values outside the interval instead of clipping them onto a constant
 /// objective plateau.
-pub(crate) const ARD_LOG_STRENGTH_MIN: f64 = -700.0;
-pub(crate) const ARD_LOG_STRENGTH_MAX: f64 = 700.0;
+pub(crate) const LOG_STRENGTH_MIN: f64 = -700.0;
+pub(crate) const LOG_STRENGTH_MAX: f64 = 700.0;
 
 /// #1026 — how the per-atom ARD precisions are exposed to the OUTER PENALIZED QUASI-LAPLACE
 /// optimizer.
@@ -352,6 +352,7 @@ impl SaeManifoldRho {
                      be finite and positive; got {dispersion}"
                 ));
             }
+            bound.validate_log_strength_domain()?;
             return Ok(bound);
         }
         // Separable-gate modes (softmax entropy / ThresholdGate gated-L1).
@@ -400,6 +401,7 @@ impl SaeManifoldRho {
                 *value += smooth_ard_shift;
             }
         }
+        scaled.validate_log_strength_domain()?;
         Ok(scaled)
     }
 
@@ -427,15 +429,12 @@ impl SaeManifoldRho {
                 *value += shift;
             }
         }
+        scaled.validate_log_strength_domain()?;
         Ok(scaled)
     }
 
     pub fn lambda_sparse(&self) -> f64 {
-        // Clamp the log-strength into the finite-normal band before
-        // exponentiating: a raw `exp(log_lambda)` overflows to `inf` for
-        // `log_lambda ≳ 709`, and `inf · 0.0` / `inf / inf` then injects NaN
-        // into the penalty value/grad/Hessian and poisons the solve.
-        Self::stable_exp_strength(self.log_lambda_sparse)
+        self.log_lambda_sparse.exp()
     }
 
     /// Number of atoms `K` carried by the per-atom smoothness vector.
@@ -444,13 +443,12 @@ impl SaeManifoldRho {
         self.log_lambda_smooth.len()
     }
 
-    /// Stable smoothness strength `exp(log_lambda_smooth[k])` for atom `k`
-    /// (#1556). The exponent is clamped into the finite-normal band by
-    /// [`Self::stable_exp_strength`] so the strength is always a finite,
-    /// strictly-positive `f64`.
+    /// Smoothness strength `exp(log_lambda_smooth[k])` for atom `k` (#1556).
+    /// Computational entry points validate the rho domain before calling this
+    /// exact, unsaturated map.
     #[must_use]
     pub fn lambda_smooth_for(&self, atom: usize) -> f64 {
-        Self::stable_exp_strength(self.log_lambda_smooth[atom])
+        self.log_lambda_smooth[atom].exp()
     }
 
     /// All `K` per-atom smoothness strengths `exp(log_lambda_smooth[k])`, atom
@@ -460,73 +458,63 @@ impl SaeManifoldRho {
     pub fn lambda_smooth_vec(&self) -> Vec<f64> {
         self.log_lambda_smooth
             .iter()
-            .map(|&v| Self::stable_exp_strength(v))
+            .map(|&v| v.exp())
             .collect()
     }
 
-    /// Exponentiate a learnable log-strength with the exponent clamped into the
-    /// finite-normal band, so the resulting strength is always a finite,
-    /// strictly-positive `f64` (no overflow to `inf`, no underflow to `0.0`).
-    pub(crate) fn stable_exp_strength(log_strength: f64) -> f64 {
-        Self::clamped_log_strength(log_strength).exp()
-    }
-
-    /// The clamped log-strength [`Self::stable_exp_strength`] exponentiates.
-    /// Every consumer that needs the strength in LOG space (e.g. the REML
-    /// smoothing-Occam normalizer `½·d·log λ`) must read THIS, not the raw
-    /// coordinate, so value and log conventions describe the same λ_eff.
-    pub(crate) fn clamped_log_strength(log_strength: f64) -> f64 {
-        log_strength.clamp(ARD_LOG_STRENGTH_MIN, ARD_LOG_STRENGTH_MAX)
-    }
-
-    /// Validate the full per-atom ARD table against the supported closed domain.
-    /// Every fallible value, inner-solve, trace, and IFT entry calls this before
-    /// consuming an ARD strength, so ARD never acquires clipped plateau semantics.
-    pub(crate) fn validate_ard_log_strength_domain(&self) -> Result<(), String> {
+    /// Validate every log-strength represented in the flat outer layout against
+    /// the supported closed domain. A structurally absent assignment strength is
+    /// deliberately ignored: it is not an objective coordinate and its stored
+    /// placeholder cannot affect the corresponding assignment family.
+    pub(crate) fn validate_log_strength_domain(&self) -> Result<(), String> {
+        let validate = |kind: &str, value: f64| {
+            if value.is_finite() && (LOG_STRENGTH_MIN..=LOG_STRENGTH_MAX).contains(&value) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{kind} must be finite and in [{LOG_STRENGTH_MIN}, \
+                     {LOG_STRENGTH_MAX}]; got {value}"
+                ))
+            }
+        };
+        if self.sparse_flat_index().is_some() {
+            validate("assignment log strength", self.log_lambda_sparse)?;
+        }
+        for (atom, &value) in self.log_lambda_smooth.iter().enumerate() {
+            validate(&format!("smoothness log strength at atom {atom}"), value)?;
+        }
         for (atom, block) in self.log_ard.iter().enumerate() {
             for (axis, &value) in block.iter().enumerate() {
-                if !value.is_finite()
-                    || !(ARD_LOG_STRENGTH_MIN..=ARD_LOG_STRENGTH_MAX).contains(&value)
-                {
-                    return Err(format!(
-                        "ARD log precision at atom {atom}, axis {axis} must be finite and in \
-                         [{ARD_LOG_STRENGTH_MIN}, {ARD_LOG_STRENGTH_MAX}]; got {value}"
-                    ));
-                }
+                validate(
+                    &format!("ARD log precision at atom {atom}, axis {axis}"),
+                    value,
+                )?;
             }
+        }
+        for (block, &value) in self.log_lambda_block.iter().enumerate() {
+            validate(&format!("block log strength at block {block}"), value)?;
         }
         Ok(())
     }
 
-    /// Objective-domain lower face in flat-rho layout. Non-ARD coordinates use
-    /// the widest finite endpoint, so intersecting this face with the configured
-    /// search box changes only ARD coordinates.
-    pub(crate) fn ard_flat_domain_lower_bound(&self) -> Option<Array1<f64>> {
-        if self.log_ard.iter().all(Array1::is_empty) {
+    /// Objective-domain lower face in flat-rho layout. Every emitted coordinate
+    /// is a log strength, so all coordinates share the same exact endpoint.
+    pub(crate) fn flat_domain_lower_bound(&self) -> Option<Array1<f64>> {
+        let len = self.to_flat().len();
+        if len == 0 {
             return None;
         }
-        let mut lower = Array1::from_elem(self.to_flat().len(), f64::MIN);
-        for atom in 0..self.log_ard.len() {
-            for axis in 0..self.log_ard[atom].len() {
-                lower[self.ard_flat_index(atom, axis)] = ARD_LOG_STRENGTH_MIN;
-            }
-        }
-        Some(lower)
+        Some(Array1::from_elem(len, LOG_STRENGTH_MIN))
     }
 
     /// Objective-domain upper face in flat-rho layout; see
-    /// [`Self::ard_flat_domain_lower_bound`].
-    pub(crate) fn ard_flat_domain_upper_bound(&self) -> Option<Array1<f64>> {
-        if self.log_ard.iter().all(Array1::is_empty) {
+    /// [`Self::flat_domain_lower_bound`].
+    pub(crate) fn flat_domain_upper_bound(&self) -> Option<Array1<f64>> {
+        let len = self.to_flat().len();
+        if len == 0 {
             return None;
         }
-        let mut upper = Array1::from_elem(self.to_flat().len(), f64::MAX);
-        for atom in 0..self.log_ard.len() {
-            for axis in 0..self.log_ard[atom].len() {
-                upper[self.ard_flat_index(atom, axis)] = ARD_LOG_STRENGTH_MAX;
-            }
-        }
-        Some(upper)
+        Some(Array1::from_elem(len, LOG_STRENGTH_MAX))
     }
 
     /// Flatten ρ into the contiguous outer-coordinate vector the generic
@@ -716,7 +704,7 @@ impl SaeManifoldRho {
                 }
             }
         };
-        rebuilt.validate_ard_log_strength_domain()?;
+        rebuilt.validate_log_strength_domain()?;
         Ok(rebuilt)
     }
 }

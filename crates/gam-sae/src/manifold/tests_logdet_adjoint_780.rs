@@ -441,7 +441,7 @@ fn ard_rho_derivative_matrix_2156(
     let mut dh = Array2::<f64>::zeros((dim, dim));
     let coord_offsets = term.assignment.coord_offsets();
     let periods = term.assignment.coords[atom].effective_axis_periods();
-    let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom][axis]);
+    let alpha = rho.log_ard[atom][axis].exp();
     for row in 0..term.n_obs() {
         let t = term.assignment.coords[atom].row(row)[axis];
         let hess = ArdAxisPrior::eval(alpha, t, periods[axis]).hess.max(0.0);

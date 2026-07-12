@@ -137,10 +137,7 @@ impl SaeManifoldTerm {
                 let inv_g_inv_s = inverse.dot(gram).dot(&inverse).dot(&atom.smooth_penalty);
                 let edf_log_lambda =
                     -lambda[atom_idx] * (0..m).map(|i| inv_g_inv_s[[i, i]]).sum::<f64>();
-                let raw_log_lambda = rho.log_lambda_smooth[atom_idx];
-                if SaeManifoldRho::clamped_log_strength(raw_log_lambda) == raw_log_lambda {
-                    log_lambda_differential = 0.5 * rank * log_n * edf_log_lambda;
-                }
+                log_lambda_differential = 0.5 * rank * log_n * edf_log_lambda;
             }
             direct_rho[rho.smooth_flat_index(atom_idx)] += log_lambda_differential;
             let occupancy_differential = if n_atom > 1.0 {

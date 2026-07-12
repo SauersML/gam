@@ -302,7 +302,7 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         residual: Option<ArrayView2<'_, f64>>,
     ) -> Result<f64, String> {
-        rho.validate_ard_log_strength_domain()?;
+        rho.validate_log_strength_domain()?;
         let n = self.n_obs();
         let p = self.output_dim();
         // Design-honesty weights are normalized to mean one, so they redistribute
@@ -392,7 +392,7 @@ impl SaeManifoldTerm {
                 continue;
             }
             for j in 0..d_k {
-                let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][j]);
+                let alpha = rho.log_ard[k][j].exp();
                 // edf_kj ∈ [0, n_active_k]; clamp against numerical drift.
                 let edf_kj = (n_active_k - alpha * traces[k][j]).clamp(0.0, n_active_k);
                 coord_edf += edf_kj;

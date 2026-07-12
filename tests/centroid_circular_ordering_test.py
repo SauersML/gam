@@ -7,7 +7,7 @@ on against real-activation censuses:
   * the same points, per-dim shuffled -> ordered_on_circle False
   * a ring masked by a dominant linear factor, seen through top-2 PCA
     (the census's own projection step) -> ordered_on_circle False
-    (this is the documented detection limit, not a bug in the test)
+    (this is the documented top-variance projection failure mode)
 """
 from __future__ import annotations
 
@@ -108,6 +108,16 @@ class CentroidCircularOrderingTest(unittest.TestCase):
         coords = np.array([[0.0, 0.0], [2.0, 4.0], [7.0, -1.0]])
         centers = _CO.kmeans_centroids(coords, 1, seed=17)
         np.testing.assert_allclose(centers[0], coords.mean(axis=0), atol=1.0e-15)
+
+    def test_ring_stats_are_scale_invariant_when_raw_squares_overflow(self) -> None:
+        angles = 2.0 * np.pi * np.arange(7) / 7.0
+        centers = np.column_stack((np.cos(angles), np.sin(angles)))
+        reference_cv, reference_gap = _CO.ring_stats(centers)
+        scaled_cv, scaled_gap = _CO.ring_stats(4.0e307 * centers)
+        self.assertTrue(np.isfinite(scaled_cv))
+        self.assertTrue(np.isfinite(scaled_gap))
+        self.assertAlmostEqual(scaled_cv, reference_cv, places=14)
+        self.assertAlmostEqual(scaled_gap, reference_gap, places=12)
 
     def test_conditional_randomization_refits_lloyd_and_preserves_marginals(
         self,

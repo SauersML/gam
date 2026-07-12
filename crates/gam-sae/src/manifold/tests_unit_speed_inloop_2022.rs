@@ -399,7 +399,7 @@ fn unit_speed_active_retraction_moves_only_ard_2070() {
     // (ARD is EXACTLY the reparam effect) the Euclidean coordinate energy
     // `½α Σ t²` re-evaluated at the re-gauged coords equals the ARD change; the
     // precision normalizer depends only on (α, n) and cancels in the delta.
-    let alpha = SaeManifoldRho::stable_exp_strength(0.0);
+    let alpha = 0.0_f64.exp();
     let expected: f64 = (0..n)
         .map(|i| 0.5 * alpha * (coords1[i] * coords1[i] - coords0[i] * coords0[i]))
         .sum();

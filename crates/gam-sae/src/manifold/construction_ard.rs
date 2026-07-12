@@ -315,7 +315,7 @@ impl SaeManifoldTerm {
         residual: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
     ) -> Result<f64, String> {
-        rho.validate_ard_log_strength_domain()?;
+        rho.validate_log_strength_domain()?;
         let n = self.n_obs();
         let p = self.output_dim();
         if residual.dim() != (n, p) {
@@ -368,7 +368,7 @@ impl SaeManifoldTerm {
                     return;
                 }
                 for axis in 0..d {
-                    let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
+                    let alpha = rho.log_ard[k][axis].exp();
                     let t = coord.row(row)[axis];
                     let v_pp = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis])
                         .hess
@@ -700,7 +700,7 @@ impl SaeManifoldTerm {
         &self,
         rho: &SaeManifoldRho,
     ) -> Result<Vec<Array1<f64>>, String> {
-        rho.validate_ard_log_strength_domain()?;
+        rho.validate_log_strength_domain()?;
         if rho.log_ard.len() != self.k_atoms() {
             return Err(format!(
                 "ARD rho has {} atoms but term has {}",
@@ -767,7 +767,7 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
-        rho.validate_ard_log_strength_domain()
+        rho.validate_log_strength_domain()
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         // RAW selected-inverse diagonal: the per-axis diagonal contraction uses
         // the DEFLATED inverse; the full kept-subspace + rotation deflation
@@ -867,7 +867,7 @@ impl SaeManifoldTerm {
                         let d = coord.latent_dim();
                         let block_start = starts[pos];
                         for axis in 0..d {
-                            let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
+                            let alpha = rho.log_ard[k][axis].exp();
                             let t = coord.row(row)[axis];
                             let prior = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis]);
                             let hess = w_row * prior.hess.max(0.0);
@@ -886,7 +886,7 @@ impl SaeManifoldTerm {
                         let d = coord.latent_dim();
                         let block_start = coord_offsets[k];
                         for axis in 0..d {
-                            let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
+                            let alpha = rho.log_ard[k][axis].exp();
                             let t = coord.row(row)[axis];
                             let prior = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis]);
                             let hess = w_row * prior.hess.max(0.0);
@@ -915,7 +915,7 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
-        rho.validate_ard_log_strength_domain()
+        rho.validate_log_strength_domain()
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let row_weights = self.row_loss_weights.as_deref();
         let coord_offsets = self.assignment.coord_offsets();
@@ -963,7 +963,7 @@ impl SaeManifoldTerm {
                 .and_then(Option::as_ref);
             let row_weight = row_weights.map_or(1.0, |weights| weights[row]);
             let mut accumulate = |atom: usize, axis: usize, slot: usize| {
-                let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom][axis]);
+                let alpha = rho.log_ard[atom][axis].exp();
                 let t = self.assignment.coords[atom].row(row)[axis];
                 let prior = ArdAxisPrior::eval(alpha, t, periods[atom][axis]);
                 let curvature = row_weight * prior.hess.max(0.0);
@@ -1054,7 +1054,7 @@ impl SaeManifoldTerm {
         probes: &[Array1<f64>],
         sinv_probes: &[Array1<f64>],
     ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
-        rho.validate_ard_log_strength_domain()
+        rho.validate_log_strength_domain()
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         let m = probes.len();
         if m == 0 || sinv_probes.len() != m {
@@ -1173,7 +1173,7 @@ impl SaeManifoldTerm {
                 let coord = &self.assignment.coords[k];
                 let d = coord.latent_dim();
                 for axis in 0..d {
-                    let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
+                    let alpha = rho.log_ard[k][axis].exp();
                     let t = coord.row(row)[axis];
                     let prior = ArdAxisPrior::eval(alpha, t, ard_axis_periods[k][axis]);
                     let hess = w_row * prior.hess.max(0.0);

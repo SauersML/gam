@@ -133,7 +133,7 @@ const ACTIVE_SUPPORT_REL_FLOOR: f64 = 0.5;
 /// the atom unless its `AtomExists` claim certified in an earlier round (the
 /// veto). A large positive `log_alpha` is a precision blow-up; the floor is set
 /// well above the strengths a live coordinate settles at and well below the
-/// `stable_exp_strength` clamp.
+/// outer log-strength domain endpoint.
 const ARD_DIVERGENCE_LOG_PRECISION: f64 = 12.0;
 
 /// Minimum symmetric code dependence for a pair to be proposed for FUSION. Below

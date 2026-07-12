@@ -374,7 +374,9 @@ pub(crate) fn ordered_beta_bernoulli_fixed_alpha_assignment_value_matches_logit_
     let mut minus = assignment.clone();
     minus.logits[[idx / k, idx % k]] -= step;
     let fd =
-        (assignment_prior_value(&plus, &rho) - assignment_prior_value(&minus, &rho)) / (2.0 * step);
+        (assignment_prior_value(&plus, &rho).unwrap()
+            - assignment_prior_value(&minus, &rho).unwrap())
+            / (2.0 * step);
 
     assert_abs_diff_eq!(grad[idx], fd, epsilon = 2.0e-7);
 }
@@ -407,7 +409,9 @@ pub(crate) fn threshold_gate_assignment_value_matches_logit_gradient_fd() {
     let mut minus = assignment.clone();
     minus.logits[[idx / k, idx % k]] -= step;
     let fd =
-        (assignment_prior_value(&plus, &rho) - assignment_prior_value(&minus, &rho)) / (2.0 * step);
+        (assignment_prior_value(&plus, &rho).unwrap()
+            - assignment_prior_value(&minus, &rho).unwrap())
+            / (2.0 * step);
 
     assert_abs_diff_eq!(grad[idx], fd, epsilon = 2.0e-8);
 }

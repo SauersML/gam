@@ -1447,6 +1447,7 @@ pub(crate) fn ordered_beta_bernoulli_exact_hessian_minus_majorizer_hvp_weighted(
     row_weights: Option<&[f64]>,
     direction: ArrayView1<'_, f64>,
 ) -> Result<Array1<f64>, String> {
+    rho.validate_log_strength_domain()?;
     let AssignmentMode::OrderedBetaBernoulli {
         temperature, alpha, ..
     } = assignment.mode
@@ -1541,7 +1542,10 @@ mod ordered_beta_bernoulli_exact_hessian_tests {
     }
 }
 
-pub fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f64 {
+pub fn assignment_prior_value(
+    assignment: &SaeAssignment,
+    rho: &SaeManifoldRho,
+) -> Result<f64, String> {
     assignment_prior_value_weighted(assignment, rho, None)
 }
 
@@ -1557,23 +1561,23 @@ pub(crate) fn assignment_prior_value_weighted(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
     row_weights: Option<&[f64]>,
-) -> f64 {
+) -> Result<f64, String> {
+    rho.validate_log_strength_domain()?;
     for row in 0..assignment.n_obs() {
-        validate_finite_logits(assignment.logits.row(row), row)
-            .expect("assignment logits must be finite");
+        validate_finite_logits(assignment.logits.row(row), row)?;
     }
     let target = flat_logits(assignment.logits.view());
     if matches!(assignment.mode, AssignmentMode::Softmax { .. }) && assignment.k_atoms() == 1 {
-        return 0.0;
+        return Ok(0.0);
     }
     // #Bug4: under FROZEN routing every logit is inert (the gates come from the
     // ρ-invariant frozen predictor, not `self.logits`), so the whole assignment
     // sparsity prior is a constant with zero gradient/curvature — score it as 0 to
     // match the derivative-side treatment. (Softmax rejects frozen routing.)
     if assignment.routing_is_frozen() {
-        return 0.0;
+        return Ok(0.0);
     }
-    match assignment.mode {
+    Ok(match assignment.mode {
         AssignmentMode::Softmax {
             temperature,
             sparsity,
@@ -1619,13 +1623,13 @@ pub(crate) fn assignment_prior_value_weighted(
         // Sparsity by construction: the fixed-|S| support IS the sparsity — there
         // is no penalty term, so the prior contributes exactly zero.
         AssignmentMode::TopK { .. } => 0.0,
-    }
+    })
 }
 
 pub fn assignment_prior_log_strength_derivative(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
-) -> f64 {
+) -> Result<f64, String> {
     assignment_prior_log_strength_derivative_weighted(assignment, rho, None)
 }
 
@@ -1635,22 +1639,22 @@ pub(crate) fn assignment_prior_log_strength_derivative_weighted(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
     row_weights: Option<&[f64]>,
-) -> f64 {
+) -> Result<f64, String> {
+    rho.validate_log_strength_domain()?;
     for row in 0..assignment.n_obs() {
-        validate_finite_logits(assignment.logits.row(row), row)
-            .expect("assignment logits must be finite");
+        validate_finite_logits(assignment.logits.row(row), row)?;
     }
     let target = flat_logits(assignment.logits.view());
     if matches!(assignment.mode, AssignmentMode::Softmax { .. }) && assignment.k_atoms() == 1 {
-        return 0.0;
+        return Ok(0.0);
     }
     // #Bug4: frozen routing ⇒ inert prior ⇒ zero ρ-derivative.
     if assignment.routing_is_frozen() {
-        return 0.0;
+        return Ok(0.0);
     }
-    match assignment.mode {
+    Ok(match assignment.mode {
         AssignmentMode::Softmax { .. } | AssignmentMode::ThresholdGate { .. } => {
-            assignment_prior_value_weighted(assignment, rho, row_weights)
+            return assignment_prior_value_weighted(assignment, rho, row_weights);
         }
         AssignmentMode::OrderedBetaBernoulli {
             temperature, alpha, ..
@@ -1672,9 +1676,8 @@ pub(crate) fn assignment_prior_log_strength_derivative_weighted(
         }
         // No prior term ⇒ no ρ-derivative (sparsity lives in the fixed support).
         AssignmentMode::TopK { .. } => 0.0,
-    }
+    })
 }
-
 pub fn assignment_prior_log_strength_hdiag(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
@@ -1689,6 +1692,7 @@ pub(crate) fn assignment_prior_log_strength_hdiag_weighted(
     rho: &SaeManifoldRho,
     row_weights: Option<&[f64]>,
 ) -> Result<Array1<f64>, String> {
+    rho.validate_log_strength_domain()?;
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)?;
     }
@@ -1804,6 +1808,7 @@ pub(crate) fn assignment_prior_log_strength_target_mixed_weighted(
     rho: &SaeManifoldRho,
     row_weights: Option<&[f64]>,
 ) -> Result<Array1<f64>, String> {
+    rho.validate_log_strength_domain()?;
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)?;
     }
@@ -1862,6 +1867,7 @@ pub(crate) fn assignment_prior_grad_hdiag_weighted(
     rho: &SaeManifoldRho,
     row_weights: Option<&[f64]>,
 ) -> Result<(Array1<f64>, Array1<f64>), String> {
+    rho.validate_log_strength_domain()?;
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)?;
     }
@@ -1987,6 +1993,7 @@ pub(crate) fn ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
     rho: &SaeManifoldRho,
     row_weights: Option<&[f64]>,
 ) -> Result<Option<OrderedBetaBernoulliHessianDiagThirdChannels>, String> {
+    rho.validate_log_strength_domain()?;
     let AssignmentMode::OrderedBetaBernoulli {
         temperature, alpha, ..
     } = assignment.mode

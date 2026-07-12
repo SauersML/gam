@@ -4680,7 +4680,7 @@ impl SaeManifoldTerm {
             &self.assignment,
             rho,
             self.row_loss_weights.as_deref(),
-        );
+        )?;
         let smoothness = penalty_scale * self.decoder_smoothness_value(&rho.lambda_smooth_vec());
         let ard = self.ard_value(rho)?;
         Ok(SaeManifoldLoss {
@@ -5080,7 +5080,7 @@ impl SaeManifoldTerm {
     }
 
     pub(crate) fn ard_value(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
-        rho.validate_ard_log_strength_domain()?;
+        rho.validate_log_strength_domain()?;
         if rho.log_ard.len() != self.k_atoms() {
             return Err(format!(
                 "ARD rho has {} atoms but term has {}",
