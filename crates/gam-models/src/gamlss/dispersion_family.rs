@@ -773,7 +773,9 @@ pub(crate) fn dispersion_eta_nll_order2(
     let eta_d = O2::variable(ed, 1);
     match kind {
         DispersionFamilyKind::NegativeBinomial => {
-            let mu = eta_mu.exp();
+            // The NB log-likelihood below is written directly in the linear
+            // predictors (log-scale) via `log_total`, so the mean `exp(eta_mu)`
+            // is never materialized here (unlike the Gamma arm).
             let theta = eta_d.exp();
             let theta_plus_y = theta.add(&O2::constant(yi));
             let log_total = if em >= ed {

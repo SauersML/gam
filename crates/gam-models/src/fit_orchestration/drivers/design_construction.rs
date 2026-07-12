@@ -2036,6 +2036,14 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 epsilon: eps,
             })
         };
+    // Defensive re-clamp of an outer coordinate into the SAME per-slot box the
+    // optimizer is bounded to (`theta_bounds` -> `with_bounds`): line-search and
+    // finite-difference probes can step a hair outside the feasible box, and
+    // `decode_theta`'s `checked_exp_log_strengths` rejects out-of-domain
+    // coordinates, so each eval clamps before decoding.
+    let clamp_theta = |theta: &Array1<f64>| -> Array1<f64> {
+        Array1::from_shape_fn(theta.len(), |i| theta[i].clamp(eps_lower[i], eps_upper[i]))
+    };
     let analytic_outer_hessian_available =
         gam_custom_family::joint_exact_analytic_outer_hessian_available()
             && base_family
@@ -2186,7 +2194,11 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         },
         |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
             let theta = clamp_theta(theta);
-            let (rho, adaptive_params) = decode_theta(&theta);
+            let DecodedSpatialAdaptiveTheta {
+                rho,
+                adaptive_params,
+                ..
+            } = decode_theta(&theta)?;
             let family_eval =
                 base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
             let result = evaluate_custom_family_joint_hyper(
@@ -2232,7 +2244,11 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         }),
         Some(|st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
             let theta = clamp_theta(theta);
-            let (rho, adaptive_params) = decode_theta(&theta);
+            let DecodedSpatialAdaptiveTheta {
+                rho,
+                adaptive_params,
+                ..
+            } = decode_theta(&theta)?;
             let family_eval =
                 base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
             let result = evaluate_custom_family_joint_hyper_efs(
@@ -2270,7 +2286,11 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         // seed; the selected seed is then fit with the full budget.
         |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
             let theta = clamp_theta(theta);
-            let (rho, adaptive_params) = decode_theta(&theta);
+            let DecodedSpatialAdaptiveTheta {
+                rho,
+                adaptive_params,
+                ..
+            } = decode_theta(&theta)?;
             let family_eval =
                 base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
             let result = evaluate_custom_family_joint_hyper(
