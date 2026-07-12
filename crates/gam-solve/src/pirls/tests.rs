@@ -4498,7 +4498,7 @@ mod root_cause_tests {
 #[cfg(test)]
 mod reporting_loglikelihood_tests {
     use super::super::{
-        calculate_loglikelihood, calculate_loglikelihood_omitting_constants,
+        calculate_loglikelihood, calculate_loglikelihood_omitting_constants_from_eta,
         pointwise_loglikelihood, pointwise_loglikelihood_omitting_constants,
     };
     use gam_problem::{

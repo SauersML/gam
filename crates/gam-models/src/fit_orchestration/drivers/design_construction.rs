@@ -5919,20 +5919,35 @@ fn fit_bounded_term_collection_with_design(
     // never drift from the standard contract (gam#1514).
     let glm_likelihood = gam_spec::GlmLikelihoodSpec::canonical(family.clone());
     let standard_deviation = if family.is_gaussian_identity() {
-        let denom = if options.compute_inference {
-            (y.len() as f64 - edf_total).max(1.0)
+        let residual_dof = if options.compute_inference {
+            y.len() as f64 - edf_total
         } else {
-            (y.len() as f64).max(1.0)
+            y.len() as f64
         };
-        (deviance / denom).sqrt()
+        if !(residual_dof.is_finite() && residual_dof > 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "bounded Gaussian residual degrees of freedom must be finite and positive, got n={} minus edf={edf_total} = {residual_dof}",
+                y.len()
+            )));
+        }
+        if !(deviance.is_finite() && deviance >= 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "bounded Gaussian deviance must be finite and non-negative, got {deviance}"
+            )));
+        }
+        let variance = deviance / residual_dof;
+        if !variance.is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "bounded Gaussian residual variance is not representable: {deviance}/{residual_dof}"
+            )));
+        }
+        variance.sqrt()
     } else {
         1.0
     };
-    let cov_scale = glm_likelihood
-        .coefficient_covariance_scale(standard_deviation * standard_deviation)
-        .max(f64::MIN_POSITIVE);
     let dispersion =
-        gam_solve::estimate::dispersion_from_likelihood(&glm_likelihood, standard_deviation);
+        gam_solve::estimate::dispersion_from_likelihood(&glm_likelihood, standard_deviation)?;
+    let cov_scale = glm_likelihood.coefficient_covariance_scale(dispersion.phi());
     // Apply the dispersion scale to the unscaled inverse, producing the reported
     // `Vb = cov_scale · H_user⁻¹` and its diagonal standard errors. The stored
     // `penalized_hessian` stays UNSCALED (`H_user`) per the dispersion-ownership
@@ -5944,9 +5959,22 @@ fn fit_bounded_term_collection_with_design(
         }
         cov
     });
+    if let Some(covariance) = beta_covariance.as_ref()
+        && covariance.iter().any(|value| !value.is_finite())
+    {
+        return Err(EstimationError::InvalidInput(
+            "bounded coefficient covariance scaling produced a non-finite value".to_string(),
+        ));
+    }
     let beta_standard_errors = beta_covariance
         .as_ref()
-        .map(|cov| Array1::from_iter((0..cov.nrows()).map(|i| cov[[i, i]].max(0.0).sqrt())));
+        .map(gam_problem::se_from_covariance)
+        .transpose()
+        .map_err(|err| {
+            EstimationError::InvalidInput(format!(
+                "bounded coefficient covariance cannot produce standard errors: {err}"
+            ))
+        })?;
 
     let geometry = Some(gam_solve::estimate::FitGeometry {
         penalized_hessian: penalized_hessian.clone().into(),

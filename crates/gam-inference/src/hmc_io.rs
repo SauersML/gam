@@ -401,13 +401,18 @@ fn hessian_whitening_transform(
     cov_scale: f64,
     cholesky_error_prefix: &str,
 ) -> Result<WhiteningTransform, String> {
+    if !(cov_scale.is_finite() && cov_scale > 0.0) {
+        return Err(format!(
+            "whitening covariance scale must be finite and strictly positive, got {cov_scale}"
+        ));
+    }
     let hessian_owned = hessian.to_owned();
     let chol_factor = hessian_owned
         .cholesky(Side::Lower)
         .map_err(|e| format!("{cholesky_error_prefix}: {:?}", e))?;
     let l_h = chol_factor.lower_triangular();
     let mut chol = solve_upper_triangular_transpose(&l_h, dim);
-    let sqrt_cov_scale = cov_scale.max(0.0).sqrt();
+    let sqrt_cov_scale = cov_scale.sqrt();
     if (sqrt_cov_scale - 1.0).abs() > 0.0 {
         chol.mapv_inplace(|v| v * sqrt_cov_scale);
     }
@@ -439,8 +444,8 @@ struct SharedData {
     offset: Option<Arc<Array1<f64>>>,
     /// Auxiliary log-link family parameter: Gamma shape, Tweedie power, or NB theta.
     gamma_shape: f64,
-    /// Dispersion parameter φ (Gaussian: σ²; Gamma: 1/shape; `Known(1.0)` for
-    /// fixed-scale families). Consumed **only** by the likelihood adapters that
+    /// Validated reciprocal response dispersion `1/phi`, precomputed once at
+    /// construction. Consumed **only** by the likelihood adapters that
     /// carry the dispersion in the data term itself: the profiled-Gaussian
     /// log-likelihood and its gradient multiply through by `1/φ`, and the
     /// Tweedie quasi-likelihood folds `1/φ` into its weight. It does NOT drive
@@ -449,7 +454,7 @@ struct SharedData {
     /// even though `φ ≠ 1`, because Gamma's dispersion already lives inside the
     /// working weight (the `shape` factor in `gamma_log_logp_and_grad`). See
     /// `inference::dispersion_cov` for the ownership invariants.
-    dispersion: gam_solve::model_types::Dispersion,
+    inv_dispersion: f64,
     /// Number of samples
     n_samples: usize,
     /// Number of coefficients
@@ -659,6 +664,28 @@ impl NutsPosterior {
             validate_count_responses("negative-binomial NUTS", &y, &weights)
                 .map_err(String::from)?;
         }
+        match nuts_family {
+            NutsFamily::GammaLog if !(gamma_shape.is_finite() && gamma_shape > 0.0) => {
+                return Err(format!(
+                    "Gamma NUTS shape must be finite and strictly positive, got {gamma_shape}"
+                ));
+            }
+            NutsFamily::TweedieLog if !is_valid_tweedie_power(gamma_shape) => {
+                return Err(format!(
+                    "Tweedie NUTS power must be finite and strictly between 1 and 2, got {gamma_shape}"
+                ));
+            }
+            NutsFamily::NegativeBinomialLog if !(gamma_shape.is_finite() && gamma_shape > 0.0) => {
+                return Err(format!(
+                    "negative-binomial NUTS theta must be finite and strictly positive, got {gamma_shape}"
+                ));
+            }
+            _ => {}
+        }
+
+        let inv_dispersion = dispersion.reciprocal().map_err(|err| {
+            format!("NUTS likelihood requires a finite reciprocal dispersion: {err}")
+        })?;
 
         // Whitening metric: `L Lᵀ` must equal the posterior covariance the
         // sampler reproduces, `Vb = cov_scale · H⁻¹` (#679/#680 invariant), so
@@ -702,7 +729,7 @@ impl NutsPosterior {
             mode: Arc::new(mode_owned),
             offset: None,
             gamma_shape,
-            dispersion,
+            inv_dispersion,
             n_samples,
             dim,
         };
@@ -810,11 +837,11 @@ impl NutsPosterior {
         //   penalty_scale = 1/cov_scale.
         // That is `1/σ²` for profiled Gaussian and exactly `1.0` for
         // Gamma/Tweedie/NB/Poisson/Binomial. The previous code used
-        // `dispersion.inv_phi()` for GammaLog (= shape = 1/φ ≠ 1), which
+        // the response-dispersion reciprocal for GammaLog (= shape = 1/φ ≠ 1), which
         // double-counted the dispersion in the sampled posterior (#680); the
         // statistical dispersion `φ` is NOT `1/cov_scale` for Gamma because it
         // already lives inside `W`. Mirrors `LinkWigglePosterior`.
-        let penalty_scale = 1.0 / self.cov_scale.max(1e-300);
+        let penalty_scale = 1.0 / self.cov_scale;
         let mz = self.penalty_z_quad.dot(z);
         let lin_term = self.penalty_z_lin.dot(z);
         let quad_term = 0.5 * z.dot(&mz);
@@ -1025,7 +1052,7 @@ fn nuts_family_logp_and_grad_into(
         NutsFamily::Gaussian => gaussian_logp_and_grad_into(data, eta, residual),
         NutsFamily::PoissonLog => poisson_log_logp_and_grad(data, eta),
         // Family mapping: TweedieLog stores variance power p in data.gamma_shape.
-        // Its dispersion phi stays in data.dispersion, matching REML scale ownership.
+        // Its reciprocal dispersion is precomputed in SharedData, matching REML scale ownership.
         NutsFamily::TweedieLog => tweedie_log_quasilogp_and_grad(data, eta, data.gamma_shape),
         NutsFamily::NegativeBinomialLog => {
             // Family mapping: NegativeBinomialLog stores theta in data.gamma_shape.
@@ -1272,7 +1299,7 @@ fn joint_family_logp_and_grad(
         ResponseFamily::Poisson => Ok(poisson_log_logp_and_grad(data, eta)),
         ResponseFamily::Tweedie { p } => {
             // Family mapping: Tweedie payload p is the variance power.
-            // Its dispersion phi stays in data.dispersion, matching REML.
+            // Its reciprocal dispersion is precomputed in SharedData, matching REML.
             let p = *p;
             if !is_valid_tweedie_power(p) {
                 return Err(HmcError::InvalidConfig {
@@ -1478,10 +1505,9 @@ fn gaussian_logp_and_grad_into(
     eta: &Array1<f64>,
     weighted_residual: &mut Array1<f64>,
 ) -> (f64, Array1<f64>) {
-    use gam_problem::dispersion_cov::DispersionExt as _;
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
-    let inv_phi = data.dispersion.inv_phi();
+    let inv_phi = data.inv_dispersion;
     assert_eq!(weighted_residual.len(), n);
     // Per-row: residual = y - η, weighted_residual = (w/φ)·residual,
     // ll contribution = -0.5·(w/φ)·residual². All independent across rows.
@@ -1547,10 +1573,9 @@ fn tweedie_log_quasilogp_and_grad(
     eta: &Array1<f64>,
     p: f64,
 ) -> (f64, Array1<f64>) {
-    use gam_problem::dispersion_cov::DispersionExt as _;
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
-    // Family mapping: Tweedie p is the variant payload; phi is data.dispersion.
+    // Family mapping: Tweedie p is the variant payload; 1/phi is precomputed.
     // Invalid payloads invalidate the target instead of falling back to p=1.5.
     if !is_valid_tweedie_power(p) {
         return (f64::NAN, Array1::from_elem(data.dim, f64::NAN));
@@ -1561,7 +1586,7 @@ fn tweedie_log_quasilogp_and_grad(
     if eta.iter().any(|&eta_i| !eta_i.is_finite()) {
         return (f64::NEG_INFINITY, Array1::zeros(data.dim));
     }
-    let inv_phi = data.dispersion.inv_phi();
+    let inv_phi = data.inv_dispersion;
     let mut residual = Array1::<f64>::zeros(n);
     let ll_parts: Vec<f64> = residual
         .as_slice_mut()
@@ -1644,7 +1669,7 @@ fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1
     if eta.iter().any(|&eta_i| !eta_i.is_finite()) {
         return (f64::NEG_INFINITY, Array1::zeros(data.dim));
     }
-    let shape = data.gamma_shape.max(1e-10);
+    let shape = data.gamma_shape;
     // Hoist shape-only constants out of the per-sample loop: ln Γ(shape) and
     // shape · ln(shape) are independent of i, so previously each sample paid
     // an extra `ln_gamma` and `ln` plus a multiply. n is typically large-scale-
@@ -1994,7 +2019,7 @@ mod tests {
             mode: Arc::new(array![0.0]),
             offset: None,
             gamma_shape: 1.0,
-            dispersion: gam_solve::model_types::Dispersion::UNIT,
+            inv_dispersion: 1.0,
             n_samples: 1,
             dim: 1,
         };
@@ -2045,7 +2070,7 @@ mod tests {
             mode: Arc::new(array![0.0]),
             offset: None,
             gamma_shape: 1.0,
-            dispersion: gam_solve::model_types::Dispersion::UNIT,
+            inv_dispersion: 1.0,
             n_samples: 2,
             dim: 1,
         };
@@ -2231,7 +2256,7 @@ mod tests {
             mode: Arc::new(Array1::zeros(1)),
             offset: None,
             gamma_shape: shape,
-            dispersion: gam_solve::estimate::Dispersion::UNIT,
+            inv_dispersion: 1.0,
             n_samples: x.nrows(),
             dim: x.ncols(),
         };
@@ -2423,7 +2448,7 @@ mod tests {
             mode: Arc::new(Array1::zeros(x.ncols())),
             offset: None,
             gamma_shape: 1.0,
-            dispersion: gam_solve::estimate::Dispersion::UNIT,
+            inv_dispersion: 1.0,
             n_samples: x.nrows(),
             dim: x.ncols(),
         };
@@ -3127,7 +3152,7 @@ mod tests {
             mode: Arc::new(Array1::zeros(1)),
             offset: None,
             gamma_shape: 1.0,
-            dispersion: gam_solve::estimate::Dispersion::UNIT,
+            inv_dispersion: 1.0,
             n_samples: 2,
             dim: 1,
         };
@@ -3297,7 +3322,7 @@ mod tests {
             mode: Arc::new(Array1::zeros(1)),
             offset: None,
             gamma_shape: 1.0,
-            dispersion: gam_solve::estimate::Dispersion::UNIT,
+            inv_dispersion: 1.0,
             n_samples: 2,
             dim: 1,
         };
@@ -5734,7 +5759,7 @@ pub enum LinkWiggleFamilyParams {
     PoissonLog,
     /// Tweedie quasi-likelihood: variance power `p ∈ (1, 2)` and dispersion
     /// `φ > 0` (the 1/φ factor scales both the log-likelihood and score,
-    /// matching the flat NUTS path's `data.dispersion` handling).
+    /// matching the flat NUTS path's reciprocal-dispersion handling).
     TweedieLog {
         power: f64,
         phi: f64,
@@ -6151,7 +6176,7 @@ impl LinkWigglePosterior {
                 // Tweedie quasi-log-likelihood on the log link, per-row
                 // ℓᵢ = (wᵢ/φ)·(yᵢ·μ^{1−p}/(1−p) − μ^{2−p}/(2−p)); the 1/φ
                 // factor scales both the value and the score exactly as the
-                // flat NUTS path's `data.dispersion` does. `p` and `φ` are
+                // flat NUTS path's reciprocal dispersion does. `p` and `φ` are
                 // validated at construction (finding 15, #2245).
                 let inv_phi = 1.0 / phi;
                 let mut ll_acc = 0.0;
@@ -6233,7 +6258,7 @@ impl LinkWigglePosterior {
         // for Gamma, double-counting the dispersion in the sampled posterior
         // and shrinking every posterior SD by `√φ` (#680). Tweedie/NB/Poisson/
         // Binomial are unit-scale and unchanged.
-        let penalty_scale = 1.0 / self.cov_scale.max(1e-300);
+        let penalty_scale = 1.0 / self.cov_scale;
 
         // Gradient w.r.t. θ (wiggle): ∂ℓ/∂θ = B(q₀)^T · residual − S_link · θ
         let s_link_theta = self.penalty_link.dot(&theta);
@@ -7189,6 +7214,9 @@ impl JointBetaRhoPosterior {
         if likelihood.is_binomial() {
             validate_binary_responses("binomial joint HMC", &y, &weights).map_err(String::from)?;
         }
+        let inv_dispersion = dispersion.reciprocal().map_err(|err| {
+            format!("joint HMC likelihood requires a finite reciprocal dispersion: {err}")
+        })?;
 
         let whitening = hessian_whitening_transform(
             hessian,
@@ -7209,12 +7237,12 @@ impl JointBetaRhoPosterior {
             // hard-coding φ = 1 gave a Gaussian fit with σ² = 4 four times its
             // true likelihood curvature, and dropping the offset shifted every
             // offset model's posterior (finding 18, #2245). The family kernels
-            // read `data.dispersion` (Gaussian 1/φ scaling, Tweedie 1/φ
+            // read the precomputed reciprocal (Gaussian 1/φ scaling, Tweedie 1/φ
             // quasi-weight); families whose working weight already carries the
-            // dispersion pass `Known(1.0)` from the caller.
+            // dispersion pass exact unit scale from the caller.
             offset: offset.map(|o| Arc::new(o.to_owned())),
             gamma_shape: gamma_shape.unwrap_or(1.0),
-            dispersion,
+            inv_dispersion,
             n_samples,
             dim: n_beta,
         };

@@ -642,7 +642,7 @@ mod adaptive_bounded_duchon_tests {
         // — verifying it confirms the bounded fit both exports a covariance
         // (gam#854) AND scales it by the estimated dispersion (gam#1514), rather
         // than the pre-#1514 invariant `Vb == H⁻¹` that silently dropped σ̂².
-        let cov_scale = fitted.fit.coefficient_covariance_scale();
+        let cov_scale = fitted.fit.coefficient_covariance_scale().unwrap();
         assert!(
             cov_scale.is_finite() && cov_scale > 0.0,
             "profiled-Gaussian bounded fit must report a finite positive σ̂² scale, got {cov_scale}"

@@ -776,7 +776,7 @@ fn dispersion_phi_prefers_inference_then_falls_back_to_standard_deviation() {
     // that scaled the covariances at fit time.
     let fit = decode_invariant_test_fit();
     assert_eq!(fit.dispersion(), Some(Dispersion::UNIT));
-    assert_eq!(fit.dispersion_phi(), 1.0);
+    assert_eq!(fit.dispersion_phi().unwrap(), 1.0);
 
     // Deployment-saved models drop `inference` (see `core_saved_fit_result`,
     // which stores `inference: None`). `dispersion()` is then `None`, but
@@ -788,9 +788,9 @@ fn dispersion_phi_prefers_inference_then_falls_back_to_standard_deviation() {
     assert!(stripped.dispersion().is_none());
     let expected_phi = stripped.standard_deviation * stripped.standard_deviation;
     assert!(
-        (stripped.dispersion_phi() - expected_phi).abs() < 1e-12,
+        (stripped.dispersion_phi().unwrap() - expected_phi).abs() < 1e-12,
         "fallback φ̂ should equal σ̂² = {expected_phi}, got {}",
-        stripped.dispersion_phi()
+        stripped.dispersion_phi().unwrap()
     );
 
     // A fixed-scale family (Poisson) keeps φ̂ = 1 on the fallback path even
@@ -802,7 +802,7 @@ fn dispersion_phi_prefers_inference_then_falls_back_to_standard_deviation() {
         InverseLink::Standard(StandardLink::Log),
     ));
     poisson.standard_deviation = 2.7;
-    assert_eq!(poisson.dispersion_phi(), 1.0);
+    assert_eq!(poisson.dispersion_phi().unwrap(), 1.0);
 }
 
 #[test]

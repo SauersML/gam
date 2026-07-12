@@ -2632,11 +2632,11 @@ impl<'a> RemlState<'a> {
         let eta_hat = pirls_result.final_eta.to_owned();
         let inverse_link = self.runtime_inverse_link();
         let base_rows = crate::pirls::deviance_eta_rows_with_log_measure_scale(
-            self.y,
+            self.y.view(),
             &eta_hat,
             &self.config.likelihood,
             &inverse_link,
-            self.weights,
+            self.weights.view(),
             -phi.ln(),
         )?;
         let base_half_values: Vec<f64> = base_rows.iter().map(|row| row.half_deviance).collect();
@@ -3695,7 +3695,7 @@ impl<'a> RemlState<'a> {
     ///
     /// `Var(yᵢ) = φ/wᵢ` under inverse-variance prior weights, so the full
     /// weighted-Gaussian normalization is `½ Σ log(2π φ/wᵢ) =
-    /// (n/2) log(2πφ) − ½ Σ log wᵢ`; the `calculate_loglikelihood_omitting_constants`
+    /// (n/2) log(2πφ) − ½ Σ log wᵢ`; the `calculate_loglikelihood_omitting_constants_from_eta`
     /// helper omits the `−½ Σ log wᵢ` piece. The `ProfiledGaussian` REML cost
     /// adds it back (`InnerSolution::gaussian_weight_log_sum_half`) so the
     /// objective VALUE is exactly invariant to a global prior-weight rescale
@@ -8182,9 +8182,14 @@ mod firth_hessian_direction_reuse_tests {
         }
         let h_solver = h.clone();
         let h_inv_solve = move |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            let sol = gam_linalg::utils::solve_symmetric_vector_with_floor(&h_solver, rhs, 1e-10)
-                .expect("well-conditioned SPD solve");
-            Ok(sol)
+            Ok(gam_linalg::utils::certified_spd_factorize(
+                &h_solver,
+                "Firth test Hessian",
+            )
+            .expect("well-conditioned SPD factor")
+            .solve(rhs)
+            .expect("certified SPD solve")
+            .into_solution())
         };
 
         let hess = RemlState::tk_hessian_rho_canonical_logit(
@@ -8287,9 +8292,14 @@ mod firth_hessian_direction_reuse_tests {
         }
         let h_solver = h.clone();
         let h_inv_solve = move |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            let sol = gam_linalg::utils::solve_symmetric_vector_with_floor(&h_solver, rhs, 1e-10)
-                .expect("well-conditioned SPD solve");
-            Ok(sol)
+            Ok(gam_linalg::utils::certified_spd_factorize(
+                &h_solver,
+                "Firth k4 test Hessian",
+            )
+            .expect("well-conditioned SPD factor")
+            .solve(rhs)
+            .expect("certified SPD solve")
+            .into_solution())
         };
         RemlState::tk_hessian_rho_canonical_logit(
             x,

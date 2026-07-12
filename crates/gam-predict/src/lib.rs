@@ -219,7 +219,7 @@ fn conditional_prediction_backend<'a>(
     fit: &'a UnifiedFitResult,
     expected_dim: usize,
     label: &str,
-) -> Option<PredictionCovarianceBackend<'a>> {
+) -> Result<Option<PredictionCovarianceBackend<'a>>, EstimationError> {
     // The canonical conditional covariance is whatever the fitter exposes via
     // `beta_covariance` (which is `Cov(β̂ | λ̂)` after any final reparameter
     // alignment the fitter performed). The penalized Hessian is the precision
@@ -236,7 +236,11 @@ fn conditional_prediction_backend<'a>(
     // `fit.beta_covariance()` over any indirect derivation.
     if let Some(covariance) = fit.beta_covariance() {
         match validate_dense_prediction_covariance(covariance.view(), expected_dim, label) {
-            Ok(()) => return Some(PredictionCovarianceBackend::from_dense(covariance.view())),
+            Ok(()) => {
+                return Ok(Some(PredictionCovarianceBackend::from_dense(
+                    covariance.view(),
+                )));
+            }
             Err(reason) => log::warn!("{label}: ignoring invalid conditional {reason}"),
         }
     }
@@ -251,12 +255,12 @@ fn conditional_prediction_backend<'a>(
         // dispersion `φ̂` here instead would double-count it for those families
         // and shrink every SE by `√φ̂` (#679). For `φ ≡ 1` families
         // (Binomial / Poisson) this collapses to the original behavior.
-        let scale = fit.coefficient_covariance_scale();
+        let scale = fit.coefficient_covariance_scale()?;
         match PredictionCovarianceBackend::from_factorized_hessian_scaled(
             SymmetricMatrix::Dense(hessian.clone()),
             scale,
         ) {
-            Ok(backend) => return Some(backend),
+            Ok(backend) => return Ok(Some(backend)),
             Err(err) => {
                 log::warn!(
                     "{label}: failed to build factorized prediction precision backend: {err}"
@@ -264,7 +268,7 @@ fn conditional_prediction_backend<'a>(
             }
         }
     }
-    None
+    Ok(None)
 }
 
 fn selected_uncertainty_backend<'a>(
@@ -275,7 +279,7 @@ fn selected_uncertainty_backend<'a>(
 ) -> Result<(PredictionCovarianceBackend<'a>, bool), EstimationError> {
     match requested_mode {
         InferenceCovarianceMode::Conditional => {
-            conditional_prediction_backend(fit, expected_dim, label)
+            conditional_prediction_backend(fit, expected_dim, label)?
                 .map(|backend| (backend, false))
                 .ok_or_else(|| {
                     EstimationError::InvalidInput(

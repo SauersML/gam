@@ -144,7 +144,7 @@ pub struct InnerSolution<'dp> {
     ///
     /// This is the per-observation Gaussian normalization constant that the
     /// `log_likelihood` (computed by
-    /// [`calculate_loglikelihood_omitting_constants`]) deliberately drops. The
+    /// [`crate::pirls::calculate_loglikelihood_omitting_constants_from_eta`]) deliberately drops. The
     /// full weighted-Gaussian negative log-likelihood normalization is
     ///   ½·Σᵢ log(2π·φ/wᵢ) = (n/2)·log(2πφ) − ½·Σᵢ log(wᵢ),
     /// because `Var(yᵢ) = φ/wᵢ` under inverse-variance prior weights.

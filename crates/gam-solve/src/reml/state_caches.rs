@@ -1693,7 +1693,6 @@ impl Gam784BlockTarget<'_> {
             )));
         }
         let mut max_log = f64::NEG_INFINITY;
-        let mut log_terms = Vec::with_capacity(s.len());
         for i in 0..s.len() {
             if !s[i].is_finite() {
                 return Err(EstimationError::PirlsRowGeometryUnrepresentable {
@@ -1709,7 +1708,6 @@ impl Gam784BlockTarget<'_> {
                 self.weights_obs_log_abs[i] + 2.0 * s[i].abs().ln()
             };
             max_log = max_log.max(log_term);
-            log_terms.push(log_term);
         }
         if max_log == f64::NEG_INFINITY {
             return Ok(0.0);
@@ -1717,10 +1715,11 @@ impl Gam784BlockTarget<'_> {
         let mut sum = 0.0_f64;
         let mut compensation = 0.0_f64;
         for i in 0..s.len() {
-            if log_terms[i] == f64::NEG_INFINITY {
+            if self.weights_obs[i] == 0.0 || s[i] == 0.0 {
                 continue;
             }
-            let term = self.weights_obs[i].signum() * (log_terms[i] - max_log).exp();
+            let log_term = self.weights_obs_log_abs[i] + 2.0 * s[i].abs().ln();
+            let term = self.weights_obs[i].signum() * (log_term - max_log).exp();
             let next = sum + term;
             compensation += if sum.abs() >= term.abs() {
                 (sum - next) + term

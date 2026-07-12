@@ -1659,11 +1659,11 @@ pub(crate) fn run_outer_with_plan(
                         // anisotropic Hessian is a far better local model than the
                         // single-magnitude scalar — it eliminates most of the
                         // StrongWolfe bracketing whose every probe is a full inner
-                        // joint-Newton re-solve. `invert_spd_with_ridge` only
-                        // returns when the curvature is SPD (after a tiny ridge),
-                        // which is exactly when it is a valid (descent-preserving)
-                        // metric; a non-PD transferred Hessian falls through to
-                        // the scalar magnitude metric. Either way the converged
+                        // joint-Newton re-solve. Only an exact certified SPD
+                        // transferred Hessian can seed this metric; an indefinite
+                        // or singular parent curvature is rejected without
+                        // perturbing it and the scalar metric is selected. Either
+                        // way the converged
                         // optimum is unchanged: BFGS reaches ∇V=0 under any SPD
                         // initial metric, and the gradient/KKT tests are identical.
                         let dense_metric = config
@@ -1674,8 +1674,20 @@ pub(crate) fn run_outer_with_plan(
                                     && h.ncols() == layout.n_params
                                     && h.iter().all(|v| v.is_finite())
                             })
-                            .and_then(|h| gam_linalg::utils::invert_spd_with_ridge(h, 1.0e-8).ok())
-                            .filter(|h_inv| h_inv.iter().all(|v| v.is_finite()));
+                            .and_then(|h| {
+                                match gam_linalg::utils::certified_spd_inverse(
+                                    h,
+                                    "transferred outer-Hessian BFGS metric",
+                                ) {
+                                    Ok(inverse) => Some(inverse.into_inverse()),
+                                    Err(error) => {
+                                        log::info!(
+                                            "[OUTER] {context}: rejected transferred BFGS metric: {error}"
+                                        );
+                                        None
+                                    }
+                                }
+                            });
                         if let Some(h_inv) = dense_metric {
                             log::info!(
                                 "[OUTER] {context}: warm-start BFGS metric = transferred \

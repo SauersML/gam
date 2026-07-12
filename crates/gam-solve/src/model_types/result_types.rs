@@ -39,7 +39,7 @@ pub fn dispersion_from_likelihood(
                 )));
             }
             let phi = standard_deviation * standard_deviation;
-            if !phi.is_finite() {
+            if !phi.is_finite() || (standard_deviation > 0.0 && phi == 0.0) {
                 return Err(invalid(format!(
                     "squared profiled Gaussian standard deviation is not representable: {standard_deviation}^2"
                 )));
@@ -70,20 +70,18 @@ pub fn dispersion_from_likelihood(
                     "Beta family precision ({phi}) and scale metadata precision ({metadata_phi}) disagree"
                 )));
             }
-            reciprocal(1.0 + *phi, true)
-        }
-        (ResponseFamily::Beta { phi }, Scale::FixedDispersion { phi: metadata_phi }) => {
-            // A fixed Beta precision has no dedicated metadata variant. A
-            // FixedDispersion therefore denotes the response-level variance
-            // multiplier directly and must agree with 1/(1+precision).
-            let resolved = reciprocal(1.0 + *phi, false)?;
-            if resolved.phi().to_bits() != metadata_phi.to_bits() {
+            if !(*phi > 0.0 && phi.is_finite()) {
                 return Err(invalid(format!(
-                    "Beta precision {phi} implies dispersion {}, but FixedDispersion stores {metadata_phi}",
-                    resolved.phi()
+                    "Beta precision must be finite and strictly positive, got {phi}"
                 )));
             }
-            Ok(resolved)
+            let beta_dispersion = if *phi >= 1.0 {
+                let inv_precision = 1.0 / *phi;
+                inv_precision / (1.0 + inv_precision)
+            } else {
+                1.0 / (1.0 + *phi)
+            };
+            estimated(beta_dispersion)
         }
         (ResponseFamily::Beta { .. }, scale) => Err(invalid(format!(
             "Beta requires resolved precision metadata, got {scale:?}"

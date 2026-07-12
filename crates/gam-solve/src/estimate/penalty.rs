@@ -385,9 +385,9 @@ impl ParametricColumnConditioning {
     pub(crate) fn backtransform_external_result(
         &self,
         mut result: ExternalOptimResult,
-    ) -> ExternalOptimResult {
+    ) -> Result<ExternalOptimResult, EstimationError> {
         if !self.is_active() {
-            return result;
+            return Ok(result);
         }
         result.beta = self.backtransform_beta(&result.beta);
         if let Some(inf) = result.inference.as_mut() {
@@ -401,7 +401,13 @@ impl ParametricColumnConditioning {
             inf.beta_standard_errors = inf
                 .beta_covariance
                 .as_ref()
-                .map(|c| se_from_covariance(c.as_array()));
+                .map(|c| se_from_covariance(c.as_array()))
+                .transpose()
+                .map_err(|err| {
+                    EstimationError::InvalidInput(format!(
+                        "back-transformed conditional covariance is invalid: {err}"
+                    ))
+                })?;
             inf.beta_covariance_corrected = inf
                 .beta_covariance_corrected
                 .take()
@@ -409,7 +415,13 @@ impl ParametricColumnConditioning {
             inf.beta_standard_errors_corrected = inf
                 .beta_covariance_corrected
                 .as_ref()
-                .map(se_from_covariance);
+                .map(se_from_covariance)
+                .transpose()
+                .map_err(|err| {
+                    EstimationError::InvalidInput(format!(
+                        "back-transformed corrected covariance is invalid: {err}"
+                    ))
+                })?;
             inf.beta_covariance_frequentist = inf
                 .beta_covariance_frequentist
                 .take()
@@ -462,7 +474,7 @@ impl ParametricColumnConditioning {
         // invertible coefficient-space reparameterization that conditioning
         // introduces, so the bundle stays correct in its own coordinates and
         // we keep it instead of wiping `pirls: None`.
-        result
+        Ok(result)
     }
 }
 

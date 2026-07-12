@@ -33,6 +33,18 @@ impl From<GpuError> for SigmaCubatureGpuError {
     }
 }
 
+/// One covariance post-processing contract shared by CPU and GPU sigma-point
+/// fits. Device execution changes how the Hessian is assembled, never how it
+/// is interpreted: every point must supply a finite symmetric matrix that
+/// passes strict unjittered Cholesky and the common residual certificate.
+pub(crate) fn certified_sigma_point_covariance(
+    hessian: &Array2<f64>,
+    label: &str,
+) -> Result<Array2<f64>, gam_linalg::utils::CertifiedSymmetricSolveError> {
+    gam_linalg::utils::certified_spd_inverse(hessian, label)
+        .map(gam_linalg::utils::CertifiedSpdInverse::into_inverse)
+}
+
 /// Per-sigma-point GPU PIRLS input: penalty, reparameterisation transform,
 /// and prior-mean shifts for one ρ / σ point.
 ///
@@ -209,7 +221,6 @@ mod linux_impl {
     use crate::gpu_kernels::sigma_cubature::{SigmaCubatureGpuError, SigmaPointGpuInput};
     use gam_gpu::gpu_error::GpuError;
     use gam_gpu::policy::{PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
-    use gam_linalg::utils::{CertifiedSpdInverse, certified_spd_inverse};
     use ndarray::{Array1, Array2, ArrayView1};
     type SigmaPointResult = (Array2<f64>, Array1<f64>);
 
@@ -355,8 +366,7 @@ mod linux_impl {
             // Map H_transformed → H_original, invert, map β_transformed
             // → β_original. Mirrors the CPU path's post-processing.
             let h_orig = hessian_to_original(&loop_out.penalized_hessian, &pt.qs);
-            let cov = certified_spd_inverse(&h_orig, "gpu sigma point")
-                .map(CertifiedSpdInverse::into_inverse)
+            let cov = super::certified_sigma_point_covariance(&h_orig, "gpu sigma point")
                 .map_err(|error| {
                     gam_gpu::gpu_err!(
                         "gpu sigma point: exact SPD penalised-Hessian inverse failed: {error}"
@@ -417,8 +427,7 @@ mod linux_impl {
             .map_err(|e| gam_gpu::gpu_err!("gaussian sigma pool: point[{idx}] pls failed: {e}"))?;
 
             let h_orig = hessian_to_original(&pls.penalized_hessian, &pt.qs);
-            let cov = certified_spd_inverse(&h_orig, "gaussian sigma point")
-                .map(CertifiedSpdInverse::into_inverse)
+            let cov = super::certified_sigma_point_covariance(&h_orig, "gaussian sigma point")
                 .map_err(|error| {
                     gam_gpu::gpu_err!(
                         "gaussian sigma point: exact SPD penalised-Hessian inverse failed: {error}"

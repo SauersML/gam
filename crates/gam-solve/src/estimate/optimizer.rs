@@ -2287,7 +2287,7 @@ where
         | ResponseFamily::Poisson
         | ResponseFamily::RoystonParmar => 1.0,
     };
-    let dispersion = dispersion_from_likelihood(&pirls_res.likelihood, standard_deviation);
+    let dispersion = dispersion_from_likelihood(&pirls_res.likelihood, standard_deviation)?;
 
     // Explicit dispersion contract for coefficient covariance matrices:
     // Vb = H⁻¹ · cov_scale, where the stored penalized Hessian is always
@@ -2310,8 +2310,25 @@ where
     // above (a deliberately distinct quantity, e.g. 1/shape for Gamma).
     let cov_scale = pirls_res
         .likelihood
-        .coefficient_covariance_scale(standard_deviation * standard_deviation)
-        .max(f64::MIN_POSITIVE);
+        .coefficient_covariance_scale(standard_deviation * standard_deviation);
+    let zero_covariance_boundary = dispersion.is_zero_estimate()
+        && matches!(
+            &pirls_res.likelihood.spec.response,
+            ResponseFamily::Gaussian
+        )
+        && matches!(
+            &pirls_res.likelihood.scale,
+            LikelihoodScaleMetadata::ProfiledGaussian
+        );
+    if !cov_scale.is_finite()
+        || cov_scale < 0.0
+        || (cov_scale == 0.0 && !zero_covariance_boundary)
+        || (zero_covariance_boundary && cov_scale != 0.0)
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "coefficient covariance scale {cov_scale:?} is inconsistent with dispersion {dispersion:?}"
+        )));
+    }
 
     // Re-certify the exact rho point and inner state that will be shipped.
     // Seeds and nuisance refinements may initialize work, but they can never
@@ -2554,8 +2571,18 @@ where
             // beta_covariance, but we need the unscaled diagonal here).
             let mut raw_se = Array1::<f64>::zeros(p_cov);
             for (index, &variance_unscaled) in h_inv.diag().iter().enumerate() {
+                if !(variance_unscaled.is_finite() && variance_unscaled > 0.0) {
+                    return Err(EstimationError::RemlOptimizationFailed(format!(
+                        "exact SPD inverse has invalid diagonal {index}: {variance_unscaled:?}"
+                    )));
+                }
                 let variance = cov_scale * variance_unscaled;
-                if !(variance.is_finite() && variance > 0.0) {
+                let valid = if zero_covariance_boundary {
+                    variance == 0.0
+                } else {
+                    variance.is_finite() && variance > 0.0
+                };
+                if !valid {
                     return Err(EstimationError::RemlOptimizationFailed(format!(
                         "posterior covariance diagonal {index} is not positive and representable: {variance:?}"
                     )));
@@ -2617,8 +2644,18 @@ where
             }
             let mut se = Array1::<f64>::zeros(p_cov);
             for (index, &variance_unscaled) in diag_inv.iter().enumerate() {
+                if !(variance_unscaled.is_finite() && variance_unscaled > 0.0) {
+                    return Err(EstimationError::RemlOptimizationFailed(format!(
+                        "exact factorized SPD inverse has invalid diagonal {index}: {variance_unscaled:?}"
+                    )));
+                }
                 let variance = cov_scale * variance_unscaled;
-                if !(variance.is_finite() && variance > 0.0) {
+                let valid = if zero_covariance_boundary {
+                    variance == 0.0
+                } else {
+                    variance.is_finite() && variance > 0.0
+                };
+                if !valid {
                     return Err(EstimationError::RemlOptimizationFailed(format!(
                         "factorized posterior variance {index} is not positive and representable: {variance:?}"
                     )));
@@ -3015,7 +3052,7 @@ mod reported_loglikelihood_normalization_tests {
     //! `ExternalOptimResult::log_likelihood` — the number that surfaces as
     //! `Model.summary()["log_likelihood"]` and feeds the conditional/corrected
     //! AIC. Before #2096 that field was wired to the REML building-block kernel
-    //! `calculate_loglikelihood_omitting_constants`, which drops the Poisson
+    //! `calculate_loglikelihood_omitting_constants_from_eta`, which drops the Poisson
     //! count normalizer `−Σ lnΓ(y+1)`. On count data that makes the reported
     //! log-likelihood POSITIVE — impossible for a probability mass — and, because
     //! different families drop different normalizers, non-comparable across

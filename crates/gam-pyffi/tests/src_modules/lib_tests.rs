@@ -216,15 +216,20 @@ fn sae_fit_report_fields_are_marshaled_without_recomputation_2236() {
 }
 
 #[test]
-fn symmetric_curvature_solve_preserves_negative_modes() {
+fn symmetric_curvature_solve_preserves_exact_negative_modes() {
     let matrix = array![[2.0, 0.0, 0.0], [0.0, -4.0, 0.0], [0.0, 0.0, -1.0e-15]];
     let rhs = array![8.0, -8.0, 1.0];
-    let solved = gam::linalg::utils::solve_symmetric_vector_with_floor(&matrix, &rhs, 1.0e-3)
-        .expect("indefinite symmetric curvature solve");
+    let solved = gam::linalg::utils::certified_symmetric_solve(
+        &matrix,
+        &rhs,
+        "indefinite symmetric curvature solve",
+    )
+    .expect("indefinite symmetric curvature solve")
+    .into_solution();
 
     assert!((solved[0] - 4.0).abs() <= 1.0e-12);
     assert!((solved[1] - 2.0).abs() <= 1.0e-12);
-    assert!((solved[2] + 250.0).abs() <= 1.0e-9);
+    assert!((solved[2] + 1.0e15).abs() <= 0.25);
 }
 
 /// Builds a deterministic formula-table dataset for the shared-tangent
@@ -1667,15 +1672,21 @@ fn make_folds_indices_rejects_invalid_inputs() {
 }
 
 /// Ordinary least squares R^2 of fitting `design @ beta ~= y` (single output),
-/// via the normal equations with a tiny relative ridge floor on the Gram for
-/// numerical robustness. Used by the issue #876 latent-decoder regression below
+/// via an exact certified SPD solve of the normal equations. Used by the issue
+/// #876 latent-decoder regression below
 /// to quantify how well a candidate latent Duchon basis reconstructs a clean
 /// circular signal. NOT a tolerance to weaken — it is the recovery metric.
 fn latent_decoder_ols_r2(design: &Array2<f64>, y: &Array1<f64>) -> f64 {
     let gram = design.t().dot(design);
     let rhs = design.t().dot(y);
-    let beta = gam::linalg::utils::solve_symmetric_vector_with_floor(&gram, &rhs, 1.0e-10)
-        .expect("OLS normal-equations solve for latent decoder recovery");
+    let beta = gam::linalg::utils::certified_spd_factorize(
+        &gram,
+        "OLS normal equations for latent decoder recovery",
+    )
+    .expect("OLS normal-equations SPD factor")
+    .solve(&rhs)
+    .expect("OLS normal-equations solve for latent decoder recovery")
+    .into_solution();
     let fitted = design.dot(&beta);
     let mean = y.sum() / y.len() as f64;
     let mut ss_res = 0.0;
@@ -1809,8 +1820,11 @@ fn issue_876_periodic_latent_duchon_decoder_is_seam_consistent_and_recovers_circ
     let solve_fitted = |design: &Array2<f64>| -> Array1<f64> {
         let gram = design.t().dot(design);
         let rhs = design.t().dot(&y);
-        let beta = gam::linalg::utils::solve_symmetric_vector_with_floor(&gram, &rhs, 1.0e-10)
-            .expect("seam OLS solve");
+        let beta = gam::linalg::utils::certified_spd_factorize(&gram, "seam OLS normal equations")
+            .expect("seam OLS SPD factor")
+            .solve(&rhs)
+            .expect("seam OLS solve")
+            .into_solution();
         design.dot(&beta)
     };
     let fitted_per = solve_fitted(&design_per);

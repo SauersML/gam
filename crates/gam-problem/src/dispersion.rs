@@ -95,6 +95,7 @@ impl Dispersion {
         if phi < 0.0 {
             return Err(DispersionError::NegativeEstimate { phi });
         }
+        let phi = if phi == 0.0 { 0.0 } else { phi };
         Ok(Self {
             source: DispersionSource::Estimated,
             phi,
@@ -171,7 +172,7 @@ impl Dispersion {
             return Ok(false);
         }
         let phi = self.phi * multiplier;
-        if !phi.is_finite() {
+        if !phi.is_finite() || (self.phi > 0.0 && phi == 0.0) {
             return Err(DispersionError::RescaleNotRepresentable {
                 phi: self.phi,
                 multiplier,
@@ -220,7 +221,10 @@ mod tests {
             Dispersion::ZERO_ESTIMATE
         );
         assert!(Dispersion::known(0.0).is_err());
-        assert!(Dispersion::estimated(-0.0).is_ok());
+        assert_eq!(
+            Dispersion::estimated(-0.0).unwrap().phi().to_bits(),
+            0.0_f64.to_bits()
+        );
         assert!(Dispersion::estimated(-1.0).is_err());
         assert!(Dispersion::known(f64::NAN).is_err());
     }

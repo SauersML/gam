@@ -21,31 +21,11 @@ fn softplus(x: f64) -> f64 {
 }
 
 #[inline]
-fn binomial_log_probabilities(
-    inverse_link: &InverseLink,
-    eta: f64,
-    mu: f64,
-) -> Result<(f64, f64), EstimationError> {
-    if matches!(inverse_link, InverseLink::Standard(StandardLink::Logit)) {
-        if !eta.is_finite() {
-            return Err(EstimationError::InverseLinkDomainViolation {
-                link: "standard logit inverse link",
-                eta,
-                lower: -f64::MAX,
-                upper: f64::MAX,
-            });
-        }
-        return Ok((-softplus(-eta), -softplus(eta)));
-    }
+fn binomial_log_probabilities(mu: f64) -> Option<(f64, f64)> {
     if mu.is_finite() && mu > 0.0 && mu < 1.0 {
-        Ok((mu.ln(), (-mu).ln_1p()))
+        Some((mu.ln(), (-mu).ln_1p()))
     } else {
-        Err(EstimationError::PirlsRowGeometryUnrepresentable {
-            row: 0,
-            quantity: "binomial log-probabilities",
-            eta,
-            value: mu,
-        })
+        None
     }
 }
 
@@ -796,7 +776,7 @@ fn deviance_eta_row_with_log_measure_scale(
                 (-softplus(-eta), -softplus(eta))
             } else {
                 let jet = jet.expect("non-logit binomial branch has an inverse-link jet");
-                binomial_log_probabilities(inverse_link, eta, jet.0).map_err(|_| {
+                binomial_log_probabilities(jet.0).ok_or_else(|| {
                     deviance_row_error(row, "binomial log-probabilities", eta, jet.0)
                 })?
             };
@@ -1030,11 +1010,11 @@ pub(crate) fn calculate_loglikelihood_omitting_constants_from_eta(
         _ => 0.0,
     };
     let deviance_rows = deviance_eta_rows_with_log_measure_scale(
-        y,
+        y.view(),
         eta,
         likelihood,
         inverse_link,
-        priorweights,
+        priorweights.view(),
         log_measure_scale,
     )?;
     let rows: Vec<Result<f64, EstimationError>> = (0..y.len())
@@ -1374,7 +1354,7 @@ pub fn calculate_deviance(
 
 #[inline]
 /// Per-observation log-likelihood (with the same family-specific constants
-/// dropped as [`calculate_loglikelihood_omitting_constants`]) evaluated at the
+/// dropped as [`calculate_loglikelihood_omitting_constants_from_eta`]) evaluated at the
 /// supplied fitted means `mu`.
 ///
 /// This is the single source of truth for the per-row likelihood kernel: the
@@ -1891,7 +1871,7 @@ pub fn tweedie_exact_loglik_total(
 /// Total fully-normalized log-likelihood — the sum of [`pointwise_loglikelihood`]
 /// over all observations. This is the absolute `log_likelihood` reported to the
 /// user (and the basis of the conditional AIC), distinct from the REML
-/// building-block [`calculate_loglikelihood_omitting_constants`].
+/// building-block [`calculate_loglikelihood_omitting_constants_from_eta`].
 pub fn calculate_loglikelihood(
     y: ArrayView1<f64>,
     mu: &Array1<f64>,

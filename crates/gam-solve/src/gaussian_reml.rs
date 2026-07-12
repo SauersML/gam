@@ -5631,7 +5631,16 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
             }
         }
     }
-    let r = gam_linalg::utils::invert_spd_with_ridge(&k_matrix, 0.0)?;
+    let r = gam_linalg::utils::certified_spd_inverse(
+        &k_matrix,
+        "block Gaussian REML penalized normal matrix",
+    )
+    .map(gam_linalg::utils::CertifiedSpdInverse::into_inverse)
+    .map_err(|error| {
+        EstimationError::InvalidInput(format!(
+            "block Gaussian REML requires an exact SPD penalized normal matrix: {error}"
+        ))
+    })?;
 
     let mut xtwy = Array1::<f64>::zeros(p_total);
     for row in 0..n {
@@ -5826,8 +5835,9 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
             }
         }
         // `outer_h` is the Jacobian of the negative profiled REML estimating
-        // equation. Preserve signed curvature directions while flooring
-        // near-zero modes; flipping negative eigenvalues would change the VJP.
+        // equation. Preserve every signed curvature direction exactly; a
+        // singular Jacobian means this VJP is not identified and must fail,
+        // rather than silently replacing its spectrum with a floored one.
         gam_linalg::matrix::symmetrize_in_place(&mut outer_h);
         if let Some(((row, col), value)) =
             outer_h.indexed_iter().find(|(_, value)| !value.is_finite())
@@ -5836,8 +5846,17 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
                 "outer rho curvature entry ({row},{col}) is non-finite: {value}"
             )));
         }
-        let rho_adj =
-            gam_linalg::utils::solve_symmetric_vector_with_floor(&outer_h, &alpha, 1.0e-10)?;
+        let rho_adj = gam_linalg::utils::certified_symmetric_solve(
+            &outer_h,
+            &alpha,
+            "block Gaussian REML outer-rho adjoint",
+        )
+        .map(gam_linalg::utils::CertifiedSymmetricSolution::into_solution)
+        .map_err(|error| {
+            EstimationError::InvalidInput(format!(
+                "block Gaussian REML outer-rho adjoint is not exactly solvable: {error}"
+            ))
+        })?;
         if let Some((block, value)) = rho_adj
             .iter()
             .enumerate()

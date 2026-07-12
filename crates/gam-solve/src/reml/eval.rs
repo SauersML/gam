@@ -325,11 +325,10 @@ pub(crate) fn sigma_cubature_evaluate_cpu_rayon(
         .map(|idx| -> Result<SigmaPointResult, EstimationError> {
             let fit_point = state.execute_pirls_stateless_for_cubature(&sigma_points[idx])?;
             let h_point = map_hessian_to_original_basis(fit_point.as_ref())?;
-            let cov_point = gam_linalg::utils::certified_spd_inverse(
+            let cov_point = crate::gpu_kernels::sigma_cubature::certified_sigma_point_covariance(
                 &h_point,
                 "auto cubature point",
             )
-            .map(gam_linalg::utils::CertifiedSpdInverse::into_inverse)
             .map_err(|error| {
                 EstimationError::RemlOptimizationFailed(format!(
                     "sigma point {idx}: exact SPD Hessian inverse failed: {error}"

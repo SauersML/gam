@@ -309,6 +309,65 @@ pub fn factorize_sparse_spd(
     })
 }
 
+/// Strict SPD factorization of canonical symmetric-upper CSC storage.
+///
+/// Unlike [`factorize_sparse_spd`], this covariance/inference entrypoint does
+/// not average triangles, combine duplicates, or drop small stored entries.
+/// Callers must provide exactly one sorted upper-triangle entry per stored
+/// coordinate. The matrix passed to sparse Cholesky is therefore bit-for-bit
+/// the matrix whose residual downstream inference certifies.
+pub fn factorize_sparse_spd_strict(
+    h_upper: &SparseColMat<usize, f64>,
+) -> Result<SparseExactFactor, LinalgError> {
+    if h_upper.nrows() == 0 || h_upper.nrows() != h_upper.ncols() {
+        bail_invalid_linalg!(
+            "strict sparse SPD factorization requires a non-empty square matrix, got {}x{}",
+            h_upper.nrows(),
+            h_upper.ncols()
+        );
+    }
+    let (symbolic, values) = h_upper.parts();
+    let col_ptr = symbolic.col_ptr();
+    let row_idx = symbolic.row_idx();
+    for col in 0..h_upper.ncols() {
+        let mut previous_row = None;
+        for idx in col_ptr[col]..col_ptr[col + 1] {
+            let row = row_idx[idx];
+            let value = values[idx];
+            if row > col {
+                bail_invalid_linalg!(
+                    "strict sparse SPD input must use upper-triangle storage; found lower entry ({row}, {col})"
+                );
+            }
+            if !value.is_finite() {
+                bail_invalid_linalg!(
+                    "strict sparse SPD input contains non-finite entry ({row}, {col}) = {value:?}"
+                );
+            }
+            if previous_row.is_some_and(|previous| row <= previous) {
+                bail_invalid_linalg!(
+                    "strict sparse SPD input column {col} has duplicate or unsorted row {row}"
+                );
+            }
+            previous_row = Some(row);
+        }
+    }
+
+    let factor = h_upper.as_ref().sp_cholesky(Side::Upper).map_err(|_| {
+        LinalgError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        }
+    })?;
+    let simplicial = factorize_simplicial_canonical_upper(h_upper)?;
+    let logdet = simplicial.logdet;
+    Ok(SparseExactFactor {
+        factor,
+        simplicial: Arc::new(simplicial),
+        n: h_upper.ncols(),
+        logdet,
+    })
+}
+
 fn canonicalize_sparse_symmetric_upper(
     matrix: &SparseColMat<usize, f64>,
     tol: f64,

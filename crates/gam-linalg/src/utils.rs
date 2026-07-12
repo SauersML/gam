@@ -227,11 +227,11 @@ impl CertifiedSpdFactor<'_> {
         let rhs_matrix = rhs.view().insert_axis(ndarray::Axis(1)).to_owned();
         let solution = self.factor.solve_mat(&rhs_matrix);
         let certificate = certify_symmetric_matrix_solution(
-            &self.matrix,
+            self.matrix,
             self.matrix_max_abs,
             &rhs_matrix,
             &solution,
-            &self.label,
+            self.label,
         )?;
         Ok(CertifiedSymmetricSolution {
             solution: solution.column(0).to_owned(),
@@ -254,11 +254,11 @@ impl CertifiedSpdFactor<'_> {
         }
         let solution = self.factor.solve_mat(rhs);
         let certificate = certify_symmetric_matrix_solution(
-            &self.matrix,
+            self.matrix,
             self.matrix_max_abs,
             rhs,
             &solution,
-            &self.label,
+            self.label,
         )?;
         Ok((solution, certificate))
     }
@@ -271,11 +271,11 @@ impl CertifiedSpdFactor<'_> {
         // project those bits back to the analytic symmetry, then recertify.
         symmetrize_in_place(&mut inverse);
         let certificate = certify_symmetric_matrix_solution(
-            &self.matrix,
+            self.matrix,
             self.matrix_max_abs,
             &rhs,
             &inverse,
-            &self.label,
+            self.label,
         )?;
         Ok(CertifiedSpdInverse {
             inverse,
@@ -392,7 +392,9 @@ fn positive_ulp(value: f64) -> f64 {
     }
 }
 
-fn validate_symmetric_matrix(
+/// Validate a non-empty finite square matrix and reject material asymmetry with
+/// a pairwise ULP-scaled test. Returns its exact max-entry norm.
+pub fn validate_finite_symmetric_matrix(
     matrix: &Array2<f64>,
     label: &str,
 ) -> Result<f64, CertifiedSymmetricSolveError> {
@@ -594,7 +596,7 @@ fn certified_symmetric_matrix_solve(
     rhs: &Array2<f64>,
     label: &str,
 ) -> Result<(Array2<f64>, SymmetricSolveCertificate), CertifiedSymmetricSolveError> {
-    let matrix_max_abs = validate_symmetric_matrix(matrix, label)?;
+    let matrix_max_abs = validate_finite_symmetric_matrix(matrix, label)?;
     if rhs.nrows() != matrix.nrows() {
         return Err(CertifiedSymmetricSolveError::InvalidRhsShape {
             label: label.to_string(),
@@ -650,7 +652,7 @@ pub fn certified_spd_factorize<'a>(
     matrix: &'a Array2<f64>,
     label: &'a str,
 ) -> Result<CertifiedSpdFactor<'a>, CertifiedSymmetricSolveError> {
-    let matrix_max_abs = validate_symmetric_matrix(matrix, label)?;
+    let matrix_max_abs = validate_finite_symmetric_matrix(matrix, label)?;
     let factor = matrix.cholesky(Side::Lower).map_err(|error| {
         CertifiedSymmetricSolveError::NotPositiveDefinite {
             label: label.to_string(),
@@ -1536,6 +1538,92 @@ pub fn solve_dense_block_system(
     certified_symmetric_solve(hessian, rhs, context)
         .map(CertifiedSymmetricSolution::into_solution)
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod certified_inverse_tests {
+    use super::{
+        CertifiedSymmetricSolveError, certified_spd_factorize, certified_spd_inverse,
+        certified_symmetric_solve,
+    };
+    use ndarray::array;
+
+    #[test]
+    fn spd_inverse_never_adds_a_diagonal_perturbation() {
+        let tiny = 2.0_f64.powi(-40);
+        let matrix = array![[8.0, 0.0], [0.0, tiny]];
+        let certified = certified_spd_inverse(&matrix, "unperturbed diagonal").unwrap();
+        let inverse = certified.inverse();
+        assert_eq!(inverse[[0, 0]], 0.125);
+        assert_eq!(inverse[[1, 1]], 2.0_f64.powi(40));
+        assert_eq!(inverse[[0, 1]], 0.0);
+        assert_eq!(inverse[[1, 0]], 0.0);
+        assert!(
+            certified.certificate().max_norm_backward_error
+                <= certified.certificate().allowed_backward_error
+        );
+    }
+
+    #[test]
+    fn spd_inverse_rejects_invertible_indefinite_covariance() {
+        let indefinite = array![[1.0, 2.0], [2.0, 1.0]];
+        assert!(matches!(
+            certified_spd_inverse(&indefinite, "indefinite covariance"),
+            Err(CertifiedSymmetricSolveError::NotPositiveDefinite { .. })
+        ));
+    }
+
+    #[test]
+    fn singular_system_fails_deterministically_without_rank_truncation() {
+        let singular = array![[1.0, 1.0], [1.0, 1.0]];
+        let first = certified_spd_inverse(&singular, "singular covariance")
+            .unwrap_err()
+            .to_string();
+        let second = certified_spd_inverse(&singular, "singular covariance")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(first, second);
+        assert!(first.contains("not strictly positive definite"));
+    }
+
+    #[test]
+    fn finite_and_symmetry_validation_reports_first_bad_coordinate() {
+        let non_finite = array![[1.0, f64::NAN], [f64::NAN, 1.0]];
+        assert!(matches!(
+            certified_spd_inverse(&non_finite, "non-finite"),
+            Err(CertifiedSymmetricSolveError::NonFiniteMatrix { row: 0, col: 1, .. })
+        ));
+
+        let asymmetric = array![[2.0, 0.25], [0.5, 2.0]];
+        assert!(matches!(
+            certified_spd_inverse(&asymmetric, "asymmetric"),
+            Err(CertifiedSymmetricSolveError::NotSymmetric { row: 1, col: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn borrowed_spd_factor_certifies_solve_at_extreme_uniform_scale() {
+        let scale = 2.0_f64.powi(500);
+        let matrix = array![[4.0 * scale, scale], [scale, 3.0 * scale]];
+        let rhs = array![scale, -2.0 * scale];
+        let factor = certified_spd_factorize(&matrix, "scaled solve").unwrap();
+        let solved = factor.solve(&rhs).unwrap();
+        assert!(
+            solved.certificate().max_norm_backward_error
+                <= solved.certificate().allowed_backward_error
+        );
+        let residual = matrix.dot(solved.solution()) - &rhs;
+        assert!(residual.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn exact_symmetric_solve_admits_nonsingular_indefinite_system_without_fallback() {
+        let matrix = array![[0.0, 2.0], [2.0, 0.0]];
+        let rhs = array![4.0, 6.0];
+        let solved = certified_symmetric_solve(&matrix, &rhs, "indefinite equation").unwrap();
+        assert_eq!(solved.solution(), &array![3.0, 2.0]);
+        assert_eq!(solved.certificate().residual_max_abs, 0.0);
+    }
 }
 
 #[cfg(test)]

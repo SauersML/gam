@@ -76,7 +76,9 @@ pub use custom_family_blockwise::{
 };
 pub use custom_family_error::CustomFamilyError;
 pub use dispersion::{Dispersion, DispersionError};
-pub use dispersion_cov::{PhiScaledCovariance, UnscaledPrecision, se_from_covariance};
+pub use dispersion_cov::{
+    CovarianceStandardErrorError, PhiScaledCovariance, UnscaledPrecision, se_from_covariance,
+};
 pub use estimation_error::{
     EstimationError, FixedLambdaCheckpoint, FixedLambdaResidualKind, FixedLambdaSolverStage,
     FixedLambdaStallReason, FixedLambdaStationarityEvidence,

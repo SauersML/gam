@@ -3473,7 +3473,13 @@ impl FittedModel {
         // unnormalizes them to physical precisions before pricing; multiplying
         // by the coefficient-covariance scale puts Var_extrap on the same
         // η-variance scale as Vp.
-        let phi_scale = fit.coefficient_covariance_scale();
+        let phi_scale = fit.coefficient_covariance_scale().map_err(|err| {
+            FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "measure-jet extrapolation variance has no valid coefficient-covariance scale: {err}"
+                ),
+            }
+        })?;
         let mut total = Array1::<f64>::zeros(data.nrows());
         let mut contributed = false;
         for (smooth_idx, term) in spec.smooth_terms.iter().enumerate() {

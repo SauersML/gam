@@ -102,13 +102,20 @@ impl SymmetricMatrix {
     /// use the existing exact sparse-SPD factorization.
     pub fn factorize_spd(&self) -> Result<Box<dyn FactorizedSystem>, String> {
         match self {
-            Self::Dense(matrix) => matrix
-                .cholesky(faer::Side::Lower)
-                .map(|factor| Box::new(factor) as Box<dyn FactorizedSystem>)
-                .map_err(|error| {
-                    format!("Dense SymmetricMatrix strict SPD factorization failed: {error}")
-                }),
-            Self::Sparse(matrix) => crate::sparse_exact::factorize_sparse_spd(matrix)
+            Self::Dense(matrix) => {
+                crate::utils::validate_finite_symmetric_matrix(
+                    matrix,
+                    "Dense SymmetricMatrix strict SPD factorization",
+                )
+                .map_err(|error| error.to_string())?;
+                matrix
+                    .cholesky(faer::Side::Lower)
+                    .map(|factor| Box::new(factor) as Box<dyn FactorizedSystem>)
+                    .map_err(|error| {
+                        format!("Dense SymmetricMatrix strict SPD factorization failed: {error}")
+                    })
+            }
+            Self::Sparse(matrix) => crate::sparse_exact::factorize_sparse_spd_strict(matrix)
                 .map(|factor| Box::new(factor) as Box<dyn FactorizedSystem>)
                 .map_err(|error| {
                     format!("Sparse SymmetricMatrix strict SPD factorization failed: {error:?}")
