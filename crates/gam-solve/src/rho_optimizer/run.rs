@@ -1123,8 +1123,9 @@ pub(crate) fn certificate_hessian_is_psd(hessian: &Array2<f64>) -> Option<bool> 
 /// [`certificate_hessian_is_psd`] so the definiteness verdict and this decrement
 /// agree on the same regularized operator. Returns `None` when the shapes are
 /// malformed, an entry is non-finite, the shifted factor is not PD, or the
-/// resulting quadratic form is negative (impossible for a PD factor, guarded
-/// against roundoff).
+/// resulting quadratic form is negative (a PD factor rules that sign out up to
+/// roundoff, which this guard absorbs; the caller then falls back to the
+/// gradient-only bound).
 pub(crate) fn newton_predicted_decrease(hessian: &Array2<f64>, grad: &Array1<f64>) -> Option<f64> {
     let n = hessian.nrows();
     if n == 0 || hessian.ncols() != n || grad.len() != n {

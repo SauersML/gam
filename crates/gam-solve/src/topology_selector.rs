@@ -1573,7 +1573,7 @@ fn fit_mixture_rung_with_minimum_order(
                      fits: &mut Vec<MixtureRungFit>,
                      attempted: &mut std::collections::BTreeSet<usize>|
      -> Option<AdaptiveRungOrderFailure> {
-        debug_assert!(k >= minimum_order && k <= n && !attempted.contains(&k));
+        assert!(k >= minimum_order && k <= n && !attempted.contains(&k));
         attempted.insert(k);
         match fit_gaussian_mixture(data, k, config) {
             Ok(fit) => {
@@ -1709,7 +1709,7 @@ pub fn fit_ring_of_clusters_rung(
                      fits: &mut Vec<RingOfClustersRungFit>,
                      attempted: &mut std::collections::BTreeSet<usize>|
      -> Option<AdaptiveRungOrderFailure> {
-        debug_assert!(k >= 3 && k <= n && !attempted.contains(&k));
+        assert!(k >= 3 && k <= n && !attempted.contains(&k));
         attempted.insert(k);
         match crate::evidence::fit_ring_gaussian_mixture(data, k, config) {
             Ok(fit) => {
