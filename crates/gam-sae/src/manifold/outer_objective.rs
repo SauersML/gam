@@ -2442,7 +2442,13 @@ impl SaeManifoldOuterObjective {
                 // (border Schur non-PD, cross-row non-PD, did-not-converge)
                 // remain the typed recoverable probe refusals the outer bridge
                 // maps to an infeasible trial (with the budget rescue re-trying
-                // on the extended budget first).
+                // on the extended budget first). The polish must run on the
+                // progress-extended refine budget: the probe's coarse budget
+                // stops short of the idempotent fixed point every other lane
+                // prices, and the resulting probe-vs-analytic value gap grows
+                // with how far the coarse KKT band sits from the settled
+                // iterate (measured 1.2x-320x over the certification roundoff
+                // bound at the same rho).
                 return self
                     .term
                     .penalized_quasi_laplace_criterion_with_refine_policy_and_lane(
@@ -2453,7 +2459,7 @@ impl SaeManifoldOuterObjective {
                         self.learning_rate,
                         self.ridge_ext_coord,
                         self.ridge_beta,
-                        false,
+                        true,
                         self.surrogate_lane.as_mut(),
                     );
             }
