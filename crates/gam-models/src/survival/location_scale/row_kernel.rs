@@ -2,9 +2,9 @@ use super::*;
 
 use crate::outer_subsample::{ARROW_ROW_CHUNK, arrow_row_chunk_count};
 use gam_math::jet_scalar::{
-    DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, HessianPattern, JetScalar,
-    OneSeed, OneSeedBatch, OneSeedLane, Order2Lane, PatternedOrder2, RuntimeJetScalar, TwoSeed,
-    hessian_pair_bits,
+    DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, JetScalar,
+    MappedOrder2Accumulator, OneSeed, OneSeedBatch, OneSeedLane, Order2, Order2Lane,
+    RuntimeJetScalar, TwoSeed,
 };
 use wide::f64x4;
 
@@ -323,9 +323,11 @@ pub(crate) const SLS_ROW_K: usize = 9;
 /// Their symmetric pair union contains 24 channels. This pattern is an
 /// execution schedule for the same generic row expression, not a derivative
 /// formula.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct SlsHessianPattern;
 
+#[cfg(test)]
 const SLS_HESSIAN_PAIRS: [(usize, usize); 24] = [
     (0, 0),
     (0, 4),
@@ -353,12 +355,15 @@ const SLS_HESSIAN_PAIRS: [(usize, usize); 24] = [
     (8, 8),
 ];
 
-impl HessianPattern<SLS_ROW_K, 24> for SlsHessianPattern {
+#[cfg(test)]
+impl gam_math::jet_scalar::HessianPattern<SLS_ROW_K, 24> for SlsHessianPattern {
     const PAIRS: [(usize, usize); 24] = SLS_HESSIAN_PAIRS;
-    const PAIR_BITS: [[u128; SLS_ROW_K]; SLS_ROW_K] = hessian_pair_bits(Self::PAIRS);
+    const PAIR_BITS: [[u128; SLS_ROW_K]; SLS_ROW_K] =
+        gam_math::jet_scalar::hessian_pair_bits(Self::PAIRS);
 }
 
-type SlsOrder2 = PatternedOrder2<SlsHessianPattern, SLS_ROW_K, 24>;
+#[cfg(test)]
+type SlsOrder2 = gam_math::jet_scalar::PatternedOrder2<SlsHessianPattern, SLS_ROW_K, 24>;
 
 /// `RowKernel<9>` adapter for the survival location-scale joint likelihood
 /// (non-wiggle path). Holds the per-β quantities already computed by
@@ -515,10 +520,10 @@ impl SurvivalLsRowKernel<'_> {
 /// * `S = TwoSeed<9>` → the contracted fourth `Σ_{cd} ℓ_{abcd} u_c v_d`
 ///   (2.8 KiB/row, the `RowKernel::row_fourth_contracted` path).
 ///
-/// The value/gradient/Hessian consumer instantiates this expression at
-/// [`SlsOrder2`], whose compile-time 24-pair Hessian pattern is the exact union
-/// induced by `(u0,u1,g)`. It omits the 57 impossible entries of a dense 9×9
-/// Hessian while preserving the same mathematical source.
+/// The value/gradient/Hessian consumer lowers the same three scalar indices
+/// `(u0,u1,g)` through [`MappedOrder2Accumulator`]. Each index is differentiated
+/// in its natural 3/3/5-dimensional support and scattered through a literal
+/// axis map, so no dense 9×9 intermediates or runtime dependency masks survive.
 ///
 /// The nine primary channels are `(h_entry, h_exit, hdot_exit, eta_t_exit,
 /// eta_t_entry, eta_t_deriv, eta_ls_exit, eta_ls_entry, eta_ls_deriv)` — see
@@ -533,64 +538,164 @@ impl SurvivalLsRowKernel<'_> {
 /// `[f64; 5]` derivative stack on the kernel and entered through
 /// [`JetScalar::compose_unary`]. There is exactly one source for value and every
 /// derivative order (the #736/#932 single-source contract).
-#[inline(always)]
-pub(crate) fn sls_row_nll<S: JetScalar<SLS_ROW_K>>(
-    vars: &[S; SLS_ROW_K],
-    kernel: &SurvivalExactRowKernel,
-) -> Result<S, String> {
-    let inv_sigma_entry = vars[7].neg().exp();
-    let u0 = vars[0].sub(&vars[4].mul(&inv_sigma_entry));
-    let inv_sigma_exit = vars[6].neg().exp();
-    let u1 = vars[1].sub(&vars[3].mul(&inv_sigma_exit));
-    let g = vars[2].add(&inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5])));
+#[derive(Clone, Copy)]
+struct SlsOuterPlan {
+    u0: [f64; 5],
+    u1: Option<[f64; 5]>,
+    g: Option<[f64; 5]>,
+}
 
-    let mut nll = u0
-        .compose_unary([
+#[inline(always)]
+fn add_scaled_stack(target: &mut [f64; 5], stack: [f64; 5], scale: f64) {
+    for i in 0..5 {
+        target[i] += scale * stack[i];
+    }
+}
+
+/// Collapse the row's additive unary terms by scalar index. The censoring and
+/// event transforms of `u1` share the same inner index, so linearity lets the
+/// compiler combine their derivative stacks before one Faà di Bruno pass.
+#[inline(always)]
+fn sls_outer_plan(kernel: &SurvivalExactRowKernel) -> SlsOuterPlan {
+    let mut u0 = [0.0; 5];
+    add_scaled_stack(
+        &mut u0,
+        [
             kernel.log_s0,
             -kernel.r0,
             -kernel.dr0,
             -kernel.ddr0,
             -kernel.dddr0,
-        ])
-        .scale(kernel.w);
+        ],
+        kernel.w,
+    );
+
     let censored_weight = kernel.w * (1.0 - kernel.d);
+    let event_weight = kernel.w * kernel.d;
+    let mut u1 = [0.0; 5];
     if censored_weight != 0.0 {
-        nll = nll.add(
-            &u1.compose_unary([
+        add_scaled_stack(
+            &mut u1,
+            [
                 kernel.log_s1,
                 -kernel.r1,
                 -kernel.dr1,
                 -kernel.ddr1,
                 -kernel.dddr1,
-            ])
-            .scale(-censored_weight),
+            ],
+            -censored_weight,
         );
     }
-    let event_weight = kernel.w * kernel.d;
     if event_weight != 0.0 {
-        nll = nll
-            .add(
-                &u1.compose_unary([
-                    kernel.logphi1,
-                    kernel.dlogphi1,
-                    kernel.d2logphi1,
-                    kernel.d3logphi1,
-                    kernel.d4logphi1,
-                ])
-                .scale(-event_weight),
-            )
-            .add(
-                &g.compose_unary([
-                    kernel.log_g,
-                    kernel.d_log_g,
-                    kernel.d2_log_g,
-                    kernel.d3_log_g,
-                    kernel.d4_log_g,
-                ])
-                .scale(-event_weight),
-            );
+        add_scaled_stack(
+            &mut u1,
+            [
+                kernel.logphi1,
+                kernel.dlogphi1,
+                kernel.d2logphi1,
+                kernel.d3logphi1,
+                kernel.d4logphi1,
+            ],
+            -event_weight,
+        );
+    }
+    let g = (event_weight != 0.0).then(|| {
+        let mut stack = [0.0; 5];
+        add_scaled_stack(
+            &mut stack,
+            [
+                kernel.log_g,
+                kernel.d_log_g,
+                kernel.d2_log_g,
+                kernel.d3_log_g,
+                kernel.d4_log_g,
+            ],
+            -event_weight,
+        );
+        stack
+    });
+    SlsOuterPlan {
+        u0,
+        u1: (censored_weight != 0.0 || event_weight != 0.0).then_some(u1),
+        g,
+    }
+}
+
+#[inline(always)]
+fn sls_index<const K: usize, S: JetScalar<K>>(h: &S, eta_t: &S, eta_ls: &S) -> S {
+    h.sub(&eta_t.mul(&eta_ls.neg().exp()))
+}
+
+#[inline(always)]
+fn sls_event_rate<const K: usize, S: JetScalar<K>>(
+    hdot: &S,
+    eta_t: &S,
+    eta_t_deriv: &S,
+    eta_ls: &S,
+    eta_ls_deriv: &S,
+) -> S {
+    hdot.add(
+        &eta_ls
+            .neg()
+            .exp()
+            .mul(&eta_t.mul(eta_ls_deriv).sub(eta_t_deriv)),
+    )
+}
+
+#[inline(always)]
+pub(crate) fn sls_row_nll<S: JetScalar<SLS_ROW_K>>(
+    vars: &[S; SLS_ROW_K],
+    kernel: &SurvivalExactRowKernel,
+) -> Result<S, String> {
+    let u0 = sls_index(&vars[0], &vars[4], &vars[7]);
+    let u1 = sls_index(&vars[1], &vars[3], &vars[6]);
+    let g = sls_event_rate(&vars[2], &vars[3], &vars[5], &vars[6], &vars[8]);
+    let plan = sls_outer_plan(kernel);
+
+    let mut nll = u0.compose_unary(plan.u0);
+    if let Some(stack) = plan.u1 {
+        nll = nll.add(&u1.compose_unary(stack));
+    }
+    if let Some(stack) = plan.g {
+        nll = nll.add(&g.compose_unary(stack));
     }
     Ok(nll)
+}
+
+/// Ahead-of-time sparse lowering of [`sls_row_nll`] for the V/G/H consumer.
+/// The scalar index expressions and outer derivative plan above are shared with
+/// every higher-order jet; only the execution representation changes.
+#[inline(always)]
+fn sls_row_vgh_compiled(
+    primary: &[f64; SLS_ROW_K],
+    kernel: &SurvivalExactRowKernel,
+) -> (f64, [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K]) {
+    let entry_vars: [Order2<3>; 3] =
+        std::array::from_fn(|axis| Order2::variable(primary[[0, 4, 7][axis]], axis));
+    let exit_vars: [Order2<3>; 3] =
+        std::array::from_fn(|axis| Order2::variable(primary[[1, 3, 6][axis]], axis));
+    let rate_vars: [Order2<5>; 5] =
+        std::array::from_fn(|axis| Order2::variable(primary[[2, 3, 5, 6, 8][axis]], axis));
+    let u0 = sls_index(&entry_vars[0], &entry_vars[1], &entry_vars[2]);
+    let u1 = sls_index(&exit_vars[0], &exit_vars[1], &exit_vars[2]);
+    let g = sls_event_rate(
+        &rate_vars[0],
+        &rate_vars[1],
+        &rate_vars[2],
+        &rate_vars[3],
+        &rate_vars[4],
+    );
+    let plan = sls_outer_plan(kernel);
+    let truncate = |stack: [f64; 5]| [stack[0], stack[1], stack[2]];
+    let mut output = MappedOrder2Accumulator::zero();
+    output.add_composed(&u0, [0, 4, 7], truncate(plan.u0));
+    if let Some(stack) = plan.u1 {
+        output.add_composed(&u1, [1, 3, 6], truncate(stack));
+    }
+    if let Some(stack) = plan.g {
+        output.add_composed(&g, [2, 3, 5, 6, 8], truncate(stack));
+    }
+    output.into_channels()
 }
 
 /// Materialize `X[row, :]` as a dense length-`ncols` vector (no sparse-aware
@@ -1463,29 +1568,16 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         &self,
         row: usize,
     ) -> Result<(f64, [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K]), String> {
-        // #932: value, gradient and Hessian derive from the SAME single-sourced
-        // row NLL (`sls_row_nll`) instantiated at `SlsOrder2`, the exact
-        // order-≤2 Leibniz / Faà di Bruno algebra over the 24 structurally live
-        // upper-triangle Hessian pairs. There is no hand-assembled row chain rule
-        // here: the `(v, g, H)` channels are the order-≤2 part of the very
-        // expression whose order-3/4 directional contractions `row_third_contracted`
-        // / `row_fourth_contracted` already evaluate, so all four channels share one
-        // mathematical definition (the #736/#932 single-source contract). Identity
-        // identity seeding makes the ε/δ-free tower carry ∂/∂p_a and
-        // ∂²/∂p_a∂p_b directly. Bit-identical to `row_nll_tower(row)?` value/grad/
-        // Hessian by the `survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels`
-        // oracle (≤ 1e-9).
-        //
-        // The former dense `Order2<9>` instantiation was measured 3.8–5.3× slower
-        // than the sparse hand assembler. `SlsOrder2` is the sparsity-aware
-        // replacement: it evaluates only the exact 24-pair support and expands
-        // structural zeros at the RowKernel boundary. Production cutover remains
-        // gated on a direct release benchmark against
-        // `assemble_joint_hessian_from_quantities`.
+        // #932: value, gradient and Hessian lower the SAME scalar `u0/u1/g`
+        // expressions and outer derivative plan used by `sls_row_nll`. Each
+        // independent index is differentiated at its natural width (3/3/5) and
+        // mapped into the nine primary channels by the universal
+        // `MappedOrder2Accumulator`; no family-specific derivative formula,
+        // runtime dependency mask, or dense 9×9 intermediate exists. The
+        // `survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels`
+        // oracle pins this compiled schedule to the full Tower4 source.
         let (p, kernel) = self.row_nll_inputs(row)?;
-        let vars: [SlsOrder2; SLS_ROW_K] = std::array::from_fn(|a| SlsOrder2::variable(p[a], a));
-        let out = sls_row_nll(&vars, &kernel)?;
-        Ok((out.value(), out.g(), out.h()))
+        Ok(sls_row_vgh_compiled(&p, &kernel))
     }
 
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; SLS_ROW_K] {

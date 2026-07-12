@@ -1343,6 +1343,93 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
     }
 }
 
+/// Static lowering target for a sum of composed, low-dimensional row atoms.
+///
+/// A row likelihood often depends on a large global primary vector only through
+/// a few small independent indices.  Evaluating the whole expression in an
+/// `Order2<K>` then pays dense `K²` arithmetic at every intermediate; carrying
+/// runtime dependency masks replaces that arithmetic with branches and bit
+/// scans.  This accumulator provides the ahead-of-time alternative: evaluate
+/// each index once in its natural local dimension `N`, then scatter the exact
+/// second-order composition into the global `K` channels through a fixed axis
+/// map.  The family still owns only its scalar index expression and certified
+/// unary derivative stack; this type owns the universal chain rule.
+///
+/// For an atom `q(x_local)` and outer stack `[f(q), f'(q), f''(q)]`, the lowered
+/// channels are
+///
+/// ```text
+/// g[a_i]       += f' q_i
+/// H[a_i, a_j] += f' q_ij + f'' q_i q_j.
+/// ```
+///
+/// Only the local upper triangle is evaluated, then mirrored into the global
+/// symmetric output.  With literal `axes` and fixed `N`, LLVM unrolls this into
+/// straight-line arithmetic: no dependency masks, sparse-pair lookups, or jet
+/// temporaries survive into the generated schedule.
+#[derive(Clone, Copy, Debug)]
+pub struct MappedOrder2Accumulator<const K: usize> {
+    value: f64,
+    gradient: [f64; K],
+    hessian: [[f64; K]; K],
+}
+
+impl<const K: usize> MappedOrder2Accumulator<K> {
+    /// Empty additive accumulator.
+    #[inline(always)]
+    #[must_use]
+    pub fn zero() -> Self {
+        Self {
+            value: 0.0,
+            gradient: [0.0; K],
+            hessian: [[0.0; K]; K],
+        }
+    }
+
+    /// Add `f(atom)` using the exact order-two Faà di Bruno rule.
+    ///
+    /// `axes[i]` maps local derivative axis `i` to its global primary axis. The
+    /// map must be injective; repeated axes would describe a nonlinear pullback
+    /// and require additional map-curvature terms rather than a scatter.
+    #[inline(always)]
+    pub fn add_composed<const N: usize>(
+        &mut self,
+        atom: &Order2<N>,
+        axes: [usize; N],
+        derivatives: [f64; 3],
+    ) {
+        debug_assert!(axes.iter().all(|&axis| axis < K));
+        debug_assert!(
+            axes.iter()
+                .enumerate()
+                .all(|(i, axis)| !axes[..i].contains(axis)),
+            "mapped atom axes must be injective"
+        );
+
+        self.value += derivatives[0];
+        for local_i in 0..N {
+            let global_i = axes[local_i];
+            self.gradient[global_i] += derivatives[1] * atom.0.g[local_i];
+            for local_j in local_i..N {
+                let global_j = axes[local_j];
+                let mut channel = derivatives[1] * atom.0.h[local_i][local_j];
+                channel += derivatives[2] * atom.0.g[local_i] * atom.0.g[local_j];
+                self.hessian[global_i][global_j] += channel;
+                if global_i != global_j {
+                    self.hessian[global_j][global_i] += channel;
+                }
+            }
+        }
+    }
+
+    /// Finish the lowering in the standard row-kernel channel layout.
+    #[inline(always)]
+    #[must_use]
+    pub fn into_channels(self) -> (f64, [f64; K], [[f64; K]; K]) {
+        (self.value, self.gradient, self.hessian)
+    }
+}
+
 // ── Lane-batched Order-2 scalar: 4 rows per pass in SIMD lanes (perf) ────
 //
 // The hot per-row jet kernels evaluate ONE row's `(v, g, H)` tower at a time in
