@@ -1269,7 +1269,10 @@ pub(crate) fn fit_binomial_location_scale_model(
 /// Returned alongside the dense penalized Hessian so the caller can populate the
 /// inference block (`edf_total`, `edf_by_block`, `penalized_hessian`). This is the
 /// same trace formula `estimate.rs` uses for the standard GAM path; the survival
-/// path runs its own `runworking_model_pirls` optimizer and therefore never
+/// Each per-penalty EDF starts from the structural `rank(S_k)`, not the width
+/// of the coefficient block that contains it. Several penalties may share a
+/// coefficient block, so block width is not a valid per-penalty rank proxy.
+/// The path runs its own `runworking_model_pirls` optimizer and therefore never
 /// reached that block, leaving edf uncomputed (issue #565).
 fn survival_transformation_edf(
     state: &gam_solve::pirls::WorkingState,
@@ -1291,8 +1294,14 @@ fn survival_transformation_edf(
     let mut total_trace = 0.0_f64;
     for (kk, block) in penalty_blocks.iter().enumerate() {
         let block_cols = block.range.end - block.range.start;
+        let penalty_rank = block_cols.checked_sub(block.nullspace_dim).ok_or_else(|| {
+            format!(
+                "survival edf: penalty {kk} nullity {} exceeds block width {block_cols}",
+                block.nullspace_dim
+            )
+        })?;
         if block.lambda <= 0.0 || block_cols == 0 {
-            edf_by_block[kk] = block_cols as f64;
+            edf_by_block[kk] = penalty_rank as f64;
             penalty_block_trace[kk] = 0.0;
             continue;
         }
@@ -1314,14 +1323,15 @@ fn survival_transformation_edf(
             trace += sol[[block.range.start + j, j]];
         }
         // Per-block penalty trace `λ_kk·tr(H⁻¹ S_kk)` is the penalized EDF of the
-        // block, bounded by `[0, block_cols]`. A ceiling-`λ` redundant block
+        // block, bounded by `[0, rank(S_k)]`. A ceiling-`λ` redundant block
         // (gam#1379) can otherwise overflow `λ·trace` to `+∞` on a ridge-
         // stabilized Hessian; clamp to the valid interval so the stored trace and
         // EDF stay finite. In-range traces pass through unchanged.
-        let lam_trace = (block.lambda * trace).clamp(0.0, block_cols as f64);
+        let penalty_rank = penalty_rank as f64;
+        let lam_trace = (block.lambda * trace).clamp(0.0, penalty_rank);
         total_trace += lam_trace;
         penalty_block_trace[kk] = lam_trace;
-        edf_by_block[kk] = (block_cols as f64 - lam_trace).clamp(0.0, block_cols as f64);
+        edf_by_block[kk] = (penalty_rank - lam_trace).clamp(0.0, penalty_rank);
     }
     let edf_total = (p as f64 - total_trace).clamp(0.0, p as f64);
     if !edf_total.is_finite()

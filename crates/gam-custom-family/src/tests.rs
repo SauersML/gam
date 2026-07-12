@@ -9063,6 +9063,49 @@ pub(crate) fn structural_edf_matches_trace_identity_noncommuting_pair() {
     );
 }
 
+#[test]
+pub(crate) fn per_penalty_edf_uses_realized_penalty_rank_2288() {
+    let spec = ParameterBlockSpec {
+        name: "complementary_penalties".to_string(),
+        design: DesignMatrix::from(Array2::<f64>::zeros((2, 4))),
+        offset: Array1::zeros(2),
+        penalties: vec![
+            PenaltyMatrix::Dense(array![
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ]),
+            PenaltyMatrix::Dense(array![
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]),
+        ],
+        // Empty is deliberate: canonicalization clears pre-transform
+        // nullities, so EDF rank must come from the same realized roots as the
+        // REML criterion rather than trusting optional metadata.
+        nullspace_dims: vec![],
+        initial_log_lambdas: array![0.0, 0.0],
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let h = Array2::<f64>::eye(4) * 2.0;
+    let lambdas = array![1.0, 1.0];
+
+    let (edf_total, edf_by_penalty, block_edf, penalty_trace) =
+        custom_family_blockwise_edf(&h, &[spec], &lambdas.view()).expect("exact EDF");
+
+    assert_eq!(penalty_trace, vec![1.0, 1.0]);
+    assert_eq!(edf_by_penalty, vec![1.0, 1.0]);
+    assert_eq!(block_edf, vec![2.0]);
+    assert_eq!(edf_total, 2.0);
+}
+
 /// Structural edf with a penalty NULLSPACE coupled to the range through the
 /// design Gram: the γ_j must come from the Schur complement
 /// `A_rr − A_r0 A₀₀⁺ A₀r` on the penalty quotient, not from `A_rr` alone.

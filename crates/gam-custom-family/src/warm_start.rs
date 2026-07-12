@@ -262,14 +262,18 @@ pub(crate) fn validate_lambda_pair_consistency(
 ///
 /// `edf_penalty` is returned aligned 1:1 with the flattened `lambdas`
 /// (one entry per penalty across all blocks), matching the
-/// `FitInference::edf_by_block` ↔ `lambdas` length invariant. The per-block
-/// aggregate edf (for `FittedBlock::edf`) is the sum of that block's penalty
-/// edfs, with an unpenalized block contributing its full column count.
+/// `FitInference::edf_by_block` ↔ `lambdas` length invariant. Per-penalty EDFs
+/// are not additive when penalty ranges overlap: each starts from its own
+/// `rank(S_k)`. The per-parameter-block aggregate is therefore computed
+/// independently as `p_block - Σ_k λ_k tr(H⁻¹S_k)`; an unpenalized block
+/// contributes its full column count.
 pub(crate) fn custom_family_blockwise_edf(
     penalized_hessian: &Array2<f64>,
     specs: &[ParameterBlockSpec],
     lambdas: &ndarray::ArrayView1<'_, f64>,
 ) -> Result<(f64, Vec<f64>, Vec<f64>, Vec<f64>), String> {
+    use gam_solve::estimate::reml::reml_outer_engine::penalty_matrix_root;
+
     let p = penalized_hessian.nrows();
     let total_cols: usize = specs.iter().map(|s| s.design.ncols()).sum();
     if penalized_hessian.ncols() != p || total_cols != p {
@@ -319,6 +323,20 @@ pub(crate) fn custom_family_blockwise_edf(
             // penalty is used as-is (mirrors `survival_transformation_edf`'s
             // explicit block placement).
             let s_local = penalty.to_dense();
+            // Use the same realized penalty root as the REML assembly. Its row
+            // count is the exact rank of the penalty coordinate that contributes
+            // `rank(S_k)·rho_k` to the criterion. Reconstructing rank from the
+            // containing block width overstates every component of a
+            // multi-penalty block; consulting `nullspace_dims` here is also
+            // incorrect after canonical pullback, which intentionally clears
+            // stale pre-transform nullities.
+            let penalty_rank = penalty_matrix_root(&s_local)
+                .map_err(|error| {
+                    format!(
+                        "custom-family edf: penalty {global_k} rank factorization failed: {error}"
+                    )
+                })?
+                .nrows();
             let mut s_full = Array2::<f64>::zeros((p, p));
             if s_local.nrows() == p && s_local.ncols() == p {
                 s_full.assign(&s_local);
@@ -343,11 +361,8 @@ pub(crate) fn custom_family_blockwise_edf(
             let lam_trace = if lambda > 0.0 { lambda * trace } else { 0.0 };
             total_trace += lam_trace;
             penalty_trace[global_k] = lam_trace;
-            // Per-penalty edf is bounded by the columns this penalty acts on,
-            // i.e. its block's column count (a `Blockwise` penalty reports the
-            // full joint width from `dim()`, so cap at `block_cols`, not `dim()`).
-            let penalty_cols = block_cols as f64;
-            let edf_k = (penalty_cols - lam_trace).clamp(0.0, penalty_cols);
+            let penalty_rank = penalty_rank as f64;
+            let edf_k = (penalty_rank - lam_trace).clamp(0.0, penalty_rank);
             edf_by_penalty[global_k] = edf_k;
             // The block's edf is the column count minus the total trace this
             // block's penalties spend (so multiple penalties on one block
