@@ -648,7 +648,6 @@ impl SaeRowJets {
     pub(crate) fn beta_l_deriv(&self, primary: usize, border: usize) -> &[f64] {
         self.channels.beta_l_deriv(primary, border)
     }
-
 }
 
 pub(crate) fn sae_dot(a: &[f64], b: &[f64]) -> f64 {

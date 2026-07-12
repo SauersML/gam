@@ -617,9 +617,8 @@ pub(crate) fn softmax_compiled_schedule_beats_hand_full_channels_932() {
         );
         let (hand_allocations, hand_bytes) = end_row_jet_allocation_measurement();
         assert!(
-            (compiled_checksum(&allocation_probe_compiled)
-                + hand_checksum(&allocation_probe_hand))
-            .is_finite(),
+            (compiled_checksum(&allocation_probe_compiled) + hand_checksum(&allocation_probe_hand))
+                .is_finite(),
             "allocation probes must materialize finite full channels"
         );
         assert!(

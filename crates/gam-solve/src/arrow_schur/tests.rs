@@ -5228,6 +5228,22 @@ fn rational_reduced_schur_plan_derived_deflates_to_target() {
     // Derived rank: an aggressive target (well under the bare std_err) forces the
     // peel to grow. The returned plan's frozen Q reduces the Hutchinson bar and
     // leaves the estimate exact.
+    //
+    // The rank CEILING must give the doubling ladder headroom to actually
+    // certify this aggressive bar. This fixture's reduced Schur is near-scalar
+    // (`hbb = 6·I`, and every row's `htbeta` block is r-independent ⇒ rank-1, so
+    // the Schur correction `C = 0.65·W Wᵀ` has ‖C‖ ≈ 0.04 and κ(S) ≈ 1.008): the
+    // off-diagonal `log(S/c)` mass is spread across ~40 cosine directions rather
+    // than concentrated on two thin tails, so a rank-32 two-sided peel removes
+    // only a fraction of the variance and cannot reach 0.1·bare. The bar is
+    // reachable — `std_err → 0` monotonically as the frozen basis approaches full
+    // rank (a full basis projects every probe to zero, leaving the deterministic
+    // term1 = exact log|S|) — but only with a ceiling that lets the peel grow
+    // past 32. Use `k`: the ladder still STOPS at the first rank that certifies,
+    // so on a genuinely wide-κ operator it returns a low-rank Q; here it peels
+    // deeper because the fixture demands it. This keeps the aggressive 0.1× bar
+    // (a real quality contract) rather than weakening it to whatever rank-32
+    // happens to achieve on a poorly-conditioned-for-deflation fixture.
     let target_rel = 0.1 * bare_eval.std_err / (exact_logdet.abs() + 1.0);
     let derived = rational_reduced_schur_plan_derived(
         &sys,
@@ -5242,7 +5258,7 @@ fn rational_reduced_schur_plan_derived_deflates_to_target() {
         40,
         1e-11,
         20_000,
-        32, // deflation_max_rank
+        k,  // deflation_max_rank: resource ceiling with headroom to certify 0.1×bare
         6,  // subspace_iters
         target_rel,
     )

@@ -149,16 +149,17 @@ impl SaeManifoldTerm {
                 lane,
             )
         } else {
-            let (v, loss, _cache) = self.penalized_quasi_laplace_criterion_with_cache_refine_policy(
-                target,
-                rho,
-                registry,
-                inner_max_iter,
-                learning_rate,
-                ridge_ext_coord,
-                ridge_beta,
-                refine_progress_extension,
-            )?;
+            let (v, loss, _cache) = self
+                .penalized_quasi_laplace_criterion_with_cache_refine_policy(
+                    target,
+                    rho,
+                    registry,
+                    inner_max_iter,
+                    learning_rate,
+                    ridge_ext_coord,
+                    ridge_beta,
+                    refine_progress_extension,
+                )?;
             Ok((v, loss))
         }
     }
@@ -668,7 +669,9 @@ impl SaeManifoldTerm {
         if inner_max_iter == 0 {
             let mut sys = self
                 .assemble_arrow_schur(target, rho, registry)
-                .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
+                .map_err(|err| {
+                    format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}")
+                })?;
             // #1095/#2228 — same decoupling as the stall / gradient-stationary
             // acceptance paths. This frozen warm-start criterion log-det is read from
             // the ridge-0 factor below, which is non-PD BY CONSTRUCTION on an
@@ -681,8 +684,10 @@ impl SaeManifoldTerm {
             // frozen log-det is finite, instead of refusing a rescuable warm-start
             // reuse. A full-rank block has no sub-floor eigenvalue and is untouched.
             Self::ensure_row_gauge_deflation_for_quasi_laplace(&mut sys);
-            let factored = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options)
-                .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
+            let factored =
+                solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options).map_err(|err| {
+                    format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}")
+                })?;
             // The frozen-state Newton step (factored.0, factored.1) is discarded
             // — only the undamped factor cache (factored.2) is consumed for the
             // log-det / selected-inverse traces; β stays at the warm-start seed.
@@ -762,7 +767,9 @@ impl SaeManifoldTerm {
         loop {
             let mut sys = self
                 .assemble_arrow_schur(target, rho, registry)
-                .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
+                .map_err(|err| {
+                    format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}")
+                })?;
             // Evidence-only factorization: the Newton step (Δt, Δβ) is discarded
             // and only the factor cache is consumed — the exact undamped log-det
             // and the selected-inverse traces. As ρ sweeps to extremes (e.g. a
@@ -1036,7 +1043,9 @@ impl SaeManifoldTerm {
                         continue;
                     }
                     Err(err) => {
-                        return Err(format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"));
+                        return Err(format!(
+                            "SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"
+                        ));
                     }
                 }
             }
@@ -1104,11 +1113,9 @@ impl SaeManifoldTerm {
                 //     branches (single objective-progress window, then the
                 //     typed refusal, whose final gate re-checks the
                 //     certificate one last time).
-                if let Ok(limit_factor) = self.factor_deflated_evidence_with_grad_norms(
-                    &mut sys,
-                    &lambda_smooth,
-                    options,
-                ) {
+                if let Ok(limit_factor) =
+                    self.factor_deflated_evidence_with_grad_norms(&mut sys, &lambda_smooth, options)
+                {
                     let decrement_sq = sae_manifold_newton_directional_decrease(
                         &sys,
                         limit_factor.delta_t.view(),
@@ -1129,8 +1136,7 @@ impl SaeManifoldTerm {
                         return Ok(limit_factor.cache);
                     }
                     let certificate_improving = last_limit_certificate.is_none_or(|previous| {
-                        predicted_relative_decrease
-                            <= CERTIFICATE_ESCALATION_PROGRESS * previous
+                        predicted_relative_decrease <= CERTIFICATE_ESCALATION_PROGRESS * previous
                     });
                     if certificate_improving
                         && certificate_escalations < CERTIFICATE_ESCALATION_ANTI_RUNAWAY_CAP
@@ -1253,8 +1259,7 @@ impl SaeManifoldTerm {
                         .max(0.0);
                         let predicted_relative_decrease =
                             0.5 * newton_decrement_sq / final_objective_scale;
-                        if predicted_relative_decrease
-                            <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
+                        if predicted_relative_decrease <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
                         {
                             log::debug!(
                                 "SAE inner final-gate decrement acceptance: ‖g‖={grad_norm:.6e} \
@@ -1322,7 +1327,9 @@ impl SaeManifoldTerm {
             // descends, not the native-terms-only loss.
             let new_loss_total = self
                 .penalized_objective_total(target, rho, registry, 1.0)
-                .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
+                .map_err(|err| {
+                    format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}")
+                })?;
             // Two stagnation signals, both required: (1) the latest refine round
             // contributed a negligible FRACTION of the total objective reduction
             // achieved since entry — the fit has captured essentially all the
@@ -1354,7 +1361,9 @@ impl SaeManifoldTerm {
             {
                 let mut stationary_sys = self
                     .assemble_arrow_schur(target, rho_fixed, registry)
-                    .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
+                    .map_err(|err| {
+                        format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}")
+                    })?;
                 // #1095/#2228 — diagnose the stalled state with the ridge-0
                 // deflated factor. Only the raw/quotient KKT residual can accept;
                 // the affine Newton decrement is reported but cannot mint an
@@ -1467,9 +1476,7 @@ impl SaeManifoldTerm {
                     // the inner gate blind to curvature while the outer gate
                     // trusts it was inconsistent, and no budget can close a gap
                     // that the objective's own resolution cannot express.)
-                    if predicted_relative_decrease
-                        <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL
-                    {
+                    if predicted_relative_decrease <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL {
                         return Ok(stationary_cache);
                     }
                     // Otherwise: a flat objective round is only a convergence
@@ -1760,9 +1767,11 @@ impl SaeManifoldTerm {
             prev_grad_norm = grad_norm;
             // Ridge-0 deflated criterion factor = the B-preconditioner for the
             // exact-pencil GMRES (identical to the outer IFT's preconditioner).
-            let factor = match self
-                .factor_deflated_evidence_with_grad_norms(&mut sys, lambda_smooth, options)
-            {
+            let factor = match self.factor_deflated_evidence_with_grad_norms(
+                &mut sys,
+                lambda_smooth,
+                options,
+            ) {
                 Ok(factor) => factor,
                 Err(err) => {
                     log::debug!(
@@ -1810,16 +1819,16 @@ impl SaeManifoldTerm {
                 t: rhs_t,
                 beta: sys.gb.mapv(|v| -v),
             };
-            let newton = match self.solve_exact_stationarity(rho_fixed, target, &cache, &solver, &rhs)
-            {
-                Ok(newton) => newton,
-                Err(err) => {
-                    log::debug!(
-                        "terminal Newton bail: exact-pencil GMRES at ‖g‖={grad_norm:.6e}: {err}"
-                    );
-                    break;
-                }
-            };
+            let newton =
+                match self.solve_exact_stationarity(rho_fixed, target, &cache, &solver, &rhs) {
+                    Ok(newton) => newton,
+                    Err(err) => {
+                        log::debug!(
+                            "terminal Newton bail: exact-pencil GMRES at ‖g‖={grad_norm:.6e}: {err}"
+                        );
+                        break;
+                    }
+                };
             let pre_obj = self
                 .penalized_objective_total(target, rho_fixed, registry, 1.0)
                 .map_err(|err| format!("SaeManifoldTerm::terminal_exact_newton_polish: {err}"))?;
@@ -2348,7 +2357,9 @@ impl SaeManifoldTerm {
         let extra_penalty_energy =
             self.reml_extra_penalty_value_total(registry)
                 .map_err(|err| {
-                    format!("SaeManifoldTerm::penalized_quasi_laplace_criterion_streaming_exact: {err}")
+                    format!(
+                        "SaeManifoldTerm::penalized_quasi_laplace_criterion_streaming_exact: {err}"
+                    )
                 })?;
         let v = {
             let ri = rank_inputs;
@@ -4475,10 +4486,7 @@ impl SaeManifoldTerm {
                 }
                 for a in 0..q {
                     for (beta_pos, channel) in border.iter().enumerate() {
-                        let dh = sae_dot(
-                            jets.beta_l_deriv(a, w_beta_pos),
-                            jets.beta(beta_pos),
-                        );
+                        let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.beta(beta_pos));
                         gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
                     }
                 }
@@ -4874,10 +4882,7 @@ impl SaeManifoldTerm {
                 }
                 for a in 0..q {
                     for (beta_pos, channel) in border.iter().enumerate() {
-                        let dh = sae_dot(
-                            jets.beta_l_deriv(a, w_beta_pos),
-                            jets.beta(beta_pos),
-                        );
+                        let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.beta(beta_pos));
                         gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
                     }
                 }

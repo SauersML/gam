@@ -46,8 +46,6 @@ use gam_solve::pirls::LinearInequalityConstraints;
 use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec, build_term_collection_design};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use smallvec::SmallVec;
-#[cfg(test)]
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Typed error for the latent-survival / latent-binary family kernels and
@@ -1090,9 +1088,6 @@ const LATENT_SURVIVAL_PRIMARY_MU: usize = 4;
 const LATENT_SURVIVAL_PRIMARY_LOG_SIGMA: usize = 5;
 const LATENT_SURVIVAL_PRIMARY_DIM: usize = 6;
 
-#[cfg(test)]
-use gam_math::jet_partitions::MultiDirJet as LatentMultiDirJet;
-
 /// Derivatives of `log(x)` through 4th order.
 ///
 /// # Contract
@@ -1152,7 +1147,36 @@ struct LatentKernelPrimaryState {
     log_sigma_factor: f64,
 }
 
+/// Complete primary-coordinate state for one latent-survival row.
+///
+/// Keeping these coupled channels together prevents boundary reordering and
+/// cross-row mean/scale mismatches when selecting a derivative backend.
+#[derive(Clone, Copy, Debug)]
+struct LatentSurvivalPrimaryPoint {
+    q_entry: f64,
+    q_exit: f64,
+    qdot_exit: f64,
+    q_right: f64,
+    mu: f64,
+    sigma: f64,
+}
+
+impl LatentSurvivalPrimaryPoint {
+    #[inline]
+    fn log_sigma_factor(self) -> f64 {
+        if self.sigma > 0.0 {
+            self.sigma.ln()
+        } else {
+            0.0
+        }
+    }
+}
+
 #[cfg(test)]
+mod test_support_kernel_recurrence {
+use super::*;
+use std::collections::BTreeMap;
+
 fn latent_kernel_accumulate_term(
     terms: &mut BTreeMap<(usize, usize, usize, usize), f64>,
     term: LatentKernelPrimaryTerm,
@@ -1166,8 +1190,7 @@ fn latent_kernel_accumulate_term(
         .or_insert(0.0) += scale * term.coeff;
 }
 
-#[cfg(test)]
-fn latent_kernel_differentiate_terms(
+pub(super) fn latent_kernel_differentiate_terms(
     terms: &[LatentKernelPrimaryTerm],
     dir: LatentKernelPrimaryDirection,
 ) -> Vec<LatentKernelPrimaryTerm> {
@@ -1257,6 +1280,7 @@ fn latent_kernel_differentiate_terms(
             })
         })
         .collect()
+}
 }
 
 // Fourth-order latent-kernel recurrences have a small finite support. Keeping
@@ -1393,6 +1417,11 @@ fn latent_kernel_term_sequence_inline(
 }
 
 #[cfg(test)]
+mod test_support_multidir_kernel {
+use super::*;
+use super::test_support_kernel_recurrence::latent_kernel_differentiate_terms;
+use gam_math::jet_partitions::MultiDirJet as LatentMultiDirJet;
+
 fn latent_kernel_term_lists_for_directions(
     base_terms: &[LatentKernelPrimaryTerm],
     directions: &[LatentKernelPrimaryDirection],
@@ -1423,8 +1452,7 @@ fn latent_kernel_term_lists_for_directions(
         .collect()
 }
 
-#[cfg(test)]
-fn latent_kernel_sum_log_jet(
+pub(super) fn latent_kernel_sum_log_jet(
     quadctx: &QuadratureContext,
     base_terms: &[LatentKernelPrimaryTerm],
     state: LatentKernelPrimaryState,
@@ -1499,6 +1527,7 @@ fn latent_kernel_sum_log_jet(
     let mut out = normalized.compose_unary(latent_unary_derivatives_log(1.0));
     out.coeffs[0] += base_log_sum;
     Ok(out)
+}
 }
 
 /// A one-pass analytic lift of a latent kernel sum into an order-specific jet.
@@ -1919,7 +1948,12 @@ fn latent_survival_map_right_direction(
 }
 
 #[cfg(test)]
-fn latent_survival_row_primary_log_jet_multidir_reference(
+mod test_support_multidir_row {
+use super::*;
+use super::test_support_multidir_kernel::latent_kernel_sum_log_jet;
+use gam_math::jet_partitions::MultiDirJet as LatentMultiDirJet;
+
+pub(super) fn latent_survival_row_primary_log_jet_multidir_reference(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
     q_entry: f64,
@@ -2078,7 +2112,6 @@ fn latent_survival_row_primary_log_jet_multidir_reference(
 /// follows by the Faà-di-Bruno composition already implemented in
 /// `MultiDirJet::compose_unary`, so the derivative reductions are consistent
 /// with the exact-event/right-censored branches by construction.
-#[cfg(test)]
 fn latent_survival_interval_numerator_log_jet_multidir_reference(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
@@ -2164,6 +2197,7 @@ fn latent_survival_interval_numerator_log_jet_multidir_reference(
     // log-of-a-difference score / curvature, consistent with the single-state
     // log-sum path (which composes `ln` at its normalised base of 1).
     Ok(linear_numerator.compose_unary(latent_unary_derivatives_log(base)))
+}
 }
 
 /// The single latent-survival row program, instantiated at an order-two,
@@ -2620,7 +2654,11 @@ fn latent_survival_row_primary_fourth_contracted(
 }
 
 #[cfg(test)]
-fn latent_survival_row_primary_gradient_hessian_multidir_reference(
+mod test_support_multidir_channels {
+use super::*;
+use super::test_support_multidir_row::latent_survival_row_primary_log_jet_multidir_reference;
+
+pub(super) fn latent_survival_row_primary_gradient_hessian_multidir_reference(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
     q_entry: f64,
@@ -2689,8 +2727,7 @@ fn latent_survival_row_primary_gradient_hessian_multidir_reference(
     Ok((log_lik, gradient, neg_hessian))
 }
 
-#[cfg(test)]
-fn latent_survival_row_primary_third_contracted_multidir_reference(
+pub(super) fn latent_survival_row_primary_third_contracted_multidir_reference(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
     q_entry: f64,
@@ -2740,8 +2777,7 @@ fn latent_survival_row_primary_third_contracted_multidir_reference(
     Ok(out)
 }
 
-#[cfg(test)]
-fn latent_survival_row_primary_fourth_contracted_multidir_reference(
+pub(super) fn latent_survival_row_primary_fourth_contracted_multidir_reference(
     quadctx: &QuadratureContext,
     row: &LatentSurvivalRow,
     q_entry: f64,
@@ -2798,6 +2834,7 @@ fn latent_survival_row_primary_fourth_contracted_multidir_reference(
         }
     }
     Ok(out)
+}
 }
 
 #[derive(Clone)]
@@ -5435,6 +5472,11 @@ impl CustomFamily for LatentBinaryFamily {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::test_support_multidir_channels::{
+        latent_survival_row_primary_fourth_contracted_multidir_reference,
+        latent_survival_row_primary_gradient_hessian_multidir_reference,
+        latent_survival_row_primary_third_contracted_multidir_reference,
+    };
     use crate::custom_family::BlockWorkingSet;
     use gam_linalg::matrix::DenseDesignMatrix;
     use ndarray::array;

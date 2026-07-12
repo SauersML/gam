@@ -338,8 +338,28 @@ __device__ __forceinline__ T NAME(T q0,T q1,T qd1,T g,const RowIn&in){         \
         double ll[5]; d_log(ad1.v,ll); td=SCALE(COMPOSE(ad1,ll),-in.wi*in.di);} \
     return ADD(ADD(exit,entry),ADD(ev,td));                                   \
 }
+DEF_NLL(nll_j2,J2,j2_const,j2_scale,j2_mul,j2_add,j2_addc,j2_compose)
 DEF_NLL(nll_js1,JS1,js1_const,js1_scale,js1_mul,js1_add,js1_addc,js1_compose)
 DEF_NLL(nll_js2,JS2,js2_const,js2_scale,js2_mul,js2_add,js2_addc,js2_compose)
+
+extern "C" __global__ void __launch_bounds__(128,1) survival_rowjet_vgh(
+        int n,
+        const double* __restrict__ q0,const double* __restrict__ q1,
+        const double* __restrict__ qd1,const double* __restrict__ gg,
+        const double* __restrict__ wi,const double* __restrict__ di,
+        const double* __restrict__ zsum,const double* __restrict__ cov,
+        double probit_scale,
+        double* __restrict__ out_v, double* __restrict__ out_g,
+        double* __restrict__ out_h){
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=n) return;
+    RowIn in; in.wi=wi[i]; in.di=di[i]; in.z_sum=zsum[i]; in.cov_ones=cov[i]; in.probit_scale=probit_scale;
+    J2 out=nll_j2(j2_var(q0[i],0),j2_var(q1[i],1),j2_var(qd1[i],2),j2_var(gg[i],3),in);
+    out_v[i]=out.v;
+    for(int a=0;a<K;a++) out_g[(size_t)i*K+a]=out.g[a];
+    for(int a=0;a<K;a++)for(int b=0;b<K;b++)
+        out_h[(size_t)i*K*K+a*K+b]=out.h[a][b];
+}
 
 extern "C" __global__ void __launch_bounds__(128,1) survival_rowjet(
         int n,

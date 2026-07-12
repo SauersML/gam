@@ -657,7 +657,6 @@ mod tests_softmax_hand_reference {
                 }
             }
         }
-
     }
 }
 
@@ -714,11 +713,8 @@ impl SaeManifoldTerm {
                     assignments,
                     second_jets,
                 )?;
-                let mut channels = crate::row_jet_program::SaeScheduledRowJets::zeros(
-                    q,
-                    p,
-                    border.len(),
-                );
+                let mut channels =
+                    crate::row_jet_program::SaeScheduledRowJets::zeros(q, p, border.len());
                 SAE_ROW_JET_ARENA.with(|cell| {
                     let mut arena = cell.borrow_mut();
                     arena.reset();

@@ -295,9 +295,8 @@ pub fn survival_rigid_row_jets(
 
 /// General VGH-only entry point. CPU execution evaluates exactly one
 /// `SparseOrder2` row program and allocates no high-order outputs. Large admitted
-/// GPU batches retain the existing device route for now; its result is narrowed
-/// at the boundary, while a dedicated J2 CUDA entry point is measured separately
-/// before replacing that kernel.
+/// GPU batches use a dedicated J2 kernel, so they likewise carry no seeded
+/// high-order state and transfer only the requested outputs.
 #[must_use]
 pub(crate) fn survival_rigid_row_vgh(
     rows: &[SurvivalRowInputs],
@@ -306,15 +305,8 @@ pub(crate) fn survival_rigid_row_vgh(
     #[cfg(target_os = "linux")]
     {
         if rows.len() >= DEVICE_ROW_THRESHOLD {
-            let zero = [0.0_f64; 4];
-            match device::survival_rigid_row_jets_device(rows, probit_scale, &zero, &zero, &zero) {
-                Ok(out) => {
-                    return SurvivalRowVghChannels {
-                        value: out.value,
-                        grad: out.grad,
-                        hess: out.hess,
-                    };
-                }
+            match device::survival_rigid_row_vgh_device(rows, probit_scale) {
+                Ok(out) => return out,
                 Err(error) => {
                     log::info!("[GPU] survival VGH device path fell back to CPU: {error}");
                 }
@@ -347,7 +339,10 @@ pub const SURVIVAL_ROWJET_SOURCE: &str = include_str!("survival_rowjet_kernel.cu
 
 #[cfg(target_os = "linux")]
 mod device {
-    use super::{SURVIVAL_ROWJET_SOURCE, SurvivalRowInputs, SurvivalRowJetChannels};
+    use super::{
+        SURVIVAL_ROWJET_SOURCE, SurvivalRowInputs, SurvivalRowJetChannels,
+        SurvivalRowVghChannels,
+    };
     use gam_gpu::gpu_error::{GpuError, GpuResultExt};
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -403,6 +398,108 @@ mod device {
         dir.iter().any(|&v| v != 0.0)
     }
 
+    type FlatInputs = (
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+        Vec<f64>,
+    );
+
+    fn flatten_inputs(rows: &[SurvivalRowInputs]) -> FlatInputs {
+        let n = rows.len();
+        let mut q0 = Vec::with_capacity(n);
+        let mut q1 = Vec::with_capacity(n);
+        let mut qd1 = Vec::with_capacity(n);
+        let mut g = Vec::with_capacity(n);
+        let mut wi = Vec::with_capacity(n);
+        let mut di = Vec::with_capacity(n);
+        let mut zs = Vec::with_capacity(n);
+        let mut cov = Vec::with_capacity(n);
+        for row in rows {
+            q0.push(row.primaries[0]);
+            q1.push(row.primaries[1]);
+            qd1.push(row.primaries[2]);
+            g.push(row.primaries[3]);
+            wi.push(row.wi);
+            di.push(row.di);
+            zs.push(row.z_sum);
+            cov.push(row.cov_ones);
+        }
+        (q0, q1, qd1, g, wi, di, zs, cov)
+    }
+
+    pub(super) fn survival_rigid_row_vgh_device(
+        rows: &[SurvivalRowInputs],
+        probit_scale: f64,
+    ) -> Result<SurvivalRowVghChannels, GpuError> {
+        let n = rows.len();
+        if n == 0 {
+            return Ok(SurvivalRowVghChannels {
+                value: Vec::new(),
+                grad: Vec::new(),
+                hess: Vec::new(),
+            });
+        }
+        let b = backend()?;
+        let module = module(b)?;
+        let function = module
+            .load_function("survival_rowjet_vgh")
+            .gpu_ctx("survival_rowjet_vgh load_function")?;
+        let stream = b.stream.clone();
+        let (q0, q1, qd1, g, wi, di, zs, cov) = flatten_inputs(rows);
+        let q0_d = stream.clone_htod(&q0).gpu_ctx("vgh htod q0")?;
+        let q1_d = stream.clone_htod(&q1).gpu_ctx("vgh htod q1")?;
+        let qd1_d = stream.clone_htod(&qd1).gpu_ctx("vgh htod qd1")?;
+        let g_d = stream.clone_htod(&g).gpu_ctx("vgh htod g")?;
+        let wi_d = stream.clone_htod(&wi).gpu_ctx("vgh htod wi")?;
+        let di_d = stream.clone_htod(&di).gpu_ctx("vgh htod di")?;
+        let zs_d = stream.clone_htod(&zs).gpu_ctx("vgh htod zsum")?;
+        let cov_d = stream.clone_htod(&cov).gpu_ctx("vgh htod cov")?;
+        let mut value_d = stream.alloc_zeros::<f64>(n).gpu_ctx("vgh alloc value")?;
+        let mut grad_d = stream.alloc_zeros::<f64>(n * 4).gpu_ctx("vgh alloc grad")?;
+        let mut hess_d = stream.alloc_zeros::<f64>(n * 16).gpu_ctx("vgh alloc hess")?;
+
+        let n_i32 = i32::try_from(n)
+            .map_err(|_| gam_gpu::gpu_err!("survival_rowjet_vgh n={n} overflows i32"))?;
+        const TPB: u32 = 128;
+        let config = LaunchConfig {
+            grid_dim: (((n as u32).div_ceil(TPB)).max(1), 1, 1),
+            block_dim: (TPB, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&function);
+        builder
+            .arg(&n_i32)
+            .arg(&q0_d)
+            .arg(&q1_d)
+            .arg(&qd1_d)
+            .arg(&g_d)
+            .arg(&wi_d)
+            .arg(&di_d)
+            .arg(&zs_d)
+            .arg(&cov_d)
+            .arg(&probit_scale)
+            .arg(&mut value_d)
+            .arg(&mut grad_d)
+            .arg(&mut hess_d);
+        // SAFETY: all device slices match the kernel signature and lengths;
+        // the launch covers exactly n rows with bounds checking in the kernel.
+        unsafe { builder.launch(config) }.gpu_ctx("survival_rowjet_vgh kernel launch")?;
+
+        let mut value = vec![0.0_f64; n];
+        let mut grad = vec![0.0_f64; n * 4];
+        let mut hess = vec![0.0_f64; n * 16];
+        stream.memcpy_dtoh(&value_d, &mut value).gpu_ctx("vgh dtoh value")?;
+        stream.memcpy_dtoh(&grad_d, &mut grad).gpu_ctx("vgh dtoh grad")?;
+        stream.memcpy_dtoh(&hess_d, &mut hess).gpu_ctx("vgh dtoh hess")?;
+        stream.synchronize().gpu_ctx("survival_rowjet_vgh synchronize")?;
+        Ok(SurvivalRowVghChannels { value, grad, hess })
+    }
+
     pub(super) fn survival_rigid_row_jets_device(
         rows: &[SurvivalRowInputs],
         probit_scale: f64,
@@ -435,24 +532,7 @@ mod device {
         let stream = b.stream.clone();
 
         // Flatten inputs into struct-of-arrays for coalesced device reads.
-        let mut q0 = vec![0.0_f64; n];
-        let mut q1 = vec![0.0_f64; n];
-        let mut qd1 = vec![0.0_f64; n];
-        let mut g = vec![0.0_f64; n];
-        let mut wi = vec![0.0_f64; n];
-        let mut di = vec![0.0_f64; n];
-        let mut zs = vec![0.0_f64; n];
-        let mut cov = vec![0.0_f64; n];
-        for (i, r) in rows.iter().enumerate() {
-            q0[i] = r.primaries[0];
-            q1[i] = r.primaries[1];
-            qd1[i] = r.primaries[2];
-            g[i] = r.primaries[3];
-            wi[i] = r.wi;
-            di[i] = r.di;
-            zs[i] = r.z_sum;
-            cov[i] = r.cov_ones;
-        }
+        let (q0, q1, qd1, g, wi, di, zs, cov) = flatten_inputs(rows);
 
         let q0_d = stream.clone_htod(&q0).gpu_ctx("htod q0")?;
         let q1_d = stream.clone_htod(&q1).gpu_ctx("htod q1")?;

@@ -784,16 +784,17 @@ impl SaeScheduledRowJets {
         let first = q.checked_mul(p);
         let second = q.checked_mul(q).and_then(|value| value.checked_mul(p));
         let beta = n_beta.checked_mul(p);
-        let mixed = q
-            .checked_mul(n_beta)
-            .and_then(|value| value.checked_mul(p));
+        let mixed = q.checked_mul(n_beta).and_then(|value| value.checked_mul(p));
         // SAFETY: a dimension product that cannot fit `usize` cannot describe a
         // realizable allocation; fail before a wrapped length aliases channels.
         let total = first
             .and_then(|value| second.and_then(|next| value.checked_add(next)))
             .and_then(|value| beta.and_then(|next| value.checked_add(next)))
             .and_then(|value| {
-                mixed.and_then(|next| next.checked_mul(2).and_then(|twice| value.checked_add(twice)))
+                mixed.and_then(|next| {
+                    next.checked_mul(2)
+                        .and_then(|twice| value.checked_add(twice))
+                })
             })
             .expect("SAE row-jet packed channel length overflow");
         Self {
@@ -898,7 +899,6 @@ impl SaeScheduledRowJets {
         let start = self.beta_l_deriv_offset() + (primary * self.n_beta + border) * self.p;
         &mut self.data[start..start + self.p]
     }
-
 }
 
 /// The derivative algebra of `Y = Σ_k z_k D_k`, where `z = softmax(r ℓ)`.
@@ -1126,11 +1126,7 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
             for (target, &value) in out.beta_deriv_mut(slot, border).iter_mut().zip(output) {
                 *target = scalar * value;
             }
-            for (target, &value) in out
-                .beta_l_deriv_mut(slot, border)
-                .iter_mut()
-                .zip(output)
-            {
+            for (target, &value) in out.beta_l_deriv_mut(slot, border).iter_mut().zip(output) {
                 *target = scalar * value;
             }
         }
@@ -1145,17 +1141,12 @@ pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(
             if coord_atom != atom {
                 continue;
             }
-            let scalar = source.gate_value(atom)
-                * source.beta_border_basis_first(border, axis)
-                * sqrt_row_w;
+            let scalar =
+                source.gate_value(atom) * source.beta_border_basis_first(border, axis) * sqrt_row_w;
             for (target, &value) in out.beta_deriv_mut(slot, border).iter_mut().zip(output) {
                 *target = scalar * value;
             }
-            for (target, &value) in out
-                .beta_l_deriv_mut(slot, border)
-                .iter_mut()
-                .zip(output)
-            {
+            for (target, &value) in out.beta_l_deriv_mut(slot, border).iter_mut().zip(output) {
                 *target = scalar * value;
             }
         }
@@ -2260,8 +2251,8 @@ mod tests {
                     max_abs = max_abs.max((compiled.first(a)[column] - tower.g()[a]).abs());
                     scale = scale.max(tower.g()[a].abs());
                     for b in 0..K {
-                        max_abs = max_abs
-                            .max((compiled.second(a, b)[column] - tower.h()[a][b]).abs());
+                        max_abs =
+                            max_abs.max((compiled.second(a, b)[column] - tower.h()[a][b]).abs());
                         scale = scale.max(tower.h()[a][b].abs());
                     }
                 }
@@ -2311,19 +2302,32 @@ mod tests {
                 .iter()
                 .enumerate()
                 .map(|(atom, &value)| {
-                    (value + if atom == logit_atom { displacement } else { 0.0 }) * inv_tau
+                    (value
+                        + if atom == logit_atom {
+                            displacement
+                        } else {
+                            0.0
+                        })
+                        * inv_tau
                 })
                 .fold(f64::NEG_INFINITY, f64::max);
             let exps: Vec<Quad> = logits
                 .iter()
                 .enumerate()
                 .map(|(atom, &value)| {
-                    let displaced =
-                        value + if atom == logit_atom { displacement } else { 0.0 };
+                    let displaced = value
+                        + if atom == logit_atom {
+                            displacement
+                        } else {
+                            0.0
+                        };
                     (q(displaced) * q(inv_tau) - q(shifted_max)).exp()
                 })
                 .collect();
-            let denominator = exps.iter().copied().fold(Quad::ZERO, |sum, value| sum + value);
+            let denominator = exps
+                .iter()
+                .copied()
+                .fold(Quad::ZERO, |sum, value| sum + value);
             exps[gated_atom] / denominator * q(phi)
         }
 
@@ -2356,23 +2360,12 @@ mod tests {
                         for phi in [1.0e-12_f64, 1.0, 1.0e12] {
                             let got = moment.gate_first(gated_atom, logit_atom) * phi;
                             let z_k = quad_border_value(
-                                &logits,
-                                inv_tau,
-                                gated_atom,
-                                logit_atom,
-                                0.0,
-                                1.0,
+                                &logits, inv_tau, gated_atom, logit_atom, 0.0, 1.0,
                             );
                             let z_j = quad_border_value(
-                                &logits,
-                                inv_tau,
-                                logit_atom,
-                                logit_atom,
-                                0.0,
-                                1.0,
+                                &logits, inv_tau, logit_atom, logit_atom, 0.0, 1.0,
                             );
-                            let diagonal: f64 =
-                                if gated_atom == logit_atom { 1.0 } else { 0.0 };
+                            let diagonal: f64 = if gated_atom == logit_atom { 1.0 } else { 0.0 };
                             let exact = z_k * (q(diagonal) - z_j) * q(inv_tau) * q(phi);
                             let exact_f64 = q_to_f64(exact);
                             let condition = q_to_f64(
@@ -2398,21 +2391,10 @@ mod tests {
                                 phi,
                             );
                             let fm1 = quad_border_value(
-                                &logits,
-                                inv_tau,
-                                gated_atom,
-                                logit_atom,
-                                -h,
-                                phi,
+                                &logits, inv_tau, gated_atom, logit_atom, -h, phi,
                             );
-                            let fp1 = quad_border_value(
-                                &logits,
-                                inv_tau,
-                                gated_atom,
-                                logit_atom,
-                                h,
-                                phi,
-                            );
+                            let fp1 =
+                                quad_border_value(&logits, inv_tau, gated_atom, logit_atom, h, phi);
                             let fp2 = quad_border_value(
                                 &logits,
                                 inv_tau,
