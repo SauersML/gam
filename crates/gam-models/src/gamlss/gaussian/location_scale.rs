@@ -1229,7 +1229,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         }
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
         let mut ll = 0.0;
-        for sampled in &subsample.rows {
+        for sampled in subsample.rows.iter() {
             let i = sampled.index;
             let row_ll = gaussian_diagonal_row_kernel(
                 i,

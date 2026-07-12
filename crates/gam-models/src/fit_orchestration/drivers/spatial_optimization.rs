@@ -6803,7 +6803,8 @@ where
         // Multi-block optimization has no preceding scalar Matérn endpoint
         // certificate, so retain its family-specific seed cascade.
         false,
-    )?;
+    )
+    .map_err(|e| e.to_string())?;
 
     // Helper: collect specs and designs from cache into owned Vecs for closure calls.
     fn collect_specs(cache: &ExactJointDesignCache<'_>) -> Vec<TermCollectionSpec> {
