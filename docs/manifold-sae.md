@@ -469,9 +469,14 @@ ring**, a **Euclidean Gaussian**, the best free **k-cluster Gaussian mixture**,
 and a constrained **ring of clusters** whose component centers share one fitted
 circle. The last class is the generative model for discrete cyclic concepts:
 it explains clumpy density without throwing away cyclic order. All four race on
-held-out predictive density (deterministic cross-fitted stacking), while the
-two mixture rungs carry certified, rank-aware Laplace evidence. `winner` names
-the best individual density. The circular topology verdict instead aggregates
+held-out predictive density (deterministic cross-fitted stacking). Each outer
+training fold selects the free-mixture and ring-cluster orders using only that
+fold's training rows before scoring its untouched rows; the all-data rung fits
+are reporting/deployment fits and never choose an outer predictive model. The
+two mixture rungs also carry certified, rank-aware Laplace evidence.
+`winner_class` names the best predictive model-selection procedure, while
+`reporting_winner` names its all-data fitted representative. The circular
+topology verdict instead aggregates
 the stacking mass of the smooth-circle and ring-of-clusters densities before
 comparing it with the aggregate non-circular mass; this is invariant to an
 otherwise arbitrary split between two predictors of the same circular class.
@@ -493,12 +498,14 @@ Returns a dict:
 
 | Key | Meaning |
 | --- | --- |
-| `winner` | `"circle"`, `"euclidean"`, `"mixture_k{k}"`, or `"ring_clusters_k{k}"` |
+| `winner_class` | `"circle"`, `"euclidean"`, `"mixture"`, or `"ring_clusters"`; the winning outer-held-out procedure |
+| `reporting_winner` | the all-data representative (`"mixture_k{k}"` / `"ring_clusters_k{k}"` for a discrete class) |
 | `circle_wins` | bool, total circular stacking mass exceeds total non-circular mass |
 | `circular_stacking_weight` / `noncircular_stacking_weight` | stacking mass aggregated within the two topology classes |
 | `circular_margin` | total circular mass minus total non-circular mass |
-| `mixture_k` | the mixture order selected inside the mixture rung |
-| `ring_clusters_k` | the order selected inside the constrained ring-of-clusters rung |
+| `mixture_reporting_k` / `ring_clusters_reporting_k` | orders selected by the all-data reporting fits; never used to choose an outer-fold predictor |
+| `mixture_fold_selected_k` / `ring_clusters_fold_selected_k` | training-only order selected in each outer fold |
+| `mixture_fold_k_histogram` / `ring_clusters_fold_k_histogram` | counts of the fold-local orders, for stability/provenance |
 | `candidate_names` / `stacking_weights` | per-candidate names and held-out stacking weights |
 | `negative_log_evidence` | per-candidate rank-aware negative log evidence |
 | `headline` | `"stacking"` or `"evidence"` — which criterion produced the verdict |
@@ -554,20 +561,32 @@ rules keep the verdict rates meaningful:
 The controls embedded in `adjudicate_atom_shape` begin at its 2-D coordinate
 input, so they isolate the adjudicator's own false-circle floor. A full census
 must also catch artifacts introduced by SAE training, co-activation grouping,
-and PCA. Generate those controls one at a time at the census pipeline entry and
-rerun every stage:
+and projection/subspace search. Use `run_shape_controlled_census` at pipeline
+entry. It invokes the exact same deterministic `(matrix, seed)` callback on the
+observed activations and both controls, isolates callback mutation with private
+matrix copies, and retains only one control matrix at a time:
 
 ```python
-for kind in ("per_dimension_shuffle", "covariance_matched_gaussian"):
-    controlled_activations = gamfit.shape_matched_control(
-        activations_float64, kind=kind, seed=11
-    )
-    # Re-run the identical SAE -> grouping -> PCA -> adjudication pipeline.
-    run_census(controlled_activations, control_kind=kind)
+def complete_pipeline(matrix, seed):
+    # Fresh fit: SAE -> grouping -> projection/search -> adjudication.
+    return run_census(matrix, seed=seed)
+
+controlled = gamfit.run_shape_controlled_census(
+    activations,
+    complete_pipeline,
+    control_seed=11,
+    pipeline_seed=11,
+)
+print(controlled.observed)
+print(controlled.per_dimension_shuffle)
+print(controlled.covariance_matched_gaussian)
 ```
 
-One control is returned per call so corpus-scale workflows can release it
-before generating the next instead of retaining both copies in memory.
+Float32 activation corpora stay float32 through the control generator; stable
+means/covariances and the covariance eigendecomposition are accumulated in
+float64 without materializing an `n × p` float64 copy. Float64 inputs remain
+float64. The callback contract requires a fresh deterministic fit and receives
+the same `pipeline_seed` for all three runs.
 
 `examples/topology_census_recipe.py` documents the full validated recipe.
 

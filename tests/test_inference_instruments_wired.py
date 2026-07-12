@@ -93,6 +93,109 @@ def test_shape_controlled_census_rejects_ambiguous_seeds_and_bad_data() -> None:
         )
 
 
+def test_float32_shape_controls_preserve_dtype_seed_marginals_and_covariance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gamfit._shape_census as shape_census
+
+    rows = np.arange(16_384, dtype=np.float32)
+    phase = np.float32(2.0 * np.pi) * rows / np.float32(rows.size)
+    activations = np.column_stack(
+        [
+            np.float32(10_000.0) + np.float32(2.0) * np.cos(phase),
+            np.float32(-20_000.0)
+            + np.float32(0.8) * np.cos(phase)
+            + np.float32(1.2) * np.sin(phase),
+            np.float32(5_000.0)
+            - np.float32(0.6) * np.cos(phase)
+            + np.float32(0.3) * np.sin(phase),
+        ]
+    ).astype(np.float32, copy=False)
+
+    def forbid_float64_control(*args, **kwargs):
+        raise AssertionError("float32 census dispatched through the float64 native control")
+
+    monkeypatch.setattr(shape_census, "shape_matched_control", forbid_float64_control)
+    calls: list[tuple[np.ndarray, int]] = []
+
+    def pipeline(matrix: np.ndarray, seed: int) -> tuple[np.dtype, tuple[int, ...], int]:
+        assert matrix.dtype == np.float32
+        assert matrix.nbytes == matrix.size * np.dtype(np.float32).itemsize
+        calls.append((matrix.copy(), seed))
+        return matrix.dtype, matrix.shape, seed
+
+    result = gamfit.run_shape_controlled_census(
+        activations,
+        pipeline,
+        control_seed=2262,
+        pipeline_seed=17,
+    )
+    assert len(calls) == 3
+    assert [seed for _, seed in calls] == [17, 17, 17]
+    assert all(matrix.dtype == np.float32 for matrix, _ in calls)
+
+    shuffle = gamfit.shape_matched_control_f32(
+        activations,
+        "per_dimension_shuffle",
+        seed=result.per_dimension_shuffle_seed,
+    )
+    repeated_shuffle = gamfit.shape_matched_control_f32(
+        activations,
+        "per_dimension_shuffle",
+        seed=result.per_dimension_shuffle_seed,
+    )
+    assert shuffle.dtype == np.float32
+    np.testing.assert_array_equal(shuffle, repeated_shuffle)
+    np.testing.assert_array_equal(calls[1][0], shuffle)
+    for col in range(activations.shape[1]):
+        np.testing.assert_array_equal(np.sort(shuffle[:, col]), np.sort(activations[:, col]))
+
+    gaussian = gamfit.shape_matched_control_f32(
+        activations,
+        "covariance_matched_gaussian",
+        seed=result.covariance_matched_gaussian_seed,
+    )
+    repeated_gaussian = gamfit.shape_matched_control_f32(
+        activations,
+        "covariance_matched_gaussian",
+        seed=result.covariance_matched_gaussian_seed,
+    )
+    assert gaussian.dtype == np.float32
+    np.testing.assert_array_equal(gaussian, repeated_gaussian)
+    np.testing.assert_array_equal(calls[2][0], gaussian)
+    target_covariance = np.cov(activations.astype(np.float64), rowvar=False, bias=True)
+    realized_covariance = np.cov(gaussian.astype(np.float64), rowvar=False, bias=True)
+    scales = np.sqrt(np.diag(target_covariance))
+    tolerance = 0.04 * np.outer(scales, scales)
+    np.testing.assert_array_less(np.abs(realized_covariance - target_covariance), tolerance)
+
+
+def test_shape_controlled_census_converts_non_native_dtype_once_to_float64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gamfit._shape_census as shape_census
+
+    source = np.arange(96, dtype=np.int16).reshape(32, 3)
+    real_array = shape_census.np.array
+    conversions: list[np.dtype] = []
+
+    def tracked_array(data, *args, **kwargs):
+        dtype = np.dtype(kwargs["dtype"])
+        conversions.append(dtype)
+        return real_array(data, *args, **kwargs)
+
+    monkeypatch.setattr(shape_census.np, "array", tracked_array)
+    seen_dtypes: list[np.dtype] = []
+
+    def pipeline(matrix: np.ndarray, seed: int) -> int:
+        seen_dtypes.append(matrix.dtype)
+        return seed
+
+    gamfit.run_shape_controlled_census(source, pipeline)
+    assert conversions == [np.dtype(np.float64)]
+    assert seen_dtypes == [np.dtype(np.float64)] * 3
+
+
 def test_layer_transport_fit_reaches_python():
     rng = np.random.default_rng(0)
     t = np.sort(rng.uniform(0.0, 2.0 * math.pi, size=200))

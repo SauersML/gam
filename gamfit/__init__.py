@@ -88,6 +88,7 @@ from ._warnings import GamInferenceWarning, emit_inference_warnings
 from ._rust import (  # native topology-census instruments
     adjudicate_atom_shape,
     shape_matched_control,
+    shape_matched_control_f32,
 )
 from ._shape_census import ShapeControlledCensus, run_shape_controlled_census
 from ._compare import compare_models

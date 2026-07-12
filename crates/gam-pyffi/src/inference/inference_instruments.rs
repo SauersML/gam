@@ -2753,6 +2753,36 @@ pub(crate) fn shape_matched_control<'py>(
     Ok(control.into_pyarray(py))
 }
 
+/// Float32-preserving structureless control for full-pipeline censuses.
+///
+/// Unlike [`shape_matched_control`], this entry point never widens the `n × p`
+/// input or output matrix. The covariance-matched branch still accumulates its
+/// `O(p²)` moment/eigendecomposition workspace in float64.
+#[pyfunction]
+#[pyo3(signature = (data, kind, seed = 11))]
+pub(crate) fn shape_matched_control_f32<'py>(
+    py: Python<'py>,
+    data: numpy::PyReadonlyArray2<'py, f32>,
+    kind: &str,
+    seed: u64,
+) -> PyResult<Bound<'py, numpy::PyArray2<f32>>> {
+    use gam::terms::sae::null_battery::{
+        covariance_matched_gaussian_null_f32, per_dimension_shuffle_null_f32,
+    };
+    use numpy::IntoPyArray;
+
+    let data = data.as_array();
+    let control = match kind {
+        "per_dimension_shuffle" => per_dimension_shuffle_null_f32(data, seed),
+        "covariance_matched_gaussian" => covariance_matched_gaussian_null_f32(data, seed),
+        other => Err(format!(
+            "shape_matched_control_f32: kind must be per_dimension_shuffle or covariance_matched_gaussian; got {other:?}"
+        )),
+    }
+    .map_err(py_value_error)?;
+    Ok(control.into_pyarray(py))
+}
+
 /// Adjudicate the representational SHAPE of a recovered atom's intrinsic 2-D
 /// coordinates (issue #977 / #907 / #2262): race a smooth S¹ ring against a
 /// Euclidean Gaussian, the best free k-cluster mixture, and a constrained
@@ -2919,6 +2949,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(debiased_functional, module)?)?;
     module.add_function(wrap_pyfunction!(glm_full_conformal, module)?)?;
     module.add_function(wrap_pyfunction!(shape_matched_control, module)?)?;
+    module.add_function(wrap_pyfunction!(shape_matched_control_f32, module)?)?;
     module.add_function(wrap_pyfunction!(adjudicate_atom_shape, module)?)?;
     module.add_function(wrap_pyfunction!(sweep_color_arm_throughput, module)?)?;
     Ok(())

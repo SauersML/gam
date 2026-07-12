@@ -36,7 +36,7 @@
 
 use std::sync::Arc;
 
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::inference::steering::steer_delta;
@@ -275,4 +275,161 @@ fn delta_is_the_activation_space_chord() {
         metric.provenance(),
         MetricProvenance::OutputFisher { .. }
     ));
+}
+
+/// Build the SAME planted circle oracle as [`planted_circle`], except the
+/// installed decoder lives in a Tier-0 STANDARDIZED internal frame:
+/// `B_int[:, c] = B_raw[:, c] / σ_c`, exactly the frame
+/// [`SaeManifoldTerm::set_tier0_scale`] documents ("the fit runs on
+/// `(Z − μ)/σ`... every reconstruction lifts back `x̂ = μ + σ ⊙ x̂_internal`").
+/// `scale` is `σ`; the term additionally carries `tier0_scale = Some(σ)` so a
+/// consumer that un-scales correctly recovers the exact same raw-frame
+/// `g(t) = R·[cos(2πt), sin(2πt)]` oracle as the unscaled fixture.
+fn planted_circle_tier0_scaled(t0: f64, scale: [f64; 2]) -> (SaeManifoldTerm, RowMetric) {
+    let p = 2usize;
+    let m = 3usize;
+    let d = 1usize;
+    let n = 1usize;
+
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(m).expect("evaluator"));
+    let coords = Array2::from_shape_vec((n, d), vec![t0]).expect("coords");
+    let (phi, jet) = {
+        use gam::terms::sae::manifold::SaeBasisEvaluator;
+        evaluator.evaluate(coords.view()).expect("evaluate")
+    };
+    assert_eq!(phi.dim(), (n, m));
+    assert_eq!(jet.dim(), (n, m, d));
+
+    // The RAW-frame decoder is identical to `planted_circle`'s; the INSTALLED
+    // decoder is that raw decoder divided column-wise by `scale`, matching the
+    // `B_int = B_raw / σ` internal-frame contract exactly.
+    let mut decoder = Array2::<f64>::zeros((m, p));
+    decoder[[2, 0]] = R / scale[0]; // cos column drives output 0
+    decoder[[1, 1]] = R / scale[1]; // sin column drives output 1
+
+    let smooth = Array2::<f64>::zeros((m, m));
+
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
+        "circle",
+        SaeAtomBasisKind::Periodic,
+        d,
+        phi,
+        jet,
+        decoder,
+        smooth,
+    )
+    .expect("atom")
+    .with_basis_evaluator(evaluator);
+
+    let logits = Array2::<f64>::zeros((n, 1));
+    let coord_values = LatentCoordValues::from_matrix_with_manifold(
+        coords.view(),
+        LatentIdMode::None,
+        LatentManifold::Circle { period: 1.0 },
+    );
+    let assignment = SaeAssignment::new(logits, vec![coord_values], 1.0).expect("assignment");
+    let mut term = SaeManifoldTerm::new(vec![atom], assignment).expect("term");
+    term.set_tier0_scale(Array1::from_vec(scale.to_vec()))
+        .expect("tier0 scale");
+
+    // The row output-Fisher metric is ALWAYS built from raw activation-space
+    // probes (never from the decoder), so it is IDENTICAL to the unscaled
+    // fixture's — an identity metric here, exactly like `planted_circle`.
+    let rank = p;
+    let u = Array2::from_shape_vec((n, p * rank), vec![1.0, 0.0, 0.0, 1.0]).expect("u");
+    let metric = RowMetric::output_fisher(Arc::new(u), p, rank).expect("metric");
+
+    (term, metric)
+}
+
+/// #2249 Tier-0-frame regression pin (`ace3b9af3`).
+///
+/// `steer_delta`/`decode_tangents_at`/`atom_behavior_isometry` used to read
+/// the fitted decoder directly, which — under Tier-0 standardization/
+/// equilibration (the default for real-activation fits) — lives in the
+/// internal frame `B_int[:, c] = B_raw[:, c] / σ_c`, while the row output-
+/// Fisher metric `M = UUᵀ` is always built from raw activation-space probes.
+/// Every dose `0.5·δᵀMδ` was therefore priced with a per-column `1/σ_c`
+/// mis-scale on `δ`, a live calibration confound stacked on top of the
+/// rank-truncation/out-of-radius pooling artifact separately diagnosed on
+/// #2249.
+///
+/// This test plants the SAME closed-form circle oracle as
+/// [`predicted_nats_match_analytic_kl_within_validity_radius`], but with the
+/// decoder installed in a Tier-0-scaled internal frame (`σ = [2.0, 0.5]`,
+/// deliberately asymmetric so a missed per-column correction cannot cancel).
+/// With the fix engaged, `steer_delta` un-scales the decoded chord/tangents
+/// back to raw units before they meet the metric, so `predicted_nats` must
+/// recover the EXACT SAME `analytic_kl` oracle the unscaled fixture matches,
+/// to the same `rel < 1e-3` tolerance. Reverting the `steering.rs` un-scaling
+/// (i.e. dropping the `if let Some(scale) = scale { ... }` correction in
+/// `decode_at`/`decode_tangents_at`) makes this test fail deterministically:
+/// the un-corrected chord at `t0=0, Δ=0.01` has component `c` off by the fixed
+/// factor `1/σ_c`, so its reported `predicted_nats` is a specific, computable
+/// wrong number, not merely a looser match to `analytic_kl` — `σ = [2.0, 0.5]`
+/// is deliberately asymmetric so the two components' errors cannot cancel
+/// each other in the quadratic form. No external data, no GPU: fixed
+/// construction, no clock, no RNG, matching the rest of this file.
+#[test]
+fn predicted_nats_survive_tier0_frame_rescale_2249() {
+    let t0 = 0.0;
+    let scale = [2.0_f64, 0.5_f64];
+    let (term, metric) = planted_circle_tier0_scaled(t0, scale);
+
+    assert_eq!(
+        term.tier0_scale().map(|s| s.to_vec()),
+        Some(scale.to_vec()),
+        "tier0 scale must round-trip through the setter"
+    );
+
+    // Same small step as the unscaled fixture's within-radius test.
+    let delta = 0.01_f64;
+    let plan = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("plan");
+
+    // The decoded chord must land back in RAW units: identical to the
+    // unscaled fixture's `delta_is_the_activation_space_chord` expectation,
+    // regardless of the internal Tier-0 scale.
+    let g_from = [R * (TWO_PI * t0).cos(), R * (TWO_PI * t0).sin()];
+    let g_to = [
+        R * (TWO_PI * (t0 + delta)).cos(),
+        R * (TWO_PI * (t0 + delta)).sin(),
+    ];
+    let expect0 = g_to[0] - g_from[0];
+    let expect1 = g_to[1] - g_from[1];
+    println!(
+        "tier0-scaled delta=[{:.6}, {:.6}] expected(raw)=[{expect0:.6}, {expect1:.6}]",
+        plan.delta[0], plan.delta[1]
+    );
+    assert!(
+        (plan.delta[0] - expect0).abs() < 1e-9,
+        "un-scaled chord[0] {:.8} must match raw-frame expectation {expect0:.8}",
+        plan.delta[0]
+    );
+    assert!(
+        (plan.delta[1] - expect1).abs() < 1e-9,
+        "un-scaled chord[1] {:.8} must match raw-frame expectation {expect1:.8}",
+        plan.delta[1]
+    );
+
+    let nats = plan.predicted_nats.expect("behavioral dose available");
+    let kl = analytic_kl(delta);
+    println!("tier0-scaled small step: predicted_nats={nats:.8e} analytic_kl={kl:.8e}");
+    let rel = (nats - kl).abs() / kl;
+    assert!(
+        rel < 1e-3,
+        "predicted nats {nats:.8e} must match analytic KL {kl:.8e} within 0.1% under Tier-0 \
+         rescaling (rel={rel:.3e}) — a failure here means the raw-frame un-scaling \
+         (#2249, ace3b9af3) is not engaged or not correct"
+    );
+
+    // The validity radius must also be reported in RAW units (a σ-mis-scaled
+    // tangent would report a systematically wrong radius even when the
+    // endpoint dose above happened to be checked at a different δ).
+    let vr = plan.validity_radius.expect("validity radius available");
+    println!("tier0-scaled validity_radius={vr:.5e} full_move={delta:.5e}");
+    assert!(
+        (vr - delta).abs() < 1e-9,
+        "tiny step must be fully within validity radius under Tier-0 rescaling: \
+         vr={vr:.5e}, move={delta:.5e}"
+    );
 }

@@ -17,8 +17,16 @@ This is the un-forced division of labor:
   Stage 1b (gam adjudicates, gamfit.adjudicate_atom_shape):
       For each group, project the group's per-token SAE codes to a 2-D intrinsic
       coordinate (PCA of the group's code submatrix) and hand it to gam's
-      cross-class adjudicator. gam auto-decides circle vs euclidean vs
-      k-cluster-mixture on HELD-OUT predictive loglik. NO topology is forced.
+      cross-class adjudicator. gam auto-decides circular vs euclidean vs the
+      free-mixture class on HELD-OUT predictive loglik. Discrete orders are
+      selected inside each outer training fold. NO topology is forced.
+
+  Full-pipeline controls (gamfit.run_shape_controlled_census):
+      Repeat the complete Stage-0 -> Stage-1b callback from scratch on an
+      independent per-dimension shuffle and covariance-matched Gaussian of the
+      original activations, with the identical pipeline seed. The reported
+      false-circle floor therefore includes SAE, grouping, projection, and
+      adjudicator artifacts; it is not a post-PCA coordinate control.
 
   Honest report:
       Count groups that adjudicate as genuinely CURVED (circle beats the cluster
@@ -34,7 +42,6 @@ from __future__ import annotations
 import argparse
 import glob
 import json
-import math
 import os
 import sys
 import time
@@ -80,6 +87,7 @@ def load_activations(act_dir: str, max_tokens: int | None, seed: int, log=print)
             if sel.size:
                 out[wi : wi + sel.size] = np.asarray(m[sel], dtype=np.float32)
                 wi += sel.size
+        rng.shuffle(out, axis=0)
         log(f"subsampled {max_tokens} tokens (of {total})")
         return out, d
     # Load all (chunk-concatenate as float32).
@@ -88,6 +96,7 @@ def load_activations(act_dir: str, max_tokens: int | None, seed: int, log=print)
     for m in mmaps:
         out[wi : wi + m.shape[0]] = np.asarray(m, dtype=np.float32)
         wi += m.shape[0]
+    rng.shuffle(out, axis=0)
     return out, d
 
 
@@ -113,7 +122,6 @@ def feature_coactivation_groups(
        >= `min_group` features.
     Returns a list of feature-index arrays (into the full F dictionary).
     """
-    F = codes.shape[1]
     order = np.argsort(-act_count)
     alive = order[act_count[order] > 0][:top_features]
     if alive.size < min_group * 2:
@@ -220,6 +228,7 @@ def adjudicate_groups(gamfit, codes, groups, W_dec, max_rows, seed, log=print):
                 folds=5,
                 seed=seed + 11 + gi,
                 mean_l0=mean_l0,
+                matched_controls=False,
             )
         except Exception as exc:  # noqa: BLE001
             log(f"  group {gi:3d}: adjudication error: {exc}")
@@ -228,28 +237,134 @@ def adjudicate_groups(gamfit, codes, groups, W_dec, max_rows, seed, log=print):
             "group": gi,
             "n_features": int(members.size),
             "n_rows": int(coords.shape[0]),
-            "winner": v["winner"],
+            "winner_class": v["winner_class"],
+            "reporting_winner": v["reporting_winner"],
             "circle_wins": bool(v["circle_wins"]),
             "circular_margin": float(v["circular_margin"]),
-            "mixture_k": int(v["mixture_k"]),
+            "mixture_reporting_k": int(v["mixture_reporting_k"]),
+            "ring_clusters_reporting_k": int(v["ring_clusters_reporting_k"]),
+            "mixture_fold_selected_k": [int(k) for k in v["mixture_fold_selected_k"]],
+            "ring_clusters_fold_selected_k": [
+                int(k) for k in v["ring_clusters_fold_selected_k"]
+            ],
+            "mixture_fold_k_histogram": {
+                int(k): int(count) for k, count in v["mixture_fold_k_histogram"].items()
+            },
+            "ring_clusters_fold_k_histogram": {
+                int(k): int(count)
+                for k, count in v["ring_clusters_fold_k_histogram"].items()
+            },
             "headline": v["headline"],
             "stacking_weights": dict(zip(v["candidate_names"], v["stacking_weights"])),
             "dictionary_mean_l0": float(v["dictionary_mean_l0"]),
-            "control_false_circle_floor": float(v["control_false_circle_floor"]),
-            "matched_controls": {
-                name: {
-                    "winner": control["winner"],
-                    "circle_wins": bool(control["circle_wins"]),
-                    "circular_margin": float(control["circular_margin"]),
-                    "mixture_k": int(control["mixture_k"]),
-                }
-                for name, control in v["matched_controls"].items()
-            },
         }
         verdicts.append(rec)
         log(f"  group {gi:3d} ({members.size:3d} feats, {coords.shape[0]:4d} rows): "
-            f"{v['winner']:16s} margin={v['circular_margin']:+.4f} k={v['mixture_k']}")
+            f"{v['winner_class']:16s} margin={v['circular_margin']:+.4f} "
+            f"reporting={v['reporting_winner']}")
     return verdicts
+
+
+def run_complete_census_pipeline(
+    activations,
+    pipeline_seed,
+    *,
+    args,
+    gamfit,
+    sae_config_type,
+    train_sae,
+    log=print,
+):
+    """Fresh-fit every stage for one observed/control activation matrix."""
+    run_started = time.time()
+    d_in = activations.shape[1]
+    cfg = sae_config_type(
+        d_in=d_in,
+        dict_size=args.dict_size,
+        l1_coeff=args.l1_coeff,
+        activation=args.activation,
+        lr=args.lr,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        seed=pipeline_seed,
+        device=args.device,
+    )
+    if args.eval_tokens < 32 or args.eval_tokens >= activations.shape[0]:
+        raise ValueError(
+            "--eval-tokens must satisfy 32 <= eval_tokens < activation rows so "
+            "SAE training, group discovery, and shape evaluation are disjoint"
+        )
+    training_activations = activations[: -args.eval_tokens]
+    geometry_activations = activations[-args.eval_tokens :]
+    discovery_rows = args.eval_tokens // 2
+    discovery_activations = geometry_activations[:discovery_rows]
+    evaluation_activations = geometry_activations[discovery_rows:]
+    log(
+        f"=== Stage 0: training overcomplete {args.activation} SAE "
+        f"d_in={d_in} dict={args.dict_size} on {training_activations.shape[0]} "
+        f"training-only tokens ==="
+    )
+    model, sae_stats, act_count = train_sae(training_activations, cfg)
+
+    import torch
+
+    device = next(model.parameters()).device
+    norm_scale = sae_stats["norm_scale"]
+
+    def encode(matrix):
+        with torch.no_grad():
+            encoded = []
+            for start in range(0, matrix.shape[0], args.batch_size):
+                batch = torch.from_numpy(matrix[start : start + args.batch_size]).float().to(device)
+                encoded.append(model.encode(batch * norm_scale).cpu().numpy())
+        return np.concatenate(encoded, axis=0)
+
+    discovery_codes = encode(discovery_activations)
+    evaluation_codes = encode(evaluation_activations)
+    log(
+        "=== Stage 1a: co-activation clustering on "
+        f"{discovery_codes.shape[0]} discovery-only tokens ==="
+    )
+    groups = feature_coactivation_groups(
+        discovery_codes,
+        act_count,
+        args.top_features,
+        args.n_groups,
+        args.min_group,
+        pipeline_seed,
+        log,
+    )
+    log(f"=== Stage 1b: gam cross-class adjudication of {len(groups)} groups ===")
+    decoder = model.W_dec.detach().cpu().numpy()
+    verdicts = adjudicate_groups(
+        gamfit,
+        evaluation_codes,
+        groups,
+        decoder,
+        args.max_group_rows,
+        pipeline_seed,
+        log,
+    )
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    from collections import Counter
+
+    winner_breakdown = Counter(verdict["winner_class"] for verdict in verdicts)
+    circular_wins = sum(bool(verdict["circle_wins"]) for verdict in verdicts)
+    dictionary_mean_l0 = float(np.count_nonzero(evaluation_codes, axis=1).mean())
+    return {
+        "sae": sae_stats,
+        "n_candidate_groups": len(groups),
+        "n_attempted": len(groups),
+        "n_adjudicated": len(verdicts),
+        "n_circular_wins": circular_wins,
+        "circular_win_rate": circular_wins / len(verdicts) if verdicts else None,
+        "dictionary_mean_l0": dictionary_mean_l0,
+        "winner_breakdown": dict(winner_breakdown),
+        "verdicts": verdicts,
+        "wall_seconds": time.time() - run_started,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -272,8 +387,8 @@ Build the wheel on a COMPUTE node (never login), then run on an a100:
     cd /path/to/scratch/gam
     maturin build --release -o dist && pip install --force-reinstall dist/*.whl'
 
-  # STEP 2 (train SAE + adjudicate):
-  sbatch -p <gpu-partition> --gres=gpu:a100:1 -t 120 --wrap '
+  # STEP 2 (three fresh SAE fits + adjudication: observed + two controls):
+  sbatch -p <gpu-partition> --gres=gpu:a100:1 -t 360 --wrap '
     source /path/to/scratch/olmo_venv/bin/activate
     export HF_HOME=/path/to/scratch/hf
     export TMPDIR=/path/to/scratch/tmp
@@ -299,12 +414,13 @@ def main() -> int:
     ap.add_argument("--lr", type=float, default=4e-4)
     ap.add_argument("--max-tokens", type=int, default=400000)
     ap.add_argument("--eval-tokens", type=int, default=20000,
-                    help="held-out token sample for co-activation + coords")
+                    help="held-out tokens split equally between group discovery and shape evaluation")
     ap.add_argument("--top-features", type=int, default=2048)
     ap.add_argument("--n-groups", type=int, default=64)
     ap.add_argument("--min-group", type=int, default=4)
     ap.add_argument("--max-group-rows", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--control-seed", type=int, default=17)
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--out", type=str, default=None)
     ap.add_argument("--print-run-spec", action="store_true")
@@ -328,90 +444,81 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"BLOCKER: gamfit wheel not importable ({exc}).", file=sys.stderr)
         return 3
-    if not hasattr(gamfit, "adjudicate_atom_shape"):
-        print("BLOCKER: gamfit wheel lacks adjudicate_atom_shape — rebuild "
-              "(capstone 222cdb2af). Without it the un-forced judge is missing.",
-              file=sys.stderr)
+    required_api = {"adjudicate_atom_shape", "run_shape_controlled_census"}
+    missing_api = sorted(name for name in required_api if not hasattr(gamfit, name))
+    if missing_api:
+        print(
+            f"BLOCKER: gamfit wheel lacks {', '.join(missing_api)} — rebuild the current wheel.",
+            file=sys.stderr,
+        )
         return 3
 
     from torch_sgd_sae import SAEConfig, train_sae
 
-    # --- Stage 0: load + train the real SGD SAE ---------------------------
-    acts, d = load_activations(args.act_dir, args.max_tokens, args.seed)
-    cfg = SAEConfig(
-        d_in=d, dict_size=args.dict_size, l1_coeff=args.l1_coeff,
-        activation=args.activation, lr=args.lr, batch_size=args.batch_size,
-        epochs=args.epochs, seed=args.seed, device=args.device,
+    activations, _ = load_activations(args.act_dir, args.max_tokens, args.seed)
+
+    def complete_pipeline(matrix, seed):
+        return run_complete_census_pipeline(
+            matrix,
+            seed,
+            args=args,
+            gamfit=gamfit,
+            sae_config_type=SAEConfig,
+            train_sae=train_sae,
+        )
+
+    controlled = gamfit.run_shape_controlled_census(
+        activations,
+        complete_pipeline,
+        control_seed=args.control_seed,
+        pipeline_seed=args.seed,
     )
-    print(f"=== Stage 0: training overcomplete {args.activation} SAE "
-          f"d_in={d} dict={args.dict_size} on {acts.shape[0]} tokens ===")
-    model, sae_stats, act_count = train_sae(acts, cfg)
-
-    # --- held-out code sample for geometry --------------------------------
-    import torch
-    device = next(model.parameters()).device
-    rng = np.random.default_rng(args.seed + 1)
-    n_eval = min(args.eval_tokens, acts.shape[0])
-    eval_idx = np.sort(rng.choice(acts.shape[0], size=n_eval, replace=False))
-    norm_scale = sae_stats["norm_scale"]  # apply the same dataset normalization
-    with torch.no_grad():
-        codes_list = []
-        for s in range(0, n_eval, args.batch_size):
-            xb = torch.from_numpy(acts[eval_idx[s : s + args.batch_size]]).float().to(device)
-            xb = xb * norm_scale
-            codes_list.append(model.encode(xb).cpu().numpy())
-        codes = np.concatenate(codes_list, axis=0)  # [n_eval, F]
-    print(f"=== Stage 1a: co-activation clustering on {n_eval} held-out tokens ===")
-
-    # --- Stage 1a: candidate groups ---------------------------------------
-    groups = feature_coactivation_groups(
-        codes, act_count, args.top_features, args.n_groups, args.min_group, args.seed)
-
-    # --- Stage 1b: gam adjudicates each group (NO forced topology) ---------
-    print(f"=== Stage 1b: gam cross-class adjudication of {len(groups)} groups ===")
-    W_dec = model.W_dec.detach().cpu().numpy()  # [F, d_in]
-    verdicts = adjudicate_groups(gamfit, codes, groups, W_dec, args.max_group_rows, args.seed)
-
-    # --- Honest report ----------------------------------------------------
-    n_adj = len(verdicts)
-    n_circle = sum(1 for v in verdicts if v["circle_wins"])
-    control_verdicts = [
-        control
-        for verdict in verdicts
-        for control in verdict["matched_controls"].values()
+    runs = {
+        "observed": controlled.observed,
+        "per_dimension_shuffle": controlled.per_dimension_shuffle,
+        "covariance_matched_gaussian": controlled.covariance_matched_gaussian,
+    }
+    control_runs = [
+        controlled.per_dimension_shuffle,
+        controlled.covariance_matched_gaussian,
     ]
-    n_control_circle = sum(1 for control in control_verdicts if control["circle_wins"])
-    from collections import Counter
-    by_winner = Counter(v["winner"].split("(")[0].split("_k")[0] for v in verdicts)
+    control_wins = sum(run["n_circular_wins"] for run in control_runs)
+    control_adjudicated = sum(run["n_adjudicated"] for run in control_runs)
     summary = {
-        "sae": sae_stats,
-        "n_candidate_groups": len(groups),
-        "n_adjudicated": n_adj,
-        "n_circle_wins": n_circle,
-        "n_control_circle_wins": n_control_circle,
-        "n_control_verdicts": len(control_verdicts),
+        "runs": runs,
         "control_false_circle_rate": (
-            n_control_circle / len(control_verdicts) if control_verdicts else None
+            control_wins / control_adjudicated if control_adjudicated else None
         ),
-        "winner_breakdown": dict(by_winner),
-        "verdicts": verdicts,
+        "control_n_circular_wins": control_wins,
+        "control_n_adjudicated": control_adjudicated,
+        "seed_provenance": {
+            "pipeline_seed": controlled.pipeline_seed,
+            "per_dimension_shuffle_seed": controlled.per_dimension_shuffle_seed,
+            "covariance_matched_gaussian_seed": controlled.covariance_matched_gaussian_seed,
+        },
         "wall_seconds": time.time() - t0,
         "config": vars(args),
     }
-    print("\n=== HONEST VERDICT ===")
-    print(f"SAE: EV={sae_stats['explained_variance']:.4f} "
-          f"mean_L0={sae_stats['mean_l0']:.1f} "
-          f"dead_frac={sae_stats['dead_feature_fraction']:.3f}")
-    print(f"groups adjudicated: {n_adj}/{len(groups)}")
-    print(f"winner breakdown: {dict(by_winner)}")
-    print(f"circle (curved) wins: {n_circle}/{n_adj}"
-          + (f" ({100*n_circle/n_adj:.0f}%)" if n_adj else ""))
-    print(f"matched-control circle wins: {n_control_circle}/{len(control_verdicts)}"
-          + (f" ({100*n_control_circle/len(control_verdicts):.0f}%), "
-             f"dictionary mean_L0={sae_stats['mean_l0']:.1f}"
-             if control_verdicts else ""))
-    if n_adj == 0:
-        print("FINDING: no group could be adjudicated (degenerate group geometry).")
+    print("\n=== HONEST FULL-PIPELINE VERDICT ===")
+    for name, run in runs.items():
+        sae = run["sae"]
+        print(
+            f"{name}: EV={sae['explained_variance']:.4f} mean_L0={sae['mean_l0']:.1f} "
+            f"dead_frac={sae['dead_feature_fraction']:.3f}; "
+            f"circular={run['n_circular_wins']}/{run['n_adjudicated']}; "
+            f"winners={run['winner_breakdown']}"
+        )
+    print(
+        "pooled matched-control false-circle floor: "
+        f"{control_wins}/{control_adjudicated}"
+        + (
+            f" ({100.0 * control_wins / control_adjudicated:.1f}%)"
+            if control_adjudicated
+            else " (no adjudicated control groups)"
+        )
+    )
+    if controlled.observed["n_adjudicated"] == 0:
+        print("FINDING: no observed group could be adjudicated (degenerate group geometry).")
 
     if args.out:
         Path(args.out).write_text(json.dumps(summary, indent=2, default=str))

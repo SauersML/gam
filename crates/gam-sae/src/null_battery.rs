@@ -592,6 +592,27 @@ pub fn per_dimension_shuffle_null(
     Ok(out)
 }
 
+/// Float32-preserving form of [`per_dimension_shuffle_null`].
+///
+/// The output is allocated directly as `n × p` float32 and values are copied
+/// bit-for-bit from the input. No float64 data matrix is materialized.
+pub fn per_dimension_shuffle_null_f32(
+    data: ArrayView2<'_, f32>,
+    seed: u64,
+) -> Result<Array2<f32>, String> {
+    validate_matrix_f32(data, "float32 per-dimension-shuffle input")?;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Array2::<f32>::zeros(data.raw_dim());
+    for col in 0..data.ncols() {
+        let mut order: Vec<usize> = (0..data.nrows()).collect();
+        order.shuffle(&mut rng);
+        for (dst, &src) in order.iter().enumerate() {
+            out[[dst, col]] = data[[src, col]];
+        }
+    }
+    Ok(out)
+}
+
 /// Gaussian matched-spectrum null for a matrix already expressed in principal-
 /// component coordinates.
 ///
@@ -704,6 +725,60 @@ fn stable_population_moments(data: ArrayView2<'_, f64>) -> Result<StablePopulati
     })
 }
 
+/// Float32-input population moments with float64 accumulation.
+///
+/// The only float64 allocations have shapes `p`, `p`, and `p × p`. Input
+/// scalars are widened one at a time, so this path cannot create an `n × p`
+/// float64 copy of the activation matrix.
+fn stable_population_moments_f32(
+    data: ArrayView2<'_, f32>,
+) -> Result<StablePopulationMoments, String> {
+    validate_matrix_f32(data, "float32 stable-population-moments input")?;
+    let n = data.nrows();
+    let p = data.ncols();
+    let origin = data.row(0).mapv(f64::from);
+    let mut mean_offset = Array1::<f64>::zeros(p);
+    for row in 0..n {
+        let count = (row + 1) as f64;
+        for axis in 0..p {
+            let relative = f64::from(data[[row, axis]]) - origin[axis];
+            mean_offset[axis] += (relative - mean_offset[axis]) / count;
+        }
+    }
+    if mean_offset.iter().any(|value| !value.is_finite()) {
+        return Err("float32 stable column-mean accumulation overflowed".to_string());
+    }
+
+    let mut covariance = Array2::<f64>::zeros((p, p));
+    for row in 0..n {
+        for left in 0..p {
+            let left_residual =
+                (f64::from(data[[row, left]]) - origin[left]) - mean_offset[left];
+            for right in 0..=left {
+                let right_residual =
+                    (f64::from(data[[row, right]]) - origin[right]) - mean_offset[right];
+                covariance[[left, right]] += left_residual * right_residual;
+            }
+        }
+    }
+    let inverse_count = 1.0 / n as f64;
+    for left in 0..p {
+        for right in 0..=left {
+            let value = covariance[[left, right]] * inverse_count;
+            covariance[[left, right]] = value;
+            covariance[[right, left]] = value;
+        }
+    }
+    if covariance.iter().any(|value| !value.is_finite()) {
+        return Err("float32 stable covariance accumulation overflowed".to_string());
+    }
+    Ok(StablePopulationMoments {
+        origin,
+        mean_offset,
+        covariance,
+    })
+}
+
 /// Certify that a symmetric covariance eigenspectrum is positive semidefinite
 /// up to the backward error of its eigendecomposition. A negative eigenvalue
 /// no larger than `64 * p * eps * trace` in magnitude is numerical zero; a
@@ -779,6 +854,54 @@ pub fn covariance_matched_gaussian_null(
                     "covariance-matched Gaussian draw overflowed at row {row}, column {col}"
                 ));
             }
+        }
+    }
+    Ok(out)
+}
+
+/// Float32-preserving covariance-matched Gaussian control.
+///
+/// Stable means, covariance, and its eigendecomposition are computed in
+/// float64, but their storage is only `O(p²)`. The input stays float32 and the
+/// `n × p` output is allocated directly as float32, so peak matrix storage does
+/// not include an `n × p` float64 conversion.
+pub fn covariance_matched_gaussian_null_f32(
+    data: ArrayView2<'_, f32>,
+    seed: u64,
+) -> Result<Array2<f32>, String> {
+    use faer::Side;
+    use gam_linalg::faer_ndarray::FaerEigh;
+
+    validate_matrix_f32(data, "float32 covariance-matched Gaussian input")?;
+    let n = data.nrows();
+    let p = data.ncols();
+    let moments = stable_population_moments_f32(data)?;
+    let covariance_trace = moments.covariance.diag().sum();
+    let (eigenvalues, eigenvectors) = moments.covariance.eigh(Side::Lower).map_err(|error| {
+        format!("float32 covariance-matched Gaussian eigendecomposition failed: {error}")
+    })?;
+    let eigenvalues = certified_covariance_spectrum(eigenvalues.view(), covariance_trace)?;
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Array2::<f32>::zeros((n, p));
+    let mut scaled_normal = vec![0.0_f64; p];
+    for row in 0..n {
+        for axis in 0..p {
+            scaled_normal[axis] = eigenvalues[axis].sqrt() * standard_normal(&mut rng);
+        }
+        for col in 0..p {
+            let mut relative_draw = moments.mean_offset[col];
+            for axis in 0..p {
+                relative_draw += eigenvectors[[col, axis]] * scaled_normal[axis];
+            }
+            let value = moments.origin[col] + relative_draw;
+            let value_f32 = value as f32;
+            if !value.is_finite() || !value_f32.is_finite() {
+                return Err(format!(
+                    "float32 covariance-matched Gaussian draw overflowed at row {row}, column {col}"
+                ));
+            }
+            out[[row, col]] = value_f32;
         }
     }
     Ok(out)
@@ -1660,6 +1783,18 @@ fn validate_matrix(data: ArrayView2<'_, f64>, name: &str) -> Result<(), String> 
     Ok(())
 }
 
+fn validate_matrix_f32(data: ArrayView2<'_, f32>, name: &str) -> Result<(), String> {
+    if data.nrows() == 0 || data.ncols() == 0 {
+        return Err(format!("{name} matrix must be non-empty"));
+    }
+    for ((i, j), &value) in data.indexed_iter() {
+        if !value.is_finite() {
+            return Err(format!("{name}[{i},{j}] is not finite: {value}"));
+        }
+    }
+    Ok(())
+}
+
 fn require_finite(value: f64, name: &str) -> Result<(), String> {
     if value.is_finite() {
         Ok(())
@@ -2108,6 +2243,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn float32_per_dimension_shuffle_is_seeded_and_preserves_exact_marginals() {
+        let rows = 2_048usize;
+        let mut observed = Array2::<f32>::zeros((rows, 3));
+        for row in 0..rows {
+            observed[[row, 0]] = row as f32 - 1_024.0;
+            observed[[row, 1]] = (row as f32 * 0.25).sin();
+            observed[[row, 2]] = (row % 17) as f32;
+        }
+        let first = per_dimension_shuffle_null_f32(observed.view(), 2262).unwrap();
+        let repeated = per_dimension_shuffle_null_f32(observed.view(), 2262).unwrap();
+        assert_eq!(first, repeated, "float32 shuffle must be seed reproducible");
+        for col in 0..observed.ncols() {
+            let mut expected = observed.column(col).to_vec();
+            let mut actual = first.column(col).to_vec();
+            expected.sort_by(f32::total_cmp);
+            actual.sort_by(f32::total_cmp);
+            assert_eq!(actual, expected, "float32 shuffle changed column {col}");
+        }
+    }
+
+    #[test]
+    fn float32_covariance_control_is_seeded_and_matches_population_moments() {
+        let rows = 16_384usize;
+        let mut observed = Array2::<f32>::zeros((rows, 3));
+        for row in 0..rows {
+            let phase = (2.0 * PI * row as f64 / rows as f64) as f32;
+            observed[[row, 0]] = 10_000.0 + 2.0 * phase.cos();
+            observed[[row, 1]] = -20_000.0 + 0.8 * phase.cos() + 1.2 * phase.sin();
+            observed[[row, 2]] = 5_000.0 - 0.6 * phase.cos() + 0.3 * phase.sin();
+        }
+        let draw = covariance_matched_gaussian_null_f32(observed.view(), 2262).unwrap();
+        let repeated = covariance_matched_gaussian_null_f32(observed.view(), 2262).unwrap();
+        assert_eq!(draw, repeated, "float32 Gaussian control must be reproducible");
+
+        let target = stable_population_moments_f32(observed.view()).unwrap();
+        let realized = stable_population_moments_f32(draw.view()).unwrap();
+        for axis in 0..observed.ncols() {
+            let target_mean = target.origin[axis] + target.mean_offset[axis];
+            let realized_mean = realized.origin[axis] + realized.mean_offset[axis];
+            let mean_se = target.covariance[[axis, axis]].sqrt() / (rows as f64).sqrt();
+            let quantization = f64::from(f32::EPSILON) * target_mean.abs();
+            assert!(
+                (realized_mean - target_mean).abs() <= 5.0 * mean_se + 2.0 * quantization,
+                "float32 Gaussian mean {axis} mismatch: target={target_mean} realized={realized_mean}"
+            );
+        }
+        for left in 0..observed.ncols() {
+            for right in 0..observed.ncols() {
+                let scale = target.covariance[[left, left]].sqrt()
+                    * target.covariance[[right, right]].sqrt();
+                assert!(
+                    (realized.covariance[[left, right]] - target.covariance[[left, right]]).abs()
+                        < 0.04 * scale,
+                    "float32 covariance ({left},{right}) mismatch: target={} realized={} scale={scale}",
+                    target.covariance[[left, right]],
+                    realized.covariance[[left, right]],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn float32_control_has_only_p_sized_float64_moment_workspace() {
+        let rows = 8_192usize;
+        let cols = 3usize;
+        let input = Array2::<f32>::from_shape_fn((rows, cols), |(row, col)| {
+            (row as f32 * 0.01 + col as f32).sin()
+        });
+        let moments = stable_population_moments_f32(input.view()).unwrap();
+        assert_eq!(moments.origin.len(), cols);
+        assert_eq!(moments.mean_offset.len(), cols);
+        assert_eq!(moments.covariance.dim(), (cols, cols));
+        let f64_workspace_scalars =
+            moments.origin.len() + moments.mean_offset.len() + moments.covariance.len();
+        assert_eq!(f64_workspace_scalars, 2 * cols + cols * cols);
+        assert!(f64_workspace_scalars < rows * cols);
+
+        let output = covariance_matched_gaussian_null_f32(input.view(), 17).unwrap();
+        assert_eq!(output.dim(), input.dim());
+        assert_eq!(
+            std::mem::size_of_val(output.as_slice().unwrap()),
+            rows * cols * std::mem::size_of::<f32>(),
+            "the only n×p output allocation must be native float32"
+        );
     }
 
     #[test]
