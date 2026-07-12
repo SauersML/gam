@@ -13,6 +13,9 @@
 //! arithmetic. Direct device tests cover both ordinary and probability-tail
 //! rows against the CPU row program.
 
+#[cfg(target_os = "linux")]
+use crate::survival::marginal_slope::row_kernel::RIGID_ROW_PROGRAM_CUDA_J2;
+
 /// Flattened row-major value, gradient, and Hessian channels for `K = 4`.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq)]
@@ -58,13 +61,39 @@ pub(crate) fn survival_rigid_row_vgh(
         .map_err(|error| format!("survival VGH device execution failed: {error}"))
 }
 
-/// Order-2 CUDA lowering for the four rigid survival primaries.
+/// CUDA substrate for the four rigid survival primaries. The stable primitive
+/// leaves, `J2` operations, and launch plumbing live here; the algebraic row
+/// schedule is generated from the canonical Rust declaration.
 #[cfg(target_os = "linux")]
-const SURVIVAL_ROWJET_SOURCE: &str = include_str!("survival_rowjet_kernel.cu");
+const SURVIVAL_ROWJET_TEMPLATE: &str = include_str!("survival_rowjet_kernel.cu");
+
+#[cfg(target_os = "linux")]
+const ROW_PROGRAM_MARKER: &str = "// __GAM_ROW_PROGRAM_CUDA_J2__";
+
+#[cfg(target_os = "linux")]
+fn survival_rowjet_source() -> &'static str {
+    static SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SOURCE.get_or_init(|| {
+        let (preamble, kernel) = SURVIVAL_ROWJET_TEMPLATE
+            .split_once(ROW_PROGRAM_MARKER)
+            .expect("survival rowjet CUDA template must contain the row-program marker");
+        assert!(
+            !kernel.contains(ROW_PROGRAM_MARKER),
+            "survival rowjet CUDA template must contain exactly one row-program marker",
+        );
+        let mut source = String::with_capacity(
+            preamble.len() + RIGID_ROW_PROGRAM_CUDA_J2.len() + kernel.len(),
+        );
+        source.push_str(preamble);
+        source.push_str(RIGID_ROW_PROGRAM_CUDA_J2);
+        source.push_str(kernel);
+        source
+    })
+}
 
 #[cfg(target_os = "linux")]
 mod device {
-    use super::{SURVIVAL_ROWJET_SOURCE, SurvivalRowInputs, SurvivalRowVghChannels};
+    use super::{SurvivalRowInputs, SurvivalRowVghChannels, survival_rowjet_source};
     use gam_gpu::gpu_error::{GpuError, GpuResultExt};
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -99,7 +128,7 @@ mod device {
         }
         // The shared compiler pins the real device architecture and disables
         // FMA contraction for close parity with separately rounded host ops.
-        let ptx = gam_gpu::device_cache::compile_ptx_arch(SURVIVAL_ROWJET_SOURCE)
+        let ptx = gam_gpu::device_cache::compile_ptx_arch(survival_rowjet_source())
             .gpu_ctx_with(|error| format!("survival_rowjet NVRTC compile: {error}"))?;
         let module = backend
             .ctx
@@ -467,22 +496,25 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn cuda_source_exports_only_the_production_vgh_kernel() {
-        assert!(SURVIVAL_ROWJET_SOURCE.contains("survival_rowjet_vgh"));
+        let source = survival_rowjet_source();
+        assert_eq!(SURVIVAL_ROWJET_TEMPLATE.matches(ROW_PROGRAM_MARKER).count(), 1);
+        assert!(!SURVIVAL_ROWJET_TEMPLATE.contains("J2 nll_j2"));
+        assert!(RIGID_ROW_PROGRAM_CUDA_J2.contains("J2 rigid_row_program"));
+        assert!(source.contains("survival_rowjet_vgh"));
         assert_eq!(
-            SURVIVAL_ROWJET_SOURCE
-                .matches("extern \"C\" __global__")
-                .count(),
+            source.matches("extern \"C\" __global__").count(),
             1,
         );
         for removed in [
             "survival_rowjet_no_t4",
             "struct JS1",
             "struct JS2",
+            "nll_j2",
             "nll_js1",
             "nll_js2",
         ] {
             assert!(
-                !SURVIVAL_ROWJET_SOURCE.contains(removed),
+                !source.contains(removed),
                 "dead CUDA surface reintroduced: {removed}",
             );
         }
