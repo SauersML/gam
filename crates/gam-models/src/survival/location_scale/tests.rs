@@ -57,18 +57,21 @@ fn survival_ls_positive_log_stack(value: f64) -> [f64; 5] {
 
 impl SurvivalExactRowKernel {
     #[inline]
-    fn location_scale_nll_tower(
+    fn location_scale_nll<S: gam_math::jet_scalar::JetScalar<2>>(
         self,
         row: SurvivalLsLocationScaleRow,
-    ) -> gam_math::jet_tower::Tower4<2> {
-        use gam_math::jet_tower::Tower4;
-
-        let eta_location = Tower4::<2>::variable(row.eta_location, 0);
-        let eta_logscale = Tower4::<2>::variable(row.eta_logscale, 1);
-        let inv_sigma = (-eta_logscale).exp();
-        let q_entry = (Tower4::<2>::constant(row.entry_index) - eta_location) * inv_sigma;
-        let q_exit = (Tower4::<2>::constant(row.exit_index) - eta_location) * inv_sigma;
-        let g = Tower4::<2>::constant(row.exit_index_derivative) * inv_sigma;
+        p: &[S; 2],
+    ) -> S {
+        let eta_location = p[0];
+        let eta_logscale = p[1];
+        let inv_sigma = eta_logscale.neg().exp();
+        let q_entry = S::constant(row.entry_index)
+            .sub(&eta_location)
+            .mul(&inv_sigma);
+        let q_exit = S::constant(row.exit_index)
+            .sub(&eta_location)
+            .mul(&inv_sigma);
+        let g = S::constant(row.exit_index_derivative).mul(&inv_sigma);
 
         let mut nll = q_entry
             .compose_unary([self.log_s0, -self.r0, -self.dr0, -self.ddr0, -self.dddr0])
@@ -76,16 +79,18 @@ impl SurvivalExactRowKernel {
 
         let censored_weight = row.weight * (1.0 - row.event);
         if censored_weight != 0.0 {
-            nll = nll
-                + q_exit
+            nll = nll.add(
+                &q_exit
                     .compose_unary([self.log_s1, -self.r1, -self.dr1, -self.ddr1, -self.dddr1])
-                    .scale(-censored_weight);
+                    .scale(-censored_weight),
+            );
         }
 
         let event_weight = row.weight * row.event;
         if event_weight != 0.0 {
             nll = nll
-                + q_exit
+                .add(
+                    &q_exit
                     .compose_unary([
                         self.logphi1,
                         self.dlogphi1,
@@ -93,22 +98,25 @@ impl SurvivalExactRowKernel {
                         self.d3logphi1,
                         self.d4logphi1,
                     ])
-                    .scale(-event_weight)
-                + g.compose_unary([
-                    self.log_g,
-                    self.d_log_g,
-                    self.d2_log_g,
-                    self.d3_log_g,
-                    self.d4_log_g,
-                ])
-                .scale(-event_weight);
+                    .scale(-event_weight),
+                )
+                .add(
+                    &g.compose_unary([
+                        self.log_g,
+                        self.d_log_g,
+                        self.d2_log_g,
+                        self.d3_log_g,
+                        self.d4_log_g,
+                    ])
+                    .scale(-event_weight),
+                );
         }
 
         nll
     }
 }
 
-impl gam_math::jet_tower::RowNllProgram<2> for SurvivalLsLocationScaleNllProgram<'_> {
+impl gam_math::jet_tower::RowProgram<2> for SurvivalLsLocationScaleNllProgram<'_> {
     fn n_rows(&self) -> usize {
         1
     }
@@ -120,26 +128,24 @@ impl gam_math::jet_tower::RowNllProgram<2> for SurvivalLsLocationScaleNllProgram
         Ok([self.row.eta_location, self.row.eta_logscale])
     }
 
-    fn row_nll(
+    fn eval<S: gam_math::jet_scalar::JetScalar<2>>(
         &self,
         row: usize,
-        p: &[gam_math::jet_tower::Tower4<2>; 2],
-    ) -> Result<gam_math::jet_tower::Tower4<2>, String> {
-        use gam_math::jet_tower::Tower4;
-
+        p: &[S; 2],
+    ) -> Result<S, String> {
         if row != 0 {
             return Err("survival LS location-scale jet row out of range".to_string());
         }
         if self.row.weight <= 0.0 {
-            return Ok(Tower4::<2>::zero());
+            return Ok(S::constant(0.0));
         }
 
         let eta_location = p[0];
         let eta_logscale = p[1];
-        let inv_sigma = (-eta_logscale).exp();
-        let q_entry = (self.row.entry_index - eta_location.v) * inv_sigma.v;
-        let q_exit = (self.row.exit_index - eta_location.v) * inv_sigma.v;
-        let g = self.row.exit_index_derivative * inv_sigma.v;
+        let inv_sigma = eta_logscale.neg().exp();
+        let q_entry = (self.row.entry_index - eta_location.value()) * inv_sigma.value();
+        let q_exit = (self.row.exit_index - eta_location.value()) * inv_sigma.value();
+        let g = self.row.exit_index_derivative * inv_sigma.value();
 
         let stack_entry = survival_ls_log_survival_stack(self.inverse_link, q_entry)?;
         let mut kernel = SurvivalExactRowKernel {
@@ -194,7 +200,7 @@ impl gam_math::jet_tower::RowNllProgram<2> for SurvivalLsLocationScaleNllProgram
             kernel.d4_log_g = stack_g[4];
         }
 
-        Ok(kernel.location_scale_nll_tower(self.row))
+        Ok(kernel.location_scale_nll(self.row, p))
     }
 }
 
@@ -954,7 +960,7 @@ fn hand_survival_ls_kernel_channels(
 
 #[test]
 fn survival_ls_location_scale_jet_program_matches_exact_row_kernel_all_channels() {
-    use gam_math::jet_tower::{evaluate_program, verify_kernel_channels};
+    use gam_math::jet_tower::{program_full_tower, verify_kernel_channels};
 
     let dirs = [[0.7, -1.1], [-0.4, 0.9], [1.3, 0.25]];
     let rows = vec![
@@ -976,7 +982,7 @@ fn survival_ls_location_scale_jet_program_matches_exact_row_kernel_all_channels(
                 deriv_log_scale: 0.0,
                 row: row_data,
             };
-            let tower = evaluate_program(&program, 0).expect("survival LS tower");
+            let tower = program_full_tower(&program, 0).expect("survival LS tower");
             let witness = hand_survival_ls_channels(&inverse_link, row_data);
             let exact_kernel = survival_ls_exact_row_kernel(&inverse_link, row_data);
             let exact_value = -exact_kernel.log_likelihood();
@@ -989,10 +995,16 @@ fn survival_ls_location_scale_jet_program_matches_exact_row_kernel_all_channels(
             let claims = hand_survival_ls_kernel_channels(&witness, &dirs);
             verify_kernel_channels(&tower, &claims, 1e-12).unwrap_or_else(|err| {
                     panic!(
-                        "survival LS K=2 RowNllProgram mismatch against hand witness for {distribution:?} row {row_index}: {err}"
+                        "survival LS K=2 RowProgram mismatch against hand witness for {distribution:?} row {row_index}: {err}"
                     )
                 });
-            let production_tower = exact_kernel.location_scale_nll_tower(row_data);
+            let vars: [gam_math::jet_tower::Tower4<2>; 2] = std::array::from_fn(|axis| {
+                gam_math::jet_tower::Tower4::variable(
+                    [row_data.eta_location, row_data.eta_logscale][axis],
+                    axis,
+                )
+            });
+            let production_tower = exact_kernel.location_scale_nll(row_data, &vars);
             // The production kernel pre-evaluates its primitive stacks in a
             // different association order than the program path; observed
             // margin is ~1.3e-12 on fourth-order channels, so 5e-12 bounds
@@ -1007,12 +1019,12 @@ fn survival_ls_location_scale_jet_program_matches_exact_row_kernel_all_channels(
 }
 
 /// #932 (survival follow-up, the issue's named next step): the survival
-/// location-scale JOINT row NLL written ONCE over `Tower4<9>` in the
+/// location-scale JOINT row NLL written ONCE over generic jet scalars in the
 /// production kernel's nine linear-predictor primaries
 /// `(h0, h1, d_raw, eta_t_exit, eta_t_entry, eta_t_deriv, eta_ls_exit,
 /// eta_ls_entry, eta_ls_deriv)` — the exact `SLS_ROW_K` channel layout of
 /// [`SurvivalLsRowKernel`]. The whole nonlinear composition that the
-/// production path hand-writes is expressed here as plain `Tower4`
+/// production path hand-writes is expressed here as generic `JetScalar`
 /// arithmetic:
 ///
 /// ```text
@@ -1038,7 +1050,7 @@ struct SurvivalLsJointNllProgram<'a> {
     weight: Vec<f64>,
 }
 
-impl gam_math::jet_tower::RowNllProgram<SLS_ROW_K> for SurvivalLsJointNllProgram<'_> {
+impl gam_math::jet_tower::RowProgram<SLS_ROW_K> for SurvivalLsJointNllProgram<'_> {
     fn n_rows(&self) -> usize {
         self.primaries.len()
     }
@@ -1050,54 +1062,61 @@ impl gam_math::jet_tower::RowNllProgram<SLS_ROW_K> for SurvivalLsJointNllProgram
             .ok_or_else(|| format!("survival LS joint program: row {row} out of range"))
     }
 
-    fn row_nll(
+    fn eval<S: gam_math::jet_scalar::JetScalar<SLS_ROW_K>>(
         &self,
         row: usize,
-        p: &[gam_math::jet_tower::Tower4<SLS_ROW_K>; SLS_ROW_K],
-    ) -> Result<gam_math::jet_tower::Tower4<SLS_ROW_K>, String> {
-        use gam_math::jet_tower::Tower4;
-
+        p: &[S; SLS_ROW_K],
+    ) -> Result<S, String> {
         let w = *self
             .weight
             .get(row)
             .ok_or_else(|| format!("survival LS joint program: weight row {row} missing"))?;
         let d = self.event[row];
         if w <= 0.0 {
-            return Ok(Tower4::<SLS_ROW_K>::zero());
+            return Ok(S::constant(0.0));
         }
 
         // Entry index: u0 = h0 + q0, q0 = −eta_t_entry · exp(−eta_ls_entry).
-        let inv_sigma_entry = (-p[7]).exp();
-        let u0 = p[0] - p[4] * inv_sigma_entry;
+        let inv_sigma_entry = p[7].neg().exp();
+        let u0 = p[0].sub(&p[4].mul(&inv_sigma_entry));
         // Exit index: u1 = h1 + q1, q1 = −eta_t_exit · exp(−eta_ls_exit).
-        let inv_sigma_exit = (-p[6]).exp();
-        let u1 = p[1] - p[3] * inv_sigma_exit;
+        let inv_sigma_exit = p[6].neg().exp();
+        let u1 = p[1].sub(&p[3].mul(&inv_sigma_exit));
         // Event Jacobian: g = d_raw + qdot,
         // qdot = exp(−eta_ls_exit)·(eta_t_exit·eta_ls_deriv − eta_t_deriv).
-        let g = p[2] + inv_sigma_exit * (p[3] * p[8] - p[5]);
+        let g = p[2].add(&inv_sigma_exit.mul(&p[3].mul(&p[8]).sub(&p[5])));
 
         // NLL = w·log S(u0) − w(1−d)·log S(u1) − w·d·(log f(u1) + log g),
         // term-for-term the sign layout of `SurvivalExactRowKernel::
         // log_likelihood` / `nll_index_tower` (left truncation divides the
         // likelihood by S(u0), so its log ADDS to the NLL).
         let mut nll = u0
-            .compose_unary(survival_ls_log_survival_stack(self.inverse_link, u0.v)?)
+            .compose_unary(survival_ls_log_survival_stack(self.inverse_link, u0.value())?)
             .scale(w);
 
         let censored_weight = w * (1.0 - d);
         if censored_weight != 0.0 {
-            nll = nll
-                + u1.compose_unary(survival_ls_log_survival_stack(self.inverse_link, u1.v)?)
-                    .scale(-censored_weight);
+            nll = nll.add(
+                &u1.compose_unary(survival_ls_log_survival_stack(self.inverse_link, u1.value())?)
+                    .scale(-censored_weight),
+            );
         }
 
         let event_weight = w * d;
         if event_weight != 0.0 {
             nll = nll
-                + u1.compose_unary(survival_ls_log_pdf_stack(self.inverse_link, u1.v, 0.0)?)
-                    .scale(-event_weight)
-                + g.compose_unary(survival_ls_positive_log_stack(g.v))
-                    .scale(-event_weight);
+                .add(
+                    &u1.compose_unary(survival_ls_log_pdf_stack(
+                        self.inverse_link,
+                        u1.value(),
+                        0.0,
+                    )?)
+                    .scale(-event_weight),
+                )
+                .add(
+                    &g.compose_unary(survival_ls_positive_log_stack(g.value()))
+                        .scale(-event_weight),
+                );
         }
 
         Ok(nll)
@@ -1187,7 +1206,7 @@ fn survival_ls_joint_oracle_states(primaries: &[[f64; SLS_ROW_K]]) -> Vec<Parame
 ///
 /// Audits every channel the hand-written [`SurvivalLsRowKernel`] emits —
 /// value / gradient / Hessian / `row_third_contracted(dir)` — against the
-/// single-expression `RowNllProgram<9>` tower truth, for every residual
+/// single-expression `RowProgram<9>` tower truth, for every residual
 /// distribution the family enumerates (Gaussian/probit, Gumbel/CLogLog =
 /// Weibull-AFT, Logistic/logit = log-logistic-AFT), over a fixture grid
 /// covering exact deaths, right-censored rows, a fractional event weight,
@@ -1218,7 +1237,7 @@ fn survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels() {
 
 fn survival_ls_joint_jet_tower_oracle_body() {
     use crate::row_kernel::RowKernel;
-    use gam_math::jet_tower::{KernelChannels, evaluate_program, verify_kernel_channels};
+    use gam_math::jet_tower::{KernelChannels, program_full_tower, verify_kernel_channels};
 
     // Channel layout per row:
     // [h0, h1, d_raw, eta_t_exit, eta_t_entry, eta_t_deriv,
@@ -1305,7 +1324,7 @@ fn survival_ls_joint_jet_tower_oracle_body() {
                      guard so no clamping perturbs the comparison (g={g_prog})"
             );
 
-            let tower = evaluate_program(&program, row).expect("survival LS joint tower");
+            let tower = program_full_tower(&program, row).expect("survival LS joint tower");
 
             let (value, gradient, hessian) =
                 RowKernel::row_kernel(&kernel, row).expect("hand kernel value/grad/hess");
@@ -1379,7 +1398,7 @@ fn survival_ls_packed_directional_matches_dense_tower_932() {
 
 fn survival_ls_packed_directional_matches_dense_tower_body() {
     use crate::row_kernel::RowKernel;
-    use gam_math::jet_tower::evaluate_program;
+    use gam_math::jet_tower::program_full_tower;
 
     let primaries: Vec<[f64; SLS_ROW_K]> = vec![
         [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
@@ -1417,8 +1436,8 @@ fn survival_ls_packed_directional_matches_dense_tower_body() {
             offsets: family.joint_block_offsets(),
         };
         // INDEPENDENT dense ground truth: the `SurvivalLsJointNllProgram`
-        // `RowNllProgram<9>` (the same one the all-channels oracle uses) — a
-        // separate Tower4<9> implementation of the row NLL, NOT the production
+        // `RowProgram<9>` (the same one the all-channels oracle uses) — an
+        // independent generic implementation of the row NLL, NOT the production
         // `sls_row_nll`. Comparing the packed production contractions against
         // THIS independent tower (rather than `sls_row_nll` at `Tower4`) keeps
         // the oracle's truth genuinely independent of the code under test.
@@ -1433,7 +1452,7 @@ fn survival_ls_packed_directional_matches_dense_tower_body() {
             // Dense ground truth: build the full Tower4<9> once and contract its
             // t3 / t4 channels. The production methods must reproduce these
             // exactly through the packed OneSeed / TwoSeed scalars.
-            let tower = evaluate_program(&program, row).expect("dense row tower");
+            let tower = program_full_tower(&program, row).expect("dense row tower");
             for u in &dirs {
                 let dense_third = tower.third_contracted(u);
                 let packed_third =
@@ -1511,7 +1530,7 @@ fn survival_ls_packed_directional_matches_dense_tower_high_curvature_932() {
 
 fn survival_ls_packed_directional_high_curvature_body() {
     use crate::row_kernel::RowKernel;
-    use gam_math::jet_tower::evaluate_program;
+    use gam_math::jet_tower::program_full_tower;
 
     // Channel layout (matches `SurvivalLsJointNllProgram::row_nll`):
     //   [0]=t_entry [1]=t_exit [2]=t_deriv [3]=thr_exit [4]=thr_entry
@@ -1608,7 +1627,7 @@ fn survival_ls_packed_directional_high_curvature_body() {
         let rel_tol = 1e-8_f64;
 
         for row in 0..n {
-            let tower = evaluate_program(&program, row).expect("dense row tower (high curvature)");
+            let tower = program_full_tower(&program, row).expect("dense row tower (high curvature)");
             for u in &dirs {
                 let dense_third = tower.third_contracted(u);
                 let packed_third =
@@ -1651,7 +1670,7 @@ fn survival_ls_packed_directional_high_curvature_body() {
         let trip_row = 3usize; // tiny-g, deep-tail event row
         let du = &dirs[0];
         let dv = &dirs[1];
-        let dense_fourth = evaluate_program(&program, trip_row)
+        let dense_fourth = program_full_tower(&program, trip_row)
             .expect("trip tower")
             .fourth_contracted(du, dv);
         let packed_fourth = RowKernel::row_fourth_contracted(&kernel, trip_row, du, dv)
