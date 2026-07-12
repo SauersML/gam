@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(target_os = "linux")]
 fn close(got: f64, expected: f64, rel: f64) {
     let scale = expected.abs().max(1.0);
     assert!(
@@ -144,6 +145,29 @@ fn gamma_balanced_products_and_near_saturation_deviance_are_representable() {
     assert!(row.w_hessian.is_finite() && row.w_hessian > 0.0);
     assert!(row.deviance.is_finite() && row.deviance >= 0.0);
     assert_eq!(row.w_solver, row.w_hessian);
+}
+
+#[test]
+fn gamma_fisher_does_not_materialize_an_unused_overflowing_observed_weight() {
+    let input = RowInput {
+        eta: 0.0,
+        y: 1.126,
+        prior_weight: 8.0e307,
+    };
+    let fisher = row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Fisher, input, 2.0)
+        .expect("Fisher score and deviance remain representable");
+    assert!(fisher.w_fisher.is_finite());
+    assert!(fisher.grad_eta.is_finite());
+    assert!(fisher.deviance.is_finite());
+    assert!(
+        row_reweight_cpu(
+            PirlsRowFamily::GammaLog,
+            CurvatureMode::Observed,
+            input,
+            2.0,
+        )
+        .is_err()
+    );
 }
 
 #[test]

@@ -183,7 +183,7 @@ pub(crate) fn sigma_cubature_dispatch(
                 return Err(error);
             }
             Err(crate::gpu_kernels::sigma_cubature::SigmaCubatureGpuError::Runtime(error)) => {
-                return Err(EstimationError::InvalidInput(format!(
+                return Err(EstimationError::RemlOptimizationFailed(format!(
                     "sigma-cubature admitted GPU runtime failure: {error}"
                 )));
             }
@@ -327,7 +327,7 @@ pub(crate) fn sigma_cubature_evaluate_cpu_rayon(
             let h_point = map_hessian_to_original_basis(fit_point.as_ref())?;
             let cov_point = matrix_inversewith_regularization(&h_point, "auto cubature point")
                 .ok_or_else(|| {
-                    EstimationError::InvalidInput(format!(
+                    EstimationError::RemlOptimizationFailed(format!(
                         "sigma point {idx}: Hessian inverse is not representable"
                     ))
                 })?;

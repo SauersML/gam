@@ -26,9 +26,9 @@
 //!   asymmetric `X_iᵀ W X_j` path inside `BlockDesignOperator::cross_block`,
 //!   where `c · X v` is genuinely signed).
 //!
-//! The two newtypes are zero-cost: `repr(transparent)` over `ArrayView1<'_,
-//! f64>`, with `into_view()` / `as_slice()` / `len()` projections so kernel
-//! bodies still see the underlying array view.
+//! The view newtypes are zero-cost: `repr(transparent)` over `ArrayView1<'_,
+//! f64>`, with narrow projections so kernel bodies still see the underlying
+//! array view.
 
 use ndarray::{Array1, ArrayView1};
 use std::ops::Deref;
@@ -352,6 +352,15 @@ mod tests {
     }
 
     #[test]
+    fn psd_try_new_rejects_positive_infinity() {
+        let a = array![1.0_f64, f64::INFINITY];
+        let err = PsdWeightsView::try_new(a.view())
+            .err()
+            .expect("infinite PSD weight must be rejected");
+        assert!(err.contains("row 1"), "unexpected diagnostic: {err}");
+    }
+
+    #[test]
     fn psd_try_from_array_round_trips() {
         let a = array![3.0_f64, 4.0];
         let psd = PsdWeightsView::try_from_array(&a).unwrap();
@@ -383,3 +392,19 @@ mod tests {
         assert_eq!((*w)[1], 20.0);
     }
 }
+    #[test]
+    fn finite_signed_view_preserves_negative_and_signed_zero() {
+        let a = array![-3.5_f64, -0.0, 2.0];
+        let weights = FiniteSignedWeightsView::try_from_array(&a).unwrap();
+        assert_eq!(weights.view()[0].to_bits(), (-3.5_f64).to_bits());
+        assert_eq!(weights.view()[1].to_bits(), (-0.0_f64).to_bits());
+    }
+
+    #[test]
+    fn finite_signed_view_reports_smallest_nonfinite_row() {
+        let a = array![1.0_f64, f64::NAN, f64::INFINITY];
+        let err = FiniteSignedWeightsView::try_from_array(&a)
+            .err()
+            .expect("non-finite weights must fail certification");
+        assert!(err.contains("row 1"), "unexpected diagnostic: {err}");
+    }

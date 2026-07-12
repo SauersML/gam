@@ -3341,7 +3341,7 @@ extern "C" __global__ void status_first_ladder(
         n: usize,
         label: &'static str,
     ) -> Result<(), PirlsGpuLoopError> {
-        let Some((row, code)) =
+        let Some((_row, _code)) =
             reduce_status_first(stream, status_first_func, status, n, status_scratch, label)?
         else {
             return Ok(());
@@ -3355,16 +3355,19 @@ extern "C" __global__ void status_first_ladder(
         let prior_host = stream
             .clone_dtoh(prior_weight)
             .map_err(|error| format!("{label} refusal prior-weight download: {error}"))?;
-        Err(replay_row_refusal(
+        let status_host = stream
+            .clone_dtoh(status)
+            .map_err(|error| format!("{label} refusal status download: {error}"))?;
+        crate::gpu_kernels::pirls_row::replay_first_refusal(
             family,
             curvature,
             gamma_shape,
-            row,
-            code,
-            eta_host[row],
-            y_host[row],
-            prior_host[row],
-        ))
+            &eta_host,
+            &y_host,
+            &prior_host,
+            &status_host,
+        )
+        .map_err(PirlsGpuLoopError::Geometry)
     }
 
     fn download_vec(

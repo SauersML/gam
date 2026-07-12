@@ -572,18 +572,20 @@ fn row_gamma_log(
     if !(w_fisher.is_finite() && w_fisher > 0.0) {
         return Err(row_error(row, "Gamma Fisher weight", input.eta, w_fisher));
     }
-    let weighted_ratio = positive_mul_div(w_fisher, input.y, mu);
-    if !(weighted_ratio.is_finite() && weighted_ratio > 0.0) {
-        return Err(row_error(
-            row,
-            "Gamma weighted mean ratio",
-            input.eta,
-            weighted_ratio,
-        ));
-    }
     let w_hessian = match mode {
         CurvatureMode::Fisher => w_fisher,
-        CurvatureMode::Observed => weighted_ratio,
+        CurvatureMode::Observed => {
+            let weighted_ratio = positive_mul_div(w_fisher, input.y, mu);
+            if !(weighted_ratio.is_finite() && weighted_ratio > 0.0) {
+                return Err(row_error(
+                    row,
+                    "Gamma observed Hessian weight",
+                    input.eta,
+                    weighted_ratio,
+                ));
+            }
+            weighted_ratio
+        }
     };
     if !w_hessian.is_finite() {
         return Err(row_error(
@@ -593,12 +595,15 @@ fn row_gamma_log(
             w_hessian,
         ));
     }
-    let grad_eta = weighted_ratio - w_fisher;
     let u = (input.y - mu) / mu;
-    let dev_base = if u.abs() <= 0.125 {
-        w_fisher * gamma_unit_deviance_near_one(u)
+    let (grad_eta, dev_base) = if u.is_finite() {
+        (w_fisher * u, w_fisher * gamma_unit_deviance_near_one(u))
     } else {
-        weighted_ratio - w_fisher * (1.0 + input.y.ln() - input.eta)
+        let weighted_ratio = positive_mul_div(w_fisher, input.y, mu);
+        (
+            weighted_ratio - w_fisher,
+            weighted_ratio - w_fisher * (1.0 + input.y.ln() - input.eta),
+        )
     };
     let dev = 2.0 * dev_base;
     certify_output(
@@ -1559,8 +1564,8 @@ pub fn launch_solve_row_on_stream(
 /// selects the alpha slot, `bx % n_blocks` selects the row tile.
 ///
 /// Caller must call [`AlphaLadderDevBuffers::zero`] before each launch, then
-/// issue a single `memcpy_dtoh` to read back `[f64; ALPHA_LADDER_LEN]` and
-/// `[u32; ALPHA_LADDER_LEN]` to pick the accepted step.
+/// reduce the alpha-major status matrix with the deterministic smallest-row
+/// reducer, then read the seven objectives plus seven row/code summaries.
 #[cfg(target_os = "linux")]
 pub fn launch_alpha_ladder_on_stream(
     backend: &PirlsRowBackend,
@@ -1930,22 +1935,27 @@ fn gamma_log_body(curvature: CurvatureMode) -> String {
         w_fisher = wp * shape;
         if (!(isfinite(w_fisher) && w_fisher > 0.0))
             pirls_refuse(&status, PIRLS_FISHER_WEIGHT);
-        double weighted_ratio = positive_mul_div(w_fisher, y_i, mu);
-        if (!(isfinite(weighted_ratio) && weighted_ratio > 0.0))
-            pirls_refuse(&status, PIRLS_GRADIENT);
 #ifdef PIRLS_CURVATURE_OBSERVED
-        w_hessian = weighted_ratio;
+        double weighted_ratio_observed = positive_mul_div(w_fisher, y_i, mu);
+        if (!(isfinite(weighted_ratio_observed) && weighted_ratio_observed > 0.0))
+            pirls_refuse(&status, PIRLS_OBSERVED_WEIGHT);
+        w_hessian = weighted_ratio_observed;
 #else
         w_hessian = w_fisher;
 #endif
         if (!isfinite(w_hessian)) pirls_refuse(&status, PIRLS_OBSERVED_WEIGHT);
         w_solver = w_hessian;
-        grad_eta = weighted_ratio - w_fisher;
-        if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
         double u = (y_i - mu) / mu;
-        double dev_base = fabs(u) <= 0.125
-            ? w_fisher * gamma_unit_deviance_near_one(u)
-            : weighted_ratio - w_fisher * (1.0 + log(y_i) - eta_i);
+        double dev_base;
+        if (isfinite(u)) {{
+            grad_eta = w_fisher * u;
+            dev_base = w_fisher * gamma_unit_deviance_near_one(u);
+        }} else {{
+            double weighted_ratio = positive_mul_div(w_fisher, y_i, mu);
+            grad_eta = weighted_ratio - w_fisher;
+            dev_base = weighted_ratio - w_fisher * (1.0 + log(y_i) - eta_i);
+        }}
+        if (!isfinite(grad_eta)) pirls_refuse(&status, PIRLS_GRADIENT);
         dev = 2.0 * dev_base;
         if (!isfinite(dev)) pirls_refuse(&status, PIRLS_DEVIANCE);
     }}

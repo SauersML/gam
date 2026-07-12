@@ -1,5 +1,7 @@
 use gam_linalg::faer_ndarray::{FaerSvd, fast_ab};
-use gam_linalg::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
+use gam_linalg::matrix::{
+    DenseDesignMatrix, DenseDesignOperator, DesignMatrix, FiniteSignedWeightsView, LinearOperator,
+};
 use ndarray::{Array1, Array2, ArrayViewMut2, s};
 use std::ops::Range;
 use std::sync::Arc;
@@ -369,6 +371,8 @@ impl LinearOperator for ScaleDeviationOperator {
             ))
             .to_string());
         }
+        FiniteSignedWeightsView::try_from_array(weights)
+            .map_err(|reason| format!("scale deviation operator XtWX: {reason}"))?;
         let n = self.nrows();
         let p = self.ncols();
         let mut out = Array2::<f64>::zeros((p, p));
@@ -376,7 +380,7 @@ impl LinearOperator for ScaleDeviationOperator {
             let end = (start + self.chunk_rows).min(n);
             let chunk = self.row_chunk(start..end).map_err(|e| e.to_string())?;
             for local in 0..chunk.nrows() {
-                let w = weights[start + local].max(0.0);
+                let w = weights[start + local];
                 if w == 0.0 {
                     continue;
                 }

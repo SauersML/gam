@@ -264,13 +264,7 @@ impl LinearOperator for TensorProductDesignOperator {
     }
 
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
-        if weights.len() != self.n {
-            return Err(format!(
-                "TensorProductDesignOperator::diag_xtw_x: weights length {} != n {}",
-                weights.len(),
-                self.n
-            ));
-        }
+        certify_signed_weights("TensorProductDesignOperator::diag_xtw_x", weights, self.n)?;
         let d = self.marginals.len();
         if d == 0 {
             return Ok(Array2::zeros((0, 0)));
@@ -307,7 +301,7 @@ impl LinearOperator for TensorProductDesignOperator {
         // reductions do not depend on worker scheduling.
         let tail_d = tail_dims.len();
         let pair_count = tail_total * (tail_total + 1) / 2;
-        let blocks: Vec<(usize, usize, Array2<f64>)> = (0..pair_count)
+        let blocks: Result<Vec<(usize, usize, Array2<f64>)>, String> = (0..pair_count)
             .into_par_iter()
             .map(|pair_idx| {
                 let (a_flat, b_flat) = upper_triangle_pair_from_index(pair_idx, tail_total);
@@ -318,7 +312,7 @@ impl LinearOperator for TensorProductDesignOperator {
 
                 let mut gamma = Array1::<f64>::zeros(n);
                 for i in 0..n {
-                    let mut prod = weights[i].max(0.0);
+                    let mut prod = weights[i];
                     if prod != 0.0 {
                         for dim_idx in 0..tail_d {
                             let m = &self.marginals[dim_idx + 1];
@@ -331,6 +325,12 @@ impl LinearOperator for TensorProductDesignOperator {
                     gamma[i] = prod;
                 }
 
+                FiniteSignedWeightsView::try_from_array(&gamma).map_err(|reason| {
+                    format!(
+                        "TensorProductDesignOperator::diag_xtw_x derived tail-pair ({a_flat}, {b_flat}): {reason}"
+                    )
+                })?;
+
                 let mut block = Array2::<f64>::zeros((q0, q0));
                 stream_weighted_crossprod_into(
                     b0.as_ref(),
@@ -340,11 +340,11 @@ impl LinearOperator for TensorProductDesignOperator {
                     CrossprodAccum::Replace,
                     effective_global_parallelism(),
                 );
-                (a_flat, b_flat, block)
+                Ok((a_flat, b_flat, block))
             })
             .collect();
 
-        for (a_flat, b_flat, block) in blocks {
+        for (a_flat, b_flat, block) in blocks? {
             // Scatter block into the full xtwx.
             // Global column for (j₁, tail_flat) = j₁ * tail_total + tail_flat.
             for a1 in 0..q0 {
@@ -364,13 +364,7 @@ impl LinearOperator for TensorProductDesignOperator {
     }
 
     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
-        if weights.len() != self.n {
-            return Err(format!(
-                "TensorProductDesignOperator::diag_gram: weights length {} != n {}",
-                weights.len(),
-                self.n
-            ));
-        }
+        certify_signed_weights("TensorProductDesignOperator::diag_gram", weights, self.n)?;
         // diag(X'WX)[j] = Σ_i w[i] · x_{ij}²
         // For tensor product: x_{i, j₁·tail+j_tail} = B₁[i,j₁] · ∏_{d>1} Bᵈ[i,jᵈ]
         // So: diag[j] = Σ_i w[i] · B₁[i,j₁]² · ∏_{d>1} Bᵈ[i,jᵈ]²
@@ -389,7 +383,7 @@ impl LinearOperator for TensorProductDesignOperator {
         for t_flat in 0..tail_total {
             decode_multi_index(t_flat, &tail_dims, &mut tail_indices);
             for i in 0..self.n {
-                let wi = weights[i].max(0.0);
+                let wi = weights[i];
                 if wi == 0.0 {
                     continue;
                 }
@@ -639,13 +633,7 @@ impl LinearOperator for RowwiseKroneckerOperator {
         let p_cov = self.p_cov;
         let p_time = self.p_time;
         let p_total = p_cov * p_time;
-        if weights.len() != n {
-            return Err(format!(
-                "RowwiseKroneckerOperator::diag_xtw_x: weights length {} != n {}",
-                weights.len(),
-                n
-            ));
-        }
+        certify_signed_weights("RowwiseKroneckerOperator::diag_xtw_x", weights, n)?;
         let mut xtwx = Array2::<f64>::zeros((p_total, p_total));
         let time = self.time_basis.as_ref();
 
@@ -666,7 +654,7 @@ impl LinearOperator for RowwiseKroneckerOperator {
                     .and(weights)
                     .and(&time_t1)
                     .and(&time_t2)
-                    .for_each(|g, &w, &a, &b| *g = w.max(0.0) * a * b);
+                    .for_each(|g, &w, &a, &b| *g = w * a * b);
                 self.cov
                     .xt_diag_x_signed_op(SignedWeightsView::from_array(&gamma))
                     .map(|block| (t1, t2, block))
@@ -690,13 +678,7 @@ impl LinearOperator for RowwiseKroneckerOperator {
         let n = self.n;
         let p_cov = self.p_cov;
         let p_time = self.p_time;
-        if weights.len() != n {
-            return Err(format!(
-                "RowwiseKroneckerOperator::diag_gram: weights {} != n {}",
-                weights.len(),
-                n
-            ));
-        }
+        certify_signed_weights("RowwiseKroneckerOperator::diag_gram", weights, n)?;
         let time = self.time_basis.as_ref();
         // diag(X'WX)[j*pt+t] = Σᵢ w[i] * cov[i,j]² * time[i,t]²
         // Use cov.diag_gram(w ⊙ time[:,t]²) which stays sparse-native.
@@ -707,7 +689,7 @@ impl LinearOperator for RowwiseKroneckerOperator {
             ndarray::Zip::from(&mut gamma)
                 .and(weights)
                 .and(&time_col)
-                .par_for_each(|g, &w, &tt| *g = w.max(0.0) * tt * tt);
+                .par_for_each(|g, &w, &tt| *g = w * tt * tt);
             let cov_diag = <DesignMatrix as LinearOperator>::diag_gram(&self.cov, &gamma)?;
             for j in 0..p_cov {
                 out[j * p_time + t] = cov_diag[j];

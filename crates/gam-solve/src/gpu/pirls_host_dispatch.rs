@@ -138,7 +138,11 @@ where
                     linear_constraints: linear_constraints.clone(),
                 };
                 if let Some(result) = try_gpu_gaussian_pls_dispatch(gpu_input) {
-                    return Some(result.map_err(EstimationError::InvalidInput));
+                    return Some(result.map_err(|message| {
+                        EstimationError::RemlOptimizationFailed(format!(
+                            "GPU Gaussian PLS runtime: {message}"
+                        ))
+                    }));
                 }
             }
         }

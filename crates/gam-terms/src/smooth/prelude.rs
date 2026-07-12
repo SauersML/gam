@@ -23,8 +23,8 @@ use gam_problem::EstimationError;
 use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
 
 use gam_linalg::matrix::{
-    BlockDesignOperator, DenseDesignOperator, DesignBlock, DesignMatrix, LinearOperator,
-    TensorProductDesignOperator,
+    BlockDesignOperator, DenseDesignOperator, DesignBlock, DesignMatrix, FiniteSignedWeightsView,
+    LinearOperator, TensorProductDesignOperator,
 };
 
 use gam_problem::LinearInequalityConstraints;

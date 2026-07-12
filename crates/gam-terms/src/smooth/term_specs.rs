@@ -6682,6 +6682,8 @@ impl LinearOperator for PcaScoresMemmapDesignOperator {
                 self.nrows
             ));
         }
+        FiniteSignedWeightsView::try_from_array(weights)
+            .map_err(|reason| format!("lazy Pca diag_xtw_x: {reason}"))?;
         let mut gram = Array2::<f64>::zeros((self.ncols, self.ncols));
         for start in (0..self.nrows).step_by(self.chunk_rows()) {
             let end = (start + self.chunk_rows()).min(self.nrows);
@@ -6711,7 +6713,7 @@ impl LinearOperator for PcaScoresMemmapDesignOperator {
 
     fn apply_weighted_normal(
         &self,
-        weights: &Array1<f64>,
+        weights: FiniteSignedWeightsView<'_>,
         vector: &Array1<f64>,
         penalty: Option<&Array2<f64>>,
         ridge: f64,
@@ -6726,11 +6728,12 @@ impl LinearOperator for PcaScoresMemmapDesignOperator {
             self.ncols,
             "lazy Pca weighted-normal vector mismatch"
         );
+        let weights = weights.view();
         let mut out = Array1::<f64>::zeros(self.ncols);
         for start in (0..self.nrows).step_by(self.chunk_rows()) {
             let end = (start + self.chunk_rows()).min(self.nrows);
             for row in start..end {
-                let w = weights[row].max(0.0);
+                let w = weights[row];
                 if w == 0.0 {
                     continue;
                 }
@@ -6767,6 +6770,8 @@ impl DenseDesignOperator for PcaScoresMemmapDesignOperator {
                 self.nrows
             ));
         }
+        FiniteSignedWeightsView::try_from_array(weights)
+            .map_err(|reason| format!("lazy Pca compute_xtwy: {reason}"))?;
         let mut out = Array1::<f64>::zeros(self.ncols);
         for start in (0..self.nrows).step_by(self.chunk_rows()) {
             let end = (start + self.chunk_rows()).min(self.nrows);
