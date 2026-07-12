@@ -2817,11 +2817,11 @@ impl BernoulliMarginalSlopeFamily {
     /// small for ordinary spline bases).
     /// Numerical parity with the independent runtime jet is pinned to ≤1e-9 by
     /// the value/gradient/full-Hessian moment oracle.
-    pub(super) fn flex_grid_calibration_derivs_compiled_jet2(
+    pub(super) fn lower_empirical_bms_plan_calibration_order2(
         &self,
+        plan: &super::cell_moment_assembly::EmpiricalBmsRowJetPlan,
         empirical_grid: &crate::bms::EmpiricalZGrid,
         primary: &PrimarySlices,
-        a: f64,
         b: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
@@ -2840,6 +2840,7 @@ impl BernoulliMarginalSlopeFamily {
         f_au: &mut Array1<f64>,
         f_uv: &mut Array2<f64>,
     ) -> Result<f64, String> {
+        let a = plan.intercept_root;
         let scale = self.probit_frailty_scale();
         let h_range = primary.h.as_ref();
         let w_range = primary.w.as_ref();
@@ -3048,7 +3049,9 @@ impl BernoulliMarginalSlopeFamily {
         let a = empirical_plan
             .as_ref()
             .map_or(row_ctx.intercept, |plan| plan.intercept_root);
-        let f_a = row_ctx.m_a;
+        let f_a = empirical_plan
+            .as_ref()
+            .map_or(row_ctx.m_a, |plan| plan.inv_f_a.recip());
         let y_i = self.y[row];
         let w_i = self.weights[row];
         let s_y = 2.0 * y_i - 1.0;
@@ -3083,10 +3086,13 @@ impl BernoulliMarginalSlopeFamily {
             // once per node. The family authors only the explicit calibration
             // channels here; the shared implicit pullback below owns the IFT
             // and observed-NLL chain rules.
-            f_aa = self.flex_grid_calibration_derivs_compiled_jet2(
+            let plan = empirical_plan
+                .as_ref()
+                .expect("empirical grid and empirical row plan are paired");
+            f_aa = self.lower_empirical_bms_plan_calibration_order2(
+                plan,
                 grid,
                 primary,
-                a,
                 b,
                 beta_h,
                 beta_w,
@@ -3413,8 +3419,7 @@ impl BernoulliMarginalSlopeFamily {
                     constraint_hessian[axis] = f_au[u];
                     constraint_hessian[axis * explicit_dimension] = f_au[u];
                     for v in 0..r {
-                        constraint_hessian
-                            [axis * explicit_dimension + (v + 1)] = f_uv[[u, v]];
+                        constraint_hessian[axis * explicit_dimension + (v + 1)] = f_uv[[u, v]];
                     }
                 }
             }
@@ -3443,12 +3448,7 @@ impl BernoulliMarginalSlopeFamily {
                     for v in u..r {
                         let other = v + 1;
                         let eta_uv = eval_coeff4_at(
-                            &g_jet.pair_from_b_family(
-                                g_jet.b_first,
-                                u,
-                                v,
-                                COEFF_SUPPORT_BHW,
-                            ),
+                            &g_jet.pair_from_b_family(g_jet.b_first, u, v, COEFF_SUPPORT_BHW),
                             z_obs,
                         );
                         eta_hessian[axis * explicit_dimension + other] = eta_uv;
@@ -3463,8 +3463,7 @@ impl BernoulliMarginalSlopeFamily {
                 eta_hessian.into_iter().map(|value| sign * value).collect(),
             )?;
             signed = signed.compose_unary(plan.observed_neglog_stack);
-            let pulled =
-                gam_math::jet_scalar::implicit_pullback_order2(&constraint, &signed, 0)?;
+            let pulled = gam_math::jet_scalar::implicit_pullback_order2(&constraint, &signed, 0)?;
             for u in 0..r {
                 scratch.grad[u] = pulled.output.gradient[u];
             }
@@ -3476,16 +3475,28 @@ impl BernoulliMarginalSlopeFamily {
                 }
             }
             let intercept_gradient = Array1::from_vec(pulled.state_gradient);
-            self.cache_row_intercept_predictor(
-                row,
-                a,
-                q,
-                b,
-                beta_h,
-                beta_w,
-                &intercept_gradient,
-            );
+            self.cache_row_intercept_predictor(row, a, q, b, beta_h, beta_w, &intercept_gradient);
             return Ok(pulled.output.value);
+        }
+
+        let a_u = &mut scratch.a_u;
+        for u in 0..r {
+            a_u[u] = -f_u[u] * inv_ma;
+        }
+        self.cache_row_intercept_predictor(row, a, q, b, beta_h, beta_w, a_u);
+        let a_uv = &mut scratch.a_uv;
+        if need_hessian {
+            for u in 0..r {
+                for v in u..r {
+                    let value = -(f_uv[[u, v]]
+                        + f_au[u] * a_u[v]
+                        + f_au[v] * a_u[u]
+                        + f_aa * a_u[u] * a_u[v])
+                        * inv_ma;
+                    a_uv[[u, v]] = value;
+                    a_uv[[v, u]] = value;
+                }
+            }
         }
 
         // `scratch.reset(need_hessian)` at the top of this function zeroed both

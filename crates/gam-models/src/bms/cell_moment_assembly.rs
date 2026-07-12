@@ -42,7 +42,7 @@ struct EmpiricalBmsCalibrationNodeJetPlan {
 pub(super) struct EmpiricalBmsRowJetPlan {
     primary: PrimarySlices,
     pub(super) intercept_root: f64,
-    inv_f_a: f64,
+    pub(super) inv_f_a: f64,
     scale: f64,
     mu_stack: [f64; 5],
     calibration: Vec<EmpiricalBmsCalibrationNodeJetPlan>,
