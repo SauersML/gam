@@ -93,11 +93,26 @@ struct FisherDirection {
 }
 
 trait FisherPerturbation: JetScalar<0> {
+    type Channels: Copy;
+    const CONTIGUOUS_FULL: bool;
+
     fn seed(direction: FisherDirection) -> Self;
     fn coefficient(&self) -> f64;
+    fn from_channels(base: f64, channels: Self::Channels) -> Self;
+    fn normalized_channels(
+        probability: f64,
+        direction_u: f64,
+        mass: &Self,
+        inverse: &Self,
+    ) -> Self::Channels;
+    fn store_channels(channels: Self::Channels, weight: f64) -> Self::Channels;
+    fn fisher_weight(weight: f64) -> f64;
 }
 
 impl FisherPerturbation for OneSeed<0> {
+    type Channels = f64;
+    const CONTIGUOUS_FULL: bool = true;
+
     #[inline(always)]
     fn seed(direction: FisherDirection) -> Self {
         Self {
@@ -110,9 +125,40 @@ impl FisherPerturbation for OneSeed<0> {
     fn coefficient(&self) -> f64 {
         gam_math::nested_dual::JetField::value(&self.eps)
     }
+
+    #[inline(always)]
+    fn from_channels(base: f64, channels: Self::Channels) -> Self {
+        Self {
+            base: <Order2<0> as JetScalar<0>>::constant(base),
+            eps: <Order2<0> as JetScalar<0>>::constant(channels),
+        }
+    }
+
+    #[inline(always)]
+    fn normalized_channels(
+        probability: f64,
+        direction_u: f64,
+        _: &Self,
+        inverse: &Self,
+    ) -> Self::Channels {
+        probability * (direction_u + gam_math::nested_dual::JetField::value(&inverse.eps))
+    }
+
+    #[inline(always)]
+    fn store_channels(channels: Self::Channels, weight: f64) -> Self::Channels {
+        channels * weight
+    }
+
+    #[inline(always)]
+    fn fisher_weight(_: f64) -> f64 {
+        1.0
+    }
 }
 
 impl FisherPerturbation for TwoSeed<0> {
+    type Channels = [f64; 3];
+    const CONTIGUOUS_FULL: bool = false;
+
     #[inline(always)]
     fn seed(direction: FisherDirection) -> Self {
         Self {
@@ -126,6 +172,73 @@ impl FisherPerturbation for TwoSeed<0> {
     #[inline(always)]
     fn coefficient(&self) -> f64 {
         gam_math::nested_dual::JetField::value(&self.eps_del)
+    }
+
+    #[inline(always)]
+    fn from_channels(base: f64, channels: Self::Channels) -> Self {
+        Self {
+            base: <Order2<0> as JetScalar<0>>::constant(base),
+            eps: <Order2<0> as JetScalar<0>>::constant(channels[0]),
+            del: <Order2<0> as JetScalar<0>>::constant(channels[1]),
+            eps_del: <Order2<0> as JetScalar<0>>::constant(channels[2]),
+        }
+    }
+
+    #[inline(always)]
+    fn normalized_channels(_: f64, _: f64, mass: &Self, inverse: &Self) -> Self::Channels {
+        let normalized = gam_math::nested_dual::JetField::mul(mass, inverse);
+        [
+            gam_math::nested_dual::JetField::value(&normalized.eps),
+            gam_math::nested_dual::JetField::value(&normalized.del),
+            gam_math::nested_dual::JetField::value(&normalized.eps_del),
+        ]
+    }
+
+    #[inline(always)]
+    fn store_channels(channels: Self::Channels, _: f64) -> Self::Channels {
+        channels
+    }
+
+    #[inline(always)]
+    fn fisher_weight(weight: f64) -> f64 {
+        weight
+    }
+}
+
+#[inline(always)]
+fn fisher_entry<S: FisherPerturbation>(
+    probability_a: S,
+    probability_b: S,
+    diagonal: bool,
+    output_weight: f64,
+) -> f64 {
+    let negative_product = gam_math::nested_dual::JetField::neg(
+        &gam_math::nested_dual::JetField::mul(&probability_a, &probability_b),
+    );
+    let entry = if diagonal {
+        gam_math::nested_dual::JetField::add(&probability_a, &negative_product)
+    } else {
+        negative_product
+    };
+    gam_math::nested_dual::JetField::scale(&entry, output_weight).coefficient()
+}
+
+#[inline(always)]
+fn write_static_fisher<S: FisherPerturbation, F: Fn(usize) -> f64, const M: usize>(
+    probability: &F,
+    normalized: &[S::Channels],
+    fisher: &mut [f64],
+    output_weight: f64,
+) {
+    for a in 0..M {
+        let pa = S::from_channels(probability(a), normalized[a]);
+        fisher[a * M + a] = fisher_entry(pa, pa, true, output_weight);
+        for b in (a + 1)..M {
+            let pb = S::from_channels(probability(b), normalized[b]);
+            let coefficient = fisher_entry(pa, pb, false, output_weight);
+            fisher[a * M + b] = coefficient;
+            fisher[b * M + a] = coefficient;
+        }
     }
 }
 
@@ -148,34 +261,95 @@ fn softmax_fisher_perturbation<S: FisherPerturbation>(
     probability: impl Fn(usize) -> f64,
     direction_u: impl Fn(usize) -> f64,
     direction_v: impl Fn(usize) -> f64,
-    normalized: &mut [S],
+    normalized: &mut [S::Channels],
     fisher: &mut [f64],
 ) {
     assert_eq!(normalized.len(), m);
     assert_eq!(fisher.len(), m * m);
-    let one = S::constant(1.0);
-    let mut denominator = one;
-    for a in 0..m {
+    let mut denominator = S::constant(1.0);
+    let perturbed_mass = |a| {
         let pa = probability(a);
+        let direction_u = direction_u(a);
         let delta = S::seed(FisherDirection {
-            u: direction_u(a),
+            u: direction_u,
             v: direction_v(a),
         });
-        let exp_delta = delta.compose_unary([1.0; 5]);
-        denominator = denominator.add(&exp_delta.sub(&one).scale(pa));
-        normalized[a] = exp_delta.scale(pa);
+        let mass = gam_math::nested_dual::JetField::scale(
+            &gam_math::nested_dual::JetField::compose_unary(&delta, [1.0; 5]),
+            pa,
+        );
+        (pa, direction_u, mass)
+    };
+    for a in 0..m {
+        let (pa, _, mass) = perturbed_mass(a);
+        denominator = gam_math::nested_dual::JetField::add(
+            &denominator,
+            &gam_math::nested_dual::JetField::sub(&mass, &S::constant(pa)),
+        );
     }
-    let inverse = denominator.compose_unary([1.0, -1.0, 2.0, -6.0, 24.0]);
-    for probability in normalized.iter_mut() {
-        *probability = probability.mul(&inverse);
+    let inverse =
+        gam_math::nested_dual::JetField::compose_unary(&denominator, [1.0, -1.0, 2.0, -6.0, 24.0]);
+    for (a, channels) in normalized.iter_mut().enumerate() {
+        let (pa, direction_u, mass) = perturbed_mass(a);
+        *channels = S::store_channels(
+            S::normalized_channels(pa, direction_u, &mass, &inverse),
+            weight,
+        );
+    }
+    let output_weight = S::fisher_weight(weight);
+    let lifted = |a| S::from_channels(probability(a), normalized[a]);
+    if m == 2 {
+        let p0 = lifted(0);
+        let p1 = lifted(1);
+        fisher[0] = fisher_entry(p0, p0, true, output_weight);
+        let off = fisher_entry(p0, p1, false, output_weight);
+        fisher[1] = off;
+        fisher[2] = off;
+        fisher[3] = fisher_entry(p1, p1, true, output_weight);
+        return;
+    }
+    if m == 3 {
+        let p0 = lifted(0);
+        let p1 = lifted(1);
+        let p2 = lifted(2);
+        fisher[0] = fisher_entry(p0, p0, true, output_weight);
+        let off01 = fisher_entry(p0, p1, false, output_weight);
+        fisher[1] = off01;
+        fisher[3] = off01;
+        let off02 = fisher_entry(p0, p2, false, output_weight);
+        fisher[2] = off02;
+        fisher[6] = off02;
+        fisher[4] = fisher_entry(p1, p1, true, output_weight);
+        let off12 = fisher_entry(p1, p2, false, output_weight);
+        fisher[5] = off12;
+        fisher[7] = off12;
+        fisher[8] = fisher_entry(p2, p2, true, output_weight);
+        return;
+    }
+    if m == 8 {
+        write_static_fisher::<S, _, 8>(&probability, normalized, fisher, output_weight);
+        return;
+    }
+    if m == 32 {
+        write_static_fisher::<S, _, 32>(&probability, normalized, fisher, output_weight);
+        return;
+    }
+    if S::CONTIGUOUS_FULL && m >= 64 {
+        for a in 0..m {
+            let pa = lifted(a);
+            let row_start = a * m;
+            for b in 0..m {
+                fisher[row_start + b] = fisher_entry(pa, lifted(b), false, output_weight);
+            }
+            fisher[row_start + a] = fisher_entry(pa, pa, true, output_weight);
+        }
+        return;
     }
     for a in 0..m {
-        let pa = normalized[a];
-        let diagonal = pa.sub(&pa.mul(&pa)).scale(weight);
-        fisher[a * m + a] = diagonal.coefficient();
+        let pa = lifted(a);
+        fisher[a * m + a] = fisher_entry(pa, pa, true, output_weight);
         for b in (a + 1)..m {
-            let off_diagonal = pa.mul(&normalized[b]).neg().scale(weight);
-            let coefficient = off_diagonal.coefficient();
+            let coefficient = fisher_entry(pa, lifted(b), false, output_weight);
             fisher[a * m + b] = coefficient;
             fisher[b * m + a] = coefficient;
         }
@@ -1007,7 +1181,7 @@ impl MultinomialFamily {
         let design = self.design.view();
         let mut out = Array3::<f64>::zeros((n, m, m));
         let mut d_eta = vec![0.0_f64; m];
-        let mut normalized = vec![<OneSeed<0> as JetScalar<0>>::constant(0.0); m];
+        let mut normalized = vec![0.0; m];
         let out_flat = out
             .as_slice_mut()
             .expect("owned Fisher jet must be contiguous");
@@ -1057,7 +1231,7 @@ impl MultinomialFamily {
         let mut out = Array3::<f64>::zeros((n, m, m));
         let mut d_eta_u = vec![0.0_f64; m];
         let mut d_eta_v = vec![0.0_f64; m];
-        let mut normalized = vec![<TwoSeed<0> as JetScalar<0>>::constant(0.0); m];
+        let mut normalized = vec![[0.0; 3]; m];
         let out_flat = out
             .as_slice_mut()
             .expect("owned Fisher jet must be contiguous");
@@ -1234,7 +1408,7 @@ impl MultinomialFamily {
                 let a0 = axis / p;
                 let i0 = axis % p;
                 let mut mat = vec![0.0_f64; dim * dim];
-                let mut normalized = vec![<OneSeed<0> as JetScalar<0>>::constant(0.0); m];
+                let mut normalized = vec![0.0; m];
                 let mut jhat = vec![0.0_f64; m * m];
                 for row in 0..n {
                     let w = self.weights[row];
@@ -1356,7 +1530,7 @@ impl MultinomialFamily {
                 let a0 = axis / p;
                 let i0 = axis % p;
                 let mut mat = vec![0.0_f64; dim * dim];
-                let mut normalized = vec![<TwoSeed<0> as JetScalar<0>>::constant(0.0); m];
+                let mut normalized = vec![[0.0; 3]; m];
                 let mut jhat = vec![0.0_f64; m * m];
                 for row in 0..n {
                     let w = self.weights[row];
