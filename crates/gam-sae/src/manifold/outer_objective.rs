@@ -4059,7 +4059,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // value+gradient eval at ρ runs LAST, after the probes, and its
                 // deterministic (cost, ∇f) pair is returned with the dense
                 // Hessian attached.
-                let hessian = fd_outer_hessian_from_gradient(self, rho);
+                let hessian = fd_outer_hessian_from_gradient(&mut *self, rho);
                 let mut eval = self.eval(rho)?;
                 // Infeasible ρ carries no defined curvature: `eval` already
                 // returned `OuterEval::infeasible` (Hessian `Unavailable`), which
