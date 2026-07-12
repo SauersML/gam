@@ -272,8 +272,7 @@ mod tests {
                 grad[row * 4..row * 4 + 4].copy_from_slice(&out.g());
                 let row_hessian = out.h();
                 for a in 0..4 {
-                    hess[row * 16 + a * 4..row * 16 + a * 4 + 4]
-                        .copy_from_slice(&row_hessian[a]);
+                    hess[row * 16 + a * 4..row * 16 + a * 4 + 4].copy_from_slice(&row_hessian[a]);
                 }
             }
         }
@@ -414,6 +413,55 @@ mod tests {
         assert_channel_parity("edge value", &cpu.value, &device.value);
         assert_channel_parity("edge gradient", &cpu.grad, &device.grad);
         assert_channel_parity("edge Hessian", &cpu.hess, &device.hess);
+    }
+
+    /// #932 production-boundary throughput measurement. The timed device call
+    /// includes allocation, all host/device transfers, launch, and synchronize;
+    /// module compilation is warmed outside the timing. This is intentionally
+    /// stricter than a kernel-only number and reports whether CUDA wins at the
+    /// exact API the row-kernel cache consumes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn measure_device_vgh_end_to_end_932() {
+        use std::time::{Duration, Instant};
+
+        if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
+            eprintln!("CUDA runtime unavailable; skipping survival VGH throughput measurement");
+            return;
+        }
+        const ROWS: usize = 1_000_000;
+        let rows = fixture(ROWS);
+        let warm =
+            survival_rigid_row_vgh_device_only(&rows, 0.7).expect("warm survival VGH device call");
+
+        let cpu_start = Instant::now();
+        let cpu = survival_rigid_row_vgh_cpu(&rows, 0.7);
+        let cpu_elapsed = cpu_start.elapsed();
+
+        let mut best_elapsed = Duration::MAX;
+        let mut best_device = warm;
+        for round in 0..3 {
+            std::hint::black_box(round);
+            let device_start = Instant::now();
+            let candidate = survival_rigid_row_vgh_device_only(&rows, 0.7)
+                .expect("timed survival VGH device call");
+            let elapsed = device_start.elapsed();
+            if elapsed < best_elapsed {
+                best_elapsed = elapsed;
+                best_device = candidate;
+            }
+        }
+
+        assert_channel_parity("measured value", &cpu.value, &best_device.value);
+        assert_channel_parity("measured gradient", &cpu.grad, &best_device.grad);
+        assert_channel_parity("measured Hessian", &cpu.hess, &best_device.hess);
+        let cpu_ns = cpu_elapsed.as_secs_f64() * 1e9 / ROWS as f64;
+        let device_ns = best_elapsed.as_secs_f64() * 1e9 / ROWS as f64;
+        eprintln!(
+            "SURVIVAL-VGH-CUDA-932 rows={ROWS} cpu={cpu_ns:.2} ns/row device-e2e={device_ns:.2} ns/row speedup={:.2}x",
+            cpu_ns / device_ns,
+        );
+        assert!(cpu_ns.is_finite() && device_ns.is_finite() && device_ns > 0.0);
     }
 
     #[cfg(target_os = "linux")]
