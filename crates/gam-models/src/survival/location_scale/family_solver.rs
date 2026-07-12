@@ -2306,32 +2306,29 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let p_total = *offsets
             .last()
             .ok_or_else(|| "missing joint block offsets".to_string())?;
-        // Assemble the joint likelihood Hessian once from the scale-stabilized
-        // quantities (the uniform `exp(−L)` rescale cancels in the RELATIVE floor
-        // `fraction × max(diag)`, so the floor is scale-invariant). Its diagonal
-        // is the SAME quantity the generic driver whitens by.
+        // Lower only the joint likelihood diagonal from the scale-stabilized
+        // packed coefficients. The uniform `exp(−L)` rescale cancels in the
+        // relative floor `fraction × max(diag)`, so the floor is scale-invariant.
         let log_scale = self.hessian_deriv_log_rescale(block_states);
-        let q = self.collect_joint_quantities_rescaled(block_states, log_scale)?;
-        // #932: link-wiggle families must take the SAME single-source §13 warp
-        // joint Hessian the Newton step uses (`survival_ls_wiggle_joint_hessian_dense`),
-        // NOT the bespoke `assemble_joint_hessian_from_quantities`. The bespoke
-        // wiggle path (`assemble_h_wiggle`) is a legacy duplicate engine that
-        // disagrees with the FD-verified §13 program (the duplicate-derivative
-        // genus #932 eliminates); flooring the trust metric off a Hessian
-        // inconsistent with the actual curvature starves the wrong coordinates.
-        // Non-wiggle families keep the bespoke assembler, which is oracle-pinned
-        // equal to the §13 RowKernel single source
-        // (`survival_ls_row_kernel_matches_bespoke_assembly`).
-        let h_joint = if self.x_link_wiggle.is_some() {
-            let dynamic = self.build_dynamic_geometry(block_states)?;
-            super::row_kernel::survival_ls_wiggle_joint_hessian_dense(self, &dynamic, log_scale)?
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        let h_diagonal = if self.x_link_wiggle.is_some() {
+            super::row_kernel::survival_ls_wiggle_joint_hessian_dense(
+                self, &dynamic, log_scale,
+            )?
+            .diag()
+            .to_owned()
         } else {
-            match self.assemble_joint_hessian_from_quantities(&q, block_states)? {
-                Some(h) => h,
-                None => return Ok(None),
+            match self.survival_ls_coefficient_hessian(
+                &dynamic,
+                log_scale,
+                None,
+                SlsCoefficientHessianTarget::DiagonalOnly,
+            )? {
+                SlsCoefficientHessian::DiagonalOnly(diagonal) => diagonal,
+                _ => unreachable!("diagonal-only SLS target returned another shape"),
             }
         };
-        if h_joint.nrows() != p_total {
+        if h_diagonal.len() != p_total {
             return Ok(None);
         }
         let mut floor = Array1::<f64>::zeros(p_total);
@@ -2348,7 +2345,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 continue;
             }
             let max_diag = (start..end)
-                .map(|j| h_joint[[j, j]].abs())
+                .map(|j| h_diagonal[j].abs())
                 .filter(|v| v.is_finite())
                 .fold(0.0_f64, f64::max);
             if !(max_diag.is_finite() && max_diag > 0.0) {
