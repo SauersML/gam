@@ -196,6 +196,7 @@ impl Parse for Input {
 enum ProgramExpr {
     Path(Ident),
     Zero,
+    Neg(Box<ProgramExpr>),
     Scale(Box<ProgramExpr>, Expr),
     AddConstant(Box<ProgramExpr>, Expr),
     Add(Box<ProgramExpr>, Box<ProgramExpr>),
@@ -317,6 +318,9 @@ fn parse_program_expr(
             let arguments = call.args.iter().collect::<Vec<_>>();
             match operation.as_str() {
                 "zero" if arguments.is_empty() => Ok(ProgramExpr::Zero),
+                "neg" if arguments.len() == 1 => Ok(ProgramExpr::Neg(Box::new(
+                    parse_program_expr(arguments[0], bindings, constants, leaves)?,
+                ))),
                 "scale" | "add_constant" if arguments.len() == 2 => {
                     let value = parse_program_expr(arguments[0], bindings, constants, leaves)?;
                     validate_scalar(arguments[1], constants)?;
@@ -398,6 +402,10 @@ fn rust_expression(expression: &ProgramExpr, leaves: &[Leaf]) -> TokenStream2 {
     match expression {
         ProgramExpr::Path(ident) => quote!(#ident),
         ProgramExpr::Zero => quote!(S::constant(0.0)),
+        ProgramExpr::Neg(value) => {
+            let value = rust_expression(value, leaves);
+            quote!({ let value = #value; value.neg() })
+        }
         ProgramExpr::Scale(value, scalar) => {
             let value = rust_expression(value, leaves);
             quote!({ let value = #value; value.scale(#scalar) })
@@ -505,6 +513,7 @@ fn cuda_expression(
     match expression {
         ProgramExpr::Path(ident) => Ok(ident.to_string()),
         ProgramExpr::Zero => Ok("j2_const(0.0)".to_string()),
+        ProgramExpr::Neg(value) => Ok(format!("j2_scale({}, -1.0)", child(value)?)),
         ProgramExpr::Scale(value, scalar) => Ok(format!(
             "j2_scale({}, {})",
             child(value)?,
