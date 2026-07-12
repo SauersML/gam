@@ -2,6 +2,7 @@
 //! helpers for `SaeManifoldTerm`, moved verbatim out of construction.rs to keep it
 //! under the 10k-line ban gate. Pure code move, no logic change.
 use super::*;
+use gam_math::special::bessel_i0_log_and_ratio;
 
 impl SaeManifoldTerm {
     /// Per-atom, per-axis coordinate sum-of-squares `‖t_kj‖² = Σ_i t_{i,k,j}²`.

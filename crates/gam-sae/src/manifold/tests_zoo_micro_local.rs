@@ -149,11 +149,15 @@ fn zz_zoo_micro_local_full_fit_and_oos_discriminator() {
 }
 
 /// #2022 canonical rank-charge zoo-micro measurement. Fits the m12 configuration
-/// once under the scale-insensitive `½·d_eff·ln N_eff` charge and
-/// `rank_eff==0 ⇒ v→+∞` veto, reporting births/deaths, co-collapse incidence,
-/// reconstruction quality, criterion, and wall-clock. This is an ordinary named
-/// measurement test because ignored tests are forbidden; focused runs select it
-/// by its `zz_rank_charge` name. Pass/fail uses finiteness plus signal engagement.
+/// once under the noise-referenced, piecewise-constant
+/// `½·d_eff·ln N_eff` charge and `rank_eff==0 ⇒ v→+∞` veto, reporting
+/// births/deaths, co-collapse incidence, reconstruction quality, criterion, and
+/// wall-clock. At fixed residual dispersion the integer rank changes only when a
+/// decoder mode crosses an MP edge; under a physical unit rescale, decoder energy
+/// and residual dispersion scale together and the count is invariant. This is an
+/// ordinary named measurement test because ignored tests are forbidden; focused
+/// runs select it by its `zz_rank_charge` name. Pass/fail uses finiteness plus
+/// signal engagement.
 #[derive(Debug)]
 struct RankChargeArm {
     fit_secs: f64,

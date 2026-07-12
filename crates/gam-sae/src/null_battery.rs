@@ -26,10 +26,23 @@ pub const COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS: usize = 1_024;
 /// Tall inputs use independent row blocks; inputs with fewer row blocks than
 /// workers split every block into deterministic column bands as well. Actual
 /// concurrency never exceeds this cap or the active Rayon pool's thread count,
-/// and the bands partition `p`, so transform memory remains bounded by
-/// `8 * 1024 * p * sizeof(f64)` independently of the corpus row count. Binary
-/// tail blocks reuse the same workspaces in later waves.
+/// and the bands partition `p`, so transform memory remains bounded both by
+/// `8 * 1024 * p * sizeof(f64)` and by the 128-MiB active-workspace budget,
+/// independently of the corpus row count. Binary tail blocks reuse the same
+/// workspaces in later waves.
 pub const COVARIANCE_EXACT_HADAMARD_MAX_PARALLEL_WORKSPACES: usize = 8;
+
+/// Maximum aggregate float64 workspace actively transformed in parallel.
+///
+/// An exclusive, internally warmed MSI sweep across `32768×1024`,
+/// `8192×4096`, and `4096×7168` found the stable throughput knee at eight
+/// 8-MiB tiles or four 28–32-MiB tiles. More active state increased RSS and
+/// tail latency without increasing useful bandwidth. Column banding makes this
+/// a hard portable memory bound rather than a shape-specific dispatch table.
+pub const COVARIANCE_EXACT_HADAMARD_PARALLEL_WORKSPACE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+
+/// Target upper bound for one cache-local Hadamard tile.
+pub const COVARIANCE_EXACT_HADAMARD_TARGET_TILE_BYTES: usize = 32 * 1024 * 1024;
 
 const HADAMARD_PERMUTATION_SEED_DOMAIN: u64 = 0x4841_4441_5045_524D;
 const HADAMARD_SIGN_SEED_DOMAIN: u64 = 0x4841_4441_5349_474E;
@@ -806,13 +819,25 @@ fn covariance_exact_hadamard_parallel_plan(
     // balanced column bands that can expose all available workers. Besides
     // filling the pool, this keeps ultra-wide B×p workspaces out of the
     // last-level-cache streaming regime without adding a stage barrier.
-    let column_bands = available_tasks.div_ceil(row_groups).min(ncols).max(1);
+    let workspace_rows = covariance_exact_hadamard_workspace_rows(nrows)?;
+    let scalar_bytes = std::mem::size_of::<f64>();
+    let maximum_workspace_scalars = COVARIANCE_EXACT_HADAMARD_TARGET_TILE_BYTES / scalar_bytes;
+    let maximum_workspace_cols = (maximum_workspace_scalars / workspace_rows).max(1);
+    let worker_bands = available_tasks.div_ceil(row_groups);
+    let budget_bands = ncols.div_ceil(maximum_workspace_cols);
+    let column_bands = worker_bands.max(budget_bands).min(ncols).max(1);
     let workspace_cols = ncols.div_ceil(column_bands);
+    let workspace_bytes = workspace_rows
+        .checked_mul(workspace_cols)
+        .and_then(|scalars| scalars.checked_mul(scalar_bytes))
+        .ok_or_else(|| "covariance-exact Hadamard tile workspace size overflowed".to_string())?;
+    let budget_tasks =
+        (COVARIANCE_EXACT_HADAMARD_PARALLEL_WORKSPACE_BUDGET_BYTES / workspace_bytes).max(1);
     let tile_groups = row_groups.checked_mul(column_bands).ok_or_else(|| {
         "covariance-exact Hadamard parallel tile-group count overflowed".to_string()
     })?;
     Ok(HadamardParallelPlan {
-        tasks: available_tasks.min(tile_groups),
+        tasks: available_tasks.min(tile_groups).min(budget_tasks),
         column_bands,
         workspace_cols,
     })
@@ -1186,8 +1211,9 @@ fn covariance_exact_hadamard_null_impl<T: NativeControlScalar>(
 /// exact arithmetic, while rowwise radii and nonlinear manifold geometry are
 /// mixed. Row-block/column-band tiles run independently with sequential
 /// butterfly arithmetic. Peak transform storage is at most
-/// `min(8, Rayon threads) × B × p` float64 scalars; column banding usually
-/// makes the realized bound substantially smaller on short, wide matrices.
+/// `min(8, Rayon threads) × B × p` float64 scalars and never exceeds the
+/// 128-MiB active-workspace budget; column banding makes each tile at most
+/// 32 MiB.
 pub fn covariance_exact_hadamard_null(
     data: ArrayView2<'_, f64>,
     seed: u64,
@@ -2876,22 +2902,21 @@ mod tests {
             .install(|| covariance_exact_hadamard_parallel_plan(rows, columns).unwrap());
         assert_eq!(one_plan.tasks, 1);
         assert_eq!(four_plan.tasks, 4);
-        assert_eq!(
-            sixteen_thread_plan.tasks,
-            COVARIANCE_EXACT_HADAMARD_MAX_PARALLEL_WORKSPACES
-        );
-        assert_eq!(one_plan.column_bands, 1);
-        assert_eq!(four_plan.column_bands, 1);
-        assert_eq!(sixteen_thread_plan.column_bands, 1);
+        assert_eq!(sixteen_thread_plan.tasks, 4);
+        assert_eq!(one_plan.column_bands, 2);
+        assert_eq!(four_plan.column_bands, 2);
+        assert_eq!(sixteen_thread_plan.column_bands, 2);
 
         let per_workspace =
             COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS * sixteen_thread_plan.workspace_cols;
         let bounded_scalars = sixteen_thread_plan.tasks * per_workspace;
         assert_eq!(
             bounded_scalars,
-            COVARIANCE_EXACT_HADAMARD_MAX_PARALLEL_WORKSPACES
-                * COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS
-                * columns
+            4 * COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS * columns.div_ceil(2)
+        );
+        assert!(
+            bounded_scalars * std::mem::size_of::<f64>()
+                <= COVARIANCE_EXACT_HADAMARD_PARALLEL_WORKSPACE_BUDGET_BYTES
         );
         assert!(bounded_scalars < rows * columns);
 
@@ -2926,9 +2951,23 @@ mod tests {
             .build()
             .unwrap()
             .install(|| covariance_exact_hadamard_parallel_plan(4_096, 7_168).unwrap());
-        assert_eq!(wide_short_plan.tasks, 8);
+        assert_eq!(wide_short_plan.tasks, 4);
         assert_eq!(wide_short_plan.column_bands, 2);
         assert_eq!(wide_short_plan.workspace_cols, 3_584);
+
+        let extreme_width_plan = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap()
+            .install(|| covariance_exact_hadamard_parallel_plan(1_024, 100_000).unwrap());
+        let extreme_tile_bytes = COVARIANCE_EXACT_HADAMARD_MAX_BLOCK_ROWS
+            * extreme_width_plan.workspace_cols
+            * std::mem::size_of::<f64>();
+        assert!(extreme_tile_bytes <= COVARIANCE_EXACT_HADAMARD_TARGET_TILE_BYTES);
+        assert!(
+            extreme_width_plan.tasks * extreme_tile_bytes
+                <= COVARIANCE_EXACT_HADAMARD_PARALLEL_WORKSPACE_BUDGET_BYTES
+        );
 
         let one_block = covariance_exact_hadamard_blocks(17).unwrap();
         let uneven_tiles = covariance_exact_hadamard_tiles(&one_block[..1], 7, 3).unwrap();

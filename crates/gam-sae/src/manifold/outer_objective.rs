@@ -1,4 +1,5 @@
 use super::*;
+use gam_math::special::bessel_i0_log_and_ratio;
 use gam_solve::rho_optimizer::{
     FixedPointCertificateEval, FixedPointCoordinateCertificate, OuterResult,
 };

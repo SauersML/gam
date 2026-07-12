@@ -1,4 +1,5 @@
 use super::*;
+use gam_math::special::bessel_i0_log_and_ratio;
 
 // ── Theorem K: the rank charge is a RUNNING COMPLEXITY λ(n) ──────────────────
 //
@@ -12,9 +13,9 @@ use super::*;
 // the coefficient of log n in the evidence. Theorem K observes that the THREE
 // quantities this code juggles are the SAME object λ evaluated in three regimes:
 //
-//   • HARD rank (n → ∞ limit, atom well above the noise edge): every resolved
-//     decoder direction is a regular parameter, λ → ½·rank_eff·basis_edf = ½·d_eff.
-//     This is the canonical criterion (hard MP count).
+//   • HARD MP detection rank (n → ∞ limit, atom well above the noise edge):
+//     every resolved decoder direction is a regular parameter,
+//     λ → ½·rank_detected·basis_edf = ½·d_eff.
 //   • WBIC SOFT count (finite n, atom NEAR the Marchenko–Pastur edge): the
 //     audit-only `wbic_audit` report records the tempered fractional count. It
 //     is diagnostic, not an alternative production criterion.
@@ -28,9 +29,12 @@ use super::*;
 // (Fisher information actually accumulated by a gated atom), never the global row
 // count — see the #2a inert-row axiom in `penalized_quasi_laplace_criterion`.
 //
-// The production criterion has one charge currency: the hard MP branch. Keeping
-// an un-differentiated soft alternative would make value and analytic gradient
-// describe different objectives, so the fractional count remains audit-only.
+// The production criterion has one charge currency: the chargeable-rank branch.
+// It equals the hard MP detection rank when at least one direction is detected;
+// #2258 promotes an MP-rank-zero but numerically alive decoder to the minimum
+// chargeable rank one. Keeping an un-differentiated soft alternative would make
+// value and analytic gradient describe different objectives, so the fractional
+// WBIC count remains audit-only.
 
 /// #9 streaming rank-charge inputs, accumulated in a SINGLE pass through
 /// [`SaeManifoldTerm::streaming_exact_arrow_log_det`]: the coordinate-block
@@ -66,10 +70,57 @@ pub struct StreamingRankInputs {
 /// (below the MP detection edge, not degenerate) and is promoted to the
 /// minimum chargeable rank 1; at or below it the decoder has genuinely
 /// vanished and the categorical Laplace-validity veto applies. Shared by the
-/// value path here and the ρ-derivative
-/// ([`super::wbic_audit::ReconSpectrum::rank_chargeable`]) so the pair can
-/// never desync.
+/// value path here, the WBIC diagnostic, and the ρ-derivative through
+/// [`classify_reconstruction_rank`], so the three views cannot desync.
 pub(crate) const RANK_VANISHED_REL: f64 = 1.0e-9;
+
+/// The two integer rank notions carried by the evidence code.
+///
+/// `mp_detection_rank` answers a statistical detection question: how many
+/// reconstruction directions clear the Marchenko–Pastur edge?
+/// `production_chargeable_rank` answers a different degeneracy question: how
+/// many directions may the Laplace value price? They differ only when no
+/// direction clears the MP edge but the fitted decoder is still numerically
+/// alive, in which case #2258 charges the minimum non-degenerate rank one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ReconstructionRankClassification {
+    pub mp_detection_rank: usize,
+    pub production_chargeable_rank: usize,
+    pub top_signal: f64,
+}
+
+/// Single source of truth for MP detection versus production chargeability.
+///
+/// Callers supply the per-observation reconstruction-Gram eigenvalues `mu`, the
+/// MP detection `edge`, and the reconstruction dispersion `r_floor`. Inputs are
+/// validated by [`validate_rank_charge_problem`] before production reaches this
+/// helper; [`super::wbic_audit::ReconSpectrum`] stores the same validated values.
+pub(super) fn classify_reconstruction_rank(
+    mu: impl IntoIterator<Item = f64>,
+    edge: f64,
+    r_floor: f64,
+) -> ReconstructionRankClassification {
+    let mut mp_detection_rank = 0usize;
+    let mut top_signal = 0.0_f64;
+    for signal in mu {
+        if signal > edge {
+            mp_detection_rank += 1;
+        }
+        top_signal = top_signal.max(signal);
+    }
+    let production_chargeable_rank = if mp_detection_rank > 0 {
+        mp_detection_rank
+    } else if top_signal > RANK_VANISHED_REL * r_floor {
+        1
+    } else {
+        0
+    };
+    ReconstructionRankClassification {
+        mp_detection_rank,
+        production_chargeable_rank,
+        top_signal,
+    }
+}
 
 /// Validate the shared reconstruction-rank problem before either the production
 /// value path or the WBIC audit touches a factorization. Keeping this contract
@@ -242,7 +293,11 @@ pub(crate) fn realised_rank_charge_dof(
     };
     let edge = crate::null_battery::mp_detection_floor(n_eff, p_out, r_floor)
         .map_err(|error| format!("realised_rank_charge_dof: {error}"))?;
-    let mut rank_eff = sv.iter().filter(|&&s| (s * s) / n_eff > edge).count() as f64;
+    let rank = classify_reconstruction_rank(
+        sv.iter().map(|&s| (s * s) / n_eff),
+        edge,
+        r_floor,
+    );
     // DETECTION vs DEGENERACY (#2258 real-activation class). rank_eff == 0
     // conflated two regimes with opposite correct handling:
     //   · VANISHED decoder (a²‖B‖² → 0): the β-mode is degenerate, the
@@ -263,22 +318,19 @@ pub(crate) fn realised_rank_charge_dof(
     //     featureless-residual birth must now pay ½·basis_edf·ln n it cannot
     //     earn), and the fit minted for the user carries its honest weak
     //     evidence instead of no model at all.
-    let top_signal = {
-        let top_sv = sv.iter().cloned().fold(0.0_f64, f64::max);
-        top_sv * top_sv / n_eff
-    };
-    if rank_eff == 0.0 && top_signal > RANK_VANISHED_REL * r_floor {
+    if rank.mp_detection_rank == 0 && rank.production_chargeable_rank == 1 {
         log::debug!(
             "realised_rank_charge_dof: below-detection-edge atom promoted to rank 1 — \
-             top sv²/n_eff={top_signal:.6e} vs MP edge={edge:.6e} \
+             top sv²/n_eff={:.6e} vs MP edge={edge:.6e} \
              (R={r_floor:.6e}, n_eff={n_eff:.3e}, p_out={p_out})"
+            , rank.top_signal
         );
-        rank_eff = 1.0;
-    } else if rank_eff == 0.0 {
+    } else if rank.production_chargeable_rank == 0 {
         log::debug!(
             "realised_rank_charge_dof: VANISHED decoder (categorical veto upstream) — \
-             top sv²/n_eff={top_signal:.6e} ≤ {RANK_VANISHED_REL:.0e}·R (R={r_floor:.6e}, \
+             top sv²/n_eff={:.6e} ≤ {RANK_VANISHED_REL:.0e}·R (R={r_floor:.6e}, \
              n_eff={n_eff:.3e}, p_out={p_out})"
+            , rank.top_signal
         );
     }
     // basis_edf = tr(gram·(gram+λS)⁻¹).
@@ -295,7 +347,7 @@ pub(crate) fn realised_rank_charge_dof(
     })?;
     let x = factor.solve_mat(gram); // X = (G+λS)⁻¹ G
     let basis_edf = (0..m).map(|i| x[[i, i]]).sum::<f64>().clamp(0.0, m as f64);
-    Ok(rank_eff * basis_edf)
+    Ok(rank.production_chargeable_rank as f64 * basis_edf)
 }
 
 /// Coordinate-block log-determinant `log|H_tt|` carried by an exact dense

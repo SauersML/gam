@@ -1,7 +1,4 @@
 use super::*;
-use gam_math::special::bessel_i0_log_and_ratio;
-#[cfg(test)]
-use gam_math::special::bessel_i0_log_minus_abs_and_ratio;
 
 /// Declared function-space seminorm used by one atom's smoothing prior.
 ///
@@ -1333,6 +1330,7 @@ impl SaeManifoldAtom {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gam_math::special::{bessel_i0_log_and_ratio, bessel_i0_log_minus_abs_and_ratio};
 
     /// The overflow-free `(log I0(η), I1(η)/I0(η))` must satisfy the exact Bessel
     /// identity `d/dη log I0(η) = I1(η)/I0(η)` on BOTH the small-argument series

@@ -600,8 +600,9 @@ destroying rowwise radii and nonlinear manifold geometry. Its work is
 `O(np log B)` with `B ≤ 1024`. Independent row blocks fill the worker pool on
 tall inputs; short, wide inputs split those blocks into deterministic column
 bands so each FWHT tile remains cache-local. Peak transform storage is at most
-`min(8, worker_threads) × B × p` float64 scalars (usually less after banding),
-rather than a corpus-sized covariance matrix or factor.
+`min(8, worker_threads) × B × p` float64 scalars and is hard-capped at 128 MiB
+of active transform state; each column-banded tile is at most 32 MiB. No
+corpus-sized covariance matrix or factor is formed.
 Float32 activation corpora produce float32 controls; float64 inputs remain
 float64. The callback contract requires a fresh deterministic fit and receives
 the same `pipeline_seed` for all three runs.

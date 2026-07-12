@@ -2720,8 +2720,8 @@ pub(crate) fn shape_matched_control<'py>(
 /// `n × p` input or output matrix. The covariance-exact branch transforms
 /// independent power-of-two row-block/column-band tiles in at most
 /// `min(8, worker_threads)` bounded float64 workspaces. Their total size never
-/// exceeds that many `B × p` matrices, with `B <= 1024`, and column banding
-/// makes the realized storage smaller for wide inputs. It never forms a
+/// exceeds that many `B × p` matrices, with `B <= 1024`, or the 128-MiB active
+/// budget. Column banding keeps each tile at most 32 MiB. It never forms a
 /// `p × p` covariance or eigendecomposition.
 #[pyfunction]
 #[pyo3(signature = (data, kind, seed = 11))]

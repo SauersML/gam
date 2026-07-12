@@ -4,8 +4,12 @@
 //! WHY. The production birth/death charge is the Laplace/BIC rank charge
 //! `½·d_eff·log N_eff` (see [`super::construction::realised_rank_charge_dof`]; #2a:
 //! the occupancy-aware `N_eff = Σ_row a²`, not the global `n`), with
-//! `d_eff = rank_eff · basis_edf`. `rank_eff` is a Marchenko–Pastur HARD count of
-//! the reconstruction-Gram eigenvalues above the noise edge — an integer. The
+//! `d_eff = rank_chargeable · basis_edf`. Two integer ranks must not be
+//! conflated. `rank_mp` is the Marchenko–Pastur detection count of reconstruction-
+//! Gram eigenvalues above the noise edge. Production uses `rank_chargeable`:
+//! it equals `rank_mp` when anything is detected, promotes an MP-rank-zero but
+//! numerically alive decoder to rank one, and leaves only a genuinely vanished
+//! decoder at zero (#2258). The
 //! `½·(·)·log n` Laplace charge is the correct free-energy penalty ONLY for a
 //! REGULAR statistical model, where the log-likelihood has a non-degenerate
 //! Hessian at the MLE and the marginal likelihood expands as
@@ -15,10 +19,10 @@
 //! (an amplitude pinned at zero) all break Hessian non-degeneracy. Watanabe's
 //! singular-learning theory replaces the `d/2` coefficient with the LEARNING
 //! COEFFICIENT (real log-canonical threshold) `λ ≤ d/2`, and the free energy is
-//! `−log Z = n·L_n(ŵ) + λ·log n + o(log n)`. So the rank charge can only ever
-//! OVER-charge a singular atom, never under-charge — it prices every above-edge
-//! direction as a full unit of complexity even when that direction is barely
-//! resolved and its true learning-coefficient contribution is a fraction.
+//! `−log Z = n·L_n(ŵ) + λ·log n + o(log n)`. The hard MP charge can
+//! over-price a barely resolved direction, but there is no universal finite-sample
+//! ordering: WBIC also sums fractional mass from every sub-edge direction, while
+//! production separately applies the #2258 minimum-rank promotion.
 //!
 //! THE ESTIMATOR (WBIC at inverse temperature `β = 1/log n`). Watanabe's Widely
 //! Applicable BIC is the tempered-posterior expected log loss
@@ -62,10 +66,14 @@
 //!
 //! CHARGES.
 //! ```text
-//! rank_hard = Σ_k 1[μ_k > e]                    (integer MP count — production)
-//! rank_soft = Σ_k μ_k/(μ_k + e·log n_eff)      (WBIC tempered count)
-//! rank charge  C_rank = ½ · rank_hard · basis_edf · log N_eff
-//! WBIC charge  C_wbic = ½ · rank_soft · basis_edf · log N_eff
+//! rank_mp = Σ_k 1[μ_k > e]                         (integer MP detection count)
+//! rank_chargeable = rank_mp,                         if rank_mp > 0
+//!                 = 1,                               if max μ > 10⁻⁹ R
+//!                 = 0,                               otherwise
+//! rank_soft = Σ_k μ_k/(μ_k + e·log n_eff)          (WBIC tempered count)
+//! C_mp   = ½ · rank_mp         · basis_edf · log N_eff (diagnostic)
+//! C_prod = ½ · rank_chargeable · basis_edf · log N_eff (production)
+//! C_wbic = ½ · rank_soft       · basis_edf · log N_eff (diagnostic)
 //! ```
 //! #2a — the log-sample-size is the atom's OCCUPANCY-aware effective sample size
 //! `N_eff = Σ_row a²` (the same `n_eff` the MP edge already uses), NOT the global
@@ -75,16 +83,15 @@
 //! over-charges every atom by `½·d_eff·log(n/N_eff)`, worst for sparse selective
 //! atoms.
 //! `basis_edf = tr(G(G+λS)⁻¹)` is ALREADY a graded (Watanabe-compatible) effective
-//! count of basis functions, so the singular correction lives ENTIRELY in the hard
-//! MP rank count. The audit reports `C_rank − C_wbic ≥ 0` per atom; the expected
-//! and observed direction is that curved atoms near singular configurations
-//! (whose over-parameterised bases pile reconstruction directions JUST above the
-//! edge) are over-charged, while regular atoms (strong directions far above, the
-//! rest far below) agree.
+//! count of basis functions. The audit reports both integer ranks, both hard
+//! charges, and the signed `C_prod − C_wbic` delta. The sign is not assumed:
+//! either charge can be larger near the MP edge.
 //!
 //! This module is an AUDIT: it does NOT change the default charge. It computes the
-//! reconstruction spectrum the SAME way the production core does (verified against
-//! [`super::construction::realised_rank_charge_dof`] in the tests) and prices both.
+//! reconstruction spectrum the SAME way the production core does and classifies
+//! detection versus chargeability through the SAME shared primitive (verified
+//! against [`super::construction::realised_rank_charge_dof`] for both resolved
+//! and weak-signal atoms in the tests).
 
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, FaerSvd};
 use ndarray::{Array2, ArrayView2};

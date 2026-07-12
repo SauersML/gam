@@ -77,9 +77,9 @@ def run_shape_controlled_census(
     normalized exactly once. The covariance-exact transform uses at most
     ``min(8, worker_threads)`` bounded row-block/column-band float64
     workspaces whose total size is at most that many ``B × p`` matrices, with
-    ``B <= 1024``. Wide inputs are column-banded, so the realized storage is
-    smaller; the transform never forms a ``p × p`` covariance or a
-    corpus-sized float64 copy of float32 input.
+    ``B <= 1024``, and is hard-capped at 128 MiB. Wide inputs are split into
+    at-most-32-MiB tiles; the transform never forms a ``p × p`` covariance or
+    a corpus-sized float64 copy of float32 input.
 
     The controls are generated at pipeline entry, not from a fitted 2-D chart:
     a per-dimension permutation preserves every marginal, while a mean-fixing
