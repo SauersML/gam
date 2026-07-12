@@ -120,19 +120,17 @@ fn ln_stack(x: f64) -> [f64; 5] {
 /// this interface and re-instantiated at [`Jet1`] / [`Jet2`] / [`Jet3`] /
 /// [`Jet4`] for gradient-only, value/grad/Hessian, contracted-third, and
 /// contracted-fourth channels.
-trait FlexJet: Sized + Clone {
+/// The runtime-`p` (Vec-backed) INNER timepoint-geometry jet layer. It EXTENDS
+/// the shared [`JetField`] scalar-field algebra (value / add / sub / mul / neg /
+/// scale / the single Faà di Bruno `compose_unary`) with only the one thing the
+/// flex geometry adds on top: the truncation order [`FlexJet::ORDER`]. The
+/// const-`K` packed row seam (`JetScalar`) extends the SAME `JetField` base — but
+/// the two program layers stay distinct: `FlexJet` is runtime-`p`, not const-`K`.
+trait FlexJet: JetField + Clone {
     /// Highest derivative order represented by this nilpotent algebra.
     /// A value-zero perturbation raised to `ORDER + 1` is identically zero, so
     /// generic Taylor-polynomial builders must stop at this exact order.
     const ORDER: usize;
-
-    fn value(&self) -> f64;
-    fn add(&self, o: &Self) -> Self;
-    fn sub(&self, o: &Self) -> Self;
-    fn mul(&self, o: &Self) -> Self;
-    fn scale(&self, s: f64) -> Self;
-    /// Faà di Bruno composition `f ∘ self` with stack `[f, f′, f″, f‴, f⁗]`.
-    fn compose_unary(&self, d: [f64; 5]) -> Self;
 }
 
 const FLEX_OUTER_SOURCE_COUNT: usize = 6;
@@ -539,9 +537,7 @@ impl Jet2 {
     }
 }
 
-impl FlexJet for Jet2 {
-    const ORDER: usize = 2;
-
+impl JetField for Jet2 {
     #[inline]
     fn value(&self) -> f64 {
         self.v
@@ -606,6 +602,10 @@ impl FlexJet for Jet2 {
             h: self.h.iter().map(|&x| x * s).collect(),
         }
     }
+    #[inline]
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
     fn compose_unary(&self, d: [f64; 5]) -> Self {
         // Order-≤2 reads only [f, f', f''].
         let p = self.p();
@@ -622,6 +622,10 @@ impl FlexJet for Jet2 {
         }
         Jet2 { v: f, g, h }
     }
+}
+
+impl FlexJet for Jet2 {
+    const ORDER: usize = 2;
 }
 
 // ── Jet1: value + gradient only (grad-only path, no discarded Hessian) ──────
@@ -665,9 +669,7 @@ impl Jet1 {
     }
 }
 
-impl FlexJet for Jet1 {
-    const ORDER: usize = 1;
-
+impl JetField for Jet1 {
     #[inline]
     fn value(&self) -> f64 {
         self.v
@@ -702,6 +704,10 @@ impl FlexJet for Jet1 {
             g: self.g.iter().map(|&x| x * s).collect(),
         }
     }
+    #[inline]
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
     fn compose_unary(&self, d: [f64; 5]) -> Self {
         // Order-≤1 reads only [f, f'].
         let p = self.p();
@@ -712,6 +718,10 @@ impl FlexJet for Jet1 {
         }
         Jet1 { v: f, g }
     }
+}
+
+impl FlexJet for Jet1 {
+    const ORDER: usize = 1;
 }
 
 // ── Jet3: one-seed directional, contracted third (doc §A.2) ────────────────
@@ -739,9 +749,7 @@ impl Jet3 {
     }
 }
 
-impl FlexJet for Jet3 {
-    const ORDER: usize = 3;
-
+impl JetField for Jet3 {
     #[inline]
     fn value(&self) -> f64 {
         self.base.v
@@ -770,6 +778,10 @@ impl FlexJet for Jet3 {
             eps: self.eps.scale(s),
         }
     }
+    #[inline]
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
     fn compose_unary(&self, d: [f64; 5]) -> Self {
         let base = self.base.compose_unary([d[0], d[1], d[2], d[3], d[4]]);
         // f'(base) as a Jet2 (consumes [f', f'', f''']).
@@ -777,6 +789,10 @@ impl FlexJet for Jet3 {
         let eps = fprime.mul(&self.eps);
         Jet3 { base, eps }
     }
+}
+
+impl FlexJet for Jet3 {
+    const ORDER: usize = 3;
 }
 
 // ── Jet4: two-seed, contracted fourth (doc §A.3) ───────────────────────────
@@ -807,9 +823,7 @@ impl Jet4 {
     }
 }
 
-impl FlexJet for Jet4 {
-    const ORDER: usize = 4;
-
+impl JetField for Jet4 {
     #[inline]
     fn value(&self) -> f64 {
         self.base.v
@@ -855,6 +869,10 @@ impl FlexJet for Jet4 {
             eps_del: self.eps_del.scale(s),
         }
     }
+    #[inline]
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
     fn compose_unary(&self, d: [f64; 5]) -> Self {
         let base = self.base.compose_unary([d[0], d[1], d[2], d[3], d[4]]);
         let fprime = self.base.compose_unary([d[1], d[2], d[3], d[4], d[4]]);
@@ -872,6 +890,10 @@ impl FlexJet for Jet4 {
             eps_del,
         }
     }
+}
+
+impl FlexJet for Jet4 {
+    const ORDER: usize = 4;
 }
 
 /// `Σ_i x[i]·y[i]` over equal-length slices.
@@ -2601,32 +2623,11 @@ impl FlexJet for Dual22 {
     // The 2+2 nesting auto-zeros `s³`/`t³`, so the highest represented order in
     // EITHER direction is 2 — but the mixed tower reaches `∂²_s ∂²_t` (order 4).
     // `base_moment_jets`' `e^{−Δq}` truncation stops at `(−Δq)^{ORDER}`; ORDER=4
-    // makes it exact for every channel this dual represents.
+    // makes it exact for every channel this dual represents. The scalar-field
+    // algebra (value / add / sub / mul / neg / scale / compose_unary) is inherited
+    // directly from the shared `JetField` base impl on `Dual2<S>` — no local
+    // re-declaration, the whole point of the unified algebra base.
     const ORDER: usize = 4;
-    #[inline]
-    fn value(&self) -> f64 {
-        JetField::value_f64(self)
-    }
-    #[inline]
-    fn add(&self, o: &Self) -> Self {
-        JetField::add(self, o)
-    }
-    #[inline]
-    fn sub(&self, o: &Self) -> Self {
-        JetField::sub(self, o)
-    }
-    #[inline]
-    fn mul(&self, o: &Self) -> Self {
-        JetField::mul(self, o)
-    }
-    #[inline]
-    fn scale(&self, s: f64) -> Self {
-        JetField::scale(self, s)
-    }
-    #[inline]
-    fn compose_unary(&self, d: [f64; 5]) -> Self {
-        JetField::compose_unary(self, d)
-    }
 }
 
 impl MomentTerm for Dual22 {
@@ -2692,9 +2693,7 @@ mod moment_engine_tests {
     #[derive(Clone)]
     struct ForcedOrder4<J>(J);
 
-    impl<J: FlexJet> FlexJet for ForcedOrder4<J> {
-        const ORDER: usize = 4;
-
+    impl<J: FlexJet> JetField for ForcedOrder4<J> {
         #[inline(always)]
         fn value(&self) -> f64 {
             self.0.value()
@@ -2716,6 +2715,11 @@ mod moment_engine_tests {
         }
 
         #[inline(always)]
+        fn neg(&self) -> Self {
+            Self(self.0.neg())
+        }
+
+        #[inline(always)]
         fn scale(&self, scale: f64) -> Self {
             Self(self.0.scale(scale))
         }
@@ -2724,6 +2728,10 @@ mod moment_engine_tests {
         fn compose_unary(&self, derivatives: [f64; 5]) -> Self {
             Self(self.0.compose_unary(derivatives))
         }
+    }
+
+    impl<J: FlexJet> FlexJet for ForcedOrder4<J> {
+        const ORDER: usize = 4;
     }
 
     // #932-2 cutover: the hand IFT intercept-Hessian lift (`lift_flex_intercept_hessian`
