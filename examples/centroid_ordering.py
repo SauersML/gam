@@ -24,9 +24,10 @@ their radius):
      centroid radii about the centroid mean (low CV = centroids sit on a
      circle), plus angular coverage (max angular gap between sorted
      centroid angles; a big gap = an arc or a clump, not a ring).
-  3. Monte-Carlo null: centroid sets drawn from a 2-D Gaussian matched to
-     the observed centroid mean/covariance; rank-deficient covariance remains
-     exactly rank-deficient (no arbitrary ridge); p = P(null CV <= observed CV).
+  3. Monte-Carlo null: centroid sets drawn in a centered, uniformly scaled
+     chart from a 2-D Gaussian with the observed covariance shape;
+     rank-deficient covariance remains exactly rank-deficient (no arbitrary
+     ridge); p = P(null CV <= observed CV).
 
 Caveat carried over from the census: sparse non-negative codes pushed
 through per-group 2-D PCA produce ring-like centroid arrangements on
@@ -48,7 +49,10 @@ __all__ = ["kmeans_centroids", "ring_stats", "ring_mc_pvalue",
 
 
 def _finite_points(values: np.ndarray, name: str, min_rows: int) -> np.ndarray:
-    points = np.asarray(values, dtype=np.float64)
+    raw = np.asarray(values)
+    if np.iscomplexobj(raw):
+        raise TypeError(f"{name} must be real-valued; complex coordinates are unsupported")
+    points = np.asarray(raw, dtype=np.float64)
     if points.ndim != 2 or points.shape[1] != 2 or points.shape[0] < min_rows:
         raise ValueError(
             f"{name} must have shape (n, 2) with n >= {min_rows}; got {points.shape}"
@@ -114,19 +118,28 @@ def kmeans_centroids(coords: np.ndarray, k: int, seed: int = 0,
     # deterministic for a seed and refuses a k larger than the distinct support.
     centers = np.empty((k, 2), dtype=np.float64)
     centers[0] = working[int(rng.integers(working.shape[0]))]
-    nearest_d2 = np.square(working - centers[0]).sum(axis=1)
+    nearest_distance = np.hypot(
+        working[:, 0] - centers[0, 0],
+        working[:, 1] - centers[0, 1],
+    )
     for index in range(1, k):
-        selected = int(np.argmax(nearest_d2))
-        if nearest_d2[selected] <= 0.0:
+        selected = int(np.argmax(nearest_distance))
+        if nearest_distance[selected] <= 0.0:
             raise ValueError(f"k={k} exceeds the number of distinct coordinate rows")
         centers[index] = working[selected]
-        candidate_d2 = np.square(working - centers[index]).sum(axis=1)
-        nearest_d2 = np.minimum(nearest_d2, candidate_d2)
+        candidate_distance = np.hypot(
+            working[:, 0] - centers[index, 0],
+            working[:, 1] - centers[index, 1],
+        )
+        nearest_distance = np.minimum(nearest_distance, candidate_distance)
 
     previous_labels: np.ndarray | None = None
     for _ in range(iters):
-        d2 = ((working[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-        labels = d2.argmin(axis=1)
+        distance = np.hypot(
+            working[:, None, 0] - centers[None, :, 0],
+            working[:, None, 1] - centers[None, :, 1],
+        )
+        labels = distance.argmin(axis=1)
         counts = np.bincount(labels, minlength=k)
         # Empty clusters are repaired as part of the deterministic Lloyd map:
         # move the largest-residual row from a cluster that retains another row.
@@ -134,7 +147,7 @@ def kmeans_centroids(coords: np.ndarray, k: int, seed: int = 0,
             donors = counts[labels] > 1
             if not donors.any():
                 raise ValueError("k-means cannot identify k nonempty clusters")
-            residual = d2[np.arange(X.shape[0]), labels]
+            residual = distance[np.arange(X.shape[0]), labels]
             donor_row = int(np.argmax(np.where(donors, residual, -np.inf)))
             donor_cluster = int(labels[donor_row])
             counts[donor_cluster] -= 1
@@ -177,14 +190,19 @@ def ring_stats(centers: np.ndarray) -> tuple[float, float]:
 def ring_mc_pvalue(centers: np.ndarray, observed_cv: float, n_null: int = 2000,
                    seed: int = 0) -> float:
     """P(null radius-CV <= observed) with null centroid sets drawn from a
-    2-D Gaussian matched to the observed centroid mean/covariance."""
+    2-D Gaussian matched to the observed covariance shape in a stable centered
+    chart. Translation and uniform scale cancel from radius CV exactly."""
     c = _finite_points(centers, "centers", 3)
     if not np.isfinite(observed_cv) or observed_cv < 0.0:
         raise ValueError(f"observed_cv must be finite and non-negative; got {observed_cv}")
     n_null = _positive_integer(n_null, "n_null")
     seed = _seed(seed)
-    centered, mean = _center_points(c)
-    covariance = centered.T @ centered / (c.shape[0] - 1)
+    centered, _ = _center_points(c)
+    coordinate_scale = float(np.max(np.abs(centered)))
+    if not np.isfinite(coordinate_scale) or coordinate_scale <= 0.0:
+        raise ValueError("centroid covariance must have positive finite scale")
+    normalized = centered / coordinate_scale
+    covariance = normalized.T @ normalized / (c.shape[0] - 1)
     if not np.isfinite(covariance).all():
         raise ValueError("centroid covariance is non-finite")
     trace = float(np.trace(covariance))
@@ -197,13 +215,19 @@ def ring_mc_pvalue(centers: np.ndarray, observed_cv: float, n_null: int = 2000,
             "centroid covariance is materially indefinite: "
             f"minimum eigenvalue {float(eigenvalues.min()):.6e}"
         )
-    eigenvalues = np.maximum(eigenvalues, 0.0)
+    # An exact zero eigenvalue may return as either sign at backward-error
+    # scale. Certify and zero that whole envelope so a rank-deficient null never
+    # acquires artificial off-subspace noise.
+    eigenvalues = np.where(eigenvalues <= tolerance, 0.0, eigenvalues)
     factor = eigenvectors * np.sqrt(eigenvalues)[None, :]
     rng = np.random.default_rng(seed)
     k = c.shape[0]
     hits = 0
     for _ in range(n_null):
-        z = rng.standard_normal((k, 2)) @ factor.T + mean
+        # The statistic recenters every draw, so generate directly in the
+        # centered chart. Adding a huge observed origin would only reintroduce
+        # cancellation without changing the mathematical null distribution.
+        z = rng.standard_normal((k, 2)) @ factor.T
         cv, _ = ring_stats(z)
         if cv <= observed_cv:
             hits += 1

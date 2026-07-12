@@ -33,8 +33,8 @@
 
 use gam::solver::evidence::StackingConfig;
 use gam::solver::topology_selector::{
-    AutoTopologyKind, CrossClassCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
-    PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_cross_class_race,
+    AutoTopologyKind, PredictiveRaceCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
+    PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_predictive_race,
 };
 use ndarray::{Array2, ArrayView2};
 
@@ -287,20 +287,20 @@ fn run_bottom_rung(data: &Array2<f64>) -> LadderOutcome {
 
     // --- Same-class headline: Euclidean(Gaussian) vs Circle, winner-take-all.
     let candidates = vec![
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
             negative_log_evidence: gaussian_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: gaussian2d_density_provider(data.view()),
         },
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
             negative_log_evidence: ring_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: ring_density_provider(data.view()),
         },
     ];
-    let verdict = adjudicate_cross_class_race(
+    let verdict = adjudicate_predictive_race(
         data.nrows(),
         candidates,
         STACKING_CV_FOLDS,
@@ -330,26 +330,26 @@ fn run_bottom_rung(data: &Array2<f64>) -> LadderOutcome {
         gam::solver::evidence::GaussianMixtureConfig::default(),
     );
     let stack_candidates = vec![
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
             negative_log_evidence: gaussian_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: gaussian2d_density_provider(data.view()),
         },
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
             negative_log_evidence: ring_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: ring_density_provider(data.view()),
         },
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Mixture { k: 1 }),
             negative_log_evidence: gaussian_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: mixture_provider,
         },
     ];
-    let stack_verdict = adjudicate_cross_class_race(
+    let stack_verdict = adjudicate_predictive_race(
         data.nrows(),
         stack_candidates,
         STACKING_CV_FOLDS,

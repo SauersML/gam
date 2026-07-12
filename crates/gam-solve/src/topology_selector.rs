@@ -119,11 +119,10 @@ pub enum AutoTopologyKind {
 }
 
 impl AutoTopologyKind {
-    /// Stable display name. The mixture variant carries its order `k`, so its
-    /// label is rendered with [`AutoTopologyKind::display_name`]; the borrowed
-    /// `as_str` returns the class tag for the smooth variants and the bare
-    /// `"mixture"` tag for the discrete rung.
-    pub const fn as_str(self) -> &'static str {
+    /// Coarse family tag for aggregate reports. This intentionally omits the
+    /// fixed order of mixture/ring candidates; use [`Self::display_name`] for
+    /// identity, serialization, diagnostics, and race columns.
+    pub const fn family_tag(self) -> &'static str {
         match self {
             AutoTopologyKind::Euclidean => "euclidean",
             AutoTopologyKind::Circle => "circle",
@@ -145,7 +144,7 @@ impl AutoTopologyKind {
         match self {
             AutoTopologyKind::Mixture { k } => format!("mixture_k{k}"),
             AutoTopologyKind::RingOfClusters { k } => format!("ring_clusters_k{k}"),
-            other => other.as_str().to_string(),
+            other => other.family_tag().to_string(),
         }
     }
 
@@ -344,7 +343,7 @@ impl PredictiveCandidateKind {
     /// family label rather than a predictive-column identity.
     pub const fn family_tag(self) -> &'static str {
         match self {
-            PredictiveCandidateKind::Fixed(kind) => kind.as_str(),
+            PredictiveCandidateKind::Fixed(kind) => kind.family_tag(),
             PredictiveCandidateKind::MixtureClass => "mixture",
             PredictiveCandidateKind::RingOfClustersClass => "ring_clusters",
         }
@@ -1924,7 +1923,7 @@ pub fn build_cv_log_density_table(
 /// any race containing an adaptive class use honest held-out stacking; only a
 /// race of fixed candidates from one side of that boundary uses evidence alone.
 #[derive(Debug, Clone)]
-pub struct CrossClassRaceVerdict {
+pub struct PredictiveRaceVerdict {
     /// Candidate display names, column-aligned with the stacking table / weights.
     pub candidate_names: Vec<String>,
     /// Whether the race actually mixed model classes (smooth vs discrete).
@@ -2032,35 +2031,16 @@ impl EvidenceCertification {
     }
 }
 
-/// One candidate entering the cross-class adjudicator: its kind, its rank-aware
+/// One candidate entering the predictive adjudicator: its kind, its rank-aware
 /// Laplace negative-log-evidence (already computed on the common scale), how
 /// that evidence was certified (for the margin contract), and a selection-time
 /// held-out-density provider that refits per CV fold.
-pub struct CrossClassCandidate<'a> {
+pub struct PredictiveRaceCandidate<'a> {
     pub kind: PredictiveCandidateKind,
     pub negative_log_evidence: f64,
-    /// Certification of `negative_log_evidence`. Defaults conceptually to
-    /// [`EvidenceCertification::Exact`]; construct with [`Self::exact`] for the
-    /// classic point-value path.
+    /// Certification of `negative_log_evidence`.
     pub certification: EvidenceCertification,
     pub density_provider: HeldOutDensityProvider<'a>,
-}
-
-impl<'a> CrossClassCandidate<'a> {
-    /// Construct a candidate whose evidence is an exact point value (the
-    /// classic full-corpus dense-logdet path — no margin floor).
-    pub fn exact(
-        kind: PredictiveCandidateKind,
-        negative_log_evidence: f64,
-        density_provider: HeldOutDensityProvider<'a>,
-    ) -> Self {
-        Self {
-            kind,
-            negative_log_evidence,
-            certification: EvidenceCertification::Exact,
-            density_provider,
-        }
-    }
 }
 
 /// Why a same-class race could not transfer its approximate-evidence verdict to
@@ -2093,15 +2073,26 @@ pub struct InsufficientRaceMargin {
 /// different — but still deterministic — foldings. It only affects the
 /// stacking path; fixed same-class races are winner-take-all on evidence and
 /// ignore it. Pass [`STACKING_CV_SEED`] for the default folding.
-pub fn adjudicate_cross_class_race(
+pub fn adjudicate_predictive_race(
     n: usize,
-    candidates: Vec<CrossClassCandidate<'_>>,
+    candidates: Vec<PredictiveRaceCandidate<'_>>,
     folds: usize,
     seed: u64,
     stacking_config: StackingConfig,
-) -> Result<CrossClassRaceVerdict, String> {
+) -> Result<PredictiveRaceVerdict, String> {
     if candidates.is_empty() {
-        return Err("cross-class race requires at least one candidate".to_string());
+        return Err("predictive race requires at least one candidate".to_string());
+    }
+    for index in 0..candidates.len() {
+        if let Some(first_index) = candidates[..index]
+            .iter()
+            .position(|candidate| candidate.kind == candidates[index].kind)
+        {
+            return Err(format!(
+                "predictive race contains duplicate candidate {:?} at indices {first_index} and {index}",
+                candidates[index].kind.display_name()
+            ));
+        }
     }
     let names: Vec<String> = candidates.iter().map(|c| c.kind.display_name()).collect();
     let evidence: Vec<f64> = candidates.iter().map(|c| c.negative_log_evidence).collect();
@@ -2160,7 +2151,7 @@ pub fn adjudicate_cross_class_race(
                 }
             }
         }
-        return Ok(CrossClassRaceVerdict {
+        return Ok(PredictiveRaceVerdict {
             candidate_names: names,
             is_cross_class: false,
             negative_log_evidence: evidence,
@@ -2186,7 +2177,7 @@ pub fn adjudicate_cross_class_race(
             winner_index = idx;
         }
     }
-    Ok(CrossClassRaceVerdict {
+    Ok(PredictiveRaceVerdict {
         candidate_names: names,
         is_cross_class,
         negative_log_evidence: evidence,
@@ -2725,20 +2716,20 @@ mod tests {
         // Two smooth candidates (same class) whose evidence came from a logdet
         // enclosure with gap 1.0. Lead of 0.5 < gap ⇒ provisional.
         let near = vec![
-            CrossClassCandidate {
+            PredictiveRaceCandidate {
                 kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
                 negative_log_evidence: 100.0,
                 certification: EvidenceCertification::Enclosure { gap: 1.0 },
                 density_provider: trivial_provider(),
             },
-            CrossClassCandidate {
+            PredictiveRaceCandidate {
                 kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
                 negative_log_evidence: 100.5,
                 certification: EvidenceCertification::Enclosure { gap: 1.0 },
                 density_provider: trivial_provider(),
             },
         ];
-        let verdict = adjudicate_cross_class_race(
+        let verdict = adjudicate_predictive_race(
             8,
             near,
             STACKING_CV_FOLDS,
@@ -2758,20 +2749,20 @@ mod tests {
 
         // A lead that clears the gap transfers the verdict cleanly.
         let far = vec![
-            CrossClassCandidate {
+            PredictiveRaceCandidate {
                 kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
                 negative_log_evidence: 100.0,
                 certification: EvidenceCertification::Enclosure { gap: 1.0 },
                 density_provider: trivial_provider(),
             },
-            CrossClassCandidate {
+            PredictiveRaceCandidate {
                 kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
                 negative_log_evidence: 105.0,
                 certification: EvidenceCertification::Enclosure { gap: 1.0 },
                 density_provider: trivial_provider(),
             },
         ];
-        let verdict_far = adjudicate_cross_class_race(
+        let verdict_far = adjudicate_predictive_race(
             8,
             far,
             STACKING_CV_FOLDS,
@@ -2795,20 +2786,20 @@ mod tests {
         // Lead strictly inside the certified transfer margin.
         let lead = 0.5 * required;
         let candidates = vec![
-            CrossClassCandidate {
+            PredictiveRaceCandidate {
                 kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
                 negative_log_evidence: 10.0,
                 certification: EvidenceCertification::Coreset { certificate: cert },
                 density_provider: trivial_provider(),
             },
-            CrossClassCandidate {
+            PredictiveRaceCandidate {
                 kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
                 negative_log_evidence: 10.0 + lead,
                 certification: EvidenceCertification::Coreset { certificate: cert },
                 density_provider: trivial_provider(),
             },
         ];
-        let verdict = adjudicate_cross_class_race(
+        let verdict = adjudicate_predictive_race(
             8,
             candidates,
             STACKING_CV_FOLDS,
@@ -2825,7 +2816,7 @@ mod tests {
     #[test]
     fn adaptive_discrete_class_race_uses_honest_predictive_stacking() {
         let candidates = vec![
-            CrossClassCandidate {
+            PredictiveRaceCandidate {
                 kind: PredictiveCandidateKind::MixtureClass,
                 // Deliberately make evidence prefer the other class: the test
                 // must fail if this adaptive race takes the evidence shortcut.
@@ -2833,14 +2824,14 @@ mod tests {
                 certification: EvidenceCertification::Exact,
                 density_provider: Box::new(|_, eval| Ok(vec![0.0; eval.len()])),
             },
-            CrossClassCandidate {
+            PredictiveRaceCandidate {
                 kind: PredictiveCandidateKind::RingOfClustersClass,
                 negative_log_evidence: 0.0,
                 certification: EvidenceCertification::Exact,
                 density_provider: Box::new(|_, eval| Ok(vec![-20.0; eval.len()])),
             },
         ];
-        let verdict = adjudicate_cross_class_race(
+        let verdict = adjudicate_predictive_race(
             10,
             candidates,
             5,
@@ -2860,6 +2851,33 @@ mod tests {
                 "ring_clusters_class".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn predictive_race_rejects_duplicate_columns() {
+        let duplicate = vec![
+            PredictiveRaceCandidate {
+                kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
+                negative_log_evidence: 1.0,
+                certification: EvidenceCertification::Exact,
+                density_provider: trivial_provider(),
+            },
+            PredictiveRaceCandidate {
+                kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
+                negative_log_evidence: 2.0,
+                certification: EvidenceCertification::Exact,
+                density_provider: trivial_provider(),
+            },
+        ];
+        let error = adjudicate_predictive_race(
+            8,
+            duplicate,
+            4,
+            STACKING_CV_SEED,
+            StackingConfig::default(),
+        )
+        .expect_err("duplicate predictive columns make stacking non-identifiable");
+        assert!(error.contains("duplicate candidate \"circle\""), "{error}");
     }
 
     /// #1386: the `seed` mixed into the cross-class CV folding is functional, not

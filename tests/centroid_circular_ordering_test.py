@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Any
 
@@ -92,6 +93,10 @@ class CentroidCircularOrderingTest(unittest.TestCase):
             _CO.centroid_circular_ordering(coords, 7, n_null=0)
         with self.assertRaises(ValueError):
             _CO.kmeans_centroids(np.zeros((8, 2)), 2)
+        with self.assertRaises(TypeError):
+            _CO.centroid_circular_ordering(
+                np.ones((8, 2), dtype=np.complex128) * (1.0 + 2.0j), 3
+            )
 
     def test_single_cluster_is_the_mean_not_the_seed_row(self) -> None:
         coords = np.array([[0.0, 0.0], [2.0, 4.0], [7.0, -1.0]])
@@ -99,9 +104,28 @@ class CentroidCircularOrderingTest(unittest.TestCase):
         np.testing.assert_allclose(centers[0], coords.mean(axis=0), atol=1.0e-15)
 
     def test_rank_deficient_gaussian_null_needs_no_ridge(self) -> None:
-        centers = np.column_stack((np.arange(7, dtype=np.float64), np.zeros(7)))
+        angle = 0.731
+        direction = np.array([np.cos(angle), np.sin(angle)])
+        coordinate = np.arange(7, dtype=np.float64) - 3.0
+        centers = np.array([1.0e6, -2.0e6]) + coordinate[:, None] * direction
         observed_cv, _ = _CO.ring_stats(centers)
-        p_value = _CO.ring_mc_pvalue(centers, observed_cv, n_null=64, seed=3)
+        _, _, right = np.linalg.svd(
+            centers - centers.mean(axis=0, keepdims=True), full_matrices=False
+        )
+        fitted_direction = right[0]
+        original_ring_stats = _CO.ring_stats
+
+        def certify_rank_one(draw: np.ndarray) -> tuple[float, float]:
+            centered = draw - draw.mean(axis=0, keepdims=True)
+            off_axis = (
+                centered[:, 0] * fitted_direction[1]
+                - centered[:, 1] * fitted_direction[0]
+            )
+            self.assertLess(float(np.max(np.abs(off_axis))), 1.0e-12)
+            return original_ring_stats(draw)
+
+        with mock.patch.object(_CO, "ring_stats", side_effect=certify_rank_one):
+            p_value = _CO.ring_mc_pvalue(centers, observed_cv, n_null=64, seed=3)
         self.assertGreater(p_value, 0.0)
         self.assertLessEqual(p_value, 1.0)
 

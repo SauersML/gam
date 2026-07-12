@@ -13,9 +13,9 @@
 
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
 use gam::solver::topology_selector::{
-    AutoTopologyKind, CrossClassCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
+    AutoTopologyKind, PredictiveRaceCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
     MIXTURE_K_LADDER, PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED,
-    adjudicate_cross_class_race, fit_mixture_rung,
+    adjudicate_predictive_race, fit_mixture_rung,
 };
 use ndarray::{Array2, ArrayView2};
 
@@ -179,13 +179,13 @@ fn run_race(data: &Array2<f64>) -> RaceOutcome {
         gam::solver::topology_selector::mixture_density_provider(data.view(), mixture_k, cfg);
 
     let candidates = vec![
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
             negative_log_evidence: circle_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: circle_provider,
         },
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Mixture { k: mixture_k }),
             negative_log_evidence: mixture_evidence,
             certification: EvidenceCertification::Exact,
@@ -193,7 +193,7 @@ fn run_race(data: &Array2<f64>) -> RaceOutcome {
         },
     ];
 
-    let verdict = adjudicate_cross_class_race(
+    let verdict = adjudicate_predictive_race(
         data.nrows(),
         candidates,
         STACKING_CV_FOLDS,
@@ -357,20 +357,20 @@ fn same_class_race_keeps_evidence_headline() {
     let provider_a = ring_density_provider(data.view());
     let provider_b = ring_density_provider(data.view());
     let candidates = vec![
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
             negative_log_evidence: 100.0,
             certification: EvidenceCertification::Exact,
             density_provider: provider_a,
         },
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Euclidean),
             negative_log_evidence: 250.0,
             certification: EvidenceCertification::Exact,
             density_provider: provider_b,
         },
     ];
-    let verdict = adjudicate_cross_class_race(
+    let verdict = adjudicate_predictive_race(
         data.nrows(),
         candidates,
         STACKING_CV_FOLDS,

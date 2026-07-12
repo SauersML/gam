@@ -1,6 +1,6 @@
 //! End-to-end OBJECTIVE quality for the discrete-mixture rung of the topology
 //! race (Object 3a / WP-C): gam's cross-class adjudicator
-//! ([`adjudicate_cross_class_race`]) must make the RIGHT structural call about
+//! ([`adjudicate_predictive_race`]) must make the RIGHT structural call about
 //! whether 2-D latent coordinates live on a CONTINUOUS CIRCLE or in a finite set
 //! of DISCRETE CLUSTERS — and it must do so at least as well as the mature
 //! cluster-count baseline (scikit-learn's `GaussianMixture` with BIC model
@@ -69,9 +69,9 @@
 
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig, fit_gaussian_mixture};
 use gam::solver::topology_selector::{
-    AutoTopologyKind, CrossClassCandidate, EvidenceCertification, HeldOutDensityProvider,
+    AutoTopologyKind, PredictiveRaceCandidate, EvidenceCertification, HeldOutDensityProvider,
     MIXTURE_K_LADDER, PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED,
-    adjudicate_cross_class_race, fit_mixture_rung, mixture_density_provider,
+    adjudicate_predictive_race, fit_mixture_rung, mixture_density_provider,
 };
 use gam::test_support::reference::{Column, run_python};
 use ndarray::{Array2, ArrayView2};
@@ -388,11 +388,11 @@ fn circle_nle(data: ArrayView2<'_, f64>) -> Result<f64, String> {
 fn build_cross_class_candidates<'a>(
     data: ArrayView2<'a, f64>,
     cfg: GaussianMixtureConfig,
-) -> Vec<CrossClassCandidate<'a>> {
+) -> Vec<PredictiveRaceCandidate<'a>> {
     let mut candidates = Vec::new();
     // Smooth circle candidate.
     let circle_evidence = circle_nle(data).expect("circle evidence");
-    candidates.push(CrossClassCandidate {
+    candidates.push(PredictiveRaceCandidate {
         kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
         negative_log_evidence: circle_evidence,
         certification: EvidenceCertification::Exact,
@@ -404,7 +404,7 @@ fn build_cross_class_candidates<'a>(
             continue;
         }
         let nle = mixture_nle_for_k(data, k, cfg).expect("mixture evidence");
-        candidates.push(CrossClassCandidate {
+        candidates.push(PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Mixture { k }),
             negative_log_evidence: nle,
             certification: EvidenceCertification::Exact,
@@ -441,7 +441,7 @@ fn cluster_regime_gam_selects_mixture_and_recovers_k_match_or_beat_sklearn() {
 
     // gam cross-class adjudication: must headline the mixture rung.
     let candidates = build_cross_class_candidates(data.view(), cfg);
-    let verdict = adjudicate_cross_class_race(
+    let verdict = adjudicate_predictive_race(
         N,
         candidates,
         STACKING_CV_FOLDS,
@@ -500,7 +500,7 @@ fn circle_regime_gam_selects_smooth_circle_not_mixture_via_interpolated_holdout(
 
     // --- METRIC 3 (HEADLINE): cross-class verdict picks the smooth circle. ---
     let candidates = build_cross_class_candidates(data.view(), cfg);
-    let verdict = adjudicate_cross_class_race(
+    let verdict = adjudicate_predictive_race(
         N,
         candidates,
         STACKING_CV_FOLDS,

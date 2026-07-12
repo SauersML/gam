@@ -233,13 +233,13 @@ fn topology_selector_breaks_exact_ties_deterministically_by_candidate_order() {
     ]));
     let out = select_topology_with_fit(&selector, |kind| {
         Ok::<_, String>(TopologyAutoFitEvidence {
-            topology_name: kind.as_str().to_string(),
+            topology_name: kind.display_name(),
             raw_reml: 4.0,
             null_dim: 0.0,
             null_space_logdet: None,
             effective_dim: 2.0,
             n_obs: 50,
-            fit_handle: kind.as_str().to_string(),
+            fit_handle: kind.display_name(),
         })
     })
     .expect("Topology selection should succeed on tied candidates");

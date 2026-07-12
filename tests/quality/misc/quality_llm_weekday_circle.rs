@@ -11,7 +11,7 @@
 //!      each spread by a wide angular jitter that fills the ring into a genuine
 //!      continuum plus a tight radial jitter). The representational topology
 //!      race — the exact
-//!      `fit_mixture_rung` + `adjudicate_cross_class_race` machinery the
+//!      `fit_mixture_rung` + `adjudicate_predictive_race` machinery the
 //!      production fit drives — must select the smooth **S¹ atom** over the
 //!      discrete **7-cluster** null, and must do so with a *reported evidence
 //!      margin*: the held-out stacking mass on the circle strictly exceeds the
@@ -47,9 +47,9 @@
 use gam::inference::smooth_test::SmoothTestScale;
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
 use gam::solver::topology_selector::{
-    AutoTopologyKind, CrossClassCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
+    AutoTopologyKind, PredictiveRaceCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
     MIXTURE_K_LADDER, PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED,
-    adjudicate_cross_class_race, fit_mixture_rung, mixture_density_provider,
+    adjudicate_predictive_race, fit_mixture_rung, mixture_density_provider,
 };
 use gam::terms::structure::anova_atom::{BindingNotion, CarveInput, carve, fit_tensor_surface};
 use ndarray::{Array1, Array2, ArrayView2};
@@ -202,13 +202,13 @@ fn race_shape(data: &Array2<f64>) -> ShapeVerdict {
     let mixture_k = rung.winner().k;
 
     let candidates = vec![
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
             negative_log_evidence: ring_negative_log_evidence(data.view()),
             certification: EvidenceCertification::Exact,
             density_provider: ring_density_provider(data.view()),
         },
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Mixture { k: mixture_k }),
             negative_log_evidence: rung.winner().negative_log_evidence,
             certification: EvidenceCertification::Exact,
@@ -216,7 +216,7 @@ fn race_shape(data: &Array2<f64>) -> ShapeVerdict {
         },
     ];
 
-    let verdict = adjudicate_cross_class_race(
+    let verdict = adjudicate_predictive_race(
         data.nrows(),
         candidates,
         STACKING_CV_FOLDS,

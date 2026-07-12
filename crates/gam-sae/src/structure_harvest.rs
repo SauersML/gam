@@ -3108,7 +3108,7 @@ fn fit_topology_candidate(
     // roughness Gram unchanged. Decoder fitting never rewrites that objective.
     let penalty = s_raw.clone();
     Ok(TopologyAutoFitEvidence {
-        topology_name: spec.kind.as_str().to_string(),
+        topology_name: spec.kind.display_name(),
         raw_reml,
         // The closed-form REML score is ALREADY restricted to the penalty's range
         // complement (rank-aware: `log|λS|₊` over the non-null directions, the null
@@ -3467,7 +3467,7 @@ fn race_spec_set(
         let spec = by_kind.get(&kind).ok_or_else(|| {
             format!(
                 "race_birth_topology: no realized candidate for fused topology {:?}",
-                kind.as_str()
+                kind.display_name()
             )
         })?;
         fit_topology_candidate(spec, target, weights)

@@ -2654,8 +2654,8 @@ fn run_atom_shape_race(
     use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
     use gam::solver::topology_selector::EvidenceCertification;
     use gam::solver::{
-        AutoTopologyKind, CrossClassCandidate, Headline, PredictiveCandidateKind,
-        adjudicate_cross_class_race, fit_mixture_rung, fit_ring_of_clusters_rung,
+        AutoTopologyKind, PredictiveRaceCandidate, Headline, PredictiveCandidateKind,
+        adjudicate_predictive_race, fit_mixture_rung, fit_ring_of_clusters_rung,
     };
 
     if coords.ncols() != 2 {
@@ -2729,19 +2729,19 @@ fn run_atom_shape_race(
         PredictiveCandidateKind::RingOfClustersClass,
     ];
     let candidates = vec![
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: candidate_kinds[0],
             negative_log_evidence: ring_negative_log_evidence_2d(reporting_coords.view())?,
             certification: EvidenceCertification::Exact,
             density_provider: ring_provider_2d(raw_coords.clone()),
         },
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: candidate_kinds[1],
             negative_log_evidence: gaussian_negative_log_evidence_2d(reporting_coords.view())?,
             certification: EvidenceCertification::Exact,
             density_provider: gaussian_provider_2d(raw_coords.clone()),
         },
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: candidate_kinds[2],
             negative_log_evidence: mixture_winner.negative_log_evidence,
             certification: EvidenceCertification::Exact,
@@ -2756,7 +2756,7 @@ fn run_atom_shape_race(
                 std::rc::Rc::clone(&mixture_fold_orders),
             ),
         },
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: candidate_kinds[3],
             negative_log_evidence: ring_clusters.winner().negative_log_evidence,
             certification: EvidenceCertification::Exact,
@@ -2769,7 +2769,7 @@ fn run_atom_shape_race(
         },
     ];
     let verdict =
-        adjudicate_cross_class_race(n, candidates, folds, seed, StackingConfig::default())?;
+        adjudicate_predictive_race(n, candidates, folds, seed, StackingConfig::default())?;
     let stacking_weights = verdict
         .stacking
         .as_ref()

@@ -23,8 +23,8 @@
 
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig, UnionStructure};
 use gam::solver::topology_selector::{
-    AutoTopologyKind, CrossClassCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
-    PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_cross_class_race,
+    AutoTopologyKind, PredictiveRaceCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
+    PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_predictive_race,
     fit_union_candidate, fit_union_rung, union_density_provider,
 };
 use ndarray::{Array2, ArrayView2};
@@ -262,19 +262,19 @@ fn run_race(data: &Array2<f64>) -> RaceOutcome {
     let torus_evidence = torus_negative_log_evidence(data.view());
 
     let candidates = vec![
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Circle),
             negative_log_evidence: ring_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: ring_density_provider(data.view()),
         },
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Torus),
             negative_log_evidence: torus_evidence,
             certification: EvidenceCertification::Exact,
             density_provider: torus_density_provider(data.view()),
         },
-        CrossClassCandidate {
+        PredictiveRaceCandidate {
             kind: PredictiveCandidateKind::Fixed(AutoTopologyKind::Union {
                 structure: union_structure,
             }),
@@ -284,7 +284,7 @@ fn run_race(data: &Array2<f64>) -> RaceOutcome {
         },
     ];
 
-    let verdict = adjudicate_cross_class_race(
+    let verdict = adjudicate_predictive_race(
         data.nrows(),
         candidates,
         STACKING_CV_FOLDS,
