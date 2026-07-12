@@ -262,8 +262,8 @@ impl SurvivalMarginalSlopeFamily {
                         &q_geom,
                         d_v,
                     )?;
-                    let mut q_de =
-                        self.row_flex_primary_fourth_contracted_exact(row, block_states, &ud, &ue)?;
+                    let mut q_de = self
+                        .row_flex_primary_fourth_contracted_exact(row, block_states, &ud, &ue)?;
                     let t_d =
                         self.row_flex_primary_third_contracted_exact(row, block_states, &ud)?;
                     let mut gamma = t_d.dot(&ue);

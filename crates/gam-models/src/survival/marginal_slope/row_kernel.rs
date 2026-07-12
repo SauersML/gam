@@ -1077,7 +1077,9 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
 
         #[cfg(target_os = "linux")]
         {
-            use crate::gpu_kernels::survival_rowjet::{SurvivalRowInputs, survival_rigid_row_vgh};
+            use crate::gpu_kernels::survival_rowjet::{
+                SurvivalRowInputs, survival_rigid_row_vgh,
+            };
             let probit_scale = self.family.probit_frailty_scale();
             let qd1_lower = self.family.time_derivative_lower_bound();
             // Gather per-row inputs in parallel (the pure-f64 score summary + primary

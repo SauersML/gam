@@ -349,16 +349,15 @@ fn flex_row_nll<J: FlexJet>(
     wi: f64,
     di: f64,
 ) -> J {
-    FlexOuterPlan::new(chi1.value(), d1.value(), qd1.value(), surv0, surv1, wi, di).evaluate(
-        &FlexJetSources {
+    FlexOuterPlan::new(chi1.value(), d1.value(), qd1.value(), surv0, surv1, wi, di)
+        .evaluate(&FlexJetSources {
             eta0,
             eta1,
             q1,
             chi1,
             d1,
             qd1,
-        },
-    )
+        })
 }
 
 // ── Compiled two-allocation order-two lowering (value/grad/Hessian) ────────
@@ -421,11 +420,7 @@ impl DynamicOrder2Term for FlexOrder2Term<'_> {
         match self {
             Self::Dense { gradient, .. } => gradient[axis],
             Self::Axis { axis: source, .. } => {
-                if axis == *source {
-                    1.0
-                } else {
-                    0.0
-                }
+                if axis == *source { 1.0 } else { 0.0 }
             }
         }
     }
@@ -1061,7 +1056,8 @@ impl SurvivalMarginalSlopeFamily {
         );
         let value = row_value + wi * di * std::f64::consts::TAU.ln();
         let grad = Array1::from(row_gradient);
-        let hess = Array2::from_shape_vec((p, p), row_hessian).map_err(|e| e.to_string())?;
+        let hess =
+            Array2::from_shape_vec((p, p), row_hessian).map_err(|e| e.to_string())?;
         Ok((value, grad, hess))
     }
 
@@ -2653,7 +2649,8 @@ impl MomentTerm for Dual22 {
         //  = [(0,0),(1,0),(0,1),(2,0),(1,1),(0,2),(2,1),(1,2),(2,2)].
         const IDX: [[usize; 3]; 3] = [[0, 2, 5], [1, 4, 7], [3, 6, 8]];
         // Binomial C(n, k) for n, k ∈ {0, 1, 2}.
-        const BINOM: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 2.0, 1.0]];
+        const BINOM: [[f64; 3]; 3] =
+            [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 2.0, 1.0]];
         let mut out = [0.0f64; 9];
         for a in 0..=2usize {
             for b in 0..=2usize {
@@ -2667,7 +2664,8 @@ impl MomentTerm for Dual22 {
                         if j + l == 0 {
                             continue; // pure-M split dropped.
                         }
-                        let w = BINOM[a][j] * BINOM[b][l] * ((j + l) as f64) / (total as f64);
+                        let w = BINOM[a][j] * BINOM[b][l] * ((j + l) as f64)
+                            / (total as f64);
                         acc += w * c[IDX[j][l]] * mm[IDX[a - j][b - l]];
                     }
                 }
@@ -5100,10 +5098,9 @@ mod moment_engine_tests {
 
         for trial in 0..4usize {
             let f = trial as f64;
-            let d1 =
-                Array1::from_iter((0..p).map(|c| {
-                    0.11 + 0.03 * (c as f64) - 0.02 * (((c + trial) % 2) as f64) + 0.01 * f
-                }));
+            let d1 = Array1::from_iter((0..p).map(|c| {
+                0.11 + 0.03 * (c as f64) - 0.02 * (((c + trial) % 2) as f64) + 0.01 * f
+            }));
             let d2 = Array1::from_iter((0..p).map(|c| {
                 -0.06 + 0.045 * (((c + trial) % 3) as f64) + 0.02 * (c as f64) - 0.015 * f
             }));
