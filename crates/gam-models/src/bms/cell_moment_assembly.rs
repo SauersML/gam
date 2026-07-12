@@ -5297,6 +5297,286 @@ mod empirical_flex_jet_oracle_tests {
         }
     }
 
+    fn benchmark_runtime(total_dimension: usize) -> DeviationRuntime {
+        let wanted = total_dimension - 2;
+        for n_knots in 5..=40 {
+            let knots = Array1::from_iter(
+                (0..n_knots).map(|i| -2.45_f64 + 5.0_f64 * (i as f64) / ((n_knots - 1) as f64)),
+            );
+            if let Ok(runtime) = DeviationRuntime::try_new(knots, 0.0, 3)
+                && runtime.basis_dim() == wanted
+            {
+                return runtime;
+            }
+        }
+        panic!("no deviation runtime realizes total primary dimension {total_dimension}");
+    }
+
+    fn benchmark_grid() -> EmpiricalZGrid {
+        let nodes: Vec<f64> = (0..65).map(|i| -2.6 + 5.2 * (i as f64) / 64.0).collect();
+        let raw: Vec<f64> = nodes.iter().map(|z| (-0.5 * z * z).exp()).collect();
+        let total: f64 = raw.iter().sum();
+        let weights = raw.into_iter().map(|weight| weight / total).collect();
+        EmpiricalZGrid::new(nodes, weights, "empirical flex contraction benchmark")
+            .expect("valid benchmark grid")
+    }
+
+    fn make_benchmark_fixture(is_score_warp: bool, total_dimension: usize) -> FlexFixture {
+        let mut fixture = make_fixture(is_score_warp);
+        let runtime = benchmark_runtime(total_dimension);
+        let basis_dim = runtime.basis_dim();
+        let grid = benchmark_grid();
+        fixture.family.score_warp = is_score_warp.then(|| runtime.clone());
+        fixture.family.link_dev = (!is_score_warp).then(|| runtime.clone());
+        fixture.family.latent_measure = LatentMeasureKind::GlobalEmpirical { grid: grid.clone() };
+        fixture.primary = PrimarySlices {
+            q: 0,
+            logslope: 1,
+            h: is_score_warp.then_some(2..2 + basis_dim),
+            w: (!is_score_warp).then_some(2..2 + basis_dim),
+            total: 2 + basis_dim,
+        };
+        fixture.beta_dev = Array1::from_shape_fn(basis_dim, |i| {
+            let center = 0.5 * (basis_dim.saturating_sub(1) as f64);
+            0.06 * ((i as f64) - center) / center.max(1.0)
+        });
+        fixture.runtime = runtime;
+        fixture.grid = grid;
+        assert_eq!(fixture.primary.total, total_dimension);
+        fixture
+    }
+
+    fn benchmark_state(
+        fixture: &FlexFixture,
+    ) -> (f64, f64, Array1<f64>, BernoulliMarginalSlopeRowExactContext) {
+        let q = 0.23_f64;
+        let slope = 0.37_f64;
+        let beta = fixture.beta_dev.clone();
+        let scale = fixture.family.probit_frailty_scale();
+        let marginal = bernoulli_marginal_link_map(
+            &InverseLink::Standard(gam_problem::StandardLink::Probit),
+            q,
+        )
+        .expect("benchmark marginal map");
+        let intercept = witness_intercept(fixture, marginal.mu, slope, &beta, scale);
+        let mut f_a = 0.0;
+        for (node, weight) in fixture.grid.pairs() {
+            let eta = witness_eta(fixture, intercept, slope, &beta, node, scale);
+            f_a += weight * witness_normal_pdf(eta);
+        }
+        (
+            q,
+            slope,
+            beta,
+            BernoulliMarginalSlopeRowExactContext {
+                intercept,
+                m_a: f_a,
+                intercept_fast_path: false,
+                degree9_cells: None,
+            },
+        )
+    }
+
+    fn legacy_empirical_flex_third(
+        fixture: &FlexFixture,
+        q: f64,
+        slope: f64,
+        beta: &Array1<f64>,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        direction: &Array1<f64>,
+    ) -> Array2<f64> {
+        let r = fixture.primary.total;
+        let basis = (0..r)
+            .map(|axis| BernoulliMarginalSlopeFamily::unit_primary_direction(r, axis))
+            .collect::<Vec<_>>();
+        let (beta_h, beta_w) = if fixture.is_score_warp {
+            (Some(beta), None)
+        } else {
+            (None, Some(beta))
+        };
+        let mut output = Array2::zeros((r, r));
+        for row in 0..r {
+            for column in row..r {
+                let directions = [basis[row].view(), basis[column].view(), direction.view()];
+                let jet = fixture
+                    .family
+                    .empirical_flex_neglog_jet(
+                        0,
+                        &fixture.primary,
+                        q,
+                        slope,
+                        beta_h,
+                        beta_w,
+                        row_ctx,
+                        &directions,
+                        &fixture.grid,
+                    )
+                    .expect("legacy third contraction");
+                output[[row, column]] = jet.coeff(0b111);
+                output[[column, row]] = output[[row, column]];
+            }
+        }
+        output
+    }
+
+    fn legacy_empirical_flex_fourth(
+        fixture: &FlexFixture,
+        q: f64,
+        slope: f64,
+        beta: &Array1<f64>,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        direction_u: &Array1<f64>,
+        direction_v: &Array1<f64>,
+    ) -> Array2<f64> {
+        let r = fixture.primary.total;
+        let basis = (0..r)
+            .map(|axis| BernoulliMarginalSlopeFamily::unit_primary_direction(r, axis))
+            .collect::<Vec<_>>();
+        let (beta_h, beta_w) = if fixture.is_score_warp {
+            (Some(beta), None)
+        } else {
+            (None, Some(beta))
+        };
+        let mut output = Array2::zeros((r, r));
+        for row in 0..r {
+            for column in row..r {
+                let directions = [
+                    basis[row].view(),
+                    basis[column].view(),
+                    direction_u.view(),
+                    direction_v.view(),
+                ];
+                let jet = fixture
+                    .family
+                    .empirical_flex_neglog_jet(
+                        0,
+                        &fixture.primary,
+                        q,
+                        slope,
+                        beta_h,
+                        beta_w,
+                        row_ctx,
+                        &directions,
+                        &fixture.grid,
+                    )
+                    .expect("legacy fourth contraction");
+                output[[row, column]] = jet.coeff(0b1111);
+                output[[column, row]] = output[[row, column]];
+            }
+        }
+        output
+    }
+
+    fn timed_matrix(
+        repetitions: usize,
+        mut evaluate: impl FnMut() -> Array2<f64>,
+    ) -> (u128, Array2<f64>) {
+        let start = std::time::Instant::now();
+        let mut output = evaluate();
+        for _ in 1..repetitions {
+            output = evaluate();
+        }
+        std::hint::black_box(&output);
+        (start.elapsed().as_nanos() / repetitions as u128, output)
+    }
+
+    fn assert_benchmark_agreement(label: &str, old: &Array2<f64>, new: &Array2<f64>) {
+        assert_eq!(old.dim(), new.dim());
+        for ((row, column), &old_value) in old.indexed_iter() {
+            let new_value = new[[row, column]];
+            assert!(
+                (old_value - new_value).abs()
+                    <= 1e-8 * old_value.abs().max(new_value.abs()).max(1.0),
+                "{label}[{row},{column}]: legacy {old_value:+.12e} != canonical {new_value:+.12e}"
+            );
+        }
+    }
+
+    /// Temporary measurement gate. It is committed so the old/new executable
+    /// pair is immutable and reproducible, then removed together with the
+    /// legacy MultiDir oracle after its MSI release run is recorded.
+    #[test]
+    fn empirical_flex_multidir_cutover_benchmark_932() {
+        for is_score_warp in [true, false] {
+            for r in [4_usize, 8, 12, 18] {
+                let fixture = make_benchmark_fixture(is_score_warp, r);
+                let (q, slope, beta, row_ctx) = benchmark_state(&fixture);
+                let direction_u = Array1::from_shape_fn(r, |axis| {
+                    ((axis + 1) as f64 / r as f64) * if axis % 2 == 0 { 1.0 } else { -0.7 }
+                });
+                let direction_v = Array1::from_shape_fn(r, |axis| {
+                    ((r - axis) as f64 / r as f64) * if axis % 3 == 0 { -0.5 } else { 0.8 }
+                });
+                let (beta_h, beta_w) = if is_score_warp {
+                    (Some(&beta), None)
+                } else {
+                    (None, Some(&beta))
+                };
+
+                let (old_third_ns, old_third) = timed_matrix(1, || {
+                    legacy_empirical_flex_third(&fixture, q, slope, &beta, &row_ctx, &direction_u)
+                });
+                let (new_third_ns, new_third) = timed_matrix(5, || {
+                    fixture
+                        .family
+                        .empirical_flex_row_third_contracted_recompute(
+                            0,
+                            &fixture.primary,
+                            q,
+                            slope,
+                            beta_h,
+                            beta_w,
+                            &row_ctx,
+                            &direction_u,
+                            &fixture.grid,
+                        )
+                        .expect("canonical third contraction")
+                });
+                assert_benchmark_agreement("third", &old_third, &new_third);
+
+                let (old_fourth_ns, old_fourth) = timed_matrix(1, || {
+                    legacy_empirical_flex_fourth(
+                        &fixture,
+                        q,
+                        slope,
+                        &beta,
+                        &row_ctx,
+                        &direction_u,
+                        &direction_v,
+                    )
+                });
+                let (new_fourth_ns, new_fourth) = timed_matrix(5, || {
+                    fixture
+                        .family
+                        .empirical_flex_row_fourth_contracted_recompute(
+                            0,
+                            &fixture.primary,
+                            q,
+                            slope,
+                            beta_h,
+                            beta_w,
+                            &row_ctx,
+                            &direction_u,
+                            &direction_v,
+                            &fixture.grid,
+                        )
+                        .expect("canonical fourth contraction")
+                });
+                assert_benchmark_agreement("fourth", &old_fourth, &new_fourth);
+
+                let kind = if is_score_warp { "score" } else { "link" };
+                eprintln!(
+                    "BMS932_BENCH kind={kind} r={r} channel=t3 old_ns={old_third_ns} new_ns={new_third_ns} speedup={:.3}",
+                    old_third_ns as f64 / new_third_ns as f64,
+                );
+                eprintln!(
+                    "BMS932_BENCH kind={kind} r={r} channel=t4 old_ns={old_fourth_ns} new_ns={new_fourth_ns} speedup={:.3}",
+                    old_fourth_ns as f64 / new_fourth_ns as f64,
+                );
+            }
+        }
+    }
+
     // NOTE: the #932 hand-vs-jet2 timing baseline (`flex_handpath_vs_jet2_timing_932`)
     // was removed — `#[ignore]`d timing benches are banned by `build.rs`. The
     // *correctness* of `empirical_flex_row_nll_jet2` against the production hand
