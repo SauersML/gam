@@ -2103,16 +2103,24 @@ mod tests {
         y: Vec<f64>,
     }
 
-    impl RowNllProgram<1> for LogitProgram {
+    impl RowProgram<1> for LogitProgram {
         fn n_rows(&self) -> usize {
             self.eta.len()
         }
         fn primaries(&self, row: usize) -> Result<[f64; 1], String> {
             Ok([self.eta[row]])
         }
-        fn row_nll(&self, row: usize, p: &[Tower4<1>; 1]) -> Result<Tower4<1>, String> {
+        fn eval<S: crate::jet_scalar::JetScalar<1>>(
+            &self,
+            row: usize,
+            p: &[S; 1],
+        ) -> Result<S, String> {
             let eta = p[0];
-            Ok((eta.exp() + 1.0).ln() - eta * self.y[row])
+            Ok(eta
+                .exp()
+                .add(&S::constant(1.0))
+                .ln()
+                .sub(&eta.scale(self.y[row])))
         }
     }
 
@@ -2123,7 +2131,7 @@ mod tests {
             y: vec![1.0, 0.0, 1.0, 0.0, 1.0],
         };
         for row in 0..prog.n_rows() {
-            let t = evaluate_program(&prog, row).expect("logit program");
+            let t = program_full_tower(&prog, row).expect("logit program");
             let eta = prog.eta[row];
             let y = prog.y[row];
             let mu = 1.0 / (1.0 + (-eta).exp());
@@ -2256,16 +2264,27 @@ mod tests {
         y: Vec<f64>,
     }
 
-    impl RowNllProgram<2> for LocScaleProgram {
+    impl RowProgram<2> for LocScaleProgram {
         fn n_rows(&self) -> usize {
             self.eta.len()
         }
         fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
             Ok([self.eta[row], self.s[row]])
         }
-        fn row_nll(&self, row: usize, p: &[Tower4<2>; 2]) -> Result<Tower4<2>, String> {
-            let r = -(p[0] - self.y[row]);
-            Ok(p[1] + (p[1] * (-2.0)).exp() * r * r * 0.5)
+        fn eval<S: crate::jet_scalar::JetScalar<2>>(
+            &self,
+            row: usize,
+            p: &[S; 2],
+        ) -> Result<S, String> {
+            let r = S::constant(self.y[row]).sub(&p[0]);
+            Ok(p[1].add(
+                &p[1]
+                    .scale(-2.0)
+                    .exp()
+                    .mul(&r)
+                    .mul(&r)
+                    .scale(0.5),
+            ))
         }
     }
 
@@ -2278,7 +2297,7 @@ mod tests {
         };
         let tol = 1e-12;
         for row in 0..prog.n_rows() {
-            let t = evaluate_program(&prog, row).expect("locscale program");
+            let t = program_full_tower(&prog, row).expect("locscale program");
             let r = prog.y[row] - prog.eta[row];
             let w = (-2.0 * prog.s[row]).exp();
             // (η, s) = indices (0, 1).
@@ -2336,9 +2355,9 @@ mod tests {
                     }
                 }
             }
-            // The derived trait-surface helpers agree with direct contraction.
+            // The canonical trait-surface helpers agree with direct contraction.
             let dir = [0.7, -1.3];
-            let third = derived_third_contracted(&prog, row, &dir).expect("third");
+            let third = program_third_contracted(&prog, row, &dir).expect("third");
             for a in 0..2 {
                 for b in 0..2 {
                     let want = t.t3[a][b][0] * dir[0] + t.t3[a][b][1] * dir[1];
@@ -2371,7 +2390,7 @@ mod tests {
         }
     }
 
-    impl RowNllProgram<3> for GnarlyProgram {
+    impl RowProgram<3> for GnarlyProgram {
         fn n_rows(&self) -> usize {
             self.primaries.len()
         }
@@ -2381,16 +2400,26 @@ mod tests {
                 .copied()
                 .ok_or_else(|| format!("gnarly: row {row} out of range"))
         }
-        fn row_nll(&self, row: usize, p: &[Tower4<3>; 3]) -> Result<Tower4<3>, String> {
+        fn eval<S: crate::jet_scalar::JetScalar<3>>(
+            &self,
+            row: usize,
+            p: &[S; 3],
+        ) -> Result<S, String> {
             let tau = *self
                 .tau
                 .get(row)
                 .ok_or_else(|| format!("gnarly: tau row {row} out of range"))?;
-            let a = (p[0] * p[1]).exp();
-            let b = (p[2] * p[2] + 1.0).sqrt();
-            let c = (a + b + tau).ln();
-            let d = (p[1] * 0.5 + 2.0).powf(1.7);
-            Ok(c / d + (p[0] - p[2]) * (p[0] - p[2]) * 0.25)
+            let a = p[0].mul(&p[1]).exp();
+            let b = p[2]
+                .mul(&p[2])
+                .add(&S::constant(1.0))
+                .sqrt();
+            let c = a.add(&b).add(&S::constant(tau)).ln();
+            let d = p[1].scale(0.5).add(&S::constant(2.0)).powf(1.7);
+            let delta = p[0].sub(&p[2]);
+            Ok(c
+                .mul(&d.recip())
+                .add(&delta.mul(&delta).scale(0.25)))
         }
     }
 
@@ -2403,7 +2432,7 @@ mod tests {
             row: usize,
             p: [f64; 3],
         }
-        impl RowNllProgram<3> for At<'_> {
+        impl RowProgram<3> for At<'_> {
             fn n_rows(&self) -> usize {
                 1
             }
@@ -2413,14 +2442,18 @@ mod tests {
                 }
                 Ok(self.p)
             }
-            fn row_nll(&self, eval_row: usize, vars: &[Tower4<3>; 3]) -> Result<Tower4<3>, String> {
+            fn eval<S: crate::jet_scalar::JetScalar<3>>(
+                &self,
+                eval_row: usize,
+                vars: &[S; 3],
+            ) -> Result<S, String> {
                 if eval_row != 0 {
                     return Err(format!("gnarly-at: eval row {eval_row} out of range"));
                 }
-                self.base.row_nll(self.row, vars)
+                self.base.eval(self.row, vars)
             }
         }
-        evaluate_program(&At { base: prog, row, p }, 0).expect("gnarly tower")
+        program_full_tower(&At { base: prog, row, p }, 0).expect("gnarly tower")
     }
 
     #[test]
@@ -2945,7 +2978,7 @@ mod tests {
             s: vec![-0.5],
             y: vec![1.0],
         };
-        let t = evaluate_program(&prog, 0).expect("tower");
+        let t = program_full_tower(&prog, 0).expect("tower");
         let dir = [0.6, -0.2];
         let mut third = t.third_contracted(&dir);
         let honest = KernelChannels {
@@ -3021,7 +3054,7 @@ mod tests {
             [3, 2, 1, 0],
         ];
         for row in 0..prog.n_rows() {
-            let t = evaluate_program(&prog, row).expect("gnarly tower");
+            let t = program_full_tower(&prog, row).expect("gnarly tower");
             let scale_t3 =
                 t.t3.iter()
                     .flatten()
