@@ -583,6 +583,49 @@ fn beta_scaled_digamma(c: f64, shape: f64, reciprocal_term: f64) -> f64 {
     }
 }
 
+#[inline]
+fn beta_log_normalizer_from_log_shapes(log_a: f64, log_b: f64, log_phi: f64) -> f64 {
+    let a = log_a.exp();
+    let b = log_b.exp();
+    match (a == 0.0, b == 0.0) {
+        (true, true) => log_a + log_b - log_phi,
+        (true, false) => log_a,
+        (false, true) => log_b,
+        (false, false) => beta_log_normalizer(a, b, log_phi.exp()),
+    }
+}
+
+#[inline]
+fn beta_fitted_loglikelihood_unit_from_eta(
+    y: f64,
+    eta: f64,
+    phi: f64,
+) -> Result<f64, EstimationError> {
+    let log_mu = -softplus(-eta);
+    let log_one_minus_mu = -softplus(eta);
+    let log_phi = phi.ln();
+    let log_a = log_phi + log_mu;
+    let log_b = log_phi + log_one_minus_mu;
+    let log_normalizer = beta_log_normalizer_from_log_shapes(log_a, log_b, log_phi);
+    let scaled_log = |log_coefficient: f64, logarithm: f64| {
+        if logarithm == 0.0 {
+            0.0
+        } else {
+            logarithm.signum() * (log_coefficient + logarithm.abs().ln()).exp()
+        }
+    };
+    stable_finite_signed_sum(
+        &[
+            log_normalizer,
+            scaled_log(log_a, y.ln()),
+            scaled_log(log_b, (-y).ln_1p()),
+            -y.ln(),
+            -(-y).ln_1p(),
+        ],
+        "Beta fitted log-likelihood",
+    )
+}
+
 /// Fallible, atomic single-row deviance/score oracle threading the log-measure
 /// scale. Production deviance/REML paths call this directly with a real
 /// `log_measure_scale`; the deviance unit tests exercise the `scale = 0` case
@@ -970,8 +1013,6 @@ pub(crate) fn deviance_eta_row_with_log_measure_scale(
                     eta,
                 ));
             }
-            let log_mu = -softplus(-eta);
-            let log_one_minus_mu = -softplus(eta);
             let (mu, one_minus_mu) = logit_probability_pair(eta);
             let tail = (-eta.abs()).exp();
             let dmu = tail / ((1.0 + tail) * (1.0 + tail));
@@ -983,23 +1024,43 @@ pub(crate) fn deviance_eta_row_with_log_measure_scale(
             if !(a.is_finite() && a >= 0.0 && b.is_finite() && b >= 0.0) {
                 return Err(deviance_row_error(row, "beta shape", eta, a.max(b)));
             }
-            let saturated = beta_saturated_loglikelihood_unit(y, *phi)?;
-            let log_normalizer = if a < f64::MIN_POSITIVE {
-                // Γ(a) = Γ(1+a)/a, and b rounds exactly to phi once the
-                // logit-tail shape is subnormal. Thus
-                // ln Γ(phi)-ln Γ(a)-ln Γ(b) -> ln(a), which remains
-                // representable through log_a even when a itself underflows.
-                phi.ln() + log_mu
-            } else if b < f64::MIN_POSITIVE {
-                phi.ln() + log_one_minus_mu
+            let logit_y = y.ln() - (1.0 - y).ln();
+            let saturated_eta = beta_eta_for_logit_target(logit_y, *phi)?;
+            let saturated = beta_fitted_loglikelihood_unit_from_eta(y, saturated_eta, *phi)?;
+            let fitted = beta_fitted_loglikelihood_unit_from_eta(y, eta, *phi)?;
+            let eta_difference = eta - saturated_eta;
+            let half_unit = if eta_difference == 0.0 {
+                0.0
+            } else if eta_difference.abs() <= 1.0e-6 {
+                let (saturated_mu, saturated_one_minus_mu) =
+                    logit_probability_pair(saturated_eta);
+                let saturated_a = saturated_mu * *phi;
+                let saturated_b = saturated_one_minus_mu * *phi;
+                let saturated_c = *phi * saturated_mu * saturated_one_minus_mu;
+                let bracket = digamma(saturated_a) - digamma(saturated_b) - logit_y;
+                let score_at_saturation = saturated_c * bracket;
+                let curvature = saturated_c * (1.0 - 2.0 * saturated_mu) * bracket
+                    + saturated_c
+                        * saturated_c
+                        * (gam_math::jet_tower::trigamma(saturated_a)
+                            + gam_math::jet_tower::trigamma(saturated_b));
+                let local = score_at_saturation * eta_difference
+                    + 0.5 * curvature * eta_difference * eta_difference;
+                if local.is_finite() {
+                    local
+                } else {
+                    stable_finite_signed_sum(
+                        &[saturated, -fitted],
+                        "Beta likelihood deviance difference",
+                    )?
+                }
             } else {
-                beta_log_normalizer(a, b, *phi)
+                stable_finite_signed_sum(
+                    &[saturated, -fitted],
+                    "Beta likelihood deviance difference",
+                )?
             };
-            let fitted = log_normalizer + *phi * xlogy(mu, y) + *phi * xlogy(one_minus_mu, 1.0 - y)
-                - y.ln()
-                - (1.0 - y).ln();
-            let half_unit = saturated - fitted;
-            if !half_unit.is_finite() {
+            if !half_unit.is_finite() || half_unit < 0.0 {
                 return Err(deviance_row_error(
                     row,
                     "beta half-deviance",
@@ -1024,7 +1085,6 @@ pub(crate) fn deviance_eta_row_with_log_measure_scale(
             }
             let scaled_psi_a = beta_scaled_digamma(c, a, one_minus_mu);
             let scaled_psi_b = beta_scaled_digamma(c, b, mu);
-            let logit_y = y.ln() - (1.0 - y).ln();
             let score_unit = scaled_psi_a - scaled_psi_b - c * logit_y;
             if !score_unit.is_finite() {
                 return Err(deviance_row_error(row, "beta eta score", eta, score_unit));
@@ -1218,6 +1278,55 @@ fn beta_null_score(eta: f64, phi: f64, weighted_logit_response: f64) -> f64 {
     beta_scaled_digamma(c, a, one_minus_mu)
         - beta_scaled_digamma(c, b, mu)
         - c * weighted_logit_response
+}
+
+fn beta_eta_for_logit_target(target: f64, phi: f64) -> Result<f64, EstimationError> {
+    let mut lower = -1.0_f64;
+    let mut upper = 1.0_f64;
+    let mut lower_score = beta_null_score(lower, phi, target);
+    let mut upper_score = beta_null_score(upper, phi, target);
+    while lower_score > 0.0 && lower > -1024.0 {
+        lower *= 2.0;
+        lower_score = beta_null_score(lower, phi, target);
+    }
+    while upper_score < 0.0 && upper < 1024.0 {
+        upper *= 2.0;
+        upper_score = beta_null_score(upper, phi, target);
+    }
+    if lower_score.is_nan() || upper_score.is_nan() || lower_score > 0.0 || upper_score < 0.0 {
+        return Err(EstimationError::InvalidInput(format!(
+            "Beta score root could not be bracketed: lower=({lower},{lower_score}), upper=({upper},{upper_score}), target={target}"
+        )));
+    }
+    for _ in 0..256 {
+        let midpoint = lower + 0.5 * (upper - lower);
+        if midpoint == lower || midpoint == upper {
+            return Ok(if lower_score.abs() <= upper_score.abs() {
+                lower
+            } else {
+                upper
+            });
+        }
+        let score = beta_null_score(midpoint, phi, target);
+        if score == 0.0 {
+            return Ok(midpoint);
+        }
+        if !score.is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "Beta score root is non-finite at eta={midpoint}: {score}"
+            )));
+        }
+        if score < 0.0 {
+            lower = midpoint;
+            lower_score = score;
+        } else {
+            upper = midpoint;
+            upper_score = score;
+        }
+    }
+    Err(EstimationError::InvalidInput(
+        "Beta score root did not reach an adjacent-float bracket".into(),
+    ))
 }
 
 /// Solve the fixed-precision Beta intercept score in its unbounded logit
@@ -1548,7 +1657,9 @@ fn omitted_log_likelihood_row(
             )
         }
         ResponseFamily::Beta { phi } => {
-            let saturated = beta_saturated_loglikelihood_unit(y, *phi)?;
+            let logit_y = y.ln() - (-y).ln_1p();
+            let saturated_eta = beta_eta_for_logit_target(logit_y, *phi)?;
+            let saturated = beta_fitted_loglikelihood_unit_from_eta(y, saturated_eta, *phi)?;
             if !saturated.is_finite() {
                 return Err(deviance_row_error(
                     row,
@@ -1722,45 +1833,6 @@ pub(crate) fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
         yi.powf(2.0 - p) / ((1.0 - p) * (2.0 - p)) - yi * mui_c.powf(1.0 - p) / (1.0 - p)
             + mui_c.powf(2.0 - p) / (2.0 - p)
     }
-}
-
-#[inline]
-fn beta_saturated_loglikelihood_unit(y: f64, phi: f64) -> Result<f64, EstimationError> {
-    if !valid_beta_phi(phi) || !valid_beta_response(y) {
-        crate::bail_invalid_estim!(
-            "Beta saturated likelihood requires y in (0,1) and positive finite precision; got y={y}, phi={phi}"
-        );
-    }
-    let log_phi = phi.ln();
-    let log_y = y.ln();
-    let log_one_minus_y = (-y).ln_1p();
-    let log_a = log_phi + log_y;
-    let log_b = log_phi + log_one_minus_y;
-    let a = log_a.exp();
-    let b = log_b.exp();
-    let log_normalizer = match (a == 0.0, b == 0.0) {
-        (true, true) => log_a + log_b - log_phi,
-        (true, false) => log_a,
-        (false, true) => log_b,
-        (false, false) => beta_log_normalizer(a, b, phi),
-    };
-    let scaled_log = |log_coefficient: f64, logarithm: f64| {
-        if logarithm == 0.0 {
-            0.0
-        } else {
-            logarithm.signum() * (log_coefficient + logarithm.abs().ln()).exp()
-        }
-    };
-    stable_finite_signed_sum(
-        &[
-            log_normalizer,
-            scaled_log(log_a, log_y),
-            scaled_log(log_b, log_one_minus_y),
-            -log_y,
-            -log_one_minus_y,
-        ],
-        "Beta saturated log-likelihood",
-    )
 }
 
 /// `ln(2π)` — the per-observation Gaussian / saddlepoint normalizer constant.

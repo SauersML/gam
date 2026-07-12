@@ -2399,7 +2399,7 @@ where
                 finalgrad_norm,
             )?;
             match smoothing_outcome {
-                super::reml::SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
+                super::reml::eval::SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
                     return Err(EstimationError::InvalidInput(format!(
                         "exact smoothing-corrected covariance unavailable: {reason:?}"
                     )));

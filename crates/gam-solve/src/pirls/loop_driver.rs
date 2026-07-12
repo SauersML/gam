@@ -1207,7 +1207,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         let beta_transformed = pls_result.beta;
         let penalized_hessian = pls_result.penalized_hessian;
         let edf = pls_result.edf;
-        let baseridge = pls_result.ridge_passport.delta();
+        let baseridge = pls_result.ridge_used;
 
         // eta = offset + X Qs beta (composed, no materialization) unless a
         // design-moving ψ tensor cache explicitly says the surface rows are a
@@ -1577,7 +1577,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         } else {
             glm_first_step_gram.cloned()
         },
-    )?;
+    );
 
     // Apply integrated (GHQ) likelihood if per-observation SE is provided.
     // This is used by the calibrator to coherently account for base prediction uncertainty.

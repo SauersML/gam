@@ -1,6 +1,7 @@
 use super::inner_strategy::GeometryBackendKind;
 use super::penalty_logdet::PenaltyPseudologdet;
 use super::*;
+use crate::model_types::SmoothingCorrectionMethod;
 use gam_linalg::matrix::symmetrize_in_place;
 use std::sync::atomic::Ordering;
 

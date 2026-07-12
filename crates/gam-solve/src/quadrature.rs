@@ -180,8 +180,8 @@ use crate::mixture_link::{
 use gam_math::probability::erfcx_nonnegative;
 use gam_math::special::stable_polynomial_times_exp_neg as cloglog_stable_poly_times_exp_neg;
 use gam_problem::types::{
-    InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkComponent, LinkFunction,
-    MixtureLinkState, ResponseFamily, SasLinkState, StandardLink,
+    GlmLikelihoodSpec, InverseLink, LinkComponent, LinkFunction, MixtureLinkState, ResponseFamily,
+    SasLinkState, StandardLink,
 };
 use statrs::function::erf::erfc;
 
@@ -3168,14 +3168,9 @@ pub fn integrated_inverse_link_jetwith_state(
 /// family, while all link-specific quadrature/special-function routing stays in
 /// the quadrature domain.
 ///
-/// `scale` carries the exponential-dispersion metadata the observation-model
-/// variance depends on (`LikelihoodScaleMetadata`): the Tweedie/Gamma variance
-/// arms read the dispersion `φ` (Tweedie) / shape `k` (Gamma) from it rather than
-/// assuming a unit scale. Families whose variance is fully pinned by the mean
-/// (Binomial/Poisson, `φ ≡ 1`) ignore `scale`; for those, callers may pass any
-/// metadata (`FixedDispersion { phi: 1.0 }` is the canonical unit-scale label).
-/// A Gamma/Tweedie response paired with `scale` metadata that does not carry the
-/// corresponding dispersion is rejected rather than silently treated as `φ = 1`.
+/// Family and scale metadata are resolved atomically from `likelihood`; a
+/// Gamma/Tweedie response without its required scalar, or any duplicated
+/// family/metadata scalar that disagrees, is rejected before integration.
 #[inline]
 pub fn integrated_family_moments_jet(
     quadctx: &QuadratureContext,
@@ -3281,7 +3276,7 @@ pub fn integrated_family_moments_jet(
                 })
             }
             InverseLink::Mixture(state) => {
-                let jet = integrated_mixture_jet(quadctx, e, se, state)?;
+                let jet = integrated_mixture_jet(quadctx, e, se, &state)?;
                 let mean = jet.mean;
                 Ok(IntegratedMomentsJet {
                     mean,
@@ -3369,7 +3364,7 @@ pub fn integrated_family_moments_jet(
                     let phi = resolved_scale
                         .tweedie_phi()
                         .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-                    phi * mean.powf(*p)
+                    phi * mean.powf(p)
                 }
                 ResponseFamily::NegativeBinomial { .. } => {
                     let theta = resolved_scale.negative_binomial_theta().map_err(|error| {
