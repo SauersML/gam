@@ -424,11 +424,8 @@ mod probit_parity_tests {
             log_ndtr_mills_curvature(f64::NEG_INFINITY),
             (f64::NEG_INFINITY, f64::INFINITY, 1.0)
         );
-        assert!(
-            log_ndtr_mills_curvature(f64::NAN)
-                .into_iter()
-                .all(f64::is_nan)
-        );
+        let (nan_log, nan_mills, nan_curv) = log_ndtr_mills_curvature(f64::NAN);
+        assert!(nan_log.is_nan() && nan_mills.is_nan() && nan_curv.is_nan());
 
         let h = 1.0e-5;
         for x in [-8.0_f64, -4.0, -2.0, 0.0, 3.0] {
