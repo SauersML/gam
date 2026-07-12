@@ -8,6 +8,7 @@ use super::gradient_paths::*;
 use super::hessian_paths::*;
 use super::row_kernel::*;
 use super::*;
+use gam_math::probability::normal_logcdf_derivatives;
 
 /// Second-order scalar moment payload for a cubic coefficient jet.
 ///
@@ -3424,10 +3425,10 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         let signed_margin = s_y * eta_val;
-        let (log_cdf, lambda) = signed_probit_logcdf_and_mills_ratio(signed_margin);
-        let neglog_val = -w_i * log_cdf;
-        let d1_m = -w_i * lambda;
-        let d2_m = w_i * lambda * (signed_margin + lambda);
+        let probit = normal_logcdf_derivatives(signed_margin);
+        let neglog_val = -w_i * probit[0];
+        let d1_m = -w_i * probit[1];
+        let d2_m = -w_i * probit[2];
 
         if need_hessian {
             let hess = &mut scratch.hess;

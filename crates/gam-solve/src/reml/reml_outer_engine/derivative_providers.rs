@@ -294,11 +294,7 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         let x_v = self.x_transformed.matrixvectormultiply(v_k); // X vₖ: n-vector
 
         let crate::pirls::DirectionalWorkingCurvature::Diagonal(mut neg_c_xv) =
-            crate::pirls::directionalworking_curvature_from_c_array(
-                &self.c_array,
-                &self.hessian_weights,
-                &x_v,
-            );
+            crate::pirls::directionalworking_curvature_from_c_array(&self.c_array, &x_v);
         neg_c_xv.mapv_inplace(|value| -value);
 
         // −Xᵀ diag(c ⊙ Xvₖ) X via the design's matrix-free weighted gram.
@@ -326,11 +322,7 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
     ) -> Result<Option<DriftDerivResult>, String> {
         let x_v = self.x_transformed.matrixvectormultiply(v_k);
         let crate::pirls::DirectionalWorkingCurvature::Diagonal(mut neg_c_xv) =
-            crate::pirls::directionalworking_curvature_from_c_array(
-                &self.c_array,
-                &self.hessian_weights,
-                &x_v,
-            );
+            crate::pirls::directionalworking_curvature_from_c_array(&self.c_array, &x_v);
         neg_c_xv.mapv_inplace(|value| -value);
         Ok(Some(DriftDerivResult::Operator(Arc::new(
             GlmCurvatureCorrectionOperator {
@@ -360,13 +352,9 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         let n = self.x_transformed.nrows();
         let mut weights = Array1::zeros(n);
 
-        // c ⊙ X u_{kl}, masked the same way as the Hessian curvature surface.
+        // Exact c ⊙ X u_{kl} on the represented Hessian curvature surface.
         let crate::pirls::DirectionalWorkingCurvature::Diagonal(first_weights) =
-            crate::pirls::directionalworking_curvature_from_c_array(
-                &self.c_array,
-                &self.hessian_weights,
-                &x_ukl,
-            );
+            crate::pirls::directionalworking_curvature_from_c_array(&self.c_array, &x_ukl);
         weights.assign(&first_weights);
 
         // + d ⊙ (X vₖ) ⊙ (X vₗ)

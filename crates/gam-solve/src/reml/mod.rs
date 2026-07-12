@@ -1442,7 +1442,6 @@ mod tests {
         let eta_dot = &x_tau_beta + &gam_linalg::faer_ndarray::fast_av(&x, &b_analytic);
         let w_direction = crate::pirls::directionalworking_curvature_from_c_array(
             &pr.solve_c_array.to_owned(),
-            &pr.finalweights.to_owned(),
             &eta_dot,
         );
         let wx = RemlState::row_scale(&x, &pr.finalweights.to_owned());

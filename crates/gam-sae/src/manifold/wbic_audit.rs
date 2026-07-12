@@ -5,9 +5,9 @@
 //! `½·d_eff·log N_eff` (see [`super::construction::realised_rank_charge_dof`]; #2a:
 //! the occupancy-aware `N_eff = Σ_row a²`, not the global `n`), with
 //! `d_eff = rank_chargeable · basis_edf`. Two integer ranks must not be
-//! conflated. `rank_mp` is the Marchenko–Pastur detection count of reconstruction-
+//! conflated. `rank_mp` is the Marchenko–Pastur hard count of reconstruction-
 //! Gram eigenvalues above the noise edge. Production uses `rank_chargeable`:
-//! it equals `rank_mp` when anything is detected, promotes an MP-rank-zero but
+//! it equals `rank_mp` when any direction clears the edge, promotes an MP-rank-zero but
 //! numerically alive decoder to rank one, and leaves only a genuinely vanished
 //! decoder at zero (#2258). The `½·(·)·log n` Laplace charge is the correct
 //! free-energy penalty ONLY for a
@@ -67,7 +67,7 @@
 //!
 //! CHARGES.
 //! ```text
-//! rank_mp = Σ_k 1[μ_k > e]                         (integer MP detection count)
+//! rank_mp = Σ_k 1[μ_k > e]                         (integer MP reconstruction count)
 //! rank_chargeable = rank_mp,                         if rank_mp > 0
 //!                 = 1,                               if max μ > 10⁻⁹ R
 //!                 = 0,                               otherwise
@@ -90,7 +90,7 @@
 //!
 //! This module is an AUDIT: it does NOT change the default charge. It computes the
 //! reconstruction spectrum the SAME way the production core does and classifies
-//! detection versus chargeability through the SAME shared primitive (verified
+//! reconstruction rank versus chargeability through the SAME shared primitive (verified
 //! against [`super::construction::realised_rank_charge_dof`] for both resolved
 //! and weak-signal atoms in the tests).
 
@@ -118,12 +118,12 @@ fn wbic_tempered_rank_fraction(mu: f64, edge: f64, n_eff: f64) -> f64 {
 
 /// The reconstruction spectrum of ONE atom — the shared substrate both charges
 /// price. `mu` are the reconstruction-Gram eigenvalues `sv(diag(√λ)·Uᵀ·D)²/n_eff`
-/// (with `(λ,U)=eigh(G)`), `edge` the Marchenko–Pastur detection floor
+/// (with `(λ,U)=eigh(G)`), `edge` the Marchenko–Pastur reconstruction-rank edge
 /// `R·(1+√(p/n_eff))²`, `dispersion` is `R`, and
 /// `basis_edf = tr(G(G+λS)⁻¹)` is the ridge-trace effective basis count. This
 /// is exactly the decomposition inside
 /// [`super::construction::realised_rank_charge_dof`], surfaced so the WBIC soft
-/// count, hard MP detection count, and production chargeable count can be
+/// count, hard MP reconstruction count, and production chargeable count can be
 /// inspected without changing the production criterion.
 #[derive(Clone, Debug)]
 pub struct ReconSpectrum {
@@ -150,7 +150,7 @@ impl ReconSpectrum {
         &self.mu
     }
 
-    /// Validated Marchenko–Pastur detection edge.
+    /// Validated Marchenko–Pastur reconstruction-rank edge.
     pub fn mp_reconstruction_rank_edge(&self) -> f64 {
         self.edge
     }
@@ -173,17 +173,17 @@ impl ReconSpectrum {
         Ok(self)
     }
 
-    /// Hard Marchenko–Pastur detection count `Σ_k 1[μ_k > e]`.
+    /// Hard Marchenko–Pastur reconstruction-rank count `Σ_k 1[μ_k > e]`.
     ///
-    /// This is a diagnostic detection rank, not the production chargeable rank:
-    /// an alive decoder can have detection rank zero and still be charged rank
+    /// This is a diagnostic reconstruction rank, not the production chargeable rank:
+    /// an alive decoder can have reconstruction rank zero and still be charged rank
     /// one by [`Self::production_chargeable_rank`].
     pub fn mp_reconstruction_rank(&self) -> usize {
         self.rank_classification().mp_reconstruction_rank
     }
 
-    /// #2258 production CHARGEABLE rank — the hard MP detection count,
-    /// with a below-detection-edge but numerically ALIVE atom promoted to the
+    /// #2258 production CHARGEABLE rank — the hard MP reconstruction count,
+    /// with a below-rank-edge but numerically ALIVE atom promoted to the
     /// minimum non-degenerate rank 1. Mirrors the identical rule inside
     /// [`super::construction::realised_rank_charge_dof`] through the shared
     /// [`super::construction::classify_reconstruction_rank`] primitive;
@@ -211,12 +211,12 @@ impl ReconSpectrum {
             .sum()
     }
 
-    /// Theoretical hard-MP detection charge
+    /// Theoretical hard-MP reconstruction-rank charge
     /// `½·rank_mp·basis_edf·log N_eff`.
     ///
     /// This is deliberately not called the production charge: #2258 production
     /// uses [`Self::production_charge`] and can promote an alive, sub-edge atom
-    /// from MP detection rank zero to chargeable rank one.
+    /// from MP reconstruction rank zero to chargeable rank one.
     ///
     /// #2a — the log-sample-size is the atom's OCCUPANCY-aware effective sample size
     /// `N_eff = Σ_row a²` (`self.n_eff`), NOT the global row count `n`: `N_eff` is the
@@ -364,7 +364,7 @@ pub struct AuditRow {
     pub name: String,
     /// Rows the atom was fit on.
     pub n: usize,
-    /// Integer count of directions above the MP detection edge.
+    /// Integer count of directions above the MP reconstruction-rank edge.
     pub mp_reconstruction_rank: usize,
     /// Integer rank the production criterion actually charges, including #2258
     /// alive-below-edge promotion.
@@ -373,7 +373,7 @@ pub struct AuditRow {
     pub rank_soft: f64,
     /// Graded effective basis count.
     pub basis_edf: f64,
-    /// Theoretical hard-MP detection charge
+    /// Theoretical hard-MP reconstruction-rank charge
     /// `½·rank_mp·basis_edf·log N_eff`.
     pub mp_reconstruction_rank_charge: f64,
     /// Actual production rank / BIC charge
@@ -684,11 +684,11 @@ mod tests {
     }
 
     /// #2258 parity on the branch the old audit mislabeled: a nonzero decoder
-    /// can sit below the MP detection edge (rank 0) while remaining numerically
+    /// can sit below the MP reconstruction-rank edge (rank 0) while remaining numerically
     /// alive, and production charges it at the minimum rank 1. Both paths call
     /// the same classifier, so this test pins the semantic and numeric contract.
     #[test]
-    fn weak_signal_detection_zero_is_production_chargeable_one() {
+    fn weak_signal_reconstruction_rank_zero_is_production_chargeable_one() {
         let gram = Array2::<f64>::eye(1);
         let decoder = Array2::<f64>::ones((1, 1));
         let n_eff = 100.0;
@@ -921,9 +921,9 @@ mod tests {
     /// edge (a filled DISK) is OVER-charged by the rank charge — `C_rank > C_wbic`
     /// by a quantified margin, the number that reprices its birth/death decision.
     /// (c) A WEAK circle whose spectrum sits just below the edge exposes the key
-    /// semantic split: MP detection rank is zero, production chargeable rank is
+    /// semantic split: MP reconstruction rank is zero, production chargeable rank is
     /// one, and WBIC still pays fractional directions. (d) A noise-only fitted
-    /// decoder has the same detection/chargeability split; only an exactly
+    /// decoder has the same reconstruction-rank/chargeability split; only an exactly
     /// vanished decoder has production rank zero.
     #[test]
     fn wbic_audit_disagreement_table() {
@@ -995,7 +995,7 @@ mod tests {
 
         // (4) NEAR-SINGULAR WEAK CIRCLE — the complementary case: a weak circle
         // whose amplitude sits at the noise scale, so its reconstruction
-        // eigenvalues fall JUST BELOW the MP edge. The MP detection count drops
+        // eigenvalues fall JUST BELOW the MP edge. The MP reconstruction count drops
         // to 0, but #2258 production recognizes the decoder as alive and charges
         // the minimum rank 1; the tempered soft count remains fractional.
         {
@@ -1065,7 +1065,7 @@ mod tests {
         }
 
         // (7) EXACT VANISHING — only this degeneracy branch remains production
-        // rank zero. It is distinct from statistical non-detection.
+        // rank zero. It is distinct from a vanished decoder.
         rows.push(AuditRow::from_spectrum(
             "decoder vanished",
             &ReconSpectrum {
@@ -1127,7 +1127,7 @@ mod tests {
             line.production_delta_fraction,
             clusters.production_delta_fraction
         );
-        // (c) the weak near-edge circle is not MP-detected but is production-
+        // (c) the weak near-edge circle is below the MP rank edge but is production-
         // chargeable. The two ranks must remain separately visible.
         assert!(
             near.mp_reconstruction_rank == 0
@@ -1135,13 +1135,13 @@ mod tests {
                 && near.rank_soft > 0.0
                 && near.mp_reconstruction_rank_charge == 0.0
                 && near.production_charge > 0.0,
-            "weak near-edge circle must distinguish MP non-detection from production \
+            "weak near-edge circle must distinguish MP reconstruction rank from production \
              chargeability: mp={} prod={} soft={:.3}",
             near.mp_reconstruction_rank,
             near.production_chargeable_rank,
             near.rank_soft
         );
-        // (d) A fitted noise decoder is alive even when MP-undetected; an exactly
+        // (d) A fitted noise decoder is alive even below the MP rank edge; an exactly
         // vanished decoder, and only that fixture, stays production rank zero.
         assert!(
             blend.mp_reconstruction_rank == 0

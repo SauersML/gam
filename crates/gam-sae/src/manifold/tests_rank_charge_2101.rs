@@ -123,7 +123,7 @@ fn rank_charge_deff_accepts_circle_and_neutralises_vanishing() {
         0.5 * d_real[0] * (80f64).ln()
     );
 
-    // Vanishing is NOT synonymous with merely falling below the MP detection
+    // Vanishing is NOT synonymous with merely falling below the MP reconstruction-rank
     // edge. The latter is an alive-but-unresolved atom and production correctly
     // promotes it to chargeable rank 1. Derive a scale with a factor-four safety
     // margin below the separate categorical threshold instead of guessing an
@@ -711,9 +711,8 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
             .enumerate()
         {
             let expected = c * c * mu_0;
-            let tolerance = 512.0
-                * f64::EPSILON
-                * expected.max(base_spectrum.mp_reconstruction_rank_edge());
+            let tolerance =
+                512.0 * f64::EPSILON * expected.max(base_spectrum.mp_reconstruction_rank_edge());
             assert!(
                 (mu_c - expected).abs() <= tolerance,
                 "decoder scaling law failed on mode {axis}: \
@@ -749,7 +748,7 @@ fn rank_charge_deff_is_piecewise_constant_with_monotone_scale_transitions_2099()
     hard_transitions.sort_by(f64::total_cmp);
     assert!(
         vanished_transition < hard_transitions[0],
-        "the degeneracy boundary must lie below the first MP detection crossing"
+        "the degeneracy boundary must lie below the first MP reconstruction-rank crossing"
     );
 
     // The base scale's plateau is bounded by the nearest MP crossings. Probe two

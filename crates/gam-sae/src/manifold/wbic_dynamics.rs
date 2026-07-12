@@ -105,10 +105,10 @@ pub struct AtomLambdaTrajectory {
     pub lambda: Vec<f64>,
     /// WBIC tempered soft rank count at every checkpoint.
     pub rank_soft: Vec<f64>,
-    /// Hard Marchenko–Pastur detection count at every checkpoint.
+    /// Hard Marchenko–Pastur reconstruction-rank count at every checkpoint.
     pub mp_reconstruction_rank: Vec<usize>,
     /// Rank the production criterion charges at every checkpoint, including the
-    /// #2258 promotion of an alive decoder below the MP detection edge.
+    /// #2258 promotion of an alive decoder below the MP reconstruction-rank edge.
     pub production_chargeable_rank: Vec<usize>,
     /// Consecutive-step jumps with their birth evidence.
     pub jumps: Vec<LambdaJump>,

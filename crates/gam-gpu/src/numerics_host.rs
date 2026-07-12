@@ -144,6 +144,39 @@ pub fn log_ndtr_and_mills(x: f64) -> (f64, f64) {
     }
 }
 
+/// Joint `(log Φ(x), φ(x)/Φ(x), −d²log Φ(x)/dx²)` host oracle.
+///
+/// The curvature's deep-left branch differentiates the same 32-level Laplace
+/// continued fraction as the CPU model kernel, retaining its unit limit without
+/// subtracting the nearly equal `x` and Mills ratio. The CUDA source mirrors
+/// this operation order; host/device transcendental channels are ULP-close,
+/// while the rational curvature branch is operation-for-operation identical
+/// when device FMA contraction is disabled.
+pub fn log_ndtr_mills_curvature(x: f64) -> (f64, f64, f64) {
+    let (log_cdf, lambda) = log_ndtr_and_mills(x);
+    if x.is_nan() {
+        return (log_cdf, lambda, x);
+    }
+    if x.is_infinite() {
+        return (log_cdf, lambda, if x.is_sign_positive() { 0.0 } else { 1.0 });
+    }
+    let curvature = if x <= -4.0 {
+        let t = -x;
+        let mut q = 0.0;
+        let mut q_first = 0.0;
+        for n in (1..=32).rev() {
+            let denominator = t + q;
+            let value = f64::from(n) / denominator;
+            q_first = -value * (1.0 + q_first) / denominator;
+            q = value;
+        }
+        1.0 + q_first
+    } else {
+        lambda * (x + lambda)
+    };
+    (log_cdf, lambda, curvature)
+}
+
 #[cfg(test)]
 mod probit_parity_tests {
     //! CPU-verifiable floating-point-order & transcendental parity harness for
@@ -288,6 +321,7 @@ mod probit_parity_tests {
             "isnan(x) || x < 0.0",
             "inv2 * 162.421875",
             "log1p(-upper_tail)",
+            "log_ndtr_mills_curvature",
         ] {
             assert!(
                 PROBIT_NUMERICS_CU.contains(required),
@@ -377,5 +411,33 @@ mod probit_parity_tests {
             log_ndtr_and_mills(f64::NEG_INFINITY),
             (f64::NEG_INFINITY, f64::INFINITY)
         );
+    }
+
+    #[test]
+    fn log_ndtr_curvature_keeps_unit_left_tail_and_matches_mills_derivative() {
+        let (_, lambda, curvature) = log_ndtr_mills_curvature(-1.0e100);
+        assert_eq!(lambda, 1.0e100);
+        assert_eq!(curvature, 1.0);
+        assert_eq!(log_ndtr_mills_curvature(f64::INFINITY), (0.0, 0.0, 0.0));
+        assert_eq!(
+            log_ndtr_mills_curvature(f64::NEG_INFINITY),
+            (f64::NEG_INFINITY, f64::INFINITY, 1.0)
+        );
+        assert!(log_ndtr_mills_curvature(f64::NAN)
+            .into_iter()
+            .all(f64::is_nan));
+
+        let h = 1.0e-5;
+        for x in [-8.0_f64, -4.0, -2.0, 0.0, 3.0] {
+            let (_, _, analytic) = log_ndtr_mills_curvature(x);
+            let (_, left) = log_ndtr_and_mills(x - h);
+            let (_, right) = log_ndtr_and_mills(x + h);
+            let finite_difference = -(right - left) / (2.0 * h);
+            let relative = (finite_difference - analytic).abs() / analytic.abs().max(1.0e-300);
+            assert!(
+                relative < 2.0e-8,
+                "curvature fd mismatch x={x}: analytic={analytic:e}, fd={finite_difference:e}, rel={relative:e}"
+            );
+        }
     }
 }

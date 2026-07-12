@@ -13,9 +13,9 @@ use gam_math::special::bessel_i0_centered_terms_from_log_abs;
 // the coefficient of log n in the evidence. Theorem K observes that the THREE
 // quantities this code juggles are the SAME object λ evaluated in three regimes:
 //
-//   • HARD MP detection rank (n → ∞ limit, atom well above the noise edge):
+//   • HARD MP reconstruction rank (n → ∞ limit, atom well above the noise edge):
 //     every resolved decoder direction is a regular parameter,
-//     λ → ½·rank_detected·basis_edf = ½·d_eff.
+//     λ → ½·rank_reconstructed·basis_edf = ½·d_eff.
 //   • WBIC SOFT count (finite n, atom NEAR the Marchenko–Pastur edge): the
 //     audit-only `wbic_audit` report records the tempered fractional count. It
 //     is diagnostic, not an alternative production criterion.
@@ -30,7 +30,7 @@ use gam_math::special::bessel_i0_centered_terms_from_log_abs;
 // count — see the #2a inert-row axiom in `penalized_quasi_laplace_criterion`.
 //
 // The production criterion has one charge currency: the chargeable-rank branch.
-// It equals the hard MP detection rank when at least one direction is detected;
+// It equals the hard MP reconstruction rank when at least one direction clears the edge;
 // #2258 promotes an MP-rank-zero but numerically alive decoder to the minimum
 // chargeable rank one. Keeping an un-differentiated soft alternative would make
 // value and analytic gradient describe different objectives, so the fractional
@@ -57,20 +57,20 @@ pub struct StreamingRankInputs {
 /// (m×p), effective sample size `n_eff = Σ_row a²`, output dim `p_out`, noise floor
 /// `r_floor` (dispersion R, assumed already guarded > 0), and smoothness `(lam_smooth,
 /// smooth_penalty)`.
-///   * `rank_detected` = Marchenko–Pastur HARD detection count on the per-atom
+///   * `rank_reconstructed` = Marchenko–Pastur HARD reconstruction count on the per-atom
 ///     reconstruction Gram
 ///     `(1/n_eff)·BᵀB`, `B = diag(a)·Φ·D`: eigenvalues = svd(diag(√λ)·Uᵀ·D)²/n_eff with
 ///     `(λ,U)=eigh(gram)`; count those above `R·(1+√(p/n_eff))²` (a real rank-2 circle
 ///     → 2). `rank_eff` is the production chargeable rank: it equals
-///     `rank_detected` unless the #2258 alive-below-edge rule promotes 0 to 1;
+///     `rank_reconstructed` unless the #2258 alive-below-edge rule promotes 0 to 1;
 ///     only a vanished decoder remains 0. [#1893/#11]
 ///   * `basis_edf = tr(gram·(gram+λS)⁻¹)`.
 /// This is the source of truth the term-level `rank_dof_from_grams` (dense + #9
 /// streaming) loops, AND that the #2023 migration gate prices linear/curved candidates
 /// through — so PROMOTE (birth) and DEMOTE (hybrid split) adjudicate in ONE currency.
-/// #2258 detection-vs-degeneracy threshold: a rank-0 atom whose top
+/// #2258 reconstruction-rank-vs-degeneracy threshold: a rank-0 atom whose top
 /// reconstruction-Gram eigenvalue exceeds `RANK_VANISHED_REL · R` is ALIVE
-/// (below the MP detection edge, not degenerate) and is promoted to the
+/// (below the MP reconstruction-rank edge, not degenerate) and is promoted to the
 /// minimum chargeable rank 1; at or below it the decoder has genuinely
 /// vanished and the categorical Laplace-validity veto applies. Shared by the
 /// value path here, the WBIC diagnostic, and the ρ-derivative through
@@ -79,8 +79,9 @@ pub(crate) const RANK_VANISHED_REL: f64 = 1.0e-9;
 
 /// The two integer rank notions carried by the evidence code.
 ///
-/// `mp_detection_rank` answers a statistical detection question: how many
-/// reconstruction directions clear the Marchenko–Pastur edge?
+/// `mp_reconstruction_rank` counts how many reconstruction directions clear
+/// the Marchenko–Pastur rank edge. It is not an information-theoretic detection
+/// limit.
 /// `production_chargeable_rank` answers a different degeneracy question: how
 /// many directions may the Laplace value price? They differ only when no
 /// direction clears the MP edge but the fitted decoder is still numerically
@@ -122,10 +123,10 @@ pub(super) fn normalized_reconstruction_energy(
     Ok(energy)
 }
 
-/// Single source of truth for MP detection versus production chargeability.
+/// Single source of truth for MP reconstruction rank versus production chargeability.
 ///
 /// Callers supply the per-observation reconstruction-Gram eigenvalues `mu`, the
-/// MP detection `edge`, and the reconstruction dispersion `r_floor`. Inputs are
+/// MP reconstruction-rank `edge`, and the reconstruction dispersion `r_floor`. Inputs are
 /// validated by [`validate_rank_charge_problem`] before production reaches this
 /// helper; [`super::wbic_audit::ReconSpectrum`] stores the same validated values.
 pub(super) fn classify_reconstruction_rank(
@@ -306,7 +307,7 @@ pub(crate) fn realised_rank_charge_dof(
     if m == 0 || n_eff == 0.0 {
         return Ok(0.0);
     }
-    // MP detection rank on the reconstruction Gram. U orthogonal ⇒ svd of
+    // MP reconstruction rank on the reconstruction Gram. U orthogonal ⇒ svd of
     // diag(√λ)·Uᵀ·D equals svd of the reconstruction square root G^½·D.
     let (evals, u) = gram
         .eigh(super::Side::Lower)
@@ -332,14 +333,14 @@ pub(crate) fn realised_rank_charge_dof(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("realised_rank_charge_dof: {error}"))?;
     let rank = classify_reconstruction_rank(&mu, edge, r_floor);
-    // DETECTION vs DEGENERACY (#2258 real-activation class). MP rank zero
+    // RECONSTRUCTION RANK vs DEGENERACY (#2258 real-activation class). MP rank zero
     // conflated two regimes with opposite correct handling:
     //   · VANISHED decoder (a²‖B‖² → 0): the β-mode is degenerate, the
     //     β-Schur log-det → −∞ is the Laplace approximation BREAKING DOWN,
     //     and the RLCT argument above makes the categorical +∞ veto the only
     //     valid pricing. This is the regime the veto was built for (births on
     //     featureless residuals).
-    //   · BELOW the MP DETECTION EDGE but numerically alive: in a p ≈ n_eff
+    //   · BELOW the MP RECONSTRUCTION-RANK EDGE but numerically alive: in a p ≈ n_eff
     //     regime the edge is ≈ 4R (measured on real GPT-2 activations:
     //     R=1.005, n_eff=84, p=64 ⇒ edge=3.53 vs top signal 0.32–0.84), so a
     //     genuine fitted decoder simply isn't separable from noise AT THIS
@@ -354,7 +355,7 @@ pub(crate) fn realised_rank_charge_dof(
     //     evidence instead of no model at all.
     if rank.mp_reconstruction_rank == 0 && rank.production_chargeable_rank == 1 {
         log::debug!(
-            "realised_rank_charge_dof: below-detection-edge atom promoted to rank 1 — \
+            "realised_rank_charge_dof: below-reconstruction-rank-edge atom promoted to rank 1 — \
              top sv²/n_eff={:.6e} vs MP edge={edge:.6e} \
              (R={r_floor:.6e}, n_eff={n_eff:.3e}, p_out={p_out})",
             rank.top_signal

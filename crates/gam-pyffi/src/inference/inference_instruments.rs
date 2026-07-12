@@ -1423,8 +1423,8 @@ mod tests {
             [0.0, -magnitude],
         ];
         let gauge = fit_shape_coordinate_gauge(coords.view(), "extreme shape").unwrap();
-        let canonical = apply_shape_coordinate_gauge(coords.view(), gauge, "extreme shape")
-            .unwrap();
+        let canonical =
+            apply_shape_coordinate_gauge(coords.view(), gauge, "extreme shape").unwrap();
         assert!(canonical.iter().all(|value| value.is_finite()));
         assert!(gauge.log_scale.is_finite());
         assert_eq!(canonical[[0, 0]], -canonical[[1, 0]]);
@@ -1753,36 +1753,40 @@ mod tests {
         assert!(err.contains("mean_l0"), "error should name mean_l0: {err}");
     }
 
-    /// #2262 rank-charge diagnostic: `detection_floor` surfaced by
+    /// #2262 rank-charge diagnostic: `reconstruction_rank_edge` surfaced by
     /// `adjudicate_atom_shape` must be exactly the same closed-form MP edge
-    /// `mp_detection_floor` (and the production reconstruction-Gram pricing)
+    /// `mp_reconstruction_rank_edge` (and production reconstruction-Gram pricing)
     /// compute — no independent reimplementation to drift out of sync.
     #[test]
-    fn detection_floor_matches_closed_form_mp_edge_2262() {
-        use gam::terms::sae::null_battery::mp_detection_floor;
+    fn reconstruction_rank_edge_matches_closed_form_mp_edge_2262() {
+        use gam::terms::sae::null_battery::mp_reconstruction_rank_edge;
 
         let n_eff = 84.0_f64;
         let ambient_p = 64.0_f64;
         let dispersion_r = 1.005_f64;
         let expected = dispersion_r * (1.0 + (ambient_p / n_eff).sqrt()).powi(2);
-        let floor =
-            mp_detection_floor(n_eff, ambient_p, dispersion_r).expect("valid inputs must succeed");
+        let edge = mp_reconstruction_rank_edge(n_eff, ambient_p, dispersion_r)
+            .expect("valid inputs must succeed");
         assert!(
-            (floor - expected).abs() < 1e-12,
-            "floor={floor} expected={expected}"
+            (edge - expected).abs() < 1e-12,
+            "edge={edge} expected={expected}"
         );
         assert_eq!(
-            shape_detection_floor(Some(n_eff), Some(ambient_p), Some(dispersion_r)).unwrap(),
+            shape_reconstruction_rank_edge(Some(n_eff), Some(ambient_p), Some(dispersion_r))
+                .unwrap(),
             Some(expected)
         );
-        assert_eq!(shape_detection_floor(None, None, None).unwrap(), None);
+        assert_eq!(
+            shape_reconstruction_rank_edge(None, None, None).unwrap(),
+            None
+        );
         for partial in [
             (Some(n_eff), None, None),
             (None, Some(ambient_p), None),
             (None, None, Some(dispersion_r)),
             (Some(n_eff), Some(ambient_p), None),
         ] {
-            let error = shape_detection_floor(partial.0, partial.1, partial.2)
+            let error = shape_reconstruction_rank_edge(partial.0, partial.1, partial.2)
                 .expect_err("a partial rank-charge diagnostic specification must be rejected");
             assert!(error.contains("supplied together"), "{error}");
         }
@@ -2311,8 +2315,7 @@ fn apply_shape_coordinate_gauge(
     let mut canonical = Array2::<f64>::zeros(coords.raw_dim());
     for row in 0..coords.nrows() {
         for axis in 0..2 {
-            let value = (coords[[row, axis]] / gauge.coordinate_scale
-                - gauge.mean_scaled[axis])
+            let value = (coords[[row, axis]] / gauge.coordinate_scale - gauge.mean_scaled[axis])
                 / gauge.rms_scaled;
             if !value.is_finite() {
                 return Err(format!(
@@ -2733,7 +2736,7 @@ fn validate_control_mean_l0(mean_l0: Option<f64>) -> Result<f64, String> {
     Ok(mean_l0)
 }
 
-fn shape_detection_floor(
+fn shape_reconstruction_rank_edge(
     n_eff: Option<f64>,
     ambient_p: Option<f64>,
     dispersion_r: Option<f64>,
@@ -2741,8 +2744,12 @@ fn shape_detection_floor(
     match (n_eff, ambient_p, dispersion_r) {
         (None, None, None) => Ok(None),
         (Some(n_eff), Some(ambient_p), Some(dispersion_r)) => {
-            gam::terms::sae::null_battery::mp_detection_floor(n_eff, ambient_p, dispersion_r)
-                .map(Some)
+            gam::terms::sae::null_battery::mp_reconstruction_rank_edge(
+                n_eff,
+                ambient_p,
+                dispersion_r,
+            )
+            .map(Some)
         }
         _ => Err(
             "adjudicate_atom_shape: n_eff, ambient_p, and dispersion_r must be supplied together"
@@ -2894,17 +2901,17 @@ pub(crate) fn shape_matched_control_f32<'py>(
 /// [`shape_matched_control`] and rerun every stage. Non-dictionary callers can
 /// explicitly disable `matched_controls` and receive no control-rate claim.
 ///
-/// #2262 rank-detection diagnostic: when `n_eff`, `ambient_p`, and
+/// #2262 reconstruction-rank diagnostic: when `n_eff`, `ambient_p`, and
 /// `dispersion_r` are all supplied (the atom's occupancy-weighted effective
 /// sample size, the ambient output width used by rank pricing, and the residual
-/// dispersion `R`), the returned dict also carries `detection_floor` — the
+/// dispersion `R`), the returned dict also carries `reconstruction_rank_edge` — the
 /// Marchenko–Pastur edge `R·(1+√(ambient_p/n_eff))²` that the production rank
-/// charge uses to classify a reconstruction direction as MP-detected (see
-/// [`gam::terms::sae::null_battery::mp_detection_floor`]). This is a
+/// charge uses for its hard reconstruction-rank count (see
+/// [`gam::terms::sae::null_battery::mp_reconstruction_rank_edge`]). This is a
 /// rank-charge diagnostic, not an information-theoretic limit: the predictive
 /// 2-D shape race does not consume it, and a below-edge direction does not
 /// negate or override the returned shape verdict. Omit all three to leave
-/// `detection_floor` as `None`; supplying only a subset is an error.
+/// `reconstruction_rank_edge` as `None`; supplying only a subset is an error.
 #[pyfunction]
 #[pyo3(
     signature = (coords, folds = 5, seed = 11, k_ladder = None, mean_l0 = None, matched_controls = true, n_eff = None, ambient_p = None, dispersion_r = None)
@@ -2928,8 +2935,8 @@ pub(crate) fn adjudicate_atom_shape<'py>(
     if matched_controls || mean_l0.is_some() {
         validate_control_mean_l0(mean_l0).map_err(py_value_error)?;
     }
-    let detection_floor =
-        shape_detection_floor(n_eff, ambient_p, dispersion_r).map_err(py_value_error)?;
+    let reconstruction_rank_edge =
+        shape_reconstruction_rank_edge(n_eff, ambient_p, dispersion_r).map_err(py_value_error)?;
     let ladder = k_ladder.unwrap_or_else(|| {
         gam::solver::MIXTURE_K_LADDER
             .iter()
@@ -2942,7 +2949,7 @@ pub(crate) fn adjudicate_atom_shape<'py>(
     let out = atom_shape_verdict_dict(py, &observed)?;
     out.set_item("dictionary_mean_l0", mean_l0)?;
 
-    out.set_item("detection_floor", detection_floor)?;
+    out.set_item("reconstruction_rank_edge", reconstruction_rank_edge)?;
 
     if matched_controls {
         let (shuffle_verdict, gaussian_verdict, control_circular_win_fraction) =

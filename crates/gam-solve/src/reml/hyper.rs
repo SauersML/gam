@@ -35,15 +35,10 @@ fn empty_hyper_coords(
 #[inline]
 pub(crate) fn directional_curvature_weights(
     c_array: &Array1<f64>,
-    hessian_weights: &Array1<f64>,
     eta_direction: &Array1<f64>,
 ) -> Array1<f64> {
     let crate::pirls::DirectionalWorkingCurvature::Diagonal(weights) =
-        crate::pirls::directionalworking_curvature_from_c_array(
-            c_array,
-            hessian_weights,
-            eta_direction,
-        );
+        crate::pirls::directionalworking_curvature_from_c_array(c_array, eta_direction);
     weights
 }
 
@@ -52,8 +47,6 @@ pub(crate) fn directional_curvature_weights(
 // Mirrors the `BinomialAuxTerms` in estimate.rs but is local to the REML
 // module so that hyper.rs can compute per-observation likelihood derivatives
 // without depending on the estimate module's private helpers.
-
-pub(crate) const LINK_BINOMIAL_AUX_MU_EPS: f64 = 1e-12;
 
 #[derive(Clone, Copy)]
 pub(crate) struct LinkBinomialAux {
@@ -68,21 +61,39 @@ pub(crate) struct LinkBinomialAux {
 }
 
 #[inline]
-pub(crate) fn link_binomial_aux(yi: f64, wi: f64, mu: f64) -> LinkBinomialAux {
-    let mu = if mu.is_finite() {
-        mu.clamp(LINK_BINOMIAL_AUX_MU_EPS, 1.0 - LINK_BINOMIAL_AUX_MU_EPS)
-    } else {
-        0.5
-    };
+pub(crate) fn link_binomial_aux(
+    row: usize,
+    eta: f64,
+    yi: f64,
+    wi: f64,
+    mu: f64,
+) -> Result<LinkBinomialAux, EstimationError> {
+    if !(mu.is_finite() && mu > 0.0 && mu < 1.0) {
+        return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+            row,
+            quantity: "outer binomial mean",
+            eta,
+            value: mu,
+        });
+    }
     let one_minusmu = 1.0 - mu;
     let a1 = wi * (yi / mu - (1.0 - yi) / one_minusmu);
     let a2 = wi * (-(yi / (mu * mu)) - (1.0 - yi) / (one_minusmu * one_minusmu));
-    LinkBinomialAux {
+    let out = LinkBinomialAux {
         a1,
         a2,
         variance: mu * one_minusmu,
         variancemu_scale: 1.0 - 2.0 * mu,
+    };
+    if !(out.a1.is_finite() && out.a2.is_finite() && out.variance.is_finite()) {
+        return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+            row,
+            quantity: "outer binomial likelihood jet",
+            eta,
+            value: out.a2,
+        });
     }
+    Ok(out)
 }
 
 #[derive(Clone)]
@@ -1748,7 +1759,6 @@ impl<'a> RemlState<'a> {
                         let c_x_psi_beta = if !is_gaussian_identity {
                             Some(std::sync::Arc::new(directional_curvature_weights(
                                 c_array,
-                                w_diag,
                                 &x_tau_beta_j,
                             )))
                         } else {
@@ -1819,8 +1829,7 @@ impl<'a> RemlState<'a> {
 
                 if !is_gaussian_identity {
                     // Third-derivative correction: X^T diag(c ⊙ X_{τ_j} β̂) X.
-                    let c_x_tau_beta =
-                        directional_curvature_weights(c_array, w_diag, &x_tau_beta_j);
+                    let c_x_tau_beta = directional_curvature_weights(c_array, &x_tau_beta_j);
                     let mut weighted_scratch = Array2::<f64>::zeros((0, 0));
                     b_j +=
                         &Self::xt_diag_x_dense_into(x_dense, &c_x_tau_beta, &mut weighted_scratch);
@@ -2248,7 +2257,6 @@ impl<'a> RemlState<'a> {
             } else {
                 Some(directional_curvature_weights(
                     &pirls_result.solve_c_array.to_owned(),
-                    w_diag.as_ref(),
                     &x_tau_beta_j,
                 ))
             };
@@ -2864,7 +2872,7 @@ impl<'a> RemlState<'a> {
             let d1 = jets.jet.d1;
             let yi = self.y[i];
             let wi = self.weights[i].max(0.0);
-            let aux = link_binomial_aux(yi, wi, mu);
+            let aux = link_binomial_aux(i, eta_i, yi, wi, mu)?;
 
             for j in 0..aux_dim {
                 let dj = if j == 0 {
@@ -3040,7 +3048,7 @@ impl<'a> RemlState<'a> {
             let d1 = jet.d1;
             let yi = self.y[i];
             let wi = self.weights[i].max(0.0);
-            let aux = link_binomial_aux(yi, wi, mu);
+            let aux = link_binomial_aux(i, eta_i, yi, wi, mu)?;
 
             for j in 0..aux_dim {
                 let dj = mix_partials[j];

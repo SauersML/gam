@@ -706,8 +706,32 @@ pub fn observed_weight_gaussian_inverse(y: f64, eta: f64, phi: f64, pw: f64) -> 
 /// ```
 #[inline]
 pub fn observed_weight_gamma_log(y: f64, mu: f64, phi: f64, pw: f64) -> (f64, f64, f64) {
-    let w = pw * y / (phi * mu);
+    let w = (pw / phi) * (y / mu);
     (w, -w, w)
+}
+
+/// NB2 observed information under the log link, evaluated through bounded
+/// ratios.  With `r = theta/(theta+mu)` and `s = 1-r`,
+/// `W_obs = prior (y+theta) r s`, `W' = W(r-s)`, and
+/// `W'' = W((r-s)^2 - 2rs)`.
+#[inline]
+pub fn observed_weight_negative_binomial_log(
+    y: f64,
+    mu: f64,
+    theta: f64,
+    prior_weight: f64,
+) -> (f64, f64, f64) {
+    let r = if theta >= mu {
+        1.0 / (1.0 + mu / theta)
+    } else {
+        let theta_over_mu = theta / mu;
+        theta_over_mu / (1.0 + theta_over_mu)
+    };
+    let s = 1.0 - r;
+    let w = prior_weight * (y + theta) * r * s;
+    let c = w * (r - s);
+    let d = w * ((r - s) * (r - s) - 2.0 * r * s);
+    (w, c, d)
 }
 
 #[inline]
@@ -796,6 +820,9 @@ pub fn observed_weight_dispatch(
         (WeightFamily::Gamma, WeightLink::Log) => {
             observed_weight_gamma_log(y, mu, phi, prior_weight)
         }
+        (WeightFamily::NegativeBinomial { theta }, WeightLink::Log) => {
+            observed_weight_negative_binomial_log(y, mu, theta, prior_weight)
+        }
         (WeightFamily::Binomial, WeightLink::Logit) => {
             observed_weight_binomial_logit_from_jet(1.0, jet, prior_weight)
         }
@@ -817,14 +844,7 @@ pub enum DirectionalWorkingCurvature {
 
 pub fn directionalworking_curvature_from_c_array(
     c_array: &Array1<f64>,
-    hessian_weights: &Array1<f64>,
     eta_direction: &Array1<f64>,
 ) -> DirectionalWorkingCurvature {
-    let mut w_direction = c_array * eta_direction;
-    for i in 0..w_direction.len() {
-        if hessian_weights[i] <= 0.0 || !w_direction[i].is_finite() {
-            w_direction[i] = 0.0;
-        }
-    }
-    DirectionalWorkingCurvature::Diagonal(w_direction)
+    DirectionalWorkingCurvature::Diagonal(c_array * eta_direction)
 }

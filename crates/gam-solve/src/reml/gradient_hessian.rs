@@ -3379,17 +3379,17 @@ impl<'a> RemlState<'a> {
         // Noncanonical / GammaLog observed-information path: each row's
         // e_i depends only on (eta[i], mu[i], priorweights[i], y[i], dmu/d2/d3
         // jets at row i, and the inverse-link's higher-order pdf derivatives
-        // evaluated at eta_used). No carrier across rows. The h4/h5 lookup
-        // calls return Result, so we propagate first error via try_for_each.
+        // evaluated at the exact eta). No carrier crosses rows. Compute into an
+        // indexed certificate vector, then scan in row order for deterministic
+        // failure selection before publishing the array.
         use rayon::prelude::*;
         let final_eta = &pirls_result.final_eta;
         let weights = &self.weights;
         let y_view = &self.y;
         let inverse_link_ref = &inverse_link;
-        let e_s = e_array.as_slice_mut().expect("e_array must be contiguous");
-        e_s.par_iter_mut()
-            .enumerate()
-            .try_for_each(|(i, e_o)| -> Result<(), EstimationError> {
+        let certified: Vec<Result<f64, EstimationError>> = (0..n)
+            .into_par_iter()
+            .map(|i| -> Result<f64, EstimationError> {
                 let eta_raw = final_eta[i];
                 let h1 = dmu_deta[i];
                 let h2 = d2mu_deta2[i];
@@ -3429,8 +3429,7 @@ impl<'a> RemlState<'a> {
                 let y_i = y_view[i];
                 let e_i = pirls::e_obs_from_jets(y_i, mu_i, h1, h2, h3, h4, h5, vj, phi, pw);
                 if e_i.is_finite() {
-                    *e_o = e_i;
-                    Ok(())
+                    Ok(e_i)
                 } else {
                     Err(EstimationError::PirlsRowGeometryUnrepresentable {
                         row: i,
@@ -3439,7 +3438,9 @@ impl<'a> RemlState<'a> {
                         value: e_i,
                     })
                 }
-            })?;
+            })
+            .collect();
+        e_array = Array1::from_vec(certified.into_iter().collect::<Result<_, _>>()?);
 
         Ok((c_array, d_array, e_array))
     }

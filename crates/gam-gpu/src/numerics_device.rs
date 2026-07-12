@@ -9,6 +9,7 @@
 //!   - `erfcx_nonnegative(x)`   — scaled complementary error function for x ≥ 0
 //!   - `log_ndtr(x)`            — log Φ(x), numerically stable in the deep left tail
 //!   - `log_ndtr_and_mills(x, *log_cdf, *lambda)` — joint (log Φ(x), φ(x)/Φ(x))
+//!   - `log_ndtr_mills_curvature(...)` — also returns `−d² log Φ(x)/dx²`
 
 /// Device-side probit numerics injected at the top of every NVRTC kernel that
 /// needs them.  Prepend this string to a kernel-specific body before passing to
@@ -90,6 +91,31 @@ log_ndtr_and_mills(double x, double *log_cdf, double *lambda) {
         double pdf = INV_SQRT_2PI * exp(-0.5 * x * x);
         *log_cdf = log1p(-upper_tail);
         *lambda  = pdf / cdf;
+    }
+}
+
+// Joint log Φ(x), Mills ratio, and positive negated log-CDF curvature
+// `-d² log Φ(x)/dx²`. The direct `lambda * (x + lambda)` spelling loses the
+// unit left-tail limit when x and lambda cancel, so the deep tail differentiates
+// the Laplace continued fraction used by the CPU kernel.
+extern "C" __device__ __forceinline__ void
+log_ndtr_mills_curvature(double x, double *log_cdf, double *lambda, double *curvature) {
+    log_ndtr_and_mills(x, log_cdf, lambda);
+    if (isnan(x)) { *curvature = x; return; }
+    if (isinf(x)) { *curvature = (x > 0.0) ? 0.0 : 1.0; return; }
+    if (x <= -4.0) {
+        double t = -x;
+        double q = 0.0;
+        double q_first = 0.0;
+        for (int n = 32; n >= 1; --n) {
+            double denominator = t + q;
+            double value = ((double)n) / denominator;
+            q_first = -value * (1.0 + q_first) / denominator;
+            q = value;
+        }
+        *curvature = 1.0 + q_first;
+    } else {
+        *curvature = *lambda * (x + *lambda);
     }
 }
 

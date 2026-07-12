@@ -1087,7 +1087,10 @@ impl GaussianComponentEval {
         }
         let log_norm = -0.5 * (d as f64 * (2.0 * std::f64::consts::PI).ln() + log_det);
         if precision.iter().any(|value| !value.is_finite()) || !log_norm.is_finite() {
-            return Err("mixture component factorization produced non-finite precision or log normalizer".to_string());
+            return Err(
+                "mixture component factorization produced non-finite precision or log normalizer"
+                    .to_string(),
+            );
         }
         Ok(Self {
             residual_origin: mean.to_owned(),
@@ -3219,9 +3222,7 @@ fn stable_scalar_mean_chart(values: ArrayView1<'_, f64>) -> Result<StableScalarM
         return Err("stable scalar mean requires finite nonempty values".to_string());
     }
     let anchor = values[0];
-    let anchor_chart_is_representable = values
-        .iter()
-        .all(|&value| (value - anchor).is_finite());
+    let anchor_chart_is_representable = values.iter().all(|&value| (value - anchor).is_finite());
     let origin = if anchor_chart_is_representable {
         anchor
     } else {
@@ -6124,6 +6125,34 @@ mod tests {
         );
         assert_eq!(reversed.components[1].kind, UnionComponentKind::Line);
         assert!((fit.bic - reversed.bic).abs() <= 1.0e-12 * (1.0 + fit.bic.abs()));
+    }
+
+    #[test]
+    fn isotropic_union_density_uses_the_same_fractional_mean_chart_as_its_mle() {
+        let translated = ndarray::array![[1.0e16], [1.0e16 + 2.0], [1.0e16 + 2.0]];
+        let fit = fit_isotropic_gaussian_component(translated.view(), 1.0e-12).unwrap();
+        let variance = fit.precision[[0, 0]].recip();
+        assert!((variance - 8.0 / 9.0).abs() <= 32.0 * f64::EPSILON);
+
+        let residuals = [-4.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0];
+        let expected_log_norm = -0.5 * ((2.0 * std::f64::consts::PI).ln() + variance.ln());
+        for (row, residual) in residuals.into_iter().enumerate() {
+            let expected = expected_log_norm - 0.5 * residual * residual / variance;
+            let actual = fit.log_density(translated.row(row));
+            assert!(
+                (actual - expected).abs() <= 32.0 * f64::EPSILON * (1.0 + expected.abs()),
+                "row {row}: density chart disagrees with fitted MLE residual: actual={actual}, expected={expected}"
+            );
+        }
+
+        let subnormal = f64::from_bits(1);
+        let constant = ndarray::array![[subnormal], [subnormal], [subnormal]];
+        let constant_fit = fit_isotropic_gaussian_component(constant.view(), 1.0).unwrap();
+        assert_eq!(constant_fit.residual(constant.row(0)), vec![0.0]);
+        assert_eq!(
+            constant_fit.log_density(constant.row(0)),
+            constant_fit.log_norm
+        );
     }
 
     #[test]

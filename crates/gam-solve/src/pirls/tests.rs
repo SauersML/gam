@@ -9,7 +9,7 @@ pub(crate) use super::*;
 
 #[cfg(test)]
 mod tests {
-    use super::loop_driver::default_beta_guess_external;
+    use super::loop_driver::{default_beta_guess_external, exact_lambdas_from_rho};
     use super::reweight::madsen_lm_accept_factor;
     use super::{
         LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath,
@@ -644,6 +644,29 @@ mod tests {
         )
         .unwrap_err();
         assert_atomic(&mu, &w, &z);
+    }
+
+    #[test]
+    fn fixed_rho_uses_the_shared_closed_log_strength_domain_without_projection() {
+        use gam_terms::analytic_penalties::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN};
+
+        let rho = array![LOG_STRENGTH_MIN, 0.0, LOG_STRENGTH_MAX];
+        let lambda = exact_lambdas_from_rho(LogSmoothingParamsView::new(rho.view())).unwrap();
+        for i in 0..rho.len() {
+            assert_eq!(lambda[i].to_bits(), rho[i].exp().to_bits());
+        }
+
+        let invalid = array![0.0, LOG_STRENGTH_MAX + 1.0, LOG_STRENGTH_MIN - 1.0];
+        let err = exact_lambdas_from_rho(LogSmoothingParamsView::new(invalid.view()))
+            .expect_err("out-of-domain rho must not be capped");
+        assert!(matches!(
+            err,
+            EstimationError::LogStrengthDomainViolation {
+                coordinate: 1,
+                value,
+                ..
+            } if value == LOG_STRENGTH_MAX + 1.0
+        ));
     }
 
     #[test]

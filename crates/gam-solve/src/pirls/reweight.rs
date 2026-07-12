@@ -359,7 +359,8 @@ where
             // domain. A trial step outside that domain is infeasible, so LM must
             // reject and damp the step rather than either projecting the link or
             // terminating the entire fit.
-            EstimationError::InverseLinkDomainViolation { .. } => true,
+            EstimationError::InverseLinkDomainViolation { .. }
+            | EstimationError::PirlsRowGeometryUnrepresentable { .. } => true,
             EstimationError::InvalidInput(message) => {
                 let message = message.to_ascii_lowercase();
                 message.contains("nan")
@@ -603,6 +604,10 @@ where
         } else {
             match model.update_with_curvature(&beta, preferred_curvature) {
                 Ok(state) => state,
+                Err(
+                    err @ (EstimationError::InverseLinkDomainViolation { .. }
+                    | EstimationError::PirlsRowGeometryUnrepresentable { .. }),
+                ) => return Err(err),
                 Err(_) if preferred_curvature == HessianCurvatureKind::Observed => {
                     used_fisher_fallback_this_iter = true;
                     consecutive_fisher_fallbacks += 1;

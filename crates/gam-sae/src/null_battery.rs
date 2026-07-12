@@ -1422,11 +1422,7 @@ fn stable_column_location(data: ArrayView2<'_, f64>) -> Result<StableColumnLocat
                 continue;
             }
             for &value in data.column(axis).iter() {
-                neumaier_add(
-                    &mut sum,
-                    &mut correction,
-                    (value - origin) / residual_scale,
-                )?;
+                neumaier_add(&mut sum, &mut correction, (value - origin) / residual_scale)?;
             }
             let axis_normalized_offset = (sum + correction) / count;
             // Fusing the scale restoration with the translated origin avoids
@@ -1478,28 +1474,44 @@ fn stable_population_moments(data: ArrayView2<'_, f64>) -> Result<StablePopulati
     let location = stable_column_location(data)?;
     let n = data.nrows();
     let p = data.ncols();
-    let inverse_sqrt_count = 1.0 / (n as f64).sqrt();
-    let mut covariance = Array2::<f64>::zeros((p, p));
-    let mut covariance_correction = Array2::<f64>::zeros((p, p));
-    let mut scaled_residuals = vec![0.0_f64; p];
+    let mut residual_scales = vec![0.0_f64; p];
     for row in 0..n {
         for axis in 0..p {
-            scaled_residuals[axis] =
-                location.centered_value(data[[row, axis]], axis)? * inverse_sqrt_count;
+            residual_scales[axis] = residual_scales[axis]
+                .max(location.centered_value(data[[row, axis]], axis)?.abs());
+        }
+    }
+    let mut covariance = Array2::<f64>::zeros((p, p));
+    let mut covariance_correction = Array2::<f64>::zeros((p, p));
+    let mut normalized_residuals = vec![0.0_f64; p];
+    for row in 0..n {
+        for axis in 0..p {
+            normalized_residuals[axis] = if residual_scales[axis] > 0.0 {
+                location.centered_value(data[[row, axis]], axis)? / residual_scales[axis]
+            } else {
+                0.0
+            };
         }
         for left in 0..p {
             for right in 0..=left {
                 neumaier_add(
                     &mut covariance[[left, right]],
                     &mut covariance_correction[[left, right]],
-                    scaled_residuals[left] * scaled_residuals[right],
+                    normalized_residuals[left] * normalized_residuals[right],
                 )?;
             }
         }
     }
     for left in 0..p {
         for right in 0..=left {
-            let value = covariance[[left, right]] + covariance_correction[[left, right]];
+            let normalized_covariance =
+                (covariance[[left, right]] + covariance_correction[[left, right]]) / n as f64;
+            let value = balanced_finite_product(
+                normalized_covariance,
+                residual_scales[left],
+                residual_scales[right],
+                "population covariance entry",
+            )?;
             covariance[[left, right]] = value;
             covariance[[right, left]] = value;
         }
@@ -1864,12 +1876,8 @@ pub fn inject_torus_spike(
     let mut rng = StdRng::seed_from_u64(seed);
     let basis = random_orthogonal(p, seed ^ 0x7055_1A7E_4D2C_A11B)?;
     let rms = matrix_rms(noise)?;
-    let amp = balanced_nonnegative_product(
-        snr,
-        rms,
-        ((p as f64) / 2.0).sqrt(),
-        "torus spike amplitude",
-    )?;
+    let amp =
+        balanced_nonnegative_product(snr, rms, ((p as f64) / 2.0).sqrt(), "torus spike amplitude")?;
     let phase0 = rng.random_range(0.0..(2.0 * PI));
     let phase1 = rng.random_range(0.0..(2.0 * PI));
     let winding = coprime_winding(n);
@@ -2278,7 +2286,8 @@ pub fn harmonic_circle_detector_stat(data: ArrayView2<'_, f64>) -> Result<f64, S
     let scale_ratio = coefficient_energy.scale / total_plane_energy.scale;
     let normalized_scale_ratio = scale_ratio * (2.0 / n as f64).sqrt();
     let harmonic_fraction = certify_unit_interval(
-        normalized_scale_ratio * normalized_scale_ratio
+        normalized_scale_ratio
+            * normalized_scale_ratio
             * (coefficient_energy.scaled_sum / total_plane_energy.scaled_sum),
         n.saturating_mul(p).saturating_mul(32),
         "harmonic-circle Fourier energy fraction",
@@ -2432,9 +2441,7 @@ fn centered_covariance_spectrum(
     let total = if total_accumulator.scale == 0.0 {
         0.0
     } else {
-        total_accumulator.scale
-            * total_accumulator.scale
-            * total_accumulator.scaled_sum
+        total_accumulator.scale * total_accumulator.scale * total_accumulator.scaled_sum
     };
     if !total.is_finite() {
         return Err("unit-chart centered energy is not representable".to_string());
@@ -2538,8 +2545,10 @@ fn append_unit_residual(
         for direction in plane.iter() {
             let dot = candidate.dot(direction);
             if !dot.is_finite() {
-                return Err("harmonic-plane orthogonalization produced a non-finite dot product"
-                    .to_string());
+                return Err(
+                    "harmonic-plane orthogonalization produced a non-finite dot product"
+                        .to_string(),
+                );
             }
             for j in 0..candidate.len() {
                 candidate[j] -= dot * direction[j];
@@ -2723,9 +2732,8 @@ pub fn summarize_null_distribution(
     let mut sorted = samples.clone();
     sorted.sort_by(|a, b| a.total_cmp(b));
     let n = samples.len();
-    let sample_matrix = ArrayView2::from_shape((n, 1), samples.as_slice()).map_err(|error| {
-        format!("could not construct null-summary sample view: {error}")
-    })?;
+    let sample_matrix = ArrayView2::from_shape((n, 1), samples.as_slice())
+        .map_err(|error| format!("could not construct null-summary sample view: {error}"))?;
     let location = stable_column_location(sample_matrix)?;
     let mean = location.absolute_mean()?[0];
     let mut residual_squares = ScaledSumSquares::default();
@@ -2957,7 +2965,7 @@ fn balanced_nonnegative_product(
     third: f64,
     name: &str,
 ) -> Result<f64, String> {
-    let mut factors = [first, second, third];
+    let factors = [first, second, third];
     if factors
         .iter()
         .any(|value| !value.is_finite() || *value < 0.0)
@@ -2966,17 +2974,39 @@ fn balanced_nonnegative_product(
             "{name} factors must be finite and nonnegative; got {factors:?}"
         ));
     }
-    factors.sort_by(f64::total_cmp);
-    let product = (factors[0] * factors[2]) * factors[1];
+    let product = balanced_finite_product(first, second, third, name)?;
     if product == 0.0 && factors.iter().all(|value| *value > 0.0) {
         Err(format!(
             "{name} is positive but underflows the float64 output domain"
         ))
-    } else if product.is_finite() {
-        Ok(product)
     } else {
-        Err(format!("{name} is not representable in float64"))
+        Ok(product)
     }
+}
+
+fn balanced_finite_product(
+    first: f64,
+    second: f64,
+    third: f64,
+    name: &str,
+) -> Result<f64, String> {
+    let factors = [first, second, third];
+    if factors.iter().any(|value| !value.is_finite()) {
+        return Err(format!("{name} factors must be finite; got {factors:?}"));
+    }
+    let negative = factors
+        .iter()
+        .filter(|value| value.is_sign_negative())
+        .count()
+        % 2
+        == 1;
+    let mut magnitudes = factors.map(f64::abs);
+    magnitudes.sort_by(f64::total_cmp);
+    let magnitude = (magnitudes[0] * magnitudes[2]) * magnitudes[1];
+    if !magnitude.is_finite() {
+        return Err(format!("{name} is not representable in float64"));
+    }
+    Ok(if negative { -magnitude } else { magnitude })
 }
 
 fn dominant_eigenvector(matrix: ArrayView2<'_, f64>, seed: u64) -> Result<Array1<f64>, String> {
@@ -3070,7 +3100,7 @@ mod tests {
     }
 
     #[test]
-    fn mp_detection_floor_matches_recon_spectrum_edge() {
+    fn mp_reconstruction_rank_edge_matches_recon_spectrum() {
         use ndarray::array;
 
         let gram = array![[3.0, 0.5], [0.5, 2.0]];
@@ -3082,15 +3112,15 @@ mod tests {
         let spectrum =
             crate::manifold::recon_spectrum(&gram, &decoder, n_eff, p_out, r_floor, 0.0, None)
                 .expect("recon_spectrum should succeed on a well-posed Gram");
-        let floor = mp_detection_floor(n_eff, p_out, r_floor)
-            .expect("mp_detection_floor should succeed on valid inputs");
+        let edge = mp_reconstruction_rank_edge(n_eff, p_out, r_floor)
+            .expect("mp_reconstruction_rank_edge should succeed on valid inputs");
 
         assert!(
-            (spectrum.mp_detection_edge() - floor).abs() < 1.0e-12,
-            "standalone detection floor must match the production MP edge byte-for-byte: \
+            (spectrum.mp_reconstruction_rank_edge() - edge).abs() < 1.0e-12,
+            "standalone reconstruction-rank edge must match production byte-for-byte: \
              spectrum.edge={} floor={}",
-            spectrum.mp_detection_edge(),
-            floor
+            spectrum.mp_reconstruction_rank_edge(),
+            edge
         );
     }
 
@@ -3114,6 +3144,18 @@ mod tests {
             summaries: Vec::new(),
         };
         assert!(primary_null_metrics(&empty).is_err());
+
+        let non_destroying_only = NullBatteryReport {
+            observed: 1.0,
+            summaries: vec![
+                summary_with_primary_metrics(NullKind::TokenShuffle, 0.01, 4.0),
+                summary_with_primary_metrics(NullKind::RandomRotation, 0.02, 3.0),
+            ],
+        };
+        assert!(
+            primary_null_metrics(&non_destroying_only).is_err(),
+            "controls that preserve the unordered or basis-invariant claim cannot silently become its primary null"
+        );
     }
 
     #[test]
@@ -3132,42 +3174,42 @@ mod tests {
     }
 
     #[test]
-    fn mp_detection_floor_grows_with_ambient_dimension_and_dispersion() {
-        let base = mp_detection_floor(50.0, 10.0, 1.0).unwrap();
-        let wider = mp_detection_floor(50.0, 200.0, 1.0).unwrap();
-        let noisier = mp_detection_floor(50.0, 10.0, 4.0).unwrap();
+    fn mp_reconstruction_rank_edge_grows_with_ambient_dimension_and_dispersion() {
+        let base = mp_reconstruction_rank_edge(50.0, 10.0, 1.0).unwrap();
+        let wider = mp_reconstruction_rank_edge(50.0, 200.0, 1.0).unwrap();
+        let noisier = mp_reconstruction_rank_edge(50.0, 10.0, 4.0).unwrap();
         assert!(
             wider > base,
-            "a larger ambient dimension should raise the detection floor: base={base} wider={wider}"
+            "a larger ambient dimension should raise the reconstruction-rank edge: base={base} wider={wider}"
         );
         assert!(
             noisier > base,
-            "higher dispersion should raise the detection floor: base={base} noisier={noisier}"
+            "higher dispersion should raise the reconstruction-rank edge: base={base} noisier={noisier}"
         );
     }
 
     #[test]
-    fn mp_detection_floor_rejects_invalid_inputs() {
-        assert!(mp_detection_floor(0.0, 10.0, 1.0).is_err());
-        assert!(mp_detection_floor(-1.0, 10.0, 1.0).is_err());
-        assert!(mp_detection_floor(f64::INFINITY, 10.0, 1.0).is_err());
-        assert!(mp_detection_floor(50.0, -1.0, 1.0).is_err());
-        assert!(mp_detection_floor(50.0, 10.0, -1.0).is_err());
-        assert!(mp_detection_floor(50.0, f64::NAN, 1.0).is_err());
-        assert!(mp_detection_floor(50.0, 10.0, f64::INFINITY).is_err());
-        assert!(mp_detection_floor(f64::MIN_POSITIVE, f64::MAX, 1.0).is_err());
+    fn mp_reconstruction_rank_edge_rejects_invalid_inputs() {
+        assert!(mp_reconstruction_rank_edge(0.0, 10.0, 1.0).is_err());
+        assert!(mp_reconstruction_rank_edge(-1.0, 10.0, 1.0).is_err());
+        assert!(mp_reconstruction_rank_edge(f64::INFINITY, 10.0, 1.0).is_err());
+        assert!(mp_reconstruction_rank_edge(50.0, -1.0, 1.0).is_err());
+        assert!(mp_reconstruction_rank_edge(50.0, 10.0, -1.0).is_err());
+        assert!(mp_reconstruction_rank_edge(50.0, f64::NAN, 1.0).is_err());
+        assert!(mp_reconstruction_rank_edge(50.0, 10.0, f64::INFINITY).is_err());
+        assert!(mp_reconstruction_rank_edge(f64::MIN_POSITIVE, f64::MAX, 1.0).is_err());
         assert_eq!(
-            mp_detection_floor(f64::MIN_POSITIVE, f64::MAX, 0.0).unwrap(),
+            mp_reconstruction_rank_edge(f64::MIN_POSITIVE, f64::MAX, 0.0).unwrap(),
             0.0
         );
     }
 
     #[test]
-    fn mp_detection_floor_recovers_representable_result_after_intermediate_overflow() {
+    fn mp_reconstruction_rank_edge_recovers_after_intermediate_overflow() {
         let n_eff = f64::MIN_POSITIVE;
         let p = f64::MAX;
         let r_floor = 0.25 * n_eff;
-        let edge = mp_detection_floor(n_eff, p, r_floor).unwrap();
+        let edge = mp_reconstruction_rank_edge(n_eff, p, r_floor).unwrap();
         let asymptotic = 0.25 * p;
         assert!(edge.is_finite() && edge > 0.0);
         assert!(
@@ -3247,6 +3289,22 @@ mod tests {
             (invariant_before - invariant_after).abs() < 1.0e-8,
             "top-two energy should survive rotation: before={invariant_before} after={invariant_after}"
         );
+    }
+
+    #[test]
+    fn random_rotation_basis_is_numerically_orthogonal() {
+        let q = random_orthogonal(64, 0xA11C_E5E5).unwrap();
+        let gram = q.t().dot(&q);
+        for row in 0..gram.nrows() {
+            for col in 0..gram.ncols() {
+                let expected = if row == col { 1.0 } else { 0.0 };
+                assert!(
+                    (gram[[row, col]] - expected).abs() <= 128.0 * f64::EPSILON,
+                    "Q'Q mismatch at ({row},{col}): {}",
+                    gram[[row, col]]
+                );
+            }
+        }
     }
 
     #[test]
@@ -3358,6 +3416,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn stable_location_retains_fractional_ulp_offsets_and_composes_in_its_chart() {
+        let translated = ndarray::array![[1.0e16], [1.0e16 + 2.0], [1.0e16 + 2.0]];
+        let location = stable_column_location(translated.view()).unwrap();
+        let residuals = translated
+            .column(0)
+            .iter()
+            .map(|&value| location.centered_value(value, 0).unwrap())
+            .collect::<Vec<_>>();
+        assert!((residuals[0] + 4.0 / 3.0).abs() <= 4.0 * f64::EPSILON);
+        assert!((residuals[1] - 2.0 / 3.0).abs() <= 4.0 * f64::EPSILON);
+        assert!((residuals.iter().sum::<f64>()).abs() <= 8.0 * f64::EPSILON);
+        let moments = stable_population_moments(translated.view()).unwrap();
+        assert!((moments.covariance[[0, 0]] - 8.0 / 9.0).abs() <= 16.0 * f64::EPSILON);
+
+        // A centered draw of -2 crosses to the adjacent representable value;
+        // reconstruction through rounded `mean + draw` would lose the chart's
+        // fractional offset and land one ULP too low.
+        assert_eq!(location.compose_centered(-2.0 / 3.0, 0).unwrap(), 1.0e16);
+
+        let subnormal = f64::from_bits(1);
+        let tiny = ndarray::array![[subnormal], [2.0 * subnormal]];
+        let tiny_location = stable_column_location(tiny.view()).unwrap();
+        assert_eq!(tiny_location.absolute_mean().unwrap()[0].to_bits(), 2);
+
+        let root_subnormal = f64::from_bits(1).sqrt();
+        let tiny_variation = ndarray::array![
+            [root_subnormal],
+            [-root_subnormal],
+            [root_subnormal],
+            [-root_subnormal],
+        ];
+        let tiny_moments = stable_population_moments(tiny_variation.view()).unwrap();
+        assert!(
+            tiny_moments.covariance[[0, 0]] > 0.0,
+            "normalizing each residual by sqrt(n) would underflow every term even though the final covariance is representable"
+        );
+    }
+
+    #[test]
+    fn architecture_match_refuses_positive_target_scale_from_constant_donor() {
+        let observed = ndarray::array![[-1.0], [0.0], [1.0], [2.0]];
+        let donor = ndarray::array![[7.0], [7.0], [7.0], [7.0]];
+        let error =
+            architecture_matched_random_weight_null(observed.view(), donor.view(), 9).unwrap_err();
+        assert!(error.contains("zero scale"), "{error}");
     }
 
     #[test]
@@ -3847,6 +3953,52 @@ mod tests {
                 scaled_certified[axis],
                 scale_squared * certified[axis],
                 "PSD certificate must commute with covariance scaling"
+            );
+        }
+    }
+
+    #[test]
+    fn topology_statistics_are_invariant_at_extreme_finite_scale() {
+        let rows = 128usize;
+        let mut base = Array2::<f64>::zeros((rows, 4));
+        for row in 0..rows {
+            let phase = std::f64::consts::TAU * row as f64 / rows as f64;
+            base[[row, 0]] = phase.cos();
+            base[[row, 1]] = phase.sin();
+            base[[row, 2]] = 0.3 * (3.0 * phase).cos();
+            base[[row, 3]] = 0.2 * (5.0 * phase).sin();
+        }
+        let scale = 1.0e200_f64;
+        let shifts = [4.0e200, -3.0e200, 2.0e200, -1.0e200];
+        let transformed = Array2::from_shape_fn(base.raw_dim(), |(row, col)| {
+            base[[row, col]].mul_add(scale, shifts[col])
+        });
+
+        for (name, original, extreme) in [
+            (
+                "ordered circle",
+                first_two_ordered_circle_stat(base.view()).unwrap(),
+                first_two_ordered_circle_stat(transformed.view()).unwrap(),
+            ),
+            (
+                "first-two energy",
+                first_two_energy_fraction(base.view()).unwrap(),
+                first_two_energy_fraction(transformed.view()).unwrap(),
+            ),
+            (
+                "top-two energy",
+                top_two_energy_fraction(base.view()).unwrap(),
+                top_two_energy_fraction(transformed.view()).unwrap(),
+            ),
+            (
+                "harmonic circle",
+                harmonic_circle_detector_stat(base.view()).unwrap(),
+                harmonic_circle_detector_stat(transformed.view()).unwrap(),
+            ),
+        ] {
+            assert!(
+                (extreme - original).abs() <= 2.0e-12 * (1.0 + original.abs()),
+                "{name} changed under a representable translation/scale: original={original}, extreme={extreme}"
             );
         }
     }

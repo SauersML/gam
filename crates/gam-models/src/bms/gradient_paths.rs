@@ -2,6 +2,7 @@ use super::family::clamp_bernoulli_link_probability;
 use super::*;
 use gam_linalg::matrix::{LinearOperator, SignedWeightsView};
 use gam_math::jet_tower::Tower4;
+use gam_math::probability::normal_logcdf_derivatives;
 use opt::{BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge};
 
 pub(crate) fn standardize_latent_z_with_policy(
@@ -251,9 +252,11 @@ pub(super) fn pooled_probit_baseline(
                 let eta = intercept + slope * zi;
                 let s = 2.0 * yi - 1.0;
                 let margin = s * eta;
-                let (logcdf, lambda) = signed_probit_logcdf_and_mills_ratio(margin);
+                let probit = normal_logcdf_derivatives(margin);
+                let logcdf = probit[0];
+                let lambda = probit[1];
                 let g_eta = -wi * s * lambda;
-                let h_eta = wi * lambda * (margin + lambda);
+                let h_eta = -wi * probit[2];
                 obj -= wi * logcdf;
                 g0 += g_eta;
                 g1 += g_eta * zi;
@@ -604,26 +607,11 @@ pub(crate) fn signed_probit_neglog_derivatives_up_to_fourth_numeric(
     if weight == 0.0 || signed_margin == f64::INFINITY {
         return (0.0, 0.0, 0.0, 0.0);
     }
-    if signed_margin == f64::NEG_INFINITY {
-        return (f64::NEG_INFINITY, weight, 0.0, 0.0);
-    }
     if signed_margin.is_nan() {
         return (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
     }
-    let (_, lambda) = signed_probit_logcdf_and_mills_ratio(signed_margin);
-    let k1 = -lambda;
-    let k2 = lambda * (signed_margin + lambda);
-    let k3 = lambda
-        * (1.0
-            - signed_margin * signed_margin
-            - 3.0 * signed_margin * lambda
-            - 2.0 * lambda * lambda);
-    let k4 = lambda
-        * ((signed_margin.powi(3) - 3.0 * signed_margin)
-            + (7.0 * signed_margin * signed_margin - 4.0) * lambda
-            + 12.0 * signed_margin * lambda * lambda
-            + 6.0 * lambda.powi(3));
-    (weight * k1, weight * k2, weight * k3, weight * k4)
+    let d = normal_logcdf_derivatives(signed_margin);
+    (-weight * d[1], -weight * d[2], -weight * d[3], -weight * d[4])
 }
 
 /// Exact probit derivative helper used by analytic jet code paths.
@@ -663,50 +651,30 @@ pub(crate) fn signed_probit_neglog_derivatives_up_to_fourth(
 /// // → [-w*logcdf, k1, k2, k3, k4]
 /// ```
 ///
-/// which evaluated `signed_probit_logcdf_and_mills_ratio` TWICE on the same
-/// `m` (once for `logΦ`, once again — discarding `logΦ` — for the Mills ratio
-/// `λ` that drives `k1..k4`). On the rigid standard-normal BMS path that pair
-/// of `erfcx`/`erfc` transcendentals is the dominant per-row arithmetic across
-/// all `n ≈ 356k` rows, so collapsing it to ONE call halves the transcendental
-/// budget of the jet build. The result is bit-identical: `logΦ` and `λ` are the
-/// exact same values the two-call form produced (same branch, same `ex`), and
-/// `k1..k4` are the same polynomials in `(m, λ)`.
+/// which evaluated the tail kernel twice on the same `m`. The centralized
+/// derivative stack evaluates it once and owns the cancellation-free left-tail
+/// continued fraction and right-tail log-magnitude recurrence shared by every
+/// probit consumer.
 ///
-/// Boundary semantics match [`unary_derivatives_neglog_phi`] (the prior
-/// two-call form): `+∞` is the saturated zero tail (all zero); `−∞` returns the
-/// `[+∞, −w, w·0, 0, 0]` limit (value `−w·logΦ(−∞)=+∞`, `k1=−λ→−∞` scaled by the
-/// `w` already folded by the numeric derivative helper); `NaN` propagates.
+/// `+∞` is the saturated zero tail. At `−∞`, a positive weight has the exact
+/// limit `[+∞, −∞, +w, −0, −0]`; a negative signed contribution reverses the
+/// infinite and zero signs through ordinary scalar multiplication. `NaN`
+/// propagates unless the row is inactive (`weight == 0`).
 #[inline]
 pub(crate) fn signed_probit_neglog_unary_stack(signed_margin: f64, weight: f64) -> [f64; 5] {
     if weight == 0.0 || signed_margin == f64::INFINITY {
         return [0.0; 5];
     }
-    if signed_margin == f64::NEG_INFINITY {
-        // logΦ(−∞) = −∞ ⇒ value −w·(−∞) = +∞; the derivative helper's −∞ limit
-        // is (−∞, w, 0, 0) for (k1, k2, k3, k4) before the weight fold below.
-        return [f64::INFINITY, f64::NEG_INFINITY, weight, 0.0, 0.0];
-    }
     if signed_margin.is_nan() {
         return [f64::NAN; 5];
     }
-    // ONE transcendental evaluation feeds both the value (logΦ) and every
-    // derivative (through the Mills ratio λ).
-    let (logcdf, lambda) = signed_probit_logcdf_and_mills_ratio(signed_margin);
-    let m = signed_margin;
-    let k1 = -lambda;
-    let k2 = lambda * (m + lambda);
-    let k3 = lambda * (1.0 - m * m - 3.0 * m * lambda - 2.0 * lambda * lambda);
-    let k4 = lambda
-        * ((m * m * m - 3.0 * m)
-            + (7.0 * m * m - 4.0) * lambda
-            + 12.0 * m * lambda * lambda
-            + 6.0 * lambda * lambda * lambda);
+    let d = normal_logcdf_derivatives(signed_margin);
     [
-        -weight * logcdf,
-        weight * k1,
-        weight * k2,
-        weight * k3,
-        weight * k4,
+        -weight * d[0],
+        -weight * d[1],
+        -weight * d[2],
+        -weight * d[3],
+        -weight * d[4],
     ]
 }
 
@@ -2141,6 +2109,26 @@ mod jet_tower_oracle_tests {
     //!   transcendental).
 
     use super::*;
+
+    #[test]
+    fn signed_probit_stack_preserves_extreme_tail_derivatives_and_weight_sign() {
+        let positive = signed_probit_neglog_unary_stack(f64::NEG_INFINITY, 2.0);
+        assert_eq!(positive, [f64::INFINITY, f64::NEG_INFINITY, 2.0, -0.0, -0.0]);
+        let negative = signed_probit_neglog_unary_stack(f64::NEG_INFINITY, -2.0);
+        assert_eq!(negative, [f64::NEG_INFINITY, f64::INFINITY, -2.0, 0.0, 0.0]);
+
+        let right = signed_probit_neglog_unary_stack(38.6, 1.0);
+        assert_eq!(right[1], -0.0);
+        assert!(right[2] > 0.0 && right[2].is_subnormal());
+        assert!(right[3] < 0.0 && right[3].is_subnormal());
+        assert!(right[4] > 0.0 && right[4].is_subnormal());
+
+        let left = signed_probit_neglog_unary_stack(-1.0e100, 1.0);
+        assert_eq!(left[1], -1.0e100);
+        assert_eq!(left[2], 1.0);
+        assert!(left[3] < 0.0 && left[3].is_finite());
+        assert_eq!(left[4], -0.0);
+    }
 
     /// #932 combined third+fourth primary tensors read off ONE shared
     /// `rigid_standard_normal_tower` jet (the redundancy-free form of the

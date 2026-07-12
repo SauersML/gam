@@ -533,6 +533,17 @@ pub enum EstimationError {
         value: f64,
     },
 
+    #[error(
+        "Log-strength domain violation at coordinate {coordinate}: value={value:?} is outside \
+         the supported interval [{lower}, {upper}]"
+    )]
+    LogStrengthDomainViolation {
+        coordinate: usize,
+        value: f64,
+        lower: f64,
+        upper: f64,
+    },
+
     #[error("monotone root solve: {0}")]
     MonotoneRoot(#[from] MonotoneRootError),
 
