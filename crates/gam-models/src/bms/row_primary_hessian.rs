@@ -3386,7 +3386,7 @@ impl BernoulliMarginalSlopeFamily {
             zero_family,
         );
 
-        if let Some(plan) = empirical_plan.as_ref() {
+        if empirical_grid.is_some() {
             let explicit_dimension = r + 1;
             let mut constraint_gradient = vec![0.0; explicit_dimension];
             let mut constraint_hessian = vec![0.0; explicit_dimension * explicit_dimension];
@@ -3438,13 +3438,19 @@ impl BernoulliMarginalSlopeFamily {
                     }
                 }
             }
-            let sign = plan.observed_sign;
+            let sign = s_y;
+            let observed_neglog_stack = unary_derivatives_neglog_phi(sign * eta_val, w_i);
+            if !observed_neglog_stack[0].is_finite() {
+                return Err(format!(
+                    "empirical BMS order-two lowering has non-finite log Phi at row {row}"
+                ));
+            }
             let mut signed = gam_math::jet_scalar::RuntimeOrder2Channels::new(
                 sign * eta_val,
                 eta_gradient.into_iter().map(|value| sign * value).collect(),
                 eta_hessian.into_iter().map(|value| sign * value).collect(),
             )?;
-            signed = signed.compose_unary(plan.observed_neglog_stack);
+            signed = signed.compose_unary(observed_neglog_stack);
             let pulled = gam_math::jet_scalar::implicit_pullback_order2(&constraint, &signed, 0)?;
             for u in 0..r {
                 scratch.grad[u] = pulled.output.gradient[u];
