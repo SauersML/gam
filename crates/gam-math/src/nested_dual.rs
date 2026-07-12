@@ -234,6 +234,32 @@ impl Dual22 {
         }
     }
 
+    /// Build a nested dual directly from its nine `(s-order, t-order)` channels,
+    /// ordered as [`Self::channels`]: `[v, ∂a, ∂b, ∂aa, ∂ab, ∂bb, ∂aab, ∂abb,
+    /// ∂aabb]`. The inverse of [`Self::channels`]. Used to assemble the result of
+    /// a channel-space operation (e.g. a moment-recurrence residual term) back
+    /// into a `Dual22`.
+    #[inline]
+    pub fn from_channels(c: [f64; 9]) -> Self {
+        Dual2 {
+            v: Dual2::<f64> {
+                v: c[0],
+                g: c[2],
+                h: c[5],
+            },
+            g: Dual2::<f64> {
+                v: c[1],
+                g: c[4],
+                h: c[7],
+            },
+            h: Dual2::<f64> {
+                v: c[3],
+                g: c[6],
+                h: c[8],
+            },
+        }
+    }
+
     /// The nine channels this nested dual represents, keyed to the two-primary
     /// [`crate::jet_tower::Tower4`] indices `0` (outer `a`) and `1` (inner `b`):
     /// `(value, ∂a, ∂b, ∂aa, ∂ab, ∂bb, ∂aab, ∂abb, ∂aabb)`.
@@ -432,6 +458,16 @@ mod nested_dual_tower4_oracle_tests {
             }
         }
         eprintln!("[nested-dual #932] directional Dual2<Dual2> vs Tower4<2> contraction max_rel = {max_rel:.3e}");
+    }
+
+    /// `from_channels` is the exact inverse of `channels` (round-trip identity),
+    /// so a channel-space operation can be assembled back into a `Dual22`
+    /// without silently transposing a slot.
+    #[test]
+    fn nested_dual2_channels_from_channels_roundtrip_932() {
+        let c = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let round = Dual22::from_channels(c).channels();
+        assert_eq!(round, c, "channels∘from_channels must be identity");
     }
 
     /// Symmetry guard: the mixed channels are order-independent — `∂a∂b == ∂b∂a`
