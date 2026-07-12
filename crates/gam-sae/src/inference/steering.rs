@@ -652,6 +652,19 @@ pub struct TargetDosePlan {
     pub metric_provenance: MetricProvenance,
 }
 
+/// One patched-forward probe with a finiteness/non-negativity guard on the
+/// returned KL. A free fn (not a closure) so the `&mut PatchedForwardKl<'_>`
+/// reborrow across the correction loop is unambiguous.
+fn probe_kl(probe: &mut PatchedForwardKl<'_>, a: f64) -> Result<f64, String> {
+    let kl = probe(a)?;
+    if !(kl.is_finite() && kl >= 0.0) {
+        return Err(format!(
+            "steer_to_target_nats: probe returned a non-finite/negative KL {kl} at amplitude {a}"
+        ));
+    }
+    Ok(kl)
+}
+
 /// Solve for the amplitude that lands a target output-KL dose `target_nats` (in
 /// nats) on atom `atom_k`'s chord from `t_from` to `t_to` (gh#2263 target-dose
 /// surface — `amplitude = 1` has no universal meaning, the dose does).
@@ -735,18 +748,8 @@ pub fn steer_to_target_nats(
     // a over the in-regime, so this converges in ~1 step in-radius and only does
     // real work where saturation bends the curve. A probed amplitude whose
     // measured KL still matches the local quadratic marks the readout-KL radius.
-    let measure = |probe: &mut PatchedForwardKl<'_>, a: f64| -> Result<f64, String> {
-        let kl = probe(a)?;
-        if !(kl.is_finite() && kl >= 0.0) {
-            return Err(format!(
-                "steer_to_target_nats: probe returned a non-finite/negative KL {kl} at amplitude {a}"
-            ));
-        }
-        Ok(kl)
-    };
-
     let mut a_prev = seed_amplitude;
-    let mut kl_prev = measure(probe, a_prev)?;
+    let mut kl_prev = probe_kl(probe, a_prev)?;
     plan.iterations += 1;
     plan.amplitude = a_prev;
     plan.measured_nats = Some(kl_prev);
@@ -765,7 +768,7 @@ pub fn steer_to_target_nats(
     let mut a_curr = (a_prev * (target_nats / kl_prev.max(f64::MIN_POSITIVE)).sqrt())
         .max(f64::MIN_POSITIVE);
     while plan.iterations < config.max_iter {
-        let kl_curr = measure(probe, a_curr)?;
+        let kl_curr = probe_kl(probe, a_curr)?;
         plan.iterations += 1;
         plan.amplitude = a_curr;
         plan.measured_nats = Some(kl_curr);

@@ -1481,6 +1481,19 @@ fn production_circle_readout_cross_seed_concordance_2260() {
         min_aligned.is_some() && mean_aligned.is_some(),
         "cross-seed aligned concordance must be computable across the five seeds"
     );
+    // Hardened guard (#2260): the production circle readout is seed-STABLE. The
+    // coordinate seed is a deterministic atan2(PC2,PC1) read (no random_state), so
+    // the converged ordering must not wander across seeds — measured min aligned
+    // concordance is 1.0 across all pairs (vs the deleted torch lane's 0.67-0.97).
+    // 0.99 leaves a wide margin over that 1.0 while still tripping hard if a
+    // regression reintroduces seed-dependent basin selection into the readout.
+    let min_aligned = min_aligned.expect("min aligned concordance");
+    assert!(
+        min_aligned >= 0.99,
+        "production circle readout must be seed-stable: min cross-seed aligned \
+         concordance {min_aligned:.4} must be >= 0.99 (deterministic atan2 seed); \
+         a lower value means seed-dependent basin selection has regressed (#2260)"
+    );
 }
 
 /// Certified-encode soundness near a SELF-CROSSING manifold. The figure-eight atom

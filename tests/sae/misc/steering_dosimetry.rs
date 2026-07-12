@@ -39,9 +39,7 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2};
 
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
-use gam::inference::steering::{
-    steer_delta, steer_to_target_nats, PatchedForwardKl, TargetDoseConfig,
-};
+use gam::inference::steering::{steer_delta, steer_to_target_nats, TargetDoseConfig};
 use gam::terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
 use gam::terms::{
     sae::manifold::PeriodicHarmonicEvaluator, sae::manifold::SaeAssignment,
@@ -523,7 +521,7 @@ fn target_dose_exact_probe_converges_in_one_step() {
         &[t0 + delta],
         target,
         TargetDoseConfig::default(),
-        Some(&mut probe as &mut PatchedForwardKl),
+        Some(&mut probe as &mut dyn FnMut(f64) -> Result<f64, String>),
     )
     .expect("target-dose plan");
 
@@ -574,7 +572,7 @@ fn target_dose_saturating_probe_secant_corrects_upward() {
         &[t0 + delta],
         target,
         TargetDoseConfig::default(),
-        Some(&mut probe as &mut PatchedForwardKl),
+        Some(&mut probe as &mut dyn FnMut(f64) -> Result<f64, String>),
     )
     .expect("target-dose plan");
 
