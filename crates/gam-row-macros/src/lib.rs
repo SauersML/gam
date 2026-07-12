@@ -660,9 +660,10 @@ fn expand(input: RowAtomInput) -> Result<TokenStream2> {
 
     if lowerings.contains(&Lowering::Order2) {
         let order2_name = format_ident!("{name}_order2");
-        let packed_hessian = (0..dimension)
-            .flat_map(|row| (row..dimension).map(move |column| hessian[row][column]))
-            .collect::<Vec<_>>();
+        let mut packed_hessian = Vec::with_capacity(dimension * (dimension + 1) / 2);
+        for (row, channels) in hessian.iter().enumerate() {
+            packed_hessian.extend_from_slice(&channels[row..]);
+        }
         let definitions = schedule_definitions(
             std::iter::once(value)
                 .chain(gradient.iter().copied())
