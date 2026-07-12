@@ -38,8 +38,8 @@ SUBTITLES = {
     "sphere": "x² + y² + z² = 1",
     "torus": "(√(x²+y²)−1)² + z² = 0.4²",
     "mobius": "one half-twist",
-    "swiss": "radius = angle  ·  height ∈ [−10.5, 10.5]",
-    "helix": "radius = 1  ·  z = 0.25 angle",
+    "swiss": "radius = angle\nheight ∈ [−10.5, 10.5]",
+    "helix": "radius = 1\nz = 0.25 angle",
 }
 
 
@@ -87,10 +87,10 @@ def render(out: Path, *, seed: int, points_per_object: int) -> None:
         _scatter(axis, kind, points, parameters)
         axis.set_title(
             f"{kind.replace('swiss', 'Swiss roll').title()}\n{SUBTITLES[kind]}",
-            fontsize=10.2,
+            fontsize=9.8,
             fontweight="semibold",
             color="#111111",
-            linespacing=1.4,
+            linespacing=1.2,
             pad=0,
         )
     figure.text(
