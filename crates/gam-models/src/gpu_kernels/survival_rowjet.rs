@@ -257,6 +257,7 @@ mod device {
 mod tests {
     use super::*;
     use crate::survival::marginal_slope::row_kernel::RigidRowInputs;
+    use gam_math::nested_dual::JetField;
 
     #[inline]
     fn rigid_cpu_row_inputs(

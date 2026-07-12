@@ -5,6 +5,7 @@
 use super::*;
 
 use gam_math::jet_scalar::JetScalar;
+use gam_math::nested_dual::JetField;
 use gam_row_macros::row_program;
 
 // ── Static-sparsity (v,g,H) scalar (#932 perf) ─────────────────────────
