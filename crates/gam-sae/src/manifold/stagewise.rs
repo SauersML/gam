@@ -1888,6 +1888,11 @@ fn race_birth_seed(
     registry: Option<&AnalyticPenaltyRegistry>,
     config: &StagewiseConfig,
 ) -> Result<RacedCandidate, String> {
+    // High-level faer SVD/eigensolver reductions use process-global
+    // parallelism and otherwise reassociate between serial and batched birth
+    // drivers. Keep those reductions sequential for the full candidate race;
+    // the fit's rayon row fan-out is governed independently and stays enabled.
+    let faer_seq_race_guard = gam_linalg::faer_ndarray::FaerSequentialScope::enter();
     let k = term.k_atoms();
     let n = term.assignment.logits.nrows();
     let born_move = match &seed.circle_coords {
@@ -1962,6 +1967,7 @@ fn race_birth_seed(
         ev,
         energy: seed.energy,
     };
+    drop(faer_seq_race_guard);
     Ok(raced_candidate)
 }
 
