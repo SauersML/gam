@@ -40,7 +40,7 @@ use ndarray::{Array1, Array2};
 
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::inference::steering::{
-    TargetDoseConfig, TargetDoseRequest, steer_delta, steer_to_target_nats,
+    TargetDoseConfig, TargetDoseError, TargetDoseRequest, steer_delta, steer_to_target_nats,
 };
 use gam::terms::latent::{LatentCoordValues, LatentIdMode, LatentManifold};
 use gam::terms::{
@@ -442,8 +442,8 @@ fn predicted_nats_survive_tier0_frame_rescale_2249() {
 /// `rank = p`, so `predicted_nats(a) = ½‖a·dg‖²` is exactly quadratic in `a`;
 /// the seed identity `½ a0² dgᵀM dg = q*` therefore holds to machine precision at
 /// every dose (and a-fortiori at infinitesimal dose). This is the pure math +
-/// plumbing surface; the closed form is reported UNVALIDATED (`converged=false`)
-/// because without a patched forward it prices the second-order dose, not KL.
+/// plumbing surface; `measured_nats=None` makes its quadratic-only validation
+/// explicit while the returned `steer` carries the exact delta to apply.
 #[test]
 fn target_dose_closed_form_seed_hits_dose_exactly() {
     let t0 = 0.0;
@@ -472,33 +472,29 @@ fn target_dose_closed_form_seed_hits_dose_exactly() {
 
     // Closed-form identity: ½ a0² dgᵀM dg == q* exactly.
     assert!(
-        (plan.predicted_nats - target).abs() / target < 1e-12,
+        (plan.steer.predicted_nats.expect("predicted dose") - target).abs() / target < 1e-12,
         "closed-form seed dose {} must equal target {target} (rel={:.3e})",
-        plan.predicted_nats,
-        (plan.predicted_nats - target).abs() / target
+        plan.steer.predicted_nats.expect("predicted dose"),
+        (plan.steer.predicted_nats.expect("predicted dose") - target).abs() / target
     );
     assert!(
-        (plan.amplitude - plan.seed_amplitude).abs() < 1e-15,
+        (plan.steer.amplitude - plan.seed_amplitude).abs() < 1e-15,
         "with no probe the amplitude is the closed-form seed"
     );
-    // Independently: applying `steer_delta` at the seed amplitude reproduces q*.
-    let applied =
-        steer_delta(&term, &metric, 0, 0, plan.amplitude, &[t0], &[t0 + delta]).expect("applied");
-    let applied_nats = applied.predicted_nats.expect("applied dose");
+    // The target-dose result is itself the exact applied move; no second steer
+    // call is necessary to recover its activation delta.
+    let applied_nats = plan.steer.predicted_nats.expect("applied dose");
     assert!(
         (applied_nats - target).abs() / target < 1e-12,
-        "re-applying the seed amplitude must land the dose: {applied_nats} vs {target}"
-    );
-    // Unvalidated closed form: no probe ⇒ not converged, no measurement, no
-    // readout-KL radius; the chart radius is still reported.
-    assert!(
-        !plan.converged,
-        "closed form is unvalidated without a probe"
+        "the atomic applied plan must land the dose: {applied_nats} vs {target}"
     );
     assert!(plan.measured_nats.is_none());
     assert_eq!(plan.iterations, 0);
     assert!(plan.readout_kl_radius.is_none());
-    assert!(plan.chart_radius.is_some(), "chart radius must be reported");
+    assert!(
+        plan.steer.validity_radius.is_some(),
+        "chart radius must be reported"
+    );
 }
 
 /// gh#2263 target-dose API — with an EXACT-quadratic patched forward the seed is
@@ -534,7 +530,6 @@ fn target_dose_exact_probe_converges_in_one_step() {
     )
     .expect("target-dose plan");
 
-    assert!(plan.converged, "exact-quadratic probe must converge");
     assert_eq!(
         plan.iterations, 1,
         "the seed already hits the target exactly"
@@ -590,10 +585,6 @@ fn target_dose_saturating_probe_secant_corrects_upward() {
     )
     .expect("target-dose plan");
 
-    assert!(
-        plan.converged,
-        "secant must reach the (sub-ceiling) target on a saturating curve"
-    );
     let measured = plan.measured_nats.expect("measured");
     assert!(
         (measured - target).abs() / target <= TargetDoseConfig::default().tol_rel,
@@ -602,9 +593,9 @@ fn target_dose_saturating_probe_secant_corrects_upward() {
     // Saturation ⇒ the quadratic over-predicts, so the true amplitude exceeds the
     // closed-form seed (had to push harder to realize the same measured KL).
     assert!(
-        plan.amplitude > plan.seed_amplitude,
+        plan.steer.amplitude > plan.seed_amplitude,
         "saturating readout needs MORE amplitude than the quadratic seed: {} vs {}",
-        plan.amplitude,
+        plan.steer.amplitude,
         plan.seed_amplitude
     );
     assert!(
@@ -618,4 +609,62 @@ fn target_dose_saturating_probe_secant_corrects_upward() {
         plan.readout_kl_radius.is_none(),
         "seed is past the readout-KL radius; radius must be reported unestablished"
     );
+}
+
+#[test]
+fn target_dose_plateau_is_an_explicit_unreachable_error() {
+    let t0 = 0.0;
+    let (term, metric) = planted_circle(t0);
+    let delta = 0.05_f64;
+    let target = 0.5_f64;
+    let mut probe = |_amplitude: f64| -> Result<f64, String> { Ok(0.1) };
+    let error = steer_to_target_nats(
+        &term,
+        &metric,
+        TargetDoseRequest {
+            atom_k: 0,
+            metric_row: 0,
+            t_from: &[t0],
+            t_to: &[t0 + delta],
+            target_nats: target,
+            config: TargetDoseConfig::default(),
+        },
+        Some(&mut probe),
+    )
+    .expect_err("a measured plateau below the target is unreachable");
+    assert!(matches!(error, TargetDoseError::UnreachableTarget { .. }));
+}
+
+#[test]
+fn target_dose_probe_exhaustion_never_returns_an_unconverged_plan() {
+    let t0 = 0.0;
+    let (term, metric) = planted_circle(t0);
+    let delta = 0.05_f64;
+    let unit = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("unit");
+    let unit_nats = unit.predicted_nats.expect("unit dose");
+    let target = 0.5_f64;
+    let mut probe = |amplitude: f64| -> Result<f64, String> {
+        Ok(0.5 * amplitude * amplitude * unit_nats)
+    };
+    let error = steer_to_target_nats(
+        &term,
+        &metric,
+        TargetDoseRequest {
+            atom_k: 0,
+            metric_row: 0,
+            t_from: &[t0],
+            t_to: &[t0 + delta],
+            target_nats: target,
+            config: TargetDoseConfig {
+                max_iter: 1,
+                ..TargetDoseConfig::default()
+            },
+        },
+        Some(&mut probe),
+    )
+    .expect_err("one below-target probe cannot certify a target-dose plan");
+    assert!(matches!(
+        error,
+        TargetDoseError::ProbeBudgetExhausted { probes: 1, .. }
+    ));
 }

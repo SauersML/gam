@@ -1069,6 +1069,7 @@ pub fn run_sae_manifold_steer_to_target(
         },
         probe,
     )
+    .map_err(|error| error.to_string())
 }
 
 /// Fully owned, Python-free request to certify an externally-trained

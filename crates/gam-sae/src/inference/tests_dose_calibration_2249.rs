@@ -438,9 +438,10 @@ mod tests {
         )
         .expect("closed-form seed");
         assert!(
-            (seed_plan.predicted_nats - target_nats).abs() <= 1e-9 * target_nats,
+            (seed_plan.steer.predicted_nats.expect("predicted dose") - target_nats).abs()
+                <= 1e-9 * target_nats,
             "closed-form seed dose {} must equal target {target_nats}",
-            seed_plan.predicted_nats
+            seed_plan.steer.predicted_nats.expect("predicted dose")
         );
         let expect_a0 = (target_nats / unit_nats).sqrt();
         assert!(
@@ -448,10 +449,7 @@ mod tests {
             "seed amplitude {} must be sqrt(q*/unit_nats) = {expect_a0}",
             seed_plan.seed_amplitude
         );
-        assert!(
-            !seed_plan.converged,
-            "probe-free seed is unvalidated by construction"
-        );
+        assert!(seed_plan.measured_nats.is_none());
 
         // Model-in-the-loop probe: exact categorical KL of the applied chord.
         let z_from_probe = z_from.clone();
@@ -481,10 +479,6 @@ mod tests {
         )
         .expect("target-dose loop with exact-KL probe");
 
-        assert!(
-            plan.converged,
-            "target-dose loop must converge on the exact-KL probe"
-        );
         let measured = plan.measured_nats.expect("measured dose");
         assert!(
             (measured - target_nats).abs() / target_nats <= 2.0e-2,

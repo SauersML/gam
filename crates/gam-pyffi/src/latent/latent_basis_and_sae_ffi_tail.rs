@@ -1678,22 +1678,30 @@ fn target_dose_plan_to_pydict(
     py: Python<'_>,
     plan: gam::inference::steering::TargetDosePlan,
 ) -> PyResult<Py<PyDict>> {
-    let provenance_str = gam::terms::sae::manifold::metric_provenance_label(plan.metric_provenance);
-    let out = PyDict::new(py);
-    out.set_item("atom", plan.atom)?;
-    out.set_item("atom_name", plan.atom_name)?;
-    out.set_item("target_nats", plan.target_nats)?;
-    out.set_item("seed_amplitude", plan.seed_amplitude)?;
-    out.set_item("amplitude", plan.amplitude)?;
-    out.set_item("predicted_nats", plan.predicted_nats)?;
-    out.set_item("predicted_nats_kind", plan.predicted_nats_kind.as_str())?;
-    out.set_item("measured_nats", plan.measured_nats)?;
-    out.set_item("iterations", plan.iterations)?;
-    out.set_item("converged", plan.converged)?;
-    out.set_item("chart_radius", plan.chart_radius)?;
-    out.set_item("readout_kl_radius", plan.readout_kl_radius)?;
-    out.set_item("metric_provenance", provenance_str)?;
-    Ok(out.unbind())
+    let gam::inference::steering::TargetDosePlan {
+        target_nats,
+        seed_amplitude,
+        steer,
+        measured_nats,
+        iterations,
+        readout_kl_radius,
+    } = plan;
+    let out = steer_plan_to_pydict(py, steer)?;
+    let bound = out.bind(py);
+    bound.set_item("target_nats", target_nats)?;
+    bound.set_item("seed_amplitude", seed_amplitude)?;
+    bound.set_item("measured_nats", measured_nats)?;
+    bound.set_item("iterations", iterations)?;
+    bound.set_item(
+        "validation",
+        if measured_nats.is_some() {
+            "patched_forward"
+        } else {
+            "quadratic_model"
+        },
+    )?;
+    bound.set_item("readout_kl_radius", readout_kl_radius)?;
+    Ok(out)
 }
 
 /// Render a [`gam::inference::steering::SteerPlan`] as the Python dict both steer
