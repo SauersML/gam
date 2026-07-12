@@ -2639,8 +2639,7 @@ impl<'a> RemlState<'a> {
             self.weights,
             -phi.ln(),
         )?;
-        let base_half_values: Vec<f64> =
-            base_rows.iter().map(|row| row.half_deviance).collect();
+        let base_half_values: Vec<f64> = base_rows.iter().map(|row| row.half_deviance).collect();
         let base_scaled_half_deviance = crate::pirls::stable_finite_signed_sum(
             &base_half_values,
             "#784 base scaled half-deviance",

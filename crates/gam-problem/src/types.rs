@@ -58,7 +58,7 @@ impl RidgePassport {
 // StabilizationLedger: canonical accounting for every fixed/heuristic ridge
 // added anywhere in the solver, linear-algebra, or family code paths.
 //
-// Three semantically distinct ridge uses must NEVER be conflated:
+// Four semantically distinct ridge uses must NEVER be conflated:
 //   1. SolverDampingOnly      — Levenberg/trust-region damping; never enters
 //                               objective, gradient, logdet, Hessian, or any
 //                               saved/serialized model artifact.
@@ -69,12 +69,13 @@ impl RidgePassport {
 //   3. ExplicitPrior          — model-level `delta * I` (or block-diagonal)
 //                               prior. Appears in quadratic, log normalizer,
 //                               Laplace Hessian, serialization, diagnostics.
+//   4. ApproximationOnly      — changes a named downstream approximation
+//                               (for example sigma-point cubature covariance)
+//                               but not the fitted model or its objective.
 //
 // `RidgePassport` above already encodes the inclusion-flag matrix for the
-// PIRLS Laplace ridge specifically; this ledger is the broader sibling that
-// every other call site (RidgePlanner, matrix_inverse_with_regularization,
-// LAML rho-Hessian inversion, survival stabilization, custom-family
-// `ridge_floor`) routes through, so a downstream consumer can ask
+// PIRLS Laplace ridge specifically; this ledger is the broader sibling for
+// every declared solver, approximation, and model ridge, so a downstream consumer can ask
 // `ledger.quadratic_delta()` rather than rediscovering the policy. The three
 // inclusion bits were lifted into the `StabilizationKind` discriminant so the
 // (kind, inclusion-flags) invariant is enforced statically — heterogeneous
@@ -107,7 +108,7 @@ pub enum StabilizationRule {
     BackoffEscalation { attempts: usize },
 }
 
-/// Three semantically distinct flavours a ridge δ can have.
+/// Four semantically distinct flavours a ridge δ can have.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum StabilizationKind {
     None,
@@ -121,6 +122,10 @@ pub enum StabilizationKind {
     NumericalPerturbation {
         backward_error_bound: Option<f64>,
     },
+    /// An explicit part of a downstream approximation, not of the fitted
+    /// model. Unlike `NumericalPerturbation`, consumers must not report the
+    /// result as if the unperturbed estimand had been evaluated.
+    ApproximationOnly,
     /// Part of the model. Enters quadratic, log normalizer, Hessian,
     /// serialization, and user-visible summaries.
     ExplicitPrior,
@@ -189,6 +194,19 @@ impl StabilizationLedger {
         }
     }
 
+    /// Ridge declared as part of a downstream approximation (for example the
+    /// regularized rho covariance used to place sigma points).
+    pub const fn approximation_only(delta: f64, chosen_by: StabilizationRule) -> Self {
+        Self {
+            kind: StabilizationKind::ApproximationOnly,
+            delta,
+            matrix_form: RidgeMatrixForm::ScaledIdentity,
+            chosen_by,
+            inertia_before: None,
+            inertia_after: None,
+        }
+    }
+
     /// Model-level explicit prior. δ enters every accounting pass: the
     /// quadratic penalty, the Laplace Hessian, the penalty log-determinant,
     /// and serialization.
@@ -244,7 +262,8 @@ impl StabilizationLedger {
             StabilizationKind::ExplicitPrior => self.delta,
             StabilizationKind::None
             | StabilizationKind::SolverDampingOnly
-            | StabilizationKind::NumericalPerturbation { .. } => 0.0,
+            | StabilizationKind::NumericalPerturbation { .. }
+            | StabilizationKind::ApproximationOnly => 0.0,
         }
     }
 
@@ -257,7 +276,8 @@ impl StabilizationLedger {
             StabilizationKind::ExplicitPrior => self.delta,
             StabilizationKind::None
             | StabilizationKind::SolverDampingOnly
-            | StabilizationKind::NumericalPerturbation { .. } => 0.0,
+            | StabilizationKind::NumericalPerturbation { .. }
+            | StabilizationKind::ApproximationOnly => 0.0,
         }
     }
 
@@ -270,7 +290,8 @@ impl StabilizationLedger {
             StabilizationKind::ExplicitPrior => self.delta,
             StabilizationKind::None
             | StabilizationKind::SolverDampingOnly
-            | StabilizationKind::NumericalPerturbation { .. } => 0.0,
+            | StabilizationKind::NumericalPerturbation { .. }
+            | StabilizationKind::ApproximationOnly => 0.0,
         }
     }
 }

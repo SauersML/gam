@@ -35,6 +35,40 @@ fn posterior_covariance_inverse(
     certified_spd_inverse(h, label).map(gam_linalg::utils::CertifiedSpdInverse::into_inverse)
 }
 
+fn certify_factorized_inference_solve(
+    hessian: &gam_linalg::matrix::SymmetricMatrix,
+    rhs: &Array2<f64>,
+    solution: &Array2<f64>,
+    label: &str,
+) -> Result<(), EstimationError> {
+    let residual = hessian.dot_matrix(solution) - rhs;
+    gam_linalg::utils::certify_linear_system_residual(
+        hessian.nrows(),
+        hessian.max_abs_entry(),
+        rhs,
+        solution,
+        &residual,
+        label,
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        EstimationError::RemlOptimizationFailed(format!(
+            "exact factorized inference solve did not certify: {error}"
+        ))
+    })
+}
+
+fn certify_factorized_inference_vector_solve(
+    hessian: &gam_linalg::matrix::SymmetricMatrix,
+    rhs: &Array1<f64>,
+    solution: &Array1<f64>,
+    label: &str,
+) -> Result<(), EstimationError> {
+    let rhs_matrix = rhs.view().insert_axis(Axis(1)).to_owned();
+    let solution_matrix = solution.view().insert_axis(Axis(1)).to_owned();
+    certify_factorized_inference_solve(hessian, &rhs_matrix, &solution_matrix, label)
+}
+
 /// Scale-free KKT residual for the Negative-Binomial conditional ML problem in
 /// `tau = log(theta)`. The score is `d log L / d theta`; therefore the
 /// minimization gradient in `tau` is `-theta * score`. At either admissible
@@ -1984,7 +2018,7 @@ where
     // Hold the governor charge across every dense inference allocation in this
     // fit. A refusal selects the factorized/diagonal path before any optional
     // covariance, influence, or smoothing-correction matrix is built.
-    let mut dense_covariance_reservation = opts
+    let dense_covariance_reservation = opts
         .compute_inference
         .then(|| reserve_dense_covariance_bundle(pirls_res.reparam_result.qs.nrows()))
         .flatten();
@@ -2029,6 +2063,12 @@ where
                     .map_err(|_| EstimationError::ModelIsIllConditioned {
                         condition_number: f64::INFINITY,
                     })?;
+            certify_factorized_inference_solve(
+                h,
+                &rhs,
+                &sol,
+                "penalty-block EDF trace",
+            )?;
             // Frobenius inner product: only the block rows of rhs are nonzero.
             let mut frob = 0.0f64;
             for col in 0..rank {
@@ -2195,20 +2235,25 @@ where
             let mut acc = s_beta_t.slice_mut(ndarray::s![r.clone()]);
             acc.scaled_add(lam_k, &local_beta);
         }
-        match factor.solve(&s_beta_t) {
-            Ok(b_t) => {
-                let qs = &pirls_res.reparam_result.qs;
-                let b_orig = qs.dot(&b_t);
-                if b_orig.iter().all(|v| v.is_finite()) {
-                    bias_correction_beta = Some(b_orig);
-                } else {
-                    log::warn!("bias-correction vector contained non-finite entries; skipping");
-                }
-            }
-            Err(e) => {
-                log::warn!("bias-correction solve failed: {e}");
-            }
+        let b_t = factor.solve(&s_beta_t).map_err(|reason| {
+            EstimationError::RemlOptimizationFailed(format!(
+                "exact bias-correction solve failed: {reason}"
+            ))
+        })?;
+        certify_factorized_inference_vector_solve(
+            h,
+            &s_beta_t,
+            &b_t,
+            "bias correction",
+        )?;
+        let qs = &pirls_res.reparam_result.qs;
+        let b_orig = qs.dot(&b_t);
+        if b_orig.iter().any(|value| !value.is_finite()) {
+            return Err(EstimationError::RemlOptimizationFailed(
+                "bias-correction basis map produced non-finite coefficients".to_string(),
+            ));
         }
+        bias_correction_beta = Some(b_orig);
         // Preserve the factorization for solve-on-demand SE and covariance
         // computation below, after dispersion has been determined.
         edf_factor = Some(factor);
@@ -2507,12 +2552,16 @@ where
         beta_standard_errors = if let Some(ref h_inv) = beta_covariance_unscaled {
             // Fast path: SE from stored full inverse (already phi-scaled via
             // beta_covariance, but we need the unscaled diagonal here).
-            let raw_se = Array1::from_iter(
-                h_inv
-                    .diag()
-                    .iter()
-                    .map(|&v| (cov_scale * v.max(0.0)).sqrt()),
-            );
+            let mut raw_se = Array1::<f64>::zeros(p_cov);
+            for (index, &variance_unscaled) in h_inv.diag().iter().enumerate() {
+                let variance = cov_scale * variance_unscaled;
+                if !(variance.is_finite() && variance > 0.0) {
+                    return Err(EstimationError::RemlOptimizationFailed(format!(
+                        "posterior covariance diagonal {index} is not positive and representable: {variance:?}"
+                    )));
+                }
+                raw_se[index] = variance.sqrt();
+            }
             Some(raw_se)
         } else if let Some(ref factor_t) = edf_factor {
             // Solve-on-demand: process columns of Qs^T in chunks.
@@ -2520,56 +2569,63 @@ where
             // (H_orig⁻¹)_{ii} = Qs[i,:] · H_t⁻¹ · Qs[i,:]'
             // Batch: column i of Qs^T is row i of Qs. Solve H_t Z = Qs^T[:,chunk]
             // then dot each solution column back with the corresponding Qs row.
+            if se_chunk_cols == 0 {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "resource policy cannot admit even one exact factorized coefficient-SE column"
+                        .to_string(),
+                ));
+            }
             let mut diag_inv = Array1::<f64>::zeros(p_cov);
             let mut col_start = 0usize;
-            let mut solve_failed = false;
             while col_start < p_cov {
                 let col_end = (col_start + se_chunk_cols).min(p_cov);
                 let chunk = col_end - col_start;
-                let Ok(_chunk_reservation) = governor.try_reserve_dense_f64_copies(
-                    qs.ncols(),
-                    chunk,
-                    2,
-                    "factorized coefficient-SE solve chunk",
-                ) else {
-                    log::warn!(
-                        "SE solve-on-demand could not reserve chunk {col_start}..{col_end}; discarding coefficient SEs"
-                    );
-                    solve_failed = true;
-                    break;
-                };
+                let _chunk_reservation = governor
+                    .try_reserve_dense_f64_copies(
+                        qs.ncols(),
+                        chunk,
+                        2,
+                        "factorized coefficient-SE solve chunk",
+                    )
+                    .map_err(|_| {
+                        EstimationError::RemlOptimizationFailed(format!(
+                            "resource policy refused exact coefficient-SE columns {col_start}..{col_end}"
+                        ))
+                    })?;
                 // qs.t() has shape (p_t, p_cov); slice to (p_t, chunk).
                 let rhs = qs.t().slice(ndarray::s![.., col_start..col_end]).to_owned();
-                match factor_t.solvemulti(&rhs) {
-                    Ok(z_chunk) => {
-                        // z_chunk is (p_t × chunk).
-                        // (H_orig⁻¹)_{ii} = qs.row(i) · z_chunk.column(i - col_start)
-                        for local_i in 0..chunk {
-                            let global_i = col_start + local_i;
-                            let qs_row = qs.row(global_i);
-                            let z_col = z_chunk.column(local_i);
-                            diag_inv[global_i] = qs_row.dot(&z_col);
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "SE solve-on-demand failed at chunk {col_start}..{col_end}: {e}"
-                        );
-                        solve_failed = true;
-                        break;
-                    }
+                let z_chunk = factor_t.solvemulti(&rhs).map_err(|reason| {
+                    EstimationError::RemlOptimizationFailed(format!(
+                        "exact coefficient-SE solve failed at columns {col_start}..{col_end}: {reason}"
+                    ))
+                })?;
+                certify_factorized_inference_solve(
+                    &pirls_res.stabilizedhessian_transformed,
+                    &rhs,
+                    &z_chunk,
+                    "factorized coefficient standard errors",
+                )?;
+                // z_chunk is (p_t × chunk).
+                // (H_orig⁻¹)_{ii} = qs.row(i) · z_chunk.column(i - col_start)
+                for local_i in 0..chunk {
+                    let global_i = col_start + local_i;
+                    let qs_row = qs.row(global_i);
+                    let z_col = z_chunk.column(local_i);
+                    diag_inv[global_i] = qs_row.dot(&z_col);
                 }
                 col_start = col_end;
             }
-            let se = diag_inv.mapv(|v| (cov_scale * v.max(0.0)).sqrt());
-            if !solve_failed && se.iter().all(|v| v.is_finite()) {
-                Some(se)
-            } else {
-                if !solve_failed {
-                    log::warn!("SE solve-on-demand produced non-finite entries; discarding");
+            let mut se = Array1::<f64>::zeros(p_cov);
+            for (index, &variance_unscaled) in diag_inv.iter().enumerate() {
+                let variance = cov_scale * variance_unscaled;
+                if !(variance.is_finite() && variance > 0.0) {
+                    return Err(EstimationError::RemlOptimizationFailed(format!(
+                        "factorized posterior variance {index} is not positive and representable: {variance:?}"
+                    )));
                 }
-                None
+                se[index] = variance.sqrt();
             }
+            Some(se)
         } else {
             None
         };

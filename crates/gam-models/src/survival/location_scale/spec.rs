@@ -660,7 +660,7 @@ pub fn survival_fit_from_parts(
             working_weights: geom.working_weights.clone(),
             working_response: geom.working_response.clone(),
             reparam_qs: None,
-            dispersion: gam_solve::estimate::Dispersion::Known(1.0),
+            dispersion: gam_solve::estimate::Dispersion::UNIT,
             beta_covariance: covariance_conditional.clone().map(Into::into),
             beta_standard_errors: covariance_conditional
                 .as_ref()

@@ -1466,7 +1466,7 @@ fn cloglog_logp_and_grad_into(
 /// HMC whitening transform targets. With `φ == 1` (the only value
 /// passed by the pre-refactor call sites) this collapses to the original
 /// `−½ w·(y − η)²` expression; with an estimated dispersion (the
-/// `Dispersion::Estimated(σ²)` branch) it removes the silent unit-σ
+/// estimated-dispersion branch) it removes the silent unit-σ
 /// approximation the Gaussian NUTS log-density used previously.
 fn gaussian_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
     let mut weighted_residual = Array1::<f64>::zeros(data.n_samples);
@@ -1822,7 +1822,7 @@ mod tests {
                 working_weights: array![1.0, 1.0, 1.0],
                 working_response: array![0.0, 0.1, -0.2],
                 reparam_qs: None,
-                dispersion: gam_solve::estimate::Dispersion::Known(1.0),
+                dispersion: gam_solve::estimate::Dispersion::UNIT,
                 beta_covariance: None,
                 beta_standard_errors: None,
                 beta_covariance_corrected: None,
@@ -1853,7 +1853,7 @@ mod tests {
             explicit.view(),
             NutsFamily::Gaussian,
             1.0,
-            gam_solve::estimate::Dispersion::Known(1.0),
+            gam_solve::estimate::Dispersion::UNIT,
             false,
         )
         .expect("HMC target whitens with upstream Hessian");
@@ -1994,7 +1994,7 @@ mod tests {
             mode: Arc::new(array![0.0]),
             offset: None,
             gamma_shape: 1.0,
-            dispersion: gam_solve::model_types::Dispersion::Known(1.0),
+            dispersion: gam_solve::model_types::Dispersion::UNIT,
             n_samples: 1,
             dim: 1,
         };
@@ -2045,7 +2045,7 @@ mod tests {
             mode: Arc::new(array![0.0]),
             offset: None,
             gamma_shape: 1.0,
-            dispersion: gam_solve::model_types::Dispersion::Known(1.0),
+            dispersion: gam_solve::model_types::Dispersion::UNIT,
             n_samples: 2,
             dim: 1,
         };
@@ -2182,7 +2182,7 @@ mod tests {
             hessian.view(),
             NutsFamily::BinomialLogit,
             1.0,
-            gam_solve::estimate::Dispersion::Known(1.0),
+            gam_solve::estimate::Dispersion::UNIT,
             true,
         )
         .expect("posterior");
@@ -2231,7 +2231,7 @@ mod tests {
             mode: Arc::new(Array1::zeros(1)),
             offset: None,
             gamma_shape: shape,
-            dispersion: gam_solve::estimate::Dispersion::Known(1.0),
+            dispersion: gam_solve::estimate::Dispersion::UNIT,
             n_samples: x.nrows(),
             dim: x.ncols(),
         };
@@ -2315,7 +2315,7 @@ mod tests {
             hessian.view(),
             NutsFamily::GammaLog,
             shape,
-            gam_solve::estimate::Dispersion::Estimated(1.0 / shape),
+            gam_solve::estimate::Dispersion::estimated(1.0 / shape).unwrap(),
             false,
         )
         .expect("GammaLog NUTS target builds");
@@ -2382,7 +2382,7 @@ mod tests {
             hessian.view(),
             NutsFamily::GammaLog,
             shape,
-            gam_solve::estimate::Dispersion::Estimated(1.0 / shape),
+            gam_solve::estimate::Dispersion::estimated(1.0 / shape).unwrap(),
             false,
         )
         .expect("GammaLog NUTS target builds");
@@ -2423,7 +2423,7 @@ mod tests {
             mode: Arc::new(Array1::zeros(x.ncols())),
             offset: None,
             gamma_shape: 1.0,
-            dispersion: gam_solve::estimate::Dispersion::Known(1.0),
+            dispersion: gam_solve::estimate::Dispersion::UNIT,
             n_samples: x.nrows(),
             dim: x.ncols(),
         };
@@ -2510,7 +2510,7 @@ mod tests {
                 mode: mode.view(),
                 hessian: non_spd_hessian.view(),
                 gamma_shape: None,
-                dispersion: gam_solve::model_types::Dispersion::Known(1.0),
+                dispersion: gam_solve::model_types::Dispersion::UNIT,
                 firth_bias_reduction: false,
                 offset: None,
             }),
@@ -2552,7 +2552,7 @@ mod tests {
                 mode: mode.view(),
                 hessian: non_spdhessian.view(),
                 gamma_shape: None,
-                dispersion: gam_solve::estimate::Dispersion::Known(1.0),
+                dispersion: gam_solve::estimate::Dispersion::UNIT,
                 firth_bias_reduction: false,
                 offset: None,
             }),
@@ -2592,7 +2592,7 @@ mod tests {
                 mode: mode.view(),
                 hessian: non_spdhessian.view(),
                 gamma_shape: None,
-                dispersion: gam_solve::estimate::Dispersion::Known(1.0),
+                dispersion: gam_solve::estimate::Dispersion::UNIT,
                 firth_bias_reduction: false,
                 offset: None,
             }),
@@ -2637,7 +2637,7 @@ mod tests {
                 mode: mode.view(),
                 hessian: hessian.view(),
                 gamma_shape: None,
-                dispersion: gam_solve::estimate::Dispersion::Known(1.0),
+                dispersion: gam_solve::estimate::Dispersion::UNIT,
                 firth_bias_reduction: true,
                 offset: None,
             }),
@@ -2680,7 +2680,7 @@ mod tests {
             hessian.view(),
             NutsFamily::Gaussian,
             1.0,
-            gam_solve::estimate::Dispersion::Known(1.0),
+            gam_solve::estimate::Dispersion::UNIT,
             false,
             None,
             &cfg,
@@ -2726,7 +2726,7 @@ mod tests {
                 hessian.view(),
                 NutsFamily::Gaussian,
                 1.0,
-                gam_solve::estimate::Dispersion::Known(1.0),
+                gam_solve::estimate::Dispersion::UNIT,
                 false,
                 None,
                 &cfg,
@@ -2859,7 +2859,7 @@ mod tests {
             hessian.view(),
             NutsFamily::Gaussian,
             1.0,
-            gam_solve::estimate::Dispersion::Known(1.0),
+            gam_solve::estimate::Dispersion::UNIT,
             false,
             None,
             &zero_chain_cfg,
@@ -2886,7 +2886,7 @@ mod tests {
             hessian.view(),
             NutsFamily::Gaussian,
             1.0,
-            gam_solve::estimate::Dispersion::Known(1.0),
+            gam_solve::estimate::Dispersion::UNIT,
             false,
             None,
             &single_chain_cfg,
@@ -2925,7 +2925,7 @@ mod tests {
                 link: InverseLink::Standard(StandardLink::Log),
             },
             gamma_shape: None,
-            dispersion: gam_solve::model_types::Dispersion::Known(1.0),
+            dispersion: gam_solve::model_types::Dispersion::UNIT,
             offset: None,
             mode: mode.view(),
             hessian: hessian.view(),
@@ -2978,7 +2978,7 @@ mod tests {
                 link: InverseLink::Standard(StandardLink::Identity),
             },
             None,
-            gam_solve::model_types::Dispersion::Known(1.0),
+            gam_solve::model_types::Dispersion::UNIT,
             None,
             RhoPrior::Flat,
             false,
@@ -3025,7 +3025,7 @@ mod tests {
                 link: InverseLink::Standard(StandardLink::Identity),
             },
             None,
-            gam_solve::model_types::Dispersion::Known(1.0),
+            gam_solve::model_types::Dispersion::UNIT,
             None,
             prior.clone(),
             false,
@@ -3044,7 +3044,7 @@ mod tests {
                 link: InverseLink::Standard(StandardLink::Identity),
             },
             None,
-            gam_solve::model_types::Dispersion::Known(1.0),
+            gam_solve::model_types::Dispersion::UNIT,
             None,
             prior,
             false,
@@ -3092,7 +3092,7 @@ mod tests {
                 link: InverseLink::Standard(StandardLink::Identity),
             },
             None,
-            gam_solve::model_types::Dispersion::Estimated(4.0),
+            gam_solve::model_types::Dispersion::estimated(4.0).unwrap(),
             Some(offset.view()),
             RhoPrior::Flat,
             false,
@@ -3127,7 +3127,7 @@ mod tests {
             mode: Arc::new(Array1::zeros(1)),
             offset: None,
             gamma_shape: 1.0,
-            dispersion: gam_solve::estimate::Dispersion::Known(1.0),
+            dispersion: gam_solve::estimate::Dispersion::UNIT,
             n_samples: 2,
             dim: 1,
         };
@@ -3242,7 +3242,7 @@ mod tests {
                 link: InverseLink::Standard(StandardLink::Identity),
             },
             None,
-            gam_solve::model_types::Dispersion::Known(1.0),
+            gam_solve::model_types::Dispersion::UNIT,
             None,
             RhoPrior::Flat,
             false,
@@ -3297,7 +3297,7 @@ mod tests {
             mode: Arc::new(Array1::zeros(1)),
             offset: None,
             gamma_shape: 1.0,
-            dispersion: gam_solve::estimate::Dispersion::Known(1.0),
+            dispersion: gam_solve::estimate::Dispersion::UNIT,
             n_samples: 2,
             dim: 1,
         };
@@ -5356,7 +5356,7 @@ pub struct GlmFlatInputs<'a> {
     pub gamma_shape: Option<f64>,
     /// Dispersion parameter φ used to scale the likelihood and the
     /// whitening Cholesky. For fixed-scale families (Binomial, Poisson)
-    /// this is `Dispersion::Known(1.0)` and has no numerical effect;
+    /// this is exact unit dispersion and has no numerical effect;
     /// for Gaussian / Gamma it carries the estimated `phi` so that the
     /// sampler targets the φ-scaled posterior covariance `Vb = φ·H⁻¹`.
     /// See `inference::dispersion_cov` for the ownership invariants.

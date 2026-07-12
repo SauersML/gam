@@ -688,7 +688,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
             working_weights: array![1.0, 0.5, 0.75],
             working_response: array![0.1, 0.2, 0.3],
             reparam_qs: Some(array![[1.0, 0.0], [0.0, 1.0]]),
-            dispersion: Dispersion::Known(1.0),
+            dispersion: Dispersion::UNIT,
             beta_covariance: Some(array![[1.0, 0.1], [0.1, 2.0]].into()),
             beta_standard_errors: Some(array![1.0, 2.0_f64.sqrt()]),
             beta_covariance_corrected: Some(array![[1.2, 0.1], [0.1, 2.2]]),
@@ -775,7 +775,7 @@ fn dispersion_phi_prefers_inference_then_falls_back_to_standard_deviation() {
     // the stored dispersion verbatim so it can never diverge from the φ̂
     // that scaled the covariances at fit time.
     let fit = decode_invariant_test_fit();
-    assert_eq!(fit.dispersion(), Some(Dispersion::Known(1.0)));
+    assert_eq!(fit.dispersion(), Some(Dispersion::UNIT));
     assert_eq!(fit.dispersion_phi(), 1.0);
 
     // Deployment-saved models drop `inference` (see `core_saved_fit_result`,

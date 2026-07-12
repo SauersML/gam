@@ -209,7 +209,7 @@ mod linux_impl {
     use crate::gpu_kernels::sigma_cubature::{SigmaCubatureGpuError, SigmaPointGpuInput};
     use gam_gpu::gpu_error::GpuError;
     use gam_gpu::policy::{PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
-    use gam_linalg::utils::matrix_inversewith_regularization;
+    use gam_linalg::utils::{CertifiedSpdInverse, certified_spd_inverse};
     use ndarray::{Array1, Array2, ArrayView1};
     type SigmaPointResult = (Array2<f64>, Array1<f64>);
 
@@ -355,9 +355,12 @@ mod linux_impl {
             // Map H_transformed → H_original, invert, map β_transformed
             // → β_original. Mirrors the CPU path's post-processing.
             let h_orig = hessian_to_original(&loop_out.penalized_hessian, &pt.qs);
-            let cov =
-                matrix_inversewith_regularization(&h_orig, "gpu sigma point").ok_or_else(|| {
-                    gam_gpu::gpu_err!("gpu sigma point: penalised Hessian inverse not well-defined")
+            let cov = certified_spd_inverse(&h_orig, "gpu sigma point")
+                .map(CertifiedSpdInverse::into_inverse)
+                .map_err(|error| {
+                    gam_gpu::gpu_err!(
+                        "gpu sigma point: exact SPD penalised-Hessian inverse failed: {error}"
+                    )
                 })?;
             let beta_orig = pt.qs.dot(&loop_out.beta);
             let sigma_result = (cov, beta_orig);
@@ -414,10 +417,11 @@ mod linux_impl {
             .map_err(|e| gam_gpu::gpu_err!("gaussian sigma pool: point[{idx}] pls failed: {e}"))?;
 
             let h_orig = hessian_to_original(&pls.penalized_hessian, &pt.qs);
-            let cov = matrix_inversewith_regularization(&h_orig, "gaussian sigma point")
-                .ok_or_else(|| {
+            let cov = certified_spd_inverse(&h_orig, "gaussian sigma point")
+                .map(CertifiedSpdInverse::into_inverse)
+                .map_err(|error| {
                     gam_gpu::gpu_err!(
-                        "gaussian sigma point: penalised Hessian inverse not well-defined"
+                        "gaussian sigma point: exact SPD penalised-Hessian inverse failed: {error}"
                     )
                 })?;
             let beta_orig = pt.qs.dot(&pls.beta);

@@ -1093,7 +1093,6 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let log_likelihood = calculate_loglikelihood_omitting_constants_from_eta(
             self.y,
             &self.workspace.eta_buf,
-            &self.lastmu,
             &self.likelihood,
             &self.link_kind,
             self.priorweights,

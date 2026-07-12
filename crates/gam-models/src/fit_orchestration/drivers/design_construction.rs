@@ -2603,7 +2603,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                     out
                 },
                 reparam_qs: None,
-                dispersion: gam_solve::estimate::Dispersion::Known(1.0),
+                dispersion: gam_solve::estimate::Dispersion::UNIT,
                 beta_covariance: beta_covariance
                     .clone()
                     .map(gam_problem::dispersion_cov::PhiScaledCovariance::from),

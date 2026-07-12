@@ -1,6 +1,7 @@
 use crate::LinalgError;
 use crate::faer_ndarray::{
-    FaerArrayView, FaerLinalgError, array2_to_matmut, factorize_symmetricwith_fallback,
+    FaerArrayView, FaerCholeskyFactor, FaerLinalgError, array2_to_matmut,
+    factorize_symmetricwith_fallback,
 };
 use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::matrix::symmetrize_in_place;
@@ -199,6 +200,90 @@ pub struct CertifiedSpdInverse {
     certificate: SymmetricSolveCertificate,
 }
 
+/// Strict, unjittered Cholesky factor coupled to the exact matrix it
+/// factorized, so every subsequent solve can be certified against that same
+/// unperturbed matrix.
+pub struct CertifiedSpdFactor<'a> {
+    matrix: &'a Array2<f64>,
+    matrix_max_abs: f64,
+    factor: FaerCholeskyFactor,
+    label: &'a str,
+}
+
+impl CertifiedSpdFactor<'_> {
+    /// Solve one right-hand side and certify the residual against the original
+    /// matrix retained by this factor.
+    pub fn solve(
+        &self,
+        rhs: &Array1<f64>,
+    ) -> Result<CertifiedSymmetricSolution, CertifiedSymmetricSolveError> {
+        if rhs.len() != self.matrix.nrows() {
+            return Err(CertifiedSymmetricSolveError::InvalidRhsShape {
+                label: self.label.to_string(),
+                expected: self.matrix.nrows(),
+                actual: rhs.len(),
+            });
+        }
+        let rhs_matrix = rhs.view().insert_axis(ndarray::Axis(1)).to_owned();
+        let solution = self.factor.solve_mat(&rhs_matrix);
+        let certificate = certify_symmetric_matrix_solution(
+            &self.matrix,
+            self.matrix_max_abs,
+            &rhs_matrix,
+            &solution,
+            &self.label,
+        )?;
+        Ok(CertifiedSymmetricSolution {
+            solution: solution.column(0).to_owned(),
+            certificate,
+        })
+    }
+
+    /// Solve multiple right-hand sides and return the solution plus its shared
+    /// max-norm backward-error certificate.
+    pub fn solve_matrix(
+        &self,
+        rhs: &Array2<f64>,
+    ) -> Result<(Array2<f64>, SymmetricSolveCertificate), CertifiedSymmetricSolveError> {
+        if rhs.nrows() != self.matrix.nrows() {
+            return Err(CertifiedSymmetricSolveError::InvalidRhsShape {
+                label: self.label.to_string(),
+                expected: self.matrix.nrows(),
+                actual: rhs.nrows(),
+            });
+        }
+        let solution = self.factor.solve_mat(rhs);
+        let certificate = certify_symmetric_matrix_solution(
+            &self.matrix,
+            self.matrix_max_abs,
+            rhs,
+            &solution,
+            &self.label,
+        )?;
+        Ok((solution, certificate))
+    }
+
+    /// Invert the retained SPD matrix and certify `A A⁻¹ = I`.
+    pub fn inverse(&self) -> Result<CertifiedSpdInverse, CertifiedSymmetricSolveError> {
+        let rhs = Array2::<f64>::eye(self.matrix.nrows());
+        let mut inverse = self.factor.solve_mat(&rhs);
+        // Independent identity columns can differ by a few solve-roundoff bits;
+        // project those bits back to the analytic symmetry, then recertify.
+        symmetrize_in_place(&mut inverse);
+        let certificate = certify_symmetric_matrix_solution(
+            &self.matrix,
+            self.matrix_max_abs,
+            &rhs,
+            &inverse,
+            &self.label,
+        )?;
+        Ok(CertifiedSpdInverse {
+            inverse,
+            certificate,
+        })
+    }
+}
+
 impl CertifiedSpdInverse {
     #[inline]
     pub fn inverse(&self) -> &Array2<f64> {
@@ -231,6 +316,8 @@ pub enum CertifiedSymmetricSolveError {
         expected: usize,
         actual: usize,
     },
+    #[error("{label}: invalid residual-certificate inputs: {reason}")]
+    InvalidCertificateInput { label: String, reason: String },
     #[error("{label}: matrix entry ({row}, {col}) is non-finite: {value:?}")]
     NonFiniteMatrix {
         label: String,
@@ -354,11 +441,7 @@ fn validate_symmetric_matrix(
 
 #[inline]
 fn max_abs_matrix(matrix: &Array2<f64>) -> f64 {
-    matrix
-        .iter()
-        .copied()
-        .map(f64::abs)
-        .fold(0.0_f64, f64::max)
+    matrix.iter().copied().map(f64::abs).fold(0.0_f64, f64::max)
 }
 
 fn max_norm_backward_error(
@@ -385,8 +468,8 @@ fn max_norm_backward_error(
     if largest == f64::NEG_INFINITY {
         return f64::INFINITY;
     }
-    let denominator_log = largest
-        + ((product_log - largest).exp() + (rhs_log - largest).exp()).ln();
+    let denominator_log =
+        largest + ((product_log - largest).exp() + (rhs_log - largest).exp()).ln();
     (residual_max_abs.ln() - denominator_log).exp()
 }
 
@@ -403,6 +486,59 @@ fn certify_symmetric_matrix_solution(
     solution: &Array2<f64>,
     label: &str,
 ) -> Result<SymmetricSolveCertificate, CertifiedSymmetricSolveError> {
+    let residual = matrix.dot(solution) - rhs;
+    certify_linear_system_residual(
+        matrix.nrows(),
+        matrix_max_abs,
+        rhs,
+        solution,
+        &residual,
+        label,
+    )
+}
+
+/// Certify a solve performed by an exact dense or sparse factorization from
+/// its residual `A X - B` and the exact matrix max-entry norm.
+///
+/// This is the shared certification boundary for operator-backed systems that
+/// cannot materialize `A` merely to call [`certified_symmetric_solve`].  It does
+/// not establish symmetry or positive-definiteness; callers must obtain those
+/// from their exact matrix representation and strict factorization.
+pub fn certify_linear_system_residual(
+    dimension: usize,
+    matrix_max_abs: f64,
+    rhs: &Array2<f64>,
+    solution: &Array2<f64>,
+    residual: &Array2<f64>,
+    label: &str,
+) -> Result<SymmetricSolveCertificate, CertifiedSymmetricSolveError> {
+    if dimension == 0
+        || !matrix_max_abs.is_finite()
+        || matrix_max_abs < 0.0
+        || rhs.nrows() != dimension
+        || solution.dim() != rhs.dim()
+        || residual.dim() != rhs.dim()
+    {
+        return Err(CertifiedSymmetricSolveError::InvalidCertificateInput {
+            label: label.to_string(),
+            reason: format!(
+                "dimension={dimension}, matrix_max_abs={matrix_max_abs:?}, rhs={:?}, solution={:?}, residual={:?}",
+                rhs.dim(),
+                solution.dim(),
+                residual.dim()
+            ),
+        });
+    }
+    for ((row, col), &value) in rhs.indexed_iter() {
+        if !value.is_finite() {
+            return Err(CertifiedSymmetricSolveError::NonFiniteRhs {
+                label: label.to_string(),
+                row,
+                col,
+                value,
+            });
+        }
+    }
     for ((row, col), &value) in solution.indexed_iter() {
         if !value.is_finite() {
             return Err(CertifiedSymmetricSolveError::NonFiniteSolution {
@@ -413,7 +549,6 @@ fn certify_symmetric_matrix_solution(
             });
         }
     }
-    let residual = matrix.dot(solution) - rhs;
     for ((row, col), &value) in residual.indexed_iter() {
         if !value.is_finite() {
             return Err(CertifiedSymmetricSolveError::NonFiniteResidual {
@@ -426,15 +561,15 @@ fn certify_symmetric_matrix_solution(
     }
     let solution_max_abs = max_abs_matrix(solution);
     let rhs_max_abs = max_abs_matrix(rhs);
-    let residual_max_abs = max_abs_matrix(&residual);
+    let residual_max_abs = max_abs_matrix(residual);
     let max_norm_backward_error = max_norm_backward_error(
-        matrix.nrows(),
+        dimension,
         matrix_max_abs,
         solution_max_abs,
         rhs_max_abs,
         residual_max_abs,
     );
-    let allowed_backward_error = solve_backward_error_allowance(matrix.nrows());
+    let allowed_backward_error = solve_backward_error_allowance(dimension);
     if !max_norm_backward_error.is_finite() || max_norm_backward_error > allowed_backward_error {
         return Err(CertifiedSymmetricSolveError::BackwardErrorTooLarge {
             label: label.to_string(),
@@ -444,7 +579,7 @@ fn certify_symmetric_matrix_solution(
         });
     }
     Ok(SymmetricSolveCertificate {
-        dimension: matrix.nrows(),
+        dimension,
         matrix_max_abs,
         solution_max_abs,
         rhs_max_abs,
@@ -477,12 +612,12 @@ fn certified_symmetric_matrix_solve(
             });
         }
     }
-    let factor = StableSolver::new(label).factorize(matrix).map_err(|error| {
-        CertifiedSymmetricSolveError::Factorization {
+    let factor = StableSolver::new(label)
+        .factorize(matrix)
+        .map_err(|error| CertifiedSymmetricSolveError::Factorization {
             label: label.to_string(),
             reason: error.to_string(),
-        }
-    })?;
+        })?;
     let mut solution = rhs.clone();
     let mut solution_view = array2_to_matmut(&mut solution);
     factor.solve_in_place(solution_view.as_mut());
@@ -509,6 +644,27 @@ pub fn certified_symmetric_solve(
     })
 }
 
+/// Strictly factor a finite symmetric positive-definite matrix without
+/// diagonal jitter, spectral repair, or an indefinite LDLT/LBLT route.
+pub fn certified_spd_factorize<'a>(
+    matrix: &'a Array2<f64>,
+    label: &'a str,
+) -> Result<CertifiedSpdFactor<'a>, CertifiedSymmetricSolveError> {
+    let matrix_max_abs = validate_symmetric_matrix(matrix, label)?;
+    let factor = matrix.cholesky(Side::Lower).map_err(|error| {
+        CertifiedSymmetricSolveError::NotPositiveDefinite {
+            label: label.to_string(),
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(CertifiedSpdFactor {
+        matrix,
+        matrix_max_abs,
+        factor,
+        label,
+    })
+}
+
 /// Invert a symmetric positive-definite matrix without an additive
 /// perturbation or spectral truncation.
 ///
@@ -521,27 +677,7 @@ pub fn certified_spd_inverse(
     matrix: &Array2<f64>,
     label: &str,
 ) -> Result<CertifiedSpdInverse, CertifiedSymmetricSolveError> {
-    let matrix_max_abs = validate_symmetric_matrix(matrix, label)?;
-    let rhs = Array2::<f64>::eye(matrix.nrows());
-    let factor = matrix.cholesky(Side::Lower).map_err(|error| {
-        CertifiedSymmetricSolveError::NotPositiveDefinite {
-            label: label.to_string(),
-            reason: error.to_string(),
-        }
-    })?;
-    let mut inverse = rhs.clone();
-    factor.solve_mat_in_place(&mut inverse);
-    // A symmetric factorization can accumulate a few asymmetric round-off bits
-    // when solving all identity columns.  This projection changes only those
-    // solve-roundoff bits and is followed by a fresh certificate against the
-    // original, unperturbed matrix.
-    symmetrize_in_place(&mut inverse);
-    let certificate =
-        certify_symmetric_matrix_solution(matrix, matrix_max_abs, &rhs, &inverse, label)?;
-    Ok(CertifiedSpdInverse {
-        inverse,
-        certificate,
-    })
+    certified_spd_factorize(matrix, label)?.inverse()
 }
 
 #[derive(Default, Clone, Copy)]
@@ -749,7 +885,6 @@ impl<'a> StableSolver<'a> {
 
         Some(pseudo)
     }
-
 }
 
 pub fn max_abs_diag(matrix: &Array2<f64>) -> f64 {

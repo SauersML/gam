@@ -27,8 +27,7 @@
 //! explicit can wrap with `PhiScaledCovariance::wrap` /
 //! `UnscaledPrecision::wrap` at the boundary.
 //!
-//! `Dispersion` lives in `gam-problem` as the neutral scale contract. The
-//! helper methods on the local `DispersionExt` trait give terse
+//! `Dispersion` lives in `gam-problem` as the neutral scale contract.
 //! `phi()` / `inv_phi()` / `sqrt_phi()` call-sites for sampling code.
 
 use ndarray::{Array1, Array2};
@@ -164,29 +163,6 @@ impl DerefMut for UnscaledPrecision {
     }
 }
 
-/// Extension methods on [`Dispersion`] used by the sampling code, kept here
-/// so we do not need to touch the canonical definition in
-/// `solver::estimate`. The conversions are all `phi`-aware: `inv_phi()`
-/// and `sqrt_phi()` are floored away from zero so that downstream
-/// arithmetic never produces `NaN` / `Inf` on a pathological zero
-/// dispersion.
-pub trait DispersionExt {
-    fn inv_phi(self) -> f64;
-    fn sqrt_phi(self) -> f64;
-}
-
-impl DispersionExt for Dispersion {
-    #[inline]
-    fn inv_phi(self) -> f64 {
-        1.0 / self.phi().max(1e-300)
-    }
-
-    #[inline]
-    fn sqrt_phi(self) -> f64 {
-        self.phi().max(0.0).sqrt()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,30 +220,5 @@ mod tests {
         let h = array![[2.0_f64, 0.0], [0.0, 3.0]];
         let wrapped = UnscaledPrecision::wrap(h.clone());
         assert_eq!(*wrapped.as_array(), h);
-    }
-
-    // ── DispersionExt ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn inv_phi_known_dispersion() {
-        assert!((Dispersion::Known(4.0).inv_phi() - 0.25).abs() < 1e-14);
-    }
-
-    #[test]
-    fn inv_phi_floors_at_one_over_1e_minus_300() {
-        // phi = 0 should return 1/1e-300, not infinity
-        let r = Dispersion::Known(0.0).inv_phi();
-        assert!(r.is_finite());
-        assert!((r - 1.0 / 1e-300).abs() < 1.0);
-    }
-
-    #[test]
-    fn sqrt_phi_returns_sqrt() {
-        assert!((Dispersion::Estimated(9.0).sqrt_phi() - 3.0).abs() < 1e-14);
-    }
-
-    #[test]
-    fn sqrt_phi_clamps_negative_to_zero() {
-        assert_eq!(Dispersion::Known(-1.0).sqrt_phi(), 0.0);
     }
 }

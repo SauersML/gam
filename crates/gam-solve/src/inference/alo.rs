@@ -91,6 +91,8 @@ pub struct AloDiagnostics {
     /// Frequentist sandwich-style standard error on eta:
     /// sqrt(phi * x_i^T H^{-1} X^T W X H^{-1} x_i).
     pub se_sandwich: Array1<f64>,
+    /// Observed-curvature row leverage `W_H,i x_iᵀH⁻¹x_i`. This is signed for
+    /// non-canonical links; negative values are valid and are never projected.
     pub leverage: Array1<f64>,
 }
 
@@ -566,7 +568,6 @@ fn compute_alo_diagnostics_from_pirls_inner(
         working_response: &alo_working_response,
         eta: &alo_final_eta,
         offset: &alo_final_offset,
-        link,
         phi,
         score_curvature: score_curvature_ref,
     };
@@ -625,7 +626,12 @@ fn log_leverage_diagnostics(leverage: &Array1<f64>, phi: f64) {
             finite_leverage.push(ai);
         }
 
-        if !(0.0..=1.0).contains(&ai) || !ai.is_finite() {
+        // Signed observed curvature permits exact negative row leverages for
+        // non-canonical links. They are not invalid: the corresponding ALO
+        // denominator `1-a_ii` is more strongly positive. Non-finite values
+        // remain invalid, while positive near-one leverage is the instability
+        // diagnostic of interest.
+        if !ai.is_finite() {
             invalid_count += 1;
             log::warn!("[GAM ALO] invalid leverage at i={}, a_ii={:.6e}", obs, ai);
         } else if ai > LEVERAGE_HIGH_THRESHOLD {
@@ -716,8 +722,6 @@ pub struct AloInput<'a> {
     pub eta: &'a Array1<f64>,
     /// Offset vector (n). Pass zeros if no offset.
     pub offset: &'a Array1<f64>,
-    /// Link function (for phi determination).
-    pub link: LinkFunction,
     /// Dispersion parameter φ. For non-Gaussian families this is 1.0.
     pub phi: f64,
     /// Optional per-row score/curvature evaluator `(i, η) → (ℓ_i'(η), ℓ_i''(η))`.
@@ -742,7 +746,6 @@ impl<'a> AloInput<'a> {
         design: &'a Array2<f64>,
         eta: &'a Array1<f64>,
         offset: &'a Array1<f64>,
-        link: LinkFunction,
         phi: f64,
     ) -> Self {
         // FitGeometry stores one working-weight vector, so this constructor is
@@ -760,7 +763,6 @@ impl<'a> AloInput<'a> {
             working_response: &geom.working_response,
             eta,
             offset,
-            link,
             phi,
             score_curvature: None,
         }
@@ -790,7 +792,6 @@ impl<'a> AloInput<'a> {
         design: &'a Array2<f64>,
         eta: &'a Array1<f64>,
         offset: &'a Array1<f64>,
-        link: LinkFunction,
         phi: f64,
         working_weights: &'a Array1<f64>,
         working_response: &'a Array1<f64>,
@@ -804,7 +805,6 @@ impl<'a> AloInput<'a> {
             working_response,
             eta,
             offset,
-            link,
             phi,
             score_curvature: None,
         }
@@ -1136,7 +1136,6 @@ pub fn compute_alo_diagnostics_from_unified(
     design: &Array2<f64>,
     eta: &Array1<f64>,
     offset: &Array1<f64>,
-    link: LinkFunction,
     phi: f64,
 ) -> Result<AloDiagnostics, EstimationError> {
     let geom = unified
@@ -1148,7 +1147,7 @@ pub fn compute_alo_diagnostics_from_unified(
                 .to_string(),
         })
         .map_err(EstimationError::from)?;
-    let input = AloInput::from_geometry(geom, design, eta, offset, link, phi);
+    let input = AloInput::from_geometry(geom, design, eta, offset, phi);
     compute_alo_from_input(&input)
 }
 
@@ -2076,7 +2075,6 @@ mod tests {
             working_response: &working_response,
             eta: &eta,
             offset: &offset,
-            link: LinkFunction::Logit,
             phi: 1.0,
             score_curvature: Some(&score_curvature),
         };
@@ -2166,7 +2164,6 @@ mod tests {
             working_response: &working_response,
             eta: &eta,
             offset: &offset,
-            link: LinkFunction::Probit,
             phi,
             score_curvature: None,
         };

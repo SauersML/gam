@@ -75,10 +75,8 @@ pub use custom_family_blockwise::{
     CUSTOM_FAMILY_RIDGE_FLOOR, ExactNewtonOuterCurvature, validate_blockspec_consistency,
 };
 pub use custom_family_error::CustomFamilyError;
-pub use dispersion::Dispersion;
-pub use dispersion_cov::{
-    DispersionExt, PhiScaledCovariance, UnscaledPrecision, se_from_covariance,
-};
+pub use dispersion::{Dispersion, DispersionError};
+pub use dispersion_cov::{PhiScaledCovariance, UnscaledPrecision, se_from_covariance};
 pub use estimation_error::{
     EstimationError, FixedLambdaCheckpoint, FixedLambdaResidualKind, FixedLambdaSolverStage,
     FixedLambdaStallReason, FixedLambdaStationarityEvidence,

@@ -13,57 +13,130 @@ use gam_problem::{
 
 pub use gam_problem::ExecutionPath;
 
-/// Strictly-positive floor on a reported dispersion / scale parameter `φ`.
-/// Every GLM family resolves `φ` to a non-negative quantity, but downstream
-/// consumers (covariance scaling, deviance ratios) divide by it, so it is
-/// clamped to the smallest positive normal `f64` to keep those quotients
-/// finite without perturbing any `φ` above the denormal range.
-const DISPERSION_POSITIVE_FLOOR: f64 = 1e-300;
-
 pub fn dispersion_from_likelihood(
     likelihood: &GlmLikelihoodSpec,
     standard_deviation: f64,
-) -> Dispersion {
-    match &likelihood.spec.response {
-        ResponseFamily::Gaussian => Dispersion::Estimated(
-            (standard_deviation * standard_deviation).max(DISPERSION_POSITIVE_FLOOR),
-        ),
-        ResponseFamily::Gamma => {
-            let phi = likelihood.scale.fixed_phi().unwrap_or_else(|| {
-                let shape = likelihood
-                    .gamma_shape()
-                    .unwrap_or(standard_deviation.max(DISPERSION_POSITIVE_FLOOR));
-                1.0 / shape.max(DISPERSION_POSITIVE_FLOOR)
-            });
-            if likelihood.scale.gamma_shape_is_estimated() {
-                Dispersion::Estimated(phi.max(DISPERSION_POSITIVE_FLOOR))
-            } else {
-                Dispersion::Known(phi.max(DISPERSION_POSITIVE_FLOOR))
+) -> Result<Dispersion, EstimationError> {
+    use LikelihoodScaleMetadata as Scale;
+
+    let invalid = |reason: String| {
+        EstimationError::InvalidInput(format!(
+            "cannot resolve response dispersion for {}: {reason}",
+            likelihood.spec.response.name()
+        ))
+    };
+    let known = |phi| Dispersion::known(phi).map_err(|err| invalid(err.to_string()));
+    let estimated = |phi| Dispersion::estimated(phi).map_err(|err| invalid(err.to_string()));
+    let reciprocal = |value, is_estimated| {
+        Dispersion::from_reciprocal(value, is_estimated).map_err(|err| invalid(err.to_string()))
+    };
+
+    match (&likelihood.spec.response, likelihood.scale) {
+        (ResponseFamily::Gaussian, Scale::ProfiledGaussian) => {
+            if !(standard_deviation.is_finite() && standard_deviation >= 0.0) {
+                return Err(invalid(format!(
+                    "profiled Gaussian standard deviation must be finite and non-negative, got {standard_deviation}"
+                )));
             }
-        }
-        ResponseFamily::Tweedie { .. } => {
-            let phi = likelihood
-                .fixed_phi()
-                .unwrap_or(1.0)
-                .max(DISPERSION_POSITIVE_FLOOR);
-            if likelihood.scale.tweedie_phi_is_estimated() {
-                Dispersion::Estimated(phi)
-            } else {
-                Dispersion::Known(phi)
+            let phi = standard_deviation * standard_deviation;
+            if !phi.is_finite() {
+                return Err(invalid(format!(
+                    "squared profiled Gaussian standard deviation is not representable: {standard_deviation}^2"
+                )));
             }
+            estimated(phi)
         }
-        ResponseFamily::NegativeBinomial { theta, .. } => Dispersion::Known(
-            likelihood
-                .fixed_phi()
-                .unwrap_or(*theta)
-                .max(DISPERSION_POSITIVE_FLOOR),
-        ),
-        ResponseFamily::Beta { phi } => {
-            Dispersion::Known((1.0 / (1.0 + phi.max(1e-12))).max(DISPERSION_POSITIVE_FLOOR))
+        (ResponseFamily::Gaussian, Scale::FixedDispersion { phi }) => known(phi),
+        (ResponseFamily::Gaussian, scale) => Err(invalid(format!(
+            "Gaussian requires ProfiledGaussian or FixedDispersion metadata, got {scale:?}"
+        ))),
+
+        (ResponseFamily::Gamma, Scale::FixedGammaShape { shape }) => reciprocal(shape, false),
+        (ResponseFamily::Gamma, Scale::EstimatedGammaShape { shape }) => reciprocal(shape, true),
+        (ResponseFamily::Gamma, Scale::FixedDispersion { phi }) => known(phi),
+        (ResponseFamily::Gamma, scale) => Err(invalid(format!(
+            "Gamma requires a resolved shape or fixed dispersion, got {scale:?}"
+        ))),
+
+        (ResponseFamily::Tweedie { .. }, Scale::EstimatedTweediePhi { phi }) => estimated(phi),
+        (ResponseFamily::Tweedie { .. }, Scale::FixedDispersion { phi }) => known(phi),
+        (ResponseFamily::Tweedie { .. }, scale) => Err(invalid(format!(
+            "Tweedie requires resolved EstimatedTweediePhi or FixedDispersion metadata, got {scale:?}"
+        ))),
+
+        (ResponseFamily::Beta { phi }, Scale::EstimatedBetaPhi { phi: metadata_phi }) => {
+            if phi.to_bits() != metadata_phi.to_bits() {
+                return Err(invalid(format!(
+                    "Beta family precision ({phi}) and scale metadata precision ({metadata_phi}) disagree"
+                )));
+            }
+            reciprocal(1.0 + *phi, true)
         }
-        ResponseFamily::Binomial | ResponseFamily::Poisson | ResponseFamily::RoystonParmar => {
-            Dispersion::Known(1.0)
+        (ResponseFamily::Beta { phi }, Scale::FixedDispersion { phi: metadata_phi }) => {
+            // A fixed Beta precision has no dedicated metadata variant. A
+            // FixedDispersion therefore denotes the response-level variance
+            // multiplier directly and must agree with 1/(1+precision).
+            let resolved = reciprocal(1.0 + *phi, false)?;
+            if resolved.phi().to_bits() != metadata_phi.to_bits() {
+                return Err(invalid(format!(
+                    "Beta precision {phi} implies dispersion {}, but FixedDispersion stores {metadata_phi}",
+                    resolved.phi()
+                )));
+            }
+            Ok(resolved)
         }
+        (ResponseFamily::Beta { .. }, scale) => Err(invalid(format!(
+            "Beta requires resolved precision metadata, got {scale:?}"
+        ))),
+
+        (
+            ResponseFamily::NegativeBinomial {
+                theta,
+                theta_fixed: false,
+            },
+            Scale::EstimatedNegBinTheta {
+                theta: metadata_theta,
+            },
+        )
+        | (
+            ResponseFamily::NegativeBinomial {
+                theta,
+                theta_fixed: true,
+            },
+            Scale::FixedNegBinTheta {
+                theta: metadata_theta,
+            },
+        ) => {
+            if !(theta.is_finite() && *theta > 0.0) {
+                return Err(invalid(format!(
+                    "negative-binomial theta must be finite and positive, got {theta}"
+                )));
+            }
+            if theta.to_bits() != metadata_theta.to_bits() {
+                return Err(invalid(format!(
+                    "negative-binomial family theta ({theta}) and scale metadata theta ({metadata_theta}) disagree"
+                )));
+            }
+            // NB2 has no scalar response dispersion: theta is part of
+            // V(mu)=mu+mu^2/theta and the Fisher working weight already carries
+            // it. Its exponential-family scale is exactly one.
+            Ok(Dispersion::UNIT)
+        }
+        (ResponseFamily::NegativeBinomial { .. }, scale) => Err(invalid(format!(
+            "negative-binomial theta ownership is unresolved or inconsistent: {scale:?}"
+        ))),
+
+        (ResponseFamily::Binomial | ResponseFamily::Poisson, Scale::FixedDispersion { phi })
+            if phi.to_bits() == 1.0_f64.to_bits() =>
+        {
+            Ok(Dispersion::UNIT)
+        }
+        (ResponseFamily::Binomial | ResponseFamily::Poisson, scale) => Err(invalid(format!(
+            "fixed-scale count/Bernoulli families require exact unit dispersion metadata, got {scale:?}"
+        ))),
+        (ResponseFamily::RoystonParmar, _) => Err(invalid(
+            "Royston-Parmar has no GLM scalar response dispersion".to_string(),
+        )),
     }
 }
 
@@ -114,7 +187,7 @@ mod per_term_edf_tests {
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
                 reparam_qs: None,
-                dispersion: Dispersion::Estimated(1.0),
+                dispersion: Dispersion::estimated(1.0).unwrap(),
                 beta_covariance: None,
                 beta_standard_errors: None,
                 beta_covariance_corrected: None,
@@ -200,7 +273,7 @@ mod per_term_edf_tests {
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
                 reparam_qs: None,
-                dispersion: Dispersion::Estimated(1.0),
+                dispersion: Dispersion::estimated(1.0).unwrap(),
                 beta_covariance: None,
                 beta_standard_errors: None,
                 beta_covariance_corrected: None,
@@ -272,7 +345,7 @@ mod per_term_edf_tests {
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
                 reparam_qs: None,
-                dispersion: Dispersion::Estimated(1.0),
+                dispersion: Dispersion::estimated(1.0).unwrap(),
                 beta_covariance: None,
                 beta_standard_errors: None,
                 beta_covariance_corrected: None,
@@ -466,7 +539,7 @@ mod per_term_edf_tests {
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
                 reparam_qs: None,
-                dispersion: Dispersion::Estimated(1.0),
+                dispersion: Dispersion::estimated(1.0).unwrap(),
                 beta_covariance: None,
                 beta_standard_errors: None,
                 beta_covariance_corrected: None,
@@ -2144,30 +2217,107 @@ impl UnifiedFitResult {
     /// each such rescale through this single method makes that impossible to get
     /// wrong: the top-level and inference blocks can never drift apart.
     ///
-    /// This is a no-op (returning `1.0`) unless the fit carries an **estimated**
-    /// scale and `var_ratio` is a finite, positive value that actually differs
-    /// from `1.0`. Fixed-scale families (Binomial/Poisson/…, `φ ≡ 1`) carry
-    /// [`Dispersion::Known`]: their covariance does not embed `σ̂²`, so it must
-    /// not move when the reported effective d.f. changes. Returns the `σ̂` ratio
-    /// (`√var_ratio`) that was applied, so a caller holding an external scalar
-    /// (a plotting scale, a cached SE) can mirror the same change; `1.0` signals
-    /// nothing was rescaled.
-    #[must_use]
-    pub fn rescale_estimated_dispersion(&mut self, var_ratio: f64) -> f64 {
-        if !(var_ratio.is_finite() && var_ratio > 0.0 && (var_ratio - 1.0).abs() > f64::EPSILON) {
-            return 1.0;
+    /// Fixed-scale families are a no-op. Invalid or unrepresentable rescaling
+    /// is an error, and every product is preflighted before any field is
+    /// mutated, so the redundant covariance representations remain atomic.
+    /// Returns the applied standard-deviation ratio (`sqrt(var_ratio)`), or one
+    /// for a fixed scale / an exact unit multiplier.
+    pub fn rescale_estimated_dispersion(
+        &mut self,
+        var_ratio: f64,
+    ) -> Result<f64, EstimationError> {
+        if !(var_ratio.is_finite() && var_ratio > 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "estimated-dispersion variance ratio must be finite and positive, got {var_ratio}"
+            )));
+        }
+        if var_ratio == 1.0 {
+            return Ok(1.0);
         }
         // Gate strictly on an ESTIMATED scale — a `Known` (fixed) dispersion
         // does not enter the covariance, so a d.f. change leaves `Vb`/`Vp`
         // untouched. When there is no inference block there is nothing whose
         // dispersion could be estimated, so treat it as fixed and bail.
-        if !matches!(
-            self.inference.as_ref().map(|inf| &inf.dispersion),
-            Some(Dispersion::Estimated(_))
-        ) {
-            return 1.0;
+        if !self
+            .inference
+            .as_ref()
+            .is_some_and(|inference| inference.dispersion.is_estimated())
+        {
+            return Ok(1.0);
         }
         let sigma_ratio = var_ratio.sqrt();
+        let mut rescaled_dispersion = self.inference.as_ref().unwrap().dispersion;
+        rescaled_dispersion
+            .rescale_estimate(var_ratio)
+            .map_err(|err| EstimationError::InvalidInput(err.to_string()))?;
+
+        let check_product = |label: &str, value: f64, multiplier: f64| {
+            let product = value * multiplier;
+            if product.is_finite() {
+                Ok(())
+            } else {
+                Err(EstimationError::InvalidInput(format!(
+                    "{label} rescale is not representable: {value} * {multiplier}"
+                )))
+            }
+        };
+        check_product(
+            "fit standard deviation",
+            self.standard_deviation,
+            sigma_ratio,
+        )?;
+        for (label, covariance) in [
+            (
+                "conditional covariance",
+                self.covariance_conditional.as_ref(),
+            ),
+            ("corrected covariance", self.covariance_corrected.as_ref()),
+        ] {
+            if let Some(covariance) = covariance {
+                for &value in covariance {
+                    check_product(label, value, var_ratio)?;
+                }
+            }
+        }
+        if let Some(inference) = self.inference.as_ref() {
+            for (label, covariance) in [
+                (
+                    "inference conditional covariance",
+                    inference.beta_covariance.as_ref().map(|cov| &cov.0),
+                ),
+                (
+                    "inference corrected covariance",
+                    inference.beta_covariance_corrected.as_ref(),
+                ),
+                (
+                    "inference frequentist covariance",
+                    inference.beta_covariance_frequentist.as_ref(),
+                ),
+            ] {
+                if let Some(covariance) = covariance {
+                    for &value in covariance {
+                        check_product(label, value, var_ratio)?;
+                    }
+                }
+            }
+            for (label, errors) in [
+                (
+                    "inference standard errors",
+                    inference.beta_standard_errors.as_ref(),
+                ),
+                (
+                    "inference corrected standard errors",
+                    inference.beta_standard_errors_corrected.as_ref(),
+                ),
+            ] {
+                if let Some(errors) = errors {
+                    for &value in errors {
+                        check_product(label, value, sigma_ratio)?;
+                    }
+                }
+            }
+        }
+
         // Top-level (canonical) covariance representation.
         if let Some(cov) = self.covariance_conditional.as_mut() {
             cov.mapv_inplace(|v| v * var_ratio);
@@ -2179,9 +2329,7 @@ impl UnifiedFitResult {
         // Paired inference-block representation — kept bit-for-bit identical to
         // the top-level blocks above (same factor, same fields).
         if let Some(inference) = self.inference.as_mut() {
-            if let Dispersion::Estimated(sigma2) = &mut inference.dispersion {
-                *sigma2 *= var_ratio;
-            }
+            inference.dispersion = rescaled_dispersion;
             if let Some(cov) = inference.beta_covariance.as_mut() {
                 cov.0.mapv_inplace(|v| v * var_ratio);
             }
@@ -2198,7 +2346,7 @@ impl UnifiedFitResult {
                 se.mapv_inplace(|v| v * sigma_ratio);
             }
         }
-        sigma_ratio
+        Ok(sigma_ratio)
     }
 
     /// Get the conditional Bayesian covariance matrix (`Vb`) if available.
@@ -2256,10 +2404,11 @@ impl UnifiedFitResult {
     /// `inference: None`): the cached `dispersion()` is then `None`, but the
     /// scale is still recoverable and identical to the value used at fit time.
     /// When the cached block is present its dispersion is preferred verbatim so
-    /// the two paths never diverge.
-    pub fn dispersion_phi(&self) -> f64 {
+    /// the two paths never diverge. Families without a scalar response scale
+    /// return an error instead of adopting a fictitious unit dispersion.
+    pub fn dispersion_phi(&self) -> Result<f64, EstimationError> {
         if let Some(dispersion) = self.dispersion() {
-            return dispersion.phi();
+            return Ok(dispersion.phi());
         }
         match &self.likelihood_family {
             Some(spec) => {
@@ -2267,12 +2416,12 @@ impl UnifiedFitResult {
                     spec: spec.clone(),
                     scale: self.likelihood_scale.clone(),
                 };
-                dispersion_from_likelihood(&glm, self.standard_deviation).phi()
+                Ok(dispersion_from_likelihood(&glm, self.standard_deviation)?.phi())
             }
-            // No engine-level family (custom/GAMLSS paths): no scalar
-            // response-scale dispersion is defined, so fall back to the
-            // fixed-scale convention `φ = 1`.
-            None => 1.0,
+            None => Err(EstimationError::InvalidInput(
+                "this fit has no engine-level family and therefore no scalar response dispersion"
+                    .to_string(),
+            )),
         }
     }
 
@@ -2287,17 +2436,21 @@ impl UnifiedFitResult {
     /// `1.0` for every family whose IRLS working weight already carries the
     /// dispersion / full Fisher information (Gamma, Tweedie, Beta,
     /// Negative-Binomial, Poisson, Binomial) — see #679. For custom/GAMLSS
-    /// paths with no engine-level family it falls back to `1.0`.
-    pub fn coefficient_covariance_scale(&self) -> f64 {
+    /// paths with no engine-level family it is undefined.
+    pub fn coefficient_covariance_scale(&self) -> Result<f64, EstimationError> {
         match &self.likelihood_family {
             Some(spec) => {
                 let glm = GlmLikelihoodSpec {
                     spec: spec.clone(),
                     scale: self.likelihood_scale.clone(),
                 };
-                glm.coefficient_covariance_scale(self.standard_deviation * self.standard_deviation)
+                let dispersion = dispersion_from_likelihood(&glm, self.standard_deviation)?;
+                Ok(glm.coefficient_covariance_scale(dispersion.phi()))
             }
-            None => 1.0,
+            None => Err(EstimationError::InvalidInput(
+                "this fit has no engine-level family and therefore no scalar coefficient-covariance scale"
+                    .to_string(),
+            )),
         }
     }
 

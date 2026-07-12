@@ -16,16 +16,15 @@ mod tests {
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily,
         WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet, calculate_deviance,
         calculate_deviance_from_eta, calculate_loglikelihood,
-        calculate_loglikelihood_omitting_constants, compute_constraint_kkt_diagnostics,
+        calculate_loglikelihood_omitting_constants_from_eta, compute_constraint_kkt_diagnostics,
         compute_observed_hessian_curvature_arrays, deviance_eta_row,
         deviance_eta_rows_with_log_measure_scale, fit_model_for_fixed_rho,
         observed_weight_dispatch, observed_weight_noncanonical, select_active_set_release,
         should_log_pirls_decision_summary, should_use_sparse_native_pirls,
         solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
-        stable_finite_signed_sum,
-        update_glmvectors, variance_jet_for_weight_family, write_gamma_log_working_state,
-        write_negative_binomial_log_working_state, write_poisson_log_working_state,
-        write_tweedie_log_working_state,
+        stable_finite_signed_sum, update_glmvectors, variance_jet_for_weight_family,
+        write_gamma_log_working_state, write_negative_binomial_log_working_state,
+        write_poisson_log_working_state, write_tweedie_log_working_state,
     };
     use crate::active_set;
     use crate::estimate::EstimationError;
@@ -1900,9 +1899,8 @@ mod tests {
             },
             StandardLink::Log,
         );
-        let nb_positive =
-            deviance_eta_row(0, 2.0, 1.0e308, &nb_positive_tail, &log, 0.25)
-                .expect("finite far-right NB score/value");
+        let nb_positive = deviance_eta_row(0, 2.0, 1.0e308, &nb_positive_tail, &log, 0.25)
+            .expect("finite far-right NB score/value");
         assert_relative_eq!(nb_positive.eta_score, 0.75, max_relative = 2.0e-15);
         assert!(nb_positive.half_deviance.is_finite());
 
@@ -1947,8 +1945,7 @@ mod tests {
             f64::from_bits(1.0_f64.to_bits() + 1),
             f64::from_bits(2.0_f64.to_bits() - 1),
         ] {
-            let (boundary, log) =
-                canonical(ResponseFamily::Tweedie { p }, StandardLink::Log);
+            let (boundary, log) = canonical(ResponseFamily::Tweedie { p }, StandardLink::Log);
             for eta in [-100.0, 100.0] {
                 let row = deviance_eta_row(0, 1.0, eta, &boundary, &log, 1.0)
                     .expect("Tweedie boundary-power row");
@@ -2388,7 +2385,14 @@ mod tests {
         let eta = x.dot(&result.beta) + &offset;
         let mu = eta.mapv(f64::exp);
         let full = calculate_loglikelihood(y.view(), &mu, &likelihood, w.view());
-        let omit = calculate_loglikelihood_omitting_constants(y.view(), &mu, &likelihood, w.view());
+        let omit = calculate_loglikelihood_omitting_constants_from_eta(
+            y.view(),
+            &eta,
+            &likelihood,
+            &InverseLink::Standard(StandardLink::Log),
+            w.view(),
+        )
+        .expect("exact eta log-likelihood");
         assert!(
             full <= 0.0,
             "Poisson reporting log-likelihood is a log-mass and must be <= 0, got {full}"
@@ -4539,7 +4543,15 @@ mod reporting_loglikelihood_tests {
 
         // The reporting kernel differs from the REML building block by EXACTLY
         // the dropped −Σ ln Γ(y+1) count normalizer — the #1581 root cause.
-        let omitting = calculate_loglikelihood_omitting_constants(y.view(), &mu, &glm, w.view());
+        let eta = mu.mapv(f64::ln);
+        let omitting = calculate_loglikelihood_omitting_constants_from_eta(
+            y.view(),
+            &eta,
+            &glm,
+            &InverseLink::Standard(StandardLink::Log),
+            w.view(),
+        )
+        .expect("exact eta log-likelihood");
         let dropped: f64 = y.iter().map(|&yi| ln_gamma(yi + 1.0)).sum();
         assert!(
             (omitting - total - dropped).abs() < 1e-10,

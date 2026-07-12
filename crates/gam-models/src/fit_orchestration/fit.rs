@@ -1693,7 +1693,7 @@ fn survival_unified_fit_result(
         working_weights: Array1::zeros(0),
         working_response: Array1::zeros(0),
         reparam_qs: None,
-        dispersion: gam_solve::estimate::Dispersion::Known(1.0),
+        dispersion: gam_solve::estimate::Dispersion::UNIT,
         beta_covariance: None,
         beta_standard_errors: None,
         beta_covariance_corrected: None,

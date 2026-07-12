@@ -4191,7 +4191,7 @@ mod tests {
             working_weights: Array1::zeros(0),
             working_response: Array1::zeros(0),
             reparam_qs: None,
-            dispersion: gam_problem::Dispersion::Known(1.0),
+            dispersion: gam_problem::Dispersion::UNIT,
             beta_covariance: Some(covariance.clone().into()),
             beta_standard_errors: None,
             beta_covariance_corrected: None,

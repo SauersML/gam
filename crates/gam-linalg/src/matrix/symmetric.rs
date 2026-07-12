@@ -262,6 +262,20 @@ impl SymmetricMatrix {
         }
     }
 
+    /// Exact maximum absolute stored matrix entry.
+    ///
+    /// Sparse matrices store one triangle of a symmetric matrix, so scanning
+    /// their stored values is also the max-entry norm of the full matrix.
+    pub fn max_abs_entry(&self) -> f64 {
+        match self {
+            Self::Dense(matrix) => matrix.iter().copied().map(f64::abs).fold(0.0_f64, f64::max),
+            Self::Sparse(matrix) => {
+                let (_, values) = matrix.parts();
+                values.iter().copied().map(f64::abs).fold(0.0_f64, f64::max)
+            }
+        }
+    }
+
     /// Multiply on the right by a dense matrix: self * rhs.
     /// Returns a dense Array2.
     pub fn dot_matrix(&self, rhs: &Array2<f64>) -> Array2<f64> {

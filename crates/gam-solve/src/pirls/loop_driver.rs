@@ -1341,7 +1341,13 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 .as_ref()
                 .map(|transform| transform.apply_transpose(&xt_wr))
                 .unwrap_or(xt_wr);
-            let deviance = calculate_deviance(y, &finalmu, likelihood, priorweights);
+            let deviance = calculate_deviance_from_eta(
+                y,
+                &final_eta,
+                likelihood,
+                &config.link_kind,
+                priorweights,
+            )?;
             let log_likelihood = calculate_loglikelihood(y, &finalmu, likelihood, priorweights);
             let max_abs_eta = inf_norm(finalmu.iter().copied());
             let (c, d, dmu_deta, d2mu_deta2, d3mu_deta3) =

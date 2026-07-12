@@ -663,7 +663,7 @@ fn constant_gaussian_standard_fit(
         working_response: working_response.clone(),
         reparam_qs: None,
         // Exact fit ⇒ residual variance is exactly zero.
-        dispersion: gam_solve::estimate::Dispersion::Estimated(0.0),
+        dispersion: gam_solve::estimate::Dispersion::ZERO_ESTIMATE,
         beta_covariance: Some(gam_problem::dispersion_cov::PhiScaledCovariance::wrap(
             ndarray::Array2::<f64>::zeros((p, p)),
         )),

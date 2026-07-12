@@ -751,12 +751,13 @@ impl<'a> RemlState<'a> {
         let log_likelihood = if is_gaussian_identity {
             -0.5 * pirls_result.deviance
         } else {
-            crate::pirls::calculate_loglikelihood_omitting_constants(
+            crate::pirls::calculate_loglikelihood_omitting_constants_from_eta(
                 self.y,
-                &pirls_result.finalmu.to_owned(),
+                &pirls_result.final_eta.to_owned(),
                 &pirls_result.likelihood,
+                &self.runtime_inverse_link(),
                 self.weights,
-            )
+            )?
         };
 
         // Construct barrier config for monotonicity constraints when no
@@ -880,12 +881,13 @@ impl<'a> RemlState<'a> {
         let log_likelihood = if is_gaussian_identity {
             -0.5 * pirls_result.deviance
         } else {
-            crate::pirls::calculate_loglikelihood_omitting_constants(
+            crate::pirls::calculate_loglikelihood_omitting_constants_from_eta(
                 self.y,
-                &pirls_result.finalmu.to_owned(),
+                &pirls_result.final_eta.to_owned(),
                 &pirls_result.likelihood,
+                &self.runtime_inverse_link(),
                 self.weights,
-            )
+            )?
         };
 
         // Construct barrier config for monotonicity constraints.

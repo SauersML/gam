@@ -1654,10 +1654,8 @@ impl Gam784BlockTarget<'_> {
             -self.phi.ln(),
         )?;
         let half_values: Vec<f64> = rows.iter().map(|row| row.half_deviance).collect();
-        let half_deviance = crate::pirls::stable_finite_signed_sum(
-            &half_values,
-            "#784 scaled half-deviance",
-        )?;
+        let half_deviance =
+            crate::pirls::stable_finite_signed_sum(&half_values, "#784 scaled half-deviance")?;
         let mut score = Array1::<f64>::zeros(rows.len());
         for (i, row) in rows.into_iter().enumerate() {
             let value = row.eta_score;
@@ -1908,7 +1906,7 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
 #[cfg(test)]
 mod exact_deviance_state_cache_tests {
     use super::*;
-    use ndarray::{array, Array2};
+    use ndarray::{Array2, array};
 
     #[test]
     fn observed_quadratic_scales_before_squaring_and_preserves_sign() {

@@ -325,12 +325,16 @@ pub(crate) fn sigma_cubature_evaluate_cpu_rayon(
         .map(|idx| -> Result<SigmaPointResult, EstimationError> {
             let fit_point = state.execute_pirls_stateless_for_cubature(&sigma_points[idx])?;
             let h_point = map_hessian_to_original_basis(fit_point.as_ref())?;
-            let cov_point = matrix_inversewith_regularization(&h_point, "auto cubature point")
-                .ok_or_else(|| {
-                    EstimationError::RemlOptimizationFailed(format!(
-                        "sigma point {idx}: Hessian inverse is not representable"
-                    ))
-                })?;
+            let cov_point = gam_linalg::utils::certified_spd_inverse(
+                &h_point,
+                "auto cubature point",
+            )
+            .map(gam_linalg::utils::CertifiedSpdInverse::into_inverse)
+            .map_err(|error| {
+                EstimationError::RemlOptimizationFailed(format!(
+                    "sigma point {idx}: exact SPD Hessian inverse failed: {error}"
+                ))
+            })?;
             let beta_point = fit_point
                 .reparam_result
                 .qs
@@ -799,16 +803,27 @@ impl<'a> RemlState<'a> {
                 .map(|&v| v.abs())
                 .fold(0.0, f64::max)
                 .max(AUTO_CUBATURE_HESSIAN_RIDGE_ABS);
+        let cubature_ridge = gam_problem::StabilizationLedger::approximation_only(
+            ridge,
+            gam_problem::StabilizationRule::FixedConstant,
+        );
         for i in 0..n_rho {
-            hessian_rho[[i, i]] += ridge;
+            hessian_rho[[i, i]] += cubature_ridge.delta;
         }
-        let Some(hessian_rho_inv) =
-            matrix_inversewith_regularization(&hessian_rho, "auto cubature rho Hessian")
-        else {
-            return self.finalize_smoothing_outcome(first_order_numerical(
-                first_order_correction,
-                "rho Hessian inversion failed after ridge regularization",
-            ));
+        let hessian_rho_inv = match gam_linalg::utils::certified_spd_inverse(
+            &hessian_rho,
+            "auto cubature explicitly ridged rho Hessian",
+        ) {
+            Ok(inverse) => inverse.into_inverse(),
+            Err(error) => {
+                log::warn!(
+                    "sigma cubature refused explicitly ridged rho Hessian: {error}"
+                );
+                return self.finalize_smoothing_outcome(first_order_numerical(
+                    first_order_correction,
+                    "explicitly ridged rho Hessian failed exact SPD inversion",
+                ));
+            }
         };
 
         let max_rhovar = hessian_rho_inv
@@ -2384,8 +2399,9 @@ mod smoothing_correction_outcome_tests {
                 .expect("inner PIRLS at near-boundary rho");
             let h_orig = map_hessian_to_original_basis(final_fit.as_ref())
                 .expect("map Hessian to original basis");
-            let base_cov = matrix_inversewith_regularization(&h_orig, "test base cov")
-                .expect("invert base Hessian");
+            let base_cov = gam_linalg::utils::certified_spd_inverse(&h_orig, "test base cov")
+                .expect("invert base Hessian")
+                .into_inverse();
 
             // Profiled Gaussian dispersion φ̂ = deviance / (n − p). Deviance (RSS)
             // scales as c², the denominator is scale-invariant, so φ̂ scales as c².

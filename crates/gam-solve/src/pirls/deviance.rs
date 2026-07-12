@@ -386,8 +386,7 @@ fn log_tweedie_half_deviance(log_weight: f64, log_y: f64, eta: f64, p: f64) -> f
         let log_c = q * eta - q.ln();
         let log_a = q * log_y - ((p - 1.0) * q).ln();
         let scale = log_b.max(log_c).max(log_a);
-        let normalized =
-            (log_b - scale).exp() + (log_c - scale).exp() - (log_a - scale).exp();
+        let normalized = (log_b - scale).exp() + (log_c - scale).exp() - (log_a - scale).exp();
         log_weight + scale + normalized.ln()
     } else {
         // Factor a=p-1 symbolically before forming absolute exponents:
@@ -732,11 +731,7 @@ fn deviance_eta_row_with_log_measure_scale(
                     log_weight + log_total + kl.ln(),
                 )?
             };
-            let log_y = if y == 0.0 {
-                f64::NEG_INFINITY
-            } else {
-                y.ln()
-            };
+            let log_y = if y == 0.0 { f64::NEG_INFINITY } else { y.ln() };
             let score_sign = if eta >= log_y { 1.0 } else { -1.0 };
             let score_log_abs = if eta >= log_theta {
                 // Factor mu from both |mu-y| and theta+mu. This retains
@@ -749,8 +744,7 @@ fn deviance_eta_row_with_log_measure_scale(
                 } else {
                     (log_y - eta) + log_abs_one_minus_exp(eta - log_y)
                 };
-                log_weight + log_theta + log_difference_over_mu
-                    - (log_theta - eta).exp().ln_1p()
+                log_weight + log_theta + log_difference_over_mu - (log_theta - eta).exp().ln_1p()
             } else {
                 // Factor theta from the denominator; its numerator factor then
                 // cancels exactly before any floating-point subtraction.
@@ -783,7 +777,12 @@ fn deviance_eta_row_with_log_measure_scale(
                         .map_err(|_| {
                             deviance_row_error(row, "inverse-link value/derivative", eta, eta)
                         })?;
-                if !(jet.0.is_finite() && jet.0 > 0.0 && jet.0 < 1.0 && jet.1.is_finite() && jet.1 > 0.0) {
+                if !(jet.0.is_finite()
+                    && jet.0 > 0.0
+                    && jet.0 < 1.0
+                    && jet.1.is_finite()
+                    && jet.1 > 0.0)
+                {
                     return Err(deviance_row_error(
                         row,
                         "inverse-link value/derivative",
@@ -854,13 +853,7 @@ fn deviance_eta_row_with_log_measure_scale(
             let score = if score_sign == 0.0 {
                 0.0
             } else {
-                finite_signed_from_log(
-                    row,
-                    "binomial eta score",
-                    eta,
-                    score_sign,
-                    score_log_abs,
-                )?
+                finite_signed_from_log(row, "binomial eta score", eta, score_sign, score_log_abs)?
             };
             (half, score)
         }
@@ -954,14 +947,7 @@ pub(crate) fn deviance_eta_rows(
     inverse_link: &InverseLink,
     priorweights: ArrayView1<f64>,
 ) -> Result<Vec<DevianceEtaRow>, EstimationError> {
-    deviance_eta_rows_with_log_measure_scale(
-        y,
-        eta,
-        likelihood,
-        inverse_link,
-        priorweights,
-        0.0,
-    )
+    deviance_eta_rows_with_log_measure_scale(y, eta, likelihood, inverse_link, priorweights, 0.0)
 }
 
 pub(crate) fn deviance_eta_rows_with_log_measure_scale(
@@ -1020,56 +1006,156 @@ pub(crate) fn calculate_deviance_from_eta(
 pub(crate) fn calculate_loglikelihood_omitting_constants_from_eta(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
-    mu: &Array1<f64>,
     likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
     priorweights: ArrayView1<f64>,
 ) -> Result<f64, EstimationError> {
-    if !matches!(likelihood.spec.response, ResponseFamily::Binomial) {
-        let value = calculate_loglikelihood_omitting_constants(y, mu, likelihood, priorweights);
-        if value.is_finite() {
-            return Ok(value);
+    let log_measure_scale = match &likelihood.spec.response {
+        ResponseFamily::Gamma => {
+            let shape = likelihood.gamma_shape().unwrap_or(1.0);
+            if !(shape.is_finite() && shape > 0.0) {
+                crate::bail_invalid_estim!("Gamma shape must be finite and positive; got {shape}");
+            }
+            shape.ln()
         }
-        crate::bail_invalid_estim!(
-            "log-likelihood is not representable on the certified PIRLS state"
-        );
-    }
+        ResponseFamily::Tweedie { .. } => {
+            let phi = fixed_glm_dispersion(likelihood);
+            if !(phi.is_finite() && phi > 0.0) {
+                crate::bail_invalid_estim!(
+                    "Tweedie dispersion must be finite and positive; got {phi}"
+                );
+            }
+            -phi.ln()
+        }
+        _ => 0.0,
+    };
+    let deviance_rows = deviance_eta_rows_with_log_measure_scale(
+        y,
+        eta,
+        likelihood,
+        inverse_link,
+        priorweights,
+        log_measure_scale,
+    )?;
     let rows: Vec<Result<f64, EstimationError>> = (0..y.len())
         .into_par_iter()
         .map(|i| {
-            let wi = priorweights[i];
-            if wi == 0.0 {
+            let weight = priorweights[i];
+            if weight == 0.0 {
                 return Ok(0.0);
             }
-            let (log_mu, log_one_minus_mu) =
-                binomial_log_probabilities(inverse_link, eta[i], mu[i]).map_err(|_| {
-                    EstimationError::PirlsRowGeometryUnrepresentable {
-                        row: i,
-                        quantity: "binomial log-probabilities",
-                        eta: eta[i],
-                        value: mu[i],
+            let log_weight = weight.ln();
+            let weighted_unit =
+                |quantity: &'static str, unit: f64| -> Result<f64, EstimationError> {
+                    if unit == 0.0 {
+                        Ok(0.0)
+                    } else {
+                        finite_signed_from_log(
+                            i,
+                            quantity,
+                            eta[i],
+                            unit.signum(),
+                            log_weight + unit.abs().ln(),
+                        )
                     }
-                })?;
-            let value = wi * (y[i] * log_mu + (1.0 - y[i]) * log_one_minus_mu);
-            if value.is_finite() {
-                Ok(value)
-            } else {
-                Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                    row: i,
-                    quantity: "binomial log-likelihood contribution",
-                    eta: eta[i],
-                    value,
-                })
+                };
+            match &likelihood.spec.response {
+                ResponseFamily::Gaussian
+                | ResponseFamily::Gamma
+                | ResponseFamily::Tweedie { .. } => Ok(-deviance_rows[i].half_deviance),
+                ResponseFamily::Poisson => {
+                    let value = if y[i] == 0.0 {
+                        finite_signed_from_log(
+                            i,
+                            "Poisson log-likelihood",
+                            eta[i],
+                            -1.0,
+                            log_weight + eta[i],
+                        )?
+                    } else if eta[i] > 0.0 {
+                        let (sign, log_abs) =
+                            signed_log_exp_difference(y[i].ln() + eta[i].ln(), eta[i]);
+                        finite_signed_from_log(
+                            i,
+                            "Poisson log-likelihood",
+                            eta[i],
+                            sign,
+                            log_weight + log_abs,
+                        )?
+                    } else if eta[i] < 0.0 {
+                        finite_signed_from_log(
+                            i,
+                            "Poisson log-likelihood",
+                            eta[i],
+                            -1.0,
+                            log_weight + logaddexp(y[i].ln() + (-eta[i]).ln(), eta[i]),
+                        )?
+                    } else {
+                        -weight
+                    };
+                    Ok(value)
+                }
+                ResponseFamily::Binomial => {
+                    let saturated = xlogy(y[i], y[i]) + xlogy(1.0 - y[i], 1.0 - y[i]);
+                    let weighted_saturated =
+                        weighted_unit("binomial saturated log-likelihood", saturated)?;
+                    stable_finite_signed_sum(
+                        &[weighted_saturated, -deviance_rows[i].half_deviance],
+                        "binomial log-likelihood row",
+                    )
+                }
+                ResponseFamily::NegativeBinomial { theta, .. } => {
+                    let saturated = if y[i] == 0.0 {
+                        0.0
+                    } else {
+                        let log_total = logaddexp(theta.ln(), y[i].ln());
+                        ln_gamma(y[i] + theta) - ln_gamma(*theta) - ln_gamma(y[i] + 1.0)
+                            + *theta * (theta.ln() - log_total)
+                            + y[i] * (y[i].ln() - log_total)
+                    };
+                    if !saturated.is_finite() {
+                        return Err(deviance_row_error(
+                            i,
+                            "negative-binomial saturated log-likelihood",
+                            eta[i],
+                            saturated,
+                        ));
+                    }
+                    let weighted_saturated =
+                        weighted_unit("negative-binomial saturated log-likelihood", saturated)?;
+                    stable_finite_signed_sum(
+                        &[weighted_saturated, -deviance_rows[i].half_deviance],
+                        "negative-binomial log-likelihood row",
+                    )
+                }
+                ResponseFamily::Beta { phi } => {
+                    let saturated = beta_loglikelihood_full_unit(y[i], y[i], *phi);
+                    if !saturated.is_finite() {
+                        return Err(deviance_row_error(
+                            i,
+                            "beta saturated log-likelihood",
+                            eta[i],
+                            saturated,
+                        ));
+                    }
+                    let weighted_saturated =
+                        weighted_unit("beta saturated log-likelihood", saturated)?;
+                    stable_finite_signed_sum(
+                        &[weighted_saturated, -deviance_rows[i].half_deviance],
+                        "beta log-likelihood row",
+                    )
+                }
+                ResponseFamily::RoystonParmar => Err(deviance_row_error(
+                    i,
+                    "Royston-Parmar GLM log-likelihood",
+                    eta[i],
+                    eta[i],
+                )),
             }
         })
         .collect();
     let rows: Vec<f64> = rows.into_iter().collect::<Result<_, _>>()?;
-    let value = gam_linalg::pairwise_reduce::par_pairwise_sum(rows.len(), |i| rows[i]);
-    if value.is_finite() {
-        Ok(value)
-    } else {
-        crate::bail_invalid_estim!("binomial log-likelihood reduction exceeded f64 range")
-    }
+    stable_finite_signed_sum(&rows, "log-likelihood reduction")
 }
 
 #[inline]
@@ -1408,122 +1494,6 @@ pub fn pointwise_loglikelihood_omitting_constants(
         ResponseFamily::RoystonParmar => vec![f64::NAN; n],
     };
     Array1::from_vec(values)
-}
-
-pub(crate) fn calculate_loglikelihood_omitting_constants(
-    y: ArrayView1<f64>,
-    mu: &Array1<f64>,
-    likelihood: &GlmLikelihoodSpec,
-    priorweights: ArrayView1<f64>,
-) -> f64 {
-    let n = y.len();
-    match &likelihood.spec.response {
-        ResponseFamily::Gaussian => {
-            // Gaussian log-likelihood (constants dropped) is
-            //     -0.5 * prior_i * (y_i - mu_i)^2 / phi.
-            // `ProfiledGaussian` returns no fixed phi and falls back to phi=1,
-            // preserving the historical profiled-sigma behaviour. A caller that
-            // fixes phi gets the scaled form that matches the IRLS weights and
-            // the scaled deviance in `calculate_deviance`.
-            let phi = likelihood.scale.fixed_phi().unwrap_or(1.0);
-            if !(phi.is_finite() && phi > 0.0) {
-                return f64::NAN;
-            }
-            let inv_phi = 1.0 / phi;
-            gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
-                let resid = y[i] - mu[i];
-                -0.5 * priorweights[i] * resid * resid * inv_phi
-            })
-        }
-        ResponseFamily::Binomial => gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
-            let mui_c = mu[i];
-            priorweights[i] * (y[i] * mui_c.ln() + (1.0 - y[i]) * (1.0 - mui_c).ln())
-        }),
-        ResponseFamily::Poisson => gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
-            let mui_c = mu[i];
-            let log_term = if y[i] > 0.0 { y[i] * mui_c.ln() } else { 0.0 };
-            priorweights[i] * (log_term - mui_c)
-        }),
-        ResponseFamily::Tweedie { p } => {
-            let p = *p;
-            let phi = fixed_glm_dispersion(likelihood);
-            if !is_valid_tweedie_power(p) || !(phi.is_finite() && phi > 0.0) {
-                return f64::NAN;
-            }
-            -0.5 * calculate_deviance(y, mu, likelihood, priorweights)
-        }
-        ResponseFamily::NegativeBinomial { theta, .. } => {
-            let theta = *theta;
-            gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
-                if !valid_negbin_theta(theta) {
-                    return f64::NAN;
-                }
-                let yi = y[i];
-                if !valid_count_response(yi) {
-                    return f64::NAN;
-                }
-                let mui_c = mu[i];
-                priorweights[i]
-                    * (ln_gamma(yi + theta) - ln_gamma(theta) - ln_gamma(yi + 1.0)
-                        + theta * (theta.ln() - (theta + mui_c).ln())
-                        + xlogy(yi, mui_c)
-                        - yi * (theta + mui_c).ln())
-            })
-        }
-        ResponseFamily::Beta { phi } => {
-            let phi = *phi;
-            gam_linalg::pairwise_reduce::par_pairwise_sum(n, |i| {
-                if !valid_beta_phi(phi) {
-                    return f64::NAN;
-                }
-                priorweights[i] * beta_loglikelihood_full_unit(y[i], mu[i], phi)
-            })
-        }
-        ResponseFamily::Gamma => {
-            // REML/LAML outer objective: use the scaled-deviance form
-            //   ℓ = −½ · shape · D(y, μ) = −Σ wᵢ · shape · d(yᵢ, μᵢ)
-            // (with `shape = 1/φ` folded in), exactly as the Tweedie branch
-            // above. This is the mgcv convention: the outer objective only needs
-            // the β-dependent part of the log-likelihood plus the
-            // penalty/log-determinant terms; the saturated-likelihood
-            // normalizing constants `shape·ln(shape) − lnΓ(shape) − shape − ln y`
-            // are independent of β (hence of the outer derivative under the
-            // fixed-dispersion handling Gamma is routed through) and are
-            // intentionally dropped.
-            //
-            // Using the full saturated form here is what made the Gamma outer
-            // cost non-finite: the per-iterate shape estimate saturates to
-            // `GAMMA_SHAPE_MAX = 1e12` whenever the working fit drives the unit
-            // deviance toward zero (the common high-dispersion / CV≈1 case),
-            // and `shape·ln(shape) − lnΓ(shape)` evaluated at 1e12 across n rows
-            // overflows. The scaled-deviance form carries no such term: the
-            // bounded unit deviance keeps the product `shape · d(y, μ)` finite
-            // even as the shape grows, so the seed screen no longer rejects
-            // every ρ candidate. See issue #359.
-            //
-            // The `shape` factor MUST be applied explicitly here (#2128).
-            // `calculate_deviance` used to fold `shape` into the returned Gamma
-            // deviance, so this used to read `-0.5 * calculate_deviance(...)` and
-            // still yield the scaled form. Issue #2126 made `calculate_deviance`
-            // report the *unscaled* Gamma deviance `D = 2·Σ wᵢ·d` (matching every
-            // other family and R/mgcv `summary.deviance`), silently dropping the
-            // `shape` factor from this REML building block. That broke the
-            // envelope identity the outer LAML relies on: the inner P-IRLS
-            // minimizes the shape-weighted penalized deviance (working weight
-            // `wᵢ·shape`, so its stationarity is `½·shape·∇D + Sβ = 0`), but the
-            // unscaled `-0.5·D` term gave the outer cost a β-gradient
-            // `½·∇D + Sβ ≠ 0` at the inner optimum. The resulting large outer KKT
-            // residual failed the LAML minimum certificate / drove the objective
-            // to a non-finite cost for every seed at moderate/high dispersion
-            // (small shape) — the #2128 defect. Re-scaling by `shape` here
-            // realigns the outer objective with the inner solver and with the
-            // shape-weighted Hessian used in `log|H|`, matching the per-row
-            // `pointwise_loglikelihood_omitting_constants` Gamma arm exactly.
-            let shape = likelihood.gamma_shape().unwrap_or(1.0);
-            -0.5 * shape * calculate_deviance(y, mu, likelihood, priorweights)
-        }
-        ResponseFamily::RoystonParmar => f64::NAN,
-    }
 }
 
 /// `ln(2π)` — the per-observation Gaussian / saddlepoint normalizer constant.

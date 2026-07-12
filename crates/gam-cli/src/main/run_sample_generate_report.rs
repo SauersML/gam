@@ -860,7 +860,6 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                             &dense_alo_design,
                             &eta,
                             &report_offset,
-                            link,
                             phi,
                         )
                     } else {

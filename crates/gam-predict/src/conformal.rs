@@ -106,7 +106,7 @@ use gam_models::family_runtime::strategy_for_spec;
 use gam_problem::EstimationError;
 use gam_solve::inference::alo::compute_alo_diagnostics_from_unified;
 use gam_solve::model_types::UnifiedFitResult;
-use gam_spec::{LikelihoodSpec, LinkFunction};
+use gam_spec::LikelihoodSpec;
 use ndarray::{Array1, Array2, ArrayView1};
 
 fn effective_scale(scale: f64, idx: usize, role: &str) -> Result<f64, EstimationError> {
@@ -323,8 +323,7 @@ impl ConformalCalibrator {
         phi: f64,
         alpha: f64,
     ) -> Result<Self, EstimationError> {
-        let link: LinkFunction = family.link.link_function();
-        let alo = compute_alo_diagnostics_from_unified(fit, design, eta, offset, link, phi)?;
+        let alo = compute_alo_diagnostics_from_unified(fit, design, eta, offset, phi)?;
         if alo.eta_tilde.len() != y.len() {
             return Err(EstimationError::InvalidInput(format!(
                 "conformal calibration: ALO produced {} held-out predictors but y has length {}",

@@ -143,7 +143,6 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             &alo_design_dense,
             &eta,
             &offset,
-            link,
             phi,
             &recomputed.working_weights,
             &recomputed.working_response,
@@ -198,7 +197,6 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                     &dense_alo_design,
                     &eta,
                     &offset,
-                    link,
                     phi,
                 )
                 .map_err(|e| {
