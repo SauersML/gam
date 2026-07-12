@@ -1100,12 +1100,11 @@ impl SurvivalLocationScaleFamily {
                 .exact_newton_joint_hessian(block_states)?
                 .map(|h| (h, 0.0)));
         }
-        let q = self.collect_joint_quantities_rescaled(block_states, log_scale)?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
         if self.x_link_wiggle.is_some() {
             // #932: the link-wiggle joint Hessian is single-sourced through the
             // §13 warp kernel (`sls_row_nll_wiggle`) instead of the bespoke
             // `assemble_h_wiggle`; non-wiggle rows are untouched below.
-            let dynamic = self.build_dynamic_geometry(block_states)?;
             return Ok(Some((
                 super::row_kernel::survival_ls_wiggle_joint_hessian_dense(
                     self, &dynamic, log_scale,
@@ -1113,13 +1112,15 @@ impl SurvivalLocationScaleFamily {
                 log_scale,
             )));
         }
-        // #932 measured perf exception: the non-wiggle joint Hessian ships the
-        // sparse `assemble_joint_hessian_from_quantities`, NOT the dense
-        // `Order2<9>` single-source row kernel. See that method's doc for the
-        // 3.8–5.3× measurement and the analytic oracles that pin it to the jet.
-        Ok(self
-            .assemble_joint_hessian_from_quantities(&q, block_states)?
-            .map(|h| (h, log_scale)))
+        match self.survival_ls_coefficient_hessian(
+            &dynamic,
+            log_scale,
+            None,
+            SlsCoefficientHessianTarget::DenseFull,
+        )? {
+            SlsCoefficientHessian::DenseFull(dense) => Ok(Some((dense, log_scale))),
+            _ => unreachable!("dense-full rescaled SLS target returned another shape"),
+        }
     }
 
     pub(crate) fn exact_newton_joint_hessian_directional_derivative_rescaled(
