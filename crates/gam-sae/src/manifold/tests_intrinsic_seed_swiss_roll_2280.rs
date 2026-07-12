@@ -210,45 +210,6 @@ fn swiss_roll_auto_seed_propagates_unfolded_coords_end_to_end() {
     );
 }
 
-/// DIAGNOSTIC (temporary #2240 trace): call the discovery race directly and report
-/// what the auto path resolves for a single-cluster swiss roll — the winning basis
-/// kind, whether the intrinsic chart propagated, and its held-out R².
-#[test]
-fn diag_swiss_roll_discovery_trace() {
-    let z = swiss_roll_grid();
-    let n = z.nrows();
-    let labels = vec![0usize; n];
-    let choices =
-        crate::structure_harvest::discover_primary_atom_topologies(z.view(), &labels, 1, &[2])
-            .expect("discovery runs");
-    let choice = &choices[0];
-    let coord_r2 = choice
-        .coords
-        .as_ref()
-        .map(|c| heldout_tps_r2(&c.slice(ndarray::s![.., 0..2]).to_owned(), &z));
-    // Also directly measure the primitive intrinsic embedding through the same
-    // standardization build_intrinsic_primary_specs applies.
-    let embed = crate::manifold::intrinsic_geodesic_embedding(z.view(), 2).unwrap();
-    let mut istd = Array2::<f64>::zeros((n, 2));
-    for col in 0..2 {
-        let sd = (embed.column(col).iter().map(|&v| v * v).sum::<f64>() / n as f64).sqrt();
-        for row in 0..n {
-            istd[[row, col]] = embed[[row, col]] / sd;
-        }
-    }
-    let embed_r2 = heldout_tps_r2(&istd, &z);
-    panic!(
-        "DIAG: winner_basis={:?} latent_dim={} n_harm={:?} n_duchon={:?} coords_some={} coord_r2={:?} raw_embed_r2={}",
-        choice.basis_kind,
-        choice.latent_dim,
-        choice.n_harmonics,
-        choice.n_duchon_centers,
-        choice.coords.is_some(),
-        coord_r2,
-        embed_r2
-    );
-}
-
 /// PARITY ON A NON-FOLD: on a gentle (unfolded) sheet the intrinsic and PCA seeds
 /// are equivalent charts — both reconstruct with high held-out R² and tie within a
 /// small band. The intrinsic seed must not REGRESS the easy case it is not needed
