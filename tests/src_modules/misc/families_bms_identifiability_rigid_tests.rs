@@ -7104,6 +7104,17 @@ fn empirical_rigid_higher_order_match_finite_differences() {
 /// `signed_probit_neglog_unary_stack` — the same single scalar source of truth
 /// the hand kernel consumes, so agreement isolates the implicit-intercept and
 /// Faà-di-Bruno assembly the hand path maintains.
+fn unary_derivatives_normal_pdf(x: f64) -> [f64; 5] {
+    let pdf = normal_pdf(x);
+    [
+        pdf,
+        -x * pdf,
+        (x * x - 1.0) * pdf,
+        (-x.powi(3) + 3.0 * x) * pdf,
+        (x.powi(4) - 6.0 * x * x + 3.0) * pdf,
+    ]
+}
+
 struct EmpiricalRigidNllProgram {
     /// Per-row converged intercept scalar root (the jet-Newton seed/anchor).
     a_root: Vec<f64>,
