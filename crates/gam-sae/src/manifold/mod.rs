@@ -164,7 +164,6 @@ pub(crate) use gam_solve::evidence::arrow_log_det_from_cache;
 pub(crate) use gam_problem::{DeclaredHessianForm, Derivative, EfsEval, HessianValue, OuterEval};
 pub(crate) use gam_solve::rho_optimizer::{
     OuterCapability, OuterConvergedVia, OuterEvalOrder, OuterObjective, SeedOutcome,
-    fd_outer_hessian_from_gradient,
 };
 
 pub(crate) use gam_solve::structure_search::{CollapseAction, CollapseEvent};
