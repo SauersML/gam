@@ -128,6 +128,10 @@ impl AnalyticPenalty for HarmonicRoughnessPenalty {
             }
             acc += w * row_sq;
         }
+        // The 1/2 is part of the public precision convention:
+        // P(b) = (lambda/2) b^T S b.  Consequently grad P = lambda S b
+        // and Hess P = lambda S; omitting it would double both derivatives
+        // relative to an evidence update lambda = rank(S)/(b^T S b).
         0.5 * weight * acc
     }
 

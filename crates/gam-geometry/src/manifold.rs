@@ -241,6 +241,15 @@ pub trait RiemannianManifold: Send + Sync {
                 "Riemannian gradient-step learning rate must be finite and positive",
             ));
         }
+        // `euclidean_grad` is a differential/covector.  Raise it through the
+        // metric first, then retract the resulting tangent vector:
+        //
+        //   e = df/dx,
+        //   grad f = Raise_x(e),
+        //   x_next = Retr_x(-eta grad f).
+        //
+        // Projecting e and retracting it directly is correct only for an
+        // induced Euclidean metric, not for affine-SPD or canonical Stiefel.
         let gradient = self.riemannian_gradient(point, euclidean_grad)?;
         let step = gradient.mapv(|value| -learning_rate * value);
         self.retract(point, step.view())

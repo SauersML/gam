@@ -187,6 +187,17 @@ impl OrderedBetaBernoulliPenalty {
                 let a = a_col[k];
                 let active_arg = mass + a;
                 let inactive_arg = n_eff - mass + 1.0;
+                // These are derivatives of the *integrated* Beta--Bernoulli
+                // scalar, not of a plug-in energy evaluated at E[pi | z]:
+                //
+                //   L(M,a) = -log(a) - log Gamma(M+a)
+                //            -log Gamma(N-M+1) + log Gamma(N+a+1),
+                //   dL/dM   = -psi(M+a) + psi(N-M+1),
+                //   d2L/dM2 = -psi1(M+a) - psi1(N-M+1).
+                //
+                // Keeping both channels here ensures the value, logit
+                // gradient, alpha update, and curvature all come from this
+                // one marginal objective.
                 MarginalColumnDerivatives {
                     mass,
                     a,

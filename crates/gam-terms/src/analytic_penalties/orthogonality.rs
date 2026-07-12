@@ -333,6 +333,10 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
                 }
             }
         }
+        // Each unordered pair appears exactly once because h starts at g+1.
+        // Thus this is (w/2) sum_{g<h} ||T_g^T T_h||_F^2.  Do not rewrite it
+        // as (w/2) sum_{g!=h}: that ordered-pair sum contains every term twice
+        // and therefore denotes a different public weight convention.
         0.5 * self.resolved_weight(rho) * acc
     }
 
@@ -343,6 +347,9 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
         let cross = self.precompute_cross(t.view());
         let weight = self.resolved_weight(rho);
         let mut grad = Array2::<f64>::zeros(t.dim());
+        // Differentiating one unordered-pair term contributes once to each of
+        // its two blocks.  Iterating ordered (g,h), g != h, below assembles
+        // those two block derivatives; it does not double the scalar weight.
         for g in 0..self.groups.len() {
             for h in 0..self.groups.len() {
                 if g == h {
