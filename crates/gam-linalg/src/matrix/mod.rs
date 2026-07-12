@@ -6115,7 +6115,8 @@ mod tests {
         BlockDesignOperator, CoefficientTransformOperator, DenseDesignMatrix, DenseDesignOperator,
         DesignBlock, DesignMatrix, EmbeddedColumnBlock, FiniteSignedWeightsView,
         MultiChannelOperator, PsdWeightsView, ReparamOperator, ResidualisedDesignOperator,
-        RowwiseKroneckerOperator, SparseDesignMatrix, dense_operator_to_dense_by_chunks,
+        ConditionedDesign, RandomEffectOperator, RowwiseKroneckerOperator, SparseDesignMatrix,
+        dense_operator_to_dense_by_chunks,
         dense_transpose_weighted_response, fast_atv, fast_av, streaming_sparse_csc_xt_diag_x,
         weighted_crossprod_dense_view, xt_diag_x_symmetric,
     };
@@ -6503,7 +6504,7 @@ mod tests {
         let re_dense = op.to_dense();
         let expected_cross = dense
             .t()
-            .dot(&(&re_dense * weights.view().insert_axis(Axis(1))));
+            .dot(&(&re_dense * &weights.view().insert_axis(Axis(1))));
         assert_eq!(cross, expected_cross);
 
         let beta = array![4.0, -2.0];

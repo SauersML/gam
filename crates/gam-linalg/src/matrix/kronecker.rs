@@ -905,7 +905,7 @@ mod tests {
         let tensor_dense = tensor.to_dense();
         let expected = tensor_dense
             .t()
-            .dot(&(&tensor_dense * weights.view().insert_axis(Axis(1))));
+            .dot(&(&tensor_dense * &weights.view().insert_axis(Axis(1))));
         let got = tensor.diag_xtw_x(&weights).unwrap();
         assert!((&got - &expected).iter().all(|value| value.abs() < 1e-12));
         let got_diag = tensor.diag_gram(&weights).unwrap();
@@ -923,7 +923,7 @@ mod tests {
         let rowwise_dense = rowwise.to_dense();
         let expected = rowwise_dense
             .t()
-            .dot(&(&rowwise_dense * weights.view().insert_axis(Axis(1))));
+            .dot(&(&rowwise_dense * &weights.view().insert_axis(Axis(1))));
         let got = rowwise.diag_xtw_x(&weights).unwrap();
         assert!((&got - &expected).iter().all(|value| value.abs() < 1e-12));
         let got_diag = rowwise.diag_gram(&weights).unwrap();
