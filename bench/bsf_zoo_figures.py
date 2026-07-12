@@ -332,23 +332,34 @@ def _atlas_scatter(
 def fig_all_zoos_atlas(
     clouds_dir: Path,
     smooth_zoo: Path,
+    amm_r2: Path,
+    amm_topology: Path,
     out: Path,
     *,
     source_sha: str,
+    amm_source_sha: str,
 ) -> None:
-    """One fitted atlas: planted manifolds, Manifold SAE, and GAM smooth zoo."""
-    if not source_sha:
-        raise ValueError("source_sha is required for a provenance-bearing atlas")
+    """One fitted atlas spanning the manifold, smooth, and 28-factor AMM zoos."""
+    if not source_sha or not amm_source_sha:
+        raise ValueError("both source SHAs are required for a provenance-bearing atlas")
     records, cloud_meta = _atlas_cloud_records(clouds_dir)
     data_config = cloud_meta["data_config"]
     fit_config = cloud_meta["fit_config"]
     smooth = plt.imread(smooth_zoo)
+    amm_r2_image = plt.imread(amm_r2)
+    amm_topology_image = plt.imread(amm_topology)
 
     n_kinds = len(ATLAS_KINDS)
-    fig = plt.figure(figsize=(21.0, 13.8), dpi=210, facecolor=SURFACE)
+    fig = plt.figure(figsize=(21.0, 18.8), dpi=210, facecolor=SURFACE)
     grid = fig.add_gridspec(
-        3, n_kinds, height_ratios=(1.0, 1.0, 1.65), hspace=0.01, wspace=0.015,
-        left=0.055, right=0.995, top=0.82, bottom=0.04,
+        4, n_kinds,
+        height_ratios=(1.0, 1.0, 1.36, 1.36),
+        hspace=0.035,
+        wspace=0.015,
+        left=0.055,
+        right=0.995,
+        top=0.85,
+        bottom=0.035,
     )
     for column, kind in enumerate(ATLAS_KINDS):
         record = records[kind]
@@ -383,38 +394,53 @@ def fig_all_zoos_atlas(
         )
 
     fig.text(
-        0.017, 0.712, "PLANTED", rotation=90, ha="center", va="center",
+        0.017, 0.764, "PLANTED", rotation=90, ha="center", va="center",
         fontsize=8.5, color=INK_MUTED, fontweight="bold",
     )
     fig.text(
-        0.017, 0.498, "ONE JOINT MANIFOLD SAE", rotation=90, ha="center", va="center",
+        0.017, 0.602, "ONE JOINT MANIFOLD SAE", rotation=90, ha="center", va="center",
         fontsize=8.5, color=SERIES["ours_rust"], fontweight="bold",
     )
 
     smooth_ax = fig.add_subplot(grid[2, :])
     smooth_ax.imshow(smooth)
     smooth_ax.set_axis_off()
+    fig.text(
+        0.017, 0.405, "GAM SMOOTH ZOO", rotation=90, ha="center", va="center",
+        fontsize=8.5, color=INK_MUTED, fontweight="bold",
+    )
+
+    amm_r2_ax = fig.add_subplot(grid[3, : n_kinds // 2])
+    amm_topology_ax = fig.add_subplot(grid[3, n_kinds // 2 :])
+    for ax, image in ((amm_r2_ax, amm_r2_image), (amm_topology_ax, amm_topology_image)):
+        ax.imshow(image)
+        ax.set_axis_off()
+    fig.text(
+        0.017, 0.158, "AMM 28-FACTOR ZOO", rotation=90, ha="center", va="center",
+        fontsize=8.5, color=INK_MUTED, fontweight="bold",
+    )
 
     fig.text(
-        0.055, 0.962, "THE GEOMETRY ZOO", ha="left", va="top",
+        0.055, 0.974, "ALL GEOMETRY ZOOS", ha="left", va="top",
         fontsize=23, color=INK, fontweight="bold",
     )
     fig.text(
-        0.055, 0.915,
+        0.055, 0.936,
         f"Eight exact analytic factor types, {data_config['l0']} superposed per sample, "
         f"recovered by one shared {fit_config['atoms']}-atom "
         f"Top-{fit_config['top_k']} Rust Manifold SAE",
         ha="left", va="top", fontsize=11.2, color=INK_2,
     )
     fig.text(
-        0.055, 0.884,
+        0.055, 0.908,
         f"Nuisance-free toy DGP · row support {data_config['l0']} · "
         f"ambient R^{data_config['ambient']} · held-out atom images from native decoding",
         ha="left", va="top", fontsize=8.8, color=INK_MUTED,
     )
     fig.text(
         0.995, 0.018,
-        f"gam {source_sha[:12]}  ·  held-out clouds  ·  color = planted intrinsic coordinate",
+        f"gam {source_sha[:12]}  ·  Manifold-SAE {amm_source_sha[:12]}  ·  "
+        "held-out clouds  ·  color = planted intrinsic coordinate",
         ha="right", va="bottom", fontsize=7.5, color=INK_MUTED,
     )
     fig.savefig(out, facecolor=SURFACE, bbox_inches="tight", pad_inches=0.12)
@@ -542,7 +568,10 @@ def main() -> int:
     parser.add_argument("--results", required=True)
     parser.add_argument("--clouds-dir", default=None)
     parser.add_argument("--smooth-zoo", default=None)
+    parser.add_argument("--amm-r2", default=None)
+    parser.add_argument("--amm-topology", default=None)
     parser.add_argument("--source-sha", default=None)
+    parser.add_argument("--amm-source-sha", default=None)
     parser.add_argument("--out-dir", default="figures/bsf_zoo")
     args = parser.parse_args()
     out_dir = Path(args.out_dir)
@@ -557,11 +586,24 @@ def main() -> int:
     if args.clouds_dir:
         fig_gallery(Path(args.clouds_dir), out_dir / "gallery.png")
     if args.smooth_zoo:
-        if args.clouds_dir is None or args.source_sha is None:
-            raise SystemExit("--smooth-zoo requires --clouds-dir and --source-sha")
+        required = {
+            "--clouds-dir": args.clouds_dir,
+            "--amm-r2": args.amm_r2,
+            "--amm-topology": args.amm_topology,
+            "--source-sha": args.source_sha,
+            "--amm-source-sha": args.amm_source_sha,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise SystemExit(f"--smooth-zoo also requires {', '.join(missing)}")
         fig_all_zoos_atlas(
-            Path(args.clouds_dir), Path(args.smooth_zoo),
-            out_dir / "all_zoos_atlas.png", source_sha=args.source_sha,
+            Path(args.clouds_dir),
+            Path(args.smooth_zoo),
+            Path(args.amm_r2),
+            Path(args.amm_topology),
+            out_dir / "all_zoos_atlas.png",
+            source_sha=args.source_sha,
+            amm_source_sha=args.amm_source_sha,
         )
     print(f"figures -> {out_dir}")
     return 0
