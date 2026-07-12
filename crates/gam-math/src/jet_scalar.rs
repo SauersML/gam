@@ -79,31 +79,12 @@ pub trait JetScalar<const K: usize>: crate::nested_dual::JetField + Copy {
     /// the scalar-specific [`OneSeed::seed_direction`] / [`TwoSeed::seed`].)
     fn variable(x: f64, axis: usize) -> Self;
 
-    /// The value channel `ℓ(p)`.
-    fn value(&self) -> f64;
-
-    /// Exact truncated Leibniz sum `self + o`.
-    fn add(&self, o: &Self) -> Self;
-    /// Exact truncated Leibniz difference `self − o`.
-    fn sub(&self, o: &Self) -> Self;
-    /// Exact truncated Leibniz product `self · o`.
-    fn mul(&self, o: &Self) -> Self;
-    /// Negate every channel.
-    fn neg(&self) -> Self;
-    /// Multiply every channel by a plain scalar `s`.
-    fn scale(&self, s: f64) -> Self;
-
-    /// Exact multivariate Faà di Bruno composition `f ∘ self`, given the outer
-    /// derivative stack `d = [f(u), f′(u), f″(u), f‴(u), f⁗(u)]` at
-    /// `u = self.value()`.
-    ///
-    /// This is the SAME `[f64; 5]` stack shape [`crate::jet_tower::Tower4`] and
-    /// the families' `unary_derivatives_*` helpers (built on erfcx / log_ndtr)
-    /// already produce, so those stacks plug in directly. Each scalar consumes
-    /// only the leading entries its order needs (order-2 reads `d[0..=2]`; the
-    /// directional scalars read one / two beyond their base) — the fixed-length
-    /// array makes that windowing total, no length guard required.
-    fn compose_unary(&self, d: [f64; 5]) -> Self;
+    // The scalar-field algebra — `value`, `add`, `sub`, `mul`, `neg`, `scale`,
+    // and the single Faà di Bruno `compose_unary([f64; 5])` — is declared ONCE on
+    // the shared [`crate::nested_dual::JetField`] supertrait (which the runtime-`p`
+    // flex jets also extend), so it is not re-declared here. The value/composition
+    // convention is identical (`u = self.value()`, the `[f64; 5]` stack shape
+    // [`crate::jet_tower::Tower4`] consumes). The helpers below build on it.
 
     /// Compose with a unary special-function whose derivative stack is built from
     /// the scalar base value through `stack_fn`. This evaluates
@@ -235,6 +216,13 @@ pub struct FixedRuntimeJet<S, const K: usize> {
 }
 
 impl<S, const K: usize> FixedRuntimeJet<S, K> {
+    /// Wrap a fixed-dimension scalar so a runtime-dimension row expression can
+    /// evaluate it without authoring a second const-generic body.
+    #[must_use]
+    pub fn from_inner(inner: S) -> Self {
+        Self { inner }
+    }
+
     /// Recover the wrapped const-generic scalar.
     #[must_use]
     pub fn into_inner(self) -> S {
@@ -1175,7 +1163,12 @@ where
         }
         out
     }
+}
 
+impl<P, const K: usize, const H: usize> crate::nested_dual::JetField for PatternedOrder2<P, K, H>
+where
+    P: HessianPattern<K, H>,
+{
     #[inline]
     fn value(&self) -> f64 {
         self.v
