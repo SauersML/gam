@@ -457,51 +457,59 @@ pub fn render_audit_table(rows: &[AuditRow]) -> String {
 /// that validates the closed form against a genuine tempered-posterior
 /// expectation.
 #[cfg(test)]
-fn direction_learning_coefficient(mu: f64, edge: f64, n_eff: f64) -> f64 {
-    0.5 * wbic_tempered_rank_fraction(mu, edge, n_eff)
-}
+mod learning_coeff_helpers {
+    use super::*;
 
-/// A genuine (non-Laplace) WBIC estimate for a SINGLE scalar-amplitude
-/// reconstruction direction, by the thermodynamic tempered-posterior expectation
-/// `E_β[nL] − nL(α̂)`, divided by `log n_eff`, to recover `λ̂`. Used ONLY to
-/// validate [`direction_learning_coefficient`]: model `nL(α) = (g/2R)(α−α̂)²`
-/// with the LIKELIHOOD tempered at `β = 1/log n_eff` and a REML Gaussian prior of
-/// precision `τ = g_edge/R` that is NOT tempered (crossover-at-edge, exactly the
-/// header's untempered prior — tempering the prior too would forfeit the WBIC
-/// temperature the estimator's name invokes), integrated in closed form over the
-/// Gaussian (the integral is exact — the point is to confirm the algebra that
-/// produced the sigmoid, not to approximate). Because the model is Gaussian this
-/// returns the SAME number as the sigmoid up to the prior-shift term, which this
-/// includes so the test sees the full expectation. `log n_eff` uses the same
-/// `n_eff` floored at `e` as production `rank_soft`.
-#[cfg(test)]
-fn sampled_direction_learning_coefficient(mu: f64, edge: f64, n_eff: f64, r_floor: f64) -> f64 {
-    let ln_neff = n_eff.max(std::f64::consts::E).ln();
-    if !(ln_neff > 0.0) || !(r_floor > 0.0) || !(n_eff > 0.0) {
-        return 0.0;
+    pub(super) fn direction_learning_coefficient(mu: f64, edge: f64, n_eff: f64) -> f64 {
+        0.5 * wbic_tempered_rank_fraction(mu, edge, n_eff)
     }
-    let beta = 1.0 / ln_neff;
-    let g = n_eff * mu; // design energy
-    let g_edge = n_eff * edge; // prior precision energy (crossover at edge)
-    let h = beta * g / r_floor; // tempered likelihood precision
-    let tau = g_edge / r_floor; // UNtempered prior precision (β does NOT enter π)
-    let prec_post = h + tau;
-    if !(prec_post > 0.0) {
-        return 0.0;
+
+    /// A genuine (non-Laplace) WBIC estimate for a SINGLE scalar-amplitude
+    /// reconstruction direction, by the thermodynamic tempered-posterior expectation
+    /// `E_β[nL] − nL(α̂)`, divided by `log n_eff`, to recover `λ̂`. Used ONLY to
+    /// validate [`direction_learning_coefficient`]: model `nL(α) = (g/2R)(α−α̂)²`
+    /// with the LIKELIHOOD tempered at `β = 1/log n_eff` and a REML Gaussian prior of
+    /// precision `τ = g_edge/R` that is NOT tempered (crossover-at-edge, exactly the
+    /// header's untempered prior — tempering the prior too would forfeit the WBIC
+    /// temperature the estimator's name invokes), integrated in closed form over the
+    /// Gaussian (the integral is exact — the point is to confirm the algebra that
+    /// produced the sigmoid, not to approximate). Because the model is Gaussian this
+    /// returns the SAME number as the sigmoid up to the prior-shift term, which this
+    /// includes so the test sees the full expectation. `log n_eff` uses the same
+    /// `n_eff` floored at `e` as production `rank_soft`.
+    pub(super) fn sampled_direction_learning_coefficient(
+        mu: f64,
+        edge: f64,
+        n_eff: f64,
+        r_floor: f64,
+    ) -> f64 {
+        let ln_neff = n_eff.max(std::f64::consts::E).ln();
+        if !(ln_neff > 0.0) || !(r_floor > 0.0) || !(n_eff > 0.0) {
+            return 0.0;
+        }
+        let beta = 1.0 / ln_neff;
+        let g = n_eff * mu; // design energy
+        let g_edge = n_eff * edge; // prior precision energy (crossover at edge)
+        let h = beta * g / r_floor; // tempered likelihood precision
+        let tau = g_edge / r_floor; // UNtempered prior precision (β does NOT enter π)
+        let prec_post = h + tau;
+        if !(prec_post > 0.0) {
+            return 0.0;
+        }
+        // MLE amplitude scale: set α̂² so the direction carries energy μ per obs, i.e.
+        // g·α̂² = n_eff·(μ − edge)_+ signal energy ⇒ α̂² = (μ − edge)_+ / μ (unitless),
+        // the fraction of the direction's energy that is signal above the floor.
+        let alpha_hat2 = ((mu - edge).max(0.0)) / mu.max(f64::MIN_POSITIVE);
+        // Tempered-posterior expectation of nL(α) = (g/2R)(α−α̂)² over α ~ N(m_post,
+        // 1/prec_post), m_post = h·α̂/prec_post (prior centred at 0):
+        //   E[nL] − nL(α̂) = (g/2R)·(Var + (m_post − α̂)²).
+        let var = 1.0 / prec_post;
+        let m_post = h * 0.0_f64.max(alpha_hat2.sqrt()) / prec_post; // α̂ sign irrelevant to (·)²
+        let alpha_hat = alpha_hat2.sqrt();
+        let shift2 = (m_post - alpha_hat) * (m_post - alpha_hat);
+        let e_delta = 0.5 * (g / r_floor) * (var + shift2);
+        e_delta / ln_neff
     }
-    // MLE amplitude scale: set α̂² so the direction carries energy μ per obs, i.e.
-    // g·α̂² = n_eff·(μ − edge)_+ signal energy ⇒ α̂² = (μ − edge)_+ / μ (unitless),
-    // the fraction of the direction's energy that is signal above the floor.
-    let alpha_hat2 = ((mu - edge).max(0.0)) / mu.max(f64::MIN_POSITIVE);
-    // Tempered-posterior expectation of nL(α) = (g/2R)(α−α̂)² over α ~ N(m_post,
-    // 1/prec_post), m_post = h·α̂/prec_post (prior centred at 0):
-    //   E[nL] − nL(α̂) = (g/2R)·(Var + (m_post − α̂)²).
-    let var = 1.0 / prec_post;
-    let m_post = h * 0.0_f64.max(alpha_hat2.sqrt()) / prec_post; // α̂ sign irrelevant to (·)²
-    let alpha_hat = alpha_hat2.sqrt();
-    let shift2 = (m_post - alpha_hat) * (m_post - alpha_hat);
-    let e_delta = 0.5 * (g / r_floor) * (var + shift2);
-    e_delta / ln_neff
 }
 
 /// Compute the audit spectrum from an already-projected reconstruction problem:
@@ -578,6 +586,9 @@ pub fn spectrum_from_fit(
 
 #[cfg(test)]
 mod tests {
+    use super::learning_coeff_helpers::{
+        direction_learning_coefficient, sampled_direction_learning_coefficient,
+    };
     use super::*;
 
     fn lcg(s: &mut u64) -> f64 {
