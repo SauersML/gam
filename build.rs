@@ -60,6 +60,13 @@ fn main() {
     // be waived by a comment in Cargo.toml — assert it here and exit(1) otherwise.
     assert_warnings_are_denied(&manifest_dir);
 
+    // #932 production derivative specializations are legal only as registered,
+    // compiler-paired RowPrograms with mandatory numerical parity pins. This
+    // gate is part of the ordinary root-library build, so `cargo check -p gam
+    // --lib` rejects an unregistered RowKernel override or generated third/fourth
+    // row atom before any test selection can omit the corresponding oracle.
+    enforce_production_derivative_specializations(&manifest_dir);
+
     // HARD ban (always fatal, independent of the demoted aggregate scanner
     // below): no non-experiment tracked file may leak the absolute cluster
     // scratch path segment or the SLURM batch directive keyword. Run first and
@@ -4598,6 +4605,236 @@ fn emit_rerun_if_dir_exists(path: &Path) {
     if path.is_dir() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DerivativeSpecializationKind {
+    RowKernel,
+    RowAtom,
+    Bespoke,
+}
+
+struct DerivativeSpecialization {
+    family: &'static str,
+    kind: DerivativeSpecializationKind,
+    production_path: &'static str,
+    production_anchors: &'static [&'static str],
+    discovery_anchor: &'static str,
+    pin_path: &'static str,
+    pin_anchors: &'static [&'static str],
+}
+
+const PRODUCTION_DERIVATIVE_SPECIALIZATIONS: &[DerivativeSpecialization] = &[
+    DerivativeSpecialization {
+        family: "BMS rigid Bernoulli",
+        kind: DerivativeSpecializationKind::RowKernel,
+        production_path: "crates/gam-models/src/bms/row_kernel.rs",
+        production_anchors: &[
+            "impl gam_math::jet_tower::RowProgram<2> for BernoulliRigidRowKernel",
+            "impl RowKernel<2> for BernoulliRigidRowKernel",
+        ],
+        discovery_anchor: "impl RowKernel<2> for BernoulliRigidRowKernel",
+        pin_path: "crates/gam-models/src/bms/gradient_paths.rs",
+        pin_anchors: &[
+            "fn rigid_bernoulli_row_kernel_agrees_with_jet_tower_program_all_channels()",
+            "verify_kernel_channels(&tower, &claims, 1e-9)",
+        ],
+    },
+    DerivativeSpecialization {
+        family: "survival location-scale",
+        kind: DerivativeSpecializationKind::RowKernel,
+        production_path: "crates/gam-models/src/survival/location_scale/row_kernel.rs",
+        production_anchors: &[
+            "impl gam_math::jet_tower::RowProgram<SLS_ROW_K> for SurvivalLsRowKernel<'_>",
+            "impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_>",
+        ],
+        discovery_anchor:
+            "impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_>",
+        pin_path: "crates/gam-models/src/survival/location_scale/tests.rs",
+        pin_anchors: &[
+            "fn survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels()",
+            "verify_kernel_channels(&tower, &claims, 1e-9)",
+        ],
+    },
+    DerivativeSpecialization {
+        family: "survival marginal-slope rigid",
+        kind: DerivativeSpecializationKind::RowKernel,
+        production_path: "crates/gam-models/src/survival/marginal_slope/row_kernel.rs",
+        production_anchors: &[
+            "impl gam_math::jet_tower::RowProgram<4> for SurvivalMarginalSlopeRowKernel",
+            "impl RowKernel<4> for SurvivalMarginalSlopeRowKernel",
+        ],
+        discovery_anchor: "impl RowKernel<4> for SurvivalMarginalSlopeRowKernel",
+        pin_path: "crates/gam-models/src/survival/marginal_slope/tests.rs",
+        pin_anchors: &[
+            "fn rigid_row_kernel_agrees_with_jet_tower_program_all_channels()",
+            "verify_kernel_channels(&tower, &claims, 1e-9)",
+        ],
+    },
+    DerivativeSpecialization {
+        family: "multinomial Fisher",
+        kind: DerivativeSpecializationKind::Bespoke,
+        production_path: "crates/gam-models/src/multinomial_reml.rs",
+        production_anchors: &[
+            "pub struct MultinomialLogitRowProgram<const M: usize>",
+            "impl<const M: usize> gam_math::jet_tower::RowProgram<M> for MultinomialLogitRowProgram<M>",
+            "fn softmax_fisher_perturbation<S: FisherPerturbation>",
+        ],
+        discovery_anchor: "fn softmax_fisher_perturbation<S: FisherPerturbation>",
+        pin_path: "crates/gam-models/src/multinomial_reml.rs",
+        pin_anchors: &[
+            "fn multinomial_live_tower_matches_jet_and_fd()",
+            "crate::multinomial_reml::MultinomialLogitRowProgram::new(eta, obs, w)",
+        ],
+    },
+    DerivativeSpecialization {
+        family: "Gaussian location-scale",
+        kind: DerivativeSpecializationKind::RowAtom,
+        production_path: "crates/gam-models/src/gamlss/gaussian/joint_psi.rs",
+        production_anchors: &[
+            "fn gaussian_normalized_row [generic, order2, third, fourth]",
+            "pub struct GaussianJointRowProgram<'a>",
+            "impl gam_math::jet_tower::RowProgram<2> for GaussianJointRowProgram<'_>",
+        ],
+        discovery_anchor: "fn gaussian_normalized_row [generic, order2, third, fourth]",
+        pin_path: "crates/gam-models/src/gamlss/gaussian/joint_psi.rs",
+        pin_anchors: &[
+            "fn first_directional_weights_match_jet_third()",
+            "fn second_directional_weights_match_jet_fourth()",
+            "crate::gamlss::GaussianJointRowProgram::new(&rows)",
+        ],
+    },
+    DerivativeSpecialization {
+        family: "cause-specific survival",
+        kind: DerivativeSpecializationKind::RowAtom,
+        production_path: "crates/gam-models/src/survival/base.rs",
+        production_anchors: &[
+            "fn cause_specific_row [generic, order2, third, fourth]",
+            "pub struct CauseSpecificRowProgram",
+            "impl gam_math::jet_tower::RowProgram<3> for CauseSpecificRowProgram",
+        ],
+        discovery_anchor: "fn cause_specific_row [generic, order2, third, fourth]",
+        pin_path: "crates/gam-models/src/survival/base.rs",
+        pin_anchors: &[
+            "fn cause_specific_live_tower_matches_jet_and_fd()",
+            "crate::survival::CauseSpecificRowProgram::new(",
+        ],
+    },
+];
+
+fn enforce_production_derivative_specializations(root: &Path) {
+    let mut violations = Vec::new();
+    for specialization in PRODUCTION_DERIVATIVE_SPECIALIZATIONS {
+        let production_path = root.join(specialization.production_path);
+        match fs::read_to_string(&production_path) {
+            Ok(source) => {
+                let production_end = source.find("#[cfg(test)]").unwrap_or(source.len());
+                for anchor in specialization.production_anchors {
+                    match source.find(anchor) {
+                        Some(offset) if offset < production_end => {}
+                        Some(_) => violations.push(format!(
+                            "{} production anchor is gated by cfg(test): {}",
+                            specialization.family, anchor
+                        )),
+                        None => violations.push(format!(
+                            "{} production anchor is missing: {}",
+                            specialization.family, anchor
+                        )),
+                    }
+                }
+            }
+            Err(error) => violations.push(format!(
+                "{} production source {} cannot be read: {error}",
+                specialization.family, specialization.production_path
+            )),
+        }
+
+        let pin_path = root.join(specialization.pin_path);
+        match fs::read_to_string(&pin_path) {
+            Ok(source) => {
+                for anchor in specialization.pin_anchors {
+                    if !source.contains(anchor) {
+                        violations.push(format!(
+                            "{} registered parity pin is missing anchor: {}",
+                            specialization.family, anchor
+                        ));
+                    }
+                }
+            }
+            Err(error) => violations.push(format!(
+                "{} pin source {} cannot be read: {error}",
+                specialization.family, specialization.pin_path
+            )),
+        }
+    }
+
+    visit_files(root, &root.join("crates/gam-models/src"), &mut |rel, content| {
+        let rel_path = rel.to_string_lossy().replace('\\', "/");
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        let production = content.split("#[cfg(test)]").next().unwrap_or(content);
+        for (line_index, line) in production.lines().enumerate() {
+            let trimmed = line.trim();
+            let row_kernel_impl = (trimmed.starts_with("impl ") || trimmed.starts_with("impl<"))
+                && trimmed.contains("RowKernel<")
+                && trimmed.contains(" for ");
+            if row_kernel_impl
+                && !specialization_site_is_registered(
+                    DerivativeSpecializationKind::RowKernel,
+                    &rel_path,
+                    trimmed,
+                )
+            {
+                violations.push(format!(
+                    "unregistered production RowKernel specialization at {rel_path}:{}: {trimmed}",
+                    line_index + 1
+                ));
+            }
+
+            let generated_tower = trimmed.starts_with("fn ")
+                && trimmed.contains('[')
+                && trimmed.contains("third")
+                && trimmed.contains("fourth");
+            if generated_tower
+                && !specialization_site_is_registered(
+                    DerivativeSpecializationKind::RowAtom,
+                    &rel_path,
+                    trimmed,
+                )
+            {
+                violations.push(format!(
+                    "unregistered generated third/fourth row specialization at {rel_path}:{}: {trimmed}",
+                    line_index + 1
+                ));
+            }
+        }
+    });
+
+    if violations.is_empty() {
+        return;
+    }
+    for violation in &violations {
+        println!("cargo:warning=#932 derivative-specialization policy: {violation}");
+    }
+    panic!(
+        "#932 derivative-specialization registry rejected {} violation(s)",
+        violations.len()
+    );
+}
+
+fn specialization_site_is_registered(
+    kind: DerivativeSpecializationKind,
+    path: &str,
+    source_line: &str,
+) -> bool {
+    PRODUCTION_DERIVATIVE_SPECIALIZATIONS
+        .iter()
+        .any(|specialization| {
+            specialization.kind == kind
+                && specialization.production_path == path
+                && source_line.contains(specialization.discovery_anchor)
+        })
 }
 
 fn visit_files(root: &Path, dir: &Path, visitor: &mut dyn FnMut(&Path, &str)) {
