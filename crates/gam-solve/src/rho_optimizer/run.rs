@@ -1964,8 +1964,63 @@ pub(crate) fn run_outer(
     // point, outside every hot loop, for every solver path and every iteration
     // budget. Missing or failed evidence is typed non-convergence; there is no
     // max-iteration or logging-level bypass.
+    //
+    // #2273 STALE-TOLERANCE DESYNC RETRY. The solver's in-loop convergence
+    // threshold is resolved ONCE from the SEED's cost scale
+    // (`rel_cost·(1+|seed_cost|)`), while this certificate re-derives the
+    // same formula at the terminal point's own (often far smaller) cost — on
+    // a perfectly-separated binomial the score plunges between the
+    // oversmoothed heuristic seed and the first accepted step, so the solver
+    // can declare victory against a bound orders of magnitude looser than
+    // the one that then refuses it here (measured: |g|=8.1e-1 accepted
+    // in-loop vs bound 8.3e-3 at certification, 'NOT STATIONARY after 1
+    // outer iteration'; the pass/fail pattern was non-monotone in n because
+    // it tracked the seed-to-terminus cost ratio, not identifiability). The
+    // desync exists precisely because the tolerance anchor differs from the
+    // terminus, so ONE re-run seeded AT the refused checkpoint removes it by
+    // construction: the retry's seed cost IS the certificate's cost, its
+    // in-loop bound equals the certificate bound, and the solver either
+    // genuinely closes the remaining gradient gap or exhausts its budget and
+    // takes the same typed refusal as before. Bounded to a single retry;
+    // only fires when the solver CLAIMED convergence (a budget-exhausted
+    // result is not a desync — its refusal is genuine).
+    let claimed_converged = result.converged;
     result.criterion_certificate =
-        Some(certify_outer_optimality(obj, config, context, &mut result)?);
+        match certify_outer_optimality(obj, config, context, &mut result) {
+            Ok(certificate) => Some(certificate),
+            Err(refusal) if claimed_converged => {
+                let prior_iterations = result.iterations;
+                log::info!(
+                    "[OUTER] {context}: solver convergence claim failed analytic \
+                     certification after {prior_iterations} iteration(s); re-running once \
+                     seeded at the refused checkpoint so the in-loop tolerance anchors to \
+                     the terminal cost scale (#2273 stale-tolerance desync)"
+                );
+                let mut retry_cfg = config.clone();
+                retry_cfg.initial_rho = Some(result.rho.clone());
+                retry_cfg.heuristic_lambdas = None;
+                retry_cfg.seed_config.max_seeds = 1;
+                retry_cfg.seed_config.seed_budget = 1;
+                retry_cfg.screen_initial_rho = false;
+                retry_cfg.warm_start_cache_hit = true;
+                retry_cfg.operator_initial_trust_radius = result.operator_trust_radius;
+                retry_cfg.warm_start_outer_hessian = result.final_hessian.clone();
+                obj.reset();
+                match run_outer_uncertified(obj, &retry_cfg, context) {
+                    Ok(mut retried) => {
+                        retried.iterations = retried.iterations.saturating_add(prior_iterations);
+                        result = retried;
+                        Some(certify_outer_optimality(obj, config, context, &mut result)?)
+                    }
+                    // The retry could not even run (e.g. the checkpoint is a
+                    // hard refusal wall for the objective): surface the
+                    // ORIGINAL certification refusal, which carries the
+                    // checkpoint evidence.
+                    Err(_) => return Err(refusal),
+                }
+            }
+            Err(refusal) => return Err(refusal),
+        };
     result.rho_uncertainty_diagnostic = Some(compute_rho_uncertainty_diagnostic(
         obj,
         config,
