@@ -7552,29 +7552,45 @@ mod tests {
     ) {
         let mut max_abs = (got.0 - reference.0).abs();
         let mut max_rel = max_abs / got.0.abs().max(reference.0.abs()).max(1e-13);
-        for (left, right) in got
-            .1
-            .iter()
-            .chain(got.2.iter())
-            .chain(got.3.iter())
-            .chain(got.4.iter())
-            .zip(
-                reference
-                    .1
-                    .iter()
-                    .chain(reference.2.iter())
-                    .chain(reference.3.iter())
-                    .chain(reference.4.iter()),
-            )
-        {
+        let mut max_abs_channel = "value".to_string();
+        let mut max_abs_values = (got.0, reference.0);
+        let mut max_rel_channel = "value".to_string();
+        let mut max_rel_values = (got.0, reference.0);
+        let mut record = |channel: String, left: f64, right: f64| {
             let absolute = (left - right).abs();
             let relative = absolute / left.abs().max(right.abs()).max(1e-13);
-            max_abs = max_abs.max(absolute);
-            max_rel = max_rel.max(relative);
+            if absolute > max_abs {
+                max_abs = absolute;
+                max_abs_channel = channel.clone();
+                max_abs_values = (left, right);
+            }
+            if relative > max_rel {
+                max_rel = relative;
+                max_rel_channel = channel;
+                max_rel_values = (left, right);
+            }
+        };
+        for (a, (&left, &right)) in got.1.iter().zip(reference.1.iter()).enumerate() {
+            record(format!("gradient[{a}]"), left, right);
+        }
+        for ((a, b), &left) in got.2.indexed_iter() {
+            record(format!("hessian[{a},{b}]"), left, reference.2[[a, b]]);
+        }
+        for ((a, b), &left) in got.3.indexed_iter() {
+            record(format!("third[{a},{b}]"), left, reference.3[[a, b]]);
+        }
+        for ((a, b), &left) in got.4.indexed_iter() {
+            record(format!("fourth[{a},{b}]"), left, reference.4[[a, b]]);
         }
         assert!(
             max_abs <= 5e-11 || max_rel <= 5e-10,
-            "{label}: one-pass channels differ from the pre-cutover MultiDirJet oracle: max_abs={max_abs:e}, max_rel={max_rel:e}"
+            "{label}: one-pass channels differ from the pre-cutover MultiDirJet oracle: \
+             max_abs={max_abs:e} at {max_abs_channel} (one-pass={}, oracle={}); \
+             max_rel={max_rel:e} at {max_rel_channel} (one-pass={}, oracle={})",
+            max_abs_values.0,
+            max_abs_values.1,
+            max_rel_values.0,
+            max_rel_values.1,
         );
     }
 
