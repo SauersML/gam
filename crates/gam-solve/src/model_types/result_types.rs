@@ -1134,7 +1134,10 @@ pub struct FitInference {
     pub working_response: Array1<f64>,
     pub reparam_qs: Option<Array2<f64>>,
     /// Dispersion/scale used to scale all coefficient covariance matrices.
-    #[serde(default)]
+    /// [`Dispersion`] is a validated newtype with no meaningful default (its
+    /// source tag and φ are always established by the fit), so this field is
+    /// required on the wire — no `#[serde(default)]`, which would both demand a
+    /// nonexistent `Default` impl and silently fabricate an unvalidated scale.
     pub dispersion: Dispersion,
     /// Conditional Bayesian covariance under fixed smoothing parameters (mgcv
     /// `Vb`): `Vb = H^{-1} * phi`, where `H = X'W_HX + S(lambda)` and `phi`

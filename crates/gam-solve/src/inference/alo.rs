@@ -2209,6 +2209,18 @@ mod tests {
     use gam_linalg::matrix::{PsdWeightsView, SignedWeightsView};
     use gam_problem::LinkFunction;
 
+    // Reference variance forms (`phi * quad`) used only as the expected value in
+    // the ALO variance tests. Production computes these through the overflow-safe
+    // `finite_nonnegative_product`; these plain-product oracles live in the test
+    // module (their only consumer) rather than as unreferenced production fns.
+    fn bayesvar_eta(phi: f64, x_hinv_x: f64) -> f64 {
+        phi * x_hinv_x
+    }
+
+    fn sandwichvar_eta_from_meat(phi: f64, meat_quad: f64) -> f64 {
+        phi * meat_quad
+    }
+
     #[test]
     fn alo_offset_update_matches_centered_algebra() {
         let eta_hat = 11.0;
