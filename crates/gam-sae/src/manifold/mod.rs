@@ -213,7 +213,6 @@ mod graph_atom;
 mod inframe_curved;
 mod intrinsic_seed;
 mod isa_seed;
-mod topology_readout;
 mod kronecker;
 pub mod lift;
 mod loss;
@@ -304,7 +303,6 @@ mod tests_recovery_split_780;
 mod tests_intrinsic_seed_swiss_roll_2280;
 
 #[cfg(test)]
-mod tests_topology_readout_2280;
 
 #[cfg(test)]
 mod tests_unit_speed_inloop_2022;
@@ -527,7 +525,6 @@ pub use graph_atom::*;
 pub use inframe_curved::*;
 pub use intrinsic_seed::*;
 pub use isa_seed::*;
-pub use topology_readout::*;
 pub(crate) use kronecker::*;
 pub use loss::*;
 pub use minimal_seed::*;
