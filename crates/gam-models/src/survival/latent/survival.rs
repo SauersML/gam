@@ -41,6 +41,7 @@ use crate::survival::lognormal_kernel::{
 };
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
+use gam_math::nested_dual::JetField;
 use gam_solve::pirls::LinearInequalityConstraints;
 use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec, build_term_collection_design};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};

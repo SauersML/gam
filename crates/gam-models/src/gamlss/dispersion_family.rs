@@ -4,8 +4,8 @@
 //! dispersion-channel joint-curvature corrections.
 
 use super::weighted_design_products::{mirror_upper_to_lower, xt_diag_x_design, xt_diag_y_design};
-// `Order2<2>::value()` is the JetScalar trait method; bring the trait into scope
-// so the dispersion row-NLL value reads (`-tower.value()`) resolve (E0599 fix).
+// Concrete `Order2` algebra methods live on the shared `JetField` supertrait;
+// keep it in scope alongside `JetScalar` so the row programs resolve them.
 use super::{
     BlockwiseTermFitResult, GamlssLambdaLayout, LOCATION_SCALE_N_OUTPUTS,
     LocationScaleFamilyBuilder, build_location_scale_block, fit_location_scale_terms,
@@ -20,6 +20,7 @@ use crate::gamlss::GamlssError;
 use crate::model_types::UnifiedFitResult;
 use gam_linalg::matrix::LinearOperator;
 use gam_math::jet_scalar::JetScalar;
+use gam_math::nested_dual::JetField;
 use gam_terms::smooth::{
     SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
     get_spatial_length_scale, spatial_term_uses_per_axis_psi,
