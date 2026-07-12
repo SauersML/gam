@@ -36,8 +36,8 @@
 
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
 use gam::solver::topology_selector::{
-    AutoTopologyKind, PredictiveRaceCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
-    MIXTURE_K_LADDER, PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED,
+    AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider, MIXTURE_K_LADDER,
+    PredictiveCandidateKind, PredictiveRaceCandidate, STACKING_CV_FOLDS, STACKING_CV_SEED,
     adjudicate_predictive_race, fit_mixture_rung, mixture_density_provider,
 };
 use ndarray::{Array2, ArrayView2};

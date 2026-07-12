@@ -23,9 +23,9 @@
 
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig, UnionStructure};
 use gam::solver::topology_selector::{
-    AutoTopologyKind, PredictiveRaceCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
-    PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_predictive_race,
-    fit_union_candidate, fit_union_rung, union_density_provider,
+    AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider,
+    PredictiveCandidateKind, PredictiveRaceCandidate, STACKING_CV_FOLDS, STACKING_CV_SEED,
+    adjudicate_predictive_race, fit_union_candidate, fit_union_rung, union_density_provider,
 };
 use ndarray::{Array2, ArrayView2};
 

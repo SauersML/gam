@@ -69,8 +69,8 @@
 
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig, fit_gaussian_mixture};
 use gam::solver::topology_selector::{
-    AutoTopologyKind, PredictiveRaceCandidate, EvidenceCertification, HeldOutDensityProvider,
-    MIXTURE_K_LADDER, PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED,
+    AutoTopologyKind, EvidenceCertification, HeldOutDensityProvider, MIXTURE_K_LADDER,
+    PredictiveCandidateKind, PredictiveRaceCandidate, STACKING_CV_FOLDS, STACKING_CV_SEED,
     adjudicate_predictive_race, fit_mixture_rung, mixture_density_provider,
 };
 use gam::test_support::reference::{Column, run_python};

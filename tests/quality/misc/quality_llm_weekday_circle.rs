@@ -47,8 +47,8 @@
 use gam::inference::smooth_test::SmoothTestScale;
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
 use gam::solver::topology_selector::{
-    AutoTopologyKind, PredictiveRaceCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
-    MIXTURE_K_LADDER, PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED,
+    AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider, MIXTURE_K_LADDER,
+    PredictiveCandidateKind, PredictiveRaceCandidate, STACKING_CV_FOLDS, STACKING_CV_SEED,
     adjudicate_predictive_race, fit_mixture_rung, mixture_density_provider,
 };
 use gam::terms::structure::anova_atom::{BindingNotion, CarveInput, carve, fit_tensor_surface};

@@ -85,11 +85,10 @@ pub use evidence::{
     solve_stacking_weights, union_per_point_log_density, union_responsibility_split,
 };
 pub use topology_selector::{
-    AutoTopologyKind, EvidenceCertification, Headline,
-    HeldOutDensityProvider, MIXTURE_K_LADDER, MixtureRungFit, MixtureRungResult,
-    PredictiveCandidateKind, PredictiveRaceCandidate, PredictiveRaceVerdict,
-    RingOfClustersRungFit, RingOfClustersRungResult, STACKING_CV_FOLDS, STACKING_CV_SEED,
-    TopologyAutoFitEvidence, TopologyAutoRankedFit, TopologyAutoSelector,
+    AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider, MIXTURE_K_LADDER,
+    MixtureRungFit, MixtureRungResult, PredictiveCandidateKind, PredictiveRaceCandidate,
+    PredictiveRaceVerdict, RingOfClustersRungFit, RingOfClustersRungResult, STACKING_CV_FOLDS,
+    STACKING_CV_SEED, TopologyAutoFitEvidence, TopologyAutoRankedFit, TopologyAutoSelector,
     TopologyAutoSelectorResult, TopologyCandidateEvidence, TopologyCandidateFailure,
     TopologyCandidateFailureStage, TopologyCandidateOutcome, TopologyCandidateRanked,
     TopologyCandidateSelectionResult, TopologyRaceParallelCandidate, TopologySelectionScoreKind,

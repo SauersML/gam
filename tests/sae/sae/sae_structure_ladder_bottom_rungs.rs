@@ -33,8 +33,9 @@
 
 use gam::solver::evidence::StackingConfig;
 use gam::solver::topology_selector::{
-    AutoTopologyKind, PredictiveRaceCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
-    PredictiveCandidateKind, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_predictive_race,
+    AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider,
+    PredictiveCandidateKind, PredictiveRaceCandidate, STACKING_CV_FOLDS, STACKING_CV_SEED,
+    adjudicate_predictive_race,
 };
 use ndarray::{Array2, ArrayView2};
 
