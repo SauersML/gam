@@ -70,7 +70,20 @@ impl GumbelTemperatureSchedule {
         }
         match self.decay {
             ScheduleKind::Geometric { rate } => {
-                if !(rate.is_finite() && rate > 0.0 && rate < 1.0) {
+                // `rate == 1.0` (no decay) is only legitimate when there is
+                // nothing to anneal towards, i.e. `tau_min == tau_start` (the
+                // `tau_min > tau_start` case was already rejected above, so
+                // this is exactly the equality case). `geometric_rate_from_steps`
+                // derives exactly `rate = 1.0` for that endpoint pair — for any
+                // `steps` — so rejecting it here made the derived-rate helper
+                // disagree with the constructor it exists to feed for a
+                // perfectly legal "no annealing needed" schedule. Genuine
+                // annealing (`tau_min < tau_start`) still requires a strictly
+                // decaying rate.
+                let no_decay_needed = self.tau_min >= self.tau_start;
+                let rate_ok =
+                    rate.is_finite() && rate > 0.0 && (rate < 1.0 || (no_decay_needed && rate == 1.0));
+                if !rate_ok {
                     return Err(format!(
                         "GumbelTemperatureSchedule::Geometric: rate must be in (0, 1); got {rate}"
                     ));
@@ -172,6 +185,38 @@ mod tests {
         assert!(
             GumbelTemperatureSchedule::new(1.0, 0.1, ScheduleKind::Geometric { rate: 0.0 })
                 .is_err()
+        );
+    }
+
+    /// A `tau_min == tau_start` endpoint pair asks for a schedule with nothing
+    /// to anneal towards. `geometric_rate_from_steps` derives exactly
+    /// `rate = 1.0` for that pair (for any `steps`), and the constructor must
+    /// accept it — this is the "no annealing needed" degenerate case, not the
+    /// out-of-range rate the previous test guards against (there, `tau_min <
+    /// tau_start` so `rate == 1.0` would mean the schedule never reaches its
+    /// floor and is rightly rejected).
+    #[test]
+    fn new_ok_for_geometric_rate_one_when_no_decay_needed() {
+        let rate = ScheduleKind::geometric_rate_from_steps(0.5, 0.5, 10);
+        assert!((rate - 1.0).abs() < 1e-15, "rate {rate}");
+        let s = GumbelTemperatureSchedule::new(0.5, 0.5, ScheduleKind::Geometric { rate })
+            .expect("tau_min == tau_start must accept the derived rate == 1.0 geometric decay");
+        for iter in [0usize, 1, 10, 1000] {
+            assert!(
+                (s.current_tau(iter) - 0.5).abs() < 1e-15,
+                "tau at iter {iter} should stay pinned at 0.5"
+            );
+        }
+    }
+
+    /// Same endpoint pair via an explicit `rate: 1.0` (not routed through the
+    /// derivation helper) must be accepted identically — the two are the same
+    /// mathematical schedule and validation cannot (and should not) tell them
+    /// apart.
+    #[test]
+    fn new_ok_for_explicit_geometric_rate_one_when_no_decay_needed() {
+        assert!(
+            GumbelTemperatureSchedule::new(0.5, 0.5, ScheduleKind::Geometric { rate: 1.0 }).is_ok()
         );
     }
 
