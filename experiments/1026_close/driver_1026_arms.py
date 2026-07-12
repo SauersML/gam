@@ -181,7 +181,7 @@ def fit_curved_topk(x_tr, x_te, mean_tr, *, K, top_k, d_atom, topology, max_epoc
 
 
 def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
-                    topology, max_epochs, curved_rows, seed, k_flat=None, collect=None):
+                    topology, max_epochs, seed, k_flat=None, collect=None):
     """ALL-RUST hybrid: gam sparse-dictionary linear tier at reduced actives plus
     a gam manifold-SAE curved TopK tier on the linear residual. Matched per-token
     active-scalar budget: k_lin + curved_k·(1+d) == top_k.
@@ -209,12 +209,11 @@ def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
           f"{time.perf_counter()-t0:.0f}s)", flush=True)
     r_tr = np.ascontiguousarray(x_tr - flat_recon_tr)
     r_te = np.ascontiguousarray(x_te - flat_recon_te)
-    rows = min(curved_rows, r_tr.shape[0])
-    sub = np.random.default_rng(seed).choice(r_tr.shape[0], rows, replace=False)
     t1 = time.perf_counter()
     curved = gamfit.sae_manifold_fit(
-        r_tr[sub], K=curved_K, d_atom=d, atom_topology=topology,
-        assignment="topk", top_k=curved_k, random_state=seed)
+        r_tr, K=curved_K, d_atom=d, atom_topology=topology,
+        assignment="topk", top_k=curved_k, n_iter=max_epochs,
+        random_state=seed)
     print(f"[hybrid_rust] curved tier fit {time.perf_counter()-t1:.0f}s", flush=True)
     curved_recon_te = np.asarray(curved.reconstruct(r_te), dtype=np.float32)
     combined = flat_recon_te + curved_recon_te
@@ -307,8 +306,6 @@ def main() -> int:
                          "circle). Self-certified via dict_params_faithful in the "
                          "result record.")
     ap.add_argument("--curved-k", type=int, default=2)
-    ap.add_argument("--curved-rows", type=int, default=20000,
-                    help="hybrid_rust: row subsample for the curved-tier Rust fit")
     ap.add_argument("--cosine-lr", action="store_true",
                     help="cosine LR decay for the external bar (stronger baseline)")
     ap.add_argument("--bits", action="store_true",
@@ -354,7 +351,7 @@ def main() -> int:
                                       curved_K=args.curved_atoms, curved_k=args.curved_k,
                                       d=args.d_atom, topology=args.atom_topology,
                                       max_epochs=args.max_epochs,
-                                      curved_rows=args.curved_rows, seed=args.seed,
+                                      seed=args.seed,
                                       k_flat=args.k_flat, collect=collect)
         extra["ev_flat_tier"] = ev_flat
     elif args.arm == "pca_bar":
@@ -367,6 +364,11 @@ def main() -> int:
         bits = score_bits_for_arm(args.arm, collect, x_te, args.bits_max_rows, args.seed)
         if bits is not None:
             extra.update(bits)
+    if args.arm == "hybrid_rust" and args.bits:
+        if extra.get("bits_dict_params_faithful") is not True:
+            raise RuntimeError(
+                "theorem-faithful hybrid exceeded the external dictionary-parameter budget"
+            )
 
     wall = time.perf_counter() - t0
     rec = {"issue": 1026, "arm": args.arm, "tag": args.tag, "N": n, "p": p,

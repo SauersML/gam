@@ -108,4 +108,4 @@ $PY -u "$DRIVER" --arm hybrid_rust "${COMMON[@]}" \
   --curved-atoms "$CURVED_ATOMS" --curved-k "$CURVED_K" \
   --atom-topology "$ATOM_TOPOLOGY" \
   --tag "${TAG}-hybrid"
-echo "=== rc=0 DONE $(date) — CHECK bits_dict_params_faithful==true in $OUT ==="
+echo "=== rc=0 DONE $(date) — driver certified bits_dict_params_faithful==true ==="
