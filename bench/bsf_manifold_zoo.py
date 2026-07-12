@@ -289,8 +289,11 @@ class ZooData:
             if empty.any():
                 active[np.flatnonzero(empty), np.argmax(probs[empty], axis=1)] = True
         else:
-            # Uniform-without-replacement active sets, vectorized via argsort.
-            order = np.argsort(rng.random((n, self.m_factors)), axis=1)[:, : self.l0]
+            # Uniform-without-replacement active sets. Partial selection avoids
+            # sorting all M random keys when only L0 << M entries are retained.
+            order = np.argpartition(
+                rng.random((n, self.m_factors)), self.l0 - 1, axis=1
+            )[:, : self.l0]
             rows = np.repeat(np.arange(n), self.l0)
             active[rows, order.ravel()] = True
         contribs: list[dict[str, np.ndarray]] | None = [] if keep_contributions else None
@@ -484,12 +487,14 @@ def _fit_ours_rust(
 # --------------------------------------------------------------------------- #
 
 
-def _point_biserial(gate: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Correlation of each gate column with a boolean mask (vectorized)."""
+def _point_biserial_matrix(gate: np.ndarray, masks: np.ndarray) -> np.ndarray:
+    """All factor-mask × gate correlations in one matrix multiply."""
     g = gate - gate.mean(axis=0, keepdims=True)
-    m = mask.astype(float) - float(mask.mean())
-    num = g.T @ m
-    den = np.sqrt(np.sum(g * g, axis=0) * float(np.sum(m * m)))
+    m = masks.astype(float) - masks.mean(axis=0, keepdims=True)
+    num = m.T @ g
+    den = np.sqrt(
+        np.sum(m * m, axis=0)[:, None] * np.sum(g * g, axis=0)[None, :]
+    )
     return num / np.maximum(den, 1e-12)
 
 
@@ -511,16 +516,17 @@ def _greedy_flat_match(
     resid = m_true.copy()
     fired = np.flatnonzero(np.any(np.abs(codes) > 0, axis=0))
     for _ in range(span_dim):
-        best_j, best_gain = -1, -np.inf
-        for j in fired:
-            if j in chosen:
-                continue
-            cand = np.outer(codes[:, j], dec[j])
-            gain = -float(np.sum((resid - cand) ** 2))
-            if gain > best_gain:
-                best_gain, best_j = gain, j
-        if best_j < 0:
+        remaining = np.asarray([j for j in fired if int(j) not in chosen], dtype=int)
+        if remaining.size == 0:
             break
+        remaining_codes = codes[:, remaining]
+        residual_projections = resid @ dec[remaining].T
+        improvements = (
+            2.0 * np.sum(remaining_codes * residual_projections, axis=0)
+            - np.sum(remaining_codes * remaining_codes, axis=0)
+            * np.sum(dec[remaining] * dec[remaining], axis=1)
+        )
+        best_j = int(remaining[int(np.argmax(improvements))])
         chosen.append(int(best_j))
         m_hat += np.outer(codes[:, best_j], dec[best_j])
         resid = m_true - m_hat
@@ -537,9 +543,7 @@ def score_recovery(
 ) -> dict[str, Any]:
     """Per-factor contribution R^2 under their block<->factor matching."""
     per_factor: list[dict[str, Any]] = []
-    corr = np.stack(
-        [_point_biserial(fitted.gate, active[:, i]) for i in range(data.m_factors)]
-    )  # (M, G)
+    corr = _point_biserial_matrix(fitted.gate, active)  # (M, G)
     matched_atoms = np.argmax(np.abs(corr), axis=1)
     contrib_cache: dict[int, np.ndarray] = {}
     for i, factor in enumerate(data.factors):
@@ -829,7 +833,7 @@ def main() -> int:
             )
             dump_seconds = time.perf_counter() - dump_start
 
-        profile = dict(fitted.extras.get("profile", {}))
+        profile = dict((fitted.extras or {}).get("profile", {}))
         profile.update(
             recovery_scoring_seconds=scoring_seconds,
             description_length_seconds=mdl_seconds,

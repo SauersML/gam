@@ -11,6 +11,8 @@ Outputs land in docs/images/:
 """
 from __future__ import annotations
 
+import argparse
+import time
 from pathlib import Path
 from typing import Any
 
@@ -198,16 +200,19 @@ def render_zoo(
     ]
     for name, formula in specs:
         log(f"[zoo] fit {name}")
+        fit_start = time.perf_counter()
         m = gamfit.fit(data, formula)
         _, _, mean, _ = grid_eval(m, side=side, with_se=False)
         surfaces.append((name, gx, gy, mean))
-        log(f"[zoo] {name} done")
+        log(f"[zoo] {name} done in {time.perf_counter() - fit_start:.2f}s")
 
     order = ["thin-plate", "Matérn", "Duchon", "tensor"]
     surfaces.sort(key=lambda t: order.index(t[0]) if t[0] in order else 99)
 
     vmin = min(float(np.percentile(s, 2)) for _, _, _, s in surfaces)
     vmax = max(float(np.percentile(s, 98)) for _, _, _, s in surfaces)
+    levels = np.linspace(vmin, vmax, 23)
+    norm = Normalize(vmin=vmin, vmax=vmax)
 
     n_panels = len(surfaces)
     fig, axes = plt.subplots(1, n_panels, figsize=(3.35 * n_panels, 3.7),
@@ -215,9 +220,11 @@ def render_zoo(
     if n_panels == 1:
         axes = [axes]
     for ax, (name, gx_, gy_, mean) in zip(axes, surfaces):
-        cf = ax.contourf(gx_, gy_, mean, levels=22, cmap="magma",
-                         vmin=vmin, vmax=vmax)
-        ax.contour(gx_, gy_, mean, levels=6, colors="white",
+        cf = ax.contourf(
+            gx_, gy_, mean, levels=levels, cmap="magma", norm=norm,
+            extend="both",
+        )
+        ax.contour(gx_, gy_, mean, levels=levels[::4], colors="white",
                    linewidths=0.35, alpha=0.55)
         ax.scatter(x1, x2, s=1.6, color="white", alpha=0.35, linewidth=0)
         ax.set_title(name, pad=8)
@@ -229,9 +236,18 @@ def render_zoo(
     cbar = fig.colorbar(cf, ax=axes if isinstance(axes, list) else list(axes),
                         fraction=0.018, pad=0.02)
     style_colorbar(cbar)
+    fig.suptitle(
+        "Smooth zoo — one dataset, four fitted geometries",
+        x=0.06,
+        y=0.98,
+        ha="left",
+        fontsize=13,
+        fontweight="semibold",
+        color="#0f172a",
+    )
 
     out = DOCS_IMAGES / "smooth_zoo.png"
-    fig.savefig(out, dpi=220, bbox_inches="tight", pad_inches=0.14)
+    fig.savefig(out, dpi=260, bbox_inches="tight", pad_inches=0.14)
     plt.close(fig)
     log(f"wrote {out}")
     return {name: surf for name, _, _, surf in surfaces}
@@ -431,7 +447,31 @@ def render_marginal_slope_3d() -> None:
     log(f"wrote {out}")
 
 
+def render_smooth_zoo_only() -> None:
+    """Fit and render only the four-panel smooth zoo."""
+    log("=== smooth zoo start ===")
+    data = make_regression()
+    fit_start = time.perf_counter()
+    model = gamfit.fit(data, "y ~ matern(x1, x2)")
+    _, _, mean, _ = grid_eval(model, side=120, with_se=False)
+    log(f"[zoo] Matérn done in {time.perf_counter() - fit_start:.2f}s")
+    render_zoo(data, mean)
+    log("=== smooth zoo done ===")
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--only",
+        choices=("all", "smooth-zoo"),
+        default="all",
+        help="Render the full docs suite or only the fitted smooth zoo.",
+    )
+    args = parser.parse_args()
+    if args.only == "smooth-zoo":
+        render_smooth_zoo_only()
+        return
+
     log("=== render_all start ===")
     data = make_regression()
     log("[main] fitting hero smooth (Matérn)")
