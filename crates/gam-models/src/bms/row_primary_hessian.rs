@@ -2817,9 +2817,9 @@ impl BernoulliMarginalSlopeFamily {
     /// small for ordinary spline bases).
     /// Numerical parity with the independent runtime jet is pinned to ≤1e-9 by
     /// the value/gradient/full-Hessian moment oracle.
-    pub(super) fn lower_empirical_bms_plan_calibration_order2(
+    pub(super) fn lower_empirical_bms_calibration_order2(
         &self,
-        plan: &super::cell_moment_assembly::EmpiricalBmsRowJetPlan,
+        intercept_root: f64,
         empirical_grid: &crate::bms::EmpiricalZGrid,
         primary: &PrimarySlices,
         b: f64,
@@ -2840,7 +2840,7 @@ impl BernoulliMarginalSlopeFamily {
         f_au: &mut Array1<f64>,
         f_uv: &mut Array2<f64>,
     ) -> Result<f64, String> {
-        let a = plan.intercept_root;
+        let a = intercept_root;
         let scale = self.probit_frailty_scale();
         let h_range = primary.h.as_ref();
         let w_range = primary.w.as_ref();
@@ -3014,23 +3014,11 @@ impl BernoulliMarginalSlopeFamily {
         let r = primary.total;
         scratch.reset(need_hessian);
         let empirical_grid = self.latent_measure.empirical_grid_for_training_row(row)?;
-        let empirical_plan = if let Some(grid) = empirical_grid.as_deref() {
+        if empirical_grid.is_some() {
             if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
                 return Err("non-finite empirical flexible row context in VGH evaluation".into());
             }
-            Some(self.empirical_bms_row_jet_plan(
-                row,
-                primary,
-                q,
-                b,
-                beta_h,
-                beta_w,
-                row_ctx.intercept,
-                grid,
-            )?)
-        } else {
-            None
-        };
+        }
         // Reusable per-row coefficient buffers live on the scratch. Resize once
         // if the scratch was constructed for a different primary dimension; the
         // common case is `len == r` so this is a no-op.
@@ -3046,12 +3034,8 @@ impl BernoulliMarginalSlopeFamily {
                 scratch.active_cell_primaries.reserve(r);
             }
         }
-        let a = empirical_plan
-            .as_ref()
-            .map_or(row_ctx.intercept, |plan| plan.intercept_root);
-        let f_a = empirical_plan
-            .as_ref()
-            .map_or(row_ctx.m_a, |plan| plan.inv_f_a.recip());
+        let a = row_ctx.intercept;
+        let f_a = row_ctx.m_a;
         let y_i = self.y[row];
         let w_i = self.weights[row];
         let s_y = 2.0 * y_i - 1.0;
@@ -3080,17 +3064,15 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_aa = 0.0f64;
 
         if let Some(grid) = empirical_grid.as_deref() {
-            // Order-two lowering of the canonical empirical row plan. The
-            // sorted grid is compiled into per-cell cubic moments, preserving
-            // O(G + cells·k²) work instead of evaluating a dense runtime jet
-            // once per node. The family authors only the explicit calibration
-            // channels here; the shared implicit pullback below owns the IFT
-            // and observed-NLL chain rules.
-            let plan = empirical_plan
-                .as_ref()
-                .expect("empirical grid and empirical row plan are paired");
-            f_aa = self.lower_empirical_bms_plan_calibration_order2(
-                plan,
+            // Pinned order-two lowering of the canonical empirical row
+            // algebra. The exact row context already owns the certified
+            // scalar root and Jacobian; materializing the full higher-order
+            // jet plan here would allocate one basis stack per grid node only
+            // to discard every field except that root. The sorted grid is
+            // compiled directly into per-cell cubic moments, preserving
+            // O(G + cells·k²) work and the allocation-free warmed VGH path.
+            f_aa = self.lower_empirical_bms_calibration_order2(
+                a,
                 grid,
                 primary,
                 b,

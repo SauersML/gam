@@ -330,9 +330,22 @@ impl DynamicJetArena {
         }
     }
 
-    /// Reclaim all scalar outputs while retaining allocated chunks.
+    /// Reclaim all scalar outputs and compact a fragmented high-water mark
+    /// into one retained chunk.
+    ///
+    /// `bumpalo::Bump::reset` keeps only its newest chunk and returns every
+    /// older chunk to the global allocator. Runtime jet tapes routinely span
+    /// several geometrically-grown chunks, so a bare reset would allocate
+    /// those discarded chunks again on every row. When reset exposes that
+    /// fragmentation, replace the empty arena once with a single chunk large
+    /// enough for the complete prior tape. Later equal-or-smaller rows reuse
+    /// that chunk without allocator traffic.
     pub fn reset(&mut self) {
+        let high_water = self.bump.allocated_bytes();
         self.bump.reset();
+        if self.bump.allocated_bytes() < high_water {
+            self.bump = bumpalo::Bump::with_capacity(high_water);
+        }
     }
 
     /// Bytes currently reserved from the global allocator. A warm-reset-warm
@@ -4297,6 +4310,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dynamic_jet_arena_compacts_fragmented_high_water_932() {
+        const WORDS_PER_ALLOCATION: usize = 1 << 17;
+        const ALLOCATIONS: usize = 6;
+
+        let mut arena = DynamicJetArena::new();
+        for lane in 0..ALLOCATIONS {
+            let allocation = arena.alloc_slice_fill_with(WORDS_PER_ALLOCATION, |_| lane as u64);
+            std::hint::black_box(allocation);
+        }
+        let fragmented_high_water = arena.allocated_bytes();
+
+        arena.reset();
+        let compact_high_water = arena.allocated_bytes();
+        assert!(
+            compact_high_water >= fragmented_high_water,
+            "compacted arena must retain the complete fragmented tape"
+        );
+
+        for lane in 0..ALLOCATIONS {
+            let allocation = arena.alloc_slice_fill_with(WORDS_PER_ALLOCATION, |_| lane as u64);
+            std::hint::black_box(allocation);
+        }
+        assert_eq!(
+            arena.allocated_bytes(),
+            compact_high_water,
+            "equal replay must fit in the compacted chunk"
+        );
+
+        arena.reset();
+        assert_eq!(
+            arena.allocated_bytes(),
+            compact_high_water,
+            "stable reset must retain the compacted chunk"
+        );
     }
 }
 
