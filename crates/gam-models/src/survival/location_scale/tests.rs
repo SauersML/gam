@@ -1783,6 +1783,70 @@ fn packed_sls_dense(
     }
 }
 
+#[test]
+fn survival_ls_packed_targets_apply_ht_mask_once_932() {
+    use crate::row_kernel::{build_row_kernel_cache, row_kernel_hessian_dense};
+
+    let family = survival_exact_newton_test_family();
+    let states = survival_exact_newton_test_states(&family, 0.3, -0.4, 0.2);
+    let dynamic = family
+        .build_dynamic_geometry(&states)
+        .expect("HT target dynamic geometry");
+    let mask = array![2.0, 0.0, 0.5];
+    let target = |shape| {
+        family
+            .survival_ls_coefficient_hessian(&dynamic, 0.0, Some(&mask), shape)
+            .expect("masked packed SLS target")
+    };
+    let dense = match target(SlsCoefficientHessianTarget::DenseFull) {
+        SlsCoefficientHessian::DenseFull(dense) => dense,
+        _ => panic!("dense target returned another packed SLS shape"),
+    };
+
+    // Independent generic pullback: RowSet owns the one HT multiplication while
+    // the ordinary RowKernel dense reducer visits exactly the selected rows.
+    let kernel = family.survival_ls_row_kernel_rescaled(&dynamic, 0.0);
+    let rows = row_set_from_survival_mask(Some(&mask), family.n);
+    let cache = build_row_kernel_cache(&kernel, &rows).expect("masked generic row cache");
+    let generic = row_kernel_hessian_dense(&kernel, &cache, &rows);
+    assert_eq!(dense.dim(), generic.dim());
+    for ((row, column), &expected) in generic.indexed_iter() {
+        let got = dense[[row, column]];
+        assert!(
+            (got - expected).abs() <= 1e-9 * expected.abs().max(1.0),
+            "masked dense Hessian [{row},{column}] packed={got:.12e} generic={expected:.12e}"
+        );
+    }
+
+    let blocks = match target(SlsCoefficientHessianTarget::BlockDiagonal) {
+        SlsCoefficientHessian::BlockDiagonal(blocks) => blocks,
+        _ => panic!("block target returned another packed SLS shape"),
+    };
+    let diagonal = match target(SlsCoefficientHessianTarget::DiagonalOnly) {
+        SlsCoefficientHessian::DiagonalOnly(diagonal) => diagonal,
+        _ => panic!("diagonal target returned another packed SLS shape"),
+    };
+    let offsets = family.joint_block_offsets();
+    for block in 0..3 {
+        let (start, end) = (offsets[block], offsets[block + 1]);
+        let expected = dense.slice(s![start..end, start..end]);
+        for ((row, column), &value) in blocks[block].indexed_iter() {
+            assert!(
+                (value - expected[[row, column]]).abs()
+                    <= 1e-9 * expected[[row, column]].abs().max(1.0),
+                "masked block {block} [{row},{column}] disagrees with dense target"
+            );
+        }
+    }
+    for coefficient in 0..diagonal.len() {
+        assert!(
+            (diagonal[coefficient] - dense[[coefficient, coefficient]]).abs()
+                <= 1e-9 * dense[[coefficient, coefficient]].abs().max(1.0),
+            "masked diagonal [{coefficient}] disagrees with dense target"
+        );
+    }
+}
+
 /// #921/#932: the packed 24-pair coefficient lowering must reproduce the
 /// generic `RowKernel<9>` dense pullback. The two paths share only the canonical
 /// row program: one lowers its 24 structural pairs through grouped X'WX calls,
