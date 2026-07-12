@@ -713,7 +713,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_abs_diff_eq!(report.critical, 1.959_963_986_120_195, epsilon = 1e-9);
+        // True two-sided 95% normal critical value z_{0.975} = 1.9599639845400545.
+        // The former golden 1.959963986120195 was the RAW Acklam-approximation
+        // output (absolute error ~1.6e-9); the quantile now carries a two-round
+        // Halley refinement against erfc and returns the true value, so the
+        // golden pins the mathematically correct quantile at a tightened
+        // tolerance.
+        assert_abs_diff_eq!(report.critical, 1.959_963_984_540_054, epsilon = 1e-11);
     }
 
     #[test]
