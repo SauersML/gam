@@ -573,13 +573,13 @@ fn sls_outer_plan(kernel: &SurvivalExactRowKernel) -> SlsOuterPlan {
 }
 
 row_atom! {
-    fn sls_index => sls_index_order2(h, eta_t, eta_ls) {
+    fn sls_index [generic, order2](h, eta_t, eta_ls) {
         h - eta_t * exp(-eta_ls)
     }
 }
 
 row_atom! {
-    fn sls_event_rate => sls_event_rate_order2(
+    fn sls_event_rate [generic, order2](
         hdot,
         eta_t,
         eta_t_deriv,

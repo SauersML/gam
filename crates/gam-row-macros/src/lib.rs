@@ -15,14 +15,23 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::{
     BinOp, Expr, ExprBinary, ExprCall, ExprGroup, ExprLit, ExprParen, ExprPath, ExprUnary, Lit,
-    Result, Token, UnOp, Visibility, braced, parenthesized, parse_macro_input,
+    Result, Token, UnOp, Visibility, braced, bracketed, parenthesized, parse_macro_input,
 };
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum Lowering {
+    Generic,
+    Order2,
+    Third,
+    Fourth,
+}
 
 struct RowAtomInput {
     visibility: Visibility,
-    generic_name: Ident,
-    static_name: Ident,
-    variables: Vec<Ident>,
+    name: Ident,
+    lowerings: HashSet<Lowering>,
+    primaries: Vec<Ident>,
+    constants: Vec<Ident>,
     expression: Expr,
 }
 
@@ -30,16 +39,67 @@ impl Parse for RowAtomInput {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let visibility = input.parse()?;
         input.parse::<Token![fn]>()?;
-        let generic_name = input.parse()?;
-        input.parse::<Token![=>]>()?;
-        let static_name = input.parse()?;
+        let name = input.parse()?;
+        let lowering_tokens;
+        bracketed!(lowering_tokens in input);
+        let mut lowerings = HashSet::new();
+        for lowering in Punctuated::<Ident, Token![,]>::parse_terminated(&lowering_tokens)? {
+            let lowering = match lowering.to_string().as_str() {
+                "generic" => Lowering::Generic,
+                "order2" => Lowering::Order2,
+                "third" => Lowering::Third,
+                "fourth" => Lowering::Fourth,
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        lowering,
+                        "row_atom lowerings are generic, order2, third, and fourth",
+                    ));
+                }
+            };
+            if !lowerings.insert(lowering) {
+                return Err(lowering_tokens.error("row_atom lowering listed more than once"));
+            }
+        }
+        if lowerings.is_empty() {
+            return Err(lowering_tokens.error("row_atom requires at least one lowering"));
+        }
         let arguments;
         parenthesized!(arguments in input);
-        let variables = Punctuated::<Ident, Token![,]>::parse_terminated(&arguments)?
-            .into_iter()
-            .collect::<Vec<_>>();
-        if variables.is_empty() {
-            return Err(input.error("row_atom requires at least one variable"));
+        let mut primaries = Vec::new();
+        while !arguments.is_empty() && !arguments.peek(Token![;]) {
+            primaries.push(arguments.parse::<Ident>()?);
+            if arguments.peek(Token![,]) {
+                arguments.parse::<Token![,]>()?;
+            } else {
+                break;
+            }
+        }
+        let mut constants = Vec::new();
+        if arguments.peek(Token![;]) {
+            arguments.parse::<Token![;]>()?;
+            while !arguments.is_empty() {
+                constants.push(arguments.parse::<Ident>()?);
+                if arguments.peek(Token![,]) {
+                    arguments.parse::<Token![,]>()?;
+                } else {
+                    break;
+                }
+            }
+        }
+        if !arguments.is_empty() {
+            return Err(arguments.error("invalid row_atom argument list"));
+        }
+        if primaries.is_empty() {
+            return Err(input.error("row_atom requires at least one primary"));
+        }
+        let mut bindings = HashSet::new();
+        for binding in primaries.iter().chain(constants.iter()) {
+            if !bindings.insert(binding.to_string()) {
+                return Err(syn::Error::new_spanned(
+                    binding,
+                    "row_atom argument names must be unique",
+                ));
+            }
         }
         let body;
         braced!(body in input);
@@ -49,9 +109,10 @@ impl Parse for RowAtomInput {
         }
         Ok(Self {
             visibility,
-            generic_name,
-            static_name,
-            variables,
+            name,
+            lowerings,
+            primaries,
+            constants,
             expression,
         })
     }
@@ -61,6 +122,7 @@ impl Parse for RowAtomInput {
 enum Node {
     Constant(u64),
     Variable(usize),
+    Parameter(usize),
     Add(usize, usize),
     Sub(usize, usize),
     Mul(usize, usize),
@@ -249,15 +311,24 @@ impl Graph {
     }
 }
 
-fn variable_index(path: &ExprPath, variables: &[Ident]) -> Result<usize> {
+enum Binding {
+    Primary(usize),
+    Constant(usize),
+}
+
+fn binding(path: &ExprPath, primaries: &[Ident], constants: &[Ident]) -> Result<Binding> {
     let ident = path
         .path
         .get_ident()
         .ok_or_else(|| syn::Error::new_spanned(path, "row_atom variables must be identifiers"))?;
-    variables
+    if let Some(axis) = primaries.iter().position(|candidate| candidate == ident) {
+        return Ok(Binding::Primary(axis));
+    }
+    constants
         .iter()
         .position(|candidate| candidate == ident)
-        .ok_or_else(|| syn::Error::new_spanned(path, format!("unknown row_atom variable `{ident}`")))
+        .map(Binding::Constant)
+        .ok_or_else(|| syn::Error::new_spanned(path, format!("unknown row_atom binding `{ident}`")))
 }
 
 fn literal_value(literal: &ExprLit) -> Result<f64> {
@@ -283,26 +354,34 @@ fn call_name(call: &ExprCall) -> Result<&Ident> {
     })
 }
 
-fn graph_expression(expression: &Expr, variables: &[Ident], graph: &mut Graph) -> Result<usize> {
+fn graph_expression(
+    expression: &Expr,
+    primaries: &[Ident],
+    constants: &[Ident],
+    graph: &mut Graph,
+) -> Result<usize> {
     match expression {
-        Expr::Path(path) => Ok(graph.intern(Node::Variable(variable_index(path, variables)?))),
+        Expr::Path(path) => Ok(match binding(path, primaries, constants)? {
+            Binding::Primary(axis) => graph.intern(Node::Variable(axis)),
+            Binding::Constant(index) => graph.intern(Node::Parameter(index)),
+        }),
         Expr::Lit(literal) => Ok(graph.constant(literal_value(literal)?)),
         Expr::Paren(ExprParen { expr, .. }) | Expr::Group(ExprGroup { expr, .. }) => {
-            graph_expression(expr, variables, graph)
+            graph_expression(expr, primaries, constants, graph)
         }
         Expr::Unary(ExprUnary {
             op: UnOp::Neg(_),
             expr,
             ..
         }) => {
-            let value = graph_expression(expr, variables, graph)?;
+            let value = graph_expression(expr, primaries, constants, graph)?;
             Ok(graph.intern(Node::Neg(value)))
         }
         Expr::Binary(ExprBinary {
             left, op, right, ..
         }) => {
-            let left = graph_expression(left, variables, graph)?;
-            let right = graph_expression(right, variables, graph)?;
+            let left = graph_expression(left, primaries, constants, graph)?;
+            let right = graph_expression(right, primaries, constants, graph)?;
             let node = match op {
                 BinOp::Add(_) => Node::Add(left, right),
                 BinOp::Sub(_) => Node::Sub(left, right),
@@ -324,7 +403,7 @@ fn graph_expression(expression: &Expr, variables: &[Ident], graph: &mut Graph) -
                     "row_atom unary functions take one argument",
                 ));
             }
-            let argument = graph_expression(&call.args[0], variables, graph)?;
+            let argument = graph_expression(&call.args[0], primaries, constants, graph)?;
             let node = match call_name(call)?.to_string().as_str() {
                 "exp" => Node::Exp(argument),
                 "ln" => Node::Ln(argument),
@@ -349,29 +428,39 @@ fn graph_expression(expression: &Expr, variables: &[Ident], graph: &mut Graph) -
     }
 }
 
-fn jet_expression(expression: &Expr, variables: &[Ident]) -> Result<TokenStream2> {
+fn jet_expression(
+    expression: &Expr,
+    primaries: &[Ident],
+    constants: &[Ident],
+) -> Result<TokenStream2> {
     match expression {
-        Expr::Path(path) => {
-            let variable = &variables[variable_index(path, variables)?];
-            Ok(quote!(*#variable))
-        }
+        Expr::Path(path) => match binding(path, primaries, constants)? {
+            Binding::Primary(axis) => {
+                let variable = &primaries[axis];
+                Ok(quote!(*#variable))
+            }
+            Binding::Constant(index) => {
+                let constant = &constants[index];
+                Ok(quote!(S::constant(#constant)))
+            }
+        },
         Expr::Lit(literal) => Ok(quote!(S::constant((#literal) as f64))),
         Expr::Paren(ExprParen { expr, .. }) | Expr::Group(ExprGroup { expr, .. }) => {
-            jet_expression(expr, variables)
+            jet_expression(expr, primaries, constants)
         }
         Expr::Unary(ExprUnary {
             op: UnOp::Neg(_),
             expr,
             ..
         }) => {
-            let value = jet_expression(expr, variables)?;
+            let value = jet_expression(expr, primaries, constants)?;
             Ok(quote!({ let value = #value; value.neg() }))
         }
         Expr::Binary(ExprBinary {
             left, op, right, ..
         }) => {
-            let left = jet_expression(left, variables)?;
-            let right = jet_expression(right, variables)?;
+            let left = jet_expression(left, primaries, constants)?;
+            let right = jet_expression(right, primaries, constants)?;
             match op {
                 BinOp::Add(_) => Ok(quote!({ let left = #left; let right = #right; left.add(&right) })),
                 BinOp::Sub(_) => Ok(quote!({ let left = #left; let right = #right; left.sub(&right) })),
@@ -394,7 +483,7 @@ fn jet_expression(expression: &Expr, variables: &[Ident]) -> Result<TokenStream2
                     "row_atom unary functions take one argument",
                 ));
             }
-            let argument = jet_expression(&call.args[0], variables)?;
+            let argument = jet_expression(&call.args[0], primaries, constants)?;
             let method = call_name(call)?;
             match method.to_string().as_str() {
                 "exp" | "ln" | "sqrt" | "recip" => Ok(quote!({
@@ -419,7 +508,7 @@ fn topological_order(id: usize, graph: &Graph, seen: &mut HashSet<usize>, order:
         return;
     }
     match graph.nodes[id] {
-        Node::Constant(_) | Node::Variable(_) => {}
+        Node::Constant(_) | Node::Variable(_) | Node::Parameter(_) => {}
         Node::Neg(value) | Node::Exp(value) | Node::Ln(value) | Node::Sqrt(value) => {
             topological_order(value, graph, seen, order);
         }
@@ -431,20 +520,32 @@ fn topological_order(id: usize, graph: &Graph, seen: &mut HashSet<usize>, order:
             topological_order(right, graph, seen, order);
         }
     }
-    if !matches!(graph.nodes[id], Node::Constant(_) | Node::Variable(_)) {
+    if !matches!(
+        graph.nodes[id],
+        Node::Constant(_) | Node::Variable(_) | Node::Parameter(_)
+    ) {
         order.push(id);
     }
 }
 
-fn node_reference(id: usize, graph: &Graph, variables: &[Ident]) -> TokenStream2 {
+fn node_reference(
+    id: usize,
+    graph: &Graph,
+    primaries: &[Ident],
+    constants: &[Ident],
+) -> TokenStream2 {
     match graph.nodes[id] {
         Node::Constant(bits) => {
             let literal = Literal::f64_unsuffixed(f64::from_bits(bits));
             quote!(#literal)
         }
         Node::Variable(axis) => {
-            let variable = &variables[axis];
+            let variable = &primaries[axis];
             quote!(#variable)
+        }
+        Node::Parameter(index) => {
+            let constant = &constants[index];
+            quote!(#constant)
         }
         _ => {
             let temporary = format_ident!("__row_atom_{id}");
@@ -453,8 +554,13 @@ fn node_reference(id: usize, graph: &Graph, variables: &[Ident]) -> TokenStream2
     }
 }
 
-fn node_definition(id: usize, graph: &Graph, variables: &[Ident]) -> TokenStream2 {
-    let reference = |child| node_reference(child, graph, variables);
+fn node_definition(
+    id: usize,
+    graph: &Graph,
+    primaries: &[Ident],
+    constants: &[Ident],
+) -> TokenStream2 {
+    let reference = |child| node_reference(child, graph, primaries, constants);
     match graph.nodes[id] {
         Node::Add(left, right) => {
             let (left, right) = (reference(left), reference(right));
@@ -488,83 +594,215 @@ fn node_definition(id: usize, graph: &Graph, variables: &[Ident]) -> TokenStream
             let value = reference(value);
             quote!(#value.sqrt())
         }
-        Node::Constant(_) | Node::Variable(_) => unreachable!("leaf has no definition"),
+        Node::Constant(_) | Node::Variable(_) | Node::Parameter(_) => {
+            unreachable!("leaf has no definition")
+        }
     }
+}
+
+fn schedule_definitions(
+    roots: impl IntoIterator<Item = usize>,
+    graph: &Graph,
+    primaries: &[Ident],
+    constants: &[Ident],
+) -> Vec<TokenStream2> {
+    let mut seen = HashSet::new();
+    let mut order = Vec::new();
+    for root in roots {
+        topological_order(root, graph, &mut seen, &mut order);
+    }
+    order
+        .into_iter()
+        .map(|id| {
+            let temporary = format_ident!("__row_atom_{id}");
+            let expression = node_definition(id, graph, primaries, constants);
+            quote!(let #temporary: f64 = #expression;)
+        })
+        .collect()
 }
 
 fn expand(input: RowAtomInput) -> Result<TokenStream2> {
     let RowAtomInput {
         visibility,
-        generic_name,
-        static_name,
-        variables,
+        name,
+        lowerings,
+        primaries,
+        constants,
         expression,
     } = input;
-    let generic_expression = jet_expression(&expression, &variables)?;
     let mut graph = Graph::new();
-    let value = graph_expression(&expression, &variables, &mut graph)?;
-    let dimension = variables.len();
+    let value = graph_expression(&expression, &primaries, &constants, &mut graph)?;
+    let dimension = primaries.len();
     let mut gradient = Vec::with_capacity(dimension);
     for axis in 0..dimension {
         gradient.push(graph.derivative(value, axis));
     }
-    let mut hessian = Vec::with_capacity(dimension * (dimension + 1) / 2);
+    let mut hessian = vec![vec![0usize; dimension]; dimension];
     for row in 0..dimension {
-        for column in row..dimension {
-            hessian.push(graph.derivative(gradient[row], column));
+        for column in 0..dimension {
+            hessian[row][column] = graph.derivative(gradient[row], column);
         }
     }
+    let mut output = Vec::new();
 
-    let roots = std::iter::once(value)
-        .chain(gradient.iter().copied())
-        .chain(hessian.iter().copied());
-    let mut seen = HashSet::new();
-    let mut order = Vec::new();
-    for root in roots {
-        topological_order(root, &graph, &mut seen, &mut order);
+    if lowerings.contains(&Lowering::Generic) {
+        let generic_expression = jet_expression(&expression, &primaries, &constants)?;
+        output.push(quote! {
+            #[inline(always)]
+            #visibility fn #name<const K: usize, S: ::gam_math::jet_scalar::JetScalar<K>>(
+                #(#primaries: &S,)*
+                #(#constants: f64),*
+            ) -> S {
+                #generic_expression
+            }
+        });
     }
-    let definitions = order.iter().map(|&id| {
-        let temporary = format_ident!("__row_atom_{id}");
-        let expression = node_definition(id, &graph, &variables);
-        quote!(let #temporary: f64 = #expression;)
-    });
-    let value = node_reference(value, &graph, &variables);
-    let gradient = gradient
-        .iter()
-        .map(|&id| node_reference(id, &graph, &variables));
-    let hessian = hessian
-        .iter()
-        .map(|&id| node_reference(id, &graph, &variables));
-    let packed = dimension * (dimension + 1) / 2;
 
-    Ok(quote! {
-        #[inline(always)]
-        #visibility fn #generic_name<const K: usize, S: ::gam_math::jet_scalar::JetScalar<K>>(
-            #(#variables: &S),*
-        ) -> S {
-            #generic_expression
-        }
+    if lowerings.contains(&Lowering::Order2) {
+        let order2_name = format_ident!("{name}_order2");
+        let packed_hessian = (0..dimension)
+            .flat_map(|row| (row..dimension).map(move |column| hessian[row][column]))
+            .collect::<Vec<_>>();
+        let definitions = schedule_definitions(
+            std::iter::once(value)
+                .chain(gradient.iter().copied())
+                .chain(packed_hessian.iter().copied()),
+            &graph,
+            &primaries,
+            &constants,
+        );
+        let value_ref = node_reference(value, &graph, &primaries, &constants);
+        let gradient_refs = gradient
+            .iter()
+            .map(|&id| node_reference(id, &graph, &primaries, &constants));
+        let hessian_refs = packed_hessian
+            .iter()
+            .map(|&id| node_reference(id, &graph, &primaries, &constants));
+        let packed = dimension * (dimension + 1) / 2;
+        output.push(quote! {
+            #[inline(always)]
+            #visibility fn #order2_name(
+                #(#primaries: f64,)*
+                #(#constants: f64),*
+            ) -> ::gam_math::jet_scalar::StaticOrder2Atom<#dimension, #packed> {
+                #(#definitions)*
+                ::gam_math::jet_scalar::StaticOrder2Atom::new(
+                    #value_ref,
+                    [#(#gradient_refs),*],
+                    [#(#hessian_refs),*],
+                )
+            }
+        });
+    }
 
-        #[inline(always)]
-        #visibility fn #static_name(#(#variables: f64),*)
-            -> ::gam_math::jet_scalar::StaticOrder2Atom<#dimension, #packed>
-        {
-            #(#definitions)*
-            ::gam_math::jet_scalar::StaticOrder2Atom::new(
-                #value,
-                [#(#gradient),*],
-                [#(#hessian),*],
-            )
+    if lowerings.contains(&Lowering::Third) {
+        let third_name = format_ident!("{name}_third_contracted");
+        let mut roots = Vec::new();
+        let mut assignments = Vec::new();
+        for row in 0..dimension {
+            for column in row..dimension {
+                let derivatives = (0..dimension)
+                    .map(|axis| graph.derivative(hessian[row][column], axis))
+                    .collect::<Vec<_>>();
+                roots.extend(derivatives.iter().copied());
+                let terms = derivatives
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, id)| !graph.is_zero(**id))
+                    .map(|(axis, &id)| {
+                        let derivative = node_reference(id, &graph, &primaries, &constants);
+                        quote!(#derivative * direction[#axis])
+                    });
+                let temporary = format_ident!("__row_atom_third_{row}_{column}");
+                assignments.push(quote! {
+                    let #temporary = 0.0 #(+ #terms)*;
+                    out[#row][#column] = #temporary;
+                    out[#column][#row] = #temporary;
+                });
+            }
         }
-    })
+        let definitions = schedule_definitions(roots, &graph, &primaries, &constants);
+        output.push(quote! {
+            #[inline(always)]
+            #visibility fn #third_name(
+                #(#primaries: f64,)*
+                #(#constants: f64,)*
+                direction: &[f64; #dimension],
+            ) -> [[f64; #dimension]; #dimension] {
+                #(#definitions)*
+                let mut out = [[0.0; #dimension]; #dimension];
+                #(#assignments)*
+                out
+            }
+        });
+    }
+
+    if lowerings.contains(&Lowering::Fourth) {
+        let fourth_name = format_ident!("{name}_fourth_contracted");
+        let mut roots = Vec::new();
+        let mut assignments = Vec::new();
+        for row in 0..dimension {
+            for column in row..dimension {
+                let third = (0..dimension)
+                    .map(|axis| graph.derivative(hessian[row][column], axis))
+                    .collect::<Vec<_>>();
+                let fourth = third
+                    .iter()
+                    .map(|&id| {
+                        (0..dimension)
+                            .map(|axis| graph.derivative(id, axis))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                roots.extend(fourth.iter().flatten().copied());
+                let terms = fourth.iter().enumerate().flat_map(|(axis_u, derivatives)| {
+                    derivatives
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, id)| !graph.is_zero(**id))
+                        .map(|(axis_v, &id)| {
+                            let derivative = node_reference(id, &graph, &primaries, &constants);
+                            quote!(#derivative * direction_u[#axis_u] * direction_v[#axis_v])
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let temporary = format_ident!("__row_atom_fourth_{row}_{column}");
+                assignments.push(quote! {
+                    let #temporary = 0.0 #(+ #terms)*;
+                    out[#row][#column] = #temporary;
+                    out[#column][#row] = #temporary;
+                });
+            }
+        }
+        let definitions = schedule_definitions(roots, &graph, &primaries, &constants);
+        output.push(quote! {
+            #[inline(always)]
+            #visibility fn #fourth_name(
+                #(#primaries: f64,)*
+                #(#constants: f64,)*
+                direction_u: &[f64; #dimension],
+                direction_v: &[f64; #dimension],
+            ) -> [[f64; #dimension]; #dimension] {
+                #(#definitions)*
+                let mut out = [[0.0; #dimension]; #dimension];
+                #(#assignments)*
+                out
+            }
+        });
+    }
+
+    Ok(quote!(#(#output)*))
 }
 
-/// Define one row atom and emit generic-jet plus static order-two backends.
+/// Define one row atom and emit exactly its requested build-time lowerings.
 ///
 /// ```ignore
 /// row_atom! {
-///     pub(crate) fn index => index_order2(h, eta, log_scale) {
-///         h - eta * exp(-log_scale)
+///     pub(crate) fn row [generic, order2, third, fourth](
+///         eta, deriv;
+///         weight, event
+///     ) {
+///         weight * (exp(eta) - event * (eta + ln(deriv)))
 ///     }
 /// }
 /// ```
