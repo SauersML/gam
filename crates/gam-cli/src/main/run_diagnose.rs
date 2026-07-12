@@ -216,7 +216,7 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                     &fit_options,
                 )
                 .map_err(|e| format!("fit_gam failed during diagnose refit: {e}"))?;
-                compute_alo_diagnostics_from_fit(&fit, y.view(), link)
+                compute_alo_diagnostics_from_fit(&fit, y.view())
                     .map_err(|e| format!("compute_alo_diagnostics_from_fit failed: {e}"))
             }
         };

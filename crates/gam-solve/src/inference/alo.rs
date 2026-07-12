@@ -33,9 +33,6 @@ pub enum AloError {
     /// The dense design matrix required for ALO could not be materialized
     /// from the underlying PIRLS artifact (e.g. sparse-only export).
     DesignDegenerate { reason: String },
-    /// The penalized Hessian factorization failed, or downstream diagnostics
-    /// produced NaN values that indicate the influence matrix is unusable.
-    InfluenceMatrixFailed { condition_number: f64 },
     /// Per-observation ALO computation produced a non-finite value (variance,
     /// denominator, or corrected η̃) at convergence.
     LooComputationFailed { reason: String },
@@ -48,12 +45,6 @@ impl fmt::Display for AloError {
             | AloError::WeightInvalid { reason }
             | AloError::DesignDegenerate { reason }
             | AloError::LooComputationFailed { reason } => f.write_str(reason),
-            AloError::InfluenceMatrixFailed { condition_number } => {
-                write!(
-                    f,
-                    "ALO influence matrix failed (condition number {condition_number:.3e})"
-                )
-            }
         }
     }
 }
@@ -67,9 +58,6 @@ impl From<AloError> for EstimationError {
             | AloError::WeightInvalid { reason }
             | AloError::DesignDegenerate { reason }
             | AloError::LooComputationFailed { reason } => EstimationError::InvalidInput(reason),
-            AloError::InfluenceMatrixFailed { condition_number } => {
-                EstimationError::ModelIsIllConditioned { condition_number }
-            }
         }
     }
 }
@@ -121,7 +109,8 @@ fn alo_eta_updatewith_offset(
 /// frozen-curvature fixed point [`alo_eta_exact_frozen_curvature`] iterates to
 /// convergence; supplying it upgrades the single-Newton-step ALO correction to
 /// the exact leave-`i`-out predictor under a frozen penalized Hessian.
-pub type AloScalarScoreCurvature<'a> = dyn Fn(usize, f64) -> (f64, f64) + Sync + 'a;
+pub type AloScalarScoreCurvature<'a> =
+    dyn Fn(usize, f64) -> Result<(f64, f64), AloError> + Sync + 'a;
 
 /// Maximum scalar Newton iterations for the exact frozen-curvature ALO fixed
 /// point. The map `r(η) = η − η̂ − a_ii ℓ_i'(η)` is one-dimensional and
@@ -155,8 +144,12 @@ const ALO_EXACT_SCALAR_TOL: f64 = 1e-12;
 /// is the corrected linear predictor `η̃_i`. Failure to reach the residual
 /// tolerance is reported to the caller; no one-step approximation is substituted
 /// for a failed exact solve.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum AloExactScalarError {
+    EvaluationFailed {
+        eta: f64,
+        reason: String,
+    },
     NonFiniteScoreCurvature {
         eta: f64,
         ell_prime: f64,
@@ -182,6 +175,9 @@ enum AloExactScalarError {
 impl fmt::Display for AloExactScalarError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
+            AloExactScalarError::EvaluationFailed { eta, ref reason } => {
+                write!(f, "score/curvature evaluation failed at eta={eta:.6e}: {reason}")
+            }
             AloExactScalarError::NonFiniteScoreCurvature {
                 eta,
                 ell_prime,
@@ -192,7 +188,7 @@ impl fmt::Display for AloExactScalarError {
             ),
             AloExactScalarError::DegenerateJacobian { eta, jacobian } => write!(
                 f,
-                "degenerate Newton Jacobian at eta={eta:.6e}: jacobian={jacobian:.6e}, min={ALO_DENOMINATOR_MIN:.1e}"
+                "degenerate Newton Jacobian at eta={eta:.6e}: jacobian={jacobian:.6e}"
             ),
             AloExactScalarError::NonFiniteStep {
                 eta,
@@ -226,7 +222,7 @@ const ALO_EXACT_SCALAR_BACKTRACKS: usize = 40;
 fn alo_eta_exact_frozen_curvature(
     eta_hat: f64,
     a_ii: f64,
-    score_curvature: &dyn Fn(f64) -> (f64, f64),
+    score_curvature: &dyn Fn(f64) -> Result<(f64, f64), AloError>,
 ) -> Result<f64, AloExactScalarError> {
     // Residual of the leave-i-out fixed point η = η̂ + a_ii ℓ'(η):
     //   r(η) = η − η̂ − a_ii ℓ'(η),     r'(η) = 1 − a_ii ℓ''(η) = jac.
@@ -252,7 +248,11 @@ fn alo_eta_exact_frozen_curvature(
     //      jac, so halving the step until |r| strictly decreases never leaves
     //      the basin even if a full step would overshoot the maximum.
     let residual_and_jac = |eta: f64| -> Result<(f64, f64), AloExactScalarError> {
-        let (ell_prime, ell_double) = score_curvature(eta);
+        let (ell_prime, ell_double) =
+            score_curvature(eta).map_err(|error| AloExactScalarError::EvaluationFailed {
+                eta,
+                reason: error.to_string(),
+            })?;
         if !ell_prime.is_finite() || !ell_double.is_finite() {
             return Err(AloExactScalarError::NonFiniteScoreCurvature {
                 eta,
@@ -269,7 +269,7 @@ fn alo_eta_exact_frozen_curvature(
         if residual.abs() <= ALO_EXACT_SCALAR_TOL {
             return Ok(eta);
         }
-        if jac.abs() <= ALO_DENOMINATOR_MIN || !jac.is_finite() {
+        if jac == 0.0 || !jac.is_finite() {
             return Err(AloExactScalarError::DegenerateJacobian { eta, jacobian: jac });
         }
         let step = residual / jac;
@@ -334,7 +334,6 @@ const LEVERAGE_HIGH_THRESHOLD: f64 = 0.99;
 const LEVERAGE_VERY_HIGH_THRESHOLD: f64 = 0.999;
 const LEVERAGE_RATE_THRESHOLDS: [f64; 3] = [0.90, 0.95, 0.99];
 const LEVERAGE_PERCENTILES: [f64; 3] = [0.50, 0.95, 0.99];
-const ALO_DENOMINATOR_MIN: f64 = 1e-12;
 const MULTIBLOCK_ALO_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// Number of observation columns solved per blocked right-hand-side batch in the
@@ -536,12 +535,37 @@ fn compute_alo_diagnostics_from_pirls_inner(
         .map_err(|reason| AloError::DesignDegenerate { reason })?;
     let x_dense = x_dense_arc.as_ref();
     let n = x_dense.nrows();
+    if y.len() != n {
+        return Err(AloError::InvalidInput {
+            reason: format!(
+                "ALO response length must match the design row count; got {} responses for {n} rows",
+                y.len()
+            ),
+        });
+    }
+    if alo_link_needs_exact_curvature_refinement(&base.likelihood) {
+        for (row, &response) in y.iter().enumerate() {
+            let valid = response.is_finite()
+                && match &base.likelihood.spec.response {
+                    ResponseFamily::Binomial => (0.0..=1.0).contains(&response),
+                    ResponseFamily::Poisson => response >= 0.0,
+                    _ => true,
+                };
+            if !valid {
+                return Err(AloError::InvalidInput {
+                    reason: format!(
+                        "ALO canonical refinement received an invalid response at row {row}: {response}"
+                    ),
+                });
+            }
+        }
+    }
 
     let phi = alo_covariance_scale(base)?;
 
-    // ALO needs the exact penalized Hessian materialized densely for chunked
-    // column solves via StableSolver.  The PIRLS export path validates the
-    // matrix instead of falling back to a numerical Hessian approximation.
+    // ALO needs the exact penalized Hessian materialized densely for chunked,
+    // residual-certified SPD solves. The PIRLS export path validates the matrix
+    // instead of falling back to a numerical Hessian approximation.
     let h_dense_for_alo = base
         .dense_stabilizedhessian_transformed(
             "ALO diagnostics require exact dense stabilized penalized Hessian",
@@ -567,21 +591,45 @@ fn compute_alo_diagnostics_from_pirls_inner(
     // Restricted to canonical links because only there does the observed
     // curvature carried by the frozen Hessian (W_H) coincide with c_i μ'(η) for
     // every trial η; non-canonical links retain the classical one-step ALO.
-    // Per-row scale c_i = W_H[i]/μ'(η̂_i). Rows whose μ'(η̂_i) is negligible
-    // (saturated / near-separation) get c_i = NaN, which makes the exact solver
-    // reject that row explicitly rather than substituting the classical one-step
-    // ALO.
+    // Per-row scale c_i = W_H[i]/μ'(η̂_i). This is an exact ratio, not a
+    // thresholded one: tiny positive curvature remains informative. If both
+    // numerator and derivative are exactly zero, the row has no representable
+    // local influence and c_i is exactly zero; every other nonrepresentable
+    // ratio is an explicit error.
     let canonical_scale: Option<Array1<f64>> =
         if alo_link_needs_exact_curvature_refinement(&base.likelihood) {
             let mut c = Array1::<f64>::zeros(n);
             for i in 0..n {
                 let dmu = base.solve_dmu_deta[i];
                 let w_h = base.finalweights[i];
-                c[i] = if dmu.abs() <= ALO_DENOMINATOR_MIN || !dmu.is_finite() || !w_h.is_finite() {
-                    f64::NAN
+                if !dmu.is_finite() || !w_h.is_finite() || dmu < 0.0 || w_h < 0.0 {
+                    return Err(AloError::WeightInvalid {
+                        reason: format!(
+                            "canonical ALO requires finite non-negative local derivative and curvature; row {i} has dmu_deta={dmu}, weight={w_h}"
+                        ),
+                    });
+                }
+                let scale = if dmu == 0.0 {
+                    if w_h == 0.0 {
+                        0.0
+                    } else {
+                        return Err(AloError::LooComputationFailed {
+                            reason: format!(
+                                "canonical ALO scale is undefined at row {i}: nonzero curvature {w_h} divided by zero inverse-link derivative"
+                            ),
+                        });
+                    }
                 } else {
                     w_h / dmu
                 };
+                if !scale.is_finite() || scale < 0.0 || (w_h > 0.0 && scale == 0.0) {
+                    return Err(AloError::LooComputationFailed {
+                        reason: format!(
+                            "canonical ALO scale is not representable at row {i}: weight={w_h}, dmu_deta={dmu}, scale={scale}"
+                        ),
+                    });
+                }
+                c[i] = scale;
             }
             Some(c)
         } else {
@@ -590,14 +638,27 @@ fn compute_alo_diagnostics_from_pirls_inner(
 
     let inv_link_for_closure = base.likelihood.spec.link.clone();
     let score_curvature_closure = canonical_scale.as_ref().map(|scale| {
-        move |i: usize, eta: f64| -> (f64, f64) {
+        move |i: usize, eta: f64| -> Result<(f64, f64), AloError> {
             let (mu, dmu) = crate::mixture_link::inverse_link_mu_d1_for_inverse_link(
                 &inv_link_for_closure,
                 eta,
             )
-            .unwrap_or((f64::NAN, f64::NAN));
+            .map_err(|error| AloError::LooComputationFailed {
+                reason: format!(
+                    "ALO inverse-link evaluation failed at row {i}, eta={eta}: {error}"
+                ),
+            })?;
             let c_i = scale[i];
-            (c_i * (mu - y[i]), c_i * dmu)
+            let score = c_i * (mu - y[i]);
+            let curvature = c_i * dmu;
+            if !score.is_finite() || !curvature.is_finite() {
+                return Err(AloError::LooComputationFailed {
+                    reason: format!(
+                        "ALO canonical row geometry is not representable at row {i}, eta={eta}: score={score}, curvature={curvature}"
+                    ),
+                });
+            }
+            Ok((score, curvature))
         }
     });
     let score_curvature_ref: Option<&AloScalarScoreCurvature> = score_curvature_closure
@@ -627,35 +688,6 @@ fn compute_alo_diagnostics_from_pirls_inner(
 
     // PIRLS-specific post-hoc leverage diagnostics logging.
     log_leverage_diagnostics(&result.leverage, phi);
-
-    // Final NaN guard with detailed error reporting.
-    let has_nan_pred = result.eta_tilde.iter().any(|&x| x.is_nan());
-    let has_nan_se_bayes = result.se_bayes.iter().any(|&x| x.is_nan());
-    let has_nan_se_sandwich = result.se_sandwich.iter().any(|&x| x.is_nan());
-    let has_nan_leverage = result.leverage.iter().any(|&x| x.is_nan());
-
-    if has_nan_pred || has_nan_se_bayes || has_nan_se_sandwich || has_nan_leverage {
-        log::error!("[GAM ALO] NaN values found in ALO diagnostics:");
-        log::error!(
-            "[GAM ALO] eta_tilde: {} NaN values",
-            result.eta_tilde.iter().filter(|&&x| x.is_nan()).count()
-        );
-        log::error!(
-            "[GAM ALO] se_bayes: {} NaN values",
-            result.se_bayes.iter().filter(|&&x| x.is_nan()).count()
-        );
-        log::error!(
-            "[GAM ALO] se_sandwich: {} NaN values",
-            result.se_sandwich.iter().filter(|&&x| x.is_nan()).count()
-        );
-        log::error!(
-            "[GAM ALO] leverage: {} NaN values",
-            result.leverage.iter().filter(|&&x| x.is_nan()).count()
-        );
-        return Err(AloError::InfluenceMatrixFailed {
-            condition_number: f64::INFINITY,
-        });
-    }
 
     Ok(result)
 }
@@ -1021,11 +1053,11 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
         .into_par_iter()
         .map(|i| {
             let denom_raw = 1.0 - aii[i];
-            if denom_raw <= ALO_DENOMINATOR_MIN || !denom_raw.is_finite() {
+            if denom_raw == 0.0 || !denom_raw.is_finite() {
                 return Err(AloError::LooComputationFailed {
                     reason: format!(
-                        "ALO denominator is too small at row {i}: a_ii={:.6e}, 1-a_ii={:.6e}, min={:.1e}",
-                        aii[i], denom_raw, ALO_DENOMINATOR_MIN
+                        "ALO deletion denominator is not invertible at row {i}: a_ii={:.6e}, 1-a_ii={:.6e}",
+                        aii[i], denom_raw
                     ),
                 });
             }
@@ -1217,7 +1249,6 @@ pub fn compute_alo_diagnostics_from_pirls(
 /// leverage is one, or if the dense Hessian / design is unavailable.
 pub fn compute_case_deletion_from_pirls(
     base: &pirls::PirlsResult,
-    y: ArrayView1<f64>,
 ) -> Result<Option<crate::sensitivity::CaseDeletionInfluence>, EstimationError> {
     let x_dense_arc = base
         .x_transformed
@@ -2057,14 +2088,16 @@ mod tests {
     fn alo_exact_frozen_curvature_converges_to_fixed_point() {
         let eta_hat = 1.0;
         let a_ii = 0.4;
-        let got = alo_eta_exact_frozen_curvature(eta_hat, a_ii, &|eta| (0.5 * (eta - 2.0), 0.5))
-            .expect("linear scalar fixed point should converge in one Newton step");
+        let got = alo_eta_exact_frozen_curvature(eta_hat, a_ii, &|eta| {
+            Ok((0.5 * (eta - 2.0), 0.5))
+        })
+        .expect("linear scalar fixed point should converge in one Newton step");
         assert!((got - 0.75).abs() < 1e-12);
     }
 
     #[test]
     fn alo_exact_frozen_curvature_reports_nonconvergence() {
-        let err = alo_eta_exact_frozen_curvature(0.0, 1.0, &|eta| (eta + 1.0, 0.0))
+        let err = alo_eta_exact_frozen_curvature(0.0, 1.0, &|eta| Ok((eta + 1.0, 0.0)))
             .expect_err("constant residual should exhaust the scalar iteration budget");
         let AloExactScalarError::MaxIterations { iterations, .. } = err else {
             panic!("constant residual must report MaxIterations, got {err:?}");
@@ -2084,7 +2117,7 @@ mod tests {
         let working_response = Array1::from_vec(vec![0.0]);
         let eta = Array1::from_vec(vec![0.0]);
         let offset = Array1::from_vec(vec![0.0]);
-        let score_curvature = |_: usize, eta: f64| (eta + 1.0, 0.0);
+        let score_curvature = |_: usize, eta: f64| Ok((eta + 1.0, 0.0));
         let input = AloInput {
             design: &design,
             penalized_hessian: &penalized_hessian,

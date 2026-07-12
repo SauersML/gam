@@ -4,10 +4,6 @@ use std::ops::{Deref, DerefMut};
 
 pub use gam_linalg::{RidgeDeterminantMode, RidgePolicy};
 
-/// Lower floor on positive working weights shared by likelihood families and
-/// PIRLS row assembly so weighted normal equations stay numerically well posed.
-pub const MIN_WEIGHT: f64 = 1e-12;
-
 pub use gam_spec::*;
 
 /// Storage form of the ridge penalty matrix.

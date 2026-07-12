@@ -865,7 +865,7 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                             phi,
                         )
                     } else {
-                        compute_alo_diagnostics_from_fit(&fit, y.view(), link)
+                        compute_alo_diagnostics_from_fit(&fit, y.view())
                     };
                     match alo_result {
                         Ok(alo) => {

@@ -41,7 +41,6 @@ use crate::survival::lognormal_kernel::{
 };
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
-use gam_problem::MIN_WEIGHT;
 use gam_solve::pirls::LinearInequalityConstraints;
 use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec, build_term_collection_design};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
@@ -118,6 +117,92 @@ fn latent_survival_event_type_for(code: u8) -> LatentSurvivalEventType {
         LATENT_SURVIVAL_EVENT_INTERVAL => LatentSurvivalEventType::IntervalCensored,
         _ => LatentSurvivalEventType::ExactEvent,
     }
+}
+
+/// Whole-input proof that likelihood row weights are finite and non-negative.
+///
+/// Construct this before evaluating any response or predictor row. Once
+/// constructed, `weight == 0` is the only dormant-row case; every positive
+/// value, including subnormals, remains part of the likelihood.
+#[derive(Clone, Copy)]
+struct ValidatedLikelihoodWeights<'a> {
+    values: &'a Array1<f64>,
+}
+
+impl<'a> ValidatedLikelihoodWeights<'a> {
+    fn new(
+        values: &'a Array1<f64>,
+        context: &str,
+    ) -> Result<Self, LatentSurvivalError> {
+        if let Some((row, &weight)) = values
+            .iter()
+            .enumerate()
+            .find(|(_, weight)| !weight.is_finite() || **weight < 0.0)
+        {
+            return Err(LatentSurvivalError::InvalidDataset {
+                reason: format!(
+                    "{context} row {} has invalid likelihood weight {weight:?}; expected finite weight >= 0",
+                    row + 1
+                ),
+            });
+        }
+        Ok(Self { values })
+    }
+
+    #[inline]
+    fn at(self, row: usize) -> f64 {
+        self.values[row]
+    }
+}
+
+/// Multiply one already-finite row quantity by a validated positive weight.
+/// Overflow and non-zero underflow are explicit errors rather than silently
+/// changing the row's contribution. Exact zero row quantities remain zero.
+fn checked_weighted_row_value(
+    weight: f64,
+    value: f64,
+    row: usize,
+    quantity: &str,
+) -> Result<f64, String> {
+    debug_assert!(weight.is_finite() && weight > 0.0);
+    if !value.is_finite() {
+        return Err(format!(
+            "latent likelihood row {} has non-finite unweighted {quantity}: {value:?}",
+            row + 1
+        ));
+    }
+    let weighted = weight * value;
+    if !weighted.is_finite() {
+        return Err(format!(
+            "latent likelihood row {} weighted {quantity} is not representable: {weight:?} * {value:?}",
+            row + 1
+        ));
+    }
+    if value != 0.0 && weighted == 0.0 {
+        return Err(format!(
+            "latent likelihood row {} weighted {quantity} underflowed and is not representable: {weight:?} * {value:?}",
+            row + 1
+        ));
+    }
+    Ok(weighted)
+}
+
+fn checked_weighted_row_matrix(
+    weight: f64,
+    values: &Array2<f64>,
+    row: usize,
+    quantity: &str,
+) -> Result<Array2<f64>, String> {
+    let mut weighted = Array2::<f64>::zeros(values.dim());
+    for ((left, right), &value) in values.indexed_iter() {
+        weighted[[left, right]] = checked_weighted_row_value(
+            weight,
+            value,
+            row,
+            &format!("{quantity}[{left},{right}]"),
+        )?;
+    }
+    Ok(weighted)
 }
 
 #[derive(Clone)]
@@ -3103,6 +3188,8 @@ impl LatentSurvivalFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<(f64, Array1<f64>), String> {
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-survival")
+            .map_err(String::from)?;
         let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
         let q_right = self.time_q_right(block_states)?;
         let sigma = self.latent_sd(block_states)?;
@@ -3116,8 +3203,8 @@ impl LatentSurvivalFamily {
                 gradient: Array1::<f64>::zeros(total),
             },
             |row_idx, acc| {
-                let wi = self.weights[row_idx];
-                if wi <= MIN_WEIGHT {
+                let wi = weights.at(row_idx);
+                if wi == 0.0 {
                     return Ok(());
                 }
                 let row = self.build_row_at(
@@ -3191,6 +3278,7 @@ impl LatentSurvivalFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<crate::survival::OffsetChannelResiduals, LatentSurvivalError> {
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-survival")?;
         let n = self.event_target.len();
         // `split_time_eta` validates the complete block slate before indexing
         // it and returns `LatentSurvivalError::BlockMismatch` when fitted state
@@ -3205,8 +3293,8 @@ impl LatentSurvivalFamily {
         let mut derivative = Array1::<f64>::zeros(n);
         let mut right = Array1::<f64>::zeros(n);
         for row_idx in 0..n {
-            let wi = self.weights[row_idx];
-            if wi <= MIN_WEIGHT {
+            let wi = weights.at(row_idx);
+            if wi == 0.0 {
                 continue;
             }
             let row = self.build_row_at(
@@ -3381,6 +3469,8 @@ impl LatentSurvivalFamily {
         ),
         String,
     > {
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-survival")
+            .map_err(String::from)?;
         let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
         let q_right = self.time_q_right(block_states)?;
         let sigma = self.latent_sd(block_states)?;
@@ -3398,8 +3488,8 @@ impl LatentSurvivalFamily {
             None
         };
         for row_idx in 0..self.event_target.len() {
-            let wi = self.weights[row_idx];
-            if wi <= MIN_WEIGHT {
+            let wi = weights.at(row_idx);
+            if wi == 0.0 {
                 continue;
             }
             let row = self.build_row_at(
@@ -3446,6 +3536,8 @@ impl LatentSurvivalFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-survival")
+            .map_err(String::from)?;
         let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
         let q_right = self.time_q_right(block_states)?;
         let sigma = self.latent_sd(block_states)?;
@@ -3460,8 +3552,8 @@ impl LatentSurvivalFamily {
                 hessian: Array2::<f64>::zeros((total, total)),
             },
             |row_idx, acc| {
-                let wi = self.weights[row_idx];
-                if wi <= MIN_WEIGHT {
+                let wi = weights.at(row_idx);
+                if wi == 0.0 {
                     return Ok(());
                 }
                 let row = self.build_row_at(
@@ -3515,6 +3607,8 @@ impl LatentSurvivalFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-survival")
+            .map_err(String::from)?;
         let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
         let q_right = self.time_q_right(block_states)?;
         let sigma = self.latent_sd(block_states)?;
@@ -3534,8 +3628,8 @@ impl LatentSurvivalFamily {
                 hessian: Array2::<f64>::zeros((total, total)),
             },
             |row_idx, acc| {
-                let wi = self.weights[row_idx];
-                if wi <= MIN_WEIGHT {
+                let wi = weights.at(row_idx);
+                if wi == 0.0 {
                     return Ok(());
                 }
                 let row = self.build_row_at(
@@ -3581,6 +3675,8 @@ impl LatentSurvivalFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-survival")
+            .map_err(String::from)?;
         let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
         let q_right = self.time_q_right(block_states)?;
         let sigma = self.latent_sd(block_states)?;
@@ -3601,8 +3697,8 @@ impl LatentSurvivalFamily {
                 hessian: Array2::<f64>::zeros((total, total)),
             },
             |row_idx, acc| {
-                let wi = self.weights[row_idx];
-                if wi <= MIN_WEIGHT {
+                let wi = weights.at(row_idx);
+                if wi == 0.0 {
                     return Ok(());
                 }
                 let row = self.build_row_at(
@@ -4301,14 +4397,16 @@ impl LatentBinaryFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-binary")
+            .map_err(String::from)?;
         let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
         let slices = self.joint_slices();
         let mut ll = 0.0;
         let mut gradient = Array1::<f64>::zeros(slices.total);
         let mut hessian = Array2::<f64>::zeros((slices.total, slices.total));
         for row_idx in 0..self.event_target.len() {
-            let wi = self.weights[row_idx];
-            if wi <= MIN_WEIGHT {
+            let wi = weights.at(row_idx);
+            if wi == 0.0 {
                 continue;
             }
             let row =
@@ -4369,6 +4467,7 @@ impl LatentBinaryFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<crate::survival::OffsetChannelResiduals, LatentSurvivalError> {
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-binary")?;
         let n = self.event_target.len();
         // `split_time_eta` returns a typed block-count error before indexing.
         // Missing state is never translated into zero residuals, because that
@@ -4377,8 +4476,8 @@ impl LatentBinaryFamily {
         let mut entry = Array1::<f64>::zeros(n);
         let mut exit = Array1::<f64>::zeros(n);
         for row_idx in 0..n {
-            let wi = self.weights[row_idx];
-            if wi <= MIN_WEIGHT {
+            let wi = weights.at(row_idx);
+            if wi == 0.0 {
                 continue;
             }
             let row =
@@ -4420,6 +4519,8 @@ impl LatentBinaryFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-binary")
+            .map_err(String::from)?;
         let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
         let slices = self.joint_slices();
         if d_beta_flat.len() != slices.total {
@@ -4431,8 +4532,8 @@ impl LatentBinaryFamily {
         }
         let mut out = Array2::<f64>::zeros((slices.total, slices.total));
         for row_idx in 0..self.event_target.len() {
-            let wi = self.weights[row_idx];
-            if wi <= MIN_WEIGHT {
+            let wi = weights.at(row_idx);
+            if wi == 0.0 {
                 continue;
             }
             let row =
@@ -4515,6 +4616,8 @@ impl LatentBinaryFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-binary")
+            .map_err(String::from)?;
         let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
         let slices = self.joint_slices();
         if d_beta_u_flat.len() != slices.total || d_beta_v_flat.len() != slices.total {
@@ -4527,8 +4630,8 @@ impl LatentBinaryFamily {
         }
         let mut out = Array2::<f64>::zeros((slices.total, slices.total));
         for row_idx in 0..self.event_target.len() {
-            let wi = self.weights[row_idx];
-            if wi <= MIN_WEIGHT {
+            let wi = weights.at(row_idx);
+            if wi == 0.0 {
                 continue;
             }
             let row =
@@ -4712,13 +4815,15 @@ impl LatentJointHessianFamily for LatentSurvivalFamily {
         v: &Array1<f64>,
         out: &mut Array1<f64>,
     ) -> Result<bool, String> {
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-survival")
+            .map_err(String::from)?;
         let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
         let q_right = self.time_q_right(block_states)?;
         let sigma = self.latent_sd(block_states)?;
         let include_log_sigma = slices.log_sigma.is_some();
         for row_idx in 0..self.event_target.len() {
-            let wi = self.weights[row_idx];
-            if wi <= MIN_WEIGHT {
+            let wi = weights.at(row_idx);
+            if wi == 0.0 {
                 continue;
             }
             let row = self.build_row_at(
@@ -4793,10 +4898,12 @@ impl LatentJointHessianFamily for LatentBinaryFamily {
         v: &Array1<f64>,
         out: &mut Array1<f64>,
     ) -> Result<bool, String> {
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-binary")
+            .map_err(String::from)?;
         let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
         for row_idx in 0..self.event_target.len() {
-            let wi = self.weights[row_idx];
-            if wi <= MIN_WEIGHT {
+            let wi = weights.at(row_idx);
+            if wi == 0.0 {
                 continue;
             }
             let row =
@@ -5042,6 +5149,8 @@ impl CustomFamily for LatentSurvivalFamily {
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-survival")
+            .map_err(String::from)?;
         let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
         let q_right = self.time_q_right(block_states)?;
         let latent_sd = self.latent_sd(block_states)?;
@@ -5052,8 +5161,8 @@ impl CustomFamily for LatentSurvivalFamily {
         let contributions: Result<Vec<f64>, String> = (0..n)
             .into_par_iter()
             .map(|i| -> Result<f64, String> {
-                let wi = self.weights[i];
-                if wi <= MIN_WEIGHT {
+                let wi = weights.at(i);
+                if wi == 0.0 {
                     return Ok(0.0);
                 }
                 let row = self.build_row_at(i, q_entry[i], q_exit[i], qdot_exit[i], q_right[i])?;
@@ -5175,6 +5284,8 @@ impl CustomFamily for LatentBinaryFamily {
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-binary")
+            .map_err(String::from)?;
         let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
         let n = self.event_target.len();
         let p_time = self.x_time_exit.ncols();
@@ -5190,8 +5301,8 @@ impl CustomFamily for LatentBinaryFamily {
         let mut mean_row_buf = Array2::<f64>::zeros((1, p_mean));
 
         for i in 0..n {
-            let wi = self.weights[i];
-            if wi <= MIN_WEIGHT {
+            let wi = weights.at(i);
+            if wi == 0.0 {
                 continue;
             }
             if !(q_entry[i].is_finite() && q_exit[i].is_finite() && mu[i].is_finite()) {
@@ -5275,11 +5386,13 @@ impl CustomFamily for LatentBinaryFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-binary")
+            .map_err(String::from)?;
         let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
         let mut ll = 0.0;
         for i in 0..self.event_target.len() {
-            let wi = self.weights[i];
-            if wi <= MIN_WEIGHT {
+            let wi = weights.at(i);
+            if wi == 0.0 {
                 continue;
             }
             let row = self.build_right_censored_row_at(i, q_entry[i], q_exit[i])?;

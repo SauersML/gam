@@ -2220,10 +2220,7 @@ impl UnifiedFitResult {
     /// mutated, so the redundant covariance representations remain atomic.
     /// Returns the applied standard-deviation ratio (`sqrt(var_ratio)`), or one
     /// for a fixed scale / an exact unit multiplier.
-    pub fn rescale_estimated_dispersion(
-        &mut self,
-        var_ratio: f64,
-    ) -> Result<f64, EstimationError> {
+    pub fn rescale_estimated_dispersion(&mut self, var_ratio: f64) -> Result<f64, EstimationError> {
         if !(var_ratio.is_finite() && var_ratio > 0.0) {
             return Err(EstimationError::InvalidInput(format!(
                 "estimated-dispersion variance ratio must be finite and positive, got {var_ratio}"
