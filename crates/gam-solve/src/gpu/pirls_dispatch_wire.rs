@@ -318,7 +318,6 @@ mod linux_impl {
                 pirls_gpu::PirlsLoopLikelihoodScale::non_gamma()
             }
         };
-        let qs_view = input.qs;
         let firth_default = FirthDiagnostics::Inactive;
         // Sanity-check that the host-side enum maps round-trip; if a future
         // change to PirlsLoopCurvatureKind / HessianCurvatureKind drops a
@@ -338,7 +337,6 @@ mod linux_impl {
             exported_curvature: input.exported_curvature,
             ridge_passport: None,
             firth: Some(firth_default.clone()),
-            qs: qs_view,
             edf: input.edf,
         };
         // step_lm_lambda = lm_ridge (temporary Newton stabilization only).

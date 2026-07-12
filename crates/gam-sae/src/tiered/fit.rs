@@ -338,8 +338,11 @@ mod fit_tests {
         // certified-vs-open distinction is asserted directly in
         // `tiered_returns_best_effort_open_certificate_at_k_gg_rank_2275`. Here we only
         // require the field to be readable alongside a finite frame residual.
-        let _ = report.tier1.convergence.certified;
-        assert!(report.tier1.convergence.frame_residual.is_finite());
+        let certified = report.tier1.convergence.certified;
+        assert!(
+            report.tier1.convergence.frame_residual.is_finite(),
+            "frame residual must be finite (certified={certified})"
+        );
     }
 
     /// #2275: at `K ≫ intrinsic-rank` the frame-projector fixed point legitimately

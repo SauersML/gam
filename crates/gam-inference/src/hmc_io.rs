@@ -538,7 +538,7 @@ fn resolve_hmc_likelihood(
             reason: format!("HMC likelihood scale metadata is unresolved: {error}"),
         })?;
     let phi = dispersion.phi();
-    let _inv_phi = dispersion
+    let inv_phi = dispersion
         .reciprocal()
         .map_err(|error| HmcError::InvalidConfig {
             reason: format!("HMC likelihood requires a finite positive dispersion: {error}"),
@@ -605,13 +605,7 @@ fn resolve_hmc_likelihood(
     target.scale = match (&target.spec.response, target.scale) {
         (ResponseFamily::Gaussian, _) => LikelihoodScaleMetadata::FixedDispersion { phi },
         (ResponseFamily::Gamma, LikelihoodScaleMetadata::FixedDispersion { .. }) => {
-            LikelihoodScaleMetadata::FixedGammaShape {
-                shape: dispersion
-                    .reciprocal()
-                    .map_err(|error| HmcError::InvalidConfig {
-                        reason: format!("Gamma HMC dispersion has no representable shape: {error}"),
-                    })?,
-            }
+            LikelihoodScaleMetadata::FixedGammaShape { shape: inv_phi }
         }
         (_, scale) => scale,
     };

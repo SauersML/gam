@@ -2496,7 +2496,7 @@ where
             while col_start < p_cov {
                 let col_end = (col_start + se_chunk_cols).min(p_cov);
                 let chunk = col_end - col_start;
-                let _chunk_reservation = governor
+                let chunk_reservation = governor
                     .try_reserve_dense_f64_copies(
                         qs.ncols(),
                         chunk,
@@ -2508,8 +2508,12 @@ where
                             "resource policy refused exact coefficient-SE columns {col_start}..{col_end}"
                         ))
                     })?;
-                // qs.t() has shape (p_t, p_cov); slice to (p_t, chunk).
-                let rhs = qs.t().slice(ndarray::s![.., col_start..col_end]).to_owned();
+                // qs.t() has shape (p_t, p_cov); slice to (p_t, chunk). The
+                // reservation covers this buffer and its `solvemulti` output
+                // jointly, so it is bound to whichever one outlives the other
+                // (both are dropped together at the end of this iteration).
+                let rhs =
+                    chunk_reservation.bind(qs.t().slice(ndarray::s![.., col_start..col_end]).to_owned());
                 let z_chunk = factor_t.solvemulti(&rhs).map_err(|reason| {
                     EstimationError::RemlOptimizationFailed(format!(
                         "exact coefficient-SE solve failed at columns {col_start}..{col_end}: {reason}"

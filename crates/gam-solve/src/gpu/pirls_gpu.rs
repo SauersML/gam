@@ -2270,21 +2270,6 @@ extern "C" __global__ void status_first_ladder(
         /// device-side Firth path would populate this with the active
         /// Jeffreys-logdet + hat-diagonal vector.
         pub firth: Option<crate::pirls::FirthDiagnostics>,
-        /// Canonical-basis transform `qs` (size `p × p`) that maps
-        /// transformed-basis β to original coordinates via
-        /// `beta_original = qs · beta_transformed`. Carried on the
-        /// struct for callers that need original-coordinate β; the
-        /// postpass does **not** apply `qs` to the loop's β because
-        /// the GPU loop already solved in the transformed design
-        /// `X·Qs`, so the loop's β *is* `beta_transformed`. When
-        /// `None`, no reparameterization is active and transformed
-        /// and original coordinates coincide.
-        ///
-        /// Deliberately a carrier: populated by the dispatch wirer but not
-        /// read inside the loop/postpass (which stays in transformed
-        /// coordinates), so `-D dead-code` is suppressed for this field.
-        #[allow(dead_code)]
-        pub qs: Option<ndarray::ArrayView2<'a, f64>>,
         /// Effective degrees of freedom at the converged mode, when
         /// the dispatch wirer has it precomputed (typical case: the
         /// outer REML caller passes its own `e_transformed` /
