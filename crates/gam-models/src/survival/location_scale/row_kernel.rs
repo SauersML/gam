@@ -3385,11 +3385,113 @@ mod patterned_order2_perf_tests {
         (out.value(), out.g(), out.h())
     }
 
+    /// Direct sparse chain-rule schedule used only as the performance baseline.
+    /// This deliberately duplicates the calculus in test code so the generic
+    /// backend is compared with the strongest plausible hand implementation.
+    fn hand(
+        p: &[f64; SLS_ROW_K],
+        kernel: &SurvivalExactRowKernel,
+    ) -> (f64, [f64; 9], [[f64; 9]; 9]) {
+        struct Index {
+            gradient: [f64; 9],
+            hessian: [[f64; 9]; 9],
+        }
+
+        let inv_entry = (-p[7]).exp();
+        let mut u0 = Index {
+            gradient: [0.0; 9],
+            hessian: [[0.0; 9]; 9],
+        };
+        u0.gradient[0] = 1.0;
+        u0.gradient[4] = -inv_entry;
+        u0.gradient[7] = p[4] * inv_entry;
+        u0.hessian[4][7] = inv_entry;
+        u0.hessian[7][4] = inv_entry;
+        u0.hessian[7][7] = -p[4] * inv_entry;
+
+        let inv_exit = (-p[6]).exp();
+        let mut u1 = Index {
+            gradient: [0.0; 9],
+            hessian: [[0.0; 9]; 9],
+        };
+        u1.gradient[1] = 1.0;
+        u1.gradient[3] = -inv_exit;
+        u1.gradient[6] = p[3] * inv_exit;
+        u1.hessian[3][6] = inv_exit;
+        u1.hessian[6][3] = inv_exit;
+        u1.hessian[6][6] = -p[3] * inv_exit;
+
+        let inner = p[3] * p[8] - p[5];
+        let mut g = Index {
+            gradient: [0.0; 9],
+            hessian: [[0.0; 9]; 9],
+        };
+        g.gradient[2] = 1.0;
+        g.gradient[3] = inv_exit * p[8];
+        g.gradient[5] = -inv_exit;
+        g.gradient[6] = -inv_exit * inner;
+        g.gradient[8] = inv_exit * p[3];
+        for (i, j, value) in [
+            (3, 6, -inv_exit * p[8]),
+            (3, 8, inv_exit),
+            (5, 6, inv_exit),
+            (6, 6, inv_exit * inner),
+            (6, 8, -inv_exit * p[3]),
+        ] {
+            g.hessian[i][j] = value;
+            g.hessian[j][i] = value;
+        }
+
+        let mut value = 0.0;
+        let mut gradient = [0.0; 9];
+        let mut hessian = [[0.0; 9]; 9];
+        let mut add = |index: &Index, stack: [f64; 3], scale: f64| {
+            value += stack[0] * scale;
+            let first = stack[1] * scale;
+            let second = stack[2] * scale;
+            for i in 0..9 {
+                gradient[i] += first * index.gradient[i];
+            }
+            for &(i, j) in &SLS_HESSIAN_PAIRS {
+                let channel =
+                    second * index.gradient[i] * index.gradient[j] + first * index.hessian[i][j];
+                hessian[i][j] += channel;
+                if i != j {
+                    hessian[j][i] += channel;
+                }
+            }
+        };
+        add(&u0, [kernel.log_s0, -kernel.r0, -kernel.dr0], kernel.w);
+        let censored_weight = kernel.w * (1.0 - kernel.d);
+        if censored_weight != 0.0 {
+            add(
+                &u1,
+                [kernel.log_s1, -kernel.r1, -kernel.dr1],
+                -censored_weight,
+            );
+        }
+        let event_weight = kernel.w * kernel.d;
+        if event_weight != 0.0 {
+            add(
+                &u1,
+                [kernel.logphi1, kernel.dlogphi1, kernel.d2logphi1],
+                -event_weight,
+            );
+            add(
+                &g,
+                [kernel.log_g, kernel.d_log_g, kernel.d2_log_g],
+                -event_weight,
+            );
+        }
+        (value, gradient, hessian)
+    }
+
     #[test]
     fn measure_sls_patterned_vs_dense_932() {
         let (p, kernel) = fixture();
         let want = dense(&p, &kernel);
         let got = patterned(&p, &kernel);
+        let hand_result = hand(&p, &kernel);
         let close = |a: f64, b: f64, label: &str| {
             let tolerance = 1e-12 * a.abs().max(b.abs()).max(1.0);
             assert!(
@@ -3398,17 +3500,31 @@ mod patterned_order2_perf_tests {
             );
         };
         close(got.0, want.0, "value");
+        close(hand_result.0, want.0, "hand value");
         for i in 0..SLS_ROW_K {
             close(got.1[i], want.1[i], &format!("gradient[{i}]"));
+            close(hand_result.1[i], want.1[i], &format!("hand gradient[{i}]"));
             for j in 0..SLS_ROW_K {
                 close(got.2[i][j], want.2[i][j], &format!("Hessian[{i},{j}]"));
+                close(
+                    hand_result.2[i][j],
+                    want.2[i][j],
+                    &format!("hand Hessian[{i},{j}]"),
+                );
             }
         }
 
         let iterations = 2_000_000usize;
         let mut best_dense = f64::INFINITY;
         let mut best_patterned = f64::INFINITY;
+        let mut best_hand = f64::INFINITY;
         for _ in 0..5 {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                black_box(hand(black_box(&p), black_box(&kernel)));
+            }
+            best_hand = best_hand.min(started.elapsed().as_secs_f64());
+
             let started = Instant::now();
             for _ in 0..iterations {
                 black_box(dense(black_box(&p), black_box(&kernel)));
@@ -3423,8 +3539,10 @@ mod patterned_order2_perf_tests {
         }
         let dense_ns = best_dense * 1e9 / iterations as f64;
         let patterned_ns = best_patterned * 1e9 / iterations as f64;
+        let hand_ns = best_hand * 1e9 / iterations as f64;
         eprintln!(
-            "SLS-PATTERNED-932 dense={dense_ns:.2} ns/row patterned={patterned_ns:.2} ns/row ratio={:.3}",
+            "SLS-PATTERNED-932 hand={hand_ns:.2} ns/row dense={dense_ns:.2} ns/row patterned={patterned_ns:.2} ns/row patterned/hand={:.3} patterned/dense={:.3}",
+            patterned_ns / hand_ns,
             patterned_ns / dense_ns,
         );
     }
