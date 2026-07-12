@@ -4549,16 +4549,12 @@ mod empirical_flex_jet_oracle_tests {
         raw / h.powi(total_order as i32)
     }
 
-    /// Production flex jet along a list of unit primary directions; returns the
-    /// `coeff` of the all-distinct-directions mask (the contracted mixed
-    /// derivative the production kernel exposes).
+    /// Read one value/gradient/Hessian/third/fourth channel from the canonical
+    /// empirical FLEX row plan. Higher channels use the packed directional
+    /// scalars production uses, so this oracle never depends on the retired
+    /// exponential bitmask representation.
     fn prod_flex_coeff(fx: &FlexFixture, p0: &[f64], dir_indices: &[usize]) -> f64 {
         let r = fx.primary.total;
-        let dirs: Vec<Array1<f64>> = dir_indices
-            .iter()
-            .map(|&i| BernoulliMarginalSlopeFamily::unit_primary_direction(r, i))
-            .collect();
-        let views: Vec<_> = dirs.iter().map(|d| d.view()).collect();
         let q = p0[fx.primary.q];
         let b = p0[fx.primary.logslope];
         let dev_range = if fx.is_score_warp {
@@ -4580,33 +4576,58 @@ mod empirical_flex_jet_oracle_tests {
         )
         .expect("link map");
         let intercept = witness_intercept(fx, marginal.mu, b, &beta, scale);
-        // F_a at the root for `m_a` (must be finite, > 0).
-        let mut m_a = 0.0;
-        for (node, weight) in fx.grid.pairs() {
-            m_a += weight * witness_normal_pdf(witness_eta(fx, intercept, b, &beta, node, scale));
-        }
-        let row_ctx = BernoulliMarginalSlopeRowExactContext {
-            intercept,
-            m_a,
-            intercept_fast_path: false,
-            degree9_cells: None,
-        };
-        let jet = fx
+        let plan = fx
             .family
-            .empirical_flex_neglog_jet(
-                0,
-                &fx.primary,
-                q,
-                b,
-                beta_h,
-                beta_w,
-                &row_ctx,
-                &views,
-                &fx.grid,
-            )
-            .expect("production flex jet");
-        let mask = (0..dir_indices.len()).fold(0usize, |m, i| m | (1 << i));
-        jet.coeff(mask)
+            .empirical_bms_row_jet_plan(0, &fx.primary, q, b, beta_h, beta_w, intercept, &fx.grid)
+            .expect("canonical empirical flex plan");
+        match dir_indices {
+            [] | [_] | [_, _] => {
+                let arena = DynamicJetArena::new();
+                let vars = arena.alloc_slice_fill_with(r, |axis| {
+                    gam_math::jet_scalar::DynamicOrder2::variable(p0[axis], axis, r, &arena)
+                });
+                let jet = plan
+                    .evaluate(vars, 2, &arena)
+                    .expect("canonical order-2 row");
+                match dir_indices {
+                    [] => jet.value(),
+                    &[axis] => jet.g()[axis],
+                    &[row, column] => jet.h_at(row, column),
+                    _ => unreachable!(),
+                }
+            }
+            &[row, column, contracted] => {
+                let direction = BernoulliMarginalSlopeFamily::unit_primary_direction(r, contracted);
+                let arena = DynamicJetArena::new();
+                let vars = arena.alloc_slice_fill_with(r, |axis| {
+                    DynamicOneSeed::seed_direction(p0[axis], axis, direction[axis], r, &arena)
+                });
+                plan.evaluate(vars, 3, &arena)
+                    .expect("canonical third row")
+                    .contracted_third()[row * r + column]
+            }
+            &[row, column, contracted_u, contracted_v] => {
+                let direction_u =
+                    BernoulliMarginalSlopeFamily::unit_primary_direction(r, contracted_u);
+                let direction_v =
+                    BernoulliMarginalSlopeFamily::unit_primary_direction(r, contracted_v);
+                let arena = DynamicJetArena::new();
+                let vars = arena.alloc_slice_fill_with(r, |axis| {
+                    DynamicTwoSeed::seed(
+                        p0[axis],
+                        axis,
+                        direction_u[axis],
+                        direction_v[axis],
+                        r,
+                        &arena,
+                    )
+                });
+                plan.evaluate(vars, 4, &arena)
+                    .expect("canonical fourth row")
+                    .contracted_fourth()[row * r + column]
+            }
+            _ => panic!("canonical flex oracle supports channels through order four"),
+        }
     }
 
     fn run_all_channels(is_score_warp: bool) {
