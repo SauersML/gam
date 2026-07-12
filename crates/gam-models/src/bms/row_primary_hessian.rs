@@ -3012,6 +3012,51 @@ impl BernoulliMarginalSlopeFamily {
 
         let r = primary.total;
         scratch.reset(need_hessian);
+        if let Some(empirical_grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
+            if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
+                return Err("non-finite empirical flexible row context in VGH evaluation".into());
+            }
+            let plan = self.empirical_bms_row_jet_plan(
+                row,
+                primary,
+                q,
+                b,
+                beta_h,
+                beta_w,
+                row_ctx.intercept,
+                &empirical_grid,
+            )?;
+            let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
+            if need_hessian {
+                let (value, gradient, hessian, intercept_gradient) =
+                    self.empirical_bms_row_order2(&plan, &point)?;
+                scratch.grad.assign(&gradient);
+                scratch.hess.assign(&hessian);
+                self.cache_row_intercept_predictor(
+                    row,
+                    plan.intercept_root,
+                    q,
+                    b,
+                    beta_h,
+                    beta_w,
+                    &intercept_gradient,
+                );
+                return Ok(value);
+            }
+            let (value, gradient, intercept_gradient) =
+                self.empirical_bms_row_order1(&plan, &point)?;
+            scratch.grad.assign(&gradient);
+            self.cache_row_intercept_predictor(
+                row,
+                plan.intercept_root,
+                q,
+                b,
+                beta_h,
+                beta_w,
+                &intercept_gradient,
+            );
+            return Ok(value);
+        }
         // Reusable per-row coefficient buffers live on the scratch. Resize once
         // if the scratch was constructed for a different primary dimension; the
         // common case is `len == r` so this is a no-op.
@@ -3056,37 +3101,7 @@ impl BernoulliMarginalSlopeFamily {
         let zero_family: &[[f64; 4]] = scratch.zero_family.as_slice();
         let mut f_aa = 0.0f64;
 
-        if let Some(empirical_grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
-            // #932 BMS-flex cutover: production routes the empirical-grid
-            // calibration derivatives through the per-denested-cell moment
-            // compiled factorization (`O(G + cells·k²)`), NOT the
-            // former hand per-node `O(G·r²)` loop. This compiled path is pinned
-            // at ≤1e-9 against the independent `empirical_flex_row_nll_jet2` grid
-            // jet AND an independent finite difference
-            // (`empirical_flex_row_nll_jet2_matches_hand_path_932`,
-            // `flex_factored_matches_jet2_degenerate_grids_932`,
-            // `hand_flex_grad_hess_matches_independent_fd_*_932`).
-            f_aa = self.flex_grid_calibration_derivs_compiled_jet2(
-                &*empirical_grid,
-                primary,
-                a,
-                b,
-                beta_h,
-                beta_w,
-                need_hessian,
-                coeff_u.as_mut_slice(),
-                coeff_au.as_mut_slice(),
-                coeff_bu.as_mut_slice(),
-                active_cell_primaries,
-                // The observed-point coefficient tape is dead until the
-                // calibration pass returns, then explicitly overwritten below.
-                // Reuse it for `H·c_u` actions: no cold-only scratch allocation.
-                g_u_fixed.as_mut_slice(),
-                f_u,
-                f_au,
-                f_uv,
-            )?;
-        } else {
+        {
             // Reuse cached row moments whenever they cover the requested
             // derivative order. Degree-9 moments are exact for gradient-only
             // calls too, and avoiding a second degree-3 cell sweep preserves

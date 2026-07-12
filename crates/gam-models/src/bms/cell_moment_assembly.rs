@@ -12,8 +12,8 @@ use super::*;
 
 use crate::fnv1a::Fnv1a;
 use gam_math::jet_scalar::{
-    DynamicJetArena, DynamicOneSeed, DynamicOrder2, DynamicTwoSeed, RuntimeJetScalar,
-    filtered_implicit_solve_runtime_scalar,
+    DynamicJetArena, DynamicOneSeed, DynamicOrder1, DynamicOrder2, DynamicTwoSeed,
+    RuntimeJetScalar, filtered_implicit_solve_runtime_scalar,
 };
 
 #[derive(Clone)]
@@ -41,7 +41,7 @@ struct EmpiricalBmsCalibrationNodeJetPlan {
 #[derive(Clone)]
 pub(super) struct EmpiricalBmsRowJetPlan {
     primary: PrimarySlices,
-    intercept_root: f64,
+    pub(super) intercept_root: f64,
     inv_f_a: f64,
     scale: f64,
     mu_stack: [f64; 5],
@@ -109,9 +109,7 @@ impl EmpiricalBmsRowJetPlan {
             return Err("empirical BMS row plan received a mismatched jet dimension".to_string());
         }
 
-        let neg_mu = vars[self.primary.q]
-            .compose_unary(self.mu_stack)
-            .neg();
+        let neg_mu = vars[self.primary.q].compose_unary(self.mu_stack).neg();
         let constraint = |a: &S| -> S {
             let mut residual = neg_mu.clone();
             for node in &self.calibration {
@@ -819,12 +817,7 @@ impl BernoulliMarginalSlopeFamily {
         let marginal = self.marginal_link_map(q)?;
         let mut calibration = Vec::with_capacity(grid.nodes.len());
         for (node, weight) in grid.pairs() {
-            let index = self.empirical_bms_index_jet_plan(
-                primary,
-                intercept_root,
-                slope,
-                node,
-            )?;
+            let index = self.empirical_bms_index_jet_plan(primary, intercept_root, slope, node)?;
             let obs = self.observed_denested_cell_partials_at_z(
                 node,
                 intercept_root,
@@ -840,12 +833,8 @@ impl BernoulliMarginalSlopeFamily {
             });
         }
 
-        let observed = self.empirical_bms_index_jet_plan(
-            primary,
-            intercept_root,
-            slope,
-            self.z[row],
-        )?;
+        let observed =
+            self.empirical_bms_index_jet_plan(primary, intercept_root, slope, self.z[row])?;
         let obs = self.observed_denested_cell_partials_at_z(
             self.z[row],
             intercept_root,
@@ -855,8 +844,7 @@ impl BernoulliMarginalSlopeFamily {
         )?;
         let observed_sign = 2.0 * self.y[row] - 1.0;
         let signed = observed_sign * eval_coeff4_at(&obs.coeff, self.z[row]);
-        let observed_neglog_stack =
-            unary_derivatives_neglog_phi(signed, self.weights[row]);
+        let observed_neglog_stack = unary_derivatives_neglog_phi(signed, self.weights[row]);
         if !observed_neglog_stack[0].is_finite() {
             return Err(format!(
                 "empirical BMS row plan has non-finite log Phi at row {row}"
@@ -903,6 +891,30 @@ impl BernoulliMarginalSlopeFamily {
             .map_err(|error| format!("empirical BMS Hessian shape: {error}"))?;
         let intercept_gradient = Array1::from_vec(out.intercept.g().to_vec());
         Ok((out.nll.v, gradient, hessian, intercept_gradient))
+    }
+
+    pub(super) fn empirical_bms_row_order1(
+        &self,
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+    ) -> Result<(f64, Array1<f64>, Array1<f64>), String> {
+        let dimension = plan.primary.total;
+        if point.len() != dimension {
+            return Err(format!(
+                "empirical BMS order-1 point length {} != {dimension}",
+                point.len()
+            ));
+        }
+        let arena = DynamicJetArena::new();
+        let vars = arena.alloc_slice_fill_with(dimension, |axis| {
+            DynamicOrder1::variable(point[axis], axis, dimension, &arena)
+        });
+        let out = plan.evaluate(vars, 1, &arena)?;
+        Ok((
+            out.nll.v,
+            Array1::from_vec(out.nll.g().to_vec()),
+            Array1::from_vec(out.intercept.g().to_vec()),
+        ))
     }
 
     pub(super) fn primary_component_jet(
@@ -1265,31 +1277,27 @@ impl BernoulliMarginalSlopeFamily {
         if dir.iter().all(|value| *value == 0.0) {
             return Ok(Array2::<f64>::zeros((r, r)));
         }
-        let basis_dirs = (0..r)
-            .map(|idx| Self::unit_primary_direction(r, idx))
-            .collect::<Vec<_>>();
-        let dir_owned = dir.to_owned();
-        let mut out = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let directions = [basis_dirs[u].view(), basis_dirs[v].view(), dir_owned.view()];
-                let jet = self.empirical_flex_neglog_jet(
-                    row,
-                    primary,
-                    q,
-                    b,
-                    beta_h,
-                    beta_w,
-                    row_ctx,
-                    &directions,
-                    grid,
-                )?;
-                let val = jet.coeff(1 | 2 | 4);
-                out[[u, v]] = val;
-                out[[v, u]] = val;
-            }
+        if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
+            return Err("non-finite empirical flexible row context in third contraction".into());
         }
-        Ok(out)
+        let plan = self.empirical_bms_row_jet_plan(
+            row,
+            primary,
+            q,
+            b,
+            beta_h,
+            beta_w,
+            row_ctx.intercept,
+            grid,
+        )?;
+        let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
+        let arena = DynamicJetArena::new();
+        let vars = arena.alloc_slice_fill_with(r, |axis| {
+            DynamicOneSeed::seed_direction(point[axis], axis, dir[axis], r, &arena)
+        });
+        let jet = plan.evaluate(vars, 3, &arena)?.nll;
+        Array2::from_shape_vec((r, r), jet.contracted_third().to_vec())
+            .map_err(|error| format!("empirical BMS third-contraction shape: {error}"))
     }
 
     pub(super) fn empirical_flex_row_fourth_contracted_recompute(
@@ -1316,37 +1324,27 @@ impl BernoulliMarginalSlopeFamily {
         if dir_u.iter().all(|value| *value == 0.0) || dir_v.iter().all(|value| *value == 0.0) {
             return Ok(Array2::<f64>::zeros((r, r)));
         }
-        let basis_dirs = (0..r)
-            .map(|idx| Self::unit_primary_direction(r, idx))
-            .collect::<Vec<_>>();
-        let dir_u_owned = dir_u.to_owned();
-        let dir_v_owned = dir_v.to_owned();
-        let mut out = Array2::<f64>::zeros((r, r));
-        for p in 0..r {
-            for q_idx in p..r {
-                let directions = [
-                    basis_dirs[p].view(),
-                    basis_dirs[q_idx].view(),
-                    dir_u_owned.view(),
-                    dir_v_owned.view(),
-                ];
-                let jet = self.empirical_flex_neglog_jet(
-                    row,
-                    primary,
-                    q,
-                    b,
-                    beta_h,
-                    beta_w,
-                    row_ctx,
-                    &directions,
-                    grid,
-                )?;
-                let val = jet.coeff(1 | 2 | 4 | 8);
-                out[[p, q_idx]] = val;
-                out[[q_idx, p]] = val;
-            }
+        if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
+            return Err("non-finite empirical flexible row context in fourth contraction".into());
         }
-        Ok(out)
+        let plan = self.empirical_bms_row_jet_plan(
+            row,
+            primary,
+            q,
+            b,
+            beta_h,
+            beta_w,
+            row_ctx.intercept,
+            grid,
+        )?;
+        let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
+        let arena = DynamicJetArena::new();
+        let vars = arena.alloc_slice_fill_with(r, |axis| {
+            DynamicTwoSeed::seed(point[axis], axis, dir_u[axis], dir_v[axis], r, &arena)
+        });
+        let jet = plan.evaluate(vars, 4, &arena)?.nll;
+        Array2::from_shape_vec((r, r), jet.contracted_fourth().to_vec())
+            .map_err(|error| format!("empirical BMS fourth-contraction shape: {error}"))
     }
 
     pub(super) fn rigid_row_kernel_eval(
