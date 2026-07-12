@@ -984,6 +984,279 @@ pub fn sae_data_row_anchored_euclidean_coords(
     Ok(out)
 }
 
+/// Deterministic farthest-point landmark selection (#2023 Tier-1 pattern): the
+/// first landmark is row 0, then each next landmark maximizes the minimum
+/// ambient distance to the chosen set, ties broken by the smaller row index. No
+/// RNG; the choice is a pure function of the data and the requested count.
+fn farthest_point_landmark_rows(z: ArrayView2<'_, f64>, m: usize) -> Vec<usize> {
+    let n = z.nrows();
+    let p = z.ncols();
+    let dist2 = |a: usize, b: usize| -> f64 {
+        (0..p)
+            .map(|c| {
+                let x = z[[a, c]] - z[[b, c]];
+                x * x
+            })
+            .sum::<f64>()
+    };
+    let mut chosen = Vec::with_capacity(m);
+    chosen.push(0usize);
+    let mut min_d2: Vec<f64> = (0..n).map(|i| dist2(i, 0)).collect();
+    while chosen.len() < m {
+        let mut best_row = usize::MAX;
+        let mut best_val = -1.0_f64;
+        for (row, &value) in min_d2.iter().enumerate() {
+            if value > best_val {
+                best_val = value;
+                best_row = row;
+            }
+        }
+        if best_row == usize::MAX {
+            break;
+        }
+        chosen.push(best_row);
+        for (row, slot) in min_d2.iter_mut().enumerate() {
+            *slot = slot.min(dist2(row, best_row));
+        }
+    }
+    chosen
+}
+
+/// Deterministic intrinsic-metric seed coordinates (issue #2240 reframe /
+/// #2280 mechanism 1): a neighborhood-graph geodesic embedding — Isomap, i.e.
+/// kNN graph → shortest-path geodesics → classical MDS — into `d` dimensions, to
+/// be raced in the seed race against the global-linear PCA seed under the same
+/// REML evidence.
+///
+/// A global linear projection (PCA) is NON-INJECTIVE on any embedding that folds
+/// back on itself — a rolled sheet, a spiral, an entangled product — so distinct
+/// manifold points collapse onto the same coordinate and the downstream fit can
+/// only average them (held-out reconstruction collapses on the overlap). The
+/// intrinsic geodesic metric unfolds the fold: graph-neighbors are manifold-
+/// neighbors, so the embedding is injective exactly where PCA is not. On an
+/// already-flat cluster the geodesic metric agrees with the Euclidean one, so
+/// this ties PCA and PCA wins on evidence/cost; the intrinsic seed earns its
+/// place only when folding breaks PCA. No shape-specific logic.
+///
+/// **Determinism (fleet law):** farthest-point landmarks from a fixed start, kNN
+/// with index tie-breaks, Floyd–Warshall geodesics, the faer symmetric
+/// eigendecomposition, and sign-pinned embedding axes are all deterministic, so
+/// the seed is bit-reproducible run-to-run and across thread/device counts.
+///
+/// Cost is bounded by capping the geodesic/MDS core at `LANDMARK_CAP` landmarks
+/// (`O(m³)` Floyd–Warshall + `O(m³)` eigendecomposition); at or below the cap
+/// every row is its own landmark (exact Isomap). Above the cap, non-landmark
+/// rows take their nearest landmark's coordinates — a coarse but deterministic
+/// seed that the joint fit refines (a smooth Landmark-MDS out-of-sample
+/// placement is the follow-up).
+pub fn intrinsic_metric_seed_coords(
+    z: ArrayView2<'_, f64>,
+    d: usize,
+    n_neighbors: usize,
+) -> Result<Array2<f64>, String> {
+    use std::cmp::Ordering;
+    let n = z.nrows();
+    let p = z.ncols();
+    if d == 0 {
+        return Err("intrinsic_metric_seed_coords: d must be >= 1".to_string());
+    }
+    if n_neighbors < 1 {
+        return Err("intrinsic_metric_seed_coords: n_neighbors must be >= 1".to_string());
+    }
+    if n < d + 1 {
+        return Err(format!(
+            "intrinsic_metric_seed_coords: need at least d+1={} rows, got {n}",
+            d + 1
+        ));
+    }
+    for ((row, col), &value) in z.indexed_iter() {
+        if !value.is_finite() {
+            return Err(format!(
+                "intrinsic_metric_seed_coords: Z must be finite; Z[{row}, {col}] = {value}"
+            ));
+        }
+    }
+    let dist2 = |a: usize, b: usize| -> f64 {
+        (0..p)
+            .map(|c| {
+                let x = z[[a, c]] - z[[b, c]];
+                x * x
+            })
+            .sum::<f64>()
+    };
+
+    const LANDMARK_CAP: usize = 700;
+    let m = n.min(LANDMARK_CAP);
+    let landmarks: Vec<usize> = if n <= LANDMARK_CAP {
+        (0..n).collect()
+    } else {
+        farthest_point_landmark_rows(z, m)
+    };
+    let cmp = |x: f64, y: f64| x.partial_cmp(&y).unwrap_or(Ordering::Equal);
+
+    // Symmetric kNN graph over the landmarks; edge weight = ambient distance.
+    let mut geo = vec![vec![f64::INFINITY; m]; m];
+    for (i, g) in geo.iter_mut().enumerate() {
+        g[i] = 0.0;
+    }
+    for i in 0..m {
+        let li = landmarks[i];
+        let mut order: Vec<usize> = (0..m).filter(|&j| j != i).collect();
+        order.sort_by(|&a, &b| {
+            cmp(dist2(li, landmarks[a]), dist2(li, landmarks[b])).then(a.cmp(&b))
+        });
+        for &j in order.iter().take(n_neighbors) {
+            let w = dist2(li, landmarks[j]).sqrt();
+            if w < geo[i][j] {
+                geo[i][j] = w;
+                geo[j][i] = w;
+            }
+        }
+    }
+
+    // Bridge disconnected components by the nearest cross-component landmark
+    // pair (deterministic) so the geodesic metric is finite everywhere.
+    loop {
+        // component labels via flood fill over finite edges
+        let mut comp = vec![usize::MAX; m];
+        let mut n_comp = 0usize;
+        for start in 0..m {
+            if comp[start] != usize::MAX {
+                continue;
+            }
+            let mut stack = vec![start];
+            comp[start] = n_comp;
+            while let Some(u) = stack.pop() {
+                for v in 0..m {
+                    if u != v && geo[u][v].is_finite() && comp[v] == usize::MAX {
+                        comp[v] = n_comp;
+                        stack.push(v);
+                    }
+                }
+            }
+            n_comp += 1;
+        }
+        if n_comp <= 1 {
+            break;
+        }
+        // nearest cross-component pair
+        let mut best = (usize::MAX, usize::MAX);
+        let mut best_d = f64::INFINITY;
+        for i in 0..m {
+            for j in (i + 1)..m {
+                if comp[i] != comp[j] {
+                    let dd = dist2(landmarks[i], landmarks[j]);
+                    if dd < best_d {
+                        best_d = dd;
+                        best = (i, j);
+                    }
+                }
+            }
+        }
+        let (i, j) = best;
+        let w = best_d.sqrt();
+        geo[i][j] = w;
+        geo[j][i] = w;
+    }
+
+    // Floyd–Warshall all-pairs shortest paths = geodesic distances.
+    for k in 0..m {
+        for i in 0..m {
+            let dik = geo[i][k];
+            if dik.is_finite() {
+                for j in 0..m {
+                    let alt = dik + geo[k][j];
+                    if alt < geo[i][j] {
+                        geo[i][j] = alt;
+                    }
+                }
+            }
+        }
+    }
+
+    // Classical MDS: double-center the squared geodesic matrix, eigendecompose.
+    let mut row_mean = vec![0.0_f64; m];
+    let mut grand = 0.0_f64;
+    for i in 0..m {
+        let mut s = 0.0_f64;
+        for j in 0..m {
+            s += geo[i][j] * geo[i][j];
+        }
+        row_mean[i] = s / m as f64;
+        grand += row_mean[i];
+    }
+    grand /= m as f64;
+    let mut b = Array2::<f64>::zeros((m, m));
+    for i in 0..m {
+        for j in 0..m {
+            let g = geo[i][j];
+            // symmetric double-centering; average i,j to kill rounding asymmetry
+            b[[i, j]] = -0.5 * (g * g - row_mean[i] - row_mean[j] + grand);
+        }
+    }
+    for i in 0..m {
+        for j in (i + 1)..m {
+            let a = 0.5 * (b[[i, j]] + b[[j, i]]);
+            b[[i, j]] = a;
+            b[[j, i]] = a;
+        }
+    }
+    let (vals, vecs) = b
+        .eigh(Side::Lower)
+        .map_err(|error| format!("intrinsic_metric_seed_coords: eigh failed: {error:?}"))?;
+    // Top-d eigenpairs by DESCENDING eigenvalue (classical MDS keeps the largest
+    // positive eigenvalues — the metric directions), index tie-break.
+    let mut idx: Vec<usize> = (0..m).collect();
+    idx.sort_by(|&a, &b2| cmp(vals[b2], vals[a]).then(a.cmp(&b2)));
+    let mut land_emb = Array2::<f64>::zeros((m, d));
+    for (col, &ei) in idx.iter().take(d).enumerate() {
+        let scale = vals[ei].max(0.0).sqrt();
+        for i in 0..m {
+            land_emb[[i, col]] = vecs[[i, ei]] * scale;
+        }
+    }
+
+    let mut out = Array2::<f64>::zeros((n, d));
+    if n <= LANDMARK_CAP {
+        out.assign(&land_emb);
+    } else {
+        for row in 0..n {
+            let mut best_idx = 0usize;
+            let mut best_d = f64::INFINITY;
+            for (li_idx, &li) in landmarks.iter().enumerate() {
+                let dd = dist2(row, li);
+                if dd < best_d {
+                    best_d = dd;
+                    best_idx = li_idx;
+                }
+            }
+            for col in 0..d {
+                out[[row, col]] = land_emb[[best_idx, col]];
+            }
+        }
+    }
+
+    // Sign-pin each axis (make its largest-magnitude entry positive) so the
+    // eigenvector sign freedom does not make the seed run-dependent.
+    for col in 0..d {
+        let mut max_row = 0usize;
+        let mut max_abs = 0.0_f64;
+        for row in 0..n {
+            let a = out[[row, col]].abs();
+            if a > max_abs {
+                max_abs = a;
+                max_row = row;
+            }
+        }
+        if out[[max_row, col]] < 0.0 {
+            for row in 0..n {
+                out[[row, col]] = -out[[row, col]];
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,6 +1288,155 @@ mod tests {
             "mixed atom kinds must allocate canonical harmonic windows cumulatively; \
              atom_idx * per-atom-need overlaps when need varies"
         );
+    }
+
+    /// #2240 reframe falsifier: on a genuinely ROLLED sheet (a swiss roll whose
+    /// layers overlap in every 2-plane), the global-linear PCA seed is
+    /// non-injective and its held-out reconstruction collapses, while the
+    /// intrinsic-metric (geodesic Isomap) seed unfolds the roll and recovers it.
+    /// This is the general seed-geometry fix — no roll-specific code — and the
+    /// property the seed race exploits: race intrinsic vs PCA, intrinsic wins
+    /// exactly when folding breaks PCA (an already-flat cluster ties, and PCA
+    /// wins there on cost/evidence). Objective quality, no reference tool.
+    #[test]
+    fn intrinsic_seed_unfolds_swiss_roll_where_pca_collapses() {
+        use gam_linalg::faer_ndarray::{fast_ata, fast_atb, FaerCholesky};
+
+        // Deterministic ~2-turn swiss roll grid, embedded in R^3.
+        let (n_t, n_h) = (45usize, 10usize);
+        let n = n_t * n_h;
+        let mut z = Array2::<f64>::zeros((n, 3));
+        for ti in 0..n_t {
+            let t = 1.2 * std::f64::consts::PI
+                + (3.2 - 1.2) * std::f64::consts::PI * ti as f64 / (n_t - 1) as f64;
+            for hi in 0..n_h {
+                let h = 10.0 * hi as f64 / (n_h - 1) as f64;
+                let row = ti * n_h + hi;
+                z[[row, 0]] = t * t.cos();
+                z[[row, 1]] = h;
+                z[[row, 2]] = t * t.sin();
+            }
+        }
+
+        // PCA-2 seed (the global-linear incumbent) via the same SVD path.
+        let mut centered = z.clone();
+        let mean = z.mean_axis(ndarray::Axis(0)).unwrap();
+        for row in 0..n {
+            for c in 0..3 {
+                centered[[row, c]] -= mean[c];
+            }
+        }
+        let (_, _, vt) = centered.svd(false, true).unwrap();
+        let vt = vt.unwrap();
+        let mut pca = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            for k in 0..2 {
+                pca[[row, k]] = (0..3).map(|c| centered[[row, c]] * vt[[k, c]]).sum();
+            }
+        }
+
+        // Intrinsic-metric seed.
+        let intrinsic = intrinsic_metric_seed_coords(z.view(), 2, 8).unwrap();
+
+        // Held-out thin-plate reconstruction R^2 from 2-D coordinates.
+        let heldout_r2 = |coords: &Array2<f64>| -> f64 {
+            // standardize coords
+            let cmean = coords.mean_axis(ndarray::Axis(0)).unwrap();
+            let mut cstd = [0.0_f64; 2];
+            for k in 0..2 {
+                cstd[k] = (coords.column(k).iter().map(|&v| (v - cmean[k]).powi(2)).sum::<f64>()
+                    / n as f64)
+                    .sqrt()
+                    .max(1e-12);
+            }
+            let n_centers = 70usize;
+            let centers: Vec<usize> =
+                (0..n_centers).map(|i| i * (n - 1) / (n_centers - 1)).collect();
+            let width = 3 + n_centers;
+            let mut phi = Array2::<f64>::zeros((n, width));
+            let cs = |row: usize, k: usize| (coords[[row, k]] - cmean[k]) / cstd[k];
+            for row in 0..n {
+                phi[[row, 0]] = 1.0;
+                phi[[row, 1]] = cs(row, 0);
+                phi[[row, 2]] = cs(row, 1);
+                for (ci, &cr) in centers.iter().enumerate() {
+                    let r2 = (0..2)
+                        .map(|k| {
+                            let d = cs(row, k) - cs(cr, k);
+                            d * d
+                        })
+                        .sum::<f64>()
+                        .max(1e-12);
+                    phi[[row, 3 + ci]] = 0.5 * r2 * r2.ln();
+                }
+            }
+            let train: Vec<usize> = (0..n).filter(|r| r % 4 != 0).collect();
+            let test: Vec<usize> = (0..n).filter(|r| r % 4 == 0).collect();
+            let phi_tr = phi.select(ndarray::Axis(0), &train);
+            let z_tr = z.select(ndarray::Axis(0), &train);
+            let mut gram = fast_ata(&phi_tr);
+            let scale = gram.diag().iter().copied().fold(0.0_f64, f64::max);
+            for dgn in gram.diag_mut().iter_mut() {
+                *dgn += scale * 1e-8;
+            }
+            let rhs = fast_atb(&phi_tr, &z_tr);
+            let decoder = gram.cholesky(Side::Lower).unwrap().solve_mat(&rhs);
+            let mut mean_t = [0.0_f64; 3];
+            for &row in &test {
+                for c in 0..3 {
+                    mean_t[c] += z[[row, c]];
+                }
+            }
+            for c in 0..3 {
+                mean_t[c] /= test.len() as f64;
+            }
+            let (mut resid, mut total) = (0.0_f64, 0.0_f64);
+            for &row in &test {
+                for c in 0..3 {
+                    let mut fit = 0.0_f64;
+                    for a in 0..width {
+                        fit += phi[[row, a]] * decoder[[a, c]];
+                    }
+                    resid += (z[[row, c]] - fit).powi(2);
+                    total += (z[[row, c]] - mean_t[c]).powi(2);
+                }
+            }
+            1.0 - resid / total
+        };
+
+        let r2_intrinsic = heldout_r2(&intrinsic);
+        let r2_pca = heldout_r2(&pca);
+        assert!(
+            r2_intrinsic > 0.99,
+            "intrinsic geodesic seed must unfold the rolled sheet; intrinsic R²={r2_intrinsic}, pca R²={r2_pca}"
+        );
+        assert!(
+            r2_pca < 0.9,
+            "the global-linear PCA seed must collapse on a genuine fold (non-injective projection); \
+             intrinsic R²={r2_intrinsic}, pca R²={r2_pca}"
+        );
+        assert!(
+            r2_intrinsic > r2_pca + 0.05,
+            "intrinsic seed must beat PCA on the fold; intrinsic R²={r2_intrinsic}, pca R²={r2_pca}"
+        );
+    }
+
+    /// Determinism (fleet law): the intrinsic seed is a pure function of the data
+    /// — bit-identical across repeated calls, no RNG, no thread/order dependence.
+    #[test]
+    fn intrinsic_seed_is_deterministic() {
+        let n = 120usize;
+        let mut z = Array2::<f64>::zeros((n, 4));
+        for row in 0..n {
+            let a = row as f64 * 0.11;
+            z[[row, 0]] = a.sin();
+            z[[row, 1]] = (2.0 * a).cos();
+            z[[row, 2]] = (0.5 * a).sin() * 0.7;
+            z[[row, 3]] = ((row % 7) as f64) * 0.05;
+        }
+        let first = intrinsic_metric_seed_coords(z.view(), 2, 6).unwrap();
+        let second = intrinsic_metric_seed_coords(z.view(), 2, 6).unwrap();
+        assert_eq!(first, second, "intrinsic seed must be bit-reproducible");
     }
 
     /// FIX #1: distinct `pc_pair_offset` ⇒ distinct random plane for a surplus
