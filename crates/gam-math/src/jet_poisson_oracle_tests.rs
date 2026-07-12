@@ -52,8 +52,8 @@
 
 use crate::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
 use crate::jet_tower::{
-    RowNllProgramGeneric, Tower4, generic_fourth_contracted, generic_full_tower,
-    generic_row_kernel, generic_third_contracted,
+    RowProgram, Tower4, program_fourth_contracted, program_full_tower, program_row_kernel,
+    program_third_contracted,
 };
 
 /// One Poisson-log row fixture: the response `y` (a count, as `f64`) and the
@@ -104,17 +104,17 @@ pub fn poisson_jet_tower(row: &PoissonRow, p0: [f64; 2]) -> Tower4<2> {
     poisson_row_nll(row, &vars)
 }
 
-/// A minimal [`RowNllProgramGeneric`] wrapper around [`poisson_row_nll`].
+/// A minimal [`RowProgram`] wrapper around [`poisson_row_nll`].
 ///
-/// This mirrors the production family seam: primaries are seeded by the generic
-/// row-kernel helpers, while the row likelihood itself stays a single expression
-/// over `S: JetScalar<2>`.
+/// This mirrors the production family seam: primaries are seeded by the
+/// `program_*` derivation helpers, while the row likelihood itself stays a single
+/// expression over `S: JetScalar<2>`.
 struct PoissonProgram {
     row: PoissonRow,
     p0: [f64; 2],
 }
 
-impl RowNllProgramGeneric<2> for PoissonProgram {
+impl RowProgram<2> for PoissonProgram {
     fn n_rows(&self) -> usize {
         1
     }
@@ -124,7 +124,7 @@ impl RowNllProgramGeneric<2> for PoissonProgram {
         Ok(self.p0)
     }
 
-    fn row_nll_generic<S: JetScalar<2>>(&self, row: usize, p: &[S; 2]) -> Result<S, String> {
+    fn eval<S: JetScalar<2>>(&self, row: usize, p: &[S; 2]) -> Result<S, String> {
         assert_eq!(row, 0, "single-row PoissonProgram only contains row zero");
         Ok(poisson_row_nll(&self.row, p))
     }
@@ -363,11 +363,11 @@ fn poisson_packed_scalars_match_hand_derived_contractions() {
     }
 }
 
-/// The RowKernel-shaped generic helper surface (`generic_row_kernel`,
-/// `generic_third_contracted`, `generic_fourth_contracted`) must be a pure
+/// The RowKernel-shaped derivation surface (`program_row_kernel`,
+/// `program_third_contracted`, `program_fourth_contracted`) must be a pure
 /// projection of the same full tower. This is the exact, FD-free oracle pattern
 /// production families use to guard hand-tuned kernels: every channel a
-/// `RowKernel` consumer can request is derived from ONE `row_nll_generic`
+/// `RowKernel` consumer can request is derived from ONE [`RowProgram::eval`]
 /// expression, so the cross-channel desynchronisation class from #736/#932 has
 /// no second derivative source in which to hide.
 #[test]
@@ -386,9 +386,9 @@ fn poisson_generic_row_kernel_helpers_are_full_tower_projections() {
             p0: [rng.uniform(-0.8, 0.8), rng.uniform(-0.8, 0.8)],
         };
 
-        let tower = generic_full_tower(&program, 0).expect("full generic Poisson tower");
+        let tower = program_full_tower(&program, 0).expect("full generic Poisson tower");
         let (value, gradient, hessian) =
-            generic_row_kernel(&program, 0).expect("generic row kernel");
+            program_row_kernel(&program, 0).expect("generic row kernel");
 
         close(value, tower.v, &format!("trial {trial} generic value"));
         for i in 0..2 {
@@ -408,7 +408,7 @@ fn poisson_generic_row_kernel_helpers_are_full_tower_projections() {
 
         for (di, dir) in dirs.iter().enumerate() {
             let third =
-                generic_third_contracted(&program, 0, dir).expect("generic third contraction");
+                program_third_contracted(&program, 0, dir).expect("generic third contraction");
             let truth = tower.third_contracted(dir);
             for i in 0..2 {
                 for j in 0..2 {
@@ -424,7 +424,7 @@ fn poisson_generic_row_kernel_helpers_are_full_tower_projections() {
         for (ui, u) in dirs.iter().enumerate() {
             let v = dirs[(ui + 1) % dirs.len()];
             let fourth =
-                generic_fourth_contracted(&program, 0, u, &v).expect("generic fourth contraction");
+                program_fourth_contracted(&program, 0, u, &v).expect("generic fourth contraction");
             let truth = tower.fourth_contracted(u, &v);
             for i in 0..2 {
                 for j in 0..2 {

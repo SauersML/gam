@@ -1945,6 +1945,112 @@ pub fn generic_full_tower<const K: usize, P: RowNllProgramGeneric<K> + ?Sized>(
     prog.row_nll_generic(row, &vars)
 }
 
+// ── The canonical single-source seam (#932 consolidation) ────────────
+//
+// `RowProgram<K>` is the ONE row-program interface #932 converges every family
+// onto. Its shape is identical to [`RowNllProgramGeneric`] — `primaries` plus a
+// single `eval<S: JetScalar<K>>` body — which it renames (`row_nll_generic` →
+// `eval`) and supersedes; it also absorbs the `Tower4`-specialised
+// [`RowNllProgram`], which is just this trait instantiated at `S = Tower4`
+// ([`program_full_tower`]). Both legacy seams are being migrated onto this trait
+// and deleted once no impl remains (unify-deletes-legacy; #932 inc 3). The
+// `program_*` helpers below are the go-forward derivation surface, deriving each
+// `RowKernel` calculus channel from the ONE `eval` expression; they mirror the
+// `generic_*` helpers exactly (same jet arithmetic, bit-identical output) and
+// replace them as families migrate.
+
+/// The single source of truth #932 asks for: a family's row negative
+/// log-likelihood written ONCE over the generic [`crate::jet_scalar::JetScalar`]
+/// interface, from which every `RowKernel` (gam-models) derivative channel is
+/// mechanically derived. A family implements ONLY this (plus its linear Jacobian
+/// wiring, which is family data, not calculus) — it cannot author an independent
+/// derivative tower, because there is no other channel to author.
+///
+/// Because a body uses only `add`/`sub`/`mul`/`scale`/`exp`/`ln`/… — all provided
+/// by [`crate::jet_scalar::JetScalar`] — the SAME body re-instantiates at
+/// [`crate::jet_scalar::Order2`] (value/grad/Hessian), [`crate::jet_scalar::OneSeed`]
+/// (contracted third), [`crate::jet_scalar::TwoSeed`] (contracted fourth), and the
+/// full [`Tower4`] (every channel), with the contraction folded into the
+/// differentiation so no dense `t3`/`t4` is ever materialised.
+pub trait RowProgram<const K: usize>: Send + Sync {
+    /// Number of observations the program covers.
+    fn n_rows(&self) -> usize;
+
+    /// Current primary-scalar values for `row` (where to seed the scalar).
+    fn primaries(&self, row: usize) -> Result<[f64; K], String>;
+
+    /// The row NLL evaluated on a generic jet scalar. `p[a]` arrives pre-seeded
+    /// (base value + per-scalar nilpotent directions) by the caller; the body
+    /// uses ONLY [`crate::jet_scalar::JetScalar`] ops and per-row data (response,
+    /// censoring, offsets) entering as constants.
+    fn eval<S: crate::jet_scalar::JetScalar<K>>(
+        &self,
+        row: usize,
+        p: &[S; K],
+    ) -> Result<S, String>;
+}
+
+/// Derive the `row_kernel` channel `(nll, ∇, H)` from a [`RowProgram`] at the
+/// value/gradient/Hessian scalar [`crate::jet_scalar::Order2`], WITHOUT
+/// materialising any third / fourth tensor. Bit-identical to the legacy
+/// [`generic_row_kernel`] (same order-2 jet arithmetic).
+pub fn program_row_kernel<const K: usize, P: RowProgram<K> + ?Sized>(
+    prog: &P,
+    row: usize,
+) -> Result<(f64, [f64; K], [[f64; K]; K]), String> {
+    let base = prog.primaries(row)?;
+    let vars: [crate::jet_scalar::Order2<K>; K] = std::array::from_fn(|a| {
+        <crate::jet_scalar::Order2<K> as crate::jet_scalar::JetScalar<K>>::variable(base[a], a)
+    });
+    let s = prog.eval(row, &vars)?;
+    Ok((crate::jet_scalar::JetScalar::value(&s), s.g(), s.h()))
+}
+
+/// Derive the `row_third_contracted(dir)` channel `Σ_c ℓ_{abc} dir_c` from a
+/// [`RowProgram`] at the one-seed scalar [`crate::jet_scalar::OneSeed`], WITHOUT
+/// materialising the dense `t3`. Bit-identical to [`generic_third_contracted`].
+pub fn program_third_contracted<const K: usize, P: RowProgram<K> + ?Sized>(
+    prog: &P,
+    row: usize,
+    dir: &[f64; K],
+) -> Result<[[f64; K]; K], String> {
+    let base = prog.primaries(row)?;
+    let vars: [crate::jet_scalar::OneSeed<K>; K] =
+        std::array::from_fn(|a| crate::jet_scalar::OneSeed::seed_direction(base[a], a, dir[a]));
+    let s = prog.eval(row, &vars)?;
+    Ok(s.contracted_third())
+}
+
+/// Derive the `row_fourth_contracted(u, v)` channel `Σ_{cd} ℓ_{abcd} u_c v_d`
+/// from a [`RowProgram`] at the two-seed scalar [`crate::jet_scalar::TwoSeed`],
+/// WITHOUT materialising the dense `t4`. Bit-identical to
+/// [`generic_fourth_contracted`].
+pub fn program_fourth_contracted<const K: usize, P: RowProgram<K> + ?Sized>(
+    prog: &P,
+    row: usize,
+    dir_u: &[f64; K],
+    dir_v: &[f64; K],
+) -> Result<[[f64; K]; K], String> {
+    let base = prog.primaries(row)?;
+    let vars: [crate::jet_scalar::TwoSeed<K>; K] =
+        std::array::from_fn(|a| crate::jet_scalar::TwoSeed::seed(base[a], a, dir_u[a], dir_v[a]));
+    let s = prog.eval(row, &vars)?;
+    Ok(s.contracted_fourth())
+}
+
+/// Derive every channel `(v, g, h, t3, t4)` in one pass from a [`RowProgram`] at
+/// the full dense [`Tower4`] scalar — the seam that absorbs the
+/// `Tower4`-specialised [`RowNllProgram`] (that trait is this one at
+/// `S = Tower4`). Bit-identical to [`generic_full_tower`].
+pub fn program_full_tower<const K: usize, P: RowProgram<K> + ?Sized>(
+    prog: &P,
+    row: usize,
+) -> Result<Tower4<K>, String> {
+    let base = prog.primaries(row)?;
+    let vars: [Tower4<K>; K] = std::array::from_fn(|a| Tower4::variable(base[a], a));
+    prog.eval(row, &vars)
+}
+
 // ── The RowJet bridge: one row-NLL body over scalar jets AND lane towers ─
 //
 // `JetScalar<K>` (jet_scalar.rs) abstracts the SCALAR jets — its `value()`
