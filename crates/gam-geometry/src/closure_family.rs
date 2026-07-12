@@ -97,6 +97,15 @@ impl ClosureFamily {
                 "closure-family window must be finite and positive; got {window}"
             ));
         }
+        if harmonics
+            .checked_mul(2)
+            .and_then(|pairs| pairs.checked_add(1))
+            .is_none()
+        {
+            return Err(format!(
+                "closure-family harmonic count {harmonics} overflows the raw basis dimension"
+            ));
+        }
         Ok(Self { harmonics, window })
     }
 
@@ -455,7 +464,15 @@ fn chi2_1_quantile(level: f64) -> f64 {
 /// nuisance `θ` and `λ_smooth` already optimised at each γ — the issue's
 /// requirement that γ and λ_smooth are confounded and must both be profiled).
 /// The grid must be sorted ascending in γ and lie in `[0, 1]`.
-pub fn profile_ci_from_grid(grid: &[(f64, f64)], level: f64) -> Result<ClosureProfileCi, String> {
+/// `interval_boundary_support_collapsed` is an independent rank/effective-range
+/// diagnostic at `γ = 0`: collapse cannot be inferred from the scalar profile
+/// values, because an ordinary regular one-sided optimum has the same monotone
+/// score shape.
+pub fn profile_ci_from_grid(
+    grid: &[(f64, f64)],
+    level: f64,
+    interval_boundary_support_collapsed: bool,
+) -> Result<ClosureProfileCi, String> {
     if grid.len() < 2 {
         return Err("closure profile CI needs at least two grid points".into());
     }
@@ -538,14 +555,7 @@ pub fn profile_ci_from_grid(grid: &[(f64, f64)], level: f64) -> Result<ClosurePr
 
     let ci_includes_circle = ci_hi >= 1.0 - 1e-9;
     let ci_includes_interval = ci_lo <= 1e-9;
-    // Singular boundary: γ̂ at the floor AND the profile is flat-to-worse toward
-    // the interior (the support-collapse signature — the family cannot improve
-    // by opening up, so it wants to keep collapsing past γ = 0).
-    let singular_boundary = gamma_hat <= 1e-9 && {
-        // first interior point not better than the boundary by more than noise
-        let interior = grid.iter().find(|&&(g, _)| g > 1e-9);
-        interior.map(|&(_, v)| v >= v_min - 1e-9).unwrap_or(false)
-    };
+    let singular_boundary = gamma_hat <= 1e-9 && interval_boundary_support_collapsed;
 
     Ok(ClosureProfileCi {
         gamma_hat,
@@ -695,6 +705,7 @@ mod tests {
                 "invalid window {window} was accepted"
             );
         }
+        assert!(ClosureFamily::new(usize::MAX, 1.0).is_err());
     }
 
     /// The analytic γ-jet of the basis matches a central finite difference at
@@ -775,7 +786,7 @@ mod tests {
             .map(|k| k as f64 / 100.0)
             .map(|g| (g, v(g)))
             .collect();
-        let ci = profile_ci_from_grid(&grid, 0.95).unwrap();
+        let ci = profile_ci_from_grid(&grid, 0.95, false).unwrap();
         assert!((ci.gamma_hat - 0.6).abs() < 0.02, "γ̂ {}", ci.gamma_hat);
         assert!(!ci.ci_includes_circle, "CI hi {}", ci.ci_hi);
         assert!(!ci.ci_includes_interval, "CI lo {}", ci.ci_lo);
@@ -794,7 +805,7 @@ mod tests {
             .map(|k| k as f64 / 100.0)
             .map(|g| (g, v(g)))
             .collect();
-        let ci = profile_ci_from_grid(&grid, 0.95).unwrap();
+        let ci = profile_ci_from_grid(&grid, 0.95, false).unwrap();
         assert!(ci.ci_includes_circle);
         assert!(!ci.singular_boundary);
     }
@@ -819,7 +830,7 @@ mod tests {
             .map(|k| k as f64 / 100.0)
             .map(|g| (g, v(g)))
             .collect();
-        let ci = profile_ci_from_grid(&grid, 0.95).unwrap();
+        let ci = profile_ci_from_grid(&grid, 0.95, false).unwrap();
         assert!((ci.gamma_hat - 0.6).abs() < 0.02, "γ̂ {}", ci.gamma_hat);
         // The disjoint dip near γ = 0.2 must not be unioned in: γ = 0.4 (well
         // above threshold, V=110) sits between it and γ̂ and must be rejected.
@@ -836,8 +847,9 @@ mod tests {
         );
     }
 
-    /// A profile that keeps improving toward γ = 0 with the floor as the
-    /// minimiser flags the singular boundary for the mixture-rung handoff.
+    /// A profile that keeps improving toward γ = 0 is not by itself evidence of
+    /// support collapse: a separate effective-range diagnostic distinguishes a
+    /// regular one-sided optimum from the singular mixture-rung handoff.
     #[test]
     fn profile_flags_singular_boundary() {
         let v = |g: f64| 10.0 + 20.0 * g; // monotone increasing ⇒ min at 0, interior worse
@@ -845,10 +857,32 @@ mod tests {
             .map(|k| k as f64 / 100.0)
             .map(|g| (g, v(g)))
             .collect();
-        let ci = profile_ci_from_grid(&grid, 0.95).unwrap();
+        let regular_ci = profile_ci_from_grid(&grid, 0.95, false).unwrap();
+        assert!(!regular_ci.singular_boundary);
+
+        let ci = profile_ci_from_grid(&grid, 0.95, true).unwrap();
         assert!((ci.gamma_hat).abs() < 1e-9);
         assert!(ci.singular_boundary);
         assert!(ci.ci_includes_interval);
+    }
+
+    #[test]
+    fn profile_grid_contract_is_enforced() {
+        for (grid, level) in [
+            (vec![(0.0, 1.0), (1.0, 2.0)], 0.0),
+            (vec![(0.0, 1.0), (1.0, 2.0)], 1.0),
+            (vec![(0.0, 1.0), (1.0, 2.0)], f64::NAN),
+            (vec![(-0.1, 1.0), (1.0, 2.0)], 0.95),
+            (vec![(0.0, 1.0), (1.1, 2.0)], 0.95),
+            (vec![(0.5, 1.0), (0.4, 2.0)], 0.95),
+            (vec![(0.5, 1.0), (0.5, 2.0)], 0.95),
+            (vec![(0.0, f64::NAN), (1.0, 2.0)], 0.95),
+        ] {
+            assert!(
+                profile_ci_from_grid(&grid, level, false).is_err(),
+                "invalid profile contract was accepted: grid={grid:?}, level={level}"
+            );
+        }
     }
 
     /// χ²₁ quantile sanity: the 95% point is ≈ 3.841.

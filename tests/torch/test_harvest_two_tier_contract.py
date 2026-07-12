@@ -24,8 +24,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from gamfit.torch.distributed_reduce import TreeReducer, build_reduction_tree
-from gamfit.torch.harvest_contract import (
+from gamfit.torch.distributed_reduce import (  # noqa: E402
+    TreeReducer,
+    build_reduction_tree,
+)
+from gamfit.torch.harvest_contract import (  # noqa: E402
     HarvestedRow,
     MetricConsumerContract,
     metric_quadratic_form,
