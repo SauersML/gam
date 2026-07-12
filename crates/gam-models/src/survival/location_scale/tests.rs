@@ -6233,7 +6233,7 @@ fn positive_log_cumulative_hazard_maps_to_baseline_cloglog_survival() {
 #[test]
 fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
     use gam_math::jet_scalar::JetScalar;
-    use gam_math::jet_tower::{RowNllProgramGeneric, generic_row_kernel};
+    use gam_math::jet_tower::{RowProgram, program_row_kernel};
 
     const PW: usize = 2;
     const KW: usize = SLS_ROW_K + PW; // 9 base channels + 2 wiggle amplitudes
@@ -6253,7 +6253,7 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
         d: f64,
         p: [f64; KW],
     }
-    impl RowNllProgramGeneric<KW> for WiggleProg {
+    impl RowProgram<KW> for WiggleProg {
         fn n_rows(&self) -> usize {
             1
         }
@@ -6263,7 +6263,7 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
             }
             Ok(self.p)
         }
-        fn row_nll_generic<S: JetScalar<KW>>(&self, row: usize, p: &[S; KW]) -> Result<S, String> {
+        fn eval<S: JetScalar<KW>>(&self, row: usize, p: &[S; KW]) -> Result<S, String> {
             if row != 0 {
                 return Err(format!("wiggle program: row {row} out of range"));
             }
@@ -6344,7 +6344,7 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
     ] {
         let link = residual_distribution_inverse_link(distribution);
         let value = |p: [f64; KW]| -> f64 {
-            generic_row_kernel(
+            program_row_kernel(
                 &WiggleProg {
                     link: link.clone(),
                     w: 1.0,
@@ -6356,7 +6356,7 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
             .expect("wiggle program value")
             .0
         };
-        let h_jet = generic_row_kernel(
+        let h_jet = program_row_kernel(
             &WiggleProg {
                 link: link.clone(),
                 w: 1.0,
