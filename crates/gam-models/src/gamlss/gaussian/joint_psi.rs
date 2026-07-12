@@ -14,7 +14,7 @@ use gam_row_macros::row_atom;
 // expression retains the production extreme-value semantics while build-time
 // differentiation emits exact observed H, contracted t3, and contracted t4.
 row_atom! {
-    fn gaussian_normalized_row [order2, third, fourth](
+    fn gaussian_normalized_row [generic, order2, third, fourth](
         delta_mu,
         delta_eta;
         obs_weight,
@@ -446,6 +446,62 @@ pub struct GaussianJointRowScalars {
     /// κ'' = κ(1−κ)(1−2κ); appears in d²H_{ls,ls} via the second
     /// η-derivative of κ'·(a−n).
     pub(crate) kappa_dprime: Array1<f64>,
+}
+
+/// Production [`gam_math::jet_tower::RowProgram`] for the normalized Gaussian
+/// location-scale row NLL.
+///
+/// The program borrows the exact certified row constants consumed by the live
+/// observed-Hessian and directional-weight paths. Its generic evaluator and
+/// those specialized order-2/third/fourth paths are emitted from the same
+/// [`gaussian_normalized_row`] declaration, so the parity oracle cannot retain
+/// an independent copy of the likelihood expression.
+pub struct GaussianJointRowProgram<'a> {
+    rows: &'a GaussianJointRowScalars,
+}
+
+impl<'a> GaussianJointRowProgram<'a> {
+    /// Bind the generic row program to one certified production scalar batch.
+    pub fn new(rows: &'a GaussianJointRowScalars) -> Self {
+        Self { rows }
+    }
+
+    fn require_row(&self, row: usize) -> Result<(), String> {
+        if row >= self.rows.obs_weight.len() {
+            return Err(format!(
+                "GaussianJointRowProgram row {row} out of range for {} rows",
+                self.rows.obs_weight.len()
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl gam_math::jet_tower::RowProgram<2> for GaussianJointRowProgram<'_> {
+    fn n_rows(&self) -> usize {
+        self.rows.obs_weight.len()
+    }
+
+    fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
+        self.require_row(row)?;
+        Ok([0.0, 0.0])
+    }
+
+    fn eval<S: gam_math::jet_scalar::JetScalar<2>>(
+        &self,
+        row: usize,
+        p: &[S; 2],
+    ) -> Result<S, String> {
+        self.require_row(row)?;
+        Ok(gaussian_normalized_row(
+            &p[0],
+            &p[1],
+            self.rows.obs_weight[row],
+            self.rows.standardized_residual[row],
+            self.rows.inv_sigma[row],
+            self.rows.kappa[row],
+        ))
+    }
 }
 
 pub(crate) struct GaussianJointPsiFirstWeights {
@@ -1558,45 +1614,7 @@ mod observed_single_source_oracle_tests {
     /// gap that the gam-math gaulss oracle covered only value/∇/observed-H.
     mod jet_third_fourth_oracle {
         use super::*;
-        use gam_math::jet_scalar::JetScalar;
-        use gam_math::jet_tower::{
-            RowProgram, program_fourth_contracted, program_third_contracted,
-        };
-
-        /// The gaulss row NLL `ℓ = a·ln σ + ½·a·(y−η_μ)²/σ²` in the PRODUCTION
-        /// log-b σ-link `σ = LOGB_SIGMA_FLOOR + e^{η_ls}`, written ONCE through the
-        /// jet scalar. Primary 0 = η_μ, primary 1 = η_ls.
-        struct GaulssJetRow {
-            y: f64,
-            eta_mu: f64,
-            eta_ls: f64,
-            a: f64,
-        }
-
-        impl RowProgram<2> for GaulssJetRow {
-            fn n_rows(&self) -> usize {
-                1
-            }
-            fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
-                if row != 0 {
-                    return Err(format!("GaulssJetRow holds exactly one row; got row {row}"));
-                }
-                Ok([self.eta_mu, self.eta_ls])
-            }
-            fn eval<S: JetScalar<2>>(&self, row: usize, p: &[S; 2]) -> Result<S, String> {
-                if row != 0 {
-                    return Err(format!("GaulssJetRow holds exactly one row; got row {row}"));
-                }
-                let sigma = p[1]
-                    .exp()
-                    .add(&S::constant(crate::sigma_link::LOGB_SIGMA_FLOOR));
-                let r = S::constant(self.y).sub(&p[0]);
-                let log_term = sigma.ln().scale(self.a);
-                let r_over_sigma = r.mul(&sigma.recip());
-                let quad = r_over_sigma.mul(&r_over_sigma).scale(0.5 * self.a);
-                Ok(log_term.add(&quad))
-            }
-        }
+        use gam_math::jet_tower::{program_fourth_contracted, program_third_contracted};
 
         fn close(hand: f64, jet: f64, label: &str) {
             let band = 1e-9 + 1e-9 * hand.abs().max(jet.abs());
@@ -1623,12 +1641,7 @@ mod observed_single_source_oracle_tests {
                         .expect("row scalars");
                 let (w_u, c_u, d_u) =
                     gaussian_joint_first_directionalweights(&rows, &array![xi_mu], &array![xi_ls]);
-                let prog = GaulssJetRow {
-                    y,
-                    eta_mu: mu,
-                    eta_ls,
-                    a,
-                };
+                let prog = crate::gamlss::GaussianJointRowProgram::new(&rows);
                 let jt = program_third_contracted(&prog, 0, &[xi_mu, xi_ls]).expect("jet third");
                 close(w_u[0], jt[0][0], &format!("dH_μμ μ={mu} η={eta_ls}"));
                 close(c_u[0], jt[0][1], &format!("dH_μls μ={mu} η={eta_ls}"));
@@ -1661,12 +1674,7 @@ mod observed_single_source_oracle_tests {
                     &array![xi_mu_v],
                     &array![xi_ls_v],
                 );
-                let prog = GaulssJetRow {
-                    y,
-                    eta_mu: mu,
-                    eta_ls,
-                    a,
-                };
+                let prog = crate::gamlss::GaussianJointRowProgram::new(&rows);
                 let jt =
                     program_fourth_contracted(&prog, 0, &[xi_mu_u, xi_ls_u], &[xi_mu_v, xi_ls_v])
                         .expect("jet fourth");
