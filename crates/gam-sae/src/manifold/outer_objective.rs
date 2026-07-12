@@ -2893,6 +2893,7 @@ impl SaeManifoldOuterObjective {
             // ever certifying the point. Genuine defects still propagate.
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                 self.probe_telemetry.record_refusal_kind(&err);
+                log::debug!("SAE criterion eval mapped refusal to +inf: {err}");
                 self.probe_telemetry.infeasible_criterion_evals += 1;
                 self.current_rho = rho;
                 return Ok(infeasible_evaluation(
@@ -3726,6 +3727,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // infeasible result; no finite pseudo-objective is introduced.
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                 self.probe_telemetry.record_refusal_kind(&err);
+                log::debug!("SAE criterion eval mapped refusal to +inf: {err}");
                 self.probe_telemetry.infeasible_criterion_evals += 1;
                 Ok(f64::INFINITY)
             }
@@ -3763,6 +3765,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // infeasible evaluation, never a finite surrogate value.
                 Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                     self.probe_telemetry.record_refusal_kind(&err);
+                log::debug!("SAE criterion eval mapped refusal to +inf: {err}");
                     self.probe_telemetry.infeasible_criterion_evals += 1;
                     return Ok(OuterEval::infeasible(rho.len()));
                 }
@@ -3821,6 +3824,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     Ok(_) => {}
                     Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                         self.probe_telemetry.record_refusal_kind(&err);
+                log::debug!("SAE criterion eval mapped refusal to +inf: {err}");
                         self.probe_telemetry.infeasible_criterion_evals += 1;
                         return Ok(OuterEval::infeasible(rho.len()));
                     }
@@ -3903,6 +3907,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // evaluation defects still hard-error below.
             Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                 self.probe_telemetry.record_refusal_kind(&err);
+                log::debug!("SAE criterion eval mapped refusal to +inf: {err}");
                 self.probe_telemetry.infeasible_criterion_evals += 1;
                 return Ok(OuterEval::infeasible(rho.len()));
             }
@@ -4026,6 +4031,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                     // no derivative.
                     Err(err) if Self::is_recoverable_value_probe_refusal(&err) => {
                         self.probe_telemetry.record_refusal_kind(&err);
+                log::debug!("SAE criterion eval mapped refusal to +inf: {err}");
                         self.probe_telemetry.infeasible_criterion_evals += 1;
                         // A reactive waypoint is a typed domain transaction,
                         // not an opaque line-search comparison. Preserve the
