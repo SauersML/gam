@@ -141,7 +141,6 @@ def _sae_fit_worker(
     seed,
     n_iter,
     separation_barrier_strength,
-    ordered_beta_bernoulli_alpha,
 ):
     """TOP-LEVEL (picklable) worker: fit + reconstruct in a child process.
 
@@ -158,22 +157,19 @@ def _sae_fit_worker(
         K=k,
         d_atom=1,
         atom_topology=topology,  # "circle" (curved) or "linear" (true rank-1 affine lane)
-        assignment="ordered_beta_bernoulli",
         n_iter=n_iter,
         random_state=seed,
         separation_barrier_strength=separation_barrier_strength,
-        ordered_beta_bernoulli_alpha=ordered_beta_bernoulli_alpha,
-        # This is a fixed-K EV-vs-K sweep: fit exactly `k` atoms and stop.
-        # The default bundled pipeline additionally runs a topology race
-        # (run_structure_search), residual-promotion, and TWO structured-whitening
+        # This is a fixed-K EV-vs-K sweep on the SHIPPED default fit path: fit
+        # exactly `k` atoms and stop. The default bundled pipeline additionally
+        # runs a topology race (run_structure_search) and TWO structured-whitening
         # residual passes (structured_residual_passes, default 2) — each re-running
         # the whole outer rho search from scratch — which is what pushed this
         # example past the 900s budget (gh#2267) while adding atoms the sweep does
-        # not want. Disable all three to take the genuinely unbundled direct path
-        # (structured_residual_passes=0 is the load-bearing one; the two passes are
-        # NOT reachable via run_structure_search/promote_from_residual alone).
+        # not want. Disable both to take the genuinely unbundled direct path
+        # (structured_residual_passes=0 is the load-bearing one — the two passes
+        # are NOT reachable via run_structure_search alone).
         run_structure_search=False,
-        promote_from_residual=False,
         structured_residual_passes=0,
     )
     fit_seconds = time.perf_counter() - fit_started
@@ -215,7 +211,6 @@ def _fit_ev(
     seed: int,
     n_iter: int,
     separation_barrier_strength: float | None,
-    ordered_beta_bernoulli_alpha: float | None,
 ) -> tuple[float, float, float, dict | None, list[str]]:
     """Fit one dictionary through the production engine; return HELD-OUT EV.
 
@@ -238,7 +233,6 @@ def _fit_ev(
             seed,
             n_iter,
             separation_barrier_strength,
-            ordered_beta_bernoulli_alpha,
         ).result()
     finally:
         executor.shutdown(wait=False)
@@ -390,22 +384,10 @@ def main() -> None:
         default=None,
         help="per-fit decoder-repulsion strength (default: evidence-derived)",
     )
-    ap.add_argument(
-        "--ordered-beta-alpha",
-        dest="ordered_beta_bernoulli_alpha",
-        type=float,
-        default=None,
-        help="per-fit ordered independent Beta--Bernoulli concentration",
-    )
     args = ap.parse_args()
 
     if args.sep_mu is not None:
         print(f"[barrier] sep_mu={args.sep_mu}", flush=True)
-    if args.ordered_beta_bernoulli_alpha is not None:
-        print(
-            f"[ordered_beta_bernoulli] alpha={args.ordered_beta_bernoulli_alpha}",
-            flush=True,
-        )
 
     x = _load_activations(args)
     rng = np.random.default_rng(args.seed)
@@ -449,7 +431,6 @@ def main() -> None:
             args.seed,
             args.n_iter,
             args.sep_mu,
-            args.ordered_beta_bernoulli_alpha,
         )
         # The pure-linear comparison arm rides a separate basis lane whose OOS /
         # basis_with_jet plumbing can error independently of the curved arm (e.g.
@@ -465,7 +446,6 @@ def main() -> None:
                 args.seed,
                 args.n_iter,
                 args.sep_mu,
-                args.ordered_beta_bernoulli_alpha,
             )
         except Exception as exc:  # noqa: BLE001 — arm-isolated, reported honestly
             print(f"[linear K={k}] arm failed, reporting NaN: {exc}", flush=True)

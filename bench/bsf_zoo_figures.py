@@ -260,6 +260,11 @@ def _atlas_cloud_records(
             raise ValueError("joint fit must use one shared atom bank of size eight")
         if fit_config.get("top_k") != data_config.get("l0"):
             raise ValueError("joint fit Top-K must match the planted row support")
+        if meta.get("matching") != "hungarian-exact-one-to-one":
+            raise ValueError("joint fit must use exact one-to-one atom/factor matching")
+        if meta.get("n_unique_matched_atoms") != len(ATLAS_KINDS):
+            raise ValueError("joint fit has collapsed or unmatched atoms")
+        matched_atoms: set[int] = set()
         for factor in meta["factors"]:
             kind = str(factor["kind"])
             if kind not in ATLAS_KINDS:
@@ -267,6 +272,10 @@ def _atlas_cloud_records(
             if kind in records:
                 raise ValueError(f"joint cloud file contains duplicate kind {kind}")
             index = int(factor["factor"])
+            matched_atom = int(factor["matched_atom"])
+            if matched_atom in matched_atoms:
+                raise ValueError(f"joint cloud file reuses learned atom {matched_atom}")
+            matched_atoms.add(matched_atom)
             records[kind] = {
                 "path": path,
                 "true": np.asarray(store[f"true_{index}"], dtype=float),

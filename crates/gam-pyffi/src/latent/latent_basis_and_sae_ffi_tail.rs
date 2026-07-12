@@ -53,7 +53,6 @@ fn sae_manifold_fit_minimal<'py>(
     // Bundled-pipeline stage toggles (#2267) forwarded to `sae_manifold_fit_inner`.
     run_structure_search: bool,
     structured_residual_passes: Option<usize>,
-    ordered_beta_bernoulli_alpha_override: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
     // Convert borrowed Python arrays into the typed library seed request.
     let assignment_kind = canonicalize_assignment_kind(&assignment_kind).map_err(py_value_error)?;
@@ -129,7 +128,6 @@ fn sae_manifold_fit_minimal<'py>(
         promote_from_residual,
         run_structure_search,
         structured_residual_passes,
-        ordered_beta_bernoulli_alpha_override,
     )?;
     // Post-search atom plans are emitted by the shared fit entry from the final
     // variable-K dictionary; the minimal binding never patches the payload.
@@ -352,7 +350,6 @@ fn public_fit_penalties(
     promote_from_residual=true,
     run_structure_search=true,
     structured_residual_passes=None,
-    ordered_beta_bernoulli_alpha_override=None,
 ))]
 // No #[allow(clippy::too_many_arguments)]: this is the flat `#[pyfunction]`
 // kwarg surface Python calls by name (mirroring `sae_manifold_fit_minimal`
@@ -397,7 +394,6 @@ fn sae_manifold_fit_model<'py>(
     promote_from_residual: bool,
     run_structure_search: bool,
     structured_residual_passes: Option<usize>,
-    ordered_beta_bernoulli_alpha_override: Option<f64>,
 ) -> PyResult<Py<crate::ManifoldSaeCore>> {
     if k_atoms == 0 {
         return Err(py_value_error(
@@ -524,7 +520,6 @@ fn sae_manifold_fit_model<'py>(
         promote_from_residual,
         run_structure_search,
         structured_residual_passes,
-        ordered_beta_bernoulli_alpha_override,
     )?;
     let raw = crate::manifold::manifold_sae_coercion::py_any_to_json_value(raw.bind(py).as_any())?;
     let fisher_nested = fisher_factors.map(|array| {

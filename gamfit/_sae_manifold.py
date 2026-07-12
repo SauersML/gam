@@ -164,7 +164,6 @@ def sae_manifold_fit(
     promote_from_residual: bool = True,
     run_structure_search: bool = True,
     structured_residual_passes: int | None = None,
-    ordered_beta_bernoulli_alpha: float | None = None,
 ) -> ManifoldSAE:
     """Fit and return the immutable Rust-owned manifold-SAE model.
 
@@ -232,9 +231,6 @@ def sae_manifold_fit(
         run_structure_search=bool(run_structure_search),
         structured_residual_passes=(
             None if structured_residual_passes is None else int(structured_residual_passes)
-        ),
-        ordered_beta_bernoulli_alpha_override=(
-            None if ordered_beta_bernoulli_alpha is None else float(ordered_beta_bernoulli_alpha)
         ),
     )
 

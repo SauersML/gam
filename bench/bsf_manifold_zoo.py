@@ -25,12 +25,12 @@ normalization and the clean, noise-free mixtures) and scores:
 * ``oracle``     -- per-row least squares on the TRUE active subspaces (the
   recovery ceiling, their protocol).
 
-Scoring follows their protocol: each factor is matched to the single atom whose
-firing best predicts the factor's presence (point-biserial correlation of
-|gate| against the active mask over held-out rows), and the matched atom ALONE
-reconstructs the factor's per-row contribution; we report per-factor R^2 on the
-rows where the factor is active. On top we report the two currencies the paper
-argues from:
+Scoring follows their protocol: factors and atoms receive the exact optimal
+one-to-one Hungarian match by point-biserial correlation of |gate| against the
+held-out active masks. The matched atom ALONE reconstructs the factor's per-row
+contribution; we report per-factor R^2 on the rows where the factor is active.
+This prevents a collapsed dictionary from claiming several planted factors
+with the same atom. On top we report the two currencies the paper argues from:
 
 * Description length (their Eq. 4, uniform across featurizers): support bits
   ``log2 C(G, L0)`` + water-filled code bits from the per-atom active-code
@@ -48,12 +48,12 @@ hue for the figure gallery (``bench/bsf_zoo_figures.py``).
 
 Paper-matched invocation (their toy: M=128, d=128, L0=4, N=3e5):
 
-    python3 bsf_manifold_zoo.py --factors 128 --ambient 128 --l0 4 \
+    python3 -m bench.bsf_manifold_zoo --factors 128 --ambient 128 --l0 4 \
         --n-train 300000 --n-test 100000 --featurizers ours_rust,flat,oracle
 
 Local smoke:
 
-    python3 bsf_manifold_zoo.py --factors 12 --ambient 48 --l0 3 \
+    python3 -m bench.bsf_manifold_zoo --factors 12 --ambient 48 --l0 3 \
         --n-train 6000 --n-test 3000 --atoms 12 --featurizers ours_rust,flat,oracle
 """
 
@@ -68,6 +68,7 @@ from typing import Any, Callable
 
 import numpy as np
 
+from bench._synth_sae_metrics import _hungarian_max_numpy
 from gamfit._description_length import FittedFeaturizer, description_length
 
 # --------------------------------------------------------------------------- #
@@ -375,7 +376,7 @@ def _fit_flat_topk(
     """The TopK SAE contrast (bench/synth_sae_compare.TopKSAE recipe)."""
     import torch
 
-    from synth_sae_compare import TopKSAE
+    from bench.synth_sae_compare import TopKSAE
 
     torch.manual_seed(seed)
     model = TopKSAE(train_x.shape[1], width, k, seed).to(device)
@@ -549,7 +550,22 @@ def score_recovery(
     """Per-factor contribution R^2 under their block<->factor matching."""
     per_factor: list[dict[str, Any]] = []
     corr = _point_biserial_matrix(fitted.gate, active)  # (M, G)
-    matched_atoms = np.argmax(np.abs(corr), axis=1)
+    matched_atoms: np.ndarray | None = None
+    matching = "flat-greedy-multi-atom"
+    if not flat_multi_atom:
+        if fitted.gate.shape[1] < data.m_factors:
+            raise ValueError(
+                "one-to-one recovery requires at least as many learned atoms as "
+                f"planted factors; got {fitted.gate.shape[1]} < {data.m_factors}"
+            )
+        factor_rows, atom_columns = _hungarian_max_numpy(np.abs(corr))
+        if factor_rows.size != data.m_factors:
+            raise RuntimeError(
+                "exact atom/factor matching did not cover every planted factor"
+            )
+        matched_atoms = np.full(data.m_factors, -1, dtype=int)
+        matched_atoms[factor_rows] = atom_columns
+        matching = "hungarian-exact-one-to-one"
     contrib_cache: dict[int, np.ndarray] = {}
     for i, factor in enumerate(data.factors):
         rows = contribs[i]["rows"]
@@ -563,6 +579,7 @@ def score_recovery(
             atom_label: Any = chosen
             active_coords = len(chosen)
         else:
+            assert matched_atoms is not None
             g = int(matched_atoms[i])
             if g not in contrib_cache:
                 contrib_cache[g] = fitted.atom_contribution(g)
@@ -588,6 +605,14 @@ def score_recovery(
         by_kind[kind] = float(np.mean([p["r2"] for p in per_factor if p["kind"] == kind]))
     return {
         "per_factor": per_factor,
+        "matching": matching,
+        "n_unique_matched_atoms": len(
+            {
+                int(p["matched_atom"])
+                for p in per_factor
+                if not isinstance(p["matched_atom"], list)
+            }
+        ),
         "r2_mean": float(np.mean(r2s)) if r2s.size else float("nan"),
         "r2_by_kind": by_kind,
         "coords_per_activation_mean": float(
@@ -680,7 +705,14 @@ def dump_clouds(
         if fitted.atom_intrinsic_coords is not None and not isinstance(p["matched_atom"], list):
             coords = fitted.atom_intrinsic_coords(int(p["matched_atom"]))
             payload[f"learned_theta_{i}"] = np.asarray(coords)[rows][take].astype(np.float32)
-        meta.append({"factor": i, "kind": p["kind"], "r2": p["r2"]})
+        meta.append(
+            {
+                "factor": i,
+                "kind": p["kind"],
+                "matched_atom": p["matched_atom"],
+                "r2": p["r2"],
+            }
+        )
     payload["meta_json"] = np.frombuffer(
         json.dumps(
             {
@@ -695,6 +727,8 @@ def dump_clouds(
                     "kinds": data.kinds,
                     "dgp": data.dgp,
                 },
+                "matching": recovery["matching"],
+                "n_unique_matched_atoms": recovery["n_unique_matched_atoms"],
                 "factors": meta,
             }
         ).encode(),
@@ -875,6 +909,8 @@ def main() -> int:
             "fit_seconds": fitted.fit_seconds,
             "recovery_r2_mean": recovery["r2_mean"],
             "recovery_r2_by_kind": recovery["r2_by_kind"],
+            "matching": recovery["matching"],
+            "n_unique_matched_atoms": recovery["n_unique_matched_atoms"],
             "coords_per_activation_mean": recovery["coords_per_activation_mean"],
             "mdl": mdl,
             "dimensionality": dimensionality,
