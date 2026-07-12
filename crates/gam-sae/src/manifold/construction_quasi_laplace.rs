@@ -2228,7 +2228,7 @@ impl SaeManifoldTerm {
     ) -> Result<Vec<f64>, String> {
         rho.validate_log_strength_domain()?;
         let mut out = Vec::with_capacity(self.atoms.len());
-        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+        for atom in self.atoms.iter() {
             let rank_s = Self::symmetric_rank(&atom.smooth_penalty)?;
             let penalized_channel_dim = atom.border_frame_rank() * rank_s;
             out.push(0.5 * (penalized_channel_dim as f64));

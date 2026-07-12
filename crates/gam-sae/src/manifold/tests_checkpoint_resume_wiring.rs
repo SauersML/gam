@@ -128,7 +128,7 @@ fn checkpoint_banks_resumes_and_discards_across_objectives() {
 #[test]
 fn checkpoint_refuses_shape_compatible_out_of_domain_rho() {
     let salt = std::process::id() as u64 ^ 0xD0A1_0001;
-    let (mut writer, flat) = tiny_objective(salt);
+    let (writer, flat) = tiny_objective(salt);
     writer.remove_checkpoint();
     writer.bank_checkpoint(&flat);
 
