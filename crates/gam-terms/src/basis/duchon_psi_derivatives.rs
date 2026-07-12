@@ -237,7 +237,7 @@ pub(crate) fn duchon_regularized_operator_core(
         if *coeff == 0.0 {
             continue;
         }
-        let (q, t, t_r, t_rr) = duchon_polyharmonic_operator_block_jets(r_eval, m as f64, k_dim)?;
+        let (q, t, t_r, t_rr) = duchon_polyharmonic_operator_block_jets(r_eval, m, k_dim)?;
         q_sum.add(coeff * q);
         t_sum.add(coeff * t);
         t_r_sum.add(coeff * t_r);

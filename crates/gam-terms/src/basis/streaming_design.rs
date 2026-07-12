@@ -134,8 +134,7 @@ impl RadialScalarKind {
                     }
                     return Ok((phi, 0.0, 0.0));
                 }
-                let (q, t, _, _) =
-                    duchon_polyharmonic_operator_block_jets(r, *block_order as f64, *dim)?;
+                let (q, t, _, _) = duchon_polyharmonic_operator_block_jets(r, *block_order, *dim)?;
                 Ok((phi, q, t))
             }
             RadialScalarKind::ThinPlate { length_scale, dim } => {
