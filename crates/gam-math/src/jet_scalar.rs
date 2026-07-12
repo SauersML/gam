@@ -49,9 +49,9 @@
 //!
 //! # Production scalars and the test-only all-channels oracle
 //!
-//! The `JetScalar` trait below is production: it is the bound on
-//! [`crate::jet_tower::RowNllProgramGeneric::row_nll_generic`], the seam a family
-//! row loss is written against. The order-specific scalars that *consume* it —
+//! The `JetScalar` trait below is production: it is the bound on the canonical
+//! [`crate::jet_tower::RowProgram::eval`] seam a family row loss is written
+//! against. The order-specific scalars that *consume* it —
 //! [`Order2`] (value/grad/Hessian), [`OneSeed`] (contracted third) and
 //! [`TwoSeed`] (contracted fourth) — are production: the survival location-scale
 //! `RowKernel<9>` builds its joint Hessian / directional derivatives through them

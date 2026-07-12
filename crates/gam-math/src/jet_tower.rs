@@ -1836,128 +1836,12 @@ pub fn derived_fourth_contracted<const K: usize, P: RowNllProgram<K> + ?Sized>(
     Ok(evaluate_program(prog, row)?.fourth_contracted(dir_u, dir_v))
 }
 
-// ── The generic program seam (#932 scalar cutover) ───────────────────
-
-/// A family's row negative log-likelihood written ONCE over the generic
-/// [`crate::jet_scalar::JetScalar`] interface, so the SAME expression can be
-/// re-instantiated at whatever order / representation a consumer needs
-/// ([`crate::jet_scalar::Order2`] for `(v, g, H)`,
-/// [`crate::jet_scalar::OneSeed`] for the contracted third,
-/// [`crate::jet_scalar::TwoSeed`] for the contracted fourth, or the full
-/// [`Tower4`] for every channel at once).
-///
-/// This is additive to [`RowNllProgram`] (which is `Tower4`-specialised): a
-/// program implementing this generic trait gets the small contracted scalars for
-/// free, dissolving the dense-`Tower4<9>` cost objection in the location-scale
-/// gates (doc §A.4). An existing `Tower4`-only [`RowNllProgram`] continues to
-/// work unchanged; new families should prefer this generic trait.
-///
-/// Because a `Tower4`-specialised `row_nll` body uses only
-/// `add`/`sub`/`mul`/`scale`/`exp`/`ln`/… — all of which this trait also
-/// provides — the same body is expressible directly over `S: JetScalar<K>`.
-/// A program written that way needs no `Tower4`-specialised method and routes
-/// the directional and joint-Hessian gates through the contracted scalars from
-/// a single definition.
-pub trait RowNllProgramGeneric<const K: usize>: Send + Sync {
-    /// Number of observations the program covers.
-    fn n_rows(&self) -> usize;
-
-    /// Current primary-scalar values for `row` (where to seed the scalar).
-    fn primaries(&self, row: usize) -> Result<[f64; K], String>;
-
-    /// The row NLL evaluated on a generic jet scalar. `p[a]` arrives pre-seeded
-    /// (base value + per-scalar nilpotent directions) by the caller; the body
-    /// uses ONLY [`crate::jet_scalar::JetScalar`] ops and per-row data
-    /// (response, censoring, offsets) entering as constants.
-    fn row_nll_generic<S: crate::jet_scalar::JetScalar<K>>(
-        &self,
-        row: usize,
-        p: &[S; K],
-    ) -> Result<S, String>;
-}
-
-/// Evaluate a generic program at the value/gradient/Hessian scalar
-/// [`crate::jet_scalar::Order2`], returning `(nll, ∇, H)` — the
-/// `row_kernel` channel — WITHOUT materialising any third / fourth tensor.
-///
-/// This is the production seam for the inner-Newton `(v, g, H)` path: the row
-/// loss is written ONCE in `row_nll_generic`, and this routes it through the
-/// cheap order-2 scalar. The single source of truth means the gradient and
-/// Hessian cannot desync from the value (the #736 / #948 bug genus).
-pub fn generic_row_kernel<const K: usize, P: RowNllProgramGeneric<K> + ?Sized>(
-    prog: &P,
-    row: usize,
-) -> Result<(f64, [f64; K], [[f64; K]; K]), String> {
-    let base = prog.primaries(row)?;
-    let vars: [crate::jet_scalar::Order2<K>; K] = std::array::from_fn(|a| {
-        <crate::jet_scalar::Order2<K> as crate::jet_scalar::JetScalar<K>>::variable(base[a], a)
-    });
-    let s = prog.row_nll_generic(row, &vars)?;
-    Ok((crate::jet_scalar::JetScalar::value(&s), s.g(), s.h()))
-}
-
-/// Evaluate a generic program at the one-seed scalar
-/// [`crate::jet_scalar::OneSeed`], returning the contracted third
-/// `Σ_c ℓ_{abc} dir_c` — the `row_third_contracted(dir)` channel — WITHOUT
-/// materialising the dense `t3` tensor. The contraction direction is folded
-/// INTO the differentiation by the nilpotent ε seeded with `dir`.
-pub fn generic_third_contracted<const K: usize, P: RowNllProgramGeneric<K> + ?Sized>(
-    prog: &P,
-    row: usize,
-    dir: &[f64; K],
-) -> Result<[[f64; K]; K], String> {
-    let base = prog.primaries(row)?;
-    let vars: [crate::jet_scalar::OneSeed<K>; K] =
-        std::array::from_fn(|a| crate::jet_scalar::OneSeed::seed_direction(base[a], a, dir[a]));
-    let s = prog.row_nll_generic(row, &vars)?;
-    Ok(s.contracted_third())
-}
-
-/// Evaluate a generic program at the two-seed scalar
-/// [`crate::jet_scalar::TwoSeed`], returning the contracted fourth
-/// `Σ_{cd} ℓ_{abcd} u_c v_d` — the `row_fourth_contracted(u, v)` channel —
-/// WITHOUT materialising the dense `t4` tensor.
-pub fn generic_fourth_contracted<const K: usize, P: RowNllProgramGeneric<K> + ?Sized>(
-    prog: &P,
-    row: usize,
-    dir_u: &[f64; K],
-    dir_v: &[f64; K],
-) -> Result<[[f64; K]; K], String> {
-    let base = prog.primaries(row)?;
-    let vars: [crate::jet_scalar::TwoSeed<K>; K] =
-        std::array::from_fn(|a| crate::jet_scalar::TwoSeed::seed(base[a], a, dir_u[a], dir_v[a]));
-    let s = prog.row_nll_generic(row, &vars)?;
-    Ok(s.contracted_fourth())
-}
-
-/// Evaluate a generic program at the full dense [`Tower4`] scalar, returning
-/// every channel `(v, g, h, t3, t4)` in one pass. Used where the UNCONTRACTED
-/// third / fourth tensors are needed (the BMS rigid `third_full` / `fourth_full`
-/// caches): the dense tensors come from the SAME `row_nll_generic` expression
-/// the order-2 / contracted scalars consume, so there is a single source of
-/// truth across every channel.
-pub fn generic_full_tower<const K: usize, P: RowNllProgramGeneric<K> + ?Sized>(
-    prog: &P,
-    row: usize,
-) -> Result<Tower4<K>, String> {
-    let base = prog.primaries(row)?;
-    let vars: [Tower4<K>; K] = std::array::from_fn(|a| Tower4::variable(base[a], a));
-    prog.row_nll_generic(row, &vars)
-}
-
 // ── The canonical single-source seam (#932 consolidation) ────────────
 //
 // `RowProgram<K>` is the ONE row-program interface #932 converges every family
-// onto. Its shape is identical to [`RowNllProgramGeneric`] — `primaries` plus a
-// single `eval<S: JetScalar<K>>` body — which it renames (`row_nll_generic` →
-// `eval`) and supersedes; it also absorbs the `Tower4`-specialised
-// [`RowNllProgram`], which is just this trait instantiated at `S = Tower4`
-// ([`program_full_tower`]). Both legacy seams are being migrated onto this trait
-// and deleted once no impl remains (unify-deletes-legacy; #932 inc 3). The
-// `program_*` helpers below are the go-forward derivation surface, deriving each
-// `RowKernel` calculus channel from the ONE `eval` expression; they mirror the
-// `generic_*` helpers exactly (same jet arithmetic, bit-identical output) and
-// replace them as families migrate.
+// onto. Its generic `eval<S: JetScalar<K>>` body is the go-forward derivation
+// surface for every calculus channel; `program_*` selects only the derivative
+// representation each consumer needs.
 
 /// The single source of truth #932 asks for: a family's row negative
 /// log-likelihood written ONCE over the generic [`crate::jet_scalar::JetScalar`]
@@ -1983,17 +1867,13 @@ pub trait RowProgram<const K: usize>: Send + Sync {
     /// (base value + per-scalar nilpotent directions) by the caller; the body
     /// uses ONLY [`crate::jet_scalar::JetScalar`] ops and per-row data (response,
     /// censoring, offsets) entering as constants.
-    fn eval<S: crate::jet_scalar::JetScalar<K>>(
-        &self,
-        row: usize,
-        p: &[S; K],
-    ) -> Result<S, String>;
+    fn eval<S: crate::jet_scalar::JetScalar<K>>(&self, row: usize, p: &[S; K])
+    -> Result<S, String>;
 }
 
 /// Derive the `row_kernel` channel `(nll, ∇, H)` from a [`RowProgram`] at the
 /// value/gradient/Hessian scalar [`crate::jet_scalar::Order2`], WITHOUT
-/// materialising any third / fourth tensor. Bit-identical to the legacy
-/// [`generic_row_kernel`] (same order-2 jet arithmetic).
+/// materialising any third / fourth tensor.
 pub fn program_row_kernel<const K: usize, P: RowProgram<K> + ?Sized>(
     prog: &P,
     row: usize,
@@ -2008,7 +1888,7 @@ pub fn program_row_kernel<const K: usize, P: RowProgram<K> + ?Sized>(
 
 /// Derive the `row_third_contracted(dir)` channel `Σ_c ℓ_{abc} dir_c` from a
 /// [`RowProgram`] at the one-seed scalar [`crate::jet_scalar::OneSeed`], WITHOUT
-/// materialising the dense `t3`. Bit-identical to [`generic_third_contracted`].
+/// materialising the dense `t3`.
 pub fn program_third_contracted<const K: usize, P: RowProgram<K> + ?Sized>(
     prog: &P,
     row: usize,
@@ -2023,8 +1903,7 @@ pub fn program_third_contracted<const K: usize, P: RowProgram<K> + ?Sized>(
 
 /// Derive the `row_fourth_contracted(u, v)` channel `Σ_{cd} ℓ_{abcd} u_c v_d`
 /// from a [`RowProgram`] at the two-seed scalar [`crate::jet_scalar::TwoSeed`],
-/// WITHOUT materialising the dense `t4`. Bit-identical to
-/// [`generic_fourth_contracted`].
+/// WITHOUT materialising the dense `t4`.
 pub fn program_fourth_contracted<const K: usize, P: RowProgram<K> + ?Sized>(
     prog: &P,
     row: usize,
@@ -2039,9 +1918,7 @@ pub fn program_fourth_contracted<const K: usize, P: RowProgram<K> + ?Sized>(
 }
 
 /// Derive every channel `(v, g, h, t3, t4)` in one pass from a [`RowProgram`] at
-/// the full dense [`Tower4`] scalar — the seam that absorbs the
-/// `Tower4`-specialised [`RowNllProgram`] (that trait is this one at
-/// `S = Tower4`). Bit-identical to [`generic_full_tower`].
+/// the full dense [`Tower4`] scalar.
 pub fn program_full_tower<const K: usize, P: RowProgram<K> + ?Sized>(
     prog: &P,
     row: usize,
@@ -2515,8 +2392,7 @@ impl<const K: usize> RowJet<K> for Tower3Lane<wide::f64x4, K> {
 /// A family's row negative log-likelihood written ONCE over the [`RowJet`]
 /// bridge, so the SAME body instantiates at the scalar jets (for the `(v, g, H)`
 /// and contracted-tensor channels) AND at the `f64x4` lane towers (for the
-/// 4-rows-per-pass SIMD batch). This is the lane-capable successor to
-/// [`RowNllProgramGeneric`]: a body written here gets the scalar channels through
+/// 4-rows-per-pass SIMD batch). A body written here gets the scalar channels through
 /// [`rowjet_row_kernel`] / [`rowjet_third_contracted`] / [`rowjet_fourth_contracted`]
 /// and the batched channels through [`generic_batched_fourth_tower`] /
 /// [`generic_batched_third_tower`], all from a single source.
@@ -2536,8 +2412,7 @@ pub trait RowNllProgramRowJet<const K: usize>: Send + Sync {
 }
 
 /// Evaluate a [`RowNllProgramRowJet`] at the value/gradient/Hessian scalar
-/// [`crate::jet_scalar::Order2`] (the `(v, g, H)` inner-Newton channel) — the
-/// `RowJet` twin of [`generic_row_kernel`].
+/// [`crate::jet_scalar::Order2`] (the `(v, g, H)` inner-Newton channel).
 pub fn rowjet_row_kernel<const K: usize, P: RowNllProgramRowJet<K> + ?Sized>(
     prog: &P,
     row: usize,
@@ -2551,7 +2426,7 @@ pub fn rowjet_row_kernel<const K: usize, P: RowNllProgramRowJet<K> + ?Sized>(
 
 /// Evaluate a [`RowNllProgramRowJet`] at the one-seed scalar
 /// [`crate::jet_scalar::OneSeed`], returning the contracted third
-/// `Σ_c ℓ_{abc} dir_c` — the `RowJet` twin of [`generic_third_contracted`].
+/// `Σ_c ℓ_{abc} dir_c`.
 pub fn rowjet_third_contracted<const K: usize, P: RowNllProgramRowJet<K> + ?Sized>(
     prog: &P,
     row: usize,
@@ -2566,7 +2441,7 @@ pub fn rowjet_third_contracted<const K: usize, P: RowNllProgramRowJet<K> + ?Size
 
 /// Evaluate a [`RowNllProgramRowJet`] at the two-seed scalar
 /// [`crate::jet_scalar::TwoSeed`], returning the contracted fourth
-/// `Σ_{cd} ℓ_{abcd} u_c v_d` — the `RowJet` twin of [`generic_fourth_contracted`].
+/// `Σ_{cd} ℓ_{abcd} u_c v_d`.
 pub fn rowjet_fourth_contracted<const K: usize, P: RowNllProgramRowJet<K> + ?Sized>(
     prog: &P,
     row: usize,
@@ -2581,10 +2456,10 @@ pub fn rowjet_fourth_contracted<const K: usize, P: RowNllProgramRowJet<K> + ?Siz
 }
 
 /// Evaluate a [`RowNllProgramRowJet`] at the `f64x4` lane [`Tower4Batch`],
-/// computing the FULL `(v, g, H, t3, t4)` for FOUR rows in one SIMD pass — the
-/// lane twin of [`generic_full_tower`]. Each of the four lanes is seeded with its
-/// own row's primaries, so [`Tower4Batch::lane`]`(i)` is `to_bits`-identical to
-/// the scalar [`generic_full_tower`] on `rows[i]`.
+/// computing the FULL `(v, g, H, t3, t4)` for FOUR rows in one SIMD pass. Each
+/// of the four lanes is seeded with its own row's primaries, so
+/// [`Tower4Batch::lane`]`(i)` is `to_bits`-identical to scalar evaluation on
+/// `rows[i]`.
 pub fn generic_batched_fourth_tower<const K: usize, P: RowNllProgramRowJet<K> + ?Sized>(
     prog: &P,
     rows: [usize; 4],
@@ -2603,8 +2478,8 @@ pub fn generic_batched_fourth_tower<const K: usize, P: RowNllProgramRowJet<K> + 
 }
 
 /// Evaluate a [`RowNllProgramRowJet`] at the `f64x4` lane [`Tower3Batch`],
-/// computing `(v, g, H, t3)` for FOUR rows in one SIMD pass — the order-≤3 lane
-/// twin of [`generic_full_tower`]. [`Tower3Batch::lane`]`(i)` is
+/// computing `(v, g, H, t3)` for FOUR rows in one SIMD pass.
+/// [`Tower3Batch::lane`]`(i)` is
 /// `to_bits`-identical to the order-≤3 scalar evaluation on `rows[i]`.
 pub fn generic_batched_third_tower<const K: usize, P: RowNllProgramRowJet<K> + ?Sized>(
     prog: &P,
