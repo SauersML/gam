@@ -157,12 +157,6 @@ pub(crate) struct SurvivalJointQuantities {
     pub(crate) d1_q1: Array1<f64>,
     pub(crate) d2_q1: Array1<f64>,
     pub(crate) d3_q1: Array1<f64>,
-    /// Exit-only derivatives of ell w.r.t. qdot1 = dq/dt.
-    pub(crate) d1_qdot1: Array1<f64>,
-    pub(crate) d2_qdot1: Array1<f64>,
-    pub(crate) h_time_h0: Array1<f64>,
-    pub(crate) h_time_h1: Array1<f64>,
-    pub(crate) h_time_d: Array1<f64>,
     /// Exit-side dq/d(eta_t) = -exp(-eta_ls_exit).
     pub(crate) dq_t: Array1<f64>,
     /// Exit-side dq/d(eta_ls).
@@ -179,59 +173,6 @@ pub(crate) struct SurvivalJointQuantities {
     pub(crate) d2q_ls_entry: Option<Array1<f64>>,
     pub(crate) d3q_tls_ls_entry: Option<Array1<f64>>,
     pub(crate) d3q_ls_entry: Option<Array1<f64>>,
-    pub(crate) dqdot_t: Array1<f64>,
-    pub(crate) dqdot_ls: Array1<f64>,
-    pub(crate) dqdot_td: Array1<f64>,
-    pub(crate) dqdot_lsd: Array1<f64>,
-    pub(crate) d2qdot_tt: Array1<f64>,
-    pub(crate) d2qdot_tls: Array1<f64>,
-    pub(crate) d2qdot_ttd: Array1<f64>,
-    pub(crate) d2qdot_tlsd: Array1<f64>,
-    pub(crate) d2qdot_ls: Array1<f64>,
-    pub(crate) d2qdot_lstd: Array1<f64>,
-    pub(crate) d2qdot_lslsd: Array1<f64>,
-    // NOTE: the only consumer of the 3rd-order qdot maps (d3qdot_tls_ls /
-    // _tls_lsd / _td_ls_ls / _ls_ls_ls / _ls_ls_lsd) is the dense `Tower4<9>`
-    // location-scale directional path, which `row_kernel_directional_supported`
-    // reports as unsupported (returns false). With no live reader, this kernel
-    // and `SurvivalDynamicGeometry` carry no 3rd-order qdot state.
-}
-
-/// Per-row negative-log-likelihood **curvatures** of the three functionally
-/// independent time-channel indices `(h0, h1, d_raw)` — i.e. the diagonal of
-/// the row NLL Hessian in time-channel space.
-///
-/// The stored `SurvivalJointQuantities` fields (`h_time_h0`, `h_time_h1`,
-/// `h_time_d`) all hold the *log-likelihood* second derivatives `+∂²ℓ/∂·²`
-/// (they are `-tower.h[i][i]` of the NLL jet, double-negated). The NLL Hessian
-/// negates each **uniformly** — `H = -∂²ℓ`. Historically each assembly site
-/// hand-applied that minus per channel, and one site drifted to `+h_time_d`,
-/// flipping the event-Jacobian (`g`) self-term and every `g`-coupled
-/// cross-block term (gam#1396). This type makes the sign live in exactly one
-/// place: the three channels are negated together at construction, so a
-/// per-channel sign skew is structurally unrepresentable.
-pub(crate) struct TimeChannelNllCurvatures {
-    /// `-∂²ℓ/∂h0²` (entry-survival channel).
-    pub(crate) h0: Array1<f64>,
-    /// `-∂²ℓ/∂h1²` (exit-survival/event-density channel).
-    pub(crate) h1: Array1<f64>,
-    /// `-∂²ℓ/∂d_raw²` (event-Jacobian `g = d_raw + qdot` channel).
-    pub(crate) d: Array1<f64>,
-}
-
-impl SurvivalJointQuantities {
-    /// Build the time-channel NLL curvature triple, applying the `H = -∂²ℓ`
-    /// negation once and uniformly across `(h0, h1, d_raw)`. Every diagonal
-    /// time-channel Hessian assembly site (block-diagonal time-time, full-joint
-    /// time-time, and the `g`-coupled time×{threshold,log_sigma,wiggle} cross
-    /// blocks) consumes this so the three channels can never disagree on sign.
-    pub(crate) fn time_channel_nll_curvatures(&self) -> TimeChannelNllCurvatures {
-        TimeChannelNllCurvatures {
-            h0: -&self.h_time_h0,
-            h1: -&self.h_time_h1,
-            d: -&self.h_time_d,
-        }
-    }
 }
 
 pub(crate) struct SurvivalJointPsiDirection {
@@ -2699,16 +2640,11 @@ impl SurvivalLocationScaleFamily {
         let mut d1_q1 = Array1::<f64>::zeros(n);
         let mut d2_q1 = Array1::<f64>::zeros(n);
         let mut d3_q1 = Array1::<f64>::zeros(n);
-        let mut d1_qdot1 = Array1::<f64>::zeros(n);
-        let mut d2_qdot1 = Array1::<f64>::zeros(n);
-        let mut h_time_h0 = Array1::<f64>::zeros(n);
-        let mut h_time_h1 = Array1::<f64>::zeros(n);
-        let mut h_time_d = Array1::<f64>::zeros(n);
 
-        // Write each row's 21 derivative scalars directly into the
+        // Write each row's six live derivative scalars directly into the
         // preallocated output arrays in parallel. The previous path collected
-        // a `Vec<Option<SurvivalRowDerivatives>>` (21 fields per row) and then
-        // serially scattered into 21 `Array1`s — at large scale that is the
+        // a `Vec<Option<SurvivalRowDerivatives>>` and then serially scattered it
+        // into `Array1`s — at large scale that is the
         // worst-case transient allocation among the family row builders.
         // Rows where `row_derivatives_rescaled` returns `Ok(None)` keep their
         // zero-initialized slots (matching the previous `continue` branch).
@@ -2743,11 +2679,6 @@ impl SurvivalLocationScaleFamily {
         let p_d1_q1 = SendPtr(d1_q1.as_mut_ptr());
         let p_d2_q1 = SendPtr(d2_q1.as_mut_ptr());
         let p_d3_q1 = SendPtr(d3_q1.as_mut_ptr());
-        let p_d1_qdot1 = SendPtr(d1_qdot1.as_mut_ptr());
-        let p_d2_qdot1 = SendPtr(d2_qdot1.as_mut_ptr());
-        let p_h_time_h0 = SendPtr(h_time_h0.as_mut_ptr());
-        let p_h_time_h1 = SendPtr(h_time_h1.as_mut_ptr());
-        let p_h_time_d = SendPtr(h_time_d.as_mut_ptr());
 
         let dyn_ref = &dynamic;
         (0..n)
@@ -2774,11 +2705,6 @@ impl SurvivalLocationScaleFamily {
                     p_d1_q1.write(i, row.d1_q1);
                     p_d2_q1.write(i, row.d2_q1);
                     p_d3_q1.write(i, row.d3_q1);
-                    p_d1_qdot1.write(i, row.d1_qdot1);
-                    p_d2_qdot1.write(i, row.d2_qdot1);
-                    p_h_time_h0.write(i, row.h_time_h0);
-                    p_h_time_h1.write(i, row.h_time_h1);
-                    p_h_time_d.write(i, row.h_time_d);
                 }
                 Ok(())
             })?;
@@ -2790,11 +2716,6 @@ impl SurvivalLocationScaleFamily {
             d1_q1,
             d2_q1,
             d3_q1,
-            d1_qdot1,
-            d2_qdot1,
-            h_time_h0,
-            h_time_h1,
-            h_time_d,
             dq_t: dynamic.dq_t_exit,
             dq_ls: dynamic.dq_ls_exit,
             d2q_tls: dynamic.d2q_tls_exit,
@@ -2807,17 +2728,6 @@ impl SurvivalLocationScaleFamily {
             d2q_ls_entry: Some(dynamic.d2q_ls_entry),
             d3q_tls_ls_entry: Some(dynamic.d3q_tls_ls_entry),
             d3q_ls_entry: Some(dynamic.d3q_ls_entry),
-            dqdot_t: dynamic.dqdot_t,
-            dqdot_ls: dynamic.dqdot_ls,
-            dqdot_td: dynamic.dqdot_td,
-            dqdot_lsd: dynamic.dqdot_lsd,
-            d2qdot_tt: dynamic.d2qdot_tt,
-            d2qdot_tls: dynamic.d2qdot_tls,
-            d2qdot_ttd: dynamic.d2qdot_ttd,
-            d2qdot_tlsd: dynamic.d2qdot_tlsd,
-            d2qdot_ls: dynamic.d2qdot_ls,
-            d2qdot_lstd: dynamic.d2qdot_lstd,
-            d2qdot_lslsd: dynamic.d2qdot_lslsd,
         })
     }
 
