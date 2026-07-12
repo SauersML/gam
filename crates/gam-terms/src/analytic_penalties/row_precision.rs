@@ -1,4 +1,5 @@
 use super::*;
+use gam_problem::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN, checked_exp_log_strength};
 
 // ---------------------------------------------------------------------------
 // Row-precision prior penalty

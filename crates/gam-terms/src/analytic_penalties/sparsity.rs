@@ -1,4 +1,5 @@
 use super::*;
+use gam_problem::{LOG_STRENGTH_MAX, LOG_STRENGTH_MIN, checked_exp_log_strength};
 
 /// Exact floating-point continuation of `log(p) + 1` on the support of a
 /// representable softmax row. An underflowed probability is exactly zero in the
