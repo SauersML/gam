@@ -1,84 +1,91 @@
 use serde::{Deserialize, Serialize};
 
-/// How ridge-adjusted determinants should be evaluated for outer criteria.
+/// Determinant semantics of an objective-accounted ridge.
+///
+/// There is deliberately no `Auto`: callers must decide whether they are
+/// evaluating the exact SPD determinant or a named positive-part
+/// approximation before constructing the policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RidgeDeterminantMode {
-    /// Use exact full logdet.
-    Auto,
-    /// Use full log-determinant of the ridged matrix (requires SPD in practice).
+    /// Exact full log-determinant of the ridged SPD matrix.
     Full,
-    /// Use positive-part pseudo-determinant (sum log ev for ev > floor).
-    PositivePart,
+    /// Positive-part pseudo-determinant. This changes the estimand and is
+    /// therefore explicitly an approximation.
+    PositivePartApproximation,
 }
 
-/// Global policy governing how a stabilization ridge participates in objectives.
+/// Structurally valid ways a diagonal ridge may participate in a computation.
+///
+/// The former public boolean matrix admitted contradictory states such as a
+/// quadratic penalty without the corresponding Hessian. This enum has only
+/// the three coherent inhabitants used by the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RidgePolicy {
-    /// Must remain independent of smoothing parameters (`rho`) for smooth outer derivatives.
-    pub rho_independent: bool,
-    /// Include ridge in quadratic penalty term: `0.5 * delta * ||beta||^2`.
-    pub include_quadratic_penalty: bool,
-    /// Include ridge in penalty determinant term (e.g. `log|S_lambda + delta I|`).
-    pub include_penalty_logdet: bool,
-    /// Include ridge in Hessian used by Laplace term / implicit differentiation.
-    pub include_laplacehessian: bool,
-    /// Determinant evaluation mode when ridge participates in logdet terms.
-    pub determinant_mode: RidgeDeterminantMode,
+pub enum RidgePolicy {
+    /// Ridge is an explicit part of the exact objective: quadratic, penalty
+    /// normalizer, and Laplace Hessian all include it, using a full SPD logdet.
+    ExactFullObjective,
+    /// Ridge participates in every objective term, but determinant evaluation
+    /// is the explicitly named positive-part approximation.
+    PositivePartApproximateObjective,
+    /// Ridge changes only an inner linear solve and never the fitted objective,
+    /// exported Hessian, determinant, covariance, or serialized model.
+    SolverOnly,
 }
 
 impl RidgePolicy {
-    /// Default policy used by PIRLS/REML path:
-    /// treat stabilization ridge as an explicit `delta I` prior contribution
-    /// with adaptive logdet evaluation.
-    pub const fn explicit_stabilization_full() -> Self {
-        Self {
-            rho_independent: true,
-            include_quadratic_penalty: true,
-            include_penalty_logdet: true,
-            include_laplacehessian: true,
-            determinant_mode: RidgeDeterminantMode::Auto,
-        }
+    pub const fn exact_full_objective() -> Self {
+        Self::ExactFullObjective
     }
 
-    pub const fn explicit_stabilization_full_exact() -> Self {
-        Self {
-            rho_independent: true,
-            include_quadratic_penalty: true,
-            include_penalty_logdet: true,
-            include_laplacehessian: true,
-            determinant_mode: RidgeDeterminantMode::Full,
-        }
+    pub const fn positive_part_approximate_objective() -> Self {
+        Self::PositivePartApproximateObjective
     }
 
-    /// Variant used when pseudo-determinants are required for indefinite matrices.
-    pub const fn explicit_stabilization_pospart() -> Self {
-        Self {
-            rho_independent: true,
-            include_quadratic_penalty: true,
-            include_penalty_logdet: true,
-            include_laplacehessian: true,
-            determinant_mode: RidgeDeterminantMode::PositivePart,
-        }
-    }
-
-    /// Solver-only stabilization: the ridge `δI` stabilizes the inner linear
-    /// solve (it bounds the Newton step `(H+δI)⁻¹∇`) but is **excluded** from
-    /// the REML/LAML objective — no `½·δ·‖β‖²` quadratic-penalty term, no
-    /// `δ`-shift of the penalty log-determinant, no `δ`-shift of the Laplace
-    /// Hessian. Use this when a numerical floor is needed purely to keep the
-    /// linear algebra finite during screening and must NOT bias the
-    /// smoothing-parameter selection or shrink identified coefficients off the
-    /// MLE. With every `include_*` false the optimized objective equals the
-    /// true penalized REML criterion, so the value surface and its analytic
-    /// gradient describe the same objective (gam#747/#748).
     pub const fn solver_only() -> Self {
-        Self {
-            rho_independent: true,
-            include_quadratic_penalty: false,
-            include_penalty_logdet: false,
-            include_laplacehessian: false,
-            determinant_mode: RidgeDeterminantMode::PositivePart,
+        Self::SolverOnly
+    }
+
+    /// Stabilization is selected independently of smoothing parameters in all
+    /// supported modes. There is no public state that can contradict this.
+    #[inline]
+    pub const fn is_rho_independent(self) -> bool {
+        true
+    }
+
+    #[inline]
+    pub const fn includes_objective(self) -> bool {
+        !matches!(self, Self::SolverOnly)
+    }
+
+    #[inline]
+    pub const fn includes_quadratic_penalty(self) -> bool {
+        self.includes_objective()
+    }
+
+    #[inline]
+    pub const fn includes_penalty_logdet(self) -> bool {
+        self.includes_objective()
+    }
+
+    #[inline]
+    pub const fn includes_laplace_hessian(self) -> bool {
+        self.includes_objective()
+    }
+
+    #[inline]
+    pub const fn determinant_mode(self) -> Option<RidgeDeterminantMode> {
+        match self {
+            Self::ExactFullObjective => Some(RidgeDeterminantMode::Full),
+            Self::PositivePartApproximateObjective => {
+                Some(RidgeDeterminantMode::PositivePartApproximation)
+            }
+            Self::SolverOnly => None,
         }
+    }
+
+    #[inline]
+    pub const fn is_approximation(self) -> bool {
+        matches!(self, Self::PositivePartApproximateObjective)
     }
 }
 
@@ -87,48 +94,34 @@ mod ridge_policy_tests {
     use super::*;
 
     #[test]
-    fn explicit_stabilization_full_includes_all_terms() {
-        let p = RidgePolicy::explicit_stabilization_full();
-        assert!(p.rho_independent);
-        assert!(p.include_quadratic_penalty);
-        assert!(p.include_penalty_logdet);
-        assert!(p.include_laplacehessian);
-        assert_eq!(p.determinant_mode, RidgeDeterminantMode::Auto);
+    fn exact_policy_is_homogeneous_and_full() {
+        let policy = RidgePolicy::exact_full_objective();
+        assert!(policy.is_rho_independent());
+        assert!(policy.includes_quadratic_penalty());
+        assert!(policy.includes_penalty_logdet());
+        assert!(policy.includes_laplace_hessian());
+        assert_eq!(policy.determinant_mode(), Some(RidgeDeterminantMode::Full));
+        assert!(!policy.is_approximation());
     }
 
     #[test]
-    fn explicit_stabilization_full_exact_uses_full_determinant() {
-        let p = RidgePolicy::explicit_stabilization_full_exact();
-        assert!(p.include_penalty_logdet);
-        assert_eq!(p.determinant_mode, RidgeDeterminantMode::Full);
-    }
-
-    #[test]
-    fn explicit_stabilization_pospart_uses_positive_part_determinant() {
-        let p = RidgePolicy::explicit_stabilization_pospart();
-        assert!(p.include_penalty_logdet);
-        assert_eq!(p.determinant_mode, RidgeDeterminantMode::PositivePart);
-    }
-
-    #[test]
-    fn solver_only_ridge_policy_stays_off_objective_accounting() {
-        let p = RidgePolicy::solver_only();
-        assert!(p.rho_independent);
-        assert!(!p.include_quadratic_penalty);
-        assert!(!p.include_penalty_logdet);
-        assert!(!p.include_laplacehessian);
-    }
-
-    #[test]
-    fn determinant_mode_variants_are_distinct() {
-        assert_ne!(RidgeDeterminantMode::Auto, RidgeDeterminantMode::Full);
-        assert_ne!(
-            RidgeDeterminantMode::Full,
-            RidgeDeterminantMode::PositivePart
+    fn positive_part_policy_is_explicitly_approximate() {
+        let policy = RidgePolicy::positive_part_approximate_objective();
+        assert!(policy.includes_objective());
+        assert_eq!(
+            policy.determinant_mode(),
+            Some(RidgeDeterminantMode::PositivePartApproximation)
         );
-        assert_ne!(
-            RidgeDeterminantMode::Auto,
-            RidgeDeterminantMode::PositivePart
-        );
+        assert!(policy.is_approximation());
+    }
+
+    #[test]
+    fn solver_only_policy_cannot_enter_objective_accounting() {
+        let policy = RidgePolicy::solver_only();
+        assert!(!policy.includes_objective());
+        assert!(!policy.includes_quadratic_penalty());
+        assert!(!policy.includes_penalty_logdet());
+        assert!(!policy.includes_laplace_hessian());
+        assert_eq!(policy.determinant_mode(), None);
     }
 }

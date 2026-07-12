@@ -288,13 +288,21 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             Cell::new(format!("{:.4}", comparison.aic_corrected)),
         ]));
         if let Some(loo) = comparison.loo.as_ref() {
+            let se = loo
+                .se
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_else(|| "n/a".to_string());
             summary.add_row(Row::from(vec![
                 Cell::new("PSIS-LOO elpd"),
-                Cell::new(format!("{:.4} (se {:.4})", loo.elpd, loo.se)),
+                Cell::new(format!("{:.4} (se {se})", loo.elpd)),
             ]));
+            let k_hat = loo
+                .k_hat_max
+                .map(|value| format!("{value:.3}"))
+                .unwrap_or_else(|| "n/a".to_string());
             summary.add_row(Row::from(vec![
                 Cell::new("PSIS k_hat (max)"),
-                Cell::new(format!("{:.3} ({} unreliable)", loo.k_hat_max, loo.n_k_bad)),
+                Cell::new(format!("{k_hat} ({} unreliable)", loo.n_k_bad)),
             ]));
         }
         cli_out!("Model comparison (corrected AIC + PSIS-LOO):");

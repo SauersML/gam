@@ -3192,7 +3192,7 @@ impl BlockEffectiveJacobian for BoundedEffectiveJacobian {
 
 #[derive(Clone)]
 struct BoundedLinearFamily {
-    family: LikelihoodSpec,
+    likelihood: gam_spec::GlmLikelihoodSpec,
     latent_cloglog_state: Option<LatentCLogLogState>,
     mixture_link_state: Option<MixtureLinkState>,
     sas_link_state: Option<SasLinkState>,
@@ -3941,11 +3941,12 @@ fn eta_exprel(rate: f64, eta: f64) -> f64 {
 }
 
 fn validate_bounded_observation_inputs(
-    family: &LikelihoodSpec,
+    likelihood: &gam_spec::GlmLikelihoodSpec,
     y: &Array1<f64>,
     weights: &Array1<f64>,
     eta: &Array1<f64>,
-) -> Result<(), EstimationError> {
+) -> Result<gam_spec::ResolvedLikelihoodScale, EstimationError> {
+    let family = &likelihood.spec;
     if weights.len() != y.len() || eta.len() != y.len() {
         crate::bail_invalid_estim!(
             "bounded family observation size mismatch: y={}, weights={}, eta={}",
@@ -3961,6 +3962,9 @@ fn validate_bounded_observation_inputs(
             family.link.link_function().name()
         );
     }
+    let resolved_scale = likelihood
+        .resolved_scale()
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     match &family.response {
         ResponseFamily::Tweedie { p } if !(p.is_finite() && *p > 1.0 && *p < 2.0) => {
             crate::bail_invalid_estim!(
@@ -3974,10 +3978,20 @@ fn validate_bounded_observation_inputs(
         }
         _ => {}
     }
+    // Atomic whole-vector preflight: an invalid later weight wins before any
+    // response or predictor row is inspected.
+    for (i, &wi) in weights.iter().enumerate() {
+        if !(wi.is_finite() && wi >= 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "bounded-family row {} has invalid prior weight {wi:?}; expected finite weight >= 0",
+                i + 1
+            )));
+        }
+    }
     for i in 0..y.len() {
         let wi = weights[i];
-        if !(wi.is_finite() && wi >= 0.0) {
-            return Err(bounded_row_error(i, "prior weight", eta[i], wi));
+        if wi == 0.0 {
+            continue;
         }
         if !eta[i].is_finite() {
             return Err(bounded_row_error(i, "linear predictor", eta[i], eta[i]));
@@ -3989,9 +4003,6 @@ fn validate_bounded_observation_inputs(
                 eta[i],
                 y[i],
             ));
-        }
-        if wi == 0.0 {
-            continue;
         }
         let yi = y[i];
         let valid = match &family.response {
@@ -4008,28 +4019,54 @@ fn validate_bounded_observation_inputs(
             return Err(bounded_row_error(i, "bounded-family response", eta[i], yi));
         }
     }
-    Ok(())
+    Ok(resolved_scale)
 }
 
 fn exact_standard_observation_row(
-    family: &LikelihoodSpec,
+    likelihood: &gam_spec::GlmLikelihoodSpec,
+    resolved_scale: gam_spec::ResolvedLikelihoodScale,
     binomial_link: &InverseLink,
     row: usize,
     y: f64,
     weight: f64,
     eta: f64,
 ) -> Result<ExactStandardObservationRow, EstimationError> {
+    if weight == 0.0 {
+        return Ok(ExactStandardObservationRow::zero_weight(0.0));
+    }
+    let family = &likelihood.spec;
     match &family.response {
         ResponseFamily::Gaussian => {
-            if weight == 0.0 {
-                return Ok(ExactStandardObservationRow::zero_weight(eta));
+            let scaled_weight = match resolved_scale {
+                gam_spec::ResolvedLikelihoodScale::ProfiledGaussian => weight,
+                gam_spec::ResolvedLikelihoodScale::FixedGaussian { phi } => {
+                    crate::gamlss::scaled_positive_product_quotient(
+                        weight,
+                        1.0,
+                        1.0,
+                        phi.value(),
+                    )
+                }
+                _ => {
+                    crate::bail_invalid_estim!(
+                        "bounded Gaussian received a non-Gaussian resolved scale"
+                    );
+                }
+            };
+            if !(scaled_weight.is_finite() && scaled_weight > 0.0) {
+                return Err(bounded_row_error(
+                    row,
+                    "bounded Gaussian dispersion-scaled weight",
+                    eta,
+                    scaled_weight,
+                ));
             }
             let residual = y - eta;
             let loss = if residual == 0.0 {
                 0.0
             } else {
                 crate::gamlss::scaled_positive_product_quotient(
-                    weight,
+                    scaled_weight,
                     residual.abs(),
                     residual.abs(),
                     2.0,
@@ -4040,9 +4077,9 @@ fn exact_standard_observation_row(
                 eta,
                 ExactStandardObservationRow {
                     mu: eta,
-                    score: weight * residual,
-                    fisherweight: weight,
-                    neghessian_eta: weight,
+                    score: scaled_weight * residual,
+                    fisherweight: scaled_weight,
+                    neghessian_eta: scaled_weight,
                     neghessian_eta_derivative: 0.0,
                     log_likelihood: -loss,
                 },
@@ -4058,9 +4095,6 @@ fn exact_standard_observation_row(
         }
         ResponseFamily::Poisson => {
             let mu = inverse_link_jet_for_inverse_link(&family.link, eta)?.mu;
-            if weight == 0.0 {
-                return Ok(ExactStandardObservationRow::zero_weight(mu));
-            }
             let fisherweight = weight * mu;
             let score = weight * (y - mu);
             let raw_log_likelihood = y.mul_add(eta, -mu);
@@ -4092,11 +4126,20 @@ fn exact_standard_observation_row(
         }
         ResponseFamily::Gamma => {
             let mu = inverse_link_jet_for_inverse_link(&family.link, eta)?.mu;
-            if weight == 0.0 {
-                return Ok(ExactStandardObservationRow::zero_weight(mu));
+            let shape = resolved_scale
+                .gamma_shape()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+            let weighted_shape = weight * shape;
+            if !(weighted_shape.is_finite() && weighted_shape > 0.0) {
+                return Err(bounded_row_error(
+                    row,
+                    "bounded Gamma shape-scaled weight",
+                    eta,
+                    weighted_shape,
+                ));
             }
             let weighted_ratio =
-                crate::gamlss::scaled_positive_product_quotient(weight, y, 1.0, mu);
+                crate::gamlss::scaled_positive_product_quotient(weight, y, shape, mu);
             if !(weighted_ratio.is_finite() && weighted_ratio > 0.0) {
                 return Err(bounded_row_error(
                     row,
@@ -4110,19 +4153,30 @@ fn exact_standard_observation_row(
                 eta,
                 ExactStandardObservationRow {
                     mu,
-                    score: weighted_ratio - weight,
-                    fisherweight: weight,
+                    score: weighted_ratio - weighted_shape,
+                    fisherweight: weighted_shape,
                     neghessian_eta: weighted_ratio,
                     neghessian_eta_derivative: -weighted_ratio,
-                    log_likelihood: -weighted_ratio - weight * eta,
+                    log_likelihood: -weighted_ratio - weighted_shape * eta,
                 },
             )
         }
         ResponseFamily::Tweedie { p } => {
             let p = *p;
             let mu = inverse_link_jet_for_inverse_link(&family.link, eta)?.mu;
-            if weight == 0.0 {
-                return Ok(ExactStandardObservationRow::zero_weight(mu));
+            let phi = resolved_scale
+                .tweedie_phi()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+            let weight = crate::gamlss::scaled_positive_product_quotient(
+                weight, 1.0, 1.0, phi,
+            );
+            if !(weight.is_finite() && weight > 0.0) {
+                return Err(bounded_row_error(
+                    row,
+                    "bounded Tweedie dispersion-scaled weight",
+                    eta,
+                    weight,
+                ));
             }
             let a = ((1.0 - p) * eta).exp();
             let b = ((2.0 - p) * eta).exp();
@@ -4177,12 +4231,11 @@ fn exact_standard_observation_row(
                 },
             )
         }
-        ResponseFamily::NegativeBinomial { theta, .. } => {
-            let theta = *theta;
+        ResponseFamily::NegativeBinomial { .. } => {
+            let theta = resolved_scale
+                .negative_binomial_theta()
+                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
             let mu = inverse_link_jet_for_inverse_link(&family.link, eta)?.mu;
-            if weight == 0.0 {
-                return Ok(ExactStandardObservationRow::zero_weight(mu));
-            }
             let log_theta = theta.ln();
             let delta = eta - log_theta;
             let log_q = -gam_linalg::utils::stable_softplus(-delta);
@@ -4252,8 +4305,8 @@ fn exact_standard_observation_row(
     }
 }
 
-fn evaluate_standard_familyobservations(
-    family: LikelihoodSpec,
+fn evaluate_resolved_standard_family_observations(
+    likelihood: &gam_spec::GlmLikelihoodSpec,
     latent_cloglog_state: Option<&LatentCLogLogState>,
     mixture_link_state: Option<&MixtureLinkState>,
     sas_link_state: Option<&SasLinkState>,
@@ -4262,7 +4315,8 @@ fn evaluate_standard_familyobservations(
     eta: &Array1<f64>,
 ) -> Result<StandardFamilyObservationState, EstimationError> {
     let n = y.len();
-    validate_bounded_observation_inputs(&family, y, weights, eta)?;
+    let resolved_scale = validate_bounded_observation_inputs(likelihood, y, weights, eta)?;
+    let family = &likelihood.spec;
     let binomial_link = resolved_bounded_binomial_link(
         &family,
         latent_cloglog_state,
@@ -4280,7 +4334,15 @@ fn evaluate_standard_familyobservations(
 
     for i in 0..n {
         let row =
-            exact_standard_observation_row(&family, &binomial_link, i, y[i], weights[i], eta[i])?;
+            exact_standard_observation_row(
+                likelihood,
+                resolved_scale,
+                &binomial_link,
+                i,
+                y[i],
+                weights[i],
+                eta[i],
+            )?;
         mu[i] = row.mu;
         score[i] = row.score;
         fisherweight[i] = row.fisherweight;
@@ -4309,6 +4371,31 @@ fn evaluate_standard_familyobservations(
         neghessian_eta_derivative,
         log_likelihood,
     })
+}
+
+/// Canonical scale-resolution boundary for callers whose family has not yet
+/// entered a fit and therefore has no independently fitted scale metadata.
+/// Bounded fits carry a full `GlmLikelihoodSpec` and call the resolved variant
+/// directly; this path derives the family-defined estimated/fixed seed once.
+fn evaluate_standard_familyobservations(
+    family: LikelihoodSpec,
+    latent_cloglog_state: Option<&LatentCLogLogState>,
+    mixture_link_state: Option<&MixtureLinkState>,
+    sas_link_state: Option<&SasLinkState>,
+    y: &Array1<f64>,
+    weights: &Array1<f64>,
+    eta: &Array1<f64>,
+) -> Result<StandardFamilyObservationState, EstimationError> {
+    let likelihood = gam_spec::GlmLikelihoodSpec::canonical(family);
+    evaluate_resolved_standard_family_observations(
+        &likelihood,
+        latent_cloglog_state,
+        mixture_link_state,
+        sas_link_state,
+        y,
+        weights,
+        eta,
+    )
 }
 
 fn exact_standard_working_response(
@@ -5831,8 +5918,8 @@ impl BoundedLinearFamily {
         let x_eff = self.effective_design_for_latent(&jac_diag);
         let eta =
             self.designzeroed.dot(latent_beta) + self.nonlinear_offset_from_latent(latent_beta)?;
-        let obs = evaluate_standard_familyobservations(
-            self.family.clone(),
+        let obs = evaluate_resolved_standard_family_observations(
+            &self.likelihood,
             self.latent_cloglog_state.as_ref(),
             self.mixture_link_state.as_ref(),
             self.sas_link_state.as_ref(),
@@ -6408,9 +6495,13 @@ fn fit_bounded_term_collection_with_design(
         );
     }
 
-    let is_beta_logistic = family.is_binomial_beta_logistic();
+    let glm_likelihood = gam_spec::GlmLikelihoodSpec::canonical(family);
+    glm_likelihood
+        .resolved_scale()
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+    let is_beta_logistic = glm_likelihood.spec.is_binomial_beta_logistic();
     let family_adapter = BoundedLinearFamily {
-        family: family.clone(),
+        likelihood: glm_likelihood.clone(),
         latent_cloglog_state: options.latent_cloglog,
         mixture_link_state: options
             .mixture_link
@@ -6602,8 +6693,7 @@ fn fit_bounded_term_collection_with_design(
     // the per-family scale is `GlmLikelihoodSpec::coefficient_covariance_scale`
     // / `dispersion_from_likelihood`, reused verbatim so the bounded path can
     // never drift from the standard contract (gam#1514).
-    let glm_likelihood = gam_spec::GlmLikelihoodSpec::canonical(family.clone());
-    let standard_deviation = if family.is_gaussian_identity() {
+    let standard_deviation = if glm_likelihood.spec.is_gaussian_identity() {
         let residual_dof = if options.compute_inference {
             y.len() as f64 - edf_total
         } else {
@@ -6632,7 +6722,9 @@ fn fit_bounded_term_collection_with_design(
     };
     let dispersion =
         gam_solve::estimate::dispersion_from_likelihood(&glm_likelihood, standard_deviation)?;
-    let cov_scale = glm_likelihood.coefficient_covariance_scale(dispersion.phi());
+    let cov_scale = glm_likelihood
+        .coefficient_covariance_scale(dispersion.phi())
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     // Apply the dispersion scale to the unscaled inverse, producing the reported
     // `Vb = cov_scale · H_user⁻¹` and its diagonal standard errors. The stored
     // `penalized_hessian` stays UNSCALED (`H_user`) per the dispersion-ownership
@@ -6712,8 +6804,8 @@ fn fit_bounded_term_collection_with_design(
                 }],
                 log_lambdas,
                 lambdas: fit.lambdas,
-                likelihood_scale: family.default_scale_metadata(),
-                likelihood_family: Some(family),
+                likelihood_scale: glm_likelihood.scale,
+                likelihood_family: Some(glm_likelihood.spec),
                 log_likelihood_normalization: gam_spec::LogLikelihoodNormalization::UserProvided,
                 log_likelihood: eta_state.log_likelihood,
                 deviance,

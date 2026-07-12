@@ -2448,7 +2448,8 @@ impl UnifiedFitResult {
                     scale: self.likelihood_scale.clone(),
                 };
                 let dispersion = dispersion_from_likelihood(&glm, self.standard_deviation)?;
-                Ok(glm.coefficient_covariance_scale(dispersion.phi()))
+                glm.coefficient_covariance_scale(dispersion.phi())
+                    .map_err(|error| EstimationError::InvalidInput(error.to_string()))
             }
             None => Err(EstimationError::InvalidInput(
                 "this fit has no engine-level family and therefore no scalar coefficient-covariance scale"

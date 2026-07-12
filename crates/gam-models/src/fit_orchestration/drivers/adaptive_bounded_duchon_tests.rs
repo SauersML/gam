@@ -836,7 +836,9 @@ mod adaptive_bounded_duchon_tests {
         let y = array![0.4, 1.0, 1.7, 2.2];
         let weights = Array1::ones(y.len());
         let family = BoundedLinearFamily {
-            family: LikelihoodSpec::gaussian_identity(),
+            likelihood: gam_spec::GlmLikelihoodSpec::canonical(
+                LikelihoodSpec::gaussian_identity(),
+            ),
             latent_cloglog_state: None,
             mixture_link_state: None,
             sas_link_state: None,

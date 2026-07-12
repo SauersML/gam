@@ -38,13 +38,13 @@ pub struct AloElpd {
     /// Expected log pointwise predictive density, `Σᵢ ℓ(yᵢ|η̃₋ᵢ)`.
     pub elpd: f64,
     /// Standard error of `elpd`, `√(n · Var(pointwise))`.
-    pub se: f64,
+    pub se: Option<f64>,
     /// Per-observation ALO elpd contributions (length `n`).
     pub pointwise: Array1<f64>,
     /// GPD tail-shape `k̂` of the cross-observation fitted-vs-ALO ratio
     /// distribution. This is an influence diagnostic, not a PSIS-LOO reliability
     /// diagnostic.
-    pub k_hat_max: f64,
+    pub k_hat_max: Option<f64>,
     /// Number of tail observations flagged when the influence diagnostic exceeds
     /// the `0.7` heavy-tail cutoff.
     pub n_k_bad: usize,
@@ -164,14 +164,15 @@ fn wps_correction_term(
 /// PSIS-LOO: there is no posterior-draw dimension, the Pareto fit is across
 /// observations, and the diagnostic never changes elpd.
 ///
-/// Returns `None` when the inputs are degenerate (non-finite, mismatched
-/// lengths, or empty). If the influence tail fit is unavailable, `k_hat_max` is
-/// `NaN` and `n_k_bad` is zero.
+/// Invalid or unrepresentable inputs are rejected explicitly. If the optional
+/// influence-tail fit is unavailable, `k_hat_max` is `None` and `n_k_bad` is
+/// zero; that diagnostic absence does not alter the certified elpd.
 pub fn alo_elpd(
     loglik_fitted: ArrayView1<'_, f64>,
     loglik_loo: ArrayView1<'_, f64>,
-) -> Option<AloElpd> {
-    let elpd = loglik_loo.iter().sum();
+) -> Result<AloElpd, EstimationError> {
+    let reduction_values: Vec<f64> = loglik_loo.iter().copied().collect();
+    let elpd = gam_solve::pirls::stable_finite_signed_sum(&reduction_values, "ALO elpd reduction")?;
     alo_elpd_with_total(loglik_fitted, loglik_loo, elpd)
 }
 
@@ -179,36 +180,55 @@ fn alo_elpd_with_total(
     loglik_fitted: ArrayView1<'_, f64>,
     loglik_loo: ArrayView1<'_, f64>,
     elpd: f64,
-) -> Option<AloElpd> {
+) -> Result<AloElpd, EstimationError> {
     let n = loglik_loo.len();
-    if n == 0 || loglik_fitted.len() != n || !elpd.is_finite() {
-        return None;
+    if n == 0 {
+        return Err(EstimationError::InvalidInput(
+            "ALO requires at least one observation".into(),
+        ));
     }
-    if loglik_fitted
-        .iter()
-        .chain(loglik_loo.iter())
-        .any(|v| !v.is_finite())
-    {
-        return None;
+    if loglik_fitted.len() != n {
+        return Err(EstimationError::InvalidInput(format!(
+            "ALO likelihood length mismatch: fitted={}, loo={n}",
+            loglik_fitted.len()
+        )));
+    }
+    if !elpd.is_finite() {
+        return Err(EstimationError::InvalidInput(format!(
+            "ALO elpd total is non-finite: {elpd}"
+        )));
+    }
+    let mut log_ratio = Array1::zeros(n);
+    for row in 0..n {
+        let fitted = loglik_fitted[row];
+        let loo = loglik_loo[row];
+        if !fitted.is_finite() || !loo.is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "ALO non-finite log-likelihood at row {row}: fitted={fitted}, loo={loo}"
+            )));
+        }
+        let ratio = fitted - loo;
+        if !ratio.is_finite() {
+            return Err(EstimationError::InvalidInput(format!(
+                "ALO log influence ratio is outside f64 range at row {row}: fitted={fitted}, loo={loo}"
+            )));
+        }
+        log_ratio[row] = ratio;
     }
     // Cross-observation influence ratios r_i = p(y_i|η̂_i) / p(y_i|η̃₋ᵢ).
     // Stabilize by subtracting the max log-ratio before exponentiating; the
     // multiplicative constant does not change the fitted GPD shape.
-    let log_ratio: Array1<f64> = &loglik_fitted.to_owned() - &loglik_loo.to_owned();
     let max_lr = log_ratio.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if !max_lr.is_finite() {
-        return None;
-    }
     let raw: Vec<f64> = log_ratio.iter().map(|&lr| (lr - max_lr).exp()).collect();
 
     let (k_hat_max, n_k_bad);
     match pareto_smooth_weights(&raw) {
         Some(psis) => {
-            k_hat_max = psis.k_hat;
+            k_hat_max = Some(psis.k_hat);
             n_k_bad = if psis.k_hat > 0.7 { psis.tail_count } else { 0 };
         }
         None => {
-            k_hat_max = f64::NAN;
+            k_hat_max = None;
             n_k_bad = 0;
         }
     }
@@ -217,17 +237,34 @@ fn alo_elpd_with_total(
     let mean = elpd / n as f64;
     // SE of the sum of n pointwise contributions: √(n·s²) with the unbiased
     // sample variance (denominator n−1). Undefined for a single observation.
-    let var = if n > 1 {
-        pointwise
+    let se = if n > 1 {
+        let max_deviation = pointwise
             .iter()
-            .map(|&p| (p - mean) * (p - mean))
-            .sum::<f64>()
-            / (n - 1) as f64
+            .map(|&value| (value - mean).abs())
+            .fold(0.0_f64, f64::max);
+        if max_deviation == 0.0 {
+            Some(0.0)
+        } else {
+            let scaled_sum_squares: f64 = pointwise
+                .iter()
+                .map(|&value| {
+                    let scaled = (value - mean) / max_deviation;
+                    scaled * scaled
+                })
+                .sum();
+            let multiplier = (n as f64 * scaled_sum_squares / (n - 1) as f64).sqrt();
+            let value = max_deviation * multiplier;
+            if !value.is_finite() {
+                return Err(EstimationError::InvalidInput(
+                    "ALO standard error is outside f64 range".into(),
+                ));
+            }
+            Some(value)
+        }
     } else {
-        f64::NAN
+        None
     };
-    let se = (n as f64 * var).sqrt();
-    Some(AloElpd {
+    Ok(AloElpd {
         elpd,
         se,
         pointwise,
@@ -353,14 +390,14 @@ pub fn model_comparison_from_unified(
     let loo = match (alo, fit.likelihood_family.as_ref()) {
         (Some(alo), Some(spec)) => {
             let scale = reporting_scale(spec, &fit.likelihood_scale, phi);
-            alo_elpd_from_family(
+            Some(alo_elpd_from_family(
                 y,
                 eta_hat,
                 alo.eta_tilde.view(),
                 prior_weights,
                 spec,
                 scale,
-            )?
+            )?)
         }
         _ => None,
     };
@@ -385,7 +422,7 @@ pub fn alo_elpd_from_family(
     prior_weights: ArrayView1<'_, f64>,
     spec: &LikelihoodSpec,
     scale: gam_problem::types::LikelihoodScaleMetadata,
-) -> Result<Option<AloElpd>, EstimationError> {
+) -> Result<AloElpd, EstimationError> {
     use gam_solve::pirls::evaluate_full_log_likelihood_from_eta;
 
     let glm = GlmLikelihoodSpec {
@@ -401,11 +438,7 @@ pub fn alo_elpd_from_family(
     // elpd is corrected (#1581/#1582/#1583).
     let ll_hat = evaluate_full_log_likelihood_from_eta(y, eta_hat, &glm, prior_weights)?;
     let ll_loo = evaluate_full_log_likelihood_from_eta(y, eta_loo, &glm, prior_weights)?;
-    Ok(alo_elpd_with_total(
-        ll_hat.pointwise(),
-        ll_loo.pointwise(),
-        ll_loo.total(),
-    ))
+    alo_elpd_with_total(ll_hat.pointwise(), ll_loo.pointwise(), ll_loo.total())
 }
 
 /// Total fully-normalized log-likelihood at the fitted linear predictor
@@ -444,12 +477,12 @@ fn reporting_scale(
 ) -> gam_problem::types::LikelihoodScaleMetadata {
     use gam_problem::types::{LikelihoodScaleMetadata, ResponseFamily};
     match spec.response {
-        ResponseFamily::Gaussian => match scale.fixed_phi() {
-            Some(p) if p.is_finite() && p > 0.0 => {
-                LikelihoodScaleMetadata::FixedDispersion { phi: p }
+        ResponseFamily::Gaussian => match *scale {
+            fixed @ LikelihoodScaleMetadata::FixedDispersion { .. } => fixed,
+            LikelihoodScaleMetadata::ProfiledGaussian if phi.is_finite() && phi > 0.0 => {
+                LikelihoodScaleMetadata::FixedDispersion { phi }
             }
-            _ if phi.is_finite() && phi > 0.0 => LikelihoodScaleMetadata::FixedDispersion { phi },
-            _ => scale.clone(),
+            other => other,
         },
         _ => scale.clone(),
     }
@@ -571,8 +604,8 @@ mod tests {
         assert_eq!(loo.pointwise, ll_loo);
         assert!((loo.elpd - -(ratios.len() as f64)).abs() < 1e-12);
         assert!(
-            loo.k_hat_max > 0.7,
-            "heavy fitted-vs-ALO ratio tail should fire influence diagnostic; got k_hat={}",
+            loo.k_hat_max.is_some_and(|value| value > 0.7),
+            "heavy fitted-vs-ALO ratio tail should fire influence diagnostic; got k_hat={:?}",
             loo.k_hat_max
         );
         assert!(
@@ -593,9 +626,9 @@ mod tests {
             aic_corrected: aic,
             loo: Some(AloElpd {
                 elpd: pw.iter().sum(),
-                se: 0.0,
+                se: Some(0.0),
                 pointwise: pw,
-                k_hat_max: 0.1,
+                k_hat_max: Some(0.1),
                 n_k_bad: 0,
             }),
         };
@@ -616,7 +649,7 @@ mod tests {
         // variance (denominator n) would give √2 instead.
         let ll: Array1<f64> = array![0.0, 2.0];
         let loo = alo_elpd(ll.view(), ll.view()).expect("alo elpd");
-        assert!((loo.se - 2.0).abs() < 1e-12, "se = {}", loo.se);
+        assert_eq!(loo.se, Some(2.0));
     }
 
     #[test]
@@ -631,9 +664,9 @@ mod tests {
             aic_corrected: 0.0,
             loo: Some(AloElpd {
                 elpd: pw.iter().sum(),
-                se: 0.0,
+                se: Some(0.0),
                 pointwise: pw,
-                k_hat_max: 0.1,
+                k_hat_max: Some(0.1),
                 n_k_bad: 0,
             }),
         };
@@ -661,9 +694,9 @@ mod tests {
             aic_corrected: 5.0,
             loo: Some(AloElpd {
                 elpd: pw.iter().sum(),
-                se: 0.0,
+                se: Some(0.0),
                 pointwise: pw,
-                k_hat_max: 0.1,
+                k_hat_max: Some(0.1),
                 n_k_bad: 0,
             }),
         };

@@ -734,7 +734,10 @@ fn alo_covariance_scale(base: &pirls::PirlsResult) -> Result<f64, AloError> {
     };
     let scale = base
         .likelihood
-        .coefficient_covariance_scale(dispersion.phi());
+        .coefficient_covariance_scale(dispersion.phi())
+        .map_err(|error| AloError::InvalidInput {
+            reason: format!("ALO could not resolve coefficient-covariance scale: {error}"),
+        })?;
     if !(scale.is_finite() && scale > 0.0) {
         return Err(AloError::InvalidInput {
             reason: format!(

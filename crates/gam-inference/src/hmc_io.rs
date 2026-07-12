@@ -30,8 +30,8 @@ use gam_linalg::matrix::DesignMatrix;
 use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use gam_models::wiggle::monotone_wiggle_basis_with_derivative_order;
 use gam_problem::types::{
-    GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily,
-    ResolvedLikelihoodScale, RhoPrior, StandardLink, is_valid_tweedie_power,
+    GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec,
+    ResolvedLikelihoodScale, ResponseFamily, RhoPrior, StandardLink, is_valid_tweedie_power,
 };
 use gam_solve::estimate::reml::FirthDenseOperator;
 use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
@@ -547,8 +547,7 @@ fn resolve_hmc_likelihood(
     if matches!(resolved_scale, ResolvedLikelihoodScale::ProfiledGaussian) {
         if !dispersion.is_estimated() {
             return Err(HmcError::InvalidConfig {
-                reason: "profiled-Gaussian HMC requires an estimated fitted dispersion"
-                    .to_string(),
+                reason: "profiled-Gaussian HMC requires an estimated fitted dispersion".to_string(),
             });
         }
     } else {
@@ -588,7 +587,11 @@ fn resolve_hmc_likelihood(
         }
     }
 
-    let cov_scale = likelihood.coefficient_covariance_scale(phi);
+    let cov_scale = likelihood
+        .coefficient_covariance_scale(phi)
+        .map_err(|error| HmcError::InvalidConfig {
+            reason: format!("HMC coefficient-covariance scale is unresolved: {error}"),
+        })?;
     if !(cov_scale.is_finite() && cov_scale > 0.0) {
         return Err(HmcError::InvalidConfig {
             reason: format!(
@@ -1441,7 +1444,7 @@ mod tests {
     fn nuts_test_likelihood(family: NutsFamily, parameter: f64) -> GlmLikelihoodSpec {
         let mut spec = family.likelihood_spec();
         let scale = match family {
-            NutsFamily::Gaussian => LikelihoodScaleMetadata::ProfiledGaussian,
+            NutsFamily::Gaussian => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
             NutsFamily::GammaLog => {
                 LikelihoodScaleMetadata::EstimatedGammaShape { shape: parameter }
             }
@@ -2940,10 +2943,10 @@ mod tests {
                 CanonicalPenalty::from_dense_root(penalty_2, 2),
             ],
             rho_mode.view(),
-            GlmLikelihoodSpec::canonical(LikelihoodSpec {
-                response: ResponseFamily::Gaussian,
-                link: InverseLink::Standard(StandardLink::Identity),
-            }),
+            GlmLikelihoodSpec {
+                spec: LikelihoodSpec::gaussian_identity(),
+                scale: LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            },
             gam_solve::model_types::Dispersion::UNIT,
             None,
             RhoPrior::Flat,
@@ -2986,10 +2989,10 @@ mod tests {
             hessian.view(),
             vec![penalty.clone()],
             array![0.0].view(),
-            GlmLikelihoodSpec::canonical(LikelihoodSpec {
-                response: ResponseFamily::Gaussian,
-                link: InverseLink::Standard(StandardLink::Identity),
-            }),
+            GlmLikelihoodSpec {
+                spec: LikelihoodSpec::gaussian_identity(),
+                scale: LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            },
             gam_solve::model_types::Dispersion::UNIT,
             None,
             prior.clone(),
@@ -3004,10 +3007,10 @@ mod tests {
             hessian.view(),
             vec![penalty],
             array![2.5].view(),
-            GlmLikelihoodSpec::canonical(LikelihoodSpec {
-                response: ResponseFamily::Gaussian,
-                link: InverseLink::Standard(StandardLink::Identity),
-            }),
+            GlmLikelihoodSpec {
+                spec: LikelihoodSpec::gaussian_identity(),
+                scale: LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            },
             gam_solve::model_types::Dispersion::UNIT,
             None,
             prior,
@@ -3199,10 +3202,10 @@ mod tests {
             hessian.view(),
             vec![cp1, cp2],
             rho.view(),
-            GlmLikelihoodSpec::canonical(LikelihoodSpec {
-                response: ResponseFamily::Gaussian,
-                link: InverseLink::Standard(StandardLink::Identity),
-            }),
+            GlmLikelihoodSpec {
+                spec: LikelihoodSpec::gaussian_identity(),
+                scale: LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            },
             gam_solve::model_types::Dispersion::UNIT,
             None,
             RhoPrior::Flat,

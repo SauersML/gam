@@ -2165,7 +2165,8 @@ where
     // above (a deliberately distinct quantity, e.g. 1/shape for Gamma).
     let cov_scale = pirls_res
         .likelihood
-        .coefficient_covariance_scale(standard_deviation * standard_deviation);
+        .coefficient_covariance_scale(standard_deviation * standard_deviation)
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
     let zero_covariance_boundary = dispersion.is_zero_estimate()
         && matches!(
             &pirls_res.likelihood.spec.response,

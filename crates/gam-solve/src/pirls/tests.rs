@@ -15,10 +15,10 @@ mod tests {
         DENSE_OUTER_MAX_P, DevianceEtaRow, LinearInequalityConstraints, PenaltyConfig, PirlsConfig,
         PirlsLinearSolvePath, PirlsProblem, PirlsWorkspace, SparseXtWxCache, WeightFamily,
         WeightLink, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet,
-        calculate_deviance_from_eta, evaluate_full_log_likelihood_from_eta,
-        calculate_loglikelihood_omitting_constants_from_eta, calculate_null_deviance,
-        compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays,
-        deviance_eta_row_with_log_measure_scale, deviance_eta_rows_with_log_measure_scale,
+        calculate_deviance_from_eta, calculate_loglikelihood_omitting_constants_from_eta,
+        calculate_null_deviance, compute_constraint_kkt_diagnostics,
+        compute_observed_hessian_curvature_arrays, deviance_eta_row_with_log_measure_scale,
+        deviance_eta_rows_with_log_measure_scale, evaluate_full_log_likelihood_from_eta,
         fit_model_for_fixed_rho, observed_weight_dispatch, observed_weight_noncanonical,
         select_active_set_release, should_log_pirls_decision_summary,
         should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
@@ -2469,14 +2469,10 @@ mod tests {
         .expect("external Poisson fit should converge");
 
         let eta = x.dot(&result.beta) + &offset;
-        let full = evaluate_full_log_likelihood_from_eta(
-            y.view(),
-            eta.view(),
-            &likelihood,
-            w.view(),
-        )
-        .expect("full eta log-likelihood")
-        .total();
+        let full =
+            evaluate_full_log_likelihood_from_eta(y.view(), eta.view(), &likelihood, w.view())
+                .expect("full eta log-likelihood")
+                .total();
         let omit = calculate_loglikelihood_omitting_constants_from_eta(
             y.view(),
             &eta,
@@ -4590,8 +4586,7 @@ mod root_cause_tests {
 #[cfg(test)]
 mod reporting_loglikelihood_tests {
     use super::super::{
-        calculate_loglikelihood_omitting_constants_from_eta,
-        evaluate_full_log_likelihood_from_eta,
+        calculate_loglikelihood_omitting_constants_from_eta, evaluate_full_log_likelihood_from_eta,
     };
     use gam_problem::{
         GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily,
@@ -4621,13 +4616,8 @@ mod reporting_loglikelihood_tests {
         link: StandardLink,
     ) -> super::super::FullLogLikelihoodEvaluation {
         let eta = eta_fixture(mu, link);
-        evaluate_full_log_likelihood_from_eta(
-            y.view(),
-            eta.view(),
-            likelihood,
-            weights.view(),
-        )
-        .expect("full eta likelihood fixture")
+        evaluate_full_log_likelihood_from_eta(y.view(), eta.view(), likelihood, weights.view())
+            .expect("full eta likelihood fixture")
     }
 
     // ---- #1581: Poisson reporting log-likelihood is a true (negative) log-mass.
@@ -4746,14 +4736,8 @@ mod reporting_loglikelihood_tests {
         for &c in &[0.5_f64, 2.0, 10.0] {
             let yc = y.mapv(|v| c * v);
             let muc = mu.mapv(|v| c * v);
-            let llc = full_at_fixture(
-                &yc,
-                &muc,
-                &glm(c * c * sigma2),
-                &w,
-                StandardLink::Identity,
-            )
-            .total();
+            let llc = full_at_fixture(&yc, &muc, &glm(c * c * sigma2), &w, StandardLink::Identity)
+                .total();
             let shift = llc - ll;
             assert!(
                 (shift - (-n * c.ln())).abs() < 1e-9,

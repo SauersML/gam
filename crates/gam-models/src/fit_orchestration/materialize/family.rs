@@ -234,12 +234,22 @@ pub fn resolve_family(
     y_kind: ResponseColumnKind,
     response_name: &str,
 ) -> Result<LikelihoodSpec, String> {
-    let nb_theta = negative_binomial_theta.unwrap_or(1.0);
-    if !nb_theta.is_finite() || nb_theta <= 0.0 {
-        return Err(format!(
-            "negative-binomial theta must be finite and > 0; got {nb_theta}"
-        ));
-    }
+    // Resolve the optional theta only inside a structurally selected NB arm.
+    // Outside NB, the option is an invalid configuration rather than a global
+    // scalar that happens to be fabricated as one.
+    let resolve_negative_binomial_theta = || -> Result<(f64, bool), String> {
+        const ESTIMATED_THETA_SEED: f64 = 1.0;
+        let (theta, fixed) = match negative_binomial_theta {
+            Some(theta) => (theta, true),
+            None => (ESTIMATED_THETA_SEED, false),
+        };
+        if !(theta.is_finite() && theta > 0.0) {
+            return Err(format!(
+                "negative-binomial theta must be finite and > 0; got {theta}"
+            ));
+        }
+        Ok((theta, fixed))
+    };
     // `link_pinned = true` means the family name carried a specific link suffix
     // (e.g. "binomial-probit"); `false` means the user only declared the response
     // family (e.g. "binomial") and any link_choice may legally refine the link
@@ -378,26 +388,32 @@ pub fn resolve_family(
                 // `FixedNegBinTheta` scale → the PIRLS refresh gate
                 // `negbin_theta_is_estimated()` stays closed). With no flag,
                 // θ is the running ML estimate (the #802 default seed 1.0).
-                "nb" | "negbin" | "negative-binomial" => (
-                    LikelihoodSpec::new(
+                "nb" | "negbin" | "negative-binomial" => {
+                    let (theta, theta_fixed) = resolve_negative_binomial_theta()?;
+                    (
+                        LikelihoodSpec::new(
                         ResponseFamily::NegativeBinomial {
-                            theta: nb_theta,
-                            theta_fixed: negative_binomial_theta.is_some(),
+                            theta,
+                            theta_fixed,
                         },
                         InverseLink::Standard(StandardLink::Log),
                     ),
                     false,
-                ),
-                "negative-binomial-log" => (
-                    LikelihoodSpec::new(
+                    )
+                }
+                "negative-binomial-log" => {
+                    let (theta, theta_fixed) = resolve_negative_binomial_theta()?;
+                    (
+                        LikelihoodSpec::new(
                         ResponseFamily::NegativeBinomial {
-                            theta: nb_theta,
-                            theta_fixed: negative_binomial_theta.is_some(),
+                            theta,
+                            theta_fixed,
                         },
                         InverseLink::Standard(StandardLink::Log),
                     ),
                     true,
-                ),
+                    )
+                }
                 "beta" | "beta-regression" => (
                     LikelihoodSpec::new(
                         ResponseFamily::Beta { phi: 1.0 },

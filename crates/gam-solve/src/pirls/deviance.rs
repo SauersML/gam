@@ -1421,9 +1421,7 @@ pub fn calculate_null_deviance(
     Ok(deviance)
 }
 
-fn eta_log_measure_scale(
-    likelihood: &GlmLikelihoodSpec,
-) -> Result<f64, EstimationError> {
+fn eta_log_measure_scale(likelihood: &GlmLikelihoodSpec) -> Result<f64, EstimationError> {
     let scale_error = |error: gam_problem::InvalidLikelihoodScale| {
         EstimationError::InvalidInput(format!(
             "{} eta log-likelihood scale: {error}",
@@ -1435,9 +1433,7 @@ fn eta_log_measure_scale(
     // non-unit Poisson/Binomial metadata before any parallel output exists.
     likelihood.resolved_scale().map_err(scale_error)?;
     match &likelihood.spec.response {
-        ResponseFamily::Gamma => likelihood
-            .resolved_gamma_log_shape()
-            .map_err(scale_error),
+        ResponseFamily::Gamma => likelihood.resolved_gamma_log_shape().map_err(scale_error),
         ResponseFamily::Tweedie { .. } => likelihood
             .resolved_tweedie_log_phi()
             .map(|log_phi| -log_phi)
@@ -1459,33 +1455,26 @@ fn omitted_log_likelihood_row(
         return Ok(0.0);
     }
     let log_weight = prior_weight.ln();
-    let weighted_unit =
-        |quantity: &'static str, unit: f64| -> Result<f64, EstimationError> {
-            if unit == 0.0 {
-                Ok(0.0)
-            } else {
-                finite_signed_from_log(
-                    row,
-                    quantity,
-                    eta,
-                    unit.signum(),
-                    log_weight + unit.abs().ln(),
-                )
-            }
-        };
+    let weighted_unit = |quantity: &'static str, unit: f64| -> Result<f64, EstimationError> {
+        if unit == 0.0 {
+            Ok(0.0)
+        } else {
+            finite_signed_from_log(
+                row,
+                quantity,
+                eta,
+                unit.signum(),
+                log_weight + unit.abs().ln(),
+            )
+        }
+    };
     match response {
         ResponseFamily::Gaussian | ResponseFamily::Gamma | ResponseFamily::Tweedie { .. } => {
             Ok(-deviance.half_deviance)
         }
         ResponseFamily::Poisson => {
             if y == 0.0 {
-                finite_signed_from_log(
-                    row,
-                    "Poisson log-likelihood",
-                    eta,
-                    -1.0,
-                    log_weight + eta,
-                )
+                finite_signed_from_log(row, "Poisson log-likelihood", eta, -1.0, log_weight + eta)
             } else if eta > 0.0 {
                 let (sign, log_abs) = signed_log_exp_difference(y.ln() + eta.ln(), eta);
                 finite_signed_from_log(
@@ -1529,10 +1518,7 @@ fn omitted_log_likelihood_row(
             }
             stable_finite_signed_sum(
                 &[
-                    weighted_unit(
-                        "negative-binomial saturated log-likelihood",
-                        saturated,
-                    )?,
+                    weighted_unit("negative-binomial saturated log-likelihood", saturated)?,
                     -deviance.half_deviance,
                 ],
                 "negative-binomial log-likelihood row",
@@ -1744,7 +1730,11 @@ impl FullLogLikelihoodEvaluation {
 #[inline]
 fn scaled_log1p_ratio(large: f64, small: f64) -> f64 {
     let ratio = small / large;
-    if ratio == 0.0 { small } else { large * ratio.ln_1p() }
+    if ratio == 0.0 {
+        small
+    } else {
+        large * ratio.ln_1p()
+    }
 }
 
 /// Stable continuous-extension `ln C(w, wy)`. The direct three-`lnGamma`
@@ -1795,8 +1785,7 @@ fn negative_binomial_saturated_log_likelihood(y: f64, theta: f64) -> f64 {
             - scaled_log1p_ratio(y, theta)
     } else {
         let gamma_ratio = log_gamma_large_ratio(theta, y);
-        gamma_ratio - ln_gamma(y + 1.0) - scaled_log1p_ratio(theta, y)
-            + y * (log_y - log_total)
+        gamma_ratio - ln_gamma(y + 1.0) - scaled_log1p_ratio(theta, y) + y * (log_y - log_total)
     }
 }
 
@@ -1821,6 +1810,17 @@ fn gamma_saturated_log_normalizer(log_shape: f64, weight: f64, y: f64) -> f64 {
 }
 
 #[inline]
+fn poisson_saturated_log_likelihood(y: f64) -> f64 {
+    if y == 0.0 {
+        0.0
+    } else if y >= 8.0 {
+        -0.5 * (LN_2PI + y.ln()) - log_gamma_stirling_correction(y)
+    } else {
+        y * (y.ln() - 1.0) - ln_gamma(y + 1.0)
+    }
+}
+
+#[inline]
 fn full_log_likelihood_row(
     row: usize,
     y: f64,
@@ -1833,14 +1833,26 @@ fn full_log_likelihood_row(
     if weight == 0.0 {
         return Ok(0.0);
     }
-    let omitted = omitted_log_likelihood_row(
-        row,
-        y,
-        eta,
-        weight,
-        &likelihood.spec.response,
-        deviance,
-    )?;
+    if matches!(likelihood.spec.response, ResponseFamily::Poisson) {
+        let saturated = poisson_saturated_log_likelihood(y);
+        let weighted_saturated = if saturated == 0.0 {
+            0.0
+        } else {
+            finite_signed_from_log(
+                row,
+                "Poisson saturated log-likelihood",
+                eta,
+                saturated.signum(),
+                weight.ln() + saturated.abs().ln(),
+            )?
+        };
+        return stable_finite_signed_sum(
+            &[weighted_saturated, -deviance.half_deviance],
+            "full Poisson log-likelihood row",
+        );
+    }
+    let omitted =
+        omitted_log_likelihood_row(row, y, eta, weight, &likelihood.spec.response, deviance)?;
     let normalizer = match &likelihood.spec.response {
         ResponseFamily::Gaussian => {
             let log_phi = likelihood.resolved_gaussian_log_phi().map_err(|error| {
@@ -1850,28 +1862,7 @@ fn full_log_likelihood_row(
             })?;
             -0.5 * (LN_2PI + log_phi - weight.ln())
         }
-        ResponseFamily::Poisson => {
-            let log_factorial = ln_gamma(y + 1.0);
-            if !log_factorial.is_finite() {
-                return Err(deviance_row_error(
-                    row,
-                    "Poisson response normalizer",
-                    eta,
-                    log_factorial,
-                ));
-            }
-            if log_factorial == 0.0 {
-                0.0
-            } else {
-                finite_signed_from_log(
-                    row,
-                    "weighted Poisson response normalizer",
-                    eta,
-                    -log_factorial.signum(),
-                    weight.ln() + log_factorial.abs().ln(),
-                )?
-            }
-        }
+        ResponseFamily::Poisson => 0.0,
         ResponseFamily::Binomial => {
             let value = binomial_log_coefficient_from_proportion(weight, y);
             if !value.is_finite() {
