@@ -28,6 +28,22 @@ thread_local! {
         std::cell::RefCell::new(DynamicJetBatchWorkspace::new(1));
 }
 
+/// Bound the live directional Hessian channels in one runtime-jet pass.
+///
+/// Each lane carries `r²` order-two coefficients at every live tape node.
+/// Keeping that product bounded avoids the cache cliff and geometric arena
+/// growth of an all-directions pass while every chunk still evaluates the same
+/// frozen [`EmpiricalBmsRowJetPlan`].
+const EMPIRICAL_BMS_BATCH_HESSIAN_CHANNEL_BUDGET: usize = 576;
+const EMPIRICAL_BMS_BATCH_LANE_CAP: usize = 8;
+
+#[inline]
+fn empirical_bms_directional_batch_lanes(r: usize) -> usize {
+    let channels_per_lane = r.saturating_mul(r).max(1);
+    (EMPIRICAL_BMS_BATCH_HESSIAN_CHANNEL_BUDGET / channels_per_lane)
+        .clamp(1, EMPIRICAL_BMS_BATCH_LANE_CAP)
+}
+
 #[derive(Clone)]
 pub(super) struct EmpiricalBmsIndexJetPlan {
     z: f64,
@@ -1063,9 +1079,9 @@ impl BernoulliMarginalSlopeFamily {
             .expect("one empirical BMS direction produces one contraction"))
     }
 
-    /// Evaluate every requested third contraction in one canonical row-plan
-    /// traversal. The order-two base is shared by all direction lanes and the
-    /// per-worker bump retains its high-water mark across rows.
+    /// Evaluate every requested third contraction from one canonical row plan.
+    /// Bounded lane chunks share the order-two base within each pass and reuse
+    /// the frozen grid/basis plan across passes.
     pub(super) fn empirical_flex_row_third_contracted_many(
         &self,
         row: usize,
@@ -1117,19 +1133,26 @@ impl BernoulliMarginalSlopeFamily {
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
         EMPIRICAL_BMS_THIRD_WORKSPACE.with(|workspace| {
             let mut workspace = workspace.borrow_mut();
-            workspace.reset(row_dirs.len());
-            let vars = workspace.alloc_slice_fill_with(r, |axis| {
-                DynamicOneSeedBatch::seed_directions(point[axis], axis, r, &workspace, |lane| {
-                    row_dirs[lane][axis]
-                })
-            });
-            let jet = plan.evaluate(vars, 3, &workspace)?;
-            (0..row_dirs.len())
-                .map(|lane| {
-                    Array2::from_shape_vec((r, r), jet.contracted_third(lane).to_vec())
-                        .map_err(|error| format!("empirical BMS third-contraction shape: {error}"))
-                })
-                .collect()
+            let lane_limit = empirical_bms_directional_batch_lanes(r);
+            let mut contracted = Vec::with_capacity(row_dirs.len());
+            for directions in row_dirs.chunks(lane_limit) {
+                workspace.reset(directions.len());
+                let vars = workspace.alloc_slice_fill_with(r, |axis| {
+                    DynamicOneSeedBatch::seed_directions(point[axis], axis, r, &workspace, |lane| {
+                        directions[lane][axis]
+                    })
+                });
+                let jet = plan.evaluate(vars, 3, &workspace)?;
+                for lane in 0..directions.len() {
+                    contracted.push(
+                        Array2::from_shape_vec((r, r), jet.contracted_third(lane).to_vec())
+                            .map_err(|error| {
+                                format!("empirical BMS third-contraction shape: {error}")
+                            })?,
+                    );
+                }
+            }
+            Ok(contracted)
         })
     }
 
@@ -1173,21 +1196,25 @@ impl BernoulliMarginalSlopeFamily {
         let point = Self::intercept_primary_point(q, b, beta_h, beta_w);
         EMPIRICAL_BMS_THIRD_WORKSPACE.with(|workspace| {
             let mut workspace = workspace.borrow_mut();
-            workspace.reset(r);
-            let vars = workspace.alloc_slice_fill_with(r, |axis| {
-                DynamicOneSeedBatch::seed_directions(point[axis], axis, r, &workspace, |lane| {
-                    if lane == axis { 1.0 } else { 0.0 }
-                })
-            });
-            let jet = plan.evaluate(vars, 3, &workspace)?;
+            let lane_limit = empirical_bms_directional_batch_lanes(r);
             let mut gradient = Array1::<f64>::zeros(r);
-            for lane in 0..r {
-                gradient[lane] = jet
-                    .contracted_third(lane)
-                    .iter()
-                    .zip(gram)
-                    .map(|(third, weight)| third * weight)
-                    .sum();
+            for axis_start in (0..r).step_by(lane_limit) {
+                let lanes = (r - axis_start).min(lane_limit);
+                workspace.reset(lanes);
+                let vars = workspace.alloc_slice_fill_with(r, |axis| {
+                    DynamicOneSeedBatch::seed_directions(point[axis], axis, r, &workspace, |lane| {
+                        if axis_start + lane == axis { 1.0 } else { 0.0 }
+                    })
+                });
+                let jet = plan.evaluate(vars, 3, &workspace)?;
+                for lane in 0..lanes {
+                    gradient[axis_start + lane] = jet
+                        .contracted_third(lane)
+                        .iter()
+                        .zip(gram)
+                        .map(|(third, weight)| third * weight)
+                        .sum();
+                }
             }
             Ok(gradient)
         })
@@ -1324,31 +1351,34 @@ impl BernoulliMarginalSlopeFamily {
         let is_zero = |direction: &Array1<f64>| direction.iter().all(|value| *value == 0.0);
         EMPIRICAL_BMS_FOURTH_WORKSPACE.with(|workspace| {
             let mut workspace = workspace.borrow_mut();
-            workspace.reset(direction_pairs.len());
-            let vars = workspace.alloc_slice_fill_with(r, |axis| {
-                DynamicTwoSeedBatch::seed_direction_pairs(
-                    point[axis],
-                    axis,
-                    r,
-                    &workspace,
-                    |lane| (direction_pairs[lane].0[axis], direction_pairs[lane].1[axis]),
-                )
-            });
-            let jet = plan.evaluate(vars, 4, &workspace)?;
-            direction_pairs
-                .iter()
-                .enumerate()
-                .map(|(lane, (direction_u, direction_v))| {
+            let lane_limit = empirical_bms_directional_batch_lanes(r);
+            let mut contracted = Vec::with_capacity(direction_pairs.len());
+            for pairs in direction_pairs.chunks(lane_limit) {
+                workspace.reset(pairs.len());
+                let vars = workspace.alloc_slice_fill_with(r, |axis| {
+                    DynamicTwoSeedBatch::seed_direction_pairs(
+                        point[axis],
+                        axis,
+                        r,
+                        &workspace,
+                        |lane| (pairs[lane].0[axis], pairs[lane].1[axis]),
+                    )
+                });
+                let jet = plan.evaluate(vars, 4, &workspace)?;
+                for (lane, (direction_u, direction_v)) in pairs.iter().enumerate() {
                     if is_zero(direction_u) || is_zero(direction_v) {
-                        Ok(Array2::<f64>::zeros((r, r)))
+                        contracted.push(Array2::<f64>::zeros((r, r)));
                     } else {
-                        Array2::from_shape_vec((r, r), jet.contracted_fourth(lane).to_vec())
-                            .map_err(|error| {
-                                format!("empirical BMS fourth-contraction shape: {error}")
-                            })
+                        contracted.push(
+                            Array2::from_shape_vec((r, r), jet.contracted_fourth(lane).to_vec())
+                                .map_err(|error| {
+                                    format!("empirical BMS fourth-contraction shape: {error}")
+                                })?,
+                        );
                     }
-                })
-                .collect()
+                }
+            }
+            Ok(contracted)
         })
     }
 
@@ -3907,6 +3937,24 @@ mod empirical_flex_jet_oracle_tests {
         let mut out = Array1::<f64>::zeros(r);
         out[idx] = 1.0;
         out
+    }
+
+    #[test]
+    fn empirical_bms_directional_batch_budget_is_dimension_bounded_932() {
+        assert_eq!(empirical_bms_directional_batch_lanes(4), 8);
+        assert_eq!(empirical_bms_directional_batch_lanes(8), 8);
+        assert_eq!(empirical_bms_directional_batch_lanes(12), 4);
+        assert_eq!(empirical_bms_directional_batch_lanes(18), 1);
+
+        for r in 1..=128 {
+            let lanes = empirical_bms_directional_batch_lanes(r);
+            assert!((1..=EMPIRICAL_BMS_BATCH_LANE_CAP).contains(&lanes));
+            let channels = lanes.saturating_mul(r.saturating_mul(r));
+            assert!(
+                channels <= EMPIRICAL_BMS_BATCH_HESSIAN_CHANNEL_BUDGET || lanes == 1,
+                "r={r} lanes={lanes} carries {channels} Hessian channels"
+            );
+        }
     }
 
     /// Test handle bundling a family with one active deviation block and the
