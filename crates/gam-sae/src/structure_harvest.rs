@@ -868,9 +868,9 @@ pub fn harvest_move_proposals(
                 if births_deferred > 0 {
                     log::debug!(
                         "[structure-harvest] #2233 MDL pre-screen deferred {births_deferred} \
-                         birth(s) (total predicted ΔMDL {deferred_predicted_bits:.1} bits; span \
-                         ŝ={span:.2}, d={intrinsic_dim}, m={basis_size}); proposed {births_proposed} \
-                         ordered by predicted ΔMDL",
+                         birth(s) (total predicted ΔMDL {deferred_predicted_bits:.1} bits; \
+                         per-proposal local span) of {r} residual factors; proposed \
+                         {births_proposed} ordered by predicted ΔMDL",
                     );
                 }
             }
