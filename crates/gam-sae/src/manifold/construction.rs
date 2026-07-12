@@ -137,7 +137,7 @@ pub(crate) fn realised_rank_charge_dof(
     } else if rank_eff == 0.0 {
         log::debug!(
             "realised_rank_charge_dof: VANISHED decoder (categorical veto upstream) — \
-             top sv²/n_eff={top_signal:.6e} ≤ {VANISHED_REL:.0e}·R (R={r_floor:.6e}, \
+             top sv²/n_eff={top_signal:.6e} ≤ {RANK_VANISHED_REL:.0e}·R (R={r_floor:.6e}, \
              n_eff={n_eff:.3e}, p_out={p_out})"
         );
     }
