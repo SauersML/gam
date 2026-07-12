@@ -1279,7 +1279,7 @@ fn tail_cell_cache_key(
     cell: DenestedCubicCell,
     max_degree: usize,
 ) -> Option<TailCellMomentCacheKey> {
-    if cell.c2.abs() > NORMALIZED_CELL_BRANCH_TOL || cell.c3.abs() > NORMALIZED_CELL_BRANCH_TOL {
+    if cell.c2 != 0.0 || cell.c3 != 0.0 {
         return None;
     }
     match (!cell.left.is_finite(), !cell.right.is_finite()) {
@@ -2962,9 +2962,7 @@ where
     let left_score_span = score_span_at(left_probe)?;
     let left_link_span = link_span_at(a + b * left_probe)?;
     let left_coeffs = denested_cell_coefficients(left_score_span, left_link_span, a, b);
-    if left_coeffs[2].abs() > NORMALIZED_CELL_BRANCH_TOL
-        || left_coeffs[3].abs() > NORMALIZED_CELL_BRANCH_TOL
-    {
+    if left_coeffs[2] != 0.0 || left_coeffs[3] != 0.0 {
         return Err(CubicCellKernelError::invalid_cell_shape(format!(
             "left tail cell must be affine (deviations constant outside support), \
              got c2={:.3e}, c3={:.3e}",
@@ -3020,9 +3018,7 @@ where
     let right_score_span = score_span_at(right_probe)?;
     let right_link_span = link_span_at(a + b * right_probe)?;
     let right_coeffs = denested_cell_coefficients(right_score_span, right_link_span, a, b);
-    if right_coeffs[2].abs() > NORMALIZED_CELL_BRANCH_TOL
-        || right_coeffs[3].abs() > NORMALIZED_CELL_BRANCH_TOL
-    {
+    if right_coeffs[2] != 0.0 || right_coeffs[3] != 0.0 {
         return Err(CubicCellKernelError::invalid_cell_shape(format!(
             "right tail cell must be affine (deviations constant outside support), \
              got c2={:.3e}, c3={:.3e}",
@@ -3080,9 +3076,10 @@ pub fn normalized_non_affine_coefficients(
 
 #[inline]
 pub fn branch_cell(cell: DenestedCubicCell) -> Result<ExactCellBranch, String> {
+    validate_cell_inputs(cell)?;
     let tol = effective_branch_tol(cell);
     if !cell.left.is_finite() || !cell.right.is_finite() {
-        if cell.c2.abs() <= tol && cell.c3.abs() <= tol {
+        if cell.c2 == 0.0 && cell.c3 == 0.0 {
             return Ok(ExactCellBranch::Affine);
         }
         return Err(CubicCellKernelError::invalid_cell_shape(format!(
@@ -3493,7 +3490,12 @@ fn affine_anchor_moment_vector_into(
     }
 }
 
-fn affine_value_from_moment_primitive(alpha: f64, beta: f64, left: f64, right: f64) -> f64 {
+fn affine_value_from_moment_primitive(
+    alpha: f64,
+    beta: f64,
+    left: f64,
+    right: f64,
+) -> Result<f64, String> {
     // Exact formula via bivariate normal CDF.
     //
     // V(α,β,l,r) = ∫_l^r Φ(α+βz)φ(z)dz
@@ -3508,7 +3510,49 @@ fn affine_value_from_moment_primitive(alpha: f64, beta: f64, left: f64, right: f
     let s = (1.0 + beta * beta).sqrt();
     let h = alpha / s;
     let rho = -beta / s;
-    bivariate_normal_cdf_interval(h, left, right, rho).unwrap_or(0.0)
+    bivariate_normal_cdf_interval(h, left, right, rho)
+}
+
+fn validate_cell_inputs(cell: DenestedCubicCell) -> Result<(), String> {
+    for (name, value) in [
+        ("c0", cell.c0),
+        ("c1", cell.c1),
+        ("c2", cell.c2),
+        ("c3", cell.c3),
+    ] {
+        if !value.is_finite() {
+            return Err(CubicCellKernelError::invalid_cell_shape(format!(
+                "cell coefficient {name} must be finite, got {value}"
+            ))
+            .into());
+        }
+    }
+    if cell.left.is_nan() || cell.right.is_nan() || cell.left >= cell.right {
+        return Err(CubicCellKernelError::invalid_cell_shape(format!(
+            "cell bounds must satisfy left < right without NaN, got [{}, {}]",
+            cell.left, cell.right
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_affine_cell_inputs(cell: DenestedCubicCell, max_degree: usize) -> Result<(), String> {
+    validate_cell_inputs(cell)?;
+    if cell.c2 != 0.0 || cell.c3 != 0.0 {
+        return Err(CubicCellKernelError::invalid_cell_shape(format!(
+            "affine cell requires c2=c3=0 exactly, got c2={:.6e}, c3={:.6e}",
+            cell.c2, cell.c3
+        ))
+        .into());
+    }
+    if max_degree > MAX_AFFINE_ANCHOR_DEGREE {
+        return Err(CubicCellKernelError::invalid_cell_shape(format!(
+            "affine cell moment degree {max_degree} exceeds supported maximum {MAX_AFFINE_ANCHOR_DEGREE}"
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// Evaluate an affine cell (c2=c3=0) with a value/moment-consistent primitive.
@@ -3521,9 +3565,10 @@ pub fn evaluate_affine_cell_state(
     cell: DenestedCubicCell,
     max_degree: usize,
 ) -> Result<CellMomentState, String> {
+    validate_affine_cell_inputs(cell, max_degree)?;
     let alpha = cell.c0;
     let beta = cell.c1;
-    let value = affine_value_from_moment_primitive(alpha, beta, cell.left, cell.right);
+    let value = affine_value_from_moment_primitive(alpha, beta, cell.left, cell.right)?;
     let moments = affine_anchor_moment_vector(alpha, beta, cell.left, cell.right, max_degree);
     Ok(CellMomentState {
         branch: ExactCellBranch::Affine,
@@ -3536,6 +3581,7 @@ fn evaluate_affine_cell_derivative_state(
     cell: DenestedCubicCell,
     max_degree: usize,
 ) -> Result<CellDerivativeMomentState, String> {
+    validate_affine_cell_inputs(cell, max_degree)?;
     let alpha = cell.c0;
     let beta = cell.c1;
     let moments = affine_anchor_moment_vector(alpha, beta, cell.left, cell.right, max_degree);
@@ -3977,14 +4023,14 @@ fn evaluate_cell_state_dispatched<S>(
     affine: fn(DenestedCubicCell, usize) -> Result<S, String>,
     non_affine: fn(DenestedCubicCell, ExactCellBranch, usize) -> Result<S, String>,
 ) -> Result<S, String> {
+    validate_cell_inputs(cell)?;
     let left_inf = !cell.left.is_finite();
     let right_inf = !cell.right.is_finite();
     if left_inf || right_inf {
         // Semi-infinite tail cells must be affine: the deviation saturates
         // to a constant outside support, so c2=c3=0.  Both the BVN CDF
         // and the truncated-Gaussian moment vector handle infinite bounds.
-        if cell.c2.abs() > NORMALIZED_CELL_BRANCH_TOL || cell.c3.abs() > NORMALIZED_CELL_BRANCH_TOL
-        {
+        if cell.c2 != 0.0 || cell.c3 != 0.0 {
             return Err(CubicCellKernelError::invalid_cell_shape(format!(
                 "semi-infinite cell [{}, {}] must be affine (c2=c3=0), got c2={:.3e}, c3={:.3e}",
                 cell.left, cell.right, cell.c2, cell.c3
@@ -4670,6 +4716,80 @@ mod tests {
                 z.powi(degree as i32) * (-cell.q(z)).exp()
             });
             assert!((state.moments[degree] - target).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn affine_cell_errors_are_never_substituted_with_probability_zero_2293() {
+        let base = DenestedCubicCell {
+            left: -0.9,
+            right: 0.8,
+            c0: 0.15,
+            c1: -0.35,
+            c2: 0.0,
+            c3: 0.0,
+        };
+        for (field, invalid) in [
+            ("c0", f64::NAN),
+            ("c0", f64::INFINITY),
+            ("c1", f64::NEG_INFINITY),
+            ("c2", f64::NAN),
+            ("c3", f64::INFINITY),
+        ] {
+            let cell = match field {
+                "c0" => DenestedCubicCell { c0: invalid, ..base },
+                "c1" => DenestedCubicCell { c1: invalid, ..base },
+                "c2" => DenestedCubicCell { c2: invalid, ..base },
+                "c3" => DenestedCubicCell { c3: invalid, ..base },
+                _ => unreachable!(),
+            };
+            assert!(evaluate_affine_cell_state(cell, 3).is_err());
+            assert!(evaluate_cell_moments_uncached(cell, 3).is_err());
+        }
+        for cell in [
+            DenestedCubicCell {
+                left: f64::NAN,
+                ..base
+            },
+            DenestedCubicCell {
+                right: f64::NAN,
+                ..base
+            },
+            DenestedCubicCell {
+                left: 1.0,
+                right: 0.0,
+                ..base
+            },
+        ] {
+            assert!(evaluate_affine_cell_state(cell, 3).is_err());
+            assert!(evaluate_cell_moments_uncached(cell, 3).is_err());
+        }
+    }
+
+    #[test]
+    fn semi_infinite_cells_require_structurally_affine_coefficients_2293() {
+        let tiny_curvature = 0.5 * NORMALIZED_CELL_BRANCH_TOL;
+        for cell in [
+            DenestedCubicCell {
+                left: f64::NEG_INFINITY,
+                right: 0.5,
+                c0: 0.2,
+                c1: -0.1,
+                c2: tiny_curvature,
+                c3: 0.0,
+            },
+            DenestedCubicCell {
+                left: -0.5,
+                right: f64::INFINITY,
+                c0: 0.2,
+                c1: -0.1,
+                c2: 0.0,
+                c3: -tiny_curvature,
+            },
+        ] {
+            assert!(branch_cell(cell).is_err());
+            assert!(evaluate_cell_moments_uncached(cell, 3).is_err());
+            assert!(tail_cell_cache_key(cell, 3).is_none());
         }
     }
 
