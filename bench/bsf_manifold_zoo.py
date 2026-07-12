@@ -422,75 +422,40 @@ def _fit_ours_rust(
     """The production Rust REML path at its DEFAULTS (magic by default)."""
     import gamfit
 
-    from synth_sae_bench_manifold import _basis_values
-
-    t0 = time.perf_counter()
+    fit_start = time.perf_counter()
     fit = gamfit.sae_manifold_fit(
         X=train_x,
-        n_atoms=atoms,
+        K=atoms,
+        assignment="topk" if top_k is not None else "softmax",
         top_k=top_k,
         n_iter=n_iter,
         random_state=seed,
     )
-    fit_seconds = time.perf_counter() - t0
+    fit_seconds = time.perf_counter() - fit_start
 
-    def _r2_of(x: np.ndarray, recon: np.ndarray) -> float:
-        ss_res = float(np.sum((x - recon) ** 2))
-        ss_tot = float(np.sum((x - x.mean(axis=0, keepdims=True)) ** 2))
-        return 1.0 - ss_res / max(ss_tot, 1e-12)
-
-    # Three-way state-vs-encoder discriminator:
-    #   native   -- fit.fitted, the terminal state's own train reconstruction;
-    #   re-enc(train) -- converged_latents on the SAME train rows (re-encode);
-    #   re-enc(test)  -- the held-out encode the arena scores.
-    # native >> re-enc(train) localizes the loss to the OOS ENCODE path itself
-    # (row re-encoding, not data novelty); re-enc(train) >> re-enc(test) is a
-    # genuine generalization gap.
-    native_train_r2 = _r2_of(train_x, np.asarray(fit.fitted, dtype=float))
-    # COLD arm must run the GENUINE frozen-decoder OOS solve on the training
-    # rows. `converged_latents(train_x)` short-circuits on a bit-exact training
-    # matrix (`_is_training_data`) and returns the STORED training latents —
-    # which would make this arm vacuously equal to `native` and mislocalize the
-    # OOS collapse. Call the underlying OOS payload directly so the cold
-    # seed/routing path actually executes.
-    train_payload = fit._oos_payload(train_x, t_init=None, a_init=None)
-    reenc_train_r2 = _r2_of(train_x, np.asarray(train_payload["fitted"], dtype=float))
-    # Warm re-encode: seed the SAME frozen-decoder OOS solve with the training
-    # fit's own converged coords/logits. Recovering the native number here
-    # proves the solver is sound and localizes the cold-path loss to
-    # seeding/routing; staying collapsed indicts the solve itself.
-    d_max = max(int(np.asarray(c).shape[1]) for c in fit.coords)
-    t_init = np.zeros((len(fit.coords), train_x.shape[0], d_max))
-    for k, c in enumerate(fit.coords):
-        c = np.asarray(c, dtype=float)
-        t_init[k, :, : c.shape[1]] = c
-    warm_payload = fit.converged_latents(
-        train_x, t_init=t_init, a_init=np.asarray(fit.low_level_logits, dtype=float)
-    )
-    warm_train_r2 = _r2_of(train_x, np.asarray(warm_payload["fitted"], dtype=float))
-    print(
-        f"[ours_rust] native train r2 {native_train_r2:.4f} | "
-        f"re-encode(train) COLD r2 {reenc_train_r2:.4f} | "
-        f"re-encode(train) WARM r2 {warm_train_r2:.4f}",
-        flush=True,
-    )
+    oos_start = time.perf_counter()
     payload = fit.converged_latents(test_x)
+    oos_seconds = time.perf_counter() - oos_start
     assignments = np.asarray(payload["assignments"], dtype=float)
     recon = np.asarray(payload["fitted"], dtype=float)
     coords = [np.asarray(c, dtype=float) for c in payload["coords"]]
+    atom_images = [np.asarray(image, dtype=float) for image in payload["atom_images"]]
     blocks = [np.asarray(b, dtype=float) for b in fit.decoder_blocks]
+    if len(atom_images) != assignments.shape[1]:
+        raise RuntimeError(
+            "native OOS atom-image count does not match the assignment width: "
+            f"{len(atom_images)} != {assignments.shape[1]}"
+        )
 
+    contribution_cache: dict[int, np.ndarray] = {}
     def contribution(g: int) -> np.ndarray:
-        basis = fit.basis_specs[g]
-        n_harm = fit._n_harmonics[g] if g < len(fit._n_harmonics) else 1
-        centers = fit._duchon_centers[g] if g < len(fit._duchon_centers) else None
-        phi = _basis_values(basis, coords[g], n_harm, centers)
-        rows = min(phi.shape[1], blocks[g].shape[0])
-        return assignments[:, g:g + 1] * (phi[:, :rows] @ blocks[g][:rows])
+        if g not in contribution_cache:
+            contribution_cache[g] = assignments[:, g:g + 1] * atom_images[g]
+        return contribution_cache[g]
 
     d_atoms = [np.asarray(c).shape[1] if np.asarray(c).ndim == 2 else 1 for c in coords]
     native_bpt = None
-    dl = getattr(fit, "description_length", None)
+    dl = fit.description_length()
     if isinstance(dl, dict) and "bits_per_token" in dl:
         native_bpt = float(dl["bits_per_token"])
     return FittedFeaturizer(
@@ -503,7 +468,14 @@ def _fit_ours_rust(
         fit_seconds=fit_seconds,
         native_bits_per_token=native_bpt,
         atom_intrinsic_coords=lambda g: coords[g],
-        extras={"basis_specs": list(fit.basis_specs)},
+        extras={
+            "basis_kinds": list(fit.basis_kinds),
+            "atom_dims": list(fit.atom_dims),
+            "profile": {
+                "native_fit_seconds": fit_seconds,
+                "heldout_oos_seconds": oos_seconds,
+            },
+        },
     )
 
 
@@ -833,9 +805,36 @@ def main() -> int:
                 raise
         else:
             raise SystemExit(f"unknown featurizer {which!r}")
+        scoring_start = time.perf_counter()
         recovery = score_recovery(
             data, fitted, test_active, contribs,
             flat_multi_atom=(which == "flat"),
+        )
+        scoring_seconds = time.perf_counter() - scoring_start
+
+        mdl_start = time.perf_counter()
+        mdl = description_length(fitted, test_x)
+        mdl_seconds = time.perf_counter() - mdl_start
+
+        dimensionality_start = time.perf_counter()
+        dimensionality = stable_ranks(fitted)
+        dimensionality_seconds = time.perf_counter() - dimensionality_start
+
+        dump_seconds = 0.0
+        if clouds_dir is not None:
+            dump_start = time.perf_counter()
+            dump_clouds(
+                clouds_dir / f"clouds_{fitted.name}_seed{args.seed}.npz",
+                data, fitted, contribs, recovery,
+            )
+            dump_seconds = time.perf_counter() - dump_start
+
+        profile = dict(fitted.extras.get("profile", {}))
+        profile.update(
+            recovery_scoring_seconds=scoring_seconds,
+            description_length_seconds=mdl_seconds,
+            dimensionality_seconds=dimensionality_seconds,
+            cloud_dump_seconds=dump_seconds,
         )
         record = {
             "record": "result",
@@ -846,9 +845,10 @@ def main() -> int:
             "recovery_r2_mean": recovery["r2_mean"],
             "recovery_r2_by_kind": recovery["r2_by_kind"],
             "coords_per_activation_mean": recovery["coords_per_activation_mean"],
-            "mdl": description_length(fitted, test_x),
-            "dimensionality": stable_ranks(fitted),
+            "mdl": mdl,
+            "dimensionality": dimensionality,
             "per_factor": recovery["per_factor"],
+            "profile": profile,
         }
         with out_path.open("a") as fh:
             fh.write(json.dumps(record) + "\n")
@@ -860,11 +860,10 @@ def main() -> int:
         )
         for kind, val in recovery["r2_by_kind"].items():
             print(f"    {kind:>8s}: {val:.4f}")
-        if clouds_dir is not None:
-            dump_clouds(
-                clouds_dir / f"clouds_{fitted.name}_seed{args.seed}.npz",
-                data, fitted, contribs, recovery,
-            )
+        print(
+            "    profile: "
+            + ", ".join(f"{name}={seconds:.2f}s" for name, seconds in profile.items())
+        )
     return 0
 
 

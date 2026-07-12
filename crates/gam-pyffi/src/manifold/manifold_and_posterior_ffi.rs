@@ -6922,18 +6922,29 @@ impl ManifoldSaeCore {
                 .ok_or_else(|| py_value_error("OOS payload missing 'atoms'".to_string()))?;
             let atoms = atoms.cast::<PyList>()?;
             let coords = PyList::empty(py);
+            let atom_images = PyList::empty(py);
             for atom in atoms.iter() {
                 let atom = atom.cast::<PyDict>()?;
                 let block = atom.get_item("on_atom_coords_t")?.ok_or_else(|| {
                     py_value_error("OOS atom payload missing 'on_atom_coords_t'".to_string())
                 })?;
                 coords.append(block)?;
+                let reconstruction = atom.get_item("atom_reconstruction")?.ok_or_else(|| {
+                    py_value_error("OOS atom payload missing 'atom_reconstruction'".to_string())
+                })?;
+                atom_images.append(reconstruction)?;
             }
             let out = PyDict::new(py);
             out.set_item("fitted", fitted)?;
             out.set_item("assignments", assignments)?;
             out.set_item("logits", logits)?;
             out.set_item("coords", coords)?;
+            // Native, unweighted per-atom decoded images g_k(t_ik). Consumers
+            // obtain the additive contribution as a_ik * g_k(t_ik).
+            // Exposing the already-materialized OOS report prevents Python
+            // callers from replaying an incomplete basis zoo (and getting
+            // sphere / torus / Mobius decoding wrong).
+            out.set_item("atom_images", atom_images)?;
             return Ok(out.unbind());
         }
 

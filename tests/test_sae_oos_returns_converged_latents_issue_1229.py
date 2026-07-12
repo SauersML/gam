@@ -124,6 +124,14 @@ def test_oos_returned_assignments_reconstruct_the_returned_fitted() -> None:
     fit = _fit(X_train)
     payload = fit.converged_latents(X_oos)
     fitted = np.asarray(payload["fitted"], dtype=float)
+    decoded = [
+        np.asarray(block, dtype=float)
+        for block in payload["atom_images"]
+    ]
+
+    assert len(decoded) == len(fit.atoms)
+    assert all(block.shape == fitted.shape for block in decoded)
+    assert all(np.isfinite(block).all() for block in decoded)
 
     # `reconstruct` runs the same OOS solve and returns its fitted values; a
     # second call on the same held-out input must reproduce the same
