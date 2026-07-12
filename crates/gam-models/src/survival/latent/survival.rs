@@ -1162,18 +1162,22 @@ struct LatentSurvivalPrimaryPoint {
 }
 
 impl LatentSurvivalPrimaryPoint {
+    /// Log-scale factor used only by derivatives along the learnable-sigma
+    /// coordinate. Fixed zero frailty has no such coordinate, so its factor is
+    /// the neutral finite placeholder; every other invalid scale remains NaN
+    /// or infinite and is rejected by the kernel's numerical checks.
     #[inline]
     fn log_sigma_factor(self) -> f64 {
-        if self.sigma > 0.0 {
-            self.sigma.ln()
-        } else {
+        if self.sigma == 0.0 {
             0.0
+        } else {
+            self.sigma.ln()
         }
     }
 }
 
 #[cfg(test)]
-mod test_support_kernel_recurrence {
+mod tests_kernel_recurrence {
     use super::*;
     use std::collections::BTreeMap;
 
@@ -1417,8 +1421,8 @@ fn latent_kernel_term_sequence_inline(
 }
 
 #[cfg(test)]
-mod test_support_multidir_kernel {
-    use super::test_support_kernel_recurrence::latent_kernel_differentiate_terms;
+mod tests_multidir_kernel {
+    use super::tests_kernel_recurrence::latent_kernel_differentiate_terms;
     use super::*;
     use gam_math::jet_partitions::MultiDirJet as LatentMultiDirJet;
 
@@ -1946,8 +1950,8 @@ fn latent_survival_map_right_direction(
 }
 
 #[cfg(test)]
-mod test_support_multidir_row {
-    use super::test_support_multidir_kernel::latent_kernel_sum_log_jet;
+mod tests_multidir_row {
+    use super::tests_multidir_kernel::latent_kernel_sum_log_jet;
     use super::*;
     use gam_math::jet_partitions::MultiDirJet as LatentMultiDirJet;
 
@@ -2572,8 +2576,8 @@ fn latent_survival_row_primary_fourth_contracted(
 }
 
 #[cfg(test)]
-mod test_support_multidir_channels {
-    use super::test_support_multidir_row::latent_survival_row_primary_log_jet_multidir_reference;
+mod tests_multidir_channels {
+    use super::tests_multidir_row::latent_survival_row_primary_log_jet_multidir_reference;
     use super::*;
 
     pub(super) fn latent_survival_row_primary_gradient_hessian_multidir_reference(
@@ -5365,7 +5369,7 @@ impl CustomFamily for LatentBinaryFamily {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support_multidir_channels::{
+    use super::tests_multidir_channels::{
         latent_survival_row_primary_fourth_contracted_multidir_reference,
         latent_survival_row_primary_gradient_hessian_multidir_reference,
         latent_survival_row_primary_third_contracted_multidir_reference,
