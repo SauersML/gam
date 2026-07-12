@@ -42,7 +42,7 @@ use ndarray::ArrayView2;
 use crate::migration_ledger::{BirthSeed, MoveEvidence, MoveReason, MoveStage, SaeMigrationLedger};
 use crate::sparse_dict::{
     BlockSeedPolicy, BlockSparseConfig, BlockSparseFit, CofitConfig, CofitReport,
-    cofit_block_and_curved, fit_block_sparse_dictionary_best_effort_with_seed,
+    cofit_block_and_curved, fit_block_sparse_dictionary_with_seed,
 };
 use crate::tiered::Tier0Mean;
 
@@ -184,19 +184,8 @@ pub fn fit_tiered(
     let seed_policy = config
         .tier1_seed
         .resolve(r0_f32.nrows(), r0_f32.ncols(), &config.tier1);
-    // Best-effort completion (#2275): at `K ≫ intrinsic-rank` the frame-projector
-    // fixed point legitimately does not certify (~`K − rank` structurally spurious
-    // blocks pinned above tolerance), which used to collapse to `Err` and skip
-    // Tier-2 entirely. Take the best fixed point reached and run Tier-2 on its
-    // residual regardless; the open certificate rides on `tier1.convergence`
-    // (`certified` + residuals) so callers see exactly which invariants closed. Real
-    // failures (validation, polar, routing) still propagate. When the frame fixed
-    // point DID certify this is identical to the historical certified path.
-    let tier1 = fit_block_sparse_dictionary_best_effort_with_seed(
-        r0_f32.view(),
-        &config.tier1,
-        seed_policy,
-    )?;
+    let tier1 =
+        fit_block_sparse_dictionary_with_seed(r0_f32.view(), &config.tier1, seed_policy)?;
 
     let mut ledger = SaeMigrationLedger::new();
 

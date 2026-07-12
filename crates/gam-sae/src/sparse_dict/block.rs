@@ -313,15 +313,6 @@ pub struct BlockSparseConvergence {
     /// certificate always records zero.
     pub polar_failures: usize,
     pub tolerance: f64,
-    /// Whether the frame-projector fixed point CERTIFIED to `tolerance` (no
-    /// accepted births, no polar failures, residuals within tolerance on the
-    /// replayed full alternation). `false` marks a **best-effort** fit returned
-    /// at `K ≫ intrinsic-rank` where ~`K − rank` blocks are structurally spurious
-    /// and the frame residual legitimately cannot close (#2275) — the residual
-    /// fields above then quantify exactly how open the certificate is. The
-    /// certified Err-contract entry point (`fit_block_sparse_dictionary*`) never
-    /// returns a `certified: false` fit; only the `*_best_effort_*` entry does.
-    pub certified: bool,
 }
 
 impl BlockSparseConvergence {
@@ -339,7 +330,6 @@ impl BlockSparseConvergence {
             accepted_births: 0,
             polar_failures: 0,
             tolerance: 1e-6,
-            certified: true,
         }
     }
 }
@@ -2173,7 +2163,6 @@ fn fit_block_sparse_dictionary_with_seed_inner(
     x: ArrayView2<'_, f32>,
     config: &BlockSparseConfig,
     seed_policy: BlockSeedPolicy,
-    best_effort: bool,
 ) -> Result<BlockSparseFit, BlockSparseFitError> {
     validate(x, config)?;
     let n = x.nrows();
@@ -2258,13 +2247,9 @@ fn fit_block_sparse_dictionary_with_seed_inner(
         }
     }
 
-    // Certified Err-contract: a non-certified fit collapses to `NonConvergence`
-    // BEFORE finalization, byte-identical to the historical contract (the reported
-    // `explained_variance` is the pre-γ-refresh `state` EV). The best-effort entry
-    // instead finalizes the same best fixed point and returns it with
-    // `certified: false` so the caller (e.g. `fit_tiered` at K ≫ rank) can run the
-    // next tier on its residual with the open certificate attached (#2275).
-    if !converged && !best_effort {
+    // A non-certified iterate is not a fit. Surface the complete replay evidence
+    // before finalization so no downstream tier can consume an open fixed point.
+    if !converged {
         return Err(BlockSparseFitError::NonConvergence {
             epochs: epochs_run,
             explained_variance: state.explained_variance,
@@ -2278,8 +2263,6 @@ fn fit_block_sparse_dictionary_with_seed_inner(
             polar_failures,
         });
     }
-    let certified = converged;
-
     let BlockSparseState {
         mut decoder,
         mut codes,
@@ -2376,7 +2359,6 @@ fn fit_block_sparse_dictionary_with_seed_inner(
             accepted_births,
             polar_failures,
             tolerance: config.tolerance,
-            certified,
         },
         block_topk: k,
         block_size: b,
@@ -2391,30 +2373,13 @@ fn fit_block_sparse_dictionary_with_seed_inner(
 ///
 /// **Certified Err contract:** returns `Err(NonConvergence)` if the frame-projector
 /// fixed point does not certify to `config.tolerance`. Byte-identical to the historical
-/// behaviour. For the K ≫ rank best-effort path see
-/// [`fit_block_sparse_dictionary_best_effort_with_seed`].
+/// behaviour.
 pub fn fit_block_sparse_dictionary_with_seed(
     x: ArrayView2<'_, f32>,
     config: &BlockSparseConfig,
     seed_policy: BlockSeedPolicy,
 ) -> Result<BlockSparseFit, BlockSparseFitError> {
-    fit_block_sparse_dictionary_with_seed_inner(x, config, seed_policy, false)
-}
-
-/// Best-effort variant of [`fit_block_sparse_dictionary_with_seed`]: when the
-/// frame-projector fixed point does not certify (the well-posed `K ≫ intrinsic-rank`
-/// regime where ~`K − rank` blocks are structurally spurious, #2275), return the best
-/// fixed point reached with `convergence.certified = false` and the open residuals,
-/// instead of an opaque `Err`. Real failures (validation, polar subsolve, routing)
-/// still propagate as `Err`. The certified case is identical to the Err-contract entry.
-/// This is the completion path `fit_tiered` uses so Tier-2 can run on the Tier-1
-/// residual at the tiered architecture's design scale.
-pub fn fit_block_sparse_dictionary_best_effort_with_seed(
-    x: ArrayView2<'_, f32>,
-    config: &BlockSparseConfig,
-    seed_policy: BlockSeedPolicy,
-) -> Result<BlockSparseFit, BlockSparseFitError> {
-    fit_block_sparse_dictionary_with_seed_inner(x, config, seed_policy, true)
+    fit_block_sparse_dictionary_with_seed_inner(x, config, seed_policy)
 }
 
 /// Overwrite `gates[i,j] = γ·‖x_i D_{g}ᵀ‖₂` for the packed routing, so the stored
