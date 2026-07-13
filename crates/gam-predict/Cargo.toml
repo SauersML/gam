@@ -29,6 +29,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 # `linalg.rs` unit tests assemble sparse `DesignMatrix` fixtures directly from
 # faer triplets, so faer is a genuine test-only dependency.
 faer = "0.24.0"
+rand = "0.10.1"
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 
 [lints.rust]

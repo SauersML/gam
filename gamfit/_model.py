@@ -667,14 +667,19 @@ class Model:
         """Draw posterior-predictive replicate responses at ``data`` (#1057).
 
         Each of the ``n_draws`` rows is a fresh synthetic response vector drawn
-        from the fitted predictive distribution — the family-aware observation
-        noise (Gaussian / Poisson / Bernoulli / Gamma / Beta / Tweedie /
-        Negative-Binomial) wrapped around the plug-in mean ``g^{-1}(X·beta_hat)``.
+        from the fitted predictive distribution. The saved model's canonical
+        generative capability supplies both its response-scale predictor and
+        observation law; this includes exact spline-scan fits and fitted
+        location/dispersion-scale or transformation-normal families without a
+        second Python family allowlist.
         This is the *observation* replicate path (distinct from :meth:`sample`,
         which draws the *parameter* posterior) and is the engine for
         posterior-predictive checks, synthetic-data generation, and
-        simulation-based calibration. The family and fitted dispersion are read
-        from the saved model — there is no family flag.
+        simulation-based calibration. The family, fitted dispersion, and any
+        analytic row-weight column are read from the saved model — there is no
+        family flag and no refit. Weighted models require that column in
+        ``data`` because replacing missing weights by one would sample from a
+        different observation law.
 
         Parameters
         ----------

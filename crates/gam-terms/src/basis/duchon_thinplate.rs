@@ -589,7 +589,6 @@ fn build_duchon_basis_uncached(
         aniso.as_deref(),
         &kernel_transform,
         identifiability_transform.as_ref(),
-        poly_cols,
     )?;
     if let Some(points) = operator_collocation_points.as_ref() {
         candidates.extend(duchon_operator_penalty_candidates(
@@ -683,9 +682,6 @@ pub fn duchon_penalties_at_length_scale(
         }
         kernel_transform = fast_ab(&kernel_transform, v);
     }
-    // Polynomial column count: `C(d+r, r)`, independent of the row count, so the
-    // n-free centers-based form equals the cold build's data-based `.ncols()`.
-    let poly_cols = polynomial_block_from_order(centers, effective_nullspace_order).ncols();
     let mut candidates = duchon_native_penalty_candidates(
         centers,
         length_scale,
@@ -694,7 +690,6 @@ pub fn duchon_penalties_at_length_scale(
         aniso.as_deref(),
         &kernel_transform,
         identifiability_transform,
-        poly_cols,
     )?;
     if let Some(points) = operator_collocation_points {
         candidates.extend(duchon_operator_penalty_candidates(
@@ -1847,15 +1842,14 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
 pub(crate) fn active_thin_plate_penalty_derivatives(
     penaltyinfo: &[PenaltyInfo],
     primary_derivative: &Array2<f64>,
+    nullspace_derivative: &Array2<f64>,
 ) -> Result<Vec<Array2<f64>>, BasisError> {
     penaltyinfo
         .iter()
         .filter(|info| info.active)
         .map(|info| match &info.source {
             PenaltySource::Primary => Ok(primary_derivative.clone()),
-            PenaltySource::DoublePenaltyNullspace => {
-                Ok(Array2::<f64>::zeros(primary_derivative.raw_dim()))
-            }
+            PenaltySource::DoublePenaltyNullspace => Ok(nullspace_derivative.clone()),
             other => Err(BasisError::InvalidInput(format!(
                 "unexpected ThinPlate penalty source in psi-derivative path: {other:?}"
             ))),
@@ -1874,7 +1868,7 @@ pub fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     spec: &ThinPlateBasisSpec,
     identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
-) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
+) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>, Array2<f64>), BasisError> {
     // Match build_thin_plate_basis exactly (Wood-TPRS path):
     //
     //   M(ψ)        = Z_kernel^T Ω(ψ) Z_kernel
@@ -2085,7 +2079,103 @@ pub fn build_thin_plate_penalty_psi_derivativeswithworkspace(
     let s_psi_out = project_penalty_matrix(&s_norm_psi, identifiability_transform);
     let s_psi_psi_out = project_penalty_matrix(&s_norm_pp, identifiability_transform);
 
-    Ok((s_psi_out, s_psi_psi_out))
+    // 9) Differentiate the double penalty in the same compact function metric
+    // used by the value path.  The frozen center support is an n-independent
+    // quadrature for this regression-spline chart.  With V and the outer
+    // identifiability chart frozen at the base point, its value design and
+    // derivatives are
+    //
+    //   B    = [Omega Z V | P(C)] T,
+    //   B_p  = [Omega_p Z V | 0] T,
+    //   B_pp = [Omega_pp Z V | 0] T.
+    //
+    // Therefore G=B'B follows the exact product rule.  The target frame is
+    // structural: coefficients whose kernel coordinates vanish after T, i.e.
+    // the surviving polynomial-function subspace.  Differentiating
+    // G N (N' G N)^-1 N' G then gives the analytic ridge derivatives; no
+    // eigenspace derivative, finite difference, or coefficient-space projector
+    // enters this path.
+    let kernel_transform = fast_ab(&z_kernel, &v);
+    let center_kernel = fast_ab(&omega, &kernel_transform);
+    let center_kernel_psi = fast_ab(&omega_psi, &kernel_transform);
+    let center_kernel_pp = fast_ab(&omega_psi_psi, &kernel_transform);
+    let center_mean: Vec<f64> = (0..d)
+        .map(|axis| centers.column(axis).sum() / k.max(1) as f64)
+        .collect();
+    let mut centered = centers.to_owned();
+    for axis in 0..d {
+        let mean = center_mean[axis];
+        centered.column_mut(axis).mapv_inplace(|value| value - mean);
+    }
+    let center_poly = thin_plate_polynomial_block(centered.view());
+    let mut center_design = Array2::<f64>::zeros((k, total_cols));
+    let mut center_design_psi = Array2::<f64>::zeros((k, total_cols));
+    let mut center_design_pp = Array2::<f64>::zeros((k, total_cols));
+    center_design
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&center_kernel);
+    center_design
+        .slice_mut(s![.., kernel_cols..])
+        .assign(&center_poly);
+    center_design_psi
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&center_kernel_psi);
+    center_design_pp
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&center_kernel_pp);
+
+    let (center_design, center_design_psi, center_design_pp, null_frame) =
+        if let Some(transform) = identifiability_transform {
+            if transform.nrows() != total_cols {
+                crate::bail_dim_basis!(
+                    "thin-plate identifiability transform has {} rows, expected {}",
+                    transform.nrows(),
+                    total_cols
+                );
+            }
+            let kernel_coordinate_map = transform.slice(s![0..kernel_cols, ..]).to_owned();
+            let (frame, _) = rrqr_nullspace_basis(
+                &kernel_coordinate_map.t().to_owned(),
+                default_rrqr_rank_alpha(),
+            )
+            .map_err(BasisError::LinalgError)?;
+            (
+                fast_ab(&center_design, transform),
+                fast_ab(&center_design_psi, transform),
+                fast_ab(&center_design_pp, transform),
+                frame,
+            )
+        } else {
+            let mut frame = Array2::<f64>::zeros((total_cols, poly_cols));
+            for column in 0..poly_cols {
+                frame[[kernel_cols + column, column]] = 1.0;
+            }
+            (center_design, center_design_psi, center_design_pp, frame)
+        };
+    let gram = symmetrize_penalty(&fast_ata(&center_design));
+    let gram_psi = symmetrize_penalty(
+        &(fast_atb(&center_design_psi, &center_design)
+            + fast_atb(&center_design, &center_design_psi)),
+    );
+    let gram_pp = symmetrize_penalty(
+        &(fast_atb(&center_design_pp, &center_design)
+            + fast_atb(&center_design_psi, &center_design_psi).mapv(|value| 2.0 * value)
+            + fast_atb(&center_design, &center_design_pp)),
+    );
+    let ridge_jet = function_space_subspace_shrinkage_derivatives(
+        &null_frame,
+        &gram,
+        &gram_psi,
+        &gram_psi,
+        &gram_pp,
+    )?;
+    let (_, ridge_psi, ridge_pp, _) = normalize_penaltywith_psi_derivatives(
+        &ridge_jet.value,
+        &ridge_jet.first_a,
+        &ridge_jet.mixed,
+    );
+
+    Ok((s_psi_out, s_psi_psi_out, ridge_psi, ridge_pp))
 }
 
 /// Build the design ψ-derivatives for a Thin-Plate Spline term via the shared
@@ -2199,19 +2289,31 @@ pub fn build_thin_plate_basis_log_kappa_derivativeswithworkspace(
         identifiability_transform.as_ref(),
         workspace,
     )?;
-    let (primary_derivative_opt, primarysecond_derivative_opt) =
-        build_thin_plate_penalty_psi_derivativeswithworkspace(
-            centers.view(),
-            &derivative_spec,
-            identifiability_transform.as_ref(),
-            workspace,
-        )?;
+    let (
+        primary_derivative_opt,
+        primarysecond_derivative_opt,
+        nullspace_derivative_opt,
+        nullspacesecond_derivative_opt,
+    ) = build_thin_plate_penalty_psi_derivativeswithworkspace(
+        centers.view(),
+        &derivative_spec,
+        identifiability_transform.as_ref(),
+        workspace,
+    )?;
     let primary_derivative = primary_derivative_opt;
     let primarysecond_derivative = primarysecond_derivative_opt;
-    let penalties_derivative =
-        active_thin_plate_penalty_derivatives(&base.penaltyinfo, &primary_derivative)?;
-    let penaltiessecond_derivative =
-        active_thin_plate_penalty_derivatives(&base.penaltyinfo, &primarysecond_derivative)?;
+    let nullspace_derivative = nullspace_derivative_opt;
+    let nullspacesecond_derivative = nullspacesecond_derivative_opt;
+    let penalties_derivative = active_thin_plate_penalty_derivatives(
+        &base.penaltyinfo,
+        &primary_derivative,
+        &nullspace_derivative,
+    )?;
+    let penaltiessecond_derivative = active_thin_plate_penalty_derivatives(
+        &base.penaltyinfo,
+        &primarysecond_derivative,
+        &nullspacesecond_derivative,
+    )?;
     Ok(BasisPsiDerivativeBundle {
         first: BasisPsiDerivativeResult {
             design_derivative: scalar.design_first,

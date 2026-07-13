@@ -2232,7 +2232,6 @@ pub fn build_duchon_native_penalty_psi_derivatives(
         spec.aniso_log_scales.as_deref(),
         &z,
         identifiability_transform,
-        poly_cols,
     )?;
     let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     let mut sources = Vec::new();

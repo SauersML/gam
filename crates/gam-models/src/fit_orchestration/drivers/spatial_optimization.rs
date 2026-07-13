@@ -5411,7 +5411,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 if spec.radial_reparam.is_none() {
                     spec.radial_reparam = radial_reparam.clone();
                 }
-                let (primary, _primary_second) =
+                let (primary, _primary_second, nullspace, _nullspace_second) =
                     gam_terms::basis::build_thin_plate_penalty_psi_derivativeswithworkspace(
                         centers.view(),
                         &spec,
@@ -5420,7 +5420,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     )
                     .map_err(|e| e.to_string())?;
                 if self.design.penalties.len() > 1 {
-                    vec![primary.clone(), Array2::<f64>::zeros(primary.raw_dim())]
+                    vec![primary, nullspace]
                 } else {
                     vec![primary]
                 }

@@ -6952,6 +6952,7 @@ fn fit_dataset_impl(
                             dataset.headers.clone(),
                             dataset.feature_ranges(),
                         );
+                    scan_payload.weight_column = fit_config.weight_column.clone();
                     scan_payload.group_metadata = fit_config.group_metadata.clone();
                     scan_payload.training_table_kind = fit_config.training_table_kind.clone();
                     scan_payload.inference_notes = inference_notes;
@@ -8764,11 +8765,8 @@ fn predict_table_jackknife_plus(
 ///
 /// Returns a row-major flat `Vec<f64>` of shape `(n_draws, n_rows)` plus the
 /// two dimensions, so the Python side can reshape into a numpy array without
-/// a copy. Survives any family supported by `NoiseModel::from_likelihood`
-/// (Gaussian, Poisson, Bernoulli, Gamma, Beta, NegBin, Tweedie). Survival /
-/// transformation-normal / scan-routed models are rejected early with a clear
-/// error — they are not Gauss GLMs and `generativespec_from_predict` does not
-/// cover them.
+/// a copy. Family/model-class capability dispatch lives in `gam-predict`; this
+/// FFI boundary never keeps its own allowlist or substitutes a different fit.
 #[pyfunction]
 fn generative_replicates(
     py: Python<'_>,
@@ -8798,105 +8796,35 @@ fn generative_replicates_encoded_impl(
     n_draws: usize,
     seed: u64,
 ) -> Result<(Vec<f64>, usize), String> {
-    use gam::inference::generative::{generativespec_from_predict, sampleobservation_replicates};
+    use gam::inference::generative::sampleobservation_replicates;
     use rand::SeedableRng;
     let model = load_model_impl(model_bytes)?;
-    // Only standard GAM models have a dense predictor + UnifiedFitResult.
-    if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
-        return Err(format!(
-            "sample_replicates supports only standard GAM models; got '{}'. \
-             Use the appropriate posterior sampling method for this model class.",
-            prediction_model_class_label(&model)
-        ));
-    }
-    // Scan-routed models: no dense predictor, no family-based noise model.
-    if scan_introspection(&model).map_err(String::from)?.is_some() {
-        return Err(
-            "sample_replicates is not yet supported for exact O(n) scan models; \
-             refit with double_penalty=true to obtain the standard B-spline model."
-                .to_string(),
-        );
-    }
-    let family = model_likelihood_spec(&model);
-    // Reject families generativespec_from_predict cannot handle (custom /
-    // survival-parametric / latent-cloglog). They require a different noise
-    // model path not yet covered by the built-in generative engine.
-    match &family.response {
-        gam::types::ResponseFamily::Gaussian
-        | gam::types::ResponseFamily::Binomial
-        | gam::types::ResponseFamily::Poisson
-        | gam::types::ResponseFamily::NegativeBinomial { .. }
-        | gam::types::ResponseFamily::Beta { .. }
-        | gam::types::ResponseFamily::Gamma
-        | gam::types::ResponseFamily::Tweedie { .. } => {}
-        other => {
-            return Err(format!(
-                "sample_replicates does not yet support the '{}' family; \
-                 supported families: gaussian, binomial, poisson, negbin, \
-                 beta, gamma, tweedie",
-                format!("{other:?}")
-            ));
-        }
-    }
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
     let col_map = dataset.column_map();
     let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
     let offset_noise =
         resolve_offset_column(&dataset, &col_map, model.noise_offset_column.as_deref())?;
-    // Resolve the analytic prior-weights column exactly as the mean/noise offsets
-    // are resolved above. A weighted Gaussian fit has `Var(y_i) = sigma^2 / w_i`,
-    // so replicate observation noise must be heteroskedastic in `w_i`; dropping
-    // the weights here drew every row from the pooled scalar `N(mu_i, sigma_hat^2)`
-    // (#2025). `resolve_weight_column` returns unit weights when the model carried
-    // no weight column, leaving unweighted fits unchanged.
-    //
-    // If the model was fitted with weights but the caller's replicate frame does
-    // not carry that column, fall back to unit weights rather than erroring: the
-    // #2025 heteroskedastic contract (Var(y_i)=sigma_hat^2/w_i) degrades to the
-    // pooled scalar `N(mu_i, sigma_hat^2)` when per-row weights are unavailable,
-    // which is the correct default in the absence of the column.
-    let weight_column = model
-        .weight_column
-        .as_deref()
-        .filter(|name| col_map.contains_key(*name));
-    let prior_weights = resolve_weight_column(&dataset, &col_map, weight_column)?;
-    let predict_input = build_predict_input_for_model(
+    // `None` means the SAVED fit is genuinely unweighted. A saved weight-column
+    // name must resolve in the requested rows; changing it to unit weights would
+    // change the fitted Gaussian observation law `sigma^2 / w_i`.
+    let prior_weights = match model.weight_column.as_deref() {
+        Some(column) => Some(resolve_weight_column(&dataset, &col_map, Some(column))?),
+        None => None,
+    };
+    let spec = gam_predict::generative_spec_for_saved_model(
         &model,
-        dataset.values.view(),
-        &col_map,
-        model.training_headers.as_ref(),
-        &offset,
-        &offset_noise,
-        false,
-    )?;
-    let predictor = model
-        .predictor()
-        .ok_or_else(|| "saved model could not construct a predictor".to_string())?;
-    let fit = fit_result_from_saved_model_for_prediction(&model)?;
-    let prediction = predictor
-        .predict_plugin_response(&predict_input)
-        .map_err(|e| format!("generative_replicates: prediction failed: {e}"))?;
-    let n_rows = prediction.mean.len();
-    // Extract the fitted dispersion through the SINGLE canonical picker that the
-    // CLI `gam generate` path also uses. This crate previously carried its own
-    // inline copy of the mapping, and its NB arm returned the *seed* theta
-    // (`Some(*theta)`) instead of `likelihood_scale.negbin_theta()` — so
-    // `Model.sample_replicates` drew Negative-Binomial counts at theta = 1
-    // regardless of the fitted overdispersion (the live remnant of #1124 in the
-    // Python path). Routing through `gam::inference::generative::family_noise_parameter`
-    // keeps the supported families and the interpretation of every dispersion
-    // parameter identical across the CLI and Python front-ends — the whole point
-    // of unifying the picker — so this class of bug cannot diverge again.
-    let gaussian_scale = gam::inference::generative::family_noise_parameter(
-        fit.likelihood_scale,
-        fit.standard_deviation,
-        &family,
+        gam_predict::SavedGenerativeInput {
+            data: dataset.values.view(),
+            col_map: &col_map,
+            training_headers: model.training_headers.as_ref(),
+            offset: &offset,
+            offset_noise: &offset_noise,
+            noise_offset_supplied: model.noise_offset_column.is_some(),
+            prior_weights: prior_weights.as_ref(),
+        },
     )
-    .map_err(|err| format!("generative_replicates: unresolved fitted scale: {err}"))?;
-    // Build the generative specification (mean + noise model).
-    let spec =
-        generativespec_from_predict(prediction, family, gaussian_scale, Some(&prior_weights))
-            .map_err(|e| format!("generative_replicates: spec error: {e}"))?;
+    .map_err(|error| format!("generative_replicates: {error}"))?;
+    let n_rows = spec.nobs();
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let draws = sampleobservation_replicates(&spec, n_draws, &mut rng)
         .map_err(|e| format!("generative_replicates: sampling failed: {e}"))?;

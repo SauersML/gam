@@ -202,27 +202,11 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn saved_likelihood_spec_for_generate(
-    model: &SavedModel,
-) -> Result<LikelihoodSpec, String> {
-    match &model.payload().family_state {
-        FittedFamily::Standard { likelihood, .. }
-        | FittedFamily::LocationScale { likelihood, .. }
-        | FittedFamily::MarginalSlope { likelihood, .. }
-        | FittedFamily::Survival { likelihood, .. }
-        | FittedFamily::TransformationNormal { likelihood } => Ok(likelihood.clone()),
-        FittedFamily::LatentSurvival { .. } | FittedFamily::LatentBinary { .. } => Err(
-            "generate is not available for latent survival/binary model family states".to_string(),
-        ),
-    }
-}
-
-/// Unified generate path: uses `PredictableModel` to produce a
-/// `GenerativeSpec` for every non-survival model class.
+/// Thin CLI adapter over the canonical saved-model generative capability.
 ///
-/// For Gaussian LS the sigma vector is extracted via `predict_noise_scale`;
-/// all other families derive their observation model from
-/// `generativespec_from_predict`.
+/// A weighted saved model must recover its requested-row weight values from
+/// the persisted column name. `None` is passed only for a genuinely unweighted
+/// fit; a missing named column is an error, never a unit-weight substitution.
 pub(crate) fn run_generate_unified(
     model: &SavedModel,
     data: ndarray::ArrayView2<'_, f64>,
@@ -232,135 +216,38 @@ pub(crate) fn run_generate_unified(
     offset_noise: &Array1<f64>,
     noise_offset_supplied: bool,
 ) -> Result<gam::generative::GenerativeSpec, String> {
-    let pred_input = build_predict_input_for_model(
-        model,
-        data,
-        col_map,
-        training_headers,
-        offset,
-        offset_noise,
-        noise_offset_supplied,
-    )?;
-    let predictor = model
-        .predictor()
-        .ok_or_else(|| "failed to build predictor for generate".to_string())?;
-
-    let model_class = model.predict_model_class();
-    let family = model.likelihood();
-    let likelihood = saved_likelihood_spec_for_generate(model)?;
-
-    if model_class == PredictModelClass::GaussianLocationScale {
-        // Gaussian LS needs the per-observation sigma for its GenerativeSpec.
-        let pred = predictor
-            .predict_plugin_response(&pred_input)
-            .map_err(|e| format!("predict_plugin_response failed: {e}"))?;
-        let sigma = predictor
-            .predict_noise_scale(&pred_input)
-            .map_err(|e| format!("predict_noise_scale failed: {e}"))?
-            .ok_or_else(|| {
-                "gaussian location-scale predictor did not produce sigma via predict_noise_scale"
-                    .to_string()
+    let prior_weights = match model.payload().weight_column.as_deref() {
+        Some(column) => {
+            let index = *col_map.get(column).ok_or_else(|| {
+                format!(
+                    "generate requires saved row-weight column {column:?}; unit-weight \
+                     substitution would change the fitted observation law"
+                )
             })?;
-        Ok(gam::generative::GenerativeSpec {
-            mean: pred.mean,
-            noise: gam::generative::NoiseModel::Gaussian { sigma },
-        })
-    } else if model_class == PredictModelClass::DispersionLocationScale {
-        // Dispersion location-scale (#913/#1125): the fit learned a per-row
-        // precision surface `exp(eta_d(x))`. Thread it into the generative noise
-        // model so synthetic data reproduces the non-constant dispersion,
-        // exactly as the Gaussian-LS branch above threads per-row sigma. Without
-        // this the family fell into the scalar `else` branch and generated
-        // homoscedastic data at the seed dispersion.
-        let pred = predictor
-            .predict_plugin_response(&pred_input)
-            .map_err(|e| format!("predict_plugin_response failed: {e}"))?;
-        match predictor
-            .predict_dispersion_scale(&pred_input)
-            .map_err(|e| format!("predict_dispersion_scale failed: {e}"))?
-        {
-            Some(dispersion) => {
-                let noise = gam::generative::NoiseModel::from_likelihood_with_per_row_dispersion(
-                    &likelihood,
-                    dispersion,
-                )
-                .map_err(|e| format!("failed to build per-row dispersion noise: {e}"))?;
-                Ok(gam::generative::GenerativeSpec {
-                    mean: pred.mean,
-                    noise,
-                })
+            if index >= data.ncols() {
+                return Err(format!(
+                    "generate row-weight column {column:?} resolves to {index}, outside the \
+                     {}-column input",
+                    data.ncols(),
+                ));
             }
-            None => {
-                // No usable per-row precision channel (e.g. a dispersion family
-                // fitted without a noise formula): fall back to the scalar
-                // estimated dispersion.
-                let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-                generativespec_from_predict(
-                    pred,
-                    likelihood,
-                    gam::generative::family_noise_parameter(
-                        fit_saved.likelihood_scale,
-                        fit_saved.standard_deviation,
-                        &family,
-                    )
-                    .map_err(|err| format!("failed to resolve generative dispersion: {err}"))?,
-                    // This scalar-dispersion fallback arm handles non-Gaussian
-                    // families (Gamma/NB/Beta/Tweedie), whose observation draw
-                    // does not take analytic prior weights; the Gaussian
-                    // weighted case is #2025 in the replicate path.
-                    None,
-                )
-                .map_err(|e| format!("failed to build generative spec: {e}"))
-            }
+            Some(data.column(index).to_owned())
         }
-    } else if model_class == PredictModelClass::TransformationNormal {
-        // Conditional transformation-normal (CTM): the latent transform
-        // `h(Y|x) ~ N(0,1)` is strictly increasing in `y`, so a response-scale
-        // draw is `Y = h⁻¹(Z|x)`, `Z ~ N(0,1)` — genuine inverse-transform
-        // sampling from `F(·|x)`, a function of the covariates alone (#1613).
-        // The earlier path fell into the scalar `else` arm below and drew
-        // Gaussian noise around the mean on the LATENT scale (sd ≈ 1, per-row
-        // mean moving the wrong way with x). Build the same monotone transform
-        // grid `predict` inverts for `E[Y|x]` (#1612) and hand it to the
-        // inverse-transform sampler so generation and prediction share one
-        // transform.
-        let grid = build_transformation_normal_quantile_grid(
-            model,
+        None => None,
+    };
+    gam_predict::generative_spec_for_saved_model(
+        model,
+        gam_predict::SavedGenerativeInput {
             data,
             col_map,
             training_headers,
             offset,
-        )?;
-        Ok(gam::generative::GenerativeSpec {
-            mean: grid.conditional_mean,
-            noise: gam::generative::NoiseModel::TransformationNormalQuantile {
-                grid_y: grid.grid_y,
-                h_grid: grid.h_grid,
-            },
-        })
-    } else {
-        // Non-Gaussian models produce their response-scale plug-in mean
-        // directly here.
-        let pred = predictor
-            .predict_plugin_response(&pred_input)
-            .map_err(|e| format!("predict_plugin_response failed: {e}"))?;
-        let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-        generativespec_from_predict(
-            pred,
-            likelihood,
-            gam::generative::family_noise_parameter(
-                fit_saved.likelihood_scale,
-                fit_saved.standard_deviation,
-                &family,
-            )
-            .map_err(|err| format!("failed to resolve generative dispersion: {err}"))?,
-            // Prior-weight scaling for the weighted-Gaussian replicate draw is
-            // resolved in the FFI `Model.sample_replicates` path (#2025); this
-            // CLI generate arm preserves its existing scalar-sigma behavior.
-            None,
-        )
-        .map_err(|e| format!("failed to build generative spec: {e}"))
-    }
+            offset_noise,
+            noise_offset_supplied,
+            prior_weights: prior_weights.as_ref(),
+        },
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn smoothing_forensics_rows(

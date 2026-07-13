@@ -716,6 +716,7 @@ fn run_canonical_standard_fit(
                     dataset.headers.clone(),
                     dataset.feature_ranges(),
                 );
+                payload.weight_column = fit_config.weight_column.clone();
                 payload.group_metadata = fit_config.group_metadata.clone();
                 payload.inference_notes = outcome.inference_notes;
                 write_payload_json(out, payload)?;
