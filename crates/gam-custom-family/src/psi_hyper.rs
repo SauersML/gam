@@ -3387,7 +3387,7 @@ pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + S
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     rho_current: &Array1<f64>,
-    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    hyper_layout: &CustomFamilyHyperLayout,
     warm_start: Option<&CustomFamilyWarmStart>,
 ) -> Result<CustomFamilyJointHyperEfsResult, CustomFamilyError> {
     Ok(evaluate_custom_family_joint_hyper_efs_owned(
@@ -3395,7 +3395,7 @@ pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + S
         specs,
         options,
         rho_current,
-        derivative_blocks,
+        hyper_layout,
         warm_start,
     )?
     .result)
@@ -3410,7 +3410,7 @@ pub fn evaluate_custom_family_joint_hyper_efs_owned<
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     rho_current: &Array1<f64>,
-    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    hyper_layout: &CustomFamilyHyperLayout,
     warm_start: Option<&CustomFamilyWarmStart>,
 ) -> Result<CustomFamilyJointHyperEfsOwnedResult, CustomFamilyError> {
     evaluate_custom_family_joint_hyper_efs_owned_shared(
@@ -3418,7 +3418,7 @@ pub fn evaluate_custom_family_joint_hyper_efs_owned<
         specs,
         options,
         rho_current,
-        Arc::new(derivative_blocks.to_vec()),
+        Arc::new(hyper_layout.clone()),
         warm_start,
     )
 }
@@ -3430,7 +3430,7 @@ pub fn evaluate_custom_family_joint_hyper_efs_shared<
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     rho_current: &Array1<f64>,
-    derivative_blocks: SharedDerivativeBlocks,
+    hyper_layout: SharedCustomFamilyHyperLayout,
     warm_start: Option<&CustomFamilyWarmStart>,
 ) -> Result<CustomFamilyJointHyperEfsResult, CustomFamilyError> {
     Ok(evaluate_custom_family_joint_hyper_efs_owned_shared(
@@ -3438,13 +3438,13 @@ pub fn evaluate_custom_family_joint_hyper_efs_shared<
         specs,
         options,
         rho_current,
-        derivative_blocks,
+        hyper_layout,
         warm_start,
     )?
     .result)
 }
 
-/// Shared-derivative-block variant of
+/// Shared-layout variant of
 /// [`evaluate_custom_family_joint_hyper_efs_owned`].
 pub fn evaluate_custom_family_joint_hyper_efs_owned_shared<
     F: CustomFamily + Clone + Send + Sync + 'static,
@@ -3453,19 +3453,19 @@ pub fn evaluate_custom_family_joint_hyper_efs_owned_shared<
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     rho_current: &Array1<f64>,
-    derivative_blocks: SharedDerivativeBlocks,
+    hyper_layout: SharedCustomFamilyHyperLayout,
     warm_start: Option<&CustomFamilyWarmStart>,
 ) -> Result<CustomFamilyJointHyperEfsOwnedResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
-    if derivative_blocks.len() != specs.len() {
+    if hyper_layout.block_count() != specs.len() {
         crate::bail_dim_custom!(
-            "joint hyper derivative block count mismatch: got {}, expected {}",
-            derivative_blocks.len(),
+            "joint hyper layout block count mismatch: got {}, expected {}",
+            hyper_layout.block_count(),
             specs.len()
         );
     }
     let (efs_eval, warm_start, inner_converged, inner) =
-        if derivative_blocks.iter().all(Vec::is_empty) {
+        if hyper_layout.is_empty() {
             outerobjectiveefs(
                 family,
                 specs,
@@ -3483,7 +3483,7 @@ pub fn evaluate_custom_family_joint_hyper_efs_owned_shared<
                 options,
                 &penalty_counts,
                 rho_current,
-                derivative_blocks,
+                hyper_layout,
                 warm_start.map(|w| &w.inner),
             )?
         };

@@ -638,8 +638,7 @@ pub(crate) fn effective_df_floor_rho_upper_bounds(
 pub(crate) fn bind_certified_custom_family_terminal_mode(
     terminal: CustomFamilyTerminalMode,
     certified_outer: &gam_solve::rho_optimizer::CertifiedOuterResult,
-    rho_prior: &gam_problem::RhoPrior,
-) -> Result<(CustomFamilyOwnedMode, f64), CustomFamilyError> {
+) -> Result<CustomFamilyOwnedMode, CustomFamilyError> {
     let certified_gradient = certified_outer.final_gradient().ok_or_else(|| {
         CustomFamilyError::Optimization {
             context: "fit_custom_family terminal gradient ownership",
@@ -698,24 +697,7 @@ pub(crate) fn bind_certified_custom_family_terminal_mode(
                 .to_string(),
         });
     }
-    let (prior_cost, _, _) = rho_prior_cost_gradient_hessian(rho_prior, &terminal.theta)
-        .map_err(|reason| CustomFamilyError::Optimization {
-            context: "fit_custom_family terminal prior identity",
-            reason,
-        })?;
-    let recomposed_objective = terminal.fit_objective + prior_cost;
-    if !terminal.fit_objective.is_finite()
-        || recomposed_objective.to_bits() != terminal.objective.to_bits()
-    {
-        return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family terminal prior identity",
-            reason: format!(
-                "same-evaluation fit objective plus labeled rho prior does not bitwise reproduce the certified outer objective: fit={:.17e}, prior={prior_cost:.17e}, outer={:.17e}",
-                terminal.fit_objective, terminal.objective,
-            ),
-        });
-    }
-    Ok((terminal.mode, terminal.fit_objective))
+    Ok(terminal.mode)
 }
 
 pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -1436,20 +1418,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 .iter()
                 .flat_map(|beta| beta.iter().copied()),
         ));
-        // Preserve the public fit criterion from this exact owned inner state
-        // before moving it into the terminal carrier. The certified outer
-        // objective adds the labeled rho prior; the public fit score has
-        // historically excluded that hyperprior.
-        let fit_objective = inner_penalized_objective(
-            &eval_result.inner,
-            include_exact_newton_logdet_h(family, options),
-            include_exact_newton_logdet_s(family, options),
-            "custom-family terminal owned mode",
-        )
-        .map_err(|reason| {
-            outer.last_error = Some(reason.clone());
-            EstimationError::RemlOptimizationFailed(reason)
-        })?;
         let objective = eval_result.objective;
         let gradient = eval_result.gradient;
         let outer_hessian = eval_result.outer_hessian;
@@ -1462,7 +1430,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             rho: rho.clone(),
             inner: eval_result.inner,
         };
-        outer.install_terminal_mode(rho, objective, fit_objective, &gradient, mode);
+        outer.install_terminal_mode(rho, objective, &gradient, mode);
         Ok(OuterEval {
             cost: objective,
             gradient,
@@ -1700,10 +1668,9 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         }
     })?;
     let rho_star = certified_outer.rho().clone();
-    let (mode, penalized_objective) =
-        bind_certified_custom_family_terminal_mode(terminal, &certified_outer, &rho_prior)?;
+    let mode = bind_certified_custom_family_terminal_mode(terminal, &certified_outer)?;
     let CustomFamilyOwnedMode {
-        objective: _,
+        objective: penalized_objective,
         rho: mode_rho,
         inner,
     } = mode;
