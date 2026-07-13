@@ -30,7 +30,7 @@
 //! [`binomial_q_derivs`], [`binomial_q_coeffs`], [`validation`],
 //! [`weighted_design_products`], [`row_linalg`], and [`joint_packing`].
 
-use gam_terms::basis::{BasisOptions, PenaltyInfo, PenaltySource};
+use gam_terms::basis::{ActivePenaltyInfo, BasisOptions, PenaltySource};
 
 use crate::custom_family::{
     AdditiveBlockJacobian, BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions,
