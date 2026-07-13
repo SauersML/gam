@@ -138,7 +138,8 @@ fn fit_at_rho(
         arrow_schur: None,
     };
     let (result, _working) = fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(array![rho].view()),
+        LogSmoothingParamsView::new(array![rho].view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),

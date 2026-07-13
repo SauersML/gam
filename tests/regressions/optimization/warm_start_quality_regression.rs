@@ -124,7 +124,8 @@ fn fit_at_rho_full(
         arrow_schur: None,
     };
     let (result, _working) = fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(array![rho].view()),
+        LogSmoothingParamsView::new(array![rho].view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),
@@ -321,7 +322,8 @@ fn pirls_result_exposes_final_accept_rho_in_unit_interval() {
         arrow_schur: None,
     };
     let (result, _) = fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(array![0.0].view()),
+        LogSmoothingParamsView::new(array![0.0].view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),

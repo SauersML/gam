@@ -90,7 +90,8 @@ fn fit_beta_norm(
     };
     let offset = Array1::<f64>::zeros(y.len());
     let (fit, _) = fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(array![rho].view()),
+        LogSmoothingParamsView::new(array![rho].view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),
@@ -392,7 +393,8 @@ fn fit_deviance(
     };
     let offset = Array1::<f64>::zeros(y.len());
     let (fit, _) = fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(array![rho].view()),
+        LogSmoothingParamsView::new(array![rho].view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),

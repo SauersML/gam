@@ -64,7 +64,8 @@ fn fit_unpenalized(
         arrow_schur: None,
     };
     let (res, _) = pirls::fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(rho.view()),
+        LogSmoothingParamsView::new(rho.view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),
@@ -127,7 +128,8 @@ fn fit_identity_penalized(
         arrow_schur: None,
     };
     let (res, _) = pirls::fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(rho.view()),
+        LogSmoothingParamsView::new(rho.view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),

@@ -124,7 +124,8 @@ fn gpu_pirls_gating_1_newton_sign_gaussian_direction() {
 
     let canonical: Vec<CanonicalPenalty> = Vec::new();
     let (fit, _) = fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(rho.view()),
+        LogSmoothingParamsView::new(rho.view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),
@@ -206,7 +207,8 @@ fn gpu_pirls_gating_2_penalty_gradient_sign_and_shift() {
     let canonical = make_canonical(&s, p);
 
     let (fit, _) = fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(rho.view()),
+        LogSmoothingParamsView::new(rho.view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),
@@ -277,7 +279,8 @@ fn gpu_pirls_gating_3_offset_parity() {
 
     let canonical: Vec<CanonicalPenalty> = Vec::new();
     let (fit, _) = fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(rho.view()),
+        LogSmoothingParamsView::new(rho.view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),
@@ -366,7 +369,8 @@ fn gpu_pirls_gating_4_penalized_line_search_rejects_unpenalized_step() {
     let canonical = make_canonical(&s, p);
 
     let (fit, _) = fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(rho.view()),
+        LogSmoothingParamsView::new(rho.view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),
@@ -456,7 +460,8 @@ fn gpu_pirls_gating_5_qs_basis_semantics() {
     let canonical = make_canonical(&s, p);
 
     let (fit, _) = fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(rho.view()),
+        LogSmoothingParamsView::new(rho.view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),
@@ -547,7 +552,8 @@ fn gpu_pirls_gating_6_final_hessian_at_accepted_eta() {
     let canonical = make_canonical(&s, p);
 
     let (fit, _) = fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(rho.view()),
+        LogSmoothingParamsView::new(rho.view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),
@@ -636,7 +642,8 @@ fn gpu_pirls_gating_7_status_or_reduce() {
     let canonical = make_canonical(&s, p);
 
     let (fit, _) = fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(rho.view()),
+        LogSmoothingParamsView::new(rho.view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),
@@ -724,7 +731,8 @@ fn gpu_pirls_gating_8_benchmark_baseline_uses_cpu_oracle() {
 
     // GPU path (cuda_selected() == true routes through GPU).
     let (fit_gpu, _) = fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(rho.view()),
+        LogSmoothingParamsView::new(rho.view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),
@@ -751,7 +759,8 @@ fn gpu_pirls_gating_8_benchmark_baseline_uses_cpu_oracle() {
 
     // Oracle path: rerun the same fixed-rho problem through the unified policy.
     let (fit_cpu, _) = fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(rho.view()),
+        LogSmoothingParamsView::new(rho.view())
+            .expect("test fixture smoothing parameters satisfy the closed domain"),
         PirlsProblem {
             x: x.view(),
             offset: offset.view(),
