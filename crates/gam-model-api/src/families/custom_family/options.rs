@@ -4,7 +4,7 @@
 
 use crate::families::custom_family::family_trait::{CustomFamily, OuterEvalContext};
 use crate::families::custom_family::psi_design::{
-    CustomFamilyBlockPsiDerivative, ExactNewtonJointHessianWorkspace,
+    CustomFamilyHyperLayout, ExactNewtonJointHessianWorkspace,
 };
 use gam_linalg::RidgePolicy;
 use gam_problem::{ParameterBlockSpec, ParameterBlockState};
@@ -101,15 +101,15 @@ pub(crate) fn assert_states_match_specs(
     }
 }
 
-pub(crate) fn assert_derivative_blocks_match_specs(
-    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+pub(crate) fn assert_hyper_layout_matches_specs(
+    hyper_layout: &CustomFamilyHyperLayout,
     specs: &[ParameterBlockSpec],
     context: &str,
 ) {
     assert_eq!(
-        derivative_blocks.len(),
+        hyper_layout.block_count(),
         specs.len(),
-        "{context}: derivative/spec block count mismatch"
+        "{context}: hyper-layout/spec block count mismatch"
     );
 }
 
