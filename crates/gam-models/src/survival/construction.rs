@@ -1393,12 +1393,23 @@ pub fn build_survival_time_basis(
                     }
                 };
 
+            let nullspace_dims = entry_basis
+                .active_penalties
+                .iter()
+                .map(|penalty| penalty.nullity)
+                .collect();
+            let penalties = entry_basis
+                .active_penalties
+                .into_iter()
+                .map(|penalty| penalty.matrix)
+                .collect();
+
             Ok(SurvivalTimeBuildOutput {
                 x_entry_time: entry_basis.design,
                 x_exit_time: exit_basis.design,
                 x_derivative_time,
-                nullspace_dims: entry_basis.nullspace_dims,
-                penalties: entry_basis.penalties,
+                nullspace_dims,
+                penalties,
                 basisname: "bspline".to_string(),
                 degree: Some(degree),
                 knots: Some(knotvec.to_vec()),
@@ -1600,7 +1611,7 @@ pub fn build_survival_time_basis(
             // value coefficients `c`: `c_0 = 0`, `c_k = Σ_{j<k} γ_j = (L γ)_k`, where
             // `L` is the `p_time × p_time` lower-triangular cumsum matrix. The
             // second-difference penalty on the B-spline values is `S_B = D₂ᵀD₂`
-            // (the `penalty_basis.penalties` block). The correct curvature penalty
+            // (the active `penalty_basis` matrix block). The correct curvature penalty
             // on γ is the **value-space congruence transform**
             //
             //   `S_I = Lᵀ S_B[1:,1:] L`,
@@ -1626,7 +1637,8 @@ pub fn build_survival_time_basis(
             // the global stabilization ridge (ridge_lambda) provides an absolute
             // positive-definite floor.
             let mut penalties = Vec::<Array2<f64>>::new();
-            for s_mat in &penalty_basis.penalties {
+            for active_penalty in &penalty_basis.active_penalties {
+                let s_mat = &active_penalty.matrix;
                 if s_mat.nrows() != p_time_full + 1 || s_mat.ncols() != p_time_full + 1 {
                     continue;
                 }
@@ -3651,11 +3663,17 @@ pub fn build_time_varying_survival_covariate_template(
             Ok(())
         })?;
 
+    let time_penalties = time_build
+        .active_penalties
+        .into_iter()
+        .map(|penalty| penalty.matrix)
+        .collect();
+
     Ok(SurvivalCovariateTermBlockTemplate::TimeVarying {
         time_basis_entry: time_design_entry,
         time_basis_exit: time_design_exit,
         time_basis_derivative_exit: time_design_derivative_exit,
-        time_penalties: time_build.penalties,
+        time_penalties,
     })
 }
 
