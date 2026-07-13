@@ -7,7 +7,7 @@
 //! only for active `(row, atom)` pairs.
 
 use crate::assignment::AssignmentMode;
-use crate::assignment_state::SaeAssignmentState;
+use crate::assignment_state::{SaeAssignmentAtomSpec, SaeAssignmentState};
 use ndarray::{Array1, Array2, ArrayView2};
 use std::ops::Range;
 use std::sync::Arc;
@@ -36,6 +36,18 @@ pub struct SaeSupportFixedPointReport {
     pub max_recurrence_change: f64,
     /// True only after a second complete decoder/coordinate cycle recurs within
     /// the same tolerance at the raw (undamped) stationarity point.
+    pub recurred: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SaeSupportCoordinateFixedPointReport {
+    pub iterations: usize,
+    pub objective: f64,
+    pub coordinate_l2: f64,
+    pub coordinate_max_abs: f64,
+    pub max_recurrence_change: f64,
+    /// True only after two complete frozen-decoder coordinate cycles recur at
+    /// the raw coordinate stationarity point.
     pub recurred: bool,
 }
 
@@ -248,6 +260,141 @@ impl SaeSupportSparseTerm {
 
     pub fn active_pair_count(&self) -> usize {
         self.atom_rows.iter().map(Vec::len).sum()
+    }
+
+    /// Route new rows against this fitted decoder without constructing a
+    /// `rows × K` score matrix. Candidate reconstruction improvements are
+    /// streamed one atom at a time and only the best `support_k` candidates,
+    /// including their heterogeneous coordinates, survive for each row.
+    pub fn reroute_fixed_decoder(
+        &self,
+        target: ArrayView2<'_, f64>,
+        support_k: usize,
+        random_state: u64,
+    ) -> Result<Self, String> {
+        if target.ncols() != self.output_dim || target.nrows() == 0 {
+            return Err(format!(
+                "SaeSupportSparseTerm::reroute_fixed_decoder: target {:?} must have positive rows and P={}",
+                target.dim(), self.output_dim
+            ));
+        }
+        if support_k == 0 || support_k > self.k_atoms() {
+            return Err(format!(
+                "SaeSupportSparseTerm::reroute_fixed_decoder requires 1 <= support_k <= K={}; got {support_k}",
+                self.k_atoms()
+            ));
+        }
+        if target.iter().any(|value| !value.is_finite()) {
+            return Err(
+                "SaeSupportSparseTerm::reroute_fixed_decoder: target contains a non-finite value"
+                    .into(),
+            );
+        }
+
+        struct Candidate {
+            atom: usize,
+            score: f64,
+            coords: Vec<f64>,
+        }
+        let better = |left: &Candidate, right: &Candidate| {
+            left.score > right.score || (left.score == right.score && left.atom < right.atom)
+        };
+        let mut indices = Vec::with_capacity(target.nrows());
+        let mut gate_params = Vec::with_capacity(target.nrows());
+        let mut coords = Vec::with_capacity(target.nrows());
+        for row in target.rows() {
+            let row_values = row.as_slice().ok_or_else(|| {
+                "SaeSupportSparseTerm::reroute_fixed_decoder: target row is not contiguous"
+                    .to_string()
+            })?;
+            let mut selected = Vec::<Candidate>::with_capacity(support_k);
+            for (atom_index, atom) in self.atoms.iter().enumerate() {
+                let candidate_coords = (0..atom.latent_dim)
+                    .map(|axis| {
+                        let raw = super::support_seed::projection(
+                            row_values,
+                            atom_index,
+                            axis + 1,
+                            random_state,
+                        );
+                        super::support_seed::chart_coordinate(&atom.basis_kind, axis, raw)
+                    })
+                    .collect::<Vec<_>>();
+                let coordinate = Array2::from_shape_vec(
+                    (1, atom.latent_dim),
+                    candidate_coords.clone(),
+                )
+                .map_err(|error| {
+                    format!("SaeSupportSparseTerm::reroute_fixed_decoder: {error}")
+                })?;
+                let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
+                    format!(
+                        "SaeSupportSparseTerm::reroute_fixed_decoder: atom {atom_index} has no evaluator"
+                    )
+                })?;
+                let (phi, _) = evaluator.evaluate(coordinate.view())?;
+                let decoded = phi.row(0).dot(&atom.decoder_coefficients);
+                let score = row
+                    .iter()
+                    .zip(decoded.iter())
+                    .map(|(truth, fit)| 2.0 * truth * fit - fit * fit)
+                    .sum::<f64>();
+                let candidate = Candidate {
+                    atom: atom_index,
+                    score,
+                    coords: candidate_coords,
+                };
+                if selected.len() < support_k {
+                    selected.push(candidate);
+                } else {
+                    let mut worst = 0usize;
+                    for slot in 1..selected.len() {
+                        if better(&selected[worst], &selected[slot]) {
+                            worst = slot;
+                        }
+                    }
+                    if better(&candidate, &selected[worst]) {
+                        selected[worst] = candidate;
+                    }
+                }
+            }
+            selected.sort_by_key(|candidate| candidate.atom);
+            indices.push(
+                selected
+                    .iter()
+                    .map(|candidate| candidate.atom as u32)
+                    .collect(),
+            );
+            gate_params.push(selected.iter().map(|candidate| candidate.score).collect());
+            coords.push(
+                selected
+                    .into_iter()
+                    .flat_map(|candidate| candidate.coords)
+                    .collect(),
+            );
+        }
+        let atom_specs = self
+            .atoms
+            .iter()
+            .enumerate()
+            .map(|(atom, template)| SaeAssignmentAtomSpec {
+                latent_dim: template.latent_dim,
+                id_mode: gam_terms::latent::LatentIdMode::None,
+                manifold: template.basis_kind.latent_manifold(template.latent_dim),
+                retraction: gam_problem::LatentRetractionRegistry::all_euclidean(),
+                latent_id: super::support_seed::splitmix64(atom as u64),
+            })
+            .collect();
+        let assignment = SaeAssignmentState::from_topk_support_heterogeneous(
+            target.nrows(),
+            self.k_atoms(),
+            support_k,
+            atom_specs,
+            indices,
+            gate_params,
+            coords,
+        )?;
+        Self::new(self.atoms.clone(), assignment)
     }
 
     pub(crate) fn beta_layout(&self) -> Result<(Vec<usize>, usize), String> {
@@ -859,6 +1006,118 @@ impl SaeSupportSparseTerm {
             coordinate_l2: coordinate_sq.sqrt(),
             coordinate_max_abs: coordinate_max,
         })
+    }
+
+    /// Raw coordinate KKT residual with decoder coefficients held fixed.
+    pub fn raw_coordinate_stationarity(
+        &self,
+        target: ArrayView2<'_, f64>,
+        ard_precisions: &[Vec<f64>],
+    ) -> Result<(f64, f64), String> {
+        self.validate_ard(ard_precisions)?;
+        let residual = self.raw_residual(target)?;
+        let mut coordinate_sq = 0.0;
+        let mut coordinate_max = 0.0_f64;
+        for row in 0..self.n_obs() {
+            for slot in 0..self.assignment.support_indices(row).len() {
+                let atom = self.assignment.support_indices(row)[slot] as usize;
+                let active = self.evaluate_active(row, slot)?;
+                let periods = self.assignment.atom_manifold(atom).axis_periods();
+                for axis in 0..active.jacobian.nrows() {
+                    let likelihood_gradient = active
+                        .jacobian
+                        .row(axis)
+                        .iter()
+                        .zip(residual.row(row).iter())
+                        .map(|(jet, error)| -jet * error)
+                        .sum::<f64>();
+                    let gradient = likelihood_gradient
+                        + ArdAxisPrior::eval(
+                            ard_precisions[atom][axis],
+                            self.assignment.coords_for_slot(row, slot)[axis],
+                            periods[axis],
+                        )
+                        .grad;
+                    coordinate_sq += gradient * gradient;
+                    coordinate_max = coordinate_max.max(gradient.abs());
+                }
+            }
+        }
+        Ok((coordinate_sq.sqrt(), coordinate_max))
+    }
+
+    fn frozen_decoder_coordinate_objective(
+        &self,
+        target: ArrayView2<'_, f64>,
+        ard_precisions: &[Vec<f64>],
+    ) -> Result<f64, String> {
+        let residual = self.raw_residual(target)?;
+        let mut objective = 0.5 * residual.iter().map(|value| value * value).sum::<f64>();
+        for row in 0..self.n_obs() {
+            for (slot, &atom) in self.assignment.support_indices(row).iter().enumerate() {
+                let atom = atom as usize;
+                let periods = self.assignment.atom_manifold(atom).axis_periods();
+                for axis in 0..self.assignment.atom_coord_dim(atom) {
+                    objective += ArdAxisPrior::eval(
+                        ard_precisions[atom][axis],
+                        self.assignment.coords_for_slot(row, slot)[axis],
+                        periods[axis],
+                    )
+                    .value;
+                }
+            }
+        }
+        if objective.is_finite() {
+            Ok(objective)
+        } else {
+            Err("SaeSupportSparseTerm::frozen_decoder_coordinate_objective is non-finite".into())
+        }
+    }
+
+    /// Frozen-decoder OOS coordinate solve over active supports only. A
+    /// budget-exhausted or merely damped point is rejected; the returned state
+    /// has recurred for two full raw-stationary coordinate cycles.
+    pub fn solve_coordinates_fixed_decoder(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        ard_precisions: &[Vec<f64>],
+        max_iter: usize,
+        tolerance: f64,
+        trust_radius: f64,
+    ) -> Result<SaeSupportCoordinateFixedPointReport, String> {
+        if target.dim() != (self.n_obs(), self.output_dim) {
+            return Err(format!(
+                "SaeSupportSparseTerm::solve_coordinates_fixed_decoder: target {:?} != ({}, {})",
+                target.dim(), self.n_obs(), self.output_dim
+            ));
+        }
+        if max_iter == 0 || !(tolerance.is_finite() && tolerance > 0.0) {
+            return Err("SaeSupportSparseTerm::solve_coordinates_fixed_decoder requires positive max_iter and finite positive tolerance".into());
+        }
+        let mut previous_candidate = false;
+        for iteration in 1..=max_iter {
+            let max_change = self.coordinate_sweep(target, ard_precisions, trust_radius)?;
+            let (coordinate_l2, coordinate_max_abs) =
+                self.raw_coordinate_stationarity(target, ard_precisions)?;
+            let candidate = max_change <= tolerance && coordinate_max_abs <= tolerance;
+            if candidate && previous_candidate {
+                return Ok(SaeSupportCoordinateFixedPointReport {
+                    iterations: iteration,
+                    objective: self
+                        .frozen_decoder_coordinate_objective(target, ard_precisions)?,
+                    coordinate_l2,
+                    coordinate_max_abs,
+                    max_recurrence_change: max_change,
+                    recurred: true,
+                });
+            }
+            previous_candidate = candidate;
+        }
+        let (_, coordinate_max_abs) =
+            self.raw_coordinate_stationarity(target, ard_precisions)?;
+        Err(format!(
+            "SaeSupportSparseTerm::solve_coordinates_fixed_decoder did not recur within {max_iter} cycles (raw coordinate KKT max={coordinate_max_abs:.6e})"
+        ))
     }
 
     /// Alternate exact decoder blocks and direct active-row coordinate Newton

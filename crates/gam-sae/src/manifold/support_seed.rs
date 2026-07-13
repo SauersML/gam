@@ -55,7 +55,7 @@ struct RankedAtom {
     score: f64,
 }
 
-fn splitmix64(mut value: u64) -> u64 {
+pub(super) fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -65,7 +65,7 @@ fn splitmix64(mut value: u64) -> u64 {
 /// Bounded-work CountSketch projection. At small P each coordinate appears in
 /// the cyclic hash permutation; at large P eight deterministic samples keep
 /// routing cost independent of the ambient output width.
-fn projection(row: &[f64], atom: usize, axis: usize, random_state: u64) -> f64 {
+pub(super) fn projection(row: &[f64], atom: usize, axis: usize, random_state: u64) -> f64 {
     let width = row.len();
     let samples = width.min(8).max(1);
     let mut total = 0.0;
@@ -177,7 +177,7 @@ pub fn sae_support_effective_atom_dims(
     resolve_support_atoms(atom_basis, atom_dim).map(|(_, dimensions, _)| dimensions)
 }
 
-fn chart_coordinate(kind: &SaeAtomBasisKind, axis: usize, raw: f64) -> f64 {
+pub(super) fn chart_coordinate(kind: &SaeAtomBasisKind, axis: usize, raw: f64) -> f64 {
     match kind {
         SaeAtomBasisKind::Periodic | SaeAtomBasisKind::Torus => {
             0.5 + raw.atan() / std::f64::consts::PI

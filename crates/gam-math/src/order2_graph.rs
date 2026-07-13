@@ -2,11 +2,10 @@
 //!
 //! [`Order2Graph`] implements the same [`RuntimeJetScalar`] algebra as the eager
 //! packed jets, but records a small scalar DAG instead of propagating a dense
-//! Hessian through every intermediate. Each node carries its value and primary
-//! gradient. Once the scalar output is known, one reverse sweep computes node
-//! adjoints and accumulates only the local curvature of nonlinear nodes:
-//!
-//! `H = sum_node adjoint[node] * J_parent' * local_H[node] * J_parent`.
+//! Hessian through every intermediate. Each node carries its value, primary
+//! gradient, and coefficients over a small basis of local curvature atoms.
+//! Scalar operations propagate those coefficients directly; the final output
+//! materializes each rank-one, cross, or quadratic atom exactly once.
 //!
 //! This is the universal second-order chain rule for a scalar DAG. Families own
 //! only their one generic row expression and certified unary derivative stacks;
@@ -87,7 +86,7 @@ impl GraphTape {
 /// Reusable storage for a compiled scalar DAG.
 ///
 /// Reset between rows. The boxed tape has fixed capacity, so every row after
-/// worker construction performs no tape or reverse-adjoint allocation and no
+/// worker construction performs no tape or curvature-basis allocation and no
 /// capacity checks or growth branches.
 #[derive(Debug)]
 pub struct Order2GraphWorkspace {
@@ -123,7 +122,7 @@ impl Order2GraphWorkspace {
         tape.coefficient_len = 0;
     }
 
-    /// Bytes retained by the fixed graph and reverse-sweep tape.
+    /// Bytes retained by the fixed graph and curvature-basis tape.
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<GraphTape>()
@@ -154,9 +153,9 @@ impl Order2GraphWorkspace {
     fn push<const K: usize>(
         tape: &mut GraphTape,
         value: f64,
-        kind: GraphNodeKind,
         support: u128,
         gradient: [f64; K],
+        hessian_weights: [f64; MAX_CURVATURE_ATOMS],
     ) -> usize {
         assert_eq!(tape.dimension, K, "compiled graph dimension mismatch");
         assert!(
@@ -164,24 +163,48 @@ impl Order2GraphWorkspace {
             "compiled graph node capacity exceeded"
         );
         let node = tape.node_len;
-        tape.nodes[node] = GraphNode {
-            value,
-            support,
-            kind,
-        };
+        tape.nodes[node] = GraphNode { value, support };
         tape.gradients[node * K..(node + 1) * K].copy_from_slice(&gradient);
+        tape.hessian_weights
+            [node * MAX_CURVATURE_ATOMS..(node + 1) * MAX_CURVATURE_ATOMS]
+            .copy_from_slice(&hessian_weights);
         tape.node_len += 1;
         node
     }
 
     #[inline(always)]
-    fn push_term(tape: &mut GraphTape, term: GraphTerm) {
+    fn inherit_hessian(
+        tape: &GraphTape,
+        output: &mut [f64; MAX_CURVATURE_ATOMS],
+        input: usize,
+        scale: f64,
+    ) {
+        for atom in 0..tape.atom_len {
+            output[atom] +=
+                scale * tape.hessian_weights[input * MAX_CURVATURE_ATOMS + atom];
+        }
+    }
+
+    #[inline(always)]
+    fn push_atom(tape: &mut GraphTape, atom: CurvatureAtom) -> usize {
         assert!(
-            tape.term_len < MAX_GRAPH_TERMS,
-            "compiled graph term capacity exceeded"
+            tape.atom_len < MAX_CURVATURE_ATOMS,
+            "compiled graph curvature capacity exceeded"
         );
-        tape.terms[tape.term_len] = term;
-        tape.term_len += 1;
+        let index = tape.atom_len;
+        tape.atoms[index] = atom;
+        tape.atom_len += 1;
+        index
+    }
+
+    #[inline(always)]
+    fn push_operand(tape: &mut GraphTape, node: usize) {
+        assert!(
+            tape.operand_len < MAX_QUADRATIC_OPERANDS,
+            "compiled graph quadratic-operand capacity exceeded"
+        );
+        tape.quadratic_operands[tape.operand_len] = node;
+        tape.operand_len += 1;
     }
 
     #[inline(always)]
@@ -196,11 +219,9 @@ impl Order2GraphWorkspace {
 
     #[inline(always)]
     fn lower<const K: usize>(&self, output: usize) -> Order2<K> {
-        let tape = self.tape_mut();
+        let tape = self.tape();
         assert_eq!(tape.dimension, K, "compiled graph dimension mismatch");
         assert!(output < tape.node_len, "compiled graph output is absent");
-        tape.adjoints[..tape.node_len].fill(0.0);
-        tape.adjoints[output] = 1.0;
 
         let mut out = crate::jet_tower::Tower2::zero();
         out.v = tape.nodes[output].value;
@@ -208,112 +229,55 @@ impl Order2GraphWorkspace {
             out.g[primary] = tape.gradients[output * K + primary];
         }
 
-        for node_index in (0..=output).rev() {
-            let adjoint = tape.adjoints[node_index];
-            if adjoint == 0.0 {
+        for atom_index in 0..tape.atom_len {
+            let weight =
+                tape.hessian_weights[output * MAX_CURVATURE_ATOMS + atom_index];
+            if weight == 0.0 {
                 continue;
             }
-            match tape.nodes[node_index].kind {
-                GraphNodeKind::Constant | GraphNodeKind::Variable => {}
-                GraphNodeKind::Add { left, right } => {
-                    tape.adjoints[left] += adjoint;
-                    tape.adjoints[right] += adjoint;
-                }
-                GraphNodeKind::Sub { left, right } => {
-                    tape.adjoints[left] += adjoint;
-                    tape.adjoints[right] -= adjoint;
-                }
-                GraphNodeKind::Scale { input, scale } => {
-                    tape.adjoints[input] += adjoint * scale;
-                }
-                GraphNodeKind::Product { left, right } => {
-                    tape.adjoints[left] += adjoint * tape.nodes[right].value;
-                    tape.adjoints[right] += adjoint * tape.nodes[left].value;
-                    for_each_supported_upper(
-                        tape.nodes[left].support | tape.nodes[right].support,
-                        |primary, other| {
-                            let left_primary = tape.gradients[left * K + primary];
-                            let right_primary = tape.gradients[right * K + primary];
-                            let curvature = left_primary * tape.gradients[right * K + other]
-                                + right_primary * tape.gradients[left * K + other];
-                            out.h[primary][other] += adjoint * curvature;
-                        },
-                    );
-                }
-                GraphNodeKind::MultiplyAdd {
-                    left,
-                    right,
-                    addend,
-                } => {
-                    tape.adjoints[left] += adjoint * tape.nodes[right].value;
-                    tape.adjoints[right] += adjoint * tape.nodes[left].value;
-                    tape.adjoints[addend] += adjoint;
-                    for_each_supported_upper(
-                        tape.nodes[left].support | tape.nodes[right].support,
-                        |primary, other| {
-                            let left_primary = tape.gradients[left * K + primary];
-                            let right_primary = tape.gradients[right * K + primary];
-                            let curvature = left_primary * tape.gradients[right * K + other]
-                                + right_primary * tape.gradients[left * K + other];
-                            out.h[primary][other] += adjoint * curvature;
-                        },
-                    );
-                }
-                GraphNodeKind::Unary {
-                    input,
-                    first,
-                    second,
-                } => {
-                    tape.adjoints[input] += adjoint * first;
-                    let curvature_scale = adjoint * second;
+            match tape.atoms[atom_index] {
+                CurvatureAtom::Empty => {}
+                CurvatureAtom::RankOne { input } => {
                     for_each_supported_upper(tape.nodes[input].support, |primary, other| {
-                        let input_primary = tape.gradients[input * K + primary];
-                        out.h[primary][other] +=
-                            curvature_scale * input_primary * tape.gradients[input * K + other];
+                        out.h[primary][other] += weight
+                            * tape.gradients[input * K + primary]
+                            * tape.gradients[input * K + other];
                     });
                 }
-                GraphNodeKind::LinearTerms { start, len } => {
-                    for term in &tape.terms[start..start + len] {
-                        tape.adjoints[term.node] += adjoint * term.first;
-                    }
+                CurvatureAtom::Cross { left, right } => {
+                    for_each_supported_upper(
+                        tape.nodes[left].support | tape.nodes[right].support,
+                        |primary, other| {
+                            let left_primary = tape.gradients[left * K + primary];
+                            let right_primary = tape.gradients[right * K + primary];
+                            let curvature = left_primary * tape.gradients[right * K + other]
+                                + right_primary * tape.gradients[left * K + other];
+                            out.h[primary][other] += weight * curvature;
+                        },
+                    );
                 }
-                GraphNodeKind::DiagonalTerms { start, len } => {
-                    for term in &tape.terms[start..start + len] {
-                        tape.adjoints[term.node] += adjoint * term.first;
-                        let curvature_scale = adjoint * term.second;
-                        for_each_supported_upper(
-                            tape.nodes[term.node].support,
-                            |primary, other| {
-                                let input_primary = tape.gradients[term.node * K + primary];
-                                out.h[primary][other] += curvature_scale
-                                    * input_primary
-                                    * tape.gradients[term.node * K + other];
-                            },
-                        );
-                    }
-                }
-                GraphNodeKind::Quadratic {
-                    start,
+                CurvatureAtom::Quadratic {
+                    operand_start,
                     len,
                     coefficient_start,
+                    support,
                 } => {
-                    let terms = &tape.terms[start..start + len];
-                    for term in terms {
-                        tape.adjoints[term.node] += adjoint * term.first;
-                    }
-                    for_each_supported_upper(tape.nodes[node_index].support, |primary, other| {
+                    let operands = &tape.quadratic_operands
+                        [operand_start..operand_start + len];
+                    for_each_supported_upper(support, |primary, other| {
                         let mut curvature = 0.0;
                         for row in 0..len {
-                            let row_gradient = tape.gradients[terms[row].node * K + primary];
+                            let row_gradient =
+                                tape.gradients[operands[row] * K + primary];
                             let mut projected = 0.0;
                             for column in 0..len {
                                 projected += tape.coefficients
                                     [coefficient_start + row * len + column]
-                                    * tape.gradients[terms[column].node * K + other];
+                                    * tape.gradients[operands[column] * K + other];
                             }
                             curvature += row_gradient * projected;
                         }
-                        out.h[primary][other] += 2.0 * adjoint * curvature;
+                        out.h[primary][other] += 2.0 * weight * curvature;
                     });
                 }
             }
@@ -375,16 +339,26 @@ impl<'arena, const K: usize> Order2Graph<'arena, K> {
             gradient[primary] = first * tape.gradients[self.node * K + primary];
         }
         let support = tape.nodes[self.node].support;
+        let mut hessian_weights = [0.0; MAX_CURVATURE_ATOMS];
+        Order2GraphWorkspace::inherit_hessian(
+            tape,
+            &mut hessian_weights,
+            self.node,
+            first,
+        );
+        if second != 0.0 {
+            let atom = Order2GraphWorkspace::push_atom(
+                tape,
+                CurvatureAtom::RankOne { input: self.node },
+            );
+            hessian_weights[atom] = second;
+        }
         let node = Order2GraphWorkspace::push(
             tape,
             value,
-            GraphNodeKind::Unary {
-                input: self.node,
-                first,
-                second,
-            },
             support,
             gradient,
+            hessian_weights,
         );
         Self {
             workspace: self.workspace,
@@ -402,9 +376,9 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         let node = Order2GraphWorkspace::push(
             workspace.tape_mut(),
             c,
-            GraphNodeKind::Constant,
             0,
             [0.0; K],
+            [0.0; MAX_CURVATURE_ATOMS],
         );
         Self { workspace, node }
     }
@@ -418,9 +392,9 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         let node = Order2GraphWorkspace::push(
             workspace.tape_mut(),
             x,
-            GraphNodeKind::Variable,
             1_u128 << axis,
             gradient,
+            [0.0; MAX_CURVATURE_ATOMS],
         );
         Self { workspace, node }
     }
@@ -458,18 +432,18 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         }
 
         let tape = workspace.tape_mut();
-        let start = tape.term_len;
+        let operand_start = tape.operand_len;
         let mut gradient = [0.0; K];
+        let mut hessian_weights = [0.0; MAX_CURVATURE_ATOMS];
         let mut support = 0_u128;
         for axis in 0..input_dimension {
             let first = 2.0 * projected[axis];
-            Order2GraphWorkspace::push_term(
+            Order2GraphWorkspace::push_operand(tape, inputs[axis].node);
+            Order2GraphWorkspace::inherit_hessian(
                 tape,
-                GraphTerm {
-                    node: inputs[axis].node,
-                    first,
-                    second: 0.0,
-                },
+                &mut hessian_weights,
+                inputs[axis].node,
+                first,
             );
             support |= tape.nodes[inputs[axis].node].support;
             for primary in 0..K {
@@ -482,16 +456,22 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                 Order2GraphWorkspace::push_coefficient(tape, coefficients.coefficient(row, column));
             }
         }
+        let atom = Order2GraphWorkspace::push_atom(
+            tape,
+            CurvatureAtom::Quadratic {
+                operand_start,
+                len: input_dimension,
+                coefficient_start,
+                support,
+            },
+        );
+        hessian_weights[atom] = 1.0;
         let node = Order2GraphWorkspace::push(
             tape,
             value,
-            GraphNodeKind::Quadratic {
-                start,
-                len: input_dimension,
-                coefficient_start,
-            },
             support,
             gradient,
+            hessian_weights,
         );
         Self { workspace, node }
     }
@@ -512,19 +492,17 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             "compiled graph linear inputs belong to different workspaces"
         );
         let tape = workspace.tape_mut();
-        let start = tape.term_len;
         let mut value = 0.0;
         let mut gradient = [0.0; K];
+        let mut hessian_weights = [0.0; MAX_CURVATURE_ATOMS];
         let mut support = 0_u128;
         for (input, &weight) in inputs.iter().zip(weights) {
             value += weight * tape.nodes[input.node].value;
-            Order2GraphWorkspace::push_term(
+            Order2GraphWorkspace::inherit_hessian(
                 tape,
-                GraphTerm {
-                    node: input.node,
-                    first: weight,
-                    second: 0.0,
-                },
+                &mut hessian_weights,
+                input.node,
+                weight,
             );
             support |= tape.nodes[input.node].support;
             for primary in 0..K {
@@ -534,12 +512,9 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         let node = Order2GraphWorkspace::push(
             tape,
             value,
-            GraphNodeKind::LinearTerms {
-                start,
-                len: inputs.len(),
-            },
             support,
             gradient,
+            hessian_weights,
         );
         Self { workspace, node }
     }
@@ -567,16 +542,39 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         let support = tape.nodes[self.node].support
             | tape.nodes[right.node].support
             | tape.nodes[addend.node].support;
+        let mut hessian_weights = [0.0; MAX_CURVATURE_ATOMS];
+        Order2GraphWorkspace::inherit_hessian(
+            tape,
+            &mut hessian_weights,
+            self.node,
+            right_value,
+        );
+        Order2GraphWorkspace::inherit_hessian(
+            tape,
+            &mut hessian_weights,
+            right.node,
+            left_value,
+        );
+        Order2GraphWorkspace::inherit_hessian(
+            tape,
+            &mut hessian_weights,
+            addend.node,
+            1.0,
+        );
+        let atom = Order2GraphWorkspace::push_atom(
+            tape,
+            CurvatureAtom::Cross {
+                left: self.node,
+                right: right.node,
+            },
+        );
+        hessian_weights[atom] = 1.0;
         let node = Order2GraphWorkspace::push(
             tape,
             value,
-            GraphNodeKind::MultiplyAdd {
-                left: self.node,
-                right: right.node,
-                addend: addend.node,
-            },
             support,
             gradient,
+            hessian_weights,
         );
         Self {
             workspace: self.workspace,
@@ -600,34 +598,38 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             "compiled graph composed inputs belong to different workspaces"
         );
         let tape = workspace.tape_mut();
-        let start = tape.term_len;
         let mut value = 0.0;
         let mut gradient = [0.0; K];
+        let mut hessian_weights = [0.0; MAX_CURVATURE_ATOMS];
         let mut support = 0_u128;
         for (input, stack) in inputs.iter().zip(derivative_stacks) {
             value += stack[0];
-            Order2GraphWorkspace::push_term(
+            Order2GraphWorkspace::inherit_hessian(
                 tape,
-                GraphTerm {
-                    node: input.node,
-                    first: stack[1],
-                    second: stack[2],
-                },
+                &mut hessian_weights,
+                input.node,
+                stack[1],
             );
             support |= tape.nodes[input.node].support;
             for primary in 0..K {
                 gradient[primary] += stack[1] * tape.gradients[input.node * K + primary];
             }
         }
+        for (input, stack) in inputs.iter().zip(derivative_stacks) {
+            if stack[2] != 0.0 {
+                let atom = Order2GraphWorkspace::push_atom(
+                    tape,
+                    CurvatureAtom::RankOne { input: input.node },
+                );
+                hessian_weights[atom] += stack[2];
+            }
+        }
         let node = Order2GraphWorkspace::push(
             tape,
             value,
-            GraphNodeKind::DiagonalTerms {
-                start,
-                len: inputs.len(),
-            },
             support,
             gradient,
+            hessian_weights,
         );
         Self { workspace, node }
     }
@@ -672,37 +674,44 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             "compiled graph composed inputs belong to different workspaces"
         );
         let tape = workspace.tape_mut();
-        let start = tape.term_len;
         let mut value = 0.0;
         let mut gradient = [0.0; K];
+        let mut hessian_weights = [0.0; MAX_CURVATURE_ATOMS];
         let mut support = 0_u128;
         for ((input, &input_scale), stack) in inputs.iter().zip(input_scales).zip(derivative_stacks)
         {
             let first = stack[1] * input_scale;
             let second = stack[2] * input_scale * input_scale;
             value += stack[0];
-            Order2GraphWorkspace::push_term(
+            Order2GraphWorkspace::inherit_hessian(
                 tape,
-                GraphTerm {
-                    node: input.node,
-                    first,
-                    second,
-                },
+                &mut hessian_weights,
+                input.node,
+                first,
             );
             support |= tape.nodes[input.node].support;
             for primary in 0..K {
                 gradient[primary] += first * tape.gradients[input.node * K + primary];
             }
         }
+        for ((input, &input_scale), stack) in
+            inputs.iter().zip(input_scales).zip(derivative_stacks)
+        {
+            let second = stack[2] * input_scale * input_scale;
+            if second != 0.0 {
+                let atom = Order2GraphWorkspace::push_atom(
+                    tape,
+                    CurvatureAtom::RankOne { input: input.node },
+                );
+                hessian_weights[atom] += second;
+            }
+        }
         let node = Order2GraphWorkspace::push(
             tape,
             value,
-            GraphNodeKind::DiagonalTerms {
-                start,
-                len: inputs.len(),
-            },
             support,
             gradient,
+            hessian_weights,
         );
         Self { workspace, node }
     }
@@ -728,15 +737,25 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         }
         let value = tape.nodes[self.node].value + tape.nodes[other.node].value;
         let support = tape.nodes[self.node].support | tape.nodes[other.node].support;
+        let mut hessian_weights = [0.0; MAX_CURVATURE_ATOMS];
+        Order2GraphWorkspace::inherit_hessian(
+            tape,
+            &mut hessian_weights,
+            self.node,
+            1.0,
+        );
+        Order2GraphWorkspace::inherit_hessian(
+            tape,
+            &mut hessian_weights,
+            other.node,
+            1.0,
+        );
         let node = Order2GraphWorkspace::push(
             tape,
             value,
-            GraphNodeKind::Add {
-                left: self.node,
-                right: other.node,
-            },
             support,
             gradient,
+            hessian_weights,
         );
         Self {
             workspace: self.workspace,
@@ -755,15 +774,25 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         }
         let value = tape.nodes[self.node].value - tape.nodes[other.node].value;
         let support = tape.nodes[self.node].support | tape.nodes[other.node].support;
+        let mut hessian_weights = [0.0; MAX_CURVATURE_ATOMS];
+        Order2GraphWorkspace::inherit_hessian(
+            tape,
+            &mut hessian_weights,
+            self.node,
+            1.0,
+        );
+        Order2GraphWorkspace::inherit_hessian(
+            tape,
+            &mut hessian_weights,
+            other.node,
+            -1.0,
+        );
         let node = Order2GraphWorkspace::push(
             tape,
             value,
-            GraphNodeKind::Sub {
-                left: self.node,
-                right: other.node,
-            },
             support,
             gradient,
+            hessian_weights,
         );
         Self {
             workspace: self.workspace,
@@ -783,15 +812,33 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                 + tape.gradients[self.node * K + primary] * right_value;
         }
         let support = tape.nodes[self.node].support | tape.nodes[other.node].support;
-        let node = Order2GraphWorkspace::push(
+        let mut hessian_weights = [0.0; MAX_CURVATURE_ATOMS];
+        Order2GraphWorkspace::inherit_hessian(
             tape,
-            left_value * right_value,
-            GraphNodeKind::Product {
+            &mut hessian_weights,
+            self.node,
+            right_value,
+        );
+        Order2GraphWorkspace::inherit_hessian(
+            tape,
+            &mut hessian_weights,
+            other.node,
+            left_value,
+        );
+        let atom = Order2GraphWorkspace::push_atom(
+            tape,
+            CurvatureAtom::Cross {
                 left: self.node,
                 right: other.node,
             },
+        );
+        hessian_weights[atom] = 1.0;
+        let node = Order2GraphWorkspace::push(
+            tape,
+            left_value * right_value,
             support,
             gradient,
+            hessian_weights,
         );
         Self {
             workspace: self.workspace,
@@ -813,15 +860,19 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         }
         let value = scale * tape.nodes[self.node].value;
         let support = tape.nodes[self.node].support;
+        let mut hessian_weights = [0.0; MAX_CURVATURE_ATOMS];
+        Order2GraphWorkspace::inherit_hessian(
+            tape,
+            &mut hessian_weights,
+            self.node,
+            scale,
+        );
         let node = Order2GraphWorkspace::push(
             tape,
             value,
-            GraphNodeKind::Scale {
-                input: self.node,
-                scale,
-            },
             support,
             gradient,
+            hessian_weights,
         );
         Self {
             workspace: self.workspace,
