@@ -794,6 +794,7 @@
     0.003
   ],
   "fisher_provenance": "output_fisher_downstream",
+  "fisher_factor_kind": "uncertified_approximation",
   "fitted": [
     [
       0.5,
@@ -909,7 +910,7 @@
     "generators": [],
     "group_signature": "SO(2)"
   },
-  "schema": "gamfit.ManifoldSAE/v3",
+  "schema": "gamfit.ManifoldSAE/v4",
   "selected_log_ard": [
     [
       0.1

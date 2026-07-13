@@ -73,7 +73,7 @@ impl SaeManifoldTerm {
         learning_rate: f64,
         ridge_ext_coord: f64,
         ridge_beta: f64,
-    ) -> Result<(f64, SaeManifoldLoss), String> {
+    ) -> Result<(f64, SaeManifoldLoss), SaeCriterionError> {
         self.penalized_quasi_laplace_criterion_with_refine_policy(
             target,
             rho,
@@ -96,7 +96,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
         refine_progress_extension: bool,
-    ) -> Result<(f64, SaeManifoldLoss), String> {
+    ) -> Result<(f64, SaeManifoldLoss), SaeCriterionError> {
         self.penalized_quasi_laplace_criterion_with_refine_policy_and_lane(
             target,
             rho,
@@ -125,7 +125,7 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
         refine_progress_extension: bool,
         lane: Option<&mut SurrogateLaneState>,
-    ) -> Result<(f64, SaeManifoldLoss), String> {
+    ) -> Result<(f64, SaeManifoldLoss), SaeCriterionError> {
         self.assignment.validate_rho_domain(rho)?;
         // #976 evidence-ledger scope: one criterion evaluation = one per-atom
         // reseed budget. The joint-fit driver no longer clears the ledger on
@@ -191,7 +191,7 @@ impl SaeManifoldTerm {
         learning_rate: f64,
         ridge_ext_coord: f64,
         ridge_beta: f64,
-    ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
+    ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), SaeCriterionError> {
         self.penalized_quasi_laplace_criterion_with_cache_refine_policy(
             target,
             rho,
@@ -214,7 +214,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
         refine_progress_extension: bool,
-    ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
+    ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), SaeCriterionError> {
         self.assignment.validate_rho_domain(rho)?;
         // #976 evidence-ledger scope (see `penalized_quasi_laplace_criterion_with_refine_policy_
         // and_lane`): direct cache-lane callers also get a fresh per-evaluation
@@ -2265,7 +2265,7 @@ impl SaeManifoldTerm {
         learning_rate: f64,
         ridge_ext_coord: f64,
         ridge_beta: f64,
-    ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
+    ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), SaeCriterionError> {
         self.penalized_quasi_laplace_criterion_streaming_exact_with_cache_and_lane(
             target,
             rho,
@@ -2290,7 +2290,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
         lane: Option<&mut SurrogateLaneState>,
-    ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
+    ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), SaeCriterionError> {
         let (cost, loss, cache, _system) = self
             .penalized_quasi_laplace_criterion_streaming_exact_with_cache_lane_and_system(
                 target,
@@ -2503,7 +2503,7 @@ impl SaeManifoldTerm {
         learning_rate: f64,
         ridge_ext_coord: f64,
         ridge_beta: f64,
-    ) -> Result<(f64, SaeManifoldLoss), String> {
+    ) -> Result<(f64, SaeManifoldLoss), SaeCriterionError> {
         self.penalized_quasi_laplace_criterion_streaming_exact_with_lane(
             target,
             rho,
@@ -2528,7 +2528,7 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
         lane: Option<&mut SurrogateLaneState>,
-    ) -> Result<(f64, SaeManifoldLoss), String> {
+    ) -> Result<(f64, SaeManifoldLoss), SaeCriterionError> {
         let (cost, loss, _cache) = self
             .penalized_quasi_laplace_criterion_streaming_exact_with_cache_and_lane(
                 target,
@@ -5102,7 +5102,7 @@ impl SaeManifoldTerm {
         learning_rate: f64,
         ridge_ext_coord: f64,
         ridge_beta: f64,
-    ) -> Result<SaeCriterion, String> {
+    ) -> Result<SaeCriterion, SaeCriterionError> {
         let (production_value, loss, cache) = self.penalized_quasi_laplace_criterion_with_cache(
             target,
             rho,

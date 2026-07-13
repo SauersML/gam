@@ -31,7 +31,7 @@ def _load(path: Path) -> dict:
 
 def test_golden_fixture_exists_and_is_schema_v3() -> None:
     payload = _load(GOLDEN_FULL)
-    assert payload["schema"] == "gamfit.ManifoldSAE/v3"
+    assert payload["schema"] == "gamfit.ManifoldSAE/v4"
     # The representative model exercises the full optional surface.
     assert len(payload["atoms"]) == 3
     assert payload["fisher_factors"] is not None

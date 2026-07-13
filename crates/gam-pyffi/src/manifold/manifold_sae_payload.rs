@@ -1,7 +1,7 @@
 //! Rust-owned serde schema for the fitted `ManifoldSAE` model artifact (#2091).
 //!
 //! The fitted SAE-manifold model is serialized to a JSON payload tagged
-//! `"gamfit.ManifoldSAE/v3"` schema. Version 3 is deliberately breaking: it
+//! `"gamfit.ManifoldSAE/v4"` schema. Version 4 is deliberately breaking: it
 //! makes the optional crosscoder layout a first-class typed field instead of
 //! accepting legacy payloads that cannot say whether decoder columns are one
 //! ambient or a stack of relevance-weighted layers. Historically the
@@ -160,11 +160,11 @@ pub(crate) struct ManifoldSaePayload {
     pub(crate) selected_log_lambda_smooth: Option<Vec<f64>>,
     pub(crate) selected_log_ard: Option<Vec<Vec<f64>>>,
 
-    // --- runtime diagnostics persisted by v3 -----------------------------
+    // --- runtime diagnostics persisted by v4 -----------------------------
     pub(crate) structured_residual_diagnostics: Vec<Value>,
     /// #2235 — the outer-ρ termination verdict/ledger the fit emitted
     /// (`{"verdict", "evals", "evals_since_improvement", "wall_seconds"}`). Like
-    /// Persisted with v3 so save/load never drops a live convergence verdict.
+    /// Persisted so save/load never drops a live convergence verdict.
     pub(crate) termination: Option<Value>,
 }
 

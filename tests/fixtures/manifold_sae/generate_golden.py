@@ -119,7 +119,7 @@ def build_payload() -> dict[str, Any]:
     selected_log_ard = [np.array([0.1]), np.array([0.2, -0.3]), np.array([0.4, 0.5])]
 
     return {
-        "schema": "gamfit.ManifoldSAE/v3",
+        "schema": "gamfit.ManifoldSAE/v4",
         "atoms": atoms,
         "atom_topology": "mixed",
         "atom_topologies": ["circle", "euclidean", "euclidean"],
@@ -242,6 +242,7 @@ def build_payload() -> dict[str, Any]:
         },
         "fisher_factors": fisher_factors.tolist(),
         "fisher_provenance": "output_fisher_downstream",
+        "fisher_factor_kind": "uncertified_approximation",
         "selected_log_lambda_sparse": -0.6,
         "selected_log_lambda_smooth": selected_log_lambda_smooth.tolist(),
         "selected_log_ard": [values.tolist() for values in selected_log_ard],

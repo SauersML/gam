@@ -94,6 +94,7 @@ def test_scalar_and_list_getters() -> None:
     assert core.assignment_label == golden["assignment_label"]
     assert core.metric_provenance == golden["metric_provenance"]
     assert core.fisher_provenance == golden["fisher_provenance"]
+    assert core.fisher_factor_kind == golden["fisher_factor_kind"]
     assert core.top_k == golden["top_k"]
     assert core.reconstruction_r2 == golden["reconstruction_r2"]
     assert core.penalized_loss_score == golden["penalized_loss_score"]
