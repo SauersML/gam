@@ -848,8 +848,7 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
     let weights = resolve_weight_column(ds, col_map, args.weights_column.as_deref())?;
     let marginal_offset = resolve_offset_column(ds, col_map, args.offset_column.as_deref())?;
     let logslope_offset = resolve_offset_column(ds, col_map, args.noise_offset_column.as_deref())?;
-    let frailty = fit_frailty_spec_from_args(args, "bernoulli marginal-slope")?
-        .resolve_fixed_gaussian_shift("bernoulli marginal-slope")?;
+    let frailty = fit_frailty_spec_from_args(args, "bernoulli marginal-slope")?;
     let routed_deviations = route_marginal_slope_deviation_blocks(
         parsed.linkwiggle.as_ref(),
         parsed_logslope.linkwiggle.as_ref(),
@@ -975,11 +974,14 @@ pub(crate) fn run_fit_bernoulli_marginal_slope(
         let save_frailty = match (&frailty, solved.gaussian_frailty_sd) {
             (
                 gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {
-                    sigma_fixed: None,
+                    scale:
+                        gam::families::survival::lognormal_kernel::FrailtyScale::Learned { .. },
                 },
                 Some(learned),
             ) => gam::families::survival::lognormal_kernel::FrailtySpec::GaussianShift {
-                sigma_fixed: Some(learned),
+                scale: gam::families::survival::lognormal_kernel::FrailtyScale::Fixed {
+                    sigma: learned,
+                },
             },
             _ => frailty,
         };
