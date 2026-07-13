@@ -1874,16 +1874,24 @@ fn harvest_glue_proposals(
         return (0, 0);
     }
     let floor = ACTIVE_SUPPORT_REL_FLOOR / k as f64;
-    let supports: Vec<Vec<bool>> = (0..k)
+    // Packed row supports (one bit per row) so the K²/2 pairwise co-fire counts
+    // below are word-parallel popcounts over n/64 words instead of an O(n)
+    // boolean scan per pair: O(K²·n) bool loads → O(K²·n/64) popcnt words.
+    let support_words = n_rows.div_ceil(64);
+    let supports: Vec<Vec<u64>> = (0..k)
         .map(|atom| {
-            (0..n_rows)
-                .map(|r| assignments[[r, atom]] > floor)
-                .collect()
+            let mut words = vec![0u64; support_words];
+            for r in 0..n_rows {
+                if assignments[[r, atom]] > floor {
+                    words[r / 64] |= 1u64 << (r % 64);
+                }
+            }
+            words
         })
         .collect();
     let support_sizes: Vec<usize> = supports
         .iter()
-        .map(|s| s.iter().filter(|&&x| x).count())
+        .map(|words| words.iter().map(|w| w.count_ones() as usize).sum())
         .collect();
     // Ambient decoder frames — only for d=1 periodic atoms (the over-tiling
     // signature); every other atom is a `None` and never a glue endpoint.
@@ -1925,9 +1933,11 @@ fn harvest_glue_proposals(
             // Disjoint-support gate: keep only pairs that co-fire no MORE than
             // independence predicts (the anti-correlated / disjoint signature the
             // fusion lane cannot see). Positively co-active pairs are fusion's.
-            let inter = (0..n_rows)
-                .filter(|&r| supports[a][r] && supports[b][r])
-                .count();
+            let inter: usize = supports[a]
+                .iter()
+                .zip(supports[b].iter())
+                .map(|(&wa, &wb)| (wa & wb).count_ones() as usize)
+                .sum();
             let expected = support_sizes[a] as f64 * support_sizes[b] as f64 / n_rows as f64;
             if inter as f64 > expected {
                 continue;
@@ -1982,9 +1992,11 @@ fn harvest_glue_proposals(
             {
                 continue;
             }
-            let inter = (0..n_rows)
-                .filter(|&r| supports[a][r] && supports[b][r])
-                .count();
+            let inter: usize = supports[a]
+                .iter()
+                .zip(supports[b].iter())
+                .map(|(&wa, &wb)| (wa & wb).count_ones() as usize)
+                .sum();
             let expected = support_sizes[a] as f64 * support_sizes[b] as f64 / n_rows as f64;
             if inter as f64 > expected {
                 continue;
