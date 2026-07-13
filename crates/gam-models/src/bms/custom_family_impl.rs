@@ -613,7 +613,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                             .exact_newton_joint_psihessian_directional_derivative(
                                 block_states,
                                 specs,
-                                derivative_blocks,
+                                hyper_layout,
                                 psi_index,
                                 &e_a,
                             )?;
