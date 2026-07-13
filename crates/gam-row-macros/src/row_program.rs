@@ -1826,7 +1826,10 @@ mod tests {
             "[__row_program_h0_1,__row_program_h1_1],",
             "[curved_v]",
         ] {
-            assert!(rust.contains(formula), "missing generated formula: {formula}");
+            assert!(
+                rust.contains(formula),
+                "missing generated formula: {formula}"
+            );
         }
         assert!(!rust.contains("JetScalar"));
         assert!(!rust.contains("SparseOrder2"));

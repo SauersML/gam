@@ -61,6 +61,46 @@ def test_steer_reuses_the_resident_metric() -> None:
     assert model.fisher_metric_build_count == 1
 
 
+def test_target_dose_probe_is_wired_through_the_public_model() -> None:
+    model = _model()
+    t_from = np.array([0.0], dtype=np.float64)
+    t_to = np.array([0.25], dtype=np.float64)
+    unit = model.steer(0, 0, 1.0, t_from, t_to)
+    target = 0.5 * float(unit["predicted_nats"])
+    probe_calls: list[float] = []
+
+    def patched_forward_kl(amplitude: float) -> float:
+        probe_calls.append(amplitude)
+        return float(model.steer(0, 0, amplitude, t_from, t_to)["predicted_nats"])
+
+    plan = model.steer_to_target(
+        {
+            "atom_k": 0,
+            "metric_row": 0,
+            "target_nats": target,
+            "t_from": t_from,
+            "t_to": t_to,
+            "tol_rel": 1.0e-12,
+            "max_iter": 4,
+            "readout_tol_rel": 0.1,
+        },
+        patched_forward_kl,
+    )
+
+    assert plan["validation"] == "patched_forward"
+    assert plan["iterations"] == 1
+    assert probe_calls == [plan["amplitude"]]
+    assert plan["measured_nats"] == pytest.approx(target, rel=1.0e-12)
+    assert plan["predicted_nats"] == pytest.approx(target, rel=1.0e-12)
+    np.testing.assert_allclose(
+        plan["delta"],
+        model.steer(0, 0, plan["amplitude"], t_from, t_to)["delta"],
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert model.fisher_metric_build_count == 1
+
+
 def test_attach_fisher_is_atomic_and_builds_once() -> None:
     model = _model()
     original = model.to_dict()
