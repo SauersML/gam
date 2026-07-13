@@ -119,7 +119,10 @@ fn spherical_harmonic_penalty_keeps_laplace_beltrami_scale() {
     let built = build_spherical_harmonic_basis(data.view(), &spec)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "build harmonic spherical basis", e));
     assert_eq!(built.active_penalties.len(), 1);
-    assert_eq!(built.active_penalties[0].info.source, PenaltySource::Primary);
+    assert_eq!(
+        built.active_penalties[0].info.source,
+        PenaltySource::Primary
+    );
     assert_eq!(built.active_penalties[0].info.normalization_scale, 1.0);
 
     let penalty = &built.active_penalties[0].matrix;
@@ -4273,20 +4276,22 @@ fn test_build_scale_free_duchon_basis_centered_spring_triplet() {
     };
     let out = build_duchon_basis(data.view(), &spec)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon basis should build", e));
-    assert_eq!(out.penalties.len(), 4);
-    assert_eq!(out.penaltyinfo.len(), 4);
-    assert!(out.penaltyinfo.iter().all(|info| info.active));
-    assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
+    assert_eq!(out.active_penalties.len(), 4);
+    assert!(out.dropped_penalties.is_empty());
     assert!(matches!(
-        out.penaltyinfo[1].source,
+        out.active_penalties[0].info.source,
+        PenaltySource::Primary
+    ));
+    assert!(matches!(
+        out.active_penalties[1].info.source,
         PenaltySource::DoublePenaltyNullspace
     ));
     assert!(matches!(
-        out.penaltyinfo[2].source,
+        out.active_penalties[2].info.source,
         PenaltySource::OperatorMass
     ));
     assert!(matches!(
-        out.penaltyinfo[3].source,
+        out.active_penalties[3].info.source,
         PenaltySource::OperatorTension
     ));
 }
@@ -4342,12 +4347,12 @@ fn assert_scale_free_joint_null_is_only_constant(
         data.ncols()
     );
     assert!(
-        out.penalties.len() >= 3,
+        out.active_penalties.len() >= 3,
         "Duchon Hilbert scale must emit native curvature plus lower-order penalties"
     );
     let mut joint = Array2::<f64>::zeros((p, p));
-    for s in out.penalties.iter() {
-        joint.scaled_add(1.0, s);
+    for active in &out.active_penalties {
+        joint.scaled_add(1.0, &active.matrix);
     }
     let s_v = gam_linalg::faer_ndarray::fast_av(&joint, &v_const);
     let s_v_norm = s_v.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -4506,11 +4511,11 @@ fn test_explicit_zero_power_is_reachable_and_distinct_from_cubic_default_d2() {
         &cubic.design.to_dense(),
         "design",
     );
-    assert_eq!(thinplate.penalties.len(), 2);
-    assert_eq!(cubic.penalties.len(), 2);
+    assert_eq!(thinplate.active_penalties.len(), 2);
+    assert_eq!(cubic.active_penalties.len(), 2);
     assert_resolved_distinct(
-        &thinplate.penalties[0],
-        &cubic.penalties[0],
+        &thinplate.active_penalties[0].matrix,
+        &cubic.active_penalties[0].matrix,
         "native RKHS penalty",
     );
 }
@@ -5295,19 +5300,22 @@ fn test_build_duchon_basis_linear_nullspace_uses_full_hilbert_scale() {
     };
     let out = build_duchon_basis(data.view(), &spec)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon basis should build", e));
-    assert_eq!(out.penaltyinfo.len(), 4);
-    assert!(out.penaltyinfo.iter().all(|info| info.active));
-    assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
+    assert_eq!(out.active_penalties.len(), 4);
+    assert!(out.dropped_penalties.is_empty());
     assert!(matches!(
-        out.penaltyinfo[1].source,
+        out.active_penalties[0].info.source,
+        PenaltySource::Primary
+    ));
+    assert!(matches!(
+        out.active_penalties[1].info.source,
         PenaltySource::DoublePenaltyNullspace
     ));
     assert!(matches!(
-        out.penaltyinfo[2].source,
+        out.active_penalties[2].info.source,
         PenaltySource::OperatorMass
     ));
     assert!(matches!(
-        out.penaltyinfo[3].source,
+        out.active_penalties[3].info.source,
         PenaltySource::OperatorTension
     ));
 }
@@ -5345,8 +5353,8 @@ fn test_duchon_zero_nullspace_uses_closed_form() {
             "Zero-nullspace Duchon basis should build", e
         )
     });
-    assert_eq!(out.penaltyinfo.len(), 3);
-    assert!(out.penaltyinfo.iter().all(|info| info.active));
+    assert_eq!(out.active_penalties.len(), 3);
+    assert!(out.dropped_penalties.is_empty());
 }
 
 #[test]
@@ -5375,8 +5383,8 @@ fn test_duchon_linear_nullspace_uses_collocation() {
             "Linear-nullspace Duchon basis should build via collocation fallback", e
         )
     });
-    assert_eq!(out.penaltyinfo.len(), 4);
-    assert!(out.penaltyinfo.iter().all(|info| info.active));
+    assert_eq!(out.active_penalties.len(), 4);
+    assert!(out.dropped_penalties.is_empty());
 }
 
 #[test]
@@ -5457,13 +5465,12 @@ fn duchon_nullspace_from_test_m(m: usize) -> DuchonNullspaceOrder {
 }
 
 #[test]
-fn filter_active_penalty_candidates_preserves_matching_kronecker_factors() {
+fn filter_penalty_candidates_preserves_matching_kronecker_factors() {
     let s = array![[1.0, -1.0], [-1.0, 1.0]];
     let identity = Array2::<f64>::eye(2);
     let kron = crate::construction::kronecker_product(&s, &identity);
-    let (_, _, penaltyinfo) = filter_active_penalty_candidates(vec![PenaltyCandidate {
+    let filtered = filter_penalty_candidates(vec![PenaltyCandidate {
         matrix: kron,
-        nullspace_dim_hint: 0,
         source: PenaltySource::TensorMarginal { dim: 0 },
         normalization_scale: 1.0,
         kronecker_factors: Some(vec![s.clone(), identity.clone()]),
@@ -5476,12 +5483,13 @@ fn filter_active_penalty_candidates_preserves_matching_kronecker_factors() {
         )
     });
 
-    assert_eq!(penaltyinfo.len(), 1);
-    assert!(penaltyinfo[0].kronecker_factors.is_some());
+    assert_eq!(filtered.active.len(), 1);
+    assert!(filtered.dropped.is_empty());
+    assert!(filtered.active[0].info.kronecker_factors.is_some());
 }
 
 #[test]
-fn filter_active_penalty_candidates_drops_stale_kronecker_factors_after_projection() {
+fn filter_penalty_candidates_drops_stale_kronecker_factors_after_projection() {
     let s = array![[1.0, -1.0], [-1.0, 1.0]];
     let identity = Array2::<f64>::eye(2);
     let kron = crate::construction::kronecker_product(&s, &identity);
@@ -5492,9 +5500,8 @@ fn filter_active_penalty_candidates_drops_stale_kronecker_factors_after_projecti
         [1.0, 1.0, 1.0]
     ];
     let projected = z.t().dot(&kron).dot(&z);
-    let (_, _, penaltyinfo) = filter_active_penalty_candidates(vec![PenaltyCandidate {
+    let filtered = filter_penalty_candidates(vec![PenaltyCandidate {
         matrix: projected,
-        nullspace_dim_hint: 0,
         source: PenaltySource::TensorMarginal { dim: 0 },
         normalization_scale: 1.0,
         kronecker_factors: Some(vec![s, identity]),
@@ -5507,9 +5514,9 @@ fn filter_active_penalty_candidates_drops_stale_kronecker_factors_after_projecti
         )
     });
 
-    assert_eq!(penaltyinfo.len(), 1);
-    assert!(penaltyinfo[0].active);
-    assert!(penaltyinfo[0].kronecker_factors.is_none());
+    assert_eq!(filtered.active.len(), 1);
+    assert!(filtered.dropped.is_empty());
+    assert!(filtered.active[0].info.kronecker_factors.is_none());
 }
 
 #[test]
@@ -5908,8 +5915,8 @@ fn test_matern_center_sum_tozero_produces_kernel_transform() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e));
     assert_eq!(out.design.nrows(), data.nrows());
     assert_eq!(out.design.ncols(), centers.nrows() - 1);
-    assert_eq!(out.penalties[0].nrows(), out.design.ncols());
-    assert_eq!(out.penalties[0].ncols(), out.design.ncols());
+    assert_eq!(out.active_penalties[0].matrix.nrows(), out.design.ncols());
+    assert_eq!(out.active_penalties[0].matrix.ncols(), out.design.ncols());
     let BasisMetadata::Matern {
         identifiability_transform,
         ..
@@ -5943,9 +5950,9 @@ fn test_matern_operator_penalties_follow_rkhs_smoothness() {
         };
         build_matern_basis(data.view(), &spec)
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e))
-            .penaltyinfo
+            .active_penalties
             .into_iter()
-            .map(|info| info.source)
+            .map(|active| active.info.source)
             .collect::<Vec<_>>()
     };
 
@@ -6016,12 +6023,12 @@ fn test_matern_operator_psi_derivatives_index_align_with_forward_gate() {
             "forward Matérn operator penalties should build", e
         )
     });
-    let (forward_penalties, _, forward_info) = filter_active_penalty_candidates(forward)
+    let filtered = filter_penalty_candidates(forward)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "forward filter", e));
-    let forward_sources: Vec<PenaltySource> = forward_info
+    let forward_sources: Vec<PenaltySource> = filtered
+        .active
         .iter()
-        .filter(|info| info.active)
-        .map(|info| info.source.clone())
+        .map(|active| active.info.source.clone())
         .collect();
     assert_eq!(
         forward_sources,
@@ -6061,9 +6068,9 @@ fn test_matern_operator_psi_derivatives_index_align_with_forward_gate() {
     // Each surviving penalty and its ψ-derivative share the same shape, so
     // the consumer's positional pairing of penalty[a] with ∂S/∂ψ[a] is
     // well-formed.
-    for (penalty, deriv) in forward_penalties.iter().zip(psi_derivatives.iter()) {
+    for (active, deriv) in filtered.active.iter().zip(psi_derivatives.iter()) {
         assert_eq!(
-            penalty.dim(),
+            active.matrix.dim(),
             deriv.dim(),
             "ψ-derivative must match its penalty's shape"
         );
@@ -6185,12 +6192,11 @@ fn test_matern_include_intercept_keeps_single_unpenalized_dimension() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e));
     // (k-1) constrained kernel cols + explicit intercept.
     assert_eq!(out.design.ncols(), centers.nrows());
-    assert_eq!(out.penalties.len(), 3);
-    assert_eq!(out.nullspace_dims.len(), 3);
+    assert_eq!(out.active_penalties.len(), 3);
 }
 
 #[test]
-fn test_matern_double_penalty_drops_inactive_nullspace_blockwithout_intercept() {
+fn test_matern_double_penalty_omits_structurally_absent_nullspace_block_without_intercept() {
     let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.4, 0.7]];
     let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
     let spec = MaternBasisSpec {
@@ -6205,11 +6211,12 @@ fn test_matern_double_penalty_drops_inactive_nullspace_blockwithout_intercept() 
     };
     let out = build_matern_basis(data.view(), &spec)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e));
-    assert_eq!(out.penalties.len(), 1);
-    assert_eq!(out.nullspace_dims.len(), 1);
-    assert_eq!(out.penaltyinfo.len(), 1);
-    assert!(out.penaltyinfo.iter().all(|info| info.active));
-    assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
+    assert_eq!(out.active_penalties.len(), 1);
+    assert!(out.dropped_penalties.is_empty());
+    assert!(matches!(
+        out.active_penalties[0].info.source,
+        PenaltySource::Primary
+    ));
 }
 
 #[test]
@@ -6228,13 +6235,14 @@ fn test_matern_double_penalty_keeps_intercept_shrinkage_block() {
     };
     let out = build_matern_basis(data.view(), &spec)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e));
-    assert_eq!(out.penalties.len(), 2);
-    assert_eq!(out.nullspace_dims.len(), 2);
-    assert_eq!(out.penaltyinfo.len(), 2);
-    assert!(out.penaltyinfo.iter().all(|info| info.active));
-    assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
+    assert_eq!(out.active_penalties.len(), 2);
+    assert!(out.dropped_penalties.is_empty());
     assert!(matches!(
-        out.penaltyinfo[1].source,
+        out.active_penalties[0].info.source,
+        PenaltySource::Primary
+    ));
+    assert!(matches!(
+        out.active_penalties[1].info.source,
         PenaltySource::DoublePenaltyNullspace
     ));
 }
@@ -6383,7 +6391,8 @@ fn test_matern_log_kappa_derivative_matchesfd() {
     let plus_design = plus.design.to_dense();
     let minus_design = minus.design.to_dense();
     let fd_design = (&plus_design - &minus_design) / (2.0 * eps);
-    let fd_penalty = (&plus.penalties[0] - &minus.penalties[0]) / (2.0 * eps);
+    let fd_penalty =
+        (&plus.active_penalties[0].matrix - &minus.active_penalties[0].matrix) / (2.0 * eps);
 
     let design_err = (&deriv.design_derivative - &fd_design)
         .iter()
@@ -6456,16 +6465,18 @@ fn test_matern_double_penalty_log_kappa_derivative_matchesfd() {
     let minus = build_matern_basis(data.view(), &spec_minus)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "minus build", e));
 
-    let fd_primary = (&plus.penalties[0] - &minus.penalties[0]) / (2.0 * eps);
+    let fd_primary =
+        (&plus.active_penalties[0].matrix - &minus.active_penalties[0].matrix) / (2.0 * eps);
     let primary_err = (&deriv.penalties_derivative[0] - &fd_primary)
         .iter()
         .map(|v| v * v)
         .sum::<f64>()
         .sqrt();
     assert_eq!(deriv.penalties_derivative.len(), 2);
-    assert_eq!(plus.penalties.len(), 2);
-    assert_eq!(minus.penalties.len(), 2);
-    let fd_shrinkage = (&plus.penalties[1] - &minus.penalties[1]) / (2.0 * eps);
+    assert_eq!(plus.active_penalties.len(), 2);
+    assert_eq!(minus.active_penalties.len(), 2);
+    let fd_shrinkage =
+        (&plus.active_penalties[1].matrix - &minus.active_penalties[1].matrix) / (2.0 * eps);
     let shrinkage_err = (&deriv.penalties_derivative[1] - &fd_shrinkage)
         .iter()
         .map(|v| v * v)
@@ -6523,7 +6534,8 @@ fn test_thin_plate_log_kappa_derivative_matchesfd() {
     let plus_design = plus.design.to_dense();
     let minus_design = minus.design.to_dense();
     let fd_design = (&plus_design - &minus_design) / (2.0 * eps);
-    let fd_primary = (&plus.penalties[0] - &minus.penalties[0]) / (2.0 * eps);
+    let fd_primary =
+        (&plus.active_penalties[0].matrix - &minus.active_penalties[0].matrix) / (2.0 * eps);
     let design_err = (&deriv.design_derivative - &fd_design)
         .iter()
         .map(|v| v * v)
@@ -6596,8 +6608,9 @@ fn test_thin_plate_log_kappasecond_derivative_matchesfd() {
     let base_design = base.design.to_dense();
     let minus_design = minus.design.to_dense();
     let fd_design = (&plus_design - &(base_design.clone() * 2.0) + &minus_design) / (eps * eps);
-    let fd_primary = (&plus.penalties[0] - &(base.penalties[0].clone() * 2.0)
-        + &minus.penalties[0])
+    let fd_primary = (&plus.active_penalties[0].matrix
+        - &(base.active_penalties[0].matrix.clone() * 2.0)
+        + &minus.active_penalties[0].matrix)
         / (eps * eps);
     let design_err = (&analytic.designsecond_derivative - &fd_design)
         .iter()
@@ -6861,7 +6874,8 @@ fn test_duchon_log_kappa_derivative_matchesfd_lengthscale_one() {
     let minus = build_duchon_basis(data.view(), &spec_minus)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "minus build", e));
     for idx in 0..derivative.first.penalties_derivative.len() {
-        let fd = (&plus.penalties[idx] - &minus.penalties[idx]) / (2.0 * eps);
+        let fd = (&plus.active_penalties[idx].matrix - &minus.active_penalties[idx].matrix)
+            / (2.0 * eps);
         let analytic = &derivative.first.penalties_derivative[idx];
         let err = (analytic - &fd).iter().map(|v| v * v).sum::<f64>().sqrt();
         let a_norm = analytic.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -7032,7 +7046,8 @@ fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_frozen() {
         "derivative must expose at least one penalty matrix"
     );
     for idx in 0..derivative.first.penalties_derivative.len() {
-        let fd = (&plus.penalties[idx] - &minus.penalties[idx]) / (2.0 * eps);
+        let fd = (&plus.active_penalties[idx].matrix - &minus.active_penalties[idx].matrix)
+            / (2.0 * eps);
         let analytic = &derivative.first.penalties_derivative[idx];
         let err = (analytic - &fd).iter().map(|v| v * v).sum::<f64>().sqrt();
         let a_norm = analytic.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -7090,7 +7105,8 @@ fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_linear_no_ident() {
     let minus = build_duchon_basis(data.view(), &spec_minus)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "minus build", e));
     for idx in 0..derivative.first.penalties_derivative.len() {
-        let fd = (&plus.penalties[idx] - &minus.penalties[idx]) / (2.0 * eps);
+        let fd = (&plus.active_penalties[idx].matrix - &minus.active_penalties[idx].matrix)
+            / (2.0 * eps);
         let analytic = &derivative.first.penalties_derivative[idx];
         let err = (analytic - &fd).iter().map(|v| v * v).sum::<f64>().sqrt();
         let a_norm = analytic.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -7149,28 +7165,32 @@ fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_linear() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "minus build", e));
     eprintln!(
         "[duchon_d1_p1_linear] n_penalties={} analytic_n={}",
-        plus.penalties.len(),
+        plus.active_penalties.len(),
         derivative.first.penalties_derivative.len()
     );
     let base = build_duchon_basis(data.view(), &spec)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "base build", e));
     for idx in 0..derivative.first.penalties_derivative.len() {
-        let fd = (&plus.penalties[idx] - &minus.penalties[idx]) / (2.0 * eps);
+        let fd = (&plus.active_penalties[idx].matrix - &minus.active_penalties[idx].matrix)
+            / (2.0 * eps);
         let analytic = &derivative.first.penalties_derivative[idx];
         let err = (analytic - &fd).iter().map(|v| v * v).sum::<f64>().sqrt();
         let a_norm = analytic.iter().map(|v| v * v).sum::<f64>().sqrt();
         let fd_norm = fd.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let s0_base_norm = base.penalties[idx]
+        let s0_base_norm = base.active_penalties[idx]
+            .matrix
             .iter()
             .map(|v| v * v)
             .sum::<f64>()
             .sqrt();
-        let s0_plus_norm = plus.penalties[idx]
+        let s0_plus_norm = plus.active_penalties[idx]
+            .matrix
             .iter()
             .map(|v| v * v)
             .sum::<f64>()
             .sqrt();
-        let s0_minus_norm = minus.penalties[idx]
+        let s0_minus_norm = minus.active_penalties[idx]
+            .matrix
             .iter()
             .map(|v| v * v)
             .sum::<f64>()
@@ -7269,8 +7289,12 @@ fn test_duchon_log_kappa_derivative_matchesfd() {
         "Duchon design derivative mismatch too large: {design_err}"
     );
 
-    assert_eq!(derivative.penalties_derivative.len(), plus.penalties.len());
-    let fd_primary_penalty = (&plus.penalties[0] - &minus.penalties[0]) / (2.0 * eps);
+    assert_eq!(
+        derivative.penalties_derivative.len(),
+        plus.active_penalties.len()
+    );
+    let fd_primary_penalty =
+        (&plus.active_penalties[0].matrix - &minus.active_penalties[0].matrix) / (2.0 * eps);
     let primary_penalty_err = (&derivative.penalties_derivative[0] - &fd_primary_penalty)
         .iter()
         .map(|v| v * v)
@@ -7281,8 +7305,9 @@ fn test_duchon_log_kappa_derivative_matchesfd() {
         "Duchon mass penalty derivative mismatch too large: {primary_penalty_err}"
     );
     for penalty_idx in 1..derivative.penalties_derivative.len() {
-        let fd_penalty =
-            (&plus.penalties[penalty_idx] - &minus.penalties[penalty_idx]) / (2.0 * eps);
+        let fd_penalty = (&plus.active_penalties[penalty_idx].matrix
+            - &minus.active_penalties[penalty_idx].matrix)
+            / (2.0 * eps);
         let penalty_err = (&derivative.penalties_derivative[penalty_idx] - &fd_penalty)
             .iter()
             .map(|v| v * v)
@@ -7372,10 +7397,11 @@ fn test_periodic_duchon_log_kappa_derivative_matchesfd() {
 
     assert_eq!(
         second_derivative.penaltiessecond_derivative.len(),
-        base.penalties.len()
+        base.active_penalties.len()
     );
-    let fd_primary_penalty = (&plus.penalties[0] - &(base.penalties[0].clone() * 2.0)
-        + &minus.penalties[0])
+    let fd_primary_penalty = (&plus.active_penalties[0].matrix
+        - &(base.active_penalties[0].matrix.clone() * 2.0)
+        + &minus.active_penalties[0].matrix)
         / (eps * eps);
     let primary_penalty_err = (&second_derivative.penaltiessecond_derivative[0]
         - &fd_primary_penalty)
@@ -7388,9 +7414,9 @@ fn test_periodic_duchon_log_kappa_derivative_matchesfd() {
         "Duchon mass penalty second derivative mismatch too large: {primary_penalty_err}"
     );
     for penalty_idx in 1..second_derivative.penaltiessecond_derivative.len() {
-        let fd_penalty = (&plus.penalties[penalty_idx]
-            - &(base.penalties[penalty_idx].clone() * 2.0)
-            + &minus.penalties[penalty_idx])
+        let fd_penalty = (&plus.active_penalties[penalty_idx].matrix
+            - &(base.active_penalties[penalty_idx].matrix.clone() * 2.0)
+            + &minus.active_penalties[penalty_idx].matrix)
             / (eps * eps);
         let penalty_err = (&second_derivative.penaltiessecond_derivative[penalty_idx]
             - &fd_penalty)

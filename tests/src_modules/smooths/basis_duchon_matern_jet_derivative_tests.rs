@@ -179,8 +179,16 @@ fn test_duchon_high_dim_single_matern_block_operator_jets_are_stable() {
     assert!(jets.q.is_finite(), "q must be finite, got {}", jets.q);
     assert!(jets.t.is_finite(), "t must be finite, got {}", jets.t);
     assert!(jets.t_r.is_finite(), "t_r must be finite, got {}", jets.t_r);
-    assert!(jets.t_rr.is_finite(), "t_rr must be finite, got {}", jets.t_rr);
-    assert!(jets.phi_rr.is_finite(), "phi_rr must be finite, got {}", jets.phi_rr);
+    assert!(
+        jets.t_rr.is_finite(),
+        "t_rr must be finite, got {}",
+        jets.t_rr
+    );
+    assert!(
+        jets.phi_rr.is_finite(),
+        "phi_rr must be finite, got {}",
+        jets.phi_rr
+    );
     assert!(jets.lap.is_finite(), "lap must be finite, got {}", jets.lap);
 
     // Stability: the regularized scalars must NOT carry the raw block's
@@ -3395,10 +3403,7 @@ fn assert_pair_block_bundle_fully_fd_gated<F>(
         "{label}: d2_eta_kappa shape"
     );
     assert!(
-        bundle
-            .d2_eta
-            .iter()
-            .all(|row| row.len() == eta.len()),
+        bundle.d2_eta.iter().all(|row| row.len() == eta.len()),
         "{label}: d2_eta columns"
     );
 
@@ -3422,10 +3427,8 @@ fn assert_pair_block_bundle_fully_fd_gated<F>(
         let eta_m1 = eta_value(-eta_step);
         let eta_p1 = eta_value(eta_step);
         let eta_p2 = eta_value(2.0 * eta_step);
-        let eta_first_fd =
-            (eta_m2 - 8.0 * eta_m1 + 8.0 * eta_p1 - eta_p2) / (12.0 * eta_step);
-        let eta_second_fd = (-eta_p2 + 16.0 * eta_p1 - 30.0 * value + 16.0 * eta_m1
-            - eta_m2)
+        let eta_first_fd = (eta_m2 - 8.0 * eta_m1 + 8.0 * eta_p1 - eta_p2) / (12.0 * eta_step);
+        let eta_second_fd = (-eta_p2 + 16.0 * eta_p1 - 30.0 * value + 16.0 * eta_m1 - eta_m2)
             / (12.0 * eta_step * eta_step);
         assert_fd_close(
             label,
@@ -3482,8 +3485,7 @@ fn assert_pair_block_bundle_fully_fd_gated<F>(
         mp[axis_b] += step;
         mm[axis_a] -= step;
         mm[axis_b] -= step;
-        (value_at(&pp, kappa) - value_at(&pm, kappa) - value_at(&mp, kappa)
-            + value_at(&mm, kappa))
+        (value_at(&pp, kappa) - value_at(&pm, kappa) - value_at(&mp, kappa) + value_at(&mm, kappa))
             / (4.0 * step * step)
     };
     let eta_cross_coarse = eta_cross_at(eta_step);
@@ -3510,11 +3512,9 @@ fn assert_pair_block_bundle_fully_fd_gated<F>(
     let kappa_m1 = value_at(eta, kappa - kappa_step);
     let kappa_p1 = value_at(eta, kappa + kappa_step);
     let kappa_p2 = value_at(eta, kappa + 2.0 * kappa_step);
-    let kappa_first_fd = (kappa_m2 - 8.0 * kappa_m1 + 8.0 * kappa_p1 - kappa_p2)
-        / (12.0 * kappa_step);
-    let kappa_second_fd = (-kappa_p2 + 16.0 * kappa_p1 - 30.0 * value
-        + 16.0 * kappa_m1
-        - kappa_m2)
+    let kappa_first_fd =
+        (kappa_m2 - 8.0 * kappa_m1 + 8.0 * kappa_p1 - kappa_p2) / (12.0 * kappa_step);
+    let kappa_second_fd = (-kappa_p2 + 16.0 * kappa_p1 - 30.0 * value + 16.0 * kappa_m1 - kappa_m2)
         / (12.0 * kappa_step * kappa_step);
     assert_fd_close(
         label,
@@ -3549,10 +3549,22 @@ fn assert_pair_block_bundle_fully_fd_gated<F>(
         .map(|&axis| bundle.d2_eta_kappa[axis].abs())
         .fold(0.0_f64, f64::max);
     let signal_floor = 1e-10 * value_scale;
-    assert!(eta_first_signal > signal_floor, "{label}: vacuous d_eta gate");
-    assert!(eta_second_signal > signal_floor, "{label}: vacuous d2_eta gate");
-    assert!(bundle.d_kappa.abs() > signal_floor, "{label}: vacuous d_kappa gate");
-    assert!(bundle.d2_kappa.abs() > signal_floor, "{label}: vacuous d2_kappa gate");
+    assert!(
+        eta_first_signal > signal_floor,
+        "{label}: vacuous d_eta gate"
+    );
+    assert!(
+        eta_second_signal > signal_floor,
+        "{label}: vacuous d2_eta gate"
+    );
+    assert!(
+        bundle.d_kappa.abs() > signal_floor,
+        "{label}: vacuous d_kappa gate"
+    );
+    assert!(
+        bundle.d2_kappa.abs() > signal_floor,
+        "{label}: vacuous d2_kappa gate"
+    );
     assert!(mixed_signal > signal_floor, "{label}: vacuous mixed gate");
 }
 
@@ -3573,19 +3585,26 @@ fn test_pair_block_derivative_branch_matrix_is_fully_fd_gated_2315() {
         ("zero-hybrid-ir-singular-odd", 3, 2, 2, false),
     ];
     for (case_label, d, m, s, expect_schoenberg) in zero_lag_cases {
-        let eta: Vec<f64> = (0..d)
-            .map(|axis| 0.06 * axis as f64 - 0.1)
-            .collect();
+        let eta: Vec<f64> = (0..d).map(|axis| 0.06 * axis as f64 - 0.1).collect();
         let r = vec![0.0_f64; d];
         let kappa = 0.9_f64;
         for q in 0..=2 {
             let schoenberg = schoenberg_self_pair_bundle(q, m, s, kappa, &eta);
             let hybrid = hybrid_self_pair_bundle_odd_d(q, m, s, kappa, &eta);
             if expect_schoenberg {
-                assert!(schoenberg.is_some(), "{case_label} q={q}: wrong zero-lag branch");
+                assert!(
+                    schoenberg.is_some(),
+                    "{case_label} q={q}: wrong zero-lag branch"
+                );
             } else {
-                assert!(schoenberg.is_none(), "{case_label} q={q}: IR gate not exercised");
-                assert!(hybrid.is_some(), "{case_label} q={q}: hybrid branch not exercised");
+                assert!(
+                    schoenberg.is_none(),
+                    "{case_label} q={q}: IR gate not exercised"
+                );
+                assert!(
+                    hybrid.is_some(),
+                    "{case_label} q={q}: hybrid branch not exercised"
+                );
             }
 
             let bundle = pair_block_radial_with_j_second_derivatives(q, m, s, kappa, &eta, &r);
@@ -3681,10 +3700,7 @@ fn test_pair_block_derivative_branch_matrix_is_fully_fd_gated_2315() {
                 kappa,
                 &bundle,
                 |eta_at, kappa_at| {
-                    pair_block_radial_with_j_second_derivatives(
-                        q, m, s, kappa_at, eta_at, &r,
-                    )
-                    .value
+                    pair_block_radial_with_j_second_derivatives(q, m, s, kappa_at, eta_at, &r).value
                 },
             );
         }
