@@ -162,26 +162,8 @@ impl RowHessian for SurvivalRowHessian {
     }
 }
 
-/// `FamilyChannelHessian` for survival marginal-slope.
-///
-/// The 4×4 per-subject W_i is the Hessian of the row negative log-likelihood
-/// `ρ_i(q0, q1, qd1, g) = −δ_i log f(η_1, ad1) − (1−δ_i) log S(η_1) + log S(η_0)`
-/// with respect to the 4-vector primary state `(q0, q1, qd1, g)`.
-///
-/// Derivation of W_i entries (all from `row_primary_closed_form`):
-///
-/// - W[0,0] = u2_η0 · c²  (q0–q0; only η0 depends on q0)
-/// - W[1,1] = (u2_η1 + w·δ) · c²  (q1–q1; η1 and log-φ both depend on q1)
-/// - W[2,2] = w·δ · (∂ad1/∂qd1)² · (−1/ad1²)  (qd1–qd1 via neglog(ad1))
-/// - W[3,3] = u2_η0·(∂η0/∂g)² + u1_η0·(∂²η0/∂g²) + u2_η1·(∂η1/∂g)² + ...
-/// - W[0,3] = W[3,0] = u2_η0·c·(q0·c1 + s_f·z) + u1_η0·c1  (cross q0–g)
-/// - W[1,3] = W[3,1] = u2_η1·c·(q1·c1 + s_f·z) + u1_η1·c1  (cross q1–g)
-/// - W[2,3] = W[3,2] = u2_ad1·c·(qd1·c1) + u1_ad1·c1  (cross qd1–g)
-/// - All other off-diagonals are zero (η0, η1, ad1 depend on non-overlapping
-///   subsets of (q0,q1,qd1,g), and only g is shared across all three).
-///
-/// This is already computed by `row_primary_closed_form` and stored in
-/// `SurvivalRowHessian::h` after PSD-clamping.
+/// `FamilyChannelHessian` for survival marginal-slope. Both the pilot snapshot
+/// and current-β refresh use the same `(3 + K)` vector row program.
 ///
 /// # β-dependent W via `channel_hessian_at`
 ///
@@ -199,7 +181,7 @@ impl RowHessian for SurvivalRowHessian {
 /// Jacobian callbacks: scalars required when β affects the primary state).
 impl FamilyChannelHessian for SurvivalRowHessian {
     fn n_outputs(&self) -> usize {
-        K_SURVIVAL
+        self.h.shape()[1]
     }
 
     fn n_subjects(&self) -> usize {
@@ -207,10 +189,11 @@ impl FamilyChannelHessian for SurvivalRowHessian {
     }
 
     fn fill_subject(&self, i: usize, out: &mut [f64]) {
-        assert_eq!(out.len(), K_SURVIVAL * K_SURVIVAL);
-        for a in 0..K_SURVIVAL {
-            for b in 0..K_SURVIVAL {
-                out[a * K_SURVIVAL + b] = self.h[[i, a, b]];
+        let k = self.h.shape()[1];
+        assert_eq!(out.len(), k * k);
+        for a in 0..k {
+            for b in 0..k {
+                out[a * k + b] = self.h[[i, a, b]];
             }
         }
     }
@@ -275,37 +258,50 @@ impl FamilyChannelHessian for SurvivalRowHessian {
                 if sc.q0_i.len() != n
                     || sc.q1_i.len() != n
                     || sc.qd1_i.len() != n
-                    || sc.g_i.len() != n
-                    || sc.z_i.len() != n
+                    || sc.slopes.nrows() != n
+                    || sc.slopes.ncols() != self.covariance.dim()
                 {
                     return Err(format!(
                         "SurvivalRowHessian::channel_hessian_at: scalars length mismatch \
-                         (expected n={n}, got q0={} q1={} qd1={} g={} z={})",
+                         (expected n={n}, K={}, got q0={} q1={} qd1={} slopes={}x{})",
+                        self.covariance.dim(),
                         sc.q0_i.len(),
                         sc.q1_i.len(),
                         sc.qd1_i.len(),
-                        sc.g_i.len(),
-                        sc.z_i.len(),
+                        sc.slopes.nrows(),
+                        sc.slopes.ncols(),
                     ));
                 }
-                let mut h_full = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
+                let primary_width = self.h.shape()[1];
+                let mut h_full = Array3::<f64>::zeros((n, primary_width, primary_width));
+                let mut workspace =
+                    crate::survival::marginal_slope::RigidVectorRowWorkspace::new(
+                        &self.covariance,
+                    )?;
                 for i in 0..n {
                     let clamped = evaluated_psd_row_hessian(
                         sc.q0_i[i],
                         sc.q1_i[i],
                         sc.qd1_i[i],
-                        sc.g_i[i],
-                        sc.z_i[i],
+                        sc.slopes.row(i).as_slice().ok_or_else(|| {
+                            "SurvivalRowHessian::channel_hessian_at slope row is not contiguous"
+                                .to_string()
+                        })?,
+                        self.z.row(i).as_slice().ok_or_else(|| {
+                            "SurvivalRowHessian::channel_hessian_at score row is not contiguous"
+                                .to_string()
+                        })?,
                         self.weights[i],
                         self.event[i],
                         self.derivative_guard,
                         sc.s,
+                        &mut workspace,
                     )
                     .map_err(|reason| {
                         format!("SurvivalRowHessian::channel_hessian_at: row {i}: {reason}")
                     })?;
-                    for a in 0..K_SURVIVAL {
-                        for b in 0..K_SURVIVAL {
+                    for a in 0..primary_width {
+                        for b in 0..primary_width {
                             h_full[[i, a, b]] = clamped[[a, b]];
                         }
                     }
@@ -320,41 +316,38 @@ fn evaluated_psd_row_hessian(
     q0: f64,
     q1: f64,
     qd1: f64,
-    g: f64,
-    z: f64,
+    slopes: &[f64],
+    z: &[f64],
     weight: f64,
     event: f64,
     derivative_guard: f64,
     probit_scale: f64,
+    workspace: &mut crate::survival::marginal_slope::RigidVectorRowWorkspace<'_>,
 ) -> Result<Array2<f64>, String> {
-    let (_, _grad, hess) = crate::survival::marginal_slope::row_primary_for_compiler(
+    crate::survival::marginal_slope::row_primary_closed_form_vector_into(
         q0,
         q1,
         qd1,
-        g,
+        slopes,
         z,
         weight,
         event,
         derivative_guard,
         probit_scale,
+        workspace,
     )?;
-    let mut h_i = Array2::<f64>::zeros((K_SURVIVAL, K_SURVIVAL));
-    for a in 0..K_SURVIVAL {
-        for b in 0..K_SURVIVAL {
-            h_i[[a, b]] = hess[a][b];
-        }
-    }
-    psd_clamp_4x4(&h_i)
+    let (_, hessian) = workspace.derivatives();
+    psd_clamp(&hessian.to_owned())
 }
 
-/// Project a 4×4 symmetric matrix onto the PSD cone by zeroing negative
+/// Project a symmetric matrix onto the PSD cone by zeroing negative
 /// eigenvalues. A failed decomposition is an invalid curvature certificate,
 /// so it is reported instead of being replaced by unrelated diagonal data.
-fn psd_clamp_4x4(m: &Array2<f64>) -> Result<Array2<f64>, String> {
+fn psd_clamp(m: &Array2<f64>) -> Result<Array2<f64>, String> {
     let k = m.nrows();
-    if m.dim() != (K_SURVIVAL, K_SURVIVAL) {
+    if k == 0 || m.ncols() != k {
         return Err(format!(
-            "survival row Hessian must be {K_SURVIVAL}x{K_SURVIVAL}, got {}x{}",
+            "survival row Hessian must be non-empty and square, got {}x{}",
             m.nrows(),
             m.ncols(),
         ));

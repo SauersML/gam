@@ -65,9 +65,7 @@ use crate::sigma_link::exp_sigma_inverse_from_eta_scalar;
 
 use crate::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
 
-use crate::survival::predict::{
-    LocationScaleEtaComponents, location_scale_eta_components, location_scale_time_warp_components,
-};
+use crate::survival::predict::{LocationScaleEtaComponents, location_scale_eta_components};
 
 use crate::survival::time_constraints::{
     FeasibilityTolerance, GuardConstraintFailure, GuardConstraintPolicy, GuardPolicy,
