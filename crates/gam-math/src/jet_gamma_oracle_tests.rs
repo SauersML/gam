@@ -269,7 +269,8 @@ fn gamma_dispersion_jet_tower_matches_independent_fd_oracle() {
     };
 
     for (row, fixture) in rows.iter().enumerate() {
-        let tower: Tower4<2> = program_full_tower(&program, row).expect("gamma jet tower");
+        let tower: Box<Tower4<2>> =
+            program_full_tower(&program, row).expect("gamma jet tower");
 
         // Value.
         close(
@@ -361,7 +362,7 @@ fn gamma_dispersion_packed_scalars_match_dense_tower_contractions() {
     };
 
     for row in 0..rows.len() {
-        let tower: Tower4<2> = program_full_tower(&program, row).expect("tower");
+        let tower: Box<Tower4<2>> = program_full_tower(&program, row).expect("tower");
 
         // Order2: value / gradient / Hessian via the production packed scalar.
         let (v, g, h) = program_row_kernel(&program, row).expect("Order2 channel");
@@ -495,7 +496,7 @@ fn affine_special_function_composition_places_certified_stack_by_order() {
             ln_gamma_derivative_stack(x0)
         };
         let c = [c0, c1];
-        let tower: Tower4<2> = program_full_tower(&program, 0).expect("affine tower");
+        let tower: Box<Tower4<2>> = program_full_tower(&program, 0).expect("affine tower");
 
         let tag = if digamma { "digamma" } else { "ln_gamma" };
         // Value.

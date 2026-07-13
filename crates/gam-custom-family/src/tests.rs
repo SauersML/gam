@@ -1644,15 +1644,6 @@ impl ExactNewtonJointHessianWorkspace for InnerPreludeCountingWorkspace {
         Ok(())
     }
 
-    fn joint_gradient_evaluation(
-        &self,
-    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        Ok(Some(ExactNewtonJointGradientEvaluation {
-            log_likelihood: 0.0,
-            gradient: array![0.0],
-        }))
-    }
-
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         self.dense_calls.fetch_add(1, Ordering::Relaxed);
         Ok(Some(array![[1.0]]))
@@ -1693,11 +1684,18 @@ impl CustomFamily for InnerPreludeWorkspaceFamily {
         })))
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, _: &[ParameterBlockSpec]) -> bool {
-        true
+    fn exact_newton_joint_gradient_evaluation(
+        &self,
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        Ok(Some(ExactNewtonJointGradientEvaluation {
+            log_likelihood: 0.0,
+            gradient: array![0.0],
+        }))
     }
 
-    fn inner_joint_workspace_gradient_available(&self, _: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, _: &[ParameterBlockSpec]) -> bool {
         true
     }
 

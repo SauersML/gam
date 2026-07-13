@@ -193,7 +193,8 @@ fn gaulss_link_jet_tower_matches_production_observed_score_and_hessian() {
 
     const REL_TOL: f64 = 1e-11;
     for (row, fixture) in rows.iter().enumerate() {
-        let tower: Tower4<2> = program_full_tower(&program, row).expect("gaulss jet tower");
+        let tower: Box<Tower4<2>> =
+            program_full_tower(&program, row).expect("gaulss jet tower");
         let claims = gaulss_observed_closed_form(fixture);
         verify_kernel_channels(&tower, &claims, REL_TOL).unwrap_or_else(|e| {
             panic!(

@@ -193,7 +193,8 @@ fn assert_vgh<const M: usize>(seed: u64) {
     let rows = make_rows::<M>(seed, 24);
     let program = MultinomialSoftmaxRow { rows: rows.clone() };
     for (row, fixture) in rows.iter().enumerate() {
-        let tower: Tower4<M> = program_full_tower(&program, row).expect("multinomial jet tower");
+        let tower: Box<Tower4<M>> =
+            program_full_tower(&program, row).expect("multinomial jet tower");
         let claims = multinomial_closed_form_vgh(fixture);
         verify_kernel_channels(&tower, &claims, REL_TOL).unwrap_or_else(|e| {
             panic!("M={M} row {row}: softmax closed form disagrees with #932 jet tower: {e}")

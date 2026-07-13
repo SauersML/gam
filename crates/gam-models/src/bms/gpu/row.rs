@@ -1200,6 +1200,12 @@ pub(crate) const BMS_FLEX_ROW_HVP_MAX_RHS: usize = 8;
 /// finaliser).
 #[cfg(target_os = "linux")]
 pub struct DeviceResidentRowHess {
+    /// Per-row negative log likelihood emitted by the same canonical row
+    /// program that emits `grad` and `hess`.
+    pub(crate) neglog: CudaSlice<f64>,
+    /// Per-row objective gradient `[n, r]`, row-major. Joint-score consumers
+    /// negate and pull this buffer back through the two designs/direct blocks.
+    pub(crate) grad: CudaSlice<f64>,
     /// Per-row dense `[n, r, r]` row-major Hessian. Element `(u, v)` of row
     /// `i` is `hess[i*r*r + u*r + v]`. This is the only on-device storage
     /// layout supported by the current HVP / diag kernels.
@@ -1212,6 +1218,14 @@ pub struct DeviceResidentRowHess {
     pub(crate) primary: BmsFlexPrimaryLayout,
     /// Estimated bytes resident on device (for accounting).
     pub(crate) bytes: u64,
+}
+
+/// Host image of the deterministic device reduction over the canonical row
+/// value/gradient buffers. The gradient uses log-likelihood/score sign.
+#[cfg(target_os = "linux")]
+pub(crate) struct BmsFlexDeviceJointGradient {
+    pub(crate) log_likelihood: f64,
+    pub(crate) gradient: Vec<f64>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1371,6 +1385,85 @@ extern "C" __global__ void bms_flex_row_hvp_reduce(
     double acc = 0.0;
     for (int c = 0; c < num_chunks; ++c) {
         acc += partial[(size_t)c * (size_t)p_total + (size_t)j];
+    }
+    out[j] = acc;
+}
+
+extern "C" __global__ void bms_flex_row_joint_gradient_partial(
+    int                  n_rows,
+    int                  r,
+    int                  p_m,
+    int                  p_g,
+    int                  p_total,
+    int                  h_block_start,
+    int                  h_block_len,
+    int                  w_block_start,
+    int                  w_block_len,
+    int                  h_primary_start,
+    int                  w_primary_start,
+    int                  rows_per_cta,
+    const double * __restrict__ row_neglog,       // [n]
+    const double * __restrict__ row_grad,         // [n, r]
+    const double * __restrict__ marginal_design,  // [n, p_m]
+    const double * __restrict__ logslope_design,  // [n, p_g]
+    double       * __restrict__ partial)          // [num_chunks, 1+p_total]
+{
+    int chunk = blockIdx.x;
+    int tid = threadIdx.x;
+    int row_lo = chunk * rows_per_cta;
+    int row_hi = row_lo + rows_per_cta;
+    if (row_hi > n_rows) row_hi = n_rows;
+    int output_width = p_total + 1;
+    double *out = partial + (size_t)chunk * (size_t)output_width;
+
+    // One thread owns each output coordinate for the whole row chunk. The
+    // inner row loop therefore has a fixed order and needs no atomics.
+    for (int output_idx = tid; output_idx < output_width; output_idx += blockDim.x) {
+        double acc = 0.0;
+        if (output_idx == 0) {
+            for (int row = row_lo; row < row_hi; ++row) {
+                acc -= row_neglog[row];
+            }
+        } else {
+            int beta_idx = output_idx - 1;
+            if (beta_idx < p_m) {
+                for (int row = row_lo; row < row_hi; ++row) {
+                    acc -= row_grad[(size_t)row * (size_t)r]
+                         * marginal_design[(size_t)row * (size_t)p_m + (size_t)beta_idx];
+                }
+            } else if (beta_idx < p_m + p_g) {
+                int j = beta_idx - p_m;
+                for (int row = row_lo; row < row_hi; ++row) {
+                    acc -= row_grad[(size_t)row * (size_t)r + 1]
+                         * logslope_design[(size_t)row * (size_t)p_g + (size_t)j];
+                }
+            } else if (beta_idx >= h_block_start && beta_idx < h_block_start + h_block_len) {
+                int primary_idx = h_primary_start + beta_idx - h_block_start;
+                for (int row = row_lo; row < row_hi; ++row) {
+                    acc -= row_grad[(size_t)row * (size_t)r + (size_t)primary_idx];
+                }
+            } else if (beta_idx >= w_block_start && beta_idx < w_block_start + w_block_len) {
+                int primary_idx = w_primary_start + beta_idx - w_block_start;
+                for (int row = row_lo; row < row_hi; ++row) {
+                    acc -= row_grad[(size_t)row * (size_t)r + (size_t)primary_idx];
+                }
+            }
+        }
+        out[output_idx] = acc;
+    }
+}
+
+extern "C" __global__ void bms_flex_row_joint_gradient_reduce(
+    int                  num_chunks,
+    int                  output_width,
+    const double * __restrict__ partial,   // [num_chunks, output_width]
+    double       * __restrict__ out)        // [output_width]
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= output_width) return;
+    double acc = 0.0;
+    for (int c = 0; c < num_chunks; ++c) {
+        acc += partial[(size_t)c * (size_t)output_width + (size_t)j];
     }
     out[j] = acc;
 }
@@ -2220,16 +2313,8 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
     }
     drop(d_status);
 
-    // The kernel writes neglog + grad alongside the row Hessian, but the
-    // device-resident cache path keeps neither on the host: the fused
-    // CPU gradient pass (the only consumer of host-side neglog/grad) is
-    // dispatched only when the GPU dense-block kernel does not apply. In that
-    // distinct consumer path, the row kernel runs again locally.
-    // Drop the device buffers so the allocation pool reclaims them
-    // immediately rather than tying them to the cache's lifetime.
-    drop(d_neglog);
-    drop(d_grad);
-    // Drop the per-cell uploads; keep d_hess + designs.
+    // Drop the per-cell uploads; keep the canonical row value, gradient,
+    // Hessian, and both pullback designs in one device-resident authority.
     drop(d_q);
     drop(d_b);
     drop(d_mu1);
@@ -2258,9 +2343,14 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
     drop(d_tau);
     drop(d_ruv);
 
-    let bytes = ((n * r * r + marginal_design_row_major.len() + logslope_design_row_major.len())
+    let bytes = ((n + n * r
+        + n * r * r
+        + marginal_design_row_major.len()
+        + logslope_design_row_major.len())
         * std::mem::size_of::<f64>()) as u64;
     Ok(DeviceResidentRowHess {
+        neglog: d_neglog,
+        grad: d_grad,
         hess: d_hess,
         marginal_design: d_marginal,
         logslope_design: d_logslope,
@@ -2269,6 +2359,145 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
         block,
         primary,
         bytes,
+    })
+}
+
+/// Reduce the canonical per-row value and objective gradient into the joint
+/// log-likelihood and score gradient without re-running row calculus on CPU.
+/// Both stages use fixed row/chunk order and no atomics.
+#[cfg(target_os = "linux")]
+pub(crate) fn launch_bms_flex_row_joint_gradient(
+    storage: &DeviceResidentRowHess,
+) -> Result<BmsFlexDeviceJointGradient, GpuError> {
+    let p_total = storage.block.p_total;
+    let output_width = p_total
+        .checked_add(1)
+        .ok_or_else(|| GpuError::DriverCallFailed {
+            reason: "bms_flex_row joint gradient: output width overflow".to_string(),
+        })?;
+    if storage.n == 0 {
+        return Ok(BmsFlexDeviceJointGradient {
+            log_likelihood: 0.0,
+            gradient: vec![0.0; p_total],
+        });
+    }
+
+    let backend = HvpKernelBackend::probe()?;
+    let stream = backend.stream.clone();
+    let args = PreparedBmsFlexRowLaunchArgs::from_storage(storage);
+    let partial_len = args
+        .num_chunks
+        .checked_mul(output_width)
+        .ok_or_else(|| GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row joint gradient: partial length overflow for chunks={} width={output_width}",
+                args.num_chunks
+            ),
+        })?;
+    let mut d_partial =
+        stream
+            .alloc_zeros::<f64>(partial_len)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("bms_flex_row joint gradient alloc partial: {err}"),
+            })?;
+    let mut d_out = stream
+        .alloc_zeros::<f64>(output_width)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row joint gradient alloc output: {err}"),
+        })?;
+    let partial_func = backend
+        .module
+        .load_function("bms_flex_row_joint_gradient_partial")
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row joint gradient load partial: {err}"),
+        })?;
+    let reduce_func = backend
+        .module
+        .load_function("bms_flex_row_joint_gradient_reduce")
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row joint gradient load reduce: {err}"),
+        })?;
+
+    let cfg_partial = LaunchConfig {
+        grid_dim: (args.num_chunks as u32, 1, 1),
+        block_dim: (HVP_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = stream.launch_builder(&partial_func);
+    builder
+        .arg(&args.n_i32)
+        .arg(&args.r_i32)
+        .arg(&args.p_m_i32)
+        .arg(&args.p_g_i32)
+        .arg(&args.p_total_i32)
+        .arg(&args.h_block_start)
+        .arg(&args.h_block_len)
+        .arg(&args.w_block_start)
+        .arg(&args.w_block_len)
+        .arg(&args.h_primary_start)
+        .arg(&args.w_primary_start)
+        .arg(&args.rows_per_cta)
+        .arg(&storage.neglog)
+        .arg(&storage.grad)
+        .arg(&storage.marginal_design)
+        .arg(&storage.logslope_design)
+        .arg(&mut d_partial);
+    // SAFETY: all resident buffers were allocated and shape-validated by the
+    // row-kernel producer; `d_partial` has `num_chunks * (1+p_total)` entries.
+    unsafe { builder.launch(cfg_partial) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row joint gradient partial launch: {err}"),
+    })?;
+
+    let output_width_i32 = i32::try_from(output_width).map_err(|_| {
+        GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row joint gradient: output_width={output_width} exceeds i32 range"
+            ),
+        }
+    })?;
+    let num_chunks_i32 = args.num_chunks as i32;
+    let reduce_blocks = (output_width as u32).div_ceil(REDUCTION_THREADS);
+    let cfg_reduce = LaunchConfig {
+        grid_dim: (reduce_blocks, 1, 1),
+        block_dim: (REDUCTION_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = stream.launch_builder(&reduce_func);
+    builder
+        .arg(&num_chunks_i32)
+        .arg(&output_width_i32)
+        .arg(&d_partial)
+        .arg(&mut d_out);
+    // SAFETY: the partial launch above populated the exact partial shape and
+    // `d_out` owns `output_width` entries.
+    unsafe { builder.launch(cfg_reduce) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row joint gradient reduce launch: {err}"),
+    })?;
+    stream
+        .synchronize()
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row joint gradient synchronize: {err}"),
+        })?;
+    let host = stream
+        .clone_dtoh(&d_out)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row joint gradient download: {err}"),
+        })?;
+    if let Some((index, value)) = host
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row joint gradient produced non-finite output[{index}]={value}"
+            ),
+        });
+    }
+    Ok(BmsFlexDeviceJointGradient {
+        log_likelihood: host[0],
+        gradient: host[1..].to_vec(),
     })
 }
 
@@ -4114,6 +4343,12 @@ mod tests {
                 .clone_htod(&logslope)
                 .expect("[bms_flex_row hvp parity] upload logslope must succeed on CUDA host");
             let storage = DeviceResidentRowHess {
+                neglog: stream
+                    .alloc_zeros::<f64>(n)
+                    .expect("[bms_flex_row hvp parity] alloc neglog"),
+                grad: stream
+                    .alloc_zeros::<f64>(n * r)
+                    .expect("[bms_flex_row hvp parity] alloc grad"),
                 hess: d_h,
                 marginal_design: d_m,
                 logslope_design: d_g,
@@ -4122,7 +4357,8 @@ mod tests {
                 block: block.clone(),
                 primary: primary.clone(),
 
-                bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
+                    * std::mem::size_of::<f64>()) as u64,
             };
             let gpu_hvp =
                 launch_bms_flex_row_hvp(&storage, &v).expect("HVP kernel must launch on CUDA host");
@@ -4245,6 +4481,12 @@ mod tests {
             .clone_htod(&logslope)
             .expect("[bms_flex_row hvp_multi parity] upload logslope must succeed on CUDA host");
         let storage = DeviceResidentRowHess {
+            neglog: stream
+                .alloc_zeros::<f64>(n)
+                .expect("[bms_flex_row hvp_multi parity] alloc neglog"),
+            grad: stream
+                .alloc_zeros::<f64>(n * r)
+                .expect("[bms_flex_row hvp_multi parity] alloc grad"),
             hess: d_h,
             marginal_design: d_m,
             logslope_design: d_g,
@@ -4253,7 +4495,8 @@ mod tests {
             block: block.clone(),
             primary: primary.clone(),
 
-            bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+            bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
+                * std::mem::size_of::<f64>()) as u64,
         };
         let scratch = bms_flex_row_hvp_multi_scratch_bytes_for_shape(n, p_total, rhs_count)
             .expect("storage scratch budget");
@@ -4390,6 +4633,12 @@ mod tests {
                 "[bms_flex_row hvp_into_device parity] upload logslope must succeed on CUDA host",
             );
             let storage = DeviceResidentRowHess {
+                neglog: stream
+                    .alloc_zeros::<f64>(n)
+                    .expect("[bms_flex_row hvp_into_device parity] alloc neglog"),
+                grad: stream
+                    .alloc_zeros::<f64>(n * r)
+                    .expect("[bms_flex_row hvp_into_device parity] alloc grad"),
                 hess: d_h,
                 marginal_design: d_m,
                 logslope_design: d_g,
@@ -4398,7 +4647,8 @@ mod tests {
                 block: block.clone(),
                 primary: primary.clone(),
 
-                bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
+                    * std::mem::size_of::<f64>()) as u64,
             };
 
             // Host-out adapter (allocates its own d_out, syncs + downloads).
@@ -4604,6 +4854,12 @@ mod tests {
                 }
             };
             let storage = DeviceResidentRowHess {
+                neglog: stream
+                    .alloc_zeros::<f64>(n)
+                    .expect("[bms_flex_row hvp parity n64_r20_p44] alloc neglog"),
+                grad: stream
+                    .alloc_zeros::<f64>(n * r)
+                    .expect("[bms_flex_row hvp parity n64_r20_p44] alloc grad"),
                 hess: d_h,
                 marginal_design: d_m,
                 logslope_design: d_g,
@@ -4612,7 +4868,8 @@ mod tests {
                 block: block.clone(),
                 primary: primary.clone(),
 
-                bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
+                    * std::mem::size_of::<f64>()) as u64,
             };
             let gpu_hvp = launch_bms_flex_row_hvp(&storage, &v)
                 .expect("HVP kernel must launch on CUDA host at n64/r20/p44");
@@ -4779,6 +5036,12 @@ mod tests {
                 "[bms_flex_row dense_block parity] upload logslope must succeed on CUDA host",
             );
             let storage = DeviceResidentRowHess {
+                neglog: stream
+                    .alloc_zeros::<f64>(n)
+                    .expect("[bms_flex_row dense_block parity] alloc neglog"),
+                grad: stream
+                    .alloc_zeros::<f64>(n * r)
+                    .expect("[bms_flex_row dense_block parity] alloc grad"),
                 hess: d_h,
                 marginal_design: d_m,
                 logslope_design: d_g,
@@ -4787,7 +5050,8 @@ mod tests {
                 block: block.clone(),
                 primary: primary.clone(),
 
-                bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
+                    * std::mem::size_of::<f64>()) as u64,
             };
             let h_gpu = launch_bms_flex_row_dense_block(&storage)
                 .expect("dense_block kernel must launch on CUDA host");
@@ -4865,6 +5129,12 @@ mod tests {
             .expect("[bms_flex_row dense HVP parity] backend probe must succeed");
         let stream = backend.stream.clone();
         let storage = DeviceResidentRowHess {
+            neglog: stream
+                .alloc_zeros::<f64>(n)
+                .expect("dense HVP parity neglog allocation"),
+            grad: stream
+                .alloc_zeros::<f64>(n * r)
+                .expect("dense HVP parity grad allocation"),
             hess: stream
                 .clone_htod(&row_hessians)
                 .expect("dense HVP parity hessian upload"),
@@ -4878,7 +5148,8 @@ mod tests {
             r,
             block,
             primary,
-            bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+            bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
+                * std::mem::size_of::<f64>()) as u64,
         };
         let actual = launch_bms_flex_row_dense(&storage)
             .expect("wide dense HVP materialization must stay on CUDA");
@@ -5019,6 +5290,12 @@ mod tests {
                 }
             };
             let storage = DeviceResidentRowHess {
+                neglog: stream
+                    .alloc_zeros::<f64>(n)
+                    .expect("[bms_flex_row hvp hill-climb] alloc neglog"),
+                grad: stream
+                    .alloc_zeros::<f64>(n * r)
+                    .expect("[bms_flex_row hvp hill-climb] alloc grad"),
                 hess: d_h,
                 marginal_design: d_m,
                 logslope_design: d_g,
@@ -5027,7 +5304,8 @@ mod tests {
                 block: block.clone(),
                 primary: primary.clone(),
 
-                bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
+                    * std::mem::size_of::<f64>()) as u64,
             };
             let warmup: usize = 3;
             let iters: usize = 15;
@@ -5232,6 +5510,12 @@ mod tests {
                 }
             };
             let storage = DeviceResidentRowHess {
+                neglog: stream
+                    .alloc_zeros::<f64>(n)
+                    .expect("[bms_flex_row dense_block hill-climb] alloc neglog"),
+                grad: stream
+                    .alloc_zeros::<f64>(n * r)
+                    .expect("[bms_flex_row dense_block hill-climb] alloc grad"),
                 hess: d_h,
                 marginal_design: d_m,
                 logslope_design: d_g,
@@ -5240,7 +5524,8 @@ mod tests {
                 block: block.clone(),
                 primary: primary.clone(),
 
-                bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+                bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
+                    * std::mem::size_of::<f64>()) as u64,
             };
             // Warmup + 5-iter median (dense build is heavier than HVP).
             let warmup: usize = 2;

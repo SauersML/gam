@@ -1801,20 +1801,21 @@ pub trait RowProgram<const K: usize>: Send + Sync {
     -> Result<S, String>;
 }
 
-/// Maximum aggregate size of a canonical row program's seeded primary jets
-/// kept on the call stack. Small fixed-width programs stay allocation-free;
-/// wider derivative representations use one exact-length heap array instead
-/// of making the thread stack scale as `K * size_of::<S>()`.
+/// Maximum size of one canonical dense-jet storage object kept on the call
+/// stack. Small fixed-width programs stay allocation-free; wider derivative
+/// representations use exact-length heap storage instead of making the thread
+/// stack scale as `K * size_of::<S>()`. A full dense result larger than this
+/// boundary is rejected in favor of the bounded directional APIs.
 ///
 /// This is a storage-policy boundary, not a calculus fallback: both branches
 /// invoke the same [`RowProgram::eval`] expression with the same scalar type.
-const PROGRAM_PRIMARY_JET_STACK_BUDGET_BYTES: usize = 64 * 1024;
+const PROGRAM_DENSE_JET_STACK_BUDGET_BYTES: usize = 64 * 1024;
 
 #[inline]
 fn program_primary_jets_fit_stack<S, const K: usize>() -> bool {
     std::mem::size_of::<S>()
         .checked_mul(K)
-        .is_some_and(|bytes| bytes <= PROGRAM_PRIMARY_JET_STACK_BUDGET_BYTES)
+        .is_some_and(|bytes| bytes <= PROGRAM_DENSE_JET_STACK_BUDGET_BYTES)
 }
 
 fn evaluate_program_with_stack_primaries<const K: usize, P, S>(
@@ -1844,10 +1845,12 @@ where
     // heap-backed storage. Converting the boxed slice to a boxed array changes
     // only its type; it never materializes `[S; K]` on the stack.
     let vars: Box<[S]> = (0..K).map(seed).collect();
-    let vars: Box<[S; K]> = match vars.try_into() {
-        Ok(vars) => vars,
-        Err(_) => unreachable!("exact-size primary jet iterator changed length"),
-    };
+    let vars: Box<[S; K]> = vars.try_into().map_err(|vars: Box<[S]>| {
+        format!(
+            "canonical row program seeded {} primary jets; expected exactly {K}",
+            vars.len()
+        )
+    })?;
     prog.eval(row, &vars)
 }
 
@@ -1915,12 +1918,27 @@ pub fn program_fourth_contracted<const K: usize, P: RowProgram<K> + ?Sized>(
 
 /// Derive every channel `(v, g, h, t3, t4)` in one pass from a [`RowProgram`] at
 /// the full dense [`Tower4`] scalar.
+///
+/// The result is boxed so the return slot itself remains bounded independently
+/// of `K`. Dense towers above the canonical storage budget are rejected before
+/// the program is touched; consumers at those widths must request only the
+/// channels they need through [`program_row_kernel`],
+/// [`program_third_contracted`], and [`program_fourth_contracted`].
 pub fn program_full_tower<const K: usize, P: RowProgram<K> + ?Sized>(
     prog: &P,
     row: usize,
-) -> Result<Tower4<K>, String> {
+) -> Result<Box<Tower4<K>>, String> {
+    let tower_bytes = std::mem::size_of::<Tower4<K>>();
+    if tower_bytes > PROGRAM_DENSE_JET_STACK_BUDGET_BYTES {
+        return Err(format!(
+            "canonical dense Tower4<{K}> requires {tower_bytes} bytes, exceeding the {}-byte \
+             storage budget; use the bounded row-kernel and directional channel APIs",
+            PROGRAM_DENSE_JET_STACK_BUDGET_BYTES
+        ));
+    }
     let base = prog.primaries(row)?;
     evaluate_program_with_seeded_primaries(prog, row, |a| Tower4::variable(base[a], a))
+        .map(Box::new)
 }
 
 // ── The oracle ───────────────────────────────────────────────────────
@@ -2443,7 +2461,7 @@ mod tests {
                 self.base.eval(self.row, vars)
             }
         }
-        program_full_tower(&At { base: prog, row, p }, 0).expect("gnarly tower")
+        *program_full_tower(&At { base: prog, row, p }, 0).expect("gnarly tower")
     }
 
     #[test]

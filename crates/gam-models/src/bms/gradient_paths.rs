@@ -1738,7 +1738,7 @@ pub(crate) fn rigid_standard_normal_tower(
         w,
         probit_scale,
     };
-    gam_math::jet_tower::program_full_tower(&program, 0)
+    gam_math::jet_tower::program_full_tower(&program, 0).map(|tower| *tower)
 }
 
 /// Branch-free `signed`-margin jet for the rigid standard-normal row kernel.

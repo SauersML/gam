@@ -220,7 +220,8 @@ fn cause_specific_royston_parmar_jet_tower_matches_production_directional_weight
 
     const REL_TOL: f64 = 1e-11;
     for (row, fixture) in rows.iter().enumerate() {
-        let tower: Tower4<3> = program_full_tower(&program, row).expect("cause-specific jet tower");
+        let tower: Box<Tower4<3>> =
+            program_full_tower(&program, row).expect("cause-specific jet tower");
         let claims = cause_specific_closed_form(fixture, &third_dirs, &fourth_pairs);
         verify_kernel_channels(&tower, &claims, REL_TOL).unwrap_or_else(|e| {
             panic!(

@@ -6131,7 +6131,7 @@ mod tests {
     }
 
     fn tower() -> Tower4<2> {
-        program_full_tower(&ExprProgram { p: SEED }, 0).expect("tower")
+        *program_full_tower(&ExprProgram { p: SEED }, 0).expect("tower")
     }
 
     /// Order2 reproduces Tower4's value/grad/Hessian channels exactly.

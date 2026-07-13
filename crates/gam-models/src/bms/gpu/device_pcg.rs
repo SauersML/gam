@@ -826,6 +826,12 @@ mod pcg_device_parity_tests {
             .clone_htod(&logslope)
             .expect("[pcg_device parity] upload logslope must succeed on a CUDA host");
         let storage = DeviceResidentRowHess {
+            neglog: stream
+                .alloc_zeros::<f64>(n)
+                .expect("[pcg_device parity] alloc neglog"),
+            grad: stream
+                .alloc_zeros::<f64>(n * r)
+                .expect("[pcg_device parity] alloc grad"),
             hess: d_h,
             marginal_design: d_m,
             logslope_design: d_g,
@@ -834,7 +840,8 @@ mod pcg_device_parity_tests {
             block,
             primary,
 
-            bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+            bytes: ((n + n * r + n * r * r + n * p_m + n * p_g)
+                * std::mem::size_of::<f64>()) as u64,
         };
 
         let out = run_pcg_against_row_hessian_device(DeviceResidentPcgInput {

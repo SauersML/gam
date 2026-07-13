@@ -266,7 +266,8 @@ fn gaussian_loc_scale_jet_tower_matches_hand_derived_via_universal_oracle() {
 
     for (row, fixture) in rows.iter().enumerate() {
         // The mechanically jet-derived dense tower (every channel in one pass).
-        let tower: Tower4<2> = program_full_tower(&program, row).expect("gaussian jet tower");
+        let tower: Box<Tower4<2>> =
+            program_full_tower(&program, row).expect("gaussian jet tower");
 
         // The INDEPENDENT hand-derived channels a hand kernel would claim.
         let claims = gaussian_closed_form_channels(fixture, &third_dirs, &fourth_pairs);
@@ -338,7 +339,7 @@ fn gaussian_loc_scale_packed_scalars_match_hand_derived_contractions() {
 
         // OneSeed: contracted third Σ_c ℓ_{abc}·dir_c via the production scalar,
         // checked against the dense tower's own contraction of t3.
-        let tower: Tower4<2> = program_full_tower(&program, row).expect("tower");
+        let tower: Box<Tower4<2>> = program_full_tower(&program, row).expect("tower");
         for (di, dir) in third_dirs.iter().enumerate() {
             let third = program_third_contracted(&program, row, dir).expect("OneSeed third");
             let truth = tower.third_contracted(dir);
