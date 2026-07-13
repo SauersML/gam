@@ -8,6 +8,7 @@ use crate::wiggle::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
 use gam_linalg::faer_ndarray::array2_to_nested_vec;
+use gam_linalg::matrix::DesignMatrix;
 use gam_problem::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, ResponseFamily, SasLinkSpec,
     SasLinkState, StandardLink,
@@ -1391,6 +1392,66 @@ impl SavedLinkWiggleRuntime {
     pub fn design(&self, q0: &Array1<f64>) -> Result<Array2<f64>, FittedModelError> {
         self.validate_monotone_derivative(q0)?;
         self.constrained_basis(q0, BasisOptions::value())
+    }
+
+    /// Reconstruct the exact index at which the saved link-wiggle basis is
+    /// evaluated.
+    ///
+    /// The frozen-basis de-aliased standard link fit persists a mean-coordinate
+    /// shift `s` so its fitted warp index is `base + X s` (#2141).  Other warp
+    /// paths persist no shift and evaluate at `base`.  Keeping this operation on
+    /// the saved runtime gives prediction and public affine-design export one
+    /// source of truth for the fitted coordinate frame.
+    pub fn warp_index(
+        &self,
+        base: &Array1<f64>,
+        mean_design: &DesignMatrix,
+    ) -> Result<Array1<f64>, FittedModelError> {
+        if mean_design.nrows() != base.len() {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "link-wiggle base predictor has {} rows but mean design has {}",
+                    base.len(),
+                    mean_design.nrows()
+                ),
+            });
+        }
+        if let Some((row, value)) = base
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(FittedModelError::InvalidInput {
+                reason: format!("link-wiggle base predictor is non-finite at row {row}: {value}"),
+            });
+        }
+        let Some(shift) = self.index_shift.as_ref() else {
+            return Ok(base.clone());
+        };
+        if shift.len() != mean_design.ncols() {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "link-wiggle frozen-index shift has {} entries but the mean design has {} columns",
+                    shift.len(),
+                    mean_design.ncols()
+                ),
+            });
+        }
+        if let Some((column, value)) = shift
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(FittedModelError::PayloadCorrupt {
+                reason: format!(
+                    "link-wiggle frozen-index shift is non-finite at column {column}: {value}"
+                ),
+            });
+        }
+        let shift = Array1::from_vec(shift.clone());
+        Ok(base + &mean_design.dot(&shift))
     }
 
     pub fn basis_row_scalar(&self, q0: f64) -> Result<Array1<f64>, FittedModelError> {
@@ -5585,5 +5646,37 @@ mod tests {
             .saved_prediction_runtime()
             .expect_err("stale payload version should fail before runtime assembly");
         assert!(err.to_string().contains("payload schema mismatch"));
+    }
+
+    #[test]
+    fn saved_link_wiggle_warp_index_applies_exact_2141_mean_shift() {
+        let runtime = SavedLinkWiggleRuntime {
+            knots: vec![],
+            degree: 0,
+            beta: vec![],
+            index_shift: Some(vec![0.25, -0.5]),
+        };
+        let design = DesignMatrix::from(array![[1.0, 2.0], [-3.0, 0.5]]);
+        let base = array![0.75, -0.25];
+        let index = runtime
+            .warp_index(&base, &design)
+            .expect("complete saved shift");
+        assert_eq!(index, array![0.0, -1.25]);
+    }
+
+    #[test]
+    fn saved_link_wiggle_warp_index_rejects_partial_shift_coordinates() {
+        let runtime = SavedLinkWiggleRuntime {
+            knots: vec![],
+            degree: 0,
+            beta: vec![],
+            index_shift: Some(vec![0.25]),
+        };
+        let design = DesignMatrix::from(array![[1.0, 2.0]]);
+        let error = runtime
+            .warp_index(&array![0.5], &design)
+            .expect_err("partial #2141 shift metadata must fail loudly");
+        assert!(error.to_string().contains("shift has 1 entries"));
+        assert!(error.to_string().contains("mean design has 2 columns"));
     }
 }

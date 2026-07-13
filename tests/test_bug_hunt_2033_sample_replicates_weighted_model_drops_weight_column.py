@@ -11,10 +11,10 @@ in a frame from which it had already been projected away and raised
 ``weights column 'w' not found`` for **every** weighted model — even when the
 caller passed the weight column in explicitly.
 
-The fix keeps the weight column in
-``prediction_consumable_columns`` (so it survives projection) and, as a
-belt-and-suspenders default, falls back to unit weights in the replicate path
-when the caller's frame simply does not carry the column, rather than erroring.
+The fix keeps the weight column in ``prediction_consumable_columns`` so it
+survives projection. A later root-cause cutover (#2300) made it required at
+replicate time: replacing a missing fitted weight by one samples from a
+different observation law and must fail loudly.
 
 Objective assertions (the generative law is the ground truth — no reference tool
 needed):
@@ -22,9 +22,8 @@ needed):
       ``(n_draws, n_rows)`` — the raw #2033 repro;
   (b) the drawn replicates are heteroskedastic in the prior weights: per-row
       replicate spread tracks ``sigma_hat / sqrt(w_i)`` (the #2025 contract);
-  (c) a weighted model whose replicate frame omits the weight column degrades
-      gracefully to the pooled scalar noise instead of raising (the fallback
-      branch, a different code path from (a)/(b));
+  (c) a weighted model whose replicate frame omits the weight column is
+      rejected instead of silently changing to pooled scalar noise;
   (d) an unweighted model is unaffected (control).
 """
 from __future__ import annotations
@@ -112,24 +111,13 @@ def test_weighted_replicates_are_heteroskedastic_in_prior_weights() -> None:
     )
 
 
-def test_weighted_model_replicate_frame_without_weight_column_degrades_gracefully() -> None:
-    """(c) Fallback branch: if the caller's replicate frame simply omits the
-    weight column, the replicate path must fall back to unit weights (pooled
-    scalar noise) rather than raising. This exercises the projection-independent
-    ``col_map``-membership guard, a different path from (a)/(b)."""
+def test_weighted_model_replicate_frame_without_weight_column_is_rejected() -> None:
+    """(c) Missing fitted weights cannot be replaced by unit weights."""
     rows, _ = _weighted_rows(160, seed=2, w_lo=0.5, w_hi=3.0)
     model = gamfit.fit(rows, "y ~ s(x)", family="gaussian", weights="w")
     frame_no_w = [{"y": r["y"], "x": r["x"]} for r in rows]
-    reps = np.asarray(model.sample_replicates(frame_no_w, 20, seed=9), dtype=float)
-    assert reps.shape == (20, len(rows))
-    assert np.all(np.isfinite(reps))
-    # With unit weights every row shares the pooled scalar scale, so the per-row
-    # spreads are homoskedastic (no 1/sqrt(w) structure).
-    per_row_std = reps.std(axis=0)
-    cv = per_row_std.std() / per_row_std.mean()
-    assert cv < 0.3, (
-        f"fallback replicate spread should be ~homoskedastic; got cv={cv:.3f}"
-    )
+    with pytest.raises(Exception, match="weight|weighted"):
+        model.sample_replicates(frame_no_w, 20, seed=9)
 
 
 def test_unweighted_model_replicates_unaffected() -> None:

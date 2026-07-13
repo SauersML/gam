@@ -898,7 +898,12 @@ fn build_predict_input_for_model_inner(
                 });
             }
             let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-            let beta = if model.has_link_wiggle() {
+            // Resolve the saved runtime through its typed error path instead of
+            // `has_link_wiggle`, whose boolean surface cannot distinguish no
+            // wiggle from partial/corrupt metadata.  Prediction and affine
+            // export must fail loudly on the latter.
+            let link_wiggle = model.saved_link_wiggle()?;
+            let beta = if link_wiggle.is_some() {
                 fit_saved
                     .block_by_role(BlockRole::Mean)
                     .ok_or_else(|| PredictInputError::MissingMetadata {

@@ -34,7 +34,7 @@ pub(crate) use gam::gamlss::{
     BinomialLocationScaleTermSpec, BlockwiseTermFitResult, GaussianLocationScaleTermSpec,
 };
 
-pub(crate) use gam::generative::{generativespec_from_predict, sampleobservation_replicates};
+pub(crate) use gam::generative::sampleobservation_replicates;
 
 pub(crate) use gam::sample::NutsConfig;
 
@@ -74,7 +74,6 @@ pub(crate) use gam::inference::model_payload_builders::{
 
 pub(crate) use gam_predict::input::{
     build_predict_input_for_model, build_transformation_normal_observed_scores,
-    build_transformation_normal_quantile_grid,
 };
 
 pub(crate) use gam_predict::linalg::{PredictionCovarianceBackend, rowwise_local_covariances};

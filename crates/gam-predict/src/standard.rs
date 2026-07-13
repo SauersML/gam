@@ -55,41 +55,6 @@ impl StandardPredictor {
 }
 
 impl StandardPredictor {
-    /// The warp-basis evaluation index for a link-wiggle predict (#2141).
-    ///
-    /// The frozen-basis de-aliased binomial-mean link fit pins the warp basis at
-    /// the frozen index `η̂ = X·(β_saved + s)`, which differs from the de-aliased
-    /// base predictor `eta_base = X·β_saved + offset` by the mean-coordinate
-    /// shift `X·s`. The reported deviance is evaluated with
-    /// `q = eta_base + B(η̂)·β_w`, so predict must evaluate the warp basis at
-    /// `η̂ = eta_base + X·s` to reproduce it; evaluating at `eta_base` (as the
-    /// pre-fix path did) reconstructs a *different* link and diverges from the
-    /// fitted deviance. When no shift is persisted (`index_shift == None`, the
-    /// non-de-aliased / dynamic-basis path) the index is the base predictor
-    /// unchanged, so this is a no-op for every other model.
-    fn wiggle_warp_index(
-        &self,
-        eta_base: &Array1<f64>,
-        input: &PredictInput,
-        runtime: &SavedLinkWiggleRuntime,
-    ) -> Result<Array1<f64>, EstimationError> {
-        match runtime.index_shift.as_ref() {
-            Some(shift) if !shift.is_empty() => {
-                if shift.len() != self.beta.len() {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "link-wiggle frozen-index shift has {} entries but the mean \
-                         block has {} coefficients",
-                        shift.len(),
-                        self.beta.len()
-                    )));
-                }
-                let shift_arr = Array1::from_vec(shift.clone());
-                Ok(eta_base + &input.design.dot(&shift_arr))
-            }
-            _ => Ok(eta_base.clone()),
-        }
-    }
-
     /// Full-uncertainty η/mean point and standard errors for the link-wiggle
     /// path, computed from an arbitrary covariance `backend` (so the caller can
     /// select conditional vs. smoothing-corrected covariance). Mirrors the
@@ -106,7 +71,9 @@ impl StandardPredictor {
             )
         })?;
         let eta_base = input.design.dot(&self.beta) + &input.offset;
-        let warp_index = self.wiggle_warp_index(&eta_base, input, runtime)?;
+        let warp_index = runtime
+            .warp_index(&eta_base, &input.design)
+            .map_err(EstimationError::from)?;
         let eta = runtime
             .apply_with_index(&eta_base, &warp_index)
             .map_err(EstimationError::from)?;
@@ -148,7 +115,9 @@ impl StandardPredictor {
         })?;
         let plugin = self.predict_plugin_response(input)?;
         let eta_base = input.design.dot(&self.beta) + &input.offset;
-        let warp_index = self.wiggle_warp_index(&eta_base, input, runtime)?;
+        let warp_index = runtime
+            .warp_index(&eta_base, &input.design)
+            .map_err(EstimationError::from)?;
         let strategy = strategy_for_family(self.family.clone(), self.link_kind.as_ref());
         // The posterior mean requires a coefficient covariance at the full warp
         // width p_main + p_w. The identifiable frozen-basis learnable-link fit
@@ -305,7 +274,9 @@ impl PredictableModel for StandardPredictor {
     ) -> Result<PredictResult, EstimationError> {
         let eta_base = input.design.dot(&self.beta) + &input.offset;
         let eta = if let Some(runtime) = self.link_wiggle.as_ref() {
-            let warp_index = self.wiggle_warp_index(&eta_base, input, runtime)?;
+            let warp_index = runtime
+                .warp_index(&eta_base, &input.design)
+                .map_err(EstimationError::from)?;
             runtime
                 .apply_with_index(&eta_base, &warp_index)
                 .map_err(EstimationError::from)?
@@ -327,7 +298,9 @@ impl PredictableModel for StandardPredictor {
         // jet a second time.
         let eta_base = input.design.dot(&self.beta) + &input.offset;
         let eta = if let Some(runtime) = self.link_wiggle.as_ref() {
-            let warp_index = self.wiggle_warp_index(&eta_base, input, runtime)?;
+            let warp_index = runtime
+                .warp_index(&eta_base, &input.design)
+                .map_err(EstimationError::from)?;
             runtime
                 .apply_with_index(&eta_base, &warp_index)
                 .map_err(EstimationError::from)?
@@ -349,7 +322,9 @@ impl PredictableModel for StandardPredictor {
                 // frozen index `η̂ = eta_base + X·s` (#2141), where the link's
                 // `dq/dη = 1 + B'(η̂)·β_w` is defined.
                 let eta_base = input.design.dot(&self.beta) + &input.offset;
-                let warp_index = self.wiggle_warp_index(&eta_base, input, runtime)?;
+                let warp_index = runtime
+                    .warp_index(&eta_base, &input.design)
+                    .map_err(EstimationError::from)?;
                 let p_main = self.beta.len();
                 let p_w = runtime.beta.len();
                 let p_total = p_main + p_w;
