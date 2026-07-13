@@ -3484,6 +3484,206 @@ impl CustomFamily for TwoBlockPersistentGradientFamily {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct OneStepReturnedSaddleFamily {
+    pub(crate) target: f64,
+}
+
+pub(crate) struct ReturnedModeSaddleWorkspace {
+    pub(crate) hessian: Array2<f64>,
+}
+
+impl ExactNewtonJointHessianWorkspace for ReturnedModeSaddleWorkspace {
+    fn warm_up_outer_caches_for_mode(&self, _: EvalMode) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        Ok(Some(self.hessian.clone()))
+    }
+}
+
+impl OneStepReturnedSaddleFamily {
+    pub(crate) fn coordinates(
+        &self,
+        states: &[ParameterBlockState],
+    ) -> Result<(f64, f64), String> {
+        let x = states
+            .first()
+            .and_then(|state| state.beta.first())
+            .copied()
+            .ok_or_else(|| "returned-saddle fixture missing x coefficient".to_string())?;
+        let y = states
+            .get(1)
+            .and_then(|state| state.beta.first())
+            .copied()
+            .ok_or_else(|| "returned-saddle fixture missing y coefficient".to_string())?;
+        Ok((x, y))
+    }
+
+    pub(crate) fn hessian(&self, x: f64, y: f64) -> Array2<f64> {
+        array![
+            [1.0, -2.0 * y / self.target],
+            [-2.0 * y / self.target, 1.0 - 2.0 * x / self.target],
+        ]
+    }
+}
+
+impl CustomFamily for OneStepReturnedSaddleFamily {
+    fn evaluate(&self, states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let (x, y) = self.coordinates(states)?;
+        let y_curvature = 1.0 - 2.0 * x / self.target;
+        let score_x = self.target - x + y * y / self.target;
+        let score_y = -y_curvature * y;
+        let negative_log_likelihood =
+            0.5 * (x - self.target).powi(2) + 0.5 * y_curvature * y * y;
+        Ok(FamilyEvaluation {
+            log_likelihood: -negative_log_likelihood,
+            blockworking_sets: vec![
+                BlockWorkingSet::ExactNewton {
+                    gradient: array![score_x],
+                    hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: array![score_y],
+                    hessian: SymmetricMatrix::Dense(array![[y_curvature]]),
+                },
+            ],
+        })
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        let (x, y) = self.coordinates(states)?;
+        Ok(Some(self.hessian(x, y)))
+    }
+
+    fn exact_newton_joint_hessian_workspace(
+        &self,
+        states: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        let (x, y) = self.coordinates(states)?;
+        Ok(Some(Arc::new(ReturnedModeSaddleWorkspace {
+            hessian: self.hessian(x, y),
+        })))
+    }
+
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        true
+    }
+
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
+    }
+}
+
+pub(crate) fn one_step_returned_saddle_specs() -> Vec<ParameterBlockSpec> {
+    ["x", "y"]
+        .into_iter()
+        .map(|name| ParameterBlockSpec {
+            name: name.to_string(),
+            design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
+                1.0
+            ]])),
+            offset: array![0.0],
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![0.0]),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        })
+        .collect()
+}
+
+#[test]
+pub(crate) fn fresh_exact_mode_curvature_certificate_detects_returned_strict_saddle() {
+    let family = OneStepReturnedSaddleFamily { target: 0.125 };
+    let specs = one_step_returned_saddle_specs();
+    let options = BlockwiseFitOptions::default();
+    let ranges = block_param_ranges(&specs);
+    let s_lambdas = vec![Array2::zeros((1, 1)), Array2::zeros((1, 1))];
+    let at_start = vec![
+        ParameterBlockState {
+            beta: array![0.0],
+            eta: array![0.0],
+        },
+        ParameterBlockState {
+            beta: array![0.0],
+            eta: array![0.0],
+        },
+    ];
+    let start_certificate = exact_joint_mode_curvature_certificate(
+        &family,
+        &at_start,
+        &specs,
+        &options,
+        &ranges,
+        &s_lambdas,
+        0.0,
+        None,
+        2,
+    )
+    .expect("positive-curvature start should be certifiable");
+    assert!(start_certificate.workspace.is_some());
+    assert!(!start_certificate.has_resolvable_negative_curvature());
+
+    let at_returned_beta = vec![
+        ParameterBlockState {
+            beta: array![family.target],
+            eta: array![family.target],
+        },
+        ParameterBlockState {
+            beta: array![0.0],
+            eta: array![0.0],
+        },
+    ];
+    let returned_certificate = exact_joint_mode_curvature_certificate(
+        &family,
+        &at_returned_beta,
+        &specs,
+        &options,
+        &ranges,
+        &s_lambdas,
+        0.0,
+        None,
+        2,
+    )
+    .expect("returned strict saddle should produce an honest certificate");
+    assert!(returned_certificate.workspace.is_some());
+    assert!(returned_certificate.has_resolvable_negative_curvature());
+    assert_eq!(returned_certificate.minimum_whitened_eigenvalue, -1.0);
+}
+
+#[test]
+pub(crate) fn joint_newton_rejects_one_step_stationary_strict_saddle_at_returned_beta() {
+    let family = OneStepReturnedSaddleFamily { target: 0.125 };
+    let specs = one_step_returned_saddle_specs();
+    let result = inner_blockwise_fit(
+        &family,
+        &specs,
+        &[Array1::zeros(0), Array1::zeros(0)],
+        &BlockwiseFitOptions {
+            inner_max_cycles: 1,
+            use_remlobjective: false,
+            ..BlockwiseFitOptions::default()
+        },
+        None,
+    );
+    let error = result.expect_err(
+        "a one-step Newton solve must not return a stationary strict saddle as a coefficient mode",
+    );
+    assert!(
+        error.contains("fresh exact returned-mode curvature"),
+        "unexpected returned-mode rejection: {error}",
+    );
+}
+
 /// gam#1088 fixture. A coupled two-block family whose joint Hessian carries
 /// a `NaN` curvature entry — the degenerate-curvature signature seen in the
 /// link-wiggle and location-scale benchmark timeouts (a collapsed/`0÷0` row
