@@ -1,3 +1,53 @@
+/// One authoritative off-manifold, fixed-stratum fixture for the #1418 exact
+/// stationarity and #2253 exact outer-Hessian gates.
+///
+/// The target excitation makes residual, entropy, and curvature-delta channels
+/// genuinely live.  Its fit must happen in this known non-vanishing
+/// regularization basin; derivative gates may subsequently freeze this state
+/// and assemble a Hessian at a different evaluation `rho`, but must never use
+/// that evaluation point to construct the fitted state.
+#[cfg(test)]
+fn converged_state_with_residual() -> (
+    SaeManifoldTerm,
+    Array2<f64>,
+    SaeManifoldRho,
+    ArrowFactorCache,
+) {
+    use crate::manifold::tests::gamma_fd_tiny_fixture;
+
+    let (mut term, mut target, mut rho) = gamma_fd_tiny_fixture();
+    let (n, p) = (target.nrows(), target.ncols());
+    for row in 0..n {
+        for col in 0..p {
+            let phase = (row as f64 + 0.35) / n as f64;
+            let theta = std::f64::consts::TAU * phase;
+            target[[row, col]] += 0.6 * (3.0 * theta + 0.5 * col as f64).sin();
+        }
+    }
+
+    rho.log_lambda_sparse = -0.5;
+    for value in rho.log_lambda_smooth.iter_mut() {
+        *value = -1.0;
+    }
+    for axis in rho.log_ard.iter_mut() {
+        for value in axis.iter_mut() {
+            *value = -0.5;
+        }
+    }
+    let (_value, _loss, cache) = term
+        .penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            40,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        )
+        .expect("off-manifold fixture must converge with both atoms alive");
+    (term, target, rho, cache)
+}
+
 #[cfg(test)]
 mod amortized_encoder_tests {
     use crate::manifold::tests::small_two_atom_periodic_term;
@@ -52,10 +102,7 @@ mod amortized_encoder_tests {
         let (term, _target, rho) = small_two_atom_periodic_term();
         let n_params = rho.to_flat().len();
         let lambda = rho.lambda_smooth_vec().unwrap();
-        let frozen_smoothness: f64 = term
-            .decoder_smoothness_value_per_atom(&lambda)
-            .iter()
-            .sum();
+        let frozen_smoothness: f64 = term.decoder_smoothness_value_per_atom(&lambda).iter().sum();
 
         let analytic = term
             .outer_explicit_smoothness_ard_hessian(&rho, frozen_smoothness)
@@ -198,49 +245,11 @@ mod amortized_encoder_tests {
     #[test]
     fn logdet_daleckii_krein_hessian_matches_finite_difference_2253() {
         use crate::manifold::arrow_solver::DeflatedArrowSolver;
-        use crate::manifold::tests::gamma_fd_tiny_fixture;
-        use ndarray::{array, Array1};
-        // Converge θ̂ in the fixture's OWN PD basin (ρ_sparse lifted off the −6
-        // floor, as the sibling logdet-adjoint gates do). The evaluation ρ below
-        // must NOT be used for the fit: at λ_smooth/α that large this 10-row, m=3
-        // decoder is driven into total co-collapse by the inner solve.
-        let (mut term, mut target, mut rho) = gamma_fd_tiny_fixture();
-        // #item1: EXCITE the sparse (softmax log-strength) logdet channel. On the
-        // pristine on-manifold target the converged fit has ~zero residual and the
-        // free logit is ~decoupled from β, so the joint and coordinate-block traces
-        // cancel to ~2e-12 and the sparse logdet row is inert (a ~0-vs-~0 FD, which
-        // validates nothing). Perturbing the target off the model manifold (the same
-        // recipe `converged_state_with_residual` uses) gives a real residual and real
-        // logit–β coupling, so the sparse joint − coordinate back-substitution term
-        // is materially nonzero and the sparse row is genuinely validated below.
-        {
-            let (n, p) = (target.nrows(), target.ncols());
-            for row in 0..n {
-                for col in 0..p {
-                    let phase = (row as f64 + 0.35) / n as f64;
-                    let theta = std::f64::consts::TAU * phase;
-                    target[[row, col]] += 0.6 * (3.0 * theta + 0.5 * col as f64).sin();
-                }
-            }
-        }
-        // Converge θ̂ at the SAME regularization `converged_state_with_residual` uses
-        // (this perturbed target vanishes atom 1 at the −6 floor; these levels keep
-        // both atoms alive and reach a PD stationary state).
-        rho.log_lambda_sparse = -0.5;
-        for v in rho.log_lambda_smooth.iter_mut() {
-            *v = -1.0;
-        }
-        rho.log_ard = vec![array![-0.5_f64], array![-0.5_f64]];
-        term.penalized_quasi_laplace_criterion_with_cache(
-            target.view(),
-            &rho,
-            None,
-            200,
-            0.4,
-            1.0e-6,
-            1.0e-6,
-        )
-        .expect("converged PD stationary theta-hat");
+        use ndarray::{Array1, array};
+        // Construct θ̂ through the shared, independently exercised PD-basin
+        // authority.  This is deliberately distinct from the lifted evaluation ρ
+        // below: fitting at that point drives this tiny decoder to co-collapse.
+        let (mut term, target, rho, _stationary_cache) = super::converged_state_with_residual();
 
         // Evaluation ρ: lift ρ_smooth / ρ_ard off the −6 floor so the Daleckii–Krein
         // CROSS terms — which scale as O(λ²) and O(α²) — sit well above FD noise. At
@@ -658,56 +667,9 @@ mod softmax_majorizer_active_entry_1410_tests {
 #[cfg(test)]
 mod exact_stationarity_solve_1418_tests {
     use super::*;
-    use crate::manifold::tests::{diagonal_latent_cache, gamma_fd_tiny_fixture};
+    use crate::manifold::tests::diagonal_latent_cache;
     use approx::assert_abs_diff_eq;
     use ndarray::Array1;
-
-    /// Build a converged tiny SAE state whose inner residual is genuinely
-    /// nonzero (an unmodellable target perturbation on a curved periodic basis),
-    /// so the dropped curvature `ΔC = A − B = ⟨r, ∂²f⟩ + (H_entropy − D) + min(V'',0)`
-    /// is materially nonzero and `A ≠ B`. Returns the term, the perturbed target,
-    /// the rho, and the converged cache.
-    fn converged_state_with_residual() -> (
-        SaeManifoldTerm,
-        Array2<f64>,
-        SaeManifoldRho,
-        ArrowFactorCache,
-    ) {
-        let (mut term, mut target, mut rho) = gamma_fd_tiny_fixture();
-        // Perturb the target off the model manifold so the inner optimum has a
-        // real residual `r`, hence a real `⟨r, ∂²f⟩` curvature delta.
-        let (n, p) = (target.nrows(), target.ncols());
-        for row in 0..n {
-            for col in 0..p {
-                let phase = (row as f64 + 0.35) / n as f64;
-                let theta = std::f64::consts::TAU * phase;
-                target[[row, col]] += 0.6 * (3.0 * theta + 0.5 * col as f64).sin();
-            }
-        }
-        // Activate the sparsity / smoothness / ARD prior strengths so the softmax
-        // entropy delta and the periodic-ARD `min(V'',0)` delta are live too.
-        rho.log_lambda_sparse = -0.5;
-        for value in rho.log_lambda_smooth.iter_mut() {
-            *value = -1.0;
-        }
-        for axis in rho.log_ard.iter_mut() {
-            for v in axis.iter_mut() {
-                *v = -0.5;
-            }
-        }
-        let (_value, _loss, cache) = term
-            .penalized_quasi_laplace_criterion_with_cache(
-                target.view(),
-                &rho,
-                None,
-                40,
-                0.4,
-                1.0e-6,
-                1.0e-6,
-            )
-            .expect("converged cache with residual");
-        (term, target, rho, cache)
-    }
 
     /// `‖A x − rhs‖` for the exact stationarity Jacobian `A` (the matrix-free
     /// `B v + ΔC v` apply).
