@@ -1359,29 +1359,19 @@ pub(crate) fn exp_sigma_derivs_up_to_fourth_array(
 
 #[cfg(test)]
 mod observed_single_source_oracle_tests {
-    //! #932 doctrine oracle for the Gaussian location-scale OBSERVED joint
-    //! Hessian tower (#1561 cutover from block-Fisher).
+    //! #932 doctrine oracle for the generated Gaussian location-scale row
+    //! program and its OBSERVED joint-Hessian tower.
     //!
-    //! The production joint Hessian is the OBSERVED information, built from
-    //! hand-written closed-form row coefficients
-    //! (`gaussian_locscale_observed_joint_row_coeffs`: `mm = w`, `ml = 2κm`,
-    //! `ll = κ'(a−n)+2κ²n`) and their β-directional drifts
-    //! (`gaussian_joint_first_directionalweights` /
-    //! `gaussian_jointsecond_directionalweights`). Those hand forms are FAST and
-    //! STAY in production — but, like every other #932 family, they must be
-    //! pinned bit-for-bit to a MECHANICAL single source so a future edit that
-    //! drops or mis-weights a term (the #736/#947 bug genus) is caught here
-    //! rather than in a silently wrong outer Hessian.
+    //! Every non-wiggle live score/Hessian/ψ channel is a chain-rule projection
+    //! of the symbolic order2/third/fourth lowerings emitted from
+    //! `gaussian_normalized_row`. The generic nested-jet evaluator and the
+    //! likelihood-only finite differences below are independent witnesses.
     //!
     //! MECHANICAL SOURCE (no hand math reused):
     //!  * The per-row negative log-likelihood is `ρ(μ,η)=−ℓ(μ,η)`, evaluated by
     //!    the production row kernel `gaussian_diagonal_row_kernel`.
-    //!  * Its OBSERVED 2×2 Hessian in `(μ,η_ls)` is taken by central finite
-    //!    differences of that kernel — a derivative the test computes from the
-    //!    likelihood ALONE, never from the hand coefficients under test.
-    //!  * The directional / second-directional drifts are pinned to central
-    //!    finite differences of the production observed coefficients along the
-    //!    same β-direction.
+    //!  * Its OBSERVED 2×2 Hessian in `(μ,η_ls)` and every directional chain are
+    //!    taken by central finite differences of that likelihood alone.
 
     use super::*;
     use ndarray::array;
@@ -1393,6 +1383,13 @@ mod observed_single_source_oracle_tests {
         -gaussian_diagonal_row_kernel(0, y, mu, eta_ls, a, ln2pi)
             .expect("representable Gaussian oracle row")
             .log_likelihood
+    }
+
+    fn gradient_fd(y: f64, mu: f64, eta_ls: f64, a: f64, h: f64) -> [f64; 2] {
+        [
+            (row_nll(y, mu + h, eta_ls, a) - row_nll(y, mu - h, eta_ls, a)) / (2.0 * h),
+            (row_nll(y, mu, eta_ls + h, a) - row_nll(y, mu, eta_ls - h, a)) / (2.0 * h),
+        ]
     }
 
     /// Observed 2×2 Hessian of the row NLL in `(μ, η_ls)` by central FD.
@@ -1410,6 +1407,174 @@ mod observed_single_source_oracle_tests {
             + row_nll(y, mu - h, eta_ls - h, a))
             / (4.0 * h * h);
         (hmm, hml, hll)
+    }
+
+    fn hessian_fd(y: f64, mu: f64, eta_ls: f64, a: f64, h: f64) -> [[f64; 2]; 2] {
+        let (mm, ml, ll) = observed_hessian_fd(y, mu, eta_ls, a, h);
+        [[mm, ml], [ml, ll]]
+    }
+
+    fn path_point(
+        base: [f64; 2],
+        direction_a: [f64; 2],
+        direction_b: [f64; 2],
+        direction_ab: [f64; 2],
+        s: f64,
+        t: f64,
+    ) -> [f64; 2] {
+        [
+            base[0] + s * direction_a[0] + t * direction_b[0] + s * t * direction_ab[0],
+            base[1] + s * direction_a[1] + t * direction_b[1] + s * t * direction_ab[1],
+        ]
+    }
+
+    fn mixed_value_fd(
+        y: f64,
+        base: [f64; 2],
+        a: f64,
+        direction_a: [f64; 2],
+        direction_b: [f64; 2],
+        direction_ab: [f64; 2],
+        h: f64,
+    ) -> f64 {
+        let pp = path_point(base, direction_a, direction_b, direction_ab, h, h);
+        let pm = path_point(base, direction_a, direction_b, direction_ab, h, -h);
+        let mp = path_point(base, direction_a, direction_b, direction_ab, -h, h);
+        let mm = path_point(base, direction_a, direction_b, direction_ab, -h, -h);
+        (row_nll(y, pp[0], pp[1], a) - row_nll(y, pm[0], pm[1], a) - row_nll(y, mp[0], mp[1], a)
+            + row_nll(y, mm[0], mm[1], a))
+            / (4.0 * h * h)
+    }
+
+    fn mixed_gradient_fd(
+        y: f64,
+        base: [f64; 2],
+        a: f64,
+        direction_a: [f64; 2],
+        direction_b: [f64; 2],
+        direction_ab: [f64; 2],
+        outer_h: f64,
+        inner_h: f64,
+    ) -> [f64; 2] {
+        let pp = path_point(
+            base,
+            direction_a,
+            direction_b,
+            direction_ab,
+            outer_h,
+            outer_h,
+        );
+        let pm = path_point(
+            base,
+            direction_a,
+            direction_b,
+            direction_ab,
+            outer_h,
+            -outer_h,
+        );
+        let mp = path_point(
+            base,
+            direction_a,
+            direction_b,
+            direction_ab,
+            -outer_h,
+            outer_h,
+        );
+        let mm = path_point(
+            base,
+            direction_a,
+            direction_b,
+            direction_ab,
+            -outer_h,
+            -outer_h,
+        );
+        let gpp = gradient_fd(y, pp[0], pp[1], a, inner_h);
+        let gpm = gradient_fd(y, pm[0], pm[1], a, inner_h);
+        let gmp = gradient_fd(y, mp[0], mp[1], a, inner_h);
+        let gmm = gradient_fd(y, mm[0], mm[1], a, inner_h);
+        std::array::from_fn(|axis| {
+            (gpp[axis] - gpm[axis] - gmp[axis] + gmm[axis]) / (4.0 * outer_h * outer_h)
+        })
+    }
+
+    fn mixed_hessian_fd(
+        y: f64,
+        base: [f64; 2],
+        a: f64,
+        direction_a: [f64; 2],
+        direction_b: [f64; 2],
+        direction_ab: [f64; 2],
+        outer_h: f64,
+        inner_h: f64,
+    ) -> [[f64; 2]; 2] {
+        let pp = path_point(
+            base,
+            direction_a,
+            direction_b,
+            direction_ab,
+            outer_h,
+            outer_h,
+        );
+        let pm = path_point(
+            base,
+            direction_a,
+            direction_b,
+            direction_ab,
+            outer_h,
+            -outer_h,
+        );
+        let mp = path_point(
+            base,
+            direction_a,
+            direction_b,
+            direction_ab,
+            -outer_h,
+            outer_h,
+        );
+        let mm = path_point(
+            base,
+            direction_a,
+            direction_b,
+            direction_ab,
+            -outer_h,
+            -outer_h,
+        );
+        let hpp = hessian_fd(y, pp[0], pp[1], a, inner_h);
+        let hpm = hessian_fd(y, pm[0], pm[1], a, inner_h);
+        let hmp = hessian_fd(y, mp[0], mp[1], a, inner_h);
+        let hmm = hessian_fd(y, mm[0], mm[1], a, inner_h);
+        std::array::from_fn(|row| {
+            std::array::from_fn(|column| {
+                (hpp[row][column] - hpm[row][column] - hmp[row][column] + hmm[row][column])
+                    / (4.0 * outer_h * outer_h)
+            })
+        })
+    }
+
+    fn assert_close(actual: f64, expected: f64, tolerance: f64, label: &str) {
+        let band = tolerance * actual.abs().max(expected.abs()).max(1.0);
+        assert!(
+            (actual - expected).abs() <= band,
+            "{label}: actual={actual:+.15e} expected={expected:+.15e} band={band:.3e}"
+        );
+    }
+
+    fn assert_matrix_close(
+        actual: &[[f64; 2]; 2],
+        expected: &[[f64; 2]; 2],
+        tolerance: f64,
+        label: &str,
+    ) {
+        for row in 0..2 {
+            for column in 0..2 {
+                assert_close(
+                    actual[row][column],
+                    expected[row][column],
+                    tolerance,
+                    &format!("{label}[{row},{column}]"),
+                );
+            }
+        }
     }
 
     /// Production observed joint-Hessian coefficients for a single row.
