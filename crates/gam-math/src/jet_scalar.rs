@@ -1067,10 +1067,13 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
         // SAFETY: `FixedRuntimeJet<S, K>` is transparent over `S`; each cast
         // preserves allocation, provenance, element count, alignment, and the
         // shared lifetime, and no mutable reference is created.
-        let left_inner = unsafe { std::slice::from_raw_parts(lefts.as_ptr().cast::<S>(), terms) };
-        let right_inner = unsafe { std::slice::from_raw_parts(rights.as_ptr().cast::<S>(), terms) };
-        let addend_inner =
-            unsafe { std::slice::from_raw_parts(addends.as_ptr().cast::<S>(), terms) };
+        let (left_inner, right_inner, addend_inner) = unsafe {
+            (
+                std::slice::from_raw_parts(lefts.as_ptr().cast::<S>(), terms),
+                std::slice::from_raw_parts(rights.as_ptr().cast::<S>(), terms),
+                std::slice::from_raw_parts(addends.as_ptr().cast::<S>(), terms),
+            )
+        };
         Self {
             inner: S::multiply_add_affine_composed_sum(
                 left_inner,
