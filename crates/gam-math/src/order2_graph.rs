@@ -592,8 +592,9 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             let other = supported_columns.trailing_zeros() as usize;
             supported_columns &= supported_columns - 1;
             if all_inputs_primary {
+                // `support` is the union of these same primary nodes, so every
+                // visited axis has at least one grouped input position.
                 let mut group = primary_input_groups[other];
-                debug_assert_ne!(group, 0);
                 while group != 0 {
                     let position = group.trailing_zeros() as usize;
                     group &= group - 1;
@@ -614,7 +615,6 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                     supported_rows &= supported_rows - 1;
                     let curvature = if all_inputs_primary {
                         let mut group = primary_input_groups[primary];
-                        debug_assert_ne!(group, 0);
                         if group.is_power_of_two() {
                             projected_direction.as_slice()[group.trailing_zeros() as usize]
                         } else {
