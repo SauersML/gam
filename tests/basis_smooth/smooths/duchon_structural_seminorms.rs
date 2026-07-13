@@ -103,20 +103,15 @@ fn build(data: &Array2<f64>, spec: &DuchonBasisSpec) -> BuiltDuchon {
         .as_ref()
         .clone();
 
-    // `penalties` holds only the ACTIVE blocks, parallel to the active subset of
-    // `penaltyinfo`. The analytic Duchon penalty emits a Primary roughness Gram
-    // and (when the null space is non-trivial) a DoublePenaltyNullspace ridge.
+    // Each active penalty carries its numerical matrix and semantic source in
+    // one record. The analytic Duchon penalty emits a Primary roughness Gram and
+    // (when the null space is non-trivial) a DoublePenaltyNullspace ridge.
     let mut primary = None;
     let mut ridge = None;
-    let active_sources = result
-        .penaltyinfo
-        .iter()
-        .filter(|info| info.active)
-        .map(|info| info.source.clone());
-    for (matrix, source) in result.penalties.iter().zip(active_sources) {
-        match source {
-            PenaltySource::Primary => primary = Some(matrix.clone()),
-            PenaltySource::DoublePenaltyNullspace => ridge = Some(matrix.clone()),
+    for penalty in &result.active_penalties {
+        match &penalty.info.source {
+            PenaltySource::Primary => primary = Some(penalty.matrix.clone()),
+            PenaltySource::DoublePenaltyNullspace => ridge = Some(penalty.matrix.clone()),
             _ => {}
         }
     }

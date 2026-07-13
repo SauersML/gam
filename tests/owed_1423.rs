@@ -33,7 +33,7 @@
 //! never against another tool's output.
 
 use gam::terms::basis::{
-    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, SpatialIdentifiability,
+    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, PenaltySource, SpatialIdentifiability,
     build_duchon_basis,
 };
 use ndarray::Array2;
@@ -111,7 +111,12 @@ fn mixed_periodicity_nonperiodic_polynomials_are_unpenalised_1423() {
         let spec = cylinder_spec(&data, order);
         let built = build_duchon_basis(data.view(), &spec)
             .unwrap_or_else(|e| panic!("m={m} cylinder mixed-periodicity build failed: {e:?}"));
-        let s = &built.penalties[0];
+        let primary = built
+            .active_penalties
+            .iter()
+            .find(|penalty| matches!(&penalty.info.source, PenaltySource::Primary))
+            .unwrap_or_else(|| panic!("m={m}: cylinder Duchon build emitted no primary penalty"));
+        let s = &primary.matrix;
         let p = s.nrows();
         let n_poly = nonperiodic_poly_count(1, m); // 1 non-periodic axis
         assert_eq!(n_poly, m, "1-axis poly count must equal m");

@@ -98,19 +98,13 @@ fn build(data: &Array2<f64>, spec: &DuchonBasisSpec) -> BuiltDuchon {
         .as_ref()
         .clone();
 
-    // `penalties` holds only the ACTIVE blocks, parallel to the active subset of
-    // `penaltyinfo`.
-    let mut tension = None;
-    let active_sources = result
-        .penaltyinfo
+    // Select the collocated tension matrix from the same atomic record that
+    // declares its semantic role.
+    let tension = result
+        .active_penalties
         .iter()
-        .filter(|info| info.active)
-        .map(|info| info.source.clone());
-    for (matrix, source) in result.penalties.iter().zip(active_sources) {
-        if matches!(source, PenaltySource::OperatorTension) {
-            tension = Some(matrix.clone());
-        }
-    }
+        .find(|penalty| matches!(&penalty.info.source, PenaltySource::OperatorTension))
+        .map(|penalty| penalty.matrix.clone());
 
     BuiltDuchon { design, tension }
 }

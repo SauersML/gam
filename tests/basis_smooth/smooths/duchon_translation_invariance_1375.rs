@@ -83,7 +83,8 @@ fn design_and_penalty(data: &Array2<f64>) -> (Array2<f64>, Array2<f64>) {
         .clone();
     let p = design.ncols();
     let mut penalty = Array2::<f64>::zeros((p, p));
-    for block in &result.penalties {
+    for active_penalty in &result.active_penalties {
+        let block = &active_penalty.matrix;
         assert_eq!(
             block.dim(),
             (p, p),

@@ -91,10 +91,9 @@ fn default_duchon_spec(k: usize, d: usize) -> DuchonBasisSpec {
 fn active_sources(spec: &DuchonBasisSpec, data: &Array2<f64>) -> Vec<PenaltySource> {
     let built = build_duchon_basis(data.view(), spec).expect("build_duchon_basis succeeded");
     built
-        .penaltyinfo
+        .active_penalties
         .iter()
-        .filter(|info| info.active)
-        .map(|info| info.source.clone())
+        .map(|penalty| penalty.info.source.clone())
         .collect()
 }
 
@@ -340,17 +339,13 @@ fn penalty_cost_is_n_independent() {
             .expect("build_duchon_basis");
 
         assert!(
-            !built.penalties.is_empty(),
+            !built.active_penalties.is_empty(),
             "n={n}: default Duchon emitted no penalties at all"
         );
 
-        for (idx, pen) in built.penalties.iter().enumerate() {
-            let source = built
-                .penaltyinfo
-                .iter()
-                .filter(|info| info.active)
-                .nth(idx)
-                .map(|info| info.source.clone());
+        for (idx, active_penalty) in built.active_penalties.iter().enumerate() {
+            let pen = &active_penalty.matrix;
+            let source = &active_penalty.info.source;
             assert_eq!(
                 pen.nrows(),
                 pen.ncols(),

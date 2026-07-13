@@ -52,9 +52,9 @@ fn duchon_2d_spec(k: usize, scale_dims: bool) -> DuchonBasisSpec {
 fn sources(spec: &DuchonBasisSpec, data: &Array2<f64>) -> Vec<PenaltySource> {
     build_duchon_basis(data.view(), spec)
         .expect("build_duchon_basis succeeded")
-        .penaltyinfo
+        .active_penalties
         .iter()
-        .map(|info| info.source.clone())
+        .map(|penalty| penalty.info.source.clone())
         .collect()
 }
 

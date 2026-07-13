@@ -32,7 +32,7 @@
 //! against another tool's output.
 
 use gam::terms::basis::{
-    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, build_duchon_basis,
+    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, PenaltySource, build_duchon_basis,
 };
 use ndarray::{Array1, Array2};
 
@@ -203,11 +203,14 @@ fn mixed_periodicity_duchon_penalty_is_psd_cylinder_and_torus_1422() {
         let spec = mixed_periodicity_spec(&data, periodic);
         let built = build_duchon_basis(data.view(), &spec)
             .unwrap_or_else(|e| panic!("{label} mixed-periodicity Duchon build failed: {e:?}"));
-        assert!(
-            !built.penalties.is_empty(),
-            "{label}: a mixed-periodicity Duchon basis must carry a primary penalty"
-        );
-        let s = &built.penalties[0];
+        let primary = built
+            .active_penalties
+            .iter()
+            .find(|penalty| matches!(&penalty.info.source, PenaltySource::Primary))
+            .unwrap_or_else(|| {
+                panic!("{label}: a mixed-periodicity Duchon basis must carry a primary penalty")
+            });
+        let s = &primary.matrix;
         let lambda_min = min_eigenvalue_symmetric(s);
         let lambda_max = max_eigenvalue_symmetric(s);
         // PSD floor scaled to the penalty magnitude: a roughness penalty must

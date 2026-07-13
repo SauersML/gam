@@ -141,9 +141,9 @@ fn thin_plate_scale_dimensions_promotes_to_anisotropic_s0_duchon() {
     let data = synthetic_data(400, 2, 7);
     let srcs: Vec<PenaltySource> = build_duchon_basis(data.view(), duchon)
         .expect("anisotropic s=0 Duchon basis builds")
-        .penaltyinfo
+        .active_penalties
         .iter()
-        .map(|info| info.source.clone())
+        .map(|penalty| penalty.info.source.clone())
         .collect();
     let relevance_axes: Vec<usize> = srcs
         .iter()
