@@ -1267,6 +1267,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compiled_fused_addend_support_obeys_structural_coefficient() {
+        let mut workspace = Order2GraphWorkspace::new();
+        {
+            workspace.reset(3);
+            let left = Order2Graph::<3>::variable(0.4, 0, 3, &workspace);
+            let right = Order2Graph::<3>::variable(-0.7, 1, 3, &workspace);
+            let omitted = Order2Graph::<3>::variable(1.1, 2, 3, &workspace);
+            let output = Order2Graph::scaled_multiply_add_affine_composed_sum(
+                &[left],
+                &[right],
+                &[omitted],
+                &[-0.0],
+                &[1.0],
+                &[[0.2, 0.0, 1.0, 0.0, 0.0]],
+                3,
+                &workspace,
+            );
+            assert_eq!(workspace.tape().nodes[output.node].support, 0b011);
+            let channels = output.into_order2();
+            assert!(channels.g()[2] == 0.0);
+            assert!((0..3).all(|axis| channels.h()[axis][2] == 0.0));
+        }
+
+        workspace.reset(3);
+        let left = Order2Graph::<3>::variable(0.4, 0, 3, &workspace);
+        let right = Order2Graph::<3>::variable(-0.7, 1, 3, &workspace);
+        let live = Order2Graph::<3>::variable(1.1, 2, 3, &workspace);
+        let output = Order2Graph::scaled_multiply_add_affine_composed_sum(
+            &[left],
+            &[right],
+            &[live],
+            &[1.0],
+            &[1.0],
+            &[[0.2, 0.0, 1.0, 0.0, 0.0]],
+            3,
+            &workspace,
+        );
+        assert_eq!(workspace.tape().nodes[output.node].support, 0b111);
+        let channels = output.into_order2();
+        assert_eq!(channels.g()[2], 0.0);
+        assert_eq!(channels.h()[2][2], 1.0);
+    }
+
     fn expression<'arena, S: RuntimeJetScalar<'arena>>(
         vars: &[S; 6],
         coefficients: &DenseSymmetric3,
