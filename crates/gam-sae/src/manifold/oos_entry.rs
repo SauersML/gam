@@ -45,6 +45,113 @@ pub struct SaeOosAtomSpec {
     pub basis_size: usize,
 }
 
+/// Convert one persisted atom-set schema into the canonical typed specs used by
+/// frozen-decoder OOS inference and every steering entry.
+///
+/// `stored_n_harmonics` uses the artifact's exact scalar representation: zero
+/// means the topology is non-harmonic, while `Periodic`, `Torus`, `Cylinder`,
+/// and `Mobius` require a positive stored order.  This function is the sole
+/// authority for that topology-dependent interpretation; bindings must not
+/// maintain their own kind lists or infer an order from decoder width.
+pub fn persisted_oos_atom_specs(
+    basis_kinds: &[SaeAtomBasisKind],
+    latent_dims: &[usize],
+    decoder_blocks: &[ArrayView2<'_, f64>],
+    centers: &[Option<Array2<f64>>],
+    stored_n_harmonics: &[usize],
+    basis_sizes: &[usize],
+) -> Result<Vec<SaeOosAtomSpec>, String> {
+    let k_atoms = basis_kinds.len();
+    if latent_dims.len() != k_atoms
+        || decoder_blocks.len() != k_atoms
+        || centers.len() != k_atoms
+        || stored_n_harmonics.len() != k_atoms
+        || basis_sizes.len() != k_atoms
+    {
+        return Err(format!(
+            "persisted_oos_atom_specs: per-atom metadata lengths must equal K={k_atoms} \
+             (latent_dims={}, decoders={}, centers={}, harmonics={}, basis_sizes={})",
+            latent_dims.len(),
+            decoder_blocks.len(),
+            centers.len(),
+            stored_n_harmonics.len(),
+            basis_sizes.len(),
+        ));
+    }
+
+    let mut atoms = Vec::with_capacity(k_atoms);
+    for atom_index in 0..k_atoms {
+        let basis_kind = basis_kinds[atom_index].clone();
+        let latent_dim = latent_dims[atom_index];
+        let basis_size = basis_sizes[atom_index];
+        let decoder = decoder_blocks[atom_index];
+        if latent_dim == 0 || basis_size == 0 {
+            return Err(format!(
+                "persisted_oos_atom_specs: atom {atom_index} latent_dim and basis_size must be \
+                 positive; got latent_dim={latent_dim}, basis_size={basis_size}"
+            ));
+        }
+        if decoder.nrows() != basis_size {
+            return Err(format!(
+                "persisted_oos_atom_specs: atom {atom_index} decoder has {} rows but persisted \
+                 basis_size is {basis_size}",
+                decoder.nrows(),
+            ));
+        }
+
+        let stored_harmonics = stored_n_harmonics[atom_index];
+        let harmonic_topology = matches!(
+            basis_kind,
+            SaeAtomBasisKind::Periodic
+                | SaeAtomBasisKind::Torus
+                | SaeAtomBasisKind::Cylinder
+                | SaeAtomBasisKind::Mobius
+        );
+        let n_harmonics = match (harmonic_topology, stored_harmonics) {
+            (true, 0) => {
+                return Err(format!(
+                    "persisted_oos_atom_specs: harmonic atom {atom_index} ({basis_kind:?}) \
+                     requires a positive persisted n_harmonics"
+                ));
+            }
+            (true, order) => Some(order),
+            (false, 0) => None,
+            (false, order) => {
+                return Err(format!(
+                    "persisted_oos_atom_specs: non-harmonic atom {atom_index} ({basis_kind:?}) \
+                     must store n_harmonics=0, got {order}"
+                ));
+            }
+        };
+
+        let atom_centers = centers[atom_index].clone();
+        match (&basis_kind, atom_centers.is_some()) {
+            (SaeAtomBasisKind::Duchon, false) => {
+                return Err(format!(
+                    "persisted_oos_atom_specs: Duchon atom {atom_index} requires persisted centers"
+                ));
+            }
+            (SaeAtomBasisKind::Duchon, true) | (_, false) => {}
+            (_, true) => {
+                return Err(format!(
+                    "persisted_oos_atom_specs: non-Duchon atom {atom_index} ({basis_kind:?}) \
+                     must not carry Duchon centers"
+                ));
+            }
+        }
+
+        atoms.push(SaeOosAtomSpec {
+            basis_kind,
+            latent_dim,
+            decoder: decoder.to_owned(),
+            centers: atom_centers,
+            n_harmonics,
+            basis_size,
+        });
+    }
+    Ok(atoms)
+}
+
 /// Assignment family for a frozen-decoder OOS solve.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SaeOosAssignmentKind {

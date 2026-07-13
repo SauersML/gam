@@ -6330,6 +6330,25 @@ impl ManifoldSaeCore {
         })
     }
 
+    /// Translate the artifact's strict non-negative integer harmonic field into
+    /// the optional wire representation consumed by the common array marshaller.
+    /// Topology interpretation belongs exclusively to
+    /// `gam_sae::manifold::persisted_oos_atom_specs`.
+    fn persisted_harmonic_orders(&self) -> PyResult<Vec<Option<usize>>> {
+        self.inner
+            .n_harmonics
+            .iter()
+            .enumerate()
+            .map(|(atom, &order)| {
+                usize::try_from(order).map(Some).map_err(|_| {
+                    py_value_error(format!(
+                        "ManifoldSAE: n_harmonics[{atom}] must be non-negative; got {order}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
     fn description_length_report(
         &self,
         l_param_bits: Option<f64>,
@@ -6412,21 +6431,7 @@ impl ManifoldSaeCore {
             .iter()
             .map(|&s| s.max(0) as usize)
             .collect();
-        // Exact mirror of the Python OOS n_harmonics gate. Every harmonic
-        // topology must carry its persisted order; the typed entry never
-        // guesses it from a decoder width.
-        let n_harm: Vec<Option<usize>> = inner
-            .basis_kinds
-            .iter()
-            .zip(&inner.n_harmonics)
-            .map(|(kind, &h)| {
-                if matches!(kind.as_str(), "periodic" | "torus" | "cylinder" | "mobius") {
-                    Some(h.max(0) as usize)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let n_harm = self.persisted_harmonic_orders()?;
         let hybrid = manifold_sae_hybrid_linear_images(&inner.hybrid_split)?;
         let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
             decoder_owned.iter().map(|a| a.view()).collect();
@@ -6816,21 +6821,7 @@ impl ManifoldSaeCore {
             .iter()
             .map(|&s| s.max(0) as usize)
             .collect();
-        // Exact mirror of the Python steer's per-kind n_harmonics gate:
-        // `int(h) if bk in {"periodic", "torus"} else None` (case-sensitive) — a
-        // looser (e.g. lowercased) predicate would diverge the rebuilt basis.
-        let n_harm: Vec<Option<usize>> = inner
-            .basis_kinds
-            .iter()
-            .zip(&inner.n_harmonics)
-            .map(|(kind, &h)| {
-                if kind == "periodic" || kind == "torus" {
-                    Some(h.max(0) as usize)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let n_harm = self.persisted_harmonic_orders()?;
         let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
             decoder_owned.iter().map(|a| a.view()).collect();
         let coord_views: Vec<ndarray::ArrayView2<'_, f64>> =
@@ -6920,18 +6911,7 @@ impl ManifoldSaeCore {
             .iter()
             .map(|&s| s.max(0) as usize)
             .collect();
-        let n_harm: Vec<Option<usize>> = inner
-            .basis_kinds
-            .iter()
-            .zip(&inner.n_harmonics)
-            .map(|(kind, &h)| {
-                if kind == "periodic" || kind == "torus" {
-                    Some(h.max(0) as usize)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let n_harm = self.persisted_harmonic_orders()?;
         let decoder_views: Vec<ndarray::ArrayView2<'_, f64>> =
             decoder_owned.iter().map(|a| a.view()).collect();
         let coord_views: Vec<ndarray::ArrayView2<'_, f64>> =

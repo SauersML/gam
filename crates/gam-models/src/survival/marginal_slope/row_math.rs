@@ -703,10 +703,10 @@ fn rigid_vector_row_nll<'arena, S>(
     z: &[f64],
     covariance: &MarginalSlopeCovariance,
     inputs: &RigidRowInputs,
-    arena: &'arena DynamicJetArena,
+    workspace: &'arena S::Workspace,
 ) -> Result<S, String>
 where
-    S: RuntimeJetScalar<'arena, Workspace = DynamicJetArena>,
+    S: RuntimeJetScalar<'arena>,
 {
     let dimension = vars.len();
     let k = dimension.checked_sub(3).ok_or_else(|| {
@@ -746,16 +746,17 @@ where
         .into());
     }
 
-    let observed_slopes =
-        arena.alloc_slice_fill_with(k, |axis| vars[3 + axis].scale(inputs.probit_scale));
-    let mut linear = S::constant(0.0, dimension, arena);
+    let observed_slopes = (0..k)
+        .map(|axis| vars[3 + axis].scale(inputs.probit_scale))
+        .collect::<Vec<_>>();
+    let mut linear = S::constant(0.0, dimension, workspace);
     for axis in 0..k {
         linear = linear.add(&observed_slopes[axis].scale(z[axis]));
     }
 
     // Preserve each covariance representation's canonical accumulation order.
     // In particular, LowRank evaluates ||L' r||^2 without materializing Sigma.
-    let mut variance = S::constant(0.0, dimension, arena);
+    let mut variance = S::constant(0.0, dimension, workspace);
     match covariance {
         MarginalSlopeCovariance::Diagonal(diagonal) => {
             for axis in 0..k {
@@ -768,7 +769,7 @@ where
         }
         MarginalSlopeCovariance::Full(matrix) => {
             for row in 0..k {
-                let mut row_dot = S::constant(0.0, dimension, arena);
+                let mut row_dot = S::constant(0.0, dimension, workspace);
                 for column in 0..k {
                     row_dot = row_dot.add(&observed_slopes[column].scale(matrix[[row, column]]));
                 }
@@ -777,7 +778,7 @@ where
         }
         MarginalSlopeCovariance::LowRank(factor) => {
             for column in 0..factor.ncols() {
-                let mut projection = S::constant(0.0, dimension, arena);
+                let mut projection = S::constant(0.0, dimension, workspace);
                 for row in 0..k {
                     projection = projection.add(&observed_slopes[row].scale(factor[[row, column]]));
                 }
@@ -799,10 +800,10 @@ where
     // At a mathematical zero, floating accumulation may land a few ulps below
     // zero. Shift only the primal constant; derivative channels are unchanged.
     if variance_value < 0.0 {
-        variance = variance.add(&S::constant(-variance_value, dimension, arena));
+        variance = variance.add(&S::constant(-variance_value, dimension, workspace));
     }
 
-    let one_plus_variance = variance.add(&S::constant(1.0, dimension, arena));
+    let one_plus_variance = variance.add(&S::constant(1.0, dimension, workspace));
     let correction =
         one_plus_variance.compose_unary(unary_derivatives_sqrt(one_plus_variance.value()));
     let eta0 = vars[0].mul(&correction).add(&linear);
@@ -826,8 +827,8 @@ where
         neg_eta1.value(),
         inputs.wi * (1.0 - inputs.di),
     ));
-    let mut event_density = S::constant(0.0, dimension, arena);
-    let mut time_derivative = S::constant(0.0, dimension, arena);
+    let mut event_density = S::constant(0.0, dimension, workspace);
+    let mut time_derivative = S::constant(0.0, dimension, workspace);
     if inputs.di > 0.0 {
         event_density = eta1
             .compose_unary(unary_derivatives_log_normal_pdf(eta1.value()))

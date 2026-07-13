@@ -781,16 +781,22 @@ fn sae_oos_request_from_arrays(
             );
         }
     };
-    let atoms = (0..k_atoms)
-        .map(|atom_index| gam::terms::sae::manifold::SaeOosAtomSpec {
-            basis_kind: sae_atom_basis_kind_from_str(&atom_basis[atom_index]),
-            latent_dim: atom_dim[atom_index],
-            decoder: decoder_blocks[atom_index].to_owned(),
-            centers: duchon_centers[atom_index].clone(),
-            n_harmonics: n_harmonics_list[atom_index],
-            basis_size: basis_size_list[atom_index],
-        })
-        .collect();
+    let basis_kinds = atom_basis
+        .iter()
+        .map(|name| sae_atom_basis_kind_from_str(name))
+        .collect::<Vec<_>>();
+    let stored_n_harmonics = n_harmonics_list
+        .iter()
+        .map(|order| order.unwrap_or(0))
+        .collect::<Vec<_>>();
+    let atoms = gam::terms::sae::manifold::persisted_oos_atom_specs(
+        &basis_kinds,
+        &atom_dim,
+        decoder_blocks,
+        duchon_centers,
+        &stored_n_harmonics,
+        &basis_size_list,
+    )?;
     let hybrid_linear_images = match hybrid_linear_images {
         Some(images) => images,
         None => Vec::new(),
@@ -1100,16 +1106,27 @@ fn sae_manifold_certify_external<'py>(
         .iter()
         .map(|o| o.as_ref().map(|a| a.as_array().to_owned()))
         .collect();
-    let atoms: Vec<gam::terms::sae::manifold::SaeOosAtomSpec> = (0..k_atoms)
-        .map(|atom_index| gam::terms::sae::manifold::SaeOosAtomSpec {
-            basis_kind: sae_atom_basis_kind_from_str(&atom_basis[atom_index]),
-            latent_dim: atom_dim[atom_index],
-            decoder: decoder_blocks[atom_index].as_array().to_owned(),
-            centers: atom_centers[atom_index].clone(),
-            n_harmonics: n_harmonics_list[atom_index],
-            basis_size: basis_size_list[atom_index],
-        })
-        .collect();
+    let basis_kinds = atom_basis
+        .iter()
+        .map(|name| sae_atom_basis_kind_from_str(name))
+        .collect::<Vec<_>>();
+    let decoder_views = decoder_blocks
+        .iter()
+        .map(|block| block.as_array())
+        .collect::<Vec<_>>();
+    let stored_n_harmonics = n_harmonics_list
+        .iter()
+        .map(|order| order.unwrap_or(0))
+        .collect::<Vec<_>>();
+    let atoms = gam::terms::sae::manifold::persisted_oos_atom_specs(
+        &basis_kinds,
+        &atom_dim,
+        &decoder_views,
+        &atom_centers,
+        &stored_n_harmonics,
+        &basis_size_list,
+    )
+    .map_err(py_value_error)?;
 
     if initial_coords.len() != k_atoms {
         return Err(py_value_error(format!(
@@ -1621,16 +1638,23 @@ fn steer_delta_with_metric_from_arrays(
     // rebuild contract `sae_manifold_predict_oos` marshals into, so the steer term
     // and the OOS term are rebuilt by one engine path (`run_sae_manifold_steer`,
     // #2236) rather than a duplicated pyffi rebuild.
-    let atoms: Vec<gam::terms::sae::manifold::SaeOosAtomSpec> = (0..k_atoms)
-        .map(|atom_index| gam::terms::sae::manifold::SaeOosAtomSpec {
-            basis_kind: sae_atom_basis_kind_from_str(&atom_basis[atom_index]),
-            latent_dim: atom_dim[atom_index],
-            decoder: decoder_blocks[atom_index].to_owned(),
-            centers: duchon_centers[atom_index].clone(),
-            n_harmonics: n_harmonics_list[atom_index],
-            basis_size: basis_size_list[atom_index],
-        })
-        .collect();
+    let basis_kinds = atom_basis
+        .iter()
+        .map(|name| sae_atom_basis_kind_from_str(name))
+        .collect::<Vec<_>>();
+    let stored_n_harmonics = n_harmonics_list
+        .iter()
+        .map(|order| order.unwrap_or(0))
+        .collect::<Vec<_>>();
+    let atoms = gam::terms::sae::manifold::persisted_oos_atom_specs(
+        &basis_kinds,
+        atom_dim,
+        decoder_blocks,
+        duchon_centers,
+        &stored_n_harmonics,
+        basis_size_list,
+    )
+    .map_err(py_value_error)?;
     let coord_blocks: Vec<Array2<f64>> = coords.iter().map(|block| block.to_owned()).collect();
 
     let request = gam::terms::sae::manifold::SaeSteerRequest {
@@ -1784,16 +1808,23 @@ fn steer_to_target_from_arrays(
             )));
         }
     };
-    let atoms: Vec<gam::terms::sae::manifold::SaeOosAtomSpec> = (0..k_atoms)
-        .map(|atom_index| gam::terms::sae::manifold::SaeOosAtomSpec {
-            basis_kind: sae_atom_basis_kind_from_str(&atom_basis[atom_index]),
-            latent_dim: atom_dim[atom_index],
-            decoder: decoder_blocks[atom_index].to_owned(),
-            centers: duchon_centers[atom_index].clone(),
-            n_harmonics: n_harmonics_list[atom_index],
-            basis_size: basis_size_list[atom_index],
-        })
-        .collect();
+    let basis_kinds = atom_basis
+        .iter()
+        .map(|name| sae_atom_basis_kind_from_str(name))
+        .collect::<Vec<_>>();
+    let stored_n_harmonics = n_harmonics_list
+        .iter()
+        .map(|order| order.unwrap_or(0))
+        .collect::<Vec<_>>();
+    let atoms = gam::terms::sae::manifold::persisted_oos_atom_specs(
+        &basis_kinds,
+        atom_dim,
+        decoder_blocks,
+        duchon_centers,
+        &stored_n_harmonics,
+        basis_size_list,
+    )
+    .map_err(py_value_error)?;
     let coord_blocks: Vec<Array2<f64>> = coords.iter().map(|block| block.to_owned()).collect();
 
     let request = gam::terms::sae::manifold::SaeSteerToTargetRequest {
