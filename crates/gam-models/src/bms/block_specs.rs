@@ -2661,10 +2661,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
             initial_sigma
         }
     };
-    let derivative_block_cache = RefCell::new(
+    let hyper_layout_cache = RefCell::new(
         None::<(
             Array1<f64>,
-            Arc<Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>>,
+            crate::custom_family::SharedCustomFamilyHyperLayout,
         )>,
     );
     let theta_matches = |left: &Array1<f64>, right: &Array1<f64>| -> bool {
@@ -2672,19 +2672,16 @@ pub fn fit_bernoulli_marginal_slope_terms(
             && left
                 .iter()
                 .zip(right.iter())
-                .all(|(lhs, rhs)| (*lhs - *rhs).abs() <= 1e-12 * (1.0 + lhs.abs().max(rhs.abs())))
+                .all(|(lhs, rhs)| lhs.to_bits() == rhs.to_bits())
     };
-    let get_derivative_blocks = |theta: &Array1<f64>,
-                                 specs: &[TermCollectionSpec],
-                                 designs: &[TermCollectionDesign]|
-     -> Result<
-        Arc<Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>>,
-        String,
-    > {
-        if let Some((cached_theta, cached_blocks)) = derivative_block_cache.borrow().as_ref()
+    let get_hyper_layout = |theta: &Array1<f64>,
+                            specs: &[TermCollectionSpec],
+                            designs: &[TermCollectionDesign]|
+     -> Result<crate::custom_family::SharedCustomFamilyHyperLayout, String> {
+        if let Some((cached_theta, cached_layout)) = hyper_layout_cache.borrow().as_ref()
             && theta_matches(cached_theta, theta)
         {
-            return Ok(Arc::clone(cached_blocks));
+            return Ok(Arc::clone(cached_layout));
         }
 
         let built = |specs: &[TermCollectionSpec],
@@ -2722,25 +2719,17 @@ pub fn fit_bernoulli_marginal_slope_terms(
             if link_dev_runtime.is_some() {
                 derivative_blocks.push(Vec::new());
             }
-            if sigma_learnable {
-                derivative_blocks
-                    .last_mut()
-                    .expect("bernoulli derivative block list is non-empty")
-                    .push(crate::custom_family::CustomFamilyBlockPsiDerivative::new(
-                        None,
-                        Array2::zeros((0, 0)),
-                        Array2::zeros((0, 0)),
-                        None,
-                        None,
-                        None,
-                        None,
-                    ));
-            }
             Ok(derivative_blocks)
         }(specs, designs)?;
-        let built = Arc::new(built);
-        derivative_block_cache.replace(Some((theta.clone(), Arc::clone(&built))));
-        Ok(built)
+        let family_axes = if sigma_learnable { vec![0] } else { Vec::new() };
+        let hyper_values = theta.slice(s![setup.rho_dim()..]).to_owned();
+        let layout = Arc::new(crate::custom_family::CustomFamilyHyperLayout::new(
+            built,
+            family_axes,
+            hyper_values,
+        )?);
+        hyper_layout_cache.replace(Some((theta.clone(), Arc::clone(&layout))));
+        Ok(layout)
     };
 
     // Bernoulli marginal-slope is a multi-block family with β-dependent
@@ -2869,7 +2858,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let sigma = sigma_from_theta(theta);
             final_sigma_cell.set(sigma);
             let family = make_family(&designs[0], &designs[1], sigma);
-            let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
+            let hyper_layout = get_hyper_layout(theta, specs, designs)?;
             // Downgrade to ValueAndGradient when the caller asks for a
             // Hessian we can't provide; preserve ValueOnly probes for
             // line-search cost-only evaluation.
@@ -2890,7 +2879,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 &blocks,
                 &eval_options,
                 &rho,
-                derivative_blocks,
+                hyper_layout,
                 exact_warm_start.borrow().as_ref(),
                 effective_mode,
             )?;
@@ -2949,7 +2938,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             let sigma = sigma_from_theta(theta);
             final_sigma_cell.set(sigma);
             let family = make_family(&designs[0], &designs[1], sigma);
-            let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
+            let hyper_layout = get_hyper_layout(theta, specs, designs)?;
             let tolerance_options =
                 joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
             let eval_options = crate::outer_subsample::exact_outer_options_for_row_set(
@@ -2961,7 +2950,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 &blocks,
                 &eval_options,
                 &rho,
-                derivative_blocks,
+                hyper_layout,
                 exact_warm_start.borrow().as_ref(),
             )?;
             if let Some(err) = bernoulli_marginal_slope_runaway_error(
