@@ -7,7 +7,7 @@ pub(crate) struct TransformationExactGeometryCache {
     pub(crate) covariate_design: TermCollectionDesign,
     pub(crate) family: TransformationNormalFamily,
     pub(crate) blocks: Vec<ParameterBlockSpec>,
-    pub(crate) derivative_blocks: SharedDerivativeBlocks,
+    pub(crate) hyper_layout: SharedCustomFamilyHyperLayout,
 }
 
 #[derive(Default)]
@@ -482,7 +482,10 @@ pub fn fit_transformation_normal(
             covariate_design: exact_design,
             blocks: vec![family.block_spec(rho)?],
             family,
-            derivative_blocks: Arc::new(vec![tensor_derivs]),
+            hyper_layout: Arc::new(CustomFamilyHyperLayout::new(
+                vec![tensor_derivs],
+                Vec::new(),
+            )?),
         }));
         Ok(())
     };
@@ -553,7 +556,7 @@ pub fn fit_transformation_normal(
                         &geometry.blocks,
                         &final_options,
                         &rho,
-                        Arc::clone(&geometry.derivative_blocks),
+                        Arc::clone(&geometry.hyper_layout),
                         &warm_starts,
                         gam_problem::EvalMode::ValueOnly,
                     )
@@ -646,7 +649,7 @@ pub fn fit_transformation_normal(
                 &geometry.blocks,
                 &eval_options,
                 &rho,
-                Arc::clone(&geometry.derivative_blocks),
+                Arc::clone(&geometry.hyper_layout),
                 &warm_starts,
                 eval_mode,
             )
