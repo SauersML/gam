@@ -3176,14 +3176,24 @@ pub struct Order2<const K: usize>(pub crate::jet_tower::Tower2<K>);
 impl<const K: usize> Order2<K> {
     /// Read the gradient channel `g_a = ∂ℓ/∂p_a`.
     #[inline]
-    pub fn g(&self) -> [f64; K] {
-        self.0.g
+    #[must_use]
+    pub fn g(&self) -> &[f64; K] {
+        &self.0.g
     }
 
     /// Read the Hessian channel.
     #[inline]
-    pub fn h(&self) -> [[f64; K]; K] {
-        self.0.h
+    #[must_use]
+    pub fn h(&self) -> &[[f64; K]; K] {
+        &self.0.h
+    }
+
+    /// Consume the jet and move out its value, gradient, and Hessian channels.
+    #[inline]
+    #[must_use]
+    pub fn into_channels(self) -> (f64, [f64; K], [[f64; K]; K]) {
+        let crate::jet_tower::Tower2 { v, g, h } = self.0;
+        (v, g, h)
     }
 }
 
@@ -4241,8 +4251,16 @@ pub struct Order1<const K: usize> {
 impl<const K: usize> Order1<K> {
     /// Read the gradient channel `g_a = ∂ℓ/∂p_a`.
     #[inline]
-    pub fn g(&self) -> [f64; K] {
-        self.g
+    #[must_use]
+    pub fn g(&self) -> &[f64; K] {
+        &self.g
+    }
+
+    /// Consume the jet and move out its value and gradient channels.
+    #[inline]
+    #[must_use]
+    pub fn into_channels(self) -> (f64, [f64; K]) {
+        (self.v, self.g)
     }
 }
 
@@ -4353,7 +4371,7 @@ impl<const K: usize> OneSeed<K> {
     /// The contracted-third channel after a `seed_direction(u)` evaluation:
     /// `out[a][b] = Σ_c ℓ_{abc} u_c`, i.e. the ε-coefficient's Hessian (doc §A.2).
     pub fn contracted_third(&self) -> [[f64; K]; K] {
-        self.eps.h()
+        *self.eps.h()
     }
 }
 
@@ -4775,7 +4793,7 @@ impl<const K: usize> TwoSeed<K> {
     /// The contracted-fourth channel after a `seed(u, v)` evaluation:
     /// `out[a][b] = Σ_{cd} ℓ_{abcd} u_c v_d`, i.e. the εδ-coefficient's Hessian.
     pub fn contracted_fourth(&self) -> [[f64; K]; K] {
-        self.eps_del.h()
+        *self.eps_del.h()
     }
 }
 
@@ -6224,14 +6242,14 @@ mod tests {
             Term {
                 first: first_stack[1],
                 second: first_stack[2],
-                gradient: first_atom.g(),
-                hessian: first_atom.h(),
+                gradient: *first_atom.g(),
+                hessian: *first_atom.h(),
             },
             Term {
                 first: second_stack[1],
                 second: second_stack[2],
-                gradient: second_atom.g(),
-                hessian: second_atom.h(),
+                gradient: *second_atom.g(),
+                hessian: *second_atom.h(),
             },
         ];
         let (value, gradient, hessian) = DynamicOrder2Accumulator::from_composed_sum(

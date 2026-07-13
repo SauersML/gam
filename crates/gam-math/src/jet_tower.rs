@@ -1813,7 +1813,7 @@ pub fn program_row_kernel<const K: usize, P: RowProgram<K> + ?Sized>(
         <crate::jet_scalar::Order2<K> as crate::jet_scalar::JetScalar<K>>::variable(base[a], a)
     });
     let s = prog.eval(row, &vars)?;
-    Ok((crate::nested_dual::JetField::value(&s), s.g(), s.h()))
+    Ok(s.into_channels())
 }
 
 /// Derive the `row_third_contracted(dir)` channel `Σ_c ℓ_{abc} dir_c` from a

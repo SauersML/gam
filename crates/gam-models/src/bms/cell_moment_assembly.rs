@@ -520,11 +520,7 @@ impl BernoulliMarginalSlopeFamily {
             measure_weights,
             2,
         )?;
-        Ok((
-            gam_math::nested_dual::JetField::value(&jet),
-            jet.g(),
-            jet.h(),
-        ))
+        Ok(jet.into_channels())
     }
 
     /// Closed-form uncontracted **third**-derivative tensor of the rigid
@@ -1322,8 +1318,8 @@ impl BernoulliMarginalSlopeFamily {
             EmpiricalBmsThirdJetSchedule::FixedWidthFromPlan => {
                 Self::empirical_fixed_third_many_dispatch(&plan, &point, row_dirs, r)
             }
-            EmpiricalBmsThirdJetSchedule::DynamicBatch { lanes } => {
-                EMPIRICAL_BMS_THIRD_WORKSPACE.with(|workspace| {
+            EmpiricalBmsThirdJetSchedule::DynamicBatch { lanes } => EMPIRICAL_BMS_THIRD_WORKSPACE
+                .with(|workspace| {
                     let mut workspace = workspace.borrow_mut();
                     let mut contracted = Vec::with_capacity(row_dirs.len());
                     for directions in row_dirs.chunks(lanes) {
@@ -1348,8 +1344,7 @@ impl BernoulliMarginalSlopeFamily {
                         }
                     }
                     Ok(contracted)
-                })
-            }
+                }),
         }
     }
 
@@ -1395,8 +1390,8 @@ impl BernoulliMarginalSlopeFamily {
             EmpiricalBmsThirdJetSchedule::FixedWidthFromPlan => {
                 Self::empirical_fixed_third_trace_dispatch(&plan, &point, gram, r)
             }
-            EmpiricalBmsThirdJetSchedule::DynamicBatch { lanes } => {
-                EMPIRICAL_BMS_THIRD_WORKSPACE.with(|workspace| {
+            EmpiricalBmsThirdJetSchedule::DynamicBatch { lanes } => EMPIRICAL_BMS_THIRD_WORKSPACE
+                .with(|workspace| {
                     let mut workspace = workspace.borrow_mut();
                     let mut gradient = Array1::<f64>::zeros(r);
                     for axis_start in (0..r).step_by(lanes) {
@@ -1424,8 +1419,7 @@ impl BernoulliMarginalSlopeFamily {
                         }
                     }
                     Ok(gradient)
-                })
-            }
+                }),
         }
     }
 

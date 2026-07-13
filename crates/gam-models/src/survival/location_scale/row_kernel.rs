@@ -3874,7 +3874,7 @@ mod patterned_order2_perf_tests {
         let vars: [Order2<SLS_ROW_K>; SLS_ROW_K] =
             std::array::from_fn(|axis| Order2::variable(p[axis], axis));
         let out = sls_row_nll(&vars, kernel).expect("dense row NLL");
-        (out.value(), out.g(), out.h())
+        out.into_channels()
     }
 
     fn patterned(

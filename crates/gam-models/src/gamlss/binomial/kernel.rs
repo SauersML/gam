@@ -586,7 +586,8 @@ pub(crate) fn binomial_location_scale_nll_gradient(
         false,
         |x, axis| Order1::<2>::variable(x, axis),
     )?;
-    Ok(out.g())
+    let (_, gradient) = out.into_channels();
+    Ok(gradient)
 }
 
 /// SIMD 4-rows-per-pass evaluation of the binomial location-scale row NLL at the

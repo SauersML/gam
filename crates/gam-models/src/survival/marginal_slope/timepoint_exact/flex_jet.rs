@@ -3177,7 +3177,7 @@ mod moment_engine_tests {
             Order2(Tower2 { v: 0.0, g, h })
         };
         let a = filtered_implicit_solve_scalar::<K, Order2<K>>(a0, 1.0 / d_check, 2, residual);
-        a.h()
+        *a.h()
     }
 
     impl SurvivalMarginalSlopeFamily {
