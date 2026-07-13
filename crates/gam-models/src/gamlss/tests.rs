@@ -5493,7 +5493,12 @@ pub(crate) fn gaussian_log_sigma_psi_terms_match_autodiff_scalar_objective() {
     ];
 
     let psi_terms = family
-        .exact_newton_joint_psi_terms(&states, &specs, &derivative_blocks, 0)
+        .exact_newton_joint_psi_terms(
+            &states,
+            &specs,
+            &test_design_hyper_layout(&derivative_blocks),
+            0,
+        )
         .expect("joint psi terms")
         .expect("expected gaussian psi terms");
 
@@ -5703,7 +5708,13 @@ pub(crate) fn gaussian_log_sigma_psi_second_order_terms_match_autodiff_scalar_ob
     ];
 
     let psi2_terms = family
-        .exact_newton_joint_psisecond_order_terms(&states, &specs, &derivative_blocks, 0, 0)
+        .exact_newton_joint_psisecond_order_terms(
+            &states,
+            &specs,
+            &test_design_hyper_layout(&derivative_blocks),
+            0,
+            0,
+        )
         .expect("joint psi psi terms")
         .expect("expected gaussian psi psi terms");
 
@@ -8478,7 +8489,12 @@ pub(crate) fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero()
 
         // 1st-order ψ joint Hessian.
         let psi = family
-            .exact_newton_joint_psi_terms(&states, &specs, &derivative_blocks, 0)
+            .exact_newton_joint_psi_terms(
+                &states,
+                &specs,
+                &test_design_hyper_layout(&derivative_blocks),
+                0,
+            )
             .expect("psi terms call")
             .expect("gaussian psi terms present");
         let h_psi = materialize(&psi.hessian_psi, psi.hessian_psi_operator.as_deref(), total);
@@ -8491,7 +8507,13 @@ pub(crate) fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero()
 
         // 2nd-order ψ joint Hessian.
         let psi2 = family
-            .exact_newton_joint_psisecond_order_terms(&states, &specs, &derivative_blocks, 0, 0)
+            .exact_newton_joint_psisecond_order_terms(
+                &states,
+                &specs,
+                &test_design_hyper_layout(&derivative_blocks),
+                0,
+                0,
+            )
             .expect("psi 2nd-order call")
             .expect("gaussian psi 2nd-order present");
         let h_psi2 = materialize(
@@ -8512,7 +8534,7 @@ pub(crate) fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero()
             .exact_newton_joint_psihessian_directional_derivative(
                 &states,
                 &specs,
-                &derivative_blocks,
+                &test_design_hyper_layout(&derivative_blocks),
                 0,
                 &d_beta,
             )
@@ -8605,7 +8627,12 @@ pub(crate) fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero()
 
         // 1st-order ψ.
         let psi = family
-            .exact_newton_joint_psi_terms(&states, &specs, &derivative_blocks, 0)
+            .exact_newton_joint_psi_terms(
+                &states,
+                &specs,
+                &test_design_hyper_layout(&derivative_blocks),
+                0,
+            )
             .expect("wiggle psi terms call")
             .expect("wiggle psi terms present");
         let h_psi = materialize(&psi.hessian_psi, psi.hessian_psi_operator.as_deref(), total);
@@ -8613,7 +8640,13 @@ pub(crate) fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero()
 
         // 2nd-order ψ.
         let psi2 = family
-            .exact_newton_joint_psisecond_order_terms(&states, &specs, &derivative_blocks, 0, 0)
+            .exact_newton_joint_psisecond_order_terms(
+                &states,
+                &specs,
+                &test_design_hyper_layout(&derivative_blocks),
+                0,
+                0,
+            )
             .expect("wiggle psi 2nd-order call")
             .expect("wiggle psi 2nd-order present");
         let h_psi2 = materialize(
@@ -8629,7 +8662,7 @@ pub(crate) fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero()
             .exact_newton_joint_psihessian_directional_derivative(
                 &states,
                 &specs,
-                &derivative_blocks,
+                &test_design_hyper_layout(&derivative_blocks),
                 0,
                 &d_beta,
             )
