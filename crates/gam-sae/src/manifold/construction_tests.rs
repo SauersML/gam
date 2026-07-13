@@ -109,8 +109,14 @@ mod amortized_encoder_tests {
     /// HVP channel gate; exercises the `A⁻¹G (A⁻¹S)²` curvature trace.
     #[test]
     fn rank_charge_direct_rho_hessian_matches_finite_difference_2253() {
+        use crate::manifold::tests::gamma_fd_tiny_fixture;
         use ndarray::Array1;
-        let (mut term, target, rho) = small_two_atom_periodic_term();
+        // small_two_atom_periodic_term co-collapses through the full inner fit at
+        // current HEAD (K=2 unsupported for that tiny target); gamma_fd_tiny is the
+        // converging fixture the sibling criterion tests use. rank-charge is
+        // smooth-index-only and assignment-mode-agnostic, so its second derivative
+        // is exercised identically.
+        let (mut term, target, rho) = gamma_fd_tiny_fixture();
         let (_cost, loss, cache) = term
             .penalized_quasi_laplace_criterion_with_cache(
                 target.view(),
@@ -127,6 +133,11 @@ mod amortized_encoder_tests {
         let analytic = term
             .rank_charge_direct_rho_hessian(target.view(), &rho, &loss, &cache)
             .expect("rank-charge direct_rho Hessian assembles");
+        assert!(
+            analytic.iter().any(|&x| x.abs() > 1.0e-6),
+            "fixture must exercise a non-trivial rank-charge curvature (interior EDF), \
+             else this gate is vacuous"
+        );
 
         let base = rho.to_flat();
         let eps = 1.0e-6;
