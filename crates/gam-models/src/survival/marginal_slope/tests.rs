@@ -9310,6 +9310,36 @@ fn survival_sparse_tower4_full_t4_matches_dense_oracle_979() {
     );
 }
 
+#[test]
+fn flex_third_jet_arena_stabilizes_after_warmup_932() {
+    let fixture = B10_PARITY_FIXTURES[0];
+    let (family, block_states) = b10_flex_family_for_parity(fixture);
+    let primary = flex_primary_slices(&family);
+    let directions = b10_direction_set(primary.total);
+    let direction = &directions[0].1;
+    let retained_bytes = || {
+        crate::survival::marginal_slope::timepoint_exact::flex_jet::with_flex_third_jet_arena(
+            |arena| arena.allocated_bytes(),
+        )
+    };
+
+    family
+        .row_flex_primary_third_contracted_exact(0, &block_states, direction)
+        .expect("warm FLEX third arena");
+    let first = retained_bytes();
+    assert!(first > 0, "FLEX third arena did not retain its warm tape");
+
+    family
+        .row_flex_primary_third_contracted_exact(0, &block_states, direction)
+        .expect("repeat FLEX third arena");
+    let second = retained_bytes();
+    assert_eq!(
+        second, first,
+        "same-width FLEX third row grew its warmed arena: {first} -> {second} bytes"
+    );
+    eprintln!("G932_FLEX_THIRD_ARENA retained_bytes={second}");
+}
+
 /// Temporary #932 release measurement. Removed immediately after the exact-SHA
 /// MSI result is captured.
 #[test]

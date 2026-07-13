@@ -95,7 +95,7 @@ thread_local! {
         std::cell::RefCell::new(DynamicJetArena::new());
 }
 
-pub(super) fn with_flex_third_jet_arena<R>(evaluate: impl FnOnce(&mut DynamicJetArena) -> R) -> R {
+pub(crate) fn with_flex_third_jet_arena<R>(evaluate: impl FnOnce(&mut DynamicJetArena) -> R) -> R {
     FLEX_THIRD_JET_ARENA.with(|workspace| {
         let mut arena = workspace.borrow_mut();
         arena.reset();
