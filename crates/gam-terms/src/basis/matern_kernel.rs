@@ -443,7 +443,6 @@ pub fn thin_plate_penalties_at_length_scale(
         )?;
         fast_ab(&internal_kernel_transform, &v)
     };
-    let poly_cols = thin_plate_polynomial_basis_dimension(centers.ncols());
     let (penalty_bending, penalty_ridge) = build_thin_plate_penalty_matrices(
         centers,
         length_scale,

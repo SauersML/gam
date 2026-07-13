@@ -1063,9 +1063,7 @@ fn apply_global_smooth_identifiability(
         ..
     } = analyze_smooth_ownership(smoothspecs);
 
-    use rayon::iter::{
-        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
-    };
+    use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
     for &idx in &ownership_order {
         let term = &smooth.terms[idx];

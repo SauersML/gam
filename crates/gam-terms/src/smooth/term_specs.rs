@@ -5638,7 +5638,7 @@ pub fn build_tensor_bspline_basis(
             spec.marginalspecs.len()
         );
     }
-    if let Some((margin, marginal)) = spec
+    if let Some((margin, _)) = spec
         .marginalspecs
         .iter()
         .enumerate()
