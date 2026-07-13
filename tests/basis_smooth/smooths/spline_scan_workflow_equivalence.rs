@@ -195,7 +195,7 @@ fn scan_routed_workflow_fit_matches_dense_oracle_at_selected_lambda() {
         idx.sort_by(|&i, &j| x[i].total_cmp(&x[j]));
         idx.iter().map(|&i| y[i]).collect()
     };
-    let (oracle_mean, oracle_var_unit) = dense_truth(&fit.knots, &knot_y, &w, fit.log_lambda);
+    let (oracle_mean, oracle_var_unit) = dense_truth(&fit.knots, &knot_y, &w, fit.log_lambda());
 
     for t in 0..fit.knots.len() {
         let dm = (fit.mean[t] - oracle_mean[t]).abs();
@@ -260,7 +260,7 @@ fn scan_routed_observation_interval_matches_dense_predictive_band() {
         idx.sort_by(|&i, &j| x[i].total_cmp(&x[j]));
         idx.iter().map(|&i| y[i]).collect()
     };
-    let (_oracle_mean, oracle_var_unit) = dense_truth(&fit.knots, &knot_y, &w, fit.log_lambda);
+    let (_oracle_mean, oracle_var_unit) = dense_truth(&fit.knots, &knot_y, &w, fit.log_lambda());
 
     // Same z the FFI scan arm uses (two-sided 95%).
     let level = 0.95_f64;

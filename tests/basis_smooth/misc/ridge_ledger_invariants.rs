@@ -14,11 +14,10 @@
 //! coordinate by reading these invariants, so the asserts here are the
 //! stable contract the rest of the codebase keys off.
 //!
-//! The "kind matches inclusion flags" invariant that used to live as a
-//! runtime check (`invariants_hold`) is now enforced statically: the
-//! inclusion flags were lifted into the [`StabilizationKind`] discriminant,
-//! so the delta accessors derive from `kind` alone. Heterogeneous /
-//! inconsistent (kind, flags) combinations are unrepresentable.
+//! The former matrix of public inclusion flags is now enforced statically:
+//! [`RidgePolicy`] admits only coherent objective or solver-only policies,
+//! while the ledger's delta accessors derive accounting participation from
+//! [`StabilizationKind`]. Heterogeneous combinations are unrepresentable.
 
 use gam::types::{
     RidgeMatrixForm, RidgePassport, RidgePolicy, StabilizationKind, StabilizationLedger,
@@ -30,12 +29,16 @@ const DELTA: f64 = 7.5e-3;
 
 #[test]
 fn solver_damping_excludes_every_accounting_term() {
-    let ledger = StabilizationLedger::solver_damping(DELTA, StabilizationRule::FixedConstant);
-    assert_eq!(ledger.delta, DELTA);
+    let ledger = StabilizationLedger::solver_damping(DELTA, StabilizationRule::FixedConstant)
+        .expect("finite non-negative solver damping is valid");
+    assert_eq!(ledger.delta(), DELTA);
     assert_eq!(ledger.quadratic_delta(), 0.0);
     assert_eq!(ledger.laplace_hessian_delta(), 0.0);
     assert_eq!(ledger.penalty_logdet_delta(), 0.0);
-    assert!(matches!(ledger.kind, StabilizationKind::SolverDampingOnly));
+    assert!(matches!(
+        ledger.kind(),
+        StabilizationKind::SolverDampingOnly
+    ));
 }
 
 #[test]
@@ -44,27 +47,31 @@ fn numerical_perturbation_excludes_every_accounting_term() {
         DELTA,
         StabilizationRule::InertiaTarget { spd_floor: 1e-10 },
         Some(1e-12),
-    );
+    )
+    .expect("finite numerical perturbation metadata is valid");
+    assert_eq!(ledger.delta(), DELTA);
+    assert_eq!(ledger.backward_error_bound(), Some(1e-12));
     assert_eq!(ledger.quadratic_delta(), 0.0);
     assert_eq!(ledger.laplace_hessian_delta(), 0.0);
     assert_eq!(ledger.penalty_logdet_delta(), 0.0);
-    match ledger.kind {
-        StabilizationKind::NumericalPerturbation {
-            backward_error_bound,
-        } => {
-            assert_eq!(backward_error_bound, Some(1e-12));
-        }
-        _ => panic!("expected NumericalPerturbation"),
-    }
+    assert!(matches!(
+        ledger.kind(),
+        StabilizationKind::NumericalPerturbation
+    ));
 }
 
 #[test]
 fn explicit_prior_includes_every_accounting_term() {
-    let ledger = StabilizationLedger::explicit_prior(DELTA, RidgeMatrixForm::ScaledIdentity);
+    let ledger = StabilizationLedger::explicit_prior(
+        DELTA,
+        RidgeMatrixForm::ScaledIdentity,
+        RidgePolicy::exact_full_objective(),
+    )
+    .expect("finite exact-objective prior ridge is valid");
     assert_eq!(ledger.quadratic_delta(), DELTA);
     assert_eq!(ledger.laplace_hessian_delta(), DELTA);
     assert_eq!(ledger.penalty_logdet_delta(), DELTA);
-    assert!(matches!(ledger.kind, StabilizationKind::ExplicitPrior));
+    assert!(matches!(ledger.kind(), StabilizationKind::ExplicitPrior));
 }
 
 /// Numerical model: confirm that an ExplicitPrior ridge δ moves objective,
@@ -78,8 +85,14 @@ fn explicit_prior_changes_objective_grad_hessian_consistently() {
     let beta = Array1::from_vec(vec![0.4, -1.1, 2.0]);
     let beta_norm_sq = beta.dot(&beta);
 
-    let prior = StabilizationLedger::explicit_prior(DELTA, RidgeMatrixForm::ScaledIdentity);
-    let damping = StabilizationLedger::solver_damping(DELTA, StabilizationRule::FixedConstant);
+    let prior = StabilizationLedger::explicit_prior(
+        DELTA,
+        RidgeMatrixForm::ScaledIdentity,
+        RidgePolicy::exact_full_objective(),
+    )
+    .expect("finite exact-objective prior ridge is valid");
+    let damping = StabilizationLedger::solver_damping(DELTA, StabilizationRule::FixedConstant)
+        .expect("finite non-negative solver damping is valid");
 
     // Synthetic baseline objective f0(β), gradient g0, Hessian h0_diag.
     let f0 = 1.234;
@@ -110,39 +123,35 @@ fn explicit_prior_changes_objective_grad_hessian_consistently() {
     assert_eq!(h_damp_diag, h0_diag);
 }
 
-/// Bridge from the legacy `RidgePassport` API: a passport whose policy
-/// turns on every inclusion flag must round-trip into an
-/// `ExplicitPrior`-kind ledger (so PIRLS-side code that already threads a
-/// passport through every call can hand the ledger downstream without
-/// reclassifying it). A passport with all flags off must round-trip into
-/// `NumericalPerturbation`.
+/// A `RidgePassport` carries the same typed accounting policy into the broader
+/// stabilization ledger. An objective-accounted passport must remain visible
+/// to every accounting pass; a solver-only passport must remain invisible.
 #[test]
-fn from_passport_round_trip_preserves_classification() {
-    let prior_passport =
-        RidgePassport::scaled_identity(DELTA, RidgePolicy::explicit_stabilization_full());
-    let prior_ledger = StabilizationLedger::from_passport(prior_passport);
+fn passport_bridge_preserves_objective_accounting_classification() {
+    let objective_passport =
+        RidgePassport::scaled_identity(DELTA, RidgePolicy::exact_full_objective())
+            .expect("finite exact-objective ridge passport is valid");
+    let objective_ledger = StabilizationLedger::from_passport(objective_passport);
     assert!(matches!(
-        prior_ledger.kind,
-        StabilizationKind::ExplicitPrior
+        objective_ledger.kind(),
+        StabilizationKind::ObjectiveStabilization
     ));
-    assert_eq!(prior_ledger.delta, DELTA);
-    assert_eq!(prior_ledger.quadratic_delta(), DELTA);
+    assert_eq!(objective_ledger.delta(), DELTA);
+    assert_eq!(objective_ledger.quadratic_delta(), DELTA);
+    assert_eq!(objective_ledger.laplace_hessian_delta(), DELTA);
+    assert_eq!(objective_ledger.penalty_logdet_delta(), DELTA);
 
-    // A policy with every flag false: morally a numerical perturbation.
-    let np_policy = RidgePolicy {
-        rho_independent: true,
-        include_quadratic_penalty: false,
-        include_penalty_logdet: false,
-        include_laplacehessian: false,
-        determinant_mode: gam::types::RidgeDeterminantMode::Auto,
-    };
-    let np_passport = RidgePassport::scaled_identity(DELTA, np_policy);
-    let np_ledger = StabilizationLedger::from_passport(np_passport);
+    let solver_passport = RidgePassport::scaled_identity(DELTA, RidgePolicy::solver_only())
+        .expect("finite solver-only ridge passport is valid");
+    let solver_ledger = StabilizationLedger::from_passport(solver_passport);
     assert!(matches!(
-        np_ledger.kind,
-        StabilizationKind::NumericalPerturbation { .. }
+        solver_ledger.kind(),
+        StabilizationKind::NumericalPerturbation
     ));
-    assert_eq!(np_ledger.quadratic_delta(), 0.0);
+    assert_eq!(solver_ledger.delta(), DELTA);
+    assert_eq!(solver_ledger.quadratic_delta(), 0.0);
+    assert_eq!(solver_ledger.laplace_hessian_delta(), 0.0);
+    assert_eq!(solver_ledger.penalty_logdet_delta(), 0.0);
 }
 
 /// `StabilizationLedger::none()` must satisfy every invariant trivially:
@@ -150,8 +159,8 @@ fn from_passport_round_trip_preserves_classification() {
 #[test]
 fn none_sentinel_holds_invariants() {
     let ledger = StabilizationLedger::none();
-    assert_eq!(ledger.delta, 0.0);
-    assert!(matches!(ledger.kind, StabilizationKind::None));
+    assert_eq!(ledger.delta(), 0.0);
+    assert!(matches!(ledger.kind(), StabilizationKind::None));
     assert_eq!(ledger.quadratic_delta(), 0.0);
     assert_eq!(ledger.laplace_hessian_delta(), 0.0);
     assert_eq!(ledger.penalty_logdet_delta(), 0.0);
