@@ -622,6 +622,112 @@ mod tests {
         .expect("state")
     }
 
+    fn bundle_with_inner_kkt_residual(
+        bundle: &EvalShared,
+        residual: Array1<f64>,
+    ) -> EvalShared {
+        let mut pirls_result = bundle.pirls_result.as_ref().clone();
+        pirls_result.lastgradient_norm = residual.dot(&residual).sqrt();
+        pirls_result.penalized_gradient_transformed = residual;
+        let mut cloned = bundle.clone();
+        cloned.pirls_result = Arc::new(pirls_result);
+        cloned
+    }
+
+    fn evaluate_synthetic_psi_value_without_inner_kkt(
+        state: &RemlState<'_>,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+    ) -> f64 {
+        let mode = super::reml_outer_engine::EvalMode::ValueOnly;
+        let mut assembly = state
+            .build_auto_assembly(rho, bundle, mode, true, false)
+            .expect("uncorrected synthetic-psi assembly");
+        let p_dim = assembly.beta.len();
+        assembly.ext_coords = vec![super::reml_outer_engine::HyperCoord {
+            a: 0.0,
+            g: Array1::zeros(p_dim),
+            drift: super::reml_outer_engine::HyperCoordDrift::none(),
+            ld_s: 0.0,
+            b_depends_on_beta: false,
+            is_penalty_like: false,
+            firth_g: None,
+            tk_eta_fixed: None,
+            tk_x_fixed: None,
+        }];
+        state
+            .assemble_and_evaluate(rho, bundle, mode, assembly)
+            .expect("uncorrected synthetic-psi value")
+            .cost
+    }
+
+    #[test]
+    fn psi_value_bridge_corrects_nonstationary_inner_mode_2305() {
+        let y = array![0.4, -0.2, 0.8, 0.1, -0.6, 0.5];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.6, -0.4],
+            [1.0, -0.2, 0.7],
+            [1.0, 0.3, -0.5],
+            [1.0, 0.8, 0.1],
+            [1.0, 1.2, 0.6],
+        ];
+        let s = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.15], [0.0, 0.15, 0.8]];
+        let cfg = RemlConfig::external(gaussian_identity_glm_spec(), 1e-12, false);
+        let state = build_logit_state(&y, &w, &x, &s, &cfg);
+        let rho = array![0.2];
+        let base = state.obtain_eval_bundle(&rho).expect("base inner mode");
+        let residual = array![0.18, -0.11, 0.07];
+        let capped = bundle_with_inner_kkt_residual(&base, residual);
+
+        let corrected = state
+            .evaluate_unified_value_only_with_synthetic_ext_count(&rho, &capped, 1, false)
+            .expect("psi value with inner-KKT correction")
+            .cost;
+        let exact_kkt_assumption =
+            evaluate_synthetic_psi_value_without_inner_kkt(&state, &rho, &capped);
+
+        assert!(
+            corrected < exact_kkt_assumption - 1e-10,
+            "a nonstationary inner residual must lower the psi objective by its positive \
+             Newton-decrement correction: corrected={corrected:.12e}, \
+             exact-kkt={exact_kkt_assumption:.12e}"
+        );
+    }
+
+    #[test]
+    fn psi_value_bridge_correction_vanishes_at_stationarity_2305() {
+        let y = array![0.4, -0.2, 0.8, 0.1, -0.6, 0.5];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.6, -0.4],
+            [1.0, -0.2, 0.7],
+            [1.0, 0.3, -0.5],
+            [1.0, 0.8, 0.1],
+            [1.0, 1.2, 0.6],
+        ];
+        let s = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.15], [0.0, 0.15, 0.8]];
+        let cfg = RemlConfig::external(gaussian_identity_glm_spec(), 1e-12, false);
+        let state = build_logit_state(&y, &w, &x, &s, &cfg);
+        let rho = array![0.2];
+        let base = state.obtain_eval_bundle(&rho).expect("base inner mode");
+        let stationary = bundle_with_inner_kkt_residual(&base, Array1::zeros(x.ncols()));
+
+        let corrected = state
+            .evaluate_unified_value_only_with_synthetic_ext_count(&rho, &stationary, 1, false)
+            .expect("stationary psi value with correction enabled")
+            .cost;
+        let exact_kkt_assumption =
+            evaluate_synthetic_psi_value_without_inner_kkt(&state, &rho, &stationary);
+
+        assert_eq!(
+            corrected, exact_kkt_assumption,
+            "the generic inner-KKT correction must be exactly zero at a stationary inner mode"
+        );
+    }
+
     #[test]
     fn repeated_penalty_ranges_keep_analytic_outer_hessian() {
         let y = array![0.2, -0.1, 0.3, 0.0];

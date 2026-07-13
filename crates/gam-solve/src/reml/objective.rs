@@ -951,7 +951,7 @@ impl<'a> RemlState<'a> {
 
     /// The penalized inner KKT residual `r = ∇_β L_pen(β̂)` at the accepted
     /// P-IRLS iterate, in the STABLE/TRANSFORMED coefficient basis, for engaging
-    /// the inner-KKT envelope correction `Ṽ = V − ½·rᵀH⁻¹r` on the flexible-link
+    /// the inner-KKT envelope correction `Ṽ = V − ½·rᵀH⁻¹r` on design-moving
     /// outer paths (ψ/anisotropy and flexible-link coordinates).
     ///
     /// The correction is engaged UNCONDITIONALLY whenever the residual is
