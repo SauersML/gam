@@ -1153,7 +1153,7 @@ impl SurvivalMarginalSlopeFamily {
             objective_psi_psi,
             score_psi_psi,
             hessian_psi_psi: Array2::zeros((0, 0)),
-            hessian_psi_psi_operator: Some(Box::new(hessian.into_operator(slices))),
+            hessian_psi_psi_operator: Some(Arc::new(hessian.into_operator(slices))),
         }))
     }
 
