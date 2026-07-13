@@ -358,14 +358,11 @@ impl Order2GraphWorkspace {
                         if curvature_scale == 0.0 {
                             continue;
                         }
-                        for_each_supported_upper(
-                            tape.nodes[input].support,
-                            |primary, other| {
-                                out.h[primary][other] += curvature_scale
-                                    * tape.gradients[input * K + primary]
-                                    * tape.gradients[input * K + other];
-                            },
-                        );
+                        for_each_supported_upper(tape.nodes[input].support, |primary, other| {
+                            out.h[primary][other] += curvature_scale
+                                * tape.gradients[input * K + primary]
+                                * tape.gradients[input * K + other];
+                        });
                     }
                 }
                 CurvatureEvent::Projected {
@@ -486,13 +483,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         assert_eq!(dimension, K, "compiled graph dimension mismatch");
         let tape = workspace.tape_mut();
         let edge_start = tape.edge_len;
-        let node = Order2GraphWorkspace::push(
-            tape,
-            c,
-            0,
-            [0.0; K],
-            edge_start,
-        );
+        let node = Order2GraphWorkspace::push(tape, c, 0, [0.0; K], edge_start);
         Self { workspace, node }
     }
 
@@ -504,13 +495,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         gradient[axis] = 1.0;
         let tape = workspace.tape_mut();
         let edge_start = tape.edge_len;
-        let node = Order2GraphWorkspace::push(
-            tape,
-            x,
-            1_u16 << axis,
-            gradient,
-            edge_start,
-        );
+        let node = Order2GraphWorkspace::push(tape, x, 1_u16 << axis, gradient, edge_start);
         Self { workspace, node }
     }
 
@@ -570,8 +555,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         let curvature_start = {
             let tape = workspace.tape_mut();
             assert!(
-                curvature_len
-                    <= MAX_PROJECTED_CURVATURE_VALUES - tape.projected_curvature_len,
+                curvature_len <= MAX_PROJECTED_CURVATURE_VALUES - tape.projected_curvature_len,
                 "compiled graph projected-curvature capacity exceeded"
             );
             let start = tape.projected_curvature_len;
