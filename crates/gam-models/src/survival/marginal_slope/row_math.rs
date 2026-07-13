@@ -1359,7 +1359,7 @@ mod tests {
         }
 
         fn backend_name(&self) -> &'static str {
-            match self.backend {
+            match &self.backend {
                 RigidVectorRowBackend::Fixed => "fixed",
                 RigidVectorRowBackend::Graph(_) => "graph",
                 RigidVectorRowBackend::Dynamic(_) => "dynamic",
@@ -2039,8 +2039,7 @@ mod tests {
         let scores = [-1.2, 0.65, 1.4];
 
         for &(label, covariance, event, q0, q1, qd1, probit_scale) in &cases {
-            let mut workspace =
-                RigidVectorRowWorkspace::new(3).expect("k=3 production workspace");
+            let mut workspace = RigidVectorRowWorkspace::new(3).expect("k=3 production workspace");
             let mut dynamic_arena = DynamicJetArena::new();
             let evaluate_production = |workspace: &mut RigidVectorRowWorkspace| {
                 row_primary_closed_form_vector(
