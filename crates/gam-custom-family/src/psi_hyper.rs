@@ -941,6 +941,36 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     }
     let rho_penalty_cache = Arc::new(rho_penalty_reservation.bind(rho_penalty_cache));
 
+    // A family-owned coordinate changes likelihood geometry directly.  Every
+    // pair touching one therefore requires explicit V_ij/g_ij/H_ij coverage;
+    // treating a missing pair as zero would silently certify a different
+    // objective.  Probe coverage while this constructor can still return a
+    // typed error.  The immutable workspace may cache the corresponding row
+    // program, so the callback's later lookup remains cheap.
+    for i in 0..hyper_layout.len() {
+        for j in i..hyper_layout.len() {
+            if hyper_layout.family_axis(i).is_none() && hyper_layout.family_axis(j).is_none() {
+                continue;
+            }
+            let pair = if let Some(workspace) = psi_workspace.as_ref() {
+                workspace.second_order_terms(i, j)?
+            } else {
+                family.exact_newton_joint_psisecond_order_terms(
+                    synced_states,
+                    specs,
+                    &hyper_layout,
+                    i,
+                    j,
+                )?
+            };
+            if pair.is_none() {
+                return Err(format!(
+                    "typed family hyper pair ({i}, {j}) has no exact V_ij/g_ij/H_ij terms"
+                ));
+            }
+        }
+    }
+
     // ψ-ψ pair callback
     let ext_ext = {
         let per_block_lambdas = Arc::clone(&per_block_lambdas);
