@@ -37,7 +37,9 @@ pub enum SaeBasisResolution {
 pub enum SaeReferenceMetricPlan {
     UnitCircle,
     SphereChart,
-    /// Flat rectangular torus with log aspect `tau`; `tau = 0` is square.
+    /// Flat rectangular torus with aspect `A = cosh(tau) >= 1`; `tau = 0`
+    /// is square. This is the exact flat comparator for the donut at the same
+    /// `tau` and therefore the same aspect.
     FlatRectangularTorus { tau: f64 },
     /// Embedded donut torus with aspect `A = cosh(tau) > 1`.
     EmbeddedDonutTorus { tau: f64 },
@@ -87,10 +89,10 @@ impl SaeAtomGeometryPlan {
             ) => true,
             (
                 SaeAtomBasisKind::Torus,
-                2..,
+                2,
                 SaeBasisResolution::TorusHarmonics { per_axis_order },
                 SaeReferenceMetricPlan::FlatRectangularTorus { tau },
-            ) => *per_axis_order >= 1 && tau.is_finite(),
+            ) => *per_axis_order >= 1 && tau.is_finite() && *tau >= 0.0,
             (
                 SaeAtomBasisKind::Torus,
                 2,

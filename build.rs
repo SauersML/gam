@@ -4769,6 +4769,60 @@ const PRODUCTION_DERIVATIVE_SPECIALIZATIONS: &[DerivativeSpecialization] = &[
         retired_identities: &[],
     },
     DerivativeSpecialization {
+        family: "survival marginal-slope FLEX",
+        kind: DerivativeSpecializationKind::Bespoke,
+        production_sources: &[
+            DerivativeAnchorSet {
+                path: "crates/gam-models/src/survival/marginal_slope/timepoint_exact/flex_jet.rs",
+                anchors: &[
+                    "trait FlexJet: JetField + Clone {",
+                    "struct FlexOuterPlan {",
+                    "fn flex_row_nll<J: FlexJet>(",
+                    "fn lower_flex_outer_plan_order2(",
+                    "fn flex_timepoint_inputs_generic<J: FlexJet + MomentTerm>(",
+                    "pub(crate) fn flex_row_nll_value_grad_hess(",
+                    "pub(crate) fn flex_row_nll_third_contracted(",
+                    "pub(crate) fn flex_row_nll_fourth_contracted(",
+                    "pub(crate) fn compute_survival_timepoint_exact_jet(",
+                    "pub(crate) fn compute_survival_timepoint_first_order_exact(",
+                    "pub(crate) fn compute_survival_timepoint_directional_jet_from_cached(",
+                    "pub(crate) fn compute_survival_timepoint_bidirectional_jet_from_cached(",
+                ],
+            },
+            DerivativeAnchorSet {
+                path: "crates/gam-models/src/survival/marginal_slope/flex_sensitivity.rs",
+                anchors: &[
+                    "let entry = self.compute_survival_timepoint_first_order_exact(",
+                    "let (row_nll, grad, _) = self.flex_row_nll_value_grad_hess(",
+                    "let entry = self.compute_survival_timepoint_exact_jet(",
+                    "let (row_nll, grad, hess) = self.flex_row_nll_value_grad_hess(",
+                ],
+            },
+            DerivativeAnchorSet {
+                path: "crates/gam-models/src/survival/marginal_slope/timepoint_exact/contracted.rs",
+                anchors: &[
+                    ".compute_survival_timepoint_directional_jet_from_cached(",
+                    "self.flex_row_nll_third_contracted(",
+                    "let entry_bi = self.compute_survival_timepoint_bidirectional_jet_from_cached(",
+                    "self.flex_row_nll_fourth_contracted(",
+                ],
+            },
+        ],
+        discovery_anchor: "fn flex_row_nll<J: FlexJet>(",
+        parity_pins: &[DerivativeAnchorSet {
+            path: "crates/gam-models/src/survival/marginal_slope/timepoint_exact/flex_jet.rs",
+            anchors: &[
+                "fn compiled_order2_row_nll_matches_generic_plan()",
+                "fn flex_timepoint_first_order_matches_jet2_and_fd_932()",
+                "fn flex_timepoint_inputs_jet3_directional_matches_hand_932()",
+                "fn flex_timepoint_inputs_jet4_bidirectional_matches_hand_932()",
+                "fn flex_timepoint_inputs_nested_dual_matches_jet4_contraction_932()",
+                "fn flex_timepoint_inputs_ghw_jet3_jet4_match_hand_932()",
+            ],
+        }],
+        retired_identities: &[],
+    },
+    DerivativeSpecialization {
         family: "multinomial Fisher",
         kind: DerivativeSpecializationKind::Bespoke,
         production_sources: &[DerivativeAnchorSet {

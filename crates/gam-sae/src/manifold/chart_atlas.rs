@@ -162,8 +162,19 @@ impl UnitSpeedChartTransition {
     }
 }
 
-/// Exact ambient isometry between two `latent_dim = 2` sphere charts (#1890
-/// pole seams).
+/// Provenance of an orthogonal sphere-chart transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SphereTransitionProvenance {
+    /// The map is derived analytically from the chart definitions and may
+    /// contribute an exact orientation cocycle sign.
+    Analytic,
+    /// The map is a polar factor fitted from decoder frames. Orthogonality of
+    /// the stored matrix does not turn its estimated sign into an exact fact.
+    Fitted,
+}
+
+/// Ambient isometry between two `latent_dim = 2` sphere charts (#1890 pole
+/// seams), with analytic-versus-fitted provenance retained in the type.
 ///
 /// Two lat/lon charts covering ONE ambient sphere with their poles in each
 /// other's interior are related by an ambient rotation `R ∈ O(3)` acting on the
@@ -185,15 +196,48 @@ pub struct SphereChartTransition {
     /// unit vector to `to_chart`'s: `u_to = R · u_from`.
     pub rotation: [[f64; 3]; 3],
     pub seam_kind: AtlasSeamKind,
+    pub provenance: SphereTransitionProvenance,
 }
 
 impl SphereChartTransition {
-    #[must_use = "transition validation errors must be handled"]
-    pub fn new(
+    #[must_use = "analytic transition validation errors must be handled"]
+    pub fn new_analytic(
         from_chart: usize,
         to_chart: usize,
         rotation: [[f64; 3]; 3],
         seam_kind: AtlasSeamKind,
+    ) -> Result<Self, String> {
+        Self::validate(
+            from_chart,
+            to_chart,
+            rotation,
+            seam_kind,
+            SphereTransitionProvenance::Analytic,
+        )
+    }
+
+    #[must_use = "fitted transition validation errors must be handled"]
+    pub fn new_fitted(
+        from_chart: usize,
+        to_chart: usize,
+        rotation: [[f64; 3]; 3],
+        seam_kind: AtlasSeamKind,
+    ) -> Result<Self, String> {
+        Self::validate(
+            from_chart,
+            to_chart,
+            rotation,
+            seam_kind,
+            SphereTransitionProvenance::Fitted,
+        )
+    }
+
+    fn validate(
+        from_chart: usize,
+        to_chart: usize,
+        rotation: [[f64; 3]; 3],
+        seam_kind: AtlasSeamKind,
+        provenance: SphereTransitionProvenance,
     ) -> Result<Self, String> {
         if from_chart == to_chart {
             return Err("sphere chart transition cannot be a self-edge".to_string());
@@ -226,6 +270,7 @@ impl SphereChartTransition {
             to_chart,
             rotation,
             seam_kind,
+            provenance,
         })
     }
 
@@ -241,11 +286,13 @@ impl SphereChartTransition {
         Self::determinant_of(&self.rotation)
     }
 
-    /// Orientation contribution to the sign cocycle: `+1` for a proper rotation
-    /// (`det R > 0`), `-1` for a reflection.
+    /// Exact orientation contribution when and only when the seam is analytic.
+    /// A fitted polar factor deliberately returns `None` even though its
+    /// numerical determinant is ±1.
     #[must_use]
-    pub fn sign(&self) -> i8 {
-        if self.determinant() >= 0.0 { 1 } else { -1 }
+    pub fn analytic_sign(&self) -> Option<i8> {
+        matches!(self.provenance, SphereTransitionProvenance::Analytic)
+            .then(|| if self.determinant() >= 0.0 { 1 } else { -1 })
     }
 
     /// Apply the exact ambient rotation to a unit vector.
@@ -273,6 +320,7 @@ impl SphereChartTransition {
             to_chart: self.from_chart,
             rotation: transpose,
             seam_kind: self.seam_kind,
+            provenance: self.provenance,
         }
     }
 
@@ -306,6 +354,13 @@ impl SphereChartTransition {
                 AtlasSeamKind::Pole
             } else {
                 AtlasSeamKind::Regular
+            },
+            provenance: if matches!(self.provenance, SphereTransitionProvenance::Analytic)
+                && matches!(next.provenance, SphereTransitionProvenance::Analytic)
+            {
+                SphereTransitionProvenance::Analytic
+            } else {
+                SphereTransitionProvenance::Fitted
             },
         })
     }
@@ -410,7 +465,21 @@ impl ManifoldChartAtlas {
             .chain(
                 self.sphere_transitions
                     .iter()
-                    .map(|t| (t.from_chart, t.to_chart, t.sign())),
+                    .filter_map(|t| {
+                        t.analytic_sign()
+                            .map(|sign| (t.from_chart, t.to_chart, sign))
+                    }),
+            )
+    }
+
+    fn transition_edges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.transitions
+            .iter()
+            .map(|transition| (transition.from_chart, transition.to_chart))
+            .chain(
+                self.sphere_transitions
+                    .iter()
+                    .map(|transition| (transition.from_chart, transition.to_chart)),
             )
     }
 
@@ -532,7 +601,8 @@ impl ManifoldChartAtlas {
             a.from_chart
                 .cmp(&b.from_chart)
                 .then(a.to_chart.cmp(&b.to_chart))
-                .then(a.sign().cmp(&b.sign()))
+                .then((a.provenance as u8).cmp(&(b.provenance as u8)))
+                .then(a.determinant().total_cmp(&b.determinant()))
                 .then((a.seam_kind as u8).cmp(&(b.seam_kind as u8)))
                 .then_with(|| {
                     for (x, y) in a.rotation.iter().flatten().zip(b.rotation.iter().flatten()) {
@@ -556,7 +626,7 @@ impl ManifoldChartAtlas {
         if self.transition_count() == 0 {
             return Err("a chart atlas requires at least one transition".to_string());
         }
-        for (from, to, _) in self.signed_edges() {
+        for (from, to) in self.transition_edges() {
             if !self.contains_chart(from) || !self.contains_chart(to) {
                 return Err("atlas transition endpoint is not an atlas chart".to_string());
             }
@@ -566,7 +636,7 @@ impl ManifoldChartAtlas {
         let mut reached = BTreeSet::from([self.charts[0]]);
         let mut queue = VecDeque::from([self.charts[0]]);
         while let Some(chart) = queue.pop_front() {
-            for (from, to, _) in self.signed_edges() {
+            for (from, to) in self.transition_edges() {
                 let next = if from == chart {
                     Some(to)
                 } else if to == chart {
@@ -591,7 +661,14 @@ impl ManifoldChartAtlas {
     /// propagated across the transition graph; a contradictory revisit is
     /// exactly a negative-holonomy cycle and therefore the Möbius obstruction.
     #[must_use]
-    pub fn orientability(&self) -> AtlasOrientability {
+    pub fn orientability(&self) -> Option<AtlasOrientability> {
+        if self
+            .sphere_transitions
+            .iter()
+            .any(|transition| transition.analytic_sign().is_none())
+        {
+            return None;
+        }
         let mut orientation = BTreeMap::new();
         let root = self.charts[0];
         orientation.insert(root, 1_i8);
@@ -609,7 +686,7 @@ impl ManifoldChartAtlas {
                 let required = here * sign;
                 match orientation.get(&next) {
                     Some(&existing) if existing != required => {
-                        return AtlasOrientability::NonOrientable;
+                        return Some(AtlasOrientability::NonOrientable);
                     }
                     Some(_) => {}
                     None => {
@@ -619,7 +696,7 @@ impl ManifoldChartAtlas {
                 }
             }
         }
-        AtlasOrientability::Orientable
+        Some(AtlasOrientability::Orientable)
     }
 
     /// Factor the chart gates on one row into `(atlas activation, partition of
@@ -925,14 +1002,14 @@ mod tests {
         let mut interval_cover = ManifoldChartAtlas::from_transition(tr(0, 1, -1, 0.0)).unwrap();
         assert_eq!(
             interval_cover.orientability(),
-            AtlasOrientability::Orientable
+            Some(AtlasOrientability::Orientable)
         );
 
         interval_cover.add_transition(tr(1, 2, 1, 0.0)).unwrap();
         interval_cover.add_transition(tr(2, 0, 1, 0.0)).unwrap();
         assert_eq!(
             interval_cover.orientability(),
-            AtlasOrientability::NonOrientable,
+            Some(AtlasOrientability::NonOrientable),
             "the cycle sign product is -1: the atlas has Möbius holonomy"
         );
     }
@@ -955,7 +1032,7 @@ mod tests {
         left.merge_with_transition(right, tr(1, 2, 1, 0.3)).unwrap();
         assert_eq!(left.charts(), &[0, 1, 2, 3]);
         assert_eq!(left.transitions().len(), 3);
-        assert_eq!(left.orientability(), AtlasOrientability::Orientable);
+        assert_eq!(left.orientability(), Some(AtlasOrientability::Orientable));
     }
 
     #[test]
@@ -963,23 +1040,45 @@ mod tests {
         let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let reflection = [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         assert_eq!(
-            SphereChartTransition::new(0, 1, identity, AtlasSeamKind::Pole)
+            SphereChartTransition::new_analytic(0, 1, identity, AtlasSeamKind::Pole)
                 .unwrap()
-                .sign(),
-            1
+                .analytic_sign(),
+            Some(1)
         );
         assert_eq!(
-            SphereChartTransition::new(0, 1, reflection, AtlasSeamKind::Pole)
+            SphereChartTransition::new_analytic(0, 1, reflection, AtlasSeamKind::Pole)
                 .unwrap()
-                .sign(),
-            -1
+                .analytic_sign(),
+            Some(-1)
         );
 
         let mut fitted_but_not_exact = identity;
         fitted_but_not_exact[0][0] += 1.0e-8;
         assert!(
-            SphereChartTransition::new(0, 1, fitted_but_not_exact, AtlasSeamKind::Pole).is_err(),
+            SphereChartTransition::new_fitted(
+                0,
+                1,
+                fitted_but_not_exact,
+                AtlasSeamKind::Pole,
+            )
+            .is_err(),
             "a fitted approximate rotation must use the statistical certificate path"
         );
+    }
+
+    #[test]
+    fn fitted_sphere_transition_cannot_enter_the_analytic_sign_cocycle() {
+        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let fitted =
+            SphereChartTransition::new_fitted(0, 1, identity, AtlasSeamKind::Pole).unwrap();
+        assert_eq!(fitted.analytic_sign(), None);
+        let atlas = ManifoldChartAtlas::from_sphere_transition(fitted).unwrap();
+        assert_eq!(atlas.orientability(), None);
+
+        let analytic =
+            SphereChartTransition::new_analytic(0, 1, identity, AtlasSeamKind::Pole).unwrap();
+        assert_eq!(analytic.analytic_sign(), Some(1));
+        let atlas = ManifoldChartAtlas::from_sphere_transition(analytic).unwrap();
+        assert_eq!(atlas.orientability(), Some(AtlasOrientability::Orientable));
     }
 }

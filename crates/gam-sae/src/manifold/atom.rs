@@ -361,6 +361,10 @@ pub struct SaeManifoldAtom {
     pub smooth_penalty: Array2<f64>,
     /// Which explicit declaration produced [`Self::smooth_penalty`].
     pub reference_roughness_kind: SaeReferenceRoughnessKind,
+    /// Persisted analytic geometry authority for atoms built by the native
+    /// lifecycle. Hand-assembled/precomputed atoms may omit it, but an atom
+    /// without this plan cannot be serialized for analytic rebuild or OOS.
+    pub geometry_plan: Option<SaeAtomGeometryPlan>,
     pub basis_evaluator: Option<Arc<dyn SaeBasisEvaluator>>,
     /// Same evaluator upcast to `dyn SaeBasisSecondJet` when the
     /// implementation provides a closed-form Hessian. `None` for
@@ -494,6 +498,7 @@ impl SaeManifoldAtom {
             smooth_penalty,
             reference_roughness_kind,
             basis_jacobian,
+            geometry_plan: None,
             basis_evaluator: None,
             basis_second_jet: None,
             decoder_frame: None,
@@ -655,6 +660,30 @@ impl SaeManifoldAtom {
         self.basis_evaluator = Some(evaluator);
         self.basis_second_jet = None;
         self
+    }
+
+    /// Attach the exact geometry plan used to build this atom. The plan's kind,
+    /// latent dimension, and derived full width must agree; there is no width or
+    /// harmonic-order inference from the realized arrays.
+    pub fn with_geometry_plan(mut self, plan: SaeAtomGeometryPlan) -> Result<Self, String> {
+        if plan.kind() != &self.basis_kind || plan.latent_dim() != self.latent_dim {
+            return Err(format!(
+                "SaeManifoldAtom::with_geometry_plan: plan ({:?}, dim={}) disagrees with atom ({:?}, dim={})",
+                plan.kind(),
+                plan.latent_dim(),
+                self.basis_kind,
+                self.latent_dim
+            ));
+        }
+        let planned_width = plan.basis_size()?;
+        if planned_width != self.full_basis_size() {
+            return Err(format!(
+                "SaeManifoldAtom::with_geometry_plan: plan width {planned_width} disagrees with atom full width {}",
+                self.full_basis_size()
+            ));
+        }
+        self.geometry_plan = Some(plan);
+        Ok(self)
     }
 
     /// Install an evaluator that additionally exposes a closed-form

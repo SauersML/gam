@@ -825,10 +825,12 @@ class AtlasNerveDiagram:
     the reduced nerve complex. ``nerve_euler_characteristic`` is the exact
     alternating sum of those admitted simplices; it is deliberately distinct
     from ``certified_euler_characteristic``, which is populated only by a
-    finite-sample Gauss--Bonnet certificate. Sparse routing alone has no
-    independent PCA split or population spectral bounds, so its holonomy status
-    remains ``not_analyzed`` and its topology cannot be promoted to a standard
-    name.
+    finite-sample Gauss--Bonnet certificate. The standalone sparse-route entry
+    point has no ambient observations and therefore reports ``not_analyzed``.
+    ``audit_sae`` supplies ambient observations, constructs a deterministic
+    cross-fit in Rust, and returns ``analyzed_refused`` with structured
+    first-order diagnostics until population spectrum/margin and Gaussian-law
+    authorities are supplied. A refusal is never a negative topology result.
     """
 
     computed: bool
@@ -844,7 +846,8 @@ class AtlasNerveDiagram:
     good_cover_certified: bool | None = None
     holonomy_status: str | None = None
     holonomy_provenance: str | None = None
-    holonomy_missing_inputs: str | None = None
+    holonomy_missing_inputs: list[str] | None = None
+    holonomy_analysis: dict[str, Any] | None = None
     certified_orientability: str | None = None
     topology_promotion: dict[str, bool | str | float] | None = None
     sampled_support_size: int | None = None
@@ -909,7 +912,12 @@ def atlas_nerve_diagram(
         holonomy_missing_inputs=(
             None
             if payload["holonomy_missing_inputs"] is None
-            else str(payload["holonomy_missing_inputs"])
+            else [str(value) for value in payload["holonomy_missing_inputs"]]
+        ),
+        holonomy_analysis=(
+            None
+            if payload["holonomy_analysis"] is None
+            else dict(payload["holonomy_analysis"])
         ),
         certified_orientability=(
             None

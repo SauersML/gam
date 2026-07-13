@@ -189,7 +189,9 @@ def test_atlas_nerve_diagram_smoke():
     assert report.good_cover_certified is False
     assert report.holonomy_status == "not_analyzed"
     assert report.holonomy_provenance is None
-    assert report.holonomy_missing_inputs is not None
+    assert isinstance(report.holonomy_missing_inputs, list)
+    assert report.holonomy_missing_inputs
+    assert report.holonomy_analysis is None
     assert report.certified_orientability is None
     assert report.topology_promotion["certified"] is False
     assert report.topology_promotion["kind"] == "graph"

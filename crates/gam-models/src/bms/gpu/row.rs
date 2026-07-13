@@ -524,13 +524,15 @@ extern "C" __global__ void bms_flex_row_kernel(
     // ── per-cell sweep ───────────────────────────────────────────────────
     unsigned int cell_lo = cell_offsets[row];
     unsigned int cell_hi = cell_offsets[row + 1];
-    int n_cells = (int)(cell_hi - cell_lo);
+    unsigned int n_cells = cell_hi - cell_lo;
 
     double local_Fa  = 0.0;
     double local_Faa = 0.0;
 
-    for (int local_c = tid; local_c < n_cells; local_c += blockDim.x) {
-        unsigned int c = cell_lo + (unsigned int)local_c;
+    for (unsigned int local_c = (unsigned int)tid;
+         local_c < n_cells;
+         local_c += (unsigned int)blockDim.x) {
+        unsigned int c = cell_lo + local_c;
 
         // Load cubic predictor coeffs C0..C3.
         double C[4];
@@ -1332,8 +1334,8 @@ extern "C" __global__ void bms_flex_row_hvp_partial(
     int chunk = blockIdx.x;
     int tid   = threadIdx.x;
     int row_lo = chunk * rows_per_cta;
-    int row_hi = row_lo + rows_per_cta;
-    if (row_hi > n_rows) row_hi = n_rows;
+    int remaining_rows = n_rows - row_lo;
+    int row_hi = row_lo + (remaining_rows < rows_per_cta ? remaining_rows : rows_per_cta);
 
     // Zero this chunk's partial slice cooperatively.
     double *out = partial + (size_t)chunk * (size_t)p_total;
@@ -1456,8 +1458,8 @@ extern "C" __global__ void bms_flex_row_joint_gradient_partial(
     int chunk = blockIdx.x;
     int tid = threadIdx.x;
     int row_lo = chunk * rows_per_cta;
-    int row_hi = row_lo + rows_per_cta;
-    if (row_hi > n_rows) row_hi = n_rows;
+    int remaining_rows = n_rows - row_lo;
+    int row_hi = row_lo + (remaining_rows < rows_per_cta ? remaining_rows : rows_per_cta);
     int output_width = p_total + 1;
     double *out = partial + (size_t)chunk * (size_t)output_width;
 
@@ -1536,10 +1538,10 @@ extern "C" __global__ void bms_flex_row_hvp_multi_partial(
     int chunk = blockIdx.x;
     int tid   = threadIdx.x;
     int row_lo = chunk * rows_per_cta;
-    int row_hi = row_lo + rows_per_cta;
-    if (row_hi > n_rows) row_hi = n_rows;
+    int remaining_rows = n_rows - row_lo;
+    int row_hi = row_lo + (remaining_rows < rows_per_cta ? remaining_rows : rows_per_cta);
 
-    int num_chunks = (n_rows + rows_per_cta - 1) / rows_per_cta;
+    int num_chunks = 1 + (n_rows - 1) / rows_per_cta;
     for (int idx = tid; idx < rhs_count * p_total; idx += blockDim.x) {
         int rhs = idx / p_total;
         int j = idx - rhs * p_total;
@@ -1670,8 +1672,8 @@ extern "C" __global__ void bms_flex_row_diag_partial(
     int chunk = blockIdx.x;
     int tid   = threadIdx.x;
     int row_lo = chunk * rows_per_cta;
-    int row_hi = row_lo + rows_per_cta;
-    if (row_hi > n_rows) row_hi = n_rows;
+    int remaining_rows = n_rows - row_lo;
+    int row_hi = row_lo + (remaining_rows < rows_per_cta ? remaining_rows : rows_per_cta);
 
     double *out = partial + (size_t)chunk * (size_t)p_total;
     for (int j = tid; j < p_total; j += blockDim.x) {
@@ -1758,8 +1760,8 @@ extern "C" __global__ void bms_flex_row_dense_block_partial(
     int chunk = blockIdx.x;
     int tid   = threadIdx.x;
     int row_lo = chunk * rows_per_cta;
-    int row_hi = row_lo + rows_per_cta;
-    if (row_hi > n_rows) row_hi = n_rows;
+    int remaining_rows = n_rows - row_lo;
+    int row_hi = row_lo + (remaining_rows < rows_per_cta ? remaining_rows : rows_per_cta);
 
     int pp = p_total * p_total;
     double *acc = shmem; // CTA-private accumulator [p_total, p_total]
@@ -2188,12 +2190,24 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
     drop(d_tau);
     drop(d_ruv);
 
-    let bytes = ((n
-        + n * r
-        + n * r * r
-        + marginal_design_row_major.len()
-        + logslope_design_row_major.len())
-        * std::mem::size_of::<f64>()) as u64;
+    let resident_elements = n
+        .checked_add(nr)
+        .and_then(|value| value.checked_add(nrr))
+        .and_then(|value| value.checked_add(marginal_len))
+        .and_then(|value| value.checked_add(logslope_len))
+        .ok_or_else(|| GpuError::DriverCallFailed {
+            reason: "bms_flex_row device-resident: resident element count overflow".to_string(),
+        })?;
+    let resident_bytes = resident_elements
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or_else(|| GpuError::DriverCallFailed {
+            reason: "bms_flex_row device-resident: resident byte count overflow".to_string(),
+        })?;
+    let bytes = u64::try_from(resident_bytes).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!(
+            "bms_flex_row device-resident: resident bytes={resident_bytes} exceed u64 range"
+        ),
+    })?;
     Ok(DeviceResidentRowHess {
         neglog: d_neglog,
         grad: d_grad,
@@ -2230,7 +2244,7 @@ pub(crate) fn launch_bms_flex_row_joint_gradient(
 
     let backend = HvpKernelBackend::probe()?;
     let stream = backend.stream.clone();
-    let args = PreparedBmsFlexRowLaunchArgs::from_storage(storage);
+    let args = PreparedBmsFlexRowLaunchArgs::from_storage(storage)?;
     let partial_len = args
         .num_chunks
         .checked_mul(output_width)
@@ -2408,58 +2422,101 @@ pub(crate) struct PreparedBmsFlexRowLaunchArgs {
     pub(crate) w_primary_start: i32,
     pub(crate) rows_per_cta: i32,
     pub(crate) num_chunks: usize,
+    pub(crate) num_chunks_i32: i32,
+    pub(crate) num_chunks_u32: u32,
+    pub(crate) p_total_u32: u32,
 }
 
 #[cfg(target_os = "linux")]
 impl PreparedBmsFlexRowLaunchArgs {
-    pub(crate) fn from_storage(storage: &DeviceResidentRowHess) -> Self {
+    pub(crate) fn from_storage(storage: &DeviceResidentRowHess) -> Result<Self, GpuError> {
+        if storage.n == 0 {
+            return Err(GpuError::DriverCallFailed {
+                reason: "bms_flex_row launch: n_rows must be > 0".to_string(),
+            });
+        }
+        if storage.r < 2 {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!("bms_flex_row launch: r={} must be >= 2", storage.r),
+            });
+        }
         let p_total = storage.block.p_total;
+        if p_total == 0 {
+            return Err(GpuError::DriverCallFailed {
+                reason: "bms_flex_row launch: p_total must be > 0".to_string(),
+            });
+        }
         let num_chunks = num_hvp_chunks(storage.n);
-        PreparedBmsFlexRowLaunchArgs {
-            n_i32: storage.n as i32,
-            r_i32: storage.r as i32,
-            p_m_i32: storage.block.p_m as i32,
-            p_g_i32: storage.block.p_g as i32,
-            p_total_i32: p_total as i32,
+        let to_i32 = |name: &str, value: usize| {
+            i32::try_from(value).map_err(|_| GpuError::DriverCallFailed {
+                reason: format!("bms_flex_row launch: {name}={value} exceeds i32 range"),
+            })
+        };
+        let to_u32 = |name: &str, value: usize| {
+            u32::try_from(value).map_err(|_| GpuError::DriverCallFailed {
+                reason: format!("bms_flex_row launch: {name}={value} exceeds u32 range"),
+            })
+        };
+        Ok(PreparedBmsFlexRowLaunchArgs {
+            n_i32: to_i32("n_rows", storage.n)?,
+            r_i32: to_i32("r", storage.r)?,
+            p_m_i32: to_i32("p_m", storage.block.p_m)?,
+            p_g_i32: to_i32("p_g", storage.block.p_g)?,
+            p_total_i32: to_i32("p_total", p_total)?,
             h_block_start: storage
                 .block
                 .h
                 .as_ref()
-                .map(|r| r.start as i32)
+                .map(|range| to_i32("h_block_start", range.start))
+                .transpose()?
                 .unwrap_or(0),
             h_block_len: storage
                 .block
                 .h
                 .as_ref()
-                .map(|r| r.len() as i32)
+                .map(|range| to_i32("h_block_len", range.len()))
+                .transpose()?
                 .unwrap_or(0),
             w_block_start: storage
                 .block
                 .w
                 .as_ref()
-                .map(|r| r.start as i32)
+                .map(|range| to_i32("w_block_start", range.start))
+                .transpose()?
                 .unwrap_or(0),
             w_block_len: storage
                 .block
                 .w
                 .as_ref()
-                .map(|r| r.len() as i32)
+                .map(|range| to_i32("w_block_len", range.len()))
+                .transpose()?
                 .unwrap_or(0),
             h_primary_start: storage
                 .primary
                 .h
                 .as_ref()
-                .map(|r| r.start as i32)
+                .map(|range| to_i32("h_primary_start", range.start))
+                .transpose()?
                 .unwrap_or(0),
             w_primary_start: storage
                 .primary
                 .w
                 .as_ref()
-                .map(|r| r.start as i32)
+                .map(|range| to_i32("w_primary_start", range.start))
+                .transpose()?
                 .unwrap_or(0),
-            rows_per_cta: HVP_ROWS_PER_CTA as i32,
+            rows_per_cta: i32::try_from(HVP_ROWS_PER_CTA).map_err(|_| {
+                GpuError::DriverCallFailed {
+                    reason: format!(
+                        "bms_flex_row launch: rows_per_cta={HVP_ROWS_PER_CTA} exceeds i32 range"
+                    ),
+                }
+            })?,
             num_chunks,
-        }
+            num_chunks_i32: to_i32("num_chunks", num_chunks)?,
+            num_chunks_u32: to_u32("num_chunks", num_chunks)?,
+            p_total_u32: to_u32("p_total", p_total)?,
+        })
     }
 }
 
@@ -2486,11 +2543,15 @@ pub(crate) fn run_bms_flex_row_partial_reduce(
 ) -> Result<(), GpuError> {
     let backend = HvpKernelBackend::probe()?;
     let stream = backend.stream.clone();
-    let args = PreparedBmsFlexRowLaunchArgs::from_storage(storage);
+    let args = PreparedBmsFlexRowLaunchArgs::from_storage(storage)?;
     let p_total = storage.block.p_total;
 
+    let partial_len = checked_shape_len(
+        &format!("{ctx} partial [num_chunks,p_total]"),
+        &[args.num_chunks, p_total],
+    )?;
     let mut d_partial = stream
-        .alloc_zeros::<f64>(args.num_chunks * p_total)
+        .alloc_zeros::<f64>(partial_len)
         .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("bms_flex_row {ctx} alloc partial: {err}"),
         })?;
@@ -2510,7 +2571,7 @@ pub(crate) fn run_bms_flex_row_partial_reduce(
         })?;
 
     let cfg_part = LaunchConfig {
-        grid_dim: (args.num_chunks as u32, 1, 1),
+        grid_dim: (args.num_chunks_u32, 1, 1),
         block_dim: (HVP_THREADS, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -2547,16 +2608,15 @@ pub(crate) fn run_bms_flex_row_partial_reduce(
     })?;
 
     let red_threads: u32 = REDUCTION_THREADS;
-    let red_blocks: u32 = ((p_total as u32) + red_threads - 1) / red_threads;
+    let red_blocks = args.p_total_u32.div_ceil(red_threads);
     let cfg_red = LaunchConfig {
         grid_dim: (red_blocks, 1, 1),
         block_dim: (red_threads, 1, 1),
         shared_mem_bytes: 0,
     };
-    let num_chunks_i32 = args.num_chunks as i32;
     let mut builder = stream.launch_builder(&red_func);
     builder
-        .arg(&num_chunks_i32)
+        .arg(&args.num_chunks_i32)
         .arg(&args.p_total_i32)
         .arg(&d_partial)
         .arg(d_out);
@@ -2657,6 +2717,11 @@ pub(crate) fn validate_bms_flex_row_hvp_multi_shape(
                 "bms_flex_row {ctx}: rhs_count({rhs_count})*p_total({p_total}) overflow"
             ),
         })?;
+    i32::try_from(rhs_elems).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!(
+            "bms_flex_row {ctx}: rhs_count({rhs_count})*p_total({p_total})={rhs_elems} exceeds CUDA int indexing range"
+        ),
+    })?;
     if v_rhs_len != rhs_elems {
         return Err(GpuError::DriverCallFailed {
             reason: format!(
@@ -2714,7 +2779,16 @@ pub fn bms_flex_row_hvp_multi_scratch_bytes_for_shape(
         .ok_or_else(|| GpuError::DriverCallFailed {
             reason: "bms_flex_row hvp_multi_scratch_bytes: element count overflow".to_string(),
         })?;
-    Ok((elems * std::mem::size_of::<f64>()) as u64)
+    let bytes = elems
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or_else(|| GpuError::DriverCallFailed {
+            reason: "bms_flex_row hvp_multi_scratch_bytes: byte count overflow".to_string(),
+        })?;
+    u64::try_from(bytes).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!(
+            "bms_flex_row hvp_multi_scratch_bytes: byte count={bytes} exceeds u64 range"
+        ),
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -2734,7 +2808,7 @@ pub(crate) fn run_bms_flex_row_multi_partial_reduce(
     )?;
     let backend = HvpKernelBackend::probe()?;
     let stream = backend.stream.clone();
-    let args = PreparedBmsFlexRowLaunchArgs::from_storage(storage);
+    let args = PreparedBmsFlexRowLaunchArgs::from_storage(storage)?;
     let p_total = storage.block.p_total;
     let partial_len = rhs_count
         .checked_mul(args.num_chunks)
@@ -2769,7 +2843,7 @@ pub(crate) fn run_bms_flex_row_multi_partial_reduce(
         reason: format!("bms_flex_row {ctx}: rhs_count={rhs_count} exceeds i32 range"),
     })?;
     let cfg_part = LaunchConfig {
-        grid_dim: (args.num_chunks as u32, 1, 1),
+        grid_dim: (args.num_chunks_u32, 1, 1),
         block_dim: (HVP_THREADS, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -2802,16 +2876,18 @@ pub(crate) fn run_bms_flex_row_multi_partial_reduce(
     })?;
 
     let red_threads: u32 = REDUCTION_THREADS;
-    let red_blocks: u32 = ((rhs_elems as u32) + red_threads - 1) / red_threads;
+    let rhs_elems_u32 = u32::try_from(rhs_elems).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row {ctx}: rhs elements={rhs_elems} exceed u32 range"),
+    })?;
+    let red_blocks = rhs_elems_u32.div_ceil(red_threads);
     let cfg_red = LaunchConfig {
         grid_dim: (red_blocks, 1, 1),
         block_dim: (red_threads, 1, 1),
         shared_mem_bytes: 0,
     };
-    let num_chunks_i32 = args.num_chunks as i32;
     let mut builder = stream.launch_builder(&red_func);
     builder
-        .arg(&num_chunks_i32)
+        .arg(&args.num_chunks_i32)
         .arg(&args.p_total_i32)
         .arg(&rhs_count_i32)
         .arg(&d_partial)
@@ -2885,7 +2961,11 @@ fn materialize_dense_from_hvp_batches(
     let mut dense = vec![0.0_f64; dense_len];
     for column_start in (0..p_total).step_by(BMS_FLEX_ROW_HVP_MAX_RHS) {
         let rhs_count = (p_total - column_start).min(BMS_FLEX_ROW_HVP_MAX_RHS);
-        let mut basis = vec![0.0_f64; rhs_count * p_total];
+        let batch_len = checked_shape_len(
+            "dense HVP materialization [rhs_count,p_total]",
+            &[rhs_count, p_total],
+        )?;
+        let mut basis = vec![0.0_f64; batch_len];
         for local_column in 0..rhs_count {
             basis[local_column * p_total + column_start + local_column] = 1.0;
         }
@@ -2910,7 +2990,7 @@ fn materialize_dense_from_hvp_batches(
     Ok(dense)
 }
 
-/// Device-output HVP. Runs `bms_flex_row_hvp_partial(_packed)` +
+/// Device-output HVP. Runs `bms_flex_row_hvp_partial` +
 /// `bms_flex_row_hvp_reduce` on the storage's stream against caller-supplied
 /// device-resident `d_v` (length `p_total` doubles), writing the result into
 /// caller-supplied `d_out` (also `p_total` doubles). **No** `synchronize()`
@@ -3046,15 +3126,16 @@ pub fn launch_bms_flex_row_dense_block(
     }
     let backend = HvpKernelBackend::probe()?;
     let stream = backend.stream.clone();
+    let args = PreparedBmsFlexRowLaunchArgs::from_storage(storage)?;
     let n = storage.n;
-    let r = storage.r;
     let rows_per_cta = DENSE_BLOCK_ROWS_PER_CTA as usize;
     let num_chunks = n.div_ceil(rows_per_cta);
-    let pp = p_total * p_total;
+    let pp = checked_shape_len("dense_block [p_total,p_total]", &[p_total, p_total])?;
+    let partial_len = checked_shape_len("dense_block partial", &[num_chunks, pp])?;
 
     let mut d_partial =
         stream
-            .alloc_zeros::<f64>(num_chunks * pp)
+            .alloc_zeros::<f64>(partial_len)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("bms_flex_row dense_block alloc partial: {err}"),
             })?;
@@ -3077,55 +3158,42 @@ pub fn launch_bms_flex_row_dense_block(
             reason: format!("bms_flex_row dense_block load reduce: {err}"),
         })?;
 
-    let n_i32 = n as i32;
-    let r_i32 = r as i32;
-    let p_m_i32 = storage.block.p_m as i32;
-    let p_g_i32 = storage.block.p_g as i32;
-    let p_total_i32 = p_total as i32;
-    let h_block_start = storage
-        .block
-        .h
-        .as_ref()
-        .map(|r| r.start as i32)
-        .unwrap_or(0);
-    let h_block_len = storage
-        .block
-        .h
-        .as_ref()
-        .map(|r| r.len() as i32)
-        .unwrap_or(0);
-    let w_block_start = storage
-        .block
-        .w
-        .as_ref()
-        .map(|r| r.start as i32)
-        .unwrap_or(0);
-    let w_block_len = storage
-        .block
-        .w
-        .as_ref()
-        .map(|r| r.len() as i32)
-        .unwrap_or(0);
-    let h_primary_start = storage
-        .primary
-        .h
-        .as_ref()
-        .map(|r| r.start as i32)
-        .unwrap_or(0);
-    let w_primary_start = storage
-        .primary
-        .w
-        .as_ref()
-        .map(|r| r.start as i32)
-        .unwrap_or(0);
-    let rows_per_cta_i32 = DENSE_BLOCK_ROWS_PER_CTA as i32;
-    let num_chunks_u32 = num_chunks as u32;
+    let rows_per_cta_i32 = i32::try_from(DENSE_BLOCK_ROWS_PER_CTA).map_err(|_| {
+        GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row dense_block: rows_per_cta={DENSE_BLOCK_ROWS_PER_CTA} exceeds i32 range"
+            ),
+        }
+    })?;
+    let num_chunks_u32 = u32::try_from(num_chunks).map_err(|_| {
+        GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row dense_block: num_chunks={num_chunks} exceeds u32 range"
+            ),
+        }
+    })?;
+    let num_chunks_i32 = i32::try_from(num_chunks).map_err(|_| {
+        GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row dense_block: num_chunks={num_chunks} exceeds i32 range"
+            ),
+        }
+    })?;
+    let pp_u32 = u32::try_from(pp).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row dense_block: p_total²={pp} exceeds u32 range"),
+    })?;
 
     // Per-CTA shmem accumulator: p_total² doubles.
-    let shmem_bytes: u32 =
-        u32::try_from(pp * std::mem::size_of::<f64>()).map_err(|_| GpuError::DriverCallFailed {
+    let shmem_bytes_usize = pp.checked_mul(std::mem::size_of::<f64>()).ok_or_else(|| {
+        GpuError::DriverCallFailed {
+            reason: format!("dense_block shmem bytes overflow for p_total={p_total}"),
+        }
+    })?;
+    let shmem_bytes: u32 = u32::try_from(shmem_bytes_usize).map_err(|_| {
+        GpuError::DriverCallFailed {
             reason: format!("dense_block shmem bytes overflow u32 for p_total={p_total}"),
-        })?;
+        }
+    })?;
 
     let cfg_part = LaunchConfig {
         grid_dim: (num_chunks_u32, 1, 1),
@@ -3134,17 +3202,17 @@ pub fn launch_bms_flex_row_dense_block(
     };
     let mut builder = stream.launch_builder(&part_func);
     builder
-        .arg(&n_i32)
-        .arg(&r_i32)
-        .arg(&p_m_i32)
-        .arg(&p_g_i32)
-        .arg(&p_total_i32)
-        .arg(&h_block_start)
-        .arg(&h_block_len)
-        .arg(&w_block_start)
-        .arg(&w_block_len)
-        .arg(&h_primary_start)
-        .arg(&w_primary_start)
+        .arg(&args.n_i32)
+        .arg(&args.r_i32)
+        .arg(&args.p_m_i32)
+        .arg(&args.p_g_i32)
+        .arg(&args.p_total_i32)
+        .arg(&args.h_block_start)
+        .arg(&args.h_block_len)
+        .arg(&args.w_block_start)
+        .arg(&args.w_block_len)
+        .arg(&args.h_primary_start)
+        .arg(&args.w_primary_start)
         .arg(&rows_per_cta_i32)
         .arg(&storage.hess)
         .arg(&storage.marginal_design)
@@ -3158,17 +3226,16 @@ pub fn launch_bms_flex_row_dense_block(
     })?;
 
     let red_threads: u32 = REDUCTION_THREADS;
-    let red_blocks: u32 = ((pp as u32) + red_threads - 1) / red_threads;
+    let red_blocks = pp_u32.div_ceil(red_threads);
     let cfg_red = LaunchConfig {
         grid_dim: (red_blocks, 1, 1),
         block_dim: (red_threads, 1, 1),
         shared_mem_bytes: 0,
     };
-    let num_chunks_i32 = num_chunks as i32;
     let mut builder = stream.launch_builder(&red_func);
     builder
         .arg(&num_chunks_i32)
-        .arg(&p_total_i32)
+        .arg(&args.p_total_i32)
         .arg(&d_partial)
         .arg(&mut d_out);
     // SAFETY: d_partial just populated, d_out is pp doubles.
@@ -3579,16 +3646,16 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn validate_rejects_r_above_max() {
-        let r = MAX_R + 1;
-        let p_h = (r - 2) / 2;
-        let p_w = (r - 2) - p_h;
+    pub(crate) fn validate_accepts_r33_with_active_h_and_w_blocks() {
+        let r = 33;
+        let p_h = 16;
+        let p_w = 15;
         let buffers = make_buffers(1, r, p_h, p_w);
-        let bad_inputs = BmsFlexRowKernelInputs {
+        let inputs = BmsFlexRowKernelInputs {
             r,
             p_h,
             p_w,
-            rho_u: &buffers.rho_u, // length matches `r` we wrote
+            rho_u: &buffers.rho_u,
             tau_u: &buffers.tau_u,
             r_uv: &buffers.r_uv,
             cell_r: &buffers.cell_r,
@@ -3597,9 +3664,27 @@ mod tests {
             cell_sbw: &buffers.cell_sbw,
             ..minimal_inputs(&buffers)
         };
-        let err = bad_inputs.validate().expect_err("r > MAX_R must fail");
-        let msg = err.to_string();
-        assert!(msg.contains("MAX_R"), "expected MAX_R hint, got: {msg}");
+        inputs
+            .validate()
+            .expect("r=33 is a valid checked shape, not a semantic width boundary");
+    }
+
+    #[test]
+    pub(crate) fn checked_shape_len_rejects_arithmetic_overflow() {
+        let err = checked_shape_len("overflow test", &[usize::MAX, 2])
+            .expect_err("shape multiplication must fail closed");
+        assert!(err.to_string().contains("shape product overflow"));
+    }
+
+    #[test]
+    pub(crate) fn validate_rejects_zero_rows_before_cuda_grid_construction() {
+        let buffers = make_buffers(1, 4, 1, 1);
+        let inputs = BmsFlexRowKernelInputs {
+            n_rows: 0,
+            ..minimal_inputs(&buffers)
+        };
+        let err = inputs.validate().expect_err("zero-row launch must fail closed");
+        assert!(err.to_string().contains("n_rows must be > 0"));
     }
 
     #[test]
@@ -3807,6 +3892,39 @@ mod tests {
         assert!(source.contains("for (int u = 1; u < r; ++u)"));
         assert!(source.contains("for (int v = u; v < r; ++v)"));
         assert!(source.contains("Canonical implicit-first stage complete"));
+        assert!(source.contains("double *F_u = out_grad + row_r_base"));
+        assert!(source.contains("double *F_au = row_f_au + row_r_base"));
+        assert!(source.contains("double *F_uv = out_hess + row_rr_base"));
+        for forbidden in [
+            "MAX_R",
+            "double F_u[",
+            "double F_au[",
+            "double F_uv[",
+            "double a_u[",
+            "double a_uv[",
+            "double bar_e_u[",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "generated row source restored width-bound scratch: {forbidden}"
+            );
+        }
+        for forbidden in [
+            "MAX_R",
+            "double row_dir[",
+            "double action[",
+            "bms_flex_row_hvp_partial_packed",
+            "bms_flex_row_diag_partial_packed",
+            "bms_flex_row_pack_upper",
+        ] {
+            assert!(
+                !HVP_KERNEL_SOURCE.contains(forbidden),
+                "HVP source restored a dead or width-bound path: {forbidden}"
+            );
+        }
+        assert!(HVP_KERNEL_SOURCE.contains("bms_flex_primary_direction"));
+        assert!(HVP_KERNEL_SOURCE.contains("direction_q[MAX_MULTI_RHS]"));
+        assert!(HVP_KERNEL_SOURCE.contains("action_g[MAX_MULTI_RHS]"));
         let mut cursor = 0usize;
         for marker in [
             "canonical calibration phase: InterceptFirst",

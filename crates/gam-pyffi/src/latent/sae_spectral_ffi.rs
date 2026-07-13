@@ -1233,15 +1233,15 @@ fn atlas_nerve_dict<'py>(
     out.set_item("good_cover_certified", diagram.good_cover_certified)?;
     match diagram.holonomy_certificate.as_ref() {
         Some(
-            certificate @ gam::terms::sae::inference::atlas_holonomy::AtlasHolonomyCertificate::ExactAnalytic(_),
+            gam::terms::sae::inference::atlas_holonomy::AtlasHolonomyCertificate::ExactAnalytic(_),
         ) => {
             out.set_item("holonomy_status", "analyzed_certified")?;
-            out.set_item("holonomy_provenance", certificate.provenance_label())?;
+            out.set_item("holonomy_provenance", "exact_analytic")?;
             out.set_item("holonomy_missing_inputs", py.None())?;
             out.set_item("holonomy_analysis", py.None())?;
         }
         Some(
-            certificate @ gam::terms::sae::inference::atlas_holonomy::AtlasHolonomyCertificate::GaussianPcaPlugin(analysis),
+            gam::terms::sae::inference::atlas_holonomy::AtlasHolonomyCertificate::GaussianPcaPlugin(analysis),
         ) => {
             let (payload, missing, fully_certified) =
                 gaussian_holonomy_analysis_dict(py, analysis)?;
@@ -1253,7 +1253,7 @@ fn atlas_nerve_dict<'py>(
                     "analyzed_refused"
                 },
             )?;
-            out.set_item("holonomy_provenance", certificate.provenance_label())?;
+            out.set_item("holonomy_provenance", "gaussian_pca_plugin")?;
             if missing.is_empty() {
                 out.set_item("holonomy_missing_inputs", py.None())?;
             } else {
@@ -2451,6 +2451,80 @@ mod sae_spectral_ffi_tests {
                     .extract::<bool>()
                     .unwrap()
             );
+        });
+    }
+
+    #[test]
+    fn audit_atlas_builds_cross_fitted_plugin_and_exposes_typed_refusals() {
+        const ROWS: usize = 64;
+        let mut indices = ndarray::Array2::<u32>::zeros((ROWS, 2));
+        let mut values = ndarray::Array3::<f32>::zeros((ROWS, 2, 2));
+        let mut ambient = ndarray::Array2::<f64>::zeros((ROWS, 3));
+        for row in 0..ROWS {
+            indices[[row, 0]] = 0;
+            indices[[row, 1]] = 1;
+            let angle = std::f64::consts::TAU * row as f64 / ROWS as f64;
+            let (sine, cosine) = angle.sin_cos();
+            for chart in 0..2 {
+                values[[row, chart, 0]] = cosine as f32;
+                values[[row, chart, 1]] = sine as f32;
+            }
+            ambient[[row, 0]] = cosine;
+            ambient[[row, 1]] = sine;
+            ambient[[row, 2]] = 0.05 * (2.0 * angle).cos();
+        }
+        let route = AuditSparseRoute::new(indices, values, 2, 2, "cross-fitted atlas route")
+            .unwrap();
+        let report = atlas_nerve_from_sparse_route(
+            &route,
+            0.0,
+            None,
+            Some(ambient.view()),
+            Some(0.05),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(report.diagram.holonomy_certificate.is_some());
+
+        Python::attach(|py| {
+            let dict = atlas_nerve_dict(py, Some(&report), "unused").unwrap();
+            let status: String = dict
+                .get_item("holonomy_status")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(status, "analyzed_refused");
+            let missing: Vec<String> = dict
+                .get_item("holonomy_missing_inputs")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(missing.contains(&"population_spectrum_uncertified".to_string()));
+            assert!(missing.contains(
+                &"population_cross_gram_margin_uncertified".to_string()
+            ));
+            let analysis = dict
+                .get_item("holonomy_analysis")
+                .unwrap()
+                .unwrap()
+                .cast_into::<PyDict>()
+                .unwrap();
+            let authority: String = analysis
+                .get_item("covariance_authority")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(authority, "asymptotic_plugin");
+            let orientation_refusals = analysis
+                .get_item("orientation_refusals")
+                .unwrap()
+                .unwrap()
+                .cast_into::<pyo3::types::PyList>()
+                .unwrap();
+            assert!(!orientation_refusals.is_empty());
         });
     }
 

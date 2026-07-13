@@ -227,15 +227,11 @@ fn sae_build_duchon_atom(
 /// identity ridge over the non-constant monomials (the constant term is left
 /// unpenalized to preserve the affine-equivariance of the patch).
 ///
-/// `centers` is accepted for API symmetry with the Duchon path; its row count
-/// determines the random-state matching seam (issue #246), but it is not
-/// otherwise used: a polynomial atom has no center-based locality.
 fn sae_build_euclidean_atom_with_degree(
     pts: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
+    dim: usize,
     max_degree: usize,
 ) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
-    let dim = centers.ncols();
     let exponents = monomial_exponents(dim, max_degree);
     let n_basis = exponents.len();
     // The design `Phi` and its jet come from the same evaluator the inner
@@ -267,13 +263,6 @@ fn sae_build_euclidean_atom_with_degree(
         }
     }
     Ok((phi, jet, penalty))
-}
-
-fn sae_build_euclidean_atom(
-    pts: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
-    sae_build_euclidean_atom_with_degree(pts, centers, SAE_EUCLIDEAN_PATCH_MAX_DEGREE)
 }
 
 /// Deterministically pick Duchon centers from the PCA-seeded coordinates.
@@ -493,41 +482,13 @@ pub fn sae_build_padded_basis_stacks(
                     .slice_mut(s![atom_idx, 0..m, 0..m])
                     .assign(&penalty);
             }
-            SaeAtomBasisKind::Linear
-            | SaeAtomBasisKind::Duchon
-            | SaeAtomBasisKind::EuclideanPatch
-            | SaeAtomBasisKind::Poincare => {
-                let centers = plan
-                    .duchon_centers()
-                    .ok_or_else(|| {
-                        format!(
-                            "sae_build_padded_basis_stacks: atom {atom_idx} non-periodic atom requires centers"
-                        )
-                    })?;
-                if centers.ncols() != d {
-                    return Err(format!(
-                        "sae_build_padded_basis_stacks: atom {atom_idx} centers have dim {} but plan latent_dim is {d}",
-                        centers.ncols()
-                    ));
-                }
-                let (phi, jet, penalty) = match plan.kind() {
-                    // #1221 — the linear atom and the euclidean (quadratic) patch
-                    // share the monomial evaluator; the polynomial DEGREE is
-                    // recovered from the plan's basis width (`d + 1` ⇒ degree 1
-                    // linear, the full monomial count ⇒ degree 2 quadratic), so a
-                    // genuinely-linear atom builds `{1, t}` and a euclidean atom
-                    // builds `{1, t, t²}`.
-                    SaeAtomBasisKind::Linear
-                    | SaeAtomBasisKind::EuclideanPatch
-                    | SaeAtomBasisKind::Poincare => {
-                        let degree = sae_euclidean_degree_for_basis_size(d, basis_sizes[atom_idx])?;
-                        sae_build_euclidean_atom_with_degree(coords.view(), centers.view(), degree)?
-                    }
-                    SaeAtomBasisKind::Duchon => {
-                        sae_build_duchon_atom(coords.view(), centers.view())?
-                    }
-                    _ => unreachable!("kind restricted by outer match"),
-                };
+            SaeAtomBasisKind::Duchon => {
+                let centers = plan.duchon_centers().ok_or_else(|| {
+                    format!(
+                        "sae_build_padded_basis_stacks: Duchon atom {atom_idx} has no centers in its resolution plan"
+                    )
+                })?;
+                let (phi, jet, penalty) = sae_build_duchon_atom(coords.view(), centers.view())?;
                 let m = phi.ncols();
                 if phi.nrows() != n_obs || m != basis_sizes[atom_idx] {
                     return Err(format!(
@@ -555,6 +516,39 @@ pub fn sae_build_padded_basis_stacks(
                 jet_stack
                     .slice_mut(s![atom_idx, 0..n_obs, 0..m, 0..jet_d])
                     .assign(&jet.slice(s![.., .., 0..jet_d]));
+                penalty_stack
+                    .slice_mut(s![atom_idx, 0..m, 0..m])
+                    .assign(&penalty);
+            }
+            SaeAtomBasisKind::Linear
+            | SaeAtomBasisKind::EuclideanPatch
+            | SaeAtomBasisKind::Poincare => {
+                let SaeBasisResolution::Polynomial { degree } = plan.geometry.resolution() else {
+                    return Err(format!(
+                        "sae_build_padded_basis_stacks: polynomial atom {atom_idx} has incompatible resolution {:?}",
+                        plan.geometry.resolution()
+                    ));
+                };
+                let (phi, jet, penalty) =
+                    sae_build_euclidean_atom_with_degree(coords.view(), d, *degree)?;
+                let m = phi.ncols();
+                if phi.dim() != (n_obs, basis_sizes[atom_idx])
+                    || jet.dim() != (n_obs, m, d)
+                    || penalty.dim() != (m, m)
+                {
+                    return Err(format!(
+                        "sae_build_padded_basis_stacks: polynomial atom {atom_idx} rebuilt shapes phi={:?}, jet={:?}, penalty={:?}, expected ({n_obs}, {m}, {d})",
+                        phi.dim(),
+                        jet.dim(),
+                        penalty.dim()
+                    ));
+                }
+                phi_stack
+                    .slice_mut(s![atom_idx, 0..n_obs, 0..m])
+                    .assign(&phi);
+                jet_stack
+                    .slice_mut(s![atom_idx, 0..n_obs, 0..m, 0..d])
+                    .assign(&jet);
                 penalty_stack
                     .slice_mut(s![atom_idx, 0..m, 0..m])
                     .assign(&penalty);
@@ -707,7 +701,6 @@ pub fn sae_build_atom_plans(
                         },
                         SaeReferenceMetricPlan::UnitCircle,
                     )?,
-                    duchon_centers: None,
                 });
             }
             SaeAtomBasisKind::Sphere => {
@@ -727,7 +720,6 @@ pub fn sae_build_atom_plans(
                         SaeBasisResolution::SphereChart,
                         SaeReferenceMetricPlan::SphereChart,
                     )?,
-                    duchon_centers: None,
                 });
             }
             SaeAtomBasisKind::Torus => {
@@ -746,7 +738,7 @@ pub fn sae_build_atom_plans(
                     SaeAtomBasisKind::Torus,
                     d,
                     SaeBasisResolution::TorusHarmonics { per_axis_order: h },
-                    SaeReferenceMetricPlan::UnitFlatTorus,
+                    SaeReferenceMetricPlan::FlatRectangularTorus { tau: 0.0 },
                 )?;
                 let basis_size = geometry.basis_size()?;
                 if basis_size > SAE_MAX_PERIODIC_HARMONICS * 4 {
@@ -754,10 +746,7 @@ pub fn sae_build_atom_plans(
                         "sae_build_atom_plans: atom {atom_idx} torus basis size {basis_size} = (2*{h}+1)^{d} exceeds the dense limit; reduce atom_dim or harmonics"
                     ));
                 }
-                plans.push(SaeAtomBuildPlan {
-                    geometry,
-                    duchon_centers: None,
-                });
+                plans.push(SaeAtomBuildPlan { geometry });
             }
             SaeAtomBasisKind::ProjectivePlane => {
                 if d != 2 {
@@ -770,7 +759,6 @@ pub fn sae_build_atom_plans(
                     .unwrap_or(1);
                 plans.push(SaeAtomBuildPlan {
                     geometry: SaeAtomGeometryPlan::projective_plane(quotient_order)?,
-                    duchon_centers: None,
                 });
             }
             SaeAtomBasisKind::KleinBottle => {
@@ -784,13 +772,9 @@ pub fn sae_build_atom_plans(
                     .unwrap_or(2);
                 plans.push(SaeAtomBuildPlan {
                     geometry: SaeAtomGeometryPlan::klein_bottle(per_axis_order)?,
-                    duchon_centers: None,
                 });
             }
-            SaeAtomBasisKind::Linear
-            | SaeAtomBasisKind::Duchon
-            | SaeAtomBasisKind::EuclideanPatch
-            | SaeAtomBasisKind::Poincare => {
+            SaeAtomBasisKind::Duchon => {
                 // A Duchon atom's curvature penalty degrades (and ultimately
                 // fails its D2 collocation) when the center count does not
                 // exceed the polynomial nullspace dimension of its resolved
@@ -823,54 +807,43 @@ pub fn sae_build_atom_plans(
                         centers[[out_row, col]] = seed_coords[[atom_idx, src_row, col]];
                     }
                 }
-                // Probe one build to learn the final basis size. The linear atom
-                // builds the degree-1 monomial patch `{1, t}` (width `d + 1`); the
-                // euclidean (quadratic) patch builds the degree-2 monomial patch
-                // (#1221); everything else (Duchon) uses the thin-plate kernel.
-                let probe_pts = Array2::<f64>::zeros((1, d));
-                let (phi, _jet, _penalty) = match kind {
-                    SaeAtomBasisKind::Linear => {
-                        sae_build_euclidean_atom_with_degree(probe_pts.view(), centers.view(), 1)?
-                    }
-                    SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Poincare => {
-                        sae_build_euclidean_atom(probe_pts.view(), centers.view())?
-                    }
-                    _ => sae_build_duchon_atom(probe_pts.view(), centers.view())?,
-                };
-                let basis_size = phi.ncols();
-                let (resolution, reference_metric) = match kind {
-                    SaeAtomBasisKind::Duchon => (
-                        SaeBasisResolution::DuchonCoordinates { basis_size },
-                        SaeReferenceMetricPlan::EuclideanDuchon,
-                    ),
-                    SaeAtomBasisKind::Linear => (
-                        SaeBasisResolution::Polynomial { degree: 1 },
-                        SaeReferenceMetricPlan::EuclideanPolynomial,
-                    ),
-                    SaeAtomBasisKind::EuclideanPatch => (
-                        SaeBasisResolution::Polynomial {
-                            degree: SAE_EUCLIDEAN_PATCH_MAX_DEGREE,
-                        },
-                        SaeReferenceMetricPlan::EuclideanPolynomial,
-                    ),
-                    SaeAtomBasisKind::Poincare => (
-                        SaeBasisResolution::Polynomial {
-                            degree: SAE_EUCLIDEAN_PATCH_MAX_DEGREE,
-                        },
-                        SaeReferenceMetricPlan::UnitPoincareBall,
-                    ),
-                    _ => unreachable!("kind restricted by outer match"),
-                };
                 plans.push(SaeAtomBuildPlan {
                     geometry: SaeAtomGeometryPlan::new(
-                        kind,
+                        SaeAtomBasisKind::Duchon,
                         d,
-                        resolution,
-                        reference_metric,
+                        SaeBasisResolution::DuchonCoordinates { centers },
+                        SaeReferenceMetricPlan::EuclideanDuchon,
                     )?,
-                    duchon_centers: Some(centers),
                 });
             }
+            SaeAtomBasisKind::Linear => plans.push(SaeAtomBuildPlan {
+                geometry: SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::Linear,
+                    d,
+                    SaeBasisResolution::Polynomial { degree: 1 },
+                    SaeReferenceMetricPlan::EuclideanPolynomial,
+                )?,
+            }),
+            SaeAtomBasisKind::EuclideanPatch => plans.push(SaeAtomBuildPlan {
+                geometry: SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::EuclideanPatch,
+                    d,
+                    SaeBasisResolution::Polynomial {
+                        degree: SAE_EUCLIDEAN_PATCH_MAX_DEGREE,
+                    },
+                    SaeReferenceMetricPlan::EuclideanPolynomial,
+                )?,
+            }),
+            SaeAtomBasisKind::Poincare => plans.push(SaeAtomBuildPlan {
+                geometry: SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::Poincare,
+                    d,
+                    SaeBasisResolution::Polynomial {
+                        degree: SAE_EUCLIDEAN_PATCH_MAX_DEGREE,
+                    },
+                    SaeReferenceMetricPlan::UnitPoincareBall,
+                )?,
+            }),
             SaeAtomBasisKind::Mobius => {
                 // Möbius band (#2240) is a first-class SEEDABLE kind: the
                 // deck-invariant double-cover layout is fixed by the production
@@ -880,10 +853,6 @@ pub fn sae_build_atom_plans(
                         "sae_build_atom_plans: atom {atom_idx} basis 'mobius' requires atom_dim == 2, got {d}"
                     ));
                 }
-                let evaluator = MobiusHarmonicEvaluator::new(
-                    SAE_MOBIUS_CIRCLE_HARMONICS,
-                    SAE_MOBIUS_WIDTH_DEGREE,
-                )?;
                 plans.push(SaeAtomBuildPlan {
                     geometry: SaeAtomGeometryPlan::new(
                         SaeAtomBasisKind::Mobius,
@@ -894,12 +863,7 @@ pub fn sae_build_atom_plans(
                         },
                         SaeReferenceMetricPlan::MobiusQuotient,
                     )?,
-                    duchon_centers: None,
                 });
-                debug_assert_eq!(
-                    plans.last().and_then(|plan| plan.basis_size().ok()),
-                    Some(evaluator.basis_size())
-                );
             }
             SaeAtomBasisKind::Cylinder => {
                 // A cylinder atom is not SEEDED through `sae_manifold_fit_minimal`:
