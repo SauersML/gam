@@ -759,7 +759,6 @@ fn reparameterize_logslope_design_reduced(
         new_nullspace_dims.push(nullspace_dim);
     }
 
-    let nrows = g_reduced.nrows();
     let new_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(g_reduced));
     // The reduced logslope block is a single dense smooth-like surface over the
     // reparameterized coordinates; it carries no parametric/random-effect/
@@ -768,7 +767,10 @@ fn reparameterize_logslope_design_reduced(
     // The penalties + nullspace_dims above are what the joint REML consumes.
     Ok(TermCollectionDesign {
         design: new_design,
-        affine_offset: Array1::zeros(nrows),
+        // Reparameterization changes only the coefficient chart G -> G T.
+        // The known affine row function is coefficient-independent and must
+        // therefore pass through unchanged.
+        affine_offset: logslope_design.affine_offset.clone(),
         penalties: new_penalties,
         nullspace_dims: new_nullspace_dims,
         penaltyinfo: Vec::new(),
