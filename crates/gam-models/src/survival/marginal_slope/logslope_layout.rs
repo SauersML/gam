@@ -256,6 +256,33 @@ impl LogslopeLayout {
         })
     }
 
+    /// Materialize every physical log-slope channel at one coefficient vector.
+    /// This is the sole batch boundary; row semantics remain owned by
+    /// [`Self::fill_callback_row`].
+    pub(crate) fn physical_values(
+        &self,
+        score_dim: usize,
+        beta: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        self.validate_for(score_dim)?;
+        if beta.len() != self.current_width {
+            return Err(format!(
+                "logslope physical-value beta length {} does not match current width {}",
+                beta.len(),
+                self.current_width,
+            ));
+        }
+        let mut values = Array2::<f64>::zeros((self.nrows, score_dim));
+        let mut workspace = self.row_workspace(score_dim)?;
+        for row in 0..self.nrows {
+            self.fill_callback_row(row, beta.view(), &mut workspace)?;
+            for (channel, value) in workspace.values().iter().copied().enumerate() {
+                values[[row, channel]] = value;
+            }
+        }
+        Ok(values)
+    }
+
     /// Stream the physical-channel coefficient Jacobian for a row range.
     ///
     /// `out` is row-major in the primary channel: row
@@ -547,30 +574,6 @@ mod tests {
             );
             self.current_width = design.ncols();
             self.coefficient_design = design;
-        }
-
-        fn physical_values(
-            &self,
-            score_dim: usize,
-            beta: ArrayView1<'_, f64>,
-        ) -> Result<Array2<f64>, String> {
-            self.validate_for(score_dim)?;
-            if beta.len() != self.current_width {
-                return Err(format!(
-                    "logslope physical-value beta length {} does not match current width {}",
-                    beta.len(),
-                    self.current_width,
-                ));
-            }
-            let mut values = Array2::<f64>::zeros((self.nrows, score_dim));
-            let mut workspace = self.row_workspace(score_dim)?;
-            for row in 0..self.nrows {
-                self.fill_callback_row(row, beta.view(), &mut workspace)?;
-                for channel in 0..score_dim {
-                    values[[row, channel]] = workspace.values[channel];
-                }
-            }
-            Ok(values)
         }
     }
 
