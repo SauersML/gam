@@ -111,13 +111,18 @@ fn zz_measure_duchon_sin8_reml_surface() {
             .clone();
         let p = xd.ncols();
         let mut s = Array2::<f64>::zeros((p, p));
-        for pen in &basis.penalties {
+        for active in &basis.active_penalties {
             // active penalties are full-size p×p here (single smooth term)
+            let pen = &active.matrix;
             if pen.nrows() == p && pen.ncols() == p {
                 s += pen;
             }
         }
-        let nulldim: usize = basis.nullspace_dims.iter().sum();
+        let nulldim: usize = basis
+            .active_penalties
+            .iter()
+            .map(|active| active.nullity)
+            .sum();
 
         // gam's REML global optimum on this basis
         let cf = gaussian_reml_closed_form(xd.view(), y_arr.view(), s.view(), None, None)
@@ -140,7 +145,7 @@ fn zz_measure_duchon_sin8_reml_surface() {
 
         eprintln!(
             "\n===== duchon sin8 k={k}: p={p} nulldim={nulldim} n_pen={} truth_amp_pp=2.0 =====",
-            basis.penalties.len()
+            basis.active_penalties.len()
         );
         eprintln!(
             "  gam REML-opt : rho={:.3} lambda={:.4e} edf={:.3} score={:.5} \

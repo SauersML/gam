@@ -1038,7 +1038,7 @@ mod tests {
             .zip(expected.active_penalties.iter())
         {
             assert_eq!(observed.info.source, target.info.source);
-            assert_eq!(observed.rank, target.rank);
+            assert_eq!(observed.info.effective_rank, target.info.effective_rank);
             assert_eq!(observed.nullity, target.nullity);
             assert_matrix_close(&observed.matrix, &target.matrix, tolerance);
         }
@@ -1064,7 +1064,7 @@ mod tests {
             .zip(expected.active_penalties.iter())
         {
             assert_eq!(observed.info.source, target.info.source);
-            assert_eq!(observed.rank, target.rank);
+            assert_eq!(observed.info.effective_rank, target.info.effective_rank);
             assert_eq!(observed.nullity, target.nullity);
             assert_matrix_close(&observed.matrix, &target.matrix, tolerance);
         }
@@ -1693,12 +1693,13 @@ mod tests {
     #[test]
     fn malformed_frozen_scale_vectors_are_rejected_before_indexing_2315() {
         let mut basis = zoo_basis(BasisScaleFamily::Matern);
-        let input_scales = match &mut basis {
-            SmoothBasisSpec::Matern { input_scales, .. } => input_scales,
-            other => panic!("family lookup returned {other:?} instead of Matérn"),
-        };
         for invalid in [vec![1.0], vec![1.0, 0.0], vec![1.0, f64::NAN]] {
-            *input_scales = Some(invalid);
+            match &mut basis {
+                SmoothBasisSpec::Matern { input_scales, .. } => {
+                    *input_scales = Some(invalid);
+                }
+                other => panic!("family lookup returned {other:?} instead of Matérn"),
+            }
             assert!(basis.validate_scale_configuration().is_err());
         }
     }

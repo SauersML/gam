@@ -118,12 +118,11 @@ fn spherical_harmonic_penalty_keeps_laplace_beltrami_scale() {
 
     let built = build_spherical_harmonic_basis(data.view(), &spec)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "build harmonic spherical basis", e));
-    assert_eq!(built.penalties.len(), 1);
-    assert_eq!(built.penaltyinfo.len(), 1);
-    assert_eq!(built.penaltyinfo[0].source, PenaltySource::Primary);
-    assert_eq!(built.penaltyinfo[0].normalization_scale, 1.0);
+    assert_eq!(built.active_penalties.len(), 1);
+    assert_eq!(built.active_penalties[0].info.source, PenaltySource::Primary);
+    assert_eq!(built.active_penalties[0].info.normalization_scale, 1.0);
 
-    let penalty = &built.penalties[0];
+    let penalty = &built.active_penalties[0].matrix;
     assert_eq!(penalty.nrows(), 24);
     assert_eq!(penalty.ncols(), 24);
 
@@ -1377,8 +1376,7 @@ fn test_build_thin_plate_basis_double_penalty_outputs_two_blocks() {
         radial_reparam: None,
     };
     let result = build_thin_plate_basis(data.view(), &spec).unwrap();
-    assert_eq!(result.penalties.len(), 2);
-    assert_eq!(result.nullspace_dims.len(), 2);
+    assert_eq!(result.active_penalties.len(), 2);
     assert_eq!(result.design.nrows(), data.nrows());
     match &result.metadata {
         BasisMetadata::ThinPlate {
@@ -1529,9 +1527,12 @@ fn test_thin_plate_identifiability_preserves_unpenalized_linear_nullspace() {
     let design = result.design.to_dense();
 
     assert_eq!(design.ncols(), 2);
-    assert_eq!(result.penalties.len(), 1);
-    assert_eq!(estimate_penalty_nullity(&result.penalties[0]).unwrap(), 1);
-    assert_eq!(result.nullspace_dims, vec![1]);
+    assert_eq!(result.active_penalties.len(), 1);
+    assert_eq!(
+        estimate_penalty_nullity(&result.active_penalties[0].matrix).unwrap(),
+        1
+    );
+    assert_eq!(result.active_penalties[0].nullity, 1);
 
     let intercept = Array2::<f64>::ones((data.nrows(), 1));
     let cross = design.t().dot(&intercept);
@@ -1597,9 +1598,15 @@ fn test_build_thin_plate_basis_center_strategies() {
     for spec in specs {
         let result = build_thin_plate_basis(data.view(), &spec).unwrap();
         assert!(result.design.nrows() > 0);
-        assert_eq!(result.penalties.len(), 1);
-        assert_eq!(result.penalties[0].nrows(), result.design.ncols());
-        assert_eq!(result.penalties[0].ncols(), result.design.ncols());
+        assert_eq!(result.active_penalties.len(), 1);
+        assert_eq!(
+            result.active_penalties[0].matrix.nrows(),
+            result.design.ncols()
+        );
+        assert_eq!(
+            result.active_penalties[0].matrix.ncols(),
+            result.design.ncols()
+        );
     }
 }
 
@@ -1675,22 +1682,20 @@ fn test_build_bspline_basis_1d_double_penalty() {
     // pre-#1266 geometry) left `λ_nullspace` unidentified, so REML weakened the
     // wiggliness penalty instead of shrinking the term out and *inflated* the
     // smooth's EDF.
-    assert_eq!(result.penalties.len(), 2);
-    assert_eq!(result.penaltyinfo.len(), 2);
-    assert_eq!(result.nullspace_dims.len(), 2);
-    assert!(result.penaltyinfo.iter().all(|info| info.active));
+    assert_eq!(result.active_penalties.len(), 2);
+    assert!(result.dropped_penalties.is_empty());
     assert!(matches!(
-        result.penaltyinfo[0].source,
+        result.active_penalties[0].info.source,
         PenaltySource::Primary
     ));
     assert!(matches!(
-        result.penaltyinfo[1].source,
+        result.active_penalties[1].info.source,
         PenaltySource::DoublePenaltyNullspace
     ));
 
     let p_constrained = result.design.ncols();
-    let bend_rank = result.penaltyinfo[0].effective_rank;
-    let null_rank = result.penaltyinfo[1].effective_rank;
+    let bend_rank = result.active_penalties[0].info.effective_rank;
+    let null_rank = result.active_penalties[1].info.effective_rank;
 
     // #1476/#1477: the double-penalty null-space shrinkage ridge `P` must be the
     // orthogonal projector onto `null(S_c)` built in the CONSTRAINED coordinate
@@ -1716,8 +1721,8 @@ fn test_build_bspline_basis_1d_double_penalty() {
          rank-2 congruence of the raw projector"
     );
 
-    let s_c = &result.penalties[0];
-    let p_null = &result.penalties[1];
+    let s_c = &result.active_penalties[0].matrix;
+    let p_null = &result.active_penalties[1].matrix;
     // Spectral complementarity: P projects onto null(S_c), so S_c·P = P·S_c = 0
     // exactly (the ridge penalizes ONLY the unpenalized polynomial direction and
     // never touches a curvature mode). The pre-fix raw-chart ridge failed this:
@@ -1770,25 +1775,28 @@ fn assert_double_penalty_projector_contract(
     label: &str,
 ) {
     assert_eq!(
-        result.penalties.len(),
+        result.active_penalties.len(),
         2,
         "{label}: a free double-penalty basis must ship the bend penalty + the \
          null-space shrinkage ridge as two separate REML coordinates"
     );
     assert!(
-        matches!(result.penaltyinfo[0].source, PenaltySource::Primary),
+        matches!(
+            result.active_penalties[0].info.source,
+            PenaltySource::Primary
+        ),
         "{label}: first block must be the primary wiggliness penalty"
     );
     assert!(
         matches!(
-            result.penaltyinfo[1].source,
+            result.active_penalties[1].info.source,
             PenaltySource::DoublePenaltyNullspace
         ),
         "{label}: second block must be the double-penalty null-space ridge"
     );
 
-    let s_c = &result.penalties[0];
-    let p_null = &result.penalties[1];
+    let s_c = &result.active_penalties[0].matrix;
+    let p_null = &result.active_penalties[1].matrix;
     let p_constrained = result.design.ncols();
 
     let s_c_block = analyze_penalty_block_with_op(s_c, None)
@@ -1808,7 +1816,7 @@ fn assert_double_penalty_projector_contract(
         "{label}: rank(P) must equal nullity(S_c) = {expected_nullity}"
     );
     assert_eq!(
-        result.penaltyinfo[1].effective_rank, expected_nullity,
+        result.active_penalties[1].info.effective_rank, expected_nullity,
         "{label}: reported ridge effective_rank must equal nullity(S_c)"
     );
 
@@ -1943,19 +1951,22 @@ fn double_penalty_suppressed_on_non_free_boundary_is_single_penalty() {
     let result = build_bspline_basis_1d(x.view(), &spec)
         .unwrap_or_else(|e| panic!("clamped double-penalty build failed: {e:?}"));
     assert_eq!(
-        result.penalties.len(),
+        result.active_penalties.len(),
         1,
         "non-free boundary suppresses the null-space block: exactly one penalty"
     );
     assert!(
-        matches!(result.penaltyinfo[0].source, PenaltySource::Primary),
+        matches!(
+            result.active_penalties[0].info.source,
+            PenaltySource::Primary
+        ),
         "the sole shipped penalty must be the primary wiggliness penalty"
     );
     assert!(
         !result
-            .penaltyinfo
+            .active_penalties
             .iter()
-            .any(|info| matches!(info.source, PenaltySource::DoublePenaltyNullspace)),
+            .any(|active| matches!(active.info.source, PenaltySource::DoublePenaltyNullspace)),
         "no spurious DoublePenaltyNullspace ridge on a non-free boundary"
     );
 }
@@ -1986,19 +1997,22 @@ fn double_penalty_on_cyclic_basis_is_single_penalty_no_spurious_ridge() {
     let result = build_bspline_basis_1d(x.view(), &spec)
         .unwrap_or_else(|e| panic!("cyclic double-penalty build failed: {e:?}"));
     assert_eq!(
-        result.penalties.len(),
+        result.active_penalties.len(),
         1,
         "cyclic basis must ship a single penalty — no double-penalty ridge"
     );
     assert!(
-        matches!(result.penaltyinfo[0].source, PenaltySource::Primary),
+        matches!(
+            result.active_penalties[0].info.source,
+            PenaltySource::Primary
+        ),
         "cyclic basis's sole penalty must be the primary wiggliness penalty"
     );
     assert!(
         !result
-            .penaltyinfo
+            .active_penalties
             .iter()
-            .any(|info| matches!(info.source, PenaltySource::DoublePenaltyNullspace)),
+            .any(|active| matches!(active.info.source, PenaltySource::DoublePenaltyNullspace)),
         "no spurious DoublePenaltyNullspace ridge on a cyclic basis"
     );
     // Seam closes: first and last evaluation rows agree column-wise.
@@ -2098,7 +2112,7 @@ fn test_clamped_bspline_curvature_penalty_null_space_is_exactly_linear() {
     };
     let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
     let design = built.design.to_dense();
-    let s = &built.penalties[0];
+    let s = &built.active_penalties[0].matrix;
     // Null space of S (curvature penalty): eigenvectors with ~zero eigenvalue.
     let (evals, evecs) = FaerEigh::eigh(s, Side::Lower).unwrap();
     let max_ev = evals.iter().cloned().fold(f64::MIN, f64::max);
@@ -2169,7 +2183,7 @@ fn test_build_bspline_basis_1d_quantile_uses_exact_derivative_gram() {
         bspline_derivative_penalty_matrix(knots.view(), spec.degree, spec.penalty_order).unwrap();
     // Since #1365 the shipped B-spline bending penalty is Frobenius-normalized
     // (`normalize_penalty`) so the REML λ-search sees a unit-Frobenius block on
-    // a basis-independent scale; `built.penalties[0]` is therefore `S/‖S‖_F`,
+    // a basis-independent scale; `built.active_penalties[0].matrix` is therefore `S/‖S‖_F`,
     // not the raw derivative Gram. The test's claim — that quantile
     // (non-uniform) knots use the exact derivative Gram — holds up to that
     // normalization, so compare against the normalized production oracle.
@@ -2181,7 +2195,7 @@ fn test_build_bspline_basis_1d_quantile_uses_exact_derivative_gram() {
         .max(1e-12);
     let expected = expected_raw.mapv(|v| v / frob);
 
-    let got = &built.penalties[0];
+    let got = &built.active_penalties[0].matrix;
     let mut max_abs = 0.0_f64;
     for i in 0..got.nrows() {
         for j in 0..got.ncols() {
@@ -2504,8 +2518,8 @@ fn test_cyclic_duchon_matches_at_period_boundary() {
     for j in 0..dense.ncols() {
         assert!((dense[[0, j]] - dense[[4, j]]).abs() < 1e-10);
     }
-    assert_eq!(built.penalties.len(), 1);
-    assert_eq!(built.penalties[0].nrows(), dense.ncols());
+    assert_eq!(built.active_penalties.len(), 1);
+    assert_eq!(built.active_penalties[0].matrix.nrows(), dense.ncols());
 }
 
 #[test]

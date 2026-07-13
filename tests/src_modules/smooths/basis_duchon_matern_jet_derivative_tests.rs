@@ -4012,9 +4012,9 @@ fn test_periodic_bspline_wraps_design_at_cylinder_seam() {
         assert_abs_diff_eq!(design[[0, col]], design[[4, col]], epsilon = 1e-12);
         assert_abs_diff_eq!(design[[1, col]], design[[5, col]], epsilon = 1e-12);
     }
-    assert_eq!(built.penalties.len(), 1);
-    assert_eq!(built.penalties[0].nrows(), design.ncols());
-    assert_eq!(built.penalties[0].ncols(), design.ncols());
+    assert_eq!(built.active_penalties.len(), 1);
+    assert_eq!(built.active_penalties[0].matrix.nrows(), design.ncols());
+    assert_eq!(built.active_penalties[0].matrix.ncols(), design.ncols());
 }
 
 #[test]
@@ -4050,7 +4050,7 @@ fn test_periodic_bspline_with_sum_to_zero_keeps_wrapped_rows_equal() {
     // would leave that λ unidentified and prevent outer-REML termination
     // (see #874 / the comment in `build_bspline_basis_1d`'s cyclic arm).
     // Match mgcv `bs="cc"`, which is likewise a single-penalty smooth.
-    assert_eq!(built.penalties.len(), 1);
+    assert_eq!(built.active_penalties.len(), 1);
 }
 
 #[test]
