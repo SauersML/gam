@@ -157,6 +157,16 @@ pub enum NoiseModel {
         shape: Array1<f64>,
     },
     Bernoulli,
+    /// Row-specific categorical response law.
+    ///
+    /// `probabilities[[i, j]]` is the fitted probability that observation `i`
+    /// takes `labels[j]`. This is the natural saved-response representation for
+    /// competing-risk event-window generation: label zero means no event in the
+    /// requested window and positive labels identify the persisted causes.
+    Categorical {
+        probabilities: Array2<f64>,
+        labels: Array1<f64>,
+    },
     /// Inverse-transform sampling for a conditional transformation-normal (CTM)
     /// model (issue #1613). The fitted latent transform `h(·|x_i)` is strictly
     /// increasing in `y` and `h(Y|x) ~ N(0, 1)`, so a response-scale draw is
@@ -781,6 +791,59 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
             }
             Ok(y)
         }
+        NoiseModel::Categorical {
+            probabilities,
+            labels,
+        } => {
+            let n = spec.mean.len();
+            if probabilities.nrows() != n {
+                crate::bail_invalid_estim!(
+                    "categorical probability rows {} do not match mean length {n}",
+                    probabilities.nrows()
+                );
+            }
+            if labels.is_empty() || probabilities.ncols() != labels.len() {
+                crate::bail_invalid_estim!(
+                    "categorical label/probability width mismatch: labels={}, columns={}",
+                    labels.len(),
+                    probabilities.ncols()
+                );
+            }
+            if labels.iter().any(|label| !label.is_finite()) {
+                crate::bail_invalid_estim!("categorical labels must be finite");
+            }
+            let mut y = Array1::<f64>::zeros(n);
+            for row in 0..n {
+                let probability_row = probabilities.row(row);
+                let mut total = 0.0_f64;
+                for (category, &probability) in probability_row.iter().enumerate() {
+                    if !(probability.is_finite() && probability >= 0.0) {
+                        crate::bail_invalid_estim!(
+                            "categorical probability at row {row}, category {category} must be finite and non-negative, got {probability}"
+                        );
+                    }
+                    total += probability;
+                }
+                let tolerance = 64.0 * f64::EPSILON * labels.len().max(1) as f64;
+                if !(total.is_finite() && (total - 1.0).abs() <= tolerance) {
+                    crate::bail_invalid_estim!(
+                        "categorical probabilities at row {row} sum to {total}, expected one within {tolerance}"
+                    );
+                }
+                let uniform = rand::Rng::random::<f64>(rng);
+                let mut cumulative = 0.0_f64;
+                let mut selected = labels.len() - 1;
+                for category in 0..labels.len() - 1 {
+                    cumulative += probability_row[category];
+                    if uniform < cumulative {
+                        selected = category;
+                        break;
+                    }
+                }
+                y[row] = labels[selected];
+            }
+            Ok(y)
+        }
         NoiseModel::TransformationNormalQuantile { grid_y, h_grid } => {
             let n = spec.mean.len();
             if h_grid.nrows() != n {
@@ -814,7 +877,51 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
     }
 }
 
-/// Draw multiple synthetic replicates (n_draws x nobs).
+/// Draw replicate chunks in deterministic draw order without materializing the
+/// full `n_draws × nobs` matrix.
+///
+/// The same RNG is advanced exactly once per observation draw regardless of
+/// `chunk_draws`, so changing the chunk size changes only memory and sink call
+/// boundaries, never the generated values. Frontends that write a file or
+/// yield an iterator should use this API; collecting the full matrix is an
+/// explicit convenience operation implemented below.
+pub fn sampleobservation_replicate_chunks<R, F>(
+    spec: &GenerativeSpec,
+    n_draws: usize,
+    chunk_draws: usize,
+    rng: &mut R,
+    mut consume: F,
+) -> Result<(), EstimationError>
+where
+    R: rand::Rng + ?Sized,
+    F: for<'a> FnMut(usize, ndarray::ArrayView2<'a, f64>) -> Result<(), EstimationError>,
+{
+    if chunk_draws == 0 {
+        crate::bail_invalid_estim!("replicate chunk size must be strictly positive");
+    }
+    if n_draws == 0 {
+        return Ok(());
+    }
+    let n = spec.nobs();
+    let capacity = chunk_draws.min(n_draws);
+    let mut chunk = Array2::<f64>::zeros((capacity, n));
+    let mut start = 0usize;
+    while start < n_draws {
+        let len = (n_draws - start).min(capacity);
+        for local_draw in 0..len {
+            let draw = sampleobservations(spec, rng)?;
+            chunk.row_mut(local_draw).assign(&draw);
+        }
+        consume(start, chunk.slice(ndarray::s![..len, ..]))?;
+        start += len;
+    }
+    Ok(())
+}
+
+/// Collect multiple synthetic replicates into an `n_draws × nobs` matrix.
+///
+/// This is intentionally the allocating convenience surface. Streaming
+/// consumers should call [`sampleobservation_replicate_chunks`] directly.
 pub fn sampleobservation_replicates<R: rand::Rng + ?Sized>(
     spec: &GenerativeSpec,
     n_draws: usize,
@@ -822,10 +929,11 @@ pub fn sampleobservation_replicates<R: rand::Rng + ?Sized>(
 ) -> Result<Array2<f64>, EstimationError> {
     let n = spec.nobs();
     let mut out = Array2::<f64>::zeros((n_draws, n));
-    for d in 0..n_draws {
-        let draw = sampleobservations(spec, rng)?;
-        out.row_mut(d).assign(&draw);
-    }
+    sampleobservation_replicate_chunks(spec, n_draws, n_draws.max(1), rng, |start, chunk| {
+        let end = start + chunk.nrows();
+        out.slice_mut(ndarray::s![start..end, ..]).assign(&chunk);
+        Ok(())
+    })?;
     Ok(out)
 }
 
@@ -842,6 +950,52 @@ pub trait CustomFamilyGenerative: CustomFamily {
 mod tests {
     use super::*;
     use crate::family_runtime::{FamilyStrategy, strategy_for_spec};
+
+    #[test]
+    fn categorical_sampler_draws_only_persisted_labels() {
+        use rand::SeedableRng;
+
+        let spec = GenerativeSpec {
+            mean: ndarray::array![1.5, 0.0],
+            noise: NoiseModel::Categorical {
+                probabilities: ndarray::array![[0.25, 0.75], [1.0, 0.0]],
+                labels: ndarray::array![0.0, 2.0],
+            },
+        };
+        let mut rng = rand::rngs::StdRng::seed_from_u64(2300);
+        let draws = sampleobservation_replicates(&spec, 2_000, &mut rng).unwrap();
+        assert!(
+            draws
+                .column(0)
+                .iter()
+                .all(|value| *value == 0.0 || *value == 2.0)
+        );
+        assert!(draws.column(1).iter().all(|value| *value == 0.0));
+        let first_mean = draws.column(0).sum() / draws.nrows() as f64;
+        assert!((first_mean - 1.5).abs() < 0.08, "mean={first_mean}");
+    }
+
+    #[test]
+    fn replicate_chunk_size_does_not_change_seeded_draw_stream() {
+        use rand::SeedableRng;
+
+        let spec = GenerativeSpec {
+            mean: ndarray::array![0.2, 0.7, 0.95],
+            noise: NoiseModel::Bernoulli,
+        };
+        let collect = |chunk_draws: usize| {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(91);
+            let mut values = Vec::<f64>::new();
+            sampleobservation_replicate_chunks(&spec, 257, chunk_draws, &mut rng, |_, chunk| {
+                values.extend(chunk.iter().copied());
+                Ok(())
+            })
+            .unwrap();
+            values
+        };
+        assert_eq!(collect(1), collect(7));
+        assert_eq!(collect(7), collect(256));
+    }
 
     /// The CTM inverse-transform sampler (#1613) must draw `Y = h⁻¹(Z|x)`,
     /// `Z ~ N(0,1)`, from each row's monotone transform — NOT Gaussian noise on
