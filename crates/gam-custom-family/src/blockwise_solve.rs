@@ -148,7 +148,7 @@ pub(crate) fn physical_warm_start_for_labeled(
     physical_rho: &Array1<f64>,
     layout: &PenaltyLabelLayout,
 ) -> Option<ConstrainedWarmStart> {
-    if !layout.has_tied_coordinates() {
+    if !layout.physical_rho_requires_remap() {
         return None;
     }
     warm_start.map(|seed| {

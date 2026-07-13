@@ -72,8 +72,29 @@ impl PenaltyLabelLayout {
         self.physical_to_outer.len()
     }
 
-    pub(crate) fn has_tied_coordinates(&self) -> bool {
+    /// Whether an optimizer-coordinate rho must be expanded before it can be
+    /// stored in a warm start consumed by the physical per-block solver.
+    ///
+    /// Cardinality alone is not sufficient: a fixed physical slot and a new
+    /// joint coordinate can cancel in the counts while the physical map still
+    /// contains a hole. The map is direct only when every physical slot maps
+    /// to the optimizer coordinate at the identical index and the vectors have
+    /// equal lengths.
+    pub(crate) fn physical_rho_requires_remap(&self) -> bool {
         self.initial_rho.len() != self.physical_to_outer.len()
+            || self
+                .physical_to_outer
+                .iter()
+                .enumerate()
+                .any(|(physical_idx, outer_idx)| *outer_idx != Some(physical_idx))
+    }
+
+    /// Whether rho can be passed directly to the legacy physical-coordinate
+    /// EFS evaluator. That evaluator sees only per-block penalties, so even an
+    /// identity rho map is ineligible when a joint penalty shares an existing
+    /// label and therefore adds no optimizer coordinate of its own.
+    pub(crate) fn supports_direct_physical_efs(&self) -> bool {
+        self.joint_specs.is_empty() && !self.physical_rho_requires_remap()
     }
 
     /// Joint-penalty `log λ` values for the current outer ρ, parallel to
@@ -257,4 +278,89 @@ pub(crate) fn aggregate_labeled_gradient(
         out[outer] += gradient[joint_base + joint_idx];
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    fn one_block(
+        penalties: Vec<PenaltyMatrix>,
+        initial_log_lambdas: Vec<f64>,
+    ) -> ParameterBlockSpec {
+        let penalty_count = penalties.len();
+        ParameterBlockSpec {
+            name: "layout".to_string(),
+            design: crate::DesignMatrix::from(Array2::<f64>::eye(2)),
+            offset: Array1::zeros(2),
+            penalties,
+            nullspace_dims: vec![0; penalty_count],
+            initial_log_lambdas: Array1::from_vec(initial_log_lambdas),
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        }
+    }
+
+    fn joint_penalty(label: &str, initial_log_lambda: f64) -> gam_problem::JointPenaltySpec {
+        gam_problem::JointPenaltySpec {
+            label: Some(label.to_string()),
+            matrix: Array2::<f64>::eye(2),
+            initial_log_lambda,
+            nullspace_dim: 0,
+        }
+    }
+
+    #[test]
+    fn fixed_and_joint_count_cancellation_requires_physical_rho_remap_2315() {
+        let specs = vec![one_block(
+            vec![
+                PenaltyMatrix::Dense(Array2::<f64>::eye(2)).with_fixed_log_lambda(2.0),
+                PenaltyMatrix::Dense(Array2::<f64>::eye(2)),
+            ],
+            vec![0.5, -1.0],
+        )];
+        let layout = penalty_label_layout_with_joint(
+            &specs,
+            vec![2],
+            vec![joint_penalty("new_joint", -2.0)],
+        )
+        .expect("fixed plus joint layout must be valid");
+
+        // One fixed physical slot removes an outer coordinate while the new
+        // joint penalty adds one, so the old cardinality predicate reported a
+        // false identity despite the hole in the physical map.
+        assert_eq!(layout.initial_rho.len(), layout.physical_count());
+        assert_eq!(layout.physical_to_outer, vec![None, Some(0)]);
+        assert_eq!(layout.joint_to_outer, vec![1]);
+        assert!(layout.physical_rho_requires_remap());
+        assert!(!layout.supports_direct_physical_efs());
+    }
+
+    #[test]
+    fn joint_reusing_physical_label_is_not_direct_efs_compatible_2315() {
+        let specs = vec![one_block(
+            vec![PenaltyMatrix::Dense(Array2::<f64>::eye(2)).with_precision_label("shared")],
+            vec![-1.0],
+        )];
+        let direct = penalty_label_layout_with_joint(&specs, vec![1], Vec::new())
+            .expect("ordinary one-to-one physical layout must be valid");
+        assert!(!direct.physical_rho_requires_remap());
+        assert!(direct.supports_direct_physical_efs());
+
+        let with_joint =
+            penalty_label_layout_with_joint(&specs, vec![1], vec![joint_penalty("shared", -1.0)])
+                .expect("joint penalty may share an existing physical precision label");
+
+        // The rho representation remains an exact identity, but the raw EFS
+        // evaluator would omit the joint penalty bundle entirely.
+        assert_eq!(with_joint.initial_rho.len(), with_joint.physical_count());
+        assert_eq!(with_joint.physical_to_outer, vec![Some(0)]);
+        assert_eq!(with_joint.joint_to_outer, vec![0]);
+        assert!(!with_joint.physical_rho_requires_remap());
+        assert!(!with_joint.supports_direct_physical_efs());
+    }
 }

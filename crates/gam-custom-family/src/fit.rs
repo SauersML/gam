@@ -1366,9 +1366,9 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             outer.reset();
         }),
         Some(|outer: &mut CustomOuterState, rho: &Array1<f64>| {
-            if label_layout.has_tied_coordinates() {
+            if !label_layout.supports_direct_physical_efs() {
                 return Err(EstimationError::RemlOptimizationFailed(
-                    "custom-family EFS is not available for tied coefficient-group precision labels"
+                    "custom-family EFS requires an identity per-block penalty-coordinate layout with no fixed, tied, or joint penalties"
                         .to_string(),
                 ));
             }
