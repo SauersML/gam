@@ -5,6 +5,7 @@ use super::cell_moment_assembly::{
 };
 use super::exact_eval_cache::*;
 use super::family::*;
+use super::flex_row_program::BmsFlexProgramPoint;
 use super::gradient_paths::*;
 use super::hessian_paths::*;
 use super::row_kernel::*;
@@ -1293,7 +1294,7 @@ impl BernoulliMarginalSlopeFamily {
         }
         let beta_h = self.score_beta(block_states)?;
         let beta_w = self.link_beta(block_states)?;
-        let scale = self.probit_frailty_scale();
+        let scale = program.scale();
         let n = self.y.len();
         let score_runtime = self.score_warp.as_ref();
         let link_runtime = self.link_dev.as_ref();
@@ -2931,12 +2932,8 @@ impl BernoulliMarginalSlopeFamily {
     /// the value/gradient/full-Hessian moment oracle.
     pub(super) fn lower_empirical_bms_calibration_order2(
         &self,
-        intercept_root: f64,
+        program: BmsFlexProgramPoint<'_>,
         empirical_grid: &crate::bms::EmpiricalZGrid,
-        primary: &PrimarySlices,
-        b: f64,
-        beta_h: Option<&Array1<f64>>,
-        beta_w: Option<&Array1<f64>>,
         need_hessian: bool,
         // Per-row coefficient scratch, owned by the caller and reused across rows
         // (`compute_row_analytic_flex_from_parts_into` sizes these to `r` on its
@@ -2952,7 +2949,11 @@ impl BernoulliMarginalSlopeFamily {
         f_au: &mut Array1<f64>,
         f_uv: &mut Array2<f64>,
     ) -> Result<f64, String> {
-        let a = intercept_root;
+        let a = program.intercept_root();
+        let primary = program.primary();
+        let b = program.slope();
+        let beta_h = program.beta_h();
+        let beta_w = program.beta_w();
         let scale = self.probit_frailty_scale();
         let h_range = primary.h.as_ref();
         let w_range = primary.w.as_ref();
@@ -3183,13 +3184,25 @@ impl BernoulliMarginalSlopeFamily {
             // to discard every field except that root. The sorted grid is
             // compiled directly into per-cell cubic moments, preserving
             // O(G + cells·k²) work and the allocation-free warmed VGH path.
-            f_aa = self.lower_empirical_bms_calibration_order2(
-                a,
-                grid,
+            let program = BmsFlexProgramPoint::new(
                 primary,
                 b,
                 beta_h,
                 beta_w,
+                a,
+                inv_ma,
+                scale,
+                [
+                    marginal.mu,
+                    marginal.mu1,
+                    marginal.mu2,
+                    marginal.mu3,
+                    marginal.mu4,
+                ],
+            )?;
+            f_aa = self.lower_empirical_bms_calibration_order2(
+                program,
+                grid,
                 need_hessian,
                 coeff_u.as_mut_slice(),
                 coeff_au.as_mut_slice(),
@@ -7152,7 +7165,7 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let point = self.primary_point_from_block_states(row, block_states, primary)?;
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
-        let plan = self.empirical_bms_row_jet_plan(
+        let plan = self.compile_empirical_bms_row_program(
             row,
             primary,
             q,

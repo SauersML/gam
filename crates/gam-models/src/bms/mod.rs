@@ -2148,6 +2148,7 @@ pub(super) const BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS: usize = 
 pub(crate) mod block_specs;
 pub(crate) mod exact_eval_cache;
 pub(crate) mod family;
+pub(crate) mod flex_row_program;
 pub(crate) mod gradient_paths;
 pub(crate) mod hessian_paths;
 pub(crate) mod install_flex;

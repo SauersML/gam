@@ -2,6 +2,10 @@ use super::exact_eval_cache::*;
 
 use super::family::*;
 
+use super::flex_row_program::{
+    BmsFlexCalibrationProgramNode, BmsFlexIndexProgram, BmsFlexProgramPoint, BmsFlexRowProgram,
+};
+
 use super::gradient_paths::*;
 
 use super::hessian_paths::*;
@@ -13,7 +17,7 @@ use super::*;
 use crate::fnv1a::Fnv1a;
 use gam_math::jet_scalar::{
     DynamicJetBatchWorkspace, DynamicOneSeedBatch, DynamicTwoSeedBatch, FixedRuntimeJet, OneSeed,
-    RuntimeJetScalar, TwoSeed, filtered_implicit_solve_runtime_scalar,
+    TwoSeed,
 };
 
 thread_local! {
@@ -48,7 +52,7 @@ pub(super) enum EmpiricalBmsFourthJetSchedule {
 /// row program contributes `O(r)` live tape nodes. Bounding `lanes·r³` tracks
 /// the leading working set that caused the measured cache cliff and geometric
 /// arena growth, while every chunk still evaluates the same frozen
-/// [`EmpiricalBmsRowJetPlan`].
+/// [`BmsFlexRowProgram`].
 const EMPIRICAL_BMS_BATCH_TAPE_WORK_BUDGET: usize = 4096;
 const EMPIRICAL_BMS_BATCH_LANE_CAP: usize = 8;
 
@@ -76,118 +80,6 @@ pub(super) fn empirical_bms_fourth_jet_schedule(r: usize) -> EmpiricalBmsFourthJ
         runtime_width => EmpiricalBmsFourthJetSchedule::DynamicBatch {
             lanes: empirical_bms_runtime_batch_lanes(runtime_width),
         },
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct EmpiricalBmsIndexJetPlan {
-    z: f64,
-    score_values: Vec<f64>,
-    link_stacks: Vec<[f64; 5]>,
-}
-
-#[derive(Clone)]
-struct EmpiricalBmsCalibrationNodeJetPlan {
-    index: EmpiricalBmsIndexJetPlan,
-    weight: f64,
-    cdf_stack: [f64; 5],
-}
-
-/// Canonical empirical-latent Bernoulli row plan shared by rigid and FLEX.
-///
-/// Rigid is the `h = w = None`, `dimension = 2` specialization. FLEX appends
-/// the score-warp and link-deviation primaries. The plan freezes only scalar
-/// base-point data: the certified intercept root, its scalar calibration
-/// Jacobian, the left-biased local spline spans, and primitive derivative
-/// stacks. Every derivative channel is produced by [`Self::evaluate`] from one
-/// [`RuntimeJetScalar`] expression.
-#[derive(Clone)]
-pub(super) struct EmpiricalBmsRowJetPlan {
-    primary: PrimarySlices,
-    pub(super) intercept_root: f64,
-    pub(super) inv_f_a: f64,
-    scale: f64,
-    mu_stack: [f64; 5],
-    calibration: Vec<EmpiricalBmsCalibrationNodeJetPlan>,
-    observed: EmpiricalBmsIndexJetPlan,
-    pub(super) observed_sign: f64,
-    pub(super) observed_neglog_stack: [f64; 5],
-}
-
-impl EmpiricalBmsRowJetPlan {
-    #[inline]
-    fn index_jet<'arena, S: RuntimeJetScalar<'arena>>(
-        &self,
-        a: &S,
-        vars: &[S],
-        index: &EmpiricalBmsIndexJetPlan,
-        workspace: &'arena S::Workspace,
-    ) -> S {
-        let dimension = self.primary.total;
-        let b = &vars[self.primary.logslope];
-        let u = a.add(&b.scale(index.z));
-        let mut inside = u.clone();
-
-        if let Some(range) = self.primary.h.as_ref() {
-            let mut score = S::constant(0.0, dimension, workspace);
-            for (local, idx) in range.clone().enumerate() {
-                score = score.add(&vars[idx].scale(index.score_values[local]));
-            }
-            inside = inside.add(&b.mul(&score));
-        }
-
-        if let Some(range) = self.primary.w.as_ref() {
-            let mut warp = S::constant(0.0, dimension, workspace);
-            for (local, idx) in range.clone().enumerate() {
-                let basis = u.compose_unary(index.link_stacks[local]);
-                warp = warp.add(&vars[idx].mul(&basis));
-            }
-            inside = inside.add(&warp);
-        }
-        inside.scale(self.scale)
-    }
-
-    /// Evaluate the single empirical-row expression in any runtime-sized jet
-    /// algebra. `lift_iters` is two for order-2, three for one-seed, and four
-    /// for two-seed/full-order evaluation.
-    pub(super) fn evaluate<'arena, S: RuntimeJetScalar<'arena>>(
-        &self,
-        vars: &[S],
-        lift_iters: usize,
-        workspace: &'arena S::Workspace,
-    ) -> Result<S, String> {
-        let dimension = self.primary.total;
-        if vars.len() != dimension {
-            return Err(format!(
-                "empirical BMS row plan received {} primaries, expected {dimension}",
-                vars.len()
-            ));
-        }
-        if vars.iter().any(|var| var.dimension() != dimension) {
-            return Err("empirical BMS row plan received a mismatched jet dimension".to_string());
-        }
-
-        let neg_mu = vars[self.primary.q].compose_unary(self.mu_stack).neg();
-        let constraint = |a: &S| -> S {
-            let mut residual = neg_mu.clone();
-            for node in &self.calibration {
-                let eta = self.index_jet(a, vars, &node.index, workspace);
-                residual = residual.add(&eta.compose_unary(node.cdf_stack).scale(node.weight));
-            }
-            residual
-        };
-        let intercept = filtered_implicit_solve_runtime_scalar(
-            self.intercept_root,
-            self.inv_f_a,
-            lift_iters,
-            dimension,
-            workspace,
-            constraint,
-        );
-        let signed = self
-            .index_jet(&intercept, vars, &self.observed, workspace)
-            .scale(self.observed_sign);
-        Ok(signed.compose_unary(self.observed_neglog_stack))
     }
 }
 
@@ -707,13 +599,13 @@ impl BernoulliMarginalSlopeFamily {
         Ok(signed.compose_unary(stack))
     }
 
-    fn empirical_bms_index_jet_plan(
+    fn compile_empirical_bms_index_program(
         &self,
         primary: &PrimarySlices,
         intercept: f64,
         slope: f64,
         z: f64,
-    ) -> Result<EmpiricalBmsIndexJetPlan, String> {
+    ) -> Result<BmsFlexIndexProgram, String> {
         let score_values = if let Some(range) = primary.h.as_ref() {
             let runtime = self.score_warp.as_ref().ok_or_else(|| {
                 "empirical BMS score-warp primary range without runtime".to_string()
@@ -760,7 +652,7 @@ impl BernoulliMarginalSlopeFamily {
         } else {
             Vec::new()
         };
-        Ok(EmpiricalBmsIndexJetPlan {
+        Ok(BmsFlexIndexProgram {
             z,
             score_values,
             link_stacks,
@@ -772,7 +664,7 @@ impl BernoulliMarginalSlopeFamily {
     /// the observed probit index is `scale * (a + b*z + deviations)`. Rigid
     /// callers convert their historical scaled intercept by dividing by
     /// `scale`, making rigid exactly the zero-deviation specialization.
-    pub(super) fn empirical_bms_row_jet_plan(
+    pub(super) fn compile_empirical_bms_row_program(
         &self,
         row: usize,
         primary: &PrimarySlices,
@@ -782,7 +674,7 @@ impl BernoulliMarginalSlopeFamily {
         beta_w: Option<&Array1<f64>>,
         intercept_seed: f64,
         grid: &EmpiricalZGrid,
-    ) -> Result<EmpiricalBmsRowJetPlan, String> {
+    ) -> Result<BmsFlexRowProgram, String> {
         if primary.total < 2 || primary.q >= primary.total || primary.logslope >= primary.total {
             return Err("empirical BMS row plan has an invalid primary layout".to_string());
         }
@@ -863,7 +755,7 @@ impl BernoulliMarginalSlopeFamily {
         let marginal = self.marginal_link_map(q)?;
         let mut calibration = Vec::with_capacity(grid.nodes.len());
         for (node, weight) in grid.pairs() {
-            let index = self.empirical_bms_index_jet_plan(primary, intercept_root, slope, node)?;
+            let index = self.compile_empirical_bms_index_program(primary, intercept_root, slope, node)?;
             let obs = self.observed_denested_cell_partials_at_z(
                 node,
                 intercept_root,
@@ -872,7 +764,7 @@ impl BernoulliMarginalSlopeFamily {
                 beta_w,
             )?;
             let eta = eval_coeff4_at(&obs.coeff, node);
-            calibration.push(EmpiricalBmsCalibrationNodeJetPlan {
+            calibration.push(BmsFlexCalibrationProgramNode {
                 index,
                 weight,
                 cdf_stack: unary_derivatives_normal_cdf(eta),
@@ -880,7 +772,7 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         let observed =
-            self.empirical_bms_index_jet_plan(primary, intercept_root, slope, self.z[row])?;
+            self.compile_empirical_bms_index_program(primary, intercept_root, slope, self.z[row])?;
         let obs = self.observed_denested_cell_partials_at_z(
             self.z[row],
             intercept_root,
@@ -896,36 +788,42 @@ impl BernoulliMarginalSlopeFamily {
                 "empirical BMS row plan has non-finite log Phi at row {row}"
             ));
         }
-        Ok(EmpiricalBmsRowJetPlan {
-            primary: primary.clone(),
+        let point = BmsFlexProgramPoint::new(
+            primary,
+            slope,
+            beta_h,
+            beta_w,
             intercept_root,
-            inv_f_a: 1.0 / f_a,
-            scale: self.probit_frailty_scale(),
-            mu_stack: [
+            1.0 / f_a,
+            self.probit_frailty_scale(),
+            [
                 marginal.mu,
                 marginal.mu1,
                 marginal.mu2,
                 marginal.mu3,
                 marginal.mu4,
             ],
+        )?;
+        BmsFlexRowProgram::from_parts(
+            point,
             calibration,
             observed,
             observed_sign,
             observed_neglog_stack,
-        })
+        )
     }
 
     /// Rigid empirical-latent specialization of the canonical BMS row plan.
     /// The historical rigid scalar root is stored in the scaled probit-index
     /// coordinate; dividing by `scale` maps it into the raw intercept coordinate
     /// used by the shared FLEX expression.
-    pub(super) fn empirical_rigid_bms_row_jet_plan(
+    pub(super) fn compile_empirical_rigid_bms_row_program(
         &self,
         row: usize,
         marginal: BernoulliMarginalLinkMap,
         slope: f64,
         grid: &EmpiricalZGrid,
-    ) -> Result<EmpiricalBmsRowJetPlan, String> {
+    ) -> Result<BmsFlexRowProgram, String> {
         let scale = self.probit_frailty_scale();
         if !(scale.is_finite() && scale > 0.0) {
             return Err(format!(
@@ -946,7 +844,7 @@ impl BernoulliMarginalSlopeFamily {
             w: None,
             total: 2,
         };
-        self.empirical_bms_row_jet_plan(
+        self.compile_empirical_bms_row_program(
             row,
             &primary,
             marginal.eta,
@@ -960,7 +858,7 @@ impl BernoulliMarginalSlopeFamily {
 
     #[inline]
     fn empirical_fixed_third_contracted_arrays<const K: usize>(
-        plan: &EmpiricalBmsRowJetPlan,
+        plan: &BmsFlexRowProgram,
         point: &[f64; K],
         direction: &[f64; K],
     ) -> Result<Array2<f64>, String> {
@@ -976,7 +874,7 @@ impl BernoulliMarginalSlopeFamily {
 
     #[inline]
     fn empirical_fixed_third_contracted<const K: usize>(
-        plan: &EmpiricalBmsRowJetPlan,
+        plan: &BmsFlexRowProgram,
         point: &[f64],
         direction: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
@@ -1000,7 +898,7 @@ impl BernoulliMarginalSlopeFamily {
 
     #[inline]
     fn empirical_fixed_fourth_contracted_arrays<const K: usize>(
-        plan: &EmpiricalBmsRowJetPlan,
+        plan: &BmsFlexRowProgram,
         point: &[f64; K],
         direction_u: &[f64; K],
         direction_v: &[f64; K],
@@ -1022,7 +920,7 @@ impl BernoulliMarginalSlopeFamily {
 
     #[inline]
     fn empirical_fixed_fourth_contracted<const K: usize>(
-        plan: &EmpiricalBmsRowJetPlan,
+        plan: &BmsFlexRowProgram,
         point: &[f64],
         direction_u: &Array1<f64>,
         direction_v: &Array1<f64>,
@@ -1055,7 +953,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     fn empirical_fixed_third_many_from_plan<const K: usize>(
-        plan: &EmpiricalBmsRowJetPlan,
+        plan: &BmsFlexRowProgram,
         point: &[f64],
         directions: &[Array1<f64>],
     ) -> Result<Vec<Array2<f64>>, String> {
@@ -1083,7 +981,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     fn empirical_fixed_third_many_dispatch(
-        plan: &EmpiricalBmsRowJetPlan,
+        plan: &BmsFlexRowProgram,
         point: &[f64],
         directions: &[Array1<f64>],
         r: usize,
@@ -1100,7 +998,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     fn empirical_fixed_third_trace_from_plan<const K: usize>(
-        plan: &EmpiricalBmsRowJetPlan,
+        plan: &BmsFlexRowProgram,
         point: &[f64],
         gram: &[f64],
     ) -> Result<Array1<f64>, String> {
@@ -1141,7 +1039,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     fn empirical_fixed_third_trace_dispatch(
-        plan: &EmpiricalBmsRowJetPlan,
+        plan: &BmsFlexRowProgram,
         point: &[f64],
         gram: &[f64],
         r: usize,
@@ -1158,7 +1056,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     pub(super) fn empirical_fixed_fourth_many_from_plan<const K: usize>(
-        plan: &EmpiricalBmsRowJetPlan,
+        plan: &BmsFlexRowProgram,
         point: &[f64],
         direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
     ) -> Result<Vec<Array2<f64>>, String> {
@@ -1225,7 +1123,7 @@ impl BernoulliMarginalSlopeFamily {
             return Err("non-finite empirical flexible row context in third contraction".into());
         }
         if matches!(r, 4 | 8 | 12 | 18) {
-            let plan = self.empirical_bms_row_jet_plan(
+            let plan = self.compile_empirical_bms_row_program(
                 row,
                 primary,
                 q,
@@ -1303,7 +1201,7 @@ impl BernoulliMarginalSlopeFamily {
         if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
             return Err("non-finite empirical flexible row context in third contraction".into());
         }
-        let plan = self.empirical_bms_row_jet_plan(
+        let plan = self.compile_empirical_bms_row_program(
             row,
             primary,
             q,
@@ -1375,7 +1273,7 @@ impl BernoulliMarginalSlopeFamily {
         if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
             return Err("non-finite empirical flexible row context in third trace gradient".into());
         }
-        let plan = self.empirical_bms_row_jet_plan(
+        let plan = self.compile_empirical_bms_row_program(
             row,
             primary,
             q,
@@ -1451,7 +1349,7 @@ impl BernoulliMarginalSlopeFamily {
             return Err("non-finite empirical flexible row context in fourth contraction".into());
         }
         if matches!(r, 4 | 8 | 12 | 18) {
-            let plan = self.empirical_bms_row_jet_plan(
+            let plan = self.compile_empirical_bms_row_program(
                 row,
                 primary,
                 q,
@@ -1545,7 +1443,7 @@ impl BernoulliMarginalSlopeFamily {
                 })
                 .collect();
         }
-        let plan = self.empirical_bms_row_jet_plan(
+        let plan = self.compile_empirical_bms_row_program(
             row,
             primary,
             q,
@@ -1592,7 +1490,7 @@ impl BernoulliMarginalSlopeFamily {
     /// Execute ordered two-seed contractions in bounded runtime-sized chunks
     /// from one already-frozen row plan.
     pub(super) fn empirical_dynamic_fourth_batch_from_plan(
-        plan: &EmpiricalBmsRowJetPlan,
+        plan: &BmsFlexRowProgram,
         point: &[f64],
         direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
         primary: &PrimarySlices,
@@ -4156,7 +4054,7 @@ mod empirical_flex_jet_oracle_tests {
     //! #932 deployment for the BMS rigid **empirical-grid FLEX** Bernoulli
     //! kernel (score-warp / link-deviation deviation blocks).
     //!
-    //! The production flex path freezes one [`EmpiricalBmsRowJetPlan`] at the
+    //! The production flex path freezes one [`BmsFlexRowProgram`] at the
     //! scalar row state, then evaluates that single expression over the
     //! fixed-width or bounded runtime [`RuntimeJetScalar`] algebra selected by
     //! the consumer schedule. The score-warp
@@ -4766,8 +4664,9 @@ mod empirical_flex_jet_oracle_tests {
     /// empirical FLEX row plan. Higher channels use the packed directional
     /// scalars production uses, so this oracle never depends on the retired
     /// exponential bitmask representation.
-    fn prod_flex_coeff(fx: &FlexFixture, p0: &[f64], dir_indices: &[usize]) -> f64 {
+    fn compiled_flex_fixture_program(fx: &FlexFixture, p0: &[f64]) -> BmsFlexRowProgram {
         let r = fx.primary.total;
+        assert_eq!(p0.len(), r, "canonical flex fixture primary width");
         let q = p0[fx.primary.q];
         let b = p0[fx.primary.logslope];
         let dev_range = if fx.is_score_warp {
@@ -4791,21 +4690,44 @@ mod empirical_flex_jet_oracle_tests {
         let intercept = witness_intercept(fx, marginal.mu, b, &beta, scale);
         let plan = fx
             .family
-            .empirical_bms_row_jet_plan(0, &fx.primary, q, b, beta_h, beta_w, intercept, &fx.grid)
+            .compile_empirical_bms_row_program(0, &fx.primary, q, b, beta_h, beta_w, intercept, &fx.grid)
             .expect("canonical empirical flex plan");
+        plan
+    }
+
+    struct CanonicalFlexOrder2 {
+        value: f64,
+        gradient: Vec<f64>,
+        hessian: Vec<f64>,
+    }
+
+    fn canonical_flex_row_program_order2(fx: &FlexFixture, p0: &[f64]) -> CanonicalFlexOrder2 {
+        let r = fx.primary.total;
+        let plan = compiled_flex_fixture_program(fx, p0);
+        let arena = DynamicJetArena::new();
+        let vars = arena.alloc_slice_fill_with(r, |axis| {
+            gam_math::jet_scalar::DynamicOrder2::variable(p0[axis], axis, r, &arena)
+        });
+        let jet = plan
+            .evaluate(vars, 2, &arena)
+            .expect("canonical order-2 row");
+        CanonicalFlexOrder2 {
+            value: jet.value(),
+            gradient: jet.g().to_vec(),
+            hessian: jet.h().to_vec(),
+        }
+    }
+
+    fn prod_flex_coeff(fx: &FlexFixture, p0: &[f64], dir_indices: &[usize]) -> f64 {
+        let r = fx.primary.total;
+        let plan = compiled_flex_fixture_program(fx, p0);
         match dir_indices {
             [] | [_] | [_, _] => {
-                let arena = DynamicJetArena::new();
-                let vars = arena.alloc_slice_fill_with(r, |axis| {
-                    gam_math::jet_scalar::DynamicOrder2::variable(p0[axis], axis, r, &arena)
-                });
-                let jet = plan
-                    .evaluate(vars, 2, &arena)
-                    .expect("canonical order-2 row");
+                let jet = canonical_flex_row_program_order2(fx, p0);
                 match dir_indices {
-                    [] => jet.value(),
-                    &[axis] => jet.g()[axis],
-                    &[row, column] => jet.h_at(row, column),
+                    [] => jet.value,
+                    &[axis] => jet.gradient[axis],
+                    &[row, column] => jet.hessian[row * r + column],
                     _ => unreachable!(),
                 }
             }
@@ -5115,159 +5037,10 @@ mod empirical_flex_jet_oracle_tests {
         );
     }
 
-    // ----------------------------------------------------------------------
-    // #932 BMS flex single-source (P2/P3): the empirical-grid flex row NLL
-    // value/gradient/Hessian read off ONE runtime-dimension jet — the
-    // calibrated intercept a(θ) lifted directly in the jet by the
-    // implicit-function-theorem operator, the observed signed-probit NLL
-    // composed on top — instead of the hand intercept/slope derivative chains
-    // of `compute_row_analytic_flex_from_parts_into`. This is the runtime
-    // analogue of the rigid `empirical_rigid_row_nll_jet` and mirrors the
-    // exact `flex_tower_witness` term-for-term (Tower4 -> runtime Jet2), so the
-    // gate below pins it to the SAME analytic derivatives the production hand
-    // path produces — at machine precision, no finite-difference truncation.
-
-    /// Observed-index jet `η(a; node) = scale·(a + b·node + warp)` over the `r`
-    /// runtime primaries, the deviation basis entering exactly as the model
-    /// (score-warp: `b·Σβⱼ·Φⱼ(node)`; link-dev: `Σβⱼ·Φⱼ(u)`, `u = a + b·node`).
-    /// `a_jet` is the (lifted or seeded) intercept jet; `b_jet` / `beta_jets`
-    /// are the seeded slope / deviation-coefficient primaries. Reuses
-    /// [`witness_basis_stacks_at`] for the per-column basis derivative stacks so
-    /// it samples the SAME spline branch the exact tower witness does.
-    fn flex_eta_row_jet2(
-        fx: &FlexFixture,
-        a_jet: &crate::bms::test_support::Jet2,
-        b_jet: &crate::bms::test_support::Jet2,
-        beta_jets: &[crate::bms::test_support::Jet2],
-        node: f64,
-        node_arg: f64,
-        scale: f64,
-    ) -> crate::bms::test_support::Jet2 {
-        use crate::bms::test_support::{Jet2, RuntimeJet};
-        let r = a_jet.p();
-        let stacks = witness_basis_stacks_at(fx, node_arg);
-        if fx.is_score_warp {
-            // inside = a + b·(node + Σⱼ βⱼ·Φⱼ(node)); Φⱼ(node) is a constant.
-            let mut warp = Jet2::constant(0.0, r);
-            for (j, stack) in stacks.iter().enumerate() {
-                warp = warp.add(&beta_jets[j].scale(stack[0]));
-            }
-            let inside = a_jet.add(&b_jet.mul(&warp.add(&Jet2::constant(node, r))));
-            inside.scale(scale)
-        } else {
-            // u = a + b·node; warp = Σⱼ βⱼ·Φⱼ(u); inside = u + warp.
-            let u = a_jet.add(&b_jet.scale(node));
-            let mut warp = Jet2::constant(0.0, r);
-            for (j, stack) in stacks.iter().enumerate() {
-                warp = warp.add(&beta_jets[j].mul(&u.compose_unary(*stack)));
-            }
-            let inside = u.add(&warp);
-            inside.scale(scale)
-        }
-    }
-
-    /// Single-source empirical-grid flex row NLL `(value, gradient, Hessian)`
-    /// over the flat primary vector `p = [q, b, β...]` (length `primary.total`),
-    /// produced entirely by the runtime-dimension jet: the calibration
-    /// `F(a, θ) = −μ(q) + Σ_k π_k Φ(η(a; x_k)) = 0` lifts the intercept `a(θ)`
-    /// directly in the jet via [`filtered_implicit_solve_jet2`]; the observed
-    /// signed-probit NLL `−w·logΦ((2y−1)·η)` is then composed on top. No hand
-    /// intercept/slope derivative formulas.
-    fn empirical_flex_row_nll_jet2(fx: &FlexFixture, p0: &[f64]) -> crate::bms::test_support::Jet2 {
-        use crate::bms::test_support::{Jet2, RuntimeJet, filtered_implicit_solve_jet2};
-        let r = fx.primary.total;
-        let q0 = p0[fx.primary.q];
-        let b0 = p0[fx.primary.logslope];
-        let dev_range = if fx.is_score_warp {
-            fx.primary.h.clone().unwrap()
-        } else {
-            fx.primary.w.clone().unwrap()
-        };
-        let beta: Vec<f64> = dev_range.clone().map(|i| p0[i]).collect();
-        let scale = fx.family.probit_frailty_scale();
-        let marginal = bernoulli_marginal_link_map(
-            &InverseLink::Standard(gam_problem::StandardLink::Probit),
-            q0,
-        )
-        .expect("flex jet2 link map");
-
-        // Converged scalar intercept root (the lift's order-0 anchor) from the
-        // independent bracketed solve — shares no jet code with the lift.
-        let a0 = witness_intercept(fx, marginal.mu, b0, &Array1::from(beta.clone()), scale);
-
-        // Seeded primaries: q at slot `primary.q`, b at `primary.logslope`, each
-        // βⱼ at its own deviation slot. q enters the row NLL ONLY through the
-        // calibrated intercept (μ(q) is the calibration target), so it is seeded
-        // for the calibration but never added to the observed index directly.
-        let q_jet = Jet2::primary(q0, fx.primary.q, r);
-        let b_jet = Jet2::primary(b0, fx.primary.logslope, r);
-        let beta_jets: Vec<Jet2> = dev_range
-            .clone()
-            .map(|i| Jet2::primary(p0[i], i, r))
-            .collect();
-        let neg_mu = q_jet
-            .compose_unary([
-                marginal.mu,
-                marginal.mu1,
-                marginal.mu2,
-                marginal.mu3,
-                marginal.mu4,
-            ])
-            .scale(-1.0);
-
-        let basis_arg = |node: f64| -> f64 {
-            if fx.is_score_warp {
-                node
-            } else {
-                a0 + b0 * node
-            }
-        };
-
-        // Calibration Jacobian F_a at the root: Σ_k π_k φ(η₀)·∂η/∂a. The score-
-        // warp basis is a-independent (∂η/∂a = scale); the link-deviation basis
-        // rides the observed index u = a + b·node (∂η/∂a = scale·(1 + Σβⱼ·Φⱼ′)).
-        let mut f_a = 0.0_f64;
-        for (node, weight) in fx.grid.pairs() {
-            let eta0 = witness_eta(fx, a0, b0, &Array1::from(beta.clone()), node, scale);
-            let eta0_a = if fx.is_score_warp {
-                scale
-            } else {
-                let stacks = witness_basis_stacks_at(fx, basis_arg(node));
-                let mut s = 1.0_f64;
-                for (j, stack) in stacks.iter().enumerate() {
-                    s += beta[j] * stack[1];
-                }
-                scale * s
-            };
-            f_a += weight * witness_normal_pdf(eta0) * eta0_a;
-        }
-        assert!(
-            f_a.is_finite() && f_a > 0.0,
-            "flex jet2: non-positive calibration Jacobian F_a={f_a}"
-        );
-        let inv_fa = 1.0 / f_a;
-
-        // Lift a(θ) directly in the jet: F(a, θ) = −μ(q) + Σ_k π_k Φ(η(a; x_k)).
-        let constraint = |a: &Jet2| -> Jet2 {
-            let mut acc = neg_mu.clone();
-            for (node, weight) in fx.grid.pairs() {
-                let eta =
-                    flex_eta_row_jet2(fx, a, &b_jet, &beta_jets, node, basis_arg(node), scale);
-                let cdf = eta.compose_unary(unary_derivatives_normal_cdf(eta.value()));
-                acc = acc.add(&cdf.scale(weight));
-            }
-            acc
-        };
-        let a_jet = filtered_implicit_solve_jet2(a0, inv_fa, 2, r, constraint);
-
-        // Observed signed-probit NLL through the SAME scalar kernel production
-        // uses: η = a(θ) + b·z + warp, ℓ = −w·logΦ((2y−1)·η).
-        let z = fx.family.z[0];
-        let eta_obs = flex_eta_row_jet2(fx, &a_jet, &b_jet, &beta_jets, z, basis_arg(z), scale);
-        let signed = eta_obs.scale(2.0 * fx.family.y[0] - 1.0);
-        let stack = signed_probit_neglog_unary_stack(signed.value(), fx.family.weights[0]);
-        signed.compose_unary(stack)
-    }
+    // The canonical Order2 witness is `canonical_flex_row_program_order2`, which executes
+    // `BmsFlexRowProgram::evaluate`. The former test-only Jet2 likelihood was
+    // deleted: keeping a second row expression as an oracle defeated the
+    // single-source contract this gate is meant to enforce.
 
     /// #932 P2/P3 GATE: the single-source runtime-jet flex row NLL matches the
     /// exact `Tower4<3>` witness on the representative `(q, b, β₀)` block at
@@ -5276,7 +5049,7 @@ mod empirical_flex_jet_oracle_tests {
     /// central-difference of the scalar NLL. A dropped/incorrect implicit-diff,
     /// Leibniz, or Faà di Bruno term would blow the 1e-9 tower bound.
     #[test]
-    fn empirical_flex_row_nll_jet2_matches_tower_and_scalar_932() {
+    fn canonical_flex_row_program_order2_matches_tower_and_scalar_932() {
         for is_score_warp in [true, false] {
             let fx = make_fixture(is_score_warp);
             let r = fx.primary.total;
@@ -5302,38 +5075,38 @@ mod empirical_flex_jet_oracle_tests {
                 "link-dev"
             };
 
-            let jet = empirical_flex_row_nll_jet2(&fx, &p0);
+            let jet = canonical_flex_row_program_order2(&fx, &p0);
             let tower = flex_tower_witness(&fx, &p0);
             let v_scalar = witness_nll(&fx, &p0);
 
             // Value vs the fully independent scalar NLL (shares no jet code).
             assert!(
-                (jet.v - v_scalar).abs() <= 1e-9 * v_scalar.abs().max(1.0),
+                (jet.value - v_scalar).abs() <= 1e-9 * v_scalar.abs().max(1.0),
                 "{label} jet value {:+.12e} != scalar witness {v_scalar:+.12e}",
-                jet.v,
+                jet.value,
             );
 
             // Value / gradient / Hessian vs the exact tower on the (q, b, β₀)
             // block — every cross channel (q×b, b×β, β×β, and the calibration
             // coupling q×* through the lifted intercept).
             assert!(
-                (jet.v - tower.v).abs() <= 1e-9 * tower.v.abs().max(1.0),
+                (jet.value - tower.v).abs() <= 1e-9 * tower.v.abs().max(1.0),
                 "{label} jet value vs tower",
             );
             let axes = [q, b, dev0];
             for &u in axes.iter() {
                 let gu = tower_channel(&fx, &tower, &[u]);
                 assert!(
-                    (jet.g[u] - gu).abs() <= 1e-9 * gu.abs().max(1.0),
+                    (jet.gradient[u] - gu).abs() <= 1e-9 * gu.abs().max(1.0),
                     "{label} grad[{u}] {:+.12e} != tower {gu:+.12e}",
-                    jet.g[u],
+                    jet.gradient[u],
                 );
                 for &v in axes.iter() {
                     let huv = tower_channel(&fx, &tower, &[u, v]);
                     assert!(
-                        (jet.h[u * r + v] - huv).abs() <= 1e-9 * huv.abs().max(1.0),
+                        (jet.hessian[u * r + v] - huv).abs() <= 1e-9 * huv.abs().max(1.0),
                         "{label} hess[{u},{v}] {:+.12e} != tower {huv:+.12e}",
-                        jet.h[u * r + v],
+                        jet.hessian[u * r + v],
                     );
                 }
             }
@@ -5348,16 +5121,16 @@ mod empirical_flex_jet_oracle_tests {
                 pm[i] -= step;
                 let fd = (witness_nll(&fx, &pp) - witness_nll(&fx, &pm)) / (2.0 * step);
                 assert!(
-                    (jet.g[i] - fd).abs() <= 1e-5 * fd.abs().max(1.0) + 1e-8,
+                    (jet.gradient[i] - fd).abs() <= 1e-5 * fd.abs().max(1.0) + 1e-8,
                     "{label} grad[{i}] {:+.12e} != fd {fd:+.12e}",
-                    jet.g[i],
+                    jet.gradient[i],
                 );
             }
         }
     }
 
     /// #932 P3 GATE (direct hand-vs-jet certificate): the single-source
-    /// runtime-jet flex row NLL ([`empirical_flex_row_nll_jet2`]) reproduces the
+    /// runtime-jet flex row NLL ([`canonical_flex_row_program_order2`]) reproduces the
     /// production HAND path `compute_row_analytic_flex_from_parts_into` — value,
     /// dense `r`-gradient, AND full `r×r` Hessian — to ≤1e-9 on the
     /// empirical-grid branch (the branch the empirical fixture routes the hand
@@ -5370,7 +5143,7 @@ mod empirical_flex_jet_oracle_tests {
     /// with score-warp OR link-wiggle active, deaths (y=1) at the observed row.
     /// A dropped IFT / Leibniz / Faà di Bruno term in either path blows the bound.
     #[test]
-    fn empirical_flex_row_nll_jet2_matches_hand_path_932() {
+    fn canonical_flex_row_program_order2_matches_hand_path_932() {
         for is_score_warp in [true, false] {
             let fx = make_fixture(is_score_warp);
             let r = fx.primary.total;
@@ -5453,23 +5226,23 @@ mod empirical_flex_jet_oracle_tests {
                 )
                 .expect("hand flex path");
 
-            let jet = empirical_flex_row_nll_jet2(&fx, &p0);
+            let jet = canonical_flex_row_program_order2(&fx, &p0);
 
             assert!(
-                (neglog - jet.v).abs() <= 1e-9 * jet.v.abs().max(1.0),
+                (neglog - jet.value).abs() <= 1e-9 * jet.value.abs().max(1.0),
                 "{label} value: hand {neglog:+.12e} != jet {:+.12e}",
-                jet.v,
+                jet.value,
             );
             for u in 0..r {
                 assert!(
-                    (scratch.grad[u] - jet.g[u]).abs() <= 1e-9 * jet.g[u].abs().max(1.0),
+                    (scratch.grad[u] - jet.gradient[u]).abs() <= 1e-9 * jet.gradient[u].abs().max(1.0),
                     "{label} grad[{u}]: hand {:+.12e} != jet {:+.12e}",
                     scratch.grad[u],
-                    jet.g[u],
+                    jet.gradient[u],
                 );
                 for v in 0..r {
                     let h_hand = scratch.hess[[u, v]];
-                    let h_jet = jet.h[u * r + v];
+                    let h_jet = jet.hessian[u * r + v];
                     assert!(
                         (h_hand - h_jet).abs() <= 1e-9 * h_jet.abs().max(1.0),
                         "{label} hess[{u},{v}]: hand {h_hand:+.12e} != jet {h_jet:+.12e}"
@@ -5482,7 +5255,7 @@ mod empirical_flex_jet_oracle_tests {
     /// #932 BMS-flex cutover INC-1(b) GATE: the per-denested-cell moment
     /// compiler (production `flex_grid_calibration_derivs_compiled_jet2`, reached
     /// through `compute_row_analytic_flex_from_parts_into`) reproduces the
-    /// INDEPENDENT grid jet `empirical_flex_row_nll_jet2` (value / dense gradient /
+    /// INDEPENDENT grid jet `canonical_flex_row_program_order2` (value / dense gradient /
     /// full Hessian) to ≤1e-9 on DEGENERATE empirical grids — a sparse grid whose
     /// four nodes leave several denested cells EMPTY and at least one holding a
     /// single node (the degenerate-moment paths where a compiled accumulator
@@ -5490,7 +5263,7 @@ mod empirical_flex_jet_oracle_tests {
     /// `b>0` AND `b<0`. The fixture routes the `GlobalEmpirical` branch, i.e. the
     /// production path the cutover replaces; `jet2` is a fully independent
     /// per-node reference (proven vs the hand path by
-    /// `empirical_flex_row_nll_jet2_matches_hand_path_932`).
+    /// `canonical_flex_row_program_order2_matches_hand_path_932`).
     #[test]
     fn flex_factored_matches_jet2_degenerate_grids_932() {
         let sparse = crate::bms::EmpiricalZGrid::new(
@@ -5575,7 +5348,7 @@ mod empirical_flex_jet_oracle_tests {
                         &mut scratch,
                     )
                     .expect("compiled moment-jet flex path");
-                let jet = empirical_flex_row_nll_jet2(&fx, &p0);
+                let jet = canonical_flex_row_program_order2(&fx, &p0);
                 let label = if is_score_warp {
                     "score-warp"
                 } else {
@@ -5583,20 +5356,20 @@ mod empirical_flex_jet_oracle_tests {
                 };
                 let tol = |x: f64| 1e-9 * x.abs().max(1.0);
                 assert!(
-                    (neglog - jet.v).abs() <= tol(jet.v),
+                    (neglog - jet.value).abs() <= tol(jet.value),
                     "{label} b={b0} value: factored {neglog:+.12e} != jet2 {:+.12e}",
-                    jet.v
+                    jet.value
                 );
                 for u in 0..r {
                     assert!(
-                        (scratch.grad[u] - jet.g[u]).abs() <= tol(jet.g[u]),
+                        (scratch.grad[u] - jet.gradient[u]).abs() <= tol(jet.gradient[u]),
                         "{label} b={b0} grad[{u}]: factored {:+.12e} != jet2 {:+.12e}",
                         scratch.grad[u],
-                        jet.g[u]
+                        jet.gradient[u]
                     );
                     for v in 0..r {
                         let h_f = scratch.hess[[u, v]];
-                        let h_j = jet.h[u * r + v];
+                        let h_j = jet.hessian[u * r + v];
                         assert!(
                             (h_f - h_j).abs() <= tol(h_j),
                             "{label} b={b0} hess[{u},{v}]: factored {h_f:+.12e} != jet2 {h_j:+.12e}"

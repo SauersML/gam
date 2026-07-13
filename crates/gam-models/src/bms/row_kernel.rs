@@ -314,7 +314,7 @@ impl gam_math::jet_tower::RowProgram<2> for BernoulliRigidRowKernel {
             Some(grid) => {
                 let plan = self
                     .family
-                    .empirical_rigid_bms_row_jet_plan(row, marginal, slope, &grid)?;
+                    .compile_empirical_rigid_bms_row_program(row, marginal, slope, &grid)?;
                 let vars = [
                     gam_math::jet_scalar::FixedRuntimeJet::from_inner(p[0]),
                     gam_math::jet_scalar::FixedRuntimeJet::from_inner(p[1]),
