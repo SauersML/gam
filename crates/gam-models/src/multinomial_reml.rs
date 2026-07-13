@@ -314,7 +314,7 @@ impl<'row> MultinomialLogitRowProgram<'row> {
     pub(crate) fn hessian_diagonal_into(&self, probabilities: &mut [f64], diagonal: &mut [f64]) {
         let active_classes = self.eta.len();
         assert_eq!(diagonal.len(), active_classes);
-        let _ = self.probabilities_into(probabilities);
+        self.probabilities_into(probabilities);
         for axis in 0..active_classes {
             let probability = probabilities[axis];
             diagonal[axis] = self.weight * probability * (1.0 - probability);

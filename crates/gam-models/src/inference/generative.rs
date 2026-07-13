@@ -5,6 +5,7 @@ use gam_problem::types::{
 };
 use gam_solve::estimate::EstimationError;
 use ndarray::{Array1, Array2};
+use rand::Rng as _;
 
 /// THE single source of truth for the scalar dispersion the generative
 /// observation model uses for a fitted family — the value handed to

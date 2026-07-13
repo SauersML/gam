@@ -15,39 +15,6 @@ pub(crate) const SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS: [&str; 6] = [
 pub(crate) const PREDICTION_INTERVAL_COLUMNS: [&str; 2] = ["mean_lower", "mean_upper"];
 pub(crate) const PREDICTION_STD_ERROR_COLUMN: &str = "std_error";
 
-pub(crate) fn write_matrix_csv(
-    path: &Path,
-    mat: &Array2<f64>,
-    prefix: &str,
-) -> Result<(), CliError> {
-    let mut wtr = WriterBuilder::new()
-        .has_headers(true)
-        .from_path(path)
-        .map_err(|e| CliError::FileWriteFailed {
-            reason: format!("failed to create output csv '{}': {e}", path.display()),
-        })?;
-    let headers = (0..mat.ncols())
-        .map(|j| format!("{prefix}_{j}"))
-        .collect::<Vec<_>>();
-    wtr.write_record(headers)
-        .map_err(|e| CliError::FileWriteFailed {
-            reason: format!("failed to write csv header: {e}"),
-        })?;
-    for i in 0..mat.nrows() {
-        let row = (0..mat.ncols())
-            .map(|j| format!("{:.12}", mat[[i, j]]))
-            .collect::<Vec<_>>();
-        wtr.write_record(row)
-            .map_err(|e| CliError::FileWriteFailed {
-                reason: format!("failed to write csv row {i}: {e}"),
-            })?;
-    }
-    wtr.flush().map_err(|e| CliError::FileWriteFailed {
-        reason: format!("failed to flush csv writer: {e}"),
-    })?;
-    Ok(())
-}
-
 pub(crate) fn load_prediction_id_values(
     path: &Path,
     id_column: &str,
