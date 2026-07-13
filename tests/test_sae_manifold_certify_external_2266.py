@@ -1,4 +1,4 @@
-"""Wheel-surface pytest for the #2266 evaluation-only certification entry.
+"""Wheel-surface pytest for the #2263/#2266 installed-state audit entry.
 
 #2266 / #2263 item 4 asks for a way to certify an externally-trained
 (torch-lane) SAE-manifold state — no closed-form solve — and get the same
@@ -13,8 +13,8 @@ exact arrays back into ``gamfit.sae_manifold_certify_external`` as if they had
 arrived from an external (e.g. torch) trainer, and check the certify path
 reproduces the SAME pinned contract the Rust test checks:
 
-* ``termination["verdict"] == "external"`` and ``termination["evals"] == 0``
-  (no outer/inner solve ran on this path);
+* ``termination["verdict"] == "audited_stationary"`` and
+  ``termination["evals"] == 0`` (no optimization ran on this path);
 * ``structure_certificate`` is a non-empty serialized certificate even with
   structure search disabled (a trivially-certifying empty ledger);
 * ``reconstruction_r2`` is finite and ``fitted`` / ``assignments_z`` carry the
@@ -110,9 +110,10 @@ def test_certify_external_round_trips_a_genuinely_converged_native_fit():
     )
 
     # --- the pinned #2266 contract (same as the Rust unit test) -----------
-    assert report["termination"]["verdict"] == "external", (
-        "the certify entry must report the External verdict, never a "
-        "Search/FixedRho certificate for state it never optimized"
+    assert report["status"] == "certified"
+    assert report["is_fit"] is True
+    assert report["termination"]["verdict"] == "audited_stationary", (
+        "the fit must identify the exact-point audit rather than claim a search ran"
     )
     assert report["termination"]["evals"] == 0, (
         "no outer/inner evaluation should run on the certify path"
@@ -148,6 +149,47 @@ def test_certify_external_round_trips_a_genuinely_converged_native_fit():
 
     assert np.isfinite(report["penalized_quasi_laplace_criterion"]), (
         "the penalized objective evaluated at the installed state must be finite"
+    )
+
+
+def test_certify_external_returns_typed_nonfit_for_perturbed_state():
+    fit, x = _fit_circle(seed=11)
+    decoder_blocks = [np.asarray(block, dtype=float).copy() for block in fit.decoder_blocks]
+    decoder_blocks[0].flat[0] += 0.25
+    report = gamfit.sae_manifold_certify_external(
+        X=x,
+        atom_basis=list(fit.basis_kinds),
+        d_atom=[int(v) for v in fit.atom_dims],
+        decoder_blocks=decoder_blocks,
+        t_init=[np.asarray(block, dtype=float) for block in fit.coords],
+        a_init=np.asarray(fit.low_level_logits, dtype=float),
+        log_lambda_smooth=[float(v) for v in fit.selected_log_lambda_smooth],
+        log_ard=[[float(v) for v in atom] for atom in fit.selected_log_ard],
+        duchon_centers=[
+            None if center is None else np.asarray(center, dtype=float)
+            for center in fit.duchon_centers
+        ],
+        n_harmonics=_n_harmonics_or_none(fit.basis_kinds, fit.n_harmonics),
+        assignment=fit.assignment,
+        alpha=float(fit.alpha),
+        tau=float(fit.tau),
+        log_lambda_sparse=float(fit.selected_log_lambda_sparse),
+        learnable_alpha=bool(fit.learnable_alpha),
+        top_k=None if fit.top_k is None else int(fit.top_k),
+        threshold_gate_threshold=float(fit.threshold_gate_threshold),
+        run_structure_search=False,
+    )
+
+    assert report["status"] == "nonstationary"
+    assert report["is_fit"] is False
+    assert report["optimization_iterations"] == 0
+    assert report["structure_search"] is None
+    assert report["structure_certificate"] is None
+    assert "fitted" not in report
+    assert "termination" not in report
+    assert report["inner_kkt"]["certifies"] is False or (
+        report["outer_stationarity"]["projected_gradient_norm"]
+        > report["outer_stationarity"]["stationarity_bound"]
     )
 
 

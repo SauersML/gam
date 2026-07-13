@@ -289,7 +289,7 @@ def sae_manifold_certify_external(
     analytic_penalties: Mapping[str, Any] | None = None,
     fisher_factors: Any = None,
 ) -> dict[str, Any]:
-    """Certify an externally-trained (torch-lane) manifold-SAE state (#2266).
+    """Audit and certify an externally-trained manifold-SAE state (#2263/#2266).
 
     Unlike :func:`sae_manifold_fit`, this runs NO closed-form solve: `t_init`
     (per-atom trained on-manifold coordinates), `a_init` (trained routing
@@ -301,13 +301,14 @@ def sae_manifold_certify_external(
     trained under" contract the frozen-decoder OOS encode carries) — an
     initial-strength substitute certifies a different model.
 
-    Returns the same report dict shape the native fit's internal payload
-    uses (`certificates`, `structure_certificate`, `atom_inference`,
-    `coordinate_fidelity`, diagnostics, …); `outer_termination.verdict` reads
-    `"external"` rather than a native stationarity certificate, since no
-    optimization ran here. Python only converts user containers to
-    contiguous arrays; validation, dictionary rebuild, certification, and
-    diagnostics are owned by the native evaluation-only entry.
+    The native entry takes no optimization step. It first measures the exact
+    installed-state inner KKT residual and outer criterion stationarity. A
+    passing state returns the ordinary fit report with
+    `status="certified"` and termination verdict `"audited_stationary"`. A
+    failing state returns `status="nonstationary"`, `is_fit=False`, typed
+    inner/outer residual diagnostics, and no fit or structure certificate.
+    Python only converts containers; validation, audit, and certification are
+    native-owned.
     """
     x = _matrix(X)
     k_atoms = len(atom_basis)
