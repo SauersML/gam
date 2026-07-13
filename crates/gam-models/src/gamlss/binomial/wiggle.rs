@@ -3123,10 +3123,8 @@ impl BinomialWiggleFirstDirectionalRows {
             + xt_diag_y_dense(&basis[0], &self.coeff_ww_bd, &basis[1])?
             + xt_diag_y_dense(&basis[1], &self.coeff_ww_bd, &basis[0])?;
         out.slice_mut(s![0..pt, pt + pls..]).assign(&h_tw);
-        out.slice_mut(s![pt..pt + pls, pt + pls..])
-            .assign(&h_lw);
-        out.slice_mut(s![pt + pls.., pt + pls..])
-            .assign(&h_ww);
+        out.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&h_lw);
+        out.slice_mut(s![pt + pls.., pt + pls..]).assign(&h_ww);
         mirror_upper_to_lower(&mut out);
         Ok(out)
     }
@@ -3204,10 +3202,8 @@ impl BinomialWiggleSecondDirectionalRows {
             + xt_diag_y_dense(&basis[2], &self.coeff_ww_bdd, &basis[0])?
             + xt_diag_x_dense(&basis[1], &self.coeff_ww_dd)?;
         out.slice_mut(s![0..pt, pt + pls..]).assign(&h_tw);
-        out.slice_mut(s![pt..pt + pls, pt + pls..])
-            .assign(&h_lw);
-        out.slice_mut(s![pt + pls.., pt + pls..])
-            .assign(&h_ww);
+        out.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&h_lw);
+        out.slice_mut(s![pt + pls.., pt + pls..]).assign(&h_ww);
         mirror_upper_to_lower(&mut out);
         Ok(out)
     }
@@ -3323,22 +3319,9 @@ impl BinomialLocationScaleWiggleFamily {
         ))))
     }
 
-    /// Build a matrix-free `RowCoeffOperator` for the BLS Wiggle joint
-    /// second directional derivative `D²_β H_L[u, v]`. Channels: X_t,
-    /// X_ls, B, B', B'', B'''.
-    ///
-    /// The dense path computes a per-row scalar `coeff_*(i, j[, k])` via
-    /// `second_directionalhessian_coeff_fromobjective_q_terms` and outer-
-    /// products it into the (t,t) / (t,ls) / (ls,ls) / (t,w) / (ls,w) /
-    /// (w,w) blocks. Each `coeff_tw(i, j)` is *linear* in the basis
-    /// derivatives at column j (`br[j], dr[j], ddr[j], d3r[j]` — they
-    /// only ever appear once in the q-Hessian directional polynomial),
-    /// so each per-(i,j) contribution decomposes into 4 channel-pair
-    /// row coefficients (X_t, B/B'/B''/B'''). The wiggle-wiggle term
-    /// `coeff_ww(i, j, k)` is *bilinear* in (br[j], dr[j], ddr[j]) ⊗
-    /// (br[k], dr[k], ddr[k]), giving 4 symmetric pair coefficients on
-    /// (B, B), (B, B'), (B, B''), (B', B'). No (B'', B'') term — the
-    /// formula is at most degree 2 in any single basis derivative.
+    /// Build the matrix-free `D²H[u,v]` operator from the K=8 typed-probe
+    /// instantiation of the canonical row expression. Probe Hessian entries
+    /// lower directly onto the B/B'/B''/B''' channel plan.
     pub(crate) fn bls_wiggle_second_directional_operator(
         &self,
         block_states: &[ParameterBlockState],
@@ -3347,340 +3330,46 @@ impl BinomialLocationScaleWiggleFamily {
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
-        let (n, eta_t, eta_ls, etaw) = self.validated_block_etas(block_states)?;
         let pt = x_t_arc.ncols();
         let pls = x_ls_arc.ncols();
-        let betaw0 = block_states[Self::BLOCK_WIGGLE].beta.clone();
-        let core0 = binomial_location_scale_core(
-            &self.y,
-            &self.weights,
-            eta_t,
-            eta_ls,
-            Some(etaw),
-            &self.link_kind,
-        )?;
-        let b0 = self.wiggle_design(core0.q0.view())?;
-        let d0 =
-            self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::first_derivative())?;
-        let dd0 =
-            self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::second_derivative())?;
-        let d3_basis = self.wiggle_d3basis_constrained(core0.q0.view())?;
-        let d3q = self.wiggle_d3q_dq03(core0.q0.view(), betaw0.view())?;
-        let d4q = self.wiggle_d4q_dq04(core0.q0.view(), betaw0.view())?;
-        let pw = b0.ncols();
-        let beta_layout = GamlssBetaLayout::withwiggle(pt, pls, pw);
-        let total = beta_layout.total();
-        if d_beta_u.len() != total || d_beta_v.len() != total {
-            return Err(GamlssError::InvalidInput {
-                reason: format!(
-                    "BLS wiggle d2H operator: d_beta_{{u,v}} length {}/{} != {}",
-                    d_beta_u.len(),
-                    d_beta_v.len(),
-                    total
-                ),
-            }
-            .into());
-        }
-        if d0.ncols() != betaw0.len()
-            || dd0.ncols() != betaw0.len()
-            || d3_basis.ncols() != betaw0.len()
-        {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "wiggle derivative/beta mismatch in d2H operator: B'={} B''={} B'''={} betaw={}",
-                d0.ncols(),
-                dd0.ncols(),
-                d3_basis.ncols(),
-                betaw0.len()
-            ) }.into());
-        }
-
-        let (u_t, u_ls, uw) = beta_layout.split_three(d_beta_u, "wiggle d2H op u")?;
-        let (v_t, v_ls, vw) = beta_layout.split_three(d_beta_v, "wiggle d2H op v")?;
+        let program = BinomialLocationScaleWiggleRowProgram::new(self, block_states, 4)?;
+        let pw = program.beta_w.len();
+        let layout = GamlssBetaLayout::withwiggle(pt, pls, pw);
+        let (u_t, u_ls, u_w) = layout.split_three(d_beta_u, "wiggle d2H operator u")?;
+        let (v_t, v_ls, v_w) = layout.split_three(d_beta_v, "wiggle d2H operator v")?;
         let d_eta_t_u = fast_av(x_t_arc.as_ref(), &u_t);
         let d_eta_ls_u = fast_av(x_ls_arc.as_ref(), &u_ls);
         let d_eta_t_v = fast_av(x_t_arc.as_ref(), &v_t);
         let d_eta_ls_v = fast_av(x_ls_arc.as_ref(), &v_ls);
+        let BinomialWiggleSecondDirectionalRows {
+            coeff_tt,
+            coeff_tl,
+            coeff_ll,
+            coeff_tw_b,
+            coeff_tw_d,
+            coeff_tw_dd,
+            coeff_tw_d3,
+            coeff_lw_b,
+            coeff_lw_d,
+            coeff_lw_dd,
+            coeff_lw_d3,
+            coeff_ww_bb,
+            coeff_ww_bd,
+            coeff_ww_bdd,
+            coeff_ww_dd,
+        } = program.second_directional_rows(
+            &d_eta_t_u,
+            &d_eta_ls_u,
+            u_w.view(),
+            &d_eta_t_v,
+            &d_eta_ls_v,
+            v_w.view(),
+        )?;
 
-        let m = d0.dot(&betaw0) + 1.0;
-        let g2 = dd0.dot(&betaw0);
-        let g3 = d3q;
-        let g4 = d4q;
-        let (sigma, ds, d2s, d3s, d4s) = exp_sigma_derivs_up_to_fourth_array(eta_ls.view());
-
-        // Per-row scalar pair coefficients.
-        let mut coeff_tt = Array1::<f64>::zeros(n);
-        let mut coeff_tl = Array1::<f64>::zeros(n);
-        let mut coeff_ll = Array1::<f64>::zeros(n);
-        // Per-row coefficients for the t↔wiggle decomposition into
-        // (X_t, B), (X_t, B'), (X_t, B''), (X_t, B''') pair entries.
-        let mut alpha_tw_b = Array1::<f64>::zeros(n);
-        let mut alpha_tw_d = Array1::<f64>::zeros(n);
-        let mut alpha_tw_dd = Array1::<f64>::zeros(n);
-        let mut alpha_tw_d3 = Array1::<f64>::zeros(n);
-        let mut alpha_lw_b = Array1::<f64>::zeros(n);
-        let mut alpha_lw_d = Array1::<f64>::zeros(n);
-        let mut alpha_lw_dd = Array1::<f64>::zeros(n);
-        let mut alpha_lw_d3 = Array1::<f64>::zeros(n);
-        // Wiggle-wiggle bilinear pair entries on (B,B), (B,B'), (B,B''), (B',B').
-        let mut c_ww_bb = Array1::<f64>::zeros(n);
-        let mut c_ww_bd = Array1::<f64>::zeros(n);
-        let mut c_ww_bdd = Array1::<f64>::zeros(n);
-        let mut c_ww_dd_pair = Array1::<f64>::zeros(n);
-
-        for i in 0..n {
-            let q_i = core0.q0[i] + etaw[i];
-            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
-                self.y[i],
-                self.weights[i],
-                q_i,
-                core0.mu[i],
-                core0.dmu_dq[i],
-                core0.d2mu_dq2[i],
-                core0.d3mu_dq3[i],
-                &self.link_kind,
-            );
-            let m4 = binomial_neglog_q_fourth_derivative_dispatch(
-                self.y[i],
-                self.weights[i],
-                q_i,
-                core0.mu[i],
-                core0.dmu_dq[i],
-                core0.d2mu_dq2[i],
-                core0.d3mu_dq3[i],
-                &self.link_kind,
-            )?;
-
-            let q0_d = nonwiggle_q_derivs(eta_t[i], sigma[i]);
-            let s_safe = sigma[i];
-            let s2 = s_safe * s_safe;
-            let s3 = s2 * s_safe;
-            let s4 = s3 * s_safe;
-            let s5 = s4 * s_safe;
-            let q0_tl_ls_ls =
-                d3s[i] / s2 - 6.0 * ds[i] * d2s[i] / s3 + 6.0 * ds[i] * ds[i] * ds[i] / s4;
-            let q0_tl_ls_ls_ls =
-                d4s[i] / s2 - 8.0 * ds[i] * d3s[i] / s3 - 6.0 * d2s[i] * d2s[i] / s3
-                    + 36.0 * ds[i] * ds[i] * d2s[i] / s4
-                    - 24.0 * ds[i] * ds[i] * ds[i] * ds[i] / s5;
-            let q0_ll_ls_ls = eta_t[i] * q0_tl_ls_ls_ls;
-
-            let u_t_i = d_eta_t_u[i];
-            let u_ls_i = d_eta_ls_u[i];
-            let v_t_i = d_eta_t_v[i];
-            let v_ls_i = d_eta_ls_v[i];
-
-            let dq0_u = q0_d.q_t * u_t_i + q0_d.q_ls * u_ls_i;
-            let dq0v = q0_d.q_t * v_t_i + q0_d.q_ls * v_ls_i;
-            let d2q0_uv =
-                q0_d.q_tl * (u_t_i * v_ls_i + v_t_i * u_ls_i) + q0_d.q_ll * u_ls_i * v_ls_i;
-
-            let dq0_t_u = q0_d.q_tl * u_ls_i;
-            let dq0_tv = q0_d.q_tl * v_ls_i;
-            let dq0_ls_u = q0_d.q_tl * u_t_i + q0_d.q_ll * u_ls_i;
-            let dq0_lsv = q0_d.q_tl * v_t_i + q0_d.q_ll * v_ls_i;
-            let dq0_tl_u = q0_d.q_tl_ls * u_ls_i;
-            let dq0_tlv = q0_d.q_tl_ls * v_ls_i;
-            let dq0_ll_u = q0_d.q_tl_ls * u_t_i + q0_d.q_ll_ls * u_ls_i;
-            let dq0_llv = q0_d.q_tl_ls * v_t_i + q0_d.q_ll_ls * v_ls_i;
-
-            let d2q0_t_uv = q0_d.q_tl_ls * u_ls_i * v_ls_i;
-            let d2q0_ls_uv =
-                q0_d.q_tl_ls * (u_ls_i * v_t_i + v_ls_i * u_t_i) + q0_d.q_ll_ls * u_ls_i * v_ls_i;
-            let d2q0_tl_uv = q0_tl_ls_ls * u_ls_i * v_ls_i;
-            let d2q0_ll_uv =
-                q0_tl_ls_ls * (u_t_i * v_ls_i + v_t_i * u_ls_i) + q0_ll_ls_ls * u_ls_i * v_ls_i;
-
-            let br = b0.row(i);
-            let dr = d0.row(i);
-            let ddr = dd0.row(i);
-            let d3r = d3_basis.row(i);
-            let b_u = br.dot(&uw);
-            let bv = br.dot(&vw);
-            let b1_u = dr.dot(&uw);
-            let b1v = dr.dot(&vw);
-            let b2_u = ddr.dot(&uw);
-            let b2v = ddr.dot(&vw);
-            let b3_u = d3r.dot(&uw);
-            let b3v = d3r.dot(&vw);
-
-            let dm_u = b1_u + g2[i] * dq0_u;
-            let dmv = b1v + g2[i] * dq0v;
-            let d2m_uv = g3[i] * dq0_u * dq0v + g2[i] * d2q0_uv + b2v * dq0_u + b2_u * dq0v;
-            let dg2_u = b2_u + g3[i] * dq0_u;
-            let dg2v = b2v + g3[i] * dq0v;
-            let d2g2_uv = g4[i] * dq0_u * dq0v + g3[i] * d2q0_uv + b3v * dq0_u + b3_u * dq0v;
-
-            let dq_u = m[i] * dq0_u + b_u;
-            let dqv = m[i] * dq0v + bv;
-            let d2q_uv = m[i] * d2q0_uv + g2[i] * dq0_u * dq0v + b1_u * dq0v + b1v * dq0_u;
-
-            let q_t = m[i] * q0_d.q_t;
-            let q_ls = m[i] * q0_d.q_ls;
-            let q_tt = g2[i] * q0_d.q_t * q0_d.q_t;
-            let q_tl = g2[i] * q0_d.q_t * q0_d.q_ls + m[i] * q0_d.q_tl;
-            let q_ll = g2[i] * q0_d.q_ls * q0_d.q_ls + m[i] * q0_d.q_ll;
-
-            let dq_t_u = dm_u * q0_d.q_t + m[i] * dq0_t_u;
-            let dq_tv = dmv * q0_d.q_t + m[i] * dq0_tv;
-            let dq_ls_u = dm_u * q0_d.q_ls + m[i] * dq0_ls_u;
-            let dq_lsv = dmv * q0_d.q_ls + m[i] * dq0_lsv;
-
-            let d2q_t_uv = d2m_uv * q0_d.q_t + dm_u * dq0_tv + dmv * dq0_t_u + m[i] * d2q0_t_uv;
-            let d2q_ls_uv =
-                d2m_uv * q0_d.q_ls + dm_u * dq0_lsv + dmv * dq0_ls_u + m[i] * d2q0_ls_uv;
-
-            let dq_tt_u = dg2_u * q0_d.q_t * q0_d.q_t + g2[i] * (2.0 * q0_d.q_t * dq0_t_u);
-            let dq_ttv = dg2v * q0_d.q_t * q0_d.q_t + g2[i] * (2.0 * q0_d.q_t * dq0_tv);
-            let d2q_tt_uv = d2g2_uv * q0_d.q_t * q0_d.q_t
-                + dg2_u * (2.0 * q0_d.q_t * dq0_tv)
-                + dg2v * (2.0 * q0_d.q_t * dq0_t_u)
-                + g2[i] * (2.0 * dq0_t_u * dq0_tv + 2.0 * q0_d.q_t * d2q0_t_uv);
-
-            let dq_tl_u = dg2_u * q0_d.q_t * q0_d.q_ls
-                + g2[i] * (dq0_t_u * q0_d.q_ls + q0_d.q_t * dq0_ls_u)
-                + dm_u * q0_d.q_tl
-                + m[i] * dq0_tl_u;
-            let dq_tlv = dg2v * q0_d.q_t * q0_d.q_ls
-                + g2[i] * (dq0_tv * q0_d.q_ls + q0_d.q_t * dq0_lsv)
-                + dmv * q0_d.q_tl
-                + m[i] * dq0_tlv;
-            let d2q_tl_uv = d2g2_uv * q0_d.q_t * q0_d.q_ls
-                + dg2_u * (dq0_tv * q0_d.q_ls + q0_d.q_t * dq0_lsv)
-                + dg2v * (dq0_t_u * q0_d.q_ls + q0_d.q_t * dq0_ls_u)
-                + g2[i]
-                    * (d2q0_t_uv * q0_d.q_ls
-                        + dq0_t_u * dq0_lsv
-                        + dq0_tv * dq0_ls_u
-                        + q0_d.q_t * d2q0_ls_uv)
-                + d2m_uv * q0_d.q_tl
-                + dm_u * dq0_tlv
-                + dmv * dq0_tl_u
-                + m[i] * d2q0_tl_uv;
-
-            let dq_ll_u = dg2_u * q0_d.q_ls * q0_d.q_ls
-                + g2[i] * (2.0 * q0_d.q_ls * dq0_ls_u)
-                + dm_u * q0_d.q_ll
-                + m[i] * dq0_ll_u;
-            let dq_llv = dg2v * q0_d.q_ls * q0_d.q_ls
-                + g2[i] * (2.0 * q0_d.q_ls * dq0_lsv)
-                + dmv * q0_d.q_ll
-                + m[i] * dq0_llv;
-            let d2q_ll_uv = d2g2_uv * q0_d.q_ls * q0_d.q_ls
-                + dg2_u * (2.0 * q0_d.q_ls * dq0_lsv)
-                + dg2v * (2.0 * q0_d.q_ls * dq0_ls_u)
-                + g2[i] * (2.0 * dq0_ls_u * dq0_lsv + 2.0 * q0_d.q_ls * d2q0_ls_uv)
-                + d2m_uv * q0_d.q_ll
-                + dm_u * dq0_llv
-                + dmv * dq0_ll_u
-                + m[i] * d2q0_ll_uv;
-
-            // Scalar pair coefficients on (X_t, X_t), (X_t, X_ls), (X_ls, X_ls).
-            coeff_tt[i] = second_directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_t, q_t, q_tt, dq_t_u, dq_tv, dq_t_u, dq_tv,
-                d2q_t_uv, d2q_t_uv, dq_tt_u, dq_ttv, d2q_tt_uv,
-            );
-            coeff_tl[i] = second_directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_t, q_ls, q_tl, dq_t_u, dq_tv, dq_ls_u, dq_lsv,
-                d2q_t_uv, d2q_ls_uv, dq_tl_u, dq_tlv, d2q_tl_uv,
-            );
-            coeff_ll[i] = second_directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_ls, q_ls, q_ll, dq_ls_u, dq_lsv, dq_ls_u,
-                dq_lsv, d2q_ls_uv, d2q_ls_uv, dq_ll_u, dq_llv, d2q_ll_uv,
-            );
-
-            // Cross block (X_a, B/B'/B''/B''') with X_a ∈ {X_t, X_ls}. Each
-            // `coeff_xw(i, j)` is linear in (br[j], dr[j], ddr[j], d3r[j])
-            // because each q-Hessian variable carrying `j` (q_xw, dq_xw_u,
-            // dq_xwv, d2q_xw_uv, qw, dqw_u, dqwv, d2qw_uv) is linear in those
-            // four. We expand `second_directionalhessian_coeff_fromobjective_q_terms`
-            // by collecting like basis-derivative powers; the coefficients are
-            // the four α_xw_{b,d,dd,d3} arrays.
-            //
-            // qw=br, dqw_u=dr·dq0u, dqwv=dr·dq0v, d2qw_uv=ddr·dq0u·dq0v + dr·d2q0_uv
-            // q_xw=dr·q0_x, dq_xw_u=ddr·dq0u·q0_x + dr·dq0_x_u, dq_xwv=ddr·dq0v·q0_x + dr·dq0_xv
-            // d2q_xw_uv=d3r·dq0u·dq0v·q0_x + ddr·(d2q0_uv·q0_x + dq0u·dq0_xv + dq0v·dq0_x_u) + dr·d2q0_x_uv
-            //
-            // d_qaqb_u = dq_x_u·qw + q_x·dqw_u  →  dq_x_u·br + q_x·dr·dq0u
-            // d_qaqbv  = dq_xv·qw + q_x·dqwv    →  dq_xv·br + q_x·dr·dq0v
-            // d2_qaqb_uv = d2q_x_uv·br + dq_x_u·dr·dq0v + dq_xv·dr·dq0u + q_x·d2qw_uv
-            //
-            // The full formula (expanded for "tw"; "lw" identical with x→ls):
-            //
-            //   m4·dq_u·dqv·q_x·br
-            // + m3·(d2q_uv·q_x·br + dq_u·(dq_xv·br + q_x·dr·dq0v) + dqv·(dq_x_u·br + q_x·dr·dq0u) + dq_u·dqv·dr·q0_x)
-            // + m2·(d2q_x_uv·br + dq_x_u·dr·dq0v + dq_xv·dr·dq0u + q_x·(ddr·dq0u·dq0v + dr·d2q0_uv)
-            //       + d2q_uv·dr·q0_x + dq_u·(ddr·dq0v·q0_x + dr·dq0_xv) + dqv·(ddr·dq0u·q0_x + dr·dq0_x_u))
-            // + m1·(d3r·dq0u·dq0v·q0_x + ddr·(d2q0_uv·q0_x + dq0u·dq0_xv + dq0v·dq0_x_u) + dr·d2q0_x_uv)
-            //
-            // Collecting like basis-derivative terms produces the closed-form
-            // expressions below.
-
-            // X_t ↔ wiggle channels.
-            alpha_tw_b[i] = m4 * dq_u * dqv * q_t
-                + m3 * (d2q_uv * q_t + dq_u * dq_tv + dqv * dq_t_u)
-                + m2 * d2q_t_uv;
-            alpha_tw_d[i] = m3 * (dq_u * q_t * dq0v + dqv * q_t * dq0_u + dq_u * dqv * q0_d.q_t)
-                + m2 * (dq_t_u * dq0v
-                    + dq_tv * dq0_u
-                    + q_t * d2q0_uv
-                    + d2q_uv * q0_d.q_t
-                    + dq_u * dq0_tv
-                    + dqv * dq0_t_u)
-                + m1 * d2q0_t_uv;
-            alpha_tw_dd[i] = m2
-                * (q_t * dq0_u * dq0v + dq_u * dq0v * q0_d.q_t + dqv * dq0_u * q0_d.q_t)
-                + m1 * (d2q0_uv * q0_d.q_t + dq0_u * dq0_tv + dq0v * dq0_t_u);
-            alpha_tw_d3[i] = m1 * dq0_u * dq0v * q0_d.q_t;
-
-            // X_ls ↔ wiggle channels (same formulas, swap t→ls).
-            alpha_lw_b[i] = m4 * dq_u * dqv * q_ls
-                + m3 * (d2q_uv * q_ls + dq_u * dq_lsv + dqv * dq_ls_u)
-                + m2 * d2q_ls_uv;
-            alpha_lw_d[i] = m3 * (dq_u * q_ls * dq0v + dqv * q_ls * dq0_u + dq_u * dqv * q0_d.q_ls)
-                + m2 * (dq_ls_u * dq0v
-                    + dq_lsv * dq0_u
-                    + q_ls * d2q0_uv
-                    + d2q_uv * q0_d.q_ls
-                    + dq_u * dq0_lsv
-                    + dqv * dq0_ls_u)
-                + m1 * d2q0_ls_uv;
-            alpha_lw_dd[i] = m2
-                * (q_ls * dq0_u * dq0v + dq_u * dq0v * q0_d.q_ls + dqv * dq0_u * q0_d.q_ls)
-                + m1 * (d2q0_uv * q0_d.q_ls + dq0_u * dq0_lsv + dq0v * dq0_ls_u);
-            alpha_lw_d3[i] = m1 * dq0_u * dq0v * q0_d.q_ls;
-
-            // Wiggle ↔ wiggle (bilinear in (br, dr, ddr) ⊗ (br, dr, ddr); no d3r).
-            //
-            // qa=brj, qb=brk, qab=0, dqa_u=drj·dq0u, dqav=drj·dq0v,
-            // dqb_u=drk·dq0u, dqbv=drk·dq0v, d2qa_uv=ddrj·dq0u·dq0v+drj·d2q0_uv,
-            // d2qb_uv=ddrk·dq0u·dq0v+drk·d2q0_uv, dqab_u=0, dqabv=0, d2qab_uv=0.
-            //
-            //   m4·dq_u·dqv·brj·brk
-            // + m3·(d2q_uv·brj·brk + dq_u·(drj·dq0v·brk + brj·drk·dq0v)
-            //                       + dqv·(drj·dq0u·brk + brj·drk·dq0u))
-            // + m2·d2_qaqb_uv
-            // where d2_qaqb_uv = (ddrj·dq0u·dq0v+drj·d2q0_uv)·brk
-            //                  + drj·dq0u·drk·dq0v + drj·dq0v·drk·dq0u
-            //                  + brj·(ddrk·dq0u·dq0v+drk·d2q0_uv).
-            //
-            // Pair (B, B): m4·dq_u·dqv + m3·d2q_uv  → coefficient of br[j]·br[k].
-            // Pair (B, B'): m3·(dq_u·dq0v + dqv·dq0u) + m2·d2q0_uv → br·dr + dr·br.
-            // Pair (B, B''): m2·dq0u·dq0v → br·ddr + ddr·br.
-            // Pair (B', B'): 2·m2·dq0u·dq0v → dr·dr (the diagonal pair only
-            //   accumulates once in `RowCoeffOperator`, so we double-count
-            //   here to match the symmetric `dr[j]·dq0u·dr[k]·dq0v +
-            //   dr[j]·dq0v·dr[k]·dq0u` cross product).
-            c_ww_bb[i] = m4 * dq_u * dqv + m3 * d2q_uv;
-            c_ww_bd[i] = m3 * (dq_u * dq0v + dqv * dq0_u) + m2 * d2q0_uv;
-            c_ww_bdd[i] = m2 * dq0_u * dq0v;
-            c_ww_dd_pair[i] = 2.0 * m2 * dq0_u * dq0v;
-        }
-
-        let basis: Arc<Array2<f64>> = Arc::new(b0);
-        let basis_d1: Arc<Array2<f64>> = Arc::new(d0);
-        let basis_d2: Arc<Array2<f64>> = Arc::new(dd0);
-        let basis_d3: Arc<Array2<f64>> = Arc::new(d3_basis);
-
+        let basis: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[0].clone());
+        let basis_d1: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[1].clone());
+        let basis_d2: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[2].clone());
+        let basis_d3: Arc<Array2<f64>> = Arc::new(program.basis_derivatives[3].clone());
         Ok(Some(Arc::new(RowCoeffOperator::from_directions(
             vec![pt, pls, pw],
             vec![
@@ -3692,39 +3381,23 @@ impl BinomialLocationScaleWiggleFamily {
                 (2, basis_d3),
             ],
             vec![
-                // (X_t, X_t)   ← `d2_h[a, b] += coeff_tt · xtr[a] · xtr[b]`
                 (0, 0, coeff_tt),
-                // (X_t, X_ls)  ← `d2_h[a, pt+b] += coeff_tl · xtr[a] · xlsr[b]`
                 (0, 1, coeff_tl),
-                // (X_ls, X_ls) ← `d2_h[pt+a, pt+b] += coeff_ll · xlsr[a] · xlsr[b]`
                 (1, 1, coeff_ll),
-                // (X_t, B/B'/B''/B''') ← per-row α_tw_{b,d,dd,d3} decomposition of
-                // `d2_h[a, pt+pls+j] += coeff_tw(i,j) · xtr[a]` (coeff_tw is
-                // linear in br[j], dr[j], ddr[j], d3r[j])
-                (0, 2, alpha_tw_b),
-                (0, 3, alpha_tw_d),
-                (0, 4, alpha_tw_dd),
-                (0, 5, alpha_tw_d3),
-                // (X_ls, B/B'/B''/B''') ← analogous α_lw_{b,d,dd,d3} decomposition
-                // of `d2_h[pt+a, pt+pls+j] += coeff_lw(i,j) · xlsr[a]`
-                (1, 2, alpha_lw_b),
-                (1, 3, alpha_lw_d),
-                (1, 4, alpha_lw_dd),
-                (1, 5, alpha_lw_d3),
-                // (B, B/B'/B'') ← bilinear decomposition of
-                // `d2_h[pt+pls+j, pt+pls+k] += coeff_ww(i,j,k)` in
-                // (br, dr, ddr) ⊗ (br, dr, ddr); no d3r entry — coeff_ww is
-                // at most degree 2 in any single basis derivative.
-                (2, 2, c_ww_bb),
-                (2, 3, c_ww_bd),
-                (2, 4, c_ww_bdd),
-                // (B', B') diagonal — coefficient absorbs a factor of 2 to
-                // match the symmetric `dr[j]·dq0u·dr[k]·dq0v + dr[j]·dq0v·
-                // dr[k]·dq0u` cross product (the diagonal pair only
-                // accumulates once in `RowCoeffOperator::mul_vec`).
-                (3, 3, c_ww_dd_pair),
+                (0, 2, coeff_tw_b),
+                (0, 3, coeff_tw_d),
+                (0, 4, coeff_tw_dd),
+                (0, 5, coeff_tw_d3),
+                (1, 2, coeff_lw_b),
+                (1, 3, coeff_lw_d),
+                (1, 4, coeff_lw_dd),
+                (1, 5, coeff_lw_d3),
+                (2, 2, coeff_ww_bb),
+                (2, 3, coeff_ww_bd),
+                (2, 4, coeff_ww_bdd),
+                (3, 3, coeff_ww_dd),
             ],
-            n,
+            self.y.len(),
         ))))
     }
 }
