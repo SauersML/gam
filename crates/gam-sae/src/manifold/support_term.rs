@@ -250,7 +250,7 @@ impl SaeSupportSparseTerm {
         self.atom_rows.iter().map(Vec::len).sum()
     }
 
-    fn beta_layout(&self) -> Result<(Vec<usize>, usize), String> {
+    pub(crate) fn beta_layout(&self) -> Result<(Vec<usize>, usize), String> {
         let mut offsets = Vec::with_capacity(self.k_atoms());
         let mut cursor = 0usize;
         for atom in &self.atoms {

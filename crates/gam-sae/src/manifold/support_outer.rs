@@ -22,7 +22,6 @@ use super::*;
 const SUPPORT_LAML_CONTEXT: &str = "support-sparse TopK grouped LAML";
 const SUPPORT_LAML_TRACE_PROBES: usize = 16;
 const SUPPORT_LAML_CG_REL_TOL: f64 = 1.0e-8;
-const SUPPORT_LAML_SLQ_REL_TOL: f64 = 1.0e-8;
 
 fn outer_error(message: impl Into<String>) -> EstimationError {
     EstimationError::RemlOptimizationFailed(message.into())
@@ -328,9 +327,7 @@ impl SaeSupportOuterObjective {
             * (joint_logdet - penalty_logdet
                 + residual_df
                     * (1.0
-                        + (std::f64::consts::TAU * std::f64::consts::PI * rss
-                            / residual_df)
-                            .ln()));
+                        + (std::f64::consts::TAU * rss / residual_df).ln()));
         let traces = self.trace_by_group(&system, &cache, &lambda_smooth)?;
         let energy = self.penalty_energy_by_group(&lambda_smooth);
         let mut gradient = Array1::<f64>::zeros(self.layout.group_keys.len());
