@@ -1972,44 +1972,37 @@ fn compute_multiblock_alo_chunk(
             }
         }
 
-        // Factor in place with partial pivoting; ridge on the diagonal if singular.
-        // Equivalence with original: original computed det via det_small, regularized
-        // by adding eps=1e-6 to the diagonal when |det| < 1e-12, then re-factored on
-        // the regularized matrix. Here we factor directly; if any pivot is below the
-        // singular threshold we add the ridge once and re-factor — same numerical path.
-        if !lu_factor_in_place(&mut scratch.imwa, &mut scratch.perm_imwa, b) {
-            for r in 0..b {
-                for c in 0..b {
-                    let idx = r * b + c;
-                    let id = if r == c { 1.0 } else { 0.0 };
-                    scratch.imwa[idx] = id - scratch.wa[idx];
-                }
-            }
-            for d in 0..b {
-                scratch.imwa[d * b + d] += ALO_LOCAL_BLOCK_RIDGE;
-            }
-            let refactored = lu_factor_in_place(&mut scratch.imwa, &mut scratch.perm_imwa, b);
-            assert!(
-                refactored,
-                "ALO local block remained singular after ridge regularization"
-            );
+        // Unit deletion leverage makes the exact frozen-H deletion system
+        // singular. That is diagnostic information, not a request to alter the
+        // estimand with a fixed local ridge. Use a scale-aware backward-error
+        // threshold and refuse with the offending row.
+        let imwa_tolerance = local_lu_pivot_tolerance(&scratch.imwa, b);
+        if !lu_factor_in_place(
+            &mut scratch.imwa,
+            &mut scratch.perm_imwa,
+            b,
+            imwa_tolerance,
+        ) {
+            return Err(AloError::LooComputationFailed {
+                reason: format!(
+                    "multi-block ALO deletion system I-WA is singular at row {i}; local pivot allowance {imwa_tolerance:.6e}, leverage trace {:.6e}",
+                    leverage[local_i]
+                ),
+            });
         }
-        if !lu_factor_in_place(&mut scratch.imaw, &mut scratch.perm_imaw, b) {
-            for r in 0..b {
-                for c in 0..b {
-                    let idx = r * b + c;
-                    let id = if r == c { 1.0 } else { 0.0 };
-                    scratch.imaw[idx] = id - scratch.aw[idx];
-                }
-            }
-            for d in 0..b {
-                scratch.imaw[d * b + d] += ALO_LOCAL_BLOCK_RIDGE;
-            }
-            let refactored = lu_factor_in_place(&mut scratch.imaw, &mut scratch.perm_imaw, b);
-            assert!(
-                refactored,
-                "ALO local variance block remained singular after ridge regularization"
-            );
+        let imaw_tolerance = local_lu_pivot_tolerance(&scratch.imaw, b);
+        if !lu_factor_in_place(
+            &mut scratch.imaw,
+            &mut scratch.perm_imaw,
+            b,
+            imaw_tolerance,
+        ) {
+            return Err(AloError::LooComputationFailed {
+                reason: format!(
+                    "multi-block ALO transpose deletion system I-AW is singular at row {i}; local pivot allowance {imaw_tolerance:.6e}, leverage trace {:.6e}",
+                    leverage[local_i]
+                ),
+            });
         }
 
         // v_i = (I - W A)⁻¹ s_i  -- solve into rhs_buf.
@@ -2034,26 +2027,49 @@ fn compute_multiblock_alo_chunk(
             scratch.delta_eta[r] = acc;
         }
 
-        let eta_i = &input.eta_hat[i];
+        let eta_i = &input.coordinate_values[i];
         let mut corrected = Array1::<f64>::zeros(b);
         for d in 0..b {
             corrected[d] = eta_i[d] + scratch.delta_eta[d];
+            if !scratch.delta_eta[d].is_finite() || !corrected[d].is_finite() {
+                return Err(AloError::LooComputationFailed {
+                    reason: format!(
+                        "multi-block ALO correction is non-finite at row {i}, coordinate {d}: delta={}, corrected={}",
+                        scratch.delta_eta[d], corrected[d]
+                    ),
+                });
+            }
         }
         eta_tilde.push(corrected);
 
-        // Cook's distance: δη^T W δη.
+        // Cook's distance uses score covariance, not observed curvature.
         let mut cook = 0.0f64;
+        let mut cook_scale = 0.0f64;
         for r in 0..b {
-            let mut w_delta_r = 0.0f64;
+            let mut covariance_delta_r = 0.0f64;
             let row_off = r * b;
             for k in 0..b {
-                w_delta_r += scratch.w_flat[row_off + k] * scratch.delta_eta[k];
+                covariance_delta_r +=
+                    scratch.covariance_flat[row_off + k] * scratch.delta_eta[k];
             }
-            cook += scratch.delta_eta[r] * w_delta_r;
+            let term = scratch.delta_eta[r] * covariance_delta_r;
+            cook += term;
+            cook_scale += term.abs();
         }
-        cook_distance[local_i] = cook;
+        let cook_tolerance = LOCAL_DELETE_SOLVE_ROUNDOFF_FACTOR
+            * b as f64
+            * f64::EPSILON
+            * cook_scale;
+        if !cook.is_finite() || cook < -cook_tolerance {
+            return Err(AloError::LooComputationFailed {
+                reason: format!(
+                    "multi-block ALO Cook influence is invalid at row {i}: value {cook:.6e}, roundoff allowance {cook_tolerance:.6e}"
+                ),
+            });
+        }
+        cook_distance[local_i] = cook.max(0.0);
 
-        // var_diag[d] = a_d^T (I-WA)⁻¹ W (I-AW)⁻¹ a_d
+        // var_diag[d] = a_d^T (I-WA)⁻¹ C (I-AW)⁻¹ a_d
         // where a_d is the d-th row of A_i.
         // Reuses already-factored imwa and imaw (one LU factorization each, reused
         // across all B right-hand sides — major saving over the original which redid
@@ -2071,27 +2087,43 @@ fn compute_multiblock_alo_chunk(
                 &mut scratch.lu_scratch,
                 b,
             );
-            // w_u = W u_d
+            // covariance_u = C u_d
             for r in 0..b {
                 let mut acc = 0.0f64;
                 let wr = r * b;
                 for k in 0..b {
-                    acc += scratch.w_flat[wr + k] * scratch.rhs_buf[k];
+                    acc += scratch.covariance_flat[wr + k] * scratch.rhs_buf[k];
                 }
-                scratch.w_u[r] = acc;
+                scratch.covariance_u[r] = acc;
             }
-            // t_d = (I - W A)⁻¹ w_u  (back-solve in place using w_u as RHS).
+            // t_d = (I - W A)⁻¹ C u_d.
             lu_solve_in_place(
                 &scratch.imwa,
                 &scratch.perm_imwa,
-                &mut scratch.w_u,
+                &mut scratch.covariance_u,
                 &mut scratch.lu_scratch,
                 b,
             );
             // v_dd = a_d^T t_d
             let mut v_dd = 0.0f64;
             for k in 0..b {
-                v_dd += scratch.a_i[row_off + k] * scratch.w_u[k];
+                v_dd += scratch.a_i[row_off + k] * scratch.covariance_u[k];
+            }
+            let variance_scale = scratch.a_i[row_off..row_off + b]
+                .iter()
+                .zip(scratch.covariance_u.iter())
+                .map(|(left, right)| (left * right).abs())
+                .sum::<f64>();
+            let variance_tolerance = LOCAL_DELETE_SOLVE_ROUNDOFF_FACTOR
+                * b as f64
+                * f64::EPSILON
+                * variance_scale;
+            if !v_dd.is_finite() || v_dd < -variance_tolerance {
+                return Err(AloError::LooComputationFailed {
+                    reason: format!(
+                        "multi-block ALO variance is invalid at row {i}, coordinate {d}: value {v_dd:.6e}, roundoff allowance {variance_tolerance:.6e}"
+                    ),
+                });
             }
             scratch.var_diag_buf[d] = v_dd.max(0.0);
         }
@@ -2127,13 +2159,31 @@ fn mat_mul_flat(a: &[f64], b_mat: &[f64], out: &mut [f64], b: usize) {
     }
 }
 
+/// Scale-aware pivot allowance for a B × B row-major local system.
+fn local_lu_pivot_tolerance(matrix: &[f64], b: usize) -> f64 {
+    let norm_inf = (0..b)
+        .map(|row| {
+            matrix[row * b..row * b + b]
+                .iter()
+                .map(|value| value.abs())
+                .sum::<f64>()
+        })
+        .fold(0.0_f64, f64::max);
+    LOCAL_DELETE_SOLVE_ROUNDOFF_FACTOR * b as f64 * f64::EPSILON * norm_inf
+}
+
 /// LU-decompose a B × B row-major matrix in place with partial pivoting and
-/// physical row swaps. Returns false if any pivot |a_kk| < 1e-12 (singular).
+/// physical row swaps. Returns false if any pivot is within the caller's
+/// scale-aware backward-error allowance.
 /// On success, `m` holds L (strict lower, unit diag implicit) and U (upper, diag
 /// included); `perm[k]` records the original-row index that ended up in physical
-/// row k after pivoting. Pivot threshold matches the original `det_small < 1e-12`
-/// path so the regularization branch fires under equivalent conditions.
-fn lu_factor_in_place(m: &mut [f64], perm: &mut [usize], b: usize) -> bool {
+/// row k after pivoting.
+fn lu_factor_in_place(
+    m: &mut [f64],
+    perm: &mut [usize],
+    b: usize,
+    pivot_tolerance: f64,
+) -> bool {
     for i in 0..b {
         perm[i] = i;
     }
@@ -2148,7 +2198,7 @@ fn lu_factor_in_place(m: &mut [f64], perm: &mut [usize], b: usize) -> bool {
                 max_idx = row;
             }
         }
-        if max_val < LU_PIVOT_SINGULAR_TOL {
+        if max_val <= pivot_tolerance {
             return false;
         }
         if max_idx != col {
@@ -2192,161 +2242,6 @@ fn lu_solve_in_place(m: &[f64], perm: &[usize], rhs: &mut [f64], scratch: &mut [
         rhs[row] = s / m[row * b + row];
     }
 }
-
-/// Compute only per-observation leverages tr(H_ii) for multi-predictor models.
-///
-/// This is cheaper than the full ALO correction when only EDF or leverage
-/// diagnostics are needed (no scores or W⁻¹ computation required).
-///
-/// Returns an n-length array of leverages.  The total model EDF is the sum
-/// of all leverages.
-pub fn compute_multiblock_alo_leverages(
-    n_obs: usize,
-    n_blocks: usize,
-    block_designs: &[Array2<f64>],
-    penalized_hessian_inv: &Array2<f64>,
-    block_weights: &[Array2<f64>],
-) -> Result<Array1<f64>, EstimationError> {
-    use rayon::prelude::*;
-
-    let n = n_obs;
-    let b = n_blocks;
-    let p_tot = penalized_hessian_inv.nrows();
-
-    let col_offsets = multiblock_col_offsets(block_designs);
-    let max_workers = rayon::current_num_threads();
-    let chunk_size = multiblock_alo_parallel_leverage_chunk_size(p_tot, b, n, max_workers);
-
-    let mut leverage = Array1::<f64>::zeros(n);
-
-    // Per-block H_inv stripe scratch (p_tot × p_blk) is read-only once built
-    // and shared by the parallel chunks.  Only per-chunk q/XT/B×B scratch is
-    // replicated across Rayon workers.
-    let block_widths: Vec<usize> = block_designs.iter().map(|d| d.ncols()).collect();
-    let mut h_stripes: Vec<FaerMat<f64>> = block_widths
-        .iter()
-        .map(|&p_blk| FaerMat::<f64>::zeros(p_tot, p_blk))
-        .collect();
-    // Populate the H_inv stripes once: each block reads a constant column slab
-    // out of `penalized_hessian_inv` and copies it into a column-major faer Mat.
-    for blk in 0..b {
-        let off_b = col_offsets[blk];
-        let p_blk = block_widths[blk];
-        let stripe = &mut h_stripes[blk];
-        for c in 0..p_blk {
-            for r in 0..p_tot {
-                stripe[(r, c)] = penalized_hessian_inv[(r, off_b + c)];
-            }
-        }
-    }
-
-    leverage
-        .as_slice_mut()
-        .expect("newly allocated Array1 is contiguous")
-        .par_chunks_mut(chunk_size)
-        .enumerate()
-        .for_each(|(chunk_idx, leverage_chunk)| {
-            let chunk_start = chunk_idx * chunk_size;
-            let chunk_len = leverage_chunk.len();
-            let chunk_end = chunk_start + chunk_len;
-
-            // Chunk-local scratch: B×B flat row-major buffers for A_i, W_i
-            // and AW = A·W.  Each worker writes only its `leverage_chunk`, so
-            // output writes are disjoint and require no synchronization.
-            let bb_sz = b * b;
-            let mut a_i = vec![0.0f64; bb_sz];
-            let mut aw = vec![0.0f64; bb_sz];
-            let mut w_flat = vec![0.0f64; bb_sz];
-
-            // Column-major faer storage for q_blocks: q_k has shape
-            // (p_tot, chunk_len) with contiguous columns, so
-            // `col_as_slice(local_i)` is a direct stripe.
-            let mut q_storage: Vec<FaerMat<f64>> = block_widths
-                .iter()
-                .map(|_| FaerMat::<f64>::zeros(p_tot, chunk_len))
-                .collect();
-
-            // Per-block X^T scratch in column-major faer storage
-            // (p_blk × chunk_len), owned by this chunk to keep the matmul input
-            // contiguous without sharing mutable scratch across threads.
-            let mut xt_storage: Vec<FaerMat<f64>> = block_widths
-                .iter()
-                .map(|&p_blk| FaerMat::<f64>::zeros(p_blk, chunk_len))
-                .collect();
-
-            // Build q_blocks[blk] = H_inv[:, off..off+p_blk] · X_blk[chunk, :]^T
-            // entirely in column-major faer storage so subsequent column reads
-            // are contiguous f64 stripes — replaces the per-chunk `to_owned()`
-            // ndarray slicing + row-major `dot()` from the original.
-            for blk in 0..b {
-                let p_blk = block_widths[blk];
-
-                let x_chunk = block_designs[blk].slice(s![chunk_start..chunk_end, ..]);
-                let xt = &mut xt_storage[blk];
-                for local_i in 0..chunk_len {
-                    let row = x_chunk.row(local_i);
-                    for j in 0..p_blk {
-                        xt[(j, local_i)] = row[j];
-                    }
-                }
-
-                matmul(
-                    q_storage[blk].as_mut(),
-                    Accum::Replace,
-                    h_stripes[blk].as_ref(),
-                    xt_storage[blk].as_ref(),
-                    1.0,
-                    Par::Seq,
-                );
-            }
-
-            for local_i in 0..chunk_len {
-                let i = chunk_start + local_i;
-                let w_i = &block_weights[i];
-
-                // Flatten W_i once per observation (row-major).
-                for r in 0..b {
-                    for c in 0..b {
-                        w_flat[r * b + c] = w_i[(r, c)];
-                    }
-                }
-
-                // Assemble A_i[a, k] = X_a[i, :] · q_k[off_a:off_a+p_a, local_i].
-                // For each k, read its column once (contiguous f64 stripe), then
-                // for each a take the matching offset slab.
-                for r in 0..bb_sz {
-                    a_i[r] = 0.0;
-                }
-                for k in 0..b {
-                    let q_k = &q_storage[k];
-                    let q_col = q_k.col_as_slice(local_i);
-                    for a in 0..b {
-                        let p_a = block_widths[a];
-                        let off_a = col_offsets[a];
-                        let xa_row = block_designs[a].row(i);
-                        let mut dot = 0.0f64;
-                        for j in 0..p_a {
-                            dot = xa_row[j].mul_add(q_col[off_a + j], dot);
-                        }
-                        a_i[a * b + k] = dot;
-                    }
-                }
-
-                // AW = A_i · W_i (B×B), then leverage = trace(AW) = sum_{a,k} A[a,k]·W[k,a].
-                mat_mul_flat(&a_i, &w_flat, &mut aw, b);
-                let mut tr = 0.0f64;
-                for d in 0..b {
-                    tr += aw[d * b + d];
-                }
-                leverage_chunk[local_i] = tr;
-            }
-        });
-
-    Ok(leverage)
-}
-
-// (Allocation-free, factor-once-reuse-many B×B LU helpers live next to the
-// multi-block ALO callsite — see `lu_factor_in_place` and `lu_solve_in_place`.)
 
 #[cfg(test)]
 mod tests {
@@ -2603,7 +2498,8 @@ mod tests {
 
     // --- Multi-block ALO tests ---
 
-    use super::{MultiBlockAloInput, compute_multiblock_alo, compute_multiblock_alo_leverages};
+    use super::{MultiBlockAloInput, compute_multiblock_alo};
+    use gam_linalg::matrix::DesignMatrix;
     use ndarray::{Array1, Array2};
 
     #[test]
@@ -2643,21 +2539,25 @@ mod tests {
             scalar_lev[i] = w[i] * xhx;
         }
 
-        // Multi-block with B=1.
-        let block_designs = vec![x.clone()];
-        let block_weights: Vec<Array2<f64>> =
+        // Multi-block with B=1. The score covariance is deliberately supplied
+        // separately even though this well-specified fixture sets C_i = W_i.
+        let coordinate_designs = vec![DesignMatrix::from(x.clone())];
+        let observed_hessians: Vec<Array2<f64>> =
             w.iter().map(|&wi| Array2::from_elem((1, 1), wi)).collect();
+        let score_covariances = observed_hessians.clone();
         let scores: Vec<Array1<f64>> = (0..n).map(|_| Array1::from_vec(vec![0.1])).collect();
-        let eta_hat: Vec<Array1<f64>> = (0..n).map(|i| Array1::from_vec(vec![i as f64])).collect();
+        let coordinate_values: Vec<Array1<f64>> =
+            (0..n).map(|i| Array1::from_vec(vec![i as f64])).collect();
 
         let input = MultiBlockAloInput {
             n_obs: n,
-            n_blocks: 1,
-            block_designs: &block_designs,
-            penalized_hessian_inv: &h_inv,
-            block_weights,
-            scores,
-            eta_hat,
+            n_coordinates: 1,
+            coordinate_designs: &coordinate_designs,
+            penalized_hessian: &h,
+            observed_hessians: &observed_hessians,
+            score_covariances: &score_covariances,
+            scores: &scores,
+            coordinate_values: &coordinate_values,
         };
 
         let result = compute_multiblock_alo(&input).unwrap();
@@ -2673,48 +2573,74 @@ mod tests {
     }
 
     #[test]
-    fn multiblock_leverage_only_matches_full() {
-        // Verify that compute_multiblock_alo_leverages returns the same
-        // leverages as compute_multiblock_alo.
-        let n = 4;
-        let p1 = 2;
-        let p2 = 3;
-        let x1 = Array2::from_shape_fn((n, p1), |(i, j)| (i + j + 1) as f64 * 0.3);
-        let x2 = Array2::from_shape_fn((n, p2), |(i, j)| (i * 2 + j) as f64 * 0.2 - 0.1);
-        let p_tot = p1 + p2;
-        let h_inv = Array2::<f64>::eye(p_tot); // Simple identity for test.
-        let block_weights: Vec<Array2<f64>> = (0..n)
-            .map(|i| {
-                let v = (i + 1) as f64;
-                Array2::from_shape_vec((2, 2), vec![v, 0.1, 0.1, v * 0.5]).unwrap()
-            })
-            .collect();
-        let scores: Vec<Array1<f64>> = (0..n).map(|_| Array1::from_vec(vec![0.0, 0.0])).collect();
-        let eta_hat: Vec<Array1<f64>> = (0..n).map(|_| Array1::from_vec(vec![0.0, 0.0])).collect();
-        let block_designs = vec![x1.clone(), x2.clone()];
-
+    fn multiblock_b2_matches_closed_form_with_cross_geometry() {
+        // A one-row B=2 identity-Jacobian fixture pins every matrix ordering:
+        // A=H^-1, M=I-WA, delta=A M^-1 s, leverage=tr(AW), and the distinct
+        // score covariance C drives Cook/variance. Diagonal-only or C=W code
+        // cannot pass this fixture.
+        let coordinate_designs = vec![
+            DesignMatrix::from(Array2::from_elem((1, 1), 1.0)),
+            DesignMatrix::from(Array2::from_elem((1, 1), 1.0)),
+        ];
+        let h = Array2::from_shape_vec((2, 2), vec![2.0, 0.25, 0.25, 3.0]).unwrap();
+        let w = Array2::from_shape_vec((2, 2), vec![0.2, 0.05, 0.05, 0.3]).unwrap();
+        let c = Array2::from_shape_vec((2, 2), vec![0.5, 0.1, 0.1, 0.4]).unwrap();
+        let observed_hessians = vec![w.clone()];
+        let score_covariances = vec![c.clone()];
+        let scores = vec![Array1::from_vec(vec![0.4, -0.2])];
+        let coordinate_values = vec![Array1::from_vec(vec![1.0, -0.5])];
         let input = MultiBlockAloInput {
-            n_obs: n,
-            n_blocks: 2,
-            block_designs: &block_designs,
-            penalized_hessian_inv: &h_inv,
-            block_weights: block_weights.clone(),
-            scores,
-            eta_hat,
+            n_obs: 1,
+            n_coordinates: 2,
+            coordinate_designs: &coordinate_designs,
+            penalized_hessian: &h,
+            observed_hessians: &observed_hessians,
+            score_covariances: &score_covariances,
+            scores: &scores,
+            coordinate_values: &coordinate_values,
         };
-        let full = compute_multiblock_alo(&input).unwrap();
-        let lev_only =
-            compute_multiblock_alo_leverages(n, 2, &block_designs, &h_inv, &block_weights).unwrap();
 
-        for i in 0..n {
+        let det_h = h[[0, 0]] * h[[1, 1]] - h[[0, 1]] * h[[1, 0]];
+        let a = Array2::from_shape_vec(
+            (2, 2),
+            vec![
+                h[[1, 1]] / det_h,
+                -h[[0, 1]] / det_h,
+                -h[[1, 0]] / det_h,
+                h[[0, 0]] / det_h,
+            ],
+        )
+        .unwrap();
+        let m = Array2::<f64>::eye(2) - w.dot(&a);
+        let det_m = m[[0, 0]] * m[[1, 1]] - m[[0, 1]] * m[[1, 0]];
+        let m_inv = Array2::from_shape_vec(
+            (2, 2),
+            vec![
+                m[[1, 1]] / det_m,
+                -m[[0, 1]] / det_m,
+                -m[[1, 0]] / det_m,
+                m[[0, 0]] / det_m,
+            ],
+        )
+        .unwrap();
+        let delta = a.dot(&m_inv.dot(&scores[0]));
+        let expected_eta = &coordinate_values[0] + &delta;
+        let expected_leverage = (a.dot(&w)).diag().sum();
+        let expected_cook = delta.dot(&c.dot(&delta));
+        let variance = a.dot(&m_inv).dot(&c).dot(&m_inv.t()).dot(&a.t());
+
+        let result = compute_multiblock_alo(&input).expect("B=2 closed-form ALO");
+        for coordinate in 0..2 {
             assert!(
-                (full.leverage[i] - lev_only[i]).abs() < 1e-12,
-                "leverage mismatch at i={}: full={}, lev_only={}",
-                i,
-                full.leverage[i],
-                lev_only[i]
+                (result.eta_tilde[0][coordinate] - expected_eta[coordinate]).abs() < 2e-12
+            );
+            assert!(
+                (result.alo_variance[0][coordinate] - variance[[coordinate, coordinate]]).abs()
+                    < 2e-12
             );
         }
+        assert!((result.leverage[0] - expected_leverage).abs() < 2e-12);
+        assert!((result.cook_distance[0] - expected_cook).abs() < 2e-12);
     }
 
     #[test]
@@ -2725,20 +2651,22 @@ mod tests {
         let n = 1;
         let p = 2;
         let x = Array2::from_shape_vec((1, p), vec![1.0, 0.5]).unwrap();
-        let h_inv = Array2::eye(p);
-        let block_designs = vec![x.clone()];
-        let block_weights = vec![Array2::from_elem((1, 1), 0.0)]; // singular
+        let h = Array2::eye(p);
+        let coordinate_designs = vec![DesignMatrix::from(x.clone())];
+        let observed_hessians = vec![Array2::from_elem((1, 1), 0.0)];
+        let score_covariances = observed_hessians.clone();
         let scores = vec![Array1::from_vec(vec![1.0])];
-        let eta_hat = vec![Array1::from_vec(vec![std::f64::consts::PI])];
+        let coordinate_values = vec![Array1::from_vec(vec![std::f64::consts::PI])];
 
         let input = MultiBlockAloInput {
             n_obs: n,
-            n_blocks: 1,
-            block_designs: &block_designs,
-            penalized_hessian_inv: &h_inv,
-            block_weights,
-            scores,
-            eta_hat,
+            n_coordinates: 1,
+            coordinate_designs: &coordinate_designs,
+            penalized_hessian: &h,
+            observed_hessians: &observed_hessians,
+            score_covariances: &score_covariances,
+            scores: &scores,
+            coordinate_values: &coordinate_values,
         };
         let result = compute_multiblock_alo(&input).unwrap();
         // Δη = A_i * s_i = 1.25 * 1.0 = 1.25
@@ -2749,56 +2677,32 @@ mod tests {
             expected,
             result.eta_tilde[0][0]
         );
-        // Cook's distance should be 0 since W_i = 0.
+        // Cook's distance should be 0 since C_i = 0.
         assert!(result.cook_distance[0].abs() < 1e-14);
-        // ALO variance should be 0 since W_i = 0.
+        // ALO variance should be 0 since C_i = 0.
         assert!(result.alo_variance[0][0].abs() < 1e-14);
     }
 
     #[test]
-    fn multiblock_cook_and_variance_basic() {
-        // B=1 with known values: verify Cook's distance and variance.
-        let n = 1;
-        let x = Array2::from_elem((1, 1), 1.0);
-        // H⁻¹ = [[0.5]]
-        let h_inv = Array2::from_elem((1, 1), 0.5);
-        let block_designs = vec![x.clone()];
-        let w_val = 2.0;
-        let s_val = 0.4;
-        let block_weights = vec![Array2::from_elem((1, 1), w_val)];
-        let scores = vec![Array1::from_vec(vec![s_val])];
-        let eta_hat = vec![Array1::from_vec(vec![1.0])];
-
+    fn multiblock_unit_leverage_refuses_instead_of_changing_estimand() {
+        let coordinate_designs = vec![DesignMatrix::from(Array2::from_elem((1, 1), 1.0))];
+        let h = Array2::from_elem((1, 1), 2.0);
+        let observed_hessians = vec![Array2::from_elem((1, 1), 2.0)];
+        let score_covariances = vec![Array2::from_elem((1, 1), 1.0)];
+        let scores = vec![Array1::from_vec(vec![0.4])];
+        let coordinate_values = vec![Array1::from_vec(vec![1.0])];
         let input = MultiBlockAloInput {
-            n_obs: n,
-            n_blocks: 1,
-            block_designs: &block_designs,
-            penalized_hessian_inv: &h_inv,
-            block_weights,
-            scores,
-            eta_hat,
+            n_obs: 1,
+            n_coordinates: 1,
+            coordinate_designs: &coordinate_designs,
+            penalized_hessian: &h,
+            observed_hessians: &observed_hessians,
+            score_covariances: &score_covariances,
+            scores: &scores,
+            coordinate_values: &coordinate_values,
         };
-        let result = compute_multiblock_alo(&input).unwrap();
-
-        // A_i = x H⁻¹ xᵀ = 1 * 0.5 * 1 = 0.5
-        // (I - W A)⁻¹ = 1 / (1 - 2.0 * 0.5) = 1/0 => regularised
-        // Actually 1 - w*a = 1 - 1.0 = 0.0, so det < 1e-12 => regularised with eps=1e-6
-        // (I - W A + eps) = 1e-6, so v = s / 1e-6 = 4e5
-        // delta_eta = A * v = 0.5 * 4e5 = 2e5
-        let expected_delta = 0.5 * s_val / ALO_LOCAL_BLOCK_RIDGE;
-        let expected_eta = 1.0 + expected_delta;
-        let expected_cook = w_val * expected_delta * expected_delta;
-        let expected_variance =
-            0.5 * 0.5 * w_val / (ALO_LOCAL_BLOCK_RIDGE * ALO_LOCAL_BLOCK_RIDGE);
-        for (got, expected, label) in [
-            (result.eta_tilde[0][0], expected_eta, "eta_tilde"),
-            (result.cook_distance[0], expected_cook, "cook_distance"),
-            (result.alo_variance[0][0], expected_variance, "alo_variance"),
-        ] {
-            assert!(
-                (got - expected).abs() <= 1e-12 * expected.abs().max(1.0),
-                "{label}: expected {expected}, got {got}"
-            );
-        }
+        let error = compute_multiblock_alo(&input)
+            .expect_err("unit deletion leverage must be reported as singular");
+        assert!(error.to_string().contains("deletion system I-WA is singular"));
     }
 }
