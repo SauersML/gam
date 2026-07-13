@@ -490,6 +490,15 @@ pub fn survival_marginal_slope_vector_neglog(
 mod vector_hand_oracle {
     use super::*;
 
+    /// Derivatives of neglog(x) = -log(x): [-1/x, 1/x², -2/x³, 6/x⁴].
+    #[inline]
+    pub(super) fn neglog_derivatives(x: f64) -> (f64, f64, f64, f64) {
+        let x1 = x.max(1e-300);
+        let inv = 1.0 / x1;
+        let inv2 = inv * inv;
+        (-inv, inv2, -2.0 * inv2 * inv, 6.0 * inv2 * inv2)
+    }
+
 fn marginal_slope_covariance_matvec(
     covariance: &MarginalSlopeCovariance,
     vector: &[f64],
@@ -930,15 +939,6 @@ pub(crate) fn c_derivatives(g: f64, probit_scale: f64) -> (f64, f64, f64, f64, f
     (c, c1, c2d, c3d, c4d)
 }
 
-/// Derivatives of neglog(x) = -log(x): [-1/x, 1/x², -2/x³, 6/x⁴].
-#[inline]
-pub(crate) fn neglog_derivatives(x: f64) -> (f64, f64, f64, f64) {
-    let x1 = x.max(1e-300);
-    let inv = 1.0 / x1;
-    let inv2 = inv * inv;
-    (-inv, inv2, -2.0 * inv2 * inv, 6.0 * inv2 * inv2)
-}
-
 /// Row-level primary value, gradient, and Hessian lowered from the canonical
 /// [`rigid_row_nll`] program.
 ///
@@ -1042,7 +1042,8 @@ mod test_support {
         let phi_u1 = w * d * eta1;
         let phi_u2 = w * d;
         // Time derivative: -d·log(ad1).
-        let (nl_u1, nl_u2, _, _) = neglog_derivatives(ad1);
+        let (nl_u1, nl_u2, _, _) =
+            super::vector_hand_oracle::neglog_derivatives(ad1);
         let td_u1 = w * d * nl_u1;
         let td_u2 = w * d * nl_u2;
 
