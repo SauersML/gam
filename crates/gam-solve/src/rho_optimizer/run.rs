@@ -2110,6 +2110,33 @@ pub(crate) fn run_outer(
         context,
         &mut result,
     ));
+    // The uncertainty diagnostic evaluates proposal points after theta-hat.
+    // Reinstall the certified point once more under cap=0 so callers receive
+    // the inner mode belonging to `result.rho`, not the diagnostic's final
+    // proposal (seeding beta alone does not restore weights, factors, or link
+    // state).  Reset forces a real installation instead of an LRU value hit.
+    let terminal_cap_guard = config
+        .outer_inner_cap
+        .as_ref()
+        .map(TerminalInnerCapGuard::lift);
+    obj.reset();
+    let terminal_installation = obj.finalize_outer_result(&result.rho, &result.plan_used);
+    let terminal_inner_converged = inner_solve_converged(config.outer_inner_cap.as_ref());
+    drop(terminal_cap_guard);
+    terminal_installation?;
+    if !terminal_inner_converged {
+        return Err(outer_nonconvergence_error(
+            context,
+            "final outer state installation did not converge at full inner fidelity",
+            &result,
+            result.final_grad_norm,
+            result
+                .criterion_certificate
+                .as_ref()
+                .map(|certificate| certificate.stationarity.bound())
+                .unwrap_or_else(|| outer_gradient_tolerance(config).abs),
+        ));
+    }
     Ok(result)
 }
 
