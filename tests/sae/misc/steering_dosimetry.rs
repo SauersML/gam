@@ -518,6 +518,7 @@ fn target_dose_exact_probe_converges_in_one_step() {
             effective_delta: plan.delta.clone(),
             exact_directional_nats: exact,
             measured_nats: exact,
+            certified_attainable_upper_nats: None,
         })
     };
     let plan = steer_to_target_nats(
@@ -579,6 +580,7 @@ fn target_dose_saturating_probe_secant_corrects_upward() {
             effective_delta: plan.delta.clone(),
             exact_directional_nats: exact,
             measured_nats: k_sat * (1.0 - (-exact / k_sat).exp()),
+            certified_attainable_upper_nats: Some(k_sat),
         })
     };
     let plan = steer_to_target_nats(
@@ -637,6 +639,7 @@ fn target_dose_plateau_is_an_explicit_unreachable_error() {
             effective_delta: plan.delta.clone(),
             exact_directional_nats: plan.predicted_nats.expect("exact local dose"),
             measured_nats: 0.1,
+            certified_attainable_upper_nats: Some(0.1),
         })
     };
     let error = steer_to_target_nats(
@@ -652,8 +655,104 @@ fn target_dose_plateau_is_an_explicit_unreachable_error() {
         },
         Some(&mut probe),
     )
-    .expect_err("a measured plateau below the target is unreachable");
-    assert!(matches!(error, TargetDoseError::UnreachableTarget { .. }));
+    .expect_err("a certified global envelope below the target is unreachable");
+    assert!(matches!(
+        error,
+        TargetDoseError::UnreachableTarget {
+            certified_attainable_upper_nats: 0.1,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn target_dose_apparent_plateau_without_certificate_is_only_unbracketed() {
+    let t0 = 0.0;
+    let (term, metric) = planted_circle(t0);
+    let delta = 0.05_f64;
+    let target = 0.5_f64;
+    let mut probe = |plan: &SteerPlan| -> Result<AppliedDoseObservation, String> {
+        Ok(AppliedDoseObservation {
+            effective_delta: plan.delta.clone(),
+            exact_directional_nats: plan.predicted_nats.expect("exact local dose"),
+            measured_nats: 0.1,
+            certified_attainable_upper_nats: None,
+        })
+    };
+    let error = steer_to_target_nats(
+        &term,
+        &metric,
+        TargetDoseRequest {
+            atom_k: 0,
+            metric_row: 0,
+            t_from: &[t0],
+            t_to: &[t0 + delta],
+            target_nats: target,
+            config: TargetDoseConfig {
+                max_iter: 3,
+                ..TargetDoseConfig::default()
+            },
+        },
+        Some(&mut probe),
+    )
+    .expect_err("three equal samples cannot certify a global attainable envelope");
+    assert!(matches!(
+        error,
+        TargetDoseError::UnbracketedTarget {
+            probes: 3,
+            max_measured_nats: 0.1,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn target_dose_expansion_continues_through_a_local_decrease() {
+    let t0 = 0.0;
+    let (term, metric) = planted_circle(t0);
+    let delta = 0.05_f64;
+    let target = 0.5_f64;
+    let unit = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("unit");
+    let unit_nats = unit.predicted_nats.expect("unit dose");
+    let seed_amplitude = (target / unit_nats).sqrt();
+    let mut probe = |plan: &SteerPlan| -> Result<AppliedDoseObservation, String> {
+        let measured_nats = if plan.amplitude < 1.5 * seed_amplitude {
+            0.20
+        } else if plan.amplitude < 3.0 * seed_amplitude {
+            0.19
+        } else {
+            target
+        };
+        Ok(AppliedDoseObservation {
+            effective_delta: plan.delta.clone(),
+            exact_directional_nats: plan.predicted_nats.expect("exact local dose"),
+            measured_nats,
+            certified_attainable_upper_nats: None,
+        })
+    };
+    let plan = steer_to_target_nats(
+        &term,
+        &metric,
+        TargetDoseRequest {
+            atom_k: 0,
+            metric_row: 0,
+            t_from: &[t0],
+            t_to: &[t0 + delta],
+            target_nats: target,
+            config: TargetDoseConfig {
+                tol_rel: 0.0,
+                max_iter: 3,
+                ..TargetDoseConfig::default()
+            },
+        },
+        Some(&mut probe),
+    )
+    .expect("a local decrease cannot terminate ordered bracket expansion");
+    assert_eq!(plan.iterations, 3);
+    assert_eq!(
+        plan.applied_probe.expect("final exact probe").measured_nats,
+        target
+    );
 }
 
 #[test]
@@ -669,6 +768,7 @@ fn target_dose_probe_exhaustion_never_returns_an_unconverged_plan() {
             effective_delta: plan.delta.clone(),
             exact_directional_nats: plan.predicted_nats.expect("exact local dose"),
             measured_nats: 0.5 * plan.amplitude * plan.amplitude * unit_nats,
+            certified_attainable_upper_nats: None,
         })
     };
     let error = steer_to_target_nats(
@@ -690,7 +790,7 @@ fn target_dose_probe_exhaustion_never_returns_an_unconverged_plan() {
     .expect_err("one below-target probe cannot certify a target-dose plan");
     assert!(matches!(
         error,
-        TargetDoseError::ProbeBudgetExhausted { probes: 1, .. }
+        TargetDoseError::UnbracketedTarget { probes: 1, .. }
     ));
 }
 
@@ -793,21 +893,37 @@ fn applied_dose_probe_payload_fails_closed() {
             effective_delta: Array1::zeros(1),
             exact_directional_nats: target,
             measured_nats: target,
+            certified_attainable_upper_nats: None,
         },
         AppliedDoseObservation {
             effective_delta: Array1::from(vec![f64::NAN, 0.0]),
             exact_directional_nats: target,
             measured_nats: target,
+            certified_attainable_upper_nats: None,
         },
         AppliedDoseObservation {
             effective_delta: Array1::zeros(2),
             exact_directional_nats: f64::NAN,
             measured_nats: target,
+            certified_attainable_upper_nats: None,
         },
         AppliedDoseObservation {
             effective_delta: Array1::zeros(2),
             exact_directional_nats: target,
             measured_nats: -1.0,
+            certified_attainable_upper_nats: None,
+        },
+        AppliedDoseObservation {
+            effective_delta: Array1::zeros(2),
+            exact_directional_nats: target,
+            measured_nats: target,
+            certified_attainable_upper_nats: Some(f64::NAN),
+        },
+        AppliedDoseObservation {
+            effective_delta: Array1::zeros(2),
+            exact_directional_nats: target,
+            measured_nats: target,
+            certified_attainable_upper_nats: Some(0.5 * target),
         },
     ];
     for invalid in cases {

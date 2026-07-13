@@ -6867,10 +6867,13 @@ impl ManifoldSaeCore {
     /// `max_iter`, and `readout_tol_rel`. Returns the
     /// closed-form seed `a0 = sqrt(2 q*/(dgᵀ M dg))` plus, when a plan-aware
     /// `probe` is supplied, the closed-loop-corrected amplitude and one atomic
-    /// observation mapping with `effective_delta`, `exact_directional_nats`, and
-    /// `measured_nats`. The callback receives the complete public steer-plan
-    /// mapping, not a scalar amplitude, so it cannot silently execute a different
-    /// activation move. Reuses the
+    /// observation mapping with `effective_delta`, `exact_directional_nats`,
+    /// `measured_nats`, and required optional
+    /// `certified_attainable_upper_nats`. The latter is `None` unless the callback
+    /// can prove a global upper bound for every non-negative amplitude on this
+    /// exact chord; pointwise plateaus are not certificates. The callback receives
+    /// the complete public steer-plan mapping, not a scalar amplitude, so it cannot
+    /// silently execute a different activation move. Reuses the
     /// SAME frozen-dictionary rebuild as `steer`.
     #[pyo3(signature = (request, probe = None))]
     fn steer_to_target<'py>(
@@ -6945,7 +6948,8 @@ impl ManifoldSaeCore {
                         let result = result.bind(py).cast::<PyDict>().map_err(|error| {
                             format!(
                                 "steer_to_target probe must return a mapping with effective_delta, \
-                                 exact_directional_nats, and measured_nats: {error}"
+                                 exact_directional_nats, measured_nats, and \
+                                 certified_attainable_upper_nats: {error}"
                             )
                         })?;
                         let required = |key: &str| {
@@ -6977,10 +6981,21 @@ impl ManifoldSaeCore {
                                     "steer_to_target probe measured_nats must be a float: {error}"
                                 )
                             })?;
+                        let certified_attainable_upper_nats =
+                            required("certified_attainable_upper_nats")?
+                                .extract::<Option<f64>>()
+                                .map_err(|error| {
+                                    format!(
+                                        "steer_to_target probe \
+                                         certified_attainable_upper_nats must be a float or \
+                                         None: {error}"
+                                    )
+                                })?;
                         Ok(gam::inference::steering::AppliedDoseObservation {
                             effective_delta: Array1::from(effective_delta),
                             exact_directional_nats,
                             measured_nats,
+                            certified_attainable_upper_nats,
                         })
                     })
                 });

@@ -1904,6 +1904,7 @@ fn target_dose_plan_to_pydict(
         applied_probe,
         iterations,
         readout_kl_radius,
+        certified_attainable_upper_nats,
     } = plan;
     let resident_metric_nats = steer.predicted_nats;
     let resident_metric_nats_kind = steer.predicted_nats_kind.as_str();
@@ -1934,6 +1935,10 @@ fn target_dose_plan_to_pydict(
         }
     }
     bound.set_item("readout_kl_radius", readout_kl_radius)?;
+    bound.set_item(
+        "certified_attainable_upper_nats",
+        certified_attainable_upper_nats,
+    )?;
     Ok(out)
 }
 

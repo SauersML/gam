@@ -403,8 +403,22 @@ Call `converged_latents` when several outputs are needed; separate
 ## Steering and causal intervention
 
 `fit.steer_to_target(request, patched_forward_kl)` builds a **causal intervention
-plan** at a requested measured KL dose. The callback applies a proposed amplitude
-to the real downstream model and returns `KL(p_base || p_patched)`:
+plan** at a requested measured KL dose. The callback applies the supplied plan to
+the real downstream model and returns one atomic mapping:
+
+```python
+def patched_forward_kl(steer_plan):
+    effective_delta = apply_exact_plan(steer_plan)
+    return {
+        "effective_delta": effective_delta,
+        "exact_directional_nats": full_local_fisher_quadratic(effective_delta),
+        "measured_nats": patched_forward_kl_nats(effective_delta),
+        # A finite value is a GLOBAL proof over all amplitudes, not a plateau guess.
+        "certified_attainable_upper_nats": None,
+    }
+```
+
+The request then controls the bracket solve:
 
 ```python
 plan = fit.steer_to_target(
@@ -422,8 +436,9 @@ plan = fit.steer_to_target(
 )
 plan["delta"]             # exact (p,) activation-space move to apply
 plan["measured_nats"]     # patched-forward KL at the solved amplitude
-plan["validation"]        # "patched_forward"
+plan["validation"]        # "applied_dose_probe"
 plan["readout_kl_radius"] # contiguous calibrated amplitude radius, or None
+plan["certified_attainable_upper_nats"] # global envelope certificate, or None
 plan["validity_radius"]   # chart-linearization radius, or None
 plan["off_manifold_norm"] # component of the move off the atom's local tangents (≈0 on-manifold)
 plan["metric_provenance"] # "OutputFisher" if a Fisher metric was installed, else "Euclidean"
@@ -434,7 +449,11 @@ what happens downstream, and how far can I trust that?" The move stays on the
 atom's fitted shape, while the patched forward—not a universal raw amplitude—
 certifies intervention strength. Target-dose solving requires an output-Fisher
 metric (`fisher_factors=` supplied to `sae_manifold_fit`) and fails explicitly
-when the target cannot be reached or certified within the probe budget.
+when the target cannot be bracketed or resolved within the probe budget. Ordered
+amplitude expansion continues through isolated equal or decreasing KL probes: no
+finite collection of point observations proves a plateau. The dedicated
+"unreachable" error is emitted only when the callback supplies a certified global
+attainable-dose upper bound that lies below the request's accepted tolerance band.
 
 ## Certified structure (anytime-valid)
 

@@ -128,6 +128,7 @@ def test_target_dose_probe_is_wired_through_the_public_model() -> None:
             "effective_delta": list(steer_plan["delta"]),
             "exact_directional_nats": exact,
             "measured_nats": exact,
+            "certified_attainable_upper_nats": None,
         }
 
     plan = model.steer_to_target(
@@ -152,6 +153,7 @@ def test_target_dose_probe_is_wired_through_the_public_model() -> None:
     assert plan["predicted_nats"] == pytest.approx(target, rel=1.0e-12)
     assert plan["predicted_nats_kind"] == "exact_directional"
     assert plan["resident_metric_nats_kind"] == "uncertified_approximation"
+    assert plan["certified_attainable_upper_nats"] is None
     np.testing.assert_allclose(
         plan["delta"],
         model.steer(0, 0, plan["amplitude"], t_from, t_to)["delta"],
@@ -195,10 +197,95 @@ def test_target_dose_rejects_scalar_and_malformed_probe_results() -> None:
             "effective_delta": [0.0],
             "exact_directional_nats": exact,
             "measured_nats": exact,
+            "certified_attainable_upper_nats": None,
         }
 
     with pytest.raises(ValueError, match="effective_delta length"):
         model.steer_to_target(request, wrong_effective_shape)
+
+    def missing_envelope(plan: dict[str, object]) -> dict[str, object]:
+        exact = float(plan["predicted_nats"])
+        return {
+            "effective_delta": list(plan["delta"]),
+            "exact_directional_nats": exact,
+            "measured_nats": exact,
+        }
+
+    with pytest.raises(
+        ValueError, match="missing.*certified_attainable_upper_nats"
+    ):
+        model.steer_to_target(request, missing_envelope)
+
+
+def test_target_dose_local_decrease_does_not_claim_unreachable() -> None:
+    model = _model()
+    t_from = np.array([0.0], dtype=np.float64)
+    t_to = np.array([0.25], dtype=np.float64)
+    unit_nats = float(model.steer(0, 0, 1.0, t_from, t_to)["predicted_nats"])
+    target = 0.5 * unit_nats
+    seed_amplitude = np.sqrt(target / unit_nats)
+
+    def nonmonotone_probe(plan: dict[str, object]) -> dict[str, object]:
+        amplitude = float(plan["amplitude"])
+        if amplitude < 1.5 * seed_amplitude:
+            measured = 0.40 * target
+        elif amplitude < 3.0 * seed_amplitude:
+            measured = 0.38 * target
+        else:
+            measured = target
+        return {
+            "effective_delta": list(plan["delta"]),
+            "exact_directional_nats": float(plan["predicted_nats"]),
+            "measured_nats": measured,
+            "certified_attainable_upper_nats": None,
+        }
+
+    plan = model.steer_to_target(
+        {
+            "atom_k": 0,
+            "metric_row": 0,
+            "target_nats": target,
+            "t_from": t_from,
+            "t_to": t_to,
+            "tol_rel": 0.0,
+            "max_iter": 3,
+            "readout_tol_rel": 0.1,
+        },
+        nonmonotone_probe,
+    )
+    assert plan["iterations"] == 3
+    assert plan["measured_nats"] == pytest.approx(target)
+
+
+def test_target_dose_unreachable_requires_a_global_envelope_certificate() -> None:
+    model = _model()
+    t_from = np.array([0.0], dtype=np.float64)
+    t_to = np.array([0.25], dtype=np.float64)
+    target = 0.5 * float(model.steer(0, 0, 1.0, t_from, t_to)["predicted_nats"])
+    observed = 0.25 * target
+    request = {
+        "atom_k": 0,
+        "metric_row": 0,
+        "target_nats": target,
+        "t_from": t_from,
+        "t_to": t_to,
+        "tol_rel": 1.0e-12,
+        "max_iter": 2,
+        "readout_tol_rel": 0.1,
+    }
+
+    def plateau(plan: dict[str, object], upper: float | None) -> dict[str, object]:
+        return {
+            "effective_delta": list(plan["delta"]),
+            "exact_directional_nats": float(plan["predicted_nats"]),
+            "measured_nats": observed,
+            "certified_attainable_upper_nats": upper,
+        }
+
+    with pytest.raises(ValueError, match="could not bracket.*no global attainable"):
+        model.steer_to_target(request, lambda plan: plateau(plan, None))
+    with pytest.raises(ValueError, match="outside the certified attainable envelope"):
+        model.steer_to_target(request, lambda plan: plateau(plan, observed))
 
 
 @pytest.mark.parametrize(
@@ -287,6 +374,7 @@ def test_public_target_dose_rebuilds_cylinder_metadata() -> None:
             "effective_delta": list(steer_plan["delta"]),
             "exact_directional_nats": exact,
             "measured_nats": exact,
+            "certified_attainable_upper_nats": None,
         }
 
     plan = model.steer_to_target(

@@ -102,9 +102,13 @@ def steer_atom(
     ``patched_forward_kl(plan)`` must execute the supplied public steer plan and
     return a mapping with ``effective_delta`` (after model dtype conversion),
     ``exact_directional_nats`` (the local full-Fisher quadratic of that effective
-    delta), and ``measured_nats = KL(p_base || p_patched)`` for the same move. The
-    Rust solver validates the atomic observation, brackets the requested dose,
-    and raises if the target is unreachable or cannot be certified.
+    delta), ``measured_nats = KL(p_base || p_patched)`` for the same move, and
+    ``certified_attainable_upper_nats``. Set the latter to ``None`` unless the
+    adapter can prove a global measured-KL upper bound over every non-negative
+    amplitude on this exact chord. The Rust solver validates the atomic
+    observation, expands through local decreases until it finds a genuine
+    sign-change bracket, and reports "unreachable" only from that global
+    certificate; an unresolved unbracketed solve is a distinct error.
     """
     plan = fit.steer_to_target(
         {

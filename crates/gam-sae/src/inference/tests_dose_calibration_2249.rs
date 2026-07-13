@@ -503,6 +503,7 @@ mod tests {
                 exact_directional_nats: 0.5
                     * categorical_quad_form(&p_from_probe, plan.delta.as_slice().unwrap()),
                 measured_nats: kl(&p_from_probe, &p_to),
+                certified_attainable_upper_nats: None,
             })
         };
         let plan = steer_to_target_nats(
