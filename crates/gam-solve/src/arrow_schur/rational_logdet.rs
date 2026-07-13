@@ -685,18 +685,19 @@ fn shifted_cg(
             // Evaluate the backward-error ratio in the log domain. The scale
             // `lambda_observed * ||y|| + ||b||` can overflow even when every
             // operand and the certified ratio are representable.
-            let backward_error_certified = if observed_operator_norm > 0.0 && y_norm > 0.0 {
-                let log_operator_solution = observed_operator_norm.ln() + y_norm.ln();
-                let log_rhs = b_norm.ln();
-                let log_scale = log_operator_solution.max(log_rhs);
-                let log_denominator = log_scale
-                    + ((log_operator_solution - log_scale).exp()
-                        + (log_rhs - log_scale).exp())
-                    .ln();
-                true_residual_norm.ln() - log_denominator <= rel_tol.ln()
-            } else {
-                false
-            };
+            let backward_error_certified =
+                if observed_operator_norm > 0.0 && y_norm > 0.0 {
+                    let log_operator_solution = observed_operator_norm.ln() + y_norm.ln();
+                    let log_rhs = b_norm.ln();
+                    let log_scale = log_operator_solution.max(log_rhs);
+                    let log_denominator = log_scale
+                        + ((log_operator_solution - log_scale).exp()
+                            + (log_rhs - log_scale).exp())
+                        .ln();
+                    true_residual_norm.ln() - log_denominator <= rel_tol.ln()
+                } else {
+                    false
+                };
             if true_residual_norm <= tol || backward_error_certified {
                 return Some((y, iters));
             }
