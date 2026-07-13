@@ -18,18 +18,6 @@ pub struct TransformationWarmStart {
     pub scale: Array1<f64>,
 }
 
-/// Explicit authority for the smoothing strengths stored on a family built
-/// from a precomputed response basis.
-///
-/// The data-scaled arm is used exactly once to seed a new fit. During joint
-/// spatial optimization, rho is already an optimizer coordinate and must be
-/// supplied directly; rebuilding the same O(n p^2) likelihood Gram there is
-/// both wasted work and a second, conflicting initialization authority.
-pub(crate) enum InitialLogLambdaSource {
-    PenaltyScaleFromWeightedGram,
-    Supplied(Array1<f64>),
-}
-
 // ---------------------------------------------------------------------------
 // The family
 // ---------------------------------------------------------------------------
@@ -77,7 +65,6 @@ pub struct TransformationNormalFamily {
 
     // --- Initial values ---
     pub(crate) initial_beta: Array1<f64>,
-    pub(crate) initial_log_lambdas: Array1<f64>,
 
     // --- Config ---
     pub(crate) block_name: String,
@@ -395,13 +382,6 @@ impl TransformationNormalFamily {
             p_cov,
             config,
         )?;
-        let policy = ResourcePolicy::default_library();
-        let x_val_weighted_gram = x_val_kron.weighted_gram(weights, &policy)?;
-
-        // ----- 5. CTN-specific smoothing seed from likelihood/penalty scales -----
-        let initial_log_lambdas =
-            ctn_penalty_scale_log_lambdas(&tensor_penalties, &x_val_weighted_gram);
-
         // Compute response median for anchoring
         let mut sorted_resp = response.to_vec();
         sorted_resp.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -425,7 +405,6 @@ impl TransformationNormalFamily {
             offset: Arc::new(offset.clone()),
             tensor_penalties,
             initial_beta,
-            initial_log_lambdas,
             block_name: "transformation".to_string(),
             response_knots: resp_knots,
             response_transform: resp_transform,
@@ -458,7 +437,6 @@ impl TransformationNormalFamily {
         covariate_penalties: Vec<PenaltyMatrix>,
         config: &TransformationNormalConfig,
         warm_start: Option<&TransformationWarmStart>,
-        initial_log_lambda_source: InitialLogLambdaSource,
     ) -> Result<Self, String> {
         let n = response_val_basis.nrows();
         if n == 0 {
@@ -591,32 +569,6 @@ impl TransformationNormalFamily {
             p_cov,
             config,
         )?;
-        let initial_log_lambdas = match initial_log_lambda_source {
-            InitialLogLambdaSource::PenaltyScaleFromWeightedGram => {
-                let policy = ResourcePolicy::default_library();
-                let x_val_weighted_gram = x_val_kron.weighted_gram(weights, &policy)?;
-                ctn_penalty_scale_log_lambdas(&tensor_penalties, &x_val_weighted_gram)
-            }
-            InitialLogLambdaSource::Supplied(log_lambdas) => {
-                if log_lambdas.len() != tensor_penalties.len() {
-                    return Err(TransformationNormalError::InvalidInput {
-                        reason: format!(
-                            "supplied transformation smoothing vector has length {}, expected {}",
-                            log_lambdas.len(),
-                            tensor_penalties.len(),
-                        ),
-                    }
-                    .into());
-                }
-                gam_problem::validate_log_strengths(log_lambdas.iter().copied()).map_err(
-                    |error| TransformationNormalError::InvalidInput {
-                        reason: format!("invalid supplied transformation smoothing strength: {error}"),
-                    },
-                )?;
-                log_lambdas
-            }
-        };
-
         // Compute response median.
         let mut sorted_resp = response.to_vec();
         sorted_resp.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -640,7 +592,6 @@ impl TransformationNormalFamily {
             offset: Arc::new(offset.clone()),
             tensor_penalties,
             initial_beta,
-            initial_log_lambdas,
             block_name: "transformation".to_string(),
             response_knots: response_knots.clone(),
             response_transform: response_transform.clone(),
@@ -669,22 +620,52 @@ impl TransformationNormalFamily {
         self.response_median
     }
 
-    /// Return the `ParameterBlockSpec` for this family (single block).
-    pub fn block_spec(&self) -> ParameterBlockSpec {
+    /// Derive the one cold-start smoothing vector from the likelihood/penalty
+    /// scale ratio without materializing the rowwise-Kronecker Gram.
+    pub(crate) fn penalty_scale_log_lambdas(&self) -> Result<Array1<f64>, String> {
+        let policy = ResourcePolicy::default_library();
+        let likelihood_diagonal_mean = self
+            .x_val_kron
+            .weighted_gram_diagonal_mean(self.weights.as_ref(), &policy)?;
+        Ok(ctn_penalty_scale_log_lambdas(
+            &self.tensor_penalties,
+            likelihood_diagonal_mean,
+        ))
+    }
+
+    /// Return the single coefficient block under one explicit smoothing state.
+    /// Family geometry owns penalties and coefficients; rho belongs to the
+    /// optimizer/block state and has exactly one caller-supplied authority.
+    pub(crate) fn block_spec(
+        &self,
+        initial_log_lambdas: &Array1<f64>,
+    ) -> Result<ParameterBlockSpec, String> {
+        if initial_log_lambdas.len() != self.tensor_penalties.len() {
+            return Err(TransformationNormalError::InvalidInput {
+                reason: format!(
+                    "transformation smoothing vector has length {}, expected {}",
+                    initial_log_lambdas.len(),
+                    self.tensor_penalties.len(),
+                ),
+            }
+            .into());
+        }
+        gam_problem::validate_log_strengths(initial_log_lambdas.iter().copied())
+            .map_err(|error| format!("invalid transformation smoothing strength: {error}"))?;
         let offset = self.offset.as_ref() + self.response_floor_offset.as_ref();
-        ParameterBlockSpec {
+        Ok(ParameterBlockSpec {
             name: self.block_name.clone(),
             design: DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(self.x_val_kron.clone()))),
             offset,
             penalties: self.tensor_penalties.clone(),
             nullspace_dims: vec![],
-            initial_log_lambdas: self.initial_log_lambdas.clone(),
+            initial_log_lambdas: initial_log_lambdas.clone(),
             initial_beta: Some(self.initial_beta.clone()),
             gauge_priority: 100,
             jacobian_callback: None,
             stacked_design: None,
             stacked_offset: None,
-        }
+        })
     }
 
     /// Total number of coefficients.
@@ -847,7 +828,6 @@ impl TransformationNormalFamily {
             offset: Arc::clone(&self.offset),
             tensor_penalties: self.tensor_penalties.clone(),
             initial_beta: self.initial_beta.clone(),
-            initial_log_lambdas: self.initial_log_lambdas.clone(),
             block_name: self.block_name.clone(),
             response_knots: self.response_knots.clone(),
             response_transform: self.response_transform.clone(),

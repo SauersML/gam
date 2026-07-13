@@ -36,6 +36,17 @@ pub fn require_row_primary_hessian_supported(n: usize, r: usize) -> Result<GpuDe
     Ok(decision)
 }
 
+/// Preserve the selected-GPU execution contract for every downstream
+/// consumer. Once policy has produced device-resident BMS FLEX state, a CUDA
+/// failure is an execution error; callers must not reinterpret it as permission
+/// to run a different CPU algorithm.
+pub(crate) fn require_selected_gpu_result<T>(
+    operation: &str,
+    result: Result<T, GpuError>,
+) -> Result<T, String> {
+    result.map_err(|error| format!("BMS FLEX selected GPU {operation} failed: {error}"))
+}
+
 /// The PTX source compiled and loaded at first use of the BMS flex GPU
 /// backend. The probe kernel exercises the full NVRTC → cuModuleLoadData
 /// → cuModuleGetFunction → cuLaunchKernel path so the scaffolding catches
@@ -189,6 +200,19 @@ mod bms_flex_gpu_tests {
     pub(crate) fn bms_flex_gpu_policy_decision_is_explicit() {
         let decision = row_primary_hessian_decision(50_000, 4);
         assert_eq!(decision.kernel, GpuKernel::MarginalSlopeRows);
+    }
+
+    #[test]
+    pub(crate) fn selected_gpu_errors_propagate_without_algorithm_substitution_932() {
+        let error = require_selected_gpu_result::<()>(
+            "sentinel operation",
+            Err(GpuError::DriverCallFailed {
+                reason: "sentinel device fault".to_string(),
+            }),
+        )
+        .expect_err("a selected CUDA failure must propagate");
+        assert!(error.contains("selected GPU sentinel operation failed"));
+        assert!(error.contains("sentinel device fault"));
     }
 
     /// V100-only: probe the backend end-to-end (CUDA context create, NVRTC

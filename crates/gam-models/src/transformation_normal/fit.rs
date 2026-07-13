@@ -68,7 +68,7 @@ impl TransformationExactModeBranch {
 }
 
 impl TransformationExactGeometryCache {
-    pub(crate) fn update_initial_log_lambdas(
+    pub(crate) fn update_block_log_lambdas(
         &mut self,
         log_lambdas: &Array1<f64>,
     ) -> Result<(), String> {
@@ -86,23 +86,12 @@ impl TransformationExactGeometryCache {
             }
             .into());
         }
-        if log_lambdas.len() != self.family.initial_log_lambdas.len() {
-            return Err(TransformationNormalError::InvalidInput {
-                reason: format!(
-                    "transformation family rho length mismatch: got {}, expected {}",
-                    log_lambdas.len(),
-                    self.family.initial_log_lambdas.len(),
-                ),
-            }
-            .into());
-        }
         gam_problem::validate_log_strengths(log_lambdas.iter().copied()).map_err(|error| {
             TransformationNormalError::InvalidInput {
                 reason: format!("invalid transformation smoothing strength: {error}"),
             }
         })?;
         spec.initial_log_lambdas = log_lambdas.clone();
-        self.family.initial_log_lambdas = log_lambdas.clone();
         Ok(())
     }
 }
@@ -253,9 +242,9 @@ pub fn fit_transformation_normal(
                 .collect(),
             &effective_config,
             warm_start,
-            InitialLogLambdaSource::PenaltyScaleFromWeightedGram,
         )?;
-        let blocks = vec![family.block_spec()];
+        let rho0 = family.penalty_scale_log_lambdas()?;
+        let blocks = vec![family.block_spec(&rho0)?];
         let fit = fit_custom_family(&family, &blocks, &options)
             .map_err(|e| format!("transformation fit failed: {e}"))?;
         let (fit, score_calibration) = calibrate_transformation_scores(&family, fit)?;
@@ -344,9 +333,9 @@ pub fn fit_transformation_normal(
             .collect(),
         &effective_config,
         warm_start,
-        InitialLogLambdaSource::PenaltyScaleFromWeightedGram,
     )?;
-    let probe_block = probe_family.block_spec();
+    let rho0 = probe_family.penalty_scale_log_lambdas()?;
+    let probe_block = probe_family.block_spec(&rho0)?;
     let n_penalties = probe_block.initial_log_lambdas.len();
     log::info!(
         "[transformation-normal] exact joint setup: rho_dim={} log_kappa_dim={} dims_per_term={:?}",
@@ -354,7 +343,6 @@ pub fn fit_transformation_normal(
         kappa0.len(),
         kappa_dims,
     );
-    let rho0 = probe_block.initial_log_lambdas.clone();
     let rho_floor = -12.0;
     let rho_lower = Array1::<f64>::from_elem(n_penalties, rho_floor);
     let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
@@ -419,9 +407,8 @@ pub fn fit_transformation_normal(
     let ws = warm_start.cloned();
 
     // Helper: build family from prebuilt response basis + covariate design.
-    let make_family = |cov_design: &TermCollectionDesign,
-                       rho: &Array1<f64>|
-     -> Result<TransformationNormalFamily, String> {
+    let make_family =
+        |cov_design: &TermCollectionDesign| -> Result<TransformationNormalFamily, String> {
             let effective_offset = cov_design
                 .compose_offset(offset.view(), "transformation-normal spatial fit")
                 .map_err(|error| error.to_string())?;
@@ -443,7 +430,6 @@ pub fn fit_transformation_normal(
                     .collect(),
                 &cfg,
                 ws.as_ref(),
-                InitialLogLambdaSource::Supplied(rho.clone()),
             )
         };
 
@@ -470,13 +456,13 @@ pub fn fit_transformation_normal(
                 .borrow_mut()
                 .as_mut()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?
-                .update_initial_log_lambdas(rho);
+                .update_block_log_lambdas(rho);
         }
 
         let geom_start = std::time::Instant::now();
         let exact_design = build_term_collection_design(covariate_data, &effective_spec)
             .map_err(|e| format!("failed to rebuild frozen transformation geometry: {e}"))?;
-        let family = make_family(&exact_design, rho)?;
+        let family = make_family(&exact_design)?;
         let cov_psi_derivs =
             build_block_spatial_psi_derivatives(covariate_data, &effective_spec, &exact_design)?
                 .ok_or_else(|| {
@@ -494,7 +480,7 @@ pub fn fit_transformation_normal(
             key,
             covariate_spec_resolved: effective_spec,
             covariate_design: exact_design,
-            blocks: vec![family.block_spec()],
+            blocks: vec![family.block_spec(rho)?],
             family,
             derivative_blocks: Arc::new(vec![tensor_derivs]),
         }));

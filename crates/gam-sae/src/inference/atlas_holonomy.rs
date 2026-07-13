@@ -117,8 +117,58 @@ pub enum AtlasStatisticalRefusal {
 /// independent or require an explicit cross block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GaussianPatchRowSplit {
-    pilot_rows: Vec<usize>,
-    inference_rows: Vec<usize>,
+    pilot_rows: GaussianRowSet,
+    inference_rows: GaussianRowSet,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GaussianRowSet {
+    Explicit(Vec<usize>),
+    Contiguous { start: usize, len: usize },
+}
+
+impl GaussianRowSet {
+    fn len(&self) -> usize {
+        match self {
+            Self::Explicit(rows) => rows.len(),
+            Self::Contiguous { len, .. } => *len,
+        }
+    }
+
+    fn contains(&self, row: usize) -> bool {
+        match self {
+            Self::Explicit(rows) => rows.binary_search(&row).is_ok(),
+            Self::Contiguous { start, len } => row >= *start && row - *start < *len,
+        }
+    }
+
+    fn intersects(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Explicit(left), right) => left.iter().any(|row| right.contains(*row)),
+            (left, Self::Explicit(right)) => right.iter().any(|row| left.contains(*row)),
+            (
+                Self::Contiguous {
+                    start: left_start,
+                    len: left_len,
+                },
+                Self::Contiguous {
+                    start: right_start,
+                    len: right_len,
+                },
+            ) => {
+                let left_end = left_start.saturating_add(*left_len);
+                let right_end = right_start.saturating_add(*right_len);
+                *left_start < right_end && *right_start < left_end
+            }
+        }
+    }
+
+    fn materialize(&self) -> Vec<usize> {
+        match self {
+            Self::Explicit(rows) => rows.clone(),
+            Self::Contiguous { start, len } => (*start..start.saturating_add(*len)).collect(),
+        }
+    }
 }
 
 impl GaussianPatchRowSplit {
@@ -141,19 +191,47 @@ impl GaussianPatchRowSplit {
             return Err("Gaussian PCA pilot and inference row sets must be disjoint".to_string());
         }
         Ok(Self {
+            pilot_rows: GaussianRowSet::Explicit(pilot_rows),
+            inference_rows: GaussianRowSet::Explicit(inference_rows),
+        })
+    }
+
+    /// Compact constructor for synthetic/analytic row populations.
+    #[must_use = "Gaussian patch row-split validation errors must be handled"]
+    pub fn from_disjoint_ranges(
+        pilot_start: usize,
+        pilot_len: usize,
+        inference_start: usize,
+        inference_len: usize,
+    ) -> Result<Self, String> {
+        if pilot_len == 0 || inference_len == 0 {
+            return Err("Gaussian PCA pilot and inference ranges must be non-empty".to_string());
+        }
+        let pilot_rows = GaussianRowSet::Contiguous {
+            start: pilot_start,
+            len: pilot_len,
+        };
+        let inference_rows = GaussianRowSet::Contiguous {
+            start: inference_start,
+            len: inference_len,
+        };
+        if pilot_rows.intersects(&inference_rows) {
+            return Err("Gaussian PCA pilot and inference ranges must be disjoint".to_string());
+        }
+        Ok(Self {
             pilot_rows,
             inference_rows,
         })
     }
 
     #[must_use]
-    pub fn pilot_rows(&self) -> &[usize] {
-        &self.pilot_rows
+    pub fn pilot_row_count(&self) -> usize {
+        self.pilot_rows.len()
     }
 
     #[must_use]
-    pub fn inference_rows(&self) -> &[usize] {
-        &self.inference_rows
+    pub fn inference_row_count(&self) -> usize {
+        self.inference_rows.len()
     }
 }
 
@@ -732,6 +810,151 @@ impl GaussianPcaPatch {
             spectrum_provenance: self.spectrum_provenance,
         }
     }
+
+    /// Fit a projected tangent on rows disjoint from the pilot projection.
+    ///
+    /// The resulting spectrum and horizontal covariance scale are explicitly
+    /// plug-in quantities. A full-ambient retained frame has zero projection
+    /// leakage by algebra; a reduced pilot frame remains uncertified until a
+    /// caller supplies an independent capture theorem.
+    #[must_use = "cross-fitted Gaussian PCA construction errors must be handled"]
+    pub fn fit_cross_fitted_plugin(
+        chart: usize,
+        row_split: GaussianPatchRowSplit,
+        data: ArrayView2<'_, f64>,
+        retained_dimension: usize,
+    ) -> Result<Self, String> {
+        let ambient = data.ncols();
+        if ambient < INTRINSIC_DIMENSION || retained_dimension < INTRINSIC_DIMENSION + 1 {
+            return Err(format!(
+                "cross-fitted patch {chart} requires ambient >= {INTRINSIC_DIMENSION} and retained dimension >= {}",
+                INTRINSIC_DIMENSION + 1
+            ));
+        }
+        if retained_dimension > ambient {
+            return Err(format!(
+                "cross-fitted patch {chart} retained dimension {retained_dimension} exceeds ambient {ambient}"
+            ));
+        }
+        let pilot_rows = row_split.pilot_rows.materialize();
+        let inference_rows = row_split.inference_rows.materialize();
+        if pilot_rows.len() < 2 || inference_rows.len() <= INTRINSIC_DIMENSION {
+            return Err(format!(
+                "cross-fitted patch {chart} needs at least two pilot rows and more than {INTRINSIC_DIMENSION} inference rows"
+            ));
+        }
+        if pilot_rows
+            .iter()
+            .chain(&inference_rows)
+            .any(|&row| row >= data.nrows())
+        {
+            return Err(format!(
+                "cross-fitted patch {chart} row identity exceeds data height {}",
+                data.nrows()
+            ));
+        }
+        let pilot_covariance = selected_covariance(data, &pilot_rows, None)?;
+        let (_, pilot_vectors) = pilot_covariance
+            .eigh(faer::Side::Lower)
+            .map_err(|error| format!("cross-fitted patch {chart} pilot PCA failed: {error}"))?;
+        let mut projection_frame = Array2::<f64>::zeros((ambient, retained_dimension));
+        for column in 0..retained_dimension {
+            let source = ambient - 1 - column;
+            projection_frame
+                .column_mut(column)
+                .assign(&pilot_vectors.column(source));
+        }
+        let inference_covariance =
+            selected_covariance(data, &inference_rows, Some(&projection_frame))?;
+        let (inference_values, inference_vectors) = inference_covariance
+            .eigh(faer::Side::Lower)
+            .map_err(|error| format!("cross-fitted patch {chart} inference PCA failed: {error}"))?;
+        let mut tangent_coordinates =
+            Array2::<f64>::zeros((retained_dimension, INTRINSIC_DIMENSION));
+        for column in 0..INTRINSIC_DIMENSION {
+            let source = retained_dimension - 1 - column;
+            tangent_coordinates
+                .column_mut(column)
+                .assign(&inference_vectors.column(source));
+        }
+        let noise_count = retained_dimension - INTRINSIC_DIMENSION;
+        let noise_variance = inference_values
+            .slice(s![0..noise_count])
+            .iter()
+            .copied()
+            .sum::<f64>()
+            / noise_count as f64;
+        let weakest_tangent = inference_values[noise_count];
+        let strongest_noise = inference_values[noise_count - 1];
+        let signal_variance = weakest_tangent - noise_variance;
+        let eigengap = weakest_tangent - strongest_noise;
+        let spectrum_provenance = GaussianPcaSpectrumProvenance::PlugInEstimate {
+            noise_variance,
+            signal_variance,
+            eigengap,
+        }
+        .validate()?;
+        let pilot_projection = if retained_dimension == ambient {
+            PilotProjectionProvenance::CertifiedFixed {
+                tangent_leakage_bound: 0.0,
+                error_probability_bound: 0.0,
+            }
+        } else {
+            PilotProjectionProvenance::IndependentPilotEstimate
+        };
+        Self::new(
+            chart,
+            row_split,
+            pilot_projection,
+            GaussianPatchCentering::MeanEstimatedOnInferenceRows,
+            projection_frame,
+            tangent_coordinates,
+            noise_variance,
+            signal_variance,
+            spectrum_provenance,
+        )
+    }
+}
+
+fn selected_covariance(
+    data: ArrayView2<'_, f64>,
+    rows: &[usize],
+    projection: Option<&Array2<f64>>,
+) -> Result<Array2<f64>, String> {
+    let dimension = projection.map_or(data.ncols(), Array2::ncols);
+    let mut mean = Array1::<f64>::zeros(dimension);
+    for &row in rows {
+        if let Some(frame) = projection {
+            mean += &frame.t().dot(&data.row(row));
+        } else {
+            mean += &data.row(row);
+        }
+    }
+    mean /= rows.len() as f64;
+    let mut covariance = Array2::<f64>::zeros((dimension, dimension));
+    for &row in rows {
+        let centered = if let Some(frame) = projection {
+            frame.t().dot(&data.row(row)) - &mean
+        } else {
+            data.row(row).to_owned() - &mean
+        };
+        for left in 0..dimension {
+            for right in 0..=left {
+                covariance[[left, right]] += centered[left] * centered[right];
+            }
+        }
+    }
+    let degrees_of_freedom = rows.len().checked_sub(1).ok_or_else(|| {
+        "sample covariance requires at least two rows".to_string()
+    })? as f64;
+    for left in 0..dimension {
+        for right in 0..=left {
+            let value = covariance[[left, right]] / degrees_of_freedom;
+            covariance[[left, right]] = value;
+            covariance[[right, left]] = value;
+        }
+    }
+    Ok(covariance)
 }
 
 /// Scalar provenance retained for every patch used by a noisy certificate.
@@ -824,8 +1047,7 @@ impl GaussianPcaErrorModel {
                 if patches[left]
                     .row_split
                     .inference_rows
-                    .iter()
-                    .any(|row| patches[right].row_split.inference_rows.binary_search(row).is_ok())
+                    .intersects(&patches[right].row_split.inference_rows)
                 {
                     return Err(format!(
                         "Gaussian PCA patches {} and {} share inference rows; an explicit joint covariance is required",
@@ -919,14 +1141,7 @@ impl GaussianPcaErrorModel {
                     if patches[left_patch]
                         .row_split
                         .inference_rows
-                        .iter()
-                        .any(|row| {
-                            patches[right_patch]
-                                .row_split
-                                .inference_rows
-                                .binary_search(row)
-                                .is_ok()
-                        })
+                        .intersects(&patches[right_patch].row_split.inference_rows)
                     {
                         return Err(format!(
                             "disjoint covariance provenance contradicts shared inference rows in patches {left_patch} and {right_patch}"
@@ -1483,16 +1698,49 @@ mod tests {
         inference_rows: usize,
         padded_ambient: usize,
     ) -> GaussianPcaPatch {
+        let base = chart * 4_000_000;
         GaussianPcaPatch::new(
             chart,
-            1_000,
-            inference_rows,
+            GaussianPatchRowSplit::from_disjoint_ranges(
+                base,
+                1_000,
+                base + 1_000_000,
+                inference_rows,
+            )
+            .unwrap(),
+            PilotProjectionProvenance::CertifiedFixed {
+                tangent_leakage_bound: 0.0,
+                error_probability_bound: 0.0,
+            },
             GaussianPatchCentering::MeanEstimatedOnInferenceRows,
             projection_frame(plane_angle, padded_ambient),
             tangent_gauge(gauge_angle, reflected),
             0.01,
             1.0,
-            GaussianPcaPopulationBounds::new(0.01, 2.0, 1.0).unwrap(),
+            GaussianPcaSpectrumProvenance::CertifiedPopulation(
+                GaussianPcaPopulationBounds::new(0.01, 2.0, 1.0).unwrap(),
+            ),
+        )
+        .unwrap()
+    }
+
+    fn certified_analysis(
+        patches: Vec<GaussianPcaPatch>,
+        edges: Vec<ProjectedAtlasEdgeSpec>,
+        level: AtlasFamilywiseLevel,
+        gauss_bonnet: Option<GaussBonnetInput>,
+    ) -> GaussianPcaHolonomyAnalysis {
+        let error_model = GaussianPcaErrorModel::independent(
+            &patches,
+            GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization,
+        )
+        .unwrap();
+        GaussianPcaHolonomyAnalysis::certify(
+            patches,
+            edges,
+            error_model,
+            level,
+            gauss_bonnet,
         )
         .unwrap()
     }
@@ -1509,7 +1757,7 @@ mod tests {
         gauges: [(f64, bool); 3],
         padded_ambient: usize,
     ) -> GaussianPcaHolonomyAnalysis {
-        GaussianPcaHolonomyAnalysis::certify(
+        certified_analysis(
             vec![
                 patch(0, 0.0, gauges[0].0, gauges[0].1, 1_000_000, padded_ambient),
                 patch(1, 0.2, gauges[1].0, gauges[1].1, 1_000_000, padded_ambient),
@@ -1526,7 +1774,6 @@ mod tests {
             AtlasFamilywiseLevel::new(0.05).unwrap(),
             None,
         )
-        .unwrap()
     }
 
     fn assert_near(left: f64, right: f64) {
@@ -1620,16 +1867,28 @@ mod tests {
         tangent: Array2<f64>,
     ) -> GaussianPcaPatch {
         let ambient = tangent.nrows();
+        let base = chart * 4_000_000;
         GaussianPcaPatch::new(
             chart,
-            inference_rows,
-            inference_rows,
+            GaussianPatchRowSplit::from_disjoint_ranges(
+                base,
+                inference_rows,
+                base + 1_000_000,
+                inference_rows,
+            )
+            .unwrap(),
+            PilotProjectionProvenance::CertifiedFixed {
+                tangent_leakage_bound: 0.0,
+                error_probability_bound: 0.0,
+            },
             GaussianPatchCentering::MeanEstimatedOnInferenceRows,
             identity_projection(ambient),
             tangent,
             0.01,
             1.0,
-            GaussianPcaPopulationBounds::new(0.01, 2.0, 1.0).unwrap(),
+            GaussianPcaSpectrumProvenance::CertifiedPopulation(
+                GaussianPcaPopulationBounds::new(0.01, 2.0, 1.0).unwrap(),
+            ),
         )
         .unwrap()
     }
@@ -1715,7 +1974,7 @@ mod tests {
 
     #[test]
     fn fundamental_cycle_preserves_parallel_overlap_identity() {
-        let analysis = GaussianPcaHolonomyAnalysis::certify(
+        let analysis = certified_analysis(
             vec![
                 patch(0, 0.0, 0.0, false, 1_000_000, 0),
                 patch(1, 0.0, 0.0, false, 1_000_000, 0),
@@ -1726,8 +1985,7 @@ mod tests {
             ],
             AtlasFamilywiseLevel::new(0.05).unwrap(),
             None,
-        )
-        .unwrap();
+        );
         assert_eq!(analysis.cycles().len(), 1);
         assert_eq!(analysis.cycles()[0].closed_chart_walk(), vec![0, 1, 0]);
         assert_eq!(
@@ -1756,20 +2014,20 @@ mod tests {
         );
         let cycle = &analysis.cycles()[0];
         assert_near(cycle.first_order_variance.unwrap(), 0.0);
-        assert_near(cycle.second_order_variance.unwrap(), 0.0);
-        assert!(cycle.naive_edgewise_second_order_variance.unwrap() > 0.0);
-        assert_near(
-            cycle
-                .shared_pair_second_order_covariance_adjustment
-                .unwrap(),
-            -cycle.naive_edgewise_second_order_variance.unwrap(),
-        );
-        assert_near(cycle.raw_ambient_second_order_variance.unwrap(), 0.0);
+        assert_near(cycle.bilinear_quadratic_variance.unwrap(), 0.0);
+        assert!(matches!(
+            cycle.limit_law,
+            Some(AtlasCycleLimitLaw::DegenerateQuadraticGaussian { .. })
+        ));
+        assert!(matches!(
+            cycle.decision.refusals(),
+            [AtlasStatisticalRefusal::DegenerateQuadraticGaussianLimit { .. }]
+        ));
     }
 
     #[test]
     fn singular_parallel_overlap_refusals_name_each_edge_identity() {
-        let analysis = GaussianPcaHolonomyAnalysis::certify(
+        let analysis = certified_analysis(
             vec![
                 patch(0, 0.0, 0.0, false, 1_000_000, 0),
                 patch(1, std::f64::consts::FRAC_PI_2, 0.0, false, 1_000_000, 0),
@@ -1780,8 +2038,7 @@ mod tests {
             ],
             AtlasFamilywiseLevel::new(0.05).unwrap(),
             None,
-        )
-        .unwrap();
+        );
         let refused_edges: BTreeSet<_> = analysis
             .orientation()
             .refusals()
@@ -1818,8 +2075,8 @@ mod tests {
             right.first_order_variance.unwrap(),
         );
         assert_near(
-            left.second_order_variance.unwrap(),
-            right.second_order_variance.unwrap(),
+            left.bilinear_quadratic_variance.unwrap(),
+            right.bilinear_quadratic_variance.unwrap(),
         );
     }
 
@@ -1829,7 +2086,7 @@ mod tests {
         let cycle = &analysis.cycles()[0];
         let correct = cycle.first_order_variance.unwrap();
         let naive = cycle.naive_edgewise_first_order_variance.unwrap();
-        let adjustment = cycle.shared_patch_covariance_adjustment.unwrap();
+        let adjustment = cycle.covariance_aggregation_adjustment.unwrap();
         assert_near(correct - naive, adjustment);
         assert!(adjustment.abs() > f64::EPSILON);
     }
@@ -1844,7 +2101,7 @@ mod tests {
             plane_tangent(0.2, ambient),
             plane_tangent(-0.15, ambient),
         ];
-        let base = GaussianPcaHolonomyAnalysis::certify(
+        let base = certified_analysis(
             true_tangents
                 .iter()
                 .cloned()
@@ -1856,8 +2113,7 @@ mod tests {
             triangle_edges(),
             AtlasFamilywiseLevel::new(0.05).unwrap(),
             None,
-        )
-        .unwrap();
+        );
         let cycle = &base.cycles()[0];
         let plugin_standard_error = cycle.standard_error.unwrap();
         assert!(plugin_standard_error > 0.0);
@@ -1936,7 +2192,7 @@ mod tests {
         let inference_rows = 1_000_000;
         let true_a = plane_tangent(0.0, 3);
         let true_b = plane_tangent(0.2, 3);
-        let analysis = GaussianPcaHolonomyAnalysis::certify(
+        let analysis = certified_analysis(
             vec![
                 projected_patch_from_tangent(0, inference_rows, true_a.clone()),
                 projected_patch_from_tangent(1, inference_rows, true_b.clone()),
@@ -1944,8 +2200,7 @@ mod tests {
             vec![ProjectedAtlasEdgeSpec::new(0, 1, 0, 0.0).unwrap()],
             AtlasFamilywiseLevel::new(0.05).unwrap(),
             None,
-        )
-        .unwrap();
+        );
         assert!(analysis.orientation().certified_value().is_some());
         let bound = analysis.orientation_flip_probability_bound();
         let perturbation_sd = analysis.patch_summaries()[0]
@@ -1992,23 +2247,16 @@ mod tests {
             base.cycles()[0].decision.certified_value(),
             padded.cycles()[0].decision.certified_value()
         );
-        let projected = padded.cycles()[0].second_order_variance.unwrap();
-        let raw = padded.cycles()[0]
-            .raw_ambient_second_order_variance
-            .unwrap();
-        let projected_rank = padded.edges()[0].projected_dimension;
-        let ambient = padded.patch_summaries()[0].ambient_dimension;
         assert_near(
-            projected / raw,
-            (projected_rank - INTRINSIC_DIMENSION) as f64 / (ambient - INTRINSIC_DIMENSION) as f64,
+            base.cycles()[0].bilinear_quadratic_variance.unwrap(),
+            padded.cycles()[0].bilinear_quadratic_variance.unwrap(),
         );
-        assert!(raw > projected);
     }
 
     #[test]
     fn orientation_bound_decreases_with_rows_and_prescription_is_closed_form() {
         let build = |rows| {
-            GaussianPcaHolonomyAnalysis::certify(
+            certified_analysis(
                 vec![
                     patch(0, 0.0, 0.0, false, rows, 0),
                     patch(1, 0.2, 0.0, false, rows, 0),
@@ -2017,7 +2265,6 @@ mod tests {
                 AtlasFamilywiseLevel::new(0.05).unwrap(),
                 None,
             )
-            .unwrap()
         };
         let small = build(16);
         let large = build(1_000_000);
@@ -2038,7 +2285,7 @@ mod tests {
     #[test]
     fn orientation_occupancy_counts_distinct_projected_edge_incidences() {
         let level = AtlasFamilywiseLevel::new(0.05).unwrap();
-        let single = GaussianPcaHolonomyAnalysis::certify(
+        let single = certified_analysis(
             vec![
                 patch(0, 0.0, 0.0, false, 1_000_000, 0),
                 patch(1, 0.2, 0.0, false, 1_000_000, 0),
@@ -2046,9 +2293,8 @@ mod tests {
             vec![ProjectedAtlasEdgeSpec::new(0, 1, 0, 0.0).unwrap()],
             level,
             None,
-        )
-        .unwrap();
-        let two_incident_edges = GaussianPcaHolonomyAnalysis::certify(
+        );
+        let two_incident_edges = certified_analysis(
             vec![
                 patch(0, 0.0, 0.0, false, 1_000_000, 0),
                 patch(1, 0.2, 0.0, false, 1_000_000, 0),
@@ -2060,8 +2306,7 @@ mod tests {
             ],
             level,
             None,
-        )
-        .unwrap();
+        );
         let single_center = single
             .sample_prescription()
             .iter()
@@ -3273,12 +3518,12 @@ impl GaussianPcaHolonomyAnalysis {
     /// Build the complete projected PCA holonomy analysis.
     #[must_use = "Gaussian PCA holonomy construction errors must be handled"]
     pub fn certify(
-        mut patches: Vec<GaussianPcaPatch>,
+        patches: Vec<GaussianPcaPatch>,
         mut edge_specs: Vec<ProjectedAtlasEdgeSpec>,
+        error_model: GaussianPcaErrorModel,
         familywise_level: AtlasFamilywiseLevel,
         gauss_bonnet_input: Option<GaussBonnetInput>,
     ) -> Result<Self, String> {
-        patches.sort_by_key(|patch| patch.chart);
         for (expected, patch) in patches.iter().enumerate() {
             if patch.chart != expected {
                 return Err(format!(
@@ -3286,6 +3531,13 @@ impl GaussianPcaHolonomyAnalysis {
                     patch.chart
                 ));
             }
+        }
+        let expected_offsets = GaussianPcaErrorModel::coordinate_offsets(&patches);
+        if error_model.offsets != expected_offsets {
+            return Err(
+                "Gaussian PCA error-model coordinates do not match the ordered patch frames"
+                    .to_string(),
+            );
         }
         let chart_count = patches.len();
         if let Some(first) = patches.first() {
@@ -3339,7 +3591,14 @@ impl GaussianPcaHolonomyAnalysis {
             .iter()
             .enumerate()
             .map(|(index, cycle)| {
-                analyze_cycle(index, cycle, &patches, &edge_work, allocated_alpha)
+                analyze_cycle(
+                    index,
+                    cycle,
+                    &patches,
+                    &edge_work,
+                    &error_model,
+                    allocated_alpha,
+                )
             })
             .collect::<Result<_, _>>()?;
         let gauss_bonnet = gauss_bonnet_input
@@ -3350,6 +3609,7 @@ impl GaussianPcaHolonomyAnalysis {
             familywise_level,
             chart_count,
             patch_summaries,
+            error_model,
             edges: edge_work.into_iter().map(|edge| edge.public).collect(),
             orientation,
             orientation_flip_probability_bound,
@@ -3365,6 +3625,7 @@ impl AtlasHolonomyCertificate {
     pub fn gaussian_pca(
         patches: Vec<GaussianPcaPatch>,
         edge_specs: Vec<ProjectedAtlasEdgeSpec>,
+        error_model: GaussianPcaErrorModel,
         familywise_level: AtlasFamilywiseLevel,
         gauss_bonnet_input: Option<GaussBonnetInput>,
     ) -> Result<Self, String> {
@@ -3372,6 +3633,7 @@ impl AtlasHolonomyCertificate {
             GaussianPcaHolonomyAnalysis::certify(
                 patches,
                 edge_specs,
+                error_model,
                 familywise_level,
                 gauss_bonnet_input,
             )?,

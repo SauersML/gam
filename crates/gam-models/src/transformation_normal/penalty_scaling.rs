@@ -2,13 +2,13 @@ use super::*;
 
 pub(crate) fn ctn_penalty_scale_log_lambdas(
     penalties: &[PenaltyMatrix],
-    likelihood_gram: &Array2<f64>,
+    likelihood_diagonal_mean: f64,
 ) -> Array1<f64> {
     if penalties.is_empty() {
         return Array1::zeros(0);
     }
 
-    let likelihood_scale = matrix_diag_mean_abs(likelihood_gram).max(CTN_SEED_SCALE_FLOOR);
+    let likelihood_scale = likelihood_diagonal_mean.max(CTN_SEED_SCALE_FLOOR);
     Array1::from_iter(penalties.iter().map(|penalty| {
         let penalty_scale = penalty_diag_scale(penalty).max(CTN_SEED_SCALE_FLOOR);
         // Lower-bound the SEED log-lambda at 0 (i.e., λ ≥ 1) so we never

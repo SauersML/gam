@@ -2769,6 +2769,55 @@ pub(crate) fn launch_bms_flex_row_hvp_multi(
         })
 }
 
+/// Materialize a row-major dense matrix from batched column images `H * I`.
+/// Each launcher input/output is row-major `[rhs_count, p_total]`; the output
+/// vectors are columns of `H`, so this routine performs the one required
+/// transpose while copying them into `[row, column]` storage.
+#[cfg(target_os = "linux")]
+fn materialize_dense_from_hvp_batches(
+    p_total: usize,
+    mut launch: impl FnMut(&[f64], usize) -> Result<Vec<f64>, GpuError>,
+) -> Result<Vec<f64>, GpuError> {
+    if p_total == 0 {
+        return Err(GpuError::DriverCallFailed {
+            reason: "bms_flex_row dense HVP materialization: p_total must be > 0".to_string(),
+        });
+    }
+    let dense_len = p_total
+        .checked_mul(p_total)
+        .ok_or_else(|| GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row dense HVP materialization: p_total={p_total} square overflow"
+            ),
+        })?;
+    let mut dense = vec![0.0_f64; dense_len];
+    for column_start in (0..p_total).step_by(BMS_FLEX_ROW_HVP_MAX_RHS) {
+        let rhs_count = (p_total - column_start).min(BMS_FLEX_ROW_HVP_MAX_RHS);
+        let mut basis = vec![0.0_f64; rhs_count * p_total];
+        for local_column in 0..rhs_count {
+            basis[local_column * p_total + column_start + local_column] = 1.0;
+        }
+        let images = launch(&basis, rhs_count)?;
+        if images.len() != basis.len() {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "bms_flex_row dense HVP materialization: batch at column {column_start} returned {} values, expected {}",
+                    images.len(),
+                    basis.len()
+                ),
+            });
+        }
+        for local_column in 0..rhs_count {
+            let column = column_start + local_column;
+            let image = &images[local_column * p_total..(local_column + 1) * p_total];
+            for (row, &value) in image.iter().enumerate() {
+                dense[row * p_total + column] = value;
+            }
+        }
+    }
+    Ok(dense)
+}
+
 /// Device-output HVP. Runs `bms_flex_row_hvp_partial(_packed)` +
 /// `bms_flex_row_hvp_reduce` on the storage's stream against caller-supplied
 /// device-resident `d_v` (length `p_total` doubles), writing the result into
@@ -2850,6 +2899,24 @@ pub(crate) const DENSE_BLOCK_MAX_P: usize = 72;
 /// occupancy with `num_chunks = ceil(n / DENSE_BLOCK_ROWS_PER_CTA)`.
 #[cfg(target_os = "linux")]
 pub(crate) const DENSE_BLOCK_ROWS_PER_CTA: u32 = 32;
+
+/// Materialize the selected device-resident joint Hessian using the fastest
+/// CUDA algorithm supported by its width. The direct shared-memory kernel is
+/// used through [`DENSE_BLOCK_MAX_P`]; wider matrices are formed as batched
+/// `H * I` column images through the existing bounded multi-RHS HVP kernel.
+/// This is an up-front device algorithm choice, not a CUDA-to-CPU fallback.
+#[cfg(target_os = "linux")]
+pub(crate) fn launch_bms_flex_row_dense(
+    storage: &DeviceResidentRowHess,
+) -> Result<Vec<f64>, GpuError> {
+    let p_total = storage.block.p_total;
+    if p_total <= DENSE_BLOCK_MAX_P {
+        return launch_bms_flex_row_dense_block(storage);
+    }
+    materialize_dense_from_hvp_batches(p_total, |basis, rhs_count| {
+        launch_bms_flex_row_hvp_multi(storage, basis, rhs_count)
+    })
+}
 
 /// Launch the Phase-6 dense joint-Hessian block kernel. Returns the
 /// host-side `[p_total, p_total]` row-major joint H as a `Vec<f64>`

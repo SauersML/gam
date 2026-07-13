@@ -204,6 +204,86 @@ impl KroneckerDesign {
         self.weighted_cross_with(w.view(), self, policy)
     }
 
+    /// Mean diagonal of `self^T diag(w) self` for non-negative weights without
+    /// materializing the `(p_a p_b)^2` Gram.
+    ///
+    /// For one row of `X = A ⊙ B`, `||X_i||² = ||A_i||² ||B_i||²`; therefore
+    /// `mean(diag(X^T W X)) = Σ_i w_i ||A_i||² ||B_i||² / (p_a p_b)`.
+    /// This is the only likelihood scale the CTN cold smoothing seed consumes.
+    pub(crate) fn weighted_gram_diagonal_mean(
+        &self,
+        weights: &Array1<f64>,
+        policy: &ResourcePolicy,
+    ) -> Result<f64, String> {
+        FiniteSignedWeightsView::try_new(weights.view()).map_err(|reason| {
+            format!("KroneckerDesign::weighted_gram_diagonal_mean: {reason}")
+        })?;
+        if weights.iter().any(|weight| *weight < 0.0) {
+            return Err(TransformationNormalError::InvalidInput {
+                reason: "KroneckerDesign diagonal-mean weights must be non-negative".to_string(),
+            }
+            .into());
+        }
+        match self {
+            KroneckerDesign::KhatriRao { left, right } => {
+                let n = left.nrows();
+                if weights.len() != n || right.nrows() != n {
+                    return Err(TransformationNormalError::InvalidInput {
+                        reason: format!(
+                            "KroneckerDesign diagonal-mean row mismatch: weights={}, left={}, right={}",
+                            weights.len(),
+                            n,
+                            right.nrows(),
+                        ),
+                    }
+                    .into());
+                }
+                let p_total = left.ncols().checked_mul(right.ncols()).ok_or_else(|| {
+                    TransformationNormalError::InvalidInput {
+                        reason: "KroneckerDesign diagonal-mean column product overflow"
+                            .to_string(),
+                    }
+                    .to_string()
+                })?;
+                if p_total == 0 {
+                    return Ok(0.0);
+                }
+                let rows_per_chunk = gam_runtime::resource::rows_for_target_bytes(
+                    policy.row_chunk_target_bytes,
+                    right.ncols().max(1),
+                );
+                let mut diagonal_sum = 0.0_f64;
+                for start in (0..n).step_by(rows_per_chunk) {
+                    let end = (start + rows_per_chunk).min(n);
+                    let right_chunk = right
+                        .try_row_chunk(start..end)
+                        .map_err(|error| error.to_string())?;
+                    for local in 0..right_chunk.nrows() {
+                        let row = start + local;
+                        let left_norm_squared =
+                            left.row(row).iter().map(|value| value * value).sum::<f64>();
+                        let right_norm_squared = right_chunk
+                            .row(local)
+                            .iter()
+                            .map(|value| value * value)
+                            .sum::<f64>();
+                        diagonal_sum += weights[row] * left_norm_squared * right_norm_squared;
+                    }
+                }
+                let mean = diagonal_sum / p_total as f64;
+                if !mean.is_finite() {
+                    return Err(TransformationNormalError::NonFinite {
+                        reason: format!(
+                            "KroneckerDesign weighted Gram diagonal mean is non-finite: {mean}"
+                        ),
+                    }
+                    .into());
+                }
+                Ok(mean)
+            }
+        }
+    }
+
     /// Compute `self^T · diag(w) · other` while keeping rowwise-Kronecker
     /// designs in factored form. Returns a dense (pa*pb) x (pc*pd) block matrix.
     pub(crate) fn weighted_cross_with(
