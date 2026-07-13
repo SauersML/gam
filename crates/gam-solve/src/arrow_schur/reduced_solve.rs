@@ -699,11 +699,38 @@ fn jacobi_diagonal_scale(schur: &Array2<f64>) -> Array1<f64> {
 /// does NOT yet get this equilibration. Both paths are exact; the GPU path is
 /// simply not yet as well-conditioned on an ill-scaled system. Porting the
 /// same technique there is a deliberate follow-up, not part of this change.
+/// Conditioning policy for a dense reduced Schur factorization.
+///
+/// Newton-step damping and evidence quotient deflation are deliberately
+/// different policies: Tikhonov directions retain a small positive curvature
+/// for a stable step, while evidence-null directions are pinned to unit
+/// stiffness so their log-determinant contribution is exactly zero.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ReducedSchurPolicy {
+    StrictNewton,
+    NewtonTikhonov { relative_floor: f64 },
+    EvidenceUnitDeflation { relative_floor: f64 },
+}
+
+impl ReducedSchurPolicy {
+    pub(crate) fn newton(relative_floor: Option<f64>) -> Self {
+        match relative_floor {
+            Some(relative_floor) => Self::NewtonTikhonov { relative_floor },
+            None => Self::StrictNewton,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DenseReducedSchurFactorization {
+    pub(crate) factor: Array2<f64>,
+    pub(crate) conditioned_schur: Option<Array2<f64>>,
+}
+
 pub(crate) fn factor_dense_reduced_schur(
     schur: &Array2<f64>,
-    schur_pd_floor: Option<f64>,
-    unit_deflate_null_directions: bool,
-) -> Result<(Array2<f64>, Option<Array2<f64>>), ArrowSchurError> {
+    policy: ReducedSchurPolicy,
+) -> Result<DenseReducedSchurFactorization, ArrowSchurError> {
     let n = schur.nrows();
     let d = jacobi_diagonal_scale(schur);
     let mut schur_scaled = Array2::<f64>::zeros((n, n));
@@ -734,8 +761,12 @@ pub(crate) fn factor_dense_reduced_schur(
             // dominated by the raw column-scale spread; the floored
             // reconstruction is undone back to original units below exactly like
             // the plain factor.
-            match schur_pd_floor {
-                Some(relative_floor) => match if unit_deflate_null_directions {
+            match policy {
+                ReducedSchurPolicy::NewtonTikhonov { relative_floor }
+                | ReducedSchurPolicy::EvidenceUnitDeflation { relative_floor } => match if matches!(
+                    policy,
+                    ReducedSchurPolicy::EvidenceUnitDeflation { .. }
+                ) {
                     spectral_unit_deflated_schur(&schur_scaled, relative_floor)
                 } else {
                     spectral_pd_floored_schur(&schur_scaled, relative_floor)
@@ -750,7 +781,9 @@ pub(crate) fn factor_dense_reduced_schur(
                         });
                     }
                 },
-                None => return Err(ArrowSchurError::SchurFactorFailed { reason: e }),
+                ReducedSchurPolicy::StrictNewton => {
+                    return Err(ArrowSchurError::SchurFactorFailed { reason: e });
+                }
             }
         }
     };
@@ -771,7 +804,10 @@ pub(crate) fn factor_dense_reduced_schur(
         }
         floored
     });
-    Ok((factor, floored_schur))
+    Ok(DenseReducedSchurFactorization {
+        factor,
+        conditioned_schur: floored_schur,
+    })
 }
 
 pub(crate) fn solve_dense_reduced_system(
@@ -780,11 +816,18 @@ pub(crate) fn solve_dense_reduced_system(
     options: &ArrowSolveOptions,
     metric_weights: Option<&MetricWeights>,
 ) -> Result<(Array1<f64>, Option<Array2<f64>>, ArrowPcgDiagnostics), ArrowSchurError> {
-    let (factor, floored_schur) = factor_dense_reduced_schur(
-        schur,
-        options.schur_pd_floor,
-        options.tolerate_ill_conditioning,
-    )?;
+    let policy = if options.tolerate_ill_conditioning {
+        options
+            .schur_pd_floor
+            .map(|relative_floor| ReducedSchurPolicy::EvidenceUnitDeflation { relative_floor })
+            .unwrap_or(ReducedSchurPolicy::StrictNewton)
+    } else {
+        ReducedSchurPolicy::newton(options.schur_pd_floor)
+    };
+    let DenseReducedSchurFactorization {
+        factor,
+        conditioned_schur: floored_schur,
+    } = factor_dense_reduced_schur(schur, policy)?;
     if let Some(floored) = floored_schur {
         let direct = mixed_precision_reduced_beta(&floored, &factor, rhs_beta, options)
             .unwrap_or_else(|| cholesky_solve_vector(&factor, rhs_beta));

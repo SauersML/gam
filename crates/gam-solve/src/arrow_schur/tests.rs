@@ -6358,8 +6358,11 @@ fn factor_dense_reduced_schur_reconstructs_original_illconditioned_matrix_2015()
         }
     }
 
-    let (factor, floored) =
-        factor_dense_reduced_schur(&schur, None, false).expect("planted matrix is PD");
+    let DenseReducedSchurFactorization {
+        factor,
+        conditioned_schur: floored,
+    } = factor_dense_reduced_schur(&schur, ReducedSchurPolicy::StrictNewton)
+        .expect("planted matrix is PD");
     assert!(
         floored.is_none(),
         "a genuinely PD matrix must not need the spectral floor"

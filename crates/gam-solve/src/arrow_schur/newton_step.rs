@@ -139,8 +139,18 @@ pub fn solve_arrow_newton_step_with_options(
             sys,
             build_dense_schur_direct(sys, evidence_htt_factors, 0.0, &backend)?,
         );
-        let (evidence_schur_factor, floored_evidence_schur) =
-            factor_dense_reduced_schur(&evidence_schur, options.schur_pd_floor, true)?;
+        let DenseReducedSchurFactorization {
+            factor: evidence_schur_factor,
+            conditioned_schur: floored_evidence_schur,
+        } = factor_dense_reduced_schur(
+            &evidence_schur,
+            options
+                .schur_pd_floor
+                .map(|relative_floor| ReducedSchurPolicy::EvidenceUnitDeflation {
+                    relative_floor,
+                })
+                .unwrap_or(ReducedSchurPolicy::StrictNewton),
+        )?;
         drop(floored_evidence_schur);
         schur_factor = Some(evidence_schur_factor);
         schur_factor_is_undamped = true;
@@ -1738,8 +1748,13 @@ pub(crate) fn try_mixed_precision_arrow_solve(
         }));
     }
 
-    let (schur_factor, floored_schur) =
-        factor_dense_reduced_schur(schur, options.schur_pd_floor, false)?;
+    let DenseReducedSchurFactorization {
+        factor: schur_factor,
+        conditioned_schur: floored_schur,
+    } = factor_dense_reduced_schur(
+        schur,
+        ReducedSchurPolicy::newton(options.schur_pd_floor),
+    )?;
     if floored_schur.is_some() {
         return Ok(Some(MixedPrecisionAttempt::Fallback {
             reason: "reduced Schur required the spectral PD-floor; using the f64 dense solve"
@@ -2543,7 +2558,11 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
         let htt_factors =
             backend.factor_blocks(&sys.rows, ridge_t, sys.d, tolerate_ill_conditioning)?;
         let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, backend)?;
-        let (schur_factor, _) = factor_dense_reduced_schur(&schur, schur_pd_floor, false)?;
+        let schur_factor = factor_dense_reduced_schur(
+            &schur,
+            ReducedSchurPolicy::newton(schur_pd_floor),
+        )?
+        .factor;
         Ok(Self {
             sys,
             backend,
