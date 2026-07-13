@@ -12,7 +12,7 @@
 //! only their one generic row expression and certified unary derivative stacks;
 //! this module owns the compiled lowering schedule.
 
-use std::cell::RefCell;
+use std::cell::UnsafeCell;
 
 use crate::jet_scalar::{Order2, RuntimeJetScalar, SymmetricQuadraticCoefficients};
 
@@ -71,55 +71,117 @@ enum GraphNodeKind {
 #[derive(Clone, Copy, Debug)]
 struct GraphNode {
     value: f64,
+    support: u128,
     kind: GraphNodeKind,
 }
 
-#[derive(Debug, Default)]
+const MAX_PRIMARY_DIMENSION: usize = 16;
+const MAX_GRAPH_NODES: usize = 64;
+const MAX_GRAPH_TERMS: usize = 128;
+const MAX_GRAPH_COEFFICIENTS: usize = MAX_PRIMARY_DIMENSION * MAX_PRIMARY_DIMENSION;
+const EMPTY_TERM: GraphTerm = GraphTerm {
+    node: 0,
+    first: 0.0,
+    second: 0.0,
+};
+const EMPTY_NODE: GraphNode = GraphNode {
+    value: 0.0,
+    support: 0,
+    kind: GraphNodeKind::Constant,
+};
+
+#[derive(Debug)]
 struct GraphTape {
     dimension: usize,
-    nodes: Vec<GraphNode>,
-    gradients: Vec<f64>,
-    terms: Vec<GraphTerm>,
-    coefficients: Vec<f64>,
+    node_len: usize,
+    term_len: usize,
+    coefficient_len: usize,
+    nodes: [GraphNode; MAX_GRAPH_NODES],
+    gradients: [f64; MAX_GRAPH_NODES * MAX_PRIMARY_DIMENSION],
+    terms: [GraphTerm; MAX_GRAPH_TERMS],
+    coefficients: [f64; MAX_GRAPH_COEFFICIENTS],
+    adjoints: [f64; MAX_GRAPH_NODES],
+}
+
+impl GraphTape {
+    fn new() -> Self {
+        Self {
+            dimension: 0,
+            node_len: 0,
+            term_len: 0,
+            coefficient_len: 0,
+            nodes: [EMPTY_NODE; MAX_GRAPH_NODES],
+            gradients: [0.0; MAX_GRAPH_NODES * MAX_PRIMARY_DIMENSION],
+            terms: [EMPTY_TERM; MAX_GRAPH_TERMS],
+            coefficients: [0.0; MAX_GRAPH_COEFFICIENTS],
+            adjoints: [0.0; MAX_GRAPH_NODES],
+        }
+    }
 }
 
 /// Reusable storage for a compiled scalar DAG.
 ///
-/// Reset between rows. All vectors retain their capacity, so a warmed worker
-/// performs no tape or reverse-adjoint allocation.
-#[derive(Debug, Default)]
+/// Reset between rows. The boxed tape has fixed capacity, so every row after
+/// worker construction performs no tape or reverse-adjoint allocation and no
+/// capacity checks or growth branches.
+#[derive(Debug)]
 pub struct Order2GraphWorkspace {
-    tape: RefCell<GraphTape>,
-    adjoints: RefCell<Vec<f64>>,
+    tape: UnsafeCell<Box<GraphTape>>,
+}
+
+impl Default for Order2GraphWorkspace {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Order2GraphWorkspace {
     /// Empty reusable graph storage.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            tape: UnsafeCell::new(Box::new(GraphTape::new())),
+        }
     }
 
-    /// Reclaim the prior row while retaining every allocation.
+    /// Reclaim the prior row in constant time.
     pub fn reset(&mut self, dimension: usize) {
-        let tape = self.tape.get_mut();
+        assert!(
+            dimension <= MAX_PRIMARY_DIMENSION,
+            "compiled graph supports at most {MAX_PRIMARY_DIMENSION} primaries"
+        );
+        let tape = self.tape.get_mut().as_mut();
         tape.dimension = dimension;
-        tape.nodes.clear();
-        tape.gradients.clear();
-        tape.terms.clear();
-        tape.coefficients.clear();
-        self.adjoints.get_mut().clear();
+        tape.node_len = 0;
+        tape.term_len = 0;
+        tape.coefficient_len = 0;
     }
 
-    /// Bytes retained by the reusable graph and reverse sweep buffers.
+    /// Bytes retained by the fixed graph and reverse-sweep tape.
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
-        let tape = self.tape.borrow();
-        tape.nodes.capacity() * std::mem::size_of::<GraphNode>()
-            + tape.gradients.capacity() * std::mem::size_of::<f64>()
-            + tape.terms.capacity() * std::mem::size_of::<GraphTerm>()
-            + tape.coefficients.capacity() * std::mem::size_of::<f64>()
-            + self.adjoints.borrow().capacity() * std::mem::size_of::<f64>()
+        std::mem::size_of::<GraphTape>()
+    }
+
+    /// Number of active nodes in the current row schedule.
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.tape().node_len
+    }
+
+    /// Shared tape access. `UnsafeCell` removes the dynamic borrow state that a
+    /// `RefCell` would place in every scalar operation. The workspace is not
+    /// `Sync`, every mutation is completed before a scalar handle is returned,
+    /// and lowering starts only after expression construction, so no aliases to
+    /// the tape contents escape these two private accessors.
+    #[inline(always)]
+    fn tape(&self) -> &GraphTape {
+        unsafe { (&*self.tape.get()).as_ref() }
+    }
+
+    #[inline(always)]
+    fn tape_mut(&self) -> &mut GraphTape {
+        unsafe { (&mut *self.tape.get()).as_mut() }
     }
 
     #[inline(always)]
@@ -127,26 +189,46 @@ impl Order2GraphWorkspace {
         tape: &mut GraphTape,
         value: f64,
         kind: GraphNodeKind,
+        support: u128,
         gradient: [f64; K],
     ) -> usize {
         assert_eq!(tape.dimension, K, "compiled graph dimension mismatch");
-        assert_eq!(tape.gradients.len(), tape.nodes.len() * K);
-        let node = tape.nodes.len();
-        tape.nodes.push(GraphNode { value, kind });
-        tape.gradients.extend_from_slice(&gradient);
+        assert!(tape.node_len < MAX_GRAPH_NODES, "compiled graph node capacity exceeded");
+        let node = tape.node_len;
+        tape.nodes[node] = GraphNode {
+            value,
+            support,
+            kind,
+        };
+        tape.gradients[node * K..(node + 1) * K].copy_from_slice(&gradient);
+        tape.node_len += 1;
         node
     }
 
-    fn lower<const K: usize>(&self, output: usize) -> Order2<K> {
-        let tape = self.tape.borrow();
-        assert_eq!(tape.dimension, K, "compiled graph dimension mismatch");
-        assert!(output < tape.nodes.len(), "compiled graph output is absent");
-        assert_eq!(tape.gradients.len(), tape.nodes.len() * K);
+    #[inline(always)]
+    fn push_term(tape: &mut GraphTape, term: GraphTerm) {
+        assert!(tape.term_len < MAX_GRAPH_TERMS, "compiled graph term capacity exceeded");
+        tape.terms[tape.term_len] = term;
+        tape.term_len += 1;
+    }
 
-        let mut adjoints = self.adjoints.borrow_mut();
-        adjoints.resize(tape.nodes.len(), 0.0);
-        adjoints.fill(0.0);
-        adjoints[output] = 1.0;
+    #[inline(always)]
+    fn push_coefficient(tape: &mut GraphTape, coefficient: f64) {
+        assert!(
+            tape.coefficient_len < MAX_GRAPH_COEFFICIENTS,
+            "compiled graph coefficient capacity exceeded"
+        );
+        tape.coefficients[tape.coefficient_len] = coefficient;
+        tape.coefficient_len += 1;
+    }
+
+    #[inline(always)]
+    fn lower<const K: usize>(&self, output: usize) -> Order2<K> {
+        let tape = self.tape_mut();
+        assert_eq!(tape.dimension, K, "compiled graph dimension mismatch");
+        assert!(output < tape.node_len, "compiled graph output is absent");
+        tape.adjoints[..tape.node_len].fill(0.0);
+        tape.adjoints[output] = 1.0;
 
         let mut out = crate::jet_tower::Tower2::zero();
         out.v = tape.nodes[output].value;
@@ -155,86 +237,87 @@ impl Order2GraphWorkspace {
         }
 
         for node_index in (0..=output).rev() {
-            let adjoint = adjoints[node_index];
+            let adjoint = tape.adjoints[node_index];
             if adjoint == 0.0 {
                 continue;
             }
             match tape.nodes[node_index].kind {
                 GraphNodeKind::Constant | GraphNodeKind::Variable => {}
                 GraphNodeKind::Add { left, right } => {
-                    adjoints[left] += adjoint;
-                    adjoints[right] += adjoint;
+                    tape.adjoints[left] += adjoint;
+                    tape.adjoints[right] += adjoint;
                 }
                 GraphNodeKind::Sub { left, right } => {
-                    adjoints[left] += adjoint;
-                    adjoints[right] -= adjoint;
+                    tape.adjoints[left] += adjoint;
+                    tape.adjoints[right] -= adjoint;
                 }
                 GraphNodeKind::Scale { input, scale } => {
-                    adjoints[input] += adjoint * scale;
+                    tape.adjoints[input] += adjoint * scale;
                 }
                 GraphNodeKind::Product { left, right } => {
-                    adjoints[left] += adjoint * tape.nodes[right].value;
-                    adjoints[right] += adjoint * tape.nodes[left].value;
-                    for primary in 0..K {
+                    tape.adjoints[left] += adjoint * tape.nodes[right].value;
+                    tape.adjoints[right] += adjoint * tape.nodes[left].value;
+                    for_each_supported_upper(
+                        tape.nodes[left].support | tape.nodes[right].support,
+                        |primary, other| {
                         let left_primary = tape.gradients[left * K + primary];
                         let right_primary = tape.gradients[right * K + primary];
-                        for other in primary..K {
-                            let curvature = left_primary * tape.gradients[right * K + other]
-                                + right_primary * tape.gradients[left * K + other];
-                            out.h[primary][other] += adjoint * curvature;
-                        }
-                    }
+                        let curvature = left_primary * tape.gradients[right * K + other]
+                            + right_primary * tape.gradients[left * K + other];
+                        out.h[primary][other] += adjoint * curvature;
+                    },
+                    );
                 }
                 GraphNodeKind::MultiplyAdd {
                     left,
                     right,
                     addend,
                 } => {
-                    adjoints[left] += adjoint * tape.nodes[right].value;
-                    adjoints[right] += adjoint * tape.nodes[left].value;
-                    adjoints[addend] += adjoint;
-                    for primary in 0..K {
+                    tape.adjoints[left] += adjoint * tape.nodes[right].value;
+                    tape.adjoints[right] += adjoint * tape.nodes[left].value;
+                    tape.adjoints[addend] += adjoint;
+                    for_each_supported_upper(
+                        tape.nodes[left].support | tape.nodes[right].support,
+                        |primary, other| {
                         let left_primary = tape.gradients[left * K + primary];
                         let right_primary = tape.gradients[right * K + primary];
-                        for other in primary..K {
-                            let curvature = left_primary * tape.gradients[right * K + other]
-                                + right_primary * tape.gradients[left * K + other];
-                            out.h[primary][other] += adjoint * curvature;
-                        }
-                    }
+                        let curvature = left_primary * tape.gradients[right * K + other]
+                            + right_primary * tape.gradients[left * K + other];
+                        out.h[primary][other] += adjoint * curvature;
+                    },
+                    );
                 }
                 GraphNodeKind::Unary {
                     input,
                     first,
                     second,
                 } => {
-                    adjoints[input] += adjoint * first;
+                    tape.adjoints[input] += adjoint * first;
                     let curvature_scale = adjoint * second;
-                    for primary in 0..K {
+                    for_each_supported_upper(tape.nodes[input].support, |primary, other| {
                         let input_primary = tape.gradients[input * K + primary];
-                        for other in primary..K {
-                            out.h[primary][other] +=
-                                curvature_scale * input_primary * tape.gradients[input * K + other];
-                        }
-                    }
+                        out.h[primary][other] +=
+                            curvature_scale * input_primary * tape.gradients[input * K + other];
+                    });
                 }
                 GraphNodeKind::LinearTerms { start, len } => {
                     for term in &tape.terms[start..start + len] {
-                        adjoints[term.node] += adjoint * term.first;
+                        tape.adjoints[term.node] += adjoint * term.first;
                     }
                 }
                 GraphNodeKind::DiagonalTerms { start, len } => {
                     for term in &tape.terms[start..start + len] {
-                        adjoints[term.node] += adjoint * term.first;
+                        tape.adjoints[term.node] += adjoint * term.first;
                         let curvature_scale = adjoint * term.second;
-                        for primary in 0..K {
+                        for_each_supported_upper(
+                            tape.nodes[term.node].support,
+                            |primary, other| {
                             let input_primary = tape.gradients[term.node * K + primary];
-                            for other in primary..K {
-                                out.h[primary][other] += curvature_scale
-                                    * input_primary
-                                    * tape.gradients[term.node * K + other];
-                            }
-                        }
+                            out.h[primary][other] += curvature_scale
+                                * input_primary
+                                * tape.gradients[term.node * K + other];
+                        },
+                        );
                     }
                 }
                 GraphNodeKind::Quadratic {
@@ -244,10 +327,9 @@ impl Order2GraphWorkspace {
                 } => {
                     let terms = &tape.terms[start..start + len];
                     for term in terms {
-                        adjoints[term.node] += adjoint * term.first;
+                        tape.adjoints[term.node] += adjoint * term.first;
                     }
-                    for primary in 0..K {
-                        for other in primary..K {
+                    for_each_supported_upper(tape.nodes[node_index].support, |primary, other| {
                             let mut curvature = 0.0;
                             for row in 0..len {
                                 let row_gradient = tape.gradients[terms[row].node * K + primary];
@@ -260,8 +342,7 @@ impl Order2GraphWorkspace {
                                 curvature += row_gradient * projected;
                             }
                             out.h[primary][other] += 2.0 * adjoint * curvature;
-                        }
-                    }
+                    });
                 }
             }
         }
@@ -272,6 +353,20 @@ impl Order2GraphWorkspace {
             }
         }
         Order2(out)
+    }
+}
+
+#[inline(always)]
+fn for_each_supported_upper(mut rows: u128, mut visit: impl FnMut(usize, usize)) {
+    while rows != 0 {
+        let primary = rows.trailing_zeros() as usize;
+        rows &= rows - 1;
+        let mut columns = rows | (1_u128 << primary);
+        while columns != 0 {
+            let other = columns.trailing_zeros() as usize;
+            columns &= columns - 1;
+            visit(primary, other);
+        }
     }
 }
 
@@ -302,19 +397,21 @@ impl<'arena, const K: usize> Order2Graph<'arena, K> {
 
     #[inline(always)]
     fn unary(&self, value: f64, first: f64, second: f64) -> Self {
-        let mut tape = self.workspace.tape.borrow_mut();
+        let tape = self.workspace.tape_mut();
         let mut gradient = [0.0; K];
         for primary in 0..K {
             gradient[primary] = first * tape.gradients[self.node * K + primary];
         }
+        let support = tape.nodes[self.node].support;
         let node = Order2GraphWorkspace::push(
-            &mut tape,
+            tape,
             value,
             GraphNodeKind::Unary {
                 input: self.node,
                 first,
                 second,
             },
+            support,
             gradient,
         );
         Self {
@@ -330,8 +427,13 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
     #[inline(always)]
     fn constant(c: f64, dimension: usize, workspace: &'arena Self::Workspace) -> Self {
         assert_eq!(dimension, K, "compiled graph dimension mismatch");
-        let mut tape = workspace.tape.borrow_mut();
-        let node = Order2GraphWorkspace::push(&mut tape, c, GraphNodeKind::Constant, [0.0; K]);
+        let node = Order2GraphWorkspace::push(
+            workspace.tape_mut(),
+            c,
+            GraphNodeKind::Constant,
+            0,
+            [0.0; K],
+        );
         Self { workspace, node }
     }
 
@@ -341,8 +443,13 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         assert!(axis < K, "compiled graph variable axis out of bounds");
         let mut gradient = [0.0; K];
         gradient[axis] = 1.0;
-        let mut tape = workspace.tape.borrow_mut();
-        let node = Order2GraphWorkspace::push(&mut tape, x, GraphNodeKind::Variable, gradient);
+        let node = Order2GraphWorkspace::push(
+            workspace.tape_mut(),
+            x,
+            GraphNodeKind::Variable,
+            1_u128 << axis,
+            gradient,
+        );
         Self { workspace, node }
     }
 
@@ -378,35 +485,40 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             value += values[axis] * projected[axis];
         }
 
-        let mut tape = workspace.tape.borrow_mut();
-        let start = tape.terms.len();
+        let tape = workspace.tape_mut();
+        let start = tape.term_len;
         let mut gradient = [0.0; K];
+        let mut support = 0_u128;
         for axis in 0..input_dimension {
             let first = 2.0 * projected[axis];
-            tape.terms.push(GraphTerm {
+            Order2GraphWorkspace::push_term(tape, GraphTerm {
                 node: inputs[axis].node,
                 first,
                 second: 0.0,
             });
+            support |= tape.nodes[inputs[axis].node].support;
             for primary in 0..K {
                 gradient[primary] += first * tape.gradients[inputs[axis].node * K + primary];
             }
         }
-        let coefficient_start = tape.coefficients.len();
+        let coefficient_start = tape.coefficient_len;
         for row in 0..input_dimension {
             for column in 0..input_dimension {
-                tape.coefficients
-                    .push(coefficients.coefficient(row, column));
+                Order2GraphWorkspace::push_coefficient(
+                    tape,
+                    coefficients.coefficient(row, column),
+                );
             }
         }
         let node = Order2GraphWorkspace::push(
-            &mut tape,
+            tape,
             value,
             GraphNodeKind::Quadratic {
                 start,
                 len: input_dimension,
                 coefficient_start,
             },
+            support,
             gradient,
         );
         Self { workspace, node }
@@ -427,28 +539,31 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                 .all(|input| std::ptr::eq(input.workspace, workspace)),
             "compiled graph linear inputs belong to different workspaces"
         );
-        let mut tape = workspace.tape.borrow_mut();
-        let start = tape.terms.len();
+        let tape = workspace.tape_mut();
+        let start = tape.term_len;
         let mut value = 0.0;
         let mut gradient = [0.0; K];
+        let mut support = 0_u128;
         for (input, &weight) in inputs.iter().zip(weights) {
             value += weight * tape.nodes[input.node].value;
-            tape.terms.push(GraphTerm {
+            Order2GraphWorkspace::push_term(tape, GraphTerm {
                 node: input.node,
                 first: weight,
                 second: 0.0,
             });
+            support |= tape.nodes[input.node].support;
             for primary in 0..K {
                 gradient[primary] += weight * tape.gradients[input.node * K + primary];
             }
         }
         let node = Order2GraphWorkspace::push(
-            &mut tape,
+            tape,
             value,
             GraphNodeKind::LinearTerms {
                 start,
                 len: inputs.len(),
             },
+            support,
             gradient,
         );
         Self { workspace, node }
