@@ -1624,20 +1624,24 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
     Some(SplineScanInputs { x, y, w, order })
 }
 
-/// Formula-level entry for the exact O(n) cubic-smoothing-spline fast path.
+/// Formula-level direct entry for the exact O(n) smoothing-spline scan.
 ///
 /// Materializes the formula exactly like [`fit_from_formula`], then runs the
 /// [`spline_scan_fast_path`] detection on the resulting standard request.
-/// When detection fires the fit is routed through
+/// This public entry point is for library callers that specifically need the
+/// specialized [`gam_solve::spline_scan::SplineScanFit`] rather than the
+/// [`FitResult::SplineScan`] sum-type returned by the canonical workflow. When
+/// detection fires the fit is routed through
 /// [`gam_solve::spline_scan::fit_spline_scan`] — the exact diffuse
 /// REML Kalman/RTS scan — and the full in-memory posterior
 /// ([`gam_solve::spline_scan::SplineScanFit`]: knots, smoothed
 /// states, pointwise variances, lag-one gains, σ², log λ, exact EDF, and an
 /// exact `predict`) is returned. `Ok(None)` means the model is not the
-/// scan-eligible shape and the caller should use the dense
-/// [`fit_from_formula`] path; this keeps every persistence-bearing consumer
-/// (model save, CLI, FFI) transparently on the dense fit, whose saved payload
-/// the scan does not yet have a schema for.
+/// scan-eligible shape; the direct caller then chooses another estimator.
+/// Persistence-bearing workflows do not call this probe: [`fit_from_formula`]
+/// returns [`FitResult::SplineScan`], and the shared
+/// [`crate::inference::model_payload_builders::assemble_spline_scan_payload`]
+/// authority writes the exact scan state for both CLI and FFI consumers.
 pub fn fit_spline_scan_from_formula(
     formula: &str,
     data: &Dataset,

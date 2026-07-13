@@ -21,17 +21,17 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use tempfile::tempdir;
 
-const EXPECTED_MODEL_PAYLOAD_VERSION: u64 = 7;
+const EXPECTED_MODEL_PAYLOAD_VERSION: u64 = 8;
 const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 2;
-// Additive fields since the original pin: used_device, training_feature_ranges,
-// transformation_response_*, transformation_score_calibration, resolved_termspec*,
-// adaptive_regularization_diagnostics, gaussian_jackknife_plus, full_conformal, and
-// (this bump 90 -> 93) inference_notes, link_wiggle_index_shift (#2141 flexible-link
-// warp index), weight_column (#2030/#2025). All three are plain `#[serde(default)]`
-// persisted payload fields (not stateful link/family states like sas_state), so they
-// round-trip via serde with back-compat and need no entry in the stateful-sync path;
-// the count is bumped after auditing that coverage.
-const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 93;
+// FittedModelPayload has 96 serialized fields in schema version 8. These pin
+// fixtures leave `group_metadata=None` and `deployment_extensions=[]`; those are
+// the only two fields guarded by `skip_serializing_if`, so their JSON payloads
+// contain exactly 94 keys. Version 8 made `training_table_kind` a required
+// serialized String, while the typed `spline_scan` and `residual_cascade`
+// representation channels remain present (as null for these dense fixtures).
+// Any payload-field or skip-rule change requires a fresh enumeration before
+// changing this pin.
+const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 94;
 const EXPECTED_STANDARD_FAMILY_FIELD_COUNT: usize = 6;
 
 fn read_saved_model_json(path: &Path) -> Value {
