@@ -98,7 +98,7 @@ use crate::migration_ledger::SaeMigrationLedger;
 use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance_for_pairs};
 use gam_linalg::faer_ndarray::FaerSvd;
 use gam_runtime::warm_start::Fingerprinter;
-use gam_solve::gaussian_reml::gaussian_reml_multi_closed_form;
+use gam_solve::gaussian_reml::gaussian_reml_multi_shared_dispersion_closed_form;
 use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
 use gam_solve::structure_search::{
     ChartGlueOutcome, CollapseAction, MoveBudget, MoveProposal, SearchLedger, SearchOutcome,
@@ -3110,9 +3110,23 @@ fn fit_topology_candidate(
     // freedom `tr[(ΦᵀWΦ + λS)⁻¹ ΦᵀWΦ]`. We feed `reml_score` as `raw_reml` and
     // `edf` as `effective_dim`, and report `null_dim = 0` so the TK normalizer does
     // NOT re-subtract a null-space term the REML score already integrated out.
-    let reml_fit =
-        gaussian_reml_multi_closed_form(phi.view(), target, s_raw.view(), Some(weights), None)
-            .map_err(|e| format!("fit_topology_candidate: REML evidence: {e:?}"))?;
+    // The ambient columns are coordinates of ONE vector-valued observation, so
+    // topology evidence must profile one shared dispersion.  Profiling a
+    // separate variance per output lets a PCA chart win tautologically: the PC
+    // axes are exact linear functions of themselves (zero residual and
+    // effectively -infinite evidence) even when the chart entirely misses an
+    // orthogonal manifold direction.  Pooling the vector deviance before its
+    // logarithm makes the race pay for every missed ambient direction while
+    // retaining the same closed-form REML, posterior-mean coefficients, and
+    // grid-free smoothing-parameter optimization.
+    let reml_fit = gaussian_reml_multi_shared_dispersion_closed_form(
+        phi.view(),
+        target,
+        s_raw.view(),
+        Some(weights),
+        None,
+    )
+    .map_err(|e| format!("fit_topology_candidate: REML evidence: {e:?}"))?;
     let lambda = reml_fit.lambda;
     if !(lambda.is_finite() && lambda >= 0.0) {
         return Err(format!(
@@ -3644,7 +3658,7 @@ pub struct PrimaryTopologyChoice {
     /// coordinates ride out of the race rather than being re-creased by the linear
     /// PCA seed downstream. `None` when the PCA seed won (the default seed path
     /// already reproduces its chart) — every non-auto atom carries `None`.
-    pub coords: Option<Array2<f64>>,
+    pub coords: Array2<f64>,
 }
 
 /// Per-atom topology discovery for the PRIMARY seed dictionary (#2238/#2239).
@@ -3964,16 +3978,15 @@ pub fn discover_primary_atom_topologies(
                     .map(|(int_fit, int_score)| (int_fit, int_score, int_chart)),
                     None => None,
                 };
-            // When the intrinsic seed wins, its unfolded chart both drives the
-            // Duchon-center growth (`sheet_coords`) AND must be installed as the
-            // atom's final seed coordinates (`winning_intrinsic_chart`) so the
-            // downstream PCA seed does not re-crease the fold.
-            let mut winning_intrinsic_chart: Option<Array2<f64>> = None;
+            // A race winner is ATOMIC: its topology kind and the coordinates on
+            // which that kind earned its evidence come from the same fitted
+            // handle.  Never track coordinate provenance in a parallel optional
+            // flag; that split allowed a Duchon kind verdict to survive while
+            // its intrinsic chart was discarded and rebuilt from PCA.
             let fit = match (pca_winner, intrinsic_challenger) {
                 (Some((p_fit, p_score)), Some((i_fit, i_score, i_chart))) => {
                     if i_score < p_score {
-                        sheet_coords = Some(i_chart.clone());
-                        winning_intrinsic_chart = Some(i_chart);
+                        debug_assert_eq!(i_fit.coords, i_chart);
                         i_fit
                     } else {
                         p_fit
@@ -3981,8 +3994,7 @@ pub fn discover_primary_atom_topologies(
                 }
                 (Some((p_fit, _)), None) => p_fit,
                 (None, Some((i_fit, _, i_chart))) => {
-                    sheet_coords = Some(i_chart.clone());
-                    winning_intrinsic_chart = Some(i_chart);
+                    debug_assert_eq!(i_fit.coords, i_chart);
                     i_fit
                 }
                 (None, None) => {
@@ -3991,6 +4003,9 @@ pub fn discover_primary_atom_topologies(
                     ));
                 }
             };
+            if fit.basis_kind == SaeAtomBasisKind::Duchon {
+                sheet_coords = Some(fit.coords.clone());
+            }
             // #2243 — for a circle winner, GROW the harmonic resolution by the
             // same REML evidence: the topology race ran the circle at a fixed low
             // budget only to discriminate topology, but a genuinely 1-D factor's
@@ -4047,18 +4062,17 @@ pub fn discover_primary_atom_topologies(
             } else {
                 None
             };
-            // Install the winning intrinsic chart, projected to the resolved
-            // latent dimension, only when the intrinsic seed actually won.
-            let coords = winning_intrinsic_chart.map(|chart| {
-                let d = fit.latent_dim.min(chart.ncols());
-                let mut out = Array2::<f64>::zeros((chart.nrows(), fit.latent_dim));
-                for row in 0..chart.nrows() {
-                    for col in 0..d {
-                        out[[row, col]] = chart[[row, col]];
-                    }
+            // Install the exact chart realization the winner was scored on.
+            // This is required for intrinsic folds and equally correct for every
+            // natural curved chart; a kind-only verdict followed by a generic
+            // coordinate rebuild is a different candidate than the one that won.
+            let d = fit.latent_dim.min(fit.coords.ncols());
+            let mut coords = Array2::<f64>::zeros((fit.coords.nrows(), fit.latent_dim));
+            for row in 0..fit.coords.nrows() {
+                for col in 0..d {
+                    coords[[row, col]] = fit.coords[[row, col]];
                 }
-                out
-            });
+            }
             Ok(PrimaryTopologyChoice {
                 basis_kind: fit.basis_kind,
                 latent_dim: fit.latent_dim,
@@ -4516,9 +4530,8 @@ pub fn resolve_auto_primary_atoms(
         ));
     }
     let mut resolution_overrides: Vec<Option<usize>> = vec![None; k_atoms];
-    // Per-atom seed-chart overrides: `Some` only where the intrinsic-metric seed
-    // won the primary race (#2240/#2280), so the caller installs the UNFOLDED
-    // geodesic chart instead of the PCA seed for that atom.
+    // Per-atom seed-chart overrides: every auto winner carries the exact chart
+    // realization on which it earned its evidence. Non-auto atoms remain None.
     let mut coord_overrides: Vec<Option<Array2<f64>>> = vec![None; k_atoms];
     if !atom_basis.iter().any(|basis| basis == "auto") {
         return Ok((resolution_overrides, coord_overrides));
@@ -4552,8 +4565,6 @@ pub fn resolve_auto_primary_atoms(
             SaeAtomBasisKind::EuclideanPatch => {
                 atom_basis[atom_idx] = "duchon".to_string();
                 atom_dim[atom_idx] = choice.latent_dim;
-                // If the intrinsic seed won, install its unfolded chart (#2280).
-                coord_overrides[atom_idx] = choice.coords.clone();
             }
             SaeAtomBasisKind::Duchon => {
                 // #2240 — the rich thin-plate sheet won the race outright.
@@ -4563,9 +4574,6 @@ pub fn resolve_auto_primary_atoms(
                 atom_basis[atom_idx] = "duchon".to_string();
                 atom_dim[atom_idx] = choice.latent_dim;
                 resolution_overrides[atom_idx] = choice.n_duchon_centers;
-                // If the intrinsic seed won, install its unfolded chart (#2280)
-                // so the thin-plate sheet is anchored on the unrolled fold.
-                coord_overrides[atom_idx] = choice.coords.clone();
             }
             SaeAtomBasisKind::Periodic => {
                 atom_basis[atom_idx] = "periodic".to_string();
@@ -4586,6 +4594,7 @@ pub fn resolve_auto_primary_atoms(
                 ));
             }
         }
+        coord_overrides[atom_idx] = Some(choice.coords.clone());
     }
     Ok((resolution_overrides, coord_overrides))
 }

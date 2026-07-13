@@ -539,6 +539,106 @@ pub fn gaussian_reml_multi_closed_form(
     gaussian_reml_multi_closed_form_with_nullspace_dim(x, y, penalty, None, weights, init_rho)
 }
 
+/// Closed-form multi-response Gaussian REML with one SHARED dispersion across
+/// all response columns.
+///
+/// This is the appropriate likelihood when the columns are coordinates of one
+/// vector-valued observation rather than unrelated responses with independently
+/// estimable noise scales.  The coefficient matrix and smoothing parameter are
+/// still shared exactly as in [`gaussian_reml_multi_closed_form`], but the
+/// profiled deviance is pooled before taking its logarithm:
+///
+/// `dp = sum_j dp_j`, `nu = d * (n_eff - nullity)`.
+///
+/// Pooling is essential for coordinate-chart races.  A chart made from a linear
+/// projection of the response reconstructs those projection axes tautologically;
+/// independently profiling each output dispersion lets one exact axis drive its
+/// variance to zero and dominate evidence even when another ambient direction is
+/// badly missed.  A shared ambient dispersion scores the reconstruction of the
+/// vector as one object and cannot be gamed by that coordinate leakage.
+pub fn gaussian_reml_multi_shared_dispersion_closed_form(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_rho: Option<f64>,
+) -> Result<GaussianRemlMultiResult, EstimationError> {
+    let prepared = prepare_gaussian_reml(x, y, penalty, None, weights, None)?;
+    let init_rho = init_rho
+        .map(f64::exp)
+        .map(validate_initial_lambda)
+        .transpose()?
+        .map(f64::ln);
+    let d = prepared.n_outputs;
+    let mut pooled_ywy = Array1::<f64>::zeros(1);
+    pooled_ywy[0] = prepared.ywy.iter().copied().sum();
+    let mut pooled_projected_rhs_squared =
+        Array2::<f64>::zeros((prepared.cache.penalty_eigenvalues.len(), 1));
+    for eig in 0..prepared.cache.penalty_eigenvalues.len() {
+        pooled_projected_rhs_squared[[eig, 0]] = prepared
+            .projected_rhs_squared
+            .row(eig)
+            .iter()
+            .copied()
+            .sum();
+    }
+    let per_output_nu = prepared.n_effective as f64 - prepared.cache.nullity as f64;
+    let shared_nu = (d as f64) * per_output_nu;
+    let eval = |rho: f64| {
+        evaluate_reml_profile(
+            &prepared.cache,
+            pooled_ywy.view(),
+            pooled_projected_rhs_squared.view(),
+            d,
+            shared_nu,
+            rho,
+        )
+    };
+    let rho = if prepared.cache.penalty_rank == 0 {
+        init_rho.unwrap_or(0.0).clamp(RHO_LOWER, RHO_UPPER)
+    } else {
+        let enclose = |a: f64, b: f64| {
+            reml_deriv_enclosure_profile(
+                &prepared.cache,
+                pooled_ywy.view(),
+                pooled_projected_rhs_squared.view(),
+                d,
+                shared_nu,
+                a,
+                b,
+            )
+        };
+        enumerate_and_select_rho(eval, enclose, init_rho, |_r, _e| {})?.0
+    };
+    let objective = eval(rho);
+    let lambda = gam_problem::checked_exp_log_strength(rho)
+        .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+    let coefficients = prepared.coefficients(lambda);
+    let fitted = dense_ab(x, coefficients.view());
+    let mut fitted_quadratic = 0.0_f64;
+    for eig in 0..prepared.cache.penalty_eigenvalues.len() {
+        let denom = 1.0 + lambda * prepared.cache.penalty_eigenvalues[eig];
+        fitted_quadratic += pooled_projected_rhs_squared[[eig, 0]] / denom;
+    }
+    let shared_sigma2 = ((pooled_ywy[0] - fitted_quadratic).max(MIN_DEVIANCE)) / shared_nu;
+    let (reml_grad_lambda, reml_hess_lambda) =
+        rho_derivatives_to_lambda(lambda, objective.grad, objective.hess);
+    Ok(GaussianRemlMultiResult {
+        lambda,
+        rho,
+        coefficients,
+        fitted,
+        reml_score: objective.cost,
+        reml_grad_lambda,
+        reml_hess_lambda,
+        reml_grad_rho: objective.grad,
+        reml_hess_rho: objective.hess,
+        edf: objective.edf,
+        sigma2: Array1::from_elem(d, shared_sigma2),
+        cache: prepared.cache,
+    })
+}
+
 pub fn gaussian_reml_multi_closed_form_with_nullspace_dim(
     x: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,
@@ -3430,11 +3530,36 @@ fn reml_deriv_enclosure(
     a: f64,
     b: f64,
 ) -> (Interval, Interval) {
-    let nu = n_effective as f64 - cache.nullity as f64;
-    let d = n_outputs as f64;
+    reml_deriv_enclosure_profile(
+        cache,
+        ywy,
+        projected_rhs_squared,
+        n_outputs,
+        n_effective as f64 - cache.nullity as f64,
+        a,
+        b,
+    )
+}
+
+/// Derivative enclosure for an arbitrary response-dispersion profile.
+/// `logdet_output_count` prices the independent coefficient columns, while
+/// `dispersion_dof` is the degrees of freedom of each pooled deviance column in
+/// `ywy` / `projected_rhs_squared`.  The ordinary multi-response objective uses
+/// `d` separate columns each with `n-q` degrees of freedom; shared-dispersion
+/// REML supplies one pooled column with `d(n-q)` degrees of freedom.
+fn reml_deriv_enclosure_profile(
+    cache: &GaussianRemlEigenCache,
+    ywy: ArrayView1<'_, f64>,
+    projected_rhs_squared: ArrayView2<'_, f64>,
+    logdet_output_count: usize,
+    dispersion_dof: f64,
+    a: f64,
+    b: f64,
+) -> (Interval, Interval) {
+    let d = logdet_output_count as f64;
     let rank = cache.penalty_rank as f64;
     let half_d = 0.5 * d;
-    let half_nu = 0.5 * nu;
+    let half_nu = 0.5 * dispersion_dof;
     let lambda_lo = a.exp();
     let lambda_hi = b.exp();
 
@@ -3462,7 +3587,7 @@ fn reml_deriv_enclosure(
     let mut g2_hi = 0.0;
     let mut vpp_disp_lo = 0.0;
     let mut vpp_disp_hi = 0.0;
-    for j in 0..n_outputs {
+    for j in 0..ywy.len() {
         let mut num_lo = 0.0; // Σ c² · w   (= dp′, ≥ 0)
         let mut num_hi = 0.0;
         let mut sv_lo = 0.0; // Σ c² · v
@@ -3748,9 +3873,29 @@ fn evaluate_reml_parts(
     n_outputs: usize,
     rho: f64,
 ) -> ObjectiveEval {
+    evaluate_reml_profile(
+        cache,
+        ywy,
+        projected_rhs_squared,
+        n_outputs,
+        n_effective as f64 - cache.nullity as f64,
+        rho,
+    )
+}
+
+/// Evaluate the REML objective under either separate or pooled response
+/// dispersions.  See [`reml_deriv_enclosure_profile`] for the two independent
+/// dimensions of the profile contract.
+fn evaluate_reml_profile(
+    cache: &GaussianRemlEigenCache,
+    ywy: ArrayView1<'_, f64>,
+    projected_rhs_squared: ArrayView2<'_, f64>,
+    logdet_output_count: usize,
+    dispersion_dof: f64,
+    rho: f64,
+) -> ObjectiveEval {
     let lambda = rho.exp();
-    let nu = n_effective as f64 - cache.nullity as f64;
-    let d = n_outputs as f64;
+    let d = logdet_output_count as f64;
 
     // Each term's value and its ρ-derivatives come back from ONE function so
     // they cannot be edited independently; `+=` folds the triple in lock-step.
@@ -3762,9 +3907,15 @@ fn evaluate_reml_parts(
         edf,
     };
     eval += logdet_term;
-    for output in 0..n_outputs {
-        eval +=
-            gaussian_reml_dispersion_term(cache, ywy, projected_rhs_squared, output, nu, lambda);
+    for output in 0..ywy.len() {
+        eval += gaussian_reml_dispersion_term(
+            cache,
+            ywy,
+            projected_rhs_squared,
+            output,
+            dispersion_dof,
+            lambda,
+        );
     }
     eval
 }
@@ -3974,6 +4125,51 @@ mod tests {
 
         assert!(result.edf >= result.cache.nullity as f64);
         assert!(result.edf <= x.ncols() as f64 + 1.0e-10);
+    }
+
+    #[test]
+    fn shared_dispersion_pools_projection_exact_and_missed_outputs() {
+        let n = 12usize;
+        let mut x = Array2::<f64>::zeros((n, 2));
+        let mut y = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            let t = row as f64 - 5.5;
+            x[[row, 0]] = 1.0;
+            x[[row, 1]] = t;
+            // The first ambient output is exactly the chart coordinate: this is
+            // the tautological zero-residual channel a PCA chart creates.
+            y[[row, 0]] = t;
+            // The second output is deliberately outside the linear chart.
+            y[[row, 1]] = if row % 2 == 0 { -2.0 } else { 3.0 };
+        }
+        let penalty = Array2::<f64>::zeros((2, 2));
+        let fit = gaussian_reml_multi_shared_dispersion_closed_form(
+            x.view(),
+            y.view(),
+            penalty.view(),
+            None,
+            None,
+        )
+        .expect("shared-dispersion vector REML fit");
+
+        assert_eq!(fit.sigma2[0].to_bits(), fit.sigma2[1].to_bits());
+        let mut pooled_rss = 0.0_f64;
+        for row in 0..n {
+            for output in 0..2 {
+                let residual = y[[row, output]] - fit.fitted[[row, output]];
+                pooled_rss += residual * residual;
+            }
+        }
+        let shared_nu = (2 * (n - fit.cache.nullity)) as f64;
+        let expected_sigma2 = pooled_rss / shared_nu;
+        assert!(expected_sigma2 > 0.0);
+        assert!(
+            (fit.sigma2[0] - expected_sigma2).abs()
+                <= f64::EPSILON * (n as f64) * expected_sigma2.max(1.0),
+            "shared sigma2 {} must equal pooled vector deviance / shared dof {}",
+            fit.sigma2[0],
+            expected_sigma2
+        );
     }
 
     #[test]
