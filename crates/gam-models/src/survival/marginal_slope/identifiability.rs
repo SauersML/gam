@@ -1700,6 +1700,7 @@ pub struct CompiledSurvivalDesignsVMExact {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::survival::{LogslopeLayout, LogslopeTopology};
     use gam_problem::Gauge;
     use ndarray::array;
 
