@@ -577,7 +577,6 @@ def _acceptance_report(
     best_hybrid = max(finite_hybrid) if finite_hybrid else float("nan")
     # Parity bar = max over the finite comparators (best finite linear arm + the
     # official full-space reference). The official reference is finite, so this can
-    # never collapse to NaN the way `max(nan, official)` did before.
     comparators = _finite([best_linear, float(official_reference_ev)])
     parity_ev = max(comparators) if comparators else float("nan")
 
@@ -763,7 +762,8 @@ def main() -> None:
     )
     print(
         f"{'K':>4}  {'hyb_EV_full':>12}  {'hyb_EV_pca':>11}  {'lin_EV_full':>12}  "
-        f"{'lin_EV_pca':>11}  {'(h-l)_full':>11}  {'hyb_s':>8}  {'lin_s':>8}  {'rec_s':>8}"
+        f"{'lin_EV_pca':>11}  {'(h-l)_full':>11}  {'hyb_fit_s':>9}  "
+        f"{'lin_fit_s':>9}  {'max_rec_s':>9}"
     )
     rows = []
     for k in ladder:
