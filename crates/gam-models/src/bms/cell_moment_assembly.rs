@@ -5792,7 +5792,7 @@ mod empirical_flex_jet_oracle_tests {
         }
     }
 
-    fn scheduled_paired_medians<T>(
+    fn scheduled_abba_medians<T>(
         samples: usize,
         mut repeated: impl FnMut() -> T,
         mut scheduled: impl FnMut() -> T,
@@ -5804,25 +5804,38 @@ mod empirical_flex_jet_oracle_tests {
         let mut repeated_output = None;
         let mut scheduled_output = None;
         for sample in 0..samples {
+            macro_rules! timed {
+                ($value:expr) => {{
+                    let start = std::time::Instant::now();
+                    let value = $value;
+                    let elapsed = start.elapsed().as_nanos();
+                    std::hint::black_box(&value);
+                    (elapsed, value)
+                }};
+            }
             let (repeated_ns, repeated_value, scheduled_ns, scheduled_value) = if sample % 2 == 0 {
-                let start = std::time::Instant::now();
-                let repeated_value = repeated();
-                let repeated_ns = start.elapsed().as_nanos();
-                let start = std::time::Instant::now();
-                let scheduled_value = scheduled();
-                let scheduled_ns = start.elapsed().as_nanos();
-                (repeated_ns, repeated_value, scheduled_ns, scheduled_value)
+                let (repeated_first_ns, _) = timed!(repeated());
+                let (scheduled_first_ns, _) = timed!(scheduled());
+                let (scheduled_second_ns, scheduled_value) = timed!(scheduled());
+                let (repeated_second_ns, repeated_value) = timed!(repeated());
+                (
+                    repeated_first_ns + repeated_second_ns,
+                    repeated_value,
+                    scheduled_first_ns + scheduled_second_ns,
+                    scheduled_value,
+                )
             } else {
-                let start = std::time::Instant::now();
-                let scheduled_value = scheduled();
-                let scheduled_ns = start.elapsed().as_nanos();
-                let start = std::time::Instant::now();
-                let repeated_value = repeated();
-                let repeated_ns = start.elapsed().as_nanos();
-                (repeated_ns, repeated_value, scheduled_ns, scheduled_value)
+                let (scheduled_first_ns, _) = timed!(scheduled());
+                let (repeated_first_ns, _) = timed!(repeated());
+                let (repeated_second_ns, repeated_value) = timed!(repeated());
+                let (scheduled_second_ns, scheduled_value) = timed!(scheduled());
+                (
+                    repeated_first_ns + repeated_second_ns,
+                    repeated_value,
+                    scheduled_first_ns + scheduled_second_ns,
+                    scheduled_value,
+                )
             };
-            std::hint::black_box(&repeated_value);
-            std::hint::black_box(&scheduled_value);
             repeated_timings.push(repeated_ns);
             scheduled_timings.push(scheduled_ns);
             speedups.push(repeated_ns as f64 / scheduled_ns as f64);
@@ -5860,7 +5873,7 @@ mod empirical_flex_jet_oracle_tests {
     /// Removed immediately after the pinned MSI result is recorded.
     #[test]
     fn empirical_flex_final_schedule_benchmark_932() {
-        const SAMPLES: usize = 9;
+        const SAMPLES: usize = 21;
 
         for is_score_warp in [true, false] {
             for r in [4_usize, 8, 12, 18] {
@@ -5967,7 +5980,7 @@ mod empirical_flex_jet_oracle_tests {
                     third_speedup,
                     third_repeated,
                     third_scheduled,
-                ) = scheduled_paired_medians(
+                ) = scheduled_abba_medians(
                     SAMPLES,
                     || {
                         directions
@@ -6021,7 +6034,7 @@ mod empirical_flex_jet_oracle_tests {
                     trace_speedup,
                     trace_repeated,
                     trace_scheduled,
-                ) = scheduled_paired_medians(
+                ) = scheduled_abba_medians(
                     SAMPLES,
                     || {
                         let mut gradient = Array1::<f64>::zeros(r);
@@ -6081,7 +6094,7 @@ mod empirical_flex_jet_oracle_tests {
                     fourth_speedup,
                     fourth_repeated,
                     fourth_scheduled,
-                ) = scheduled_paired_medians(
+                ) = scheduled_abba_medians(
                     SAMPLES,
                     || {
                         ordered_pairs
@@ -6142,15 +6155,15 @@ mod empirical_flex_jet_oracle_tests {
                 );
                 let kind = if is_score_warp { "score" } else { "link" };
                 eprintln!(
-                    "BMS932_FINAL kind={kind} r={r} channel=t3-many repeated_median_ns={third_repeated_ns} scheduled_median_ns={third_scheduled_ns} paired_speedup={:.3} arena_bytes={third_stable}",
+                    "BMS932_FINAL kind={kind} r={r} channel=t3-many repeated_abba_median_ns={third_repeated_ns} scheduled_abba_median_ns={third_scheduled_ns} abba_speedup={:.3} arena_bytes={third_stable}",
                     third_speedup,
                 );
                 eprintln!(
-                    "BMS932_FINAL kind={kind} r={r} channel=t3-trace repeated_median_ns={trace_repeated_ns} scheduled_median_ns={trace_scheduled_ns} paired_speedup={:.3} arena_bytes={third_stable}",
+                    "BMS932_FINAL kind={kind} r={r} channel=t3-trace repeated_abba_median_ns={trace_repeated_ns} scheduled_abba_median_ns={trace_scheduled_ns} abba_speedup={:.3} arena_bytes={third_stable}",
                     trace_speedup,
                 );
                 eprintln!(
-                    "BMS932_FINAL kind={kind} r={r} channel=t4-many repeated_median_ns={fourth_repeated_ns} scheduled_median_ns={fourth_scheduled_ns} paired_speedup={:.3} arena_bytes={fourth_stable}",
+                    "BMS932_FINAL kind={kind} r={r} channel=t4-many repeated_abba_median_ns={fourth_repeated_ns} scheduled_abba_median_ns={fourth_scheduled_ns} abba_speedup={:.3} arena_bytes={fourth_stable}",
                     fourth_speedup,
                 );
             }
