@@ -1032,7 +1032,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         } else {
             0.0
         };
-        let geometry = compute_joint_geometry(
+        let geometry = Some(compute_joint_geometry(
             family,
             specs,
             &inner.block_states,
@@ -1044,7 +1044,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .map_err(|reason| CustomFamilyError::Optimization {
             context: "fit_custom_family no-smoothing joint geometry",
             reason,
-        })?;
+        })?);
         let penalized_objective = checked_penalizedobjective(
             inner.log_likelihood,
             inner.penalty_value,
@@ -1442,6 +1442,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             // that coordinate rather than the evaluator's expanded physical
             // smoothing vector.
             rho: rho.clone(),
+            hyper_values: Array1::zeros(0),
             inner: eval_result.inner,
         };
         outer.install_terminal_mode(rho, objective, &gradient, mode);
@@ -1686,8 +1687,16 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     let CustomFamilyOwnedMode {
         objective: penalized_objective,
         rho: mode_rho,
+        hyper_values: mode_hyper_values,
         inner,
     } = mode;
+    if !mode_hyper_values.is_empty() {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family terminal mode ownership",
+            reason: "rho-only outer optimization retained unexpected non-rho coordinates"
+                .to_string(),
+        });
+    }
     if !inner.converged {
         return Err(CustomFamilyError::Optimization {
             context: "fit_custom_family terminal mode ownership",
@@ -1782,7 +1791,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         ),
     })?;
 
-    let geometry = compute_joint_geometry(
+    let geometry = Some(compute_joint_geometry(
         family,
         specs,
         &inner.block_states,
@@ -1794,7 +1803,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     .map_err(|reason| CustomFamilyError::Optimization {
         context: "fit_custom_family joint geometry",
         reason,
-    })?;
+    })?);
     // Cross-fit FitArtifact capture (Phase 0/1) for the converged smoothing
     // fit: persist the descriptor-indexed raw-β + ρ so a later fold transfers
     // ρ. Best-effort; never affects this fit's result. Gated on the same opt-in
@@ -1936,7 +1945,7 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
             rho.as_slice().unwrap_or(&[])
         ),
     })?;
-    let geometry = compute_joint_geometry(
+    let geometry = Some(compute_joint_geometry(
         family,
         specs,
         &inner.block_states,
@@ -1948,7 +1957,7 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
     .map_err(|reason| CustomFamilyError::Optimization {
         context: "fit_custom_family_fixed_log_lambdas joint geometry",
         reason,
-    })?;
+    })?);
     assemble_custom_family_fit_result(
         inner,
         BlockwiseFitAssembly {
@@ -2049,6 +2058,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
     let CustomFamilyOwnedMode {
         objective: selected_objective,
         rho,
+        hyper_values,
         inner,
     } = mode;
     if !inner.converged {
@@ -2070,18 +2080,20 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
         });
     }
 
-    if let Some((certified_theta, _)) = certified_theta
-        && (certified_theta.len() < rho.len()
-            || certified_theta
+    if let Some((certified_theta, _)) = certified_theta {
+        let expected_len = rho.len() + hyper_values.len();
+        let identity_matches = certified_theta.len() == expected_len
+            && certified_theta
                 .iter()
-                .zip(rho.iter())
-                .any(|(certified, selected)| certified.to_bits() != selected.to_bits()))
-    {
-        return Err(CustomFamilyError::InvalidInput {
-            context: "fit_custom_family_fixed_log_lambdas_from_owned_mode smoothing identity",
-            reason: "the selected smoothing coordinates do not bitwise match the certified outer optimum prefix"
-                .to_string(),
-        });
+                .zip(rho.iter().chain(hyper_values.iter()))
+                .all(|(certified, selected)| certified.to_bits() == selected.to_bits());
+        if !identity_matches {
+            return Err(CustomFamilyError::InvalidInput {
+                context: "fit_custom_family_fixed_log_lambdas_from_owned_mode full hyper identity",
+                reason: "the owned mode's [rho | manifest values] do not bitwise match the certified outer optimum"
+                    .to_string(),
+            });
+        }
     }
     let spec_rho = flatten_log_lambdas(specs);
     if rho.len() != spec_rho.len()
@@ -2159,7 +2171,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
         context: "fit_custom_family_fixed_log_lambdas_from_owned_mode covariance",
         reason: error.to_string(),
     })?;
-    let geometry = compute_joint_geometry(
+    let geometry = Some(compute_joint_geometry(
         family,
         specs,
         &inner.block_states,
@@ -2171,7 +2183,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
     .map_err(|reason| CustomFamilyError::Optimization {
         context: "fit_custom_family_fixed_log_lambdas_from_owned_mode geometry",
         reason,
-    })?;
+    })?);
 
     assemble_custom_family_fit_result(
         inner,
