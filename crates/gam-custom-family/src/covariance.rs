@@ -1183,21 +1183,34 @@ pub(crate) fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + '
     states: &[ParameterBlockState],
     per_block_log_lambdas: &[Array1<f64>],
     options: &BlockwiseFitOptions,
+    preferred_unpenalized_hessian: Option<&Array2<f64>>,
 ) -> Result<Array2<f64>, String> {
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    let Some(mut h) = exact_newton_joint_hessian_symmetrized(
-        family,
-        states,
-        specs,
-        total,
-        "joint exact-newton Hessian shape mismatch in covariance",
-    )?
-    else {
-        return Err(
-            "joint covariance requires an exact analytic Hessian; objective perturbation is forbidden"
-                .to_string(),
-        );
+    let mut h = if let Some(hessian) = preferred_unpenalized_hessian {
+        if hessian.dim() != (total, total) || hessian.iter().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "preferred joint covariance Hessian must be finite with shape {total}x{total}, got {}x{}",
+                hessian.nrows(),
+                hessian.ncols(),
+            ));
+        }
+        hessian.clone()
+    } else {
+        let Some(hessian) = exact_newton_joint_hessian_symmetrized(
+            family,
+            states,
+            specs,
+            total,
+            "joint exact-newton Hessian shape mismatch in covariance",
+        )?
+        else {
+            return Err(
+                "joint covariance requires an exact analytic Hessian; objective perturbation is forbidden"
+                    .to_string(),
+            );
+        };
+        hessian
     };
     for (b, spec) in specs.iter().enumerate() {
         let (start, end) = ranges[b];
@@ -1292,11 +1305,19 @@ pub(crate) fn compute_joint_covariance_required<F: CustomFamily + Clone + Send +
     states: &[ParameterBlockState],
     per_block_log_lambdas: &[Array1<f64>],
     options: &BlockwiseFitOptions,
+    preferred_unpenalized_hessian: Option<&Array2<f64>>,
 ) -> Result<Option<Array2<f64>>, CustomFamilyError> {
     if !options.compute_covariance {
         return Ok(None);
     }
-    compute_joint_covariance(family, specs, states, per_block_log_lambdas, options)
+    compute_joint_covariance(
+        family,
+        specs,
+        states,
+        per_block_log_lambdas,
+        options,
+        preferred_unpenalized_hessian,
+    )
         .map(Some)
         .map_err(|e| CustomFamilyError::InvalidInput {
             context: "compute_joint_covariance_required",
@@ -1311,15 +1332,12 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
     states: &[ParameterBlockState],
     per_block_log_lambdas: &[Array1<f64>],
     options: &BlockwiseFitOptions,
+    preferred_unpenalized_hessian: Option<&Array2<f64>>,
 ) -> Result<Option<FitGeometry>, String> {
     if specs.len() != per_block_log_lambdas.len() {
         return Ok(None);
     }
     if specs.len() == 1 {
-        let eval = family.evaluate(states).ok();
-        let Some(eval) = eval else {
-            return Ok(None);
-        };
         let spec = &specs[0];
         let lambdas = exact_lambdas_from_log_strengths(
             &per_block_log_lambdas[0],
@@ -1338,7 +1356,28 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
         //   and add the penalties, so these families report inference / total
         //   edf instead of dropping geometry (and therefore inference) for the
         //   whole fit (#720).
-        let (mut h, working_weights, working_response) =
+        let (mut h, working_weights, working_response) = if let Some(hessian) =
+            preferred_unpenalized_hessian
+        {
+            let p = spec.design.ncols();
+            if hessian.dim() != (p, p) || hessian.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "preferred single-block geometry Hessian must be finite with shape {p}x{p}, got {}x{}",
+                    hessian.nrows(),
+                    hessian.ncols(),
+                ));
+            }
+            let working_len = states.first().map(|state| state.eta.len()).unwrap_or(0);
+            (
+                hessian.clone(),
+                Array1::zeros(working_len),
+                Array1::zeros(working_len),
+            )
+        } else {
+            let eval = family.evaluate(states).ok();
+            let Some(eval) = eval else {
+                return Ok(None);
+            };
             match eval.blockworking_sets.as_slice() {
                 [
                     BlockWorkingSet::Diagonal {
@@ -1365,7 +1404,8 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
                     (h, Array1::zeros(working_len), Array1::zeros(working_len))
                 }
                 _ => return Ok(None),
-            };
+            }
+        };
         for (k, s) in spec.penalties.iter().enumerate() {
             let s_dense = s.as_dense_cow();
             h.scaled_add(lambdas[k], &*s_dense);
@@ -1401,21 +1441,35 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
         custom_family_block_role(&spec.name, idx, specs.len()) == gam_problem::BlockRole::LinkWiggle
     });
     let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
-    let Some(mut h) = exact_newton_joint_hessian_symmetrized(
-        family,
-        states,
-        specs,
-        total_p,
-        "compute_joint_geometry",
-    )?
-    else {
-        if requires_explicit_joint_hessian {
-            return Err(
-                "link-wiggle fits require an exact explicit joint Hessian for posterior sampling"
-                    .to_string(),
-            );
+    let mut h = if let Some(hessian) = preferred_unpenalized_hessian {
+        if hessian.dim() != (total_p, total_p)
+            || hessian.iter().any(|value| !value.is_finite())
+        {
+            return Err(format!(
+                "preferred joint geometry Hessian must be finite with shape {total_p}x{total_p}, got {}x{}",
+                hessian.nrows(),
+                hessian.ncols(),
+            ));
         }
-        return Ok(None);
+        hessian.clone()
+    } else {
+        let Some(hessian) = exact_newton_joint_hessian_symmetrized(
+            family,
+            states,
+            specs,
+            total_p,
+            "compute_joint_geometry",
+        )?
+        else {
+            if requires_explicit_joint_hessian {
+                return Err(
+                    "link-wiggle fits require an exact explicit joint Hessian for posterior sampling"
+                        .to_string(),
+                );
+            }
+            return Ok(None);
+        };
+        hessian
     };
     let ranges = block_param_ranges(specs);
     for (block_idx, spec) in specs.iter().enumerate() {

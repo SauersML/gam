@@ -540,17 +540,16 @@ pub fn fit_transformation_normal(
             )
             .map_err(|e| format!("transformation final mode profile: {e}"))?;
             let selected_objective = selection.result.objective;
-            let warm_start = selection.result.warm_start;
             log::info!(
                 "[transformation-normal] final fixed-rho coefficient mode selected candidate={} objective={:.16e}",
                 selection.selected_candidate,
                 selected_objective,
             );
-            let fit = fit_custom_family_fixed_log_lambdas(
+            let fit = fit_custom_family_fixed_log_lambdas_from_mode_selection(
                 &geometry.family,
                 &geometry.blocks,
                 &options,
-                Some(&warm_start),
+                selection,
                 0,
                 None,
                 true,

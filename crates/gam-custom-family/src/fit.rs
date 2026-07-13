@@ -938,6 +938,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             &inner.block_states,
             &per_block,
             options,
+            None,
         )
         .map_err(|error| CustomFamilyError::Optimization {
             context: "fit_custom_family no-smoothing covariance factorization",
@@ -948,12 +949,18 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         } else {
             0.0
         };
-        let geometry =
-            compute_joint_geometry(family, specs, &inner.block_states, &per_block, options)
-                .map_err(|reason| CustomFamilyError::Optimization {
-                    context: "fit_custom_family no-smoothing joint geometry",
-                    reason,
-                })?;
+        let geometry = compute_joint_geometry(
+            family,
+            specs,
+            &inner.block_states,
+            &per_block,
+            options,
+            None,
+        )
+        .map_err(|reason| CustomFamilyError::Optimization {
+            context: "fit_custom_family no-smoothing joint geometry",
+            reason,
+        })?;
         let penalized_objective = checked_penalizedobjective(
             inner.log_likelihood,
             inner.penalty_value,
@@ -1706,6 +1713,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         &inner.block_states,
         &per_block,
         &final_options,
+        None,
     )
     .map_err(|error| CustomFamilyError::Optimization {
         context: "fit_custom_family final covariance factorization",
@@ -1725,6 +1733,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         &inner.block_states,
         &per_block,
         &final_options,
+        None,
     )
     .map_err(|reason| CustomFamilyError::Optimization {
         context: "fit_custom_family joint geometry",
@@ -1834,20 +1843,33 @@ pub fn fit_custom_family_fixed_log_lambdas<F: CustomFamily + Clone + Send + Sync
         &inner.block_states,
         outer_iterations,
     )?;
-    let covariance_conditional =
-        compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)
-            .map_err(|error| CustomFamilyError::Optimization {
-                context: "fit_custom_family_fixed_log_lambdas covariance factorization",
-                reason: format!(
-                    "{error}; rho_checkpoint={:?}; no fit was assembled",
-                    rho.as_slice().unwrap_or(&[])
-                ),
-            })?;
-    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block, options)
-        .map_err(|reason| CustomFamilyError::Optimization {
-            context: "fit_custom_family_fixed_log_lambdas joint geometry",
-            reason,
-        })?;
+    let covariance_conditional = compute_joint_covariance_required(
+        family,
+        specs,
+        &inner.block_states,
+        &per_block,
+        options,
+        None,
+    )
+    .map_err(|error| CustomFamilyError::Optimization {
+        context: "fit_custom_family_fixed_log_lambdas covariance factorization",
+        reason: format!(
+            "{error}; rho_checkpoint={:?}; no fit was assembled",
+            rho.as_slice().unwrap_or(&[])
+        ),
+    })?;
+    let geometry = compute_joint_geometry(
+        family,
+        specs,
+        &inner.block_states,
+        &per_block,
+        options,
+        None,
+    )
+    .map_err(|reason| CustomFamilyError::Optimization {
+        context: "fit_custom_family_fixed_log_lambdas joint geometry",
+        reason,
+    })?;
     let penalized_objective = inner_penalized_objective(
         &inner,
         include_exact_newton_logdet_h(family, options),
@@ -1867,6 +1889,170 @@ pub fn fit_custom_family_fixed_log_lambdas<F: CustomFamily + Clone + Send + Sync
             canonical: Some(&canonical),
             result_specs: raw_specs,
             penalized_objective,
+            outer_iterations,
+            outer_gradient_norm,
+            criterion_certificate: None,
+            outer_converged: true,
+            joint_log_lambdas: None,
+        },
+    )
+}
+
+/// Assemble a fixed-hyperparameter fit from the exact coefficient mode that
+/// won atomic nonconvex profiling.
+///
+/// This consuming boundary deliberately performs no canonicalization, warm
+/// restart, or inner solve. The selected mode, its objective, and its returned-
+/// beta Hessian workspace are one identity; changing any one of them would
+/// silently switch the Laplace branch after outer optimization.
+pub fn fit_custom_family_fixed_log_lambdas_from_mode_selection<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    selection: CustomFamilyJointHyperModeSelection,
+    outer_iterations: usize,
+    outer_gradient_norm: Option<f64>,
+    outer_converged: bool,
+) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
+    if !outer_converged {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection",
+            reason: "the enclosing outer optimization did not certify convergence; refusing to assemble its selected coefficient checkpoint"
+                .to_string(),
+        });
+    }
+
+    let CustomFamilyJointHyperModeSelection {
+        result,
+        selected_candidate,
+        screened_objectives,
+        selected_inner: inner,
+        ..
+    } = selection;
+    if !result.inner_converged || !inner.converged {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection",
+            reason: "the selected coefficient branch was not converged; no fit was assembled"
+                .to_string(),
+        });
+    }
+
+    let selected_objective = result.objective;
+    let screened_objective = screened_objectives
+        .get(selected_candidate)
+        .and_then(|objective| *objective)
+        .ok_or_else(|| CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection objective identity",
+            reason: "the selected candidate has no finite screened profile objective".to_string(),
+        })?;
+    if screened_objective.to_bits() != selected_objective.to_bits() {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection objective identity",
+            reason: format!(
+                "selected profile objective changed after screening: screened={screened_objective:.17e}, selected={selected_objective:.17e}"
+            ),
+        });
+    }
+
+    let selected_warm_start = result.warm_start.inner;
+    let beta_matches = selected_warm_start.block_beta.len() == inner.block_states.len()
+        && selected_warm_start
+            .block_beta
+            .iter()
+            .zip(inner.block_states.iter())
+            .all(|(carried, state)| {
+                carried.len() == state.beta.len()
+                    && carried
+                        .iter()
+                        .zip(state.beta.iter())
+                        .all(|(left, right)| left.to_bits() == right.to_bits())
+            });
+    if !beta_matches {
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection coefficient identity",
+            reason: "the selected result carrier and owned inner mode have different coefficient bits"
+                .to_string(),
+        });
+    }
+
+    let rho = selected_warm_start.rho;
+    let spec_rho = flatten_log_lambdas(specs);
+    if rho.len() != spec_rho.len()
+        || rho
+            .iter()
+            .zip(spec_rho.iter())
+            .any(|(selected, configured)| selected.to_bits() != configured.to_bits())
+    {
+        return Err(CustomFamilyError::InvalidInput {
+            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection",
+            reason: "selected smoothing coordinates do not bitwise match the supplied coefficient-mode geometry"
+                .to_string(),
+        });
+    }
+    let penalty_counts = validate_blockspecs(specs)?;
+    let per_block = split_log_lambdas(&rho, &penalty_counts)?;
+
+    let total_p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+    let workspace = inner.joint_workspace.as_ref().ok_or_else(|| {
+        CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambdas_from_mode_selection curvature identity",
+            reason: "the selected mode did not retain its certified returned-beta Hessian workspace"
+                .to_string(),
+        }
+    })?;
+    let hessian_source = exact_newton_joint_hessian_source_from_workspace(
+        workspace,
+        total_p,
+        MaterializationIntent::LogdetFactorization,
+        "selected-mode final Hessian",
+    )?
+    .ok_or_else(|| CustomFamilyError::Optimization {
+        context: "fit_custom_family_fixed_log_lambdas_from_mode_selection curvature identity",
+        reason: "the selected mode workspace did not expose its exact returned-beta Hessian"
+            .to_string(),
+    })?;
+    let hessian = materialize_joint_hessian_source(
+        &hessian_source,
+        total_p,
+        "selected-mode final Hessian materialization",
+    )?;
+
+    let covariance_conditional = compute_joint_covariance_required(
+        family,
+        specs,
+        &inner.block_states,
+        &per_block,
+        options,
+        Some(&hessian),
+    )
+    .map_err(|error| CustomFamilyError::Optimization {
+        context: "fit_custom_family_fixed_log_lambdas_from_mode_selection covariance",
+        reason: error.to_string(),
+    })?;
+    let geometry = compute_joint_geometry(
+        family,
+        specs,
+        &inner.block_states,
+        &per_block,
+        options,
+        Some(&hessian),
+    )
+    .map_err(|reason| CustomFamilyError::Optimization {
+        context: "fit_custom_family_fixed_log_lambdas_from_mode_selection geometry",
+        reason,
+    })?;
+
+    assemble_custom_family_fit_result(
+        inner,
+        BlockwiseFitAssembly {
+            rho_physical: rho,
+            covariance_conditional,
+            geometry,
+            canonical: None,
+            result_specs: specs,
+            penalized_objective: selected_objective,
             outer_iterations,
             outer_gradient_norm,
             criterion_certificate: None,
