@@ -1417,12 +1417,12 @@ impl Step6DeviceBatch {
 /// thread-tile exactly as the host does, so each row's output is bit-identical
 /// to the host per-row partial.
 ///
-/// #415 parity-lock: the Linux CPU-side device-arithmetic emulator's structural
+/// #415 parity-lock: the CPU-side device-arithmetic emulator's structural
 /// lockstep guard (`step6_tests::step6_device_emulator_source_lockstep_fingerprint_415`)
-/// asserts that the `.cu` still spells the arithmetic the emulator mirrors; no
-/// CUDA device is required. The source and its NVRTC consumers remain
-/// Linux-gated so non-Linux production builds do not compile unused CUDA data.
-#[cfg(target_os = "linux")]
+/// asserts that the `.cu` still spells the arithmetic the emulator mirrors on
+/// every test target; no CUDA device is required. Production retains the source
+/// only on Linux, where the NVRTC consumers are available.
+#[cfg(any(target_os = "linux", test))]
 const SURVIVAL_FLEX_STEP6_SOURCE: &str = r#"
 extern "C" __global__ void survival_flex_step6_rows(
     const double * __restrict__ g_p_flat,
@@ -3100,10 +3100,9 @@ mod step6_tests {
     /// #415 structural lockstep guard: the `.cu` must still spell the exact
     /// arithmetic `emulate_step6_row_pullback_device` mirrors. A dropped
     /// skip-zero branch, a renamed output, or a re-indexed contraction removes
-    /// one of these load-bearing substrings and fails the Linux test build,
+    /// one of these load-bearing substrings and fails every test build,
     /// flagging that the CPU emulator is now stale relative to the device
     /// program. No CUDA device is required.
-    #[cfg(target_os = "linux")]
     #[test]
     fn step6_device_emulator_source_lockstep_fingerprint_415() {
         let src = SURVIVAL_FLEX_STEP6_SOURCE;
