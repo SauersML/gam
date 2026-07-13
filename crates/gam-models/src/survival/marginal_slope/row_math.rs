@@ -792,10 +792,10 @@ where
         for derivative in event_stack.iter_mut().chain(&mut time_stack) {
             *derivative *= scale;
         }
-        Ok(S::scaled_multiply_add_affine_composed_sum(
+        Ok(S::shared_multiply_add_affine_composed_sum(
             &[&vars[1], &vars[0], &vars[1], &vars[2]],
-            &[&correction, &correction, &correction, &correction],
-            &[&linear, &linear, &linear, &linear],
+            &correction,
+            &linear,
             &[1.0, 1.0, 1.0, 0.0],
             &[-1.0, -1.0, 1.0, 1.0],
             &[exit_stack, entry_stack, event_stack, time_stack],
@@ -803,10 +803,10 @@ where
             workspace,
         ))
     } else {
-        Ok(S::scaled_multiply_add_affine_composed_sum(
+        Ok(S::shared_multiply_add_affine_composed_sum(
             &[&vars[1], &vars[0]],
-            &[&correction, &correction],
-            &[&linear, &linear],
+            &correction,
+            &linear,
             &[1.0, 1.0],
             &[-1.0, -1.0],
             &[exit_stack, entry_stack],

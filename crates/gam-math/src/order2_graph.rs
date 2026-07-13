@@ -903,8 +903,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                 let left = lefts[term].node;
                 let cross = tape.gradients[left * K + primary]
                     * tape.gradients[right_node * K + other]
-                    + tape.gradients[left * K + other]
-                        * tape.gradients[right_node * K + primary];
+                    + tape.gradients[left * K + other] * tape.gradients[right_node * K + primary];
                 channel += firsts[term] * cross
                     + seconds[term] * term_gradients[term][primary] * term_gradients[term][other];
             }
@@ -1291,10 +1290,10 @@ mod tests {
             let left = Order2Graph::<3>::variable(0.4, 0, 3, &workspace);
             let right = Order2Graph::<3>::variable(-0.7, 1, 3, &workspace);
             let omitted = Order2Graph::<3>::variable(1.1, 2, 3, &workspace);
-            let output = Order2Graph::scaled_multiply_add_affine_composed_sum(
+            let output = Order2Graph::shared_multiply_add_affine_composed_sum(
                 &[&left],
-                &[&right],
-                &[&omitted],
+                &right,
+                &omitted,
                 &[-0.0],
                 &[1.0],
                 &[[0.2, 0.0, 1.0, 0.0, 0.0]],
@@ -1311,10 +1310,10 @@ mod tests {
         let left = Order2Graph::<3>::variable(0.4, 0, 3, &workspace);
         let right = Order2Graph::<3>::variable(-0.7, 1, 3, &workspace);
         let live = Order2Graph::<3>::variable(1.1, 2, 3, &workspace);
-        let output = Order2Graph::scaled_multiply_add_affine_composed_sum(
+        let output = Order2Graph::shared_multiply_add_affine_composed_sum(
             &[&left],
-            &[&right],
-            &[&live],
+            &right,
+            &live,
             &[1.0],
             &[1.0],
             &[[0.2, 0.0, 1.0, 0.0, 0.0]],
@@ -1364,9 +1363,8 @@ mod tests {
             vars[3].multiply_add(&vars[4], &vars[5]),
         ];
         let lefts: [&S; N] = std::array::from_fn(|term| &upstream[term % upstream.len()]);
-        let rights: [&S; N] =
-            std::array::from_fn(|term| &upstream[(3 * term + 1) % upstream.len()]);
-        let addends: [&S; N] = std::array::from_fn(|term| &vars[(5 * term + 2) % vars.len()]);
+        let right = &upstream[1];
+        let addend = &vars[2];
         let addend_scales: [f64; N] = std::array::from_fn(|term| match term % 4 {
             0 => 0.0,
             1 => 1.0,
@@ -1380,10 +1378,10 @@ mod tests {
         });
         let derivative_stacks: [[f64; 5]; N] =
             std::array::from_fn(|term| stacks[term % stacks.len()]);
-        S::scaled_multiply_add_affine_composed_sum(
+        S::shared_multiply_add_affine_composed_sum(
             &lefts,
-            &rights,
-            &addends,
+            right,
+            addend,
             &addend_scales,
             &input_scales,
             &derivative_stacks,
@@ -1416,12 +1414,13 @@ mod tests {
 
         fused_workspace.reset(6);
         let empty_terms: [&Order2Graph<'_, 6>; 0] = [];
+        let empty_shared = Order2Graph::constant(1.0, 6, &fused_workspace);
         let empty_scales: [f64; 0] = [];
         let empty_stacks: [[f64; 5]; 0] = [];
-        let empty = Order2Graph::scaled_multiply_add_affine_composed_sum(
+        let empty = Order2Graph::shared_multiply_add_affine_composed_sum(
             &empty_terms,
-            &empty_terms,
-            &empty_terms,
+            &empty_shared,
+            &empty_shared,
             &empty_scales,
             &empty_scales,
             &empty_stacks,
