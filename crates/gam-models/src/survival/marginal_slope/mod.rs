@@ -13,13 +13,12 @@
 //! the `CustomFamily` impl, block Jacobians, fit setup, and the entry point.
 //!
 
-// Public surface: the marginal-slope identifiability pipeline (global-T
-// assembly, per-term parametric design compile, raw↔compiled β projection) is
-// the same public API the pre-#1521 monolith exposed as
-// `gam::identifiability::marginal_slope`. Its entry points are exercised by this
-// module's own unit tests and are public for downstream consumers; keeping the
-// module `pub` (not `pub(crate)`) preserves that contract and the dead-code
-// exemption rustc grants reachable public API.
+// Public surface: the family-agnostic marginal-slope identifiability utilities
+// remain available to downstream consumers. The survival construction seam
+// that consumes `LogslopeLayout` is crate-private: the layout owns transformed
+// family state and cannot be constructed independently without breaking its
+// channel/offset invariants. Keeping the module public exposes only the
+// reusable compiler and projection contracts, not that internal state carrier.
 pub mod identifiability;
 
 pub(crate) use crate::custom_family::{
