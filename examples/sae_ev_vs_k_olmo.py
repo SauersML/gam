@@ -176,13 +176,12 @@ def _sae_fit_worker(
     # hybrid-split collapse-rescue's train-indexed fresh codes align) to isolate
     # whether the curved fit's collapse is repaired in-sample, separately from the
     # held-out generalization (which still needs the OOS coordinate projection).
-    train_probe_error = None
-    try:
-        fitted_train = m.reconstruct(z_tr)
-        train_ev = _ev(z_tr, fitted_train)
-    except Exception as exc:  # noqa: BLE001 - diagnostic only, never fail the fit
-        train_ev = float("nan")
-        train_probe_error = str(exc)
+    # A failed train reconstruction invalidates the arm just as surely as a
+    # failed held-out reconstruction.  Let the exception cross the worker
+    # boundary so the ladder aborts instead of emitting a plausible row whose
+    # diagnostic half is NaN (#2267).
+    fitted_train = m.reconstruct(z_tr)
+    train_ev = _ev(z_tr, fitted_train)
 
     hybrid_split = getattr(m, "hybrid_split", None)
     atom_topologies = [str(v) for v in getattr(m, "atom_topologies", [])]
@@ -193,7 +192,6 @@ def _sae_fit_worker(
         "reconstruct_seconds": reconstruct_seconds,
         "hybrid_split": None if hybrid_split is None else _jsonable(hybrid_split),
         "atom_topologies": atom_topologies,
-        "train_probe_error": train_probe_error,
     }
 
 
@@ -233,8 +231,6 @@ def _fit_ev(
 
     fit_seconds = result["fit_seconds"]
     reconstruct_seconds = result["reconstruct_seconds"]
-    if result["train_probe_error"] is not None:
-        print(f"[{topology} K={k}] train-EV probe failed: {result['train_probe_error']}", flush=True)
     print(
         f"[{topology} K={k}] IN_SAMPLE_EV={result['train_ev']:.4f}  "
         f"held_out_EV={result['test_ev']:.4f}",

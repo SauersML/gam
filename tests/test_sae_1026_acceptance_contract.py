@@ -105,7 +105,6 @@ def test_1026_fit_ev_reports_jsonable_hybrid_split(monkeypatch):
         42,
         1,
         60.0,
-        60.0,
     )
 
     assert ev == 1.0
