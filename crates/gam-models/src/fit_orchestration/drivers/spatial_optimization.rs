@@ -5849,7 +5849,14 @@ pub struct SpatialLengthScaleOptimizationResult<FitOut> {
     pub resolved_specs: Vec<TermCollectionSpec>,
     pub designs: Vec<TermCollectionDesign>,
     pub fit: FitOut,
+    pub certified_outer: Option<gam_solve::rho_optimizer::CertifiedOuterResult>,
     pub timing: Option<SpatialLengthScaleOptimizationTiming>,
+}
+
+#[derive(Clone, Copy)]
+pub enum SpatialFitProvenance<'a> {
+    NoOuterOptimization,
+    Certified(&'a gam_solve::rho_optimizer::CertifiedOuterResult),
 }
 
 /// Exact-joint hyper-parameter setup for N-block spatial length-scale optimization.
@@ -6494,6 +6501,7 @@ where
         &Array1<f64>,
         &[TermCollectionSpec],
         &[TermCollectionDesign],
+        SpatialFitProvenance<'_>,
     ) -> Result<FitOut, String>,
     ExactFn: FnMut(
         &Array1<f64>,
@@ -6548,11 +6556,17 @@ where
         // Build temporary owned slices for the closure call.
         let spec_refs: Vec<TermCollectionSpec> = resolved_specs.clone();
         let design_refs: Vec<TermCollectionDesign> = designs.clone();
-        let fit = fit_fn(&theta0, &spec_refs, &design_refs)?;
+        let fit = fit_fn(
+            &theta0,
+            &spec_refs,
+            &design_refs,
+            SpatialFitProvenance::NoOuterOptimization,
+        )?;
         return Ok(SpatialLengthScaleOptimizationResult {
             resolved_specs,
             designs,
             fit,
+            certified_outer: None,
             timing: None,
         });
     }
@@ -7120,21 +7134,17 @@ where
         optim_total_s: kphase_total_s,
     };
 
-    if !result.converged {
-        return Err(format!(
-            "n-block exact-joint spatial κ optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
-            result.iterations,
-            result.final_value,
-            result.final_grad_norm_report(),
-        ));
-    }
     if !matches!(state.row_set, gam_problem::outer_subsample::RowSet::All) {
         return Err(
             "n-block exact-joint spatial optimization returned before its exact full-data transition"
                 .to_string(),
         );
     }
-    let theta_star = result.rho;
+    let certified_outer = gam_solve::rho_optimizer::CertifiedOuterResult::try_from(result)
+        .map_err(|reason| {
+            format!("n-block exact-joint spatial optimization was not certified: {reason}")
+        })?;
+    let theta_star = certified_outer.rho().clone();
 
     // ── P7 stage rotation ────────────────────────────────────────────────
     // The returned theta and certificate now belong to the exact full-data
@@ -7145,7 +7155,12 @@ where
     let resolved_specs: Vec<TermCollectionSpec> = collect_specs(&state.cache);
     let designs: Vec<TermCollectionDesign> = collect_designs(&state.cache);
 
-    let fit = fit_fn(&theta_star, &resolved_specs, &designs)?;
+    let fit = fit_fn(
+        &theta_star,
+        &resolved_specs,
+        &designs,
+        SpatialFitProvenance::Certified(&certified_outer),
+    )?;
 
     for spec in &resolved_specs {
         log_spatial_aniso_scales(spec);
@@ -7155,6 +7170,7 @@ where
         resolved_specs,
         designs,
         fit,
+        certified_outer: Some(certified_outer),
         timing: Some(timing),
     })
 }
