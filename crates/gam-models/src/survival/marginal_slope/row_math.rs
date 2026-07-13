@@ -907,8 +907,10 @@ fn row_primary_closed_form_vector_fixed<const DIM: usize>(
         qd1_lower: derivative_guard,
     };
     let row = rigid_vector_row_nll(&vars, z, covariance, &inputs, &())?.into_inner();
-    let gradient = Array1::from_vec(row.g().to_vec());
-    let hessian = Array2::from_shape_fn((DIM, DIM), |(a, b)| row.h()[a][b]);
+    let gradient_channels = row.g();
+    let hessian_channels = row.h();
+    let gradient = Array1::from_vec(gradient_channels.to_vec());
+    let hessian = Array2::from_shape_fn((DIM, DIM), |(a, b)| hessian_channels[a][b]);
     Ok((row.0.v, gradient, hessian))
 }
 
@@ -992,8 +994,10 @@ fn row_primary_closed_form_vector_graph<const DIM: usize>(
         qd1_lower: derivative_guard,
     };
     let row = rigid_vector_row_nll(&vars, z, covariance, &inputs, workspace)?.into_order2();
-    let gradient = Array1::from_vec(row.g().to_vec());
-    let hessian = Array2::from_shape_fn((DIM, DIM), |(a, b)| row.h()[a][b]);
+    let gradient_channels = row.g();
+    let hessian_channels = row.h();
+    let gradient = Array1::from_vec(gradient_channels.to_vec());
+    let hessian = Array2::from_shape_fn((DIM, DIM), |(a, b)| hessian_channels[a][b]);
     Ok((row.0.v, gradient, hessian))
 }
 
