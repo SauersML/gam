@@ -2698,7 +2698,7 @@ impl BernoulliMarginalSlopeFamily {
         // Flex path: full IFT analytic kernel.
         if self.effective_flex_active(block_states)? {
             let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
-            let neglog = self.compute_row_analytic_flex_into(
+            let neglog = self.lower_bms_flex_row_order2(
                 row,
                 block_states,
                 primary,
@@ -2761,7 +2761,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok((grad, hess))
     }
 
-    pub(super) fn compute_row_analytic_flex_into(
+    pub(super) fn lower_bms_flex_row_order2(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],

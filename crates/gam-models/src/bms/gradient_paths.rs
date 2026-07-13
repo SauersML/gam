@@ -3095,15 +3095,7 @@ mod flex_primary_hessian_oracle_tests {
         let mut scratch =
             super::super::hessian_paths::BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
         perturbed
-            .compute_row_analytic_flex_into(
-                row,
-                states,
-                primary,
-                &row_ctx,
-                None,
-                false,
-                &mut scratch,
-            )
+            .lower_bms_flex_row_order2(row, states, primary, &row_ctx, None, false, &mut scratch)
             .expect("z-perturbed flex gradient");
         scratch.grad
     }
@@ -3126,15 +3118,7 @@ mod flex_primary_hessian_oracle_tests {
         let mut scratch =
             super::super::hessian_paths::BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
         family
-            .compute_row_analytic_flex_into(
-                row,
-                &states,
-                primary,
-                row_ctx,
-                None,
-                false,
-                &mut scratch,
-            )
+            .lower_bms_flex_row_order2(row, &states, primary, row_ctx, None, false, &mut scratch)
             .expect("analytic flex z-sensitivity");
         let analytic = scratch.score_zeta.clone();
 

@@ -779,7 +779,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         // earlier implementation materialized the dense matrix column-by-column
         // by calling `exact_newton_joint_hessian_matvec_from_cache` once per
         // unit basis vector, and each matvec re-ran
-        // `compute_row_analytic_flex_into` (cell partition + cell-moment
+        // `lower_bms_flex_row_order2` (cell partition + cell-moment
         // evaluation + basis evaluation) for every row. That made the dense
         // build cost `slices.total * n * per_row_cell_work`. The flex
         // per-row work is direction-independent, so the column loop was
