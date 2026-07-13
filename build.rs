@@ -4718,6 +4718,8 @@ const PRODUCTION_DERIVATIVE_SPECIALIZATIONS: &[DerivativeSpecialization] = &[
                     "fn generated_cuda_row_kernel_matches_canonical_cpu_lowering_415()",
                     "fn generated_cuda_row_kernel_r33_matches_canonical_cpu_lowering_932()",
                     "fn bms_flex_row_r33_consumers_match_cpu_oracles_when_cuda_available()",
+                    "fn mandatory_required_gpu_workspace_consumes_device_cache_end_to_end_932()",
+                    "fn release_measure_generated_bms_full_row_vs_strongest_cpu_932()",
                     "fn generated_source_interprets_compact_canonical_phase_streams()",
                 ],
             },
