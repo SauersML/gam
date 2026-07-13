@@ -392,7 +392,7 @@ pub fn build_jeffreys_hphi_ctx<F: CustomFamily + Clone + Send + Sync + 'static>(
 
 pub fn build_contracted_psi_hook(
     specs: &[ParameterBlockSpec],
-    derivative_blocks: SharedDerivativeBlocks,
+    hyper_layout: SharedCustomFamilyHyperLayout,
     beta_flat: &Array1<f64>,
     rho: &[f64],
     penalty_counts: &[usize],
@@ -423,31 +423,39 @@ pub fn build_contracted_psi_hook(
     // ψ → (block, local) location and block-local S_ψ for every ψ axis, built
     // once. `s_local` (block-local S_ψ) is reused for the τ-Hessian and as the
     // first leg of the bilinear `tr(S⁺ S_ψi S⁺ S_ψj)` penalty-logdet term.
-    struct PsiAxis {
+    struct DesignPsiAxis {
         pub(crate) block: usize,
         pub(crate) local: usize,
         pub(crate) start: usize,
         pub(crate) end: usize,
         pub(crate) s_psi_local: Array2<f64>,
     }
-    let mut axes: Vec<PsiAxis> = Vec::new();
-    for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
-        let (start, end) = ranges_arc[block_idx];
-        let p_block = end - start;
-        for (local_idx, deriv) in block_derivs.iter().enumerate() {
+    let mut axes: Vec<Option<DesignPsiAxis>> = Vec::with_capacity(hyper_layout.len());
+    for axis_idx in 0..hyper_layout.len() {
+        if let Some((block_idx, deriv)) = hyper_layout.design_derivative(axis_idx) {
+            let local_idx = match hyper_layout.axis(axis_idx) {
+                Some(CustomFamilyHyperAxis::DesignPenalty {
+                    derivative_index, ..
+                }) => derivative_index,
+                _ => unreachable!("design derivative must have a design axis identity"),
+            };
+            let (start, end) = ranges_arc[block_idx];
+            let p_block = end - start;
             let s_psi_local =
                 assemble_block_local_s_psi(deriv, &per_block_lambdas[block_idx], p_block);
-            axes.push(PsiAxis {
+            axes.push(Some(DesignPsiAxis {
                 block: block_idx,
                 local: local_idx,
                 start,
                 end,
                 s_psi_local,
-            });
+            }));
+        } else {
+            axes.push(None);
         }
     }
     let axes = Arc::new(axes);
-    let psi_dim = axes.len();
+    let psi_dim = hyper_layout.len();
     if psi_dim == 0 {
         return Ok(None);
     }
@@ -478,7 +486,7 @@ pub fn build_contracted_psi_hook(
         }
     }
 
-    let derivative_blocks = Arc::clone(&derivative_blocks);
+    let hyper_layout = Arc::clone(&hyper_layout);
 
     // EXPLICIT Firth/Jeffreys ψψ VALUE second derivative context (gam#1607). The
     // outer LAML cost folds `−Φ(β̂)` with `Φ = ½ log|Z_Jᵀ H_info Z_J|₊` (gated),
