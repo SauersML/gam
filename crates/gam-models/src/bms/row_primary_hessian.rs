@@ -8,7 +8,7 @@ use super::family::*;
 use super::flex_row_program::{
     BmsFlexCalibrationOrder2Node, BmsFlexCalibrationOrder3Node, BmsFlexCalibrationOrder4Node,
     BmsFlexProgramPoint, BmsFlexRowOrder2FinalizerNode, BmsFlexRowOrder3FinalizerNode,
-    BmsFlexRowProgram,
+    BmsFlexRowOrder4FinalizerNode, BmsFlexRowProgram,
 };
 use super::gradient_paths::*;
 use super::hessian_paths::*;
@@ -6150,101 +6150,8 @@ impl BernoulliMarginalSlopeFamily {
 
         f_u[0] = -marginal.mu1;
         f_uv[[0, 0]] = -marginal.mu2;
-        f_uv_dir[0] = -dir_u[0] * marginal.mu3;
-        f_uv_dir[r * r] = -dir_v[0] * marginal.mu3;
-        f_uv_mixed[0] = -dir_u[0] * dir_v[0] * marginal.mu4;
-
-        let f_a_u = f_a_dir[0];
-        let f_a_v = f_a_dir[1];
-        let f_aa_u = f_aa_dir[0];
-        let f_aa_v = f_aa_dir[1];
-        let f_a_uv = f_a_mixed[0];
-        let f_aa_uv = f_aa_mixed[0];
-        let f_au_u = ndarray::ArrayView1::from(&f_au_dir[..r]);
-        let f_au_v = ndarray::ArrayView1::from(&f_au_dir[r..]);
-        let f_au_uv = ndarray::ArrayView1::from(&f_au_mixed[..]);
-        let f_uv_u = ndarray::ArrayView2::from_shape((r, r), &f_uv_dir[..r * r])
-            .map_err(|error| format!("invalid BMS fourth left-direction shape: {error}"))?;
-        let f_uv_v = ndarray::ArrayView2::from_shape((r, r), &f_uv_dir[r * r..])
-            .map_err(|error| format!("invalid BMS fourth right-direction shape: {error}"))?;
-        let f_uv_uv = ndarray::ArrayView2::from_shape((r, r), &f_uv_mixed[..])
-            .map_err(|error| format!("invalid BMS fourth mixed-direction shape: {error}"))?;
 
         let inv_f_a = 1.0 / f_a;
-        let mut a_u = Array1::<f64>::zeros(r);
-        for u in 0..r {
-            a_u[u] = -f_u[u] * inv_f_a;
-        }
-        let mut a_uv = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let val =
-                    -(f_uv[[u, v]] + f_au[u] * a_u[v] + f_au[v] * a_u[u] + f_aa * a_u[u] * a_u[v])
-                        * inv_f_a;
-                a_uv[[u, v]] = val;
-                a_uv[[v, u]] = val;
-            }
-        }
-        let a_u_dir_u = a_uv.dot(dir_u);
-        let a_u_dir_v = a_uv.dot(dir_v);
-        let mut a_uv_u = Array2::<f64>::zeros((r, r));
-        let mut a_uv_v = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let n_u = f_uv_u[[u, v]]
-                    + f_au_u[u] * a_u[v]
-                    + f_au[u] * a_u_dir_u[v]
-                    + f_au_u[v] * a_u[u]
-                    + f_au[v] * a_u_dir_u[u]
-                    + f_aa_u * a_u[u] * a_u[v]
-                    + f_aa * (a_u_dir_u[u] * a_u[v] + a_u[u] * a_u_dir_u[v]);
-                let val_u = -(n_u + f_a_u * a_uv[[u, v]]) * inv_f_a;
-                a_uv_u[[u, v]] = val_u;
-                a_uv_u[[v, u]] = val_u;
-
-                let n_v = f_uv_v[[u, v]]
-                    + f_au_v[u] * a_u[v]
-                    + f_au[u] * a_u_dir_v[v]
-                    + f_au_v[v] * a_u[u]
-                    + f_au[v] * a_u_dir_v[u]
-                    + f_aa_v * a_u[u] * a_u[v]
-                    + f_aa * (a_u_dir_v[u] * a_u[v] + a_u[u] * a_u_dir_v[v]);
-                let val_v = -(n_v + f_a_v * a_uv[[u, v]]) * inv_f_a;
-                a_uv_v[[u, v]] = val_v;
-                a_uv_v[[v, u]] = val_v;
-            }
-        }
-        let a_u_uv = a_uv_u.dot(dir_v);
-        let mut a_uv_uv = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let n_uv = f_uv_uv[[u, v]]
-                    + f_au_uv[u] * a_u[v]
-                    + f_au_u[u] * a_u_dir_v[v]
-                    + f_au_v[u] * a_u_dir_u[v]
-                    + f_au[u] * a_u_uv[v]
-                    + f_au_uv[v] * a_u[u]
-                    + f_au_u[v] * a_u_dir_v[u]
-                    + f_au_v[v] * a_u_dir_u[u]
-                    + f_au[v] * a_u_uv[u]
-                    + f_aa_uv * a_u[u] * a_u[v]
-                    + f_aa_u * (a_u_dir_v[u] * a_u[v] + a_u[u] * a_u_dir_v[v])
-                    + f_aa_v * (a_u_dir_u[u] * a_u[v] + a_u[u] * a_u_dir_u[v])
-                    + f_aa
-                        * (a_u_uv[u] * a_u[v]
-                            + a_u_dir_u[u] * a_u_dir_v[v]
-                            + a_u_dir_v[u] * a_u_dir_u[v]
-                            + a_u[u] * a_u_uv[v]);
-                let val = -(n_uv
-                    + f_a_v * a_uv_u[[u, v]]
-                    + f_a_u * a_uv_v[[u, v]]
-                    + f_a_uv * a_uv[[u, v]])
-                    * inv_f_a;
-                a_uv_uv[[u, v]] = val;
-                a_uv_uv[[v, u]] = val;
-            }
-        }
-
         let z_obs = self.z[row];
         let u_obs = a + b * z_obs;
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;

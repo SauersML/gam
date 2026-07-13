@@ -166,6 +166,48 @@ pub(super) enum BmsFlexRowOrder3FinalizerPhase {
     NegLogThird { direction: usize },
 }
 
+/// Dependency-ordered mixed directional extension of the Order3 row
+/// finalizer. The complete lower-order stream is wrapped verbatim; only the
+/// genuinely new direction-pair stages live at Order4.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BmsFlexRowOrder4FinalizerNode {
+    Order3(BmsFlexRowOrder3FinalizerNode),
+    DirectionPairStart {
+        pair: usize,
+    },
+    ImplicitMixedSecond {
+        pair: usize,
+        left: usize,
+        right: usize,
+    },
+    ObservedMixedFirst {
+        pair: usize,
+        primary: usize,
+    },
+    ObservedMixedSecond {
+        pair: usize,
+        left: usize,
+        right: usize,
+    },
+    NegLogFourth {
+        pair: usize,
+        left: usize,
+        right: usize,
+    },
+}
+
+/// Compact Order4 phases. Each [`Self::Order3`] phase is the canonical
+/// lower-order phase itself, not a restatement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BmsFlexRowOrder4FinalizerPhase {
+    Order3(BmsFlexRowOrder3FinalizerPhase),
+    DirectionPairStart { pair: usize },
+    ImplicitMixedSecond { pair: usize },
+    ObservedMixedFirst { pair: usize },
+    ObservedMixedSecond { pair: usize },
+    NegLogFourth { pair: usize },
+}
+
 /// Borrowed scalar coordinates of the canonical BMS FLEX row program.
 ///
 /// This is the zero-allocation input to optimized lowerings. The dense generic
@@ -692,6 +734,99 @@ impl BmsFlexRowProgram {
             visit(BmsFlexRowOrder3FinalizerPhase::ObservedDirectionalFirst { direction })?;
             visit(BmsFlexRowOrder3FinalizerPhase::ObservedDirectionalSecond { direction })?;
             visit(BmsFlexRowOrder3FinalizerPhase::NegLogThird { direction })?;
+        }
+        Ok(())
+    }
+
+    /// Interpret the dependency-ordered mixed-direction finalizer.
+    pub(super) fn try_for_each_order4_finalizer<E>(
+        primary_count: usize,
+        direction_count: usize,
+        direction_pair_count: usize,
+        mut visit: impl FnMut(BmsFlexRowOrder4FinalizerNode) -> Result<(), E>,
+    ) -> Result<(), E> {
+        Self::try_for_each_order4_finalizer_phase(
+            direction_count,
+            direction_pair_count,
+            |phase| Self::try_expand_order4_finalizer_phase(primary_count, phase, &mut visit),
+        )
+    }
+
+    fn try_expand_order4_finalizer_phase<E>(
+        primary_count: usize,
+        phase: BmsFlexRowOrder4FinalizerPhase,
+        visit: &mut impl FnMut(BmsFlexRowOrder4FinalizerNode) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match phase {
+            BmsFlexRowOrder4FinalizerPhase::Order3(order3_phase) => {
+                Self::try_expand_order3_finalizer_phase(
+                    primary_count,
+                    order3_phase,
+                    &mut |node| visit(BmsFlexRowOrder4FinalizerNode::Order3(node)),
+                )?;
+            }
+            BmsFlexRowOrder4FinalizerPhase::DirectionPairStart { pair } => {
+                visit(BmsFlexRowOrder4FinalizerNode::DirectionPairStart { pair })?;
+            }
+            BmsFlexRowOrder4FinalizerPhase::ImplicitMixedSecond { pair } => {
+                for left in 0..primary_count {
+                    for right in left..primary_count {
+                        visit(BmsFlexRowOrder4FinalizerNode::ImplicitMixedSecond {
+                            pair,
+                            left,
+                            right,
+                        })?;
+                    }
+                }
+            }
+            BmsFlexRowOrder4FinalizerPhase::ObservedMixedFirst { pair } => {
+                for primary in 0..primary_count {
+                    visit(BmsFlexRowOrder4FinalizerNode::ObservedMixedFirst { pair, primary })?;
+                }
+            }
+            BmsFlexRowOrder4FinalizerPhase::ObservedMixedSecond { pair } => {
+                for left in 0..primary_count {
+                    for right in left..primary_count {
+                        visit(BmsFlexRowOrder4FinalizerNode::ObservedMixedSecond {
+                            pair,
+                            left,
+                            right,
+                        })?;
+                    }
+                }
+            }
+            BmsFlexRowOrder4FinalizerPhase::NegLogFourth { pair } => {
+                for left in 0..primary_count {
+                    for right in left..primary_count {
+                        visit(BmsFlexRowOrder4FinalizerNode::NegLogFourth {
+                            pair,
+                            left,
+                            right,
+                        })?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Visit compact Order4 phases without selecting an index representation.
+    pub(super) fn try_for_each_order4_finalizer_phase<E>(
+        direction_count: usize,
+        direction_pair_count: usize,
+        mut visit: impl FnMut(BmsFlexRowOrder4FinalizerPhase) -> Result<(), E>,
+    ) -> Result<(), E> {
+        Self::try_for_each_order3_finalizer_phase(direction_count, |phase| {
+            visit(BmsFlexRowOrder4FinalizerPhase::Order3(phase))
+        })?;
+        for pair in 0..direction_pair_count {
+            visit(BmsFlexRowOrder4FinalizerPhase::DirectionPairStart {
+                pair,
+            })?;
+            visit(BmsFlexRowOrder4FinalizerPhase::ImplicitMixedSecond { pair })?;
+            visit(BmsFlexRowOrder4FinalizerPhase::ObservedMixedFirst { pair })?;
+            visit(BmsFlexRowOrder4FinalizerPhase::ObservedMixedSecond { pair })?;
+            visit(BmsFlexRowOrder4FinalizerPhase::NegLogFourth { pair })?;
         }
         Ok(())
     }
