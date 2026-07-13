@@ -90,11 +90,13 @@ impl SurvivalMarginalSlopeFamily {
         } else {
             Some(event_secondary.as_slice())
         };
-        // The outer ρ is supplied externally via `OuterEvalContext`; a
-        // non-contiguous view here is degenerate but possible. Auto-subsampling
-        // is a pure performance optimization, so fall back to the original
-        // options (full-data eval) rather than panicking.
-        let rho_slice = ctx.rho.as_slice()?;
+        // `OuterEvalContext` owns an `Array1`, so its ρ storage is a contiguous
+        // construction invariant. Violating that contract is a programming
+        // error; silently changing the row measure would hide it.
+        let rho_slice = ctx
+            .rho
+            .as_slice()
+            .expect("outer-evaluation rho must be contiguous");
         crate::marginal_slope_shared::maybe_install_auto_outer_subsample(
             options,
             z_key.as_slice().expect("z key must be contiguous"),
