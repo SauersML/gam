@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,7 @@ SCRIPT = ROOT / "experiments" / "steering_e1" / "run_e1.py"
 SPEC = importlib.util.spec_from_file_location("steering_e1_run", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 E1 = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = E1
 SPEC.loader.exec_module(E1)
 
 
