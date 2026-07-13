@@ -1018,6 +1018,8 @@ impl SmoothDesign {
 #[derive(Debug, Clone)]
 pub struct RawSmoothDesign {
     pub term_designs: Vec<DesignMatrix>,
+    /// Sum of every fixed affine term contribution on the realized rows.
+    pub affine_offset: Array1<f64>,
     /// Per-term block-local penalties.  Each `col_range` is relative to the
     /// smooth block (i.e. indexing into the concatenation of `term_designs`).
     pub penalties: Vec<BlockwisePenalty>,
@@ -1035,21 +1037,6 @@ impl RawSmoothDesign {
     }
     pub fn nrows(&self) -> usize {
         self.term_designs.first().map_or(0, DesignMatrix::nrows)
-    }
-}
-
-impl From<RawSmoothDesign> for SmoothDesign {
-    fn from(value: RawSmoothDesign) -> Self {
-        Self {
-            term_designs: value.term_designs,
-            penalties: value.penalties,
-            nullspace_dims: value.nullspace_dims,
-            penaltyinfo: value.penaltyinfo,
-            dropped_penaltyinfo: value.dropped_penaltyinfo,
-            terms: value.terms,
-            coefficient_lower_bounds: value.coefficient_lower_bounds,
-            linear_constraints: value.linear_constraints,
-        }
     }
 }
 
@@ -2357,6 +2344,13 @@ pub struct TermCollectionDesign {
     /// to the lazy block operator when sparse storage would just re-encode a
     /// dense matrix.
     pub design: DesignMatrix,
+    /// Known row-wise affine contribution to the linear predictor.
+    ///
+    /// The realized predictor is `affine_offset + design * beta`. This channel
+    /// is deliberately separate from `design`: folding it into an estimated
+    /// intercept would make inhomogeneous term constraints coefficient-
+    /// dependent and would corrupt all linear-operator/Hessian identities.
+    pub affine_offset: Array1<f64>,
     pub penalties: Vec<BlockwisePenalty>,
     pub nullspace_dims: Vec<usize>,
     pub penaltyinfo: Vec<PenaltyBlockInfo>,
@@ -2375,6 +2369,47 @@ pub struct TermCollectionDesign {
 }
 
 impl TermCollectionDesign {
+    /// Add this collection's fixed affine channel to a caller-owned likelihood
+    /// offset, validating the universal row/finite-value contract at the seam
+    /// where the two offset sources become one.
+    pub fn compose_offset(
+        &self,
+        base: ArrayView1<'_, f64>,
+        context: &str,
+    ) -> Result<Array1<f64>, BasisError> {
+        let n = self.design.nrows();
+        if self.affine_offset.len() != n || base.len() != n {
+            crate::bail_dim_basis!(
+                "{context}: design rows={n}, affine offset rows={}, base offset rows={}",
+                self.affine_offset.len(),
+                base.len()
+            );
+        }
+        if self.affine_offset.iter().any(|value| !value.is_finite())
+            || base.iter().any(|value| !value.is_finite())
+        {
+            crate::bail_invalid_basis!("{context}: offsets must be finite");
+        }
+        Ok(base.to_owned() + &self.affine_offset)
+    }
+
+    /// Evaluate `affine_offset + design * beta` with a checked coefficient
+    /// width. Prediction/reporting code should use this instead of applying the
+    /// linear operator alone whenever it has no separate user offset channel.
+    pub fn apply(&self, beta: ArrayView1<'_, f64>) -> Result<Array1<f64>, BasisError> {
+        if beta.len() != self.design.ncols() {
+            crate::bail_dim_basis!(
+                "term-collection predictor coefficient length {} does not match design width {}",
+                beta.len(),
+                self.design.ncols()
+            );
+        }
+        if beta.iter().any(|value| !value.is_finite()) {
+            crate::bail_invalid_basis!("term-collection predictor coefficients must be finite");
+        }
+        Ok(self.design.apply(&beta.to_owned()) + &self.affine_offset)
+    }
+
     /// Number of global penalty blocks that precede the smooth-term penalty
     /// blocks in the flat smoothing-parameter / EDF-trace layout.
     ///
@@ -9265,6 +9300,7 @@ pub fn build_smooth_design_withworkspace_unvalidated(
     let total_p: usize = local_builds.iter().map(|built| built.dim).sum();
 
     let mut local_designs: Vec<DesignMatrix> = Vec::with_capacity(local_builds.len());
+    let mut affine_offset = Array1::<f64>::zeros(data.nrows());
     let mut terms_out = Vec::<SmoothTerm>::with_capacity(terms.len());
     let mut penalties_global = Vec::<BlockwisePenalty>::new();
     let mut nullspace_dims_global = Vec::<usize>::new();
@@ -9405,6 +9441,18 @@ pub fn build_smooth_design_withworkspace_unvalidated(
             any_bounds = true;
         }
 
+        if let Some(term_offset) = built.affine_offset.as_ref() {
+            if term_offset.len() != data.nrows() {
+                crate::bail_dim_basis!(
+                    "smooth term '{}' affine offset has {} rows but the realized data has {}",
+                    term.name,
+                    term_offset.len(),
+                    data.nrows()
+                );
+            }
+            affine_offset += term_offset;
+        }
+
         // Move the per-term design out of `built` rather than cloning it.
         local_designs.push(built.design);
 
@@ -9439,6 +9487,7 @@ pub fn build_smooth_design_withworkspace_unvalidated(
 
     Ok(RawSmoothDesign {
         term_designs: local_designs,
+        affine_offset,
         penalties: penalties_global,
         nullspace_dims: nullspace_dims_global,
         penaltyinfo: penaltyinfo_global,

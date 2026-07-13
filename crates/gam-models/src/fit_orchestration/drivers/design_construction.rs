@@ -70,6 +70,9 @@ pub fn fit_term_collection_with_coefficient_groups(
     let realized = design
         .realize_coefficient_groups(groups, &base_fit_opts.rho_prior)
         .map_err(EstimationError::BasisError)?;
+    let effective_offset = design
+        .compose_offset(offset, "coefficient-group fit")
+        .map_err(EstimationError::BasisError)?;
     let mut grouped_options = base_fit_opts.clone();
     grouped_options.rho_prior = realized.rho_prior;
     let fitted = FittedTermCollection {
@@ -77,7 +80,7 @@ pub fn fit_term_collection_with_coefficient_groups(
             design.design.clone(),
             y,
             weights,
-            offset,
+            effective_offset.view(),
             realized.penalty_specs,
             realized.nullspace_dims,
             family.clone(),
@@ -104,6 +107,9 @@ where
     F: FnMut(&PenaltyBlockGammaPriorMetadata<'_>) -> Option<(f64, f64)>,
 {
     let design = build_term_collection_design_with_policy(data, spec, &options.resource_policy)?;
+    let effective_offset = design
+        .compose_offset(offset, "penalty-prior callback fit")
+        .map_err(EstimationError::BasisError)?;
     let mut fit_opts = adaptive_fit_options_base(options, &design);
     fit_opts.rho_prior = realize_penalty_block_gamma_priors(&design, callback)
         .map_err(EstimationError::BasisError)?;
@@ -112,7 +118,7 @@ where
             design.design.clone(),
             y,
             weights,
-            offset,
+            effective_offset.view(),
             &design.penalties,
             None,
             family.clone(),
@@ -136,6 +142,9 @@ pub fn fit_term_collection_with_penalty_block_gamma_priors(
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
     let design = build_term_collection_design_with_policy(data, spec, &options.resource_policy)?;
+    let effective_offset = design
+        .compose_offset(offset, "penalty-prior fit")
+        .map_err(EstimationError::BasisError)?;
     let mut fit_opts = adaptive_fit_options_base(options, &design);
     fit_opts.rho_prior = realize_keyed_penalty_block_gamma_priors(&design, priors)
         .map_err(EstimationError::BasisError)?;
@@ -144,7 +153,7 @@ pub fn fit_term_collection_with_penalty_block_gamma_priors(
             design.design.clone(),
             y,
             weights,
-            offset,
+            effective_offset.view(),
             &design.penalties,
             None,
             family.clone(),
@@ -189,6 +198,9 @@ pub fn fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_prior
     let realized = design
         .realize_coefficient_groups(groups, &base_rho_prior)
         .map_err(EstimationError::BasisError)?;
+    let effective_offset = design
+        .compose_offset(offset, "coefficient-group and penalty-prior fit")
+        .map_err(EstimationError::BasisError)?;
     let mut grouped_options = base_fit_opts.clone();
     grouped_options.rho_prior = realized.rho_prior;
     let fitted = FittedTermCollection {
@@ -196,7 +208,7 @@ pub fn fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_prior
             design.design.clone(),
             y,
             weights,
-            offset,
+            effective_offset.view(),
             realized.penalty_specs,
             realized.nullspace_dims,
             family.clone(),
@@ -296,6 +308,10 @@ fn fit_term_collection_on_realized_design(
     family: LikelihoodSpec,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
+    let effective_offset = design
+        .compose_offset(offset, "term-collection fit")
+        .map_err(EstimationError::BasisError)?;
+    let offset = effective_offset.view();
     if has_bounded_linear_terms(spec) {
         return fit_bounded_term_collection_with_design(
             y,

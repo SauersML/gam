@@ -759,6 +759,7 @@ fn reparameterize_logslope_design_reduced(
         new_nullspace_dims.push(nullspace_dim);
     }
 
+    let nrows = g_reduced.nrows();
     let new_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(g_reduced));
     // The reduced logslope block is a single dense smooth-like surface over the
     // reparameterized coordinates; it carries no parametric/random-effect/
@@ -767,6 +768,7 @@ fn reparameterize_logslope_design_reduced(
     // The penalties + nullspace_dims above are what the joint REML consumes.
     Ok(TermCollectionDesign {
         design: new_design,
+        affine_offset: Array1::zeros(nrows),
         penalties: new_penalties,
         nullspace_dims: new_nullspace_dims,
         penaltyinfo: Vec::new(),
@@ -1372,8 +1374,10 @@ mod runaway_tests {
         intercept_range: std::ops::Range<usize>,
         linear_ranges: Vec<(String, std::ops::Range<usize>)>,
     ) -> TermCollectionDesign {
+        let nrows = x.nrows();
         TermCollectionDesign {
             design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x)),
+            affine_offset: Array1::zeros(nrows),
             penalties: Vec::new(),
             nullspace_dims: Vec::new(),
             penaltyinfo: Vec::new(),

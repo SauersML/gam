@@ -155,7 +155,7 @@ pub fn build_term_collection_design_inner_with_policy(
         None => Vec::new(),
     };
 
-    let smooth = apply_global_smooth_identifiability(
+    let (smooth, affine_offset) = apply_global_smooth_identifiability(
         smooth_raw,
         data,
         &spec.linear_terms,
@@ -419,6 +419,7 @@ pub fn build_term_collection_design_inner_with_policy(
 
     Ok(TermCollectionDesign {
         design,
+        affine_offset,
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -505,10 +506,41 @@ pub fn build_term_collection_design_with_policy(
     build_term_collection_design_inner_with_policy(data, &planned_spec, policy)
 }
 
-/// Build the EXACT analytic average-derivative design `∂(design row)/∂x_c` of a
-/// term collection: the matrix `D` whose row `i` is `∂X[i,:]/∂x_{deriv_col}`,
-/// laid out column-for-column identically to `build_term_collection_design`, so
-/// `D · β = ∂m/∂x_{deriv_col}(x_i)` for the fitted coefficient vector `β` (#1120).
+/// Exact analytic derivative of an affine term-collection realization.
+#[derive(Debug, Clone)]
+pub struct TermCollectionDerivativeDesign {
+    /// `∂design(x)/∂x_c`, aligned column-for-column with the value design.
+    pub design: Array2<f64>,
+    /// `∂affine_offset(x)/∂x_c` on the same rows.
+    pub affine_offset: Array1<f64>,
+}
+
+impl TermCollectionDerivativeDesign {
+    /// Evaluate `∂affine_offset/∂x_c + (∂design/∂x_c) * beta`.
+    pub fn apply(&self, beta: ArrayView1<'_, f64>) -> Result<Array1<f64>, BasisError> {
+        if beta.len() != self.design.ncols() {
+            crate::bail_dim_basis!(
+                "term-collection derivative coefficient length {} does not match design width {}",
+                beta.len(),
+                self.design.ncols()
+            );
+        }
+        if self.affine_offset.len() != self.design.nrows() {
+            crate::bail_dim_basis!(
+                "term-collection derivative affine offset has {} rows but derivative design has {}",
+                self.affine_offset.len(),
+                self.design.nrows()
+            );
+        }
+        Ok(self.design.dot(&beta) + &self.affine_offset)
+    }
+}
+
+/// Build the EXACT analytic average-derivative realization of a term
+/// collection: `D = ∂design/∂x_c` plus the distinct fixed channel
+/// `d = ∂affine_offset/∂x_c`. The two are laid out on the same rows as
+/// `build_term_collection_design`, so the fitted derivative is `d + D * beta`
+/// (#1120/#2297).
 ///
 /// This is a provably exact analytic derivative of the design, so the production
 /// path differentiates the model basis (a known analytic function) in closed form.
@@ -540,7 +572,7 @@ pub fn build_term_collection_derivative_design(
     data: ArrayView2<'_, f64>,
     spec: &TermCollectionSpec,
     deriv_col: usize,
-) -> Result<Array2<f64>, BasisError> {
+) -> Result<TermCollectionDerivativeDesign, BasisError> {
     if deriv_col >= data.ncols() {
         return Err(BasisError::InvalidInput(format!(
             "average-derivative column {deriv_col} out of range for data with {} columns",
@@ -555,6 +587,7 @@ pub fn build_term_collection_derivative_design(
     let n = data.nrows();
     let p_total = value.design.ncols();
     let mut d = Array2::<f64>::zeros((n, p_total));
+    let mut affine_derivative = Array1::<f64>::zeros(n);
 
     // Global layout: [intercept | linear | random_effects | smooth].
     let p_intercept = value.intercept_range.len();
@@ -593,7 +626,8 @@ pub fn build_term_collection_derivative_design(
             // Term does not involve the differentiated covariate ⇒ zero columns.
             continue;
         }
-        let block = smooth_term_first_derivative_block(data, termspec, term_value, deriv_col)?;
+        let (block, term_affine_derivative) =
+            smooth_term_first_derivative_block(data, termspec, term_value, deriv_col)?;
         let range = (term_value.coeff_range.start + smooth_start)
             ..(term_value.coeff_range.end + smooth_start);
         if block.ncols() != range.len() {
@@ -606,9 +640,22 @@ pub fn build_term_collection_derivative_design(
             )));
         }
         d.slice_mut(s![.., range]).assign(&block);
+        if let Some(term_offset) = term_affine_derivative {
+            if term_offset.len() != n {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "average-derivative design: smooth term '{}' affine derivative has {} rows but the data has {n}",
+                    termspec.name,
+                    term_offset.len()
+                )));
+            }
+            affine_derivative += &term_offset;
+        }
     }
 
-    Ok(d)
+    Ok(TermCollectionDerivativeDesign {
+        design: d,
+        affine_offset: affine_derivative,
+    })
 }
 
 /// Analytic `∂/∂x_{deriv_col}` of a linear term's realized design column.
@@ -690,7 +737,7 @@ fn smooth_term_first_derivative_block(
     termspec: &SmoothTermSpec,
     term_value: &SmoothTerm,
     deriv_col: usize,
-) -> Result<Array2<f64>, BasisError> {
+) -> Result<(Array2<f64>, Option<Array1<f64>>), BasisError> {
     let feature_col = match &termspec.basis {
         SmoothBasisSpec::BSpline1D { feature_col, .. } => *feature_col,
         other => {
@@ -713,14 +760,21 @@ fn smooth_term_first_derivative_block(
         )));
     }
 
-    let (knots, degree, transform, periodic) = match &term_value.metadata {
+    let (knots, degree, transform, periodic, anchor_offset_coeffs) = match &term_value.metadata {
         BasisMetadata::BSpline1D {
             knots,
             degree,
             identifiability_transform,
             periodic,
+            anchor_offset_coeffs,
             ..
-        } => (knots, *degree, identifiability_transform.as_ref(), periodic),
+        } => (
+            knots,
+            *degree,
+            identifiability_transform.as_ref(),
+            periodic,
+            anchor_offset_coeffs.as_ref(),
+        ),
         other => {
             return Err(BasisError::InvalidInput(format!(
                 "analytic average-derivative design expected B-spline metadata for term '{}', \
@@ -752,9 +806,24 @@ fn smooth_term_first_derivative_block(
     )?;
     let deriv_basis = deriv_basis_arc.as_ref();
 
+    let affine_derivative = match anchor_offset_coeffs {
+        Some(beta_p) => {
+            if deriv_basis.ncols() != beta_p.len() {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "B-spline term '{}': raw derivative basis has {} columns but the affine anchor lift has {} coefficients",
+                    termspec.name,
+                    deriv_basis.ncols(),
+                    beta_p.len()
+                )));
+            }
+            Some(deriv_basis.dot(beta_p))
+        }
+        None => None,
+    };
+
     // Push the basis derivative through the SAME frozen linear chart the value
-    // design used. (Additive offsets do not exist here: the chart is a pure
-    // linear reparameterization, so the chain rule passes it through unchanged.)
+    // design used. The fixed affine channel remains separate and is returned
+    // above, so neither channel is mistaken for a fitted coefficient.
     let block = match transform {
         Some(z) => {
             if deriv_basis.ncols() != z.nrows() {
@@ -770,7 +839,7 @@ fn smooth_term_first_derivative_block(
         }
         None => deriv_basis.to_owned(),
     };
-    Ok(block)
+    Ok((block, affine_derivative))
 }
 
 /// Short human-readable label for a smooth basis variant, used only in the
@@ -904,7 +973,7 @@ fn apply_global_smooth_identifiability(
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
     smoothspecs: &[SmoothTermSpec],
-) -> Result<SmoothDesign, BasisError> {
+) -> Result<(SmoothDesign, Array1<f64>), BasisError> {
     // Global smooth identifiability policy:
     //
     // 1. Any smooth that overlaps explicit linear terms is residualized against
@@ -924,7 +993,30 @@ fn apply_global_smooth_identifiability(
     }
 
     if smooth.terms.is_empty() {
-        return Ok(smooth.into());
+        let RawSmoothDesign {
+            term_designs,
+            affine_offset,
+            penalties,
+            nullspace_dims,
+            penaltyinfo,
+            dropped_penaltyinfo,
+            terms,
+            coefficient_lower_bounds,
+            linear_constraints,
+        } = smooth;
+        return Ok((
+            SmoothDesign {
+                term_designs,
+                penalties,
+                nullspace_dims,
+                penaltyinfo,
+                dropped_penaltyinfo,
+                terms,
+                coefficient_lower_bounds,
+                linear_constraints,
+            },
+            affine_offset,
+        ));
     }
 
     let mut local_designs = vec![None; smooth.terms.len()];
@@ -1422,34 +1514,37 @@ fn apply_global_smooth_identifiability(
         "globally reparameterized smooth penalty metadata bookkeeping diverged"
     );
 
-    Ok(SmoothDesign {
-        term_designs: local_designs
-            .into_iter()
-            .map(|design| design.expect("local design must exist for every smooth term"))
-            .collect(),
-        penalties: penalties_global,
-        nullspace_dims: nullspace_dims_global,
-        penaltyinfo: penaltyinfo_global,
-        dropped_penaltyinfo: dropped_penaltyinfo_global,
-        terms: terms_out,
-        coefficient_lower_bounds: if any_bounds {
-            Some(coefficient_lower_bounds)
-        } else {
-            None
+    Ok((
+        SmoothDesign {
+            term_designs: local_designs
+                .into_iter()
+                .map(|design| design.expect("local design must exist for every smooth term"))
+                .collect(),
+            penalties: penalties_global,
+            nullspace_dims: nullspace_dims_global,
+            penaltyinfo: penaltyinfo_global,
+            dropped_penaltyinfo: dropped_penaltyinfo_global,
+            terms: terms_out,
+            coefficient_lower_bounds: if any_bounds {
+                Some(coefficient_lower_bounds)
+            } else {
+                None
+            },
+            linear_constraints: if linear_constraintsrows.is_empty() {
+                None
+            } else {
+                let mut a = Array2::<f64>::zeros((linear_constraintsrows.len(), total_p));
+                for (i, row) in linear_constraintsrows.iter().enumerate() {
+                    a.row_mut(i).assign(row);
+                }
+                Some(LinearInequalityConstraints {
+                    a,
+                    b: Array1::from_vec(linear_constraints_b),
+                })
+            },
         },
-        linear_constraints: if linear_constraintsrows.is_empty() {
-            None
-        } else {
-            let mut a = Array2::<f64>::zeros((linear_constraintsrows.len(), total_p));
-            for (i, row) in linear_constraintsrows.iter().enumerate() {
-                a.row_mut(i).assign(row);
-            }
-            Some(LinearInequalityConstraints {
-                a,
-                b: Array1::from_vec(linear_constraints_b),
-            })
-        },
-    })
+        smooth.affine_offset,
+    ))
 }
 
 /// If `termspec` is a single-level factor-by smooth (`s(x, by=fac)` expanded

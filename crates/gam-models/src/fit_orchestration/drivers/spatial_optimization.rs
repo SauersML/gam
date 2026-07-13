@@ -7459,6 +7459,10 @@ fn try_exact_joint_latent_coord_optimization(
         }
     }
 
+    let effective_offset = best
+        .design
+        .compose_offset(offset, "latent-coordinate joint fit")
+        .map_err(EstimationError::BasisError)?;
     let mut ctx = LatentJointContext {
         rho_dim,
         cache: SingleBlockLatentCoordDesignCache::new(
@@ -7473,7 +7477,7 @@ fn try_exact_joint_latent_coord_optimization(
             y,
             weights,
             &best.design.design,
-            offset,
+            effective_offset.view(),
             &best.design.penalties,
             &external_opts_for_design(&family, &best.design, options),
             "latent-coordinate-joint",

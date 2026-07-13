@@ -4167,28 +4167,7 @@ fn parse_bspline_boundary_conditions(
         boundary_anchor_value(options, "right", fallback_anchor),
     );
 
-    // Non-zero anchors require an affine offset term that the current basis
-    // builder does not synthesize (see `build_bspline_basis_1d` in
-    // src/terms/basis.rs). Surface the rejection at parse time with the side
-    // and value in the diagnostic, instead of letting the value-only error
-    // emerge deep inside the basis builder where the user has no context
-    // about which anchor key (`anchor`, `left_anchor`, `right_anchor`, …)
-    // routed into which endpoint.
-    reject_nonzero_anchor("left", boundary_conditions.left)?;
-    reject_nonzero_anchor("right", boundary_conditions.right)?;
-
     Ok(boundary_conditions)
-}
-
-fn reject_nonzero_anchor(side: &str, cond: BSplineEndpointBoundaryCondition) -> Result<(), String> {
-    if let BSplineEndpointBoundaryCondition::Anchored { value } = cond {
-        if value.abs() > 1e-12 {
-            return Err(format!(
-                "non-zero {side} anchor {value} requires an affine offset term that is not yet supported; only anchored value 0 is accepted at parse time"
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Resolve the requested internal-knot count and effective spline degree for
