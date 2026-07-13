@@ -946,6 +946,22 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
+    fn empirical_fixed_third_contracted_arrays<const K: usize>(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64; K],
+        direction: &[f64; K],
+    ) -> Result<Array2<f64>, String> {
+        let vars: [FixedRuntimeJet<OneSeed<K>, K>; K] = std::array::from_fn(|axis| {
+            FixedRuntimeJet::from_inner(OneSeed::seed_direction(point[axis], axis, direction[axis]))
+        });
+        let contracted = plan
+            .evaluate(&vars, 3, &())?
+            .into_inner()
+            .contracted_third();
+        Ok(Array2::from_shape_fn((K, K), |(a, b)| contracted[a][b]))
+    }
+
+    #[inline]
     fn empirical_fixed_third_contracted<const K: usize>(
         plan: &EmpiricalBmsRowJetPlan,
         point: &[f64],
@@ -966,20 +982,7 @@ impl BernoulliMarginalSlopeFamily {
                     direction.len()
                 )
             })?;
-        let vars: [FixedRuntimeJet<OneSeed<K>, K>; K] = std::array::from_fn(|axis| {
-            FixedRuntimeJet::from_inner(OneSeed::seed_direction(point[axis], axis, direction[axis]))
-        });
-        let contracted = plan
-            .evaluate(&vars, 3, &())?
-            .into_inner()
-            .contracted_third();
-        let mut out = Array2::<f64>::zeros((K, K));
-        for a in 0..K {
-            for b in 0..K {
-                out[[a, b]] = contracted[a][b];
-            }
-        }
-        Ok(out)
+        Self::empirical_fixed_third_contracted_arrays(plan, point, direction)
     }
 
     #[inline]
