@@ -4138,7 +4138,8 @@ pub(crate) fn load_joint_gradient_evaluation<F: CustomFamily + Clone + Send + Sy
         ),
         None => None,
     };
-    if let Some(workspace_ref) = workspace.as_ref()
+    if family.inner_joint_workspace_gradient_available(specs)
+        && let Some(workspace_ref) = workspace.as_ref()
         && let Some(joint_eval) = workspace_ref.joint_gradient_evaluation()?
     {
         return Ok((

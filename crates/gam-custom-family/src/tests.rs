@@ -1635,6 +1635,176 @@ pub(crate) fn workspace_hessian_source_honors_operator_preference_before_dense_p
     }
 }
 
+pub(crate) struct InnerPreludeCountingWorkspace {
+    pub(crate) dense_calls: Arc<AtomicUsize>,
+}
+
+impl ExactNewtonJointHessianWorkspace for InnerPreludeCountingWorkspace {
+    fn warm_up_outer_caches_for_mode(&self, _: EvalMode) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn joint_gradient_evaluation(
+        &self,
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        Ok(Some(ExactNewtonJointGradientEvaluation {
+            log_likelihood: 0.0,
+            gradient: array![0.0],
+        }))
+    }
+
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        self.dense_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(array![[1.0]]))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct InnerPreludeWorkspaceFamily {
+    pub(crate) evaluations: Arc<AtomicUsize>,
+    pub(crate) workspace_builds: Arc<AtomicUsize>,
+    pub(crate) dense_calls: Arc<AtomicUsize>,
+    pub(crate) provide_workspace: bool,
+}
+
+impl CustomFamily for InnerPreludeWorkspaceFamily {
+    fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        self.evaluations.fetch_add(1, Ordering::Relaxed);
+        Ok(FamilyEvaluation {
+            log_likelihood: 0.0,
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient: array![0.0],
+                hessian: SymmetricMatrix::Dense(array![[1.0]]),
+            }],
+        })
+    }
+
+    fn exact_newton_joint_hessian_workspace(
+        &self,
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        self.workspace_builds.fetch_add(1, Ordering::Relaxed);
+        if !self.provide_workspace {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(InnerPreludeCountingWorkspace {
+            dense_calls: Arc::clone(&self.dense_calls),
+        })))
+    }
+
+    fn inner_coefficient_hessian_hvp_available(&self, _: &[ParameterBlockSpec]) -> bool {
+        true
+    }
+
+    fn inner_joint_workspace_gradient_available(&self, _: &[ParameterBlockSpec]) -> bool {
+        true
+    }
+
+    fn joint_trust_metric_block_floor(
+        &self,
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+    ) -> Result<Option<Array1<f64>>, String> {
+        Err("inner-prelude-workspace-cycle0-reached".to_string())
+    }
+}
+
+#[test]
+pub(crate) fn inner_workspace_prevalidation_reuses_cycle0_hessian_without_family_replay() {
+    let evaluations = Arc::new(AtomicUsize::new(0));
+    let workspace_builds = Arc::new(AtomicUsize::new(0));
+    let dense_calls = Arc::new(AtomicUsize::new(0));
+    let family = InnerPreludeWorkspaceFamily {
+        evaluations: Arc::clone(&evaluations),
+        workspace_builds: Arc::clone(&workspace_builds),
+        dense_calls: Arc::clone(&dense_calls),
+        provide_workspace: true,
+    };
+    let spec = ParameterBlockSpec {
+        name: "workspace".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: 1,
+        use_remlobjective: false,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+
+    let error = inner_blockwise_fit(&family, &[spec], &[Array1::zeros(0)], &options, None)
+        .expect_err("fixture stops immediately after cycle-0 consumes its Hessian source");
+    assert_eq!(error, "inner-prelude-workspace-cycle0-reached");
+    assert_eq!(
+        evaluations.load(Ordering::Relaxed),
+        0,
+        "workspace curvature is authoritative; prevalidation must not replay family.evaluate",
+    );
+    assert_eq!(
+        workspace_builds.load(Ordering::Relaxed),
+        1,
+        "gradient loading and cycle 0 must retain one workspace at the same beta",
+    );
+    assert_eq!(
+        dense_calls.load(Ordering::Relaxed),
+        1,
+        "prevalidation must hand its exact dense source to cycle 0 instead of materializing it twice",
+    );
+}
+
+#[test]
+pub(crate) fn advertised_inner_workspace_missing_fails_closed_without_family_fallback() {
+    let evaluations = Arc::new(AtomicUsize::new(0));
+    let workspace_builds = Arc::new(AtomicUsize::new(0));
+    let family = InnerPreludeWorkspaceFamily {
+        evaluations: Arc::clone(&evaluations),
+        workspace_builds: Arc::clone(&workspace_builds),
+        dense_calls: Arc::new(AtomicUsize::new(0)),
+        provide_workspace: false,
+    };
+    let spec = ParameterBlockSpec {
+        name: "missing-workspace".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+
+    let error = inner_blockwise_fit(
+        &family,
+        &[spec],
+        &[Array1::zeros(0)],
+        &BlockwiseFitOptions::default(),
+        None,
+    )
+    .expect_err("an advertised workspace source must not silently fall back");
+    assert!(
+        error.contains("requested an exact Hessian workspace, but the family returned none"),
+        "unexpected missing-workspace error: {error}",
+    );
+    assert_eq!(workspace_builds.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        evaluations.load(Ordering::Relaxed),
+        0,
+        "missing authoritative curvature must fail before family.evaluate can create a second source",
+    );
+}
+
 /// A workspace that exposes both a dense build and a matrix-free HVP and
 /// refines its representation per intent (#738): matrix-free for the inner
 /// solve, dense for logdet factorization. Mirrors CTN's contract.
