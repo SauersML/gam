@@ -77,6 +77,100 @@ pub struct StreamingRankInputs {
 /// [`classify_reconstruction_rank`], so the three views cannot desync.
 pub(crate) const RANK_VANISHED_REL: f64 = 1.0e-9;
 
+/// Non-empty, canonical set of numerical atom slots whose realised decoder
+/// rank is exactly zero at a converged fixed-`rho` inner state.
+///
+/// This is a structural boundary of the fixed-`K` model, not a floating-point
+/// value and not a numerical failure.  Keeping the slots sorted and unique
+/// makes dense, streaming, and criterion-as-atoms evaluations report the same
+/// event byte-for-byte and gives the variable-`K` orchestrator one unambiguous
+/// transactional removal set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VanishedAtoms(Box<[usize]>);
+
+impl VanishedAtoms {
+    fn from_slots(slots: impl IntoIterator<Item = usize>) -> Option<Self> {
+        let mut slots: Vec<usize> = slots.into_iter().collect();
+        slots.sort_unstable();
+        slots.dedup();
+        (!slots.is_empty()).then(|| Self(slots.into_boxed_slice()))
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        self.0.iter().copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn as_btree_set(&self) -> std::collections::BTreeSet<usize> {
+        self.iter().collect()
+    }
+}
+
+impl std::fmt::Display for VanishedAtoms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "vanished atoms {:?}", &self.0)
+    }
+}
+
+/// Typed result boundary for the quasi-Laplace criterion.
+///
+/// `VanishedAtoms` deliberately does not travel through a formatted string:
+/// the outer fixed-`K` optimizer treats it as an infeasible trial, while the
+/// fit-stage owner can inspect the committed terminal state and restart on the
+/// physically compacted `K-r` stratum.  Every other failure remains an ordinary
+/// numerical/contract error.
+#[derive(Debug)]
+pub enum SaeCriterionError {
+    VanishedAtoms(VanishedAtoms),
+    Numerical(String),
+}
+
+impl SaeCriterionError {
+    pub fn vanished_atoms(&self) -> Option<&VanishedAtoms> {
+        match self {
+            Self::VanishedAtoms(atoms) => Some(atoms),
+            Self::Numerical(_) => None,
+        }
+    }
+
+    pub fn numerical_message(&self) -> Option<&str> {
+        match self {
+            Self::Numerical(message) => Some(message),
+            Self::VanishedAtoms(_) => None,
+        }
+    }
+}
+
+impl From<String> for SaeCriterionError {
+    fn from(message: String) -> Self {
+        Self::Numerical(message)
+    }
+}
+
+impl From<&str> for SaeCriterionError {
+    fn from(message: &str) -> Self {
+        Self::Numerical(message.to_string())
+    }
+}
+
+impl std::fmt::Display for SaeCriterionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VanishedAtoms(atoms) => atoms.fmt(f),
+            Self::Numerical(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for SaeCriterionError {}
+
 /// The two integer rank notions carried by the evidence code.
 ///
 /// `mp_reconstruction_rank` counts how many reconstruction directions clear
@@ -463,51 +557,57 @@ pub(crate) fn coordinate_block_log_det(cache: &ArrowFactorCache) -> Result<f64, 
 /// Dense, streaming, and criterion-as-atoms assembly all call this function so
 /// the value cannot retain the full coordinate logdet after the analytic
 /// gradient has switched to the realised-rank charge. A zero realised rank is
-/// the categorical Laplace-invalid branch and therefore yields positive
-/// infinity, matching the production criterion contract.
+/// the categorical Laplace-invalid boundary and is returned as a typed
+/// [`VanishedAtoms`] event. It is never laundered into a floating-point
+/// sentinel.
 pub(crate) fn rank_adjusted_quasi_laplace_complexity(
     log_det: f64,
     log_det_tt: f64,
     d_eff: &[f64],
     n_eff: &[f64],
-) -> Result<f64, String> {
+) -> Result<f64, SaeCriterionError> {
     if d_eff.len() != n_eff.len() {
-        return Err(format!(
+        return Err(SaeCriterionError::Numerical(format!(
             "rank_adjusted_quasi_laplace_complexity: d_eff length {} does not match N_eff length {}",
             d_eff.len(),
             n_eff.len()
-        ));
-    }
-    if d_eff.iter().any(|&value| value == 0.0) {
-        return Ok(f64::INFINITY);
+        )));
     }
     if !(log_det.is_finite() && log_det_tt.is_finite()) {
-        return Err(format!(
+        return Err(SaeCriterionError::Numerical(format!(
             "rank_adjusted_quasi_laplace_complexity: non-finite logdet input \
              (joint={log_det}, coordinate={log_det_tt})"
-        ));
+        )));
     }
     let mut rank_charge = 0.0_f64;
+    let mut vanished = Vec::new();
     for (atom, (&dof, &occupancy)) in d_eff.iter().zip(n_eff.iter()).enumerate() {
-        if !(dof.is_finite() && dof > 0.0) {
-            return Err(format!(
-                "rank_adjusted_quasi_laplace_complexity: atom {atom} has invalid positive realised DOF {dof}"
-            ));
+        if !(dof.is_finite() && dof >= 0.0) {
+            return Err(SaeCriterionError::Numerical(format!(
+                "rank_adjusted_quasi_laplace_complexity: atom {atom} has invalid non-negative realised DOF {dof}"
+            )));
         }
         if !(occupancy.is_finite() && occupancy >= 0.0) {
-            return Err(format!(
+            return Err(SaeCriterionError::Numerical(format!(
                 "rank_adjusted_quasi_laplace_complexity: atom {atom} has invalid effective sample size {occupancy}"
-            ));
+            )));
+        }
+        if dof == 0.0 {
+            vanished.push(atom);
+            continue;
         }
         rank_charge += 0.5 * dof * occupancy.max(1.0).ln();
+    }
+    if let Some(atoms) = VanishedAtoms::from_slots(vanished) {
+        return Err(SaeCriterionError::VanishedAtoms(atoms));
     }
     let value = 0.5 * (log_det - log_det_tt) + rank_charge;
     if value.is_finite() {
         Ok(value)
     } else {
-        Err(format!(
+        Err(SaeCriterionError::Numerical(format!(
             "rank_adjusted_quasi_laplace_complexity: assembled non-finite value {value}"
-        ))
+        )))
     }
 }
 

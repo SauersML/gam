@@ -508,6 +508,8 @@ pub fn rank_charge_dof(
     construction::realised_rank_charge_dof(gram, decoder, n_eff, p_out, dispersion, 0.0, None)
 }
 
+pub use construction::{SaeCriterionError, VanishedAtoms};
+
 pub use crate::inference::atlas_nerve::AtlasCoveringSide;
 pub use atom_build::*;
 pub use coordinate_fidelity::*;
