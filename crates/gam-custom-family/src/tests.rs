@@ -4267,6 +4267,220 @@ pub(crate) fn terminal_mode_binding_rejects_gradient_substitution() {
 }
 
 #[test]
+pub(crate) fn labeled_terminal_mode_keeps_one_outer_rho_for_two_physical_penalties() {
+    let shared = "shared_precision";
+    let specs = vec![ParameterBlockSpec {
+        name: "tied_terminal_rho".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![
+            PenaltyMatrix::Dense(array![[1.0]]).with_precision_label(shared),
+            PenaltyMatrix::Dense(array![[2.0]]).with_precision_label(shared),
+        ],
+        nullspace_dims: vec![0, 0],
+        initial_log_lambdas: array![0.25, 0.25],
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: false,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let penalty_counts = validate_blockspecs(&specs).expect("valid tied penalties");
+    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
+        .expect("valid tied layout");
+    assert_eq!(layout.initial_rho, array![0.25]);
+    let theta = array![-0.375];
+    let eval = outerobjectivegradienthessian_labeled(
+        &OneBlockIdentityFamily,
+        &specs,
+        &options,
+        &layout,
+        &theta,
+        None,
+        &gam_problem::RhoPrior::Flat,
+        EvalMode::ValueAndGradient,
+    )
+    .expect("tied labeled outer evaluation");
+    let physical = split_labeled_log_lambdas(&theta, &layout).expect("physical expansion");
+    assert_eq!(physical, vec![array![-0.375, -0.375]]);
+    assert_eq!(
+        eval.warm_start.rho, theta,
+        "pullback must restore the semantic labeled coordinate on the warm cache",
+    );
+    let persistent = constrained_warm_start_from_inner(&theta, &eval.inner);
+    assert_eq!(
+        persistent.rho, theta,
+        "persistent custom-family warm starts are keyed by outer/labeled rho, not physical slots",
+    );
+
+    let objective = eval.objective;
+    let gradient = eval.gradient.clone();
+    let mode = CustomFamilyOwnedMode {
+        objective,
+        rho: theta.clone(),
+        inner: eval.inner,
+    };
+    let mut state = CustomOuterState::new(None);
+    state.install_terminal_mode(&theta, objective, &gradient, mode);
+    let terminal = state
+        .terminal_mode
+        .take()
+        .expect("the non-Clone mode must move exactly once into terminal ownership");
+    assert_eq!(terminal.mode.rho, theta);
+    assert_eq!(terminal.theta.len(), 1);
+}
+
+#[test]
+pub(crate) fn owned_joint_penalty_geometry_uses_terminal_workspace_without_family_replay() {
+    #[derive(Clone)]
+    struct CountingJointQuadratic {
+        evaluations: Arc<AtomicUsize>,
+    }
+
+    impl CustomFamily for CountingJointQuadratic {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            self.evaluations.fetch_add(1, Ordering::Relaxed);
+            let beta = &block_states[0].beta;
+            Ok(FamilyEvaluation {
+                log_likelihood: -0.5 * beta.dot(beta),
+                blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                    gradient: -beta,
+                    hessian: SymmetricMatrix::Dense(Array2::eye(2)),
+                }],
+            })
+        }
+
+        fn exact_newton_joint_hessian(
+            &self,
+            _: &[ParameterBlockState],
+        ) -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(Array2::eye(2)))
+        }
+
+        fn exact_newton_joint_hessian_directional_derivative(
+            &self,
+            _: &[ParameterBlockState],
+            _: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(Array2::zeros((2, 2))))
+        }
+
+        fn has_explicit_joint_hessian(&self) -> bool {
+            true
+        }
+    }
+
+    let family = CountingJointQuadratic {
+        evaluations: Arc::new(AtomicUsize::new(0)),
+    };
+    let specs = vec![ParameterBlockSpec {
+        name: "joint_terminal_geometry".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::eye(2))),
+        offset: Array1::zeros(2),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.25, -0.5]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    let joint_spec = gam_problem::JointPenaltySpec {
+        label: Some("joint_precision".to_string()),
+        matrix: Array2::eye(2),
+        initial_log_lambda: 0.0,
+        nullspace_dim: 0,
+    };
+    let layout = penalty_label_layout_with_joint(&specs, vec![0], vec![joint_spec])
+        .expect("valid joint-penalty layout");
+    let theta = array![std::f64::consts::LN_2];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        compute_covariance: true,
+        ..BlockwiseFitOptions::default()
+    };
+    let evaluated = outerobjectivegradienthessian_labeled(
+        &family,
+        &specs,
+        &options,
+        &layout,
+        &theta,
+        None,
+        &gam_problem::RhoPrior::Flat,
+        EvalMode::ValueAndGradient,
+    )
+    .expect("joint-penalty terminal evaluation");
+    let workspace = evaluated
+        .inner
+        .joint_workspace
+        .as_ref()
+        .expect("terminal mode must retain returned-beta Hessian workspace");
+    let evaluations_before_assembly = family.evaluations.load(Ordering::Relaxed);
+    let source = exact_newton_joint_hessian_source_from_workspace(
+        workspace,
+        2,
+        MaterializationIntent::LogdetFactorization,
+        "joint-penalty terminal test Hessian",
+    )
+    .expect("terminal Hessian source")
+    .expect("terminal Hessian source must be present");
+    let hessian = materialize_joint_hessian_source(
+        &source,
+        2,
+        "joint-penalty terminal test Hessian materialization",
+    )
+    .expect("terminal Hessian materialization");
+    let bundle = gam_problem::JointPenaltyBundle::new(
+        Arc::new(layout.joint_specs.clone()),
+        layout.joint_log_lambdas(&theta),
+        2,
+    )
+    .expect("rho-specific joint bundle");
+    let assembly_options = BlockwiseFitOptions {
+        joint_penalties: Some(Arc::new(bundle)),
+        ..options.clone()
+    };
+    let per_block = split_labeled_log_lambdas(&theta, &layout).expect("empty block rho layout");
+    let covariance = compute_joint_covariance_required(
+        &family,
+        &specs,
+        &evaluated.inner.block_states,
+        &per_block,
+        &assembly_options,
+        Some(&hessian),
+    )
+    .expect("joint terminal covariance")
+    .expect("covariance requested");
+    let geometry = compute_joint_geometry(
+        &family,
+        &specs,
+        &evaluated.inner.block_states,
+        &per_block,
+        &assembly_options,
+        Some(&hessian),
+    )
+    .expect("joint terminal geometry")
+    .expect("joint terminal geometry present");
+    assert_eq!(
+        family.evaluations.load(Ordering::Relaxed),
+        evaluations_before_assembly,
+        "terminal Hessian materialization, covariance, and geometry must not call family.evaluate",
+    );
+    let expected_precision = Array2::eye(2) * 3.0;
+    assert_eq!(geometry.penalized_hessian.as_array(), &expected_precision);
+    assert_eq!(covariance, Array2::eye(2) / 3.0);
+}
+
+#[test]
 pub(crate) fn owned_mode_finalizer_preserves_prior_and_active_jeffreys_without_replay() {
     #[derive(Clone)]
     struct ActiveJeffreysQuadraticFamily {
