@@ -1007,6 +1007,44 @@ impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
         }
     }
 
+    fn visit_upper_triangle(
+        &self,
+        direction: &mut [f64],
+        projected: &mut [f64],
+        mut visit: impl FnMut(usize, usize, f64),
+    ) {
+        let dimension = self.dim();
+        assert_eq!(direction.len(), dimension);
+        assert_eq!(projected.len(), dimension);
+        match self {
+            Self::Diagonal(diagonal) => {
+                for column in 0..dimension {
+                    for row in 0..=column {
+                        visit(row, column, if row == column { diagonal[row] } else { 0.0 });
+                    }
+                }
+            }
+            Self::Full(matrix) => {
+                for column in 0..dimension {
+                    for row in 0..=column {
+                        visit(row, column, matrix[[row, column]]);
+                    }
+                }
+            }
+            Self::LowRank(factor) => {
+                for column in 0..dimension {
+                    for row in 0..=column {
+                        let mut value = 0.0;
+                        for rank in 0..factor.ncols() {
+                            value += factor[[row, rank]] * factor[[column, rank]];
+                        }
+                        visit(row, column, value);
+                    }
+                }
+            }
+        }
+    }
+
     fn quadratic_value<T, F>(&self, input: &[T], value: F) -> f64
     where
         F: Fn(&T) -> f64,

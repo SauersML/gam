@@ -22,9 +22,9 @@ model.predict(
 | Argument | Default | Meaning |
 | --- | --- | --- |
 | `data` | required | Table-like input matching the training schema. |
-| `interval` | `None` | Single uncertainty knob. `None` returns point predictions only; a float in `(0, 1)` (e.g. `0.95`) requests the full uncertainty decomposition at that pointwise coverage. `"conformal"` requests exact jackknife+ intervals for eligible Gaussian-identity fits; `"full_conformal"` requests the exact full-conformal set. On standard GLMs / location-scale this populates `std_error`, `mean_lower`, `mean_upper`. On survival location-scale it populates `survival_se` and `eta_se` on the returned `SurvivalPrediction`. Other survival likelihoods and competing-risks reject non-`None` interval requests at the Rust boundary. |
+| `interval` | `None` | Single uncertainty knob. `None` returns point predictions only; a float in `(0, 1)` (e.g. `0.95`) requests the full uncertainty decomposition at that pointwise coverage. `"conformal"` requests exact jackknife+ intervals for eligible Gaussian-identity fits; `"full_conformal"` requests the exact full-conformal set. On standard GLMs / location-scale this populates `std_error`, `mean_lower`, `mean_upper`. On single-event survival it populates `survival_se` and `eta_se`. On competing-risks survival it populates SE/lower/upper arrays for every cause-specific hazard, survival, cumulative hazard, CIF, overall survival, and eta surface. |
 | `conformal_level` | `0.9` | Marginal coverage for `interval="conformal"` or `"full_conformal"`. Ignored for numeric Wald intervals. |
-| `covariance_mode` | `None` | Python accepts `"conditional"` or `"smoothing"` for interval covariance. `None` requires smoothing-corrected covariance and errors when the fit cannot supply it. The CLI uses the equivalent `--covariance-mode conditional|corrected` names. |
+| `covariance_mode` | `None` | Python accepts `"conditional"` or `"smoothing"` for interval covariance. `None` requires smoothing-corrected covariance and errors when the fit cannot supply it. Competing-risks predictions expose the resolved source as `covariance_source`; current cause-specific fits provide the full joint conditional covariance, so callers must request `"conditional"` until the fitter produces a smoothing correction. The CLI uses the equivalent `--covariance-mode conditional|corrected` names. |
 | `observation_interval` | `False` | When `True` and `interval` is numeric, adds response-scale prediction interval columns for families with an observation variance. |
 | `return_type` | `None` | One of `"dict"`, `"numpy"`, `"pandas"`, `"polars"`, `"pyarrow"` for table-shaped outputs. Defaults to the input table kind, falling back to the training table kind. |
 | `id_column` | `None` | Name of a column in `data` whose stringified values are carried through into table outputs and `SurvivalPrediction`. |
@@ -232,12 +232,28 @@ upper = (S + 1.96 * se).clip(0.0, 1.0)
 lower = (S - 1.96 * se).clip(0.0, 1.0)
 ```
 
-Other survival likelihood modes (transformation, Weibull, marginal-slope,
-latent, latent-binary) and competing-risks survival reject any
-`interval=...` at the Rust boundary. For those, use
-`Model.sample(...)` to draw posterior coefficients; note that
-`PosteriorSamples.predict_draws(...)` is restricted to standard
-non-link-wiggle GAMs (see `posterior-sampling.md`).
+For a fitted competing-risks model, interval prediction propagates the complete
+joint coefficient covariance through every cause-specific surface and the
+Aalen-Johansen CIF recurrence:
+
+```python
+pred = model.predict(
+    test_df,
+    interval=0.95,
+    covariance_mode="conditional",
+)
+
+pred.covariance_source       # "conditional"
+pred.cif_se                  # (K * n_rows, n_times)
+pred.cif_lower
+pred.cif_upper
+pred.overall_survival_se     # (n_rows, n_times)
+```
+
+Covariance selection is exact. Omitting `covariance_mode` means required
+smoothing-corrected covariance; if the fit has only conditional covariance,
+prediction raises instead of silently substituting it. Latent and
+latent-binary survival still do not expose these surfaces.
 
 ### Competing-risks CIF
 

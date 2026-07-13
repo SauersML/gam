@@ -1107,6 +1107,303 @@ pub struct GaussianLocationScaleFitResult {
     pub response_scale: f64,
 }
 
+/// Exact coefficient-frame map for the frozen-basis binomial mean-wiggle
+/// de-aliasing step.
+///
+/// The joint solver sees `[X, B - XA]` and returns coordinates
+/// `(beta_mean_solver, beta_w)`. Saved prediction deliberately uses `[X, B]`,
+/// so the reported coordinates are
+///
+/// ```text
+/// beta_mean_saved = beta_mean_solver - A beta_w
+/// beta_w_saved    = beta_w.
+/// ```
+///
+/// This is one linear section with the cross-block lift
+/// `M = [[I, -A], [0, I]]`. Keeping it as a [`gam_problem::Gauge`] makes the
+/// same map authoritative for coefficients, covariance, and the active
+/// geometry lineage used by saved-model ALO.
+fn binomial_mean_wiggle_saved_frame_gauge(
+    alias: &Array2<f64>,
+    mean_width: usize,
+    wiggle_width: usize,
+) -> Result<gam_problem::Gauge, String> {
+    if alias.dim() != (mean_width, wiggle_width) {
+        return Err(format!(
+            "binomial mean-wiggle de-alias map is {}x{}, expected {mean_width}x{wiggle_width}",
+            alias.nrows(),
+            alias.ncols(),
+        ));
+    }
+    let total_width = mean_width.checked_add(wiggle_width).ok_or_else(|| {
+        "binomial mean-wiggle coefficient dimension overflows usize".to_string()
+    })?;
+    let mut transform = Array2::<f64>::eye(total_width);
+    for row in 0..mean_width {
+        for column in 0..wiggle_width {
+            transform[[row, mean_width + column]] = -alias[[row, column]];
+        }
+    }
+    let gauge = gam_problem::Gauge::from_t(
+        transform,
+        &[mean_width, wiggle_width],
+        &[mean_width, wiggle_width],
+    );
+    gauge.validate().map_err(|reason| {
+        format!("binomial mean-wiggle saved coefficient gauge is invalid: {reason}")
+    })?;
+    Ok(gauge)
+}
+
+fn binomial_mean_wiggle_saved_geometry(
+    geometry: &gam_solve::model_types::FitGeometry,
+    saved_frame: &gam_problem::Gauge,
+) -> Result<gam_solve::model_types::FitGeometry, String> {
+    let mut saved_geometry = geometry.clone();
+    saved_geometry.coefficient_gauge = geometry
+        .coefficient_gauge
+        .left_compose(saved_frame)
+        .map_err(|reason| {
+            format!(
+                "binomial mean-wiggle active geometry cannot compose with its exact saved-result gauge: {reason}"
+            )
+        })?;
+    Ok(saved_geometry)
+}
+
+fn binomial_mean_wiggle_saved_covariance(
+    covariance: &Array2<f64>,
+    saved_frame: &gam_problem::Gauge,
+    label: &str,
+) -> Result<Array2<f64>, String> {
+    let expected = saved_frame.reduced_total();
+    if covariance.dim() != (expected, expected) {
+        return Err(format!(
+            "binomial mean-wiggle {label} is {}x{}; exact saved-result gauge requires {expected}x{expected} solver-frame coordinates",
+            covariance.nrows(),
+            covariance.ncols(),
+        ));
+    }
+    if let Some(((row, column), value)) = covariance
+        .indexed_iter()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(format!(
+            "binomial mean-wiggle {label} is non-finite at ({row}, {column}): {value}"
+        ));
+    }
+    let saved = saved_frame.lift_covariance(covariance);
+    if let Some(((row, column), value)) = saved
+        .indexed_iter()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(format!(
+            "binomial mean-wiggle saved-frame {label} is non-finite at ({row}, {column}): {value}"
+        ));
+    }
+    Ok(saved)
+}
+
+/// Atomically move a converged frozen-basis mean-wiggle fit from the solver's
+/// residualized-design coordinates into the saved prediction coordinates.
+///
+/// The penalized Hessian remains in its exact active solver coordinates;
+/// composing its coefficient gauge records how raw saved rows pull back into
+/// that frame. Covariances, in contrast, push forward through the saved-frame
+/// map. No dimension mismatch is ignorable: returning a partially transformed
+/// fit would make point estimates and uncertainty describe different models.
+fn finalize_binomial_mean_wiggle_saved_frame(
+    fit: &mut UnifiedFitResult,
+    alias: &Array2<f64>,
+    mean_design: &Array2<f64>,
+    mean_offset: &Array1<f64>,
+) -> Result<(), String> {
+    use gam_problem::BlockRole;
+
+    if fit.blocks.len() != 2
+        || fit.blocks[0].role != BlockRole::Mean
+        || fit.blocks[1].role != BlockRole::LinkWiggle
+    {
+        return Err(format!(
+            "binomial mean-wiggle saved-frame finalization requires fitted blocks [Mean, LinkWiggle], got {:?}",
+            fit.blocks
+                .iter()
+                .map(|block| block.role)
+                .collect::<Vec<_>>()
+        ));
+    }
+    if fit.block_states.len() != 2 {
+        return Err(format!(
+            "binomial mean-wiggle saved-frame finalization requires two fitted block states, got {}",
+            fit.block_states.len(),
+        ));
+    }
+    if mean_offset.len() != mean_design.nrows() {
+        return Err(format!(
+            "binomial mean-wiggle mean offset has {} rows, expected {}",
+            mean_offset.len(),
+            mean_design.nrows(),
+        ));
+    }
+
+    let mean_width = fit.blocks[0].beta.len();
+    let wiggle_width = fit.blocks[1].beta.len();
+    if mean_design.ncols() != mean_width {
+        return Err(format!(
+            "binomial mean-wiggle saved mean design has {} columns, expected fitted width {mean_width}",
+            mean_design.ncols(),
+        ));
+    }
+    for block_index in 0..2 {
+        if fit.block_states[block_index].beta != fit.blocks[block_index].beta {
+            return Err(format!(
+                "binomial mean-wiggle fitted block {block_index} and block-state coefficients disagree before saved-frame finalization"
+            ));
+        }
+    }
+    let total_width = mean_width.checked_add(wiggle_width).ok_or_else(|| {
+        "binomial mean-wiggle coefficient dimension overflows usize".to_string()
+    })?;
+    if fit.beta.len() != total_width {
+        return Err(format!(
+            "binomial mean-wiggle flat coefficient vector has width {}, expected {total_width}",
+            fit.beta.len(),
+        ));
+    }
+    if fit.beta.slice(s![0..mean_width]) != fit.blocks[0].beta
+        || fit.beta.slice(s![mean_width..total_width]) != fit.blocks[1].beta
+    {
+        return Err(
+            "binomial mean-wiggle flat and block coefficient vectors disagree before saved-frame finalization"
+                .to_string(),
+        );
+    }
+
+    let saved_frame =
+        binomial_mean_wiggle_saved_frame_gauge(alias, mean_width, wiggle_width)?;
+    let saved_blocks = saved_frame.lift_block_betas(&[
+        fit.blocks[0].beta.clone(),
+        fit.blocks[1].beta.clone(),
+    ]);
+    let saved_mean_eta = mean_design.dot(&saved_blocks[0]) + mean_offset;
+    let mut saved_beta = Array1::<f64>::zeros(total_width);
+    saved_beta
+        .slice_mut(s![0..mean_width])
+        .assign(&saved_blocks[0]);
+    saved_beta
+        .slice_mut(s![mean_width..total_width])
+        .assign(&saved_blocks[1]);
+
+    let saved_conditional = fit
+        .covariance_conditional
+        .as_ref()
+        .map(|covariance| {
+            binomial_mean_wiggle_saved_covariance(
+                covariance,
+                &saved_frame,
+                "conditional covariance",
+            )
+        })
+        .transpose()?;
+    let saved_corrected = fit
+        .covariance_corrected
+        .as_ref()
+        .map(|covariance| {
+            binomial_mean_wiggle_saved_covariance(
+                covariance,
+                &saved_frame,
+                "corrected covariance",
+            )
+        })
+        .transpose()?;
+    let saved_geometry = binomial_mean_wiggle_saved_geometry(
+        fit.geometry.as_ref().ok_or_else(|| {
+            "binomial mean-wiggle fit is missing its exact active geometry".to_string()
+        })?,
+        &saved_frame,
+    )?;
+
+    let mut saved_inference = fit.inference.clone();
+    if let Some(inference) = saved_inference.as_mut() {
+        if inference.beta_covariance.is_none() && inference.beta_standard_errors.is_some() {
+            return Err(
+                "binomial mean-wiggle inference has conditional standard errors without their covariance"
+                    .to_string(),
+            );
+        }
+        if inference.beta_covariance_corrected.is_none()
+            && inference.beta_standard_errors_corrected.is_some()
+        {
+            return Err(
+                "binomial mean-wiggle inference has corrected standard errors without their covariance"
+                    .to_string(),
+            );
+        }
+        if let Some(covariance) = inference.beta_covariance.take() {
+            let covariance = binomial_mean_wiggle_saved_covariance(
+                covariance.as_array(),
+                &saved_frame,
+                "inference conditional covariance",
+            )?;
+            if inference.beta_standard_errors.is_some() {
+                inference.beta_standard_errors = Some(
+                    gam_problem::se_from_covariance(&covariance).map_err(|reason| {
+                        format!(
+                            "binomial mean-wiggle saved conditional standard errors are invalid: {reason}"
+                        )
+                    })?,
+                );
+            }
+            inference.beta_covariance = Some(covariance.into());
+        }
+        if let Some(covariance) = inference.beta_covariance_corrected.take() {
+            let covariance = binomial_mean_wiggle_saved_covariance(
+                &covariance,
+                &saved_frame,
+                "inference corrected covariance",
+            )?;
+            if inference.beta_standard_errors_corrected.is_some() {
+                inference.beta_standard_errors_corrected = Some(
+                    gam_problem::se_from_covariance(&covariance).map_err(|reason| {
+                        format!(
+                            "binomial mean-wiggle saved corrected standard errors are invalid: {reason}"
+                        )
+                    })?,
+                );
+            }
+            inference.beta_covariance_corrected = Some(covariance);
+        }
+        if let Some(covariance) = inference.beta_covariance_frequentist.take() {
+            inference.beta_covariance_frequentist = Some(
+                binomial_mean_wiggle_saved_covariance(
+                    &covariance,
+                    &saved_frame,
+                    "frequentist covariance",
+                )?,
+            );
+        }
+        if let Some(correction) = inference.smoothing_correction.take() {
+            inference.smoothing_correction = Some(binomial_mean_wiggle_saved_covariance(
+                &correction,
+                &saved_frame,
+                "smoothing covariance correction",
+            )?);
+        }
+    }
+
+    fit.blocks[0].beta = saved_blocks[0].clone();
+    fit.blocks[1].beta = saved_blocks[1].clone();
+    fit.block_states[0].beta = saved_blocks[0].clone();
+    fit.block_states[0].eta = saved_mean_eta;
+    fit.block_states[1].beta = saved_blocks[1].clone();
+    fit.beta = saved_beta;
+    fit.covariance_conditional = saved_conditional;
+    fit.covariance_corrected = saved_corrected;
+    fit.geometry = Some(saved_geometry);
+    fit.inference = saved_inference;
+    Ok(())
+}
+
 /// Fit the binomial mean link-wiggle model. The observation-space de-aliasing
 /// preserves the standard I-spline coefficient coordinate, which is returned
 /// for the saved-model predict runtime.
@@ -1429,7 +1726,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
     // *different* link than the fit used. We persist the shift
     // `s = β_frozen_source − β_saved` (a mean-coordinate vector) so predict can form the
     // frozen index `X·(β_saved + s) = η̂` and reproduce the fitted `q` exactly.
-    let frozen_source_beta = Some(frozen_source_beta);
+    let frozen_source_beta = frozen_source_beta;
     // The solver coefficient is already the standard I-spline coefficient:
     // observation-space residualization changed the design, not its coefficient
     // chart. The family imposes β_w ≥ 0 during the continuously optimized
@@ -1439,51 +1736,40 @@ pub(crate) fn fit_binomial_mean_wiggle(
     let saved_warp_beta = fit
         .block_states
         .get(BinomialMeanWiggleFamily::BLOCK_WIGGLE)
-        .map(|state| state.beta.to_vec());
-    if let Some(beta_w) = saved_warp_beta.as_ref() {
-        validate_monotone_wiggle_beta_nonnegative(beta_w, "fit_binomial_mean_wiggle saved warp")?;
-    }
-    if let Some(beta_w) = saved_warp_beta.as_ref() {
-        let alias = &last_alias;
-        let beta_w = Array1::from_vec(beta_w.clone());
-        if alias.ncols() == beta_w.len() && alias.nrows() == eta_block_input.design.ncols() {
-            let shift = alias.dot(&beta_w);
-            if let Some(block) = fit.blocks.get_mut(BinomialMeanWiggleFamily::BLOCK_ETA) {
-                if block.beta.len() == shift.len() {
-                    block.beta -= &shift;
-                }
-            }
-            if let Some(state) = fit
-                .block_states
-                .get_mut(BinomialMeanWiggleFamily::BLOCK_ETA)
-            {
-                if state.beta.len() == shift.len() {
-                    state.beta -= &shift;
-                    state.eta = x_dense.dot(&state.beta) + &eta_block_input.offset;
-                }
-            }
-            if fit.beta.len() >= shift.len() {
-                for i in 0..shift.len() {
-                    fit.beta[i] -= shift[i];
-                }
-            }
-        }
-    }
+        .map(|state| state.beta.to_vec())
+        .ok_or_else(|| {
+            "fit_binomial_mean_wiggle: converged fit is missing its LinkWiggle block state"
+                .to_string()
+        })?;
+    validate_monotone_wiggle_beta_nonnegative(
+        &saved_warp_beta,
+        "fit_binomial_mean_wiggle saved warp",
+    )?;
+    finalize_binomial_mean_wiggle_saved_frame(
+        &mut fit,
+        &last_alias,
+        &x_dense,
+        &eta_block_input.offset,
+    )?;
     // The frozen-index shift `s = β_frozen_source − β_saved` for the predict
     // runtime (#2141). `β_saved` is the just-de-aliased mean block; adding
     // `X·s` to the predict base predictor recovers the frozen warp index `η̂`.
     // Only meaningful when a warp actually engaged (`saved_warp_beta` present).
-    let saved_index_shift: Option<Vec<f64>> = match (
-        saved_warp_beta.as_ref(),
-        frozen_source_beta.as_ref(),
-        fit.block_states.get(BinomialMeanWiggleFamily::BLOCK_ETA),
-    ) {
-        (Some(_), Some(source), Some(state)) if source.len() == state.beta.len() => {
-            Some((source - &state.beta).to_vec())
-        }
-        _ => None,
-    };
-    Ok((fit, saved_warp_beta, saved_index_shift))
+    let saved_mean_state = fit
+        .block_states
+        .get(BinomialMeanWiggleFamily::BLOCK_ETA)
+        .ok_or_else(|| {
+            "fit_binomial_mean_wiggle: finalized fit is missing its Mean block state".to_string()
+        })?;
+    if frozen_source_beta.len() != saved_mean_state.beta.len() {
+        return Err(format!(
+            "fit_binomial_mean_wiggle: frozen-index source has {} coefficients, but saved Mean block has {}",
+            frozen_source_beta.len(),
+            saved_mean_state.beta.len(),
+        ));
+    }
+    let saved_index_shift = Some((&frozen_source_beta - &saved_mean_state.beta).to_vec());
+    Ok((fit, Some(saved_warp_beta), saved_index_shift))
 }
 
 /// Densify a wiggle-block penalty spec to its full `p×p` matrix for the

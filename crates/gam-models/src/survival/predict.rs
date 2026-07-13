@@ -270,11 +270,11 @@ fn select_survival_prediction_covariance<'a>(
     mode: SurvivalPredictionCovarianceMode,
 ) -> Result<&'a Array2<f64>, SurvivalPredictError> {
     match mode {
-        SurvivalPredictionCovarianceMode::Conditional => conditional.ok_or_else(|| {
-            SurvivalPredictError::PosteriorCovariance {
+        SurvivalPredictionCovarianceMode::Conditional => {
+            conditional.ok_or_else(|| SurvivalPredictError::PosteriorCovariance {
                 reason: "fit result does not contain conditional covariance".to_string(),
-            }
-        }),
+            })
+        }
         SurvivalPredictionCovarianceMode::SmoothingCorrected => {
             smoothing_corrected.ok_or_else(|| SurvivalPredictError::PosteriorCovariance {
                 reason: "fit result does not contain smoothing-corrected covariance".to_string(),
@@ -543,9 +543,8 @@ fn posterior_standard_error_matrix(
             });
         }
         let variance = second - first * first;
-        let roundoff_tolerance = 128.0
-            * f64::EPSILON
-            * second.abs().max((first * first).abs()).max(1.0);
+        let roundoff_tolerance =
+            128.0 * f64::EPSILON * second.abs().max((first * first).abs()).max(1.0);
         if variance < -roundoff_tolerance {
             return Err(SurvivalPredictError::NumericalFailure {
                 reason: format!(
@@ -584,9 +583,8 @@ fn posterior_standard_error_vector(
             });
         }
         let variance = second - first * first;
-        let roundoff_tolerance = 128.0
-            * f64::EPSILON
-            * second.abs().max((first * first).abs()).max(1.0);
+        let roundoff_tolerance =
+            128.0 * f64::EPSILON * second.abs().max((first * first).abs()).max(1.0);
         if variance < -roundoff_tolerance {
             return Err(SurvivalPredictError::NumericalFailure {
                 reason: format!(
@@ -896,8 +894,7 @@ fn predict_competing_risks_with_posterior(
                     survival_second[cause][[row, time]] += weight * survival * survival;
                     hazard_mean[cause][[row, time]] += weight * hazard;
                     hazard_second[cause][[row, time]] += weight * hazard * hazard;
-                    cumulative_hazard_mean[cause][[row, time]] +=
-                        weight * cumulative_hazard;
+                    cumulative_hazard_mean[cause][[row, time]] += weight * cumulative_hazard;
                     cumulative_hazard_second[cause][[row, time]] +=
                         weight * cumulative_hazard * cumulative_hazard;
                     cif_mean[cause][[row, time]] += weight * cif;
@@ -2437,7 +2434,10 @@ fn build_marginal_slope_predict_context(
     let logslope_design = build_term_collection_design(logslope_input, &logslopespec)
         .map_err(|e| format!("failed to build survival marginal-slope logslope design: {e}"))?;
     let effective_noise_offset = logslope_design
-        .compose_offset(noise_offset.view(), "survival marginal-slope logslope block")
+        .compose_offset(
+            noise_offset.view(),
+            "survival marginal-slope logslope block",
+        )
         .map_err(|error| error.to_string())?;
 
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
@@ -3116,7 +3116,10 @@ fn predict_survival_location_scale_batch(
         gam_terms::smooth::build_term_collection_design(sigma_input, &log_sigmaspec)
             .map_err(|err| format!("failed to build survival log-sigma design: {err}"))?;
     let effective_noise_offset = raw_sigma_design
-        .compose_offset(noise_offset.view(), "survival location-scale log-sigma block")
+        .compose_offset(
+            noise_offset.view(),
+            "survival location-scale log-sigma block",
+        )
         .map_err(|error| error.to_string())?;
     let survival_noise_transform = scale_transform_from_payload(
         &model.survival_noise_projection,
@@ -4254,6 +4257,51 @@ mod tests {
     use crate::probability::{normal_cdf, normal_pdf};
 
     #[test]
+    fn competing_risks_covariance_mode_selects_exact_requested_matrix() {
+        let conditional = ndarray::array![[1.0, 0.2], [0.2, 2.0]];
+        let corrected = ndarray::array![[1.5, 0.4], [0.4, 3.0]];
+
+        let selected_conditional = select_survival_prediction_covariance(
+            Some(&conditional),
+            Some(&corrected),
+            SurvivalPredictionCovarianceMode::Conditional,
+        )
+        .expect("conditional covariance");
+        let selected_corrected = select_survival_prediction_covariance(
+            Some(&conditional),
+            Some(&corrected),
+            SurvivalPredictionCovarianceMode::SmoothingCorrected,
+        )
+        .expect("smoothing-corrected covariance");
+
+        assert_eq!(selected_conditional, &conditional);
+        assert_eq!(selected_corrected, &corrected);
+        assert_eq!(
+            SurvivalPredictionCovarianceMode::Conditional.as_str(),
+            "conditional"
+        );
+        assert_eq!(
+            SurvivalPredictionCovarianceMode::SmoothingCorrected.as_str(),
+            "smoothing-corrected"
+        );
+    }
+
+    #[test]
+    fn competing_risks_smoothing_covariance_never_falls_back() {
+        let conditional = ndarray::array![[1.0]];
+        let error = select_survival_prediction_covariance(
+            Some(&conditional),
+            None,
+            SurvivalPredictionCovarianceMode::SmoothingCorrected,
+        )
+        .expect_err("a corrected request must not substitute conditional covariance");
+        assert_eq!(
+            error.to_string(),
+            "fit result does not contain smoothing-corrected covariance"
+        );
+    }
+
+    #[test]
     fn posterior_quadrature_second_moment_honors_cross_coordinate_covariance() {
         let posterior_mean = ndarray::array![0.4, -0.2];
         let covariance = ndarray::array![[0.9, 0.35], [0.35, 0.6]];
@@ -4272,9 +4320,8 @@ mod tests {
         .expect("joint posterior quadrature");
 
         let expected_mean = posterior_mean[0] + 2.0 * posterior_mean[1];
-        let expected_variance = covariance[[0, 0]]
-            + 4.0 * covariance[[1, 1]]
-            + 4.0 * covariance[[0, 1]];
+        let expected_variance =
+            covariance[[0, 0]] + 4.0 * covariance[[1, 1]] + 4.0 * covariance[[0, 1]];
         assert!((functional_mean - expected_mean).abs() <= 1e-12);
         assert!((recovered_cross_covariance - covariance[[0, 1]]).abs() <= 1e-12);
 

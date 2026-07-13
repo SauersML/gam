@@ -197,11 +197,35 @@ upper = (S + 1.96 * se_S).clip(0.0, 1.0)
 lower = (S - 1.96 * se_S).clip(0.0, 1.0)
 ```
 
-Other survival likelihood modes reject any non-`None` `interval` at the
-Rust boundary. `Model.sample(...)` can draw posterior coefficients for
-supported saved survival models, but `PosteriorSamples.predict(...)` /
-`predict_draws(...)` are restricted to standard, non-link-wiggle GAMs;
-see [posterior-sampling.md](posterior-sampling.md).
+Joint competing-risks fits expose uncertainty for every cause-specific
+hazard, survival, cumulative-hazard, and CIF surface, plus overall survival
+and each cause's linear predictor:
+
+```python
+pred = model.predict(
+    test_df,
+    interval=0.95,
+    covariance_mode="conditional",
+)
+
+pred.covariance_source  # "conditional"
+pred.cif_se
+pred.cif_lower
+pred.cif_upper
+pred.overall_survival_se
+```
+
+The covariance request is strict. The default and `covariance_mode="smoothing"`
+require a saved smoothing-corrected covariance and raise when it is absent;
+they never substitute the conditional covariance. Current cause-specific fits
+save the complete joint conditional covariance, including cross-cause blocks,
+so their supported interval spelling is `covariance_mode="conditional"`.
+
+Latent and latent-binary survival do not expose these surface intervals.
+`Model.sample(...)` can draw posterior coefficients for supported saved
+survival models, but `PosteriorSamples.predict(...)` / `predict_draws(...)`
+are restricted to standard, non-link-wiggle GAMs; see
+[posterior-sampling.md](posterior-sampling.md).
 
 ## Example
 

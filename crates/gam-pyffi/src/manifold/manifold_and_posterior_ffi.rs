@@ -5946,6 +5946,21 @@ fn serialize_competing_risks_prediction_payload(
     result: gam::families::survival::predict::CompetingRisksPredictResult,
     interval_level: Option<f64>,
 ) -> Result<String, String> {
+    let covariance_source = match (interval_level, result.covariance_source) {
+        (Some(_), Some(source)) => Some(source.as_str()),
+        (Some(_), None) => {
+            return Err(
+                "competing-risks interval is missing resolved covariance provenance".to_string(),
+            );
+        }
+        (None, Some(source)) => {
+            return Err(format!(
+                "competing-risks prediction resolved {} covariance without an interval request",
+                source.as_str()
+            ));
+        }
+        (None, None) => None,
+    };
     let (
         hazard_lower,
         hazard_upper,
@@ -6163,9 +6178,7 @@ fn serialize_competing_risks_prediction_payload(
         "class": "competing_risks_prediction",
         "model_class": "competing risks survival",
         "likelihood_mode": likelihood_mode_str,
-        "covariance_source": result
-            .covariance_source
-            .map(gam::families::survival::predict::SurvivalPredictionCovarianceMode::as_str),
+        "covariance_source": covariance_source,
         "endpoint_names": result.endpoint_names,
         "times": result.times,
         "interval_level": interval_level,

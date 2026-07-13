@@ -629,14 +629,12 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                 support |= tape.nodes[input.node].support;
             }
         }
-        // A primary node carries an explicit basis identity. Grouping input
-        // positions by that axis makes the common variable-only quadratic
-        // lowering matrix free without paying the general dense J^T A J row
-        // contractions. Repeated and permuted primaries remain exact: a basis
-        // direction contains every input mapped to its axis, and each projected
-        // row is reduced over the corresponding group. Constants and derived
+        // A primary node carries an explicit basis identity. Recording each
+        // input position's axis lets the common variable-only quadratic scatter
+        // the operator's packed curvature directly into primary coordinates.
+        // Repeated and permuted primaries remain exact; constants and derived
         // nodes retain the unrestricted Jacobian projection below.
-        let mut primary_input_groups = [0_u32; MAX_PRIMARY_DIMENSION];
+        let mut input_primary_axes = [NO_PRIMARY_AXIS; MAX_QUADRATIC_ARITY];
         let all_inputs_primary = {
             let tape = workspace.tape();
             inputs.iter().enumerate().all(|(position, input)| {
@@ -644,7 +642,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                 if primary_axis == NO_PRIMARY_AXIS {
                     false
                 } else {
-                    primary_input_groups[primary_axis as usize] |= 1_u32 << position;
+                    input_primary_axes[position] = primary_axis;
                     true
                 }
             })
@@ -675,36 +673,37 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         let mut curvature_offset = 0;
         if all_inputs_primary {
             // For primary inputs J is a (possibly repeated/permuted) selection
-            // matrix, so J' A J is obtained directly from A. Calling
-            // `multiply` once per primary direction would turn a dense
-            // quadratic from O(K^2) into O(K^3), even though its Hessian is
-            // simply 2A for the common injective case.
-            let mut supported_columns = support;
-            while supported_columns != 0 {
-                let other = supported_columns.trailing_zeros() as usize;
-                supported_columns &= supported_columns - 1;
-                let mut supported_rows =
-                    support & (u16::MAX >> (MAX_PRIMARY_DIMENSION - other - 1));
-                while supported_rows != 0 {
-                    let primary = supported_rows.trailing_zeros() as usize;
-                    supported_rows &= supported_rows - 1;
-                    let mut curvature = 0.0;
-                    let mut row_group = primary_input_groups[primary];
-                    while row_group != 0 {
-                        let row = row_group.trailing_zeros() as usize;
-                        row_group &= row_group - 1;
-                        let mut column_group = primary_input_groups[other];
-                        while column_group != 0 {
-                            let column = column_group.trailing_zeros() as usize;
-                            column_group &= column_group - 1;
-                            curvature += coefficients.coefficient(row, column);
-                        }
-                    }
-                    workspace.tape_mut().projected_curvatures[curvature_start + curvature_offset] =
-                        2.0 * curvature;
-                    curvature_offset += 1;
-                }
-            }
+            // matrix. Ask the operator to visit its packed upper triangle:
+            // matrix-free implementations retain their `multiply` contract,
+            // while structured operators can emit native O(K²) curvature.
+            workspace.tape_mut().projected_curvatures
+                [curvature_start..curvature_start + curvature_len]
+                .fill(0.0);
+            let mut direction_storage = MaybeUninit::uninit();
+            let direction =
+                InlineScalars::initialize_zeros(&mut direction_storage, input_dimension);
+            let mut projected_direction_storage = MaybeUninit::uninit();
+            let projected_direction =
+                InlineScalars::initialize_zeros(&mut projected_direction_storage, input_dimension);
+            coefficients.visit_upper_triangle(
+                direction.as_mut_slice(),
+                projected_direction.as_mut_slice(),
+                |row, column, coefficient| {
+                    let row_axis = input_primary_axes[row] as usize;
+                    let column_axis = input_primary_axes[column] as usize;
+                    let primary = row_axis.min(column_axis);
+                    let other = row_axis.max(column_axis);
+                    let offset = supported_upper_offset(support, primary, other);
+                    let repeated_axis_multiplicity = if row != column && row_axis == column_axis {
+                        2.0
+                    } else {
+                        1.0
+                    };
+                    workspace.tape_mut().projected_curvatures[curvature_start + offset] +=
+                        2.0 * repeated_axis_multiplicity * coefficient;
+                },
+            );
+            curvature_offset = curvature_len;
         } else {
             // Project each unrestricted primary-space input direction through
             // the operator while no tape borrow is live. This preserves
