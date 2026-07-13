@@ -295,6 +295,56 @@ struct TermDerivs {
     hess: f64,
 }
 
+/// Boundary-stable kernels for one nonnegative affine mode
+/// `t = exp(rho) * delta`.
+///
+/// Forming `t` first is numerically wrong at the finite rho boundaries: a
+/// large, finite `log(t) = rho + log(delta)` can overflow even though all four
+/// ratios below have finite limits.  Keeping the mode in log-space makes the
+/// objective and both derivatives regular at both smoothing boundaries.
+#[derive(Clone, Copy)]
+struct ModalKernels {
+    log_one_plus_t: f64,
+    /// `t / (1 + t)`.
+    u: f64,
+    /// `1 / (1 + t)`.
+    v: f64,
+    /// `t / (1 + t)^2 = u * v`.
+    w: f64,
+    /// `t(1 - t) / (1 + t)^3 = u * v * (v - u)`.
+    k: f64,
+}
+
+fn modal_kernels(rho: f64, delta: f64) -> ModalKernels {
+    if delta == 0.0 {
+        return ModalKernels {
+            log_one_plus_t: 0.0,
+            u: 0.0,
+            v: 1.0,
+            w: 0.0,
+            k: 0.0,
+        };
+    }
+    let log_t = rho + delta.ln();
+    let (log_one_plus_t, u, v) = if log_t >= 0.0 {
+        let reciprocal_t = (-log_t).exp();
+        let v = reciprocal_t / (1.0 + reciprocal_t);
+        (log_t + reciprocal_t.ln_1p(), 1.0 - v, v)
+    } else {
+        let t = log_t.exp();
+        let u = t / (1.0 + t);
+        (t.ln_1p(), u, 1.0 - u)
+    };
+    let w = u * v;
+    ModalKernels {
+        log_one_plus_t,
+        u,
+        v,
+        w,
+        k: w * (v - u),
+    }
+}
+
 impl std::ops::AddAssign<TermDerivs> for ObjectiveEval {
     /// Fold a term's `(value, grad, hess)` triple into the running totals in
     /// lock-step, so value and derivative can never be added at separate sites.
@@ -315,19 +365,18 @@ fn gaussian_reml_logdet_term(
     rho: f64,
     n_outputs: f64,
 ) -> (TermDerivs, f64) {
-    let lambda = rho.exp();
     let mut logdet_h = cache.logdet_xtwx;
     let mut trace_h = 0.0;
     let mut trace_h_deriv = 0.0;
     let mut edf = 0.0;
     for &delta in &cache.penalty_eigenvalues {
-        let t = lambda * delta;
-        logdet_h += (1.0 + t).ln();
+        let mode = modal_kernels(rho, delta);
+        logdet_h += mode.log_one_plus_t;
         if delta > 0.0 {
-            trace_h += t / (1.0 + t);
-            trace_h_deriv += t / ((1.0 + t) * (1.0 + t));
+            trace_h += mode.u;
+            trace_h_deriv += mode.w;
         }
-        edf += 1.0 / (1.0 + t);
+        edf += mode.v;
     }
     let logdet_s = cache.logdet_penalty_positive + (cache.penalty_rank as f64) * rho;
     let term = TermDerivs {
@@ -350,18 +399,17 @@ fn gaussian_reml_dispersion_term(
     projected_rhs_squared: ArrayView2<'_, f64>,
     output: usize,
     nu: f64,
-    lambda: f64,
+    rho: f64,
 ) -> TermDerivs {
     let mut fitted_quadratic = 0.0;
     let mut dp_grad = 0.0;
     let mut dp_hess = 0.0;
     for eig in 0..cache.penalty_eigenvalues.len() {
         let c2 = projected_rhs_squared[[eig, output]];
-        let t = lambda * cache.penalty_eigenvalues[eig];
-        let denom = 1.0 + t;
-        fitted_quadratic += c2 / denom;
-        dp_grad += c2 * t / (denom * denom);
-        dp_hess += c2 * t * (1.0 - t) / (denom * denom * denom);
+        let mode = modal_kernels(rho, cache.penalty_eigenvalues[eig]);
+        fitted_quadratic += c2 * mode.v;
+        dp_grad += c2 * mode.w;
+        dp_hess += c2 * mode.k;
     }
     let dp = (ywy[output] - fitted_quadratic).max(MIN_DEVIANCE);
     TermDerivs {
@@ -464,19 +512,27 @@ pub fn gaussian_reml_point_eval_at_rho(
     })
 }
 
-/// Full stationary-point certificate of the closed-form Gaussian REML
-/// ρ-objective: every root of `∂V/∂ρ` the grid-free enumerator isolated on
-/// `[RHO_LOWER, RHO_UPPER]` (ascending), the globally selected ρ̂, the two
-/// window-endpoint costs, and whether the branch-and-bound bottomed out at its
-/// ρ-resolution floor. Diagnostic surface for auditing λ-selection completeness
-/// against a brute-force scan; the production optimizers ([`optimize_rho`] /
-/// `optimize_rho_no_alloc`) reduce through the SAME core and select the same ρ̂.
+/// Successful finite-window certificate for the profiled Gaussian REML
+/// ρ-objective.
+///
+/// `roots` contains one representative from every stationary bracket isolated
+/// on `rho_window`; `root_brackets` records those location certificates and
+/// `root_gradients` makes their numerical residuals directly auditable. The
+/// selected ρ is the lowest evaluated representative or boundary, and
+/// `selected_projected_gradient_residual` is the box-KKT residual at that
+/// selection. A search cell whose stationary structure remains ambiguous at
+/// `root_location_resolution` is not represented by a flag in a successful
+/// value: the search returns [`EstimationError::RemlDidNotConverge`] instead.
 #[derive(Clone, Debug)]
 pub struct GaussianRemlStationarySet {
     pub roots: Vec<f64>,
+    pub root_brackets: Vec<[f64; 2]>,
+    pub root_gradients: Vec<f64>,
     pub selected_rho: f64,
+    pub selected_projected_gradient_residual: f64,
     pub endpoint_costs: [f64; 2],
-    pub hit_resolution_floor: bool,
+    pub rho_window: [f64; 2],
+    pub root_location_resolution: f64,
 }
 
 /// Enumerate the closed-form Gaussian REML stationary set at the given design,
@@ -501,9 +557,13 @@ pub fn gaussian_reml_stationary_set(
     if prepared.cache.penalty_rank == 0 {
         return Ok(GaussianRemlStationarySet {
             roots: Vec::new(),
+            root_brackets: Vec::new(),
+            root_gradients: Vec::new(),
             selected_rho: init_rho.unwrap_or(0.0).clamp(RHO_LOWER, RHO_UPPER),
+            selected_projected_gradient_residual: 0.0,
             endpoint_costs,
-            hit_resolution_floor: false,
+            rho_window: [RHO_LOWER, RHO_UPPER],
+            root_location_resolution: RHO_BRACKET_RESOLUTION,
         });
     }
     let eval = |rho: f64| prepared.evaluate(rho);
@@ -519,13 +579,22 @@ pub fn gaussian_reml_stationary_set(
         )
     };
     let mut roots = Vec::new();
-    let (selected_rho, hit_resolution_floor) =
-        enumerate_and_select_rho(&eval, &enclose, init_rho, |r, _e| roots.push(r))?;
+    let mut root_brackets = Vec::new();
+    let mut root_gradients = Vec::new();
+    let selection = enumerate_and_select_rho(&eval, &enclose, init_rho, |root, e| {
+        roots.push(root.rho);
+        root_brackets.push(root.bracket);
+        root_gradients.push(e.grad);
+    })?;
     Ok(GaussianRemlStationarySet {
         roots,
-        selected_rho,
+        root_brackets,
+        root_gradients,
+        selected_rho: selection.rho,
+        selected_projected_gradient_residual: selection.projected_gradient_residual,
         endpoint_costs,
-        hit_resolution_floor,
+        rho_window: [RHO_LOWER, RHO_UPPER],
+        root_location_resolution: RHO_BRACKET_RESOLUTION,
     })
 }
 
