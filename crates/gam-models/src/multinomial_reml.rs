@@ -1123,14 +1123,8 @@ impl MultinomialFamily {
                     && spec.offset.len() == n
                     && spec.stacked_design.is_none()
                     && spec.stacked_offset.is_none()
-                    // Production blocks carry the full per-term penalty/λ list.
-                    // Accept the empty legacy/joint form here as well so older
-                    // workspaces and diagnostic callers can still reuse the
-                    // family HVP/gradient/log-likelihood machinery.
-                    && (spec.initial_log_lambdas.len() == self.penalties.len()
-                        || spec.initial_log_lambdas.is_empty())
-                    && (spec.penalties.len() == self.penalties.len()
-                        || spec.penalties.is_empty())
+                    && spec.initial_log_lambdas.len() == self.penalties.len()
+                    && spec.penalties.len() == self.penalties.len()
             })
     }
 
