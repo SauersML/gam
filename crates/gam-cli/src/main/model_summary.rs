@@ -218,7 +218,7 @@ pub(crate) fn build_model_summary(
         .ncols()
         .saturating_sub(design.smooth.total_smooth_cols());
     for term in &design.smooth.terms {
-        let k = term.penalties_local.len();
+        let k = term.active_penalties.len();
         let term_penalty_start = penalty_cursor;
         let global_range =
             (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end);

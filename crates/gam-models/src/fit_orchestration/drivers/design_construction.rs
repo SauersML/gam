@@ -1224,33 +1224,28 @@ fn extract_spatial_operator_runtime_caches(
             continue;
         };
         let global_base_idx = global_range.start;
-        let mut active_local_idx = 0usize;
         let mut mass_local_idx = None;
         let mut tension_local_idx = None;
         let mut stiffness_local_idx = None;
         let mut mass_norm = None;
         let mut tension_norm = None;
         let mut stiffness_norm = None;
-        for info in &term_fit.penaltyinfo_local {
-            if !info.active {
-                continue;
-            }
-            match info.source {
+        for (active_local_idx, penalty) in term_fit.active_penalties.iter().enumerate() {
+            match penalty.info.source {
                 PenaltySource::OperatorMass => {
                     mass_local_idx = Some(active_local_idx);
-                    mass_norm = Some(info.normalization_scale);
+                    mass_norm = Some(penalty.info.normalization_scale);
                 }
                 PenaltySource::OperatorTension => {
                     tension_local_idx = Some(active_local_idx);
-                    tension_norm = Some(info.normalization_scale);
+                    tension_norm = Some(penalty.info.normalization_scale);
                 }
                 PenaltySource::OperatorStiffness => {
                     stiffness_local_idx = Some(active_local_idx);
-                    stiffness_norm = Some(info.normalization_scale);
+                    stiffness_norm = Some(penalty.info.normalization_scale);
                 }
                 _ => {}
             }
-            active_local_idx += 1;
         }
         // The Charbonnier adaptive overlay rebuilds the {mass, tension,
         // stiffness} D-operator triplet from explicit collocation derivatives
@@ -1388,7 +1383,7 @@ fn extract_spatial_operator_runtime_caches(
         // Runtime operator caches must live on the same normalized penalty scale as the
         // shipped design penalties. The basis builders normalize S0=D0'D0, S1=D1'D1, and
         // S2=D2'D2 before exposing them as smoothing blocks, recording the corresponding
-        // Frobenius norms in penaltyinfo_local.normalization_scale. If the exact adaptive
+        // Frobenius norms in each atomic active penalty's normalization scale. If the exact adaptive
         // path uses raw collocation operators here, then its Charbonnier penalties live on a
         // different geometry from the ordinary Matérn/Duchon penalties:
         //

@@ -815,7 +815,7 @@ pub struct SmoothTerm {
     /// Joint-null absorption rotation. `Some(Q)` records the orthonormal
     /// `(p_local × p_local)` matrix that was applied to this term's design
     /// and per-block penalties at construction time:
-    /// `term_design ← X_raw · Q`, `penalties_local[k] ← Qᵀ · S_raw · Q`.
+    /// `term_design ← X_raw · Q`, `active_penalties[k].matrix ← Qᵀ · S_raw · Q`.
     /// The smooth's coefficient vector therefore lives in the rotated
     /// (`γ`) coordinate system, with `β_raw = Q · γ` recovering the raw
     /// pre-rotation parameterization. `None` means either no joint null

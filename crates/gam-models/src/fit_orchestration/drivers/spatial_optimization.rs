@@ -2246,17 +2246,17 @@ fn constant_curvature_kappa_fair_profile_value_gradient(
     let derivatives =
         gam_terms::basis::build_constant_curvature_basis_kappa_derivatives(data, &profile_spec)
             .map_err(EstimationError::from)?;
-    if basis.penalties.len() != 1 || derivatives.first.penalties_derivative.len() != 1 {
+    if basis.active_penalties.len() != 1 || derivatives.first.penalties_derivative.len() != 1 {
         crate::bail_invalid_estim!(
             "constant-curvature fair profile expected one primary penalty; value blocks={}, derivative blocks={}",
-            basis.penalties.len(),
+            basis.active_penalties.len(),
             derivatives.first.penalties_derivative.len(),
         );
     }
 
     let smooth_design = basis.design.to_dense();
     let smooth_design_kappa = &derivatives.first.design_derivative;
-    let smooth_penalty = &basis.penalties[0];
+    let smooth_penalty = &basis.active_penalties[0].matrix;
     let smooth_penalty_kappa = &derivatives.first.penalties_derivative[0];
     let n = smooth_design.nrows();
     let p = smooth_design.ncols();
@@ -4365,13 +4365,8 @@ struct SingleSmoothTermRealization {
 }
 
 impl SingleSmoothTermRealization {
-    fn active_penaltyinfo(&self) -> Vec<PenaltyInfo> {
-        self.term
-            .penaltyinfo_local
-            .iter()
-            .filter(|info| info.active)
-            .cloned()
-            .collect()
+    fn active_penalty_count(&self) -> usize {
+        self.term.active_penalties.len()
     }
 }
 
@@ -4426,29 +4421,14 @@ fn wrap_local_build_as_realization(
         None
     };
 
-    let active_count = local.penaltyinfo.iter().filter(|info| info.active).count();
-    if active_count != local.penalties.len() {
-        return Err(format!(
-            "internal penalty info mismatch for term '{}': active_infos={}, penalties={}",
-            termspec.name,
-            active_count,
-            local.penalties.len()
-        ));
-    }
-
-    let mut dropped_penaltyinfo = Vec::<DroppedPenaltyBlockInfo>::new();
-    for info in local.penaltyinfo.iter().filter(|info| !info.active) {
-        dropped_penaltyinfo.push(DroppedPenaltyBlockInfo {
+    let dropped_penaltyinfo = local
+        .dropped_penalties
+        .iter()
+        .map(|info| DroppedPenaltyBlockInfo {
             termname: Some(termspec.name.clone()),
             penalty: info.clone(),
-        });
-    }
-    for info in &local.pre_dropped_penaltyinfo {
-        dropped_penaltyinfo.push(DroppedPenaltyBlockInfo {
-            termname: Some(termspec.name.clone()),
-            penalty: info.clone(),
-        });
-    }
+        })
+        .collect();
 
     // Stage-2 joint-null absorption rotation, same logic as the main
     // aggregation loop in `build_smooth_design_withworkspace_unvalidated`:
@@ -4469,15 +4449,16 @@ fn wrap_local_build_as_realization(
                         )
                     },
                 )?;
-            local.penalties = local
-                .penalties
-                .into_iter()
-                .map(|s_local| {
-                    let qt_s = gam_linalg::faer_ndarray::fast_atb(q, &s_local);
-                    gam_linalg::faer_ndarray::fast_ab(&qt_s, q)
-                })
-                .collect();
-            local.ops = vec![None; local.penalties.len()];
+            for penalty in &mut local.active_penalties {
+                let qt_s = gam_linalg::faer_ndarray::fast_atb(q, &penalty.matrix);
+                penalty.matrix = gam_linalg::faer_ndarray::fast_ab(&qt_s, q);
+                penalty.null_eigenvectors = penalty
+                    .null_eigenvectors
+                    .as_ref()
+                    .map(|basis| gam_linalg::faer_ndarray::fast_atb(q, basis));
+                penalty.op = None;
+                penalty.info.kronecker_factors = None;
+            }
             local.kronecker_factored = None;
             Some(rot)
         }
@@ -4489,9 +4470,8 @@ fn wrap_local_build_as_realization(
         name: termspec.name.clone(),
         coeff_range: 0..p_local,
         shape: termspec.shape,
-        penalties_local: local.penalties.clone(),
-        nullspace_dims: local.nullspaces.clone(),
-        penaltyinfo_local: local.penaltyinfo.clone(),
+        active_penalties: local.active_penalties.clone(),
+        dropped_penalties: local.dropped_penalties.clone(),
         metadata: local.metadata.clone(),
         lower_bounds_local: lb_local,
         linear_constraints_local: local.linear_constraints.clone(),
@@ -4974,14 +4954,14 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 ))
                 .into());
             }
-            if realization.active_penaltyinfo().len()
-                != design.smooth.terms[term_idx].penalties_local.len()
+            if realization.active_penalty_count()
+                != design.smooth.terms[term_idx].active_penalties.len()
             {
                 return Err(SmoothError::dimension_mismatch(format!(
                     "cached realization penalty mismatch for term '{}': cached_penalties={}, design_penalties={}",
                     termspec.name,
-                    realization.active_penaltyinfo().len(),
-                    design.smooth.terms[term_idx].penalties_local.len()
+                    realization.active_penalty_count(),
+                    design.smooth.terms[term_idx].active_penalties.len()
                 ))
                 .into());
             }
@@ -5206,8 +5186,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 // produce a 1-block surface against a 3-block frozen design — the
                 // topology desync #1270 hard-errored on. Sharing the builder
                 // makes the block count ψ-stable by construction.
-                let (penalties, nullspace_dims, _info) =
-                    matern_operator_penalty_triplet_at_length_scale(
+                let filtered = matern_operator_penalty_triplet_at_length_scale(
                         centers.view(),
                         periodic.as_deref(),
                         identifiability_transform.as_ref(),
@@ -5217,7 +5196,17 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                         effective_ls,
                     )
                     .map_err(|e| e.to_string())?;
-                (penalties, nullspace_dims)
+                let locals = filtered
+                    .active
+                    .iter()
+                    .map(|penalty| penalty.matrix.clone())
+                    .collect();
+                let nullspace_dims = filtered
+                    .active
+                    .iter()
+                    .map(|penalty| penalty.nullity)
+                    .collect();
+                (locals, nullspace_dims)
             }
             BasisMetadata::ThinPlate {
                 centers,
@@ -5659,9 +5648,8 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         } = realization;
         let SmoothTerm {
             name,
-            penalties_local,
-            nullspace_dims,
-            penaltyinfo_local,
+            active_penalties,
+            dropped_penalties,
             metadata,
             lower_bounds_local,
             linear_constraints_local,
@@ -5695,11 +5683,6 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             .into());
         }
 
-        let active_penaltyinfo = penaltyinfo_local
-            .iter()
-            .filter(|info| info.active)
-            .cloned()
-            .collect::<Vec<_>>();
         let smooth_penalty_range = self
             .smooth_penalty_ranges
             .get(term_idx)
@@ -5714,16 +5697,11 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 format!("incremental realizer missing full penalty range for term {term_idx}")
             })?
             .clone();
-        if active_penaltyinfo.len() != smooth_penalty_range.len()
-            || penalties_local.len() != smooth_penalty_range.len()
-            || nullspace_dims.len() != smooth_penalty_range.len()
-        {
+        if active_penalties.len() != smooth_penalty_range.len() {
             return Err(SmoothError::dimension_mismatch(format!(
-                "incremental realizer topology changed for term '{}': penalties={}, infos={}, nullspaces={}, cached_penalties={}",
+                "incremental realizer topology changed for term '{}': active_penalties={}, cached_penalties={}",
                 name,
-                penalties_local.len(),
-                active_penaltyinfo.len(),
-                nullspace_dims.len(),
+                active_penalties.len(),
                 smooth_penalty_range.len()
             ))
             .into());
@@ -5731,11 +5709,10 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
 
         self.design.smooth.term_designs[term_idx] = design_local;
 
-        for (offset, penalty_local) in penalties_local.iter().enumerate() {
+        for (offset, active_penalty) in active_penalties.iter().enumerate() {
             let smooth_penalty_idx = smooth_penalty_range.start + offset;
             let full_penalty_idx = full_penalty_range.start + offset;
-            let nullspace_dim = nullspace_dims[offset];
-            let penalty_info = active_penaltyinfo[offset].clone();
+            let penalty_local = &active_penalty.matrix;
 
             if penalty_local.nrows() != coeff_range.len()
                 || penalty_local.ncols() != coeff_range.len()
@@ -5766,6 +5743,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             // With per-term block-local penalties, col_range already targets
             // this specific term, so .local is p_k × p_k.
             smooth_penalty.local.assign(penalty_local);
+            smooth_penalty.op = active_penalty.op.clone();
 
             let full_bp = self
                 .design
@@ -5780,25 +5758,26 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             // With per-term block-local penalties, col_range already targets
             // this specific term, so .local is p_k × p_k.
             full_bp.local.assign(penalty_local);
+            full_bp.op = active_penalty.op.clone();
 
-            self.design.smooth.nullspace_dims[smooth_penalty_idx] = nullspace_dim;
-            self.design.nullspace_dims[full_penalty_idx] = nullspace_dim;
+            self.design.smooth.nullspace_dims[smooth_penalty_idx] = active_penalty.nullity;
+            self.design.nullspace_dims[full_penalty_idx] = active_penalty.nullity;
 
             self.design.smooth.penaltyinfo[smooth_penalty_idx].global_index = smooth_penalty_idx;
             self.design.smooth.penaltyinfo[smooth_penalty_idx].termname = Some(name.clone());
-            self.design.smooth.penaltyinfo[smooth_penalty_idx].penalty = penalty_info.clone();
+            self.design.smooth.penaltyinfo[smooth_penalty_idx].penalty =
+                active_penalty.info.clone();
 
             self.design.penaltyinfo[full_penalty_idx].global_index = full_penalty_idx;
             self.design.penaltyinfo[full_penalty_idx].termname = Some(name.clone());
-            self.design.penaltyinfo[full_penalty_idx].penalty = penalty_info;
+            self.design.penaltyinfo[full_penalty_idx].penalty = active_penalty.info.clone();
         }
 
         let target_term = self.design.smooth.terms.get_mut(term_idx).ok_or_else(|| {
             format!("incremental realizer smooth term {term_idx} disappeared during replacement")
         })?;
-        target_term.penalties_local = penalties_local;
-        target_term.nullspace_dims = nullspace_dims;
-        target_term.penaltyinfo_local = penaltyinfo_local;
+        target_term.active_penalties = active_penalties;
+        target_term.dropped_penalties = dropped_penalties;
         target_term.metadata = metadata;
         target_term.lower_bounds_local = lower_bounds_local;
         target_term.linear_constraints_local = linear_constraints_local;

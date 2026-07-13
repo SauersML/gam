@@ -66,7 +66,7 @@ pub struct PenaltyBlockGammaPriorMetadata<'a> {
     pub termname: Option<&'a str>,
     pub source: String,
     pub effective_rank: usize,
-    pub nullspace_dim_hint: usize,
+    pub nullity: usize,
 }
 
 fn penalty_block_label_candidates(info: &PenaltyBlockInfo) -> Vec<String> {
@@ -99,7 +99,7 @@ fn penalty_block_metadata(
         termname: info.termname.as_deref(),
         source: format!("{:?}", info.penalty.source),
         effective_rank: info.penalty.effective_rank,
-        nullspace_dim_hint: nullspace_dim,
+        nullity: nullspace_dim,
     }
 }
 

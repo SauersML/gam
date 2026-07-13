@@ -417,13 +417,10 @@ pub(crate) fn append_binomial_log_sigma_shrinkage_penalty_design(
     design.penaltyinfo.push(PenaltyBlockInfo {
         global_index: design.penaltyinfo.len(),
         termname: Some("log_sigma_shrinkage".to_string()),
-        penalty: PenaltyInfo {
+        penalty: ActivePenaltyInfo {
             source: PenaltySource::Other("shrinkage".to_string()),
             original_index: 0,
-            active: true,
             effective_rank: p,
-            dropped_reason: None,
-            nullspace_dim_hint: 0,
             normalization_scale: 1.0,
             kronecker_factors: None,
         },

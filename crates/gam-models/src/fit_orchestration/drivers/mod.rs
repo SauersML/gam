@@ -9,7 +9,8 @@
 // `gam_solve::*`, basis/term machinery as `gam_terms::*`).
 use gam_terms::basis::{
     BasisError, BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult,
-    BasisWorkspace, CenterStrategy, MaternIdentifiability, PenaltyInfo, PenaltySource,
+    ActivePenalty, ActivePenaltyInfo, BasisWorkspace, CenterStrategy, DroppedPenaltyInfo,
+    MaternIdentifiability, PenaltySource,
     build_constant_curvature_basis_kappa_derivatives,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_collocation_operator_matrices, build_measure_jet_basis_psi_derivatives,

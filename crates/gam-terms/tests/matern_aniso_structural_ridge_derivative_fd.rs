@@ -103,19 +103,18 @@ fn matern_aniso_nonorthogonal_structural_ridge_jet_matches_central_finite_differ
     let (data, spec, psi) = fixture();
     let base = build_matern_basiswithworkspace(data.view(), &spec, &mut BasisWorkspace::default())
         .expect("base anisotropic Matérn value build");
-    let active_sources = base
-        .penaltyinfo
+    let ridge_index = base
+        .active_penalties
         .iter()
-        .filter(|info| info.active)
-        .map(|info| &info.source)
-        .collect::<Vec<_>>();
-    assert_eq!(active_sources.len(), base.penalties.len());
-    let ridge_index = active_sources
-        .iter()
-        .position(|source| matches!(source, PenaltySource::DoublePenaltyNullspace))
+        .position(|penalty| {
+            matches!(
+                penalty.info.source,
+                PenaltySource::DoublePenaltyNullspace
+            )
+        })
         .expect("explicit intercept must emit an active structural ridge");
 
-    let ridge = &base.penalties[ridge_index];
+    let ridge = &base.active_penalties[ridge_index].matrix;
     let intercept_column = ridge.ncols() - 1;
     let kernel_intercept_overlap = (0..intercept_column)
         .map(|column| ridge[[column, intercept_column]].abs())
@@ -129,10 +128,13 @@ fn matern_aniso_nonorthogonal_structural_ridge_jet_matches_central_finite_differ
         .expect("analytic anisotropic Matérn derivative build");
     assert_eq!(derivatives.penalties_first.len(), 2);
     assert_eq!(derivatives.penalties_second_diag.len(), 2);
-    assert_eq!(derivatives.penalties_first[0].len(), base.penalties.len());
+    assert_eq!(
+        derivatives.penalties_first[0].len(),
+        base.active_penalties.len()
+    );
     assert_eq!(
         derivatives.penalties_second_diag[0].len(),
-        base.penalties.len()
+        base.active_penalties.len()
     );
     assert!(derivatives.penalties_cross_pairs.contains(&(0, 1)));
     let analytic_cross = derivatives
@@ -141,7 +143,7 @@ fn matern_aniso_nonorthogonal_structural_ridge_jet_matches_central_finite_differ
         .expect("mixed structural-ridge derivative provider")
         .evaluate(0, 1)
         .expect("mixed structural-ridge derivative evaluation");
-    assert_eq!(analytic_cross.len(), base.penalties.len());
+    assert_eq!(analytic_cross.len(), base.active_penalties.len());
 
     let first_step = 1.0e-6;
     let mut psi_first_plus = psi.clone();
@@ -159,7 +161,8 @@ fn matern_aniso_nonorthogonal_structural_ridge_jet_matches_central_finite_differ
     psi_second_minus[0] -= second_step;
     let second_plus = realized_penalties_at_psi(&data, &spec, &psi_second_plus);
     let second_minus = realized_penalties_at_psi(&data, &spec, &psi_second_minus);
-    let fd_second = (&second_plus[ridge_index] - &(&base.penalties[ridge_index] * 2.0)
+    let fd_second = (&second_plus[ridge_index]
+        - &(&base.active_penalties[ridge_index].matrix * 2.0)
         + &second_minus[ridge_index])
         / (second_step * second_step);
 

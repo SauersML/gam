@@ -1,4 +1,5 @@
 pub mod affine_design;
+pub mod alo;
 pub mod conformal;
 pub mod generative;
 pub mod input;
@@ -8,6 +9,7 @@ pub mod posterior_bands;
 pub mod posterior_predict;
 
 pub use affine_design::*;
+pub use alo::*;
 pub use conformal::*;
 pub use gam_models::inference::predict_io::{
     BernoulliMarginalSlopePredictor, PredictInput, PredictResult,

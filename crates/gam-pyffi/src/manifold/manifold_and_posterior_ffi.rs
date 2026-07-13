@@ -1413,7 +1413,7 @@ fn summary_smooth_terms(
         .ncols()
         .saturating_sub(design.smooth.total_smooth_cols());
     for term in &design.smooth.terms {
-        let k = term.penalties_local.len();
+        let k = term.active_penalties.len();
         // Per-term EDF as the influence-matrix trace over the term's coefficient
         // block, NOT the legacy `Σ_kk edf_by_block` per-penalty sum. For a tensor
         // product `te`/`ti` (and anisotropic / adaptive smooths) several penalty

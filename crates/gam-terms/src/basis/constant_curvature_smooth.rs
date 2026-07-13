@@ -68,7 +68,7 @@ use gam_geometry::constant_curvature::{ConstantCurvature, distance_kappa_jet};
 use super::{
     BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeBundle,
     BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy, PenaltyCandidate,
-    ActivePenaltyInfo, PenaltySource, filter_penalty_candidates, normalize_penalty,
+    ActivePenalty, PenaltySource, filter_penalty_candidates, normalize_penalty,
     select_centers_by_strategy, weighted_coefficient_sum_to_zero_transform,
 };
 

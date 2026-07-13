@@ -2587,14 +2587,20 @@ fn duchon_basis_with_jet<'py>(
     // which uses the same `Z` and `α` as the helper above, so `S` is the
     // penalty of exactly the `Φ` returned here.
     let built = build_duchon_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
-    let primary_idx = built
-        .penaltyinfo
+    let penalty = built
+        .active_penalties
         .iter()
-        .position(|info| matches!(info.source, gam::terms::basis::PenaltySource::Primary))
+        .find(|penalty| {
+            matches!(
+                penalty.info.source,
+                gam::terms::basis::PenaltySource::Primary
+            )
+        })
         .ok_or_else(|| {
             py_value_error("duchon_basis_with_jet: primary penalty was not built".to_string())
-        })?;
-    let penalty = built.penalties[primary_idx].clone();
+        })?
+        .matrix
+        .clone();
 
     if phi.ncols() != jet.shape()[1] {
         return Err(py_value_error(format!(
@@ -3312,16 +3318,22 @@ fn duchon_function_norm_penalty<'py>(
         .map_err(basis_error_to_pyerr)?;
         // Mixed-periodicity builder emits a single Primary candidate (the
         // function-norm Gram).
-        let idx = built
-            .penaltyinfo
+        let penalty = built
+            .active_penalties
             .iter()
-            .position(|info| matches!(info.source, gam::terms::basis::PenaltySource::Primary))
+            .find(|penalty| {
+                matches!(
+                    penalty.info.source,
+                    gam::terms::basis::PenaltySource::Primary
+                )
+            })
             .ok_or_else(|| {
                 py_value_error(
                     "mixed-periodicity Duchon function-norm penalty was not built".to_string(),
                 )
-            })?;
-        let penalty = built.penalties[idx].clone();
+            })?
+            .matrix
+            .clone();
         return Ok(penalty.into_pyarray(py).unbind());
     }
     let spec = DuchonBasisSpec {
@@ -3342,16 +3354,22 @@ fn duchon_function_norm_penalty<'py>(
     // penalty on the scale-free polyharmonic basis) plus a null-space shrinkage
     // ridge; it no longer ships the mass/tension/stiffness operator triplet.
     // The function norm is the Primary block.
-    let primary_idx = built
-        .penaltyinfo
+    let penalty = built
+        .active_penalties
         .iter()
-        .position(|info| matches!(info.source, gam::terms::basis::PenaltySource::Primary))
+        .find(|penalty| {
+            matches!(
+                penalty.info.source,
+                gam::terms::basis::PenaltySource::Primary
+            )
+        })
         .ok_or_else(|| {
             py_value_error(
                 "Duchon function-norm penalty (Primary native-norm Gram) was not built".to_string(),
             )
-        })?;
-    let penalty = built.penalties[primary_idx].clone();
+        })?
+        .matrix
+        .clone();
     Ok(penalty.into_pyarray(py).unbind())
 }
 
@@ -3422,14 +3440,20 @@ fn sphere_basis<'py>(
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
     };
     let built = build_spherical_spline_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
-    let primary_idx = built
-        .penaltyinfo
+    let penalty = built
+        .active_penalties
         .iter()
-        .position(|info| matches!(info.source, gam::terms::basis::PenaltySource::Primary))
+        .find(|penalty| {
+            matches!(
+                penalty.info.source,
+                gam::terms::basis::PenaltySource::Primary
+            )
+        })
         .ok_or_else(|| {
             py_value_error("sphere_basis: primary penalty was not built; check spec".to_string())
-        })?;
-    let penalty = built.penalties[primary_idx].clone();
+        })?
+        .matrix
+        .clone();
     let design = built.design.to_dense();
     Ok((
         design.into_pyarray(py).unbind(),
@@ -3525,16 +3549,22 @@ fn sphere_basis_with_centers<'py>(
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
     };
     let built = build_spherical_spline_basis(pts, &spec).map_err(basis_error_to_pyerr)?;
-    let primary_idx = built
-        .penaltyinfo
+    let penalty = built
+        .active_penalties
         .iter()
-        .position(|info| matches!(info.source, gam::terms::basis::PenaltySource::Primary))
+        .find(|penalty| {
+            matches!(
+                penalty.info.source,
+                gam::terms::basis::PenaltySource::Primary
+            )
+        })
         .ok_or_else(|| {
             py_value_error(
                 "sphere_basis_with_centers: primary penalty was not built; check spec".to_string(),
             )
-        })?;
-    let penalty = built.penalties[primary_idx].clone();
+        })?
+        .matrix
+        .clone();
     let design = built.design.to_dense();
     Ok((
         design.into_pyarray(py).unbind(),

@@ -900,16 +900,8 @@ pub(super) fn assert_term_collection_designs_match(
             "{label} penalty source mismatch at {idx}"
         );
         assert_eq!(
-            linfo.penalty.active, rinfo.penalty.active,
-            "{label} penalty active mismatch at {idx}"
-        );
-        assert_eq!(
             linfo.penalty.effective_rank, rinfo.penalty.effective_rank,
             "{label} penalty rank mismatch at {idx}"
-        );
-        assert_eq!(
-            linfo.penalty.nullspace_dim_hint, rinfo.penalty.nullspace_dim_hint,
-            "{label} penalty nullspace hint mismatch at {idx}"
         );
         assert!(
             (linfo.penalty.normalization_scale - rinfo.penalty.normalization_scale).abs() <= 1e-10,
@@ -2959,7 +2951,7 @@ fn periodic_bspline_margin_wraps_exactly_at_period() {
     for row in dense.rows() {
         assert!((row.sum() - 1.0).abs() < 1e-12);
     }
-    assert_eq!(built.nullspace_dims[0], 1);
+    assert_eq!(built.active_penalties[0].nullity, 1);
 }
 
 #[test]

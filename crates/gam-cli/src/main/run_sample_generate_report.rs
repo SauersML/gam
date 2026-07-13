@@ -663,7 +663,7 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                 {
                     let mut penalty_cursor = design.leading_penalty_blocks_before_smooth();
                     for term in &design.smooth.terms {
-                        let k = term.penalties_local.len();
+                        let k = term.active_penalties.len();
                         let term_penalty_start = penalty_cursor;
                         penalty_cursor += k;
                         let gam::basis::BasisMetadata::MeasureJet {

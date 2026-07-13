@@ -1928,7 +1928,7 @@ pub fn filter_penalty_candidates(
         } else {
             let null_basis = nullspace_basis_from_block(&analysis);
             log::debug!(
-                "Retained penalty block source={:?} original_index={} rank={} nullspace_dim_hint={} has_op={} has_null_basis={}",
+                "Retained penalty block source={:?} original_index={} rank={} nullity={} has_op={} has_null_basis={}",
                 source,
                 original_index,
                 analysis.rank,
