@@ -182,11 +182,17 @@ def _sae_fit_worker(
     # diagnostic half is NaN (#2267).
     fitted_train = m.reconstruct(z_tr)
     train_ev = _ev(z_tr, fitted_train)
+    test_ev = _ev(z_te, fitted_test)
+    if not np.isfinite(train_ev) or not np.isfinite(test_ev):
+        raise RuntimeError(
+            f"{topology} K={k} produced non-finite reconstruction EV "
+            f"(train={train_ev!r}, held_out={test_ev!r})"
+        )
 
     hybrid_split = getattr(m, "hybrid_split", None)
     atom_topologies = [str(v) for v in getattr(m, "atom_topologies", [])]
     return {
-        "test_ev": _ev(z_te, fitted_test),
+        "test_ev": test_ev,
         "train_ev": train_ev,
         "fit_seconds": fit_seconds,
         "reconstruct_seconds": reconstruct_seconds,
