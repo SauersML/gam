@@ -4721,7 +4721,128 @@ const PRODUCTION_DERIVATIVE_SPECIALIZATIONS: &[DerivativeSpecialization] = &[
     },
 ];
 
+#[derive(Debug)]
+struct DerivativeDeclaration {
+    line_index: usize,
+    source: String,
+}
+
+fn normalized_rust_fragment(source: &str) -> String {
+    source.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn code_anchor_line_indices(source: &str, anchor: &str) -> Vec<usize> {
+    strip_file_lines(source)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(line_index, line)| line.contains(anchor).then_some(line_index))
+        .collect()
+}
+
+fn derivative_declarations(source: &str, test_mask: &[bool]) -> Vec<DerivativeDeclaration> {
+    let lines = strip_file_lines(source);
+    let mut declarations = Vec::new();
+    let mut line_index = 0usize;
+    while line_index < lines.len() {
+        if test_mask.get(line_index).copied().unwrap_or(false) {
+            line_index += 1;
+            continue;
+        }
+        let trimmed = lines[line_index].trim();
+        let starts_relevant_declaration = trimmed.starts_with("impl ")
+            || trimmed.starts_with("impl<")
+            || trimmed.starts_with("fn ");
+        if !starts_relevant_declaration {
+            line_index += 1;
+            continue;
+        }
+
+        let start = line_index;
+        let mut source = trimmed.to_string();
+        while !source.contains('{') && !source.ends_with(';') && line_index + 1 < lines.len() {
+            line_index += 1;
+            if test_mask.get(line_index).copied().unwrap_or(false) {
+                break;
+            }
+            source.push(' ');
+            source.push_str(lines[line_index].trim());
+        }
+        declarations.push(DerivativeDeclaration {
+            line_index: start,
+            source: normalized_rust_fragment(&source),
+        });
+        line_index += 1;
+    }
+    declarations
+}
+
+fn is_row_kernel_declaration(declaration: &str) -> bool {
+    (declaration.starts_with("impl ") || declaration.starts_with("impl<"))
+        && declaration.contains("RowKernel<")
+        && declaration.contains(" for ")
+}
+
+fn generated_derivative_modes(declaration: &str) -> Option<(bool, bool)> {
+    if !declaration.starts_with("fn ") {
+        return None;
+    }
+    let mode_start = declaration.find('[')?;
+    let mode_end = declaration[mode_start + 1..].find(']')? + mode_start + 1;
+    let modes = declaration[mode_start + 1..mode_end]
+        .split(',')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    let third = modes.contains(&"third");
+    let fourth = modes.contains(&"fourth");
+    (third || fourth).then_some((third, fourth))
+}
+
+fn enforce_derivative_policy_negative_probes() {
+    let comment_only = "// impl RowKernel<7> for CommentOnlyKernel";
+    assert!(
+        code_anchor_line_indices(comment_only, "impl RowKernel<7> for CommentOnlyKernel")
+            .is_empty(),
+        "#932 policy self-test: a comment-only anchor was treated as production code"
+    );
+
+    let row_kernel = "impl RowKernel<7> for PlantedKernel {}";
+    let row_mask = compute_test_mask(row_kernel, Path::new("crates/gam-models/src/planted.rs"));
+    let row_declarations = derivative_declarations(row_kernel, &row_mask);
+    assert!(
+        row_declarations.iter().any(|declaration| {
+            is_row_kernel_declaration(&declaration.source)
+                && !specialization_site_is_registered(
+                    DerivativeSpecializationKind::RowKernel,
+                    "crates/gam-models/src/planted.rs",
+                    &declaration.source,
+                )
+        }),
+        "#932 policy self-test: an unregistered RowKernel was not discovered"
+    );
+
+    let separate_generated = "row_atom! {\n    fn planted_third [generic, third](x) { x }\n    fn planted_fourth [generic, fourth](x) { x }\n}";
+    let generated_mask =
+        compute_test_mask(separate_generated, Path::new("crates/gam-models/src/planted.rs"));
+    let generated_declarations = derivative_declarations(separate_generated, &generated_mask);
+    let unregistered_generated = generated_declarations
+        .iter()
+        .filter(|declaration| {
+            generated_derivative_modes(&declaration.source).is_some()
+                && !specialization_site_is_registered(
+                    DerivativeSpecializationKind::RowAtom,
+                    "crates/gam-models/src/planted.rs",
+                    &declaration.source,
+                )
+        })
+        .count();
+    assert_eq!(
+        unregistered_generated, 2,
+        "#932 policy self-test: separate generated-third/fourth declarations were not both discovered"
+    );
+}
+
 fn enforce_production_derivative_specializations(root: &Path) {
+    enforce_derivative_policy_negative_probes();
     let mut violations = Vec::new();
     for specialization in PRODUCTION_DERIVATIVE_SPECIALIZATIONS {
         let production_path = root.join(specialization.production_path);
@@ -4730,23 +4851,20 @@ fn enforce_production_derivative_specializations(root: &Path) {
                 let test_mask =
                     compute_test_mask(&source, Path::new(specialization.production_path));
                 for anchor in specialization.production_anchors {
-                    match source.find(anchor) {
-                        Some(offset) => {
-                            let line = source[..offset]
-                                .bytes()
-                                .filter(|byte| *byte == b'\n')
-                                .count();
-                            if test_mask.get(line).copied().unwrap_or(false) {
-                                violations.push(format!(
-                                    "{} production anchor is gated by cfg(test): {}",
-                                    specialization.family, anchor
-                                ));
-                            }
-                        }
-                        None => violations.push(format!(
+                    let anchor_lines = code_anchor_line_indices(&source, anchor);
+                    if anchor_lines.is_empty() {
+                        violations.push(format!(
                             "{} production anchor is missing: {}",
                             specialization.family, anchor
-                        )),
+                        ));
+                    } else if anchor_lines
+                        .iter()
+                        .all(|line| test_mask.get(*line).copied().unwrap_or(false))
+                    {
+                        violations.push(format!(
+                            "{} production anchor is gated by cfg(test): {}",
+                            specialization.family, anchor
+                        ));
                     }
                 }
             }
@@ -4760,7 +4878,7 @@ fn enforce_production_derivative_specializations(root: &Path) {
         match fs::read_to_string(&pin_path) {
             Ok(source) => {
                 for anchor in specialization.pin_anchors {
-                    if !source.contains(anchor) {
+                    if code_anchor_line_indices(&source, anchor).is_empty() {
                         violations.push(format!(
                             "{} registered parity pin is missing anchor: {}",
                             specialization.family, anchor
@@ -4784,47 +4902,33 @@ fn enforce_production_derivative_specializations(root: &Path) {
                 return;
             }
             let test_mask = compute_test_mask(content, rel);
-            for (line_index, line) in content.lines().enumerate() {
-                if test_mask.get(line_index).copied().unwrap_or(false) {
-                    continue;
-                }
-                let trimmed = line.trim();
-                let row_kernel_impl =
-                    trimmed
-                        .split_once(" for ")
-                        .is_some_and(|(implementation, _)| {
-                            (implementation.starts_with("impl ")
-                                || implementation.starts_with("impl<"))
-                                && implementation.contains("RowKernel<")
-                        });
-                if row_kernel_impl
+            for declaration in derivative_declarations(content, &test_mask) {
+                if is_row_kernel_declaration(&declaration.source)
                     && !specialization_site_is_registered(
                         DerivativeSpecializationKind::RowKernel,
                         &rel_path,
-                        trimmed,
+                        &declaration.source,
                     )
                 {
                     violations.push(format!(
-                    "unregistered production RowKernel specialization at {rel_path}:{}: {trimmed}",
-                    line_index + 1
-                ));
+                        "unregistered production RowKernel specialization at {rel_path}:{}: {}",
+                        declaration.line_index + 1,
+                        declaration.source
+                    ));
                 }
 
-                let generated_tower = trimmed.starts_with("fn ")
-                    && trimmed.contains('[')
-                    && trimmed.contains("third")
-                    && trimmed.contains("fourth");
-                if generated_tower
+                if generated_derivative_modes(&declaration.source).is_some()
                     && !specialization_site_is_registered(
                         DerivativeSpecializationKind::RowAtom,
                         &rel_path,
-                        trimmed,
+                        &declaration.source,
                     )
                 {
                     violations.push(format!(
-                    "unregistered generated third/fourth row specialization at {rel_path}:{}: {trimmed}",
-                    line_index + 1
-                ));
+                        "unregistered generated third/fourth row specialization at {rel_path}:{}: {}",
+                        declaration.line_index + 1,
+                        declaration.source
+                    ));
                 }
             }
         },
@@ -4847,12 +4951,15 @@ fn specialization_site_is_registered(
     path: &str,
     source_line: &str,
 ) -> bool {
+    let normalized_source = normalized_rust_fragment(source_line);
     PRODUCTION_DERIVATIVE_SPECIALIZATIONS
         .iter()
         .any(|specialization| {
             specialization.kind == kind
                 && specialization.production_path == path
-                && source_line.contains(specialization.discovery_anchor)
+                && normalized_source.contains(&normalized_rust_fragment(
+                    specialization.discovery_anchor,
+                ))
         })
 }
 
