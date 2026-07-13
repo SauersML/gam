@@ -3261,11 +3261,8 @@ mod moment_engine_tests {
     /// #932 item-2 increment 1: the FlexJet moment recurrence must reproduce the
     /// numeric `reduce_sextic_moments` on the VALUE channel term-for-term (a
     /// generic non-degenerate sextic cell), proving the port of the raising
-    /// recurrence + boundary term to the jet algebra is exact. The derivative
-    /// channels are exercised end-to-end by `flex_timepoint_inputs_jet3_directional_
-    /// matches_hand_932` / `_jet4_bidirectional_matches_hand_932` / `_ghw_jet3_jet4_
-    /// match_hand_932`, which pin the full directional/bidirectional moment jets
-    /// against the hand timepoint packs.
+    /// recurrence + boundary term to the jet algebra is exact. Independent
+    /// finite-difference and nested-dual gates exercise the derivative channels.
     #[test]
     fn cell_moment_recurrence_jet_value_matches_numeric_932() {
         let cell = DenestedCubicCell {
@@ -4552,23 +4549,17 @@ mod moment_engine_tests {
             .evaluate_survival_denom_d(a1, g, bh, bw)
             .expect("denom");
 
-        // ── #932 SCALAR-FD ORACLE (runs FIRST, before any cmp_mat): the authoritative
-        // [q1,q1] bidirectional reference, built WITHOUT the hand bidirectional path.
+        // ── #932 scalar-FD oracle: the authoritative [q1,q1]
+        // bidirectional reference.
         //
         // `q1` (= primary.q1) enters the OBSERVED eta/chi/D only through the lifted
         // intercept a (no de-nested-cell coefficient dependence: the eta_aa·a_u² and
         // r_uv terms vanish at the q1 axis), so eta_uv_uv[q1,q1] = D_d1 D_d2(∂²_q1
         // eta_obs) is a pure chain through the intercept solve a(q1, β). Finite-
         // difference the observed scalars eta_obs/chi_obs/D as functions of the q1
-        // marginal and the (dir1, dir2)-perturbed primaries — the intercept root is
-        // bisected to 1e-12, so this is an exact oracle. The hand
-        // `compute_survival_timepoint_bidirectional` §D moving-boundary flux is still
-        // incomplete at the q1 self-block (gam#1454: 1a7801741/c8aea3f11 closed the
-        // off-q1 blocks; the q1 self-flux into `auvd12` remains short), so the gate
-        // asserts the [q1,q1] entries against THIS oracle, not the buggy moving-target
-        // hand. The probe also pins the jet's lifted intercept a_uv_uv against the
-        // scalar-FD a-Hessian — the cross-check that localized the bug to the hand,
-        // not the jet (this PROBE PASSES).
+        // marginal and the (dir1, dir2)-perturbed primaries. The intercept root is
+        // solved at every stencil point, so the oracle includes the complete moving
+        // boundary response. The probe also pins the lifted intercept itself.
         let (oracle_eta_uvuv, oracle_chi_uvuv, oracle_d_uvuv) = {
             let dir1 = Array1::from_iter(
                 (0..p).map(|c| 0.12 + 0.04 * (c as f64) - 0.01 * ((c % 2) as f64)),
@@ -4692,12 +4683,9 @@ mod moment_engine_tests {
 
             // Oracle matrices: the FULL bidirectional (a, eta, chi, D) Hessian for EVERY
             // (u,v) — the scalar-FD of the real intercept solve is ground truth at every
-            // entry, so the gate asserts the whole eta/chi/D_uv_uv matrix against it and
-            // drops the hand reference entirely (the hand §D moving-boundary has multiple
-            // #1454 incompletenesses across the matrix — q1 row/col AND the h/w blocks —
-            // so it is not a usable reference here). The Hessian is symmetric, so compute
-            // v>=u and mirror. `a`-channel diagonal [q1,q1] feeds the lifted-intercept
-            // cross-check below.
+            // entry, so the gate asserts the whole eta/chi/D_uv_uv matrix against it.
+            // The Hessian is symmetric, so compute v>=u and mirror. `a`-channel
+            // diagonal [q1,q1] feeds the lifted-intercept cross-check below.
             let mut o_eta = Array2::<f64>::zeros((p, p));
             let mut o_chi = Array2::<f64>::zeros((p, p));
             let mut o_d = Array2::<f64>::zeros((p, p));
@@ -4730,10 +4718,6 @@ mod moment_engine_tests {
             Array1::from_iter((0..p).map(|c| 0.12 + 0.04 * (c as f64) - 0.01 * ((c % 2) as f64)));
         let dir2 =
             Array1::from_iter((0..p).map(|c| -0.07 + 0.05 * ((c % 3) as f64) + 0.02 * (c as f64)));
-        // The hand bidirectional pack is intentionally NOT used as a reference for the
-        // eps_del Hessians: it has multiple #1454 §D moving-boundary incompletenesses
-        // across the matrix. The scalar-FD oracle (`oracle_*_uvuv`) is asserted instead.
-
         let template4 = Jet4::primary(0.0, usize::MAX, p, 0.0, 0.0);
         let b_jet4 = Jet4::primary(g, primary.g, p, dir1[primary.g], dir2[primary.g]);
         let du4: Vec<Jet4> = (0..p)
@@ -4757,12 +4741,8 @@ mod moment_engine_tests {
         )
         .expect("generic jet4");
 
-        // Bidirectional eps_del Hessians: assert the FULL matrix against the scalar-FD
-        // oracle (ground truth from the real intercept solve) at EVERY (u,v) — the hand
-        // bidirectional has multiple #1454 §D moving-boundary incompletenesses across the
-        // matrix (q1 row/col AND the h/w blocks), so it is dropped as a reference here.
-        // Any jet≠oracle entry beyond the (generous) FD tolerance is a REAL JET BUG and
-        // is reported in full (all failing [u,v] with jet/oracle/rel-err), not masked.
+        // Assert the full bidirectional Hessian against the scalar-FD oracle at every
+        // entry. Report every mismatch so a channel regression is immediately local.
         let cmp_mat_oracle = |label: &str, jet: &Vec<f64>, oracle: &Array2<f64>| {
             let mut fails: Vec<String> = Vec::new();
             for u in 0..p {

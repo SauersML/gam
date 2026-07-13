@@ -308,7 +308,9 @@ fn fitted_leading_coordinate_at(
         "refit beta ({}) shorter than coordinate-0 design width ({leading_width})",
         beta.len()
     );
-    (0..leading_width).map(|column| dense[[row, column]] * beta[column]).sum()
+    (0..leading_width)
+        .map(|column| dense[[row, column]] * beta[column])
+        .sum::<f64>()
 }
 
 /// The `leave_out` highest-leverage rows — where the ALO one-step correction is
@@ -349,7 +351,6 @@ fn assert_alo_matches_brute_force_loo(
 
     let mut alo_values = Vec::with_capacity(fold_rows.len());
     let mut gaps = Vec::with_capacity(fold_rows.len());
-    let mut standard_errors = Vec::with_capacity(fold_rows.len());
     for &(row, brute) in brute_force {
         let alo = diag.diagnostics.eta_tilde[row][0];
         let se = diag.diagnostics.alo_variance[row][0].sqrt();
@@ -369,7 +370,6 @@ fn assert_alo_matches_brute_force_loo(
         );
         alo_values.push(alo);
         gaps.push(gap);
-        standard_errors.push(se);
     }
 
     let alo_min = alo_values.iter().copied().fold(f64::INFINITY, f64::min);

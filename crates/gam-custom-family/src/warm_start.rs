@@ -922,6 +922,14 @@ impl CustomFamilyWarmStart {
 pub(crate) struct CustomOuterState {
     pub(crate) warm_cache: Option<ConstrainedWarmStart>,
     pub(crate) reset_warm_cache: Option<ConstrainedWarmStart>,
+    /// Exact derivative-bearing coefficient mode installed by the most recent
+    /// analytic outer evaluation.
+    ///
+    /// This is deliberately an ownership slot rather than a warm-start cache:
+    /// `CustomFamilyOwnedMode` is non-`Clone`, so fit assembly can consume the
+    /// one inner result that produced the certified objective and derivatives
+    /// without re-entering the (potentially nonconvex) coefficient solver.
+    pub(crate) terminal_mode: Option<CustomFamilyTerminalMode>,
     pub(crate) last_error: Option<String>,
     pub(crate) initial_gradient_norm: Option<f64>,
     pub(crate) outer_derivative_pilot: Option<OuterDerivativePilotSchedule>,
@@ -932,6 +940,7 @@ impl CustomOuterState {
         Self {
             warm_cache: warm_start.clone(),
             reset_warm_cache: warm_start,
+            terminal_mode: None,
             last_error: None,
             initial_gradient_norm: None,
             outer_derivative_pilot: None,
@@ -956,6 +965,7 @@ impl CustomOuterState {
             // stage's warm baseline. `run_outer_uncertified` resets before its
             // seed loop, so promote the live cache into the reset slot first.
             self.reset_warm_cache = self.warm_cache.clone();
+            self.terminal_mode = None;
             self.initial_gradient_norm = None;
             self.last_error = None;
         }
@@ -964,6 +974,22 @@ impl CustomOuterState {
 
     pub(crate) fn reset(&mut self) {
         self.warm_cache = self.reset_warm_cache.clone();
+        self.terminal_mode = None;
+    }
+
+    pub(crate) fn install_terminal_mode(
+        &mut self,
+        theta: &Array1<f64>,
+        objective: f64,
+        gradient: &Array1<f64>,
+        mode: CustomFamilyOwnedMode,
+    ) {
+        self.terminal_mode = Some(CustomFamilyTerminalMode {
+            theta: theta.clone(),
+            objective,
+            gradient: gradient.clone(),
+            mode,
+        });
     }
 
     pub(crate) fn seed_cached_beta(
@@ -993,6 +1019,18 @@ impl CustomOuterState {
         self.last_error = None;
         Ok(gam_solve::rho_optimizer::SeedOutcome::Installed)
     }
+}
+
+/// Sealed terminal payload owned by the custom-family outer objective.
+///
+/// `theta`, `objective`, and `gradient` are retained bit-for-bit beside the
+/// coefficient mode so the optimizer's certified result can be bound to the
+/// exact evaluator state before fit assembly consumes it.
+pub(crate) struct CustomFamilyTerminalMode {
+    pub(crate) theta: Array1<f64>,
+    pub(crate) objective: f64,
+    pub(crate) gradient: Array1<f64>,
+    pub(crate) mode: CustomFamilyOwnedMode,
 }
 
 pub struct CustomFamilyJointHyperResult {
