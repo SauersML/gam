@@ -1976,7 +1976,7 @@ fn compute_multiblock_alo_chunk(
         // tolerance scaled only by the already-cancelled matrix would erase
         // exactly the information needed to recognize unit deletion leverage.
         let imwa_tolerance =
-            identity_minus_product_lu_tolerance(&scratch.w_flat, &scratch.a_i, &scratch.wa, b);
+            identity_minus_product_lu_tolerance(&scratch.w_flat, &scratch.a_i, &scratch.wa, b)?;
         if !lu_factor_in_place(&mut scratch.imwa, &mut scratch.perm_imwa, b, imwa_tolerance) {
             return Err(AloError::LooComputationFailed {
                 reason: format!(
@@ -1986,7 +1986,7 @@ fn compute_multiblock_alo_chunk(
             });
         }
         let imaw_tolerance =
-            identity_minus_product_lu_tolerance(&scratch.a_i, &scratch.w_flat, &scratch.aw, b);
+            identity_minus_product_lu_tolerance(&scratch.a_i, &scratch.w_flat, &scratch.aw, b)?;
         if !lu_factor_in_place(&mut scratch.imaw, &mut scratch.perm_imaw, b, imaw_tolerance) {
             return Err(AloError::LooComputationFailed {
                 reason: format!(
@@ -2202,10 +2202,25 @@ fn identity_minus_product_lu_tolerance(
     right: &[f64],
     product: &[f64],
     b: usize,
-) -> f64 {
-    debug_assert_eq!(left.len(), b * b);
-    debug_assert_eq!(right.len(), b * b);
-    debug_assert_eq!(product.len(), b * b);
+) -> Result<f64, AloError> {
+    let expected_len = b.checked_mul(b).ok_or_else(|| AloError::InvalidInput {
+        reason: format!(
+            "multi-block ALO local deletion dimension B={b} overflows the square matrix size"
+        ),
+    })?;
+    for (name, actual_len) in [
+        ("left operand", left.len()),
+        ("right operand", right.len()),
+        ("precomputed product", product.len()),
+    ] {
+        if actual_len != expected_len {
+            return Err(AloError::InvalidInput {
+                reason: format!(
+                    "multi-block ALO local deletion {name} has length {actual_len}, expected B*B={expected_len} for B={b}"
+                ),
+            });
+        }
+    }
 
     let mut operand_envelope_inf = 0.0_f64;
     let mut system_norm_inf = 0.0_f64;
@@ -2229,8 +2244,10 @@ fn identity_minus_product_lu_tolerance(
     let formation_operations = b.saturating_mul(2).saturating_add(1);
     let elimination_operations = b.saturating_mul(3);
     let backward_error_scale = operand_envelope_inf.max(system_norm_inf);
-    (floating_point_gamma(formation_operations) + floating_point_gamma(elimination_operations))
-        * backward_error_scale
+    Ok(
+        (floating_point_gamma(formation_operations) + floating_point_gamma(elimination_operations))
+            * backward_error_scale,
+    )
 }
 
 /// LU-decompose a B × B row-major matrix in place with partial pivoting and
@@ -2638,7 +2655,8 @@ mod tests {
                 system[row * b + column] = identity - product[row * b + column];
             }
         }
-        let tolerance = identity_minus_product_lu_tolerance(left, right, &product, b);
+        let tolerance = identity_minus_product_lu_tolerance(left, right, &product, b)
+            .expect("test matrices satisfy the B-by-B local deletion contract");
         let mut permutation = vec![0; b];
         lu_factor_in_place(&mut system, &mut permutation, b, tolerance)
     }
