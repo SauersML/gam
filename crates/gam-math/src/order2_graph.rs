@@ -17,54 +17,20 @@ use std::cell::UnsafeCell;
 use crate::jet_scalar::{Order2, RuntimeJetScalar, SymmetricQuadraticCoefficients};
 
 #[derive(Clone, Copy, Debug)]
-struct GraphTerm {
-    node: usize,
-    first: f64,
-    second: f64,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum GraphNodeKind {
-    Constant,
-    Variable,
-    Add {
-        left: usize,
-        right: usize,
-    },
-    Sub {
-        left: usize,
-        right: usize,
-    },
-    Scale {
+enum CurvatureAtom {
+    Empty,
+    RankOne {
         input: usize,
-        scale: f64,
     },
-    Product {
+    Cross {
         left: usize,
         right: usize,
-    },
-    MultiplyAdd {
-        left: usize,
-        right: usize,
-        addend: usize,
-    },
-    Unary {
-        input: usize,
-        first: f64,
-        second: f64,
-    },
-    LinearTerms {
-        start: usize,
-        len: usize,
-    },
-    DiagonalTerms {
-        start: usize,
-        len: usize,
     },
     Quadratic {
-        start: usize,
+        operand_start: usize,
         len: usize,
         coefficient_start: usize,
+        support: u128,
     },
 }
 
@@ -72,35 +38,32 @@ enum GraphNodeKind {
 struct GraphNode {
     value: f64,
     support: u128,
-    kind: GraphNodeKind,
 }
 
 const MAX_PRIMARY_DIMENSION: usize = 16;
-const MAX_GRAPH_NODES: usize = 64;
-const MAX_GRAPH_TERMS: usize = 128;
+const MAX_GRAPH_NODES: usize = 32;
+const MAX_CURVATURE_ATOMS: usize = 32;
+const MAX_QUADRATIC_OPERANDS: usize = 64;
 const MAX_GRAPH_COEFFICIENTS: usize = MAX_PRIMARY_DIMENSION * MAX_PRIMARY_DIMENSION;
-const EMPTY_TERM: GraphTerm = GraphTerm {
-    node: 0,
-    first: 0.0,
-    second: 0.0,
-};
 const EMPTY_NODE: GraphNode = GraphNode {
     value: 0.0,
     support: 0,
-    kind: GraphNodeKind::Constant,
 };
+const EMPTY_ATOM: CurvatureAtom = CurvatureAtom::Empty;
 
 #[derive(Debug)]
 struct GraphTape {
     dimension: usize,
     node_len: usize,
-    term_len: usize,
+    atom_len: usize,
+    operand_len: usize,
     coefficient_len: usize,
     nodes: [GraphNode; MAX_GRAPH_NODES],
     gradients: [f64; MAX_GRAPH_NODES * MAX_PRIMARY_DIMENSION],
-    terms: [GraphTerm; MAX_GRAPH_TERMS],
+    hessian_weights: [f64; MAX_GRAPH_NODES * MAX_CURVATURE_ATOMS],
+    atoms: [CurvatureAtom; MAX_CURVATURE_ATOMS],
+    quadratic_operands: [usize; MAX_QUADRATIC_OPERANDS],
     coefficients: [f64; MAX_GRAPH_COEFFICIENTS],
-    adjoints: [f64; MAX_GRAPH_NODES],
 }
 
 impl GraphTape {
@@ -108,13 +71,15 @@ impl GraphTape {
         Self {
             dimension: 0,
             node_len: 0,
-            term_len: 0,
+            atom_len: 0,
+            operand_len: 0,
             coefficient_len: 0,
             nodes: [EMPTY_NODE; MAX_GRAPH_NODES],
             gradients: [0.0; MAX_GRAPH_NODES * MAX_PRIMARY_DIMENSION],
-            terms: [EMPTY_TERM; MAX_GRAPH_TERMS],
+            hessian_weights: [0.0; MAX_GRAPH_NODES * MAX_CURVATURE_ATOMS],
+            atoms: [EMPTY_ATOM; MAX_CURVATURE_ATOMS],
+            quadratic_operands: [0; MAX_QUADRATIC_OPERANDS],
             coefficients: [0.0; MAX_GRAPH_COEFFICIENTS],
-            adjoints: [0.0; MAX_GRAPH_NODES],
         }
     }
 }
@@ -153,7 +118,8 @@ impl Order2GraphWorkspace {
         let tape = self.tape.get_mut().as_mut();
         tape.dimension = dimension;
         tape.node_len = 0;
-        tape.term_len = 0;
+        tape.atom_len = 0;
+        tape.operand_len = 0;
         tape.coefficient_len = 0;
     }
 
