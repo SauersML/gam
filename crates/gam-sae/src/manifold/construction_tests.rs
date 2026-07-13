@@ -249,11 +249,6 @@ mod amortized_encoder_tests {
             .sparse_flat_index()
             .expect("the softmax fixture must carry a live sparse log-strength coordinate");
         coord_indices.push(sparse_index);
-        assert!(
-            analytic[[sparse_index, sparse_index]].abs() > 1.0e-6,
-            "sparse log-strength logdet curvature must be non-trivial: {}",
-            analytic[[sparse_index, sparse_index]]
-        );
 
         // Non-vacuity: a smoothing AND an ARD diagonal must carry real curvature,
         // else the gate would pass on an all-zero block.
@@ -339,6 +334,24 @@ mod amortized_encoder_tests {
             }
             v
         };
+        // The sparse (softmax log-strength) channel must be LIVE on this fixture,
+        // else its row of the gate is vacuous. Assert on the GRADIENT channel, not
+        // on the Hessian entry: the Hessian entry is allowed to be small (the joint
+        // and coordinate-block legs can cancel), but a dead gradient channel would
+        // mean the fixture never exercises the sparse operator at all.
+        let base_trace = logdet_trace_at(0.0, sparse_index);
+        eprintln!(
+            "CH4 sparse diagnostics: logdet_trace[sparse]={:.6e}, H[sparse,sparse]={:.6e}",
+            base_trace[sparse_index],
+            analytic[[sparse_index, sparse_index]]
+        );
+        assert!(
+            base_trace[sparse_index].abs() > 1.0e-6,
+            "the sparse log-strength logdet channel must be live on this fixture, else its \
+             row of this gate is vacuous: logdet_trace[sparse]={}",
+            base_trace[sparse_index]
+        );
+
         for &j in &coord_indices {
             let fd_col = (logdet_trace_at(1.0, j) - logdet_trace_at(-1.0, j)) / (2.0 * h);
             for &i in &coord_indices {
