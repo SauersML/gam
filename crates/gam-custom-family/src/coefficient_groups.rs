@@ -10,7 +10,8 @@
 
 use super::{
     CoefficientBlockSelector, CoefficientGroupSpec, CustomFamilyError, ParameterBlockSpec,
-    PenaltyMatrix, RealizedCoefficientGroup, RealizedCoefficientGroupSpecs, validate_blockspecs,
+    PenaltyMatrix, RealizedCoefficientGroup, RealizedCoefficientGroupSpecs,
+    penalty_label_layout_with_joint, resolved_physical_penalty_label, validate_blockspecs,
 };
 use ndarray::{Array1, Array2};
 use std::collections::{BTreeMap, BTreeSet};
