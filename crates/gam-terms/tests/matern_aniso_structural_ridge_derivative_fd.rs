@@ -8,8 +8,9 @@
 //! validate one basis-level invariant.
 
 use gam_terms::basis::{
-    BasisWorkspace, CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu,
-    PenaltySource, build_matern_basis_log_kappa_aniso_derivatives, build_matern_basiswithworkspace,
+    ActivePenalty, BasisWorkspace, CenterStrategy, MaternBasisSpec, MaternIdentifiability,
+    MaternNu, PenaltySource, build_matern_basis_log_kappa_aniso_derivatives,
+    build_matern_basiswithworkspace,
 };
 use ndarray::{Array2, array};
 
@@ -57,11 +58,11 @@ fn fixture() -> (Array2<f64>, MaternBasisSpec, Vec<f64>) {
     (data, spec, psi)
 }
 
-fn realized_penalties_at_psi(
+fn realized_active_penalties_at_psi(
     data: &Array2<f64>,
     spec: &MaternBasisSpec,
     psi: &[f64],
-) -> Vec<Array2<f64>> {
+) -> Vec<ActivePenalty> {
     let (length_scale, eta) = psi_to_length_scale_and_eta(psi);
     let mut trial = spec.clone();
     trial.length_scale = length_scale;
@@ -69,9 +70,15 @@ fn realized_penalties_at_psi(
     build_matern_basiswithworkspace(data.view(), &trial, &mut BasisWorkspace::default())
         .expect("realized anisotropic Matérn value build")
         .active_penalties
-        .iter()
-        .map(|penalty| penalty.matrix.clone())
-        .collect()
+}
+
+fn structural_ridge_at(active_penalties: &[ActivePenalty], ridge_index: usize) -> &ActivePenalty {
+    let ridge = &active_penalties[ridge_index];
+    assert!(
+        matches!(ridge.info.source, PenaltySource::DoublePenaltyNullspace),
+        "active penalty index {ridge_index} must remain the structural-ridge coordinate"
+    );
+    ridge
 }
 
 fn max_abs(matrix: &Array2<f64>) -> f64 {
@@ -111,7 +118,7 @@ fn matern_aniso_nonorthogonal_structural_ridge_jet_matches_central_finite_differ
         .iter()
         .position(|penalty| matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace))
         .expect("explicit intercept must emit an active structural ridge");
-    let ridge = &base.active_penalties[ridge_index].matrix;
+    let ridge = &structural_ridge_at(&base.active_penalties, ridge_index).matrix;
     let intercept_column = ridge.ncols() - 1;
     let kernel_intercept_overlap = (0..intercept_column)
         .map(|column| ridge[[column, intercept_column]].abs())
@@ -147,34 +154,38 @@ fn matern_aniso_nonorthogonal_structural_ridge_jet_matches_central_finite_differ
     psi_first_plus[0] += first_step;
     let mut psi_first_minus = psi.clone();
     psi_first_minus[0] -= first_step;
-    let first_plus = realized_penalties_at_psi(&data, &spec, &psi_first_plus);
-    let first_minus = realized_penalties_at_psi(&data, &spec, &psi_first_minus);
-    let fd_first = (&first_plus[ridge_index] - &first_minus[ridge_index]) / (2.0 * first_step);
+    let first_plus = realized_active_penalties_at_psi(&data, &spec, &psi_first_plus);
+    let first_minus = realized_active_penalties_at_psi(&data, &spec, &psi_first_minus);
+    let fd_first = (&structural_ridge_at(&first_plus, ridge_index).matrix
+        - &structural_ridge_at(&first_minus, ridge_index).matrix)
+        / (2.0 * first_step);
 
     let second_step = 2.0e-4;
     let mut psi_second_plus = psi.clone();
     psi_second_plus[0] += second_step;
     let mut psi_second_minus = psi.clone();
     psi_second_minus[0] -= second_step;
-    let second_plus = realized_penalties_at_psi(&data, &spec, &psi_second_plus);
-    let second_minus = realized_penalties_at_psi(&data, &spec, &psi_second_minus);
-    let fd_second = (&second_plus[ridge_index]
-        - &(&base.active_penalties[ridge_index].matrix * 2.0)
-        + &second_minus[ridge_index])
+    let second_plus = realized_active_penalties_at_psi(&data, &spec, &psi_second_plus);
+    let second_minus = realized_active_penalties_at_psi(&data, &spec, &psi_second_minus);
+    let fd_second = (&structural_ridge_at(&second_plus, ridge_index).matrix
+        - &(&structural_ridge_at(&base.active_penalties, ridge_index).matrix * 2.0)
+        + &structural_ridge_at(&second_minus, ridge_index).matrix)
         / (second_step * second_step);
 
     let corner = |axis_a_sign: f64, axis_b_sign: f64| {
         let mut point = psi.clone();
         point[0] += axis_a_sign * second_step;
         point[1] += axis_b_sign * second_step;
-        realized_penalties_at_psi(&data, &spec, &point)
+        realized_active_penalties_at_psi(&data, &spec, &point)
     };
     let plus_plus = corner(1.0, 1.0);
     let plus_minus = corner(1.0, -1.0);
     let minus_plus = corner(-1.0, 1.0);
     let minus_minus = corner(-1.0, -1.0);
-    let fd_cross = (&plus_plus[ridge_index] - &plus_minus[ridge_index] - &minus_plus[ridge_index]
-        + &minus_minus[ridge_index])
+    let fd_cross = (&structural_ridge_at(&plus_plus, ridge_index).matrix
+        - &structural_ridge_at(&plus_minus, ridge_index).matrix
+        - &structural_ridge_at(&minus_plus, ridge_index).matrix
+        + &structural_ridge_at(&minus_minus, ridge_index).matrix)
         / (4.0 * second_step * second_step);
 
     let analytic_first = &derivatives.penalties_first[0][ridge_index];

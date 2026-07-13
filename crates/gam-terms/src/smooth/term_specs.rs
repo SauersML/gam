@@ -2253,12 +2253,34 @@ impl KroneckerPenaltySystem {
 
 #[cfg(test)]
 mod joint_unpenalized_dim_tests {
-    use super::joint_unpenalized_dim;
+    use super::{ActivePenalty, ActivePenaltyInfo, PenaltySource, joint_unpenalized_dim};
     use ndarray::{Array2, array};
+
+    fn active_penalty(
+        matrix: Array2<f64>,
+        effective_rank: usize,
+        nullity: usize,
+        original_index: usize,
+        source: PenaltySource,
+    ) -> ActivePenalty {
+        ActivePenalty {
+            matrix,
+            nullity,
+            null_eigenvectors: None,
+            op: None,
+            info: ActivePenaltyInfo {
+                source,
+                original_index,
+                effective_rank,
+                normalization_scale: 1.0,
+                kronecker_factors: None,
+            },
+        }
+    }
 
     #[test]
     fn no_penalty_is_fully_unpenalized() {
-        assert_eq!(joint_unpenalized_dim(4, &[], &[]), 4);
+        assert_eq!(joint_unpenalized_dim(4, &[]), 4);
     }
 
     #[test]
@@ -2266,7 +2288,8 @@ mod joint_unpenalized_dim_tests {
         // A 3×3 penalty that penalizes only the last coordinate ⇒ 2-dim null
         // space (the first two coordinates are unpenalized).
         let s = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 5.0]];
-        assert_eq!(joint_unpenalized_dim(3, std::slice::from_ref(&s), &[2]), 2);
+        let penalties = [active_penalty(s, 1, 2, 0, PenaltySource::Primary)];
+        assert_eq!(joint_unpenalized_dim(3, &penalties), 2);
     }
 
     #[test]
@@ -2279,7 +2302,11 @@ mod joint_unpenalized_dim_tests {
         // someone, so the joint unpenalized dim is 0.
         let bending = array![[0.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 4.0]];
         let ridge = array![[2.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
-        assert_eq!(joint_unpenalized_dim(3, &[bending, ridge], &[1, 2]), 0);
+        let penalties = [
+            active_penalty(bending, 2, 1, 0, PenaltySource::Primary),
+            active_penalty(ridge, 1, 2, 1, PenaltySource::DoublePenaltyNullspace),
+        ];
+        assert_eq!(joint_unpenalized_dim(3, &penalties), 0);
     }
 
     #[test]
@@ -2289,7 +2316,11 @@ mod joint_unpenalized_dim_tests {
         // even though naively summing the per-penalty dims would give 4.
         let a = array![[0.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 0.0]];
         let b = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 3.0]];
-        assert_eq!(joint_unpenalized_dim(3, &[a, b], &[2, 2]), 1);
+        let penalties = [
+            active_penalty(a, 1, 2, 0, PenaltySource::Primary),
+            active_penalty(b, 1, 2, 1, PenaltySource::OperatorStiffness),
+        ];
+        assert_eq!(joint_unpenalized_dim(3, &penalties), 1);
     }
 
     #[test]
@@ -2299,15 +2330,26 @@ mod joint_unpenalized_dim_tests {
         // dim is 0 (never over-rejecting).
         let full: Array2<f64> = array![[0.0, 0.0], [0.0, 1.0]];
         let factor: Array2<f64> = array![[1.0]]; // wrong shape for p_local=2
-        assert_eq!(
-            joint_unpenalized_dim(2, &[full, factor.clone()], &[1, 0]),
-            0
-        );
+        let mixed_penalties = [
+            active_penalty(full, 1, 1, 0, PenaltySource::Primary),
+            active_penalty(
+                factor.clone(),
+                2,
+                0,
+                1,
+                PenaltySource::TensorMarginal { dim: 0 },
+            ),
+        ];
+        assert_eq!(joint_unpenalized_dim(2, &mixed_penalties), 0);
         // With a single non-materialized penalty, fall back to its own null dim.
-        assert_eq!(
-            joint_unpenalized_dim(4, std::slice::from_ref(&factor), &[2]),
-            2
-        );
+        let factor_penalties = [active_penalty(
+            factor,
+            2,
+            2,
+            0,
+            PenaltySource::TensorMarginal { dim: 0 },
+        )];
+        assert_eq!(joint_unpenalized_dim(4, &factor_penalties), 2);
     }
 }
 

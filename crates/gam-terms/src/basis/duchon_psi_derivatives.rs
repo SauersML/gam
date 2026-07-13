@@ -2060,11 +2060,11 @@ mod end_to_end_1604_tests {
                 panic!("d=1 hybrid Duchon power={power} build rejected (gam#1604): {e}")
             });
             assert!(
-                !result.penalties.is_empty(),
+                !result.active_penalties.is_empty(),
                 "d=1 hybrid Duchon power={power} produced no penalty"
             );
-            for (k, pen) in result.penalties.iter().enumerate() {
-                let sym = symmetrize_penalty(pen);
+            for (k, penalty) in result.active_penalties.iter().enumerate() {
+                let sym = symmetrize_penalty(&penalty.matrix);
                 let (evals, _) =
                     FaerEigh::eigh(&sym, faer::Side::Lower).expect("symmetric eigendecomposition");
                 let lam_min = evals.iter().copied().fold(f64::INFINITY, f64::min);
