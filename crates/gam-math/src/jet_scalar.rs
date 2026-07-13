@@ -1027,8 +1027,8 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
                 gradient[primary] += stack[1] * input.g[primary];
                 for other in primary..dimension {
                     let index = primary * dimension + other;
-                    hessian[index] += stack[1] * input.h[index]
-                        + stack[2] * input.g[primary] * input.g[other];
+                    hessian[index] +=
+                        stack[1] * input.h[index] + stack[2] * input.g[primary] * input.g[other];
                 }
             }
         }
@@ -2495,9 +2495,8 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
         let mut out = crate::jet_tower::Tower2::zero();
         out.v = self.0.v * right.0.v + addend.0.v;
         for primary in 0..K {
-            out.g[primary] = self.0.v * right.0.g[primary]
-                + self.0.g[primary] * right.0.v
-                + addend.0.g[primary];
+            out.g[primary] =
+                self.0.v * right.0.g[primary] + self.0.g[primary] * right.0.v + addend.0.g[primary];
             for other in primary..K {
                 let channel = self.0.v * right.0.h[primary][other]
                     + self.0.g[primary] * right.0.g[other]
@@ -3466,10 +3465,7 @@ impl<const K: usize> crate::nested_dual::JetField for OneSeed<K> {
         let mut eps = crate::jet_tower::Tower2::<K>::zero();
         eps.v = ab.v * be.v + ae.v * bb.v;
         for i in 0..K {
-            eps.g[i] = ab.v * be.g[i]
-                + ab.g[i] * be.v
-                + ae.v * bb.g[i]
-                + ae.g[i] * bb.v;
+            eps.g[i] = ab.v * be.g[i] + ab.g[i] * be.v + ae.v * bb.g[i] + ae.g[i] * bb.v;
         }
         for i in 0..K {
             for j in i..K {
@@ -3518,8 +3514,7 @@ impl<const K: usize> crate::nested_dual::JetField for OneSeed<K> {
         for i in 0..K {
             for j in i..K {
                 let channel = d[1] * e.h[i][j]
-                    + d[2]
-                        * (b.g[i] * e.g[j] + b.g[j] * e.g[i] + b.h[i][j] * e.v)
+                    + d[2] * (b.g[i] * e.g[j] + b.g[j] * e.g[i] + b.h[i][j] * e.v)
                     + d[3] * b.g[i] * b.g[j] * e.v;
                 eps.h[i][j] = channel;
                 eps.h[j][i] = channel;
@@ -3622,25 +3617,23 @@ impl<L: Lane, const K: usize> OneSeedLane<L, K> {
         let be = &o.eps;
         let mut eps = Order2Lane::constant(ab.v.mul(be.v).add(ae.v.mul(bb.v)));
         for i in 0..K {
-            eps.g[i] = ab
-                .v
-                .mul(be.g[i])
-                .add(ab.g[i].mul(be.v))
-                .add(ae.v.mul(bb.g[i]))
-                .add(ae.g[i].mul(bb.v));
+            eps.g[i] =
+                ab.v.mul(be.g[i])
+                    .add(ab.g[i].mul(be.v))
+                    .add(ae.v.mul(bb.g[i]))
+                    .add(ae.g[i].mul(bb.v));
         }
         for i in 0..K {
             for j in i..K {
-                let channel = ab
-                    .v
-                    .mul(be.h[i][j])
-                    .add(ab.g[i].mul(be.g[j]))
-                    .add(ab.g[j].mul(be.g[i]))
-                    .add(ab.h[i][j].mul(be.v))
-                    .add(ae.v.mul(bb.h[i][j]))
-                    .add(ae.g[i].mul(bb.g[j]))
-                    .add(ae.g[j].mul(bb.g[i]))
-                    .add(ae.h[i][j].mul(bb.v));
+                let channel =
+                    ab.v.mul(be.h[i][j])
+                        .add(ab.g[i].mul(be.g[j]))
+                        .add(ab.g[j].mul(be.g[i]))
+                        .add(ab.h[i][j].mul(be.v))
+                        .add(ae.v.mul(bb.h[i][j]))
+                        .add(ae.g[i].mul(bb.g[j]))
+                        .add(ae.g[j].mul(bb.g[i]))
+                        .add(ae.h[i][j].mul(bb.v));
                 eps.h[i][j] = channel;
                 eps.h[j][i] = channel;
             }
@@ -3685,8 +3678,7 @@ impl<L: Lane, const K: usize> OneSeedLane<L, K> {
         }
         for i in 0..K {
             for j in i..K {
-                let mixed = b
-                    .g[i]
+                let mixed = b.g[i]
                     .mul(e.g[j])
                     .add(b.g[j].mul(e.g[i]))
                     .add(b.h[i][j].mul(e.v));
@@ -4363,6 +4355,30 @@ mod tests {
             JetField::add,
             JetField::scale,
         );
+        let derivative_stacks = [
+            [0.8, -0.3, 0.7, 0.0, 0.0],
+            [-0.2, 1.1, -0.4, 0.0, 0.0],
+            [1.4, 0.25, 0.6, 0.0, 0.0],
+        ];
+        let fixed_add_direct = fixed_inputs[0].add_constant(0.65);
+        let fixed_add_scalar = fixed_inputs[0].add(&Order2::constant(0.65));
+        let fixed_multiply_add_direct =
+            fixed_inputs[0].multiply_add(&fixed_inputs[1], &fixed_inputs[2]);
+        let fixed_multiply_add_scalar = multiply_add_default(
+            &fixed_inputs[0],
+            &fixed_inputs[1],
+            &fixed_inputs[2],
+            JetField::mul,
+            JetField::add,
+        );
+        let fixed_composed_direct = Order2::composed_sum(&fixed_inputs, &derivative_stacks);
+        let fixed_composed_scalar = composed_sum_default(
+            &fixed_inputs,
+            &derivative_stacks,
+            Order2::constant,
+            JetField::add,
+            JetField::compose_unary,
+        );
 
         let arena = DynamicJetArena::new();
         let dynamic_vars: [DynamicOrder2<'_>; K] =
@@ -4391,6 +4407,26 @@ mod tests {
             RuntimeJetScalar::add,
             RuntimeJetScalar::scale,
         );
+        let dynamic_add_direct = dynamic_inputs[0].add_constant(0.65, &arena);
+        let dynamic_add_scalar = dynamic_inputs[0].add(&DynamicOrder2::constant(0.65, K, &arena));
+        let dynamic_multiply_add_direct =
+            dynamic_inputs[0].multiply_add(&dynamic_inputs[1], &dynamic_inputs[2]);
+        let dynamic_multiply_add_scalar = multiply_add_default(
+            &dynamic_inputs[0],
+            &dynamic_inputs[1],
+            &dynamic_inputs[2],
+            RuntimeJetScalar::mul,
+            RuntimeJetScalar::add,
+        );
+        let dynamic_composed_direct =
+            DynamicOrder2::composed_sum(&dynamic_inputs, &derivative_stacks, K, &arena);
+        let dynamic_composed_scalar = composed_sum_default(
+            &dynamic_inputs,
+            &derivative_stacks,
+            |value| DynamicOrder2::constant(value, K, &arena),
+            RuntimeJetScalar::add,
+            RuntimeJetScalar::compose_unary,
+        );
 
         let tolerance = 2.0e-13;
         for (label, actual, expected) in [
@@ -4409,6 +4445,36 @@ mod tests {
                 "dynamic linear value",
                 dynamic_linear_direct.value(),
                 dynamic_linear_scalar.value(),
+            ),
+            (
+                "fixed add-constant value",
+                fixed_add_direct.value(),
+                fixed_add_scalar.value(),
+            ),
+            (
+                "dynamic add-constant value",
+                dynamic_add_direct.value(),
+                dynamic_add_scalar.value(),
+            ),
+            (
+                "fixed multiply-add value",
+                fixed_multiply_add_direct.value(),
+                fixed_multiply_add_scalar.value(),
+            ),
+            (
+                "dynamic multiply-add value",
+                dynamic_multiply_add_direct.value(),
+                dynamic_multiply_add_scalar.value(),
+            ),
+            (
+                "fixed composed-sum value",
+                fixed_composed_direct.value(),
+                fixed_composed_scalar.value(),
+            ),
+            (
+                "dynamic composed-sum value",
+                dynamic_composed_direct.value(),
+                dynamic_composed_scalar.value(),
             ),
         ] {
             assert!(
@@ -4438,6 +4504,36 @@ mod tests {
                     dynamic_linear_direct.g()[primary_a],
                     dynamic_linear_scalar.g()[primary_a],
                 ),
+                (
+                    "fixed add-constant gradient",
+                    fixed_add_direct.g()[primary_a],
+                    fixed_add_scalar.g()[primary_a],
+                ),
+                (
+                    "dynamic add-constant gradient",
+                    dynamic_add_direct.g()[primary_a],
+                    dynamic_add_scalar.g()[primary_a],
+                ),
+                (
+                    "fixed multiply-add gradient",
+                    fixed_multiply_add_direct.g()[primary_a],
+                    fixed_multiply_add_scalar.g()[primary_a],
+                ),
+                (
+                    "dynamic multiply-add gradient",
+                    dynamic_multiply_add_direct.g()[primary_a],
+                    dynamic_multiply_add_scalar.g()[primary_a],
+                ),
+                (
+                    "fixed composed-sum gradient",
+                    fixed_composed_direct.g()[primary_a],
+                    fixed_composed_scalar.g()[primary_a],
+                ),
+                (
+                    "dynamic composed-sum gradient",
+                    dynamic_composed_direct.g()[primary_a],
+                    dynamic_composed_scalar.g()[primary_a],
+                ),
             ] {
                 assert!(
                     (actual - expected).abs()
@@ -4466,6 +4562,36 @@ mod tests {
                         "dynamic linear Hessian",
                         dynamic_linear_direct.h_at(primary_a, primary_b),
                         dynamic_linear_scalar.h_at(primary_a, primary_b),
+                    ),
+                    (
+                        "fixed add-constant Hessian",
+                        fixed_add_direct.h()[primary_a][primary_b],
+                        fixed_add_scalar.h()[primary_a][primary_b],
+                    ),
+                    (
+                        "dynamic add-constant Hessian",
+                        dynamic_add_direct.h_at(primary_a, primary_b),
+                        dynamic_add_scalar.h_at(primary_a, primary_b),
+                    ),
+                    (
+                        "fixed multiply-add Hessian",
+                        fixed_multiply_add_direct.h()[primary_a][primary_b],
+                        fixed_multiply_add_scalar.h()[primary_a][primary_b],
+                    ),
+                    (
+                        "dynamic multiply-add Hessian",
+                        dynamic_multiply_add_direct.h_at(primary_a, primary_b),
+                        dynamic_multiply_add_scalar.h_at(primary_a, primary_b),
+                    ),
+                    (
+                        "fixed composed-sum Hessian",
+                        fixed_composed_direct.h()[primary_a][primary_b],
+                        fixed_composed_scalar.h()[primary_a][primary_b],
+                    ),
+                    (
+                        "dynamic composed-sum Hessian",
+                        dynamic_composed_direct.h_at(primary_a, primary_b),
+                        dynamic_composed_scalar.h_at(primary_a, primary_b),
                     ),
                 ] {
                     assert!(
@@ -4908,10 +5034,7 @@ mod tests {
             let fused_product = left.mul(&right);
             let unfused_product = OneSeed {
                 base: left.base.mul(&right.base),
-                eps: left
-                    .base
-                    .mul(&right.eps)
-                    .add(&left.eps.mul(&right.base)),
+                eps: left.base.mul(&right.eps).add(&left.eps.mul(&right.base)),
             };
             assert_channels_close(
                 &format!("sample {sample} product"),
