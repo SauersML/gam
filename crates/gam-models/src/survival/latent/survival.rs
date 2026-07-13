@@ -1819,9 +1819,9 @@ fn latent_kernel_sum_order2_parts<const K: usize>(
 /// `(S_u/S, S_au/S, S_abu/S)`, and the two-seed cross part carries
 /// `(S_uv/S, S_auv/S, S_abuv/S)`. For each requested output channel we expose
 /// those moments as a four-slot derivative table `(a,b,u,v)` and let the shared
-/// compensated Faà-di-Bruno reducer perform `log` composition. This avoids the
-/// severe tail cancellation caused by composing projected `Order2` products in
-/// stages, while retaining one recurrence, one moment layout, and one general
+/// compensated truncated-Taylor reducer perform `log` composition. This avoids
+/// the severe tail cancellation caused by composing projected `Order2` products
+/// in stages, while retaining one recurrence, one moment layout, and one general
 /// composition rule for Order2, OneSeed, and TwoSeed.
 fn latent_kernel_normalized_log_parts<const K: usize>(
     base_log_sum: f64,
@@ -1830,13 +1830,8 @@ fn latent_kernel_normalized_log_parts<const K: usize>(
 ) -> [Order2<K>; 4] {
     assert!(matches!(part_count, 1 | 2 | 4));
     let log_stack = latent_unary_derivatives_log(1.0);
-    let log_derivative = |moments: &[f64; 16], positions: &[usize]| {
-        gam_math::jet_algebra::faa_di_bruno_compensated(positions, &log_stack, |block| {
-            let mask = block
-                .iter()
-                .fold(0usize, |mask, &slot| mask | (1usize << slot));
-            moments[mask]
-        })
+    let compose_log = |moments: [f64; 16]| {
+        gam_math::jet_partitions::compose_unary_four_slot_coefficients(moments, log_stack)
     };
     let moments_for = |a: usize, b: usize| {
         let base = &normalized_parts[0].0;
@@ -1870,29 +1865,29 @@ fn latent_kernel_normalized_log_parts<const K: usize>(
     }
     if part_count == 4 {
         out[2].0.v = normalized_parts[2].0.v;
-        let moments = moments_for(0, 0);
-        out[3].0.v = log_derivative(&moments, &[2, 3]);
+        let composed = compose_log(moments_for(0, 0));
+        out[3].0.v = composed[0b1100];
     }
 
     for a in 0..K {
-        let moments = moments_for(a, a);
-        out[0].0.g[a] = moments[1];
+        let composed = compose_log(moments_for(a, a));
+        out[0].0.g[a] = composed[0b0001];
         if part_count >= 2 {
-            out[1].0.g[a] = log_derivative(&moments, &[0, 2]);
+            out[1].0.g[a] = composed[0b0101];
         }
         if part_count == 4 {
-            out[2].0.g[a] = log_derivative(&moments, &[0, 3]);
-            out[3].0.g[a] = log_derivative(&moments, &[0, 2, 3]);
+            out[2].0.g[a] = composed[0b1001];
+            out[3].0.g[a] = composed[0b1101];
         }
         for b in a..K {
-            let moments = moments_for(a, b);
-            out[0].0.h[a][b] = log_derivative(&moments, &[0, 1]);
+            let composed = compose_log(moments_for(a, b));
+            out[0].0.h[a][b] = composed[0b0011];
             if part_count >= 2 {
-                out[1].0.h[a][b] = log_derivative(&moments, &[0, 1, 2]);
+                out[1].0.h[a][b] = composed[0b0111];
             }
             if part_count == 4 {
-                out[2].0.h[a][b] = log_derivative(&moments, &[0, 1, 3]);
-                out[3].0.h[a][b] = log_derivative(&moments, &[0, 1, 2, 3]);
+                out[2].0.h[a][b] = composed[0b1011];
+                out[3].0.h[a][b] = composed[0b1111];
             }
             for part in 0..part_count {
                 out[part].0.h[b][a] = out[part].0.h[a][b];

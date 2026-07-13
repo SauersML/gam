@@ -198,42 +198,46 @@ impl MultiDirJet {
         if count <= 1 {
             return <Self as crate::jet_algebra::JetAlgebra<DERIVS>>::compose_unary(self, derivs);
         }
-        // Per-block Taylor coefficients c_k = f^{(k)} / k!  (k = 1..=4): the
-        // `1/k!` undoes the ordered-tuple overcount of the subset-convolution
-        // power v^{⊛k} relative to the unordered set-partition sum.
-        let c1 = derivs[1];
-        let c2 = derivs[2] * 0.5;
-        let c3 = derivs[3] * (1.0 / 6.0);
-        let c4 = derivs[4] * (1.0 / 24.0);
-
         let mut out = vec![0.0; count];
         COMPOSE_SCRATCH.with(|cell| {
             let mut buf = cell.borrow_mut();
-            // Four contiguous scratch lanes: v, p2 = v², p3 = v³, p4 = v⁴.
             buf.clear();
             buf.resize(4 * count, 0.0);
-            let (vbuf, rest) = buf.split_at_mut(count);
-            let (p2, rest) = rest.split_at_mut(count);
-            let (p3, p4) = rest.split_at_mut(count);
-
-            // v = non-constant part of self (the constant channel squares to a
-            // 0-block, which the k = 0 term carries separately).
-            vbuf.copy_from_slice(&self.coeffs);
-            vbuf[0] = 0.0;
-
-            // Powers via compensated subset convolution, pruned by output
-            // popcount: v^{⊛k}[mask] = 0 whenever popcount(mask) < k.
-            subset_conv_into(vbuf, vbuf, p2, 2);
-            subset_conv_into(p2, vbuf, p3, 3);
-            subset_conv_into(p2, p2, p4, 4);
-
-            // out[mask] = c1·v + c2·v² + c3·v³ + c4·v⁴ (mask ≠ 0), Neumaier-
-            // compensated and f64x4-vectorised over masks. out[0] = f^{(0)}.
-            combine_powers(vbuf, p2, p3, p4, [c1, c2, c3, c4], &mut out);
-            out[0] = derivs[0];
+            compose_unary_coefficients_into(
+                &self.coeffs,
+                derivs,
+                buf.as_mut_slice(),
+                &mut out,
+            );
         });
         Self { coeffs: out }
     }
+}
+
+/// Compose a four-slot multilinear coefficient table through one unary
+/// derivative stack without constructing an owned [`MultiDirJet`].
+///
+/// This is the allocation-free fixed-width entry point to the exact same
+/// compensated truncated-Taylor/subset-convolution schedule used by
+/// [`MultiDirJet::compose_unary`]. Slot-mask `m` in the returned array is the
+/// derivative for the corresponding subset of the four input slots. It exists
+/// for packed analytic primitives that already own their normalized derivative
+/// table and need the shared, double-double-graded composition arithmetic
+/// without adopting the oracle's heap-backed storage layout.
+#[inline]
+pub fn compose_unary_four_slot_coefficients(
+    coefficients: [f64; 16],
+    derivs: [f64; 5],
+) -> [f64; 16] {
+    let mut scratch = [0.0f64; 64];
+    let mut out = [0.0f64; 16];
+    compose_unary_coefficients_into(
+        &coefficients,
+        derivs,
+        &mut scratch,
+        &mut out,
+    );
+    out
 }
 
 thread_local! {
@@ -241,6 +245,42 @@ thread_local! {
     /// demand and never freed, so a steady-state `compose_unary` does zero heap
     /// work beyond the owned output `Vec`.
     static COMPOSE_SCRATCH: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+}
+
+#[inline]
+fn compose_unary_coefficients_into(
+    coefficients: &[f64],
+    derivs: [f64; DERIVS],
+    scratch: &mut [f64],
+    out: &mut [f64],
+) {
+    let count = coefficients.len();
+    assert!(count > 1 && count.is_power_of_two());
+    assert!(scratch.len() == 4 * count && out.len() == count);
+    let (vbuf, rest) = scratch.split_at_mut(count);
+    let (p2, rest) = rest.split_at_mut(count);
+    let (p3, p4) = rest.split_at_mut(count);
+
+    // v is the non-constant part of the input. The k=0 Taylor term owns the
+    // constant coefficient, so the zero mask must not enter any power.
+    vbuf.copy_from_slice(coefficients);
+    vbuf[0] = 0.0;
+
+    // These three compensated subset convolutions are the unique Motzkin-floor
+    // schedule for the degree-four truncated Taylor polynomial.
+    subset_conv_into(vbuf, vbuf, p2, 2);
+    subset_conv_into(p2, vbuf, p3, 3);
+    subset_conv_into(p2, p2, p4, 4);
+    // `1/k!` undoes the ordered-tuple overcount of each k-fold subset power
+    // relative to the unordered set-partition sum.
+    let coefficients_by_order = [
+        derivs[1],
+        derivs[2] * 0.5,
+        derivs[3] * (1.0 / 6.0),
+        derivs[4] * (1.0 / 24.0),
+    ];
+    combine_powers(vbuf, p2, p3, p4, coefficients_by_order, out);
+    out[0] = derivs[0];
 }
 
 /// Branchless TwoSum: returns `(s, e)` with `s = fl(a+b)` and `a+b = s+e`
