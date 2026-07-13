@@ -549,7 +549,21 @@ impl LatentManifold {
                     }
                     offset += dim;
                 }
-                assert_eq!(offset, g.len());
+                // The per-part ambient widths (`part.ambient_dim(1)`) must tile
+                // `g` exactly. This holds because every `Product` is built in
+                // expanded scalar-factor form — a multi-dimensional Euclidean
+                // atom is stored as `d` single-axis `Euclidean` children, never
+                // one `d`-wide `Euclidean` (which `ambient_dim(1)` would
+                // under-count as one axis, mis-tiling a mixed-dimension composite
+                // and firing here — the #2295 zoo-fit panic). See
+                // `SaeManifoldTerm::append_coordinate_manifold_parts`.
+                assert_eq!(
+                    offset,
+                    g.len(),
+                    "Product factor ambient widths ({offset}) must tile the gradient ({}); a \
+                     Product must be in expanded scalar-factor form (see #2295)",
+                    g.len()
+                );
                 out
             }
         }
@@ -1708,6 +1722,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression for #2295: a composite `Product` mixing a d=1 factor with a
+    /// d=2 factor must split the flat gradient at the correct per-part offsets
+    /// (each factor is projected at ITS OWN ambient width), round-trip with
+    /// `offset == g.len()`, and reproduce every factor's standalone projection.
+    /// The joint mixed-dimension superposition path (zoo dims=[1,1,2,2,2,2,2,1])
+    /// drives exactly this split; a per-part width that ignored a factor's true
+    /// dimension miscounted the offsets and tripped `assert_eq!(offset, g.len())`
+    /// after the first sub-dimensional factor.
+    #[test]
+    fn product_gradient_projection_splits_mixed_dimensional_factors() {
+        let circle = LatentManifold::Circle {
+            period: std::f64::consts::TAU,
+        };
+        // `Sphere { dim: 2 }` is S¹ embedded in R², i.e. a genuinely 2-wide
+        // ambient block whose tangent projection removes the radial component —
+        // a non-trivial d=2 factor next to the flat d=1 circle.
+        let sphere = LatentManifold::Sphere { dim: 2 };
+        let product = LatentManifold::Product(vec![circle.clone(), sphere.clone()]);
+
+        // Ambient width = 1 (circle) + 2 (sphere) = 3, split at offsets 0 and 1.
+        assert_eq!(product.ambient_dim(3), 3);
+
+        // Base point: the circle coordinate, then a unit 2-vector for the sphere.
+        let t = array![0.5_f64, 0.6, 0.8];
+        let g = array![1.3_f64, 2.0, -0.7];
+
+        let projected = product.project_gradient_to_tangent(t.view(), g.view());
+        assert_eq!(projected.len(), 3, "composite output tiles the full ambient");
+
+        // Each factor projected standalone at its own offset/width must match the
+        // composite's corresponding block.
+        let circle_block =
+            circle.project_gradient_to_tangent(t.slice(s![0..1]), g.slice(s![0..1]));
+        let sphere_block =
+            sphere.project_gradient_to_tangent(t.slice(s![1..3]), g.slice(s![1..3]));
+        assert_eq!(projected[0], circle_block[0], "d=1 circle factor block");
+        for a in 0..2 {
+            assert_eq!(projected[1 + a], sphere_block[a], "d=2 sphere factor block");
+        }
+
+        // Non-triviality guard: the sphere block genuinely removed the radial
+        // component, so this is not a vacuous identity round-trip.
+        let radial = g[1] * t[1] + g[2] * t[2];
+        assert!(
+            radial.abs() > 1e-6,
+            "fixture must exercise a non-tangent gradient on the sphere factor"
+        );
+        assert!(
+            (sphere_block[0] - (g[1] - radial * t[1])).abs() < 1e-12
+                && (sphere_block[1] - (g[2] - radial * t[2])).abs() < 1e-12,
+            "sphere tangent projection must remove the radial component"
+        );
     }
 
     /// Regression for issue #191 (and the K=2 periodic case of #174):
