@@ -164,6 +164,43 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         self.evaluate_blockwise_exact_newton(block_states)
     }
 
+    fn current_identifiability_family_scalars(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, String> {
+        if block_states.len() < 3 {
+            return Err(format!(
+                "survival marginal-slope identifiability state requires time, marginal, and logslope blocks; got {}",
+                block_states.len(),
+            ));
+        }
+        let slopes = self
+            .logslope_layout
+            .physical_values(self.score_dim(), block_states[2].beta.view())?;
+        let mut q0 = Vec::with_capacity(self.n);
+        let mut q1 = Vec::with_capacity(self.n);
+        let mut qd1 = Vec::with_capacity(self.n);
+        for row in 0..self.n {
+            let values = self.row_dynamic_q_values(row, block_states)?;
+            q0.push(values.q0);
+            q1.push(values.q1);
+            qd1.push(values.qd1);
+        }
+        let scalars = SurvivalMarginalSlopeFamilyScalars::new(
+            q0,
+            q1,
+            qd1,
+            slopes,
+            self.probit_frailty_scale(),
+            &self.score_covariance,
+        )?;
+        Ok(Some(Arc::new(scalars)))
+    }
+
+    fn identifiability_probit_frailty_scale(&self) -> f64 {
+        self.probit_frailty_scale()
+    }
+
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         let options = BlockwiseFitOptions {
             auto_outer_subsample: false,

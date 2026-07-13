@@ -1911,7 +1911,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         if p_tw > 0 {
             if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
                 let p_m = marginal_design.design.ncols();
-                let p_g = logslope_design.design.ncols();
                 // Densify time designs (already densified earlier in the
                 // V+M-exact path; densify again cheaply here — or reuse
                 // if the earlier path failed and we are on the raw path).
@@ -1932,10 +1931,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                         .design
                         .try_to_dense_arc("build_blocks::tw_jac::marginal")
                         .ok()?;
-                    let d_log = logslope_design
-                        .design
-                        .try_to_dense_arc("build_blocks::tw_jac::logslope")
-                        .ok()?;
                     let knots = timewiggle.knots.clone();
                     let degree = timewiggle.degree;
                     let marginal_offset = Arc::new(spec.marginal_offset.clone());
@@ -1944,7 +1939,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                         Arc::clone(&d_exit),
                         Arc::clone(&d_deriv),
                         Arc::clone(&d_marg),
-                        Arc::clone(&d_log),
                         Arc::clone(&offset_entry),
                         Arc::clone(&offset_exit),
                         Arc::clone(&derivative_offset_exit),
@@ -1953,8 +1947,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                         degree,
                         p_tw,
                         p_m,
-                        p_g,
-                        probit_scale,
                     ))
                         as Arc<dyn crate::custom_family::BlockEffectiveJacobian>;
                     let marginal_jac = Arc::new(SmsTimewiggleMarginalJacobian::new(
@@ -1962,7 +1954,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                         d_exit,
                         d_deriv,
                         d_marg,
-                        d_log,
                         Arc::clone(&offset_entry),
                         Arc::clone(&offset_exit),
                         Arc::clone(&derivative_offset_exit),
@@ -1971,8 +1962,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                         degree,
                         design_exit.ncols(),
                         p_tw,
-                        p_g,
-                        probit_scale,
                     ))
                         as Arc<dyn crate::custom_family::BlockEffectiveJacobian>;
                     Some((time_jac, marginal_jac))

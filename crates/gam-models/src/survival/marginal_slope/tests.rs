@@ -301,6 +301,53 @@ fn closed_form_block_states(
 }
 
 #[test]
+fn converged_identifiability_scalars_use_current_vector_geometry_932() {
+    let n = 2;
+    let mut family = make_closed_form_test_family(n);
+    let design = array![[1.0], [2.0]];
+    let offset = array![0.2, -0.1];
+    family.logslope_layout = LogslopeTopology::shared()
+        .materialize_identity(DesignMatrix::from(design.clone()), &offset)
+        .unwrap();
+    let beta_logslope = array![0.5];
+    let eta_logslope = design.dot(&beta_logslope) + &offset;
+    let states = vec![
+        ParameterBlockState {
+            beta: Array1::zeros(0),
+            eta: Array1::zeros(n),
+        },
+        ParameterBlockState {
+            beta: Array1::zeros(0),
+            eta: Array1::zeros(n),
+        },
+        ParameterBlockState {
+            beta: beta_logslope,
+            eta: eta_logslope.clone(),
+        },
+    ];
+
+    let erased =
+        <SurvivalMarginalSlopeFamily as CustomFamily>::current_identifiability_family_scalars(
+            &family, &states,
+        )
+        .unwrap()
+        .expect("survival must expose converged scalars");
+    let scalars = erased
+        .downcast_ref::<SurvivalMarginalSlopeFamilyScalars>()
+        .expect("survival scalar type");
+    assert_eq!(scalars.slopes.column(0), eta_logslope.view());
+    for row in 0..n {
+        assert_eq!(scalars.q0_i[row], family.offset_entry[row]);
+        assert_eq!(scalars.q1_i[row], family.offset_exit[row]);
+        assert_eq!(scalars.qd1_i[row], family.derivative_offset_exit[row]);
+        assert_eq!(
+            scalars.c_i[row],
+            (1.0 + eta_logslope[row] * eta_logslope[row]).sqrt(),
+        );
+    }
+}
+
+#[test]
 fn survival_primary_g_fourth_cell_partials_are_zero() {
     let family = make_closed_form_test_family(1);
     let primary = flex_primary_slices(&family);
@@ -3545,7 +3592,6 @@ fn timewiggle_time_jacobian_nonzero_at_zero_beta_linearization() {
         Arc::clone(&zeros),
         Arc::clone(&zeros),
         Arc::new(Array2::<f64>::zeros((n, 0))), // p_m = 0
-        Arc::new(Array2::<f64>::zeros((n, 0))), // p_g = 0
         Arc::clone(&offset_entry),
         Arc::clone(&offset_exit),
         Arc::clone(&offset_deriv),
@@ -3554,8 +3600,6 @@ fn timewiggle_time_jacobian_nonzero_at_zero_beta_linearization() {
         degree,
         p_tw,
         0,
-        0,
-        1.0,
     );
     let empty: Vec<f64> = Vec::new();
     let state = crate::custom_family::FamilyLinearizationState {

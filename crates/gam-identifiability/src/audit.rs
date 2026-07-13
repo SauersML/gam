@@ -2859,6 +2859,10 @@ pub struct AuditDriftSummary {
     pub pilot_rank: usize,
     /// Current-β effective rank.
     pub current_rank: usize,
+    /// Whether the pilot audit carried an unresolved fatal alias.
+    pub pilot_fatal: bool,
+    /// Whether the converged-state audit carries an unresolved fatal alias.
+    pub current_fatal: bool,
     /// `‖β_current − β_pilot‖₂ / (‖β_pilot‖₂ + ε)` — relative norm change.
     pub beta_relative_change: f64,
     /// Columns dropped in the current audit that were NOT dropped in the pilot.
@@ -3009,8 +3013,10 @@ pub fn maybe_log_audit_drift(
         .map(|d| format!("{}[{}]", d.block, d.column))
         .collect();
 
-    let verdict_changed =
-        pilot_rank != current_rank || !newly_dropped.is_empty() || !recovered.is_empty();
+    let verdict_changed = pilot_rank != current_rank
+        || pilot_audit.fatal != current_audit.fatal
+        || !newly_dropped.is_empty()
+        || !recovered.is_empty();
 
     if verdict_changed {
         // Structured INFO log so log-grep can find all drift events.
@@ -3028,11 +3034,13 @@ pub fn maybe_log_audit_drift(
             recovered.join(", ")
         };
         log::info!(
-            "[AUDIT-DRIFT] pilot_rank={} current_rank={} \
+            "[AUDIT-DRIFT] pilot_rank={} current_rank={} pilot_fatal={} current_fatal={} \
              beta_relative_change={:.4} outer_iter={} \
              newly_dropped=[{}] recovered=[{}]",
             pilot_rank,
             current_rank,
+            pilot_audit.fatal,
+            current_audit.fatal,
             beta_relative_change,
             outer_iter,
             if newly_str.is_empty() {
@@ -3047,6 +3055,8 @@ pub fn maybe_log_audit_drift(
     Ok(Some(AuditDriftSummary {
         pilot_rank,
         current_rank,
+        pilot_fatal: pilot_audit.fatal,
+        current_fatal: current_audit.fatal,
         beta_relative_change,
         newly_dropped,
         recovered,

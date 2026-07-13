@@ -453,8 +453,8 @@ impl crate::custom_family::BlockEffectiveJacobian for TimeBlockJacobian {
 // p_time = p_base + p_tw where p_tw = time_wiggle_ncols.
 
 /// n_outputs = 3 stacked Jacobian for the **time** block when timewiggle
-/// is active.  Computes `c_i` from the embedded logslope design and
-/// joint β, so no `family_scalars` are required.
+/// is active. Current `c_i` values come from the family-owned vector
+/// log-slope state, so nonzero β requires `family_scalars`.
 pub struct SmsTimewiggleTimeJacobian {
     pub(crate) design_entry: Arc<Array2<f64>>,
     pub(crate) design_exit: Arc<Array2<f64>>,
@@ -558,8 +558,7 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
                 value
                     .downcast_ref::<SurvivalMarginalSlopeFamilyScalars>()
                     .ok_or_else(|| {
-                        "timewiggle time Jacobian received the wrong family-scalar type"
-                            .to_string()
+                        "timewiggle time Jacobian received the wrong family-scalar type".to_string()
                     })
             })
             .transpose()?;
@@ -912,20 +911,23 @@ mod tests {
             .unwrap();
         let covariance = MarginalSlopeCovariance::Diagonal(array![2.0, 0.5]);
         let callback =
-            LogslopeBlockJacobian::new(layout, Arc::new(array![[1.5, -0.5]]), covariance).unwrap();
+            LogslopeBlockJacobian::new(layout, Arc::new(array![[1.5, -0.5]]), covariance.clone())
+                .unwrap();
         assert_eq!(
             crate::custom_family::BlockEffectiveJacobian::n_outputs(&callback),
             3
         );
-        let scalars: Arc<dyn std::any::Any + Send + Sync> =
-            Arc::new(SurvivalMarginalSlopeFamilyScalars::new(
+        let scalars: Arc<dyn std::any::Any + Send + Sync> = Arc::new(
+            SurvivalMarginalSlopeFamilyScalars::new(
                 vec![1.1],
                 vec![1.3],
                 vec![0.7],
-                vec![0.0],
+                array![[0.0, 0.0]],
                 0.8,
-                vec![0.0],
-            ));
+                &covariance,
+            )
+            .unwrap(),
+        );
         let beta = [0.1, 0.2];
         let state = crate::custom_family::FamilyLinearizationState {
             beta: &beta,

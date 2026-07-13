@@ -18,6 +18,9 @@
 //! what the arrow Schur elimination in `solver/arrow_schur.rs` consumes.
 
 use crate::model_types::EstimationError;
+use crate::multinomial_reml::{
+    MultinomialLogitRowProgram, multinomial_logit_probabilities_into,
+};
 use ndarray::{Array1, Array2, Array3, ArrayView2};
 
 /// Per-output noise model for a vector response.
@@ -571,24 +574,7 @@ impl MultinomialLogitLikelihood {
     /// matrix-free callers route through this method rather than carrying
     /// their own softmax.
     pub fn softmax_with_baseline(eta_active: &[f64], out: &mut [f64]) {
-        assert_eq!(out.len(), eta_active.len() + 1);
-        let mut max_eta = 0.0_f64;
-        for &v in eta_active {
-            if v > max_eta {
-                max_eta = v;
-            }
-        }
-        let baseline = (-max_eta).exp();
-        let mut denom = baseline;
-        for (idx, &v) in eta_active.iter().enumerate() {
-            let e = (v - max_eta).exp();
-            out[idx] = e;
-            denom += e;
-        }
-        for v in out.iter_mut().take(eta_active.len()) {
-            *v /= denom;
-        }
-        out[eta_active.len()] = baseline / denom;
+        multinomial_logit_probabilities_into(eta_active, out);
     }
 
     /// Convenience: compute the full (N, K) probability matrix from
@@ -612,6 +598,99 @@ impl MultinomialLogitLikelihood {
             }
         }
         probs
+    }
+
+    #[inline]
+    fn row_program<'row>(
+        &self,
+        row: usize,
+        eta: &'row [f64],
+        response: &'row [f64],
+    ) -> MultinomialLogitRowProgram<'row> {
+        MultinomialLogitRowProgram::new(eta, response, self.row_weight(row))
+            .unwrap_or_else(|error| panic!("invalid multinomial row {row}: {error}"))
+    }
+
+    /// Fused live value/gradient/Hessian evaluation. This is the one production
+    /// batch entry used by the joint REML adapter, so it performs one stable
+    /// normalization per row rather than three independent likelihood passes.
+    pub(crate) fn value_gradient_hessian(
+        &self,
+        eta: ArrayView2<f64>,
+        y: ArrayView2<f64>,
+    ) -> (f64, Array2<f64>, Array3<f64>) {
+        let n = eta.nrows();
+        let m = self.active_classes;
+        let k = self.total_classes();
+        assert_eq!(eta.ncols(), m, "eta must have K-1 columns");
+        assert_eq!(y.dim(), (n, k), "y must be (N, K) simplex encoded");
+        let mut gradient_log_likelihood = Array2::<f64>::zeros((n, m));
+        let mut hessian = Array3::<f64>::zeros((n, m, m));
+        let mut eta_row = vec![0.0_f64; m];
+        let mut response_row = vec![0.0_f64; k];
+        let mut probabilities = vec![0.0_f64; k];
+        let mut gradient_nll = vec![0.0_f64; m];
+        let mut hessian_row = vec![0.0_f64; m * m];
+        let mut negative_log_likelihood = 0.0_f64;
+        for row in 0..n {
+            for axis in 0..m {
+                eta_row[axis] = eta[[row, axis]];
+            }
+            for class in 0..k {
+                response_row[class] = y[[row, class]];
+            }
+            let program = self.row_program(row, &eta_row, &response_row);
+            negative_log_likelihood += program.value_gradient_hessian_into(
+                &mut probabilities,
+                &mut gradient_nll,
+                &mut hessian_row,
+            );
+            for axis in 0..m {
+                gradient_log_likelihood[[row, axis]] = -gradient_nll[axis];
+                for other in 0..m {
+                    hessian[[row, axis, other]] = hessian_row[axis * m + other];
+                }
+            }
+        }
+        (
+            -negative_log_likelihood,
+            gradient_log_likelihood,
+            hessian,
+        )
+    }
+
+    /// Fused value/gradient entry for callers that do not consume curvature.
+    pub(crate) fn value_gradient(
+        &self,
+        eta: ArrayView2<f64>,
+        y: ArrayView2<f64>,
+    ) -> (f64, Array2<f64>) {
+        let n = eta.nrows();
+        let m = self.active_classes;
+        let k = self.total_classes();
+        assert_eq!(eta.ncols(), m, "eta must have K-1 columns");
+        assert_eq!(y.dim(), (n, k), "y must be (N, K) simplex encoded");
+        let mut gradient_log_likelihood = Array2::<f64>::zeros((n, m));
+        let mut eta_row = vec![0.0_f64; m];
+        let mut response_row = vec![0.0_f64; k];
+        let mut probabilities = vec![0.0_f64; k];
+        let mut gradient_nll = vec![0.0_f64; m];
+        let mut negative_log_likelihood = 0.0_f64;
+        for row in 0..n {
+            for axis in 0..m {
+                eta_row[axis] = eta[[row, axis]];
+            }
+            for class in 0..k {
+                response_row[class] = y[[row, class]];
+            }
+            let program = self.row_program(row, &eta_row, &response_row);
+            negative_log_likelihood +=
+                program.value_gradient_into(&mut probabilities, &mut gradient_nll);
+            for axis in 0..m {
+                gradient_log_likelihood[[row, axis]] = -gradient_nll[axis];
+            }
+        }
+        (-negative_log_likelihood, gradient_log_likelihood)
     }
 }
 

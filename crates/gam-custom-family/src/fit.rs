@@ -34,6 +34,72 @@ pub(crate) fn lift_block_states_to_raw(
         .collect()
 }
 
+/// Re-run the unified identifiability audit at the converged raw-coordinate
+/// state when a family exposes dynamic primary scalars. Any change from the
+/// pilot verdict invalidates the gauge used by the solve, so result assembly
+/// fails closed instead of publishing a locally unidentified or over-reduced
+/// fit.
+fn audit_converged_identifiability<F: CustomFamily + ?Sized>(
+    family: &F,
+    raw_specs: &[ParameterBlockSpec],
+    canonical: &gam_identifiability::canonical::CanonicalSpecs,
+    reduced_states: &[ParameterBlockState],
+    outer_iter: usize,
+) -> Result<(), CustomFamilyError> {
+    let raw_states = lift_block_states_to_raw(canonical, reduced_states.to_vec());
+    let Some(family_scalars) = family
+        .current_identifiability_family_scalars(&raw_states)
+        .map_err(|reason| CustomFamilyError::Optimization {
+            context: "converged identifiability scalars",
+            reason,
+        })?
+    else {
+        return Ok(());
+    };
+    let beta_current: Vec<f64> = raw_states
+        .iter()
+        .flat_map(|state| state.beta.iter().copied())
+        .collect();
+    let beta_pilot = vec![0.0; beta_current.len()];
+    let drift = gam_identifiability::audit::maybe_log_audit_drift(
+        raw_specs,
+        &canonical.audit,
+        &beta_pilot,
+        &beta_current,
+        Some(&family_scalars),
+        outer_iter,
+        1,
+        family.identifiability_probit_frailty_scale(),
+    )
+    .map_err(|error| CustomFamilyError::Optimization {
+        context: "converged identifiability audit",
+        reason: error.to_string(),
+    })?
+    .ok_or_else(|| CustomFamilyError::Optimization {
+        context: "converged identifiability audit",
+        reason: "period-one converged audit did not run".to_string(),
+    })?;
+    if drift.current_rank != drift.pilot_rank
+        || drift.current_fatal != drift.pilot_fatal
+        || !drift.newly_dropped.is_empty()
+        || !drift.recovered.is_empty()
+    {
+        return Err(CustomFamilyError::Optimization {
+            context: "converged identifiability audit",
+            reason: format!(
+                "identifiability verdict changed after convergence: pilot_rank={} current_rank={} pilot_fatal={} current_fatal={} newly_dropped={} recovered={}",
+                drift.pilot_rank,
+                drift.current_rank,
+                drift.pilot_fatal,
+                drift.current_fatal,
+                drift.newly_dropped.len(),
+                drift.recovered.len(),
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Lift a reduced-space conditional covariance and retain the exact active
 /// precision frame used by the solver.
 ///
@@ -865,6 +931,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             });
         }
         refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+        audit_converged_identifiability(family, raw_specs, &canonical, &inner.block_states, 0)?;
         let covariance_conditional = compute_joint_covariance_required(
             family,
             specs,
@@ -1623,6 +1690,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
              {e}.{last_error_detail}"
         )
     })?;
+    audit_converged_identifiability(
+        family,
+        raw_specs,
+        &canonical,
+        &inner.block_states,
+        outer_iters,
+    )?;
     // gam#1587: pass `final_options` (carrying the joint penalty bundle) so the
     // posterior precision `H = H_lik + S_λ` includes the full-width centered
     // penalty, matching the inner-converged mode.
@@ -1753,6 +1827,13 @@ pub fn fit_custom_family_fixed_log_lambdas<F: CustomFamily + Clone + Send + Sync
         });
     }
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
+    audit_converged_identifiability(
+        family,
+        raw_specs,
+        &canonical,
+        &inner.block_states,
+        outer_iterations,
+    )?;
     let covariance_conditional =
         compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)
             .map_err(|error| CustomFamilyError::Optimization {

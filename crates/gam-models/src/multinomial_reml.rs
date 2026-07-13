@@ -71,10 +71,38 @@ use crate::vector_response::{
 };
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
+use gam_math::nested_dual::JetField;
 use gam_problem::HyperOperator;
 use gam_solve::pirls::dense_block_xtwx;
 use ndarray::{Array1, Array2, Array3, ArrayView2};
 use std::sync::{Arc, Mutex};
+
+#[inline]
+fn multinomial_stable_shift(eta: &[f64]) -> f64 {
+    eta.iter().copied().fold(0.0_f64, f64::max)
+}
+
+/// Canonical stable normalization for active logits plus an implicit zero
+/// reference logit. Every probability consumer, including prediction and the
+/// higher-order Fisher schedule, receives its base state from this function.
+pub(crate) fn multinomial_logit_probabilities_into(eta: &[f64], probabilities: &mut [f64]) -> f64 {
+    assert_eq!(probabilities.len(), eta.len() + 1);
+    let shift = multinomial_stable_shift(eta);
+    let active_classes = eta.len();
+    let reference_mass = (-shift).exp();
+    let mut denominator = reference_mass;
+    for (axis, &logit) in eta.iter().enumerate() {
+        let mass = (logit - shift).exp();
+        probabilities[axis] = mass;
+        denominator += mass;
+    }
+    let inverse_denominator = denominator.recip();
+    for probability in &mut probabilities[..active_classes] {
+        *probability *= inverse_denominator;
+    }
+    probabilities[active_classes] = reference_mass * inverse_denominator;
+    shift + denominator.ln()
+}
 
 /// Production [`gam_math::jet_tower::RowProgram`] for one reference-coded
 /// multinomial-logit row.
@@ -85,22 +113,26 @@ use std::sync::{Arc, Mutex};
 /// production parity tests invoke this type directly rather than restating its
 /// expression under `cfg(test)`.
 #[derive(Clone, Copy, Debug)]
-pub struct MultinomialLogitRowProgram<const M: usize> {
-    eta: [f64; M],
-    observed_class: usize,
+pub struct MultinomialLogitRowProgram<'row> {
+    eta: &'row [f64],
+    response: &'row [f64],
     weight: f64,
 }
 
-impl<const M: usize> MultinomialLogitRowProgram<M> {
-    /// Construct one validated row. `observed_class == M` selects the implicit
-    /// reference class.
-    pub fn new(eta: [f64; M], observed_class: usize, weight: f64) -> Result<Self, String> {
-        if M == 0 {
+impl<'row> MultinomialLogitRowProgram<'row> {
+    /// Construct one validated row. `eta` contains the active-class logits and
+    /// `response` contains the complete simplex row, including the implicit
+    /// reference class in its last slot.
+    pub fn new(eta: &'row [f64], response: &'row [f64], weight: f64) -> Result<Self, String> {
+        let active_classes = eta.len();
+        if active_classes == 0 {
             return Err("MultinomialLogitRowProgram requires at least one active class".into());
         }
-        if observed_class > M {
+        if response.len() != active_classes + 1 {
             return Err(format!(
-                "MultinomialLogitRowProgram observed class {observed_class} exceeds reference class {M}"
+                "MultinomialLogitRowProgram response length {} must equal active classes + reference = {}",
+                response.len(),
+                active_classes + 1,
             ));
         }
         if !weight.is_finite() || weight < 0.0 {
@@ -118,9 +150,26 @@ impl<const M: usize> MultinomialLogitRowProgram<M> {
                 "MultinomialLogitRowProgram eta[{axis}] must be finite, got {value}"
             ));
         }
+        if let Some((class, value)) = response
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite() || *value < 0.0)
+        {
+            return Err(format!(
+                "MultinomialLogitRowProgram response[{class}] must be finite and non-negative, got {value}"
+            ));
+        }
+        let response_mass: f64 = response.iter().sum();
+        let simplex_tolerance = 1.0e-10 * (1.0 + response.len() as f64);
+        if (response_mass - 1.0).abs() > simplex_tolerance {
+            return Err(format!(
+                "MultinomialLogitRowProgram response must sum to one, got {response_mass}"
+            ));
+        }
         Ok(Self {
             eta,
-            observed_class,
+            response,
             weight,
         })
     }
@@ -133,29 +182,164 @@ impl<const M: usize> MultinomialLogitRowProgram<M> {
         }
         Ok(())
     }
+
+    /// Stable shift shared by the semantic row expression and its compiled
+    /// probability/Fisher schedule. Including the reference logit zero keeps
+    /// every exponential argument non-positive.
+    #[inline]
+    fn stable_shift(&self) -> f64 {
+        multinomial_stable_shift(self.eta)
+    }
+
+    /// The one semantic row NLL over an arbitrary scalar field. Constants enter
+    /// through `constant`, allowing the same body to evaluate plain `f64` and
+    /// every fixed Taylor scalar selected by [`gam_math::jet_tower::RowProgram`].
+    ///
+    /// Centering the response term before adding the reference-class share avoids
+    /// the catastrophic `shift - observed_logit` cancellation that a conventional
+    /// `shift + log(sum(exp(eta-shift))) - y'eta` spelling suffers in saturated
+    /// tails. The identity uses `sum(response) = 1`:
+    ///
+    /// `NLL/w = log(D) - sum_active y_a(eta_a-shift) + y_ref*shift`.
+    fn eval_expression<S: JetField>(
+        &self,
+        primaries: &[S],
+        constant: impl Fn(f64) -> S,
+    ) -> S {
+        assert_eq!(primaries.len(), self.eta.len());
+        let shift = self.stable_shift();
+        let mut denominator = constant((-shift).exp());
+        let mut centered_response = constant(0.0);
+        for (axis, primary) in primaries.iter().enumerate() {
+            let centered = primary.add(&constant(-shift));
+            let exponential_value = centered.value().exp();
+            let exponential = centered.compose_unary([
+                exponential_value,
+                exponential_value,
+                exponential_value,
+                exponential_value,
+                exponential_value,
+            ]);
+            denominator = denominator.add(&exponential);
+            centered_response = centered_response.add(&centered.scale(self.response[axis]));
+        }
+        let denominator_value = denominator.value();
+        let reciprocal = 1.0 / denominator_value;
+        let log_denominator = denominator.compose_unary([
+            denominator_value.ln(),
+            reciprocal,
+            -reciprocal * reciprocal,
+            2.0 * reciprocal * reciprocal * reciprocal,
+            -6.0 * reciprocal * reciprocal * reciprocal * reciprocal,
+        ]);
+        log_denominator
+            .sub(&centered_response)
+            .add(&constant(self.response[self.eta.len()] * shift))
+            .scale(self.weight)
+    }
+
+    /// Stable scalar NLL from the exact semantic expression.
+    #[inline]
+    pub(crate) fn negative_log_likelihood(&self) -> f64 {
+        self.eval_expression(self.eta, |value| value)
+    }
+
+    /// Compile the semantic normalized-softmax row into probabilities. The
+    /// returned log-partition uses the same centered representation as
+    /// [`Self::eval_expression`]; no probability clamp or alternate tail policy
+    /// exists anywhere in the live likelihood.
+    #[inline]
+    pub(crate) fn probabilities_into(&self, probabilities: &mut [f64]) -> f64 {
+        assert_eq!(probabilities.len(), self.response.len());
+        multinomial_logit_probabilities_into(self.eta, probabilities)
+    }
+
+    /// Structure-compiled value/gradient lowering of the semantic row. The
+    /// gradient is the NLL gradient; callers needing the log-likelihood negate
+    /// both channels.
+    pub(crate) fn value_gradient_into(
+        &self,
+        probabilities: &mut [f64],
+        gradient: &mut [f64],
+    ) -> f64 {
+        let active_classes = self.eta.len();
+        assert_eq!(gradient.len(), active_classes);
+        self.probabilities_into(probabilities);
+        for axis in 0..active_classes {
+            gradient[axis] = self.weight * (probabilities[axis] - self.response[axis]);
+        }
+        self.negative_log_likelihood()
+    }
+
+    /// Diagonal-only structure-compiled Hessian lowering. This preserves the
+    /// O(M) preconditioner path without reintroducing a second softmax formula.
+    pub(crate) fn hessian_diagonal_into(
+        &self,
+        probabilities: &mut [f64],
+        diagonal: &mut [f64],
+    ) {
+        let active_classes = self.eta.len();
+        assert_eq!(diagonal.len(), active_classes);
+        self.probabilities_into(probabilities);
+        for axis in 0..active_classes {
+            let probability = probabilities[axis];
+            diagonal[axis] = self.weight * probability * (1.0 - probability);
+        }
+    }
+
+    /// Structure-compiled value/gradient/Hessian lowering of the semantic row.
+    /// `gradient` is the NLL gradient and `hessian` is row-major. Both are
+    /// mechanically determined by the normalized masses produced above.
+    pub(crate) fn value_gradient_hessian_into(
+        &self,
+        probabilities: &mut [f64],
+        gradient: &mut [f64],
+        hessian: &mut [f64],
+    ) -> f64 {
+        let active_classes = self.eta.len();
+        assert_eq!(gradient.len(), active_classes);
+        assert_eq!(hessian.len(), active_classes * active_classes);
+        let value = self.value_gradient_into(probabilities, gradient);
+        for row in 0..active_classes {
+            let probability_row = probabilities[row];
+            for column in 0..active_classes {
+                let probability_column = probabilities[column];
+                hessian[row * active_classes + column] = self.weight
+                    * if row == column {
+                        probability_row * (1.0 - probability_column)
+                    } else {
+                        -probability_row * probability_column
+                    };
+            }
+        }
+        value
+    }
 }
 
-impl<const M: usize> gam_math::jet_tower::RowProgram<M> for MultinomialLogitRowProgram<M> {
+impl<const M: usize> gam_math::jet_tower::RowProgram<M> for MultinomialLogitRowProgram<'_> {
     fn n_rows(&self) -> usize {
         1
     }
 
     fn primaries(&self, row: usize) -> Result<[f64; M], String> {
         Self::require_row(row)?;
-        Ok(self.eta)
+        self.eta.try_into().map_err(|_| {
+            format!(
+                "MultinomialLogitRowProgram has {} active logits but RowProgram dimension is {M}",
+                self.eta.len()
+            )
+        })
     }
 
     fn eval<S: JetScalar<M>>(&self, row: usize, p: &[S; M]) -> Result<S, String> {
         Self::require_row(row)?;
-        let mut normalizer = S::constant(1.0);
-        for primary in p {
-            normalizer = normalizer.add(&primary.exp());
+        if self.eta.len() != M {
+            return Err(format!(
+                "MultinomialLogitRowProgram has {} active logits but RowProgram dimension is {M}",
+                self.eta.len()
+            ));
         }
-        let mut nll = normalizer.ln().scale(self.weight);
-        if self.observed_class < M {
-            nll = nll.sub(&p[self.observed_class].scale(self.weight));
-        }
-        Ok(nll)
+        Ok(self.eval_expression(p, S::constant))
     }
 }
 
