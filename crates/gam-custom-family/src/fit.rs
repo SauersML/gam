@@ -1289,7 +1289,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                       rho: &Array1<f64>,
                       order: OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
-        let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
         // Genuinely value-only fulfilment (#979). A `Value` request — issued only
         // by the continuation pre-warm and outer cost probes — never consumes the
         // outer gradient. Routing it through the value+gradient assembly below
@@ -1302,6 +1301,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // `outer.warm_cache`) with a zero-length gradient and skip the outer
         // gradient assembly. ValueAndGradient / ValueGradientHessian are unchanged.
         if matches!(order, OuterEvalOrder::Value) {
+            let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
             return match outerobjectivegradienthessian_labeled(
                 family,
                 specs,
@@ -1348,6 +1348,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // consumed by certified fit assembly. A failed analytic probe must not
         // leave an older mode available for accidental substitution.
         outer.begin_terminal_evaluation();
+        let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
         let eval_result = match outerobjectivegradienthessian_labeled(
             family,
             specs,
