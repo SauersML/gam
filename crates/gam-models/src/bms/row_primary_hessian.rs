@@ -7039,7 +7039,7 @@ impl BernoulliMarginalSlopeFamily {
                         &ordered_pairs,
                     )
                 }
-                EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth => pair_chunk
+                EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth => ordered_pairs
                     .iter()
                     .map(|&(direction_u, direction_v)| {
                         self.row_primary_fourth_contracted(
