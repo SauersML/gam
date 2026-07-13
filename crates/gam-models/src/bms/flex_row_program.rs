@@ -34,7 +34,7 @@ pub(super) enum BmsFlexCalibrationOrder2Node {
 /// backends may preserve a phase as one runtime loop, avoiding max-width
 /// source unrolling while retaining the same semantic phase order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BmsFlexCalibrationOrder2Phase {
+pub(super) enum BmsFlexCalibrationOrder2Phase {
     InterceptFirst,
     InterceptSecond,
     PrimaryFirstAndInterceptSecond,
@@ -112,7 +112,7 @@ pub(super) enum BmsFlexRowOrder2FinalizerNode {
 /// Indexed CPU visits and compact generated device loops are expansions of
 /// this one phase stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BmsFlexRowOrder2FinalizerPhase {
+pub(super) enum BmsFlexRowOrder2FinalizerPhase {
     ImplicitFirst,
     ImplicitFirstComplete,
     ImplicitSecond,
@@ -372,7 +372,7 @@ impl BmsFlexRowProgram {
 
     /// Visit the canonical Order2 calibration phases without choosing a
     /// backend index representation.
-    pub(super) fn try_for_each_calibration_order2_phase<E>(
+    fn try_for_each_calibration_order2_phase<E>(
         need_hessian: bool,
         mut visit: impl FnMut(BmsFlexCalibrationOrder2Phase) -> Result<(), E>,
     ) -> Result<(), E> {
@@ -535,7 +535,7 @@ impl BmsFlexRowProgram {
 
     /// Visit the canonical dependency phases without selecting an index
     /// representation for a backend.
-    pub(super) fn try_for_each_order2_finalizer_phase<E>(
+    fn try_for_each_order2_finalizer_phase<E>(
         need_hessian: bool,
         mut visit: impl FnMut(BmsFlexRowOrder2FinalizerPhase) -> Result<(), E>,
     ) -> Result<(), E> {
