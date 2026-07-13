@@ -166,6 +166,7 @@ def test_2267_overcomplete_curved_worker_passes_exact_topk(monkeypatch):
     assert kwargs["run_structure_search"] is False
     assert kwargs["structured_residual_passes"] == 0
     assert result["test_ev"] == 1.0
+    assert "assignments" not in FakeManifoldSAE().converged_latents(train)
     assert result["support_evidence"]["train"]["nonzero_min"] == 2
     assert result["support_evidence"]["held_out"]["nonzero_max"] == 2
     assert result["certificate"]["type"] == "ManifoldSAE.certificates+termination"

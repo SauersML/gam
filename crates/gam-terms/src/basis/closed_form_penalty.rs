@@ -906,7 +906,7 @@ pub(crate) fn hybrid_self_pair_radial_derivative_with_kappa_derivs_odd_d(
     d: usize,
     kappa: f64,
 ) -> Option<(f64, f64, f64)> {
-    if d % 2 != 1 || q > 2 || s == 0 || !(kappa > 0.0) || !kappa.is_finite() {
+    if d % 2 != 1 || q > 2 || !(kappa > 0.0) || !kappa.is_finite() {
         return None;
     }
 
@@ -923,7 +923,9 @@ pub(crate) fn hybrid_self_pair_radial_derivative_with_kappa_derivs_odd_d(
     // exponent cannot repair that value/derivative mismatch.
     let pair_p_order = m.checked_mul(2)?;
     let pair_s_order = s.checked_mul(2)?;
-    let spectral_decay_order = pair_p_order.checked_add(pair_s_order)?.checked_mul(2)?;
+    let spectral_decay_order = pair_p_order
+        .checked_add(pair_s_order)?
+        .checked_mul(2)?;
     let required = d.checked_add(q.checked_mul(2)?)?;
     if spectral_decay_order <= required {
         return None;

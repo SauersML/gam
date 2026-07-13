@@ -776,7 +776,12 @@ fn sae_manifold_fit_model<'py>(
 /// a per-atom list of `(M_k, p)` arrays; `duchon_centers` is `Some` only for
 /// non-periodic atoms; `n_harmonics_list` is `Some` only for periodic atoms.
 ///
-/// Returns the same full payload dict as the fit path (issue #357): the
+/// This array-level entry is the full-support (`K<=P`) specialization. A fitted
+/// overcomplete TopK model owns support-native OOS through
+/// `ManifoldSAE.converged_latents`; accepting it here would recreate the exact
+/// dense `N×K` payload the support representation removes.
+///
+/// Returns the same full payload dict as the dense fit path (issue #357): the
 /// converged per-token assignments `assignments_z` (N, K), per-atom
 /// on-manifold coordinates `on_atom_coords_t`, gating logits, and the
 /// reconstruction `fitted`. Downstream supervised heads consume the OOS
@@ -818,6 +823,12 @@ fn sae_oos_request_from_arrays(
     {
         return Err(format!(
             "sae_manifold_predict_oos: per-atom metadata lengths must equal K={k_atoms}"
+        ));
+    }
+    if assignment_kind == "topk" && k_atoms > x_view.ncols() {
+        return Err(format!(
+            "sae_manifold_predict_oos: overcomplete hard TopK requires the fitted support-native ManifoldSAE OOS entry; dense array OOS would allocate N×K at K={k_atoms} > P={}",
+            x_view.ncols()
         ));
     }
     let assignment = match assignment_kind.as_str() {
@@ -1152,6 +1163,11 @@ fn sae_manifold_certify_external<'py>(
     let z_view = z.as_array();
     let (n_obs, p_out) = z_view.dim();
     let k_atoms = atom_basis.len();
+    if assignment_kind == "topk" && k_atoms > p_out {
+        return Err(py_value_error(format!(
+            "sae_manifold_certify_external: overcomplete hard TopK certification requires canonical support indices and heterogeneous compact coordinates; dense logits are invalid at K={k_atoms} > P={p_out}"
+        )));
+    }
     if atom_dim.len() != k_atoms
         || decoder_blocks.len() != k_atoms
         || duchon_centers.len() != k_atoms
