@@ -817,7 +817,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jet_scalar::{FixedRuntimeJet, JetScalar};
+    use crate::jet_scalar::{DynamicJetArena, DynamicOrder2, FixedRuntimeJet, JetScalar};
     use crate::nested_dual::JetField;
 
     struct DenseSymmetric3([[f64; 3]; 3]);
@@ -837,6 +837,69 @@ mod tests {
 
         fn coefficient(&self, row: usize, column: usize) -> f64 {
             self.0[row][column]
+        }
+    }
+
+    struct MatrixFreeDense3<'arena> {
+        matrix: [[f64; 3]; 3],
+        workspace: &'arena Order2GraphWorkspace,
+    }
+
+    impl SymmetricQuadraticCoefficients for MatrixFreeDense3<'_> {
+        fn dimension(&self) -> usize {
+            3
+        }
+
+        fn multiply(&self, input: &[f64], output: &mut [f64]) {
+            assert!(self.workspace.node_count() != 0);
+            for row in 0..3 {
+                output[row] = (0..3)
+                    .map(|column| self.matrix[row][column] * input[column])
+                    .sum();
+            }
+        }
+
+        fn coefficient(&self, _row: usize, _column: usize) -> f64 {
+            panic!("compiled graph quadratic lowering must preserve matrix-free multiply")
+        }
+    }
+
+    #[test]
+    fn compiled_graph_quadratic_arity_is_independent_and_matrix_free() {
+        let mut workspace = Order2GraphWorkspace::new();
+        workspace.reset(2);
+        let x = Order2Graph::variable(0.4, 0, 2, &workspace);
+        let y = Order2Graph::variable(-0.7, 1, 2, &workspace);
+        let xy = x.product(&y);
+        let coefficients = MatrixFreeDense3 {
+            matrix: [[1.2, -0.3, 0.25], [-0.3, 0.8, 0.17], [0.25, 0.17, 1.4]],
+            workspace: &workspace,
+        };
+        let graph = Order2Graph::symmetric_quadratic_form(
+            &[x, y, xy],
+            &coefficients,
+            2,
+            &workspace,
+        )
+        .into_order2();
+
+        let arena = DynamicJetArena::new();
+        let eager_x = DynamicOrder2::variable(0.4, 0, 2, &arena);
+        let eager_y = DynamicOrder2::variable(-0.7, 1, 2, &arena);
+        let eager_xy = eager_x.product(&eager_y);
+        let eager = DynamicOrder2::symmetric_quadratic_form(
+            &[eager_x, eager_y, eager_xy],
+            &coefficients,
+            2,
+            &arena,
+        );
+
+        assert_eq!(graph.value(), eager.v);
+        assert_eq!(graph.g().as_slice(), eager.g());
+        for row in 0..2 {
+            for column in 0..2 {
+                assert_eq!(graph.h()[row][column], eager.h_at(row, column));
+            }
         }
     }
 

@@ -9100,10 +9100,18 @@ pub(crate) fn per_penalty_edf_uses_realized_penalty_rank_2288() {
     let (edf_total, edf_by_penalty, block_edf, penalty_trace) =
         custom_family_blockwise_edf(&h, &[spec], &lambdas.view()).expect("exact EDF");
 
-    assert_eq!(penalty_trace, vec![1.0, 1.0]);
-    assert_eq!(edf_by_penalty, vec![1.0, 1.0]);
-    assert_eq!(block_edf, vec![2.0]);
-    assert_eq!(edf_total, 2.0);
+    // These values come from a floating-point factor solve.  The regression is
+    // the order-one distinction between the realized rank-2 bases here and the
+    // old containing-width-4 base/cap, not bit identity with the rational
+    // result.  Keep the tolerance tight enough that the old result cannot pass.
+    for &actual in &penalty_trace {
+        assert_relative_eq!(actual, 1.0, epsilon = 1e-12);
+    }
+    for &actual in &edf_by_penalty {
+        assert_relative_eq!(actual, 1.0, epsilon = 1e-12);
+    }
+    assert_relative_eq!(block_edf[0], 2.0, epsilon = 1e-12);
+    assert_relative_eq!(edf_total, 2.0, epsilon = 1e-12);
 }
 
 /// Structural edf with a penalty NULLSPACE coupled to the range through the
