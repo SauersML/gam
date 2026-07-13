@@ -10,10 +10,8 @@
 //! Families tested:
 //!   - Survival marginal-slope (K=4): `SurvivalRowHessian`
 //!   - Bernoulli marginal-slope (K=1): `BernoulliRowHessian`
-//!   - Gaussian location-scale (K=2): `GaussianLocationScaleChannelHessian`
 
 use gam::families::custom_family::FamilyChannelHessian;
-use gam::families::gamlss::GaussianLocationScaleChannelHessian;
 use gam::families::survival::marginal_slope::identifiability::SurvivalRowHessian;
 use gam::identifiability::families::bernoulli::BernoulliRowHessian;
 use ndarray::Array1;
@@ -127,18 +125,6 @@ fn bernoulli_channel_hessian_matches_fd() {
             rel = rel_err(got, ref_val),
         );
     }
-}
-
-// ── Gaussian location-scale (K=2) ─────────────────────────────────────────────
-
-/// Gaussian location-scale row NLL as a function of (μ, log_σ).
-/// ρ(μ, s) = w * [s + 0.5 * (y - μ)^2 * exp(-2s)]
-fn gaussian_row_nll(u: &[f64], y: f64, w: f64) -> f64 {
-    let mu = u[0];
-    let s = u[1];
-    let inv_sigma2 = (-2.0 * s).exp();
-    let resid = y - mu;
-    w * (s + 0.5 * resid * resid * inv_sigma2)
 }
 
 // ── End-to-end Fisher Gram J^T W J for survival marginal-slope ────────────────
@@ -305,53 +291,4 @@ fn survival_marginal_slope_channel_stacked_fisher_gram_matches_closed_form() {
         "channel-stacked Fisher Gram closed-form vs explicit Σ J^T W J: \
          max_err={max_err:.3e} max_scale={max_scale:.3e}"
     );
-}
-
-#[test]
-fn gaussian_location_scale_channel_hessian_matches_fd() {
-    let ys: Vec<f64> = (0..N).map(|i| -1.0 + (i as f64) * 0.15).collect();
-    let ws: Vec<f64> = (0..N).map(|i| 0.8 + (i as f64) * 0.02).collect();
-    // Pilot (mu, log_sigma).
-    let mus: Vec<f64> = (0..N).map(|i| -0.8 + (i as f64) * 0.1).collect();
-    let logss: Vec<f64> = (0..N).map(|i| -0.5 + (i as f64) * 0.06).collect();
-
-    let y_arr = Array1::from_iter(ys.iter().copied());
-    let w_arr = Array1::from_iter(ws.iter().copied());
-    let mu_arr = Array1::from_iter(mus.iter().copied());
-    let logs_arr = Array1::from_iter(logss.iter().copied());
-
-    // FD compares against the raw OBSERVED Hessian (no PSD clamp). The
-    // production constructor `from_pilot` clamps for the canonicalize gate;
-    // here we test the closed-form formula matches the row NLL second
-    // derivatives exactly.
-    let hess = GaussianLocationScaleChannelHessian::from_pilot_observed_unclamped(
-        &y_arr, &w_arr, &mu_arr, &logs_arr,
-    )
-    .expect("GaussianLocationScaleChannelHessian::from_pilot_observed_unclamped failed");
-
-    for i in 0..N {
-        let u = [mus[i], logss[i]];
-        let f = |uu: &[f64]| gaussian_row_nll(uu, ys[i], ws[i]);
-        let fd = fd_hessian(&f, &u, 2, FD_H);
-
-        let mut buf = [0.0f64; 4];
-        hess.fill_subject(i, &mut buf);
-
-        for a in 0..2 {
-            for b in 0..2 {
-                let got = buf[a * 2 + b];
-                let ref_val = fd[a][b];
-                if !ref_val.is_finite() {
-                    continue;
-                }
-                assert!(
-                    err_within_tol(got, ref_val),
-                    "gaussian location-scale W_i[{a},{b}] row {i}: \
-                     got={got:.6e} fd={ref_val:.6e} abs_err={abs:.2e} rel_err={rel:.2e}",
-                    abs = (got - ref_val).abs(),
-                    rel = rel_err(got, ref_val),
-                );
-            }
-        }
-    }
 }

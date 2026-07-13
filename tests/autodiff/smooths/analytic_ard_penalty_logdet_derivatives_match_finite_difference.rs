@@ -12,7 +12,9 @@ fn analytic_ard_penalty_logdet_derivatives_match_finite_difference() {
         latent_dim,
     )));
     let rho = array![0.0_f64, 0.3, -0.2];
-    let frozen = penalty.freeze(target.clone(), rho.clone());
+    let frozen = penalty
+        .freeze(target.clone(), rho.clone())
+        .expect("ARD fixture must freeze at finite target and rho coordinates");
 
     let dense = frozen.as_dense();
     for i in 0..dense.nrows() {
