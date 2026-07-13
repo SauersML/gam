@@ -628,25 +628,41 @@ fn witness_scalar_dependencies(
     Ok(dependencies)
 }
 
-fn scalar_cuda(expression: &Expr, constants: &HashSet<String>) -> Result<String> {
+#[derive(Clone, Copy)]
+enum SymbolicTarget {
+    Rust,
+    Cuda,
+}
+
+fn symbolic_scalar(
+    expression: &Expr,
+    constants: &HashSet<String>,
+    target: SymbolicTarget,
+) -> Result<String> {
     match expression {
         Expr::Path(path) => {
             let ident = path_ident(path)?;
             if constants.contains(&ident.to_string()) {
-                Ok(format!("in.{ident}"))
+                Ok(match target {
+                    SymbolicTarget::Rust => ident.to_string(),
+                    SymbolicTarget::Cuda => format!("in.{ident}"),
+                })
             } else {
-                Err(syn::Error::new_spanned(ident, "unknown CUDA scalar"))
+                Err(syn::Error::new_spanned(
+                    ident,
+                    "unknown row_program symbolic scalar",
+                ))
             }
         }
         Expr::Lit(literal) if numeric_literal(literal) => Ok(quote!(#literal).to_string()),
         Expr::Paren(ExprParen { expr, .. }) | Expr::Group(ExprGroup { expr, .. }) => {
-            Ok(format!("({})", scalar_cuda(expr, constants)?))
+            Ok(format!("({})", symbolic_scalar(expr, constants, target)?))
         }
         Expr::Unary(ExprUnary {
             op: UnOp::Neg(_),
             expr,
             ..
-        }) => Ok(format!("-({})", scalar_cuda(expr, constants)?)),
+        }) => Ok(format!("-({})", symbolic_scalar(expr, constants, target)?)),
         Expr::Binary(ExprBinary {
             left, op, right, ..
         }) => {
@@ -664,25 +680,25 @@ fn scalar_cuda(expression: &Expr, constants: &HashSet<String>) -> Result<String>
                 _ => {
                     return Err(syn::Error::new_spanned(
                         op,
-                        "unsupported CUDA scalar operator",
+                        "unsupported row_program symbolic scalar operator",
                     ));
                 }
             };
             Ok(format!(
                 "({} {operator} {})",
-                scalar_cuda(left, constants)?,
-                scalar_cuda(right, constants)?
+                symbolic_scalar(left, constants, target)?,
+                symbolic_scalar(right, constants, target)?
             ))
         }
         _ => Err(syn::Error::new_spanned(
             expression,
-            "unsupported CUDA scalar expression",
+            "unsupported row_program symbolic scalar expression",
         )),
     }
 }
 
 #[derive(Clone)]
-struct CudaJet {
+struct SymbolicJet {
     value: String,
     gradient: Vec<Option<String>>,
     // Only entries with a <= b are populated. The generated CUDA computes the
@@ -691,12 +707,12 @@ struct CudaJet {
 }
 
 #[derive(Clone)]
-struct CudaSupport {
+struct SymbolicSupport {
     gradient: Vec<bool>,
     hessian: Vec<bool>,
 }
 
-impl CudaSupport {
+impl SymbolicSupport {
     fn empty(dimension: usize) -> Self {
         Self {
             gradient: vec![false; dimension],
@@ -704,7 +720,7 @@ impl CudaSupport {
         }
     }
 
-    fn include(&mut self, jet: &CudaJet) {
+    fn include(&mut self, jet: &SymbolicJet) {
         for (present, component) in self.gradient.iter_mut().zip(&jet.gradient) {
             *present |= component.is_some();
         }
@@ -714,7 +730,7 @@ impl CudaSupport {
     }
 }
 
-impl CudaJet {
+impl SymbolicJet {
     fn zero(dimension: usize) -> Self {
         Self {
             value: "0.0".to_string(),
@@ -730,13 +746,13 @@ impl CudaJet {
         out
     }
 
-    fn support(&self) -> CudaSupport {
-        let mut support = CudaSupport::empty(self.gradient.len());
+    fn support(&self) -> SymbolicSupport {
+        let mut support = SymbolicSupport::empty(self.gradient.len());
         support.include(self);
         support
     }
 
-    fn reference(name: &str, support: &CudaSupport, dimension: usize) -> Self {
+    fn reference(name: &str, support: &SymbolicSupport, dimension: usize) -> Self {
         let mut out = Self::zero(dimension);
         out.value = format!("{name}_v");
         for axis in 0..dimension {
@@ -754,145 +770,147 @@ impl CudaJet {
     }
 }
 
-fn cuda_is_zero(value: &str) -> bool {
+fn symbolic_is_zero(value: &str) -> bool {
     value == "0.0"
 }
 
-fn cuda_is_one(value: &str) -> bool {
+fn symbolic_is_one(value: &str) -> bool {
     value == "1.0"
 }
 
-fn cuda_is_negative_one(value: &str) -> bool {
+fn symbolic_is_negative_one(value: &str) -> bool {
     matches!(value, "-1.0" | "-(1.0)" | "(-1.0)")
 }
 
-fn cuda_negate(value: &str) -> String {
-    if cuda_is_zero(value) {
+fn symbolic_negate(value: &str) -> String {
+    if symbolic_is_zero(value) {
         "0.0".to_string()
-    } else if cuda_is_negative_one(value) {
+    } else if symbolic_is_negative_one(value) {
         "1.0".to_string()
-    } else if cuda_is_one(value) {
+    } else if symbolic_is_one(value) {
         "-1.0".to_string()
     } else {
         format!("-({value})")
     }
 }
 
-fn cuda_add(left: &str, right: &str) -> String {
-    if cuda_is_zero(left) {
+fn symbolic_add(left: &str, right: &str) -> String {
+    if symbolic_is_zero(left) {
         right.to_string()
-    } else if cuda_is_zero(right) {
+    } else if symbolic_is_zero(right) {
         left.to_string()
     } else {
         format!("({left} + {right})")
     }
 }
 
-fn cuda_multiply(left: &str, right: &str) -> String {
-    if cuda_is_zero(left) || cuda_is_zero(right) {
+fn symbolic_multiply(left: &str, right: &str) -> String {
+    if symbolic_is_zero(left) || symbolic_is_zero(right) {
         "0.0".to_string()
-    } else if cuda_is_one(left) {
+    } else if symbolic_is_one(left) {
         right.to_string()
-    } else if cuda_is_one(right) {
+    } else if symbolic_is_one(right) {
         left.to_string()
-    } else if cuda_is_negative_one(left) {
-        cuda_negate(right)
-    } else if cuda_is_negative_one(right) {
-        cuda_negate(left)
+    } else if symbolic_is_negative_one(left) {
+        symbolic_negate(right)
+    } else if symbolic_is_negative_one(right) {
+        symbolic_negate(left)
     } else {
         format!("({left} * {right})")
     }
 }
 
-fn cuda_add_component(left: &Option<String>, right: &Option<String>) -> Option<String> {
+fn symbolic_add_component(left: &Option<String>, right: &Option<String>) -> Option<String> {
     match (left, right) {
-        (Some(left), Some(right)) => Some(cuda_add(left, right)),
+        (Some(left), Some(right)) => Some(symbolic_add(left, right)),
         (Some(value), None) | (None, Some(value)) => Some(value.clone()),
         (None, None) => None,
     }
 }
 
-fn cuda_multiply_component(left: &Option<String>, right: &Option<String>) -> Option<String> {
+fn symbolic_multiply_component(left: &Option<String>, right: &Option<String>) -> Option<String> {
     match (left, right) {
-        (Some(left), Some(right)) => Some(cuda_multiply(left, right)),
+        (Some(left), Some(right)) => Some(symbolic_multiply(left, right)),
         _ => None,
     }
 }
 
-fn cuda_scale_component(component: &Option<String>, scalar: &str) -> Option<String> {
+fn symbolic_scale_component(component: &Option<String>, scalar: &str) -> Option<String> {
     component
         .as_ref()
-        .map(|component| cuda_multiply(component, scalar))
+        .map(|component| symbolic_multiply(component, scalar))
 }
 
-fn cuda_add_jets(left: CudaJet, right: CudaJet) -> CudaJet {
-    CudaJet {
-        value: cuda_add(&left.value, &right.value),
+fn symbolic_add_jets(left: SymbolicJet, right: SymbolicJet) -> SymbolicJet {
+    SymbolicJet {
+        value: symbolic_add(&left.value, &right.value),
         gradient: left
             .gradient
             .iter()
             .zip(&right.gradient)
-            .map(|(left, right)| cuda_add_component(left, right))
+            .map(|(left, right)| symbolic_add_component(left, right))
             .collect(),
         hessian: left
             .hessian
             .iter()
             .zip(&right.hessian)
-            .map(|(left, right)| cuda_add_component(left, right))
+            .map(|(left, right)| symbolic_add_component(left, right))
             .collect(),
     }
 }
 
-fn cuda_multiply_jets(left: CudaJet, right: CudaJet) -> CudaJet {
+fn symbolic_multiply_jets(left: SymbolicJet, right: SymbolicJet) -> SymbolicJet {
     let dimension = left.gradient.len();
     let mut gradient = vec![None; dimension];
     let mut hessian = vec![None; dimension * dimension];
     for axis in 0..dimension {
-        gradient[axis] = cuda_add_component(
-            &cuda_scale_component(&right.gradient[axis], &left.value),
-            &cuda_scale_component(&left.gradient[axis], &right.value),
+        gradient[axis] = symbolic_add_component(
+            &symbolic_scale_component(&right.gradient[axis], &left.value),
+            &symbolic_scale_component(&left.gradient[axis], &right.value),
         );
         for other in axis..dimension {
             let index = axis * dimension + other;
-            let inherited_right = cuda_scale_component(&right.hessian[index], &left.value);
+            let inherited_right = symbolic_scale_component(&right.hessian[index], &left.value);
             let cross_forward =
-                cuda_multiply_component(&left.gradient[axis], &right.gradient[other]);
+                symbolic_multiply_component(&left.gradient[axis], &right.gradient[other]);
             let cross_reverse =
-                cuda_multiply_component(&left.gradient[other], &right.gradient[axis]);
-            let inherited_left = cuda_scale_component(&left.hessian[index], &right.value);
-            hessian[index] = cuda_add_component(
-                &cuda_add_component(
-                    &cuda_add_component(&inherited_right, &cross_forward),
+                symbolic_multiply_component(&left.gradient[other], &right.gradient[axis]);
+            let inherited_left = symbolic_scale_component(&left.hessian[index], &right.value);
+            hessian[index] = symbolic_add_component(
+                &symbolic_add_component(
+                    &symbolic_add_component(&inherited_right, &cross_forward),
                     &cross_reverse,
                 ),
                 &inherited_left,
             );
         }
     }
-    CudaJet {
-        value: cuda_multiply(&left.value, &right.value),
+    SymbolicJet {
+        value: symbolic_multiply(&left.value, &right.value),
         gradient,
         hessian,
     }
 }
 
-fn cuda_expression(
+fn symbolic_expression(
     expression: &ProgramExpr,
     owner: &str,
     leaves: &[Leaf],
     constants: &HashSet<String>,
-    bindings: &HashMap<String, CudaJet>,
+    bindings: &HashMap<String, SymbolicJet>,
+    target: SymbolicTarget,
     dimension: usize,
     stack_index: &mut usize,
     preludes: &mut Vec<String>,
-) -> Result<CudaJet> {
+) -> Result<SymbolicJet> {
     let mut child = |expression: &ProgramExpr| {
-        cuda_expression(
+        symbolic_expression(
             expression,
             owner,
             leaves,
             constants,
             bindings,
+            target,
             dimension,
             stack_index,
             preludes,
@@ -900,87 +918,99 @@ fn cuda_expression(
     };
     match expression {
         ProgramExpr::Path(ident) => bindings.get(&ident.to_string()).cloned().ok_or_else(|| {
-            syn::Error::new_spanned(ident, "CUDA row_program binding is not defined")
+            syn::Error::new_spanned(ident, "symbolic row_program binding is not defined")
         }),
-        ProgramExpr::Zero => Ok(CudaJet::zero(dimension)),
+        ProgramExpr::Zero => Ok(SymbolicJet::zero(dimension)),
         ProgramExpr::Neg(value) => {
             let value = child(value)?;
-            Ok(CudaJet {
-                value: cuda_negate(&value.value),
+            Ok(SymbolicJet {
+                value: symbolic_negate(&value.value),
                 gradient: value
                     .gradient
                     .iter()
-                    .map(|component| component.as_ref().map(|value| cuda_negate(value)))
+                    .map(|component| component.as_ref().map(|value| symbolic_negate(value)))
                     .collect(),
                 hessian: value
                     .hessian
                     .iter()
-                    .map(|component| component.as_ref().map(|value| cuda_negate(value)))
+                    .map(|component| component.as_ref().map(|value| symbolic_negate(value)))
                     .collect(),
             })
         }
         ProgramExpr::Scale(value, scalar) => {
             let value = child(value)?;
-            let scalar = scalar_cuda(scalar, constants)?;
-            Ok(CudaJet {
-                value: cuda_multiply(&value.value, &scalar),
+            let scalar = symbolic_scalar(scalar, constants, target)?;
+            Ok(SymbolicJet {
+                value: symbolic_multiply(&value.value, &scalar),
                 gradient: value
                     .gradient
                     .iter()
-                    .map(|component| cuda_scale_component(component, &scalar))
+                    .map(|component| symbolic_scale_component(component, &scalar))
                     .collect(),
                 hessian: value
                     .hessian
                     .iter()
-                    .map(|component| cuda_scale_component(component, &scalar))
+                    .map(|component| symbolic_scale_component(component, &scalar))
                     .collect(),
             })
         }
         ProgramExpr::AddConstant(value, scalar) => {
             let mut value = child(value)?;
-            value.value = cuda_add(&value.value, &scalar_cuda(scalar, constants)?);
+            value.value = symbolic_add(&value.value, &symbolic_scalar(scalar, constants, target)?);
             Ok(value)
         }
-        ProgramExpr::Add(left, right) => Ok(cuda_add_jets(child(left)?, child(right)?)),
-        ProgramExpr::Mul(left, right) => Ok(cuda_multiply_jets(child(left)?, child(right)?)),
+        ProgramExpr::Add(left, right) => Ok(symbolic_add_jets(child(left)?, child(right)?)),
+        ProgramExpr::Mul(left, right) => Ok(symbolic_multiply_jets(child(left)?, child(right)?)),
         ProgramExpr::Compose {
             leaf,
             value,
             arguments,
         } => {
             let input = bindings.get(&value.to_string()).cloned().ok_or_else(|| {
-                syn::Error::new_spanned(value, "CUDA compose input is not defined")
+                syn::Error::new_spanned(value, "symbolic compose input is not defined")
             })?;
             let suffix = *stack_index;
             *stack_index += 1;
             let stack = format!("{owner}_stack{suffix}");
-            let cuda_leaf = &leaves[*leaf].cuda;
             let mut leaf_arguments = vec![input.value.clone()];
             for argument in arguments {
-                leaf_arguments.push(scalar_cuda(argument, constants)?);
+                leaf_arguments.push(symbolic_scalar(argument, constants, target)?);
             }
-            leaf_arguments.push(stack.clone());
-            preludes.push(format!(
-                "double {stack}[3];\n{cuda_leaf}({});",
-                leaf_arguments.join(", ")
-            ));
+            match target {
+                SymbolicTarget::Rust => {
+                    let rust_leaf = &leaves[*leaf].rust;
+                    let rust_leaf = quote!(#rust_leaf).to_string();
+                    preludes.push(format!(
+                        "let {stack} = {rust_leaf}({});",
+                        leaf_arguments.join(", ")
+                    ));
+                }
+                SymbolicTarget::Cuda => {
+                    let cuda_leaf = &leaves[*leaf].cuda;
+                    leaf_arguments.push(stack.clone());
+                    preludes.push(format!(
+                        "double {stack}[3];\n{cuda_leaf}({});",
+                        leaf_arguments.join(", ")
+                    ));
+                }
+            }
 
             let first = format!("{stack}[1]");
             let second = format!("{stack}[2]");
             let mut gradient = vec![None; dimension];
             let mut hessian = vec![None; dimension * dimension];
             for axis in 0..dimension {
-                gradient[axis] = cuda_scale_component(&input.gradient[axis], &first);
+                gradient[axis] = symbolic_scale_component(&input.gradient[axis], &first);
                 for other in axis..dimension {
                     let index = axis * dimension + other;
-                    let inherited = cuda_scale_component(&input.hessian[index], &first);
+                    let inherited = symbolic_scale_component(&input.hessian[index], &first);
                     let curvature =
-                        cuda_multiply_component(&input.gradient[axis], &input.gradient[other])
-                            .map(|component| cuda_multiply(&second, &component));
-                    hessian[index] = cuda_add_component(&inherited, &curvature);
+                        symbolic_multiply_component(&input.gradient[axis], &input.gradient[other])
+                            .map(|component| symbolic_multiply(&second, &component));
+                    hessian[index] = symbolic_add_component(&inherited, &curvature);
                 }
             }
-            Ok(CudaJet {
+            Ok(SymbolicJet {
                 value: format!("{stack}[0]"),
                 gradient,
                 hessian,
@@ -989,28 +1019,36 @@ fn cuda_expression(
     }
 }
 
-struct CudaLocal {
+struct SymbolicLocal {
     name: String,
     mutable: bool,
-    value: CudaJet,
+    value: SymbolicJet,
     preludes: Vec<String>,
 }
 
-struct CudaAssignment {
+struct SymbolicAssignment {
     target: String,
-    value: CudaJet,
+    value: SymbolicJet,
     preludes: Vec<String>,
 }
 
-enum CudaStatement {
-    Local(CudaLocal),
+enum SymbolicStatement {
+    Local(SymbolicLocal),
     If {
         condition: String,
-        assignments: Vec<CudaAssignment>,
+        assignments: Vec<SymbolicAssignment>,
     },
 }
 
-fn cuda_push_preludes(source: &mut String, preludes: &[String], indentation: &str) {
+struct SymbolicSchedule {
+    statements: Vec<SymbolicStatement>,
+    result: SymbolicJet,
+    result_preludes: Vec<String>,
+    mutable_support: HashMap<String, SymbolicSupport>,
+    witness_values: Vec<String>,
+}
+
+fn push_preludes(source: &mut String, preludes: &[String], indentation: &str) {
     for prelude in preludes {
         for line in prelude.lines() {
             source.push_str(indentation);
@@ -1020,8 +1058,135 @@ fn cuda_push_preludes(source: &mut String, preludes: &[String], indentation: &st
     }
 }
 
-fn cuda_component(component: &Option<String>) -> &str {
+fn symbolic_component(component: &Option<String>) -> &str {
     component.as_deref().unwrap_or("0.0")
+}
+
+fn symbolic_schedule(
+    primaries: &[Ident],
+    constants: &HashSet<String>,
+    leaves: &[Leaf],
+    statements: &[Statement],
+    result: &ProgramExpr,
+    witnesses: &[Ident],
+    target: SymbolicTarget,
+) -> Result<SymbolicSchedule> {
+    let dimension = primaries.len();
+    let mut bindings = HashMap::<String, SymbolicJet>::new();
+    for (axis, primary) in primaries.iter().enumerate() {
+        bindings.insert(
+            primary.to_string(),
+            SymbolicJet::primary(&primary.to_string(), axis, dimension),
+        );
+    }
+    let mut mutable_support = HashMap::<String, SymbolicSupport>::new();
+    let mut symbolic_statements = Vec::new();
+    // One source-wide namespace makes temporary declarations collision-free,
+    // including repeated assignments to the same mutable local in one scope.
+    let mut stack_index = 0;
+    for statement in statements {
+        match statement {
+            Statement::Local {
+                name,
+                mutable,
+                value,
+            } => {
+                let mut preludes = Vec::new();
+                let value = symbolic_expression(
+                    value,
+                    &name.to_string(),
+                    leaves,
+                    constants,
+                    &bindings,
+                    target,
+                    dimension,
+                    &mut stack_index,
+                    &mut preludes,
+                )?;
+                let support = value.support();
+                if *mutable {
+                    mutable_support.insert(name.to_string(), support.clone());
+                }
+                bindings.insert(
+                    name.to_string(),
+                    SymbolicJet::reference(&name.to_string(), &support, dimension),
+                );
+                symbolic_statements.push(SymbolicStatement::Local(SymbolicLocal {
+                    name: name.to_string(),
+                    mutable: *mutable,
+                    value,
+                    preludes,
+                }));
+            }
+            Statement::If {
+                condition,
+                assignments,
+            } => {
+                let mut symbolic_assignments = Vec::new();
+                for (target_name, value) in assignments {
+                    let mut preludes = Vec::new();
+                    let value = symbolic_expression(
+                        value,
+                        &target_name.to_string(),
+                        leaves,
+                        constants,
+                        &bindings,
+                        target,
+                        dimension,
+                        &mut stack_index,
+                        &mut preludes,
+                    )?;
+                    let support = mutable_support
+                        .get_mut(&target_name.to_string())
+                        .expect("validated mutable symbolic target");
+                    support.include(&value);
+                    bindings.insert(
+                        target_name.to_string(),
+                        SymbolicJet::reference(&target_name.to_string(), support, dimension),
+                    );
+                    symbolic_assignments.push(SymbolicAssignment {
+                        target: target_name.to_string(),
+                        value,
+                        preludes,
+                    });
+                }
+                symbolic_statements.push(SymbolicStatement::If {
+                    condition: symbolic_scalar(condition, constants, target)?,
+                    assignments: symbolic_assignments,
+                });
+            }
+        }
+    }
+    let witness_values = witnesses
+        .iter()
+        .map(|witness| {
+            bindings
+                .get(&witness.to_string())
+                .map(|jet| jet.value.clone())
+                .ok_or_else(|| {
+                    syn::Error::new_spanned(witness, "symbolic witness binding is not defined")
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut result_preludes = Vec::new();
+    let result = symbolic_expression(
+        result,
+        "result",
+        leaves,
+        constants,
+        &bindings,
+        target,
+        dimension,
+        &mut stack_index,
+        &mut result_preludes,
+    )?;
+    Ok(SymbolicSchedule {
+        statements: symbolic_statements,
+        result,
+        result_preludes,
+        mutable_support,
+        witness_values,
+    })
 }
 
 fn cuda_source(
@@ -1044,110 +1209,26 @@ fn cuda_source(
         ])
         .collect::<Vec<_>>()
         .join(", ");
-    let mut bindings = HashMap::<String, CudaJet>::new();
-    for (axis, primary) in primaries.iter().enumerate() {
-        bindings.insert(
-            primary.to_string(),
-            CudaJet::primary(&primary.to_string(), axis, dimension),
-        );
-    }
-    let mut mutable_support = HashMap::<String, CudaSupport>::new();
-    let mut cuda_statements = Vec::new();
-    // One source-wide namespace makes temporary declarations collision-free,
-    // including repeated assignments to the same mutable local in one scope.
-    let mut stack_index = 0;
-    for statement in statements {
-        match statement {
-            Statement::Local {
-                name,
-                mutable,
-                value,
-            } => {
-                let mut preludes = Vec::new();
-                let value = cuda_expression(
-                    value,
-                    &name.to_string(),
-                    leaves,
-                    constants,
-                    &bindings,
-                    dimension,
-                    &mut stack_index,
-                    &mut preludes,
-                )?;
-                let support = value.support();
-                if *mutable {
-                    mutable_support.insert(name.to_string(), support.clone());
-                }
-                bindings.insert(
-                    name.to_string(),
-                    CudaJet::reference(&name.to_string(), &support, dimension),
-                );
-                cuda_statements.push(CudaStatement::Local(CudaLocal {
-                    name: name.to_string(),
-                    mutable: *mutable,
-                    value,
-                    preludes,
-                }));
-            }
-            Statement::If {
-                condition,
-                assignments,
-            } => {
-                let mut cuda_assignments = Vec::new();
-                for (target, value) in assignments {
-                    let mut preludes = Vec::new();
-                    let value = cuda_expression(
-                        value,
-                        &target.to_string(),
-                        leaves,
-                        constants,
-                        &bindings,
-                        dimension,
-                        &mut stack_index,
-                        &mut preludes,
-                    )?;
-                    let support = mutable_support
-                        .get_mut(&target.to_string())
-                        .expect("validated mutable CUDA target");
-                    support.include(&value);
-                    bindings.insert(
-                        target.to_string(),
-                        CudaJet::reference(&target.to_string(), support, dimension),
-                    );
-                    cuda_assignments.push(CudaAssignment {
-                        target: target.to_string(),
-                        value,
-                        preludes,
-                    });
-                }
-                cuda_statements.push(CudaStatement::If {
-                    condition: scalar_cuda(condition, constants)?,
-                    assignments: cuda_assignments,
-                });
-            }
-        }
-    }
-    let mut preludes = Vec::new();
-    let result = cuda_expression(
-        result,
-        "result",
-        leaves,
+    let schedule = symbolic_schedule(
+        primaries,
         constants,
-        &bindings,
-        dimension,
-        &mut stack_index,
-        &mut preludes,
+        leaves,
+        statements,
+        result,
+        &[],
+        SymbolicTarget::Cuda,
     )?;
 
     let mut source = format!("__device__ __forceinline__ void {name}(\n        {parameters}) {{\n");
-    for statement in &cuda_statements {
+    for statement in &schedule.statements {
         match statement {
-            CudaStatement::Local(local) => {
-                cuda_push_preludes(&mut source, &local.preludes, "    ");
+            SymbolicStatement::Local(local) => {
+                push_preludes(&mut source, &local.preludes, "    ");
                 let support = if local.mutable {
-                    mutable_support
+                    schedule
+                        .mutable_support
                         .get(&local.name)
-                        .expect("mutable CUDA support exists")
+                        .expect("mutable symbolic support exists")
                         .clone()
                 } else {
                     local.value.support()
@@ -1161,7 +1242,7 @@ fn cuda_source(
                         source.push_str(&format!(
                             "    double {}_g{axis} = {};\n",
                             local.name,
-                            cuda_component(&local.value.gradient[axis]),
+                            symbolic_component(&local.value.gradient[axis]),
                         ));
                     }
                     for other in axis..dimension {
@@ -1170,22 +1251,23 @@ fn cuda_source(
                             source.push_str(&format!(
                                 "    double {}_h{axis}_{other} = {};\n",
                                 local.name,
-                                cuda_component(&local.value.hessian[index]),
+                                symbolic_component(&local.value.hessian[index]),
                             ));
                         }
                     }
                 }
             }
-            CudaStatement::If {
+            SymbolicStatement::If {
                 condition,
                 assignments,
             } => {
                 source.push_str(&format!("    if ({condition}) {{\n"));
                 for assignment in assignments {
-                    cuda_push_preludes(&mut source, &assignment.preludes, "        ");
-                    let support = mutable_support
+                    push_preludes(&mut source, &assignment.preludes, "        ");
+                    let support = schedule
+                        .mutable_support
                         .get(&assignment.target)
-                        .expect("mutable CUDA assignment support exists");
+                        .expect("mutable symbolic assignment support exists");
                     source.push_str(&format!(
                         "        {}_v = {};\n",
                         assignment.target, assignment.value.value,
@@ -1195,7 +1277,7 @@ fn cuda_source(
                             source.push_str(&format!(
                                 "        {}_g{axis} = {};\n",
                                 assignment.target,
-                                cuda_component(&assignment.value.gradient[axis]),
+                                symbolic_component(&assignment.value.gradient[axis]),
                             ));
                         }
                         for other in axis..dimension {
@@ -1204,7 +1286,7 @@ fn cuda_source(
                                 source.push_str(&format!(
                                     "        {}_h{axis}_{other} = {};\n",
                                     assignment.target,
-                                    cuda_component(&assignment.value.hessian[index]),
+                                    symbolic_component(&assignment.value.hessian[index]),
                                 ));
                             }
                         }
@@ -1214,16 +1296,16 @@ fn cuda_source(
             }
         }
     }
-    cuda_push_preludes(&mut source, &preludes, "    ");
-    source.push_str(&format!("    *row_value = {};\n", result.value));
+    push_preludes(&mut source, &schedule.result_preludes, "    ");
+    source.push_str(&format!("    *row_value = {};\n", schedule.result.value));
     for axis in 0..dimension {
         source.push_str(&format!(
             "    row_gradient[{axis}] = {};\n",
-            cuda_component(&result.gradient[axis]),
+            symbolic_component(&schedule.result.gradient[axis]),
         ));
         for other in axis..dimension {
             let index = axis * dimension + other;
-            let component = cuda_component(&result.hessian[index]);
+            let component = symbolic_component(&schedule.result.hessian[index]);
             source.push_str(&format!(
                 "    row_hessian[{}] = {component};\n",
                 axis * dimension + other,

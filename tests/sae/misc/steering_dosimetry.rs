@@ -667,3 +667,88 @@ fn target_dose_probe_exhaustion_never_returns_an_unconverged_plan() {
         TargetDoseError::ProbeBudgetExhausted { probes: 1, .. }
     ));
 }
+
+/// gh#2263: a relative tolerance is a fraction, not an arbitrary non-negative
+/// scalar. Values at or above one can certify zero realized KL for a positive
+/// target, while NaN/infinity make every comparison meaningless. Zero remains
+/// a valid exact-agreement request.
+#[test]
+fn target_dose_relative_tolerances_have_fractional_finite_domain() {
+    let t0 = 0.0;
+    let (term, metric) = planted_circle(t0);
+    let delta = 0.02_f64;
+    let unit = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("unit");
+    let target = unit.predicted_nats.expect("unit dose");
+
+    steer_to_target_nats(
+        &term,
+        &metric,
+        TargetDoseRequest {
+            atom_k: 0,
+            metric_row: 0,
+            t_from: &[t0],
+            t_to: &[t0 + delta],
+            target_nats: target,
+            config: TargetDoseConfig {
+                tol_rel: 0.0,
+                readout_tol_rel: 0.0,
+                ..TargetDoseConfig::default()
+            },
+        },
+        None,
+    )
+    .expect("zero requests exact agreement and is a valid relative tolerance");
+
+    for invalid in [1.0, f64::INFINITY, f64::NAN] {
+        for config in [
+            TargetDoseConfig {
+                tol_rel: invalid,
+                ..TargetDoseConfig::default()
+            },
+            TargetDoseConfig {
+                readout_tol_rel: invalid,
+                ..TargetDoseConfig::default()
+            },
+        ] {
+            let error = steer_to_target_nats(
+                &term,
+                &metric,
+                TargetDoseRequest {
+                    atom_k: 0,
+                    metric_row: 0,
+                    t_from: &[t0],
+                    t_to: &[t0 + delta],
+                    target_nats: target,
+                    config,
+                },
+                None,
+            )
+            .expect_err("a non-fractional/non-finite tolerance must fail closed");
+            assert!(matches!(error, TargetDoseError::InvalidRequest(_)));
+        }
+    }
+}
+
+/// gh#2263: the closed-form seed is execution data for a patched forward. An
+/// extreme but finite target must fail before an infinite amplitude can escape
+/// to that callback or to the returned activation delta.
+#[test]
+fn target_dose_rejects_unrepresentable_seed_amplitude() {
+    let t0 = 0.0;
+    let (term, metric) = planted_circle(t0);
+    let error = steer_to_target_nats(
+        &term,
+        &metric,
+        TargetDoseRequest {
+            atom_k: 0,
+            metric_row: 0,
+            t_from: &[t0],
+            t_to: &[t0 + 0.02],
+            target_nats: f64::MAX,
+            config: TargetDoseConfig::default(),
+        },
+        None,
+    )
+    .expect_err("an infinite closed-form seed must fail before steering execution");
+    assert!(matches!(error, TargetDoseError::InvalidRequest(_)));
+}

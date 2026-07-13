@@ -784,9 +784,13 @@ pub fn steer_to_target_nats(
             "steer_to_target_nats: target_nats must be finite and positive, got {target_nats}"
         )));
     }
-    if !(config.tol_rel > 0.0) || config.max_iter == 0 || !(config.readout_tol_rel > 0.0) {
+    if !(config.tol_rel.is_finite() && (0.0..1.0).contains(&config.tol_rel))
+        || config.max_iter == 0
+        || !(config.readout_tol_rel.is_finite() && (0.0..1.0).contains(&config.readout_tol_rel))
+    {
         return Err(TargetDoseError::InvalidRequest(format!(
-            "steer_to_target_nats: config must have tol_rel>0, max_iter>0, readout_tol_rel>0; \
+            "steer_to_target_nats: config must have finite 0<=tol_rel<1, max_iter>0, \
+             finite 0<=readout_tol_rel<1; \
              got {config:?}"
         )));
     }
@@ -801,10 +805,10 @@ pub fn steer_to_target_nats(
             unit.metric_provenance
         ))
     })?;
-    if !(unit_nats > 0.0) {
+    if !(unit_nats.is_finite() && unit_nats > 0.0) {
         return Err(TargetDoseError::InvalidRequest(format!(
-            "steer_to_target_nats: unit-amplitude dose is {unit_nats} (the chord carries no \
-             Fisher mass in metric row {metric_row}); cannot solve for a target amplitude"
+            "steer_to_target_nats: unit-amplitude dose must be finite and positive; got \
+             {unit_nats} in metric row {metric_row}"
         )));
     }
     if probe.is_none() && unit.predicted_nats_kind != FisherDoseKind::ExactFull {
@@ -814,6 +818,12 @@ pub fn steer_to_target_nats(
     }
     // Closed-form first-order seed: a0²·unit_nats = q*.
     let seed_amplitude = (target_nats / unit_nats).sqrt();
+    if !(seed_amplitude.is_finite() && seed_amplitude > 0.0) {
+        return Err(TargetDoseError::InvalidRequest(format!(
+            "steer_to_target_nats: target {target_nats} nats and unit dose {unit_nats} \
+             imply an unrepresentable amplitude {seed_amplitude}"
+        )));
+    }
     let quad = |a: f64| a * a * unit_nats;
 
     let finish = |amplitude: f64,
@@ -877,6 +887,12 @@ pub fn steer_to_target_nats(
             });
         }
         let next_a = hi_a * 2.0;
+        if !(next_a.is_finite() && next_a > hi_a) {
+            return Err(TargetDoseError::InvalidRequest(format!(
+                "steer_to_target_nats: target {target_nats} nats requires an amplitude \
+                 beyond the finite f64 range after amplitude {hi_a} realized {hi_kl} nats"
+            )));
+        }
         let next_kl = probe_kl(probe, next_a)?;
         probes += 1;
         if can_establish_readout_radius {
