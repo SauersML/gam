@@ -302,17 +302,9 @@ impl BasisScaleContract {
         length_scale: Option<f64>,
     ) -> Result<NormalizedEuclideanFrame, BasisError> {
         let replay = stored_scales.is_some();
-        let scales = match stored_scales {
-            Some(scales) => {
-                validate_input_scale_vector(scales, coordinates.ncols(), self.family)?;
-                Some(scales.to_vec())
-            }
-            None => compute_spatial_input_scales(coordinates.view()),
-        };
-
-        match self.input_frame {
-            InputFrameNormalization::AutoStandardizedOriginalUnits
-            | InputFrameNormalization::AutoStandardizedFreshOriginalReplayRealized => {}
+        let replay_range_is_already_realized = match self.input_frame {
+            InputFrameNormalization::AutoStandardizedOriginalUnits => false,
+            InputFrameNormalization::AutoStandardizedFreshOriginalReplayRealized => true,
             InputFrameNormalization::Parameterized
             | InputFrameNormalization::Intrinsic
             | InputFrameNormalization::PcaGauge
@@ -322,32 +314,29 @@ impl BasisScaleContract {
                     self.family
                 )));
             }
-        }
+        };
+        let scales = match stored_scales {
+            Some(scales) => {
+                validate_input_scale_vector(scales, coordinates.ncols(), self.family)?;
+                Some(scales.to_vec())
+            }
+            None => compute_spatial_input_scales(coordinates.view()),
+        };
 
         let transformed_length = if let Some(scales) = scales.as_deref() {
             apply_input_standardization(&mut coordinates, scales);
-            match self.input_frame {
-                InputFrameNormalization::AutoStandardizedOriginalUnits => {
-                    length_scale.map(|ell| compensate_length_scale_for_standardization(ell, scales))
-                }
-                InputFrameNormalization::AutoStandardizedFreshOriginalReplayRealized if replay => {
-                    length_scale
-                }
-                InputFrameNormalization::AutoStandardizedFreshOriginalReplayRealized => {
-                    length_scale.map(|ell| {
-                        if ell > 0.0 {
-                            compensate_length_scale_for_standardization(ell, scales)
-                        } else {
-                            ell
-                        }
-                    })
-                }
-                InputFrameNormalization::Parameterized
-                | InputFrameNormalization::Intrinsic
-                | InputFrameNormalization::PcaGauge
-                | InputFrameNormalization::Delegated => {
-                    unreachable!("the normalization policy was checked before applying the frame")
-                }
+            if replay_range_is_already_realized && replay {
+                length_scale
+            } else if replay_range_is_already_realized {
+                length_scale.map(|ell| {
+                    if ell > 0.0 {
+                        compensate_length_scale_for_standardization(ell, scales)
+                    } else {
+                        ell
+                    }
+                })
+            } else {
+                length_scale.map(|ell| compensate_length_scale_for_standardization(ell, scales))
             }
         } else {
             length_scale
@@ -365,27 +354,16 @@ fn scale(power: i8, parameter: DimensionfulBasisParameter) -> DimensionfulParame
     DimensionfulParameterScale::new(parameter, power)
 }
 
-fn bspline_family(spec: &BSplineBasisSpec) -> BasisScaleFamily {
-    match (&spec.knotspec, &spec.boundary) {
-        (BSplineKnotSpec::NaturalCubicRegression { .. }, _) => BasisScaleFamily::NaturalCubic,
-        (BSplineKnotSpec::PeriodicUniform { .. }, _)
-        | (_, OneDimensionalBoundary::Cyclic { .. }) => BasisScaleFamily::CyclicBSpline,
-        (BSplineKnotSpec::Generate { .. }, OneDimensionalBoundary::Open)
-        | (BSplineKnotSpec::Automatic { .. }, OneDimensionalBoundary::Open)
-        | (BSplineKnotSpec::Provided(_), OneDimensionalBoundary::Open) => {
-            BasisScaleFamily::OpenBSpline
-        }
-    }
-}
-
 fn bspline_contract(spec: &BSplineBasisSpec) -> BasisScaleContract {
-    let family = bspline_family(spec);
-    let (null_geometry, mut parameters) = match family {
-        BasisScaleFamily::OpenBSpline | BasisScaleFamily::NaturalCubic => (
+    let (family, null_geometry, mut parameters) = match (&spec.knotspec, &spec.boundary) {
+        (BSplineKnotSpec::NaturalCubicRegression { .. }, _) => (
+            BasisScaleFamily::NaturalCubic,
             BasisNullGeometryScaleLaw::PolynomialPullback,
             vec![scale(1, DimensionfulBasisParameter::Knots)],
         ),
-        BasisScaleFamily::CyclicBSpline => (
+        (BSplineKnotSpec::PeriodicUniform { .. }, _)
+        | (_, OneDimensionalBoundary::Cyclic { .. }) => (
+            BasisScaleFamily::CyclicBSpline,
             BasisNullGeometryScaleLaw::CyclicConstantMode,
             vec![
                 scale(1, DimensionfulBasisParameter::Knots),
@@ -393,26 +371,13 @@ fn bspline_contract(spec: &BSplineBasisSpec) -> BasisScaleContract {
                 scale(1, DimensionfulBasisParameter::Periods),
             ],
         ),
-        BasisScaleFamily::ByVariableNumeric
-        | BasisScaleFamily::ByVariableFactor
-        | BasisScaleFamily::FactorSumToZero
-        | BasisScaleFamily::BySmoothNumeric
-        | BasisScaleFamily::BySmoothFactor
-        | BasisScaleFamily::FactorSmoothFs
-        | BasisScaleFamily::FactorSmoothSz
-        | BasisScaleFamily::FactorSmoothRe
-        | BasisScaleFamily::ThinPlate
-        | BasisScaleFamily::SphereWahba
-        | BasisScaleFamily::SphereHarmonic
-        | BasisScaleFamily::ConstantCurvature
-        | BasisScaleFamily::Matern
-        | BasisScaleFamily::MeasureJet
-        | BasisScaleFamily::PureDuchon
-        | BasisScaleFamily::HybridDuchon
-        | BasisScaleFamily::Pca
-        | BasisScaleFamily::TensorBSpline => {
-            unreachable!("bspline_family returned a non-B-spline family")
-        }
+        (BSplineKnotSpec::Generate { .. }, OneDimensionalBoundary::Open)
+        | (BSplineKnotSpec::Automatic { .. }, OneDimensionalBoundary::Open)
+        | (BSplineKnotSpec::Provided(_), OneDimensionalBoundary::Open) => (
+            BasisScaleFamily::OpenBSpline,
+            BasisNullGeometryScaleLaw::PolynomialPullback,
+            vec![scale(1, DimensionfulBasisParameter::Knots)],
+        ),
     };
     if matches!(spec.knotspec, BSplineKnotSpec::Generate { .. }) {
         parameters.push(scale(1, DimensionfulBasisParameter::DomainEndpoints));
@@ -506,58 +471,37 @@ impl SmoothBasisSpec {
                     Vec::new(),
                 ),
             },
-            SmoothBasisSpec::FactorSmooth { spec } => {
-                let family = match &spec.flavour {
-                    FactorSmoothFlavour::Fs { .. } => BasisScaleFamily::FactorSmoothFs,
-                    FactorSmoothFlavour::Sz => BasisScaleFamily::FactorSmoothSz,
-                    FactorSmoothFlavour::Re => BasisScaleFamily::FactorSmoothRe,
-                };
-                match family {
-                    BasisScaleFamily::FactorSmoothFs | BasisScaleFamily::FactorSmoothSz => {
-                        BasisScaleContract::wrapper(
-                            family,
-                            BasisCoordinateScaleAction::DiscreteReplication,
-                            BasisDesignScaleLaw::ReplicatedInner,
-                            BasisDerivativeScaleLaw::DelegatedToInner,
-                            bspline_contract(&spec.marginal),
-                            Vec::new(),
-                        )
-                    }
-                    BasisScaleFamily::FactorSmoothRe => BasisScaleContract {
-                        family,
-                        coordinate_action: BasisCoordinateScaleAction::PositiveAffineAbscissa,
-                        design: BasisDesignScaleLaw::RandomInterceptSlopeDegreesZeroAndOne,
-                        penalty: BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
-                        derivatives: BasisDerivativeScaleLaw::InverseCoordinatePower {
-                            maximum_order: 1,
-                        },
-                        null_geometry: BasisNullGeometryScaleLaw::FullRankRandomEffect,
-                        dimensionful_parameters: vec![scale(1, DimensionfulBasisParameter::Knots)],
-                        children: vec![bspline_contract(&spec.marginal)],
-                        input_frame: InputFrameNormalization::Delegated,
+            SmoothBasisSpec::FactorSmooth { spec } => match &spec.flavour {
+                FactorSmoothFlavour::Fs { .. } => BasisScaleContract::wrapper(
+                    BasisScaleFamily::FactorSmoothFs,
+                    BasisCoordinateScaleAction::DiscreteReplication,
+                    BasisDesignScaleLaw::ReplicatedInner,
+                    BasisDerivativeScaleLaw::DelegatedToInner,
+                    bspline_contract(&spec.marginal),
+                    Vec::new(),
+                ),
+                FactorSmoothFlavour::Sz => BasisScaleContract::wrapper(
+                    BasisScaleFamily::FactorSmoothSz,
+                    BasisCoordinateScaleAction::DiscreteReplication,
+                    BasisDesignScaleLaw::ReplicatedInner,
+                    BasisDerivativeScaleLaw::DelegatedToInner,
+                    bspline_contract(&spec.marginal),
+                    Vec::new(),
+                ),
+                FactorSmoothFlavour::Re => BasisScaleContract {
+                    family: BasisScaleFamily::FactorSmoothRe,
+                    coordinate_action: BasisCoordinateScaleAction::PositiveAffineAbscissa,
+                    design: BasisDesignScaleLaw::RandomInterceptSlopeDegreesZeroAndOne,
+                    penalty: BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
+                    derivatives: BasisDerivativeScaleLaw::InverseCoordinatePower {
+                        maximum_order: 1,
                     },
-                    BasisScaleFamily::ByVariableNumeric
-                    | BasisScaleFamily::ByVariableFactor
-                    | BasisScaleFamily::FactorSumToZero
-                    | BasisScaleFamily::OpenBSpline
-                    | BasisScaleFamily::CyclicBSpline
-                    | BasisScaleFamily::NaturalCubic
-                    | BasisScaleFamily::BySmoothNumeric
-                    | BasisScaleFamily::BySmoothFactor
-                    | BasisScaleFamily::ThinPlate
-                    | BasisScaleFamily::SphereWahba
-                    | BasisScaleFamily::SphereHarmonic
-                    | BasisScaleFamily::ConstantCurvature
-                    | BasisScaleFamily::Matern
-                    | BasisScaleFamily::MeasureJet
-                    | BasisScaleFamily::PureDuchon
-                    | BasisScaleFamily::HybridDuchon
-                    | BasisScaleFamily::Pca
-                    | BasisScaleFamily::TensorBSpline => {
-                        unreachable!("factor flavour resolved to a non-factor family")
-                    }
-                }
-            }
+                    null_geometry: BasisNullGeometryScaleLaw::FullRankRandomEffect,
+                    dimensionful_parameters: vec![scale(1, DimensionfulBasisParameter::Knots)],
+                    children: vec![bspline_contract(&spec.marginal)],
+                    input_frame: InputFrameNormalization::Delegated,
+                },
+            },
             SmoothBasisSpec::ThinPlate { .. } => BasisScaleContract::leaf(
                 BasisScaleFamily::ThinPlate,
                 BasisCoordinateScaleAction::UniformEuclideanScale,
@@ -698,10 +642,7 @@ impl SmoothBasisSpec {
             }
             SmoothBasisSpec::BSpline1D { .. } => Ok(()),
             SmoothBasisSpec::BySmooth { smooth, .. } => smooth.validate_scale_configuration(),
-            SmoothBasisSpec::FactorSmooth { spec } => {
-                let _ = bspline_contract(&spec.marginal);
-                Ok(())
-            }
+            SmoothBasisSpec::FactorSmooth { .. } => Ok(()),
             SmoothBasisSpec::ThinPlate {
                 feature_cols,
                 input_scales,
@@ -1246,6 +1187,16 @@ mod tests {
     fn wrapper_basis(family: BasisScaleFamily, abscissa_scale: f64) -> SmoothBasisSpec {
         let inner = || Box::new(basis(0, abscissa_scale));
         let levels = vec![0.0_f64.to_bits(), 1.0_f64.to_bits(), 2.0_f64.to_bits()];
+        let factor_smooth = |flavour| SmoothBasisSpec::FactorSmooth {
+            spec: FactorSmoothSpec {
+                continuous_cols: vec![0],
+                group_col: 1,
+                marginal: open_marginal(abscissa_scale),
+                flavour,
+                group_frozen_levels: Some(levels.clone()),
+                frozen_global_orthogonality: None,
+            },
+        };
         match family {
             BasisScaleFamily::ByVariableNumeric => SmoothBasisSpec::ByVariable {
                 inner: inner(),
@@ -1282,44 +1233,11 @@ mod tests {
                     frozen_levels: Some(levels),
                 },
             },
-            BasisScaleFamily::FactorSmoothFs
-            | BasisScaleFamily::FactorSmoothSz
-            | BasisScaleFamily::FactorSmoothRe => SmoothBasisSpec::FactorSmooth {
-                spec: FactorSmoothSpec {
-                    continuous_cols: vec![0],
-                    group_col: 1,
-                    marginal: open_marginal(abscissa_scale),
-                    flavour: match family {
-                        BasisScaleFamily::FactorSmoothFs => FactorSmoothFlavour::Fs {
-                            m_null_penalty_orders: vec![1],
-                        },
-                        BasisScaleFamily::FactorSmoothSz => FactorSmoothFlavour::Sz,
-                        BasisScaleFamily::FactorSmoothRe => FactorSmoothFlavour::Re,
-                        BasisScaleFamily::ByVariableNumeric
-                        | BasisScaleFamily::ByVariableFactor
-                        | BasisScaleFamily::FactorSumToZero
-                        | BasisScaleFamily::OpenBSpline
-                        | BasisScaleFamily::CyclicBSpline
-                        | BasisScaleFamily::NaturalCubic
-                        | BasisScaleFamily::BySmoothNumeric
-                        | BasisScaleFamily::BySmoothFactor
-                        | BasisScaleFamily::ThinPlate
-                        | BasisScaleFamily::SphereWahba
-                        | BasisScaleFamily::SphereHarmonic
-                        | BasisScaleFamily::ConstantCurvature
-                        | BasisScaleFamily::Matern
-                        | BasisScaleFamily::MeasureJet
-                        | BasisScaleFamily::PureDuchon
-                        | BasisScaleFamily::HybridDuchon
-                        | BasisScaleFamily::Pca
-                        | BasisScaleFamily::TensorBSpline => {
-                            unreachable!("outer factor-family match guarantees the flavour")
-                        }
-                    },
-                    group_frozen_levels: Some(levels),
-                    frozen_global_orthogonality: None,
-                },
-            },
+            BasisScaleFamily::FactorSmoothFs => factor_smooth(FactorSmoothFlavour::Fs {
+                m_null_penalty_orders: vec![1],
+            }),
+            BasisScaleFamily::FactorSmoothSz => factor_smooth(FactorSmoothFlavour::Sz),
+            BasisScaleFamily::FactorSmoothRe => factor_smooth(FactorSmoothFlavour::Re),
             BasisScaleFamily::OpenBSpline
             | BasisScaleFamily::CyclicBSpline
             | BasisScaleFamily::NaturalCubic
@@ -1775,8 +1693,9 @@ mod tests {
     #[test]
     fn malformed_frozen_scale_vectors_are_rejected_before_indexing_2315() {
         let mut basis = zoo_basis(BasisScaleFamily::Matern);
-        let SmoothBasisSpec::Matern { input_scales, .. } = &mut basis else {
-            unreachable!("family lookup returned a non-Matérn basis");
+        let input_scales = match &mut basis {
+            SmoothBasisSpec::Matern { input_scales, .. } => input_scales,
+            other => panic!("family lookup returned {other:?} instead of Matérn"),
         };
         for invalid in [vec![1.0], vec![1.0, 0.0], vec![1.0, f64::NAN]] {
             *input_scales = Some(invalid);
