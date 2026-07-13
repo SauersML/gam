@@ -2113,6 +2113,55 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
     fn variable(x: f64, axis: usize) -> Self {
         Order2(crate::jet_tower::Tower2::variable(x, axis))
     }
+
+    #[inline(always)]
+    fn symmetric_quadratic_form<C: SymmetricQuadraticCoefficients>(
+        inputs: &[Self],
+        coefficients: &C,
+    ) -> Self {
+        assert_eq!(inputs.len(), coefficients.dimension());
+        let input_dimension = inputs.len();
+        assert!(input_dimension <= K);
+        let mut values = [0.0; K];
+        for axis in 0..input_dimension {
+            values[axis] = inputs[axis].0.v;
+        }
+        let mut projected = [0.0; K];
+        coefficients.multiply(
+            &values[..input_dimension],
+            &mut projected[..input_dimension],
+        );
+
+        let mut out = crate::jet_tower::Tower2::zero();
+        for axis in 0..input_dimension {
+            out.v += values[axis] * projected[axis];
+        }
+        for primary in 0..K {
+            let mut channel = 0.0;
+            for axis in 0..input_dimension {
+                channel += projected[axis] * inputs[axis].0.g[primary];
+            }
+            out.g[primary] = 2.0 * channel;
+        }
+        for primary_a in 0..K {
+            for primary_b in primary_a..K {
+                let mut inherited = 0.0;
+                let mut curvature = 0.0;
+                for row in 0..input_dimension {
+                    inherited += projected[row] * inputs[row].0.h[primary_a][primary_b];
+                    for column in 0..input_dimension {
+                        curvature += coefficients.coefficient(row, column)
+                            * inputs[row].0.g[primary_a]
+                            * inputs[column].0.g[primary_b];
+                    }
+                }
+                let channel = 2.0 * (inherited + curvature);
+                out.h[primary_a][primary_b] = channel;
+                out.h[primary_b][primary_a] = channel;
+            }
+        }
+        Order2(out)
+    }
 }
 
 impl<const K: usize> crate::nested_dual::JetField for Order2<K> {
