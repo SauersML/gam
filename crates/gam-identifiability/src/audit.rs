@@ -2907,7 +2907,8 @@ pub fn maybe_log_audit_drift(
     family_scalars: Option<&std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     outer_iter: usize,
     every_n_iters: usize,
-) -> Option<AuditDriftSummary> {
+    probit_frailty_scale: f64,
+) -> Result<Option<AuditDriftSummary>, EstimationError> {
     // Drift threshold: re-audit when:
     //   (a) relative β movement > 0.5 (substantial step from pilot), OR
     //   (b) every `every_n_iters` outer iterations (amortised cost check).
@@ -2940,7 +2941,7 @@ pub fn maybe_log_audit_drift(
     let periodic_check = (outer_iter % period) == 0;
 
     if !large_beta_movement && !periodic_check {
-        return None;
+        return Ok(None);
     }
 
     // Run the flat audit at the current β.  For channel-aware families the
@@ -2957,34 +2958,27 @@ pub fn maybe_log_audit_drift(
     // curvature-weighted.  That is the correct identifiability check: structural
     // rank is what tells you whether the model is locally identified at β.
     let p_total: usize = specs.iter().map(|s| s.design.ncols()).sum();
-    let beta_for_state: Vec<f64> = if beta_current.len() == p_total {
-        beta_current.to_vec()
-    } else {
-        // Length mismatch: the caller's β does not match the assembled design
-        // width, so the audit cannot be evaluated at the real β. Fall back to
-        // the origin (β = 0) but record it — the structural rank read at β = 0
-        // can differ from the rank at the true β, so a drift verdict resting on
-        // this fallback is only a coarse structural check.
-        log::debug!(
-            "[identifiability-drift] beta_current len {} != design width {}; \
-             auditing structural rank at the beta=0 fallback",
+    if beta_pilot.len() != p_total || beta_current.len() != p_total {
+        return Err(EstimationError::LayoutError(format!(
+            "identifiability drift requires pilot/current beta width {p_total}, got pilot={} current={}",
+            beta_pilot.len(),
             beta_current.len(),
-            p_total,
-        );
-        vec![0.0; p_total]
-    };
+        )));
+    }
+    if !(probit_frailty_scale.is_finite() && probit_frailty_scale > 0.0) {
+        return Err(EstimationError::LayoutError(format!(
+            "identifiability drift requires a positive finite probit/frailty scale, got {probit_frailty_scale}"
+        )));
+    }
     let state = gam_problem::FamilyLinearizationState {
-        beta: &beta_for_state,
+        beta: beta_current,
         family_scalars: family_scalars.cloned(),
         channel_hessian: None,
-        probit_frailty_scale: 1.0,
+        probit_frailty_scale,
     };
 
     // Re-run the flat audit at beta_current.
-    let current_audit = match audit_identifiability_with_state(specs, &state) {
-        Ok(a) => a,
-        Err(_) => return None,
-    };
+    let current_audit = audit_identifiability_with_state(specs, &state)?;
 
     let pilot_rank: usize = pilot_audit.blocks.iter().map(|b| b.effective_dim).sum();
     let current_rank: usize = current_audit.blocks.iter().map(|b| b.effective_dim).sum();
@@ -3050,13 +3044,13 @@ pub fn maybe_log_audit_drift(
         );
     }
 
-    Some(AuditDriftSummary {
+    Ok(Some(AuditDriftSummary {
         pilot_rank,
         current_rank,
         beta_relative_change,
         newly_dropped,
         recovered,
-    })
+    }))
 }
 
 /// Run [`audit_identifiability`] with an explicit [`FamilyLinearizationState`]

@@ -323,7 +323,9 @@ fn audit_drift_detection_fires_when_rank_changes() {
         None,
         0, // outer_iter
         10,
-    );
+        1.0,
+    )
+    .expect("current-state audit must succeed");
 
     // Drift re-audit finds rank 1 (one drop) vs pilot rank 2 → summary present.
     let summary = summary.expect("audit_drift_detection_fires_when_rank_changes: expected Some");
@@ -373,7 +375,9 @@ fn audit_drift_silent_when_rank_stable() {
         None,
         0,
         10,
-    );
+        1.0,
+    )
+    .expect("current-state audit must succeed");
 
     let summary = summary.expect("audit_drift_silent_when_rank_stable: expected Some");
     assert_eq!(
