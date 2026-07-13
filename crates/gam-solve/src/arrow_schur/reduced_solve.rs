@@ -1707,6 +1707,13 @@ pub struct SurrogateLaneState {
     /// selected-inverse trace `tr(S⁻¹·M) ≈ (1/m)Σ_j (S⁻¹v_j)ᵀ(M v_j)` off the
     /// SAME probes as the value, so value and ρ-gradient never desync.
     inverse_probes: Option<(Vec<Array1<f64>>, Vec<Array1<f64>>)>,
+    /// Request/stash the lossless weighted derivative representation emitted by
+    /// the next rational value evaluation.  Unlike `inverse_probes`, this is the
+    /// derivative of the fixed rational surrogate itself (all shifted solves and
+    /// frozen-Q columns), and is the only bundle admissible for its outer
+    /// gradient.
+    request_logdet_derivative_bundle: bool,
+    logdet_derivative_bundle: Option<RationalLogdetDerivativeBundle>,
     /// The previous ρ's `S⁻¹ v_j` solves, kept as the CG warm-start for the next
     /// bundle solve. `S⁻¹` is smooth in ρ, so a neighbouring-ρ solution is a near
     /// seed (common-random-numbers reuse — the discipline that makes the
@@ -1724,6 +1731,8 @@ impl SurrogateLaneState {
             cfg,
             request_inverse_probes: false,
             inverse_probes: None,
+            request_logdet_derivative_bundle: false,
+            logdet_derivative_bundle: None,
             warm_inverse_probes: None,
         }
     }
@@ -1747,6 +1756,23 @@ impl SurrogateLaneState {
     pub fn take_inverse_probes(&mut self) -> Option<(Vec<Array1<f64>>, Vec<Array1<f64>>)> {
         self.request_inverse_probes = false;
         self.inverse_probes.take()
+    }
+
+    /// Ask the next rational value evaluation to retain its complete weighted
+    /// derivative representation. Clears stale output eagerly so a failed value
+    /// cannot be paired with a previous operator's gradient.
+    pub fn request_logdet_derivative_bundle(&mut self) {
+        self.request_logdet_derivative_bundle = true;
+        self.logdet_derivative_bundle = None;
+    }
+
+    /// Consume the derivative representation produced by the most recent
+    /// requested rational value evaluation.
+    pub fn take_logdet_derivative_bundle(
+        &mut self,
+    ) -> Option<RationalLogdetDerivativeBundle> {
+        self.request_logdet_derivative_bundle = false;
+        self.logdet_derivative_bundle.take()
     }
 }
 
@@ -1860,12 +1886,13 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
                 .as_ref()
                 .expect("plan installed just above when absent");
             let want_bundle = state.request_inverse_probes;
+            let want_logdet_derivative = state.request_logdet_derivative_bundle;
             // Value (and, when the gradient lane asked for it, the shared
             // (probes, S⁻¹·probes) bundle) computed under one borrow of the
             // frozen plan; the bundle is stashed on the lane after the borrow
             // ends. The bundle uses the plan's RAW probes v_j (not the deflation-
             // projected ones) since tr(S⁻¹·M) contracts the full S⁻¹ v_j.
-            let (estimate, bundle) = {
+            let (estimate, derivative_bundle, bundle) = {
                 // #1017: ONE reduced-Schur operator for the whole value ladder —
                 // the frozen plan walks its shift ladder through this single
                 // resident apply instead of re-capturing a `schur_matvec` closure
@@ -1887,6 +1914,16 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
                         reason: "rational log-det surrogate evaluation returned non-finite"
                             .to_string(),
                     })?;
+                let derivative_bundle = if want_logdet_derivative {
+                    Some(plan.directional_derivative_bundle(&eval).ok_or_else(|| {
+                        ArrowSchurError::SchurFactorFailed {
+                            reason: "rational log-det derivative bundle assembly failed"
+                                .to_string(),
+                        }
+                    })?)
+                } else {
+                    None
+                };
                 let bundle = if want_bundle {
                     let sinv = reduced_schur_inverse_probe_solves(
                         sys,
@@ -1907,8 +1944,12 @@ pub fn matrix_free_arrow_evidence_log_det_surrogate(
                 } else {
                     None
                 };
-                (eval.estimate, bundle)
+                (eval.estimate, derivative_bundle, bundle)
             };
+            if want_logdet_derivative {
+                state.logdet_derivative_bundle = derivative_bundle;
+                state.request_logdet_derivative_bundle = false;
+            }
             if want_bundle {
                 // Keep the fresh solves as the next ρ's warm-start seed (CRN),
                 // then hand the bundle to the gradient lane.

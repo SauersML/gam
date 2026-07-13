@@ -1003,6 +1003,51 @@ mod tests {
     }
 
     #[test]
+    fn fixed_probe_derivative_bundle_matches_rational_directional_not_raw_inverse() {
+        // Use an intentionally coarse, fixed quadrature window so the rational
+        // surrogate's derivative is decisively different from the exact
+        // shift-zero trace.  The production bundle must reproduce the former:
+        // substituting `(v, S^-1 v)` here would make this regression fail.
+        let diagonal = array![0.2, 3.0, 17.0];
+        let direction = array![1.0, 2.0, 4.0];
+        let matvec = |v: ArrayView1<f64>| &diagonal * &v;
+        let dmatvec = |v: ArrayView1<f64>| &direction * &v;
+        let plan = RationalLogdetPlan::build(3, 3, 71, 0.2, 17.0, 0.25)
+            .expect("fixed rational plan");
+        let eval = plan
+            .evaluate(&matvec, 1.0e-13, 64)
+            .expect("fixed rational evaluation");
+        let authority = plan
+            .directional_derivative(&eval, &dmatvec)
+            .expect("rational directional derivative");
+        let bundle = plan
+            .directional_derivative_bundle(&eval)
+            .expect("lossless rational derivative bundle");
+        let represented = bundle
+            .directional_derivative(&dmatvec)
+            .expect("represented directional derivative");
+        let scale = authority.abs().max(1.0);
+        assert!(
+            (represented - authority).abs() <= 64.0 * f64::EPSILON * scale,
+            "lossless bundle derivative {represented:.16e} != rational authority \
+             {authority:.16e}"
+        );
+
+        // Rademacher probes resolve this diagonal exact-inverse trace exactly;
+        // it is therefore a clean stand-in for the obsolete raw t=0 bundle.
+        let raw_shift_zero = direction
+            .iter()
+            .zip(diagonal.iter())
+            .map(|(&d, &s)| d / s)
+            .sum::<f64>();
+        assert!(
+            (raw_shift_zero - authority).abs() > 1.0e-4,
+            "fixture must separate the rational derivative ({authority:.9e}) from the \
+             raw shift-zero inverse trace ({raw_shift_zero:.9e})"
+        );
+    }
+
+    #[test]
     fn evaluate_is_deterministic_across_calls() {
         let dim = 24;
         let lambdas: Vec<f64> = (1..=dim).map(|i| i as f64).collect();
