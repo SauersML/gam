@@ -37,6 +37,7 @@ fn fixture(n: usize) -> Vec<SaeSoftmaxRowJetInput> {
             SaeSoftmaxRowJetInput {
                 n_atoms: k,
                 out_dim: p,
+                coordinate_slots: SaeSoftmaxRowJetInput::coordinate_slots_for(&primaries),
                 primaries: primaries.clone(),
                 gate_values: vec![z0, 1.0 - z0],
                 active_atoms: vec![true, true],
@@ -46,10 +47,10 @@ fn fixture(n: usize) -> Vec<SaeSoftmaxRowJetInput> {
                     .collect(),
                 decoded_first,
                 decoded_second,
-                beta_atoms: vec![0, 1],
+                beta_atoms: vec![0, 1].into(),
                 beta_basis_values: vec![0.7, -0.4],
                 beta_basis_first,
-                beta_outputs: vec![1.0, 0.2, -0.1, -0.3, 0.8, 0.5],
+                beta_outputs: vec![1.0, 0.2, -0.1, -0.3, 0.8, 0.5].into(),
             }
         })
         .collect()

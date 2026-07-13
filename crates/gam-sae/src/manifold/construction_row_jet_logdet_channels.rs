@@ -771,7 +771,9 @@ impl SaeManifoldTerm {
             )?;
             let tile_rows = plan.tile_rows;
             if tile_rows == 0 {
-                return Ok(start);
+                return Err(format!(
+                    "complete SAE row-jet planner returned an empty tile at nonempty row {start}"
+                ));
             }
             let mut inputs = Vec::with_capacity(tile_rows);
             let mut layouts = Vec::with_capacity(tile_rows);
@@ -781,12 +783,9 @@ impl SaeManifoldTerm {
                 let vars = self.row_vars_for_cache_row(row, cache)?;
                 self.assignment.try_assignments_row_into(
                     row,
-                    assignments
-                        .as_slice_mut()
-                        .ok_or_else(|| {
-                            "complete SAE row-jet assignment scratch is not contiguous"
-                                .to_string()
-                        })?,
+                    assignments.as_slice_mut().ok_or_else(|| {
+                        "complete SAE row-jet assignment scratch is not contiguous".to_string()
+                    })?,
                 )?;
                 let source = ProductionSoftmaxRowProgram {
                     term: self,

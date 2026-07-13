@@ -89,11 +89,9 @@ impl SaeSoftmaxRowJetInput {
             .copied()
             .enumerate()
             .filter_map(|(slot, primary)| match primary {
-                SaeRowJetPrimary::Coordinate { atom, axis } => Some(SaeCoordinateSlot {
-                    atom,
-                    axis,
-                    slot,
-                }),
+                SaeRowJetPrimary::Coordinate { atom, axis } => {
+                    Some(SaeCoordinateSlot { atom, axis, slot })
+                }
                 SaeRowJetPrimary::Logit { .. } => None,
             })
             .collect();
@@ -117,10 +115,7 @@ impl SaeSoftmaxRowJetInput {
     pub(crate) fn from_source<S: SaeSoftmaxRowProgramSource>(
         source: &S,
         sqrt_row_weight: f64,
-        shared_beta_layout: Option<(
-            std::sync::Arc<[usize]>,
-            std::sync::Arc<[f64]>,
-        )>,
+        shared_beta_layout: Option<(std::sync::Arc<[usize]>, std::sync::Arc<[f64]>)>,
     ) -> Result<Self, String> {
         let n_atoms = source.n_atoms();
         let out_dim = source.out_dim();
@@ -192,17 +187,15 @@ impl SaeSoftmaxRowJetInput {
             }
         }
 
-        let beta_atoms: std::sync::Arc<[usize]> = shared_beta_layout
-            .as_ref()
-            .map_or_else(
-                || {
-                    (0..n_beta)
-                        .map(|border| source.beta_border_atom(border))
-                        .collect::<Vec<_>>()
-                        .into()
-                },
-                |(atoms, _)| atoms.clone(),
-            );
+        let beta_atoms: std::sync::Arc<[usize]> = shared_beta_layout.as_ref().map_or_else(
+            || {
+                (0..n_beta)
+                    .map(|border| source.beta_border_atom(border))
+                    .collect::<Vec<_>>()
+                    .into()
+            },
+            |(atoms, _)| atoms.clone(),
+        );
         let beta_basis_values: Vec<f64> = (0..n_beta)
             .map(|border| source.beta_border_basis_value(border))
             .collect();
@@ -320,8 +313,7 @@ impl SaeSoftmaxRowJetInput {
             ));
         }
         let summation_bound = rounding_mass / (1.0 - rounding_mass);
-        let normalization_bound =
-            f64::EPSILON + summation_bound + f64::EPSILON * summation_bound;
+        let normalization_bound = f64::EPSILON + summation_bound + f64::EPSILON * summation_bound;
         if (gate_sum - 1.0).abs() > normalization_bound * gate_sum.abs().max(1.0) {
             return Err(format!(
                 "SAE row-jet gate values must sum to one within the f64 normalization bound {normalization_bound:e}; got {gate_sum:e}"
@@ -559,6 +551,12 @@ impl SaeRowJetMemoryLedger {
         let primary_bytes = q
             .checked_mul(std::mem::size_of::<SaeRowJetPrimary>())
             .ok_or_else(|| "SAE row-jet primary byte count overflow".to_string())?;
+        // The shape planner runs before row snapshots exist, so charge the
+        // canonical slot table at its exact worst-case length q. Logit entries
+        // make the realized table smaller, never larger than this bound.
+        let coordinate_slot_bytes = q
+            .checked_mul(std::mem::size_of::<SaeCoordinateSlot>())
+            .ok_or_else(|| "SAE row-jet coordinate-slot byte count overflow".to_string())?;
         let beta_atom_bytes = n_beta
             .checked_mul(std::mem::size_of::<usize>())
             .ok_or_else(|| "SAE row-jet beta-atom byte count overflow".to_string())?;
@@ -567,6 +565,7 @@ impl SaeRowJetMemoryLedger {
             f64_count(&[n_beta, p])?,
             active_bool_bytes,
             primary_bytes,
+            coordinate_slot_bytes,
             beta_atom_bytes,
             std::mem::size_of::<SaeSoftmaxRowJetInput>(),
         ]
@@ -594,12 +593,19 @@ impl SaeRowJetMemoryLedger {
         let host_bytes_per_row = shared_host
             .checked_add(staging_input.max(scheduled_output))
             .ok_or_else(|| "SAE row-jet host row-byte sum overflow".to_string())?;
-        let fixed_host_bytes = f64_count(&[k])?
-            .checked_add(std::mem::size_of::<SaeRowJetChannels>())
-            .and_then(|value| {
-                value.checked_add(4 * std::mem::size_of::<Vec<()>>())
-            })
-            .ok_or_else(|| "SAE row-jet fixed host byte sum overflow".to_string())?;
+        let fixed_host_bytes = [
+            f64_count(&[k])?,
+            f64_count(&[n_beta, p])?,
+            n_beta
+                .checked_mul(std::mem::size_of::<usize>())
+                .ok_or_else(|| "SAE row-jet shared beta-atom byte overflow".to_string())?,
+            i32_count(&[n_beta])?,
+            std::mem::size_of::<SaeRowJetChannels>(),
+            4 * std::mem::size_of::<Vec<()>>(),
+        ]
+        .into_iter()
+        .try_fold(0usize, |sum, value| sum.checked_add(value))
+        .ok_or_else(|| "SAE row-jet fixed host byte sum overflow".to_string())?;
         Ok(Self {
             fixed_device_bytes,
             device_bytes_per_row,
@@ -821,31 +827,24 @@ pub fn execute_softmax_row_jet_tile(
 
 struct InputSource<'a> {
     input: &'a SaeSoftmaxRowJetInput,
-    coordinate_slots: std::collections::HashMap<(usize, usize), usize>,
     structural_error: std::cell::RefCell<Option<String>>,
 }
 
 impl InputSource<'_> {
     fn new(input: &SaeSoftmaxRowJetInput) -> Self {
-        let coordinate_slots = input
-            .primaries
-            .iter()
-            .copied()
-            .enumerate()
-            .filter_map(|(slot, primary)| match primary {
-                SaeRowJetPrimary::Coordinate { atom, axis } => Some(((atom, axis), slot)),
-                SaeRowJetPrimary::Logit { .. } => None,
-            })
-            .collect();
         Self {
             input,
-            coordinate_slots,
             structural_error: std::cell::RefCell::new(None),
         }
     }
 
     fn coordinate_slot(&self, atom: usize, axis: usize, context: &'static str) -> Option<usize> {
-        let slot = self.coordinate_slots.get(&(atom, axis)).copied();
+        let slot = self
+            .input
+            .coordinate_slots
+            .binary_search_by_key(&(atom, axis), |entry| (entry.atom, entry.axis))
+            .ok()
+            .map(|index| self.input.coordinate_slots[index].slot);
         if slot.is_none() {
             let mut error = self.structural_error.borrow_mut();
             if error.is_none() {
@@ -903,7 +902,8 @@ impl SaeSoftmaxRowProgramSource for InputSource<'_> {
             out.fill(0.0);
             return;
         };
-        let Some(slot_b) = self.coordinate_slot(atom, axis_b, "decoded second right channel") else {
+        let Some(slot_b) = self.coordinate_slot(atom, axis_b, "decoded second right channel")
+        else {
             out.fill(0.0);
             return;
         };
@@ -1266,7 +1266,7 @@ mod device {
             .clone_htod(nonempty_f64(&beta_first).as_ref())
             .gpu_ctx("SAE row-jet htod beta basis first")?;
         let beta_output_dev = stream
-            .clone_htod(nonempty_f64(&rows[0].beta_outputs).as_ref())
+            .clone_htod(nonempty_f64(rows[0].beta_outputs.as_ref()).as_ref())
             .gpu_ctx("SAE row-jet htod beta outputs")?;
 
         let first_len = device_length(&[n, q, p])?;
@@ -1484,6 +1484,7 @@ mod tests {
                 SaeSoftmaxRowJetInput {
                     n_atoms: k,
                     out_dim: p,
+                    coordinate_slots: SaeSoftmaxRowJetInput::coordinate_slots_for(&primaries),
                     primaries: primaries.clone(),
                     gate_values,
                     active_atoms: vec![true, true, row % 2 == 0],
@@ -1491,10 +1492,10 @@ mod tests {
                     decoded,
                     decoded_first,
                     decoded_second,
-                    beta_atoms,
+                    beta_atoms: beta_atoms.into(),
                     beta_basis_values,
                     beta_basis_first,
-                    beta_outputs: vec![1.0, 0.2, -0.5, 0.8, 0.3, -0.7],
+                    beta_outputs: vec![1.0, 0.2, -0.5, 0.8, 0.3, -0.7].into(),
                 }
             })
             .collect()
