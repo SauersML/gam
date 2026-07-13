@@ -868,15 +868,15 @@ mod tests {
     fn compiled_graph_quadratic_arity_is_independent_and_matrix_free() {
         let mut workspace = Order2GraphWorkspace::new();
         workspace.reset(2);
-        let x = Order2Graph::variable(0.4, 0, 2, &workspace);
-        let y = Order2Graph::variable(-0.7, 1, 2, &workspace);
+        let x = Order2Graph::<2>::variable(0.4, 0, 2, &workspace);
+        let y = Order2Graph::<2>::variable(-0.7, 1, 2, &workspace);
         let xy = x.product(&y);
         let coefficients = MatrixFreeDense3 {
             matrix: [[1.2, -0.3, 0.25], [-0.3, 0.8, 0.17], [0.25, 0.17, 1.4]],
             workspace: &workspace,
         };
         let graph =
-            Order2Graph::symmetric_quadratic_form(&[x, y, xy], &coefficients, 2, &workspace)
+            Order2Graph::<2>::symmetric_quadratic_form(&[x, y, xy], &coefficients, 2, &workspace)
                 .into_order2();
 
         let arena = DynamicJetArena::new();
