@@ -1477,7 +1477,7 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
             return Ok(None);
         };
 
-        let hessian_psi_psi_operator: Box<dyn HyperOperator> = Box::new(
+        let hessian_psi_psi_operator: Arc<dyn HyperOperator> = Arc::new(
             TransformationNormalPsiPsiHessianOperator::new_with_trace_axes(
                 Arc::new(self.family.clone()),
                 entry.beta.as_ref().clone(),
