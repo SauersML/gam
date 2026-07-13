@@ -3,7 +3,7 @@ use crate::util::span::span_index_for_breakpoints;
 use gam_linalg::faer_ndarray::{FaerEigh, fast_ab};
 use gam_solve::pirls::LinearInequalityConstraints;
 use gam_terms::basis::create_ispline_derivative_dense;
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 /// Require a breakpoint sequence suitable for BMS span lookup: finite,
 /// strictly increasing, and long enough to define at least one span.
@@ -999,7 +999,7 @@ impl DeviationRuntime {
 
     pub(super) fn validate_beta_shape(
         &self,
-        beta: &Array1<f64>,
+        beta: ArrayView1<'_, f64>,
         label: &str,
     ) -> Result<(), String> {
         if beta.len() != self.basis_dim {
@@ -1266,18 +1266,18 @@ impl DeviationRuntime {
 
     pub(crate) fn local_cubic_on_span(
         &self,
-        beta: &Array1<f64>,
+        beta: ArrayView1<'_, f64>,
         span_idx: usize,
     ) -> Result<exact_kernel::LocalSpanCubic, String> {
-        self.validate_beta_shape(beta, "deviation local cubic coefficients")?;
+        self.validate_beta_shape(beta.view(), "deviation local cubic coefficients")?;
         let (left, right) = self.span_interval(span_idx)?;
         Ok(exact_kernel::LocalSpanCubic {
             left,
             right,
-            c0: self.span_c0.row(span_idx).dot(beta),
-            c1: self.span_c1.row(span_idx).dot(beta),
-            c2: self.span_c2.row(span_idx).dot(beta),
-            c3: self.span_c3.row(span_idx).dot(beta),
+            c0: self.span_c0.row(span_idx).dot(&beta),
+            c1: self.span_c1.row(span_idx).dot(&beta),
+            c2: self.span_c2.row(span_idx).dot(&beta),
+            c3: self.span_c3.row(span_idx).dot(&beta),
         })
     }
 
@@ -1411,16 +1411,16 @@ impl DeviationRuntime {
     /// left span so span-local third derivatives match derivative designs.
     pub(crate) fn local_cubic_at(
         &self,
-        beta: &Array1<f64>,
+        beta: ArrayView1<'_, f64>,
         value: f64,
     ) -> Result<exact_kernel::LocalSpanCubic, String> {
-        self.validate_beta_shape(beta, "deviation local cubic")?;
+        self.validate_beta_shape(beta.view(), "deviation local cubic")?;
         let (left_ep, right_ep) = self.support_interval()?;
         if value < left_ep {
             return Ok(exact_kernel::LocalSpanCubic {
                 left: left_ep,
                 right: left_ep + 1.0,
-                c0: self.left_tail_value(beta),
+                c0: self.left_tail_value(beta.view()),
                 c1: 0.0,
                 c2: 0.0,
                 c3: 0.0,
@@ -1430,7 +1430,7 @@ impl DeviationRuntime {
             return Ok(exact_kernel::LocalSpanCubic {
                 left: right_ep,
                 right: right_ep + 1.0,
-                c0: self.right_tail_value(beta),
+                c0: self.right_tail_value(beta.view()),
                 c1: 0.0,
                 c2: 0.0,
                 c3: 0.0,
@@ -1444,14 +1444,14 @@ impl DeviationRuntime {
 
     /// Left-tail constant: deviation value at the leftmost breakpoint.
     /// For anchored I-spline bases this is the anchor value (typically 0).
-    pub(super) fn left_tail_value(&self, beta: &Array1<f64>) -> f64 {
-        self.span_c0.row(0).dot(beta)
+    pub(super) fn left_tail_value(&self, beta: ArrayView1<'_, f64>) -> f64 {
+        self.span_c0.row(0).dot(&beta)
     }
 
     /// Right-tail constant: deviation value at the rightmost breakpoint.
     /// For I-spline bases this is the saturated integral value.
-    pub(super) fn right_tail_value(&self, beta: &Array1<f64>) -> f64 {
-        self.right_boundary_value_row.dot(beta)
+    pub(super) fn right_tail_value(&self, beta: ArrayView1<'_, f64>) -> f64 {
+        self.right_boundary_value_row.dot(&beta)
     }
 
     /// Conservative L1 sup-norm bound for the deviation value basis.

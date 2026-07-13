@@ -262,14 +262,14 @@ pub(crate) fn build_denested_partition_cells(
         &link_breaks,
         |z| {
             if let (Some(runtime), Some(beta)) = (score_warp, beta_h) {
-                runtime.local_cubic_at(beta, z)
+                runtime.local_cubic_at(beta.view(), z)
             } else {
                 Ok(zero_local_span_cubic())
             }
         },
         |u| {
             if let (Some(runtime), Some(beta)) = (link_dev, beta_w) {
-                runtime.local_cubic_at(beta, u)
+                runtime.local_cubic_at(beta.view(), u)
             } else {
                 Ok(zero_local_span_cubic())
             }
@@ -313,12 +313,12 @@ pub(crate) fn observed_denested_cell_partials(
     let zero_link_span = zero_local_span_cubic();
     let u_obs = a + b * z_obs;
     let score_span_obs = if let (Some(runtime), Some(beta_h)) = (score_warp, beta_h) {
-        runtime.local_cubic_at(beta_h, z_obs)?
+        runtime.local_cubic_at(beta_h.view(), z_obs)?
     } else {
         zero_score_span
     };
     let link_span_obs = if let (Some(runtime), Some(beta_w)) = (link_dev, beta_w) {
-        runtime.local_cubic_at(beta_w, u_obs)?
+        runtime.local_cubic_at(beta_w.view(), u_obs)?
     } else {
         zero_link_span
     };

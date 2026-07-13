@@ -41,7 +41,7 @@ impl SurvivalMarginalSlopeFamily {
             |z| self.score_warp_local_cubic_at(beta_h, z),
             |u| {
                 if let (Some(runtime), Some(beta_w)) = (self.link_dev.as_ref(), beta_w) {
-                    runtime.local_cubic_at(beta_w, u)
+                    runtime.local_cubic_at(beta_w.view(), u)
                 } else {
                     Ok(Self::zero_score_warp_span())
                 }

@@ -59,7 +59,7 @@ impl SurvivalMarginalSlopeFamily {
             .score_warp
             .as_ref()
             .ok_or_else(|| "missing survival score-warp runtime".to_string())?;
-        score_warp_component_beta(runtime, beta_h, coord)
+        Ok(score_warp_component_beta(runtime, beta_h.view(), coord)?.to_owned())
     }
 
     #[inline]
@@ -97,12 +97,12 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(Self::zero_score_warp_span());
         };
         if self.score_dim() == 1 {
-            return runtime.local_cubic_at(beta_h, value);
+            return runtime.local_cubic_at(beta_h.view(), value);
         }
         let mut sum = Self::zero_score_warp_span();
         for coord in 0..self.score_dim() {
-            let local_beta = score_warp_component_beta(runtime, beta_h, coord)?;
-            let span = runtime.local_cubic_at(&local_beta, value)?;
+            let local_beta = score_warp_component_beta(runtime, beta_h.view(), coord)?;
+            let span = runtime.local_cubic_at(local_beta, value)?;
             if coord == 0 {
                 sum = exact_kernel::LocalSpanCubic {
                     left: span.left,
@@ -128,10 +128,10 @@ impl SurvivalMarginalSlopeFamily {
         };
         let mut value = 0.0;
         for coord in 0..self.score_dim() {
-            let local_beta = score_warp_component_beta(runtime, beta_h, coord)?;
+            let local_beta = score_warp_component_beta(runtime, beta_h.view(), coord)?;
             let z_coord = self.z[[row, coord]];
             value += runtime
-                .local_cubic_at(&local_beta, z_coord)?
+                .local_cubic_at(local_beta, z_coord)?
                 .evaluate(z_coord);
         }
         Ok(value)

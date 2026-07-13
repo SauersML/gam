@@ -135,7 +135,7 @@ fn saved_anchored_deviation_runtime_local_cubic_reconstructs_values() {
     assert!(n_spans >= 2);
     for span_idx in 0..n_spans {
         let cubic = runtime
-            .local_cubic_on_span(&beta, span_idx)
+            .local_cubic_on_span(beta.view(), span_idx)
             .expect("local cubic");
         let x_eval = array![cubic.left, 0.5 * (cubic.left + cubic.right), cubic.right];
         let expected = runtime.design(&x_eval).expect("design").dot(&beta);
@@ -147,14 +147,16 @@ fn saved_anchored_deviation_runtime_local_cubic_reconstructs_values() {
             let x = x_eval[i];
             assert!((cubic.evaluate(x) - expected[i]).abs() < 1e-10);
             assert!((cubic.first_derivative(x) - expected_d1[i]).abs() < 1e-10);
-            let selected = runtime.local_cubic_at(&beta, x).expect("local cubic at x");
+            let selected = runtime
+                .local_cubic_at(beta.view(), x)
+                .expect("local cubic at x");
             let expected_span_idx = if i == 0 && span_idx > 0 {
                 span_idx - 1
             } else {
                 span_idx
             };
             let expected_cubic = runtime
-                .local_cubic_on_span(&beta, expected_span_idx)
+                .local_cubic_on_span(beta.view(), expected_span_idx)
                 .expect("expected local cubic on span");
             assert_eq!(selected.left, expected_cubic.left);
             assert_eq!(selected.right, expected_cubic.right);

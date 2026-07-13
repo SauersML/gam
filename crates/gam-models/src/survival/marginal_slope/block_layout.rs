@@ -32,11 +32,11 @@ pub(crate) fn score_warp_component_range(
     coord * p..(coord + 1) * p
 }
 
-pub(crate) fn score_warp_component_beta(
+pub(crate) fn score_warp_component_beta<'a>(
     runtime: &DeviationRuntime,
-    beta: &Array1<f64>,
+    beta: ArrayView1<'a, f64>,
     coord: usize,
-) -> Result<Array1<f64>, String> {
+) -> Result<ArrayView1<'a, f64>, String> {
     let range = score_warp_component_range(runtime, coord);
     if range.end > beta.len() {
         return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
@@ -48,7 +48,7 @@ pub(crate) fn score_warp_component_beta(
         }
         .into());
     }
-    Ok(beta.slice(s![range]).to_owned())
+    Ok(beta.slice_move(s![range]))
 }
 
 /// Stripe a (post-reparam) scalar score-warp `base` across K z coordinates
