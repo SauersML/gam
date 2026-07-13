@@ -1987,8 +1987,8 @@ impl HvpKernelBackend {
 /// bit-for-bit precisely because `marginal_design` and `β_m` are the matched
 /// (design, coefficient) pair the CPU path uses. The validation below pins
 /// `marginal_design.len() == n·p_m` (with `p_m` widened), so a stale narrow
-/// design against a widened `block.p_m` is rejected cleanly (CPU fallback)
-/// rather than silently computing the wrong η. The absorber is dropped at
+/// design against a widened `block.p_m` is rejected cleanly rather than
+/// silently computing the wrong η. The absorber is dropped at
 /// predict, where the marginal design is rebuilt without the influence columns,
 /// so the predict-time `p_m` is narrow and this path is correct there too.
 #[cfg(target_os = "linux")]
@@ -2113,6 +2113,11 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("bms_flex_row device-resident alloc hess: {err}"),
             })?;
+    let mut d_status = stream
+        .alloc_zeros::<u32>(n)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row device-resident alloc status: {err}"),
+        })?;
 
     let func = backend
         .module
@@ -2181,7 +2186,8 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
         .arg(&d_e_obs)
         .arg(&mut d_neglog)
         .arg(&mut d_grad)
-        .arg(&mut d_hess);
+        .arg(&mut d_hess)
+        .arg(&mut d_status);
     // SAFETY: same shape contract as `launch_linux`: every kernel parameter is
     // either a primitive scalar by-value, a const device pointer whose
     // capacity was validated by `inputs.validate()`, or one of the three
@@ -2195,11 +2201,30 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
             reason: format!("bms_flex_row device-resident synchronize: {err}"),
         })?;
 
+    let status = stream
+        .clone_dtoh(&d_status)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row device-resident download status: {err}"),
+        })?;
+    if let Some((row, code)) = status
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, code)| *code != 0)
+    {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row device-resident rejected non-finite row {row} with status {code}"
+            ),
+        });
+    }
+    drop(d_status);
+
     // The kernel writes neglog + grad alongside the row Hessian, but the
     // device-resident cache path keeps neither on the host: the fused
     // CPU gradient pass (the only consumer of host-side neglog/grad) is
-    // dispatched only as a fallback when the GPU dense-block kernel does
-    // not apply, and in that fallback the row kernel runs again locally.
+    // dispatched only when the GPU dense-block kernel does not apply. In that
+    // distinct consumer path, the row kernel runs again locally.
     // Drop the device buffers so the allocation pool reclaims them
     // immediately rather than tying them to the cache's lifetime.
     drop(d_neglog);
