@@ -130,6 +130,36 @@ fn linear_combination_default<T>(
         })
 }
 
+fn multiply_add_default<T>(
+    left: &T,
+    right: &T,
+    addend: &T,
+    mul: impl Fn(&T, &T) -> T,
+    add: impl Fn(&T, &T) -> T,
+) -> T {
+    add(&mul(left, right), addend)
+}
+
+fn composed_sum_default<T>(
+    inputs: &[T],
+    derivative_stacks: &[[f64; 5]],
+    constant: impl Fn(f64) -> T,
+    add: impl Fn(&T, &T) -> T,
+    compose: impl Fn(&T, [f64; 5]) -> T,
+) -> T {
+    assert_eq!(
+        inputs.len(),
+        derivative_stacks.len(),
+        "composed-sum term-count mismatch"
+    );
+    inputs
+        .iter()
+        .zip(derivative_stacks)
+        .fold(constant(0.0), |sum, (input, &stack)| {
+            add(&sum, &compose(input, stack))
+        })
+}
+
 /// A truncated-Taylor scalar carrying derivatives in `K` primaries.
 ///
 /// All concrete scalars here ([`Order2`], [`OneSeed`], [`TwoSeed`]) and the full
@@ -172,6 +202,33 @@ pub trait JetScalar<const K: usize>: crate::nested_dual::JetField + Copy {
             Self::constant,
             crate::nested_dual::JetField::add,
             crate::nested_dual::JetField::scale,
+        )
+    }
+
+    /// Add a primal constant without changing derivative channels.
+    fn add_constant(&self, constant: f64) -> Self {
+        self.add(&Self::constant(constant))
+    }
+
+    /// Evaluate `self * right + addend` in one semantic primitive.
+    fn multiply_add(&self, right: &Self, addend: &Self) -> Self {
+        multiply_add_default(
+            self,
+            right,
+            addend,
+            crate::nested_dual::JetField::mul,
+            crate::nested_dual::JetField::add,
+        )
+    }
+
+    /// Sum unary compositions directly from certified derivative stacks.
+    fn composed_sum(inputs: &[Self], derivative_stacks: &[[f64; 5]]) -> Self {
+        composed_sum_default(
+            inputs,
+            derivative_stacks,
+            Self::constant,
+            crate::nested_dual::JetField::add,
+            crate::nested_dual::JetField::compose_unary,
         )
     }
 
@@ -303,6 +360,36 @@ pub trait RuntimeJetScalar<'arena>: Clone {
             |value| Self::constant(value, dimension, workspace),
             Self::add,
             Self::scale,
+        )
+    }
+
+    /// Add a primal constant without changing derivative channels.
+    fn add_constant(&self, constant: f64) -> Self {
+        self.add(&Self::constant(constant, self.dimension(), self.workspace()))
+    }
+
+    /// Workspace backing this scalar. Direct runtime lowerings use it to avoid
+    /// constructing a zero-derivative constant for [`Self::add_constant`].
+    fn workspace(&self) -> &'arena Self::Workspace;
+
+    /// Evaluate `self * right + addend` in one semantic primitive.
+    fn multiply_add(&self, right: &Self, addend: &Self) -> Self {
+        multiply_add_default(self, right, addend, Self::mul, Self::add)
+    }
+
+    /// Sum unary compositions directly from certified derivative stacks.
+    fn composed_sum(
+        inputs: &[Self],
+        derivative_stacks: &[[f64; 5]],
+        dimension: usize,
+        workspace: &'arena Self::Workspace,
+    ) -> Self {
+        composed_sum_default(
+            inputs,
+            derivative_stacks,
+            |value| Self::constant(value, dimension, workspace),
+            Self::add,
+            Self::compose_unary,
         )
     }
     /// Number of primary derivative axes carried by this scalar.
