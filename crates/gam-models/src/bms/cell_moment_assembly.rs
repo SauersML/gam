@@ -4081,7 +4081,7 @@ mod empirical_flex_jet_oracle_tests {
     //! the witness rejects it.
 
     use super::*;
-    use gam_math::jet_scalar::{DynamicJetArena, DynamicOneSeed, DynamicTwoSeed};
+    use gam_math::jet_scalar::{DynamicJetArena, DynamicOneSeed, DynamicTwoSeed, RuntimeJetScalar};
 
     fn unit_primary_direction(r: usize, idx: usize) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(r);

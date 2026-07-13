@@ -205,9 +205,7 @@ fn bernoulli_flex_axis_tensor_cache_matches_slow_recompute() {
         let mut q_dir = Array1::<f64>::zeros(r);
         q_dir[q] = 1.25;
         let zero_fourth = family
-            .row_primary_fourth_contracted(
-                row, &states, &cache, row_ctx, &zero_dir, &q_dir,
-            )
+            .row_primary_fourth_contracted(row, &states, &cache, row_ctx, &zero_dir, &q_dir)
             .expect("zero fourth fast path");
         assert!(
             zero_fourth.iter().all(|&value| value == 0.0),
@@ -245,9 +243,7 @@ fn bernoulli_flex_axis_tensor_cache_matches_slow_recompute() {
                     .row_primary_third_contracted(row, &states, &cache, row_ctx, &dir)
                     .expect("fast third");
                 let slow = family
-                    .row_primary_third_contracted_with_moments(
-                        row, &states, &cache, row_ctx, &dir,
-                    )
+                    .row_primary_third_contracted_with_moments(row, &states, &cache, row_ctx, &dir)
                     .expect("slow third");
                 assert_eq!(fast.dim(), (r, r));
                 for (a, b) in fast.iter().zip(slow.iter()) {
@@ -265,19 +261,13 @@ fn bernoulli_flex_axis_tensor_cache_matches_slow_recompute() {
                 let mut dv = Array1::<f64>::zeros(r);
                 dv[av] = sv;
                 let fast = family
-                    .row_primary_fourth_contracted(
-                        row, &states, &cache, row_ctx, &du, &dv,
-                    )
+                    .row_primary_fourth_contracted(row, &states, &cache, row_ctx, &du, &dv)
                     .expect("fast fourth");
                 let ordered = family
-                    .row_primary_fourth_contracted_ordered(
-                        row, &states, &cache, row_ctx, &du, &dv,
-                    )
+                    .row_primary_fourth_contracted_ordered(row, &states, &cache, row_ctx, &du, &dv)
                     .expect("slow fourth ordered");
                 let swapped = family
-                    .row_primary_fourth_contracted_ordered(
-                        row, &states, &cache, row_ctx, &dv, &du,
-                    )
+                    .row_primary_fourth_contracted_ordered(row, &states, &cache, row_ctx, &dv, &du)
                     .expect("slow fourth swapped");
                 for ((f, o), w) in fast.iter().zip(ordered.iter()).zip(swapped.iter()) {
                     let slow = 0.5 * (o + w);
@@ -617,8 +607,7 @@ fn bernoulli_flex_hvp_cache_matches_uncached_path_small_case() {
         row_primary_hessians: RowPrimaryEvalCache::Empty,
         rigid_third_full: gam_runtime::resource::RayonSafeOnce::new(),
         rigid_fourth_full: gam_runtime::resource::RayonSafeOnce::new(),
-        flex_axis_third_tensors: gam_runtime::resource::RayonSafeOnce::new(),
-        flex_axis_fourth_tensors: gam_runtime::resource::RayonSafeOnce::new(),
+        flex_row_program_derivatives: gam_runtime::resource::RayonSafeOnce::new(),
         full_data_outer_rows: std::sync::OnceLock::new(),
     };
     let direction =
@@ -696,8 +685,7 @@ fn bernoulli_flex_tiled_hvp_cache_matches_host_cache_small_case() {
         )),
         rigid_third_full: gam_runtime::resource::RayonSafeOnce::new(),
         rigid_fourth_full: gam_runtime::resource::RayonSafeOnce::new(),
-        flex_axis_third_tensors: gam_runtime::resource::RayonSafeOnce::new(),
-        flex_axis_fourth_tensors: gam_runtime::resource::RayonSafeOnce::new(),
+        flex_row_program_derivatives: gam_runtime::resource::RayonSafeOnce::new(),
         full_data_outer_rows: std::sync::OnceLock::new(),
     };
     let direction =
@@ -779,8 +767,7 @@ fn bernoulli_flex_hvp_cache_timing_large_scale_shape_pattern() {
         row_primary_hessians: RowPrimaryEvalCache::Empty,
         rigid_third_full: gam_runtime::resource::RayonSafeOnce::new(),
         rigid_fourth_full: gam_runtime::resource::RayonSafeOnce::new(),
-        flex_axis_third_tensors: gam_runtime::resource::RayonSafeOnce::new(),
-        flex_axis_fourth_tensors: gam_runtime::resource::RayonSafeOnce::new(),
+        flex_row_program_derivatives: gam_runtime::resource::RayonSafeOnce::new(),
         full_data_outer_rows: std::sync::OnceLock::new(),
     };
     let directions: Vec<_> = (0..4)
@@ -900,10 +887,7 @@ fn bernoulli_large_scale_outer_derivatives_keep_analytic_hessian_route() {
         crate::custom_family::custom_family_outer_derivatives(&family, &specs, &options);
 
     assert_eq!(gradient, gam_problem::Derivative::Analytic);
-    assert_eq!(
-        hessian,
-        gam_problem::DeclaredHessianForm::Either
-    );
+    assert_eq!(hessian, gam_problem::DeclaredHessianForm::Either);
 }
 
 #[test]
@@ -1219,12 +1203,8 @@ fn bernoulli_contracted_psi_second_order_matches_per_pair_contraction() {
         );
 
         let hess_dense = match &contracted.hessian[i] {
-            gam_problem::DriftDerivResult::Operator(op) => {
-                op.to_dense()
-            }
-            gam_problem::DriftDerivResult::Dense(m) => {
-                m.clone()
-            }
+            gam_problem::DriftDerivResult::Operator(op) => op.to_dense(),
+            gam_problem::DriftDerivResult::Dense(m) => m.clone(),
         };
         let hess_err = rel_diff_array2(&hess_dense, &ref_hess);
         assert!(
@@ -1531,7 +1511,9 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
 fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
     use gam_custom_family::build_psi_hyper_coords;
     use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
-    use gam_solve::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianFactorization};
+    use gam_solve::estimate::reml::reml_outer_engine::{
+        DenseSpectralOperator, HessianFactorization,
+    };
 
     let n = 32usize;
     let y: Array1<f64> =
@@ -1866,10 +1848,8 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
         }],
     };
     let base_spec = make_spec(base_length_scale);
-    let base_design =
-        build_term_collection_design(data.view(), &base_spec).expect("base design");
-    let frozen_spec =
-        freeze_term_collection_from_design(&base_spec, &base_design).expect("freeze");
+    let base_design = build_term_collection_design(data.view(), &base_spec).expect("base design");
+    let frozen_spec = freeze_term_collection_from_design(&base_spec, &base_design).expect("freeze");
     let p_log = base_design.design.ncols();
     let beta_marg = array![0.4_f64, -0.3];
     let beta_log = Array1::from_shape_fn(p_log, |k| 0.1 * ((k % 3) as f64 - 1.0));
@@ -1889,9 +1869,9 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
         let derivative_blocks = vec![Vec::new(), logslope_psi];
         let marginal_mat =
             Array2::from_shape_fn((n, 2), |(r, c)| if c == 0 { 1.0 } else { marginal_cov[r] });
-        let marginal_design = DesignMatrix::Dense(
-            gam_linalg::matrix::DenseDesignMatrix::from(marginal_mat.clone()),
-        );
+        let marginal_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            marginal_mat.clone(),
+        ));
         let logslope_design = design.design.clone();
         let family = BernoulliMarginalSlopeFamily {
             y: Arc::new(y.clone()),
@@ -2369,9 +2349,7 @@ impl gam_math::jet_tower::RowProgram<2> for BernoulliRigidNllProgram {
             marginal.q4,
         ]);
         let observed_g = p[1].scale(s_f);
-        let one_plus_b2 = observed_g
-            .mul(&observed_g)
-            .add(&S::constant(1.0));
+        let one_plus_b2 = observed_g.mul(&observed_g).add(&S::constant(1.0));
         let c = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.value()));
         let eta = q.mul(&c).add(&observed_g.scale(z));
         let m = eta.scale(s);
@@ -2392,8 +2370,8 @@ impl gam_math::jet_tower::RowProgram<2> for BernoulliRigidNllProgram {
 /// is CI-verified channel-by-channel against the one-expression truth.
 #[test]
 fn bernoulli_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
-    use gam_math::jet_tower::{KernelChannels, program_full_tower, verify_kernel_channels};
     use crate::row_kernel::RowKernel;
+    use gam_math::jet_tower::{KernelChannels, program_full_tower, verify_kernel_channels};
 
     let n = 6usize;
     let dirs: [[f64; 2]; 3] = [[0.8, -0.6], [-0.35, 1.1], [1.4, 0.25]];
