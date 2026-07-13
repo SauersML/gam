@@ -1352,8 +1352,10 @@ pub struct TorusHarmonicMode {
 
 #[derive(Debug, Clone)]
 pub struct TorusHarmonicEvaluator {
-    pub latent_dim: usize,
-    pub num_harmonics: usize,
+    latent_dim: usize,
+    num_harmonics: usize,
+    axis_basis_size: usize,
+    basis_size: usize,
 }
 
 impl TorusHarmonicEvaluator {
@@ -1370,7 +1372,7 @@ impl TorusHarmonicEvaluator {
             .ok_or_else(|| {
                 "TorusHarmonicEvaluator: per-axis basis width overflowed usize".to_string()
             })?;
-        (0..latent_dim)
+        let basis_size = (0..latent_dim)
             .try_fold(1usize, |width, _| width.checked_mul(axis_width))
             .ok_or_else(|| {
                 "TorusHarmonicEvaluator: tensor basis width overflowed usize".to_string()
@@ -1378,23 +1380,25 @@ impl TorusHarmonicEvaluator {
         Ok(Self {
             latent_dim,
             num_harmonics,
+            axis_basis_size: axis_width,
+            basis_size,
         })
     }
 
+    pub fn latent_dim(&self) -> usize {
+        self.latent_dim
+    }
+
+    pub fn num_harmonics(&self) -> usize {
+        self.num_harmonics
+    }
+
     pub fn axis_basis_size(&self) -> usize {
-        2 * self.num_harmonics + 1
+        self.axis_basis_size
     }
 
     pub fn basis_size(&self) -> usize {
-        // (2H+1)^d — computed iteratively to surface overflow.
-        let axis_m = self.axis_basis_size();
-        let mut total: usize = 1;
-        for _ in 0..self.latent_dim {
-            total = total
-                .checked_mul(axis_m)
-                .expect("TorusHarmonicEvaluator: basis size overflowed usize");
-        }
-        total
+        self.basis_size
     }
 
     /// Real Fourier component represented by one per-axis column index.
@@ -4141,6 +4145,13 @@ mod tests {
             twins[[row, 1]] = -twins[[row, 1]];
         }
         assert_quotient_deck_covariance(&evaluator, &coords, &twins, [1.0, -1.0]);
+    }
+
+    #[test]
+    fn harmonic_cover_constructors_reject_width_overflow_without_panicking() {
+        assert!(SphericalHarmonicEvaluator::new(usize::MAX).is_err());
+        assert!(TorusHarmonicEvaluator::new(1, usize::MAX).is_err());
+        assert!(TorusHarmonicEvaluator::new(usize::BITS as usize, 1).is_err());
     }
 
     #[test]

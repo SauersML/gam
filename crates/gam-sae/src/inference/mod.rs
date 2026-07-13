@@ -8,6 +8,7 @@
 //! old `gam::inference::{atom_lens, steering, ...}` paths valid via re-exports.
 
 pub mod atlas_nerve;
+pub mod atlas_holonomy;
 pub mod atom_geometry;
 pub mod atom_lens;
 pub mod checkpoint_dynamics;

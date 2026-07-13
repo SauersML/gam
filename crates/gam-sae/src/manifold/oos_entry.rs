@@ -336,7 +336,7 @@ fn sphere_penalty() -> Array2<f64> {
 
 fn torus_penalty(evaluator: &TorusHarmonicEvaluator) -> Array2<f64> {
     let axis_m = evaluator.axis_basis_size();
-    let latent_dim = evaluator.latent_dim;
+    let latent_dim = evaluator.latent_dim();
     let m = evaluator.basis_size();
     let mut penalty = Array2::<f64>::zeros((m, m));
     let mut index = vec![0usize; latent_dim];

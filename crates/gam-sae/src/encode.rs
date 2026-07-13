@@ -240,15 +240,15 @@ impl BasisHessianLipschitz for TorusHarmonicEvaluator {
     }
     fn jacobian_sup(&self, chart: &ChartRegion) -> f64 {
         chart.assert_valid();
-        torus_jet_sup(self.num_harmonics, self.latent_dim, 1)
+        torus_jet_sup(self.num_harmonics(), self.latent_dim(), 1)
     }
     fn hessian_sup(&self, chart: &ChartRegion) -> f64 {
         chart.assert_valid();
-        torus_jet_sup(self.num_harmonics, self.latent_dim, 2)
+        torus_jet_sup(self.num_harmonics(), self.latent_dim(), 2)
     }
     fn third_sup(&self, chart: &ChartRegion) -> f64 {
         chart.assert_valid();
-        torus_jet_sup(self.num_harmonics, self.latent_dim, 3)
+        torus_jet_sup(self.num_harmonics(), self.latent_dim(), 3)
     }
 }
 
