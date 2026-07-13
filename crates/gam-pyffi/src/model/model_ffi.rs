@@ -310,6 +310,10 @@ struct PredictionPayload {
     /// predictions or model classes that do not carry the field yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     interval_method: Option<String>,
+    /// Exact covariance definition used for model-based interval uncertainty.
+    /// Omitted for point-only and conformal predictions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    covariance_source: Option<String>,
 }
 
 /// Typed wire payload for NUTS posterior draws.

@@ -34,7 +34,7 @@
 //! (`unconditional = FALSE`), while `unconditional = TRUE` adds the Wood--Pya--
 //! Säfken smoothing-parameter correction. gam is checked both ways: explicit
 //! `Conditional` intervals stay conditional, and the default
-//! `ConditionalPlusSmoothingPreferred` path must widen from `Vb` to the
+//! `SmoothingCorrected` path must widen from `Vb` to the
 //! rho-marginalized `Vp` whenever the fitted smooth exposes that correction.
 
 use csv::StringRecord;
@@ -201,7 +201,7 @@ fn response_scale_ci_is_calibrated_and_matches_or_beats_mgcv() {
             &fit.fit,
             &PredictUncertaintyOptions {
                 confidence_level: NOMINAL,
-                covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+                covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
                 mean_interval_method: MeanIntervalMethod::Delta,
                 includeobservation_interval: false,
                 apply_bias_correction: false,
@@ -214,7 +214,8 @@ fn response_scale_ci_is_calibrated_and_matches_or_beats_mgcv() {
         )
         .expect("gam rho-marginalized uncertainty prediction");
         assert!(
-            pred_rho_marginalized.covariance_corrected_used,
+            pred_rho_marginalized.covariance_source
+                == InferenceCovarianceMode::SmoothingCorrected,
             "smooth fit should expose and use the smoothing-parameter-corrected covariance"
         );
         let rho_mean_lower = pred_rho_marginalized.mean_lower.to_vec();

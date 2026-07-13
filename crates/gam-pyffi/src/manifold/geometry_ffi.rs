@@ -7960,6 +7960,20 @@ fn predict_dataset_impl(
         return predict_table_survival(model, &dataset, &options);
     }
     let columns = predict_columns(model, dataset, &options)?;
+    let covariance_source = if options.interval.is_some() {
+        if model.payload().spline_scan.is_some() {
+            Some("spline-scan-posterior".to_string())
+        } else {
+            Some(
+                parse_covariance_mode(options.covariance_mode.as_deref())?
+                    .unwrap_or(gam_predict::InferenceCovarianceMode::SmoothingCorrected)
+                    .as_str()
+                    .to_string(),
+            )
+        }
+    } else {
+        None
+    };
     serde_json::to_string(&PredictionPayload {
         columns,
         model_class: prediction_model_class_label(model),
@@ -7968,6 +7982,7 @@ fn predict_dataset_impl(
         // predictive band (or no interval at all); the jackknife+ provenance
         // tag is only attached by the dedicated full-conformal predict entry.
         interval_method: None,
+        covariance_source,
     })
     .map_err(|err| format!("failed to serialize prediction payload: {err}"))
 }
@@ -8161,7 +8176,7 @@ fn predict_columns(
             // link-wiggle path that never bias-corrects; bias-aware coverage is
             // already supplied by the smoothing-corrected covariance.
             //
-            // CLI<->Python parity: `covariance_mode` (default smoothing-preferred,
+            // CLI<->Python parity: `covariance_mode` (default smoothing-corrected,
             // matching the prior hardcode) and `observation_interval` are now
             // user-selectable, mirroring `gam predict --covariance-mode` and the
             // engine's `includeobservation_interval` switch.
@@ -8427,6 +8442,7 @@ fn predict_encoded_table_conformal_impl(
         interval_method: Some(
             "split-conformal (distribution-free, finite-sample marginal coverage)".to_string(),
         ),
+        covariance_source: None,
     })
     .map_err(|err| format!("failed to serialize conformal prediction payload: {err}"))
 }
@@ -8545,6 +8561,7 @@ fn predict_encoded_table_jackknife_plus_impl(
             conformal_level * 100.0,
             (2.0 * conformal_level - 1.0).max(0.0) * 100.0
         )),
+        covariance_source: None,
     })
     .map_err(|err| format!("failed to serialize jackknife+ prediction payload: {err}"))
 }
@@ -8674,6 +8691,7 @@ fn predict_encoded_table_full_conformal_impl(
              frozen_rho_certified=1, under the global-ρ grid-Lipschitz assumption)",
             conformal_level * 100.0
         )),
+        covariance_source: None,
     })
     .map_err(|err| format!("failed to serialize full-conformal prediction payload: {err}"))
 }

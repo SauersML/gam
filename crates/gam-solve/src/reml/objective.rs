@@ -139,7 +139,7 @@ impl<'a> RemlState<'a> {
                 p.len()
             );
         }
-        let rho_key = EvalCacheManager::sanitized_rhokey(p);
+        let rho_key = self.rhokey_sanitized(p);
         if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
             log::debug!(
                 "[REML] eval#{} cache hit | cost {:.6e} | elapsed {:.1}ms",
@@ -2392,7 +2392,7 @@ impl<'a> RemlState<'a> {
                 p.len()
             );
         }
-        let rho_key = EvalCacheManager::sanitized_rhokey(p);
+        let rho_key = self.rhokey_sanitized(p);
         if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
             let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
             log::debug!(
@@ -2510,7 +2510,7 @@ impl<'a> RemlState<'a> {
                 allow_second_order
             );
         }
-        let rho_key = EvalCacheManager::sanitized_rhokey(p);
+        let rho_key = self.rhokey_sanitized(p);
         if let Some(eval) = self.cache_manager.cached_outer_eval(&rho_key) {
             let cache_satisfies_request = !allow_second_order || eval.hessian.is_analytic();
             if cache_satisfies_request {

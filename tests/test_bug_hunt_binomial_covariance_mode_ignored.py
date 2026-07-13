@@ -4,7 +4,7 @@ interval, so binomial credible intervals are the bare conditional ones.
 
 ``Model.predict``'s ``covariance_mode`` selects the covariance source for the
 response-scale SE: ``"conditional"`` = ``H^{-1}`` only; ``"smoothing"`` /
-``None`` (the default ``ConditionalPlusSmoothingPreferred``) add the
+``None`` (the default required ``SmoothingCorrected`` mode) adds the
 first-order smoothing correction ``J·Var(rho_hat)·J^T``; ``"required"`` demands
 that correction and errors if it cannot be formed (``gamfit/_model.py:84-95``).
 For a smooth model with REML-selected ``rho``, the correction is non-trivial, so

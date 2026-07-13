@@ -267,7 +267,7 @@ fn confidence_intervals_cover_truth_under_logistic_link() {
                 offset.view(),
                 LikelihoodSpec::binomial_logit(),
                 &fit.fit,
-                &options(InferenceCovarianceMode::ConditionalPlusSmoothingPreferred),
+                &options(InferenceCovarianceMode::SmoothingCorrected),
             )
             .expect("gam uncertainty under logit link");
 

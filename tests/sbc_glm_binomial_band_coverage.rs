@@ -144,7 +144,7 @@ fn response_band(fit: &FitResult, level: f64) -> (Array1<f64>, Array1<f64>) {
     // a confounding correction — the same central band #1871 compares to INLA.
     let options = PredictUncertaintyOptions {
         confidence_level: level,
-        covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+        covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
         mean_interval_method: MeanIntervalMethod::TransformEta,
         includeobservation_interval: false,
         apply_bias_correction: false,

@@ -56,42 +56,6 @@ pub(crate) const PREWARM_COST_CLIFF_COEFF_DIM: usize = 12;
 pub(crate) const PREWARM_COST_BUDGET_COEFF_PRODUCT: usize =
     PREWARM_COST_CLIFF_COEFF_DIM * SINGLE_EXPENSIVE_PREWARM_BUDGET;
 
-/// RAII guard that lifts the outer-aware inner-PIRLS iteration cap
-/// (`RemlState::outer_inner_cap`, shared into the outer optimizer via
-/// `InnerProgressFeedback::cap`) to 0 ("no cap") for the duration of the
-/// finalize evaluation at the converged outer point, then restores whatever
-/// value the search-time schedule had last published on drop. This mirrors the
-/// post-run convergence guard `run_outer_inner_cap_guard`
-/// (`src/solver/estimate/optimizer.rs:135`), which does the same `swap(0, …)` /
-/// restore, but happens INSIDE `run_outer_with_plan` so the finalize inner
-/// solve runs at full inner budget and a search-time throttle (e.g. 3 iters)
-/// can never escalate a capped `MaxIterationsReached` into a fatal
-/// `PirlsDidNotConverge` (#1572).
-struct FinalizeInnerCapGuard<'a> {
-    cap: &'a std::sync::atomic::AtomicUsize,
-    prev_cap: usize,
-}
-
-impl<'a> FinalizeInnerCapGuard<'a> {
-    fn lift(cap: &'a std::sync::atomic::AtomicUsize) -> Self {
-        let prev_cap = cap.swap(0, std::sync::atomic::Ordering::Relaxed);
-        if prev_cap != 0 {
-            log::debug!(
-                "[OUTER] finalize: lifting throttled inner-PIRLS cap (prev_cap={prev_cap}) \
-                 for full-budget evaluation at θ̂"
-            );
-        }
-        Self { cap, prev_cap }
-    }
-}
-
-impl Drop for FinalizeInnerCapGuard<'_> {
-    fn drop(&mut self) {
-        self.cap
-            .store(self.prev_cap, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
 /// Floor on the scaled budget: even on the largest problems the pre-warm must
 /// still anneal a few continuation legs from the oversmoothing ρ₀ toward the
 /// seed so the warm β it forwards is genuinely near-optimal (capping must not
@@ -2108,7 +2072,14 @@ pub(crate) fn run_outer_with_plan(
         let finalize_cap_guard = config
             .outer_inner_cap
             .as_ref()
-            .map(|feedback| FinalizeInnerCapGuard::lift(feedback.cap.as_ref()));
+            .map(TerminalInnerCapGuard::lift);
+        if finalize_cap_guard.is_some() {
+            // Certification may have happened before later multistart trials.
+            // Clear every search-state cache before installing the selected
+            // point so a rho-only hit cannot leave the objective owning the
+            // last rejected trial's inner mode.
+            obj.reset();
+        }
         let finalize_outcome = obj.finalize_outer_result(&result.rho, the_plan);
         drop(finalize_cap_guard);
         finalize_outcome?;

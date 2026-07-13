@@ -310,8 +310,7 @@ fn predict_payload_field_audits(payload: &PredictUncertaintyResult) -> Vec<Field
         mean_upper,
         observation_lower,
         observation_upper,
-        covariance_mode_requested,
-        covariance_corrected_used,
+        covariance_source,
     } = payload;
     // Consume the bound references so the exhaustive pattern is not flagged
     // unused; the values themselves are irrelevant, only the field set matters.
@@ -326,8 +325,7 @@ fn predict_payload_field_audits(payload: &PredictUncertaintyResult) -> Vec<Field
         mean_upper,
         observation_lower,
         observation_upper,
-        covariance_mode_requested,
-        covariance_corrected_used,
+        covariance_source,
     ));
     vec![
         FieldAudit::point("eta"),
@@ -341,8 +339,7 @@ fn predict_payload_field_audits(payload: &PredictUncertaintyResult) -> Vec<Field
         FieldAudit::audited("observation_lower", "predictive_interval_gaussian"),
         FieldAudit::audited("observation_upper", "predictive_interval_gaussian"),
         // Provenance metadata, not a coverage-bearing value.
-        FieldAudit::point("covariance_mode_requested"),
-        FieldAudit::point("covariance_corrected_used"),
+        FieldAudit::point("covariance_source"),
     ]
 }
 
@@ -353,24 +350,21 @@ fn coefficient_payload_field_audits(payload: &CoefficientUncertaintyResult) -> V
         standard_error,
         lower,
         upper,
-        corrected,
-        covariance_mode_requested,
+        covariance_source,
     } = payload;
     std::hint::black_box((
         estimate,
         standard_error,
         lower,
         upper,
-        corrected,
-        covariance_mode_requested,
+        covariance_source,
     ));
     vec![
         FieldAudit::point("estimate"),
         FieldAudit::audited("standard_error", "coefficient_wald_interval"),
         FieldAudit::audited("lower", "coefficient_wald_interval"),
         FieldAudit::audited("upper", "coefficient_wald_interval"),
-        FieldAudit::point("corrected"),
-        FieldAudit::point("covariance_mode_requested"),
+        FieldAudit::point("covariance_source"),
     ]
 }
 
@@ -389,6 +383,8 @@ fn posterior_mean_payload_field_audits(payload: &PredictPosteriorMeanResult) -> 
         mean_upper,
         observation_lower,
         observation_upper,
+        point_covariance_source,
+        uncertainty_covariance_source,
     } = payload;
     std::hint::black_box((
         eta,
@@ -399,6 +395,8 @@ fn posterior_mean_payload_field_audits(payload: &PredictPosteriorMeanResult) -> 
         mean_upper,
         observation_lower,
         observation_upper,
+        point_covariance_source,
+        uncertainty_covariance_source,
     ));
     vec![
         FieldAudit::point("eta"),
@@ -409,6 +407,8 @@ fn posterior_mean_payload_field_audits(payload: &PredictPosteriorMeanResult) -> 
         FieldAudit::audited("mean_upper", "mean_credible_band_conditional"),
         FieldAudit::audited("observation_lower", "predictive_interval_gaussian"),
         FieldAudit::audited("observation_upper", "predictive_interval_gaussian"),
+        FieldAudit::point("point_covariance_source"),
+        FieldAudit::point("uncertainty_covariance_source"),
     ]
 }
 
@@ -546,8 +546,7 @@ fn payload_probe() -> PredictUncertaintyResult {
         mean_upper: one.clone(),
         observation_lower: None,
         observation_upper: None,
-        covariance_mode_requested: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
-        covariance_corrected_used: false,
+        covariance_source: InferenceCovarianceMode::SmoothingCorrected,
     }
 }
 
@@ -563,6 +562,8 @@ fn posterior_mean_probe() -> PredictPosteriorMeanResult {
         mean_upper: None,
         observation_lower: None,
         observation_upper: None,
+        point_covariance_source: InferenceCovarianceMode::Conditional,
+        uncertainty_covariance_source: None,
     }
 }
 
@@ -574,8 +575,7 @@ fn coefficient_probe() -> CoefficientUncertaintyResult {
         standard_error: one.clone(),
         lower: one.clone(),
         upper: one.clone(),
-        corrected: false,
-        covariance_mode_requested: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+        covariance_source: InferenceCovarianceMode::SmoothingCorrected,
     }
 }
 
@@ -638,13 +638,11 @@ fn covariance_and_interval_modes_map_to_registered_bands() {
 
     for mode in [
         InferenceCovarianceMode::Conditional,
-        InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
-        InferenceCovarianceMode::ConditionalPlusSmoothingRequired,
+        InferenceCovarianceMode::SmoothingCorrected,
     ] {
         let target = match mode {
             InferenceCovarianceMode::Conditional => "mean_credible_band_conditional",
-            InferenceCovarianceMode::ConditionalPlusSmoothingPreferred
-            | InferenceCovarianceMode::ConditionalPlusSmoothingRequired => {
+            InferenceCovarianceMode::SmoothingCorrected => {
                 "mean_credible_band_smoothing_corrected"
             }
         };

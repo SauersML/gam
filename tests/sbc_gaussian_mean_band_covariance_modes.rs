@@ -3,7 +3,7 @@
 //! smoothing-corrected `H⁻¹ + J·Var(ρ̂)·Jᵀ` band.
 //!
 //! The sibling gate `sbc_gaussian_smooth_band_coverage` audits only the default
-//! `ConditionalPlusSmoothingPreferred` mode. The open UQ cluster splits across
+//! required `SmoothingCorrected` mode. The open UQ cluster splits across
 //! the two covariance modes:
 //!   * #1870 — the mean-prediction band coverage collapses to 0.157: the
 //!     CONDITIONAL band (no ρ̂ correction) under-covers because it ignores
@@ -68,12 +68,12 @@ const CONFIGS: [BandConfig; 4] = [
         label: "conditional bias-corrected (#1870 oracle)",
     },
     BandConfig {
-        covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+        covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
         apply_bias_correction: false,
         label: "smoothing-corrected core (#1871)",
     },
     BandConfig {
-        covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+        covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
         apply_bias_correction: true,
         label: "smoothing-corrected bias-corrected (default user band)",
     },

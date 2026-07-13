@@ -5141,18 +5141,17 @@ pub(crate) fn symmetric_matrix_cache_bytes(m: &gam_linalg::matrix::SymmetricMatr
 pub(crate) const OUTER_EVAL_LRU_CAPACITY: usize = 8;
 
 /// Bounded least-recently-used cache of converged outer REML evaluations,
-/// keyed by sanitized rho-bits.
+/// keyed by sanitized rho-bits plus the active inner-solve caps.
 ///
-/// CORRECTNESS: the key (`Vec<u64>` of `f64::to_bits`, with ±0 canonicalized)
-/// is the complete result-determining input for a fixed `RemlState`. Every
+/// CORRECTNESS: the key starts with `Vec<u64>` of `f64::to_bits` (with ±0
+/// canonicalized) and appends the screening and outer P-IRLS caps. Every
 /// other input to `OuterEval` — design matrix, prior weights, offset, penalty
 /// structure, link/SAS/mixture state, Firth/Jeffreys configuration, and the
-/// rho-prior — is immutable for the lifetime of the state that owns the cache,
-/// so the stored cost / gradient / inner-beta hint depend only on rho. A hit
-/// therefore returns exactly the value a recompute at that rho would converge
-/// to (to the solver's own tolerance, identical to the trust the pre-existing
-/// single-slot cache already placed in rho-only keying). Distinct rho-points
-/// never alias: lookups compare the full key vector.
+/// rho-prior — is immutable for the lifetime of the state that owns the cache.
+/// Inner fidelity is not immutable: search-time caps deliberately change it.
+/// Including those caps prevents a full-fidelity terminal request from
+/// replaying a coarse search entry at the same rho. Distinct rho/fidelity
+/// states never alias because lookups compare the full key vector.
 pub(crate) struct OuterEvalLru {
     capacity: usize,
     /// Front = least-recently-used, back = most-recently-used.
@@ -5212,14 +5211,15 @@ pub(crate) struct EvalCacheManager {
     /// distinct eval" semantics, independent of the multi-slot reuse cache.
     pub(crate) current_outer_eval: RwLock<Option<(Vec<u64>, OuterEval)>>,
     /// Bounded multi-slot LRU of converged outer evaluations keyed by the
-    /// sanitized rho-bits (#1575).
+    /// sanitized rho-bits and the active inner-solve caps (#1575/#2309).
     ///
     /// For a frozen `RemlState` (fixed design, prior weights, offset, penalty
     /// structure, link state, Firth/Jeffreys configuration, and rho-prior — all
     /// of which are immutable for the lifetime of the state that owns this
-    /// manager and therefore the lifetime of the cache), the outer objective
-    /// value, its gradient, and the inner-beta hint are deterministic functions
-    /// of rho alone. The sanitized rho-bits are thus the complete result key.
+    /// manager and therefore the lifetime of the cache), the remaining
+    /// result-determining state is `(rho, screening_cap, outer_cap)`. The cap
+    /// suffix is essential because a search-time partial inner mode and the
+    /// terminal uncapped mode can share bit-identical rho.
     /// The binomial REML fit performs ~20-32 seed-grid pre-solves plus
     /// line-search revisits; with only the single `current_outer_eval` slot,
     /// any revisit to an earlier rho re-ran a full n-sized P-IRLS. This LRU

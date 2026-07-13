@@ -43,28 +43,6 @@ impl fmt::Display for CovarianceSource {
     }
 }
 
-/// Policy for choosing a coefficient covariance from a unified fit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CovarianceSelection {
-    /// Require one exact covariance definition; absence is an error.
-    Exact(CovarianceSource),
-    /// Prefer smoothing-corrected `Vp`, then use conditional `Vb` when no
-    /// corrected covariance was computed.
-    PreferSmoothingCorrectedThenConditional,
-}
-
-impl Default for CovarianceSelection {
-    fn default() -> Self {
-        Self::PreferSmoothingCorrectedThenConditional
-    }
-}
-
-impl From<CovarianceSource> for CovarianceSelection {
-    fn from(source: CovarianceSource) -> Self {
-        Self::Exact(source)
-    }
-}
-
 /// A covariance borrowed from a fit together with its exact provenance.
 #[derive(Clone, Copy, Debug)]
 pub struct SelectedCovariance<'a> {
@@ -74,29 +52,15 @@ pub struct SelectedCovariance<'a> {
 
 /// Select a coefficient covariance from a unified fit under an explicit policy.
 ///
-/// [`CovarianceSelection::Exact`] never substitutes another definition when the
-/// requested one is absent.  The default preference policy names its complete
-/// ordering, and [`SelectedCovariance::source`] records its resolved provenance.
+/// The requested source is exact: absence is an error and no other covariance
+/// definition is substituted. [`SelectedCovariance::source`] records the
+/// resolved provenance.
 pub fn select_covariance<'a>(
     fit: &'a UnifiedFitResult,
-    selection: impl Into<CovarianceSelection>,
+    source: CovarianceSource,
 ) -> Result<SelectedCovariance<'a>, EffectError> {
-    let (source, matrix) = match selection.into() {
-        CovarianceSelection::Exact(source) => {
-            let matrix = covariance_by_source(fit, source)
-                .ok_or(EffectError::MissingCovariance { source })?;
-            (source, matrix)
-        }
-        CovarianceSelection::PreferSmoothingCorrectedThenConditional => {
-            if let Some(matrix) = fit.beta_covariance_corrected() {
-                (CovarianceSource::SmoothingCorrected, matrix)
-            } else if let Some(matrix) = fit.beta_covariance() {
-                (CovarianceSource::Conditional, matrix)
-            } else {
-                return Err(EffectError::MissingPreferredCovariance);
-            }
-        }
-    };
+    let matrix = covariance_by_source(fit, source)
+        .ok_or(EffectError::MissingCovariance { source })?;
 
     Ok(SelectedCovariance {
         source,
@@ -176,7 +140,6 @@ pub enum EffectError {
     MissingCovariance {
         source: CovarianceSource,
     },
-    MissingPreferredCovariance,
     EmptyCoefficients,
     EmptyContrastDesign,
     InvalidLevel {
@@ -221,9 +184,6 @@ impl fmt::Display for EffectError {
             Self::MissingCovariance { source } => {
                 write!(formatter, "fit has no {source} coefficient covariance")
             }
-            Self::MissingPreferredCovariance => formatter.write_str(
-                "fit has neither a smoothing-corrected nor a conditional coefficient covariance",
-            ),
             Self::EmptyCoefficients => {
                 formatter.write_str("beta must contain at least one coefficient")
             }
@@ -290,11 +250,11 @@ impl Error for EffectError {}
 /// covariance-selection policy.
 pub fn effect_report_from_fit(
     fit: &UnifiedFitResult,
-    selection: impl Into<CovarianceSelection>,
+    source: CovarianceSource,
     contrast_design: ArrayView2<'_, f64>,
     options: BandOptions,
 ) -> Result<EffectReport, EffectError> {
-    let selected = select_covariance(fit, selection)?;
+    let selected = select_covariance(fit, source)?;
     effect_report(fit.beta.view(), selected.matrix, contrast_design, options)
 }
 

@@ -110,7 +110,7 @@ fn predictive_interval(fit: &FitResult, level: f64) -> (Array1<f64>, Array1<f64>
         .expect("fit records its likelihood family");
     let options = PredictUncertaintyOptions {
         confidence_level: level,
-        covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+        covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
         mean_interval_method: MeanIntervalMethod::TransformEta,
         includeobservation_interval: true,
         apply_bias_correction: false,

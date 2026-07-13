@@ -51,6 +51,8 @@ fn enrich_posterior_mean_bounds_clamps_domains_for_probability_and_count_familie
         mean_upper: None,
         observation_lower: None,
         observation_upper: None,
+        point_covariance_source: InferenceCovarianceMode::Conditional,
+        uncertainty_covariance_source: None,
     };
     enrich_posterior_mean_bounds(
         &mut beta_result,
@@ -76,6 +78,8 @@ fn enrich_posterior_mean_bounds_clamps_domains_for_probability_and_count_familie
         mean_upper: None,
         observation_lower: None,
         observation_upper: None,
+        point_covariance_source: InferenceCovarianceMode::Conditional,
+        uncertainty_covariance_source: None,
     };
     enrich_posterior_mean_bounds(
         &mut pois_result,

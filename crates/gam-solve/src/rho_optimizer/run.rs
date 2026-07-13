@@ -2,6 +2,33 @@ use super::*;
 
 pub(crate) const OPERATOR_TRUST_RESTART_RADIUS_FLOOR: f64 = 1.0e-6;
 
+/// Hold terminal evidence at full inner-solve fidelity.
+///
+/// Search-time REML evaluations may deliberately cap P-IRLS.  A terminal
+/// certificate or final state installation is a different operation: it must
+/// run with the cap lifted, then restore the scheduler's value after the
+/// operation completes.  The objective reset performed by the callers clears
+/// any evaluation/P-IRLS entries created under the search state before the
+/// full-fidelity request is made.
+pub(crate) struct TerminalInnerCapGuard<'a> {
+    cap: &'a AtomicUsize,
+    previous: usize,
+}
+
+impl<'a> TerminalInnerCapGuard<'a> {
+    pub(crate) fn lift(feedback: &'a InnerProgressFeedback) -> Self {
+        let cap = feedback.cap.as_ref();
+        let previous = cap.swap(0, Ordering::Relaxed);
+        Self { cap, previous }
+    }
+}
+
+impl Drop for TerminalInnerCapGuard<'_> {
+    fn drop(&mut self) {
+        self.cap.store(self.previous, Ordering::Relaxed);
+    }
+}
+
 /// Configuration for the outer optimization runner.
 #[derive(Clone, Debug)]
 pub(crate) struct OuterConfig {
@@ -1295,6 +1322,15 @@ fn certify_fixed_point_optimality(
                 config.tolerance,
             )
         })?;
+    if !inner_solve_converged(config.outer_inner_cap.as_ref()) {
+        return Err(outer_nonconvergence_error(
+            context,
+            "terminal fixed-point evidence was evaluated at a non-converged inner state",
+            result,
+            None,
+            config.tolerance,
+        ));
+    }
     if evaluation.coordinates.len() != layout.n_params {
         return Err(outer_nonconvergence_error(
             context,
@@ -1376,28 +1412,11 @@ fn certify_fixed_point_optimality(
         projected_inf = projected_inf.max(projected.abs());
     }
 
-    let solver_final_value = result.final_value;
-    let cost_agreement_bound =
-        f64::EPSILON.sqrt() * solver_final_value.abs().max(evaluation.cost.abs()).max(1.0);
     result.final_value = evaluation.cost;
     result.final_grad_norm = None;
     result.final_gradient = None;
     result.final_hessian = None;
     result.converged = false;
-    if !solver_final_value.is_finite()
-        || (solver_final_value - evaluation.cost).abs() > cost_agreement_bound
-    {
-        return Err(outer_nonconvergence_error(
-            context,
-            &format!(
-                "fixed-point solver value {solver_final_value:.16e} disagrees with certificate value {:.16e} at the selected point (roundoff bound {cost_agreement_bound:.3e})",
-                evaluation.cost
-            ),
-            result,
-            Some(projected_inf),
-            config.tolerance,
-        ));
-    }
 
     let certificate = OuterCriterionCertificate {
         stationarity: OuterStationarityCertificate::FixedPoint {
@@ -1441,6 +1460,28 @@ fn certify_fixed_point_optimality(
 /// objective declares it and can materialize it; BFGS/EFS solver geometry is
 /// never mistaken for objective curvature.
 pub(crate) fn certify_outer_optimality(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    context: &str,
+    result: &mut OuterResult,
+) -> Result<OuterCriterionCertificate, EstimationError> {
+    let terminal_cap_guard = config
+        .outer_inner_cap
+        .as_ref()
+        .map(TerminalInnerCapGuard::lift);
+    if terminal_cap_guard.is_some() {
+        // `reset` is deliberately conditional on the presence of the cap
+        // contract.  Those are the REML/mixture objectives whose search cache
+        // can contain a coarse inner state; uncapped objectives retain their
+        // ordinary stateful certification semantics.
+        obj.reset();
+    }
+    let outcome = certify_outer_optimality_at_terminal_fidelity(obj, config, context, result);
+    drop(terminal_cap_guard);
+    outcome
+}
+
+fn certify_outer_optimality_at_terminal_fidelity(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
     context: &str,
@@ -1530,6 +1571,15 @@ pub(crate) fn certify_outer_optimality(
             outer_gradient_tolerance(config).abs,
         )
     })?;
+    if !inner_solve_converged(config.outer_inner_cap.as_ref()) {
+        return Err(outer_nonconvergence_error(
+            context,
+            "terminal analytic evidence was evaluated at a non-converged inner state",
+            result,
+            None,
+            outer_gradient_tolerance(config).abs,
+        ));
+    }
     layout
         .validate_gradient_len(&evaluation.gradient, "outer certificate gradient")
         .map_err(|err| {
@@ -1579,16 +1629,6 @@ pub(crate) fn certify_outer_optimality(
         stationarity_bound = stationarity_bound.max(noise_bound);
     }
 
-    // The cost-only and derivative-bearing interfaces must describe the same
-    // objective.  This is an analytic consistency check, not a finite
-    // difference: the solver's terminal value came from the value path and
-    // `evaluation.cost` came from the unified analytic sample at the identical
-    // point.  A scale-aware roundoff bound catches structurally desynchronised
-    // closures without rejecting harmless evaluation-order noise.
-    let solver_final_value = result.final_value;
-    let cost_agreement_bound =
-        f64::EPSILON.sqrt() * solver_final_value.abs().max(evaluation.cost.abs()).max(1.0);
-
     // Install measured first-order evidence before any fallible curvature
     // processing. If curvature is malformed, the retained resume checkpoint
     // still carries the exact value/gradient that caused certification to stop.
@@ -1596,40 +1636,6 @@ pub(crate) fn certify_outer_optimality(
     result.final_grad_norm = Some(projected_grad_norm);
     result.final_gradient = Some(evaluation.gradient);
     result.converged = false;
-    // #2253 — a WALL-SENTINEL solver value against a FINITE analytic sample is a
-    // transient-refusal-vs-real mismatch, NOT a two-closure objective desync.
-    // The solver's terminal value comes from the value/probe lane, which can hit
-    // the finite collapse/refusal wall (a bounded but astronomically large
-    // sentinel) at a hard terminal ρ where the full derivative-bearing eval
-    // still certifies a real value — measured 2026-07-11: solver 1e12 vs
-    // analytic 51.86 on a K=1 circle after the IFT-deflation fixes. The analytic
-    // sample is the authoritative objective (it just re-solved the inner state
-    // AND its gradient at this exact point and passed the finite check above);
-    // adopt it and let the stationarity/Hessian gates below judge it. A genuine
-    // closure desync surfaces as two FINITE values differing beyond the roundoff
-    // bound, which the branch still rejects.
-    const OUTER_WALL_SENTINEL_FLOOR: f64 = 1.0e10;
-    let solver_is_wall =
-        !solver_final_value.is_finite() || solver_final_value.abs() >= OUTER_WALL_SENTINEL_FLOOR;
-    let analytic_is_real =
-        result.final_value.is_finite() && result.final_value.abs() < OUTER_WALL_SENTINEL_FLOOR;
-    let transient_wall = solver_is_wall && analytic_is_real;
-    if !transient_wall
-        && (!solver_final_value.is_finite()
-            || (solver_final_value - result.final_value).abs() > cost_agreement_bound)
-    {
-        return Err(outer_nonconvergence_error(
-            context,
-            &format!(
-                "cost-only value {solver_final_value:.16e} disagrees with analytic-sample value \
-                 {:.16e} at the selected point (roundoff bound {cost_agreement_bound:.3e})",
-                result.final_value,
-            ),
-            result,
-            Some(projected_grad_norm),
-            stationarity_bound,
-        ));
-    }
 
     let analytic_hessian = if capability.hessian.is_analytic() {
         match evaluation.hessian.materialize_dense() {

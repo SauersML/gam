@@ -733,7 +733,7 @@ fn difference_smooth_json_impl(model_bytes: &[u8], request_json: &str) -> Result
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     let selected_covariance = gam::inference::effects::select_covariance(
         &fit,
-        gam::inference::effects::CovarianceSelection::default(),
+        gam::inference::effects::CovarianceSource::SmoothingCorrected,
     )
     .map_err(|error| error.to_string())?;
     let payload = model.payload();

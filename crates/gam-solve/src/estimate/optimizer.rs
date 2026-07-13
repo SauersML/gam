@@ -353,54 +353,6 @@ fn with_reml_beta_seed_hook<'state, 'data>() -> impl FnMut(
     }
 }
 
-enum RemlInnerCapGuardArm {
-    Standard,
-    MixtureSas,
-}
-
-/// Re-run one full-inner-tolerance `compute_cost` at the converged operating
-/// point so the cached warm-start β is no longer pinned to whatever coarse cap
-/// the outer-aware inner-PIRLS schedule last set (path #3; see the call-site
-/// comments).
-///
-/// `rho` MUST be the smoothing-only penalty-block log-λ — its length equals the
-/// number of penalty blocks, because `compute_cost` exponentiates the whole
-/// vector into the penalty λ vector. For the parameterized-link arms
-/// (`MixtureSas`: SAS / Beta-Logistic / mixture / blended) the outer optimizer
-/// works in an augmented θ that trails the link parameters after the smoothing
-/// block; the caller must slice that block out (and install the link state on
-/// `state`) via `apply_link_theta` BEFORE calling this guard. Passing the raw
-/// augmented θ here over-counts the lambdas and faults the reparameterizer
-/// ("Lambda count mismatch", #1571). The `arm` only selects the log label.
-fn run_outer_inner_cap_guard(
-    state: &mut crate::estimate::reml::RemlState<'_>,
-    rho: &Array1<f64>,
-    arm: RemlInnerCapGuardArm,
-) -> Result<(), EstimationError> {
-    let prev_cap = state.outer_inner_cap.swap(0, Ordering::Relaxed);
-    let guard_start = std::time::Instant::now();
-    // The eval-bundle and cross-call PIRLS caches are keyed by rho, not by the
-    // inner iteration cap. Even `prev_cap == 0` does not prove that a cached
-    // visit to the selected rho was full fidelity: the adaptive schedule can
-    // lift its cap after that entry was written. Always invalidate before the
-    // guard evaluation so the shipped point is necessarily a fresh
-    // full-tolerance inner solve and the later projected-KKT audit cannot reuse
-    // coarse beta/gradient state.
-    state.reset_outer_seed_state();
-    state.compute_cost(rho)?;
-    match arm {
-        RemlInnerCapGuardArm::Standard => log::info!(
-            "[OUTER guard] convergence-guard re-eval at converged ρ done (prev_cap={prev_cap}, elapsed={:.3}s)",
-            guard_start.elapsed().as_secs_f64()
-        ),
-        RemlInnerCapGuardArm::MixtureSas => log::info!(
-            "[OUTER guard] convergence-guard re-eval at converged ρ done (mixture/SAS arm; prev_cap={prev_cap}, elapsed={:.3}s)",
-            guard_start.elapsed().as_secs_f64()
-        ),
-    }
-    Ok(())
-}
-
 /// The weighted-mean response level an unpenalized intercept would absorb, used
 /// to center the response during outer REML λ-selection (issue #1000).
 ///
@@ -1179,20 +1131,6 @@ where
 
             let strategy_result = problem.run(&mut obj, "standard REML")?;
             drop(obj);
-            // Convergence guard for the outer-aware inner-PIRLS schedule
-            // (path #3): the BFGS bridge stores a coarsen-then-tighten cap
-            // into `reml_state.outer_inner_cap` on every accepted gradient
-            // eval. After the outer optimizer returns, the cached warm-start
-            // β was computed at whatever cap the schedule last set — which
-            // for fast-converging fits (≤5 BFGS iters) is a coarse cap of
-            // 5/10/20 rather than the full inner budget. Reset the cap to 0
-            // and run one final cost eval at the converged ρ so the cached
-            // β is at full inner tolerance.
-            run_outer_inner_cap_guard(
-                &mut reml_state,
-                &strategy_result.rho,
-                RemlInnerCapGuardArm::Standard,
-            )?;
             let accepted_rho = strategy_result.rho.clone();
             (
                 accepted_rho,
@@ -1511,35 +1449,6 @@ where
             let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
             let outer_result = problem.run(&mut obj, "mixture/SAS flexible link")?;
             drop(obj);
-            // Convergence guard for the outer-aware inner-PIRLS schedule
-            // (path #3) — see the matching comment in the standard REML arm
-            // above. Reset the cap and run one final compute_cost at the
-            // converged θ so the cached warm-start β is at full inner
-            // tolerance regardless of where the BFGS schedule was when the
-            // optimizer terminated.
-            //
-            // The outer vector here is the AUGMENTED θ = [ρ_smooth (k) | link
-            // params (mixture_dim and/or sas_dim)], not a smoothing-only ρ.
-            // `compute_cost` exponentiates its argument wholesale into the
-            // penalty λ vector (loop_driver.rs `rho.mapv(exp)`), so the guard
-            // must receive exactly the same smoothing-only ρ — and the same
-            // installed link state — the outer evaluator operated on, never the
-            // raw augmented θ. Feeding the full θ in made the guard hand `k +
-            // mixture_dim + sas_dim` "lambdas" to a `k`-penalty reparameterizer,
-            // which faults with "Lambda count mismatch" (#1571). Route θ through
-            // the same `apply_link_theta` the eval closure (optimizer.rs:1759)
-            // and the accept-fit slice (the `final_rho` line just below) use: it
-            // installs the converged mixture/SAS link state onto `reml_state`
-            // and returns the smoothing-only ρ block.
-            let guard_rho = {
-                let mut state_ref: &mut crate::estimate::reml::RemlState<'_> = &mut reml_state;
-                apply_link_theta(&mut state_ref, &outer_result.rho)?
-            };
-            run_outer_inner_cap_guard(
-                &mut reml_state,
-                &guard_rho,
-                RemlInnerCapGuardArm::MixtureSas,
-            )?;
             let final_rho = outer_result.rho.slice(s![..k]).to_owned();
             let final_mix_state = if use_mixture {
                 let final_mix_rho = outer_result.rho.slice(s![k..(k + mixture_dim)]).to_owned();

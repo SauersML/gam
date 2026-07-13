@@ -4480,7 +4480,18 @@ impl<'a> RemlState<'a> {
     /// Returns None if any component is NaN, in which case caching is skipped.
     /// Maps -0.0 to 0.0 to ensure consistency in caching.
     pub(super) fn rhokey_sanitized(&self, rho: &Array1<f64>) -> Option<Vec<u64>> {
-        EvalCacheManager::sanitized_rhokey(rho)
+        // A capped inner solve is a different mathematical state from an
+        // uncapped solve at the same rho.  Keep both cap identities in every
+        // eval, bundle, and PIRLS key so terminal cap=0 evidence can never
+        // replay a search-time entry produced under cap=3..64.  Screening
+        // normally suppresses cache writes, but including its cap closes the
+        // same identity hole for any bundle retained within a screening call.
+        super::rho_key::sanitized_eval_state_key(
+            rho,
+            self.screening_max_inner_iterations
+                .load(Ordering::Relaxed),
+            self.outer_inner_cap.load(Ordering::Relaxed),
+        )
     }
 
     pub(super) fn prepare_eval_bundlewithkey(

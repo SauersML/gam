@@ -827,7 +827,7 @@ fn covered(lower: &[f64], upper: &[f64], truth: &[f64]) -> usize {
 /// nominal and (b) it covers at least as well as mgcv on the identical data.
 ///
 /// MATCHED COVARIANCE (the finding-#6 fix): gam uses
-/// `ConditionalPlusSmoothingPreferred` (`H⁻¹ + J·Var(ρ̂)·Jᵀ` — the conditional
+/// `SmoothingCorrected` (`H⁻¹ + J·Var(ρ̂)·Jᵀ` — the conditional
 /// posterior PLUS the first-order smoothing-parameter-uncertainty correction).
 /// mgcv's matching covariance is `Vc`, obtained with `unconditional = TRUE` in
 /// `predict.gam`. The mgcv call below therefore passes `unconditional = TRUE`,
@@ -891,7 +891,7 @@ fn poisson_response_ci_is_calibrated_and_matches_mgcv() {
             &fit.fit,
             &PredictUncertaintyOptions {
                 confidence_level: nominal,
-                covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+                covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
                 mean_interval_method: MeanIntervalMethod::Delta,
                 includeobservation_interval: false,
                 apply_bias_correction: false,
@@ -916,7 +916,7 @@ fn poisson_response_ci_is_calibrated_and_matches_mgcv() {
             m <- gam(y ~ s(x, bs = "cr", k = 10), data = df, family = poisson(),
                      select = FALSE, method = "REML")
             # unconditional = TRUE -> Vc (adds the smoothing-parameter-uncertainty
-            # term), the match for gam's ConditionalPlusSmoothingPreferred mode.
+            # term), the match for gam's SmoothingCorrected mode.
             p <- predict(m, newdata = df, se.fit = TRUE, type = "response",
                          unconditional = TRUE)
             z <- qnorm(0.975)

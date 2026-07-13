@@ -405,7 +405,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
 
     let options = PredictUncertaintyOptions {
         confidence_level: 0.90,
-        covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+        covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
         mean_interval_method: MeanIntervalMethod::TransformEta,
         includeobservation_interval: false,
         apply_bias_correction: false,

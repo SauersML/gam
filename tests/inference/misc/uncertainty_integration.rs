@@ -238,7 +238,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
     let coef_ci = coefficient_uncertainty(
         &fit,
         0.95,
-        InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+        InferenceCovarianceMode::SmoothingCorrected,
     )
     .expect("coefficient CI should work");
     assert_eq!(coef_ci.estimate.len(), fit.beta.len());
@@ -266,7 +266,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
     let coef_ci_80 = coefficient_uncertainty(
         &fit,
         0.80,
-        InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+        InferenceCovarianceMode::SmoothingCorrected,
     )
     .expect("80% coefficient CI should also work");
     for i in 0..p {
@@ -338,7 +338,7 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
         &fit,
         &PredictUncertaintyOptions {
             confidence_level: 0.95,
-            covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+            covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
             mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: true,
             apply_bias_correction: false,
@@ -632,7 +632,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
         &fit,
         &PredictUncertaintyOptions {
             confidence_level: 0.95,
-            covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+            covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
             mean_interval_method: MeanIntervalMethod::Delta,
             includeobservation_interval: false,
             apply_bias_correction: false,
