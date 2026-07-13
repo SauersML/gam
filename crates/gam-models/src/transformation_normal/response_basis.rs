@@ -149,7 +149,7 @@ pub(crate) fn build_response_basis(
     // location row/column.
     let value_degree = response_degree + 1;
     let mut resp_penalties = Vec::new();
-    let mut add_penalty = |order: usize, penalties: &mut Vec<Array2<f64>>| -> Result<(), String> {
+    let add_penalty = |order: usize, penalties: &mut Vec<Array2<f64>>| -> Result<(), String> {
         if order == 0 {
             return Err(TransformationNormalError::InvalidInput {
                 reason: "response penalty derivative order must be >= 1; order 0 is the value \
