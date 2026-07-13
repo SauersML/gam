@@ -6105,6 +6105,13 @@ impl<'d> ExactJointDesignCache<'d> {
         }
     }
 
+    /// Revoke objective values when the row measure changes while retaining
+    /// the realized design at the current theta.
+    fn invalidate_objective_memo(&mut self) {
+        self.last_cost = None;
+        self.last_eval = None;
+    }
+
     fn specs(&self) -> Vec<&TermCollectionSpec> {
         self.realizers.iter().map(|r| r.spec()).collect()
     }
@@ -6611,10 +6618,14 @@ where
 
     struct NBlockExactJointState<'d> {
         cache: ExactJointDesignCache<'d>,
+        row_set: gam_problem::outer_subsample::RowSet,
+        staged_pilot_active: bool,
     }
 
     let mut state = NBlockExactJointState {
         cache: ExactJointDesignCache::new(data, cache_blocks, rho_dim, all_dims.clone())?,
+        row_set: gam_problem::outer_subsample::RowSet::All,
+        staged_pilot_active: false,
     };
 
     // ── P7: staged-κ schedule ────────────────────────────────────────────
@@ -6625,16 +6636,18 @@ where
     // Monte-Carlo error of a `K = 5_000`-row pilot is ≪ the κ posterior
     // width, so estimating θ on a stratified `K`-row pilot returns
     // statistically the *same* estimate as the full-data fit at a
-    // fraction of the wall-clock cost. We then do one Gauss-Newton-style
-    // polish at `K_polish` to absorb residual Monte-Carlo error before
-    // the final coefficient fit at the polished θ on the full data.
+    // fraction of the wall-clock cost. The shared outer runner then continues
+    // from that checkpoint on the exact full-data measure and issues its
+    // mandatory analytic certificate only after the transition.
     //
     // This is **not a heuristic shortcut**. It is the textbook
     // pilot-then-refine schedule for stationary-process likelihoods,
     // chosen here because the per-eval cost of the κ gradient grows
     // linearly in `n` and the pilot subsample reduces that cost by a
-    // factor of `n / K`. The final coefficient fit at θ̂_polished on the
-    // full data preserves estimation accuracy for β.
+    // factor of `n / K`. The exact continuation is a one-seed warm start that
+    // retains the learned trust radius and Hessian; it costs one terminal
+    // full-data evaluation when the pilot point already certifies and keeps
+    // optimizing when it does not.
     //
     // At `n < STAGED_KAPPA_TRIGGER_N` the schedule collapses to one
     // full-data stage — identical to the pre-P7 behaviour.
@@ -6642,17 +6655,14 @@ where
     // `outer_derivative_policy.should_use_staged_kappa(n_total)`; this fn
     // only carries the constants it consumes directly.
     const KAPPA_PILOT_K: usize = 5_000;
-    const KAPPA_POLISH_K: usize = 25_000;
-    const KAPPA_POLISH_TRIGGER_N: usize = 100_000;
 
     let n_total = data.nrows();
     let use_staged_kappa = outer_derivative_policy.should_use_staged_kappa(n_total);
     if use_staged_kappa {
         log::info!(
-            "[KAPPA-STAGED] auto-engaging pilot+polish schedule: n={} pilot_k={} polish_k={}",
+            "[KAPPA-STAGED] auto-engaging pilot+exact schedule: n={} pilot_k={}",
             n_total,
             KAPPA_PILOT_K,
-            KAPPA_POLISH_K,
         );
     }
 
@@ -6704,16 +6714,14 @@ where
         OuterScoreSubsample::from_uniform_inclusion_mask(mask, n_total, seed)
     }
 
-    let current_row_set: std::cell::RefCell<gam_problem::outer_subsample::RowSet> =
-        if use_staged_kappa {
-            let pilot = build_uniform_pilot_subsample(n_total, KAPPA_PILOT_K, n_total as u64);
-            std::cell::RefCell::new(gam_problem::outer_subsample::RowSet::Subsample {
-                rows: std::sync::Arc::clone(&pilot.rows),
-                n_full: n_total,
-            })
-        } else {
-            std::cell::RefCell::new(gam_problem::outer_subsample::RowSet::All)
+    if use_staged_kappa {
+        let pilot = build_uniform_pilot_subsample(n_total, KAPPA_PILOT_K, n_total as u64);
+        state.row_set = gam_problem::outer_subsample::RowSet::Subsample {
+            rows: std::sync::Arc::clone(&pilot.rows),
+            n_full: n_total,
         };
+        state.staged_pilot_active = true;
+    }
 
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
     let exact_efs_fn_cell = std::cell::RefCell::new(&mut exact_efs_fn);
@@ -6881,10 +6889,13 @@ where
                 gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient
             };
             let t0 = std::time::Instant::now();
-            let result = {
-                let row_set_borrow = current_row_set.borrow();
-                (*exact_fn_cell.borrow_mut())(theta, &specs, &designs, eval_mode, &row_set_borrow)
-            };
+            let result = (*exact_fn_cell.borrow_mut())(
+                theta,
+                &specs,
+                &designs,
+                eval_mode,
+                &ctx.row_set,
+            );
             let elapsed_s = t0.elapsed().as_secs_f64();
             kphase_eval_calls.set(kphase_eval_calls.get() + 1);
             kphase_eval_total_s.set(kphase_eval_total_s.get() + elapsed_s);
@@ -6961,16 +6972,13 @@ where
                 // n=320 000, n_grid=293, p_resp=32, p_cov=23) is now paid only
                 // when the outer evaluator actually requests it.
                 let t0 = std::time::Instant::now();
-                let result = {
-                    let row_set_borrow = current_row_set.borrow();
-                    (*exact_fn_cell.borrow_mut())(
-                        theta,
-                        &specs,
-                        &designs,
-                        gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueOnly,
-                        &row_set_borrow,
-                    )
-                };
+                let result = (*exact_fn_cell.borrow_mut())(
+                    theta,
+                    &specs,
+                    &designs,
+                    gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueOnly,
+                    &ctx.row_set,
+                );
                 let elapsed_s = t0.elapsed().as_secs_f64();
                 kphase_cost_calls.set(kphase_cost_calls.get() + 1);
                 kphase_cost_total_s.set(kphase_cost_total_s.get() + elapsed_s);
@@ -7047,11 +7055,25 @@ where
                 },
             ),
         );
-        let mut obj = obj.with_seed_inner_state(
-            move |_ctx: &mut &mut NBlockExactJointState<'_>, beta: &Array1<f64>| {
-                (seed_inner_beta_fn)(beta)
-            },
-        );
+        let mut obj = obj
+            .with_seed_inner_state(
+                move |_ctx: &mut &mut NBlockExactJointState<'_>, beta: &Array1<f64>| {
+                    (seed_inner_beta_fn)(beta)
+                },
+            )
+            .with_exact_polish(|ctx: &mut &mut NBlockExactJointState<'_>| {
+                if !ctx.staged_pilot_active {
+                    return false;
+                }
+                // Objective memoization is theta-only, so a pilot value at the
+                // warm checkpoint must not alias the exact full-data value.
+                // Keep the realized design and warm coefficient state: only the
+                // score measure changes here.
+                ctx.cache.invalidate_objective_memo();
+                ctx.row_set = gam_problem::outer_subsample::RowSet::All;
+                ctx.staged_pilot_active = false;
+                true
+            });
 
         problem
             .run(&mut obj, "n-block exact-joint spatial")
@@ -7106,69 +7128,18 @@ where
             result.final_grad_norm_report(),
         ));
     }
+    if !matches!(state.row_set, gam_problem::outer_subsample::RowSet::All) {
+        return Err(
+            "n-block exact-joint spatial optimization returned before its exact full-data transition"
+                .to_string(),
+        );
+    }
     let theta_star = result.rho;
 
     // ── P7 stage rotation ────────────────────────────────────────────────
-    //
-    // The optimization above ran against `current_row_set` — the pilot
-    // subsample under `use_staged_kappa`, otherwise the full data. We
-    // now:
-    //
-    // 1. If `n_total ≥ KAPPA_POLISH_TRIGGER_N`, rotate to a larger
-    //    polish subsample and request a single value+gradient evaluation
-    //    at `theta_star` so the family caches its polished score. This
-    //    is the Gauss-Newton-style polish in the schedule — one step
-    //    rather than a full re-run because the pilot has already
-    //    consumed most of the curvature information.
-    //
-    // 2. Always rotate back to `RowSet::All` before the final
-    //    coefficient fit `fit_fn(theta_star)`. The final β estimate at
-    //    θ̂ uses the full data so no estimation accuracy is lost.
-    if use_staged_kappa && n_total >= KAPPA_POLISH_TRIGGER_N {
-        let polish = build_uniform_pilot_subsample(
-            n_total,
-            KAPPA_POLISH_K,
-            (n_total as u64).wrapping_add(0xA5A5A5A5),
-        );
-        *current_row_set.borrow_mut() = gam_problem::outer_subsample::RowSet::Subsample {
-            rows: std::sync::Arc::clone(&polish.rows),
-            n_full: n_total,
-        };
-        log::info!(
-            "[KAPPA-STAGED] rotating to polish subsample: k={} at theta_star",
-            polish.rows.len(),
-        );
-        // One V+G evaluation at theta_star on the polish subsample. The
-        // returned objective pieces must be usable; the family-side cache
-        // update inside `exact_fn` is consumed by the final fit.
-        state.cache.ensure_theta(&theta_star)?;
-        let (polish_cost, polish_grad, _) = {
-            let specs = collect_specs(&state.cache);
-            let designs = collect_designs(&state.cache);
-            let row_set_borrow = current_row_set.borrow();
-            exact_fn(
-                &theta_star,
-                &specs,
-                &designs,
-                gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient,
-                &row_set_borrow,
-            )?
-        };
-        if !polish_cost.is_finite() || polish_grad.iter().any(|value| !value.is_finite()) {
-            return Err(
-                "polish subsample exact-joint evaluation produced non-finite objective pieces"
-                    .to_string(),
-            );
-        }
-    }
-    *current_row_set.borrow_mut() = gam_problem::outer_subsample::RowSet::All;
-    if use_staged_kappa {
-        log::info!(
-            "[KAPPA-STAGED] rotating to full data for final coefficient fit (n={})",
-            n_total,
-        );
-    }
-
+    // The returned theta and certificate now belong to the exact full-data
+    // continuation. No separate probe may mutate that certified identity before
+    // the final coefficient fit.
     state.cache.ensure_theta(&theta_star)?;
 
     let resolved_specs: Vec<TermCollectionSpec> = collect_specs(&state.cache);
