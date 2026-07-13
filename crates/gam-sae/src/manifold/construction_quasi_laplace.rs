@@ -375,6 +375,18 @@ impl SaeManifoldTerm {
             // atom detection silently degrades (R→0 keeps rank_eff≈rank), so surface
             // it loudly rather than hiding a re-admitted co-collapse.
             let residual = self.reconstruction_residual(target, rho)?;
+            let mut grams = self.empty_decoder_gram_accumulator();
+            self.accumulate_decoder_gram(&mut grams);
+            let n_eff = self.per_atom_effective_sample_size();
+            let dispersion_lower_bound = self
+                .reconstruction_dispersion_lower_bound(&loss, Some(residual.view()))?;
+            if let Some(atoms) = self.vanished_atoms_from_signal_upper_bound(
+                &grams,
+                &n_eff,
+                dispersion_lower_bound,
+            )? {
+                return Err(SaeCriterionError::VanishedAtoms(atoms));
+            }
             let disp = self
                 .reconstruction_dispersion(&loss, &cache, rho, Some(residual.view()))
                 .map_err(|e| {
@@ -382,12 +394,11 @@ impl SaeManifoldTerm {
                         "SaeManifoldTerm::penalized_quasi_laplace_criterion: rank-charge dispersion is required: {e}"
                     )
                 })?;
-            let d_eff = self.per_atom_realised_rank_dof(rho, disp)?;
+            let d_eff = self.rank_dof_from_grams(&grams, &n_eff, rho, disp)?;
             // Occupancy-aware effective sample size N_eff,k = Σ_i a_{ik}², the #2a
             // per-atom BIC log-scale (same quantity `per_atom_realised_rank_dof` uses
             // internally for the MP edge; recomputed here — a cheap Σa² — to price the
             // charge in the same currency).
-            let n_eff = self.per_atom_effective_sample_size();
             // #5 VETO — categorical Laplace-VALIDITY condition (blend-null null-license
             // fix, recov matrix 12484591): an atom with rank_eff==0 (⟺ d_eff==0)
             // reconstructs NOTHING. Its quasi-Laplace score is not "small" — it is INVALID:
@@ -2500,6 +2511,15 @@ impl SaeManifoldTerm {
             // chunk-accumulated Grams. The β/Schur block (the ‖B‖-independent part
             // of log_det) is untouched — bit-identical dense↔streaming by design.
             let residual = self.reconstruction_residual(target, rho)?;
+            let dispersion_lower_bound = self
+                .reconstruction_dispersion_lower_bound(&loss, Some(residual.view()))?;
+            if let Some(atoms) = self.vanished_atoms_from_signal_upper_bound(
+                &ri.grams,
+                &ri.n_eff,
+                dispersion_lower_bound,
+            )? {
+                return Err(SaeCriterionError::VanishedAtoms(atoms));
+            }
             let disp = self
                 .reconstruction_dispersion(
                     &loss,

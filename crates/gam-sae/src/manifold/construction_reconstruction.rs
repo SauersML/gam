@@ -258,6 +258,69 @@ pub fn reconstruct_persisted_atom_set(
 }
 
 impl SaeManifoldTerm {
+    /// Lower bound on every valid reconstruction dispersion at this fitted
+    /// state. The dispersion denominator is residual degrees of freedom and
+    /// cannot exceed the scalar observation count `N*P`; therefore the
+    /// criterion's authoritative RSS divided by `N*P` is the bound. The
+    /// whitening/raw-frame choice is shared with [`Self::reconstruction_dispersion`]
+    /// so the structural rank decision cannot price another likelihood.
+    pub(crate) fn reconstruction_dispersion_lower_bound(
+        &self,
+        loss: &SaeManifoldLoss,
+        residual: Option<ArrayView2<'_, f64>>,
+    ) -> Result<f64, String> {
+        let n_scalar = self.n_obs().checked_mul(self.output_dim()).ok_or_else(|| {
+            "reconstruction_dispersion_lower_bound: scalar observation count overflowed"
+                .to_string()
+        })?;
+        if n_scalar == 0 {
+            return Err(
+                "reconstruction_dispersion_lower_bound: scalar observation count is zero"
+                    .to_string(),
+            );
+        }
+        Ok(self.reconstruction_residual_sum_squares(loss, residual)? / n_scalar as f64)
+    }
+
+    fn reconstruction_residual_sum_squares(
+        &self,
+        loss: &SaeManifoldLoss,
+        residual: Option<ArrayView2<'_, f64>>,
+    ) -> Result<f64, String> {
+        if let Some(residual) = residual.as_ref() {
+            if residual.dim() != (self.n_obs(), self.output_dim()) {
+                return Err(format!(
+                    "reconstruction residual shape {:?} does not match ({}, {})",
+                    residual.dim(),
+                    self.n_obs(),
+                    self.output_dim(),
+                ));
+            }
+            if residual.iter().any(|value| !value.is_finite()) {
+                return Err("reconstruction residual must be finite".to_string());
+            }
+        }
+        let metric_whitens = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|metric| metric.whitens_likelihood());
+        let rss = if metric_whitens {
+            residual
+                .as_ref()
+                .map(|values| values.iter().map(|value| value * value).sum::<f64>())
+                .unwrap_or(2.0 * loss.data_fit)
+        } else {
+            2.0 * loss.data_fit
+        };
+        if rss.is_finite() && rss >= 0.0 {
+            Ok(rss)
+        } else {
+            Err(format!(
+                "reconstruction residual sum of squares must be finite and non-negative; got {rss}"
+            ))
+        }
+    }
+
     /// Gaussian reconstruction dispersion `φ̂`, the scale that turns the
     /// unscaled inverse-Hessian β-block `S_β⁻¹` into a posterior covariance
     /// `Cov(β) = φ̂·S_β⁻¹` — the same `Vb = φ·H⁻¹` convention the main GAM
@@ -323,18 +386,7 @@ impl SaeManifoldTerm {
         // at the requested rho' for every structured pass), and the shape
         // bands are φ-scaled output-frame covariances. Price φ from the RAW
         // residual whenever the caller supplied it and the metric whitens.
-        let metric_whitens = self
-            .row_metric
-            .as_ref()
-            .is_some_and(|metric| metric.whitens_likelihood());
-        let rss = if metric_whitens && residual.is_some() {
-            residual
-                .as_ref()
-                .map(|res| res.iter().map(|value| value * value).sum::<f64>())
-                .unwrap_or(2.0 * loss.data_fit)
-        } else {
-            2.0 * loss.data_fit
-        };
+        let rss = self.reconstruction_residual_sum_squares(loss, residual)?;
         let smooth_edf: f64 = self
             .decoder_smoothness_effective_dof_per_atom(cache, &rho.lambda_smooth_vec()?)
             .map_err(|e| format!("reconstruction_dispersion: smooth edf: {e}"))?

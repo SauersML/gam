@@ -366,9 +366,8 @@ enum FisherOutputSchedule {
     ContiguousFull,
 }
 
-const AVX2_WITHOUT_AVX512: bool =
-    cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
-        && !cfg!(all(target_arch = "x86_64", target_feature = "avx512f"));
+const AVX2_WITHOUT_AVX512: bool = cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
+    && !cfg!(all(target_arch = "x86_64", target_feature = "avx512f"));
 
 /// Select a storage schedule for the same elementwise [`fisher_entry`]
 /// expression. First-order M=32 favors contiguous rows on AVX2-only targets,
@@ -2663,8 +2662,7 @@ mod tests {
                 "M=32 first-directional Fisher schedule does not match the target ISA"
             );
             assert!(
-                fisher_output_schedule::<TwoSeed<0>>(M)
-                    == FisherOutputSchedule::SymmetricTriangle,
+                fisher_output_schedule::<TwoSeed<0>>(M) == FisherOutputSchedule::SymmetricTriangle,
                 "M=32 second-directional Fisher schedule must retain symmetric output"
             );
 
@@ -2684,18 +2682,13 @@ mod tests {
                 let observed_class = if trial % 2 == 0 { trial } else { M };
                 let weight = 0.8 + 0.3 * trial as f64;
                 let family = single_row_family(observed_class, weight, M + 1);
-                let program = MultinomialLogitRowProgram::new(
-                    eta,
-                    observed_class,
-                    weight,
-                )
-                .expect("valid M=32 multinomial row program");
+                let program = MultinomialLogitRowProgram::new(eta, observed_class, weight)
+                    .expect("valid M=32 multinomial row program");
 
                 let production_first = prod_third(&family, &eta, &direction);
                 let canonical_first = program_third_contracted(&program, 0, &direction)
                     .expect("canonical M=32 first-directional Fisher contraction");
-                let production_second =
-                    prod_fourth(&family, &eta, &direction_u, &direction);
+                let production_second = prod_fourth(&family, &eta, &direction_u, &direction);
                 let canonical_second =
                     program_fourth_contracted(&program, 0, &direction_u, &direction)
                         .expect("canonical M=32 second-directional Fisher contraction");
@@ -2706,17 +2699,13 @@ mod tests {
                             production_first[row][column],
                             canonical_first[row][column],
                             JET_TOL,
-                            &format!(
-                                "M=32 trial {trial} first-directional[{row}][{column}]"
-                            ),
+                            &format!("M=32 trial {trial} first-directional[{row}][{column}]"),
                         );
                         close(
                             production_second[row][column],
                             canonical_second[row][column],
                             JET_TOL,
-                            &format!(
-                                "M=32 trial {trial} second-directional[{row}][{column}]"
-                            ),
+                            &format!("M=32 trial {trial} second-directional[{row}][{column}]"),
                         );
                     }
                 }

@@ -1628,6 +1628,85 @@ impl SaeManifoldTerm {
             .collect()
     }
 
+    /// Certify decoder disappearance without consulting the joint inverse.
+    ///
+    /// Every reconstruction-Gram eigenvalue of atom `k` is bounded by
+    /// `||G_k||_2 ||D_k||_F^2 / N_eff,k`, which is in turn bounded by
+    /// `||G_k||_inf ||D_k||_F^2 / N_eff,k`. If that upper bound is already at
+    /// or below `RANK_VANISHED_REL * dispersion_lower_bound`, the atom is
+    /// vanished for every admissible dispersion. This one-sided certificate
+    /// belongs before ARD EDF: the null stratum makes the joint decoder mode
+    /// degenerate, while disappearance itself depends only on the fitted
+    /// function image and likelihood scale.
+    pub(crate) fn vanished_atoms_from_signal_upper_bound(
+        &self,
+        grams: &[Array2<f64>],
+        n_eff: &[f64],
+        dispersion_lower_bound: f64,
+    ) -> Result<Option<VanishedAtoms>, String> {
+        if grams.len() != self.k_atoms() || n_eff.len() != self.k_atoms() {
+            return Err(format!(
+                "vanished_atoms_from_signal_upper_bound: expected {} Gram/sample blocks; got {} and {}",
+                self.k_atoms(),
+                grams.len(),
+                n_eff.len(),
+            ));
+        }
+        if !(dispersion_lower_bound.is_finite() && dispersion_lower_bound >= 0.0) {
+            return Err(format!(
+                "vanished_atoms_from_signal_upper_bound: dispersion lower bound must be finite and non-negative; got {dispersion_lower_bound}"
+            ));
+        }
+
+        let mut vanished = Vec::new();
+        for atom in 0..self.k_atoms() {
+            let gram = &grams[atom];
+            let decoder = &self.atoms[atom].decoder_coefficients;
+            let m = decoder.nrows();
+            if gram.dim() != (m, m) {
+                return Err(format!(
+                    "vanished_atoms_from_signal_upper_bound: atom {atom} Gram {:?} does not match decoder basis width {m}",
+                    gram.dim(),
+                ));
+            }
+            if gram
+                .iter()
+                .chain(decoder.iter())
+                .any(|value| !value.is_finite())
+            {
+                return Err(format!(
+                    "vanished_atoms_from_signal_upper_bound: atom {atom} Gram and decoder must be finite"
+                ));
+            }
+            let occupancy = n_eff[atom];
+            if !(occupancy.is_finite() && occupancy >= 0.0) {
+                return Err(format!(
+                    "vanished_atoms_from_signal_upper_bound: atom {atom} effective sample size must be finite and non-negative; got {occupancy}"
+                ));
+            }
+            if occupancy == 0.0 {
+                vanished.push(atom);
+                continue;
+            }
+
+            let gram_inf_norm = (0..m)
+                .map(|row| (0..m).map(|col| gram[[row, col]].abs()).sum::<f64>())
+                .fold(0.0_f64, f64::max);
+            let decoder_frobenius_squared =
+                decoder.iter().map(|value| value * value).sum::<f64>();
+            let signal_upper_bound = gram_inf_norm * decoder_frobenius_squared / occupancy;
+            if !signal_upper_bound.is_finite() {
+                return Err(format!(
+                    "vanished_atoms_from_signal_upper_bound: atom {atom} signal upper bound is not finite"
+                ));
+            }
+            if signal_upper_bound <= RANK_VANISHED_REL * dispersion_lower_bound {
+                vanished.push(atom);
+            }
+        }
+        Ok(VanishedAtoms::from_slots(vanished))
+    }
+
     /// Shared rank-charge DOF core (#11): `d_eff_k = rank_eff_k · basis_edf_k` from the
     /// PRE-ACCUMULATED per-atom Grams `grams[k] = Φ_kᵀdiag(a_k²)Φ_k` and effective sample
     /// sizes `n_eff[k] = Σ_row a_k²`. Split out of `per_atom_realised_rank_dof` so the
