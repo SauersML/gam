@@ -5,7 +5,8 @@
 use super::*;
 
 use gam_math::jet_scalar::{
-    DynamicJetArena, DynamicOrder2, RuntimeJetScalar, SymmetricQuadraticCoefficients,
+    DynamicJetArena, DynamicOrder2, FixedRuntimeJet, JetScalar, Order2, RuntimeJetScalar,
+    SymmetricQuadraticCoefficients,
 };
 use gam_math::order2_graph::{Order2Graph, Order2GraphWorkspace};
 
@@ -984,6 +985,51 @@ fn row_primary_closed_form_vector_dynamic(
     Ok((row.v, gradient, hessian))
 }
 
+fn row_primary_closed_form_vector_fixed<const DIM: usize>(
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    slopes: &[f64],
+    z: &[f64],
+    covariance: &MarginalSlopeCovariance,
+    w: f64,
+    d: f64,
+    derivative_guard: f64,
+    probit_scale: f64,
+) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+    if DIM != 3 + slopes.len() {
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "fixed runtime-vector row dimension mismatch: DIM={DIM}, slopes={}",
+                slopes.len()
+            ),
+        }
+        .into());
+    }
+    let values: [f64; DIM] = std::array::from_fn(|axis| match axis {
+        0 => q0,
+        1 => q1,
+        2 => qd1,
+        _ => slopes[axis - 3],
+    });
+    let vars: [FixedRuntimeJet<Order2<DIM>, DIM>; DIM] = std::array::from_fn(|axis| {
+        FixedRuntimeJet::from_inner(Order2::variable(values[axis], axis))
+    });
+    let inputs = RigidRowInputs {
+        row: 0,
+        wi: w,
+        di: d,
+        z_sum: 0.0,
+        covariance_ones: 0.0,
+        probit_scale,
+        qd1_lower: derivative_guard,
+    };
+    let row = rigid_vector_row_nll(&vars, z, covariance, &inputs, &())?.into_inner();
+    let gradient = Array1::from_vec(row.g().to_vec());
+    let hessian = Array2::from_shape_fn((DIM, DIM), |(a, b)| row.h()[a][b]);
+    Ok((row.0.v, gradient, hessian))
+}
+
 /// Reusable storage for the production compiled graph and the uncommon
 /// runtime-width backend. The graph schedule covers the observed score widths;
 /// the dynamic packed algebra remains the exact same-expression backend for
@@ -1383,54 +1429,6 @@ mod tests {
         fn retained_bytes(&self) -> usize {
             self.graph.retained_bytes() + self.dynamic.allocated_bytes()
         }
-    }
-
-    fn row_primary_closed_form_vector_fixed<const DIM: usize>(
-        q0: f64,
-        q1: f64,
-        qd1: f64,
-        slopes: &[f64],
-        z: &[f64],
-        covariance: &MarginalSlopeCovariance,
-        w: f64,
-        d: f64,
-        derivative_guard: f64,
-        probit_scale: f64,
-    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        use gam_math::jet_scalar::{FixedRuntimeJet, JetScalar, Order2};
-        use gam_math::nested_dual::JetField;
-
-        if DIM != 3 + slopes.len() {
-            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-                reason: format!(
-                    "fixed runtime-vector row dimension mismatch: DIM={DIM}, slopes={}",
-                    slopes.len()
-                ),
-            }
-            .into());
-        }
-        let values: [f64; DIM] = std::array::from_fn(|axis| match axis {
-            0 => q0,
-            1 => q1,
-            2 => qd1,
-            _ => slopes[axis - 3],
-        });
-        let vars: [FixedRuntimeJet<Order2<DIM>, DIM>; DIM] = std::array::from_fn(|axis| {
-            FixedRuntimeJet::from_inner(Order2::variable(values[axis], axis))
-        });
-        let inputs = RigidRowInputs {
-            row: 0,
-            wi: w,
-            di: d,
-            z_sum: 0.0,
-            covariance_ones: 0.0,
-            probit_scale,
-            qd1_lower: derivative_guard,
-        };
-        let row = rigid_vector_row_nll(&vars, z, covariance, &inputs, &())?.into_inner();
-        let gradient = Array1::from_vec(row.g().to_vec());
-        let hessian = Array2::from_shape_fn((DIM, DIM), |(a, b)| row.h()[a][b]);
-        Ok((row.value(), gradient, hessian))
     }
 
     /// #1440 cutover oracle: the pilot W-metric chain factors are now the EXACT
