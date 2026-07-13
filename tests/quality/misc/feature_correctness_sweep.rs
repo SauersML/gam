@@ -8,8 +8,8 @@
 use gam::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
     BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, CenterStrategy, OneDimensionalBoundary,
-    PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec, build_bspline_basis_1d,
-    build_periodic_bspline_basis_1d, build_spherical_spline_basis,
+    PenaltySource, PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec,
+    build_bspline_basis_1d, build_periodic_bspline_basis_1d, build_spherical_spline_basis,
     cyclic_bspline_derivative_penalty_matrix, evaluate_bspline_derivative_scalar,
     periodic_bspline_first_derivative_nd, spherical_wahba_kernel_matrix,
 };
@@ -385,8 +385,9 @@ fn bc_bspline_realizes_nonzero_anchor_as_affine_lift() {
         "left endpoint affine value must equal the anchor, got {}",
         affine[0]
     );
+    let dense_design = built.design.to_dense();
     assert!(
-        built.design.row(0).iter().all(|value| value.abs() < 1e-10),
+        dense_design.row(0).iter().all(|value| value.abs() < 1e-10),
         "the estimated coefficient chart must remain homogeneously pinned"
     );
 }
@@ -704,7 +705,12 @@ fn sphere_harmonic_penalty_diagonal_eigenvalues_match_l_l_plus_1_squared() {
     let pts = random_lat_lon(60, 13);
     let l_max = 5;
     let built = build_harmonic(pts.view(), l_max, false).unwrap();
-    let p = &built.penalties[0];
+    let p = &built
+        .active_penalties
+        .iter()
+        .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
+        .expect("harmonic sphere basis must retain its primary roughness penalty")
+        .matrix;
     // Normalized penalty; raw eigenvalue per (l, m) is [l(l+1)]^2. After
     // normalize_penalty, values may be scaled — confirm the *relative*
     // ratios: each (2l+1)-block has the same diagonal value.

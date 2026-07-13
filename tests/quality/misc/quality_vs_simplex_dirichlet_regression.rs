@@ -200,9 +200,10 @@ fn pspline_parts(x_all: &[f64]) -> (Array2<f64>, Vec<PenaltyMatrix>, Vec<usize>,
         }
     }
 
-    let mut penalties = Vec::with_capacity(basis.penalties.len());
-    let mut nullspace_dims = Vec::with_capacity(basis.penalties.len());
-    for (k, s_basis) in basis.penalties.iter().enumerate() {
+    let mut penalties = Vec::with_capacity(basis.active_penalties.len());
+    let mut nullspace_dims = Vec::with_capacity(basis.active_penalties.len());
+    for (k, active_penalty) in basis.active_penalties.iter().enumerate() {
+        let s_basis = &active_penalty.matrix;
         assert!(
             s_basis.nrows() == p_s && s_basis.ncols() == p_s,
             "penalty {k} shape {:?} != {p_s}x{p_s}",
@@ -218,8 +219,7 @@ fn pspline_parts(x_all: &[f64]) -> (Array2<f64>, Vec<PenaltyMatrix>, Vec<usize>,
         // The padded penalty gains one extra null direction (the unpenalized
         // intercept column) on top of the basis penalty's own structural null
         // space (linear trend for a 2nd-order difference).
-        let base_null = basis.nullspace_dims.get(k).copied().unwrap_or(0);
-        nullspace_dims.push(base_null + 1);
+        nullspace_dims.push(active_penalty.nullity + 1);
     }
 
     let train = full.slice(ndarray::s![0..N, ..]).to_owned();
@@ -1247,9 +1247,10 @@ fn pspline_real_parts(
         }
     }
 
-    let mut penalties = Vec::with_capacity(basis.penalties.len());
-    let mut nullspace_dims = Vec::with_capacity(basis.penalties.len());
-    for (k, s_basis) in basis.penalties.iter().enumerate() {
+    let mut penalties = Vec::with_capacity(basis.active_penalties.len());
+    let mut nullspace_dims = Vec::with_capacity(basis.active_penalties.len());
+    for (k, active_penalty) in basis.active_penalties.iter().enumerate() {
+        let s_basis = &active_penalty.matrix;
         assert!(
             s_basis.nrows() == p_s && s_basis.ncols() == p_s,
             "skye penalty {k} shape {:?} != {p_s}x{p_s}",
@@ -1262,8 +1263,7 @@ fn pspline_real_parts(
             }
         }
         penalties.push(PenaltyMatrix::from(s));
-        let base_null = basis.nullspace_dims.get(k).copied().unwrap_or(0);
-        nullspace_dims.push(base_null + 1);
+        nullspace_dims.push(active_penalty.nullity + 1);
     }
 
     let train = full.slice(ndarray::s![0..n_train, ..]).to_owned();

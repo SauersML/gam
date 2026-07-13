@@ -10,6 +10,11 @@ use gam_models::inference::model::{
     FittedModel, PredictModelClass, binomial_location_scale_threshold_beta,
     gaussian_location_scale_mean_beta, location_scale_noise_beta,
 };
+use gam_models::survival::{
+    CauseSpecificSurvivalAloRowInput, SurvivalLikelihoodMode,
+    cause_specific_survival_alo_row_geometry, require_saved_survival_likelihood_mode,
+    survival_event_code_from_value,
+};
 use gam_models::transformation_normal::{
     TRANSFORMATION_MONOTONICITY_EPS, TransformationNormalAloRowInput,
     transformation_normal_alo_row_geometry,
@@ -31,6 +36,137 @@ use crate::{FittedModelPredictExt, PredictInput};
 pub struct SavedAloObservations<'a> {
     pub response: &'a Array1<f64>,
     pub prior_weights: &'a Array1<f64>,
+}
+
+/// Exact affine row carrier for a saved cause-specific transformation/Weibull
+/// survival likelihood.
+///
+/// Coordinates are flattened cause-major as
+/// `[eta_exit, eta_entry, derivative_exit]` for each cause. Every coordinate
+/// carries its own parameter-aligned design and coefficient range; the three
+/// ranges for one cause intentionally overlap because all three predictors are
+/// affine functions of the same fitted endpoint block.
+#[derive(Clone)]
+pub struct SavedCauseSpecificSurvivalAloInput {
+    event_codes: Array1<u8>,
+    entry_active: Vec<bool>,
+    coordinate_designs: Vec<DesignMatrix>,
+    coordinate_offsets: Vec<Array1<f64>>,
+    coordinate_ranges: Vec<Range<usize>>,
+    cause_count: usize,
+}
+
+impl SavedCauseSpecificSurvivalAloInput {
+    pub fn new(
+        event_codes: Array1<u8>,
+        entry_active: Vec<bool>,
+        coordinate_designs: Vec<DesignMatrix>,
+        coordinate_offsets: Vec<Array1<f64>>,
+        coordinate_ranges: Vec<Range<usize>>,
+        cause_count: usize,
+    ) -> Result<Self, String> {
+        if cause_count == 0 {
+            return Err("saved cause-specific ALO requires at least one cause".to_string());
+        }
+        let n = event_codes.len();
+        if n == 0 {
+            return Err("saved cause-specific ALO requires at least one row".to_string());
+        }
+        if entry_active.len() != n {
+            return Err(format!(
+                "saved cause-specific ALO entry activity has {} rows; expected {n}",
+                entry_active.len()
+            ));
+        }
+        let coordinate_count = cause_count.checked_mul(3).ok_or_else(|| {
+            "saved cause-specific ALO coordinate count overflows usize".to_string()
+        })?;
+        if coordinate_designs.len() != coordinate_count
+            || coordinate_offsets.len() != coordinate_count
+            || coordinate_ranges.len() != coordinate_count
+        {
+            return Err(format!(
+                "saved cause-specific ALO requires {coordinate_count} coordinate designs/offsets/ranges for {cause_count} causes; got designs={}, offsets={}, ranges={}",
+                coordinate_designs.len(),
+                coordinate_offsets.len(),
+                coordinate_ranges.len()
+            ));
+        }
+        for coordinate in 0..coordinate_count {
+            let design = &coordinate_designs[coordinate];
+            let offset = &coordinate_offsets[coordinate];
+            let range = &coordinate_ranges[coordinate];
+            if design.nrows() != n || offset.len() != n {
+                return Err(format!(
+                    "saved cause-specific ALO coordinate {coordinate} row mismatch: design={}, offset={}, expected={n}",
+                    design.nrows(),
+                    offset.len()
+                ));
+            }
+            if range.is_empty() || design.ncols() != range.len() {
+                return Err(format!(
+                    "saved cause-specific ALO coordinate {coordinate} has design width {} and coefficient range {:?}",
+                    design.ncols(),
+                    range
+                ));
+            }
+        }
+        if let Some((row, code)) = event_codes
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, code)| usize::from(*code) > cause_count)
+        {
+            return Err(format!(
+                "saved cause-specific ALO event code[{row}]={code} exceeds fitted cause count {cause_count}"
+            ));
+        }
+        Ok(Self {
+            event_codes,
+            entry_active,
+            coordinate_designs,
+            coordinate_offsets,
+            coordinate_ranges,
+            cause_count,
+        })
+    }
+}
+
+/// Typed survival row carriers accepted by saved-model ALO.
+#[derive(Clone)]
+pub enum SavedSurvivalAloInput {
+    CauseSpecific(SavedCauseSpecificSurvivalAloInput),
+}
+
+/// Class-aware saved-model ALO input.
+///
+/// The affine predictor carrier cannot represent survival's entry/exit/time
+/// derivative row map. Making that distinction explicit prevents a survival
+/// model from being silently forced through a simpler prediction surface.
+#[derive(Clone)]
+pub enum SavedModelAloInput {
+    Affine(PredictInput),
+    Survival(SavedSurvivalAloInput),
+}
+
+impl SavedModelAloInput {
+    pub fn affine(input: PredictInput) -> Self {
+        Self::Affine(input)
+    }
+
+    pub fn survival(input: SavedSurvivalAloInput) -> Self {
+        Self::Survival(input)
+    }
+
+    pub fn require_affine(&self, class: PredictModelClass) -> Result<&PredictInput, String> {
+        match self {
+            Self::Affine(input) => Ok(input),
+            Self::Survival(_) => Err(format!(
+                "saved {} ALO requires an affine predictor carrier, not survival row geometry",
+                class.name()
+            )),
+        }
+    }
 }
 
 /// Class-neutral diagnostics returned by saved-model multi-coordinate ALO.
@@ -1045,6 +1181,151 @@ fn compute_saved_transformation_normal_alo(
     )
 }
 
+fn compute_saved_cause_specific_survival_alo(
+    model: &FittedModel,
+    input: &SavedCauseSpecificSurvivalAloInput,
+    observations: SavedAloObservations<'_>,
+) -> Result<SavedModelAloDiagnostics, EstimationError> {
+    let class = PredictModelClass::Survival;
+    let likelihood_mode = require_saved_survival_likelihood_mode(model)
+        .map_err(|error| invalid(format!("saved survival ALO likelihood mode: {error}")))?;
+    if !matches!(
+        likelihood_mode,
+        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
+    ) {
+        return Err(invalid(format!(
+            "saved cause-specific ALO row geometry is valid only for transformation/weibull survival, got {likelihood_mode:?}"
+        )));
+    }
+    let n = input.event_codes.len();
+    if observations.response.len() != n || observations.prior_weights.len() != n {
+        return Err(invalid(format!(
+            "saved cause-specific ALO row mismatch: event_codes={n}, response={}, weights={}",
+            observations.response.len(),
+            observations.prior_weights.len()
+        )));
+    }
+    for row in 0..n {
+        let response_code = survival_event_code_from_value(observations.response[row], row)
+            .map_err(|reason| invalid(format!("saved survival ALO response: {reason}")))?;
+        if response_code != input.event_codes[row] {
+            return Err(invalid(format!(
+                "saved survival ALO event code mismatch at row {row}: typed carrier={}, observations={response_code}",
+                input.event_codes[row]
+            )));
+        }
+        let weight = observations.prior_weights[row];
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(invalid(format!(
+                "saved survival ALO prior weight[{row}] must be finite and non-negative, got {weight}"
+            )));
+        }
+    }
+
+    let fit = model.payload().fit_result.as_ref().ok_or_else(|| {
+        invalid("saved survival ALO requires a canonical fitted coefficient state")
+    })?;
+    let parameter_dimension = fit.beta.len();
+    let hessian = require_saved_hessian(model, class, parameter_dimension)?;
+    let fitted_cause_count = model
+        .payload()
+        .survival_cause_count
+        .unwrap_or(fit.blocks.len())
+        .max(1);
+    if input.cause_count != fitted_cause_count || fit.blocks.len() != fitted_cause_count {
+        return Err(invalid(format!(
+            "saved cause-specific ALO cause topology mismatch: carrier={}, metadata={}, fitted_blocks={}",
+            input.cause_count,
+            fitted_cause_count,
+            fit.blocks.len()
+        )));
+    }
+
+    let coordinate_count = input.cause_count * 3;
+    let mut coordinate_arrays = Vec::with_capacity(coordinate_count);
+    for coordinate in 0..coordinate_count {
+        let range = &input.coordinate_ranges[coordinate];
+        if range.end > parameter_dimension {
+            return Err(invalid(format!(
+                "saved cause-specific ALO coordinate {coordinate} range {range:?} exceeds fitted parameter dimension {parameter_dimension}"
+            )));
+        }
+        let beta = fit.beta.slice(s![range.clone()]).to_owned();
+        coordinate_arrays.push(
+            input.coordinate_designs[coordinate].dot(&beta)
+                + &input.coordinate_offsets[coordinate],
+        );
+    }
+
+    let mut observed_hessians = Vec::with_capacity(n);
+    let mut scores = Vec::with_capacity(n);
+    let mut coordinate_values = Vec::with_capacity(n);
+    for row in 0..n {
+        let mut score = Array1::<f64>::zeros(coordinate_count);
+        let mut observed_hessian = Array2::<f64>::zeros((coordinate_count, coordinate_count));
+        let mut values = Array1::<f64>::zeros(coordinate_count);
+        for cause in 0..input.cause_count {
+            let start = cause * 3;
+            let eta_exit = coordinate_arrays[start][row];
+            let eta_entry = coordinate_arrays[start + 1][row];
+            let derivative_exit = coordinate_arrays[start + 2][row];
+            values[start] = eta_exit;
+            values[start + 1] = eta_entry;
+            values[start + 2] = derivative_exit;
+            let geometry = cause_specific_survival_alo_row_geometry(
+                CauseSpecificSurvivalAloRowInput {
+                    eta_exit,
+                    eta_entry,
+                    derivative_exit,
+                    prior_weight: observations.prior_weights[row],
+                    entry_active: input.entry_active[row],
+                    event: usize::from(input.event_codes[row]) == cause + 1,
+                },
+            )
+            .map_err(|reason| {
+                invalid(format!(
+                    "saved survival ALO row {row}, cause {}: {reason}",
+                    cause + 1
+                ))
+            })?;
+            for left in 0..3 {
+                score[start + left] = geometry.nll_score[left];
+                for right in 0..3 {
+                    observed_hessian[[start + left, start + right]] =
+                        geometry.observed_hessian[left][right];
+                }
+            }
+        }
+        scores.push(score);
+        observed_hessians.push(observed_hessian);
+        coordinate_values.push(values);
+    }
+    let coordinate_names = (0..input.cause_count)
+        .flat_map(|cause| {
+            let prefix = if input.cause_count == 1 {
+                String::new()
+            } else {
+                format!("cause[{}].", cause + 1)
+            };
+            [
+                format!("{prefix}eta-exit"),
+                format!("{prefix}eta-entry"),
+                format!("{prefix}derivative-exit"),
+            ]
+        })
+        .collect::<Vec<_>>();
+    compute_saved_multicoordinate_core(
+        class,
+        coordinate_names,
+        input.coordinate_designs.clone(),
+        input.coordinate_ranges.clone(),
+        hessian,
+        observed_hessians,
+        scores,
+        coordinate_values,
+    )
+}
+
 /// Replay exact ALO from one saved-model authority for every fitted class.
 ///
 /// The dispatcher never refits, substitutes a simpler model, or reconstructs
@@ -1054,27 +1335,55 @@ fn compute_saved_transformation_normal_alo(
 /// prediction quadrature carrier.
 pub fn compute_saved_model_alo(
     model: &FittedModel,
-    input: &PredictInput,
+    input: &SavedModelAloInput,
     observations: SavedAloObservations<'_>,
 ) -> Result<SavedModelAloDiagnostics, EstimationError> {
     match model.predict_model_class() {
-        PredictModelClass::Standard => compute_saved_standard_alo(model, input, &observations),
+        PredictModelClass::Standard => compute_saved_standard_alo(
+            model,
+            input
+                .require_affine(PredictModelClass::Standard)
+                .map_err(invalid)?,
+            &observations,
+        ),
         PredictModelClass::GaussianLocationScale
         | PredictModelClass::BinomialLocationScale
         | PredictModelClass::DispersionLocationScale => {
-            compute_saved_location_scale_alo(model, input, observations)
+            let class = model.predict_model_class();
+            compute_saved_location_scale_alo(
+                model,
+                input.require_affine(class).map_err(invalid)?,
+                observations,
+            )
         }
         PredictModelClass::BernoulliMarginalSlope => {
-            compute_saved_bernoulli_marginal_slope_alo(model, input, observations)
+            compute_saved_bernoulli_marginal_slope_alo(
+                model,
+                input
+                    .require_affine(PredictModelClass::BernoulliMarginalSlope)
+                    .map_err(invalid)?,
+                observations,
+            )
         }
         PredictModelClass::TransformationNormal => compute_saved_transformation_normal_alo(
             model,
-            &input.design,
-            &input.offset,
+            &input
+                .require_affine(PredictModelClass::TransformationNormal)
+                .map_err(invalid)?
+                .design,
+            &input
+                .require_affine(PredictModelClass::TransformationNormal)
+                .map_err(invalid)?
+                .offset,
             observations,
         ),
-        PredictModelClass::Survival => Err(invalid(
-            "saved survival ALO requires typed event/time row replay; no survival mode may be substituted",
-        )),
+        PredictModelClass::Survival => match input {
+            SavedModelAloInput::Survival(SavedSurvivalAloInput::CauseSpecific(input)) => {
+                compute_saved_cause_specific_survival_alo(model, input, observations)
+            }
+            SavedModelAloInput::Affine(_) => Err(invalid(
+                "saved survival ALO requires typed entry/exit/derivative row geometry",
+            )),
+        },
     }
 }

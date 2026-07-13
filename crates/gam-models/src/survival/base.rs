@@ -371,6 +371,18 @@ pub fn cause_specific_survival_alo_row_geometry(
             input.prior_weight
         ));
     }
+    // The live fit drops zero-weight rows before it evaluates any predictor
+    // channel. Saved replay must preserve that exact measure: a structurally
+    // invalid derivative or overflowing inactive predictor on a row carrying
+    // no likelihood mass is irrelevant, and must not turn an exact zero
+    // score/curvature row into a diagnostic failure.
+    if input.prior_weight == 0.0 {
+        return Ok(CauseSpecificSurvivalAloRowGeometry {
+            negative_log_likelihood: 0.0,
+            nll_score: [0.0; 3],
+            observed_hessian: [[0.0; 3]; 3],
+        });
+    }
     if !input.eta_exit.is_finite() {
         return Err(format!(
             "cause-specific saved ALO exit index must be finite, got {}",
