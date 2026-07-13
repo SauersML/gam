@@ -191,6 +191,9 @@ pub fn score_influence_jacobian(
     let x_cov = cov_design.design.try_row_chunk(0..n).map_err(|e| {
         format!("score_influence_jacobian: covariate design materialization failed: {e}")
     })?;
+    let effective_offset = cov_design
+        .compose_offset(offset.view(), "score influence Jacobian")
+        .map_err(|e| e.to_string())?;
 
     // γ_k(x_i) = Σ_j Xᶜᵒᵛ_{i,j}·Γ[k,j]  ⇒  gamma = Xᶜᵒᵛ · Γᵀ  (n × p_resp).
     let gamma = fast_abt(&x_cov, &beta_mat);
@@ -238,7 +241,7 @@ pub fn score_influence_jacobian(
         // operating point (and the emitted z) where the fitted model evaluates
         // it. The per-row monotonicity floor ε·(y − median) and the endpoint
         // floors are recomputed from the fitted median.
-        let offset_i = offset[i];
+        let offset_i = effective_offset[i];
         let value_floor = TRANSFORMATION_MONOTONICITY_EPS * (response[i] - median);
         let mut h = val_row[0] * g0 + offset_i + value_floor;
         let mut l = lower_basis[0] * g0 + offset_i + lower_floor;

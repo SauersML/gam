@@ -2342,6 +2342,11 @@ pub(crate) fn fit_survival_transformation_model(
             let mut eta_offset_exit = prepared.eta_offset_exit.clone();
             eta_offset_entry += &spec.covariate_offset;
             eta_offset_exit += &spec.covariate_offset;
+            // Covariates enter both cumulative-hazard evaluations and are
+            // constant with respect to survival time. Their fixed affine lift
+            // therefore belongs in entry and exit, but not the time derivative.
+            eta_offset_entry += &covariate_design.affine_offset;
+            eta_offset_exit += &covariate_design.affine_offset;
             let p_time_total = prepared.time_design_exit.ncols();
             let p = p_time_total + p_cov;
             let mut penalty_blocks = Vec::<PenaltyBlock>::new();

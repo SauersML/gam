@@ -490,9 +490,12 @@ pub(crate) fn build_survival_covariate_block_from_design(
 ) -> Result<CovariateBlockKind, String> {
     match template {
         SurvivalCovariateTermBlockTemplate::Static => {
+            let effective_offset = cov_design
+                .compose_offset(offset.view(), "survival location-scale covariate block")
+                .map_err(|error| error.to_string())?;
             Ok(CovariateBlockKind::Static(ParameterBlockInput {
                 design: cov_design.design.clone(),
-                offset: offset.clone(),
+                offset: effective_offset,
                 penalties: cov_design
                     .penalties
                     .iter()
@@ -509,6 +512,14 @@ pub(crate) fn build_survival_covariate_block_from_design(
             time_basis_derivative_exit,
             time_penalties,
         } => {
+            if cov_design.affine_offset.iter().any(|value| *value != 0.0) {
+                return Err(
+                    "survival location-scale time-varying covariate blocks do not support \
+                     non-zero smooth anchors: tensoring a scalar boundary lift over the time \
+                     basis requires an explicit time-dependent anchor function"
+                        .to_string(),
+                );
+            }
             let p_cov = cov_design.design.ncols();
             let p_time = time_basis_exit.ncols();
             let design_covariates = cov_design.design.clone();

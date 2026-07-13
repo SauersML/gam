@@ -129,6 +129,18 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let marginalspec_boot = joint_specs.remove(0);
     let (logslope_design, logslopespec_boot, logslope_surface_ranges) =
         combine_logslope_surface_designs(joint_designs, &joint_specs)?;
+    spec.marginal_offset = marginal_design
+        .compose_offset(
+            spec.marginal_offset.view(),
+            "survival marginal-slope marginal block",
+        )
+        .map_err(|error| error.to_string())?;
+    spec.logslope_offset = logslope_design
+        .compose_offset(
+            spec.logslope_offset.view(),
+            "survival marginal-slope logslope block",
+        )
+        .map_err(|error| error.to_string())?;
 
     // Phase-4b parametric identifiability pre-flight (observability-only).
     //

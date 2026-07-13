@@ -603,6 +603,9 @@ pub fn fit_latent_survival_terms(
     let hazard_loading = latent_hazard_loading(&frailty, "latent-survival")?;
     let mean_design =
         build_term_collection_design(data, &spec.meanspec).map_err(|e| e.to_string())?;
+    let mean_offset = mean_design
+        .compose_offset(spec.mean_offset.view(), "latent-survival mean block")
+        .map_err(|e| e.to_string())?;
     let resolvedspec = freeze_term_collection_from_design(&spec.meanspec, &mean_design)
         .map_err(|e| e.to_string())?;
     let time_prepared = prepare_latent_time_block(
@@ -657,7 +660,7 @@ pub fn fit_latent_survival_terms(
 
     let mut blocks = vec![
         build_time_blockspec(&time_prepared, &spec.time_block),
-        build_mean_blockspec(&mean_design, spec.mean_offset.clone()),
+        build_mean_blockspec(&mean_design, mean_offset),
     ];
     if latent_sd.is_none() {
         blocks.push(build_log_sigma_blockspec(
@@ -809,6 +812,9 @@ pub fn fit_latent_binary_terms(
     let (_, hazard_loading) = fixed_latent_hazard_frailty(&frailty, "latent-binary")?;
     let mean_design =
         build_term_collection_design(data, &spec.meanspec).map_err(|e| e.to_string())?;
+    let mean_offset = mean_design
+        .compose_offset(spec.mean_offset.view(), "latent-binary mean block")
+        .map_err(|e| e.to_string())?;
     let resolvedspec = freeze_term_collection_from_design(&spec.meanspec, &mean_design)
         .map_err(|e| e.to_string())?;
     let time_prepared = prepare_latent_time_block(&spec.time_block, None, spec.derivative_guard)?;
@@ -829,7 +835,7 @@ pub fn fit_latent_binary_terms(
 
     let blocks = vec![
         build_time_blockspec(&time_prepared, &spec.time_block),
-        build_mean_blockspec(&mean_design, spec.mean_offset.clone()),
+        build_mean_blockspec(&mean_design, mean_offset),
     ];
     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
     let baseline_offset_residuals = family.offset_channel_residuals(&fit.block_states)?;

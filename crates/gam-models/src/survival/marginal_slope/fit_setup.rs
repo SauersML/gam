@@ -671,6 +671,17 @@ pub(crate) fn combine_logslope_surface_designs(
                 .to_string(),
         );
     }
+    if designs
+        .iter()
+        .any(|design| design.affine_offset.iter().any(|value| *value != 0.0))
+    {
+        return Err(
+            "per-score logslope surfaces do not support non-zero smooth anchors: each affine \
+             surface lift must be coupled to its own latent-score coordinate, but the shared \
+             logslope offset channel is scalar"
+                .to_string(),
+        );
+    }
 
     let mut ranges = Vec::with_capacity(designs.len());
     let mut offset = 0usize;

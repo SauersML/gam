@@ -172,12 +172,12 @@ pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
 ) -> Result<SelectedWiggleBasis, String> {
     let eta_threshold = pilot
         .threshold_design
-        .design
-        .dot(&pilot.fit.beta_threshold());
+        .apply(pilot.fit.beta_threshold().view())
+        .map_err(|error| error.to_string())?;
     let eta_log_sigma = pilot
         .log_sigma_design
-        .design
-        .dot(&pilot.fit.beta_log_sigma());
+        .apply(pilot.fit.beta_log_sigma().view())
+        .map_err(|error| error.to_string())?;
     let q_seed = Array1::from_iter(
         eta_threshold
             .iter()

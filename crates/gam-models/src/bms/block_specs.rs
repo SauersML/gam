@@ -2060,6 +2060,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
     .map_err(|e| format!("failed to rebuild frozen probe BMS joint designs: {e}"))?;
     let marginal_design = joint_designs.remove(0);
     let logslope_design = joint_designs.remove(0);
+    spec.marginal_offset = marginal_design
+        .compose_offset(spec.marginal_offset.view(), "BMS marginal block")
+        .map_err(|error| error.to_string())?;
+    spec.logslope_offset = logslope_design
+        .compose_offset(spec.logslope_offset.view(), "BMS logslope block")
+        .map_err(|error| error.to_string())?;
     // #905: the conditional `E[z|C]`/`Var(z|C)` Rao gate conditions on the
     // marginal-index span a(C) (= the marginal design columns), which is
     // exactly where the `b(C)·m(C)` leakage lives. It is engaged only on the
