@@ -909,59 +909,26 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitOutcom
             let dispersion_before = shape_uncertainty.dispersion;
             let log_lambda_smooth_before = rho.log_lambda_smooth.clone();
             term.set_row_metric(metric)?;
-            // Clone the pre-built registry (cheap) and warm-start ρ from the
-            // settled fit — identical to the binding rebuilding it from the same
-            // `latent_payload` + descriptor JSON each pass.
-            let warm_flat = rho.to_flat();
-            let mut objective = SaeManifoldOuterObjective::new(
+            let stage = SaeFitStage::StructuredResidual {
+                pass: pass + 1,
+                total_passes,
+            };
+            let mut objective = match fit_outer_stage_to_boundary(
                 term,
-                z.clone(),
-                Some(registry.clone()),
+                &z,
+                &registry,
                 rho,
                 max_iter,
                 learning_rate,
                 ridge_ext_coord,
                 ridge_beta,
-            );
-            let stage = SaeFitStage::StructuredResidual {
-                pass: pass + 1,
-                total_passes,
-            };
-            scope_outer_checkpoint_to_stage(&mut objective, stage);
-            // #2021 — a promotion (below) grows K, enlarging ρ; size the outer
-            // problem from the CURRENT warm vector, not the pass-0 `n_params`
-            // (identical to `n_params` when no birth has occurred).
-            // Resume only the checkpoint for this exact structured phase. Earlier
-            // phases have already been deterministically rebuilt on this run;
-            // their distinct files cannot leak a differently-whitened state here.
-            let search_init_rho = match objective.try_resume_from_checkpoint(warm_flat.len())? {
-                Some(banked) => ndarray::Array1::from(banked),
-                None => warm_flat,
-            };
-            // #2138 — same shared cancel flag; each pass's objective polls it.
-            objective.set_cancel_flag(Arc::clone(&cancel_flag));
-            // Honor the same typed outer-search contract as pass 0. Structured
-            // residual alternation still runs when ρ search is disabled; only
-            // the hyperparameter walk is fixed at the warm ρ. The former
-            // unconditional `OuterProblem` silently re-enabled an outer search
-            // after a fixed-ρ primary fit.
-            let mut objective = if run_outer_rho_search {
-                let problem = OuterProblem::new(search_init_rho.len())
-                    .with_initial_rho(search_init_rho)
-                    .with_seed_config(SeedConfig {
-                        max_seeds: 1,
-                        seed_budget: 1,
-                        ..Default::default()
-                    });
-                // SPEC 20 — possession of the objective below is itself the
-                // convergence certificate: `certify_outer_stage` returns it only for
-                // `OuterResult.converged`, and drops it without removing its
-                // phase-scoped checkpoint for every typed failure.
-                let run_result = problem.run(&mut objective, "SAE manifold (structured)");
-                certify_outer_stage(objective, stage, run_result)?
-            } else {
-                objective.fit_at_fixed_rho(search_init_rho.view())?;
-                objective
+                run_outer_rho_search,
+                stage,
+                &cancel_flag,
+                installed_label,
+            )? {
+                SaeStageFit::Certified(objective) => objective,
+                SaeStageFit::Null(report) => return Ok(SaeFitOutcome::Null(report)),
             };
             // Refresh shape bands + fitted state from the FINAL pass objective
             // (decoder_shape_uncertainty must be read before `into_fitted`).

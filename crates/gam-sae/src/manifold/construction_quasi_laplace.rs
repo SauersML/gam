@@ -2342,15 +2342,15 @@ impl SaeManifoldTerm {
                 return Err(error);
             }
         };
-        let system = system.ok_or_else(|| {
-            SaeCriterionError::Numerical(
-                "streaming outer evaluation did not retain its matrix-free evidence system"
-                    .to_string(),
-            )
-        })?;
         let inverse_probe_bundle = lane.take_inverse_probes().ok_or_else(|| {
             SaeCriterionError::Numerical(
                 "streaming outer evaluation did not emit the requested selected-inverse probe bundle"
+                    .to_string(),
+            )
+        })?;
+        let system = system.ok_or_else(|| {
+            SaeCriterionError::Numerical(
+                "streaming outer evaluation did not retain its matrix-free evidence system"
                     .to_string(),
             )
         })?;
@@ -5140,9 +5140,12 @@ impl SaeManifoldTerm {
             .map_err(|err| format!("SaeManifoldTerm::criterion_as_atoms: {err}"))?;
         let data_fit_priors_value = loss.total() + extra_penalty_energy;
 
-        let solver = self.outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec()?)?;
-        let components =
-            self.analytic_outer_rho_gradient_components(target, rho, &loss, &cache, &solver)?;
+        let solver = self
+            .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec()?)
+            .map_err(|error| SaeCriterionError::Numerical(error.to_string()))?;
+        let components = self
+            .analytic_outer_rho_gradient_components(target, rho, &loss, &cache, &solver)
+            .map_err(|error| SaeCriterionError::Numerical(error.to_string()))?;
         let criterion = SaeCriterion::assemble(
             data_fit_priors_value,
             quasi_laplace_complexity,

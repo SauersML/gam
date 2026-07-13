@@ -728,7 +728,7 @@ fn complete_matrix_free_outer_gradient_matches_dense_softmax() {
 /// ("infeasible to exercise [at massive K] in a unit test"), we exercise the full
 /// streaming path here at a small, fast, memory-bounded whitened multi-atom fit.
 /// The production K=32/p=128 shape is covered upstream by
-/// `wide_border_routes_to_streaming_without_fake_gradient_certificate`, which pins that the memory
+/// `wide_border_routes_to_streaming_with_complete_analytic_gradient_certificate`, which pins that the memory
 /// planner refuses the dense direct plan and admits the matrix-free plan at that
 /// shape — the two together establish that a wide-border large-K whitened fit
 /// routes to, and runs through, the streaming lane without hard-erroring.

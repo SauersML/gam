@@ -3708,11 +3708,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
             //    from the joint-Hessian IFT (`outer_gradient_arrow_solver`), for
             //    every assignment mode, including ordered Beta--Bernoulli (#1006).
             //  * Matrix-free (dense criterion factor exceeds the in-core budget,
-            //    e.g. large-K / wide-border duchon): no dense cache exists for the
-            //    IFT solve, so the fixed-point lane updates covered ρ coordinates
-            //    from analytic inverse traces in one pass. It explicitly declares
-            //    the gradient UNAVAILABLE; the zero-gradient `eval` result in that
-            //    regime is startup plumbing and can never certify a fit.
+            //    e.g. large-K / wide-border duchon): the rational value emits one
+            //    frozen inverse-probe bundle, and the complete gradient consumes
+            //    it plus one matrix-free adjoint solve. No dense cache or synthetic
+            //    zero derivative enters this route.
             gradient,
             // The profiled SAE criterion currently exposes an exact analytic
             // gradient but no exact second derivative. Never advertise curvature
