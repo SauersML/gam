@@ -1267,8 +1267,6 @@ fn fit_expectile_laws(
     config: &FitConfig,
     tau: f64,
 ) -> Result<StandardFitResult, WorkflowError> {
-    use gam_linalg::matrix::LinearOperator;
-
     if config.frailty.is_active() {
         return Err(WorkflowError::InvalidConfig {
             reason: "expectile regression does not support frailty; use a survival/frailty-aware family instead"

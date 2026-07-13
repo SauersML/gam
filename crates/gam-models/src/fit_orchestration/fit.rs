@@ -344,9 +344,6 @@ fn tweedie_profile_loglik(request: &StandardFitRequest<'_>, p: f64) -> Option<f6
         return None;
     }
     let family = LikelihoodSpec::new(ResponseFamily::Tweedie { p }, request.family.link.clone());
-    // `apply` is the `LinearOperator` trait method used to rebuild the fitted
-    // linear predictor from the design and coefficients.
-    use gam_linalg::matrix::LinearOperator;
     let fitted = fit_standard_base(request, &family, &request.options).ok()?;
     // μ = g⁻¹(Xβ̂ + offset); the Tweedie family is fixed to the log link by
     // `resolve_family`, so g⁻¹ = exp. `design.apply` reproduces the fitted
