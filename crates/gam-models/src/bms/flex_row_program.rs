@@ -331,22 +331,8 @@ impl BmsFlexRowProgram {
         Ok(())
     }
 
-    /// Interpret the canonical directional derivative of the Order2 schedule.
-    /// `active_primaries` has the same meaning and ordering as in
-    /// [`Self::try_for_each_calibration_order2`].
-    pub(super) fn try_for_each_calibration_order3<E>(
-        active_primaries: &[usize],
-        direction_count: usize,
-        visit: impl FnMut(BmsFlexCalibrationOrder3Node) -> Result<(), E>,
-    ) -> Result<(), E> {
-        Self::try_for_each_calibration_order3_indexed(
-            active_primaries.len(),
-            |position| active_primaries[position],
-            direction_count,
-            visit,
-        )
-    }
-
+    /// Interpret the canonical directional derivative of the Order2 schedule
+    /// for a contiguous range of active primary coordinates.
     pub(super) fn try_for_each_calibration_order3_contiguous<E>(
         active_primaries: std::ops::Range<usize>,
         direction_count: usize,
@@ -396,20 +382,8 @@ impl BmsFlexRowProgram {
     }
 
     /// Interpret the canonical mixed directional derivative of the Order2
-    /// schedule for `direction_pair_count` backend-owned direction pairs.
-    pub(super) fn try_for_each_calibration_order4<E>(
-        active_primaries: &[usize],
-        direction_pair_count: usize,
-        visit: impl FnMut(BmsFlexCalibrationOrder4Node) -> Result<(), E>,
-    ) -> Result<(), E> {
-        Self::try_for_each_calibration_order4_indexed(
-            active_primaries.len(),
-            |position| active_primaries[position],
-            direction_pair_count,
-            visit,
-        )
-    }
-
+    /// schedule for a contiguous primary range and
+    /// `direction_pair_count` backend-owned direction pairs.
     pub(super) fn try_for_each_calibration_order4_contiguous<E>(
         active_primaries: std::ops::Range<usize>,
         direction_pair_count: usize,
@@ -609,8 +583,9 @@ mod tests {
         );
 
         let mut order3 = Vec::new();
-        BmsFlexRowProgram::try_for_each_calibration_order3(
-            &active,
+        BmsFlexRowProgram::try_for_each_calibration_order3_indexed(
+            active.len(),
+            |position| active[position],
             2,
             |node| -> Result<(), std::convert::Infallible> {
                 order3.push(node);
@@ -663,8 +638,9 @@ mod tests {
         }));
 
         let mut order4 = Vec::new();
-        BmsFlexRowProgram::try_for_each_calibration_order4(
-            &active,
+        BmsFlexRowProgram::try_for_each_calibration_order4_indexed(
+            active.len(),
+            |position| active[position],
             1,
             |node| -> Result<(), std::convert::Infallible> {
                 order4.push(node);
