@@ -421,7 +421,12 @@ fn cross_block_identifiability_anchor_wider_than_candidate_no_false_alias() {
         &[],
         &weights,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "wider anchor should not false-positive full alias", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "wider anchor should not false-positive full alias", e
+        )
+    });
     let p_after = link_prepared.runtime.basis_dim();
     assert!(
         p_after > 0,
@@ -501,7 +506,12 @@ fn cross_block_identifiability_minimal_counterexample_keeps_orthogonal_complemen
         &[],
         &weights,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "minimal counterexample must keep p_before - 1 directions, not collapse to 0", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "minimal counterexample must keep p_before - 1 directions, not collapse to 0", e
+        )
+    });
     let p_after = link_prepared.runtime.basis_dim();
     assert_eq!(
         p_after,
@@ -570,7 +580,12 @@ fn cross_block_identifiability_true_alias_returns_fully_aliased_outcome() {
         &[],
         &weights,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "true alias must produce a structured FullyAliased outcome", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "true alias must produce a structured FullyAliased outcome", e
+        )
+    });
     match outcome {
         FlexCompileOutcome::FullyAliased { reason } => {
             assert!(
@@ -623,7 +638,12 @@ fn cross_block_identifiability_flex_anchor_true_alias_returns_fully_aliased() {
         &[&flex_anchor_design],
         &weights,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "flex-anchor true alias must produce a structured FullyAliased outcome", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "flex-anchor true alias must produce a structured FullyAliased outcome", e
+        )
+    });
     match outcome {
         FlexCompileOutcome::FullyAliased { reason } => {
             assert!(
@@ -697,7 +717,9 @@ fn cross_block_identifiability_partial_alias_keeps_residual_rank() {
     // R (its leading nonzero diagonal entries). For the row counts
     // and knot configs used here, p_c is small so we just take the
     // full Q and let the algorithm itself report the surviving rank.
-    let (q, _r) = candidate_design.qr().unwrap_or_else(|e| panic!("{} failed: {:?}", "thin QR of candidate", e));
+    let (q, _r) = candidate_design
+        .qr()
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "thin QR of candidate", e));
     let p_c = candidate_design.ncols();
     // k_alias < p_c so partial (not full) alias.
     let k_alias = (p_c / 2).max(1);
@@ -732,7 +754,12 @@ fn cross_block_identifiability_partial_alias_keeps_residual_rank() {
         &[],
         &weights,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "partial alias must keep the surviving rank", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "partial alias must keep the surviving rank", e
+        )
+    });
     let p_after = link_prepared.runtime.basis_dim();
     assert_eq!(
         p_after,
@@ -759,8 +786,8 @@ fn cross_block_identifiability_partial_alias_keeps_residual_rank() {
 
 #[test]
 fn flex_hessian_matvec_matches_dense_hessian() {
-    let (family, states, cache, direction) =
-        flex_hessian_matvec_fixture(96).unwrap_or_else(|e| panic!("{} failed: {:?}", "flex Hv fixture", e));
+    let (family, states, cache, direction) = flex_hessian_matvec_fixture(96)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "flex Hv fixture", e));
     let dense = family
         .exact_newton_joint_hessian_dense_from_cache(&states, &cache)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "dense Hessian", e));
@@ -773,8 +800,8 @@ fn flex_hessian_matvec_matches_dense_hessian() {
 
 #[test]
 fn row_primary_third_trace_many_matches_single_direction_contracts() {
-    let (family, states, cache, direction_a) =
-        flex_hessian_matvec_fixture(24).unwrap_or_else(|e| panic!("{} failed: {:?}", "flex trace fixture", e));
+    let (family, states, cache, direction_a) = flex_hessian_matvec_fixture(24)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "flex trace fixture", e));
     let direction_b = Array1::from_iter((0..cache.slices.total).map(|j| {
         let x = j as f64 + 0.5;
         0.02 * (0.7 * x).sin() - 0.015 * (0.31 * x).cos()
@@ -804,7 +831,9 @@ fn row_primary_third_trace_many_matches_single_direction_contracts() {
         for (dir_idx, row_dir) in row_dirs.iter().enumerate() {
             let third = family
                 .row_primary_third_contracted(row, &states, &cache, row_ctx, row_dir)
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "single-direction third contraction", e));
+                .unwrap_or_else(|e| {
+                    panic!("{} failed: {:?}", "single-direction third contraction", e)
+                });
             let single = BernoulliMarginalSlopeFamily::row_primary_trace_contract(&third, &gram);
             let denom = single.abs().max(many[dir_idx].abs()).max(1.0);
             let rel = (single - many[dir_idx]).abs() / denom;
@@ -832,8 +861,8 @@ fn bernoulli_margslope_warm_start_cache_persists_across_eval_cache_builds() {
         num_internal_knots: 4,
         ..DeviationBlockConfig::default()
     };
-    let score_prepared =
-        build_score_warp_deviation_block_from_seed(&z, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "score-warp deviation block", e));
+    let score_prepared = build_score_warp_deviation_block_from_seed(&z, &cfg)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "score-warp deviation block", e));
     let q_seed = Array1::from_iter(z.iter().map(|zi| 0.1 + 0.25 * zi));
     let link_seed = padded_deviation_seed(&q_seed, 1.0, 0.5);
     let link_prepared =
@@ -925,8 +954,8 @@ fn bernoulli_margslope_flex_ll_early_exit_is_exact_or_provably_rejected() {
         num_internal_knots: 4,
         ..DeviationBlockConfig::default()
     };
-    let score_prepared =
-        build_score_warp_deviation_block_from_seed(&z, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "score-warp deviation block", e));
+    let score_prepared = build_score_warp_deviation_block_from_seed(&z, &cfg)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "score-warp deviation block", e));
     let q_seed = Array1::from_iter(z.iter().map(|zi| 0.1 + 0.2 * zi));
     let link_seed = padded_deviation_seed(&q_seed, 1.0, 0.5);
     let link_prepared =
@@ -936,12 +965,12 @@ fn bernoulli_margslope_flex_ll_early_exit_is_exact_or_provably_rejected() {
         y: Arc::new(y),
         weights: Arc::new(weights),
         z: Arc::new(z),
-        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::ones(
-            (n, 1),
-        ))),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::ones(
-            (n, 1),
-        ))),
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::ones((n, 1)),
+        )),
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::ones((n, 1)),
+        )),
         score_warp: Some(score_prepared.runtime.clone()),
         link_dev: Some(link_prepared.runtime.clone()),
         ..default_test_family()
@@ -972,7 +1001,12 @@ fn bernoulli_margslope_flex_ll_early_exit_is_exact_or_provably_rejected() {
     permissive.early_exit_threshold = Some((-exact) + 1.0);
     let accepted = family
         .log_likelihood_only_with_options(&states, &permissive)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "permissive threshold should compute full FLEX ll", e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "permissive threshold should compute full FLEX ll", e
+            )
+        });
     let rel = ((accepted - exact) / exact.abs().max(1.0)).abs();
     assert!(
         rel < 1e-10,
@@ -1055,8 +1089,10 @@ fn base_spec(
 #[test]
 fn bernoulli_marginal_link_map_zeroes_derivatives_on_clamped_tails() {
     let link = bernoulli_marginal_slope_probit_link();
-    let lower = bernoulli_marginal_link_map(&link, -8.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "lower tail map", e));
-    let upper = bernoulli_marginal_link_map(&link, 8.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "upper tail map", e));
+    let lower = bernoulli_marginal_link_map(&link, -8.0)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "lower tail map", e));
+    let upper = bernoulli_marginal_link_map(&link, 8.0)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "upper tail map", e));
     let lower_q = standard_normal_quantile(BERNOULLI_LINK_PROBABILITY_EPS).unwrap();
     let upper_q = standard_normal_quantile(1.0 - BERNOULLI_LINK_PROBABILITY_EPS).unwrap();
 
@@ -1083,7 +1119,8 @@ fn rigid_transformed_gradient_matches_negative_log_likelihood_derivative() {
         let marginal = bernoulli_marginal_link_map(&link, eta_value).unwrap();
         rigid_standard_normal_neglog_only(marginal.q, g_value, z, y, weight, probit_scale).unwrap()
     };
-    let marginal = bernoulli_marginal_link_map(&link, eta).unwrap_or_else(|e| panic!("{} failed: {:?}", "marginal map", e));
+    let marginal = bernoulli_marginal_link_map(&link, eta)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "marginal map", e));
     let grad = rigid_standard_normal_row_kernel(marginal, g, z, y, weight, probit_scale)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "kernel", e))
         .1;
@@ -1445,7 +1482,8 @@ fn rigid_standard_normal_tower_path_matches_hand_chain_witness() {
         } else {
             interior_tol
         };
-        let marginal = bernoulli_marginal_link_map(&link, eta).unwrap_or_else(|e| panic!("{} failed: {:?}", "marginal map", e));
+        let marginal = bernoulli_marginal_link_map(&link, eta)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "marginal map", e));
         for g in g_grid {
             for z in z_grid {
                 for y in [0.0, 1.0] {
@@ -1459,7 +1497,9 @@ fn rigid_standard_normal_tower_path_matches_hand_chain_witness() {
                                 weight,
                                 probit_scale,
                             )
-                            .unwrap_or_else(|e| panic!("{} failed: {:?}", "production row kernel", e));
+                            .unwrap_or_else(|e| {
+                                panic!("{} failed: {:?}", "production row kernel", e)
+                            });
                             let hand = hand_rigid_standard_normal_row_kernel(
                                 marginal,
                                 g,
@@ -1595,18 +1635,31 @@ fn rigid_standard_normal_third_fourth_full_are_single_sourced_from_tower_932() {
     let g_grid = [-1.4, -0.55, 0.0, 0.8, 1.7];
     let z_grid = [-2.25, -0.35, 0.4, 2.1];
     for eta in eta_grid {
-        let marginal = bernoulli_marginal_link_map(&link, eta).unwrap_or_else(|e| panic!("{} failed: {:?}", "marginal map", e));
+        let marginal = bernoulli_marginal_link_map(&link, eta)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "marginal map", e));
         for g in g_grid {
             for z in z_grid {
                 for y in [0.0, 1.0] {
                     for weight in [1.0, 1.3] {
                         for probit_scale in [1.0, 0.7] {
-                            let tower =
-                                rigid_standard_normal_tower(marginal, g, z, y, weight, probit_scale)
-                                    .unwrap_or_else(|e| panic!("{} failed: {:?}", "tower", e));
-                            let third =
-                                rigid_standard_normal_third_full(marginal, g, z, y, weight, probit_scale)
-                                    .unwrap_or_else(|e| panic!("{} failed: {:?}", "third", e));
+                            let tower = rigid_standard_normal_tower(
+                                marginal,
+                                g,
+                                z,
+                                y,
+                                weight,
+                                probit_scale,
+                            )
+                            .unwrap_or_else(|e| panic!("{} failed: {:?}", "tower", e));
+                            let third = rigid_standard_normal_third_full(
+                                marginal,
+                                g,
+                                z,
+                                y,
+                                weight,
+                                probit_scale,
+                            )
+                            .unwrap_or_else(|e| panic!("{} failed: {:?}", "third", e));
                             let fourth = rigid_standard_normal_fourth_full(
                                 marginal,
                                 g,
@@ -1747,7 +1800,9 @@ fn bernoulli_log_likelihood_subsample_half_scales_correctly() {
     // Horvitz-Thompson: 2 * Σ_even should approximate the full-data sum.
     // For a smooth integrand on a moderately fine grid, ~5% relative
     // accuracy is plenty.
-    let baseline = family.log_likelihood_only(&states).unwrap_or_else(|e| panic!("{} failed: {:?}", "baseline ll", e));
+    let baseline = family
+        .log_likelihood_only(&states)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "baseline ll", e));
     let ht_rel = ((scaled - baseline) / baseline.abs().max(1.0)).abs();
     assert!(
         ht_rel < 0.05,
@@ -1867,8 +1922,16 @@ fn bernoulli_sigma_psi_terms_subsample_half_scales_correctly() {
     let exp_score = &raw.score_psi * factor;
     let score_rel = rel_diff_array1(&scaled.score_psi, &exp_score);
     assert!(score_rel < 1e-12, "score_psi rel {}", score_rel);
-    let h_scaled = scaled.hessian_psi_operator.as_ref().expect("op failed").to_dense();
-    let h_raw = raw.hessian_psi_operator.as_ref().expect("op failed").to_dense();
+    let h_scaled = scaled
+        .hessian_psi_operator
+        .as_ref()
+        .expect("op failed")
+        .to_dense();
+    let h_raw = raw
+        .hessian_psi_operator
+        .as_ref()
+        .expect("op failed")
+        .to_dense();
     let h_exp = &h_raw * factor;
     let h_rel = rel_diff_array2(&h_scaled, &h_exp);
     assert!(h_rel < 1e-12, "hessian rel {}", h_rel);
@@ -2140,8 +2203,12 @@ fn score_warp_basis_smoothness_penalty_is_full_rank() {
         num_internal_knots: 5,
         ..DeviationBlockConfig::default()
     };
-    let prepared = build_score_warp_deviation_block_from_seed(&seed, &cfg)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "build smoothness-null-space-drop score-warp", e));
+    let prepared = build_score_warp_deviation_block_from_seed(&seed, &cfg).unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "build smoothness-null-space-drop score-warp", e
+        )
+    });
     let max_order = cfg
         .penalty_orders
         .iter()
@@ -2153,7 +2220,12 @@ fn score_warp_basis_smoothness_penalty_is_full_rank() {
     let (penalty, nullity) = prepared
         .runtime
         .integrated_derivative_penalty_with_nullity(max_order)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "integrated penalty on transformed basis", e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "integrated penalty on transformed basis", e
+            )
+        });
     assert_eq!(
         nullity, 0,
         "smoothness-null-space-drop basis must have zero nullity at the max configured \
@@ -2163,9 +2235,12 @@ fn score_warp_basis_smoothness_penalty_is_full_rank() {
     // numerical positive-eigenvalue threshold — confirms full rank
     // beyond the rank-reporting heuristic.
     use gam_linalg::faer_ndarray::FaerEigh;
-    let (evals, _) = penalty
-        .eigh(faer::Side::Lower)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "eigendecomposition of transformed-basis penalty", e));
+    let (evals, _) = penalty.eigh(faer::Side::Lower).unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "eigendecomposition of transformed-basis penalty", e
+        )
+    });
     let evals_slice = evals
         .as_slice()
         .expect("contiguous transformed-basis penalty eigenvalues");
@@ -2191,7 +2266,12 @@ fn link_deviation_basis_smoothness_penalty_is_full_rank() {
         ..DeviationBlockConfig::default()
     };
     let prepared = build_link_deviation_block_from_knots_design_seed_and_weights(&q, &q, &cfg)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "build smoothness-null-space-drop link-deviation", e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "build smoothness-null-space-drop link-deviation", e
+            )
+        });
     let max_order = cfg
         .penalty_orders
         .iter()
@@ -2203,16 +2283,24 @@ fn link_deviation_basis_smoothness_penalty_is_full_rank() {
     let (penalty, nullity) = prepared
         .runtime
         .integrated_derivative_penalty_with_nullity(max_order)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "integrated penalty on transformed basis", e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "integrated penalty on transformed basis", e
+            )
+        });
     assert_eq!(
         nullity, 0,
         "smoothness-null-space-drop basis must have zero nullity at the max configured \
              derivative order; got {nullity}"
     );
     use gam_linalg::faer_ndarray::FaerEigh;
-    let (evals, _) = penalty
-        .eigh(faer::Side::Lower)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "eigendecomposition of transformed-basis penalty", e));
+    let (evals, _) = penalty.eigh(faer::Side::Lower).unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "eigendecomposition of transformed-basis penalty", e
+        )
+    });
     let evals_slice = evals
         .as_slice()
         .expect("contiguous transformed-basis penalty eigenvalues");
@@ -2231,7 +2319,10 @@ fn bernoulli_marginal_slope_rejects_nonprobit_base_link() {
     let y = array![0.0, 1.0];
     let weights = array![1.0, 1.0];
     let z = array![-0.4, 0.9];
-    let design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0], [1.0]]));
+    let design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
+        [1.0],
+        [1.0]
+    ]));
     let spec = BernoulliMarginalSlopeTermSpec {
         y,
         weights,
@@ -2658,11 +2749,11 @@ fn structural_deviation_runtime_is_c2_at_internal_breakpoints() {
     for span_idx in 1..n_spans {
         let left_cubic = prepared
             .runtime
-            .local_cubic_on_span(&beta, span_idx - 1)
+            .local_cubic_on_span(beta.view(), span_idx - 1)
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "left span cubic", e));
         let right_cubic = prepared
             .runtime
-            .local_cubic_on_span(&beta, span_idx)
+            .local_cubic_on_span(beta.view(), span_idx)
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "right span cubic", e));
         let knot = prepared.runtime.breakpoints()[span_idx];
         assert!(
@@ -2706,7 +2797,10 @@ fn deviation_runtime_replays_exact_training_design() {
         },
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "build deviation block", e));
-    let replayed = prepared.runtime.design(&seed).unwrap_or_else(|e| panic!("{} failed: {:?}", "replayed design", e));
+    let replayed = prepared
+        .runtime
+        .design(&seed)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "replayed design", e));
     let trained = prepared.block.design.to_dense();
     assert_eq!(replayed.dim(), trained.dim());
     for i in 0..replayed.nrows() {
@@ -2783,7 +2877,7 @@ fn structural_constraints_are_quadratic_derivative_bernstein_controls() {
     for span_idx in 0..n_spans {
         let cubic = prepared
             .runtime
-            .local_cubic_on_span(&beta, span_idx)
+            .local_cubic_on_span(beta.view(), span_idx)
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "local cubic", e));
         let left = cubic.left;
         let right = cubic.right;
@@ -2853,8 +2947,7 @@ fn deviation_penalties_are_integrated_function_penalties() {
         }
     }
 
-    let gam_solve::estimate::PenaltySpec::Dense(l2_penalty) = &prepared.block.penalties[1]
-    else {
+    let gam_solve::estimate::PenaltySpec::Dense(l2_penalty) = &prepared.block.penalties[1] else {
         panic!("deviation double penalty should be dense");
     };
     let mut max_identity_diff = 0.0_f64;
@@ -2905,12 +2998,15 @@ fn local_cubic_span_reconstructs_deviation_exactly() {
     for span_idx in 0..n_spans {
         let cubic = prepared
             .runtime
-            .local_cubic_on_span(&beta, span_idx)
+            .local_cubic_on_span(beta.view(), span_idx)
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "local cubic coefficients", e));
         let left = cubic.left;
         let right = cubic.right;
         let x_eval = array![left, 0.5 * (left + right), right];
-        let value_design = prepared.runtime.design(&x_eval).unwrap_or_else(|e| panic!("{} failed: {:?}", "value design", e));
+        let value_design = prepared
+            .runtime
+            .design(&x_eval)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "value design", e));
         let d1_design = prepared
             .runtime
             .first_derivative_design(&x_eval)
@@ -2938,7 +3034,7 @@ fn local_cubic_span_reconstructs_deviation_exactly() {
             );
             let selected = prepared
                 .runtime
-                .local_cubic_at(&beta, x)
+                .local_cubic_at(beta.view(), x)
                 .unwrap_or_else(|e| panic!("{} failed: {:?}", "lookup cubic at x", e));
             if x < support_left || x > support_right {
                 // Strictly outside support: tail saturation — constant
@@ -2957,8 +3053,10 @@ fn local_cubic_span_reconstructs_deviation_exactly() {
                 };
                 let expected_cubic = prepared
                     .runtime
-                    .local_cubic_on_span(&beta, expected_span_idx)
-                    .unwrap_or_else(|e| panic!("{} failed: {:?}", "expected lookup cubic on span", e));
+                    .local_cubic_on_span(beta.view(), expected_span_idx)
+                    .unwrap_or_else(|e| {
+                        panic!("{} failed: {:?}", "expected lookup cubic on span", e)
+                    });
                 assert_eq!(selected, expected_cubic);
             }
         }
@@ -2984,7 +3082,10 @@ fn basis_span_cubic_reconstructs_basis_column_exactly() {
         .basis_span_cubic(0, basis_idx)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "basis span cubic", e));
     let x_eval = array![cubic.left, 0.5 * (cubic.left + cubic.right), cubic.right];
-    let design = prepared.runtime.design(&x_eval).unwrap_or_else(|e| panic!("{} failed: {:?}", "basis design", e));
+    let design = prepared
+        .runtime
+        .design(&x_eval)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "basis design", e));
     let d1 = prepared
         .runtime
         .first_derivative_design(&x_eval)
@@ -3032,19 +3133,19 @@ fn deviation_runtime_saturates_outside_support() {
 
     let left_tail_near = prepared
         .runtime
-        .local_cubic_at(&beta, left - 0.25)
+        .local_cubic_at(beta.view(), left - 0.25)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "left tail", e));
     let left_tail_far = prepared
         .runtime
-        .local_cubic_at(&beta, left - 3.0)
+        .local_cubic_at(beta.view(), left - 3.0)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "left far tail", e));
     let right_tail_near = prepared
         .runtime
-        .local_cubic_at(&beta, right + 0.25)
+        .local_cubic_at(beta.view(), right + 0.25)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "right tail", e));
     let right_tail_far = prepared
         .runtime
-        .local_cubic_at(&beta, right + 3.0)
+        .local_cubic_at(beta.view(), right + 3.0)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "right far tail", e));
 
     for cubic in [
@@ -3129,8 +3230,8 @@ fn denested_microcells_follow_score_and_link_breaks() {
             .breakpoints()
             .as_slice()
             .expect("link breaks"),
-        |z| score_prepared.runtime.local_cubic_at(&beta_h, z),
-        |u| link_prepared.runtime.local_cubic_at(&beta_w, u),
+        |z| score_prepared.runtime.local_cubic_at(beta_h.view(), z),
+        |u| link_prepared.runtime.local_cubic_at(beta_w.view(), u),
     )
     .expect("exact module microcells for a=0.25");
     let exact_cells_a1 = build_denested_partition_cells(
@@ -3146,8 +3247,8 @@ fn denested_microcells_follow_score_and_link_breaks() {
             .breakpoints()
             .as_slice()
             .expect("link breaks"),
-        |z| score_prepared.runtime.local_cubic_at(&beta_h, z),
-        |u| link_prepared.runtime.local_cubic_at(&beta_w, u),
+        |z| score_prepared.runtime.local_cubic_at(beta_h.view(), z),
+        |u| link_prepared.runtime.local_cubic_at(beta_w.view(), u),
     )
     .expect("exact module microcells for a=0.55");
 
@@ -3214,8 +3315,8 @@ fn denested_microcell_eta_matches_direct_denested_formula() {
             .breakpoints()
             .as_slice()
             .expect("link breaks"),
-        |z| score_prepared.runtime.local_cubic_at(&beta_h, z),
-        |u| link_prepared.runtime.local_cubic_at(&beta_w, u),
+        |z| score_prepared.runtime.local_cubic_at(beta_h.view(), z),
+        |u| link_prepared.runtime.local_cubic_at(beta_w.view(), u),
     )
     .expect("microcells");
 
@@ -3295,7 +3396,8 @@ fn denested_branch_selection_uses_normalized_cell_coefficients() {
         ExactCellBranchShared::Affine
     );
     assert_eq!(
-        branch_exact_cell(quartic).unwrap_or_else(|e| panic!("{} failed: {:?}", "quartic branch", e)),
+        branch_exact_cell(quartic)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "quartic branch", e)),
         ExactCellBranchShared::Quartic
     );
     assert_eq!(
@@ -3409,23 +3511,20 @@ fn observed_denested_partials_include_third_a_derivative_for_piecewise_cubic_lin
     let beta_w = Array1::from_iter(
         (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
     );
-    let family = BernoulliMarginalSlopeFamily {
-        y: Arc::new(array![0.0, 1.0, 1.0]),
-        weights: Arc::new(array![1.0, 0.7, 1.3]),
-        z: Arc::new(z.clone()),
-        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        link_dev: Some(link_prepared.runtime.clone()),
-        ..default_test_family()
-    };
+    let family =
+        BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 1.0]),
+            weights: Arc::new(array![1.0, 0.7, 1.3]),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            link_dev: Some(link_prepared.runtime.clone()),
+            ..default_test_family()
+        };
 
     let a = 0.35;
     let b = 0.6;
@@ -3436,7 +3535,7 @@ fn observed_denested_partials_include_third_a_derivative_for_piecewise_cubic_lin
     let u_obs = a + b * z[row];
     let link_span = link_prepared
         .runtime
-        .local_cubic_at(&beta_w, u_obs)
+        .local_cubic_at(beta_w.view(), u_obs)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "local cubic at observed point", e));
     let expected_daaa = exact_kernel::denested_cell_third_partials(link_span).0;
 
@@ -3452,9 +3551,10 @@ fn pooled_probit_baseline_matches_expanded_integer_weight_fit() {
     let y = array![0.0, 1.0, 0.0, 1.0];
     let z = array![-1.5, -0.2, 0.4, 1.4];
     let weights = array![25.0, 2.0, 1.0, 20.0];
-    let weighted = pooled_probit_baseline(&y, &z, &weights).unwrap_or_else(|e| panic!("{} failed: {:?}", "weighted baseline", e));
-    let unweighted =
-        pooled_probit_baseline(&y, &z, &Array1::ones(y.len())).unwrap_or_else(|e| panic!("{} failed: {:?}", "unweighted baseline", e));
+    let weighted = pooled_probit_baseline(&y, &z, &weights)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "weighted baseline", e));
+    let unweighted = pooled_probit_baseline(&y, &z, &Array1::ones(y.len()))
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "unweighted baseline", e));
     let (y_expanded, z_expanded) = expand_integer_weight_rows(&y, &z, &weights);
     let expanded =
         pooled_probit_baseline(&y_expanded, &z_expanded, &Array1::ones(y_expanded.len()))
@@ -3504,7 +3604,7 @@ fn validate_spec_rejects_nonfinite_z_values() {
 }
 
 #[test]
-fn validate_spec_accepts_learnable_gaussian_shift_sigma() { 
+fn validate_spec_accepts_learnable_gaussian_shift_sigma() {
     let data = Array2::<f64>::zeros((3, 0));
     let mut spec = base_spec(
         array![0.0, 1.0, 0.0],
@@ -3513,7 +3613,12 @@ fn validate_spec_accepts_learnable_gaussian_shift_sigma() {
     );
     spec.frailty = FrailtySpec::GaussianShift { sigma_fixed: None };
 
-    validate_spec(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "learnable GaussianShift sigma should validate", e));
+    validate_spec(data.view(), &spec).unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "learnable GaussianShift sigma should validate", e
+        )
+    });
 }
 
 #[test]
@@ -3573,23 +3678,20 @@ fn flexible_family_routes_outer_derivatives_by_scale() {
         },
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "score warp block", e));
-    let family = BernoulliMarginalSlopeFamily {
-        y: Arc::new(array![0.0, 1.0, 0.0]),
-        weights: Arc::new(Array1::ones(3)),
-        z: Arc::new(seed.clone()),
-        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        score_warp: Some(score_prepared.runtime.clone()),
-        ..default_test_family()
-    };
+    let family =
+        BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(3)),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            ..default_test_family()
+        };
     let specs = vec![
         dummy_blockspec(1, 3),
         dummy_blockspec(1, 3),
@@ -3636,14 +3738,8 @@ fn flexible_family_routes_outer_derivatives_by_scale() {
         &large_flex_specs,
         &BlockwiseFitOptions::default(),
     );
-    assert_eq!(
-        large_flex_gradient,
-        gam_problem::Derivative::Analytic
-    );
-    assert_eq!(
-        large_flex_hessian,
-        gam_problem::DeclaredHessianForm::Either
-    );
+    assert_eq!(large_flex_gradient, gam_problem::Derivative::Analytic);
+    assert_eq!(large_flex_hessian, gam_problem::DeclaredHessianForm::Either);
 
     let mut large_rigid_family = large_flex_family.clone();
     large_rigid_family.score_warp = None;
@@ -3758,9 +3854,9 @@ fn exact_outer_order_stays_second_order_at_large_scale_work_scale() {
     use ndarray::Array2;
 
     // Small problem (K=4, n=10, p=8): combined cost ≪ threshold → Second.
-    let small_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros(
-        (10, 8),
-    )));
+    let small_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+        Array2::zeros((10, 8)),
+    ));
     let small_specs: Vec<ParameterBlockSpec> = (0..2)
         .map(|i| ParameterBlockSpec {
             name: format!("block_{i}"),
@@ -3788,9 +3884,9 @@ fn exact_outer_order_stays_second_order_at_large_scale_work_scale() {
     // on a K²·n·p² work estimate. The new contract keeps exact analytic
     // Hessians exposed; representation and runtime cost are handled by the
     // Hessian operator layer.
-    let big_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-        5_000, 500,
-    ))));
+    let big_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+        Array2::zeros((5_000, 500)),
+    ));
     let big_specs: Vec<ParameterBlockSpec> = (0..2)
         .map(|i| ParameterBlockSpec {
             name: format!("block_{i}"),
@@ -3825,9 +3921,9 @@ fn exact_outer_order_stays_second_order_at_large_scale_work_scale() {
     // for no reason).
     let ctn_specs = vec![ParameterBlockSpec {
         name: "ctn".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-            1, 1,
-        )))),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros(
+            (1, 1),
+        ))),
         offset: ndarray::Array1::zeros(1),
         penalties: (0..22)
             .map(|_| crate::custom_family::PenaltyMatrix::Dense(Array2::zeros((1, 1))))
@@ -3857,9 +3953,9 @@ fn exact_outer_order_stays_second_order_at_large_scale_work_scale() {
     );
     let huge_k_specs = vec![ParameterBlockSpec {
         name: "k".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-            1, 1,
-        )))),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros(
+            (1, 1),
+        ))),
         offset: ndarray::Array1::zeros(1),
         penalties: (0..5_000)
             .map(|_| crate::custom_family::PenaltyMatrix::Dense(Array2::zeros((1, 1))))
@@ -3892,12 +3988,12 @@ fn bernoulli_marginal_slope_coefficient_cost_uses_joint_coupled_formula() {
     let n = 1000usize;
     let p_marg = 20usize;
     let p_log = 8usize;
-    let marg_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-        n, p_marg,
-    ))));
-    let log_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
-        n, p_log,
-    ))));
+    let marg_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+        Array2::zeros((n, p_marg)),
+    ));
+    let log_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+        Array2::zeros((n, p_log)),
+    ));
     let family = BernoulliMarginalSlopeFamily {
         y: Arc::new(Array1::zeros(n)),
         weights: Arc::new(Array1::from_elem(n, 1.0)),
@@ -3956,8 +4052,12 @@ fn rigid_fast_path_matches_loglik_finite_differences() {
         y: Arc::new(array![1.0]),
         weights: Arc::new(array![1.2]),
         z: Arc::new(array![0.3]),
-        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
+            [1.0]
+        ])),
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
+            [1.0]
+        ])),
         ..default_test_family()
     };
     let states_at = |q: f64, g: f64| {
@@ -4391,10 +4491,9 @@ fn h_only_exact_outer_directional_derivatives_are_present_and_finite() {
         .len();
     let beta_score = Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0)));
     let scalar_design = || {
-        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::from_elem(
-            (seed.len(), 1),
-            1.0,
-        )))
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Array2::from_elem((seed.len(), 1), 1.0),
+        ))
     };
 
     let family = BernoulliMarginalSlopeFamily {
@@ -4544,21 +4643,10 @@ fn h_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
-            .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_third_contracted failed: {e}")
-            });
+            .unwrap_or_else(|e| panic!("row {row}: row_primary_third_contracted failed: {e}"));
         let fourth = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &dir_u,
-                &dir_v,
-            )
-            .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_fourth_contracted failed: {e}")
-            });
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_u, &dir_v)
+            .unwrap_or_else(|e| panic!("row {row}: row_primary_fourth_contracted failed: {e}"));
 
         assert_eq!(third.dim(), (total, total));
         assert_eq!(fourth.dim(), (total, total));
@@ -4660,21 +4748,10 @@ fn w_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
-            .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_third_contracted failed: {e}")
-            });
+            .unwrap_or_else(|e| panic!("row {row}: row_primary_third_contracted failed: {e}"));
         let fourth = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &dir_u,
-                &dir_v,
-            )
-            .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_fourth_contracted failed: {e}")
-            });
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_u, &dir_v)
+            .unwrap_or_else(|e| panic!("row {row}: row_primary_fourth_contracted failed: {e}"));
 
         assert_eq!(third.dim(), (total, total));
         assert_eq!(fourth.dim(), (total, total));
@@ -4744,21 +4821,10 @@ fn dual_flex_row_primary_higher_order_contractions_are_finite_and_symmetric() {
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
-            .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_third_contracted failed: {e}")
-            });
+            .unwrap_or_else(|e| panic!("row {row}: row_primary_third_contracted failed: {e}"));
         let fourth = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &dir_u,
-                &dir_v,
-            )
-            .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_fourth_contracted failed: {e}")
-            });
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_u, &dir_v)
+            .unwrap_or_else(|e| panic!("row {row}: row_primary_fourth_contracted failed: {e}"));
 
         assert_eq!(third.dim(), (total, total));
         assert_eq!(fourth.dim(), (total, total));
@@ -4806,21 +4872,10 @@ fn dual_flex_row_primary_higher_order_zero_direction_returns_zero() {
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &zero)
-            .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_third_contracted failed: {e}")
-            });
+            .unwrap_or_else(|e| panic!("row {row}: row_primary_third_contracted failed: {e}"));
         let fourth = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &zero,
-                &zero,
-            )
-            .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_fourth_contracted failed: {e}")
-            });
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &zero, &zero)
+            .unwrap_or_else(|e| panic!("row {row}: row_primary_fourth_contracted failed: {e}"));
 
         assert!(
             third.iter().all(|value| value.abs() <= 0.0),
@@ -4846,21 +4901,10 @@ fn h_only_row_primary_higher_order_zero_direction_returns_zero() {
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &zero)
-            .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_third_contracted failed: {e}")
-            });
+            .unwrap_or_else(|e| panic!("row {row}: row_primary_third_contracted failed: {e}"));
         let fourth = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &zero,
-                &zero,
-            )
-            .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_fourth_contracted failed: {e}")
-            });
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &zero, &zero)
+            .unwrap_or_else(|e| panic!("row {row}: row_primary_fourth_contracted failed: {e}"));
 
         assert!(
             third.iter().all(|value| value.abs() <= 0.0),
@@ -4886,21 +4930,10 @@ fn w_only_row_primary_higher_order_zero_direction_returns_zero() {
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let third = family
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &zero)
-            .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_third_contracted failed: {e}")
-            });
+            .unwrap_or_else(|e| panic!("row {row}: row_primary_third_contracted failed: {e}"));
         let fourth = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &zero,
-                &zero,
-            )
-            .unwrap_or_else(|e| {
-                panic!("row {row}: row_primary_fourth_contracted failed: {e}")
-            });
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &zero, &zero)
+            .unwrap_or_else(|e| panic!("row {row}: row_primary_fourth_contracted failed: {e}"));
 
         assert!(
             third.iter().all(|value| value.abs() <= 0.0),
@@ -4921,11 +4954,21 @@ fn dual_flex_exact_outer_zero_direction_returns_zero() {
     let zero = Array1::<f64>::zeros(slices.total);
     let third = family
         .exact_newton_joint_hessian_directional_derivative(&block_states, &zero)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex third directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex third directional derivative", e
+            )
+        })
         .expect("dual-flex third directional derivative matrix");
     let fourth = family
         .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &zero, &zero)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex fourth directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex fourth directional derivative", e
+            )
+        })
         .expect("dual-flex fourth directional derivative matrix");
 
     assert!(
@@ -4966,11 +5009,21 @@ fn dual_flex_exact_outer_fourth_direction_swap_is_symmetric() {
 
     let forward = family
         .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_u, &dir_v)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex fourth directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex fourth directional derivative", e
+            )
+        })
         .expect("dual-flex fourth directional derivative matrix");
     let swapped = family
         .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_v, &dir_u)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex swapped fourth directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex swapped fourth directional derivative", e
+            )
+        })
         .expect("dual-flex swapped fourth directional derivative matrix");
 
     assert_eq!(forward.dim(), (total, total));
@@ -5018,24 +5071,10 @@ fn dual_flex_row_primary_fourth_direction_swap_is_symmetric() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let forward = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &dir_u,
-                &dir_v,
-            )
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_u, &dir_v)
             .unwrap_or_else(|e| panic!("row {row}: forward fourth contraction failed: {e}"));
         let swapped = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &dir_v,
-                &dir_u,
-            )
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_v, &dir_u)
             .unwrap_or_else(|e| panic!("row {row}: swapped fourth contraction failed: {e}"));
 
         assert_eq!(forward.dim(), (total, total));
@@ -5088,33 +5127,13 @@ fn dual_flex_row_primary_higher_order_direction_sign_rules_hold() {
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &dir_u)
             .unwrap_or_else(|e| panic!("row {row}: third contraction failed: {e}"));
         let third_neg = family
-            .row_primary_third_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &neg_dir_u,
-            )
+            .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &neg_dir_u)
             .unwrap_or_else(|e| panic!("row {row}: negated third contraction failed: {e}"));
         let fourth = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &dir_u,
-                &dir_v,
-            )
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_u, &dir_v)
             .unwrap_or_else(|e| panic!("row {row}: fourth contraction failed: {e}"));
         let fourth_neg_u = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &neg_dir_u,
-                &dir_v,
-            )
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &neg_dir_u, &dir_v)
             .unwrap_or_else(|e| panic!("row {row}: negated-u fourth contraction failed: {e}"));
 
         for i in 0..total {
@@ -5161,24 +5180,10 @@ fn h_only_row_primary_fourth_direction_swap_is_symmetric() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let forward = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &dir_u,
-                &dir_v,
-            )
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_u, &dir_v)
             .unwrap_or_else(|e| panic!("row {row}: forward fourth contraction failed: {e}"));
         let swapped = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &dir_v,
-                &dir_u,
-            )
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_v, &dir_u)
             .unwrap_or_else(|e| panic!("row {row}: swapped fourth contraction failed: {e}"));
 
         for i in 0..total {
@@ -5221,24 +5226,10 @@ fn w_only_row_primary_fourth_direction_swap_is_symmetric() {
             .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
             .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
         let forward = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &dir_u,
-                &dir_v,
-            )
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_u, &dir_v)
             .unwrap_or_else(|e| panic!("row {row}: forward fourth contraction failed: {e}"));
         let swapped = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &dir_v,
-                &dir_u,
-            )
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir_v, &dir_u)
             .unwrap_or_else(|e| panic!("row {row}: swapped fourth contraction failed: {e}"));
 
         for i in 0..total {
@@ -5280,24 +5271,10 @@ fn h_only_row_primary_higher_order_direction_sign_rules_hold() {
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &neg_dir)
             .unwrap_or_else(|e| panic!("row {row}: negated third contraction failed: {e}"));
         let fourth = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &dir,
-                &dir,
-            )
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir, &dir)
             .unwrap_or_else(|e| panic!("row {row}: fourth contraction failed: {e}"));
         let fourth_neg = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &neg_dir,
-                &neg_dir,
-            )
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &neg_dir, &neg_dir)
             .unwrap_or_else(|e| panic!("row {row}: doubly-negated fourth contraction failed: {e}"));
 
         for i in 0..total {
@@ -5343,24 +5320,10 @@ fn w_only_row_primary_higher_order_direction_sign_rules_hold() {
             .row_primary_third_contracted(row, &block_states, &cache, &row_ctx, &neg_dir)
             .unwrap_or_else(|e| panic!("row {row}: negated third contraction failed: {e}"));
         let fourth = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &dir,
-                &dir,
-            )
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &dir, &dir)
             .unwrap_or_else(|e| panic!("row {row}: fourth contraction failed: {e}"));
         let fourth_neg = family
-            .row_primary_fourth_contracted(
-                row,
-                &block_states,
-                &cache,
-                &row_ctx,
-                &neg_dir,
-                &neg_dir,
-            )
+            .row_primary_fourth_contracted(row, &block_states, &cache, &row_ctx, &neg_dir, &neg_dir)
             .unwrap_or_else(|e| panic!("row {row}: doubly-negated fourth contraction failed: {e}"));
 
         for i in 0..total {
@@ -5407,19 +5370,39 @@ fn dual_flex_exact_outer_direction_sign_rules_hold() {
     let neg_dir_u = dir_u.mapv(|value| -value);
     let third = family
         .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_u)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex third directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex third directional derivative", e
+            )
+        })
         .expect("dual-flex third directional derivative matrix");
     let third_neg = family
         .exact_newton_joint_hessian_directional_derivative(&block_states, &neg_dir_u)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex negated third directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex negated third directional derivative", e
+            )
+        })
         .expect("dual-flex negated third directional derivative matrix");
     let fourth = family
         .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_u, &dir_v)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex fourth directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex fourth directional derivative", e
+            )
+        })
         .expect("dual-flex fourth directional derivative matrix");
     let fourth_neg_u = family
         .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &neg_dir_u, &dir_v)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex negated-u fourth directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex negated-u fourth directional derivative", e
+            )
+        })
         .expect("dual-flex negated-u fourth directional derivative matrix");
 
     assert_eq!(third.dim(), (total, total));
@@ -5470,7 +5453,12 @@ fn dual_flex_exact_outer_fourth_double_sign_flip_is_invariant() {
     let neg_dir_v = dir_v.mapv(|value| -value);
     let forward = family
         .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_u, &dir_v)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex fourth directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex fourth directional derivative", e
+            )
+        })
         .expect("dual-flex fourth directional derivative matrix");
     let flipped = family
         .exact_newton_joint_hessiansecond_directional_derivative(
@@ -5478,7 +5466,12 @@ fn dual_flex_exact_outer_fourth_double_sign_flip_is_invariant() {
             &neg_dir_u,
             &neg_dir_v,
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex doubly-negated fourth directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex doubly-negated fourth directional derivative", e
+            )
+        })
         .expect("dual-flex doubly-negated fourth directional derivative matrix");
 
     assert_eq!(forward.dim(), (total, total));
@@ -5522,15 +5515,30 @@ fn dual_flex_exact_outer_third_direction_is_linear() {
     let dir_sum = &dir_u + &dir_v;
     let third_u = family
         .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_u)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex third directional derivative u", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex third directional derivative u", e
+            )
+        })
         .expect("dual-flex third directional derivative u matrix");
     let third_v = family
         .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_v)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex third directional derivative v", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex third directional derivative v", e
+            )
+        })
         .expect("dual-flex third directional derivative v matrix");
     let third_sum = family
         .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_sum)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex third directional derivative sum", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex third directional derivative sum", e
+            )
+        })
         .expect("dual-flex third directional derivative sum matrix");
 
     for i in 0..total {
@@ -5736,15 +5744,30 @@ fn dual_flex_exact_outer_fourth_first_direction_is_linear() {
     let dir_sum = &dir_u + &dir_v;
     let fourth_u = family
         .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_u, &dir_w)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex fourth directional derivative u,w", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex fourth directional derivative u,w", e
+            )
+        })
         .expect("dual-flex fourth directional derivative u,w matrix");
     let fourth_v = family
         .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_v, &dir_w)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex fourth directional derivative v,w", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex fourth directional derivative v,w", e
+            )
+        })
         .expect("dual-flex fourth directional derivative v,w matrix");
     let fourth_sum = family
         .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_sum, &dir_w)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dual-flex fourth directional derivative (u+v),w", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "dual-flex fourth directional derivative (u+v),w", e
+            )
+        })
         .expect("dual-flex fourth directional derivative (u+v),w matrix");
 
     for i in 0..total {
@@ -5779,15 +5802,30 @@ fn h_only_exact_outer_third_direction_is_linear() {
     let dir_sum = &dir_u + &dir_v;
     let third_u = family
         .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_u)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "h-only third directional derivative u", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "h-only third directional derivative u", e
+            )
+        })
         .expect("h-only third directional derivative u matrix");
     let third_v = family
         .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_v)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "h-only third directional derivative v", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "h-only third directional derivative v", e
+            )
+        })
         .expect("h-only third directional derivative v matrix");
     let third_sum = family
         .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_sum)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "h-only third directional derivative sum", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "h-only third directional derivative sum", e
+            )
+        })
         .expect("h-only third directional derivative sum matrix");
 
     for i in 0..total {
@@ -5822,15 +5860,30 @@ fn w_only_exact_outer_third_direction_is_linear() {
     let dir_sum = &dir_u + &dir_v;
     let third_u = family
         .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_u)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "w-only third directional derivative u", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "w-only third directional derivative u", e
+            )
+        })
         .expect("w-only third directional derivative u matrix");
     let third_v = family
         .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_v)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "w-only third directional derivative v", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "w-only third directional derivative v", e
+            )
+        })
         .expect("w-only third directional derivative v matrix");
     let third_sum = family
         .exact_newton_joint_hessian_directional_derivative(&block_states, &dir_sum)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "w-only third directional derivative sum", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "w-only third directional derivative sum", e
+            )
+        })
         .expect("w-only third directional derivative sum matrix");
 
     for i in 0..total {
@@ -5863,7 +5916,12 @@ fn h_only_exact_outer_direction_sign_rules_hold() {
         .expect("h-only third directional derivative matrix");
     let third_neg = family
         .exact_newton_joint_hessian_directional_derivative(&block_states, &neg_dir)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "h-only negated third directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "h-only negated third directional derivative", e
+            )
+        })
         .expect("h-only negated third directional derivative matrix");
     let fourth = family
         .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir, &dir)
@@ -5871,7 +5929,12 @@ fn h_only_exact_outer_direction_sign_rules_hold() {
         .expect("h-only fourth directional derivative matrix");
     let fourth_neg = family
         .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &neg_dir, &neg_dir)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "h-only doubly-negated fourth directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "h-only doubly-negated fourth directional derivative", e
+            )
+        })
         .expect("h-only doubly-negated fourth directional derivative matrix");
 
     for i in 0..total {
@@ -5907,7 +5970,12 @@ fn w_only_exact_outer_direction_sign_rules_hold() {
         .expect("w-only third directional derivative matrix");
     let third_neg = family
         .exact_newton_joint_hessian_directional_derivative(&block_states, &neg_dir)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "w-only negated third directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "w-only negated third directional derivative", e
+            )
+        })
         .expect("w-only negated third directional derivative matrix");
     let fourth = family
         .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir, &dir)
@@ -5915,7 +5983,12 @@ fn w_only_exact_outer_direction_sign_rules_hold() {
         .expect("w-only fourth directional derivative matrix");
     let fourth_neg = family
         .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &neg_dir, &neg_dir)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "w-only doubly-negated fourth directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "w-only doubly-negated fourth directional derivative", e
+            )
+        })
         .expect("w-only doubly-negated fourth directional derivative matrix");
 
     for i in 0..total {
@@ -5956,7 +6029,12 @@ fn h_only_exact_outer_fourth_direction_swap_is_symmetric() {
         .expect("h-only fourth directional derivative matrix");
     let swapped = family
         .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_v, &dir_u)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "h-only swapped fourth directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "h-only swapped fourth directional derivative", e
+            )
+        })
         .expect("h-only swapped fourth directional derivative matrix");
 
     for i in 0..total {
@@ -5993,7 +6071,12 @@ fn w_only_exact_outer_fourth_direction_swap_is_symmetric() {
         .expect("w-only fourth directional derivative matrix");
     let swapped = family
         .exact_newton_joint_hessiansecond_directional_derivative(&block_states, &dir_v, &dir_u)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "w-only swapped fourth directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "w-only swapped fourth directional derivative", e
+            )
+        })
         .expect("w-only swapped fourth directional derivative matrix");
 
     for i in 0..total {
@@ -6068,23 +6151,20 @@ fn w_only_gradient_matches_loglik_finite_differences() {
         },
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "link block", e));
-    let family = BernoulliMarginalSlopeFamily {
-        y: Arc::new(y.clone()),
-        weights: Arc::new(weights.clone()),
-        z: Arc::new(z.clone()),
-        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        link_dev: Some(link_prepared.runtime.clone()),
-        ..default_test_family()
-    };
+    let family =
+        BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            link_dev: Some(link_prepared.runtime.clone()),
+            ..default_test_family()
+        };
     let beta_w = Array1::from_iter(
         (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
     );
@@ -6108,7 +6188,9 @@ fn w_only_gradient_matches_loglik_finite_differences() {
     let q0 = 0.25;
     let b0 = 0.6;
     let block_states = states_at(q0, b0, beta_w.clone());
-    let eval = family.evaluate(&block_states).unwrap_or_else(|e| panic!("{} failed: {:?}", "family evaluation", e));
+    let eval = family
+        .evaluate(&block_states)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "family evaluation", e));
     let grad_q = match &eval.blockworking_sets[0] {
         BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
         _ => panic!("expected exact-newton q block"),
@@ -6176,23 +6258,20 @@ fn h_only_gradient_matches_loglik_finite_differences() {
         },
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "score warp block", e));
-    let family = BernoulliMarginalSlopeFamily {
-        y: Arc::new(y.clone()),
-        weights: Arc::new(weights.clone()),
-        z: Arc::new(z.clone()),
-        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        score_warp: Some(score_prepared.runtime.clone()),
-        ..default_test_family()
-    };
+    let family =
+        BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            ..default_test_family()
+        };
     let beta_h = Array1::from_iter(
         (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
     );
@@ -6216,7 +6295,9 @@ fn h_only_gradient_matches_loglik_finite_differences() {
     let q0 = 0.25;
     let b0 = 0.6;
     let block_states = states_at(q0, b0, beta_h.clone());
-    let eval = family.evaluate(&block_states).unwrap_or_else(|e| panic!("{} failed: {:?}", "family evaluation", e));
+    let eval = family
+        .evaluate(&block_states)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "family evaluation", e));
     let grad_q = match &eval.blockworking_sets[0] {
         BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
         _ => panic!("expected exact-newton q block"),
@@ -6293,24 +6374,21 @@ fn flexible_denested_gradient_matches_loglik_finite_differences() {
         },
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "link block", e));
-    let family = BernoulliMarginalSlopeFamily {
-        y: Arc::new(y.clone()),
-        weights: Arc::new(weights.clone()),
-        z: Arc::new(z.clone()),
-        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        score_warp: Some(score_prepared.runtime.clone()),
-        link_dev: Some(link_prepared.runtime.clone()),
-        ..default_test_family()
-    };
+    let family =
+        BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+            ..default_test_family()
+        };
     let beta_h = Array1::from_iter(
         (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
     );
@@ -6341,7 +6419,9 @@ fn flexible_denested_gradient_matches_loglik_finite_differences() {
     let q0 = 0.25;
     let b0 = 0.6;
     let block_states = states_at(q0, b0, beta_h.clone(), beta_w.clone());
-    let eval = family.evaluate(&block_states).unwrap_or_else(|e| panic!("{} failed: {:?}", "family evaluation", e));
+    let eval = family
+        .evaluate(&block_states)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "family evaluation", e));
     let grad_q = match &eval.blockworking_sets[0] {
         BlockWorkingSet::ExactNewton { gradient, .. } => gradient[0],
         _ => panic!("expected exact-newton q block"),
@@ -6436,24 +6516,21 @@ fn flexible_exact_outer_directional_derivatives_are_present_and_finite() {
         },
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "link block", e));
-    let family = BernoulliMarginalSlopeFamily {
-        y: Arc::new(y.clone()),
-        weights: Arc::new(weights.clone()),
-        z: Arc::new(z.clone()),
-        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
-            [1.0],
-            [1.0],
-            [1.0]
-        ])),
-        score_warp: Some(score_prepared.runtime.clone()),
-        link_dev: Some(link_prepared.runtime.clone()),
-        ..default_test_family()
-    };
+    let family =
+        BernoulliMarginalSlopeFamily {
+            y: Arc::new(y.clone()),
+            weights: Arc::new(weights.clone()),
+            z: Arc::new(z.clone()),
+            marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                array![[1.0], [1.0], [1.0]],
+            )),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+            ..default_test_family()
+        };
     let beta_h = Array1::from_iter(
         (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
     );
@@ -6607,7 +6684,9 @@ fn flexible_evaluate_block_diagonals_match_joint_exact_oracle() {
             eta: Array1::zeros(z.len()),
         },
     ];
-    let eval = family.evaluate(&block_states).unwrap_or_else(|e| panic!("{} failed: {:?}", "block evaluation", e));
+    let eval = family
+        .evaluate(&block_states)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "block evaluation", e));
     let joint_hessian = family
         .exact_newton_joint_hessian(&block_states)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "joint hessian result", e))
@@ -6819,7 +6898,8 @@ fn rank_int_calibration_is_invariant_to_common_weight_rescaling() {
             .unwrap_or_else(|e| panic!("rank-INT fit failed at weight scale {scale}: {e:?}"));
         // Mid-ranks are (0.25, 0.75) at every common weight scale.
         assert!(
-            (cal.weighted_cdf[0] - 0.25).abs() < 1e-12 && (cal.weighted_cdf[1] - 0.75).abs() < 1e-12,
+            (cal.weighted_cdf[0] - 0.25).abs() < 1e-12
+                && (cal.weighted_cdf[1] - 0.75).abs() < 1e-12,
             "mid-distribution ranks must be (0.25, 0.75) independent of weight scale, got {:?} at scale {scale}",
             cal.weighted_cdf
         );
@@ -6882,7 +6962,8 @@ fn empirical_intercept_calibrates_marginal_probability() {
 fn skewed_rigid_empirical_grid_calibrates_marginal_probability() {
     let z = array![-1.15, -1.05, -0.95, -0.8, -0.65, -0.45, 0.1, 0.9, 2.4, 4.7];
     let weights = array![1.0, 1.0, 1.0, 0.9, 0.9, 0.8, 0.5, 0.35, 0.2, 0.1];
-    let grid = build_empirical_z_grid(&z, &weights, 7, "test skewed grid").unwrap_or_else(|e| panic!("{} failed: {:?}", "grid", e));
+    let grid = build_empirical_z_grid(&z, &weights, 7, "test skewed grid")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "grid", e));
     let target_q = 0.25;
     let target_mu = normal_cdf(target_q);
     let slope = 1.35;
@@ -6920,7 +7001,8 @@ fn empirical_rigid_fd_fixture() -> (
 ) {
     let grid_nodes = array![-1.15, -1.05, -0.95, -0.8, -0.65, -0.45, 0.1, 0.9, 2.4, 4.7];
     let grid_w = array![1.0, 1.0, 1.0, 0.9, 0.9, 0.8, 0.5, 0.35, 0.2, 0.1];
-    let grid = build_empirical_z_grid(&grid_nodes, &grid_w, 7, "cf vs fd grid").unwrap_or_else(|e| panic!("{} failed: {:?}", "grid", e));
+    let grid = build_empirical_z_grid(&grid_nodes, &grid_w, 7, "cf vs fd grid")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "grid", e));
     let family = BernoulliMarginalSlopeFamily {
         y: Arc::new(array![1.0, 0.0, 1.0]),
         weights: Arc::new(array![1.0, 0.7, 1.3]),
@@ -6942,7 +7024,9 @@ fn empirical_rigid_fd_fixture() -> (
 fn empirical_rigid_grad_hess_match_finite_differences() {
     let (family, grid, marginal_etas, slopes) = empirical_rigid_fd_fixture();
     let cf = |row: usize, m: f64, g: f64| {
-        let marginal = family.marginal_link_map(m).unwrap_or_else(|e| panic!("{} failed: {:?}", "link map", e));
+        let marginal = family
+            .marginal_link_map(m)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "link map", e));
         family
             .empirical_rigid_primary_grad_hess_closed_form(
                 row,
@@ -7005,7 +7089,9 @@ fn empirical_rigid_grad_hess_match_finite_differences() {
 fn empirical_rigid_higher_order_match_finite_differences() {
     let (family, grid, marginal_etas, slopes) = empirical_rigid_fd_fixture();
     let hess = |row: usize, m: f64, g: f64| {
-        let marginal = family.marginal_link_map(m).unwrap_or_else(|e| panic!("{} failed: {:?}", "link map", e));
+        let marginal = family
+            .marginal_link_map(m)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "link map", e));
         family
             .empirical_rigid_primary_grad_hess_closed_form(
                 row,
@@ -7223,7 +7309,9 @@ fn empirical_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
     let mut signv = Vec::new();
     for row in 0..3 {
         let (m, g) = (marginal_etas[row], slopes[row]);
-        let lm = family.marginal_link_map(m).unwrap_or_else(|e| panic!("{} failed: {:?}", "link map", e));
+        let lm = family
+            .marginal_link_map(m)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "link map", e));
         let root = family
             .empirical_rigid_intercept_for_row(row, lm, g, &grid.nodes, &grid.weights)
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "intercept root", e));
@@ -7252,7 +7340,9 @@ fn empirical_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
 
     for row in 0..3 {
         let (m, g) = (marginal_etas[row], slopes[row]);
-        let lm = family.marginal_link_map(m).unwrap_or_else(|e| panic!("{} failed: {:?}", "link map", e));
+        let lm = family
+            .marginal_link_map(m)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "link map", e));
 
         // First, confirm the program VALUE channel equals the production NLL
         // exactly (the program is only a valid oracle if its value path is the
@@ -7294,7 +7384,8 @@ fn empirical_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
             fourth,
         };
 
-        let tower = program_full_tower(&program, row).unwrap_or_else(|e| panic!("{} failed: {:?}", "program tower", e));
+        let tower = program_full_tower(&program, row)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "program tower", e));
         verify_kernel_channels(&tower, &claims, 1e-7).unwrap_or_else(|e| {
             panic!("empirical rigid jet-tower oracle mismatch at row {row}: {e}")
         });
@@ -7362,7 +7453,12 @@ fn empirical_intercept_recovers_from_deep_tail_warm_start() {
         &weights,
         stale_warm_start,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "empirical intercept must recover from deep-tail warm start", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "empirical intercept must recover from deep-tail warm start", e
+        )
+    });
     let calibrated = nodes
         .iter()
         .zip(weights.iter())
@@ -7397,7 +7493,12 @@ fn empirical_intercept_recovers_from_far_right_warm_start() {
         &weights,
         stale_warm_start,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "empirical intercept must recover from far-right warm start", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "empirical intercept must recover from far-right warm start", e
+        )
+    });
     let calibrated = nodes
         .iter()
         .zip(weights.iter())
@@ -7495,7 +7596,12 @@ fn weighted_ridge_sandwich_cov_is_finite_on_rank_deficient_normal_matrix() {
     normal_matrix[[1, 1]] *= 1.0 + AUTO_Z_CONDITIONAL_RIDGE_REL;
 
     let cov = weighted_ridge_sandwich_cov(basis.view(), &residuals, weights.view(), &normal_matrix)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "rank-deficient normal matrix must yield a finite sandwich via pseudo-inverse", e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "rank-deficient normal matrix must yield a finite sandwich via pseudo-inverse", e
+            )
+        });
 
     assert_eq!(cov.dim(), (2, 2));
     assert!(
@@ -7554,7 +7660,12 @@ fn conditional_latent_gate_handles_rank_deficient_conditioning_basis() {
     let weights = Array1::ones(n);
 
     let cal = fit_conditional_latent_calibration_if_needed(&z, &weights, a_block.view())
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "conditional gate must not error on a rank-deficient conditioning basis", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "conditional gate must not error on a rank-deficient conditioning basis", e
+            )
+        })
         .expect("conditional Rao gate must fire on a clear conditional mean shift");
 
     assert!(
@@ -7581,9 +7692,12 @@ fn conditional_latent_gate_handles_rank_deficient_conditioning_basis() {
     // pseudo-inverse internally, and the fitted m̂(C) lives in the identifiable
     // span of the basis, so ζ = (z − m̂(C))/√v̂(C) must be conditionally
     // centered on the informative direction.
-    let zeta = cal
-        .apply(z.view(), a_block.view())
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "conditional calibration applies on rank-deficient basis", e));
+    let zeta = cal.apply(z.view(), a_block.view()).unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "conditional calibration applies on rank-deficient basis", e
+        )
+    });
     let informative_arr = Array1::from(informative);
     let cov_after = weighted_cov_for_test(&informative_arr, &zeta, &weights);
     assert!(
@@ -7634,7 +7748,12 @@ fn auto_latent_measure_routes_conditional_shift_to_location_scale() {
 
     let (measure, calibration) =
         build_latent_measure_with_geometry(&z, &weights, &policy, Some(a_block.view()))
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "auto latent measure with conditioning", e));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{} failed: {:?}",
+                    "auto latent measure with conditioning", e
+                )
+            });
     assert!(matches!(measure, LatentMeasureKind::StandardNormal));
     assert!(
         matches!(
@@ -7649,8 +7768,12 @@ fn auto_latent_measure_routes_conditional_shift_to_location_scale() {
     // calibration, since this z passes the pooled-normal diagnostics well
     // enough — exactly the leak the issue describes).
     let (_measure_blind, calibration_blind) =
-        build_latent_measure_with_geometry(&z, &weights, &policy, None)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "auto latent measure without conditioning", e));
+        build_latent_measure_with_geometry(&z, &weights, &policy, None).unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "auto latent measure without conditioning", e
+            )
+        });
     assert!(
         !matches!(
             calibration_blind,
@@ -7665,15 +7788,16 @@ fn auto_latent_measure_preserves_standard_normal_fast_path() {
     let n = 2001usize;
     let z = Array1::from_iter((0..n).map(|idx| {
         let p = (idx as f64 + 0.5) / n as f64;
-        standard_normal_quantile(p).unwrap_or_else(|e| panic!("{} failed: {:?}", "normal quantile", e))
+        standard_normal_quantile(p)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "normal quantile", e))
     }));
     let weights = Array1::ones(n);
     let policy = LatentZPolicy {
         latent_measure: LatentMeasureSpec::Auto { grid_size: 17 },
         ..LatentZPolicy::default()
     };
-    let (measure, calibration) =
-        build_latent_measure_with_geometry(&z, &weights, &policy, None).unwrap_or_else(|e| panic!("{} failed: {:?}", "measure", e));
+    let (measure, calibration) = build_latent_measure_with_geometry(&z, &weights, &policy, None)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "measure", e));
 
     assert!(matches!(measure, LatentMeasureKind::StandardNormal));
     assert!(
@@ -7758,7 +7882,12 @@ fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
 
     let drift = family
         .sigma_exact_joint_psihessian_directional_derivative(&block_states, &array![0.1, -0.2])
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic sigma Hessian directional derivative", e))
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "analytic sigma Hessian directional derivative", e
+            )
+        })
         .expect("sigma drift present");
     assert_eq!(drift.dim(), (2, 2));
     assert!(drift.iter().all(|value| value.is_finite()));

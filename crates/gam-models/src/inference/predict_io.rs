@@ -835,7 +835,7 @@ impl BernoulliMarginalSlopePredictor {
                 if let (Some(runtime), Some(beta)) =
                     (self.score_warp_runtime.as_ref(), beta_score_warp)
                 {
-                    let mut span = runtime.local_cubic_at(beta, z)?;
+                    let mut span = runtime.local_cubic_at(beta.view(), z)?;
                     // `local_cubic_at`'s c0 is `Σ_j basis_c0[span][j] · beta[j]`.
                     // The cross-block residual replaces basis_c0 by
                     // basis_c0 − n_row · M, contributing a row-constant
@@ -861,7 +861,7 @@ impl BernoulliMarginalSlopePredictor {
                 if let (Some(runtime), Some(beta)) =
                     (self.link_deviation_runtime.as_ref(), beta_link_dev)
                 {
-                    let mut span = runtime.local_cubic_at(beta, u)?;
+                    let mut span = runtime.local_cubic_at(beta.view(), u)?;
                     if let Some(corr) = link_dev_correction_for_row {
                         span.c0 -= corr.dot(beta);
                     }
@@ -984,7 +984,7 @@ impl BernoulliMarginalSlopePredictor {
             (self.score_warp_runtime.as_ref(), beta_score_warp)
         {
             let mut span = runtime
-                .local_cubic_at(beta, z_value)
+                .local_cubic_at(beta.view(), z_value)
                 .map_err(EstimationError::from)?;
             if let Some(corr) = score_warp_correction_for_row {
                 span.c0 -= corr.dot(beta);
@@ -997,7 +997,7 @@ impl BernoulliMarginalSlopePredictor {
             (self.link_deviation_runtime.as_ref(), beta_link_dev)
         {
             let mut span = runtime
-                .local_cubic_at(beta, u_value)
+                .local_cubic_at(beta.view(), u_value)
                 .map_err(EstimationError::from)?;
             if let Some(corr) = link_dev_correction_for_row {
                 span.c0 -= corr.dot(beta);

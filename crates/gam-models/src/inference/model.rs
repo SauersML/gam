@@ -31,7 +31,7 @@ use gam_terms::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
 // and by saved-payload consumers. Re-export them so that public path stays
 // valid rather than forcing every caller onto the relocated crate path.
 pub use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView1};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2059,7 +2059,7 @@ impl SavedCompiledFlexBlock {
 
     pub fn local_cubic_on_span(
         &self,
-        beta: &Array1<f64>,
+        beta: ArrayView1<'_, f64>,
         span_idx: usize,
     ) -> Result<crate::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
         self.validate_exact_replay_contract()?;
@@ -2077,7 +2077,7 @@ impl SavedCompiledFlexBlock {
 
     fn local_cubic_on_span_validated(
         &self,
-        beta: &Array1<f64>,
+        beta: ArrayView1<'_, f64>,
         span_idx: usize,
     ) -> Result<crate::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
         let points = &self.breakpoints;
@@ -2201,7 +2201,7 @@ impl SavedCompiledFlexBlock {
 
     pub fn local_cubic_at(
         &self,
-        beta: &Array1<f64>,
+        beta: ArrayView1<'_, f64>,
         value: f64,
     ) -> Result<crate::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
         self.validate_exact_replay_contract()?;

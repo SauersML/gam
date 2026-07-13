@@ -298,14 +298,14 @@ mod saved_survival_marginal_slope_test_support {
             &link_breaks,
             |z| {
                 if let (Some(runtime), Some(beta)) = (score_runtime, score_beta) {
-                    runtime.local_cubic_at(beta, z).map_err(String::from)
+                    runtime.local_cubic_at(beta.view(), z).map_err(String::from)
                 } else {
                     Ok(saved_survival_default_score_span())
                 }
             },
             |u| {
                 if let (Some(runtime), Some(beta)) = (link_runtime, link_beta) {
-                    runtime.local_cubic_at(beta, u).map_err(String::from)
+                    runtime.local_cubic_at(beta.view(), u).map_err(String::from)
                 } else {
                     Ok(saved_survival_default_link_span())
                 }
