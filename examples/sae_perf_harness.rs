@@ -711,15 +711,17 @@ fn run(shape: Shape) -> Result<(), String> {
 
     let mut term_for_criterion = fixture.term.clone();
     let start = Instant::now();
-    let (criterion, loss) = term_for_criterion.penalized_quasi_laplace_criterion(
-        fixture.target.view(),
-        &fixture.rho,
-        None,
-        INNER_MAX_ITER,
-        LEARNING_RATE,
-        RIDGE_EXT_COORD,
-        RIDGE_BETA,
-    )?;
+    let (criterion, loss) = term_for_criterion
+        .penalized_quasi_laplace_criterion(
+            fixture.target.view(),
+            &fixture.rho,
+            None,
+            INNER_MAX_ITER,
+            LEARNING_RATE,
+            RIDGE_EXT_COORD,
+            RIDGE_BETA,
+        )
+        .map_err(|error| format!("penalized quasi-Laplace criterion evaluation failed: {error}"))?;
     print_stage(
         &fixture.shape,
         "criterion_eval",

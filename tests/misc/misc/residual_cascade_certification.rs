@@ -704,7 +704,10 @@ fn coarse_space_preconditioner_conditions_uniformly_in_depth() {
             }
         }
         // Coarse-space preconditioner P = blockdiag(A_CC, diag A_FF).
-        let nc = design.coarse_space_cols(log_lambda).min(m);
+        let nc = design
+            .coarse_space_cols(log_lambda)
+            .expect("finite log_lambda=0 fixture must define a coarse-space dimension")
+            .min(m);
         cuts.push(nc);
         let mut p = vec![0.0_f64; m * m];
         for i in 0..nc {
