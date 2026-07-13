@@ -38,6 +38,71 @@ mod amortized_encoder_tests {
         );
     }
 
+    /// PATH C (#2253) — the exact fixed-stratum Hessian block for the
+    /// solver-free explicit channels (decoder-smoothness with its Occam
+    /// renormalization + ARD log-precision prior) must equal a central finite
+    /// difference of the SAME production gradient channels at a frozen inner
+    /// state. This is the first HVP channel gate: it exercises the smoothness
+    /// renormalization's rank-one cross-coupling and the periodic-ARD normalizer
+    /// second derivative on the two-atom circle fixture. The rank-charge,
+    /// assignment, log-determinant, and third-order channels are gated
+    /// separately; this reference deliberately omits them.
+    #[test]
+    fn outer_explicit_smoothness_ard_hessian_matches_finite_difference_2253() {
+        use ndarray::Array1;
+        let (term, _target, rho) = small_two_atom_periodic_term();
+        let n_params = rho.to_flat().len();
+        let lambda = rho.lambda_smooth_vec().unwrap();
+        let frozen_smoothness: f64 = term
+            .decoder_smoothness_value_per_atom(&lambda)
+            .iter()
+            .sum();
+
+        let analytic = term
+            .outer_explicit_smoothness_ard_hessian(&rho, frozen_smoothness)
+            .expect("explicit smoothness/ARD Hessian block assembles");
+
+        let base = rho.to_flat();
+        let eps = 1.0e-6;
+        for j in 0..n_params {
+            // Solver-free reference gradient (smoothness renormalized to the
+            // FROZEN energy + ARD explicit derivative) at ρ ± ε e_j.
+            let gradient = |sign: f64| -> Array1<f64> {
+                let mut flat = base.clone();
+                flat[j] += sign * eps;
+                let r = rho.from_flat(flat.view()).unwrap();
+                let mut v = Array1::<f64>::zeros(n_params);
+                let lam = r.lambda_smooth_vec().unwrap();
+                let se = term.decoder_smoothness_value_per_atom(&lam);
+                let s: f64 = se.iter().sum();
+                for a in 0..r.log_lambda_smooth.len() {
+                    v[r.smooth_flat_index(a)] = if s.abs() > 0.0 {
+                        frozen_smoothness * se[a] / s
+                    } else {
+                        se[a]
+                    };
+                }
+                let ard = term.ard_log_precision_explicit_derivatives(&r).unwrap();
+                for (atom, axes) in ard.iter().enumerate() {
+                    for axis in 0..axes.len() {
+                        v[r.ard_flat_index(atom, axis)] += ard[atom][axis];
+                    }
+                }
+                v
+            };
+            let fd_col = (gradient(1.0) - gradient(-1.0)) / (2.0 * eps);
+            for i in 0..n_params {
+                let analytic_ij = analytic[[i, j]];
+                let fd_ij = fd_col[i];
+                assert!(
+                    (analytic_ij - fd_ij).abs() < 1.0e-6 + 1.0e-5 * analytic_ij.abs(),
+                    "explicit smoothness/ARD Hessian [{i},{j}] mismatch: \
+                     analytic={analytic_ij}, fd={fd_ij}"
+                );
+            }
+        }
+    }
+
     /// The fitted amplitudes the encoder derives are exactly the posterior gate
     /// coordinates used by reconstruction. Decoder magnitude stays in `B`, so
     /// there is no second radial-scale channel to fold into these values.
