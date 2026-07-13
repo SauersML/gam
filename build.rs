@@ -4777,9 +4777,37 @@ fn derivative_declarations(source: &str, test_mask: &[bool]) -> Vec<DerivativeDe
 }
 
 fn is_row_kernel_declaration(declaration: &str) -> bool {
-    (declaration.starts_with("impl ") || declaration.starts_with("impl<"))
-        && declaration.contains("RowKernel<")
-        && declaration.contains(" for ")
+    let Some(mut implemented) = declaration.strip_prefix("impl") else {
+        return false;
+    };
+    implemented = implemented.trim_start();
+    if implemented.starts_with('<') {
+        let mut depth = 0usize;
+        let mut generic_end = None;
+        for (index, byte) in implemented.bytes().enumerate() {
+            match byte {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        generic_end = Some(index + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(generic_end) = generic_end else {
+            return false;
+        };
+        implemented = implemented[generic_end..].trim_start();
+    }
+    let Some((implemented_trait, _)) = implemented.split_once(" for ") else {
+        return false;
+    };
+    let implemented_trait = implemented_trait.trim();
+    implemented_trait.starts_with("RowKernel<")
+        || implemented_trait.contains("::RowKernel<")
 }
 
 fn generated_derivative_modes(declaration: &str) -> Option<(bool, bool)> {
@@ -4818,6 +4846,19 @@ fn enforce_derivative_policy_negative_probes() {
                 )
         }),
         "#932 policy self-test: an unregistered RowKernel was not discovered"
+    );
+
+    let bounded_helper =
+        "impl<const K: usize, T: RowKernel<K>> HyperOperator for PlantedWrapper<K, T> {}";
+    let bounded_mask = compute_test_mask(
+        bounded_helper,
+        Path::new("crates/gam-models/src/planted.rs"),
+    );
+    assert!(
+        derivative_declarations(bounded_helper, &bounded_mask)
+            .iter()
+            .all(|declaration| !is_row_kernel_declaration(&declaration.source)),
+        "#932 policy self-test: a generic RowKernel bound was mistaken for a RowKernel implementation"
     );
 
     let separate_generated = "row_atom! {\n    fn planted_third [generic, third](x) { x }\n    fn planted_fourth [generic, fourth](x) { x }\n}";
