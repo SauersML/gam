@@ -755,7 +755,8 @@ impl BernoulliMarginalSlopeFamily {
         let marginal = self.marginal_link_map(q)?;
         let mut calibration = Vec::with_capacity(grid.nodes.len());
         for (node, weight) in grid.pairs() {
-            let index = self.compile_empirical_bms_index_program(primary, intercept_root, slope, node)?;
+            let index =
+                self.compile_empirical_bms_index_program(primary, intercept_root, slope, node)?;
             let obs = self.observed_denested_cell_partials_at_z(
                 node,
                 intercept_root,
@@ -4690,7 +4691,16 @@ mod empirical_flex_jet_oracle_tests {
         let intercept = witness_intercept(fx, marginal.mu, b, &beta, scale);
         let plan = fx
             .family
-            .compile_empirical_bms_row_program(0, &fx.primary, q, b, beta_h, beta_w, intercept, &fx.grid)
+            .compile_empirical_bms_row_program(
+                0,
+                &fx.primary,
+                q,
+                b,
+                beta_h,
+                beta_w,
+                intercept,
+                &fx.grid,
+            )
             .expect("canonical empirical flex plan");
         plan
     }
@@ -5235,7 +5245,8 @@ mod empirical_flex_jet_oracle_tests {
             );
             for u in 0..r {
                 assert!(
-                    (scratch.grad[u] - jet.gradient[u]).abs() <= 1e-9 * jet.gradient[u].abs().max(1.0),
+                    (scratch.grad[u] - jet.gradient[u]).abs()
+                        <= 1e-9 * jet.gradient[u].abs().max(1.0),
                     "{label} grad[{u}]: hand {:+.12e} != jet {:+.12e}",
                     scratch.grad[u],
                     jet.gradient[u],

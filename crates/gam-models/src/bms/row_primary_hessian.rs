@@ -2954,7 +2954,7 @@ impl BernoulliMarginalSlopeFamily {
         let b = program.slope();
         let beta_h = program.beta_h();
         let beta_w = program.beta_w();
-        let scale = self.probit_frailty_scale();
+        let scale = program.scale();
         let h_range = primary.h.as_ref();
         let w_range = primary.w.as_ref();
         let score_runtime = self.score_warp.as_ref();
