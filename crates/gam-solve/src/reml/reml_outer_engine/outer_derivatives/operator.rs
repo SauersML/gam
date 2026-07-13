@@ -1139,30 +1139,34 @@ pub(crate) fn build_outer_hessian_operator(
     {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let pair_count = total * (total + 1) / 2;
-        let pair_drifts: Vec<((usize, usize), Vec<DriftDerivResult>)> = (0..pair_count)
-            .into_par_iter()
-            .map(|pair_idx| {
-                let (ii, jj) = upper_triangle_pair_from_index(pair_idx, total);
-                let beta_i = coords[ii].v.mapv(|value| -value);
-                let beta_j = coords[jj].v.mapv(|value| -value);
-                let mut drifts = Vec::new();
-                if let Some(drift_fn) = solution.fixed_drift_deriv.as_ref() {
-                    if coords[ii].b_depends_on_beta
-                        && let Some(ext_i) = coords[ii].ext_index
-                        && let Some(result) = drift_fn(ext_i, &beta_j)
-                    {
-                        drifts.push(result);
+        let pair_drifts: Result<Vec<((usize, usize), Vec<DriftDerivResult>)>, String> =
+            (0..pair_count)
+                .into_par_iter()
+                .map(|pair_idx| -> Result<_, String> {
+                    let (ii, jj) = upper_triangle_pair_from_index(pair_idx, total);
+                    let beta_i = coords[ii].v.mapv(|value| -value);
+                    let beta_j = coords[jj].v.mapv(|value| -value);
+                    let mut drifts = Vec::new();
+                    if let Some(drift_fn) = solution.fixed_drift_deriv.as_ref() {
+                        if coords[ii].b_depends_on_beta
+                            && let Some(ext_i) = coords[ii].ext_index
+                        {
+                            if let Some(result) = drift_fn(ext_i, &beta_j)? {
+                                drifts.push(result);
+                            }
+                        }
+                        if coords[jj].b_depends_on_beta
+                            && let Some(ext_j) = coords[jj].ext_index
+                        {
+                            if let Some(result) = drift_fn(ext_j, &beta_i)? {
+                                drifts.push(result);
+                            }
+                        }
                     }
-                    if coords[jj].b_depends_on_beta
-                        && let Some(ext_j) = coords[jj].ext_index
-                        && let Some(result) = drift_fn(ext_j, &beta_i)
-                    {
-                        drifts.push(result);
-                    }
-                }
-                ((ii, jj), drifts)
-            })
-            .collect();
+                    Ok(((ii, jj), drifts))
+                })
+                .collect();
+        let pair_drifts = pair_drifts?;
 
         let mut term_pairs = Vec::new();
         let mut term_drifts = Vec::new();
