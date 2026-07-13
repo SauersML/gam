@@ -36,6 +36,13 @@ pub enum SaeRowJetPrimary {
     Coordinate { atom: usize, axis: usize },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SaeCoordinateSlot {
+    pub atom: usize,
+    pub axis: usize,
+    pub slot: usize,
+}
+
 fn public_primary(value: SaeRowPrimary) -> SaeRowJetPrimary {
     match value {
         SaeRowPrimary::Logit { atom } => SaeRowJetPrimary::Logit { atom },
@@ -62,19 +69,38 @@ pub struct SaeSoftmaxRowJetInput {
     pub n_atoms: usize,
     pub out_dim: usize,
     pub primaries: Vec<SaeRowJetPrimary>,
+    pub coordinate_slots: Vec<SaeCoordinateSlot>,
     pub gate_values: Vec<f64>,
     pub active_atoms: Vec<bool>,
     pub sqrt_row_weight: f64,
     pub decoded: Vec<f64>,
     pub decoded_first: Vec<f64>,
     pub decoded_second: Vec<f64>,
-    pub beta_atoms: Vec<usize>,
+    pub beta_atoms: std::sync::Arc<[usize]>,
     pub beta_basis_values: Vec<f64>,
     pub beta_basis_first: Vec<f64>,
-    pub beta_outputs: Vec<f64>,
+    pub beta_outputs: std::sync::Arc<[f64]>,
 }
 
 impl SaeSoftmaxRowJetInput {
+    pub fn coordinate_slots_for(primaries: &[SaeRowJetPrimary]) -> Vec<SaeCoordinateSlot> {
+        let mut slots: Vec<SaeCoordinateSlot> = primaries
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(slot, primary)| match primary {
+                SaeRowJetPrimary::Coordinate { atom, axis } => Some(SaeCoordinateSlot {
+                    atom,
+                    axis,
+                    slot,
+                }),
+                SaeRowJetPrimary::Logit { .. } => None,
+            })
+            .collect();
+        slots.sort_unstable_by_key(|entry| (entry.atom, entry.axis));
+        slots
+    }
+
     #[inline]
     pub fn n_primaries(&self) -> usize {
         self.primaries.len()
@@ -91,6 +117,10 @@ impl SaeSoftmaxRowJetInput {
     pub(crate) fn from_source<S: SaeSoftmaxRowProgramSource>(
         source: &S,
         sqrt_row_weight: f64,
+        shared_beta_layout: Option<(
+            std::sync::Arc<[usize]>,
+            std::sync::Arc<[f64]>,
+        )>,
     ) -> Result<Self, String> {
         let n_atoms = source.n_atoms();
         let out_dim = source.out_dim();
@@ -162,9 +192,17 @@ impl SaeSoftmaxRowJetInput {
             }
         }
 
-        let beta_atoms: Vec<usize> = (0..n_beta)
-            .map(|border| source.beta_border_atom(border))
-            .collect();
+        let beta_atoms: std::sync::Arc<[usize]> = shared_beta_layout
+            .as_ref()
+            .map_or_else(
+                || {
+                    (0..n_beta)
+                        .map(|border| source.beta_border_atom(border))
+                        .collect::<Vec<_>>()
+                        .into()
+                },
+                |(atoms, _)| atoms.clone(),
+            );
         let beta_basis_values: Vec<f64> = (0..n_beta)
             .map(|border| source.beta_border_basis_value(border))
             .collect();
@@ -180,15 +218,22 @@ impl SaeSoftmaxRowJetInput {
                 }
             }
         }
-        let mut beta_outputs = vec![0.0; beta_output_len];
-        for border in 0..n_beta {
-            beta_outputs[border * out_dim..(border + 1) * out_dim]
-                .copy_from_slice(source.beta_border_output(border));
-        }
+        let beta_outputs: std::sync::Arc<[f64]> = match shared_beta_layout {
+            Some((_, outputs)) => outputs,
+            None => {
+                let mut outputs = vec![0.0; beta_output_len];
+                for border in 0..n_beta {
+                    outputs[border * out_dim..(border + 1) * out_dim]
+                        .copy_from_slice(source.beta_border_output(border));
+                }
+                outputs.into()
+            }
+        };
 
         let input = Self {
             n_atoms,
             out_dim,
+            coordinate_slots: Self::coordinate_slots_for(&primaries),
             primaries,
             gate_values: (0..n_atoms).map(|atom| source.gate_value(atom)).collect(),
             active_atoms: (0..n_atoms)
@@ -298,6 +343,13 @@ impl SaeSoftmaxRowJetInput {
                     "SAE row-jet primary {primary:?} appears more than once"
                 ));
             }
+        }
+        let expected_coordinate_slots = Self::coordinate_slots_for(&self.primaries);
+        if self.coordinate_slots != expected_coordinate_slots {
+            return Err(
+                "SAE row-jet coordinate slot table is not the canonical primary-derived table"
+                    .to_string(),
+            );
         }
         for (border, &atom) in self.beta_atoms.iter().enumerate() {
             if atom >= k {
@@ -422,6 +474,7 @@ impl SaeRowJetChannels {
 pub struct SaeRowJetMemoryLedger {
     pub fixed_device_bytes: usize,
     pub device_bytes_per_row: usize,
+    pub fixed_host_bytes: usize,
     pub cpu_host_bytes_per_row: usize,
     pub host_bytes_per_row: usize,
 }
@@ -495,26 +548,62 @@ impl SaeRowJetMemoryLedger {
             .and_then(|value| value.checked_add(output))
             .ok_or_else(|| "SAE row-jet device row-byte sum overflow".to_string())?;
 
-        // During a launch, semantic row inputs coexist with their contiguous
-        // staging arrays; downloaded flat outputs coexist briefly with the
-        // production scheduled-row expansion. The latter has two mixed arrays.
+        // Host residency has two phases. During a launch, the authoritative
+        // semantic row snapshots coexist with contiguous CUDA staging and the
+        // allocated download vectors. During production expansion, those row
+        // snapshots and flat downloads coexist with `SaeScheduledRowJets` (whose
+        // two mixed arrays intentionally duplicate the single wire channel).
+        let active_bool_bytes = k
+            .checked_mul(std::mem::size_of::<bool>())
+            .ok_or_else(|| "SAE row-jet active-mask byte count overflow".to_string())?;
+        let primary_bytes = q
+            .checked_mul(std::mem::size_of::<SaeRowJetPrimary>())
+            .ok_or_else(|| "SAE row-jet primary byte count overflow".to_string())?;
+        let beta_atom_bytes = n_beta
+            .checked_mul(std::mem::size_of::<usize>())
+            .ok_or_else(|| "SAE row-jet beta-atom byte count overflow".to_string())?;
+        let semantic_input = [
+            input_f64,
+            f64_count(&[n_beta, p])?,
+            active_bool_bytes,
+            primary_bytes,
+            beta_atom_bytes,
+            std::mem::size_of::<SaeSoftmaxRowJetInput>(),
+        ]
+        .into_iter()
+        .try_fold(0usize, |sum, value| sum.checked_add(value))
+        .ok_or_else(|| "SAE row-jet semantic-input byte sum overflow".to_string())?;
+        let production_layout = q
+            .checked_mul(std::mem::size_of::<SaeRowJetPrimary>())
+            .and_then(|value| value.checked_add(std::mem::size_of::<Vec<SaeRowJetPrimary>>()))
+            .ok_or_else(|| "SAE row-jet production-layout byte sum overflow".to_string())?;
+        let staging_input = input_f64
+            .checked_add(input_i32)
+            .ok_or_else(|| "SAE row-jet staging-input byte sum overflow".to_string())?;
         let scheduled_output = output
             .checked_add(f64_count(&[q, n_beta, p])?)
+            .and_then(|value| value.checked_add(std::mem::size_of::<SaeScheduledRowJets>()))
             .ok_or_else(|| "SAE row-jet scheduled-output byte sum overflow".to_string())?;
-        let cpu_host_bytes_per_row = input_f64
-            .checked_add(input_i32)
+        let shared_host = semantic_input
+            .checked_add(production_layout)
             .and_then(|value| value.checked_add(output))
-            .and_then(|value| value.checked_add(scheduled_output))
+            .ok_or_else(|| "SAE row-jet shared host byte sum overflow".to_string())?;
+        let cpu_host_bytes_per_row = shared_host
+            .checked_add(scheduled_output)
             .ok_or_else(|| "SAE row-jet CPU host row-byte sum overflow".to_string())?;
-        let host_bytes_per_row = input_f64
-            .checked_add(input_i32)
-            .and_then(|value| value.checked_mul(2))
-            .and_then(|value| value.checked_add(output))
-            .and_then(|value| value.checked_add(scheduled_output))
+        let host_bytes_per_row = shared_host
+            .checked_add(staging_input.max(scheduled_output))
             .ok_or_else(|| "SAE row-jet host row-byte sum overflow".to_string())?;
+        let fixed_host_bytes = f64_count(&[k])?
+            .checked_add(std::mem::size_of::<SaeRowJetChannels>())
+            .and_then(|value| {
+                value.checked_add(4 * std::mem::size_of::<Vec<()>>())
+            })
+            .ok_or_else(|| "SAE row-jet fixed host byte sum overflow".to_string())?;
         Ok(Self {
             fixed_device_bytes,
             device_bytes_per_row,
+            fixed_host_bytes,
             cpu_host_bytes_per_row,
             host_bytes_per_row,
         })
@@ -524,7 +613,9 @@ impl SaeRowJetMemoryLedger {
         let device_rows = device_budget
             .checked_sub(self.fixed_device_bytes)
             .map_or(0, |bytes| bytes / self.device_bytes_per_row.max(1));
-        let host_rows = host_budget / self.host_bytes_per_row.max(1);
+        let host_rows = host_budget
+            .checked_sub(self.fixed_host_bytes)
+            .map_or(0, |bytes| bytes / self.host_bytes_per_row.max(1));
         device_rows.min(host_rows)
     }
 }
@@ -565,10 +656,16 @@ pub fn plan_softmax_row_jets(
         });
     }
     let host_budget = crate::manifold::sae_host_in_core_budget_bytes().0;
-    if ledger.cpu_host_bytes_per_row > host_budget {
+    let one_row_host_bytes = ledger
+        .fixed_host_bytes
+        .checked_add(ledger.cpu_host_bytes_per_row)
+        .ok_or_else(|| "complete SAE one-row host-byte sum overflow".to_string())?;
+    if one_row_host_bytes > host_budget {
+        let second_channel_bytes = checked_product(&[q, q, p])?
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or_else(|| "complete SAE q^2 p channel-byte sum overflow".to_string())?;
         return Err(format!(
-            "complete SAE row jet needs {} host bytes for one K={k}, q={q}, p={p}, beta={n_beta} row, exceeding the cgroup-aware budget {host_budget}",
-            ledger.cpu_host_bytes_per_row
+            "complete SAE row jet refuses one K={k}, q={q}, p={p}, beta={n_beta} row: the q^2*p second channel alone is {second_channel_bytes} bytes and simultaneous host residency is {one_row_host_bytes} bytes, exceeding the cgroup-aware budget {host_budget}"
         ));
     }
     if mode == gam_gpu::GpuPolicy::Off {
@@ -724,15 +821,47 @@ pub fn execute_softmax_row_jet_tile(
 
 struct InputSource<'a> {
     input: &'a SaeSoftmaxRowJetInput,
+    coordinate_slots: std::collections::HashMap<(usize, usize), usize>,
+    structural_error: std::cell::RefCell<Option<String>>,
 }
 
 impl InputSource<'_> {
-    fn coordinate_slot(&self, atom: usize, axis: usize) -> usize {
-        self.input
+    fn new(input: &SaeSoftmaxRowJetInput) -> Self {
+        let coordinate_slots = input
             .primaries
             .iter()
-            .position(|candidate| *candidate == SaeRowJetPrimary::Coordinate { atom, axis })
-            .expect("validated row source requested a present coordinate")
+            .copied()
+            .enumerate()
+            .filter_map(|(slot, primary)| match primary {
+                SaeRowJetPrimary::Coordinate { atom, axis } => Some(((atom, axis), slot)),
+                SaeRowJetPrimary::Logit { .. } => None,
+            })
+            .collect();
+        Self {
+            input,
+            coordinate_slots,
+            structural_error: std::cell::RefCell::new(None),
+        }
+    }
+
+    fn coordinate_slot(&self, atom: usize, axis: usize, context: &'static str) -> Option<usize> {
+        let slot = self.coordinate_slots.get(&(atom, axis)).copied();
+        if slot.is_none() {
+            let mut error = self.structural_error.borrow_mut();
+            if error.is_none() {
+                *error = Some(format!(
+                    "{context} requested absent SAE coordinate ({atom}, {axis})"
+                ));
+            }
+        }
+        slot
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        match self.structural_error.borrow_mut().take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -761,14 +890,23 @@ impl SaeSoftmaxRowProgramSource for InputSource<'_> {
     }
     fn fill_decoded_first(&self, atom: usize, axis: usize, out: &mut [f64]) {
         let p = self.input.out_dim;
-        let slot = self.coordinate_slot(atom, axis);
+        let Some(slot) = self.coordinate_slot(atom, axis, "decoded first channel") else {
+            out.fill(0.0);
+            return;
+        };
         out.copy_from_slice(&self.input.decoded_first[slot * p..(slot + 1) * p]);
     }
     fn fill_decoded_second(&self, atom: usize, axis_a: usize, axis_b: usize, out: &mut [f64]) {
         let p = self.input.out_dim;
         let q = self.input.n_primaries();
-        let slot_a = self.coordinate_slot(atom, axis_a);
-        let slot_b = self.coordinate_slot(atom, axis_b);
+        let Some(slot_a) = self.coordinate_slot(atom, axis_a, "decoded second left channel") else {
+            out.fill(0.0);
+            return;
+        };
+        let Some(slot_b) = self.coordinate_slot(atom, axis_b, "decoded second right channel") else {
+            out.fill(0.0);
+            return;
+        };
         let start = (slot_a * q + slot_b) * p;
         out.copy_from_slice(&self.input.decoded_second[start..start + p]);
     }
@@ -783,8 +921,10 @@ impl SaeSoftmaxRowProgramSource for InputSource<'_> {
     }
     fn beta_border_basis_first(&self, border: usize, axis: usize) -> f64 {
         let atom = self.input.beta_atoms[border];
-        let slot = self.coordinate_slot(atom, axis);
-        self.input.beta_basis_first[slot * self.input.n_beta_borders() + border]
+        self.coordinate_slot(atom, axis, "beta-border first channel")
+            .map_or(0.0, |slot| {
+                self.input.beta_basis_first[slot * self.input.n_beta_borders() + border]
+            })
     }
     fn beta_border_output(&self, border: usize) -> &[f64] {
         let p = self.input.out_dim;
@@ -802,8 +942,9 @@ fn cpu_tile(
 ) -> Result<SaeRowJetChannels, String> {
     let mut out = SaeRowJetChannels::zeros(rows.len(), k, q, p, n_beta)?;
     for (row, input) in rows.iter().enumerate() {
-        let scheduled =
-            execute_softmax_row_program(&InputSource { input }, inv_tau, input.sqrt_row_weight);
+        let source = InputSource::new(input);
+        let scheduled = execute_softmax_row_program(&source, inv_tau, input.sqrt_row_weight);
+        source.finish()?;
         for slot in 0..q {
             let target = row * q * p + slot * p;
             out.first[target..target + p].copy_from_slice(scheduled.first(slot));
@@ -969,6 +1110,7 @@ mod device {
     };
     use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
     use gam_gpu::gpu_error::{GpuError, GpuResultExt};
+    use std::borrow::Cow;
     use std::sync::{Arc, OnceLock};
 
     struct Backend {
@@ -1014,6 +1156,22 @@ mod device {
 
     fn device_length(shape: &[usize]) -> Result<usize, GpuError> {
         checked_product(shape).map_err(|reason| gam_gpu::gpu_err!("{reason}"))
+    }
+
+    fn nonempty_f64(values: &[f64]) -> Cow<'_, [f64]> {
+        if values.is_empty() {
+            Cow::Owned(vec![0.0])
+        } else {
+            Cow::Borrowed(values)
+        }
+    }
+
+    fn nonempty_i32(values: &[i32]) -> Cow<'_, [i32]> {
+        if values.is_empty() {
+            Cow::Owned(vec![0])
+        } else {
+            Cow::Borrowed(values)
+        }
     }
 
     pub(super) fn device_tile(
@@ -1076,53 +1234,39 @@ mod device {
 
         // cudarc does not guarantee zero-length allocations. Dummy cells are
         // never read because the corresponding kernel has total=0 and is not launched.
-        let nonempty = |values: &[f64]| {
-            if values.is_empty() {
-                vec![0.0]
-            } else {
-                values.to_vec()
-            }
-        };
-        let nonempty_i32 = |values: &[i32]| {
-            if values.is_empty() {
-                vec![0]
-            } else {
-                values.to_vec()
-            }
-        };
         let z_dev = stream.clone_htod(&z).gpu_ctx("SAE row-jet htod gates")?;
         let active_dev = stream
             .clone_htod(&active)
             .gpu_ctx("SAE row-jet htod active mask")?;
         let kind_dev = stream
-            .clone_htod(&nonempty_i32(&kind))
+            .clone_htod(nonempty_i32(&kind).as_ref())
             .gpu_ctx("SAE row-jet htod primary kinds")?;
         let atom_dev = stream
-            .clone_htod(&nonempty_i32(&atom))
+            .clone_htod(nonempty_i32(&atom).as_ref())
             .gpu_ctx("SAE row-jet htod primary atoms")?;
         let decoded_dev = stream
             .clone_htod(&decoded)
             .gpu_ctx("SAE row-jet htod decoded")?;
         let d1_dev = stream
-            .clone_htod(&nonempty(&d1))
+            .clone_htod(nonempty_f64(&d1).as_ref())
             .gpu_ctx("SAE row-jet htod decoded first")?;
         let d2_dev = stream
-            .clone_htod(&nonempty(&d2))
+            .clone_htod(nonempty_f64(&d2).as_ref())
             .gpu_ctx("SAE row-jet htod decoded second")?;
         let sqrt_w_dev = stream
             .clone_htod(&sqrt_w)
             .gpu_ctx("SAE row-jet htod row weights")?;
         let beta_atom_dev = stream
-            .clone_htod(&nonempty_i32(&beta_atom))
+            .clone_htod(nonempty_i32(&beta_atom).as_ref())
             .gpu_ctx("SAE row-jet htod beta atoms")?;
         let beta_phi_dev = stream
-            .clone_htod(&nonempty(&beta_phi))
+            .clone_htod(nonempty_f64(&beta_phi).as_ref())
             .gpu_ctx("SAE row-jet htod beta basis values")?;
         let beta_first_dev = stream
-            .clone_htod(&nonempty(&beta_first))
+            .clone_htod(nonempty_f64(&beta_first).as_ref())
             .gpu_ctx("SAE row-jet htod beta basis first")?;
         let beta_output_dev = stream
-            .clone_htod(&nonempty(&rows[0].beta_outputs))
+            .clone_htod(nonempty_f64(&rows[0].beta_outputs).as_ref())
             .gpu_ctx("SAE row-jet htod beta outputs")?;
 
         let first_len = device_length(&[n, q, p])?;

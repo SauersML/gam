@@ -6178,6 +6178,27 @@ mod tensor_function_space_runtime_tests {
         }
     }
 
+    fn scaled_provided_marginal(scale: f64) -> BSplineBasisSpec {
+        BSplineBasisSpec {
+            degree: 2,
+            penalty_order: 1,
+            knotspec: BSplineKnotSpec::Provided(Array1::from(vec![
+                0.0,
+                0.0,
+                0.0,
+                0.25 * scale,
+                0.6 * scale,
+                scale,
+                scale,
+                scale,
+            ])),
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
+        }
+    }
+
     #[test]
     fn function_space_tensor_ridge_uses_exact_canonical_runtime() {
         let data = array![
@@ -6214,6 +6235,64 @@ mod tensor_function_space_runtime_tests {
             singly_penalized.kronecker_factored.is_some(),
             "the exact marginal-only fast path must remain available"
         );
+    }
+
+
+    /// Tensor products must inherit affine-abscissa invariance independently
+    /// from every margin. The crossed 3×3 scale matrix is the composed case:
+    /// one tiny margin and one huge margin must not cancel or mask each other.
+    #[test]
+    fn tensor_bspline_full_design_is_independently_scale_invariant_2315() {
+        let data = array![
+            [0.00, 0.13],
+            [0.08, 0.91],
+            [0.22, 0.37],
+            [0.41, 1.00],
+            [0.58, 0.02],
+            [0.73, 0.66],
+            [0.89, 0.48],
+            [1.00, 0.00]
+        ];
+        let build = |x_scale: f64, y_scale: f64| {
+            let mut scaled = data.clone();
+            scaled.column_mut(0).mapv_inplace(|value| value * x_scale);
+            scaled.column_mut(1).mapv_inplace(|value| value * y_scale);
+            let spec = TensorBSplineSpec {
+                marginalspecs: vec![
+                    scaled_provided_marginal(x_scale),
+                    scaled_provided_marginal(y_scale),
+                ],
+                periods: Vec::new(),
+                double_penalty: false,
+                identifiability: TensorBSplineIdentifiability::None,
+                penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
+            };
+            build_tensor_bspline_basis(scaled.view(), &[0, 1], &spec)
+                .expect("scaled tensor basis")
+                .design
+                .to_dense()
+        };
+
+        let reference = build(1.0, 1.0);
+        assert!(
+            reference.iter().any(|value| value.abs() > 0.25),
+            "tensor fixture must carry nontrivial product-basis signal"
+        );
+        for x_scale in [1e-9_f64, 1.0, 1e9] {
+            for y_scale in [1e-9_f64, 1.0, 1e9] {
+                let actual = build(x_scale, y_scale);
+                assert_eq!(actual.dim(), reference.dim());
+                for ((row, col), &expected) in reference.indexed_iter() {
+                    let observed = actual[[row, col]];
+                    assert!(
+                        (observed - expected).abs() <= 5e-10,
+                        "tensor design[{row},{col}] changed under independent margin scales \
+                         ({x_scale},{y_scale}): observed={observed:.16e} \
+                         expected={expected:.16e}"
+                    );
+                }
+            }
+        }
     }
 }
 

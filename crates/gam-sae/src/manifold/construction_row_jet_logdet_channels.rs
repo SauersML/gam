@@ -776,13 +776,17 @@ impl SaeManifoldTerm {
             let mut inputs = Vec::with_capacity(tile_rows);
             let mut layouts = Vec::with_capacity(tile_rows);
             let mut assignments = Array1::<f64>::zeros(self.k_atoms());
+            let mut shared_beta_layout = None;
             for row in start..start + tile_rows {
                 let vars = self.row_vars_for_cache_row(row, cache)?;
                 self.assignment.try_assignments_row_into(
                     row,
                     assignments
                         .as_slice_mut()
-                        .expect("contiguous assignment scratch"),
+                        .ok_or_else(|| {
+                            "complete SAE row-jet assignment scratch is not contiguous"
+                                .to_string()
+                        })?,
                 )?;
                 let source = ProductionSoftmaxRowProgram {
                     term: self,
@@ -796,12 +800,13 @@ impl SaeManifoldTerm {
                     .row_loss_weights
                     .as_deref()
                     .map_or(1.0, |weights| weights[row].sqrt());
-                inputs.push(
-                    crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput::from_source(
-                        &source,
-                        sqrt_row_weight,
-                    )?,
-                );
+                let input = crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput::from_source(
+                    &source,
+                    sqrt_row_weight,
+                    shared_beta_layout.clone(),
+                )?;
+                shared_beta_layout = Some((input.beta_atoms.clone(), input.beta_outputs.clone()));
+                inputs.push(input);
                 layouts.push(vars);
             }
             let channels = crate::gpu_kernels::sae_rowjet::execute_softmax_row_jet_tile(
@@ -820,7 +825,9 @@ impl SaeManifoldTerm {
         let mut a = Array1::<f64>::zeros(self.k_atoms());
         self.assignment.try_assignments_row_into(
             start,
-            a.as_slice_mut().expect("contiguous assignment scratch"),
+            a.as_slice_mut().ok_or_else(|| {
+                "SAE scalar row-jet assignment scratch is not contiguous".to_string()
+            })?,
         )?;
         let jets = self.row_jets_for_logdet(start, vars, a.view(), second_jets, border)?;
         window.push_back(jets);
