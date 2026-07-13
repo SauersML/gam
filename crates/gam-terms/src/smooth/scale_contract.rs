@@ -8,6 +8,7 @@
 //! error until its law is declared here.
 
 use super::*;
+use crate::basis::{OneDimensionalBoundary, SphereMethod};
 
 /// Builder-level basis family.  Variants that share a `SmoothBasisSpec` arm but
 /// use different mathematics (cyclic/open/natural-cubic, Wahba/harmonic sphere,
@@ -72,9 +73,11 @@ pub enum BasisCoordinateScaleAction {
     PositiveAffineAbscissa,
     /// Each tensor margin has its own positive affine map.
     IndependentPositiveAffineAxes,
-    /// `x' = a*Q*x + b`, with one `a > 0` and orthogonal `Q`; centers,
-    /// periodic lengths, and kernel range move with the same similarity.
-    EuclideanSimilarity,
+    /// `x' = a*x + b`, with one `a > 0` shared by every Euclidean axis;
+    /// centers, periodic lengths, and kernel range move with the same map.
+    /// (A diagonal anisotropy cannot represent a general rotated metric, so
+    /// rotation is deliberately not claimed by this scale-only contract.)
+    UniformEuclideanScale,
     /// Degrees/radians are two coordinate encodings of the same point on S².
     IntrinsicAngularUnitConversion,
     /// `x'=a*x`, `kappa'=kappa/a^2`, `ell'=a*ell` in the stereographic chart.
@@ -557,7 +560,7 @@ impl SmoothBasisSpec {
             }
             SmoothBasisSpec::ThinPlate { .. } => BasisScaleContract::leaf(
                 BasisScaleFamily::ThinPlate,
-                BasisCoordinateScaleAction::EuclideanSimilarity,
+                BasisCoordinateScaleAction::UniformEuclideanScale,
                 BasisDesignScaleLaw::Invariant,
                 BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
                 BasisDerivativeScaleLaw::InverseCoordinatePowerAndInvariantLogRange {
@@ -599,7 +602,7 @@ impl SmoothBasisSpec {
             ),
             SmoothBasisSpec::Matern { .. } => BasisScaleContract::leaf(
                 BasisScaleFamily::Matern,
-                BasisCoordinateScaleAction::EuclideanSimilarity,
+                BasisCoordinateScaleAction::UniformEuclideanScale,
                 BasisDesignScaleLaw::Invariant,
                 BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
                 BasisDerivativeScaleLaw::InverseCoordinatePowerAndInvariantLogRange {
@@ -611,7 +614,7 @@ impl SmoothBasisSpec {
             ),
             SmoothBasisSpec::MeasureJet { .. } => BasisScaleContract::leaf(
                 BasisScaleFamily::MeasureJet,
-                BasisCoordinateScaleAction::EuclideanSimilarity,
+                BasisCoordinateScaleAction::UniformEuclideanScale,
                 BasisDesignScaleLaw::Invariant,
                 BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
                 BasisDerivativeScaleLaw::InverseCoordinatePowerAndInvariantLogRange {
@@ -637,7 +640,7 @@ impl SmoothBasisSpec {
                 };
                 BasisScaleContract::leaf(
                     family,
-                    BasisCoordinateScaleAction::EuclideanSimilarity,
+                    BasisCoordinateScaleAction::UniformEuclideanScale,
                     BasisDesignScaleLaw::Invariant,
                     BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
                     if spec.length_scale.is_some() {
@@ -779,6 +782,13 @@ fn validate_input_scale_vector(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::basis::{
+        BSplineBoundaryConditions, BasisWorkspace, ConstantCurvatureIdentifiability,
+        DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternIdentifiability, MaternNu,
+        MeasureJetIdentifiability, SphereWahbaKernel, SphericalSplineIdentifiability,
+        build_constant_curvature_basis, build_spherical_spline_basis,
+        constant_curvature_kernel_kappa_jets,
+    };
     use ndarray::{Array1, Array2, array};
     use std::collections::HashSet;
 
