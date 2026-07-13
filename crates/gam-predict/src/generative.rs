@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use gam_models::inference::generative::{
     GenerativeSpec, NoiseModel, family_noise_parameter, generativespec_from_predict,
 };
-use gam_models::inference::model::{FittedFamily, FittedModel, PredictModelClass};
+use gam_models::inference::model::{
+    FittedEstimator, FittedFamily, FittedModel, PredictModelClass,
+};
 use gam_models::inference::predict_io::PredictResult;
 use gam_models::survival::predict::{
     SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
@@ -505,6 +507,12 @@ pub fn generative_spec_for_saved_model(
         noise_offset_supplied,
         prior_weights,
     } = request;
+    if let FittedEstimator::Expectile { .. } = model.estimator() {
+        return Err(SavedGenerativeError::UnsupportedSampler {
+            model_class: model.predict_model_class(),
+            family: model.payload().family.clone(),
+        });
+    }
     if let Some(spec) = spline_scan_generative_spec(model, data.view(), col_map, prior_weights)? {
         return Ok(spec);
     }
@@ -661,7 +669,9 @@ mod tests {
     use super::*;
     use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
     use gam_models::inference::generative::sampleobservation_replicates;
-    use gam_models::inference::model::FittedModel;
+    use gam_models::inference::model::{
+        FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
+    };
     use gam_models::inference::model_payload_builders::assemble_spline_scan_payload;
     use ndarray::{Array2, array};
     use rand::SeedableRng;
@@ -678,6 +688,48 @@ mod tests {
     fn event_window_probability_rejects_nonmonotone_or_depleted_entry_mass() {
         assert!(conditional_window_survival(0.4, 0.5, 3).is_err());
         assert!(conditional_window_survival(0.0, 0.0, 4).is_err());
+    }
+
+    #[test]
+    fn expectile_surface_refuses_to_invent_a_gaussian_observation_law() {
+        let mut payload = FittedModelPayload::new(
+            MODEL_PAYLOAD_VERSION,
+            "y ~ 1".to_string(),
+            ModelKind::Standard,
+            FittedFamily::Standard {
+                likelihood: gam_problem::types::LikelihoodSpec::gaussian_identity(),
+                link: Some(gam_problem::types::StandardLink::Identity),
+                latent_cloglog_state: None,
+                mixture_state: None,
+                sas_state: None,
+            },
+            "expectile(0.9)".to_string(),
+        );
+        payload.estimator = FittedEstimator::Expectile { tau: 0.9 };
+        let model = FittedModel::from_payload(payload);
+        let data = Array2::<f64>::zeros((1, 0));
+        let columns = HashMap::new();
+        let zero = Array1::<f64>::zeros(1);
+        let error = generative_spec_for_saved_model(
+            &model,
+            SavedGenerativeInput {
+                data: data.view(),
+                col_map: &columns,
+                training_headers: None,
+                offset: &zero,
+                offset_noise: &zero,
+                noise_offset_supplied: false,
+                prior_weights: None,
+            },
+        )
+        .expect_err("an expectile estimator alone does not define an observation sampler");
+        assert!(matches!(
+            error,
+            SavedGenerativeError::UnsupportedSampler {
+                family,
+                model_class: PredictModelClass::Standard,
+            } if family == "expectile(0.9)"
+        ));
     }
 
     fn weighted_scan_model() -> (FittedModel, gam_solve::spline_scan::SplineScanFit) {

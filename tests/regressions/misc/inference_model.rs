@@ -1,6 +1,7 @@
 use gam::families::survival::lognormal_kernel::FrailtySpec;
 use gam::inference::model::{
-    FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
+    FittedEstimator, FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION,
+    ModelKind,
 };
 use gam::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, MixtureLinkState,
@@ -173,6 +174,40 @@ fn payload_with_older_version_is_rejected_with_version_mismatch() {
         err.to_string().contains("MODEL_PAYLOAD_VERSION"),
         "version mismatch errors should explicitly mention MODEL_PAYLOAD_VERSION"
     );
+}
+
+#[test]
+fn estimator_metadata_is_required_and_expectile_tau_is_validated() {
+    let mut payload = FittedModelPayload::new(
+        MODEL_PAYLOAD_VERSION,
+        "y ~ 1".to_string(),
+        ModelKind::Standard,
+        FittedFamily::Standard {
+            likelihood: LikelihoodSpec::gaussian_identity(),
+            link: Some(StandardLink::Identity),
+            latent_cloglog_state: None,
+            mixture_state: None,
+            sas_state: None,
+        },
+        "expectile(0.9)".to_string(),
+    );
+    payload.estimator = FittedEstimator::Expectile { tau: 0.9 };
+
+    let mut encoded = serde_json::to_value(&payload).expect("serialize current payload");
+    encoded
+        .as_object_mut()
+        .expect("payload JSON object")
+        .remove("estimator");
+    assert!(
+        serde_json::from_value::<FittedModelPayload>(encoded).is_err(),
+        "v12 must not decode a saved model whose estimator identity is absent"
+    );
+
+    payload.estimator = FittedEstimator::Expectile { tau: 1.0 };
+    let error = FittedModel::from_payload(payload)
+        .validate_for_persistence()
+        .expect_err("tau=1 is not an expectile target");
+    assert!(error.to_string().contains("strictly in (0, 1)"));
 }
 
 #[test]

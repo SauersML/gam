@@ -54,6 +54,7 @@ the test passes without edits.
 from __future__ import annotations
 
 import importlib
+import json
 from typing import Any
 
 pytest: Any = importlib.import_module("pytest")
@@ -79,17 +80,34 @@ def _predict_grid(model: Any) -> np.ndarray:
     return np.asarray(model.predict(grid)).ravel()
 
 
-def test_expectile_family_is_fittable_from_python_and_monotone_in_tau() -> None:
+def test_expectile_family_is_fittable_from_python_and_monotone_in_tau(
+    tmp_path: Any,
+) -> None:
     df = _make_data()
 
     # The bug: this call raises InvalidConfigurationError("unknown family
     # 'expectile(0.9)'") today, even though gam::fit_from_formula fits it.
     lo = _predict_grid(gamfit.fit(df, "y ~ s(x)", family="expectile(0.1)"))
     mid = _predict_grid(gamfit.fit(df, "y ~ s(x)", family="expectile(0.5)"))
-    hi = _predict_grid(gamfit.fit(df, "y ~ s(x)", family="expectile(0.9)"))
+    hi_model = gamfit.fit(df, "y ~ s(x)", family="expectile(0.9)")
+    hi = _predict_grid(hi_model)
 
     assert np.all(np.isfinite(lo)) and np.all(np.isfinite(mid)) and np.all(np.isfinite(hi))
 
     # Defining property of expectiles: strictly ordered in tau at every point.
     assert np.all(lo < mid), f"0.1-expectile must lie below the median fit:\nlo={lo}\nmid={mid}"
     assert np.all(hi > mid), f"0.9-expectile must lie above the median fit:\nhi={hi}\nmid={mid}"
+
+    # An expectile is an asymmetric-loss target, not a probability law. The
+    # saved artifact must retain tau and refuse observation generation rather
+    # than silently interpreting the Gaussian inner solver as Gaussian noise.
+    model_path = tmp_path / "expectile.gam"
+    hi_model.save(model_path)
+    saved = json.loads(model_path.read_text(encoding="utf-8"))
+    assert saved["payload"]["estimator"] == {
+        "estimator_kind": "expectile",
+        "tau": 0.9,
+    }
+    restored = gamfit.load(model_path)
+    with pytest.raises(Exception, match="expectile.*no observation-replicate sampler"):
+        restored.sample_replicates(pd.DataFrame({"x": [0.25, 0.75]}), 3, seed=4)

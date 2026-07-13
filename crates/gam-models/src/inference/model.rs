@@ -4416,7 +4416,7 @@ impl FittedModel {
                     && matches!(
                         &self.family_state,
                         FittedFamily::Standard { likelihood, .. }
-                            if *likelihood == LikelihoodSpec::gaussian_identity()
+                            if likelihood == &LikelihoodSpec::gaussian_identity()
                     );
                 if !gaussian_identity_standard || !expectile_family_tag {
                     return Err(FittedModelError::SchemaMismatch {

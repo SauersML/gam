@@ -84,8 +84,9 @@ pub(crate) use gam::data::{
 pub(crate) use gam::inference::formula_dsl::{parse_formula, parse_surv_response};
 
 pub(crate) use gam::inference::model::{
-    FittedFamily, FittedModel, FittedModelPayload, GroupMetadata, MODEL_PAYLOAD_VERSION, ModelKind,
-    PredictModelClass, SavedDeploymentExtension, SavedLatentZNormalization,
+    FittedEstimator, FittedFamily, FittedModel, FittedModelPayload, GroupMetadata,
+    MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedDeploymentExtension,
+    SavedLatentZNormalization,
     append_deployment_extension_columns,
 };
 

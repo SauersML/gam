@@ -75,4 +75,38 @@ fn expectile_cli_fit_does_not_abort_on_standard_frailty_guard() {
         output.status.code(),
         stderr.lines().rev().take(6).collect::<Vec<_>>().join("\n")
     );
+
+    let saved: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(out.path()).expect("read saved expectile model"),
+    )
+    .expect("decode saved expectile model");
+    assert_eq!(
+        saved["payload"]["estimator"],
+        serde_json::json!({"estimator_kind": "expectile", "tau": 0.5}),
+        "CLI persistence must retain the expectile target instead of erasing it into Gaussian"
+    );
+
+    let generated = tempfile::Builder::new()
+        .suffix(".csv")
+        .tempfile()
+        .expect("temp generated output path");
+    let generation = Command::new(env!("CARGO_BIN_EXE_gam"))
+        .arg("generate")
+        .arg(out.path())
+        .arg(fixture)
+        .arg("--n-draws")
+        .arg("2")
+        .arg("--out")
+        .arg(generated.path())
+        .output()
+        .expect("spawn gam generate");
+    let generation_error = String::from_utf8_lossy(&generation.stderr);
+    assert!(
+        !generation.status.success()
+            && generation_error.contains("expectile")
+            && generation_error.contains("no observation-replicate sampler"),
+        "an expectile target has no implied observation law and generation must refuse it; \
+         status={:?}, stderr={generation_error}",
+        generation.status.code(),
+    );
 }

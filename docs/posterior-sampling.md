@@ -72,6 +72,12 @@ window and positive integer labels identify the persisted cause. Censoring and
 inspection records are study-design mechanisms rather than draws from those
 event laws, so this API does not invent them.
 
+Expectile fits persist their asymmetric target `tau`, but an expectile is an
+estimating-loss target rather than an observation distribution. Replicate
+generation therefore raises a typed unsupported-sampler error for an expectile
+artifact instead of silently borrowing the Gaussian law used by its inner
+weighted solver.
+
 `sample_replicates` is the convenient allocating form. `iter_replicates`
 requires an explicit positive `chunk_size` and retains only one draw chunk at a
 time. Adjacent chunks use seekable global draw indices, so concatenating them

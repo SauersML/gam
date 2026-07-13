@@ -21,10 +21,39 @@ use ndarray::Array1;
 /// formulas.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BmsFlexCalibrationOrder2Node {
+    InterceptFirst,
     InterceptSecond,
     PrimaryFirst { primary: usize },
     InterceptPrimarySecond { primary: usize },
     PrimaryPairSecond { left: usize, right: usize },
+}
+
+/// Declarative directional derivative of the Order2 calibration schedule.
+///
+/// `DirectionStart` lets an optimized backend compile the sparse coefficient
+/// direction once, then consume every derivative node for that direction.
+/// The node order is part of the semantic program: CPU moments and generated
+/// device code do not own independent primary/direction loops.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BmsFlexCalibrationOrder3Node {
+    DirectionStart {
+        direction: usize,
+    },
+    InterceptDirectionalSecond {
+        direction: usize,
+    },
+    InterceptDirectionalThird {
+        direction: usize,
+    },
+    InterceptPrimaryDirectionalThird {
+        direction: usize,
+        primary: usize,
+    },
+    PrimaryPairDirectionalThird {
+        direction: usize,
+        left: usize,
+        right: usize,
+    },
 }
 
 /// Borrowed scalar coordinates of the canonical BMS FLEX row program.
@@ -212,6 +241,7 @@ impl BmsFlexRowProgram {
         need_hessian: bool,
         mut visit: impl FnMut(BmsFlexCalibrationOrder2Node) -> Result<(), E>,
     ) -> Result<(), E> {
+        visit(BmsFlexCalibrationOrder2Node::InterceptFirst)?;
         if need_hessian {
             visit(BmsFlexCalibrationOrder2Node::InterceptSecond)?;
         }
@@ -225,6 +255,39 @@ impl BmsFlexRowProgram {
             for (position, &left) in active_primaries.iter().enumerate() {
                 for &right in &active_primaries[position..] {
                     visit(BmsFlexCalibrationOrder2Node::PrimaryPairSecond { left, right })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Interpret the canonical directional derivative of the Order2 schedule.
+    /// `active_primaries` has the same meaning and ordering as in
+    /// [`Self::try_for_each_calibration_order2`].
+    pub(super) fn try_for_each_calibration_order3<E>(
+        active_primaries: &[usize],
+        direction_count: usize,
+        mut visit: impl FnMut(BmsFlexCalibrationOrder3Node) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for direction in 0..direction_count {
+            visit(BmsFlexCalibrationOrder3Node::DirectionStart { direction })?;
+            visit(BmsFlexCalibrationOrder3Node::InterceptDirectionalSecond { direction })?;
+            visit(BmsFlexCalibrationOrder3Node::InterceptDirectionalThird { direction })?;
+            for &primary in active_primaries {
+                visit(
+                    BmsFlexCalibrationOrder3Node::InterceptPrimaryDirectionalThird {
+                        direction,
+                        primary,
+                    },
+                )?;
+            }
+            for (position, &left) in active_primaries.iter().enumerate() {
+                for &right in &active_primaries[position..] {
+                    visit(BmsFlexCalibrationOrder3Node::PrimaryPairDirectionalThird {
+                        direction,
+                        left,
+                        right,
+                    })?;
                 }
             }
         }
@@ -323,5 +386,85 @@ impl BmsFlexRowProgram {
             .evaluate_index(&intercept, vars, &self.observed, workspace)
             .scale(self.observed_sign);
         Ok(signed.compose_unary(self.observed_neglog_stack))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derivative_node_stream_owns_sparse_primary_and_direction_order() {
+        let active = [1, 4];
+        let mut order2 = Vec::new();
+        BmsFlexRowProgram::for_each_calibration_order2(&active, true, |node| order2.push(node));
+        assert_eq!(
+            order2,
+            vec![
+                BmsFlexCalibrationOrder2Node::InterceptFirst,
+                BmsFlexCalibrationOrder2Node::InterceptSecond,
+                BmsFlexCalibrationOrder2Node::PrimaryFirst { primary: 1 },
+                BmsFlexCalibrationOrder2Node::InterceptPrimarySecond { primary: 1 },
+                BmsFlexCalibrationOrder2Node::PrimaryFirst { primary: 4 },
+                BmsFlexCalibrationOrder2Node::InterceptPrimarySecond { primary: 4 },
+                BmsFlexCalibrationOrder2Node::PrimaryPairSecond { left: 1, right: 1 },
+                BmsFlexCalibrationOrder2Node::PrimaryPairSecond { left: 1, right: 4 },
+                BmsFlexCalibrationOrder2Node::PrimaryPairSecond { left: 4, right: 4 },
+            ]
+        );
+
+        let mut order3 = Vec::new();
+        BmsFlexRowProgram::try_for_each_calibration_order3(
+            &active,
+            2,
+            |node| -> Result<(), std::convert::Infallible> {
+                order3.push(node);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(order3.len(), 16);
+        assert_eq!(
+            &order3[..8],
+            &[
+                BmsFlexCalibrationOrder3Node::DirectionStart { direction: 0 },
+                BmsFlexCalibrationOrder3Node::InterceptDirectionalSecond { direction: 0 },
+                BmsFlexCalibrationOrder3Node::InterceptDirectionalThird { direction: 0 },
+                BmsFlexCalibrationOrder3Node::InterceptPrimaryDirectionalThird {
+                    direction: 0,
+                    primary: 1,
+                },
+                BmsFlexCalibrationOrder3Node::InterceptPrimaryDirectionalThird {
+                    direction: 0,
+                    primary: 4,
+                },
+                BmsFlexCalibrationOrder3Node::PrimaryPairDirectionalThird {
+                    direction: 0,
+                    left: 1,
+                    right: 1,
+                },
+                BmsFlexCalibrationOrder3Node::PrimaryPairDirectionalThird {
+                    direction: 0,
+                    left: 1,
+                    right: 4,
+                },
+                BmsFlexCalibrationOrder3Node::PrimaryPairDirectionalThird {
+                    direction: 0,
+                    left: 4,
+                    right: 4,
+                },
+            ]
+        );
+        assert!(order3[8..].iter().all(|node| match node {
+            BmsFlexCalibrationOrder3Node::DirectionStart { direction }
+            | BmsFlexCalibrationOrder3Node::InterceptDirectionalSecond { direction }
+            | BmsFlexCalibrationOrder3Node::InterceptDirectionalThird { direction }
+            | BmsFlexCalibrationOrder3Node::InterceptPrimaryDirectionalThird {
+                direction, ..
+            }
+            | BmsFlexCalibrationOrder3Node::PrimaryPairDirectionalThird { direction, .. } => {
+                *direction == 1
+            }
+        }));
     }
 }

@@ -4576,21 +4576,35 @@ fn build_standard_payload(
         };
     let family_link = family.link_function();
     let family_inverse_link = family.link.clone();
-    let family_name = family.name().to_string();
+    let estimator = gam::families::fit_orchestration::expectile_tau_for_config(fit_config)
+        .map_err(|error| format!("failed to persist estimator metadata: {error}"))?
+        .map_or(FittedEstimator::Likelihood, |tau| {
+            FittedEstimator::Expectile { tau }
+        });
+    let family_name = match estimator {
+        FittedEstimator::Likelihood => family.name().to_string(),
+        FittedEstimator::Expectile { tau } => format!("expectile({tau})"),
+    };
     // #942 MAGIC: precompute the exact Gaussian-identity jackknife+ substrate
     // (distribution-free, finite-sample ≥level coverage with no held-out fold)
     // while the training design + response are still in hand. `None` for any
     // ineligible model; predict falls back to the model-based band.
-    let jackknife_plus_stats = gaussian_jackknife_plus_stats_for_standard_fit(
-        &formula, dataset, fit_config, &family, &saved_fit, design,
-    );
+    let jackknife_plus_stats = match estimator {
+        FittedEstimator::Likelihood => gaussian_jackknife_plus_stats_for_standard_fit(
+            &formula, dataset, fit_config, &family, &saved_fit, design,
+        ),
+        FittedEstimator::Expectile { .. } => None,
+    };
     // #1098 MAGIC: precompute the EXACT Gaussian-identity full-conformal
     // substrate (distribution-free finite-sample set, no held-out fold) under
     // the same eligibility as jackknife+. Computed here while `formula`/`family`/
     // `saved_fit` are still owned — the payload constructor moves them below.
-    let full_conformal_substrate = exact_full_conformal_substrate_for_standard_fit(
-        &formula, dataset, fit_config, &family, &saved_fit, design,
-    );
+    let full_conformal_substrate = match estimator {
+        FittedEstimator::Likelihood => exact_full_conformal_substrate_for_standard_fit(
+            &formula, dataset, fit_config, &family, &saved_fit, design,
+        ),
+        FittedEstimator::Expectile { .. } => None,
+    };
     let mut payload = FittedModelPayload::new(
         MODEL_PAYLOAD_VERSION,
         formula,
@@ -4604,6 +4618,7 @@ fn build_standard_payload(
         },
         family_name,
     );
+    payload.estimator = estimator;
     payload.unified = Some(saved_fit.clone());
     payload.fit_result = Some(saved_fit);
     payload.data_schema = Some(dataset.schema.clone());

@@ -3,8 +3,8 @@ use gam::families::survival::lognormal_kernel::FrailtySpec;
 // `predictor()` / `block_roles()` are provided by the predict extension trait,
 // which moved into `gam-predict` when the prediction engine was peeled out.
 use gam::inference::model::{
-    FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
-    PredictModelClass,
+    FittedEstimator, FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION,
+    ModelKind, PredictModelClass,
 };
 use gam::solver::estimate::{
     BlockRole, FitArtifacts, FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts,
@@ -21,17 +21,16 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use tempfile::tempdir;
 
-const EXPECTED_MODEL_PAYLOAD_VERSION: u64 = 9;
+const EXPECTED_MODEL_PAYLOAD_VERSION: u64 = 12;
 const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 2;
-// FittedModelPayload has 97 serialized fields in schema version 9. These pin
+// FittedModelPayload has 96 serialized fields in schema version 12. These pin
 // fixtures leave `group_metadata=None` and `deployment_extensions=[]`; those are
 // the only two fields guarded by `skip_serializing_if`, so their JSON payloads
-// contain exactly 95 keys. Version 9 adds the canonical standard-link-wiggle
-// function-penalty metadata required to replay its posterior target without
-// inferring penalty order from lambda position; it is null for these fixtures.
+// contain exactly 94 keys. Version 12 adds the required fitted-estimator tag so
+// an expectile target cannot be decoded as a Gaussian observation law.
 // Any payload-field or skip-rule change requires a fresh enumeration before
 // changing this pin.
-const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 95;
+const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 94;
 const EXPECTED_STANDARD_FAMILY_FIELD_COUNT: usize = 6;
 
 fn read_saved_model_json(path: &Path) -> Value {
@@ -61,6 +60,17 @@ fn assert_saved_model_schema_is_pinned(saved: &Value) {
         payload.get("version").and_then(Value::as_u64),
         Some(EXPECTED_MODEL_PAYLOAD_VERSION),
         "saved model schema version changed; audit stateful payload fields before updating this test"
+    );
+    assert_eq!(
+        serde_json::from_value::<FittedEstimator>(
+            payload
+                .get("estimator")
+                .expect("required estimator metadata")
+                .clone()
+        )
+        .expect("decode estimator metadata"),
+        FittedEstimator::Likelihood,
+        "ordinary likelihood fits must persist their estimator identity"
     );
 }
 
