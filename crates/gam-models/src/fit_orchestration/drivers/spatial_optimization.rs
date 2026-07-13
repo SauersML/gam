@@ -6514,6 +6514,7 @@ where
         &Array1<f64>,
         &[TermCollectionSpec],
         &[TermCollectionDesign],
+        &gam_problem::outer_subsample::RowSet,
     ) -> Result<gam_problem::EfsEval, String>,
     SeedFn: FnMut(&Array1<f64>) -> Result<gam_solve::rho_optimizer::SeedOutcome, EstimationError>,
 {
@@ -7051,6 +7052,7 @@ where
                         theta,
                         &specs,
                         &designs,
+                        &ctx.row_set,
                     );
                     let elapsed_s = t0.elapsed().as_secs_f64();
                     kphase_efs_calls.set(kphase_efs_calls.get() + 1);

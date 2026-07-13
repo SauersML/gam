@@ -4,6 +4,84 @@
 // resolve through the parent namespace.
 use super::*;
 
+/// Materialize the exact outer-evaluation options for the row measure owned by
+/// the spatial driver. Both analytic and EFS lanes call this helper: a
+/// full-data continuation must actively revoke any caller-carried pilot or
+/// automatic sampler, while a pilot must preserve the driver's exact HT row
+/// weights.
+fn gamlss_exact_outer_options(
+    options: &BlockwiseFitOptions,
+    row_set: &crate::row_kernel::RowSet,
+) -> BlockwiseFitOptions {
+    let mut effective = options.clone();
+    effective.auto_outer_subsample = false;
+    effective.outer_score_subsample = match row_set {
+        crate::row_kernel::RowSet::All => None,
+        crate::row_kernel::RowSet::Subsample { rows, n_full } => Some(std::sync::Arc::new(
+            crate::outer_subsample::OuterScoreSubsample::from_weighted_rows(
+                rows.as_ref().clone(),
+                *n_full,
+                0,
+            ),
+        )),
+    };
+    effective
+}
+
+#[cfg(test)]
+mod exact_outer_row_measure_tests {
+    use super::*;
+
+    #[test]
+    fn gamlss_exact_outer_options_preserve_efs_row_authority() {
+        let mut options = BlockwiseFitOptions::default();
+        options.auto_outer_subsample = true;
+        options.outer_score_subsample = Some(std::sync::Arc::new(
+            crate::outer_subsample::OuterScoreSubsample::from_uniform_inclusion_mask(
+                vec![9], 10, 17,
+            ),
+        ));
+        let rows = std::sync::Arc::new(vec![
+            gam_problem::outer_subsample::WeightedOuterRow {
+                index: 1,
+                weight: 2.5,
+                stratum: 3,
+            },
+            gam_problem::outer_subsample::WeightedOuterRow {
+                index: 7,
+                weight: 4.0,
+                stratum: 8,
+            },
+        ]);
+
+        let sampled = gamlss_exact_outer_options(
+            &options,
+            &crate::row_kernel::RowSet::Subsample { rows, n_full: 11 },
+        );
+        assert!(!sampled.auto_outer_subsample);
+        let installed = sampled
+            .outer_score_subsample
+            .as_ref()
+            .expect("EFS pilot row measure");
+        assert_eq!(installed.n_full, 11);
+        assert_eq!(installed.rows.len(), 2);
+        assert_eq!(installed.rows[0].index, 1);
+        assert_eq!(installed.rows[0].weight.to_bits(), 2.5_f64.to_bits());
+        assert_eq!(installed.rows[0].stratum, 3);
+        assert_eq!(installed.rows[1].index, 7);
+        assert_eq!(installed.rows[1].weight.to_bits(), 4.0_f64.to_bits());
+        assert_eq!(installed.rows[1].stratum, 8);
+
+        let full = gamlss_exact_outer_options(&options, &crate::row_kernel::RowSet::All);
+        assert!(!full.auto_outer_subsample);
+        assert!(
+            full.outer_score_subsample.is_none(),
+            "EFS full-data continuation must revoke every stale pilot"
+        );
+        assert!(options.outer_score_subsample.is_some());
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct GamlssLambdaLayout {
     pub(crate) k_mean: usize,
@@ -2243,30 +2321,11 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     // weight is consulted only by outer-only paths inside the
                     // family). When the staging schedule is full-data the option
                     // stays `None` and the call is equivalent to the prior path.
-                    let eval_options = match row_set {
-                        crate::row_kernel::RowSet::All => {
-                            std::borrow::Cow::Borrowed(options)
-                        }
-                        crate::row_kernel::RowSet::Subsample {
-                            rows,
-                            n_full,
-                        } => {
-                            let subsample = crate::outer_subsample::
-                                OuterScoreSubsample::from_weighted_rows(
-                                    (**rows).clone(),
-                                    *n_full,
-                                    *n_full as u64,
-                                );
-                            let mut cloned = options.clone();
-                            cloned.outer_score_subsample =
-                                Some(std::sync::Arc::new(subsample));
-                            std::borrow::Cow::Owned(cloned)
-                        }
-                    };
+                    let eval_options = gamlss_exact_outer_options(options, row_set);
                     let eval = evaluate_custom_family_joint_hyper(
                         &family,
                         &blocks,
-                        eval_options.as_ref(),
+                        &eval_options,
                         &rho,
                         &psiderivative_blocks,
                         warm_start.as_ref(),
@@ -2288,7 +2347,10 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     }
                     Ok((eval.objective, eval.gradient, eval.outer_hessian))
                 },
-                |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+                |theta,
+                 specs: &[TermCollectionSpec],
+                 designs: &[TermCollectionDesign],
+                 row_set: &crate::row_kernel::RowSet| {
                     if !analytic_joint_derivatives_available {
                         return Err(
                             "analytic spatial psi derivatives are unavailable for this exact two-block path"
@@ -2322,10 +2384,11 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         &designs[1],
                     )?;
                     let warm_start = hyper_warm_start_cell.borrow().clone();
+                    let eval_options = gamlss_exact_outer_options(options, row_set);
                     let eval = evaluate_custom_family_joint_hyper_efs(
                         &family,
                         &blocks,
-                        options,
+                        &eval_options,
                         &rho,
                         &psiderivative_blocks,
                         warm_start.as_ref(),

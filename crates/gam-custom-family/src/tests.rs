@@ -4163,6 +4163,47 @@ pub(crate) fn certified_test_outer(
 }
 
 #[test]
+pub(crate) fn fixed_log_lambda_outer_finalizer_rejects_recomputed_objective_mismatch() {
+    let specs = vec![ParameterBlockSpec {
+        name: "certified_fixed_rho".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
+        nullspace_dims: vec![0],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: false,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let selected_theta = array![0.0];
+    let certified_outer = certified_test_outer(selected_theta.clone(), 123.0);
+
+    let error = fit_custom_family_fixed_log_lambdas_from_outer(
+        &OneBlockIdentityFamily,
+        &specs,
+        &options,
+        None,
+        &selected_theta,
+        &certified_outer,
+    )
+    .expect_err("a different coefficient objective cannot inherit the outer certificate");
+
+    assert!(
+        error
+            .to_string()
+            .contains("does not belong to the certified outer optimum"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
 pub(crate) fn returned_mode_finalizer_preserves_owned_mode_without_family_replay() {
     let family = OneStepReturnedSaddleFamily::new(0.125);
     let specs = one_step_returned_saddle_specs();

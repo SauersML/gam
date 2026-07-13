@@ -133,27 +133,6 @@ pub(crate) fn transformation_spatial_geometry_key(
     Ok(key)
 }
 
-pub(crate) fn transformation_exact_outer_options(
-    options: &BlockwiseFitOptions,
-    row_set: &gam_problem::outer_subsample::RowSet,
-) -> BlockwiseFitOptions {
-    let mut effective = options.clone();
-    effective.auto_outer_subsample = false;
-    effective.outer_score_subsample = match row_set {
-        gam_problem::outer_subsample::RowSet::All => None,
-        gam_problem::outer_subsample::RowSet::Subsample { rows, n_full } => {
-            Some(Arc::new(
-                crate::outer_subsample::OuterScoreSubsample::from_weighted_rows(
-                    rows.as_ref().clone(),
-                    *n_full,
-                    0,
-                ),
-            ))
-        }
-    };
-    effective
-}
-
 // ---------------------------------------------------------------------------
 // Top-level fit function
 // ---------------------------------------------------------------------------
@@ -563,7 +542,7 @@ pub fn fit_transformation_normal(
                 .as_mut()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
             let warm_starts = exact_mode_candidates(gam_problem::EvalMode::ValueOnly, &rho);
-            let final_options = transformation_exact_outer_options(
+            let final_options = crate::outer_subsample::exact_outer_options_for_row_set(
                 &options,
                 &gam_problem::outer_subsample::RowSet::All,
             );
@@ -656,7 +635,8 @@ pub fn fit_transformation_normal(
             // `row_set` is the outer driver's authoritative measure. Rebuild
             // the family-facing option on every evaluation so a pilot mask
             // cannot survive the driver's rotation back to full data.
-            let eval_options = transformation_exact_outer_options(&options, row_set);
+            let eval_options =
+                crate::outer_subsample::exact_outer_options_for_row_set(&options, row_set);
             let selection = evaluate_custom_family_joint_hyper_best_mode_shared(
                 &geometry.family,
                 &geometry.blocks,
@@ -707,7 +687,10 @@ pub fn fit_transformation_normal(
 
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
-        |_theta, _specs: &[TermCollectionSpec], _designs: &[TermCollectionDesign]| {
+        |_theta,
+         _specs: &[TermCollectionSpec],
+         _designs: &[TermCollectionDesign],
+         _row_set| {
             Err::<gam_problem::EfsEval, String>("transformation-normal EFS callback invoked even though fixed-point optimization is disabled for beta-dependent exact curvature".to_string())
         },
         |_beta: &Array1<f64>| Ok(gam_solve::rho_optimizer::SeedOutcome::NoSlot),

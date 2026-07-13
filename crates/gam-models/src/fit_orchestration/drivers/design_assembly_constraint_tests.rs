@@ -3445,7 +3445,7 @@ pub(super) fn run_two_block_exact_joint_optimize(
                 },
             ))
         },
-        |theta, specs, designs| {
+        |theta, specs, designs, _row_set| {
             assert_eq!(theta.len(), theta_dim);
             assert_eq!(specs.len(), 2);
             assert!(!designs.is_empty());
@@ -3581,7 +3581,7 @@ fn staged_exact_joint_outer_reoptimizes_and_certifies_the_full_row_measure() {
             };
             Ok((cost, gradient, hessian))
         },
-        |_theta, _specs, _designs| {
+        |_theta, _specs, _designs, _row_set| {
             Err("fixed-point callback must stay disabled in staged regression".to_string())
         },
         |_beta| Ok(gam_solve::rho_optimizer::SeedOutcome::NoSlot),
@@ -6715,7 +6715,7 @@ fn exact_joint_two_block_no_spatial_fast_path_returns_fully_frozen_specs() {
                 },
             ))
         },
-        |theta, specs, designs| {
+        |theta, specs, designs, _row_set| {
             assert_eq!(theta.len(), theta_dim);
             assert_eq!(specs.len(), 2);
             assert_eq!(designs.len(), 2);
