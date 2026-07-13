@@ -30,6 +30,7 @@ use gam_spec::{GlmLikelihoodSpec, LinkFunction};
 use gam_terms::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
 };
+use gam_terms::smooth::{LinearCoefficientGeometry, TermCollectionSpec};
 use ndarray::{Array1, Array2, s};
 
 use crate::{FittedModelPredictExt, PredictInput};
@@ -276,6 +277,15 @@ pub struct SavedModelAloDiagnostics {
 
 fn invalid(reason: impl Into<String>) -> EstimationError {
     EstimationError::InvalidInput(reason.into())
+}
+
+fn termspec_has_bounded_terms(spec: &TermCollectionSpec) -> bool {
+    spec.linear_terms.iter().any(|term| {
+        matches!(
+            term.coefficient_geometry,
+            LinearCoefficientGeometry::Bounded { .. }
+        )
+    })
 }
 
 fn require_location_scale_inputs<'a>(
@@ -585,6 +595,28 @@ fn compute_saved_standard_alo(
     {
         return Err(invalid(
             "saved standard ALO received non-standard secondary or auxiliary coordinates",
+        ));
+    }
+    // `require_saved_hessian` below is the saved *unconstrained* penalized
+    // Hessian: `compute_alo_from_input` feeds it straight into the classical
+    // one-step leave-one-out formula, which assumes a single quadratic
+    // neighborhood around beta. A `bounded()` term's active box constraint
+    // breaks that assumption — the true leave-one-out geometry at an active
+    // bound is piecewise, not a single quadratic — so replaying the saved
+    // Hessian would silently ignore the constraint. Surface that gap
+    // explicitly (this dispatcher never refits, so there is no constrained
+    // alternative to fall back to) instead of reporting a leverage that
+    // quietly assumes the bound away.
+    if model
+        .resolved_termspec
+        .as_ref()
+        .is_some_and(termspec_has_bounded_terms)
+    {
+        return Err(invalid(
+            "saved standard ALO does not yet support bounded() coefficients: leave-one-out \
+             geometry for a box-constrained coefficient is not a single unconstrained \
+             quadratic, so replaying the saved penalized Hessian would silently ignore the \
+             constraint",
         ));
     }
     if let Some((row, weight)) = observations

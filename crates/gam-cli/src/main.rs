@@ -11,8 +11,7 @@ pub(crate) use csv::WriterBuilder;
 
 pub(crate) use gam::estimate::{
     BlockRole, ContinuousSmoothnessOrderStatus, FittedLinkState, ModelSummary,
-    ParametricTermSummary, SmoothTermSummary, UnifiedFitResult,
-    compute_continuous_smoothness_order,
+    ParametricTermSummary, SmoothTermSummary, UnifiedFitResult, compute_continuous_smoothness_order,
 };
 
 pub(crate) use gam::families::bms::{
