@@ -127,18 +127,33 @@ impl LogslopeTopology {
             ));
         }
         match self {
-            Self::Shared => Ok(LogslopeLayout {
-                coefficient_design,
-                nrows,
-                current_width,
-                channels: LogslopeChannels::Shared {
-                    offset: Arc::new(common_offset.clone()),
-                },
-            }),
+            Self::Shared => {
+                certify_channel_nonzero(
+                    &raw_design,
+                    &current_from_raw,
+                    &(0..raw_design.ncols()),
+                    0,
+                    "shared logslope",
+                )?;
+                Ok(LogslopeLayout {
+                    coefficient_design,
+                    nrows,
+                    current_width,
+                    channels: LogslopeChannels::Shared {
+                        offset: Arc::new(common_offset.clone()),
+                    },
+                })
+            }
             Self::PerScore { raw_ranges } => {
                 validate_partition(raw_ranges, raw_design.ncols(), "per-score logslope layout")?;
                 for (channel, range) in raw_ranges.iter().enumerate() {
-                    certify_channel_nonzero(&raw_design, &current_from_raw, range, channel)?;
+                    certify_channel_nonzero(
+                        &raw_design,
+                        &current_from_raw,
+                        range,
+                        channel,
+                        "per-score logslope",
+                    )?;
                 }
                 let mut offsets = Array2::<f64>::zeros((nrows, raw_ranges.len()));
                 for mut column in offsets.columns_mut() {
@@ -408,10 +423,11 @@ fn certify_channel_nonzero(
     current_from_raw: &Array2<f64>,
     range: &std::ops::Range<usize>,
     channel: usize,
+    context: &str,
 ) -> Result<(), String> {
     if range.is_empty() || current_from_raw.ncols() == 0 {
         return Err(format!(
-            "per-score logslope channel {channel} has no current-coordinate derivative"
+            "{context} channel {channel} has no current-coordinate derivative"
         ));
     }
     let mut chunk = Array2::<f64>::zeros((
@@ -426,7 +442,7 @@ fn certify_channel_nonzero(
         }
         raw_design
             .row_chunk_into(start..end, chunk.view_mut())
-            .map_err(|error| format!("per-score logslope channel scan failed: {error}"))?;
+            .map_err(|error| format!("{context} channel scan failed: {error}"))?;
         for local_row in 0..rows {
             for current_col in 0..current_from_raw.ncols() {
                 let mut value = 0.0;
@@ -435,7 +451,7 @@ fn certify_channel_nonzero(
                 }
                 if !value.is_finite() {
                     return Err(format!(
-                        "per-score logslope channel {channel} produced a non-finite current-coordinate row"
+                        "{context} channel {channel} produced a non-finite current-coordinate row"
                     ));
                 }
                 if value != 0.0 {
@@ -445,7 +461,7 @@ fn certify_channel_nonzero(
         }
     }
     Err(format!(
-        "per-score logslope channel {channel} is identically zero after the coefficient transform"
+        "{context} channel {channel} is identically zero after the coefficient transform"
     ))
 }
 
@@ -582,5 +598,41 @@ mod tests {
             .err()
             .expect("second physical channel must be rejected");
         assert!(error.contains("channel 1 is identically zero"), "{error}");
+    }
+
+    #[test]
+    fn shared_transformed_zero_physical_channel_is_rejected_exactly() {
+        let topology = LogslopeTopology::shared();
+        let error = topology
+            .materialize(
+                DesignMatrix::from(array![[1.0, 2.0], [3.0, 6.0]]),
+                array![[2.0], [-1.0]],
+                &array![0.0, 0.0],
+            )
+            .err()
+            .expect("shared physical channel must survive the coefficient transform");
+        assert!(
+            error.contains("shared logslope channel 0 is identically zero"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn shared_zero_width_physical_channel_is_rejected_exactly() {
+        let topology = LogslopeTopology::shared();
+        let raw_design = DesignMatrix::from(array![[1.0], [2.0]]);
+        let error = topology
+            .materialize_with_design(
+                raw_design,
+                DesignMatrix::from(Array2::<f64>::zeros((2, 0))),
+                Array2::<f64>::zeros((1, 0)),
+                &array![0.0, 0.0],
+            )
+            .err()
+            .expect("shared physical channel cannot have zero current width");
+        assert!(
+            error.contains("shared logslope channel 0 has no current-coordinate derivative"),
+            "{error}"
+        );
     }
 }
