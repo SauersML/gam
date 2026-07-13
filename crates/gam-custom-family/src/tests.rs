@@ -9090,53 +9090,84 @@ pub(crate) fn structural_edf_matches_trace_identity_noncommuting_pair() {
 
 #[test]
 pub(crate) fn per_penalty_edf_uses_realized_penalty_rank_2288() {
-    let spec = ParameterBlockSpec {
-        name: "complementary_penalties".to_string(),
-        design: DesignMatrix::from(Array2::<f64>::zeros((2, 4))),
-        offset: Array1::zeros(2),
-        penalties: vec![
-            PenaltyMatrix::Dense(array![
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0],
-            ]),
-            PenaltyMatrix::Dense(array![
-                [0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ]),
-        ],
-        // Empty is deliberate: canonicalization clears pre-transform
-        // nullities, so EDF rank must come from the same realized roots as the
-        // REML criterion rather than trusting optional metadata.
-        nullspace_dims: vec![],
-        initial_log_lambdas: array![0.0, 0.0],
-        initial_beta: None,
-        gauge_priority: 100,
-        jacobian_callback: None,
-        stacked_design: None,
-        stacked_offset: None,
-    };
-    let h = Array2::<f64>::eye(4) * 2.0;
-    let lambdas = array![1.0, 1.0];
+    // Two blocks × two penalties, with distinct ranks, strengths, diagonal
+    // weights, and Hessian scales. Every flattened output is intentionally
+    // different: a positional permutation, a reset of the global penalty
+    // cursor at a block boundary, or use of containing-block width as rank can
+    // no longer pass accidentally.
+    let specs = vec![
+        ParameterBlockSpec {
+            name: "first_two_penalty_block".to_string(),
+            design: DesignMatrix::from(Array2::<f64>::zeros((2, 3))),
+            offset: Array1::zeros(2),
+            penalties: vec![
+                PenaltyMatrix::Dense(array![
+                    [1.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ]),
+                PenaltyMatrix::Dense(array![
+                    [0.0, 0.0, 0.0],
+                    [0.0, 2.0, 0.0],
+                    [0.0, 0.0, 3.0],
+                ]),
+            ],
+            // Empty is deliberate: canonicalization clears pre-transform
+            // nullities, so rank must come from the realized roots.
+            nullspace_dims: vec![],
+            initial_log_lambdas: array![1.0_f64.ln(), 0.5_f64.ln()],
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        },
+        ParameterBlockSpec {
+            name: "second_two_penalty_block".to_string(),
+            design: DesignMatrix::from(Array2::<f64>::zeros((2, 3))),
+            offset: Array1::zeros(2),
+            penalties: vec![
+                PenaltyMatrix::Dense(array![
+                    [4.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ]),
+                PenaltyMatrix::Dense(array![
+                    [0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 2.0],
+                ]),
+            ],
+            nullspace_dims: vec![],
+            initial_log_lambdas: array![0.25_f64.ln(), 2.0_f64.ln()],
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        },
+    ];
+    let h = Array2::from_diag(&array![4.0, 5.0, 10.0, 8.0, 10.0, 20.0]);
+    let lambdas = array![1.0, 0.5, 0.25, 2.0];
 
     let (edf_total, edf_by_penalty, block_edf, penalty_trace) =
-        custom_family_blockwise_edf(&h, &[spec], &lambdas.view()).expect("exact EDF");
+        custom_family_blockwise_edf(&h, &specs, &lambdas.view()).expect("exact composed EDF");
 
-    // These values come from a floating-point factor solve.  The regression is
-    // the order-one distinction between the realized rank-2 bases here and the
-    // old containing-width-4 base/cap, not bit identity with the rational
-    // result.  Keep the tolerance tight enough that the old result cannot pass.
-    for &actual in &penalty_trace {
-        assert_relative_eq!(actual, 1.0, epsilon = 1e-12);
+    // Independent diagonal oracle:
+    //   λ tr(H⁻¹S) = [1/4, (1/2)(2/5+3/10), (1/4)(4/8), 2(1/10+2/20)].
+    let expected_trace = [0.25, 0.35, 0.125, 0.4];
+    let expected_edf = [0.75, 1.65, 0.875, 1.6];
+    assert_eq!(penalty_trace.len(), expected_trace.len());
+    assert_eq!(edf_by_penalty.len(), expected_edf.len());
+    for (&actual, &expected) in penalty_trace.iter().zip(expected_trace.iter()) {
+        assert_relative_eq!(actual, expected, epsilon = 1e-12);
     }
-    for &actual in &edf_by_penalty {
-        assert_relative_eq!(actual, 1.0, epsilon = 1e-12);
+    for (&actual, &expected) in edf_by_penalty.iter().zip(expected_edf.iter()) {
+        assert_relative_eq!(actual, expected, epsilon = 1e-12);
     }
-    assert_relative_eq!(block_edf[0], 2.0, epsilon = 1e-12);
-    assert_relative_eq!(edf_total, 2.0, epsilon = 1e-12);
+    assert_relative_eq!(block_edf[0], 2.4, epsilon = 1e-12);
+    assert_relative_eq!(block_edf[1], 2.475, epsilon = 1e-12);
+    assert_relative_eq!(edf_total, 4.875, epsilon = 1e-12);
 }
 
 /// Structural edf with a penalty NULLSPACE coupled to the range through the

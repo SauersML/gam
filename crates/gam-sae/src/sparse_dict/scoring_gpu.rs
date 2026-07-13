@@ -431,7 +431,7 @@ pub fn score_block_cpu(rows: ArrayView2<'_, f32>, atoms: ArrayView2<'_, f32>) ->
 /// Minimum score-block element count (`n_rows · n_atoms`) below which the device
 /// launch is not worth its fixed cost (probe + H2D + D2H). Below this the CPU
 /// reference is used. Tuned to the same genus as the other SAE device floors
-/// (`sae_rowjet::DEVICE_ROW_THRESHOLD`).
+/// (the calibrated row-kernel crossover used by the complete SAE row jet).
 pub const DEVICE_SCORE_BLOCK_MIN_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_MIN_ELEMS;
 
 /// Which path produced a score block. Returned by the fail-loud entry point so
