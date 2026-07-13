@@ -48,8 +48,7 @@ const DEVICE_ROW_THRESHOLD: usize = 100_000;
 #[inline]
 #[must_use]
 pub(crate) fn survival_rigid_row_vgh_device_selected(n_rows: usize) -> bool {
-    n_rows >= DEVICE_ROW_THRESHOLD
-        && gam_gpu::device_runtime::GpuRuntime::global().is_some()
+    n_rows >= DEVICE_ROW_THRESHOLD && gam_gpu::device_runtime::GpuRuntime::global().is_some()
 }
 
 /// Execute an already-admitted production V/G/H batch on CUDA.
@@ -289,10 +288,7 @@ mod tests {
         rows: &[SurvivalRowInputs],
         probit_scale: f64,
     ) -> SurvivalRowVghChannels {
-        use crate::survival::marginal_slope::row_kernel::{
-            RIGID_LINEAR_MASK, SparseOrder2, rigid_row_nll,
-        };
-        use gam_math::jet_scalar::JetScalar;
+        use crate::survival::marginal_slope::row_kernel::rigid_row_order2;
 
         let n = rows.len();
         let mut value = vec![0.0_f64; n];
@@ -301,12 +297,9 @@ mod tests {
         for (row, input) in rows.iter().enumerate() {
             let in_row = rigid_cpu_row_inputs(row, input, probit_scale);
             let p = input.primaries;
-            let vars: [SparseOrder2<RIGID_LINEAR_MASK>; 4] =
-                std::array::from_fn(|axis| SparseOrder2::variable(p[axis], axis));
-            if let Ok(out) = rigid_row_nll(&vars, &in_row) {
-                value[row] = out.value();
-                grad[row * 4..row * 4 + 4].copy_from_slice(&out.g());
-                let row_hessian = out.h();
+            if let Ok((row_value, row_gradient, row_hessian)) = rigid_row_order2(&p, &in_row) {
+                value[row] = row_value;
+                grad[row * 4..row * 4 + 4].copy_from_slice(&row_gradient);
                 for a in 0..4 {
                     hess[row * 16 + a * 4..row * 16 + a * 4 + 4].copy_from_slice(&row_hessian[a]);
                 }
@@ -404,9 +397,7 @@ mod tests {
             let tolerance = PARITY_ABS_TOLERANCE + PARITY_REL_TOLERANCE * scale;
             assert!(
                 same_nonfinite
-                    || (left.is_finite()
-                        && right.is_finite()
-                        && (left - right).abs() <= tolerance),
+                    || (left.is_finite() && right.is_finite() && (left - right).abs() <= tolerance),
                 "survival VGH {name}[{index}] device drift: cpu={left:+.16e}, \
                  device={right:+.16e}, tolerance={tolerance:.3e}",
             );
