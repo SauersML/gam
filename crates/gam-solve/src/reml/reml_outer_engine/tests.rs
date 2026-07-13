@@ -2632,14 +2632,14 @@ pub(crate) fn subspace_base_h2_traces_match_scalar_projected_kernel_path() {
             a: 0.0,
             g: Array1::zeros(3),
             b_mat: Array2::zeros((0, 0)),
-            b_operator: Some(Box::new(DenseMatrixHyperOperator { matrix: op_a })),
+            b_operator: Some(Arc::new(DenseMatrixHyperOperator { matrix: op_a })),
             ld_s: 0.0,
         },
         HyperCoordPair {
             a: 0.0,
             g: Array1::zeros(3),
             b_mat: Array2::zeros((0, 0)),
-            b_operator: Some(Box::new(CompositeHyperOperator {
+            b_operator: Some(Arc::new(CompositeHyperOperator {
                 dense: Some(composite_dense),
                 operators: vec![weighted, op_b_arc],
                 dim_hint: 3,
