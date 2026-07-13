@@ -751,6 +751,15 @@ pub trait RuntimeJetScalar<'arena>: Clone {
         self.compose_unary([e, e, e, e, e])
     }
 
+    /// `ln(self)`. Caller guarantees positivity. This is the runtime-width
+    /// counterpart of [`JetScalar::ln`] and uses the identical certified
+    /// derivative stack.
+    fn ln(&self) -> Self {
+        let u = self.value();
+        let r = 1.0 / u;
+        self.compose_unary([u.ln(), r, -r * r, 2.0 * r * r * r, -6.0 * r * r * r * r])
+    }
+
     /// `1/self`.
     fn recip(&self) -> Self {
         let r = 1.0 / self.value();
@@ -7410,6 +7419,20 @@ mod unit_tests {
         assert!((lnp.g()[0] - 1.0 / p0).abs() < 1e-15, "d/dp ln(p) = 1/p");
         assert!(
             (lnp.h()[0][0] - (-1.0 / (p0 * p0))).abs() < 1e-15,
+            "d²/dp² ln(p) = -1/p²"
+        );
+    }
+
+    #[test]
+    fn dynamic_order2_ln_uses_runtime_scalar_derivative_stack() {
+        let p0 = 2.0_f64;
+        let arena = DynamicJetArena::new();
+        let p = DynamicOrder2::variable(p0, 0, 1, &arena);
+        let lnp = RuntimeJetScalar::ln(&p);
+        assert!((lnp.value() - p0.ln()).abs() < 1e-15, "ln value");
+        assert!((lnp.g()[0] - 1.0 / p0).abs() < 1e-15, "d/dp ln(p) = 1/p");
+        assert!(
+            (lnp.h_at(0, 0) - (-1.0 / (p0 * p0))).abs() < 1e-15,
             "d²/dp² ln(p) = -1/p²"
         );
     }
