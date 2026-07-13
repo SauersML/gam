@@ -7,8 +7,8 @@
 //! whose entry/exit/derivative designs all share `n` rows and `p_time`
 //! columns. The only model-specific knobs are:
 //!
-//! * how the frailty spec resolves to `(sigma, loading)` — the survival model
-//!   permits a learnable sigma (`None`), the binary model demands a fixed one;
+//! * how the frailty spec resolves to `(scale, loading)` — the survival model
+//!   permits a learned scale, while the binary model demands a fixed one;
 //! * whether the per-row unloaded *hazard* (`unloaded_hazard_exit`) participates
 //!   — the survival model carries it (it feeds the exact-event loaded/unloaded
 //!   split), the binary model never observes an exact event so it has none.
@@ -19,16 +19,15 @@
 //! descriptor they hand it.
 
 use crate::survival::location_scale::TimeBlockInput;
-use crate::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
+use crate::survival::lognormal_kernel::{FrailtyScale, FrailtySpec, HazardLoading};
 use ndarray::{Array1, ArrayView2};
 
 /// Outcome of resolving a [`FrailtySpec`] for a latent-interval model: the
-/// (possibly learnable) latent sigma and the hazard loading. `sigma == None`
-/// marks a learnable scale; the binary model rejects that case in its
-/// `frailty_policy` and always yields `Some(sigma)`.
+/// typed latent scale and the hazard loading. The binary model rejects
+/// [`FrailtyScale::Learned`] in its `frailty_policy`.
 #[derive(Clone, Copy, Debug)]
 pub struct LatentFrailtyResolution {
-    pub sigma: Option<f64>,
+    pub scale: FrailtyScale,
     pub loading: HazardLoading,
 }
 
@@ -61,9 +60,9 @@ pub trait LatentIntervalModel {
     /// byte-identical to the pre-unification per-family validators.
     fn context() -> &'static str;
 
-    /// Resolve the supplied frailty spec into a sigma / loading pair, or reject
-    /// it. The survival policy permits `sigma == None` (learnable); the binary
-    /// policy requires a finite fixed sigma.
+    /// Resolve the supplied frailty spec into a scale / loading pair, or reject
+    /// it. The survival policy permits a learned scale; the binary policy
+    /// requires a finite fixed sigma.
     fn frailty_policy(
         frailty: &FrailtySpec,
     ) -> Result<LatentFrailtyResolution, crate::survival::latent::LatentSurvivalError>;
@@ -85,16 +84,16 @@ pub trait LatentIntervalModel {
 /// per-row interval/event/unloaded-mass invariant, and the time block's
 /// row/column/offset shape. Exact-zero rows are dormant after the weight
 /// preflight and their response geometry is never inspected. Returns the
-/// resolved (possibly learnable) latent sigma on success.
+/// resolved typed latent scale on success.
 pub fn validate_latent_interval_inputs<M: LatentIntervalModel>(
     data: ArrayView2<'_, f64>,
     row: &LatentIntervalRowView<'_>,
-) -> Result<Option<f64>, crate::survival::latent::LatentSurvivalError> {
+) -> Result<FrailtyScale, crate::survival::latent::LatentSurvivalError> {
     use crate::survival::latent::{LatentSurvivalError, validate_unloaded_components_for_loading};
 
     let context = M::context();
     let resolution = M::frailty_policy(row.frailty)?;
-    let LatentFrailtyResolution { sigma, loading } = resolution;
+    let LatentFrailtyResolution { scale, loading } = resolution;
     let n = data.nrows();
     if n == 0 {
         return Err(LatentSurvivalError::InvalidDataset {
@@ -214,7 +213,7 @@ pub fn validate_latent_interval_inputs<M: LatentIntervalModel>(
         )?;
     }
     validate_latent_interval_time_block(context, n, row.time_block)?;
-    Ok(sigma)
+    Ok(scale)
 }
 
 /// The size-mismatch diagnostic. The survival variant carries the
