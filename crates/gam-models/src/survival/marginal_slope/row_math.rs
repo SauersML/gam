@@ -1238,6 +1238,7 @@ mod tests {
     /// mixed blocks that a scalar or block-diagonal check would miss.
     #[test]
     fn runtime_vector_row_program_matches_strongest_hand_mixed_score_vgh_932() {
+        let diagonal = MarginalSlopeCovariance::Diagonal(Array1::from_vec(vec![1.2, 0.9, 0.7]));
         let full = MarginalSlopeCovariance::Full(
             Array2::from_shape_vec(
                 (3, 3),
@@ -1250,6 +1251,8 @@ mod tests {
                 .expect("3x2 covariance factor"),
         );
         let cases = [
+            (&diagonal, 0.0, -0.4, 0.65, 0.95, 0.8),
+            (&diagonal, 1.0, 0.15, -0.55, 1.35, 0.94),
             (&full, 0.0, -0.6, 0.45, 0.85, 0.72),
             (&full, 1.0, 0.3, -0.75, 1.25, 1.0),
             (&low_rank, 0.35, -1.1, 0.8, 0.55, 0.63),
@@ -1346,6 +1349,7 @@ mod tests {
             best
         }
 
+        let diagonal = MarginalSlopeCovariance::Diagonal(Array1::from_vec(vec![1.2, 0.9, 0.7]));
         let full = MarginalSlopeCovariance::Full(
             Array2::from_shape_vec(
                 (3, 3),
@@ -1358,6 +1362,7 @@ mod tests {
                 .expect("3x2 covariance factor"),
         );
         let cases = [
+            ("diagonal", &diagonal, 1.0, 0.15, -0.55, 1.35, 0.94),
             ("full", &full, 1.0, 0.3, -0.75, 1.25, 1.0),
             ("low_rank", &low_rank, 1.0, 0.9, -0.2, 1.6, 0.91),
         ];
