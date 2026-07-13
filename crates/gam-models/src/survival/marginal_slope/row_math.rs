@@ -929,8 +929,8 @@ impl RigidVectorRowWorkspace {
                 }
                 .into());
             }
-            1..=8 => RigidVectorRowBackend::Fixed,
-            9..=13 => RigidVectorRowBackend::Graph(Order2GraphWorkspace::new()),
+            1..=6 => RigidVectorRowBackend::Fixed,
+            7..=13 => RigidVectorRowBackend::Graph(Order2GraphWorkspace::new()),
             14.. => RigidVectorRowBackend::Dynamic(DynamicJetArena::new()),
         };
         Ok(Self {
@@ -1066,8 +1066,8 @@ pub(crate) fn row_primary_closed_form_vector(
         (RigidVectorRowBackend::Fixed, 4) => fixed_row!(7),
         (RigidVectorRowBackend::Fixed, 5) => fixed_row!(8),
         (RigidVectorRowBackend::Fixed, 6) => fixed_row!(9),
-        (RigidVectorRowBackend::Fixed, 7) => fixed_row!(10),
-        (RigidVectorRowBackend::Fixed, 8) => fixed_row!(11),
+        (RigidVectorRowBackend::Graph(graph), 7) => graph_row!(10, graph),
+        (RigidVectorRowBackend::Graph(graph), 8) => graph_row!(11, graph),
         (RigidVectorRowBackend::Graph(graph), 9) => graph_row!(12, graph),
         (RigidVectorRowBackend::Graph(graph), 10) => graph_row!(13, graph),
         (RigidVectorRowBackend::Graph(graph), 11) => graph_row!(14, graph),
@@ -1754,7 +1754,7 @@ mod tests {
                     )
                     .expect("zero-order canonical vector row");
                     if shape_index == 0 && event == 0.0 {
-                        let expected_backend = if k <= 8 { "fixed" } else { "graph" };
+                        let expected_backend = if k <= 6 { "fixed" } else { "graph" };
                         assert_eq!(production_workspace.backend_name(), expected_backend);
                     }
                     let graph = row_primary_closed_form_vector_graph::<DIM>(
@@ -2158,9 +2158,9 @@ mod tests {
         }
     }
 
-    /// Temporary #932 release sweep for every width promoted to the packed
-    /// fixed schedule. This compares every canonical backend directly so the
-    /// production cutoff cannot hide a larger-width stack-probe cost.
+    /// Temporary #932 release sweep across the fixed/graph cutover candidates.
+    /// This compares every canonical backend directly so the production cutoff
+    /// cannot hide a larger-width stack-probe cost.
     #[test]
     fn release_measure_packed_widths_k1_to_k8_vs_strongest_hand_932() {
         use std::hint::black_box;
