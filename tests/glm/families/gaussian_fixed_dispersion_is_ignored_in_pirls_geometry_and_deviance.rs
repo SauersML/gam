@@ -1,11 +1,11 @@
-use gam::solver::pirls::{calculate_deviance, update_glmvectors_by_family};
+use gam::solver::pirls::{calculate_deviance_from_eta, update_glmvectors_by_family};
 use gam::types::{
     GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily,
 };
 use ndarray::array;
 
 #[test]
-fn gaussian_fixed_dispersion_should_scale_working_weight_and_deviance() {
+fn gaussian_fixed_dispersion_scales_working_geometry_but_not_reported_deviance() {
     let likelihood = GlmLikelihoodSpec {
         spec: LikelihoodSpec {
             response: ResponseFamily::Gaussian,
@@ -40,11 +40,18 @@ fn gaussian_fixed_dispersion_should_scale_working_weight_and_deviance() {
         w[0]
     );
 
-    let dev = calculate_deviance(y.view(), &mu, &likelihood, prior.view());
-    let expected_dev = prior[0] * (y[0] - mu[0]).powi(2) / 4.0;
+    let dev = calculate_deviance_from_eta(
+        y.view(),
+        &eta,
+        &likelihood,
+        &likelihood.spec.link,
+        prior.view(),
+    )
+    .expect("Gaussian deviance must be representable");
+    let expected_dev = prior[0] * (y[0] - mu[0]).powi(2);
     assert!(
         (dev - expected_dev).abs() < 1e-12,
-        "Gaussian deviance must divide weighted RSS by fixed dispersion phi (expected {}, got {})",
+        "reported Gaussian deviance must remain unscaled weighted RSS (expected {}, got {})",
         expected_dev,
         dev
     );

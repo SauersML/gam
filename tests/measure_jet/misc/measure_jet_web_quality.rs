@@ -302,7 +302,10 @@ fn measure_jet_extrapolation_variance_for_fit(
 ) -> Array1<f64> {
     let raw = ambient_matrix(data, test);
     let mut total = Array1::<f64>::zeros(test.len());
-    let phi_scale = fit.fit.coefficient_covariance_scale();
+    let covariance_scale = fit
+        .fit
+        .coefficient_covariance_scale()
+        .expect("converged Gaussian measure-jet fixture must resolve its covariance scale");
     for term in &fit.resolvedspec.smooth_terms {
         let SmoothBasisSpec::MeasureJet {
             feature_cols,
@@ -389,7 +392,7 @@ fn measure_jet_extrapolation_variance_for_fit(
                 0.05,
             )
             .expect("measure-jet extrapolation variance for interval gate");
-            total[i] += phi_scale * v;
+            total[i] += covariance_scale * v;
         }
     }
     total

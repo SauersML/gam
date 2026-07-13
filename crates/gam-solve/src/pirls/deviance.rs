@@ -666,21 +666,12 @@ pub(crate) fn deviance_eta_row_with_log_measure_scale(
             if !y.is_finite() {
                 return Err(deviance_row_error(row, "Gaussian response", eta, y));
             }
-            let phi = if matches!(
-                &likelihood.scale,
-                gam_problem::LikelihoodScaleMetadata::ProfiledGaussian
-            ) {
-                // Reported profiled-Gaussian deviance is intentionally the raw
-                // RSS measure; profiling happens in the outer objective.
-                1.0
-            } else {
-                likelihood.fixed_phi().ok_or_else(|| {
-                    deviance_row_error(row, "Gaussian dispersion metadata", eta, f64::NAN)
-                })?
-            };
-            if !(phi.is_finite() && phi > 0.0) {
-                return Err(deviance_row_error(row, "Gaussian dispersion", eta, phi));
-            }
+            // The conventional reported deviance is weighted RSS and therefore
+            // receives `log_measure_scale = 0`.  Exact likelihood/score callers
+            // pass `-log(phi)` through that same explicit channel.  Keeping phi
+            // out of this family branch prevents one row object from silently
+            // changing the reporting estimand while preserving the scaled
+            // Gaussian likelihood geometry.
             let (residual_sign, residual_log_abs) = signed_log_difference(y, eta);
             let half = if residual_sign == 0.0 {
                 0.0
@@ -690,7 +681,7 @@ pub(crate) fn deviance_eta_row_with_log_measure_scale(
                     "Gaussian half-deviance",
                     eta,
                     1.0,
-                    log_weight + 2.0 * residual_log_abs - phi.ln() - std::f64::consts::LN_2,
+                    log_weight + 2.0 * residual_log_abs - std::f64::consts::LN_2,
                 )?
             };
             let score = if residual_sign == 0.0 {
@@ -701,7 +692,7 @@ pub(crate) fn deviance_eta_row_with_log_measure_scale(
                     "Gaussian eta score",
                     eta,
                     -residual_sign,
-                    log_weight + residual_log_abs - phi.ln(),
+                    log_weight + residual_log_abs,
                 )?
             };
             (half, score)
@@ -1143,6 +1134,12 @@ pub(crate) fn deviance_eta_rows_with_log_measure_scale(
             priorweights.len()
         );
     }
+    likelihood.resolved_scale().map_err(|error| {
+        EstimationError::InvalidInput(format!(
+            "{} deviance scale: {error}",
+            likelihood.spec.response.name()
+        ))
+    })?;
     let rows: Vec<Result<DevianceEtaRow, EstimationError>> = (0..eta.len())
         .into_par_iter()
         .map(|i| {
@@ -1563,11 +1560,19 @@ fn eta_log_measure_scale(likelihood: &GlmLikelihoodSpec) -> Result<f64, Estimati
     // Resolve every family, even those whose numeric row scale is one: this is
     // the ownership boundary that rejects contradictory NB/Beta duplicates and
     // non-unit Poisson/Binomial metadata before any parallel output exists.
-    likelihood.resolved_scale().map_err(scale_error)?;
+    let scale = likelihood.resolved_scale().map_err(scale_error)?;
     match &likelihood.spec.response {
-        ResponseFamily::Gamma => likelihood.resolved_gamma_log_shape().map_err(scale_error),
-        ResponseFamily::Tweedie { .. } => likelihood
-            .resolved_tweedie_log_phi()
+        ResponseFamily::Gaussian => scale
+            .gaussian_log_phi()
+            .map(|log_phi| -log_phi)
+            .map_err(|error| {
+                EstimationError::InvalidInput(format!(
+                    "Gaussian eta log-likelihood requires an explicit positive dispersion: {error}"
+                ))
+            }),
+        ResponseFamily::Gamma => scale.gamma_log_shape().map_err(scale_error),
+        ResponseFamily::Tweedie { .. } => scale
+            .tweedie_log_phi()
             .map(|log_phi| -log_phi)
             .map_err(scale_error),
         _ => Ok(0.0),
@@ -2072,13 +2077,6 @@ pub fn evaluate_full_log_likelihood_from_eta(
         );
     }
     let log_measure_scale = eta_log_measure_scale(likelihood)?;
-    if matches!(&likelihood.spec.response, ResponseFamily::Gaussian) {
-        likelihood.resolved_gaussian_log_phi().map_err(|error| {
-            EstimationError::InvalidInput(format!(
-                "fully-normalized Gaussian likelihood requires an explicit positive dispersion: {error}"
-            ))
-        })?;
-    }
     let rows: Vec<Result<f64, EstimationError>> = (0..eta.len())
         .into_par_iter()
         .map(|row| {
