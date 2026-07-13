@@ -6293,9 +6293,12 @@ mod tests {
 
         fn try_row_chunk(
             &self,
-            _rows: Range<usize>,
+            rows: Range<usize>,
         ) -> Result<Array2<f64>, MatrixMaterializationError> {
-            panic!("DirectFillOnlyOperator owned row chunks are forbidden")
+            panic!(
+                "DirectFillOnlyOperator owned row chunk {}..{} is forbidden",
+                rows.start, rows.end
+            )
         }
 
         fn to_dense(&self) -> Array2<f64> {
