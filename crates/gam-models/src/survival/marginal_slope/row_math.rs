@@ -1967,6 +1967,136 @@ mod tests {
         check_width::<16>();
     }
 
+    /// First width beyond the compiled graph's exact u16 axis-mask domain.
+    /// Production must select the dynamic packed lowering without touching the
+    /// graph, while preserving the canonical row expression's complete V/G/H.
+    #[test]
+    fn dynamic_schedule_boundary_k14_matches_strongest_hand_vgh_932() {
+        const K: usize = 14;
+        const DIM: usize = K + 3;
+        let slopes: Vec<f64> = (0..K)
+            .map(|axis| {
+                let magnitude = 0.19 + 0.045 * axis as f64;
+                if axis % 2 == 0 { magnitude } else { -magnitude }
+            })
+            .collect();
+        let scores: Vec<f64> = (0..K)
+            .map(|axis| -1.1 + 2.2 * (axis + 1) as f64 / (K + 1) as f64)
+            .collect();
+        let diagonal = MarginalSlopeCovariance::Diagonal(Array1::from_shape_fn(K, |axis| {
+            0.8 + 0.055 * axis as f64
+        }));
+        let full = MarginalSlopeCovariance::Full(Array2::from_shape_fn((K, K), |(row, col)| {
+            if row == col {
+                1.0 + 0.04 * row as f64
+            } else {
+                0.018 / (1.0 + row.abs_diff(col) as f64)
+            }
+        }));
+        let low_rank =
+            MarginalSlopeCovariance::LowRank(Array2::from_shape_fn((K, 3), |(row, column)| {
+                let sign = if (row + column) % 2 == 0 { 1.0 } else { -1.0 };
+                sign * (0.14 + 0.018 * row as f64 + 0.035 * column as f64)
+            }));
+        let covariances = [diagonal, full, low_rank];
+        let mut production_workspace = RigidVectorRowWorkspace::new();
+        let mut dynamic_arena = DynamicJetArena::new();
+        let initial_graph_nodes = production_workspace.graph.node_count();
+        let initial_dynamic_bytes = production_workspace.dynamic.allocated_bytes();
+
+        let close = |shape: usize, event: f64, channel: &str, actual: f64, expected: f64| {
+            let tolerance = 8.0e-11 * actual.abs().max(expected.abs()).max(1.0);
+            assert!(
+                actual.is_finite()
+                    && expected.is_finite()
+                    && (actual - expected).abs() <= tolerance,
+                "k={K} shape={shape} event={event} {channel}: actual={actual:+.16e}, hand={expected:+.16e}, tolerance={tolerance:.3e}"
+            );
+        };
+
+        for (shape, covariance) in covariances.iter().enumerate() {
+            for event in [0.0, 0.35, 1.0] {
+                let production = row_primary_closed_form_vector(
+                    -0.31,
+                    0.47,
+                    1.09,
+                    &slopes,
+                    &scores,
+                    covariance,
+                    1.17,
+                    event,
+                    1.0e-8,
+                    0.83,
+                    &mut production_workspace,
+                )
+                .expect("production dynamic-boundary row");
+                let dynamic = row_primary_closed_form_vector_dynamic(
+                    -0.31,
+                    0.47,
+                    1.09,
+                    &slopes,
+                    &scores,
+                    covariance,
+                    1.17,
+                    event,
+                    1.0e-8,
+                    0.83,
+                    &mut dynamic_arena,
+                )
+                .expect("direct dynamic-boundary row");
+                let hand = vector_hand_oracle_tests::row_primary_closed_form_vector_hand_reference(
+                    -0.31, 0.47, 1.09, &slopes, &scores, covariance, 1.17, event, 1.0e-8, 0.83,
+                )
+                .expect("strongest-hand dynamic-boundary row");
+
+                close(shape, event, "production value", production.0, hand.0);
+                close(shape, event, "dynamic value", dynamic.0, hand.0);
+                for primary in 0..DIM {
+                    close(
+                        shape,
+                        event,
+                        &format!("production gradient[{primary}]"),
+                        production.1[primary],
+                        hand.1[primary],
+                    );
+                    close(
+                        shape,
+                        event,
+                        &format!("dynamic gradient[{primary}]"),
+                        dynamic.1[primary],
+                        hand.1[primary],
+                    );
+                    for other in 0..DIM {
+                        close(
+                            shape,
+                            event,
+                            &format!("production Hessian[{primary},{other}]"),
+                            production.2[[primary, other]],
+                            hand.2[[primary, other]],
+                        );
+                        close(
+                            shape,
+                            event,
+                            &format!("dynamic Hessian[{primary},{other}]"),
+                            dynamic.2[[primary, other]],
+                            hand.2[[primary, other]],
+                        );
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            production_workspace.graph.node_count(),
+            initial_graph_nodes,
+            "k={K}: dynamic schedule must not record a compiled graph"
+        );
+        assert!(
+            production_workspace.dynamic.allocated_bytes() > initial_dynamic_bytes,
+            "k={K}: production did not select the dynamic packed arena"
+        );
+    }
+
     /// Temporary #932 release measurement for the runtime-width row program.
     /// Correctness remains pinned by
     /// `runtime_vector_row_program_matches_strongest_hand_mixed_score_vgh_932`;
