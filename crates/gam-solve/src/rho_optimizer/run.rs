@@ -1662,7 +1662,31 @@ pub(crate) fn certify_outer_optimality(
     // decrement scales quadratically with ‖g‖ at fixed direction, that bound is
     // `‖Pg‖·√(objective_tol/Δpred)`, which clears the actual ‖Pg‖ iff
     // `Δpred ≤ objective_tol`.
-    if let Some(hessian) = analytic_hessian.as_ref()
+    // #2269 (c) — MEASURED curvature for the gradient-only path. The rescue
+    // above requires a Hessian; objectives on the gradient-only / matrix-free
+    // lane historically had NO rescue and refused at small multiples of the band
+    // (measured post-desync-retry: |Pg| = 8.24e-4 against 3.66e-4 after 14
+    // iterations — 2.25×, with no way to ask whether resolvable descent remains).
+    // With the deterministic-reduction stack the outer criterion is reproducible,
+    // so at tiny ρ-dimension the honest answer is cheap: central differences of
+    // the ANALYTIC gradient (2·n_params extra evals, first-order-accurate in the
+    // gradient so immune to value-noise second-differencing) give a measured
+    // Hessian for the SAME decrement certificate. Computed lazily, only on the
+    // would-refuse path, only when no analytic Hessian exists, and capped at 3
+    // parameters so the cost stays a handful of evaluations. An indefinite
+    // measured Hessian fails the decrement gate (and the certificate's PSD gate)
+    // exactly as an analytic one would — it measures a true minimum, it never
+    // certifies a saddle, and it never enters the advertised derivative contract.
+    const FD_CURVATURE_MAX_PARAMS: usize = 3;
+    let fd_hessian: Option<Array2<f64>> = if analytic_hessian.is_none()
+        && layout.n_params <= FD_CURVATURE_MAX_PARAMS
+        && projected_grad_norm > stationarity_bound
+    {
+        fd_outer_hessian_from_gradient(obj, &result.rho)
+    } else {
+        None
+    };
+    if let Some(hessian) = analytic_hessian.as_ref().or(fd_hessian.as_ref())
         && let Some(predicted_decrease) = newton_predicted_decrease(hessian, &projected_gradient)
         && predicted_decrease.is_finite()
         && predicted_decrease > 0.0
@@ -1693,7 +1717,10 @@ pub(crate) fn certify_outer_optimality(
             projected_grad_norm,
             bound: stationarity_bound,
         },
-        hessian_psd: analytic_hessian.as_ref().and_then(certificate_hessian_is_psd),
+        hessian_psd: analytic_hessian
+            .as_ref()
+            .or(fd_hessian.as_ref())
+            .and_then(certificate_hessian_is_psd),
         lambdas_railed: certificate_railed_lambdas(&result.rho, layout.rho_dim(), config),
     };
     // Install the measured evidence before deciding its verdict.  A rejected
@@ -1898,6 +1925,64 @@ pub enum OperatorTrustRegionStopReason {
     /// caller should consider re-fitting under a different solver class
     /// (e.g. BFGS gradient-only) instead of trusting the partial result.
     RoutingMismatch,
+}
+
+/// Central-difference Hessian of the outer criterion from its ANALYTIC
+/// gradient, for the #2269 gradient-only-path decrement rescue. `None` on any
+/// evaluation failure, length mismatch, or non-finite entry — the caller then
+/// simply has no curvature evidence, exactly as before. The mixed-partial
+/// asymmetry (truncation + residual inner noise) is symmetrized away.
+///
+/// This is the CERTIFICATE's own private measured-curvature evidence: it feeds
+/// only the Newton-decrement gate and the `hessian_psd` check in
+/// `certify_outer_optimality` (it MEASURES whether a reached point is a true
+/// minimum), and NEVER the objective's advertised `DeclaredHessianForm` /
+/// production step direction. A finite-difference Hessian at a saddle is
+/// indefinite, so the PSD gate correctly REFUSES it — it can only rescue a true
+/// minimum the gradient-only path would otherwise reject for lack of curvature
+/// evidence, never false-certify a saddle. Kept private and off the derivative
+/// contract for exactly that reason (#2253).
+fn fd_outer_hessian_from_gradient(
+    obj: &mut dyn OuterObjective,
+    rho: &Array1<f64>,
+) -> Option<Array2<f64>> {
+    let n = rho.len();
+    let mut h_mat = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        // Physically small in log-λ space, comfortably above the inner
+        // solve's certified-band noise on the gradient.
+        let h = 1.0e-3 * (1.0 + rho[i].abs());
+        let mut rho_plus = rho.clone();
+        rho_plus[i] += h;
+        let mut rho_minus = rho.clone();
+        rho_minus[i] -= h;
+        let g_plus = obj
+            .eval_with_order(&rho_plus, OuterEvalOrder::ValueAndGradient)
+            .ok()?
+            .gradient;
+        let g_minus = obj
+            .eval_with_order(&rho_minus, OuterEvalOrder::ValueAndGradient)
+            .ok()?
+            .gradient;
+        if g_plus.len() != n || g_minus.len() != n {
+            return None;
+        }
+        for j in 0..n {
+            let value = (g_plus[j] - g_minus[j]) / (2.0 * h);
+            if !value.is_finite() {
+                return None;
+            }
+            h_mat[[i, j]] = value;
+        }
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let symmetric = 0.5 * (h_mat[[i, j]] + h_mat[[j, i]]);
+            h_mat[[i, j]] = symmetric;
+            h_mat[[j, i]] = symmetric;
+        }
+    }
+    Some(h_mat)
 }
 
 /// Run the outer smoothing-parameter optimization.
