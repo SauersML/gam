@@ -75,10 +75,11 @@ fn checkpoint_banks_resumes_and_discards_across_objectives() {
     let (mut first, flat) = tiny_objective(salt);
     // Ensure no stale file from a crashed previous run of THIS test.
     first.remove_checkpoint();
-    let cost = first
-        .eval_cost(&flat)
-        .expect("tiny circle criterion must evaluate");
-    assert!(cost.is_finite());
+    let banked = first
+        .eval(&flat)
+        .expect("tiny circle authoritative criterion and gradient must evaluate");
+    assert!(banked.cost.is_finite());
+    assert!(banked.gradient.iter().all(|value| value.is_finite()));
     // The eval above recorded a first (improving) cost, which banks a
     // checkpoint through the wired call sites; bank explicitly as well so the
     // assertion does not depend on which eval lane the criterion took.
@@ -98,8 +99,9 @@ fn checkpoint_banks_resumes_and_discards_across_objectives() {
         resumed_rho.is_some(),
         "identical data + schema must resume the banked checkpoint"
     );
+    let resumed_rho = resumed_rho.unwrap();
     assert_eq!(
-        resumed_rho.unwrap().len(),
+        resumed_rho.len(),
         flat.len(),
         "resumed rho must match the outer coordinate length"
     );
@@ -108,6 +110,27 @@ fn checkpoint_banks_resumes_and_discards_across_objectives() {
         resumed_decoder, fitted_decoder,
         "resume must install the banked decoder exactly (value-for-value)"
     );
+    let resumed = second
+        .eval(&resumed_rho)
+        .expect("resumed authoritative criterion and gradient must evaluate");
+    assert_eq!(
+        resumed.cost.to_bits(),
+        banked.cost.to_bits(),
+        "resume must reproduce the banked objective bit-for-bit"
+    );
+    assert_eq!(resumed.gradient.len(), banked.gradient.len());
+    for (coordinate, (&actual, &expected)) in resumed
+        .gradient
+        .iter()
+        .zip(banked.gradient.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            actual.to_bits(),
+            expected.to_bits(),
+            "resume must reproduce banked gradient coordinate {coordinate} bit-for-bit"
+        );
+    }
 
     // Minting a converged fit discards the file; a third job starts cold.
     second.remove_checkpoint();
