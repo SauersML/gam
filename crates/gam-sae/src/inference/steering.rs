@@ -616,7 +616,8 @@ pub struct TargetDoseConfig {
     /// Hard cap on patched-forward probes, including bracket construction.
     pub max_iter: usize,
     /// A probed amplitude counts as inside the readout-KL radius while its
-    /// measured KL matches the local quadratic within this relative tolerance.
+    /// measured KL matches the probe's exact directional local-Fisher dose
+    /// within this relative tolerance.
     pub readout_tol_rel: f64,
 }
 
@@ -670,9 +671,10 @@ pub struct TargetDosePlan {
     /// Number of patched-forward probes consumed (0 without a callback).
     pub iterations: usize,
     /// **READOUT-KL radius**: the largest probed amplitude whose measured KL still
-    /// matched the local quadratic within `readout_tol_rel` before the first
-    /// probed failure. A later accidental match cannot extend the radius past a
-    /// failed point. `None` without a callback or when the first probe failed.
+    /// matched its exact directional local-Fisher dose within `readout_tol_rel`
+    /// before the first probed failure. A later accidental match cannot extend
+    /// the radius past a failed point. `None` without a callback or when the
+    /// first probe failed.
     pub readout_kl_radius: Option<f64>,
 }
 

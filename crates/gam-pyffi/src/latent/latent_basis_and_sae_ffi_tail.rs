@@ -1704,7 +1704,7 @@ struct SteerToTargetArraysRequest<'a> {
 
 /// Typed extraction of the public `ManifoldSaeCore.steer_to_target` mapping.
 /// Every dose and solver field is required; optionality belongs only to the
-/// separate patched-forward probe.
+/// separate plan-aware applied-dose probe.
 struct ManifoldSteerToTargetRequest {
     atom_k: usize,
     metric_row: usize,
