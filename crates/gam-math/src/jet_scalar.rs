@@ -98,18 +98,12 @@ where
     let mut out = constant(0.0);
     for row in 0..inputs.len() {
         let diagonal = mul(&inputs[row], &inputs[row]);
-        out = add(
-            &out,
-            &scale(&diagonal, coefficients.coefficient(row, row)),
-        );
+        out = add(&out, &scale(&diagonal, coefficients.coefficient(row, row)));
         for column in row + 1..inputs.len() {
             let cross = mul(&inputs[row], &inputs[column]);
             out = add(
                 &out,
-                &scale(
-                    &cross,
-                    2.0 * coefficients.coefficient(row, column),
-                ),
+                &scale(&cross, 2.0 * coefficients.coefficient(row, column)),
             );
         }
     }
@@ -352,9 +346,8 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
         assert_eq!(inputs.len(), coefficients.dimension());
         // `FixedRuntimeJet` is `repr(transparent)` over `S`, so a slice has the
         // same element layout, alignment, length, and provenance.
-        let inner = unsafe {
-            std::slice::from_raw_parts(inputs.as_ptr().cast::<S>(), inputs.len())
-        };
+        let inner =
+            unsafe { std::slice::from_raw_parts(inputs.as_ptr().cast::<S>(), inputs.len()) };
         Self {
             inner: S::symmetric_quadratic_form(inner, coefficients),
         }
@@ -770,8 +763,7 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
                 let mut inherited = 0.0;
                 let mut curvature = 0.0;
                 for row in 0..input_dimension {
-                    inherited +=
-                        projected[row] * inputs[row].h[primary_a * dimension + primary_b];
+                    inherited += projected[row] * inputs[row].h[primary_a * dimension + primary_b];
                     for column in 0..input_dimension {
                         curvature += coefficients.coefficient(row, column)
                             * inputs[row].g[primary_a]
@@ -3846,6 +3838,125 @@ mod tests {
     use super::*;
     use crate::jet_tower::{RowProgram, Tower4, program_full_tower};
     use crate::nested_dual::JetField;
+
+    struct DenseSymmetric3([[f64; 3]; 3]);
+
+    impl SymmetricQuadraticCoefficients for DenseSymmetric3 {
+        fn dimension(&self) -> usize {
+            3
+        }
+
+        fn multiply(&self, input: &[f64], output: &mut [f64]) {
+            assert_eq!(input.len(), 3);
+            assert_eq!(output.len(), 3);
+            for (row, output) in output.iter_mut().enumerate() {
+                *output = (0..3)
+                    .map(|column| self.0[row][column] * input[column])
+                    .sum();
+            }
+        }
+
+        fn coefficient(&self, row: usize, column: usize) -> f64 {
+            self.0[row][column]
+        }
+    }
+
+    #[test]
+    fn symmetric_quadratic_order2_lowerings_match_scalar_program() {
+        const K: usize = 4;
+        let coefficients = DenseSymmetric3([[1.2, 0.3, -0.2], [0.3, 0.8, 0.15], [-0.2, 0.15, 1.5]]);
+        let values = [0.4, -0.7, 1.1, 0.25];
+        let fixed_vars: [Order2<K>; K] =
+            std::array::from_fn(|axis| Order2::variable(values[axis], axis));
+        let fixed_inputs = [
+            fixed_vars[0].mul(&fixed_vars[1]).add(&fixed_vars[3]),
+            fixed_vars[1].exp().add(&fixed_vars[2].scale(0.4)),
+            fixed_vars[2].mul(&fixed_vars[2]).sub(&fixed_vars[0]),
+        ];
+        let fixed_direct = Order2::symmetric_quadratic_form(&fixed_inputs, &coefficients);
+        let fixed_scalar = symmetric_quadratic_form_default(
+            &fixed_inputs,
+            &coefficients,
+            Order2::constant,
+            JetField::add,
+            JetField::mul,
+            JetField::scale,
+        );
+
+        let arena = DynamicJetArena::new();
+        let dynamic_vars: [DynamicOrder2<'_>; K] =
+            std::array::from_fn(|axis| DynamicOrder2::variable(values[axis], axis, K, &arena));
+        let dynamic_inputs = [
+            dynamic_vars[0].mul(&dynamic_vars[1]).add(&dynamic_vars[3]),
+            dynamic_vars[1].exp().add(&dynamic_vars[2].scale(0.4)),
+            dynamic_vars[2].mul(&dynamic_vars[2]).sub(&dynamic_vars[0]),
+        ];
+        let dynamic_direct =
+            DynamicOrder2::symmetric_quadratic_form(&dynamic_inputs, &coefficients, K, &arena);
+        let dynamic_scalar = symmetric_quadratic_form_default(
+            &dynamic_inputs,
+            &coefficients,
+            |value| DynamicOrder2::constant(value, K, &arena),
+            RuntimeJetScalar::add,
+            RuntimeJetScalar::mul,
+            RuntimeJetScalar::scale,
+        );
+
+        let tolerance = 2.0e-13;
+        for (label, actual, expected) in [
+            ("fixed value", fixed_direct.value(), fixed_scalar.value()),
+            (
+                "dynamic value",
+                dynamic_direct.value(),
+                dynamic_scalar.value(),
+            ),
+        ] {
+            assert!(
+                (actual - expected).abs() <= tolerance * actual.abs().max(expected.abs()).max(1.0),
+                "{label}: direct={actual:+.16e}, scalar={expected:+.16e}"
+            );
+        }
+        for primary_a in 0..K {
+            for (label, actual, expected) in [
+                (
+                    "fixed gradient",
+                    fixed_direct.g()[primary_a],
+                    fixed_scalar.g()[primary_a],
+                ),
+                (
+                    "dynamic gradient",
+                    dynamic_direct.g()[primary_a],
+                    dynamic_scalar.g()[primary_a],
+                ),
+            ] {
+                assert!(
+                    (actual - expected).abs()
+                        <= tolerance * actual.abs().max(expected.abs()).max(1.0),
+                    "{label}[{primary_a}]: direct={actual:+.16e}, scalar={expected:+.16e}"
+                );
+            }
+            for primary_b in 0..K {
+                for (label, actual, expected) in [
+                    (
+                        "fixed Hessian",
+                        fixed_direct.h()[primary_a][primary_b],
+                        fixed_scalar.h()[primary_a][primary_b],
+                    ),
+                    (
+                        "dynamic Hessian",
+                        dynamic_direct.h_at(primary_a, primary_b),
+                        dynamic_scalar.h_at(primary_a, primary_b),
+                    ),
+                ] {
+                    assert!(
+                        (actual - expected).abs()
+                            <= tolerance * actual.abs().max(expected.abs()).max(1.0),
+                        "{label}[{primary_a},{primary_b}]: direct={actual:+.16e}, scalar={expected:+.16e}"
+                    );
+                }
+            }
+        }
+    }
 
     /// A small polynomial-plus-unary row expression written ONCE, generically
     /// over `S: JetScalar<2>`, so it can be evaluated against every scalar:
