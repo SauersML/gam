@@ -2488,6 +2488,48 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     Ok(eval_result)
 }
 
+/// Re-evaluate the exact profiled criterion on an already-converged coefficient
+/// mode without entering the inner optimizer again.
+///
+/// Spatial joint optimization realizes every non-smoothing hyperparameter in
+/// `family` and `specs` before calling the custom-family evaluator.  Once that
+/// geometry is fixed, derivative blocks describe how the geometry moves; they
+/// do not contribute an additional scalar value.  Supplying zero derivative
+/// axes here therefore evaluates the same value at the realized full-theta
+/// point while retaining the complete value pipeline: projected penalty
+/// log-determinants, the KKT profile correction, and the gated Jeffreys/Firth
+/// value and Hessian log-determinant all remain active.
+///
+/// Taking ownership of `inner` is load-bearing.  The returned carrier owns the
+/// exact mode used for the replay, so a certified finalizer can continue to fit
+/// assembly without a warm restart selecting another coefficient basin.
+pub(crate) fn evaluate_custom_family_profile_objective_from_inner<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    rho_current: &Array1<f64>,
+    inner: BlockwiseInnerResult,
+) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
+    let penalty_counts = validate_blockspecs(specs)?;
+    let derivative_blocks: SharedDerivativeBlocks =
+        Arc::new((0..specs.len()).map(|_| Vec::new()).collect());
+    evaluate_custom_family_hyper_internal_shared(
+        family,
+        specs,
+        options,
+        &penalty_counts,
+        rho_current,
+        derivative_blocks,
+        None,
+        gam_problem::RhoPrior::Flat,
+        EvalMode::ValueOnly,
+        EvalMode::ValueOnly,
+        Some(inner),
+    )
+}
+
 pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
