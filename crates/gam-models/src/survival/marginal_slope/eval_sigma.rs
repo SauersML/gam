@@ -37,9 +37,8 @@ impl SurvivalMarginalSlopeFamily {
             .map(|opt| opt.unwrap_or(0.0));
             return total;
         }
-        // True fast path: K=1 keeps the original scalar closed form; K>1
-        // uses the covariance-aware vector likelihood. Rigid derivative
-        // paths are derived from the canonical RowProgram expression.
+        // True fast path: K=1 uses the packed lowering of the canonical row
+        // program; K>1 uses the covariance-aware vector likelihood.
         let guard = self.derivative_guard;
         let probit_scale = self.probit_frailty_scale();
         let score_dim = self.score_dim();

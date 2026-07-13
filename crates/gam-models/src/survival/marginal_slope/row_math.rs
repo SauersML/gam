@@ -1,7 +1,6 @@
-//! Closed-form per-row marginal-slope kernel mathematics: the rigid/shared/
-//! vector closed forms, the analytic derivative helpers (`c_derivatives`,
-//! `neglog_derivatives`), the pilot-eta geometry solvers, the public vector
-//! NLL/eta/scale helpers, latent-z standardization, and the eval cache.
+//! Per-row marginal-slope mathematics: the canonical rigid row-program
+//! lowering, vector score geometry, analytic primitive helpers, pilot-eta
+//! solvers, latent-z standardization, and the evaluation cache.
 
 use super::*;
 
@@ -14,8 +13,9 @@ use super::*;
 // with η₀ = q₀c + s_f g z, η₁ = q₁c + s_f g z, a'₁ = qd₁·c,
 // c = √(1 + (s_f g)²), s_f = 1/√(1+σ²).
 //
-// All derivatives w.r.t. the 4 primary scalars (q₀, q₁, qd₁, g) are
-// closed-form scalar formulas. No jets, no per-row heap allocation.
+// The K=1 value/gradient/Hessian is lowered from `rigid_row_nll` at the packed
+// `SparseOrder2` scalar. It remains stack-only while sharing one mathematical
+// expression with the higher-order and CUDA schedules.
 
 #[inline]
 pub(crate) fn rigid_observed_logslope(g: f64, probit_scale: f64) -> f64 {
