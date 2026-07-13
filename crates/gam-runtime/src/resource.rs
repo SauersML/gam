@@ -33,29 +33,164 @@ pub const OWNED_DATA_CACHE_MAX_ENTRIES: usize = 2;
 const GOVERNOR_BUDGET_NUMERATOR: u128 = 3;
 const GOVERNOR_BUDGET_DENOMINATOR: u128 = 4;
 
-/// Convert detected host/cgroup availability to the one process budget.
+/// Which observation is the binding ceiling on memory available to this
+/// process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryAvailabilitySource {
+    Host,
+    Cgroup,
+}
+
+impl std::fmt::Display for MemoryAvailabilitySource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Host => formatter.write_str("host"),
+            Self::Cgroup => formatter.write_str("cgroup"),
+        }
+    }
+}
+
+/// The current process' cgroup memory observation.
 ///
-/// A reported zero is a real exhausted-memory signal and deliberately yields
-/// a zero budget.  In particular, it must never be replaced by a guessed
-/// positive allowance: doing so is exactly how a process in an exhausted
-/// cgroup gets killed by the kernel.
-fn governor_budget_from_available(host_available: u64, cgroup_available: Option<u64>) -> usize {
-    let available = cgroup_available
-        .map(|cgroup| host_available.min(cgroup))
-        .unwrap_or(host_available);
-    let scaled = u128::from(available) * GOVERNOR_BUDGET_NUMERATOR / GOVERNOR_BUDGET_DENOMINATOR;
+/// `available_bytes == 0` is an authoritative exhaustion signal. An absent or
+/// unlimited controller is represented by no cgroup observation, never by a
+/// fabricated zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CgroupMemoryAvailability {
+    total_bytes: u64,
+    available_bytes: u64,
+    resident_bytes: u64,
+}
+
+impl CgroupMemoryAvailability {
+    pub const fn total_bytes(self) -> u64 {
+        self.total_bytes
+    }
+
+    pub const fn available_bytes(self) -> u64 {
+        self.available_bytes
+    }
+
+    pub const fn resident_bytes(self) -> u64 {
+        self.resident_bytes
+    }
+}
+
+/// Provenance-preserving memory availability for the current process.
+///
+/// The admitted value is exactly `min(host, cgroup)` when a cgroup observation
+/// exists, otherwise the host value. In particular, a genuine cgroup zero is
+/// preserved and can never turn into a positive host allowance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryAvailability {
+    host_available_bytes: u64,
+    cgroup: Option<CgroupMemoryAvailability>,
+    available_bytes: u64,
+    limiting_source: MemoryAvailabilitySource,
+}
+
+impl MemoryAvailability {
+    fn from_observation(
+        host_available_bytes: u64,
+        cgroup: Option<CgroupMemoryAvailability>,
+    ) -> Self {
+        let (available_bytes, limiting_source) = match cgroup {
+            Some(observation) if observation.available_bytes < host_available_bytes => (
+                observation.available_bytes,
+                MemoryAvailabilitySource::Cgroup,
+            ),
+            _ => (host_available_bytes, MemoryAvailabilitySource::Host),
+        };
+        Self {
+            host_available_bytes,
+            cgroup,
+            available_bytes,
+            limiting_source,
+        }
+    }
+
+    pub const fn host_available_bytes(self) -> u64 {
+        self.host_available_bytes
+    }
+
+    pub const fn cgroup(self) -> Option<CgroupMemoryAvailability> {
+        self.cgroup
+    }
+
+    pub const fn available_bytes(self) -> u64 {
+        self.available_bytes
+    }
+
+    pub fn available_bytes_usize(self) -> usize {
+        usize::try_from(self.available_bytes).unwrap_or(usize::MAX)
+    }
+
+    pub const fn limiting_source(self) -> MemoryAvailabilitySource {
+        self.limiting_source
+    }
+}
+
+impl std::fmt::Display for MemoryAvailability {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.cgroup {
+            Some(cgroup) => write!(
+                formatter,
+                "{} bytes limited by {} (host_available={}, cgroup_available={}, cgroup_total={}, cgroup_resident={})",
+                self.available_bytes,
+                self.limiting_source,
+                self.host_available_bytes,
+                cgroup.available_bytes,
+                cgroup.total_bytes,
+                cgroup.resident_bytes,
+            ),
+            None => write!(
+                formatter,
+                "{} bytes limited by host (no finite cgroup observation)",
+                self.available_bytes,
+            ),
+        }
+    }
+}
+
+/// Refresh and return the OS and cgroup observations that govern process
+/// memory admission. This is the single system-memory authority shared by the
+/// global governor and specialized runtime planners.
+pub fn detect_memory_availability() -> MemoryAvailability {
+    static SYSTEM: OnceLock<Mutex<sysinfo::System>> = OnceLock::new();
+    let system = SYSTEM.get_or_init(|| Mutex::new(sysinfo::System::new()));
+    let mut system = system.lock().expect("sysinfo system mutex poisoned");
+    system.refresh_memory();
+    let cgroup = system.cgroup_limits().map(|limits| CgroupMemoryAvailability {
+        total_bytes: limits.total_memory,
+        available_bytes: limits.free_memory,
+        resident_bytes: limits.rss,
+    });
+    MemoryAvailability::from_observation(system.available_memory(), cgroup)
+}
+
+/// Convert one provenance-preserving availability observation to the process
+/// budget. Zero is an authoritative exhausted-memory signal and deliberately
+/// yields a zero budget.
+fn governor_budget_from_availability(availability: MemoryAvailability) -> usize {
+    let scaled = u128::from(availability.available_bytes()) * GOVERNOR_BUDGET_NUMERATOR
+        / GOVERNOR_BUDGET_DENOMINATOR;
     usize::try_from(scaled).unwrap_or(usize::MAX)
 }
 
-fn detect_governor_budget_bytes() -> usize {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    // Containers: the cgroup allowance is the real ceiling regardless of what
-    // the host machine has available. `Some(0)` is intentionally preserved.
-    governor_budget_from_available(
-        sys.available_memory(),
-        sys.cgroup_limits().map(|limits| limits.free_memory),
-    )
+/// Origin of a governor budget, retained in every typed refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryBudgetSource {
+    Detected(MemoryAvailability),
+    Explicit,
+}
+
+impl std::fmt::Display for MemoryBudgetSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Detected(availability) => write!(formatter, "detected {availability}"),
+            Self::Explicit => formatter.write_str("explicit test budget"),
+        }
+    }
 }
 
 /// Typed refusal from [`MemoryGovernor::try_reserve`].
@@ -68,13 +203,14 @@ fn detect_governor_budget_bytes() -> usize {
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum MemoryReservationError {
     #[error(
-        "{context}: cannot reserve {requested_bytes} bytes; {reserved_bytes} of {budget_bytes} bytes already reserved process-wide"
+        "{context}: cannot reserve {requested_bytes} bytes; {reserved_bytes} of {budget_bytes} bytes already reserved process-wide; budget source: {budget_source}"
     )]
     BudgetExceeded {
         context: Box<str>,
         requested_bytes: usize,
         reserved_bytes: usize,
         budget_bytes: usize,
+        budget_source: MemoryBudgetSource,
     },
 
     #[error(
@@ -91,6 +227,7 @@ pub enum MemoryReservationError {
 #[derive(Debug)]
 struct GovernorLedger {
     budget_bytes: usize,
+    budget_source: MemoryBudgetSource,
     reserved_bytes: std::sync::atomic::AtomicUsize,
 }
 
@@ -119,7 +256,17 @@ impl MemoryGovernor {
     /// The process-wide governor. Budget detection runs once, on first use.
     pub fn global() -> &'static MemoryGovernor {
         static GLOBAL: OnceLock<MemoryGovernor> = OnceLock::new();
-        GLOBAL.get_or_init(|| MemoryGovernor::with_budget(detect_governor_budget_bytes()))
+        GLOBAL.get_or_init(|| {
+            let availability = detect_memory_availability();
+            MemoryGovernor::with_detected_availability(availability)
+        })
+    }
+
+    fn with_detected_availability(availability: MemoryAvailability) -> Self {
+        Self::with_budget_source(
+            governor_budget_from_availability(availability),
+            MemoryBudgetSource::Detected(availability),
+        )
     }
 
     /// Construct a ledger with an explicit budget. Private: production code
@@ -127,9 +274,14 @@ impl MemoryGovernor {
     /// [`global`](Self::global), which calls this exactly once with the
     /// detected budget. Unit tests use it for isolated ledgers.
     fn with_budget(budget_bytes: usize) -> Self {
+        Self::with_budget_source(budget_bytes, MemoryBudgetSource::Explicit)
+    }
+
+    fn with_budget_source(budget_bytes: usize, budget_source: MemoryBudgetSource) -> Self {
         Self {
             ledger: Arc::new(GovernorLedger {
                 budget_bytes,
+                budget_source,
                 reserved_bytes: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
@@ -137,6 +289,10 @@ impl MemoryGovernor {
 
     pub fn budget_bytes(&self) -> usize {
         self.ledger.budget_bytes
+    }
+
+    pub fn budget_source(&self) -> MemoryBudgetSource {
+        self.ledger.budget_source
     }
 
     pub fn reserved_bytes(&self) -> usize {
@@ -180,6 +336,7 @@ impl MemoryGovernor {
                         requested_bytes: bytes,
                         reserved_bytes: current,
                         budget_bytes: self.ledger.budget_bytes,
+                        budget_source: self.ledger.budget_source,
                     });
                 }
             };
@@ -1059,6 +1216,7 @@ mod resource_policy_tests {
                 requested_bytes: 600,
                 reserved_bytes: 600,
                 budget_bytes: 1_000,
+                budget_source: MemoryBudgetSource::Explicit,
             }
         );
         // After releasing the holder, the same request succeeds: refusal is a
@@ -1153,10 +1311,70 @@ mod resource_policy_tests {
     }
 
     #[test]
-    fn budget_derivation_honors_zero_and_cgroup_limits() {
-        assert_eq!(governor_budget_from_available(1_000, None), 750);
-        assert_eq!(governor_budget_from_available(1_000, Some(400)), 300);
-        assert_eq!(governor_budget_from_available(1_000, Some(0)), 0);
-        assert_eq!(governor_budget_from_available(0, None), 0);
+    fn memory_availability_distinguishes_host_cgroup_and_exhaustion() {
+        let host_only = MemoryAvailability::from_observation(1_000, None);
+        assert_eq!(host_only.available_bytes(), 1_000);
+        assert_eq!(host_only.limiting_source(), MemoryAvailabilitySource::Host);
+        assert_eq!(governor_budget_from_availability(host_only), 750);
+
+        let finite_cgroup = MemoryAvailability::from_observation(
+            1_000,
+            Some(CgroupMemoryAvailability {
+                total_bytes: 600,
+                available_bytes: 400,
+                resident_bytes: 200,
+            }),
+        );
+        assert_eq!(finite_cgroup.available_bytes(), 400);
+        assert_eq!(
+            finite_cgroup.limiting_source(),
+            MemoryAvailabilitySource::Cgroup
+        );
+        assert_eq!(governor_budget_from_availability(finite_cgroup), 300);
+
+        let exhausted_cgroup = MemoryAvailability::from_observation(
+            1_000,
+            Some(CgroupMemoryAvailability {
+                total_bytes: 600,
+                available_bytes: 0,
+                resident_bytes: 600,
+            }),
+        );
+        assert_eq!(exhausted_cgroup.available_bytes(), 0);
+        assert_eq!(
+            exhausted_cgroup.limiting_source(),
+            MemoryAvailabilitySource::Cgroup
+        );
+        assert_eq!(governor_budget_from_availability(exhausted_cgroup), 0);
+
+        let host_is_tighter = MemoryAvailability::from_observation(
+            1_000,
+            Some(CgroupMemoryAvailability {
+                total_bytes: 8_000,
+                available_bytes: 6_000,
+                resident_bytes: 2_000,
+            }),
+        );
+        assert_eq!(host_is_tighter.available_bytes(), 1_000);
+        assert_eq!(
+            host_is_tighter.limiting_source(),
+            MemoryAvailabilitySource::Host
+        );
+    }
+
+    #[test]
+    fn compressed_macos_observation_keeps_xnu_available_memory_positive() {
+        // #2316's healthy 8 GiB macOS host had more compressed than
+        // free+inactive pages. sysinfo 0.33 subtracted compressor pages and
+        // saturated to zero; 0.38 follows XNU and reports
+        // (active + inactive + free) * page_size.
+        let xnu_available = (75_514_u64 + 69_056 + 3_802) * 16_384;
+        assert_eq!(xnu_available, 2_430_926_848);
+        let availability = MemoryAvailability::from_observation(xnu_available, None);
+        assert_eq!(availability.available_bytes(), xnu_available);
+        assert_eq!(
+            governor_budget_from_availability(availability),
+            1_823_195_136
+        );
     }
 }

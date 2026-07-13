@@ -827,25 +827,26 @@ mod vector_hand_oracle_tests {
     }
 }
 
-const RIGID_VECTOR_FEATURE_DIMENSION: usize = 5;
-const FEATURE_Q0: usize = 0;
-const FEATURE_Q1: usize = 1;
-const FEATURE_QD1: usize = 2;
-const FEATURE_LINEAR: usize = 3;
-const FEATURE_VARIANCE: usize = 4;
+pub(crate) const RIGID_FEATURE_DIMENSION: usize = 5;
+pub(crate) const FEATURE_Q0: usize = 0;
+pub(crate) const FEATURE_Q1: usize = 1;
+pub(crate) const FEATURE_QD1: usize = 2;
+pub(crate) const FEATURE_LINEAR: usize = 3;
+pub(crate) const FEATURE_VARIANCE: usize = 4;
 
-// The only vector-row likelihood declaration. Both consumers below are emitted
-// from this parsed SSA: `*_runtime` accepts feature jets carrying the oracle's
-// runtime primary width, while `*_order2` differentiates the same expression in
-// the five semantic features `(q0, q1, qd1, L, V)`. Production then applies the
-// universal order-two feature pullback; no family derivative formula is kept in
-// parallel with this program.
+// The only rigid-row likelihood declaration. Every scalar/shared and vector
+// consumer is emitted from this parsed SSA in the five semantic features
+// `(q0, q1, qd1, L, V)`: generic jets carry any compile-time derivative width,
+// runtime jets carry the vector oracle's dynamic width, direct order two feeds
+// the universal feature pullback, the sliced witness surface owns admission,
+// and CUDA feeds the mechanical 5->4 device pullback. No family likelihood
+// expression exists outside this declaration.
 row_program! {
-    fn rigid_vector_feature_program(
+    pub(crate) fn rigid_feature_program(
         q0, q1, qd1, linear, variance;
         wi, di, probit_scale
     )
-    emit [runtime, order2];
+    emit [generic, runtime, order2, witnesses, cuda];
     leaves {
         sqrt => unary_derivatives_sqrt => d_sqrt,
         neglog_phi => unary_derivatives_neglog_phi => neglog_phi_stack,
@@ -925,8 +926,8 @@ fn validated_vector_variance(raw_variance: f64, probit_scale: f64) -> Result<f64
 }
 
 #[inline(always)]
-fn rigid_vector_feature_nll<'arena, S>(
-    features: &[S; RIGID_VECTOR_FEATURE_DIMENSION],
+fn rigid_feature_runtime_nll<'arena, S>(
+    features: &[S; RIGID_FEATURE_DIMENSION],
     inputs: &RigidRowInputs,
     dimension: usize,
     workspace: &'arena S::Workspace,
@@ -935,7 +936,7 @@ where
     S: RuntimeJetScalar<'arena>,
 {
     validate_vector_probit_scale(inputs)?;
-    let (nll, [neg_eta0, neg_eta1, adjusted_derivative]) = rigid_vector_feature_program_runtime(
+    let (nll, [neg_eta0, neg_eta1, adjusted_derivative]) = rigid_feature_program_runtime(
         &features[FEATURE_Q0],
         &features[FEATURE_Q1],
         &features[FEATURE_QD1],
@@ -960,7 +961,7 @@ where
 /// Runtime-width correctness oracle for independent score slopes.
 ///
 /// The covariance representation changes only how `(L, V)` are constructed.
-/// Every likelihood operation is delegated to the `rigid_vector_feature_program`
+/// Every likelihood operation is delegated to the `rigid_feature_program`
 /// row-program declaration, whose runtime lowering lets these five features carry
 /// the full primary width.
 fn rigid_vector_row_nll<'arena, S>(
@@ -1021,7 +1022,7 @@ where
         linear,
         variance,
     ];
-    rigid_vector_feature_nll(&features, inputs, dimension, workspace)
+    rigid_feature_runtime_nll(&features, inputs, dimension, workspace)
 }
 
 #[inline]
@@ -1059,7 +1060,7 @@ fn checked_vector_workspace_layout(
         }
         .to_string()
     })?;
-    let jacobian_cells = RIGID_VECTOR_FEATURE_DIMENSION
+    let jacobian_cells = RIGID_FEATURE_DIMENSION
         .checked_mul(dimension)
         .ok_or_else(|| SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: format!(
@@ -1164,7 +1165,7 @@ fn bound_covariance_matvec_into(
 /// feature pair. The callback owns the feature map's intrinsic Hessians, keeping
 /// the chain rule independent of covariance representation.
 #[inline(always)]
-fn order2_feature_pullback_into<const FEATURES: usize>(
+pub(crate) fn order2_feature_pullback_into<const FEATURES: usize>(
     feature_gradient: &[f64; FEATURES],
     feature_hessian: &[[f64; FEATURES]; FEATURES],
     jacobian: &[f64],
@@ -1211,7 +1212,7 @@ fn order2_feature_pullback_into<const FEATURES: usize>(
 #[inline(always)]
 fn add_weighted_variance_hessian(
     covariance: &MarginalSlopeCovariance,
-    feature_gradient: &[f64; RIGID_VECTOR_FEATURE_DIMENSION],
+    feature_gradient: &[f64; RIGID_FEATURE_DIMENSION],
     dimension: usize,
     hessian: &mut [f64],
 ) {
@@ -1333,7 +1334,7 @@ pub(crate) fn row_primary_closed_form_vector_into(
         qd1_lower: derivative_guard,
     };
     let (value, feature_gradient, feature_hessian, [neg_eta0, neg_eta1, adjusted_derivative]) =
-        rigid_vector_feature_program_order2(q0, q1, qd1, linear, raw_variance, w, d, probit_scale);
+        rigid_feature_program_order2(q0, q1, qd1, linear, raw_variance, w, d, probit_scale);
     validate_rigid_row_admission(qd1, &inputs, neg_eta0, neg_eta1, adjusted_derivative)?;
 
     let (gradient, hessian) = derivative_cells.split_at_mut(dimension);

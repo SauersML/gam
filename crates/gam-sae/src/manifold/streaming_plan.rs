@@ -2,7 +2,7 @@ use super::*;
 
 pub(crate) const SAE_BYTES_PER_F64: usize = 8;
 
-pub(crate) const SAE_HOST_IN_CORE_FALLBACK_BYTES: usize = 2 * 1024 * 1024 * 1024;
+pub(crate) const SAE_HOST_IN_CORE_USEFUL_WORK_FLOOR_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 pub(crate) const SAE_HOST_MEMORY_BUDGET_FRACTION_NUMERATOR: usize = 3;
 
@@ -40,18 +40,6 @@ pub(crate) const SAE_HOST_MEMORY_RESERVE_FLOOR_BYTES: usize = 256 * 1024 * 1024;
 /// the exact device-aware budget as before.
 pub(crate) const SAE_MIN_DEVICE_POOL_IN_CORE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-/// Absolute floor for the *matrix-free streaming* admission test. The chunked
-/// matrix-free plan exists precisely to bound peak memory by the chunk window
-/// rather than the full problem, so it must stay admittable even when the
-/// in-core budget collapses to ~0 (memory-starved / oversubscribed box, or a
-/// cgroup whose `available − reserve` underflows to zero). A starved box can
-/// always afford a few chunk windows plus the border vector workspace; gating
-/// streaming on the same budget as the dense direct plan would refuse the one
-/// plan that was designed to run there. The dense direct path keeps gating on
-/// the real budget — it can genuinely OOM — so this floor only ever relaxes the
-/// streaming fallback, never admits a full-batch in-core solve.
-pub(crate) const SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES: usize = 64 * 1024 * 1024;
-
 /// Absolute size below which a *direct* (dense, full-batch) plan is always
 /// admissible provided it fits the reported available memory, regardless of the
 /// headroom-reserved in-core budget. The budget subtracts a flat `max(available/8,
@@ -74,7 +62,7 @@ pub struct SaeStreamingPlan {
     pub estimated_direct_peak_bytes: usize,
     pub estimated_matrix_free_peak_bytes: usize,
     pub in_core_budget_bytes: usize,
-    pub host_available_bytes: usize,
+    pub process_available_bytes: usize,
     pub direct_admitted: bool,
     pub matrix_free_admitted: bool,
 }
@@ -87,7 +75,7 @@ pub(crate) fn sae_streaming_plan_from_budget(
     border_dim: usize,
     in_core_budget_bytes: usize,
     chunk_window_bytes: usize,
-    host_available_bytes: usize,
+    process_available_bytes: usize,
 ) -> SaeStreamingPlan {
     let per_row_words = total_basis
         .saturating_mul(1 + d_max)
@@ -117,9 +105,7 @@ pub(crate) fn sae_streaming_plan_from_budget(
     let direct_peak_bytes = full_batch_bytes
         .saturating_add(row_cross_bytes)
         .saturating_add(dense_schur_bytes);
-    // Matrix-free streaming budget, floored so the chunked/sparse plan stays
-    // admittable on a starved box (see SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES).
-    let matrix_free_budget = in_core_budget_bytes.max(SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES);
+    let matrix_free_budget = in_core_budget_bytes;
     let chunk_resident_bytes = chunk_window_bytes.min(full_batch_bytes.max(per_row_bytes));
     let border_vector_bytes = border_dim
         .saturating_mul(SAE_BYTES_PER_F64)
@@ -163,15 +149,12 @@ pub(crate) fn sae_streaming_plan_from_budget(
     // fallback). It only ever admits plans too small to OOM, so large plans stay
     // gated on the real budget and still stream.
     let direct_fits_tiny = direct_peak_bytes <= SAE_DIRECT_ALWAYS_ADMIT_BYTES
-        && direct_peak_bytes <= host_available_bytes;
+        && direct_peak_bytes <= process_available_bytes;
     let direct_admitted = direct_peak_bytes <= in_core_budget_bytes || direct_fits_tiny;
-    // The matrix-free streaming plan is the bounded-memory fallback: its peak is
-    // the chunk window plus the row-cross and border-vector workspace, not the
-    // full batch. Admit it against the larger of the in-core budget and an
-    // absolute streaming floor so a starved box (budget collapsed to ~0) can
-    // still run the plan that was designed for exactly that regime. The direct
-    // (dense, full-batch) admission above is intentionally NOT floored — it can
-    // OOM, so it stays gated on the real budget.
+    // Matrix-free streaming bounds its peak to the chunk, row-cross and border
+    // workspaces, but it is still a real allocation. Admit it against the same
+    // authoritative process budget: a genuine zero means exhausted memory,
+    // not permission to manufacture a positive allowance.
     let matrix_free_admitted = matrix_free_peak_bytes <= matrix_free_budget;
     let rows_per_chunk = (chunk_window_bytes / per_row_bytes).max(SAE_MIN_STREAMING_CHUNK_ROWS);
     SaeStreamingPlan {
@@ -187,7 +170,7 @@ pub(crate) fn sae_streaming_plan_from_budget(
         estimated_direct_peak_bytes: direct_peak_bytes,
         estimated_matrix_free_peak_bytes: matrix_free_peak_bytes,
         in_core_budget_bytes,
-        host_available_bytes,
+        process_available_bytes,
         direct_admitted,
         matrix_free_admitted,
     }

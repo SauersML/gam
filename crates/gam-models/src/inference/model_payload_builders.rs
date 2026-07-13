@@ -32,8 +32,8 @@ use crate::survival::construction::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, survival_baseline_targetname,
 };
 use crate::survival::location_scale::{
-    ResidualDistribution, SurvivalCovariateTimeBasis,
-    SurvivalLocationScaleTimeParameterization, residual_distribution_from_inverse_link,
+    ResidualDistribution, SurvivalCovariateTimeBasis, SurvivalLocationScaleTimeParameterization,
+    residual_distribution_from_inverse_link,
 };
 use crate::transformation_normal::TransformationNormalFamily;
 use faer::Side;
@@ -1068,13 +1068,9 @@ pub fn assemble_survival_marginal_slope_payload(
         .link_dev_runtime
         .map(serialize_anchored_deviation_runtime);
     payload.influence_absorber_width = inputs.influence_absorber_width;
-    payload.influence_absorber_design = inputs.influence_absorber_design.map(|design| {
-        design
-            .rows()
-            .into_iter()
-            .map(|row| row.to_vec())
-            .collect()
-    });
+    payload.influence_absorber_design = inputs
+        .influence_absorber_design
+        .map(|design| design.rows().into_iter().map(|row| row.to_vec()).collect());
     payload.survival_marginal_slope_score_covariance = Some(
         inputs
             .score_covariance

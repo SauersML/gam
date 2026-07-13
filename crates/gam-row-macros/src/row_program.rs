@@ -1736,7 +1736,10 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
         let witness_values = witnesses.iter().map(|witness| quote!(#witness.value()));
         quote! {
             #[inline(always)]
-            #visibility fn #name<S: ::gam_math::jet_scalar::JetScalar<#dimension>>(
+            #visibility fn #name<
+                const __ROW_PROGRAM_DERIVATIVE_DIMENSION: usize,
+                S: ::gam_math::jet_scalar::JetScalar<__ROW_PROGRAM_DERIVATIVE_DIMENSION>,
+            >(
                 #(#primaries: &S,)*
                 #(#constants: f64),*
             ) -> (S, [f64; #witness_count]) {
@@ -1990,7 +1993,9 @@ mod tests {
         })
         .expect("parse row program");
         let expanded = expand(input).expect("expand row program").to_string();
-        assert!(expanded.contains("JetScalar < 2usize >"));
+        assert!(expanded.contains(
+            "JetScalar < __ROW_PROGRAM_DERIVATIVE_DIMENSION >"
+        ));
         assert!(expanded.contains("RuntimeJetScalar"));
         assert!(expanded.contains("fn sample_runtime"));
         assert!(expanded.contains("fn sample_order2"));

@@ -1260,10 +1260,17 @@ pub(crate) fn evaluate_custom_family_hyper_internal<
         warm_start,
         rho_prior,
         eval_mode,
+        PsiWarmStartScope::UnknownGeometry,
     )
 }
 
-pub(crate) fn evaluate_custom_family_hyper_internal_shared<
+#[derive(Clone, Copy)]
+enum PsiWarmStartScope {
+    UnknownGeometry,
+    CurrentEvaluation,
+}
+
+fn evaluate_custom_family_hyper_internal_shared<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
     family: &F,
@@ -1275,6 +1282,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
     warm_start: Option<&ConstrainedWarmStart>,
     rho_prior: gam_problem::RhoPrior,
     eval_mode: EvalMode,
+    warm_start_scope: PsiWarmStartScope,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
     if derivative_blocks.len() != specs.len() {
         crate::bail_dim_custom!(
@@ -1307,8 +1315,11 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho_current, penalty_counts)?;
-    let psi_safe_warm_start =
-        warm_start_without_cached_inner_for_psi_derivatives(warm_start, psi_dim > 0);
+    let psi_safe_warm_start = match warm_start_scope {
+        PsiWarmStartScope::UnknownGeometry =>
+            warm_start_without_cached_inner_for_psi_derivatives(warm_start, psi_dim > 0),
+        PsiWarmStartScope::CurrentEvaluation => warm_start.cloned(),
+    };
 
     // gam#1820: for a COUPLED family whose joint Hessian depends on β, the
     // exact-Newton LAML outer GRADIENT `½tr(H⁻¹Ḣ)` — including its `D_βH[β_i]`
@@ -2550,8 +2561,175 @@ pub fn evaluate_custom_family_joint_hyper_shared<
             .or_else(|| warm_start.map(|w| &w.inner)),
         gam_problem::RhoPrior::Flat,
         eval_mode,
+        PsiWarmStartScope::UnknownGeometry,
     )?;
     Ok(outer_eval_result_to_joint_hyper_result(eval_result))
+}
+
+pub struct CustomFamilyJointHyperModeSelection {
+    pub result: CustomFamilyJointHyperResult,
+    pub selected_candidate: usize,
+    pub screened_objectives: Vec<Option<f64>>,
+    pub rejected_candidates: Vec<Option<String>>,
+}
+
+/// Profile a nonconvex coefficient mode without assembling expensive outer
+/// derivatives for every candidate.
+///
+/// Every candidate is first solved under the derivative-quality inner options
+/// in value-only mode. The lowest finite converged objective wins (candidate
+/// order breaks exact ties), then only that winner is evaluated in the
+/// requested derivative mode. The winner's cached inner result is reused only
+/// inside this atomic call, where family, specs, rho, ψ geometry, and options
+/// are unchanged; ordinary public warm starts retain the conservative
+/// cross-geometry cache invalidation policy.
+pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    rho_current: &Array1<f64>,
+    derivative_blocks: SharedDerivativeBlocks,
+    candidates: &[Option<CustomFamilyWarmStart>],
+    eval_mode: EvalMode,
+) -> Result<CustomFamilyJointHyperModeSelection, CustomFamilyError> {
+    if candidates.is_empty() {
+        return Err(CustomFamilyError::InvalidInput {
+            context: "evaluate_custom_family_joint_hyper_best_mode_shared",
+            reason: "at least one coefficient-mode candidate is required".to_string(),
+        });
+    }
+
+    let mut screened_objectives = vec![None; candidates.len()];
+    let mut rejected_candidates = vec![None; candidates.len()];
+    let mut best: Option<(usize, CustomFamilyJointHyperResult)> = None;
+    for (candidate_idx, warm_start) in candidates.iter().enumerate() {
+        let candidate = match evaluate_custom_family_joint_hyper_shared(
+            family,
+            specs,
+            options,
+            rho_current,
+            Arc::clone(&derivative_blocks),
+            warm_start.as_ref(),
+            EvalMode::ValueOnly,
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                rejected_candidates[candidate_idx] = Some(format!("evaluator error: {error}"));
+                continue;
+            }
+        };
+        if !candidate.inner_converged {
+            rejected_candidates[candidate_idx] =
+                Some("inner coefficient solve did not converge".to_string());
+            continue;
+        }
+        if !candidate.objective.is_finite() {
+            rejected_candidates[candidate_idx] =
+                Some("profile objective was non-finite".to_string());
+            continue;
+        }
+        screened_objectives[candidate_idx] = Some(candidate.objective);
+        if best
+            .as_ref()
+            .is_none_or(|(_, current)| candidate.objective < current.objective)
+        {
+            best = Some((candidate_idx, candidate));
+        }
+    }
+
+    let Some((selected_candidate, screened_winner)) = best else {
+        let reasons = rejected_candidates
+            .iter()
+            .enumerate()
+            .map(|(idx, reason)| {
+                format!(
+                    "candidate {idx}: {}",
+                    reason.as_deref().unwrap_or("no finite converged result")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: format!(
+                "no coefficient-mode candidate produced a finite converged profile objective: {reasons}"
+            ),
+        });
+    };
+
+    if matches!(eval_mode, EvalMode::ValueOnly) {
+        return Ok(CustomFamilyJointHyperModeSelection {
+            result: screened_winner,
+            selected_candidate,
+            screened_objectives,
+            rejected_candidates,
+        });
+    }
+
+    let screened_beta_bits: Vec<Vec<u64>> = screened_winner
+        .warm_start
+        .inner
+        .block_beta
+        .iter()
+        .map(|beta| beta.iter().map(|value| value.to_bits()).collect())
+        .collect();
+    let penalty_counts = validate_blockspecs(specs)?;
+    let has_psi_derivatives = derivative_blocks.iter().any(|block| !block.is_empty());
+    let (eval_options, _) =
+        derivative_quality_options_and_warm_start(options, None, has_psi_derivatives);
+    let derivative_eval = evaluate_custom_family_hyper_internal_shared(
+        family,
+        specs,
+        &eval_options,
+        &penalty_counts,
+        rho_current,
+        derivative_blocks,
+        Some(&screened_winner.warm_start.inner),
+        gam_problem::RhoPrior::Flat,
+        eval_mode,
+        PsiWarmStartScope::CurrentEvaluation,
+    )?;
+    let result = outer_eval_result_to_joint_hyper_result(derivative_eval);
+    if !result.inner_converged
+        || !result.objective.is_finite()
+        || result.gradient.iter().any(|value| !value.is_finite())
+    {
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: format!(
+                "selected coefficient-mode candidate {selected_candidate} did not produce finite converged requested derivatives"
+            ),
+        });
+    }
+    let returned_beta_matches = result.warm_start.inner.block_beta.len()
+        == screened_beta_bits.len()
+        && result
+            .warm_start
+            .inner
+            .block_beta
+            .iter()
+            .zip(&screened_beta_bits)
+            .all(|(beta, expected)| {
+                beta.len() == expected.len()
+                    && beta
+                        .iter()
+                        .zip(expected)
+                        .all(|(value, bits)| value.to_bits() == *bits)
+            });
+    if !returned_beta_matches {
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: format!(
+                "selected coefficient-mode candidate {selected_candidate} changed coefficient basins between value screening and derivative assembly"
+            ),
+        });
+    }
+
+    Ok(CustomFamilyJointHyperModeSelection {
+        result,
+        selected_candidate,
+        screened_objectives,
+        rejected_candidates,
+    })
 }
 
 pub(crate) fn derivative_quality_options_and_warm_start(

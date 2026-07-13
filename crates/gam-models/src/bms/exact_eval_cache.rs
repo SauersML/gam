@@ -8,20 +8,10 @@ pub(super) fn log_exact_work(n: usize) -> bool {
     n >= EXACT_WORK_LOG_MIN_ROWS
 }
 
-/// Cross-platform available-RAM probe backed by `sysinfo`. Returns the bytes
-/// the OS reports as available for new allocations (free + reclaimable cache);
-/// the underlying `System` instance is leaked behind a `OnceLock` so the cost
-/// of `new_with_specifics` is paid once per process.
+/// Current cgroup-aware process-memory allowance from the runtime's single
+/// authoritative OS probe.
 pub(super) fn runtime_available_memory_bytes() -> u64 {
-    static SYSTEM: OnceLock<Mutex<sysinfo::System>> = OnceLock::new();
-    let lock = SYSTEM.get_or_init(|| {
-        let refresh =
-            sysinfo::RefreshKind::new().with_memory(sysinfo::MemoryRefreshKind::everything());
-        Mutex::new(sysinfo::System::new_with_specifics(refresh))
-    });
-    let mut system = lock.lock().expect("sysinfo system mutex poisoned");
-    system.refresh_memory_specifics(sysinfo::MemoryRefreshKind::everything());
-    system.available_memory()
+    gam_runtime::resource::detect_memory_availability().available_bytes()
 }
 
 /// Process-global counter of bytes currently pinned by live BMS row-primary

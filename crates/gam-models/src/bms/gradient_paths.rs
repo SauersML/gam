@@ -1,5 +1,6 @@
 use super::family::clamp_bernoulli_link_probability;
 use super::*;
+use gam_linalg::faer_ndarray::FaerEigh;
 use gam_linalg::matrix::{FiniteSignedWeightsView, LinearOperator};
 use gam_math::jet_scalar::SymmetricQuadraticCoefficients;
 use gam_math::jet_tower::Tower4;
@@ -847,21 +848,32 @@ impl MarginalSlopeCovariance {
                         cov.ncols()
                     ));
                 }
+                for ((i, j), &value) in cov.indexed_iter() {
+                    if !value.is_finite() {
+                        return Err(format!(
+                            "{context} full covariance entry ({i},{j}) is non-finite"
+                        ));
+                    }
+                }
                 for i in 0..cov.nrows() {
-                    for j in 0..cov.ncols() {
-                        let value = cov[[i, j]];
-                        if !value.is_finite() {
+                    for j in (i + 1)..cov.ncols() {
+                        if cov[[i, j]] != cov[[j, i]] {
                             return Err(format!(
-                                "{context} full covariance entry ({i},{j}) is non-finite"
+                                "{context} full covariance must be exactly symmetric at ({i},{j}): upper={}, lower={}",
+                                cov[[i, j]],
+                                cov[[j, i]],
                             ));
                         }
-                        if (value - cov[[j, i]]).abs()
-                            > 1e-10 * (1.0 + value.abs().max(cov[[j, i]].abs()))
-                        {
-                            return Err(format!(
-                                "{context} full covariance must be symmetric at ({i},{j})"
-                            ));
-                        }
+                    }
+                }
+                let (eigenvalues, _) = cov.eigh(faer::Side::Lower).map_err(|error| {
+                    format!("{context} full covariance PSD eigendecomposition failed: {error}")
+                })?;
+                for (index, &eigenvalue) in eigenvalues.iter().enumerate() {
+                    if !(eigenvalue.is_finite() && eigenvalue >= 0.0) {
+                        return Err(format!(
+                            "{context} full covariance must be positive semidefinite; eigenvalue {index} is {eigenvalue}"
+                        ));
                     }
                 }
             }
@@ -1219,7 +1231,6 @@ pub fn marginal_slope_covariance_from_scores(
         return Ok(MarginalSlopeCovariance::Diagonal(cov.diag().to_owned()));
     }
 
-    use gam_linalg::faer_ndarray::FaerEigh;
     let (evals, evecs) = cov
         .eigh(faer::Side::Lower)
         .map_err(|err| format!("marginal-slope covariance eigendecomposition failed: {err}"))?;
@@ -2240,6 +2251,40 @@ pub(crate) fn unary_derivatives_log(x: f64) -> [f64; 5] {
 pub(crate) fn unary_derivatives_log_normal_pdf(x: f64) -> [f64; 5] {
     let c = 0.5 * (2.0 * std::f64::consts::PI).ln();
     [-0.5 * x * x - c, -x, -1.0, 0.0, 0.0]
+}
+
+#[cfg(test)]
+mod covariance_admission_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn full_covariance_admission_rejects_one_ulp_asymmetry_932() {
+        let upper = 0.25_f64;
+        let lower = f64::from_bits(upper.to_bits() + 1);
+        let covariance = MarginalSlopeCovariance::Full(array![[1.0, upper], [lower, 1.0]]);
+        let error = covariance
+            .validate("one-ulp covariance")
+            .expect_err("any asymmetric full operator must be rejected");
+        assert!(error.contains("must be exactly symmetric"), "{error}");
+    }
+
+    #[test]
+    fn full_covariance_admission_rejects_indefinite_matrix_before_row_use_932() {
+        let covariance = MarginalSlopeCovariance::Full(array![[1.0, 2.0], [2.0, 1.0]]);
+        let error = covariance
+            .validate("indefinite covariance")
+            .expect_err("an indefinite full operator is not a covariance");
+        assert!(error.contains("must be positive semidefinite"), "{error}");
+    }
+
+    #[test]
+    fn full_covariance_admission_accepts_exact_singular_psd_932() {
+        let covariance = MarginalSlopeCovariance::Full(array![[1.0, 0.0], [0.0, 0.0]]);
+        covariance
+            .validate("singular covariance")
+            .expect("an exact singular PSD covariance is admissible");
+    }
 }
 
 #[cfg(test)]
