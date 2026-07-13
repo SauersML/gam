@@ -1030,10 +1030,10 @@ fn row_primary_closed_form_vector_fixed<const DIM: usize>(
     Ok((row.0.v, gradient, hessian))
 }
 
-/// Reusable storage for the production compiled graph and the uncommon
-/// runtime-width backend. The graph schedule covers the observed score widths;
-/// the dynamic packed algebra remains the exact same-expression backend for
-/// widths above the const-primary schedule.
+/// Reusable storage for the production reverse graph and runtime-width backend.
+/// Common widths use the stack-packed lowering; wider const-primary rows use
+/// the reverse graph, and dimensions above its exact support use the dynamic
+/// packed instantiation of the same row expression.
 pub(crate) struct RigidVectorRowWorkspace {
     graph: Order2GraphWorkspace,
     dynamic: DynamicJetArena,
@@ -1141,21 +1141,43 @@ pub(crate) fn row_primary_closed_form_vector(
         };
     }
 
+    macro_rules! fixed_row {
+        ($dimension:literal) => {
+            row_primary_closed_form_vector_fixed::<$dimension>(
+                q0,
+                q1,
+                qd1,
+                slopes,
+                z,
+                covariance,
+                w,
+                d,
+                derivative_guard,
+                probit_scale,
+            )
+        };
+    }
+
     match k {
         0 => Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: "survival marginal-slope vector row requires at least one score slope"
                 .to_string(),
         }
         .into()),
-        1 => graph_row!(4),
-        2 => graph_row!(5),
-        3 => graph_row!(6),
-        4 => graph_row!(7),
-        5 => graph_row!(8),
-        6 => graph_row!(9),
-        7 => graph_row!(10),
-        8 => graph_row!(11),
-        9.. => row_primary_closed_form_vector_dynamic(
+        1 => fixed_row!(4),
+        2 => fixed_row!(5),
+        3 => fixed_row!(6),
+        4 => fixed_row!(7),
+        5 => fixed_row!(8),
+        6 => fixed_row!(9),
+        7 => fixed_row!(10),
+        8 => fixed_row!(11),
+        9 => graph_row!(12),
+        10 => graph_row!(13),
+        11 => graph_row!(14),
+        12 => graph_row!(15),
+        13 => graph_row!(16),
+        14.. => row_primary_closed_form_vector_dynamic(
             q0,
             q1,
             qd1,
@@ -1586,8 +1608,8 @@ mod tests {
     }
 
     /// #932 runtime-width cutover gate. The production row program derives the
-    /// complete V/G/H tower through the scheduled compiled graph for `k <= 8`
-    /// and the same-expression dynamic backend above it. This compares every
+    /// complete V/G/H tower through the scheduled fixed/graph backends for
+    /// `k <= 13` and the same-expression dynamic backend above it. This compares every
     /// channel with the retired strongest-hand schedule for all covariance
     /// forms. The explicit score-score assertions pin the mixed blocks that a
     /// scalar or block-diagonal check would miss.
@@ -1806,6 +1828,17 @@ mod tests {
                     .expect("production vector row");
                     if shape_index == 0 && event == 0.0 {
                         if k <= 8 {
+                            assert_eq!(
+                                production_workspace.graph.node_count(),
+                                initial_graph_nodes,
+                                "k={k}: fixed schedule unexpectedly recorded a graph"
+                            );
+                            assert_eq!(
+                                production_workspace.dynamic.allocated_bytes(),
+                                initial_dynamic_bytes,
+                                "k={k}: fixed schedule unexpectedly used the dynamic arena"
+                            );
+                        } else if k <= 13 {
                             assert!(
                                 production_workspace.graph.node_count() > initial_graph_nodes,
                                 "k={k}: scheduled production graph did not record a row"
@@ -1928,6 +1961,10 @@ mod tests {
         check_width::<10>();
         check_width::<11>();
         check_width::<12>();
+        check_width::<13>();
+        check_width::<14>();
+        check_width::<15>();
+        check_width::<16>();
     }
 
     /// Temporary #932 release measurement for the runtime-width row program.
