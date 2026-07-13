@@ -17,6 +17,18 @@ pub use penalty_priors::{
 
 include!("smooth/term_specs.rs");
 
+/// Exhaustive coordinate-scale laws for every smooth-basis constructor.
+///
+/// Kept next to the term specification rather than in an individual basis
+/// implementation: wrappers and tensor products are basis trees, so only the
+/// specification layer can state (and validate) the complete composed law.
+mod scale_contract;
+pub use scale_contract::{
+    BasisCoordinateScaleAction, BasisDerivativeScaleLaw, BasisDesignScaleLaw,
+    BasisNullGeometryScaleLaw, BasisPenaltyScaleLaw, BasisScaleContract, BasisScaleFamily,
+    DimensionfulBasisParameter, DimensionfulParameterScale,
+};
+
 pub mod structure_analysis;
 use self::structure_analysis::smooth_has_frozen_identifiability;
 pub use self::structure_analysis::{

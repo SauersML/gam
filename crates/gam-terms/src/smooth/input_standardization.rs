@@ -101,10 +101,3 @@ pub fn compensate_length_scale_for_standardization(length_scale: f64, scales: &[
         length_scale
     }
 }
-
-pub fn compensate_optional_length_scale_for_standardization(
-    length_scale: Option<f64>,
-    scales: &[f64],
-) -> Option<f64> {
-    length_scale.map(|l| compensate_length_scale_for_standardization(l, scales))
-}

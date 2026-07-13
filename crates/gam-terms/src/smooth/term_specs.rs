@@ -7,7 +7,7 @@ pub use error::SmoothError;
 
 use input_standardization::{
     apply_input_standardization, compensate_length_scale_for_standardization,
-    compensate_optional_length_scale_for_standardization, compute_spatial_input_scales,
+    compute_spatial_input_scales,
 };
 
 use shape_constraints::{
@@ -907,10 +907,7 @@ impl SmoothTerm {
     /// almost the whole shrunk block at full rank, manufacturing overwhelming
     /// "significance" for a term the fit drove to ~0 EDF.
     pub fn wald_unpenalized_dim(&self) -> usize {
-        joint_unpenalized_dim(
-            self.coeff_range.len(),
-            &self.active_penalties,
-        )
+        joint_unpenalized_dim(self.coeff_range.len(), &self.active_penalties)
     }
 }
 
@@ -918,10 +915,7 @@ impl SmoothTerm {
 /// joint null space `∩_k null(S_k) = null(Σ_k S_k)` of a term's local penalty
 /// blocks, with a conservative fallback when a penalty is not materialized as a
 /// full `p_local × p_local` matrix (e.g. a Kronecker tensor factor).
-pub fn joint_unpenalized_dim(
-    p_local: usize,
-    active_penalties: &[ActivePenalty],
-) -> usize {
+pub fn joint_unpenalized_dim(p_local: usize, active_penalties: &[ActivePenalty]) -> usize {
     use gam_linalg::faer_ndarray::FaerEigh;
     if p_local == 0 {
         return 0;
@@ -1287,6 +1281,12 @@ pub fn validate_smooth_basis_frozen(
     label: &str,
     term_name: &str,
 ) -> Result<(), String> {
+    if let Err(error) = basis.validate_scale_configuration() {
+        return Err(SmoothError::invalid_config(format!(
+            "{label} term '{term_name}' has an invalid scale contract: {error}"
+        ))
+        .into());
+    }
     match basis {
         SmoothBasisSpec::ByVariable { inner, .. }
         | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
@@ -1413,6 +1413,13 @@ impl TermCollectionSpec {
             }
         }
         for st in &self.smooth_terms {
+            if let Err(error) = st.basis.validate_scale_configuration() {
+                return Err(SmoothError::invalid_config(format!(
+                    "{label} term '{}' has an invalid scale contract: {error}",
+                    st.name
+                ))
+                .into());
+            }
             match &st.basis {
                 SmoothBasisSpec::ByVariable { inner, .. } => {
                     validate_smooth_basis_frozen(inner, label, &st.name)?;
@@ -3828,10 +3835,8 @@ pub fn spatial_term_psi_bounds(
         .map(|scales| compensate_length_scale_for_standardization(1.0, scales))
         .unwrap_or(1.0);
     let psi_chart_offset = inverse_sigma_geom.ln();
-    let psi_lo_data =
-        (KERNEL_RANGE_MIN_DIAMETER_FRACTION / r_max).ln() + psi_chart_offset;
-    let psi_hi_data =
-        (KERNEL_RANGE_MAX_SPACING_MULTIPLE / r_min).ln() + psi_chart_offset;
+    let psi_lo_data = (KERNEL_RANGE_MIN_DIAMETER_FRACTION / r_max).ln() + psi_chart_offset;
+    let psi_hi_data = (KERNEL_RANGE_MAX_SPACING_MULTIPLE / r_min).ln() + psi_chart_offset;
     // #1074: the Matérn-specific length-scale ceiling that used to live here was
     // deleted. It was masking, not fixing, the real defect: a hard upper bound on
     // the kernel range that pinned the κ-optimizer short rather than letting the
@@ -4959,11 +4964,7 @@ pub fn matern_low_rank_center_resolution_length_scale(
     }
     let extent = feature_columns_rotation_invariant_range(data, feature_cols)?;
     let length_scale = extent / (num_centers as f64).sqrt();
-    Some(
-        length_scale
-            .max(AUTO_LENGTH_SCALE_FLOOR)
-            .min(extent),
-    )
+    Some(length_scale.max(AUTO_LENGTH_SCALE_FLOOR).min(extent))
 }
 
 /// Low-rank radial-basis length-scale seed tied to the requested center spacing.
@@ -6272,9 +6273,12 @@ mod tensor_function_space_runtime_tests {
         };
         let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
             .expect("double-penalty tensor basis");
-        assert!(built.active_penalties.iter().any(|penalty| {
-            matches!(penalty.info.source, PenaltySource::TensorGlobalRidge)
-        }));
+        assert!(
+            built
+                .active_penalties
+                .iter()
+                .any(|penalty| { matches!(penalty.info.source, PenaltySource::TensorGlobalRidge) })
+        );
         assert!(
             built.kronecker_factored.is_none(),
             "the legacy factored runtime cannot represent a function-metric global ridge"
@@ -7192,12 +7196,12 @@ pub fn build_pca_smooth_basis(
             })?;
         let penalty = pca_function_mass_penalty(raw_score_gram, op.nrows, smooth_penalty)?;
         let filtered = filter_penalty_candidates(vec![PenaltyCandidate {
-                matrix: penalty,
-                source: PenaltySource::OperatorMass,
-                normalization_scale: 1.0,
-                kronecker_factors: None,
-                op: None,
-            }])?;
+            matrix: penalty,
+            source: PenaltySource::OperatorMass,
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+            op: None,
+        }])?;
         return Ok(BasisBuildResult {
             design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(op))),
             affine_offset: None,
@@ -7241,12 +7245,12 @@ pub fn build_pca_smooth_basis(
     let raw_score_gram = gam_linalg::faer_ndarray::fast_ata(&design);
     let penalty = pca_function_mass_penalty(raw_score_gram, design.nrows(), smooth_penalty)?;
     let filtered = filter_penalty_candidates(vec![PenaltyCandidate {
-            matrix: penalty,
-            source: PenaltySource::OperatorMass,
-            normalization_scale: 1.0,
-            kronecker_factors: None,
-            op: None,
-        }])?;
+        matrix: penalty,
+        source: PenaltySource::OperatorMass,
+        normalization_scale: 1.0,
+        kronecker_factors: None,
+        op: None,
+    }])?;
     Ok(BasisBuildResult {
         design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(design)),
         affine_offset: None,
@@ -7332,8 +7336,7 @@ mod pca_function_mass_tests {
     fn npy_header_parser_uses_exact_ast_fields_2293() {
         let path = PathBuf::from("scores.npy");
         let bytes = npy_v1_bytes(
-            "{'shape':(3, 2), 'note':'True', 'descr':'<f8', 'fortran_order':False,}"
-                .to_string(),
+            "{'shape':(3, 2), 'note':'True', 'descr':'<f8', 'fortran_order':False,}".to_string(),
         );
         let (offset, rows, cols) =
             parse_f64_2d_npy_header(&bytes, &path).expect("valid reordered header");
@@ -7348,7 +7351,10 @@ mod pca_function_mass_tests {
             "{'descr':'<f8','fortran_order':False,'shape':(6,),}",
         ] {
             let invalid = npy_v1_bytes(header.to_string());
-            assert!(parse_f64_2d_npy_header(&invalid, &path).is_err(), "{header}");
+            assert!(
+                parse_f64_2d_npy_header(&invalid, &path).is_err(),
+                "{header}"
+            );
         }
     }
 
@@ -7716,8 +7722,7 @@ pub fn build_by_smooth_local(
             // joint-null rotation absent. The canonical filter authors matrix,
             // rank, nullity, null basis, and metadata together.
             let filtered = crate::basis::filter_penalty_candidates(candidates)?;
-            let joint_null_rotation =
-                crate::basis::compute_joint_null_rotation(&filtered.active)?;
+            let joint_null_rotation = crate::basis::compute_joint_null_rotation(&filtered.active)?;
             let mut dropped_penalties = inner.dropped_penalties;
             dropped_penalties.extend(filtered.dropped);
 
@@ -8205,6 +8210,7 @@ pub fn build_single_local_smooth_term(
     term: &SmoothTermSpec,
     workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<LocalSmoothTermBuild, BasisError> {
+    term.basis.validate_scale_configuration()?;
     if term.shape != ShapeConstraint::None && !shape_supports_basis(term) {
         crate::bail_invalid_basis!(
             "ShapeConstraint::{:?} is unsupported for term '{}'",
@@ -8453,17 +8459,16 @@ pub fn build_single_local_smooth_term(
                     let (s_null, null_scale) =
                         normalize_penalty_in_constrained_space(&stz_pooled_null);
                     candidates.push(PenaltyCandidate {
-                            matrix: s_null,
-                            source: PenaltySource::DoublePenaltyNullspace,
-                            normalization_scale: null_scale,
-                            kronecker_factors: None,
-                            op: None,
-                        });
+                        matrix: s_null,
+                        source: PenaltySource::DoublePenaltyNullspace,
+                        normalization_scale: null_scale,
+                        kronecker_factors: None,
+                        op: None,
+                    });
                 }
             }
             let filtered = crate::basis::filter_penalty_candidates(candidates)?;
-            let mut dropped_penalties =
-                std::mem::take(&mut inner_built.dropped_penalties);
+            let mut dropped_penalties = std::mem::take(&mut inner_built.dropped_penalties);
             dropped_penalties.extend(filtered.dropped);
             inner_built.dim = p * l_minus_one;
             inner_built.design =
@@ -8510,25 +8515,16 @@ pub fn build_single_local_smooth_term(
                     );
                 }
             }
-            let mut x = select_columns(data, feature_cols)?;
-            // Auto-standardize multivariate inputs: use stored scales (prediction)
-            // or compute fresh ones (training). Same standardization-vs-
-            // length-scale compensation as Matérn / hybrid Duchon: divide
-            // the user's L by σ_geom so kernel(‖x_std − c_std‖/L_eff)
-            // matches the original-coord kernel for uniform σ.
-            let (scales, length_scale_eff) = if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
-                (
-                    Some(s.clone()),
-                    compensate_length_scale_for_standardization(spec.length_scale, s),
-                )
-            } else if let Some(s) = compute_spatial_input_scales(x.view()) {
-                apply_input_standardization(&mut x, &s);
-                let l_eff = compensate_length_scale_for_standardization(spec.length_scale, &s);
-                (Some(s), l_eff)
-            } else {
-                (None, spec.length_scale)
-            };
+            let frame = term.basis.scale_contract().normalize_euclidean_frame(
+                select_columns(data, feature_cols)?,
+                input_scales.as_deref(),
+                Some(spec.length_scale),
+            )?;
+            let x = frame.coordinates;
+            let scales = frame.input_scales;
+            let length_scale_eff = frame
+                .length_scale
+                .expect("ThinPlate declares a required length-scale coordinate");
             let mut spec_local = spec.clone();
             spec_local.length_scale = length_scale_eff;
             if matches!(
@@ -8637,32 +8633,19 @@ pub fn build_single_local_smooth_term(
                     term.name
                 );
             }
-            let mut x = select_columns(data, feature_cols)?;
-            // Matern-style per-axis standardization; the realized σ vector is
-            // persisted into the metadata for predict-time replay.
-            //
-            // Length-scale round-trip contract (owning statement; the freeze
-            // and frozen-validation arms reference it): `input_scales: Some`
-            // marks the REPLAY path — the frozen length_scale is already the
-            // realized post-standardization value and passes through
-            // verbatim. Fresh path: an explicit user length_scale is in
-            // ORIGINAL coordinates and gets the σ_geom compensation; the 0.0
-            // auto sentinel passes through (auto-derivation runs inside the
-            // builder, post-standardization).
-            let (scales, length_scale_eff) = if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
-                (Some(s.clone()), spec.length_scale)
-            } else if let Some(s) = compute_spatial_input_scales(x.view()) {
-                apply_input_standardization(&mut x, &s);
-                let l_eff = if spec.length_scale > 0.0 {
-                    compensate_length_scale_for_standardization(spec.length_scale, &s)
-                } else {
-                    spec.length_scale
-                };
-                (Some(s), l_eff)
-            } else {
-                (None, spec.length_scale)
-            };
+            // The typed scale contract owns the intentionally asymmetric
+            // fresh/replay rule: fresh explicit ranges are in original units,
+            // while a frozen MeasureJet range is already in its realized frame.
+            let frame = term.basis.scale_contract().normalize_euclidean_frame(
+                select_columns(data, feature_cols)?,
+                input_scales.as_deref(),
+                Some(spec.length_scale),
+            )?;
+            let x = frame.coordinates;
+            let scales = frame.input_scales;
+            let length_scale_eff = frame
+                .length_scale
+                .expect("MeasureJet declares a required length-scale coordinate");
             let mut spec_local = spec.clone();
             spec_local.length_scale = length_scale_eff;
             let mut result = build_measure_jet_basis(x.view(), &spec_local)?;
@@ -8689,34 +8672,16 @@ pub fn build_single_local_smooth_term(
                     );
                 }
             }
-            let mut x = select_columns(data, feature_cols)?;
-            // Auto-standardization (per-axis division by σ_a) reinterprets
-            // the user's `length_scale` from original data coordinates
-            // into post-standardization coordinates: for uniform σ_a = σ,
-            // `kernel(‖x_std − c_std‖/L)` equals `kernel(‖x − c‖/(σ·L))`,
-            // so the effective kernel range shrinks by σ. To keep
-            // `length_scale` consistently expressed in *original* data
-            // coordinates regardless of axis variances, we standardize
-            // and divide L by σ_geom = (∏σ_a)^(1/d). For uniform σ this
-            // recovers the user's kernel exactly; for anisotropic data
-            // the resulting per-axis effective scales σ_a / σ_geom are
-            // the standard Mahalanobis preconditioning and preserve the
-            // geometric-mean kernel range. Storing the σ vector in
-            // metadata.input_scales makes the same transformation
-            // replayable at predict time.
-            let (scales, length_scale_eff) = if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
-                (
-                    Some(s.clone()),
-                    compensate_length_scale_for_standardization(spec.length_scale, s),
-                )
-            } else if let Some(s) = compute_spatial_input_scales(x.view()) {
-                apply_input_standardization(&mut x, &s);
-                let l_eff = compensate_length_scale_for_standardization(spec.length_scale, &s);
-                (Some(s), l_eff)
-            } else {
-                (None, spec.length_scale)
-            };
+            let frame = term.basis.scale_contract().normalize_euclidean_frame(
+                select_columns(data, feature_cols)?,
+                input_scales.as_deref(),
+                Some(spec.length_scale),
+            )?;
+            let x = frame.coordinates;
+            let scales = frame.input_scales;
+            let length_scale_eff = frame
+                .length_scale
+                .expect("Matérn declares a required length-scale coordinate");
             let mut spec_local = spec.clone();
             spec_local.length_scale = length_scale_eff;
             let mut result = build_matern_basiswithworkspace(x.view(), &spec_local, workspace)?;
@@ -8746,31 +8711,14 @@ pub fn build_single_local_smooth_term(
                     );
                 }
             }
-            let mut x = select_columns(data, feature_cols)?;
-            // Hybrid Duchon (length_scale=Some) is governed by the same
-            // standardization-vs-length-scale equivalence as Matérn: the
-            // user's `length_scale` is interpreted in original data
-            // coordinates, but auto-standardization (per-axis division by
-            // σ_a) reinterprets it as σ_geom · L. Pre-multiply by 1/σ_geom
-            // so kernel(‖x_std − c_std‖/L_eff) reproduces the user's
-            // original-coord kernel exactly for uniform σ_a, and reduces
-            // to standard Mahalanobis preconditioning for anisotropic σ.
-            // Pure Duchon (length_scale=None) is scale-free and needs no
-            // compensation.
-            let (scales, length_scale_eff) = if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
-                (
-                    Some(s.clone()),
-                    compensate_optional_length_scale_for_standardization(spec.length_scale, s),
-                )
-            } else if let Some(s) = compute_spatial_input_scales(x.view()) {
-                apply_input_standardization(&mut x, &s);
-                let l_eff =
-                    compensate_optional_length_scale_for_standardization(spec.length_scale, &s);
-                (Some(s), l_eff)
-            } else {
-                (None, spec.length_scale)
-            };
+            let frame = term.basis.scale_contract().normalize_euclidean_frame(
+                select_columns(data, feature_cols)?,
+                input_scales.as_deref(),
+                spec.length_scale,
+            )?;
+            let x = frame.coordinates;
+            let scales = frame.input_scales;
+            let length_scale_eff = frame.length_scale;
             let mut spec_local = spec.clone();
             spec_local.length_scale = length_scale_eff;
             // The Duchon input axis is standardized in place above (`x → x/σ`,
@@ -9031,42 +8979,42 @@ pub fn build_single_local_smooth_term(
     let penalty_candidates = penalties_t
         .into_iter()
         .map(|penalty| -> Result<PenaltyCandidate, BasisError> {
-                let ActivePenalty {
-                    matrix,
-                    op: op_in,
-                    info,
-                    ..
-                } = penalty;
-                let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
-                let normalization_scale = info.normalization_scale * c_new;
-                let op_scale = 1.0 / c_new;
-                let kronecker_scale = 1.0 / c_new;
-                // Frobenius rescale: wrap inner op in `ScaledPenaltyOp(1/c_new)`
-                // so `op.as_dense() == matrix` post-normalization.
-                let scaled_op = if op_scale > 0.0 && op_scale.is_finite() {
-                    op_in.map(|op| {
-                        std::sync::Arc::new(crate::analytic_penalties::ScaledPenaltyOp::new(
-                            op, op_scale,
-                        ))
-                            as std::sync::Arc<dyn crate::analytic_penalties::PenaltyOp>
-                    })
-                } else {
-                    None
-                };
-                let kronecker_factors = info.kronecker_factors.map(|mut factors| {
-                    if let Some(first) = factors.first_mut() {
-                        first.mapv_inplace(|v| v * kronecker_scale);
-                    }
-                    factors
-                });
-                Ok(PenaltyCandidate {
-                    matrix,
-                    source: info.source,
-                    normalization_scale,
-                    kronecker_factors,
-                    op: scaled_op,
+            let ActivePenalty {
+                matrix,
+                op: op_in,
+                info,
+                ..
+            } = penalty;
+            let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
+            let normalization_scale = info.normalization_scale * c_new;
+            let op_scale = 1.0 / c_new;
+            let kronecker_scale = 1.0 / c_new;
+            // Frobenius rescale: wrap inner op in `ScaledPenaltyOp(1/c_new)`
+            // so `op.as_dense() == matrix` post-normalization.
+            let scaled_op = if op_scale > 0.0 && op_scale.is_finite() {
+                op_in.map(|op| {
+                    std::sync::Arc::new(crate::analytic_penalties::ScaledPenaltyOp::new(
+                        op, op_scale,
+                    ))
+                        as std::sync::Arc<dyn crate::analytic_penalties::PenaltyOp>
                 })
+            } else {
+                None
+            };
+            let kronecker_factors = info.kronecker_factors.map(|mut factors| {
+                if let Some(first) = factors.first_mut() {
+                    first.mapv_inplace(|v| v * kronecker_scale);
+                }
+                factors
+            });
+            Ok(PenaltyCandidate {
+                matrix,
+                source: info.source,
+                normalization_scale,
+                kronecker_factors,
+                op: scaled_op,
             })
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let filtered = crate::basis::filter_penalty_candidates(penalty_candidates)?;
     dropped_penalties_t.extend(filtered.dropped);

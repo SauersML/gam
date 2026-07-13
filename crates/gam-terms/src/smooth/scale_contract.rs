@@ -1,0 +1,1207 @@
+//! Exhaustive coordinate-scale contracts for smooth basis construction.
+//!
+//! A scale contract is not a human-readable tag.  It is a typed description of
+//! the pullback that must be applied to every coordinate-bearing part of a
+//! basis: design, penalty, coordinate derivatives, null geometry, and
+//! dimensionful hyperparameters.  [`SmoothBasisSpec::scale_contract`] matches
+//! every enum arm without a wildcard, so adding a new basis variant is a compile
+//! error until its law is declared here.
+
+use super::*;
+
+/// Builder-level basis family.  Variants that share a `SmoothBasisSpec` arm but
+/// use different mathematics (cyclic/open/natural-cubic, Wahba/harmonic sphere,
+/// pure/hybrid Duchon, and factor-wrapper flavours) remain distinct here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BasisScaleFamily {
+    ByVariableNumeric,
+    ByVariableFactor,
+    FactorSumToZero,
+    OpenBSpline,
+    CyclicBSpline,
+    NaturalCubic,
+    BySmoothNumeric,
+    BySmoothFactor,
+    FactorSmoothFs,
+    FactorSmoothSz,
+    FactorSmoothRe,
+    ThinPlate,
+    SphereWahba,
+    SphereHarmonic,
+    ConstantCurvature,
+    Matern,
+    MeasureJet,
+    PureDuchon,
+    HybridDuchon,
+    Pca,
+    TensorBSpline,
+}
+
+impl BasisScaleFamily {
+    /// Canonical registry order.  The registry-completeness test walks this
+    /// array and compares it with a concrete `SmoothBasisSpec` zoo.
+    pub const ALL: [Self; 21] = [
+        Self::ByVariableNumeric,
+        Self::ByVariableFactor,
+        Self::FactorSumToZero,
+        Self::OpenBSpline,
+        Self::CyclicBSpline,
+        Self::NaturalCubic,
+        Self::BySmoothNumeric,
+        Self::BySmoothFactor,
+        Self::FactorSmoothFs,
+        Self::FactorSmoothSz,
+        Self::FactorSmoothRe,
+        Self::ThinPlate,
+        Self::SphereWahba,
+        Self::SphereHarmonic,
+        Self::ConstantCurvature,
+        Self::Matern,
+        Self::MeasureJet,
+        Self::PureDuchon,
+        Self::HybridDuchon,
+        Self::Pca,
+        Self::TensorBSpline,
+    ];
+}
+
+/// Coordinate action under which the declared law is exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasisCoordinateScaleAction {
+    /// `x' = a*x + b`, `a > 0`; all knots/endpoints move by the same map.
+    PositiveAffineAbscissa,
+    /// Each tensor margin has its own positive affine map.
+    IndependentPositiveAffineAxes,
+    /// `x' = a*Q*x + b`, with one `a > 0` and orthogonal `Q`; centers,
+    /// periodic lengths, and kernel range move with the same similarity.
+    EuclideanSimilarity,
+    /// Degrees/radians are two coordinate encodings of the same point on S².
+    IntrinsicAngularUnitConversion,
+    /// `x'=a*x`, `kappa'=kappa/a^2`, `ell'=a*ell` in the stereographic chart.
+    ConstantCurvatureChartSimilarity,
+    /// `x'=a*x`, `mean'=a*mean`, `loadings'=loadings/a`, preserving PCA scores.
+    PcaScoreGauge,
+    /// Multiply an inner smooth by a numeric `by` coordinate.
+    NumericModulation,
+    /// Replicate/gate an inner smooth using dimensionless categorical labels.
+    DiscreteReplication,
+}
+
+/// Transformation of the emitted design matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasisDesignScaleLaw {
+    /// The declared joint coordinate/parameter action leaves every design entry
+    /// invariant (up to floating-point roundoff).
+    Invariant,
+    /// Scaling only the numeric multiplier by `a` sends `X -> a*X`; scaling an
+    /// inner coordinate follows the child's law.
+    NumericMultiplierDegreeOne,
+    /// Wrapper design is a row gate/replication of its invariant inner design.
+    ReplicatedInner,
+    /// Tensor design is the row-wise product of invariant marginal designs.
+    TensorProductOfMarginals,
+}
+
+/// Transformation of active penalty matrices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasisPenaltyScaleLaw {
+    /// The raw functional has the stated coordinate homogeneity, while the
+    /// emitted unit-Frobenius matrix is invariant and its recorded
+    /// `normalization_scale` carries that power.
+    FrobeniusNormalizedRawPower(i32),
+    /// The raw derivative-energy functional has exact homogeneity
+    /// `a^(1 - 2*order)`; keeping `order` typed avoids truncating a structural
+    /// basis parameter into a fixed-width exponent.
+    FrobeniusNormalizedDerivativeOrder { order: usize },
+    /// Each tensor marginal carries its own `1 - 2*marginal_order` raw power;
+    /// every emitted normalized Kronecker penalty is invariant.
+    FrobeniusNormalizedPerMarginalDerivativeOrder,
+    /// Kernel/energy construction and its normalization are invariant under the
+    /// complete declared parameter pullback.
+    FrobeniusNormalizedInvariant,
+    /// Penalties are copied/congruence-transformed into wrapper blocks without
+    /// introducing a coordinate scale of their own.
+    ReplicatedInner,
+    /// PCA uses the empirical function-mass Gram `X_score'X_score/n`; invariant
+    /// scores therefore give an exactly invariant penalty and null geometry.
+    InvariantFunctionMass,
+}
+
+/// Transformation of analytic input/hyperparameter derivatives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasisDerivativeScaleLaw {
+    /// An order-q coordinate derivative transforms as `D'^q = a^-q D^q`.
+    InverseCoordinatePower { maximum_order: usize },
+    /// The same coordinate law, while derivatives in `log(kappa)=-log(ell)`
+    /// remain invariant under `ell -> a*ell`.
+    InverseCoordinatePowerAndInvariantLogRange { maximum_order: usize },
+    /// Under `kappa'=kappa/a^2`, first and second derivatives with respect to
+    /// the numeric curvature coordinate gain factors `a^2` and `a^4`.
+    ConstantCurvatureParameterPowers,
+    /// Derivatives live in the intrinsic angular chart; changing degrees to
+    /// radians applies the ordinary inverse unit-conversion chain rule.
+    IntrinsicAngularChainRule,
+    /// Wrapper derivatives obey the product rule with the numeric multiplier.
+    NumericModulationProductRule,
+    /// Discrete gates/replications introduce no derivative coordinate.
+    DelegatedToInner,
+    /// Tensor partial derivatives take the inverse power on the differentiated
+    /// margin and multiply the invariant values of all other margins.
+    TensorMarginalProductRule { maximum_order: usize },
+}
+
+/// Transformation of the structural penalty null space / identifiability
+/// section.  This is explicit because equal penalty ranks alone do not prove
+/// that the same unpenalized functions survived a coordinate change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BasisNullGeometryScaleLaw {
+    PolynomialPullback,
+    CyclicConstantMode,
+    TensorProductPullback,
+    EuclideanPolynomialPullback,
+    CenterConstraintPullback,
+    MeasureJetAffineHeadPullback,
+    IntrinsicHarmonicSubspace,
+    ConstantCurvatureCenterConstraint,
+    PcaScoreCongruence,
+    ReplicatedInner,
+}
+
+/// Every dimensionful object that must move with a coordinate-unit change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DimensionfulBasisParameter {
+    Knots,
+    DomainEndpoints,
+    Periods,
+    Centers,
+    InputStandardDeviations,
+    LengthScale,
+    MeasureJetScaleBand,
+    MeasureJetCoordinateNoise,
+    Curvature,
+    PcaCenterMean,
+    PcaLoadings,
+    NumericByMultiplier,
+}
+
+/// Integer homogeneity of a dimensionful parameter under `x -> a*x`.
+/// `power=1` means multiply by `a`, `-1` divide by `a`, and `-2` divide by
+/// `a^2`.  Angular units use `power=1` with the degree/radian conversion in
+/// place of `a`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DimensionfulParameterScale {
+    pub parameter: DimensionfulBasisParameter,
+    pub power: i8,
+}
+
+impl DimensionfulParameterScale {
+    const fn new(parameter: DimensionfulBasisParameter, power: i8) -> Self {
+        Self { parameter, power }
+    }
+}
+
+/// How construction realizes the input frame.  This is deliberately private:
+/// callers consume it through [`BasisScaleContract::normalize_euclidean_frame`]
+/// rather than branching on a second public policy enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputFrameNormalization {
+    Parameterized,
+    AutoStandardizedOriginalUnits,
+    AutoStandardizedFreshOriginalReplayRealized,
+    Intrinsic,
+    PcaGauge,
+    Delegated,
+}
+
+/// Complete scale declaration for one node of a smooth-basis tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BasisScaleContract {
+    pub family: BasisScaleFamily,
+    pub coordinate_action: BasisCoordinateScaleAction,
+    pub design: BasisDesignScaleLaw,
+    pub penalty: BasisPenaltyScaleLaw,
+    pub derivatives: BasisDerivativeScaleLaw,
+    pub null_geometry: BasisNullGeometryScaleLaw,
+    pub dimensionful_parameters: Vec<DimensionfulParameterScale>,
+    /// Inner/marginal contracts in construction order.  Wrappers have one
+    /// child; tensors have one child per marginal; leaf bases have none.
+    pub children: Vec<BasisScaleContract>,
+    input_frame: InputFrameNormalization,
+}
+
+/// Realized Euclidean input frame returned to the spatial constructors.
+pub(super) struct NormalizedEuclideanFrame {
+    pub coordinates: Array2<f64>,
+    pub input_scales: Option<Vec<f64>>,
+    pub length_scale: Option<f64>,
+}
+
+impl BasisScaleContract {
+    fn leaf(
+        family: BasisScaleFamily,
+        coordinate_action: BasisCoordinateScaleAction,
+        design: BasisDesignScaleLaw,
+        penalty: BasisPenaltyScaleLaw,
+        derivatives: BasisDerivativeScaleLaw,
+        null_geometry: BasisNullGeometryScaleLaw,
+        dimensionful_parameters: Vec<DimensionfulParameterScale>,
+        input_frame: InputFrameNormalization,
+    ) -> Self {
+        Self {
+            family,
+            coordinate_action,
+            design,
+            penalty,
+            derivatives,
+            null_geometry,
+            dimensionful_parameters,
+            children: Vec::new(),
+            input_frame,
+        }
+    }
+
+    fn wrapper(
+        family: BasisScaleFamily,
+        coordinate_action: BasisCoordinateScaleAction,
+        design: BasisDesignScaleLaw,
+        derivatives: BasisDerivativeScaleLaw,
+        child: BasisScaleContract,
+        dimensionful_parameters: Vec<DimensionfulParameterScale>,
+    ) -> Self {
+        Self {
+            family,
+            coordinate_action,
+            design,
+            penalty: BasisPenaltyScaleLaw::ReplicatedInner,
+            derivatives,
+            null_geometry: BasisNullGeometryScaleLaw::ReplicatedInner,
+            dimensionful_parameters,
+            children: vec![child],
+            input_frame: InputFrameNormalization::Delegated,
+        }
+    }
+
+    /// Standardize a Euclidean spatial input using this family's declared
+    /// original-unit/replay law.  This is the sole construction path for the
+    /// ThinPlate, Matérn, Duchon, and MeasureJet `input_scales` fields.
+    pub(super) fn normalize_euclidean_frame(
+        &self,
+        mut coordinates: Array2<f64>,
+        stored_scales: Option<&[f64]>,
+        length_scale: Option<f64>,
+    ) -> Result<NormalizedEuclideanFrame, BasisError> {
+        let replay = stored_scales.is_some();
+        let scales = match stored_scales {
+            Some(scales) => {
+                validate_input_scale_vector(scales, coordinates.ncols(), self.family)?;
+                Some(scales.to_vec())
+            }
+            None => compute_spatial_input_scales(coordinates.view()),
+        };
+
+        match self.input_frame {
+            InputFrameNormalization::AutoStandardizedOriginalUnits
+            | InputFrameNormalization::AutoStandardizedFreshOriginalReplayRealized => {}
+            InputFrameNormalization::Parameterized
+            | InputFrameNormalization::Intrinsic
+            | InputFrameNormalization::PcaGauge
+            | InputFrameNormalization::Delegated => {
+                return Err(BasisError::InvalidInput(format!(
+                    "basis {:?} does not declare Euclidean auto-standardization",
+                    self.family
+                )));
+            }
+        }
+
+        let transformed_length = if let Some(scales) = scales.as_deref() {
+            apply_input_standardization(&mut coordinates, scales);
+            match self.input_frame {
+                InputFrameNormalization::AutoStandardizedOriginalUnits => {
+                    length_scale.map(|ell| compensate_length_scale_for_standardization(ell, scales))
+                }
+                InputFrameNormalization::AutoStandardizedFreshOriginalReplayRealized if replay => {
+                    length_scale
+                }
+                InputFrameNormalization::AutoStandardizedFreshOriginalReplayRealized => {
+                    length_scale.map(|ell| {
+                        if ell > 0.0 {
+                            compensate_length_scale_for_standardization(ell, scales)
+                        } else {
+                            ell
+                        }
+                    })
+                }
+                InputFrameNormalization::Parameterized
+                | InputFrameNormalization::Intrinsic
+                | InputFrameNormalization::PcaGauge
+                | InputFrameNormalization::Delegated => {
+                    unreachable!("the normalization policy was checked before applying the frame")
+                }
+            }
+        } else {
+            length_scale
+        };
+
+        Ok(NormalizedEuclideanFrame {
+            coordinates,
+            input_scales: scales,
+            length_scale: transformed_length,
+        })
+    }
+}
+
+fn scale(power: i8, parameter: DimensionfulBasisParameter) -> DimensionfulParameterScale {
+    DimensionfulParameterScale::new(parameter, power)
+}
+
+fn bspline_family(spec: &BSplineBasisSpec) -> BasisScaleFamily {
+    match (&spec.knotspec, &spec.boundary) {
+        (BSplineKnotSpec::NaturalCubicRegression { .. }, _) => BasisScaleFamily::NaturalCubic,
+        (BSplineKnotSpec::PeriodicUniform { .. }, _)
+        | (_, OneDimensionalBoundary::Cyclic { .. }) => BasisScaleFamily::CyclicBSpline,
+        (BSplineKnotSpec::Generate { .. }, OneDimensionalBoundary::Open)
+        | (BSplineKnotSpec::Automatic { .. }, OneDimensionalBoundary::Open)
+        | (BSplineKnotSpec::Provided(_), OneDimensionalBoundary::Open) => {
+            BasisScaleFamily::OpenBSpline
+        }
+    }
+}
+
+fn bspline_contract(spec: &BSplineBasisSpec) -> BasisScaleContract {
+    let family = bspline_family(spec);
+    let (null_geometry, mut parameters) = match family {
+        BasisScaleFamily::OpenBSpline | BasisScaleFamily::NaturalCubic => (
+            BasisNullGeometryScaleLaw::PolynomialPullback,
+            vec![scale(1, DimensionfulBasisParameter::Knots)],
+        ),
+        BasisScaleFamily::CyclicBSpline => (
+            BasisNullGeometryScaleLaw::CyclicConstantMode,
+            vec![
+                scale(1, DimensionfulBasisParameter::Knots),
+                scale(1, DimensionfulBasisParameter::DomainEndpoints),
+                scale(1, DimensionfulBasisParameter::Periods),
+            ],
+        ),
+        BasisScaleFamily::ByVariableNumeric
+        | BasisScaleFamily::ByVariableFactor
+        | BasisScaleFamily::FactorSumToZero
+        | BasisScaleFamily::BySmoothNumeric
+        | BasisScaleFamily::BySmoothFactor
+        | BasisScaleFamily::FactorSmoothFs
+        | BasisScaleFamily::FactorSmoothSz
+        | BasisScaleFamily::FactorSmoothRe
+        | BasisScaleFamily::ThinPlate
+        | BasisScaleFamily::SphereWahba
+        | BasisScaleFamily::SphereHarmonic
+        | BasisScaleFamily::ConstantCurvature
+        | BasisScaleFamily::Matern
+        | BasisScaleFamily::MeasureJet
+        | BasisScaleFamily::PureDuchon
+        | BasisScaleFamily::HybridDuchon
+        | BasisScaleFamily::Pca
+        | BasisScaleFamily::TensorBSpline => {
+            unreachable!("bspline_family returned a non-B-spline family")
+        }
+    };
+    if matches!(spec.knotspec, BSplineKnotSpec::Generate { .. }) {
+        parameters.push(scale(1, DimensionfulBasisParameter::DomainEndpoints));
+    }
+    let penalty = if family == BasisScaleFamily::NaturalCubic {
+        BasisPenaltyScaleLaw::FrobeniusNormalizedRawPower(-3)
+    } else {
+        BasisPenaltyScaleLaw::FrobeniusNormalizedDerivativeOrder {
+            order: spec.penalty_order,
+        }
+    };
+    BasisScaleContract::leaf(
+        family,
+        BasisCoordinateScaleAction::PositiveAffineAbscissa,
+        BasisDesignScaleLaw::Invariant,
+        penalty,
+        BasisDerivativeScaleLaw::InverseCoordinatePower { maximum_order: 2 },
+        null_geometry,
+        parameters,
+        InputFrameNormalization::Parameterized,
+    )
+}
+
+fn spatial_parameters(
+    include_length: bool,
+    include_periods: bool,
+) -> Vec<DimensionfulParameterScale> {
+    let mut parameters = vec![
+        scale(1, DimensionfulBasisParameter::Centers),
+        scale(1, DimensionfulBasisParameter::InputStandardDeviations),
+    ];
+    if include_length {
+        parameters.push(scale(1, DimensionfulBasisParameter::LengthScale));
+    }
+    if include_periods {
+        parameters.push(scale(1, DimensionfulBasisParameter::Periods));
+    }
+    parameters
+}
+
+impl SmoothBasisSpec {
+    /// Return the complete scale contract for this concrete basis tree.
+    ///
+    /// There is intentionally no wildcard arm: a new `SmoothBasisSpec` variant
+    /// cannot compile until its design, penalty, derivative, null-space, and
+    /// dimensionful-parameter laws are all selected here.
+    pub fn scale_contract(&self) -> BasisScaleContract {
+        match self {
+            SmoothBasisSpec::ByVariable { inner, by, .. } => match by {
+                ByVariableSpec::Numeric => BasisScaleContract::wrapper(
+                    BasisScaleFamily::ByVariableNumeric,
+                    BasisCoordinateScaleAction::NumericModulation,
+                    BasisDesignScaleLaw::NumericMultiplierDegreeOne,
+                    BasisDerivativeScaleLaw::NumericModulationProductRule,
+                    inner.scale_contract(),
+                    vec![scale(1, DimensionfulBasisParameter::NumericByMultiplier)],
+                ),
+                ByVariableSpec::Level { .. } => BasisScaleContract::wrapper(
+                    BasisScaleFamily::ByVariableFactor,
+                    BasisCoordinateScaleAction::DiscreteReplication,
+                    BasisDesignScaleLaw::ReplicatedInner,
+                    BasisDerivativeScaleLaw::DelegatedToInner,
+                    inner.scale_contract(),
+                    Vec::new(),
+                ),
+            },
+            SmoothBasisSpec::FactorSumToZero { inner, .. } => BasisScaleContract::wrapper(
+                BasisScaleFamily::FactorSumToZero,
+                BasisCoordinateScaleAction::DiscreteReplication,
+                BasisDesignScaleLaw::ReplicatedInner,
+                BasisDerivativeScaleLaw::DelegatedToInner,
+                inner.scale_contract(),
+                Vec::new(),
+            ),
+            SmoothBasisSpec::BSpline1D { spec, .. } => bspline_contract(spec),
+            SmoothBasisSpec::BySmooth { smooth, by_kind } => match by_kind {
+                ByVarKind::Numeric { .. } => BasisScaleContract::wrapper(
+                    BasisScaleFamily::BySmoothNumeric,
+                    BasisCoordinateScaleAction::NumericModulation,
+                    BasisDesignScaleLaw::NumericMultiplierDegreeOne,
+                    BasisDerivativeScaleLaw::NumericModulationProductRule,
+                    smooth.scale_contract(),
+                    vec![scale(1, DimensionfulBasisParameter::NumericByMultiplier)],
+                ),
+                ByVarKind::Factor { .. } => BasisScaleContract::wrapper(
+                    BasisScaleFamily::BySmoothFactor,
+                    BasisCoordinateScaleAction::DiscreteReplication,
+                    BasisDesignScaleLaw::ReplicatedInner,
+                    BasisDerivativeScaleLaw::DelegatedToInner,
+                    smooth.scale_contract(),
+                    Vec::new(),
+                ),
+            },
+            SmoothBasisSpec::FactorSmooth { spec } => {
+                let family = match &spec.flavour {
+                    FactorSmoothFlavour::Fs { .. } => BasisScaleFamily::FactorSmoothFs,
+                    FactorSmoothFlavour::Sz => BasisScaleFamily::FactorSmoothSz,
+                    FactorSmoothFlavour::Re => BasisScaleFamily::FactorSmoothRe,
+                };
+                BasisScaleContract::wrapper(
+                    family,
+                    BasisCoordinateScaleAction::DiscreteReplication,
+                    BasisDesignScaleLaw::ReplicatedInner,
+                    BasisDerivativeScaleLaw::DelegatedToInner,
+                    bspline_contract(&spec.marginal),
+                    Vec::new(),
+                )
+            }
+            SmoothBasisSpec::ThinPlate { .. } => BasisScaleContract::leaf(
+                BasisScaleFamily::ThinPlate,
+                BasisCoordinateScaleAction::EuclideanSimilarity,
+                BasisDesignScaleLaw::Invariant,
+                BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
+                BasisDerivativeScaleLaw::InverseCoordinatePowerAndInvariantLogRange {
+                    maximum_order: 2,
+                },
+                BasisNullGeometryScaleLaw::EuclideanPolynomialPullback,
+                spatial_parameters(true, true),
+                InputFrameNormalization::AutoStandardizedOriginalUnits,
+            ),
+            SmoothBasisSpec::Sphere { spec, .. } => {
+                let family = match spec.method {
+                    SphereMethod::Wahba => BasisScaleFamily::SphereWahba,
+                    SphereMethod::Harmonic => BasisScaleFamily::SphereHarmonic,
+                };
+                BasisScaleContract::leaf(
+                    family,
+                    BasisCoordinateScaleAction::IntrinsicAngularUnitConversion,
+                    BasisDesignScaleLaw::Invariant,
+                    BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
+                    BasisDerivativeScaleLaw::IntrinsicAngularChainRule,
+                    BasisNullGeometryScaleLaw::IntrinsicHarmonicSubspace,
+                    vec![scale(1, DimensionfulBasisParameter::Centers)],
+                    InputFrameNormalization::Intrinsic,
+                )
+            }
+            SmoothBasisSpec::ConstantCurvature { .. } => BasisScaleContract::leaf(
+                BasisScaleFamily::ConstantCurvature,
+                BasisCoordinateScaleAction::ConstantCurvatureChartSimilarity,
+                BasisDesignScaleLaw::Invariant,
+                BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
+                BasisDerivativeScaleLaw::ConstantCurvatureParameterPowers,
+                BasisNullGeometryScaleLaw::ConstantCurvatureCenterConstraint,
+                vec![
+                    scale(1, DimensionfulBasisParameter::Centers),
+                    scale(1, DimensionfulBasisParameter::LengthScale),
+                    scale(-2, DimensionfulBasisParameter::Curvature),
+                ],
+                InputFrameNormalization::Intrinsic,
+            ),
+            SmoothBasisSpec::Matern { .. } => BasisScaleContract::leaf(
+                BasisScaleFamily::Matern,
+                BasisCoordinateScaleAction::EuclideanSimilarity,
+                BasisDesignScaleLaw::Invariant,
+                BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
+                BasisDerivativeScaleLaw::InverseCoordinatePowerAndInvariantLogRange {
+                    maximum_order: 2,
+                },
+                BasisNullGeometryScaleLaw::CenterConstraintPullback,
+                spatial_parameters(true, true),
+                InputFrameNormalization::AutoStandardizedOriginalUnits,
+            ),
+            SmoothBasisSpec::MeasureJet { .. } => BasisScaleContract::leaf(
+                BasisScaleFamily::MeasureJet,
+                BasisCoordinateScaleAction::EuclideanSimilarity,
+                BasisDesignScaleLaw::Invariant,
+                BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
+                BasisDerivativeScaleLaw::InverseCoordinatePowerAndInvariantLogRange {
+                    maximum_order: 2,
+                },
+                BasisNullGeometryScaleLaw::MeasureJetAffineHeadPullback,
+                {
+                    let mut parameters = spatial_parameters(true, false);
+                    parameters.push(scale(1, DimensionfulBasisParameter::MeasureJetScaleBand));
+                    parameters.push(scale(
+                        1,
+                        DimensionfulBasisParameter::MeasureJetCoordinateNoise,
+                    ));
+                    parameters
+                },
+                InputFrameNormalization::AutoStandardizedFreshOriginalReplayRealized,
+            ),
+            SmoothBasisSpec::Duchon { spec, .. } => {
+                let family = if spec.length_scale.is_some() {
+                    BasisScaleFamily::HybridDuchon
+                } else {
+                    BasisScaleFamily::PureDuchon
+                };
+                BasisScaleContract::leaf(
+                    family,
+                    BasisCoordinateScaleAction::EuclideanSimilarity,
+                    BasisDesignScaleLaw::Invariant,
+                    BasisPenaltyScaleLaw::FrobeniusNormalizedInvariant,
+                    if spec.length_scale.is_some() {
+                        BasisDerivativeScaleLaw::InverseCoordinatePowerAndInvariantLogRange {
+                            maximum_order: 2,
+                        }
+                    } else {
+                        BasisDerivativeScaleLaw::InverseCoordinatePower { maximum_order: 2 }
+                    },
+                    BasisNullGeometryScaleLaw::EuclideanPolynomialPullback,
+                    spatial_parameters(spec.length_scale.is_some(), true),
+                    InputFrameNormalization::AutoStandardizedOriginalUnits,
+                )
+            }
+            SmoothBasisSpec::Pca { .. } => BasisScaleContract::leaf(
+                BasisScaleFamily::Pca,
+                BasisCoordinateScaleAction::PcaScoreGauge,
+                BasisDesignScaleLaw::Invariant,
+                BasisPenaltyScaleLaw::InvariantFunctionMass,
+                BasisDerivativeScaleLaw::InverseCoordinatePower { maximum_order: 1 },
+                BasisNullGeometryScaleLaw::PcaScoreCongruence,
+                vec![
+                    scale(1, DimensionfulBasisParameter::PcaCenterMean),
+                    scale(-1, DimensionfulBasisParameter::PcaLoadings),
+                ],
+                InputFrameNormalization::PcaGauge,
+            ),
+            SmoothBasisSpec::TensorBSpline { spec, .. } => BasisScaleContract {
+                family: BasisScaleFamily::TensorBSpline,
+                coordinate_action: BasisCoordinateScaleAction::IndependentPositiveAffineAxes,
+                design: BasisDesignScaleLaw::TensorProductOfMarginals,
+                penalty: BasisPenaltyScaleLaw::FrobeniusNormalizedPerMarginalDerivativeOrder,
+                derivatives: BasisDerivativeScaleLaw::TensorMarginalProductRule {
+                    maximum_order: 2,
+                },
+                null_geometry: BasisNullGeometryScaleLaw::TensorProductPullback,
+                dimensionful_parameters: Vec::new(),
+                children: spec.marginalspecs.iter().map(bspline_contract).collect(),
+                input_frame: InputFrameNormalization::Delegated,
+            },
+        }
+    }
+
+    /// Validate every scale-bearing field before construction or frozen replay.
+    /// Wrapper recursion is exhaustive; no basis can bypass this check.
+    pub fn validate_scale_configuration(&self) -> Result<(), BasisError> {
+        let contract = self.scale_contract();
+        match self {
+            SmoothBasisSpec::ByVariable { inner, .. }
+            | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+                inner.validate_scale_configuration()
+            }
+            SmoothBasisSpec::BSpline1D { .. } => Ok(()),
+            SmoothBasisSpec::BySmooth { smooth, .. } => smooth.validate_scale_configuration(),
+            SmoothBasisSpec::FactorSmooth { spec } => {
+                let _ = bspline_contract(&spec.marginal);
+                Ok(())
+            }
+            SmoothBasisSpec::ThinPlate {
+                feature_cols,
+                input_scales,
+                ..
+            }
+            | SmoothBasisSpec::Matern {
+                feature_cols,
+                input_scales,
+                ..
+            }
+            | SmoothBasisSpec::MeasureJet {
+                feature_cols,
+                input_scales,
+                ..
+            }
+            | SmoothBasisSpec::Duchon {
+                feature_cols,
+                input_scales,
+                ..
+            } => {
+                if feature_cols.is_empty() {
+                    return Err(BasisError::InvalidInput(format!(
+                        "basis {:?} requires at least one coordinate axis",
+                        contract.family
+                    )));
+                }
+                if let Some(scales) = input_scales {
+                    validate_input_scale_vector(scales, feature_cols.len(), contract.family)?;
+                }
+                Ok(())
+            }
+            SmoothBasisSpec::Sphere { feature_cols, .. }
+            | SmoothBasisSpec::ConstantCurvature { feature_cols, .. } => {
+                if feature_cols.is_empty() {
+                    return Err(BasisError::InvalidInput(format!(
+                        "basis {:?} requires at least one coordinate axis",
+                        contract.family
+                    )));
+                }
+                Ok(())
+            }
+            SmoothBasisSpec::Pca { .. } => Ok(()),
+            SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
+                if feature_cols.len() != spec.marginalspecs.len() {
+                    return Err(BasisError::DimensionMismatch(format!(
+                        "TensorBSpline has {} feature axes but {} marginal scale contracts",
+                        feature_cols.len(),
+                        spec.marginalspecs.len()
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn validate_input_scale_vector(
+    scales: &[f64],
+    expected: usize,
+    family: BasisScaleFamily,
+) -> Result<(), BasisError> {
+    if scales.len() != expected {
+        return Err(BasisError::DimensionMismatch(format!(
+            "basis {family:?} has {} stored input scales for {expected} coordinate axes",
+            scales.len()
+        )));
+    }
+    if let Some((axis, value)) = scales
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite() || *value <= 0.0)
+    {
+        return Err(BasisError::InvalidInput(format!(
+            "basis {family:?} input scale at axis {axis} must be positive and finite, got {value}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{Array1, Array2, array};
+    use std::collections::HashSet;
+
+    fn open_marginal(scale: f64) -> BSplineBasisSpec {
+        BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Provided(Array1::from(vec![
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.25 * scale,
+                0.6 * scale,
+                scale,
+                scale,
+                scale,
+                scale,
+            ])),
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
+        }
+    }
+
+    fn basis(feature_col: usize, scale: f64) -> SmoothBasisSpec {
+        SmoothBasisSpec::BSpline1D {
+            feature_col,
+            spec: open_marginal(scale),
+        }
+    }
+
+    fn factor_spec(flavour: FactorSmoothFlavour) -> SmoothBasisSpec {
+        SmoothBasisSpec::FactorSmooth {
+            spec: FactorSmoothSpec {
+                continuous_cols: vec![0],
+                group_col: 1,
+                marginal: open_marginal(1.0),
+                flavour,
+                group_frozen_levels: Some(vec![0.0_f64.to_bits(), 1.0_f64.to_bits()]),
+                frozen_global_orthogonality: None,
+            },
+        }
+    }
+
+    fn scale_contract_zoo() -> Vec<SmoothBasisSpec> {
+        let by_level_bits = 1.0_f64.to_bits();
+        let mut sphere_harmonic = SphericalSplineBasisSpec::default();
+        sphere_harmonic.method = SphereMethod::Harmonic;
+        sphere_harmonic.max_degree = Some(3);
+        vec![
+            SmoothBasisSpec::ByVariable {
+                inner: Box::new(basis(0, 1.0)),
+                by_col: 1,
+                kind: BySmoothKind::Numeric,
+                by: ByVariableSpec::Numeric,
+            },
+            SmoothBasisSpec::ByVariable {
+                inner: Box::new(basis(0, 1.0)),
+                by_col: 1,
+                kind: BySmoothKind::Level {
+                    level_bits: by_level_bits,
+                },
+                by: ByVariableSpec::Level {
+                    value_bits: by_level_bits,
+                    label: "one".to_string(),
+                },
+            },
+            SmoothBasisSpec::FactorSumToZero {
+                inner: Box::new(basis(0, 1.0)),
+                by_col: 1,
+                levels: vec![0.0_f64.to_bits(), by_level_bits],
+                frozen_global_orthogonality: None,
+            },
+            basis(0, 1.0),
+            SmoothBasisSpec::BSpline1D {
+                feature_col: 0,
+                spec: BSplineBasisSpec {
+                    knotspec: BSplineKnotSpec::PeriodicUniform {
+                        data_range: (0.0, 1.0),
+                        num_basis: 8,
+                    },
+                    boundary: OneDimensionalBoundary::Cyclic {
+                        start: 0.0,
+                        end: 1.0,
+                    },
+                    ..open_marginal(1.0)
+                },
+            },
+            SmoothBasisSpec::BSpline1D {
+                feature_col: 0,
+                spec: BSplineBasisSpec {
+                    knotspec: BSplineKnotSpec::NaturalCubicRegression {
+                        knots: array![0.0, 0.2, 0.5, 0.8, 1.0],
+                    },
+                    ..open_marginal(1.0)
+                },
+            },
+            SmoothBasisSpec::BySmooth {
+                smooth: Box::new(basis(0, 1.0)),
+                by_kind: ByVarKind::Numeric { feature_col: 1 },
+            },
+            SmoothBasisSpec::BySmooth {
+                smooth: Box::new(basis(0, 1.0)),
+                by_kind: ByVarKind::Factor {
+                    feature_col: 1,
+                    ordered: false,
+                    frozen_levels: Some(vec![0.0_f64.to_bits(), by_level_bits]),
+                },
+            },
+            factor_spec(FactorSmoothFlavour::Fs {
+                m_null_penalty_orders: vec![1],
+            }),
+            factor_spec(FactorSmoothFlavour::Sz),
+            factor_spec(FactorSmoothFlavour::Re),
+            SmoothBasisSpec::ThinPlate {
+                feature_cols: vec![0, 1],
+                spec: ThinPlateBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                    periodic: None,
+                    length_scale: 0.7,
+                    double_penalty: false,
+                    identifiability: SpatialIdentifiability::None,
+                    radial_reparam: None,
+                },
+                input_scales: None,
+            },
+            SmoothBasisSpec::Sphere {
+                feature_cols: vec![0, 1],
+                spec: SphericalSplineBasisSpec::default(),
+            },
+            SmoothBasisSpec::Sphere {
+                feature_cols: vec![0, 1],
+                spec: sphere_harmonic,
+            },
+            SmoothBasisSpec::ConstantCurvature {
+                feature_cols: vec![0, 1],
+                spec: ConstantCurvatureBasisSpec::default(),
+            },
+            SmoothBasisSpec::Matern {
+                feature_cols: vec![0, 1],
+                spec: MaternBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                    periodic: None,
+                    length_scale: 0.7,
+                    nu: MaternNu::ThreeHalves,
+                    include_intercept: false,
+                    double_penalty: false,
+                    identifiability: MaternIdentifiability::None,
+                    aniso_log_scales: None,
+                },
+                input_scales: None,
+            },
+            SmoothBasisSpec::MeasureJet {
+                feature_cols: vec![0, 1],
+                spec: MeasureJetBasisSpec::default(),
+                input_scales: None,
+            },
+            SmoothBasisSpec::Duchon {
+                feature_cols: vec![0, 1],
+                spec: DuchonBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                    periodic: None,
+                    length_scale: None,
+                    power: 0.0,
+                    nullspace_order: DuchonNullspaceOrder::Linear,
+                    identifiability: SpatialIdentifiability::None,
+                    aniso_log_scales: None,
+                    operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    boundary: OneDimensionalBoundary::Open,
+                    radial_reparam: None,
+                },
+                input_scales: None,
+            },
+            SmoothBasisSpec::Duchon {
+                feature_cols: vec![0, 1],
+                spec: DuchonBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                    periodic: None,
+                    length_scale: Some(0.7),
+                    power: 1.0,
+                    nullspace_order: DuchonNullspaceOrder::Linear,
+                    identifiability: SpatialIdentifiability::None,
+                    aniso_log_scales: None,
+                    operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    boundary: OneDimensionalBoundary::Open,
+                    radial_reparam: None,
+                },
+                input_scales: None,
+            },
+            SmoothBasisSpec::Pca {
+                feature_cols: vec![0, 1],
+                basis_matrix: array![[1.0], [0.0]],
+                centered: true,
+                smooth_penalty: 1.0,
+                center_mean: Some(array![0.0, 0.0]),
+                pca_basis_path: None,
+                chunk_size: 32,
+            },
+            SmoothBasisSpec::TensorBSpline {
+                feature_cols: vec![0, 1],
+                spec: TensorBSplineSpec {
+                    marginalspecs: vec![open_marginal(1.0), open_marginal(1.0)],
+                    periods: vec![None, None],
+                    double_penalty: false,
+                    identifiability: TensorBSplineIdentifiability::None,
+                    penalty_decomposition:
+                        TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn scale_contract_registry_is_exhaustive_unique_and_typed_2315() {
+        let zoo = scale_contract_zoo();
+        let observed: HashSet<_> = zoo
+            .iter()
+            .map(|basis| basis.scale_contract().family)
+            .collect();
+        let expected: HashSet<_> = BasisScaleFamily::ALL.into_iter().collect();
+        assert_eq!(zoo.len(), BasisScaleFamily::ALL.len());
+        assert_eq!(observed, expected);
+
+        for basis in &zoo {
+            let contract = basis.scale_contract();
+            match contract.family {
+                BasisScaleFamily::ByVariableNumeric
+                | BasisScaleFamily::ByVariableFactor
+                | BasisScaleFamily::FactorSumToZero
+                | BasisScaleFamily::BySmoothNumeric
+                | BasisScaleFamily::BySmoothFactor
+                | BasisScaleFamily::FactorSmoothFs
+                | BasisScaleFamily::FactorSmoothSz
+                | BasisScaleFamily::FactorSmoothRe => {
+                    assert_eq!(contract.children.len(), 1, "{:?}", contract.family);
+                }
+                BasisScaleFamily::TensorBSpline => {
+                    assert_eq!(contract.children.len(), 2);
+                }
+                BasisScaleFamily::OpenBSpline
+                | BasisScaleFamily::CyclicBSpline
+                | BasisScaleFamily::NaturalCubic
+                | BasisScaleFamily::ThinPlate
+                | BasisScaleFamily::SphereWahba
+                | BasisScaleFamily::SphereHarmonic
+                | BasisScaleFamily::ConstantCurvature
+                | BasisScaleFamily::Matern
+                | BasisScaleFamily::MeasureJet
+                | BasisScaleFamily::PureDuchon
+                | BasisScaleFamily::HybridDuchon
+                | BasisScaleFamily::Pca => assert!(contract.children.is_empty()),
+            }
+            let unique_parameters: HashSet<_> = contract
+                .dimensionful_parameters
+                .iter()
+                .map(|parameter| parameter.parameter)
+                .collect();
+            assert_eq!(
+                unique_parameters.len(),
+                contract.dimensionful_parameters.len(),
+                "duplicate dimensionful parameter in {:?}",
+                contract.family
+            );
+        }
+    }
+
+    fn assert_matrix_close(actual: &Array2<f64>, expected: &Array2<f64>, tolerance: f64) {
+        assert_eq!(actual.dim(), expected.dim());
+        for ((row, col), &target) in expected.indexed_iter() {
+            let observed = actual[[row, col]];
+            assert!(
+                (observed - target).abs() <= tolerance * (1.0 + target.abs()),
+                "matrix[{row},{col}] differs: observed={observed:.16e}, target={target:.16e}"
+            );
+        }
+    }
+
+    fn assert_build_geometry_close(
+        actual: &BasisBuildResult,
+        expected: &BasisBuildResult,
+        tolerance: f64,
+    ) {
+        assert_matrix_close(&actual.design.to_dense(), &expected.design.to_dense(), tolerance);
+        assert_eq!(actual.active_penalties.len(), expected.active_penalties.len());
+        for (observed, target) in actual
+            .active_penalties
+            .iter()
+            .zip(expected.active_penalties.iter())
+        {
+            assert_eq!(observed.info.source, target.info.source);
+            assert_eq!(observed.rank, target.rank);
+            assert_eq!(observed.nullity, target.nullity);
+            assert_matrix_close(&observed.matrix, &target.matrix, tolerance);
+        }
+    }
+
+    fn scaled_cyclic_marginal(scale: f64) -> BSplineBasisSpec {
+        BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::PeriodicUniform {
+                data_range: (-0.4 * scale, 1.6 * scale),
+                num_basis: 9,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Cyclic {
+                start: -0.4 * scale,
+                end: 1.6 * scale,
+            },
+            boundary_conditions: BSplineBoundaryConditions::default(),
+        }
+    }
+
+    fn scaled_natural_marginal(scale: f64) -> BSplineBasisSpec {
+        BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::NaturalCubicRegression {
+                knots: array![0.0, 0.17, 0.43, 0.71, 1.0].mapv(|value| value * scale),
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
+        }
+    }
+
+    #[test]
+    fn declared_spline_builders_obey_design_penalty_and_null_scale_laws_2315() {
+        let open_points = array![0.0, 0.05, 0.3, 0.55, 0.72, 0.95, 1.0];
+        let cyclic_points = array![-2.4, -0.4, -0.13, 0.2, 1.1, 1.6, 3.6];
+        let natural_points = array![-0.35, 0.0, 0.09, 0.43, 0.86, 1.0, 1.28];
+
+        for (family, points, build_spec) in [
+            (
+                BasisScaleFamily::OpenBSpline,
+                open_points,
+                open_marginal as fn(f64) -> BSplineBasisSpec,
+            ),
+            (
+                BasisScaleFamily::CyclicBSpline,
+                cyclic_points,
+                scaled_cyclic_marginal as fn(f64) -> BSplineBasisSpec,
+            ),
+            (
+                BasisScaleFamily::NaturalCubic,
+                natural_points,
+                scaled_natural_marginal as fn(f64) -> BSplineBasisSpec,
+            ),
+        ] {
+            let reference_spec = build_spec(1.0);
+            assert_eq!(bspline_contract(&reference_spec).family, family);
+            let reference = build_bspline_basis_1d(points.view(), &reference_spec)
+                .expect("reference scalar basis");
+            for factor in [1e-9_f64, 1.0, 1e9] {
+                let actual = build_bspline_basis_1d(
+                    points.mapv(|value| value * factor).view(),
+                    &build_spec(factor),
+                )
+                .expect("rescaled scalar basis");
+                assert_build_geometry_close(&actual, &reference, 8e-10);
+                for (observed, target) in actual
+                    .active_penalties
+                    .iter()
+                    .zip(reference.active_penalties.iter())
+                {
+                    let rescaled = observed.info.normalization_scale * factor.powi(3);
+                    assert!(
+                        (rescaled - target.info.normalization_scale).abs()
+                            <= 2e-8 * (1.0 + target.info.normalization_scale.abs()),
+                        "{family:?} raw penalty normalizer violated a^-3 at factor {factor}"
+                    );
+                }
+            }
+        }
+
+        let tensor_data = array![
+            [0.00, 0.13],
+            [0.08, 0.91],
+            [0.22, 0.37],
+            [0.41, 1.00],
+            [0.58, 0.02],
+            [0.73, 0.66],
+            [0.89, 0.48],
+            [1.00, 0.00]
+        ];
+        let build_tensor = |x_scale: f64, y_scale: f64| {
+            let mut scaled = tensor_data.clone();
+            scaled
+                .column_mut(0)
+                .mapv_inplace(|value| value * x_scale);
+            scaled
+                .column_mut(1)
+                .mapv_inplace(|value| value * y_scale);
+            let spec = TensorBSplineSpec {
+                marginalspecs: vec![open_marginal(x_scale), open_marginal(y_scale)],
+                periods: vec![None, None],
+                double_penalty: false,
+                identifiability: TensorBSplineIdentifiability::None,
+                penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
+            };
+            build_tensor_bspline_basis(scaled.view(), &[0, 1], &spec)
+                .expect("rescaled tensor basis")
+        };
+        let reference = build_tensor(1.0, 1.0);
+        for x_scale in [1e-9_f64, 1.0, 1e9] {
+            for y_scale in [1e-9_f64, 1.0, 1e9] {
+                let actual = build_tensor(x_scale, y_scale);
+                assert_build_geometry_close(&actual, &reference, 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn euclidean_registry_frames_are_similarity_invariant_for_every_declared_family_2315() {
+        let coordinates = array![
+            [-0.9, 0.2],
+            [-0.4, 0.8],
+            [0.1, -0.6],
+            [0.7, 0.4],
+            [1.2, -0.1]
+        ];
+        let cases = [
+            (BasisScaleFamily::ThinPlate, scale_contract_zoo()[11].clone(), Some(0.7)),
+            (BasisScaleFamily::Matern, scale_contract_zoo()[15].clone(), Some(0.7)),
+            (BasisScaleFamily::MeasureJet, scale_contract_zoo()[16].clone(), Some(0.7)),
+            (BasisScaleFamily::PureDuchon, scale_contract_zoo()[17].clone(), None),
+            (BasisScaleFamily::HybridDuchon, scale_contract_zoo()[18].clone(), Some(0.7)),
+        ];
+        for (family, basis, length_scale) in cases {
+            let contract = basis.scale_contract();
+            assert_eq!(contract.family, family);
+            let reference = contract
+                .normalize_euclidean_frame(coordinates.clone(), None, length_scale)
+                .expect("reference scale frame");
+            for factor in [1e-9_f64, 1.0, 1e9] {
+                let actual = contract
+                    .normalize_euclidean_frame(
+                        coordinates.mapv(|value| factor * value),
+                        None,
+                        length_scale.map(|ell| factor * ell),
+                    )
+                    .expect("rescaled frame");
+                assert_matrix_close(&actual.coordinates, &reference.coordinates, 3e-12);
+                match (actual.length_scale, reference.length_scale) {
+                    (Some(observed), Some(target)) => assert!(
+                        (observed - target).abs() <= 3e-12 * (1.0 + target.abs()),
+                        "{family:?} effective range changed at factor {factor}: {observed} vs {target}"
+                    ),
+                    (None, None) => {}
+                    pair => panic!("{family:?} changed optional range shape: {pair:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_frozen_scale_vectors_are_rejected_before_indexing_2315() {
+        let mut basis = scale_contract_zoo()[15].clone();
+        let SmoothBasisSpec::Matern { input_scales, .. } = &mut basis else {
+            unreachable!("zoo index 15 is Matérn");
+        };
+        for invalid in [vec![1.0], vec![1.0, 0.0], vec![1.0, f64::NAN]] {
+            *input_scales = Some(invalid);
+            assert!(basis.validate_scale_configuration().is_err());
+        }
+    }
+}

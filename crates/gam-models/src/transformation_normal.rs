@@ -25,6 +25,7 @@
 //! values rather than mapping onto the full real line.
 
 mod endpoint_normalizer;
+mod alo_replay;
 
 // Shared imports re-exported so every concern submodule pulls them through
 // `use super::*;` without re-listing. `pub(crate)` lets the child globs see them.
@@ -32,6 +33,10 @@ pub(crate) use endpoint_normalizer::{
     LogNormalCdfDiffDerivatives, endpoint_chain_first, endpoint_chain_fourth,
     endpoint_chain_second, endpoint_chain_third, log_normal_cdf_diff,
     log_normal_cdf_diff_derivatives,
+};
+pub use alo_replay::{
+    TransformationNormalAloRowGeometry, TransformationNormalAloRowInput,
+    transformation_normal_alo_row_geometry,
 };
 
 pub(crate) use crate::custom_family::{

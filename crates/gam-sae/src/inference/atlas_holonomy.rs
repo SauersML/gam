@@ -916,7 +916,13 @@ pub struct GaussBonnetConfidence {
     pub standard_error: f64,
     pub polar_linearization_remainder_bound: f64,
     pub geometric_remainder_bound: f64,
-    pub rounding_margin: f64,
+    /// Distance from this observed estimate to its nearest integer-cell
+    /// boundary after deterministic remainders.
+    pub observed_rounding_margin: f64,
+    /// Uniform half-cell margin governing the frequentist probability that
+    /// rounding selects the wrong integer, independent of the realized
+    /// residual inside the selected cell.
+    pub stochastic_rounding_margin: f64,
     pub misround_probability_bound: f64,
     pub decision: AtlasStatisticalDecision<AtlasEulerCharacteristic>,
 }
@@ -1144,6 +1150,116 @@ mod tests {
         assert!((left - right).abs() <= f64::EPSILON.sqrt() * scale);
     }
 
+    /// Test-only independent SplitMix64 + Box--Muller stream. The production
+    /// certificate contains no RNG; this deliberately avoids sharing any
+    /// numerical path with its variance and tail calculations.
+    struct DeterministicGaussian {
+        state: u64,
+        spare: Option<f64>,
+    }
+
+    impl DeterministicGaussian {
+        fn new(seed: u64) -> Self {
+            Self {
+                state: seed,
+                spare: None,
+            }
+        }
+
+        fn uniform_open(&mut self) -> f64 {
+            self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
+            let mut value = self.state;
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+            value ^= value >> 31;
+            ((value >> 11) as f64 + 0.5) / ((1_u64 << 53) as f64)
+        }
+
+        fn normal(&mut self) -> f64 {
+            if let Some(spare) = self.spare.take() {
+                return spare;
+            }
+            let radius = (-2.0 * self.uniform_open().ln()).sqrt();
+            let angle = std::f64::consts::TAU * self.uniform_open();
+            self.spare = Some(radius * angle.sin());
+            radius * angle.cos()
+        }
+    }
+
+    fn identity_projection(ambient: usize) -> Array2<f64> {
+        let mut identity = Array2::<f64>::zeros((ambient, ambient));
+        for diagonal in 0..ambient {
+            identity[[diagonal, diagonal]] = 1.0;
+        }
+        identity
+    }
+
+    fn plane_tangent(angle: f64, ambient: usize) -> Array2<f64> {
+        let mut tangent = Array2::<f64>::zeros((ambient, INTRINSIC_DIMENSION));
+        tangent[[0, 0]] = angle.cos();
+        tangent[[2, 0]] = angle.sin();
+        tangent[[1, 1]] = 1.0;
+        tangent
+    }
+
+    fn orthonormalize_two_columns(mut frame: Array2<f64>) -> Array2<f64> {
+        let first_norm = frame.column(0).dot(&frame.column(0)).sqrt();
+        for row in 0..frame.nrows() {
+            frame[[row, 0]] /= first_norm;
+        }
+        let projection = frame.column(0).dot(&frame.column(1));
+        for row in 0..frame.nrows() {
+            frame[[row, 1]] -= projection * frame[[row, 0]];
+        }
+        let second_norm = frame.column(1).dot(&frame.column(1)).sqrt();
+        for row in 0..frame.nrows() {
+            frame[[row, 1]] /= second_norm;
+        }
+        frame
+    }
+
+    fn perturb_tangent(
+        tangent: &Array2<f64>,
+        standard_deviation: f64,
+        gaussian: &mut DeterministicGaussian,
+    ) -> Array2<f64> {
+        let mut perturbed = tangent.clone();
+        for value in &mut perturbed {
+            *value += standard_deviation * gaussian.normal();
+        }
+        orthonormalize_two_columns(perturbed)
+    }
+
+    fn projected_patch_from_tangent(
+        chart: usize,
+        inference_rows: usize,
+        tangent: Array2<f64>,
+    ) -> GaussianPcaPatch {
+        let ambient = tangent.nrows();
+        GaussianPcaPatch::new(
+            chart,
+            inference_rows,
+            inference_rows,
+            GaussianPatchCentering::MeanEstimatedOnInferenceRows,
+            identity_projection(ambient),
+            tangent,
+            0.01,
+            1.0,
+            GaussianPcaPopulationBounds::new(0.01, 2.0, 1.0).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn polar_edge_angle(from: &Array2<f64>, to: &Array2<f64>) -> f64 {
+        let cross = to.t().dot(from);
+        (cross[[1, 0]] - cross[[0, 1]]).atan2(cross[[0, 0]] + cross[[1, 1]])
+    }
+
+    fn wrap_signed_angle(angle: f64) -> f64 {
+        (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
+            - std::f64::consts::PI
+    }
+
     #[test]
     fn authoritative_edge_constructors_enforce_canonical_identity() {
         assert!(AtlasHolonomyEdgeId::new(1, 1, 0).is_err());
@@ -1336,6 +1452,146 @@ mod tests {
     }
 
     #[test]
+    fn independent_projector_simulation_calibrates_cycle_plugin_variance() {
+        const REPLICATES: usize = 2_048;
+        let ambient = 4;
+        let inference_rows = 100_000;
+        let true_tangents = [
+            plane_tangent(0.0, ambient),
+            plane_tangent(0.2, ambient),
+            plane_tangent(-0.15, ambient),
+        ];
+        let base = GaussianPcaHolonomyAnalysis::certify(
+            true_tangents
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(chart, tangent)| {
+                    projected_patch_from_tangent(chart, inference_rows, tangent)
+                })
+                .collect(),
+            triangle_edges(),
+            AtlasFamilywiseLevel::new(0.05).unwrap(),
+            None,
+        )
+        .unwrap();
+        let cycle = &base.cycles()[0];
+        let plugin_standard_error = cycle.standard_error.unwrap();
+        assert!(plugin_standard_error > 0.0);
+        let perturbation_sd = base.patch_summaries()[0]
+            .projector_variance_scale()
+            .sqrt();
+        let gaussian_boundary = cycle_rejection_boundary(
+            plugin_standard_error,
+            0.0,
+            0.0,
+            cycle.gaussian_error_budget,
+        )
+        .unwrap();
+
+        let mut gaussian = DeterministicGaussian::new(0x2311_0001);
+        let mut sum = 0.0;
+        let mut sum_squares = 0.0;
+        let mut rejections = 0usize;
+        for _ in 0..REPLICATES {
+            let fitted: Vec<_> = true_tangents
+                .iter()
+                .map(|tangent| perturb_tangent(tangent, perturbation_sd, &mut gaussian))
+                .collect();
+            let angle = wrap_signed_angle(
+                polar_edge_angle(&fitted[0], &fitted[1])
+                    + polar_edge_angle(&fitted[1], &fitted[2])
+                    + polar_edge_angle(&fitted[2], &fitted[0]),
+            );
+            sum += angle;
+            sum_squares += angle * angle;
+            rejections += usize::from(angle.abs() > gaussian_boundary);
+        }
+        let mean = sum / REPLICATES as f64;
+        let empirical_sd =
+            (sum_squares / REPLICATES as f64 - mean * mean).max(0.0).sqrt();
+        assert!(
+            (empirical_sd / plugin_standard_error - 1.0).abs() <= 0.15,
+            "plugin sd={plugin_standard_error:.6e}, independent Monte-Carlo sd={empirical_sd:.6e}"
+        );
+        let rejection_rate = rejections as f64 / REPLICATES as f64;
+        let nominal = cycle.gaussian_error_budget;
+        let binomial_standard_error =
+            (nominal * (1.0 - nominal) / REPLICATES as f64).sqrt();
+        assert!(
+            (rejection_rate - nominal).abs() <= 5.0 * binomial_standard_error,
+            "nominal={nominal:.6}, empirical rejection={rejection_rate:.6}"
+        );
+    }
+
+    #[test]
+    fn two_sided_cycle_test_has_nominal_size_and_closed_form_power() {
+        const REPLICATES: usize = 4_096;
+        let alpha = 0.05;
+        let standard_error = 0.2;
+        let boundary = cycle_rejection_boundary(standard_error, 0.0, 0.0, alpha).unwrap();
+        let critical = boundary / standard_error;
+        let noncentrality = 3.0;
+        let normal = Normal::new(0.0, 1.0).unwrap();
+        let expected_power = 1.0 - normal.cdf(critical - noncentrality)
+            + normal.cdf(-critical - noncentrality);
+        let mut gaussian = DeterministicGaussian::new(0x2311_0002);
+        let mut null_rejections = 0usize;
+        let mut alternative_rejections = 0usize;
+        for _ in 0..REPLICATES {
+            null_rejections += usize::from(
+                (standard_error * gaussian.normal()).abs() > boundary,
+            );
+            alternative_rejections += usize::from(
+                (standard_error * (noncentrality + gaussian.normal())).abs() > boundary,
+            );
+        }
+        let null_rate = null_rejections as f64 / REPLICATES as f64;
+        let power = alternative_rejections as f64 / REPLICATES as f64;
+        let null_mc_se = (alpha * (1.0 - alpha) / REPLICATES as f64).sqrt();
+        let power_mc_se =
+            (expected_power * (1.0 - expected_power) / REPLICATES as f64).sqrt();
+        assert!((null_rate - alpha).abs() <= 5.0 * null_mc_se);
+        assert!((power - expected_power).abs() <= 5.0 * power_mc_se);
+        assert!(power > null_rate);
+    }
+
+    #[test]
+    fn observed_orientation_flips_do_not_exceed_finite_sample_bound() {
+        const REPLICATES: usize = 2_048;
+        let inference_rows = 1_000_000;
+        let true_a = plane_tangent(0.0, 3);
+        let true_b = plane_tangent(0.2, 3);
+        let analysis = GaussianPcaHolonomyAnalysis::certify(
+            vec![
+                projected_patch_from_tangent(0, inference_rows, true_a.clone()),
+                projected_patch_from_tangent(1, inference_rows, true_b.clone()),
+            ],
+            vec![ProjectedAtlasEdgeSpec::new(0, 1, 0, 0.0).unwrap()],
+            AtlasFamilywiseLevel::new(0.05).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert!(analysis.orientation().certified_value().is_some());
+        let bound = analysis.orientation_flip_probability_bound();
+        let perturbation_sd = analysis.patch_summaries()[0]
+            .projector_variance_scale()
+            .sqrt();
+        let mut gaussian = DeterministicGaussian::new(0x2311_0003);
+        let mut flips = 0usize;
+        for _ in 0..REPLICATES {
+            let fitted_a = perturb_tangent(&true_a, perturbation_sd, &mut gaussian);
+            let fitted_b = perturb_tangent(&true_b, perturbation_sd, &mut gaussian);
+            flips += usize::from(determinant_2(fitted_b.t().dot(&fitted_a).view()) < 0.0);
+        }
+        let observed = flips as f64 / REPLICATES as f64;
+        assert!(
+            observed <= bound + 1.0 / REPLICATES as f64,
+            "observed flip rate {observed:.6e} exceeded finite-sample bound {bound:.6e}"
+        );
+    }
+
+    #[test]
     fn ambient_zero_padding_does_not_enter_projected_variance_or_tail() {
         let base = triangle_analysis([(0.0, false); 3], 0);
         let padded = triangle_analysis([(0.0, false); 3], 97);
@@ -1501,6 +1757,58 @@ mod tests {
             confidence.decision.refusals(),
             [AtlasStatisticalRefusal::GaussBonnetRoundingMarginExhausted { .. }]
         ));
+    }
+
+    #[test]
+    fn integer_euler_confidence_calibrates_under_independent_gaussian_curvature() {
+        const REPLICATES: usize = 4_096;
+        let requested_alpha = 0.05;
+        let target_misround_probability = 0.04;
+        let normal = Normal::new(0.0, 1.0).unwrap();
+        let critical = normal.inverse_cdf(1.0 - target_misround_probability / 2.0);
+        let standard_error = std::f64::consts::PI / critical;
+        let true_chi = AtlasEulerCharacteristic(2);
+        let template = GaussBonnetInput::new(
+            vec![
+                GaussBonnetNoiseSource::new(0, arr2(&[[standard_error * standard_error]])).unwrap(),
+            ],
+            vec![
+                GaussBonnetContribution::new(
+                    std::f64::consts::TAU * true_chi.value() as f64,
+                    0.0,
+                    0.0,
+                    vec![GaussBonnetSourceGradient::new(0, array![1.0]).unwrap()],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut gaussian = DeterministicGaussian::new(0x2311_0004);
+        let mut wrong = 0usize;
+        for _ in 0..REPLICATES {
+            let mut input = template.clone();
+            input.contributions[0].curvature_estimate = std::f64::consts::TAU
+                * true_chi.value() as f64
+                + standard_error * gaussian.normal();
+            let confidence = gauss_bonnet_confidence(&input, requested_alpha).unwrap();
+            assert_eq!(
+                confidence.decision.error_probability_bound(),
+                Some(confidence.misround_probability_bound)
+            );
+            assert!(confidence.misround_probability_bound <= requested_alpha);
+            wrong += usize::from(
+                confidence.decision.certified_value().copied() != Some(true_chi),
+            );
+        }
+        let observed = wrong as f64 / REPLICATES as f64;
+        let binomial_standard_error = (target_misround_probability
+            * (1.0 - target_misround_probability)
+            / REPLICATES as f64)
+            .sqrt();
+        assert!(
+            (observed - target_misround_probability).abs() <= 5.0 * binomial_standard_error,
+            "declared misround={target_misround_probability:.6}, observed={observed:.6}"
+        );
     }
 }
 
@@ -2028,6 +2336,28 @@ fn edge_step_matrix(edge: &EdgeWork, forward: bool) -> Option<Array2<f64>> {
     })
 }
 
+fn gaussian_two_sided_radius(
+    standard_error: f64,
+    error_probability: f64,
+) -> Result<f64, String> {
+    let normal = Normal::new(0.0, 1.0)
+        .map_err(|error| format!("standard-normal construction failed: {error}"))?;
+    Ok(normal.inverse_cdf(1.0 - error_probability / 2.0) * standard_error)
+}
+
+fn cycle_rejection_boundary(
+    standard_error: f64,
+    polar_linearization_remainder_bound: f64,
+    geometric_remainder_bound: f64,
+    gaussian_error_budget: f64,
+) -> Result<f64, String> {
+    Ok(gaussian_two_sided_radius(
+        standard_error,
+        gaussian_error_budget,
+    )? + polar_linearization_remainder_bound
+        + geometric_remainder_bound)
+}
+
 fn analyze_cycle(
     cycle_index: usize,
     cycle: &FundamentalCycle,
@@ -2333,11 +2663,12 @@ fn analyze_cycle(
             decision: AtlasStatisticalDecision::Refused { reasons },
         });
     }
-    let normal = Normal::new(0.0, 1.0)
-        .map_err(|error| format!("standard-normal construction failed: {error}"))?;
-    let critical = normal.inverse_cdf(1.0 - gaussian_error_budget / 2.0);
-    let rejection_boundary =
-        critical * standard_error + polar_linearization_remainder_bound + geometric_remainder_bound;
+    let rejection_boundary = cycle_rejection_boundary(
+        standard_error,
+        polar_linearization_remainder_bound,
+        geometric_remainder_bound,
+        gaussian_error_budget,
+    )?;
     if std::f64::consts::PI - absolute_angle <= rejection_boundary {
         return Ok(AtlasCycleHolonomy {
             cycle_index,
@@ -2462,8 +2793,17 @@ fn gauss_bonnet_confidence(
         - std::f64::consts::TAU * nearest_integer_candidate.value() as f64)
         .abs();
     let total_remainder = polar_linearization_remainder_bound + geometric_remainder_bound;
-    let rounding_margin = std::f64::consts::PI - residual_to_integer_curvature - total_remainder;
-    let (misround_probability_bound, decision) = if rounding_margin <= 0.0 {
+    let observed_rounding_margin =
+        std::f64::consts::PI - residual_to_integer_curvature - total_remainder;
+    // The wrong-integer event is `|noise| >= pi - deterministic_remainder`.
+    // Its probability is uniform over the realized position inside the chosen
+    // rounding cell. Subtracting that observed residual from the Gaussian tail
+    // radius would turn a frequentist error rate into a data-dependent number
+    // and could not be advertised as the misround probability.
+    let stochastic_rounding_margin = std::f64::consts::PI - total_remainder;
+    let (misround_probability_bound, decision) = if observed_rounding_margin <= 0.0
+        || stochastic_rounding_margin <= 0.0
+    {
         (
             1.0,
             AtlasStatisticalDecision::Refused {
@@ -2481,7 +2821,8 @@ fn gauss_bonnet_confidence(
         } else {
             let normal = Normal::new(0.0, 1.0)
                 .map_err(|error| format!("standard-normal construction failed: {error}"))?;
-            (2.0 * (1.0 - normal.cdf(rounding_margin / standard_error))).clamp(0.0, 1.0)
+            (2.0 * (1.0 - normal.cdf(stochastic_rounding_margin / standard_error)))
+                .clamp(0.0, 1.0)
         };
         if probability <= allocated_alpha {
             (
@@ -2513,7 +2854,8 @@ fn gauss_bonnet_confidence(
         standard_error,
         polar_linearization_remainder_bound,
         geometric_remainder_bound,
-        rounding_margin,
+        observed_rounding_margin,
+        stochastic_rounding_margin,
         misround_probability_bound,
         decision,
     })
