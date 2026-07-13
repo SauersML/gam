@@ -2863,9 +2863,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // is consumable wherever the slope information `G` (the per-row
     // `∂score_β/∂ζ_i` of the marginal/logslope blocks) is available.
     //
-    // ASSEMBLY READY, ONE ENGINE QUANTITY OUTSTANDING. The full correction is
-    // assembled by `LatentZConditionalCalibration::generated_regressor_correction`
-    // (mod.rs): given the per-row reduced-frame slope-score sensitivity to the
+    // The full correction is assembled by
+    // `LatentZConditionalCalibration::generated_regressor_correction` (mod.rs):
+    // given the per-row reduced-frame slope-score sensitivity to the
     // calibrated score `s_i = ∂score_β,i/∂ζ_i` (an `n × p_β` matrix), it
     //   1. builds `J_zeta` row-by-row via `zeta_theta1_jacobian_row` (exact-zero
     //      on floored rows, so `G`'s support is the gate-fired rows),
@@ -2874,55 +2874,41 @@ pub fn fit_bernoulli_marginal_slope_terms(
     //      covariance IS `H_β⁻¹`, so `H_β⁻¹ G = Vb·G`), and
     //   4. returns `(Vb·G)·V₁·(Vb·G)ᵀ` (PSD ⇒ corrected slope SE strictly ≥
     //      naive whenever the gate fires).
-    // So `V₁`, `∂ζ/∂θ₁`, the `Vb` frame, and the whole congruence are all
-    // available HERE — the only quantity the seam still lacks is `s_i`.
+    // `V₁`, `∂ζ/∂θ₁`, the `Vb` frame, and the whole congruence therefore meet
+    // here with the exact row-kernel `s_i` channel.
     //
     // `s_i = ∂²ℓ_i/∂β∂ζ_i = J_iᵀ·(∂²ℓ_i/∂η_i∂ζ_i)` is the mixed `(β, ζ)` second
     // derivative of the row kernel contracted through the slope Jacobian `J_i`.
-    // When the calibrated residual ζ passes the standard-normal adequacy gate,
-    // `build_latent_measure_with_geometry` pairs `ConditionalLocationScale`
-    // with `LatentMeasureKind::StandardNormal` and the per-row kernel is the
-    // closed-form `rigid_standard_normal` tower
-    // `η = q·c(g) + g·(s·ζ)`. The mixed 2-vector `∂²ℓ_i/∂(q,g)∂ζ_i` is read off the
-    // SAME `Tower4` the value/grad/Hessian path uses (#932 row-jet machinery) by
-    // seeding `ζ` as a third jet axis
-    // (`rigid_standard_normal_mixed_z_sensitivity`); contracting it through the
-    // marginal+logslope design rows (the `J_iᵀ` the row kernel exposes via
-    // `jacobian_transpose_action`) yields `s_i` in the SAME reduced frame as
-    // `covariance_conditional` (`rigid_standard_normal_score_zeta_sensitivity`).
+    // For the rigid StandardNormal kernel the mixed 2-vector is read from the
+    // same row tower by seeding ζ as a third axis. For score_warp/link_dev flex
+    // kernels, the span-local cubic row calculus differentiates its observed-z
+    // coefficient jets and scatters every active primary into the same reduced
+    // full-beta frame as `covariance_conditional` (#2303).
     let (latent_z_rank_int_calibration, latent_z_conditional_calibration) =
         match latent_z_calibration {
             LatentMeasureCalibration::None => (None, None),
             LatentMeasureCalibration::RankInverseNormal(cal) => (Some(cal), None),
             LatentMeasureCalibration::ConditionalLocationScale(cal) => (None, Some(cal)),
         };
-    // #905/#1028: apply the Murphy–Topel generated-regressor correction now that
-    // `s_i` is available. `covariance_conditional` (Vb) and `covariance_corrected`
-    // (Vp) are in the reduced logslope frame (`p_m + r`), exactly the frame
-    // `s_i`'s reduced-logslope contraction lives in, so add the PSD term
-    // `(Vb·G)·V₁·(Vb·G)ᵀ` to each. Applied only for the canonical (non-flex)
-    // standard-normal kernel: the rigid tower carries no score_warp/link_dev
-    // z-dependence, so when aux deviation blocks widen β beyond `p_m + r` the
-    // correction's deviation columns are not yet derived and the term is skipped
-    // (the conditional gate's intended kernel has no such blocks). Likewise
-    // skipped when the calibrated residual failed the standard-normal adequacy
-    // gate and the fit ran under the empirical latent measure: the `s_i`
-    // sensitivity below is read off the rigid standard-normal tower, which is
-    // not the kernel that produced `Vb` in that case.
+    // #905/#1028/#2303: apply the Murphy–Topel correction while every block is
+    // still in the exact reduced covariance frame. The rigid kernel uses its
+    // three-axis tower; flex fits use the observed-z derivative channel from
+    // the same span-local cubic row calculus that produced their score and
+    // Hessian, including every score_warp/link_dev coefficient. No active block
+    // may be padded with zero sensitivity or skipped.
     if let Some(cal) = latent_z_conditional_calibration.as_ref()
-        && matches!(latent_measure, LatentMeasureKind::StandardNormal)
         && let Some(vb) = solved_fit.covariance_conditional.clone()
     {
+        if !matches!(latent_measure, LatentMeasureKind::StandardNormal) {
+            return Err(
+                "BMS Murphy-Topel generated-regressor covariance is unavailable for a conditional latent-z calibration whose second-stage latent measure is not StandardNormal"
+                    .to_string(),
+            );
+        }
         let p_beta = vb.nrows();
-        let marginal_dense = marginal_design
+        let calibration_marginal_dense = marginal_design
             .design
             .try_to_dense_arc("bms generated-regressor marginal design")?;
-        let logslope_reduced = reduce_logslope_design(&logslope_design)?;
-        let logslope_reduced_dense = logslope_reduced
-            .design
-            .try_to_dense_arc("bms generated-regressor reduced logslope design")?;
-        let p_m = marginal_dense.ncols();
-        let r = logslope_reduced_dense.ncols();
         if p_beta != vb.ncols() {
             return Err(format!(
                 "bms generated-regressor: covariance_conditional must be square, got {}×{}",
@@ -2930,14 +2916,40 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 vb.ncols()
             ));
         }
-        // Skip when aux deviation (score_warp / link_dev) blocks are present:
-        // β is wider than the marginal+reduced-logslope frame the rigid kernel's
-        // z-channel covers. Equality ⇒ the canonical non-flex gate kernel.
-        if p_beta == p_m + r {
+        let correction_family = make_family(
+            &marginal_design,
+            &logslope_design,
+            final_sigma_cell.get(),
+        );
+        let flex_active = score_warp_runtime.is_some() || link_dev_runtime.is_some();
+        let s = if flex_active {
+            correction_family.flex_score_zeta_sensitivity(
+                &solved_fit.block_states,
+                options,
+                p_beta,
+            )?
+        } else {
+            // Use the FAMILY designs here, not the raw reporting designs: they
+            // are exactly the widened-marginal/reduced-logslope coefficient
+            // frame carried by Vb (including an active influence absorber).
+            let score_marginal_dense = correction_family
+                .marginal_design
+                .try_to_dense_arc("bms generated-regressor fitted marginal design")?;
+            let score_logslope_dense = correction_family
+                .logslope_design
+                .try_to_dense_arc("bms generated-regressor fitted logslope design")?;
+            let p_score = score_marginal_dense.ncols() + score_logslope_dense.ncols();
+            if p_beta != p_score {
+                return Err(format!(
+                    "bms generated-regressor rigid covariance/frame mismatch: covariance width {p_beta} != marginal({}) + logslope({})",
+                    score_marginal_dense.ncols(),
+                    score_logslope_dense.ncols()
+                ));
+            }
             let marginal_eta = &solved_fit.block_states[0].eta;
             let slope_eta = &solved_fit.block_states[1].eta;
             let probit_scale = probit_frailty_scale(final_sigma_cell.get());
-            let s = rigid_standard_normal_score_zeta_sensitivity(
+            rigid_standard_normal_score_zeta_sensitivity(
                 &spec.base_link,
                 marginal_eta,
                 slope_eta,
@@ -2945,43 +2957,49 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 y.as_ref(),
                 weights.as_ref(),
                 probit_scale,
-                marginal_dense.view(),
-                logslope_reduced_dense.view(),
+                score_marginal_dense.view(),
+                score_logslope_dense.view(),
                 p_beta,
-            )?;
-            // `generated_regressor_correction` re-derives `∂ζ_i/∂θ₁` via
-            // `zeta_theta1_jacobian_row(z_i, a_row)`, which expects the RAW
-            // normalized latent score `z_i` (it recomputes `ζ_i = (z_i − m)/√v`
-            // internally), and conditions on the marginal-index span
-            // `a(C_i)` = the RAW marginal design rows (the basis the gate was fit
-            // on). Feed `spec.z` (the standardized raw score, NOT the calibrated
-            // ζ the kernel consumed) and the raw marginal dense design.
-            let correction = cal.generated_regressor_correction(
-                s.view(),
-                spec.z.view(),
-                marginal_dense.view(),
-                vb.view(),
-            )?;
-            if let Some(cov) = solved_fit.covariance_conditional.as_mut() {
-                *cov = &*cov + &correction;
-            }
-            if let Some(cov) = solved_fit.covariance_corrected.as_mut() {
-                *cov = &*cov + &correction;
-            }
-            log::info!(
-                "[BMS latent-z] Murphy–Topel generated-regressor SE correction applied: \
-                 p_beta={p_beta} theta1_dim={} max_diag_inflation={:.3e}",
-                cal.theta1_dim(),
-                (0..p_beta)
-                    .map(|i| correction[[i, i]])
-                    .fold(0.0_f64, f64::max),
-            );
-        } else {
-            log::info!(
-                "[BMS latent-z] Murphy–Topel generated-regressor SE correction skipped: \
-                 aux deviation blocks present (p_beta={p_beta} > marginal({p_m})+logslope({r})); \
-                 rigid-kernel z-channel does not yet cover score_warp/link_dev deviations"
-            );
+            )?
+        };
+        // The first-stage Jacobian expects the RAW normalized score and the
+        // raw calibration design, whereas `s` above is evaluated at the
+        // calibrated score consumed by the second-stage kernel.
+        let correction = cal.generated_regressor_correction(
+            s.view(),
+            spec.z.view(),
+            calibration_marginal_dense.view(),
+            vb.view(),
+        )?;
+        if let Some(cov) = solved_fit.covariance_conditional.as_mut() {
+            *cov = &*cov + &correction;
+        }
+        if let Some(cov) = solved_fit.covariance_corrected.as_mut() {
+            *cov = &*cov + &correction;
+        }
+        log::info!(
+            "[BMS latent-z] Murphy–Topel generated-regressor SE correction applied: \
+             p_beta={p_beta} flex_active={flex_active} theta1_dim={} max_diag_inflation={:.3e}",
+            cal.theta1_dim(),
+            (0..p_beta)
+                .map(|i| correction[[i, i]])
+                .fold(0.0_f64, f64::max),
+        );
+    }
+    // Only after covariance correction is complete may the reported logslope
+    // coefficients be lifted from fitted G*T coordinates into the original
+    // full-width G frame used by prediction and reporting.
+    if let Some(reparam) = logslope_reduced_reparam.as_ref() {
+        let r = reparam.reduced_cols();
+        if let Some(block) = solved_fit.blocks.get_mut(1)
+            && block.beta.len() == r
+        {
+            block.beta = reparam.recover_original_logslope_beta(&block.beta)?;
+        }
+        if let Some(state) = solved_fit.block_states.get_mut(1)
+            && state.beta.len() == r
+        {
+            state.beta = reparam.recover_original_logslope_beta(&state.beta)?;
         }
     }
     // #461: PREDICT SEAM — when the Stage-1 influence absorber is active

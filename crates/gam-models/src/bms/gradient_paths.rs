@@ -1829,13 +1829,10 @@ pub(super) fn rigid_standard_normal_mixed_z_sensitivity(
 ///   s_i[logslope_range]  = (∂²(log L_i)/∂g∂ζ_i) · logslope_design.row(i)
 /// ```
 ///
-/// `logslope_design` MUST be the reduced-basis design `G·T` actually fitted
-/// (so `p_β = p_marginal + r` matches the reduced-frame `covariance_conditional`
-/// the correction inflates). The aux deviation blocks (score_warp / link_dev),
-/// when present, occupy the trailing columns of `p_beta` and are left zero here:
-/// the rigid standard-normal kernel carries no deviation z-dependence, and the
-/// conditional gate's canonical (non-flex) kernel has no such blocks — the
-/// caller wires the correction only when `p_beta == p_marginal + p_logslope`.
+/// `logslope_design` MUST be the reduced-basis design `G·T` actually fitted and
+/// `p_beta` MUST equal `p_marginal + r`. Flex models use the separate exact
+/// cubic-jet channel that includes score_warp/link_dev coordinates; this rigid
+/// helper never accepts or zero-pads a wider covariance frame (#2303).
 pub(super) fn rigid_standard_normal_score_zeta_sensitivity(
     base_link: &InverseLink,
     marginal_eta: &Array1<f64>,
@@ -1869,9 +1866,9 @@ pub(super) fn rigid_standard_normal_score_zeta_sensitivity(
             logslope_design.nrows()
         ));
     }
-    if p_m + r > p_beta {
+    if p_m + r != p_beta {
         return Err(format!(
-            "score_zeta_sensitivity width overflow: marginal({p_m}) + logslope({r}) > p_beta({p_beta})"
+            "rigid score_zeta_sensitivity width mismatch: marginal({p_m}) + logslope({r}) != p_beta({p_beta})"
         ));
     }
     let mut s = Array2::<f64>::zeros((n, p_beta));
@@ -2822,6 +2819,142 @@ mod flex_primary_hessian_oracle_tests {
             .compute_row_primary_gradient_hessian(row, &states, primary, &row_ctx)
             .expect("perturbed gradient");
         grad
+    }
+
+    /// NLL primary gradient after perturbing only the observed generated
+    /// regressor for one row. The latent-measure calibration root is rebuilt,
+    /// while every fitted coefficient stays fixed. Central-differencing this
+    /// and negating gives the independent LOG-LIKELIHOOD score-z derivative
+    /// used to verify the #2303 analytic channel.
+    fn flex_nll_gradient_at_perturbed_z(
+        family: &BernoulliMarginalSlopeFamily,
+        states: &[ParameterBlockState],
+        primary: &super::super::hessian_paths::PrimarySlices,
+        row: usize,
+        delta: f64,
+    ) -> Array1<f64> {
+        let mut perturbed = family.clone();
+        let mut z = family.z.as_ref().clone();
+        z[row] += delta;
+        perturbed.z = Arc::new(z);
+        let row_ctx = perturbed
+            .build_row_exact_context_with_stats_and_cell_cache(row, states, None, false)
+            .expect("z-perturbed row context");
+        let mut scratch =
+            super::super::hessian_paths::BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
+        perturbed
+            .compute_row_analytic_flex_into(
+                row,
+                states,
+                primary,
+                &row_ctx,
+                None,
+                false,
+                &mut scratch,
+            )
+            .expect("z-perturbed flex gradient");
+        scratch.grad
+    }
+
+    /// #2303: the Murphy–Topel observed-z channel must cover BOTH deviation
+    /// blocks, not merely the rigid q/logslope coordinates. Compare every
+    /// primary coordinate to an independent central difference of the score,
+    /// then assert the coefficient-space scatter retains nonzero score-warp and
+    /// link-deviation columns.
+    #[test]
+    fn flex_score_zeta_sensitivity_covers_all_active_deviation_blocks_2303() {
+        let n = 12usize;
+        let (family, states) = make_flex_oracle_family(n);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("flex exact eval cache");
+        let primary = &cache.primary;
+        let row = 5usize;
+        let row_ctx = BernoulliMarginalSlopeFamily::row_ctx(&cache, row);
+        let mut scratch =
+            super::super::hessian_paths::BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
+        family
+            .compute_row_analytic_flex_into(
+                row,
+                &states,
+                primary,
+                row_ctx,
+                None,
+                false,
+                &mut scratch,
+            )
+            .expect("analytic flex z-sensitivity");
+        let analytic = scratch.score_zeta.clone();
+
+        let h = 1e-5_f64;
+        let nll_plus = flex_nll_gradient_at_perturbed_z(&family, &states, primary, row, h);
+        let nll_minus = flex_nll_gradient_at_perturbed_z(&family, &states, primary, row, -h);
+        for u in 0..primary.total {
+            // score = -NLL gradient.
+            let finite_difference = -(nll_plus[u] - nll_minus[u]) / (2.0 * h);
+            let scale = 1.0 + analytic[u].abs().max(finite_difference.abs());
+            let relative_error = (analytic[u] - finite_difference).abs() / scale;
+            assert!(
+                relative_error <= 2e-6,
+                "flex score-zeta primary {u}: analytic={} FD={} relative_error={relative_error}",
+                analytic[u],
+                finite_difference
+            );
+        }
+        let h_range = primary.h.as_ref().expect("score-warp primary range");
+        let w_range = primary.w.as_ref().expect("link-deviation primary range");
+        assert!(
+            analytic
+                .slice(s![h_range.start..h_range.end])
+                .iter()
+                .any(|value| value.abs() > 1e-10),
+            "score-warp z-sensitivity must not be zero-filled"
+        );
+        assert!(
+            analytic
+                .slice(s![w_range.start..w_range.end])
+                .iter()
+                .any(|value| value.abs() > 1e-10),
+            "link-deviation z-sensitivity must not be zero-filled"
+        );
+
+        let coefficient = family
+            .flex_score_zeta_sensitivity(
+                &states,
+                &BlockwiseFitOptions::default(),
+                cache.slices.total,
+            )
+            .expect("full coefficient score-zeta sensitivity");
+        assert_eq!(coefficient.dim(), (n, cache.slices.total));
+        for range in [
+            cache.slices.h.as_ref().expect("score-warp beta range"),
+            cache.slices.w.as_ref().expect("link-deviation beta range"),
+        ] {
+            assert!(
+                coefficient
+                    .slice(s![.., range.start..range.end])
+                    .iter()
+                    .any(|value| value.abs() > 1e-10),
+                "active deviation coefficient range {range:?} must carry Murphy-Topel sensitivity"
+            );
+        }
+
+        let wrong_width = cache
+            .slices
+            .total
+            .checked_sub(1)
+            .expect("nonempty coefficient frame");
+        let error = family
+            .flex_score_zeta_sensitivity(
+                &states,
+                &BlockwiseFitOptions::default(),
+                wrong_width,
+            )
+            .expect_err("partial Murphy-Topel covariance frame must be rejected");
+        assert!(
+            error.contains("covariance/frame mismatch"),
+            "unexpected partial-frame error: {error}"
+        );
     }
 
     /// The hand-assembled BMS-FLEX per-row primary Hessian must equal the
