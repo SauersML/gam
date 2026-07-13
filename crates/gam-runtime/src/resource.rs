@@ -94,10 +94,22 @@ impl MemoryAvailability {
         cgroup: Option<CgroupMemoryAvailability>,
     ) -> Self {
         let (available_bytes, limiting_source) = match cgroup {
-            Some(observation) if observation.available_bytes <= host_available_bytes => (
-                observation.available_bytes,
-                MemoryAvailabilitySource::Cgroup,
-            ),
+            // A real memory cgroup ceiling always reports a positive `total_bytes`;
+            // its `available_bytes == 0` is then an authoritative exhaustion signal
+            // and is deliberately preserved. A `total_bytes == 0` observation is the
+            // contradictory "no ceiling" case — cgroup v2 with `memory.max = max`,
+            // an unset controller, or a sysinfo misread — where `available_bytes == 0`
+            // carries no information and must never brick a process that has real host
+            // memory. Such an observation is treated as absent and falls back to host.
+            Some(observation)
+                if observation.total_bytes > 0
+                    && observation.available_bytes <= host_available_bytes =>
+            {
+                (
+                    observation.available_bytes,
+                    MemoryAvailabilitySource::Cgroup,
+                )
+            }
             _ => (host_available_bytes, MemoryAvailabilitySource::Host),
         };
         Self {
@@ -1375,6 +1387,25 @@ mod resource_policy_tests {
             both_exhausted.limiting_source(),
             MemoryAvailabilitySource::Cgroup
         );
+
+        // #2317: cgroup v2 with `memory.max = max` (or an unset/misread controller)
+        // surfaces as a zero-total observation whose `available_bytes == 0` is
+        // meaningless. It must NOT be read as exhaustion — the process has real host
+        // memory and must keep a positive budget. A zero total is not a real ceiling.
+        let unlimited_cgroup = MemoryAvailability::from_observation(
+            8_000,
+            Some(CgroupMemoryAvailability {
+                total_bytes: 0,
+                available_bytes: 0,
+                resident_bytes: 0,
+            }),
+        );
+        assert_eq!(unlimited_cgroup.available_bytes(), 8_000);
+        assert_eq!(
+            unlimited_cgroup.limiting_source(),
+            MemoryAvailabilitySource::Host
+        );
+        assert_eq!(governor_budget_from_availability(unlimited_cgroup), 6_000);
     }
 
     #[test]
