@@ -386,12 +386,14 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     total_joint_p,
                 )?;
                 cached_mode_acceptable = !certificate.has_resolvable_negative_curvature();
+                let minimum_whitened_eigenvalue = certificate.minimum_whitened_eigenvalue;
+                let numerical_floor = certificate.numerical_floor;
                 certified_workspace = certificate.workspace;
                 if !cached_mode_acceptable {
                     log::warn!(
                         "[PIRLS/joint-Newton warm-start] refused cached same-rho inner mode: fresh returned-mode curvature lambda_min={:.6e} < -floor={:.6e}; retaining beta only as an uncertified solver seed",
-                        certificate.minimum_whitened_eigenvalue,
-                        certificate.numerical_floor,
+                        minimum_whitened_eigenvalue,
+                        numerical_floor,
                     );
                 }
             }
