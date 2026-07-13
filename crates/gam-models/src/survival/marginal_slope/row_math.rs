@@ -486,6 +486,8 @@ mod vector_hand_oracle_tests {
         (-inv, inv2, -2.0 * inv2 * inv, 6.0 * inv2 * inv2)
     }
 
+    /// Test-oracle scratch and derivative output allocated once per measured
+    /// covariance. The `_into` oracle below performs no success-path allocation.
     pub(super) struct ReusableHandVectorRowWorkspace {
         score_dimension: usize,
         observed_slopes: Box<[f64]>,
@@ -690,8 +692,7 @@ mod vector_hand_oracle_tests {
                     }
                 };
                 workspace.c2[a * k + b] = s2 * sigma_ab / c
-                    - (s2 * workspace.sigma_g[a]) * (s2 * workspace.sigma_g[b])
-                        / (c * c * c);
+                    - (s2 * workspace.sigma_g[a]) * (s2 * workspace.sigma_g[b]) / (c * c * c);
             }
         }
 
@@ -2299,7 +2300,8 @@ mod tests {
 
     /// Temporary #932 release sweep for the fused fixed/graph cutover candidates.
     /// This compares every canonical backend directly so the production cutoff
-    /// cannot hide a larger-width stack or lowering cost.
+    /// cannot hide a larger-width stack or lowering cost. Production and the
+    /// strongest-hand oracle both reuse all derivative output and hand scratch.
     #[test]
     fn release_measure_packed_widths_k1_to_k8_vs_strongest_hand_932() {
         use std::hint::black_box;
