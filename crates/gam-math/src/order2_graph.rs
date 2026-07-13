@@ -75,7 +75,8 @@ struct GraphNode {
 }
 
 const MAX_PRIMARY_DIMENSION: usize = 16;
-const MAX_GRAPH_NODES: usize = 32;
+const MAX_QUADRATIC_ARITY: usize = 32;
+const MAX_GRAPH_NODES: usize = 64;
 const MAX_GRAPH_TERMS: usize = MAX_GRAPH_NODES * MAX_GRAPH_NODES;
 const MAX_DENSE_CURVATURE_VALUES: usize =
     MAX_GRAPH_NODES * MAX_PRIMARY_DIMENSION * (MAX_PRIMARY_DIMENSION + 1) / 2;
@@ -96,14 +97,17 @@ const EMPTY_NODE: GraphNode = GraphNode {
 /// inactive suffix uninitialized prevents full-capacity scratch clears while
 /// retaining allocation-free, checked storage for the general graph contract.
 struct InlineScalars {
-    slots: [MaybeUninit<f64>; MAX_GRAPH_NODES],
+    slots: [MaybeUninit<f64>; MAX_QUADRATIC_ARITY],
     len: usize,
 }
 
 impl InlineScalars {
     #[inline(always)]
     fn initialize_zeros(storage: &mut MaybeUninit<Self>, len: usize) -> &mut Self {
-        assert!(len <= MAX_GRAPH_NODES, "inline scalar capacity exceeded");
+        assert!(
+            len <= MAX_QUADRATIC_ARITY,
+            "inline scalar capacity exceeded"
+        );
         let scalars = storage.as_mut_ptr();
         // SAFETY: every bit pattern is valid for `MaybeUninit<f64>`, so writing
         // `len` makes the enclosing `InlineScalars` initialized. Only the
@@ -512,7 +516,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         assert_eq!(dimension, K, "compiled graph dimension mismatch");
         assert_eq!(inputs.len(), coefficients.dimension());
         assert!(
-            inputs.len() <= MAX_GRAPH_NODES,
+            inputs.len() <= MAX_QUADRATIC_ARITY,
             "compiled graph quadratic arity exceeds graph capacity"
         );
         assert!(
@@ -1018,6 +1022,25 @@ mod tests {
         }
     }
 
+    struct MatrixFreeIdentity32<'arena> {
+        workspace: &'arena Order2GraphWorkspace,
+    }
+
+    impl SymmetricQuadraticCoefficients for MatrixFreeIdentity32<'_> {
+        fn dimension(&self) -> usize {
+            MAX_QUADRATIC_ARITY
+        }
+
+        fn multiply(&self, input: &[f64], output: &mut [f64]) {
+            assert!(self.workspace.node_count() != 0);
+            output.copy_from_slice(input);
+        }
+
+        fn coefficient(&self, _row: usize, _column: usize) -> f64 {
+            panic!("compiled graph quadratic lowering must preserve matrix-free multiply")
+        }
+    }
+
     #[test]
     fn compiled_graph_quadratic_arity_is_independent_and_matrix_free() {
         let mut workspace = Order2GraphWorkspace::new();
@@ -1057,6 +1080,28 @@ mod tests {
                 close(graph.h()[row][column], eager.h_at(row, column));
             }
         }
+    }
+
+    #[test]
+    fn compiled_graph_accepts_maximum_quadratic_arity_plus_output_node() {
+        let mut workspace = Order2GraphWorkspace::new();
+        workspace.reset(1);
+        let values: [f64; MAX_QUADRATIC_ARITY] =
+            std::array::from_fn(|axis| 0.01 * (axis + 1) as f64);
+        let vars: [Order2Graph<'_, 1>; MAX_QUADRATIC_ARITY] =
+            std::array::from_fn(|axis| Order2Graph::variable(values[axis], 0, 1, &workspace));
+        let coefficients = MatrixFreeIdentity32 {
+            workspace: &workspace,
+        };
+        let graph = Order2Graph::symmetric_quadratic_form(&vars, &coefficients, 1, &workspace)
+            .into_order2();
+
+        let expected_value = values.iter().map(|value| value * value).sum::<f64>();
+        let expected_gradient = 2.0 * values.iter().sum::<f64>();
+        let tolerance = 2.0e-13;
+        assert!((graph.value() - expected_value).abs() <= tolerance);
+        assert!((graph.g()[0] - expected_gradient).abs() <= tolerance);
+        assert!((graph.h()[0][0] - 2.0 * MAX_QUADRATIC_ARITY as f64).abs() <= tolerance);
     }
 
     fn expression<'arena, S: RuntimeJetScalar<'arena>>(
