@@ -42,11 +42,12 @@ impl ExactNewtonJointPsiTerms {
     }
 }
 
+#[derive(Clone)]
 pub struct ExactNewtonJointPsiSecondOrderTerms {
     pub objective_psi_psi: f64,
     pub score_psi_psi: Array1<f64>,
     pub hessian_psi_psi: Array2<f64>,
-    pub hessian_psi_psi_operator: Option<Box<dyn HyperOperator>>,
+    pub hessian_psi_psi_operator: Option<Arc<dyn HyperOperator>>,
 }
 
 /// Direction-contracted second-order ψ terms for the profiled θ-HVP (#740).
