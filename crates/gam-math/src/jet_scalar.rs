@@ -3211,10 +3211,40 @@ impl<const K: usize> crate::nested_dual::JetField for OneSeed<K> {
         }
     }
     fn mul(&self, o: &Self) -> Self {
-        // (a.base + ε a.eps)(b.base + ε b.eps), dropping ε².
+        // (a.base + ε a.eps)(b.base + ε b.eps), dropping ε².  Build
+        // the epsilon channels directly instead of materialising two complete
+        // Order2 products and adding them.  The upper triangle is sufficient:
+        // every input Hessian is symmetric and this polynomial preserves that
+        // invariant exactly.
+        let ab = &self.base.0;
+        let ae = &self.eps.0;
+        let bb = &o.base.0;
+        let be = &o.eps.0;
+        let mut eps = crate::jet_tower::Tower2::<K>::zero();
+        eps.v = ab.v * be.v + ae.v * bb.v;
+        for i in 0..K {
+            eps.g[i] = ab.v * be.g[i]
+                + ab.g[i] * be.v
+                + ae.v * bb.g[i]
+                + ae.g[i] * bb.v;
+        }
+        for i in 0..K {
+            for j in i..K {
+                let channel = ab.v * be.h[i][j]
+                    + ab.g[i] * be.g[j]
+                    + ab.g[j] * be.g[i]
+                    + ab.h[i][j] * be.v
+                    + ae.v * bb.h[i][j]
+                    + ae.g[i] * bb.g[j]
+                    + ae.g[j] * bb.g[i]
+                    + ae.h[i][j] * bb.v;
+                eps.h[i][j] = channel;
+                eps.h[j][i] = channel;
+            }
+        }
         OneSeed {
             base: self.base.mul(&o.base),
-            eps: self.base.mul(&o.eps).add(&self.eps.mul(&o.base)),
+            eps: Order2(eps),
         }
     }
     fn neg(&self) -> Self {
@@ -3230,17 +3260,32 @@ impl<const K: usize> crate::nested_dual::JetField for OneSeed<K> {
         }
     }
     fn compose_unary(&self, d: [f64; 5]) -> Self {
-        // f(base + ε eps) = f(base) + ε · f'(base)·eps  (ε² = 0). Each factor is
-        // an Order2 composition: the base composes with the f-stack, and the
-        // ε-coefficient is the Order2 of the SHIFTED stack (the chain rule
-        // `f'(base)` as an Order2) times eps. Order2 reads only the leading
-        // three entries of whatever stack it is handed, so the trailing slots
-        // are unused padding (the fixed-length array makes the windowing total).
+        // f(base + ε eps) = f(base) + ε · f'(base)·eps (ε² = 0).
+        // Fuse the shifted composition and product into their final channels;
+        // this removes one temporary Order2 composition and one Order2 product
+        // from every unary primitive in a directional row program.
         let base = self.base.compose_unary([d[0], d[1], d[2], d[3], d[4]]);
-        // f'(base) as an Order2 (consumes [f', f'', f''']).
-        let fprime = self.base.compose_unary([d[1], d[2], d[3], d[4], d[4]]);
-        let eps = fprime.mul(&self.eps);
-        OneSeed { base, eps }
+        let b = &self.base.0;
+        let e = &self.eps.0;
+        let mut eps = crate::jet_tower::Tower2::<K>::zero();
+        eps.v = d[1] * e.v;
+        for i in 0..K {
+            eps.g[i] = d[2] * b.g[i] * e.v + d[1] * e.g[i];
+        }
+        for i in 0..K {
+            for j in i..K {
+                let channel = d[1] * e.h[i][j]
+                    + d[2]
+                        * (b.g[i] * e.g[j] + b.g[j] * e.g[i] + b.h[i][j] * e.v)
+                    + d[3] * b.g[i] * b.g[j] * e.v;
+                eps.h[i][j] = channel;
+                eps.h[j][i] = channel;
+            }
+        }
+        OneSeed {
+            base,
+            eps: Order2(eps),
+        }
     }
 }
 
@@ -3328,9 +3373,38 @@ impl<L: Lane, const K: usize> OneSeedLane<L, K> {
     /// Lane-wise `self · o`, ε² = 0 truncation (mirrors [`OneSeed::mul`]).
     #[inline]
     pub fn mul(&self, o: &Self) -> Self {
+        let ab = &self.base;
+        let ae = &self.eps;
+        let bb = &o.base;
+        let be = &o.eps;
+        let mut eps = Order2Lane::constant(ab.v.mul(be.v).add(ae.v.mul(bb.v)));
+        for i in 0..K {
+            eps.g[i] = ab
+                .v
+                .mul(be.g[i])
+                .add(ab.g[i].mul(be.v))
+                .add(ae.v.mul(bb.g[i]))
+                .add(ae.g[i].mul(bb.v));
+        }
+        for i in 0..K {
+            for j in i..K {
+                let channel = ab
+                    .v
+                    .mul(be.h[i][j])
+                    .add(ab.g[i].mul(be.g[j]))
+                    .add(ab.g[j].mul(be.g[i]))
+                    .add(ab.h[i][j].mul(be.v))
+                    .add(ae.v.mul(bb.h[i][j]))
+                    .add(ae.g[i].mul(bb.g[j]))
+                    .add(ae.g[j].mul(bb.g[i]))
+                    .add(ae.h[i][j].mul(bb.v));
+                eps.h[i][j] = channel;
+                eps.h[j][i] = channel;
+            }
+        }
         OneSeedLane {
             base: self.base.mul(&o.base),
-            eps: self.base.mul(&o.eps).add(&self.eps.mul(&o.base)),
+            eps,
         }
     }
 
@@ -3359,8 +3433,27 @@ impl<L: Lane, const K: usize> OneSeedLane<L, K> {
     #[inline]
     pub fn compose_unary(&self, d: [L; 5]) -> Self {
         let base = self.base.compose_unary([d[0], d[1], d[2]]);
-        let fprime = self.base.compose_unary([d[1], d[2], d[3]]);
-        let eps = fprime.mul(&self.eps);
+        let b = &self.base;
+        let e = &self.eps;
+        let mut eps = Order2Lane::constant(d[1].mul(e.v));
+        for i in 0..K {
+            eps.g[i] = d[2].mul(b.g[i]).mul(e.v).add(d[1].mul(e.g[i]));
+        }
+        for i in 0..K {
+            for j in i..K {
+                let mixed = b
+                    .g[i]
+                    .mul(e.g[j])
+                    .add(b.g[j].mul(e.g[i]))
+                    .add(b.h[i][j].mul(e.v));
+                let channel = d[1]
+                    .mul(e.h[i][j])
+                    .add(d[2].mul(mixed))
+                    .add(d[3].mul(b.g[i]).mul(b.g[j]).mul(e.v));
+                eps.h[i][j] = channel;
+                eps.h[j][i] = channel;
+            }
+        }
         OneSeedLane { base, eps }
     }
 
