@@ -2201,6 +2201,56 @@ mod tests {
         }
     }
 
+    struct LargestBudgetedDenseProgram;
+
+    impl RowProgram<9> for LargestBudgetedDenseProgram {
+        fn n_rows(&self) -> usize {
+            1
+        }
+
+        fn primaries(&self, row: usize) -> Result<[f64; 9], String> {
+            if row == 0 {
+                Ok([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
+            } else {
+                Err(format!("largest budgeted dense program has no row {row}"))
+            }
+        }
+
+        fn eval<S: crate::jet_scalar::JetScalar<9>>(
+            &self,
+            row: usize,
+            primaries: &[S; 9],
+        ) -> Result<S, String> {
+            if row != 0 {
+                return Err(format!("largest budgeted dense program has no row {row}"));
+            }
+            let linear =
+                S::linear_combination(primaries, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+            let quartic = primaries[0]
+                .mul(&primaries[1])
+                .mul(&primaries[2])
+                .mul(&primaries[3]);
+            Ok(linear.add(&quartic))
+        }
+    }
+
+    #[test]
+    fn full_tower_accepts_largest_width_inside_storage_budget_932() {
+        assert_eq!(std::mem::size_of::<Tower4<9>>(), 59_048);
+        assert!(
+            !program_primary_jets_fit_stack::<Tower4<9>, 9>(),
+            "nine full-width primary towers must use exact-length heap storage"
+        );
+
+        let tower = program_full_tower(&LargestBudgetedDenseProgram, 0)
+            .expect("Tower4<9> must remain inside the canonical dense storage budget");
+        assert_eq!(tower.v, 309.0);
+        assert_eq!(tower.g, [25.0, 14.0, 11.0, 10.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        // `t4` stores derivatives, not Taylor coefficients: the distinct-axis
+        // derivative of p0*p1*p2*p3 is 1, with no 4! normalization.
+        assert_eq!(tower.t4[0][1][2][3], 1.0);
+    }
+
     #[test]
     fn full_tower_refuses_oversized_result_before_touching_program() {
         let tower_bytes = std::mem::size_of::<Tower4<10>>();
