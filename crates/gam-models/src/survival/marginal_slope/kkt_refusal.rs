@@ -297,14 +297,8 @@ pub(crate) fn assemble_joint_penalized_hessian_and_score(
 
     let mut m = s_total.clone();
     let mut g = Array1::<f64>::zeros(p_total);
-    let time_operator = TimeBlockOperator::new(
-        dq0.clone(),
-        dq1.clone(),
-        dqd1.clone(),
-        score_dim,
-    );
-    let marginal_operator =
-        QChannelBlockOperator::new(m_dq.clone(), m_dqd1.clone(), score_dim);
+    let time_operator = TimeBlockOperator::new(dq0.clone(), dq1.clone(), dqd1.clone(), score_dim);
+    let marginal_operator = QChannelBlockOperator::new(m_dq.clone(), m_dqd1.clone(), score_dim);
     let logslope_operator = LogslopeBlockOperator::new(logslope_layout.clone(), score_dim)?;
     let mut time_rows = Array2::<f64>::zeros((n * primary_width, p_time));
     let mut marginal_rows = Array2::<f64>::zeros((n * primary_width, p_marg));
@@ -332,8 +326,7 @@ pub(crate) fn assemble_joint_penalized_hessian_and_score(
         }
         for c in 0..p_log {
             for channel in 0..primary_width {
-                j_i[[channel, log_off + c]] =
-                    logslope_rows[[i * primary_width + channel, c]];
+                j_i[[channel, log_off + c]] = logslope_rows[[i * primary_width + channel, c]];
             }
         }
         // H_i J_i  (`(3+K) × p_total`).
@@ -545,9 +538,10 @@ pub(crate) fn survival_row_gradient_from_pilot_primary_state(
             q0[i],
             q1[i],
             qd1[i],
-            slopes.row(i).as_slice().ok_or_else(|| {
-                "survival_row_gradient: slope row is not contiguous".to_string()
-            })?,
+            slopes
+                .row(i)
+                .as_slice()
+                .ok_or_else(|| "survival_row_gradient: slope row is not contiguous".to_string())?,
             z.row(i)
                 .as_slice()
                 .ok_or_else(|| "survival_row_gradient: score row is not contiguous".to_string())?,
