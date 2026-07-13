@@ -4,7 +4,9 @@
 
 use super::*;
 
-use gam_math::jet_scalar::{DynamicJetArena, DynamicOrder2, RuntimeJetScalar};
+use gam_math::jet_scalar::{
+    DynamicJetArena, DynamicOrder2, RuntimeJetScalar, SymmetricQuadraticCoefficients,
+};
 
 // ── Closed-form row kernel ─────────────────────────────────────────────
 //
@@ -698,6 +700,66 @@ mod vector_hand_oracle_tests {
 /// and Hessian channel then flows through the same stable probit/log-density
 /// leaf stacks as [`rigid_row_nll`]. There is no separately maintained chain
 /// rule for score cross-blocks.
+impl SymmetricQuadraticCoefficients for MarginalSlopeCovariance {
+    fn dimension(&self) -> usize {
+        self.dim()
+    }
+
+    fn multiply(&self, input: &[f64], output: &mut [f64]) {
+        assert_eq!(input.len(), self.dim());
+        assert_eq!(output.len(), self.dim());
+        match self {
+            Self::Diagonal(diagonal) => {
+                for axis in 0..input.len() {
+                    output[axis] = diagonal[axis] * input[axis];
+                }
+            }
+            Self::Full(matrix) => {
+                for row in 0..input.len() {
+                    let mut value = 0.0;
+                    for column in 0..input.len() {
+                        value += matrix[[row, column]] * input[column];
+                    }
+                    output[row] = value;
+                }
+            }
+            Self::LowRank(factor) => {
+                for row in 0..input.len() {
+                    let mut value = 0.0;
+                    for column in 0..input.len() {
+                        let mut coefficient = 0.0;
+                        for rank in 0..factor.ncols() {
+                            coefficient += factor[[row, rank]] * factor[[column, rank]];
+                        }
+                        value += coefficient * input[column];
+                    }
+                    output[row] = value;
+                }
+            }
+        }
+    }
+
+    fn coefficient(&self, row: usize, column: usize) -> f64 {
+        match self {
+            Self::Diagonal(diagonal) => {
+                if row == column {
+                    diagonal[row]
+                } else {
+                    0.0
+                }
+            }
+            Self::Full(matrix) => matrix[[row, column]],
+            Self::LowRank(factor) => {
+                let mut value = 0.0;
+                for rank in 0..factor.ncols() {
+                    value += factor[[row, rank]] * factor[[column, rank]];
+                }
+                value
+            }
+        }
+    }
+}
+
 fn rigid_vector_row_nll<'arena, S>(
     vars: &[S],
     z: &[f64],
@@ -751,34 +813,9 @@ where
         linear = linear.add(&vars[3 + axis].scale(inputs.probit_scale * z[axis]));
     }
 
-    // Preserve each covariance representation's canonical accumulation order.
-    // In particular, LowRank evaluates ||L' r||^2 without materializing Sigma.
-    let mut variance = S::constant(0.0, dimension, workspace);
-    match covariance {
-        MarginalSlopeCovariance::Diagonal(diagonal) => {
-            for axis in 0..k {
-                variance = variance.add(&vars[3 + axis].mul(&vars[3 + axis]).scale(diagonal[axis]));
-            }
-        }
-        MarginalSlopeCovariance::Full(matrix) => {
-            for row in 0..k {
-                let mut row_dot = S::constant(0.0, dimension, workspace);
-                for column in 0..k {
-                    row_dot = row_dot.add(&vars[3 + column].scale(matrix[[row, column]]));
-                }
-                variance = variance.add(&vars[3 + row].mul(&row_dot));
-            }
-        }
-        MarginalSlopeCovariance::LowRank(factor) => {
-            for column in 0..factor.ncols() {
-                let mut projection = S::constant(0.0, dimension, workspace);
-                for row in 0..k {
-                    projection = projection.add(&vars[3 + row].scale(factor[[row, column]]));
-                }
-                variance = variance.add(&projection.mul(&projection));
-            }
-        }
-    }
+    // One semantic primitive owns the mechanically derived V/G/H channels for
+    // `g' Sigma g`; representation-specific multiplication stays matrix free.
+    let mut variance = S::symmetric_quadratic_form(&vars[3..], covariance, dimension, workspace);
     variance = variance.scale(inputs.probit_scale * inputs.probit_scale);
     let variance_value = variance.value();
     if !(variance_value.is_finite()
@@ -1270,6 +1307,73 @@ mod tests {
                     (probit_scale - fd_s).abs() < 1e-6,
                     "s'(g) must equal probit_scale"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn covariance_quadratic_primitive_matches_scalar_program_all_forms_932() {
+        use gam_math::jet_scalar::{JetScalar, Order2};
+        use gam_math::nested_dual::JetField;
+
+        const DIM: usize = 5;
+        let values = [0.4, -0.7, 1.1, 0.25, -0.3];
+        let vars: [Order2<DIM>; DIM] =
+            std::array::from_fn(|axis| Order2::variable(values[axis], axis));
+        let inputs = [
+            vars[0].mul(&vars[1]).add(&vars[3]),
+            vars[1].exp().add(&vars[2].scale(0.4)),
+            vars[2].mul(&vars[4]).sub(&vars[0]),
+        ];
+        let covariances = [
+            MarginalSlopeCovariance::Diagonal(Array1::from_vec(vec![1.2, 0.8, 1.5])),
+            MarginalSlopeCovariance::Full(
+                Array2::from_shape_vec(
+                    (3, 3),
+                    vec![1.2, 0.3, -0.2, 0.3, 0.8, 0.15, -0.2, 0.15, 1.5],
+                )
+                .expect("3x3 covariance"),
+            ),
+            MarginalSlopeCovariance::LowRank(
+                Array2::from_shape_vec((3, 2), vec![0.8, -0.1, 0.25, 0.7, -0.45, 0.35])
+                    .expect("3x2 factor"),
+            ),
+        ];
+
+        for covariance in &covariances {
+            let direct = Order2::symmetric_quadratic_form(&inputs, covariance);
+            let mut scalar = Order2::constant(0.0);
+            for row in 0..inputs.len() {
+                scalar = scalar.add(
+                    &inputs[row]
+                        .mul(&inputs[row])
+                        .scale(covariance.coefficient(row, row)),
+                );
+                for column in row + 1..inputs.len() {
+                    scalar = scalar.add(
+                        &inputs[row]
+                            .mul(&inputs[column])
+                            .scale(2.0 * covariance.coefficient(row, column)),
+                    );
+                }
+            }
+            let tolerance = 2.0e-13;
+            let close = |actual: f64, expected: f64| {
+                assert!(
+                    (actual - expected).abs()
+                        <= tolerance * actual.abs().max(expected.abs()).max(1.0),
+                    "quadratic primitive mismatch: direct={actual:+.16e}, scalar={expected:+.16e}"
+                );
+            };
+            close(direct.value(), scalar.value());
+            for primary_a in 0..DIM {
+                close(direct.g()[primary_a], scalar.g()[primary_a]);
+                for primary_b in 0..DIM {
+                    close(
+                        direct.h()[primary_a][primary_b],
+                        scalar.h()[primary_a][primary_b],
+                    );
+                }
             }
         }
     }
