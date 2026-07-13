@@ -1639,6 +1639,153 @@ pub(crate) struct InnerPreludeCountingWorkspace {
     pub(crate) dense_calls: Arc<AtomicUsize>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum FusedTrialWorkspaceOutcome {
+    MissingWorkspace,
+    MissingLogLikelihood,
+    LogLikelihoodError,
+    Value(f64),
+}
+
+pub(crate) struct FusedTrialWorkspace {
+    pub(crate) outcome: FusedTrialWorkspaceOutcome,
+}
+
+impl ExactNewtonJointHessianWorkspace for FusedTrialWorkspace {
+    fn warm_up_outer_caches_for_mode(&self, _: EvalMode) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
+        match self.outcome {
+            FusedTrialWorkspaceOutcome::MissingLogLikelihood => Ok(None),
+            FusedTrialWorkspaceOutcome::LogLikelihoodError => {
+                Err("fused-trial-log-likelihood-error".to_string())
+            }
+            FusedTrialWorkspaceOutcome::Value(value) => Ok(Some(value)),
+            FusedTrialWorkspaceOutcome::MissingWorkspace => {
+                unreachable!("missing-workspace outcome never constructs a workspace")
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct FusedTrialWorkspaceFamily {
+    pub(crate) advertises_log_likelihood: bool,
+    pub(crate) outcome: FusedTrialWorkspaceOutcome,
+}
+
+impl CustomFamily for FusedTrialWorkspaceFamily {
+    fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        unreachable!("the fused-trial contract test never evaluates the scalar family")
+    }
+
+    fn exact_newton_joint_hessian_workspace_with_options(
+        &self,
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        _: &BlockwiseFitOptions,
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        match self.outcome {
+            FusedTrialWorkspaceOutcome::MissingWorkspace => Ok(None),
+            outcome => Ok(Some(Arc::new(FusedTrialWorkspace { outcome }))),
+        }
+    }
+
+    fn inner_joint_workspace_log_likelihood_available(&self, _: &[ParameterBlockSpec]) -> bool {
+        self.advertises_log_likelihood
+    }
+}
+
+#[test]
+pub(crate) fn fused_trial_scalar_fallback_requires_absent_capability() {
+    let family = FusedTrialWorkspaceFamily {
+        advertises_log_likelihood: false,
+        outcome: FusedTrialWorkspaceOutcome::MissingWorkspace,
+    };
+    assert!(
+        joint_line_search_log_likelihood_with_workspace(
+            &family,
+            &BlockwiseFitOptions::default(),
+            &[],
+            &[],
+        )
+        .expect("absent capability is not an error")
+        .is_none(),
+    );
+}
+
+#[test]
+pub(crate) fn fused_trial_advertised_missing_workspace_fails_closed() {
+    let family = FusedTrialWorkspaceFamily {
+        advertises_log_likelihood: true,
+        outcome: FusedTrialWorkspaceOutcome::MissingWorkspace,
+    };
+    let error = joint_line_search_log_likelihood_with_workspace(
+        &family,
+        &BlockwiseFitOptions::default(),
+        &[],
+        &[],
+    )
+    .expect_err("an advertised fused workspace is mandatory");
+    assert!(error.contains("returned no workspace"), "unexpected error: {error}");
+}
+
+#[test]
+pub(crate) fn fused_trial_advertised_missing_likelihood_fails_closed() {
+    let family = FusedTrialWorkspaceFamily {
+        advertises_log_likelihood: true,
+        outcome: FusedTrialWorkspaceOutcome::MissingLogLikelihood,
+    };
+    let error = joint_line_search_log_likelihood_with_workspace(
+        &family,
+        &BlockwiseFitOptions::default(),
+        &[],
+        &[],
+    )
+    .expect_err("an advertised fused likelihood is mandatory");
+    assert!(
+        error.contains("returned no log-likelihood"),
+        "unexpected error: {error}",
+    );
+}
+
+#[test]
+pub(crate) fn fused_trial_workspace_error_is_not_scalarized() {
+    let family = FusedTrialWorkspaceFamily {
+        advertises_log_likelihood: true,
+        outcome: FusedTrialWorkspaceOutcome::LogLikelihoodError,
+    };
+    assert_eq!(
+        joint_line_search_log_likelihood_with_workspace(
+            &family,
+            &BlockwiseFitOptions::default(),
+            &[],
+            &[],
+        )
+        .expect_err("workspace evaluation errors must propagate"),
+        "fused-trial-log-likelihood-error",
+    );
+}
+
+#[test]
+pub(crate) fn fused_trial_returns_workspace_and_exact_likelihood_together() {
+    let family = FusedTrialWorkspaceFamily {
+        advertises_log_likelihood: true,
+        outcome: FusedTrialWorkspaceOutcome::Value(-3.25),
+    };
+    let (value, _) = joint_line_search_log_likelihood_with_workspace(
+        &family,
+        &BlockwiseFitOptions::default(),
+        &[],
+        &[],
+    )
+    .expect("advertised workspace should evaluate")
+    .expect("advertised capability must return fused evidence");
+    assert_eq!(value.to_bits(), (-3.25_f64).to_bits());
+}
+
 impl ExactNewtonJointHessianWorkspace for InnerPreludeCountingWorkspace {
     fn warm_up_outer_caches_for_mode(&self, _: EvalMode) -> Result<(), String> {
         Ok(())
