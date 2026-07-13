@@ -6865,11 +6865,12 @@ impl ManifoldSaeCore {
     /// for a meaningless raw amplitude. The required `request` mapping contains
     /// `atom_k`, `metric_row`, `target_nats`, `t_from`, `t_to`, `tol_rel`,
     /// `max_iter`, and `readout_tol_rel`. Returns the
-    /// closed-form seed `a0 = sqrt(2 q*/(dgᵀ M dg))` plus, when a `probe`
-    /// (a Python callable `a → measured KL in nats`, a patched forward) is
-    /// supplied, the closed-loop-corrected amplitude, the measured KL, and the
-    /// exact activation `delta`, measured-validation state, and dual radii
-    /// (`validity_radius` + `readout_kl_radius`). Reuses the
+    /// closed-form seed `a0 = sqrt(2 q*/(dgᵀ M dg))` plus, when a plan-aware
+    /// `probe` is supplied, the closed-loop-corrected amplitude and one atomic
+    /// observation mapping with `effective_delta`, `exact_directional_nats`, and
+    /// `measured_nats`. The callback receives the complete public steer-plan
+    /// mapping, not a scalar amplitude, so it cannot silently execute a different
+    /// activation move. Reuses the
     /// SAME frozen-dictionary rebuild as `steer`.
     #[pyo3(signature = (request, probe = None))]
     fn steer_to_target<'py>(
@@ -6927,22 +6928,62 @@ impl ManifoldSaeCore {
             })
             .transpose()?;
 
-        // Wrap the optional Python patched-forward into a Rust FnMut(a) -> KL.
-        let mut probe_boxed: Option<Box<dyn FnMut(f64) -> Result<f64, String>>> =
-            probe.map(|obj| {
-                let boxed: Box<dyn FnMut(f64) -> Result<f64, String>> =
-                    Box::new(move |a: f64| -> Result<f64, String> {
-                        Python::attach(|py| {
-                            let res = obj
-                                .call1(py, (a,))
-                                .map_err(|e| format!("steer_to_target probe raised: {e}"))?;
-                            res.extract::<f64>(py).map_err(|e| {
-                                format!("steer_to_target probe must return a float: {e}")
-                            })
+        // The external model adapter receives the exact public plan and returns
+        // the three inseparable quantities the Rust dose contract validates.
+        let mut probe_boxed: Option<
+            Box<gam::inference::steering::AppliedDoseProbe<'_>>,
+        > = probe.map(|obj| {
+            let boxed: Box<gam::inference::steering::AppliedDoseProbe<'_>> =
+                Box::new(move |plan: &gam::inference::steering::SteerPlan| {
+                    Python::attach(|py| {
+                        let plan_dict = steer_plan_to_pydict(py, plan.clone())?;
+                        let result = obj
+                            .call1(py, (plan_dict,))
+                            .map_err(|error| format!("steer_to_target probe raised: {error}"))?;
+                        let result = result.bind(py).cast::<PyDict>().map_err(|error| {
+                            format!(
+                                "steer_to_target probe must return a mapping with effective_delta, \
+                                 exact_directional_nats, and measured_nats: {error}"
+                            )
+                        })?;
+                        let required = |key: &str| {
+                            result
+                                .get_item(key)
+                                .map_err(|error| error.to_string())?
+                                .ok_or_else(|| {
+                                    format!("steer_to_target probe result is missing {key:?}")
+                                })
+                        };
+                        let effective_delta = required("effective_delta")?
+                            .extract::<Vec<f64>>()
+                            .map_err(|error| {
+                                format!(
+                                    "steer_to_target probe effective_delta must be a float list: {error}"
+                                )
+                            })?;
+                        let exact_directional_nats = required("exact_directional_nats")?
+                            .extract::<f64>()
+                            .map_err(|error| {
+                                format!(
+                                    "steer_to_target probe exact_directional_nats must be a float: {error}"
+                                )
+                            })?;
+                        let measured_nats = required("measured_nats")?
+                            .extract::<f64>()
+                            .map_err(|error| {
+                                format!(
+                                    "steer_to_target probe measured_nats must be a float: {error}"
+                                )
+                            })?;
+                        Ok(gam::inference::steering::AppliedDoseObservation {
+                            effective_delta: Array1::from(effective_delta),
+                            exact_directional_nats,
+                            measured_nats,
                         })
-                    });
-                boxed
-            });
+                    })
+                });
+            boxed
+        });
         let probe_ref = probe_boxed.as_deref_mut();
 
         let plan = steer_to_target_from_arrays(

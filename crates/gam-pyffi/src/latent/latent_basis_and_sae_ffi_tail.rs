@@ -1753,7 +1753,7 @@ impl ManifoldSteerToTargetRequest {
 
 fn steer_to_target_from_arrays(
     request: SteerToTargetArraysRequest<'_>,
-    probe: Option<&mut gam::inference::steering::PatchedForwardKl<'_>>,
+    probe: Option<&mut gam::inference::steering::AppliedDoseProbe<'_>>,
 ) -> PyResult<gam::inference::steering::TargetDosePlan> {
     let SteerToTargetArraysRequest {
         atom_k,
@@ -1856,24 +1856,38 @@ fn target_dose_plan_to_pydict(
         target_nats,
         seed_amplitude,
         steer,
-        measured_nats,
+        applied_probe,
         iterations,
         readout_kl_radius,
     } = plan;
+    let resident_metric_nats = steer.predicted_nats;
+    let resident_metric_nats_kind = steer.predicted_nats_kind.as_str();
     let out = steer_plan_to_pydict(py, steer)?;
     let bound = out.bind(py);
     bound.set_item("target_nats", target_nats)?;
     bound.set_item("seed_amplitude", seed_amplitude)?;
-    bound.set_item("measured_nats", measured_nats)?;
     bound.set_item("iterations", iterations)?;
-    bound.set_item(
-        "validation",
-        if measured_nats.is_some() {
-            "patched_forward"
-        } else {
-            "quadratic_model"
-        },
-    )?;
+    bound.set_item("resident_metric_nats", resident_metric_nats)?;
+    bound.set_item("resident_metric_nats_kind", resident_metric_nats_kind)?;
+    match applied_probe {
+        Some(observation) => {
+            bound.set_item("effective_delta", observation.effective_delta.to_vec())?;
+            bound.set_item("exact_directional_nats", observation.exact_directional_nats)?;
+            bound.set_item("measured_nats", observation.measured_nats)?;
+            // The canonical probed prediction is the exact directional Fisher
+            // value. The resident factor remains separately visible above and
+            // retains its original status; it is never promoted.
+            bound.set_item("predicted_nats", observation.exact_directional_nats)?;
+            bound.set_item("predicted_nats_kind", "exact_directional")?;
+            bound.set_item("validation", "applied_dose_probe")?;
+        }
+        None => {
+            bound.set_item("effective_delta", py.None())?;
+            bound.set_item("exact_directional_nats", py.None())?;
+            bound.set_item("measured_nats", py.None())?;
+            bound.set_item("validation", "exact_factor_model")?;
+        }
+    }
     bound.set_item("readout_kl_radius", readout_kl_radius)?;
     Ok(out)
 }
