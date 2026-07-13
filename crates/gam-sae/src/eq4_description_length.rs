@@ -452,6 +452,130 @@ mod tests {
         assert!(fixture(&[1], -1).unwrap_err().contains("dictionary_params"));
     }
 
+    /// The horizon is required and separately declared: a caller that passes a
+    /// horizon below 2 (e.g. one that tried to conflate it with a tiny estimation
+    /// subsample) gets a typed error naming `amortization_horizon`, so the #2283
+    /// confound cannot recur through a silent default.
+    #[test]
+    fn production_eq4_rejects_a_sub_two_amortization_horizon() {
+        let test_x = array![[0.0, 0.0], [1.0, 0.5], [2.0, 1.5], [3.0, 1.0]];
+        let recon = test_x.mapv(|value| 0.8 * value);
+        let gate = Array2::ones((test_x.nrows(), 1));
+        let contribution = recon.clone();
+        for horizon in [1_i64, 0, -8] {
+            let err = eq4_fixed_distortion_description_length(
+                test_x.view(),
+                recon.view(),
+                gate.view(),
+                &[1],
+                4,
+                horizon,
+                &[0.9],
+                None,
+                |_atom, take| {
+                    let mut selected = Array2::zeros((take.len(), contribution.ncols()));
+                    for (out_row, &source_row) in take.iter().enumerate() {
+                        selected.row_mut(out_row).assign(&contribution.row(source_row));
+                    }
+                    Ok(selected)
+                },
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("amortization_horizon"),
+                "horizon {horizon} error should name amortization_horizon: {err}"
+            );
+        }
+    }
+
+    /// Audit §34 "MDL sample invariance": holding `amortization_horizon` fixed,
+    /// scoring the SAME fitted model at estimation subsamples of 256 / 1024 / 8192
+    /// rows must leave the dictionary term BITWISE identical and the total agree
+    /// within Monte-Carlo error. This is the acceptance test for #2283: the
+    /// dictionary code no longer picks up the estimation subsample size.
+    #[test]
+    fn eq4_dictionary_term_is_invariant_to_the_estimation_subsample() {
+        // A single deterministic fitted model on many rows: a flat rank-one atom
+        // (code_dim 1) whose contribution is a fixed function of the row, so any
+        // row subsample scores the SAME underlying model.
+        let full_rows = 8192_usize;
+        let d = 3_usize;
+        let mut test_x = Array2::<f64>::zeros((full_rows, d));
+        for i in 0..full_rows {
+            let phase = i as f64 * 0.001;
+            test_x[[i, 0]] = phase.sin();
+            test_x[[i, 1]] = (0.5 * phase).cos();
+            test_x[[i, 2]] = 0.3 * phase.sin() - 0.2;
+        }
+        let recon = test_x.mapv(|value| 0.85 * value);
+        let contribution = recon.clone();
+        let gate = Array2::ones((full_rows, 1));
+
+        let horizon = 120_000_i64;
+        let dictionary_params = 4096_i64;
+        let targets = [0.99, 0.95, 0.90, 0.80];
+
+        let score_at = |rows: usize| -> Eq4DescriptionLength {
+            let tx = test_x.slice(ndarray::s![..rows, ..]);
+            let rc = recon.slice(ndarray::s![..rows, ..]);
+            let gt = gate.slice(ndarray::s![..rows, ..]);
+            let contribution = contribution.clone();
+            eq4_fixed_distortion_description_length(
+                tx,
+                rc,
+                gt,
+                &[1],
+                dictionary_params,
+                horizon,
+                &targets,
+                None,
+                move |_atom, take| {
+                    let mut selected = Array2::zeros((take.len(), contribution.ncols()));
+                    for (out_row, &source_row) in take.iter().enumerate() {
+                        selected.row_mut(out_row).assign(&contribution.row(source_row));
+                    }
+                    Ok(selected)
+                },
+            )
+            .unwrap()
+        };
+
+        let small = score_at(256);
+        let medium = score_at(1024);
+        let large = score_at(8192);
+
+        // Every run declared the same horizon and priced the same decoder.
+        for run in [&small, &medium, &large] {
+            assert_eq!(run.amortization_horizon, horizon);
+        }
+        assert_eq!(small.estimation_rows, 256);
+        assert_eq!(medium.estimation_rows, 1024);
+        assert_eq!(large.estimation_rows, 8192);
+
+        // The dictionary term is BITWISE identical across subsamples: it depends
+        // only on the declared horizon, so re-estimation does not move it at all.
+        let expected_dict = 0.5 * dictionary_params as f64 / horizon as f64 * (horizon as f64).log2();
+        assert_eq!(small.dictionary_bits, expected_dict);
+        assert_eq!(medium.dictionary_bits, small.dictionary_bits);
+        assert_eq!(large.dictionary_bits, small.dictionary_bits);
+
+        // The dictionary charge is ~95% of the score at this overcompleteness; the
+        // confound would have moved the total by `0.5·params·(log₂ Nⱼ/Nⱼ − …)`
+        // hundreds of bits. With the fix the totals agree within Monte-Carlo error
+        // of the code/residual expectations across a 32× subsample change.
+        for target_idx in 0..targets.len() {
+            let s = small.per_target[target_idx].bits;
+            let m = medium.per_target[target_idx].bits;
+            let l = large.per_target[target_idx].bits;
+            let mc_tol = 1.0e-2 * (1.0 + l.abs());
+            assert!(
+                (s - l).abs() <= mc_tol && (m - l).abs() <= mc_tol,
+                "target {} totals drifted beyond MC tol: 256={s} 1024={m} 8192={l}",
+                targets[target_idx]
+            );
+        }
+    }
+
     #[test]
     fn flat_atom_fast_path_matches_svd_to_tolerance() {
         // A rank-one contribution: scalar codes ⊗ one decoder row — the exact

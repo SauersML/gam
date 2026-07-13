@@ -922,6 +922,10 @@ fn eq4_curved_advantage_and_prescreen(
             flat_gate.view(),
             &flat_dims,
             (s * p) as i64,
+            // Both featurizers declare the same planted N-token amortisation
+            // horizon (matching the pre-screen's `n_tokens = n`), so the
+            // flat-vs-curved advantage isolates the support/dictionary crossover.
+            n as i64,
             &[target],
             None,
             move |atom, take| {
@@ -951,6 +955,7 @@ fn eq4_curved_advantage_and_prescreen(
             curved_gate.view(),
             &curved_dims,
             (basis_m * p) as i64,
+            n as i64,
             &[target],
             None,
             move |_atom, take| {

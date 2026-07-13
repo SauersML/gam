@@ -143,8 +143,11 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
-      # Daily run leaves this empty so runner.py disables the per-command timeout entirely.
-      BENCH_CMD_TIMEOUT_SEC: ${{ github.event.schedule == '0 7 * * *' && '' || '2400' }}
+      # A benchmark intended to detect #979 must never recreate its unbounded
+      # subprocess hang. The daily run may use a longer job envelope for all
+      # shards, but every individual fit/predict keeps the same deterministic
+      # 40-minute mission bound and emits a typed timeout artifact on failure.
+      BENCH_CMD_TIMEOUT_SEC: "2400"
     steps:
       - name: Checkout
         uses: actions/checkout@v4

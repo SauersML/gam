@@ -36,6 +36,7 @@ def description_length(
     fitted: FittedFeaturizer,
     test_x: np.ndarray,
     *,
+    amortization_horizon: int,
     r2_targets: tuple[float, ...] | None = None,
 ) -> dict[str, Any]:
     """Score support, code, residual, and dictionary bits at fixed R-squared.
@@ -47,7 +48,24 @@ def description_length(
     core's dtypes and adapts ``atom_contribution`` into the row-fetch callback
     the core drives (one atom at a time, so a lazy contribution still only
     materialises the sampled firing rows).
+
+    ``amortization_horizon`` is the DECLARED dictionary-code ``N`` — the
+    message / deployment horizon or declared training-observation count — charged
+    in ``0.5 * dictionary_params / N * log2(N)``. It is a REQUIRED keyword with no
+    default: the number of rows of ``test_x`` is the estimation subsample
+    (Monte-Carlo estimator size) and must NEVER be reused as the horizon (#2283 /
+    audit §21). Passing them as one number silently made the authoritative
+    bits-at-R2 row meaningless, so the two are separated here and the caller must
+    state the horizon explicitly; the core rejects a horizon below 2.
     """
+    horizon = int(amortization_horizon)
+    if horizon < 2:
+        raise ValueError(
+            "amortization_horizon must be an explicit integer >= 2 (the declared "
+            "message/deployment or training-observation N); it is NOT the "
+            f"{np.asarray(test_x).shape[0]}-row estimation subsample and is never "
+            f"defaulted to it, got {amortization_horizon!r}"
+        )
 
     test_x = np.ascontiguousarray(np.asarray(test_x, dtype=np.float64))
     recon = np.ascontiguousarray(np.asarray(fitted.recon, dtype=np.float64))
@@ -70,6 +88,7 @@ def description_length(
         gate,
         code_dims,
         fitted.dictionary_params,
+        horizon,
         _fetch,
         r2_targets=(
             None

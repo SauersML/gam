@@ -171,11 +171,14 @@ pub fn build_bspline_basis_1d(
             );
         }
         let knots = cyclic_uniform_knot_vector(start, end, spec.degree, num_basis);
-        let s_bend_raw = cyclic_bspline_derivative_penalty_matrix(
+        let s_bend_raw = ConstructiveQuadratic::from_energy_factor(
+            cyclic_bspline_derivative_penalty_factor(
             spec.degree,
             num_basis,
             end - start,
             spec.penalty_order,
+            )?,
+            "cyclic B-spline roughness",
         )?;
         // A cyclic derivative penalty has a single null direction — the constant
         // vector — and that direction is removed wholesale by the periodic
@@ -202,11 +205,11 @@ pub fn build_bspline_basis_1d(
         // raw `S` (scale 1.0) put `λ` on a basis-dependent scale and the outer
         // λ-search heuristics under-smoothed exactly as for the open ps single
         // penalty. Fit-invariant at the REML optimum (only `λ̂` rescales by `c`).
-        let (s_bend_norm, s_bend_scale) = normalize_penalty(&s_bend_raw);
+        let (_, s_bend_scale) = normalize_penalty(s_bend_raw.dense());
         let penalties_raw = vec![PenaltyCandidate {
-            matrix: ConstructiveQuadratic::try_from_dense_psd(
-                s_bend_norm,
-                "cyclic B-spline roughness",
+            matrix: s_bend_raw.scaled(
+                1.0 / s_bend_scale,
+                "normalized cyclic B-spline roughness",
             )?,
             source: PenaltySource::Primary,
             normalization_scale: s_bend_scale,
@@ -344,8 +347,10 @@ pub fn build_bspline_basis_1d(
         None
     };
     if let Some((knots, p_raw, chunk)) = auto_chunk_streaming {
-        let s_bend_raw =
-            bspline_derivative_penalty_matrix(knots.view(), spec.degree, spec.penalty_order)?;
+        let s_bend_raw = ConstructiveQuadratic::from_energy_factor(
+            bspline_derivative_penalty_factor(knots.view(), spec.degree, spec.penalty_order)?,
+            "streaming B-spline roughness",
+        )?;
         let penalties_raw = bspline_penalty_candidates(&s_bend_raw, spec, &knots)?;
         let penalties_raw_mats = penalties_raw
             .iter()
@@ -555,8 +560,10 @@ pub fn build_bspline_basis_1d(
         }
         None => None,
     };
-    let s_bend_raw =
-        bspline_derivative_penalty_matrix(knots.view(), spec.degree, spec.penalty_order)?;
+    let s_bend_raw = ConstructiveQuadratic::from_energy_factor(
+        bspline_derivative_penalty_factor(knots.view(), spec.degree, spec.penalty_order)?,
+        "B-spline roughness",
+    )?;
     let penalties_raw = bspline_penalty_candidates(&s_bend_raw, spec, &knots)?;
     let penalties_raw_mats: Vec<Array2<f64>> = penalties_raw
         .iter()
@@ -2231,7 +2238,7 @@ pub(crate) fn validated_kronecker_factors(
 /// common (unit-Frobenius) scale the coordinate is identified and the double
 /// penalty shrinks — never inflates — null-space / unsupported terms.
 fn bspline_penalty_candidates(
-    s_bend_raw: &Array2<f64>,
+    s_bend_raw: &ConstructiveQuadratic,
     spec: &BSplineBasisSpec,
     knots: &Array1<f64>,
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
@@ -2247,7 +2254,7 @@ fn bspline_penalty_candidates(
         // quantity is a property of the fitted function, invariant to how the
         // B-spline basis happens to be scaled or parameterized.
         let gram = bspline_function_gram(knots, spec.degree)?;
-        function_space_nullspace_shrinkage(s_bend_raw, &gram)?
+        function_space_nullspace_shrinkage(s_bend_raw.dense(), &gram)?
     } else {
         None
     };
@@ -2268,11 +2275,11 @@ fn bspline_penalty_candidates(
     // `λ̂` rescales by `c`); it just removes the scale miscalibration of the
     // λ-search heuristics.
     let Some(shrinkage) = shrinkage else {
-        let (bend_norm, bend_scale) = normalize_penalty(s_bend_raw);
+        let (_, bend_scale) = normalize_penalty(s_bend_raw.dense());
         return Ok(vec![PenaltyCandidate {
-            matrix: ConstructiveQuadratic::try_from_dense_psd(
-                bend_norm,
-                "B-spline roughness",
+            matrix: s_bend_raw.scaled(
+                1.0 / bend_scale,
+                "normalized B-spline roughness",
             )?,
             source: PenaltySource::Primary,
             normalization_scale: bend_scale,
@@ -2281,13 +2288,13 @@ fn bspline_penalty_candidates(
         }]);
     };
 
-    let (bend_norm, bend_scale) = normalize_penalty(s_bend_raw);
+    let (_, bend_scale) = normalize_penalty(s_bend_raw.dense());
     let (ridge_norm, ridge_scale) = normalize_penalty(&shrinkage);
     Ok(vec![
         PenaltyCandidate {
-            matrix: ConstructiveQuadratic::try_from_dense_psd(
-                bend_norm,
-                "B-spline roughness",
+            matrix: s_bend_raw.scaled(
+                1.0 / bend_scale,
+                "normalized B-spline roughness",
             )?,
             source: PenaltySource::Primary,
             normalization_scale: bend_scale,

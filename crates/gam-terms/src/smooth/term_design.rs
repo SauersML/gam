@@ -1217,22 +1217,31 @@ fn apply_global_smooth_identifiability(
         let penalty_candidates = term
             .active_penalties
             .par_iter()
-            .map(|penalty| {
-                let matrix = if let Some(gauge) = coefficient_gauge.as_ref() {
-                    gauge.restrict_penalty(&penalty.matrix)
+            .map(|penalty| -> Result<PenaltyCandidate, BasisError> {
+                let raw = ConstructiveQuadratic::try_from_dense_psd(
+                    penalty.matrix.clone(),
+                    "global smooth source penalty",
+                )?;
+                let restricted = if let Some(gauge) = coefficient_gauge.as_ref() {
+                    raw.restricted(gauge, "global smooth identifiability restriction")?
                 } else {
-                    penalty.matrix.clone()
+                    raw
                 };
-                let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
-                PenaltyCandidate {
+                let (_, c_new) =
+                    normalize_penalty_in_constrained_space(restricted.dense());
+                let matrix = restricted.scaled(
+                    1.0 / c_new,
+                    "normalized global smooth penalty",
+                )?;
+                Ok(PenaltyCandidate {
                     matrix,
                     source: penalty.info.source.clone(),
                     normalization_scale: penalty.info.normalization_scale * c_new,
                     kronecker_factors: None,
                     op: None,
-                }
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         // #1476-class fix (central, basis-agnostic): when a non-trivial GLOBAL
         // identifiability/orthogonalization transform `z_opt` was applied above,
         // it congruence-restricts EVERY penalty — including a Marra & Wood double-
@@ -1282,16 +1291,19 @@ fn apply_global_smooth_identifiability(
             };
             // Snapshot each Primary's support + a clone of its matrix (immutable
             // borrow released before we mutate the ridges below).
-            let primaries: Vec<((usize, usize), Array2<f64>)> = penalty_candidates
+            let primaries: Vec<((usize, usize), ConstructiveQuadratic)> = penalty_candidates
                 .iter()
                 .filter(|c| matches!(c.source, PenaltySource::Primary))
-                .map(|c| {
-                    (
+                .map(|c| -> Result<_, BasisError> {
+                    Ok((
                         support_rows(&c.matrix),
-                        c.matrix.mapv(|value| value * c.normalization_scale),
-                    )
+                        c.matrix.scaled(
+                            c.normalization_scale,
+                            "physical global smooth primary",
+                        )?,
+                    ))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
             for candidate in &mut penalty_candidates {
                 if !matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
                     continue;
@@ -1316,20 +1328,42 @@ fn apply_global_smooth_identifiability(
                 // generalized `(S, S+R)` null solve preserves the function metric
                 // through this global congruence instead of replacing it by a
                 // coefficient-space projector.
-                let block = s_full.slice(s![*plo..*phi, *plo..*phi]).to_owned();
-                let ridge_full = candidate
-                    .matrix
-                    .mapv(|value| value * candidate.normalization_scale);
-                let ridge_block = ridge_full.slice(s![*plo..*phi, *plo..*phi]).to_owned();
+                let block = ConstructiveQuadratic::from_energy_factor(
+                    s_full.factor().slice(s![.., *plo..*phi]).to_owned(),
+                    "owned global smooth primary block",
+                )?;
+                let ridge_full = candidate.matrix.scaled(
+                    candidate.normalization_scale,
+                    "physical global smooth null ridge",
+                )?;
+                let ridge_block = ConstructiveQuadratic::from_energy_factor(
+                    ridge_full
+                        .factor()
+                        .slice(s![.., *plo..*phi])
+                        .to_owned(),
+                    "owned global smooth null-ridge block",
+                )?;
                 let rebuilt_block =
                     crate::basis::rebuild_metric_consistent_ridge(&block, &ridge_block)?;
                 match rebuilt_block {
                     Some(ridge_block) => {
-                        let mut full = Array2::<f64>::zeros((q, q));
-                        full.slice_mut(s![*plo..*phi, *plo..*phi])
-                            .assign(&ridge_block);
-                        let (matrix, scale) = normalize_penalty_in_constrained_space(&full);
-                        candidate.matrix = matrix;
+                        let mut full_factor = Array2::<f64>::zeros((
+                            ridge_block.factor().nrows(),
+                            q,
+                        ));
+                        full_factor
+                            .slice_mut(s![.., *plo..*phi])
+                            .assign(ridge_block.factor());
+                        let full = ConstructiveQuadratic::from_energy_factor(
+                            full_factor,
+                            "embedded global smooth null ridge",
+                        )?;
+                        let (_, scale) =
+                            normalize_penalty_in_constrained_space(full.dense());
+                        candidate.matrix = full.scaled(
+                            1.0 / scale,
+                            "normalized embedded global smooth null ridge",
+                        )?;
                         candidate.normalization_scale = scale;
                         candidate.kronecker_factors = None;
                         candidate.op = None;
@@ -1337,7 +1371,7 @@ fn apply_global_smooth_identifiability(
                     // Constrained bending block is full rank: no null space to
                     // shrink. Zero the ridge; the filter drops it.
                     None => {
-                        candidate.matrix = Array2::<f64>::zeros((q, q));
+                        candidate.matrix = ConstructiveQuadratic::zero(q);
                         candidate.normalization_scale = 1.0;
                         candidate.kronecker_factors = None;
                         candidate.op = None;

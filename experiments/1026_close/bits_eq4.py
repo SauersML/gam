@@ -30,12 +30,24 @@ def description_length(
     fitted: FittedFeaturizer,
     test_x: Any,
     *,
+    amortization_horizon: int,
     r2_targets: tuple[float, ...] | None = None,
 ) -> dict[str, Any]:
-    """Load the native-backed Eq. 4 scorer at the actual scoring boundary."""
+    """Load the native-backed Eq. 4 scorer at the actual scoring boundary.
+
+    ``amortization_horizon`` is the DECLARED dictionary-code ``N`` and is passed
+    straight through as a required keyword — it is separate from the estimation
+    subsample (``test_x`` row count) so the dictionary term is invariant to how
+    many rows were sampled to estimate the score (#2283).
+    """
     from gamfit._description_length import description_length as score
 
-    return score(fitted, test_x, r2_targets=r2_targets)
+    return score(
+        fitted,
+        test_x,
+        amortization_horizon=amortization_horizon,
+        r2_targets=r2_targets,
+    )
 
 
 def scorer_source() -> str:

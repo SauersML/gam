@@ -1891,6 +1891,31 @@ impl ConstructiveQuadratic {
         Self::from_energy_factor(self.factor.mapv(|value| value * root), context)
     }
 
+    /// Sum PSD quadratics by vertically concatenating their energy factors.
+    pub fn sum(terms: &[Self], context: &str) -> Result<Self, BasisError> {
+        let coefficient_dim = terms
+            .first()
+            .map(|term| term.factor.ncols())
+            .unwrap_or(0);
+        if terms
+            .iter()
+            .any(|term| term.factor.ncols() != coefficient_dim)
+        {
+            crate::bail_dim_basis!(
+                "{context}: constructive penalty sum has inconsistent coefficient dimensions"
+            );
+        }
+        let rows = terms.iter().map(|term| term.factor.nrows()).sum();
+        let mut factor = Array2::<f64>::zeros((rows, coefficient_dim));
+        let mut start = 0usize;
+        for term in terms {
+            let end = start + term.factor.nrows();
+            factor.slice_mut(s![start..end, ..]).assign(&term.factor);
+            start = end;
+        }
+        Self::from_energy_factor(factor, context)
+    }
+
     /// The exact zero quadratic on a coefficient chart of `dimension`.
     pub fn zero(dimension: usize) -> Self {
         Self {

@@ -393,13 +393,18 @@ fn format_g(x: f64) -> String {
 /// coordinate spectrum, and the joint firing-weighted reverse-water-filling)
 /// lives in `eq4_description_length`; this only marshals the arrays and drives
 /// the Python `atom_contribution` callback that materialises each atom's firing
-/// rows. Returns the same dict shape the NumPy scorer returned (`support_bits`,
-/// `achieved_block_l0`, `bits_at_r2_{g}` / `code_bits_at_r2_{g}` /
+/// rows. `dictionary_params` is the STORAGE-CODE decoder scalar count and
+/// `amortization_horizon` is the DECLARED dictionary-code `N` (the message /
+/// deployment / training horizon), passed separately from the `test_x` row count
+/// so the dictionary term is invariant to the estimation subsample (#2283).
+/// Returns the same dict shape the NumPy scorer returned (`support_bits`,
+/// `achieved_block_l0`, `dictionary_bits`, `estimation_rows`,
+/// `amortization_horizon`, `bits_at_r2_{g}` / `code_bits_at_r2_{g}` /
 /// `resid_bits_at_r2_{g}` per target, and `native_bits_per_token` when given).
 #[pyfunction]
 #[pyo3(signature = (
-    test_x, recon, gate, code_dims, dictionary_params, atom_contribution,
-    r2_targets = None, native_bits_per_token = None,
+    test_x, recon, gate, code_dims, dictionary_params, amortization_horizon,
+    atom_contribution, r2_targets = None, native_bits_per_token = None,
 ))]
 fn sae_eq4_description_length<'py>(
     py: Python<'py>,
@@ -408,6 +413,7 @@ fn sae_eq4_description_length<'py>(
     gate: PyReadonlyArray2<'py, f64>,
     code_dims: PyReadonlyArray1<'py, i64>,
     dictionary_params: i64,
+    amortization_horizon: i64,
     atom_contribution: Bound<'py, PyAny>,
     r2_targets: Option<Vec<f64>>,
     native_bits_per_token: Option<f64>,
@@ -450,6 +456,7 @@ fn sae_eq4_description_length<'py>(
         gate,
         &code_dims,
         dictionary_params,
+        amortization_horizon,
         &targets,
         native_bits_per_token,
         fetch,
@@ -465,6 +472,8 @@ fn sae_eq4_description_length<'py>(
     out.set_item("support_bits", dl.support_bits)?;
     out.set_item("achieved_block_l0", dl.achieved_block_l0)?;
     out.set_item("dictionary_bits", dl.dictionary_bits)?;
+    out.set_item("estimation_rows", dl.estimation_rows)?;
+    out.set_item("amortization_horizon", dl.amortization_horizon)?;
     for row in &dl.per_target {
         let suffix = format_g(row.target);
         out.set_item(format!("bits_at_r2_{suffix}"), row.bits)?;

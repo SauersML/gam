@@ -35,7 +35,11 @@ from pathlib import Path
 import numpy as np
 
 
-PAIR_SCHEMA = "gam.issue2283.eq4-pair.v1"
+# v2 (#2283): the Eq-4 dictionary term now depends on a DECLARED
+# amortization_horizon that is separate from the bits estimation subsample, so
+# the horizon is part of the pair identity and v1 rows (whose dictionary bits
+# were computed with the confounded subsample N) are rejected on load.
+PAIR_SCHEMA = "gam.issue2283.eq4-pair.v2"
 FLAT_CHECKPOINT_SCHEMA = "gam.issue2283.flat-checkpoint.v1"
 FLAT_CHECKPOINT_ARRAYS = {
     "decoder",
@@ -280,6 +284,7 @@ def _pair_identity(
             "top_k": args.top_k,
             "bits_max_rows": args.bits_max_rows,
             "bits_rows": int(bits_idx.size),
+            "amortization_horizon": args.amortization_horizon,
         },
     }
 
@@ -649,9 +654,16 @@ def fit_hybrid_curved_resume(
 
 # --------------------------------------------------------------------------- #
 def score_bits_for_arm(
-    arm, collect, x_te, test_row_ids, bits_idx, sparse_score_mode
+    arm, collect, x_te, test_row_ids, bits_idx, sparse_score_mode,
+    amortization_horizon,
 ):
     """Build the arm's FittedFeaturizer on a test subsample and score Eq-4 bits.
+
+    ``amortization_horizon`` is the DECLARED dictionary-code ``N`` (the
+    deployment / training horizon the decoder is amortised over). It is passed
+    SEPARATELY from ``bits_idx`` — the estimation subsample used to estimate the
+    code / residual / support expectations — so the dictionary term is invariant
+    to the subsample size (#2283).
 
     Returns a dict of ``bits_at_r2_*`` / ``code_bits_*`` / ``resid_bits_*`` /
     ``support_bits`` (namespaced ``bits_<key>``) plus the scorer provenance, or
@@ -685,10 +697,15 @@ def score_bits_for_arm(
     else:
         return None
 
-    dl = bits_eq4.description_length(fitted, x_bits.astype(np.float64))
+    dl = bits_eq4.description_length(
+        fitted,
+        x_bits.astype(np.float64),
+        amortization_horizon=amortization_horizon,
+    )
     out = {f"bits_{k}": v for k, v in dl.items()}
     out["bits_scorer"] = bits_eq4.scorer_source()
     out["bits_rows"] = int(bits_idx.size)
+    out["bits_amortization_horizon"] = int(amortization_horizon)
     out["bits_test_positions_sha256"] = _array_sha256(bits_idx)
     out["bits_row_ids_sha256"] = _array_sha256(test_row_ids[bits_idx])
     if fitted.extras is not None and "score_route_stats" in fitted.extras:
@@ -764,9 +781,20 @@ def main() -> int:
                          "R2 on the test split (the MDL scoreboard the crossover "
                          "theorem says curved atoms win by a wide margin)")
     ap.add_argument("--bits-max-rows", type=int, default=8192,
-                    help="test-row subsample for Eq-4 bits (bounds the per-atom "
-                         "SVD sweep at K=32768); the gate/contrib/recon are all "
-                         "rebuilt on this same subsample")
+                    help="ESTIMATION subsample for Eq-4 bits: the number of test "
+                         "rows sampled to estimate the code/residual/support "
+                         "expectations (bounds the per-atom SVD sweep at K=32768). "
+                         "This is the Monte-Carlo estimator size ONLY; it no longer "
+                         "sets the dictionary amortisation N (#2283). The "
+                         "gate/contrib/recon are all rebuilt on this same subsample.")
+    ap.add_argument("--amortization-horizon", type=int, default=None,
+                    help="DECLARED dictionary-code N charged in "
+                         "0.5*dictionary_params/N*log2(N): the message/deployment "
+                         "horizon or declared training-observation count. Required "
+                         "with --bits and passed SEPARATELY from --bits-max-rows so "
+                         "the dictionary term is invariant to the estimation "
+                         "subsample (#2283 / audit §21). Must be >= 2; never "
+                         "defaulted to the subsample size.")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     try:
@@ -793,6 +821,14 @@ def main() -> int:
         ap.error("--arm external_topk requires --bits for the #2283 paired measurement")
     if args.bits_max_rows <= 0:
         ap.error("--bits-max-rows must be positive")
+    if args.bits:
+        if args.amortization_horizon is None:
+            ap.error(
+                "--bits requires an explicit --amortization-horizon (the declared "
+                "dictionary-code N); it is never defaulted to --bits-max-rows (#2283)"
+            )
+        if args.amortization_horizon < 2:
+            ap.error("--amortization-horizon must be >= 2")
 
     X, sampled_row_ids, data_manifest = load_chunk_dir(
         args.chunk_dir, args.max_rows, args.seed
@@ -893,6 +929,7 @@ def main() -> int:
             test_row_ids,
             bits_idx,
             args.sparse_score_mode,
+            args.amortization_horizon,
         )
         if bits is not None:
             extra.update(bits)
@@ -919,6 +956,7 @@ def main() -> int:
            "hybrid_phase": args.hybrid_phase,
            "max_rows": args.max_rows, "test_frac": args.test_frac,
            "bits_max_rows": args.bits_max_rows,
+           "amortization_horizon": args.amortization_horizon,
            "steps": args.steps, "lr": args.lr, "batch_size": args.batch_size,
            "max_epochs": args.max_epochs, "atom_topology": args.atom_topology,
            "seed": args.seed, "ev": ev, "wall_s": round(wall, 1),

@@ -1037,7 +1037,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             &per_block,
             options,
             None,
-            None,
+            inner.terminal_working_sets.as_deref(),
         )
         .map_err(|reason| CustomFamilyError::Optimization {
             context: "fit_custom_family no-smoothing joint geometry",
@@ -1948,7 +1948,7 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
         &per_block,
         options,
         None,
-        None,
+        inner.terminal_working_sets.as_deref(),
     )
     .map_err(|reason| CustomFamilyError::Optimization {
         context: "fit_custom_family_fixed_log_lambdas joint geometry",

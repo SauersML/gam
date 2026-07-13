@@ -5471,7 +5471,10 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
         let sym = (&raw + &raw.t()) * 0.5;
         let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym);
         candidates.push(PenaltyCandidate {
-            matrix,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                matrix,
+                "Matérn operator penalty",
+            )?,
             source,
             normalization_scale,
             kronecker_factors: None,
@@ -5952,7 +5955,10 @@ pub fn build_tensor_bspline_basis(
                     kronecker_marginal_penalties.push(normalized_marginal_penalties[dim].0.clone());
                 }
                 candidates.push(PenaltyCandidate {
-                    matrix: s_dim,
+                    matrix: ConstructiveQuadratic::try_from_dense_psd(
+                        s_dim,
+                        "tensor marginal penalty",
+                    )?,
                     source: PenaltySource::TensorMarginal { dim },
                     normalization_scale: normalized_marginal_penalties[dim].1,
                     kronecker_factors: Some(factors),
@@ -5967,7 +5973,10 @@ pub fn build_tensor_bspline_basis(
             {
                 let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&shrink);
                 candidates.push(PenaltyCandidate {
-                    matrix,
+                    matrix: ConstructiveQuadratic::try_from_dense_psd(
+                        matrix,
+                        "tensor global null-function ridge",
+                    )?,
                     source: PenaltySource::TensorGlobalRidge,
                     normalization_scale,
                     kronecker_factors: None,
@@ -6001,7 +6010,10 @@ pub fn build_tensor_bspline_basis(
                 }
                 let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&matrix);
                 candidates.push(PenaltyCandidate {
-                    matrix,
+                    matrix: ConstructiveQuadratic::try_from_dense_psd(
+                        matrix,
+                        "tensor separable penalty",
+                    )?,
                     source: PenaltySource::TensorSeparable { penalized_margins },
                     normalization_scale,
                     kronecker_factors: Some(factors),
@@ -6016,7 +6028,10 @@ pub fn build_tensor_bspline_basis(
             {
                 let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&matrix);
                 candidates.push(PenaltyCandidate {
-                    matrix,
+                    matrix: ConstructiveQuadratic::try_from_dense_psd(
+                        matrix,
+                        "separable tensor global null-function ridge",
+                    )?,
                     source: PenaltySource::TensorGlobalRidge,
                     normalization_scale,
                     kronecker_factors: None,
@@ -6098,7 +6113,9 @@ pub fn build_tensor_bspline_basis(
         candidates = candidates
             .into_iter()
             .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
-                let matrix = gauge.restrict_penalty(&candidate.matrix);
+                let restricted = candidate
+                    .matrix
+                    .restricted(&gauge, "tensor identifiability restriction")?;
                 // Re-normalize in the *actual* coefficient chart used by the
                 // fit.  The tensor sum-to-zero transform is not norm-preserving
                 // for each overlapping marginal penalty, so carrying the raw
@@ -6106,7 +6123,11 @@ pub fn build_tensor_bspline_basis(
                 // relative amount of smoothing seen by the LAML/REML optimizer.
                 // Keep the physical scale in metadata and give the optimizer
                 // unit-scale constrained penalties for every tensor margin.
-                let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
+                let (_, c_new) = normalize_penalty_in_constrained_space(restricted.dense());
+                let matrix = restricted.scaled(
+                    1.0 / c_new,
+                    "normalized tensor penalty after identifiability",
+                )?;
                 Ok(PenaltyCandidate {
                     matrix,
                     source: candidate.source,
@@ -6135,32 +6156,45 @@ pub fn build_tensor_bspline_basis(
                 })?
                 .matrix
                 .nrows();
-            let mut joint_primary = Array2::<f64>::zeros((width, width));
-            for candidate in &candidates {
-                if !matches!(candidate.source, PenaltySource::TensorGlobalRidge) {
-                    joint_primary += &candidate
-                        .matrix
-                        .mapv(|value| value * candidate.normalization_scale);
-                }
-            }
+            let physical_primary_terms = candidates
+                .iter()
+                .filter(|candidate| {
+                    !matches!(candidate.source, PenaltySource::TensorGlobalRidge)
+                })
+                .map(|candidate| {
+                    candidate.matrix.scaled(
+                        candidate.normalization_scale,
+                        "physical tensor primary penalty",
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let joint_primary = ConstructiveQuadratic::sum(
+                &physical_primary_terms,
+                "joint tensor primary penalty",
+            )?;
             for candidate in &mut candidates {
                 if !matches!(candidate.source, PenaltySource::TensorGlobalRidge) {
                     continue;
                 }
-                let physical_ridge = candidate
-                    .matrix
-                    .mapv(|value| value * candidate.normalization_scale);
+                let physical_ridge = candidate.matrix.scaled(
+                    candidate.normalization_scale,
+                    "physical tensor null ridge",
+                )?;
                 match crate::basis::rebuild_metric_consistent_ridge(
                     &joint_primary,
                     &physical_ridge,
                 )? {
                     Some(rebuilt) => {
-                        let (matrix, scale) = normalize_penalty_in_constrained_space(&rebuilt);
-                        candidate.matrix = matrix;
+                        let (_, scale) =
+                            normalize_penalty_in_constrained_space(rebuilt.dense());
+                        candidate.matrix = rebuilt.scaled(
+                            1.0 / scale,
+                            "normalized rebuilt tensor null ridge",
+                        )?;
                         candidate.normalization_scale = scale;
                     }
                     None => {
-                        candidate.matrix = Array2::<f64>::zeros((width, width));
+                        candidate.matrix = ConstructiveQuadratic::zero(width);
                         candidate.normalization_scale = 1.0;
                     }
                 }
@@ -7161,7 +7195,10 @@ pub fn build_pca_smooth_basis(
             })?;
         let penalty = pca_function_mass_penalty(raw_score_gram, op.nrows, smooth_penalty)?;
         let filtered = filter_penalty_candidates(vec![PenaltyCandidate {
-            matrix: penalty,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                penalty,
+                "lazy PCA function-mass penalty",
+            )?,
             source: PenaltySource::OperatorMass,
             normalization_scale: 1.0,
             kronecker_factors: None,
@@ -7210,7 +7247,10 @@ pub fn build_pca_smooth_basis(
     let raw_score_gram = gam_linalg::faer_ndarray::fast_ata(&design);
     let penalty = pca_function_mass_penalty(raw_score_gram, design.nrows(), smooth_penalty)?;
     let filtered = filter_penalty_candidates(vec![PenaltyCandidate {
-        matrix: penalty,
+        matrix: ConstructiveQuadratic::try_from_dense_psd(
+            penalty,
+            "PCA function-mass penalty",
+        )?,
         source: PenaltySource::OperatorMass,
         normalization_scale: 1.0,
         kronecker_factors: None,
@@ -7672,7 +7712,10 @@ pub fn build_by_smooth_local(
                         .assign(&base_penalty.matrix);
                     let (s_big, scale) = normalize_penalty_in_constrained_space(&s_big);
                     candidates.push(PenaltyCandidate {
-                        matrix: s_big,
+                        matrix: ConstructiveQuadratic::try_from_dense_psd(
+                            s_big,
+                            "factor-smooth replicated penalty",
+                        )?,
                         source: base_penalty.info.source.clone(),
                         normalization_scale: base_penalty.info.normalization_scale * scale,
                         kronecker_factors: None,
@@ -7989,7 +8032,10 @@ pub fn build_factor_smooth(
         }
         let (s_big, factor_smooth_scale) = normalize_penalty_in_constrained_space(&s_big);
         candidates.push(PenaltyCandidate {
-            matrix: s_big,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s_big,
+                "factor-smooth shared penalty",
+            )?,
             source,
             normalization_scale: base_scale * factor_smooth_scale,
             kronecker_factors: None,
@@ -8054,7 +8100,10 @@ pub fn build_factor_smooth(
             }
             let (s_null, null_scale) = normalize_penalty_in_constrained_space(&s_null);
             candidates.push(PenaltyCandidate {
-                matrix: s_null,
+                matrix: ConstructiveQuadratic::try_from_dense_psd(
+                    s_null,
+                    "factor-smooth null-function penalty",
+                )?,
                 source: PenaltySource::Primary,
                 normalization_scale: null_scale,
                 kronecker_factors: None,
@@ -8368,7 +8417,10 @@ pub fn build_single_local_smooth_term(
                     let raw = stz_per_group_penalty(&base_penalty.matrix, which_level);
                     let (s_big, group_scale) = normalize_penalty_in_constrained_space(&raw);
                     candidates.push(PenaltyCandidate {
-                        matrix: s_big,
+                        matrix: ConstructiveQuadratic::try_from_dense_psd(
+                            s_big,
+                            "grouped factor-smooth penalty",
+                        )?,
                         source: base_penalty.info.source.clone(),
                         normalization_scale: base_penalty.info.normalization_scale * group_scale,
                         kronecker_factors: None,
@@ -8424,7 +8476,10 @@ pub fn build_single_local_smooth_term(
                     let (s_null, null_scale) =
                         normalize_penalty_in_constrained_space(&stz_pooled_null);
                     candidates.push(PenaltyCandidate {
-                        matrix: s_null,
+                        matrix: ConstructiveQuadratic::try_from_dense_psd(
+                            s_null,
+                            "grouped factor-smooth null penalty",
+                        )?,
                         source: PenaltySource::DoublePenaltyNullspace,
                         normalization_scale: null_scale,
                         kronecker_factors: None,
@@ -8973,7 +9028,10 @@ pub fn build_single_local_smooth_term(
                 factors
             });
             Ok(PenaltyCandidate {
-                matrix,
+                matrix: ConstructiveQuadratic::try_from_dense_psd(
+                    matrix,
+                    "shape-constrained transformed penalty",
+                )?,
                 source: info.source,
                 normalization_scale,
                 kronecker_factors,

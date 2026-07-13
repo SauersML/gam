@@ -186,13 +186,21 @@ def main() -> int:
     # Score sequentially so the two (N, G) gates are never both resident.
     flat = flat_featurizer(X, dirs, k_circ=args.k_circ, bg_l0=args.bg_l0, g_dict=args.g_dict)
     ev_flat = _ev(X, flat.recon)
-    dl_flat = description_length(flat, X, r2_targets=targets)
+    # The synthetic corpus is scored on all N rows, so the estimation subsample IS
+    # N here; the declared dictionary amortisation horizon is that same planted
+    # token count. Passing it explicitly (never implicitly from the row count)
+    # keeps the score well-defined under #2283.
+    dl_flat = description_length(
+        flat, X, amortization_horizon=args.n, r2_targets=targets
+    )
     del flat
 
     hyb = hybrid_featurizer(X, dirs, k_circ=args.k_circ, bg_l0=args.bg_l0,
                             g_dict=args.g_dict, n_harm=args.n_harm)
     ev_hyb = _ev(X, hyb.recon)
-    dl_hyb = description_length(hyb, X, r2_targets=targets)
+    dl_hyb = description_length(
+        hyb, X, amortization_horizon=args.n, r2_targets=targets
+    )
     del hyb
 
     l0_flat = dl_flat["achieved_block_l0"]

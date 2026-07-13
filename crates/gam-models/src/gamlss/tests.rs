@@ -48,6 +48,18 @@ use num_dual::{
 };
 use statrs::function::gamma::ln_gamma;
 
+fn test_design_hyper_layout(
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+) -> CustomFamilyHyperLayout {
+    let axis_count = derivative_blocks.iter().map(Vec::len).sum();
+    CustomFamilyHyperLayout::new(
+        derivative_blocks.to_vec(),
+        Vec::new(),
+        Array1::zeros(axis_count),
+    )
+    .expect("test design hyper layout")
+}
+
 pub(crate) fn intercept_block(n: usize) -> ParameterBlockInput {
     ParameterBlockInput {
         design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
@@ -4647,12 +4659,13 @@ pub(crate) fn assert_joint_psi_hook_surface<F: CustomFamily>(
     intercept: f64,
     label: &str,
 ) {
+    let hyper_layout = test_design_hyper_layout(derivative_blocks);
     let psi_terms = family
-        .exact_newton_joint_psi_terms(block_states, blocks, derivative_blocks, 0)
+        .exact_newton_joint_psi_terms(block_states, blocks, &hyper_layout, 0)
         .expect("joint psi terms call")
         .unwrap_or_else(|| panic!("{label} family should return joint psi terms"));
     let psi2_terms = family
-        .exact_newton_joint_psisecond_order_terms(block_states, blocks, derivative_blocks, 0, 0)
+        .exact_newton_joint_psisecond_order_terms(block_states, blocks, &hyper_layout, 0, 0)
         .expect("joint psi second-order call")
         .unwrap_or_else(|| panic!("{label} family should return joint psi second-order terms"));
     let total = block_states
@@ -4685,7 +4698,7 @@ pub(crate) fn assert_joint_psi_hook_surface<F: CustomFamily>(
         .exact_newton_joint_psihessian_directional_derivative(
             block_states,
             blocks,
-            derivative_blocks,
+            &hyper_layout,
             0,
             &d_beta_flat,
         )

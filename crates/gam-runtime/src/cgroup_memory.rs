@@ -58,6 +58,7 @@ pub struct CgroupMemoryProbeFailure {
 }
 
 impl CgroupMemoryProbeFailure {
+    #[cfg(any(target_os = "linux", test))]
     fn new(
         kind: CgroupMemoryProbeFailureKind,
         path: impl Into<Box<str>>,
@@ -120,6 +121,7 @@ pub struct CgroupMemoryAvailability {
 }
 
 impl CgroupMemoryAvailability {
+    #[cfg(any(target_os = "linux", test))]
     fn from_consistent_counters(
         binding_path: impl Into<Box<str>>,
         limit_bytes: u64,
@@ -777,6 +779,22 @@ mod linux {
         }
 
         #[test]
+        fn cgroup_v2_root_accounting_without_memory_max_is_unbounded() {
+            let fixture = Fixture::new("/");
+            fs::write(fixture.mount.join("memory.current"), "1000\n")
+                .expect("root current");
+            fs::write(fixture.mount.join("memory.stat"), "inactive_file 700\n")
+                .expect("root stat");
+            assert!(matches!(
+                fixture.observe(),
+                CgroupMemoryObservation::V2Unbounded {
+                    inspected_levels: 0,
+                    ..
+                }
+            ));
+        }
+
+        #[test]
         fn finite_zero_remains_authoritative() {
             let fixture = Fixture::new("/tenant/leaf");
             fixture.level("tenant/leaf", "0", 0, 0);
@@ -894,6 +912,25 @@ mod linux {
             fs::write(&mountinfo_file, "").expect("mountinfo");
             let failure = detect_from_proc_files(&cgroup_file, &mountinfo_file)
                 .expect_err("v1 memory cannot inherit host availability");
+            assert_eq!(
+                failure.kind(),
+                CgroupMemoryProbeFailureKind::UnsupportedCgroupV1
+            );
+        }
+
+        #[test]
+        fn hybrid_v1_memory_and_v2_membership_fails_closed() {
+            let fixture = Fixture::new("/tenant/leaf");
+            fs::write(
+                &fixture.cgroup_file,
+                "0::/tenant/leaf\n4:memory:/legacy\n",
+            )
+            .expect("hybrid membership");
+            let failure = detect_from_proc_files(
+                &fixture.cgroup_file,
+                &fixture.mountinfo_file,
+            )
+            .expect_err("an active v1 memory controller cannot be ignored");
             assert_eq!(
                 failure.kind(),
                 CgroupMemoryProbeFailureKind::UnsupportedCgroupV1

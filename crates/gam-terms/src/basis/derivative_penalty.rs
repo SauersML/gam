@@ -49,6 +49,21 @@ pub fn bspline_derivative_penalty_matrix(
     degree: usize,
     order: usize,
 ) -> Result<Array2<f64>, BasisError> {
+    let factor = bspline_derivative_penalty_factor(knot_vector, degree, order)?;
+    let mut penalty = fast_ata(&factor);
+    symmetrize_in_place(&mut penalty);
+    Ok(penalty)
+}
+
+/// Constructive energy factor for the exact open B-spline roughness.
+///
+/// Each row is one weighted derivative-evaluation functional from the exact
+/// span quadrature, so `S = AᵀA` without first materializing a dense Gram.
+pub fn bspline_derivative_penalty_factor(
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+    order: usize,
+) -> Result<Array2<f64>, BasisError> {
     validate_knots_for_degree(knot_vector, degree)?;
     let num_basis = knot_vector.len() - degree - 1;
     if order == 0 || order >= num_basis {
@@ -66,22 +81,20 @@ pub fn bspline_derivative_penalty_matrix(
     let (normalized_knots, domain_scale) =
         normalized_open_knot_vector(knot_vector, degree, num_basis)?;
 
-    let mut s = Array2::<f64>::zeros((num_basis, num_basis));
     // The modeling interval is covered by spans `[t_k, t_{k+1}]` for
     // `k = degree .. num_basis`; clamped boundary knots make the exterior
     // spans degenerate and they carry no integral mass.
-    accumulate_derivative_gram_spans(
+    let mut factor = derivative_energy_factor_spans(
         normalized_knots.view(),
         degree,
         order,
         degree..num_basis,
         num_basis,
+        num_basis,
         |col| col,
-        &mut s,
     )?;
-    rescale_derivative_gram(&mut s, domain_scale, order)?;
-    symmetrize_in_place(&mut s);
-    Ok(s)
+    rescale_derivative_factor(&mut factor, domain_scale, order)?;
+    Ok(factor)
 }
 
 /// Exact function-space penalties for the anchored I-spline basis.
@@ -244,6 +257,19 @@ pub fn cyclic_bspline_derivative_penalty_matrix(
     period: f64,
     order: usize,
 ) -> Result<Array2<f64>, BasisError> {
+    let factor = cyclic_bspline_derivative_penalty_factor(degree, num_basis, period, order)?;
+    let mut penalty = fast_ata(&factor);
+    symmetrize_in_place(&mut penalty);
+    Ok(penalty)
+}
+
+/// Constructive energy factor for the exact cyclic B-spline roughness.
+pub fn cyclic_bspline_derivative_penalty_factor(
+    degree: usize,
+    num_basis: usize,
+    period: f64,
+    order: usize,
+) -> Result<Array2<f64>, BasisError> {
     if degree < 1 {
         return Err(BasisError::InvalidDegree(degree));
     }
@@ -282,21 +308,19 @@ pub fn cyclic_bspline_derivative_penalty_matrix(
     let knots = cyclic_uniform_knot_vector(0.0, 1.0, degree, num_basis);
     let num_basis_extended = knots.len() - degree - 1;
 
-    let mut s = Array2::<f64>::zeros((num_basis, num_basis));
     // One period = the `num_basis` spans `[t_k, t_{k+1}]`,
     // `k = degree .. degree + num_basis`, of the extended knot line.
-    accumulate_derivative_gram_spans(
+    let mut factor = derivative_energy_factor_spans(
         knots.view(),
         degree,
         order,
         degree..degree + num_basis,
         num_basis_extended,
+        num_basis,
         |col| col % num_basis,
-        &mut s,
     )?;
-    rescale_derivative_gram(&mut s, period, order)?;
-    symmetrize_in_place(&mut s);
-    Ok(s)
+    rescale_derivative_factor(&mut factor, period, order)?;
+    Ok(factor)
 }
 
 /// Maps the open spline's modeling interval to `[0, 1]`. Assembly in this
@@ -370,23 +394,29 @@ fn derivative_gram_coordinate_scale(domain_scale: f64, order: usize) -> Result<f
     Ok(scale)
 }
 
-/// Applies the exact coordinate covariance to a unit-domain derivative Gram
-/// and rejects scales whose floating-point representation would change the
-/// operator's rank. A finite scale factor alone is not sufficient: multiplying
-/// a large unit-domain entry can still overflow, while a positive subnormal
-/// factor can underflow one or more basis-function energies to zero.
-fn rescale_derivative_gram(
-    gram: &mut Array2<f64>,
+/// Apply exact coordinate covariance to the energy factor and reject a scale
+/// whose floating representation would erase any basis-function energy.
+fn rescale_derivative_factor(
+    factor: &mut Array2<f64>,
     domain_scale: f64,
     order: usize,
 ) -> Result<(), BasisError> {
-    let coordinate_scale = derivative_gram_coordinate_scale(domain_scale, order)?;
-    gram.mapv_inplace(|value| value * coordinate_scale);
-    let entries_are_finite = gram.iter().all(|value| value.is_finite());
-    let preserves_all_basis_diagonals = (0..gram.nrows()).all(|i| gram[[i, i]] > 0.0);
-    if !entries_are_finite || !preserves_all_basis_diagonals {
+    let root_scale = derivative_gram_coordinate_scale(domain_scale, order)?.sqrt();
+    factor.mapv_inplace(|value| value * root_scale);
+    if factor.iter().any(|value| !value.is_finite()) {
         return Err(BasisError::InvalidInput(format!(
-            "order-{order} roughness Gram over domain width {domain_scale} is not representable"
+            "order-{order} roughness factor over domain width {domain_scale} is not representable"
+        )));
+    }
+    let preserves_all_basis_energies = (0..factor.ncols()).all(|column| {
+        factor
+            .column(column)
+            .iter()
+            .any(|value| *value != 0.0)
+    });
+    if !preserves_all_basis_energies {
+        return Err(BasisError::InvalidInput(format!(
+            "order-{order} roughness factor over domain width {domain_scale} lost a basis-function energy"
         )));
     }
     Ok(())
@@ -399,21 +429,27 @@ fn rescale_derivative_gram(
 /// (pre-fold) basis dimension of `knot_vector`. On each span only the
 /// `degree + 1` basis functions `k − degree ..= k` are supported, so the
 /// inner accumulation is restricted to that window.
-fn accumulate_derivative_gram_spans(
+fn derivative_energy_factor_spans(
     knot_vector: ArrayView1<f64>,
     degree: usize,
     order: usize,
     spans: std::ops::Range<usize>,
     out_len: usize,
+    output_dim: usize,
     fold: impl Fn(usize) -> usize,
-    s: &mut Array2<f64>,
-) -> Result<(), BasisError> {
+) -> Result<Array2<f64>, BasisError> {
     // Integrand degree per span is 2(p − m); `p − m + 1` Gauss points are
     // exact through degree 2(p − m) + 1.
     let quad_points = degree - order + 1;
     let (nodes, weights) = gauss_legendre(quad_points);
+    let active_spans = spans
+        .clone()
+        .filter(|&k| knot_vector[k + 1] > knot_vector[k])
+        .count();
+    let mut factor = Array2::<f64>::zeros((active_spans * quad_points, output_dim));
     let mut row = vec![0.0_f64; out_len];
     let mut workspace = BsplineDerivativeWorkspace::new();
+    let mut factor_row = 0usize;
 
     for k in spans {
         let left = knot_vector[k];
@@ -437,7 +473,7 @@ fn accumulate_derivative_gram_spans(
                 &mut workspace,
                 0,
             )?;
-            let w = weight * half;
+            let root_weight = (weight * half).sqrt();
             let support_start = k - degree;
             for i in support_start..=k {
                 let vi = row[i];
@@ -445,16 +481,13 @@ fn accumulate_derivative_gram_spans(
                     continue;
                 }
                 let fi = fold(i);
-                for j in support_start..=k {
-                    let vj = row[j];
-                    if vj != 0.0 {
-                        s[[fi, fold(j)]] += w * vi * vj;
-                    }
-                }
+                factor[[factor_row, fi]] += root_weight * vi;
             }
+            factor_row += 1;
         }
     }
-    Ok(())
+    debug_assert_eq!(factor_row, factor.nrows());
+    Ok(factor)
 }
 
 /// Exact symmetrization: the accumulation is symmetric in exact arithmetic;

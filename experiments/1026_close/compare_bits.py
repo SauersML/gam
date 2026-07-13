@@ -16,7 +16,11 @@ import json
 import math
 
 
-PAIR_SCHEMA = "gam.issue2283.eq4-pair.v1"
+# v2 (#2283): dictionary bits are charged against a DECLARED amortization_horizon
+# that is separate from the bits estimation subsample. v1 rows priced the
+# dictionary term with the confounded subsample N and are NOT comparable, so this
+# comparator rejects them at the schema gate and requires an explicit horizon.
+PAIR_SCHEMA = "gam.issue2283.eq4-pair.v2"
 ARMS = ("external_topk", "hybrid_rust")
 TARGETS = ("0.99", "0.95", "0.9", "0.8")
 HISTORICAL_BAR_R2_099 = 56_322.0
@@ -80,6 +84,18 @@ def _authoritative_pair(records, run_id):
             raise ValueError(f"{record['arm']} bit rows do not match its pair identity")
         if record.get("bits_dict_params_faithful") is not True:
             raise ValueError(f"{record['arm']} row is not dictionary-parameter faithful")
+        horizon = record.get("bits_amortization_horizon")
+        if not isinstance(horizon, int) or horizon < 2:
+            raise ValueError(
+                f"{record['arm']} row has no declared amortization horizon (>= 2); "
+                "it predates the #2283 confound fix and must be re-scored"
+            )
+        if record.get("pair_identity", {}).get("config", {}).get(
+            "amortization_horizon"
+        ) != horizon:
+            raise ValueError(
+                f"{record['arm']} amortization horizon disagrees with its pair identity"
+            )
     if external["pair_identity"] != hybrid["pair_identity"]:
         raise ValueError("external and hybrid rows have different config/provenance identities")
     if hybrid.get("hybrid_phase") != "curved-resume":
