@@ -7017,7 +7017,7 @@ impl BernoulliMarginalSlopeFamily {
                 &plan,
                 &primary_point,
                 &ordered_pairs,
-                primary.total,
+                primary,
             )?;
             let mut orientations = ordered.into_iter();
             while let Some(mut ordered) = orientations.next() {
