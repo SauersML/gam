@@ -678,6 +678,7 @@ fn constant_gaussian_standard_fit(
         bias_correction_jacobian: None,
     };
     let geometry = Some(gam_solve::estimate::FitGeometry {
+        coefficient_gauge: gam_problem::gauge::Gauge::identity(&[beta.len()]),
         penalized_hessian: penalized_hessian_precision,
         working_weights: weights,
         working_response,

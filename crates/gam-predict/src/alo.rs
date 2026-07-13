@@ -1,6 +1,6 @@
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 
-use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, ReparamOperator};
 use gam_models::gamlss::{
     BinomialLocationScaleAloRowInput, DispersionFamilyKind, GaussianLocationScaleAloRowInput,
     binomial_location_scale_alo_row_geometry, dispersion_alo_row_geometry,
@@ -19,7 +19,7 @@ use gam_models::transformation_normal::{
     TRANSFORMATION_MONOTONICITY_EPS, TransformationNormalAloRowInput,
     transformation_normal_alo_row_geometry,
 };
-use gam_problem::{EstimationError, ResponseFamily};
+use gam_problem::{EstimationError, Gauge, ResponseFamily};
 use gam_solve::inference::alo::{
     AloInput, MultiBlockAloDiagnostics, MultiBlockAloInput, compute_alo_from_input,
     compute_multiblock_alo,
@@ -285,32 +285,161 @@ fn location_scale_coordinate_layout(
     (designs, ranges, names)
 }
 
-fn require_saved_hessian<'a>(
+struct SavedAloGeometry<'a> {
+    gauge: &'a Gauge,
+    penalized_hessian: &'a Array2<f64>,
+}
+
+/// Require the exact active-coordinate geometry persisted by the fit.
+///
+/// A saved beta vector is a reporting coordinate, not necessarily the frame
+/// in which the optimizer's precision lives.  The mandatory gauge is the
+/// authority connecting them: `beta_saved = T theta_active + a`.  Guessing an
+/// identity map or treating a pushed-forward covariance as a precision would
+/// be mathematically invalid whenever `T` is rectangular.
+fn require_saved_geometry<'a>(
     model: &'a FittedModel,
     class: PredictModelClass,
-    parameter_dimension: usize,
-) -> Result<&'a Array2<f64>, EstimationError> {
+    raw_parameter_dimension: usize,
+) -> Result<SavedAloGeometry<'a>, EstimationError> {
     let fit = model.payload().fit_result.as_ref().ok_or_else(|| {
         invalid(format!(
             "saved {} ALO requires a canonical fitted coefficient state",
             class.name()
         ))
     })?;
-    let hessian = fit.penalized_hessian().ok_or_else(|| {
+    let geometry = fit.geometry.as_ref().ok_or_else(|| {
         invalid(format!(
-            "saved {} ALO requires the exact unscaled penalized Hessian",
+            "saved {} ALO requires exact fitted working geometry",
             class.name()
         ))
     })?;
-    if hessian.dim() != (parameter_dimension, parameter_dimension) {
+    geometry.coefficient_gauge.validate().map_err(|reason| {
+        invalid(format!(
+            "saved {} ALO coefficient gauge is invalid: {reason}",
+            class.name()
+        ))
+    })?;
+    if geometry.coefficient_gauge.raw_total() != raw_parameter_dimension {
         return Err(invalid(format!(
-            "saved {} ALO precision is {}x{}; parameter layout requires {parameter_dimension}x{parameter_dimension}",
+            "saved {} ALO gauge maps {} raw coefficients; fitted row layout requires {raw_parameter_dimension}",
+            class.name(),
+            geometry.coefficient_gauge.raw_total(),
+        )));
+    }
+    let active_dimension = geometry.coefficient_gauge.reduced_total();
+    let hessian = geometry.penalized_hessian.as_array();
+    if hessian.dim() != (active_dimension, active_dimension) || active_dimension == 0 {
+        return Err(invalid(format!(
+            "saved {} ALO active precision is {}x{}; coefficient gauge requires {active_dimension}x{active_dimension}",
             class.name(),
             hessian.nrows(),
             hessian.ncols(),
         )));
     }
-    Ok(hessian)
+    Ok(SavedAloGeometry {
+        gauge: &geometry.coefficient_gauge,
+        penalized_hessian: hessian,
+    })
+}
+
+fn exact_identity(matrix: &Array2<f64>) -> bool {
+    matrix.nrows() == matrix.ncols()
+        && matrix
+            .indexed_iter()
+            .all(|((row, column), &value)| value == if row == column { 1.0 } else { 0.0 })
+}
+
+/// Pull local raw-coordinate row Jacobians into the saved Hessian's active
+/// frame.  Each raw local design `X_b` covers `raw_range_b`, so its exact
+/// active Jacobian is
+///
+/// `X_b * T[raw_range_b, active_support_b]`.
+///
+/// The support is trimmed only at columns that are *exactly* zero.  This keeps
+/// identity/block gauges cheap while preserving arbitrary dense or triangular
+/// cross-block maps.  A coordinate fixed by the gauge receives a one-column
+/// exact-zero design, which represents zero influence without inventing a
+/// parameter or requiring an empty range that the ALO kernel forbids.
+fn pullback_saved_coordinate_designs(
+    class: PredictModelClass,
+    gauge: &Gauge,
+    coordinate_designs: Vec<DesignMatrix>,
+    raw_coordinate_ranges: Vec<Range<usize>>,
+) -> Result<(Vec<DesignMatrix>, Vec<Range<usize>>), EstimationError> {
+    if coordinate_designs.len() != raw_coordinate_ranges.len() {
+        return Err(invalid(format!(
+            "saved {} ALO has {} coordinate designs but {} raw coefficient ranges",
+            class.name(),
+            coordinate_designs.len(),
+            raw_coordinate_ranges.len(),
+        )));
+    }
+    let active_dimension = gauge.reduced_total();
+    if active_dimension == 0 {
+        return Err(invalid(format!(
+            "saved {} ALO coefficient gauge has no active coordinates",
+            class.name()
+        )));
+    }
+
+    let mut active_designs = Vec::with_capacity(coordinate_designs.len());
+    let mut active_ranges = Vec::with_capacity(raw_coordinate_ranges.len());
+    for (coordinate, (design, raw_range)) in coordinate_designs
+        .into_iter()
+        .zip(raw_coordinate_ranges)
+        .enumerate()
+    {
+        if raw_range.start > raw_range.end
+            || raw_range.end > gauge.raw_total()
+            || design.ncols() != raw_range.len()
+            || raw_range.is_empty()
+        {
+            return Err(invalid(format!(
+                "saved {} ALO coordinate {coordinate} design width {} is not aligned to raw range {:?} in a {}-coefficient gauge",
+                class.name(),
+                design.ncols(),
+                raw_range,
+                gauge.raw_total(),
+            )));
+        }
+
+        let raw_to_active = gauge.t_full.slice(s![raw_range, ..]);
+        let first_active = (0..active_dimension).find(|&column| {
+            raw_to_active
+                .column(column)
+                .iter()
+                .any(|&value| value != 0.0)
+        });
+        let active_range = match first_active {
+            Some(start) => {
+                let end = (start..active_dimension)
+                    .rev()
+                    .find(|&column| {
+                        raw_to_active
+                            .column(column)
+                            .iter()
+                            .any(|&value| value != 0.0)
+                    })
+                    .expect("first active gauge column proves a last column")
+                    + 1;
+                start..end
+            }
+            None => 0..1,
+        };
+        let transform = raw_to_active
+            .slice(s![.., active_range.clone()])
+            .to_owned();
+        if exact_identity(&transform) {
+            active_designs.push(design);
+        } else {
+            active_designs.push(DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
+                ReparamOperator::new(design, Arc::new(transform)),
+            ))));
+        }
+        active_ranges.push(active_range);
+    }
+    Ok((active_designs, active_ranges))
 }
 
 fn standard_alo_dispersion(

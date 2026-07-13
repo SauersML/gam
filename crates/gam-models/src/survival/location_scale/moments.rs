@@ -503,8 +503,16 @@ pub(crate) fn exact_survival_response_moments(
     Ok((first, second))
 }
 
-pub(crate) fn lift_conditional_covariance(
-    cov_reduced: &Array2<f64>,
+/// Exact affine map from the fitted location-scale coefficient frame into the
+/// saved/reporting frame.
+///
+/// The inner fit sees the reduced time block and the active tails of the
+/// threshold and log-sigma blocks. Saved coefficients expand all three back to
+/// their raw layouts. Keeping this as a single [`Gauge`] is essential: the
+/// conditional covariance pushes forward through it, while the penalized
+/// Hessian remains in the active frame and is paired with this map for exact
+/// post-fit row-Jacobian pullback.
+pub(crate) fn survival_location_scale_finalization_gauge(
     time_gauge: &Gauge,
     p_threshold_reduced: usize,
     p_threshold_full: usize,
@@ -513,11 +521,17 @@ pub(crate) fn lift_conditional_covariance(
     p_log_sigma_full: usize,
     log_sigma_fixed_cols: usize,
     p_linkwiggle: usize,
-) -> Result<Array2<f64>, String> {
+) -> Result<Gauge, String> {
+    time_gauge.validate().map_err(|reason| {
+        SurvivalLocationScaleError::InvalidConfiguration {
+            reason: format!("survival location-scale time gauge is invalid: {reason}"),
+        }
+        .to_string()
+    })?;
     if time_gauge.n_blocks() != 1 {
         return Err(SurvivalLocationScaleError::InvalidConfiguration {
             reason: format!(
-                "survival location-scale covariance lift expected a single-block time gauge, got {} blocks",
+                "survival location-scale finalization expected a single-block time gauge, got {} blocks",
                 time_gauge.n_blocks()
             ),
         }
@@ -560,16 +574,6 @@ pub(crate) fn lift_conditional_covariance(
         .into());
     }
 
-    let p_reduced = p_time_reduced + p_threshold_reduced + p_log_sigma_reduced + p_linkwiggle;
-    let p_full = p_time_full + p_threshold_full + p_log_sigma_full + p_linkwiggle;
-    if cov_reduced.nrows() != p_reduced || cov_reduced.ncols() != p_reduced {
-        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-            "survival location-scale covariance lift expected reduced matrix {p_reduced}x{p_reduced}, got {}x{}",
-            cov_reduced.nrows(),
-            cov_reduced.ncols()
-        ) }.into());
-    }
-
     let fixed_tail_transform = |full: usize, fixed: usize, reduced: usize| {
         let mut t = Array2::<f64>::zeros((full, reduced));
         for j in 0..reduced {
@@ -577,13 +581,40 @@ pub(crate) fn lift_conditional_covariance(
         }
         t
     };
-    let joint_gauge = Gauge::from_block_transforms(&[
+    let p_full = p_time_full + p_threshold_full + p_log_sigma_full + p_linkwiggle;
+    let mut affine_shift = Array1::<f64>::zeros(p_full);
+    affine_shift
+        .slice_mut(s![0..p_time_full])
+        .assign(&time_gauge.affine_shift);
+    let joint_gauge = Gauge::from_block_transforms_with_shift(&[
         time_gauge.block_transform(0),
         fixed_tail_transform(p_threshold_full, threshold_fixed_cols, p_threshold_reduced),
         fixed_tail_transform(p_log_sigma_full, log_sigma_fixed_cols, p_log_sigma_reduced),
         Array2::<f64>::eye(p_linkwiggle),
-    ]);
+    ], affine_shift);
+    let p_reduced = p_time_reduced + p_threshold_reduced + p_log_sigma_reduced + p_linkwiggle;
     assert_eq!(joint_gauge.raw_total(), p_full);
     assert_eq!(joint_gauge.reduced_total(), p_reduced);
-    Ok(joint_gauge.lift_covariance(cov_reduced))
+    Ok(joint_gauge)
+}
+
+pub(crate) fn lift_conditional_covariance(
+    cov_reduced: &Array2<f64>,
+    finalization_gauge: &Gauge,
+) -> Result<Array2<f64>, String> {
+    finalization_gauge.validate().map_err(|reason| {
+        SurvivalLocationScaleError::InvalidConfiguration {
+            reason: format!("survival location-scale finalization gauge is invalid: {reason}"),
+        }
+        .to_string()
+    })?;
+    let p_reduced = finalization_gauge.reduced_total();
+    if cov_reduced.nrows() != p_reduced || cov_reduced.ncols() != p_reduced {
+        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
+            "survival location-scale covariance lift expected active matrix {p_reduced}x{p_reduced}, got {}x{}",
+            cov_reduced.nrows(),
+            cov_reduced.ncols()
+        ) }.into());
+    }
+    Ok(finalization_gauge.lift_covariance(cov_reduced))
 }

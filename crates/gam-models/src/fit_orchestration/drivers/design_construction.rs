@@ -2618,6 +2618,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 bias_correction_jacobian: None,
             };
             let geometry = Some(gam_solve::estimate::FitGeometry {
+                coefficient_gauge: gam_problem::gauge::Gauge::identity(&[beta.len()]),
                 penalized_hessian: penalized_hessian.into(),
                 working_weights: inf.working_weights.clone(),
                 working_response: inf.working_response.clone(),
@@ -6773,6 +6774,7 @@ fn fit_bounded_term_collection_with_design(
     let working_response = exact_standard_working_response(&eta_state)?;
 
     let geometry = Some(gam_solve::estimate::FitGeometry {
+        coefficient_gauge: gam_problem::gauge::Gauge::identity(&[beta.len()]),
         penalized_hessian: penalized_hessian.clone().into(),
         working_weights: eta_state.fisherweight.clone(),
         working_response: working_response.clone(),

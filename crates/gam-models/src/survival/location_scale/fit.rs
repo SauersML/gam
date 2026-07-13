@@ -57,6 +57,12 @@ pub(crate) fn fit_reduced_parametric_aft(
     };
 
     let geometry = Some(FitGeometry {
+        coefficient_gauge: gam_problem::gauge::Gauge::identity(
+            &specs
+                .iter()
+                .map(|spec| spec.design.ncols())
+                .collect::<Vec<_>>(),
+        ),
         penalized_hessian: h.into(),
         working_weights: Array1::<f64>::zeros(0),
         working_response: Array1::<f64>::zeros(0),
