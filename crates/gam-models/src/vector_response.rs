@@ -215,14 +215,22 @@ fn validate_row_weights(weights: &Array1<f64>, n: usize) -> Result<(), Estimatio
 /// Diagonal-noise Gaussian this is exactly `(N, M)` of per-output precisions.
 pub trait VectorLikelihood {
     /// log p(Y | η).
-    fn log_lik(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> f64;
+    fn log_lik(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Result<f64, EstimationError>;
 
     /// ∂ log p(Y | η) / ∂ η, shape (N, M).
-    fn grad_eta(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64>;
+    fn grad_eta(
+        &self,
+        eta: ArrayView2<f64>,
+        y: ArrayView2<f64>,
+    ) -> Result<Array2<f64>, EstimationError>;
 
     /// Diagonal of the per-row Hessian −∂² log p / ∂ η ∂ η, shape (N, M).
     /// This is the per-row block consumed by `solver/arrow_schur.rs`.
-    fn hess_diag(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64>;
+    fn hess_diag(
+        &self,
+        eta: ArrayView2<f64>,
+        y: ArrayView2<f64>,
+    ) -> Result<Array2<f64>, EstimationError>;
 
     /// Per-row dense Hessian block −∂² log p / ∂η_a ∂η_b, shape (N, M, M).
     ///
@@ -238,8 +246,12 @@ pub trait VectorLikelihood {
     /// [`gam_solve::pirls::dense_block_xtwx`] /
     /// [`gam_solve::pirls::dense_block_xtwy`] to build `XᵀWX` and `XᵀWy`
     /// for vector-response IRLS in output-major coefficient ordering.
-    fn hess_block(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array3<f64> {
-        let diag = self.hess_diag(eta, y);
+    fn hess_block(
+        &self,
+        eta: ArrayView2<f64>,
+        y: ArrayView2<f64>,
+    ) -> Result<Array3<f64>, EstimationError> {
+        let diag = self.hess_diag(eta, y)?;
         let (n, m) = diag.dim();
         let mut out = Array3::<f64>::zeros((n, m, m));
         for row in 0..n {
@@ -247,8 +259,40 @@ pub trait VectorLikelihood {
                 out[[row, j, j]] = diag[[row, j]];
             }
         }
-        out
+        Ok(out)
     }
+}
+
+pub(crate) fn validate_vector_likelihood_inputs(
+    context: &str,
+    eta: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    expected_columns: Option<usize>,
+) -> Result<(), EstimationError> {
+    if eta.dim() != y.dim() {
+        crate::bail_invalid_estim!(
+            "{context}: eta shape {:?} does not match response shape {:?}",
+            eta.dim(),
+            y.dim()
+        );
+    }
+    if let Some(expected) = expected_columns
+        && eta.ncols() != expected
+    {
+        crate::bail_invalid_estim!(
+            "{context}: eta has {} columns; expected {expected}",
+            eta.ncols()
+        );
+    }
+    if let Some(((row, column), value)) = eta.indexed_iter().find(|(_, value)| !value.is_finite()) {
+        crate::bail_invalid_estim!("{context}: eta[{row},{column}] must be finite, got {value}");
+    }
+    if let Some(((row, column), value)) = y.indexed_iter().find(|(_, value)| !value.is_finite()) {
+        crate::bail_invalid_estim!(
+            "{context}: response[{row},{column}] must be finite, got {value}"
+        );
+    }
+    Ok(())
 }
 
 /// Gaussian vector likelihood with identity link.
@@ -315,9 +359,13 @@ impl GaussianVectorLikelihood {
 }
 
 impl VectorLikelihood for GaussianVectorLikelihood {
-    fn log_lik(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> f64 {
-        assert_eq!(eta.dim(), y.dim());
-        assert_eq!(eta.ncols(), self.precision.len());
+    fn log_lik(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Result<f64, EstimationError> {
+        validate_vector_likelihood_inputs(
+            "GaussianVectorLikelihood::log_lik",
+            eta,
+            y,
+            Some(self.precision.len()),
+        )?;
         let m = eta.ncols();
         let rank = self.factor.as_ref().map_or(0, |f| f.ncols());
         let mut acc = 0.0;
@@ -348,11 +396,20 @@ impl VectorLikelihood for GaussianVectorLikelihood {
             }
             acc += w * row_acc;
         }
-        -0.5 * acc
+        Ok(-0.5 * acc)
     }
 
-    fn grad_eta(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64> {
-        assert_eq!(eta.dim(), y.dim());
+    fn grad_eta(
+        &self,
+        eta: ArrayView2<f64>,
+        y: ArrayView2<f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        validate_vector_likelihood_inputs(
+            "GaussianVectorLikelihood::grad_eta",
+            eta,
+            y,
+            Some(self.precision.len()),
+        )?;
         let (n_rows, n_cols) = eta.dim();
         let rank = self.factor.as_ref().map_or(0, |f| f.ncols());
         let mut out = Array2::<f64>::zeros((n_rows, n_cols));
@@ -383,11 +440,20 @@ impl VectorLikelihood for GaussianVectorLikelihood {
                 }
             }
         }
-        out
+        Ok(out)
     }
 
-    fn hess_diag(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64> {
-        assert_eq!(eta.dim(), y.dim());
+    fn hess_diag(
+        &self,
+        eta: ArrayView2<f64>,
+        y: ArrayView2<f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        validate_vector_likelihood_inputs(
+            "GaussianVectorLikelihood::hess_diag",
+            eta,
+            y,
+            Some(self.precision.len()),
+        )?;
         // Diagonal of −∂² log p / ∂η² = w · diag(diag(d) + F·Fᵀ); the diagonal
         // of (F·Fᵀ) at output m is Σ_k F[m, k]². This is the diagonal
         // *preconditioner* only — the off-diagonal cross terms F[a, k]·F[b, k]
@@ -421,10 +487,14 @@ impl VectorLikelihood for GaussianVectorLikelihood {
                 out[[n, j]] = w * d;
             }
         }
-        out
+        Ok(out)
     }
 
-    fn hess_block(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array3<f64> {
+    fn hess_block(
+        &self,
+        eta: ArrayView2<f64>,
+        y: ArrayView2<f64>,
+    ) -> Result<Array3<f64>, EstimationError> {
         // Per-row dense block −∂² log p / ∂η_a ∂η_b. With log-likelihood
         //     ℓ = −½ Σ_n w_n · rₙᵀ W rₙ,   r = y − η,   W = diag(precision) + F·Fᵀ,
         // the gradient is wₙ · W rₙ and the negative Hessian block is exactly
@@ -433,8 +503,12 @@ impl VectorLikelihood for GaussianVectorLikelihood {
         // `grad_eta` exactly); the diagonal-only trait default would drop the
         // F·Fᵀ cross terms F[a,k]·F[b,k] for a ≠ b, so it must be overridden
         // whenever a low-rank factor is present.
-        assert_eq!(eta.dim(), y.dim());
-        assert_eq!(eta.ncols(), self.precision.len());
+        validate_vector_likelihood_inputs(
+            "GaussianVectorLikelihood::hess_block",
+            eta,
+            y,
+            Some(self.precision.len()),
+        )?;
         let (n_rows, m) = eta.dim();
         let rank = self.factor.as_ref().map_or(0, |f| f.ncols());
 
@@ -468,7 +542,7 @@ impl VectorLikelihood for GaussianVectorLikelihood {
                 }
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -604,9 +678,10 @@ impl MultinomialLogitLikelihood {
         row: usize,
         eta: &'row [f64],
         response: &'row [f64],
-    ) -> MultinomialLogitRowProgram<'row> {
-        MultinomialLogitRowProgram::new(eta, response, self.row_weight(row))
-            .unwrap_or_else(|error| panic!("invalid multinomial row {row}: {error}"))
+    ) -> Result<MultinomialLogitRowProgram<'row>, EstimationError> {
+        MultinomialLogitRowProgram::new(eta, response, self.row_weight(row)).map_err(|error| {
+            EstimationError::InvalidInput(format!("invalid multinomial row {row}: {error}"))
+        })
     }
 
     /// Fused live value/gradient/Hessian evaluation. This is the one production
@@ -616,12 +691,22 @@ impl MultinomialLogitLikelihood {
         &self,
         eta: ArrayView2<f64>,
         y: ArrayView2<f64>,
-    ) -> (f64, Array2<f64>, Array3<f64>) {
+    ) -> Result<(f64, Array2<f64>, Array3<f64>), EstimationError> {
         let n = eta.nrows();
         let m = self.active_classes;
         let k = self.total_classes();
-        assert_eq!(eta.ncols(), m, "eta must have K-1 columns");
-        assert_eq!(y.dim(), (n, k), "y must be (N, K) simplex encoded");
+        if y.dim() != (n, k) {
+            crate::bail_invalid_estim!(
+                "MultinomialLogitLikelihood::value_gradient_hessian: response shape {:?} must be ({n}, {k})",
+                y.dim()
+            );
+        }
+        validate_vector_likelihood_inputs(
+            "MultinomialLogitLikelihood::value_gradient_hessian active response",
+            eta,
+            y.slice(ndarray::s![.., ..m]),
+            Some(m),
+        )?;
         let mut gradient_log_likelihood = Array2::<f64>::zeros((n, m));
         let mut hessian = Array3::<f64>::zeros((n, m, m));
         let mut eta_row = vec![0.0_f64; m];
@@ -637,7 +722,7 @@ impl MultinomialLogitLikelihood {
             for class in 0..k {
                 response_row[class] = y[[row, class]];
             }
-            let program = self.row_program(row, &eta_row, &response_row);
+            let program = self.row_program(row, &eta_row, &response_row)?;
             negative_log_likelihood += program.value_gradient_hessian_into(
                 &mut probabilities,
                 &mut gradient_nll,
@@ -650,7 +735,7 @@ impl MultinomialLogitLikelihood {
                 }
             }
         }
-        (-negative_log_likelihood, gradient_log_likelihood, hessian)
+        Ok((-negative_log_likelihood, gradient_log_likelihood, hessian))
     }
 
     /// Fused value/gradient entry for callers that do not consume curvature.
@@ -658,12 +743,22 @@ impl MultinomialLogitLikelihood {
         &self,
         eta: ArrayView2<f64>,
         y: ArrayView2<f64>,
-    ) -> (f64, Array2<f64>) {
+    ) -> Result<(f64, Array2<f64>), EstimationError> {
         let n = eta.nrows();
         let m = self.active_classes;
         let k = self.total_classes();
-        assert_eq!(eta.ncols(), m, "eta must have K-1 columns");
-        assert_eq!(y.dim(), (n, k), "y must be (N, K) simplex encoded");
+        if y.dim() != (n, k) {
+            crate::bail_invalid_estim!(
+                "MultinomialLogitLikelihood::value_gradient: response shape {:?} must be ({n}, {k})",
+                y.dim()
+            );
+        }
+        validate_vector_likelihood_inputs(
+            "MultinomialLogitLikelihood::value_gradient active response",
+            eta,
+            y.slice(ndarray::s![.., ..m]),
+            Some(m),
+        )?;
         let mut gradient_log_likelihood = Array2::<f64>::zeros((n, m));
         let mut eta_row = vec![0.0_f64; m];
         let mut response_row = vec![0.0_f64; k];
@@ -677,24 +772,34 @@ impl MultinomialLogitLikelihood {
             for class in 0..k {
                 response_row[class] = y[[row, class]];
             }
-            let program = self.row_program(row, &eta_row, &response_row);
+            let program = self.row_program(row, &eta_row, &response_row)?;
             negative_log_likelihood +=
                 program.value_gradient_into(&mut probabilities, &mut gradient_nll);
             for axis in 0..m {
                 gradient_log_likelihood[[row, axis]] = -gradient_nll[axis];
             }
         }
-        (-negative_log_likelihood, gradient_log_likelihood)
+        Ok((-negative_log_likelihood, gradient_log_likelihood))
     }
 }
 
 impl VectorLikelihood for MultinomialLogitLikelihood {
-    fn log_lik(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> f64 {
+    fn log_lik(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Result<f64, EstimationError> {
         let n = eta.nrows();
         let m = self.active_classes;
         let k = self.total_classes();
-        assert_eq!(eta.ncols(), m, "η must have K-1 columns");
-        assert_eq!(y.dim(), (n, k), "y must be (N, K) simplex encoded");
+        if y.dim() != (n, k) {
+            crate::bail_invalid_estim!(
+                "MultinomialLogitLikelihood::log_lik: response shape {:?} must be ({n}, {k})",
+                y.dim()
+            );
+        }
+        validate_vector_likelihood_inputs(
+            "MultinomialLogitLikelihood::log_lik active response",
+            eta,
+            y.slice(ndarray::s![.., ..m]),
+            Some(m),
+        )?;
         let mut eta_row = vec![0.0_f64; m];
         let mut response_row = vec![0.0_f64; k];
         let mut negative_log_likelihood = 0.0_f64;
@@ -706,17 +811,25 @@ impl VectorLikelihood for MultinomialLogitLikelihood {
                 response_row[class] = y[[row, class]];
             }
             negative_log_likelihood += self
-                .row_program(row, &eta_row, &response_row)
+                .row_program(row, &eta_row, &response_row)?
                 .negative_log_likelihood();
         }
-        -negative_log_likelihood
+        Ok(-negative_log_likelihood)
     }
 
-    fn grad_eta(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64> {
-        self.value_gradient(eta, y).1
+    fn grad_eta(
+        &self,
+        eta: ArrayView2<f64>,
+        y: ArrayView2<f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        Ok(self.value_gradient(eta, y)?.1)
     }
 
-    fn hess_diag(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64> {
+    fn hess_diag(
+        &self,
+        eta: ArrayView2<f64>,
+        y: ArrayView2<f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
         // Per-row diagonal of the (M, M) Fisher block:
         //     H_{n,a,a} = w_n · p_{n,a} · (1 − p_{n,a})
         // Provided for callers that explicitly want the diagonal-only
@@ -724,8 +837,18 @@ impl VectorLikelihood for MultinomialLogitLikelihood {
         let n = eta.nrows();
         let m = self.active_classes;
         let k = self.total_classes();
-        assert_eq!(eta.ncols(), m, "η must have K-1 columns");
-        assert_eq!(y.dim(), (n, k), "y must be (N, K) simplex encoded");
+        if y.dim() != (n, k) {
+            crate::bail_invalid_estim!(
+                "MultinomialLogitLikelihood::hess_diag: response shape {:?} must be ({n}, {k})",
+                y.dim()
+            );
+        }
+        validate_vector_likelihood_inputs(
+            "MultinomialLogitLikelihood::hess_diag active response",
+            eta,
+            y.slice(ndarray::s![.., ..m]),
+            Some(m),
+        )?;
         let mut out = Array2::<f64>::zeros((n, m));
         let mut eta_row = vec![0.0_f64; m];
         let mut response_row = vec![0.0_f64; k];
@@ -738,17 +861,21 @@ impl VectorLikelihood for MultinomialLogitLikelihood {
             for class in 0..k {
                 response_row[class] = y[[row, class]];
             }
-            self.row_program(row, &eta_row, &response_row)
+            self.row_program(row, &eta_row, &response_row)?
                 .hessian_diagonal_into(&mut probabilities, &mut diagonal);
             for axis in 0..m {
                 out[[row, axis]] = diagonal[axis];
             }
         }
-        out
+        Ok(out)
     }
 
-    fn hess_block(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array3<f64> {
-        self.value_gradient_hessian(eta, y).2
+    fn hess_block(
+        &self,
+        eta: ArrayView2<f64>,
+        y: ArrayView2<f64>,
+    ) -> Result<Array3<f64>, EstimationError> {
+        Ok(self.value_gradient_hessian(eta, y)?.2)
     }
 }
 
@@ -908,6 +1035,32 @@ mod tests {
         expect_invalid_input!(
             GaussianVectorLikelihood::from_target(&target),
             "row_weights length",
+        );
+    }
+
+    #[test]
+    fn vector_likelihood_rejects_nonfinite_optimizer_state_without_panicking_932() {
+        let target = dummy_target(1, 2);
+        let likelihood =
+            GaussianVectorLikelihood::from_target(&target).expect("finite Gaussian vector target");
+        let eta = Array2::from_shape_vec((1, 2), vec![0.0, f64::NAN]).expect("eta shape");
+        expect_invalid_input!(
+            likelihood.log_lik(eta.view(), target.y.view()),
+            "eta[0,1] must be finite",
+        );
+    }
+
+    #[test]
+    fn multinomial_row_validation_propagates_as_typed_likelihood_error_932() {
+        let likelihood = MultinomialLogitLikelihood::with_classes(3)
+            .expect("three-class reference-coded likelihood");
+        let eta =
+            Array2::from_shape_vec((1, 2), vec![f64::INFINITY, 0.0]).expect("active eta shape");
+        let response =
+            Array2::from_shape_vec((1, 3), vec![1.0, 0.0, 0.0]).expect("simplex response shape");
+        expect_invalid_input!(
+            likelihood.log_lik(eta.view(), response.view()),
+            "eta[0,0] must be finite",
         );
     }
 }

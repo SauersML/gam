@@ -85,7 +85,13 @@ fn multinomial_stable_shift(eta: &[f64]) -> f64 {
 /// Canonical stable normalization for active logits plus an implicit zero
 /// reference logit. Every probability consumer, including prediction and the
 /// higher-order Fisher schedule, receives its base state from this function.
-pub(crate) fn multinomial_logit_probabilities_into(eta: &[f64], probabilities: &mut [f64]) -> f64 {
+/// The returned `(shift, log_centered_denominator)` keeps scalar likelihood
+/// lowerings in the same cancellation-free coordinates without repeating the
+/// exponential pass.
+pub(crate) fn multinomial_logit_probabilities_into(
+    eta: &[f64],
+    probabilities: &mut [f64],
+) -> (f64, f64) {
     assert_eq!(probabilities.len(), eta.len() + 1);
     let shift = multinomial_stable_shift(eta);
     let active_classes = eta.len();
@@ -101,7 +107,7 @@ pub(crate) fn multinomial_logit_probabilities_into(eta: &[f64], probabilities: &
         *probability *= inverse_denominator;
     }
     probabilities[active_classes] = reference_mass * inverse_denominator;
-    shift + denominator.ln()
+    (shift, denominator.ln())
 }
 
 /// Production [`gam_math::jet_tower::RowProgram`] for one reference-coded
@@ -203,6 +209,9 @@ impl<'row> MultinomialLogitRowProgram<'row> {
     /// `NLL/w = log(D) - sum_active y_a(eta_a-shift) + y_ref*shift`.
     fn eval_expression<S: JetField>(&self, primaries: &[S], constant: impl Fn(f64) -> S) -> S {
         assert_eq!(primaries.len(), self.eta.len());
+        if self.weight == 0.0 {
+            return constant(0.0);
+        }
         let shift = self.stable_shift();
         let mut denominator = constant((-shift).exp());
         let mut centered_response = constant(0.0);
@@ -217,7 +226,10 @@ impl<'row> MultinomialLogitRowProgram<'row> {
                 exponential_value,
             ]);
             denominator = denominator.add(&exponential);
-            centered_response = centered_response.add(&centered.scale(self.response[axis]));
+            let response = self.response[axis];
+            if response != 0.0 {
+                centered_response = centered_response.add(&centered.scale(response));
+            }
         }
         let denominator_value = denominator.value();
         let reciprocal = 1.0 / denominator_value;
@@ -228,10 +240,14 @@ impl<'row> MultinomialLogitRowProgram<'row> {
             2.0 * reciprocal * reciprocal * reciprocal,
             -6.0 * reciprocal * reciprocal * reciprocal * reciprocal,
         ]);
-        log_denominator
-            .sub(&centered_response)
-            .add(&constant(self.response[self.eta.len()] * shift))
-            .scale(self.weight)
+        let reference_response = self.response[self.eta.len()];
+        let nll = log_denominator.sub(&centered_response);
+        let nll = if reference_response == 0.0 {
+            nll
+        } else {
+            nll.add(&constant(reference_response * shift))
+        };
+        nll.scale(self.weight)
     }
 
     /// Stable scalar NLL from the exact semantic expression.
@@ -241,13 +257,39 @@ impl<'row> MultinomialLogitRowProgram<'row> {
     }
 
     /// Compile the semantic normalized-softmax row into probabilities. The
-    /// returned log-partition uses the same centered representation as
+    /// returned shift and centered log-denominator use the same representation as
     /// [`Self::eval_expression`]; no probability clamp or alternate tail policy
     /// exists anywhere in the live likelihood.
     #[inline]
-    pub(crate) fn probabilities_into(&self, probabilities: &mut [f64]) -> f64 {
+    pub(crate) fn probabilities_into(&self, probabilities: &mut [f64]) -> (f64, f64) {
         assert_eq!(probabilities.len(), self.response.len());
         multinomial_logit_probabilities_into(self.eta, probabilities)
+    }
+
+    /// Scalar structure-compiled lowering of [`Self::eval_expression`] from a
+    /// normalization already produced for gradient/Hessian channels.
+    #[inline]
+    fn negative_log_likelihood_from_normalization(
+        &self,
+        shift: f64,
+        log_centered_denominator: f64,
+    ) -> f64 {
+        if self.weight == 0.0 {
+            return 0.0;
+        }
+        let mut centered_response = 0.0_f64;
+        for (axis, &response) in self.response[..self.eta.len()].iter().enumerate() {
+            if response != 0.0 {
+                centered_response += response * (self.eta[axis] - shift);
+            }
+        }
+        let reference_response = self.response[self.eta.len()];
+        let reference_term = if reference_response == 0.0 {
+            0.0
+        } else {
+            reference_response * shift
+        };
+        self.weight * (log_centered_denominator - centered_response + reference_term)
     }
 
     /// Structure-compiled value/gradient lowering of the semantic row. The
@@ -260,11 +302,11 @@ impl<'row> MultinomialLogitRowProgram<'row> {
     ) -> f64 {
         let active_classes = self.eta.len();
         assert_eq!(gradient.len(), active_classes);
-        self.probabilities_into(probabilities);
+        let (shift, log_centered_denominator) = self.probabilities_into(probabilities);
         for axis in 0..active_classes {
             gradient[axis] = self.weight * (probabilities[axis] - self.response[axis]);
         }
-        self.negative_log_likelihood()
+        self.negative_log_likelihood_from_normalization(shift, log_centered_denominator)
     }
 
     /// Diagonal-only structure-compiled Hessian lowering. This preserves the
@@ -272,7 +314,7 @@ impl<'row> MultinomialLogitRowProgram<'row> {
     pub(crate) fn hessian_diagonal_into(&self, probabilities: &mut [f64], diagonal: &mut [f64]) {
         let active_classes = self.eta.len();
         assert_eq!(diagonal.len(), active_classes);
-        self.probabilities_into(probabilities);
+        let _ = self.probabilities_into(probabilities);
         for axis in 0..active_classes {
             let probability = probabilities[axis];
             diagonal[axis] = self.weight * probability * (1.0 - probability);
@@ -1120,11 +1162,15 @@ impl MultinomialFamily {
     /// the current `η`. Centralises the softmax-driven kernel so every
     /// downstream assembly (gradient, dense Hessian, directional derivative)
     /// reads from the same source.
-    fn evaluate_row_kernels(&self, eta: ArrayView2<'_, f64>) -> (f64, Array3<f64>, Array2<f64>) {
+    fn evaluate_row_kernels(
+        &self,
+        eta: ArrayView2<'_, f64>,
+    ) -> Result<(f64, Array3<f64>, Array2<f64>), String> {
         let (log_lik, grad_eta_logl, fisher) = self
             .likelihood
-            .value_gradient_hessian(eta, self.y_one_hot.view());
-        (log_lik, fisher, grad_eta_logl)
+            .value_gradient_hessian(eta, self.y_one_hot.view())
+            .map_err(|error| error.to_string())?;
+        Ok((log_lik, fisher, grad_eta_logl))
     }
 
     /// Assemble the per-block gradient `∂(−log L)/∂β_a = X^T (p_a − y_a)`
@@ -1234,7 +1280,7 @@ impl MultinomialFamily {
         &self,
         eta: ArrayView2<'_, f64>,
         probs_full: ArrayView2<'_, f64>,
-    ) -> (f64, Array1<f64>) {
+    ) -> Result<(f64, Array1<f64>), String> {
         let n = self.weights.len();
         let p = self.design.ncols();
         let m = self.active_classes();
@@ -1257,7 +1303,7 @@ impl MultinomialFamily {
                 response_row[class] = self.y_one_hot[[row, class]];
             }
             let program = MultinomialLogitRowProgram::new(&eta_row, &response_row, w)
-                .unwrap_or_else(|error| panic!("invalid frozen multinomial row {row}: {error}"));
+                .map_err(|error| format!("invalid frozen multinomial row {row}: {error}"))?;
             log_lik -= program.negative_log_likelihood();
         }
         let mut grad = Array1::<f64>::zeros(m * p);
@@ -1272,7 +1318,7 @@ impl MultinomialFamily {
                 grad[a * p + i] = acc;
             }
         }
-        (log_lik, grad)
+        Ok((log_lik, grad))
     }
 
     /// Apply a coefficient-space direction `d_β` to the design to obtain
@@ -2050,7 +2096,7 @@ impl CustomFamily for MultinomialFamily {
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         let eta = self.collect_eta_matrix(block_states)?;
-        let (log_lik, fisher, grad_eta_logl) = self.evaluate_row_kernels(eta.view());
+        let (log_lik, fisher, grad_eta_logl) = self.evaluate_row_kernels(eta.view())?;
         let working_sets = self.assemble_block_diagonal_working_sets(&fisher, &grad_eta_logl)?;
         Ok(FamilyEvaluation {
             log_likelihood: log_lik,
@@ -2060,7 +2106,9 @@ impl CustomFamily for MultinomialFamily {
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         let eta = self.collect_eta_matrix(block_states)?;
-        Ok(self.likelihood.log_lik(eta.view(), self.y_one_hot.view()))
+        self.likelihood
+            .log_lik(eta.view(), self.y_one_hot.view())
+            .map_err(|error| error.to_string())
     }
 
     fn exact_newton_joint_hessian(
@@ -2068,7 +2116,7 @@ impl CustomFamily for MultinomialFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         let eta = self.collect_eta_matrix(block_states)?;
-        let (_, fisher, _) = self.evaluate_row_kernels(eta.view());
+        let (_, fisher, _) = self.evaluate_row_kernels(eta.view())?;
         let hessian = self.assemble_joint_hessian(&fisher)?;
         Ok(Some(hessian))
     }
@@ -2081,7 +2129,8 @@ impl CustomFamily for MultinomialFamily {
         let eta = self.collect_eta_matrix(block_states)?;
         let (log_lik, grad_eta_logl) = self
             .likelihood
-            .value_gradient(eta.view(), self.y_one_hot.view());
+            .value_gradient(eta.view(), self.y_one_hot.view())
+            .map_err(|error| error.to_string())?;
         let gradient = self.assemble_joint_gradient(&grad_eta_logl);
         Ok(Some(ExactNewtonJointGradientEvaluation {
             log_likelihood: log_lik,
@@ -2281,7 +2330,7 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
     fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
         let (log_lik, _) = self
             .family
-            .joint_loglik_and_gradient_from_probs(self.eta.view(), self.probs.view());
+            .joint_loglik_and_gradient_from_probs(self.eta.view(), self.probs.view())?;
         Ok(Some(log_lik))
     }
 
@@ -2290,7 +2339,7 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         let (log_likelihood, gradient) = self
             .family
-            .joint_loglik_and_gradient_from_probs(self.eta.view(), self.probs.view());
+            .joint_loglik_and_gradient_from_probs(self.eta.view(), self.probs.view())?;
         Ok(Some(ExactNewtonJointGradientEvaluation {
             log_likelihood,
             gradient,
@@ -2737,8 +2786,9 @@ mod tests {
                 // ∇NLL = −∇log_lik).
                 let probs = active_probs(&family, &eta);
                 let eta_matrix = Array2::from_shape_vec((1, M), eta.to_vec()).expect("eta matrix");
-                let (log_lik, grad_ll) =
-                    family.joint_loglik_and_gradient_from_probs(eta_matrix.view(), probs.view());
+                let (log_lik, grad_ll) = family
+                    .joint_loglik_and_gradient_from_probs(eta_matrix.view(), probs.view())
+                    .expect("valid frozen multinomial row");
                 close(
                     jet_v,
                     -log_lik,
@@ -2856,6 +2906,8 @@ mod tests {
                 ([1_000.0, -1_000.0, -750.0], [0.0, 0.0, 0.0, 1.0], 1.25),
                 ([-1_000.0, -900.0, -800.0], [0.0, 0.0, 1.0, 0.0], 0.75),
                 ([1_000.0, 1_000.0, -1_000.0], [0.2, 0.3, 0.1, 0.4], 2.0),
+                ([f64::MAX, -f64::MAX, 0.0], [1.0, 0.0, 0.0, 0.0], 1.0),
+                ([f64::MAX, -f64::MAX, 0.0], [0.0, 0.0, 0.0, 1.0], 0.0),
             ];
             let direction = [0.7, -0.4, 1.1];
             let direction_u = [-0.3, 0.9, 0.2];
@@ -2905,7 +2957,8 @@ mod tests {
                     .expect("tail response matrix");
                 let (live_log_likelihood, live_gradient, live_hessian) = family
                     .likelihood
-                    .value_gradient_hessian(eta_matrix.view(), response_matrix.view());
+                    .value_gradient_hessian(eta_matrix.view(), response_matrix.view())
+                    .expect("valid multinomial tail row");
                 close(
                     canonical_value,
                     -live_log_likelihood,

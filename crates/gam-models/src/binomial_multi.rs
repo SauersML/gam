@@ -55,7 +55,7 @@ use crate::model_types::EstimationError;
 use crate::penalized_vector_glm::{
     PenalizedVectorGlmInputs, VectorGlmSolve, fit_penalized_vector_glm,
 };
-use crate::vector_response::VectorLikelihood;
+use crate::vector_response::{VectorLikelihood, validate_vector_likelihood_inputs};
 use gam_problem::FixedLambdaSolverStage;
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 
@@ -158,7 +158,12 @@ impl VectorLikelihood for BinomialMultiLikelihood {
     /// the objective registered no improvement. The softplus form keeps the
     /// true slope (≈ |η| per unit) at any saturation, so value, gradient, and
     /// curvature are exact surfaces of ONE function.
-    fn log_lik(&self, eta: ArrayView2<'_, f64>, y: ArrayView2<'_, f64>) -> f64 {
+    fn log_lik(
+        &self,
+        eta: ArrayView2<'_, f64>,
+        y: ArrayView2<'_, f64>,
+    ) -> Result<f64, EstimationError> {
+        validate_vector_likelihood_inputs("BinomialMultiLikelihood::log_lik", eta, y, None)?;
         let (n, k) = eta.dim();
         let mut acc = 0.0_f64;
         for row in 0..n {
@@ -171,11 +176,16 @@ impl VectorLikelihood for BinomialMultiLikelihood {
                         + (1.0 - yv) * gam_linalg::utils::stable_softplus(e));
             }
         }
-        acc
+        Ok(acc)
     }
 
     /// `∂ log L / ∂η_{n,a} = w_n (y_{n,a} − μ_{n,a})`.
-    fn grad_eta(&self, eta: ArrayView2<'_, f64>, y: ArrayView2<'_, f64>) -> Array2<f64> {
+    fn grad_eta(
+        &self,
+        eta: ArrayView2<'_, f64>,
+        y: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        validate_vector_likelihood_inputs("BinomialMultiLikelihood::grad_eta", eta, y, None)?;
         let (n, k) = eta.dim();
         let mut out = Array2::<f64>::zeros((n, k));
         for row in 0..n {
@@ -185,15 +195,19 @@ impl VectorLikelihood for BinomialMultiLikelihood {
                 out[[row, a]] = w * (y[[row, a]] - mu);
             }
         }
-        out
+        Ok(out)
     }
 
     /// Per-output diagonal curvature `w_n μ_{n,a} (1 − μ_{n,a})`. The Fisher
     /// information of independent Bernoulli outputs is `y`-independent; `y` is
     /// read only to assert the target shape matches `eta`, as in the sibling
     /// [`VectorLikelihood`] implementations.
-    fn hess_diag(&self, eta: ArrayView2<'_, f64>, y: ArrayView2<'_, f64>) -> Array2<f64> {
-        assert_eq!(eta.dim(), y.dim(), "y must match eta shape (N, K)");
+    fn hess_diag(
+        &self,
+        eta: ArrayView2<'_, f64>,
+        y: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        validate_vector_likelihood_inputs("BinomialMultiLikelihood::hess_diag", eta, y, None)?;
         let (n, k) = eta.dim();
         let mut out = Array2::<f64>::zeros((n, k));
         for row in 0..n {
@@ -203,15 +217,19 @@ impl VectorLikelihood for BinomialMultiLikelihood {
                 out[[row, a]] = w * mu * (1.0 - mu);
             }
         }
-        out
+        Ok(out)
     }
 
     /// Row-diagonal Fisher block `H_{n,a,b} = δ_{ab} · w_n μ_{n,a}(1 − μ_{n,a})`.
     /// The independent columns have no cross-output coupling, so the off-diagonal
     /// entries are identically zero; lifting [`Self::hess_diag`] onto the per-row
     /// diagonal (the [`VectorLikelihood`] default) is exact here.
-    fn hess_block(&self, eta: ArrayView2<'_, f64>, y: ArrayView2<'_, f64>) -> Array3<f64> {
-        let diag = self.hess_diag(eta, y);
+    fn hess_block(
+        &self,
+        eta: ArrayView2<'_, f64>,
+        y: ArrayView2<'_, f64>,
+    ) -> Result<Array3<f64>, EstimationError> {
+        let diag = self.hess_diag(eta, y)?;
         let (n, k) = diag.dim();
         let mut out = Array3::<f64>::zeros((n, k, k));
         for row in 0..n {
@@ -219,7 +237,7 @@ impl VectorLikelihood for BinomialMultiLikelihood {
                 out[[row, a, a]] = diag[[row, a]];
             }
         }
-        out
+        Ok(out)
     }
 }
 

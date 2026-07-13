@@ -79,7 +79,6 @@ use gam_problem::{
 use gam_solve::pirls::dense_block_xtwx;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
 use opt::{BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge};
-use std::convert::Infallible;
 
 /// Base Levenberg–Marquardt ridge as a fraction of the penalized Hessian's
 /// largest diagonal entry (so it is invariant to the problem's overall
@@ -686,12 +685,13 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     // it is read, so reusing it is bit-for-bit identical to the prior
     // allocate-fresh body: `recompute_eta` runs the SAME `Σ_i design·β` loop in
     // the SAME order this closure used inline.
-    let evaluate_objective = |beta_trial: &Array2<f64>, eta_scratch: &mut Array2<f64>| -> f64 {
-        recompute_eta(beta_trial, eta_scratch);
-        let ll = likelihood.log_lik(eta_scratch.view(), y);
-        let pen = weighted_penalty_sum(beta_trial, penalty, lambdas, class_penalty_metric);
-        -ll + pen
-    };
+    let evaluate_objective =
+        |beta_trial: &Array2<f64>, eta_scratch: &mut Array2<f64>| -> Result<f64, EstimationError> {
+            recompute_eta(beta_trial, eta_scratch);
+            let ll = likelihood.log_lik(eta_scratch.view(), y)?;
+            let pen = weighted_penalty_sum(beta_trial, penalty, lambdas, class_penalty_metric);
+            Ok(-ll + pen)
+        };
 
     for iter in 0..max_iter {
         iterations = completed_iterations.checked_add(iter + 1).ok_or_else(|| {
@@ -706,9 +706,10 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         // the caller-supplied curvature override (issue #349 escape-hatch —
         // curvature only) or the analytic [`VectorLikelihood::hess_block`]. The
         // residual r_{n,a} = −∂ log L / ∂η_a stays analytic in both cases.
-        let analytic_fisher = fisher_w_override
-            .as_ref()
-            .map_or_else(|| Some(likelihood.hess_block(eta.view(), y)), |_| None);
+        let analytic_fisher = match fisher_w_override.as_ref() {
+            Some(_) => None,
+            None => Some(likelihood.hess_block(eta.view(), y)?),
+        };
         let fisher_blocks = match fisher_w_override.as_ref() {
             Some(fw) => *fw,
             None => analytic_fisher
@@ -716,7 +717,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
                 .expect("analytic Fisher computed when no override")
                 .view(),
         };
-        let residual = likelihood.grad_eta(eta.view(), y).mapv(|v| -v);
+        let residual = likelihood.grad_eta(eta.view(), y)?.mapv(|v| -v);
 
         // Penalized Hessian: H = block(XᵀWX) + diag_a(λ_a S).
         let mut hessian = dense_block_xtwx(design, fisher_blocks, None)?;
@@ -882,12 +883,12 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
             out
         };
         if iter == 0 {
-            last_objective = evaluate_objective(&beta, &mut eta_objective_scratch);
+            last_objective = evaluate_objective(&beta, &mut eta_objective_scratch)?;
             if !last_objective.is_finite() {
                 crate::bail_invalid_estim!("{context}: non-finite objective at β = 0");
             }
         }
-        let accepted = match backtracking_line_search::<_, Infallible>(
+        let accepted = backtracking_line_search::<_, EstimationError>(
             BacktrackConfig {
                 contraction: LINE_SEARCH_SHRINK,
                 max_steps: MAX_BACKTRACKS + 1,
@@ -895,14 +896,11 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
             },
             |alpha| {
                 let candidate = proposed_beta(alpha);
-                let objective = evaluate_objective(&candidate, &mut eta_objective_scratch);
+                let objective = evaluate_objective(&candidate, &mut eta_objective_scratch)?;
                 Ok(Some((objective, candidate)))
             },
             |_alpha, f| f.is_finite() && f <= last_objective + OBJECTIVE_DECREASE_SLACK,
-        ) {
-            Ok(accepted) => accepted,
-            Err(never) => match never {},
-        };
+        )?;
         let Some(accepted) = accepted else {
             // Every candidate failed the descent certificate. Keep the last
             // ACCEPTED iterate as checkpoint evidence; a rejected trial can
@@ -955,7 +953,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
 
     // ──────────────────────────── post-process ────────────────────────────
     recompute_eta(&beta, &mut eta);
-    let log_likelihood = likelihood.log_lik(eta.view(), y);
+    let log_likelihood = likelihood.log_lik(eta.view(), y)?;
     let penalty_term = weighted_penalty_sum(&beta, penalty, lambdas, class_penalty_metric);
 
     // Re-assemble the final penalized Hessian before certification. This is not
@@ -972,9 +970,10 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     // ridge is added only when the raw factorization / solve is non-finite
     // (rank-deficient null direction), mirroring the Newton step's ridge logic,
     // so the covariance is always finite; at full rank the ridge is never used.
-    let analytic_fisher_final = fisher_w_override
-        .as_ref()
-        .map_or_else(|| Some(likelihood.hess_block(eta.view(), y)), |_| None);
+    let analytic_fisher_final = match fisher_w_override.as_ref() {
+        Some(_) => None,
+        None => Some(likelihood.hess_block(eta.view(), y)?),
+    };
     let fisher_blocks_final = match fisher_w_override.as_ref() {
         Some(fw) => *fw,
         None => analytic_fisher_final
@@ -1021,7 +1020,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     // when the accepted step is tiny); this second evaluation closes the only
     // gap through which heavy backtracking could otherwise certify a point
     // whose post-step score is still material.
-    let final_residual = likelihood.grad_eta(eta.view(), y).mapv(|value| -value);
+    let final_residual = likelihood.grad_eta(eta.view(), y)?.mapv(|value| -value);
     fill_penalized_gradient(
         design,
         final_residual.view(),
