@@ -583,7 +583,6 @@ fn fit_outer_stage_to_boundary(
     metric_provenance: &'static str,
 ) -> Result<SaeStageFit, SaeFitError> {
     loop {
-        let rho_flat = rho.to_flat();
         let mut objective = SaeManifoldOuterObjective::new(
             term,
             target.clone(),
@@ -594,6 +593,12 @@ fn fit_outer_stage_to_boundary(
             ridge_ext_coord,
             ridge_beta,
         );
+        // `new` canonicalizes the rho layout against the term's assignment
+        // family.  In particular, compacting a softmax dictionary to K=1
+        // removes the now-nonexistent sparse/router coordinate.  Flatten only
+        // after that canonicalization: retaining the pre-construction flat
+        // vector would feed a stale old-K layout into the reduced objective.
+        let rho_flat = objective.current_rho_flat();
         scope_outer_checkpoint_to_stage(&mut objective, stage);
         objective.set_cancel_flag(Arc::clone(cancel_flag));
 
@@ -846,6 +851,7 @@ mod structured_pass_request_tests {
 #[cfg(test)]
 mod vanished_stage_tests {
     use super::*;
+    use crate::basis::EuclideanPatchEvaluator;
     use crate::manifold::{AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom};
     use gam_terms::latent::LatentManifold;
     use ndarray::Array3;
@@ -859,6 +865,10 @@ mod vanished_stage_tests {
             if atom == 0 && live_first {
                 decoder[[0, 0]] = 1.0;
             }
+            let evaluator = Arc::new(
+                EuclideanPatchEvaluator::new(1, 0)
+                    .expect("degree-zero Euclidean evaluator"),
+            );
             atoms.push(
                 SaeManifoldAtom::new_with_provided_function_gram(
                     format!("atom{atom}"),
@@ -869,7 +879,8 @@ mod vanished_stage_tests {
                     decoder,
                     Array2::<f64>::eye(1),
                 )
-                .unwrap(),
+                .unwrap()
+                .with_basis_second_jet(evaluator),
             );
         }
         let mut logits = Array2::<f64>::zeros((n, k));

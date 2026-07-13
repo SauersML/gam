@@ -160,6 +160,53 @@ fn composed_sum_default<T>(
         })
 }
 
+fn affine_compose_default<T>(
+    input: &T,
+    input_scale: f64,
+    input_shift: f64,
+    derivative_stack: [f64; 5],
+    scale: impl Fn(&T, f64) -> T,
+    add_constant: impl Fn(&T, f64) -> T,
+    compose: impl Fn(&T, [f64; 5]) -> T,
+) -> T {
+    compose(
+        &add_constant(&scale(input, input_scale), input_shift),
+        derivative_stack,
+    )
+}
+
+fn affine_composed_sum_default<T>(
+    inputs: &[T],
+    input_scales: &[f64],
+    derivative_stacks: &[[f64; 5]],
+    constant: impl Fn(f64) -> T,
+    add: impl Fn(&T, &T) -> T,
+    scale: impl Fn(&T, f64) -> T,
+    add_constant: impl Fn(&T, f64) -> T,
+    compose: impl Fn(&T, [f64; 5]) -> T,
+) -> T {
+    assert_eq!(inputs.len(), input_scales.len());
+    assert_eq!(inputs.len(), derivative_stacks.len());
+    inputs
+        .iter()
+        .zip(input_scales)
+        .zip(derivative_stacks)
+        .fold(constant(0.0), |sum, ((input, &input_scale), &stack)| {
+            add(
+                &sum,
+                &affine_compose_default(
+                    input,
+                    input_scale,
+                    0.0,
+                    stack,
+                    &scale,
+                    &add_constant,
+                    &compose,
+                ),
+            )
+        })
+}
+
 /// A truncated-Taylor scalar carrying derivatives in `K` primaries.
 ///
 /// All concrete scalars here ([`Order2`], [`OneSeed`], [`TwoSeed`]) and the full
@@ -228,6 +275,48 @@ pub trait JetScalar<const K: usize>: crate::nested_dual::JetField + Copy {
             derivative_stacks,
             Self::constant,
             crate::nested_dual::JetField::add,
+            crate::nested_dual::JetField::compose_unary,
+        )
+    }
+
+    /// Exact product as an explicit compiled graph node.
+    fn product(&self, right: &Self) -> Self {
+        self.mul(right)
+    }
+
+    /// Compose a certified outer stack after the affine map
+    /// `u = input_scale * self + input_shift`.
+    fn affine_compose(
+        &self,
+        input_scale: f64,
+        input_shift: f64,
+        derivative_stack: [f64; 5],
+    ) -> Self {
+        affine_compose_default(
+            self,
+            input_scale,
+            input_shift,
+            derivative_stack,
+            crate::nested_dual::JetField::scale,
+            Self::add_constant,
+            crate::nested_dual::JetField::compose_unary,
+        )
+    }
+
+    /// Sum unary compositions whose inputs each carry an affine scale.
+    fn affine_composed_sum(
+        inputs: &[Self],
+        input_scales: &[f64],
+        derivative_stacks: &[[f64; 5]],
+    ) -> Self {
+        affine_composed_sum_default(
+            inputs,
+            input_scales,
+            derivative_stacks,
+            Self::constant,
+            crate::nested_dual::JetField::add,
+            crate::nested_dual::JetField::scale,
+            Self::add_constant,
             crate::nested_dual::JetField::compose_unary,
         )
     }
@@ -388,6 +477,50 @@ pub trait RuntimeJetScalar<'arena>: Clone {
             Self::compose_unary,
         )
     }
+
+    /// Exact product as an explicit compiled graph node.
+    fn product(&self, right: &Self) -> Self {
+        self.mul(right)
+    }
+
+    /// Compose a certified outer stack after an affine input map.
+    fn affine_compose(
+        &self,
+        input_scale: f64,
+        input_shift: f64,
+        derivative_stack: [f64; 5],
+        workspace: &'arena Self::Workspace,
+    ) -> Self {
+        affine_compose_default(
+            self,
+            input_scale,
+            input_shift,
+            derivative_stack,
+            Self::scale,
+            |value, constant| value.add_constant(constant, workspace),
+            Self::compose_unary,
+        )
+    }
+
+    /// Sum unary compositions whose inputs each carry an affine scale.
+    fn affine_composed_sum(
+        inputs: &[Self],
+        input_scales: &[f64],
+        derivative_stacks: &[[f64; 5]],
+        dimension: usize,
+        workspace: &'arena Self::Workspace,
+    ) -> Self {
+        affine_composed_sum_default(
+            inputs,
+            input_scales,
+            derivative_stacks,
+            |value| Self::constant(value, dimension, workspace),
+            Self::add,
+            Self::scale,
+            |value, constant| value.add_constant(constant, workspace),
+            Self::compose_unary,
+        )
+    }
     /// Number of primary derivative axes carried by this scalar.
     fn dimension(&self) -> usize;
     /// Value channel.
@@ -529,6 +662,44 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
             unsafe { std::slice::from_raw_parts(inputs.as_ptr().cast::<S>(), inputs.len()) };
         Self {
             inner: S::composed_sum(inner, derivative_stacks),
+        }
+    }
+
+    #[inline(always)]
+    fn product(&self, right: &Self) -> Self {
+        Self {
+            inner: self.inner.product(&right.inner),
+        }
+    }
+
+    #[inline(always)]
+    fn affine_compose(
+        &self,
+        input_scale: f64,
+        input_shift: f64,
+        derivative_stack: [f64; 5],
+        &(): &'arena Self::Workspace,
+    ) -> Self {
+        Self {
+            inner: self
+                .inner
+                .affine_compose(input_scale, input_shift, derivative_stack),
+        }
+    }
+
+    #[inline(always)]
+    fn affine_composed_sum(
+        inputs: &[Self],
+        input_scales: &[f64],
+        derivative_stacks: &[[f64; 5]],
+        dimension: usize,
+        &(): &'arena Self::Workspace,
+    ) -> Self {
+        assert_eq!(dimension, K, "fixed jet dimension mismatch");
+        let inner =
+            unsafe { std::slice::from_raw_parts(inputs.as_ptr().cast::<S>(), inputs.len()) };
+        Self {
+            inner: S::affine_composed_sum(inner, input_scales, derivative_stacks),
         }
     }
 
@@ -954,6 +1125,113 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
                 let channel = 2.0 * (inherited + curvature);
                 hessian[primary_a * dimension + primary_b] = channel;
                 hessian[primary_b * dimension + primary_a] = channel;
+            }
+        }
+        Self {
+            arena,
+            v: value,
+            g: gradient,
+            h: hessian,
+        }
+    }
+
+    #[inline(always)]
+    fn product(&self, right: &Self) -> Self {
+        self.assert_compatible(right);
+        let dimension = self.dimension();
+        let gradient = self.arena.zeros(dimension);
+        let hessian = self.arena.zeros(dimension * dimension);
+        for primary in 0..dimension {
+            gradient[primary] = self.v * right.g[primary] + self.g[primary] * right.v;
+            for other in primary..dimension {
+                let index = primary * dimension + other;
+                let channel = self.v * right.h[index]
+                    + self.g[primary] * right.g[other]
+                    + self.g[other] * right.g[primary]
+                    + self.h[index] * right.v;
+                hessian[index] = channel;
+                hessian[other * dimension + primary] = channel;
+            }
+        }
+        Self {
+            arena: self.arena,
+            v: self.v * right.v,
+            g: gradient,
+            h: hessian,
+        }
+    }
+
+    #[inline(always)]
+    fn affine_compose(
+        &self,
+        input_scale: f64,
+        _input_shift: f64,
+        derivative_stack: [f64; 5],
+        arena: &'arena DynamicJetArena,
+    ) -> Self {
+        assert!(std::ptr::eq(self.arena, arena));
+        let dimension = self.dimension();
+        let first = derivative_stack[1] * input_scale;
+        let second = derivative_stack[2] * input_scale * input_scale;
+        let gradient = arena.zeros(dimension);
+        let hessian = arena.zeros(dimension * dimension);
+        for primary in 0..dimension {
+            gradient[primary] = first * self.g[primary];
+            for other in primary..dimension {
+                let index = primary * dimension + other;
+                let channel =
+                    first * self.h[index] + second * self.g[primary] * self.g[other];
+                hessian[index] = channel;
+                hessian[other * dimension + primary] = channel;
+            }
+        }
+        Self {
+            arena,
+            v: derivative_stack[0],
+            g: gradient,
+            h: hessian,
+        }
+    }
+
+    #[inline(always)]
+    fn affine_composed_sum(
+        inputs: &[Self],
+        input_scales: &[f64],
+        derivative_stacks: &[[f64; 5]],
+        dimension: usize,
+        arena: &'arena DynamicJetArena,
+    ) -> Self {
+        assert_eq!(inputs.len(), input_scales.len());
+        assert_eq!(inputs.len(), derivative_stacks.len());
+        assert!(
+            inputs.iter().all(|input| {
+                input.dimension() == dimension && std::ptr::eq(input.arena, arena)
+            }),
+            "dynamic affine-composed-sum jets must share dimension and arena"
+        );
+        let gradient = arena.zeros(dimension);
+        let hessian = arena.zeros(dimension * dimension);
+        let mut value = 0.0;
+        for ((input, &input_scale), stack) in inputs
+            .iter()
+            .zip(input_scales)
+            .zip(derivative_stacks)
+        {
+            let first = stack[1] * input_scale;
+            let second = stack[2] * input_scale * input_scale;
+            value += stack[0];
+            for primary in 0..dimension {
+                gradient[primary] += first * input.g[primary];
+                for other in primary..dimension {
+                    let index = primary * dimension + other;
+                    hessian[index] += first * input.h[index]
+                        + second * input.g[primary] * input.g[other];
+                }
+            }
+        }
+        for primary in 0..dimension {
+            for other in primary + 1..dimension {
+                hessian[other * dimension + primary] = hessian[primary * dimension + other];
             }
         }
         Self {

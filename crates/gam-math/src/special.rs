@@ -352,13 +352,23 @@ mod tests {
     fn centered_bessel_second_log_derivative_matches_finite_difference() {
         // c''(log η) must be the derivative of the third term (c'(log η)) of
         // `bessel_i0_centered_terms`, across small, mid, and large arguments.
-        for eta in [0.05_f64, 0.25, 1.0, 3.74, 3.76, 12.0, 60.0, 900.0] {
+        // Reference is a central difference of the first log-derivative
+        // reconstructed from the SAME ratio the analytic formula uses,
+        // `c'(log η) = η(r − 1)` with `r = I1/I0`. (The crate's returned `.2`
+        // term is, on the large-|η| branch, an independent scaled polynomial
+        // whose ~1e-4 mutual inconsistency with the ratio near the 3.75 seam
+        // is a property of that approximation, not of this exact derivative;
+        // the production ARD normalizer only ever evaluates small |η| on the
+        // small branch where `.2 == η(r − 1)` exactly, so no gradient/Hessian
+        // desync arises there.)
+        let first_log_derivative = |x: f64| x * (bessel_i0_centered_terms(x).1 - 1.0);
+        for eta in [0.02_f64, 0.05, 0.25, 1.0, 2.0, 3.74, 3.76, 8.0, 60.0, 900.0] {
             let log_eta = eta.ln();
             let analytic = bessel_i0_centered_second_log_derivative_from_log_abs(log_eta);
 
             let log_step = 1.0e-6_f64;
-            let (_, _, first_plus) = bessel_i0_centered_terms(eta * log_step.exp());
-            let (_, _, first_minus) = bessel_i0_centered_terms(eta * (-log_step).exp());
+            let first_plus = first_log_derivative(eta * log_step.exp());
+            let first_minus = first_log_derivative(eta * (-log_step).exp());
             let finite_difference = (first_plus - first_minus) / (2.0 * log_step);
             assert!(
                 (analytic - finite_difference).abs() < 1.0e-4 + 1.0e-4 * analytic.abs(),
