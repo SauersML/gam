@@ -702,5 +702,44 @@ mod tests {
             intrinsic_chart_embedding_axes(&SaeAtomBasisKind::Linear, 2),
             2
         );
+
+        // Ten points spanning four ambient dimensions make the kNN graph
+        // complete for a four-axis embedding, so classical MDS recovers four
+        // genuine functions. Both coordinates of each chart must vary. With
+        // the old latent-dimension allocation, sphere latitude and torus axis 1
+        // were identically zero here.
+        let mut z = Array2::<f64>::zeros((10, 4));
+        for axis in 0..4 {
+            z[[2 * axis, axis]] = 1.0;
+            z[[2 * axis + 1, axis]] = -1.0;
+        }
+        z[[8, 0]] = 0.5;
+        z[[8, 1]] = -0.25;
+        z[[8, 2]] = 0.75;
+        z[[8, 3]] = 0.125;
+        z[[9, 0]] = -0.375;
+        z[[9, 1]] = 0.625;
+        z[[9, 2]] = 0.25;
+        z[[9, 3]] = -0.875;
+        let seed = sae_intrinsic_seed_initial_coords(
+            z.view(),
+            &[SaeAtomBasisKind::Sphere, SaeAtomBasisKind::Torus],
+            &[2, 2],
+        )
+        .unwrap();
+        for atom in 0..2 {
+            for axis in 0..2 {
+                let (lo, hi) = seed
+                    .slice(ndarray::s![atom, .., axis])
+                    .iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                        (lo.min(v), hi.max(v))
+                    });
+                assert!(
+                    hi > lo,
+                    "intrinsic chart {atom} axis {axis} must carry a genuine coordinate"
+                );
+            }
+        }
     }
 }
