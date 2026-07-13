@@ -76,7 +76,7 @@ impl LogslopeTopology {
         current_from_raw: Array2<f64>,
         common_offset: &Array1<f64>,
     ) -> Result<LogslopeLayout, String> {
-        let coefficient_design = wrap_design_with_transform(
+        let coefficient_design = identifiability::wrap_design_with_transform(
             raw_design.clone(),
             &current_from_raw,
             "logslope layout coefficient design",
@@ -138,12 +138,7 @@ impl LogslopeTopology {
             Self::PerScore { raw_ranges } => {
                 validate_partition(raw_ranges, raw_design.ncols(), "per-score logslope layout")?;
                 for (channel, range) in raw_ranges.iter().enumerate() {
-                    certify_channel_nonzero(
-                        &raw_design,
-                        &current_from_raw,
-                        range,
-                        channel,
-                    )?;
+                    certify_channel_nonzero(&raw_design, &current_from_raw, range, channel)?;
                 }
                 let mut offsets = Array2::<f64>::zeros((nrows, raw_ranges.len()));
                 for mut column in offsets.columns_mut() {
@@ -190,6 +185,7 @@ impl LogslopeLayout {
     /// Shared-channel constructor. Production paths use
     /// [`LogslopeTopology::materialize_identity`] so topology validation stays
     /// at the construction boundary.
+    #[cfg(test)]
     pub(crate) fn shared(coefficient_design: DesignMatrix, offset: Array1<f64>) -> Self {
         let nrows = coefficient_design.nrows();
         let current_width = coefficient_design.ncols();
@@ -218,6 +214,17 @@ impl LogslopeLayout {
     #[inline]
     pub(crate) fn coefficient_design(&self) -> &DesignMatrix {
         &self.coefficient_design
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_coefficient_design(&mut self, design: DesignMatrix) {
+        assert_eq!(
+            design.nrows(),
+            self.nrows,
+            "test replacement must preserve logslope layout row count"
+        );
+        self.current_width = design.ncols();
+        self.coefficient_design = design;
     }
 
     pub(crate) fn validate_for(&self, score_dim: usize) -> Result<(), String> {
@@ -343,9 +350,7 @@ impl LogslopeLayout {
         workspace: &mut LogslopeRowWorkspace,
     ) -> Result<(), String> {
         match &self.channels {
-            LogslopeChannels::PerScore { .. } => {
-                self.fill_per_score_row(row, beta, workspace)
-            }
+            LogslopeChannels::PerScore { .. } => self.fill_per_score_row(row, beta, workspace),
             LogslopeChannels::Shared { offset } => {
                 if row >= self.nrows {
                     return Err(format!(
@@ -364,21 +369,18 @@ impl LogslopeLayout {
                     || workspace.values.len() != workspace.channel_rows.nrows()
                 {
                     return Err(
-                        "shared logslope callback workspace shape does not match layout".to_string(),
+                        "shared logslope callback workspace shape does not match layout"
+                            .to_string(),
                     );
                 }
                 self.coefficient_design
-                    .row_chunk_into(
-                        row..row + 1,
-                        workspace.channel_rows.slice_mut(s![0..1, ..]),
-                    )
+                    .row_chunk_into(row..row + 1, workspace.channel_rows.slice_mut(s![0..1, ..]))
                     .map_err(|error| {
                         format!("shared logslope callback row materialization failed: {error}")
                     })?;
                 for channel in 1..workspace.channel_rows.nrows() {
                     for col in 0..self.current_width {
-                        workspace.channel_rows[[channel, col]] =
-                            workspace.channel_rows[[0, col]];
+                        workspace.channel_rows[[channel, col]] = workspace.channel_rows[[0, col]];
                     }
                 }
                 let value = self.coefficient_design.dot_row(row, beta) + offset[row];
@@ -387,7 +389,6 @@ impl LogslopeLayout {
             }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -449,7 +450,10 @@ fn certify_channel_nonzero(
             "per-score logslope channel {channel} has no current-coordinate derivative"
         ));
     }
-    let mut chunk = Array2::<f64>::zeros((CHANNEL_SCAN_ROWS.min(raw_design.nrows()), raw_design.ncols()));
+    let mut chunk = Array2::<f64>::zeros((
+        CHANNEL_SCAN_ROWS.min(raw_design.nrows()),
+        raw_design.ncols(),
+    ));
     for start in (0..raw_design.nrows()).step_by(CHANNEL_SCAN_ROWS) {
         let end = (start + CHANNEL_SCAN_ROWS).min(raw_design.nrows());
         let rows = end - start;
@@ -463,8 +467,7 @@ fn certify_channel_nonzero(
             for current_col in 0..current_from_raw.ncols() {
                 let mut value = 0.0;
                 for raw_col in range.clone() {
-                    value += chunk[[local_row, raw_col]]
-                        * current_from_raw[[raw_col, current_col]];
+                    value += chunk[[local_row, raw_col]] * current_from_raw[[raw_col, current_col]];
                 }
                 if !value.is_finite() {
                     return Err(format!(
@@ -503,11 +506,12 @@ mod tests {
             .unwrap();
         let beta = array![17.0, 19.0, 23.0];
         let mut workspace = layout.row_workspace(2).unwrap();
-        layout
-            .fill_per_score_row(0, &beta, &mut workspace)
-            .unwrap();
+        layout.fill_per_score_row(0, &beta, &mut workspace).unwrap();
 
-        assert_eq!(workspace.channel_rows(), array![[2.0, 0.0, 0.0], [0.0, 3.0, 5.0]]);
+        assert_eq!(
+            workspace.channel_rows(),
+            array![[2.0, 0.0, 0.0], [0.0, 3.0, 5.0]]
+        );
         assert_eq!(workspace.values(), &[34.5, 172.5]);
     }
 
@@ -557,10 +561,7 @@ mod tests {
             .t()
             .dot(&channel_hessian)
             .dot(&expected_current_channels);
-        let raw_hessian = raw_channels
-            .t()
-            .dot(&channel_hessian)
-            .dot(&raw_channels);
+        let raw_hessian = raw_channels.t().dot(&channel_hessian).dot(&raw_channels);
         let expected_hessian = current_from_raw
             .t()
             .dot(&raw_hessian)

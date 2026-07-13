@@ -26,9 +26,8 @@ pub fn dispersion_from_likelihood(
         ))
     };
     let known = |phi| Dispersion::known(phi).map_err(|err| invalid(err.to_string()));
-    let estimated_dispersion = |phi| {
-        Dispersion::estimated(phi).map_err(|err| invalid(err.to_string()))
-    };
+    let estimated_dispersion =
+        |phi| Dispersion::estimated(phi).map_err(|err| invalid(err.to_string()));
     let reciprocal = |value, is_estimated| {
         Dispersion::from_reciprocal(value, is_estimated).map_err(|err| invalid(err.to_string()))
     };
@@ -49,8 +48,7 @@ pub fn dispersion_from_likelihood(
         Scale::ProfiledGaussian => {
             let standard_deviation = profiled_gaussian_standard_deviation.ok_or_else(|| {
                 invalid(
-                    "profiled Gaussian requires an explicit fitted standard deviation"
-                        .to_string(),
+                    "profiled Gaussian requires an explicit fitted standard deviation".to_string(),
                 )
             })?;
             if !(standard_deviation.is_finite() && standard_deviation >= 0.0) {
@@ -1123,7 +1121,11 @@ pub struct FitInference {
     /// Method that produced `smoothing_correction`. Required whenever a matrix
     /// is present; `None` means no correction was retained.
     pub smoothing_correction_method: Option<SmoothingCorrectionMethod>,
-    /// Raw penalised Hessian `H = X'W_HX + S(λ)` with NO dispersion scaling.
+    /// Penalised Hessian `H = X'W_HX + S(λ)` with NO dispersion scaling.
+    /// When [`UnifiedFitResult::geometry`] is present, this matrix shares its
+    /// exact active coefficient frame and therefore has dimension
+    /// `geometry.coefficient_gauge.reduced_total()`. Without saved geometry it
+    /// is in the saved/raw coefficient frame.
     /// Stored as [`UnscaledPrecision`] so callers that need the φ-scaled
     /// covariance `Vb` know they must pair this with [`Self::dispersion`].
     /// `#[serde(transparent)]` on the newtype keeps the on-disk encoding
@@ -1139,9 +1141,10 @@ pub struct FitInference {
     /// nonexistent `Default` impl and silently fabricate an unvalidated scale.
     pub dispersion: Dispersion,
     /// Conditional Bayesian covariance under fixed smoothing parameters (mgcv
-    /// `Vb`): `Vb = H^{-1} * phi`, where `H = X'W_HX + S(lambda)` and `phi`
-    /// is [`dispersion`](Self::dispersion). Do not use an unscaled `H^{-1}`
-    /// for standard errors when scale is estimated.
+    /// `Vb`). In an unreduced coefficient frame, `Vb = H^{-1} * phi`. With an
+    /// active geometry gauge `β = Tθ + a`, the saved/raw covariance is
+    /// `Vb = T H_θ^{-1} Tᵀ * phi`. Do not use an unscaled `H^{-1}` for
+    /// standard errors when scale is estimated.
     pub beta_covariance: Option<gam_problem::dispersion_cov::PhiScaledCovariance>,
     /// Marginal SEs from `beta_covariance`.
     pub beta_standard_errors: Option<Array1<f64>>,
@@ -1299,9 +1302,20 @@ pub struct FittedBlock {
 
 /// Working-set geometry at convergence needed by ALO and other post-fit
 /// diagnostics. Only populated when the inner solver provides the data.
+///
+/// The saved coefficient blocks are always in the raw reporting frame. The
+/// geometry may occupy a smaller active frame; `coefficient_gauge` is the
+/// required affine map `β_saved = T θ_active + a` connecting the two.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FitGeometry {
-    /// Joint penalized Hessian `H = X'W_HX + S(λ)` at convergence.
+    /// Exact affine lift from the active geometry coordinates (the columns of
+    /// `T`) to the saved/raw coefficient blocks (the rows of `T`). This field is
+    /// intentionally required on the wire: models saved before the active-frame
+    /// schema must be regenerated rather than guessed as identity.
+    pub coefficient_gauge: gam_problem::gauge::Gauge,
+    /// Joint penalized Hessian `H = X'W_HX + S(λ)` at convergence, in the
+    /// active coordinates of `coefficient_gauge` (dimension
+    /// `coefficient_gauge.reduced_total()`).
     /// Stored as [`UnscaledPrecision`] so the dispersion-ownership invariant
     /// (this matrix is *not* φ-scaled) is enforced at the type level.
     pub penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision,
@@ -1583,6 +1597,11 @@ pub use gam_problem::{ensure_finite_scalar, validate_all_finite};
 
 impl FitGeometry {
     pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {
+        self.coefficient_gauge.validate().map_err(|reason| {
+            EstimationError::InvalidInput(format!(
+                "fit_result.geometry.coefficient_gauge is invalid: {reason}"
+            ))
+        })?;
         validate_all_finite_estimation(
             "fit_result.geometry.penalized_hessian",
             self.penalized_hessian.iter().copied(),
@@ -1936,6 +1955,38 @@ impl UnifiedFitResult {
                 p
             );
         }
+        let penalized_hessian_dim = if let Some(geom) = geometry.as_ref() {
+            let gauge = &geom.coefficient_gauge;
+            if gauge.n_blocks() != blocks.len() {
+                crate::bail_invalid_estim!(
+                    "UnifiedFitResult geometry coefficient gauge block count mismatch: gauge={}, fitted blocks={}",
+                    gauge.n_blocks(),
+                    blocks.len(),
+                );
+            }
+            for (block_index, (raw_width, block)) in gauge
+                .raw_widths()
+                .into_iter()
+                .zip(blocks.iter())
+                .enumerate()
+            {
+                if raw_width != block.beta.len() {
+                    crate::bail_invalid_estim!(
+                        "UnifiedFitResult geometry coefficient gauge raw block {block_index} has width {raw_width}, expected saved beta width {}",
+                        block.beta.len(),
+                    );
+                }
+            }
+            let active_dim = gauge.reduced_total();
+            validate_dense_hessian_export(
+                "UnifiedFitResult geometry active-coordinate penalized Hessian",
+                &geom.penalized_hessian,
+                active_dim,
+            )?;
+            active_dim
+        } else {
+            p
+        };
         if let Some(inf) = inference.as_ref() {
             if !inf.edf_by_block.is_empty() && inf.edf_by_block.len() != lambdas.len() {
                 crate::bail_invalid_estim!(
@@ -1959,19 +2010,10 @@ impl UnifiedFitResult {
                     inf.working_response.len()
                 );
             }
-            if inf.penalized_hessian.nrows() != p || inf.penalized_hessian.ncols() != p {
-                crate::bail_invalid_estim!(
-                    "UnifiedFitResult penalized Hessian shape mismatch: got {}x{}, expected {}x{}",
-                    inf.penalized_hessian.nrows(),
-                    inf.penalized_hessian.ncols(),
-                    p,
-                    p
-                );
-            }
             validate_dense_hessian_export(
                 "UnifiedFitResult inference penalized Hessian",
                 &inf.penalized_hessian,
-                p,
+                penalized_hessian_dim,
             )?;
             if let Some(cov) = inf.beta_covariance.as_ref() {
                 if cov.nrows() != p || cov.ncols() != p {
@@ -2081,20 +2123,6 @@ impl UnifiedFitResult {
             }
         }
         if let Some(geom) = geometry.as_ref() {
-            if geom.penalized_hessian.nrows() != p || geom.penalized_hessian.ncols() != p {
-                crate::bail_invalid_estim!(
-                    "UnifiedFitResult geometry penalized Hessian shape mismatch: got {}x{}, expected {}x{}",
-                    geom.penalized_hessian.nrows(),
-                    geom.penalized_hessian.ncols(),
-                    p,
-                    p
-                );
-            }
-            validate_dense_hessian_export(
-                "UnifiedFitResult geometry penalized Hessian",
-                &geom.penalized_hessian,
-                p,
-            )?;
             if geom.working_weights.len() != geom.working_response.len() {
                 crate::bail_invalid_estim!(
                     "UnifiedFitResult geometry working vector length mismatch: working_weights={}, working_response={}",
@@ -2354,10 +2382,13 @@ impl UnifiedFitResult {
         Ok(sigma_ratio)
     }
 
-    /// Get the conditional Bayesian covariance matrix (`Vb`) if available.
+    /// Get the conditional Bayesian covariance matrix (`Vb`) in the saved/raw
+    /// coefficient frame, if available.
     ///
-    /// Contract: `Vb = H^{-1} * phi`, scaled by the fitted dispersion. This is
-    /// the Wood/mgcv `Vb` (Bayesian/conditional) covariance.
+    /// Contract: for an active geometry gauge `β = Tθ + a`,
+    /// `Vb_raw = T H_active^{-1} Tᵀ * phi`. For an identity gauge this
+    /// reduces to `H^{-1} * phi`. This is the Wood/mgcv `Vb`
+    /// (Bayesian/conditional) covariance.
     pub fn beta_covariance(&self) -> Option<&Array2<f64>> {
         self.covariance_conditional.as_ref()
     }
@@ -2522,6 +2553,11 @@ impl UnifiedFitResult {
 
     /// Get the penalized Hessian if available.
     ///
+    /// The matrix is in the active geometry coordinate frame when
+    /// [`Self::geometry`] is present, so it may be smaller than the saved beta
+    /// vector. Pair it with `geometry.coefficient_gauge`; only an identity gauge
+    /// makes this a saved/raw-coordinate Hessian.
+    ///
     /// Boundary accessor: returns `&Array2<f64>` so out-of-scope consumers
     /// (CLI, GPU, families) keep their pre-newtype call shape. Use
     /// [`Self::penalized_hessian_unscaled`] when the caller wants the
@@ -2538,10 +2574,11 @@ impl UnifiedFitResult {
             })
     }
 
-    /// Get the penalized Hessian as the [`UnscaledPrecision`] newtype if
-    /// available. Use this when constructing newtype-aware APIs (HMC
-    /// whitening, sampling) so the dispersion convention is enforced at
-    /// the type level.
+    /// Get the active-coordinate penalized Hessian as the
+    /// [`UnscaledPrecision`] newtype if available. Use this when constructing
+    /// newtype-aware APIs (HMC whitening, sampling) so both the dispersion
+    /// convention and the accompanying `geometry.coefficient_gauge` are
+    /// handled explicitly.
     pub fn penalized_hessian_unscaled(
         &self,
     ) -> Option<&gam_problem::dispersion_cov::UnscaledPrecision> {

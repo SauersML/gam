@@ -92,9 +92,7 @@ pub(crate) use gam::report;
 
 pub(crate) use gam::probability::{normal_cdf, standard_normal_quantile};
 
-pub(crate) use gam::families::fit_orchestration::drivers::{
-    freeze_term_collection_from_design,
-};
+pub(crate) use gam::families::fit_orchestration::drivers::freeze_term_collection_from_design;
 pub(crate) use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
     SmoothStructureAnalysis, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,

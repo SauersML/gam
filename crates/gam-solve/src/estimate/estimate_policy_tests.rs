@@ -707,6 +707,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
         }),
         fitted_link: FittedLinkState::Standard(None),
         geometry: Some(FitGeometry {
+            coefficient_gauge: gam_problem::Gauge::identity(&[2]),
             penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]].into(),
             working_weights: array![1.0, 0.5, 0.75],
             working_response: array![0.1, 0.2, 0.3],
@@ -734,6 +735,37 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
 fn decode_invariant_test_fit() -> UnifiedFitResult {
     UnifiedFitResult::try_from_parts(decode_invariant_test_parts())
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "construct decode invariant test fit", e))
+}
+
+#[test]
+fn unified_fit_accepts_inference_hessian_in_rectangular_active_geometry_frame() {
+    let mut parts = decode_invariant_test_parts();
+    let active_hessian = array![[2.5]];
+    let geometry = parts.geometry.as_mut().expect("fixture geometry");
+    geometry.coefficient_gauge = gam_problem::Gauge::from_t(
+        Array2::from_shape_vec((2, 1), vec![1.0, -1.0]).unwrap(),
+        &[2],
+        &[1],
+    );
+    geometry.penalized_hessian = active_hessian.clone().into();
+    parts
+        .inference
+        .as_mut()
+        .expect("fixture inference")
+        .penalized_hessian = active_hessian.clone().into();
+
+    let fit = UnifiedFitResult::try_from_parts(parts)
+        .expect("a saved two-coordinate beta may carry one-coordinate active geometry");
+    assert_eq!(fit.beta.len(), 2);
+    assert_eq!(
+        fit.geometry
+            .as_ref()
+            .expect("saved geometry")
+            .coefficient_gauge
+            .reduced_total(),
+        1
+    );
+    assert_eq!(fit.penalized_hessian().expect("active Hessian").dim(), (1, 1));
 }
 
 #[test]

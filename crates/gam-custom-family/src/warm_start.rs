@@ -628,13 +628,45 @@ pub fn blockwise_fit_from_parts(
     if let Some(geom) = geometry.as_ref() {
         geom.validate_numeric_finiteness()
             .map_err(|e| e.to_string())?;
-        let (rows, cols) = geom.penalized_hessian.dim();
-        if rows != total_p || cols != total_p {
+        let mut raw_block_starts = Vec::with_capacity(block_states.len() + 1);
+        raw_block_starts.push(0usize);
+        for state in &block_states {
+            raw_block_starts.push(
+                raw_block_starts
+                    .last()
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(state.beta.len())
+                    .ok_or_else(|| CustomFamilyError::DimensionMismatch {
+                        reason: "blockwise_fit raw coefficient partition overflows usize"
+                            .to_string(),
+                    })?,
+            );
+        }
+        if geom.coefficient_gauge.block_starts_raw != raw_block_starts {
             return Err(CustomFamilyError::DimensionMismatch {
                 reason: format!(
-                    "blockwise_fit.geometry.penalized_hessian must be {}x{}, got {}x{}",
-                    total_p, total_p, rows, cols
+                    "blockwise_fit.geometry raw gauge partition {:?} does not match fitted block partition {:?}",
+                    geom.coefficient_gauge.block_starts_raw, raw_block_starts
                 ),
+            }
+            .into());
+        }
+        let active_dimension = geom.coefficient_gauge.reduced_total();
+        let (rows, cols) = geom.penalized_hessian.dim();
+        if rows != active_dimension || cols != active_dimension {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "blockwise_fit.geometry active penalized_hessian must be {active_dimension}x{active_dimension}, got {rows}x{cols}"
+                ),
+            }
+            .into());
+        }
+        if !geom.coefficient_gauge.is_identity() && precomputed_edf.is_none() {
+            return Err(CustomFamilyError::InvalidInput {
+                context: "blockwise_fit_from_parts",
+                reason: "non-identity active geometry requires its reduced-coordinate EDF; raw penalties cannot be paired with an active-coordinate Hessian"
+                    .to_string(),
             }
             .into());
         }

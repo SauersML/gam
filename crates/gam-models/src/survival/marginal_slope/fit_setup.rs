@@ -530,22 +530,17 @@ pub(crate) fn install_time_nullspace_shrinkage_penalty(
     let entry_gram = time_block
         .design_entry
         .diag_xtw_x(&Array1::ones(entry_mass))
-        .map_err(|err| {
-            format!("survival-marginal-slope time_block entry function Gram: {err}")
-        })?;
+        .map_err(|err| format!("survival-marginal-slope time_block entry function Gram: {err}"))?;
     let exit_gram = time_block
         .design_exit
         .diag_xtw_x(&Array1::ones(exit_mass))
-        .map_err(|err| {
-            format!("survival-marginal-slope time_block exit function Gram: {err}")
-        })?;
+        .map_err(|err| format!("survival-marginal-slope time_block exit function Gram: {err}"))?;
     let function_gram = (entry_gram + exit_gram).mapv(|value| value / total_mass as f64);
 
-    let Some(shrinkage) = gam_terms::basis::function_space_nullspace_shrinkage(
-        &aggregate,
-        &function_gram,
-    )
-        .map_err(|err| format!("survival-marginal-slope time_block nullspace shrinkage: {err}"))?
+    let Some(shrinkage) =
+        gam_terms::basis::function_space_nullspace_shrinkage(&aggregate, &function_gram).map_err(
+            |err| format!("survival-marginal-slope time_block nullspace shrinkage: {err}"),
+        )?
     else {
         return Ok(false);
     };

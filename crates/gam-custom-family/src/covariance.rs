@@ -1390,6 +1390,7 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
         // letting result assembly reject an otherwise valid fit geometry.
         symmetrize_dense_in_place(&mut h);
         return Ok(Some(FitGeometry {
+            coefficient_gauge: gam_problem::gauge::Gauge::identity(&[spec.design.ncols()]),
             penalized_hessian: h.into(),
             working_weights,
             working_response,
@@ -1459,6 +1460,12 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
     }
     let working_len = states.first().map(|state| state.eta.len()).unwrap_or(0);
     Ok(Some(FitGeometry {
+        coefficient_gauge: gam_problem::gauge::Gauge::identity(
+            &specs
+                .iter()
+                .map(|spec| spec.design.ncols())
+                .collect::<Vec<_>>(),
+        ),
         penalized_hessian: h.into(),
         working_weights: Array1::zeros(working_len),
         working_response: Array1::zeros(working_len),

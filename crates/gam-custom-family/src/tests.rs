@@ -93,6 +93,7 @@ pub(crate) fn blockwise_fit_from_parts_accepts_stacked_solver_eta_with_canonical
             inner_cycles: 0,
             outer_converged: true,
             geometry: Some(FitGeometry {
+                coefficient_gauge: gam_problem::gauge::Gauge::identity(&[1]),
                 penalized_hessian: Array2::eye(1).into(),
                 working_weights: Array1::ones(2),
                 working_response: Array1::zeros(2),

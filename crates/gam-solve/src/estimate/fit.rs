@@ -286,6 +286,7 @@ where
         .map(|inf| inf.edf_total)
         .unwrap_or(0.0);
     let geometry = result.inference.as_ref().map(|inf| FitGeometry {
+        coefficient_gauge: gam_problem::Gauge::identity(&[result.beta.len()]),
         penalized_hessian: inf.penalized_hessian.clone(),
         working_weights: inf.working_weights.clone(),
         working_response: inf.working_response.clone(),

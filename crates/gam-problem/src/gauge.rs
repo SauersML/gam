@@ -3,7 +3,7 @@
 // Every identifiability mechanism in the engine performs the same
 // mathematical act: quotient the coefficient space by directions in
 // ker(J) ∩ ker(S), pick a section, fit in the reduced coordinates θ,
-// and lift estimates / covariance / geometry back to the raw
+// and lift estimates / covariance back to the raw
 // coordinates β. This module owns that act once.
 //
 // A `Gauge` is the affine section itself: the lift matrix
@@ -17,15 +17,17 @@
 //
 // Lift conventions (the whole point — there is exactly one):
 //   - point estimate:   β_raw = T · θ + a
-//   - covariance / any symmetric bilinear form: Σ_raw = T · Σ_θ · Tᵀ
+//   - covariance:       Σ_raw = T · Σ_θ · Tᵀ
+//   - Hessian/penalty:  H_θ = Tᵀ · H_raw · T
 //   - η is invariant:   X_raw · (T · θ + a) = X_reduced · θ + offset_reduced
 //
-// Raw directions outside the section (zero rows of `T`) receive exactly
-// zero estimate, zero variance, and zero covariance with every other
-// coordinate: a coordinate the reduced fit cannot move carries no
+// Raw directions the active fit cannot move (zero rows of `T`) receive their
+// fixed affine-shift value, zero variance, and zero covariance with every
+// other coordinate: a coordinate the reduced fit cannot move carries no
 // posterior uncertainty in raw space.
 
 use ndarray::{Array1, Array2, ArrayBase, Data, Ix2};
+use serde::{Deserialize, Serialize};
 
 use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
 
@@ -49,7 +51,7 @@ pub trait CompiledBlockMap {
 
 /// The lift `T : reduced → raw` plus the per-block partitions of both
 /// coordinate systems. See the module docs for the lift conventions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Gauge {
     /// Global lift matrix, shape `(Σ p_b_raw) × (Σ r_b_reduced)`.
     pub t_full: Array2<f64>,
@@ -158,6 +160,75 @@ pub fn assemble_block_triangular_t(
 }
 
 impl Gauge {
+    /// Validate the serialized affine section and its block topology.
+    ///
+    /// A `Gauge` is persisted inside fitted models and its fields remain public
+    /// for matrix-oriented consumers. Consumers of decoded or manually
+    /// assembled state must therefore reject malformed dimensions, partitions,
+    /// and non-finite affine maps before coefficient or curvature transforms.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.block_starts_raw.len() != self.block_starts_reduced.len() {
+            return Err(format!(
+                "raw and reduced block partitions have different lengths: {} and {}",
+                self.block_starts_raw.len(),
+                self.block_starts_reduced.len(),
+            ));
+        }
+        if self.block_starts_raw.is_empty() {
+            return Err("block partitions must contain their zero origin".to_string());
+        }
+        if self.block_starts_raw[0] != 0 || self.block_starts_reduced[0] != 0 {
+            return Err(format!(
+                "block partitions must start at zero, got raw={} and reduced={}",
+                self.block_starts_raw[0], self.block_starts_reduced[0],
+            ));
+        }
+        for (label, starts) in [
+            ("raw", &self.block_starts_raw),
+            ("reduced", &self.block_starts_reduced),
+        ] {
+            if let Some((index, pair)) = starts
+                .windows(2)
+                .enumerate()
+                .find(|(_, pair)| pair[0] > pair[1])
+            {
+                return Err(format!(
+                    "{label} block partition decreases at boundary {index}: {} > {}",
+                    pair[0], pair[1],
+                ));
+            }
+        }
+        if self.t_full.nrows() != self.raw_total() || self.t_full.ncols() != self.reduced_total() {
+            return Err(format!(
+                "lift shape {:?} does not match partition totals ({}, {})",
+                self.t_full.dim(),
+                self.raw_total(),
+                self.reduced_total(),
+            ));
+        }
+        if self.reduced_total() > self.raw_total() {
+            return Err(format!(
+                "reduced total {} exceeds raw total {}; an affine section cannot be injective",
+                self.reduced_total(),
+                self.raw_total(),
+            ));
+        }
+        if self.affine_shift.len() != self.raw_total() {
+            return Err(format!(
+                "affine shift length {} does not match raw total {}",
+                self.affine_shift.len(),
+                self.raw_total(),
+            ));
+        }
+        if self.t_full.iter().any(|value| !value.is_finite()) {
+            return Err("lift contains a non-finite value".to_string());
+        }
+        if self.affine_shift.iter().any(|value| !value.is_finite()) {
+            return Err("affine shift contains a non-finite value".to_string());
+        }
+        Ok(())
+    }
+
     /// The trivial section: raw == reduced for every block.
     pub fn identity(raw_widths: &[usize]) -> Self {
         let transforms: Vec<Array2<f64>> =
@@ -225,8 +296,10 @@ impl Gauge {
     /// That is the one Gauge convention with `T = z` over a single block, so
     /// the centring constraint stops being a special-cased outside-the-object
     /// transform and becomes a `Gauge` section like every other reduction:
-    /// the covariance / penalised-Hessian of the centred fit pushes forward to
-    /// the raw basis through the SAME `z` via [`Gauge::lift_covariance`].
+    /// the covariance of the centred fit pushes forward to the raw basis
+    /// through the SAME `z` via [`Gauge::lift_covariance`]. A raw-coordinate
+    /// Hessian or penalty instead pulls back to the centred coordinates as
+    /// `zᵀ H z` via [`Gauge::restrict_penalty`].
     ///
     /// `z` is taken as the section itself (rather than recomputed from a basis)
     /// because the constraint matrix is the only gauge-relevant artifact — the
@@ -287,6 +360,45 @@ impl Gauge {
             block_starts_raw: starts_from_widths(raw_widths),
             block_starts_reduced: starts_from_widths(reduced_widths),
         }
+    }
+
+    /// Compose this affine section on the left with `outer`.
+    ///
+    /// `self` maps active geometry coordinates into a current raw coefficient
+    /// frame, while `outer` maps that current frame into a new raw frame:
+    ///
+    /// ```text
+    /// current = T_self · active + a_self
+    /// new     = T_outer · current + a_outer
+    /// ```
+    ///
+    /// Therefore the returned section has lift `T_outer · T_self` and
+    /// shift `T_outer · a_self + a_outer`. The complete intermediate block
+    /// partition must agree exactly; matching only the total dimension would
+    /// lose the coefficient-block lineage persisted with a fit.
+    pub fn left_compose(&self, outer: &Gauge) -> Result<Gauge, String> {
+        self.validate()
+            .map_err(|reason| format!("inner gauge is invalid: {reason}"))?;
+        outer
+            .validate()
+            .map_err(|reason| format!("outer gauge is invalid: {reason}"))?;
+        if self.block_starts_raw != outer.block_starts_reduced {
+            return Err(format!(
+                "composition frame partition mismatch: inner raw {:?} != outer reduced {:?}",
+                self.block_starts_raw, outer.block_starts_reduced,
+            ));
+        }
+
+        let composed = Gauge {
+            t_full: fast_ab(&outer.t_full, &self.t_full),
+            affine_shift: outer.t_full.dot(&self.affine_shift) + &outer.affine_shift,
+            block_starts_raw: outer.block_starts_raw.clone(),
+            block_starts_reduced: self.block_starts_reduced.clone(),
+        };
+        composed
+            .validate()
+            .map_err(|reason| format!("composed gauge is invalid: {reason}"))?;
+        Ok(composed)
     }
 
     /// Build from a compiled identifiability reparametrisation
@@ -417,6 +529,20 @@ impl Gauge {
             .all(|((i, j), &v)| v == if i == j { 1.0 } else { 0.0 })
     }
 
+    /// Whether this is the exact affine identity on every persisted block.
+    ///
+    /// This is stricter than the internal linear fast-path predicate: the lift
+    /// must be a literal identity, the affine shift must be exactly zero, and
+    /// raw/reduced block boundaries must coincide. No tolerance is used, so a
+    /// `true` result is a proof that active and saved coordinates are identical
+    /// rather than merely numerically close.
+    pub fn is_identity(&self) -> bool {
+        self.validate().is_ok()
+            && self.block_starts_raw == self.block_starts_reduced
+            && self.affine_shift.iter().all(|&value| value == 0.0)
+            && self.t_full_is_identity()
+    }
+
     /// Compose a raw design and offset with the affine section:
     /// `X_raw · (Tθ + a) + o_raw = (X_raw · T)θ + (o_raw + X_raw · a)`.
     pub fn restrict_design_and_offset<S: Data<Elem = f64>>(
@@ -436,8 +562,8 @@ impl Gauge {
         (reduced_design, reduced_offset)
     }
 
-    /// Pull a raw-coordinate quadratic form back to reduced coordinates:
-    /// `S_reduced = Tᵀ · S_raw · T`.
+    /// Pull a raw-coordinate quadratic form (including a penalty or Hessian)
+    /// back to reduced coordinates: `S_reduced = Tᵀ · S_raw · T`.
     pub fn restrict_penalty<S: Data<Elem = f64>>(
         &self,
         raw_penalty: &ArrayBase<S, Ix2>,
@@ -528,23 +654,26 @@ impl Gauge {
         out
     }
 
-    /// Push a reduced-coordinate symmetric matrix (posterior covariance,
-    /// penalized Hessian — any symmetric bilinear form on θ) forward to
-    /// raw coordinates via the exact sandwich `M_raw = T · M_θ · Tᵀ`.
+    /// Push a reduced-coordinate posterior covariance forward to raw
+    /// coordinates via the exact sandwich `Σ_raw = T · Σ_θ · Tᵀ`.
+    ///
+    /// This is deliberately covariance-specific. Hessians and penalties are
+    /// covariant quadratic forms and transform in the opposite direction via
+    /// [`Gauge::restrict_penalty`]; `T H Tᵀ` is not a Hessian pushforward.
     ///
     /// The result is explicitly symmetrised: `T · M · Tᵀ` is symmetric
     /// for symmetric `M`, but the two matmuls accumulate independent
     /// rounding, so the transpose pair is averaged to land an exactly
     /// symmetric matrix for downstream Cholesky / eigensolves.
-    pub fn lift_covariance(&self, m_reduced: &Array2<f64>) -> Array2<f64> {
+    pub fn lift_covariance(&self, covariance_reduced: &Array2<f64>) -> Array2<f64> {
         let total_reduced = self.reduced_total();
         assert_eq!(
-            m_reduced.dim(),
+            covariance_reduced.dim(),
             (total_reduced, total_reduced),
             "Gauge::lift_covariance: matrix has shape {:?}, expected ({total_reduced}, {total_reduced})",
-            m_reduced.dim(),
+            covariance_reduced.dim(),
         );
-        let t_m = fast_ab(&self.t_full, m_reduced);
+        let t_m = fast_ab(&self.t_full, covariance_reduced);
         let mut raw = fast_abt(&t_m, &self.t_full);
         let n = raw.nrows();
         for i in 0..n {
@@ -565,6 +694,7 @@ mod tests {
     #[test]
     fn identity_gauge_round_trips_betas_and_covariance() {
         let gauge = Gauge::identity(&[2, 3]);
+        assert!(gauge.is_identity());
         assert_eq!(gauge.n_blocks(), 2);
         assert_eq!(gauge.raw_total(), 5);
         assert_eq!(gauge.reduced_total(), 5);
@@ -645,6 +775,7 @@ mod tests {
         let t = Array2::from_shape_vec((3, 1), vec![2.0, -1.0, 0.5]).unwrap();
         let shift = Array1::from(vec![0.25, 1.5, -0.75]);
         let gauge = Gauge::from_block_transform_with_shift(t.clone(), shift.clone());
+        assert!(!gauge.is_identity());
         let theta = Array1::from(vec![4.0]);
 
         let raw = gauge.lift_block_betas(&[theta.clone()]);
@@ -981,5 +1112,59 @@ mod tests {
         assert!((lifted[[2, 2]] - 1.0).abs() < 1e-14);
         assert!((lifted[[3, 3]] - 1.0).abs() < 1e-14);
         assert!((lifted[[2, 3]] - 0.25).abs() < 1e-14);
+    }
+
+    #[test]
+    fn left_compose_preserves_affine_maps_and_block_lineage() {
+        // active [1,1] -> current raw [2,1]
+        let inner_t = Array2::from_shape_vec((3, 2), vec![1.0, 0.0, -0.5, 0.0, 0.0, 2.0]).unwrap();
+        let inner_shift = Array1::from(vec![0.25, -1.0, 0.5]);
+        let inner =
+            Gauge::from_t_with_shift(inner_t.clone(), &[2, 1], &[1, 1], inner_shift.clone());
+
+        // current [2,1] -> new raw [3,1]
+        let outer_t = Array2::from_shape_vec(
+            (4, 3),
+            vec![1.0, 0.0, 0.5, 0.0, 2.0, 0.0, -1.0, 0.25, 0.0, 0.0, 0.0, 3.0],
+        )
+        .unwrap();
+        let outer_shift = Array1::from(vec![1.0, -0.5, 0.75, 2.0]);
+        let outer =
+            Gauge::from_t_with_shift(outer_t.clone(), &[3, 1], &[2, 1], outer_shift.clone());
+
+        let composed = inner.left_compose(&outer).expect("compatible frames");
+        assert_eq!(composed.raw_widths(), vec![3, 1]);
+        assert_eq!(composed.reduced_widths(), vec![1, 1]);
+        assert_eq!(composed.t_full, fast_ab(&outer_t, &inner_t));
+        assert_eq!(
+            composed.affine_shift,
+            outer_t.dot(&inner_shift) + &outer_shift
+        );
+
+        let active = Array1::from(vec![1.5, -0.75]);
+        let current = inner_t.dot(&active) + &inner_shift;
+        let expected_new = outer_t.dot(&current) + &outer_shift;
+        let actual_new = composed.t_full.dot(&active) + &composed.affine_shift;
+        for index in 0..actual_new.len() {
+            assert!((actual_new[index] - expected_new[index]).abs() < 1e-14);
+        }
+
+        let encoded = serde_json::to_string(&composed).expect("serialize gauge");
+        let decoded: Gauge = serde_json::from_str(&encoded).expect("deserialize gauge");
+        decoded.validate().expect("round-tripped gauge");
+        assert_eq!(decoded.t_full, composed.t_full);
+        assert_eq!(decoded.affine_shift, composed.affine_shift);
+        assert_eq!(decoded.block_starts_raw, composed.block_starts_raw);
+        assert_eq!(decoded.block_starts_reduced, composed.block_starts_reduced);
+    }
+
+    #[test]
+    fn left_compose_rejects_equal_totals_with_different_block_frames() {
+        let inner = Gauge::from_t(Array2::eye(3), &[2, 1], &[2, 1]);
+        let outer = Gauge::from_t(Array2::eye(3), &[2, 1], &[1, 2]);
+        let error = inner
+            .left_compose(&outer)
+            .expect_err("block boundaries are part of the coordinate frame");
+        assert!(error.contains("composition frame partition mismatch"));
     }
 }

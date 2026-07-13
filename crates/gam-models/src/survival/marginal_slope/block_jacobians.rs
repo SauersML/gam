@@ -92,9 +92,7 @@ impl LogslopeBlockJacobian {
                     .zip(values.iter())
                     .map(|(variance, value)| variance * value),
             ),
-            MarginalSlopeCovariance::Full(covariance) => {
-                covariance.dot(&ArrayView1::from(values))
-            }
+            MarginalSlopeCovariance::Full(covariance) => covariance.dot(&ArrayView1::from(values)),
             MarginalSlopeCovariance::LowRank(factor) => {
                 let projected = factor.t().dot(&ArrayView1::from(values));
                 factor.dot(&projected)
@@ -214,7 +212,7 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
 /// At g=0 (β=0 init): c=1, so each row is just M[i,:].
 pub struct MarginalBlockJacobian {
     /// The marginal basis design (n × p_marginal), `Arc`-shared with its
-    /// owner (see [`LogslopeBlockJacobian::design`]).
+    /// owner rather than copied for the callback lifetime.
     pub(crate) design: Arc<Array2<f64>>,
 }
 
@@ -294,7 +292,7 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalBlockJacobian {
 ///
 /// At g=0 (β=0 init): c=1.
 pub struct TimeBlockJacobian {
-    // `Arc`-shared with their owners (see [`LogslopeBlockJacobian::design`]).
+    // `Arc`-shared with their owners.
     pub(crate) design_entry: Arc<Array2<f64>>,
     pub(crate) design_exit: Arc<Array2<f64>>,
     pub(crate) design_deriv: Arc<Array2<f64>>,
@@ -857,4 +855,62 @@ pub(crate) fn sms_tw_first_order_geom(
         dq_dq0,
         d2q_dq02,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn per_score_logslope_callback_uses_offsets_covariance_and_full_width_rows() {
+        let topology = LogslopeTopology::per_score(vec![0..1, 1..2], 2).unwrap();
+        let layout = topology
+            .materialize_identity(DesignMatrix::from(array![[2.0, 3.0]]), &array![0.4])
+            .unwrap();
+        let covariance = MarginalSlopeCovariance::Diagonal(array![2.0, 0.5]);
+        let callback = LogslopeBlockJacobian::new(
+            layout,
+            Arc::new(array![[1.5, -0.5]]),
+            covariance,
+        )
+        .unwrap();
+        let scalars: Arc<dyn std::any::Any + Send + Sync> =
+            Arc::new(SurvivalMarginalSlopeFamilyScalars::new(
+                vec![1.1],
+                vec![1.3],
+                vec![0.7],
+                vec![0.0],
+                0.8,
+                vec![0.0],
+            ));
+        let beta = [0.1, 0.2];
+        let state = crate::custom_family::FamilyLinearizationState {
+            beta: &beta,
+            family_scalars: Some(scalars),
+            channel_hessian: None,
+            probit_frailty_scale: 0.8,
+        };
+        let jacobian = crate::custom_family::BlockEffectiveJacobian::effective_jacobian_rows(
+            &callback,
+            &state,
+            0..1,
+        )
+        .unwrap();
+
+        // g=(2*.1+.4, 3*.2+.4)=(.6,1), Sigma*g=(1.2,.5).
+        let c = (1.0_f64 + 0.8_f64.powi(2) * 1.22).sqrt();
+        let dc0 = 0.8_f64.powi(2) * (1.2 * 2.0) / c;
+        let dc1 = 0.8_f64.powi(2) * (0.5 * 3.0) / c;
+        let linear0 = 0.8 * 1.5 * 2.0;
+        let linear1 = 0.8 * -0.5 * 3.0;
+        let expected = array![
+            [1.1 * dc0 + linear0, 1.1 * dc1 + linear1],
+            [1.3 * dc0 + linear0, 1.3 * dc1 + linear1],
+            [0.7 * dc0, 0.7 * dc1],
+        ];
+        for (actual, expected) in jacobian.iter().zip(expected.iter()) {
+            assert!((actual - expected).abs() <= 1e-12, "{actual} != {expected}");
+        }
+    }
 }

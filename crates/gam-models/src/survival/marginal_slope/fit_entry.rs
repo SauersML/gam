@@ -147,9 +147,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         raw_logslope_design_for_layout.clone(),
         &common_logslope_offset,
     )?;
-    if logslope_topology.is_per_score()
-        && logslope_topology.score_count() != spec.z.ncols()
-    {
+    if logslope_topology.is_per_score() && logslope_topology.score_count() != spec.z.ncols() {
         return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: format!(
                 "survival marginal-slope has {} per-score logslope channels but latent score dimension K={}",
@@ -1646,10 +1644,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         };
         let logslope_layout = match coords {
             BlockDesignCoords::PostCutover => post_cutover_logslope_layout.clone(),
-            BlockDesignCoords::RematerializedRaw => logslope_topology.materialize_identity(
-                logslope_design.design.clone(),
-                &common_logslope_offset,
-            )?,
+            BlockDesignCoords::RematerializedRaw => logslope_topology
+                .materialize_identity(logslope_design.design.clone(), &common_logslope_offset)?,
         };
         logslope_layout.validate_for(spec.z.ncols())?;
         Ok(SurvivalMarginalSlopeFamily {
@@ -1690,10 +1686,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let hints = hints.borrow();
         let block_logslope_layout = match coords {
             BlockDesignCoords::PostCutover => post_cutover_logslope_layout.clone(),
-            BlockDesignCoords::RematerializedRaw => logslope_topology.materialize_identity(
-                logslope_design.design.clone(),
-                &common_logslope_offset,
-            )?,
+            BlockDesignCoords::RematerializedRaw => logslope_topology
+                .materialize_identity(logslope_design.design.clone(), &common_logslope_offset)?,
         };
         block_logslope_layout.validate_for(spec.z.ncols())?;
         let mut cursor = 0usize;
@@ -1770,12 +1764,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let logslope_beta_hint = hints
             .logslope_beta
             .as_ref()
-            .filter(|beta| {
-                beta.len()
-                    == block_logslope_layout
-                        .coefficient_design()
-                        .ncols()
-            })
+            .filter(|beta| beta.len() == block_logslope_layout.coefficient_design().ncols())
             .cloned();
         let mut blocks = vec![
             build_time_blockspec(&time_block_ref, &design_exit, rho_time, time_beta_hint),

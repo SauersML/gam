@@ -602,7 +602,8 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
         let gc = self
-            .logslope_layout.coefficient_design()
+            .logslope_layout
+            .coefficient_design()
             .try_row_chunk(row..row + 1)
             .map_err(|e| format!("logslope_design try_row_chunk: {e}"))?;
         let gr = gc.row(0);
@@ -752,7 +753,9 @@ impl SurvivalMarginalSlopeFamily {
                         q_geom.dq0_time.dot(&d_time) + q_geom.dq0_marginal.dot(&d_marginal),
                         q_geom.dq1_time.dot(&d_time) + q_geom.dq1_marginal.dot(&d_marginal),
                         q_geom.dqd1_time.dot(&d_time) + q_geom.dqd1_marginal.dot(&d_marginal),
-                        self.logslope_layout.coefficient_design().dot_row_view(row, d_logslope),
+                        self.logslope_layout
+                            .coefficient_design()
+                            .dot_row_view(row, d_logslope),
                     ]);
                     let t_ud = self.row_primary_third_contracted(row, block_states, u_d.view())?;
                     let h_ud = h_pi.dot(&u_d);
@@ -944,13 +947,17 @@ impl SurvivalMarginalSlopeFamily {
                         q_geom.dq0_time.dot(&du_t) + q_geom.dq0_marginal.dot(&du_m),
                         q_geom.dq1_time.dot(&du_t) + q_geom.dq1_marginal.dot(&du_m),
                         q_geom.dqd1_time.dot(&du_t) + q_geom.dqd1_marginal.dot(&du_m),
-                        self.logslope_layout.coefficient_design().dot_row_view(row, du_g),
+                        self.logslope_layout
+                            .coefficient_design()
+                            .dot_row_view(row, du_g),
                     ]);
                     let ue = Array1::from_vec(vec![
                         q_geom.dq0_time.dot(&dv_t) + q_geom.dq0_marginal.dot(&dv_m),
                         q_geom.dq1_time.dot(&dv_t) + q_geom.dq1_marginal.dot(&dv_m),
                         q_geom.dqd1_time.dot(&dv_t) + q_geom.dqd1_marginal.dot(&dv_m),
-                        self.logslope_layout.coefficient_design().dot_row_view(row, dv_g),
+                        self.logslope_layout
+                            .coefficient_design()
+                            .dot_row_view(row, dv_g),
                     ]);
 
                     let t_d = self.row_primary_third_contracted(row, block_states, ud.view())?;
@@ -1069,7 +1076,8 @@ impl SurvivalMarginalSlopeFamily {
                         &q_geom.dqd1_marginal,
                     ];
                     let gc = self
-                        .logslope_layout.coefficient_design()
+                        .logslope_layout
+                        .coefficient_design()
                         .try_row_chunk(row..row + 1)
                         .map_err(|e| format!("logslope_design try_row_chunk: {e}"))?;
                     let gr = gc.row(0);
@@ -1724,7 +1732,8 @@ impl SurvivalMarginalSlopeFamily {
             .as_sparse()
             .and_then(|s| s.to_csr_arc());
         let logslope_csr = self
-            .logslope_layout.coefficient_design()
+            .logslope_layout
+            .coefficient_design()
             .as_sparse()
             .and_then(|s| s.to_csr_arc());
 
@@ -1874,8 +1883,7 @@ impl SurvivalMarginalSlopeFamily {
                                 for ca in 0..p_g {
                                     let va = channel_rows[[a, ca]] * alpha;
                                     for cb in 0..p_g {
-                                        acc.6[[ca, cb]] +=
-                                            va * channel_rows[[b, cb]];
+                                        acc.6[[ca, cb]] += va * channel_rows[[b, cb]];
                                     }
                                 }
                             }

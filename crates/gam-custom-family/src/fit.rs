@@ -34,29 +34,35 @@ pub(crate) fn lift_block_states_to_raw(
         .collect()
 }
 
-/// Lift a reduced-space conditional covariance / joint geometry pair
-/// back to the raw coordinate system by sandwiching with the joint
-/// block-diagonal transform `T_full = blockdiag(T_i)`. Selection-T
-/// zero-pads the dropped raw rows/cols; the lifted Hessian is exactly
-/// the post-canonicalisation Hessian as seen in raw coordinates and is
-/// rank-deficient by construction along the dropped directions
-/// (matching the inner-solve geometry the canonical step produced).
+/// Lift a reduced-space conditional covariance and retain the exact active
+/// precision frame used by the solver.
+///
+/// Covariance is a contravariant coefficient uncertainty and therefore pushes
+/// forward as `T Σθ Tᵀ`. Precision is a quadratic form on the active tangent
+/// space: it must remain `Hθ`, accompanied by the affine gauge
+/// `βraw = T θ + a`. A rectangular `T` has no full raw-coordinate inverse, so
+/// sandwiching `Hθ` as if it were covariance manufactures a rank-deficient
+/// matrix that is not a precision. Saved ALO pulls raw row Jacobians back as
+/// `Jθ = Jraw T` and solves this retained `Hθ` exactly.
 pub(crate) fn lift_fit_geometry_to_raw(
     canonical: &gam_identifiability::canonical::CanonicalSpecs,
     covariance_conditional: Option<Array2<f64>>,
     geometry: Option<FitGeometry>,
-) -> (Option<Array2<f64>>, Option<FitGeometry>) {
+) -> Result<(Option<Array2<f64>>, Option<FitGeometry>), CustomFamilyError> {
     let lifted_cov = covariance_conditional.map(|c| canonical.gauge.lift_covariance(&c));
-    let lifted_geom = geometry.map(|g| {
-        let h_red = g.penalized_hessian.into_array();
-        let h_raw = canonical.gauge.lift_covariance(&h_red);
-        FitGeometry {
-            penalized_hessian: h_raw.into(),
-            working_weights: g.working_weights,
-            working_response: g.working_response,
-        }
-    });
-    (lifted_cov, lifted_geom)
+    let lifted_geom = geometry
+        .map(|mut geometry| {
+            geometry.coefficient_gauge = geometry
+                .coefficient_gauge
+                .left_compose(&canonical.gauge)
+                .map_err(|reason| CustomFamilyError::InvalidInput {
+                    context: "lift_fit_geometry_to_raw",
+                    reason,
+                })?;
+            Ok::<_, CustomFamilyError>(geometry)
+        })
+        .transpose()?;
+    Ok((lifted_cov, lifted_geom))
 }
 
 fn gauge_is_identity(gauge: &gam_solve::gauge::Gauge) -> bool {
@@ -143,7 +149,7 @@ pub(crate) fn assemble_custom_family_fit_result(
             let precomputed_edf = reduced_blockwise_edf(geometry.as_ref(), canonical, &lambdas);
             let block_states = lift_block_states_to_raw(canonical, inner.block_states);
             let (covariance_conditional, geometry) =
-                lift_fit_geometry_to_raw(canonical, covariance_conditional, geometry);
+                lift_fit_geometry_to_raw(canonical, covariance_conditional, geometry)?;
             (
                 block_states,
                 covariance_conditional,

@@ -51,7 +51,8 @@ impl SurvivalMarginalSlopeFamily {
             .expect("marginal syr_row_into dimension mismatch");
 
         // logslope-logslope block: H[3,3] * g_row ⊗ g_row
-        self.logslope_layout.coefficient_design()
+        self.logslope_layout
+            .coefficient_design()
             .syr_row_into_view(
                 row,
                 h[[3, 3]],
@@ -66,12 +67,13 @@ impl SurvivalMarginalSlopeFamily {
                 self.marginal_design
                     .row_outer_into_view(
                         row,
-                        &self.logslope_layout.coefficient_design(),
+                        self.logslope_layout.coefficient_design(),
                         alpha_mg,
                         target.slice_mut(s![slices.marginal.clone(), slices.logslope.clone()]),
                     )
                     .expect("marginal-logslope row_outer_into dimension mismatch");
-                self.logslope_layout.coefficient_design()
+                self.logslope_layout
+                    .coefficient_design()
                     .row_outer_into_view(
                         row,
                         &self.marginal_design,
@@ -91,12 +93,13 @@ impl SurvivalMarginalSlopeFamily {
             time_designs[a]
                 .row_outer_into_view(
                     row,
-                    &self.logslope_layout.coefficient_design(),
+                    self.logslope_layout.coefficient_design(),
                     alpha,
                     target.slice_mut(s![slices.time.clone(), slices.logslope.clone()]),
                 )
                 .expect("time-logslope row_outer_into dimension mismatch");
-            self.logslope_layout.coefficient_design()
+            self.logslope_layout
+                .coefficient_design()
                 .row_outer_into_view(
                     row,
                     time_designs[a],
@@ -164,7 +167,8 @@ impl SurvivalMarginalSlopeFamily {
         self.marginal_design
             .syr_row_into_view(row, alpha_mm, marginal_target.view_mut())
             .expect("marginal syr_row_into dimension mismatch");
-        self.logslope_layout.coefficient_design()
+        self.logslope_layout
+            .coefficient_design()
             .syr_row_into_view(row, h[[3, 3]], logslope_target.view_mut())
             .expect("logslope syr_row_into dimension mismatch");
     }
@@ -205,7 +209,8 @@ impl SurvivalMarginalSlopeFamily {
         let q1_dir = q_geom.dq1_time.dot(&d_time) + q_geom.dq1_marginal.dot(&d_marginal);
         let qd1_dir = q_geom.dqd1_time.dot(&d_time) + q_geom.dqd1_marginal.dot(&d_marginal);
         let g_dir = self
-            .logslope_layout.coefficient_design()
+            .logslope_layout
+            .coefficient_design()
             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
 
         if let Some(primary) = flex_primary.as_ref() {

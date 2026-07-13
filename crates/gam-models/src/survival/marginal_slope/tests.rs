@@ -5265,7 +5265,8 @@ fn censored_rows_still_reject_invalid_time_derivative() {
         )),
         logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        ))).into(),
+        )))
+        .into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -5335,7 +5336,8 @@ fn exact_newton_evaluation_propagates_invalid_rows() {
         )),
         logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        ))).into(),
+        )))
+        .into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -5398,7 +5400,8 @@ fn time_constraints_use_exact_derivative_guard_rows() {
         )),
         logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((2, 0)),
-        ))).into(),
+        )))
+        .into(),
         time_linear_constraints: time_derivative_guard_constraints(
             &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
                 [1.0, 1.0],
@@ -5481,7 +5484,8 @@ fn time_block_constraints_synthesize_qd1_rows_when_stored_constraints_missing() 
         )),
         logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        ))).into(),
+        )))
+        .into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -5544,7 +5548,8 @@ fn time_block_max_feasible_step_uses_synthesized_qd1_rows() {
         )),
         logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        ))).into(),
+        )))
+        .into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -5604,7 +5609,8 @@ fn coupled_qd1_guard_limits_time_step_before_post_update_projection() {
         )),
         logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        ))).into(),
+        )))
+        .into(),
         time_linear_constraints: Some(constraints),
         score_warp: None,
         link_dev: None,
@@ -5676,7 +5682,8 @@ fn timewiggle_tail_step_is_clipped_before_it_can_flip_derivative() {
         )),
         logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        ))).into(),
+        )))
+        .into(),
         time_linear_constraints: Some(constraints),
         score_warp: None,
         link_dev: None,
@@ -5726,7 +5733,8 @@ fn time_block_post_update_rejects_infeasible_beta_instead_of_projecting() {
         )),
         logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        ))).into(),
+        )))
+        .into(),
         time_linear_constraints: append_timewiggle_tail_nonnegative_constraints(
             time_derivative_guard_constraints(
                 &DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[
@@ -5816,7 +5824,8 @@ fn time_block_post_update_rejects_qd1_when_no_linear_constraints() {
         )),
         logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        ))).into(),
+        )))
+        .into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -5898,7 +5907,8 @@ fn time_block_post_update_errors_when_current_violates_qd1() {
         )),
         logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        ))).into(),
+        )))
+        .into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -5968,7 +5978,8 @@ fn time_block_feasible_step_stays_inside_derivative_guard() {
         )),
         logslope_layout: (DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((1, 0)),
-        ))).into(),
+        )))
+        .into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -6050,7 +6061,8 @@ fn mixed_blockwise_exact_newton_preserves_sparse_block_hessians() {
         offset_exit: Arc::new(array![0.0, 0.0]),
         derivative_offset_exit: Arc::new(array![0.05, 0.05]),
         marginal_design: sparse_design(&array![[1.0, 0.0], [0.0, 1.0]]),
-        logslope_layout: (DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0], [0.5]]))).into(),
+        logslope_layout: (DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0], [0.5]])))
+            .into(),
         score_warp: None,
         link_dev: None,
         influence_absorber: None,
@@ -6600,7 +6612,11 @@ fn block_psi_test_block_states(
 ) -> Vec<ParameterBlockState> {
     let n = family.n;
     let m_design = family.marginal_design.to_dense().to_owned();
-    let g_design = family.logslope_layout.coefficient_design().to_dense().to_owned();
+    let g_design = family
+        .logslope_layout
+        .coefficient_design()
+        .to_dense()
+        .to_owned();
     let m_eta = m_design.dot(&array![m_beta]);
     let g_eta = g_design.dot(&array![g_beta]);
     vec![
@@ -7247,7 +7263,11 @@ fn flex_no_wiggle_test_block_states(
 ) -> Vec<ParameterBlockState> {
     let n = family.n;
     let m_design = family.marginal_design.to_dense().to_owned();
-    let g_design = family.logslope_layout.coefficient_design().to_dense().to_owned();
+    let g_design = family
+        .logslope_layout
+        .coefficient_design()
+        .to_dense()
+        .to_owned();
     let m_beta = 0.15_f64;
     let g_beta = 0.25_f64;
     let m_eta = m_design.dot(&array![m_beta]);
@@ -7371,7 +7391,8 @@ fn step6_joint_beta_pullback_matches_cpu_dense_assembly_flex_no_wiggle() {
         // logslope primary g (index 3): the logslope design row.
         {
             let chunk = family
-                .logslope_layout.coefficient_design()
+                .logslope_layout
+                .coefficient_design()
                 .try_row_chunk(row..row + 1)
                 .expect("logslope row");
             let g_row = chunk.row(0);
@@ -8735,7 +8756,9 @@ fn rigid_survival_all_axes_build_once_equals_per_axis_sweep_979() {
     for frailty in [None, Some(0.55_f64)] {
         let mut family = oracle_rigid_family(n, &z, &weights, &event, frailty);
         family.marginal_design = DesignMatrix::from(marginal_design.clone());
-        family.logslope_layout.coefficient_design() = DesignMatrix::from(logslope_design.clone());
+        family
+            .logslope_layout
+            .replace_coefficient_design(DesignMatrix::from(logslope_design.clone()));
 
         let beta_time = array![0.65];
         let block_states = vec![
@@ -8852,7 +8875,9 @@ fn survival_jeffreys_contracted_trace_hessian_matches_fd_of_trace() {
 
     let mut family = oracle_rigid_family(n, &z, &weights, &event, None);
     family.marginal_design = DesignMatrix::from(marginal_design.clone());
-    family.logslope_layout.coefficient_design() = DesignMatrix::from(logslope_design.clone());
+    family
+        .logslope_layout
+        .replace_coefficient_design(DesignMatrix::from(logslope_design.clone()));
 
     let total = 1 + p_m + p_g;
     let specs = vec![
@@ -9055,7 +9080,9 @@ fn survival_jeffreys_contracted_trace_hook_beats_pairwise_979() {
 
     let mut family = oracle_rigid_family(n, &z, &weights, &event, None);
     family.marginal_design = DesignMatrix::from(marginal_design.clone());
-    family.logslope_layout.coefficient_design() = DesignMatrix::from(logslope_design.clone());
+    family
+        .logslope_layout
+        .replace_coefficient_design(DesignMatrix::from(logslope_design.clone()));
 
     let total = 1 + p_m + p_g;
     let specs = vec![
@@ -9196,7 +9223,9 @@ fn survival_sparse_tower4_full_t4_matches_dense_oracle_979() {
 
     let mut family = oracle_rigid_family(n, &z, &weights, &event, None);
     family.marginal_design = DesignMatrix::from(marginal_design.clone());
-    family.logslope_layout.coefficient_design() = DesignMatrix::from(logslope_design.clone());
+    family
+        .logslope_layout
+        .replace_coefficient_design(DesignMatrix::from(logslope_design.clone()));
 
     let beta_time = array![0.6];
     let beta_marginal = array![0.18, -0.12];
