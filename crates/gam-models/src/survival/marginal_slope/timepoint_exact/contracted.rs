@@ -81,42 +81,40 @@ impl SurvivalMarginalSlopeFamily {
 
         let geometry = self.prepare_row_flex_third_geometry(row, block_states, &primary)?;
         let (entry_base, entry_ext, exit_base, exit_ext) =
-            super::flex_jet::with_flex_third_jet_arena(
-                |jet_arena| -> Result<_, String> {
-                    let (entry_base, entry_ext) =
-                        self.compute_survival_timepoint_directional_jet_from_cached(
-                            geometry.row,
-                            &primary,
-                            geometry.q0,
-                            geometry.q0_index,
-                            geometry.a0,
-                            geometry.g,
-                            geometry.beta_h.as_ref(),
-                            geometry.beta_w.as_ref(),
-                            geometry.o_infl,
-                            &geometry.entry_cached,
-                            dir,
-                            jet_arena,
-                        )?;
-                    jet_arena.reset();
-                    let (exit_base, exit_ext) =
-                        self.compute_survival_timepoint_directional_jet_from_cached(
-                            geometry.row,
-                            &primary,
-                            geometry.q1,
-                            geometry.q1_index,
-                            geometry.a1,
-                            geometry.g,
-                            geometry.beta_h.as_ref(),
-                            geometry.beta_w.as_ref(),
-                            geometry.o_infl,
-                            &geometry.exit_cached,
-                            dir,
-                            jet_arena,
-                        )?;
-                    Ok((entry_base, entry_ext, exit_base, exit_ext))
-                },
-            )?;
+            super::flex_jet::with_flex_third_jet_arena(|jet_arena| -> Result<_, String> {
+                let (entry_base, entry_ext) = self
+                    .compute_survival_timepoint_directional_jet_from_cached(
+                        geometry.row,
+                        &primary,
+                        geometry.q0,
+                        geometry.q0_index,
+                        geometry.a0,
+                        geometry.g,
+                        geometry.beta_h.as_ref(),
+                        geometry.beta_w.as_ref(),
+                        geometry.o_infl,
+                        &geometry.entry_cached,
+                        dir,
+                        jet_arena,
+                    )?;
+                jet_arena.reset();
+                let (exit_base, exit_ext) = self
+                    .compute_survival_timepoint_directional_jet_from_cached(
+                        geometry.row,
+                        &primary,
+                        geometry.q1,
+                        geometry.q1_index,
+                        geometry.a1,
+                        geometry.g,
+                        geometry.beta_h.as_ref(),
+                        geometry.beta_w.as_ref(),
+                        geometry.o_infl,
+                        &geometry.exit_cached,
+                        dir,
+                        jet_arena,
+                    )?;
+                Ok((entry_base, entry_ext, exit_base, exit_ext))
+            })?;
         if !exit_base.chi.is_finite() || exit_base.chi <= 0.0 {
             return Err(SurvivalMarginalSlopeError::NumericalFailure {
                 reason: format!(
@@ -241,8 +239,7 @@ impl SurvivalMarginalSlopeFamily {
             return Err(SurvivalMarginalSlopeError::NumericalFailure {
                 reason: format!(
                     "survival third contracted row {}: non-positive chi1={:.3e}",
-                    geometry.row,
-                    exit.chi,
+                    geometry.row, exit.chi,
                 ),
             }
             .into());
@@ -273,8 +270,8 @@ impl SurvivalMarginalSlopeFamily {
         // extension (Block-10 directional pack) comes from the single-source
         // `flex_timepoint_inputs_generic` jet builder at `Jet3`, replacing the hand
         // `compute_survival_timepoint_directional_exact_from_cached` + `block10_pack_dir`.
-        let (entry_ext, exit_ext) = super::flex_jet::with_flex_third_jet_arena(
-            |jet_arena| -> Result<_, String> {
+        let (entry_ext, exit_ext) =
+            super::flex_jet::with_flex_third_jet_arena(|jet_arena| -> Result<_, String> {
                 let (_, entry_ext) = self.compute_survival_timepoint_directional_jet_from_cached(
                     base.row,
                     &primary,
@@ -305,8 +302,7 @@ impl SurvivalMarginalSlopeFamily {
                     jet_arena,
                 )?;
                 Ok((entry_ext, exit_ext))
-            },
-        )?;
+            })?;
 
         self.row_flex_third_contract_from_packs(base, dir, &entry_ext, &exit_ext)
     }
@@ -451,9 +447,9 @@ impl SurvivalMarginalSlopeFamily {
         // returning the Block-10 packs directly, replacing the hand
         // `compute_survival_timepoint_{directional,bidirectional}_exact_from_cached`.
         let (entry_ext_u, entry_ext_v, exit_ext_u, exit_ext_v) =
-            super::flex_jet::with_flex_third_jet_arena(
-                |jet_arena| -> Result<_, String> {
-                    let entry_ext_u = self.compute_survival_timepoint_directional_jet_from_cached(
+            super::flex_jet::with_flex_third_jet_arena(|jet_arena| -> Result<_, String> {
+                let (_, entry_ext_u) = self
+                    .compute_survival_timepoint_directional_jet_from_cached(
                         row,
                         &primary,
                         q0,
@@ -462,12 +458,14 @@ impl SurvivalMarginalSlopeFamily {
                         g,
                         beta_h,
                         beta_w,
+                        o_infl,
                         &entry_cached,
                         dir_u,
                         jet_arena,
                     )?;
-                    jet_arena.reset();
-                    let entry_ext_v = self.compute_survival_timepoint_directional_jet_from_cached(
+                jet_arena.reset();
+                let (_, entry_ext_v) = self
+                    .compute_survival_timepoint_directional_jet_from_cached(
                         row,
                         &primary,
                         q0,
@@ -476,41 +474,43 @@ impl SurvivalMarginalSlopeFamily {
                         g,
                         beta_h,
                         beta_w,
+                        o_infl,
                         &entry_cached,
                         dir_v,
                         jet_arena,
                     )?;
-                    jet_arena.reset();
-                    let exit_ext_u = self.compute_survival_timepoint_directional_jet_from_cached(
-                        row,
-                        &primary,
-                        q1,
-                        primary.q1,
-                        a1,
-                        g,
-                        beta_h,
-                        beta_w,
-                        &exit_cached,
-                        dir_u,
-                        jet_arena,
-                    )?;
-                    jet_arena.reset();
-                    let exit_ext_v = self.compute_survival_timepoint_directional_jet_from_cached(
-                        row,
-                        &primary,
-                        q1,
-                        primary.q1,
-                        a1,
-                        g,
-                        beta_h,
-                        beta_w,
-                        &exit_cached,
-                        dir_v,
-                        jet_arena,
-                    )?;
-                    Ok((entry_ext_u, entry_ext_v, exit_ext_u, exit_ext_v))
-                },
-            )?;
+                jet_arena.reset();
+                let (_, exit_ext_u) = self.compute_survival_timepoint_directional_jet_from_cached(
+                    row,
+                    &primary,
+                    q1,
+                    primary.q1,
+                    a1,
+                    g,
+                    beta_h,
+                    beta_w,
+                    o_infl,
+                    &exit_cached,
+                    dir_u,
+                    jet_arena,
+                )?;
+                jet_arena.reset();
+                let (_, exit_ext_v) = self.compute_survival_timepoint_directional_jet_from_cached(
+                    row,
+                    &primary,
+                    q1,
+                    primary.q1,
+                    a1,
+                    g,
+                    beta_h,
+                    beta_w,
+                    o_infl,
+                    &exit_cached,
+                    dir_v,
+                    jet_arena,
+                )?;
+                Ok((entry_ext_u, entry_ext_v, exit_ext_u, exit_ext_v))
+            })?;
 
         // Bidirectional extensions D_{d1} D_{d2} (η_uv, χ_uv, D_uv).
         let entry_bi = self.compute_survival_timepoint_bidirectional_jet_from_cached(
