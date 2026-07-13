@@ -1418,13 +1418,17 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err("SurvivalLocationScaleFamily does not declare family-owned hyper axes"
+                .to_string());
+        }
         self.exact_newton_joint_psi_terms_masked(
             block_states,
             specs,
-            derivative_blocks,
+            hyper_layout.design_derivative_blocks(),
             psi_index,
             None,
         )
@@ -1434,10 +1438,15 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err("SurvivalLocationScaleFamily does not declare family-owned hyper axes"
+                .to_string());
+        }
+        let derivative_blocks = hyper_layout.design_derivative_blocks();
         if block_states.len() != self.expected_blocks()
             || derivative_blocks.len() != self.expected_blocks()
         {
@@ -1463,8 +1472,13 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err("SurvivalLocationScaleFamily does not declare family-owned hyper axes"
+                .to_string());
+        }
+        let derivative_blocks = hyper_layout.design_derivative_blocks();
         if block_states.len() != self.expected_blocks()
             || specs.len() != self.expected_blocks()
             || derivative_blocks.len() != self.expected_blocks()
@@ -1489,9 +1503,14 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err("SurvivalLocationScaleFamily does not declare family-owned hyper axes"
+                .to_string());
+        }
+        let derivative_blocks = hyper_layout.design_derivative_blocks();
         if block_states.len() != self.expected_blocks()
             || specs.len() != self.expected_blocks()
             || derivative_blocks.len() != self.expected_blocks()
@@ -1520,10 +1539,15 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err("SurvivalLocationScaleFamily does not declare family-owned hyper axes"
+                .to_string());
+        }
+        let derivative_blocks = hyper_layout.design_derivative_blocks();
         if block_states.len() != self.expected_blocks()
             || derivative_blocks.len() != self.expected_blocks()
         {
