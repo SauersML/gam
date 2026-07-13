@@ -1514,8 +1514,6 @@ mod tests {
                 smoothing_correction: None,
                 smoothing_correction_method: None,
                 penalized_hessian: hessian.clone().into(),
-                working_weights: array![1.0, 1.0, 1.0],
-                working_response: array![0.0, 0.1, -0.2],
                 reparam_qs: None,
                 dispersion: gam_solve::estimate::Dispersion::UNIT,
                 beta_covariance: None,
@@ -1576,8 +1574,7 @@ mod tests {
             Some(FitGeometry {
                 coefficient_gauge: gam_problem::Gauge::identity(&[1, 1]),
                 penalized_hessian: hessian.clone().into(),
-                working_weights: array![1.0, 0.8],
-                working_response: array![0.0, 0.1],
+                working: None,
             }),
         );
 

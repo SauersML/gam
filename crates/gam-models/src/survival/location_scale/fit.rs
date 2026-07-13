@@ -11,8 +11,8 @@ use super::*;
 /// `−ℓ̂`. The conditional covariance is the inverse of the observed information
 /// `H` (the joint negative-log-likelihood Hessian at the MLE), and the
 /// geometry's penalized Hessian is `H` itself — matching the exact-Newton joint
-/// geometry the coupled survival path stores (`working_weights`/`working_response`
-/// are the zero-length convention used by exact-Newton joint families). The
+/// geometry the coupled survival path stores. Exact-Newton curvature has no
+/// single diagonal row representation, so `working` is explicitly `None`. The
 /// shared [`crate::custom_family::blockwise_fit_from_parts`] assembler then
 /// computes EDF (= parameter count, since unpenalized) and the inference block
 /// exactly as for any custom-family fit.
@@ -64,8 +64,7 @@ pub(crate) fn fit_reduced_parametric_aft(
                 .collect::<Vec<_>>(),
         ),
         penalized_hessian: h.into(),
-        working_weights: Array1::<f64>::zeros(0),
-        working_response: Array1::<f64>::zeros(0),
+        working: None,
     });
 
     // The block states carry their η in the family's native row layout — the

@@ -584,6 +584,40 @@ impl Gauge {
         fast_ab(&t_s, &self.t_full)
     }
 
+    /// Pull a constructive quadratic factor into reduced coordinates.
+    ///
+    /// A positive-semidefinite quadratic represented as
+    /// `S_raw = A_rawᵀ A_raw` has energy `‖A_raw · β_raw‖²`.  Under this
+    /// gauge's section `β_raw = T · θ + a`, the quadratic part is therefore
+    /// represented *constructively* by
+    ///
+    /// ```text
+    /// A_reduced = A_raw · T,
+    /// S_reduced = A_reducedᵀ A_reduced.
+    /// ```
+    ///
+    /// Keeping the rectangular factor across the congruence is stronger than
+    /// materializing `Tᵀ S_raw T`: it preserves the proof that the restricted
+    /// form is PSD and its null space is `null(A_raw T)`, even when two dense
+    /// matrix products would leave a signed roundoff residue in an exact null
+    /// direction (#2318).
+    pub fn restrict_quadratic_factor<S: Data<Elem = f64>>(
+        &self,
+        raw_factor: &ArrayBase<S, Ix2>,
+    ) -> Array2<f64> {
+        let raw_total = self.raw_total();
+        assert_eq!(
+            raw_factor.ncols(),
+            raw_total,
+            "Gauge::restrict_quadratic_factor: factor has {} columns, expected {raw_total}",
+            raw_factor.ncols(),
+        );
+        if self.t_full_is_identity() {
+            return raw_factor.to_owned();
+        }
+        fast_ab(raw_factor, &self.t_full)
+    }
+
     /// Append blocks that were never reduced (raw == reduced, identity
     /// lift). Used to lift joint objects that span both gauged blocks
     /// and untouched ones (e.g. the survival flex blocks alongside the

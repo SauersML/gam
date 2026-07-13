@@ -164,8 +164,8 @@ pub(crate) struct BlockwiseFitAssembly<'a> {
     pub(crate) rho_physical: Array1<f64>,
     pub(crate) covariance_conditional: Option<Array2<f64>>,
     pub(crate) geometry: Option<FitGeometry>,
-    /// EDF derived from an owned coefficient-space penalized Hessian when no
-    /// truthful row-wise `FitGeometry` exists.
+    /// EDF derived in the reduced coefficient frame before a non-square gauge
+    /// lift. Row-wise working evidence is orthogonal to this precision path.
     pub(crate) precomputed_edf: Option<(f64, Vec<f64>, Vec<f64>, Vec<f64>)>,
     pub(crate) canonical: Option<&'a gam_identifiability::canonical::CanonicalSpecs>,
     pub(crate) result_specs: &'a [ParameterBlockSpec],

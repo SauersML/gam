@@ -1768,9 +1768,166 @@ pub struct FilteredPenalties {
     pub dropped: Vec<DroppedPenaltyInfo>,
 }
 
+/// A positive-semidefinite quadratic with a construction witness.
+///
+/// `factor` is the authoritative representation: for coefficients `β`, the
+/// penalty is `‖factor · β‖²`, hence its dense matrix is
+/// `factorᵀ factor` by construction.  The cached dense matrix exists only for
+/// consumers that require it; rank/null-space logic must use the factor and
+/// must never attempt to recover PSD provenance from signed eigenvalues of a
+/// rounded dense congruence (#2318).
+#[derive(Clone)]
+pub struct ConstructiveQuadratic {
+    factor: Array2<f64>,
+    matrix: Array2<f64>,
+}
+
+impl ConstructiveQuadratic {
+    /// Construct directly from an energy factor `A`, representing `AᵀA`.
+    pub fn from_energy_factor(
+        factor: Array2<f64>,
+        context: &str,
+    ) -> Result<Self, BasisError> {
+        if factor.iter().any(|value| !value.is_finite()) {
+            crate::bail_invalid_basis!(
+                "{context}: constructive penalty factor contains a non-finite value"
+            );
+        }
+        let matrix = fast_ata(&factor);
+        if matrix.iter().any(|value| !value.is_finite()) {
+            crate::bail_invalid_basis!(
+                "{context}: constructive penalty Gram is not representable"
+            );
+        }
+        Ok(Self { factor, matrix })
+    }
+
+    /// Checked bridge for legacy dense factories that already produce a PSD
+    /// function quadratic but do not yet expose their native energy factor.
+    ///
+    /// This is deliberately fallible and reconstructs a factor from the
+    /// canonical range spectrum. Material negative curvature is rejected; a
+    /// caller can no longer place an unchecked `Array2` in a
+    /// [`PenaltyCandidate`]. New factories should use
+    /// [`Self::from_energy_factor`] so PSD is true by construction rather than
+    /// inferred after dense assembly.
+    pub fn try_from_dense_psd(
+        dense: Array2<f64>,
+        context: &str,
+    ) -> Result<Self, BasisError> {
+        if dense.nrows() != dense.ncols() {
+            crate::bail_dim_basis!(
+                "{context}: dense penalty must be square, got {}x{}",
+                dense.nrows(),
+                dense.ncols()
+            );
+        }
+        if dense.iter().any(|value| !value.is_finite()) {
+            crate::bail_invalid_basis!("{context}: dense penalty contains a non-finite value");
+        }
+        if dense.nrows() == 0 {
+            return Self::from_energy_factor(Array2::zeros((0, 0)), context);
+        }
+        let sym = symmetrize_penalty(&dense);
+        let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower)
+            .map_err(BasisError::LinalgError)?;
+        let tolerance = spectral_tolerance(&sym, &evals);
+        if let Some(&negative) = evals.iter().find(|&&value| value < -tolerance) {
+            return Err(BasisError::IndefinitePenalty {
+                context: context.to_string(),
+                min_eigenvalue: negative,
+                tolerance,
+                guidance: "supply the native energy factor for a PSD function penalty; negative curvature is not a penalty null direction".to_string(),
+            });
+        }
+        let positive: Vec<usize> = evals
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &value)| (value > tolerance).then_some(index))
+            .collect();
+        let mut factor = Array2::<f64>::zeros((positive.len(), dense.nrows()));
+        for (row, index) in positive.into_iter().enumerate() {
+            let scale = evals[index].sqrt();
+            for column in 0..dense.nrows() {
+                factor[[row, column]] = scale * evecs[[column, index]];
+            }
+        }
+        Self::from_energy_factor(factor, context)
+    }
+
+    /// The authoritative rectangular energy factor.
+    pub fn factor(&self) -> &Array2<f64> {
+        &self.factor
+    }
+
+    /// Dense materialization `AᵀA` for consumers that require a matrix.
+    pub fn dense(&self) -> &Array2<f64> {
+        &self.matrix
+    }
+
+    /// Consume this quadratic and return its dense materialization.
+    pub fn into_dense(self) -> Array2<f64> {
+        self.matrix
+    }
+
+    /// Apply a coefficient gauge to the factor, preserving PSD by
+    /// construction instead of multiplying the rounded dense Gram twice.
+    pub fn restricted(
+        &self,
+        gauge: &gam_problem::Gauge,
+        context: &str,
+    ) -> Result<Self, BasisError> {
+        Self::from_energy_factor(gauge.restrict_quadratic_factor(&self.factor), context)
+    }
+
+    /// Multiply the represented quadratic by a finite non-negative scalar.
+    pub fn scaled(&self, scale: f64, context: &str) -> Result<Self, BasisError> {
+        if !scale.is_finite() || scale < 0.0 {
+            crate::bail_invalid_basis!(
+                "{context}: constructive penalty scale must be finite and non-negative, got {scale}"
+            );
+        }
+        let root = scale.sqrt();
+        Self::from_energy_factor(self.factor.mapv(|value| value * root), context)
+    }
+
+    /// The exact zero quadratic on a coefficient chart of `dimension`.
+    pub fn zero(dimension: usize) -> Self {
+        Self {
+            factor: Array2::zeros((0, dimension)),
+            matrix: Array2::zeros((dimension, dimension)),
+        }
+    }
+}
+
+impl std::fmt::Debug for ConstructiveQuadratic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConstructiveQuadratic")
+            .field(
+                "factor",
+                &format_args!("{}×{}", self.factor.nrows(), self.factor.ncols()),
+            )
+            .field(
+                "matrix",
+                &format_args!("{}×{}", self.matrix.nrows(), self.matrix.ncols()),
+            )
+            .finish()
+    }
+}
+
+impl std::ops::Deref for ConstructiveQuadratic {
+    type Target = Array2<f64>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.matrix
+    }
+}
+
 #[derive(Clone)]
 pub struct PenaltyCandidate {
-    pub matrix: Array2<f64>,
+    /// Constructive PSD quadratic. Raw dense matrices cannot inhabit a
+    /// candidate without passing through a checked constructor.
+    pub matrix: ConstructiveQuadratic,
     pub source: PenaltySource,
     pub normalization_scale: f64,
     /// Optional Kronecker factors whose product equals `matrix`.

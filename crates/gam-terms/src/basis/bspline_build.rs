@@ -204,7 +204,10 @@ pub fn build_bspline_basis_1d(
         // penalty. Fit-invariant at the REML optimum (only `λ̂` rescales by `c`).
         let (s_bend_norm, s_bend_scale) = normalize_penalty(&s_bend_raw);
         let penalties_raw = vec![PenaltyCandidate {
-            matrix: s_bend_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s_bend_norm,
+                "cyclic B-spline roughness",
+            )?,
             source: PenaltySource::Primary,
             normalization_scale: s_bend_scale,
             kronecker_factors: None,
@@ -212,7 +215,7 @@ pub fn build_bspline_basis_1d(
         }];
         let penalties_raw_mats = penalties_raw
             .iter()
-            .map(|candidate| candidate.matrix.clone())
+            .map(|candidate| candidate.matrix.dense().clone())
             .collect();
         let auto_chunk = auto_streaming_chunk_size_for_dense(data.len(), num_basis);
         let (design, transformed_candidates, identifiability_transform) =
@@ -244,17 +247,15 @@ pub fn build_bspline_basis_1d(
                         spec.degree,
                         &spec.identifiability,
                     )?;
-                let transformed_candidates = penalty_mats
-                    .into_iter()
-                    .zip(penalties_raw)
-                    .map(|(matrix, candidate)| PenaltyCandidate {
-                        matrix,
-                        source: candidate.source,
-                        normalization_scale: candidate.normalization_scale,
-                        kronecker_factors: None,
-                        op: None,
-                    })
-                    .collect();
+                // `penalty_mats` is retained only for the public dense policy
+                // API. The fit candidates follow the same transform through
+                // their energy factors, preserving PSD/null provenance.
+                drop(penalty_mats);
+                let transformed_candidates = restrict_penalty_candidates(
+                    penalties_raw,
+                    identifiability_transform.as_ref(),
+                    "cyclic B-spline identifiability",
+                )?;
                 (
                     DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(design_c)),
                     transformed_candidates,
@@ -348,7 +349,7 @@ pub fn build_bspline_basis_1d(
         let penalties_raw = bspline_penalty_candidates(&s_bend_raw, spec, &knots)?;
         let penalties_raw_mats = penalties_raw
             .iter()
-            .map(|candidate| candidate.matrix.clone())
+            .map(|candidate| candidate.matrix.dense().clone())
             .collect();
         log::info!(
             "B-spline basis auto-streaming evaluator: n={} p={} chunk_size={}",
@@ -559,28 +560,16 @@ pub fn build_bspline_basis_1d(
     let penalties_raw = bspline_penalty_candidates(&s_bend_raw, spec, &knots)?;
     let penalties_raw_mats: Vec<Array2<f64>> = penalties_raw
         .iter()
-        .map(|candidate| candidate.matrix.clone())
+        .map(|candidate| candidate.matrix.dense().clone())
         .collect();
     let (design, transformed_candidates, identifiability_transform) = if let Some(sparse_basis) =
         design_sparse_opt
     {
         match &spec.identifiability {
             BSplineIdentifiability::None => {
-                let transformed_candidates = penalties_raw
-                    .into_iter()
-                    .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
-                        Ok(PenaltyCandidate {
-                            matrix: candidate.matrix,
-                            source: candidate.source,
-                            normalization_scale: candidate.normalization_scale,
-                            kronecker_factors: None,
-                            op: None,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
                 (
                     DesignMatrix::Sparse(gam_linalg::matrix::SparseDesignMatrix::new(sparse_basis)),
-                    transformed_candidates,
+                    penalties_raw,
                     None,
                 )
             }
@@ -594,7 +583,10 @@ pub fn build_bspline_basis_1d(
                 let transformed_candidates = penalties_raw
                     .into_iter()
                     .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
-                        let matrix = gauge.restrict_penalty(&candidate.matrix);
+                        let matrix = candidate.matrix.restricted(
+                            &gauge,
+                            "sparse B-spline sum-to-zero restriction",
+                        )?;
                         Ok(PenaltyCandidate {
                             matrix,
                             source: candidate.source,
@@ -672,21 +664,12 @@ pub fn build_bspline_basis_1d(
             )?;
         let identifiability_transform =
             compose_optional_bspline_transform(boundary_transform, identifiability_local)?;
-        let transformed_candidates = penalties
-            .into_iter()
-            .zip(penalties_raw.into_iter())
-            .map(
-                |(matrix, candidate)| -> Result<PenaltyCandidate, BasisError> {
-                    Ok(PenaltyCandidate {
-                        matrix,
-                        source: candidate.source,
-                        normalization_scale: candidate.normalization_scale,
-                        kronecker_factors: None,
-                        op: None,
-                    })
-                },
-            )
-            .collect::<Result<Vec<_>, _>>()?;
+        drop(penalties);
+        let transformed_candidates = restrict_penalty_candidates(
+            penalties_raw,
+            identifiability_transform.as_ref(),
+            "B-spline boundary and identifiability restriction",
+        )?;
         (
             DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(design)),
             transformed_candidates,
@@ -772,7 +755,10 @@ pub fn build_cubic_regression_basis_1d(
     let want_nullspace = spec.double_penalty;
     let (bend_norm, bend_scale) = normalize_penalty(&s_bend_raw);
     let mut penalties_raw = vec![PenaltyCandidate {
-        matrix: bend_norm,
+        matrix: ConstructiveQuadratic::try_from_dense_psd(
+            bend_norm,
+            "cubic-regression roughness",
+        )?,
         source: PenaltySource::Primary,
         normalization_scale: bend_scale,
         kronecker_factors: None,
@@ -789,7 +775,10 @@ pub fn build_cubic_regression_basis_1d(
     if let Some(shrinkage) = cr_shrinkage {
         let (ridge_norm, ridge_scale) = normalize_penalty(&shrinkage);
         penalties_raw.push(PenaltyCandidate {
-            matrix: ridge_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                ridge_norm,
+                "cubic-regression null-function ridge",
+            )?,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: ridge_scale,
             kronecker_factors: None,
@@ -805,7 +794,7 @@ pub fn build_cubic_regression_basis_1d(
     // constrained map stored in metadata for predict-time replay.
     let raw_penalty_mats: Vec<Array2<f64>> = penalties_raw
         .iter()
-        .map(|candidate| candidate.matrix.clone())
+        .map(|candidate| candidate.matrix.dense().clone())
         .collect();
     let (design_c, penalty_mats_c, identifiability_transform) =
         apply_bspline_identifiability_policy(
@@ -816,17 +805,12 @@ pub fn build_cubic_regression_basis_1d(
             &spec.identifiability,
         )?;
 
-    let transformed_candidates: Vec<PenaltyCandidate> = penalty_mats_c
-        .into_iter()
-        .zip(penalties_raw)
-        .map(|(matrix, candidate)| PenaltyCandidate {
-            matrix,
-            source: candidate.source,
-            normalization_scale: candidate.normalization_scale,
-            kronecker_factors: None,
-            op: None,
-        })
-        .collect();
+    drop(penalty_mats_c);
+    let transformed_candidates = restrict_penalty_candidates(
+        penalties_raw,
+        identifiability_transform.as_ref(),
+        "cubic-regression identifiability restriction",
+    )?;
 
     // Rebuild the double-penalty ridge in the constrained chart (no-op when no
     // ridge candidate is present) and renormalize every constrained block to
@@ -1348,17 +1332,15 @@ pub(crate) fn build_streaming_bspline_design_and_candidates(
         }
     }
 
-    let transformed_candidates = penalty_mats
-        .into_iter()
-        .zip(penalties_raw)
-        .map(|(matrix, candidate)| PenaltyCandidate {
-            matrix,
-            source: candidate.source,
-            normalization_scale: candidate.normalization_scale,
-            kronecker_factors: None,
-            op: None,
-        })
-        .collect();
+    // The dense matrices above serve the legacy design-policy return shape;
+    // candidates themselves are restricted through their factors exactly once
+    // by the composed raw-to-final transform.
+    drop(penalty_mats);
+    let transformed_candidates = restrict_penalty_candidates(
+        penalties_raw,
+        transform_opt.as_ref(),
+        "streaming B-spline identifiability restriction",
+    )?;
     let op = StreamingBSplineEvaluator::new(
         Arc::new(data.to_owned()),
         Arc::new(knots.clone()),
@@ -2232,7 +2214,10 @@ fn bspline_penalty_candidates(
     let Some(shrinkage) = shrinkage else {
         let (bend_norm, bend_scale) = normalize_penalty(s_bend_raw);
         return Ok(vec![PenaltyCandidate {
-            matrix: bend_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                bend_norm,
+                "B-spline roughness",
+            )?,
             source: PenaltySource::Primary,
             normalization_scale: bend_scale,
             kronecker_factors: None,
@@ -2244,14 +2229,20 @@ fn bspline_penalty_candidates(
     let (ridge_norm, ridge_scale) = normalize_penalty(&shrinkage);
     Ok(vec![
         PenaltyCandidate {
-            matrix: bend_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                bend_norm,
+                "B-spline roughness",
+            )?,
             source: PenaltySource::Primary,
             normalization_scale: bend_scale,
             kronecker_factors: None,
             op: None,
         },
         PenaltyCandidate {
-            matrix: ridge_norm,
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                ridge_norm,
+                "B-spline null-function ridge",
+            )?,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: ridge_scale,
             kronecker_factors: None,

@@ -609,16 +609,6 @@ pub fn survival_fit_from_parts(
             }
             .into());
         }
-        if geom.working_weights.len() != geom.working_response.len() {
-            return Err(SurvivalLocationScaleError::DimensionMismatch {
-                reason: format!(
-                    "survival_fit.geometry working length mismatch: weights={}, response={}",
-                    geom.working_weights.len(),
-                    geom.working_response.len()
-                ),
-            }
-            .into());
-        }
     }
 
     // Effective degrees of freedom per block from the converged penalized
@@ -729,8 +719,6 @@ pub fn survival_fit_from_parts(
             smoothing_correction: None,
             smoothing_correction_method: None,
             penalized_hessian: geom.penalized_hessian.clone(),
-            working_weights: geom.working_weights.clone(),
-            working_response: geom.working_response.clone(),
             reparam_qs: None,
             dispersion: gam_solve::estimate::Dispersion::UNIT,
             beta_covariance: covariance_conditional.clone().map(Into::into),

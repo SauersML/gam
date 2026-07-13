@@ -796,9 +796,12 @@ fn cli_sample_bounded_model_reaches_sampler_config_validation() {
         None,
         None,
         Some(FitGeometry {
+            coefficient_gauge: gam_problem::Gauge::identity(&[2]),
             penalized_hessian: array![[4.0, 1.0], [1.0, 3.0]].into(),
-            working_weights: array![1.0, 1.0, 1.0],
-            working_response: array![0.0, 1.0, 1.0],
+            working: Some(gam::estimate::WorkingGeometry {
+                working_weights: array![1.0, 1.0, 1.0],
+                working_response: array![0.0, 1.0, 1.0],
+            }),
         }),
         saved_fit_summary_fixture(),
     );
@@ -1991,9 +1994,9 @@ fn nonlinear_saved_model_with_hessian_only_remains_persistable_and_predictable()
         inference: None,
         fitted_link: FittedLinkState::Standard(None),
         geometry: Some(FitGeometry {
+            coefficient_gauge: gam_problem::Gauge::identity(&[1]),
             penalized_hessian: array![[2.0]].into(),
-            working_weights: Array1::zeros(0),
-            working_response: Array1::zeros(0),
+            working: None,
         }),
         block_states: Vec::new(),
         pirls_status: gam::pirls::PirlsStatus::Converged,
@@ -2973,8 +2976,6 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
             smoothing_correction: None,
             smoothing_correction_method: None,
             penalized_hessian: hessian.clone().into(),
-            working_weights: working_weights.clone(),
-            working_response: working_response.clone(),
             reparam_qs: Some(Array2::eye(2)),
             dispersion: gam::estimate::Dispersion::known(1.0)
                 .expect("unit known dispersion is valid"),
@@ -2990,9 +2991,12 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
         }),
         fitted_link: FittedLinkState::Standard(Some(StandardLink::Logit)),
         geometry: Some(FitGeometry {
+            coefficient_gauge: gam_problem::Gauge::identity(&[2]),
             penalized_hessian: hessian.into(),
-            working_weights,
-            working_response,
+            working: Some(gam::estimate::WorkingGeometry {
+                working_weights,
+                working_response,
+            }),
         }),
         block_states: Vec::new(),
         pirls_status: gam::pirls::PirlsStatus::Converged,
@@ -3018,11 +3022,13 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
         .geometry
         .as_ref()
         .unwrap_or_else(|| panic!("{} failed", "geometry kept"));
-    assert_eq!(inf.working_weights.len(), 0);
-    assert_eq!(inf.working_response.len(), 0);
     assert!(inf.reparam_qs.is_none());
-    assert_eq!(geom.working_weights.len(), 0);
-    assert_eq!(geom.working_response.len(), 0);
+    let working = geom
+        .working
+        .as_ref()
+        .unwrap_or_else(|| panic!("{} failed", "working geometry kept"));
+    assert_eq!(working.working_weights.len(), 3);
+    assert_eq!(working.working_response.len(), 3);
     fit.validate_numeric_finiteness().unwrap_or_else(|e| {
         panic!(
             "{} failed: {:?}",

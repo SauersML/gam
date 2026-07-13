@@ -1415,8 +1415,7 @@ mod binomial_mean_wiggle_saved_frame_tests {
         let geometry = gam_solve::model_types::FitGeometry {
             coefficient_gauge: active_to_solver,
             penalized_hessian: active_hessian.clone().into(),
-            working_weights: Array1::zeros(0),
-            working_response: Array1::zeros(0),
+            working: None,
         };
         let saved_geometry = binomial_mean_wiggle_saved_geometry(&geometry, &saved_frame)
             .expect("non-square active geometry composes through saved frame");

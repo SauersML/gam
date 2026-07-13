@@ -4187,8 +4187,6 @@ mod tests {
             smoothing_correction: None,
             smoothing_correction_method: None,
             penalized_hessian: Array2::<f64>::eye(p).into(),
-            working_weights: Array1::zeros(0),
-            working_response: Array1::zeros(0),
             reparam_qs: None,
             dispersion: gam_problem::Dispersion::UNIT,
             beta_covariance: Some(covariance.clone().into()),

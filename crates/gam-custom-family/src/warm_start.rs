@@ -626,9 +626,13 @@ pub fn blockwise_fit_from_parts(
         }
     }
 
-    if let Some(geom) = geometry.as_ref() {
-        geom.validate_numeric_finiteness()
-            .map_err(|e| e.to_string())?;
+    let geom = geometry.as_ref().ok_or_else(|| CustomFamilyError::InvalidInput {
+        context: "blockwise_fit_from_parts",
+        reason: "a converged custom-family fit must retain coefficient gauge and penalized Hessian geometry"
+            .to_string(),
+    })?;
+    {
+        geom.validate_numeric_finiteness().map_err(|e| e.to_string())?;
         let mut raw_block_starts = Vec::with_capacity(block_states.len() + 1);
         raw_block_starts.push(0usize);
         for state in &block_states {
@@ -691,17 +695,14 @@ pub fn blockwise_fit_from_parts(
             expected_rho
         ) }.into());
     }
-    // Effective degrees of freedom and the inference block. When the
-    // converged geometry carries the joint penalized Hessian we compute the
+    // Effective degrees of freedom and the inference block. The converged
+    // coefficient geometry always carries the joint penalized Hessian; compute the
     // mgcv trace edf `p − Σ_k λ_k·tr(H⁻¹ S_k)` here so every custom-family fit
     // (CTN transformation-normal, Dirichlet, …) reports `edf_total` /
     // per-block `edf` like the standard GAM path, instead of leaving inference
-    // unpopulated. A factorization failure is non-fatal: the fit still returns
-    // with `edf=0`/`inference=None` rather than aborting, but in practice the
-    // ridge-retry inside `custom_family_blockwise_edf` recovers any boundary
-    // indefiniteness.
-    let (edf_total_opt, edf_by_penalty, block_edf, penalty_trace): (
-        Option<f64>,
+    // unpopulated. Optional row evidence is not part of this calculation.
+    let (edf_total, edf_by_penalty, block_edf, penalty_trace): (
+        f64,
         Vec<f64>,
         Vec<f64>,
         Vec<f64>,
@@ -711,32 +712,23 @@ pub fn blockwise_fit_from_parts(
         // reported on the raw fit — exact because the trace edf is
         // reparameterization-invariant).
         Some((edf_total, edf_by_penalty, block_edf, penalty_trace)) => {
-            (Some(edf_total), edf_by_penalty, block_edf, penalty_trace)
+            (edf_total, edf_by_penalty, block_edf, penalty_trace)
         }
-        // Fallback: compute from whatever geometry we were handed. Used
-        // only when the caller did not precompute (no reduced geometry);
-        // the ridge-retry factorization makes this robust to a marginally
-        // indefinite Hessian.
-        None => match geometry.as_ref() {
-            Some(geom) => {
-                match custom_family_blockwise_edf(
+        // Compute from coefficient precision when the caller did not already
+        // supply the basis-invariant reduced-space traces.
+        None => {
+            let (edf_total, edf_by_penalty, block_edf, penalty_trace) =
+                custom_family_blockwise_edf(
                     geom.penalized_hessian.as_array(),
                     specs,
                     &lambdas.view(),
-                ) {
-                    Ok((edf_total, edf_by_penalty, block_edf, penalty_trace)) => {
-                        (Some(edf_total), edf_by_penalty, block_edf, penalty_trace)
-                    }
-                    Err(err) => {
-                        log::warn!(
-                            "[custom-family inference] effective degrees of freedom unavailable: {err}"
-                        );
-                        (None, Vec::new(), vec![0.0; block_states.len()], Vec::new())
-                    }
-                }
-            }
-            None => (None, Vec::new(), vec![0.0; block_states.len()], Vec::new()),
-        },
+                )
+                .map_err(|reason| CustomFamilyError::Optimization {
+                    context: "blockwise_fit_from_parts coefficient-geometry EDF",
+                    reason: format!("{reason}; refusing to assemble a fit without EDF/inference"),
+                })?;
+            (edf_total, edf_by_penalty, block_edf, penalty_trace)
+        }
     };
 
     let mut lambda_offset = 0usize;
@@ -765,28 +757,25 @@ pub fn blockwise_fit_from_parts(
     // Hessian is reported unscaled (dispersion = 1) — the EDF trace is
     // dispersion-free, and downstream covariance scaling pairs `H` with the
     // family's own dispersion where needed.
-    let inference = match (edf_total_opt, geometry.as_ref()) {
-        (Some(edf_total), Some(geom)) => Some(gam_solve::model_types::FitInference {
-            edf_by_block: edf_by_penalty,
-            penalty_block_trace: penalty_trace,
-            edf_total,
-            smoothing_correction: None,
-            smoothing_correction_method: None,
-            penalized_hessian: geom.penalized_hessian.clone(),
-            reparam_qs: None,
-            dispersion: gam_solve::model_types::Dispersion::UNIT,
-            beta_covariance: None,
-            beta_standard_errors: None,
-            beta_covariance_corrected: None,
-            beta_standard_errors_corrected: None,
-            beta_covariance_frequentist: None,
-            coefficient_influence: None,
-            weighted_gram: None,
-            bias_correction_beta: None,
-            bias_correction_jacobian: None,
-        }),
-        _ => None,
-    };
+    let inference = Some(gam_solve::model_types::FitInference {
+        edf_by_block: edf_by_penalty,
+        penalty_block_trace: penalty_trace,
+        edf_total,
+        smoothing_correction: None,
+        smoothing_correction_method: None,
+        penalized_hessian: geom.penalized_hessian.clone(),
+        reparam_qs: None,
+        dispersion: gam_solve::model_types::Dispersion::UNIT,
+        beta_covariance: None,
+        beta_standard_errors: None,
+        beta_covariance_corrected: None,
+        beta_standard_errors_corrected: None,
+        beta_covariance_frequentist: None,
+        coefficient_influence: None,
+        weighted_gram: None,
+        bias_correction_beta: None,
+        bias_correction_jacobian: None,
+    });
 
     gam_solve::model_types::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
         blocks,

@@ -1330,12 +1330,11 @@ fn summary_smooth_terms(
         family.response,
         ResponseFamily::Gaussian | ResponseFamily::Gamma
     );
-    // n (for the F-distribution denominator) comes from the saved working-set
-    // geometry when present; the Wald χ² (Known-scale) branch never reads it.
-    let n_obs = fit
-        .geometry
-        .as_ref()
-        .map(|geom| geom.working_response.len() as f64);
+    // Sample size belongs to the rebuilt training design, not optional IRLS
+    // row evidence. Exact-Newton and multi-parameter fits retain coefficient
+    // geometry without a single working vector and still have a valid Wald/F
+    // denominator.
+    let n_obs = Some(design.design.nrows() as f64);
     let residual_df = n_obs.zip(fit.edf_total()).and_then(|(n, edf)| {
         let value = n - edf;
         (edf.is_finite() && value.is_finite() && value > 0.0).then_some(value)
@@ -1665,12 +1664,9 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         deployment_extensions: model.payload().deployment_extensions.clone(),
         deviance: fit.deviance,
         log_likelihood: Some(fit.log_likelihood),
-        // Observation count from the IRLS working set (same source the Wald χ²
-        // n-dependence reads). Lets `compare_models` reject cross-`n` comparisons.
-        n_obs: fit
-            .geometry
-            .as_ref()
-            .map(|geom| geom.working_response.len()),
+        // Observation count comes from the rebuilt training design; it does
+        // not depend on whether the terminal solver exposed diagonal IRLS rows.
+        n_obs: Some(design.design.nrows()),
         reml_score,
         raw_reml_score,
         null_space_logdet: fit.artifacts.null_space_logdet,
