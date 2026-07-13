@@ -2176,6 +2176,48 @@ mod tests {
         }
     }
 
+    struct OversizedDenseProgram;
+
+    impl RowProgram<10> for OversizedDenseProgram {
+        fn n_rows(&self) -> usize {
+            1
+        }
+
+        fn primaries(&self, _row: usize) -> Result<[f64; 10], String> {
+            Err("dense-tower storage check reached program primaries".to_string())
+        }
+
+        fn eval<S: crate::jet_scalar::JetScalar<10>>(
+            &self,
+            _row: usize,
+            _p: &[S; 10],
+        ) -> Result<S, String> {
+            Err("dense-tower storage check reached program evaluation".to_string())
+        }
+    }
+
+    #[test]
+    fn full_tower_refuses_oversized_result_before_touching_program() {
+        let tower_bytes = std::mem::size_of::<Tower4<10>>();
+        assert!(tower_bytes > PROGRAM_DENSE_JET_STACK_BUDGET_BYTES);
+        assert!(
+            std::mem::size_of::<Result<Box<Tower4<32>>, String>>()
+                <= 4 * std::mem::size_of::<usize>(),
+            "boxed full-tower API must keep its return slot independent of dense tower width"
+        );
+
+        let error = program_full_tower(&OversizedDenseProgram, 0)
+            .expect_err("Tower4<10> must exceed the canonical dense storage budget");
+        assert_eq!(
+            error,
+            format!(
+                "canonical dense Tower4<10> requires {tower_bytes} bytes, exceeding the {}-byte \
+                 storage budget; use the bounded row-kernel and directional channel APIs",
+                PROGRAM_DENSE_JET_STACK_BUDGET_BYTES
+            )
+        );
+    }
+
     fn assert_close(label: &str, got: f64, want: f64, rel_tol: f64) {
         let diff = (got - want).abs();
         assert!(
