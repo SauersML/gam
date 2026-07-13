@@ -181,6 +181,7 @@ def main() -> int:
 
     rows = []
     for K in args.k_grid:
+        print(f"[#2132] START K={K:5d}", flush=True)
         t0 = time.time()
         ev_c = curved_ev(x_tr, x_te, mean_tr, K=K, top_k=args.top_k,
                          d_atom=args.d_atom, topology=args.atom_topology,
