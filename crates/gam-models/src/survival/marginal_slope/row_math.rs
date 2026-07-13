@@ -1133,7 +1133,7 @@ impl RigidVectorRowWorkspace {
             }
             .to_string()
         })?;
-        let backend = if score_dimension <= 5 {
+        let backend = if score_dimension <= 3 {
             RigidVectorRowBackend::Fixed
         } else if score_dimension <= 13 {
             RigidVectorRowBackend::Graph(Order2GraphWorkspace::new())
@@ -1298,8 +1298,8 @@ pub(crate) fn row_primary_closed_form_vector_into(
         (RigidVectorRowBackend::Fixed, 1) => fixed_row!(4, gradient, hessian),
         (RigidVectorRowBackend::Fixed, 2) => fixed_row!(5, gradient, hessian),
         (RigidVectorRowBackend::Fixed, 3) => fixed_row!(6, gradient, hessian),
-        (RigidVectorRowBackend::Fixed, 4) => fixed_row!(7, gradient, hessian),
-        (RigidVectorRowBackend::Fixed, 5) => fixed_row!(8, gradient, hessian),
+        (RigidVectorRowBackend::Graph(graph), 4) => graph_row!(7, graph, gradient, hessian),
+        (RigidVectorRowBackend::Graph(graph), 5) => graph_row!(8, graph, gradient, hessian),
         (RigidVectorRowBackend::Graph(graph), 6) => graph_row!(9, graph, gradient, hessian),
         (RigidVectorRowBackend::Graph(graph), 7) => graph_row!(10, graph, gradient, hessian),
         (RigidVectorRowBackend::Graph(graph), 8) => graph_row!(11, graph, gradient, hessian),
@@ -2026,7 +2026,7 @@ mod tests {
                     )
                     .expect("zero-order canonical vector row");
                     if shape_index == 0 && event == 0.0 {
-                        let expected_backend = if k <= 5 { "fixed" } else { "graph" };
+                        let expected_backend = if k <= 3 { "fixed" } else { "graph" };
                         assert_eq!(production_workspace.backend_name(), expected_backend);
                     }
                     let graph = collect_row_into(DIM, |gradient, hessian| {
