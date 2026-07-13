@@ -361,10 +361,11 @@ impl RationalLogdetPlan {
 
     /// Evaluate the surrogate `L̃ ≈ log det S` through `matvec(v) = S·v`.
     ///
-    /// Each shifted system is solved by plain CG to relative residual
+    /// Each shifted system is solved by plain CG to normwise backward error
     /// `cg_rel_tol`, walking the shift ladder from the largest `t` (near-trivial
     /// solves) down to the smallest, warm-starting each solve from the previous
-    /// shift's solution for the same probe.
+    /// shift's solution for the same probe. A stricter RHS-relative residual
+    /// also terminates the solve when it is attainable.
     pub fn evaluate(
         &self,
         matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
@@ -615,14 +616,25 @@ impl RationalLogdetPlan {
 
 /// Plain CG on `(A + t·I) y = b` through the un-shifted `matvec(v) = A·v`,
 /// warm-started from `y0`. Returns the solution and the iteration count only
-/// after the TRUE residual meets `rel_tol`; exhaustion and non-finite/SPD
-/// breakdowns return `None`. When the recursively updated CG residual reaches
-/// tolerance before the true residual does, the recurrence is restarted from
-/// the true residual (reliable residual replacement) rather than rejecting a
-/// recoverable solve. Returning an iteration-capped last iterate would make the
-/// value consume an approximate inverse while the derivative formula
-/// differentiates an exact inverse, re-opening the #2080 objective/gradient
-/// desynchronisation this module exists to prevent.
+/// after the TRUE residual certifies either the stricter RHS-relative residual
+/// or the requested normwise backward error; exhaustion and non-finite/SPD
+/// breakdowns return `None`. The matrix-free backward-error denominator uses
+/// the largest Rayleigh quotient observed over the CG directions. For SPD `A`,
+/// this is a lower bound on `||A||₂`, hence
+///
+/// `||r||₂ / (lambda_observed ||y||₂ + ||b||₂)`
+///
+/// is a conservative upper bound on the usual normwise backward error. This
+/// closes the f64 roundoff gap where `||r||/||b||` cannot reach a requested
+/// tolerance even though the computed solution already solves a nearby system
+/// to that tolerance. When the recursively updated CG residual reaches the
+/// RHS-relative threshold before the true residual does, the recurrence is
+/// restarted from the true residual (reliable residual replacement) rather
+/// than rejecting a recoverable solve. Returning an uncertified
+/// iteration-capped last iterate would make the value consume an uncontrolled
+/// approximate inverse while the derivative formula differentiates an exact
+/// inverse, re-opening the #2080 objective/gradient desynchronisation this
+/// module exists to prevent.
 fn shifted_cg(
     matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
     t: f64,
@@ -649,6 +661,7 @@ fn shifted_cg(
     }
     let tol = rel_tol * b_norm;
     let mut iters = 0usize;
+    let mut observed_operator_norm = 0.0_f64;
     loop {
         if rs.sqrt() <= tol {
             // Recursive CG residuals lose their equality to `b - A y` through
@@ -664,7 +677,27 @@ fn shifted_cg(
             if !true_rs.is_finite() {
                 return None;
             }
-            if true_rs.sqrt() <= tol {
+            let true_residual_norm = true_rs.sqrt();
+            let y_norm = y.dot(&y).sqrt();
+            if !y_norm.is_finite() {
+                return None;
+            }
+            // Evaluate the backward-error ratio in the log domain. The scale
+            // `lambda_observed * ||y|| + ||b||` can overflow even when every
+            // operand and the certified ratio are representable.
+            let backward_error_certified = if observed_operator_norm > 0.0 && y_norm > 0.0 {
+                let log_operator_solution = observed_operator_norm.ln() + y_norm.ln();
+                let log_rhs = b_norm.ln();
+                let log_scale = log_operator_solution.max(log_rhs);
+                let log_denominator = log_scale
+                    + ((log_operator_solution - log_scale).exp()
+                        + (log_rhs - log_scale).exp())
+                    .ln();
+                true_residual_norm.ln() - log_denominator <= rel_tol.ln()
+            } else {
+                false
+            };
+            if true_residual_norm <= tol || backward_error_certified {
                 return Some((y, iters));
             }
             if iters >= max_iters {
@@ -681,6 +714,14 @@ fn shifted_cg(
         let denom = p.dot(&ap);
         if !(denom.is_finite() && denom > 0.0) {
             return None;
+        }
+        let p_norm_sq = p.dot(&p);
+        if !(p_norm_sq.is_finite() && p_norm_sq > 0.0) {
+            return None;
+        }
+        let rayleigh = denom / p_norm_sq;
+        if rayleigh.is_finite() {
+            observed_operator_norm = observed_operator_norm.max(rayleigh);
         }
         let alpha = rs / denom;
         y.scaled_add(alpha, &p);
