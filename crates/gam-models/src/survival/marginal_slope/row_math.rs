@@ -845,7 +845,11 @@ fn row_primary_closed_form_vector_dynamic_into(
     }
     let dim = 3 + k;
     assert_eq!(gradient.len(), dim, "dynamic row gradient width mismatch");
-    assert_eq!(hessian.len(), dim * dim, "dynamic row Hessian width mismatch");
+    assert_eq!(
+        hessian.len(),
+        dim * dim,
+        "dynamic row Hessian width mismatch"
+    );
     arena.reset();
     let primary_values = arena.alloc_slice_fill_with(dim, |axis| match axis {
         0 => q0,
@@ -1003,7 +1007,11 @@ fn row_primary_closed_form_vector_graph_into<const DIM: usize>(
         .into());
     }
     assert_eq!(gradient.len(), DIM, "compiled row gradient width mismatch");
-    assert_eq!(hessian.len(), DIM * DIM, "compiled row Hessian width mismatch");
+    assert_eq!(
+        hessian.len(),
+        DIM * DIM,
+        "compiled row Hessian width mismatch"
+    );
     workspace.reset(DIM);
     let primary_values: [f64; DIM] = std::array::from_fn(|axis| match axis {
         0 => q0,
@@ -1124,20 +1132,20 @@ pub(crate) fn row_primary_closed_form_vector_into(
         (RigidVectorRowBackend::Graph(graph), 13) => graph_row!(16, graph),
         (RigidVectorRowBackend::Dynamic(arena), 14..) => {
             row_primary_closed_form_vector_dynamic_into(
-            q0,
-            q1,
-            qd1,
-            slopes,
-            z,
-            covariance,
-            w,
-            d,
-            derivative_guard,
-            probit_scale,
-            arena,
-            gradient,
-            hessian,
-        )
+                q0,
+                q1,
+                qd1,
+                slopes,
+                z,
+                covariance,
+                w,
+                d,
+                derivative_guard,
+                probit_scale,
+                arena,
+                gradient,
+                hessian,
+            )
         }
         _ => Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: format!(
@@ -1817,8 +1825,7 @@ mod tests {
                         &mut production_workspace,
                     )
                     .expect("production vector row");
-                    let production =
-                        collect_workspace_row(production_value, &production_workspace);
+                    let production = collect_workspace_row(production_value, &production_workspace);
                     let value = survival_marginal_slope_vector_neglog(
                         q0,
                         q1,
@@ -2009,7 +2016,7 @@ mod tests {
 
         for (shape, covariance) in covariances.iter().enumerate() {
             for event in [0.0, 0.35, 1.0] {
-                let production = row_primary_closed_form_vector(
+                let production_value = row_primary_closed_form_vector_into(
                     -0.31,
                     0.47,
                     1.09,
@@ -2023,23 +2030,28 @@ mod tests {
                     &mut production_workspace,
                 )
                 .expect("production dynamic-boundary row");
+                let production = collect_workspace_row(production_value, &production_workspace);
                 let value = survival_marginal_slope_vector_neglog(
                     -0.31, 0.47, 1.09, &slopes, &scores, covariance, 1.17, event, 1.0e-8, 0.83,
                 )
                 .expect("zero-order dynamic-boundary row");
-                let dynamic = row_primary_closed_form_vector_dynamic(
-                    -0.31,
-                    0.47,
-                    1.09,
-                    &slopes,
-                    &scores,
-                    covariance,
-                    1.17,
-                    event,
-                    1.0e-8,
-                    0.83,
-                    &mut dynamic_arena,
-                )
+                let dynamic = collect_row_into(DIM, |gradient, hessian| {
+                    row_primary_closed_form_vector_dynamic_into(
+                        -0.31,
+                        0.47,
+                        1.09,
+                        &slopes,
+                        &scores,
+                        covariance,
+                        1.17,
+                        event,
+                        1.0e-8,
+                        0.83,
+                        &mut dynamic_arena,
+                        gradient,
+                        hessian,
+                    )
+                })
                 .expect("direct dynamic-boundary row");
                 let hand = vector_hand_oracle_tests::row_primary_closed_form_vector_hand_reference(
                     -0.31, 0.47, 1.09, &slopes, &scores, covariance, 1.17, event, 1.0e-8, 0.83,
@@ -2097,7 +2109,7 @@ mod tests {
 
         let mut workspace = RigidVectorRowWorkspace::new(3).expect("k=3 workspace");
         let covariance = MarginalSlopeCovariance::Diagonal(Array1::ones(2));
-        let error = row_primary_closed_form_vector(
+        let error = row_primary_closed_form_vector_into(
             -0.2,
             0.4,
             1.1,
@@ -2176,26 +2188,37 @@ mod tests {
                             .expect("packed production workspace");
                         let mut graph_workspace = Order2GraphWorkspace::new();
                         let mut dynamic_arena = DynamicJetArena::new();
+                        let mut fixed_gradient = [0.0; $dim];
+                        let mut fixed_hessian = [0.0; $dim * $dim];
+                        let mut graph_gradient = [0.0; $dim];
+                        let mut graph_hessian = [0.0; $dim * $dim];
+                        let mut dynamic_gradient = [0.0; $dim];
+                        let mut dynamic_hessian = [0.0; $dim * $dim];
                         let evaluate_production = |workspace: &mut RigidVectorRowWorkspace| {
-                            row_primary_closed_form_vector(
+                            let value = row_primary_closed_form_vector_into(
                                 -0.28, 0.53, 1.18, &slopes, &scores, covariance, 1.21, event,
                                 1.0e-8, 0.87, workspace,
                             )
-                            .expect("packed production width")
+                            .expect("packed production width");
+                            let derivatives = workspace.derivatives();
+                            black_box(derivatives);
+                            value
                         };
                         black_box(evaluate_production(&mut workspace));
 
                         let production_ns =
                             best_ns(5_000, || evaluate_production(&mut workspace));
                         let fixed_ns = best_ns(5_000, || {
-                            row_primary_closed_form_vector_fixed::<$dim>(
+                            let value = row_primary_closed_form_vector_fixed_into::<$dim>(
                                 -0.28, 0.53, 1.18, &slopes, &scores, covariance, 1.21, event,
-                                1.0e-8, 0.87,
+                                1.0e-8, 0.87, &mut fixed_gradient, &mut fixed_hessian,
                             )
-                            .expect("direct fixed width")
+                            .expect("direct fixed width");
+                            black_box((&fixed_gradient, &fixed_hessian));
+                            value
                         });
                         let graph_ns = best_ns(5_000, || {
-                            row_primary_closed_form_vector_graph::<$dim>(
+                            let value = row_primary_closed_form_vector_graph_into::<$dim>(
                                 -0.28,
                                 0.53,
                                 1.18,
@@ -2207,11 +2230,15 @@ mod tests {
                                 1.0e-8,
                                 0.87,
                                 &mut graph_workspace,
+                                &mut graph_gradient,
+                                &mut graph_hessian,
                             )
-                            .expect("direct graph width")
+                            .expect("direct graph width");
+                            black_box((&graph_gradient, &graph_hessian));
+                            value
                         });
                         let dynamic_ns = best_ns(5_000, || {
-                            row_primary_closed_form_vector_dynamic(
+                            let value = row_primary_closed_form_vector_dynamic_into(
                                 -0.28,
                                 0.53,
                                 1.18,
@@ -2223,8 +2250,12 @@ mod tests {
                                 1.0e-8,
                                 0.87,
                                 &mut dynamic_arena,
+                                &mut dynamic_gradient,
+                                &mut dynamic_hessian,
                             )
-                            .expect("direct dynamic width")
+                            .expect("direct dynamic width");
+                            black_box((&dynamic_gradient, &dynamic_hessian));
+                            value
                         });
                         let hand_ns = best_ns(5_000, || {
                             vector_hand_oracle_tests::row_primary_closed_form_vector_hand_reference(

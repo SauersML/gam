@@ -168,9 +168,7 @@ struct ArrayHessianSink<'a, const K: usize>(&'a mut [[f64; K]; K]);
 impl<const K: usize> HessianSink<K> for ArrayHessianSink<'_, K> {
     #[inline(always)]
     fn reset(&mut self) {
-        for row in &mut *self.0 {
-            row.fill(0.0);
-        }
+        // `into_order2` is the sole constructor and supplies `Tower2::zero()`.
     }
 
     #[inline(always)]
@@ -537,8 +535,7 @@ impl<'arena, const K: usize> Order2Graph<'arena, K> {
             "compiled graph Hessian width mismatch"
         );
         let mut hessian = RowMajorHessianSink::<K>(hessian_row_major);
-        self.workspace
-            .lower_into(self.node, gradient, &mut hessian)
+        self.workspace.lower_into(self.node, gradient, &mut hessian)
     }
 
     #[inline(always)]
