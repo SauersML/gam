@@ -1256,8 +1256,7 @@ mod tests {
     }
 
     fn wrap_signed_angle(angle: f64) -> f64 {
-        (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
-            - std::f64::consts::PI
+        (angle + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
     }
 
     #[test]
@@ -1478,16 +1477,10 @@ mod tests {
         let cycle = &base.cycles()[0];
         let plugin_standard_error = cycle.standard_error.unwrap();
         assert!(plugin_standard_error > 0.0);
-        let perturbation_sd = base.patch_summaries()[0]
-            .projector_variance_scale()
-            .sqrt();
-        let gaussian_boundary = cycle_rejection_boundary(
-            plugin_standard_error,
-            0.0,
-            0.0,
-            cycle.gaussian_error_budget,
-        )
-        .unwrap();
+        let perturbation_sd = base.patch_summaries()[0].projector_variance_scale().sqrt();
+        let gaussian_boundary =
+            cycle_rejection_boundary(plugin_standard_error, 0.0, 0.0, cycle.gaussian_error_budget)
+                .unwrap();
 
         let mut gaussian = DeterministicGaussian::new(0x2311_0001);
         let mut sum = 0.0;
@@ -1508,16 +1501,16 @@ mod tests {
             rejections += usize::from(angle.abs() > gaussian_boundary);
         }
         let mean = sum / REPLICATES as f64;
-        let empirical_sd =
-            (sum_squares / REPLICATES as f64 - mean * mean).max(0.0).sqrt();
+        let empirical_sd = (sum_squares / REPLICATES as f64 - mean * mean)
+            .max(0.0)
+            .sqrt();
         assert!(
             (empirical_sd / plugin_standard_error - 1.0).abs() <= 0.15,
             "plugin sd={plugin_standard_error:.6e}, independent Monte-Carlo sd={empirical_sd:.6e}"
         );
         let rejection_rate = rejections as f64 / REPLICATES as f64;
         let nominal = cycle.gaussian_error_budget;
-        let binomial_standard_error =
-            (nominal * (1.0 - nominal) / REPLICATES as f64).sqrt();
+        let binomial_standard_error = (nominal * (1.0 - nominal) / REPLICATES as f64).sqrt();
         assert!(
             (rejection_rate - nominal).abs() <= 5.0 * binomial_standard_error,
             "nominal={nominal:.6}, empirical rejection={rejection_rate:.6}"
@@ -1533,15 +1526,13 @@ mod tests {
         let critical = boundary / standard_error;
         let noncentrality = 3.0;
         let normal = Normal::new(0.0, 1.0).unwrap();
-        let expected_power = 1.0 - normal.cdf(critical - noncentrality)
-            + normal.cdf(-critical - noncentrality);
+        let expected_power =
+            1.0 - normal.cdf(critical - noncentrality) + normal.cdf(-critical - noncentrality);
         let mut gaussian = DeterministicGaussian::new(0x2311_0002);
         let mut null_rejections = 0usize;
         let mut alternative_rejections = 0usize;
         for _ in 0..REPLICATES {
-            null_rejections += usize::from(
-                (standard_error * gaussian.normal()).abs() > boundary,
-            );
+            null_rejections += usize::from((standard_error * gaussian.normal()).abs() > boundary);
             alternative_rejections += usize::from(
                 (standard_error * (noncentrality + gaussian.normal())).abs() > boundary,
             );
@@ -1549,8 +1540,7 @@ mod tests {
         let null_rate = null_rejections as f64 / REPLICATES as f64;
         let power = alternative_rejections as f64 / REPLICATES as f64;
         let null_mc_se = (alpha * (1.0 - alpha) / REPLICATES as f64).sqrt();
-        let power_mc_se =
-            (expected_power * (1.0 - expected_power) / REPLICATES as f64).sqrt();
+        let power_mc_se = (expected_power * (1.0 - expected_power) / REPLICATES as f64).sqrt();
         assert!((null_rate - alpha).abs() <= 5.0 * null_mc_se);
         assert!((power - expected_power).abs() <= 5.0 * power_mc_se);
         assert!(power > null_rate);
@@ -1796,15 +1786,12 @@ mod tests {
                 Some(confidence.misround_probability_bound)
             );
             assert!(confidence.misround_probability_bound <= requested_alpha);
-            wrong += usize::from(
-                confidence.decision.certified_value().copied() != Some(true_chi),
-            );
+            wrong += usize::from(confidence.decision.certified_value().copied() != Some(true_chi));
         }
         let observed = wrong as f64 / REPLICATES as f64;
-        let binomial_standard_error = (target_misround_probability
-            * (1.0 - target_misround_probability)
-            / REPLICATES as f64)
-            .sqrt();
+        let binomial_standard_error =
+            (target_misround_probability * (1.0 - target_misround_probability) / REPLICATES as f64)
+                .sqrt();
         assert!(
             (observed - target_misround_probability).abs() <= 5.0 * binomial_standard_error,
             "declared misround={target_misround_probability:.6}, observed={observed:.6}"
@@ -2336,10 +2323,7 @@ fn edge_step_matrix(edge: &EdgeWork, forward: bool) -> Option<Array2<f64>> {
     })
 }
 
-fn gaussian_two_sided_radius(
-    standard_error: f64,
-    error_probability: f64,
-) -> Result<f64, String> {
+fn gaussian_two_sided_radius(standard_error: f64, error_probability: f64) -> Result<f64, String> {
     let normal = Normal::new(0.0, 1.0)
         .map_err(|error| format!("standard-normal construction failed: {error}"))?;
     Ok(normal.inverse_cdf(1.0 - error_probability / 2.0) * standard_error)
@@ -2351,11 +2335,11 @@ fn cycle_rejection_boundary(
     geometric_remainder_bound: f64,
     gaussian_error_budget: f64,
 ) -> Result<f64, String> {
-    Ok(gaussian_two_sided_radius(
-        standard_error,
-        gaussian_error_budget,
-    )? + polar_linearization_remainder_bound
-        + geometric_remainder_bound)
+    Ok(
+        gaussian_two_sided_radius(standard_error, gaussian_error_budget)?
+            + polar_linearization_remainder_bound
+            + geometric_remainder_bound,
+    )
 }
 
 fn analyze_cycle(
@@ -2821,8 +2805,7 @@ fn gauss_bonnet_confidence(
         } else {
             let normal = Normal::new(0.0, 1.0)
                 .map_err(|error| format!("standard-normal construction failed: {error}"))?;
-            (2.0 * (1.0 - normal.cdf(stochastic_rounding_margin / standard_error)))
-                .clamp(0.0, 1.0)
+            (2.0 * (1.0 - normal.cdf(stochastic_rounding_margin / standard_error))).clamp(0.0, 1.0)
         };
         if probability <= allocated_alpha {
             (

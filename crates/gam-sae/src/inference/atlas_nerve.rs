@@ -1041,11 +1041,13 @@ mod tests {
     use crate::chart_transfer::certify_square_transfer;
     use crate::inference::atlas_holonomy::{
         AtlasFamilywiseLevel, AtlasHolonomyCertificate, AtlasHolonomyEdgeId, AtlasSignedEdge,
-        AtlasStatisticalDecision, ExactAnalyticHolonomyCertificate, GaussianPatchCentering,
-        GaussianPcaPatch, GaussianPcaPopulationBounds, ProjectedAtlasEdgeSpec,
+        AtlasStatisticalDecision, ExactAnalyticHolonomyCertificate, GaussBonnetContribution,
+        GaussBonnetInput, GaussBonnetNoiseSource, GaussBonnetSourceGradient,
+        GaussianPatchCentering, GaussianPcaPatch, GaussianPcaPopulationBounds,
+        ProjectedAtlasEdgeSpec,
     };
     use crate::manifold::{AtlasOrientability, GraphCompressionKind};
-    use ndarray::{Array2, arr2};
+    use ndarray::{Array2, arr2, array};
     use std::collections::BTreeSet;
 
     fn charts_from_faces(n_charts: usize, faces: &[Vec<usize>]) -> Vec<AtlasChart> {
@@ -1196,6 +1198,67 @@ mod tests {
         .unwrap()
     }
 
+    fn confident_gaussian_certificate(
+        n_charts: usize,
+        maximal_intersections: &[Vec<usize>],
+        euler_characteristic: i64,
+    ) -> AtlasHolonomyCertificate {
+        let projection_frame = arr2(&[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        let tangent_coordinates = arr2(&[[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]);
+        let bounds = GaussianPcaPopulationBounds::new(0.01, 2.0, 1.0).unwrap();
+        let patches = (0..n_charts)
+            .map(|chart| {
+                GaussianPcaPatch::new(
+                    chart,
+                    1_000_000,
+                    1_000_000,
+                    GaussianPatchCentering::MeanEstimatedOnInferenceRows,
+                    projection_frame.clone(),
+                    tangent_coordinates.clone(),
+                    0.01,
+                    1.0,
+                    bounds,
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut pairs = BTreeSet::new();
+        for intersection in maximal_intersections {
+            for left in 0..intersection.len() {
+                for right in (left + 1)..intersection.len() {
+                    pairs.insert((
+                        intersection[left].min(intersection[right]),
+                        intersection[left].max(intersection[right]),
+                    ));
+                }
+            }
+        }
+        let edge_specs = pairs
+            .into_iter()
+            .map(|(a, b)| ProjectedAtlasEdgeSpec::new(a, b, 0, 0.0).unwrap())
+            .collect();
+        let gauss_bonnet = GaussBonnetInput::new(
+            vec![GaussBonnetNoiseSource::new(0, arr2(&[[0.0]])).unwrap()],
+            vec![
+                GaussBonnetContribution::new(
+                    std::f64::consts::TAU * euler_characteristic as f64,
+                    0.0,
+                    0.0,
+                    vec![GaussBonnetSourceGradient::new(0, array![1.0]).unwrap()],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        AtlasHolonomyCertificate::gaussian_pca(
+            patches,
+            edge_specs,
+            AtlasFamilywiseLevel::new(0.01).unwrap(),
+            Some(gauss_bonnet),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn charts_tiling_synthetic_sphere_have_h2() {
         let faces = vec![vec![0, 1, 2], vec![0, 1, 3], vec![0, 2, 3], vec![1, 2, 3]];
@@ -1227,6 +1290,46 @@ mod tests {
             certified.certified_compression().kind,
             GraphCompressionKind::Sphere,
             "even the sphere name requires an authoritative orientability certificate"
+        );
+    }
+
+    #[test]
+    fn noisy_sphere_promotion_requires_agreeing_integer_curvature_confidence() {
+        let faces = vec![vec![0, 1, 2], vec![0, 1, 3], vec![0, 2, 3], vec![1, 2, 3]];
+        let charts = charts_from_faces(4, &faces);
+        let gates = all_valid_pair_gates(4);
+        let cover = good_cover_certificate(4, &faces);
+
+        let agreeing = build_atlas_nerve(
+            &charts,
+            &gates,
+            Some(&cover),
+            Some(confident_gaussian_certificate(4, &faces, 2)),
+        )
+        .unwrap();
+        assert_eq!(
+            agreeing
+                .certified_gauss_bonnet_euler_characteristic()
+                .unwrap()
+                .value(),
+            2
+        );
+        assert_eq!(
+            agreeing.certified_compression().kind,
+            GraphCompressionKind::Sphere
+        );
+
+        let disagreeing = build_atlas_nerve(
+            &charts,
+            &gates,
+            Some(&cover),
+            Some(confident_gaussian_certificate(4, &faces, 1)),
+        )
+        .unwrap();
+        assert_eq!(
+            disagreeing.certified_compression().kind,
+            GraphCompressionKind::Graph,
+            "a confident but contradictory curvature integer must block promotion"
         );
     }
 
