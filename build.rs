@@ -4806,8 +4806,7 @@ fn is_row_kernel_declaration(declaration: &str) -> bool {
         return false;
     };
     let implemented_trait = implemented_trait.trim();
-    implemented_trait.starts_with("RowKernel<")
-        || implemented_trait.contains("::RowKernel<")
+    implemented_trait.starts_with("RowKernel<") || implemented_trait.contains("::RowKernel<")
 }
 
 fn generated_derivative_modes(declaration: &str) -> Option<(bool, bool)> {
