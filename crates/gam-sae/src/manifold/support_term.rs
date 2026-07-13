@@ -9,6 +9,8 @@
 use crate::assignment::AssignmentMode;
 use crate::assignment_state::SaeAssignmentState;
 use ndarray::{Array1, Array2, ArrayView2};
+use std::ops::Range;
+use std::sync::Arc;
 
 use super::*;
 
@@ -42,6 +44,118 @@ struct ActiveAtomEval {
     decoded: Array1<f64>,
     /// Coordinate-major decoded jet, `(d_k, P)`.
     jacobian: Array2<f64>,
+}
+
+#[derive(Clone)]
+struct SupportBasisBlock {
+    beta_offset: usize,
+    phi: Array1<f64>,
+}
+
+#[derive(Clone)]
+struct SupportLinearizedRow {
+    blocks: Vec<SupportBasisBlock>,
+    jacobian: Array2<f64>,
+}
+
+#[derive(Clone)]
+struct SupportBetaOperator {
+    rows: Vec<SupportLinearizedRow>,
+    beta_offsets: Vec<usize>,
+    basis_sizes: Vec<usize>,
+    penalties: Vec<Array2<f64>>,
+    lambda_smooth: Vec<f64>,
+    output_dim: usize,
+    beta_dim: usize,
+}
+
+impl SupportBetaOperator {
+    fn apply(&self, vector: ndarray::ArrayView1<'_, f64>, out: &mut Array1<f64>) {
+        debug_assert_eq!(vector.len(), self.beta_dim);
+        debug_assert_eq!(out.len(), self.beta_dim);
+        out.fill(0.0);
+        let mut output = vec![0.0; self.output_dim];
+        for row in &self.rows {
+            output.fill(0.0);
+            for block in &row.blocks {
+                for basis in 0..block.phi.len() {
+                    let base = block.beta_offset + basis * self.output_dim;
+                    for channel in 0..self.output_dim {
+                        output[channel] += block.phi[basis] * vector[base + channel];
+                    }
+                }
+            }
+            for block in &row.blocks {
+                for basis in 0..block.phi.len() {
+                    let base = block.beta_offset + basis * self.output_dim;
+                    for channel in 0..self.output_dim {
+                        out[base + channel] += block.phi[basis] * output[channel];
+                    }
+                }
+            }
+        }
+        for atom in 0..self.penalties.len() {
+            let lambda = self.lambda_smooth[atom];
+            let m = self.basis_sizes[atom];
+            let offset = self.beta_offsets[atom];
+            for left in 0..m {
+                for right in 0..m {
+                    let weight = lambda * self.penalties[atom][[left, right]];
+                    for channel in 0..self.output_dim {
+                        out[offset + left * self.output_dim + channel] +=
+                            weight * vector[offset + right * self.output_dim + channel];
+                    }
+                }
+            }
+        }
+    }
+
+    fn htbeta_forward(
+        &self,
+        row: usize,
+        vector: ndarray::ArrayView1<'_, f64>,
+        out: &mut Array1<f64>,
+    ) {
+        let linearized = &self.rows[row];
+        let mut output = vec![0.0; self.output_dim];
+        for block in &linearized.blocks {
+            for basis in 0..block.phi.len() {
+                let base = block.beta_offset + basis * self.output_dim;
+                for channel in 0..self.output_dim {
+                    output[channel] += block.phi[basis] * vector[base + channel];
+                }
+            }
+        }
+        out.fill(0.0);
+        for axis in 0..linearized.jacobian.nrows() {
+            for channel in 0..self.output_dim {
+                out[axis] += linearized.jacobian[[axis, channel]] * output[channel];
+            }
+        }
+    }
+
+    fn htbeta_transpose(
+        &self,
+        row: usize,
+        vector: ndarray::ArrayView1<'_, f64>,
+        out: &mut Array1<f64>,
+    ) {
+        let linearized = &self.rows[row];
+        let mut output = vec![0.0; self.output_dim];
+        for axis in 0..linearized.jacobian.nrows() {
+            for channel in 0..self.output_dim {
+                output[channel] += linearized.jacobian[[axis, channel]] * vector[axis];
+            }
+        }
+        for block in &linearized.blocks {
+            for basis in 0..block.phi.len() {
+                let base = block.beta_offset + basis * self.output_dim;
+                for channel in 0..self.output_dim {
+                    out[base + channel] += block.phi[basis] * output[channel];
+                }
+            }
+        }
+    }
 }
 
 /// One hard-TopK curved model with no dense assignment specialization.
@@ -134,6 +248,182 @@ impl SaeSupportSparseTerm {
 
     pub fn active_pair_count(&self) -> usize {
         self.atom_rows.iter().map(Vec::len).sum()
+    }
+
+    fn beta_layout(&self) -> Result<(Vec<usize>, usize), String> {
+        let mut offsets = Vec::with_capacity(self.k_atoms());
+        let mut cursor = 0usize;
+        for atom in &self.atoms {
+            offsets.push(cursor);
+            cursor = cursor
+                .checked_add(
+                    atom.basis_size()
+                        .checked_mul(self.output_dim)
+                        .ok_or_else(|| "SaeSupportSparseTerm: beta block width overflow".to_string())?,
+                )
+                .ok_or_else(|| "SaeSupportSparseTerm: beta dimension overflow".to_string())?;
+        }
+        Ok((offsets, cursor))
+    }
+
+    /// Assemble the exact support-row Gauss-Newton Arrow system. `H_bb` and
+    /// every `H_tb` row are installed as sparse matvec/adjoint operators; the
+    /// only resident row matrices are `q_i×q_i`, with
+    /// `q_i = sum_{k in S_i} d_k`.
+    pub fn assemble_arrow_schur(
+        &self,
+        target: ArrayView2<'_, f64>,
+        lambda_smooth: &[f64],
+        ard_precisions: &[Vec<f64>],
+    ) -> Result<ArrowSchurSystem, String> {
+        if target.dim() != (self.n_obs(), self.output_dim) {
+            return Err(format!(
+                "SaeSupportSparseTerm::assemble_arrow_schur: target {:?} != ({}, {})",
+                target.dim(), self.n_obs(), self.output_dim
+            ));
+        }
+        self.validate_smoothing(lambda_smooth)?;
+        if ard_precisions.len() != self.k_atoms() {
+            return Err(format!(
+                "SaeSupportSparseTerm::assemble_arrow_schur: ARD blocks {} != K={}",
+                ard_precisions.len(), self.k_atoms()
+            ));
+        }
+        for (atom, values) in ard_precisions.iter().enumerate() {
+            if values.len() != self.assignment.atom_coord_dim(atom)
+                || values.iter().any(|value| !value.is_finite() || *value <= 0.0)
+            {
+                return Err(format!(
+                    "SaeSupportSparseTerm::assemble_arrow_schur: atom {atom} ARD must contain {} finite positive precisions",
+                    self.assignment.atom_coord_dim(atom)
+                ));
+            }
+        }
+        let (beta_offsets, beta_dim) = self.beta_layout()?;
+        let per_row_dims = (0..self.n_obs())
+            .map(|row| self.assignment.coords_row(row).len())
+            .collect::<Vec<_>>();
+        let mut system = ArrowSchurSystem::new_with_per_row_dims_empty_hbb_and_htbeta_cols(
+            per_row_dims,
+            beta_dim,
+            0,
+        );
+        let mut linearized_rows = Vec::with_capacity(self.n_obs());
+        let mut hbb_diag = Array1::<f64>::zeros(beta_dim);
+        for row in 0..self.n_obs() {
+            let q = self.assignment.coords_row(row).len();
+            let mut fitted = Array1::<f64>::zeros(self.output_dim);
+            let mut jacobian = Array2::<f64>::zeros((q, self.output_dim));
+            let mut blocks = Vec::with_capacity(self.assignment.support_indices(row).len());
+            let mut cursor = 0usize;
+            for slot in 0..self.assignment.support_indices(row).len() {
+                let atom_idx = self.assignment.support_indices(row)[slot] as usize;
+                let active = self.evaluate_active(row, slot)?;
+                fitted += &active.decoded;
+                for axis in 0..active.jacobian.nrows() {
+                    jacobian
+                        .row_mut(cursor + axis)
+                        .assign(&active.jacobian.row(axis));
+                }
+                for basis in 0..active.phi.len() {
+                    let base = beta_offsets[atom_idx] + basis * self.output_dim;
+                    for channel in 0..self.output_dim {
+                        hbb_diag[base + channel] += active.phi[basis] * active.phi[basis];
+                    }
+                }
+                blocks.push(SupportBasisBlock {
+                    beta_offset: beta_offsets[atom_idx],
+                    phi: active.phi,
+                });
+                cursor += active.jacobian.nrows();
+            }
+            let residual = &target.row(row) - &fitted;
+            system.rows[row].htt.assign(&jacobian.dot(&jacobian.t()));
+            system.rows[row].gt.assign(&(-jacobian.dot(&residual)));
+            let periods = self
+                .assignment
+                .support_indices(row)
+                .iter()
+                .flat_map(|&atom| self.assignment.atom_manifold(atom as usize).axis_periods())
+                .collect::<Vec<_>>();
+            let mut coord_cursor = 0usize;
+            for (slot, &atom) in self.assignment.support_indices(row).iter().enumerate() {
+                let atom = atom as usize;
+                for axis in 0..self.assignment.atom_coord_dim(atom) {
+                    let coordinate = self.assignment.coords_for_slot(row, slot)[axis];
+                    let prior = ArdAxisPrior::eval(
+                        ard_precisions[atom][axis],
+                        coordinate,
+                        periods[coord_cursor],
+                    );
+                    system.rows[row].gt[coord_cursor] += prior.grad;
+                    system.rows[row].htt[[coord_cursor, coord_cursor]] +=
+                        prior.psd_majorizer_hess();
+                    coord_cursor += 1;
+                }
+            }
+            for block in &blocks {
+                for basis in 0..block.phi.len() {
+                    let base = block.beta_offset + basis * self.output_dim;
+                    for channel in 0..self.output_dim {
+                        system.gb[base + channel] -= block.phi[basis] * residual[channel];
+                    }
+                }
+            }
+            linearized_rows.push(SupportLinearizedRow { blocks, jacobian });
+        }
+        for atom in 0..self.k_atoms() {
+            let m = self.atoms[atom].basis_size();
+            let lambda = lambda_smooth[atom];
+            let sb = self.atoms[atom]
+                .smooth_penalty
+                .dot(&self.atoms[atom].decoder_coefficients);
+            for basis in 0..m {
+                let base = beta_offsets[atom] + basis * self.output_dim;
+                for channel in 0..self.output_dim {
+                    system.gb[base + channel] += lambda * sb[[basis, channel]];
+                    hbb_diag[base + channel] +=
+                        lambda * self.atoms[atom].smooth_penalty[[basis, basis]];
+                }
+            }
+        }
+        let operator = Arc::new(SupportBetaOperator {
+            rows: linearized_rows,
+            beta_offsets: beta_offsets.clone(),
+            basis_sizes: self.atoms.iter().map(SaeManifoldAtom::basis_size).collect(),
+            penalties: self
+                .atoms
+                .iter()
+                .map(|atom| atom.smooth_penalty.clone())
+                .collect(),
+            lambda_smooth: lambda_smooth.to_vec(),
+            output_dim: self.output_dim,
+            beta_dim,
+        });
+        let shared = Arc::clone(&operator);
+        system.set_shared_beta_operator(
+            move |vector, out| shared.apply(vector, out),
+            hbb_diag,
+        );
+        let forward = Arc::clone(&operator);
+        let transpose = Arc::clone(&operator);
+        system.set_row_htbeta_operator(
+            move |row, vector, out| forward.htbeta_forward(row, vector, out),
+            move |row, vector, out| transpose.htbeta_transpose(row, vector, out),
+        );
+        let block_offsets: Arc<[Range<usize>]> = self
+            .atoms
+            .iter()
+            .enumerate()
+            .map(|(atom, template)| {
+                beta_offsets[atom]
+                    ..beta_offsets[atom] + template.basis_size() * self.output_dim
+            })
+            .collect::<Vec<_>>()
+            .into();
+        system.set_block_offsets(block_offsets);
+        system.refresh_row_hessian_fingerprint();
+        Ok(system)
     }
 
     fn evaluate_active(&self, row: usize, slot: usize) -> Result<ActiveAtomEval, String> {
