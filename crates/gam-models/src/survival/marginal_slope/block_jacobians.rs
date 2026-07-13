@@ -13,6 +13,8 @@ use gam_math::jet_scalar::SymmetricQuadraticCoefficients;
 /// - `qd1_i`: derivative probit argument (per-row, length n)
 /// - `slopes`: per-row physical log-slope vector `(n × K)`
 /// - `c_i`: `sqrt(1 + s² g_iᵀΣg_i)` (per-row, length n)
+/// - `timewiggle_primary_rows`: canonical channel-major q-gradient rows when
+///   the nonlinear timewiggle map is active
 /// - `s`: probit scale (scalar, = `probit_frailty_scale()`)
 pub struct SurvivalMarginalSlopeFamilyScalars {
     pub(crate) q0_i: Vec<f64>,
@@ -26,6 +28,42 @@ pub struct SurvivalMarginalSlopeFamilyScalars {
     /// from a block-local audit coefficient slice.
     pub(crate) timewiggle_primary_rows: Option<(Array2<f64>, Array2<f64>)>,
     pub(crate) s: f64,
+}
+
+fn scaled_channel_major_rows(
+    source: &Array2<f64>,
+    c_i: &[f64],
+    n: usize,
+    columns: usize,
+    rows: std::ops::Range<usize>,
+    label: &str,
+) -> Result<Array2<f64>, String> {
+    if c_i.len() != n {
+        return Err(format!(
+            "{label} c length {} does not match n={n}",
+            c_i.len(),
+        ));
+    }
+    if source.dim() != (3 * n, columns) {
+        return Err(format!(
+            "{label} primary rows are {}x{}, expected {}x{columns}",
+            source.nrows(),
+            source.ncols(),
+            3 * n,
+        ));
+    }
+    let chunk = rows.end - rows.start;
+    let mut jacobian = Array2::<f64>::zeros((3 * chunk, columns));
+    for row in rows.clone() {
+        let local_row = row - rows.start;
+        for channel in 0..3 {
+            for column in 0..columns {
+                jacobian[[channel * chunk + local_row, column]] =
+                    c_i[row] * source[[channel * n + row, column]];
+            }
+        }
+    }
+    Ok(jacobian)
 }
 
 impl SurvivalMarginalSlopeFamilyScalars {
@@ -551,6 +589,31 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
         let chunk = rows.end - rows.start;
         let p_base = p.saturating_sub(self.p_tw);
 
+        if let Some(values) = state
+            .family_scalars
+            .as_ref()
+            .map(|value| {
+                value
+                    .downcast_ref::<SurvivalMarginalSlopeFamilyScalars>()
+                    .ok_or_else(|| {
+                        "timewiggle time Jacobian received the wrong family-scalar type".to_string()
+                    })
+            })
+            .transpose()?
+        {
+            let (time_rows, _) = values.timewiggle_primary_rows.as_ref().ok_or_else(|| {
+                "timewiggle time Jacobian requires canonical current q-gradient rows".to_string()
+            })?;
+            return scaled_channel_major_rows(
+                time_rows,
+                &values.c_i,
+                n,
+                p,
+                rows,
+                "timewiggle time Jacobian",
+            );
+        }
+
         let beta = state.beta;
         // β_t = joint β[0 .. p_time]
         let beta_t = if beta.len() >= p { &beta[..p] } else { beta };
@@ -578,47 +641,6 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
             let e = (s + self.p_m).min(beta.len());
             if e > s { &beta[s..e] } else { &[][..] }
         };
-        let scalars = state
-            .family_scalars
-            .as_ref()
-            .map(|value| {
-                value
-                    .downcast_ref::<SurvivalMarginalSlopeFamilyScalars>()
-                    .ok_or_else(|| {
-                        "timewiggle time Jacobian received the wrong family-scalar type".to_string()
-                    })
-            })
-            .transpose()?;
-        if let Some(values) = scalars {
-            if values.c_i.len() != n {
-                return Err(format!(
-                    "timewiggle time Jacobian c length {} does not match n={n}",
-                    values.c_i.len(),
-                ));
-            }
-            let (time_rows, _) = values.timewiggle_primary_rows.as_ref().ok_or_else(|| {
-                "timewiggle time Jacobian requires canonical current q-gradient rows".to_string()
-            })?;
-            if time_rows.dim() != (3 * n, p) {
-                return Err(format!(
-                    "timewiggle time Jacobian primary rows are {}x{}, expected {}x{p}",
-                    time_rows.nrows(),
-                    time_rows.ncols(),
-                    3 * n,
-                ));
-            }
-            let mut jac = Array2::<f64>::zeros((3 * chunk, p));
-            for i in rows.clone() {
-                let local_i = i - rows.start;
-                for channel in 0..3 {
-                    for column in 0..p {
-                        jac[[channel * chunk + local_i, column]] =
-                            values.c_i[i] * time_rows[[channel * n + i, column]];
-                    }
-                }
-            }
-            return Ok(jac);
-        }
         if beta.iter().any(|&value| value != 0.0) {
             return Err(
                 "timewiggle time Jacobian requires current survival marginal-slope family scalars at nonzero beta"
@@ -793,6 +815,33 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacob
         let p_t = self.p_time;
         let p_base = p_t.saturating_sub(self.p_tw);
 
+        if let Some(values) = state
+            .family_scalars
+            .as_ref()
+            .map(|value| {
+                value
+                    .downcast_ref::<SurvivalMarginalSlopeFamilyScalars>()
+                    .ok_or_else(|| {
+                        "timewiggle marginal Jacobian received the wrong family-scalar type"
+                            .to_string()
+                    })
+            })
+            .transpose()?
+        {
+            let (_, marginal_rows) = values.timewiggle_primary_rows.as_ref().ok_or_else(|| {
+                "timewiggle marginal Jacobian requires canonical current q-gradient rows"
+                    .to_string()
+            })?;
+            return scaled_channel_major_rows(
+                marginal_rows,
+                &values.c_i,
+                n,
+                p_m,
+                rows,
+                "timewiggle marginal Jacobian",
+            );
+        }
+
         let beta = state.beta;
         let beta_t = if beta.len() >= p_t {
             &beta[..p_t]
@@ -810,50 +859,6 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacob
             let e = (s + p_m).min(beta.len());
             if e > s { &beta[s..e] } else { &[][..] }
         };
-        let scalars = state
-            .family_scalars
-            .as_ref()
-            .map(|value| {
-                value
-                    .downcast_ref::<SurvivalMarginalSlopeFamilyScalars>()
-                    .ok_or_else(|| {
-                        "timewiggle marginal Jacobian received the wrong family-scalar type"
-                            .to_string()
-                    })
-            })
-            .transpose()?;
-        if let Some(values) = scalars {
-            if values.c_i.len() != n {
-                return Err(format!(
-                    "timewiggle marginal Jacobian c length {} does not match n={n}",
-                    values.c_i.len(),
-                ));
-            }
-            let (_, marginal_rows) =
-                values.timewiggle_primary_rows.as_ref().ok_or_else(|| {
-                    "timewiggle marginal Jacobian requires canonical current q-gradient rows"
-                        .to_string()
-                })?;
-            if marginal_rows.dim() != (3 * n, p_m) {
-                return Err(format!(
-                    "timewiggle marginal Jacobian primary rows are {}x{}, expected {}x{p_m}",
-                    marginal_rows.nrows(),
-                    marginal_rows.ncols(),
-                    3 * n,
-                ));
-            }
-            let mut jac = Array2::<f64>::zeros((3 * chunk, p_m));
-            for i in rows.clone() {
-                let local_i = i - rows.start;
-                for channel in 0..3 {
-                    for column in 0..p_m {
-                        jac[[channel * chunk + local_i, column]] =
-                            values.c_i[i] * marginal_rows[[channel * n + i, column]];
-                    }
-                }
-            }
-            return Ok(jac);
-        }
         if beta.iter().any(|&value| value != 0.0) {
             return Err(
                 "timewiggle marginal Jacobian requires current survival marginal-slope family scalars at nonzero beta"
@@ -1029,6 +1034,116 @@ mod tests {
         ];
         for (actual, expected) in jacobian.iter().zip(expected.iter()) {
             assert!((actual - expected).abs() <= 1e-12, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn timewiggle_current_audit_uses_family_q_gradient_rows_932() {
+        let n = 2;
+        let p_time = 2;
+        let p_marginal = 1;
+        let time_rows = array![
+            [1.0, 2.0],
+            [3.0, 4.0],
+            [5.0, 6.0],
+            [7.0, 8.0],
+            [9.0, 10.0],
+            [11.0, 12.0],
+        ];
+        let marginal_rows = array![[13.0], [14.0], [15.0], [16.0], [17.0], [18.0]];
+        let covariance = MarginalSlopeCovariance::Diagonal(array![2.0]);
+        let scalars = SurvivalMarginalSlopeFamilyScalars::new(
+            vec![0.1, 0.2],
+            vec![0.3, 0.4],
+            vec![0.5, 0.6],
+            array![[0.5], [-0.25]],
+            Some((time_rows.clone(), marginal_rows.clone())),
+            0.8,
+            &covariance,
+        )
+        .unwrap();
+        let c_i = scalars.c_i.clone();
+        let scalars: Arc<dyn std::any::Any + Send + Sync> = Arc::new(scalars);
+
+        let design_time = Arc::new(Array2::<f64>::zeros((n, p_time)));
+        let design_marginal = Arc::new(Array2::<f64>::zeros((n, p_marginal)));
+        let offset = Arc::new(Array1::<f64>::zeros(n));
+        let knots = array![0.0, 0.0, 1.0, 1.0];
+        let time_callback = SmsTimewiggleTimeJacobian::new(
+            design_time.clone(),
+            design_time.clone(),
+            design_time.clone(),
+            design_marginal.clone(),
+            offset.clone(),
+            offset.clone(),
+            offset.clone(),
+            offset.clone(),
+            knots.clone(),
+            1,
+            1,
+            p_marginal,
+        );
+        let marginal_callback = SmsTimewiggleMarginalJacobian::new(
+            design_time.clone(),
+            design_time.clone(),
+            design_time,
+            design_marginal,
+            offset.clone(),
+            offset.clone(),
+            offset.clone(),
+            offset,
+            knots,
+            1,
+            p_time,
+            1,
+        );
+
+        // Each callback receives only its own block's nonzero coefficients.
+        // The exact current rows must therefore come from the family scalar
+        // snapshot, never from parsing this slice as a joint coefficient vector.
+        let time_beta = [7.0, -3.0];
+        let time_state = crate::custom_family::FamilyLinearizationState {
+            beta: &time_beta,
+            family_scalars: Some(scalars.clone()),
+            channel_hessian: None,
+            probit_frailty_scale: 0.8,
+        };
+        let marginal_beta = [11.0];
+        let marginal_state = crate::custom_family::FamilyLinearizationState {
+            beta: &marginal_beta,
+            family_scalars: Some(scalars),
+            channel_hessian: None,
+            probit_frailty_scale: 0.8,
+        };
+        let actual_time = crate::custom_family::BlockEffectiveJacobian::effective_jacobian_rows(
+            &time_callback,
+            &time_state,
+            0..n,
+        )
+        .unwrap();
+        let actual_marginal =
+            crate::custom_family::BlockEffectiveJacobian::effective_jacobian_rows(
+                &marginal_callback,
+                &marginal_state,
+                0..n,
+            )
+            .unwrap();
+
+        for row in 0..n {
+            for channel in 0..3 {
+                for column in 0..p_time {
+                    let index = channel * n + row;
+                    assert_eq!(
+                        actual_time[[index, column]],
+                        c_i[row] * time_rows[[index, column]]
+                    );
+                }
+                let index = channel * n + row;
+                assert_eq!(
+                    actual_marginal[[index, 0]],
+                    c_i[row] * marginal_rows[[index, 0]],
+                );
+            }
         }
     }
 }

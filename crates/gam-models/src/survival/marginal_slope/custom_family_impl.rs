@@ -198,8 +198,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                 for column in 0..p_marginal {
                     marginal_rows[[row, column]] = values.dq0_marginal[column];
                     marginal_rows[[self.n + row, column]] = values.dq1_marginal[column];
-                    marginal_rows[[2 * self.n + row, column]] =
-                        values.dqd1_marginal[column];
+                    marginal_rows[[2 * self.n + row, column]] = values.dqd1_marginal[column];
                 }
             }
             Some((time_rows, marginal_rows))
