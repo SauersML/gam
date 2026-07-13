@@ -1505,8 +1505,9 @@ fn sae_manifold_certify_external<'py>(
 
     out.set_item("chosen_k", k_atoms)?;
     out.set_item("oos_projection_top1", top_k == Some(1))?;
-    if let Some(json) = structure_search_json {
-        out.set_item("structure_search", json)?;
+    match structure_search_json {
+        Some(json) => out.set_item("structure_search", json)?,
+        None => out.set_item("structure_search", py.None())?,
     }
     match structure_certificate_json {
         Some(json) => out.set_item("structure_certificate", json)?,

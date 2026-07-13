@@ -2352,8 +2352,9 @@ fn sae_manifold_fit_inner<'py>(
     // whenever the structure search ran (it runs on every fit); the value is the
     // certificate of which dictionary moves the held-out data does and does not
     // support — an all-contested ledger is the common, conservative outcome.
-    if let Some(json) = structure_search_json {
-        out.set_item("structure_search", json)?;
+    match structure_search_json {
+        Some(json) => out.set_item("structure_search", json)?,
+        None => out.set_item("structure_search", py.None())?,
     }
     match structure_certificate_json {
         Some(json) => out.set_item("structure_certificate", json)?,
