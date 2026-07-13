@@ -1043,10 +1043,9 @@ mod tests {
         AtlasFamilywiseLevel, AtlasHolonomyCertificate, AtlasHolonomyEdgeId, AtlasSignedEdge,
         AtlasStatisticalDecision, ExactAnalyticHolonomyCertificate, GaussBonnetContribution,
         GaussBonnetInput, GaussBonnetNoiseSource, GaussBonnetSourceGradient,
-        GaussianPatchCentering, GaussianPatchRowSplit,
-        GaussianPcaErrorModel, GaussianPcaPatch, GaussianPcaPopulationBounds,
-        GaussianPcaSpectrumProvenance, PilotProjectionProvenance, PopulationCrossGramProvenance,
-        ProjectedAtlasEdgeSpec,
+        GaussianPatchCentering, GaussianPatchRowSplit, GaussianPcaErrorModel, GaussianPcaPatch,
+        GaussianPcaPopulationBounds, GaussianPcaSpectrumProvenance, PilotProjectionProvenance,
+        PopulationCrossGramProvenance, ProjectedAtlasEdgeSpec,
     };
     use crate::manifold::{AtlasOrientability, GraphCompressionKind};
     use ndarray::{Array2, arr2, array};

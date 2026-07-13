@@ -2238,6 +2238,8 @@ impl SaeManifoldTerm {
                     AtomTopology::Torus { latent_dim: d }
                 }
                 (SaeAtomBasisKind::Sphere, _) => AtomTopology::Sphere,
+                (SaeAtomBasisKind::ProjectivePlane, _) => AtomTopology::ProjectivePlane,
+                (SaeAtomBasisKind::KleinBottle, _) => AtomTopology::KleinBottle,
                 // `Cylinder` (`S¹ × ℝ`) has exactly one continuous gauge: the
                 // rotation (shift) of the periodic axis. The unbounded line axis
                 // carries no rotational gauge, and its translation is already

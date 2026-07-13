@@ -225,9 +225,21 @@ fn expected_betti_signature(
             b1: 2,
             b2: Some(1),
         }),
+        // Closed non-orientable surfaces are evaluated over F2, where the
+        // fundamental class survives in H2.
+        SaeAtomBasisKind::KleinBottle => Some(BettiSignature {
+            b0: 1,
+            b1: 2,
+            b2: Some(1),
+        }),
         SaeAtomBasisKind::Sphere => Some(BettiSignature {
             b0: 1,
             b1: 0,
+            b2: Some(1),
+        }),
+        SaeAtomBasisKind::ProjectivePlane => Some(BettiSignature {
+            b0: 1,
+            b1: 1,
             b2: Some(1),
         }),
         SaeAtomBasisKind::Linear

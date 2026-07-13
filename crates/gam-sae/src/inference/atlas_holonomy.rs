@@ -2916,14 +2916,14 @@ mod tests {
     ) -> GaussBonnetInput {
         let sources = vec![GaussBonnetNoiseSource::new(7, arr2(&[[1.0]])).unwrap()];
         let contributions = vec![
-                GaussBonnetContribution::new(
-                    std::f64::consts::TAU,
-                    remainder,
-                    0.0,
-                    vec![GaussBonnetSourceGradient::new(7, array![1.0]).unwrap()],
-                )
-                .unwrap(),
-            ];
+            GaussBonnetContribution::new(
+                std::f64::consts::TAU,
+                remainder,
+                0.0,
+                vec![GaussBonnetSourceGradient::new(7, array![1.0]).unwrap()],
+            )
+            .unwrap(),
+        ];
         match authority {
             GaussBonnetCovarianceAuthority::CertifiedIndependentGaussianSources => {
                 GaussBonnetInput::certified_independent_gaussian(sources, contributions).unwrap()

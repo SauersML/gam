@@ -446,6 +446,10 @@ fn ideal_curve_dim(kind: &SaeAtomBasisKind, latent_dim: usize, m: usize, p: usiz
         // Each periodic/circle factor spans a (sin, cos) 2-plane.
         SaeAtomBasisKind::Periodic => 2.0,
         SaeAtomBasisKind::Torus => 2.0 * d,
+        // Both quotient surfaces have their natural injective planted
+        // realizations in R4; charging them as a sphere or flat 2-plane would
+        // erase the code-savings geometry the topology race is meant to test.
+        SaeAtomBasisKind::ProjectivePlane | SaeAtomBasisKind::KleinBottle => 4.0,
         // S² embeds in ℝ³; higher-d spheres in ℝ^{d+1}.
         SaeAtomBasisKind::Sphere => d + 1.0,
         // S¹ × ℝ: a circle plane (2) tensored with a flat line (1).
@@ -477,6 +481,8 @@ fn topology_name(kind: &SaeAtomBasisKind) -> String {
         SaeAtomBasisKind::Periodic => "periodic".to_string(),
         SaeAtomBasisKind::Sphere => "sphere".to_string(),
         SaeAtomBasisKind::Torus => "torus".to_string(),
+        SaeAtomBasisKind::ProjectivePlane => "projective_plane".to_string(),
+        SaeAtomBasisKind::KleinBottle => "klein_bottle".to_string(),
         SaeAtomBasisKind::Cylinder => "cylinder".to_string(),
         SaeAtomBasisKind::Mobius => "mobius".to_string(),
         SaeAtomBasisKind::Linear => "linear".to_string(),
@@ -493,7 +499,15 @@ fn topology_name(kind: &SaeAtomBasisKind) -> String {
 fn topology_is_curved(topology: &str) -> bool {
     matches!(
         topology,
-        "periodic" | "sphere" | "torus" | "cylinder" | "mobius" | "poincare" | "duchon"
+        "periodic"
+            | "sphere"
+            | "torus"
+            | "projective_plane"
+            | "klein_bottle"
+            | "cylinder"
+            | "mobius"
+            | "poincare"
+            | "duchon"
     )
 }
 

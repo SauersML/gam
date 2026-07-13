@@ -916,6 +916,12 @@ pub(crate) fn family_jet_sups(
             let ev = SphereChartEvaluator;
             JetSups::from_family(&ev, chart)
         }
+        ProjectivePlane | KleinBottle => {
+            return Err(
+                "EncodeAtlas: quotient spectral jet sup requires a plan-native bound; route this atom through exact analytic encode"
+                    .to_string(),
+            );
+        }
         Cylinder => {
             // Cylinder width is `(2H+1)·(D+1)` with the canonical flat-axis
             // degree `D = SAE_CYLINDER_LINE_DEGREE` (the harvest convention).
@@ -4257,7 +4263,9 @@ pub(crate) fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Ar
     use crate::manifold::SaeAtomBasisKind::*;
     let d = atom.latent_dim;
     match &atom.basis_kind {
-        Periodic | Torus => regular_product_grid(d, resolution, 0.0, 1.0, false),
+        Periodic | Torus | KleinBottle => {
+            regular_product_grid(d, resolution, 0.0, 1.0, false)
+        }
         // Cylinder `S¹ × ℝ`: axis 0 is the periodic circle `[0, 1)` (no
         // endpoint, like the harmonic axes); axis 1 is the unbounded line,
         // covered by a strided unit box `[-0.5, 0.5]` about the origin (like the
@@ -4267,8 +4275,15 @@ pub(crate) fn chart_center_grid(atom: &SaeManifoldAtom, resolution: usize) -> Ar
         Cylinder => regular_product_grid(d, resolution, -0.5, 0.5, true),
         Mobius if d == 2 => mobius_chart_center_grid(resolution),
         Mobius => regular_product_grid(d, resolution, -1.0, 1.0, true),
-        Sphere if d == 2 => sphere_latlon_grid(resolution),
-        Linear | Sphere | Duchon | EuclideanPatch | Poincare | Precomputed(_) | FiniteSet => {
+        Sphere | ProjectivePlane if d == 2 => sphere_latlon_grid(resolution),
+        Linear
+        | Sphere
+        | ProjectivePlane
+        | Duchon
+        | EuclideanPatch
+        | Poincare
+        | Precomputed(_)
+        | FiniteSet => {
             // Unbounded / non-compact latents (and the finite-set index axis): a
             // strided cover of a unit box about the origin per axis. The certified
             // radius refines each chart; out-of-cover starts route to the exact
@@ -4403,7 +4418,9 @@ pub(crate) fn mobius_chart_center_grid(resolution: usize) -> Array2<f64> {
 pub(crate) fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) -> f64 {
     use crate::manifold::SaeAtomBasisKind::*;
     match &atom.basis_kind {
-        Periodic | Torus => 0.5 / (capped_per_axis(atom.latent_dim, resolution) as f64),
+        Periodic | Torus | KleinBottle => {
+            0.5 / (capped_per_axis(atom.latent_dim, resolution) as f64)
+        }
         // Must use the SAME capped per-axis count `sphere_latlon_grid` lays the
         // centers on: the coarsest tiling step is the longitude half-spacing `π/r`
         // with `r` the grid's per-axis count. Deriving the radius from the RAW
@@ -4414,7 +4431,7 @@ pub(crate) fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) ->
         // uses `SHAPE_BAND_MAX_POINTS.isqrt()` — the largest `r` with `r² ≤`
         // the band-point budget — so the two stay in lockstep if the budget moves
         // (a hardcoded `22` here silently desyncs the moment the budget changes).
-        Sphere => {
+        Sphere | ProjectivePlane => {
             let r_cap = SHAPE_BAND_MAX_POINTS.isqrt();
             std::f64::consts::PI / (resolution.max(2).min(r_cap) as f64)
         }
@@ -4464,8 +4481,18 @@ pub(crate) fn chart_region(
         }
         // Cylinder has no radial kernel block (it is a harmonic × polynomial
         // tensor, not a Duchon radial basis), so it needs no radial r_min/r_max.
-        Periodic | Sphere | Torus | Cylinder | Mobius | Linear | EuclideanPatch | Poincare
-        | Precomputed(_) | FiniteSet => region,
+        Periodic
+        | Sphere
+        | Torus
+        | ProjectivePlane
+        | KleinBottle
+        | Cylinder
+        | Mobius
+        | Linear
+        | EuclideanPatch
+        | Poincare
+        | Precomputed(_)
+        | FiniteSet => region,
     }
 }
 

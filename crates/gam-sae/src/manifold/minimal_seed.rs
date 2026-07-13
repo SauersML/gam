@@ -133,7 +133,7 @@ pub fn build_sae_minimal_seed(
         request.random_state,
         &overrides,
     )?;
-    let effective_atom_dim: Vec<usize> = plans.iter().map(|plan| plan.latent_dim).collect();
+    let effective_atom_dim: Vec<usize> = plans.iter().map(SaeAtomBuildPlan::latent_dim).collect();
 
     let coords_are_cold = request.initial_coords.is_none();
     let mut start_coords = match request.initial_coords {
@@ -171,7 +171,7 @@ pub fn build_sae_minimal_seed(
     {
         let labels = sae_output_energy_cluster_labels(request.target, k_atoms);
         let plan_kinds: Vec<SaeAtomBasisKind> =
-            plans.iter().map(|plan| plan.kind.clone()).collect();
+            plans.iter().map(|plan| plan.kind().clone()).collect();
         sae_refine_periodic_seed_coords_by_cluster(
             request.target,
             &plan_kinds,

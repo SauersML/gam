@@ -1073,9 +1073,8 @@ fn gaussian_holonomy_analysis_dict<'py>(
     analysis: &gam::terms::sae::inference::atlas_holonomy::GaussianPcaHolonomyAnalysis,
 ) -> PyResult<(Bound<'py, PyDict>, Vec<&'static str>, bool)> {
     use gam::terms::sae::inference::atlas_holonomy::{
-        AtlasCycleAsymptoticRegime, CrossPatchCovarianceProvenance, GaussianPcaCovarianceAuthority,
-        GaussianPcaSpectrumProvenance, GaussBonnetCovarianceAuthority,
-        PilotProjectionProvenance,
+        AtlasCycleAsymptoticRegime, CrossPatchCovarianceProvenance, GaussBonnetCovarianceAuthority,
+        GaussianPcaCovarianceAuthority, GaussianPcaSpectrumProvenance, PilotProjectionProvenance,
     };
     let out = PyDict::new(py);
     out.set_item("familywise_alpha", analysis.familywise_level().alpha())?;

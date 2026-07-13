@@ -2562,9 +2562,9 @@ fn compact_glued_atoms(
                 && transition.sign == -1
                 && matches!(transition.seam_kind, AtlasSeamKind::Regular) => {}
             (CertifiedGlueTransition::Sphere(transition), ChartGlueOutcome::RegisterAtlas)
-                if transition.from_chart == b
-                    && transition.to_chart == a
-                    && matches!(transition.seam_kind, AtlasSeamKind::Pole) => {}
+                if transition.from_chart() == b
+                    && transition.to_chart() == a
+                    && matches!(transition.seam_kind(), AtlasSeamKind::Pole) => {}
             _ => {
                 return Err(format!(
                     "compact_glued_atoms: accepted glue ({a},{b}) is incompatible with its certified transition"
