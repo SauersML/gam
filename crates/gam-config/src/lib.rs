@@ -3,7 +3,7 @@ use gam_inference::model::GroupMetadata;
 use gam_models::fit_orchestration::descriptors::build_analytic_penalty_registry_from_descriptors;
 use gam_models::fit_orchestration::{CtnStage1Recipe, FitConfig};
 use gam_models::survival::location_scale::residual_distribution_inverse_link;
-use gam_models::survival::lognormal_kernel::{FrailtySpec, HazardLoading};
+use gam_models::survival::lognormal_kernel::{FrailtyScale, FrailtySpec, HazardLoading};
 use gam_models::survival::parse_survival_distribution;
 use gam_models::survival::parse_survival_likelihood_mode;
 use gam_models::transformation_normal::TransformationNormalConfig;
@@ -33,6 +33,10 @@ pub enum CliHazardLoading {
     Full,
     LoadedVsUnloaded,
 }
+
+const DEFAULT_LEARNED_FRAILTY_SCALE: FrailtyScale = FrailtyScale::Learned {
+    initial_sigma: 0.5,
+};
 
 impl CtnStage1Document {
     fn into_recipe(self) -> Result<CtnStage1Recipe, String> {
@@ -261,16 +265,16 @@ pub fn resolve_cli_frailty_spec(
     hazard_loading: Option<CliHazardLoading>,
     context: &str,
 ) -> Result<FrailtySpec, String> {
-    let validate_sigma = || -> Result<Option<f64>, String> {
+    let resolve_scale = || -> Result<FrailtyScale, String> {
         match frailty_sd {
-            None => Ok(None),
+            None => Ok(DEFAULT_LEARNED_FRAILTY_SCALE),
             Some(sigma) => {
                 if !sigma.is_finite() || sigma < 0.0 {
                     return Err(format!(
                         "{context} requires a finite --frailty-sd >= 0, got {sigma}"
                     ));
                 }
-                Ok(Some(sigma))
+                Ok(FrailtyScale::Fixed { sigma })
             }
         }
     };
@@ -291,11 +295,11 @@ pub fn resolve_cli_frailty_spec(
                 ));
             }
             Ok(FrailtySpec::GaussianShift {
-                sigma_fixed: validate_sigma()?,
+                scale: resolve_scale()?,
             })
         }
         Some(CliFrailtyKind::HazardMultiplier) => Ok(FrailtySpec::HazardMultiplier {
-            sigma_fixed: validate_sigma()?,
+            scale: resolve_scale()?,
             loading: hazard_loading.map(cli_hazard_loading).ok_or_else(|| {
                 format!("{context} requires --hazard-loading with --frailty-kind hazard-multiplier")
             })?,
@@ -524,13 +528,15 @@ fn parse_json_frailty_spec(
 ) -> Result<FrailtySpec, String> {
     if let Some(kind) = frailty_kind {
         let trimmed = kind.trim().to_ascii_lowercase();
-        let sigma = frailty_sd;
+        let scale = frailty_sd
+            .map(|sigma| FrailtyScale::Fixed { sigma })
+            .unwrap_or(DEFAULT_LEARNED_FRAILTY_SCALE);
         let hazard_loading = hazard_loading
             .as_ref()
             .map(|raw| raw.trim().to_ascii_lowercase());
         let frailty = match trimmed.as_str() {
             "none" | "" => {
-                if sigma.is_some() || hazard_loading.is_some() {
+                if frailty_sd.is_some() || hazard_loading.is_some() {
                     return Err(
                         "frailty_kind='none' does not accept frailty_sd or hazard_loading"
                             .to_string(),
@@ -549,7 +555,7 @@ fn parse_json_frailty_spec(
                     }
                 };
                 FrailtySpec::HazardMultiplier {
-                    sigma_fixed: sigma,
+                    scale,
                     loading,
                 }
             }
@@ -560,7 +566,7 @@ fn parse_json_frailty_spec(
                             .to_string(),
                     );
                 }
-                FrailtySpec::GaussianShift { sigma_fixed: sigma }
+                FrailtySpec::GaussianShift { scale }
             }
             other => {
                 return Err(format!(
@@ -568,6 +574,7 @@ fn parse_json_frailty_spec(
                 ));
             }
         };
+        frailty.validate().map_err(|err| err.to_string())?;
         Ok(frailty)
     } else if frailty_sd.is_some() || hazard_loading.is_some() {
         Err("frailty_kind is required when frailty_sd or hazard_loading is provided".to_string())
@@ -906,7 +913,7 @@ mod tests {
                 cli: {
                     let mut input = base_cli();
                     input.frailty = FrailtySpec::HazardMultiplier {
-                        sigma_fixed: Some(0.35),
+                        scale: FrailtyScale::Fixed { sigma: 0.35 },
                         loading: HazardLoading::LoadedVsUnloaded,
                     };
                     input
@@ -922,7 +929,7 @@ mod tests {
                 cli: {
                     let mut input = base_cli();
                     input.frailty = FrailtySpec::GaussianShift {
-                        sigma_fixed: Some(0.2),
+                        scale: FrailtyScale::Fixed { sigma: 0.2 },
                     };
                     input
                 },
