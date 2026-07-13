@@ -63,6 +63,94 @@ pub(super) const GAUGE_PRIORITY_LINK_DEV: u8 = 60;
 /// inner-solve-reported objective without moving the selected length scale.
 pub(crate) const EXACT_SPATIAL_OUTER_TOL_FLOOR: f64 = 1e-6;
 
+/// Derive the BMS exact outer-evaluation options from the row measure selected
+/// by the spatial optimizer.
+///
+/// The callback's [`RowSet`](crate::row_kernel::RowSet) is the sole authority
+/// for this evaluation. Reusing either a caller-carried pilot mask or automatic
+/// sampling would let the inner fit and its outer derivatives describe a
+/// different Horvitz--Thompson measure. `All` therefore clears every stale
+/// pilot just as deliberately as `Subsample` installs the optimizer-selected
+/// weighted rows.
+pub(crate) fn bms_exact_outer_options(
+    options: &BlockwiseFitOptions,
+    row_set: &crate::row_kernel::RowSet,
+) -> BlockwiseFitOptions {
+    let mut effective = options.clone();
+    effective.auto_outer_subsample = false;
+    effective.outer_score_subsample = match row_set {
+        crate::row_kernel::RowSet::All => None,
+        crate::row_kernel::RowSet::Subsample { rows, n_full } => Some(Arc::new(
+            crate::outer_subsample::OuterScoreSubsample::from_weighted_rows(
+                rows.as_ref().clone(),
+                *n_full,
+                0,
+            ),
+        )),
+    };
+    effective
+}
+
+#[cfg(test)]
+mod exact_outer_options_tests {
+    use super::*;
+
+    #[test]
+    fn exact_outer_options_follow_authoritative_row_set() {
+        let mut options = BlockwiseFitOptions::default();
+        options.auto_outer_subsample = true;
+        options.outer_score_subsample = Some(Arc::new(
+            crate::outer_subsample::OuterScoreSubsample::from_uniform_inclusion_mask(
+                vec![9],
+                10,
+                17,
+            ),
+        ));
+
+        let rows = Arc::new(vec![
+            gam_problem::outer_subsample::WeightedOuterRow {
+                index: 1,
+                weight: 2.5,
+                stratum: 3,
+            },
+            gam_problem::outer_subsample::WeightedOuterRow {
+                index: 7,
+                weight: 4.0,
+                stratum: 8,
+            },
+        ]);
+        let sampled = bms_exact_outer_options(
+            &options,
+            &crate::row_kernel::RowSet::Subsample { rows, n_full: 11 },
+        );
+        assert!(!sampled.auto_outer_subsample);
+        let installed = sampled
+            .outer_score_subsample
+            .as_ref()
+            .expect("BMS exact outer pilot row measure");
+        assert_eq!(installed.n_full, 11);
+        assert_eq!(installed.seed, 0);
+        assert_eq!(installed.rows.len(), 2);
+        assert_eq!(installed.rows[0].index, 1);
+        assert_eq!(installed.rows[0].weight.to_bits(), 2.5_f64.to_bits());
+        assert_eq!(installed.rows[0].stratum, 3);
+        assert_eq!(installed.rows[1].index, 7);
+        assert_eq!(installed.rows[1].weight.to_bits(), 4.0_f64.to_bits());
+        assert_eq!(installed.rows[1].stratum, 8);
+
+        let full = bms_exact_outer_options(&options, &crate::row_kernel::RowSet::All);
+        assert!(!full.auto_outer_subsample);
+        assert!(
+            full.outer_score_subsample.is_none(),
+            "full-data replay must clear every stale pilot mask"
+        );
+        assert!(
+            options.outer_score_subsample.is_some(),
+            "deriving the effective measure must not mutate caller options"
+        );
+    }
+}
+
 // ── BlockEffectiveJacobian impls for BMS ─────────────────────────────────────
 //
 // BMS has a single Bernoulli output per row (n_outputs = 1). The observed η is
@@ -2850,17 +2938,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 }
                 other => other,
             };
-            let mut eval_options =
+            let tolerance_options =
                 joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
-            if let crate::row_kernel::RowSet::Subsample { rows, n_full } = row_set {
-                let subsample = crate::outer_subsample::OuterScoreSubsample::from_weighted_rows(
-                    rows.as_ref().clone(),
-                    *n_full,
-                    0,
-                );
-                eval_options.outer_score_subsample = Some(Arc::new(subsample));
-                eval_options.auto_outer_subsample = false;
-            }
+            let eval_options = bms_exact_outer_options(&tolerance_options, row_set);
             let eval = evaluate_custom_family_joint_hyper_shared(
                 &family,
                 &blocks,
