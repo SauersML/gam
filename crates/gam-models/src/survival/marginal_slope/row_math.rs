@@ -1754,10 +1754,10 @@ mod tests {
         }
     }
 
-    /// Permanent backend-dispatch gate. Every scheduled compiled width and the
-    /// first dynamic width evaluate the same generic row expression through the
-    /// graph, eager fixed, eager dynamic, and retired strongest-hand authority.
-    /// All covariance representations and both survival branches are covered.
+    /// Permanent backend-dispatch gate. Every scheduled compiled width evaluates
+    /// the same generic row expression through the graph, eager fixed, eager
+    /// dynamic, and retired strongest-hand authority. All covariance
+    /// representations and both survival branches are covered.
     #[test]
     fn compiled_graph_schedule_matches_all_backends_every_width_932() {
         fn check_width<const DIM: usize>() {
@@ -1838,7 +1838,7 @@ mod tests {
                                 initial_dynamic_bytes,
                                 "k={k}: fixed schedule unexpectedly used the dynamic arena"
                             );
-                        } else if k <= 13 {
+                        } else {
                             assert!(
                                 production_workspace.graph.node_count() > initial_graph_nodes,
                                 "k={k}: scheduled production graph did not record a row"
@@ -1847,17 +1847,6 @@ mod tests {
                                 production_workspace.dynamic.allocated_bytes(),
                                 initial_dynamic_bytes,
                                 "k={k}: scheduled graph width unexpectedly used the dynamic arena"
-                            );
-                        } else {
-                            assert_eq!(
-                                production_workspace.graph.node_count(),
-                                initial_graph_nodes,
-                                "k={k}: dynamic boundary unexpectedly recorded a graph"
-                            );
-                            assert!(
-                                production_workspace.dynamic.allocated_bytes()
-                                    > initial_dynamic_bytes,
-                                "k={k}: production boundary did not use the dynamic arena"
                             );
                         }
                     }
