@@ -528,11 +528,8 @@ pub fn survival_fit_from_parts(
     if let Some(geom) = geometry.as_ref() {
         geom.validate_numeric_finiteness()
             .map_err(|e| e.to_string())?;
-        let mut saved_block_widths = vec![
-            beta_time.len(),
-            beta_threshold.len(),
-            beta_log_sigma.len(),
-        ];
+        let mut saved_block_widths =
+            vec![beta_time.len(), beta_threshold.len(), beta_log_sigma.len()];
         if let Some(beta) = beta_link_wiggle.as_ref() {
             saved_block_widths.push(beta.len());
         }

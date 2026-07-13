@@ -4,11 +4,12 @@
 
 use super::*;
 
-use gam_math::jet_scalar::{
-    DynamicJetArena, DynamicOrder2, FixedRuntimeJet, JetScalar, Order2, RuntimeJetScalar,
-    RuntimeValue,
-};
+#[cfg(test)]
+use gam_math::jet_scalar::{DynamicJetArena, DynamicOrder2, FixedRuntimeJet, JetScalar, Order2};
+use gam_math::jet_scalar::{RuntimeJetScalar, RuntimeValue};
+#[cfg(test)]
 use gam_math::order2_graph::{Order2Graph, Order2GraphWorkspace};
+use gam_row_macros::row_program;
 
 // ── Closed-form row kernel ─────────────────────────────────────────────
 //
@@ -830,14 +831,140 @@ mod vector_hand_oracle_tests {
     }
 }
 
-/// Runtime-width rigid row program for independent score slopes.
+const RIGID_VECTOR_FEATURE_DIMENSION: usize = 5;
+const FEATURE_Q0: usize = 0;
+const FEATURE_Q1: usize = 1;
+const FEATURE_QD1: usize = 2;
+const FEATURE_LINEAR: usize = 3;
+const FEATURE_VARIANCE: usize = 4;
+
+// The only vector-row likelihood declaration. Both consumers below are emitted
+// from this parsed SSA: `*_runtime` accepts feature jets carrying the oracle's
+// runtime primary width, while `*_order2` differentiates the same expression in
+// the five semantic features `(q0, q1, qd1, L, V)`. Production then applies the
+// universal order-two feature pullback; no family derivative formula is kept in
+// parallel with this program.
+row_program! {
+    fn rigid_vector_feature_program(
+        q0, q1, qd1, linear, variance;
+        wi, di, probit_scale
+    )
+    leaves {
+        sqrt => unary_derivatives_sqrt => d_sqrt,
+        neglog_phi => unary_derivatives_neglog_phi => neglog_phi_stack,
+        log_normal_pdf => unary_derivatives_log_normal_pdf => d_lognormpdf,
+        log => unary_derivatives_log => d_log,
+    }
+    witnesses [neg_eta0, neg_eta1, adjusted_derivative];
+    {
+        let correction_argument = add_constant(
+            scale(variance, probit_scale * probit_scale),
+            1.0
+        );
+        let correction = compose(sqrt, correction_argument);
+        let eta0 = add(mul(q0, correction), linear);
+        let eta1 = add(mul(q1, correction), linear);
+        let adjusted_derivative = mul(qd1, correction);
+
+        let neg_eta0 = neg(eta0);
+        let entry = scale(compose(neglog_phi, neg_eta0, wi), -1.0);
+        let neg_eta1 = neg(eta1);
+        let exit = compose(neglog_phi, neg_eta1, wi * (1.0 - di));
+
+        let mut event_density = zero();
+        let mut time_derivative = zero();
+        if (di > 0.0) {
+            event_density = scale(
+                compose(log_normal_pdf, eta1),
+                (-wi) * di
+            );
+            time_derivative = scale(
+                compose(log, adjusted_derivative),
+                (-wi) * di
+            );
+        }
+        return add(
+            add(exit, entry),
+            add(event_density, time_derivative)
+        );
+    }
+}
+
+#[inline]
+fn validate_vector_probit_scale(inputs: &RigidRowInputs) -> Result<(), String> {
+    if inputs.probit_scale.is_finite() {
+        Ok(())
+    } else {
+        Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: format!(
+                "survival marginal-slope probit scale must be finite, got {}",
+                inputs.probit_scale
+            ),
+        }
+        .into())
+    }
+}
+
+#[inline]
+fn validated_vector_variance(raw_variance: f64, probit_scale: f64) -> Result<f64, String> {
+    let scaled_variance = probit_scale * probit_scale * raw_variance;
+    if !(scaled_variance.is_finite()
+        && scaled_variance >= crate::bms::gradient_paths::COVARIANCE_QUADRATIC_FORM_PSD_TOL)
+    {
+        return Err(SurvivalMarginalSlopeError::NumericalFailure {
+            reason: format!(
+                "survival marginal-slope covariance quadratic form must be non-negative, got {scaled_variance}"
+            ),
+        }
+        .into());
+    }
+    // At a mathematical zero, floating accumulation may land a few ulps below
+    // zero. Shift only the primal constant; derivative channels are unchanged.
+    Ok(if scaled_variance < 0.0 {
+        0.0
+    } else {
+        raw_variance
+    })
+}
+
+#[inline(always)]
+fn rigid_vector_feature_nll<'arena, S>(
+    features: &[S; RIGID_VECTOR_FEATURE_DIMENSION],
+    inputs: &RigidRowInputs,
+    dimension: usize,
+    workspace: &'arena S::Workspace,
+) -> Result<S, String>
+where
+    S: RuntimeJetScalar<'arena>,
+{
+    validate_vector_probit_scale(inputs)?;
+    let (nll, [neg_eta0, neg_eta1, adjusted_derivative]) = rigid_vector_feature_program_runtime(
+        &features[FEATURE_Q0],
+        &features[FEATURE_Q1],
+        &features[FEATURE_QD1],
+        &features[FEATURE_LINEAR],
+        &features[FEATURE_VARIANCE],
+        inputs.wi,
+        inputs.di,
+        inputs.probit_scale,
+        dimension,
+        workspace,
+    );
+    validate_rigid_row_admission(
+        features[FEATURE_QD1].value(),
+        inputs,
+        neg_eta0,
+        neg_eta1,
+        adjusted_derivative,
+    )?;
+    Ok(nll)
+}
+
+/// Runtime-width correctness oracle for independent score slopes.
 ///
-/// The first three primaries are `(q0, q1, qd1)` and the remaining primaries
-/// are the score-specific slopes. The covariance representation changes only
-/// how the exact quadratic form `r' Sigma r` is lowered; every value, gradient,
-/// and Hessian channel then flows through the same stable probit/log-density
-/// leaf stacks as [`rigid_row_nll`]. There is no separately maintained chain
-/// rule for score cross-blocks.
+/// The covariance representation changes only how `(L, V)` are constructed.
+/// Every likelihood operation is delegated to [`rigid_vector_feature_program`],
+/// whose runtime lowering lets these five features carry the full primary width.
 fn rigid_vector_row_nll<'arena, S>(
     vars: &[S],
     z: &[f64],
@@ -868,15 +995,7 @@ where
         .into());
     }
     covariance.validate("survival marginal-slope vector row program")?;
-    if !inputs.probit_scale.is_finite() {
-        return Err(SurvivalMarginalSlopeError::InvalidInput {
-            reason: format!(
-                "survival marginal-slope probit scale must be finite, got {}",
-                inputs.probit_scale
-            ),
-        }
-        .into());
-    }
+    validate_vector_probit_scale(inputs)?;
     if z.iter().any(|value| !value.is_finite())
         || vars[3..].iter().any(|slope| !slope.value().is_finite())
     {
@@ -892,83 +1011,22 @@ where
     // One semantic primitive owns the mechanically derived V/G/H channels for
     // `g' Sigma g`; representation-specific multiplication stays matrix free.
     let mut variance = S::symmetric_quadratic_form(&vars[3..], covariance, dimension, workspace);
-    let probit_variance_scale = inputs.probit_scale * inputs.probit_scale;
-    let variance_value = variance.value() * probit_variance_scale;
-    if !(variance_value.is_finite()
-        && variance_value >= crate::bms::gradient_paths::COVARIANCE_QUADRATIC_FORM_PSD_TOL)
-    {
-        return Err(SurvivalMarginalSlopeError::NumericalFailure {
-            reason: format!(
-                "survival marginal-slope covariance quadratic form must be non-negative, got {variance_value}"
-            ),
-        }
-        .into());
-    }
-    // At a mathematical zero, floating accumulation may land a few ulps below
-    // zero. Shift only the primal constant; derivative channels are unchanged.
-    if variance_value < 0.0 {
-        variance = variance.add_constant(-variance.value(), workspace);
+    let validated_variance = validated_vector_variance(variance.value(), inputs.probit_scale)?;
+    if validated_variance != variance.value() {
+        variance = variance.add_constant(validated_variance - variance.value(), workspace);
     }
 
-    let correction_argument = 1.0 + probit_variance_scale * variance.value();
-    let correction = variance.affine_compose(
-        probit_variance_scale,
-        1.0,
-        unary_derivatives_sqrt(correction_argument),
-        workspace,
-    );
-    let correction_value = correction.value();
-    let linear_value = linear.value();
-    let eta0_value = vars[0].value() * correction_value + linear_value;
-    let eta1_value = vars[1].value() * correction_value + linear_value;
-    let adjusted_derivative_value = vars[2].value() * correction_value;
-    let neg_eta0 = -eta0_value;
-    let neg_eta1 = -eta1_value;
-
-    validate_rigid_row_admission(
-        vars[2].value(),
-        inputs,
-        neg_eta0,
-        neg_eta1,
-        adjusted_derivative_value,
-    )?;
-
-    let mut entry_stack = unary_derivatives_neglog_phi(neg_eta0, inputs.wi);
-    for derivative in &mut entry_stack {
-        *derivative = -*derivative;
-    }
-    let exit_stack = unary_derivatives_neglog_phi(neg_eta1, inputs.wi * (1.0 - inputs.di));
-    if inputs.di > 0.0 {
-        let scale = (-inputs.wi) * inputs.di;
-        let mut event_stack = unary_derivatives_log_normal_pdf(eta1_value);
-        let mut time_stack = unary_derivatives_log(adjusted_derivative_value);
-        for derivative in event_stack.iter_mut().chain(&mut time_stack) {
-            *derivative *= scale;
-        }
-        Ok(S::shared_multiply_add_affine_composed_sum(
-            &[&vars[1], &vars[0], &vars[1], &vars[2]],
-            &correction,
-            &linear,
-            &[1.0, 1.0, 1.0, 0.0],
-            &[-1.0, -1.0, 1.0, 1.0],
-            &[exit_stack, entry_stack, event_stack, time_stack],
-            dimension,
-            workspace,
-        ))
-    } else {
-        Ok(S::shared_multiply_add_affine_composed_sum(
-            &[&vars[1], &vars[0]],
-            &correction,
-            &linear,
-            &[1.0, 1.0],
-            &[-1.0, -1.0],
-            &[exit_stack, entry_stack],
-            dimension,
-            workspace,
-        ))
-    }
+    let features = [
+        vars[0].clone(),
+        vars[1].clone(),
+        vars[2].clone(),
+        linear,
+        variance,
+    ];
+    rigid_vector_feature_nll(&features, inputs, dimension, workspace)
 }
 
+#[cfg(test)]
 fn row_primary_closed_form_vector_dynamic_into(
     q0: f64,
     q1: f64,
@@ -1032,6 +1090,7 @@ fn row_primary_closed_form_vector_dynamic_into(
     Ok(row.v)
 }
 
+#[cfg(test)]
 fn row_primary_closed_form_vector_fixed_into<const DIM: usize>(
     q0: f64,
     q1: f64,
@@ -1084,32 +1143,18 @@ fn row_primary_closed_form_vector_fixed_into<const DIM: usize>(
     Ok(value)
 }
 
-enum RigidVectorRowBackend {
-    Fixed,
-    Graph(Order2GraphWorkspace),
-    Dynamic(DynamicJetArena),
-}
-
-/// Width-bound storage for exactly one production row backend and its reusable
-/// derivative output. The single boxed buffer stores `D + D²` cells: gradient
-/// first, then a row-major Hessian. A fold can never silently reuse storage
-/// configured for another score dimension.
-pub(crate) struct RigidVectorRowWorkspace {
+#[inline]
+fn checked_vector_workspace_layout(
     score_dimension: usize,
-    backend: RigidVectorRowBackend,
-    derivative_cells: Box<[f64]>,
-}
-
-impl RigidVectorRowWorkspace {
-    pub(crate) fn new(score_dimension: usize) -> Result<Self, String> {
-        if score_dimension == 0 {
-            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-                reason: "survival marginal-slope vector row requires at least one score slope"
-                    .to_string(),
-            }
-            .into());
+) -> Result<(usize, usize, usize), String> {
+    if score_dimension == 0 {
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: "survival marginal-slope vector row requires at least one score slope"
+                .to_string(),
         }
-        let dimension = score_dimension.checked_add(3).ok_or_else(|| {
+        .into());
+    }
+    let dimension = score_dimension.checked_add(3).ok_or_else(|| {
             SurvivalMarginalSlopeError::IncompatibleDimensions {
                 reason: format!(
                     "survival marginal-slope score width {score_dimension} overflows its primary dimension"
@@ -1117,38 +1162,69 @@ impl RigidVectorRowWorkspace {
             }
             .to_string()
         })?;
-        let hessian_cells = dimension.checked_mul(dimension).ok_or_else(|| {
-            SurvivalMarginalSlopeError::IncompatibleDimensions {
-                reason: format!(
-                    "survival marginal-slope primary width {dimension} overflows its Hessian storage"
-                ),
-            }
-            .to_string()
-        })?;
-        let derivative_cells = dimension.checked_add(hessian_cells).ok_or_else(|| {
-            SurvivalMarginalSlopeError::IncompatibleDimensions {
-                reason: format!(
-                    "survival marginal-slope primary width {dimension} overflows its derivative storage"
-                ),
-            }
-            .to_string()
-        })?;
-        let backend = if score_dimension <= 3 {
-            RigidVectorRowBackend::Fixed
-        } else if score_dimension <= 13 {
-            RigidVectorRowBackend::Graph(Order2GraphWorkspace::new())
-        } else {
-            RigidVectorRowBackend::Dynamic(DynamicJetArena::new())
+    let hessian_cells = dimension.checked_mul(dimension).ok_or_else(|| {
+        SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope primary width {dimension} overflows its Hessian storage"
+            ),
+        }
+        .to_string()
+    })?;
+    let derivative_cells = dimension.checked_add(hessian_cells).ok_or_else(|| {
+        SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope primary width {dimension} overflows its derivative storage"
+            ),
+        }
+        .to_string()
+    })?;
+    let jacobian_cells = RIGID_VECTOR_FEATURE_DIMENSION
+        .checked_mul(dimension)
+        .ok_or_else(|| SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope primary width {dimension} overflows its feature Jacobian storage"
+            ),
+        }
+        .to_string())?;
+    Ok((dimension, jacobian_cells, derivative_cells))
+}
+
+/// Reusable, allocation-free production workspace bound to one validated score
+/// covariance. The row kernel performs one covariance matvec and one packed
+/// coefficient traversal; validation and representation binding happen here.
+pub(crate) struct RigidVectorRowWorkspace<'covariance> {
+    covariance: &'covariance MarginalSlopeCovariance,
+    sigma_g: Box<[f64]>,
+    low_rank_projection: Box<[f64]>,
+    feature_jacobian: Box<[f64]>,
+    derivative_cells: Box<[f64]>,
+}
+
+impl<'covariance> RigidVectorRowWorkspace<'covariance> {
+    pub(crate) fn new(covariance: &'covariance MarginalSlopeCovariance) -> Result<Self, String> {
+        covariance.validate("survival marginal-slope vector row workspace")?;
+        let score_dimension = covariance.dim();
+        let (dimension, jacobian_cells, derivative_cells) =
+            checked_vector_workspace_layout(score_dimension)?;
+        let projection_dimension = match covariance {
+            MarginalSlopeCovariance::LowRank(factor) => factor.ncols(),
+            MarginalSlopeCovariance::Diagonal(_) | MarginalSlopeCovariance::Full(_) => 0,
         };
+        let mut feature_jacobian = vec![0.0; jacobian_cells].into_boxed_slice();
+        feature_jacobian[FEATURE_Q0 * dimension + FEATURE_Q0] = 1.0;
+        feature_jacobian[FEATURE_Q1 * dimension + FEATURE_Q1] = 1.0;
+        feature_jacobian[FEATURE_QD1 * dimension + FEATURE_QD1] = 1.0;
         Ok(Self {
-            score_dimension,
-            backend,
+            covariance,
+            sigma_g: vec![0.0; score_dimension].into_boxed_slice(),
+            low_rank_projection: vec![0.0; projection_dimension].into_boxed_slice(),
+            feature_jacobian,
             derivative_cells: vec![0.0; derivative_cells].into_boxed_slice(),
         })
     }
 
     pub(crate) fn derivatives(&self) -> (ArrayView1<'_, f64>, ArrayView2<'_, f64>) {
-        let dimension = 3 + self.score_dimension;
+        let dimension = 3 + self.covariance.dim();
         let (gradient, hessian) = self.derivative_cells.split_at(dimension);
         (
             ArrayView1::from(gradient),
@@ -1158,6 +1234,148 @@ impl RigidVectorRowWorkspace {
     }
 }
 
+#[inline(always)]
+fn bound_covariance_matvec_into(
+    covariance: &MarginalSlopeCovariance,
+    vector: &[f64],
+    output: &mut [f64],
+    low_rank_projection: &mut [f64],
+) {
+    debug_assert_eq!(vector.len(), covariance.dim());
+    debug_assert_eq!(output.len(), covariance.dim());
+    match covariance {
+        MarginalSlopeCovariance::Diagonal(diagonal) => {
+            for axis in 0..vector.len() {
+                output[axis] = diagonal[axis] * vector[axis];
+            }
+        }
+        MarginalSlopeCovariance::Full(matrix) => {
+            for row in 0..vector.len() {
+                let mut value = 0.0;
+                for column in 0..vector.len() {
+                    value += matrix[[row, column]] * vector[column];
+                }
+                output[row] = value;
+            }
+        }
+        MarginalSlopeCovariance::LowRank(factor) => {
+            debug_assert_eq!(low_rank_projection.len(), factor.ncols());
+            low_rank_projection.fill(0.0);
+            for rank in 0..factor.ncols() {
+                for axis in 0..vector.len() {
+                    low_rank_projection[rank] += factor[[axis, rank]] * vector[axis];
+                }
+            }
+            output.fill(0.0);
+            for axis in 0..vector.len() {
+                for rank in 0..factor.ncols() {
+                    output[axis] += factor[[axis, rank]] * low_rank_projection[rank];
+                }
+            }
+        }
+    }
+}
+
+/// Universal second-order pullback
+/// `g_x = J^T g_y`, `H_x = J^T H_y J + sum_m g_y[m] H(y_m)`.
+/// Structural feature supports avoid multiplying the three identity rows by
+/// their known zeros. The callback owns the feature map's intrinsic Hessians,
+/// so the chain rule itself remains independent of covariance representation.
+#[inline(always)]
+fn order2_feature_pullback_into<const FEATURES: usize>(
+    feature_gradient: &[f64; FEATURES],
+    feature_hessian: &[[f64; FEATURES]; FEATURES],
+    jacobian: &[f64],
+    support_starts: &[usize; FEATURES],
+    support_ends: &[usize; FEATURES],
+    dimension: usize,
+    gradient: &mut [f64],
+    hessian: &mut [f64],
+    add_weighted_feature_hessians: impl FnOnce(&[f64; FEATURES], &mut [f64]),
+) {
+    debug_assert_eq!(jacobian.len(), FEATURES * dimension);
+    debug_assert_eq!(gradient.len(), dimension);
+    debug_assert_eq!(hessian.len(), dimension * dimension);
+    gradient.fill(0.0);
+    hessian.fill(0.0);
+
+    for feature in 0..FEATURES {
+        let weight = feature_gradient[feature];
+        let row_offset = feature * dimension;
+        for axis in support_starts[feature]..support_ends[feature] {
+            gradient[axis] += weight * jacobian[row_offset + axis];
+        }
+    }
+
+    for left_feature in 0..FEATURES {
+        let left_offset = left_feature * dimension;
+        for right_feature in left_feature..FEATURES {
+            let right_offset = right_feature * dimension;
+            let weight = feature_hessian[left_feature][right_feature];
+            for left_axis in support_starts[left_feature]..support_ends[left_feature] {
+                let left = jacobian[left_offset + left_axis];
+                for right_axis in support_starts[right_feature]..support_ends[right_feature] {
+                    let channel = weight * left * jacobian[right_offset + right_axis];
+                    hessian[left_axis * dimension + right_axis] += channel;
+                    if left_feature != right_feature {
+                        hessian[right_axis * dimension + left_axis] += channel;
+                    }
+                }
+            }
+        }
+    }
+    add_weighted_feature_hessians(feature_gradient, hessian);
+}
+
+#[inline(always)]
+fn add_weighted_variance_hessian(
+    covariance: &MarginalSlopeCovariance,
+    feature_gradient: &[f64; RIGID_VECTOR_FEATURE_DIMENSION],
+    dimension: usize,
+    hessian: &mut [f64],
+) {
+    let scale = 2.0 * feature_gradient[FEATURE_VARIANCE];
+    match covariance {
+        MarginalSlopeCovariance::Diagonal(diagonal) => {
+            for axis in 0..diagonal.len() {
+                let primary = 3 + axis;
+                hessian[primary * dimension + primary] += scale * diagonal[axis];
+            }
+        }
+        MarginalSlopeCovariance::Full(matrix) => {
+            for row in 0..matrix.nrows() {
+                let primary_row = 3 + row;
+                for column in row..matrix.ncols() {
+                    let primary_column = 3 + column;
+                    let channel = scale * matrix[[row, column]];
+                    hessian[primary_row * dimension + primary_column] += channel;
+                    if row != column {
+                        hessian[primary_column * dimension + primary_row] += channel;
+                    }
+                }
+            }
+        }
+        MarginalSlopeCovariance::LowRank(factor) => {
+            for row in 0..factor.nrows() {
+                let primary_row = 3 + row;
+                for column in row..factor.nrows() {
+                    let primary_column = 3 + column;
+                    let mut coefficient = 0.0;
+                    for rank in 0..factor.ncols() {
+                        coefficient += factor[[row, rank]] * factor[[column, rank]];
+                    }
+                    let channel = scale * coefficient;
+                    hessian[primary_row * dimension + primary_column] += channel;
+                    if row != column {
+                        hessian[primary_column * dimension + primary_row] += channel;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn row_primary_closed_form_vector_graph_into<const DIM: usize>(
     q0: f64,
     q1: f64,
@@ -1219,127 +1437,97 @@ pub(crate) fn row_primary_closed_form_vector_into(
     qd1: f64,
     slopes: &[f64],
     z: &[f64],
-    covariance: &MarginalSlopeCovariance,
     w: f64,
     d: f64,
     derivative_guard: f64,
     probit_scale: f64,
-    workspace: &mut RigidVectorRowWorkspace,
+    workspace: &mut RigidVectorRowWorkspace<'_>,
 ) -> Result<f64, String> {
     let k = slopes.len();
-    if z.len() != k || covariance.dim() != k {
+    let configured_dimension = workspace.covariance.dim();
+    if z.len() != k {
         return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: format!(
-                "survival marginal-slope vector row dimension mismatch: slopes={}, z={}, covariance={}",
+                "survival marginal-slope vector row dimension mismatch: slopes={}, z={}",
                 k,
                 z.len(),
-                covariance.dim()
             ),
         }
         .into());
     }
-    if workspace.score_dimension != k {
+    if configured_dimension != k {
         return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: format!(
-                "survival marginal-slope vector workspace width mismatch: configured={}, row={k}",
-                workspace.score_dimension
+                "survival marginal-slope vector workspace width mismatch: configured={configured_dimension}, row={k}"
             ),
         }
         .into());
     }
-
-    macro_rules! graph_row {
-        ($dimension:literal, $graph:expr, $gradient:expr, $hessian:expr) => {
-            row_primary_closed_form_vector_graph_into::<$dimension>(
-                q0,
-                q1,
-                qd1,
-                slopes,
-                z,
-                covariance,
-                w,
-                d,
-                derivative_guard,
-                probit_scale,
-                $graph,
-                $gradient,
-                $hessian,
-            )
-        };
+    validate_vector_probit_scale(&RigidRowInputs {
+        row: 0,
+        wi: w,
+        di: d,
+        z_sum: 0.0,
+        covariance_ones: 0.0,
+        probit_scale,
+        qd1_lower: derivative_guard,
+    })?;
+    if z.iter().any(|value| !value.is_finite()) || slopes.iter().any(|value| !value.is_finite()) {
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: "survival marginal-slope vector scores and slopes must be finite".to_string(),
+        }
+        .into());
     }
-
-    macro_rules! fixed_row {
-        ($dimension:literal, $gradient:expr, $hessian:expr) => {
-            row_primary_closed_form_vector_fixed_into::<$dimension>(
-                q0,
-                q1,
-                qd1,
-                slopes,
-                z,
-                covariance,
-                w,
-                d,
-                derivative_guard,
-                probit_scale,
-                $gradient,
-                $hessian,
-            )
-        };
-    }
-
     let dimension = 3 + k;
     let RigidVectorRowWorkspace {
-        backend,
+        covariance,
+        sigma_g,
+        low_rank_projection,
+        feature_jacobian,
         derivative_cells,
-        ..
     } = workspace;
-    let (gradient, hessian) = derivative_cells.split_at_mut(dimension);
-    match (backend, k) {
-        (RigidVectorRowBackend::Fixed, 1) => fixed_row!(4, gradient, hessian),
-        (RigidVectorRowBackend::Fixed, 2) => fixed_row!(5, gradient, hessian),
-        (RigidVectorRowBackend::Fixed, 3) => fixed_row!(6, gradient, hessian),
-        (RigidVectorRowBackend::Graph(graph), 4) => graph_row!(7, graph, gradient, hessian),
-        (RigidVectorRowBackend::Graph(graph), 5) => graph_row!(8, graph, gradient, hessian),
-        (RigidVectorRowBackend::Graph(graph), 6) => graph_row!(9, graph, gradient, hessian),
-        (RigidVectorRowBackend::Graph(graph), 7) => graph_row!(10, graph, gradient, hessian),
-        (RigidVectorRowBackend::Graph(graph), 8) => graph_row!(11, graph, gradient, hessian),
-        (RigidVectorRowBackend::Graph(graph), 9) => graph_row!(12, graph, gradient, hessian),
-        (RigidVectorRowBackend::Graph(graph), 10) => {
-            graph_row!(13, graph, gradient, hessian)
-        }
-        (RigidVectorRowBackend::Graph(graph), 11) => {
-            graph_row!(14, graph, gradient, hessian)
-        }
-        (RigidVectorRowBackend::Graph(graph), 12) => {
-            graph_row!(15, graph, gradient, hessian)
-        }
-        (RigidVectorRowBackend::Graph(graph), 13) => {
-            graph_row!(16, graph, gradient, hessian)
-        }
-        (RigidVectorRowBackend::Dynamic(arena), 14..) => {
-            row_primary_closed_form_vector_dynamic_into(
-                q0,
-                q1,
-                qd1,
-                slopes,
-                z,
-                covariance,
-                w,
-                d,
-                derivative_guard,
-                probit_scale,
-                arena,
-                gradient,
-                hessian,
-            )
-        }
-        _ => Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-            reason: format!(
-                "survival marginal-slope vector workspace backend does not support score width {k}"
-            ),
-        }
-        .into()),
+    let covariance = *covariance;
+    bound_covariance_matvec_into(covariance, slopes, sigma_g, low_rank_projection);
+    let mut raw_variance = 0.0;
+    let mut linear_dot = 0.0;
+    for axis in 0..k {
+        raw_variance += slopes[axis] * sigma_g[axis];
+        linear_dot += slopes[axis] * z[axis];
+        feature_jacobian[FEATURE_LINEAR * dimension + 3 + axis] = probit_scale * z[axis];
+        feature_jacobian[FEATURE_VARIANCE * dimension + 3 + axis] = 2.0 * sigma_g[axis];
     }
+    raw_variance = validated_vector_variance(raw_variance, probit_scale)?;
+    let linear = probit_scale * linear_dot;
+    let inputs = RigidRowInputs {
+        row: 0,
+        wi: w,
+        di: d,
+        z_sum: 0.0,
+        covariance_ones: 0.0,
+        probit_scale,
+        qd1_lower: derivative_guard,
+    };
+    let (value, feature_gradient, feature_hessian, [neg_eta0, neg_eta1, adjusted_derivative]) =
+        rigid_vector_feature_program_order2(q0, q1, qd1, linear, raw_variance, w, d, probit_scale);
+    validate_rigid_row_admission(qd1, &inputs, neg_eta0, neg_eta1, adjusted_derivative)?;
+
+    let support_starts = [0, 1, 2, 3, 3];
+    let support_ends = [1, 2, 3, dimension, dimension];
+    let (gradient, hessian) = derivative_cells.split_at_mut(dimension);
+    order2_feature_pullback_into(
+        &feature_gradient,
+        &feature_hessian,
+        feature_jacobian,
+        &support_starts,
+        &support_ends,
+        dimension,
+        gradient,
+        hessian,
+        |gradient, hessian| {
+            add_weighted_variance_hessian(covariance, gradient, dimension, hessian);
+        },
+    );
+    Ok(value)
 }
 
 pub(crate) fn standardize_latent_z_matrix_with_policy(
@@ -1614,20 +1802,10 @@ mod tests {
 
     fn collect_workspace_row(
         value: f64,
-        workspace: &RigidVectorRowWorkspace,
+        workspace: &RigidVectorRowWorkspace<'_>,
     ) -> (f64, Array1<f64>, Array2<f64>) {
         let (gradient, hessian) = workspace.derivatives();
         (value, gradient.to_owned(), hessian.to_owned())
-    }
-
-    impl RigidVectorRowWorkspace {
-        fn backend_name(&self) -> &'static str {
-            match &self.backend {
-                RigidVectorRowBackend::Fixed => "fixed",
-                RigidVectorRowBackend::Graph(_) => "graph",
-                RigidVectorRowBackend::Dynamic(_) => "dynamic",
-            }
-        }
     }
 
     /// #1440 cutover oracle: the pilot W-metric chain factors are now the EXACT
@@ -1784,12 +1962,10 @@ mod tests {
         }
     }
 
-    /// #932 runtime-width cutover gate. The production row program derives the
-    /// complete V/G/H tower through the scheduled fixed/graph backends for
-    /// `k <= 13` and the same-expression dynamic backend above it. This compares every
-    /// channel with the retired strongest-hand schedule for all covariance
-    /// forms. The explicit score-score assertions pin the mixed blocks that a
-    /// scalar or block-diagonal check would miss.
+    /// #932 feature-pullback gate. Production differentiates the canonical
+    /// five-feature row program once and mechanically pulls every V/G/H channel
+    /// back to runtime score width. This compares it with the runtime/fixed
+    /// oracles and the strongest-hand schedule for every covariance form.
     #[test]
     fn runtime_vector_row_program_matches_strongest_hand_mixed_score_vgh_932() {
         let diagonal = MarginalSlopeCovariance::Diagonal(Array1::from_vec(vec![1.2, 0.9, 0.7]));
@@ -1814,7 +1990,6 @@ mod tests {
         ];
         let slopes = [0.55, -0.8, 0.35];
         let scores = [-1.2, 0.65, 1.4];
-        let mut workspace = RigidVectorRowWorkspace::new(3).expect("k=3 production workspace");
         let mut dynamic_arena = DynamicJetArena::new();
         let close = |label: &str, actual: f64, expected: f64| {
             let tolerance = 5.0e-11 * actual.abs().max(expected.abs()).max(1.0);
@@ -1827,13 +2002,14 @@ mod tests {
         };
 
         for (case, &(covariance, event, q0, q1, qd1, probit_scale)) in cases.iter().enumerate() {
+            let mut workspace =
+                RigidVectorRowWorkspace::new(covariance).expect("k=3 production workspace");
             let production_value = row_primary_closed_form_vector_into(
                 q0,
                 q1,
                 qd1,
                 &slopes,
                 &scores,
-                covariance,
                 1.3,
                 event,
                 1.0e-8,
@@ -1940,9 +2116,9 @@ mod tests {
         }
     }
 
-    /// Permanent backend-dispatch gate. Every scheduled compiled width evaluates
-    /// the same generic row expression through the graph, eager fixed, eager
-    /// dynamic, and retired strongest-hand authority. All covariance
+    /// Permanent all-width gate. Every width evaluates the same generated
+    /// feature likelihood through production pullback, graph, eager fixed,
+    /// eager dynamic, and strongest-hand authority. All covariance
     /// representations and both survival branches are covered.
     #[test]
     fn compiled_graph_schedule_matches_all_backends_every_width_932() {
@@ -1991,11 +2167,11 @@ mod tests {
                 );
             };
 
-            let mut production_workspace =
-                RigidVectorRowWorkspace::new(k).expect("production width workspace");
             let mut graph_workspace = Order2GraphWorkspace::new();
             let mut dynamic_arena = DynamicJetArena::new();
             for (shape_index, covariance) in covariances.iter().enumerate() {
+                let mut production_workspace =
+                    RigidVectorRowWorkspace::new(covariance).expect("production width workspace");
                 for event in [0.0, 0.35, 1.0] {
                     let production_value = row_primary_closed_form_vector_into(
                         q0,
@@ -2003,7 +2179,6 @@ mod tests {
                         qd1,
                         &slopes,
                         &scores,
-                        covariance,
                         1.17,
                         event,
                         1.0e-8,
@@ -2025,10 +2200,6 @@ mod tests {
                         probit_scale,
                     )
                     .expect("zero-order canonical vector row");
-                    if shape_index == 0 && event == 0.0 {
-                        let expected_backend = if k <= 3 { "fixed" } else { "graph" };
-                        assert_eq!(production_workspace.backend_name(), expected_backend);
-                    }
                     let graph = collect_row_into(DIM, |gradient, hessian| {
                         row_primary_closed_form_vector_graph_into::<DIM>(
                             q0,
@@ -2154,9 +2325,9 @@ mod tests {
         check_width::<16>();
     }
 
-    /// First width beyond the compiled graph's exact u16 axis-mask domain.
-    /// Production must select the dynamic packed lowering without touching the
-    /// graph, while preserving the canonical row expression's complete V/G/H.
+    /// A width beyond the graph oracle's exact u16 axis-mask domain. Production
+    /// has no width dispatch: the same feature pullback must preserve complete
+    /// V/G/H here as at every smaller width.
     #[test]
     fn dynamic_schedule_boundary_k14_matches_strongest_hand_vgh_932() {
         const K: usize = 14;
@@ -2186,8 +2357,6 @@ mod tests {
                 sign * (0.14 + 0.018 * row as f64 + 0.035 * column as f64)
             }));
         let covariances = [diagonal, full, low_rank];
-        let mut production_workspace =
-            RigidVectorRowWorkspace::new(K).expect("k=14 production workspace");
         let mut dynamic_arena = DynamicJetArena::new();
 
         let close = |shape: usize, event: f64, channel: &str, actual: f64, expected: f64| {
@@ -2201,6 +2370,8 @@ mod tests {
         };
 
         for (shape, covariance) in covariances.iter().enumerate() {
+            let mut production_workspace =
+                RigidVectorRowWorkspace::new(covariance).expect("k=14 production workspace");
             for event in [0.0, 0.35, 1.0] {
                 let production_value = row_primary_closed_form_vector_into(
                     -0.31,
@@ -2208,7 +2379,6 @@ mod tests {
                     1.09,
                     &slopes,
                     &scores,
-                    covariance,
                     1.17,
                     event,
                     1.0e-8,
@@ -2281,28 +2451,27 @@ mod tests {
                 }
             }
         }
-
-        assert_eq!(production_workspace.backend_name(), "dynamic");
     }
 
     #[test]
     fn vector_workspace_is_compact_and_rejects_cross_width_reuse_932() {
         assert!(
-            std::mem::size_of::<RigidVectorRowWorkspace>() <= 128,
-            "backend selector must not inline the fixed graph tape"
+            std::mem::size_of::<RigidVectorRowWorkspace<'static>>() <= 128,
+            "feature pullback workspace metadata must remain compact"
         );
-        assert!(RigidVectorRowWorkspace::new(0).is_err());
-        assert!(RigidVectorRowWorkspace::new(usize::MAX).is_err());
+        assert!(checked_vector_workspace_layout(0).is_err());
+        assert!(checked_vector_workspace_layout(usize::MAX).is_err());
 
-        let mut workspace = RigidVectorRowWorkspace::new(3).expect("k=3 workspace");
-        let covariance = MarginalSlopeCovariance::Diagonal(Array1::ones(2));
+        let empty_covariance = MarginalSlopeCovariance::Diagonal(Array1::zeros(0));
+        assert!(RigidVectorRowWorkspace::new(&empty_covariance).is_err());
+        let covariance = MarginalSlopeCovariance::Diagonal(Array1::ones(3));
+        let mut workspace = RigidVectorRowWorkspace::new(&covariance).expect("k=3 workspace");
         let error = row_primary_closed_form_vector_into(
             -0.2,
             0.4,
             1.1,
             &[0.3, -0.5],
             &[0.7, -1.2],
-            &covariance,
             1.0,
             1.0,
             1.0e-8,
@@ -2313,10 +2482,9 @@ mod tests {
         assert!(error.contains("workspace width mismatch"), "{error}");
     }
 
-    /// Temporary #932 release sweep for the fused fixed/graph cutover candidates.
-    /// This compares every canonical backend directly so the production cutoff
-    /// cannot hide a larger-width stack or lowering cost. Production and the
-    /// strongest-hand oracle both reuse all derivative output and hand scratch.
+    /// #932 release sweep for the feature pullback against every canonical
+    /// correctness oracle. Production and strongest-hand both reuse derivative
+    /// output and covariance scratch so timing includes row arithmetic only.
     #[test]
     fn release_measure_packed_widths_k1_to_k8_vs_strongest_hand_932() {
         use std::hint::black_box;
@@ -2372,7 +2540,7 @@ mod tests {
 
                 for &(label, covariance) in &cases {
                     for event in [0.0, 1.0] {
-                        let mut workspace = RigidVectorRowWorkspace::new($k)
+                        let mut workspace = RigidVectorRowWorkspace::new(covariance)
                             .expect("packed production workspace");
                         let mut hand_workspace =
                             vector_hand_oracle_tests::ReusableHandVectorRowWorkspace::new(
@@ -2387,10 +2555,10 @@ mod tests {
                         let mut graph_hessian = [0.0; $dim * $dim];
                         let mut dynamic_gradient = [0.0; $dim];
                         let mut dynamic_hessian = [0.0; $dim * $dim];
-                        let evaluate_production = |workspace: &mut RigidVectorRowWorkspace| {
+                        let evaluate_production = |workspace: &mut RigidVectorRowWorkspace<'_>| {
                             let value = row_primary_closed_form_vector_into(
-                                -0.28, 0.53, 1.18, &slopes, &scores, covariance, 1.21, event,
-                                1.0e-8, 0.87, workspace,
+                                -0.28, 0.53, 1.18, &slopes, &scores, 1.21, event, 1.0e-8, 0.87,
+                                workspace,
                             )
                             .expect("packed production width");
                             let derivatives = workspace.derivatives();

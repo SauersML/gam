@@ -93,7 +93,6 @@ use gam_solve::mixture_link::{
 
 use gam_solve::pirls::LinearInequalityConstraints;
 
-
 use crate::fit_orchestration::drivers::{
     ExactJointHyperSetup, freeze_term_collection_from_design,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
@@ -165,7 +164,7 @@ pub(crate) use moments::*;
 pub use predict::*;
 pub(crate) use prepare::*;
 pub use residual_dist::*;
-pub(crate) use row_kernel::*;
+pub use row_kernel::*;
 pub use spec::*;
 pub use time_block::*;
 pub(crate) use wiggle_geometry::*;

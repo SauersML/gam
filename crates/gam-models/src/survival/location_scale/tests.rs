@@ -91,14 +91,14 @@ impl SurvivalExactRowKernel {
             nll = nll
                 .add(
                     &q_exit
-                    .compose_unary([
-                        self.logphi1,
-                        self.dlogphi1,
-                        self.d2logphi1,
-                        self.d3logphi1,
-                        self.d4logphi1,
-                    ])
-                    .scale(-event_weight),
+                        .compose_unary([
+                            self.logphi1,
+                            self.dlogphi1,
+                            self.d2logphi1,
+                            self.d3logphi1,
+                            self.d4logphi1,
+                        ])
+                        .scale(-event_weight),
                 )
                 .add(
                     &g.compose_unary([
@@ -1090,14 +1090,20 @@ impl gam_math::jet_tower::RowProgram<SLS_ROW_K> for SurvivalLsJointNllProgram<'_
         // log_likelihood` / `nll_index_tower` (left truncation divides the
         // likelihood by S(u0), so its log ADDS to the NLL).
         let mut nll = u0
-            .compose_unary(survival_ls_log_survival_stack(self.inverse_link, u0.value())?)
+            .compose_unary(survival_ls_log_survival_stack(
+                self.inverse_link,
+                u0.value(),
+            )?)
             .scale(w);
 
         let censored_weight = w * (1.0 - d);
         if censored_weight != 0.0 {
             nll = nll.add(
-                &u1.compose_unary(survival_ls_log_survival_stack(self.inverse_link, u1.value())?)
-                    .scale(-censored_weight),
+                &u1.compose_unary(survival_ls_log_survival_stack(
+                    self.inverse_link,
+                    u1.value(),
+                )?)
+                .scale(-censored_weight),
             );
         }
 
@@ -1626,7 +1632,8 @@ fn survival_ls_packed_directional_high_curvature_body() {
         let rel_tol = 1e-8_f64;
 
         for row in 0..n {
-            let tower = program_full_tower(&program, row).expect("dense row tower (high curvature)");
+            let tower =
+                program_full_tower(&program, row).expect("dense row tower (high curvature)");
             for u in &dirs {
                 let dense_third = tower.third_contracted(u);
                 let packed_third =
@@ -6401,8 +6408,10 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
                         .scale(-event_weight),
                     )
                     .add(
-                        &g.compose_unary(survival_ls_positive_log_stack(gam_math::nested_dual::JetField::value(&g)))
-                            .scale(-event_weight),
+                        &g.compose_unary(survival_ls_positive_log_stack(
+                            gam_math::nested_dual::JetField::value(&g),
+                        ))
+                        .scale(-event_weight),
                     );
             }
             Ok(nll)
@@ -6846,7 +6855,10 @@ fn survival_ls_block_diagonal_wiggle_block_matches_single_source_932() {
         survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::value())
             .expect("wiggle design B(q0_exit)");
     let pw = xwiggle.ncols();
-    assert!(pw >= 2, "fixture must have a multi-column wiggle basis, got {pw}");
+    assert!(
+        pw >= 2,
+        "fixture must have a multi-column wiggle basis, got {pw}"
+    );
 
     for distribution in [
         ResidualDistribution::Gaussian,
@@ -6882,13 +6894,14 @@ fn survival_ls_block_diagonal_wiggle_block_matches_single_source_932() {
             offsets[SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE],
             offsets[SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE + 1],
         );
-        let evaluation = family.evaluate(&states).expect("live wiggle block evaluation");
-        let wiggle_block = match &evaluation.blockworking_sets
-            [SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE]
-        {
-            BlockWorkingSet::ExactNewton { hessian, .. } => hessian.to_dense(),
-            _ => panic!("wiggle block must use exact Newton curvature"),
-        };
+        let evaluation = family
+            .evaluate(&states)
+            .expect("live wiggle block evaluation");
+        let wiggle_block =
+            match &evaluation.blockworking_sets[SurvivalLocationScaleFamily::BLOCK_LINK_WIGGLE] {
+                BlockWorkingSet::ExactNewton { hessian, .. } => hessian.to_dense(),
+                _ => panic!("wiggle block must use exact Newton curvature"),
+            };
         assert_eq!(
             wiggle_block.dim(),
             (hi - lo, hi - lo),
@@ -7673,9 +7686,7 @@ fn survival_ls_scale_aware_location_block_trust_metric_floor_caps_starvation_156
         SlsCoefficientHessian::DiagonalOnly(diagonal) => diagonal,
         _ => panic!("diagonal target returned another packed SLS shape"),
     };
-    let raw_diag: Vec<f64> = (loc_start..loc_end)
-        .map(|j| h_diagonal[j].abs())
-        .collect();
+    let raw_diag: Vec<f64> = (loc_start..loc_end).map(|j| h_diagonal[j].abs()).collect();
     let raw_max = raw_diag.iter().copied().fold(0.0_f64, f64::max);
     let raw_min = raw_diag.iter().copied().fold(f64::INFINITY, f64::min);
     assert!(

@@ -48,6 +48,27 @@ pub(crate) fn event_mix(d: f64, event_val: f64, censored_val: f64) -> f64 {
     }
 }
 
+#[inline]
+fn survival_predictor_state(
+    h0: f64,
+    h1: f64,
+    d_raw: f64,
+    q0: f64,
+    q1: f64,
+    qdot1: f64,
+) -> SurvivalPredictorState {
+    let g_diff = compensated_difference(d_raw, -qdot1);
+    SurvivalPredictorState {
+        h0,
+        h1,
+        g: g_diff.value,
+        q0,
+        q1,
+        g_roundoff_slack: g_diff.roundoff_slack,
+        g_operand_scale: g_diff.operand_scale,
+    }
+}
+
 impl SurvivalExactRowKernel {
     #[inline]
     pub(crate) fn log_likelihood(self) -> f64 {
@@ -873,6 +894,282 @@ pub(crate) fn sls_row_nll_wiggle<'arena, S: RuntimeJetScalar<'arena>>(
             );
     }
     nll
+}
+
+/// Saved link-wiggle inputs for one survival location-scale ALO row.
+///
+/// Every slice is evaluated at the unwarped standardized residual for the
+/// same row. Second derivatives are required because the observed row Hessian
+/// includes the score-times-map-Hessian chain-rule term; a post-warp Jacobian
+/// alone is not exact.
+pub struct SurvivalLocationScaleAloWiggleInput<'a> {
+    pub beta: &'a [f64],
+    pub entry_basis: &'a [f64],
+    pub entry_basis_d1: &'a [f64],
+    pub entry_basis_d2: &'a [f64],
+    pub exit_basis: &'a [f64],
+    pub exit_basis_d1: &'a [f64],
+    pub exit_basis_d2: &'a [f64],
+}
+
+/// Exact affine local coordinates consumed by the fitted survival
+/// location-scale row likelihood.
+///
+/// The output coordinate order is
+///
+/// `[h_entry, h_exit, hdot_exit, eta_t_exit, eta_t_entry, eta_t_dot_exit,
+///   eta_log_sigma_exit, eta_log_sigma_entry, eta_log_sigma_dot_exit,
+///   link_wiggle_beta...]`.
+///
+/// These are deliberately the affine predictor channels, not the post-warp
+/// indices `(u_entry, u_exit, g)`: the latter have a nonlinear parameter map
+/// whose second derivative contributes to observed curvature.
+pub struct SurvivalLocationScaleAloRowInput<'a> {
+    pub inverse_link: &'a InverseLink,
+    pub prior_weight: f64,
+    pub event: f64,
+    pub derivative_guard: f64,
+    pub h_entry: f64,
+    pub h_exit: f64,
+    pub hdot_exit: f64,
+    pub eta_threshold_exit: f64,
+    pub eta_threshold_entry: f64,
+    pub eta_threshold_derivative_exit: f64,
+    pub eta_log_sigma_exit: f64,
+    pub eta_log_sigma_entry: f64,
+    pub eta_log_sigma_derivative_exit: f64,
+    pub link_wiggle: Option<SurvivalLocationScaleAloWiggleInput<'a>>,
+}
+
+pub struct SurvivalLocationScaleAloRowGeometry {
+    pub nll_score: Array1<f64>,
+    pub observed_hessian: Array2<f64>,
+    pub coordinate_values: Array1<f64>,
+}
+
+/// Replay one saved survival location-scale row through the exact fitting
+/// program and return its NLL score and observed Hessian.
+///
+/// No coefficient-space numerical differentiation, Fisher substitution, or
+/// simplified post-warp map is used. A zero-weight row returns exact zero
+/// channels before evaluating predictors, matching the fitter's dropped-row
+/// semantics.
+pub fn survival_location_scale_alo_row_geometry(
+    input: SurvivalLocationScaleAloRowInput<'_>,
+) -> Result<SurvivalLocationScaleAloRowGeometry, String> {
+    if !input.prior_weight.is_finite() || input.prior_weight < 0.0 {
+        return Err(format!(
+            "survival location-scale ALO prior weight must be finite and non-negative, got {}",
+            input.prior_weight
+        ));
+    }
+    let wiggle_dimension = input
+        .link_wiggle
+        .as_ref()
+        .map_or(0, |wiggle| wiggle.beta.len());
+    if let Some(wiggle) = input.link_wiggle.as_ref() {
+        for (label, values) in [
+            ("entry basis", wiggle.entry_basis),
+            ("entry basis d1", wiggle.entry_basis_d1),
+            ("entry basis d2", wiggle.entry_basis_d2),
+            ("exit basis", wiggle.exit_basis),
+            ("exit basis d1", wiggle.exit_basis_d1),
+            ("exit basis d2", wiggle.exit_basis_d2),
+        ] {
+            if values.len() != wiggle_dimension {
+                return Err(format!(
+                    "survival location-scale ALO {label} has {} entries; link-wiggle beta has {wiggle_dimension}",
+                    values.len()
+                ));
+            }
+        }
+        if wiggle_dimension == 0 {
+            return Err(
+                "survival location-scale ALO link-wiggle metadata has zero coefficients"
+                    .to_string(),
+            );
+        }
+    }
+    let dimension = SLS_ROW_K + wiggle_dimension;
+    let mut coordinate_values = vec![
+        input.h_entry,
+        input.h_exit,
+        input.hdot_exit,
+        input.eta_threshold_exit,
+        input.eta_threshold_entry,
+        input.eta_threshold_derivative_exit,
+        input.eta_log_sigma_exit,
+        input.eta_log_sigma_entry,
+        input.eta_log_sigma_derivative_exit,
+    ];
+    if let Some(wiggle) = input.link_wiggle.as_ref() {
+        coordinate_values.extend_from_slice(wiggle.beta);
+    }
+    let coordinate_values = Array1::from_vec(coordinate_values);
+    if input.prior_weight == 0.0 {
+        return Ok(SurvivalLocationScaleAloRowGeometry {
+            nll_score: Array1::zeros(dimension),
+            observed_hessian: Array2::zeros((dimension, dimension)),
+            coordinate_values,
+        });
+    }
+    if !input.event.is_finite() || !(0.0..=1.0).contains(&input.event) {
+        return Err(format!(
+            "survival location-scale ALO event target must lie in [0,1], got {}",
+            input.event
+        ));
+    }
+
+    let inv_sigma_entry = (-input.eta_log_sigma_entry).exp();
+    let inv_sigma_exit = (-input.eta_log_sigma_exit).exp();
+    let q_base_entry = -input.eta_threshold_entry * inv_sigma_entry;
+    let q_base_exit = -input.eta_threshold_exit * inv_sigma_exit;
+    let qdot_base_exit = inv_sigma_exit
+        * (input.eta_threshold_exit * input.eta_log_sigma_derivative_exit
+            - input.eta_threshold_derivative_exit);
+    let (q_entry, q_exit, qdot_exit) = match input.link_wiggle.as_ref() {
+        Some(wiggle) => {
+            let mut q_entry = q_base_entry;
+            let mut q_exit = q_base_exit;
+            let mut derivative_multiplier = 1.0;
+            for coefficient in 0..wiggle_dimension {
+                let beta = wiggle.beta[coefficient];
+                q_entry += beta * wiggle.entry_basis[coefficient];
+                q_exit += beta * wiggle.exit_basis[coefficient];
+                derivative_multiplier += beta * wiggle.exit_basis_d1[coefficient];
+            }
+            (q_entry, q_exit, derivative_multiplier * qdot_base_exit)
+        }
+        None => (q_base_entry, q_base_exit, qdot_base_exit),
+    };
+    let state = survival_predictor_state(
+        input.h_entry,
+        input.h_exit,
+        input.hdot_exit,
+        q_entry,
+        q_exit,
+        qdot_exit,
+    );
+    let kernel = SurvivalLocationScaleFamily::exact_row_kernel_from_parts(
+        input.inverse_link,
+        input.derivative_guard,
+        input.prior_weight,
+        input.event,
+        0,
+        state,
+        0.0,
+    )?
+    .expect("positive-weight ALO row produces an exact kernel");
+
+    let (score, hessian) = match input.link_wiggle.as_ref() {
+        None => {
+            let primary: [f64; SLS_ROW_K] = coordinate_values
+                .as_slice()
+                .expect("owned ALO coordinates are contiguous")
+                .try_into()
+                .expect("non-wiggle coordinate count is nine");
+            let (_, score, hessian) = sls_row_vgh_compiled(&primary, &kernel);
+            (
+                Array1::from_vec(score.to_vec()),
+                Array2::from_shape_vec(
+                    (SLS_ROW_K, SLS_ROW_K),
+                    hessian.into_iter().flatten().collect(),
+                )
+                .expect("fixed survival location-scale Hessian shape"),
+            )
+        }
+        Some(wiggle) => {
+            let arena = DynamicJetArena::new();
+            let variables = arena.alloc_slice_fill_with(dimension, |axis| {
+                DynamicOrder2::variable(coordinate_values[axis], axis, dimension, &arena)
+            });
+            let zero_third = vec![0.0; wiggle_dimension];
+            let basis = SlsWiggleRowBasis {
+                b_u0: [
+                    wiggle.entry_basis,
+                    wiggle.entry_basis_d1,
+                    wiggle.entry_basis_d2,
+                    &zero_third,
+                ],
+                b_u1: [
+                    wiggle.exit_basis,
+                    wiggle.exit_basis_d1,
+                    wiggle.exit_basis_d2,
+                    &zero_third,
+                ],
+            };
+            let result = sls_row_nll_wiggle(variables, &kernel, wiggle_dimension, &basis);
+            (
+                Array1::from_vec(result.g().to_vec()),
+                Array2::from_shape_vec((dimension, dimension), result.h().to_vec())
+                    .expect("dynamic survival location-scale Hessian shape"),
+            )
+        }
+    };
+    if score.iter().any(|value| !value.is_finite())
+        || hessian.iter().any(|value| !value.is_finite())
+        || coordinate_values.iter().any(|value| !value.is_finite())
+    {
+        return Err(
+            "survival location-scale ALO row geometry contains a non-finite channel".to_string(),
+        );
+    }
+    Ok(SurvivalLocationScaleAloRowGeometry {
+        nll_score: score,
+        observed_hessian: hessian,
+        coordinate_values,
+    })
+}
+
+#[cfg(test)]
+mod saved_alo_row_tests {
+    use super::*;
+
+    #[test]
+    fn saved_censored_cloglog_row_matches_independent_closed_form_jet() {
+        let weight = 1.7;
+        let geometry = survival_location_scale_alo_row_geometry(SurvivalLocationScaleAloRowInput {
+            inverse_link: &InverseLink::Standard(StandardLink::CLogLog),
+            prior_weight: weight,
+            event: 0.0,
+            derivative_guard: 1e-8,
+            h_entry: -0.3,
+            h_exit: 0.4,
+            hdot_exit: 1.2,
+            eta_threshold_exit: 0.25,
+            eta_threshold_entry: -0.15,
+            eta_threshold_derivative_exit: 0.08,
+            eta_log_sigma_exit: 0.2,
+            eta_log_sigma_entry: -0.1,
+            eta_log_sigma_derivative_exit: -0.04,
+            link_wiggle: None,
+        })
+        .expect("exact saved row geometry");
+
+        // Independent CLogLog censored-row identity:
+        // NLL = w[log S(u_entry) - log S(u_exit)]
+        //     = w[-exp(u_entry) + exp(u_exit)].
+        let arena = DynamicJetArena::new();
+        let vars = arena.alloc_slice_fill_with(SLS_ROW_K, |axis| {
+            DynamicOrder2::variable(geometry.coordinate_values[axis], axis, SLS_ROW_K, &arena)
+        });
+        let u_entry = vars[0].sub(&vars[4].mul(&vars[7].neg().exp()));
+        let u_exit = vars[1].sub(&vars[3].mul(&vars[6].neg().exp()));
+        let oracle = u_entry
+            .exp()
+            .scale(-weight)
+            .add(&u_exit.exp().scale(weight));
+
+        for axis in 0..SLS_ROW_K {
+            assert!((geometry.nll_score[axis] - oracle.g()[axis]).abs() <= 2e-12);
+            for other in 0..SLS_ROW_K {
+                assert!(
+                    (geometry.observed_hessian[[axis, other]] - oracle.h_at(axis, other)).abs()
+                        <= 3e-12
+                );
+            }
+        }
+    }
 }
 
 /// #932 link-wiggle joint-Hessian production kernel: routes the survival-LS
@@ -3505,16 +3802,7 @@ impl SurvivalLocationScaleFamily {
         q1: f64,
         qdot1: f64,
     ) -> SurvivalPredictorState {
-        let g_diff = compensated_difference(d_raw, -qdot1);
-        SurvivalPredictorState {
-            h0,
-            h1,
-            g: g_diff.value,
-            q0,
-            q1,
-            g_roundoff_slack: g_diff.roundoff_slack,
-            g_operand_scale: g_diff.operand_scale,
-        }
+        survival_predictor_state(h0, h1, d_raw, q0, q1, qdot1)
     }
 
     #[inline]
@@ -3548,17 +3836,43 @@ impl SurvivalLocationScaleFamily {
         state: SurvivalPredictorState,
         deriv_log_scale: f64,
     ) -> Result<Option<SurvivalExactRowKernel>, String> {
-        let w = self.w[row];
+        Self::exact_row_kernel_from_parts(
+            &self.inverse_link,
+            self.derivative_guard,
+            self.w[row],
+            self.y[row],
+            row,
+            state,
+            deriv_log_scale,
+        )
+    }
+
+    fn exact_row_kernel_from_parts(
+        inverse_link: &InverseLink,
+        derivative_guard: f64,
+        w: f64,
+        d: f64,
+        row: usize,
+        state: SurvivalPredictorState,
+        deriv_log_scale: f64,
+    ) -> Result<Option<SurvivalExactRowKernel>, String> {
         if w <= 0.0 {
             return Ok(None);
         }
-        let d = self.validated_event_target(row)?;
+        if !(d.is_finite() && (0.0..=1.0).contains(&d)) {
+            return Err(SurvivalLocationScaleError::ConstraintViolation {
+                reason: format!(
+                    "survival location-scale event target must lie in [0,1] at row {row}, got {d}"
+                ),
+            }
+            .into());
+        }
         let u0 = state.h0 + state.q0;
         let u1 = state.h1 + state.q1;
 
         let (log_s0, r0, dr0, ddr0, dddr0) =
             Self::exact_survival_neglog_derivatives_fourth_rescaled(
-                &self.inverse_link,
+                inverse_link,
                 u0,
                 deriv_log_scale,
             )
@@ -3571,14 +3885,11 @@ impl SurvivalLocationScaleFamily {
         // `exp(u1 - deriv_log_scale)`. Share that work when both are called
         // back-to-back on the exit row.
         let ((log_s1, r1, dr1, ddr1, dddr1), (logphi1, dlogphi1, d2logphi1, d3logphi1, d4logphi1)) =
-            if matches!(
-                &self.inverse_link,
-                InverseLink::Standard(StandardLink::CLogLog)
-            ) {
+            if matches!(inverse_link, InverseLink::Standard(StandardLink::CLogLog)) {
                 Self::clglog_exit_pair(u1, deriv_log_scale)
             } else {
                 let surv = Self::exact_survival_neglog_derivatives_fourth_rescaled(
-                    &self.inverse_link,
+                    inverse_link,
                     u1,
                     deriv_log_scale,
                 )
@@ -3586,14 +3897,11 @@ impl SurvivalLocationScaleFamily {
                     format!("inverse-link survival evaluation failed at row {row} exit: {e}")
                 })?;
 
-                let pdf = Self::exact_log_pdf_derivatives_rescaled(
-                    &self.inverse_link,
-                    u1,
-                    deriv_log_scale,
-                )
-                .map_err(|e| {
-                    format!("inverse-link log-pdf evaluation failed at row {row} exit: {e}")
-                })?;
+                let pdf =
+                    Self::exact_log_pdf_derivatives_rescaled(inverse_link, u1, deriv_log_scale)
+                        .map_err(|e| {
+                            format!("inverse-link log-pdf evaluation failed at row {row} exit: {e}")
+                        })?;
                 (surv, pdf)
             };
 
@@ -3624,7 +3932,15 @@ impl SurvivalLocationScaleFamily {
             .into());
         }
 
-        let guard = self.time_derivative_lower_bound();
+        if !(derivative_guard.is_finite() && derivative_guard > 0.0) {
+            return Err(SurvivalLocationScaleError::InvalidConfiguration {
+                reason: format!(
+                    "survival location-scale derivative guard must be finite and positive, got {derivative_guard}"
+                ),
+            }
+            .into());
+        }
+        let guard = derivative_guard;
         let mut g = state.g;
         // Layer 4: NaN is a hard error (genuinely bad data or upstream logic
         // bug).  ±inf is clamped to finite extremes so downstream log(g) is

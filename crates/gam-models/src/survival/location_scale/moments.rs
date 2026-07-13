@@ -595,10 +595,8 @@ pub(crate) fn survival_location_scale_finalization_gauge(
     if let Some(width) = p_linkwiggle {
         block_transforms.push(Array2::<f64>::eye(width));
     }
-    let joint_gauge =
-        Gauge::from_block_transforms_with_shift(&block_transforms, affine_shift);
-    let p_reduced =
-        p_time_reduced + p_threshold_reduced + p_log_sigma_reduced + p_linkwiggle_width;
+    let joint_gauge = Gauge::from_block_transforms_with_shift(&block_transforms, affine_shift);
+    let p_reduced = p_time_reduced + p_threshold_reduced + p_log_sigma_reduced + p_linkwiggle_width;
     assert_eq!(joint_gauge.raw_total(), p_full);
     assert_eq!(joint_gauge.reduced_total(), p_reduced);
     Ok(joint_gauge)
