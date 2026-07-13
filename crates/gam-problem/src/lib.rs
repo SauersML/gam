@@ -1048,7 +1048,7 @@ impl DriftDerivResult {
 }
 
 pub type FixedDriftDerivFn =
-    Box<dyn Fn(usize, &Array1<f64>) -> Option<DriftDerivResult> + Send + Sync>;
+    Box<dyn Fn(usize, &Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>;
 
 /// Shared-ownership form of [`FixedDriftDerivFn`] used for `InnerSolution`
 /// storage, so the same `M_i[u] = D_β B_i[u]` callback can be cloned into a
@@ -1058,7 +1058,7 @@ pub type FixedDriftDerivFn =
 /// (tangent-wrapped) Hessian operator's `trace_logdet_*`, so the clone-through
 /// is exact under projection.
 pub type SharedFixedDriftDerivFn =
-    Arc<dyn Fn(usize, &Array1<f64>) -> Option<DriftDerivResult> + Send + Sync>;
+    Arc<dyn Fn(usize, &Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>;
 
 pub struct ContractedPsiSecondOrder {
     pub objective: Array1<f64>,
