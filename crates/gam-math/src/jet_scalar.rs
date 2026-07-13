@@ -110,6 +110,26 @@ where
     out
 }
 
+fn linear_combination_default<T>(
+    inputs: &[T],
+    weights: &[f64],
+    constant: impl Fn(f64) -> T,
+    add: impl Fn(&T, &T) -> T,
+    scale: impl Fn(&T, f64) -> T,
+) -> T {
+    assert_eq!(
+        inputs.len(),
+        weights.len(),
+        "linear-combination dimension mismatch"
+    );
+    inputs
+        .iter()
+        .zip(weights)
+        .fold(constant(0.0), |sum, (input, &weight)| {
+            add(&sum, &scale(input, weight))
+        })
+}
+
 /// A truncated-Taylor scalar carrying derivatives in `K` primaries.
 ///
 /// All concrete scalars here ([`Order2`], [`OneSeed`], [`TwoSeed`]) and the full
@@ -140,6 +160,17 @@ pub trait JetScalar<const K: usize>: crate::nested_dual::JetField + Copy {
             Self::constant,
             crate::nested_dual::JetField::add,
             crate::nested_dual::JetField::mul,
+            crate::nested_dual::JetField::scale,
+        )
+    }
+
+    /// Evaluate `sum_i weights[i] * inputs[i]` in one semantic primitive.
+    fn linear_combination(inputs: &[Self], weights: &[f64]) -> Self {
+        linear_combination_default(
+            inputs,
+            weights,
+            Self::constant,
+            crate::nested_dual::JetField::add,
             crate::nested_dual::JetField::scale,
         )
     }
@@ -258,6 +289,23 @@ pub trait RuntimeJetScalar<'arena>: Clone {
             Self::scale,
         )
     }
+
+
+    /// Evaluate `sum_i weights[i] * inputs[i]` in one semantic primitive.
+    fn linear_combination(
+        inputs: &[Self],
+        weights: &[f64],
+        dimension: usize,
+        workspace: &'arena Self::Workspace,
+    ) -> Self {
+        linear_combination_default(
+            inputs,
+            weights,
+            |value| Self::constant(value, dimension, workspace),
+            Self::add,
+            Self::scale,
+        )
+    }
     /// Number of primary derivative axes carried by this scalar.
     fn dimension(&self) -> usize;
     /// Value channel.
@@ -353,6 +401,23 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
             unsafe { std::slice::from_raw_parts(inputs.as_ptr().cast::<S>(), inputs.len()) };
         Self {
             inner: S::symmetric_quadratic_form(inner, coefficients),
+        }
+    }
+
+    #[inline(always)]
+    fn linear_combination(
+        inputs: &[Self],
+        weights: &[f64],
+        dimension: usize,
+        &(): &'arena Self::Workspace,
+    ) -> Self {
+        assert_eq!(dimension, K, "fixed jet dimension mismatch");
+        assert_eq!(inputs.len(), weights.len());
+        // `FixedRuntimeJet` is `repr(transparent)` over `S`.
+        let inner =
+            unsafe { std::slice::from_raw_parts(inputs.as_ptr().cast::<S>(), inputs.len()) };
+        Self {
+            inner: S::linear_combination(inner, weights),
         }
     }
 
@@ -761,21 +826,63 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             gradient[primary] = 2.0 * channel;
         }
         let hessian = arena.zeros(dimension * dimension);
-        for primary_a in 0..dimension {
-            for primary_b in primary_a..dimension {
+        let input_gradient = arena.zeros(input_dimension);
+        let projected_gradient = arena.zeros(input_dimension);
+        for primary_b in 0..dimension {
+            for row in 0..input_dimension {
+                input_gradient[row] = inputs[row].g[primary_b];
+            }
+            coefficients.multiply(input_gradient, projected_gradient);
+            for primary_a in 0..=primary_b {
                 let mut inherited = 0.0;
                 let mut curvature = 0.0;
                 for row in 0..input_dimension {
                     inherited += projected[row] * inputs[row].h[primary_a * dimension + primary_b];
-                    for column in 0..input_dimension {
-                        curvature += coefficients.coefficient(row, column)
-                            * inputs[row].g[primary_a]
-                            * inputs[column].g[primary_b];
-                    }
+                    curvature += inputs[row].g[primary_a] * projected_gradient[row];
                 }
                 let channel = 2.0 * (inherited + curvature);
                 hessian[primary_a * dimension + primary_b] = channel;
                 hessian[primary_b * dimension + primary_a] = channel;
+            }
+        }
+        Self {
+            arena,
+            v: value,
+            g: gradient,
+            h: hessian,
+        }
+    }
+
+    #[inline(always)]
+    fn linear_combination(
+        inputs: &[Self],
+        weights: &[f64],
+        dimension: usize,
+        arena: &'arena DynamicJetArena,
+    ) -> Self {
+        assert_eq!(inputs.len(), weights.len());
+        assert!(
+            inputs.iter().all(|input| {
+                input.dimension() == dimension && std::ptr::eq(input.arena, arena)
+            }),
+            "dynamic linear-combination jets must share dimension and arena"
+        );
+        let mut value = 0.0;
+        for (input, &weight) in inputs.iter().zip(weights) {
+            value += input.v * weight;
+        }
+        let gradient = arena.zeros(dimension);
+        let hessian = arena.zeros(dimension * dimension);
+        for primary in 0..dimension {
+            for (input, &weight) in inputs.iter().zip(weights) {
+                gradient[primary] += input.g[primary] * weight;
+            }
+            for other in primary..dimension {
+                let index = primary * dimension + other;
+                for (input, &weight) in inputs.iter().zip(weights) {
+                    hessian[index] += input.h[index] * weight;
+                }
+                hessian[other * dimension + primary] = hessian[index];
             }
         }
         Self {

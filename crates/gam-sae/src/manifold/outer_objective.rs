@@ -3984,7 +3984,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // Skipped under a #2080 (a) handoff: the installed state is already AT
         // the converged optimum for this ρ, and the encoder warm-start is a
         // basin-ENTRY heuristic that would only move latents off it.
-        if !probe_handoff_installed {
+        if !probe_handoff_installed && !self.audit_installed_state {
             let warm_start_outcome = self
                 .term
                 .warm_start_latents_from_amortized_encoder(self.target.view(), &rho_state);
