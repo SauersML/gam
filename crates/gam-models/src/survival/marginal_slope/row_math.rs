@@ -746,12 +746,9 @@ where
         .into());
     }
 
-    let observed_slopes = (0..k)
-        .map(|axis| vars[3 + axis].scale(inputs.probit_scale))
-        .collect::<Vec<_>>();
     let mut linear = S::constant(0.0, dimension, workspace);
     for axis in 0..k {
-        linear = linear.add(&observed_slopes[axis].scale(z[axis]));
+        linear = linear.add(&vars[3 + axis].scale(inputs.probit_scale * z[axis]));
     }
 
     // Preserve each covariance representation's canonical accumulation order.
@@ -761,8 +758,8 @@ where
         MarginalSlopeCovariance::Diagonal(diagonal) => {
             for axis in 0..k {
                 variance = variance.add(
-                    &observed_slopes[axis]
-                        .mul(&observed_slopes[axis])
+                    &vars[3 + axis]
+                        .mul(&vars[3 + axis])
                         .scale(diagonal[axis]),
                 );
             }
@@ -771,21 +768,22 @@ where
             for row in 0..k {
                 let mut row_dot = S::constant(0.0, dimension, workspace);
                 for column in 0..k {
-                    row_dot = row_dot.add(&observed_slopes[column].scale(matrix[[row, column]]));
+                    row_dot = row_dot.add(&vars[3 + column].scale(matrix[[row, column]]));
                 }
-                variance = variance.add(&observed_slopes[row].mul(&row_dot));
+                variance = variance.add(&vars[3 + row].mul(&row_dot));
             }
         }
         MarginalSlopeCovariance::LowRank(factor) => {
             for column in 0..factor.ncols() {
                 let mut projection = S::constant(0.0, dimension, workspace);
                 for row in 0..k {
-                    projection = projection.add(&observed_slopes[row].scale(factor[[row, column]]));
+                    projection = projection.add(&vars[3 + row].scale(factor[[row, column]]));
                 }
                 variance = variance.add(&projection.mul(&projection));
             }
         }
     }
+    variance = variance.scale(inputs.probit_scale * inputs.probit_scale);
     let variance_value = variance.value();
     if !(variance_value.is_finite()
         && variance_value >= crate::bms::gradient_paths::COVARIANCE_QUADRATIC_FORM_PSD_TOL)
