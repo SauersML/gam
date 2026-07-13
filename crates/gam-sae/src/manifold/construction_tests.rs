@@ -116,7 +116,7 @@ mod amortized_encoder_tests {
                 target.view(),
                 &rho,
                 None,
-                8,
+                40,
                 0.4,
                 1.0e-6,
                 1.0e-6,
