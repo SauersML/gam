@@ -490,6 +490,13 @@ pub fn sae_intrinsic_seed_initial_coords(
     atom_dim: &[usize],
 ) -> Result<Array3<f64>, String> {
     let k_atoms = basis_kinds.len();
+    if atom_dim.len() != k_atoms {
+        return Err(format!(
+            "sae_intrinsic_seed_initial_coords: basis_kinds and atom_dim must have the same length; got {} and {}",
+            k_atoms,
+            atom_dim.len()
+        ));
+    }
     let (n_obs, _p) = z.dim();
     let latent_d_max = atom_dim.iter().copied().max().unwrap_or(1).max(1);
     let embedding_axes = basis_kinds
@@ -759,5 +766,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn intrinsic_seed_rejects_misaligned_atom_metadata() {
+        let z = Array2::<f64>::zeros((3, 2));
+        let error = sae_intrinsic_seed_initial_coords(
+            z.view(),
+            &[SaeAtomBasisKind::Linear, SaeAtomBasisKind::Sphere],
+            &[2],
+        )
+        .unwrap_err();
+        assert!(error.contains("same length"));
     }
 }
