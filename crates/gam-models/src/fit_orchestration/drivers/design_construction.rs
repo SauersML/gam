@@ -2082,6 +2082,11 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         .with_fallback_policy(gam_solve::rho_optimizer::FallbackPolicy::Disabled)
         .with_psi_dim(n_theta.saturating_sub(rho_dim))
         .with_tolerance(options.tol)
+        // The Charbonnier surface is routinely flat at an active box face.
+        // Make its intended score-relative stationarity resolution part of the
+        // optimizer-owned certificate instead of reinterpreting a rejected
+        // checkpoint after `run` returns (SPEC 20).
+        .with_rel_cost_tolerance(Some(options.tol))
         .with_max_iter(options.max_iter)
         .with_seed_config(gam_problem::SeedConfig::default())
         .with_screening_cap(Arc::clone(&screening_cap))
@@ -2327,63 +2332,16 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         },
     );
 
-    let outer_result = problem
-        .run(&mut obj, "exact spatial adaptive regularization")
+    let certified_outer = problem
+        .run_certified(&mut obj, "exact spatial adaptive regularization")
         .map_err(|e| {
             EstimationError::InvalidInput(format!(
                 "exact spatial adaptive outer optimization failed: {e}"
             ))
         })?;
-    if !outer_result.converged {
-        // The strict absolute-floor gradient criterion (`‖g‖_proj ≤ options.tol`)
-        // is too tight near the box-constrained boundary of the adaptive
-        // Charbonnier pseudo-Laplace objective: as the optimizer pushes ε → ∞
-        // (overlay-disabled corner), λ → λ_min, the Hessian's nearly-null
-        // direction lets Cauchy/Newton accept ~e-3-magnitude probe steps that
-        // give cost changes well below 6-digit precision, and the projected
-        // gradient floors at numerical-noise-scale (≈ 5e-6 for n≈500, cost≈
-        // 3e2 fits in double precision) rather than at 0. Accept the iterate
-        // when the mgcv-style relative-to-cost criterion ‖g‖_proj ≤ τ·(1+|f|)
-        // is satisfied — that is the textbook REML convergence rule and is
-        // exactly what `opt::GradientTolerance::relative_to_cost(τ)` would
-        // have enforced if this OuterProblem path had wired it through. The
-        // strict absolute floor is retained as the primary check; the
-        // rel-to-cost form only kicks in once the absolute one has timed out
-        // at `max_iter`, so unconverged divergent runs (which have large |g|)
-        // still surface as errors.
-        let rel_to_cost_threshold = options.tol * (1.0_f64 + outer_result.final_value.abs());
-        // Rel-to-cost acceptance requires an actual gradient measurement;
-        // `None` (cache-hit short-circuit, gradient-free path) cannot satisfy
-        // the mgcv-style criterion regardless of magnitude.
-        if let Some(final_grad) = outer_result
-            .final_grad_norm
-            .filter(|v| v.is_finite() && *v <= rel_to_cost_threshold)
-        {
-            log::info!(
-                "[spatial-adaptive] outer optimization hit max_iter={} but \
-                 projected gradient norm {:.3e} ≤ τ·(1+|f|) = {:.3e} \
-                 (τ={:.3e}, |f|={:.3e}); accepting iterate under the mgcv-style \
-                 relative-to-cost REML convergence criterion.",
-                outer_result.iterations,
-                final_grad,
-                rel_to_cost_threshold,
-                options.tol,
-                outer_result.final_value.abs(),
-            );
-        } else {
-            crate::bail_invalid_estim!(
-                "exact spatial adaptive outer optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
-                outer_result.iterations,
-                outer_result.final_value,
-                outer_result.final_grad_norm_report(),
-            );
-        }
-    }
-    let outer_iterations = outer_result.iterations;
-    // `None` = no gradient measurement (cache-hit / gradient-free); the
-    // authoritative convergence signal is `outer_converged`.
-    let outer_grad_norm: Option<f64> = outer_result.final_grad_norm;
-    let theta_star = outer_result.rho;
+    let outer_iterations = certified_outer.iterations();
+    let outer_grad_norm = certified_outer.final_grad_norm();
+    let theta_star = certified_outer.rho().clone();
     let DecodedSpatialAdaptiveTheta {
         rho: _,
         retained_lambdas,
@@ -2397,23 +2355,36 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     for (idx, penalty) in retained_penalties.iter().enumerate() {
         fixed_total.scaled_add(retained_lambdas[idx], penalty);
     }
+    // Preserve the exact outer geometry for certified finalization: retained
+    // quadratic penalties remain in the block spec (and therefore in the rho
+    // prefix), while adaptive lambda/epsilon coordinates are realized in the
+    // family.  A second equivalent representation with the retained quadratic
+    // folded into the family is used only for downstream diagnostics below.
+    let certified_final_family = base_family.with_adaptive_params(
+        adaptive_params.clone(),
+        zero_quadratic.clone(),
+    );
     let final_family =
         base_family.with_adaptive_params(adaptive_params.clone(), Arc::new(fixed_total.clone()));
     let final_blockspec = ParameterBlockSpec {
         name: "eta".to_string(),
         design: baseline.design.design.clone(),
         offset: offset.to_owned(),
-        penalties: vec![],
-        nullspace_dims: vec![],
-        initial_log_lambdas: Array1::zeros(0),
+        penalties: retained_penalties
+            .iter()
+            .cloned()
+            .map(PenaltyMatrix::Dense)
+            .collect(),
+        nullspace_dims: retained_nullspace_dims.clone(),
+        initial_log_lambdas: theta_star.slice(s![..rho_dim]).to_owned(),
         initial_beta: Some(baseline.fit.beta.clone()),
         gauge_priority: 100,
         jacobian_callback: None,
         stacked_design: None,
         stacked_offset: None,
     };
-    let final_fit = fit_custom_family(
-        &final_family,
+    let final_fit = fit_custom_family_fixed_log_lambdas_from_outer(
+        &certified_final_family,
         &[final_blockspec],
         &BlockwiseFitOptions {
             inner_max_cycles: options.max_iter,
@@ -2423,6 +2394,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             compute_covariance: true,
             ..BlockwiseFitOptions::default()
         },
+        obj.state.warm_cache.as_ref(),
+        &theta_star,
+        &certified_outer,
     )
     .map_err(EstimationError::CustomFamily)?;
     let beta = final_fit.block_states[0].beta.clone();
@@ -2624,10 +2598,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 working_response: inf.working_response.clone(),
             });
             let covariance_conditional = beta_covariance;
-            // `final_fit` is a sealed `UnifiedFitResult`: it can only exist
-            // because `try_from_parts` already certified inner+outer
-            // convergence, so its outer status is convergence by construction.
-            let pirls_status_val = gam_solve::pirls::PirlsStatus::Converged;
+            let convergence = final_fit.convergence_evidence();
+            let pirls_status_val = convergence.inner_status();
+            let certified_outer_present = convergence.outer_certificate().is_some();
             UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
                 blocks: vec![gam_solve::estimate::FittedBlock {
                     beta: beta.clone(),
@@ -2647,8 +2620,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 penalized_objective: final_fit.penalized_objective,
                 used_device: false,
                 outer_iterations,
-                // Sealed result ⇒ outer convergence was certified at assembly.
-                outer_converged: true,
+                outer_converged: certified_outer_present,
                 outer_gradient_norm: outer_grad_norm,
                 standard_deviation,
                 covariance_conditional,
@@ -2662,6 +2634,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 constraint_kkt: None,
                 artifacts: gam_solve::estimate::FitArtifacts {
                     pirls: None,
+                    criterion_certificate: final_fit.artifacts.criterion_certificate.clone(),
                     ..Default::default()
                 },
                 inner_cycles: 0,

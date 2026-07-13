@@ -1510,6 +1510,13 @@ mod adaptive_bounded_duchon_tests {
         assert_eq!(diag.maps.len(), 1);
         assert!(fit.fit.beta.iter().all(|v| v.is_finite()));
         assert!(fit.fit.reml_score.is_finite());
+        let outer_certificate = fit
+            .fit
+            .convergence_evidence()
+            .outer_certificate()
+            .expect("an optimized adaptive fit must retain optimizer-owned outer evidence");
+        assert!(outer_certificate.certifies());
+        assert_eq!(fit.fit.outer_iterations, diag.epsilon_outer_iterations);
     }
 
     #[test]

@@ -23,6 +23,7 @@ use gam_custom_family::{
     ExactNewtonOuterObjective, FamilyEvaluation, FamilyLinearizationState, ParameterBlockSpec,
     ParameterBlockState, PenaltyMatrix, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    fit_custom_family_fixed_log_lambdas_from_outer,
 };
 
 use gam_solve::estimate::{
