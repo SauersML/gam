@@ -943,7 +943,7 @@ pub fn jeffreys_subspace_from_penalty(
 #[derive(Clone)]
 pub struct JointJeffreysPlan {
     z_j: Array2<f64>,
-    reduced_information: Array2<f64>,
+    reduced_dim: usize,
     evals: Array1<f64>,
     evecs: Array2<f64>,
     lambda_min: f64,
@@ -980,7 +980,7 @@ impl JointJeffreysPlan {
         if m == 0 {
             return Ok(Self {
                 z_j: z_j.to_owned(),
-                reduced_information: Array2::zeros((0, 0)),
+                reduced_dim: 0,
                 evals: Array1::zeros(0),
                 evecs: Array2::zeros((0, 0)),
                 lambda_min: f64::INFINITY,
@@ -1024,7 +1024,7 @@ impl JointJeffreysPlan {
         }
         Ok(Self {
             z_j: z_j.to_owned(),
-            reduced_information: h_id_sym,
+            reduced_dim: m,
             evals,
             evecs,
             lambda_min,
@@ -1039,7 +1039,7 @@ impl JointJeffreysPlan {
 
     /// Whether the exact conditioning gate permits a nonzero Jeffreys term.
     pub fn is_active(&self) -> bool {
-        !self.reduced_information.is_empty() && self.gate_weight != 0.0
+        self.reduced_dim != 0 && self.gate_weight != 0.0
     }
 
     fn coefficient_dim(&self) -> usize {
@@ -1129,7 +1129,7 @@ where
     if !plan.is_active() {
         return Ok((0.0, Array1::zeros(p), Array2::zeros((p, p))));
     }
-    let m = plan.reduced_information.nrows();
+    let m = plan.reduced_dim;
     let z_j = plan.z_j;
     let evals = plan.evals;
     let evecs = plan.evecs;
@@ -1990,7 +1990,7 @@ impl JeffreysHphiDriftBase {
         hdots: Vec<Array2<f64>>,
     ) -> Result<Option<JeffreysHphiDriftBase>, String> {
         let p = plan.coefficient_dim();
-        let m = plan.reduced_information.nrows();
+        let m = plan.reduced_dim;
         for hdot in &hdots {
             if hdot.nrows() != p || hdot.ncols() != p {
                 return Err(format!(
