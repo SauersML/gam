@@ -3,6 +3,7 @@ pub mod jet_partitions;
 pub mod jet_scalar;
 pub mod jet_tower;
 pub mod nested_dual;
+pub mod order2_graph;
 pub mod probability;
 pub mod score_opt;
 pub mod special;
