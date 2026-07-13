@@ -703,7 +703,7 @@ fn sphere_pole_pair_registers_atlas_end_to_end() {
     );
     let sphere_seam = &atlas.sphere_transitions()[0];
     assert_eq!(
-        sphere_seam.seam_kind,
+        sphere_seam.seam_kind(),
         AtlasSeamKind::Pole,
         "classified as a pole seam"
     );
@@ -718,11 +718,13 @@ fn sphere_pole_pair_registers_atlas_end_to_end() {
         sphere_seam.determinant()
     );
 
-    // The fitted seam is useful geometry but cannot certify the exact cocycle.
+    // The fitted seam is useful geometry but does not contribute an analytic
+    // sign. Because it is a single bridge (an unknown-edge forest), its sign is
+    // gauge-removable and orientability is nevertheless determined.
     assert_eq!(
         atlas.orientability(),
-        None,
-        "fitted sphere seams require the statistical holonomy path"
+        Some(AtlasOrientability::Orientable),
+        "one fitted bridge cannot create a sign-holonomy cycle"
     );
 
     // Registration is an image-EXACT algebraic quotient of the same gates: it

@@ -399,7 +399,7 @@ impl<'a> BmsFlexRowKernelInputs<'a> {
 }
 
 /// Non-semantic CUDA scaffolding for the generated row kernel. One CUDA block
-/// per row; 32 threads per block parallelise the per-cell sums into
+/// per row; the generated launch width parallelises the per-cell sums into
 /// shared-memory scratch. The calibration and finalizer markers are replaced
 /// by interpreting [`BmsFlexRowProgram`]'s typed node streams.
 ///
@@ -410,10 +410,11 @@ impl<'a> BmsFlexRowKernelInputs<'a> {
 ///
 #[cfg(target_os = "linux")]
 const CUDA_ROW_KERNEL_TEMPLATE: &str = r#"
-// One block per row. blockDim.x = 32; threadIdx.x parallises per-cell sums.
+// One block per row. threadIdx.x parallelises per-cell sums.
 // Semantic calibration/finalization visits are generated from BmsFlexRowProgram.
 
 #define INV_TWO_PI     0.15915494309189535
+#define BMS_FLEX_ROW_THREADS /*__BMS_FLEX_ROW_THREADS__*/
 
 extern "C" __device__ __forceinline__ double atomic_add_f64(double *addr, double value) {
     unsigned long long int *addr_as_ull = (unsigned long long int *)addr;
@@ -505,8 +506,8 @@ extern "C" __global__ void bms_flex_row_kernel(
     double *F_u = out_grad + row_r_base;
     double *F_au = row_f_au + row_r_base;
     double *F_uv = out_hess + row_rr_base;
-    __shared__ double reduce_a[32];
-    __shared__ double reduce_b[32];
+    __shared__ double reduce_a[BMS_FLEX_ROW_THREADS];
+    __shared__ double reduce_b[BMS_FLEX_ROW_THREADS];
     __shared__ double F_a_shared;
     __shared__ double F_aa_shared;
 
@@ -818,7 +819,10 @@ fn build_generated_row_kernel_source() -> String {
     )
     .expect("the infallible finalizer phase emitter cannot fail");
     source.push_str(suffix);
-    source
+    source.replace(
+        "/*__BMS_FLEX_ROW_THREADS__*/",
+        &ROW_KERNEL_THREADS.to_string(),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1769,8 +1773,9 @@ extern "C" __global__ void bms_flex_row_dense_block_partial(
     __syncthreads();
 
     // Per-row work performed by thread 0 to avoid cross-thread RW
-    // contention on `acc[]`. Per-row complexity is O(r * p_m + r * p_g
-    // + r²): tractable because r ≤ 32 and p_m + p_g typically ≤ 64.
+    // contention on `acc[]`. Per-row complexity is O(r² + p_total²); the host
+    // selects this direct algorithm only for small p_total, while r remains a
+    // checked runtime width with no semantic ceiling.
     // Tighter parallel implementations are possible (warp-stripe the
     // 4-way nested u-v-m-n loop) but Phase 6 is a debug-only path and
     // the simple version is easier to audit for correctness against
@@ -2446,6 +2451,136 @@ impl PreparedBmsFlexRowLaunchArgs {
                 reason: "bms_flex_row launch: p_total must be > 0".to_string(),
             });
         }
+        if storage.primary.r != storage.r {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "bms_flex_row launch: primary.r={} != storage.r={}",
+                    storage.primary.r, storage.r
+                ),
+            });
+        }
+        let h_block_len = storage.block.h.as_ref().map_or(0, |range| range.len());
+        let w_block_len = storage.block.w.as_ref().map_or(0, |range| range.len());
+        let h_primary_len = storage.primary.h.as_ref().map_or(0, |range| range.len());
+        let w_primary_len = storage.primary.w.as_ref().map_or(0, |range| range.len());
+        if h_block_len != h_primary_len || w_block_len != w_primary_len {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "bms_flex_row launch: block/primary direct lengths disagree: h={h_block_len}/{h_primary_len}, w={w_block_len}/{w_primary_len}"
+                ),
+            });
+        }
+        let h_block_start = storage
+            .block
+            .p_m
+            .checked_add(storage.block.p_g)
+            .ok_or_else(|| GpuError::DriverCallFailed {
+                reason: "bms_flex_row launch: p_m+p_g overflow".to_string(),
+            })?;
+        let w_block_start = h_block_start.checked_add(h_block_len).ok_or_else(|| {
+            GpuError::DriverCallFailed {
+                reason: "bms_flex_row launch: h block end overflow".to_string(),
+            }
+        })?;
+        let expected_p_total = w_block_start.checked_add(w_block_len).ok_or_else(|| {
+            GpuError::DriverCallFailed {
+                reason: "bms_flex_row launch: w block end overflow".to_string(),
+            }
+        })?;
+        let w_primary_start = 2_usize.checked_add(h_primary_len).ok_or_else(|| {
+            GpuError::DriverCallFailed {
+                reason: "bms_flex_row launch: h primary end overflow".to_string(),
+            }
+        })?;
+        let expected_r = w_primary_start
+            .checked_add(w_primary_len)
+            .ok_or_else(|| GpuError::DriverCallFailed {
+                reason: "bms_flex_row launch: w primary end overflow".to_string(),
+            })?;
+        let check_range =
+            |name: &str,
+             range: Option<&std::ops::Range<usize>>,
+             expected_start: usize,
+             expected_len: usize|
+             -> Result<(), GpuError> {
+                match (range, expected_len) {
+                    (None, 0) => Ok(()),
+                    (Some(range), len)
+                        if len > 0
+                            && range.start == expected_start
+                            && range.end == expected_start + len =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(GpuError::DriverCallFailed {
+                        reason: format!(
+                            "bms_flex_row launch: {name}={range:?} must be {expected_start}..{}",
+                            expected_start + expected_len
+                        ),
+                    }),
+                }
+            };
+        check_range(
+            "block.h",
+            storage.block.h.as_ref(),
+            h_block_start,
+            h_block_len,
+        )?;
+        check_range(
+            "block.w",
+            storage.block.w.as_ref(),
+            w_block_start,
+            w_block_len,
+        )?;
+        check_range("primary.h", storage.primary.h.as_ref(), 2, h_primary_len)?;
+        check_range(
+            "primary.w",
+            storage.primary.w.as_ref(),
+            w_primary_start,
+            w_primary_len,
+        )?;
+        if p_total != expected_p_total || storage.r != expected_r {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!(
+                    "bms_flex_row launch: inconsistent layout p_total={p_total}/{expected_p_total}, r={}/{}",
+                    storage.r, expected_r
+                ),
+            });
+        }
+        let expected_nr = checked_shape_len("launch storage [n,r]", &[storage.n, storage.r])?;
+        let expected_nrr =
+            checked_shape_len("launch storage [n,r,r]", &[storage.n, storage.r, storage.r])?;
+        let expected_marginal = checked_shape_len(
+            "launch storage marginal design",
+            &[storage.n, storage.block.p_m],
+        )?;
+        let expected_logslope = checked_shape_len(
+            "launch storage logslope design",
+            &[storage.n, storage.block.p_g],
+        )?;
+        for (name, have, want) in [
+            ("neglog", storage.neglog.len(), storage.n),
+            ("grad", storage.grad.len(), expected_nr),
+            ("hess", storage.hess.len(), expected_nrr),
+            (
+                "marginal_design",
+                storage.marginal_design.len(),
+                expected_marginal,
+            ),
+            (
+                "logslope_design",
+                storage.logslope_design.len(),
+                expected_logslope,
+            ),
+        ] {
+            if have != want {
+                return Err(GpuError::DriverCallFailed {
+                    reason: format!(
+                        "bms_flex_row launch: storage {name}.len()={have} != {want}"
+                    ),
+                });
+            }
+        }
         let num_chunks = num_hvp_chunks(storage.n);
         let to_i32 = |name: &str, value: usize| {
             i32::try_from(value).map_err(|_| GpuError::DriverCallFailed {
@@ -2632,65 +2767,39 @@ pub(crate) fn run_bms_flex_row_partial_reduce(
     Ok(())
 }
 
-/// Host-returning joint-β launcher shared by [`launch_bms_flex_row_hvp`]
-/// ([`BmsFlexRowLaunchMode::HvpHostOut`]) and [`launch_bms_flex_row_diagonal`]
-/// ([`BmsFlexRowLaunchMode::DiagonalHostOut`]).
-///
-/// Probes the backend, allocates the `p_total`-double output on its stream,
-/// optionally uploads a host direction `v` (HVP modes; `None` for the diagonal
-/// mode, which takes no direction), runs the shared partial+reduce engine, then
-/// synchronizes and downloads the reduced image to a host `Vec<f64>`. `ctx`
-/// tags every `DriverCallFailed` reason with the originating entry point.
+/// Host-returning diagonal adapter. HVP host output uses the multi-RHS engine,
+/// so this function exposes only the one live no-direction mode.
 #[cfg(target_os = "linux")]
-pub(crate) fn launch_bms_flex_row_host(
+pub(crate) fn launch_bms_flex_row_diagonal_host(
     storage: &DeviceResidentRowHess,
-    mode: BmsFlexRowLaunchMode,
-    v: Option<&[f64]>,
-    ctx: &str,
 ) -> Result<Vec<f64>, GpuError> {
     let p_total = storage.block.p_total;
-    if let Some(v) = v {
-        if v.len() != p_total {
-            return Err(GpuError::DriverCallFailed {
-                reason: format!(
-                    "bms_flex_row {ctx}: v.len()={} != p_total={p_total}",
-                    v.len()
-                ),
-            });
-        }
-    }
-
     let backend = HvpKernelBackend::probe()?;
     let stream = backend.stream.clone();
-
-    let d_v = match v {
-        Some(v) => Some(
-            stream
-                .clone_htod(v)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("bms_flex_row {ctx} upload v: {err}"),
-                })?,
-        ),
-        None => None,
-    };
     let mut d_out =
         stream
             .alloc_zeros::<f64>(p_total)
             .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("bms_flex_row {ctx} alloc out: {err}"),
+                reason: format!("bms_flex_row diag alloc out: {err}"),
             })?;
 
-    run_bms_flex_row_partial_reduce(storage, mode, d_v.as_ref(), &mut d_out, ctx)?;
+    run_bms_flex_row_partial_reduce(
+        storage,
+        BmsFlexRowLaunchMode::DiagonalHostOut,
+        None,
+        &mut d_out,
+        "diag",
+    )?;
 
     stream
         .synchronize()
         .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row {ctx} synchronize: {err}"),
+            reason: format!("bms_flex_row diag synchronize: {err}"),
         })?;
     stream
         .clone_dtoh(&d_out)
         .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row {ctx} download out: {err}"),
+            reason: format!("bms_flex_row diag download out: {err}"),
         })
 }
 
@@ -3053,7 +3162,7 @@ pub(crate) fn launch_bms_flex_row_hvp(
 pub(crate) fn launch_bms_flex_row_diagonal(
     storage: &DeviceResidentRowHess,
 ) -> Result<Vec<f64>, GpuError> {
-    launch_bms_flex_row_host(storage, BmsFlexRowLaunchMode::DiagonalHostOut, None, "diag")
+    launch_bms_flex_row_diagonal_host(storage)
 }
 
 /// Block 9 Phase 6 — hard cap on `p_total` for the dense joint-Hessian
@@ -4302,12 +4411,13 @@ mod tests {
         );
     }
 
-    /// GPU↔CPU parity for the HVP and diagonal kernels. Skips on non-Linux /
-    /// no-CUDA hosts. Hand-constructs a small `DeviceResidentRowHess` by
+    /// GPU↔CPU parity for every device-resident row consumer at `r=33`, with
+    /// both direct h/w blocks active. Skips on non-Linux / no-CUDA hosts.
+    /// Hand-constructs a small `DeviceResidentRowHess` by
     /// allocating the device slices directly, uploading the same arrays the
     /// CPU oracle consumes, then dispatching the device kernels.
     #[test]
-    pub(crate) fn bms_flex_row_hvp_kernel_matches_cpu_oracle_when_cuda_available() {
+    pub(crate) fn bms_flex_row_r33_consumers_match_cpu_oracles_when_cuda_available() {
         #[cfg(not(target_os = "linux"))]
         {
             eprintln!(
@@ -4324,12 +4434,12 @@ mod tests {
                 );
                 return;
             };
-            let n = 4_usize;
-            let r = 4_usize;
+            let n = 3_usize;
+            let p_h_dim = 16_usize;
+            let p_w_dim = 15_usize;
+            let r = 2 + p_h_dim + p_w_dim;
             let p_m = 2_usize;
             let p_g = 2_usize;
-            let p_h_dim = 1_usize;
-            let p_w_dim = 1_usize;
             let p_total = p_m + p_g + p_h_dim + p_w_dim;
             let block = BmsFlexBlockLayout {
                 p_m,
@@ -4339,15 +4449,17 @@ mod tests {
                 p_total,
             };
             let primary = BmsFlexPrimaryLayout {
-                h: Some(2..3),
-                w: Some(3..4),
+                h: Some(2..2 + p_h_dim),
+                w: Some(2 + p_h_dim..2 + p_h_dim + p_w_dim),
                 r,
             };
             let mut row_hessians = vec![0.0_f64; n * r * r];
             for row in 0..n {
                 for u in 0..r {
                     for v in u..r {
-                        let val = ((row + 1) as f64) * (1.0 + (u as f64) + 2.0 * (v as f64));
+                        let val = 0.001
+                            * ((row + 1) as f64)
+                            * (1.0 + (u as f64) + 2.0 * (v as f64));
                         row_hessians[row * r * r + u * r + v] = val;
                         row_hessians[row * r * r + v * r + u] = val;
                     }
@@ -4402,6 +4514,23 @@ mod tests {
                 &primary,
                 n,
             );
+            let mut cpu_dense = vec![0.0_f64; p_total * p_total];
+            for column in 0..p_total {
+                let mut basis = vec![0.0_f64; p_total];
+                basis[column] = 1.0;
+                let image = cpu_oracle_bms_flex_row_hvp(
+                    &row_hessians,
+                    &marginal,
+                    &logslope,
+                    &block,
+                    &primary,
+                    n,
+                    &basis,
+                );
+                for (row, value) in image.into_iter().enumerate() {
+                    cpu_dense[row * p_total + column] = value;
+                }
+            }
 
             // Allocate a DeviceResidentRowHess by hand using the HVP backend's
             // stream + module so we don't need to drive the full BMS row kernel.
@@ -4445,6 +4574,8 @@ mod tests {
                 .expect("diagonal kernel must launch on CUDA host");
             let gpu_joint = launch_bms_flex_row_joint_gradient(&storage)
                 .expect("joint-gradient kernel must launch on CUDA host");
+            let gpu_dense = launch_bms_flex_row_dense(&storage)
+                .expect("dense kernel must launch at r=33 on CUDA host");
             assert_eq!(gpu_hvp.len(), cpu_hvp.len());
             assert_eq!(gpu_diag.len(), cpu_diag.len());
             assert_eq!(gpu_joint.gradient.len(), cpu_gradient.len());
@@ -4475,6 +4606,14 @@ mod tests {
                     "joint gradient[{i}]: cpu={} gpu={} |Δ|={gdiff:.3e}",
                     cpu_gradient[i],
                     gpu_joint.gradient[i]
+                );
+            }
+            assert_eq!(gpu_dense.len(), cpu_dense.len());
+            for (index, (&cpu, &gpu)) in cpu_dense.iter().zip(&gpu_dense).enumerate() {
+                let tolerance = 1e-10 * (1.0 + cpu.abs());
+                assert!(
+                    (cpu - gpu).abs() <= tolerance,
+                    "dense[{index}] at r=33: cpu={cpu} gpu={gpu} tolerance={tolerance}"
                 );
             }
         }

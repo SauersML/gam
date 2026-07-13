@@ -912,9 +912,7 @@ fn atlas_refusal_code(
         AtlasStatisticalRefusal::SingularProjectedCrossGram { .. } => {
             "singular_projected_cross_gram"
         }
-        AtlasStatisticalRefusal::PatchTailCrossesEigengap { .. } => {
-            "patch_tail_crosses_eigengap"
-        }
+        AtlasStatisticalRefusal::PatchTailCrossesEigengap { .. } => "patch_tail_crosses_eigengap",
         AtlasStatisticalRefusal::OrientationFlipBoundExceedsLevel { .. } => {
             "orientation_flip_bound_exceeds_level"
         }
@@ -1073,7 +1071,9 @@ fn gaussian_holonomy_analysis_dict<'py>(
     analysis: &gam::terms::sae::inference::atlas_holonomy::GaussianPcaHolonomyAnalysis,
 ) -> PyResult<(Bound<'py, PyDict>, Vec<&'static str>, bool)> {
     use gam::terms::sae::inference::atlas_holonomy::{
-        AtlasCycleAsymptoticRegime, GaussianPcaCovarianceAuthority,
+        AtlasCycleAsymptoticRegime, CrossPatchCovarianceProvenance,
+        GaussianPcaCovarianceAuthority, GaussianPcaSpectrumProvenance,
+        PilotProjectionProvenance,
     };
     let out = PyDict::new(py);
     out.set_item("familywise_alpha", analysis.familywise_level().alpha())?;
@@ -1086,6 +1086,50 @@ fn gaussian_holonomy_analysis_dict<'py>(
             GaussianPcaCovarianceAuthority::AsymptoticPlugIn => "asymptotic_plugin",
         },
     )?;
+    out.set_item(
+        "cross_patch_covariance_provenance",
+        match analysis.error_model().cross_patch_provenance() {
+            CrossPatchCovarianceProvenance::DisjointInferenceRows => {
+                "disjoint_inference_rows"
+            }
+            CrossPatchCovarianceProvenance::ExplicitJointCovariance => {
+                "explicit_joint_covariance"
+            }
+        },
+    )?;
+    let patches = pyo3::types::PyList::empty(py);
+    for patch in analysis.patch_summaries() {
+        let row = PyDict::new(py);
+        row.set_item("chart", patch.chart)?;
+        row.set_item("pilot_rows", patch.projection_fit_rows)?;
+        row.set_item("inference_rows", patch.inference_rows)?;
+        row.set_item(
+            "covariance_degrees_of_freedom",
+            patch.covariance_degrees_of_freedom,
+        )?;
+        row.set_item("ambient_dimension", patch.ambient_dimension)?;
+        row.set_item("retained_dimension", patch.retained_dimension)?;
+        row.set_item(
+            "pilot_projection_provenance",
+            match patch.pilot_projection {
+                PilotProjectionProvenance::ExactAnalyticCapture => "exact_analytic_capture",
+                PilotProjectionProvenance::IndependentPilotEstimate => {
+                    "independent_pilot_estimate"
+                }
+            },
+        )?;
+        row.set_item(
+            "spectrum_provenance",
+            match patch.spectrum_provenance {
+                GaussianPcaSpectrumProvenance::CertifiedPopulation(_) => "certified_population",
+                GaussianPcaSpectrumProvenance::PlugInEstimate { .. } => "plugin_estimate",
+            },
+        )?;
+        row.set_item("noise_variance", patch.noise_variance_estimate)?;
+        row.set_item("signal_variance", patch.signal_variance_estimate)?;
+        patches.append(row)?;
+    }
+    out.set_item("patches", patches)?;
     match analysis.orientation_flip_probability_bound() {
         Some(bound) => out.set_item("orientation_flip_probability_bound", bound)?,
         None => out.set_item("orientation_flip_probability_bound", py.None())?,
@@ -1093,6 +1137,18 @@ fn gaussian_holonomy_analysis_dict<'py>(
     out.set_item(
         "orientation_refusals",
         atlas_refusal_list(py, analysis.orientation().refusals())?,
+    )?;
+    out.set_item(
+        "orientation_decision",
+        match analysis.orientation().certified_value() {
+            Some(gam::terms::sae::manifold::AtlasOrientability::Orientable) => "orientable",
+            Some(gam::terms::sae::manifold::AtlasOrientability::NonOrientable) => "non_orientable",
+            None => "refused",
+        },
+    )?;
+    out.set_item(
+        "orientation_error_probability_bound",
+        analysis.orientation().error_probability_bound(),
     )?;
     let prescriptions = pyo3::types::PyList::empty(py);
     for prescription in analysis.sample_prescription() {
@@ -1164,13 +1220,26 @@ fn gaussian_holonomy_analysis_dict<'py>(
             "polar_linearization_remainder_bound",
             cycle.polar_linearization_remainder_bound,
         )?;
-        row.set_item(
-            "geometric_remainder_bound",
-            cycle.geometric_remainder_bound,
-        )?;
+        row.set_item("geometric_remainder_bound", cycle.geometric_remainder_bound)?;
         row.set_item(
             "refusals",
             atlas_refusal_list(py, cycle.decision.refusals())?,
+        )?;
+        row.set_item(
+            "decision",
+            match cycle.decision.certified_value() {
+                Some(
+                    gam::terms::sae::inference::atlas_holonomy::AtlasCycleConclusion::NonTrivialHolonomy,
+                ) => "nontrivial_holonomy",
+                Some(
+                    gam::terms::sae::inference::atlas_holonomy::AtlasCycleConclusion::NotRejected,
+                ) => "not_rejected",
+                None => "refused",
+            },
+        )?;
+        row.set_item(
+            "error_probability_bound",
+            cycle.decision.error_probability_bound(),
         )?;
         for refusal in cycle.decision.refusals() {
             missing.insert(atlas_refusal_code(refusal));
@@ -1190,6 +1259,25 @@ fn gaussian_holonomy_analysis_dict<'py>(
         gauss_bonnet.set_item(
             "refusals",
             atlas_refusal_list(py, confidence.decision.refusals())?,
+        )?;
+        gauss_bonnet.set_item(
+            "decision",
+            if confidence.decision.certified_value().is_some() {
+                "certified_integer"
+            } else {
+                "refused"
+            },
+        )?;
+        gauss_bonnet.set_item(
+            "certified_euler_characteristic",
+            confidence
+                .decision
+                .certified_value()
+                .map(|value| value.value()),
+        )?;
+        gauss_bonnet.set_item(
+            "error_probability_bound",
+            confidence.decision.error_probability_bound(),
         )?;
         for refusal in confidence.decision.refusals() {
             missing.insert(atlas_refusal_code(refusal));
@@ -1232,16 +1320,22 @@ fn atlas_nerve_dict<'py>(
     }
     out.set_item("good_cover_certified", diagram.good_cover_certified)?;
     match diagram.holonomy_certificate.as_ref() {
+        Some(certificate) => out.set_item("holonomy_provenance", certificate.provenance_label())?,
+        None => out.set_item("holonomy_provenance", py.None())?,
+    }
+    match diagram.holonomy_certificate.as_ref() {
         Some(
             gam::terms::sae::inference::atlas_holonomy::AtlasHolonomyCertificate::ExactAnalytic(_),
         ) => {
             out.set_item("holonomy_status", "analyzed_certified")?;
-            out.set_item("holonomy_provenance", "exact_analytic")?;
-            out.set_item("holonomy_missing_inputs", py.None())?;
+            out.set_item("holonomy_refusal_codes", py.None())?;
+            out.set_item("holonomy_unavailable_reason", py.None())?;
             out.set_item("holonomy_analysis", py.None())?;
         }
         Some(
-            gam::terms::sae::inference::atlas_holonomy::AtlasHolonomyCertificate::GaussianPcaPlugin(analysis),
+            gam::terms::sae::inference::atlas_holonomy::AtlasHolonomyCertificate::GaussianPcaPlugin(
+                analysis,
+            ),
         ) => {
             let (payload, missing, fully_certified) =
                 gaussian_holonomy_analysis_dict(py, analysis)?;
@@ -1253,12 +1347,12 @@ fn atlas_nerve_dict<'py>(
                     "analyzed_refused"
                 },
             )?;
-            out.set_item("holonomy_provenance", "gaussian_pca_plugin")?;
             if missing.is_empty() {
-                out.set_item("holonomy_missing_inputs", py.None())?;
+                out.set_item("holonomy_refusal_codes", py.None())?;
             } else {
-                out.set_item("holonomy_missing_inputs", missing)?;
+                out.set_item("holonomy_refusal_codes", missing)?;
             }
+            out.set_item("holonomy_unavailable_reason", py.None())?;
             out.set_item("holonomy_analysis", payload)?;
         }
         None => {
@@ -1267,16 +1361,14 @@ fn atlas_nerve_dict<'py>(
             // bounds, or shared-source curvature covariance required by the
             // Gaussian finite-sample proof. Absence is not a negative result.
             out.set_item("holonomy_status", "not_analyzed")?;
-            out.set_item("holonomy_provenance", py.None())?;
             out.set_item("holonomy_analysis", py.None())?;
+            out.set_item("holonomy_refusal_codes", py.None())?;
             out.set_item(
-                "holonomy_missing_inputs",
-                vec![
-                    report
-                        .holonomy_unavailable_reason
-                        .as_deref()
-                        .unwrap_or("cross-fitted holonomy inputs were unavailable"),
-                ],
+                "holonomy_unavailable_reason",
+                report
+                    .holonomy_unavailable_reason
+                    .as_deref()
+                    .unwrap_or("cross-fitted holonomy inputs were unavailable"),
             )?;
         }
     }
@@ -2473,17 +2565,12 @@ mod sae_spectral_ffi_tests {
             ambient[[row, 1]] = sine;
             ambient[[row, 2]] = 0.05 * (2.0 * angle).cos();
         }
-        let route = AuditSparseRoute::new(indices, values, 2, 2, "cross-fitted atlas route")
-            .unwrap();
-        let report = atlas_nerve_from_sparse_route(
-            &route,
-            0.0,
-            None,
-            Some(ambient.view()),
-            Some(0.05),
-        )
-        .unwrap()
-        .unwrap();
+        let route =
+            AuditSparseRoute::new(indices, values, 2, 2, "cross-fitted atlas route").unwrap();
+        let report =
+            atlas_nerve_from_sparse_route(&route, 0.0, None, Some(ambient.view()), Some(0.05))
+                .unwrap()
+                .unwrap();
         assert!(report.diagram.holonomy_certificate.is_some());
 
         Python::attach(|py| {
@@ -2496,15 +2583,13 @@ mod sae_spectral_ffi_tests {
                 .unwrap();
             assert_eq!(status, "analyzed_refused");
             let missing: Vec<String> = dict
-                .get_item("holonomy_missing_inputs")
+                .get_item("holonomy_refusal_codes")
                 .unwrap()
                 .unwrap()
                 .extract()
                 .unwrap();
             assert!(missing.contains(&"population_spectrum_uncertified".to_string()));
-            assert!(missing.contains(
-                &"population_cross_gram_margin_uncertified".to_string()
-            ));
+            assert!(missing.contains(&"population_cross_gram_margin_uncertified".to_string()));
             let analysis = dict
                 .get_item("holonomy_analysis")
                 .unwrap()

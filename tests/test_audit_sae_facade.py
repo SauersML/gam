@@ -83,10 +83,10 @@ def test_audit_sae_surfaces_atlas_nerve_covering_side_next_to_betti():
     assert atlas_nerve["certified_euler_characteristic"] is None
     assert atlas_nerve["holonomy_status"] == "analyzed_refused"
     assert atlas_nerve["holonomy_provenance"] == "gaussian_pca_plugin"
-    assert "population_spectrum_uncertified" in atlas_nerve["holonomy_missing_inputs"]
+    assert "population_spectrum_uncertified" in atlas_nerve["holonomy_refusal_codes"]
     assert (
         "population_cross_gram_margin_uncertified"
-        in atlas_nerve["holonomy_missing_inputs"]
+        in atlas_nerve["holonomy_refusal_codes"]
     )
     assert atlas_nerve["holonomy_analysis"]["covariance_authority"] == (
         "asymptotic_plugin"

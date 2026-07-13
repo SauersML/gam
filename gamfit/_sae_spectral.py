@@ -846,7 +846,8 @@ class AtlasNerveDiagram:
     good_cover_certified: bool | None = None
     holonomy_status: str | None = None
     holonomy_provenance: str | None = None
-    holonomy_missing_inputs: list[str] | None = None
+    holonomy_refusal_codes: list[str] | None = None
+    holonomy_unavailable_reason: str | None = None
     holonomy_analysis: dict[str, Any] | None = None
     certified_orientability: str | None = None
     topology_promotion: dict[str, bool | str | float] | None = None
@@ -909,10 +910,15 @@ def atlas_nerve_diagram(
             if payload["holonomy_provenance"] is None
             else str(payload["holonomy_provenance"])
         ),
-        holonomy_missing_inputs=(
+        holonomy_refusal_codes=(
             None
-            if payload["holonomy_missing_inputs"] is None
-            else [str(value) for value in payload["holonomy_missing_inputs"]]
+            if payload["holonomy_refusal_codes"] is None
+            else [str(value) for value in payload["holonomy_refusal_codes"]]
+        ),
+        holonomy_unavailable_reason=(
+            None
+            if payload["holonomy_unavailable_reason"] is None
+            else str(payload["holonomy_unavailable_reason"])
         ),
         holonomy_analysis=(
             None

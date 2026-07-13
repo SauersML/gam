@@ -47,7 +47,10 @@ pub enum SaeReferenceMetricPlan {
     FlatKleinBottle,
     EuclideanDuchon,
     EuclideanPolynomial,
-    UnitPoincareBall,
+    /// Unit-curvature Poincare ball with the fixed reference rows that define
+    /// the conformal Dirichlet function Gram. These rows are model data: OOS
+    /// rebuild must replay them exactly, never replace them with query rows.
+    UnitPoincareBall { reference_coords: Array2<f64> },
     CylinderProduct,
     MobiusQuotient,
     DiscreteCounting,
@@ -141,8 +144,13 @@ impl SaeAtomGeometryPlan {
                 SaeAtomBasisKind::Poincare,
                 _,
                 SaeBasisResolution::Polynomial { degree },
-                SaeReferenceMetricPlan::UnitPoincareBall,
-            ) => *degree == SAE_EUCLIDEAN_PATCH_MAX_DEGREE,
+                SaeReferenceMetricPlan::UnitPoincareBall { reference_coords },
+            ) => {
+                *degree == SAE_EUCLIDEAN_PATCH_MAX_DEGREE
+                    && reference_coords.nrows() > 0
+                    && reference_coords.ncols() == latent_dim
+                    && reference_coords.iter().all(|value| value.is_finite())
+            }
             (
                 SaeAtomBasisKind::Cylinder,
                 2,
@@ -317,20 +325,227 @@ impl SaeAtomGeometryPlan {
         Ok(evaluator)
     }
 
-    /// Exact cover-restricted spectral penalty for quotient atoms.
-    pub fn quotient_spectral_penalty(&self, power: u32) -> Result<Option<Array2<f64>>, String> {
-        match &self.resolution {
-            SaeBasisResolution::ProjectivePlaneHarmonics { quotient_order } => Ok(Some(
-                QuotientSpectralEvaluator::projective_plane(*quotient_order)?
-                    .spectral_penalty(power)?,
+    /// Evaluate the plan's analytic basis and materialize the one declared
+    /// reference-function Gram. This is the sole seed/rebuild/OOS authority:
+    /// callers only validate and copy these arrays, never reconstruct a
+    /// topology-specific penalty from raw widths or kind tags.
+    pub(crate) fn evaluate_bundle(
+        &self,
+        coords: ArrayView2<'_, f64>,
+    ) -> Result<SaeAtomEvaluationBundle, String> {
+        if coords.ncols() != self.latent_dim {
+            return Err(format!(
+                "SaeAtomGeometryPlan::evaluate_bundle: coordinate width {} != plan latent_dim {}",
+                coords.ncols(),
+                self.latent_dim
+            ));
+        }
+        if coords.iter().any(|value| !value.is_finite()) {
+            return Err(
+                "SaeAtomGeometryPlan::evaluate_bundle: coordinates must be finite".to_string(),
+            );
+        }
+        let evaluator = self.build_evaluator()?;
+        let (basis_values, basis_jacobian) = evaluator.evaluate(coords)?;
+        let reference_penalty = self.reference_penalty(evaluator.as_ref())?;
+        let expected_width = self.basis_size()?;
+        let n_rows = coords.nrows();
+        if basis_values.dim() != (n_rows, expected_width)
+            || basis_jacobian.dim() != (n_rows, expected_width, self.latent_dim)
+            || reference_penalty.dim() != (expected_width, expected_width)
+        {
+            return Err(format!(
+                "SaeAtomGeometryPlan::evaluate_bundle: plan {:?} produced values={:?}, jacobian={:?}, reference_penalty={:?}; expected ({n_rows}, {expected_width}), ({n_rows}, {expected_width}, {}), ({expected_width}, {expected_width})",
+                self.kind,
+                basis_values.dim(),
+                basis_jacobian.dim(),
+                reference_penalty.dim(),
+                self.latent_dim
+            ));
+        }
+        if basis_values
+            .iter()
+            .chain(basis_jacobian.iter())
+            .chain(reference_penalty.iter())
+            .any(|value| !value.is_finite())
+        {
+            return Err(format!(
+                "SaeAtomGeometryPlan::evaluate_bundle: plan {:?} produced non-finite basis or penalty data",
+                self.kind
+            ));
+        }
+        Ok(SaeAtomEvaluationBundle {
+            basis_values,
+            basis_jacobian,
+            reference_penalty,
+            evaluator,
+        })
+    }
+
+    fn reference_penalty(
+        &self,
+        evaluator: &dyn SaeBasisSecondJet,
+    ) -> Result<Array2<f64>, String> {
+        match (&self.resolution, &self.reference_metric) {
+            (
+                SaeBasisResolution::PeriodicHarmonics { order },
+                SaeReferenceMetricPlan::UnitCircle,
+            ) => periodic_reference_penalty(*order),
+            (SaeBasisResolution::SphereChart, SaeReferenceMetricPlan::SphereChart) => {
+                Ok(sphere_chart_reference_penalty())
+            }
+            (
+                SaeBasisResolution::TorusHarmonics { per_axis_order },
+                SaeReferenceMetricPlan::FlatRectangularTorus { tau },
+            ) => flat_rectangular_torus_reference_penalty(*per_axis_order, *tau),
+            (
+                SaeBasisResolution::TorusHarmonics { .. },
+                SaeReferenceMetricPlan::EmbeddedDonutTorus { tau },
+            ) => Err(format!(
+                "embedded-donut reference penalty at tau={tau} requires the exact closed-form dense Fourier operator from Phase 4; refusing to substitute the flat rectangular penalty"
             )),
-            SaeBasisResolution::KleinBottleHarmonics { per_axis_order } => Ok(Some(
-                QuotientSpectralEvaluator::klein_bottle(*per_axis_order)?
-                    .spectral_penalty(power)?,
+            (
+                SaeBasisResolution::ProjectivePlaneHarmonics { quotient_order },
+                SaeReferenceMetricPlan::RoundProjectivePlane,
+            ) => QuotientSpectralEvaluator::projective_plane(*quotient_order)?
+                .spectral_penalty(2),
+            (
+                SaeBasisResolution::KleinBottleHarmonics { per_axis_order },
+                SaeReferenceMetricPlan::FlatKleinBottle,
+            ) => QuotientSpectralEvaluator::klein_bottle(*per_axis_order)?
+                .spectral_penalty(2),
+            (
+                SaeBasisResolution::DuchonCoordinates { centers },
+                SaeReferenceMetricPlan::EuclideanDuchon,
+            ) => gam_terms::basis::duchon_sae_atom_penalty(
+                centers.view(),
+                duchon_nullspace_from_m(sae_duchon_atom_m(self.latent_dim)),
+            )
+            .map_err(|error| error.to_string()),
+            (
+                SaeBasisResolution::Polynomial { degree },
+                SaeReferenceMetricPlan::EuclideanPolynomial,
+            ) => Ok(polynomial_reference_penalty(self.latent_dim, *degree)),
+            (
+                SaeBasisResolution::Polynomial { .. },
+                SaeReferenceMetricPlan::UnitPoincareBall { reference_coords },
+            ) => {
+                let (_, reference_jacobian) = evaluator.evaluate(reference_coords.view())?;
+                gam_geometry::manifolds::poincare::conformal_dirichlet_penalty(
+                    reference_coords.view(),
+                    reference_jacobian.view(),
+                    -1.0,
+                )
+                .map_err(|error| {
+                    format!(
+                        "SaeAtomGeometryPlan::reference_penalty: Poincare conformal Dirichlet Gram failed: {error}"
+                    )
+                })
+            }
+            (
+                SaeBasisResolution::CylinderHarmonics {
+                    circle_order,
+                    line_degree,
+                },
+                SaeReferenceMetricPlan::CylinderProduct,
+            ) => Ok(CylinderHarmonicEvaluator::new(*circle_order, *line_degree)?.roughness_gram()),
+            (
+                SaeBasisResolution::MobiusHarmonics {
+                    circle_order,
+                    width_degree,
+                },
+                SaeReferenceMetricPlan::MobiusQuotient,
+            ) => Ok(MobiusHarmonicEvaluator::new(*circle_order, *width_degree)?.roughness_gram()),
+            (
+                SaeBasisResolution::FiniteAnchors { .. },
+                SaeReferenceMetricPlan::DiscreteCounting,
+            ) => Err("finite-set atoms have no continuous analytic evaluation bundle".to_string()),
+            (
+                SaeBasisResolution::Precomputed { .. },
+                SaeReferenceMetricPlan::CallerProvided,
+            ) => Err("precomputed atoms require a caller-supplied evaluation bundle".to_string()),
+            _ => Err(format!(
+                "SaeAtomGeometryPlan::reference_penalty: internally inconsistent plan {:?}",
+                self
             )),
-            _ => Ok(None),
         }
     }
+}
+
+pub(crate) struct SaeAtomEvaluationBundle {
+    pub(crate) basis_values: Array2<f64>,
+    pub(crate) basis_jacobian: Array3<f64>,
+    pub(crate) reference_penalty: Array2<f64>,
+    pub(crate) evaluator: Arc<dyn SaeBasisSecondJet>,
+}
+
+fn duchon_nullspace_from_m(m: usize) -> gam_terms::basis::DuchonNullspaceOrder {
+    match m {
+        1 => gam_terms::basis::DuchonNullspaceOrder::Zero,
+        2 => gam_terms::basis::DuchonNullspaceOrder::Linear,
+        other => gam_terms::basis::DuchonNullspaceOrder::Degree(other - 1),
+    }
+}
+
+/// Squared normalized-Laplacian Gram on the unit circle under normalized Haar
+/// measure. Every raw sine/cosine column has L2 weight one half.
+fn periodic_reference_penalty(order: usize) -> Result<Array2<f64>, String> {
+    let width = sae_periodic_basis_size(order)?;
+    let mut penalty = Array2::<f64>::zeros((width, width));
+    for harmonic in 1..=order {
+        let weight = 0.5 * (harmonic as f64).powi(4);
+        penalty[[2 * harmonic - 1, 2 * harmonic - 1]] = weight;
+        penalty[[2 * harmonic, 2 * harmonic]] = weight;
+    }
+    Ok(penalty)
+}
+
+/// Squared round-sphere Laplacian Gram for `[1,x,y,z,xy,yz,xz]` under the
+/// normalized area measure. Degree-one modes have eigenvalue 2 and L2 weight
+/// 1/3; the degree-two cross modes have eigenvalue 6 and L2 weight 1/15.
+fn sphere_chart_reference_penalty() -> Array2<f64> {
+    let mut penalty = Array2::<f64>::zeros((SAE_SPHERE_BASIS_SIZE, SAE_SPHERE_BASIS_SIZE));
+    for column in 1..=3 {
+        penalty[[column, column]] = 4.0 / 3.0;
+    }
+    for column in 4..=6 {
+        penalty[[column, column]] = 12.0 / 5.0;
+    }
+    penalty
+}
+
+/// Squared Laplace--Beltrami Gram for a flat rectangular torus of aspect
+/// `A=cosh(tau)`. Axis 0 is the long cycle, so the normalized eigenvalue is
+/// `k0^2/A^2 + k1^2`; tensor sine/cosine L2 weights come from normalized Haar
+/// measure. The overall physical scale is intentionally left to smoothing.
+fn flat_rectangular_torus_reference_penalty(
+    per_axis_order: usize,
+    tau: f64,
+) -> Result<Array2<f64>, String> {
+    let evaluator = TorusHarmonicEvaluator::new(2, per_axis_order)?;
+    let aspect = tau.cosh();
+    let inverse_aspect_squared = aspect.recip().powi(2);
+    let modes = evaluator.spectral_modes();
+    let mut penalty = Array2::<f64>::zeros((modes.len(), modes.len()));
+    for (column, mode) in modes.iter().enumerate() {
+        let long_frequency = mode.components[0].harmonic() as f64;
+        let short_frequency = mode.components[1].harmonic() as f64;
+        let eigenvalue = long_frequency.powi(2) * inverse_aspect_squared
+            + short_frequency.powi(2);
+        penalty[[column, column]] = eigenvalue.powi(2) * mode.l2_gram_weight;
+    }
+    Ok(penalty)
+}
+
+fn polynomial_reference_penalty(latent_dim: usize, degree: usize) -> Array2<f64> {
+    let exponents = gam_terms::basis::monomial_exponents(latent_dim, degree);
+    let mut penalty = Array2::<f64>::zeros((exponents.len(), exponents.len()));
+    for (column, exponent) in exponents.iter().enumerate() {
+        if exponent.iter().any(|power| *power != 0) {
+            penalty[[column, column]] = 1.0;
+        }
+    }
+    penalty
 }
 
 #[cfg(test)]

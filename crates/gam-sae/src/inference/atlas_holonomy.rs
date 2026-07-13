@@ -1368,8 +1368,8 @@ impl AtlasCycleHolonomy {
 /// A covariance source shared by one or more Gauss--Bonnet angle terms.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GaussBonnetNoiseSource {
-    pub source: usize,
-    pub covariance: Array2<f64>,
+    source: usize,
+    covariance: Array2<f64>,
 }
 
 impl GaussBonnetNoiseSource {
@@ -1423,8 +1423,8 @@ impl GaussBonnetNoiseSource {
 /// Gradient of one measured angle with respect to one shared noise source.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GaussBonnetSourceGradient {
-    pub source: usize,
-    pub gradient: Array1<f64>,
+    source: usize,
+    gradient: Array1<f64>,
 }
 
 impl GaussBonnetSourceGradient {
@@ -1442,10 +1442,10 @@ impl GaussBonnetSourceGradient {
 /// One signed curvature/angle-defect contribution.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GaussBonnetContribution {
-    pub curvature_estimate: f64,
-    pub polar_linearization_remainder_bound: f64,
-    pub geometric_remainder_bound: f64,
-    pub source_gradients: Vec<GaussBonnetSourceGradient>,
+    curvature_estimate: f64,
+    polar_linearization_remainder_bound: f64,
+    geometric_remainder_bound: f64,
+    source_gradients: Vec<GaussBonnetSourceGradient>,
 }
 
 impl GaussBonnetContribution {
@@ -1483,9 +1483,9 @@ impl GaussBonnetContribution {
 /// Inputs for the integer Gauss--Bonnet confidence calculation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GaussBonnetInput {
-    pub covariance_authority: GaussBonnetCovarianceAuthority,
-    pub sources: Vec<GaussBonnetNoiseSource>,
-    pub contributions: Vec<GaussBonnetContribution>,
+    covariance_authority: GaussBonnetCovarianceAuthority,
+    sources: Vec<GaussBonnetNoiseSource>,
+    contributions: Vec<GaussBonnetContribution>,
 }
 
 /// Whether the propagated Gauss--Bonnet covariance supports a finite-sample
@@ -1982,10 +1982,7 @@ mod tests {
         tangent
     }
 
-    fn align_tangent_to_population(
-        fitted: &Array2<f64>,
-        population: &Array2<f64>,
-    ) -> Array2<f64> {
+    fn align_tangent_to_population(fitted: &Array2<f64>, population: &Array2<f64>) -> Array2<f64> {
         let cross = fitted.t().dot(population);
         let (left, _, right_t) = cross.svd(true, true).unwrap();
         fitted.dot(&left.unwrap().dot(&right_t.unwrap()))
@@ -2033,8 +2030,7 @@ mod tests {
             let transition = left.unwrap().dot(&right_t.unwrap());
             holonomy = transition.dot(&holonomy);
         }
-        (holonomy[[1, 0]] - holonomy[[0, 1]])
-            .atan2(holonomy[[0, 0]] + holonomy[[1, 1]])
+        (holonomy[[1, 0]] - holonomy[[0, 1]]).atan2(holonomy[[0, 0]] + holonomy[[1, 1]])
     }
 
     fn wrap_signed_angle(angle: f64) -> f64 {
@@ -2138,7 +2134,10 @@ mod tests {
             )
             .unwrap()
         };
-        let patches = vec![make_patch(0, (0..50).collect()), make_patch(1, (50..100).collect())];
+        let patches = vec![
+            make_patch(0, (0..50).collect()),
+            make_patch(1, (50..100).collect()),
+        ];
 
         assert!(GaussianPcaErrorModel::independent(&patches).is_err());
         let dimension = GaussianPcaErrorModel::coordinate_offsets(&patches)
@@ -2206,9 +2205,7 @@ mod tests {
         let patches = vec![make_patch(0, frame_a), make_patch(1, frame_b)];
         let edge = build_projected_edge(&patches, certified_edge(0, 1, 0, 0.0)).unwrap();
         let normal = identity_square(3) - tangent.dot(&tangent.t());
-        let normal_cross_operator = normal
-            .dot(&edge.projection_cross_gram_ba)
-            .dot(&normal);
+        let normal_cross_operator = normal.dot(&edge.projection_cross_gram_ba).dot(&normal);
 
         assert_eq!(edge.public.projected_dimension, 4);
         assert_near(frobenius_squared(normal_cross_operator.view()), 0.0);
@@ -2449,9 +2446,7 @@ mod tests {
             .iter()
             .cloned()
             .enumerate()
-            .map(|(chart, tangent)| {
-                projected_patch_from_tangent(chart, ROWS_PER_PATCH, tangent)
-            })
+            .map(|(chart, tangent)| projected_patch_from_tangent(chart, ROWS_PER_PATCH, tangent))
             .collect();
         let error_model = GaussianPcaErrorModel::independent(&patches).unwrap();
         let analysis = GaussianPcaHolonomyAnalysis::certify(
@@ -2465,12 +2460,18 @@ mod tests {
         let plugin_standard_error = analysis.cycles()[0].standard_error.unwrap();
         let rejection_boundary =
             cycle_rejection_boundary(plugin_standard_error, 0.0, 0.0, 0.05).unwrap();
-        assert!(analysis.cycles()[0].decision.refusals().iter().any(|reason| {
-            matches!(
-                reason,
-                AtlasStatisticalRefusal::GaussianLinearizationIsPlugin { .. }
-            )
-        }));
+        assert!(
+            analysis.cycles()[0]
+                .decision
+                .refusals()
+                .iter()
+                .any(|reason| {
+                    matches!(
+                        reason,
+                        AtlasStatisticalRefusal::GaussianLinearizationIsPlugin { .. }
+                    )
+                })
+        );
 
         let mut gaussian = DeterministicGaussian::new(0x2311_0005);
         let mut sum = 0.0;
@@ -2498,8 +2499,7 @@ mod tests {
         );
         let rejection_rate = rejections as f64 / REPLICATES as f64;
         let nominal = 0.05;
-        let binomial_standard_error =
-            (nominal * (1.0 - nominal) / REPLICATES as f64).sqrt();
+        let binomial_standard_error = (nominal * (1.0 - nominal) / REPLICATES as f64).sqrt();
         assert!(
             (rejection_rate - nominal).abs() <= 5.0 * binomial_standard_error,
             "nominal={nominal:.6}, actual-row PCA rejection={rejection_rate:.6}"
