@@ -2674,6 +2674,7 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
         .iter()
         .map(|beta| beta.iter().map(|value| value.to_bits()).collect())
         .collect();
+    let screened_objective_bits = screened_winner.objective.to_bits();
     let penalty_counts = validate_blockspecs(specs)?;
     let has_psi_derivatives = derivative_blocks.iter().any(|block| !block.is_empty());
     let (eval_options, _) =
@@ -2720,6 +2721,13 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
         return Err(CustomFamilyError::NumericalFailure {
             reason: format!(
                 "selected coefficient-mode candidate {selected_candidate} changed coefficient basins between value screening and derivative assembly"
+            ),
+        });
+    }
+    if result.objective.to_bits() != screened_objective_bits {
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: format!(
+                "selected coefficient-mode candidate {selected_candidate} changed profile objective between value screening and derivative assembly"
             ),
         });
     }
