@@ -3963,17 +3963,13 @@ pub fn discover_primary_atom_topologies(
                         )
                     },
                 )? {
-                    Some((int_specs, int_chart)) => race_spec_set(
-                        int_specs,
-                        target,
-                        weights.view(),
-                    )
-                    .map_err(|error| {
+                    Some(int_specs) => race_spec_set(int_specs, target, weights.view()).map_err(
+                        |error| {
                         format!(
                             "discover_primary_atom_topologies: intrinsic evidence race failed for auto atom {atom_idx}: {error}"
                         )
-                    })?
-                    .map(|(int_fit, int_score)| (int_fit, int_score, int_chart)),
+                    },
+                    )?,
                     None => None,
                 };
             // A race winner is ATOMIC: its topology kind and the coordinates on
@@ -3982,19 +3978,15 @@ pub fn discover_primary_atom_topologies(
             // flag; that split allowed a Duchon kind verdict to survive while
             // its intrinsic chart was discarded and rebuilt from PCA.
             let fit = match (pca_winner, intrinsic_challenger) {
-                (Some((p_fit, p_score)), Some((i_fit, i_score, i_chart))) => {
+                (Some((p_fit, p_score)), Some((i_fit, i_score))) => {
                     if i_score < p_score {
-                        debug_assert_eq!(i_fit.coords, i_chart);
                         i_fit
                     } else {
                         p_fit
                     }
                 }
                 (Some((p_fit, _)), None) => p_fit,
-                (None, Some((i_fit, _, i_chart))) => {
-                    debug_assert_eq!(i_fit.coords, i_chart);
-                    i_fit
-                }
+                (None, Some((i_fit, _))) => i_fit,
                 (None, None) => {
                     return Err(format!(
                         "discover_primary_atom_topologies: evidence race returned no winner for auto atom {atom_idx}"
@@ -4095,15 +4087,16 @@ pub fn discover_primary_atom_topologies(
 /// SAME REML evidence and keeps the PCA winner on ties, so the intrinsic seed
 /// supplants the linear one only when its unfolding earns strictly higher evidence.
 ///
-/// Returns `(specs, chart)` where `chart` is the standardized intrinsic 2-D chart
-/// the winning sheet's resolution growth reads. `None` when the atom is `d < 2`
-/// (folds are a sheet story; `d = 1` line/circle is served by the PCA race), the
-/// cluster is too small for a geodesic graph, or the embedding is degenerate.
+/// Every returned spec owns the standardized intrinsic 2-D chart it is evaluated
+/// on, so the eventual fit handle carries coordinate provenance atomically.
+/// `None` when the atom is `d < 2` (folds are a sheet story; `d = 1` line/circle
+/// is served by the PCA race), the cluster is too small for a geodesic graph, or
+/// the embedding is degenerate.
 fn build_intrinsic_primary_specs(
     target: ArrayView2<'_, f64>,
     rows: &[usize],
     max_dim: usize,
-) -> Result<Option<(Vec<TopologyCandidateSpec>, Array2<f64>)>, String> {
+) -> Result<Option<Vec<TopologyCandidateSpec>>, String> {
     if max_dim < 2 || rows.len() < 3 {
         return Ok(None);
     }
@@ -4157,7 +4150,7 @@ fn build_intrinsic_primary_specs(
             coords: coords.clone(),
         });
     }
-    Ok(Some((specs, coords)))
+    Ok(Some(specs))
 }
 
 /// Duchon nullspace order `m` for the raced 2-D thin-plate sheet (#2240) —
@@ -6182,12 +6175,14 @@ mod tests {
             second[[row, 2]] = 2.0e6;
         }
         let rows = (0..local_rows).collect::<Vec<_>>();
-        let (_, first_chart) = build_intrinsic_primary_specs(first.view(), &rows, 2)
+        let first_specs = build_intrinsic_primary_specs(first.view(), &rows, 2)
             .expect("first local embedding")
             .expect("realizable first local chart");
-        let (_, second_chart) = build_intrinsic_primary_specs(second.view(), &rows, 2)
+        let second_specs = build_intrinsic_primary_specs(second.view(), &rows, 2)
             .expect("second local embedding")
             .expect("realizable second local chart");
+        let first_chart = &first_specs[0].coords;
+        let second_chart = &second_specs[0].coords;
 
         for row in 0..local_rows {
             for col in 0..2 {
