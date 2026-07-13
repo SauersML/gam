@@ -1849,7 +1849,7 @@ fn sae_manifold_fit_inner<'py>(
     // forward-looking `"output_fisher_downstream"`. Gauge/lens consume either
     // unchanged.
     fisher_provenance: Option<&str>,
-    /// Required factor operator status; never reconstructed from rank or trace.
+    // Required factor operator status; never reconstructed from rank or trace.
     fisher_factor_kind: Option<&str>,
     // Per-row design-honesty reconstruction weights (#977). When present, the
     // length-`n_obs` `√w` reweighting installed via `set_row_loss_weights`
