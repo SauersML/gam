@@ -4821,8 +4821,10 @@ fn enforce_derivative_policy_negative_probes() {
     );
 
     let separate_generated = "row_atom! {\n    fn planted_third [generic, third](x) { x }\n    fn planted_fourth [generic, fourth](x) { x }\n}";
-    let generated_mask =
-        compute_test_mask(separate_generated, Path::new("crates/gam-models/src/planted.rs"));
+    let generated_mask = compute_test_mask(
+        separate_generated,
+        Path::new("crates/gam-models/src/planted.rs"),
+    );
     let generated_declarations = derivative_declarations(separate_generated, &generated_mask);
     let unregistered_generated = generated_declarations
         .iter()
@@ -4957,9 +4959,8 @@ fn specialization_site_is_registered(
         .any(|specialization| {
             specialization.kind == kind
                 && specialization.production_path == path
-                && normalized_source.contains(&normalized_rust_fragment(
-                    specialization.discovery_anchor,
-                ))
+                && normalized_source
+                    .contains(&normalized_rust_fragment(specialization.discovery_anchor))
         })
 }
 
