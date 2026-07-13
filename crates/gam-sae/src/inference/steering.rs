@@ -595,11 +595,16 @@ pub fn predicted_response(
 /// Keeping all three values atomic prevents a caller from pricing one vector
 /// and measuring another, and keeps the resident [`RowMetric`] dose an explicit
 /// diagnostic rather than silently promoting an approximate operator (#2249).
+/// `certified_attainable_upper_nats`, when present, is a global upper bound on
+/// measured KL over every finite non-negative amplitude on this exact atom
+/// chord and downstream execution context. A point observation or an apparent
+/// plateau is not such a certificate.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppliedDoseObservation {
     pub effective_delta: Array1<f64>,
     pub exact_directional_nats: f64,
     pub measured_nats: f64,
+    pub certified_attainable_upper_nats: Option<f64>,
 }
 
 /// Plan-aware external-model dose probe. The callback must execute the supplied
@@ -676,6 +681,9 @@ pub struct TargetDosePlan {
     /// the radius past a failed point. `None` without a callback or when the
     /// first probe failed.
     pub readout_kl_radius: Option<f64>,
+    /// Tightest global attainable-dose upper bound certified by any applied
+    /// probe in this solve. `None` means no global envelope was certified.
+    pub certified_attainable_upper_nats: Option<f64>,
 }
 
 /// A measured target-dose solve either returns a certified plan or one of these
@@ -690,12 +698,19 @@ pub enum TargetDoseError {
     },
     UnreachableTarget {
         target_nats: f64,
-        amplitude: f64,
-        measured_nats: f64,
+        certified_attainable_upper_nats: f64,
     },
-    ProbeBudgetExhausted {
+    UnbracketedTarget {
         target_nats: f64,
+        max_probed_amplitude: f64,
+        max_measured_nats: f64,
+        probes: usize,
+    },
+    BracketResolutionExhausted {
+        target_nats: f64,
+        lower_amplitude: f64,
         lower_nats: f64,
+        upper_amplitude: f64,
         upper_nats: f64,
         probes: usize,
     },
@@ -714,22 +729,37 @@ impl std::fmt::Display for TargetDoseError {
             ),
             Self::UnreachableTarget {
                 target_nats,
-                amplitude,
-                measured_nats,
+                certified_attainable_upper_nats,
             } => write!(
                 f,
-                "steer_to_target_nats: target {target_nats} nats is unreachable; \
-                 KL stopped increasing at amplitude {amplitude} with {measured_nats} nats"
+                "steer_to_target_nats: target {target_nats} nats is outside the certified \
+                 attainable envelope, whose global upper bound is \
+                 {certified_attainable_upper_nats} nats"
             ),
-            Self::ProbeBudgetExhausted {
+            Self::UnbracketedTarget {
                 target_nats,
+                max_probed_amplitude,
+                max_measured_nats,
+                probes,
+            } => write!(
+                f,
+                "steer_to_target_nats: could not bracket target {target_nats} nats after \
+                 {probes} probes through amplitude {max_probed_amplitude}; the largest \
+                 observed dose was {max_measured_nats} nats and no global attainable \
+                 envelope certified the target unreachable"
+            ),
+            Self::BracketResolutionExhausted {
+                target_nats,
+                lower_amplitude,
                 lower_nats,
+                upper_amplitude,
                 upper_nats,
                 probes,
             } => write!(
                 f,
                 "steer_to_target_nats: exhausted {probes} probes before resolving target \
-                 {target_nats} nats inside measured bracket [{lower_nats}, {upper_nats}]"
+                 {target_nats} nats inside measured bracket \
+                 ({lower_amplitude}, {lower_nats})..({upper_amplitude}, {upper_nats})"
             ),
         }
     }
@@ -770,7 +800,44 @@ fn probe_applied_dose(
             observation.measured_nats
         )));
     }
+    if let Some(upper) = observation.certified_attainable_upper_nats {
+        if !(upper.is_finite() && upper >= 0.0) {
+            return Err(TargetDoseError::Probe(format!(
+                "steer_to_target_nats: probe certified_attainable_upper_nats must be finite \
+                 and non-negative when present; got {upper}"
+            )));
+        }
+        if observation.measured_nats > upper {
+            return Err(TargetDoseError::Probe(format!(
+                "steer_to_target_nats: measured dose {} exceeds the probe's certified \
+                 global attainable upper bound {upper}",
+                observation.measured_nats
+            )));
+        }
+    }
     Ok(observation)
+}
+
+/// Merge one probe's optional global certificate into the solve-wide envelope.
+/// Every certificate must bound every observation in the same solve, not only
+/// the point at which it was returned.
+fn merge_attainable_envelope(
+    observation: &AppliedDoseObservation,
+    max_measured_nats: f64,
+    envelope: &mut Option<f64>,
+) -> Result<(), TargetDoseError> {
+    if let Some(upper) = observation.certified_attainable_upper_nats {
+        *envelope = Some(envelope.map_or(upper, |current| current.min(upper)));
+    }
+    if let Some(upper) = *envelope
+        && max_measured_nats > upper
+    {
+        return Err(TargetDoseError::Probe(format!(
+            "steer_to_target_nats: observed dose {max_measured_nats} exceeds an earlier \
+             certified global attainable upper bound {upper}"
+        )));
+    }
+    Ok(())
 }
 
 fn record_readout_probe(
@@ -803,9 +870,12 @@ fn record_readout_probe(
 /// correctly scaled only because the chord and the metric now share the raw
 /// activation frame (gh#2249, `ace3b9af3`; a Tier-0 σ-mis-scale on `dg` would
 /// have poisoned `a0`). Past the readout-KL radius the true KL saturates, so an
-/// optional `probe` (a patched forward) constructs a first-crossing bracket and
-/// solves it with a safeguarded secant, while recording the contiguous
-/// readout-KL radius. With
+/// optional `probe` (a patched forward) expands amplitudes in increasing order
+/// until two exact observations form a sign-change bracket, then solves that
+/// bracket with a safeguarded secant while recording the contiguous readout-KL
+/// radius. A local decrease is only another point observation: expansion keeps
+/// going. `UnreachableTarget` is possible only when a probe supplies a certified
+/// global attainable-dose upper bound below the requested tolerance band. With
 /// `probe = None` the result is the unvalidated closed-form seed: pure math and
 /// plumbing, no model in the loop.
 pub fn steer_to_target_nats(
@@ -874,7 +944,8 @@ pub fn steer_to_target_nats(
     let finish = |steer: SteerPlan,
                   applied_probe: Option<AppliedDoseObservation>,
                   iterations: usize,
-                  readout_kl_radius: Option<f64>|
+                  readout_kl_radius: Option<f64>,
+                  certified_attainable_upper_nats: Option<f64>|
      -> Result<TargetDosePlan, TargetDoseError> {
         Ok(TargetDosePlan {
             target_nats,
@@ -883,13 +954,14 @@ pub fn steer_to_target_nats(
             applied_probe,
             iterations,
             readout_kl_radius,
+            certified_attainable_upper_nats,
         })
     };
 
     let probe = match probe {
         Some(probe) => probe,
         // No model in the loop: return the unvalidated closed-form seed.
-        None => return finish(plan_at(seed_amplitude)?, None, 0, None),
+        None => return finish(plan_at(seed_amplitude)?, None, 0, None, None),
     };
 
     // Track a contiguous probed prefix of quadratic agreement. Once an amplitude
@@ -897,9 +969,11 @@ pub fn steer_to_target_nats(
     let mut first_readout_failure: Option<f64> = None;
     let mut readout_kl_radius: Option<f64> = None;
 
-    // Establish a genuine first-crossing bracket [lo, hi], starting from the
-    // exact point KL(0)=0 and expanding the closed-form seed until the measured
-    // curve reaches the target. A plateau is an explicit unreachable target.
+    // Establish a genuine sign-change bracket [lo, hi], starting from the exact
+    // point KL(0)=0 and expanding the closed-form seed in amplitude order. No
+    // finite set of non-increasing observations proves a global plateau; only a
+    // callback-supplied global envelope can certify that the target is outside
+    // the attainable range.
     let mut probes = 0usize;
     let mut lo_a = 0.0_f64;
     let mut lo_kl = 0.0_f64;
@@ -908,6 +982,14 @@ pub fn steer_to_target_nats(
     let mut hi_probe = probe_applied_dose(probe, &hi_plan)?;
     let mut hi_kl = hi_probe.measured_nats;
     probes += 1;
+    let mut max_probed_amplitude = hi_a;
+    let mut max_measured_nats = hi_kl;
+    let mut certified_attainable_upper_nats = None;
+    merge_attainable_envelope(
+        &hi_probe,
+        max_measured_nats,
+        &mut certified_attainable_upper_nats,
+    )?;
     record_readout_probe(
         hi_a,
         hi_kl,
@@ -917,28 +999,52 @@ pub fn steer_to_target_nats(
         &mut readout_kl_radius,
     );
     if (hi_kl - target_nats).abs() / target_nats <= config.tol_rel {
-        return finish(hi_plan, Some(hi_probe), probes, readout_kl_radius);
+        return finish(
+            hi_plan,
+            Some(hi_probe),
+            probes,
+            readout_kl_radius,
+            certified_attainable_upper_nats,
+        );
+    }
+    let accepted_lower_nats = target_nats * (1.0 - config.tol_rel);
+    if let Some(upper) = certified_attainable_upper_nats
+        && upper < accepted_lower_nats
+    {
+        return Err(TargetDoseError::UnreachableTarget {
+            target_nats,
+            certified_attainable_upper_nats: upper,
+        });
     }
     while hi_kl < target_nats {
         if probes >= config.max_iter {
-            return Err(TargetDoseError::ProbeBudgetExhausted {
+            return Err(TargetDoseError::UnbracketedTarget {
                 target_nats,
-                lower_nats: hi_kl,
-                upper_nats: hi_kl,
+                max_probed_amplitude,
+                max_measured_nats,
                 probes,
             });
         }
         let next_a = hi_a * 2.0;
         if !(next_a.is_finite() && next_a > hi_a) {
-            return Err(TargetDoseError::InvalidRequest(format!(
-                "steer_to_target_nats: target {target_nats} nats requires an amplitude \
-                 beyond the finite f64 range after amplitude {hi_a} realized {hi_kl} nats"
-            )));
+            return Err(TargetDoseError::UnbracketedTarget {
+                target_nats,
+                max_probed_amplitude,
+                max_measured_nats,
+                probes,
+            });
         }
         let next_plan = plan_at(next_a)?;
         let next_probe = probe_applied_dose(probe, &next_plan)?;
         let next_kl = next_probe.measured_nats;
         probes += 1;
+        max_probed_amplitude = next_a;
+        max_measured_nats = max_measured_nats.max(next_kl);
+        merge_attainable_envelope(
+            &next_probe,
+            max_measured_nats,
+            &mut certified_attainable_upper_nats,
+        )?;
         record_readout_probe(
             next_a,
             next_kl,
@@ -947,11 +1053,21 @@ pub fn steer_to_target_nats(
             &mut first_readout_failure,
             &mut readout_kl_radius,
         );
-        if next_kl <= hi_kl {
+        if (next_kl - target_nats).abs() / target_nats <= config.tol_rel {
+            return finish(
+                next_plan,
+                Some(next_probe),
+                probes,
+                readout_kl_radius,
+                certified_attainable_upper_nats,
+            );
+        }
+        if let Some(upper) = certified_attainable_upper_nats
+            && upper < accepted_lower_nats
+        {
             return Err(TargetDoseError::UnreachableTarget {
                 target_nats,
-                amplitude: next_a,
-                measured_nats: next_kl,
+                certified_attainable_upper_nats: upper,
             });
         }
         lo_a = hi_a;
@@ -960,9 +1076,6 @@ pub fn steer_to_target_nats(
         hi_kl = next_kl;
         hi_plan = next_plan;
         hi_probe = next_probe;
-        if (hi_kl - target_nats).abs() / target_nats <= config.tol_rel {
-            return finish(hi_plan, Some(hi_probe), probes, readout_kl_radius);
-        }
     }
 
     // Safeguarded secant inside the measured bracket. If roundoff puts the
@@ -979,6 +1092,12 @@ pub fn steer_to_target_nats(
         let candidate_probe = probe_applied_dose(probe, &candidate_plan)?;
         let measured = candidate_probe.measured_nats;
         probes += 1;
+        max_measured_nats = max_measured_nats.max(measured);
+        merge_attainable_envelope(
+            &candidate_probe,
+            max_measured_nats,
+            &mut certified_attainable_upper_nats,
+        )?;
         record_readout_probe(
             candidate,
             measured,
@@ -993,6 +1112,7 @@ pub fn steer_to_target_nats(
                 Some(candidate_probe),
                 probes,
                 readout_kl_radius,
+                certified_attainable_upper_nats,
             );
         }
         if measured < target_nats {
@@ -1003,9 +1123,11 @@ pub fn steer_to_target_nats(
             hi_kl = measured;
         }
     }
-    Err(TargetDoseError::ProbeBudgetExhausted {
+    Err(TargetDoseError::BracketResolutionExhausted {
         target_nats,
+        lower_amplitude: lo_a,
         lower_nats: lo_kl,
+        upper_amplitude: hi_a,
         upper_nats: hi_kl,
         probes,
     })

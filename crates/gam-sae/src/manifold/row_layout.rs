@@ -24,6 +24,48 @@ pub struct SaeRowLayout {
 }
 
 impl SaeRowLayout {
+    /// Build directly from the canonical support-sparse state. This is the
+    /// production TopK path: it never constructs K-wide gates merely to recover
+    /// the support indices that are already the fundamental state.
+    pub(crate) fn from_assignment_state(
+        state: &crate::assignment_state::SaeAssignmentState,
+    ) -> Result<Self, String> {
+        let mut coord_offsets_full = Vec::with_capacity(state.k_atoms());
+        let mut cursor = 0usize;
+        let mut coord_dims = Vec::with_capacity(state.k_atoms());
+        for atom in 0..state.k_atoms() {
+            coord_offsets_full.push(cursor);
+            let d = state.atom_coord_dim(atom);
+            coord_dims.push(d);
+            cursor += d;
+        }
+        let active_atoms = (0..state.n_obs())
+            .map(|row| {
+                state
+                    .support_indices(row)
+                    .iter()
+                    .map(|&atom| atom as usize)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut coord_starts = Vec::with_capacity(state.n_obs());
+        for active in &active_atoms {
+            let mut row_cursor = 0usize;
+            let mut starts = Vec::with_capacity(active.len());
+            for &atom in active {
+                starts.push(row_cursor);
+                row_cursor += coord_dims[atom];
+            }
+            coord_starts.push(starts);
+        }
+        Ok(Self {
+            active_atoms,
+            coord_starts,
+            coord_offsets_full,
+            coord_dims,
+        })
+    }
+
     /// Build the exact compact layout from hard TopK gates. Every row must have
     /// exactly `support_size` entries equal to one and every other entry equal
     /// to zero; accepting approximate weights here would silently change the
