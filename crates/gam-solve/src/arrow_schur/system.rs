@@ -2324,6 +2324,17 @@ pub struct RowDeflationSpectrum {
     pub cond_evals: Array1<f64>,
 }
 
+/// Raw and conditioned eigenspectrum of an evidence β-Schur that underwent
+/// unit deflation. `deflated[m]` is authoritative: a conditioned eigenvalue of
+/// one is not itself evidence that the direction is a quotient null.
+#[derive(Debug, Clone)]
+pub struct BetaSchurDeflationSpectrum {
+    pub evecs: Array2<f64>,
+    pub raw_evals: Array1<f64>,
+    pub cond_evals: Array1<f64>,
+    pub deflated: Arc<[bool]>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ArrowFactorCache {
     /// Per-row lower-triangular Cholesky factors of `H_tt^(i) + ridge_t·I`.
@@ -2355,6 +2366,11 @@ pub struct ArrowFactorCache {
     /// consumers must not combine `schur_factor` with [`Self::undamped_factor`]:
     /// that would mix two different bordered-arrow operators.
     pub schur_factor_is_undamped: bool,
+    /// Authoritative original-coordinate spectrum and null mask used when the
+    /// undamped evidence β-Schur was unit-deflated. The mask, rather than a
+    /// threshold re-derived from `L Lᵀ`, defines which directions contribute
+    /// `log 1 = 0` to the value and zero to every inverse/trace contraction.
+    pub beta_schur_deflation: Option<BetaSchurDeflationSpectrum>,
     /// Exact undamped joint-Hessian log-determinant produced by the dense
     /// factorization path. REML evidence consumes this directly so the Laplace
     /// normalizer cannot miss the log-det even when later cache consumers only
@@ -3006,6 +3022,10 @@ impl ArrowFactorCache {
                 ),
             });
         }
+        if self.beta_schur_deflation.is_some() {
+            let deflated = self.deflated_schur_pseudo_inverse()?;
+            return Ok(self.apply_deflated_pseudo_inverse(&deflated, rhs));
+        }
         let rhs_owned = match self.beta_gauge_quotient.as_ref() {
             Some(quotient) => quotient.project_complement(rhs),
             None => rhs.to_owned(),
@@ -3226,6 +3246,37 @@ impl ArrowFactorCache {
             });
         }
         let k = self.k;
+        if let Some(spectrum) = self.beta_schur_deflation.as_ref() {
+            if spectrum.evecs.dim() != (k, k)
+                || spectrum.raw_evals.len() != k
+                || spectrum.cond_evals.len() != k
+                || spectrum.deflated.len() != k
+            {
+                return Err(ArrowSchurError::SchurFactorFailed {
+                    reason: "cached β-Schur deflation spectrum has incoherent dimensions"
+                        .to_string(),
+                });
+            }
+            let mut inv_evals = Array1::<f64>::zeros(k);
+            for eig_idx in 0..k {
+                if spectrum.deflated[eig_idx] {
+                    continue;
+                }
+                let lambda = spectrum.cond_evals[eig_idx];
+                if !(lambda.is_finite() && lambda > 0.0) {
+                    return Err(ArrowSchurError::SchurFactorFailed {
+                        reason: format!(
+                            "cached β-Schur kept eigenvalue {eig_idx} is not positive finite: {lambda:e}"
+                        ),
+                    });
+                }
+                inv_evals[eig_idx] = 1.0 / lambda;
+            }
+            return Ok(DeflatedSchurPseudoInverse {
+                evecs: spectrum.evecs.clone(),
+                inv_evals,
+            });
+        }
         // Reconstruct `M = L Lᵀ` from the LOWER triangle only (the strict-upper
         // entries of the stored factor are not part of the Cholesky factor and
         // must not enter the product).
@@ -3254,18 +3305,12 @@ impl ArrowFactorCache {
                     .to_string(),
             });
         }
-        // Canonical rank floor, with the SAME hysteresis band the per-row
-        // spectral deflation applies — this is a rank-deflation (deciding which
-        // curvature directions are numerically null), not a λ-smoothing floor.
-        let floor = SPECTRAL_DEFLATION_REL_FLOOR * max_abs;
-        let deflate_floor = floor * (1.0 - SPECTRAL_DEFLATION_HYSTERESIS_FRACTION);
-        let inv_evals = evals.mapv(|lambda| {
-            if lambda.is_finite() && lambda > deflate_floor {
-                1.0 / lambda
-            } else {
-                0.0
-            }
-        });
+        // No evidence deflation was performed, so every factor eigenvalue is
+        // part of the value and must remain part of the inverse. Boundary rank
+        // decisions are made once during evidence factorization and carried in
+        // `beta_schur_deflation`; inferring a new mask from the conditioned
+        // factor would desynchronize the value and its gradient.
+        let inv_evals = evals.mapv(|lambda| 1.0 / lambda);
         Ok(DeflatedSchurPseudoInverse { evecs, inv_evals })
     }
 

@@ -378,6 +378,7 @@ mod selected_inverse_row_blocks_oracle_tests {
             htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
             schur_factor: Some(schur),
             schur_factor_is_undamped: true,
+            beta_schur_deflation: None,
             joint_hessian_log_det: None,
             solver_mode: ArrowSolverMode::Direct,
             ridge_t: 0.0,

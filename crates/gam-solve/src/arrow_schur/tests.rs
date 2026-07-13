@@ -6361,6 +6361,7 @@ fn factor_dense_reduced_schur_reconstructs_original_illconditioned_matrix_2015()
     let DenseReducedSchurFactorization {
         factor,
         conditioned_schur: floored,
+        beta_deflation: _,
     } = factor_dense_reduced_schur(&schur, ReducedSchurPolicy::StrictNewton)
         .expect("planted matrix is PD");
     assert!(

@@ -100,6 +100,7 @@ pub fn solve_arrow_newton_step_with_options(
     // Cholesky (O(N d³), same complexity class as the Newton solve).
     let htt_factors = step.htt_factors;
     let mut schur_factor = step.schur_factor;
+    let mut beta_schur_deflation = None;
     let schur_log_det_override = step.schur_log_det_override;
     // The per-row deflated directions must describe the factors the gradient's
     // selected-inverse actually uses. For the ridge-0 evidence cache the damped
@@ -127,10 +128,14 @@ pub fn solve_arrow_newton_step_with_options(
             undamped.deflation_row_spectra,
         )
     };
-    let mut schur_factor_is_undamped = sys.k == 0 || (ridge_t == 0.0 && ridge_beta == 0.0);
+    let mut schur_factor_is_undamped = sys.k == 0;
     let mut beta_gauge_factor_is_pinned =
         evidence_beta_gauge_active(sys, ridge_t, ridge_beta, options);
-    if sys.k > 0 && !schur_factor_is_undamped {
+    // A step factor is never an evidence factor, even at ridge zero: its
+    // collapsed directions follow Newton/Tikhonov policy. Rebuild the dense
+    // undamped Schur explicitly so value, inverse, and gradients share the
+    // evidence unit-deflation convention and its exact null-space metadata.
+    if sys.k > 0 && schur_factor.is_some() {
         let evidence_htt_factors = match &htt_factors_undamped {
             ArrowUndampedFactors::SameAsDamped => &htt_factors,
             ArrowUndampedFactors::Owned(factors) => factors,
@@ -142,6 +147,7 @@ pub fn solve_arrow_newton_step_with_options(
         let DenseReducedSchurFactorization {
             factor: evidence_schur_factor,
             conditioned_schur: floored_evidence_schur,
+            beta_deflation: evidence_beta_deflation,
         } = factor_dense_reduced_schur(
             &evidence_schur,
             options
@@ -153,6 +159,7 @@ pub fn solve_arrow_newton_step_with_options(
         )?;
         drop(floored_evidence_schur);
         schur_factor = Some(evidence_schur_factor);
+        beta_schur_deflation = evidence_beta_deflation;
         schur_factor_is_undamped = true;
         beta_gauge_factor_is_pinned = sys.beta_gauge_quotient.is_some();
     }
@@ -162,6 +169,7 @@ pub fn solve_arrow_newton_step_with_options(
         htt_factors_undamped,
         schur_factor,
         schur_factor_is_undamped,
+        beta_schur_deflation,
         joint_hessian_log_det: None,
         solver_mode: options.mode,
         ridge_t,
@@ -1751,6 +1759,7 @@ pub(crate) fn try_mixed_precision_arrow_solve(
     let DenseReducedSchurFactorization {
         factor: schur_factor,
         conditioned_schur: floored_schur,
+        beta_deflation: _,
     } = factor_dense_reduced_schur(
         schur,
         ReducedSchurPolicy::newton(options.schur_pd_floor),

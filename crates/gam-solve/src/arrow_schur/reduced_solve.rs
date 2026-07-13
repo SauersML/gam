@@ -501,29 +501,11 @@ pub(crate) fn spectral_pd_floored_schur(
     schur: &Array2<f64>,
     relative_floor: f64,
 ) -> Option<(Array2<f64>, Array2<f64>)> {
-    spectral_conditioned_schur_with_factor(schur, relative_floor, false)
+    spectral_pd_floored_schur_with_factor(schur, relative_floor)
 }
 
-/// Unit-stiffness quotient conditioning for the *reduced* evidence Schur block.
-///
-/// `spectral_pd_floored_schur` is the right object for Newton steps: it is a
-/// Levenberg-Marquardt floor that damps collapsed decoder directions just enough
-/// to compute a stable `Δβ`.  The Laplace evidence path is different.  Once the
-/// reduced Schur is being used only for a log determinant, a non-positive (or
-/// numerically null) reduced direction is a quotient/null direction, just like
-/// the per-row `H_tt` spectral-deflation case.  It must contribute the
-/// ρ-independent constant `log 1 = 0`, not `log(floor·max λ)`: the latter is a
-/// ρ-dependent Occam reward for collapsed/redundant decoders and can make the
-/// outer REML sweep prefer a worse planted-manifold optimum.
-pub(crate) fn spectral_unit_deflated_schur(
-    schur: &Array2<f64>,
-    relative_floor: f64,
-) -> Option<(Array2<f64>, Array2<f64>)> {
-    spectral_conditioned_schur_with_factor(schur, relative_floor, true)
-}
-
-/// Shared body for [`spectral_pd_floored_schur`] / [`spectral_unit_deflated_schur`]:
-/// symmetrise, eigendecompose, condition the spectrum per policy, and return BOTH
+/// Shared body for [`spectral_pd_floored_schur`]: symmetrise, eigendecompose,
+/// condition the spectrum, and return BOTH
 /// the conditioned matrix `Σ λ̃_i v_i v_iᵀ` (consumed by Steihaug / matvec /
 /// mixed-precision refinement) and its lower Cholesky factor.
 ///
@@ -537,10 +519,9 @@ pub(crate) fn spectral_unit_deflated_schur(
 /// refusal at a ρ whose conditioned evidence is perfectly well-defined. The QR
 /// route factors the exact conditioned spectrum, so it succeeds whenever the
 /// policy produced strictly positive `λ̃` (always, by construction).
-fn spectral_conditioned_schur_with_factor(
+fn spectral_pd_floored_schur_with_factor(
     schur: &Array2<f64>,
     relative_floor: f64,
-    unit_deflate_null_directions: bool,
 ) -> Option<(Array2<f64>, Array2<f64>)> {
     let n = schur.nrows();
     if n == 0 || schur.ncols() != n || !(relative_floor.is_finite() && relative_floor > 0.0) {
@@ -567,25 +548,15 @@ fn spectral_conditioned_schur_with_factor(
         return None;
     }
     let floor = relative_floor * max_abs;
-    let deflate_floor = floor * (1.0 - SPECTRAL_DEFLATION_HYSTERESIS_FRACTION);
     // Newton-step policy (LM): clamp every eigenvalue UP to a strictly positive
     // `floor` — healthy positive directions (`λ ≫ floor`) keep their EXACT
     // eigenvalue, collapsed/indefinite directions get the minimal stiffness for
-    // a stable `Δβ`. Evidence policy (`unit_deflate_null_directions`): a
-    // non-positive / numerically-null direction is a quotient direction and
-    // contributes the ρ-independent `log 1 = 0`, so it is set to UNIT stiffness
-    // instead (see the doc comments on the public wrappers).
+    // a stable `Δβ`.
     let mut conditioned = Array2::<f64>::zeros((n, n));
     let mut weighted_vt = Array2::<f64>::zeros((n, n));
     for eig_idx in 0..evals.len() {
         let lambda = evals[eig_idx];
-        let lambda_conditioned = if unit_deflate_null_directions {
-            if !lambda.is_finite() || lambda <= 0.0 || lambda < deflate_floor {
-                1.0
-            } else {
-                lambda.max(floor)
-            }
-        } else if lambda.is_finite() {
+        let lambda_conditioned = if lambda.is_finite() {
             lambda.max(floor)
         } else {
             floor
@@ -605,6 +576,97 @@ fn spectral_conditioned_schur_with_factor(
     let factor =
         spectral_qr_cholesky_factor(&weighted_vt).or_else(|| cholesky_lower(&conditioned).ok())?;
     Some((conditioned, factor))
+}
+
+/// Original-coordinate unit-deflation for an evidence reduced Schur.
+///
+/// The rank decision and unit pin are made in the caller's β coordinates. A
+/// Jacobi congruence is appropriate for a Newton solve but would turn a unit
+/// eigenvalue in scaled coordinates into a scale-dependent stiffness after
+/// unscaling, corrupting both `log 1 = 0` and the cached null-space metadata.
+fn factor_evidence_unit_deflated_schur(
+    schur: &Array2<f64>,
+    relative_floor: f64,
+) -> Option<DenseReducedSchurFactorization> {
+    let n = schur.nrows();
+    if n == 0 || schur.ncols() != n || !(relative_floor.is_finite() && relative_floor > 0.0) {
+        return None;
+    }
+    let mut sym = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            let value = 0.5 * (schur[[i, j]] + schur[[j, i]]);
+            if !value.is_finite() {
+                return None;
+            }
+            sym[[i, j]] = value;
+        }
+    }
+    let (raw_evals, evecs) = sym.eigh(Side::Lower).ok()?;
+    let max_abs = raw_evals.iter().fold(0.0_f64, |acc, &value| {
+        if value.is_finite() {
+            acc.max(value.abs())
+        } else {
+            acc
+        }
+    });
+    if !(max_abs.is_finite() && max_abs > 0.0) {
+        return None;
+    }
+    let deflate_floor = relative_floor
+        * max_abs
+        * (1.0 - SPECTRAL_DEFLATION_HYSTERESIS_FRACTION);
+    let deflated: Vec<bool> = raw_evals
+        .iter()
+        .map(|&value| !value.is_finite() || value < deflate_floor)
+        .collect();
+
+    // Preserve the ordinary equilibrated-Cholesky bit path in the interior.
+    // If Cholesky alone is numerically unable to factor a spectrally healthy
+    // operator, the spectral QR below still factors the identical raw spectrum.
+    if !deflated.iter().any(|&is_deflated| is_deflated)
+        && let Ok(interior) = factor_dense_reduced_schur(schur, ReducedSchurPolicy::StrictNewton)
+    {
+        return Some(interior);
+    }
+
+    let mut cond_evals = raw_evals.clone();
+    let mut conditioned = Array2::<f64>::zeros((n, n));
+    let mut weighted_vt = Array2::<f64>::zeros((n, n));
+    for eig_idx in 0..n {
+        if deflated[eig_idx] {
+            cond_evals[eig_idx] = 1.0;
+        }
+        let lambda = cond_evals[eig_idx];
+        if !(lambda.is_finite() && lambda > 0.0) {
+            return None;
+        }
+        let sqrt_lambda = lambda.sqrt();
+        for i in 0..n {
+            let vi = evecs[[i, eig_idx]];
+            weighted_vt[[eig_idx, i]] = sqrt_lambda * vi;
+            if vi != 0.0 {
+                for j in 0..n {
+                    conditioned[[i, j]] += lambda * vi * evecs[[j, eig_idx]];
+                }
+            }
+        }
+    }
+    let factor = spectral_qr_cholesky_factor(&weighted_vt)?;
+    let beta_deflation = deflated
+        .iter()
+        .any(|&is_deflated| is_deflated)
+        .then(|| BetaSchurDeflationSpectrum {
+            evecs,
+            raw_evals,
+            cond_evals,
+            deflated: deflated.into(),
+        });
+    Some(DenseReducedSchurFactorization {
+        factor,
+        conditioned_schur: beta_deflation.as_ref().map(|_| conditioned),
+        beta_deflation,
+    })
 }
 
 /// Lower Cholesky factor of `A = WᵀW` computed from `W` itself: QR gives
@@ -659,8 +721,8 @@ fn jacobi_diagonal_scale(schur: &Array2<f64>) -> Array1<f64> {
 }
 
 /// Factor the dense reduced Schur complement `S`, returning its lower Cholesky
-/// factor (or, when `S` is not PD, the spectrally-floored reconstruction and
-/// ITS factor).
+/// factor, the conditioned operator when policy changed it, and authoritative
+/// β-null metadata for evidence unit deflation.
 ///
 /// #2015 — SOLVER-LEVEL conditioning fix (design: issue 2015 comment
 /// 4949898801). A real activation+behavior augmented target can carry output
@@ -683,15 +745,9 @@ fn jacobi_diagonal_scale(schur: &Array2<f64>) -> Array1<f64> {
 /// Cholesky factor of the CALLER'S ORIGINAL `schur`, just computed via a
 /// numerically superior route. Undoing the scale is one exact elementwise
 /// multiply (`factor[i,j] *= d[i]`, `floored[i,j] *= d[i]*d[j]`) — no further
-/// precision is lost recovering original units. Consequently this function's
-/// signature, return values, and units are UNCHANGED from before the fix, and
-/// every one of its ~15 callers across `newton_step.rs` / `reduced_solve.rs`
-/// (the direct solve, `mixed_precision_reduced_beta`'s certified refinement,
-/// `try_mixed_precision_arrow_solve`'s kappa gate, the evidence log-det
-/// diagonal sum, the Takahashi selected-inverse, `steihaug_dense_system`'s
-/// trust-region fallback) needs no change: they already operate on whatever
-/// `(factor, floored_schur)` this function hands back, in the SAME original
-/// units as always.
+/// precision is lost recovering original units. Evidence unit deflation
+/// deliberately bypasses this congruence and works in the original β
+/// coordinates so a unit-pinned null contributes exactly `log 1`.
 ///
 /// GPU cross-reference: the device/GPU dense-reference path
 /// (`gam_solve::gpu_kernels::arrow_schur::solve_arrow_newton_step_dense_reference`)
@@ -699,7 +755,6 @@ fn jacobi_diagonal_scale(schur: &Array2<f64>) -> Array1<f64> {
 /// does NOT yet get this equilibration. Both paths are exact; the GPU path is
 /// simply not yet as well-conditioned on an ill-scaled system. Porting the
 /// same technique there is a deliberate follow-up, not part of this change.
-/// Conditioning policy for a dense reduced Schur factorization.
 ///
 /// Newton-step damping and evidence quotient deflation are deliberately
 /// different policies: Tikhonov directions retain a small positive curvature
@@ -725,12 +780,21 @@ impl ReducedSchurPolicy {
 pub(crate) struct DenseReducedSchurFactorization {
     pub(crate) factor: Array2<f64>,
     pub(crate) conditioned_schur: Option<Array2<f64>>,
+    pub(crate) beta_deflation: Option<BetaSchurDeflationSpectrum>,
 }
 
 pub(crate) fn factor_dense_reduced_schur(
     schur: &Array2<f64>,
     policy: ReducedSchurPolicy,
 ) -> Result<DenseReducedSchurFactorization, ArrowSchurError> {
+    if let ReducedSchurPolicy::EvidenceUnitDeflation { relative_floor } = policy {
+        return factor_evidence_unit_deflated_schur(schur, relative_floor).ok_or_else(|| {
+            ArrowSchurError::SchurFactorFailed {
+                reason: "evidence reduced Schur unit-deflation declined (no usable spectrum)"
+                    .to_string(),
+            }
+        });
+    }
     let n = schur.nrows();
     let d = jacobi_diagonal_scale(schur);
     let mut schur_scaled = Array2::<f64>::zeros((n, n));
@@ -762,15 +826,10 @@ pub(crate) fn factor_dense_reduced_schur(
             // reconstruction is undone back to original units below exactly like
             // the plain factor.
             match policy {
-                ReducedSchurPolicy::NewtonTikhonov { relative_floor }
-                | ReducedSchurPolicy::EvidenceUnitDeflation { relative_floor } => match if matches!(
-                    policy,
-                    ReducedSchurPolicy::EvidenceUnitDeflation { .. }
+                ReducedSchurPolicy::NewtonTikhonov { relative_floor } => match spectral_pd_floored_schur(
+                    &schur_scaled,
+                    relative_floor,
                 ) {
-                    spectral_unit_deflated_schur(&schur_scaled, relative_floor)
-                } else {
-                    spectral_pd_floored_schur(&schur_scaled, relative_floor)
-                } {
                     Some((floored, floored_factor)) => (floored_factor, Some(floored)),
                     None => {
                         return Err(ArrowSchurError::SchurFactorFailed {
@@ -784,6 +843,9 @@ pub(crate) fn factor_dense_reduced_schur(
                 ReducedSchurPolicy::StrictNewton => {
                     return Err(ArrowSchurError::SchurFactorFailed { reason: e });
                 }
+                ReducedSchurPolicy::EvidenceUnitDeflation { .. } => unreachable!(
+                    "evidence unit deflation returns before Newton equilibration"
+                ),
             }
         }
     };
@@ -807,6 +869,7 @@ pub(crate) fn factor_dense_reduced_schur(
     Ok(DenseReducedSchurFactorization {
         factor,
         conditioned_schur: floored_schur,
+        beta_deflation: None,
     })
 }
 
@@ -827,6 +890,7 @@ pub(crate) fn solve_dense_reduced_system(
     let DenseReducedSchurFactorization {
         factor,
         conditioned_schur: floored_schur,
+        beta_deflation: _,
     } = factor_dense_reduced_schur(schur, policy)?;
     if let Some(floored) = floored_schur {
         let direct = mixed_precision_reduced_beta(&floored, &factor, rhs_beta, options)
