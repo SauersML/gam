@@ -7090,7 +7090,7 @@ where
             });
 
         problem
-            .run(&mut obj, "n-block exact-joint spatial")
+            .run_certified(&mut obj, "n-block exact-joint spatial")
             .map_err(|error| error.to_string())?
     }; // obj dropped here, releasing mutable borrow on state
 
@@ -7140,10 +7140,7 @@ where
                 .to_string(),
         );
     }
-    let certified_outer = gam_solve::rho_optimizer::CertifiedOuterResult::try_from(result)
-        .map_err(|reason| {
-            format!("n-block exact-joint spatial optimization was not certified: {reason}")
-        })?;
+    let certified_outer = result;
     let theta_star = certified_outer.rho().clone();
 
     // ── P7 stage rotation ────────────────────────────────────────────────

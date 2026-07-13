@@ -909,6 +909,24 @@ impl OuterProblem {
         }
         result
     }
+
+    /// Run the outer optimization and return an unforgeable certified-result
+    /// carrier.  Callers that only need checkpoints or diagnostics should use
+    /// [`Self::run`]; fit assembly after an optimized outer coordinate must use
+    /// this boundary so a caller-constructed [`OuterResult`] cannot mint
+    /// convergence provenance.
+    pub fn run_certified(
+        &self,
+        obj: &mut dyn OuterObjective,
+        context: &str,
+    ) -> Result<CertifiedOuterResult, EstimationError> {
+        let result = self.run(obj, context)?;
+        CertifiedOuterResult::from_optimizer_result(result).map_err(|reason| {
+            EstimationError::RemlOptimizationFailed(format!(
+                "{context}: outer result failed certified-fit validation: {reason}"
+            ))
+        })
+    }
 }
 
 /// Internal outcome of one planned solver/multistart attempt.
@@ -1076,10 +1094,13 @@ pub struct CertifiedOuterResult {
     result: OuterResult,
 }
 
-impl TryFrom<OuterResult> for CertifiedOuterResult {
-    type Error = String;
-
-    fn try_from(result: OuterResult) -> Result<Self, Self::Error> {
+impl CertifiedOuterResult {
+    /// The sole constructor is reached from [`OuterProblem::run_certified`]
+    /// after the optimizer has produced the result.  Keeping this private is
+    /// load-bearing: `OuterResult` is also a public diagnostic/checkpoint
+    /// payload, so a public conversion would let downstream code fabricate a
+    /// certificate-shaped result without ever running an objective.
+    fn from_optimizer_result(result: OuterResult) -> Result<Self, String> {
         if !result.converged {
             return Err(format!(
                 "outer optimization did not converge after {} iterations",
@@ -1114,11 +1135,15 @@ impl TryFrom<OuterResult> for CertifiedOuterResult {
                 certificate.summary()
             ));
         }
+        if result.converged_via.is_none() {
+            return Err(
+                "outer optimization did not retain optimizer-owned termination provenance"
+                    .to_string(),
+            );
+        }
         Ok(Self { result })
     }
-}
 
-impl CertifiedOuterResult {
     /// Exact optimizer-owned hyperparameter vector covered by the certificate.
     pub fn rho(&self) -> &Array1<f64> {
         &self.result.rho
