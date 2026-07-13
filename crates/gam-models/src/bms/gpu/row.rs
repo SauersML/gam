@@ -3651,6 +3651,7 @@ mod tests {
     /// missing-runtime, probe, upload, launch, synchronization, status, or
     /// download failure aborts the test instead of turning into a skip.
     #[test]
+    #[ignore = "mandatory A100 acceptance; run explicitly with --exact --ignored"]
     fn mandatory_required_gpu_workspace_consumes_device_cache_end_to_end_932() {
         configure_global_policy(GpuPolicy::Required);
         assert_eq!(
@@ -3821,6 +3822,7 @@ mod tests {
     /// `cold_gpu_e2e_nvrtc_ms` includes the first NVRTC loads and the 21 ABBA
     /// samples describe only the subsequently cached compiler state.
     #[test]
+    #[ignore = "release-only A100 measurement; run explicitly with --exact --ignored"]
     fn release_measure_generated_bms_full_row_vs_strongest_cpu_932() {
         const N: usize = 32_768;
         const WARMUPS: usize = 3;
