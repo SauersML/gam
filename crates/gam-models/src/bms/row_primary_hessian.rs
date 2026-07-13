@@ -7,7 +7,7 @@ use super::exact_eval_cache::*;
 use super::family::*;
 use super::flex_row_program::{
     BmsFlexCalibrationOrder2Node, BmsFlexCalibrationOrder3Node, BmsFlexCalibrationOrder4Node,
-    BmsFlexProgramPoint, BmsFlexRowProgram,
+    BmsFlexProgramPoint, BmsFlexRowOrder2FinalizerNode, BmsFlexRowProgram,
 };
 use super::gradient_paths::*;
 use super::hessian_paths::*;

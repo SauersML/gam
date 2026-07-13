@@ -82,6 +82,33 @@ pub(super) enum BmsFlexCalibrationOrder4Node {
     },
 }
 
+/// Dependency-ordered row finalizer shared by optimized CPU and generated
+/// device backends after calibration moments have been lowered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BmsFlexRowOrder2FinalizerNode {
+    ImplicitFirst {
+        primary: usize,
+    },
+    ImplicitFirstComplete,
+    ImplicitSecond {
+        left: usize,
+        right: usize,
+    },
+    ObservedFirst {
+        primary: usize,
+    },
+    ObservedScoreSensitivity {
+        primary: usize,
+    },
+    ObservedSecond {
+        left: usize,
+        right: usize,
+    },
+    NegLogFirst {
+        primary: usize,
+    },
+}
+
 /// Borrowed scalar coordinates of the canonical BMS FLEX row program.
 ///
 /// This is the zero-allocation input to optimized lowerings. The dense generic
@@ -347,6 +374,42 @@ impl BmsFlexRowProgram {
         Ok(())
     }
 
+    /// Interpret the dependency-ordered implicit/observed Order2 finalizer.
+    pub(super) fn try_for_each_order2_finalizer<E>(
+        primary_count: usize,
+        need_hessian: bool,
+        mut visit: impl FnMut(BmsFlexRowOrder2FinalizerNode) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for primary in 0..primary_count {
+            visit(BmsFlexRowOrder2FinalizerNode::ImplicitFirst { primary })?;
+        }
+        visit(BmsFlexRowOrder2FinalizerNode::ImplicitFirstComplete)?;
+        if need_hessian {
+            for left in 0..primary_count {
+                for right in left..primary_count {
+                    visit(BmsFlexRowOrder2FinalizerNode::ImplicitSecond { left, right })?;
+                }
+            }
+        }
+        for primary in 0..primary_count {
+            visit(BmsFlexRowOrder2FinalizerNode::ObservedFirst { primary })?;
+        }
+        for primary in 0..primary_count {
+            visit(BmsFlexRowOrder2FinalizerNode::ObservedScoreSensitivity { primary })?;
+        }
+        if need_hessian {
+            for left in 0..primary_count {
+                for right in left..primary_count {
+                    visit(BmsFlexRowOrder2FinalizerNode::ObservedSecond { left, right })?;
+                }
+            }
+        }
+        for primary in 0..primary_count {
+            visit(BmsFlexRowOrder2FinalizerNode::NegLogFirst { primary })?;
+        }
+        Ok(())
+    }
+
     pub(super) fn from_parts(
         point: BmsFlexProgramPoint<'_>,
         calibration: Vec<BmsFlexCalibrationProgramNode>,
@@ -559,6 +622,37 @@ mod tests {
                     left: 4,
                     right: 4,
                 },
+            ]
+        );
+
+        let mut finalizer = Vec::new();
+        BmsFlexRowProgram::try_for_each_order2_finalizer(
+            2,
+            true,
+            |node| -> Result<(), std::convert::Infallible> {
+                finalizer.push(node);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            finalizer,
+            vec![
+                BmsFlexRowOrder2FinalizerNode::ImplicitFirst { primary: 0 },
+                BmsFlexRowOrder2FinalizerNode::ImplicitFirst { primary: 1 },
+                BmsFlexRowOrder2FinalizerNode::ImplicitFirstComplete,
+                BmsFlexRowOrder2FinalizerNode::ImplicitSecond { left: 0, right: 0 },
+                BmsFlexRowOrder2FinalizerNode::ImplicitSecond { left: 0, right: 1 },
+                BmsFlexRowOrder2FinalizerNode::ImplicitSecond { left: 1, right: 1 },
+                BmsFlexRowOrder2FinalizerNode::ObservedFirst { primary: 0 },
+                BmsFlexRowOrder2FinalizerNode::ObservedFirst { primary: 1 },
+                BmsFlexRowOrder2FinalizerNode::ObservedScoreSensitivity { primary: 0 },
+                BmsFlexRowOrder2FinalizerNode::ObservedScoreSensitivity { primary: 1 },
+                BmsFlexRowOrder2FinalizerNode::ObservedSecond { left: 0, right: 0 },
+                BmsFlexRowOrder2FinalizerNode::ObservedSecond { left: 0, right: 1 },
+                BmsFlexRowOrder2FinalizerNode::ObservedSecond { left: 1, right: 1 },
+                BmsFlexRowOrder2FinalizerNode::NegLogFirst { primary: 0 },
+                BmsFlexRowOrder2FinalizerNode::NegLogFirst { primary: 1 },
             ]
         );
     }
