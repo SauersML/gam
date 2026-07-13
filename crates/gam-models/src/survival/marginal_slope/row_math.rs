@@ -768,145 +768,146 @@ pub(crate) fn row_primary_closed_form(
 
 #[cfg(test)]
 mod test_support {
-use super::*;
+    use super::*;
 
-/// Historical hand-expanded K=1 V/G/H schedule, retained only as an
-/// independent strongest-hand test and performance witness for the generated
-/// [`row_primary_closed_form`] lowering. Production must never call this body.
-#[inline]
-pub(super) fn row_primary_closed_form_hand_reference(
-    q0: f64,
-    q1: f64,
-    qd1: f64,
-    g: f64,
-    z: f64,
-    w: f64,
-    d: f64,
-    derivative_guard: f64,
-    probit_scale: f64,
-) -> Result<(f64, [f64; N_PRIMARY], [[f64; N_PRIMARY]; N_PRIMARY]), String> {
-    let (c, c1, c2, ..) = c_derivatives(g, probit_scale);
-    let observed_g = rigid_observed_logslope(g, probit_scale);
+    /// Historical hand-expanded K=1 V/G/H schedule, retained only as an
+    /// independent strongest-hand test and performance witness for the generated
+    /// [`row_primary_closed_form`] lowering. Production must never call this body.
+    #[inline]
+    pub(super) fn row_primary_closed_form_hand_reference(
+        q0: f64,
+        q1: f64,
+        qd1: f64,
+        g: f64,
+        z: f64,
+        w: f64,
+        d: f64,
+        derivative_guard: f64,
+        probit_scale: f64,
+    ) -> Result<(f64, [f64; N_PRIMARY], [[f64; N_PRIMARY]; N_PRIMARY]), String> {
+        let (c, c1, c2, ..) = c_derivatives(g, probit_scale);
+        let observed_g = rigid_observed_logslope(g, probit_scale);
 
-    // Linear predictors
-    let eta0 = q0 * c + observed_g * z;
-    let eta1 = q1 * c + observed_g * z;
-    let ad1 = qd1 * c;
+        // Linear predictors
+        let eta0 = q0 * c + observed_g * z;
+        let eta1 = q1 * c + observed_g * z;
+        let ad1 = qd1 * c;
 
-    if survival_derivative_guard_violated(qd1, derivative_guard) {
-        return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+        if survival_derivative_guard_violated(qd1, derivative_guard) {
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
             reason: format!(
                 "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
             ),
         }
         .into());
+        }
+
+        // ── NLL terms ──
+        // Entry survival: -neglogΦ(-η₀) = logΦ(-η₀)
+        let (logcdf_neg_eta0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
+        // Exit survival: (1-d)·neglogΦ(-η₁)
+        let (logcdf_neg_eta1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
+        // Event density: d·logφ(η₁)
+        let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
+        // Time derivative: d·log(ad1)
+        let log_ad1 = ad1.max(1e-300).ln();
+
+        let nll =
+            w * ((1.0 - d) * (-logcdf_neg_eta1) + logcdf_neg_eta0 - d * log_phi_eta1 - d * log_ad1);
+
+        // ── First and second derivatives of each NLL component ──
+        // signed_probit_neglog_derivatives gives derivatives with respect to m for
+        // -weight * logΦ(m). Here m = -η, so odd derivatives flip sign when mapped
+        // back to derivatives with respect to η.
+        // For entry: m = -η₀, weight = -w because the NLL contains +w logΦ(-η₀)
+        let (e0_k1, e0_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta0, -w)?;
+        // For exit: m = -η₁, weight = w(1-d)
+        let (e1_k1, e1_k2, _, _) =
+            signed_probit_neglog_derivatives_up_to_fourth(-eta1, w * (1.0 - d))?;
+        // Event density: -d·logφ(η₁) = d·(η₁²/2 + const).
+        // d/dη₁ = d·w·η₁, d²/dη₁² = d·w.
+        let phi_u1 = w * d * eta1;
+        let phi_u2 = w * d;
+        // Time derivative: -d·log(ad1).
+        let (nl_u1, nl_u2, _, _) = neglog_derivatives(ad1);
+        let td_u1 = w * d * nl_u1;
+        let td_u2 = w * d * nl_u2;
+
+        // ── Chain rule to primary space ──
+        // η₀ depends on (q₀, g): ∂η₀/∂q₀ = c, ∂η₀/∂g = q₀c₁ + s_f z
+        // η₁ depends on (q₁, g): ∂η₁/∂q₁ = c, ∂η₁/∂g = q₁c₁ + s_f z
+        // ad1 depends on (qd1, g): ∂ad1/∂qd1 = c, ∂ad1/∂g = qd1·c₁
+        let deta0_dq0 = c;
+        let deta0_dg = q0 * c1 + probit_scale * z;
+        let deta1_dq1 = c;
+        let deta1_dg = q1 * c1 + probit_scale * z;
+        let dad1_dqd1 = c;
+        let dad1_dg = qd1 * c1;
+
+        // Combined first derivatives of total NLL:
+        // u1 for η₀ terms = -e0_k1 (chain rule through m = -η₀)
+        // u1 for η₁ terms = -e1_k1 + phi_u1 (chain rule through m = -η₁)
+        // u1 for ad1 term = td_u1 (time derivative)
+        let u1_eta0 = -e0_k1;
+        let u1_eta1 = -e1_k1 + phi_u1;
+        let u1_ad1 = td_u1;
+
+        let mut grad = [0.0_f64; N_PRIMARY];
+        grad[0] = u1_eta0 * deta0_dq0; // ∂ℓ/∂q₀
+        grad[1] = u1_eta1 * deta1_dq1; // ∂ℓ/∂q₁
+        grad[2] = u1_ad1 * dad1_dqd1; // ∂ℓ/∂qd₁
+        grad[3] = u1_eta0 * deta0_dg + u1_eta1 * deta1_dg + u1_ad1 * dad1_dg; // ∂ℓ/∂g
+
+        // Combined second derivatives:
+        let u2_eta0 = e0_k2;
+        let u2_eta1 = e1_k2 + phi_u2;
+        let u2_ad1 = td_u2;
+
+        // Second mixed derivatives of η w.r.t. primary scalars:
+        let d2eta0_dq0dg = c1;
+        let d2eta1_dq1dg = c1;
+        let d2ad1_dqd1dg = c1;
+        // d²η₀/dg² = q₀·c₂ (z is linear in g, so its second derivative is 0)
+        let d2eta0_dg2 = q0 * c2;
+        let d2eta1_dg2 = q1 * c2;
+        let d2ad1_dg2 = qd1 * c2;
+
+        let mut hess = [[0.0_f64; N_PRIMARY]; N_PRIMARY];
+
+        // (q0, q0)
+        hess[0][0] = u2_eta0 * deta0_dq0 * deta0_dq0;
+        // (q1, q1)
+        hess[1][1] = u2_eta1 * deta1_dq1 * deta1_dq1;
+        // (qd1, qd1)
+        hess[2][2] = u2_ad1 * dad1_dqd1 * dad1_dqd1;
+        // (q0, q1) = 0 (η₀ and η₁ share no primary scalars except g)
+        hess[0][1] = 0.0;
+        hess[1][0] = 0.0;
+        // (q0, qd1) = 0
+        hess[0][2] = 0.0;
+        hess[2][0] = 0.0;
+        // (q1, qd1) = 0
+        hess[1][2] = 0.0;
+        hess[2][1] = 0.0;
+        // (q0, g) = u2_η₀ · (∂η₀/∂q₀)(∂η₀/∂g) + u1_η₀ · (∂²η₀/∂q₀∂g)
+        hess[0][3] = u2_eta0 * deta0_dq0 * deta0_dg + u1_eta0 * d2eta0_dq0dg;
+        hess[3][0] = hess[0][3];
+        // (q1, g)
+        hess[1][3] = u2_eta1 * deta1_dq1 * deta1_dg + u1_eta1 * d2eta1_dq1dg;
+        hess[3][1] = hess[1][3];
+        // (qd1, g)
+        hess[2][3] = u2_ad1 * dad1_dqd1 * dad1_dg + u1_ad1 * d2ad1_dqd1dg;
+        hess[3][2] = hess[2][3];
+        // (g, g) = Σ_terms [u2·(dterm/dg)² + u1·(d²term/dg²)]
+        hess[3][3] = u2_eta0 * deta0_dg * deta0_dg
+            + u1_eta0 * d2eta0_dg2
+            + u2_eta1 * deta1_dg * deta1_dg
+            + u1_eta1 * d2eta1_dg2
+            + u2_ad1 * dad1_dg * dad1_dg
+            + u1_ad1 * d2ad1_dg2;
+
+        Ok((nll, grad, hess))
     }
-
-    // ── NLL terms ──
-    // Entry survival: -neglogΦ(-η₀) = logΦ(-η₀)
-    let (logcdf_neg_eta0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
-    // Exit survival: (1-d)·neglogΦ(-η₁)
-    let (logcdf_neg_eta1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
-    // Event density: d·logφ(η₁)
-    let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
-    // Time derivative: d·log(ad1)
-    let log_ad1 = ad1.max(1e-300).ln();
-
-    let nll =
-        w * ((1.0 - d) * (-logcdf_neg_eta1) + logcdf_neg_eta0 - d * log_phi_eta1 - d * log_ad1);
-
-    // ── First and second derivatives of each NLL component ──
-    // signed_probit_neglog_derivatives gives derivatives with respect to m for
-    // -weight * logΦ(m). Here m = -η, so odd derivatives flip sign when mapped
-    // back to derivatives with respect to η.
-    // For entry: m = -η₀, weight = -w because the NLL contains +w logΦ(-η₀)
-    let (e0_k1, e0_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta0, -w)?;
-    // For exit: m = -η₁, weight = w(1-d)
-    let (e1_k1, e1_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta1, w * (1.0 - d))?;
-    // Event density: -d·logφ(η₁) = d·(η₁²/2 + const).
-    // d/dη₁ = d·w·η₁, d²/dη₁² = d·w.
-    let phi_u1 = w * d * eta1;
-    let phi_u2 = w * d;
-    // Time derivative: -d·log(ad1).
-    let (nl_u1, nl_u2, _, _) = neglog_derivatives(ad1);
-    let td_u1 = w * d * nl_u1;
-    let td_u2 = w * d * nl_u2;
-
-    // ── Chain rule to primary space ──
-    // η₀ depends on (q₀, g): ∂η₀/∂q₀ = c, ∂η₀/∂g = q₀c₁ + s_f z
-    // η₁ depends on (q₁, g): ∂η₁/∂q₁ = c, ∂η₁/∂g = q₁c₁ + s_f z
-    // ad1 depends on (qd1, g): ∂ad1/∂qd1 = c, ∂ad1/∂g = qd1·c₁
-    let deta0_dq0 = c;
-    let deta0_dg = q0 * c1 + probit_scale * z;
-    let deta1_dq1 = c;
-    let deta1_dg = q1 * c1 + probit_scale * z;
-    let dad1_dqd1 = c;
-    let dad1_dg = qd1 * c1;
-
-    // Combined first derivatives of total NLL:
-    // u1 for η₀ terms = -e0_k1 (chain rule through m = -η₀)
-    // u1 for η₁ terms = -e1_k1 + phi_u1 (chain rule through m = -η₁)
-    // u1 for ad1 term = td_u1 (time derivative)
-    let u1_eta0 = -e0_k1;
-    let u1_eta1 = -e1_k1 + phi_u1;
-    let u1_ad1 = td_u1;
-
-    let mut grad = [0.0_f64; N_PRIMARY];
-    grad[0] = u1_eta0 * deta0_dq0; // ∂ℓ/∂q₀
-    grad[1] = u1_eta1 * deta1_dq1; // ∂ℓ/∂q₁
-    grad[2] = u1_ad1 * dad1_dqd1; // ∂ℓ/∂qd₁
-    grad[3] = u1_eta0 * deta0_dg + u1_eta1 * deta1_dg + u1_ad1 * dad1_dg; // ∂ℓ/∂g
-
-    // Combined second derivatives:
-    let u2_eta0 = e0_k2;
-    let u2_eta1 = e1_k2 + phi_u2;
-    let u2_ad1 = td_u2;
-
-    // Second mixed derivatives of η w.r.t. primary scalars:
-    let d2eta0_dq0dg = c1;
-    let d2eta1_dq1dg = c1;
-    let d2ad1_dqd1dg = c1;
-    // d²η₀/dg² = q₀·c₂ (z is linear in g, so its second derivative is 0)
-    let d2eta0_dg2 = q0 * c2;
-    let d2eta1_dg2 = q1 * c2;
-    let d2ad1_dg2 = qd1 * c2;
-
-    let mut hess = [[0.0_f64; N_PRIMARY]; N_PRIMARY];
-
-    // (q0, q0)
-    hess[0][0] = u2_eta0 * deta0_dq0 * deta0_dq0;
-    // (q1, q1)
-    hess[1][1] = u2_eta1 * deta1_dq1 * deta1_dq1;
-    // (qd1, qd1)
-    hess[2][2] = u2_ad1 * dad1_dqd1 * dad1_dqd1;
-    // (q0, q1) = 0 (η₀ and η₁ share no primary scalars except g)
-    hess[0][1] = 0.0;
-    hess[1][0] = 0.0;
-    // (q0, qd1) = 0
-    hess[0][2] = 0.0;
-    hess[2][0] = 0.0;
-    // (q1, qd1) = 0
-    hess[1][2] = 0.0;
-    hess[2][1] = 0.0;
-    // (q0, g) = u2_η₀ · (∂η₀/∂q₀)(∂η₀/∂g) + u1_η₀ · (∂²η₀/∂q₀∂g)
-    hess[0][3] = u2_eta0 * deta0_dq0 * deta0_dg + u1_eta0 * d2eta0_dq0dg;
-    hess[3][0] = hess[0][3];
-    // (q1, g)
-    hess[1][3] = u2_eta1 * deta1_dq1 * deta1_dg + u1_eta1 * d2eta1_dq1dg;
-    hess[3][1] = hess[1][3];
-    // (qd1, g)
-    hess[2][3] = u2_ad1 * dad1_dqd1 * dad1_dg + u1_ad1 * d2ad1_dqd1dg;
-    hess[3][2] = hess[2][3];
-    // (g, g) = Σ_terms [u2·(dterm/dg)² + u1·(d²term/dg²)]
-    hess[3][3] = u2_eta0 * deta0_dg * deta0_dg
-        + u1_eta0 * d2eta0_dg2
-        + u2_eta1 * deta1_dg * deta1_dg
-        + u1_eta1 * d2eta1_dg2
-        + u2_ad1 * dad1_dg * dad1_dg
-        + u1_ad1 * d2ad1_dg2;
-
-    Ok((nll, grad, hess))
-}
 }
 
 /// Crate-visible wrapper around `row_primary_closed_form` so the
@@ -1117,12 +1118,9 @@ mod tests {
                 max_abs = max_abs.max(gradient_abs);
                 max_rel = max_rel.max(gradient_abs / hand.1[axis_a].abs().max(1.0));
                 for axis_b in 0..N_PRIMARY {
-                    let hessian_abs =
-                        (canonical.2[axis_a][axis_b] - hand.2[axis_a][axis_b]).abs();
+                    let hessian_abs = (canonical.2[axis_a][axis_b] - hand.2[axis_a][axis_b]).abs();
                     max_abs = max_abs.max(hessian_abs);
-                    max_rel = max_rel.max(
-                        hessian_abs / hand.2[axis_a][axis_b].abs().max(1.0),
-                    );
+                    max_rel = max_rel.max(hessian_abs / hand.2[axis_a][axis_b].abs().max(1.0));
                 }
             }
             assert!(max_rel <= 2.0e-11, "case {case} parity rel={max_rel:e}");
