@@ -937,6 +937,91 @@ fn isometry_gn_majorizer_is_psd_and_symmetric() {
     }
 }
 
+/// Regression for #2294: the interior-mutable `jacobian_cache` is refreshed
+/// per-atom, so a heterogeneous SAE with MIXED latent dimensions (the zoo
+/// `dims = [1,1,2,2,2,2,2,1]`) can leave a cache built for one atom's
+/// `latent_dim` in the slot when a DIFFERENT atom is evaluated. Reading a
+/// `d = 2` cache (`ncols = p·2`) at `d = 1` previously tripped the
+/// `pullback_metric` shape assert (`p·2 != p·1`) with a hard panic that
+/// aborted the whole zoo fit. The root fix keys the read on the atom's
+/// dimensional identity `(latent_dim, p_out)`: a mismatch is a clean cache-miss
+/// (`None`), never a wrong-`d` read or a panic. A correctly-refreshed cache
+/// still yields the exact pullback metric at every `d`.
+#[test]
+fn isometry_pullback_metric_mixed_latent_dim_never_panics() {
+    let p = 4usize;
+    let n_obs = 3usize;
+
+    // A shared penalty whose cache is refreshed per-atom, exactly as the SAE
+    // outer loop drives one `IsometryPenalty` across atoms of different `d`.
+    let target = PsiSlice::full(n_obs * 2, Some(2));
+    let pen = IsometryPenalty::new_euclidean(target, p);
+
+    // --- Atom A: latent_dim = 2. Cache ncols = p·2. ---
+    let mut j2 = Array2::<f64>::zeros((n_obs, p * 2));
+    for n in 0..n_obs {
+        for i in 0..p {
+            for a in 0..2 {
+                j2[[n, i * 2 + a]] = 0.5 + 0.3 * n as f64 - 0.2 * i as f64 + 0.11 * a as f64;
+            }
+        }
+    }
+    pen.refresh_caches(Some(Arc::new(j2.clone())), None);
+    let g2 = pen
+        .pullback_metric(2)
+        .expect("d=2 pullback metric available for a d=2 cache");
+    assert_eq!(g2.dim(), (n_obs, 2 * 2));
+    // g_n[a,b] = Σ_i J[n,i,a]·J[n,i,b].
+    for n in 0..n_obs {
+        for a in 0..2 {
+            for b in 0..2 {
+                let mut expected = 0.0;
+                for i in 0..p {
+                    expected += j2[[n, i * 2 + a]] * j2[[n, i * 2 + b]];
+                }
+                assert_abs_diff_eq!(g2[[n, a * 2 + b]], expected, epsilon = 1e-12);
+            }
+        }
+    }
+
+    // --- Stale cross-atom read: the d=2 cache is still installed, but atom B
+    // has latent_dim = 1. Before #2294 this panicked at the shape assert; now
+    // it is a clean cache-miss (None), NOT a wrong-`d` reshape. ---
+    assert!(
+        pen.pullback_metric(1).is_none(),
+        "a d=2 cache read at d=1 must be a cache-miss, not a panic or wrong-d read"
+    );
+
+    // --- Atom B refreshes the cache for its own latent_dim = 1 (ncols = p·1),
+    // and its pullback metric is then exact. The two atoms alternate through the
+    // same penalty without corruption. ---
+    let mut j1 = Array2::<f64>::zeros((n_obs, p));
+    for n in 0..n_obs {
+        for i in 0..p {
+            j1[[n, i]] = 0.9 - 0.13 * n as f64 + 0.07 * i as f64;
+        }
+    }
+    pen.refresh_caches(Some(Arc::new(j1.clone())), None);
+    let g1 = pen
+        .pullback_metric(1)
+        .expect("d=1 pullback metric available for a d=1 cache");
+    assert_eq!(g1.dim(), (n_obs, 1));
+    for n in 0..n_obs {
+        let mut expected = 0.0;
+        for i in 0..p {
+            expected += j1[[n, i]] * j1[[n, i]];
+        }
+        assert_abs_diff_eq!(g1[[n, 0]], expected, epsilon = 1e-12);
+    }
+
+    // And the reverse stale direction: a d=1 cache read at d=2 is likewise a
+    // clean miss.
+    assert!(
+        pen.pullback_metric(2).is_none(),
+        "a d=1 cache read at d=2 must be a cache-miss, not a panic or wrong-d read"
+    );
+}
+
 /// As the normalized residual `g/gbar − g_ref → 0` the exact Hessian collapses onto its
 /// Gauss-Newton block. Pinning the reference metric to the model's own
 /// pullback metric drives the residual to exactly zero, so the exact `hvp`
