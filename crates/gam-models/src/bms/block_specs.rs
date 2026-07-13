@@ -3017,11 +3017,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 vb.ncols()
             ));
         }
-        let correction_family = make_family(
-            &marginal_design,
-            &logslope_design,
-            final_sigma_cell.get(),
-        );
+        let correction_family =
+            make_family(&marginal_design, &logslope_design, final_sigma_cell.get());
         let flex_active = score_warp_runtime.is_some() || link_dev_runtime.is_some();
         let s = if flex_active {
             correction_family.flex_score_zeta_sensitivity(

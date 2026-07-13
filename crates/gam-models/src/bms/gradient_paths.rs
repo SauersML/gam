@@ -2311,12 +2311,9 @@ mod jet_tower_oracle_tests {
             let g = p[1];
             // observed slope b = s·g, scale c = √(1 + b²).
             let observed_slope = g.scale(s);
-            let one_plus_slope_squared = observed_slope
-                .mul(&observed_slope)
-                .add(&S::constant(1.0));
-            let c = one_plus_slope_squared.compose_unary(unary_derivatives_sqrt(
-                one_plus_slope_squared.value(),
-            ));
+            let one_plus_slope_squared = observed_slope.mul(&observed_slope).add(&S::constant(1.0));
+            let c = one_plus_slope_squared
+                .compose_unary(unary_derivatives_sqrt(one_plus_slope_squared.value()));
             // η = q·c + b·z, signed margin m = (2y−1)·η.
             let eta = q.mul(&c).add(&observed_slope.scale(z));
             let signed = eta.scale(2.0 * y - 1.0);
@@ -3064,11 +3061,7 @@ mod flex_primary_hessian_oracle_tests {
             .checked_sub(1)
             .expect("nonempty coefficient frame");
         let error = family
-            .flex_score_zeta_sensitivity(
-                &states,
-                &BlockwiseFitOptions::default(),
-                wrong_width,
-            )
+            .flex_score_zeta_sensitivity(&states, &BlockwiseFitOptions::default(), wrong_width)
             .expect_err("partial Murphy-Topel covariance frame must be rejected");
         assert!(
             error.contains("covariance/frame mismatch"),

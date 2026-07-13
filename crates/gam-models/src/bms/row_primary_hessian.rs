@@ -1,7 +1,7 @@
 use super::cell_moment_assembly::{
-    BernoulliInterceptSolveStats, EmpiricalBmsFourthJetSchedule,
-    empirical_bms_fourth_jet_schedule, fill_link_basis_cell_coeff_gradient,
-    fill_link_basis_cell_coeff_jet, fill_score_basis_cell_coeff_jet,
+    BernoulliInterceptSolveStats, EmpiricalBmsFourthJetSchedule, empirical_bms_fourth_jet_schedule,
+    fill_link_basis_cell_coeff_gradient, fill_link_basis_cell_coeff_jet,
+    fill_score_basis_cell_coeff_jet,
 };
 use super::exact_eval_cache::*;
 use super::family::*;
@@ -2799,11 +2799,7 @@ impl BernoulliMarginalSlopeFamily {
         let mut full_options = options.clone();
         full_options.outer_score_subsample = None;
         full_options.auto_outer_subsample = false;
-        let cache = self.build_or_reuse_shared_exact_cache(
-            block_states,
-            &full_options,
-            false,
-        )?;
+        let cache = self.build_or_reuse_shared_exact_cache(block_states, &full_options, false)?;
         let slices = &cache.slices;
         let primary = &cache.primary;
         if slices.total != expected_beta_dim {
