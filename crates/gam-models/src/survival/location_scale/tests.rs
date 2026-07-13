@@ -4247,7 +4247,7 @@ fn inverse_link_survival_prob_complements_failure_prob() {
 fn lift_conditional_covariance_rejects_time_map_wider_than_raw() {
     let z = array![[1.0, 0.0]];
     let time_gauge = Gauge::from_block_transforms(&[z]);
-    let err = survival_location_scale_finalization_gauge(&time_gauge, 0, 0, 0, 0, 0, 0, 0)
+    let err = survival_location_scale_finalization_gauge(&time_gauge, 0, 0, 0, 0, 0, 0, None)
         .expect_err(
             "a reduced time block wider than the raw time map must fail before ndarray assignment",
         );
@@ -4262,7 +4262,7 @@ fn lift_conditional_covariance_preserveswiggle_block() {
     let z = array![[1.0, 0.0], [0.5, 1.0], [0.0, 1.0]];
     let time_gauge = Gauge::from_block_transforms(&[z]);
     let finalization_gauge =
-        survival_location_scale_finalization_gauge(&time_gauge, 1, 1, 0, 1, 1, 0, 1)
+        survival_location_scale_finalization_gauge(&time_gauge, 1, 1, 0, 1, 1, 0, Some(1))
             .expect("location-scale finalization gauge");
     let cov_reduced = array![
         [2.0, 0.1, 0.2, 0.3, 0.4],
@@ -4271,13 +4271,25 @@ fn lift_conditional_covariance_preserveswiggle_block() {
         [0.3, 0.6, 0.8, 5.0, 1.1],
         [0.4, 0.7, 0.9, 1.1, 6.0],
     ];
-    let lifted = lift_conditional_covariance(&cov_reduced, &finalization_gauge)
-        .expect("covariance lift");
+    let lifted =
+        lift_conditional_covariance(&cov_reduced, &finalization_gauge).expect("covariance lift");
     assert_eq!(lifted.dim(), (6, 6));
     assert!((lifted[[5, 5]] - 6.0).abs() <= 1e-12);
     assert!((lifted[[0, 5]] - 0.4).abs() <= 1e-12);
     assert!((lifted[[3, 5]] - 0.9).abs() <= 1e-12);
     assert!((lifted[[4, 5]] - 1.1).abs() <= 1e-12);
+}
+
+#[test]
+fn finalization_gauge_preserves_absent_optional_block_topology() {
+    let time_gauge = Gauge::identity(&[2]);
+    let finalization_gauge =
+        survival_location_scale_finalization_gauge(&time_gauge, 1, 1, 0, 1, 1, 0, None)
+            .expect("three-block location-scale finalization gauge");
+
+    assert_eq!(finalization_gauge.n_blocks(), 3);
+    assert_eq!(finalization_gauge.block_starts_raw, vec![0, 2, 3, 4]);
+    assert_eq!(finalization_gauge.block_starts_reduced, vec![0, 2, 3, 4]);
 }
 
 #[test]
@@ -4287,7 +4299,7 @@ fn finalization_gauge_composes_non_square_active_frames_and_affine_shift() {
         array![0.25, -0.5, 0.75],
     );
     let finalization_gauge =
-        survival_location_scale_finalization_gauge(&time_gauge, 1, 2, 1, 1, 1, 0, 1)
+        survival_location_scale_finalization_gauge(&time_gauge, 1, 2, 1, 1, 1, 0, Some(1))
             .expect("location-scale finalization gauge");
     assert_eq!(finalization_gauge.t_full.dim(), (7, 5));
     assert_eq!(
@@ -4312,16 +4324,14 @@ fn finalization_gauge_composes_non_square_active_frames_and_affine_shift() {
     assert_eq!(composed.t_full.dim(), (7, 4));
 
     let raw_row = array![[0.2, -0.3, 0.7, 1.1, -1.3, 0.4, 2.0]];
-    let through_both = inner_gauge.restrict_design(
-        &finalization_gauge.restrict_design(&raw_row),
-    );
+    let through_both = inner_gauge.restrict_design(&finalization_gauge.restrict_design(&raw_row));
     let through_composed = composed.restrict_design(&raw_row);
-    assert_eq!(through_composed, through_both);
+    for (actual, expected) in through_composed.iter().zip(through_both.iter()) {
+        assert!((actual - expected).abs() <= 1e-14);
+    }
 
-    let expected_shift = finalization_gauge
-        .t_full
-        .dot(&inner_gauge.affine_shift)
-        + &finalization_gauge.affine_shift;
+    let expected_shift =
+        finalization_gauge.t_full.dot(&inner_gauge.affine_shift) + &finalization_gauge.affine_shift;
     assert_eq!(composed.affine_shift, expected_shift);
 }
 

@@ -866,7 +866,7 @@ pub(crate) fn finalize_survival_location_scale_fit(
         beta_log_sigma_active.len(),
         beta_log_sigma.len(),
         prepared.log_sigma_fixed_cols,
-        beta_link_wiggle.as_ref().map_or(0, |b| b.len()),
+        beta_link_wiggle.as_ref().map(|b| b.len()),
     )?;
     let lambdas = fit.lambdas.clone();
     let lambdas_time = lambdas.slice(s![0..prepared.k_time]).to_owned();

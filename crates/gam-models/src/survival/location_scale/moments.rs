@@ -520,14 +520,8 @@ pub(crate) fn survival_location_scale_finalization_gauge(
     p_log_sigma_reduced: usize,
     p_log_sigma_full: usize,
     log_sigma_fixed_cols: usize,
-    p_linkwiggle: usize,
+    p_linkwiggle: Option<usize>,
 ) -> Result<Gauge, String> {
-    time_gauge.validate().map_err(|reason| {
-        SurvivalLocationScaleError::InvalidConfiguration {
-            reason: format!("survival location-scale time gauge is invalid: {reason}"),
-        }
-        .to_string()
-    })?;
     if time_gauge.n_blocks() != 1 {
         return Err(SurvivalLocationScaleError::InvalidConfiguration {
             reason: format!(
@@ -573,6 +567,12 @@ pub(crate) fn survival_location_scale_finalization_gauge(
         }
         .into());
     }
+    time_gauge.validate().map_err(|reason| {
+        SurvivalLocationScaleError::InvalidConfiguration {
+            reason: format!("survival location-scale time gauge is invalid: {reason}"),
+        }
+        .to_string()
+    })?;
 
     let fixed_tail_transform = |full: usize, fixed: usize, reduced: usize| {
         let mut t = Array2::<f64>::zeros((full, reduced));
@@ -581,18 +581,24 @@ pub(crate) fn survival_location_scale_finalization_gauge(
         }
         t
     };
-    let p_full = p_time_full + p_threshold_full + p_log_sigma_full + p_linkwiggle;
+    let p_linkwiggle_width = p_linkwiggle.unwrap_or(0);
+    let p_full = p_time_full + p_threshold_full + p_log_sigma_full + p_linkwiggle_width;
     let mut affine_shift = Array1::<f64>::zeros(p_full);
     affine_shift
         .slice_mut(s![0..p_time_full])
         .assign(&time_gauge.affine_shift);
-    let joint_gauge = Gauge::from_block_transforms_with_shift(&[
+    let mut block_transforms = vec![
         time_gauge.block_transform(0),
         fixed_tail_transform(p_threshold_full, threshold_fixed_cols, p_threshold_reduced),
         fixed_tail_transform(p_log_sigma_full, log_sigma_fixed_cols, p_log_sigma_reduced),
-        Array2::<f64>::eye(p_linkwiggle),
-    ], affine_shift);
-    let p_reduced = p_time_reduced + p_threshold_reduced + p_log_sigma_reduced + p_linkwiggle;
+    ];
+    if let Some(width) = p_linkwiggle {
+        block_transforms.push(Array2::<f64>::eye(width));
+    }
+    let joint_gauge =
+        Gauge::from_block_transforms_with_shift(&block_transforms, affine_shift);
+    let p_reduced =
+        p_time_reduced + p_threshold_reduced + p_log_sigma_reduced + p_linkwiggle_width;
     assert_eq!(joint_gauge.raw_total(), p_full);
     assert_eq!(joint_gauge.reduced_total(), p_reduced);
     Ok(joint_gauge)
