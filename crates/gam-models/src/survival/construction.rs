@@ -3267,6 +3267,31 @@ pub fn survival_derivative_guard_for_likelihood(likelihood_mode: SurvivalLikelih
     }
 }
 
+/// Resolve the actual parametric offset chart used by a marginal-slope fit.
+///
+/// A nominal `Linear` target has zero derivative and therefore starts the
+/// `-log(q')` barrier exactly on its guard.  Fitting consequently uses a
+/// deterministic exponential-survival (Weibull shape one) offset at the
+/// data-scale mean positive exit time.  This function is the shared authority
+/// for fitting and persistence: saving the nominal `Linear` request would not
+/// be enough to replay the fitted row likelihood.
+pub fn survival_marginal_slope_offset_baseline_config(
+    age_exit: &Array1<f64>,
+    requested: &SurvivalBaselineConfig,
+) -> SurvivalBaselineConfig {
+    if requested.target == SurvivalBaselineTarget::Linear {
+        SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Weibull,
+            scale: Some(positive_survival_time_seed(age_exit)),
+            shape: Some(1.0),
+            rate: None,
+            makeham: None,
+        }
+    } else {
+        requested.clone()
+    }
+}
+
 pub fn build_survival_time_offsets_for_likelihood(
     age_entry: &Array1<f64>,
     age_exit: &Array1<f64>,

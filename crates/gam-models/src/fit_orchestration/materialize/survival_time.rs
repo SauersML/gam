@@ -74,19 +74,14 @@ pub fn prepare_survival_time_stack(
         // fitted hazard is the same flexible family), so the fix is a pure
         // preconditioning of the cold start. Gated to MarginalSlope with a Linear
         // target so every other Linear-baseline survival path is byte-unchanged.
-        let conditioning_cfg;
-        let offset_cfg = if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope
-            && baseline_cfg.target == SurvivalBaselineTarget::Linear
-        {
-            let scale = crate::survival::construction::positive_survival_time_seed(age_exit);
-            conditioning_cfg = crate::survival::construction::SurvivalBaselineConfig {
-                target: SurvivalBaselineTarget::Weibull,
-                scale: Some(scale),
-                shape: Some(1.0),
-                rate: None,
-                makeham: None,
-            };
-            &conditioning_cfg
+        let marginal_slope_offset_cfg;
+        let offset_cfg = if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+            marginal_slope_offset_cfg =
+                crate::survival::construction::survival_marginal_slope_offset_baseline_config(
+                    age_exit,
+                    baseline_cfg,
+                );
+            &marginal_slope_offset_cfg
         } else {
             baseline_cfg
         };

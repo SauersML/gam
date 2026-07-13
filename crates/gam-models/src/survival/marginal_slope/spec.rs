@@ -107,6 +107,9 @@ pub struct SurvivalMarginalSlopeFitResult {
     pub baseline_offset_curvatures: OffsetChannelCurvatures,
     pub z_normalization: LatentZNormalization,
     pub time_block_penalties_len: usize,
+    pub time_wiggle_knots: Option<Array1<f64>>,
+    pub time_wiggle_degree: Option<usize>,
+    pub time_wiggle_ncols: usize,
     pub score_warp_runtime: Option<DeviationRuntime>,
     pub link_dev_runtime: Option<DeviationRuntime>,
     /// Width `p₁` of the absorbed Stage-1 influence block (#461) when the fit
@@ -115,6 +118,10 @@ pub struct SurvivalMarginalSlopeFitResult {
     /// absorber's `γ`; this width lets it account for the extra trailing block
     /// and slice `γ` out of the joint covariance.
     pub influence_absorber_width: Option<usize>,
+    /// Exact residualized training-row absorber design.  This is likelihood
+    /// state, not prediction state: ordinary prediction drops the fitted
+    /// absorber, while saved-model ALO must replay its row Jacobian exactly.
+    pub influence_absorber_design: Option<Array2<f64>>,
 }
 
 pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {

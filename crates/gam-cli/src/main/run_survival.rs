@@ -1119,6 +1119,42 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 &fit.logslope_design,
             )
             .map_err(|e| e.to_string())?;
+            let baseline_timewiggle = match prepared.timewiggle_build.as_ref() {
+                Some(wiggle) => {
+                    let beta_time = &fit
+                        .fit
+                        .blocks
+                        .first()
+                        .ok_or_else(|| {
+                            "survival marginal-slope fit is missing its time block".to_string()
+                        })?
+                        .beta;
+                    let p_base = time_build.x_exit_time.ncols();
+                    if beta_time.len() != p_base + wiggle.ncols {
+                        return Err(format!(
+                            "survival marginal-slope timewiggle width mismatch at save: time beta={}, base={p_base}, wiggle={}",
+                            beta_time.len(),
+                            wiggle.ncols,
+                        ));
+                    }
+                    Some(SurvivalTimewiggle {
+                        degree: wiggle.degree,
+                        knots: wiggle.knots.to_vec(),
+                        penalty_orders: effective_timewiggle
+                            .as_ref()
+                            .map(|config| config.penalty_orders.clone()),
+                        double_penalty: effective_timewiggle
+                            .as_ref()
+                            .map(|config| config.double_penalty),
+                        beta: SurvivalTimewiggleBeta::Single(
+                            beta_time.slice(s![p_base..]).to_vec(),
+                        ),
+                    })
+                }
+                None => None,
+            };
+            let saved_offset_baseline =
+                survival_marginal_slope_offset_baseline_config(&age_exit, &baseline_cfg);
             let payload = assemble_survival_marginal_slope_payload(
                 SurvivalMarginalSlopeInputs {
                     formula,
@@ -1129,7 +1165,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survival_exit: args.exit,
                     survival_event: args.event,
                     survivalspec: effectivespec.clone(),
-                    baseline_cfg: baseline_cfg.clone(),
+                    baseline_cfg: saved_offset_baseline,
                     time_basis: SavedSurvivalTimeBasis::from_build(&time_build, time_anchor),
                     ridge_lambda: effective_config.ridge_lambda,
                     survival_likelihood_label: survival_likelihood_modename(likelihood_mode)
@@ -1143,9 +1179,11 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                         sd: fit.z_normalization.sd,
                     },
                     baseline_logslope: fit.baseline_slope,
+                    timewiggle: baseline_timewiggle,
                     score_warp_runtime: fit.score_warp_runtime.as_ref(),
                     link_dev_runtime: fit.link_dev_runtime.as_ref(),
                     influence_absorber_width: fit.influence_absorber_width,
+                    influence_absorber_design: fit.influence_absorber_design.as_ref(),
                 },
                 SavedModelSourceMetadata {
                     training_headers: ds.headers.clone(),

@@ -386,6 +386,11 @@ pub struct FittedModelPayload {
     /// the extra block and slice `γ` out of the joint covariance.
     #[serde(default)]
     pub influence_absorber_width: Option<usize>,
+    /// Exact residualized training-row design paired with the trailing
+    /// survival marginal-slope influence block.  Mandatory in the v10 schema:
+    /// `None` is the explicit no-absorber state, while an absent JSON field is
+    /// rejected rather than interpreted as an old-model fallback.
+    pub influence_absorber_design: Option<Vec<Vec<f64>>>,
     #[serde(default)]
     pub survival_entry: Option<String>,
     #[serde(default)]
@@ -733,6 +738,7 @@ impl FittedModelPayload {
             score_warp_runtime: None,
             link_deviation_runtime: None,
             influence_absorber_width: None,
+            influence_absorber_design: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,

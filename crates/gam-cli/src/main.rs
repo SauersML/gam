@@ -120,7 +120,7 @@ pub(crate) use gam::families::survival::{
     require_structural_survival_time_basis, resolve_survival_marginal_slope_time_anchor_value,
     resolve_survival_time_anchor_value, resolve_survival_transformation_time_anchor_value,
     resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
-    survival_likelihood_modename,
+    survival_likelihood_modename, survival_marginal_slope_offset_baseline_config,
 };
 
 pub(crate) use gam::families::wiggle::buildwiggle_block_input_from_knots;

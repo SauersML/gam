@@ -2887,10 +2887,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         baseline_offset_curvatures,
         z_normalization,
         time_block_penalties_len: time_penalties_len,
+        time_wiggle_knots: spec.timewiggle_block.as_ref().map(|wiggle| wiggle.knots.clone()),
+        time_wiggle_degree: spec.timewiggle_block.as_ref().map(|wiggle| wiggle.degree),
+        time_wiggle_ncols: derived_time_wiggle_ncols.unwrap_or(0),
         score_warp_runtime,
         link_dev_runtime,
         influence_absorber_width: influence_absorber_residualized
             .as_ref()
             .map(|z_tilde| z_tilde.ncols()),
+        influence_absorber_design: influence_absorber_residualized,
     })
 }

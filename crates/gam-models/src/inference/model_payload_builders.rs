@@ -964,6 +964,8 @@ pub struct SurvivalMarginalSlopeInputs<'a> {
     pub z_column: String,
     pub latent_z_normalization: SavedLatentZNormalization,
     pub baseline_logslope: f64,
+    /// Frozen nonlinear time-wiggle authority, including the raw fitted tail.
+    pub timewiggle: Option<SurvivalTimewiggle>,
     pub score_warp_runtime: Option<&'a DeviationRuntime>,
     pub link_dev_runtime: Option<&'a DeviationRuntime>,
     /// Width `p₁` of the absorbed Stage-1 influence block (#461) when the fit
@@ -971,6 +973,7 @@ pub struct SurvivalMarginalSlopeInputs<'a> {
     /// this is persisted only so the predictor accounts for the extra trailing
     /// block in the saved block count.
     pub influence_absorber_width: Option<usize>,
+    pub influence_absorber_design: Option<&'a Array2<f64>>,
 }
 
 /// Construct a Royston-Parmar survival [`FittedModelPayload`] through the
@@ -1049,6 +1052,13 @@ pub fn assemble_survival_marginal_slope_payload(
     payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
     payload.logslope_baseline = Some(inputs.baseline_logslope);
     payload.logslope_baselines = Some(vec![inputs.baseline_logslope]);
+    if let Some(timewiggle) = inputs.timewiggle {
+        payload.baseline_timewiggle_degree = Some(timewiggle.degree);
+        payload.baseline_timewiggle_knots = Some(timewiggle.knots);
+        payload.baseline_timewiggle_penalty_orders = timewiggle.penalty_orders;
+        payload.baseline_timewiggle_double_penalty = timewiggle.double_penalty;
+        apply_timewiggle_beta(&mut payload, timewiggle.beta);
+    }
     payload.score_warp_runtime = inputs
         .score_warp_runtime
         .map(serialize_anchored_deviation_runtime);
@@ -1056,6 +1066,13 @@ pub fn assemble_survival_marginal_slope_payload(
         .link_dev_runtime
         .map(serialize_anchored_deviation_runtime);
     payload.influence_absorber_width = inputs.influence_absorber_width;
+    payload.influence_absorber_design = inputs.influence_absorber_design.map(|design| {
+        design
+            .rows()
+            .into_iter()
+            .map(|row| row.to_vec())
+            .collect()
+    });
     source.apply_to(&mut payload);
     payload
 }
