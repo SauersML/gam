@@ -1,4 +1,5 @@
 use super::*;
+use crate::survival::lognormal_kernel::FrailtyScale;
 
 pub(crate) fn materialize_standard<'a>(
     parsed: &ParsedFormula,
@@ -131,11 +132,11 @@ pub(crate) fn materialize_standard<'a>(
     let latent_cloglog = if family.is_latent_cloglog() {
         let sigma = match config.frailty.clone() {
             FrailtySpec::HazardMultiplier {
-                sigma_fixed: Some(sigma),
+                scale: FrailtyScale::Fixed { sigma },
                 loading: crate::survival::lognormal_kernel::HazardLoading::Full,
             } => sigma,
             FrailtySpec::HazardMultiplier {
-                sigma_fixed: Some(_),
+                scale: FrailtyScale::Fixed { .. },
                 loading,
             } => {
                 return Err(WorkflowError::MissingDependency {
@@ -146,7 +147,8 @@ pub(crate) fn materialize_standard<'a>(
                 .into());
             }
             FrailtySpec::HazardMultiplier {
-                sigma_fixed: None, ..
+                scale: FrailtyScale::Learned { .. },
+                ..
             } => {
                 return Err(WorkflowError::MissingDependency {
                     reason:
