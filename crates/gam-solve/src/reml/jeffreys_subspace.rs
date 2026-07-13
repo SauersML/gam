@@ -1890,24 +1890,23 @@ impl JeffreysHphiDriftBase {
     where
         BaseFn: Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
     {
-        let p = h_joint.nrows();
-        if h_joint.ncols() != p {
-            return Err(format!(
-                "JeffreysHphiDriftBase::prepare: H must be square, got {}x{}",
-                h_joint.nrows(),
-                h_joint.ncols()
-            ));
-        }
-        if z_j.nrows() != p {
-            return Err(format!(
-                "JeffreysHphiDriftBase::prepare: Z_J has {} rows, expected {p}",
-                z_j.nrows()
-            ));
-        }
-        let m = z_j.ncols();
-        if m == 0 || p == 0 {
+        let plan = JointJeffreysPlan::prepare(h_joint, z_j)?;
+        Self::prepare_from_plan(plan, base_hessian_dir)
+    }
+
+    /// Prepare from an already-authoritative reduced-information plan.  The
+    /// derivative provider is never touched when the plan's gate is inactive.
+    pub fn prepare_from_plan<BaseFn>(
+        plan: JointJeffreysPlan,
+        base_hessian_dir: BaseFn,
+    ) -> Result<Option<JeffreysHphiDriftBase>, String>
+    where
+        BaseFn: Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
+    {
+        if !plan.is_active() {
             return Ok(None);
         }
+        let p = plan.coefficient_dim();
         // The β-FIXED per-axis base needs the `p` first directional derivatives
         // `Hdot[e_a]` (the dominant `O(n·p)` cost). PARALLEL AXIS SWEEP: each axis
         // is an independent pure evaluation of `(family, β̂, e_a)`, fanned across
@@ -1942,7 +1941,7 @@ impl JeffreysHphiDriftBase {
             }
             hdots
         };
-        Self::from_axis_derivatives(h_joint, z_j, hdots)
+        Self::from_plan_axis_derivatives(plan, hdots)
     }
 
     /// Same prepared base as [`prepare`], but consuming the PRECOMPUTED all-axes
@@ -1958,31 +1957,27 @@ impl JeffreysHphiDriftBase {
         z_j: ArrayView2<'_, f64>,
         hdots: Vec<Array2<f64>>,
     ) -> Result<Option<JeffreysHphiDriftBase>, String> {
-        let p = h_joint.nrows();
-        if h_joint.ncols() != p {
-            return Err(format!(
-                "JeffreysHphiDriftBase::prepare_with_axes: H must be square, got {}x{}",
-                h_joint.nrows(),
-                h_joint.ncols()
-            ));
+        let plan = JointJeffreysPlan::prepare(h_joint, z_j)?;
+        Self::prepare_with_plan_axes(plan, hdots)
+    }
+
+    /// Consume a precomputed canonical derivative batch using the exact same
+    /// plan that authorized it.  This is the batched outer-drift entry point.
+    pub fn prepare_with_plan_axes(
+        plan: JointJeffreysPlan,
+        hdots: Vec<Array2<f64>>,
+    ) -> Result<Option<JeffreysHphiDriftBase>, String> {
+        if !plan.is_active() {
+            return Ok(None);
         }
-        if z_j.nrows() != p {
-            return Err(format!(
-                "JeffreysHphiDriftBase::prepare_with_axes: Z_J has {} rows, expected {p}",
-                z_j.nrows()
-            ));
-        }
+        let p = plan.coefficient_dim();
         if hdots.len() != p {
             return Err(format!(
                 "JeffreysHphiDriftBase::prepare_with_axes: got {} axis derivatives, expected {p}",
                 hdots.len()
             ));
         }
-        let m = z_j.ncols();
-        if m == 0 || p == 0 {
-            return Ok(None);
-        }
-        Self::from_axis_derivatives(h_joint, z_j, hdots)
+        Self::from_plan_axis_derivatives(plan, hdots)
     }
 
     /// Shared reduction: from the `p` first-directional derivatives `{Hdot[e_a]}`
@@ -1990,13 +1985,12 @@ impl JeffreysHphiDriftBase {
     /// β-fixed drift base. Reproduces EXACTLY the value-path reduced information,
     /// conditioning gate, and floored pseudo-inverse so the derivative stays
     /// consistent with the `H_Φ` the objective uses.
-    fn from_axis_derivatives(
-        h_joint: ArrayView2<'_, f64>,
-        z_j: ArrayView2<'_, f64>,
+    fn from_plan_axis_derivatives(
+        plan: JointJeffreysPlan,
         hdots: Vec<Array2<f64>>,
     ) -> Result<Option<JeffreysHphiDriftBase>, String> {
-        let p = h_joint.nrows();
-        let m = z_j.ncols();
+        let p = plan.coefficient_dim();
+        let m = plan.reduced_information.nrows();
         for hdot in &hdots {
             if hdot.nrows() != p || hdot.ncols() != p {
                 return Err(format!(
@@ -2006,40 +2000,15 @@ impl JeffreysHphiDriftBase {
                 ));
             }
         }
-        // Reproduce EXACTLY the value-path reduced information, conditioning gate,
-        // and floored pseudo-inverse so the derivative is consistent with the
-        // `H_Φ` the objective uses.
-        let hz0 = h_joint.dot(&z_j);
-        let h_id = z_j.t().dot(&hz0);
-        let mut h_id_sym = Array2::<f64>::zeros((m, m));
-        for i in 0..m {
-            for j in 0..m {
-                h_id_sym[[i, j]] = 0.5 * (h_id[[i, j]] + h_id[[j, i]]);
-            }
-        }
-        let (evals, evecs) = h_id_sym.eigh(Side::Lower).map_err(|e| {
-            format!("JeffreysHphiDriftBase::prepare: eigendecomposition failed: {e}")
-        })?;
-        let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
-        let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-        let gate_weight = conditioning_gate_weight(lambda_min, lambda_max);
-        if gate_weight == 0.0 {
-            return Ok(None);
-        }
-        let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
+        let z_owned = plan.z_j;
+        let evals = plan.evals;
+        let evecs = plan.evecs;
+        let floor = plan.floor;
+        let gate_weight = plan.gate_weight;
+        let floor_in_relative_regime = plan.floor_in_relative_regime;
+        let idx_min = plan.idx_min;
+        let idx_max = plan.idx_max;
         let psi = floored_inverse_divided_differences(&evals, floor);
-        let floor_in_relative_regime = lambda_max > 0.0
-            && REDUCED_INFO_RELATIVE_FLOOR * lambda_max >= REDUCED_INFO_ABSOLUTE_FLOOR;
-        let mut idx_max = 0usize;
-        let mut idx_min = 0usize;
-        for i in 1..m {
-            if evals[i] > evals[idx_max] {
-                idx_max = i;
-            }
-            if evals[i] < evals[idx_min] {
-                idx_min = i;
-            }
-        }
         // The β-FIXED per-axis base: `Ṽ_a = Vᵀ D_a V` and `Ψ ∘ Ṽ_a`, formed from
         // the `p` supplied first directional derivatives `Hdot[e_a]`. The per-axis
         // reduction (`Ṽ_a = Vᵀ (Z_Jᵀ Hdot[e_a] Z_J)_sym V` + row writes) is
@@ -2049,7 +2018,6 @@ impl JeffreysHphiDriftBase {
         // is the two dense GEMMs per axis (`p×m·p×p·p×m`), so this collapses the
         // serial O(p) Gram-reduction sweep that dominated the large-`p`
         // marginal-slope path (#979).
-        let z_owned = z_j.to_owned();
         let mut a_rows = Array2::<f64>::zeros((p, m * m));
         let mut aw_rows = Array2::<f64>::zeros((p, m * m));
         {
@@ -2062,7 +2030,7 @@ impl JeffreysHphiDriftBase {
                 .zip(hdots.into_par_iter())
                 .for_each(|((mut a_row, mut aw_row), hdot_a)| {
                     gam_problem::with_nested_parallel(|| {
-                        let d_a_raw = z_j.t().dot(&hdot_a.dot(&z_j));
+                        let d_a_raw = z_owned.t().dot(&hdot_a.dot(&z_owned));
                         let mut d_a = Array2::<f64>::zeros((m, m));
                         for i in 0..m {
                             for j in 0..m {
@@ -2451,6 +2419,7 @@ mod tests {
     #[test]
     fn inactive_reduced_gate_performs_zero_all_axis_builds() {
         use std::cell::Cell;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         // The ambient H has a weak middle axis, but Z_J excludes it.  The exact
         // reduced information is diag(32, 64), which clears both gate ramps.
@@ -2470,6 +2439,15 @@ mod tests {
         assert_eq!(phi, 0.0);
         assert_eq!(grad, Array1::zeros(3));
         assert_eq!(hphi, Array2::zeros((3, 3)));
+
+        let outer_axis_builds = AtomicUsize::new(0);
+        let outer_base = JeffreysHphiDriftBase::prepare(h.view(), z.view(), |_axis| {
+            outer_axis_builds.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(Array2::zeros((3, 3))))
+        })
+        .expect("inactive outer Jeffreys plan");
+        assert!(outer_base.is_none());
+        assert_eq!(outer_axis_builds.load(Ordering::Relaxed), 0);
     }
 
     /// Test-only analytic oracle: the per-direction mode-response drift

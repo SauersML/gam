@@ -628,14 +628,20 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
     if h_joint.nrows() != total_p || h_joint.ncols() != total_p {
         return Ok(None);
     }
+    let plan = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
+        h_joint.view(),
+        z_joint.view(),
+    )?;
+    if !plan.is_active() {
+        return Ok(None);
+    }
     let family_owned = family.clone();
     let states_owned: Vec<ParameterBlockState> = states.to_vec();
     let specs_owned: Vec<ParameterBlockSpec> = specs.to_vec();
-    let z_columns = z_joint.clone();
     let batch: JeffreysHphiDriftBatchFn = Arc::new(move |deltas: &[Array1<f64>]| {
-        // Prepare the β-fixed base ONCE: the reduced-information eigendecomposition
-        // plus the `p` first directional derivatives `Hdot[e_a]` (the dominant
-        // cost). Acquire the WHOLE canonical-axis set in ONE batched hook call —
+        // The exact reduced-information plan authorized this closure before it
+        // was returned, so an inactive outer gate performs zero derivative work.
+        // Acquire the WHOLE canonical-axis set in ONE batched hook call —
         // the same path the value-path `joint_jeffreys_term` uses — so a family
         // that assembles every axis in one shared softmax/Gram pass (multinomial)
         // pays a SINGLE sweep instead of the `p` concurrent cache-miss sweeps the
@@ -650,15 +656,13 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
             )?;
         let base = match all_axes {
             Some(hdots) => {
-                gam_solve::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare_with_axes(
-                    h_joint.view(),
-                    z_columns.view(),
+                gam_solve::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare_with_plan_axes(
+                    plan.clone(),
                     hdots,
                 )?
             }
-            None => gam_solve::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare(
-                h_joint.view(),
-                z_columns.view(),
+            None => gam_solve::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare_from_plan(
+                plan.clone(),
                 |direction: &Array1<f64>| {
                     family_owned.joint_jeffreys_information_directional_derivative_with_specs(
                         &states_owned,
