@@ -399,15 +399,17 @@ extern "C" __device__ __forceinline__ double atomic_add_f64(double *addr, double
 }
 
 // `nan_fill_outputs`: thread-0-only path used when row inputs are degenerate
-// (`F_a` non-finite or non-positive). Writes NaNs to neglog/grad/hess so the
-// host falls back to CPU for that row.
+// (`F_a` non-finite or non-positive). The status channel makes the host reject
+// the entire selected-GPU execution before any output can enter a cache.
 extern "C" __device__ __forceinline__ void
 nan_fill_outputs(int r,
                  int row,
                  double *out_neglog,
                  double *out_grad,
-                 double *out_hess) {
+                 double *out_hess,
+                 unsigned int *out_status) {
     double nan_value = __longlong_as_double(0x7ff8000000000000ULL);
+    out_status[row] = 1U;
     out_neglog[row] = nan_value;
     for (int u = 0; u < r; ++u) {
         out_grad[row * r + u] = nan_value;
@@ -455,7 +457,8 @@ extern "C" __global__ void bms_flex_row_kernel(
     const double * __restrict__ row_e_obs,    // [n_rows] observed predictor VALUE
     double       * __restrict__ out_neglog,
     double       * __restrict__ out_grad,
-    double       * __restrict__ out_hess)
+    double       * __restrict__ out_hess,
+    unsigned int * __restrict__ out_status)
 {
     int row = blockIdx.x;
     if (row >= n_rows) return;
@@ -587,7 +590,7 @@ extern "C" __global__ void bms_flex_row_kernel(
 
     // Guard: degenerate F_a ⇒ NaN-fill this row's outputs.
     if (!isfinite(F_a) || F_a <= 0.0) {
-        nan_fill_outputs(r, row, out_neglog, out_grad, out_hess);
+        nan_fill_outputs(r, row, out_neglog, out_grad, out_hess, out_status);
         return;
     }
     double inv_Fa = 1.0 / F_a;
@@ -621,6 +624,19 @@ extern "C" __global__ void bms_flex_row_kernel(
 
     out_neglog[row] = -w * log_cdf;
     /*__BMS_FLEX_ORDER2_FINALIZER__*/
+    if (!isfinite(out_neglog[row])) {
+        out_status[row] = 2U;
+    }
+    for (int u = 0; u < r; ++u) {
+        if (!isfinite(out_grad[row * r + u])) {
+            out_status[row] = 2U;
+        }
+    }
+    for (int uv = 0; uv < r * r; ++uv) {
+        if (!isfinite(out_hess[row * r * r + uv])) {
+            out_status[row] = 2U;
+        }
+    }
 }
 "#;
 
@@ -945,6 +961,11 @@ pub(crate) fn launch_linux(
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("bms_flex_row alloc hess: {err}"),
             })?;
+    let mut d_status = stream
+        .alloc_zeros::<u32>(n)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row alloc status: {err}"),
+        })?;
 
     let func = backend
         .module
@@ -1007,7 +1028,8 @@ pub(crate) fn launch_linux(
         .arg(&d_e_obs)
         .arg(&mut d_neglog)
         .arg(&mut d_grad)
-        .arg(&mut d_hess);
+        .arg(&mut d_hess)
+        .arg(&mut d_status);
 
     // SAFETY: every kernel parameter above is either a primitive `i32` /
     // `f64` (passed by value), a const device pointer to a buffer whose
@@ -1023,6 +1045,22 @@ pub(crate) fn launch_linux(
         .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("bms_flex_row synchronize: {err}"),
         })?;
+
+    let status = stream
+        .clone_dtoh(&d_status)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row download status: {err}"),
+        })?;
+    if let Some((row, code)) = status
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, code)| *code != 0)
+    {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row rejected non-finite row {row} with status {code}"),
+        });
+    }
 
     let neglog = stream
         .clone_dtoh(&d_neglog)
