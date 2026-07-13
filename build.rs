@@ -4721,6 +4721,8 @@ const PRODUCTION_DERIVATIVE_SPECIALIZATIONS: &[DerivativeSpecialization] = &[
             },
         ],
         retired_identities: &[
+            "ROW_KERNEL_BODY",
+            "cpu_oracle_outputs",
             "compute_row_analytic_flex_into",
             "compute_row_analytic_flex_into_with_moments",
             "compute_row_analytic_flex_from_parts_into",
