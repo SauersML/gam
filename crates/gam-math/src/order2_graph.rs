@@ -660,15 +660,6 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             .map(|(&input, &projected)| input * projected)
             .sum();
 
-        // Project each primary-space input direction through the operator while
-        // no tape borrow is live. Besides preserving structured `multiply`
-        // implementations, this prevents arbitrary coefficient callbacks from
-        // aliasing the workspace's `UnsafeCell` accessors.
-        let mut direction_storage = MaybeUninit::uninit();
-        let direction = InlineScalars::initialize_zeros(&mut direction_storage, input_dimension);
-        let mut projected_direction_storage = MaybeUninit::uninit();
-        let projected_direction =
-            InlineScalars::initialize_zeros(&mut projected_direction_storage, input_dimension);
         let supported_dimension = support.count_ones() as usize;
         let curvature_len = supported_dimension * (supported_dimension + 1) / 2;
         let curvature_start = {
@@ -682,46 +673,67 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
             start
         };
         let mut curvature_offset = 0;
-        let mut supported_columns = support;
-        while supported_columns != 0 {
-            let other = supported_columns.trailing_zeros() as usize;
-            supported_columns &= supported_columns - 1;
-            if all_inputs_primary {
-                // `support` is the union of these same primary nodes, so every
-                // visited axis has at least one grouped input position.
-                let mut group = primary_input_groups[other];
-                while group != 0 {
-                    let position = group.trailing_zeros() as usize;
-                    group &= group - 1;
-                    direction.as_mut_slice()[position] = 1.0;
-                }
-            } else {
-                let tape = workspace.tape();
-                for (channel, input) in direction.as_mut_slice().iter_mut().zip(inputs) {
-                    *channel = tape.gradients[input.node * K + other];
-                }
-            }
-            coefficients.multiply(direction.as_slice(), projected_direction.as_mut_slice());
-            let mut supported_rows = support & (u16::MAX >> (MAX_PRIMARY_DIMENSION - other - 1));
-            {
-                let tape = workspace.tape_mut();
+        if all_inputs_primary {
+            // For primary inputs J is a (possibly repeated/permuted) selection
+            // matrix, so J' A J is obtained directly from A. Calling
+            // `multiply` once per primary direction would turn a dense
+            // quadratic from O(K^2) into O(K^3), even though its Hessian is
+            // simply 2A for the common injective case.
+            let mut supported_columns = support;
+            while supported_columns != 0 {
+                let other = supported_columns.trailing_zeros() as usize;
+                supported_columns &= supported_columns - 1;
+                let mut supported_rows =
+                    support & (u16::MAX >> (MAX_PRIMARY_DIMENSION - other - 1));
                 while supported_rows != 0 {
                     let primary = supported_rows.trailing_zeros() as usize;
                     supported_rows &= supported_rows - 1;
-                    let curvature = if all_inputs_primary {
-                        let mut group = primary_input_groups[primary];
-                        if group.is_power_of_two() {
-                            projected_direction.as_slice()[group.trailing_zeros() as usize]
-                        } else {
-                            let mut grouped_projection = 0.0;
-                            while group != 0 {
-                                let position = group.trailing_zeros() as usize;
-                                group &= group - 1;
-                                grouped_projection += projected_direction.as_slice()[position];
-                            }
-                            grouped_projection
+                    let mut curvature = 0.0;
+                    let mut row_group = primary_input_groups[primary];
+                    while row_group != 0 {
+                        let row = row_group.trailing_zeros() as usize;
+                        row_group &= row_group - 1;
+                        let mut column_group = primary_input_groups[other];
+                        while column_group != 0 {
+                            let column = column_group.trailing_zeros() as usize;
+                            column_group &= column_group - 1;
+                            curvature += coefficients.coefficient(row, column);
                         }
-                    } else {
+                    }
+                    workspace.tape_mut().projected_curvatures[curvature_start + curvature_offset] =
+                        2.0 * curvature;
+                    curvature_offset += 1;
+                }
+            }
+        } else {
+            // Project each unrestricted primary-space input direction through
+            // the operator while no tape borrow is live. This preserves
+            // structured `multiply` implementations and prevents arbitrary
+            // coefficient callbacks from aliasing the workspace's `UnsafeCell`.
+            let mut direction_storage = MaybeUninit::uninit();
+            let direction =
+                InlineScalars::initialize_zeros(&mut direction_storage, input_dimension);
+            let mut projected_direction_storage = MaybeUninit::uninit();
+            let projected_direction =
+                InlineScalars::initialize_zeros(&mut projected_direction_storage, input_dimension);
+            let mut supported_columns = support;
+            while supported_columns != 0 {
+                let other = supported_columns.trailing_zeros() as usize;
+                supported_columns &= supported_columns - 1;
+                {
+                    let tape = workspace.tape();
+                    for (channel, input) in direction.as_mut_slice().iter_mut().zip(inputs) {
+                        *channel = tape.gradients[input.node * K + other];
+                    }
+                }
+                coefficients.multiply(direction.as_slice(), projected_direction.as_mut_slice());
+                let mut supported_rows =
+                    support & (u16::MAX >> (MAX_PRIMARY_DIMENSION - other - 1));
+                while supported_rows != 0 {
+                    let primary = supported_rows.trailing_zeros() as usize;
+                    supported_rows &= supported_rows - 1;
+                    let curvature = {
+                        let tape = workspace.tape();
                         inputs
                             .iter()
                             .zip(projected_direction.as_slice())
@@ -730,16 +742,9 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                             })
                             .sum::<f64>()
                     };
-                    tape.projected_curvatures[curvature_start + curvature_offset] = 2.0 * curvature;
+                    workspace.tape_mut().projected_curvatures[curvature_start + curvature_offset] =
+                        2.0 * curvature;
                     curvature_offset += 1;
-                }
-            }
-            if all_inputs_primary {
-                let mut group = primary_input_groups[other];
-                while group != 0 {
-                    let position = group.trailing_zeros() as usize;
-                    group &= group - 1;
-                    direction.as_mut_slice()[position] = 0.0;
                 }
             }
         }
