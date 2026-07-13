@@ -44,8 +44,9 @@ pub(crate) use crate::custom_family::{
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, FamilyEvaluation, JointHessianSourcePreference,
     MaterializablePsiDerivativeOperator, MaterializationIntent, ParameterBlockSpec,
-    ParameterBlockState, PenaltyMatrix, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
+    ParameterBlockState, PenaltyMatrix, SharedDerivativeBlocks,
+    evaluate_custom_family_joint_hyper_best_mode_shared, fit_custom_family,
+    fit_custom_family_fixed_log_lambdas,
 };
 pub(crate) use crate::fit_orchestration::drivers::{
     ExactJointHyperSetup, freeze_term_collection_from_design,

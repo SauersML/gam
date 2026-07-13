@@ -9,50 +9,63 @@ pub(crate) fn exact_ctn_mode_branch_freezes_derivative_input() {
         CustomFamilyWarmStart::from_cached_beta(&[1], &array![value])
             .expect("one-coefficient CTN mode seed")
     };
-    let beta_value = |state: &TransformationExactModeBranch| {
-        state
-            .warm_start(&Array1::zeros(0))
-            .expect("compatible CTN mode seed")
+    let carried_beta = |candidates: &[Option<CustomFamilyWarmStart>]| {
+        candidates
+            .get(1)
+            .and_then(Option::as_ref)
+            .expect("compatible carried CTN mode seed")
             .block_beta_view(0)
             .expect("one CTN coefficient")[0]
     };
 
     let mut state = TransformationExactModeBranch::default();
-    assert!(state.warm_start(&Array1::zeros(0)).is_none());
+    let (froze, candidates) =
+        state.candidates(gam_problem::EvalMode::ValueOnly, &Array1::zeros(0));
+    assert!(!froze);
+    assert_eq!(candidates.len(), 1);
+    assert!(candidates[0].is_none());
 
     state.record_value(gam_problem::EvalMode::ValueOnly, warm(1.0));
-    assert_eq!(beta_value(&state), 1.0);
+    let (_, candidates) =
+        state.candidates(gam_problem::EvalMode::ValueOnly, &Array1::zeros(0));
+    assert_eq!(carried_beta(&candidates), 1.0);
     state.record_value(gam_problem::EvalMode::ValueOnly, warm(2.0));
-    assert_eq!(beta_value(&state), 2.0);
 
     let (froze, candidates) = state.candidates(gam_problem::EvalMode::ValueOnly, &Array1::zeros(0));
     assert!(!froze);
     assert_eq!(candidates.len(), 2);
     assert!(candidates[0].is_none(), "cold candidate is evaluated first");
-    assert_eq!(
-        candidates[1]
-            .as_ref()
-            .expect("continuation candidate")
-            .block_beta_view(0)
-            .expect("one CTN coefficient")[0],
-        2.0
-    );
+    assert_eq!(carried_beta(&candidates), 2.0);
 
-    assert!(state.prepare(gam_problem::EvalMode::ValueGradientHessian));
-    assert_eq!(beta_value(&state), 2.0);
+    let (froze, candidates) = state.candidates(
+        gam_problem::EvalMode::ValueGradientHessian,
+        &Array1::zeros(0),
+    );
+    assert!(froze);
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates[0].is_none(), "cold remains first after freeze");
+    assert_eq!(carried_beta(&candidates), 2.0);
 
     state.record_value(gam_problem::EvalMode::ValueOnly, warm(4.0));
     state.record_value(gam_problem::EvalMode::ValueAndGradient, warm(5.0));
     assert!(!state.prepare(gam_problem::EvalMode::ValueAndGradient));
+    let (froze, candidates) =
+        state.candidates(gam_problem::EvalMode::ValueOnly, &Array1::zeros(0));
+    assert!(!froze);
+    assert_eq!(candidates.len(), 2);
+    assert!(candidates[0].is_none());
     assert_eq!(
-        beta_value(&state),
+        carried_beta(&candidates),
         2.0,
         "outer trial history must not replace the CTN branch anchor"
     );
 
     let mut cold = TransformationExactModeBranch::default();
-    assert!(cold.prepare(gam_problem::EvalMode::ValueAndGradient));
-    assert!(cold.warm_start(&Array1::zeros(0)).is_none());
+    let (froze, candidates) =
+        cold.candidates(gam_problem::EvalMode::ValueAndGradient, &Array1::zeros(0));
+    assert!(froze);
+    assert_eq!(candidates.len(), 1);
+    assert!(candidates[0].is_none());
 }
 
 pub(crate) fn dense_first_order_psi_hessian(terms: &ExactNewtonJointPsiTerms) -> Array2<f64> {
