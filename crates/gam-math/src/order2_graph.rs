@@ -157,6 +157,60 @@ impl GraphTape {
     }
 }
 
+trait HessianSink<const K: usize> {
+    fn reset(&mut self);
+    fn add_upper(&mut self, row: usize, column: usize, value: f64);
+    fn reflect_upper(&mut self);
+}
+
+struct ArrayHessianSink<'a, const K: usize>(&'a mut [[f64; K]; K]);
+
+impl<const K: usize> HessianSink<K> for ArrayHessianSink<'_, K> {
+    #[inline(always)]
+    fn reset(&mut self) {
+        for row in &mut *self.0 {
+            row.fill(0.0);
+        }
+    }
+
+    #[inline(always)]
+    fn add_upper(&mut self, row: usize, column: usize, value: f64) {
+        self.0[row][column] += value;
+    }
+
+    #[inline(always)]
+    fn reflect_upper(&mut self) {
+        for row in 0..K {
+            for column in row + 1..K {
+                self.0[column][row] = self.0[row][column];
+            }
+        }
+    }
+}
+
+struct RowMajorHessianSink<'a, const K: usize>(&'a mut [f64]);
+
+impl<const K: usize> HessianSink<K> for RowMajorHessianSink<'_, K> {
+    #[inline(always)]
+    fn reset(&mut self) {
+        self.0.fill(0.0);
+    }
+
+    #[inline(always)]
+    fn add_upper(&mut self, row: usize, column: usize, value: f64) {
+        self.0[row * K + column] += value;
+    }
+
+    #[inline(always)]
+    fn reflect_upper(&mut self) {
+        for row in 0..K {
+            for column in row + 1..K {
+                self.0[column * K + row] = self.0[row * K + column];
+            }
+        }
+    }
+}
+
 /// Reusable storage for a compiled scalar DAG.
 ///
 /// Reset between rows. The boxed tape has checked fixed capacities, so every
@@ -285,18 +339,21 @@ impl Order2GraphWorkspace {
     }
 
     #[inline(always)]
-    fn lower<const K: usize>(&self, output: usize) -> Order2<K> {
+    fn lower_into<const K: usize, H: HessianSink<K>>(
+        &self,
+        output: usize,
+        gradient: &mut [f64],
+        hessian: &mut H,
+    ) -> f64 {
         let tape = self.tape_mut();
         assert_eq!(tape.dimension, K, "compiled graph dimension mismatch");
         assert!(output < tape.node_len, "compiled graph output is absent");
+        assert_eq!(gradient.len(), K, "compiled graph gradient width mismatch");
         tape.adjoints[..tape.node_len].fill(0.0);
         tape.adjoints[output] = 1.0;
 
-        let mut out = crate::jet_tower::Tower2::zero();
-        out.v = tape.nodes[output].value;
-        for primary in 0..K {
-            out.g[primary] = tape.gradients[output * K + primary];
-        }
+        gradient.copy_from_slice(&tape.gradients[output * K..(output + 1) * K]);
+        hessian.reset();
 
         for node_index in (0..=output).rev() {
             let adjoint = tape.adjoints[node_index];
@@ -325,9 +382,13 @@ impl Order2GraphWorkspace {
                     let input = input as usize;
                     let curvature_scale = owner_adjoint * second;
                     for_each_supported_upper(tape.nodes[input].support, |primary, other| {
-                        out.h[primary][other] += curvature_scale
-                            * tape.gradients[input * K + primary]
-                            * tape.gradients[input * K + other];
+                        hessian.add_upper(
+                            primary,
+                            other,
+                            curvature_scale
+                                * tape.gradients[input * K + primary]
+                                * tape.gradients[input * K + other],
+                        );
                     });
                 }
                 CurvatureEvent::Cross { owner, left, right } => {
@@ -344,7 +405,7 @@ impl Order2GraphWorkspace {
                             let right_primary = tape.gradients[right * K + primary];
                             let curvature = left_primary * tape.gradients[right * K + other]
                                 + right_primary * tape.gradients[left * K + other];
-                            out.h[primary][other] += owner_adjoint * curvature;
+                            hessian.add_upper(primary, other, owner_adjoint * curvature);
                         },
                     );
                 }
@@ -365,9 +426,13 @@ impl Order2GraphWorkspace {
                             continue;
                         }
                         for_each_supported_upper(tape.nodes[input].support, |primary, other| {
-                            out.h[primary][other] += curvature_scale
-                                * tape.gradients[input * K + primary]
-                                * tape.gradients[input * K + other];
+                            hessian.add_upper(
+                                primary,
+                                other,
+                                curvature_scale
+                                    * tape.gradients[input * K + primary]
+                                    * tape.gradients[input * K + other],
+                            );
                         });
                     }
                 }
@@ -383,20 +448,20 @@ impl Order2GraphWorkspace {
                     let mut curvature_offset = 0;
                     let curvature_start = curvature_start as usize;
                     for_each_supported_upper_by_column(support, |primary, other| {
-                        out.h[primary][other] += owner_adjoint
-                            * tape.projected_curvatures[curvature_start + curvature_offset];
+                        hessian.add_upper(
+                            primary,
+                            other,
+                            owner_adjoint
+                                * tape.projected_curvatures[curvature_start + curvature_offset],
+                        );
                         curvature_offset += 1;
                     });
                 }
             }
         }
 
-        for primary in 0..K {
-            for other in primary + 1..K {
-                out.h[other][primary] = out.h[primary][other];
-            }
-        }
-        Order2(out)
+        hessian.reflect_upper();
+        tape.nodes[output].value
     }
 }
 
@@ -451,7 +516,29 @@ impl<'arena, const K: usize> Order2Graph<'arena, K> {
     /// Lower this scalar output to the ordinary packed order-2 channels.
     #[must_use]
     pub fn into_order2(self) -> Order2<K> {
-        self.workspace.lower(self.node)
+        let mut out = crate::jet_tower::Tower2::zero();
+        let mut hessian = ArrayHessianSink(&mut out.h);
+        out.v = self
+            .workspace
+            .lower_into(self.node, &mut out.g, &mut hessian);
+        Order2(out)
+    }
+
+    /// Lower into caller-owned gradient and row-major Hessian storage.
+    ///
+    /// Both slices are completely overwritten, including structurally-zero
+    /// channels. Reusing them therefore requires no caller-side clearing.
+    #[must_use]
+    pub fn lower_into(self, gradient: &mut [f64], hessian_row_major: &mut [f64]) -> f64 {
+        assert_eq!(gradient.len(), K, "compiled graph gradient width mismatch");
+        assert_eq!(
+            hessian_row_major.len(),
+            K * K,
+            "compiled graph Hessian width mismatch"
+        );
+        let mut hessian = RowMajorHessianSink::<K>(hessian_row_major);
+        self.workspace
+            .lower_into(self.node, gradient, &mut hessian)
     }
 
     #[inline(always)]
@@ -1183,6 +1270,32 @@ mod tests {
     use crate::jet_scalar::{DynamicJetArena, DynamicOrder2, FixedRuntimeJet, JetScalar};
     use crate::nested_dual::JetField;
     use std::cell::Cell;
+
+    #[test]
+    fn lower_into_overwrites_every_channel_across_workspace_reset() {
+        let mut workspace = Order2GraphWorkspace::new();
+        workspace.reset(3);
+        let x = Order2Graph::<3>::variable(0.5, 0, 3, &workspace);
+        let y = Order2Graph::<3>::variable(-0.25, 1, 3, &workspace);
+        let output = x.product(&y);
+        let mut gradient = [f64::NAN; 3];
+        let mut hessian = [17.0; 9];
+
+        assert_eq!(output.lower_into(&mut gradient, &mut hessian), -0.125);
+        assert_eq!(gradient, [-0.25, 0.5, 0.0]);
+        assert_eq!(hessian, [0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+
+        workspace.reset(3);
+        let x = Order2Graph::<3>::variable(0.25, 0, 3, &workspace);
+        let z = Order2Graph::<3>::variable(0.5, 2, 3, &workspace);
+        let output = Order2Graph::linear_combination(&[x, z], &[2.0, -4.0], 3, &workspace);
+        gradient.fill(f64::NAN);
+        hessian.fill(-9.0);
+
+        assert_eq!(output.lower_into(&mut gradient, &mut hessian), -1.5);
+        assert_eq!(gradient, [2.0, 0.0, -4.0]);
+        assert_eq!(hessian, [0.0; 9]);
+    }
 
     struct DenseSymmetric3([[f64; 3]; 3]);
 

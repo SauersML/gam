@@ -816,7 +816,7 @@ where
     }
 }
 
-fn row_primary_closed_form_vector_dynamic(
+fn row_primary_closed_form_vector_dynamic_into(
     q0: f64,
     q1: f64,
     qd1: f64,
@@ -828,7 +828,9 @@ fn row_primary_closed_form_vector_dynamic(
     derivative_guard: f64,
     probit_scale: f64,
     arena: &mut DynamicJetArena,
-) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+    gradient: &mut [f64],
+    hessian: &mut [f64],
+) -> Result<f64, String> {
     let k = slopes.len();
     if z.len() != k || covariance.dim() != k {
         return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
@@ -842,6 +844,8 @@ fn row_primary_closed_form_vector_dynamic(
         .into());
     }
     let dim = 3 + k;
+    assert_eq!(gradient.len(), dim, "dynamic row gradient width mismatch");
+    assert_eq!(hessian.len(), dim * dim, "dynamic row Hessian width mismatch");
     arena.reset();
     let primary_values = arena.alloc_slice_fill_with(dim, |axis| match axis {
         0 => q0,
@@ -862,12 +866,16 @@ fn row_primary_closed_form_vector_dynamic(
         qd1_lower: derivative_guard,
     };
     let row = rigid_vector_row_nll(vars, z, covariance, &inputs, arena)?;
-    let gradient = Array1::from_vec(row.g().to_vec());
-    let hessian = Array2::from_shape_fn((dim, dim), |(a, b)| row.h_at(a, b));
-    Ok((row.v, gradient, hessian))
+    gradient.copy_from_slice(row.g());
+    for row_axis in 0..dim {
+        for column_axis in 0..dim {
+            hessian[row_axis * dim + column_axis] = row.h_at(row_axis, column_axis);
+        }
+    }
+    Ok(row.v)
 }
 
-fn row_primary_closed_form_vector_fixed<const DIM: usize>(
+fn row_primary_closed_form_vector_fixed_into<const DIM: usize>(
     q0: f64,
     q1: f64,
     qd1: f64,
@@ -878,7 +886,9 @@ fn row_primary_closed_form_vector_fixed<const DIM: usize>(
     d: f64,
     derivative_guard: f64,
     probit_scale: f64,
-) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+    gradient: &mut [f64],
+    hessian: &mut [f64],
+) -> Result<f64, String> {
     if DIM != 3 + slopes.len() {
         return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: format!(
@@ -888,6 +898,8 @@ fn row_primary_closed_form_vector_fixed<const DIM: usize>(
         }
         .into());
     }
+    assert_eq!(gradient.len(), DIM, "fixed row gradient width mismatch");
+    assert_eq!(hessian.len(), DIM * DIM, "fixed row Hessian width mismatch");
     let values: [f64; DIM] = std::array::from_fn(|axis| match axis {
         0 => q0,
         1 => q1,
@@ -907,11 +919,12 @@ fn row_primary_closed_form_vector_fixed<const DIM: usize>(
         qd1_lower: derivative_guard,
     };
     let row = rigid_vector_row_nll(&vars, z, covariance, &inputs, &())?.into_inner();
-    let gradient_channels = row.g();
-    let hessian_channels = row.h();
-    let gradient = Array1::from_vec(gradient_channels.to_vec());
-    let hessian = Array2::from_shape_fn((DIM, DIM), |(a, b)| hessian_channels[a][b]);
-    Ok((row.0.v, gradient, hessian))
+    let (value, gradient_channels, hessian_channels) = row.into_channels();
+    gradient.copy_from_slice(&gradient_channels);
+    for (target, source) in hessian.chunks_exact_mut(DIM).zip(hessian_channels) {
+        target.copy_from_slice(&source);
+    }
+    Ok(value)
 }
 
 enum RigidVectorRowBackend {
@@ -920,13 +933,14 @@ enum RigidVectorRowBackend {
     Dynamic(DynamicJetArena),
 }
 
-/// Width-bound storage for exactly one production row backend. Fixed widths
-/// carry no workspace, graph widths own one boxed tape, and dynamic widths own
-/// one arena; a fold can never silently reuse storage configured for another
-/// score dimension.
+/// Width-bound storage for exactly one production row backend and its reusable
+/// derivative output. The single boxed buffer stores `D + D²` cells: gradient
+/// first, then a row-major Hessian. A fold can never silently reuse storage
+/// configured for another score dimension.
 pub(crate) struct RigidVectorRowWorkspace {
     score_dimension: usize,
     backend: RigidVectorRowBackend,
+    derivative_cells: Box<[f64]>,
 }
 
 impl RigidVectorRowWorkspace {
@@ -943,14 +957,26 @@ impl RigidVectorRowWorkspace {
             6..=13 => RigidVectorRowBackend::Graph(Order2GraphWorkspace::new()),
             14.. => RigidVectorRowBackend::Dynamic(DynamicJetArena::new()),
         };
+        let dimension = 3 + score_dimension;
         Ok(Self {
             score_dimension,
             backend,
+            derivative_cells: vec![0.0; dimension + dimension * dimension].into_boxed_slice(),
         })
+    }
+
+    pub(crate) fn derivatives(&self) -> (ArrayView1<'_, f64>, ArrayView2<'_, f64>) {
+        let dimension = 3 + self.score_dimension;
+        let (gradient, hessian) = self.derivative_cells.split_at(dimension);
+        (
+            ArrayView1::from(gradient),
+            ArrayView2::from_shape((dimension, dimension), hessian)
+                .expect("row workspace derivative buffer shape is invariant"),
+        )
     }
 }
 
-fn row_primary_closed_form_vector_graph<const DIM: usize>(
+fn row_primary_closed_form_vector_graph_into<const DIM: usize>(
     q0: f64,
     q1: f64,
     qd1: f64,
@@ -962,7 +988,9 @@ fn row_primary_closed_form_vector_graph<const DIM: usize>(
     derivative_guard: f64,
     probit_scale: f64,
     workspace: &mut Order2GraphWorkspace,
-) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+    gradient: &mut [f64],
+    hessian: &mut [f64],
+) -> Result<f64, String> {
     if DIM != 3 + slopes.len() || z.len() != slopes.len() || covariance.dim() != slopes.len() {
         return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: format!(
@@ -974,6 +1002,8 @@ fn row_primary_closed_form_vector_graph<const DIM: usize>(
         }
         .into());
     }
+    assert_eq!(gradient.len(), DIM, "compiled row gradient width mismatch");
+    assert_eq!(hessian.len(), DIM * DIM, "compiled row Hessian width mismatch");
     workspace.reset(DIM);
     let primary_values: [f64; DIM] = std::array::from_fn(|axis| match axis {
         0 => q0,
@@ -993,15 +1023,11 @@ fn row_primary_closed_form_vector_graph<const DIM: usize>(
         probit_scale,
         qd1_lower: derivative_guard,
     };
-    let row = rigid_vector_row_nll(&vars, z, covariance, &inputs, workspace)?.into_order2();
-    let gradient_channels = row.g();
-    let hessian_channels = row.h();
-    let gradient = Array1::from_vec(gradient_channels.to_vec());
-    let hessian = Array2::from_shape_fn((DIM, DIM), |(a, b)| hessian_channels[a][b]);
-    Ok((row.0.v, gradient, hessian))
+    let row = rigid_vector_row_nll(&vars, z, covariance, &inputs, workspace)?;
+    Ok(row.lower_into(gradient, hessian))
 }
 
-pub(crate) fn row_primary_closed_form_vector(
+pub(crate) fn row_primary_closed_form_vector_into(
     q0: f64,
     q1: f64,
     qd1: f64,
@@ -1013,7 +1039,7 @@ pub(crate) fn row_primary_closed_form_vector(
     derivative_guard: f64,
     probit_scale: f64,
     workspace: &mut RigidVectorRowWorkspace,
-) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+) -> Result<f64, String> {
     let k = slopes.len();
     if z.len() != k || covariance.dim() != k {
         return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
@@ -1038,7 +1064,7 @@ pub(crate) fn row_primary_closed_form_vector(
 
     macro_rules! graph_row {
         ($dimension:literal, $graph:expr) => {
-            row_primary_closed_form_vector_graph::<$dimension>(
+            row_primary_closed_form_vector_graph_into::<$dimension>(
                 q0,
                 q1,
                 qd1,
@@ -1050,13 +1076,15 @@ pub(crate) fn row_primary_closed_form_vector(
                 derivative_guard,
                 probit_scale,
                 $graph,
+                gradient,
+                hessian,
             )
         };
     }
 
     macro_rules! fixed_row {
         ($dimension:literal) => {
-            row_primary_closed_form_vector_fixed::<$dimension>(
+            row_primary_closed_form_vector_fixed_into::<$dimension>(
                 q0,
                 q1,
                 qd1,
@@ -1067,11 +1095,20 @@ pub(crate) fn row_primary_closed_form_vector(
                 d,
                 derivative_guard,
                 probit_scale,
+                gradient,
+                hessian,
             )
         };
     }
 
-    match (&mut workspace.backend, k) {
+    let dimension = 3 + k;
+    let RigidVectorRowWorkspace {
+        backend,
+        derivative_cells,
+        ..
+    } = workspace;
+    let (gradient, hessian) = derivative_cells.split_at_mut(dimension);
+    match (backend, k) {
         (RigidVectorRowBackend::Fixed, 1) => fixed_row!(4),
         (RigidVectorRowBackend::Fixed, 2) => fixed_row!(5),
         (RigidVectorRowBackend::Fixed, 3) => fixed_row!(6),
@@ -1085,7 +1122,8 @@ pub(crate) fn row_primary_closed_form_vector(
         (RigidVectorRowBackend::Graph(graph), 11) => graph_row!(14, graph),
         (RigidVectorRowBackend::Graph(graph), 12) => graph_row!(15, graph),
         (RigidVectorRowBackend::Graph(graph), 13) => graph_row!(16, graph),
-        (RigidVectorRowBackend::Dynamic(arena), 14..) => row_primary_closed_form_vector_dynamic(
+        (RigidVectorRowBackend::Dynamic(arena), 14..) => {
+            row_primary_closed_form_vector_dynamic_into(
             q0,
             q1,
             qd1,
@@ -1097,7 +1135,10 @@ pub(crate) fn row_primary_closed_form_vector(
             derivative_guard,
             probit_scale,
             arena,
-        ),
+            gradient,
+            hessian,
+        )
+        }
         _ => Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: format!(
                 "survival marginal-slope vector workspace backend does not support score width {k}"
@@ -1362,6 +1403,29 @@ mod tests {
     use super::*;
     use gam_math::jet_scalar::SymmetricQuadraticCoefficients;
 
+    fn collect_row_into(
+        dimension: usize,
+        evaluate: impl FnOnce(&mut [f64], &mut [f64]) -> Result<f64, String>,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let mut derivative_cells = vec![0.0; dimension + dimension * dimension];
+        let (gradient, hessian) = derivative_cells.split_at_mut(dimension);
+        let value = evaluate(gradient, hessian)?;
+        Ok((
+            value,
+            Array1::from_vec(gradient.to_vec()),
+            Array2::from_shape_vec((dimension, dimension), hessian.to_vec())
+                .expect("test derivative buffer shape is invariant"),
+        ))
+    }
+
+    fn collect_workspace_row(
+        value: f64,
+        workspace: &RigidVectorRowWorkspace,
+    ) -> (f64, Array1<f64>, Array2<f64>) {
+        let (gradient, hessian) = workspace.derivatives();
+        (value, gradient.to_owned(), hessian.to_owned())
+    }
+
     impl RigidVectorRowWorkspace {
         fn backend_name(&self) -> &'static str {
             match &self.backend {
@@ -1569,7 +1633,7 @@ mod tests {
         };
 
         for (case, &(covariance, event, q0, q1, qd1, probit_scale)) in cases.iter().enumerate() {
-            let production = row_primary_closed_form_vector(
+            let production_value = row_primary_closed_form_vector_into(
                 q0,
                 q1,
                 qd1,
@@ -1583,32 +1647,41 @@ mod tests {
                 &mut workspace,
             )
             .expect("compiled vector row program");
-            let dynamic = row_primary_closed_form_vector_dynamic(
-                q0,
-                q1,
-                qd1,
-                &slopes,
-                &scores,
-                covariance,
-                1.3,
-                event,
-                1.0e-8,
-                probit_scale,
-                &mut dynamic_arena,
-            )
+            let production = collect_workspace_row(production_value, &workspace);
+            let dynamic = collect_row_into(6, |gradient, hessian| {
+                row_primary_closed_form_vector_dynamic_into(
+                    q0,
+                    q1,
+                    qd1,
+                    &slopes,
+                    &scores,
+                    covariance,
+                    1.3,
+                    event,
+                    1.0e-8,
+                    probit_scale,
+                    &mut dynamic_arena,
+                    gradient,
+                    hessian,
+                )
+            })
             .expect("dynamic vector row program");
-            let fixed = row_primary_closed_form_vector_fixed::<6>(
-                q0,
-                q1,
-                qd1,
-                &slopes,
-                &scores,
-                covariance,
-                1.3,
-                event,
-                1.0e-8,
-                probit_scale,
-            )
+            let fixed = collect_row_into(6, |gradient, hessian| {
+                row_primary_closed_form_vector_fixed_into::<6>(
+                    q0,
+                    q1,
+                    qd1,
+                    &slopes,
+                    &scores,
+                    covariance,
+                    1.3,
+                    event,
+                    1.0e-8,
+                    probit_scale,
+                    gradient,
+                    hessian,
+                )
+            })
             .expect("fixed vector row program");
             let hand = vector_hand_oracle_tests::row_primary_closed_form_vector_hand_reference(
                 q0,
@@ -1730,7 +1803,7 @@ mod tests {
             let mut dynamic_arena = DynamicJetArena::new();
             for (shape_index, covariance) in covariances.iter().enumerate() {
                 for event in [0.0, 0.35, 1.0] {
-                    let production = row_primary_closed_form_vector(
+                    let production_value = row_primary_closed_form_vector_into(
                         q0,
                         q1,
                         qd1,
@@ -1744,6 +1817,8 @@ mod tests {
                         &mut production_workspace,
                     )
                     .expect("production vector row");
+                    let production =
+                        collect_workspace_row(production_value, &production_workspace);
                     let value = survival_marginal_slope_vector_neglog(
                         q0,
                         q1,
@@ -1761,46 +1836,58 @@ mod tests {
                         let expected_backend = if k <= 5 { "fixed" } else { "graph" };
                         assert_eq!(production_workspace.backend_name(), expected_backend);
                     }
-                    let graph = row_primary_closed_form_vector_graph::<DIM>(
-                        q0,
-                        q1,
-                        qd1,
-                        &slopes,
-                        &scores,
-                        covariance,
-                        1.17,
-                        event,
-                        1.0e-8,
-                        probit_scale,
-                        &mut graph_workspace,
-                    )
+                    let graph = collect_row_into(DIM, |gradient, hessian| {
+                        row_primary_closed_form_vector_graph_into::<DIM>(
+                            q0,
+                            q1,
+                            qd1,
+                            &slopes,
+                            &scores,
+                            covariance,
+                            1.17,
+                            event,
+                            1.0e-8,
+                            probit_scale,
+                            &mut graph_workspace,
+                            gradient,
+                            hessian,
+                        )
+                    })
                     .expect("compiled graph vector row");
-                    let dynamic = row_primary_closed_form_vector_dynamic(
-                        q0,
-                        q1,
-                        qd1,
-                        &slopes,
-                        &scores,
-                        covariance,
-                        1.17,
-                        event,
-                        1.0e-8,
-                        probit_scale,
-                        &mut dynamic_arena,
-                    )
+                    let dynamic = collect_row_into(DIM, |gradient, hessian| {
+                        row_primary_closed_form_vector_dynamic_into(
+                            q0,
+                            q1,
+                            qd1,
+                            &slopes,
+                            &scores,
+                            covariance,
+                            1.17,
+                            event,
+                            1.0e-8,
+                            probit_scale,
+                            &mut dynamic_arena,
+                            gradient,
+                            hessian,
+                        )
+                    })
                     .expect("dynamic vector row");
-                    let fixed = row_primary_closed_form_vector_fixed::<DIM>(
-                        q0,
-                        q1,
-                        qd1,
-                        &slopes,
-                        &scores,
-                        covariance,
-                        1.17,
-                        event,
-                        1.0e-8,
-                        probit_scale,
-                    )
+                    let fixed = collect_row_into(DIM, |gradient, hessian| {
+                        row_primary_closed_form_vector_fixed_into::<DIM>(
+                            q0,
+                            q1,
+                            qd1,
+                            &slopes,
+                            &scores,
+                            covariance,
+                            1.17,
+                            event,
+                            1.0e-8,
+                            probit_scale,
+                            gradient,
+                            hessian,
+                        )
+                    })
                     .expect("fixed vector row");
                     let hand =
                         vector_hand_oracle_tests::row_primary_closed_form_vector_hand_reference(

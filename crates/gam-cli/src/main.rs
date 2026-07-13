@@ -9,8 +9,6 @@ pub(crate) use comfy_table::{Cell, ContentArrangement, Row, Table, presets::UTF8
 
 pub(crate) use csv::WriterBuilder;
 
-pub(crate) use gam::alo::compute_alo_diagnostics_from_fit;
-
 pub(crate) use gam::estimate::{
     BlockRole, ContinuousSmoothnessOrderStatus, FitOptions, FittedLinkState, ModelSummary,
     ParametricTermSummary, SmoothTermSummary, UnifiedFitResult,
@@ -164,7 +162,7 @@ pub(crate) use gam::families::fit_orchestration::{
     route_marginal_slope_deviation_blocks,
 };
 
-pub(crate) use ndarray::{Array1, Array2, ArrayView1, Axis, s};
+pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 
 pub(crate) use rand::{SeedableRng, rngs::StdRng};
 

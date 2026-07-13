@@ -1,5 +1,79 @@
 use super::*;
 
+fn saved_alo_report_data(
+    alo: gam_predict::SavedModelAloDiagnostics,
+) -> Result<report::AloData, String> {
+    if alo.coordinate_names.is_empty() {
+        return Err(format!(
+            "saved {} ALO result has no affine coordinate names",
+            alo.model_class.name()
+        ));
+    }
+    let diagnostics = alo.diagnostics;
+    let n = diagnostics.leverage.len();
+    if diagnostics.eta_tilde.len() != n
+        || diagnostics.alo_variance.len() != n
+        || diagnostics.cook_distance.len() != n
+    {
+        return Err(format!(
+            "saved {} ALO result has inconsistent row counts: leverage={n}, eta={}, variance={}, cook={}",
+            alo.model_class.name(),
+            diagnostics.eta_tilde.len(),
+            diagnostics.alo_variance.len(),
+            diagnostics.cook_distance.len(),
+        ));
+    }
+    let mut rows = Vec::with_capacity(n);
+    for row in 0..n {
+        let coordinates = diagnostics.eta_tilde[row].to_vec();
+        let variances = &diagnostics.alo_variance[row];
+        let leverage = diagnostics.leverage[row];
+        let cook_distance = diagnostics.cook_distance[row];
+        if !leverage.is_finite()
+            || !cook_distance.is_finite()
+            || cook_distance < 0.0
+            || coordinates.iter().any(|value| !value.is_finite())
+        {
+            return Err(format!(
+                "saved {} ALO row {row} has non-representable diagnostics",
+                alo.model_class.name()
+            ));
+        }
+        if coordinates.len() != alo.coordinate_names.len()
+            || variances.len() != alo.coordinate_names.len()
+        {
+            return Err(format!(
+                "saved {} ALO row {row} has eta/variance widths {}/{}; expected {}",
+                alo.model_class.name(),
+                coordinates.len(),
+                variances.len(),
+                alo.coordinate_names.len(),
+            ));
+        }
+        let mut standard_errors = Vec::with_capacity(variances.len());
+        for (coordinate, &variance) in variances.iter().enumerate() {
+            if !variance.is_finite() || variance < 0.0 {
+                return Err(format!(
+                    "saved {} ALO row {row} coordinate {coordinate} has invalid variance {variance}",
+                    alo.model_class.name()
+                ));
+            }
+            standard_errors.push(variance.sqrt());
+        }
+        rows.push(report::AloRow {
+            index: row,
+            leverage,
+            eta_tilde: coordinates,
+            standard_errors,
+            cook_distance,
+        });
+    }
+    Ok(report::AloData {
+        coordinate_names: alo.coordinate_names,
+        rows,
+    })
+}
+
 pub(crate) fn run_sample(args: SampleArgs) -> Result<(), String> {
     validate_positive_optional_usize("--chains", args.chains)?;
     validate_positive_optional_usize("--samples", args.samples)?;
@@ -533,6 +607,39 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
         let parsed = parse_formula(&model.formula)?;
 
         if let Some(y_col) = col_map.get(&parsed.response).copied() {
+            let alo_response = ds.values.column(y_col).to_owned();
+            let alo_weights =
+                resolve_weight_column(&ds, &col_map, model.payload().weight_column.as_deref())
+                    .map_err(|error| {
+                        format!("failed to resolve saved report ALO weights: {error}")
+                    })?;
+            let (alo_offset, alo_noise_offset) = report_offset_for(&model, &ds, &col_map)?;
+            let alo_result = build_saved_alo_predict_input(
+                &model,
+                ds.values.view(),
+                &col_map,
+                training_headers,
+                &alo_offset,
+                &alo_noise_offset,
+                saved_noise_offset_column.is_some(),
+            )
+            .and_then(|alo_input| {
+                gam_predict::compute_saved_model_alo(
+                    &model,
+                    &alo_input,
+                    gam_predict::SavedAloObservations {
+                        response: &alo_response,
+                        prior_weights: &alo_weights,
+                    },
+                )
+                .map_err(|error| error.to_string())
+            })
+            .and_then(saved_alo_report_data);
+            match alo_result {
+                Ok(alo) => alo_data = Some(alo),
+                Err(error) => notes.push(format!("ALO diagnostics unavailable: {error}")),
+            }
+
             if model.predict_model_class() == PredictModelClass::BernoulliMarginalSlope {
                 let y = ds.values.column(y_col).to_owned();
                 n_obs = Some(y.len());
@@ -563,11 +670,14 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                     // deciles.
                     let y_vec = y.to_vec();
                     let p_vec = pred.mean.to_vec();
+                    let leverage = alo_data
+                        .as_ref()
+                        .map(|alo| alo.rows.iter().map(|row| row.leverage).collect::<Vec<_>>());
                     let residuals = report_residual_diagnostics(
                         &ResponseFamily::Binomial,
                         &y_vec,
                         &p_vec,
-                        None,
+                        leverage.as_deref(),
                         edf_total,
                         &mut notes,
                     )?;
@@ -728,52 +838,6 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                             per_scale,
                             implied_order,
                         });
-                    }
-                }
-
-                // ALO diagnostics: try geometry-based path from unified
-                // result first, fall back to PIRLS-based path.
-                if let Some(link) = model
-                    .resolved_inverse_link()
-                    .ok()
-                    .and_then(|r| r.map(|lk| lk.link_function()))
-                {
-                    let alo_result = if let Some(unified) = model.unified() {
-                        let (report_offset, _report_noise_offset) =
-                            report_offset_for(&model, &ds, &col_map)?;
-                        let effective_report_offset = design
-                            .compose_offset(report_offset.view(), "report ALO design")
-                            .map_err(|error| error.to_string())?;
-                        let eta = &design.design.dot(&fit.beta) + &effective_report_offset;
-                        let dense_alo_design = design.design.to_dense();
-                        // φ must match the PIRLS-backed refit fallback: Gaussian
-                        // (Identity) uses σ̂², not a hard-coded 1.0, or the
-                        // reported ALO SEs are off by √φ̂ (#881-class).
-                        let phi = geometry_alo_phi(unified, link);
-                        gam::alo::compute_alo_diagnostics_from_unified(
-                            unified,
-                            &dense_alo_design,
-                            &eta,
-                            &effective_report_offset,
-                            phi,
-                        )
-                    } else {
-                        compute_alo_diagnostics_from_fit(&fit, y.view())
-                    };
-                    match alo_result {
-                        Ok(alo) => {
-                            alo_data = Some(report::AloData {
-                                rows: (0..alo.leverage.len())
-                                    .map(|i| report::AloRow {
-                                        index: i,
-                                        leverage: alo.leverage[i],
-                                        eta_tilde: alo.eta_tilde[i],
-                                        se_sandwich: alo.se_sandwich[i],
-                                    })
-                                    .collect(),
-                            });
-                        }
-                        Err(e) => notes.push(format!("ALO diagnostics unavailable: {e}")),
                     }
                 }
 

@@ -113,7 +113,7 @@ fn corrected_aic_penalizes_at_least_as_much_as_conditional() {
         ds.values.column(1),
         eta_hat.view(),
         weights.view(),
-        Some(&alo),
+        Some(alo.eta_tilde.view()),
     )
     .expect("construct comparison channels for the exact Gaussian fixture");
     let corrected_edf = comparison
@@ -237,7 +237,7 @@ fn psis_loo_paired_comparison_prefers_the_true_generator() {
             ds.values.column(1),
             eta_hat.view(),
             weights.view(),
-            Some(&alo),
+            Some(alo.eta_tilde.view()),
         )
         .expect("construct comparison channels for the exact Gaussian fixture")
     };

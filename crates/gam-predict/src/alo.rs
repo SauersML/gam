@@ -195,7 +195,13 @@ fn standard_alo_dispersion(
             "saved standard identity-link ALO requires a positive finite fitted residual standard deviation, got {standard_deviation}"
         )));
     }
-    Ok(standard_deviation * standard_deviation)
+    let phi = standard_deviation * standard_deviation;
+    if !phi.is_finite() {
+        return Err(invalid(format!(
+            "saved standard identity-link ALO residual variance is outside f64 range: sigma={standard_deviation}"
+        )));
+    }
+    Ok(phi)
 }
 
 fn compute_saved_standard_alo(
@@ -260,11 +266,9 @@ fn compute_saved_standard_alo(
         invalid("saved standard ALO requires the exact converged working-set geometry")
     })?;
     let eta = input.design.dot(beta) + &input.offset;
-    let likelihood = GlmLikelihoodSpec::try_new(
-        model.likelihood(),
-        fit.likelihood_scale.clone(),
-    )
-    .map_err(|error| invalid(format!("saved standard ALO likelihood scale: {error}")))?;
+    let likelihood =
+        GlmLikelihoodSpec::try_new(model.likelihood(), fit.likelihood_scale.clone())
+            .map_err(|error| invalid(format!("saved standard ALO likelihood scale: {error}")))?;
     let mut mean = Array1::<f64>::zeros(n);
     let mut working_weights = Array1::<f64>::zeros(n);
     let mut working_response = Array1::<f64>::zeros(n);
@@ -301,10 +305,17 @@ fn compute_saved_standard_alo(
         .copied()
         .map(|standard_error| Array1::from_vec(vec![standard_error * standard_error]))
         .collect::<Vec<_>>();
-    let cook_distance = Array1::from_shape_fn(n, |row| {
+    let mut cook_distance = Array1::<f64>::zeros(n);
+    for row in 0..n {
         let deletion = scalar.eta_tilde[row] - eta[row];
-        phi * working_weights[row] * deletion * deletion
-    });
+        let cook = phi * working_weights[row] * deletion * deletion;
+        if !cook.is_finite() || cook < 0.0 {
+            return Err(invalid(format!(
+                "saved standard ALO Cook distance is invalid at row {row}: {cook}"
+            )));
+        }
+        cook_distance[row] = cook;
+    }
     Ok(SavedModelAloDiagnostics {
         model_class: class,
         coordinate_names: vec!["eta".to_string()],

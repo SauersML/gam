@@ -201,14 +201,17 @@ pub struct CalibrationData {
 }
 
 pub struct AloData {
+    /// Affine fitted-likelihood coordinates, aligned with every row vector.
+    pub coordinate_names: Vec<String>,
     pub rows: Vec<AloRow>,
 }
 
 pub struct AloRow {
     pub index: usize,
     pub leverage: f64,
-    pub eta_tilde: f64,
-    pub se_sandwich: f64,
+    pub eta_tilde: Vec<f64>,
+    pub standard_errors: Vec<f64>,
+    pub cook_distance: f64,
 }
 
 pub struct SmoothPlotData {
@@ -834,15 +837,46 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
 
     // ALO diagnostics table (only if present)
     let alo_section = if let Some(alo) = &input.alo {
+        if alo.coordinate_names.is_empty() {
+            return Err("ALO report data requires at least one coordinate name".to_string());
+        }
+        for row in &alo.rows {
+            if row.eta_tilde.len() != alo.coordinate_names.len()
+                || row.standard_errors.len() != alo.coordinate_names.len()
+            {
+                return Err(format!(
+                    "ALO report row {} has coordinate lengths eta={}, se={}; expected {}",
+                    row.index,
+                    row.eta_tilde.len(),
+                    row.standard_errors.len(),
+                    alo.coordinate_names.len()
+                ));
+            }
+        }
         let max_show = 100;
         let n_show = alo.rows.len().min(max_show);
         let rows = alo.rows[..n_show]
             .iter()
             .map(|r| {
+                let coordinates = alo
+                    .coordinate_names
+                    .iter()
+                    .zip(&r.eta_tilde)
+                    .map(|(name, value)| format!("{}={value:.6e}", esc(name)))
+                    .collect::<Vec<_>>()
+                    .join("<br>");
+                let standard_errors = alo
+                    .coordinate_names
+                    .iter()
+                    .zip(&r.standard_errors)
+                    .map(|(name, value)| format!("{}={value:.6e}", esc(name)))
+                    .collect::<Vec<_>>()
+                    .join("<br>");
                 format!(
                     "<tr><td class=\"mono\">{}</td><td class=\"num\">{:.6e}</td>\
-                 <td class=\"num\">{:.6e}</td><td class=\"num\">{:.6e}</td></tr>",
-                    r.index, r.leverage, r.eta_tilde, r.se_sandwich
+                 <td class=\"num\">{coordinates}</td><td class=\"num\">{standard_errors}</td>\
+                 <td class=\"num\">{:.6e}</td></tr>",
+                    r.index, r.leverage, r.cook_distance
                 )
             })
             .collect::<Vec<_>>()
@@ -860,7 +894,7 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
              <h2>ALO Diagnostics</h2>\n\
              {truncation_note}\n\
              <div class=\"table-wrap\"><table>\n\
-             <thead><tr><th>Row</th><th>Leverage</th><th>\u{03B7}\u{0303}</th><th>SE (sandwich)</th></tr></thead>\n\
+             <thead><tr><th>Row</th><th>Leverage</th><th>Deleted-row coordinates</th><th>ALO SE</th><th>Cook distance</th></tr></thead>\n\
              <tbody>{rows}</tbody>\n</table></div>\n</section>"
         )
     } else {
@@ -1378,6 +1412,44 @@ mod tests {
             html.contains("&lt;script&gt;"),
             "script tag must be HTML-escaped"
         );
+    }
+
+    #[test]
+    fn render_html_preserves_multicoordinate_alo_rows() {
+        let mut input = minimal_input("y ~ x");
+        input.alo = Some(AloData {
+            coordinate_names: vec!["mean".to_string(), "<log-scale>".to_string()],
+            rows: vec![AloRow {
+                index: 4,
+                leverage: 0.25,
+                eta_tilde: vec![1.5, -0.75],
+                standard_errors: vec![0.1, 0.2],
+                cook_distance: 0.03125,
+            }],
+        });
+        let html = render_html(&input).expect("render multicoordinate ALO");
+        assert!(html.contains("Deleted-row coordinates"));
+        assert!(html.contains("mean=1.500000e0"));
+        assert!(html.contains("&lt;log-scale&gt;=-7.500000e-1"));
+        assert!(html.contains("Cook distance"));
+        assert!(!html.contains("<log-scale>"));
+    }
+
+    #[test]
+    fn render_html_rejects_misaligned_alo_coordinate_vectors() {
+        let mut input = minimal_input("y ~ x");
+        input.alo = Some(AloData {
+            coordinate_names: vec!["mean".to_string(), "log-scale".to_string()],
+            rows: vec![AloRow {
+                index: 0,
+                leverage: 0.1,
+                eta_tilde: vec![1.0],
+                standard_errors: vec![0.2, 0.3],
+                cook_distance: 0.01,
+            }],
+        });
+        let error = render_html(&input).expect_err("misaligned ALO rows must be rejected");
+        assert!(error.contains("coordinate lengths"));
     }
 
     #[test]

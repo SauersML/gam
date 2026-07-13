@@ -94,8 +94,9 @@ pub(crate) fn build_saved_alo_predict_input(
         col_map,
         "resolved_termspec",
     )?;
-    let design = build_term_collection_design(data, &spec)
-        .map_err(|error| format!("failed to build saved transformation-normal ALO design: {error}"))?;
+    let design = build_term_collection_design(data, &spec).map_err(|error| {
+        format!("failed to build saved transformation-normal ALO design: {error}")
+    })?;
     let effective_offset = design
         .compose_offset(offset.view(), "saved transformation-normal ALO design")
         .map_err(|error| error.to_string())?;

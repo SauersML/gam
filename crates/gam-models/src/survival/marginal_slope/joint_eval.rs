@@ -1806,7 +1806,7 @@ impl SurvivalMarginalSlopeFamily {
                             + self.derivative_offset_exit[row];
                         let slopes = self.logslope_surface_values_for_row(row, beta_logslope)?;
                         let z = self.z.row(row).to_vec();
-                        let (nll, f_pi, f_pipi) = row_primary_closed_form_vector(
+                        let nll = row_primary_closed_form_vector_into(
                             q0,
                             q1,
                             qd1,
@@ -1819,6 +1819,7 @@ impl SurvivalMarginalSlopeFamily {
                             probit_scale,
                             &mut row_jet_arena,
                         )?;
+                        let (f_pi, f_pipi) = row_jet_arena.derivatives();
                         acc.0 -= nll;
                         self.design_entry
                             .axpy_row_into(row, -f_pi[0], &mut acc.1.view_mut())?;
@@ -1944,7 +1945,7 @@ impl SurvivalMarginalSlopeFamily {
                             + self.derivative_offset_exit[row];
                         let slopes = self.logslope_surface_values_for_row(row, beta_logslope)?;
                         let z = self.z.row(row).to_vec();
-                        let (nll, f_pi, f_pipi) = row_primary_closed_form_vector(
+                        let nll = row_primary_closed_form_vector_into(
                             q0,
                             q1,
                             qd1,
@@ -1957,6 +1958,7 @@ impl SurvivalMarginalSlopeFamily {
                             probit_scale,
                             &mut row_jet_arena,
                         )?;
+                        let (f_pi, f_pipi) = row_jet_arena.derivatives();
                         acc.0 -= nll;
                         let mut j = Array2::<f64>::zeros((dim, total));
                         let entry = self.design_entry.try_row_chunk(row..row + 1).map_err(|e| {
