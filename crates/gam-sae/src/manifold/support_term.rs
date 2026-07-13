@@ -83,8 +83,16 @@ struct SupportBetaOperator {
 
 impl SupportBetaOperator {
     fn apply(&self, vector: ndarray::ArrayView1<'_, f64>, out: &mut Array1<f64>) {
-        debug_assert_eq!(vector.len(), self.beta_dim);
-        debug_assert_eq!(out.len(), self.beta_dim);
+        assert_eq!(
+            vector.len(),
+            self.beta_dim,
+            "SupportBetaOperator input width must equal its declared beta dimension"
+        );
+        assert_eq!(
+            out.len(),
+            self.beta_dim,
+            "SupportBetaOperator output width must equal its declared beta dimension"
+        );
         out.fill(0.0);
         let mut output = vec![0.0; self.output_dim];
         for row in &self.rows {
@@ -452,8 +460,9 @@ impl SaeSupportSparseTerm {
             }
         }
         let (beta_offsets, beta_dim) = self.beta_layout()?;
+        let row_layout = SaeRowLayout::from_assignment_state(&self.assignment)?;
         let per_row_dims = (0..self.n_obs())
-            .map(|row| self.assignment.coords_row(row).len())
+            .map(|row| row_layout.row_q_active(row))
             .collect::<Vec<_>>();
         let mut system = ArrowSchurSystem::new_with_per_row_dims_empty_hbb_and_htbeta_cols(
             per_row_dims,
@@ -463,15 +472,15 @@ impl SaeSupportSparseTerm {
         let mut linearized_rows = Vec::with_capacity(self.n_obs());
         let mut hbb_diag = Array1::<f64>::zeros(beta_dim);
         for row in 0..self.n_obs() {
-            let q = self.assignment.coords_row(row).len();
+            let q = row_layout.row_q_active(row);
             let mut fitted = Array1::<f64>::zeros(self.output_dim);
             let mut jacobian = Array2::<f64>::zeros((q, self.output_dim));
             let mut blocks = Vec::with_capacity(self.assignment.support_indices(row).len());
-            let mut cursor = 0usize;
             for slot in 0..self.assignment.support_indices(row).len() {
                 let atom_idx = self.assignment.support_indices(row)[slot] as usize;
                 let active = self.evaluate_active(row, slot)?;
                 fitted += &active.decoded;
+                let cursor = row_layout.coord_starts[row][slot];
                 for axis in 0..active.jacobian.nrows() {
                     jacobian
                         .row_mut(cursor + axis)
@@ -487,7 +496,6 @@ impl SaeSupportSparseTerm {
                     beta_offset: beta_offsets[atom_idx],
                     phi: active.phi,
                 });
-                cursor += active.jacobian.nrows();
             }
             let residual = &target.row(row) - &fitted;
             system.rows[row].htt.assign(&jacobian.dot(&jacobian.t()));

@@ -786,14 +786,18 @@ pub(crate) fn factor_dense_reduced_schur(
     schur: &Array2<f64>,
     policy: ReducedSchurPolicy,
 ) -> Result<DenseReducedSchurFactorization, ArrowSchurError> {
-    if let ReducedSchurPolicy::EvidenceUnitDeflation { relative_floor } = policy {
-        return factor_evidence_unit_deflated_schur(schur, relative_floor).ok_or_else(|| {
-            ArrowSchurError::SchurFactorFailed {
-                reason: "evidence reduced Schur unit-deflation declined (no usable spectrum)"
-                    .to_string(),
-            }
-        });
-    }
+    let newton_relative_floor = match policy {
+        ReducedSchurPolicy::StrictNewton => None,
+        ReducedSchurPolicy::NewtonTikhonov { relative_floor } => Some(relative_floor),
+        ReducedSchurPolicy::EvidenceUnitDeflation { relative_floor } => {
+            return factor_evidence_unit_deflated_schur(schur, relative_floor).ok_or_else(|| {
+                ArrowSchurError::SchurFactorFailed {
+                    reason: "evidence reduced Schur unit-deflation declined (no usable spectrum)"
+                        .to_string(),
+                }
+            });
+        }
+    };
     let n = schur.nrows();
     let d = jacobi_diagonal_scale(schur);
     let mut schur_scaled = Array2::<f64>::zeros((n, n));
@@ -824,8 +828,8 @@ pub(crate) fn factor_dense_reduced_schur(
             // dominated by the raw column-scale spread; the floored
             // reconstruction is undone back to original units below exactly like
             // the plain factor.
-            match policy {
-                ReducedSchurPolicy::NewtonTikhonov { relative_floor } => {
+            match newton_relative_floor {
+                Some(relative_floor) => {
                     match spectral_pd_floored_schur(&schur_scaled, relative_floor) {
                         Some((floored, floored_factor)) => (floored_factor, Some(floored)),
                         None => {
@@ -838,11 +842,8 @@ pub(crate) fn factor_dense_reduced_schur(
                         }
                     }
                 }
-                ReducedSchurPolicy::StrictNewton => {
+                None => {
                     return Err(ArrowSchurError::SchurFactorFailed { reason: e });
-                }
-                ReducedSchurPolicy::EvidenceUnitDeflation { .. } => {
-                    unreachable!("evidence unit deflation returns before Newton equilibration")
                 }
             }
         }

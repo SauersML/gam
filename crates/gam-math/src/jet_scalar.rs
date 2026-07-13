@@ -684,8 +684,8 @@ impl<'arena> RuntimeJetScalar<'arena> for RuntimeValue {
     #[inline(always)]
     fn affine_compose(
         &self,
-        _input_scale: f64,
-        _input_shift: f64,
+        _: f64,
+        _: f64,
         derivative_stack: [f64; 5],
         &(): &'arena Self::Workspace,
     ) -> Self {

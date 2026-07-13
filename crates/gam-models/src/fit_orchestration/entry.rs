@@ -995,14 +995,22 @@ fn adaptive_spatial_candidates(
         .design
         .ncols()
         .saturating_sub(result.design.smooth.total_smooth_cols());
-    let mut penalty_cursor = result.design.leading_penalty_blocks_before_smooth();
     let mut candidates = Vec::new();
     for term_index in 0..term_count {
         let realized = &result.design.smooth.terms[term_index];
-        let penalty_count = realized.penalties_local.len();
         if result.adaptive_spatial_terms[term_index]
             && let Some(current_centers) = result.adaptive_spatial_center_counts[term_index]
         {
+            let penalty_range = result
+                .design
+                .smooth_term_penalty_range(term_index)
+                .map_err(|reason| WorkflowError::IntegrationFailed { reason })?
+                .ok_or_else(|| WorkflowError::IntegrationFailed {
+                    reason: format!(
+                        "adaptive spatial term '{}' emitted no penalty block",
+                        result.resolvedspec.smooth_terms[term_index].name,
+                    ),
+                })?;
             let spatial_dimension = result.resolvedspec.smooth_terms[term_index]
                 .basis
                 .structural_feature_cols()
@@ -1026,7 +1034,7 @@ fn adaptive_spatial_candidates(
                 ..(smooth_offset + realized.coeff_range.end);
             let edf = result
                 .fit
-                .per_term_edf(global_range, penalty_cursor, penalty_count);
+                .per_term_edf(global_range, penalty_range.start, penalty_range.len());
             let nullspace_dim = realized.wald_unpenalized_dim();
             match adaptive_center_decision(
                 current_centers,
@@ -1058,7 +1066,6 @@ fn adaptive_spatial_candidates(
                 }
             }
         }
-        penalty_cursor = penalty_cursor.saturating_add(penalty_count);
     }
     Ok(AdaptiveSpatialCandidates {
         term_count,

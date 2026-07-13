@@ -982,8 +982,8 @@ pub fn steer_to_target_nats(
     let mut lo_a = 0.0_f64;
     let mut lo_kl = 0.0_f64;
     let mut hi_a = seed_amplitude;
-    let mut hi_plan = plan_at(hi_a)?;
-    let mut hi_probe = probe_applied_dose(probe, &hi_plan)?;
+    let hi_plan = plan_at(hi_a)?;
+    let hi_probe = probe_applied_dose(probe, &hi_plan)?;
     let mut hi_kl = hi_probe.measured_nats;
     probes += 1;
     let mut max_probed_amplitude = hi_a;
@@ -1078,10 +1078,6 @@ pub fn steer_to_target_nats(
         lo_kl = hi_kl;
         hi_a = next_a;
         hi_kl = next_kl;
-        if hi_kl > target_nats {
-            hi_plan = next_plan;
-            hi_probe = next_probe;
-        }
     }
 
     // Safeguarded secant inside the measured bracket. If roundoff puts the

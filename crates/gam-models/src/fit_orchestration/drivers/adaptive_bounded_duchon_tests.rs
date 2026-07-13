@@ -44,14 +44,14 @@ mod adaptive_bounded_duchon_tests {
     #[test]
     fn spatial_penalty_ranges_follow_realized_global_layout_2287() {
         let data = array![
-            [1.0, 0.0, 0.00, 0.57],
-            [2.0, 1.0, 0.14, 0.00],
-            [3.0, 0.0, 0.29, 0.86],
-            [4.0, 1.0, 0.43, 0.29],
-            [5.0, 0.0, 0.57, 1.00],
-            [6.0, 1.0, 0.71, 0.43],
-            [7.0, 0.0, 0.86, 0.14],
-            [8.0, 1.0, 1.00, 0.71],
+            [1.0, -0.8, 0.0, 0.0, 0.00, 0.57],
+            [2.0, -0.4, 1.0, 1.0, 0.14, 0.00],
+            [3.0, -0.1, 0.0, 2.0, 0.29, 0.86],
+            [4.0, 0.2, 1.0, 3.0, 0.43, 0.29],
+            [5.0, 0.5, 0.0, 0.0, 0.57, 1.00],
+            [6.0, 0.7, 1.0, 1.0, 0.71, 0.43],
+            [7.0, 0.9, 0.0, 2.0, 0.86, 0.14],
+            [8.0, 1.1, 1.0, 3.0, 1.00, 0.71],
         ];
         let smooth = |name: &str, feature_col: usize| SmoothTermSpec {
             name: name.to_string(),
@@ -64,7 +64,7 @@ mod adaptive_bounded_duchon_tests {
                         data_range: (0.0, 1.0),
                         num_internal_knots: 4,
                     },
-                    double_penalty: false,
+                    double_penalty: true,
                     identifiability: BSplineIdentifiability::None,
                     boundary_conditions: BSplineBoundaryConditions::default(),
                     boundary: OneDimensionalBoundary::Open,
@@ -74,36 +74,73 @@ mod adaptive_bounded_duchon_tests {
             joint_null_rotation: None,
         };
         let spec = TermCollectionSpec {
-            // Exactly one function-space ridge is emitted for this term.
-            linear_terms: vec![LinearTermSpec {
-                name: "linear".to_string(),
-                feature_col: 0,
-                feature_cols: vec![0],
-                categorical_levels: vec![],
-                double_penalty: true,
-                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
-                coefficient_min: None,
-                coefficient_max: None,
-            }],
-            // The non-empty coefficient range is intentionally unpenalized and
-            // therefore contributes no global penalty block.
-            random_effect_terms: vec![RandomEffectTermSpec {
-                name: "unpenalized_group".to_string(),
-                feature_col: 1,
-                drop_first_level: false,
-                penalized: false,
-                frozen_levels: Some(vec![0, 1]),
-                lenient_unseen: true,
-            }],
+            // Two linear columns but only the first emits a function-space
+            // ridge: coefficient width is deliberately not penalty count.
+            linear_terms: vec![
+                LinearTermSpec {
+                    name: "penalized_linear".to_string(),
+                    feature_col: 0,
+                    feature_cols: vec![0],
+                    categorical_levels: vec![],
+                    double_penalty: true,
+                    coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                    coefficient_min: None,
+                    coefficient_max: None,
+                },
+                LinearTermSpec {
+                    name: "unpenalized_linear".to_string(),
+                    feature_col: 1,
+                    feature_cols: vec![1],
+                    categorical_levels: vec![],
+                    double_penalty: false,
+                    coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                    coefficient_min: None,
+                    coefficient_max: None,
+                },
+            ],
+            // Likewise, both random effects own non-empty coefficient ranges
+            // but only the first emits a ridge.
+            random_effect_terms: vec![
+                RandomEffectTermSpec {
+                    name: "penalized_group".to_string(),
+                    feature_col: 2,
+                    drop_first_level: false,
+                    penalized: true,
+                    frozen_levels: Some(vec![0, 1]),
+                    lenient_unseen: true,
+                },
+                RandomEffectTermSpec {
+                    name: "unpenalized_group".to_string(),
+                    feature_col: 3,
+                    drop_first_level: false,
+                    penalized: false,
+                    frozen_levels: Some(vec![0, 1, 2, 3]),
+                    lenient_unseen: true,
+                },
+            ],
             // Distinct feature ownership is essential here. Two copies of the
             // same smooth are deliberately collapsed by global hierarchical
             // identifiability, in which case the second term correctly owns no
             // realized penalty block and cannot test a two-term layout.
-            smooth_terms: vec![smooth("first_smooth", 2), smooth("second_smooth", 3)],
+            // Each surviving smooth emits BOTH its primary roughness and its
+            // function-space null ridge, so every repeated axis has width two.
+            smooth_terms: vec![smooth("first_smooth", 4), smooth("second_smooth", 5)],
         };
         let design = build_term_collection_design(data.view(), &spec).expect("mixed design");
 
-        assert_eq!(design.leading_penalty_blocks_before_smooth(), 1);
+        assert_eq!(design.leading_penalty_blocks_before_smooth(), 2);
+        assert_eq!(design.penalties.len(), 6);
+        assert_eq!(design.penaltyinfo.len(), design.penalties.len());
+        assert_eq!(design.penaltyinfo[0].termname.as_deref(), Some("penalized_linear"));
+        assert!(matches!(
+            &design.penaltyinfo[0].penalty.source,
+            PenaltySource::Other(source) if source == "LinearTermRidge"
+        ));
+        assert_eq!(design.penaltyinfo[1].termname.as_deref(), Some("penalized_group"));
+        assert!(matches!(
+            &design.penaltyinfo[1].penalty.source,
+            PenaltySource::Other(source) if source == "RandomEffectRidge(penalized_group)"
+        ));
         let first = design
             .smooth_term_penalty_range(0)
             .expect("consistent layout")
@@ -112,16 +149,33 @@ mod adaptive_bounded_duchon_tests {
             .smooth_term_penalty_range(1)
             .expect("consistent layout")
             .expect("penalized second smooth");
-        assert_eq!(first.start, 1);
+        assert_eq!(first, 2..4);
+        assert_eq!(second, 4..6);
         assert_eq!(second.start, first.end);
-        assert_eq!(
-            design.penaltyinfo[first.start].termname.as_deref(),
-            Some("first_smooth")
-        );
-        assert_eq!(
-            design.penaltyinfo[second.start].termname.as_deref(),
-            Some("second_smooth")
-        );
+        for (range, name) in [(first.clone(), "first_smooth"), (second.clone(), "second_smooth")]
+        {
+            let infos = &design.penaltyinfo[range.clone()];
+            assert_eq!(infos.len(), 2);
+            assert!(infos.iter().all(|info| info.termname.as_deref() == Some(name)));
+            assert!(infos.iter().any(|info| {
+                matches!(info.penalty.source, PenaltySource::Primary)
+            }));
+            assert!(infos.iter().any(|info| {
+                matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace)
+            }));
+            for (global_index, info) in range.zip(infos.iter()) {
+                assert_eq!(info.global_index, global_index);
+                assert!(info.penalty.effective_rank > 0);
+            }
+        }
+
+        // Independent consumer cross-check: the incremental κ realizer's
+        // production range resolver translates the actual emitter layout into
+        // smooth-local coordinates without constructing a second spec cursor.
+        let (smooth_ranges, full_ranges) = emitted_smooth_penalty_ranges(&design)
+            .expect("incremental realizer accepts composed emitted layout");
+        assert_eq!(smooth_ranges, vec![0..2, 2..4]);
+        assert_eq!(full_ranges, vec![first, second]);
     }
 
     #[test]

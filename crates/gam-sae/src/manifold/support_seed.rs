@@ -10,7 +10,11 @@ use crate::assignment_state::{SaeAssignmentAtomSpec, SaeAssignmentState};
 use crate::front_door::{SaeFitAdmission, SaeFitLane};
 use ndarray::{Array2, Array3, ArrayView2, s};
 
-use super::{SaeAtomBasisKind, sae_atom_basis_kind_from_str};
+use super::{
+    SaeAtomBasisKind, SaeManifoldAtom, SaeReferenceRoughness, build_sae_basis_evaluators,
+    sae_atom_basis_kind_from_str, sae_build_atom_plans, sae_build_padded_basis_stacks,
+    sae_pick_duchon_center_indices,
+};
 
 pub struct SaeSupportSeedRequest<'a> {
     pub target: ArrayView2<'a, f64>,

@@ -210,11 +210,16 @@ impl Order2GraphWorkspace {
     /// the tape contents escape these two private accessors.
     #[inline(always)]
     fn tape(&self) -> &GraphTape {
+        // SAFETY: the workspace is not Sync, scalar construction completes each
+        // mutation before returning, and lowering starts only after construction,
+        // so no mutable reference aliases this shared tape reference.
         unsafe { (&*self.tape.get()).as_ref() }
     }
 
     #[inline(always)]
     fn tape_mut(&self) -> &mut GraphTape {
+        // SAFETY: the workspace is not Sync and every tape mutation is serialized
+        // by the expression-construction/lowering protocol described on `tape`.
         unsafe { (&mut *self.tape.get()).as_mut() }
     }
 
@@ -250,7 +255,10 @@ impl Order2GraphWorkspace {
             tape.edge_len < MAX_GRAPH_EDGES,
             "compiled graph edge capacity exceeded"
         );
-        debug_assert!(parent < MAX_GRAPH_NODES);
+        assert!(
+            parent < tape.node_len,
+            "compiled graph edge parent must name an existing node"
+        );
         tape.edge_parents[tape.edge_len] = parent as u8;
         tape.edge_firsts[tape.edge_len] = first;
         tape.edge_len += 1;
@@ -272,7 +280,10 @@ impl Order2GraphWorkspace {
             tape.diagonal_len < MAX_GRAPH_EDGES,
             "compiled graph diagonal-term capacity exceeded"
         );
-        debug_assert!(input < MAX_GRAPH_NODES);
+        assert!(
+            input < tape.node_len,
+            "compiled graph diagonal input must name an existing node"
+        );
         tape.diagonal_inputs[tape.diagonal_len] = input as u8;
         tape.diagonal_seconds[tape.diagonal_len] = second;
         tape.diagonal_len += 1;
@@ -593,7 +604,10 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
                 curvature_offset += 1;
             }
         }
-        debug_assert_eq!(curvature_offset, curvature_len);
+        assert_eq!(
+            curvature_offset, curvature_len,
+            "compiled graph projected-curvature schedule must fill its exact packed range"
+        );
 
         let tape = workspace.tape_mut();
         let owner = tape.node_len;
@@ -970,7 +984,7 @@ mod tests {
             }
         }
 
-        fn coefficient(&self, _row: usize, _column: usize) -> f64 {
+        fn coefficient(&self, _: usize, _: usize) -> f64 {
             panic!("compiled graph quadratic lowering must preserve matrix-free multiply")
         }
     }
@@ -989,7 +1003,7 @@ mod tests {
             output.copy_from_slice(input);
         }
 
-        fn coefficient(&self, _row: usize, _column: usize) -> f64 {
+        fn coefficient(&self, _: usize, _: usize) -> f64 {
             panic!("compiled graph quadratic lowering must preserve matrix-free multiply")
         }
     }
@@ -1010,7 +1024,7 @@ mod tests {
             output.copy_from_slice(input);
         }
 
-        fn coefficient(&self, _row: usize, _column: usize) -> f64 {
+        fn coefficient(&self, _: usize, _: usize) -> f64 {
             panic!("compiled graph quadratic lowering must preserve matrix-free multiply")
         }
     }

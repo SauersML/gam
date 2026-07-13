@@ -4860,6 +4860,61 @@ impl<'d> std::fmt::Debug for FrozenTermCollectionIncrementalRealizer<'d> {
     }
 }
 
+/// Translate the authoritative emitted global penalty layout into the two
+/// coordinate systems the incremental realizer updates.
+///
+/// The model-global ranges come directly from `TermCollectionDesign`; the
+/// smooth-local ranges are their exact translation past the recorded leading
+/// penalty prefix. Keeping this outside the constructor makes the layout
+/// invariant independently testable without constructing any κ-specific
+/// spatial caches.
+fn emitted_smooth_penalty_ranges(
+    design: &TermCollectionDesign,
+) -> Result<(Vec<Range<usize>>, Vec<Range<usize>>), String> {
+    let leading = design.leading_penalty_blocks_before_smooth();
+    let mut smooth_penalty_ranges = Vec::with_capacity(design.smooth.terms.len());
+    let mut full_penalty_ranges = Vec::with_capacity(design.smooth.terms.len());
+    let mut smooth_cursor = 0usize;
+    for term_idx in 0..design.smooth.terms.len() {
+        let full_range = design.smooth_term_penalty_range(term_idx)?;
+        match full_range {
+            Some(full_range) => {
+                let local_start = full_range.start.checked_sub(leading).ok_or_else(|| {
+                    "incremental realizer smooth penalty range precedes the emitted smooth prefix"
+                        .to_string()
+                })?;
+                let local_end = full_range.end.checked_sub(leading).ok_or_else(|| {
+                    "incremental realizer smooth penalty range precedes the emitted smooth prefix"
+                        .to_string()
+                })?;
+                if local_start != smooth_cursor {
+                    return Err(format!(
+                        "incremental realizer non-contiguous emitted smooth layout at term {term_idx}: expected local start {smooth_cursor}, got {local_start}"
+                    ));
+                }
+                smooth_cursor = local_end;
+                smooth_penalty_ranges.push(local_start..local_end);
+                full_penalty_ranges.push(full_range);
+            }
+            None => {
+                smooth_penalty_ranges.push(smooth_cursor..smooth_cursor);
+                let global_cursor = leading.checked_add(smooth_cursor).ok_or_else(|| {
+                    "incremental realizer empty smooth penalty range overflow".to_string()
+                })?;
+                full_penalty_ranges.push(global_cursor..global_cursor);
+            }
+        }
+    }
+    if smooth_cursor != design.smooth.penalties.len() {
+        return Err(format!(
+            "incremental realizer smooth penalty mismatch: ranged={}, actual={}",
+            smooth_cursor,
+            design.smooth.penalties.len()
+        ));
+    }
+    Ok((smooth_penalty_ranges, full_penalty_ranges))
+}
+
 impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
     fn new(
         data: ArrayView2<'d, f64>,
@@ -4885,33 +4940,12 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             .into());
         }
 
-        let mut smooth_cursor = 0usize;
-        let mut smooth_penalty_ranges = Vec::with_capacity(design.smooth.terms.len());
-        for term in &design.smooth.terms {
-            let next = smooth_cursor + term.penalties_local.len();
-            smooth_penalty_ranges.push(smooth_cursor..next);
-            smooth_cursor = next;
-        }
-        if smooth_cursor != design.smooth.penalties.len() {
-            return Err(SmoothError::dimension_mismatch(format!(
-                "incremental realizer smooth penalty mismatch: ranged={}, actual={}",
-                smooth_cursor,
-                design.smooth.penalties.len()
-            ))
-            .into());
-        }
-
-        let fixed_penalty_offset = design
-            .penalties
-            .len()
-            .checked_sub(design.smooth.penalties.len())
-            .ok_or_else(|| {
-                "incremental realizer encountered invalid penalty bookkeeping".to_string()
-            })?;
-        let full_penalty_ranges = smooth_penalty_ranges
-            .iter()
-            .map(|range| (fixed_penalty_offset + range.start)..(fixed_penalty_offset + range.end))
-            .collect::<Vec<_>>();
+        // Cache the exact ranges reported by the emitted global layout. Do not
+        // reconstruct a second global offset from term specs or coefficient
+        // blocks: unpenalized fixed/random effects own columns but emit no
+        // penalty, and multi-penalty smooths own more than one coordinate.
+        let (smooth_penalty_ranges, full_penalty_ranges) =
+            emitted_smooth_penalty_ranges(&design)?;
         let fixed_blocks = build_term_collection_fixed_blocks(data, &spec)
             .map_err(|e| format!("failed to cache fixed term-collection blocks: {e}"))?;
 
@@ -8520,15 +8554,15 @@ pub fn smooth_term_lr_inference_forspec(
         .coefficient_covariance_scale(family_disp)
         .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
 
-    // The penalty-block cursor walks the same block order the summary table
-    // uses: any leading linear/random-effect penalty blocks first (skipped
-    // here), then smooth terms.
-    let mut penalty_cursor = full.design.leading_penalty_blocks_before_smooth();
     let mut out = Vec::<SmoothTermLrInference>::new();
     for (term_idx, design_term) in full.design.smooth.terms.iter().enumerate() {
-        let k = design_term.penalties_local.len();
-        let block_start = penalty_cursor;
-        penalty_cursor += k;
+        let penalty_range = full
+            .design
+            .smooth_term_penalty_range(term_idx)
+            .map_err(EstimationError::InvalidInput)?;
+        let (block_start, k) = penalty_range
+            .map(|range| (range.start, range.len()))
+            .unwrap_or((0, 0));
         // Shape-constrained smooths get no central-χ² LR (cone-projected
         // boundary test); the summary table skips them too.
         if design_term.shape != ShapeConstraint::None {

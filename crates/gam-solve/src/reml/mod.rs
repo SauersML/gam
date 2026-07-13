@@ -1153,7 +1153,7 @@ mod tests {
     pub(crate) fn eval_cache_manager_stores_first_order_outer_eval() {
         let cache = EvalCacheManager::new();
         let rho = array![0.25, -0.0];
-        let rho_key = EvalCacheManager::sanitized_rhokey(&rho);
+        let rho_key = super::rho_key::sanitized_rhokey(&rho);
         let eval = OuterEval {
             cost: 3.5,
             gradient: array![1.0, -2.0],
@@ -1212,7 +1212,7 @@ mod tests {
         // (1) Round-trip fidelity: store at rho_a, then a forced hit must equal
         // the stored eval bit-for-bit (the "hit == miss" guarantee).
         let rho_a = array![0.25, -1.5];
-        let key_a = EvalCacheManager::sanitized_rhokey(&rho_a);
+        let key_a = super::rho_key::sanitized_rhokey(&rho_a);
         let eval_a = make_eval(0.25);
         cache.store_outer_eval(&key_a, &eval_a);
         let hit_a = cache
@@ -1231,7 +1231,7 @@ mod tests {
         // (2) No aliasing: a second, distinct rho must return its OWN eval, and
         // the first key must still return the first eval untouched.
         let rho_b = array![0.25, -1.4999999999999998];
-        let key_b = EvalCacheManager::sanitized_rhokey(&rho_b);
+        let key_b = super::rho_key::sanitized_rhokey(&rho_b);
         assert_ne!(key_a, key_b, "the two rho-keys must differ");
         let eval_b = make_eval(7.0);
         cache.store_outer_eval(&key_b, &eval_b);
@@ -1260,7 +1260,7 @@ mod tests {
         let mut evals = Vec::new();
         for i in 0..OUTER_EVAL_LRU_CAPACITY {
             let rho = array![i as f64, -(i as f64)];
-            let key = EvalCacheManager::sanitized_rhokey(&rho);
+            let key = super::rho_key::sanitized_rhokey(&rho);
             let eval = make_eval(i as f64 + 0.123);
             cache.store_outer_eval(&key, &eval);
             keys.push(key);
@@ -1273,7 +1273,7 @@ mod tests {
         );
         // One more distinct key evicts the LRU (key[0]).
         let rho_overflow = array![999.0, -999.0];
-        let key_overflow = EvalCacheManager::sanitized_rhokey(&rho_overflow);
+        let key_overflow = super::rho_key::sanitized_rhokey(&rho_overflow);
         let eval_overflow = make_eval(42.0);
         cache.store_outer_eval(&key_overflow, &eval_overflow);
         assert_eq!(
@@ -5238,14 +5238,6 @@ impl EvalCacheManager {
             outer_eval_lru: RwLock::new(OuterEvalLru::new(OUTER_EVAL_LRU_CAPACITY)),
             pirls_cache_enabled: AtomicBool::new(true),
         }
-    }
-
-    /// Creates a sanitized cache key from rho values.
-    /// Returns None if any component is NaN, in which case caching is skipped.
-    /// Maps -0.0 to 0.0 to ensure key stability.
-    #[cfg(test)]
-    pub(crate) fn sanitized_rhokey(rho: &Array1<f64>) -> Option<Vec<u64>> {
-        self::rho_key::sanitized_rhokey(rho)
     }
 
     /// Memoizing wrapper for `PenaltySubspace` construction.

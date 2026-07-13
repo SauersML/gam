@@ -69,7 +69,9 @@ impl SaeSupportSmoothingLayout {
                 self.group_keys.len()
             ));
         }
-        let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())?;
+        let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied()).map_err(
+            |error| format!("SaeSupportSmoothingLayout::expand: invalid log strength: {error}"),
+        )?;
         Ok(self
             .atom_group
             .iter()
