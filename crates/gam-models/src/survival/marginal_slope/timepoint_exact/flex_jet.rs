@@ -8,11 +8,9 @@
 //! ```
 //! (`flex_sensitivity.rs:105`). [`flex_row_nll`] writes this **once** over a
 //! generic [`FlexJet`] scalar; instantiating it at [`Jet2`] yields value /
-//! gradient / Hessian (replacing the hand grad/Hessian loops in
-//! `flex_sensitivity.rs`), at [`Jet3`] yields the contracted third
-//! `D_dir H[u,v]`, and at [`Jet4`] the contracted fourth — replacing the
-//! former probit-chain + quotient-rule assembly. The directional /
-//! bidirectional contraction "directions" fall out of the nilpotent ε / δ seeds of the timepoint
+//! gradient / Hessian, at [`Jet3`] yields the contracted third `D_dir H[u,v]`,
+//! and at [`Jet4`] the contracted fourth. The directional / bidirectional
+//! contraction "directions" fall out of the nilpotent ε / δ seeds of the timepoint
 //! jets, exactly as the packed `Order2`/`OneSeed`/`TwoSeed` scalars do for
 //! location-scale — but here over a **runtime** primary count `p` (the flex
 //! primary count `4 + |h| + |w| + 1` is large and variable, so a `Vec`-backed
@@ -27,55 +25,18 @@
 //! stack `surv_stack` and the `ln` stack carry the only special functions (humans
 //! own primitive stability, the algebra owns combinatorics).
 //!
-//! ────────────────────────────────────────────────────────────────────────────
-//! ## #932-2 cutover — status, verification, and findings (2026-06-24)
+//! Verification is deliberately independent of the production composition:
 //!
-//! **PRODUCTION CUTOVER COMPLETE.** The flex survival timepoint derivatives flow
-//! through this jet single-source in production:
-//!   - `flex_sensitivity.rs` (value/grad/Hessian) → `compute_survival_timepoint_exact_jet`,
-//!   - `contracted.rs` (third/fourth) → `compute_survival_timepoint_{directional,bidirectional}_jet_from_cached`.
-//! The former hand timepoint producers have been deleted; finite differences,
-//! nested duals, and generic-plan comparisons independently pin the generated
-//! channels.
+//! - scalar finite differences re-solve the real moving-boundary intercept;
+//! - `Dual22` checks fourth order through a distinct 2+2 nesting;
+//! - the compiled order-two lowering is pinned to the generic plan;
+//! - rigid zero-deviation rows are pinned to the independent `Tower4` program.
 //!
-//! **HOW THE JET WAS PROVEN CORRECT.** The `Jet2`/`Jet3`/`Jet4` builders are pinned
-//! in `moment_engine_tests` against the hand path AND — decisively — against a
-//! **full-matrix scalar finite-difference oracle** of the *real* intercept solve
-//! (`solve_row_survival_intercept_with_slot`), independent of any hand derivative.
-//! All 13 gates pass; the bidirectional `eta_uv_uv`/`chi_uv_uv`/`d_uv_uv` are
-//! asserted vs that FD oracle at every `(u,v)`. Verified on an MSI warm-target watch
-//! loop (`flex_jet::moment_engine_tests`, then the full `flex` production set).
+//! The Euler projector in [`MomentTerm::moment_term`] supplies the universal
+//! `j/(j+m)` distinguished-derivative weight, and [`lift_intercept_flex`] runs
+//! enough frozen-inverse iterations for the represented jet order. Those two
+//! rules are shared by every timepoint channel.
 //!
-//! **THREE REAL JET BUGS FOUND AND FIXED** (the genuine math, all here):
-//!   1. `moment_term` was a plain product → it double-counted the calibration's
-//!      shared η-motion by `(j+m)/j` per Leibniz split (lifted intercept Hessian
-//!      2× too large). Fixed to the distinguished-derivative projector (weight
-//!      `j/(j+m)=|A|/|I|`; see [`MomentTerm::moment_term`]).
-//!   2. The intercept lift ran a hardcoded 2 iterations; the frozen-inverse chord
-//!      recovers exactly ONE Taylor degree per pass (`e_r∈m^{r+1}`), so `Jet3`
-//!      (order 3) / `Jet4` (order 4) directional channels were under-converged.
-//!      Fixed to 4 (see [`lift_intercept_flex`]).
-//!   3. `cell_chi_poly_jets` truncated χ's per-primary chain at 1st order in (a,b),
-//!      dropping `½coeff_aaau·da² + coeff_aabu·da·db + ½coeff_abbu·db²` (= `∂_a` of
-//!      η's 3rd-order per-primary terms) — zero for g-only, nonzero on h/w channels.
-//!
-//! **KEY FINDING — the jet was correct; the HAND oracle was the bug.** With the
-//! three jet bugs fixed, the last gate (`ghw eta_uv_uv`) still "failed" against the
-//! hand. The scalar-FD oracle PROVED the jet correct (`a_uv_uv[q1,q1]` jet == FD),
-//! so the mismatch was the hand `bidirectional`'s §D moving-boundary flux being
-//! incomplete on the q1 (moving-edge) row/column — exactly the #1454 hand-derivative
-//! bug class #932 exists to eliminate. Data: concurrent #1454 fixes drifted the hand
-//! value `0.2338→0.23177` toward the stable jet `0.22318` as they landed. The gate
-//! now asserts the jet vs the FD oracle (ground truth), not the moving-target hand.
-//!
-//! **BONUS — the cutover FIXED a production bug.** Routing `contracted.rs` through
-//! the jet flipped `flex_contracted_tower_matches_independent_fd_witness_nonzero_
-//! deviation` from a pre-existing RED (the hand #1454 flux bug) to GREEN: the broad
-//! `flex` production suite went 86→87 passing. The only remaining red anywhere in
-//! the `flex` filter is `solver::psi_gram_tensor::…reduced_basis_witness_reflexive`,
-//! which is unrelated (it matches the filter only via "re-FLEX-ive") and predates
-//! all of this.
-//! ────────────────────────────────────────────────────────────────────────────
 
 use super::*;
 use crate::bms::signed_probit_neglog_unary_stack;
@@ -1637,11 +1598,8 @@ impl SurvivalMarginalSlopeFamily {
 // `flex_timepoint_inputs_generic` and its helpers (the `FlexJet` moment
 // recurrence, intercept lift, cell-coefficient / chi-poly / moving-edge jets, and
 // the observed / calibration input bridges) live here at module scope, consumed by
-// the `compute_survival_timepoint_exact_jet` Jet2 wrapper below. The `#[test]`
-// oracle gates + the `flex_timepoint_inputs_jet2_impl` cross-check path remain
-// in `#[cfg(test)] mod moment_engine_tests`, pinning the one generic projector
-// against the scalar-FD oracle of the real intercept solve and the historical
-// hand timepoint packs.
+// the `compute_survival_timepoint_exact_jet` Jet2 wrapper below. Independent
+// scalar-FD and nested-dual gates live in `moment_engine_tests`.
 
 // #932: the `recip`/`exp`/`add_const` jet helpers (formerly `FlexJet` default
 // methods) live here as free generic fns — only the relocated moment-engine /
@@ -1977,14 +1935,10 @@ fn edge_sliver_jet<J: FlexJet>(n: usize, c: &[J; 4], z_e: &J, finite: bool) -> O
 }
 
 /// #932 item-2 STEP 3c: the GENERIC-order timepoint `(eta, chi, d)` builder over
-/// ANY `FlexJet` order (`Jet2`/`Jet3`/`Jet4`). Unlike `flex_timepoint_inputs_jet2_
-/// impl` (which freezes the channel weights as scalars and pokes `Jet2` internals
-/// to seed the second-order channel Hessian), this consumes ONLY jet algebra, so
+/// ANY `FlexJet` order (`Jet2`/`Jet3`/`Jet4`). It consumes only jet algebra, so
 /// instantiating it at `Jet3` (one directional seed) yields the directional
 /// extension `D_dir(eta,chi,d)` in the `eps` channel, and at `Jet4` (two seeds)
-/// the mixed second-directional `D_d1 D_d2` in the `eps_del` channel — the exact
-/// `block10_pack_dir`/`block10_pack_bi` content the hand `directional`/
-/// `bidirectional` modules assemble by explicit chain rule.
+/// the mixed second-directional `D_d1 D_d2` in the `eps_del` channel.
 ///
 /// The caller pre-seeds `b_jet` (the slope `g` primary), `du[u]` (the unit
 /// per-primary jets), `template` (a zero jet shaped at the right order/`p`), and

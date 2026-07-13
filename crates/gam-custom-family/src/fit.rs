@@ -1261,6 +1261,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         }
         let request_hessian =
             matches!(order, OuterEvalOrder::ValueGradientHessian) && need_outer_hessian;
+        // Only a successful derivative-bearing evaluation may own the mode
+        // consumed by certified fit assembly. A failed analytic probe must not
+        // leave an older mode available for accidental substitution.
+        outer.terminal_mode = None;
         let eval_result = match outerobjectivegradienthessian_labeled(
             family,
             specs,
@@ -1343,10 +1347,23 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 .iter()
                 .flat_map(|beta| beta.iter().copied()),
         ));
+        let objective = eval_result.objective;
+        let gradient = eval_result.gradient;
+        let outer_hessian = eval_result.outer_hessian;
+        let mode = CustomFamilyOwnedMode {
+            objective,
+            // `pullback_labeled_outer_eval` has already made `rho` the
+            // semantic outer coordinate and added the labeled prior. Retain
+            // that coordinate rather than the evaluator's expanded physical
+            // smoothing vector.
+            rho: rho.clone(),
+            inner: eval_result.inner,
+        };
+        outer.install_terminal_mode(rho, objective, &gradient, mode);
         Ok(OuterEval {
-            cost: eval_result.objective,
-            gradient: eval_result.gradient,
-            hessian: eval_result.outer_hessian,
+            cost: objective,
+            gradient,
+            hessian: outer_hessian,
             inner_beta_hint,
         })
     };

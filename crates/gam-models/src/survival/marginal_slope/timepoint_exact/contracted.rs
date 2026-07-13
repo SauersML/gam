@@ -2,8 +2,7 @@
 //!
 //! Builds the third- and fourth-order directional contractions of the
 //! primary-space NLL Hessian on top of the exact timepoint evaluations, and
-//! routes the general (flex vs rigid) entry points to either the exact flex
-//! path or the rigid fallback.
+//! routes the general entry points to the model-selected flex or rigid path.
 
 use super::*;
 use super::flex_jet::{
@@ -210,9 +209,8 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<FlexThirdRowBase, String> {
         let geometry = self.prepare_row_flex_third_geometry(row, block_states, primary)?;
 
-        // #932-2 increment 3: the contracted BASE timepoint (value/grad/Hessian seed of
-        // the Jet3/Jet4 contraction) now comes from the single-source jet builder, not
-        // the hand `compute_survival_timepoint_exact_from_cached`.
+        // The contracted base timepoint is the Jet2 instance of the same
+        // single-source expression used by the Jet3/Jet4 contractions.
         let entry = self.compute_survival_timepoint_exact_jet_from_cached(
             geometry.row,
             primary,
@@ -256,8 +254,8 @@ impl SurvivalMarginalSlopeFamily {
 
     /// Contract the third-order tensor of a row against a single direction,
     /// reusing the direction-independent [`FlexThirdRowBase`]. Only the
-    /// directional timepoint extensions and the Block 10 third-contraction
-    /// assembly are recomputed per axis. Bit-identical to the inline path that
+    /// directional timepoint extensions and the third-contraction lowering are
+    /// recomputed per axis. Bit-identical to the inline path that
     /// [`Self::row_flex_primary_third_contracted_exact`] previously ran.
     pub(crate) fn row_flex_third_contract_from_base(
         &self,
@@ -272,10 +270,8 @@ impl SurvivalMarginalSlopeFamily {
         let beta_h = base.beta_h.as_ref();
         let beta_w = base.beta_w.as_ref();
 
-        // #932-2 PRODUCTION cutover (increment 2): the directional timepoint
-        // extension (Block-10 directional pack) comes from the single-source
-        // `flex_timepoint_inputs_generic` jet builder at `Jet3`, replacing the hand
-        // `compute_survival_timepoint_directional_exact_from_cached` + `block10_pack_dir`.
+        // The directional pack is the Jet3 instance of the canonical timepoint
+        // expression.
         let (entry_ext, exit_ext) =
             super::flex_jet::with_flex_third_jet_arena(|jet_arena| -> Result<_, String> {
                 let (_, entry_ext) = self.compute_survival_timepoint_directional_jet_from_cached(
@@ -324,9 +320,7 @@ impl SurvivalMarginalSlopeFamily {
         // #932 single-source: the contracted third `Σ_c ℓ_{abc} dir_c =
         // (D_dir H)[a][b]` is the ε-Hessian channel of the ONE generic flex
         // row-NLL expression (`flex_row_nll`) instantiated at the one-seed jet
-        // `Jet3`, seeded from the base + directional timepoint packs. Replaces
-        // the bespoke probit-chain / quotient-rule assembly that the Block-10
-        // `cpu_oracle_third_contraction` hand-coded.
+        // `Jet3`, seeded from the base + directional timepoint packs.
         self.flex_row_nll_third_contracted(
             base.row,
             &primary,
@@ -410,8 +404,7 @@ impl SurvivalMarginalSlopeFamily {
         let entry_cached = self.build_cached_partition(&primary, a0, g, beta_h, beta_w)?;
         let exit_cached = self.build_cached_partition(&primary, a1, g, beta_h, beta_w)?;
 
-        // #932-2 increment 3: contracted-fourth BASE timepoint via the single-source
-        // jet builder (replaces the hand `compute_survival_timepoint_exact_from_cached`).
+        // Contracted-fourth base timepoint via the canonical Jet2 builder.
         let entry_base = self.compute_survival_timepoint_exact_jet_from_cached(
             row,
             &primary,
@@ -447,11 +440,8 @@ impl SurvivalMarginalSlopeFamily {
             .into());
         }
 
-        // #932-2 PRODUCTION cutover (increment 2): both the directional (u, v) and
-        // the mixed second-directional (bi) timepoint extensions come from the
-        // single-source `flex_timepoint_inputs_generic` jet builder at `Jet3`/`Jet4`,
-        // returning the Block-10 packs directly, replacing the hand
-        // `compute_survival_timepoint_{directional,bidirectional}_exact_from_cached`.
+        // Both directional and mixed-directional timepoint extensions instantiate
+        // the same expression at Jet3 and Jet4.
         let (entry_ext_u, entry_ext_v, exit_ext_u, exit_ext_v) =
             super::flex_jet::with_flex_third_jet_arena(|jet_arena| -> Result<_, String> {
                 let (_, entry_ext_u) = self
@@ -549,9 +539,7 @@ impl SurvivalMarginalSlopeFamily {
         // #932 single-source: the contracted fourth `Σ_cd ℓ_{abcd} u_c v_d` is
         // the εδ-Hessian channel of the ONE generic flex row-NLL expression
         // (`flex_row_nll`) instantiated at the two-seed jet `Jet4`, seeded from
-        // the base + both directional + bidirectional timepoint packs. Replaces
-        // the bespoke per-(u,v) probit-chain / quotient-rule assembly that the
-        // Block-10 `cpu_oracle_fourth_contraction` hand-coded.
+        // the base + both directional + bidirectional timepoint packs.
         self.flex_row_nll_fourth_contracted(
             row,
             &primary,
