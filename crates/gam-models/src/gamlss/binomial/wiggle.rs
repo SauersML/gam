@@ -270,16 +270,15 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
             self.basis_derivatives[0].clone(),
             self.basis_derivatives[1].clone(),
         );
-        let probe_terms = [(2, [1.0, 0.0, 0.0, 0.0, 0.0]), (3, [0.0, 1.0, 0.0, 0.0, 0.0])];
+        let probe_terms = [
+            (2, [1.0, 0.0, 0.0, 0.0, 0.0]),
+            (3, [0.0, 1.0, 0.0, 0.0, 0.0]),
+        ];
         for row in 0..n {
             let values = [self.eta_t[row], self.eta_ls[row], 0.0, 0.0];
             let primaries: [Order2<4>; 4] =
                 std::array::from_fn(|axis| Order2::variable(values[axis], axis));
-            let warp = self.linear_basis_stack(
-                row,
-                self.beta_w.view(),
-                Some(self.etaw[row]),
-            );
+            let warp = self.linear_basis_stack(row, self.beta_w.view(), Some(self.etaw[row]));
             let h = self
                 .eval_fixed(row, &primaries, warp, &probe_terms, 2)?
                 .into_channels()
