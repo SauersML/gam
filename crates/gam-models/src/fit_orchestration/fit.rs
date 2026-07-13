@@ -253,15 +253,72 @@ fn certified_retry_or_original<T, E>(original: E, retry: Result<T, E>) -> Result
     }
 }
 
+fn rescale_covariance_coordinates(covariance: &mut Array2<f64>, factors: &[f64]) {
+    let dimension = factors.len();
+    assert_eq!(
+        covariance.dim(),
+        (dimension, dimension),
+        "covariance must align with the remapped coefficient vector"
+    );
+    for i in 0..dimension {
+        for j in 0..dimension {
+            covariance[[i, j]] *= factors[i] * factors[j];
+        }
+    }
+}
+
+fn rescale_precision_coordinates(
+    precision: &mut gam_problem::dispersion_cov::UnscaledPrecision,
+    factors: &[f64],
+) {
+    let dimension = factors.len();
+    assert_eq!(
+        precision.dim(),
+        (dimension, dimension),
+        "precision must align with the remapped coefficient vector"
+    );
+    for i in 0..dimension {
+        for j in 0..dimension {
+            precision[[i, j]] /= factors[i] * factors[j];
+        }
+    }
+}
+
 #[cfg(test)]
 mod standard_convergence_gate_tests {
     use super::{
-        certified_retry_or_original, firth_can_rescue, survival_baseline_parameter_checkpoint,
+        certified_retry_or_original, firth_can_rescue, rescale_covariance_coordinates,
+        rescale_precision_coordinates, survival_baseline_parameter_checkpoint,
         survival_pirls_status_is_certified,
     };
     use crate::survival::construction::{SurvivalBaselineConfig, SurvivalBaselineTarget};
     use gam_solve::estimate::EstimationError;
     use gam_solve::pirls::PirlsStatus;
+    use ndarray::array;
+
+    #[test]
+    fn raw_coordinate_precision_is_the_inverse_congruence_of_covariance() {
+        let mut covariance = array![[0.30, -0.10], [-0.10, 0.70]];
+        let mut precision =
+            gam_problem::dispersion_cov::UnscaledPrecision::wrap(array![[3.5, 0.5], [0.5, 1.5]]);
+        let factors = [4.0, 1.0];
+
+        rescale_covariance_coordinates(&mut covariance, &factors);
+        rescale_precision_coordinates(&mut precision, &factors);
+
+        assert_eq!(covariance, array![[4.8, -0.4], [-0.4, 0.7]]);
+        assert_eq!(
+            precision.as_array(),
+            &array![[0.21875, 0.125], [0.125, 1.5]]
+        );
+        let identity = precision.as_array().dot(&covariance);
+        for i in 0..2 {
+            for j in 0..2 {
+                let target = if i == j { 1.0 } else { 0.0 };
+                assert!((identity[[i, j]] - target).abs() <= 2e-15);
+            }
+        }
+    }
 
     #[test]
     fn failed_retry_returns_original_evidence() {
@@ -1156,24 +1213,11 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw(
         };
         row_factors.extend(std::iter::repeat_n(f, block.beta.len()));
     }
-    let parameter_dimension = row_factors.len();
-    let rescale_cov = |cov: &mut Array2<f64>| {
-        assert_eq!(
-            cov.dim(),
-            (parameter_dimension, parameter_dimension),
-            "Gaussian location-scale covariance must align with the remapped coefficient vector"
-        );
-        for i in 0..parameter_dimension {
-            for j in 0..parameter_dimension {
-                cov[[i, j]] *= row_factors[i] * row_factors[j];
-            }
-        }
-    };
     if let Some(cov) = result.fit.fit.covariance_conditional.as_mut() {
-        rescale_cov(cov);
+        rescale_covariance_coordinates(cov, &row_factors);
     }
     if let Some(cov) = result.fit.fit.covariance_corrected.as_mut() {
-        rescale_cov(cov);
+        rescale_covariance_coordinates(cov, &row_factors);
     }
 
     // Precision transforms contravariantly to covariance. If
@@ -1187,24 +1231,11 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw(
     // deletion) therefore mixed parameter systems. Transform every persisted
     // precision copy at the producer boundary so the saved model has one
     // coordinate convention.
-    let rescale_precision =
-        |precision: &mut gam_problem::dispersion_cov::UnscaledPrecision| {
-            assert_eq!(
-                precision.dim(),
-                (parameter_dimension, parameter_dimension),
-                "Gaussian location-scale precision must align with the remapped coefficient vector"
-            );
-            for i in 0..parameter_dimension {
-                for j in 0..parameter_dimension {
-                    precision[[i, j]] /= row_factors[i] * row_factors[j];
-                }
-            }
-        };
     if let Some(geometry) = result.fit.fit.geometry.as_mut() {
-        rescale_precision(&mut geometry.penalized_hessian);
+        rescale_precision_coordinates(&mut geometry.penalized_hessian, &row_factors);
     }
     if let Some(inference) = result.fit.fit.inference.as_mut() {
-        rescale_precision(&mut inference.penalized_hessian);
+        rescale_precision_coordinates(&mut inference.penalized_hessian, &row_factors);
     }
 
     // The residual-scale summary `standard_deviation` is a response-units
