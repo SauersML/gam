@@ -1820,7 +1820,7 @@ mod tests {
             "letcurved_h1_1:f64=(curved_stack0[2]*(product_g1*product_g1));",
             "letmutout_g0:f64=1.0;",
             "letmutout_h0_1:f64=0.0;",
-            "iftake>0.0{",
+            "if(take>0.0){",
             "out_g1=(curved_g1+1.0);",
             "[__row_program_h0_0,__row_program_h0_1],",
             "[__row_program_h0_1,__row_program_h1_1],",
