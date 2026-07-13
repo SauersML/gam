@@ -1348,6 +1348,7 @@ pub(crate) struct EvalCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gam_math::jet_scalar::SymmetricQuadraticCoefficients;
 
     impl RigidVectorRowWorkspace {
         fn retained_bytes(&self) -> usize {
