@@ -5579,6 +5579,99 @@ mod empirical_flex_jet_oracle_tests {
             }
         }
     }
+    fn benchmark_fixed_third_many<const K: usize>(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+        directions: &[Array1<f64>],
+    ) -> Result<Vec<Array2<f64>>, String> {
+        directions
+            .iter()
+            .map(|direction| {
+                BernoulliMarginalSlopeFamily::empirical_fixed_third_contracted::<K>(
+                    plan, point, direction,
+                )
+            })
+            .collect()
+    }
+
+    fn benchmark_fixed_third_many_dispatch(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+        directions: &[Array1<f64>],
+        r: usize,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        match r {
+            8 => benchmark_fixed_third_many::<8>(plan, point, directions),
+            12 => benchmark_fixed_third_many::<12>(plan, point, directions),
+            18 => benchmark_fixed_third_many::<18>(plan, point, directions),
+            _ => Err(format!("unsupported benchmark fixed third width {r}")),
+        }
+    }
+
+    fn benchmark_fixed_trace<const K: usize>(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+        gram: &[f64],
+    ) -> Result<Array1<f64>, String> {
+        let mut gradient = Array1::<f64>::zeros(K);
+        for axis in 0..K {
+            let mut basis = Array1::<f64>::zeros(K);
+            basis[axis] = 1.0;
+            let third = BernoulliMarginalSlopeFamily::empirical_fixed_third_contracted::<K>(
+                plan, point, &basis,
+            )?;
+            gradient[axis] =
+                BernoulliMarginalSlopeFamily::row_primary_trace_contract(&third, gram);
+        }
+        Ok(gradient)
+    }
+
+    fn benchmark_fixed_trace_dispatch(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+        gram: &[f64],
+        r: usize,
+    ) -> Result<Array1<f64>, String> {
+        match r {
+            8 => benchmark_fixed_trace::<8>(plan, point, gram),
+            12 => benchmark_fixed_trace::<12>(plan, point, gram),
+            18 => benchmark_fixed_trace::<18>(plan, point, gram),
+            _ => Err(format!("unsupported benchmark fixed trace width {r}")),
+        }
+    }
+
+    fn benchmark_fixed_fourth_many<const K: usize>(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+        direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
+    ) -> Result<Vec<Array2<f64>>, String> {
+        direction_pairs
+            .iter()
+            .map(|(direction_u, direction_v)| {
+                BernoulliMarginalSlopeFamily::empirical_fixed_fourth_contracted::<K>(
+                    plan,
+                    point,
+                    direction_u,
+                    direction_v,
+                )
+            })
+            .collect()
+    }
+
+    fn benchmark_fixed_fourth_many_dispatch(
+        plan: &EmpiricalBmsRowJetPlan,
+        point: &[f64],
+        direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
+        r: usize,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        match r {
+            8 => benchmark_fixed_fourth_many::<8>(plan, point, direction_pairs),
+            12 => benchmark_fixed_fourth_many::<12>(plan, point, direction_pairs),
+            18 => benchmark_fixed_fourth_many::<18>(plan, point, direction_pairs),
+            _ => Err(format!("unsupported benchmark fixed fourth width {r}")),
+        }
+    }
+
     fn median_batch_output<T>(samples: usize, mut evaluate: impl FnMut() -> T) -> (u128, T) {
         assert!(samples > 0);
         let mut timings = Vec::with_capacity(samples);
@@ -5721,9 +5814,9 @@ mod empirical_flex_jet_oracle_tests {
                     directions
                         .iter()
                         .map(|direction| {
-                            let mut one = fixture
+                            fixture
                                 .family
-                                .empirical_flex_row_third_contracted_many(
+                                .empirical_flex_row_third_contracted(
                                     0,
                                     &fixture.primary,
                                     q,
@@ -5731,13 +5824,32 @@ mod empirical_flex_jet_oracle_tests {
                                     beta_h,
                                     beta_w,
                                     &row_ctx,
-                                    std::slice::from_ref(direction),
+                                    direction,
                                     &fixture.grid,
                                 )
-                                .expect("repeated one-lane third contraction");
-                            one.pop().expect("one direction produces one contraction")
+                                .expect("repeated fixed-width third contraction")
                         })
                         .collect::<Vec<_>>()
+                });
+                let (third_fixed_ns, third_fixed) = median_batch_output(SAMPLES, || {
+                    let plan = fixture
+                        .family
+                        .empirical_bms_row_jet_plan(
+                            0,
+                            &fixture.primary,
+                            q,
+                            slope,
+                            beta_h,
+                            beta_w,
+                            row_ctx.intercept,
+                            &fixture.grid,
+                        )
+                        .expect("fixed-width third row plan");
+                    let point = BernoulliMarginalSlopeFamily::intercept_primary_point(
+                        q, slope, beta_h, beta_w,
+                    );
+                    benchmark_fixed_third_many_dispatch(&plan, &point, &directions, r)
+                        .expect("one-plan fixed-width third contractions")
                 });
                 let (third_batch_ns, third_batch) = median_batch_output(SAMPLES, || {
                     fixture
@@ -5757,6 +5869,11 @@ mod empirical_flex_jet_oracle_tests {
                 });
                 for lane in 0..r {
                     assert_matrix_close(
+                        "one-plan fixed-width third",
+                        &third_repeated[lane],
+                        &third_fixed[lane],
+                    );
+                    assert_matrix_close(
                         "timed batched third",
                         &third_repeated[lane],
                         &third_batch[lane],
@@ -5768,9 +5885,9 @@ mod empirical_flex_jet_oracle_tests {
                     for axis in 0..r {
                         let mut basis = Array1::<f64>::zeros(r);
                         basis[axis] = 1.0;
-                        let mut one = fixture
+                        let third = fixture
                             .family
-                            .empirical_flex_row_third_contracted_many(
+                            .empirical_flex_row_third_contracted(
                                 0,
                                 &fixture.primary,
                                 q,
@@ -5778,16 +5895,35 @@ mod empirical_flex_jet_oracle_tests {
                                 beta_h,
                                 beta_w,
                                 &row_ctx,
-                                std::slice::from_ref(&basis),
+                                &basis,
                                 &fixture.grid,
                             )
-                            .expect("repeated trace basis contraction");
+                            .expect("repeated fixed-width trace basis contraction");
                         gradient[axis] = BernoulliMarginalSlopeFamily::row_primary_trace_contract(
-                            &one.pop().expect("one basis produces one contraction"),
-                            &gram,
+                            &third, &gram,
                         );
                     }
                     gradient
+                });
+                let (trace_fixed_ns, trace_fixed) = median_batch_output(SAMPLES, || {
+                    let plan = fixture
+                        .family
+                        .empirical_bms_row_jet_plan(
+                            0,
+                            &fixture.primary,
+                            q,
+                            slope,
+                            beta_h,
+                            beta_w,
+                            row_ctx.intercept,
+                            &fixture.grid,
+                        )
+                        .expect("fixed-width trace row plan");
+                    let point = BernoulliMarginalSlopeFamily::intercept_primary_point(
+                        q, slope, beta_h, beta_w,
+                    );
+                    benchmark_fixed_trace_dispatch(&plan, &point, &gram, r)
+                        .expect("one-plan fixed-width trace gradient")
                 });
                 let (trace_batch_ns, trace_batch) = median_batch_output(SAMPLES, || {
                     fixture
@@ -5807,7 +5943,12 @@ mod empirical_flex_jet_oracle_tests {
                 });
                 for axis in 0..r {
                     let expected = trace_repeated[axis];
+                    let fixed = trace_fixed[axis];
                     let actual = trace_batch[axis];
+                    assert!(
+                        (expected - fixed).abs()
+                            <= 2e-10 * expected.abs().max(fixed.abs()).max(1.0)
+                    );
                     assert!(
                         (expected - actual).abs()
                             <= 2e-10 * expected.abs().max(actual.abs()).max(1.0)

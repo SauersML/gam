@@ -136,6 +136,44 @@ pub struct RationalLogdetEval {
     pub cg_iterations: usize,
 }
 
+/// Lossless low-rank representation of the derivative of one fixed rational
+/// log-determinant evaluation.
+///
+/// For every symmetric operator direction `D`,
+///
+/// `plan.directional_derivative(eval, D) = (1/r) Σ_a x_a^T D x_a`,
+///
+/// where `x_a` are [`Self::vectors`] and `r` is their count.  The vectors fold
+/// in every quadrature weight, the Hutchinson `1/m`, and the deterministic
+/// deflation block.  Consequently consumers that already assemble arrow
+/// selected-inverse contractions from probe pairs can use `(vectors, vectors)`
+/// without pretending that the vectors are raw probes or unshifted `S^-1`
+/// solves.  This representation is the derivative of the rational SURROGATE,
+/// not an estimator of the derivative of the exact log determinant.
+pub struct RationalLogdetDerivativeBundle {
+    pub vectors: Vec<Array1<f64>>,
+}
+
+impl RationalLogdetDerivativeBundle {
+    /// Apply the represented derivative to a symmetric operator direction.
+    pub fn directional_derivative(
+        &self,
+        dmatvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
+    ) -> Option<f64> {
+        if self.vectors.is_empty() {
+            return None;
+        }
+        let inv_rank = 1.0 / self.vectors.len() as f64;
+        let derivative = self
+            .vectors
+            .iter()
+            .map(|vector| vector.dot(&dmatvec(vector.view())))
+            .sum::<f64>()
+            * inv_rank;
+        derivative.is_finite().then_some(derivative)
+    }
+}
+
 impl RationalLogdetPlan {
     /// Build a plan for spectrum bracket `[lambda_min, lambda_max]` (rough
     /// estimates are fine — the window is padded two decades on each side),
@@ -495,6 +533,69 @@ impl RationalLogdetPlan {
         }
         let acc = acc_defl + acc_probe / m;
         acc.is_finite().then_some(acc)
+    }
+
+    /// Collapse [`RationalLogdetEval`]'s complete shifted-solve ladder into a
+    /// lossless weighted low-rank derivative representation.
+    ///
+    /// This is deliberately derived from the same evaluation that produced the
+    /// value.  Re-solving only the raw probes at shift zero would instead encode
+    /// `tr(S^-1 D)`, which is generally NOT the derivative of this fixed-node
+    /// rational surrogate and would reopen the objective/gradient desynchrony
+    /// the surrogate exists to prevent.
+    pub fn directional_derivative_bundle(
+        &self,
+        eval: &RationalLogdetEval,
+    ) -> Option<RationalLogdetDerivativeBundle> {
+        if eval.shifted_solves.len() != self.nodes.len()
+            || eval.deflation_solves.len() != eval.deflation_basis.len().min(1) * self.nodes.len()
+        {
+            return None;
+        }
+        let probe_count = self.probes.len();
+        if probe_count == 0
+            || eval
+                .shifted_solves
+                .iter()
+                .any(|solves| solves.len() != probe_count)
+            || eval.deflation_solves.iter().any(|solves| {
+                solves.len() != eval.deflation_basis.len()
+            })
+        {
+            return None;
+        }
+        let term_count = self.nodes.len().checked_mul(
+            probe_count.checked_add(eval.deflation_basis.len())?,
+        )?;
+        if term_count == 0 {
+            return None;
+        }
+        let mut vectors = Vec::with_capacity(term_count);
+        let rank = term_count as f64;
+        let probes = probe_count as f64;
+        for (node, &(_, weight)) in self.nodes.iter().enumerate() {
+            if !(weight.is_finite() && weight > 0.0) {
+                return None;
+            }
+            let probe_scale = (rank * weight / probes).sqrt();
+            let deflation_scale = (rank * weight).sqrt();
+            if !(probe_scale.is_finite() && deflation_scale.is_finite()) {
+                return None;
+            }
+            for solve in &eval.shifted_solves[node] {
+                if solve.len() != self.dim {
+                    return None;
+                }
+                vectors.push(solve * probe_scale);
+            }
+            for solve in &eval.deflation_solves[node] {
+                if solve.len() != self.dim {
+                    return None;
+                }
+                vectors.push(solve * deflation_scale);
+            }
+        }
+        Some(RationalLogdetDerivativeBundle { vectors })
     }
 }
 

@@ -653,6 +653,7 @@ pub fn run_sae_manifold_fit(mut request: SaeFitRequest) -> Result<SaeFitOutcome,
     for mut row in request.target.rows_mut() {
         row -= &mu;
     }
+    let tier0_residual_sum_squares = request.target.iter().map(|value| value * value).sum::<f64>();
     // Tier-0 INPUT STANDARDIZATION — the conditioning half of the peel. There is
     // no column equilibration anywhere else in the fit path, so a raw activation
     // target's column-norm spread (measured ~1.3e4, joint Hessian κ ≈ 1e8 on
@@ -731,6 +732,8 @@ pub fn run_sae_manifold_fit(mut request: SaeFitRequest) -> Result<SaeFitOutcome,
         SaeFitOutcome::Null(report) => {
             report.tier0 = Tier0Mean { mean: mu.clone() };
             lift_tier0_rows(&mut report.fitted, &mu, sigma.as_ref());
+            report.residual_sum_squares = tier0_residual_sum_squares;
+            report.reconstruction_r2 = 0.0;
         }
     }
     Ok(outcome)
