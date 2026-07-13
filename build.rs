@@ -4847,6 +4847,76 @@ const PRODUCTION_DERIVATIVE_SPECIALIZATIONS: &[DerivativeSpecialization] = &[
         retired_identities: &[],
     },
     DerivativeSpecialization {
+        family: "SAE reconstruction row jets",
+        kind: DerivativeSpecializationKind::Bespoke,
+        production_sources: &[
+            DerivativeAnchorSet {
+                path: "crates/gam-sae/src/row_jet_program.rs",
+                anchors: &[
+                    "pub struct SaeReconstructionRowProgram {",
+                    "pub fn reconstruction_all_columns_dynamic<'arena>(",
+                    "pub fn beta_border_order1_dynamic<'arena>(",
+                    "pub(crate) trait SaeSoftmaxRowProgramSource {",
+                    "struct SoftmaxMoment<'a, S> {",
+                    "pub(crate) fn execute_softmax_row_program<S: SaeSoftmaxRowProgramSource>(",
+                ],
+            },
+            DerivativeAnchorSet {
+                path: "crates/gam-sae/src/manifold/construction_row_jet_logdet_channels.rs",
+                anchors: &[
+                    "impl crate::row_jet_program::SaeSoftmaxRowProgramSource for ProductionSoftmaxRowProgram<'_> {",
+                    "pub(crate) fn reconstruction_row_program_for_logdet(",
+                    "fn fill_reconstruction_channels_from_program_dynamic(",
+                    "fn fill_beta_border_channels_from_program_dynamic(",
+                    "pub(crate) fn row_jets_for_logdet(",
+                    "let scheduled = crate::row_jet_program::execute_softmax_row_program(",
+                    "let plan = crate::gpu_kernels::sae_rowjet::plan_softmax_row_jets(",
+                    "let input = crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput::from_source(",
+                    "let channels = crate::gpu_kernels::sae_rowjet::execute_softmax_row_jet_tile(",
+                ],
+            },
+            DerivativeAnchorSet {
+                path: "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs",
+                anchors: &[
+                    "pub fn plan_softmax_row_jets(",
+                    "pub fn execute_softmax_row_jet_tile(",
+                    "impl SaeSoftmaxRowProgramSource for InputSource<'_> {",
+                    "let scheduled = execute_softmax_row_program(&source, inv_tau, input.sqrt_row_weight);",
+                    "pub const COMPLETE_SOFTMAX_KERNEL_SOURCE: &str = r#\"",
+                ],
+            },
+        ],
+        discovery_anchor: "SaeSoftmaxRowProgramSource for",
+        parity_pins: &[
+            DerivativeAnchorSet {
+                path: "crates/gam-sae/src/row_jet_program.rs",
+                anchors: &[
+                    "fn recon_jet_matches_hand_path_value_grad_hess()",
+                    "fn compiled_softmax_schedule_matches_generic_tower_all_channels_932()",
+                    "fn runtime_row_jets_match_fixed_oracle_above_old_arity_ceiling_932()",
+                    "fn softmax_reconstruction_t3_t4_match_independent_fd_witness()",
+                    "fn planted_t3_t4_corruption_is_caught_by_fd_witness()",
+                    "fn planted_cross_block_sign_flip_is_caught()",
+                ],
+            },
+            DerivativeAnchorSet {
+                path: "crates/gam-sae/src/manifold/tests_row_jet_and_outer_objective_780.rs",
+                anchors: &[
+                    "pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache()",
+                ],
+            },
+            DerivativeAnchorSet {
+                path: "crates/gam-sae/src/gpu_kernels/sae_rowjet.rs",
+                anchors: &[
+                    "fn complete_cpu_rowjet_contains_coordinate_mixed_and_beta_channels_2304()",
+                    "fn memory_ledger_counts_coordinate_and_mixed_tensors_2304()",
+                    "fn complete_device_matches_cpu_every_channel_when_admitted_2304()",
+                ],
+            },
+        ],
+        retired_identities: &[],
+    },
+    DerivativeSpecialization {
         family: "Gaussian location-scale",
         kind: DerivativeSpecializationKind::RowAtom,
         production_sources: &[DerivativeAnchorSet {
@@ -4958,9 +5028,9 @@ fn derivative_declarations(source: &str, test_mask: &[bool]) -> Vec<DerivativeDe
     declarations
 }
 
-fn is_row_kernel_declaration(declaration: &str) -> bool {
+fn implemented_trait_from_declaration(declaration: &str) -> Option<&str> {
     let Some(mut implemented) = declaration.strip_prefix("impl") else {
-        return false;
+        return None;
     };
     implemented = implemented.trim_start();
     if implemented.starts_with('<') {
@@ -4980,15 +5050,29 @@ fn is_row_kernel_declaration(declaration: &str) -> bool {
             }
         }
         let Some(generic_end) = generic_end else {
-            return false;
+            return None;
         };
         implemented = implemented[generic_end..].trim_start();
     }
     let Some((implemented_trait, _)) = implemented.split_once(" for ") else {
+        return None;
+    };
+    Some(implemented_trait.trim())
+}
+
+fn is_row_kernel_declaration(declaration: &str) -> bool {
+    let Some(implemented_trait) = implemented_trait_from_declaration(declaration) else {
         return false;
     };
-    let implemented_trait = implemented_trait.trim();
     implemented_trait.starts_with("RowKernel<") || implemented_trait.contains("::RowKernel<")
+}
+
+fn is_sae_softmax_row_program_source_declaration(declaration: &str) -> bool {
+    let Some(implemented_trait) = implemented_trait_from_declaration(declaration) else {
+        return false;
+    };
+    implemented_trait == "SaeSoftmaxRowProgramSource"
+        || implemented_trait.ends_with("::SaeSoftmaxRowProgramSource")
 }
 
 fn generated_derivative_modes(declaration: &str) -> Option<(bool, bool)> {
@@ -5006,7 +5090,41 @@ fn generated_derivative_modes(declaration: &str) -> Option<(bool, bool)> {
     (third || fourth).then_some((third, fourth))
 }
 
+fn enforce_derivative_registry_invariants() {
+    for (index, specialization) in PRODUCTION_DERIVATIVE_SPECIALIZATIONS.iter().enumerate() {
+        assert!(
+            !specialization.production_sources.is_empty(),
+            "#932 policy self-test: {} has no registered production source",
+            specialization.family
+        );
+        assert!(
+            !specialization.parity_pins.is_empty(),
+            "#932 policy self-test: {} has no registered parity pin",
+            specialization.family
+        );
+        let discovery_anchor = normalized_rust_fragment(specialization.discovery_anchor);
+        assert!(
+            specialization
+                .production_sources
+                .iter()
+                .flat_map(|source| source.anchors.iter())
+                .any(|anchor| normalized_rust_fragment(anchor).contains(&discovery_anchor)),
+            "#932 policy self-test: {} discovery anchor is not owned by a production source",
+            specialization.family
+        );
+        assert!(
+            PRODUCTION_DERIVATIVE_SPECIALIZATIONS[index + 1..]
+                .iter()
+                .all(|other| other.family != specialization.family),
+            "#932 policy self-test: duplicate specialization family {}",
+            specialization.family
+        );
+    }
+}
+
 fn enforce_derivative_policy_negative_probes() {
+    enforce_derivative_registry_invariants();
+
     let comment_only = "// impl RowKernel<7> for CommentOnlyKernel";
     assert!(
         code_anchor_line_indices(comment_only, "impl RowKernel<7> for CommentOnlyKernel")
@@ -5062,6 +5180,31 @@ fn enforce_derivative_policy_negative_probes() {
     assert_eq!(
         unregistered_generated, 2,
         "#932 policy self-test: separate generated-third/fourth declarations were not both discovered"
+    );
+
+    let sae_source = "impl SaeSoftmaxRowProgramSource for PlantedSaeSource {}";
+    let sae_mask = compute_test_mask(sae_source, Path::new("crates/gam-sae/src/planted.rs"));
+    let sae_declarations = derivative_declarations(sae_source, &sae_mask);
+    assert!(
+        sae_declarations.iter().any(|declaration| {
+            is_sae_softmax_row_program_source_declaration(&declaration.source)
+                && !specialization_site_is_registered(
+                    DerivativeSpecializationKind::Bespoke,
+                    "crates/gam-sae/src/planted.rs",
+                    &declaration.source,
+                )
+        }),
+        "#932 policy self-test: an unregistered SAE softmax row-program source was not discovered"
+    );
+    let sae_bound = "fn planted<S: SaeSoftmaxRowProgramSource>(source: &S) {}";
+    let sae_bound_mask = compute_test_mask(sae_bound, Path::new("crates/gam-sae/src/planted.rs"));
+    assert!(
+        derivative_declarations(sae_bound, &sae_bound_mask)
+            .iter()
+            .all(|declaration| {
+                !is_sae_softmax_row_program_source_declaration(&declaration.source)
+            }),
+        "#932 policy self-test: an SAE source bound was mistaken for a trait implementation"
     );
 
     let retired = "fn planted_retired_identity() {}";
@@ -5180,6 +5323,33 @@ fn enforce_production_derivative_specializations(root: &Path) {
                 {
                     violations.push(format!(
                         "unregistered generated third/fourth row specialization at {rel_path}:{}: {}",
+                        declaration.line_index + 1,
+                        declaration.source
+                    ));
+                }
+            }
+        },
+    );
+
+    visit_files(
+        root,
+        &root.join("crates/gam-sae/src"),
+        &mut |rel, content| {
+            let rel_path = rel.to_string_lossy().replace('\\', "/");
+            if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+                return;
+            }
+            let test_mask = compute_test_mask(content, rel);
+            for declaration in derivative_declarations(content, &test_mask) {
+                if is_sae_softmax_row_program_source_declaration(&declaration.source)
+                    && !specialization_site_is_registered(
+                        DerivativeSpecializationKind::Bespoke,
+                        &rel_path,
+                        &declaration.source,
+                    )
+                {
+                    violations.push(format!(
+                        "unregistered production SAE softmax row-program source at {rel_path}:{}: {}",
                         declaration.line_index + 1,
                         declaration.source
                     ));

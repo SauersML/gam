@@ -107,13 +107,13 @@ fn end_row_jet_allocation_measurement() -> (u64, u64) {
 /// [`SaeReconstructionRowProgram`] from the SAME production inputs (the
 /// term's basis value/jacobian tensors, `atom_second_jets`, decoder
 /// blocks, gate logits/assignments, and the cache's own
-/// `row_vars_for_cache_row` primary layout) and compared column by
-/// column. The hand path sums sparse cross terms per (logit, coord)
-/// variable pair; the tower derives them by Leibniz from one expression —
-/// independent arithmetic, so agreement is a correctness proof of the
-/// production packing on a real converged state. The `weighted` arm
-/// exercises the #977 `set_row_loss_weights` √w seam, which scales every
-/// production channel by `sqrt(w_row)`.
+/// `row_vars_for_cache_row` primary layout) and compared column by column.
+/// Production lowers the borrowed inputs through the structure-compiled
+/// softmax schedule; the dense tower derives the same channels independently
+/// by Leibniz from one expression. Agreement therefore proves the live
+/// compiled packing on a real converged state. The `weighted` arm exercises
+/// the #977 `set_row_loss_weights` √w seam, which scales every production
+/// channel by `sqrt(w_row)`.
 #[test]
 pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache() {
     use crate::row_jet_program::{AtomRowBasisJet, RowGate, SaeReconstructionRowProgram};
@@ -198,8 +198,8 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                 }
             }
 
-            // Per-atom basis jets straight from the production tensors the
-            // hand path consumes: basis_values / basis_jacobian /
+            // Per-atom basis jets straight from the tensors consumed by the
+            // production compiled schedule: basis_values / basis_jacobian /
             // atom_second_jets / decoder_coefficients.
             let atoms: Vec<AtomRowBasisJet> = term
                 .atoms
@@ -289,10 +289,10 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                 }
             }
 
-            // β BORDER CHANNELS (#932): the hand path packs `beta`
+            // β BORDER CHANNELS (#932): the production schedule emits `beta`
             // (value ∂ẑ_c/∂β = ζ_k·Φ_b·output_c) and `beta_deriv` /
             // `beta_l_deriv` (the mixed ∂²ẑ_c/∂β∂p_a = ∂(ζ_k·Φ_b)/∂p_a·output_c)
-            // term by term in `row_jets_for_logdet`, with NO tower oracle
+            // from the same centered-moment source, with no tower oracle
             // previously. The arrow β coefficient multiplies the channel's
             // (frame / identity) `output` vector — NOT the current decoder
             // matrix — so the local-variable dependence is exactly
@@ -325,7 +325,7 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                         let d_floor = want_d.abs().max(1e-12);
                         // `beta_deriv` and `beta_l_deriv` are the SAME mixed
                         // ∂²ẑ_c/∂β∂p_a derivative the linear-in-β reconstruction
-                        // produces (the hand path fills both identically); both
+                        // produces (the schedule fills both identically); both
                         // must equal the tower's first-derivative channel × out_c.
                         assert!(
                             (jets.beta_deriv(a, beta_pos)[out_col] - want_d).abs()
@@ -532,11 +532,11 @@ fn row_jet_channel_error(actual: &SaeRowJets, expected: &LegacySaeRowJets) -> (f
     (max_abs, scale)
 }
 
-/// Full-output correctness + release timing gate against the exact pre-change
-/// production hand implementation.  The K sweep demonstrates the intended
-/// complexity change: hand `d2z` contraction O(L²KP) versus the compiled centered
-/// moment's output-optimal O(L²P), while all coordinate and beta channels remain
-/// present and are checked entry by entry.
+/// Full-output correctness + release timing gate against the exact historical
+/// production hand reference. The K sweep demonstrates the intended complexity
+/// change: hand `d2z` contraction O(L²KP) versus the compiled centered moment's
+/// output-optimal O(L²P), while all coordinate and beta channels remain present
+/// and are checked entry by entry.
 #[test]
 pub(crate) fn softmax_compiled_schedule_beats_hand_full_channels_932() {
     use std::time::{Duration, Instant};

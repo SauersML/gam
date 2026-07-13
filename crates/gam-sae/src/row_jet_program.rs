@@ -9,22 +9,22 @@
 //!   ẑ_row,c(p) = Σ_k ζ_k(ℓ) · decoded_{k,c}(t_k),   decoded_{k,c}(t) = Σ_b Φ_b(t)·B_{b,c}
 //! ```
 //!
-//! — a **gate nonlinearity** `ζ(ℓ)` (softmax / ordered Beta--Bernoulli sigmoid) composed with a
-//! **basis** `Φ(t)` composed with a **linear decoder** `B`, in the per-row
-//! primary coordinates `p = (gate logits ℓ, latent coordinates t)`. Today the
-//! arrow-Schur assembly (`SaeManifoldTerm::row_jets_for_logdet`) hand-packs the
-//! `first`/`second` channels of this reconstruction from separate gate
-//! derivative arrays (`gate_derivatives_for_row`) and basis jet tensors —
-//! exactly the kind of hand-maintained cross-block tower whose sign flips are
-//! the #736 / desync bug genus. The #1006 third-order logdet adjoint
-//! `Γ_a = tr(H⁻¹ ∂H/∂θ_a)` is the consumer of those very channels.
+//! — a **gate nonlinearity** `ζ(ℓ)` (softmax / ordered Beta--Bernoulli sigmoid)
+//! composed with a **basis** `Φ(t)` composed with a **linear decoder** `B`, in
+//! the per-row primary coordinates `p = (gate logits ℓ, latent coordinates t)`.
+//! Production derives the complete arrow-Schur `first`/`second` and decoder-
+//! border channels from this semantic program. Softmax rows use the borrowed
+//! [`SaeSoftmaxRowProgramSource`] and [`execute_softmax_row_program`] schedule;
+//! its bounded batch seam evaluates the same centered-moment identities on CPU
+//! or CUDA. Other gate graphs use [`SaeReconstructionRowProgram`] over the
+//! runtime jet algebra. The #1006 third-order logdet adjoint
+//! `Γ_a = tr(H⁻¹ ∂H/∂θ_a)` consumes those shared channels.
 //!
-//! This module writes that reconstruction **once** over the
-//! [`Tower4<K>`](gam_math::jet_tower::Tower4) scalar so the
-//! value/gradient/Hessian/third channels of one row come from ONE jet
-//! evaluation. [`SaeReconstructionRowProgram`] is generic over the gate kind
-//! and the per-row basis jets; the gate, basis and decoder compose with plain
-//! `Tower4` arithmetic, so there is no separate "channel" to forget.
+//! [`SaeReconstructionRowProgram`] is generic over the gate kind and per-row
+//! basis jets, so gate, basis, and decoder are still written once. Dense
+//! [`Tower4<K>`](gam_math::jet_tower::Tower4) evaluation remains an independent
+//! test oracle for the production order-≤2 lowerings and the higher derivative
+//! witnesses; it is not the softmax hot path.
 //!
 //! # The basis as a local jet
 //!
@@ -32,13 +32,11 @@
 //! function of perturbed coordinates: it consumes the precomputed jet tensors
 //! `(Φ, ∂Φ/∂t, ∂²Φ/∂t²)` evaluated at the current `t`. The reconstruction's
 //! dependence on `t` is therefore *defined* by those tensors — the local
-//! quadratic Taylor model of `Φ` about the current point. This program builds
-//! each basis function as exactly that `Tower4` quadratic from the stored jets,
-//! so the value/first/second channels it emits are the same object the hand
-//! path packs — derived by independent arithmetic (tower Leibniz / Faà di
-//! Bruno vs hand-summed cross terms). Agreement across both is a true
-//! correctness proof of the hand kernel; disagreement names a dropped or
-//! sign-flipped cross block loudly. That oracle is the riding test below.
+//! quadratic Taylor model of `Φ` about the current point. The generic runtime
+//! jet and dense `Tower4` oracle build exactly that quadratic; the compiled
+//! softmax schedule lowers it through centered moments. Tests compare both
+//! lowerings with a historical explicit cross-term reference, so a dropped or
+//! sign-flipped block is named independently rather than shared silently.
 
 use gam_math::jet_scalar::{
     DynamicJetArena, DynamicOrder1, DynamicOrder2, FixedRuntimeJet, Order1, Order2,
@@ -378,8 +376,8 @@ impl SaeReconstructionRowProgram {
     /// assignment modes (the production users of dynamic jets) have independent
     /// gates, so this evaluates the same [`Self::gate_tower`] expression once per
     /// atom and stores the handles in the row workspace. Softmax uses the same
-    /// path only as a dynamic correctness oracle; production softmax remains the
-    /// closed-form hand kernel.
+    /// path only as a dynamic correctness oracle; production softmax uses the
+    /// structure-compiled centered-moment schedule.
     fn all_gates_dynamic<'arena, S>(&self, arena: &'arena DynamicJetArena) -> &'arena [S]
     where
         S: RuntimeJetScalar<'arena, Workspace = DynamicJetArena>,
@@ -1272,12 +1270,12 @@ mod tests {
     // itself is no longer named here, so only JetField is imported.
     use gam_math::nested_dual::JetField;
 
-    /// Replicate the production hand path (`row_jets_for_logdet`) arithmetic for
-    /// the reconstruction `first`/`second` channels of ONE output column, from
-    /// the same atom jets and softmax gate derivatives — independent code from
-    /// the tower. The two must agree to machine precision; this is the #932
-    /// universal oracle for the SAE row program (the analog of the survival
-    /// `rigid_row_kernel_agrees_with_jet_tower_program` oracle).
+    /// Replicate the historical hand path formerly used by `row_jets_for_logdet`
+    /// for the reconstruction `first`/`second` channels of one output column.
+    /// It starts from the same atom jets and explicit softmax derivatives but is
+    /// independent of both the generic tower and the production compiled
+    /// schedule. Agreement makes it the #932 historical oracle for the SAE row
+    /// program (the analog of the survival RowKernel oracle).
     struct HandChannels {
         first: Vec<f64>,       // [primary]
         second: Vec<Vec<f64>>, // [primary][primary]
@@ -1285,7 +1283,7 @@ mod tests {
     }
 
     /// Softmax gate first/second derivatives wrt logit primaries, term-for-term
-    /// the production `gate_derivatives_for_row` softmax branch.
+    /// the retired `gate_derivatives_for_row` softmax branch.
     fn softmax_gate_derivs(gate: &[f64], inv_tau: f64) -> (Vec<Vec<f64>>, Vec<Vec<Vec<f64>>>) {
         let k = gate.len();
         // dz[j][kk] = ∂ζ_kk/∂ℓ_j ; d2z[j][l][kk] = ∂²ζ_kk/∂ℓ_j∂ℓ_l.
@@ -1313,9 +1311,9 @@ mod tests {
         (dz, d2z)
     }
 
-    /// Hand-pack the reconstruction column channels exactly as the production
-    /// `row_jets_for_logdet` does for a softmax gate: gate-logit primaries first
-    /// (one per atom), then each atom's latent coords.
+    /// Hand-pack the reconstruction column channels exactly as the former
+    /// `row_jets_for_logdet` softmax path did: gate-logit primaries first (one
+    /// per atom), then each atom's latent coordinates.
     fn hand_softmax_column(
         prog: &SaeReconstructionRowProgram,
         out_col: usize,
@@ -1577,10 +1575,10 @@ mod tests {
         }
     }
 
-    /// #932 correctness gate: the production packed jet recon
+    /// #932 correctness gate: the generic packed jet reconstruction
     /// ([`SaeReconstructionRowProgram::reconstruction_all_columns_packed`], gate +
     /// basis jets HOISTED out of the column loop, softmax denom/recip SHARED) and
-    /// the per-column packed call must each reproduce the hand path
+    /// and the per-column packed call must each reproduce the historical hand path
     /// ([`hand_softmax_column`], the old `row_jets_for_logdet` closed-form softmax
     /// gate Jacobian/Hessian × decoded basis, re-derived per output column) on
     /// value/grad/Hessian — the #932 bit-identity bar. (The ns/row timing
