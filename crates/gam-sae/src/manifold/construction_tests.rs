@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::manifold::tests::gamma_fd_tiny_fixture;
 
 #[cfg(test)]
