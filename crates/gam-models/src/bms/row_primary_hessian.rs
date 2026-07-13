@@ -7,7 +7,8 @@ use super::exact_eval_cache::*;
 use super::family::*;
 use super::flex_row_program::{
     BmsFlexCalibrationOrder2Node, BmsFlexCalibrationOrder3Node, BmsFlexCalibrationOrder4Node,
-    BmsFlexProgramPoint, BmsFlexRowOrder2FinalizerNode, BmsFlexRowProgram,
+    BmsFlexProgramPoint, BmsFlexRowOrder2FinalizerNode, BmsFlexRowOrder3FinalizerNode,
+    BmsFlexRowProgram,
 };
 use super::gradient_paths::*;
 use super::hessian_paths::*;
@@ -4014,40 +4015,8 @@ impl BernoulliMarginalSlopeFamily {
 
         f_u[0] = -marginal.mu1;
         f_uv[[0, 0]] = -marginal.mu2;
-        f_uv_dir[[0, 0]] = -dir[0] * marginal.mu3;
 
         let inv_f_a = 1.0 / f_a;
-        let mut a_u = Array1::<f64>::zeros(r);
-        for u in 0..r {
-            a_u[u] = -f_u[u] * inv_f_a;
-        }
-        let mut a_uv = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let val =
-                    -(f_uv[[u, v]] + f_au[u] * a_u[v] + f_au[v] * a_u[u] + f_aa * a_u[u] * a_u[v])
-                        * inv_f_a;
-                a_uv[[u, v]] = val;
-                a_uv[[v, u]] = val;
-            }
-        }
-        let a_dir = a_u.dot(dir);
-        let a_u_dir = a_uv.dot(dir);
-        let mut a_uv_dir = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let n_dir = f_uv_dir[[u, v]]
-                    + f_au_dir[u] * a_u[v]
-                    + f_au[u] * a_u_dir[v]
-                    + f_au_dir[v] * a_u[u]
-                    + f_au[v] * a_u_dir[u]
-                    + f_aa_dir * a_u[u] * a_u[v]
-                    + f_aa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v]);
-                let val = -(n_dir + f_a_dir * a_uv[[u, v]]) * inv_f_a;
-                a_uv_dir[[u, v]] = val;
-                a_uv_dir[[v, u]] = val;
-            }
-        }
 
         let z_obs = self.z[row];
         let u_obs = a + b * z_obs;
