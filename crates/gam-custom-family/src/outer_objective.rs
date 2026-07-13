@@ -209,10 +209,12 @@ pub(crate) fn outer_efs_result_to_joint_hyper_efs_result(
     efs_eval: gam_problem::EfsEval,
     warm_start: ConstrainedWarmStart,
     inner_converged: bool,
+    hyper_values: Array1<f64>,
 ) -> CustomFamilyJointHyperEfsResult {
     CustomFamilyJointHyperEfsResult {
         efs_eval,
         warm_start: CustomFamilyWarmStart { inner: warm_start },
+        hyper_values,
         inner_converged,
     }
 }
