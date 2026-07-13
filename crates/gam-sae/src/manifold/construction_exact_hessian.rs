@@ -1009,4 +1009,112 @@ impl SaeManifoldTerm {
             third_order_correction,
         })
     }
+
+    /// PATH C channel — exact fixed-stratum second derivative of the
+    /// SOLVER-FREE explicit outer-gradient channels: the decoder-smoothness
+    /// penalty energy (with its Occam renormalization to `loss.smoothness`) and
+    /// the ARD log-precision prior. The rank-charge `direct_rho`, assignment
+    /// log-strength, log-determinant traces, and third-order IFT channels are
+    /// each assembled by their own methods; this one deliberately covers only
+    /// the two channels that are closed forms of ρ at a frozen inner state
+    /// (`atoms`, `assignment`) and touch no `H⁻¹`/`A⁺` solve, so it needs no
+    /// cache and its FD gate is self-contained.
+    ///
+    /// Math (all at fixed stratum, `s = log α`, `f_k = ⟨B_k, S_k B_k⟩` frozen):
+    /// * Smoothness. The gradient renormalizes the per-atom penalty energy
+    ///   `se_k = ½ λ_k f_k` to the frozen scalar `C = loss.smoothness`, i.e.
+    ///   `g_k = C · se_k / Σ_m se_m`. With `∂se_k/∂ρ_j = δ_{jk} se_k` (each `se`
+    ///   is degree-one in its own `λ`), holding `C` frozen gives the symmetric
+    ///   rank-structured block
+    ///   `∂²/∂ρ_i∂ρ_j = (C/Σ)·(δ_{ij} se_i − se_i se_j / Σ)` — NOT diagonal: the
+    ///   shared normalizer couples every pair of smoothing atoms. (When `Σ` is
+    ///   zero the gradient leaves the energy unrenormalized, `g_k = se_k`, whose
+    ///   second derivative is the plain diagonal `δ_{ij} se_i`.)
+    /// * ARD. Per `(atom, axis)` the gradient is `energy_deriv + normalizer_deriv`
+    ///   with `energy_deriv = Σ_i w_i · V(α, t_i)` (degree-one in `α`, so its own
+    ///   `∂/∂s` is itself) and a normalizer that is `−½ n_eff` (constant → zero
+    ///   second derivative) on a Euclidean axis and `n_eff · d1(log η)` on a
+    ///   periodic axis, `log η = log α + 2(log p − log τ)`. The periodic
+    ///   second derivative is therefore `energy_deriv + n_eff · c''(log η)` with
+    ///   `c''` the stable [`gam_math::special::bessel_i0_centered_second_log_derivative_from_log_abs`].
+    ///   ARD axes are mutually independent, so the block is diagonal here; a
+    ///   shared-ARD coordinate owned by several atoms accumulates their diagonals
+    ///   (chain rule through the broadcast), matching the gradient's `+=`.
+    /// * Occam. `reml_occam_log_lambda_smooth_derivative` is a ρ-independent
+    ///   half-integer channel dimension, so it contributes nothing here.
+    ///
+    /// `frozen_smoothness_energy` is the criterion's reported `loss.smoothness`
+    /// at the fixed stratum (equal to `Σ_m se_m` on the full-batch path; a
+    /// minibatch `penalty_scale` folded into it is preserved exactly by the
+    /// `C/Σ` renormalization).
+    pub(crate) fn outer_explicit_smoothness_ard_hessian(
+        &self,
+        rho: &SaeManifoldRho,
+        frozen_smoothness_energy: f64,
+    ) -> Result<Array2<f64>, String> {
+        self.assignment.validate_rho_domain(rho)?;
+        let n_params = rho.to_flat().len();
+        let mut hessian = Array2::<f64>::zeros((n_params, n_params));
+
+        // Decoder-smoothness penalty energy with its Occam renormalization.
+        let lambda_smooth = rho.lambda_smooth_vec()?;
+        let smooth_energy = self.decoder_smoothness_value_per_atom(&lambda_smooth);
+        let energy_sum: f64 = smooth_energy.iter().sum();
+        let k_smooth = rho.log_lambda_smooth.len();
+        if energy_sum.abs() > 0.0 {
+            let renorm = frozen_smoothness_energy / energy_sum;
+            for a in 0..k_smooth {
+                let ia = rho.smooth_flat_index(a);
+                for b in 0..k_smooth {
+                    let ib = rho.smooth_flat_index(b);
+                    let diagonal = if a == b { smooth_energy[a] } else { 0.0 };
+                    hessian[[ia, ib]] +=
+                        renorm * (diagonal - smooth_energy[a] * smooth_energy[b] / energy_sum);
+                }
+            }
+        } else {
+            for a in 0..k_smooth {
+                let ia = rho.smooth_flat_index(a);
+                hessian[[ia, ia]] += smooth_energy[a];
+            }
+        }
+
+        // ARD log-precision prior (diagonal per coordinate; shared axes sum).
+        let ard_precisions = self.validated_ard_precisions(rho)?;
+        let row_w = self.row_loss_weights.as_deref();
+        let n = self.n_obs() as f64;
+        let n_eff = row_w.map_or(n, |w| w.iter().sum::<f64>());
+        for (atom_idx, coord) in self.assignment.coords.iter().enumerate() {
+            if rho.log_ard[atom_idx].is_empty() {
+                continue;
+            }
+            let periods = coord.effective_axis_periods();
+            for axis in 0..coord.latent_dim() {
+                let alpha = ard_precisions[atom_idx][axis];
+                let log_alpha = rho.log_ard[atom_idx][axis];
+                let period = periods[axis];
+                let mut energy_deriv = 0.0_f64;
+                for row in 0..coord.n_obs() {
+                    let w_row = row_w.map_or(1.0, |w| w[row]);
+                    let t = coord.row(row)[axis];
+                    energy_deriv += w_row * ArdAxisPrior::eval(alpha, t, period).value;
+                }
+                let normalizer_second = match period {
+                    None => 0.0,
+                    Some(p) => {
+                        let log_eta =
+                            log_alpha + 2.0 * (p.ln() - std::f64::consts::TAU.ln());
+                        n_eff
+                            * gam_math::special::bessel_i0_centered_second_log_derivative_from_log_abs(
+                                log_eta,
+                            )
+                    }
+                };
+                let idx = rho.ard_flat_index(atom_idx, axis);
+                hessian[[idx, idx]] += energy_deriv + normalizer_second;
+            }
+        }
+
+        Ok(hessian)
+    }
 }

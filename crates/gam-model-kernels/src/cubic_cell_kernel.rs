@@ -4719,6 +4719,33 @@ mod tests {
         }
     }
 
+    /// #2293 regression at the exact failure boundary: the affine primitive
+    /// must propagate a BVN-domain error instead of substituting the plausible
+    /// probability `0.0`. This calls the private primitive directly so the
+    /// public cell validator below cannot intercept the malformed state first;
+    /// restoring `unwrap_or(0.0)` would make these cases return `Ok(0.0)` and
+    /// fail this test.
+    #[test]
+    fn affine_value_primitive_propagates_bvn_errors_2293() {
+        for (case, result) in [
+            (
+                "non-finite standardized threshold",
+                affine_value_from_moment_primitive(f64::NAN, -0.35, -0.9, 0.8),
+            ),
+            (
+                "non-finite integration bound",
+                affine_value_from_moment_primitive(0.15, -0.35, f64::NAN, 0.8),
+            ),
+        ] {
+            let error = result.expect_err(case);
+            assert!(!error.is_empty(), "{case} must retain its BVN diagnostic");
+        }
+    }
+
+    /// Public evaluators must reject malformed cells at their validation
+    /// boundary. This is intentionally separate from
+    /// `affine_value_primitive_propagates_bvn_errors_2293`, which bypasses that
+    /// boundary to pin the internal `Result` propagation itself.
     #[test]
     fn affine_cell_errors_are_never_substituted_with_probability_zero_2293() {
         let base = DenestedCubicCell {
