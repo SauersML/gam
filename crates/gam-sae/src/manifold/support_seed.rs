@@ -8,7 +8,7 @@
 
 use crate::assignment_state::{SaeAssignmentAtomSpec, SaeAssignmentState};
 use crate::front_door::{SaeFitAdmission, SaeFitLane};
-use ndarray::ArrayView2;
+use ndarray::{Array2, Array3, ArrayView2, s};
 
 use super::{SaeAtomBasisKind, sae_atom_basis_kind_from_str};
 
@@ -29,6 +29,21 @@ pub struct SaeSupportSeedReport {
     pub effective_atom_dim: Vec<usize>,
     /// Maximum atom-score cells retained simultaneously, independent of `K`.
     pub peak_score_cells: usize,
+}
+
+pub struct SaeSupportTermSeedRequest {
+    pub assignment: SaeAssignmentState,
+    pub atom_basis: Vec<String>,
+    /// Public dimensions (periodic entries are harmonic resolution, matching
+    /// the dense planner); the assignment carries effective chart dimensions.
+    pub atom_dim: Vec<usize>,
+    pub output_dim: usize,
+    pub random_state: u64,
+}
+
+pub struct SaeSupportTermSeedReport {
+    pub term: super::SaeSupportSparseTerm,
+    pub atom_plans: Vec<super::SaeAtomBuildPlan>,
 }
 
 #[derive(Clone, Copy)]
@@ -287,6 +302,190 @@ pub fn build_sae_support_seed(
         effective_atom_dim,
         peak_score_cells: request.support_k,
     })
+}
+
+fn bounded_atom_chart_samples(
+    assignment: &SaeAssignmentState,
+    atom: usize,
+    seed_width: usize,
+    wanted: usize,
+    random_state: u64,
+) -> Array2<f64> {
+    let effective_dim = assignment.atom_coord_dim(atom);
+    let mut observed = Vec::<Vec<f64>>::new();
+    for row in 0..assignment.n_obs() {
+        if let Ok(slot) = assignment.support_indices(row).binary_search(&(atom as u32)) {
+            observed.push(assignment.coords_for_slot(row, slot).to_vec());
+        }
+    }
+    let mut means = vec![0.0; effective_dim];
+    for sample in &observed {
+        for axis in 0..effective_dim {
+            means[axis] += sample[axis];
+        }
+    }
+    if !observed.is_empty() {
+        for mean in &mut means {
+            *mean /= observed.len() as f64;
+        }
+    }
+    let mut scales = vec![1.0; effective_dim];
+    if observed.len() > 1 {
+        for axis in 0..effective_dim {
+            let variance = observed
+                .iter()
+                .map(|sample| (sample[axis] - means[axis]).powi(2))
+                .sum::<f64>()
+                / observed.len() as f64;
+            if variance.is_finite() && variance > f64::EPSILON {
+                scales[axis] = variance.sqrt();
+            }
+        }
+    }
+    let rows = wanted.max(1);
+    let mut out = Array2::<f64>::zeros((rows, seed_width));
+    let retained = observed.len().min(rows);
+    let retained_indices = sae_pick_duchon_center_indices(
+        observed.len(),
+        retained,
+        random_state.wrapping_add(atom as u64),
+    );
+    for (row, source) in retained_indices.into_iter().enumerate() {
+        for axis in 0..effective_dim {
+            out[[row, axis]] = observed[source][axis];
+        }
+    }
+    for row in retained..rows {
+        for axis in 0..seed_width {
+            let hash = splitmix64(
+                random_state
+                    ^ (atom as u64).wrapping_mul(0xd6e8_feb8_6659_fd93)
+                    ^ (row as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    ^ (axis as u64).wrapping_mul(0xa5a3_564e_27f8_864d),
+            );
+            let unit = ((hash >> 11) as f64) * (1.0 / ((1_u64 << 53) as f64));
+            if axis < effective_dim {
+                out[[row, axis]] = means[axis] + scales[axis] * (2.0 * unit - 1.0);
+            } else {
+                out[[row, axis]] = 2.0 * unit - 1.0;
+            }
+        }
+    }
+    out
+}
+
+/// Build analytic atom templates from a support seed one atom at a time. The
+/// largest observation-indexed allocation is one `(1, M_k, d_k)` basis jet;
+/// no K-wide observation tensor is constructed.
+pub fn build_sae_support_term_seed(
+    request: SaeSupportTermSeedRequest,
+) -> Result<SaeSupportTermSeedReport, String> {
+    let k_atoms = request.assignment.k_atoms();
+    if request.atom_basis.len() != k_atoms || request.atom_dim.len() != k_atoms {
+        return Err(format!(
+            "build_sae_support_term_seed: metadata lengths basis={}, dims={} must equal K={k_atoms}",
+            request.atom_basis.len(),
+            request.atom_dim.len()
+        ));
+    }
+    if request.output_dim == 0 {
+        return Err("build_sae_support_term_seed: output_dim must be positive".into());
+    }
+    let mut atoms = Vec::with_capacity(k_atoms);
+    let mut atom_plans = Vec::with_capacity(k_atoms);
+    for atom in 0..k_atoms {
+        let effective_dim = request.assignment.atom_coord_dim(atom);
+        let public_dim = request.atom_dim[atom];
+        let kind = sae_atom_basis_kind_from_str(&request.atom_basis[atom]);
+        let design_rows = if matches!(
+            kind,
+            SaeAtomBasisKind::Duchon
+                | SaeAtomBasisKind::Linear
+                | SaeAtomBasisKind::EuclideanPatch
+                | SaeAtomBasisKind::Poincare
+        ) {
+            32
+        } else {
+            1
+        };
+        // `sae_build_atom_plans` interprets periodic public_dim as harmonic
+        // order before reducing to a 1-D chart, so its temporary seed width
+        // must cover both the public and effective dimensions.
+        let seed_width = public_dim.max(effective_dim);
+        let chart_samples = bounded_atom_chart_samples(
+            &request.assignment,
+            atom,
+            seed_width,
+            design_rows,
+            request.random_state,
+        );
+        let mut plan_seed = Array3::<f64>::zeros((1, design_rows, seed_width));
+        plan_seed.slice_mut(s![0, .., ..]).assign(&chart_samples);
+        let dummy_target = Array2::<f64>::zeros((design_rows, 1));
+        let mut plans = sae_build_atom_plans(
+            dummy_target.view(),
+            std::slice::from_ref(&request.atom_basis[atom]),
+            std::slice::from_ref(&public_dim),
+            plan_seed.view(),
+            request.random_state.wrapping_add(atom as u64),
+            &[None],
+        )?;
+        let plan = plans
+            .pop()
+            .ok_or_else(|| "build_sae_support_term_seed: atom planner returned no plan".to_string())?;
+        if plan.latent_dim != effective_dim {
+            return Err(format!(
+                "build_sae_support_term_seed: atom {atom} plan latent dim {} != sparse state dim {effective_dim}",
+                plan.latent_dim
+            ));
+        }
+        let mut probe_seed = Array3::<f64>::zeros((1, 1, effective_dim));
+        for axis in 0..effective_dim {
+            probe_seed[[0, 0, axis]] = chart_samples[[0, axis]];
+        }
+        let (phi_stack, jet_stack, penalty_stack, basis_sizes, coord_blocks) =
+            sae_build_padded_basis_stacks(std::slice::from_ref(&plan), probe_seed.view(), 1)?;
+        let evaluators = build_sae_basis_evaluators(
+            std::slice::from_ref(&plan.kind),
+            &basis_sizes,
+            std::slice::from_ref(&effective_dim),
+            &coord_blocks,
+            std::slice::from_ref(&plan.duchon_centers),
+        )?;
+        let evaluator = evaluators
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| format!("build_sae_support_term_seed: atom {atom} has no evaluator"))?;
+        let m = basis_sizes[0];
+        let phi = phi_stack.slice(s![0, 0..1, 0..m]).to_owned();
+        let jet = jet_stack
+            .slice(s![0, 0..1, 0..m, 0..effective_dim])
+            .to_owned();
+        let reference = if matches!(kind, SaeAtomBasisKind::Poincare) {
+            SaeReferenceRoughness::PoincareConformalDirichlet {
+                reference_coords: coord_blocks[0].clone(),
+            }
+        } else {
+            SaeReferenceRoughness::ProvidedFunctionGram(
+                penalty_stack.slice(s![0, 0..m, 0..m]).to_owned(),
+            )
+        };
+        let atom_template = SaeManifoldAtom::new(
+            format!("atom_{atom}"),
+            kind,
+            effective_dim,
+            phi,
+            jet,
+            Array2::<f64>::zeros((m, request.output_dim)),
+            reference,
+        )?
+        .with_basis_second_jet(evaluator);
+        atoms.push(atom_template);
+        atom_plans.push(plan);
+    }
+    let term = super::SaeSupportSparseTerm::new(atoms, request.assignment)?;
+    Ok(SaeSupportTermSeedReport { term, atom_plans })
 }
 
 #[cfg(test)]
