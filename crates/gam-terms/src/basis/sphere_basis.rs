@@ -3536,9 +3536,19 @@ mod wahba_penalty_invariants_tests {
             .expect("metric construction")
             .expect("Wahba low-degree null space");
 
-        let null = generalized_nullspace_basis(&penalty, &gram, "Wahba test")
-            .expect("generalized null frame")
-            .expect("nonempty null frame");
+        // The decomposed Wahba chart is `[kernel | low degree]`, and the
+        // primary RKHS seminorm has an exact zero block on the appended
+        // low-degree columns.  Exercise those structural null directions
+        // directly instead of reaching into the sibling B-spline module's
+        // private generalized-eigensolver (which is an implementation detail
+        // of the ridge constructor being tested).
+        let low_degree = decomposition.low_degree_cols;
+        assert!(low_degree > 0, "fixture must retain low-degree harmonics");
+        let mut null = Array2::<f64>::zeros((penalty.nrows(), low_degree));
+        let low_degree_start = penalty.nrows() - low_degree;
+        for column in 0..low_degree {
+            null[[low_degree_start + column, column]] = 1.0;
+        }
         let metric_action_error = (&ridge.dot(&null) - &gram.dot(&null))
             .iter()
             .map(|value| value.abs())
