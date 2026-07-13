@@ -2701,8 +2701,7 @@ impl BinomialLocationScaleWiggleFamily {
             return Ok(None);
         };
         let program = BinomialLocationScaleWiggleRowProgram::new(self, block_states, 3)?;
-        let layout =
-            GamlssBetaLayout::withwiggle(x_t.ncols(), x_ls.ncols(), program.beta_w.len());
+        let layout = GamlssBetaLayout::withwiggle(x_t.ncols(), x_ls.ncols(), program.beta_w.len());
         let (u_t, u_ls, u_w) = layout.split_three(d_beta_flat, "expected wiggle d_beta")?;
         let d_eta_t = fast_av(&x_t, &u_t);
         let d_eta_ls = fast_av(&x_ls, &u_ls);
@@ -2730,12 +2729,9 @@ impl BinomialLocationScaleWiggleFamily {
             return Ok(None);
         };
         let program = BinomialLocationScaleWiggleRowProgram::new(self, block_states, 4)?;
-        let layout =
-            GamlssBetaLayout::withwiggle(x_t.ncols(), x_ls.ncols(), program.beta_w.len());
-        let (u_t, u_ls, u_w) =
-            layout.split_three(d_beta_u_flat, "expected wiggle d_beta_u")?;
-        let (v_t, v_ls, v_w) =
-            layout.split_three(d_beta_v_flat, "expected wiggle d_beta_v")?;
+        let layout = GamlssBetaLayout::withwiggle(x_t.ncols(), x_ls.ncols(), program.beta_w.len());
+        let (u_t, u_ls, u_w) = layout.split_three(d_beta_u_flat, "expected wiggle d_beta_u")?;
+        let (v_t, v_ls, v_w) = layout.split_three(d_beta_v_flat, "expected wiggle d_beta_v")?;
         let d_eta_t_u = fast_av(&x_t, &u_t);
         let d_eta_ls_u = fast_av(&x_ls, &u_ls);
         let d_eta_t_v = fast_av(&x_t, &v_t);
