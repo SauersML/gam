@@ -1179,8 +1179,8 @@ pub(crate) fn exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
 
 /// Add the exact per-block and joint penalties to an owned returned-beta
 /// likelihood Hessian. This coefficient-space precision is shared by
-/// covariance and EDF; it is deliberately separate from `FitGeometry`, whose
-/// row-wise working-data contract cannot be inferred from a Hessian alone.
+/// covariance, EDF, and `FitGeometry`; optional row evidence remains a
+/// separate field and is never inferred from this matrix.
 pub(crate) fn penalized_hessian_from_owned_mode(
     specs: &[ParameterBlockSpec],
     per_block_log_lambdas: &[Array1<f64>],
@@ -1352,7 +1352,8 @@ pub(crate) fn compute_joint_covariance_required<F: CustomFamily + Clone + Send +
     })
 }
 
-/// Compute joint working-set geometry at convergence for ALO diagnostics.
+/// Compute terminal coefficient geometry, with optional single-diagonal row
+/// evidence for consumers such as ALO.
 pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -1361,123 +1362,101 @@ pub(crate) fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'st
     options: &BlockwiseFitOptions,
     preferred_unpenalized_hessian: Option<&Array2<f64>>,
     preferred_working_sets: Option<&[BlockWorkingSet]>,
-) -> Result<Option<FitGeometry>, String> {
+) -> Result<FitGeometry, String> {
     if specs.len() != per_block_log_lambdas.len() {
-        return Ok(None);
+        return Err(format!(
+            "terminal geometry has {} parameter blocks but {} per-block smoothing vectors",
+            specs.len(),
+            per_block_log_lambdas.len(),
+        ));
     }
-    if specs.len() == 1 {
-        let spec = &specs[0];
-        let lambdas = exact_lambdas_from_log_strengths(
-            &per_block_log_lambdas[0],
-            "single-block geometry log strength",
-        )?;
-        // The penalized joint Hessian `H_pen = H_lik + Σ_k λ_k S_k` is the exact
-        // mgcv quantity the trace edf `p − Σ_k λ_k·tr(H_pen⁻¹ S_k)` consumes. Two
-        // single-block working-set shapes reach here:
-        //
-        // * `Diagonal` — IRLS/GLM families expose only the diagonal working
-        //   weights, so the likelihood curvature is reconstructed as the
-        //   Gauss–Newton gram `XᵀWX`.
-        // * `ExactNewton` — coefficient-space exact curvature has no paired
-        //   score-side IRLS row measure, so it cannot populate `FitGeometry`.
-        //   Its owned Hessian feeds covariance and EDF through separate typed
-        //   coefficient-space channels.
-        let (mut h, working_weights, working_response) = if let Some(hessian) =
-            preferred_unpenalized_hessian
-        {
-            let p = spec.design.ncols();
-            if hessian.dim() != (p, p) || hessian.iter().any(|value| !value.is_finite()) {
-                return Err(format!(
-                    "preferred single-block geometry Hessian must be finite with shape {p}x{p}, got {}x{}",
-                    hessian.nrows(),
-                    hessian.ncols(),
-                ));
-            }
-            match preferred_working_sets {
-                Some([
-                    BlockWorkingSet::Diagonal {
-                        working_response,
-                        working_weights,
-                    },
-                ]) => (
-                    hessian.clone(),
-                    working_weights.clone(),
-                    working_response.clone(),
-                ),
-                // Exact coefficient curvature is sufficient for covariance
-                // and EDF, but it does not imply an IRLS row measure. Never
-                // mint ALO geometry from empty or zero pseudo-data.
-                Some([BlockWorkingSet::ExactNewton { .. }]) => return Ok(None),
-                None => return Ok(None),
-                Some(_) => return Ok(None),
-            }
-        } else {
-            let eval = family.evaluate(states).ok();
-            let Some(eval) = eval else {
-                return Ok(None);
-            };
-            match eval.blockworking_sets.as_slice() {
-                [
-                    BlockWorkingSet::Diagonal {
-                        working_response,
-                        working_weights,
-                    },
-                ] => {
-                    let h = spec.design.xt_diag_x_signed_op(
-                        FiniteSignedWeightsView::try_from_array(working_weights)?,
-                    )?;
-                    (h, working_weights.clone(), working_response.clone())
-                }
-                [BlockWorkingSet::ExactNewton { hessian, .. }] => {
-                    let h = hessian.to_dense();
-                    if h.nrows() != spec.design.ncols() || h.ncols() != spec.design.ncols() {
-                        return Ok(None);
-                    }
-                    // `FitGeometry` promises paired score-side IRLS row data;
-                    // exact coefficient curvature alone does not provide it.
-                    return Ok(None);
-                }
-                _ => return Ok(None),
-            }
-        };
-        for (k, s) in spec.penalties.iter().enumerate() {
-            let s_dense = s.as_dense_cow();
-            h.scaled_add(lambdas[k], &*s_dense);
-        }
-        // gam#1587/#561: add the full-width JOINT penalty (the multinomial
-        // centered `Σ_t λ_t (M ⊗ S_t)`) at the selected `ρ_t` so the exported
-        // geometry's penalized Hessian matches the inner-converged operator and
-        // the trace EDF `tr(H⁻¹ S_λ)` is non-zero. No-op for per-block-only
-        // families. (Single-block joint penalties are unusual but handled for
-        // symmetry with the multi-block branch.)
-        if let Some(bundle) = options.joint_penalties.as_deref()
-            && !bundle.is_empty()
-            && h.nrows() == bundle.specs()[0].dim()
-        {
-            bundle.add_to_matrix(&mut h);
-        }
-        // Exact-Newton families may return a Hessian assembled from directional
-        // callbacks whose off-diagonal entries differ by floating-point order
-        // or, for pseudo-Laplace tests, by a deliberately non-symmetric input
-        // that is accepted only after symmetrization. Export the same symmetric
-        // penalized Hessian used by the determinant/covariance path instead of
-        // letting result assembly reject an otherwise valid fit geometry.
-        symmetrize_dense_in_place(&mut h);
-        return Ok(Some(FitGeometry {
-            coefficient_gauge: gam_problem::gauge::Gauge::identity(&[spec.design.ncols()]),
-            penalized_hessian: h.into(),
-            working_weights,
-            working_response,
-        }));
+    if let Some(working_sets) = preferred_working_sets
+        && working_sets.len() != specs.len()
+    {
+        return Err(format!(
+            "terminal geometry has {} parameter blocks but {} owned working sets",
+            specs.len(),
+            working_sets.len(),
+        ));
     }
 
-    // `FitGeometry` owns one paired score-side row measure. Multiple parameter
-    // blocks may have different working responses/weights and therefore cannot
-    // be encoded truthfully in that type. Their owned joint Hessian still feeds
-    // covariance and EDF through separate coefficient-space channels; ALO
-    // geometry remains explicitly unavailable until it has a typed multi-block
-    // representation.
-    Ok(None)
+    let total = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+    let unpenalized_hessian = if let Some(hessian) = preferred_unpenalized_hessian {
+        hessian.clone()
+    } else {
+        exact_newton_joint_hessian_symmetrized(
+            family,
+            states,
+            specs,
+            total,
+            "terminal coefficient geometry Hessian shape mismatch",
+        )?
+        .ok_or_else(|| {
+            "terminal coefficient geometry requires an exact analytic Hessian; objective perturbation and placeholder geometry are forbidden"
+                .to_string()
+        })?
+    };
+    let penalized_hessian = penalized_hessian_from_owned_mode(
+        specs,
+        per_block_log_lambdas,
+        options,
+        &unpenalized_hessian,
+    )?;
+
+    // A single diagonal working set is the only live row-wise contract. A
+    // multi-block fit has several distinct row measures, and Exact-Newton
+    // curvature lives in coefficient space; both therefore retain `None`
+    // rather than fabricated empty/zero vectors or an unused stacked variant.
+    let working = if specs.len() == 1 {
+        let evaluated;
+        let working_sets = match preferred_working_sets {
+            Some(working_sets) => working_sets,
+            None => {
+                evaluated = family.evaluate(states)?;
+                evaluated.blockworking_sets.as_slice()
+            }
+        };
+        match working_sets {
+            [BlockWorkingSet::Diagonal {
+                working_response,
+                working_weights,
+            }] => {
+                let expected_rows = specs[0].design.nrows();
+                if working_weights.len() != expected_rows
+                    || working_response.len() != expected_rows
+                {
+                    return Err(format!(
+                        "single-diagonal terminal working geometry has weights/response lengths {}/{}, expected {expected_rows}",
+                        working_weights.len(),
+                        working_response.len(),
+                    ));
+                }
+                Some(WorkingGeometry {
+                    working_weights: working_weights.clone(),
+                    working_response: working_response.clone(),
+                })
+            }
+            [BlockWorkingSet::ExactNewton { .. }] => None,
+            _ => {
+                return Err(format!(
+                    "single-block terminal geometry requires exactly one owned working set, got {}",
+                    working_sets.len(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    let block_widths = specs
+        .iter()
+        .map(|spec| spec.design.ncols())
+        .collect::<Vec<_>>();
+    Ok(FitGeometry {
+        coefficient_gauge: gam_problem::gauge::Gauge::identity(&block_widths),
+        penalized_hessian: penalized_hessian.into(),
+        working,
+    })
 }
 
 pub(crate) fn joint_penalty_subspace_trace_parts(

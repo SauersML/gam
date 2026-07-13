@@ -95,8 +95,10 @@ pub(crate) fn blockwise_fit_from_parts_accepts_stacked_solver_eta_with_canonical
             geometry: Some(FitGeometry {
                 coefficient_gauge: gam_problem::gauge::Gauge::identity(&[1]),
                 penalized_hessian: Array2::eye(1).into(),
-                working_weights: Array1::ones(2),
-                working_response: Array1::zeros(2),
+                working: Some(WorkingGeometry {
+                    working_weights: Array1::ones(2),
+                    working_response: Array1::zeros(2),
+                }),
             }),
             precomputed_edf: Some((1.0, Vec::new(), vec![1.0], Vec::new())),
             joint_log_lambdas: None,
@@ -106,7 +108,17 @@ pub(crate) fn blockwise_fit_from_parts_accepts_stacked_solver_eta_with_canonical
     .expect("stacked solver eta should assemble against canonical geometry rows");
 
     assert_eq!(fit.block_states[0].eta.len(), 6);
-    assert_eq!(fit.geometry.as_ref().unwrap().working_weights.len(), 2);
+    assert_eq!(
+        fit.geometry
+            .as_ref()
+            .unwrap()
+            .working
+            .as_ref()
+            .unwrap()
+            .working_weights
+            .len(),
+        2,
+    );
 }
 
 #[test]
@@ -121,8 +133,10 @@ pub(crate) fn custom_family_geometry_keeps_active_precision_under_rectangular_ra
     let geometry = FitGeometry {
         coefficient_gauge: Gauge::identity(&[2]),
         penalized_hessian: active_hessian.clone().into(),
-        working_weights: array![1.0],
-        working_response: array![0.0],
+        working: Some(WorkingGeometry {
+            working_weights: array![1.0],
+            working_response: array![0.0],
+        }),
     };
 
     let lifted = lift_fit_geometry_through_gauge(&outer, Some(geometry))
@@ -4473,7 +4487,7 @@ pub(crate) fn owned_joint_penalty_geometry_uses_terminal_workspace_without_famil
         Some(&hessian),
         evaluated.inner.terminal_working_sets.as_deref(),
     )
-    .expect("joint terminal geometry decision");
+    .expect("joint terminal geometry");
     assert_eq!(
         family.evaluations.load(Ordering::Relaxed),
         evaluations_before_assembly,
@@ -4481,8 +4495,13 @@ pub(crate) fn owned_joint_penalty_geometry_uses_terminal_workspace_without_famil
     );
     let expected_covariance = Array2::eye(2) / 3.0;
     assert!(
-        geometry.is_none(),
+        geometry.working.is_none(),
         "exact joint coefficient curvature has no single truthful IRLS row measure",
+    );
+    assert_eq!(
+        geometry.penalized_hessian.as_array(),
+        &(Array2::eye(2) * 3.0),
+        "Exact-Newton terminal geometry must retain the joint penalized precision",
     );
     assert!(
         covariance

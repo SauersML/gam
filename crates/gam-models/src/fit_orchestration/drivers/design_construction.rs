@@ -2613,6 +2613,10 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         fit: {
             let log_lambdas =
                 checked_fit_log_lambdas(&full_lambdas, "final exact spatial adaptive fit")?;
+            let working = gam_solve::estimate::WorkingGeometry {
+                working_weights: final_eval.obs.fisherweight.clone(),
+                working_response: exact_standard_working_response(&final_eval.obs)?,
+            };
             let inf = FitInference {
                 edf_by_block,
                 penalty_block_trace,
@@ -2622,8 +2626,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 // Boundary adapter: wrap the raw `Array2<f64>` Hessian as
                 // `UnscaledPrecision` for the newtype storage.
                 penalized_hessian: penalized_hessian.clone().into(),
-                working_weights: final_eval.obs.fisherweight.clone(),
-                working_response: exact_standard_working_response(&final_eval.obs)?,
                 reparam_qs: None,
                 dispersion: gam_solve::estimate::Dispersion::UNIT,
                 beta_covariance: beta_covariance
@@ -2641,8 +2643,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             let geometry = Some(gam_solve::estimate::FitGeometry {
                 coefficient_gauge: gam_problem::gauge::Gauge::identity(&[beta.len()]),
                 penalized_hessian: penalized_hessian.into(),
-                working_weights: inf.working_weights.clone(),
-                working_response: inf.working_response.clone(),
+                working: Some(working),
             });
             let covariance_conditional = beta_covariance;
             let convergence = final_fit.convergence_evidence();
@@ -6788,8 +6789,10 @@ fn fit_bounded_term_collection_with_design(
     let geometry = Some(gam_solve::estimate::FitGeometry {
         coefficient_gauge: gam_problem::gauge::Gauge::identity(&[beta_user.len()]),
         penalized_hessian: penalized_hessian.clone().into(),
-        working_weights: eta_state.fisherweight.clone(),
-        working_response: working_response.clone(),
+        working: Some(gam_solve::estimate::WorkingGeometry {
+            working_weights: eta_state.fisherweight.clone(),
+            working_response,
+        }),
     });
     let max_abs_eta = eta_state
         .eta
@@ -6808,8 +6811,6 @@ fn fit_bounded_term_collection_with_design(
                 // Boundary adapter: `penalized_hessian` storage is now
                 // `UnscaledPrecision`.
                 penalized_hessian: penalized_hessian.clone().into(),
-                working_weights: eta_state.fisherweight.clone(),
-                working_response,
                 reparam_qs: None,
                 dispersion,
                 beta_covariance: beta_covariance

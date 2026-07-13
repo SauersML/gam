@@ -671,23 +671,12 @@ pub fn blockwise_fit_from_parts(
             }
             .into());
         }
-        let geom_len = geom.working_weights.len();
-        if geom_len != geom.working_response.len() {
+        if let Some(working) = geom.working.as_ref()
+            && working.working_weights.len() != n
+        {
             return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "blockwise_fit.geometry working vector length mismatch: weights={}, response={}",
-                geom.working_weights.len(),
-                geom.working_response.len(),
-            ) }.into());
-        }
-        if geom_len != n && (n == 0 || geom_len % n != 0) {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "blockwise_fit.geometry.working_weights length mismatch: got {geom_len}, expected {n} or a stacked multiple of {n}",
-            ) }.into());
-        }
-        if geom.working_response.len() != n && (n == 0 || geom.working_response.len() % n != 0) {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "blockwise_fit.geometry.working_response length mismatch: got {}, expected {n} or a stacked multiple of {n}",
-                geom.working_response.len(),
+                "blockwise_fit.geometry single-diagonal working row count mismatch: got {}, expected {n}",
+                working.working_weights.len(),
             ) }.into());
         }
     }
@@ -784,8 +773,6 @@ pub fn blockwise_fit_from_parts(
             smoothing_correction: None,
             smoothing_correction_method: None,
             penalized_hessian: geom.penalized_hessian.clone(),
-            working_weights: geom.working_weights.clone(),
-            working_response: geom.working_response.clone(),
             reparam_qs: None,
             dispersion: gam_solve::model_types::Dispersion::UNIT,
             beta_covariance: None,

@@ -7,21 +7,11 @@ pub(crate) fn blockwise_options_from_fit_args()
 }
 
 pub(crate) fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
-    // GUARD (#2030): the persisted geometry carrier's row-sized working
-    // vectors (`working_weights` / `working_response`) MUST survive
-    // compaction. `gam diagnose` (and post-fit `--alo` diagnostics) takes the
-    // geometry ALO path in `run_diagnose.rs` whenever `unified.geometry` is
-    // `Some`, passing `geom.working_weights` / `geom.working_response` through
-    // the saved-geometry ALO boundary. Zeroing them to length 0 makes ALO fail its
-    // length-N validation ("ALO diagnostics require hessian_weights length N;
-    // got 0") on EVERY standard fit, because the field is present-but-empty so
-    // diagnose never falls through to its refit fallback. A prior fix carried
-    // this warning; commit 57bdc8011 deleted it and reintroduced the defect.
-    // The two carriers must also stay length-synchronized: `validate` bails
-    // with "UnifiedFitResult geometry working_weights must match
-    // inference.working_weights" if one is emptied while the other is not, so
-    // we cannot drop just one copy. We therefore keep BOTH working vectors and
-    // reclaim memory only from `reparam_qs` and the heavier `artifacts`.
+    // GUARD (#2030): the geometry carrier's optional owned row evidence MUST
+    // survive compaction. Saved ALO explicitly requires `geometry.working`;
+    // `None` correctly means unavailable, while truncating a present vector
+    // would corrupt a valid single-diagonal fit. `FitInference` deliberately
+    // has no duplicate copy, so only this one source of truth is retained.
     if let Some(inf) = fit.inference.as_mut() {
         inf.reparam_qs = None;
     }

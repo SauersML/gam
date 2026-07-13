@@ -56,7 +56,7 @@ pub(crate) use gam_solve::estimate::reml::reml_outer_engine::{
 // crate-root `model_types` module; `EstimationError` already descended to
 // `gam-problem` and arrives via the `gam_problem::*` glob below.
 pub(crate) use gam_solve::model_types::{
-    ActiveLinearConstraintBlock, FitGeometry, ProjectedKktResidual,
+    ActiveLinearConstraintBlock, FitGeometry, ProjectedKktResidual, WorkingGeometry,
 };
 pub(crate) use gam_solve::pirls::solve_newton_directionwith_lower_bounds;
 

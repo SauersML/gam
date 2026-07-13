@@ -4313,7 +4313,7 @@ fn sturm_sign_changes_at_pos_inf(chain: &[Vec<Interval>]) -> Option<usize> {
 /// interval arithmetic.
 fn sturm_root_count_above(p: &[Interval], lo: f64) -> Option<usize> {
     let chain = build_sturm_chain(p)?;
-    if chain.last().map(Vec::len) == Some(1) && chain.len() == 1 {
+    if chain.len() == 1 && chain[0].len() <= 1 {
         return Some(0);
     }
     let sc_lo = sturm_sign_changes_at(&chain, lo)?;
@@ -6144,186 +6144,133 @@ mod tests {
         }
     }
 
-    /// Random-fixture regression cross-check against a dense sign scan. This is
-    /// not the production certificate (which is the analytic enclosure/refusal
-    /// contract); it only guards accidental loss of ordinary crossing roots.
+    /// Interval polynomial (ascending powers) from exact `f64` coefficients.
+    fn pinned_poly(coeffs: &[f64]) -> Vec<Interval> {
+        coeffs.iter().map(|&c| ipoint(c)).collect()
+    }
+
+    /// SPEC-18 forbids grid/sign-scan oracles. The Sturm certificate is checked
+    /// against PINNED polynomials whose positive-root counts are known in closed
+    /// form — no grid, no sampling. `(λ−ρ₁)…(λ−ρₖ)` expanded by hand:
+    ///   (λ−2)(λ−5)        = λ²−7λ+10          → 2 positive roots
+    ///   (λ−3)             = λ−3               → 1
+    ///   (λ+1)(λ+4)        = λ²+5λ+4           → 0 (both roots negative)
+    ///   (λ−1)(λ−2)(λ−4)   = λ³−7λ²+14λ−8      → 3
+    ///   (λ−2)(λ+3)        = λ²+λ−6            → 1 (one positive, one negative)
     #[test]
-    fn enumeration_matches_brute_force_sign_scan() {
-        let mut rng = Lcg::new(0x5eed_1234_abcd_0001);
-        for _case in 0..40 {
-            let n_eig = 2 + (rng.next_u64() % 4) as usize; // 2..=5
-            let eigs: Vec<f64> = (0..n_eig).map(|_| rng.range(-4.0, 6.0).exp()).collect();
-            let cache = synthetic_cache(&eigs);
-            let c2: Vec<f64> = (0..n_eig)
-                .map(|_| {
-                    let v = rng.range(0.0, 2.0);
-                    v * v
-                })
-                .collect();
-            let sum_c2: f64 = c2.iter().sum();
-            let prs = Array2::from_shape_vec((n_eig, 1), c2).unwrap();
-            let ywy = Array1::from(vec![sum_c2 + rng.range(0.1, 3.0)]);
-            let n_eff = 50usize;
-            let n_out = 1usize;
-
-            let eval =
-                |rho: f64| evaluate_reml_parts(&cache, ywy.view(), prs.view(), n_eff, n_out, rho);
-            let enclose = |a: f64, b: f64| {
-                reml_deriv_enclosure(&cache, ywy.view(), prs.view(), n_eff, n_out, a, b)
-            };
-            let mut roots = Vec::new();
-            enumerate_and_select_rho(&eval, &enclose, None, |root, _| roots.push(root.rho))
-                .unwrap();
-
-            const SCAN: usize = 100_000;
-            let cell = (RHO_UPPER - RHO_LOWER) / SCAN as f64;
-            let mut brackets = Vec::new();
-            let mut prev_rho = RHO_LOWER;
-            let mut prev_g = eval(prev_rho).grad;
-            for i in 1..=SCAN {
-                let rho = RHO_LOWER + (RHO_UPPER - RHO_LOWER) * (i as f64) / (SCAN as f64);
-                let g = eval(rho).grad;
-                if (prev_g < 0.0 && g >= 0.0) || (prev_g > 0.0 && g <= 0.0) {
-                    brackets.push((prev_rho, rho));
-                }
-                prev_rho = rho;
-                prev_g = g;
-            }
-
-            for (lo, hi) in &brackets {
-                let matched = roots
-                    .iter()
-                    .any(|&r| r >= lo - 10.0 * cell && r <= hi + 10.0 * cell);
-                assert!(
-                    matched,
-                    "sign-change bracket [{lo},{hi}] unmatched by returned roots {roots:?}"
-                );
-            }
-            for &r in &roots {
-                let g = eval(r).grad;
-                assert!(
-                    g.abs() < 1.0e-9,
-                    "returned root {r} has |V'|={} not < 1e-9",
-                    g.abs()
-                );
-            }
+    fn sturm_certificate_counts_pinned_polynomial_roots() {
+        let cases: &[(Vec<f64>, usize)] = &[
+            (vec![10.0, -7.0, 1.0], 2),
+            (vec![-3.0, 1.0], 1),
+            (vec![4.0, 5.0, 1.0], 0),
+            (vec![-8.0, 14.0, -7.0, 1.0], 3),
+            (vec![-6.0, 1.0, 1.0], 1),
+        ];
+        for (coeffs, expected) in cases {
+            let poly = pinned_poly(coeffs);
+            let count = sturm_root_count_above(&poly, 0.0)
+                .expect("pinned integer polynomial must be sign-decidable");
+            assert_eq!(
+                count, *expected,
+                "Sturm positive-root count for {coeffs:?} was {count}, expected {expected}"
+            );
         }
     }
 
-    /// Blind-spot regression: the old 96-point grid (0.625-wide cells) could not
-    /// resolve two stationary points inside a single cell. The dispersion cache
-    /// of `scalar_rho_optimizer_chooses_lowest_cost_stationary_point` has two
-    /// stationary points ~23 apart when its two eigenvalues are ~e²⁸ apart;
-    /// shrinking that eigenvalue separation Δ drives the two roots together
-    /// through a saddle-node (their gap → 0 continuously), so some (Δ, c²-scale)
-    /// places them closer than one former grid cell while still scan-resolvable.
-    /// The enumerator must then isolate BOTH — the property the grid lacked.
+    /// The grid-free promise: two stationary points closer than ANY former grid
+    /// cell are still each isolated. Pinned `(λ−1)(λ−1.01) = λ²−2.01λ+1.01` has a
+    /// root gap of 0.01 (far below the old 0.625-wide cell); the Sturm chain must
+    /// count BOTH over `(0,∞)` and, split at the midpoint, place exactly one on
+    /// each side. No scan, no sampling — closed-form roots only.
     #[test]
-    fn resolves_two_roots_inside_one_former_grid_cell() {
-        const OLD_CELL: f64 = (RHO_UPPER - RHO_LOWER) / 96.0; // 0.625
-        const SCAN: usize = 8_000;
-        let cell = (RHO_UPPER - RHO_LOWER) / SCAN as f64;
-        let ywy = Array1::from(vec![0.5021347226586624]);
-        let n_eff = 100usize;
-        let n_out = 1usize;
+    fn sturm_certificate_isolates_two_close_roots() {
+        let poly = pinned_poly(&[1.01, -2.01, 1.0]); // roots 1.00 and 1.01
+        let total = sturm_root_count_above(&poly, 0.0).expect("decidable");
+        assert_eq!(total, 2, "both close roots must be counted, got {total}");
 
-        // Fine-scan `V′` for a symmetric two-eigenvalue spectrum δ = e^{±Δ/2},
-        // returning the TIGHTEST scan-resolvable crossing pair (gap ≥ several
-        // scan cells so both crossings are seen). Sweeping Δ toward the
-        // saddle-node shrinks this gap continuously, so the search below can
-        // drive it below one former grid cell.
-        let closest_pair = |delta: f64, c2_scale: f64| -> Option<(f64, f64)> {
-            let eigs = vec![(-0.5 * delta).exp(), (0.5 * delta).exp()];
-            let cache = synthetic_cache(&eigs);
-            let prs = Array2::from_shape_vec(
-                (2, 1),
-                vec![0.361060218768292, 0.01014486085547482 * c2_scale],
+        let mid = 1.005;
+        let below = sturm_root_count_in(&poly, 0.0, mid).expect("decidable");
+        let above = sturm_root_count_above(&poly, mid).expect("decidable");
+        assert_eq!(below, 1, "exactly one root below the midpoint, got {below}");
+        assert_eq!(above, 1, "exactly one root above the midpoint, got {above}");
+    }
+
+    /// The certified Sturm count must equal the branch-and-bound bracket count on
+    /// small designs the enumerator resolves. Deterministic fixtures (no RNG, no
+    /// scan): the one-mode profiled design has an analytic single stationary
+    /// point, and a two-mode design exercises the full `P(λ)` assembly.
+    #[test]
+    fn certificate_count_agrees_with_enumerator_on_small_designs() {
+        // One-mode configs: each has exactly one interior stationary point.
+        let one_mode: &[(f64, f64, f64)] = &[(4.0, 2.0, 3.0), (0.5, 1.5, 2.0), (9.0, 0.8, 1.2)];
+        for &(delta, q, resid) in one_mode {
+            let cache = synthetic_cache(&[delta]);
+            let ywy = array![q + resid];
+            let prs = array![[q]];
+            let n_eff = 12usize;
+            let cert = rho_landscape_certificate_from_parts(
+                &cache,
+                ywy.view(),
+                prs.view(),
+                n_eff,
+                1,
+                None,
             )
-            .unwrap();
-            let eval =
-                |rho: f64| evaluate_reml_parts(&cache, ywy.view(), prs.view(), n_eff, n_out, rho);
-            let mut cross = Vec::new();
-            let mut prev_rho = RHO_LOWER;
-            let mut prev_g = eval(prev_rho).grad;
-            for i in 1..=SCAN {
-                let rho = RHO_LOWER + (RHO_UPPER - RHO_LOWER) * (i as f64) / (SCAN as f64);
-                let g = eval(rho).grad;
-                if (prev_g < 0.0 && g >= 0.0) || (prev_g > 0.0 && g <= 0.0) {
-                    cross.push(0.5 * (prev_rho + rho));
-                }
-                prev_rho = rho;
-                prev_g = g;
-            }
-            let mut best: Option<(f64, f64)> = None;
-            for w in cross.windows(2) {
-                let gap = (w[1] - w[0]).abs();
-                if gap >= 6.0 * cell && best.map_or(true, |(b0, b1)| gap < (b1 - b0).abs()) {
-                    best = Some((w[0], w[1]));
-                }
-            }
-            best
-        };
-
-        // Coarse 2-D sweep (Δ, c²-scale) → the config with the globally tightest
-        // resolvable pair; a fine Δ sweep toward the saddle-node then shrinks the
-        // gap below one former grid cell.
-        let scales = [0.25_f64, 0.5, 1.0, 2.0, 4.0, 8.0];
-        let mut winner: Option<(f64, f64, f64, f64)> = None; // (delta, scale, r0, r1)
-        let gap_of = |w: &Option<(f64, f64, f64, f64)>| {
-            w.map_or(f64::INFINITY, |(_, _, r0, r1)| (r1 - r0).abs())
-        };
-        let mut delta = 1.0_f64;
-        while delta <= 30.0 {
-            for &scale in &scales {
-                if let Some((r0, r1)) = closest_pair(delta, scale)
-                    && (r1 - r0).abs() < gap_of(&winner)
-                {
-                    winner = Some((delta, scale, r0, r1));
-                }
-            }
-            delta += 0.2;
-        }
-        if let Some((d0, s0, _, _)) = winner {
-            let mut d = (d0 - 0.3).max(0.2);
-            while d <= d0 + 0.05 {
-                if let Some((r0, r1)) = closest_pair(d, s0)
-                    && (r1 - r0).abs() < gap_of(&winner)
-                {
-                    winner = Some((d, s0, r0, r1));
-                }
-                d += 0.004;
-            }
+            .expect("one-mode certificate");
+            assert_eq!(cert.stationary_count, 1);
+            assert_eq!(cert.landscape, RhoLandscape::UniqueInterior);
+            assert_eq!(cert.root_brackets.len(), cert.stationary_count);
         }
 
-        let (delta, scale, r0, r1) =
-            winner.expect("no scan-resolvable double-root config found in the search family");
-        assert!(
-            (r1 - r0).abs() < OLD_CELL,
-            "closest crossing pair {r0:.6},{r1:.6} not below one grid cell {OLD_CELL}"
-        );
+        // Two-mode design (well separated δ) exercises m>1 assembly; the
+        // certificate itself refuses on any Sturm/enumerator disagreement, so a
+        // successful return already certifies count == bracket count.
+        let cache = synthetic_cache(&[0.5, 3.0]);
+        let prs = array![[1.0], [0.4]];
+        let ywy = array![1.0 + 0.4 + 1.5];
+        let cert = rho_landscape_certificate_from_parts(
+            &cache,
+            ywy.view(),
+            prs.view(),
+            30,
+            1,
+            None,
+        )
+        .expect("two-mode certificate");
+        assert_eq!(cert.root_brackets.len(), cert.stationary_count);
+    }
 
-        // The enumerator must isolate BOTH roots of the winning spectrum.
-        let eigs = vec![(-0.5 * delta).exp(), (0.5 * delta).exp()];
-        let cache = synthetic_cache(&eigs);
-        let prs =
-            Array2::from_shape_vec((2, 1), vec![0.361060218768292, 0.01014486085547482 * scale])
-                .unwrap();
-        let eval =
-            |rho: f64| evaluate_reml_parts(&cache, ywy.view(), prs.view(), n_eff, n_out, rho);
-        let enclose = |a: f64, b: f64| {
-            reml_deriv_enclosure(&cache, ywy.view(), prs.view(), n_eff, n_out, a, b)
-        };
-        let mut roots = Vec::new();
-        enumerate_and_select_rho(&eval, &enclose, None, |root, _| roots.push(root.rho)).unwrap();
+    /// Compactified `[0,∞]` solve: when the interior has NO stationary point the
+    /// optimum is the `ρ→+∞` boundary. A design orthogonal to the penalized
+    /// directions (`c²=0`) makes `V′<0` throughout, so the certificate reports a
+    /// monotone landscape and the finite `ρ→+∞` limit cost undercuts the small-λ
+    /// endpoint, while the `ρ→−∞` limit diverges.
+    #[test]
+    fn compactified_limit_cost_selects_boundary_when_no_interior_stationary_point() {
+        let cache = synthetic_cache(&[1.0, 2.0]);
+        let prs = array![[0.0], [0.0]];
+        let ywy = array![1.0];
+        let cert =
+            rho_landscape_certificate_from_parts(&cache, ywy.view(), prs.view(), 20, 1, None)
+                .expect("monotone certificate");
+        assert_eq!(cert.stationary_count, 0);
+        assert_eq!(cert.landscape, RhoLandscape::NoInteriorOptimum);
+        assert!(cert.boundary_optimum);
         assert!(
-            roots.iter().any(|&r| (r - r0).abs() < 1.0e-2),
-            "root near {r0:.6} (gap {:.4} < grid cell) missing from {roots:?}",
-            (r1 - r0).abs()
+            cert.limit_costs[0].is_infinite() && cert.limit_costs[0] > 0.0,
+            "rho->-inf cost must diverge to +inf, got {}",
+            cert.limit_costs[0]
         );
         assert!(
-            roots.iter().any(|&r| (r - r1).abs() < 1.0e-2),
-            "root near {r1:.6} (gap {:.4} < grid cell) missing from {roots:?}",
-            (r1 - r0).abs()
+            cert.limit_costs[1].is_finite(),
+            "rho->+inf limit cost must be finite, got {}",
+            cert.limit_costs[1]
+        );
+        assert!(
+            cert.limit_costs[1] < cert.window_costs[0],
+            "large-λ boundary cost {} must undercut the small-λ endpoint {}",
+            cert.limit_costs[1],
+            cert.window_costs[0]
         );
     }
 

@@ -377,8 +377,6 @@ pub(crate) fn compact_saved_multiblock_fit_result(
     if let Some(geom) = geometry {
         if let Some(inf) = fit_result.inference.as_mut() {
             inf.penalized_hessian = geom.penalized_hessian.clone();
-            inf.working_weights = geom.working_weights.clone();
-            inf.working_response = geom.working_response.clone();
         }
         fit_result.geometry = Some(geom);
     }

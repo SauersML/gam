@@ -1466,13 +1466,24 @@ fn atlas_nerve_dict<'py>(
 /// out. Returns `{computed: false, reason}` for shapes the nerve does not apply to
 /// (scalar `block_size == 1` or fewer than two selected charts), matching
 /// `atlas_nerve_dict`'s skipped-report contract.
+///
+/// Supplying `observations` (the ambient activation rows these charts were read
+/// from, one row per route row) together with `familywise_alpha` promotes the
+/// front door from a combinatorial-only nerve to a certified fit: it runs the
+/// cross-fitted Gaussian-PCA holonomy producer and threads the resulting
+/// finite-sample certificate — projected-PCA patches, disjoint-inference-row
+/// error model, and every typed refusal — through the diagram. The two arguments
+/// travel together because a topology promotion must state the error probability
+/// it spends; omitting both keeps the pure combinatorial reduction.
 #[pyfunction(signature = (
     indices,
     values,
     n_units,
     block_size,
     activation_threshold = 1.0e-6,
-    blocks = None
+    blocks = None,
+    observations = None,
+    familywise_alpha = None
 ))]
 fn atlas_nerve_diagram<'py>(
     py: Python<'py>,
@@ -1482,6 +1493,8 @@ fn atlas_nerve_diagram<'py>(
     block_size: usize,
     activation_threshold: f32,
     blocks: Option<Vec<usize>>,
+    observations: Option<PyReadonlyArray2<'py, f64>>,
+    familywise_alpha: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
     let route = AuditSparseRoute::new(
         indices.as_array().to_owned(),
@@ -1491,8 +1504,21 @@ fn atlas_nerve_diagram<'py>(
         "atlas route",
     )
     .map_err(PyValueError::new_err)?;
+    // When the caller supplies the ambient activations these charts were read
+    // from together with a familywise level, run the cross-fitted Gaussian-PCA
+    // holonomy producer and thread a real finite-sample certificate through the
+    // nerve. Without both, the front door stays a combinatorial-only nerve; the
+    // two travel together because a topology promotion must always state the
+    // error probability it is willing to spend.
+    let observations = observations.map(|array| array.as_array().to_owned());
     let report = detach_py_result(py, "atlas_nerve_diagram", move || {
-        atlas_nerve_from_sparse_route(&route, activation_threshold, blocks.as_deref(), None, None)
+        atlas_nerve_from_sparse_route(
+            &route,
+            activation_threshold,
+            blocks.as_deref(),
+            observations.as_ref().map(ndarray::Array2::view),
+            familywise_alpha,
+        )
     })?;
     let reason = if block_size == 1 {
         "scalar block_size == 1 exposes no atlas nerve"
@@ -2755,6 +2781,107 @@ mod sae_spectral_ffi_tests {
                 .cast_into::<pyo3::types::PyList>()
                 .unwrap();
             assert!(!orientation_refusals.is_empty());
+        });
+    }
+
+    #[test]
+    fn atlas_nerve_diagram_front_door_threads_a_real_holonomy_certificate() {
+        // The standalone front door must be able to run a real fit, not only the
+        // combinatorial nerve: supplying the ambient activation rows plus a
+        // familywise level drives the cross-fitted Gaussian-PCA producer and
+        // threads a genuine finite-sample certificate through the diagram, rather
+        // than the historical `None, None` combinatorial-only path.
+        const ROWS: usize = 64;
+        let mut indices = ndarray::Array2::<u32>::zeros((ROWS, 2));
+        let mut values = ndarray::Array3::<f32>::zeros((ROWS, 2, 2));
+        let mut ambient = ndarray::Array2::<f64>::zeros((ROWS, 3));
+        for row in 0..ROWS {
+            indices[[row, 0]] = 0;
+            indices[[row, 1]] = 1;
+            let angle = std::f64::consts::TAU * row as f64 / ROWS as f64;
+            let (sine, cosine) = angle.sin_cos();
+            for chart in 0..2 {
+                values[[row, chart, 0]] = cosine as f32;
+                values[[row, chart, 1]] = sine as f32;
+            }
+            ambient[[row, 0]] = cosine;
+            ambient[[row, 1]] = sine;
+            ambient[[row, 2]] = 0.05 * (2.0 * angle).cos();
+        }
+
+        Python::attach(|py| {
+            let indices_py = indices.clone().into_pyarray(py);
+            let values_py = values.clone().into_pyarray(py);
+            let ambient_py = ambient.clone().into_pyarray(py);
+
+            // Real fit: ambient observations + familywise level are threaded
+            // through, so a Gaussian-PCA certificate is produced end-to-end.
+            let certified = atlas_nerve_diagram(
+                py,
+                indices_py.readonly(),
+                values_py.readonly(),
+                2,
+                2,
+                0.0,
+                None,
+                Some(ambient_py.readonly()),
+                Some(0.05),
+            )
+            .unwrap();
+            let certified = certified.bind(py);
+            let status: String = certified
+                .get_item("holonomy_status")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_ne!(
+                status, "not_analyzed",
+                "supplying ambient observations must produce a real holonomy certificate"
+            );
+            assert!(
+                certified
+                    .get_item("holonomy_provenance")
+                    .unwrap()
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap()
+                    .contains("gaussian"),
+                "the threaded certificate must be the fitted Gaussian-PCA plugin"
+            );
+            assert!(
+                certified
+                    .get_item("holonomy_unavailable_reason")
+                    .unwrap()
+                    .unwrap()
+                    .is_none(),
+                "a produced certificate leaves no unavailable reason"
+            );
+
+            // Contrast: without the ambient inputs the front door stays a pure
+            // combinatorial nerve and reports no analyzed holonomy.
+            let indices_py = indices.clone().into_pyarray(py);
+            let values_py = values.clone().into_pyarray(py);
+            let combinatorial = atlas_nerve_diagram(
+                py,
+                indices_py.readonly(),
+                values_py.readonly(),
+                2,
+                2,
+                0.0,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let combinatorial = combinatorial.bind(py);
+            let combinatorial_status: String = combinatorial
+                .get_item("holonomy_status")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(combinatorial_status, "not_analyzed");
         });
     }
 

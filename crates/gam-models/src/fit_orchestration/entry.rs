@@ -660,8 +660,6 @@ fn constant_gaussian_standard_fit(
         smoothing_correction: None,
         smoothing_correction_method: None,
         penalized_hessian: penalized_hessian_precision.clone(),
-        working_weights: weights.clone(),
-        working_response: working_response.clone(),
         reparam_qs: None,
         // Exact fit ⇒ residual variance is exactly zero.
         dispersion: gam_solve::estimate::Dispersion::ZERO_ESTIMATE,
@@ -680,8 +678,10 @@ fn constant_gaussian_standard_fit(
     let geometry = Some(gam_solve::estimate::FitGeometry {
         coefficient_gauge: gam_problem::gauge::Gauge::identity(&[beta.len()]),
         penalized_hessian: penalized_hessian_precision,
-        working_weights: weights,
-        working_response,
+        working: Some(gam_solve::estimate::WorkingGeometry {
+            working_weights: weights,
+            working_response,
+        }),
     });
     let fit = gam_solve::estimate::UnifiedFitResult::try_from_parts(
         gam_solve::estimate::UnifiedFitResultParts {

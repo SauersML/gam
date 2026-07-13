@@ -1900,15 +1900,15 @@ fn survival_unified_fit_result(
     assert_eq!(edf_by_block.len(), lambdas.len());
     assert_eq!(penalty_block_trace.len(), lambdas.len());
 
+    let penalized_hessian =
+        gam_problem::dispersion_cov::UnscaledPrecision::wrap(penalized_hessian);
     let inference = gam_solve::estimate::FitInference {
         edf_by_block: edf_by_block.clone(),
         penalty_block_trace,
         edf_total,
         smoothing_correction: None,
         smoothing_correction_method: None,
-        penalized_hessian: penalized_hessian.into(),
-        working_weights: Array1::zeros(0),
-        working_response: Array1::zeros(0),
+        penalized_hessian: penalized_hessian.clone(),
         reparam_qs: None,
         dispersion: gam_solve::estimate::Dispersion::UNIT,
         beta_covariance: None,
@@ -1948,7 +1948,11 @@ fn survival_unified_fit_result(
         covariance_corrected: None,
         inference: Some(inference),
         fitted_link: FittedLinkState::Standard(None),
-        geometry: None,
+        geometry: Some(gam_solve::estimate::FitGeometry {
+            coefficient_gauge: gam_problem::gauge::Gauge::identity(&[beta.len()]),
+            penalized_hessian,
+            working: None,
+        }),
         block_states: Vec::new(),
         pirls_status: summary.status,
         max_abs_eta: summary.max_abs_eta,
