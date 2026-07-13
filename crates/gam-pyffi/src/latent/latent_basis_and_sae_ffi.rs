@@ -2035,9 +2035,9 @@ fn sae_manifold_fit_inner<'py>(
     let atom_basis: Vec<String> = term
         .atoms
         .iter()
-        .map(|atom| sae_atom_basis_kind_name(&atom.basis_kind))
+        .map(|atom| sae_atom_basis_kind_name(atom.basis_kind()))
         .collect();
-    let atom_dim: Vec<usize> = term.atoms.iter().map(|atom| atom.latent_dim).collect();
+    let atom_dim: Vec<usize> = term.atoms.iter().map(|atom| atom.latent_dim()).collect();
     let log_ard_py = PyList::empty(py);
     for atom_log_ard in &rho.log_ard {
         log_ard_py.append(atom_log_ard.clone().into_pyarray(py))?;

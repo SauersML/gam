@@ -1187,6 +1187,19 @@ fn gaussian_holonomy_analysis_dict<'py>(
                 row.set_item("projected_dimension", projected_dimension)?;
                 row.set_item("aligned_frame_error_budget", aligned_frame_error_budget)?;
             }
+            AtlasInferenceOccupancyPrescription::RequiredRowsExceedRepresentableRange {
+                projected_dimension,
+                aligned_frame_error_budget,
+            } => {
+                row.set_item(
+                    "inference_requirement",
+                    "required_rows_exceed_representable_range",
+                )?;
+                row.set_item("required_inference_rows", py.None())?;
+                row.set_item("required_covariance_degrees_of_freedom", py.None())?;
+                row.set_item("projected_dimension", projected_dimension)?;
+                row.set_item("aligned_frame_error_budget", aligned_frame_error_budget)?;
+            }
             AtlasInferenceOccupancyPrescription::PopulationTailInputsRequired => {
                 row.set_item("inference_requirement", "population_tail_inputs_required")?;
                 row.set_item("required_inference_rows", py.None())?;

@@ -923,7 +923,7 @@ fn sae_oos_report_to_pydict<'py>(
     for atom in report.atoms {
         let atom_dict = PyDict::new(py);
         atom_dict.set_item("decoder_B", atom.decoder.into_pyarray(py))?;
-        atom_dict.set_item("basis_kind", sae_atom_basis_kind_name(&atom.basis_kind))?;
+        atom_dict.set_item("basis_kind", sae_atom_basis_kind_name(atom.basis_kind()))?;
         atom_dict.set_item("basis_centers", py.None())?;
         atom_dict.set_item("on_atom_coords_t", atom.coords.into_pyarray(py))?;
         atom_dict.set_item("assignments_z", atom.assignments.into_pyarray(py))?;
@@ -1384,9 +1384,9 @@ fn sae_manifold_certify_external<'py>(
     let atom_basis: Vec<String> = term
         .atoms
         .iter()
-        .map(|atom| sae_atom_basis_kind_name(&atom.basis_kind))
+        .map(|atom| sae_atom_basis_kind_name(atom.basis_kind()))
         .collect();
-    let atom_dim: Vec<usize> = term.atoms.iter().map(|atom| atom.latent_dim).collect();
+    let atom_dim: Vec<usize> = term.atoms.iter().map(|atom| atom.latent_dim()).collect();
     let log_ard_py = PyList::empty(py);
     for atom_log_ard in &rho.log_ard {
         log_ard_py.append(atom_log_ard.clone().into_pyarray(py))?;

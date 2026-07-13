@@ -559,6 +559,17 @@ impl GaussianPcaPopulationBounds {
                 "PCA eigengap lower bound must be finite and positive, got {eigengap_lower}"
             ));
         }
+        let spectral_radius_upper = noise_variance_upper + signal_variance_upper;
+        if !spectral_radius_upper.is_finite() {
+            return Err(format!(
+                "projected population spectral-radius upper bound must be finite, got noise={noise_variance_upper}, signal={signal_variance_upper}"
+            ));
+        }
+        if eigengap_lower > spectral_radius_upper {
+            return Err(format!(
+                "PCA eigengap lower bound {eigengap_lower} cannot exceed the projected population spectral-radius upper bound {spectral_radius_upper}"
+            ));
+        }
         Ok(Self {
             noise_variance_upper,
             signal_variance_upper,
@@ -1332,6 +1343,13 @@ pub enum AtlasInferenceOccupancyPrescription {
         projected_dimension: usize,
         aligned_frame_error_budget: f64,
     },
+    /// The requested probability is mathematically meaningful, but its row
+    /// requirement exceeds the integer range accepted by this implementation.
+    /// A magic maximum row count would falsely present this as attainable.
+    RequiredRowsExceedRepresentableRange {
+        projected_dimension: usize,
+        aligned_frame_error_budget: f64,
+    },
     /// A population spectrum or cross-Gram margin is absent. More inference
     /// rows alone cannot repair the missing authority.
     PopulationTailInputsRequired,
@@ -1962,6 +1980,9 @@ mod tests {
                 projected_dimension,
                 aligned_frame_error_budget,
             ),
+            AtlasInferenceOccupancyPrescription::RequiredRowsExceedRepresentableRange {
+                ..
+            } => panic!("test fixture has a representable inference occupancy"),
             AtlasInferenceOccupancyPrescription::PopulationTailInputsRequired => {
                 panic!("test fixture supplies every population tail input")
             }
@@ -2134,6 +2155,8 @@ mod tests {
 
     #[test]
     fn authoritative_edge_constructors_enforce_canonical_identity() {
+        assert!(GaussianPcaPopulationBounds::new(f64::MAX, f64::MAX, 1.0).is_err());
+        assert!(GaussianPcaPopulationBounds::new(0.0, 1.0, 2.0).is_err());
         assert!(AtlasHolonomyEdgeId::new(1, 1, 0).is_err());
         assert_eq!(
             AtlasHolonomyEdgeId::new(4, 2, 9).unwrap(),
@@ -2856,6 +2879,41 @@ mod tests {
     }
 
     #[test]
+    fn tiny_certified_margin_has_typed_unrepresentable_occupancy() {
+        let analysis = certified_analysis(
+            vec![
+                patch(0, 0.0, 0.0, false, 1_000_000, 0),
+                patch(1, 0.2, 0.0, false, 1_000_000, 0),
+            ],
+            vec![
+                ProjectedAtlasEdgeSpec::new(
+                    0,
+                    1,
+                    0,
+                    PopulationCrossGramProvenance::CertifiedSmallestSingularValue {
+                        lower_bound: f64::MIN_POSITIVE,
+                    },
+                    0.0,
+                )
+                .unwrap(),
+            ],
+            AtlasFamilywiseLevel::new(0.05).unwrap(),
+            None,
+        );
+
+        assert!(analysis.sample_prescription().iter().all(|prescription| {
+            matches!(
+                prescription.inference,
+                AtlasInferenceOccupancyPrescription::RequiredRowsExceedRepresentableRange {
+                    projected_dimension: 3,
+                    aligned_frame_error_budget,
+                } if aligned_frame_error_budget.is_finite()
+                    && aligned_frame_error_budget > 0.0
+            )
+        }));
+    }
+
+    #[test]
     fn ambient_zero_padding_does_not_enter_projected_variance_or_tail() {
         let base = triangle_analysis([(0.0, false); 3], 0);
         let padded = triangle_analysis([(0.0, false); 3], 97);
@@ -3549,7 +3607,8 @@ fn fundamental_cycles(
 
 fn aligned_frame_error(projector_error: f64) -> f64 {
     let q = projector_error.clamp(0.0, 1.0);
-    (2.0 - 2.0 * (1.0 - q * q).sqrt()).sqrt()
+    let cosine = (1.0 - q * q).sqrt();
+    q * (2.0 / (1.0 + cosine)).sqrt()
 }
 
 fn projector_error_for_aligned_frame_error(frame_error: f64) -> f64 {
@@ -3590,7 +3649,7 @@ fn patch_tail(
 /// its own unconditional error threshold.
 fn orientation_endpoint_frame_budget(edge: &EdgeWork) -> Option<f64> {
     let population_margin = edge.public.population_cross_gram.certified_lower_bound()?;
-    Some((1.0 + population_margin).sqrt() - 1.0)
+    Some(population_margin / ((1.0 + population_margin).sqrt() + 1.0))
 }
 
 fn covariance_budget_ratio(patch: &GaussianPcaPatch, frame_budget: f64) -> f64 {
@@ -3602,23 +3661,42 @@ fn covariance_budget_ratio(patch: &GaussianPcaPatch, frame_budget: f64) -> f64 {
     covariance_budget / bounds.spectral_radius_upper()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequiredCovarianceDegreesOfFreedom {
+    Representable(usize),
+    ExceedsRepresentableRange,
+}
+
 fn required_covariance_degrees_of_freedom(
     patch: &GaussianPcaPatch,
     projected_dimension: usize,
     frame_budget: f64,
     tail_parameter: f64,
-) -> usize {
+) -> RequiredCovarianceDegreesOfFreedom {
     let normalized_budget = covariance_budget_ratio(patch, frame_budget);
-    let u_budget = (1.0 + normalized_budget).sqrt() - 1.0;
-    if u_budget <= 0.0 {
-        return usize::MAX;
+    if !(normalized_budget.is_finite() && normalized_budget > 0.0) {
+        return RequiredCovarianceDegreesOfFreedom::ExceedsRepresentableRange;
+    }
+    // Rationalizing `sqrt(1 + b) - 1` preserves tiny, valid budgets instead of
+    // cancelling them to zero before representability is decided.
+    let u_budget = normalized_budget / ((1.0 + normalized_budget).sqrt() + 1.0);
+    if !(u_budget.is_finite() && u_budget > 0.0) {
+        return RequiredCovarianceDegreesOfFreedom::ExceedsRepresentableRange;
     }
     let numerator = (projected_dimension as f64).sqrt() + (2.0 * tail_parameter).sqrt();
-    let required = (numerator / u_budget).powi(2).ceil();
-    if required.is_finite() && required <= usize::MAX as f64 {
-        required as usize
-    } else {
-        usize::MAX
+    if !(numerator.is_finite() && numerator > 0.0) {
+        return RequiredCovarianceDegreesOfFreedom::ExceedsRepresentableRange;
+    }
+    let required = (numerator / u_budget).powi(2).ceil().max(1.0);
+    if !required.is_finite() {
+        return RequiredCovarianceDegreesOfFreedom::ExceedsRepresentableRange;
+    }
+    // Convert through a wider integer so the rounded `usize::MAX as f64`
+    // boundary cannot saturate back to the same magic value.
+    let required_wide = required as u128;
+    match usize::try_from(required_wide) {
+        Ok(required) if required > 0 => RequiredCovarianceDegreesOfFreedom::Representable(required),
+        _ => RequiredCovarianceDegreesOfFreedom::ExceedsRepresentableRange,
     }
 }
 
@@ -3628,7 +3706,11 @@ fn supported_tail_parameter(
     frame_budget: f64,
 ) -> f64 {
     let normalized_budget = covariance_budget_ratio(patch, frame_budget);
-    let u_budget = (1.0 + normalized_budget).sqrt() - 1.0;
+    let u_budget = if normalized_budget.is_finite() && normalized_budget > 0.0 {
+        normalized_budget / ((1.0 + normalized_budget).sqrt() + 1.0)
+    } else {
+        0.0
+    };
     let available = (patch.covariance_degrees_of_freedom() as f64).sqrt() * u_budget
         - (projected_dimension as f64).sqrt();
     if available > 0.0 {
@@ -3636,6 +3718,19 @@ fn supported_tail_parameter(
     } else {
         0.0
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PatchOccupancyRequirement {
+    Representable {
+        covariance_degrees_of_freedom: usize,
+        projected_dimension: usize,
+        aligned_frame_error_budget: f64,
+    },
+    ExceedsRepresentableRange {
+        projected_dimension: usize,
+        aligned_frame_error_budget: f64,
+    },
 }
 
 fn orientation_tail_and_prescription(
@@ -3707,7 +3802,7 @@ fn orientation_tail_and_prescription(
     // must count edge endpoints, not merely distinct patches.
     let incidence_count = 2 * edges.len();
     let requested_tail_parameter = (2.0 * incidence_count as f64 / allocated_alpha).ln();
-    let mut patch_requirements = vec![None::<(usize, usize, f64)>; patches.len()];
+    let mut patch_requirements = vec![None::<PatchOccupancyRequirement>; patches.len()];
     let mut flip_probability_bound = 0.0_f64;
     for edge in edges {
         let Some(frame_budget) = orientation_endpoint_frame_budget(edge) else {
@@ -3719,17 +3814,43 @@ fn orientation_tail_and_prescription(
                 continue;
             }
             let projected_dimension = edge.public.projected_dimension;
-            let required_dof = required_covariance_degrees_of_freedom(
+            let requirement = match required_covariance_degrees_of_freedom(
                 patch,
                 projected_dimension,
                 frame_budget,
                 requested_tail_parameter,
-            );
-            let replace = patch_requirements[chart]
-                .as_ref()
-                .is_none_or(|&(current, _, _)| required_dof > current);
+            ) {
+                RequiredCovarianceDegreesOfFreedom::Representable(
+                    covariance_degrees_of_freedom,
+                ) => PatchOccupancyRequirement::Representable {
+                    covariance_degrees_of_freedom,
+                    projected_dimension,
+                    aligned_frame_error_budget: frame_budget,
+                },
+                RequiredCovarianceDegreesOfFreedom::ExceedsRepresentableRange => {
+                    PatchOccupancyRequirement::ExceedsRepresentableRange {
+                        projected_dimension,
+                        aligned_frame_error_budget: frame_budget,
+                    }
+                }
+            };
+            let replace = match (patch_requirements[chart], requirement) {
+                (None, _) => true,
+                (Some(PatchOccupancyRequirement::ExceedsRepresentableRange { .. }), _) => false,
+                (_, PatchOccupancyRequirement::ExceedsRepresentableRange { .. }) => true,
+                (
+                    Some(PatchOccupancyRequirement::Representable {
+                        covariance_degrees_of_freedom: current,
+                        ..
+                    }),
+                    PatchOccupancyRequirement::Representable {
+                        covariance_degrees_of_freedom: candidate,
+                        ..
+                    },
+                ) => candidate > current,
+            };
             if replace {
-                patch_requirements[chart] = Some((required_dof, projected_dimension, frame_budget));
+                patch_requirements[chart] = Some(requirement);
             }
             let supported = supported_tail_parameter(patch, projected_dimension, frame_budget);
             flip_probability_bound += (2.0 * (-supported).exp()).min(1.0);
@@ -3756,20 +3877,41 @@ fn orientation_tail_and_prescription(
         let inference = if patch.spectrum_provenance.certified_bounds().is_some()
             && all_incident_margins_certified
         {
-            let (required_dof, projected_dimension, frame_budget) = patch_requirements[chart]
+            let requirement = patch_requirements[chart]
                 .ok_or_else(|| {
                     format!(
                         "atlas patch {chart} has certified incident tail inputs but no occupancy requirement"
                     )
                 })?;
-            AtlasInferenceOccupancyPrescription::Required {
-                rows: patch
+            match requirement {
+                PatchOccupancyRequirement::Representable {
+                    covariance_degrees_of_freedom,
+                    projected_dimension,
+                    aligned_frame_error_budget,
+                } => match patch
                     .centering
-                    .rows_for_degrees_of_freedom(required_dof)
-                    .unwrap_or(usize::MAX),
-                covariance_degrees_of_freedom: required_dof,
-                projected_dimension,
-                aligned_frame_error_budget: frame_budget,
+                    .rows_for_degrees_of_freedom(covariance_degrees_of_freedom)
+                {
+                    Some(rows) => AtlasInferenceOccupancyPrescription::Required {
+                        rows,
+                        covariance_degrees_of_freedom,
+                        projected_dimension,
+                        aligned_frame_error_budget,
+                    },
+                    None => {
+                        AtlasInferenceOccupancyPrescription::RequiredRowsExceedRepresentableRange {
+                            projected_dimension,
+                            aligned_frame_error_budget,
+                        }
+                    }
+                },
+                PatchOccupancyRequirement::ExceedsRepresentableRange {
+                    projected_dimension,
+                    aligned_frame_error_budget,
+                } => AtlasInferenceOccupancyPrescription::RequiredRowsExceedRepresentableRange {
+                    projected_dimension,
+                    aligned_frame_error_budget,
+                },
             }
         } else {
             AtlasInferenceOccupancyPrescription::PopulationTailInputsRequired

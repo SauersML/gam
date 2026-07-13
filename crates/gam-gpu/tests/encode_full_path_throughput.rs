@@ -181,7 +181,7 @@ fn full_exact_encode_throughput_and_correctness() {
     // --- Production reference: per-row exact encode (the definition of truth a
     // batched/accelerated encode must reproduce). This IS the production CPU
     // encode (`certified_encode_row`), looped in row order. ---
-    let mut coords_ref = Array2::<f64>::zeros((n, atom.latent_dim));
+    let mut coords_ref = Array2::<f64>::zeros((n, atom.latent_dim()));
     let mut certified_ref = vec![false; n];
     for i in 0..n {
         let (t, cert) = atlas
