@@ -2395,6 +2395,50 @@ mod tests {
     }
 
     #[test]
+    fn projector_normal_variance_is_zero_in_model_frozen_directions() {
+        // The estimated tangent 2-plane can only fluctuate inside the pilot
+        // frame's normal complement N_j = W_j W_j^T - U_j U_j^T. A perturbation
+        // aligned with the tangent gauge U_j itself is a direction the PCA model
+        // cannot move in, so its propagated projector gradient - and hence the
+        // first-order variance it contributes through the covariance quadratic -
+        // must be exactly zero. A retained direction orthogonal to the tangent
+        // lives in N_j and must be preserved with strictly positive norm. This
+        // is the audit's zero-vs-positive counterexample stated at the projector
+        // gradient that enters the cycle variance: removing the tangent frame
+        // (not the normal complement) is exactly what confines variance to N_j.
+        let patch = patch(0, 0.0, 0.0, false, 1_000_000, 0);
+        // tangent_gauge(0, false) spans retained axes e0, e1; the retained
+        // normal complement N_j is therefore spanned by e2.
+        let model_frozen = arr2(&[[2.0, -3.0], [5.0, 7.0], [0.0, 0.0]]);
+        let projected_frozen = project_retained_normal(&patch, &model_frozen);
+        assert_eq!(
+            frobenius_squared(projected_frozen.view()),
+            0.0,
+            "a tangent-gauge (model-frozen) direction must carry exactly zero projector variance"
+        );
+
+        let normal_direction = arr2(&[[0.0, 0.0], [0.0, 0.0], [1.0, -4.0]]);
+        let projected_normal = project_retained_normal(&patch, &normal_direction);
+        assert_eq!(
+            projected_normal, normal_direction,
+            "a retained direction inside N_j must be preserved exactly"
+        );
+        assert!(
+            frobenius_squared(projected_normal.view()) > 0.0,
+            "an N_j direction must retain strictly positive variance"
+        );
+
+        // A mixed input keeps only its N_j component: the tangent (model-frozen)
+        // part is removed exactly while the normal part survives untouched.
+        let mixed = &model_frozen + &normal_direction;
+        let projected_mixed = project_retained_normal(&patch, &mixed);
+        assert_eq!(
+            projected_mixed, normal_direction,
+            "projecting the retained normal must strip only the model-frozen tangent component"
+        );
+    }
+
+    #[test]
     fn zero_tilt_parallel_cycle_preserves_overlap_identity_and_refuses_normal_law() {
         let analysis = certified_analysis(
             vec![

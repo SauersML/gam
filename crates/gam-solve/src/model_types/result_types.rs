@@ -155,8 +155,6 @@ mod per_term_edf_tests {
                 smoothing_correction: None,
                 smoothing_correction_method: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(36)),
-                working_weights: Array1::ones(1),
-                working_response: Array1::zeros(1),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0).unwrap(),
                 beta_covariance: None,
@@ -242,8 +240,6 @@ mod per_term_edf_tests {
                 smoothing_correction: None,
                 smoothing_correction_method: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
-                working_weights: Array1::ones(1),
-                working_response: Array1::zeros(1),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0).unwrap(),
                 beta_covariance: None,
@@ -315,8 +311,6 @@ mod per_term_edf_tests {
                 smoothing_correction: None,
                 smoothing_correction_method: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
-                working_weights: Array1::ones(1),
-                working_response: Array1::zeros(1),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0).unwrap(),
                 beta_covariance: None,
@@ -510,8 +504,6 @@ mod per_term_edf_tests {
                 smoothing_correction: None,
                 smoothing_correction_method: None,
                 penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
-                working_weights: Array1::ones(1),
-                working_response: Array1::zeros(1),
                 reparam_qs: None,
                 dispersion: Dispersion::estimated(1.0).unwrap(),
                 beta_covariance: None,
@@ -1131,8 +1123,6 @@ pub struct FitInference {
     /// `#[serde(transparent)]` on the newtype keeps the on-disk encoding
     /// identical to the pre-newtype `Array2<f64>` storage.
     pub penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision,
-    pub working_weights: Array1<f64>,
-    pub working_response: Array1<f64>,
     pub reparam_qs: Option<Array2<f64>>,
     /// Dispersion/scale used to scale all coefficient covariance matrices.
     /// [`Dispersion`] is a validated newtype with no meaningful default (its
@@ -1300,8 +1290,23 @@ pub struct FittedBlock {
     pub lambdas: Array1<f64>,
 }
 
-/// Working-set geometry at convergence needed by ALO and other post-fit
-/// diagnostics. Only populated when the inner solver provides the data.
+/// Owned diagonal working-set evidence at convergence.
+///
+/// This evidence is distinct from coefficient geometry: Exact-Newton and
+/// multi-parameter fits can retain an exact coefficient gauge and penalized
+/// Hessian without having a single row-wise IRLS representation. Consumers
+/// that mathematically require row evidence (currently ALO and constrained
+/// Gaussian centering) must explicitly require this value.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkingGeometry {
+    /// Score-side Fisher IRLS weights paired with `working_response`.
+    pub working_weights: Array1<f64>,
+    /// IRLS working response at convergence.
+    pub working_response: Array1<f64>,
+}
+
+/// Coefficient geometry retained at convergence for inference and post-fit
+/// diagnostics.
 ///
 /// The saved coefficient blocks are always in the raw reporting frame. The
 /// geometry may occupy a smaller active frame; `coefficient_gauge` is the
@@ -1319,10 +1324,11 @@ pub struct FitGeometry {
     /// Stored as [`UnscaledPrecision`] so the dispersion-ownership invariant
     /// (this matrix is *not* φ-scaled) is enforced at the type level.
     pub penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision,
-    /// Score-side Fisher IRLS weights paired with `working_response`.
-    pub working_weights: Array1<f64>,
-    /// IRLS working response at convergence.
-    pub working_response: Array1<f64>,
+    /// Optional owned row-wise diagonal IRLS evidence. `None` is a typed
+    /// statement that the terminal solver geometry has no single diagonal
+    /// row representation; it is never represented by empty or zero-filled
+    /// placeholder vectors.
+    pub working: Option<WorkingGeometry>,
 }
 
 #[derive(Clone)]
@@ -1606,12 +1612,28 @@ impl FitGeometry {
             "fit_result.geometry.penalized_hessian",
             self.penalized_hessian.iter().copied(),
         )?;
+        if let Some(working) = self.working.as_ref() {
+            working.validate_numeric_finiteness()?;
+        }
+        Ok(())
+    }
+}
+
+impl WorkingGeometry {
+    pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {
+        if self.working_weights.len() != self.working_response.len() {
+            return Err(EstimationError::InvalidInput(format!(
+                "fit_result.geometry working vector length mismatch: working_weights={}, working_response={}",
+                self.working_weights.len(),
+                self.working_response.len(),
+            )));
+        }
         validate_all_finite_estimation(
-            "fit_result.geometry.working_weights",
+            "fit_result.geometry.working.working_weights",
             self.working_weights.iter().copied(),
         )?;
         validate_all_finite_estimation(
-            "fit_result.geometry.working_response",
+            "fit_result.geometry.working.working_response",
             self.working_response.iter().copied(),
         )?;
         Ok(())
@@ -1628,14 +1650,6 @@ impl FitInference {
         validate_all_finite_estimation(
             "fit_result.penalty_block_trace",
             self.penalty_block_trace.iter().copied(),
-        )?;
-        validate_all_finite_estimation(
-            "fit_result.working_weights",
-            self.working_weights.iter().copied(),
-        )?;
-        validate_all_finite_estimation(
-            "fit_result.working_response",
-            self.working_response.iter().copied(),
         )?;
         validate_all_finite_estimation(
             "fit_result.penalized_hessian",
@@ -2003,13 +2017,6 @@ impl UnifiedFitResult {
                     lambdas.len()
                 );
             }
-            if inf.working_weights.len() != inf.working_response.len() {
-                crate::bail_invalid_estim!(
-                    "UnifiedFitResult working vector length mismatch: working_weights={}, working_response={}",
-                    inf.working_weights.len(),
-                    inf.working_response.len()
-                );
-            }
             validate_dense_hessian_export(
                 "UnifiedFitResult inference penalized Hessian",
                 &inf.penalized_hessian,
@@ -2123,24 +2130,9 @@ impl UnifiedFitResult {
             }
         }
         if let Some(geom) = geometry.as_ref() {
-            if geom.working_weights.len() != geom.working_response.len() {
-                crate::bail_invalid_estim!(
-                    "UnifiedFitResult geometry working vector length mismatch: working_weights={}, working_response={}",
-                    geom.working_weights.len(),
-                    geom.working_response.len()
-                );
-            }
             if let Some(inf) = inference.as_ref() {
                 if geom.penalized_hessian != inf.penalized_hessian {
                     crate::bail_invalid_estim!("UnifiedFitResult geometry penalized Hessian must match inference.penalized_hessian"
-                            .to_string(),);
-                }
-                if geom.working_weights != inf.working_weights {
-                    crate::bail_invalid_estim!("UnifiedFitResult geometry working_weights must match inference.working_weights"
-                            .to_string(),);
-                }
-                if geom.working_response != inf.working_response {
-                    crate::bail_invalid_estim!("UnifiedFitResult geometry working_response must match inference.working_response"
                             .to_string(),);
                 }
             }
@@ -2601,14 +2593,23 @@ impl UnifiedFitResult {
             .and_then(|inf| inf.beta_covariance.as_ref())
     }
 
-    /// Get working weights if available.
-    pub fn working_weights(&self) -> Option<&Array1<f64>> {
-        self.inference.as_ref().map(|inf| &inf.working_weights)
+    /// Get owned row-wise diagonal working evidence if available.
+    pub fn working_geometry(&self) -> Option<&WorkingGeometry> {
+        self.geometry
+            .as_ref()
+            .and_then(|geometry| geometry.working.as_ref())
     }
 
-    /// Get working response if available.
+    /// Get working weights if single diagonal row evidence is available.
+    pub fn working_weights(&self) -> Option<&Array1<f64>> {
+        self.working_geometry()
+            .map(|working| &working.working_weights)
+    }
+
+    /// Get working response if single diagonal row evidence is available.
     pub fn working_response(&self) -> Option<&Array1<f64>> {
-        self.inference.as_ref().map(|inf| &inf.working_response)
+        self.working_geometry()
+            .map(|working| &working.working_response)
     }
 
     /// Smoothing-parameter uncertainty covariance contribution `J·Var(ρ)·Jᵀ`

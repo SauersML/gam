@@ -164,6 +164,9 @@ pub(crate) struct BlockwiseFitAssembly<'a> {
     pub(crate) rho_physical: Array1<f64>,
     pub(crate) covariance_conditional: Option<Array2<f64>>,
     pub(crate) geometry: Option<FitGeometry>,
+    /// EDF derived from an owned coefficient-space penalized Hessian when no
+    /// truthful row-wise `FitGeometry` exists.
+    pub(crate) precomputed_edf: Option<(f64, Vec<f64>, Vec<f64>, Vec<f64>)>,
     pub(crate) canonical: Option<&'a gam_identifiability::canonical::CanonicalSpecs>,
     pub(crate) result_specs: &'a [ParameterBlockSpec],
     pub(crate) penalized_objective: f64,
@@ -186,6 +189,7 @@ pub(crate) fn assemble_custom_family_fit_result(
         rho_physical,
         covariance_conditional,
         geometry,
+        precomputed_edf,
         canonical,
         result_specs,
         penalized_objective,
@@ -200,7 +204,8 @@ pub(crate) fn assemble_custom_family_fit_result(
         exact_lambdas_from_log_strengths(&log_lambdas, "custom-family fitted log strength")?;
     let (block_states, covariance_conditional, geometry, precomputed_edf) =
         if let Some(canonical) = canonical {
-            let precomputed_edf = reduced_blockwise_edf(geometry.as_ref(), canonical, &lambdas);
+            let precomputed_edf = precomputed_edf
+                .or_else(|| reduced_blockwise_edf(geometry.as_ref(), canonical, &lambdas));
             let block_states = lift_block_states_to_raw(canonical, inner.block_states);
             let (covariance_conditional, geometry) =
                 lift_fit_geometry_to_raw(canonical, covariance_conditional, geometry)?;
@@ -211,7 +216,12 @@ pub(crate) fn assemble_custom_family_fit_result(
                 precomputed_edf,
             )
         } else {
-            (inner.block_states, covariance_conditional, geometry, None)
+            (
+                inner.block_states,
+                covariance_conditional,
+                geometry,
+                precomputed_edf,
+            )
         };
 
     blockwise_fit_from_parts(
@@ -1029,6 +1039,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             &per_block,
             options,
             None,
+            None,
         )
         .map_err(|reason| CustomFamilyError::Optimization {
             context: "fit_custom_family no-smoothing joint geometry",
@@ -1066,6 +1077,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 rho_physical: physical_rho0,
                 covariance_conditional,
                 geometry,
+                precomputed_edf: None,
                 canonical: Some(&canonical),
                 result_specs: raw_specs,
                 penalized_objective,
@@ -1743,6 +1755,16 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         total_p,
         "custom-family certified terminal Hessian materialization",
     )?;
+    let penalized_hessian = penalized_hessian_from_owned_mode(
+        specs,
+        &per_block,
+        &final_options,
+        &hessian,
+    )
+    .map_err(|reason| CustomFamilyError::Optimization {
+        context: "fit_custom_family terminal penalized Hessian",
+        reason,
+    })?;
 
     let covariance_conditional = compute_joint_covariance_required(
         family,
@@ -1751,8 +1773,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         &per_block,
         &final_options,
         Some(&hessian),
-        inner.terminal_working_sets.as_deref(),
-        inner.terminal_working_sets.as_deref(),
     )
     .map_err(|error| CustomFamilyError::Optimization {
         context: "fit_custom_family final covariance factorization",
@@ -1769,6 +1789,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         &per_block,
         &final_options,
         Some(&hessian),
+        inner.terminal_working_sets.as_deref(),
     )
     .map_err(|reason| CustomFamilyError::Optimization {
         context: "fit_custom_family joint geometry",
@@ -1791,6 +1812,26 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         );
     }
     let rho_star_physical = expand_labeled_log_lambdas(&rho_star, &label_layout)?;
+    let physical_lambdas = exact_lambdas_from_log_strengths(
+        &rho_star_physical,
+        "custom-family terminal EDF log strength",
+    )?;
+    let precomputed_edf = if label_layout.joint_specs.is_empty() {
+        Some(
+            custom_family_blockwise_edf(&penalized_hessian, specs, &physical_lambdas.view())
+                .map_err(|reason| CustomFamilyError::Optimization {
+                    context: "fit_custom_family terminal EDF",
+                    reason,
+                })?,
+        )
+    } else {
+        // The public per-penalty EDF vectors are aligned to per-block lambdas.
+        // A full-width joint penalty has no truthful slot in that schema; do
+        // not report p as if the owned joint penalty spent zero degrees of
+        // freedom. `joint_log_lambdas` below preserves the selected strengths
+        // until a typed joint-EDF channel exists.
+        None
+    };
     // gam#1587/#561: a family whose smoothing rides on the full-width JOINT
     // penalty (the multinomial centered `Σ_t λ_t (M ⊗ S_t)` metric) leaves its
     // per-block penalty lists — and hence the physical `rho_physical`/`lambdas`
@@ -1806,6 +1847,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             rho_physical: rho_star_physical,
             covariance_conditional,
             geometry,
+            precomputed_edf,
             canonical: Some(&canonical),
             result_specs: raw_specs,
             penalized_objective,
@@ -1901,6 +1943,7 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
         &per_block,
         options,
         None,
+        None,
     )
     .map_err(|reason| CustomFamilyError::Optimization {
         context: "fit_custom_family_fixed_log_lambdas joint geometry",
@@ -1912,6 +1955,7 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
             rho_physical: rho,
             covariance_conditional,
             geometry,
+            precomputed_edf: None,
             canonical: Some(&canonical),
             result_specs: raw_specs,
             penalized_objective,
@@ -2110,8 +2154,6 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
         &per_block,
         options,
         Some(&hessian),
-        inner.terminal_working_sets.as_deref(),
-        inner.terminal_working_sets.as_deref(),
     )
     .map_err(|error| CustomFamilyError::Optimization {
         context: "fit_custom_family_fixed_log_lambdas_from_owned_mode covariance",
@@ -2124,6 +2166,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
         &per_block,
         options,
         Some(&hessian),
+        inner.terminal_working_sets.as_deref(),
     )
     .map_err(|reason| CustomFamilyError::Optimization {
         context: "fit_custom_family_fixed_log_lambdas_from_owned_mode geometry",
@@ -2136,6 +2179,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
             rho_physical: rho,
             covariance_conditional,
             geometry,
+            precomputed_edf: None,
             canonical: Some(&canonical),
             result_specs: specs,
             penalized_objective: selected_objective,

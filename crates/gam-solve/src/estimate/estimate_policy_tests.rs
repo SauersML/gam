@@ -691,8 +691,6 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
                 },
             ),
             penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]].into(),
-            working_weights: array![1.0, 0.5, 0.75],
-            working_response: array![0.1, 0.2, 0.3],
             reparam_qs: Some(array![[1.0, 0.0], [0.0, 1.0]]),
             dispersion: Dispersion::UNIT,
             beta_covariance: Some(array![[1.0, 0.1], [0.1, 2.0]].into()),
@@ -709,8 +707,10 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
         geometry: Some(FitGeometry {
             coefficient_gauge: gam_problem::Gauge::identity(&[2]),
             penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]].into(),
-            working_weights: array![1.0, 0.5, 0.75],
-            working_response: array![0.1, 0.2, 0.3],
+            working: Some(crate::model_types::WorkingGeometry {
+                working_weights: array![1.0, 0.5, 0.75],
+                working_response: array![0.1, 0.2, 0.3],
+            }),
         }),
         block_states: Vec::new(),
         pirls_status: crate::pirls::PirlsStatus::Converged,

@@ -32,7 +32,7 @@ use gam_terms::basis::{
     create_basis, evaluate_bspline_derivative_scalar,
 };
 use gam_terms::inference::formula_dsl::LinkWiggleFormulaSpec;
-use ndarray::{Array1, Array2, array, s};
+use ndarray::{Array1, Array2, Array3, array, s};
 use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -583,7 +583,7 @@ pub fn initial_survival_baseline_config_for_fit(
     )
 }
 
-fn survival_baseline_theta_from_config(
+pub fn survival_baseline_theta_from_config(
     cfg: &SurvivalBaselineConfig,
 ) -> Result<Option<Array1<f64>>, String> {
     Ok(match cfg.target {
@@ -616,7 +616,7 @@ fn survival_baseline_theta_from_config(
     })
 }
 
-fn survival_baseline_config_from_theta(
+pub fn survival_baseline_config_from_theta(
     target: SurvivalBaselineTarget,
     theta: &Array1<f64>,
 ) -> Result<SurvivalBaselineConfig, String> {
@@ -2901,7 +2901,7 @@ pub fn marginal_slope_baseline_chain_rule_hessian(
     }
     let probe_age = age_exit.iter().copied().find(|v| v.is_finite() && *v > 0.0);
     let dim = match probe_age {
-        Some(t) => match marginal_slope_baseline_offset_theta_second_partials(t, cfg)? {
+        Some(t) => match marginal_slope_baseline_offset_theta_geometry(t, cfg)? {
             None => return Ok(None),
             Some(parts) => parts.first.len(),
         },
@@ -2922,8 +2922,7 @@ pub fn marginal_slope_baseline_chain_rule_hessian(
         n,
         || Array2::<f64>::zeros((dim, dim)),
         |mut acc, i, _row_weight| -> Result<Array2<f64>, String> {
-            let exit_parts =
-                marginal_slope_baseline_offset_theta_second_partials(age_exit[i], cfg)?
+            let exit_parts = marginal_slope_baseline_offset_theta_geometry(age_exit[i], cfg)?
                     .ok_or_else(|| {
                         "unexpected None from marginal-slope second partials at exit".to_string()
                     })?;
@@ -2935,7 +2934,7 @@ pub fn marginal_slope_baseline_chain_rule_hessian(
             let mut entry_parts = None;
             if residuals.entry[i] != 0.0 {
                 entry_parts = Some(
-                    marginal_slope_baseline_offset_theta_second_partials(age_entry[i], cfg)?
+                    marginal_slope_baseline_offset_theta_geometry(age_entry[i], cfg)?
                         .ok_or_else(|| {
                             "unexpected None from marginal-slope second partials at entry"
                                 .to_string()
@@ -2973,15 +2972,36 @@ pub fn marginal_slope_baseline_chain_rule_hessian(
     Ok(Some(hessian))
 }
 
-struct MarginalSlopeThetaSecondPartials {
-    first: Vec<(f64, f64)>,
-    second: Vec<Vec<(f64, f64)>>,
+/// Complete analytic baseline chart at one age for survival marginal-slope.
+///
+/// `value` is `(q(t), dq(t)/dt)`. `first[k]` and `second[k][l]` are the
+/// corresponding first and second partials with respect to the nonlinear
+/// baseline coordinates returned by [`survival_baseline_theta_from_config`].
+/// A nonlinear baseline evaluated at the survival origin has identically zero
+/// value and derivatives because origin rows are anchored outside the finite
+/// probit chart. Linear baselines have no coordinates and return `None`.
+#[derive(Clone, Debug)]
+pub struct MarginalSlopeBaselineOffsetThetaGeometry {
+    pub value: (f64, f64),
+    pub first: Vec<(f64, f64)>,
+    pub second: Vec<Vec<(f64, f64)>>,
 }
 
-fn marginal_slope_baseline_offset_theta_second_partials(
+pub fn marginal_slope_baseline_offset_theta_geometry(
     age: f64,
     cfg: &SurvivalBaselineConfig,
-) -> Result<Option<MarginalSlopeThetaSecondPartials>, String> {
+) -> Result<Option<MarginalSlopeBaselineOffsetThetaGeometry>, String> {
+    if age == 0.0 {
+        let Some(theta) = survival_baseline_theta_from_config(cfg)? else {
+            return Ok(None);
+        };
+        let dim = theta.len();
+        return Ok(Some(MarginalSlopeBaselineOffsetThetaGeometry {
+            value: (0.0, 0.0),
+            first: vec![(0.0, 0.0); dim],
+            second: vec![vec![(0.0, 0.0); dim]; dim],
+        }));
+    }
     let Some(point) = evaluate_marginal_slope_baseline_point(age, cfg)? else {
         return Ok(None);
     };
@@ -3014,7 +3034,8 @@ fn marginal_slope_baseline_offset_theta_second_partials(
             second_out[i][j] = (q_ij, qt_ij);
         }
     }
-    Ok(Some(MarginalSlopeThetaSecondPartials {
+    Ok(Some(MarginalSlopeBaselineOffsetThetaGeometry {
+        value: (point.q, point.q_t),
         first: first_out,
         second: second_out,
     }))
@@ -3242,6 +3263,281 @@ pub fn build_survival_marginal_slope_baseline_offsets(
         cfg,
         BaselineOffsetEvaluator::ProbitSurvival,
     )
+}
+
+/// Rowwise value, gradient, and Hessian of the complete marginal-slope time
+/// offset with respect to a nonlinear survival-baseline chart.
+///
+/// The first-derivative arrays have shape `n × d` and the second-derivative
+/// arrays have shape `n × d × d`, where `d = theta.len()`. The value arrays may
+/// include a frozen non-baseline residual; that residual has zero derivatives.
+#[derive(Clone, Debug)]
+pub struct SurvivalMarginalSlopeOffsetGeometry {
+    pub baseline_config: SurvivalBaselineConfig,
+    pub theta: Array1<f64>,
+    pub offset_entry: Array1<f64>,
+    pub offset_exit: Array1<f64>,
+    pub derivative_offset_exit: Array1<f64>,
+    pub offset_entry_theta_first: Array2<f64>,
+    pub offset_exit_theta_first: Array2<f64>,
+    pub derivative_offset_exit_theta_first: Array2<f64>,
+    pub offset_entry_theta_second: Array3<f64>,
+    pub offset_exit_theta_second: Array3<f64>,
+    pub derivative_offset_exit_theta_second: Array3<f64>,
+}
+
+fn validate_marginal_slope_baseline_row_geometry(
+    row: &MarginalSlopeBaselineOffsetThetaGeometry,
+    dim: usize,
+    channel: &str,
+) -> Result<(), String> {
+    if row.first.len() != dim
+        || row.second.len() != dim
+        || row.second.iter().any(|axis| axis.len() != dim)
+    {
+        return Err(format!(
+            "survival marginal-slope baseline {channel} theta dimension drifted"
+        ));
+    }
+    if !row.value.0.is_finite()
+        || !row.value.1.is_finite()
+        || row
+            .first
+            .iter()
+            .any(|&(value, derivative)| !value.is_finite() || !derivative.is_finite())
+        || row.second.iter().flatten().any(|&(value, derivative)| {
+            !value.is_finite() || !derivative.is_finite()
+        })
+    {
+        return Err(format!(
+            "survival marginal-slope baseline {channel} geometry must be finite"
+        ));
+    }
+    Ok(())
+}
+
+/// Evaluate the nonlinear parametric baseline on every marginal-slope row.
+///
+/// This function evaluates only baseline-dependent offset geometry. It never
+/// constructs or mutates time designs, wiggle knots, penalties, or linear
+/// constraints. Linear baselines have no hyperparameter chart and return
+/// `None`.
+pub fn build_survival_marginal_slope_baseline_geometry(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<Option<SurvivalMarginalSlopeOffsetGeometry>, String> {
+    if age_entry.len() != age_exit.len() {
+        return Err(
+            "survival marginal-slope baseline geometry requires matching entry/exit lengths"
+                .to_string(),
+        );
+    }
+    let Some(theta) = survival_baseline_theta_from_config(cfg)? else {
+        return Ok(None);
+    };
+    let dim = theta.len();
+    let zero = || MarginalSlopeBaselineOffsetThetaGeometry {
+        value: (0.0, 0.0),
+        first: vec![(0.0, 0.0); dim],
+        second: vec![vec![(0.0, 0.0); dim]; dim],
+    };
+    let rows = (0..age_exit.len())
+        .into_par_iter()
+        .map(
+            |row_index| -> Result<
+                (
+                    MarginalSlopeBaselineOffsetThetaGeometry,
+                    MarginalSlopeBaselineOffsetThetaGeometry,
+                ),
+                String,
+            > {
+                let entry_age = age_entry[row_index];
+                if !entry_age.is_finite() {
+                    return Err(format!(
+                        "non-finite survival marginal-slope entry age at row {row_index}"
+                    ));
+                }
+                let entry = if entry_age <= 0.0 {
+                    zero()
+                } else {
+                    marginal_slope_baseline_offset_theta_geometry(entry_age, cfg)?.ok_or_else(
+                        || {
+                            "nonlinear survival baseline unexpectedly has no entry geometry"
+                                .to_string()
+                        },
+                    )?
+                };
+                let exit = marginal_slope_baseline_offset_theta_geometry(
+                    age_exit[row_index],
+                    cfg,
+                )?
+                .ok_or_else(|| {
+                    "nonlinear survival baseline unexpectedly has no exit geometry".to_string()
+                })?;
+                validate_marginal_slope_baseline_row_geometry(&entry, dim, "entry")?;
+                validate_marginal_slope_baseline_row_geometry(&exit, dim, "exit")?;
+                Ok((entry, exit))
+            },
+        )
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let n = rows.len();
+    let mut offset_entry = Array1::<f64>::zeros(n);
+    let mut offset_exit = Array1::<f64>::zeros(n);
+    let mut derivative_offset_exit = Array1::<f64>::zeros(n);
+    let mut offset_entry_theta_first = Array2::<f64>::zeros((n, dim));
+    let mut offset_exit_theta_first = Array2::<f64>::zeros((n, dim));
+    let mut derivative_offset_exit_theta_first = Array2::<f64>::zeros((n, dim));
+    let mut offset_entry_theta_second = Array3::<f64>::zeros((n, dim, dim));
+    let mut offset_exit_theta_second = Array3::<f64>::zeros((n, dim, dim));
+    let mut derivative_offset_exit_theta_second = Array3::<f64>::zeros((n, dim, dim));
+    for (row_index, (entry, exit)) in rows.into_iter().enumerate() {
+        offset_entry[row_index] = entry.value.0;
+        offset_exit[row_index] = exit.value.0;
+        derivative_offset_exit[row_index] = exit.value.1;
+        for axis in 0..dim {
+            offset_entry_theta_first[[row_index, axis]] = entry.first[axis].0;
+            offset_exit_theta_first[[row_index, axis]] = exit.first[axis].0;
+            derivative_offset_exit_theta_first[[row_index, axis]] = exit.first[axis].1;
+            for other_axis in 0..dim {
+                offset_entry_theta_second[[row_index, axis, other_axis]] =
+                    entry.second[axis][other_axis].0;
+                offset_exit_theta_second[[row_index, axis, other_axis]] =
+                    exit.second[axis][other_axis].0;
+                derivative_offset_exit_theta_second[[row_index, axis, other_axis]] =
+                    exit.second[axis][other_axis].1;
+            }
+        }
+    }
+    Ok(Some(SurvivalMarginalSlopeOffsetGeometry {
+        baseline_config: cfg.clone(),
+        theta,
+        offset_entry,
+        offset_exit,
+        derivative_offset_exit,
+        offset_entry_theta_first,
+        offset_exit_theta_first,
+        derivative_offset_exit_theta_first,
+        offset_entry_theta_second,
+        offset_exit_theta_second,
+        derivative_offset_exit_theta_second,
+    }))
+}
+
+/// A nonlinear baseline chart over already-prepared marginal-slope offsets.
+///
+/// Construction subtracts the initial parametric baseline from the prepared
+/// offset channels exactly once. Candidate evaluations add a new baseline to
+/// that same frozen residual. Consequently candidate theta values cannot move
+/// any prepared time design, wiggle knot, penalty, or feasibility cone; only
+/// the three row-offset value channels move, with analytic first and second
+/// derivatives supplied by the same evaluation.
+#[derive(Clone, Debug)]
+pub struct SurvivalMarginalSlopeFrozenOffsetChart {
+    age_entry: Array1<f64>,
+    age_exit: Array1<f64>,
+    target: SurvivalBaselineTarget,
+    initial_theta: Array1<f64>,
+    fixed_offset_entry: Array1<f64>,
+    fixed_offset_exit: Array1<f64>,
+    fixed_derivative_offset_exit: Array1<f64>,
+}
+
+impl SurvivalMarginalSlopeFrozenOffsetChart {
+    pub fn new(
+        age_entry: &Array1<f64>,
+        age_exit: &Array1<f64>,
+        initial_config: &SurvivalBaselineConfig,
+        prepared_offset_entry: &Array1<f64>,
+        prepared_offset_exit: &Array1<f64>,
+        prepared_derivative_offset_exit: &Array1<f64>,
+    ) -> Result<Self, String> {
+        let n = age_exit.len();
+        if age_entry.len() != n
+            || prepared_offset_entry.len() != n
+            || prepared_offset_exit.len() != n
+            || prepared_derivative_offset_exit.len() != n
+        {
+            return Err(format!(
+                "survival marginal-slope frozen offset chart length mismatch: entry={}, exit={n}, prepared_entry={}, prepared_exit={}, prepared_derivative={}",
+                age_entry.len(),
+                prepared_offset_entry.len(),
+                prepared_offset_exit.len(),
+                prepared_derivative_offset_exit.len(),
+            ));
+        }
+        if prepared_offset_entry
+            .iter()
+            .chain(prepared_offset_exit.iter())
+            .chain(prepared_derivative_offset_exit.iter())
+            .any(|value| !value.is_finite())
+        {
+            return Err(
+                "survival marginal-slope prepared offsets must be finite before freezing"
+                    .to_string(),
+            );
+        }
+        let initial_geometry = build_survival_marginal_slope_baseline_geometry(
+            age_entry,
+            age_exit,
+            initial_config,
+        )?
+        .ok_or_else(|| {
+            "survival marginal-slope frozen offset chart requires a nonlinear baseline"
+                .to_string()
+        })?;
+        Ok(Self {
+            age_entry: age_entry.clone(),
+            age_exit: age_exit.clone(),
+            target: initial_config.target,
+            initial_theta: initial_geometry.theta,
+            fixed_offset_entry: prepared_offset_entry - &initial_geometry.offset_entry,
+            fixed_offset_exit: prepared_offset_exit - &initial_geometry.offset_exit,
+            fixed_derivative_offset_exit: prepared_derivative_offset_exit
+                - &initial_geometry.derivative_offset_exit,
+        })
+    }
+
+    pub fn target(&self) -> SurvivalBaselineTarget {
+        self.target
+    }
+
+    pub fn initial_theta(&self) -> &Array1<f64> {
+        &self.initial_theta
+    }
+
+    pub fn fixed_offsets(&self) -> (&Array1<f64>, &Array1<f64>, &Array1<f64>) {
+        (
+            &self.fixed_offset_entry,
+            &self.fixed_offset_exit,
+            &self.fixed_derivative_offset_exit,
+        )
+    }
+
+    pub fn evaluate_initial(&self) -> Result<SurvivalMarginalSlopeOffsetGeometry, String> {
+        self.evaluate(&self.initial_theta)
+    }
+
+    pub fn evaluate(
+        &self,
+        theta: &Array1<f64>,
+    ) -> Result<SurvivalMarginalSlopeOffsetGeometry, String> {
+        let config = survival_baseline_config_from_theta(self.target, theta)?;
+        let mut geometry = build_survival_marginal_slope_baseline_geometry(
+            &self.age_entry,
+            &self.age_exit,
+            &config,
+        )?
+        .ok_or_else(|| {
+            "survival marginal-slope nonlinear baseline chart lost its theta coordinates"
+                .to_string()
+        })?;
+        geometry.offset_entry += &self.fixed_offset_entry;
+        geometry.offset_exit += &self.fixed_offset_exit;
+        geometry.derivative_offset_exit += &self.fixed_derivative_offset_exit;
+        Ok(geometry)
+    }
 }
 
 pub fn location_scale_uses_probit_survival_baseline(inverse_link: Option<&InverseLink>) -> bool {
@@ -3782,6 +4078,7 @@ mod tests {
     use super::{
         SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalTimeBasisConfig,
         baseline_chain_rule_gradient, baseline_offset_theta_partials,
+        build_survival_marginal_slope_baseline_geometry,
         build_survival_marginal_slope_baseline_offsets, build_survival_time_basis,
         build_survival_timewiggle_from_baseline, evaluate_survival_baseline,
         evaluate_survival_marginal_slope_baseline, fitted_weibull_baseline_from_linear_time_beta,
@@ -3791,7 +4088,7 @@ mod tests {
         optimize_survival_baseline_config_with_gradient,
         optimize_survival_baseline_config_with_gradient_only,
         resolve_survival_marginal_slope_time_anchor_value, survival_baseline_config_from_theta,
-        survival_baseline_theta_from_config,
+        survival_baseline_theta_from_config, SurvivalMarginalSlopeFrozenOffsetChart,
     };
     use crate::probability::normal_cdf;
     use crate::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
@@ -3832,6 +4129,128 @@ mod tests {
         assert_eq!(build.penalties.len(), 3);
         assert_eq!(build.nullspace_dims, vec![1, 2, 3]);
         assert!(build.ncols > 0);
+    }
+
+    #[test]
+    fn marginal_slope_frozen_offset_chart_moves_only_parametric_offsets() {
+        let age_entry = array![0.0, 0.75, 2.0];
+        let age_exit = array![1.5, 3.0, 5.5];
+        let initial_config = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::GompertzMakeham,
+            scale: None,
+            shape: Some(0.08),
+            rate: Some(0.22),
+            makeham: Some(0.04),
+        };
+        let initial_baseline = build_survival_marginal_slope_baseline_geometry(
+            &age_entry,
+            &age_exit,
+            &initial_config,
+        )
+        .expect("initial baseline geometry")
+        .expect("nonlinear chart");
+        let fixed_entry = array![0.125, -0.25, 0.375];
+        let fixed_exit = array![-0.45, 0.55, 0.65];
+        let fixed_derivative = array![0.015, 0.025, 0.035];
+        let prepared_entry = &initial_baseline.offset_entry + &fixed_entry;
+        let prepared_exit = &initial_baseline.offset_exit + &fixed_exit;
+        let prepared_derivative =
+            &initial_baseline.derivative_offset_exit + &fixed_derivative;
+        let chart = SurvivalMarginalSlopeFrozenOffsetChart::new(
+            &age_entry,
+            &age_exit,
+            &initial_config,
+            &prepared_entry,
+            &prepared_exit,
+            &prepared_derivative,
+        )
+        .expect("freeze prepared offsets");
+
+        let initial = chart.evaluate_initial().expect("evaluate initial theta");
+        for row in 0..age_exit.len() {
+            assert!((initial.offset_entry[row] - prepared_entry[row]).abs() < 1e-14);
+            assert!((initial.offset_exit[row] - prepared_exit[row]).abs() < 1e-14);
+            assert!(
+                (initial.derivative_offset_exit[row] - prepared_derivative[row]).abs() < 1e-14
+            );
+        }
+
+        let mut candidate_theta = chart.initial_theta().clone();
+        candidate_theta[0] += 0.3;
+        candidate_theta[1] -= 0.025;
+        candidate_theta[2] -= 0.2;
+        let candidate = chart
+            .evaluate(&candidate_theta)
+            .expect("evaluate candidate theta");
+        let candidate_baseline = build_survival_marginal_slope_baseline_geometry(
+            &age_entry,
+            &age_exit,
+            &candidate.baseline_config,
+        )
+        .expect("candidate baseline geometry")
+        .expect("nonlinear chart");
+        let frozen = chart.fixed_offsets();
+        for row in 0..age_exit.len() {
+            assert!(
+                (candidate.offset_entry[row]
+                    - candidate_baseline.offset_entry[row]
+                    - frozen.0[row])
+                    .abs()
+                    < 1e-14
+            );
+            assert!(
+                (candidate.offset_exit[row]
+                    - candidate_baseline.offset_exit[row]
+                    - frozen.1[row])
+                    .abs()
+                    < 1e-14
+            );
+            assert!(
+                (candidate.derivative_offset_exit[row]
+                    - candidate_baseline.derivative_offset_exit[row]
+                    - frozen.2[row])
+                    .abs()
+                    < 1e-14
+            );
+        }
+        assert_eq!(
+            candidate.offset_entry_theta_first,
+            candidate_baseline.offset_entry_theta_first
+        );
+        assert_eq!(
+            candidate.offset_exit_theta_first,
+            candidate_baseline.offset_exit_theta_first
+        );
+        assert_eq!(
+            candidate.derivative_offset_exit_theta_first,
+            candidate_baseline.derivative_offset_exit_theta_first
+        );
+        assert_eq!(
+            candidate.offset_entry_theta_second,
+            candidate_baseline.offset_entry_theta_second
+        );
+        assert_eq!(
+            candidate.offset_exit_theta_second,
+            candidate_baseline.offset_exit_theta_second
+        );
+        assert_eq!(
+            candidate.derivative_offset_exit_theta_second,
+            candidate_baseline.derivative_offset_exit_theta_second
+        );
+        assert!(
+            candidate
+                .offset_entry_theta_first
+                .row(0)
+                .iter()
+                .all(|value| *value == 0.0)
+        );
+        assert!(
+            candidate
+                .offset_entry_theta_second
+                .index_axis(ndarray::Axis(0), 0)
+                .iter()
+                .all(|value| *value == 0.0)
+        );
     }
 
     #[test]

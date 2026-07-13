@@ -1177,6 +1177,64 @@ pub(crate) fn exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
     }
 }
 
+/// Add the exact per-block and joint penalties to an owned returned-beta
+/// likelihood Hessian. This coefficient-space precision is shared by
+/// covariance and EDF; it is deliberately separate from `FitGeometry`, whose
+/// row-wise working-data contract cannot be inferred from a Hessian alone.
+pub(crate) fn penalized_hessian_from_owned_mode(
+    specs: &[ParameterBlockSpec],
+    per_block_log_lambdas: &[Array1<f64>],
+    options: &BlockwiseFitOptions,
+    unpenalized_hessian: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    let ranges = block_param_ranges(specs);
+    let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    if unpenalized_hessian.dim() != (total, total)
+        || unpenalized_hessian.iter().any(|value| !value.is_finite())
+    {
+        return Err(format!(
+            "owned returned-beta Hessian must be finite with shape {total}x{total}, got {}x{}",
+            unpenalized_hessian.nrows(),
+            unpenalized_hessian.ncols(),
+        ));
+    }
+    if per_block_log_lambdas.len() != specs.len() {
+        return Err(format!(
+            "owned returned-beta penalty layout has {} blocks, expected {}",
+            per_block_log_lambdas.len(),
+            specs.len(),
+        ));
+    }
+    let mut h = unpenalized_hessian.clone();
+    for (b, spec) in specs.iter().enumerate() {
+        let (start, end) = ranges[b];
+        let lambdas = exact_lambdas_from_log_strengths(
+            &per_block_log_lambdas[b],
+            &format!("owned returned-beta block {b} log strength"),
+        )?;
+        if lambdas.len() != spec.penalties.len() {
+            return Err(format!(
+                "owned returned-beta block {b} has {} smoothing strengths, expected {}",
+                lambdas.len(),
+                spec.penalties.len(),
+            ));
+        }
+        let mut s_lambda = Array2::<f64>::zeros((end - start, end - start));
+        for (k, s) in spec.penalties.iter().enumerate() {
+            s.add_scaled_to(lambdas[k], &mut s_lambda);
+        }
+        h.slice_mut(ndarray::s![start..end, start..end])
+            .scaled_add(1.0, &s_lambda);
+    }
+    if let Some(bundle) = options.joint_penalties.as_deref()
+        && !bundle.is_empty()
+    {
+        bundle.add_to_matrix(&mut h);
+    }
+    symmetrize_dense_in_place(&mut h);
+    Ok(h)
+}
+
 pub(crate) fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -1185,16 +1243,8 @@ pub(crate) fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + '
     options: &BlockwiseFitOptions,
     preferred_unpenalized_hessian: Option<&Array2<f64>>,
 ) -> Result<Array2<f64>, String> {
-    let ranges = block_param_ranges(specs);
-    let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    let mut h = if let Some(hessian) = preferred_unpenalized_hessian {
-        if hessian.dim() != (total, total) || hessian.iter().any(|value| !value.is_finite()) {
-            return Err(format!(
-                "preferred joint covariance Hessian must be finite with shape {total}x{total}, got {}x{}",
-                hessian.nrows(),
-                hessian.ncols(),
-            ));
-        }
+    let total = specs.iter().map(|spec| spec.design.ncols()).sum();
+    let unpenalized_hessian = if let Some(hessian) = preferred_unpenalized_hessian {
         hessian.clone()
     } else {
         let Some(hessian) = exact_newton_joint_hessian_symmetrized(
@@ -1212,35 +1262,12 @@ pub(crate) fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + '
         };
         hessian
     };
-    for (b, spec) in specs.iter().enumerate() {
-        let (start, end) = ranges[b];
-        let lambdas = exact_lambdas_from_log_strengths(
-            &per_block_log_lambdas[b],
-            &format!("joint covariance block {b} log strength"),
-        )?;
-        let mut s_lambda = Array2::<f64>::zeros((end - start, end - start));
-        for (k, s) in spec.penalties.iter().enumerate() {
-            s.add_scaled_to(lambdas[k], &mut s_lambda);
-        }
-        h.slice_mut(ndarray::s![start..end, start..end])
-            .scaled_add(1.0, &s_lambda);
-    }
-    // gam#1587/#561: families whose smoothing is carried by a full-width JOINT
-    // penalty (the multinomial centered `Σ_t λ_t (M ⊗ S_t)` metric) leave their
-    // per-block penalty lists empty — every block above contributes nothing — so
-    // the exported posterior precision MUST also add the joint contribution
-    // `Σ_t exp(ρ_t) S_t` at the SAME selected `ρ_t` the inner solve used. Without
-    // this the reported covariance is the UNPENALIZED `H_lik⁻¹` (standard errors
-    // silently too wide) and the EDF trace `tr(H⁻¹ S_λ)` reads zero (no smoothing
-    // spent), even though `fit_custom_family` threads the joint bundle through
-    // `options` for exactly this reason. A no-op for every per-block-only family
-    // (`joint_penalties` is `None`).
-    if let Some(bundle) = options.joint_penalties.as_deref()
-        && !bundle.is_empty()
-    {
-        bundle.add_to_matrix(&mut h);
-    }
-    symmetrize_dense_in_place(&mut h);
+    let h = penalized_hessian_from_owned_mode(
+        specs,
+        per_block_log_lambdas,
+        options,
+        &unpenalized_hessian,
+    )?;
     // #748 + audit-41: a Laplace posterior covariance exists only when the
     // posterior precision `H + S_λ` is strictly positive definite AT THE
     // CONVERGED OPTIMUM. Indefinite means the mode is not a maximum;

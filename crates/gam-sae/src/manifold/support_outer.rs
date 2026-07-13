@@ -288,14 +288,27 @@ impl SaeSupportOuterObjective {
         let joint_logdet = cache
             .arrow_log_det()
             .ok_or_else(|| outer_error("support LAML factor cache has no joint log determinant"))?;
-        let residual = self
-            .term
-            .raw_residual(self.target.view())
-            .map_err(outer_error)?;
-        let rss = residual.iter().map(|value| value * value).sum::<f64>();
-        if !(rss.is_finite() && rss > 0.0) {
+        // Gaussian dispersion argument = the PENALIZED deviance
+        //   D_p(ρ) = ‖y − ŷ‖² + β̂ᵀ S_ρ β̂ + (every other penalty the inner solve descends),
+        // NOT the raw residual sum of squares. This mirrors the canonical dense
+        // manifold path, whose profiled-scale data term ranks `loss.total()`
+        // (data_fit + smoothness + ard + sparsity) — the full penalized loss —
+        // precisely so the envelope theorem makes the analytic outer gradient
+        // exact (construction_quasi_laplace.rs:357). `penalized_objective` returns
+        // ½·D_p (½‖y−ŷ‖² + ½Σ_k λ_k β̂ᵀS_kβ̂ + ARD), so 2× recovers D_p. At the inner
+        // optimum β̂ minimizes the full penalized objective, hence the envelope
+        // theorem gives d D_p/dρ_g = ∂_ρ_g D_p|_{β̂} = Σ_{k∈g} λ_k β̂ᵀS_kβ̂ = energy[g]
+        // — the exact numerator the gradient below already forms. With the RAW rss
+        // instead, d(rss)/dρ_g carries an implicit H⁻¹ envelope term ≠ energy[g],
+        // so value and gradient would descend different functions (the desync bug).
+        let deviance = 2.0
+            * self
+                .term
+                .penalized_objective(self.target.view(), &lambda_smooth, &self.ard_precisions)
+                .map_err(outer_error)?;
+        if !(deviance.is_finite() && deviance > 0.0) {
             return Err(outer_error(format!(
-                "support LAML requires positive finite raw residual deviance; got {rss}"
+                "support LAML requires positive finite penalized deviance; got {deviance}"
             )));
         }
         let (_, beta_dim) = self.beta_layout()?;
@@ -320,14 +333,14 @@ impl SaeSupportOuterObjective {
         }
         let cost = 0.5
             * (joint_logdet - penalty_logdet
-                + residual_df * (1.0 + (std::f64::consts::TAU * rss / residual_df).ln()));
+                + residual_df * (1.0 + (std::f64::consts::TAU * deviance / residual_df).ln()));
         let traces = self.trace_by_group(&system, &cache, &lambda_smooth)?;
         let energy = self.penalty_energy_by_group(&lambda_smooth);
         let mut gradient = Array1::<f64>::zeros(self.layout.group_keys.len());
         for group in 0..gradient.len() {
             gradient[group] = 0.5
                 * (traces[group] - self.spectrum.rank_by_group[group] as f64
-                    + residual_df * energy[group] / rss);
+                    + residual_df * energy[group] / deviance);
         }
         if !cost.is_finite() || gradient.iter().any(|value| !value.is_finite()) {
             return Err(outer_error(

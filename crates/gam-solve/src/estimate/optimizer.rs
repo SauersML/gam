@@ -2488,8 +2488,6 @@ where
         smoothing_correction,
         smoothing_correction_method,
         penalized_hessian: penalized_hessian.into(),
-        working_weights: pirls_res.solveweights.to_owned(),
-        working_response: pirls_res.solveworking_response.to_owned(),
         reparam_qs: Some(pirls_res.reparam_result.qs.clone()),
         dispersion,
         beta_covariance,
