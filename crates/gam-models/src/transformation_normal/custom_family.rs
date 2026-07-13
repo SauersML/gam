@@ -387,9 +387,14 @@ impl CustomFamily for TransformationNormalFamily {
         &self,
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
-        psi_derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err("TransformationNormalFamily does not declare family-owned hyper axes"
+                .to_string());
+        }
+        let psi_derivs = hyper_layout.design_derivative_blocks();
         if psi_derivs.is_empty() || psi_index >= psi_derivs[0].len() {
             return Ok(None);
         }
@@ -428,10 +433,15 @@ impl CustomFamily for TransformationNormalFamily {
         &self,
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
-        psi_derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err("TransformationNormalFamily does not declare family-owned hyper axes"
+                .to_string());
+        }
+        let psi_derivs = hyper_layout.design_derivative_blocks();
         if psi_derivs.is_empty() || psi_i >= psi_derivs[0].len() || psi_j >= psi_derivs[0].len() {
             return Ok(None);
         }
@@ -534,10 +544,15 @@ impl CustomFamily for TransformationNormalFamily {
         &self,
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
-        psi_derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err("TransformationNormalFamily does not declare family-owned hyper axes"
+                .to_string());
+        }
+        let psi_derivs = hyper_layout.design_derivative_blocks();
         if psi_derivs.is_empty() || psi_index >= psi_derivs[0].len() {
             return Ok(None);
         }
@@ -594,8 +609,12 @@ impl CustomFamily for TransformationNormalFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err("TransformationNormalFamily does not declare family-owned hyper axes"
+                .to_string());
+        }
         if !self.inner_coefficient_hessian_hvp_available(specs) {
             return Err(TransformationNormalError::InvalidInput {
                 reason: "TransformationNormalFamily joint psi workspace received incompatible block specs"
@@ -606,7 +625,7 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(Some(Arc::new(TransformationNormalPsiWorkspace::new(
             self.clone(),
             block_states.to_vec(),
-            derivative_blocks.to_vec(),
+            hyper_layout.design_derivative_blocks().to_vec(),
         ))))
     }
 
@@ -633,9 +652,13 @@ impl CustomFamily for TransformationNormalFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        hyper_layout: &CustomFamilyHyperLayout,
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        if hyper_layout.family_axis_count() != 0 {
+            return Err("TransformationNormalFamily does not declare family-owned hyper axes"
+                .to_string());
+        }
         if !self.inner_coefficient_hessian_hvp_available(specs) {
             return Err(TransformationNormalError::InvalidInput {
                 reason: "TransformationNormalFamily joint psi workspace received incompatible block specs"
@@ -662,7 +685,7 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(Some(Arc::new(TransformationNormalPsiWorkspace::new(
             family,
             block_states.to_vec(),
-            derivative_blocks.to_vec(),
+            hyper_layout.design_derivative_blocks().to_vec(),
         ))))
     }
 
