@@ -275,6 +275,11 @@ impl<'a> BmsFlexRowKernelInputs<'a> {
     /// Sanity-check every shape the kernel relies on. This is the only place
     /// length errors are surfaced — the device kernel assumes valid layout.
     pub(crate) fn validate(&self) -> Result<(), GpuError> {
+        if self.n_rows == 0 {
+            return Err(GpuError::DriverCallFailed {
+                reason: "bms_flex_row inputs: n_rows must be > 0".to_string(),
+            });
+        }
         if self.r == 0 {
             return Err(GpuError::DriverCallFailed {
                 reason: "bms_flex_row inputs: r must be > 0".to_string(),
@@ -1209,10 +1214,10 @@ pub(crate) const HVP_THREADS: u32 = 128;
 #[cfg(target_os = "linux")]
 pub(crate) const REDUCTION_THREADS: u32 = 256;
 
-/// Maximum RHS columns fused into one row-primary HVP launch. The matching
-/// CUDA source uses fixed shared arrays sized as
-/// `BMS_FLEX_ROW_HVP_MAX_RHS * MAX_R`; increasing this requires updating the
-/// `MAX_MULTI_RHS` define in `HVP_KERNEL_SOURCE`.
+/// Maximum RHS columns fused into one row-primary HVP launch. This is an
+/// internal batching width, not a matrix-width limit: wider dense matrices are
+/// materialised in consecutive batches. The CUDA source has four scalar
+/// shared arrays of this length; primary directions are derived on demand.
 #[cfg(target_os = "linux")]
 pub(crate) const BMS_FLEX_ROW_HVP_MAX_RHS: usize = 8;
 
@@ -1224,18 +1229,6 @@ pub(crate) const BMS_FLEX_ROW_HVP_MAX_RHS: usize = 8;
 /// so every downstream value/score/Hessian consumer shares one row evaluation
 /// without round-tripping the large cache through host RAM. Drop releases the
 /// device memory back to the CUDA runtime.
-/// Per-row Hessian storage layout on the device. The build path is free to
-/// emit either, and the Hv / diag kernels read whichever the storage says.
-///
-/// Charter (Block 9 Phase 4): packed-upper halves the DRAM footprint of the
-/// `n × r²` cache (per-row `r*(r+1)/2` doubles instead of `r²`), at the cost
-/// of a single per-entry index conversion in the kernel. The benchmark
-/// decides whether the packed path becomes the default for large-scale
-/// fits (`r = 20` → 210 vs 400 doubles per row, ~47.5% smaller). The
-/// numerics are bit-equal because each `H_i` is symmetric by construction
-/// (the row kernel emits a symmetric block by construction — see the
-/// symmetric scratch-write loop in `bms_flex_row_kernel`'s shared-memory
-/// finaliser).
 #[cfg(target_os = "linux")]
 pub struct DeviceResidentRowHess {
     /// Per-row negative log likelihood emitted by the same canonical row
@@ -1691,7 +1684,7 @@ extern "C" __global__ void bms_flex_row_diag_partial(
         const double *grow = logslope_design + (size_t)row * (size_t)p_g;
         const double *Hrow = row_hessians + (size_t)row * (size_t)r * (size_t)r;
         double h00 = Hrow[0];
-        double h11 = Hrow[1 * r + 1];
+        double h11 = Hrow[(size_t)r + 1U];
         for (int j = tid; j < p_m; j += blockDim.x) {
             double v = mrow[j];
             out[j] += h00 * v * v;
@@ -1703,172 +1696,13 @@ extern "C" __global__ void bms_flex_row_diag_partial(
         if (tid == 0) {
             for (int k = 0; k < h_block_len; ++k) {
                 int ii = h_primary_start + k;
-                out[h_block_start + k] += Hrow[ii * r + ii];
+                out[h_block_start + k] +=
+                    Hrow[(size_t)ii * (size_t)r + (size_t)ii];
             }
             for (int k = 0; k < w_block_len; ++k) {
                 int ii = w_primary_start + k;
-                out[w_block_start + k] += Hrow[ii * r + ii];
-            }
-        }
-        __syncthreads();
-    }
-}
-
-// ────────────────────────────────────────────────────────────────────────
-// Phase 4 — SymmetricPackedUpper variants. Per-row storage is
-//   row_hessians_packed + (size_t)row * (size_t)(r*(r+1)/2)
-// indexed as
-//   packed[(u*(2*r - u - 1))/2 + (v - u)]   for u <= v
-// with symmetric mirror for v < u.
-// ────────────────────────────────────────────────────────────────────────
-
-// Helper: packed-upper index for (u, v) within a single row of r*(r+1)/2
-// doubles. Caller must pre-swap so that u <= v.
-__device__ __forceinline__ int bms_flex_packed_idx(int u, int v, int r) {
-    // u*(2r - u - 1)/2 + (v - u)
-    return (u * (2 * r - u - 1)) / 2 + (v - u);
-}
-
-// Pack one row of the full row-major r×r Hessian into packed-upper layout.
-// Launched as one CTA per row (gridDim.x = n_rows, blockDim.x configurable).
-// Bit-equal copy: each upper-triangle entry is read once from the dense
-// source and written once to the packed destination.
-extern "C" __global__ void bms_flex_row_pack_upper(
-    int                  n_rows,
-    int                  r,
-    const double * __restrict__ src_full,    // [n, r*r]
-    double       * __restrict__ dst_packed)  // [n, r*(r+1)/2]
-{
-    int row = blockIdx.x;
-    if (row >= n_rows) return;
-    int tid = threadIdx.x;
-    int per_row = r * (r + 1) / 2;
-    const double *src = src_full + (size_t)row * (size_t)r * (size_t)r;
-    double       *dst = dst_packed + (size_t)row * (size_t)per_row;
-    // Linear scan over packed positions; map each back to (u, v).
-    for (int pos = tid; pos < per_row; pos += blockDim.x) {
-        // Invert: for u in [0, r), the range [u_start, u_start + (r - u))
-        // contains positions for that u. u_start = u*(2r - u - 1)/2.
-        // Solve smallest u with u*(2r - u - 1)/2 > pos to get u (then
-        // back off by one); equivalent O(r) linear scan with r <= 32.
-        int u = 0;
-        int u_start = 0;
-        while (u < r) {
-            int next = u_start + (r - u);
-            if (pos < next) break;
-            u_start = next;
-            ++u;
-        }
-        int v = u + (pos - u_start);
-        dst[pos] = src[(size_t)u * (size_t)r + (size_t)v];
-    }
-}
-
-extern "C" __global__ void bms_flex_row_hvp_partial_packed(
-    int                  n_rows,
-    int                  r,
-    int                  p_m,
-    int                  p_g,
-    int                  p_total,
-    int                  h_block_start,
-    int                  h_block_len,
-    int                  w_block_start,
-    int                  w_block_len,
-    int                  h_primary_start,
-    int                  w_primary_start,
-    int                  rows_per_cta,
-    const double * __restrict__ row_hessians_packed, // [n, r*(r+1)/2]
-    const double * __restrict__ marginal_design,
-    const double * __restrict__ logslope_design,
-    const double * __restrict__ v,
-    double       * __restrict__ partial)
-{
-    int chunk = blockIdx.x;
-    int tid   = threadIdx.x;
-    int row_lo = chunk * rows_per_cta;
-    int row_hi = row_lo + rows_per_cta;
-    if (row_hi > n_rows) row_hi = n_rows;
-
-    int per_row = r * (r + 1) / 2;
-    double *out = partial + (size_t)chunk * (size_t)p_total;
-    for (int j = tid; j < p_total; j += blockDim.x) {
-        out[j] = 0.0;
-    }
-    __syncthreads();
-
-    __shared__ double row_dir[32];
-    __shared__ double action[32];
-    __shared__ double dot_reduce[128];
-
-    for (int row = row_lo; row < row_hi; ++row) {
-        const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
-        const double *grow = logslope_design + (size_t)row * (size_t)p_g;
-        const double *Hrow = row_hessians_packed + (size_t)row * (size_t)per_row;
-
-        // row_dir[0] = mrow · v[0..p_m]
-        double local = 0.0;
-        for (int j = tid; j < p_m; j += blockDim.x) {
-            local += mrow[j] * v[j];
-        }
-        dot_reduce[tid] = local;
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) dot_reduce[tid] += dot_reduce[tid + stride];
-            __syncthreads();
-        }
-        if (tid == 0) row_dir[0] = dot_reduce[0];
-
-        // row_dir[1] = grow · v[p_m..p_m+p_g]
-        local = 0.0;
-        for (int j = tid; j < p_g; j += blockDim.x) {
-            local += grow[j] * v[p_m + j];
-        }
-        dot_reduce[tid] = local;
-        __syncthreads();
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) dot_reduce[tid] += dot_reduce[tid + stride];
-            __syncthreads();
-        }
-        if (tid == 0) row_dir[1] = dot_reduce[0];
-
-        if (tid == 0) {
-            for (int k = 0; k < h_block_len; ++k) {
-                row_dir[h_primary_start + k] = v[h_block_start + k];
-            }
-            for (int k = 0; k < w_block_len; ++k) {
-                row_dir[w_primary_start + k] = v[w_block_start + k];
-            }
-        }
-        __syncthreads();
-
-        // action[u] = Σ_w H[u, w] · row_dir[w], where H[u, w] reads from
-        // packed-upper with (uu, vv) = (min(u, w), max(u, w)).
-        if (tid < r) {
-            double acc = 0.0;
-            int u = tid;
-            for (int w = 0; w < r; ++w) {
-                int uu = u < w ? u : w;
-                int vv = u < w ? w : u;
-                acc += Hrow[bms_flex_packed_idx(uu, vv, r)] * row_dir[w];
-            }
-            action[tid] = acc;
-        }
-        __syncthreads();
-
-        double a0 = action[0];
-        for (int j = tid; j < p_m; j += blockDim.x) {
-            out[j] += a0 * mrow[j];
-        }
-        double a1 = action[1];
-        for (int j = tid; j < p_g; j += blockDim.x) {
-            out[p_m + j] += a1 * grow[j];
-        }
-        if (tid == 0) {
-            for (int k = 0; k < h_block_len; ++k) {
-                out[h_block_start + k] += action[h_primary_start + k];
-            }
-            for (int k = 0; k < w_block_len; ++k) {
-                out[w_block_start + k] += action[w_primary_start + k];
+                out[w_block_start + k] +=
+                    Hrow[(size_t)ii * (size_t)r + (size_t)ii];
             }
         }
         __syncthreads();
@@ -1946,7 +1780,7 @@ extern "C" __global__ void bms_flex_row_dense_block_partial(
             const double *Hrow = row_hessians + (size_t)row * (size_t)r * (size_t)r;
             for (int u = 0; u < r; ++u) {
                 for (int v = 0; v < r; ++v) {
-                    double huv = Hrow[u * r + v];
+                    double huv = Hrow[(size_t)u * (size_t)r + (size_t)v];
                     if (huv == 0.0) continue;
                     // For each (u, v), iterate (m, n) over the non-zero
                     // outer-product support of phi_u and phi_v.
@@ -2013,65 +1847,6 @@ extern "C" __global__ void bms_flex_row_dense_block_reduce(
     out[j] = acc;
 }
 
-extern "C" __global__ void bms_flex_row_diag_partial_packed(
-    int                  n_rows,
-    int                  r,
-    int                  p_m,
-    int                  p_g,
-    int                  p_total,
-    int                  h_block_start,
-    int                  h_block_len,
-    int                  w_block_start,
-    int                  w_block_len,
-    int                  h_primary_start,
-    int                  w_primary_start,
-    int                  rows_per_cta,
-    const double * __restrict__ row_hessians_packed,
-    const double * __restrict__ marginal_design,
-    const double * __restrict__ logslope_design,
-    double       * __restrict__ partial)
-{
-    int chunk = blockIdx.x;
-    int tid   = threadIdx.x;
-    int row_lo = chunk * rows_per_cta;
-    int row_hi = row_lo + rows_per_cta;
-    if (row_hi > n_rows) row_hi = n_rows;
-
-    int per_row = r * (r + 1) / 2;
-    double *out = partial + (size_t)chunk * (size_t)p_total;
-    for (int j = tid; j < p_total; j += blockDim.x) {
-        out[j] = 0.0;
-    }
-    __syncthreads();
-
-    for (int row = row_lo; row < row_hi; ++row) {
-        const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
-        const double *grow = logslope_design + (size_t)row * (size_t)p_g;
-        const double *Hrow = row_hessians_packed + (size_t)row * (size_t)per_row;
-        // Diagonal entry for (u, u) sits at packed_idx(u, u, r).
-        double h00 = Hrow[bms_flex_packed_idx(0, 0, r)];
-        double h11 = Hrow[bms_flex_packed_idx(1, 1, r)];
-        for (int j = tid; j < p_m; j += blockDim.x) {
-            double v = mrow[j];
-            out[j] += h00 * v * v;
-        }
-        for (int j = tid; j < p_g; j += blockDim.x) {
-            double v = grow[j];
-            out[p_m + j] += h11 * v * v;
-        }
-        if (tid == 0) {
-            for (int k = 0; k < h_block_len; ++k) {
-                int ii = h_primary_start + k;
-                out[h_block_start + k] += Hrow[bms_flex_packed_idx(ii, ii, r)];
-            }
-            for (int k = 0; k < w_block_len; ++k) {
-                int ii = w_primary_start + k;
-                out[w_block_start + k] += Hrow[bms_flex_packed_idx(ii, ii, r)];
-            }
-        }
-        __syncthreads();
-    }
-}
 "#;
 
 #[cfg(target_os = "linux")]

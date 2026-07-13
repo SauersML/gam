@@ -1,22 +1,24 @@
 //! Typed atom geometry authority shared by seed, fit, rebuild, and OOS paths.
 //!
 //! A basis width is a theorem of a topology plus its resolution; it is not an
-//! independently writable property.  Likewise, the smoothing operator belongs
-//! to a declared reference metric.  This module keeps those two choices paired
-//! so persisted scalar metadata is validated once at the boundary and every
-//! internal consumer rebuilds the same evaluator and penalty.
+//! independently writable property. Likewise, the smoothing operator belongs
+//! to a declared reference metric. Persisted models store this tagged plan
+//! directly. There is intentionally no loader that reconstructs it from the
+//! former parallel `(kind, harmonic_order, basis_width)` scalars.
 
 use super::*;
 
 /// Basis-native resolution of one analytic atom family.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SaeBasisResolution {
     PeriodicHarmonics { order: usize },
     SphereChart,
     TorusHarmonics { per_axis_order: usize },
     ProjectivePlaneHarmonics { quotient_order: usize },
     KleinBottleHarmonics { per_axis_order: usize },
-    DuchonCoordinates { basis_size: usize },
+    /// Duchon centers are the resolution authority. The evaluator derives its
+    /// width from these centers and the dimension-derived null-space order.
+    DuchonCoordinates { centers: Array2<f64> },
     Polynomial { degree: usize },
     CylinderHarmonics {
         circle_order: usize,
@@ -31,16 +33,16 @@ pub enum SaeBasisResolution {
 }
 
 /// Reference geometry whose function-space seminorm the atom stores.
-///
-/// These are geometric declarations, not coefficient-size fallbacks.  The two
-/// quotient metrics route directly to the cover-restricted spectral operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SaeReferenceMetricPlan {
     UnitCircle,
     SphereChart,
-    UnitFlatTorus,
-    UnitRoundProjectivePlane,
-    UnitFlatKleinBottle,
+    /// Flat rectangular torus with log aspect `tau`; `tau = 0` is square.
+    FlatRectangularTorus { tau: f64 },
+    /// Embedded donut torus with aspect `A = cosh(tau) > 1`.
+    EmbeddedDonutTorus { tau: f64 },
+    RoundProjectivePlane,
+    FlatKleinBottle,
     EuclideanDuchon,
     EuclideanPolynomial,
     UnitPoincareBall,
@@ -50,8 +52,8 @@ pub enum SaeReferenceMetricPlan {
     CallerProvided,
 }
 
-/// Complete analytic geometry plan for one atom.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Complete persisted analytic geometry plan for one atom.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SaeAtomGeometryPlan {
     kind: SaeAtomBasisKind,
     latent_dim: usize,
@@ -70,88 +72,102 @@ impl SaeAtomGeometryPlan {
         if latent_dim == 0 {
             return Err("SaeAtomGeometryPlan requires latent_dim >= 1".to_string());
         }
-        let valid = matches!(
-            (&kind, latent_dim, &resolution, reference_metric),
+        let semantic_match = match (&kind, latent_dim, &resolution, &reference_metric) {
             (
                 SaeAtomBasisKind::Periodic,
                 1,
-                SaeBasisResolution::PeriodicHarmonics { order: 1.. },
+                SaeBasisResolution::PeriodicHarmonics { order },
                 SaeReferenceMetricPlan::UnitCircle,
-            )
-                | (
-                    SaeAtomBasisKind::Sphere,
-                    2,
-                    SaeBasisResolution::SphereChart,
-                    SaeReferenceMetricPlan::SphereChart,
-                )
-                | (
-                    SaeAtomBasisKind::Torus,
-                    _,
-                    SaeBasisResolution::TorusHarmonics { per_axis_order: 1.. },
-                    SaeReferenceMetricPlan::UnitFlatTorus,
-                )
-                | (
-                    SaeAtomBasisKind::ProjectivePlane,
-                    2,
-                    SaeBasisResolution::ProjectivePlaneHarmonics { quotient_order: 1.. },
-                    SaeReferenceMetricPlan::UnitRoundProjectivePlane,
-                )
-                | (
-                    SaeAtomBasisKind::KleinBottle,
-                    2,
-                    SaeBasisResolution::KleinBottleHarmonics { per_axis_order: 2.. },
-                    SaeReferenceMetricPlan::UnitFlatKleinBottle,
-                )
-                | (
-                    SaeAtomBasisKind::Duchon,
-                    _,
-                    SaeBasisResolution::DuchonCoordinates { basis_size: 1.. },
-                    SaeReferenceMetricPlan::EuclideanDuchon,
-                )
-                | (
-                    SaeAtomBasisKind::Linear | SaeAtomBasisKind::EuclideanPatch,
-                    _,
-                    SaeBasisResolution::Polynomial { .. },
-                    SaeReferenceMetricPlan::EuclideanPolynomial,
-                )
-                | (
-                    SaeAtomBasisKind::Poincare,
-                    _,
-                    SaeBasisResolution::Polynomial { .. },
-                    SaeReferenceMetricPlan::UnitPoincareBall,
-                )
-                | (
-                    SaeAtomBasisKind::Cylinder,
-                    2,
-                    SaeBasisResolution::CylinderHarmonics {
-                        circle_order: 1..,
-                        ..
-                    },
-                    SaeReferenceMetricPlan::CylinderProduct,
-                )
-                | (
-                    SaeAtomBasisKind::Mobius,
-                    2,
-                    SaeBasisResolution::MobiusHarmonics {
-                        circle_order: 1..,
-                        ..
-                    },
-                    SaeReferenceMetricPlan::MobiusQuotient,
-                )
-                | (
-                    SaeAtomBasisKind::FiniteSet,
-                    _,
-                    SaeBasisResolution::FiniteAnchors { anchors: 1.. },
-                    SaeReferenceMetricPlan::DiscreteCounting,
-                )
-                | (
-                    SaeAtomBasisKind::Precomputed(_),
-                    _,
-                    SaeBasisResolution::Precomputed { basis_size: 1.. },
-                    SaeReferenceMetricPlan::CallerProvided,
-                )
-        );
-        if !valid {
+            ) => *order >= 1,
+            (
+                SaeAtomBasisKind::Sphere,
+                2,
+                SaeBasisResolution::SphereChart,
+                SaeReferenceMetricPlan::SphereChart,
+            ) => true,
+            (
+                SaeAtomBasisKind::Torus,
+                2..,
+                SaeBasisResolution::TorusHarmonics { per_axis_order },
+                SaeReferenceMetricPlan::FlatRectangularTorus { tau },
+            ) => *per_axis_order >= 1 && tau.is_finite(),
+            (
+                SaeAtomBasisKind::Torus,
+                2,
+                SaeBasisResolution::TorusHarmonics { per_axis_order },
+                SaeReferenceMetricPlan::EmbeddedDonutTorus { tau },
+            ) => *per_axis_order >= 1 && tau.is_finite() && *tau > 0.0,
+            (
+                SaeAtomBasisKind::ProjectivePlane,
+                2,
+                SaeBasisResolution::ProjectivePlaneHarmonics { quotient_order },
+                SaeReferenceMetricPlan::RoundProjectivePlane,
+            ) => *quotient_order >= 1,
+            (
+                SaeAtomBasisKind::KleinBottle,
+                2,
+                SaeBasisResolution::KleinBottleHarmonics { per_axis_order },
+                SaeReferenceMetricPlan::FlatKleinBottle,
+            ) => *per_axis_order >= 2,
+            (
+                SaeAtomBasisKind::Duchon,
+                _,
+                SaeBasisResolution::DuchonCoordinates { centers },
+                SaeReferenceMetricPlan::EuclideanDuchon,
+            ) => {
+                centers.nrows() > 0
+                    && centers.ncols() == latent_dim
+                    && centers.iter().all(|value| value.is_finite())
+            }
+            (
+                SaeAtomBasisKind::Linear,
+                _,
+                SaeBasisResolution::Polynomial { degree },
+                SaeReferenceMetricPlan::EuclideanPolynomial,
+            ) => *degree == 1,
+            (
+                SaeAtomBasisKind::EuclideanPatch,
+                _,
+                SaeBasisResolution::Polynomial { degree },
+                SaeReferenceMetricPlan::EuclideanPolynomial,
+            ) => {
+                (SAE_EUCLIDEAN_PATCH_MAX_DEGREE
+                    ..=SAE_EUCLIDEAN_PATCH_RECOVERY_MAX_DEGREE)
+                    .contains(degree)
+            }
+            (
+                SaeAtomBasisKind::Poincare,
+                _,
+                SaeBasisResolution::Polynomial { degree },
+                SaeReferenceMetricPlan::UnitPoincareBall,
+            ) => *degree == SAE_EUCLIDEAN_PATCH_MAX_DEGREE,
+            (
+                SaeAtomBasisKind::Cylinder,
+                2,
+                SaeBasisResolution::CylinderHarmonics { circle_order, .. },
+                SaeReferenceMetricPlan::CylinderProduct,
+            ) => *circle_order >= 1,
+            (
+                SaeAtomBasisKind::Mobius,
+                2,
+                SaeBasisResolution::MobiusHarmonics { circle_order, .. },
+                SaeReferenceMetricPlan::MobiusQuotient,
+            ) => *circle_order >= 1,
+            (
+                SaeAtomBasisKind::FiniteSet,
+                _,
+                SaeBasisResolution::FiniteAnchors { anchors },
+                SaeReferenceMetricPlan::DiscreteCounting,
+            ) => *anchors >= 2,
+            (
+                SaeAtomBasisKind::Precomputed(_),
+                _,
+                SaeBasisResolution::Precomputed { basis_size },
+                SaeReferenceMetricPlan::CallerProvided,
+            ) => *basis_size >= 1,
+            _ => false,
+        };
+        if !semantic_match {
             return Err(format!(
                 "invalid atom geometry tuple: kind={kind:?}, latent_dim={latent_dim}, resolution={resolution:?}, reference_metric={reference_metric:?}"
             ));
@@ -171,7 +187,7 @@ impl SaeAtomGeometryPlan {
             SaeAtomBasisKind::ProjectivePlane,
             2,
             SaeBasisResolution::ProjectivePlaneHarmonics { quotient_order },
-            SaeReferenceMetricPlan::UnitRoundProjectivePlane,
+            SaeReferenceMetricPlan::RoundProjectivePlane,
         )
     }
 
@@ -180,7 +196,7 @@ impl SaeAtomGeometryPlan {
             SaeAtomBasisKind::KleinBottle,
             2,
             SaeBasisResolution::KleinBottleHarmonics { per_axis_order },
-            SaeReferenceMetricPlan::UnitFlatKleinBottle,
+            SaeReferenceMetricPlan::FlatKleinBottle,
         )
     }
 
@@ -196,237 +212,99 @@ impl SaeAtomGeometryPlan {
         &self.resolution
     }
 
-    pub fn reference_metric(&self) -> SaeReferenceMetricPlan {
-        self.reference_metric
+    pub fn reference_metric(&self) -> &SaeReferenceMetricPlan {
+        &self.reference_metric
     }
 
-    /// Width derived from the typed resolution.  No caller supplies a second
-    /// width for analytic families.
+    pub fn duchon_centers(&self) -> Option<&Array2<f64>> {
+        match &self.resolution {
+            SaeBasisResolution::DuchonCoordinates { centers } => Some(centers),
+            _ => None,
+        }
+    }
+
+    /// Width derived from the tagged resolution.
     pub fn basis_size(&self) -> Result<usize, String> {
-        match self.resolution {
-            SaeBasisResolution::PeriodicHarmonics { order } => sae_periodic_basis_size(order),
+        match &self.resolution {
+            SaeBasisResolution::PeriodicHarmonics { order } => sae_periodic_basis_size(*order),
             SaeBasisResolution::SphereChart => Ok(SAE_SPHERE_BASIS_SIZE),
             SaeBasisResolution::TorusHarmonics { per_axis_order } => {
-                TorusHarmonicEvaluator::new(self.latent_dim, per_axis_order)
+                TorusHarmonicEvaluator::new(self.latent_dim, *per_axis_order)
                     .map(|evaluator| evaluator.basis_size())
             }
             SaeBasisResolution::ProjectivePlaneHarmonics { quotient_order } => {
-                projective_plane_basis_size(quotient_order)
+                projective_plane_basis_size(*quotient_order)
             }
             SaeBasisResolution::KleinBottleHarmonics { per_axis_order } => {
-                klein_bottle_basis_size(per_axis_order)
+                klein_bottle_basis_size(*per_axis_order)
             }
-            SaeBasisResolution::DuchonCoordinates { basis_size }
-            | SaeBasisResolution::Precomputed { basis_size } => Ok(basis_size),
-            SaeBasisResolution::Polynomial { degree } => {
-                Ok(gam_terms::basis::monomial_exponents(self.latent_dim, degree).len())
+            SaeBasisResolution::DuchonCoordinates { centers } => {
+                let evaluator = DuchonCoordinateEvaluator::new(
+                    centers.clone(),
+                    sae_duchon_atom_m(self.latent_dim),
+                )?;
+                let probe = Array2::<f64>::zeros((1, self.latent_dim));
+                evaluator
+                    .evaluate(probe.view())
+                    .map(|(phi, _)| phi.ncols())
             }
+            SaeBasisResolution::Polynomial { degree } => Ok(
+                gam_terms::basis::monomial_exponents(self.latent_dim, *degree).len(),
+            ),
             SaeBasisResolution::CylinderHarmonics {
                 circle_order,
                 line_degree,
-            } => CylinderHarmonicEvaluator::new(circle_order, line_degree)
+            } => CylinderHarmonicEvaluator::new(*circle_order, *line_degree)
                 .map(|evaluator| evaluator.basis_size()),
             SaeBasisResolution::MobiusHarmonics {
                 circle_order,
                 width_degree,
-            } => MobiusHarmonicEvaluator::new(circle_order, width_degree)
+            } => MobiusHarmonicEvaluator::new(*circle_order, *width_degree)
                 .map(|evaluator| evaluator.basis_size()),
-            SaeBasisResolution::FiniteAnchors { anchors } => Ok(anchors),
+            SaeBasisResolution::FiniteAnchors { anchors } => Ok(*anchors),
+            SaeBasisResolution::Precomputed { basis_size } => Ok(*basis_size),
         }
-    }
-
-    /// Scalar harmonic metadata emitted by the current artifact wire format.
-    /// This is a derived projection of [`Self::resolution`], never an authority.
-    pub fn stored_harmonic_order(&self) -> usize {
-        match self.resolution {
-            SaeBasisResolution::PeriodicHarmonics { order } => order,
-            SaeBasisResolution::TorusHarmonics { per_axis_order }
-            | SaeBasisResolution::KleinBottleHarmonics { per_axis_order } => per_axis_order,
-            SaeBasisResolution::ProjectivePlaneHarmonics { quotient_order } => quotient_order,
-            SaeBasisResolution::CylinderHarmonics { circle_order, .. }
-            | SaeBasisResolution::MobiusHarmonics { circle_order, .. } => circle_order,
-            _ => 0,
-        }
-    }
-
-    /// Reconstruct and validate a typed plan from persisted scalar metadata.
-    /// `persisted_basis_size` is an integrity check for analytic families, not a
-    /// second source of width.
-    pub fn from_persisted(
-        kind: SaeAtomBasisKind,
-        latent_dim: usize,
-        stored_harmonic_order: usize,
-        persisted_basis_size: usize,
-    ) -> Result<Self, String> {
-        let (resolution, reference_metric) = match &kind {
-            SaeAtomBasisKind::Periodic => (
-                SaeBasisResolution::PeriodicHarmonics {
-                    order: stored_harmonic_order,
-                },
-                SaeReferenceMetricPlan::UnitCircle,
-            ),
-            SaeAtomBasisKind::Sphere => {
-                require_zero_harmonics(&kind, stored_harmonic_order)?;
-                (
-                    SaeBasisResolution::SphereChart,
-                    SaeReferenceMetricPlan::SphereChart,
-                )
-            }
-            SaeAtomBasisKind::Torus => (
-                SaeBasisResolution::TorusHarmonics {
-                    per_axis_order: stored_harmonic_order,
-                },
-                SaeReferenceMetricPlan::UnitFlatTorus,
-            ),
-            SaeAtomBasisKind::ProjectivePlane => (
-                SaeBasisResolution::ProjectivePlaneHarmonics {
-                    quotient_order: stored_harmonic_order,
-                },
-                SaeReferenceMetricPlan::UnitRoundProjectivePlane,
-            ),
-            SaeAtomBasisKind::KleinBottle => (
-                SaeBasisResolution::KleinBottleHarmonics {
-                    per_axis_order: stored_harmonic_order,
-                },
-                SaeReferenceMetricPlan::UnitFlatKleinBottle,
-            ),
-            SaeAtomBasisKind::Duchon => {
-                require_zero_harmonics(&kind, stored_harmonic_order)?;
-                (
-                    SaeBasisResolution::DuchonCoordinates {
-                        basis_size: persisted_basis_size,
-                    },
-                    SaeReferenceMetricPlan::EuclideanDuchon,
-                )
-            }
-            SaeAtomBasisKind::Linear
-            | SaeAtomBasisKind::EuclideanPatch
-            | SaeAtomBasisKind::Poincare => {
-                require_zero_harmonics(&kind, stored_harmonic_order)?;
-                let degree = sae_euclidean_degree_for_basis_size(latent_dim, persisted_basis_size)?;
-                let metric = if matches!(kind, SaeAtomBasisKind::Poincare) {
-                    SaeReferenceMetricPlan::UnitPoincareBall
-                } else {
-                    SaeReferenceMetricPlan::EuclideanPolynomial
-                };
-                (SaeBasisResolution::Polynomial { degree }, metric)
-            }
-            SaeAtomBasisKind::Cylinder => {
-                let circle_width = stored_harmonic_order
-                    .checked_mul(2)
-                    .and_then(|value| value.checked_add(1))
-                    .ok_or_else(|| {
-                        format!(
-                            "cylinder harmonic width overflowed for order {stored_harmonic_order}"
-                        )
-                    })?;
-                if stored_harmonic_order == 0
-                    || persisted_basis_size == 0
-                    || persisted_basis_size % circle_width != 0
-                {
-                    return Err(format!(
-                        "cylinder width {persisted_basis_size} is incompatible with circle order {stored_harmonic_order}"
-                    ));
-                }
-                (
-                    SaeBasisResolution::CylinderHarmonics {
-                        circle_order: stored_harmonic_order,
-                        line_degree: persisted_basis_size / circle_width - 1,
-                    },
-                    SaeReferenceMetricPlan::CylinderProduct,
-                )
-            }
-            SaeAtomBasisKind::Mobius => {
-                if stored_harmonic_order == 0 {
-                    return Err("Mobius harmonic order must be positive".to_string());
-                }
-                let width_degree = (0..=persisted_basis_size)
-                    .find(|&degree| {
-                        MobiusHarmonicEvaluator::new(stored_harmonic_order, degree)
-                            .is_ok_and(|evaluator| evaluator.basis_size() == persisted_basis_size)
-                    })
-                    .ok_or_else(|| {
-                        format!(
-                            "Mobius width {persisted_basis_size} has no exact width degree for circle order {stored_harmonic_order}"
-                        )
-                    })?;
-                (
-                    SaeBasisResolution::MobiusHarmonics {
-                        circle_order: stored_harmonic_order,
-                        width_degree,
-                    },
-                    SaeReferenceMetricPlan::MobiusQuotient,
-                )
-            }
-            SaeAtomBasisKind::FiniteSet => {
-                require_zero_harmonics(&kind, stored_harmonic_order)?;
-                (
-                    SaeBasisResolution::FiniteAnchors {
-                        anchors: persisted_basis_size,
-                    },
-                    SaeReferenceMetricPlan::DiscreteCounting,
-                )
-            }
-            SaeAtomBasisKind::Precomputed(_) => {
-                require_zero_harmonics(&kind, stored_harmonic_order)?;
-                (
-                    SaeBasisResolution::Precomputed {
-                        basis_size: persisted_basis_size,
-                    },
-                    SaeReferenceMetricPlan::CallerProvided,
-                )
-            }
-        };
-        let plan = Self::new(kind, latent_dim, resolution, reference_metric)?;
-        let derived = plan.basis_size()?;
-        if derived != persisted_basis_size {
-            return Err(format!(
-                "persisted basis width {persisted_basis_size} disagrees with typed plan width {derived} for {:?}",
-                plan.kind
-            ));
-        }
-        Ok(plan)
     }
 
     /// Build the one analytic evaluator declared by this plan.
-    pub fn build_evaluator(
-        &self,
-        centers: Option<&Array2<f64>>,
-    ) -> Result<Arc<dyn SaeBasisSecondJet>, String> {
-        let evaluator: Arc<dyn SaeBasisSecondJet> = match self.resolution {
-            SaeBasisResolution::PeriodicHarmonics { order } => {
-                Arc::new(PeriodicHarmonicEvaluator::new(sae_periodic_basis_size(order)?)?)
-            }
+    pub fn build_evaluator(&self) -> Result<Arc<dyn SaeBasisSecondJet>, String> {
+        let evaluator: Arc<dyn SaeBasisSecondJet> = match &self.resolution {
+            SaeBasisResolution::PeriodicHarmonics { order } => Arc::new(
+                PeriodicHarmonicEvaluator::new(sae_periodic_basis_size(*order)?)?,
+            ),
             SaeBasisResolution::SphereChart => Arc::new(SphereChartEvaluator),
             SaeBasisResolution::TorusHarmonics { per_axis_order } => Arc::new(
-                TorusHarmonicEvaluator::new(self.latent_dim, per_axis_order)?,
+                TorusHarmonicEvaluator::new(self.latent_dim, *per_axis_order)?,
             ),
-            SaeBasisResolution::ProjectivePlaneHarmonics { quotient_order } => {
-                Arc::new(QuotientSpectralEvaluator::projective_plane(quotient_order)?)
-            }
+            SaeBasisResolution::ProjectivePlaneHarmonics { quotient_order } => Arc::new(
+                QuotientSpectralEvaluator::projective_plane(*quotient_order)?,
+            ),
             SaeBasisResolution::KleinBottleHarmonics { per_axis_order } => Arc::new(
-                QuotientSpectralEvaluator::klein_bottle(per_axis_order)?,
+                QuotientSpectralEvaluator::klein_bottle(*per_axis_order)?,
             ),
-            SaeBasisResolution::DuchonCoordinates { .. } => {
-                let centers = centers.ok_or_else(|| {
-                    format!("{:?} requires persisted Duchon centers", self.kind)
-                })?;
+            SaeBasisResolution::DuchonCoordinates { centers } => {
                 Arc::new(DuchonCoordinateEvaluator::new(
                     centers.clone(),
-                    sae_duchon_atom_m(centers.ncols()),
+                    sae_duchon_atom_m(self.latent_dim),
                 )?)
             }
-            SaeBasisResolution::Polynomial { degree } => {
-                Arc::new(EuclideanPatchEvaluator::new(self.latent_dim, degree)?)
-            }
+            SaeBasisResolution::Polynomial { degree } => Arc::new(
+                EuclideanPatchEvaluator::new(self.latent_dim, *degree)?,
+            ),
             SaeBasisResolution::CylinderHarmonics {
                 circle_order,
                 line_degree,
-            } => Arc::new(CylinderHarmonicEvaluator::new(circle_order, line_degree)?),
+            } => Arc::new(CylinderHarmonicEvaluator::new(
+                *circle_order,
+                *line_degree,
+            )?),
             SaeBasisResolution::MobiusHarmonics {
                 circle_order,
                 width_degree,
-            } => Arc::new(MobiusHarmonicEvaluator::new(circle_order, width_degree)?),
+            } => Arc::new(MobiusHarmonicEvaluator::new(
+                *circle_order,
+                *width_degree,
+            )?),
             SaeBasisResolution::FiniteAnchors { .. } => {
                 return Err("finite-set atoms have no continuous analytic evaluator".to_string());
             }
@@ -439,27 +317,17 @@ impl SaeAtomGeometryPlan {
 
     /// Exact cover-restricted spectral penalty for quotient atoms.
     pub fn quotient_spectral_penalty(&self, power: u32) -> Result<Option<Array2<f64>>, String> {
-        match self.resolution {
+        match &self.resolution {
             SaeBasisResolution::ProjectivePlaneHarmonics { quotient_order } => Ok(Some(
-                QuotientSpectralEvaluator::projective_plane(quotient_order)?
+                QuotientSpectralEvaluator::projective_plane(*quotient_order)?
                     .spectral_penalty(power)?,
             )),
             SaeBasisResolution::KleinBottleHarmonics { per_axis_order } => Ok(Some(
-                QuotientSpectralEvaluator::klein_bottle(per_axis_order)?
+                QuotientSpectralEvaluator::klein_bottle(*per_axis_order)?
                     .spectral_penalty(power)?,
             )),
             _ => Ok(None),
         }
-    }
-}
-
-fn require_zero_harmonics(kind: &SaeAtomBasisKind, order: usize) -> Result<(), String> {
-    if order == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "non-harmonic atom {kind:?} must store harmonic order zero; got {order}"
-        ))
     }
 }
 
@@ -471,39 +339,46 @@ mod tests {
     fn quotient_plan_is_the_only_width_and_metric_authority() {
         let rp2 = SaeAtomGeometryPlan::projective_plane(3).unwrap();
         assert_eq!(rp2.basis_size().unwrap(), 28);
-        assert_eq!(rp2.stored_harmonic_order(), 3);
         assert_eq!(
             rp2.reference_metric(),
-            SaeReferenceMetricPlan::UnitRoundProjectivePlane
+            &SaeReferenceMetricPlan::RoundProjectivePlane
         );
 
         let klein = SaeAtomGeometryPlan::klein_bottle(3).unwrap();
         assert_eq!(klein.basis_size().unwrap(), 24);
-        assert_eq!(klein.stored_harmonic_order(), 3);
         assert_eq!(
             klein.reference_metric(),
-            SaeReferenceMetricPlan::UnitFlatKleinBottle
+            &SaeReferenceMetricPlan::FlatKleinBottle
         );
         assert!(SaeAtomGeometryPlan::klein_bottle(1).is_err());
     }
 
     #[test]
-    fn persisted_quotient_width_is_validation_not_authority() {
+    fn semantic_plan_mismatches_are_rejected() {
         assert!(
-            SaeAtomGeometryPlan::from_persisted(
-                SaeAtomBasisKind::ProjectivePlane,
+            SaeAtomGeometryPlan::new(
+                SaeAtomBasisKind::Linear,
                 2,
-                3,
-                27,
+                SaeBasisResolution::Polynomial { degree: 2 },
+                SaeReferenceMetricPlan::EuclideanPolynomial,
             )
             .is_err()
         );
         assert!(
-            SaeAtomGeometryPlan::from_persisted(
-                SaeAtomBasisKind::KleinBottle,
-                2,
-                3,
-                25,
+            SaeAtomGeometryPlan::new(
+                SaeAtomBasisKind::Torus,
+                1,
+                SaeBasisResolution::TorusHarmonics { per_axis_order: 2 },
+                SaeReferenceMetricPlan::FlatRectangularTorus { tau: 0.0 },
+            )
+            .is_err()
+        );
+        assert!(
+            SaeAtomGeometryPlan::new(
+                SaeAtomBasisKind::FiniteSet,
+                1,
+                SaeBasisResolution::FiniteAnchors { anchors: 1 },
+                SaeReferenceMetricPlan::DiscreteCounting,
             )
             .is_err()
         );

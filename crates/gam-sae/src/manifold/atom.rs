@@ -46,6 +46,17 @@ pub enum SaeAtomBasisKind {
     Periodic,
     Sphere,
     Torus,
+    /// Real projective plane `RP² = S²/{u ~ -u}` on the round unit cover.
+    /// The analytic basis is the even-degree spherical-harmonic restriction
+    /// owned by [`crate::basis::QuotientSpectralEvaluator`]. Coordinates stay
+    /// on the existing `(latitude, longitude)` sphere cover; antipodal rows are
+    /// an exact discrete gauge because every emitted basis column is even.
+    ProjectivePlane,
+    /// Flat Klein bottle `T²/{(theta, phi) ~ (theta + 1/2, -phi)}`.
+    /// The analytic basis is the diagonal-character restriction of the real
+    /// tensor Fourier cover. Coordinates remain two unit-period circle phases;
+    /// the deck twin is an exact discrete gauge of every decoder function.
+    KleinBottle,
     /// Cylinder `S¹ × ℝ` (`d = 2`): a periodic circle axis tensored with a flat
     /// (Duchon-polynomial) line axis, via [`CylinderHarmonicEvaluator`]. Axis 0
     /// is the circle (fraction-of-period convention, wrapped modulo `1.0`),
@@ -166,7 +177,7 @@ impl SaeAtomBasisKind {
             // artefact-free spherical geometry.
             // Treating it as `LatentManifold::Sphere { dim: 2 }` would
             // require ambient unit-vectors of length 2 (impossible for S^2).
-            Self::Sphere => LatentManifold::Product(vec![
+            Self::Sphere | Self::ProjectivePlane => LatentManifold::Product(vec![
                 LatentManifold::Interval {
                     lo: -std::f64::consts::FRAC_PI_2,
                     hi: std::f64::consts::FRAC_PI_2,
@@ -179,7 +190,7 @@ impl SaeAtomBasisKind {
             // fraction-of-period convention with `PeriodicHarmonicEvaluator`
             // (basis is `cos(2π·h·t)`, `sin(2π·h·t)` on each axis). Each
             // per-axis latent wraps modulo `1.0`.
-            Self::Torus => {
+            Self::Torus | Self::KleinBottle => {
                 if latent_dim == 1 {
                     LatentManifold::Circle { period: 1.0 }
                 } else {

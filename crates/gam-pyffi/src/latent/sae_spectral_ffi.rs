@@ -889,6 +889,319 @@ fn atlas_nerve_from_sparse_route(
     }))
 }
 
+fn atlas_refusal_code(
+    refusal: &gam::terms::sae::inference::atlas_holonomy::AtlasStatisticalRefusal,
+) -> &'static str {
+    use gam::terms::sae::inference::atlas_holonomy::AtlasStatisticalRefusal;
+    match refusal {
+        AtlasStatisticalRefusal::PilotProjectionUncertified { .. } => {
+            "pilot_projection_uncertified"
+        }
+        AtlasStatisticalRefusal::PopulationSpectrumUncertified { .. } => {
+            "population_spectrum_uncertified"
+        }
+        AtlasStatisticalRefusal::GaussianLinearizationIsPlugin { .. } => {
+            "gaussian_linearization_is_plugin"
+        }
+        AtlasStatisticalRefusal::DegenerateFirstOrderLimitUnresolved { .. } => {
+            "degenerate_first_order_limit_unresolved"
+        }
+        AtlasStatisticalRefusal::PopulationCrossGramMarginUncertified { .. } => {
+            "population_cross_gram_margin_uncertified"
+        }
+        AtlasStatisticalRefusal::SingularProjectedCrossGram { .. } => {
+            "singular_projected_cross_gram"
+        }
+        AtlasStatisticalRefusal::PatchTailCrossesEigengap { .. } => {
+            "patch_tail_crosses_eigengap"
+        }
+        AtlasStatisticalRefusal::OrientationFlipBoundExceedsLevel { .. } => {
+            "orientation_flip_bound_exceeds_level"
+        }
+        AtlasStatisticalRefusal::ImproperCycleHolonomy { .. } => "improper_cycle_holonomy",
+        AtlasStatisticalRefusal::PolarLinearizationUnresolved { .. } => {
+            "polar_linearization_unresolved"
+        }
+        AtlasStatisticalRefusal::CycleAngleBranchCutCrossed { .. } => {
+            "cycle_angle_branch_cut_crossed"
+        }
+        AtlasStatisticalRefusal::GaussBonnetRoundingMarginExhausted { .. } => {
+            "gauss_bonnet_rounding_margin_exhausted"
+        }
+        AtlasStatisticalRefusal::GaussBonnetErrorBoundExceedsLevel { .. } => {
+            "gauss_bonnet_error_bound_exceeds_level"
+        }
+        AtlasStatisticalRefusal::GaussBonnetGaussianLinearizationIsPlugin => {
+            "gauss_bonnet_gaussian_linearization_is_plugin"
+        }
+        AtlasStatisticalRefusal::GaussBonnetFirstOrderLimitDegenerate { .. } => {
+            "gauss_bonnet_first_order_limit_degenerate"
+        }
+    }
+}
+
+fn atlas_refusal_dict<'py>(
+    py: Python<'py>,
+    refusal: &gam::terms::sae::inference::atlas_holonomy::AtlasStatisticalRefusal,
+) -> PyResult<Bound<'py, PyDict>> {
+    use gam::terms::sae::inference::atlas_holonomy::AtlasStatisticalRefusal;
+    let out = PyDict::new(py);
+    out.set_item("code", atlas_refusal_code(refusal))?;
+    let set_edge = |out: &Bound<'py, PyDict>, edge| -> PyResult<()> {
+        out.set_item("edge_a", edge.a())?;
+        out.set_item("edge_b", edge.b())?;
+        out.set_item("overlap", edge.overlap())?;
+        Ok(())
+    };
+    match refusal {
+        AtlasStatisticalRefusal::PilotProjectionUncertified { chart }
+        | AtlasStatisticalRefusal::PopulationSpectrumUncertified { chart } => {
+            out.set_item("chart", chart)?;
+        }
+        AtlasStatisticalRefusal::GaussianLinearizationIsPlugin { cycle_index }
+        | AtlasStatisticalRefusal::ImproperCycleHolonomy { cycle_index } => {
+            out.set_item("cycle_index", cycle_index)?;
+        }
+        AtlasStatisticalRefusal::DegenerateFirstOrderLimitUnresolved {
+            cycle_index,
+            bilinear_quadratic_bias_diagnostic,
+            bilinear_quadratic_variance_diagnostic,
+        } => {
+            out.set_item("cycle_index", cycle_index)?;
+            out.set_item(
+                "bilinear_quadratic_bias_diagnostic",
+                bilinear_quadratic_bias_diagnostic,
+            )?;
+            out.set_item(
+                "bilinear_quadratic_variance_diagnostic",
+                bilinear_quadratic_variance_diagnostic,
+            )?;
+        }
+        AtlasStatisticalRefusal::PopulationCrossGramMarginUncertified { edge } => {
+            set_edge(&out, *edge)?;
+        }
+        AtlasStatisticalRefusal::SingularProjectedCrossGram {
+            edge,
+            smallest_singular_value,
+            numerical_rank_threshold,
+        } => {
+            set_edge(&out, *edge)?;
+            out.set_item("smallest_singular_value", smallest_singular_value)?;
+            out.set_item("numerical_rank_threshold", numerical_rank_threshold)?;
+        }
+        AtlasStatisticalRefusal::PatchTailCrossesEigengap {
+            edge,
+            chart,
+            covariance_error_bound,
+            eigengap_lower,
+        } => {
+            set_edge(&out, *edge)?;
+            out.set_item("chart", chart)?;
+            out.set_item("covariance_error_bound", covariance_error_bound)?;
+            out.set_item("eigengap_lower", eigengap_lower)?;
+        }
+        AtlasStatisticalRefusal::OrientationFlipBoundExceedsLevel {
+            flip_probability_bound,
+            allocated_alpha,
+        } => {
+            out.set_item("flip_probability_bound", flip_probability_bound)?;
+            out.set_item("allocated_alpha", allocated_alpha)?;
+        }
+        AtlasStatisticalRefusal::PolarLinearizationUnresolved {
+            cycle_index,
+            edge,
+            cross_gram_error_bound,
+            population_smallest_singular_value_lower_bound,
+        } => {
+            out.set_item("cycle_index", cycle_index)?;
+            set_edge(&out, *edge)?;
+            out.set_item("cross_gram_error_bound", cross_gram_error_bound)?;
+            out.set_item(
+                "population_smallest_singular_value_lower_bound",
+                population_smallest_singular_value_lower_bound,
+            )?;
+        }
+        AtlasStatisticalRefusal::CycleAngleBranchCutCrossed {
+            cycle_index,
+            absolute_angle,
+            uncertainty_radius,
+        } => {
+            out.set_item("cycle_index", cycle_index)?;
+            out.set_item("absolute_angle", absolute_angle)?;
+            out.set_item("uncertainty_radius", uncertainty_radius)?;
+        }
+        AtlasStatisticalRefusal::GaussBonnetRoundingMarginExhausted {
+            residual_to_integer_curvature,
+            total_remainder_bound,
+        } => {
+            out.set_item(
+                "residual_to_integer_curvature",
+                residual_to_integer_curvature,
+            )?;
+            out.set_item("total_remainder_bound", total_remainder_bound)?;
+        }
+        AtlasStatisticalRefusal::GaussBonnetErrorBoundExceedsLevel {
+            misround_probability_bound,
+            allocated_alpha,
+        } => {
+            out.set_item("misround_probability_bound", misround_probability_bound)?;
+            out.set_item("allocated_alpha", allocated_alpha)?;
+        }
+        AtlasStatisticalRefusal::GaussBonnetFirstOrderLimitDegenerate {
+            first_order_variance,
+        } => {
+            out.set_item("first_order_variance", first_order_variance)?;
+        }
+        AtlasStatisticalRefusal::GaussBonnetGaussianLinearizationIsPlugin => {}
+    }
+    Ok(out)
+}
+
+fn atlas_refusal_list<'py>(
+    py: Python<'py>,
+    refusals: &[gam::terms::sae::inference::atlas_holonomy::AtlasStatisticalRefusal],
+) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+    let out = pyo3::types::PyList::empty(py);
+    for refusal in refusals {
+        out.append(atlas_refusal_dict(py, refusal)?)?;
+    }
+    Ok(out)
+}
+
+fn gaussian_holonomy_analysis_dict<'py>(
+    py: Python<'py>,
+    analysis: &gam::terms::sae::inference::atlas_holonomy::GaussianPcaHolonomyAnalysis,
+) -> PyResult<(Bound<'py, PyDict>, Vec<&'static str>, bool)> {
+    use gam::terms::sae::inference::atlas_holonomy::{
+        AtlasCycleAsymptoticRegime, GaussianPcaCovarianceAuthority,
+    };
+    let out = PyDict::new(py);
+    out.set_item("familywise_alpha", analysis.familywise_level().alpha())?;
+    out.set_item(
+        "covariance_authority",
+        match analysis.error_model().authority() {
+            GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization => {
+                "certified_gaussian_linearization"
+            }
+            GaussianPcaCovarianceAuthority::AsymptoticPlugIn => "asymptotic_plugin",
+        },
+    )?;
+    match analysis.orientation_flip_probability_bound() {
+        Some(bound) => out.set_item("orientation_flip_probability_bound", bound)?,
+        None => out.set_item("orientation_flip_probability_bound", py.None())?,
+    }
+    out.set_item(
+        "orientation_refusals",
+        atlas_refusal_list(py, analysis.orientation().refusals())?,
+    )?;
+    let prescriptions = pyo3::types::PyList::empty(py);
+    for prescription in analysis.sample_prescription() {
+        let row = PyDict::new(py);
+        row.set_item("chart", prescription.chart)?;
+        row.set_item("current_rows", prescription.current_rows)?;
+        row.set_item("required_rows", prescription.required_rows)?;
+        row.set_item(
+            "current_covariance_degrees_of_freedom",
+            prescription.current_covariance_degrees_of_freedom,
+        )?;
+        row.set_item(
+            "required_covariance_degrees_of_freedom",
+            prescription.required_covariance_degrees_of_freedom,
+        )?;
+        row.set_item("projected_dimension", prescription.projected_dimension)?;
+        row.set_item(
+            "aligned_frame_error_budget",
+            prescription.aligned_frame_error_budget,
+        )?;
+        prescriptions.append(row)?;
+    }
+    out.set_item("sample_prescription", prescriptions)?;
+    let cycles = pyo3::types::PyList::empty(py);
+    let mut missing = std::collections::BTreeSet::new();
+    for refusal in analysis.orientation().refusals() {
+        missing.insert(atlas_refusal_code(refusal));
+    }
+    let mut fully_certified = analysis.orientation().certified_value().is_some();
+    for cycle in analysis.cycles() {
+        let row = PyDict::new(py);
+        row.set_item("cycle_index", cycle.cycle_index)?;
+        row.set_item("closed_chart_walk", cycle.closed_chart_walk())?;
+        row.set_item("absolute_angle", cycle.absolute_angle)?;
+        let regime = match cycle.asymptotic_regime {
+            Some(AtlasCycleAsymptoticRegime::FirstOrderGaussian {
+                authority: GaussianPcaCovarianceAuthority::CertifiedGaussianLinearization,
+                ..
+            }) => "certified_first_order_gaussian",
+            Some(AtlasCycleAsymptoticRegime::FirstOrderGaussian {
+                authority: GaussianPcaCovarianceAuthority::AsymptoticPlugIn,
+                ..
+            }) => "plugin_first_order_gaussian",
+            Some(AtlasCycleAsymptoticRegime::FirstOrderDegenerate { .. }) => {
+                "first_order_degenerate_unresolved"
+            }
+            None => "unavailable",
+        };
+        row.set_item("asymptotic_regime", regime)?;
+        row.set_item("first_order_variance", cycle.first_order_variance)?;
+        row.set_item(
+            "naive_edgewise_first_order_variance",
+            cycle.naive_edgewise_first_order_variance,
+        )?;
+        row.set_item(
+            "covariance_aggregation_adjustment",
+            cycle.covariance_aggregation_adjustment,
+        )?;
+        row.set_item(
+            "bilinear_quadratic_bias_diagnostic",
+            cycle.bilinear_quadratic_bias,
+        )?;
+        row.set_item(
+            "bilinear_quadratic_variance_diagnostic",
+            cycle.bilinear_quadratic_variance,
+        )?;
+        row.set_item("standard_error", cycle.standard_error)?;
+        row.set_item(
+            "polar_linearization_remainder_bound",
+            cycle.polar_linearization_remainder_bound,
+        )?;
+        row.set_item(
+            "geometric_remainder_bound",
+            cycle.geometric_remainder_bound,
+        )?;
+        row.set_item(
+            "refusals",
+            atlas_refusal_list(py, cycle.decision.refusals())?,
+        )?;
+        for refusal in cycle.decision.refusals() {
+            missing.insert(atlas_refusal_code(refusal));
+        }
+        fully_certified &= cycle.decision.certified_value().is_some();
+        cycles.append(row)?;
+    }
+    out.set_item("cycles", cycles)?;
+    if let Some(confidence) = analysis.gauss_bonnet() {
+        let gauss_bonnet = PyDict::new(py);
+        gauss_bonnet.set_item("first_order_variance", confidence.first_order_variance)?;
+        gauss_bonnet.set_item("standard_error", confidence.standard_error)?;
+        gauss_bonnet.set_item(
+            "misround_probability_bound",
+            confidence.misround_probability_bound,
+        )?;
+        gauss_bonnet.set_item(
+            "refusals",
+            atlas_refusal_list(py, confidence.decision.refusals())?,
+        )?;
+        for refusal in confidence.decision.refusals() {
+            missing.insert(atlas_refusal_code(refusal));
+        }
+        fully_certified &= confidence.decision.certified_value().is_some();
+        out.set_item("gauss_bonnet", gauss_bonnet)?;
+    } else {
+        out.set_item("gauss_bonnet", py.None())?;
+    }
+    Ok((out, missing.into_iter().collect(), fully_certified))
+}
+
 fn atlas_nerve_dict<'py>(
     py: Python<'py>,
     report: Option<&AuditAtlasReport>,
@@ -919,25 +1232,34 @@ fn atlas_nerve_dict<'py>(
     }
     out.set_item("good_cover_certified", diagram.good_cover_certified)?;
     match diagram.holonomy_certificate.as_ref() {
-        Some(certificate) => {
-            let certified = certificate.certified_orientability().is_some();
+        Some(
+            certificate @ gam::terms::sae::inference::atlas_holonomy::AtlasHolonomyCertificate::ExactAnalytic(_),
+        ) => {
+            out.set_item("holonomy_status", "analyzed_certified")?;
+            out.set_item("holonomy_provenance", certificate.provenance_label())?;
+            out.set_item("holonomy_missing_inputs", py.None())?;
+            out.set_item("holonomy_analysis", py.None())?;
+        }
+        Some(
+            certificate @ gam::terms::sae::inference::atlas_holonomy::AtlasHolonomyCertificate::GaussianPcaPlugin(analysis),
+        ) => {
+            let (payload, missing, fully_certified) =
+                gaussian_holonomy_analysis_dict(py, analysis)?;
             out.set_item(
                 "holonomy_status",
-                if certified {
+                if fully_certified {
                     "analyzed_certified"
                 } else {
                     "analyzed_refused"
                 },
             )?;
             out.set_item("holonomy_provenance", certificate.provenance_label())?;
-            if certified {
+            if missing.is_empty() {
                 out.set_item("holonomy_missing_inputs", py.None())?;
             } else {
-                out.set_item(
-                    "holonomy_missing_inputs",
-                    "certified population spectral bounds and a finite-sample Gaussian linearization law",
-                )?;
+                out.set_item("holonomy_missing_inputs", missing)?;
             }
+            out.set_item("holonomy_analysis", payload)?;
         }
         None => {
             // Sparse block routing supplies fitted pairwise transfers, but not
@@ -946,12 +1268,15 @@ fn atlas_nerve_dict<'py>(
             // Gaussian finite-sample proof. Absence is not a negative result.
             out.set_item("holonomy_status", "not_analyzed")?;
             out.set_item("holonomy_provenance", py.None())?;
+            out.set_item("holonomy_analysis", py.None())?;
             out.set_item(
                 "holonomy_missing_inputs",
-                report
-                    .holonomy_unavailable_reason
-                    .as_deref()
-                    .unwrap_or("cross-fitted holonomy inputs were unavailable"),
+                vec![
+                    report
+                        .holonomy_unavailable_reason
+                        .as_deref()
+                        .unwrap_or("cross-fitted holonomy inputs were unavailable"),
+                ],
             )?;
         }
     }

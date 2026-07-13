@@ -1287,7 +1287,7 @@ impl BernoulliMarginalSlopeFamily {
         };
         let primary = &cache.primary;
         let r = primary.total;
-        if r < 2 || r > crate::bms::gpu::row::MAX_R {
+        if r < 2 {
             return Ok(None);
         }
         let h_range = primary.h.clone();
