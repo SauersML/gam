@@ -22,12 +22,107 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import os
+import platform
+import re
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
+
+
+PAIR_SCHEMA = "gam.issue2283.eq4-pair.v1"
+HEX_SHA256 = re.compile(r"[0-9a-f]{64}")
+HEX_GIT_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def _canonical_json(payload) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _payload_sha256(payload) -> str:
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def _file_sha256(path: str | Path) -> str:
+    with open(path, "rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _array_sha256(values: np.ndarray) -> str:
+    array = np.ascontiguousarray(values)
+    header = _canonical_json({"dtype": array.dtype.str, "shape": list(array.shape)})
+    digest = hashlib.sha256()
+    digest.update(header.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(memoryview(array).cast("B"))
+    return digest.hexdigest()
+
+
+def _validate_measurement_identity(run_id: str, code_revision: str, wheel_sha256: str) -> None:
+    if not run_id.strip():
+        raise ValueError("--run-id must be non-empty")
+    if HEX_GIT_SHA.fullmatch(code_revision) is None:
+        raise ValueError("--code-revision must be one lowercase 40-digit Git SHA")
+    if HEX_SHA256.fullmatch(wheel_sha256) is None:
+        raise ValueError("--wheel-sha256 must be one lowercase SHA-256 digest")
+
+
+def _source_provenance(code_revision: str, wheel_sha256: str) -> dict:
+    import gamfit
+    import arm_featurizers
+    import bits_eq4
+    from gamfit import _description_length
+    from gamfit._binding import rust_module
+
+    rust_extension = Path(rust_module().__file__).resolve()
+    paths = {
+        "driver": Path(__file__).resolve(),
+        "arm_featurizers": Path(arm_featurizers.__file__).resolve(),
+        "bits_eq4": Path(bits_eq4.__file__).resolve(),
+        "description_length": Path(_description_length.__file__).resolve(),
+        "rust_extension": rust_extension,
+    }
+    return {
+        "code_revision": code_revision,
+        "wheel_sha256": wheel_sha256,
+        "gamfit_version": str(gamfit.__version__),
+        "source_sha256": {name: _file_sha256(path) for name, path in paths.items()},
+    }
+
+
+def _execution_provenance() -> dict:
+    payload = {
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+        "platform": platform.platform(),
+        "node": platform.node(),
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+    }
+    try:
+        import torch
+    except ImportError:
+        payload["torch"] = None
+        payload["cuda"] = None
+        return payload
+    payload["torch"] = torch.__version__
+    payload["cuda"] = {
+        "runtime": torch.version.cuda,
+        "available": bool(torch.cuda.is_available()),
+    }
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        payload["cuda"].update(
+            {
+                "device_index": int(device),
+                "device_name": torch.cuda.get_device_name(device),
+                "device_capability": list(torch.cuda.get_device_capability(device)),
+            }
+        )
+    return payload
 
 
 def held_out_ev(x_test: np.ndarray, recon: np.ndarray, mean_train: np.ndarray) -> float:
@@ -36,7 +131,7 @@ def held_out_ev(x_test: np.ndarray, recon: np.ndarray, mean_train: np.ndarray) -
     return 1.0 - ssr / max(sst, 1e-300)
 
 
-def load_chunk_dir(chunk_dir: str, max_rows: int, seed: int) -> np.ndarray:
+def load_chunk_dir(chunk_dir: str, max_rows: int, seed: int):
     """mmap chunk_*.npy float16 shards; deterministic max_rows subsample (the
     #1893 loader, verbatim semantics so splits agree with that harness)."""
     import glob
@@ -50,6 +145,20 @@ def load_chunk_dir(chunk_dir: str, max_rows: int, seed: int) -> np.ndarray:
         if int(m.shape[1]) != p:
             raise SystemExit(f"inconsistent p across shards: {p} vs {m.shape[1]}")
     counts = [int(m.shape[0]) for m in mms]
+    manifest = {
+        "schema": "gam.issue2283.creditscope-shards.v1",
+        "shards": [
+            {
+                "path": str(Path(path).resolve()),
+                "bytes": int(os.path.getsize(path)),
+                "shape": [int(value) for value in mmap.shape],
+                "dtype": mmap.dtype.str,
+                "sha256": _file_sha256(path),
+            }
+            for path, mmap in zip(files, mms, strict=True)
+        ],
+    }
+    manifest["sha256"] = _payload_sha256(manifest)
     offsets = np.cumsum([0] + counts)
     rng = np.random.default_rng(seed)
     take = min(max_rows, int(offsets[-1]))
@@ -60,17 +169,25 @@ def load_chunk_dir(chunk_dir: str, max_rows: int, seed: int) -> np.ndarray:
         if sel.size:
             parts.append(np.asarray(m[sel], dtype=np.float32))
     out = np.concatenate(parts, axis=0)
-    rng.shuffle(out)
-    return np.ascontiguousarray(out, dtype=np.float32)
+    order = np.arange(out.shape[0], dtype=np.int64)
+    rng.shuffle(order)
+    out = np.ascontiguousarray(out[order], dtype=np.float32)
+    row_ids = np.ascontiguousarray(idx[order], dtype=np.int64)
+    return out, row_ids, manifest
 
 
-def make_split(X: np.ndarray, test_frac: float, seed: int):
+def make_split(X: np.ndarray, row_ids: np.ndarray, test_frac: float, seed: int):
     rng = np.random.default_rng(seed + 1)  # split stream separate from subsample stream
     n = X.shape[0]
     perm = rng.permutation(n)
     n_test = max(1, int(round(test_frac * n)))
     te, tr = perm[:n_test], perm[n_test:]
-    return np.ascontiguousarray(X[tr]), np.ascontiguousarray(X[te])
+    return (
+        np.ascontiguousarray(X[tr]),
+        np.ascontiguousarray(X[te]),
+        np.ascontiguousarray(row_ids[tr]),
+        np.ascontiguousarray(row_ids[te]),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -248,7 +365,9 @@ def fit_hybrid_rust(x_tr, x_te, mean_tr, *, K, top_k, curved_K, curved_k, d,
 
 
 # --------------------------------------------------------------------------- #
-def score_bits_for_arm(arm, collect, x_te, bits_max_rows, seed, sparse_score_mode):
+def score_bits_for_arm(
+    arm, collect, x_te, test_row_ids, bits_max_rows, seed, sparse_score_mode
+):
     """Build the arm's FittedFeaturizer on a test subsample and score Eq-4 bits.
 
     Returns a dict of ``bits_at_r2_*`` / ``code_bits_*`` / ``resid_bits_*`` /
@@ -287,6 +406,8 @@ def score_bits_for_arm(arm, collect, x_te, bits_max_rows, seed, sparse_score_mod
     out = {f"bits_{k}": v for k, v in dl.items()}
     out["bits_scorer"] = bits_eq4.scorer_source()
     out["bits_rows"] = int(take)
+    out["bits_test_positions_sha256"] = _array_sha256(idx.astype(np.int64, copy=False))
+    out["bits_row_ids_sha256"] = _array_sha256(test_row_ids[idx])
     if fitted.extras is not None and "score_route_stats" in fitted.extras:
         out["bits_score_route_stats"] = fitted.extras["score_route_stats"]
     # gam#2233 self-certification: the Eq-4 dictionary term is
@@ -310,6 +431,9 @@ def main() -> int:
                     choices=["external_topk", "gam_flat", "curved_topk",
                              "pca_bar", "hybrid_rust"])
     ap.add_argument("--chunk-dir", required=True)
+    ap.add_argument("--run-id", required=True)
+    ap.add_argument("--code-revision", required=True)
+    ap.add_argument("--wheel-sha256", required=True)
     ap.add_argument("--max-rows", type=int, default=120_000)
     ap.add_argument("--test-frac", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=0)
@@ -353,17 +477,24 @@ def main() -> int:
                     help="test-row subsample for Eq-4 bits (bounds the per-atom "
                          "SVD sweep at K=32768); the gate/contrib/recon are all "
                          "rebuilt on this same subsample")
-    ap.add_argument("--tag", default="")
-    ap.add_argument("--out", default="results_1026.jsonl")
+    ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    try:
+        _validate_measurement_identity(args.run_id, args.code_revision, args.wheel_sha256)
+    except ValueError as error:
+        ap.error(str(error))
     if args.arm in {"gam_flat", "hybrid_rust"}:
         if args.sparse_minibatch is None or args.sparse_minibatch <= 0:
             ap.error(f"--arm {args.arm} requires a positive --sparse-minibatch")
         if args.sparse_score_mode != "required":
             ap.error(f"--arm {args.arm} requires --sparse-score-mode required")
 
-    X = load_chunk_dir(args.chunk_dir, args.max_rows, args.seed)
-    x_tr, x_te = make_split(X, args.test_frac, args.seed)
+    X, sampled_row_ids, data_manifest = load_chunk_dir(
+        args.chunk_dir, args.max_rows, args.seed
+    )
+    x_tr, x_te, train_row_ids, test_row_ids = make_split(
+        X, sampled_row_ids, args.test_frac, args.seed
+    )
     mean_tr = x_tr.mean(0)
     n, p = X.shape
     print(f"[#1026] arm={args.arm} N={n} p={p} train={x_tr.shape[0]} test={x_te.shape[0]} "
@@ -410,6 +541,7 @@ def main() -> int:
             args.arm,
             collect,
             x_te,
+            test_row_ids,
             args.bits_max_rows,
             args.seed,
             args.sparse_score_mode,
@@ -426,12 +558,45 @@ def main() -> int:
     if "sparse_route_stats" in collect:
         extra["sparse_route_stats"] = collect["sparse_route_stats"]
         extra["sparse_convergence"] = collect["sparse_convergence"]
-    rec = {"issue": 1026, "arm": args.arm, "tag": args.tag, "N": n, "p": p,
+    source_provenance = _source_provenance(args.code_revision, args.wheel_sha256)
+    data_identity = {
+        "manifest_sha256": data_manifest["sha256"],
+        "sampled_row_ids_sha256": _array_sha256(sampled_row_ids),
+        "train_row_ids_sha256": _array_sha256(train_row_ids),
+        "test_row_ids_sha256": _array_sha256(test_row_ids),
+        "bits_test_positions_sha256": extra.get("bits_test_positions_sha256"),
+        "bits_row_ids_sha256": extra.get("bits_row_ids_sha256"),
+    }
+    pair_identity = {
+        "schema": PAIR_SCHEMA,
+        "run_id": args.run_id,
+        "source": source_provenance,
+        "data": data_identity,
+        "config": {
+            "max_rows": args.max_rows,
+            "test_frac": args.test_frac,
+            "seed": args.seed,
+            "N": n,
+            "p": p,
+            "K": args.K,
+            "top_k": args.top_k,
+            "bits_max_rows": args.bits_max_rows if args.bits else None,
+        },
+    }
+    rec = {"issue": 2283, "arm": args.arm, "run_id": args.run_id, "N": n, "p": p,
            "K": args.K, "k_flat": args.k_flat, "top_k": args.top_k, "d_atom": args.d_atom,
            "curved_atoms": args.curved_atoms, "curved_k": args.curved_k,
            "sparse_minibatch": args.sparse_minibatch,
            "sparse_score_mode": args.sparse_score_mode,
-           "steps": args.steps, "seed": args.seed, "ev": ev, "wall_s": round(wall, 1),
+           "max_rows": args.max_rows, "test_frac": args.test_frac,
+           "bits_max_rows": args.bits_max_rows if args.bits else None,
+           "steps": args.steps, "lr": args.lr, "batch_size": args.batch_size,
+           "max_epochs": args.max_epochs, "atom_topology": args.atom_topology,
+           "seed": args.seed, "ev": ev, "wall_s": round(wall, 1),
+           "data_manifest": data_manifest,
+           "pair_identity": pair_identity,
+           "pair_identity_sha256": _payload_sha256(pair_identity),
+           "execution_provenance": _execution_provenance(),
            **extra}
     print("[#1026] RESULT " + json.dumps(rec), flush=True)
     with open(args.out, "a") as f:

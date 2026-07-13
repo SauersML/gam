@@ -44,19 +44,19 @@ mod adaptive_bounded_duchon_tests {
     #[test]
     fn spatial_penalty_ranges_follow_realized_global_layout_2287() {
         let data = array![
-            [1.0, 0.0, 0.00],
-            [2.0, 1.0, 0.14],
-            [3.0, 0.0, 0.29],
-            [4.0, 1.0, 0.43],
-            [5.0, 0.0, 0.57],
-            [6.0, 1.0, 0.71],
-            [7.0, 0.0, 0.86],
-            [8.0, 1.0, 1.00],
+            [1.0, 0.0, 0.00, 0.57],
+            [2.0, 1.0, 0.14, 0.00],
+            [3.0, 0.0, 0.29, 0.86],
+            [4.0, 1.0, 0.43, 0.29],
+            [5.0, 0.0, 0.57, 1.00],
+            [6.0, 1.0, 0.71, 0.43],
+            [7.0, 0.0, 0.86, 0.14],
+            [8.0, 1.0, 1.00, 0.71],
         ];
-        let smooth = |name: &str| SmoothTermSpec {
+        let smooth = |name: &str, feature_col: usize| SmoothTermSpec {
             name: name.to_string(),
             basis: SmoothBasisSpec::BSpline1D {
-                feature_col: 2,
+                feature_col,
                 spec: BSplineBasisSpec {
                     degree: 3,
                     penalty_order: 2,
@@ -95,7 +95,11 @@ mod adaptive_bounded_duchon_tests {
                 frozen_levels: Some(vec![0, 1]),
                 lenient_unseen: true,
             }],
-            smooth_terms: vec![smooth("first_smooth"), smooth("second_smooth")],
+            // Distinct feature ownership is essential here. Two copies of the
+            // same smooth are deliberately collapsed by global hierarchical
+            // identifiability, in which case the second term correctly owns no
+            // realized penalty block and cannot test a two-term layout.
+            smooth_terms: vec![smooth("first_smooth", 2), smooth("second_smooth", 3)],
         };
         let design = build_term_collection_design(data.view(), &spec).expect("mixed design");
 
